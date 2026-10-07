@@ -176,7 +176,7 @@ pub async fn flush(db: Option<worker::D1Database>, pending: Vec<(String, u64)>) 
     if stmts.is_empty() {
         return;
     }
-    if let Err(e) = db.batch(stmts).await {
+    if let Err(e) = crate::d1_ledger::counted_batch(&db, stmts).await {
         worker::console_warn!("[courier] counter flush failed ({} rows): {e}", pending.len());
     }
 }

@@ -135,6 +135,9 @@ pub mod beef_guard;
 pub mod compaction;
 pub mod courier;
 pub mod cors;
+/// bsv-low #499: the D1 rows ledger, the overlay's own source compiled here (this crate does not link the overlay).
+#[path = "../../overlay-cloudflare/src/d1_ledger.rs"]
+pub mod d1_ledger;
 pub mod credit_beef;
 pub mod hops_view;
 /// bsv-low #532: the identity views (names and pictures), a proxy to LOW's identity resolver.
@@ -169,8 +172,29 @@ use worker::{event, Context, Env, Request, Response, Result, Router};
 /// server. Every response — success, 4xx, or 5xx — gets wildcard CORS stamped
 /// on the way out, so a cross-origin browser always sees the real status
 /// instead of an opaque network error.
+///
+/// bsv-low #499 (lens fold M2): the WHOLE body runs under the request's D1 rows ledger, the internal hooks and the
+/// front door's own replies included (the t=0 burst's hooks answered with no figures before), and every answer,
+/// an escaped handler error's too (L5), carries `Server-Timing: d1;desc=..`, stamped last (after any signing).
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let d1_route = d1_ledger::route_of(req.path().as_str(), D1_LEDGER_ROUTES);
+    let (out, d1) = d1_ledger::scoped(serve(req, env, ctx)).await;
+    d1_ledger::record(d1_route, d1);
+    let mut resp = match out {
+        Ok(resp) => resp,
+        Err(e) => {
+            let mut resp = d1_ledger::escaped(&e, d1)?;
+            cors::add_cors_headers(&mut resp);
+            return Ok(resp);
+        }
+    };
+    d1_ledger::stamp(&mut resp, d1);
+    Ok(resp)
+}
+
+/// The fetch body, under the ledger [`fetch`] scopes.
+async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // 2026-09-04: the WoC api key for this isolate's provider reads (see routes::provider_get).
     routes::set_woc_api_key(env.secret("WOC_API_KEY").ok().map(|k| k.to_string()));
     // bsv-low #451 slice B: the Arcade endpoint for `/tx-any`'s first external witness (`routes::arcade_url`).
@@ -198,7 +222,8 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // The returned token is what `router` demands (gate round 2, MED-3):
     // deleting this line, or wrapping it in `if false`, is a BUILD failure —
     // there is no other way to obtain a `LatchColumnsEnsured`.
-    let schema_ready = schema::ensure_latch_columns(&env).await;
+    // bsv-low #499 (lens fold L2): keyed `(boot)` in the ledger, not under the route that woke the isolate.
+    let schema_ready = d1_ledger::boot(schema::ensure_latch_columns(&env)).await;
 
     // W2-P4: first-party internal webhooks (bearer INTERNAL_TOKEN) — served
     // BEFORE the BRC-103 front door, exactly like the relay's /broadcast:
@@ -255,6 +280,8 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // bsv-low #451 slice B: the courier census's durable deltas ride ONE D1 batch, after the answer, when a flush is
     // due (`courier::should_flush`: the isolate's exact head, then by calls or by time).
     let counters_db = env.d1("OVERLAY_DB").ok();
+    // bsv-low #499: the figures ride the answer's `Server-Timing` (stamped by `fetch`, after this body signed or
+    // sealed the response) and `/health.d1Budget`.
     let mut resp = router(state, schema_ready).run(req, env).await?;
     let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
     if !pending.is_empty() {
@@ -307,6 +334,41 @@ fn stamp_cors(resp: &mut Response, identity_cors: &Option<identity::IdentityCors
         None => cors::add_cors_headers(resp),
     }
 }
+
+/// bsv-low #499: the routes the D1 rows ledger keys by name (`d1_ledger::route_of`; anything else is `other`). A
+/// route with a path parameter is listed by its fixed head.
+pub const D1_LEDGER_ROUTES: &[&str] = &[
+    "/owed",
+    "/pots-view",
+    "/results",
+    "/utxo-status",
+    "/recovery-view",
+    "/refund-view",
+    "/refund-backups",
+    "/live-view",
+    "/hops-view",
+    "/leaderboard",
+    "/record",
+    "/proof",
+    "/lane/attest",
+    "/spent-any",
+    "/tx-any",
+    "/beef",
+    "/credit-beef",
+    "/rate",
+    "/tip",
+    "/epoch",
+    "/health",
+    // bsv-low #532 (the merge over #499): the identity views, each its own key. A more specific head is listed before
+    // the head it starts with (`route_of` takes the first match): the picture before `/identity`, the kill route
+    // before `/internal`.
+    "/identities",
+    "/identity/pic",
+    "/identity",
+    "/internal/identity/kill",
+    // lens fold M2: the first-party hooks and the tower's population, one key (the overlay keys `/internal` too)
+    "/internal",
+];
 
 /// The route table. All GET, all JSON; unknown paths get a JSON 404 via the
 /// `or_else_any_method` catch-alls (worker-rs' default no-match 404 is plain
@@ -368,4 +430,37 @@ fn router(
         .get("/health", routes::health)
         .or_else_any_method("/", routes::not_found)
         .or_else_any_method("/*catchall", routes::not_found)
+}
+
+#[cfg(test)]
+mod d1_ledger_door_pins {
+    fn squash(s: &str) -> String {
+        s.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n").split_whitespace().collect()
+    }
+
+    /// bsv-low #499 (lens fold M2, L5): the WHOLE fetch body runs under the request's ledger, so the internal hooks
+    /// (the t=0 burst's own door), the latch-column boot and the front door's replies are counted and stamped, and
+    /// an escaped handler error is answered with its figures in both workers. The runtime half is the tier's (every
+    /// `/internal/pot-changed` answer carries `d1;desc=`). RED on `a0db9fb`: the scope wrapped only the router, after
+    /// the hook dispatch and the front door, and an escaped `Err` left through `out?` unstamped.
+    #[test]
+    fn the_hooks_and_the_front_door_run_inside_the_ledger_and_an_escaped_error_is_stamped() {
+        let lib = squash(include_str!("lib.rs"));
+        let fetch = lib.find(&squash("pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {")).expect("the entry");
+        let serve = lib.find(&squash("async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {")).expect("the body");
+        let entry = &lib[fetch..serve];
+        assert!(entry.contains(&squash("d1_ledger::scoped(serve(req, env, ctx)).await;")), "fetch runs the whole body under the ledger");
+        assert!(entry.contains(&squash("Err(e) => { let mut resp = d1_ledger::escaped(&e, d1)?;")), "an escaped error is answered stamped");
+        let body = &lib[serve..];
+        let end = body.find(&squash("pub const D1_LEDGER_ROUTES")).expect("the body's end");
+        let body = &body[..end];
+        for door in ["\"/internal/tip-changed\"", "\"/internal/pot-changed\"", "\"/internal/hop-changed\"", "\"/internal/lobby-changed\"", "\"/internal/armed-pots\"", "auth::front_door(req,&env)", "schema::ensure_latch_columns(&env)"] {
+            assert!(body.contains(door), "{door} is served inside the scoped body");
+        }
+        assert!(!body.contains("d1_ledger::scoped("), "one scope per request, at the entry");
+        assert!(lib.contains(&squash("\"/internal\",")), "the hooks have their ledger key");
+        let overlay = squash(include_str!("../../overlay-cloudflare/src/lib.rs"));
+        assert!(overlay.contains(&squash("Err(e) => return crate::d1_ledger::escaped(&e, tally),")), "the overlay stamps an escaped error too");
+        assert!(overlay.contains(&squash("crate::d1_ledger::boot(ensure_overlay_migrations(&db))")), "the overlay's migrations are keyed (boot)");
+    }
 }

@@ -2239,6 +2239,88 @@ pub fn note_recompute_write_superseded() {
     RECOMPUTE_WRITES_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// bsv-low #499: the recomputes ONE identity may run on ONE isolate inside one window (the brain's per-identity
+/// recompute, bounded). Past it a recompute is SHED: the hook's or the read's ask runs nothing, the reader is served
+/// the snapshot `owed_rows` holds, and the shed is counted (`recomputeShed` on `/health`). Nothing new is persisted:
+/// a hook marks the identity stale BEFORE it asks, and a shed marks it stale AGAIN ([`owed_shed_plan`], one one-row
+/// UPDATE), so the first read after the window recomputes (the read's own staleness rule). The second mark is the
+/// lens fold's M1: a walk in flight when the 13th hook marked stale writes `stale = 0` over that mark (its write is
+/// stamped at its START, before the hook's change), and the folded rerun of that hook is the shed one; without the
+/// re-mark the list served the walk's older rows as fresh for up to 15 minutes. What a shed costs, stated: no push
+/// (`owed-changed` is sent by a walk only), so a change that lands while its identity is over the ceiling reaches
+/// the page at the page's next read past the window (mount, a tip, a socket reconnect, an event; the page has no
+/// timer). The ceiling is PER ISOLATE: hooks reach whichever isolate the platform picks, so the fleet bound is 12
+/// times the live isolates (a brake on one isolate's herd, not a D1 budget). A walk on ANOTHER isolate that began
+/// before the shed and lands after it still clears the re-mark (the isolate-local lock cannot see it); its rows
+/// are then at most that walk's start old, and the 5 and 15 minute age rules still recompute.
+///
+/// Why 12: one hand drives at most a handful per seat (the JOIN's `pot-changed` and `hop-changed`, the settle's
+/// `pot-changed`, the seat's filings, a block's tip), the in-flight lock already folds twins, and a claim reruns
+/// at most `OWED_RERUNS_PER_CLAIM` more; 12 a minute is a recompute every 5 s held for a minute, which no honest
+/// table reaches and a hook storm (the 2026-09-01 callback flood, the loop-11 t=0 herd) does.
+pub const OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW: u32 = 12;
+/// The window of [`OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW`]: one minute, fixed from the first recompute in it.
+pub const OWED_RECOMPUTE_RATE_WINDOW_MS: i64 = 60_000;
+/// Identities tracked before the expired windows are pruned (the map is per isolate and bounded by its traffic).
+const OWED_RECOMPUTE_RATE_PRUNE_AT: usize = 1024;
+
+/// PURE (pinned): the per-identity recompute counter of one isolate.
+#[derive(Debug, Default)]
+pub struct RecomputeRate {
+    /// identity (lowercase) -> (window start ms, recomputes run in it)
+    windows: HashMap<String, (i64, u32)>,
+}
+
+impl RecomputeRate {
+    /// May `identity_lc` recompute now? `true` counts the run. `sheddable = false` is the FIRST read of an identity
+    /// (no snapshot exists to serve): it always runs, and it counts. `false` is a shed (the caller serves the
+    /// snapshot and counts it with [`note_recompute_shed`]).
+    pub fn admit(&mut self, identity_lc: &str, now_ms: i64, sheddable: bool) -> bool {
+        if self.windows.len() >= OWED_RECOMPUTE_RATE_PRUNE_AT {
+            self.windows.retain(|_, (start, _)| now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS);
+        }
+        let w = self.windows.entry(identity_lc.to_string()).or_insert((now_ms, 0));
+        if now_ms.saturating_sub(w.0) >= OWED_RECOMPUTE_RATE_WINDOW_MS {
+            *w = (now_ms, 0);
+        }
+        if sheddable && w.1 >= OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW {
+            return false;
+        }
+        w.1 = w.1.saturating_add(1);
+        true
+    }
+    /// The recomputes `identity_lc` has run in its current window (0 past it).
+    pub fn in_window(&self, identity_lc: &str, now_ms: i64) -> u32 {
+        match self.windows.get(identity_lc) {
+            Some((start, n)) if now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS => *n,
+            _ => 0,
+        }
+    }
+    /// Identities at the ceiling right now.
+    pub fn at_ceiling(&self, now_ms: i64) -> usize {
+        self.windows
+            .values()
+            .filter(|(start, n)| now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS && *n >= OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW)
+            .count()
+    }
+}
+
+/// bsv-low #499 (lens fold M1): the statement a SHED runs, with its bind: the identity marked stale again, so the
+/// first read past the window recomputes whatever a walk in flight cleared (see
+/// [`OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW`]). PURE (pinned on real SQLite in the race's order).
+pub fn owed_shed_plan(identity_lc: &str) -> (&'static str, String) {
+    (OWED_STALE_FOR_IDENTITY_SQL, identity_lc.to_string())
+}
+
+/// bsv-low #499: recomputes shed by the per-identity ceiling (the snapshot served instead).
+static RECOMPUTE_SHED: AtomicU64 = AtomicU64::new(0);
+pub fn note_recompute_shed() {
+    RECOMPUTE_SHED.fetch_add(1, Ordering::Relaxed);
+}
+pub fn recompute_shed_total() -> u64 {
+    RECOMPUTE_SHED.load(Ordering::Relaxed)
+}
+
 pub fn owed_health_json() -> Value {
     let mut by_source = serde_json::Map::new();
     for (i, s) in RECOMPUTE_SOURCES.iter().enumerate() {
@@ -2256,6 +2338,9 @@ pub fn owed_health_json() -> Value {
         "recomputeCoalesced": RECOMPUTE_COALESCED.load(Ordering::Relaxed),
         "recomputeLockTakeovers": RECOMPUTE_LOCK_TAKEOVERS.load(Ordering::Relaxed),
         "recomputeWritesSuperseded": RECOMPUTE_WRITES_SUPERSEDED.load(Ordering::Relaxed),
+        "recomputeShed": RECOMPUTE_SHED.load(Ordering::Relaxed),
+        "recomputesPerIdentityPerMinute": OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW,
+        "recomputeCeilingScope": "per identity per isolate: the fleet bound is this times the live isolates",
         "collectedReadFaults": COLLECTED_READ_FAULTS.load(Ordering::Relaxed),
         "heldFilingsMatched": HELD_FILINGS_MATCHED.load(Ordering::Relaxed),
         "heldFilingsKeyMismatch": HELD_FILINGS_KEY_MISMATCH.load(Ordering::Relaxed),
@@ -5085,5 +5170,131 @@ mod tests {
         // with a stored snapshot the reader gets it, untouched
         let newer = vec![row(0x0b, OwedFamily::HopStranded, json!({ "claim": "sweep-hop", "claimable": true }))];
         assert_eq!(superseded_read_snapshot(Some((newer.clone(), Some(900_001), 71_000, true)), (older, Some(900_000), 1_000, false)), (newer, Some(900_001), 71_000, true));
+    }
+
+    /// bsv-low #499: THE CEILING SHEDS. Twelve recomputes of one identity inside a minute run; the thirteenth is
+    /// shed (the caller serves the snapshot and counts it); another identity is untouched; the first read of an
+    /// identity (no snapshot to serve) runs over the ceiling and still counts; the window past, the identity runs
+    /// again. RED on `b1ad9a1`: there was no ceiling (every ask walked).
+    #[test]
+    fn the_thirteenth_recompute_of_one_identity_inside_a_minute_is_shed_to_the_snapshot() {
+        let mut rate = RecomputeRate::default();
+        let (me, other) = ("02".repeat(33), "03".repeat(33));
+        let t0 = 1_790_000_000_000_i64;
+        for i in 0..OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW {
+            assert!(rate.admit(&me, t0 + i64::from(i) * 1_000, true), "recompute {} of the minute runs", i + 1);
+        }
+        assert_eq!(OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW, 12);
+        assert_eq!(rate.at_ceiling(t0 + 12_000), 1);
+        let shed_before = recompute_shed_total();
+        // the 13th inside the minute: shed (the route counts it and serves the snapshot)
+        assert!(!rate.admit(&me, t0 + 59_999, true), "the 13th recompute inside the minute must be shed");
+        note_recompute_shed();
+        assert!(recompute_shed_total() > shed_before, "a shed is counted on /health (recomputeShed)");
+        assert_eq!(rate.in_window(&me, t0 + 59_999), 12, "a shed is not a run");
+        // a stranger's storm is not mine, and mine is not theirs
+        assert!(rate.admit(&other, t0 + 30_000, true));
+        // a first read always runs (there is no snapshot to shed to) and counts
+        assert!(rate.admit(&me, t0 + 59_999, false));
+        assert_eq!(rate.in_window(&me, t0 + 59_999), 13);
+        // the window past: runs again, counted from one
+        assert!(rate.admit(&me, t0 + 60_000, true));
+        assert_eq!(rate.in_window(&me, t0 + 60_000), 1);
+        assert_eq!(rate.at_ceiling(t0 + 60_000), 0);
+    }
+
+    /// bsv-low #499 (lens fold M1): A SHED NEVER LOSES A REFRESH. The race, on real SQLite with the shipped
+    /// statements: walk 12 of B begins (t = 10 000) and reads the store; the 13th hook marks B stale (its change
+    /// landed after walk 12 read); walk 12 writes its snapshot (`stale = 0`, stamped at its start, which is still the
+    /// newest stamp, so the write lands and clears the hook's mark); the claim pops the folded ask and the ceiling
+    /// sheds it, and the shed runs [`owed_shed_plan`]. The next read must see the identity stale and recompute, at
+    /// the age the walk left (a list of one claimable payout, which the age rule alone recomputes only after 15
+    /// minutes). RED on `a0db9fb`: a shed wrote nothing (no `owed_shed_plan`), the read saw `stale = 0` and served
+    /// walk 12's rows. To red: drop the plan's statement in `owed_recompute_and_push` (the source half below).
+    #[test]
+    fn a_shed_rerun_after_a_walk_cleared_the_hooks_mark_leaves_the_identity_stale_for_the_next_read() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(OWED_ROWS_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        let payout = OwedRow {
+            identity: ME.to_string(),
+            outpoint: format!("{}:0", tx(0x21)),
+            family: OwedFamily::Payout,
+            game_id: tx(0x21),
+            sats: Some(20_190),
+            opponent_identity: Some(OPP.to_string()),
+            at_height: None,
+            facts: json!({ "claim": "payout", "claimable": true }),
+            reason: None,
+        };
+        // an earlier snapshot, then twelve recomputes inside the minute (the counter at its ceiling)
+        assert!(owed_write_landed(run_owed_write(&mut conn, &owed_write_plan(ME, &[], 1_000, Some(900_000), false)), 1_000));
+        let mut rate = RecomputeRate::default();
+        let t0 = 10_000i64;
+        for i in 0..OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW {
+            assert!(rate.admit(ME, t0 + i64::from(i), true));
+        }
+        // walk 12 began at t0 (its stamp) and read the store; the 13th hook's change lands, the hook marks stale
+        conn.execute(OWED_STALE_FOR_IDENTITY_SQL, [ME]).unwrap();
+        assert_eq!(served(&conn, ME).2, 1, "the hook marked the identity stale");
+        // walk 12 writes what it read (the payout, not the hook's change): stamped t0, newest, so it lands, stale = 0
+        let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, std::slice::from_ref(&payout), t0, Some(900_001), false));
+        assert!(owed_write_landed(stamp, t0));
+        assert_eq!(served(&conn, ME).2, 0, "the walk's write cleared the hook's mark (the race)");
+        // the claim pops the folded ask: the ceiling sheds it, and the shed runs its plan
+        assert!(!rate.admit(ME, t0 + 30_000, true), "the folded rerun is the 13th: shed");
+        let (sql, bind) = owed_shed_plan(ME);
+        conn.execute(sql, [bind.as_str()]).unwrap();
+        // the next read: stale, so it recomputes at once (not 15 minutes later by age)
+        let (rows, computed_at, stale) = served(&conn, ME);
+        assert_eq!((rows.len(), computed_at, stale), (1, t0, 1), "walk 12's rows stand, marked stale");
+        let read_at = t0 + 40_000;
+        assert!(
+            should_recompute(stale != 0, read_at - computed_at, Some(900_001), Some(900_001), std::slice::from_ref(&payout)),
+            "the next read recomputes"
+        );
+        assert!(
+            !should_recompute(false, read_at - computed_at, Some(900_001), Some(900_001), std::slice::from_ref(&payout)),
+            "without the mark the age rule alone would have served the old rows (the bug's 15 minutes)"
+        );
+        // past the window the read's recompute runs (it is not shed again)
+        assert!(rate.admit(ME, t0 + OWED_RECOMPUTE_RATE_WINDOW_MS, true));
+        // the source half: the hooks' and claims' entry runs the plan on a shed, before it returns
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let code: String = include_str!("routes.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let routes = squash(&code);
+        let push = routes.find(&squash("pub(crate) async fn owed_recompute_and_push(")).expect("the hooks' entry");
+        assert!(
+            routes[push..].starts_with(&squash(
+                "pub(crate) async fn owed_recompute_and_push( env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>, ) { if !owed_recompute_admit(identity_lc, source, true) { owed_shed_remark(db, identity_lc).await; return; }"
+            )),
+            "a shed in owed_recompute_and_push re-marks the identity stale before it returns"
+        );
+        let remark = routes.find(&squash("async fn owed_shed_remark(")).expect("the re-mark");
+        assert!(routes[remark..].contains(&squash("crate::owed::owed_shed_plan(identity_lc)")), "the re-mark runs the pinned plan");
+    }
+
+    /// bsv-low #499: EVERY WALK ASKS THE CEILING FIRST. The pure counter above sheds nothing unless the route asks
+    /// it before each `owed_recompute`: the hooks' and claims' one entry (`owed_recompute_and_push`), the read's
+    /// inline arm, and the first read (which counts and never sheds). `owed_recompute(` is called at exactly the two
+    /// sites below, so a new caller that skips the ask breaks the count here. To red: delete the ask in
+    /// `owed_recompute_and_push` (the walk then runs past the ceiling).
+    #[test]
+    fn every_owed_recompute_caller_asks_the_ceiling_before_it_walks() {
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let code: String = include_str!("routes.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let routes = squash(&code);
+        let push = routes.find(&squash("pub(crate) async fn owed_recompute_and_push(")).expect("the hooks' entry");
+        let push_body = &routes[push..];
+        let ask = push_body.find(&squash("if !owed_recompute_admit(identity_lc, source, true) { owed_shed_remark(db, identity_lc).await; return; }")).expect("the ask");
+        let walk = push_body.find(&squash("owed_recompute(env, db, identity_lc, source, tip_hint)")).expect("the walk");
+        assert!(ask < walk, "owed_recompute_and_push must ask the ceiling before it walks");
+        assert!(routes.contains(&squash("owed_recompute_admit(&identity, \"read-first\", false); match owed_compute_on_read(")));
+        assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, source, true) { owed_shed_remark(&db, &identity).await; (rows, prev_tip, st.computed_at_ms as i64, cut) } else { match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)")));
+        assert_eq!(routes.matches(&squash("owed_recompute(env, db, identity_lc,")).count(), 2, "the walk's two callers (the push and the read's compute)");
     }
 }

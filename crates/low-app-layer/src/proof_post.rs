@@ -18,6 +18,7 @@
 //! VERIFIED session must be the poster (the seam refuses a mismatch).
 //! Ties: the revealed side posts with itself as `winner` (the bundle's own
 //! `winnerSeat`); `winner` here means POSTER.
+use crate::d1_ledger::Counted;
 use base64::Engine as _;
 use serde::Deserialize;
 use worker::{Request, Response, Result, RouteContext};
@@ -255,7 +256,7 @@ pub async fn proof_get(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
     let rows = db
         .prepare(PROOF_POST_READ_SQL)
         .bind(&[game_id.as_str().into(), winner.as_str().into()])?
-        .all()
+        .counted_all()
         .await?
         .results::<ProofPostReadRowD1>()?;
     let result: Vec<serde_json::Value> = rows
@@ -335,7 +336,7 @@ pub async fn proof_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resul
                 .as_deref()
                 .map_or(worker::wasm_bindgen::JsValue::NULL, |v| v.into()),
         ])?
-        .run()
+        .counted_run()
         .await?;
     crate::routes::json_response(
         serde_json::json!({

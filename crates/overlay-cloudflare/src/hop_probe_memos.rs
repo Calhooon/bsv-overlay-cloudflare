@@ -140,7 +140,7 @@ async fn delete(db: &D1Database, sql: &str, binds: &[JsValue]) -> Result<u64, St
     } else {
         stmt.bind(binds).map_err(|e| e.to_string())?
     };
-    let res = stmt.run().await.map_err(|e| e.to_string())?;
+    let res = crate::d1_ledger::Counted::counted_run(&stmt).await.map_err(|e| e.to_string())?;
     Ok(res
         .meta()
         .ok()

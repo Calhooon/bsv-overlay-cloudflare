@@ -87,6 +87,7 @@
 //! IS pinned natively is the statement's byte-identity with the migration
 //! that owns it and the exact error class this treats as benign.
 
+use crate::d1_ledger::Counted;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 /// The #283 potparty latch column — byte-identical to its migration in the
@@ -366,13 +367,13 @@ async fn apply(db: &worker::D1Database) {
     // This is the module's first in-list dependency; the per-statement
     // idempotence claims below are per-statement, not cross-statement.
     for stmt in CREATE_TABLE_CATCHUPS {
-        if let Err(e) = db.prepare(*stmt).run().await {
+        if let Err(e) = db.prepare(*stmt).counted_run().await {
             all_ok = false;
             worker::console_log!("[schema] CREATE deferred: {stmt} — {e}");
         }
     }
     for stmt in LATCH_COLUMN_ALTERS {
-        match db.prepare(*stmt).run().await {
+        match db.prepare(*stmt).counted_run().await {
             Ok(_) => {}
             Err(e) => {
                 let msg = e.to_string();

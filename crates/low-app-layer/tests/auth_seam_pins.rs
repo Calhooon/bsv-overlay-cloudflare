@@ -82,10 +82,12 @@ fn seven_handlers_use_the_identity_seam_and_no_handler_parses_identity_itself() 
 /// Rule 8b pin: NO request header is ever read in this crate — the verified
 /// identity travels in-process only (router data), so a forged
 /// `X-Identity-Key` (or any header) cannot become an identity in either
-/// mode. Pinned as a POSITIVE count of the one benign `.headers().get(`
-/// call that exists (a RESPONSE Content-Length read in the live-view tower
-/// fan-out) — any NEW header read anywhere in src/ moves the count and
-/// fails this pin loudly, forcing a review.
+/// mode. Pinned as a POSITIVE count of the benign `.headers().get(`
+/// calls that exist (a RESPONSE Content-Length read in the live-view tower
+/// fan-out, and since bsv-low #499 the view actor's RESPONSE `Server-Timing`
+/// read in `rebuild_do_response`, its compute's D1 figures): any NEW header
+/// read anywhere in src/ moves the count and fails this pin loudly, forcing a
+/// review.
 #[test]
 fn no_request_header_is_ever_read_as_an_identity() {
     let all_src = [
@@ -111,9 +113,10 @@ fn no_request_header_is_ever_read_as_an_identity() {
         identity_header_mentions += count(&code.to_ascii_lowercase(), "identity-key\"");
     }
     assert_eq!(
-        header_reads, 1,
-        "exactly ONE .headers().get( call may exist in src/ (the live-view \
-         response Content-Length budget); a new header read must be reviewed \
+        header_reads, 2,
+        "exactly TWO .headers().get( calls may exist in src/ (the live-view \
+         response Content-Length budget, the view actor's response \
+         Server-Timing, bsv-low #499); a new header read must be reviewed \
          against Rule 8b and this count updated deliberately"
     );
     assert_eq!(

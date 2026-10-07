@@ -14,6 +14,7 @@ pub mod broadcaster;
 pub mod chain_tracker;
 pub mod change_flush;
 pub mod d1;
+pub mod d1_ledger;
 pub mod d1_discovery;
 pub mod d1_storage;
 pub mod ef;
@@ -125,8 +126,41 @@ fn non_gasp_peers() -> Vec<peer_crawler::PeerConfig> {
     }]
 }
 
+/// bsv-low #499: the routes the D1 rows ledger keys by name (`d1_ledger::route_of`; anything else is `other`). A
+/// route with a path parameter is listed by its fixed head. `/admin` and `/internal` are one key each.
+pub const D1_LEDGER_ROUTES: &[&str] = &[
+    "/submit",
+    "/lookup",
+    "/arc-ingest",
+    "/requestSyncResponse",
+    "/requestForeignGASPNode",
+    "/health/invariants",
+    "/health",
+    "/beef-any",
+    "/listTopicManagers",
+    "/listLookupServiceProviders",
+    "/admin",
+    "/internal",
+];
+
+/// The fetch entry: [`dispatch`] under the request's D1 rows ledger (bsv-low #499). What the request cost D1 rides
+/// its answer as `Server-Timing: d1;desc="reads=N writes=M stmts=K"` (appended to the route's own timing) and the
+/// route's running maxima ride `/health/invariants.d1Budget`.
 #[event(fetch)]
 async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
+    let route = crate::d1_ledger::route_of(req.path().as_str(), D1_LEDGER_ROUTES);
+    let (out, tally) = crate::d1_ledger::scoped(dispatch(req, env, ctx)).await;
+    crate::d1_ledger::record(route, tally);
+    // lens fold L5: an escaped handler error is answered as the runtime would, with the figures stamped
+    let mut resp = match out {
+        Ok(resp) => resp,
+        Err(e) => return crate::d1_ledger::escaped(&e, tally),
+    };
+    crate::d1_ledger::stamp(&mut resp, tally);
+    Ok(resp)
+}
+
+async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
     // Install a panic hook so Rust panics surface in wrangler tail as
     // proper stack traces instead of the Worker silently returning early
     // (the default wasm behaviour). `set_once` makes re-calls across
@@ -159,7 +193,8 @@ async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> 
 
     // Apply migrations once per isolate (idempotent — CREATE IF NOT EXISTS;
     // unguarded per-request execution was 63 D1 round-trips/request, #255)
-    ensure_overlay_migrations(&db)
+    // bsv-low #499 (lens fold L2): under its own ledger key, `(boot)`, not the route that woke the isolate
+    crate::d1_ledger::boot(ensure_overlay_migrations(&db))
         .await
         .map_err(|e| worker::Error::from(format!("Migration failed: {e}")))?;
 
@@ -430,7 +465,8 @@ pub async fn build_engine_from_env(env: &Env) -> Result<Engine, String> {
         env.d1("OVERLAY_DB")
             .map_err(|e| format!("D1 binding error: {e}"))?,
     );
-    ensure_overlay_migrations(&db)
+    // bsv-low #499 (lens fold L2): under its own ledger key, `(boot)`, not the route that woke the isolate
+    crate::d1_ledger::boot(ensure_overlay_migrations(&db))
         .await
         .map_err(|e| format!("Migration failed: {e}"))?;
     let ship_storage: Rc<dyn SHIPStorage> = Rc::new(D1SHIPStorage::new(db.clone()));

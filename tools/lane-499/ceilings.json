@@ -1,0 +1,105 @@
+{
+  "doc": "bsv-low #499: the D1 ceilings of the budget tier (docs/D1-BUDGETS.md). Each ceiling is the figure measured on the fixture D1 (b1ad9a1 plus lane 499, 2026-10-07, identical at 300 and 1200 strangers) plus the margin below; raise one only with a new measurement and its reason in the doc.",
+  "margin": "reads: measured x 1.5 rounded up, at least measured + 4; writes: measured + 2, and a route that measured 0 writes keeps 0 (a read that starts writing reds); stmts: measured + 2",
+  "scenarios": {
+    "utxo-status-8": {
+      "route": "/utxo-status?outpoints=<A's 8 pots>",
+      "measured": {
+        "reads": 8,
+        "writes": 0,
+        "stmts": 1
+      },
+      "ceiling": {
+        "reads": 12,
+        "writes": 0,
+        "stmts": 3
+      },
+      "censusKey": "/utxo-status"
+    },
+    "pots-view-8": {
+      "route": "/pots-view?outpoints=<A's 8 pots>",
+      "measured": {
+        "reads": 8,
+        "writes": 0,
+        "stmts": 1
+      },
+      "ceiling": {
+        "reads": 12,
+        "writes": 0,
+        "stmts": 3
+      },
+      "censusKey": "/pots-view"
+    },
+    "results-view-compute": {
+      "route": "/results?identity=A: the view actor's compute (d1view)",
+      "measured": {
+        "reads": 191,
+        "writes": 0,
+        "stmts": 6
+      },
+      "ceiling": {
+        "reads": 287,
+        "writes": 0,
+        "stmts": 8
+      },
+      "censusKey": "/results:view"
+    },
+    "results-forward": {
+      "route": "/results?identity=A: the forwarding request (d1)",
+      "measured": {
+        "reads": 0,
+        "writes": 0,
+        "stmts": 0
+      },
+      "ceiling": {
+        "reads": 4,
+        "writes": 0,
+        "stmts": 2
+      },
+      "censusKey": "/results"
+    },
+    "owed-first-read": {
+      "route": "/owed?identity=A: the first read (the compute on read and its write)",
+      "measured": {
+        "reads": 352,
+        "writes": 18,
+        "stmts": 26
+      },
+      "ceiling": {
+        "reads": 528,
+        "writes": 20,
+        "stmts": 28
+      },
+      "censusKey": "/owed"
+    },
+    "owed-served-read": {
+      "route": "/owed?identity=A: a served read",
+      "measured": {
+        "reads": 17,
+        "writes": 0,
+        "stmts": 2
+      },
+      "ceiling": {
+        "reads": 26,
+        "writes": 0,
+        "stmts": 4
+      },
+      "censusKey": null
+    },
+    "submit-admit-1": {
+      "route": "/submit: an operator historical-tx-no-spv submit admitting one tm_collected output",
+      "measured": {
+        "reads": 0,
+        "writes": 13,
+        "stmts": 7
+      },
+      "ceiling": {
+        "reads": 4,
+        "writes": 15,
+        "stmts": 9
+      },
+      "censusKey": "/submit"
+    }
+  },
+  "censusKey": "the d1Budget route a production census holds against this ceiling (advisory there: production rows are not the fixture's); null = the route's maximum is another scenario's"
+}

@@ -5,7 +5,7 @@
 # in parity mode + runs the differential harness + writes PARITY_REPORT.md.
 # Exit is non-zero on any un-noted divergence.
 
-.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ownership \
+.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ownership \
         wrangler-dev harness test e2e-bsv-storage clean help
 
 help:
@@ -20,6 +20,7 @@ help:
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
 	@echo "  ownership        The storage ownership check (bsv-low #474): every SQL statement against storage-ownership.json (part of ci)"
 	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799)"
+	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; :LANE_BASE+9, +10)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
 
@@ -226,7 +227,7 @@ ownership:
 # deleting the bound.
 ROUTE_UP_TRIES ?= 60
 ROUTE_UP_SLEEP ?= 3
-ci-route:
+ci-route: ci-d1-budget
 	@set -e; \
 	B=$${LANE_BASE:-8791}; P1=$$B; P2=$$((B+1)); P3=$$((B+2)); P4=$$((B+3)); P5=$$((B+4)); P6=$$((B+5)); P7=$$((B+6)); P8=$$((B+7)); P9=$$((B+8)); \
 	strict_log=/tmp/lane347-route-strict.log; \
@@ -379,6 +380,93 @@ ci-route:
 	  node tools/lane-script/script_refusal_route_ci.mjs http://127.0.0.1:$$P7; \
 	EXPECT_DOOR=off FIXTURE_PORT=$$P8 \
 	  node tools/lane-script/script_refusal_route_ci.mjs http://127.0.0.1:$$P9
+
+# bsv-low #499: THE D1 BUDGET TIER. A prerequisite of `ci-route` (so part of `ci`), in its own block.
+#
+# Every hot route answers what it cost D1 (`Server-Timing: d1;desc="reads=N writes=M stmts=K"`, the request's
+# rows ledger, `crates/overlay-cloudflare/src/d1_ledger.rs`). Two workers on a FIXTURE D1 (real SQLite under
+# `wrangler dev --local`): the app layer on the seed `crates/low-app-layer/examples/d1_budget_seed.rs` prints
+# (the production schema plus identity A's 8 pots, B's 2 and 300 strangers' noise), loaded by
+# `wrangler d1 execute --local --persist-to`; the overlay on its own fresh state. `tools/lane-499` drives each
+# scenario and reds BY NAME when a figure passes its ceiling (`tools/lane-499/ceilings.json`, the table and the
+# margin in `docs/D1-BUDGETS.md`), then pins the brain's recompute ceiling through the route.
+# `D1_BUDGET_MEASURE=1 make ci-d1-budget` prints the measured table and enforces nothing.
+#
+# Ports: LANE_BASE+9 (app layer) and LANE_BASE+10 (overlay), :8800 and :8801 by default; the same pre-flight,
+# bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network: no
+# fixture pot is spent and no hop filed (no courier), the app layer's service bindings are absent (its tip reads
+# answer 503 and the views serve without a tip), and the overlay's ARCADE_URL is a closed local port.
+ci-d1-budget:
+	@set -e; \
+	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); \
+	app_log=/tmp/lane499-d1-app.log; ov_log=/tmp/lane499-d1-overlay.log; \
+	state=$$(mktemp -d /tmp/lane499-d1-state.XXXXXX); ov_state=$$(mktemp -d /tmp/lane499-d1-ovstate.XXXXXX); \
+	job_pids=""; owned_ports=""; \
+	kill_tree() { \
+	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
+	  kill -TERM "$$1" 2>/dev/null || true; \
+	}; \
+	cleanup() { \
+	  for _p in $$job_pids; do kill_tree "$$_p"; done; \
+	  _n=0; \
+	  while [ $$_n -lt 10 ]; do \
+	    _left=""; \
+	    for _pt in $$owned_ports; do \
+	      _left="$$_left $$(lsof -nP -tiTCP:$$_pt -sTCP:LISTEN 2>/dev/null || true)"; \
+	    done; \
+	    _left=$$(echo $$_left); \
+	    if [ -z "$$_left" ]; then break; fi; \
+	    kill -KILL $$_left 2>/dev/null || true; \
+	    _n=$$((_n+1)); sleep 1; \
+	  done; \
+	  if [ -n "$$_left" ]; then echo "⚠ ci-d1-budget: could not free$$owned_ports (still held by:$$_left)"; fi; \
+	  rm -rf "$$state" "$$ov_state"; \
+	}; \
+	trap 'cleanup; exit 130' INT TERM; \
+	trap cleanup EXIT; \
+	for _pt in $$PA $$PO; do \
+	  _held=$$(lsof -nP -tiTCP:$$_pt -sTCP:LISTEN 2>/dev/null || true); \
+	  if [ -n "$$_held" ]; then \
+	    echo "✗ ci-d1-budget: :$$_pt is ALREADY BOUND before we start, refusing to run (a stale worker would answer)."; \
+	    ps -o pid,ppid,command -p $$_held 2>/dev/null || true; \
+	    exit 1; \
+	  fi; \
+	done; \
+	owned_ports="$$PA $$PO"; \
+	wait_up() { \
+	  _url=$$1; _log=$$2; _label=$$3; _i=0; _t0=$$(date +%s); \
+	  while [ $$_i -lt $(ROUTE_UP_TRIES) ]; do \
+	    if curl -s -m 2 -o /dev/null "$$_url"; then return 0; fi; \
+	    _i=$$((_i+1)); sleep $(ROUTE_UP_SLEEP); \
+	  done; \
+	  echo "✗ ci-d1-budget: the $$_label worker never answered at $$_url after $$(( $$(date +%s) - _t0 ))s; its log:"; \
+	  cat "$$_log" 2>/dev/null || true; \
+	  return 1; \
+	}; \
+	echo "→ ci-d1-budget: the fixture D1 (seed + wrangler d1 execute --local)…"; \
+	cargo run -q $(WORKERS) -p low-app-layer --example d1_budget_seed > "$$state/seed.sql"; \
+	( cd crates/low-app-layer && npx wrangler d1 execute low-overlay-db --local --persist-to "$$state" --file "$$state/seed.sql" ) > /tmp/lane499-d1-seed.log 2>&1 \
+	  || { echo "✗ ci-d1-budget: the seed did not load"; cat /tmp/lane499-d1-seed.log; exit 1; }; \
+	echo "→ starting wrangler dev :$$PA (the app layer on the fixture D1)…"; \
+	( cd crates/low-app-layer && exec npx wrangler dev --local --port $$PA --ip 127.0.0.1 --persist-to "$$state" \
+	    --var AUTH_ENFORCE:false --var SESSION_LANE:false \
+	    --var INTERNAL_TOKEN:ci-internal-tok \
+	) > "$$app_log" 2>&1 & \
+	job_pids="$$job_pids $$!"; \
+	wait_up http://127.0.0.1:$$PA/health "$$app_log" "app layer"; \
+	echo "→ starting wrangler dev :$$PO (the overlay, tm_collected, ARCADE_URL a closed port)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$PO --ip 127.0.0.1 --persist-to "$$ov_state" \
+	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
+	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
+	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
+	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:true \
+	    --var ARCADE_URL:http://127.0.0.1:9 \
+	) > "$$ov_log" 2>&1 & \
+	job_pids="$$job_pids $$!"; \
+	wait_up http://127.0.0.1:$$PO/listTopicManagers "$$ov_log" "overlay"; \
+	node tools/lane-499/d1_budget_route_ci.mjs http://127.0.0.1:$$PA http://127.0.0.1:$$PO; \
+	python3 scripts/d1-census.py --self-test; \
+	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`

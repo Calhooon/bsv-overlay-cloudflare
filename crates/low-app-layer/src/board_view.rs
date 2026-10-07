@@ -36,6 +36,8 @@ pub struct BoardView {
     /// `Rc` so DETACHED compute tasks (spawn_local) can write it after the
     /// request that started them is gone — see `spawn_compute`.
     cache: Rc<RefCell<HashMap<u32, (String, u64)>>>,
+    /// bsv-low #499: the D1 rows ledger of each key's last compute (served as the `d1view` segment).
+    computed: Rc<RefCell<HashMap<u32, crate::d1_ledger::Tally>>>,
     /// limit-keys with a refresh in flight (actor-local single-flight).
     /// Cleared INSIDE the detached task, so an aborted caller can never wedge
     /// a key in "refreshing" forever (the 2026-08-27 layer-9 bug).
@@ -48,6 +50,7 @@ impl DurableObject for BoardView {
             _state: state,
             env,
             cache: Rc::new(RefCell::new(HashMap::new())),
+            computed: Rc::new(RefCell::new(HashMap::new())),
             refreshing: Rc::new(RefCell::new(HashSet::new())),
         }
     }
@@ -134,10 +137,10 @@ impl BoardView {
         // across an await (the actor interleaves at awaits).
         let held = self.cache.borrow().get(&key).cloned();
         match held {
-            Some((body, at)) if now.saturating_sub(at) <= FRESH_MS => body_response(body, false),
+            Some((body, at)) if now.saturating_sub(at) <= FRESH_MS => body_response(body, false, self.last_compute(key)),
             Some((body, _)) => {
                 self.spawn_compute(key, compute);
-                body_response(body, true)
+                body_response(body, true, self.last_compute(key))
             }
             None => {
                 self.spawn_compute(key, compute);
@@ -145,7 +148,7 @@ impl BoardView {
                     Delay::from(std::time::Duration::from_millis(100)).await;
                     let hit = self.cache.borrow().get(&key).cloned();
                     if let Some((body, _)) = hit {
-                        return body_response(body, false);
+                        return body_response(body, false, self.last_compute(key));
                     }
                     // Compute finished without caching (non-200): stop waiting.
                     if !self.refreshing.borrow().contains(&key) {
@@ -174,10 +177,13 @@ impl BoardView {
             return;
         }
         let cache = Rc::clone(&self.cache);
+        let computed = Rc::clone(&self.computed);
         let refreshing = Rc::clone(&self.refreshing);
         let env = self.env.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let out = compute().await;
+            // bsv-low #499: the compute is detached from every request, so it runs under its own D1 ledger
+            let (out, d1) = crate::d1_ledger::scoped(compute()).await;
+            computed.borrow_mut().insert(key, d1);
             if let Ok((200, new_body)) = out {
                 let prev = cache.borrow().get(&key).map(|(b, _)| b.clone());
                 let changed = prev.as_deref() != Some(new_body.as_str());
@@ -210,10 +216,21 @@ async fn push_board_changed(env: &Env) {
     .await
 }
 
-fn body_response(body: String, stale: bool) -> Result<Response> {
+impl BoardView {
+    fn last_compute(&self, key: u32) -> Option<crate::d1_ledger::Tally> {
+        self.computed.borrow().get(&key).copied()
+    }
+}
+
+/// The held copy, with the D1 figures of the compute that produced it (`d1view`; bsv-low #499): a served copy
+/// reads no row, and the route records the compute's figures under its `:view` key.
+fn body_response(body: String, stale: bool, d1: Option<crate::d1_ledger::Tally>) -> Result<Response> {
     let mut resp = crate::routes::json_response_cached(body, 200, 5)?;
     if stale {
         resp.headers_mut().set("X-Board-Stale", "1")?;
+    }
+    if let Some(t) = d1 {
+        resp.headers_mut().set("Server-Timing", &crate::d1_ledger::named_segment("d1view", t))?;
     }
     Ok(resp)
 }
