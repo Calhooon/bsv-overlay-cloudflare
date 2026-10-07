@@ -19,12 +19,13 @@
 //!   a service binding (a plain workers.dev fetch to a same-account worker
 //!   loops back to the caller, so the binding is required).
 //!
-//! STRICTLY READ-ONLY on DATA: this worker never inserts, updates or deletes
-//! a row. It takes no queue and holds no secrets — every route is a public
-//! GET over public chain facts, answered with wildcard CORS so the browser
-//! can call it cross-origin.
+//! NOT read-only on data (bsv-low #474): since M18-2 it files rows (the
+//! filings, the hop sweeps, the owed list, the courier memos). Its write set,
+//! table by table, is in `storage-ownership.json` and
+//! `docs/STORAGE-OWNERSHIP.md`, and `make ci` refuses a statement the
+//! manifest does not grant.
 //!
-//! **One exception, and it is DDL rather than data (bsv-low #283):** the
+//! **The DDL it issues (bsv-low #283):** the
 //! overlay owns the schema and applies `OVERLAY_MIGRATIONS` on ITS cold
 //! start, which is not an ordering this worker can wait for — a cold isolate
 //! here can reach a column the overlay has not added yet and fail every

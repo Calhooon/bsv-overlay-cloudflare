@@ -5,7 +5,7 @@
 # in parity mode + runs the differential harness + writes PARITY_REPORT.md.
 # Exit is non-zero on any un-noted divergence.
 
-.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget \
+.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ownership \
         wrangler-dev harness test e2e-bsv-storage clean help
 
 help:
@@ -18,6 +18,7 @@ help:
 	@echo "  harness          Run parity-harness once (assumes services are up)"
 	@echo "  test             cargo test of BOTH workspaces (root: engine crates + harness; workers/: the LOW workers)"
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
+	@echo "  ownership        The storage ownership check (bsv-low #474): every SQL statement against storage-ownership.json (part of ci)"
 	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799)"
 	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; :LANE_BASE+9, +10)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
@@ -115,6 +116,8 @@ ci:
 	@set -e; \
 	bash scripts/check-config-ids.sh --self-test; \
 	bash scripts/check-config-ids.sh; \
+	python3 scripts/check-storage-ownership.py --self-test; \
+	python3 scripts/check-storage-ownership.py; \
 	cargo test --workspace --features bsv-overlay-engine/memory-storage --no-fail-fast; \
 	cargo test $(WORKERS) --workspace --no-fail-fast; \
 	cargo clippy --workspace --all-targets --features bsv-overlay-engine/memory-storage -- -D warnings; \
@@ -125,6 +128,13 @@ ci:
 	$(MAKE) ci-deploy; \
 	$(MAKE) ci-route; \
 	echo "✅ local CI green"
+
+# bsv-low #474: the shared D1's ownership manifest. Every SQL statement of the
+# overlay, discovery and app-layer crates against storage-ownership.json (prose:
+# docs/STORAGE-OWNERSHIP.md). Python 3 stdlib only. Part of `ci`.
+ownership:
+	@python3 scripts/check-storage-ownership.py --self-test
+	@python3 scripts/check-storage-ownership.py
 
 # ROUTE-LEVEL coverage for the #347 submit gate AND `/arc-ingest` bearer-auth
 # (Rule 22). PART OF `ci`.

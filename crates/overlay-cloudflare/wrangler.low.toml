@@ -169,8 +169,15 @@ crons = ["*/15 * * * *"]
 # SHIP/SLAP are deliberately NOT suffixed (see src/lib.rs) — peer discovery
 # is a global namespace and the engine hardcodes those four names.
 #
-# WIPING BETA (the point of all this) — never against the prod database id:
-#   npx wrangler d1 execute low-overlay-db-beta --remote --command "DELETE FROM …"
+# WIPING BETA (the point of all this), never against the prod database id:
+# read docs/STORAGE-OWNERSHIP.md first. A wipe moves LOW's era cutoff
+# (WRITTEN_OFF_BEFORE_MS / _HEIGHT, bsv-low #470 option A); it NEVER deletes
+# from a never-wipe table: pot_records, potparty_records, potrefund_records,
+# hopsweep_records, hopparty_records, result_markers_v2, collected_markers_v2,
+# proof_posts, collected_markers, banned_hosts, pot_evictions and the 11
+# *_evicted twins (storage-ownership.json, never_wipe). A DELETE by hand
+# touches only a table that page marks "no", after a `wrangler d1 export`:
+#   npx wrangler d1 execute low-overlay-db-beta --remote --command "DELETE FROM <a table marked no> ..."
 # ══════════════════════════════════════════════════════════════════════════
 
 # Workers Logs (2026-09-03): persistent, queryable invocation logs for the fleet.
