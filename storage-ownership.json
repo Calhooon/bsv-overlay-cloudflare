@@ -1186,6 +1186,12 @@
     "store": "AuthSessionStore DO + AUTH_SESSIONS KV",
     "owner": "low-app-layer",
     "holds": "BRC-103 sessions and origin lanes"
+   },
+   {
+    "store": "IDENTITY_KILL KV, keys `identity-kill:<imageHash>`",
+    "owner": "low-app-layer",
+    "holds": "the operator's picture kill list: one key per killed hash, value {reason, killedAtMs}; written only by POST /internal/identity/kill (bearer INTERNAL_TOKEN), read by the identity views",
+    "never_wipe": true
    }
   ],
   "low-watchtower": [

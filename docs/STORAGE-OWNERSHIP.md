@@ -151,6 +151,7 @@ No cross-worker access exists today: each store below is read and written only b
 |---|---|---|
 | `BoardView` DO | low-app-layer | an in-memory cache of the board and the results bodies (no `state.storage` call) |
 | `AuthSessionStore` DO + `AUTH_SESSIONS` KV | low-app-layer | BRC-103 sessions and the origin lanes |
+| `IDENTITY_KILL` KV, keys `identity-kill:<imageHash>` (bsv-low #532) | low-app-layer | the operator's picture kill list, `{reason, killedAtMs}` per killed hash; written only by `POST /internal/identity/kill` (bearer `INTERNAL_TOKEN`), read by the identity views. **Never-wipe**: a wipe re-exposes every face the operator removed |
 
 ### The tower (bsv-low `workers/low-watchtower`)
 
