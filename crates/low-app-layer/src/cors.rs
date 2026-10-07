@@ -25,7 +25,7 @@ pub fn is_preflight(req: &Request) -> bool {
 }
 
 /// The `x-bsv-auth-*` header list, straight from the middleware's constants.
-fn auth_header_list() -> String {
+pub(crate) fn auth_header_list() -> String {
     [
         auth_headers::VERSION,
         auth_headers::IDENTITY_KEY,
@@ -45,7 +45,7 @@ fn auth_header_list() -> String {
 /// of the real status).
 /// bsv-low #441: the session lane's headers (the middleware's constants, never
 /// literals): allowed on a request, the seal exposed on the answer.
-fn lane_header_lists() -> (String, String) {
+pub(crate) fn lane_header_lists() -> (String, String) {
     use bsv_middleware_cloudflare::session_lane as lane;
     (
         [

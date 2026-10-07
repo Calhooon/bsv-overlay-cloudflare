@@ -112,6 +112,10 @@
 //! - `GET /beef/:txid` — the admitted BEEF bytes from `transactions`.
 //! - `GET /tip` — present chain height via the CHAINTRACKS service binding.
 //! - `GET /health` — liveness.
+//! - `GET /identities?ik=`, `GET /identity/:ik`, `GET /identity/verify/:ik`,
+//!   `GET /identity/pic/:imageHash`, `POST /internal/identity/kill`: the
+//!   identity views (bsv-low #532), a proxy to LOW's identity resolver through
+//!   the `IDENTITY` binding; see the `identity` module.
 //!
 //! NO CACHING (owner call, 2026-07-14): the Cache API misbehaves on
 //! workers.dev (intermittent CF 1042s observed on the first deploy), and the
@@ -132,6 +136,8 @@ pub mod courier;
 pub mod cors;
 pub mod credit_beef;
 pub mod hops_view;
+/// bsv-low #532: the identity views (names and pictures), a proxy to LOW's identity resolver.
+pub mod identity;
 pub mod internal_events;
 pub mod lane_attest;
 pub mod live_view;
@@ -171,7 +177,12 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // Readable wasm panics in `wrangler tail` (set_once → cheap on re-entry).
     console_error_panic_hook::set_once();
 
+    // bsv-low #532: the identity views answer CORS to the app origins only; decided before the request moves.
+    let identity_cors = identity::IdentityCors::for_request(&req, &env);
     if cors::is_preflight(&req) {
+        if let Some(c) = &identity_cors {
+            return c.preflight();
+        }
         return cors::preflight();
     }
 
@@ -209,6 +220,14 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         return armed_pots::armed_pots(req, &env).await;
     }
 
+    // bsv-low #532: the picture bytes (the front door's JSON signing would destroy them; an `<img>` sends no
+    // auth) and the operator's kill list (bearer INTERNAL_TOKEN) are served before the front door.
+    if identity::is_front_door_exempt(&req.method(), &req.path()) {
+        let mut resp = identity::serve_exempt(req, &env).await?;
+        stamp_cors(&mut resp, &identity_cors);
+        return Ok(resp);
+    }
+
     // BRC-103/104 front door: handshake replies / strict-mode refusals /
     // middleware refusals return here; otherwise the request proceeds with
     // the resolved [`auth::AuthState`] as the router data (in-process only —
@@ -216,7 +235,7 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let (req, mut state) = match auth::front_door(req, &env).await? {
         auth::FrontDoor::Proceed(req, state) => (req, state),
         auth::FrontDoor::Reply(mut resp) => {
-            cors::add_cors_headers(&mut resp);
+            stamp_cors(&mut resp, &identity_cors);
             return Ok(resp);
         }
     };
@@ -251,7 +270,7 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         });
         resp = bsv_middleware_cloudflare::seal_lane_response_text(text, status, &lane)
             .map_err(|e| worker::Error::from(e.to_string()))?;
-        cors::add_cors_headers(&mut resp);
+        stamp_cors(&mut resp, &identity_cors);
         return Ok(resp);
     }
     if let Some(session) = session {
@@ -273,8 +292,16 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         resp.headers_mut().set("Content-Type", "application/json")?;
         resp.headers_mut().set("Cache-Control", "no-store")?;
     }
-    cors::add_cors_headers(&mut resp);
+    stamp_cors(&mut resp, &identity_cors);
     Ok(resp)
+}
+
+/// The wildcard CORS of every route, or the identity views' app-origin set (bsv-low #532).
+fn stamp_cors(resp: &mut Response, identity_cors: &Option<identity::IdentityCors>) {
+    match identity_cors {
+        Some(c) => c.apply(resp),
+        None => cors::add_cors_headers(resp),
+    }
 }
 
 /// The route table. All GET, all JSON; unknown paths get a JSON 404 via the
@@ -329,6 +356,10 @@ fn router(
         // browser never calls a courier (the same-origin WoC proxy is gone).
         .get_async("/rate", routes::rate)
         .get_async("/tip", routes::tip)
+        // bsv-low #532: the identity views (`identity`); `/identity/*rest` is `:ik` or `verify/:ik` (the picture
+        // route is served before the front door).
+        .get_async(identity::BATCH_ROUTE, identity::get_batch)
+        .get_async("/identity/*rest", identity::get_identity)
         .get("/epoch", routes::epoch)
         .get("/health", routes::health)
         .or_else_any_method("/", routes::not_found)

@@ -38,7 +38,8 @@ worker = { version = "0.8", features = ["d1"] }
 # note in bsv-low's decision log).
 bsv-middleware-cloudflare = "0.3"
 serde.workspace = true
-serde_json.workspace = true
+# bsv-low #532: `raw_value` so the identity views pass the resolver's JSON through byte for byte.
+serde_json = { workspace = true, features = ["raw_value"] }
 hex.workspace = true
 # bsv-low P1.1 proof-in-DB (2026-09-02): the posted bundle travels base64 (same crate/version as the overlay).
 base64 = "0.22"

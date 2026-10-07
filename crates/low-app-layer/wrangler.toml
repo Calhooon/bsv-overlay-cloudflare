@@ -61,6 +61,10 @@ OVERLAY_URL = "https://low-overlay.dev-a3e.workers.dev"
 # bsv-low #451 slice B: the Arcade endpoint `/tx-any` asks FIRST for a tx the index holds without a verified bump
 # (our broadcaster's live word is the network witness; the couriers only when it does not know). Not a secret.
 ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
+# bsv-low #532: the path the IDENTITY binding (LOW's identity resolver) sees for the identity views, and the app
+# origins those views answer CORS to (comma separated, exact; unset = none). Not secrets.
+IDENTITY_URL = "https://low-identity-resolver.dev-a3e.workers.dev"
+IDENTITY_APP_ORIGINS = "https://bsvarcade.com,https://www.bsvarcade.com,https://low-pot.pages.dev"
 
 # Storage epoch (bsv-low THE ORDER item 2, owner-ruled 2026-08-06): served
 # verbatim by `GET /epoch` as {"storageEpoch": "<value>"}. BUMPING THIS VALUE
@@ -149,6 +153,17 @@ service = "low-relay"
 [[services]]
 binding = "OVERLAY"
 service = "low-overlay"
+# bsv-low #532: LOW's identity resolver (same account) for the identity views (`src/identity.rs`): names,
+# pictures and their SMT proofs. Same 1042 rule as RELAY. `service` is a worker name, not a secret.
+[[services]]
+binding = "IDENTITY"
+service = "low-identity-resolver"
+
+# bsv-low #532: the identity views' kill list (one key per killed picture hash, written only by
+# `POST /internal/identity/kill`). id is a placeholder, injected at deploy time like AUTH_SESSIONS'.
+[[kv_namespaces]]
+binding = "IDENTITY_KILL"
+id = "__LOW_APPLAYER_DEFAULT_KV_IDENTITY_KILL_ID__"  # low-app-layer-IDENTITY_KILL
 
 # ══════════════════════════════════════════════════════════════════════════
 # beta — the ISOLATED pre-release stack (bsv-low, 2026-08-12)
@@ -201,6 +216,10 @@ name = "low-app-layer-beta"
 RELAY_URL = "https://low-relay-beta.dev-a3e.workers.dev"
 OVERLAY_URL = "https://low-overlay-beta.dev-a3e.workers.dev"
 ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
+# bsv-low #532 (see the prod vars): beta's resolver, and beta's app origins (the beta site, the fleet's harness
+# deployment, a local dev server).
+IDENTITY_URL = "https://low-identity-resolver-beta.dev-a3e.workers.dev"
+IDENTITY_APP_ORIGINS = "https://low-beta.pages.dev,https://low-harness.pages.dev,http://localhost:5173"
 # bsv-low #441 C6 (2026-09-14): STRICT on beta — the client's identity reads are
 # handshake-first (a cold read waits for its warmup, bounded) so an honest read is
 # never anonymous; prod stays lenient until the promotion.
@@ -257,6 +276,14 @@ service = "low-relay-beta"
 [[env.beta.services]]
 binding = "OVERLAY"
 service = "low-overlay-beta"
+# The BETA identity resolver and beta's own kill list (see the prod IDENTITY / IDENTITY_KILL blocks).
+[[env.beta.services]]
+binding = "IDENTITY"
+service = "low-identity-resolver-beta"
+
+[[env.beta.kv_namespaces]]
+binding = "IDENTITY_KILL"
+id = "__LOW_APPLAYER_BETA_KV_IDENTITY_KILL_ID__"  # low-app-layer-beta-IDENTITY_KILL
 
 [env.beta.durable_objects]
 bindings = [

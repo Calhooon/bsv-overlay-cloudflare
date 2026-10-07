@@ -6867,6 +6867,8 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     body["couriers"] = crate::courier::health_json();
     // bsv-low #497: the exchange rate's sample, its age and every rung's counts (this isolate's).
     body["rate"] = crate::rate::health_json(worker::Date::now().as_millis() as f64);
+    // bsv-low #532: the identity views' outcomes per route and the budget (this isolate's).
+    body["identity"] = crate::identity::health_json();
     // #375 (review MED-2's surface half): the ACTIVE era cutoff — post the
     // future-cutoff belt, i.e. exactly what the views are filtering by and
     // what /epoch serves. `null` = write-off inert. One glance answers
