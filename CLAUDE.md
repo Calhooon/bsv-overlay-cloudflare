@@ -424,8 +424,11 @@ relay's stores, owners only). `make ci` runs
 `scripts/check-storage-ownership.py`: a statement the manifest does not
 grant, a table it does not list (a migration adding a table must add its
 row in the JSON and on the page), or an unpinned string-built table name is
-red with the file, the line and the table. Its parser limits are in the
-script's header and pinned by its `--self-test`.
+red with the file, the line and the table. A never-wipe table is enforced for
+every crate, its owner included (the lens fold of 2026-10-07): no DROP,
+TRUNCATE, destructive ALTER or DELETE with no WHERE, and a DELETE with a
+WHERE only under the row's `delete_scope` (crate, file, statement). Its
+parser limits are in the script's header and pinned by its `--self-test`.
 
 ## Testing
 

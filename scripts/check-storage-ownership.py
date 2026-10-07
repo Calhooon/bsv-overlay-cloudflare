@@ -7,10 +7,16 @@ of the scanned crates (production code only: `tests/`, `examples/`, `benches/` a
 skipped), finds the SQL in it, and refuses:
 
   * a WRITE (INSERT / UPDATE / DELETE / REPLACE / CREATE / ALTER / DROP) to a table the crate holds no grant for;
-  * a READ (FROM / JOIN) of a table the crate is not granted (a writer may read what it writes);
+  * a READ (FROM / JOIN) of a table the crate is not granted (an INSERT / UPDATE / DELETE / REPLACE grant implies a
+    read; a DDL grant does not);
+  * on a NEVER-WIPE table, for every crate (the owner, the schema owner and an in-place allow included): a DROP, a
+    TRUNCATE, an ALTER that drops a column or renames, a DELETE with no WHERE; and a DELETE with a WHERE that the
+    table's `delete_scope` does not grant by crate, file and statement (a scope nothing uses is stale, a red);
   * a table the manifest does not list (so a migration that adds a table must add a row);
   * a dynamic table name (`FROM {table}`, `INSERT INTO "{}"`, a keyword ending its literal) not pinned in the
-    manifest's `dynamic_sites` with its count, and a pin whose count no longer matches;
+    manifest's `dynamic_sites`: each site is pinned by its statement (the literal, whitespace collapsed, at most 120
+    characters), so a new site, a changed one or one gone is a red at its file:line;
+  * a CTE named like a manifest table;
   * a manifest row of the shared D1 that nothing creates, and a non-owner grant nothing exercises (stale);
   * a manifest table with no row in docs/STORAGE-OWNERSHIP.md.
 
@@ -19,15 +25,24 @@ line, or on the line above it: `// storage-ok(<table>): <reason>` (the reason is
 
 LIMITS (each pinned by --self-test, so a change in what the parser sees is a red here, not a surprise):
   1. String-built SQL: only SQL inside a string literal is seen. A table name that is not in the same literal as its
-     keyword is a DYNAMIC site (pinned by count, its tables listed by hand), never resolved through a const or arg.
+     keyword is a DYNAMIC site (pinned by statement, its tables listed by hand), never resolved through a const or
+     arg. A pin names the site's text, not the table a caller passes: a new caller of a pinned helper, reaching
+     another table through the same statement, stays green; the pin's `tables` are read by hand.
   2. Reads are seen by the UPPERCASE keywords FROM and JOIN only (English text in messages would flood a
-     case-blind match); writes are matched case-blind but need their full shape (`INSERT INTO t`, `UPDATE t SET`).
+     case-blind match); writes are matched case-blind but need their full shape (`INSERT INTO t`, `DELETE FROM t`,
+     `UPDATE t SET`, `UPDATE t AS x SET`, `UPDATE t x SET`). An UPDATE is also seen when its literal ends at `UPDATE`
+     (a dynamic site) or, UPPERCASE, at `UPDATE t` (resolved: `concat!("UPDATE t ", "SET ...")`) or `UPDATE {t}`
+     (dynamic); a lowercase `update t` split from its SET, or an UPDATE split anywhere else, is unseen.
   3. A comma join is followed (`FROM a x, b y`); a table named only inside a subquery's own FROM is seen as usual.
-     CTE names (`name AS (`) defined anywhere in the same file are not tables.
+     A CTE name (`name AS (`) defined anywhere in the same file is not a table for a READ (a `{cte}` is spliced
+     across literals); it never hides a write, and a CTE named like a manifest table is a red.
   4. Only `.rs` and `.sql` files under the scanned crates' trees are read; SQL a worker receives at run time
      (none today) is out of reach.
   5. `#[cfg(test)]` is recognised on an item whose body is a brace block or ends at `;`; a test helper outside
      such an item (a `pub fn` used only by tests) is scanned as production code.
+  6. Never-wipe: a DELETE's WHERE is looked for in its own literal only (a WHERE in another literal reads as none,
+     a red); what the WHERE selects is not judged, the `delete_scope` grant is the reviewed word for it. SQL an
+     operator runs by hand (`wrangler d1 execute`) is out of reach: docs/STORAGE-OWNERSHIP.md is the rule there.
 
   python3 scripts/check-storage-ownership.py              check the tree; exit 1 on any red
   python3 scripts/check-storage-ownership.py --self-test  fixtures only; run by `make ci`
@@ -42,22 +57,29 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MANIFEST = "storage-ownership.json"
 DOC = os.path.join("docs", "STORAGE-OWNERSHIP.md")
-WRITE_OPS = ("INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER", "DROP")
+WRITE_OPS = ("INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER", "DROP", "TRUNCATE")
+# A statement that empties or removes a whole table (an unconditional DELETE is judged with these).
+WIPE_OPS = ("DROP", "TRUNCATE")
 SKIP_DIRS = {"tests", "examples", "benches", "target", "node_modules", ".wrangler"}
+STMT_MAX = 120
 IDENT = r'[ \t\n"`\[]*([A-Za-z_][A-Za-z0-9_]*)?'
 
 # (op, regex). The table token follows the match; a missing identifier there is a dynamic site.
 PATTERNS = [
     ("INSERT", re.compile(r"\bINSERT(?:\s+OR\s+[A-Za-z]+)?\s+INTO\b", re.I)),
     ("REPLACE", re.compile(r"(?<!OR )\bREPLACE\s+INTO\b", re.I)),
-    ("UPDATE", re.compile(r"\bUPDATE(?:\s+OR\s+[A-Za-z]+)?(?=\s+[\"`\[]?[A-Za-z_{][^\s]*\s+SET\b)", re.I)),
     ("DELETE", re.compile(r"\bDELETE\s+FROM\b", re.I)),
     ("CREATE", re.compile(r"\bCREATE\s+(?:VIRTUAL\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?\b", re.I)),
     ("CREATE", re.compile(r"\bCREATE\s+(?:UNIQUE\s+)?INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+[A-Za-z_][A-Za-z0-9_]*\s+ON\b", re.I)),
     ("ALTER", re.compile(r"\bALTER\s+TABLE\b", re.I)),
     ("DROP", re.compile(r"\bDROP\s+(?:TABLE|INDEX)(?:\s+IF\s+EXISTS)?\b", re.I)),
+    ("TRUNCATE", re.compile(r"\bTRUNCATE\s+TABLE\b", re.I)),
     ("SELECT", re.compile(r"\b(?:FROM|JOIN)\b")),
 ]
+# UPDATE (bsv-low #474 lens M2): any `UPDATE [OR x]` not an upsert's `DO UPDATE`; its shape is judged in hits_in.
+UPDATE = re.compile(r"(?<![A-Za-z0-9_])(?<!DO\s)UPDATE(?:\s+OR\s+[A-Za-z]+)?(?![A-Za-z0-9_])", re.I)
+# `t SET`, `t AS x SET`, `t x SET`: the full shape of an UPDATE (the alias is SQLite's).
+UPDATE_SHAPE = re.compile(r'[ \t\n"`\[]*(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]*\})[ \t\n"`\]]*(?:\s+(?:AS\s+)?(?!SET\b)[A-Za-z_][A-Za-z0-9_]*)?\s+SET\b', re.I)
 ALLOW = re.compile(r"//\s*storage-ok\(([A-Za-z0-9_]+)\):\s*\S")
 CTE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+(?:NOT\s+)?(?:MATERIALIZED\s+)?\(", re.I)
 # SQLite's own names and table-valued functions a FROM may name.
@@ -185,7 +207,9 @@ def line_starts(src):
 # ---------------------------------------------------------------- extraction
 
 def hits_in(text):
-    """(offset, op, table or None, token) for every SQL reference in one literal; None is a dynamic site."""
+    """(offset, op, table or None, token, wipe) for every SQL reference in one literal; None is a dynamic site.
+    `wipe` marks a statement that empties or removes the table: DROP, TRUNCATE, an ALTER that drops or renames,
+    a DELETE with no WHERE in the same literal (a WHERE in another literal is not seen, so it counts as none)."""
     out = []
     for op, rx in PATTERNS:
         for m in rx.finditer(text):
@@ -199,24 +223,46 @@ def hits_in(text):
                     continue  # the FROM of a DELETE, a write seen above
                 if name is None:
                     if rest.strip() == "" or rest.lstrip(' \t\n"`[').startswith("{"):
-                        out.append((m.start(), op, None, token))
+                        out.append((m.start(), op, None, token, False))
                     continue  # a subquery `FROM (`, or prose
                 if after.startswith("("):
                     continue  # a table-valued function
-                out.append((m.start(), op, name, token))
+                out.append((m.start(), op, name, token, False))
                 # a comma join: `FROM a x, b y`
                 tail = after
                 while True:
                     c = re.match(r"(?:\s+(?:AS\s+)?(?!WHERE\b|ON\b|JOIN\b|LEFT\b|INNER\b|CROSS\b|GROUP\b|ORDER\b|LIMIT\b|UNION\b)[A-Za-z_][A-Za-z0-9_]*)?\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\()", tail)
                     if not c:
                         break
-                    out.append((m.start(), op, c.group(1), token))
+                    out.append((m.start(), op, c.group(1), token, False))
                     tail = tail[c.end():]
                 continue
+            stmt = rest.split(";")[0]
+            wipe = op in WIPE_OPS
+            if op == "DELETE":
+                wipe = not re.search(r"\bWHERE\b", stmt, re.I)
+            elif op == "ALTER":
+                wipe = bool(re.search(r"\bDROP\s+COLUMN\b|\bRENAME\b", stmt, re.I))
             if name is None or after.startswith("{"):
-                out.append((m.start(), op, None, token))
+                out.append((m.start(), op, None, token, wipe))
             else:
-                out.append((m.start(), op, name, token))
+                out.append((m.start(), op, name, token, wipe))
+    # UPDATE (lens M2): the full shape `UPDATE t [AS x | x] SET` in one literal, case-blind, is resolved; so is an
+    # UPPERCASE `UPDATE t` that ends its literal (`concat!("UPDATE t ", "SET ...")`). A literal ending in
+    # `UPDATE` (`"UPDATE " + t`), or an UPPERCASE `UPDATE {t}`, is a dynamic site. Anything else is prose.
+    for m in UPDATE.finditer(text):
+        rest = text[m.end():]
+        t = re.match(IDENT, rest)
+        name = t.group(1) if t else None
+        after = rest[t.end():] if t else rest
+        token = rest.strip()[:24].split("\n")[0]
+        upper = text[m.start():m.start() + 6] == "UPDATE"
+        if UPDATE_SHAPE.match(rest):
+            out.append((m.start(), "UPDATE", None if (name is None or after.startswith("{")) else name, token, False))
+        elif rest.strip() == "" or (upper and name is None and rest.lstrip(' \t\n"`[').startswith("{")):
+            out.append((m.start(), "UPDATE", None, token, False))
+        elif upper and name is not None and after.strip(' \t\n"`]') == "":
+            out.append((m.start(), "UPDATE", name, token, False))
     return out
 
 
@@ -243,10 +289,18 @@ def scan_file(path, rel=None):
         spans = test_spans(code)
     starts = line_starts(src)
     src_lines = src.split("\n")
-    ctes = set()
-    for _, text in lits:
-        ctes.update(m.group(1) for m in CTE.finditer(text))
-    out = []
+    # A CTE name defined anywhere in the file (a `{cte}` is spliced across literals) hides a READ only: a write
+    # never targets a CTE. A CTE named like a manifest table is a red in judge (lens L1), so it hides nothing.
+    ctes, out = {}, []
+    for lit_line, text in lits:
+        off = starts[lit_line - 1] if lit_line - 1 < len(starts) else 0
+        if any(a <= off < b for a, b in spans):
+            continue
+        for m in CTE.finditer(text):
+            ctes.setdefault(m.group(1), lit_line + text.count("\n", 0, m.start()))
+    for name, ln in sorted(ctes.items()):
+        out.append({"file": rel, "line": ln, "op": "CTE", "table": name, "token": name, "wipe": False,
+                    "stmt": "", "allow": False})
     for lit_line, text in lits:
         off = starts[lit_line - 1] if lit_line - 1 < len(starts) else 0
         if any(a <= off < b for a, b in spans):
@@ -255,11 +309,14 @@ def scan_file(path, rel=None):
         for ln in (lit_line - 1, lit_line):
             if 1 <= ln <= len(src_lines):
                 allows.update(m.group(1) for m in ALLOW.finditer(src_lines[ln - 1]))
-        for pos, op, table, token in hits_in(text):
-            if table is not None and (table in ctes or table in BUILTIN):
+        # the statement that names a site in a pin or a delete_scope: the literal, whitespace collapsed, a cooked
+        # escaped quote put back against its name, at most STMT_MAX characters
+        stmt = re.sub(r' "(?=[\s,)]|$)', '"', " ".join(text.split()))[:STMT_MAX]
+        for pos, op, table, token, wipe in hits_in(text):
+            if table is not None and ((op == "SELECT" and table in ctes) or table in BUILTIN):
                 continue
-            out.append({"file": rel, "line": lit_line + text.count("\n", 0, pos), "op": op,
-                        "table": table, "token": token, "allow": table in allows if table else False})
+            out.append({"file": rel, "line": lit_line + text.count("\n", 0, pos), "op": op, "table": table,
+                        "token": token, "wipe": wipe, "stmt": stmt, "allow": table in allows if table else False})
     return out
 
 
@@ -268,10 +325,11 @@ def scan_file(path, rel=None):
 def judge(man, hits_by_crate):
     reds, notes = [], []
     tables = {t["name"]: t for t in man["tables"]}
-    not_tables = set(man.get("not_tables", {}))
+    not_tables = man.get("not_tables", {})
     exercised = set()  # (crate, table, kind)
     created = set()
-    dyn_count = {}
+    dyn_sites = {}  # (file, op) -> [hit]
+    scopes_used = set()  # (table, crate, file, statement)
 
     def granted(crate, table, op):
         t = tables[table]
@@ -280,20 +338,46 @@ def judge(man, hits_by_crate):
         if crate == man.get("schema_owner") and op in ("CREATE", "ALTER", "DROP") and t["database"] == man["shared_database"]:
             return True  # the migrations own the schema of every shared table
         g = t.get("writers", {}).get(crate, [])
-        if op == "SELECT":
-            return crate in t.get("readers", []) or bool(g)
+        if op == "SELECT":  # a DML grant implies a read; a DDL grant does not (lens N1)
+            return crate in t.get("readers", []) or any(o in g for o in ("INSERT", "UPDATE", "DELETE", "REPLACE"))
         return op in g
+
+    def never_wipe(crate, name, op, wipe, stmt, file, where):
+        """The never-wipe rule (lens M1), for every crate, the owner and the schema owner included: no DROP,
+        TRUNCATE, destructive ALTER or unconditional DELETE; a DELETE with a WHERE only under a `delete_scope`
+        grant of the table's row naming this crate, file and statement."""
+        t = tables[name]
+        if not t.get("never_wipe") is True:
+            return
+        if wipe:
+            what = "DELETE with no WHERE" if op == "DELETE" else op
+            reds.append(f"{where}: crate `{crate}` issues a {what} on `{name}`, a NEVER-WIPE table: no crate may (docs/STORAGE-OWNERSHIP.md)")
+            return
+        if op != "DELETE":
+            return
+        for g in t.get("delete_scope", []):
+            if g["crate"] == crate and g["file"] == file and g["statement"] == stmt:
+                scopes_used.add((name, crate, file, stmt))
+                return
+        reds.append(f"{where}: crate `{crate}` deletes from `{name}`, a NEVER-WIPE table, and its row grants no "
+                    f"delete_scope for this statement: `{stmt[:96]}`")
 
     for crate, hits in hits_by_crate.items():
         for h in hits:
             where = f'{h["file"]}:{h["line"]}'
-            if h["table"] is None:
-                key = (h["file"], h["op"])
-                dyn_count[key] = dyn_count.get(key, 0) + 1
-                continue
             name = h["table"]
-            if name in not_tables:
+            if h["op"] == "CTE":
+                if name in tables:
+                    reds.append(f"{where}: a CTE named `{name}`, a manifest table, would hide that table's reads in this file: rename it")
                 continue
+            if name is None:
+                dyn_sites.setdefault((h["file"], h["op"]), []).append(h)
+                continue
+            nt = not_tables.get(name)
+            if nt and nt["crate"] == crate and h["op"] in nt["ops"]:
+                continue  # prose, scoped to its crate and op (lens L2)
+            if name in tables:
+                never_wipe(crate, name, h["op"], h["wipe"], h["stmt"], h["file"], where)
             if h["allow"]:
                 notes.append(f"allowed in place: {where} {h['op']} {name}")
                 continue
@@ -308,16 +392,28 @@ def judge(man, hits_by_crate):
                 reds.append(f"{where}: crate `{crate}` {what} table `{name}`, owned by `{tables[name]['owner']}`, and the manifest grants it no such access")
             exercised.add((crate, name, kind))
 
-    # dynamic sites: pinned by (file, op) count, their tables granted like any statement
+    # dynamic sites: pinned by (file, op), each SITE named by its statement (lens L3), the tables granted by hand
     pins = {(d["file"], d["op"]): d for d in man.get("dynamic_sites", [])}
-    for key, n in sorted(dyn_count.items()):
+    for key, hs in sorted(dyn_sites.items()):
         d = pins.get(key)
         if d is None:
-            reds.append(f"{key[0]}: {n} dynamic-table {key[1]} site(s) not pinned in {MANIFEST} dynamic_sites (name the tables it reaches)")
-        elif d["count"] != n:
-            reds.append(f"{key[0]}: {n} dynamic-table {key[1]} site(s), pinned {d['count']}: re-read the sites and re-pin")
+            for h in hs:
+                reds.append(f"{h['file']}:{h['line']}: dynamic-table {key[1]} site not pinned in {MANIFEST} dynamic_sites "
+                            f"(name the tables it reaches): `{h['stmt'][:96]}`")
+            continue
+        pinned = list(d["statements"])
+        if d["count"] != len(pinned):
+            reds.append(f"{key[0]}: dynamic_sites {key[1]} pins count {d['count']} and {len(pinned)} statements: make them agree")
+        for h in hs:
+            if h["stmt"] in pinned:
+                pinned.remove(h["stmt"])
+            else:
+                reds.append(f"{h['file']}:{h['line']}: dynamic-table {key[1]} site not among its pinned statements: "
+                            f"re-read it and re-pin: `{h['stmt'][:96]}`")
+        for st in pinned:
+            reds.append(f"{key[0]}: dynamic_sites pins a {key[1]} site the file no longer has: drop it: `{st[:96]}`")
     for key, d in pins.items():
-        if key not in dyn_count:
+        if key not in dyn_sites:
             reds.append(f"{key[0]}: dynamic_sites pins {d['count']} {key[1]} site(s) and the file has none: drop the stale pin")
             continue
         for name in d["tables"]:
@@ -329,11 +425,31 @@ def judge(man, hits_by_crate):
             if not granted(d["crate"], name, key[1]):
                 reds.append(f"{key[0]}: dynamic {key[1]} by `{d['crate']}` reaches `{name}`, owned by `{tables[name]['owner']}`, with no grant")
             exercised.add((d["crate"], name, "read" if key[1] == "SELECT" else key[1]))
+            if tables[name].get("never_wipe") is True:
+                hs = dyn_sites[key]
+                wiping = [h for h in hs if h["wipe"]]
+                for h in wiping:
+                    never_wipe(d["crate"], name, key[1], True, h["stmt"], h["file"], f"{h['file']}:{h['line']}")
+                if key[1] == "DELETE" and not wiping:
+                    stmts = {h["stmt"] for h in hs}
+                    ok = [g for g in tables[name].get("delete_scope", [])
+                          if g["crate"] == d["crate"] and g["file"] == key[0] and g["statement"] in stmts]
+                    if not ok:
+                        reds.append(f"{key[0]}: dynamic DELETE by `{d['crate']}` reaches `{name}`, a NEVER-WIPE table, "
+                                    f"and its row grants no delete_scope for any of the file's DELETE sites")
+                    for g in ok:
+                        scopes_used.add((name, g["crate"], g["file"], g["statement"]))
 
     scanned = set(hits_by_crate)
     for name, t in tables.items():
         if t["database"] == man["shared_database"] and name not in created:
             reds.append(f"{MANIFEST}: table `{name}` is listed and nothing in the scanned crates creates it: a stale row")
+        if t.get("delete_scope") and t.get("never_wipe") is not True:
+            reds.append(f"{MANIFEST}: `{name}` carries a delete_scope and is not never-wipe: drop the scope")
+        for g in t.get("delete_scope", []):
+            if g["crate"] in scanned and (name, g["crate"], g["file"], g["statement"]) not in scopes_used:
+                reds.append(f"{MANIFEST}: `{name}` grants `{g['crate']}` a delete_scope in {g['file']} no statement uses: "
+                            f"a stale scope: `{g['statement'][:96]}`")
         for crate, ops in t.get("writers", {}).items():
             if crate == t["owner"] or crate not in scanned:
                 continue
@@ -440,12 +556,18 @@ def self_test():
     reds, _, _ = tree(dyn)
     check("an unpinned dynamic table name is red", sum("not pinned" in r for r in reds) == 2)
     pin = lambda m: m["dynamic_sites"].extend([
-        {"file": "guest/src/lib.rs", "op": "DELETE", "count": 1, "crate": "guest", "tables": ["owned"], "why": "fixture"},
-        {"file": "guest/src/lib.rs", "op": "SELECT", "count": 1, "crate": "guest", "tables": ["owned"], "why": "fixture"}])
+        {"file": "guest/src/lib.rs", "op": "DELETE", "count": 1, "statements": ["DELETE FROM {t} WHERE k = ?"],
+         "crate": "guest", "tables": ["owned"], "why": "fixture"},
+        {"file": "guest/src/lib.rs", "op": "SELECT", "count": 1, "statements": ["SELECT k FROM {}"],
+         "crate": "guest", "tables": ["owned"], "why": "fixture"}])
     reds, _, _ = tree(dyn, pin)
     check("a pinned dynamic site still needs its tables granted", len(reds) == 1 and "DELETE" in reds[0] and "`owned`" in reds[0])
     reds, _, _ = tree(dyn + 'fn i(t: &str) { q(format!("SELECT 1 FROM {t}")); }\n', pin)
-    check("a dynamic site past its pinned count is red", any("pinned 1" in r for r in reds))
+    check("a dynamic site past its pinned count is red, naming file:line", any("guest/src/lib.rs:3" in r and "not among" in r for r in reds))
+    # LENS L3: a pinned site swapped for another, same count, is red at the new site and names the one gone.
+    reds, _, _ = tree(dyn.replace("SELECT k FROM {}", "SELECT v FROM {}"), pin)
+    check("a dynamic site swapped at the same count is red at its file:line (lens L3)",
+          any("guest/src/lib.rs:2" in r and "SELECT v FROM" in r for r in reds) and any("no longer has" in r for r in reds))
     split = 'fn j() { q(String::from("SELECT k FROM ") + T); }\n'
     _, _, hits = tree(split)
     check("a keyword ending its literal is a dynamic site", any(h["table"] is None for h in hits["guest"]))
@@ -467,6 +589,59 @@ def self_test():
     _, _, hits = tree("fn m() { q(r#\"DELETE FROM \"owned\" WHERE k = '}'\"#); q(\"INSERT INTO \\\"shared\\\" (k) VALUES (1)\"); let c = '\"'; }\n")
     got = sorted((h["op"], h["table"]) for h in hits["guest"])
     check("raw strings, quoted names and char literals lex right", ("DELETE", "owned") in got and ("INSERT", "shared") in got)
+    # LENS M1: the never-wipe flag (`shared` is never-wipe), for every crate, the owner included.
+    nw = lambda r: any("NEVER-WIPE" in x and "`shared`" in x for x in r)
+    reds, _, _ = tree(own_extra='const X: &str = "DROP TABLE IF EXISTS shared";\n')
+    check("the owner's DROP of a never-wipe table is red (lens M1)", nw(reds) and any("own/src/lib.rs:3" in x for x in reds))
+    reds, _, _ = tree(own_extra='const X: &str = "DELETE FROM shared";\n')
+    check("the owner's DELETE with no WHERE on a never-wipe table is red (lens M1)", nw(reds) and any("no WHERE" in x for x in reds))
+    reds, _, _ = tree(own_extra='const X: &str = "TRUNCATE TABLE shared";\nconst Y: &str = "ALTER TABLE shared DROP COLUMN k";\n')
+    check("a TRUNCATE and a destructive ALTER of a never-wipe table are red", sum("NEVER-WIPE" in x for x in reds) == 2)
+    scope = lambda m: m["tables"][1].update(delete_scope=[{"crate": "owner-crate", "file": "own/src/lib.rs",
+                                                           "statement": "DELETE FROM shared WHERE k = ?", "why": "fixture"}])
+    reds, _, _ = tree(own_extra='const X: &str = "DELETE FROM shared WHERE k = ?";\n', man_edit=scope)
+    check("a DELETE ... WHERE on a never-wipe table under its delete_scope is green (lens M1)", reds == [])
+    reds, _, _ = tree(own_extra='const X: &str = "DELETE FROM shared WHERE k = ?";\n')
+    check("a DELETE ... WHERE on a never-wipe table with no delete_scope is red (lens M1)", nw(reds) and any("delete_scope" in x for x in reds))
+    reds, _, _ = tree(own_extra='const X: &str = "DELETE FROM shared WHERE k > ?";\n', man_edit=scope)
+    check("a delete_scope grants its own statement only, and an unused one is stale", nw(reds) and any("stale scope" in x for x in reds))
+    reds, _, _ = tree('fn d() {\n    // storage-ok(shared): fixture, an allow does not lift never-wipe\n    q("DROP TABLE shared");\n}\n',
+                      lambda m: m.update(schema_owner="guest"))
+    check("the schema owner's DROP of a never-wipe table is red, an in-place allow included (lens M1)", nw(reds))
+    dpin = lambda m: m["dynamic_sites"].append({"file": "own/src/lib.rs", "op": "DELETE", "count": 1, "crate": "owner-crate",
+                                                "statements": ["DELETE FROM {t} WHERE k = ?"], "tables": ["shared"], "why": "fixture"})
+    dsrc = 'fn e(t: &str) { q(format!("DELETE FROM {t} WHERE k = ?")); }\n'
+    reds, _, _ = tree(own_extra=dsrc, man_edit=dpin)
+    check("a dynamic DELETE reaching a never-wipe table with no delete_scope is red", any("NEVER-WIPE" in x and "dynamic" in x for x in reds))
+    dscope = lambda m: (dpin(m), m["tables"][1].update(delete_scope=[{"crate": "owner-crate", "file": "own/src/lib.rs",
+                                                                       "statement": "DELETE FROM {t} WHERE k = ?", "why": "fixture"}]))
+    reds, _, _ = tree(own_extra=dsrc, man_edit=dscope)
+    check("a dynamic DELETE reaching a never-wipe table under its delete_scope is green", reds == [])
+    reds, _, _ = tree(own_extra=dsrc.replace(" WHERE k = ?", ""), man_edit=lambda m: (dscope(m), m["dynamic_sites"][0].update(statements=["DELETE FROM {t}"])))
+    check("a dynamic DELETE with no WHERE reaching a never-wipe table is red", any("no WHERE" in x for x in reds))
+    # LENS M2: an UPDATE split across literals, string-built or aliased is resolved or dynamic, never unseen.
+    reds, _, _ = tree('fn u() { q(concat!("UPDATE owned ", "SET k = 1 WHERE k = ?")); }\n')
+    check("an UPDATE split by concat! is resolved and red (lens M2)", any("guest/src/lib.rs:2" in x and "UPDATE" in x and "`owned`" in x for x in reds))
+    reds, _, _ = tree('fn u(t: &str) { q(String::from("UPDATE ") + t + " SET k = 1"); }\n')
+    check("an UPDATE whose table is built in code is an unpinned dynamic site (lens M2)", any("dynamic-table UPDATE" in x for x in reds))
+    reds, _, _ = tree('fn u() { q("UPDATE owned AS o SET k = 1"); q("UPDATE OR IGNORE owned o SET k = 2"); }\n')
+    check("an aliased UPDATE is resolved and red (lens M2)", sum("writes (UPDATE) table `owned`" in x for x in reds) == 2)
+    _, _, hits = tree('fn u() { log("failed to update the row"); log("UPDATE-only latch"); log("the UPDATE of one column"); }\n')
+    check("prose naming update is not a statement", not any(h["op"] == "UPDATE" for h in hits["guest"]))
+    # LENS L1: a CTE named like a manifest table is red, and a CTE never hides a write.
+    reds, _, _ = tree('fn c() { q("WITH owned AS (SELECT 1) SELECT * FROM owned"); q("DELETE FROM owned WHERE k = ?"); }\n')
+    check("a CTE named like a manifest table is red, and does not hide a write (lens L1)",
+          any("CTE named `owned`" in x for x in reds) and any("writes (DELETE) table `owned`" in x for x in reds))
+    # LENS L2: not_tables is scoped to its crate and op.
+    ntab = lambda m: m["not_tables"].update(prose={"crate": "owner-crate", "ops": ["SELECT"], "why": "fixture"})
+    reds, _, _ = tree('fn n() { q("INSERT INTO prose (k) VALUES (1)"); }\n', ntab)
+    check("a not_tables word is a table outside its crate and op (lens L2)", any("`prose`" in x and "not in" in x for x in reds))
+    reds, _, _ = tree(own_extra='const P: &str = "funds FROM prose";\n', man_edit=ntab)
+    check("a not_tables word inside its crate and op is skipped", reds == [])
+    # LENS N1: a DDL grant does not imply a read.
+    reds, _, _ = tree('fn a() { q("ALTER TABLE owned ADD COLUMN x INTEGER"); q("SELECT x FROM owned"); }\n',
+                      lambda m: (m["tables"][0]["readers"].clear(), m["tables"][0]["writers"].update(guest=["ALTER"])))
+    check("a DDL grant implies no read (lens N1)", any("reads table `owned`" in x for x in reds))
     print(f"check-storage-ownership self-test: {ok} ok, {bad} failed")
     return bad == 0
 
@@ -479,6 +654,8 @@ def main(argv):
         rows = {}
         for crate, hs in hits.items():
             for h in hs:
+                if h["op"] == "CTE":
+                    continue
                 k = (crate, h["op"], h["table"] or f"<dynamic {h['file']}>")
                 rows[k] = rows.get(k, 0) + 1
         for (c, op, t), n in sorted(rows.items()):
@@ -488,7 +665,7 @@ def main(argv):
         print("usage: check-storage-ownership.py [--self-test|--inventory]", file=sys.stderr)
         return 2
     (reds, notes), hits = run()
-    n = sum(len(h) for h in hits.values())
+    n = sum(1 for hs in hits.values() for h in hs if h["op"] != "CTE")
     for note in notes:
         print(f"  note: {note}")
     if reds:
