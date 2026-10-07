@@ -152,6 +152,11 @@ pub const SETTLE_SIGNERS_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN settl
 pub const SPENDER_PAY_A_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN spenderPayASats INTEGER";
 pub const SPENDER_PAY_B_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN spenderPayBSats INTEGER";
 
+/// bsv-low #492 (the B3 lens fold M1): the paying transaction a held filing names (overlay migration 163). `/record`
+/// writes it and `/owed` reads it, so a cold isolate ahead of the overlay must add it (the module's membership rule).
+/// NULL = the row names no transaction (a chain marker, the v1 filing): it retires nothing by transaction.
+pub const PAY_TXID_ALTER: &str = "ALTER TABLE collected_markers_v2 ADD COLUMN payTxid TEXT";
+
 pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     SIG_VALID_ALTER,
     MARKER_VALID_ALTER,
@@ -162,6 +167,7 @@ pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     SETTLE_SIGNERS_ALTER,
     SPENDER_PAY_A_ALTER,
     SPENDER_PAY_B_ALTER,
+    PAY_TXID_ALTER,
 ];
 
 /// The bsv-low #371 `network_seen` TABLE, same Rule-24 contract as the
@@ -419,10 +425,11 @@ mod tests {
     fn every_app_layer_alter_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             LATCH_COLUMN_ALTERS.len(),
-            9,
+            10,
             "sigValid (#283), markerValid (#362), firstSpentAt (#217), \
              spenderFinal (#371), claimValid + rowValid (brain-cutover M1), \
-             settleSigners (#406), spenderPayASats + spenderPayBSats (#468)"
+             settleSigners (#406), spenderPayASats + spenderPayBSats (#468), \
+             payTxid (#492, the held filing's paying transaction)"
         );
         for stmt in LATCH_COLUMN_ALTERS {
             let column = stmt
