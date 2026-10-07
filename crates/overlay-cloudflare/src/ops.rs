@@ -1194,6 +1194,9 @@ pub async fn health_invariants(
         // The flip-criterion instrument for #347 criterion 1 — durable D1
         // totals, three states (Rule 13), reader contract in `census_json`.
         "submitReadinessCensus": census,
+        // bsv-low #499: this isolate's D1 rows ledger, the per-route running maxima since boot (what
+        // `scripts/d1-census.py` reads before a promotion; the request that serves this body is not in it yet).
+        "d1Budget": crate::d1_ledger::budget_json(),
     });
 
     let mut resp = Response::from_json(&body)?.with_status(status);

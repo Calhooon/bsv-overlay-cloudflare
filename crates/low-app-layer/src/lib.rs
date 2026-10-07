@@ -130,6 +130,9 @@ pub mod beef_guard;
 pub mod compaction;
 pub mod courier;
 pub mod cors;
+/// bsv-low #499: the D1 rows ledger, the overlay's own source compiled here (this crate does not link the overlay).
+#[path = "../../overlay-cloudflare/src/d1_ledger.rs"]
+pub mod d1_ledger;
 pub mod credit_beef;
 pub mod hops_view;
 pub mod internal_events;
@@ -232,7 +235,12 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // bsv-low #451 slice B: the courier census's durable deltas ride ONE D1 batch, after the answer, when a flush is
     // due (`courier::should_flush`: the isolate's exact head, then by calls or by time).
     let counters_db = env.d1("OVERLAY_DB").ok();
-    let mut resp = router(state, schema_ready).run(req, env).await?;
+    // bsv-low #499: the route runs under the request's D1 rows ledger; the figures ride the answer's
+    // `Server-Timing` (stamped last, after any signing or sealing rebuilt the response) and `/health.d1Budget`.
+    let d1_route = d1_ledger::route_of(req.path().as_str(), D1_LEDGER_ROUTES);
+    let (out, d1) = d1_ledger::scoped(router(state, schema_ready).run(req, env)).await;
+    d1_ledger::record(d1_route, d1);
+    let mut resp = out?;
     let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
     if !pending.is_empty() {
         ctx.wait_until(async move { courier::flush(counters_db, pending).await });
@@ -252,6 +260,7 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         resp = bsv_middleware_cloudflare::seal_lane_response_text(text, status, &lane)
             .map_err(|e| worker::Error::from(e.to_string()))?;
         cors::add_cors_headers(&mut resp);
+        d1_ledger::stamp(&mut resp, d1);
         return Ok(resp);
     }
     if let Some(session) = session {
@@ -274,8 +283,35 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         resp.headers_mut().set("Cache-Control", "no-store")?;
     }
     cors::add_cors_headers(&mut resp);
+    d1_ledger::stamp(&mut resp, d1);
     Ok(resp)
 }
+
+/// bsv-low #499: the routes the D1 rows ledger keys by name (`d1_ledger::route_of`; anything else is `other`). A
+/// route with a path parameter is listed by its fixed head.
+pub const D1_LEDGER_ROUTES: &[&str] = &[
+    "/owed",
+    "/pots-view",
+    "/results",
+    "/utxo-status",
+    "/recovery-view",
+    "/refund-view",
+    "/refund-backups",
+    "/live-view",
+    "/hops-view",
+    "/leaderboard",
+    "/record",
+    "/proof",
+    "/lane/attest",
+    "/spent-any",
+    "/tx-any",
+    "/beef",
+    "/credit-beef",
+    "/rate",
+    "/tip",
+    "/epoch",
+    "/health",
+];
 
 /// The route table. All GET, all JSON; unknown paths get a JSON 404 via the
 /// `or_else_any_method` catch-alls (worker-rs' default no-match 404 is plain

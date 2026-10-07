@@ -17,6 +17,7 @@
 //!
 //! A pot that appears here with NO tower record is itself a finding the
 //! monitor pages on (the arm never reached the tower, or was displaced).
+use crate::d1_ledger::Counted;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use worker::*;
@@ -154,7 +155,7 @@ pub async fn armed_pots(req: Request, env: &Env) -> Result<Response> {
         wasm_bindgen::JsValue::from_f64(since_seconds(since_ms) as f64),
         wasm_bindgen::JsValue::from_f64((limit + 1) as f64),
     ])?;
-    let rows: Vec<ArmedPotRowD1> = match stmt.all().await.and_then(|r| r.results::<ArmedPotRowD1>())
+    let rows: Vec<ArmedPotRowD1> = match stmt.counted_all().await.and_then(|r| r.results::<ArmedPotRowD1>())
     {
         Ok(rows) => rows,
         Err(e) => {

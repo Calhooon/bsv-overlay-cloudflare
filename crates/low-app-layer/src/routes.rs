@@ -19,6 +19,7 @@
 //! unchanged; the server never 503s on a legitimately-sized request regardless
 //! of client chunk size. A chunk's D1 error still surfaces as the same 503.
 
+use crate::d1_ledger::Counted;
 use serde::Deserialize;
 use worker::wasm_bindgen::JsValue;
 use worker::{console_warn, Headers, Method, Request, RequestInit, Response, Result, RouteContext};
@@ -73,10 +74,20 @@ pub(crate) fn json_error(msg: &str, status: u16) -> Result<Response> {
 /// body and re-wrapping it costs one copy and restores header mutability;
 /// the DO's own cache header is re-applied here (5 s — the actor's SWR
 /// freshness), and CORS attaches at the single worker-level site.
-async fn rebuild_do_response(resp: &mut Response) -> Result<Response> {
+async fn rebuild_do_response(resp: &mut Response, view_route: &'static str) -> Result<Response> {
     let status = resp.status_code();
+    let timing = resp.headers().get("Server-Timing").ok().flatten();
     let body = resp.text().await?;
-    json_response_cached(body, status, 5)
+    let mut out = json_response_cached(body, status, 5)?;
+    // bsv-low #499: the view actor's compute ran detached from this request; its D1 figures (`d1view`) ride the
+    // answer and are recorded here, in the worker's isolate, under `view_route` (the census reads them on /health)
+    if let Some(t) = timing.as_deref() {
+        if let Some(view) = crate::d1_ledger::parse_segment(t, "d1view") {
+            crate::d1_ledger::record(view_route, view);
+        }
+        out.headers_mut().set("Server-Timing", t)?;
+    }
+    Ok(out)
 }
 
 pub(crate) fn json_response_cached(
@@ -298,7 +309,7 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
             binds.push(JsValue::from_f64(f64::from(op.vout)));
         }
         let stmt = db.prepare(batch_where_sql(chunk.len())).bind(&binds)?;
-        match stmt.all().await.and_then(|r| r.results::<PotRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<PotRowD1>()) {
             Ok(chunk_rows) => rows.extend(chunk_rows.into_iter().map(PotRowD1::into_row)),
             Err(e) => {
                 console_warn!("[utxo-status] pot_records batch query failed: {e}");
@@ -365,7 +376,7 @@ async fn load_stored_beef(
             continue;
         };
         let (row, proof_verified): (Option<BeefRow>, bool) =
-            match stmt.first::<BeefTrustRow>(None).await {
+            match stmt.counted_first::<BeefTrustRow>().await {
                 Ok(row) => {
                     let verified =
                         row.as_ref().and_then(|r| r.proof_verified).unwrap_or(0.0) != 0.0;
@@ -376,7 +387,7 @@ async fn load_stored_beef(
                         faulted = true;
                         continue;
                     };
-                    match stmt.first::<BeefRow>(None).await {
+                    match stmt.counted_first::<BeefRow>().await {
                         Ok(row) => (row, false),
                         Err(e) => {
                             console_warn!("[credit-beef] {table} query failed: {e}");
@@ -687,7 +698,7 @@ pub async fn pots_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         let stmt = db
             .prepare(pots_view_join_sql(chunk.len(), era))
             .bind(&binds)?;
-        match stmt.all().await.and_then(|r| r.results::<PotsViewRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<PotsViewRowD1>()) {
             Ok(chunk_rows) => rows.extend(chunk_rows.into_iter().map(PotsViewRowD1::into_row)),
             Err(e) => {
                 console_warn!("[pots-view] pot_records join query failed: {e}");
@@ -843,7 +854,7 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result
         .map(|a| a.min(crate::logic::RECOVERY_VIEW_AFTER_MAX))
         .unwrap_or(0);
     let stmt = db.prepare(recovery_view_sql(era, after)).bind(&binds)?;
-    let rows: Vec<RecoveryRow> = match stmt.all().await.and_then(|r| r.results::<RecoveryRowD1>()) {
+    let rows: Vec<RecoveryRow> = match stmt.counted_all().await.and_then(|r| r.results::<RecoveryRowD1>()) {
         Ok(rows) => rows.into_iter().map(RecoveryRowD1::into_row).collect(),
         Err(e) => {
             console_warn!("[recovery-view] potparty join query failed: {e}");
@@ -936,7 +947,7 @@ async fn collected_games_for(
                 return None;
             }
         };
-        match stmt.all().await.and_then(|r| r.results::<GameIdRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<GameIdRowD1>()) {
             Ok(rows) => out.extend(rows.into_iter().map(|r| r.game_id.to_ascii_lowercase())),
             Err(e) => {
                 // A whole-set None rather than a partial set: a partial answer
@@ -1079,7 +1090,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
                 // NEVER return the DO response verbatim — its headers are
                 // immutable and CORS would silently fail to attach (see
                 // `rebuild_do_response`).
-                Ok(mut resp) => return rebuild_do_response(&mut resp).await,
+                Ok(mut resp) => return rebuild_do_response(&mut resp, "/leaderboard:view").await,
                 Err(e) => {
                     console_warn!("[leaderboard] BoardView unreachable ({e}) — direct compute")
                 }
@@ -1154,7 +1165,7 @@ pub async fn compute_leaderboard_body_string(
         .prepare(crate::logic::chain_wins_spine_sql(era))
         .bind(&binds)?;
     let mut owner_rows: Vec<OwnerRowD1> =
-        match stmt.all().await.and_then(|r| r.results::<OwnerRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<OwnerRowD1>()) {
             Ok(rows) => rows,
             Err(e) => {
                 console_warn!("[leaderboard] chain-wins spine query failed: {e}");
@@ -1184,7 +1195,7 @@ pub async fn compute_leaderboard_body_string(
             .prepare(crate::logic::chain_wins_owners_sql(chunk.len(), era))
             .bind(&b)?;
         match stmt
-            .all()
+            .counted_all()
             .await
             .and_then(|r| r.results::<ChainWinPotRowD1>())
         {
@@ -1217,7 +1228,7 @@ pub async fn compute_leaderboard_body_string(
             b.push(JsValue::from_f64(f64::from(op.vout)));
         }
         let stmt = db.prepare(batch_where_sql(chunk.len())).bind(&b)?;
-        match stmt.all().await.and_then(|r| r.results::<PotRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<PotRowD1>()) {
             Ok(rows) => status_rows.extend(rows.into_iter().map(PotRowD1::into_row)),
             Err(e) => {
                 console_warn!("[leaderboard] pot_records batch query failed: {e}");
@@ -1258,7 +1269,7 @@ pub async fn compute_leaderboard_body_string(
                 continue;
             }
         };
-        match stmt.all().await.and_then(|r| r.results::<ResultRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<ResultRowD1>()) {
             Ok(rows) => {
                 for m in rows.into_iter().filter_map(ResultRowD1::into_marker) {
                     push_marker(m);
@@ -1275,7 +1286,7 @@ pub async fn compute_leaderboard_body_string(
             b.push(era_bind(ms));
         }
         match db.prepare(crate::logic::era_hands_sql(era)).bind(&b) {
-            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<ResultRowD1>()) {
+            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<ResultRowD1>()) {
                 Ok(rows) => {
                     for m in rows.into_iter().filter_map(ResultRowD1::into_marker) {
                         push_marker(m);
@@ -1319,7 +1330,7 @@ pub async fn compute_leaderboard_body_string(
                     b.push(JsValue::from_f64(f64::from(op.vout)));
                 }
                 match db.prepare(batch_where_sql(chunk.len())).bind(&b) {
-                    Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<PotRowD1>()) {
+                    Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<PotRowD1>()) {
                         Ok(rows) => extra_rows.extend(rows.into_iter().map(PotRowD1::into_row)),
                         Err(e) => console_warn!(
                             "[leaderboard] hands pots status query failed (hands omitted): {e}"
@@ -1363,7 +1374,7 @@ pub async fn compute_leaderboard_body_string(
                     .bind(&b)
                 {
                     Ok(stmt) => match stmt
-                        .all()
+                        .counted_all()
                         .await
                         .and_then(|r| r.results::<ChainWinPotRowD1>())
                     {
@@ -1434,7 +1445,7 @@ pub async fn compute_leaderboard_body_string(
             }
         };
         match stmt
-            .all()
+            .counted_all()
             .await
             .and_then(|r| r.results::<ProofPointerRowD1>())
         {
@@ -1477,7 +1488,7 @@ pub async fn compute_leaderboard_body_string(
             }
         };
         match stmt
-            .all()
+            .counted_all()
             .await
             .and_then(|r| r.results::<ProofPostedRowD1>())
         {
@@ -1721,7 +1732,7 @@ async fn classify_spent_pots(
             }
         };
         match stmt
-            .all()
+            .counted_all()
             .await
             .and_then(|r| r.results::<DecodedPotRowD1>())
         {
@@ -1832,7 +1843,7 @@ async fn classify_spent_pots(
                 return (verdicts, params_by_pot, signers_by_pot);
             }
         };
-        match stmt.all().await.and_then(|r| r.results::<PotBeefRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<PotBeefRowD1>()) {
             Ok(rows) => {
                 for r in rows {
                     if let Some(bytes) = r.beef.and_then(|h| decode_beef_hex(&h)) {
@@ -2129,7 +2140,7 @@ pub async fn results(req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
             let target = format!("https://board-view/results?identity={identity_lc}&after={after}");
             match stub.fetch_with_str(&target).await {
                 // Same immutable-headers hazard as the board forward above.
-                Ok(mut resp) => return rebuild_do_response(&mut resp).await,
+                Ok(mut resp) => return rebuild_do_response(&mut resp, "/results:view").await,
                 Err(e) => console_warn!("[results] view actor unreachable ({e}) — direct compute"),
             }
         }
@@ -2215,7 +2226,7 @@ pub(crate) async fn owed_identities_by_marker(db: &worker::D1Database, txid: &st
         crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL,
     ] {
         match db.prepare(sql).bind(&[JsValue::from_str(txid), JsValue::from_f64(f64::from(vout))]) {
-            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<IdentityOnlyD1>()) {
+            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<IdentityOnlyD1>()) {
                 Ok(rows) => {
                     for r in rows {
                         let id = r.identity.to_ascii_lowercase();
@@ -2286,7 +2297,7 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
             .prepare(crate::results::decoded_pots_sql(1))
             .bind(&[JsValue::from_str(&txid), JsValue::from_f64(f64::from(vout))])?;
         let rows = match stmt
-            .all()
+            .counted_all()
             .await
             .and_then(|r| r.results::<DecodedPotRowD1>())
         {
@@ -2488,7 +2499,7 @@ pub(crate) async fn internal_hop_changed(mut req: Request, env: &worker::Env, ct
 pub(crate) async fn owed_mark_stale(db: &worker::D1Database, sql: &str, binds: &[JsValue], what: &str) {
     match db.prepare(sql).bind(binds) {
         Ok(stmt) => {
-            if let Err(e) = stmt.run().await {
+            if let Err(e) = stmt.counted_run().await {
                 console_warn!("[owed] stale mark ({what}) failed: {e}");
             }
         }
@@ -2588,7 +2599,7 @@ pub(crate) async fn owed_recompute(
         // compute had a tip, the previous rows STAND and the fault is counted. A first compute proceeds without a
         // gate (the staleness rule re-derives it minutes later).
         let prev = match db.prepare(crate::owed::OWED_STATE_READ_SQL).bind(&[JsValue::from_str(identity_lc)]) {
-            Ok(stmt) => stmt.first::<OwedStateD1>(None).await.ok().flatten().and_then(|s| s.tip),
+            Ok(stmt) => stmt.counted_first::<OwedStateD1>().await.ok().flatten().and_then(|s| s.tip),
             Err(_) => None,
         };
         if prev.is_some() {
@@ -2638,7 +2649,7 @@ pub(crate) async fn owed_recompute(
                 .bind(&binds)
                 .map_err(|e| format!("owed refund bind: {e}"))?;
             let rows: Vec<crate::refund_view::RefundViewRow> = stmt
-                .all()
+                .counted_all()
                 .await
                 .and_then(|r| r.results::<RefundViewRowD1>())
                 .map_err(|e| format!("owed refund query: {e}"))?
@@ -2670,7 +2681,7 @@ pub(crate) async fn owed_recompute(
                 .bind(&binds)
                 .map_err(|e| format!("owed hops bind: {e}"))?;
             let rows: Vec<crate::hops_view::HopsViewRow> = stmt
-                .all()
+                .counted_all()
                 .await
                 .and_then(|r| r.results::<HopsViewRowD1>())
                 .map_err(|e| format!("owed hops query: {e}"))?
@@ -2730,7 +2741,7 @@ pub(crate) async fn owed_recompute(
             let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_evictions WHERE readmittedAt IS NULL AND txid IN ({placeholders})");
             let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
             match db.prepare(&sql).bind(&b) {
-                Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<TxidOnlyD1>()) {
+                Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<TxidOnlyD1>()) {
                     Ok(rows) => evicted_pots.extend(rows.into_iter().map(|r| r.txid.to_ascii_lowercase())),
                     Err(e) => console_warn!("[owed] evictions chunk failed (an evicted pot keeps its sentence this pass): {e}"),
                 },
@@ -2751,7 +2762,7 @@ pub(crate) async fn owed_recompute(
         }
         let since = JsValue::from_f64((now_ms - crate::owed::OWED_EVICTION_WINDOW_MS) as f64);
         match db.prepare(crate::owed::OWED_EVICTIONS_WINDOW_SQL).bind(&[since]) {
-            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<EvictionRowD1>()) {
+            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<EvictionRowD1>()) {
                 Ok(rows) => rows.into_iter().map(|r| (r.txid.to_ascii_lowercase(), r.released_spends)).collect(),
                 Err(e) => {
                     console_warn!("[owed] evictions window failed (a refused hop keeps its sentence this pass): {e}");
@@ -2783,7 +2794,7 @@ pub(crate) async fn owed_recompute(
         }
         let since = JsValue::from_f64((now_ms - crate::owed::OWED_EVICTION_WINDOW_MS) as f64);
         let rows: Vec<(String, u32, String)> = match db.prepare(crate::owed::OWED_DOOR_REFUSALS_SQL).bind(&[JsValue::from_str(identity_lc), since]) {
-            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<RefusalRowD1>()) {
+            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<RefusalRowD1>()) {
                 Ok(rows) => rows.into_iter().map(|r| (r.hop_txid, r.hop_vout as u32, r.reason)).collect(),
                 Err(e) => {
                     console_warn!("[owed] door refusals read failed (a door-refused hop keeps its sentence this pass): {e}");
@@ -2832,7 +2843,7 @@ pub(crate) async fn owed_recompute(
             );
             let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
             match db.prepare(&sql).bind(&b) {
-                Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<EvictedKeysD1>()) {
+                Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<EvictedKeysD1>()) {
                     Ok(rows) => twin_keys.extend(rows.into_iter().filter_map(|r| {
                         let keys = crate::results::CommittedKeys::from_columns(
                             r.pub_a.as_deref(),
@@ -2889,7 +2900,7 @@ pub(crate) async fn owed_recompute(
             }
             let stmt = db.prepare(&sql).bind(&b).map_err(|e| format!("owed backups bind: {e}"))?;
             let rows: Vec<ValidRefundRowD1> = stmt
-                .all()
+                .counted_all()
                 .await
                 .and_then(|r| r.results::<ValidRefundRowD1>())
                 .map_err(|e| format!("owed backups query: {e}"))?;
@@ -3042,7 +3053,7 @@ pub(crate) async fn owed_recompute(
             sweep_raw_hex: String,
         }
         let rows = match db.prepare(crate::hopsweep::HOPSWEEPS_FOR_IDENTITY_SQL).bind(&[JsValue::from_str(identity_lc)]) {
-            Ok(stmt) => stmt.all().await.and_then(|r| r.results::<SweepRowD1>()),
+            Ok(stmt) => stmt.counted_all().await.and_then(|r| r.results::<SweepRowD1>()),
             Err(e) => Err(e),
         };
         match rows {
@@ -3096,7 +3107,7 @@ pub(crate) async fn owed_recompute(
             let sql = crate::hopsweep::sweep_proofs_sql(chunk.len());
             let binds: Vec<JsValue> = chunk.iter().map(|t| JsValue::from_str(t)).collect();
             let rows = match db.prepare(&sql).bind(&binds) {
-                Ok(stmt) => stmt.all().await.and_then(|r| r.results::<ProofRowD1>()),
+                Ok(stmt) => stmt.counted_all().await.and_then(|r| r.results::<ProofRowD1>()),
                 Err(e) => Err(e),
             };
             match rows {
@@ -3176,7 +3187,7 @@ pub(crate) async fn owed_recompute(
                 b.push(JsValue::from_str(g));
             }
             let rows = match db.prepare(&sql).bind(&b) {
-                Ok(stmt) => stmt.all().await.and_then(|r| r.results::<CollectedRowD1>()),
+                Ok(stmt) => stmt.counted_all().await.and_then(|r| r.results::<CollectedRowD1>()),
                 Err(e) => Err(e),
             };
             match rows {
@@ -3214,7 +3225,7 @@ pub(crate) async fn owed_recompute(
         let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_records WHERE lockKind = 'covenant' AND lower(txid) IN ({placeholders})");
         let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
         match db.prepare(&sql).bind(&b) {
-            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<TxidRowD1>()) {
+            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<TxidRowD1>()) {
                 Ok(rows) => pot_spenders.extend(rows.into_iter().map(|r| r.txid.to_ascii_lowercase())),
                 Err(e) => {
                     pot_spenders_faulted = true;
@@ -3363,7 +3374,7 @@ pub(crate) async fn owed_recompute(
             let mut outs = outputs_of(&tx);
             // the index's own spend word per output (the swept sats collected and moved on, or still at the home)
             if let Ok(stmt) = db.prepare("SELECT outputIndex, spent FROM pot_records WHERE txid = ?1").bind(&[JsValue::from_str(&sp)]) {
-                if let Ok(rows) = stmt.all().await.and_then(|r| r.results::<SpentRowD1>()) {
+                if let Ok(rows) = stmt.counted_all().await.and_then(|r| r.results::<SpentRowD1>()) {
                     for r in rows {
                         if let Some(o) = outs.iter_mut().find(|o| o.vout == r.output_index as u32) {
                             o.spent = r.spent.map(|v| v >= 1.0);
@@ -3503,7 +3514,7 @@ pub(crate) async fn owed_recompute(
         stmts.push(db.prepare(*sql).bind(&b).map_err(|e| format!("owed write bind: {e}"))?);
     }
     debug_assert!(stmts.len() <= 3 + crate::owed::OWED_MAX_ROWS, "the batch stays under the row cap + the three bookends");
-    let written = db.batch(stmts).await.map_err(|e| format!("owed write: {e}"))?;
+    let written = crate::d1_ledger::counted_batch(db, stmts).await.map_err(|e| format!("owed write: {e}"))?;
     #[derive(Deserialize)]
     struct StampD1 {
         #[serde(rename = "computedAtMs")]
@@ -3633,7 +3644,7 @@ impl crate::owed::PayVoutWorld for PayVoutReads<'_> {
         let sql = format!("SELECT txid, hex(beef) AS beef FROM pot_beefs WHERE txid IN ({placeholders})");
         let binds: Vec<JsValue> = txids.iter().map(|t| JsValue::from_str(t)).collect();
         let read = match self.db.prepare(&sql).bind(&binds) {
-            Ok(stmt) => stmt.all().await.and_then(|r| r.results::<PotBeefRowD1>()),
+            Ok(stmt) => stmt.counted_all().await.and_then(|r| r.results::<PotBeefRowD1>()),
             Err(e) => Err(e),
         };
         let beefs = read.map_err(|e| {
@@ -3692,6 +3703,10 @@ pub(crate) async fn owed_recompute_and_push(
     source: &str,
     tip_hint: Option<u64>,
 ) {
+    // bsv-low #499: past the identity's ceiling the walk is shed (the stale mark its hook wrote stays for the read)
+    if !owed_recompute_admit(identity_lc, source, true) {
+        return;
+    }
     match owed_recompute(env, db, identity_lc, source, tip_hint).await {
         // bsv-low #487: a snapshot the write refused is not announced (the newer walk's own push stands)
         Ok(c) if c.superseded => {}
@@ -3728,6 +3743,29 @@ thread_local! {
     /// halved: two walks one after the other instead of two at once; three or more asks per run shrink to two), so the
     /// LAST write's state is what gets computed ("computed on every write" holds) and the queue sees no parallel walks.
     static OWED_RERUN: std::cell::RefCell<std::collections::HashMap<String, String>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// bsv-low #499: the recomputes each identity ran on THIS isolate in its current minute (`owed::RecomputeRate`).
+    static OWED_RATE: std::cell::RefCell<crate::owed::RecomputeRate> = std::cell::RefCell::new(crate::owed::RecomputeRate::default());
+}
+/// bsv-low #499: may this recompute run? Every walk asks here first: the hooks' and the claims' through
+/// `owed_recompute_and_push`, the read's inline arm, and the first read (`sheddable = false`: no snapshot exists to
+/// serve, so it runs and counts). A shed is counted and logged; the caller serves the snapshot it holds.
+pub(crate) fn owed_recompute_admit(identity_lc: &str, source: &str, sheddable: bool) -> bool {
+    let now_ms = worker::Date::now().as_millis() as i64;
+    let run = OWED_RATE.with(|r| r.borrow_mut().admit(identity_lc, now_ms, sheddable));
+    if !run {
+        crate::owed::note_recompute_shed();
+        console_warn!(
+            "[owed] recompute ({source}) for {}… shed: {} recomputes inside {} ms already (the snapshot stands)",
+            &identity_lc[..12.min(identity_lc.len())],
+            crate::owed::OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW,
+            crate::owed::OWED_RECOMPUTE_RATE_WINDOW_MS
+        );
+    }
+    run
+}
+/// The identities at the ceiling on this isolate now, for `/health`.
+pub(crate) fn owed_rate_at_ceiling(now_ms: i64) -> usize {
+    OWED_RATE.with(|r| r.borrow().at_ceiling(now_ms))
 }
 /// An in-flight mark whose last PROGRESS is older than this is abandoned. The mark is `(token, last_progress_ms)`
 /// and a live claim re-stamps its progress before every walk (the delta-verify's LOW-2: a claim is up to three
@@ -3868,8 +3906,8 @@ pub(crate) async fn owed_recompute_claimed(
 /// `None` on any fault or a missing marker.
 async fn owed_read_stored(db: &worker::D1Database, identity_lc: &str) -> Option<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool)> {
     let id = [JsValue::from_str(identity_lc)];
-    let st = db.prepare(crate::owed::OWED_STATE_READ_SQL).bind(&id).ok()?.first::<OwedStateD1>(None).await.ok()??;
-    let rows = db.prepare(crate::owed::OWED_ROWS_READ_SQL).bind(&id).ok()?.all().await.and_then(|r| r.results::<OwedRowD1>()).ok()?;
+    let st = db.prepare(crate::owed::OWED_STATE_READ_SQL).bind(&id).ok()?.counted_first::<OwedStateD1>().await.ok()??;
+    let rows = db.prepare(crate::owed::OWED_ROWS_READ_SQL).bind(&id).ok()?.counted_all().await.and_then(|r| r.results::<OwedRowD1>()).ok()?;
     Some((
         rows.into_iter().filter_map(OwedRowD1::into_row).collect(),
         st.tip.map(|t| t as u64),
@@ -3930,7 +3968,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
         .prepare(crate::owed::OWED_STATE_READ_SQL)
         .bind(&[JsValue::from_str(&identity)])
     {
-        Ok(stmt) => match stmt.first::<OwedStateD1>(None).await {
+        Ok(stmt) => match stmt.counted_first::<OwedStateD1>().await {
             Ok(v) => v,
             Err(e) => {
                 console_warn!("[owed] state read failed: {e}");
@@ -3952,7 +3990,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                 present: Option<f64>,
             }
             let known = match db.prepare(crate::owed::OWED_IDENTITY_PROBE_SQL).bind(&[JsValue::from_str(&identity)]) {
-                Ok(stmt) => match stmt.first::<PresentD1>(None).await {
+                Ok(stmt) => match stmt.counted_first::<PresentD1>().await {
                     Ok(v) => v.is_some(),
                     Err(e) => {
                         console_warn!("[owed] identity probe failed: {e}");
@@ -3967,6 +4005,8 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             if !known {
                 return json_response(crate::owed::owed_body(&identity, None, &[], now_ms, false), 200);
             }
+            // bsv-low #499: the first read has no snapshot to shed to, so it runs; it counts against the minute
+            owed_recompute_admit(&identity, "read-first", false);
             match owed_compute_on_read(&ctx.env, &db, &identity, "read-first", None).await {
                 Ok(v) => v,
                 Err(resp) => return resp,
@@ -3977,7 +4017,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                 .prepare(crate::owed::OWED_ROWS_READ_SQL)
                 .bind(&[JsValue::from_str(&identity)])
             {
-                Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<OwedRowD1>()) {
+                Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<OwedRowD1>()) {
                     Ok(rows) => rows.into_iter().filter_map(OwedRowD1::into_row).collect(),
                     Err(e) => {
                         console_warn!("[owed] rows read failed: {e}");
@@ -4036,10 +4076,15 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                         if tip_now.is_none() {
                             tip_now = chaintracks_present_height(&ctx, "owed").await.ok();
                         }
-                        // N4: whichever arm asked for it, a compute that faults leaves the rows in hand standing
-                        match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now).await {
-                            Ok(v) => v,
-                            Err(_) => (rows, prev_tip, st.computed_at_ms as i64, cut),
+                        // N4: whichever arm asked for it, a compute that faults leaves the rows in hand standing;
+                        // bsv-low #499: so does one the identity's ceiling sheds
+                        if !owed_recompute_admit(&identity, source, true) {
+                            (rows, prev_tip, st.computed_at_ms as i64, cut)
+                        } else {
+                            match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now).await {
+                                Ok(v) => v,
+                                Err(_) => (rows, prev_tip, st.computed_at_ms as i64, cut),
+                            }
                         }
                     }
                 }
@@ -4070,7 +4115,7 @@ async fn gather_result_entries(
         .bind(&binds)
         .map_err(|e| format!("results bind failed: {e}"))?;
     let mut rows: Vec<crate::results::ResultsRow> =
-        match stmt.all().await.and_then(|r| r.results::<ResultsRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<ResultsRowD1>()) {
             Ok(rows) => rows.into_iter().map(ResultsRowD1::into_row).collect(),
             Err(e) => return Err(format!("potparty join query failed: {e}")),
         };
@@ -4108,7 +4153,7 @@ async fn gather_result_entries(
             }
             match db.prepare(&sql).bind(&binds) {
                 Ok(stmt) => match stmt
-                    .all()
+                    .counted_all()
                     .await
                     .and_then(|r| r.results::<crate::results::PageOverlay>())
                 {
@@ -4143,7 +4188,7 @@ async fn gather_result_entries(
                 continue;
             }
         };
-        match stmt.all().await.and_then(|r| r.results::<ResultRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<ResultRowD1>()) {
             Ok(rows) => claim_markers.extend(rows.into_iter().filter_map(ResultRowD1::into_marker)),
             Err(e) => {
                 console_warn!("[results] result_markers_v2 query failed (claims omitted): {e}");
@@ -4263,7 +4308,7 @@ async fn results_proof_hands(
             }
         };
         match stmt
-            .all()
+            .counted_all()
             .await
             .and_then(|r| r.results::<ProofHandsRowD1>())
         {
@@ -4311,7 +4356,7 @@ async fn results_proof_hands(
             }
         };
         match stmt
-            .all()
+            .counted_all()
             .await
             .and_then(|r| r.results::<ProofPostHandsRowD1>())
         {
@@ -4342,7 +4387,7 @@ async fn results_proof_hands(
             .bind(&binds)
         {
             Ok(stmt) => match stmt
-                .all()
+                .counted_all()
                 .await
                 .and_then(|r| r.results::<ProofBytesRowD1>())
             {
@@ -4411,7 +4456,7 @@ async fn results_hand_markers(
             }
         };
         match stmt
-            .all()
+            .counted_all()
             .await
             .and_then(|r| r.results::<HandMarkerRowD1>())
         {
@@ -4469,7 +4514,7 @@ async fn results_hop_seat_markers(
         let Ok(stmt) = db.prepare(&sql).bind(&binds) else {
             continue;
         };
-        match stmt.all().await.and_then(|r| r.results::<HopSeatRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<HopSeatRowD1>()) {
             Ok(rows) => {
                 let hops: Vec<crate::results::HopSeatRow> = rows
                     .into_iter()
@@ -4544,7 +4589,7 @@ async fn results_seat_markers(
             }
         };
         match stmt
-            .all()
+            .counted_all()
             .await
             .and_then(|r| r.results::<SeatMarkerRowD1>())
         {
@@ -4730,7 +4775,7 @@ pub async fn refund_view(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         .prepare(crate::refund_view::refund_view_sql(era, after))
         .bind(&binds)?;
     let mut rows: Vec<crate::refund_view::RefundViewRow> = match stmt
-        .all()
+        .counted_all()
         .await
         .and_then(|r| r.results::<RefundViewRowD1>())
     {
@@ -4791,7 +4836,7 @@ pub async fn refund_backups(req: Request, ctx: RouteContext<AuthState>) -> Resul
         .prepare(crate::refund_backups::refund_backups_sql(era))
         .bind(&binds)?;
     let mut rows: Vec<crate::refund_backups::RefundBackupRow> = match stmt
-        .all()
+        .counted_all()
         .await
         .and_then(|r| r.results::<crate::refund_backups::RefundBackupRowD1>())
     {
@@ -5005,7 +5050,7 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         ))
         .bind(&binds)?;
     let rows: Vec<crate::hops_view::HopsViewRow> =
-        match stmt.all().await.and_then(|r| r.results::<HopsViewRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<HopsViewRowD1>()) {
             Ok(rows) => rows.into_iter().map(HopsViewRowD1::into_row).collect(),
             Err(e) => {
                 console_warn!("[hops-view] hopparty join query failed: {e}");
@@ -5060,7 +5105,7 @@ async fn read_probe_memos(
     for keys in crate::hops_view::probe_memo_read_chunks(targets) {
         let binds: Vec<JsValue> = keys.iter().map(|k| JsValue::from_str(k)).collect();
         match db.prepare(crate::hops_view::probe_memo_read_sql(keys.len())).bind(&binds) {
-            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<ProbeMemoRow>()) {
+            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<ProbeMemoRow>()) {
                 Ok(chunk) => rows.extend(chunk),
                 Err(e) => {
                     console_warn!("[spent-any] probe memo read failed ({} targets): {e}", targets.len());
@@ -5095,7 +5140,7 @@ async fn probe_memo_read_faulted(db: &worker::D1Database) {
     let binds = [JsValue::from_str(crate::owed::COUNTER_PROBE_MEMO_READ_FAULTS), JsValue::from_f64(1.0)];
     match db.prepare(crate::beef_guard::BUMP_COUNTER_SQL).bind(&binds) {
         Ok(stmt) => {
-            if let Err(e) = stmt.run().await {
+            if let Err(e) = stmt.counted_run().await {
                 console_warn!("[spent-any] probe memo read fault counter write failed: {e}");
             }
         }
@@ -5122,7 +5167,7 @@ async fn write_probe_memos(db: &worker::D1Database, memos: &[crate::hops_view::P
     if stmts.is_empty() {
         return;
     }
-    if let Err(e) = db.batch(stmts).await {
+    if let Err(e) = crate::d1_ledger::counted_batch(db, stmts).await {
         console_warn!("[spent-any] probe memo write failed ({} rows): {e}", memos.len());
     }
 }
@@ -5170,7 +5215,7 @@ async fn read_verdict_memos(
             .prepare(crate::txany::verdict_memo_read_many_sql(chunk.len()))
             .bind(&binds)
         {
-            Ok(stmt) => match stmt.all().await.and_then(|r| r.results::<VerdictMemoRow>()) {
+            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<VerdictMemoRow>()) {
                 Ok(rows) => rows,
                 Err(e) => {
                     console_warn!("[tx-any] verdict memo read failed ({} txids): {e}", chunk.len());
@@ -5213,7 +5258,7 @@ async fn write_verdict_memo(env: &worker::Env, memo: &crate::txany::VerdictMemo)
     ];
     match db.prepare(crate::txany::VERDICT_MEMO_UPSERT_SQL).bind(&binds) {
         Ok(stmt) => {
-            if let Err(e) = stmt.run().await {
+            if let Err(e) = stmt.counted_run().await {
                 console_warn!("[tx-any] verdict memo write failed for {}: {e}", memo.txid);
             }
         }
@@ -5536,7 +5581,7 @@ async fn live_view_candidates(
             }
         };
         match stmt
-            .all()
+            .counted_all()
             .await
             .and_then(|r| r.results::<SeatMarkerRowD1>())
         {
@@ -5566,7 +5611,7 @@ async fn live_view_candidates(
             }
         };
         match stmt
-            .all()
+            .counted_all()
             .await
             .and_then(|r| r.results::<SeatMarkerRowD1>())
         {
@@ -5663,7 +5708,7 @@ pub async fn live_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         }
     };
     let mut rows: Vec<crate::live_view::LiveViewRow> =
-        match stmt.all().await.and_then(|r| r.results::<LiveViewRowD1>()) {
+        match stmt.counted_all().await.and_then(|r| r.results::<LiveViewRowD1>()) {
             Ok(rows) => rows.into_iter().map(LiveViewRowD1::into_row).collect(),
             Err(e) => {
                 console_warn!("[live-view] potparty join query failed: {e}");
@@ -6711,7 +6756,7 @@ async fn tx_any_index_leg_batch(ctx: &RouteContext<AuthState>, keys: &[String]) 
             let binds: Vec<JsValue> = chunk.iter().map(|k| JsValue::from_str(k)).collect();
             let rows: Vec<BeefTrustRowKeyed> = match db.prepare(&sql).bind(&binds) {
                 Ok(stmt) => match stmt
-                    .all()
+                    .counted_all()
                     .await
                     .and_then(|r| r.results::<BeefTrustRowKeyed>())
                 {
@@ -6863,6 +6908,10 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     // bsv-low #469: the owed list's recomputes by source, the rows written by family, the faults.
     body["owed"] = crate::owed::owed_health_json();
     body["owed"]["inFlight"] = owed_in_flight_snapshot(worker::Date::now().as_millis() as i64);
+    body["owed"]["recomputeAtCeiling"] = serde_json::json!(owed_rate_at_ceiling(worker::Date::now().as_millis() as i64));
+    // bsv-low #499: this isolate's D1 rows ledger, the per-route running maxima since boot (the overlay serves the
+    // same body on `/health/invariants.d1Budget`; `scripts/d1-census.py` reads both).
+    body["d1Budget"] = crate::d1_ledger::budget_json();
     // bsv-low #451 slice B: the isolate's courier tally (the durable one is the overlay's /health/invariants).
     body["couriers"] = crate::courier::health_json();
     // bsv-low #497: the exchange rate's sample, its age and every rung's counts (this isolate's).

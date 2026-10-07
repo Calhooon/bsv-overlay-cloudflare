@@ -3,6 +3,7 @@
 //! Adapted from ~/bsv/rust-wallet-infra/src/d1/mod.rs.
 //! Provides Query builder with typed bind values and row deserialization.
 
+use crate::d1_ledger::Counted;
 use serde::de::DeserializeOwned;
 use worker::wasm_bindgen::JsValue;
 use worker::{D1Database, D1PreparedStatement};
@@ -145,9 +146,11 @@ impl Query {
         stmt.bind(&js_values).map_err(|e| e.to_string())
     }
 
+    // bsv-low #499: the three awaits below are the overlay's ONE D1 seam, each counted on the request's rows
+    // ledger (`crate::d1_ledger`): every engine and discovery statement goes through them.
     pub async fn fetch_all<T: DeserializeOwned>(self, db: &D1Database) -> Result<Vec<T>, String> {
         let stmt = self.prepare(db)?;
-        let result = stmt.all().await.map_err(|e| e.to_string())?;
+        let result = stmt.counted_all().await.map_err(|e| e.to_string())?;
         result.results::<T>().map_err(|e| e.to_string())
     }
 
@@ -156,12 +159,12 @@ impl Query {
         db: &D1Database,
     ) -> Result<Option<T>, String> {
         let stmt = self.prepare(db)?;
-        stmt.first::<T>(None).await.map_err(|e| e.to_string())
+        stmt.counted_first::<T>().await.map_err(|e| e.to_string())
     }
 
     pub async fn execute(self, db: &D1Database) -> Result<(), String> {
         let stmt = self.prepare(db)?;
-        stmt.run().await.map_err(|e| e.to_string())?;
+        stmt.counted_run().await.map_err(|e| e.to_string())?;
         Ok(())
     }
 }

@@ -47,6 +47,7 @@
 //! Round-2 review M3: the guard lives in the ONE shared loader
 //! (`routes::load_stored_beef`), so `/beef` and `/credit-beef` cannot drift.
 
+use crate::d1_ledger::Counted;
 use bsv_rs::transaction::{Beef, MerklePath};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
@@ -174,7 +175,7 @@ async fn bump_counter_by(db: Option<&worker::D1Database>, name: &str, delta: u64
             return;
         }
     };
-    if let Err(e) = stmt.run().await {
+    if let Err(e) = stmt.counted_run().await {
         worker::console_warn!("[beef-guard] counter {name} write failed: {e}");
     }
 }

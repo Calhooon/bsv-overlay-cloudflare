@@ -103,6 +103,7 @@
 //! pot, none of them rank-1 on the refund window, none of them a committed
 //! seat, none of them a chain win; the per-IP rate rule at the edge is the
 //! operator's step at the promotion (the same residual as `/cases`).
+use crate::d1_ledger::Counted;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
@@ -1539,7 +1540,7 @@ async fn read_pot_context(
     let row = db
         .prepare(crate::results::decoded_pots_sql(1))
         .bind(&[js(pot_txid_lc), js_num(i64::from(pot_vout))])?
-        .first::<PotRowD1>(None)
+        .counted_first::<PotRowD1>()
         .await?;
     Ok(row.and_then(|r| r.context()))
 }
@@ -1577,7 +1578,7 @@ async fn read_hop_context(
     let row = db
         .prepare(crate::hopsweep::HOP_CONTEXT_SQL)
         .bind(&[js(hop_txid_lc), js_num(i64::from(hop_vout)), js(poster_lc)])?
-        .first::<HopRowD1>(None)
+        .counted_first::<HopRowD1>()
         .await?;
     Ok(row.map(|r| crate::hopsweep::HopContext {
         identity: r.identity.to_ascii_lowercase(),
@@ -1601,7 +1602,7 @@ async fn count(
     let row = db
         .prepare(sql)
         .bind(binds)?
-        .first::<CountRowD1>(None)
+        .counted_first::<CountRowD1>()
         .await?;
     Ok(row.and_then(|r| r.n).map_or(0, |n| n as i64))
 }
@@ -1755,7 +1756,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                     js_num(now),
                     js_num(i64::from(*sig_valid)),
                 ])?
-                .run()
+                .counted_run()
                 .await?;
         }
         VerifiedRecord::Potrefund(r, refund_valid) => {
@@ -1772,7 +1773,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                     js_num(now),
                     js_num(i64::from(*refund_valid)),
                 ])?
-                .run()
+                .counted_run()
                 .await?;
             if *refund_valid {
                 // The late latch: a row filed at rank 0 earlier (the same
@@ -1780,7 +1781,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                 let latched = db
                     .prepare(POTREFUND_LATCH_SQL)
                     .bind(&[js(&r.txid)])?
-                    .run()
+                    .counted_run()
                     .await?;
                 if latched
                     .meta()
@@ -1812,7 +1813,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                     js_num(now),
                     js_num(*tier),
                 ])?
-                .run()
+                .counted_run()
                 .await?;
             let pot = r.pot_txid.as_str();
             let per_pot = overlay_discovery::result::storage::RESULT_ROWS_PER_POT as i64;
@@ -1841,7 +1842,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                     js(pot),
                     js_num(per_pot),
                 ])?
-                .run()
+                .counted_run()
                 .await?;
         }
         VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) => {
@@ -1860,7 +1861,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                     js_num(now),
                     js_opt(pay_txid),
                 ])?
-                .run()
+                .counted_run()
                 .await?;
             // The B3 lens fold L2: the INSERT is `OR IGNORE`, so a re-file of content already on file writes
             // nothing. Then nothing changed in what is owed: no stale mark, no `owed-changed` push, no `filed`
@@ -1883,7 +1884,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                     js_num(0),
                     js_num(now),
                 ])?
-                .run()
+                .counted_run()
                 .await?;
         }
     }
