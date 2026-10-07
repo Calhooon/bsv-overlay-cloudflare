@@ -225,7 +225,10 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // auth) and the operator's kill list (bearer INTERNAL_TOKEN) are served before the front door.
     if identity::is_front_door_exempt(&req.method(), &req.path()) {
         let mut resp = identity::serve_exempt(req, &env).await?;
-        stamp_cors(&mut resp, &identity_cors);
+        // The picture gets the app-origin set; the kill route, like every `/internal/*` route, gets no CORS.
+        if let Some(c) = &identity_cors {
+            c.apply(&mut resp);
+        }
         return Ok(resp);
     }
 

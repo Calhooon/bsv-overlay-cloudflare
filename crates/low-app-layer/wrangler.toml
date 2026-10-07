@@ -61,8 +61,9 @@ OVERLAY_URL = "https://low-overlay.dev-a3e.workers.dev"
 # bsv-low #451 slice B: the Arcade endpoint `/tx-any` asks FIRST for a tx the index holds without a verified bump
 # (our broadcaster's live word is the network witness; the couriers only when it does not know). Not a secret.
 ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
-# bsv-low #532: the path the IDENTITY binding (LOW's identity resolver) sees for the identity views, and the app
-# origins those views answer CORS to (comma separated, exact; unset = none). Not secrets.
+# bsv-low #532: the URL the IDENTITY binding (LOW's identity resolver) is asked for the identity views (any host:
+# over the binding only the path counts; the prod resolver has no workers.dev host), and the app origins those
+# views answer CORS to (comma separated, exact; unset = none; never localhost here, pinned). Not secrets.
 IDENTITY_URL = "https://low-identity-resolver.dev-a3e.workers.dev"
 IDENTITY_APP_ORIGINS = "https://bsvarcade.com,https://www.bsvarcade.com,https://low-pot.pages.dev"
 
@@ -182,7 +183,7 @@ service = "low-identity-resolver"
 # `POST /internal/identity/kill`). id is a placeholder, injected at deploy time like AUTH_SESSIONS'.
 [[kv_namespaces]]
 binding = "IDENTITY_KILL"
-id = "__LOW_APPLAYER_DEFAULT_KV_IDENTITY_KILL_ID__"  # low-app-layer-IDENTITY_KILL
+id = "__LOW_APPLAYER_DEFAULT_KV_IDENTITY_KILL_ID__"  # low-app-layer-identity-kill
 
 # ══════════════════════════════════════════════════════════════════════════
 # beta — the ISOLATED pre-release stack (bsv-low, 2026-08-12)
@@ -236,7 +237,7 @@ RELAY_URL = "https://low-relay-beta.dev-a3e.workers.dev"
 OVERLAY_URL = "https://low-overlay-beta.dev-a3e.workers.dev"
 ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
 # bsv-low #532 (see the prod vars): beta's resolver, and beta's app origins (the beta site, the fleet's harness
-# deployment, a local dev server).
+# deployment, a local dev server: localhost is on this beta list only, never prod's, pinned in identity_tests.rs).
 IDENTITY_URL = "https://low-identity-resolver-beta.dev-a3e.workers.dev"
 IDENTITY_APP_ORIGINS = "https://low-beta.pages.dev,https://low-harness.pages.dev,http://localhost:5173"
 # bsv-low #441 C6 (2026-09-14): STRICT on beta — the client's identity reads are
@@ -302,7 +303,7 @@ service = "low-identity-resolver-beta"
 
 [[env.beta.kv_namespaces]]
 binding = "IDENTITY_KILL"
-id = "__LOW_APPLAYER_BETA_KV_IDENTITY_KILL_ID__"  # low-app-layer-beta-IDENTITY_KILL
+id = "__LOW_APPLAYER_BETA_KV_IDENTITY_KILL_ID__"  # low-app-layer-identity-kill-beta
 
 [env.beta.durable_objects]
 bindings = [

@@ -11,55 +11,70 @@
 //! | `GET /identity/pic/:imageHash` | `GET /api/pf/picture/content/:imageHash` | anonymous only, served BEFORE the front door | `public, immutable, max-age=31536000` on a 200; `no-store` otherwise |
 //! | `POST /internal/identity/kill` `{imageHash, reason?, unkill?}` | none (the `IDENTITY_KILL` KV) | the operator's `INTERNAL_TOKEN` bearer, served BEFORE the front door | `no-store` |
 //!
-//! The callee paths are Zanaadu's app-layer routes at `2de902a`
-//! (`app-layer-lib/src/routes/pf.rs`, `identity.rs`, `pf_content.rs`), the
-//! contract until lane M29-3a writes the resolver's own CONTRACT.md. The
-//! `IDENTITY_URL` var names the host the callee sees; the binding carries the
-//! request (a URL fetch between two Workers of this account is error 1042).
+//! The callee paths and the batch body are the resolver's own contract,
+//! `workers/low-identity-resolver/CONTRACT.md` in bsv-low (Zanaadu's
+//! app-layer routes at `2de902a`, plus the resolver's merged `display` pick);
+//! the reconciled shape this module answers is bsv-low's
+//! `docs/IDENTITY-CONTRACT-2026-10-07.md`. The `IDENTITY_URL` var names the
+//! host the callee sees (any host: over the binding only the path counts); the
+//! binding carries the request (a URL fetch between two Workers of this
+//! account is error 1042).
 //!
-//! ## The field mapping (resolver answer to the #532 shape)
+//! ## The field mapping (resolver answer to the contract shape)
 //!
-//! Per key, from the resolver's `identities[<ik>]`:
-//! - `names`, `pictures`, `preference`: passed through BYTE FOR BYTE (raw JSON
-//!   values, never re-serialized), so the M29-6 parity harness can compare them
-//!   with Zanaadu's `/api/pf/identity` directly. A key the resolver did not
-//!   answer is `[]`, `[]`, `{"name":null,"picture":null}` (Zanaadu's own
+//! LOW re-derives NOTHING here: no display rule lives in this module. Per key,
+//! from the resolver's `identities[<ik>]`:
+//! - `userNumber`, `names`, `pictures`, `preference`: passed through BYTE FOR
+//!   BYTE (raw JSON values, never re-serialized), so the M29-6 parity harness
+//!   can compare them with Zanaadu's `/api/pf/identity` directly. `userNumber`
+//!   is always `null` on LOW (a PfOnly node). A key the resolver did not answer
+//!   is `null`, `[]`, `[]`, `{"name":null,"picture":null}` (Zanaadu's own
 //!   "holds nothing" shape).
-//! - `userNumber`: DROPPED (Zanaadu's registration number, not LOW's).
-//! - `display`: COMPUTED here by the #532 display rules (chain-only until Z3,
-//!   so `preference` does not steer it):
-//!   - `name` = the folded `name` of the OLDEST holding, a holding being a row
-//!     whose `ownerCanonical` AND `consented` are both true (Zanaadu's
-//!     "holdings / face = ownerCanonical && consented"; a bare transfer is not
-//!     consent): lowest `height`, unmined last, alphabetical tiebreak on the
-//!     folded name; `nameDisplay` = that row's `display` (the
-//!     committed casing; the folded name when absent); `since` = that row's
-//!     `{height, headTxid}`. No holding: all three `null`.
-//!   - `imageHash` = the NEWEST picture whose `ownerCanonical` AND `consented`
-//!     are both true (unmined first, then highest `height`, alphabetical
-//!     tiebreak on the hash), skipping a hash on the kill list (the first
-//!     [`PICTURE_KILL_LOOKAHEAD`] candidates are asked); `pictureUrl` =
-//!     `<this worker's origin>/identity/pic/<imageHash>`. A kill list that
-//!     cannot be read shows NO picture (fail closed) and the answer is
-//!     `no-store`.
-//!   - A non-canonical row is never shown as that person (#532: attribution
-//!     only where `ownerSigner == anyoneChild(ownerIdentity)`, which the
-//!     resolver reports as `ownerCanonical`).
+//! - `display`: the resolver's `display` (the lib's own pick, PF-SPEC 7.4)
+//!   MAPPED, never computed:
+//!   - `name`, `nameDisplay`: the pick's, as given.
+//!   - `imageHash`: the pick's `picture`, renamed; `null` when the pick has
+//!     none, when that hash is on the kill list (no fallback to another
+//!     picture: the kill list applies to the picture only, never to the name),
+//!     or when the kill list cannot be read (fail closed; the answer is then
+//!     `no-store`).
+//!   - `pictureUrl`: `<this worker's origin>/identity/pic/<imageHash>`, or
+//!     `null` with `imageHash`.
+//!   - `since`: `{height, headTxid}` of the entry's `names[]` row whose `name`
+//!     equals the pick's `name` (`height` `null` until mined); `null` when the
+//!     pick has no name, and `null` when no row matches. The pick and the rows
+//!     are two reads at the resolver, so a mirror write between them can leave
+//!     the pick naming no row of this body (the M29-3a display lens,
+//!     MEDIUM-1): a lookup miss, never a fault, counted as
+//!     `identity.display.sinceMiss` on `/health`.
+//!   - The pick's `ownerCanonical` (and its own `userNumber`) are DROPPED: the
+//!     contract's `display` has no such field, and the entry's `userNumber` is
+//!     already passed through.
+//!   - A resolver entry with NO `display` (a resolver older than M29-3a's
+//!     display merge) maps to the all-null display, counted as
+//!     `identity.display.absent`; it is never derived here.
 //! - The top-level `namespaceIds` is passed through byte for byte.
+//!
+//! On the shared fixtures the mapped display equals Zanaadu's
+//! `expected.display` for every holder; on LOW's live resolver carol, dave and
+//! erin's picks would differ, because Zanaadu's pick applies the holder's
+//! preference and LOW's mirror holds no preference records (the resolver's
+//! CONTRACT.md, "Known differences").
 //!
 //! The batch answers `{"namespaceIds", "identities": {<ik>: entry}}` with every
 //! requested key present (sorted); the single key form answers
-//! `{"namespaceIds", "identityKey", "names", "pictures", "preference",
-//! "display"}`; the verify route answers `{"identityKey", "display", "name",
-//! "picture"}` where `name` / `picture` are the resolver's verify bodies
-//! passed through byte for byte (`shardId`, `head {txid, vout, height}`,
-//! `root`, `chainRoot`, `match`, `leaf`, the 256 `siblings` and their
-//! `directions`: what the client's Verify recomputes), `null` when there is no
-//! display pick or the resolver answers 404 for it.
+//! `{"namespaceIds", "identityKey", "userNumber", "names", "pictures",
+//! "preference", "display"}`; the verify route answers `{"identityKey",
+//! "display", "name", "picture"}` where `name` / `picture` are the resolver's
+//! verify bodies of the MAPPED picks, passed through byte for byte (`shardId`,
+//! `head {txid, vout, height}`, `root`, `chainRoot`, `match`, `leaf`, the 256
+//! `siblings` and their `directions`: what the client's Verify recomputes),
+//! `null` when there is no pick or the resolver answers 404 for it.
 //!
-//! Byte for byte holds on the ANONYMOUS path. A caller that authenticates gets
-//! the same JSON re-serialized and signed by `lib.rs` (the crate's posture for
-//! every JSON route), `no-store`.
+//! Byte for byte holds on the ANONYMOUS path, which is the path the client
+//! uses (plain `fetch`, `credentials: 'omit'`). A caller that authenticates
+//! gets the same JSON re-serialized and signed by `lib.rs` (the crate's
+//! posture for every JSON route), `no-store`.
 //!
 //! ## The picture route's hardening
 //!
@@ -68,8 +83,9 @@
 //! (a declared `Content-Length` over it is refused before a byte is read, the
 //! stream is cut at it), `sha256(body)` equals the hash in the URL (so the
 //! route cannot be poisoned: it is hash-addressed and checked), and the MAGIC
-//! BYTES say png, jpeg, webp or gif ([`sniff_image`]; the resolver's claimed
-//! type is never read, so SVG and HTML can never pass). The 200 carries the
+//! BYTES say png, jpeg, webp, gif or avif ([`sniff_image`]; AVIF is `ftyp` at
+//! 4 and the brand `avif` at 8, Zanaadu's content route's own rule; the
+//! resolver's claimed type is never read, so SVG and HTML can never pass). The 200 carries the
 //! sniffed type, `x-content-type-options: nosniff`,
 //! `content-security-policy: sandbox` and the immutable cache line. Every
 //! refusal is a 404 `no-store` (the same body, not an oracle); a kill list or
@@ -85,22 +101,40 @@
 //!
 //! The `IDENTITY_KILL` KV namespace, owned by this worker: one key per killed
 //! hash, `identity-kill:<imageHash>` -> `{"reason", "killedAtMs"}`. Read with
-//! one point `get` on the picture route and one bulk `get` (at most 100 keys
-//! per call) on the JSON routes; written only by the kill route. KV is
-//! eventually consistent: a kill is seen everywhere within about a minute.
+//! one point `get` on the picture route and ONE bulk `get` of the picks (at
+//! most 100, one per key) on the JSON routes; written only by the kill route.
+//! KV is eventually consistent: a kill is seen everywhere within about a
+//! minute. Never wiped (`storage-ownership.json`): a wipe re-exposes every
+//! face the operator removed.
 //!
 //! ## Budgets (per isolate)
 //!
 //! Every GET route charges keys against two fixed one-minute windows: the
 //! caller's IP (`CF-Connecting-IP`) and, when the caller authenticated, its
 //! identity ([`IP_KEYS_PER_WINDOW`], [`IDENTITY_KEYS_PER_WINDOW`]; the batch
-//! charges its key count, the other routes one). Past either: 429
-//! `ERR_IDENTITY_BUDGET` with `scope`, `retryAfterMs` and `Retry-After`. The
-//! windows live in the isolate (no store is asked), so the bound is per
-//! isolate, a soft lever beside the edge's own; past [`BUDGET_MAX_TRACKED`]
-//! callers the expired windows are dropped, and if none expired every window
-//! is dropped (fail open, counted as `evictions`). No route here reads a D1
-//! row: the D1 rows-read ceiling of every route is ZERO (pinned).
+//! charges its key count, verify three (its three resolver calls), the other
+//! routes one). Past either: 429 `ERR_IDENTITY_BUDGET` with `scope`,
+//! `retryAfterMs` and `Retry-After`. The windows live in the isolate (no store
+//! is asked), so the bound is per isolate; past [`BUDGET_MAX_TRACKED`] callers
+//! the expired windows are dropped, and if none expired every window is
+//! dropped (fail open, counted as `evictions`: a caller rotating more than that
+//! many IPs inside one window clears them all). No route here reads a D1 row:
+//! the D1 rows-read ceiling of every route is ZERO beyond the per-isolate
+//! latch every route of this worker pays once (`schema::ensure_latch_columns`,
+//! pinned).
+//!
+//! The residuals, stated (the M29-3b lens, L2 to L4 and N9). The client reads
+//! anonymously, so the per-identity window binds only an authenticated caller
+//! and the per-IP window is the lever in practice. A caller with no
+//! `CF-Connecting-IP` (a service binding, local dev) shares the one window
+//! `unknown`. The JSON routes' `s-maxage` is a header only: this worker uses no
+//! Cache API, so Cloudflare does not store its answers and every request
+//! reaches the resolver, whose D1 pays for it (a 100-key batch reads every
+//! by-owner row of 100 keys there, twice: the lib's body and its pick). So a
+//! determined caller can drive the resolver's D1 at about (isolates it
+//! touches) x [`IP_KEYS_PER_WINDOW`] keys per minute per IP. No edge
+//! rate-limiting rule is set (CAP's decision of 2026-10-07): the per-isolate
+//! budgets stand alone.
 //!
 //! ## CORS
 //!
@@ -108,12 +142,16 @@
 //! only to an origin in `IDENTITY_APP_ORIGINS` (comma separated, exact match;
 //! unset = none), with `Vary: Origin`, and expose every header a browser must
 //! read: the BRC-104 reply headers, the session lane's seal and offer,
-//! `Retry-After` and `ETag`.
+//! `Retry-After` and `ETag`. The match is exact, so a Pages preview host
+//! (`<sha>.low-pot.pages.dev`) reads no names (fail-safe). `localhost` is on
+//! the beta list only, never prod's (pinned against `wrangler.toml`). The kill
+//! route answers with no CORS at all, like every `/internal/*` route.
 //!
 //! ## Counters
 //!
 //! `/health` carries `identity.routes.<route>.<outcome>` for this isolate,
-//! and the budget's limits and evictions.
+//! `identity.display.{sinceMiss, absent}`, and the budget's limits and
+//! evictions.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -149,12 +187,12 @@ pub const PICTURE_MAX_BYTES: usize = 64 * 1024;
 pub const RESOLVER_JSON_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// One resolver call's wall-clock bound.
 pub const RESOLVER_TIMEOUT_MS: u64 = 8_000;
-/// How many picture candidates per key are asked of the kill list.
-pub const PICTURE_KILL_LOOKAHEAD: usize = 3;
 /// KV's bulk get takes at most 100 keys.
 pub const KILL_BULK_CHUNK: usize = 100;
 /// The kill reason's cap, in bytes.
 pub const KILL_REASON_MAX_BYTES: usize = 500;
+/// The kill route's body cap, in bytes (a hash, a reason, a flag).
+pub const KILL_BODY_MAX_BYTES: usize = 4 * 1024;
 
 pub const JSON_CACHE_CONTROL: &str = "public, s-maxage=30, stale-while-revalidate=300";
 pub const PICTURE_CACHE_CONTROL: &str = "public, immutable, max-age=31536000";
@@ -236,7 +274,7 @@ pub fn is_normalized_name(s: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The image type the MAGIC BYTES declare, as its canonical mime, or `None`.
-/// Only png, jpeg, webp and gif; SVG (text) and everything else is `None`.
+/// Only png, jpeg, webp, gif and avif; SVG (text) and everything else is `None`.
 pub fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
     if bytes.starts_with(PNG) {
@@ -250,6 +288,11 @@ pub fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
     }
     if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         return Some("image/webp");
+    }
+    // Zanaadu's content route (`pf_content.rs`): an ISO-BMFF `ftyp` box whose
+    // major brand is `avif`.
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && &bytes[8..12] == b"avif" {
+        return Some("image/avif");
     }
     None
 }
@@ -278,37 +321,31 @@ pub fn picture_gate(image_hash_lc: &str, bytes: &[u8]) -> PictureGate {
 }
 
 // ---------------------------------------------------------------------------
-// The resolver's answer and the display rules
+// The resolver's answer and the display mapping
 // ---------------------------------------------------------------------------
 
-/// The fields of a resolver name item the display rules read (the item itself
-/// is passed through raw).
+/// The fields of a resolver name item `since` reads (the item itself is
+/// passed through raw).
 #[derive(Debug, Clone, Deserialize)]
 pub struct NameRow {
     pub name: String,
     #[serde(default)]
-    pub display: Option<String>,
-    #[serde(rename = "ownerCanonical", default)]
-    pub owner_canonical: bool,
-    #[serde(default)]
     pub height: Option<i64>,
     #[serde(rename = "headTxid", default)]
     pub head_txid: String,
-    #[serde(default)]
-    pub consented: bool,
 }
 
-/// The fields of a resolver picture item the display rules read.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PictureRow {
-    #[serde(rename = "imageHash")]
-    pub image_hash: String,
-    #[serde(rename = "ownerCanonical", default)]
-    pub owner_canonical: bool,
+/// The resolver's `display` (the lib's pick), the fields the mapping reads.
+/// Its `userNumber` and its owner flag are not read (dropped, see the module
+/// doc).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResolverPick {
     #[serde(default)]
-    pub consented: bool,
+    pub name: Option<String>,
+    #[serde(rename = "nameDisplay", default)]
+    pub name_display: Option<String>,
     #[serde(default)]
-    pub height: Option<i64>,
+    pub picture: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -318,7 +355,7 @@ pub struct Since {
     pub head_txid: String,
 }
 
-/// The #532 `display` block.
+/// The contract's `display` block.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Display {
     pub name: Option<String>,
@@ -331,72 +368,42 @@ pub struct Display {
     pub since: Option<Since>,
 }
 
-/// The display name: the OLDEST holding, canonical AND consented (lowest
-/// height, unmined last, alphabetical tiebreak on the folded name). Pure.
-pub fn display_name(names: &[NameRow]) -> Option<&NameRow> {
-    names
-        .iter()
-        .filter(|r| r.owner_canonical && r.consented)
-        .min_by(|a, b| {
-            (a.height.is_none(), a.height, &a.name).cmp(&(b.height.is_none(), b.height, &b.name))
-        })
+/// `since`: the `names[]` row whose `name` equals the pick's. A lookup, not a
+/// rule; `None` when the pick has no name or no row matches. Pure.
+pub fn since_of(pick: &ResolverPick, names: &[NameRow]) -> Option<Since> {
+    let name = pick.name.as_deref()?;
+    names.iter().find(|r| r.name == name).map(|r| Since {
+        height: r.height,
+        head_txid: r.head_txid.clone(),
+    })
 }
 
-/// The picture candidates, best first: canonical AND consented, the NEWEST
-/// first (unmined first, then highest height, alphabetical tiebreak on the
-/// hash), well-formed hashes only, at most [`PICTURE_KILL_LOOKAHEAD`]. Pure.
-pub fn picture_candidates(pictures: &[PictureRow]) -> Vec<String> {
-    let mut rows: Vec<(Option<i64>, String)> = pictures
-        .iter()
-        .filter(|r| r.owner_canonical && r.consented)
-        .filter_map(|r| parse_image_hash(&r.image_hash).map(|h| (r.height, h)))
-        .collect();
-    rows.sort_by(|a, b| {
-        // None (unmined) is the newest; then descending height; then the hash.
-        let rank = |h: &Option<i64>| match h {
-            None => (0u8, 0i64),
-            Some(v) => (1u8, -*v),
-        };
-        (rank(&a.0), &a.1).cmp(&(rank(&b.0), &b.1))
-    });
-    let mut out: Vec<String> = Vec::new();
-    for (_, h) in rows {
-        if !out.contains(&h) {
-            out.push(h);
-        }
-        if out.len() == PICTURE_KILL_LOOKAHEAD {
-            break;
-        }
-    }
-    out
-}
-
-/// The `display` block from the name rows and the picture candidates.
-/// `killed: None` = the kill list could not be read: no picture (fail closed).
-/// `origin` is this worker's origin (`https://host`), so `pictureUrl` points at
-/// THIS worker's picture route. Pure.
-pub fn display_for(
+/// The `display` block MAPPED from the resolver's pick. `pick: None` = the
+/// resolver sent no `display`: all null. `killed: None` = the kill list could
+/// not be read: no picture (fail closed). A killed pick shows no picture and
+/// nothing else in its place. `origin` is this worker's origin
+/// (`https://host`), so `pictureUrl` points at THIS worker's picture route.
+/// Pure.
+pub fn map_display(
+    pick: Option<&ResolverPick>,
     names: &[NameRow],
-    candidates: &[String],
     killed: Option<&HashSet<String>>,
     origin: &str,
 ) -> Display {
-    let mut d = Display::default();
-    if let Some(row) = display_name(names) {
-        d.name = Some(row.name.clone());
-        d.name_display = Some(row.display.clone().unwrap_or_else(|| row.name.clone()));
-        d.since = Some(Since {
-            height: row.height,
-            head_txid: row.head_txid.clone(),
-        });
+    let Some(pick) = pick else {
+        return Display::default();
+    };
+    let image_hash = match (pick.picture.as_ref(), killed) {
+        (Some(h), Some(killed)) if !killed.contains(h) => Some(h.clone()),
+        _ => None,
+    };
+    Display {
+        name: pick.name.clone(),
+        name_display: pick.name_display.clone(),
+        picture_url: image_hash.as_ref().map(|h| format!("{origin}{PICTURE_ROUTE_PREFIX}{h}")),
+        image_hash,
+        since: since_of(pick, names),
     }
-    if let Some(killed) = killed {
-        if let Some(h) = candidates.iter().find(|h| !killed.contains(*h)) {
-            d.picture_url = Some(format!("{origin}{PICTURE_ROUTE_PREFIX}{h}"));
-            d.image_hash = Some(h.clone());
-        }
-    }
-    d
 }
 
 fn raw(s: &str) -> Box<RawValue> {
@@ -413,20 +420,26 @@ struct ResolverBatch {
 
 #[derive(Deserialize)]
 struct ResolverEntry {
+    #[serde(rename = "userNumber", default)]
+    user_number: Option<Box<RawValue>>,
     names: Box<RawValue>,
     pictures: Box<RawValue>,
     #[serde(default)]
     preference: Option<Box<RawValue>>,
+    #[serde(default)]
+    display: Option<ResolverPick>,
 }
 
-/// One requested key, parsed: the raw parts and what the display rules read.
+/// One requested key, parsed: the raw parts, the pick and what `since` reads.
 pub struct ParsedEntry {
     pub key: String,
+    user_number_raw: Box<RawValue>,
     names_raw: Box<RawValue>,
     pictures_raw: Box<RawValue>,
     preference_raw: Box<RawValue>,
     pub names: Vec<NameRow>,
-    pub candidates: Vec<String>,
+    /// The resolver's pick; `None` when its entry carried no `display`.
+    pub pick: Option<ResolverPick>,
 }
 
 /// The resolver's batch answer for `keys`, every requested key present.
@@ -436,32 +449,52 @@ pub struct ParsedBatch {
 }
 
 /// Parse the resolver's `/api/pf/identity` body for the requested `keys`. A
-/// body that is not that shape (or whose name / picture items lack the fields
-/// the display rules read) is an error: the route answers 502, never a guess.
+/// body that is not that shape (a name item without `name`, a pick whose
+/// `picture` is not a 64-hex hash) is an error: the route answers 502, never
+/// a guess. A key the resolver did not answer is the empty shape with the
+/// all-null pick (what the resolver answers for a key that holds nothing).
 pub fn parse_resolver_batch(body: &[u8], keys: &[String]) -> std::result::Result<ParsedBatch, String> {
     let mut batch: ResolverBatch =
         serde_json::from_slice(body).map_err(|e| format!("resolver batch body: {e}"))?;
     let mut entries = Vec::with_capacity(keys.len());
     for key in keys {
-        let (names_raw, pictures_raw, preference_raw) = match batch.identities.remove(key) {
+        let (user_number_raw, names_raw, pictures_raw, preference_raw, pick) = match batch.identities.remove(key) {
             Some(e) => (
+                e.user_number.unwrap_or_else(|| raw("null")),
                 e.names,
                 e.pictures,
                 e.preference.unwrap_or_else(|| raw(r#"{"name":null,"picture":null}"#)),
+                e.display,
             ),
-            None => (raw("[]"), raw("[]"), raw(r#"{"name":null,"picture":null}"#)),
+            None => (
+                raw("null"),
+                raw("[]"),
+                raw("[]"),
+                raw(r#"{"name":null,"picture":null}"#),
+                Some(ResolverPick::default()),
+            ),
         };
         let names: Vec<NameRow> = serde_json::from_str(names_raw.get())
             .map_err(|e| format!("resolver names for {key}: {e}"))?;
-        let pictures: Vec<PictureRow> = serde_json::from_str(pictures_raw.get())
-            .map_err(|e| format!("resolver pictures for {key}: {e}"))?;
+        let pick = match pick {
+            Some(mut p) => {
+                if let Some(h) = p.picture.take() {
+                    p.picture = Some(
+                        parse_image_hash(&h).ok_or_else(|| format!("resolver pick for {key}: picture '{h}' is not a hash"))?,
+                    );
+                }
+                Some(p)
+            }
+            None => None,
+        };
         entries.push(ParsedEntry {
             key: key.clone(),
-            candidates: picture_candidates(&pictures),
+            user_number_raw,
             names,
             names_raw,
             pictures_raw,
             preference_raw,
+            pick,
         });
     }
     Ok(ParsedBatch {
@@ -474,6 +507,8 @@ pub fn parse_resolver_batch(body: &[u8], keys: &[String]) -> std::result::Result
 
 #[derive(Serialize)]
 struct EntryOut<'a> {
+    #[serde(rename = "userNumber")]
+    user_number: &'a RawValue,
     names: &'a RawValue,
     pictures: &'a RawValue,
     preference: &'a RawValue,
@@ -493,6 +528,8 @@ struct SingleOut<'a> {
     namespace_ids: &'a RawValue,
     #[serde(rename = "identityKey")]
     identity_key: &'a str,
+    #[serde(rename = "userNumber")]
+    user_number: &'a RawValue,
     names: &'a RawValue,
     pictures: &'a RawValue,
     preference: &'a RawValue,
@@ -500,23 +537,45 @@ struct SingleOut<'a> {
 }
 
 impl ParsedBatch {
-    /// Every candidate hash of every key, once (what the kill list is asked).
+    /// The picks' pictures, once each (what the kill list is asked: at most
+    /// one per key).
     pub fn kill_candidates(&self) -> Vec<String> {
         let mut seen = HashSet::new();
         self.entries
             .iter()
-            .flat_map(|e| e.candidates.iter())
+            .filter_map(|e| e.pick.as_ref().and_then(|p| p.picture.as_ref()))
             .filter(|h| seen.insert(h.as_str()))
             .cloned()
             .collect()
     }
 
+    /// How many entries carried no `display`, and how many picks name no row
+    /// of their own `names[]` (`since` missed). Pure.
+    pub fn display_notes(&self) -> (u64, u64) {
+        let absent = self.entries.iter().filter(|e| e.pick.is_none()).count() as u64;
+        let since_miss = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.pick
+                    .as_ref()
+                    .is_some_and(|p| p.name.is_some() && since_of(p, &e.names).is_none())
+            })
+            .count() as u64;
+        (absent, since_miss)
+    }
+
+    fn display_of(e: &ParsedEntry, killed: Option<&HashSet<String>>, origin: &str) -> Display {
+        map_display(e.pick.as_ref(), &e.names, killed, origin)
+    }
+
     fn entry_out<'a>(e: &'a ParsedEntry, killed: Option<&HashSet<String>>, origin: &str) -> EntryOut<'a> {
         EntryOut {
+            user_number: &e.user_number_raw,
             names: &e.names_raw,
             pictures: &e.pictures_raw,
             preference: &e.preference_raw,
-            display: display_for(&e.names, &e.candidates, killed, origin),
+            display: Self::display_of(e, killed, origin),
         }
     }
 
@@ -540,6 +599,7 @@ impl ParsedBatch {
         serde_json::to_string(&SingleOut {
             namespace_ids: &self.namespace_ids,
             identity_key: &e.key,
+            user_number: entry.user_number,
             names: entry.names,
             pictures: entry.pictures,
             preference: entry.preference,
@@ -690,10 +750,14 @@ async fn fetch_batch<R: Resolver>(r: &R, keys: &[String]) -> std::result::Result
         identity_warn!("[identity] resolver batch answered {}", up.status);
         return Err(Answer::error(502, "identity resolver refused the read", Outcome::UpstreamFault));
     }
-    parse_resolver_batch(&up.body, keys).map_err(|e| {
+    let batch = parse_resolver_batch(&up.body, keys).map_err(|e| {
         identity_warn!("[identity] {e}");
         Answer::error(502, "identity resolver answered an unexpected shape", Outcome::UpstreamFault)
-    })
+    })?;
+    let (absent, since_miss) = batch.display_notes();
+    DISPLAY_ABSENT.fetch_add(absent, Ordering::Relaxed);
+    DISPLAY_SINCE_MISS.fetch_add(since_miss, Ordering::Relaxed);
+    Ok(batch)
 }
 
 /// The kill-list read for the JSON routes: `None` on a fault (no pictures).
@@ -774,7 +838,7 @@ struct VerifyOut<'a> {
     picture: Option<&'a RawValue>,
 }
 
-/// `GET /identity/verify/:ik`: the display picks, then the resolver's SMT
+/// `GET /identity/verify/:ik`: the mapped picks, then the resolver's SMT
 /// proof of each (at most three resolver calls).
 pub async fn verify_answer<R: Resolver, K: KillList>(r: &R, k: &K, key: &str, origin: &str) -> Answer {
     let batch = match fetch_batch(r, &[key.to_string()]).await {
@@ -783,7 +847,7 @@ pub async fn verify_answer<R: Resolver, K: KillList>(r: &R, k: &K, key: &str, or
     };
     let killed = killed_or_none(k, &batch).await;
     let e = &batch.entries[0];
-    let display = display_for(&e.names, &e.candidates, killed.as_ref(), origin);
+    let display = map_display(e.pick.as_ref(), &e.names, killed.as_ref(), origin);
     let name = match display.name.as_deref().filter(|n| is_normalized_name(n)) {
         Some(n) => match fetch_verify(r, &format!("{RESOLVER_VERIFY_NAME_PATH}{n}")).await {
             Ok(v) => v,
@@ -854,6 +918,10 @@ pub async fn picture_answer<R: Resolver, K: KillList>(r: &R, k: &K, hash_param: 
     }
 }
 
+fn kill_body_too_large() -> Answer {
+    Answer::error(413, "body over 4 KB", Outcome::BadRequest)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KillBody {
@@ -868,6 +936,9 @@ struct KillBody {
 /// `POST /internal/identity/kill` after the bearer check: `{imageHash,
 /// reason?}` kills, `{imageHash, unkill: true}` lifts a kill.
 pub async fn kill_answer<K: KillList>(k: &K, body: &[u8], now_ms: i64) -> Answer {
+    if body.len() > KILL_BODY_MAX_BYTES {
+        return kill_body_too_large();
+    }
     let parsed: KillBody = match serde_json::from_slice(body) {
         Ok(b) => b,
         Err(_) => {
@@ -1024,12 +1095,16 @@ fn charge_isolate(ip: &str, identity: Option<&str>, units: u32) -> Option<Answer
 // ---------------------------------------------------------------------------
 
 static COUNTS: [[AtomicU64; 11]; 5] = [const { [const { AtomicU64::new(0) }; 11] }; 5];
+/// Resolver entries that carried no `display` (an old resolver): mapped all null.
+static DISPLAY_ABSENT: AtomicU64 = AtomicU64::new(0);
+/// Picks whose `name` is no row of the same body's `names[]`: `since` null.
+static DISPLAY_SINCE_MISS: AtomicU64 = AtomicU64::new(0);
 
 pub fn count(route: RouteId, outcome: Outcome) {
     COUNTS[route as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
 }
 
-/// The `/health` block: `routes.<route>.<outcome>` and the budget.
+/// The `/health` block: `routes.<route>.<outcome>`, `display` and the budget.
 pub fn health_json() -> serde_json::Value {
     let mut routes = serde_json::Map::new();
     for (r, rname) in ROUTE_NAMES.iter().enumerate() {
@@ -1042,6 +1117,10 @@ pub fn health_json() -> serde_json::Value {
     let evictions = BUDGET.with(|b| b.borrow().evictions);
     serde_json::json!({
         "routes": routes,
+        "display": {
+            "sinceMiss": DISPLAY_SINCE_MISS.load(Ordering::Relaxed),
+            "absent": DISPLAY_ABSENT.load(Ordering::Relaxed),
+        },
         "budget": {
             "windowMs": BUDGET_WINDOW_MS,
             "ipKeysPerWindow": IP_KEYS_PER_WINDOW,
@@ -1083,7 +1162,7 @@ pub fn cors_headers(origin: Option<&str>) -> Vec<(&'static str, String)> {
     let mut h = vec![("Vary", "Origin".to_string())];
     if let Some(o) = origin {
         h.push(("Access-Control-Allow-Origin", o.to_string()));
-        h.push(("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS".to_string()));
+        h.push(("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS".to_string()));
         h.push((
             "Access-Control-Allow-Headers",
             format!("Content-Type, {auth_list}, {lane_allow}"),
@@ -1278,6 +1357,8 @@ fn to_response(a: Answer) -> Result<Response> {
     Ok(resp)
 }
 
+/// The caller's IP; a caller without `CF-Connecting-IP` (a service binding,
+/// local dev) shares the one window `unknown`.
 fn client_ip(req: &Request) -> String {
     req.headers()
         .get("CF-Connecting-IP")
@@ -1327,7 +1408,9 @@ async fn run<R: Resolver>(
             let Some(key) = parse_identity_key(key_param) else {
                 return Answer::error(400, "not a compressed identity key (66 hex chars, 02/03 prefix)", Outcome::BadRequest);
             };
-            if let Some(a) = charge_isolate(&client_ip(req), identity, 1) {
+            // Verify costs three resolver calls, so it is charged three keys.
+            let units = if route == RouteId::Verify { 3 } else { 1 };
+            if let Some(a) = charge_isolate(&client_ip(req), identity, units) {
                 return a;
             }
             if route == RouteId::Single {
@@ -1385,6 +1468,16 @@ pub async fn serve_exempt(mut req: Request, env: &Env) -> Result<Response> {
         if !crate::internal_events::internal_bearer_ok(&req, env) {
             count(RouteId::Kill, Outcome::Unauthorized);
             return to_response(Answer::error(401, "unauthorized", Outcome::Unauthorized));
+        }
+        let declared = req
+            .headers()
+            .get("Content-Length")
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        if declared.is_some_and(|n| n > KILL_BODY_MAX_BYTES) {
+            count(RouteId::Kill, Outcome::BadRequest);
+            return to_response(kill_body_too_large());
         }
         let body = req.bytes().await.unwrap_or_default();
         let now = worker::Date::now().as_millis() as i64;
