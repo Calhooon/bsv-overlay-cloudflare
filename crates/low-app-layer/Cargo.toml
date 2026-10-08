@@ -35,7 +35,7 @@ worker = { version = "0.8", features = ["d1"] }
 # middleware, pinned from crates.io at the same major the tower pins
 # (`workers/low-watchtower` pins "0.3"; NEVER a cargo path-patch — a dead
 # path-patch once stranded the relay on 0.2.0, see the middleware-lineage
-# note in bsv-low's decision log). Floor 0.3.8 (bsv-low #577): the session
+# note in bsv-low's decision log). Exactly 0.3.8 (bsv-low #577; a caret would take the release-branch 0.3.9): the session
 # lane (0.3.4/0.3.5, D12) from the registry, no git patch; never 0.3.7, which
 # shipped without the payment path's output check.
 bsv-middleware-cloudflare = "=0.3.8"
