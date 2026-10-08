@@ -251,8 +251,8 @@ SPENT row beside the new head, no UTXO.)
 
 Who replays: the queue (`/submit`, `/arc-ingest`) replays a faulted submit
 up to 3 times (`max_retries`), then the message goes to the dead letter
-queue where one is configured (`wrangler.low.toml`); nothing replays it after
-that. GASP replays only a transaction whose outputs are NOT held (its UTXO
+queue, whose consumer parks it in D1 (bsv-low #576, "The dead letters"
+below); only the operator's lever replays it after that. GASP replays only a transaction whose outputs are NOT held (its UTXO
 failed, the cursor stayed, the next tick walks it again): one whose outputs
 landed is known to the walk and is never submitted again, so its applied row
 is written by its spender (H2) or by a later submit of it at the door.
@@ -468,11 +468,13 @@ replay then landing over its coin; and on a node with a GASP peer, a chain
 whose successors were dead-lettered, which the walk brings in from the
 peer. What needs the operator's lever: a dead-lettered predecessor, and every
 successor dead-lettered while waiting for it (the predecessor landing later
-does not bring a dead letter back). The lever, bsv-low #576 (filed, not
-built), parks `low-overlay-mutations-dlq` in D1 and re-drives it on
-`POST /internal/redrive-dead-letters`, at most 50 letters per call, OLDEST
-first, so a predecessor's letter is replayed before its successors'; each
-replay is the same bytes through the same door, dedup-safe. What the lever
+does not bring a dead letter back). The lever, bsv-low #576 (built; see
+"The dead letters" below), parks `low-overlay-mutations-dlq` in D1
+(`mutation_dead_letters`) and re-drives it on
+`POST /internal/redrive-dead-letters`, at most 200 letters per call (default
+25), OLDEST first, so a predecessor's letter is replayed before its
+successors'; each replay is the same bytes through the same door,
+dedup-safe, and a letter is re-driven at most 3 times. What the lever
 does NOT heal: a predecessor that never lands whatever replays it, carried
 or absent (its manager fails it for good, its own walk refuses it, its
 landing or its re-judgement does not fit in the 256 reads, a decoy no peer
@@ -537,6 +539,47 @@ subject already holding its output (the lens fold, L4) trusts that output;
 one written by a finalize over a predecessor the peer pruned, or one an
 eviction stripped of its predecessor's rows, is recorded over an unlanded
 predecessor: the pruned case is limit (4), the eviction L2's guard.
+
+## The dead letters (bsv-low #576)
+
+A mutation the queue dead-letters (a `/submit` or `/arc-ingest` replay that
+was not durable on any of its 1 + `max_retries` deliveries, an e1d "not now"
+over a predecessor that does not land included) is never lost and never
+re-driven blind (`dead_letters.rs`). The main consumer notes each failed
+replay's fault and attempt on a `failing` row (the platform gives a Rust
+consumer no delivery count) and resolves the row on an ack. The DLQ consumer
+(the same `#[event(queue)]`, branched on a queue name ending `-dlq`; bound in
+`wrangler.toml`, prod and beta of `wrangler.low.toml`, `max_batch_size = 10`,
+`max_retries = 10`, no DLQ of its own) PARKS the message as is in
+`mutation_dead_letters` (key: subject txid by D5 and the sorted topics; the
+fault, the attempts, `parked_at`, a history entry per park), once: a
+redelivery of a parked letter changes nothing. Nothing deletes from the table
+(never-wipe, rebuild `lost`: once the DLQ acks, the row is the only copy).
+
+`POST /internal/redrive-dead-letters` (bearer `INTERNAL_TOKEN`, as
+`/internal/reorg`), body `{"limit"?: n, "txid"?: "<key>"}`: `limit` default
+25, clamped to 200; reads the oldest parked rows (or one txid's), claims each
+by a compare-and-set (`status = 'parked' AND redrives = <read>`) and only then
+sends it once to `MUTATION_QUEUE` as a fresh message (its attempt count reset
+to 0: 1 + `max_retries` deliveries again), stamped `reason = "redrive"` and
+its key, so a re-death parks the SAME row with its history. Two calls never
+enqueue one letter twice; a send fault reverts the claim. A letter re-driven
+`MAX_REDRIVES` (3) times that parks again is exhausted: never selected again,
+listed in `/health/invariants.deadLetters.exhausted` (with the counts by
+status, the oldest parked and the last re-drive). Counters
+`dead_letters_parked_total`, `dead_letters_redriven_total`,
+`dead_letters_still_failing_total`. Nothing re-drives on its own (S2: a dead
+letter is the operator's decision). Reference parity: ts-stack's
+`overlay-express` has no queue and no dead letter; this lifecycle is our
+platform's addition. Limits, stated: eleven D1 faults in a row on the DLQ
+consumer's park lose that letter (logged with its txid); a claimed letter
+whose send faulted and whose revert faulted too stays `redriven`, unsent,
+shown in the health counts. Pins: `cargo test --manifest-path
+workers/Cargo.toml -p bsv-overlay-cloudflare --lib e576`; the route tier
+`tools/lane-e576/dead_letter_route_ci.mjs` (`make ci-d1-budget`: a real
+"not now" successor dead-lettered and parked through the local queue, the
+lever's bearer, limit, one-enqueue claim and ceiling, a re-park with its
+history, the health block), RED on `835b80c`.
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 

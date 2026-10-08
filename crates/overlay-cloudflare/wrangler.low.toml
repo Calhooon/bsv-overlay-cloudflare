@@ -140,6 +140,15 @@ max_retries = 3
 # design).
 dead_letter_queue = "low-overlay-mutations-dlq"
 
+# bsv-low #576: the dead letters are CONSUMED, by this worker, and parked in D1
+# (`mutation_dead_letters`); only the operator re-drives them
+# (`POST /internal/redrive-dead-letters`, bearer INTERNAL_TOKEN). A park that
+# faults is retried here; no dead letter queue of its own.
+[[queues.consumers]]
+queue = "low-overlay-mutations-dlq"
+max_batch_size = 10
+max_retries = 10
+
 [triggers]
 crons = ["*/15 * * * *"]
 
@@ -279,6 +288,12 @@ max_retries = 3
 # S2: `wrangler queues create low-overlay-mutations-beta-dlq` before the
 # beta deploy (see the prod consumer's note).
 dead_letter_queue = "low-overlay-mutations-beta-dlq"
+
+# bsv-low #576: the beta dead letters, parked in beta's D1 (see the prod note).
+[[env.beta.queues.consumers]]
+queue = "low-overlay-mutations-beta-dlq"
+max_batch_size = 10
+max_retries = 10
 
 [env.beta.triggers]
 crons = ["*/15 * * * *"]

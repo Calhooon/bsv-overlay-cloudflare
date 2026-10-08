@@ -395,6 +395,10 @@ ci-route: ci-d1-budget
 # landing-guard cell (`tools/lane-e1d`), which seeds an OPEN eviction row into that worker's `--persist-to` D1
 # and reads its tables back with `wrangler d1 execute --local`: a carried predecessor under an open eviction is
 # never landed, and its successor is "not now".
+# Then bsv-low #576's dead-letter cell (`tools/lane-e576`, the overlay given `INTERNAL_TOKEN`): a real "not now"
+# successor dead-lettered through the local queue and PARKED in `mutation_dead_letters`, the lever's bearer, its
+# limit, its one-enqueue claim and its ceiling over seeded letters, a re-driven letter parked again with its
+# history, and `/health/invariants.deadLetters`.
 #
 # Ports: LANE_BASE+9 (app layer) and LANE_BASE+10 (overlay), :8800 and :8801 by default; the same pre-flight,
 # bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network: no
@@ -465,13 +469,15 @@ ci-d1-budget:
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
 	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:true \
 	    --var ARCADE_URL:http://127.0.0.1:9 \
+	    --var INTERNAL_TOKEN:ci-internal-tok \
 	) > "$$ov_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PO/listTopicManagers "$$ov_log" "overlay"; \
 	node tools/lane-499/d1_budget_route_ci.mjs http://127.0.0.1:$$PA http://127.0.0.1:$$PO; \
 	python3 scripts/d1-census.py --self-test; \
 	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO; \
-	node tools/lane-e1d/landing_guard_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"
+	node tools/lane-e1d/landing_guard_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
+	node tools/lane-e576/dead_letter_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`

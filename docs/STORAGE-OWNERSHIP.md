@@ -36,7 +36,7 @@ The resolver (`workers/low-identity-resolver`, lane M29-3a) reads the D1. What i
 
 ## The tables of `low-overlay-db`
 
-55 rows: 50 owned by `overlay-cloudflare`, 5 by `low-app-layer` (`hopsweep_records`, `proof_posts`, `owed_rows`, `owed_state`, `hop_chain_probes`). 22 are never-wipe: the money tables and filings (`pot_records`, `potparty_records`, `potrefund_records`, `hopsweep_records`, `hopparty_records`, `result_markers_v2`, `collected_markers_v2`, `proof_posts`), the eviction ledger (`pot_evictions` and its 11 `_evicted` twins), the dead v1 `collected_markers` (the copy source of v2) and `banned_hosts` (the operator's word, held nowhere else).
+56 rows: 51 owned by `overlay-cloudflare`, 5 by `low-app-layer` (`hopsweep_records`, `proof_posts`, `owed_rows`, `owed_state`, `hop_chain_probes`). 23 are never-wipe: the money tables and filings (`pot_records`, `potparty_records`, `potrefund_records`, `hopsweep_records`, `hopparty_records`, `result_markers_v2`, `collected_markers_v2`, `proof_posts`), the eviction ledger (`pot_evictions` and its 11 `_evicted` twins), the dead v1 `collected_markers` (the copy source of v2) `banned_hosts` (the operator's word, held nowhere else) and `mutation_dead_letters` (the parked dead letters, #576: the only copy once the DLQ acks).
 
 The filed rows of `potparty_records`, `potrefund_records`, `result_markers_v2`, `collected_markers_v2` and `lb_marker_rows` are written today only by the app layer's `/record` (`crates/low-app-layer/src/record_post.rs`); the overlay is still named their owner, as it holds the schema and its topic managers wrote the old era's rows.
 
@@ -79,6 +79,7 @@ The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` r
 | `ops_counters` | overlay-cloudflare | low-app-layer: INSERT | none | transient | no | operator counters |
 | `ops_heartbeat` | overlay-cloudflare | none | none | transient | no | a heartbeat |
 | `submit_refusals` | overlay-cloudflare | none | low-app-layer | transient | no | a census window (#366) |
+| `mutation_dead_letters` | overlay-cloudflare | none | none | lost | **yes** | bsv-low #576: the parked dead letters; once the DLQ consumer acks a letter this row is its only copy, and the operator's lever re-drives from it; nothing deletes from it |
 | `banned_hosts` | overlay-cloudflare | none | none | lost | **yes** | the operator's bans: nothing else holds them (export first) |
 | `ship_records` | overlay-cloudflare | none | none | chain | no | other overlays' adverts; tm_ship is not registered on LOW (empty) |
 | `slap_records` | overlay-cloudflare | none | none | chain | no | as ship_records |
@@ -104,6 +105,7 @@ The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` r
 
 - #470 section 2.1 names "the app layer's record path" as a writer of `pot_records`. No production statement of `crates/low-app-layer` writes `pot_records` (its only statement there is the catch-up ALTER); the block-event pass the app layer drives reaches the overlay through the `OVERLAY` service binding, and the overlay writes the row.
 - `submit_refusals` (the #366 census window) is not in #470's inventory; it is listed here as `transient`.
+- `mutation_dead_letters` (#576, after #470) is not in #470's inventory; it is listed here as never-wipe, `lost`.
 - `hop_chain_probes` is owned here by the app layer (it writes the memos); the overlay holds INSERT and DELETE on it (the reorg mark and the expiry, `hop_probe_memos.rs`).
 - The never-wipe set adds to #470 section 3 (each under the ruling's "plus what the storage manifest #474 names"): `collected_markers` v1 (#470: "n/a, no"); `banned_hosts` (#470: "lost (export first)", not in section 3); `proof_posts`, `result_markers_v2` and `collected_markers_v2` (not in section 3); the 11 `_evicted` twins never-wipe unconditionally, where #470 item 8 says "while any eviction is unresolved"; the identity node's D1, R2 bucket, KV and queue.
 

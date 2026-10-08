@@ -856,6 +856,17 @@
    "why": "a census window (#366)"
   },
   {
+   "name": "mutation_dead_letters",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "the dead-lettered mutation messages (bytes, topics, mode), their last fault, attempts, status, re-drives and park history",
+   "why": "bsv-low #576: once the DLQ consumer acks a dead letter this row is its only copy, and the operator's lever re-drives from it; nothing deletes from it"
+  },
+  {
    "name": "banned_hosts",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

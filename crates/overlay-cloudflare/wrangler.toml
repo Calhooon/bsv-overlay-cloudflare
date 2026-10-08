@@ -90,6 +90,16 @@ binding = "MUTATION_QUEUE"
 queue = "overlay-mutations"
 max_batch_size = 1
 max_retries = 3
+# bsv-low #576: a replay that still faults after max_retries is dead-lettered
+# and PARKED in D1 by the consumer below (never a silent drop); only the
+# operator re-drives it (`POST /internal/redrive-dead-letters`). Create the
+# queue before deploying: `wrangler queues create overlay-mutations-dlq`.
+dead_letter_queue = "overlay-mutations-dlq"
+
+[[queues.consumers]]
+queue = "overlay-mutations-dlq"
+max_batch_size = 10
+max_retries = 10
 
 [triggers]
 crons = ["*/15 * * * *"]

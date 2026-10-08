@@ -49,6 +49,10 @@ pub struct MutationMessage {
     /// parses.
     #[serde(default)]
     pub reason: String,
+    /// bsv-low #576: set on a message the operator re-drove from the parked dead letters (its letter's key and the
+    /// re-drive's number), so a re-death parks the SAME row. Absent on every S2 replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redrive: Option<crate::dead_letters::RedriveTag>,
 }
 
 /// The reason stamped on an S2 replay message.
@@ -103,6 +107,7 @@ pub fn replay_message(
         topics: topics.to_vec(),
         mode: mode_wire(mode).to_string(),
         reason: reason.to_string(),
+        redrive: None,
     })
 }
 
@@ -243,6 +248,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v.reason, "");
+        assert_eq!(v.redrive, None, "bsv-low #576: a message from before the lever parses too");
         assert_eq!(v.topics, vec!["tm_pot".to_string()]);
     }
 }

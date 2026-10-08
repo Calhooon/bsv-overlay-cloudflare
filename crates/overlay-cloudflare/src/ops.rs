@@ -180,6 +180,13 @@ pub const COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE: &str = "admit_fast_reevicted
 /// bsv-low #575 (the E1D delta-2 fold, L2): a carried predecessor the engine was about to land first from a
 /// successor's BEEF, refused BEFORE its write because it is under an OPEN eviction (the successor's topic waits).
 pub const COUNTER_LANDING_REFUSED_EVICTED: &str = "landing_refused_evicted_total";
+/// bsv-low #576: dead letters PARKED in `mutation_dead_letters` by the DLQ consumer (a re-park of a re-driven letter
+/// included; a DLQ redelivery of a parked letter is not counted twice).
+pub const COUNTER_DEAD_LETTERS_PARKED: &str = "dead_letters_parked_total";
+/// bsv-low #576: parked letters the operator's lever re-enqueued (`POST /internal/redrive-dead-letters`).
+pub const COUNTER_DEAD_LETTERS_REDRIVEN: &str = "dead_letters_redriven_total";
+/// bsv-low #576: re-driven letters that dead-lettered again and were parked again.
+pub const COUNTER_DEAD_LETTERS_STILL_FAILING: &str = "dead_letters_still_failing_total";
 /// loop 18: an eviction pass that could not prove every table clean (a faulted read, a survivor after the
 /// second move) — the open marker stands; the write-side guard and the next eviction converge.
 pub const COUNTER_ADMIT_FAST_EVICT_INCOMPLETE: &str = "admit_fast_evict_incomplete_total";
@@ -867,6 +874,9 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
     // unknown, never as fine) — added here rather than in the literal above,
     // which is at serde_json's `json!` recursion limit.
     for name in [
+        COUNTER_DEAD_LETTERS_PARKED,
+        COUNTER_DEAD_LETTERS_REDRIVEN,
+        COUNTER_DEAD_LETTERS_STILL_FAILING,
         COUNTER_ARC_INGEST_SEEN_LATCHED,
         COUNTER_ARC_INGEST_EVICTED,
         COUNTER_ARC_INGEST_READMITTED,
@@ -1151,6 +1161,7 @@ pub async fn health_invariants(
     let status = if strict && dead { 503 } else { 200 };
     let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);
     let mut index_janitor = index_janitor_backlog(db).await;
+    let dead_letters = crate::dead_letters::health_json(db).await;
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);
     let body = json!({
@@ -1201,6 +1212,9 @@ pub async fn health_invariants(
         // bsv-low #499: this isolate's D1 rows ledger, the per-route running maxima since boot (what
         // `scripts/d1-census.py` reads before a promotion; the request that serves this body is not in it yet).
         "d1Budget": crate::d1_ledger::budget_json(),
+        // bsv-low #576: the parked dead letters (count by status, the oldest parked, the last re-drive, the letters
+        // past the re-drive ceiling); `readable: false` = the table is unreadable, distinct from none.
+        "deadLetters": dead_letters,
     });
 
     let mut resp = Response::from_json(&body)?.with_status(status);

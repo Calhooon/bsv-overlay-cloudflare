@@ -456,7 +456,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 157 → 160 for bsv-low #469 decision 3 (2026-09-19): `hopsweep_records` + its two indexes (the filed hop sweeps).
 /// 160 → 162 for bsv-low #486 (2026-10-06): `submit_refusals` + its age index (the door's refusal ledger).
 /// 162 → 163 for bsv-low #492 (2026-10-07, the B3 lens fold M1): `collected_markers_v2.payTxid` (one additive ALTER).
-pub const OVERLAY_MIGRATION_COUNT: usize = 163;
+/// 163 → 165 for bsv-low #576 (2026-10-08): `mutation_dead_letters` + its status index (the parked dead letters).
+pub const OVERLAY_MIGRATION_COUNT: usize = 165;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1710,6 +1711,12 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // ALTER; the runner ignores the re-run "duplicate column" error. The app layer READS and WRITES it, so it
     // issues the byte-identical catch-up (`low-app-layer/src/schema.rs`).
     "ALTER TABLE collected_markers_v2 ADD COLUMN payTxid TEXT",
+    // bsv-low #576 (2026-10-08): THE PARKED DEAD LETTERS. A mutation the queue dead-lettered after its replays
+    // (`low-overlay-mutations-dlq`) is written here by the DLQ consumer and re-driven only by the operator's lever
+    // (`POST /internal/redrive-dead-letters`); the failing replays note their fault first (`dead_letters.rs`).
+    // Never wiped, never deleted from: once the DLQ message is acked this row is its only copy.
+    crate::dead_letters::DEAD_LETTERS_CREATE,
+    crate::dead_letters::DEAD_LETTERS_INDEX,
 ];
 
 // =============================================================================
