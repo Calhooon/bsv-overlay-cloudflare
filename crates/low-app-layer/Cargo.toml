@@ -38,7 +38,7 @@ worker = { version = "0.8", features = ["d1"] }
 # note in bsv-low's decision log). Floor 0.3.8 (bsv-low #577): the session
 # lane (0.3.4/0.3.5, D12) from the registry, no git patch; never 0.3.7, which
 # shipped without the payment path's output check.
-bsv-middleware-cloudflare = "0.3.8"
+bsv-middleware-cloudflare = "=0.3.8"
 serde.workspace = true
 # bsv-low #532: `raw_value` so the identity views pass the resolver's JSON through byte for byte.
 serde_json = { workspace = true, features = ["raw_value"] }
