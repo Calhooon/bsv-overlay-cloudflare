@@ -386,7 +386,7 @@
    "rebuild_class": "chain",
    "never_wipe": false,
    "holds": "the engine's applied-transaction marks",
-   "why": "dedup marks, re-derived on re-admission"
+   "why": "dedup marks, re-derived on re-admission; the successor rule reads a row as landed (bsv-low #575), so never wiped without outputs"
   },
   {
    "name": "low_records",

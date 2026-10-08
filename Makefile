@@ -391,6 +391,10 @@ ci-route: ci-d1-budget
 # scenario and reds BY NAME when a figure passes its ceiling (`tools/lane-499/ceilings.json`, the table and the
 # margin in `docs/D1-BUDGETS.md`), then pins the brain's recompute ceiling through the route.
 # `D1_BUDGET_MEASURE=1 make ci-d1-budget` prints the measured table and enforces nothing.
+# Last, on the same overlay worker (after the budget legs, so their figures are untouched): bsv-low #575's
+# landing-guard cell (`tools/lane-e1d`), which seeds an OPEN eviction row into that worker's `--persist-to` D1
+# and reads its tables back with `wrangler d1 execute --local`: a carried predecessor under an open eviction is
+# never landed, and its successor is "not now".
 #
 # Ports: LANE_BASE+9 (app layer) and LANE_BASE+10 (overlay), :8800 and :8801 by default; the same pre-flight,
 # bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network: no
@@ -466,7 +470,8 @@ ci-d1-budget:
 	wait_up http://127.0.0.1:$$PO/listTopicManagers "$$ov_log" "overlay"; \
 	node tools/lane-499/d1_budget_route_ci.mjs http://127.0.0.1:$$PA http://127.0.0.1:$$PO; \
 	python3 scripts/d1-census.py --self-test; \
-	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO
+	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO; \
+	node tools/lane-e1d/landing_guard_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`

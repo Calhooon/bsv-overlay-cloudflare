@@ -257,15 +257,111 @@ failed, the cursor stayed, the next tick walks it again): one whose outputs
 landed is known to the walk and is never submitted again, so its applied row
 is written by its spender (H2) or by a later submit of it at the door.
 
-A successor that found no previous coin and admits nothing while a
-predecessor has NOT LANDED is reported as a fault (`predecessor_not_landed`)
-and not recorded as applied. Known two ways: the engine saw the predecessor
-fault (one invocation's memory), or the store says so
-(`Engine::unlanded_predecessor`, any invocation): a transaction whose body
-the submitted BEEF carries, with no applied row, no output held, spending a
-coin the topic holds (or a coin of another such transaction). "Landed" needs
+A successor that found no previous coin while a predecessor's landing is
+UNKNOWN is reported as a fault (`predecessor_not_landed`), nothing of it is
+written and it is not recorded as applied (#559 for one that admits nothing;
+lane E1D, bsv-low #575 and zanaadu-v2 #365, 2026-10-08, for one the manager
+admits WITHOUT its coin, the pf head manager's case: it was inserted and
+recorded, and the predecessor, landed later, stood unspent beside the tip).
+"Landed" is an applied row in the topic or an output held there. Known four
+ways: the engine saw the predecessor fault (one invocation's memory, every
+door, the finalize submit included), or the store says so
+(`Engine::unlanded_predecessor`, any invocation, never at a finalize submit)
+of an unlanded transaction that is a PREDECESSOR because (a) its body is in
+the BEEF and it spends a coin the topic holds (or a coin of another such
+transaction); (b) its body is in the BEEF, it spends no coin the topic holds,
+the manager NAMES the output the walk spends of it (`identify_needed_inputs`
+over the transaction that spends it) and a dry run of the manager over that
+body with no coins would admit that named output (the OPENER, E1D: the cure
+D17 named; a manager `Err` there is "not now", its typed refusal
+`NoAdmissibleOutputs` is not); or (c) its body is NOT in the BEEF (a PROVEN
+successor carries none) and the manager names the outpoint as overlay history
+(D13's word; an `Err` names nothing). The dry run asks only of a NAMED output
+(the E1D lens fold, H1): run on every unheld body, a manager that admits on
+shape made a spend of a shape-admissible output this node never held (a
+revocation of an ad it never saw; a stranger's own few-sat SHIP output) "not
+now" on every presentation, three replays and a dead letter each. A
+successor that admits nothing starts the walk from every input; one that
+admits starts it only from the inputs the manager NAMES, and the engine's
+memory looks only at those too (the lens fold, L1), so under a manager that
+names nothing (all 16 of this workspace) an admitting successor is asked
+nothing, as in the reference, and its BEEF is not even parsed; a successor
+that admits NOTHING is still asked of every input, so it waits for, or has
+landed first, a carried body that spends a coin the topic holds (case a):
+there the store differs from the reference's, which records the successor and
+never admits that body (the E1D delta fold, L3). The manager is
+asked over the SUBJECT-NAMED BEEF (BRC-95 atomic, what the lookup services
+get; the lens fold, M2): over the submitted bytes a manager that parses
+`from_beef(_, None)` took the wire-LAST transaction of an out-of-order BEEF
+and named an ancestor's inputs, and the cure turned itself off.
+
+The door lands a CARRIED predecessor first (the lens fold, M1; the walk's rule,
+at the door; `Engine::land_carried`): when the question names an unlanded
+predecessor whose body the BEEF carries (cases a and b), that body is
+submitted on its own to the topic (its atomic BEEF out of the successor's, no
+off-chain values, never a broadcast), ancestors first on an explicit stack,
+and the successor's topic is then judged again over the coin it now finds.
+The first that does not land ends it: the successor waits. Each link is
+ADMITTED once (the E1D delta fold, L4): a link blocked by the one under it is
+asked only a dry run and writes nothing, and is admitted for real once that
+one landed. Each body is WALKED once per topic of the submit: the successor's own SPV walk
+already covered every body it reaches without crossing a proven one, so
+those are not walked again; a body reached only through a proven one gets
+its own walk, trusting what the submit already walked. The submit's 256
+reads bound EVERYTHING the door reads past the subject's own validation and
+writes (the delta fold, M1): the question's reads, each landing's (its
+applied row, one coin per input, and its writes' one read per coin, charged
+before it starts) and each re-judgement of the successor after a landing
+(its applied row, one coin per input, charged BEFORE the landing: a landing
+whose re-judgement does not fit is not made). A carried chain too deep for
+them is "not now"; the links that landed before the reads ran out stay
+landed and the replay goes on from them. A wide successor lands what the
+256 leave room for after each re-judgement (one per presentation at 240
+inputs, none at 252). Not charged, and
+stated: a landing's fault-path reads (the read-back of its coins, the undo of
+its outputs, one each) and the deep delete's walk of retained history (as in
+any submit). Nothing is landed into a topic whose manager or any lookup
+service READS off-chain values (`TopicManager::reads_off_chain_values`,
+`LookupService::reads_off_chain_values(topic)`, both DEFAULT `true`; the
+delta fold, L1): the landing has none to give, the predecessor's own submit
+would then be a dupe and its values never told, so that topic waits for the
+predecessor's own submit. Every manager and lookup service of
+`overlay-discovery` answers `false`; a consumer's that does not say lands
+nothing first (683dffd's answer for it). The worker's queue replay carries no
+off-chain values at all (`MutationMessage` has none): on LOW a faulted
+submit's values were already lost at its replay, before and after this. Each
+landed body is reported (`MutationReport::landed_predecessors`, ancestors
+first; the delta fold, L2). Before a body is landed the engine asks the
+caller's predicate (`Engine::set_landing_guard`, once per body, before its
+submit and its reads; the delta-2 fold, L2): the worker installs its
+eviction ledger (`admit_fast::landing_guard`) at every engine it builds, so
+a body under an OPEN eviction, or one whose ledger read faults, is not
+written, no lookup service is told, the successor's topic is "not now"
+(`landing_refused_evicted_total`; a fault `admit_fast_ledger_unreadable_total`).
+A gated door's accept of the successor does not readmit the predecessor's
+row: it is the network's word on the successor, whose EF carries the
+predecessor's outputs and not the predecessor, and a pending accept can turn
+out an orphan; the predecessor is readmitted by its own word (its gated
+submit, a MINED proof, `/admin/readmit`) and the successor's replay lands
+after that, or its dead letter waits for #576. After the write the worker
+still guards each landed body like the subject's own write
+(`admit_fast::guard_landed`, at `/submit`, the queue replay and
+`/admin/readmit`; the belt for a row opened while the landing wrote): one
+under an OPEN eviction is re-evicted, counted
+(`admit_fast_reevicted_after_write_total`); an unreadable ledger is counted
+and logged and asked no more (the retry dedups and lands nothing). The peer
+crawler guards its subjects not at all (pre-existing) and its landings only
+before the write (its engine carries the predicate); a GASP finalize lands
+nothing. A subject that already HOLDS an output in the topic (its own
+earlier submit's leftover: the delete started and faulted, D17 M1) does not
+wait: its replay finishes it (the lens fold, L4: a proven head spend naming a
+decoy was "not now" on every replay); one read, only on the way to "not now".
+"Landed" needs
 a clean answer, so a read that faults or the question running out of its
-reads is "not now" too (the delta fold, M1 and M2). Two bounds, both ours.
+reads is "not now" too (the delta fold, M1 and M2). Two bounds, both ours
+(E1D's reads, an absent named body's applied row and outputs, are counted in
+both as an unproven body's; a dry run reads nothing and runs at most once per
+body the reads reached).
 The question costs at most 256 store reads per SUBMIT over every body it
 reads, in every topic of the submit together (the third delta fold, M1:
 `PREDECESSOR_READS_PER_SUBMIT`; a later topic's question starts from what the
@@ -295,9 +391,45 @@ bsv-overlay-engine --features memory-storage --test gasp_topic_manager i559`,
 `fold559`, `delta559` (the delta lens's X4 to X9, each RED on `33e78fb`),
 `delta2_559` (the delta-2 lens's Y1 and Y2, a finalize over a node with 17
 landed parents, rows 2 and 6 of its table; the M1 and M2 pins RED on
-`e24f962`), `limit_opener` (its Y4, a limit pinned as it is) and `delta3_559`
-(the delta-3 lens's M1: the 256 reads of one submit to the read, and two
-topics sharing them; RED on `5ecf49c`).
+`e24f962`), `delta3_559` (the delta-3 lens's M1: the 256 reads of one submit
+to the read, and two topics sharing them; RED on `5ecf49c`) and `e1d` (lane
+E1D: `e1d_a` Zanaadu's run on the GASP path, `e1d_b` the door with a proven
+successor in both classes, `e1d_c` the opener with and without its body,
+each RED on `8d147d7`; `e1d_d` and `e1d_e` what did not change) and
+`e1d_fold` (the E1D lens fold: `h1` the lens's revocation of an unseen ad,
+`m2` a subject-first BEEF, `m1_a` the door landing a carried predecessor and a
+carried chain, `l4` a replay over a named decoy, `l3` the walk's capped reads,
+each RED on `683dffd`; `m1_b` the landings' bound; `e1d_c` and `e1d_d` were
+amended, both RED on `683dffd`) and `e1d_delta` (the E1D delta fold: `m1`
+the read count of one submit over carried spends, to the read, `l4` each link
+of a carried chain admitted once and walked once, `l1` a predecessor's
+off-chain values never taken by a landing, each RED on `0da3a82`; the
+worker's `admit_fast::tests::e1d_delta_l2`, RED on `0da3a82`, a source-shape
+pin) and `e1d_fold3` (the delta-2 fold: `l2` the door asking the landing
+guard before it lands, RED on `f057acc` with the API grafted inert; its
+route-tier cell `tools/lane-e1d/landing_guard_route_ci.mjs`, run by `make
+ci-d1-budget` over a real open eviction row, RED on `f057acc`). The pin of the
+opener limit (`limit_opener`) is retired: `e1d_c` is its cure.
+
+The GASP walk re-asks the predecessor FIRST (E1D, an addition to D13): a
+PROVEN node whose own output the no-coin dry run ADMITS no longer ends the
+walk blindly (the reference stops there). Its manager's named inputs are
+asked, and those neither held nor landed are requested from the peer (or
+the chain fetcher), so the predecessor joins the graph and its finalize
+submit comes first; one that does not land stops the graph and the UTXO
+waits for the next tick (the gap guard); one the peer cannot serve prunes
+(D14). When every named input is held or landed, or the node spends
+nothing, the walk stops as the reference's. The "landed" reads of one node
+are capped at 16 (two per transaction at most; the lens fold, L3): past them
+an input is requested, as on a read fault. A predecessor whose manager
+answers a permanent `Err` in the anchor replay (pf_name's terminal
+`head_race`) now holds the cursor below its successor's UTXO (D15's
+contract), where the base recorded the admitted tip alone (lens N2). For
+pf_name the re-ask does not widen #555 (its dry run refuses an untracked tip
+on a fresh node); a STATELESS manager that admits on shape AND names its
+inputs would walk to its genesis on every bootstrap, where the reference
+stops at the tip (lens N1). Pins `e1d_a`, `e1d_e`, `e_admitted_output_*`
+(the extra names call, stated), `e1d_fold_l3`.
 
 The limits, stated. (1) Two faults in one submit: an undo is separate calls,
 and one that faults too leaves the inserted output beside the kept coin
@@ -315,16 +447,48 @@ the inserts, as in the reference): on an insert fault the store keeps the old
 head while every lookup service was told it is spent, and an output that was
 inserted and undone was told as admitted, with no retraction. The replay
 heals it; after the dead letter the split stays until the next head. (4) The
-store's answer needs the predecessor's body in the BEEF: an unproven
-successor carries it, a PROVEN one does not, and one that arrives in a later
-invocation before the replay is recorded as in the reference, the chain then
-one behind its tip. And it never sees an OPENER as unlanded: "unlanded" needs
-a coin the topic holds somewhere up the walk, so a predecessor that spends no
-coin of the topic (a chain's genesis, the JOIN under `tm_pot`) is not one,
-its successor in a later invocation before the opener's replay is recorded,
-and the chain stops at the opener (pin `limit_opener`; the cure, a dry run of
-the manager over the candidate body with no coins, is the owner's call and is
-not built). It cannot tell a faulted predecessor from one nobody submitted
+store's answer for a body the BEEF does not carry is the manager's word: a
+manager that names nothing (or a predecessor it does not name) leaves a
+PROVEN successor recorded as in the reference, and a successor the manager
+admits without its coin is asked only of its named inputs, so the 16
+workspace managers' admitted successors (a SHIP update over an ad this node
+never saw) are recorded as in the reference, the phantom included. A named
+input that never lands (a decoy no peer serves, with the real predecessor
+landed and holding no coin) keeps its successor "not now" at the door,
+where GASP prunes it (D14), unless the successor already holds its output
+(L4 above). A successor whose predecessor's body is ABSENT converges only
+when the predecessor lands (its replay, a GASP peer, a resubmit); after its
+dead letter every successor at the door is dead-lettered too until an
+operator re-drives it, a frozen chain at the door on a node with no GASP
+peer (the lens fold, M1: the 2026-08-26 phantom-ack class). What converges
+by itself: a carried predecessor that lands (in the successor's own submit);
+an absent one that lands while the successor still has replays left (its
+own replay, a GASP peer serving the chain, a resubmit), the successor's next
+replay then landing over its coin; and on a node with a GASP peer, a chain
+whose successors were dead-lettered, which the walk brings in from the
+peer. What needs the operator's lever: a dead-lettered predecessor, and every
+successor dead-lettered while waiting for it (the predecessor landing later
+does not bring a dead letter back). The lever, bsv-low #576 (filed, not
+built), parks `low-overlay-mutations-dlq` in D1 and re-drives it on
+`POST /internal/redrive-dead-letters`, at most 50 letters per call, OLDEST
+first, so a predecessor's letter is replayed before its successors'; each
+replay is the same bytes through the same door, dedup-safe. What the lever
+does NOT heal: a predecessor that never lands whatever replays it, carried
+or absent (its manager fails it for good, its own walk refuses it, its
+landing or its re-judgement does not fit in the 256 reads, a decoy no peer
+serves): the replay is the same refusal and its successors are "not now"
+at every presentation, re-driven or not (the delta lens, N7), until an
+operator removes the cause. A finalize submit asks only the engine's memory,
+so a successor whose named predecessor the peer pruned is recorded as in
+the reference. The reference (ts-stack `Engine.submit`, `f999e0c1a`)
+records every topic that did not fail, whatever its predecessor: each
+"not now" here is a delta. At `/submit` an admitting successor's "not now"
+is the S2 queued ack (the STEAK names what will be admitted once its
+predecessor lands, and nothing is held until the replay); the dry runs and
+the names call are manager CPU inside the Worker's cap, whose breach is the
+platform's error and never a record. Pre-existing and not widened: a graph
+deeper than the budget (#555), the unbounded anchor verify (#557), a "not
+now" over a BEEF above 90,000 bytes answering 502 (#568). It cannot tell a faulted predecessor from one nobody submitted
 yet: the successor is "not now" until it lands. And a transaction that admits
 nothing, found no coin and carries more UNPROVEN, UNLANDED bodies than 16
 reads settle (five single-input ancestors, fewer with more inputs) is "not
@@ -343,7 +507,36 @@ insert that lands late leaves it the same way. (6) H2's row is per transaction, 
 per output: a transaction with several admitted outputs of which only some
 landed (a second insert that landed after its timeout) is a dupe once a
 successor spent one of them, and the output its undo took out is not put
-back.
+back. (7) "Landed" reads `applied_transactions` (lens N4, traced against
+`storage-ownership.json`, `rebuild_class: chain`): a wipe of that table
+ALONE makes every spent-and-deleted transaction read "not landed", and a
+re-presented old head whose own row went with it would have the door land its
+carried chain again from the opener, a second head beside the tip for a
+manager that needs its coin. Never wipe it without `outputs` (a full rebuild,
+which re-lands from nothing and converges). (8) A successor that is also a
+predecessor cascades (it lands once its own predecessor does); N replays of
+one write nothing but the manager's own idempotent state (lens N5, pinned by
+`e1d_fold_m1_a`'s dupes). (9) The landings, by the delta lens's notes. N1: a
+stranger's BEEF makes the node submit bodies it was not asked to admit, each
+one the stranger's to submit directly (bound by txid to the subject's input
+ancestry, into the subject's topic only, under the same manager and walk):
+no new admission. A landed body skips the route's per-subject steps other
+than the eviction guard (L2 above): the `network_seen` latch, the pending
+watch and the census do not see it. N2: a landed body is a whole submit
+(recorded, its lookup services told, its faults under #559's rules) that
+nobody acks; a landing that does not land makes the successor "not now",
+and the queue replays the SUCCESSOR's bytes, which land it again. N3: a body
+reached only through a proven one gets its own walk (L4 above) and one that
+fails it, or whose sources the BEEF lacks, does not land: the successor is
+"not now" at every presentation, as on `683dffd`; not pinned. N4: two
+successors in flight carrying one predecessor are two submits of one body,
+which #559's rules cover (idempotent inserts, H2's record, one applied row);
+not executed (`MemoryStorage` does not interleave). N5: GASP is unchanged by
+the landings (a finalize never lands). N6: the replay that finishes a
+subject already holding its output (the lens fold, L4) trusts that output;
+one written by a finalize over a predecessor the peer pruned, or one an
+eviction stripped of its predecessor's rows, is recorded over an unlanded
+predecessor: the pruned case is limit (4), the eviction L2's guard.
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 
@@ -353,15 +546,26 @@ argument under the reference's own name, `context: &TopicAdmittanceContext`
 The two GASP calls pass `TopicAdmittanceContext::DRY_RUN`: the needed-input
 walk over every proven node of a peer (`find_needed_inputs`) and the anchor
 replay of #551
-(`validate_graph_anchor`). `Engine::submit` passes `dry_run: false` (the queue
+(`validate_graph_anchor`), and so does the predecessor question's dry run
+of a candidate body (`unlanded_predecessor`, lane E1D: the opener cure,
+under the submit's own mode). `Engine::submit` passes `dry_run: false` (the queue
 replay, `/submit`, `/arc-ingest`, the peer crawler and the GASP finalize all go
 through it), and `Engine::submit_validate_only`, the only other caller, passes
-`true`: a validate-only call admits nothing. On a dry run a manager must
+`true`: a validate-only call admits nothing. The door's dry run asks only of
+an output the manager NAMES (the E1D lens fold, H1). A carried predecessor the
+door lands first is judged as a DRY RUN until its topic is known not to wait,
+then admitted with `dry_run: false` over the same coins, once (the E1D delta
+fold, L4); the successor's re-judgement after a landing is real, as its first
+judgement was (L5 below). On a dry run a manager must
 leave NO durable trace: no storage write, no head advance, no counter an
 operator reads as an admission. `mode` is not a substitute: the queue replays
 real submissions under `historical-tx`, the mode of both dry runs. The
 workspace's 16 managers hold no state and ignore the flag; a manager that
-writes on admission must read it. The method stays required, so a manager
+writes on admission must read it. And a manager that writes on admission must
+RE-ADMIT the same transaction idempotently (lens L5): an admitting successor's
+REAL admission call runs, and may write (pf_name advances its head and writes
+its admit row), before the engine answers "not now" and the queue replays it;
+pf_name's replay branch reads `find_admit`. The method stays required, so a manager
 cannot miss the argument on a re-pin. Pins: `cargo test -p bsv-overlay-engine
 --features memory-storage --test gasp_topic_manager dryrun`.
 

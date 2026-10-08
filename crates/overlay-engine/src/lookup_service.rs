@@ -37,6 +37,20 @@ pub trait LookupService {
     /// - `WholeTx`: entire spending transaction as Atomic BEEF
     fn spend_notification_mode(&self) -> SpendNotificationMode;
 
+    /// Whether this service READS the off-chain values of what it is told
+    /// of in `topic` (`output_admitted_by_topic`, `output_spent`; lane E1D's
+    /// delta fold, L1). The door lands a carried predecessor first with NO
+    /// off-chain values (the submit carries only the successor's), and the
+    /// predecessor's own submit is a dupe after that, so the values are
+    /// never told: the engine lands nothing first into a topic for which
+    /// any lookup service answers `true` (the successor waits for the
+    /// predecessor's own submit). Default `true`, so a service that does
+    /// not say never loses a value; one that never reads them answers
+    /// `false`.
+    fn reads_off_chain_values(&self, _topic: &str) -> bool {
+        true
+    }
+
     // ========================================================================
     // Lifecycle hooks (called by Engine during submit)
     // ========================================================================

@@ -580,6 +580,7 @@ fn build_engine_with_storage(
     hopparty_storage: Rc<dyn HoppartyStorage>,
 ) -> Engine {
     // Storage
+    let ledger = db.clone();
     let storage = Box::new(D1Storage::new(db));
 
     // Topic manager + lookup service registration is driven by env vars so
@@ -1107,6 +1108,15 @@ fn build_engine_with_storage(
     let proof_tracker = lookup_service_chain_tracker(env);
     let proof_fetcher = courier_fetcher(env, proof_tracker);
     engine.set_ancestor_fetcher(std::rc::Rc::new(proof_fetcher));
+
+    // bsv-low #575 (the E1D delta-2 fold, L2): a carried predecessor the engine would land first from a
+    // successor's BEEF is asked of the eviction ledger BEFORE its write (`admit_fast::landing_guard`), at every
+    // door this engine serves; `guard_landed` after the write stays the belt.
+    engine.set_landing_guard(std::rc::Rc::new(move |txid: &str, topic: &str| {
+        let (db, txid, topic) = (ledger.clone(), txid.to_string(), topic.to_string());
+        Box::pin(async move { crate::admit_fast::landing_guard(&db, &txid, &topic).await })
+            as overlay_engine::engine::LandingGuardFuture
+    }));
 
     engine
 }
@@ -2189,7 +2199,15 @@ async fn queue_handler(
             }
         }
 
-        match engine.submit_with_report(&tagged_beef, mode).await {
+        let replayed = engine.submit_with_report(&tagged_beef, mode).await;
+        // lane E1D's delta fold (L2): what the engine landed first from the BEEF (written whole, whatever the
+        // subject's own report) is guarded like the replay's own write; the batch's end flush ships the notes
+        if let (Ok((_, report)), Some(db)) = (&replayed, &counters) {
+            if !report.landed_predecessors.is_empty() {
+                crate::admit_fast::guard_landed(db, &report.landed_predecessors, "Queue").await;
+            }
+        }
+        match replayed {
             Ok((_steak, report)) if report.is_durable() => {
                 // the write-side guard, AFTER the replay's write (the gate's HIGH-1): an eviction that opened
                 // while this replay was landing — its table loop missed the rows landing after each step — is

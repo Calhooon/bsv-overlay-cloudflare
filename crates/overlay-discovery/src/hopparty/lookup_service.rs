@@ -61,6 +61,11 @@ impl HoppartyLookupService {
 
 #[async_trait(?Send)]
 impl LookupService for HoppartyLookupService {
+    /// Nothing told to this service reads an off-chain value.
+    fn reads_off_chain_values(&self, _topic: &str) -> bool {
+        false
+    }
+
     fn admission_mode(&self) -> AdmissionMode {
         // Whole-tx: the CONTAINER supplies the hop txid and the hop
         // output's script/value (module docs).

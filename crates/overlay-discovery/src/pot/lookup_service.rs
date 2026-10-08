@@ -143,6 +143,11 @@ async fn bump_verifies(tracker: &dyn ChainTracker, bump: &MerklePath, txid: &str
 
 #[async_trait(?Send)]
 impl LookupService for PotLookupService {
+    /// Nothing told to this service reads an off-chain value.
+    fn reads_off_chain_values(&self, _topic: &str) -> bool {
+        false
+    }
+
     fn admission_mode(&self) -> AdmissionMode {
         // Whole-tx: we persist the FULL funding BEEF (the engine's
         // `transactions` table is lifecycle-managed — see the module docs).

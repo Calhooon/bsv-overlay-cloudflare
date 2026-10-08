@@ -92,6 +92,9 @@ pub struct Engine {
     /// invocation's memory; across invocations the same question is put to
     /// the store ([`Engine::unlanded_predecessor`]).
     not_landed: std::cell::RefCell<HashSet<(String, String)>>,
+    /// Asked before the door lands a carried predecessor (bsv-low #575, the
+    /// E1D delta-2 fold, L2). See [`Engine::set_landing_guard`].
+    landing_guard: Option<LandingGuard>,
     /// Reference-parity spend verification on submit (2026-09-08). `true`
     /// (DEFAULT): every submit outside `HistoricalTxNoSpv` runs the
     /// reference's `Transaction.verify` walk: merkle paths against the chain
@@ -116,6 +119,16 @@ pub type SleepFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
 /// tests pass `ready(())` (instant deadline) or `pending()` (no deadline)
 /// to drive the race deterministically.
 pub type SleepFactory = std::rc::Rc<dyn Fn(u64) -> SleepFuture>;
+
+/// The answer of a [`LandingGuard`]: `Ok` lets the body land, `Err` says why
+/// it may not (the topic waits).
+pub type LandingGuardFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>;
+
+/// The caller's admission predicate over a carried predecessor the door is
+/// about to land: `(predecessor txid, topic)`. See
+/// [`Engine::set_landing_guard`].
+pub type LandingGuard = std::rc::Rc<dyn Fn(&str, &str) -> LandingGuardFuture>;
 
 /// The bound of ONE GASP finalize submit's storage calls and hooks (bsv-low
 /// #559, the lens fold of 2026-10-07, F2). The submit itself is never
@@ -235,6 +248,18 @@ const PREDECESSOR_READS: usize = 16;
 /// invocation's D1 allowance, is per invocation; 256 is the door's own unit
 /// ([`DoorBudget`]'s inputs per transaction), no derived figure.
 const PREDECESSOR_READS_PER_SUBMIT: usize = 256;
+
+/// Why a successor must wait ([`Engine::unlanded_predecessor`]), and the
+/// unlanded predecessor whose body the BEEF carries, when the answer names
+/// one: the door lands it first ([`Engine::land_carried`]).
+/// A submit's STEAK and report, and the carried predecessor that blocks each
+/// topic of a carried predecessor's own submit ([`Engine::submit_counted`]).
+type Counted = (Steak, MutationReport, HashMap<String, String>);
+
+struct NotNow {
+    why: String,
+    carried: Option<String>,
+}
 
 /// Summary of an [`Engine::complete_missing_proofs`] pass.
 ///
@@ -411,6 +436,12 @@ pub struct MutationReport {
     /// that means "nothing new", never "judged another tx" (loop-3 client
     /// belt re-presents read the empty STEAK as index-pending).
     pub deduped_topics: Vec<String>,
+    /// The predecessors the door LANDED first from this submit's BEEF, as
+    /// `(txid, topic)`, ancestors first ([`Engine::land_carried`]; the E1D
+    /// delta fold, L2). Each is an admission write of its own that no
+    /// caller asked for: a caller that guards its admission writes (the
+    /// worker's eviction ledger, bsv-low #513) guards these too.
+    pub landed_predecessors: Vec<(String, String)>,
 }
 
 /// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): what [`Engine::renotify_admitted`] did.
@@ -734,6 +765,7 @@ impl Engine {
             finalize_submit_budget: None,
             finalize_gate: crate::gasp::SubmitGate::default(),
             not_landed: std::cell::RefCell::new(HashSet::new()),
+            landing_guard: None,
             verify_scripts: true,
             config,
         }
@@ -766,6 +798,23 @@ impl Engine {
     /// NOT call this — when unset, GASP ingest behavior is unchanged.
     pub fn set_ancestor_fetcher(&mut self, fetcher: std::rc::Rc<dyn crate::gasp::AncestorFetcher>) {
         self.ancestor_fetcher = Some(fetcher);
+    }
+
+    /// Set the admission predicate asked BEFORE the door lands a carried
+    /// predecessor (bsv-low #575, the E1D delta-2 fold, L2;
+    /// [`Engine::land_carried`]). It is asked once per body the landing
+    /// would submit, before that body's submit (a dry one included) and
+    /// before its reads are charged; an `Err` (the caller's refusal, or its
+    /// own read fault) ends the landing with nothing of that body written
+    /// and the successor's topic answers "not now", as on `683dffd`. The
+    /// worker installs its eviction ledger here: an OPEN eviction of the
+    /// body refuses it. Its read is not one of the submit's 256 (it is the
+    /// caller's store, at most one per landed body). Unset (default): every
+    /// carried predecessor may land. What the predicate cannot see (a row
+    /// opened while the landing writes) stays the caller's to guard after
+    /// the write ([`MutationReport::landed_predecessors`]).
+    pub fn set_landing_guard(&mut self, guard: LandingGuard) {
+        self.landing_guard = Some(guard);
     }
 
     /// Set the per-peer GASP sync budget (bsv-low#302).
@@ -905,6 +954,7 @@ impl Engine {
                 roots: RootPolicy::AcceptUnchecked,
                 budget: Some(DoorBudget::DEFAULT),
             },
+            &HashSet::new(),
         )
         .await
     }
@@ -934,7 +984,13 @@ impl Engine {
         // manager that writes on admission must not write here, or the real
         // submit that follows meets a head this call already advanced.
         let (_validations, steak, _tx, _txid) = self
-            .run_validation(tagged_beef, mode, &TopicAdmittanceContext::DRY_RUN, None)
+            .run_validation(
+                tagged_beef,
+                mode,
+                &TopicAdmittanceContext::DRY_RUN,
+                None,
+                None,
+            )
             .await?;
         Ok(steak)
     }
@@ -1025,14 +1081,72 @@ impl Engine {
         bound: Option<&CallBound>,
         finalize: bool,
     ) -> Result<(Steak, MutationReport), EngineError> {
-        // A submit is a real admission, never a dry run.
-        let (validations, mut steak, tx, txid) = self
-            .run_validation(tagged_beef, mode, &TopicAdmittanceContext::default(), bound)
+        // The reads the store's predecessor question has made in this
+        // submit, every topic together ([`PREDECESSOR_READS_PER_SUBMIT`]),
+        // the predecessors the door lands first from the BEEF included.
+        let mut question_reads = 0usize;
+        self.submit_counted(
+            tagged_beef,
+            mode,
+            bound,
+            finalize,
+            None,
+            &mut question_reads,
+        )
+        .await
+        .map(|(steak, report, _)| (steak, report))
+    }
+
+    /// [`Engine::submit_bounded`] over the submit's read allowance
+    /// (`question_reads`), which a predecessor the door lands first from the
+    /// BEEF shares with the successor that carried it (lane E1D's lens fold,
+    /// M1). `carried` is `Some` for such a predecessor's own submit
+    /// ([`Engine::land_carried`]), holding the bodies whose SPV walk already
+    /// passed in this submit (none is walked twice; the delta fold, L4): it
+    /// lands nothing first itself, and it names instead the carried
+    /// predecessor that blocks each topic (the third value), so the landing
+    /// is an explicit stack and never a recursion of submits (nested polls
+    /// grow the stack, and a Worker's is small). Its manager is asked as a
+    /// DRY RUN first, and for real only once its topic is not blocked: a
+    /// link blocked below is judged twice and admitted once. Boxed: the
+    /// landing is a submit of its own.
+    fn submit_counted<'a>(
+        &'a self,
+        tagged_beef: &'a TaggedBEEF,
+        mode: SubmitMode,
+        bound: Option<&'a CallBound>,
+        finalize: bool,
+        carried: Option<&'a HashSet<String>>,
+        question_reads: &'a mut usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Counted, EngineError>> + 'a>>
+    {
+        Box::pin(async move {
+            self.submit_counted_inner(tagged_beef, mode, bound, finalize, carried, question_reads)
+                .await
+        })
+    }
+
+    async fn submit_counted_inner(
+        &self,
+        tagged_beef: &TaggedBEEF,
+        mode: SubmitMode,
+        bound: Option<&CallBound>,
+        finalize: bool,
+        walked: Option<&HashSet<String>>,
+        question_reads: &mut usize,
+    ) -> Result<Counted, EngineError> {
+        // A submit is a real admission, never a dry run; a carried
+        // predecessor's is judged dry until its topic is known not to wait.
+        let carried = walked.is_some();
+        let context = if carried {
+            TopicAdmittanceContext::DRY_RUN
+        } else {
+            TopicAdmittanceContext::default()
+        };
+        let (mut validations, mut steak, tx, txid) = self
+            .run_validation(tagged_beef, mode, &context, bound, walked)
             .await?;
         let mut report = MutationReport::default();
-        // The reads the store's predecessor question has made in this
-        // submit, every topic together ([`PREDECESSOR_READS_PER_SUBMIT`]).
-        let mut question_reads = 0usize;
         // The body every LOOKUP SERVICE receives NAMES the subject (BRC-95
         // atomic prefix over the WHOLE submitted body — bsv-rs's
         // `to_binary_atomic` sorts, names, never prunes). Lookup services
@@ -1046,6 +1160,59 @@ impl Engine {
             .ok()
             .and_then(|mut b| b.to_binary_atomic(&txid).ok())
             .unwrap_or_else(|| tagged_beef.beef.clone());
+
+        // The successor rule, asked of every topic that found no coin before
+        // anything of this submit is written ([`Engine::successors_waiting`]):
+        // the topics that must wait, each with why.
+        let mut blocked: HashMap<String, String> = HashMap::new();
+        let waits = self
+            .successors_waiting(
+                &tx,
+                &txid,
+                &subject_named_beef,
+                &mut validations,
+                &mut steak,
+                tagged_beef.off_chain_values.as_deref(),
+                mode,
+                bound,
+                finalize,
+                !carried,
+                &mut blocked,
+                question_reads,
+                &mut report.landed_predecessors,
+            )
+            .await;
+        // A carried predecessor's topic that does not wait is judged again,
+        // for real: what it admits is this call's word, over the same coins.
+        if carried {
+            for v in &mut validations {
+                if v.is_dupe || v.failed || v.read_fault.is_some() || waits.contains_key(&v.topic) {
+                    continue;
+                }
+                match self
+                    .judge(
+                        &tx,
+                        &v.topic,
+                        &v.previous_coins,
+                        tagged_beef.off_chain_values.as_deref(),
+                        mode,
+                        &TopicAdmittanceContext::default(),
+                        bound,
+                    )
+                    .await
+                {
+                    Ok(admittance) => v.admittance = admittance,
+                    Err(e) => {
+                        error!("Error validating topic {} during submit: {e}", v.topic);
+                        v.failed = true;
+                        v.previous_coins.clear();
+                        v.previous_outputs.clear();
+                        v.admittance = AdmittanceInstructions::default();
+                    }
+                }
+                steak.insert(v.topic.clone(), v.admittance.clone());
+            }
+        }
 
         // =================================================================
         // PHASE 3: MUTATE STORAGE
@@ -1079,57 +1246,17 @@ impl Engine {
                 continue;
             }
 
-            // bsv-low #559: a transaction that found NO previous coin and
-            // admits nothing, while a transaction it spends from has not
-            // landed, was judged without the coin its predecessor has yet
-            // to leave. Recording it as applied would make its replay a
-            // dupe for good (the chain ends at the predecessor). It is
-            // reported as a fault instead and recorded nowhere: "not now".
-            // An addition to the reference, which records every non-failed
-            // topic. "Has not landed" is known two ways: this engine saw it
-            // fault (`not_landed`, one invocation), or the store says so
-            // ([`Engine::unlanded_predecessor`], any invocation, when the
-            // submitted BEEF carries the predecessor's body). A GASP
-            // finalize submit asks only the first (the second delta fold of
-            // 2026-10-07, M2): its graph passed the anchor check, every
-            // parent inside the graph was submitted just before it and the
-            // sequence stops at the first that does not land, and a parent
-            // outside the graph is one the store held. The store's question
-            // there bought nothing and, at its read bound, held the graph's
-            // cursor.
-            if v.previous_outputs.is_empty() && admittance.outputs_to_admit.is_empty() {
-                let remembered = tx
-                    .inputs
-                    .iter()
-                    .map(|input| input.get_source_txid().unwrap_or_default())
-                    .find(|source| {
-                        self.not_landed
-                            .borrow()
-                            .contains(&(source.clone(), topic.clone()))
-                    });
-                let waits_on = match remembered {
-                    Some(predecessor) => Some(format!("{predecessor} has not landed")),
-                    None if finalize => None,
-                    None => {
-                        self.unlanded_predecessor(
-                            &tx,
-                            &tagged_beef.beef,
-                            topic,
-                            &mut question_reads,
-                            bound,
-                        )
-                        .await
-                    }
-                };
-                if let Some(not_now) = waits_on {
-                    report.fault(topic, "predecessor_not_landed", not_now.clone());
-                    self.hold_unapplied(
-                        &txid,
-                        topic,
-                        &format!("found no coin and its predecessor {not_now}"),
-                    );
-                    continue;
-                }
+            // bsv-low #559 and lane E1D: a topic that found no coin while a
+            // predecessor's landing is unknown is "not now", recorded
+            // nowhere ([`Engine::successors_waiting`]).
+            if let Some(not_now) = waits.get(topic) {
+                report.fault(topic, "predecessor_not_landed", not_now.clone());
+                self.hold_unapplied(
+                    &txid,
+                    topic,
+                    &format!("found no coin and its predecessor {not_now}"),
+                );
+                continue;
             }
 
             // ── Handle stale vs retained previous coins ──
@@ -1585,7 +1712,362 @@ impl Engine {
             }
         }
 
-        Ok((steak, report))
+        Ok((steak, report, blocked))
+    }
+
+    /// The successor rule (bsv-low #559; lane E1D, bsv-low #575; and its
+    /// lens fold of 2026-10-08), asked of every topic of a submit that found
+    /// NO previous coin while the transaction spends something, before
+    /// anything of the submit is written. Returns the topics that must wait,
+    /// each with why: those are reported as a fault (`predecessor_not_landed`)
+    /// and recorded nowhere, "not now". An addition to the reference, which
+    /// records every non-failed topic.
+    ///
+    /// Such a topic was judged without the coin a predecessor has yet to
+    /// leave. Recorded as applied, its replay was a dupe for good: a
+    /// transaction that admits nothing ended the chain at the predecessor
+    /// (#559), and one the manager admits WITHOUT its coin (the pf head
+    /// manager over its own head state, E1D) was inserted, and the
+    /// predecessor, landing later, stood unspent beside the tip.
+    ///
+    /// "Has not landed" is known two ways: this engine saw it fault
+    /// (`not_landed`, one invocation, every door), or the store says so
+    /// ([`Engine::unlanded_predecessor`], any invocation, never at a GASP
+    /// finalize submit: its graph passed the anchor check, every parent
+    /// inside the graph was submitted just before it and the sequence stops
+    /// at the first that does not land; the second delta fold of 2026-10-07,
+    /// M2). For a successor that admits something, both look only at the
+    /// inputs the manager NAMES as its history (`identify_needed_inputs`
+    /// over the subject-named BEEF; the lens fold, L1): a manager that
+    /// names nothing (all 16 of this workspace) asks nothing there, as in
+    /// the reference. A successor that admits NOTHING is asked of every
+    /// input whatever its manager names (D17 (a)), so under such a manager
+    /// it still waits for, or lands first, a carried body that spends a
+    /// coin the topic holds: there the store differs from the reference's
+    /// (the E1D delta fold, L3).
+    ///
+    /// The door lands a carried predecessor FIRST (the lens fold, M1; the
+    /// GASP walk's rule, at the door): when the question names an unlanded
+    /// predecessor whose body the BEEF carries, that body is submitted on
+    /// its own to this topic ([`Engine::land_carried`]), under the submit's
+    /// read allowance, and once it lands the topic is judged again
+    /// ([`Engine::validate_topic`]) and asked again. The re-judgement's
+    /// reads (the applied row, one coin per input) are charged to that
+    /// allowance BEFORE the landing (the E1D delta fold, M1): a landing whose
+    /// re-judgement would not fit is not made, and the topic waits. So one
+    /// submit reads at most its own validation and writes plus
+    /// [`PREDECESSOR_READS_PER_SUBMIT`], landings (on their clean path) and
+    /// re-judgements included; a faulted landing's read-backs and undo, and
+    /// a deep delete's walk of retained history, are not charged.
+    /// Nothing is landed into a topic whose manager or a lookup
+    /// service reads off-chain values (the delta fold, L1: the landing has
+    /// none to give, and the predecessor's own submit would be a dupe): the
+    /// topic waits for that submit. The first predecessor that does not land
+    /// ends it: the topic waits. A predecessor whose body the BEEF does not
+    /// carry is never landed here: its successor converges only when it
+    /// lands (its own replay, a GASP peer, a resubmit).
+    #[allow(clippy::too_many_arguments)]
+    async fn successors_waiting(
+        &self,
+        tx: &Transaction,
+        txid: &str,
+        subject_named_beef: &[u8],
+        validations: &mut [TopicValidation],
+        steak: &mut Steak,
+        off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+        bound: Option<&CallBound>,
+        finalize: bool,
+        lands: bool,
+        blocked: &mut HashMap<String, String>,
+        question_reads: &mut usize,
+        landed: &mut Vec<(String, String)>,
+    ) -> HashMap<String, String> {
+        let mut waits = HashMap::new();
+        let spent: Vec<(String, u32)> = tx
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                let source = input.get_source_txid().ok()?;
+                (!source.is_empty()).then_some((source, input.source_output_index))
+            })
+            .collect();
+        if spent.is_empty() {
+            return waits;
+        }
+        let found_no_coin = |v: &TopicValidation| {
+            !v.is_dupe && !v.failed && v.read_fault.is_none() && v.previous_outputs.is_empty()
+        };
+        for v in validations.iter_mut() {
+            if !found_no_coin(v) {
+                continue;
+            }
+            let Some(manager) = self.managers.get(&v.topic) else {
+                continue;
+            };
+            let topic = v.topic.clone();
+            // The manager's word on the subject's history, asked at most
+            // once per topic: up front for a successor that admits, by the
+            // question when it needs it for one that does not.
+            let mut subject_names: Option<HashSet<String>> = None;
+            loop {
+                let admits = !v.admittance.outputs_to_admit.is_empty();
+                if admits && subject_names.is_none() {
+                    subject_names = Some(
+                        self.named_history(manager.as_ref(), subject_named_beef, bound)
+                            .await,
+                    );
+                }
+                let remembered = spent.iter().find(|(source, vout)| {
+                    (!admits
+                        || subject_names
+                            .as_ref()
+                            .is_some_and(|named| named.contains(&format!("{source}.{vout}"))))
+                        && self
+                            .not_landed
+                            .borrow()
+                            .contains(&(source.clone(), topic.clone()))
+                });
+                if let Some((predecessor, _)) = remembered {
+                    waits.insert(topic.clone(), format!("{predecessor} has not landed"));
+                    break;
+                }
+                if finalize {
+                    break;
+                }
+                let Some(not_now) = self
+                    .unlanded_predecessor(
+                        tx,
+                        txid,
+                        subject_named_beef,
+                        &topic,
+                        mode,
+                        admits,
+                        &mut subject_names,
+                        question_reads,
+                        bound,
+                    )
+                    .await
+                else {
+                    break;
+                };
+                let Some(carried) = not_now.carried else {
+                    waits.insert(topic.clone(), not_now.why);
+                    break;
+                };
+                if !lands {
+                    blocked.insert(topic.clone(), carried);
+                    waits.insert(topic.clone(), not_now.why);
+                    break;
+                }
+                if !self.lands_without_values(&topic) {
+                    waits.insert(
+                        topic.clone(),
+                        format!(
+                            "{}; not landed first from the BEEF: the topic's manager or a lookup service reads off-chain values, and only the predecessor's own submit carries them",
+                            not_now.why
+                        ),
+                    );
+                    break;
+                }
+                // The re-judgement after the landing, charged before it.
+                let rejudge = 1 + spent.len();
+                if *question_reads + rejudge > PREDECESSOR_READS_PER_SUBMIT {
+                    waits.insert(
+                        topic.clone(),
+                        format!(
+                            "{}; its landing and the re-judgement after it do not fit in the submit's {PREDECESSOR_READS_PER_SUBMIT} reads",
+                            not_now.why
+                        ),
+                    );
+                    break;
+                }
+                *question_reads += rejudge;
+                match self
+                    .land_carried(
+                        subject_named_beef,
+                        txid,
+                        &carried,
+                        &topic,
+                        mode,
+                        bound,
+                        question_reads,
+                        landed,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        *v = self
+                            .validate_topic(
+                                tx,
+                                txid,
+                                &topic,
+                                off_chain_values,
+                                mode,
+                                &TopicAdmittanceContext::default(),
+                                bound,
+                            )
+                            .await;
+                        steak.insert(topic.clone(), v.admittance.clone());
+                        if !found_no_coin(v) {
+                            break;
+                        }
+                    }
+                    Err(did_not_land) => {
+                        // No re-judgement follows: its reads were not made.
+                        *question_reads -= rejudge;
+                        waits.insert(
+                            topic.clone(),
+                            format!(
+                                "{}; submitted first from the BEEF, it did not land ({did_not_land})",
+                                not_now.why
+                            ),
+                        );
+                        break;
+                    }
+                }
+            }
+            // A subject that already HOLDS an output in the topic landed
+            // there before (the leftover of its own earlier submit whose
+            // delete was started and faulted, D17 M1: its outputs held, no
+            // applied row), and that admission was judged with its coin.
+            // Its replay finishes it and does not wait (the E1D lens fold,
+            // L4: a proven head spend that names a decoy no peer serves was
+            // "not now" on every replay, three and a dead letter). One read,
+            // only on the way to "not now", inside the allowance.
+            if !finalize
+                && waits.contains_key(&topic)
+                && *question_reads < PREDECESSOR_READS_PER_SUBMIT
+            {
+                *question_reads += 1;
+                if let Ok(outputs) = stored(
+                    bound,
+                    self.storage.find_outputs_for_transaction(txid, false),
+                )
+                .await
+                {
+                    if outputs.iter().any(|o| o.topic == topic) {
+                        info!("topic {topic}: {txid} holds its outputs already; its replay finishes it");
+                        waits.remove(&topic);
+                        blocked.remove(&topic);
+                    }
+                }
+            }
+        }
+        waits
+    }
+
+    /// Land an unlanded predecessor whose body the successor's BEEF carries
+    /// (lane E1D's lens fold, M1): submit it on its own to `topic`, its
+    /// atomic BEEF out of the successor's, no off-chain values (the caller
+    /// lands nothing into a topic that reads them; the delta fold, L1),
+    /// never a broadcast (`current-tx` is submitted as `historical-tx`: the
+    /// successor's BEEF carries it to the network).
+    ///
+    /// Each body is WALKED once in this submit (the delta fold, L4): the
+    /// successor's own SPV walk (`subject`, the same mode, tracker and
+    /// switch) already passed over every body it reaches without crossing a
+    /// proven one, so those are not walked again; a body reached only
+    /// through a proven one (which the successor's walk does not descend)
+    /// gets its own walk, trusting what this submit already walked, and so
+    /// does nothing twice. A walk that refuses a body ends the landing.
+    ///
+    /// A predecessor whose own submit waits on a carried predecessor of ITS
+    /// own goes on a stack under it: ancestors first, the walk's rule at
+    /// the door. Its manager was asked only a DRY RUN then and nothing was
+    /// written; once the one under it landed it is submitted again and
+    /// admitted for real, once ([`Engine::submit_counted`]). Each submit's
+    /// reads on its clean path (its applied row, one coin per input, and
+    /// its writes' one read of each coin it spends) are charged to the
+    /// submit's allowance before it starts, and its predecessor
+    /// question shares that allowance, so the landings of one submit stop
+    /// at [`PREDECESSOR_READS_PER_SUBMIT`] reads, however deep the chain.
+    /// Each body that lands is pushed on `landed` (the report's
+    /// `landed_predecessors`, for the caller's admission guard; the delta
+    /// fold, L2). Each body is asked of the caller's landing guard first,
+    /// once ([`Engine::set_landing_guard`]; the delta-2 fold, L2): a refusal
+    /// ends the landing before that body is submitted.
+    /// `Ok` once `predecessor` LANDED in `topic` (recorded there,
+    /// now or before); otherwise why not, at the first that did not.
+    #[allow(clippy::too_many_arguments)]
+    async fn land_carried(
+        &self,
+        beef_bytes: &[u8],
+        subject: &str,
+        predecessor: &str,
+        topic: &str,
+        mode: SubmitMode,
+        bound: Option<&CallBound>,
+        question_reads: &mut usize,
+        landed: &mut Vec<(String, String)>,
+    ) -> Result<(), String> {
+        let beef = Beef::from_binary(beef_bytes)
+            .map_err(|e| format!("the BEEF could not be read again ({e})"))?;
+        let mode = match mode {
+            SubmitMode::CurrentTx => SubmitMode::HistoricalTx,
+            other => other,
+        };
+        let walks = mode != SubmitMode::HistoricalTxNoSpv;
+        let mut walked: HashSet<String> = if walks {
+            walk_cover(&beef, subject)
+        } else {
+            HashSet::new()
+        };
+        let mut stack = vec![predecessor.to_string()];
+        let mut guarded: HashSet<String> = HashSet::new();
+        while let Some(next) = stack.last().cloned() {
+            let body = beef
+                .find_atomic_transaction(&next)
+                .ok_or_else(|| format!("{next}: its body is not in the BEEF"))?;
+            // The caller's admission predicate, before anything of this body
+            // is submitted (the delta-2 fold, L2).
+            if let Some(guard) = &self.landing_guard {
+                if guarded.insert(next.clone()) {
+                    bounded(bound, guard(&next, topic))
+                        .await
+                        .and_then(|answer| answer)
+                        .map_err(|why| format!("{next}: refused by the landing guard ({why})"))?;
+                }
+            }
+            // Its validation (the applied row, one coin per input) and its
+            // writes' one read of each coin it spends.
+            let cost = 1 + 2 * body.inputs.len();
+            if *question_reads + cost > PREDECESSOR_READS_PER_SUBMIT {
+                return Err(format!(
+                    "{next}: its submit does not fit in the submit's {PREDECESSOR_READS_PER_SUBMIT} reads"
+                ));
+            }
+            *question_reads += cost;
+            let atomic = body
+                .to_atomic_beef(true)
+                .map_err(|e| format!("{next}: its BEEF could not be built ({e})"))?;
+            let tagged = TaggedBEEF::new(atomic, vec![topic.to_string()]);
+            let (_, report, blocked) = self
+                .submit_counted(&tagged, mode, bound, false, Some(&walked), question_reads)
+                .await
+                .map_err(|e| format!("{next}: {e}"))?;
+            // Its walk passed, so did that of every body it reaches.
+            if walks && !walked.contains(&next) {
+                walked.extend(walk_cover(&beef, &next));
+            }
+            let landed_now = report.applied_topics.iter().any(|t| t == topic);
+            if report.is_durable()
+                && (landed_now || report.deduped_topics.iter().any(|t| t == topic))
+            {
+                info!("topic {topic}: {next} landed first from its successor's BEEF");
+                if landed_now {
+                    landed.push((next.clone(), topic.to_string()));
+                }
+                stack.pop();
+                continue;
+            }
+            match blocked.get(topic) {
+                Some(under) if !stack.contains(under) => stack.push(under.clone()),
+                _ if report.is_durable() => return Err(format!("{next}: the manager failed it")),
+                _ => return Err(format!("{next}: {}", report.summary())),
+            }
+        }
+        Ok(())
     }
 
     /// A topic of a submit that is NOT recorded as applied: logged, and
@@ -1634,35 +2116,76 @@ impl Engine {
     }
 
     /// The store's own answer to "has a predecessor of `tx` not landed?"
-    /// (bsv-low #559, the lens fold of 2026-10-07, F3), for a transaction
-    /// that found no previous coin and admits nothing. The engine's memory
-    /// of a faulted submit (`not_landed`) dies with the invocation; this
-    /// does not. A transaction the submitted BEEF carries the body of has
-    /// not landed in `topic` when it has no applied row there, none of its
-    /// outputs is held there, and it spends a coin the topic HOLDS (or, the
-    /// same question one step up, a coin of another such transaction): it is
-    /// a spend of this topic that the store has not taken yet, and `tx` was
-    /// judged without what it will leave.
+    /// (bsv-low #559, the lens fold of 2026-10-07, F3; lane E1D, bsv-low
+    /// #575, and its lens fold of 2026-10-08), for a transaction that found
+    /// no previous coin. The engine's memory of a faulted submit
+    /// (`not_landed`) dies with the invocation; this does not. A transaction
+    /// HAS LANDED in `topic` when it has an applied row there or an output
+    /// held there; anything else is not known to have landed, and it is a
+    /// PREDECESSOR of `tx` when one of these says so:
     ///
-    /// The limits, stated. It sees only bodies in the BEEF: an unproven
-    /// successor carries its parent (the live `/submit` case), a PROVEN one
-    /// does not, and is then recorded as in the reference. It cannot tell a
-    /// faulted predecessor from one nobody submitted yet: a successor is
-    /// "not now" in both until the predecessor lands. And it never sees an
-    /// OPENER as unlanded (the delta-2 lens of 2026-10-07, L1): "unlanded"
-    /// needs a coin the topic holds somewhere up the walk, and a predecessor
-    /// that spends no coin of the topic (the first transaction of a chain,
-    /// one the manager admits on its outputs alone) has none. Its successor
-    /// in a later invocation, before the opener's replay, is recorded as in
-    /// the reference, its own replay is then a dupe and the chain stops at
-    /// the opener. The cure (a dry run of the manager over the candidate
-    /// body with no coins: admitted means an unlanded opener) is not built.
+    /// - its body is in the BEEF and it spends a coin the topic HOLDS (or,
+    ///   one step up, a coin of another such transaction): a spend of this
+    ///   topic the store has not taken yet (#559);
+    /// - its body is in the BEEF, it spends no coin the topic holds, the
+    ///   manager NAMES the outpoint the walk spends from it as overlay
+    ///   history (`identify_needed_inputs` over the BEEF of the transaction
+    ///   that spends it, `tx` or a body the walk reached), and the manager,
+    ///   asked of that body in a dry run with no coins
+    ///   (`TopicAdmittanceContext::DRY_RUN`, the submit's mode, no off-chain
+    ///   values), would admit that named output: an OPENER that has not
+    ///   landed (E1D, the cure D17 named). Only a NAMED output is dry-run
+    ///   (the lens fold, H1): with every unheld body dry-run, a manager that
+    ///   admits on output shape (all 16 of this workspace) made a spend of a
+    ///   shape-admissible output this node never held (a revocation of an
+    ///   ad it never saw; a stranger's own few-sat SHIP output) "not now" on
+    ///   every presentation, three replays and a dead letter each, where the
+    ///   reference records it. A manager `Err` in the dry run is "not now"
+    ///   (the manager's contract at the anchor replay, D15), except its
+    ///   typed refusal `NoAdmissibleOutputs`, which is "not admitted";
+    /// - its body is NOT in the BEEF (a PROVEN successor carries none) and
+    ///   the manager names the outpoint `tx` spends from it as overlay
+    ///   history (D13's word; an `Err` there names nothing, as in the walk).
+    ///
+    /// The manager is asked over `beef_bytes`, the SUBJECT-NAMED BEEF of the
+    /// submit (BRC-95 atomic, the body the lookup services get; the lens
+    /// fold, M2): over the submitted bytes a manager that parses
+    /// `from_beef(_, None)` took the wire-LAST transaction of a non-atomic
+    /// BEEF, named an ancestor's inputs, and the question asked nothing.
+    ///
+    /// `admits` says which inputs of `tx` start the walk. A transaction that
+    /// admits nothing (D17's class) starts from every input. One that admits
+    /// WITHOUT its coin (E1D) starts only from the inputs the manager names:
+    /// a manager that admits a successor with no coin has said the coin does
+    /// not decide the admission, so only its own word makes an input a
+    /// predecessor. Every manager of this workspace names nothing: an
+    /// admitting successor is then asked nothing, as in the reference, and
+    /// so is a spend of an unheld output nobody names (the lens fold, H1);
+    /// but a successor that admits nothing still finds case (a), a carried
+    /// body that spends a coin the topic holds, and waits for it or has it
+    /// landed first, where the reference records the successor and never
+    /// admits that body (the E1D delta fold, L3). A named input whose body
+    /// the BEEF carries is still walked and dry-run, so a named decoy the
+    /// manager would not admit is no predecessor.
+    ///
+    /// The answer carries the predecessor when its body is in the BEEF (the
+    /// first two cases): the door lands it first ([`Engine::successors_waiting`]).
+    ///
+    /// The limits, stated. It cannot tell a faulted predecessor from one
+    /// nobody submitted yet: a successor is "not now" in both until the
+    /// predecessor lands (the door lands a carried one itself). A named
+    /// input whose body is absent and which never lands (a decoy no one
+    /// submits, beside a real predecessor that landed and holds no coin)
+    /// keeps its successor "not now" at the door; the GASP walk prunes such
+    /// an input instead (D14). Deeper than the successor's own inputs, an
+    /// absent body ends the walk as before.
     ///
     /// "Landed" needs a clean answer (the delta fold of 2026-10-07, M1 and
     /// M2): a read that faults, or the question running out of its reads
-    /// (the 16 of a topic or the 256 of the submit), answers "not now" too, naming the transaction it could not settle.
-    /// Recording the successor there made its replay a dupe and stopped the
-    /// chain behind it for good; a retried no-op is the lesser cost.
+    /// (the 16 of a topic or the 256 of the submit), answers "not now" too,
+    /// naming the transaction it could not settle. Recording the successor
+    /// there made its replay a dupe and stopped the chain behind it for
+    /// good; a retried no-op is the lesser cost.
     ///
     /// What the bound counts (the second delta fold of 2026-10-07, M2): the
     /// reads spent on a body that is NEITHER proven in the BEEF NOR found
@@ -1700,20 +2223,63 @@ impl Engine {
     /// landed body costs one read by its applied row or two by a held
     /// output, a proven, unlanded one two and one per input), is never
     /// recorded, where the reference records it: each submit of it is a
-    /// fault and a replay.
-    ///
-    /// A GASP finalize submit does not ask this question at all (see the
-    /// call).
+    /// fault and a replay. The manager CPU it adds: one names call per
+    /// spender a dry run needs (the subject's, and one per walked body with
+    /// an unheld source), and at most one dry run per body the reads
+    /// reached; each candidate is built out of the BEEF parsed once (the
+    /// lens fold, L2).
     ///
     /// Returns why the submit must wait, for the report.
+    #[allow(clippy::too_many_arguments)]
     async fn unlanded_predecessor(
         &self,
         tx: &Transaction,
+        txid: &str,
         beef_bytes: &[u8],
         topic: &str,
+        mode: SubmitMode,
+        admits: bool,
+        subject_names: &mut Option<HashSet<String>>,
         question_reads: &mut usize,
         bound: Option<&CallBound>,
-    ) -> Option<String> {
+    ) -> Option<NotNow> {
+        let manager = self.managers.get(topic)?;
+        let wait = |why: String| Some(NotNow { why, carried: None });
+        // The outpoints `tx` spends, as `txid.vout`.
+        let starts: Vec<(String, u32)> = tx
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                let source = input.get_source_txid().ok()?;
+                (!source.is_empty()).then_some((source, input.source_output_index))
+            })
+            .collect();
+        // The outputs of each candidate that the walk spends, and who spends
+        // each: a dry run asks only of an output its spender names.
+        let mut spent_of: HashMap<String, HashSet<u32>> = HashMap::new();
+        let mut spenders: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        let mut ask: Vec<String> = Vec::new();
+        for (source, vout) in &starts {
+            if admits
+                && subject_names
+                    .as_ref()
+                    .is_some_and(|named| !named.contains(&format!("{source}.{vout}")))
+            {
+                continue;
+            }
+            spent_of.entry(source.clone()).or_default().insert(*vout);
+            spenders
+                .entry(source.clone())
+                .or_default()
+                .push((txid.to_string(), *vout));
+            ask.push(source.clone());
+        }
+        // Nothing to ask (a transaction that admits and names nothing, every
+        // manager of this workspace): the BEEF is not even parsed.
+        if ask.is_empty() {
+            return None;
+        }
+        let direct: HashSet<String> = ask.iter().cloned().collect();
         let beef = Beef::from_binary(beef_bytes).ok()?;
         // Each body the BEEF carries, and whether the BEEF says it is
         // proven (a bump index: its word, no proof is checked here).
@@ -1725,41 +2291,65 @@ impl Engine {
                     .map(|body| (btx.txid(), (body, btx.bump_index().is_some())))
             })
             .collect();
+        // The manager's names over each walked body other than `tx`.
+        let mut names_over: HashMap<String, HashSet<String>> = HashMap::new();
         // The reads spent on bodies neither proven nor found landed.
         let mut reads = 0usize;
         let mut asked: HashSet<String> = HashSet::new();
-        let mut ask: Vec<String> = tx
-            .inputs
-            .iter()
-            .map(|input| input.get_source_txid().unwrap_or_default())
-            .collect();
         while let Some(candidate) = ask.pop() {
             if candidate.is_empty() || !asked.insert(candidate.clone()) {
                 continue;
             }
-            let Some(&(body, proven)) = bodies.get(&candidate) else {
-                continue;
-            };
+            let spent_outputs = spent_of.get(&candidate).cloned().unwrap_or_default();
+            // An absent body is asked of the store only when it is one of
+            // `tx`'s own inputs and the manager names it (E1D).
+            let body = bodies.get(&candidate).copied();
+            if body.is_none() {
+                if !direct.contains(&candidate) {
+                    continue;
+                }
+                if subject_names.is_none() {
+                    *subject_names = Some(
+                        self.named_history(manager.as_ref(), beef_bytes, bound)
+                            .await,
+                    );
+                }
+                let is_named = subject_names.as_ref().is_some_and(|named| {
+                    spent_outputs
+                        .iter()
+                        .any(|vout| named.contains(&format!("{candidate}.{vout}")))
+                });
+                if !is_named {
+                    continue;
+                }
+            }
+            let proven = body.is_some_and(|(_, proven)| proven);
             // This candidate's own reads: they join `reads` once it is
             // found not landed, and never if the BEEF proves it.
             let mut spent = 0usize;
             let out_of = |spent: usize| !proven && reads + spent >= PREDECESSOR_READS;
             let out_of_reads = || {
-                Some(format!(
+                wait(format!(
                     "{candidate} is not known to have landed: the question ran out of its {PREDECESSOR_READS} reads"
                 ))
             };
             // The submit's allowance, over every read: proven or landed,
             // this topic or an earlier one.
             let out_of_allowance = || {
-                Some(format!(
+                wait(format!(
                     "{candidate} is not known to have landed: the question ran out of the submit's {PREDECESSOR_READS_PER_SUBMIT} reads"
                 ))
             };
             let unread = |e: StorageError| {
-                Some(format!(
+                wait(format!(
                     "{candidate} is not known to have landed: the store could not say ({e})"
                 ))
+            };
+            let carried = |why: String| {
+                Some(NotNow {
+                    why,
+                    carried: Some(candidate.clone()),
+                })
             };
             let record = AppliedTransaction {
                 txid: candidate.clone(),
@@ -1798,6 +2388,13 @@ impl Engine {
                 Ok(_) => continue,
                 Err(e) => return unread(e),
             }
+            // Not landed. With no body to walk, the manager's word is the
+            // whole answer (E1D).
+            let Some((body, _)) = body else {
+                return wait(format!(
+                    "{candidate} has not landed (the manager names it as history; the BEEF does not carry it)"
+                ));
+            };
             for input in &body.inputs {
                 let source = input.get_source_txid().unwrap_or_default();
                 if source.is_empty() {
@@ -1823,11 +2420,98 @@ impl Engine {
                 )
                 .await;
                 match coin {
-                    Ok(Some(_)) => return Some(format!("{candidate} has not landed")),
+                    Ok(Some(_)) => return carried(format!("{candidate} has not landed")),
                     // Not held: its own transaction may be the one that has
                     // not landed.
-                    Ok(None) => ask.push(source),
+                    Ok(None) => {
+                        spent_of
+                            .entry(source.clone())
+                            .or_default()
+                            .insert(input.source_output_index);
+                        spenders
+                            .entry(source.clone())
+                            .or_default()
+                            .push((candidate.clone(), input.source_output_index));
+                        ask.push(source);
+                    }
                     Err(e) => return unread(e),
+                }
+            }
+            // It spends no coin the topic holds. Does a spender NAME an
+            // output the walk spends of it (the lens fold, H1)? A names call
+            // per spender, no store read.
+            let mut named_outputs: HashSet<u32> = HashSet::new();
+            for (spender, vout) in spenders.get(&candidate).cloned().unwrap_or_default() {
+                let names = if spender == txid {
+                    if subject_names.is_none() {
+                        *subject_names = Some(
+                            self.named_history(manager.as_ref(), beef_bytes, bound)
+                                .await,
+                        );
+                    }
+                    subject_names.as_ref()
+                } else {
+                    if !names_over.contains_key(&spender) {
+                        let names = match beef
+                            .find_atomic_transaction(&spender)
+                            .and_then(|spender| spender.to_atomic_beef(true).ok())
+                        {
+                            Some(spender_beef) => {
+                                self.named_history(manager.as_ref(), &spender_beef, bound)
+                                    .await
+                            }
+                            None => HashSet::new(),
+                        };
+                        names_over.insert(spender.clone(), names);
+                    }
+                    names_over.get(&spender)
+                };
+                if names.is_some_and(|named| named.contains(&format!("{candidate}.{vout}"))) {
+                    named_outputs.insert(vout);
+                }
+            }
+            if !named_outputs.is_empty() {
+                // Would the manager admit a named output of it with no coins
+                // (E1D, the opener)? A dry run over the candidate built out
+                // of the BEEF parsed above (its proof and, unproven, its
+                // sources linked): no store read, nothing counted.
+                let judged = beef
+                    .find_atomic_transaction(&candidate)
+                    .unwrap_or_else(|| body.clone());
+                let verdict = bounded(
+                    bound,
+                    manager.identify_admissible_outputs(
+                        &judged,
+                        &[],
+                        None,
+                        mode,
+                        &TopicAdmittanceContext::DRY_RUN,
+                    ),
+                )
+                .await;
+                match verdict {
+                    Ok(Ok(admittance)) => {
+                        if admittance
+                            .outputs_to_admit
+                            .iter()
+                            .any(|vout| named_outputs.contains(vout))
+                        {
+                            return carried(format!(
+                                "{candidate} has not landed (the manager names the output spent from it and would admit it with no coin: an opener)"
+                            ));
+                        }
+                    }
+                    Ok(Err(TopicManagerError::NoAdmissibleOutputs(_))) => {}
+                    Ok(Err(e)) => {
+                        return wait(format!(
+                            "{candidate} is not known to have landed: the manager could not judge it ({e})"
+                        ))
+                    }
+                    Err(no_answer) => {
+                        return wait(format!(
+                            "{candidate} is not known to have landed: the manager did not answer ({no_answer})"
+                        ))
+                    }
                 }
             }
             if !proven {
@@ -1835,6 +2519,30 @@ impl Engine {
             }
         }
         None
+    }
+
+    /// The outpoints (`txid.vout`) the topic manager NAMES as overlay
+    /// history of the transaction `beef_bytes` names (`identify_needed_inputs`,
+    /// D13's word; an atomic BEEF, so a manager that parses
+    /// `from_beef(_, None)` reads that transaction). An `Err` or no answer
+    /// names nothing, as the GASP walk treats it (logged).
+    async fn named_history(
+        &self,
+        manager: &dyn TopicManager,
+        beef_bytes: &[u8],
+        bound: Option<&CallBound>,
+    ) -> HashSet<String> {
+        match bounded(bound, manager.identify_needed_inputs(beef_bytes, None)).await {
+            Ok(Ok(named)) => named.iter().map(Outpoint::to_graph_id).collect(),
+            Ok(Err(e)) => {
+                warn!("the predecessor question: the manager could not name its inputs: {e}");
+                HashSet::new()
+            }
+            Err(no_answer) => {
+                warn!("the predecessor question: the manager did not name its inputs: {no_answer}");
+                HashSet::new()
+            }
+        }
     }
 
     /// The reference's `tx.verify(chainTracker)` on submit, walked LINEARLY
@@ -1857,6 +2565,7 @@ impl Engine {
         chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
         beef_bytes: &[u8],
         subject_txid: &str,
+        trusted: &HashSet<String>,
     ) -> Result<(), EngineError> {
         Self::verify_beef_linear_with(
             chain_tracker,
@@ -1866,6 +2575,7 @@ impl Engine {
                 roots: RootPolicy::AgainstTracker,
                 budget: None,
             },
+            trusted,
         )
         .await
         .map(|_| ())
@@ -1887,6 +2597,7 @@ impl Engine {
         beef_bytes: &[u8],
         subject_txid: &str,
         policy: WalkPolicy,
+        trusted: &HashSet<String>,
     ) -> Result<WalkStats, EngineError> {
         use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
         use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
@@ -1927,7 +2638,9 @@ impl Engine {
             }
         };
 
-        let mut seen: HashSet<String> = HashSet::new();
+        // A trusted transaction (one an earlier walk of the same submit
+        // passed over) is neither checked nor descended again.
+        let mut seen: HashSet<String> = trusted.clone();
         let mut queue: Vec<String> = vec![subject_txid.to_string()];
         while let Some(txid) = queue.pop() {
             if !seen.insert(txid.clone()) {
@@ -2238,6 +2951,201 @@ impl Engine {
         Ok(())
     }
 
+    /// Phase 1 of ONE topic: the dedup read, the previous coins, the
+    /// manager's judgement. Read-only. [`Engine::run_validation`] asks it of
+    /// every topic; the door asks it again of a topic whose predecessor it
+    /// landed first from the BEEF (lane E1D's lens fold, M1).
+    #[allow(clippy::too_many_arguments)]
+    async fn validate_topic(
+        &self,
+        tx: &Transaction,
+        txid: &str,
+        topic: &str,
+        off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+        context: &TopicAdmittanceContext,
+        bound: Option<&CallBound>,
+    ) -> TopicValidation {
+        let tx_record = AppliedTransaction {
+            txid: txid.to_string(),
+            topic: topic.to_string(),
+        };
+        // A dedup read that FAULTS is the topic's read fault (the delta
+        // fold of 2026-10-07, H3): nothing is judged and nothing is
+        // written for the topic, the fault rides the report and the
+        // replay asks again. The reference fails the topic there
+        // (`Engine.ts` `submit`: the throw lands in the per-topic catch,
+        // `failedTopics.add`). Read as "not a dupe", as it was, a
+        // re-presented transaction the manager admits with no previous
+        // coin was inserted a second time, unspent, beside the output
+        // that had spent it, under a durable report.
+        let is_dupe = match stored(
+            bound,
+            self.storage.does_applied_transaction_exist(&tx_record),
+        )
+        .await
+        {
+            Ok(is_dupe) => is_dupe,
+            Err(e) => {
+                error!("Error reading the applied row of {txid} for topic {topic}: {e}");
+                return TopicValidation {
+                    topic: topic.to_string(),
+                    is_dupe: false,
+                    previous_coins: vec![],
+                    previous_outputs: vec![],
+                    admittance: AdmittanceInstructions::default(),
+                    failed: false,
+                    read_fault: Some(("does_applied_transaction_exist", e.to_string())),
+                };
+            }
+        };
+
+        if is_dupe {
+            return TopicValidation {
+                topic: topic.to_string(),
+                is_dupe: true,
+                previous_coins: vec![],
+                previous_outputs: vec![],
+                admittance: AdmittanceInstructions::default(),
+                failed: false,
+                read_fault: None,
+            };
+        }
+
+        let mut previous_coins: Vec<u32> = Vec::new();
+        let mut previous_outputs: Vec<Output> = Vec::new();
+        let mut read_fault: Option<(&'static str, String)> = None;
+
+        for (input_idx, input) in tx.inputs.iter().enumerate() {
+            let source_txid = input.get_source_txid().unwrap_or_default();
+            if source_txid.is_empty() {
+                continue;
+            }
+            match stored(
+                bound,
+                self.storage.find_output(
+                    &source_txid,
+                    input.source_output_index,
+                    Some(topic),
+                    None,
+                    false,
+                ),
+            )
+            .await
+            {
+                Ok(Some(prev_output)) => {
+                    previous_coins.push(input_idx as u32);
+                    previous_outputs.push(prev_output);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // A faulted read is NOT "no previous coin": the
+                    // spend may consume an admitted output we simply
+                    // could not read. Validation proceeds (the topic
+                    // manager decides on what it can see) but the fault
+                    // rides the report and blocks the applied record.
+                    error!(
+                        "Error reading previous output {source_txid}:{} for topic {topic}: {e}",
+                        input.source_output_index
+                    );
+                    if read_fault.is_none() {
+                        read_fault = Some(("find_output", e.to_string()));
+                    }
+                }
+            }
+        }
+
+        let judged = self
+            .judge(
+                tx,
+                topic,
+                &previous_coins,
+                off_chain_values,
+                mode,
+                context,
+                bound,
+            )
+            .await;
+        match judged {
+            Ok(admittance) => TopicValidation {
+                topic: topic.to_string(),
+                is_dupe: false,
+                previous_coins,
+                previous_outputs,
+                admittance,
+                failed: false,
+                read_fault: read_fault.clone(),
+            },
+            Err(e) => {
+                error!("Error validating topic {topic} during submit: {e}");
+                TopicValidation {
+                    topic: topic.to_string(),
+                    is_dupe: false,
+                    previous_coins: vec![],
+                    previous_outputs: vec![],
+                    admittance: AdmittanceInstructions::default(),
+                    failed: true,
+                    read_fault,
+                }
+            }
+        }
+    }
+
+    /// The topic manager's judgement of `tx` over the previous coins found
+    /// (input indices), as [`Engine::validate_topic`] asks it; a carried
+    /// predecessor's submit asks it again for real once its topic does not
+    /// wait (the E1D delta fold, L4).
+    #[allow(clippy::too_many_arguments)]
+    async fn judge(
+        &self,
+        tx: &Transaction,
+        topic: &str,
+        previous_coins: &[u32],
+        off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+        context: &TopicAdmittanceContext,
+        bound: Option<&CallBound>,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        let manager = &self.managers[topic];
+        let previous_coin_bytes = previous_coins
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect::<Vec<u8>>();
+        // Under a finalize submit's bound a manager that does not answer
+        // is a manager that failed: nothing is written for the topic.
+        bounded(
+            bound,
+            manager.identify_admissible_outputs(
+                // The ONE engine parse of the submitted BEEF, shared by
+                // every topic on this submit (bsv-low #289 — managers
+                // used to re-parse the same bytes independently).
+                tx,
+                &previous_coin_bytes,
+                off_chain_values,
+                mode,
+                // `dry_run` is `false` on a submit, `true` on a
+                // validate-only call.
+                context,
+            ),
+        )
+        .await
+        .map_err(TopicManagerError::Other)
+        .and_then(|judged| judged)
+    }
+
+    /// Whether the door may land a carried predecessor into `topic` (the
+    /// E1D delta fold, L1): neither its manager nor any lookup service
+    /// reads off-chain values there, which the landing does not have.
+    fn lands_without_values(&self, topic: &str) -> bool {
+        self.managers
+            .get(topic)
+            .is_some_and(|manager| !manager.reads_off_chain_values())
+            && self
+                .lookup_services
+                .values()
+                .all(|ls| !ls.reads_off_chain_values(topic))
+    }
+
     /// Run Phase 1 (topic validation) and Phase 2 (broadcast) without mutating storage.
     ///
     /// Returns (validations, steak, parsed_tx, txid) so the caller can either
@@ -2248,6 +3156,7 @@ impl Engine {
         mode: SubmitMode,
         context: &TopicAdmittanceContext,
         bound: Option<&CallBound>,
+        walked: Option<&HashSet<String>>,
     ) -> Result<(Vec<TopicValidation>, Steak, Transaction, String), EngineError> {
         // Validate all topics are supported
         for topic in &tagged_beef.topics {
@@ -2280,14 +3189,24 @@ impl Engine {
         // through the topic manager before a single BEEF of it reaches this
         // door. Before #551 the anchor check was a no-op and this skip
         // admitted a peer's graph on structure alone.
+        //
+        // A predecessor the door lands first (`walked`, the E1D delta fold,
+        // L4) is not walked again when this submit's walks already passed
+        // over it, and its walk trusts what they passed over.
         if mode != SubmitMode::HistoricalTxNoSpv {
-            verify_spv_like_the_reference(
-                self.chain_tracker.as_deref(),
-                self.verify_scripts,
-                &tagged_beef.beef,
-                &txid,
-            )
-            .await?;
+            match walked {
+                Some(walked) if walked.contains(&txid) => {}
+                trusted => {
+                    verify_spv_trusting(
+                        self.chain_tracker.as_deref(),
+                        self.verify_scripts,
+                        &tagged_beef.beef,
+                        &txid,
+                        trusted.unwrap_or(&HashSet::new()),
+                    )
+                    .await?;
+                }
+            }
         }
 
         let mut steak = Steak::new();
@@ -2298,147 +3217,18 @@ impl Engine {
         let mut validations = Vec::new();
 
         for topic in &tagged_beef.topics {
-            let tx_record = AppliedTransaction {
-                txid: txid.clone(),
-                topic: topic.clone(),
-            };
-            // A dedup read that FAULTS is the topic's read fault (the delta
-            // fold of 2026-10-07, H3): nothing is judged and nothing is
-            // written for the topic, the fault rides the report and the
-            // replay asks again. The reference fails the topic there
-            // (`Engine.ts` `submit`: the throw lands in the per-topic catch,
-            // `failedTopics.add`). Read as "not a dupe", as it was, a
-            // re-presented transaction the manager admits with no previous
-            // coin was inserted a second time, unspent, beside the output
-            // that had spent it, under a durable report.
-            let is_dupe = match stored(
-                bound,
-                self.storage.does_applied_transaction_exist(&tx_record),
-            )
-            .await
-            {
-                Ok(is_dupe) => is_dupe,
-                Err(e) => {
-                    error!("Error reading the applied row of {txid} for topic {topic}: {e}");
-                    validations.push(TopicValidation {
-                        topic: topic.clone(),
-                        is_dupe: false,
-                        previous_coins: vec![],
-                        previous_outputs: vec![],
-                        admittance: AdmittanceInstructions::default(),
-                        failed: false,
-                        read_fault: Some(("does_applied_transaction_exist", e.to_string())),
-                    });
-                    continue;
-                }
-            };
-
-            if is_dupe {
-                validations.push(TopicValidation {
-                    topic: topic.clone(),
-                    is_dupe: true,
-                    previous_coins: vec![],
-                    previous_outputs: vec![],
-                    admittance: AdmittanceInstructions::default(),
-                    failed: false,
-                    read_fault: None,
-                });
-                continue;
-            }
-
-            let mut previous_coins: Vec<u32> = Vec::new();
-            let mut previous_outputs: Vec<Output> = Vec::new();
-            let mut read_fault: Option<(&'static str, String)> = None;
-
-            for (input_idx, input) in tx.inputs.iter().enumerate() {
-                let source_txid = input.get_source_txid().unwrap_or_default();
-                if source_txid.is_empty() {
-                    continue;
-                }
-                match stored(
-                    bound,
-                    self.storage.find_output(
-                        &source_txid,
-                        input.source_output_index,
-                        Some(topic),
-                        None,
-                        false,
-                    ),
-                )
-                .await
-                {
-                    Ok(Some(prev_output)) => {
-                        previous_coins.push(input_idx as u32);
-                        previous_outputs.push(prev_output);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        // A faulted read is NOT "no previous coin": the
-                        // spend may consume an admitted output we simply
-                        // could not read. Validation proceeds (the topic
-                        // manager decides on what it can see) but the fault
-                        // rides the report and blocks the applied record.
-                        error!(
-                            "Error reading previous output {source_txid}:{} for topic {topic}: {e}",
-                            input.source_output_index
-                        );
-                        if read_fault.is_none() {
-                            read_fault = Some(("find_output", e.to_string()));
-                        }
-                    }
-                }
-            }
-
-            let manager = &self.managers[topic];
-            let previous_coin_bytes = previous_coins
-                .iter()
-                .flat_map(|i| i.to_le_bytes())
-                .collect::<Vec<u8>>();
-            // Under a finalize submit's bound a manager that does not answer
-            // is a manager that failed: nothing is written for the topic.
-            let judged = bounded(
-                bound,
-                manager.identify_admissible_outputs(
-                    // The ONE engine parse of the submitted BEEF, shared by
-                    // every topic on this submit (bsv-low #289 — managers
-                    // used to re-parse the same bytes independently).
+            validations.push(
+                self.validate_topic(
                     &tx,
-                    &previous_coin_bytes,
+                    &txid,
+                    topic,
                     tagged_beef.off_chain_values.as_deref(),
                     mode,
-                    // `dry_run` is `false` on a submit, `true` on a
-                    // validate-only call.
                     context,
-                ),
-            )
-            .await
-            .map_err(TopicManagerError::Other)
-            .and_then(|judged| judged);
-            match judged {
-                Ok(admittance) => {
-                    validations.push(TopicValidation {
-                        topic: topic.clone(),
-                        is_dupe: false,
-                        previous_coins,
-                        previous_outputs,
-                        admittance,
-                        failed: false,
-                        read_fault: read_fault.clone(),
-                    });
-                }
-                Err(e) => {
-                    error!("Error validating topic {topic} during submit: {e}");
-                    validations.push(TopicValidation {
-                        topic: topic.clone(),
-                        is_dupe: false,
-                        previous_coins: vec![],
-                        previous_outputs: vec![],
-                        admittance: AdmittanceInstructions::default(),
-                        failed: true,
-                        read_fault,
-                    });
-                }
-            }
+                    bound,
+                )
+                .await,
+            );
         }
 
         // Build preliminary STEAK
@@ -4329,11 +5119,55 @@ pub(crate) async fn verify_spv_like_the_reference(
     beef_bytes: &[u8],
     subject_txid: &str,
 ) -> Result<(), EngineError> {
+    verify_spv_trusting(
+        chain_tracker,
+        verify_scripts,
+        beef_bytes,
+        subject_txid,
+        &HashSet::new(),
+    )
+    .await
+}
+
+/// [`verify_spv_like_the_reference`] trusting the transactions an earlier
+/// walk of the same submit passed over (a predecessor the door lands first,
+/// the E1D delta fold, L4): the script walk neither checks nor descends
+/// them. The structural escape hatch checks the whole BEEF it is given.
+async fn verify_spv_trusting(
+    chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
+    verify_scripts: bool,
+    beef_bytes: &[u8],
+    subject_txid: &str,
+    trusted: &HashSet<String>,
+) -> Result<(), EngineError> {
     if verify_scripts {
-        Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid).await
+        Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid, trusted).await
     } else {
         Engine::verify_spv_structurally(chain_tracker, beef_bytes).await
     }
+}
+
+/// The transactions the SPV walk of `from` passes over in `beef`
+/// ([`Engine::verify_beef_linear_with`]'s traversal, nothing checked): `from`
+/// and every source the BEEF carries, a proven transaction included and not
+/// descended. The E1D delta fold, L4: what a landing need not walk again.
+fn walk_cover(beef: &Beef, from: &str) -> HashSet<String> {
+    let bodies: HashMap<String, &Transaction> = beef
+        .txs
+        .iter()
+        .filter_map(|btx| btx.tx().map(|tx| (btx.txid(), tx)))
+        .collect();
+    let mut cover = HashSet::new();
+    let mut queue = vec![from.to_string()];
+    while let Some(txid) = queue.pop() {
+        if !cover.insert(txid.clone()) || beef.find_bump(&txid).is_some() {
+            continue;
+        }
+        if let Some(tx) = bodies.get(&txid) {
+            queue.extend(tx.inputs.iter().filter_map(|i| i.source_txid.clone()));
+        }
+    }
+    cover
 }
 
 /// The engine's [`crate::gasp::FinalizedGraphHook`] (bsv-low #552): submit

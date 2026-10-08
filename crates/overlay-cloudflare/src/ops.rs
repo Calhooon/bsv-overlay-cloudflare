@@ -177,6 +177,9 @@ pub const COUNTER_SUBMIT_TERMINAL_CAPPED: &str = "submit_terminal_judged_capped_
 /// loop 18: an admission write that outran its own eviction's table loop — re-evicted after the write, the
 /// submit answered as the refusal it is.
 pub const COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE: &str = "admit_fast_reevicted_after_write_total";
+/// bsv-low #575 (the E1D delta-2 fold, L2): a carried predecessor the engine was about to land first from a
+/// successor's BEEF, refused BEFORE its write because it is under an OPEN eviction (the successor's topic waits).
+pub const COUNTER_LANDING_REFUSED_EVICTED: &str = "landing_refused_evicted_total";
 /// loop 18: an eviction pass that could not prove every table clean (a faulted read, a survivor after the
 /// second move) — the open marker stands; the write-side guard and the next eviction converge.
 pub const COUNTER_ADMIT_FAST_EVICT_INCOMPLETE: &str = "admit_fast_evict_incomplete_total";
@@ -889,6 +892,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE,
         COUNTER_SUBMIT_TERMINAL_CAPPED,
         COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
+        COUNTER_LANDING_REFUSED_EVICTED,
         COUNTER_ADMIT_FAST_EVICT_INCOMPLETE,
         COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
         COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
