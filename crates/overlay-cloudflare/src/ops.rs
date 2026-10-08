@@ -187,6 +187,17 @@ pub const COUNTER_DEAD_LETTERS_PARKED: &str = "dead_letters_parked_total";
 pub const COUNTER_DEAD_LETTERS_REDRIVEN: &str = "dead_letters_redriven_total";
 /// bsv-low #576: re-driven letters that dead-lettered again and were parked again.
 pub const COUNTER_DEAD_LETTERS_STILL_FAILING: &str = "dead_letters_still_failing_total";
+/// bsv-low #576 (lens fold, H1): a dead letter whose park faulted on its LAST DLQ delivery: the platform drops it
+/// (logged `[dead-letters] LOST` with its key and the sha256 of its bytes). Best effort: D1 is usually what faulted.
+pub const COUNTER_DEAD_LETTERS_LOST: &str = "dead_letters_lost_total";
+/// bsv-low #576 (lens fold, M2): a new letter NOT parked because the table holds the ceiling of letters with bytes
+/// ([`crate::dead_letters::PARKED_ROWS_CEILING`]); it is handed back to the DLQ with backoff, never acked.
+pub const COUNTER_DEAD_LETTERS_CEILING_DEFERRED: &str = "dead_letters_ceiling_deferred_total";
+/// bsv-low #576 (lens fold, M1): re-drives claimed longer than [`crate::dead_letters::STALE_REDRIVE_MS`] ago and
+/// never resolved nor parked again, returned to the parked set by the lever.
+pub const COUNTER_DEAD_LETTERS_STALE_RETURNED: &str = "dead_letters_stale_returned_total";
+/// bsv-low #576 (lens fold, M2): parked or re-driven letters whose bytes later landed (the row is deleted).
+pub const COUNTER_DEAD_LETTERS_RESOLVED: &str = "dead_letters_resolved_total";
 /// loop 18: an eviction pass that could not prove every table clean (a faulted read, a survivor after the
 /// second move) — the open marker stands; the write-side guard and the next eviction converge.
 pub const COUNTER_ADMIT_FAST_EVICT_INCOMPLETE: &str = "admit_fast_evict_incomplete_total";
@@ -877,6 +888,10 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_DEAD_LETTERS_PARKED,
         COUNTER_DEAD_LETTERS_REDRIVEN,
         COUNTER_DEAD_LETTERS_STILL_FAILING,
+        COUNTER_DEAD_LETTERS_LOST,
+        COUNTER_DEAD_LETTERS_CEILING_DEFERRED,
+        COUNTER_DEAD_LETTERS_STALE_RETURNED,
+        COUNTER_DEAD_LETTERS_RESOLVED,
         COUNTER_ARC_INGEST_SEEN_LATCHED,
         COUNTER_ARC_INGEST_EVICTED,
         COUNTER_ARC_INGEST_READMITTED,

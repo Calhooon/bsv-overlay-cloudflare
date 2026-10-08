@@ -2120,7 +2120,45 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
 /// is safe — a topic whose every write landed is detected and skipped in
 /// Phase 1, and a topic that faulted is never recorded as applied, so its
 /// replay is re-validated and re-written (idempotent backend writes).
-#[event(queue)]
+/// The Worker's `queue` export, written out as worker-macros 0.8.5's `event(queue)` attribute writes it
+/// (`event.rs`: a synchronous wrapper returning a Promise, a panic on `Err`), so the batch arrives as the
+/// platform's own object (bsv-low #576's lens fold, H1): the DLQ consumer reads each message's `attempts`, which
+/// workers-rs 0.8.5's `Message` does not expose, to time its backoff and to know its LAST delivery.
+mod _worker_queue {
+    use ::worker::wasm_bindgen;
+    use ::worker::wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    pub fn queue(
+        event: ::worker::worker_sys::MessageBatch,
+        env: ::worker::Env,
+        ctx: ::worker::worker_sys::Context,
+    ) -> ::worker::js_sys::Promise {
+        ::worker::js_sys::futures::future_to_promise(::std::panic::AssertUnwindSafe(async move {
+            let ctx = ::worker::Context::new(ctx);
+            if let Err(e) = super::queue_entry(event, env, ctx).await {
+                ::worker::console_log!("{}", &e);
+                panic!("{}", e);
+            }
+            Ok(::worker::wasm_bindgen::JsValue::UNDEFINED)
+        }))
+    }
+}
+
+async fn queue_entry(
+    event: worker::worker_sys::MessageBatch,
+    env: Env,
+    ctx: worker::Context,
+) -> worker::Result<()> {
+    // bsv-low #576: a batch from the dead letter queue is PARKED in D1, never replayed here (the operator's lever
+    // re-drives it).
+    let name: String = event.queue().map(String::from).unwrap_or_default();
+    if crate::dead_letters::is_dead_letter_queue(&name) {
+        return crate::dead_letters::park_batch(&event, &env).await;
+    }
+    queue_handler(worker::MessageBatch::from(event), env, ctx).await
+}
+
 async fn queue_handler(
     batch: worker::MessageBatch<crate::queue::MutationMessage>,
     env: Env,
@@ -2130,32 +2168,49 @@ async fn queue_handler(
     use overlay_engine::types::{SubmitMode, TaggedBEEF};
     use worker::MessageExt;
 
-    // bsv-low #576: a batch from the dead letter queue is PARKED in D1, never replayed here (the operator's lever
-    // re-drives it).
-    if crate::dead_letters::is_dead_letter_queue(&batch.queue()) {
-        return crate::dead_letters::park_batch(&batch, &env).await;
-    }
-
     let engine = build_engine_from_env(&env)
         .await
         .map_err(|e| worker::Error::from(format!("Queue engine build failed: {e}")))?;
 
-    for msg_result in batch.iter() {
-        let msg = match msg_result {
-            Ok(m) => m,
+    // bsv-low #576's lens fold (N4, M1): every message keeps its handle, so nothing is dropped here unseen: a body
+    // that does not decode and one whose BEEF is not base64 are handed back like any fault, dead-letter after their
+    // replays and are PARKED (the undecodable one exhausted), where the platform used to ack them silently.
+    let counters = env.d1("OVERLAY_DB").ok();
+    for msg in batch.raw_iter() {
+        let body: crate::queue::MutationMessage = match worker::serde_wasm_bindgen::from_value(
+            msg.body(),
+        ) {
+            Ok(b) => b,
             Err(e) => {
-                worker::console_log!("Queue: failed to deserialize message: {}", e);
+                worker::console_log!("Queue: failed to deserialize message ({e}) — retrying; it dead-letters and is parked");
+                if let Some(db) = &counters {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
+                        .await;
+                }
+                msg.retry();
                 continue;
             }
         };
-
-        let body = msg.body();
+        let body = &body;
 
         let beef = match STANDARD.decode(&body.beef_b64) {
             Ok(b) => b,
             Err(e) => {
-                worker::console_log!("Queue: invalid base64 BEEF: {}", e);
-                msg.ack();
+                worker::console_log!(
+                    "Queue: invalid base64 BEEF ({e}) — retrying; it dead-letters and is parked"
+                );
+                if let Some(db) = &counters {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
+                        .await;
+                    crate::dead_letters::note_failing(
+                        db,
+                        body,
+                        None,
+                        &format!("invalid base64 BEEF ({e})"),
+                    )
+                    .await;
+                }
+                msg.retry();
                 continue;
             }
         };
@@ -2167,7 +2222,6 @@ async fn queue_handler(
         };
 
         let mode: SubmitMode = crate::queue::replay_submit_mode(&body.mode);
-        let counters = env.d1("OVERLAY_DB").ok();
         // ── bsv-low LOOP 18 (2026-09-21): a replay never resurrects an evicted pot ──
         // The subject by the ONE rule (D5, `subject_txid_of` over the enqueued bytes: no EF conversion, so a
         // JOIN carrying a txid-only hop — the F-D class — is judged too; the gate's MEDIUM-3); a body that does not

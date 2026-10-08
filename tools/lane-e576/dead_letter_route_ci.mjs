@@ -16,7 +16,9 @@
  *     enqueue per claim); the exhausted letter is never moved.
  *  4. A re-driven letter that fails again (its bytes do not parse) parks AGAIN on the same row, with its history.
  *  5. `/health/invariants.deadLetters`: the counts, the oldest parked, the last re-drive, the exhausted list.
- * On the base (`835b80c`) there is no route (the dispatch's 404) and no table: RED.
+ *  6-9. The lens fold (lane E576-f): the health's exhaustedCount / ceiling / stale fields; a stale re-drive returned
+ *     and re-driven (M1); an exhausted letter forced by txid (L5); a bad-base64 replay dead-lettered and parked (N4).
+ * On the base (`835b80c`) there is no route (the dispatch's 404) and no table: RED. On `f8b5525` legs 6-9: RED.
  *
  *   node tools/lane-e576/dead_letter_route_ci.mjs <overlay base> <overlay --persist-to dir>
  *
@@ -218,6 +220,46 @@ expect(
   '/health/invariants.deadLetters: the count, the oldest parked, the last re-drive, the exhausted letter',
   JSON.stringify(dl),
 )
+
+// ── bsv-low #576's lens fold (lane E576-f) ──────────────────────────────────
+// 6. The health block's new fields (M1, M2, L4).
+expect(
+  typeof dl.exhaustedCount === 'number' && dl.exhaustedCount >= 1 && dl.ceiling?.max === 2000 && typeof dl.ceiling?.held === 'number' &&
+    typeof dl.staleRedriven === 'number' && dl.staleAfterMs === 3_600_000 && typeof dl.parkedLast24h === 'number' && !('resolved' in dl),
+  '/health/invariants.deadLetters: exhaustedCount, the ceiling, the stale re-drives, the last 24 h',
+  JSON.stringify(dl),
+)
+// 7. M1: a re-drive claimed two hours ago that never came back is returned to the parked set and re-driven.
+d1(`INSERT INTO mutation_dead_letters (txid, topics, message, fault, attempts, status, redrives, first_seen_at, parked_at, redriven_at, history) VALUES ('e576s', 'tm_collected', '${msg}', 'its send never left', 0, 'redriven', 1, 500, 500, ${Date.now() - 2 * 3_600_000}, '[]')`)
+const hs = await health()
+expect((hs.deadLetters?.staleRedriven ?? 0) >= 1 && hs.deadLetters?.oldestRedriven?.txid === 'e576s', 'the health shows the stale re-drive meanwhile', JSON.stringify(hs.deadLetters))
+const stale0 = hs.counters?.dead_letters_stale_returned_total ?? NaN
+const st = await lever({ txid: 'e576s' })
+expect(
+  st.status === 200 && (st.json?.staleReturned ?? []).some((r) => r.txid === 'e576s') && (st.json?.redriven ?? []).some((r) => r.txid === 'e576s' && r.redrive === 2),
+  'the lever returns the stale re-drive to the parked set and re-drives it (its spent re-drive stays spent)',
+  st.text.slice(0, 400),
+)
+expect(((await health()).counters?.dead_letters_stale_returned_total ?? NaN) >= stale0 + 1, 'dead_letters_stale_returned_total moved', `${stale0}`)
+// 8. L5: the exhausted letter is re-driven once more only with force, by txid.
+const nf = await lever({ txid: 'e576x' })
+const fx = await lever({ txid: 'e576x', force: true })
+const bad = await lever({ force: true })
+expect(
+  nf.json?.read === 0 && (fx.json?.redriven ?? []).some((r) => r.txid === 'e576x' && r.redrive === 4 && r.forced === true) && bad.status === 400,
+  'an exhausted letter moves only with {"txid", "force": true} (a force with no txid is 400)',
+  `${nf.text.slice(0, 120)} | ${fx.text.slice(0, 200)} | ${bad.status}`,
+)
+// 9. N4: a body whose BEEF is not base64 is no longer acked silently: it dead-letters and parks again.
+const badMsg = JSON.stringify({ beef_b64: '!!!!', topics: ['tm_collected'], mode: 'historical-tx', reason: 'phase3-fault' }).replaceAll("'", "''")
+d1(`INSERT INTO mutation_dead_letters (txid, topics, message, fault, attempts, status, redrives, first_seen_at, parked_at, history) VALUES ('e576n', 'tm_collected', '${badMsg}', 'seeded', 0, 'parked', 0, 400, 400, '[]')`)
+const nb = await lever({ txid: 'e576n' })
+expect((nb.json?.redriven ?? []).length === 1, 'the bad-base64 letter is re-driven', nb.text.slice(0, 200))
+const nbParked = await until('e576n parked again', () => {
+  const r = letter('e576n')
+  return r && r.status === 'parked' && /invalid base64/.test(r.fault ?? '') ? r : null
+})
+expect(!!nbParked, `a bad-base64 replay is handed back, dead-letters and parks again with its fault (within ${WAIT_MS / 1000} s)`, JSON.stringify({ ...(letter('e576n') ?? {}), message: '…' }))
 
 } catch (e) {
   expect(false, 'the seeded legs ran (the table and the lever exist)', `${e.message ?? e}`.split('\n')[0])

@@ -2918,7 +2918,7 @@ pub fn check_admin_auth(req: &Request, env: &Env) -> Result<(), worker::Result<R
 /// early-exit `!=` leaked how many leading bytes matched through timing.
 /// The fold touches every byte regardless of where the first mismatch is;
 /// only the token's LENGTH remains observable, which is not secret.
-fn fixed_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn fixed_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

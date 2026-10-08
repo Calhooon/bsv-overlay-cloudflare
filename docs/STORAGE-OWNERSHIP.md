@@ -79,7 +79,7 @@ The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` r
 | `ops_counters` | overlay-cloudflare | low-app-layer: INSERT | none | transient | no | operator counters |
 | `ops_heartbeat` | overlay-cloudflare | none | none | transient | no | a heartbeat |
 | `submit_refusals` | overlay-cloudflare | none | low-app-layer | transient | no | a census window (#366) |
-| `mutation_dead_letters` | overlay-cloudflare | none | none | lost | **yes** | bsv-low #576: the parked dead letters; once the DLQ consumer acks a letter this row is its only copy, and the operator's lever re-drives from it; nothing deletes from it |
+| `mutation_dead_letters` | overlay-cloudflare | none | none | lost | **yes** | bsv-low #576: the parked dead letters; once the DLQ consumer acks a letter this row is its only copy, and the operator's lever re-drives from it. The lens fold (M2): one scoped DELETE, `dead_letters::resolve` when a replay of the key is acked (its bytes landed; the row copies nothing); at most 2000 letters hold bytes, a row holds one queue message and 20 history entries |
 | `banned_hosts` | overlay-cloudflare | none | none | lost | **yes** | the operator's bans: nothing else holds them (export first) |
 | `ship_records` | overlay-cloudflare | none | none | chain | no | other overlays' adverts; tm_ship is not registered on LOW (empty) |
 | `slap_records` | overlay-cloudflare | none | none | chain | no | as ship_records |

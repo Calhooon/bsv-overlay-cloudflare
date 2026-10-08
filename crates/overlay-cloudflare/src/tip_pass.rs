@@ -79,10 +79,14 @@ pub const REORG_SWEEP_LIMIT: u64 = 200;
 /// rows (a small ladder allowance; most passes spend none).
 pub const REORG_SWEEP_BUDGET: u32 = 20;
 
-/// `Authorization: Bearer <INTERNAL_TOKEN>` — exact, non-empty; no secret ⇒ refused.
+/// `Authorization: Bearer <INTERNAL_TOKEN>` — exact, non-empty; no secret ⇒ refused. Compared in fixed time
+/// (bsv-low #576's lens fold, L1: the admin token's #320 L1 compare; the dead-letter lever can enqueue).
 pub fn bearer_ok(authorization: Option<&str>, secret: Option<&str>) -> bool {
     match (authorization, secret) {
-        (Some(a), Some(s)) if !s.is_empty() => a.strip_prefix("Bearer ").map(str::trim) == Some(s),
+        (Some(a), Some(s)) if !s.is_empty() => a
+            .strip_prefix("Bearer ")
+            .map(str::trim)
+            .is_some_and(|p| crate::routes::fixed_time_eq(p.as_bytes(), s.as_bytes())),
         _ => false,
     }
 }
@@ -866,6 +870,19 @@ mod tests {
         assert!(!bearer_ok(Some("s3cret"), Some("s3cret")));
         assert!(!bearer_ok(None, Some("s3cret")));
         assert!(!bearer_ok(Some("Bearer "), Some("")));
+        assert!(
+            !bearer_ok(Some("Bearer s3cre"), Some("s3cret")),
+            "a prefix is not the token"
+        );
+        assert!(!bearer_ok(Some("Bearer s3cret!"), Some("s3cret")));
+        // bsv-low #576's lens fold (L1): the compare is the fixed-time one, not `==` on strings
+        let src = include_str!("tip_pass.rs");
+        let f = &src[src.find("pub fn bearer_ok(").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        assert!(
+            f.contains("crate::routes::fixed_time_eq(") && !f.contains("== Some(s)"),
+            "{f}"
+        );
         assert!(!bearer_ok(Some("Bearer s3cret"), None));
     }
 
