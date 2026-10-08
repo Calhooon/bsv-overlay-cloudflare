@@ -404,7 +404,11 @@ amended, both RED on `683dffd`) and `e1d_delta` (the E1D delta fold: `m1`
 the read count of one submit over carried spends, to the read, `l4` each link
 of a carried chain admitted once and walked once, `l1` a predecessor's
 off-chain values never taken by a landing, each RED on `0da3a82`; the
-worker's `admit_fast::tests::e1d_delta_l2`, RED on `0da3a82`). The pin of the
+worker's `admit_fast::tests::e1d_delta_l2`, RED on `0da3a82`, a source-shape
+pin) and `e1d_fold3` (the delta-2 fold: `l2` the door asking the landing
+guard before it lands, RED on `f057acc` with the API grafted inert; its
+route-tier cell `tools/lane-e1d/landing_guard_route_ci.mjs`, run by `make
+ci-d1-budget` over a real open eviction row, RED on `f057acc`). The pin of the
 opener limit (`limit_opener`) is retired: `e1d_c` is its cure.
 
 The GASP walk re-asks the predecessor FIRST (E1D, an addition to D13): a
