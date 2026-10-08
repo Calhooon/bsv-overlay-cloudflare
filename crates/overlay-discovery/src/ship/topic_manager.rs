@@ -41,6 +41,11 @@ impl Default for SHIPTopicManager {
 
 #[async_trait(?Send)]
 impl TopicManager for SHIPTopicManager {
+    /// Admission is judged on the transaction alone: no off-chain value is read.
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,

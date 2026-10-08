@@ -1554,6 +1554,12 @@ async fn submit_inner(
         }
     };
     let engine_submit_ms = js_sys::Date::now() - engine_started;
+    // lane E1D's delta fold (L2): what the engine landed first from the BEEF is guarded like the subject's write
+    if !mutation_report.landed_predecessors.is_empty() {
+        if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
+            crate::admit_fast::guard_landed(&ledger_db, &mutation_report.landed_predecessors, "POST /submit").await;
+        }
+    }
     // ── bsv-low LOOP 18: the write-side guard, AFTER the write ──
     // Pair 11's JOIN: the callbacks' evictions ran their table loops while this write was still landing (12.8 s
     // under the fleet burst), and the rows written after each table's step survived — the pot stayed `known`.
@@ -3199,6 +3205,12 @@ pub async fn admin_readmit(
         .await
     {
         Ok((steak, report)) => {
+            // lane E1D's delta fold (L2): what the engine landed first from the BEEF is guarded like any admission
+            if !report.landed_predecessors.is_empty() {
+                if let Ok(db) = env.d1("OVERLAY_DB") {
+                    crate::admit_fast::guard_landed(&db, &report.landed_predecessors, "POST /admin/readmit").await;
+                }
+            }
             let admitted = steak
                 .get(&topic)
                 .map(|a| a.outputs_to_admit.clone())

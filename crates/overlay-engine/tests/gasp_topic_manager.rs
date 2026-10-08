@@ -165,6 +165,10 @@ struct HeadChainManager(Rc<RefCell<HeadState>>);
 
 #[async_trait(?Send)]
 impl TopicManager for HeadChainManager {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -379,6 +383,10 @@ struct DefaultInputsManager;
 
 #[async_trait(?Send)]
 impl TopicManager for DefaultInputsManager {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
     async fn identify_admissible_outputs(
         &self,
         _tx: &Transaction,
@@ -506,6 +514,10 @@ struct ProbeManager {
 
 #[async_trait(?Send)]
 impl TopicManager for ProbeManager {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -1007,6 +1019,10 @@ impl DecoyHeadManager {
 
 #[async_trait(?Send)]
 impl TopicManager for DecoyHeadManager {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -1598,6 +1614,10 @@ struct AdmitsOutputZero(Rc<RefCell<HeadState>>);
 
 #[async_trait(?Send)]
 impl TopicManager for AdmitsOutputZero {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -2008,6 +2028,10 @@ struct RetainingHeadManager {
 
 #[async_trait(?Send)]
 impl TopicManager for RetainingHeadManager {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -2531,6 +2555,10 @@ struct RecordedHeadManager(Rc<RefCell<HeadState>>);
 
 #[async_trait(?Send)]
 impl TopicManager for RecordedHeadManager {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -3030,6 +3058,10 @@ struct StatefulHead<M> {
 
 #[async_trait(?Send)]
 impl<M: TopicManager> TopicManager for StatefulHead<M> {
+    fn reads_off_chain_values(&self) -> bool {
+        self.rule.reads_off_chain_values()
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -3646,6 +3678,10 @@ struct NotNow<M> {
 
 #[async_trait(?Send)]
 impl<M: TopicManager> TopicManager for NotNow<M> {
+    fn reads_off_chain_values(&self) -> bool {
+        self.rule.reads_off_chain_values()
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -4357,6 +4393,10 @@ struct ToldLookup {
 
 #[async_trait(?Send)]
 impl bsv_overlay_engine::lookup_service::LookupService for ToldLookup {
+    fn reads_off_chain_values(&self, _topic: &str) -> bool {
+        false
+    }
+
     fn admission_mode(&self) -> AdmissionMode {
         AdmissionMode::LockingScript
     }
@@ -5872,6 +5912,10 @@ struct TipShapeManager;
 
 #[async_trait(?Send)]
 impl TopicManager for TipShapeManager {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -6201,6 +6245,10 @@ struct ShapeHeadManager {
 
 #[async_trait(?Send)]
 impl TopicManager for ShapeHeadManager {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -6547,6 +6595,10 @@ struct Nameless<M>(M);
 
 #[async_trait(?Send)]
 impl<M: TopicManager> TopicManager for Nameless<M> {
+    fn reads_off_chain_values(&self) -> bool {
+        self.0.reads_off_chain_values()
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -6831,6 +6883,10 @@ struct NamesEveryInput;
 
 #[async_trait(?Send)]
 impl TopicManager for NamesEveryInput {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
     async fn identify_admissible_outputs(
         &self,
         tx: &Transaction,
@@ -6978,4 +7034,391 @@ async fn e1d_fold_l3_the_walks_landed_reads_are_capped_per_node() {
     );
     // The strip's one read per input (the reference's), then the 16.
     assert_eq!(reads.get(), 20 + 16);
+}
+
+// ============================================================================
+// The E1D delta fold (delta lens `docs/audit/E1D-delta-2026-10-08.md` on
+// `0da3a82`): M1, L1, L2, L4. Each pin below is RED on `0da3a82`.
+// ============================================================================
+
+// `k` held heads (proven, one output each: the shape manager admits them),
+// `k` spends of them that admit nothing (`w` outputs each, never submitted
+// here), and the subject: a spend of every output of those spends (two
+// outputs, it admits nothing), whose BEEF carries them all. The delta lens's
+// public-door shape (SHIP adverts, their revocations, one subject).
+fn wide_over_carried_spends(k: usize, w: usize) -> (Vec<Transaction>, Transaction) {
+    let heads: Vec<Transaction> = (0..k)
+        .map(|j| {
+            let mut head = Transaction::new();
+            head.inputs
+                .push(TransactionInput::new("44".repeat(32), j as u32));
+            head.outputs
+                .push(TransactionOutput::new(1000, plain_output().locking_script));
+            proven(&head, 700 + j as u32)
+        })
+        .collect();
+    let mut subject = Transaction::new();
+    for head in &heads {
+        let mut spend = Transaction::new();
+        let mut input = TransactionInput::new(head.id(), 0);
+        input.source_transaction = Some(Box::new(head.clone()));
+        spend.inputs.push(input);
+        for _ in 0..w {
+            spend
+                .outputs
+                .push(TransactionOutput::new(10, plain_output().locking_script));
+        }
+        for vout in 0..w as u32 {
+            let mut input = TransactionInput::new(spend.id(), vout);
+            input.source_transaction = Some(Box::new(spend.clone()));
+            subject.inputs.push(input);
+        }
+    }
+    subject.outputs.push(plain_output());
+    subject.outputs.push(plain_output());
+    (heads, subject)
+}
+
+// M1, the delta lens's `delta_d1`. After each landing the door judged the
+// subject again (its applied row, one coin per input), and none of those
+// reads was charged to the submit's 256: one public submit of a 252-input
+// subject over 18 carried spends read the store 5,081 times on `0da3a82`
+// (3,283 for 12 x 20). Now the re-judgement is charged BEFORE its landing,
+// and a landing whose re-judgement does not fit is not made: one submit
+// reads its own validation (1 + inputs) plus at most 256, to the read.
+#[tokio::test]
+async fn e1d_delta_m1_one_submit_reads_its_validation_and_at_most_256_more() {
+    let (_logs, _guard) = capture_logs();
+    // (k, w, the exact reads of the one submit, landed)
+    let rows = [(1, 2, 13, 1), (12, 20, 493, 1), (18, 14, 257, 0)];
+    let mut seen = Vec::new();
+    for (k, w, _, _) in rows {
+        let (heads, subject) = wide_over_carried_spends(k, w);
+        let store = Rc::new(MemoryStorage::new());
+        for head in &heads {
+            assert!(submitted(&shape_door(&store, false), &beef_of(head))
+                .await
+                .is_durable());
+        }
+        let storage = ScriptedStore::plain(&store);
+        let reads = storage.reads.clone();
+        let engine = door(ShapeHeadManager { names: false }, storage);
+        let r = submitted(&engine, &beef_of(&subject)).await;
+        println!(
+            "E1D delta M1 k={k} w={w} ({} inputs): {} reads (bound {}), landed {}, durable {} ({})",
+            k * w,
+            reads.get(),
+            1 + k * w + 256,
+            r.landed_predecessors.len(),
+            r.is_durable(),
+            r.summary()
+        );
+        seen.push((reads.get(), r));
+    }
+    // The reads first, every row: the bound and the exact count.
+    for ((k, w, exact, _), (reads, _)) in rows.iter().zip(&seen) {
+        assert!(*reads <= 1 + k * w + 256, "k={k} w={w}: {reads} reads");
+        assert_eq!(reads, exact, "k={k} w={w}");
+    }
+    for ((k, w, _, landed), (_, r)) in rows.iter().zip(&seen) {
+        assert_eq!(r.landed_predecessors.len(), *landed, "k={k} w={w}");
+        if *k == 1 {
+            assert!(r.is_durable(), "{}", r.summary());
+            assert_eq!(r.applied_topics, vec![TOPIC.to_string()]);
+        } else {
+            assert!(
+                r.faults.iter().any(|f| f.site == "predecessor_not_landed"),
+                "{}",
+                r.summary()
+            );
+        }
+    }
+}
+
+// A manager over the rule of `M` that records every admission call: the
+// txid judged and whether it was a dry run.
+struct Recorded<M> {
+    rule: M,
+    calls: Rc<RefCell<Vec<(String, bool)>>>,
+}
+
+#[async_trait(?Send)]
+impl<M: TopicManager> TopicManager for Recorded<M> {
+    fn reads_off_chain_values(&self) -> bool {
+        self.rule.reads_off_chain_values()
+    }
+
+    async fn identify_admissible_outputs(
+        &self,
+        tx: &Transaction,
+        previous_coins: &[u8],
+        off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+        context: &TopicAdmittanceContext,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        self.calls.borrow_mut().push((tx.id(), context.dry_run));
+        self.rule
+            .identify_admissible_outputs(tx, previous_coins, off_chain_values, mode, context)
+            .await
+    }
+
+    async fn identify_needed_inputs(
+        &self,
+        beef: &[u8],
+        off_chain_values: Option<&[u8]>,
+    ) -> Result<Vec<Outpoint>, TopicManagerError> {
+        self.rule
+            .identify_needed_inputs(beef, off_chain_values)
+            .await
+    }
+
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+// A shape door that records its manager's calls and checks roots against
+// `tracker`, over `store`.
+fn recorded_door(
+    store: &Rc<MemoryStorage>,
+    calls: &Rc<RefCell<Vec<(String, bool)>>>,
+    tracker: &KnownRoots,
+) -> Engine {
+    Engine::with_chain_tracker(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(Recorded {
+                rule: ShapeHeadManager { names: true },
+                calls: calls.clone(),
+            }) as Box<dyn TopicManager>,
+        )]),
+        HashMap::new(),
+        Box::new(ScriptedStore::plain(store)),
+        None,
+        None,
+        Some(Box::new(tracker.clone())),
+        EngineConfig::default(),
+    )
+}
+
+// L4, the delta lens's `delta_d3`. A carried chain of unlanded heads, each
+// blocked by the one under it: on `0da3a82` each link was submitted, found
+// blocked, and submitted again once the one under it landed, so its manager
+// was asked for REAL twice (`[1, 2, 2, ...]`), and in a walked mode each of
+// those submits walked its whole atomic BEEF again (the ancestry, down to
+// the proven genesis: the chain tracker asked once per submit). Now a
+// blocked link is asked only a DRY RUN and admitted for real ONCE, ancestors
+// first, and no body is walked twice in the submit: the successor's own walk
+// covered the chain, the tracker is asked once for the whole submit. The
+// chain is script-valid (`OP_1` outputs, empty unlocking scripts).
+#[tokio::test]
+async fn e1d_delta_l4_each_link_of_a_carried_chain_is_admitted_once_and_walked_once() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = scripted_chain(8, "51", 1);
+    let tracker = KnownRoots::of(&nodes);
+    let store = Rc::new(MemoryStorage::new());
+    let calls: Rc<RefCell<Vec<(String, bool)>>> = Rc::default();
+    let genesis = recorded_door(&store, &calls, &tracker)
+        .submit_with_report(&proven_beef(&nodes[0]), SubmitMode::HistoricalTx)
+        .await
+        .unwrap()
+        .1;
+    assert!(genesis.is_durable());
+    calls.borrow_mut().clear();
+    let asked_before = tracker.asked.load(Ordering::SeqCst);
+
+    let r = recorded_door(&store, &calls, &tracker)
+        .submit_with_report(&unproven_beef(&nodes, 7, 0), SubmitMode::HistoricalTx)
+        .await
+        .unwrap()
+        .1;
+    let real: Vec<usize> = nodes[1..7]
+        .iter()
+        .map(|n| {
+            let txid = node_txid(n);
+            calls
+                .borrow()
+                .iter()
+                .filter(|(t, dry)| *t == txid && !dry)
+                .count()
+        })
+        .collect();
+    let asked = tracker.asked.load(Ordering::SeqCst) - asked_before;
+    println!(
+        "E1D delta L4: real calls per link {real:?}, tracker asked {asked}, landed {:?}, durable {} ({})",
+        r.landed_predecessors.len(),
+        r.is_durable(),
+        r.summary()
+    );
+    assert!(r.is_durable(), "{}", r.summary());
+    assert_eq!(rows(&store, &nodes).await, ["7:spent=false"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 8]);
+    assert_eq!(real, [1; 6], "each link admitted once");
+    assert_eq!(asked, 1, "one walk reaches the proven genesis");
+    // L2's record: the landed links, ancestors first.
+    assert_eq!(
+        r.landed_predecessors,
+        nodes[1..7]
+            .iter()
+            .map(|n| (node_txid(n), TOPIC.to_string()))
+            .collect::<Vec<_>>()
+    );
+}
+
+// What a `ValuesLookup` was told: each txid and its off-chain values.
+type ToldValues = Rc<RefCell<Vec<(String, Option<Vec<u8>>)>>>;
+
+// A lookup service that records the off-chain values it is told with, and
+// says whether it reads them.
+struct ValuesLookup {
+    told: ToldValues,
+    reads: bool,
+}
+
+#[async_trait(?Send)]
+impl bsv_overlay_engine::lookup_service::LookupService for ValuesLookup {
+    fn admission_mode(&self) -> AdmissionMode {
+        AdmissionMode::LockingScript
+    }
+    fn spend_notification_mode(&self) -> SpendNotificationMode {
+        SpendNotificationMode::None
+    }
+    fn reads_off_chain_values(&self, _topic: &str) -> bool {
+        self.reads
+    }
+    async fn output_admitted_by_topic(
+        &self,
+        payload: &OutputAdmittedByTopic,
+    ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
+        if let OutputAdmittedByTopic::LockingScript {
+            txid,
+            off_chain_values,
+            ..
+        } = payload
+        {
+            self.told
+                .borrow_mut()
+                .push((txid.clone(), off_chain_values.clone()));
+        }
+        Ok(())
+    }
+    async fn output_evicted(
+        &self,
+        _txid: &str,
+        _output_index: u32,
+    ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
+        Ok(())
+    }
+    async fn lookup(
+        &self,
+        _question: &LookupQuestion,
+    ) -> Result<LookupResult, bsv_overlay_engine::lookup_service::LookupServiceError> {
+        Ok(LookupResult::OutputList(Vec::new()))
+    }
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+fn values_door(
+    store: &Rc<MemoryStorage>,
+    told: &ToldValues,
+    reads: bool,
+    storage: ScriptedStore,
+) -> Engine {
+    let _ = store;
+    Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(ShapeHeadManager { names: true }) as Box<dyn TopicManager>,
+        )]),
+        HashMap::from([(
+            "ls_values".to_string(),
+            Box::new(ValuesLookup {
+                told: told.clone(),
+                reads,
+            }) as Box<dyn bsv_overlay_engine::lookup_service::LookupService>,
+        )]),
+        Box::new(storage),
+        None,
+        EngineConfig::default(),
+    )
+}
+
+// L1, the delta lens's `delta_d2`. Head 1's own submit carries off-chain
+// values and faults; head 2, carrying head 1, arrives before head 1's
+// replay. On `0da3a82` the door landed head 1 with NO values (the lookup
+// service was told `None`) and head 1's replay with its values was then a
+// dupe: the values were never told. Now a topic whose lookup service reads
+// off-chain values gets nothing landed first: head 2 waits, head 1's replay
+// lands WITH its values, and head 2's replay then lands over its coin. A
+// service that does not read them (the second half) lets the door land.
+#[tokio::test]
+async fn e1d_delta_l1_a_landing_never_takes_a_predecessors_off_chain_values() {
+    let (_logs, _guard) = capture_logs();
+    for reads in [true, false] {
+        let nodes = chain(3);
+        let store = Rc::new(MemoryStorage::new());
+        let told: ToldValues = Rc::default();
+        let with_values = |node: &GASPNode| {
+            let mut beef = proven_beef(node);
+            beef.off_chain_values = Some(b"sidecar".to_vec());
+            beef
+        };
+        let a = values_door(
+            &store,
+            &told,
+            reads,
+            ScriptedStore::armed(&store, node_txid(&nodes[1]), 0, InsertEvent::Faults),
+        );
+        assert!(submitted(&a, &proven_beef(&nodes[0])).await.is_durable());
+        assert!(!submitted(&a, &with_values(&nodes[1])).await.is_durable());
+        drop(a);
+        told.borrow_mut().clear();
+
+        let door = || values_door(&store, &told, reads, ScriptedStore::plain(&store));
+        let head2 = submitted(&door(), &unproven_beef(&nodes, 2, 0)).await;
+        let replay1 = submitted(&door(), &with_values(&nodes[1])).await;
+        let replay2 = submitted(&door(), &unproven_beef(&nodes, 2, 0)).await;
+        let head1_told: Vec<Option<Vec<u8>>> = told
+            .borrow()
+            .iter()
+            .filter(|(t, _)| *t == node_txid(&nodes[1]))
+            .map(|(_, v)| v.clone())
+            .collect();
+        println!(
+            "E1D delta L1 reads={reads}: head 2 durable {} ({}), head 1 replay applied {:?} deduped {:?}, head 1 told {head1_told:?}",
+            head2.is_durable(),
+            head2.summary(),
+            replay1.applied_topics,
+            replay1.deduped_topics
+        );
+        if reads {
+            assert!(head2
+                .faults
+                .iter()
+                .any(|f| f.site == "predecessor_not_landed"));
+            assert!(head2.landed_predecessors.is_empty());
+            assert_eq!(replay1.applied_topics, vec![TOPIC.to_string()]);
+            assert_eq!(head1_told, [Some(b"sidecar".to_vec())]);
+            assert_eq!(replay2.applied_topics, vec![TOPIC.to_string()]);
+        } else {
+            assert!(head2.is_durable(), "{}", head2.summary());
+            assert_eq!(
+                head2.landed_predecessors,
+                [(node_txid(&nodes[1]), TOPIC.to_string())]
+            );
+            assert_eq!(replay1.deduped_topics, vec![TOPIC.to_string()]);
+            assert_eq!(head1_told, [None]);
+        }
+        assert_eq!(rows(&store, &nodes).await, ["2:spent=false"]);
+        assert_eq!(applied_rows(&store, &nodes).await, [true; 3]);
+    }
 }

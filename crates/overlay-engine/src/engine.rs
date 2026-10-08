@@ -423,6 +423,12 @@ pub struct MutationReport {
     /// that means "nothing new", never "judged another tx" (loop-3 client
     /// belt re-presents read the empty STEAK as index-pending).
     pub deduped_topics: Vec<String>,
+    /// The predecessors the door LANDED first from this submit's BEEF, as
+    /// `(txid, topic)`, ancestors first ([`Engine::land_carried`]; the E1D
+    /// delta fold, L2). Each is an admission write of its own that no
+    /// caller asked for: a caller that guards its admission writes (the
+    /// worker's eviction ledger, bsv-low #513) guards these too.
+    pub landed_predecessors: Vec<(String, String)>,
 }
 
 /// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): what [`Engine::renotify_admitted`] did.
@@ -917,6 +923,7 @@ impl Engine {
                 roots: RootPolicy::AcceptUnchecked,
                 budget: Some(DoorBudget::DEFAULT),
             },
+            &HashSet::new(),
         )
         .await
     }
@@ -946,7 +953,13 @@ impl Engine {
         // manager that writes on admission must not write here, or the real
         // submit that follows meets a head this call already advanced.
         let (_validations, steak, _tx, _txid) = self
-            .run_validation(tagged_beef, mode, &TopicAdmittanceContext::DRY_RUN, None)
+            .run_validation(
+                tagged_beef,
+                mode,
+                &TopicAdmittanceContext::DRY_RUN,
+                None,
+                None,
+            )
             .await?;
         Ok(steak)
     }
@@ -1046,7 +1059,7 @@ impl Engine {
             mode,
             bound,
             finalize,
-            false,
+            None,
             &mut question_reads,
         )
         .await
@@ -1056,19 +1069,23 @@ impl Engine {
     /// [`Engine::submit_bounded`] over the submit's read allowance
     /// (`question_reads`), which a predecessor the door lands first from the
     /// BEEF shares with the successor that carried it (lane E1D's lens fold,
-    /// M1). `carried` is `true` for such a predecessor's own submit
-    /// ([`Engine::land_carried`]): it lands nothing first itself, and it names instead the
-    /// carried predecessor that blocks each topic (the third value), so the
-    /// landing is an explicit stack and never a recursion of submits (nested
-    /// polls grow the stack, and a Worker's is small). Boxed: the landing is
-    /// a submit of its own.
+    /// M1). `carried` is `Some` for such a predecessor's own submit
+    /// ([`Engine::land_carried`]), holding the bodies whose SPV walk already
+    /// passed in this submit (none is walked twice; the delta fold, L4): it
+    /// lands nothing first itself, and it names instead the carried
+    /// predecessor that blocks each topic (the third value), so the landing
+    /// is an explicit stack and never a recursion of submits (nested polls
+    /// grow the stack, and a Worker's is small). Its manager is asked as a
+    /// DRY RUN first, and for real only once its topic is not blocked: a
+    /// link blocked below is judged twice and admitted once. Boxed: the
+    /// landing is a submit of its own.
     fn submit_counted<'a>(
         &'a self,
         tagged_beef: &'a TaggedBEEF,
         mode: SubmitMode,
         bound: Option<&'a CallBound>,
         finalize: bool,
-        carried: bool,
+        carried: Option<&'a HashSet<String>>,
         question_reads: &'a mut usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Counted, EngineError>> + 'a>>
     {
@@ -1084,12 +1101,19 @@ impl Engine {
         mode: SubmitMode,
         bound: Option<&CallBound>,
         finalize: bool,
-        carried: bool,
+        walked: Option<&HashSet<String>>,
         question_reads: &mut usize,
     ) -> Result<Counted, EngineError> {
-        // A submit is a real admission, never a dry run.
+        // A submit is a real admission, never a dry run; a carried
+        // predecessor's is judged dry until its topic is known not to wait.
+        let carried = walked.is_some();
+        let context = if carried {
+            TopicAdmittanceContext::DRY_RUN
+        } else {
+            TopicAdmittanceContext::default()
+        };
         let (mut validations, mut steak, tx, txid) = self
-            .run_validation(tagged_beef, mode, &TopicAdmittanceContext::default(), bound)
+            .run_validation(tagged_beef, mode, &context, bound, walked)
             .await?;
         let mut report = MutationReport::default();
         // The body every LOOKUP SERVICE receives NAMES the subject (BRC-95
@@ -1124,8 +1148,40 @@ impl Engine {
                 !carried,
                 &mut blocked,
                 question_reads,
+                &mut report.landed_predecessors,
             )
             .await;
+        // A carried predecessor's topic that does not wait is judged again,
+        // for real: what it admits is this call's word, over the same coins.
+        if carried {
+            for v in &mut validations {
+                if v.is_dupe || v.failed || v.read_fault.is_some() || waits.contains_key(&v.topic) {
+                    continue;
+                }
+                match self
+                    .judge(
+                        &tx,
+                        &v.topic,
+                        &v.previous_coins,
+                        tagged_beef.off_chain_values.as_deref(),
+                        mode,
+                        &TopicAdmittanceContext::default(),
+                        bound,
+                    )
+                    .await
+                {
+                    Ok(admittance) => v.admittance = admittance,
+                    Err(e) => {
+                        error!("Error validating topic {} during submit: {e}", v.topic);
+                        v.failed = true;
+                        v.previous_coins.clear();
+                        v.previous_outputs.clear();
+                        v.admittance = AdmittanceInstructions::default();
+                    }
+                }
+                steak.insert(v.topic.clone(), v.admittance.clone());
+            }
+        }
 
         // =================================================================
         // PHASE 3: MUTATE STORAGE
@@ -1652,18 +1708,33 @@ impl Engine {
     /// M2). For a successor that admits something, both look only at the
     /// inputs the manager NAMES as its history (`identify_needed_inputs`
     /// over the subject-named BEEF; the lens fold, L1): a manager that
-    /// names nothing (all 16 of this workspace) is answered as in the
-    /// reference.
+    /// names nothing (all 16 of this workspace) asks nothing there, as in
+    /// the reference. A successor that admits NOTHING is asked of every
+    /// input whatever its manager names (D17 (a)), so under such a manager
+    /// it still waits for, or lands first, a carried body that spends a
+    /// coin the topic holds: there the store differs from the reference's
+    /// (the E1D delta fold, L3).
     ///
     /// The door lands a carried predecessor FIRST (the lens fold, M1; the
     /// GASP walk's rule, at the door): when the question names an unlanded
     /// predecessor whose body the BEEF carries, that body is submitted on
     /// its own to this topic ([`Engine::land_carried`]), under the submit's
     /// read allowance, and once it lands the topic is judged again
-    /// ([`Engine::validate_topic`]) and asked again. The first predecessor
-    /// that does not land ends it: the topic waits. A predecessor whose body
-    /// the BEEF does not carry is never landed here: its successor converges
-    /// only when it lands (its own replay, a GASP peer, a resubmit).
+    /// ([`Engine::validate_topic`]) and asked again. The re-judgement's
+    /// reads (the applied row, one coin per input) are charged to that
+    /// allowance BEFORE the landing (the E1D delta fold, M1): a landing whose
+    /// re-judgement would not fit is not made, and the topic waits. So one
+    /// submit reads at most its own validation and writes plus
+    /// [`PREDECESSOR_READS_PER_SUBMIT`], landings (on their clean path) and
+    /// re-judgements included; a faulted landing's read-backs and undo, and
+    /// a deep delete's walk of retained history, are not charged.
+    /// Nothing is landed into a topic whose manager or a lookup
+    /// service reads off-chain values (the delta fold, L1: the landing has
+    /// none to give, and the predecessor's own submit would be a dupe): the
+    /// topic waits for that submit. The first predecessor that does not land
+    /// ends it: the topic waits. A predecessor whose body the BEEF does not
+    /// carry is never landed here: its successor converges only when it
+    /// lands (its own replay, a GASP peer, a resubmit).
     #[allow(clippy::too_many_arguments)]
     async fn successors_waiting(
         &self,
@@ -1679,6 +1750,7 @@ impl Engine {
         lands: bool,
         blocked: &mut HashMap<String, String>,
         question_reads: &mut usize,
+        landed: &mut Vec<(String, String)>,
     ) -> HashMap<String, String> {
         let mut waits = HashMap::new();
         let spent: Vec<(String, u32)> = tx
@@ -1757,14 +1829,39 @@ impl Engine {
                     waits.insert(topic.clone(), not_now.why);
                     break;
                 }
+                if !self.lands_without_values(&topic) {
+                    waits.insert(
+                        topic.clone(),
+                        format!(
+                            "{}; not landed first from the BEEF: the topic's manager or a lookup service reads off-chain values, and only the predecessor's own submit carries them",
+                            not_now.why
+                        ),
+                    );
+                    break;
+                }
+                // The re-judgement after the landing, charged before it.
+                let rejudge = 1 + spent.len();
+                if *question_reads + rejudge > PREDECESSOR_READS_PER_SUBMIT {
+                    waits.insert(
+                        topic.clone(),
+                        format!(
+                            "{}; its landing and the re-judgement after it do not fit in the submit's {PREDECESSOR_READS_PER_SUBMIT} reads",
+                            not_now.why
+                        ),
+                    );
+                    break;
+                }
+                *question_reads += rejudge;
                 match self
                     .land_carried(
                         subject_named_beef,
+                        txid,
                         &carried,
                         &topic,
                         mode,
                         bound,
                         question_reads,
+                        landed,
                     )
                     .await
                 {
@@ -1786,6 +1883,8 @@ impl Engine {
                         }
                     }
                     Err(did_not_land) => {
+                        // No re-judgement follows: its reads were not made.
+                        *question_reads -= rejudge;
                         waits.insert(
                             topic.clone(),
                             format!(
@@ -1829,29 +1928,44 @@ impl Engine {
 
     /// Land an unlanded predecessor whose body the successor's BEEF carries
     /// (lane E1D's lens fold, M1): submit it on its own to `topic`, its
-    /// atomic BEEF out of the successor's, no off-chain values (those are
-    /// the successor's), never a broadcast (`current-tx` is submitted as
-    /// `historical-tx`: the successor's BEEF carries it to the network), its
-    /// own SPV walk in every mode that walks (the successor's does not
-    /// descend a proven body, so a body reached through one was never
-    /// walked).
+    /// atomic BEEF out of the successor's, no off-chain values (the caller
+    /// lands nothing into a topic that reads them; the delta fold, L1),
+    /// never a broadcast (`current-tx` is submitted as `historical-tx`: the
+    /// successor's BEEF carries it to the network).
+    ///
+    /// Each body is WALKED once in this submit (the delta fold, L4): the
+    /// successor's own SPV walk (`subject`, the same mode, tracker and
+    /// switch) already passed over every body it reaches without crossing a
+    /// proven one, so those are not walked again; a body reached only
+    /// through a proven one (which the successor's walk does not descend)
+    /// gets its own walk, trusting what this submit already walked, and so
+    /// does nothing twice. A walk that refuses a body ends the landing.
+    ///
     /// A predecessor whose own submit waits on a carried predecessor of ITS
-    /// own goes on a stack under it, and is submitted again once that one
-    /// landed: ancestors first, each a whole submit, the walk's rule at the
-    /// door. Each submit's validation reads (its applied row, one coin per
-    /// input) are charged to the submit's allowance before it starts, and
-    /// its predecessor question shares that allowance, so the landings of
-    /// one submit stop at [`PREDECESSOR_READS_PER_SUBMIT`] reads, however
-    /// deep the chain. `Ok` once `predecessor` LANDED in `topic` (recorded
-    /// there, now or before); otherwise why not, at the first that did not.
+    /// own goes on a stack under it: ancestors first, the walk's rule at
+    /// the door. Its manager was asked only a DRY RUN then and nothing was
+    /// written; once the one under it landed it is submitted again and
+    /// admitted for real, once ([`Engine::submit_counted`]). Each submit's
+    /// reads on its clean path (its applied row, one coin per input, and
+    /// its writes' one read of each coin it spends) are charged to the
+    /// submit's allowance before it starts, and its predecessor
+    /// question shares that allowance, so the landings of one submit stop
+    /// at [`PREDECESSOR_READS_PER_SUBMIT`] reads, however deep the chain.
+    /// Each body that lands is pushed on `landed` (the report's
+    /// `landed_predecessors`, for the caller's admission guard; the delta
+    /// fold, L2). `Ok` once `predecessor` LANDED in `topic` (recorded there,
+    /// now or before); otherwise why not, at the first that did not.
+    #[allow(clippy::too_many_arguments)]
     async fn land_carried(
         &self,
         beef_bytes: &[u8],
+        subject: &str,
         predecessor: &str,
         topic: &str,
         mode: SubmitMode,
         bound: Option<&CallBound>,
         question_reads: &mut usize,
+        landed: &mut Vec<(String, String)>,
     ) -> Result<(), String> {
         let beef = Beef::from_binary(beef_bytes)
             .map_err(|e| format!("the BEEF could not be read again ({e})"))?;
@@ -1859,12 +1973,20 @@ impl Engine {
             SubmitMode::CurrentTx => SubmitMode::HistoricalTx,
             other => other,
         };
+        let walks = mode != SubmitMode::HistoricalTxNoSpv;
+        let mut walked: HashSet<String> = if walks {
+            walk_cover(&beef, subject)
+        } else {
+            HashSet::new()
+        };
         let mut stack = vec![predecessor.to_string()];
         while let Some(next) = stack.last().cloned() {
             let body = beef
                 .find_atomic_transaction(&next)
                 .ok_or_else(|| format!("{next}: its body is not in the BEEF"))?;
-            let cost = 1 + body.inputs.len();
+            // Its validation (the applied row, one coin per input) and its
+            // writes' one read of each coin it spends.
+            let cost = 1 + 2 * body.inputs.len();
             if *question_reads + cost > PREDECESSOR_READS_PER_SUBMIT {
                 return Err(format!(
                     "{next}: its submit does not fit in the submit's {PREDECESSOR_READS_PER_SUBMIT} reads"
@@ -1876,17 +1998,21 @@ impl Engine {
                 .map_err(|e| format!("{next}: its BEEF could not be built ({e})"))?;
             let tagged = TaggedBEEF::new(atomic, vec![topic.to_string()]);
             let (_, report, blocked) = self
-                .submit_counted(&tagged, mode, bound, false, true, question_reads)
+                .submit_counted(&tagged, mode, bound, false, Some(&walked), question_reads)
                 .await
                 .map_err(|e| format!("{next}: {e}"))?;
-            let landed = report.is_durable()
-                && report
-                    .applied_topics
-                    .iter()
-                    .chain(&report.deduped_topics)
-                    .any(|t| t == topic);
-            if landed {
+            // Its walk passed, so did that of every body it reaches.
+            if walks && !walked.contains(&next) {
+                walked.extend(walk_cover(&beef, &next));
+            }
+            let landed_now = report.applied_topics.iter().any(|t| t == topic);
+            if report.is_durable()
+                && (landed_now || report.deduped_topics.iter().any(|t| t == topic))
+            {
                 info!("topic {topic}: {next} landed first from its successor's BEEF");
+                if landed_now {
+                    landed.push((next.clone(), topic.to_string()));
+                }
                 stack.pop();
                 continue;
             }
@@ -1987,10 +2113,15 @@ impl Engine {
     /// WITHOUT its coin (E1D) starts only from the inputs the manager names:
     /// a manager that admits a successor with no coin has said the coin does
     /// not decide the admission, so only its own word makes an input a
-    /// predecessor. Every manager of this workspace names nothing and is
-    /// answered as in the reference, in both classes; a named input whose
-    /// body the BEEF carries is still walked and dry-run, so a named decoy
-    /// the manager would not admit is no predecessor.
+    /// predecessor. Every manager of this workspace names nothing: an
+    /// admitting successor is then asked nothing, as in the reference, and
+    /// so is a spend of an unheld output nobody names (the lens fold, H1);
+    /// but a successor that admits nothing still finds case (a), a carried
+    /// body that spends a coin the topic holds, and waits for it or has it
+    /// landed first, where the reference records the successor and never
+    /// admits that body (the E1D delta fold, L3). A named input whose body
+    /// the BEEF carries is still walked and dry-run, so a named decoy the
+    /// manager would not admit is no predecessor.
     ///
     /// The answer carries the predecessor when its body is in the BEEF (the
     /// first two cases): the door lands it first ([`Engine::successors_waiting`]).
@@ -2389,6 +2520,7 @@ impl Engine {
         chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
         beef_bytes: &[u8],
         subject_txid: &str,
+        trusted: &HashSet<String>,
     ) -> Result<(), EngineError> {
         Self::verify_beef_linear_with(
             chain_tracker,
@@ -2398,6 +2530,7 @@ impl Engine {
                 roots: RootPolicy::AgainstTracker,
                 budget: None,
             },
+            trusted,
         )
         .await
         .map(|_| ())
@@ -2419,6 +2552,7 @@ impl Engine {
         beef_bytes: &[u8],
         subject_txid: &str,
         policy: WalkPolicy,
+        trusted: &HashSet<String>,
     ) -> Result<WalkStats, EngineError> {
         use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
         use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
@@ -2459,7 +2593,9 @@ impl Engine {
             }
         };
 
-        let mut seen: HashSet<String> = HashSet::new();
+        // A trusted transaction (one an earlier walk of the same submit
+        // passed over) is neither checked nor descended again.
+        let mut seen: HashSet<String> = trusted.clone();
         let mut queue: Vec<String> = vec![subject_txid.to_string()];
         while let Some(txid) = queue.pop() {
             if !seen.insert(txid.clone()) {
@@ -2874,31 +3010,17 @@ impl Engine {
             }
         }
 
-        let manager = &self.managers[topic];
-        let previous_coin_bytes = previous_coins
-            .iter()
-            .flat_map(|i| i.to_le_bytes())
-            .collect::<Vec<u8>>();
-        // Under a finalize submit's bound a manager that does not answer
-        // is a manager that failed: nothing is written for the topic.
-        let judged = bounded(
-            bound,
-            manager.identify_admissible_outputs(
-                // The ONE engine parse of the submitted BEEF, shared by
-                // every topic on this submit (bsv-low #289 — managers
-                // used to re-parse the same bytes independently).
+        let judged = self
+            .judge(
                 tx,
-                &previous_coin_bytes,
+                topic,
+                &previous_coins,
                 off_chain_values,
                 mode,
-                // `dry_run` is `false` on a submit, `true` on a
-                // validate-only call.
                 context,
-            ),
-        )
-        .await
-        .map_err(TopicManagerError::Other)
-        .and_then(|judged| judged);
+                bound,
+            )
+            .await;
         match judged {
             Ok(admittance) => TopicValidation {
                 topic: topic.to_string(),
@@ -2924,6 +3046,61 @@ impl Engine {
         }
     }
 
+    /// The topic manager's judgement of `tx` over the previous coins found
+    /// (input indices), as [`Engine::validate_topic`] asks it; a carried
+    /// predecessor's submit asks it again for real once its topic does not
+    /// wait (the E1D delta fold, L4).
+    #[allow(clippy::too_many_arguments)]
+    async fn judge(
+        &self,
+        tx: &Transaction,
+        topic: &str,
+        previous_coins: &[u32],
+        off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+        context: &TopicAdmittanceContext,
+        bound: Option<&CallBound>,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        let manager = &self.managers[topic];
+        let previous_coin_bytes = previous_coins
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect::<Vec<u8>>();
+        // Under a finalize submit's bound a manager that does not answer
+        // is a manager that failed: nothing is written for the topic.
+        bounded(
+            bound,
+            manager.identify_admissible_outputs(
+                // The ONE engine parse of the submitted BEEF, shared by
+                // every topic on this submit (bsv-low #289 — managers
+                // used to re-parse the same bytes independently).
+                tx,
+                &previous_coin_bytes,
+                off_chain_values,
+                mode,
+                // `dry_run` is `false` on a submit, `true` on a
+                // validate-only call.
+                context,
+            ),
+        )
+        .await
+        .map_err(TopicManagerError::Other)
+        .and_then(|judged| judged)
+    }
+
+    /// Whether the door may land a carried predecessor into `topic` (the
+    /// E1D delta fold, L1): neither its manager nor any lookup service
+    /// reads off-chain values there, which the landing does not have.
+    fn lands_without_values(&self, topic: &str) -> bool {
+        self.managers
+            .get(topic)
+            .is_some_and(|manager| !manager.reads_off_chain_values())
+            && self
+                .lookup_services
+                .values()
+                .all(|ls| !ls.reads_off_chain_values(topic))
+    }
+
     /// Run Phase 1 (topic validation) and Phase 2 (broadcast) without mutating storage.
     ///
     /// Returns (validations, steak, parsed_tx, txid) so the caller can either
@@ -2934,6 +3111,7 @@ impl Engine {
         mode: SubmitMode,
         context: &TopicAdmittanceContext,
         bound: Option<&CallBound>,
+        walked: Option<&HashSet<String>>,
     ) -> Result<(Vec<TopicValidation>, Steak, Transaction, String), EngineError> {
         // Validate all topics are supported
         for topic in &tagged_beef.topics {
@@ -2966,14 +3144,24 @@ impl Engine {
         // through the topic manager before a single BEEF of it reaches this
         // door. Before #551 the anchor check was a no-op and this skip
         // admitted a peer's graph on structure alone.
+        //
+        // A predecessor the door lands first (`walked`, the E1D delta fold,
+        // L4) is not walked again when this submit's walks already passed
+        // over it, and its walk trusts what they passed over.
         if mode != SubmitMode::HistoricalTxNoSpv {
-            verify_spv_like_the_reference(
-                self.chain_tracker.as_deref(),
-                self.verify_scripts,
-                &tagged_beef.beef,
-                &txid,
-            )
-            .await?;
+            match walked {
+                Some(walked) if walked.contains(&txid) => {}
+                trusted => {
+                    verify_spv_trusting(
+                        self.chain_tracker.as_deref(),
+                        self.verify_scripts,
+                        &tagged_beef.beef,
+                        &txid,
+                        trusted.unwrap_or(&HashSet::new()),
+                    )
+                    .await?;
+                }
+            }
         }
 
         let mut steak = Steak::new();
@@ -4886,11 +5074,55 @@ pub(crate) async fn verify_spv_like_the_reference(
     beef_bytes: &[u8],
     subject_txid: &str,
 ) -> Result<(), EngineError> {
+    verify_spv_trusting(
+        chain_tracker,
+        verify_scripts,
+        beef_bytes,
+        subject_txid,
+        &HashSet::new(),
+    )
+    .await
+}
+
+/// [`verify_spv_like_the_reference`] trusting the transactions an earlier
+/// walk of the same submit passed over (a predecessor the door lands first,
+/// the E1D delta fold, L4): the script walk neither checks nor descends
+/// them. The structural escape hatch checks the whole BEEF it is given.
+async fn verify_spv_trusting(
+    chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
+    verify_scripts: bool,
+    beef_bytes: &[u8],
+    subject_txid: &str,
+    trusted: &HashSet<String>,
+) -> Result<(), EngineError> {
     if verify_scripts {
-        Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid).await
+        Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid, trusted).await
     } else {
         Engine::verify_spv_structurally(chain_tracker, beef_bytes).await
     }
+}
+
+/// The transactions the SPV walk of `from` passes over in `beef`
+/// ([`Engine::verify_beef_linear_with`]'s traversal, nothing checked): `from`
+/// and every source the BEEF carries, a proven transaction included and not
+/// descended. The E1D delta fold, L4: what a landing need not walk again.
+fn walk_cover(beef: &Beef, from: &str) -> HashSet<String> {
+    let bodies: HashMap<String, &Transaction> = beef
+        .txs
+        .iter()
+        .filter_map(|btx| btx.tx().map(|tx| (btx.txid(), tx)))
+        .collect();
+    let mut cover = HashSet::new();
+    let mut queue = vec![from.to_string()];
+    while let Some(txid) = queue.pop() {
+        if !cover.insert(txid.clone()) || beef.find_bump(&txid).is_some() {
+            continue;
+        }
+        if let Some(tx) = bodies.get(&txid) {
+            queue.extend(tx.inputs.iter().filter_map(|i| i.source_txid.clone()));
+        }
+    }
+    cover
 }
 
 /// The engine's [`crate::gasp::FinalizedGraphHook`] (bsv-low #552): submit

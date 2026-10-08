@@ -806,6 +806,38 @@ pub async fn open_eviction(db: &D1Database, txid: &str) -> Result<Option<OpenEvi
     }))
 }
 
+/// THE WRITE-SIDE GUARD over what the engine LANDED first from a submit's BEEF (lane E1D's delta fold, L2;
+/// `MutationReport::landed_predecessors`): each landed predecessor is an admission write of its own, which no
+/// caller asked for and no door read the ledger for, so it is asked AFTER the write, as every admission writer's
+/// write is: a landed txid under an OPEN eviction is re-evicted (what the landing wrote moves to the twins), counted
+/// and logged. An unreadable ledger is counted and logged (fail-loud) and changes no answer: a retry would not ask
+/// again (the subject's replay dedups and lands nothing). It never returns early, so the pot notes of a re-eviction
+/// ride the caller's own exit flush (the dispatch's one exit; the queue batch's end).
+pub async fn guard_landed(db: &D1Database, landed: &[(String, String)], origin: &str) {
+    for (txid, topic) in landed {
+        match open_eviction(db, txid).await {
+            Ok(Some(ev)) => {
+                let now_ms = worker::Date::now().as_millis();
+                let outcome = evict_txid_everywhere(db, txid, &ev.reason, now_ms).await;
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1).await;
+                worker::console_log!(
+                    "{origin}: {txid}, landed first into {topic} from a successor's BEEF, is under an OPEN eviction (at {} ms — {}): re-evicted {} row(s)",
+                    ev.evicted_at_ms,
+                    ev.reason,
+                    outcome.moved
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1).await;
+                worker::console_log!(
+                    "{origin}: the eviction ledger could not be read for {txid}, landed first into {topic} ({e}); not asked again"
+                );
+            }
+        }
+    }
+}
+
 /// The refused verdict memo for a txid (round 5 of the gate, N1): the door's readmission deletes the memo FIRST, so
 /// a `refused` row present after the write was written by a pass that completed after the door — the network's
 /// fresh word, never the door's stale one. `Err` when the memo could not be read.
@@ -3339,5 +3371,39 @@ mod tests {
         // the restore coalesces the NOT NULL expression default all the same (legal in a SELECT)
         let (ins, _) = restore_sql("low_records", "txid", std::slice::from_ref(&expr));
         assert!(ins.contains("COALESCE(\"createdAt\", datetime('now'))"), "{ins}");
+    }
+
+    // lane E1D's delta fold (L2, the delta lens on `0da3a82`): a predecessor the engine LANDS first from a
+    // submit's BEEF is an admission write the eviction ledger was never asked about (an evicted txid's rows are
+    // shadow-moved, so it reads "not landed" and a successor carrying it landed it again under the OPEN row; the
+    // post-write guard re-evicted only the subject). Every submit that reads a report now guards what it landed,
+    // and the guard re-evicts under an open row. RED on `0da3a82` (no `guard_landed`).
+    #[test]
+    fn e1d_delta_l2_every_submit_with_a_report_guards_what_it_landed() {
+        for (file, src) in [("routes.rs", include_str!("routes.rs")), ("lib.rs", include_str!("lib.rs"))] {
+            // a call, never a comment that names one
+            let calls: Vec<usize> = src
+                .match_indices(".submit_with_report(")
+                .map(|(at, _)| at)
+                .filter(|&at| !src[src[..at].rfind('\n').map_or(0, |nl| nl + 1)..at].trim_start().starts_with("//"))
+                .collect();
+            assert!(!calls.is_empty(), "{file}: no submit with a report");
+            for at in calls {
+                let after = &src[at..];
+                let window = &after[..after.len().min(1_500)];
+                assert!(
+                    window.contains("crate::admit_fast::guard_landed(") && window.contains("landed_predecessors"),
+                    "{file}: the submit at byte {at} does not guard what it landed"
+                );
+            }
+        }
+        let src = include_str!("admit_fast.rs");
+        let guard = &src[src.find("pub async fn guard_landed(").unwrap()..];
+        let guard = &guard[..guard.find("\n}\n").unwrap()];
+        let open = guard.find("open_eviction(db, txid)").expect("the ledger is read per landed txid");
+        let evict = guard.find("evict_txid_everywhere(db, txid, &ev.reason").expect("an open row re-evicts");
+        assert!(open < evict);
+        assert!(guard.contains("COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE"), "counted");
+        assert!(guard.contains("COUNTER_ADMIT_FAST_LEDGER_UNREADABLE"), "an unreadable ledger is counted");
     }
 }

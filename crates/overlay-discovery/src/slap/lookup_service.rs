@@ -25,6 +25,11 @@ impl SLAPLookupService {
 
 #[async_trait(?Send)]
 impl LookupService for SLAPLookupService {
+    /// Nothing told to this service reads an off-chain value.
+    fn reads_off_chain_values(&self, _topic: &str) -> bool {
+        false
+    }
+
     fn admission_mode(&self) -> AdmissionMode {
         AdmissionMode::LockingScript
     }

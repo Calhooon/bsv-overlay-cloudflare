@@ -2189,7 +2189,15 @@ async fn queue_handler(
             }
         }
 
-        match engine.submit_with_report(&tagged_beef, mode).await {
+        let replayed = engine.submit_with_report(&tagged_beef, mode).await;
+        // lane E1D's delta fold (L2): what the engine landed first from the BEEF (written whole, whatever the
+        // subject's own report) is guarded like the replay's own write; the batch's end flush ships the notes
+        if let (Ok((_, report)), Some(db)) = (&replayed, &counters) {
+            if !report.landed_predecessors.is_empty() {
+                crate::admit_fast::guard_landed(db, &report.landed_predecessors, "Queue").await;
+            }
+        }
+        match replayed {
             Ok((_steak, report)) if report.is_durable() => {
                 // the write-side guard, AFTER the replay's write (the gate's HIGH-1): an eviction that opened
                 // while this replay was landing — its table loop missed the rows landing after each step — is

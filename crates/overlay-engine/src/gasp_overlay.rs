@@ -45,6 +45,9 @@ use tracing::{debug, error, warn};
 use crate::gasp::{GASPError, GASPStorage};
 use crate::storage::Storage;
 use crate::topic_manager::TopicManager;
+use crate::types::{
+    GASPInputRequest, GASPNode, GASPNodeResponse, GASPOutput, SubmitMode, TopicAdmittanceContext,
+};
 
 /// The most store reads [`OverlayGASPStorage::find_needed_inputs`] spends
 /// on asking whether an admitted node's named inputs have LANDED (E1D's
@@ -52,9 +55,6 @@ use crate::topic_manager::TopicManager;
 /// row, then its held outputs). A transaction past it is requested from the
 /// peer. The figure is the door's own per-topic bound (`PREDECESSOR_READS`).
 const LANDED_READS_PER_NODE: usize = 16;
-use crate::types::{
-    GASPInputRequest, GASPNode, GASPNodeResponse, GASPOutput, SubmitMode, TopicAdmittanceContext,
-};
 
 /// A GASP node stored during in-progress graph construction.
 #[derive(Debug, Clone)]

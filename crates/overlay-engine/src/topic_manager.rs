@@ -79,6 +79,19 @@ pub trait TopicManager {
         Ok(Vec::new())
     }
 
+    /// Whether this manager's admission READS the transaction's off-chain
+    /// values (lane E1D's delta fold, L1). The door lands a carried
+    /// predecessor first with NO off-chain values (the submit carries only
+    /// the successor's), and the predecessor's own submit is a dupe after
+    /// that, so values its manager would have read are lost for good: the
+    /// engine lands nothing first into a topic whose manager answers `true`
+    /// (the successor waits for the predecessor's own submit). Default
+    /// `true`, so a manager that does not say is never judged without its
+    /// values; one that never reads them answers `false`.
+    fn reads_off_chain_values(&self) -> bool {
+        true
+    }
+
     /// Return Markdown documentation for this topic manager.
     async fn get_documentation(&self) -> String;
 
