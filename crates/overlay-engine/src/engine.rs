@@ -1088,8 +1088,9 @@ impl Engine {
             // An addition to the reference, which records every non-failed
             // topic. "Has not landed" is known two ways: this engine saw it
             // fault (`not_landed`, one invocation), or the store says so
-            // ([`Engine::unlanded_predecessor`], any invocation, when the
-            // submitted BEEF carries the predecessor's body). A GASP
+            // ([`Engine::unlanded_predecessor`], any invocation: of a body
+            // the BEEF carries, or of one it does not that the manager names
+            // as history, lane E1D). A GASP
             // finalize submit asks only the first (the second delta fold of
             // 2026-10-07, M2): its graph passed the anchor check, every
             // parent inside the graph was submitted just before it and the
@@ -1097,7 +1098,21 @@ impl Engine {
             // outside the graph is one the store held. The store's question
             // there bought nothing and, at its read bound, held the graph's
             // cursor.
-            if v.previous_outputs.is_empty() && admittance.outputs_to_admit.is_empty() {
+            //
+            // Lane E1D (bsv-low #575, zanaadu-v2 #365) widens the class from
+            // "found no coin and admits nothing" to "found no coin": a
+            // manager that admits a successor WITHOUT its coin (the pf head
+            // manager over its own head state) had the successor inserted and
+            // recorded over a predecessor that never landed, and when that
+            // predecessor landed later its head stood unspent beside the tip
+            // for good. Which inputs count is the question's business
+            // ([`Engine::unlanded_predecessor`]): for a successor that admits
+            // something, only the ones the manager NAMES as its history.
+            let spends_something = tx
+                .inputs
+                .iter()
+                .any(|input| input.get_source_txid().is_ok_and(|s| !s.is_empty()));
+            if v.previous_outputs.is_empty() && spends_something {
                 let remembered = tx
                     .inputs
                     .iter()
@@ -1115,6 +1130,8 @@ impl Engine {
                             &tx,
                             &tagged_beef.beef,
                             topic,
+                            mode,
+                            !admittance.outputs_to_admit.is_empty(),
                             &mut question_reads,
                             bound,
                         )
@@ -1634,29 +1651,46 @@ impl Engine {
     }
 
     /// The store's own answer to "has a predecessor of `tx` not landed?"
-    /// (bsv-low #559, the lens fold of 2026-10-07, F3), for a transaction
-    /// that found no previous coin and admits nothing. The engine's memory
-    /// of a faulted submit (`not_landed`) dies with the invocation; this
-    /// does not. A transaction the submitted BEEF carries the body of has
-    /// not landed in `topic` when it has no applied row there, none of its
-    /// outputs is held there, and it spends a coin the topic HOLDS (or, the
-    /// same question one step up, a coin of another such transaction): it is
-    /// a spend of this topic that the store has not taken yet, and `tx` was
-    /// judged without what it will leave.
+    /// (bsv-low #559, the lens fold of 2026-10-07, F3; lane E1D, bsv-low
+    /// #575), for a transaction that found no previous coin. The engine's
+    /// memory of a faulted submit (`not_landed`) dies with the invocation;
+    /// this does not. A transaction HAS LANDED in `topic` when it has an
+    /// applied row there or an output held there; anything else is not known
+    /// to have landed, and it is a PREDECESSOR of `tx` when one of these
+    /// says so:
     ///
-    /// The limits, stated. It sees only bodies in the BEEF: an unproven
-    /// successor carries its parent (the live `/submit` case), a PROVEN one
-    /// does not, and is then recorded as in the reference. It cannot tell a
-    /// faulted predecessor from one nobody submitted yet: a successor is
-    /// "not now" in both until the predecessor lands. And it never sees an
-    /// OPENER as unlanded (the delta-2 lens of 2026-10-07, L1): "unlanded"
-    /// needs a coin the topic holds somewhere up the walk, and a predecessor
-    /// that spends no coin of the topic (the first transaction of a chain,
-    /// one the manager admits on its outputs alone) has none. Its successor
-    /// in a later invocation, before the opener's replay, is recorded as in
-    /// the reference, its own replay is then a dupe and the chain stops at
-    /// the opener. The cure (a dry run of the manager over the candidate
-    /// body with no coins: admitted means an unlanded opener) is not built.
+    /// - its body is in the BEEF and it spends a coin the topic HOLDS (or,
+    ///   one step up, a coin of another such transaction): a spend of this
+    ///   topic the store has not taken yet (#559);
+    /// - its body is in the BEEF, it spends no coin the topic holds, and the
+    ///   manager, asked of that body in a dry run with no coins
+    ///   (`TopicAdmittanceContext::DRY_RUN`, the submit's mode, no off-chain
+    ///   values), would admit an output the walk spends: an OPENER that has
+    ///   not landed (E1D, the cure D17 named). A manager `Err` there is "not
+    ///   now" (the manager's contract at the anchor replay, D15), except its
+    ///   typed refusal `NoAdmissibleOutputs`, which is "not admitted";
+    /// - its body is NOT in the BEEF (a PROVEN successor carries none) and
+    ///   the manager names the outpoint `tx` spends from it as overlay
+    ///   history (`identify_needed_inputs` over the submitted BEEF, D13's
+    ///   word; an `Err` there names nothing, as in the walk).
+    ///
+    /// `admits` says which inputs of `tx` start the walk. A transaction that
+    /// admits nothing (D17's class) starts from every input. One that admits
+    /// WITHOUT its coin (E1D) starts only from the inputs the manager names:
+    /// a manager that admits a successor with no coin has said the coin does
+    /// not decide the admission, so only its own word makes an input a
+    /// predecessor. Every manager of this workspace names nothing and is
+    /// answered as in the reference; a named input whose body the BEEF
+    /// carries is still walked and dry-run, so a named decoy the manager
+    /// would not admit is no predecessor.
+    ///
+    /// The limits, stated. It cannot tell a faulted predecessor from one
+    /// nobody submitted yet: a successor is "not now" in both until the
+    /// predecessor lands. A named input whose body is absent and which never
+    /// lands (a decoy no one submits, beside a real predecessor that landed
+    /// and holds no coin) keeps its successor "not now" at the door; the
+    /// GASP walk prunes such an input instead (D14). Deeper than the
+    /// successor's own inputs, an absent body ends the walk as before.
     ///
     /// "Landed" needs a clean answer (the delta fold of 2026-10-07, M1 and
     /// M2): a read that faults, or the question running out of its reads
@@ -1706,14 +1740,56 @@ impl Engine {
     /// call).
     ///
     /// Returns why the submit must wait, for the report.
+    #[allow(clippy::too_many_arguments)]
     async fn unlanded_predecessor(
         &self,
         tx: &Transaction,
         beef_bytes: &[u8],
         topic: &str,
+        mode: SubmitMode,
+        admits: bool,
         question_reads: &mut usize,
         bound: Option<&CallBound>,
     ) -> Option<String> {
+        let manager = self.managers.get(topic)?;
+        // The outpoints `tx` spends, as `txid.vout`.
+        let starts: Vec<(String, u32)> = tx
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                let source = input.get_source_txid().ok()?;
+                (!source.is_empty()).then_some((source, input.source_output_index))
+            })
+            .collect();
+        // The manager's own word on which of them are its history (D13),
+        // asked at most once: up front for a transaction that admits, at the
+        // first absent body for one that does not.
+        let mut named: Option<HashSet<String>> = None;
+        if admits {
+            named = Some(
+                self.named_history(manager.as_ref(), beef_bytes, bound)
+                    .await,
+            );
+        }
+        // The outputs of each candidate that the walk spends.
+        let mut spent_of: HashMap<String, HashSet<u32>> = HashMap::new();
+        let mut ask: Vec<String> = Vec::new();
+        for (source, vout) in &starts {
+            if named
+                .as_ref()
+                .is_some_and(|named| !named.contains(&format!("{source}.{vout}")))
+            {
+                continue;
+            }
+            spent_of.entry(source.clone()).or_default().insert(*vout);
+            ask.push(source.clone());
+        }
+        // Nothing to ask (a transaction that admits and names nothing, every
+        // manager of this workspace): the BEEF is not even parsed.
+        if ask.is_empty() {
+            return None;
+        }
+        let direct: HashSet<String> = ask.iter().cloned().collect();
         let beef = Beef::from_binary(beef_bytes).ok()?;
         // Each body the BEEF carries, and whether the BEEF says it is
         // proven (a bump index: its word, no proof is checked here).
@@ -1728,18 +1804,34 @@ impl Engine {
         // The reads spent on bodies neither proven nor found landed.
         let mut reads = 0usize;
         let mut asked: HashSet<String> = HashSet::new();
-        let mut ask: Vec<String> = tx
-            .inputs
-            .iter()
-            .map(|input| input.get_source_txid().unwrap_or_default())
-            .collect();
         while let Some(candidate) = ask.pop() {
             if candidate.is_empty() || !asked.insert(candidate.clone()) {
                 continue;
             }
-            let Some(&(body, proven)) = bodies.get(&candidate) else {
-                continue;
-            };
+            let spent_outputs = spent_of.get(&candidate).cloned().unwrap_or_default();
+            // An absent body is asked of the store only when it is one of
+            // `tx`'s own inputs and the manager names it (E1D).
+            let body = bodies.get(&candidate).copied();
+            if body.is_none() {
+                if !direct.contains(&candidate) {
+                    continue;
+                }
+                if named.is_none() {
+                    named = Some(
+                        self.named_history(manager.as_ref(), beef_bytes, bound)
+                            .await,
+                    );
+                }
+                let is_named = named.as_ref().is_some_and(|named| {
+                    spent_outputs
+                        .iter()
+                        .any(|vout| named.contains(&format!("{candidate}.{vout}")))
+                });
+                if !is_named {
+                    continue;
+                }
+            }
+            let proven = body.is_some_and(|(_, proven)| proven);
             // This candidate's own reads: they join `reads` once it is
             // found not landed, and never if the BEEF proves it.
             let mut spent = 0usize;
@@ -1798,6 +1890,13 @@ impl Engine {
                 Ok(_) => continue,
                 Err(e) => return unread(e),
             }
+            // Not landed. With no body to walk, the manager's word is the
+            // whole answer (E1D).
+            let Some((body, _)) = body else {
+                return Some(format!(
+                    "{candidate} has not landed (the manager names it as history; the BEEF does not carry it)"
+                ));
+            };
             for input in &body.inputs {
                 let source = input.get_source_txid().unwrap_or_default();
                 if source.is_empty() {
@@ -1826,8 +1925,60 @@ impl Engine {
                     Ok(Some(_)) => return Some(format!("{candidate} has not landed")),
                     // Not held: its own transaction may be the one that has
                     // not landed.
-                    Ok(None) => ask.push(source),
+                    Ok(None) => {
+                        spent_of
+                            .entry(source.clone())
+                            .or_default()
+                            .insert(input.source_output_index);
+                        ask.push(source);
+                    }
                     Err(e) => return unread(e),
+                }
+            }
+            // It spends no coin the topic holds. Would the manager admit
+            // what the walk spends of it, with no coins (E1D, the opener)?
+            // A dry run: no store read, nothing counted against the reads.
+            let judged = if proven {
+                // A proven body's sources are not in the BEEF: the bare body
+                // is all there is.
+                body.clone()
+            } else {
+                Transaction::from_beef(beef_bytes, Some(&candidate))
+                    .unwrap_or_else(|_| body.clone())
+            };
+            let verdict = bounded(
+                bound,
+                manager.identify_admissible_outputs(
+                    &judged,
+                    &[],
+                    None,
+                    mode,
+                    &TopicAdmittanceContext::DRY_RUN,
+                ),
+            )
+            .await;
+            match verdict {
+                Ok(Ok(admittance)) => {
+                    if admittance
+                        .outputs_to_admit
+                        .iter()
+                        .any(|vout| spent_outputs.contains(vout))
+                    {
+                        return Some(format!(
+                            "{candidate} has not landed (the manager would admit the output spent from it with no coin: an opener)"
+                        ));
+                    }
+                }
+                Ok(Err(TopicManagerError::NoAdmissibleOutputs(_))) => {}
+                Ok(Err(e)) => {
+                    return Some(format!(
+                        "{candidate} is not known to have landed: the manager could not judge it ({e})"
+                    ))
+                }
+                Err(no_answer) => {
+                    return Some(format!(
+                        "{candidate} is not known to have landed: the manager did not answer ({no_answer})"
+                    ))
                 }
             }
             if !proven {
@@ -1835,6 +1986,29 @@ impl Engine {
             }
         }
         None
+    }
+
+    /// The outpoints (`txid.vout`) the topic manager NAMES as overlay
+    /// history of the submitted transaction (`identify_needed_inputs`, D13's
+    /// word, over the submitted BEEF). An `Err` or no answer names nothing,
+    /// as the GASP walk treats it (logged).
+    async fn named_history(
+        &self,
+        manager: &dyn TopicManager,
+        beef_bytes: &[u8],
+        bound: Option<&CallBound>,
+    ) -> HashSet<String> {
+        match bounded(bound, manager.identify_needed_inputs(beef_bytes, None)).await {
+            Ok(Ok(named)) => named.iter().map(Outpoint::to_graph_id).collect(),
+            Ok(Err(e)) => {
+                warn!("the predecessor question: the manager could not name its inputs: {e}");
+                HashSet::new()
+            }
+            Err(no_answer) => {
+                warn!("the predecessor question: the manager did not name its inputs: {no_answer}");
+                HashSet::new()
+            }
+        }
     }
 
     /// The reference's `tx.verify(chainTracker)` on submit, walked LINEARLY

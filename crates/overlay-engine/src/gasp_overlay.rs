@@ -16,8 +16,9 @@
 //! ## find_needed_inputs
 //!
 //! Parses the node's raw transaction hex to determine what inputs are needed:
-//! - A proven node ends the walk unless its output is not yet admissible and
-//!   its topic manager names inputs needed for overlay history.
+//! - A proven node ends the walk unless its topic manager names inputs needed
+//!   for overlay history: when its output is not yet admissible, those not
+//!   held; when it is admissible, those neither held nor landed (lane E1D).
 //! - If no proof, all transaction inputs are requested (minus any already
 //!   known in local storage).
 //!
@@ -560,8 +561,12 @@ impl GASPStorage for OverlayGASPStorage<'_> {
 
     /// Determine which inputs are needed to validate this node.
     ///
-    /// - A proven node ends the walk if its output is admissible, or its topic
-    ///   manager names no inputs. Without a manager, proven nodes always stop.
+    /// - A proven node ends the walk if its topic manager names no inputs it
+    ///   still needs: for a node whose output is NOT admissible, every named
+    ///   input not held (D13); for one whose output IS admissible, every named
+    ///   input neither held nor landed (lane E1D, an addition: the reference
+    ///   stops at an admissible node). Without a manager, proven nodes always
+    ///   stop.
     /// - If no proof, parses the raw transaction and requests all inputs,
     ///   filtering out any inputs already known in local storage.
     /// - Admission errors propagate to GASP's incoming UTXO handler. Errors
@@ -572,6 +577,8 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         node: &GASPNode,
     ) -> Result<Option<GASPNodeResponse>, GASPError> {
         let mut requested_inputs: HashMap<String, GASPInputRequest> = HashMap::new();
+        // A proven node whose own output the dry run admits (lane E1D).
+        let mut admitted = false;
 
         if let Some(proof_hex) = &node.proof {
             let Some(manager) = self.topic_manager else {
@@ -598,7 +605,28 @@ impl GASPStorage for OverlayGASPStorage<'_> {
                 )
                 .await
                 .map_err(|e| GASPError::Other(e.to_string()))?;
-            if admittance.outputs_to_admit.contains(&node.output_index) {
+            // The reference stops here (D13). Lane E1D (bsv-low #575,
+            // zanaadu-v2 #365) asks the named inputs of an ADMITTED node too:
+            // a manager that admits a successor with no coin (the pf head
+            // manager over its own head state) ended the walk at the
+            // successor while its predecessor had not landed, the graph was
+            // the successor alone, and its finalize submit recorded it with
+            // no coin; the predecessor, landed on a later tick, stood unspent
+            // beside the tip for good. So the predecessor is asked FIRST: a
+            // named input that is neither held nor landed (below) is
+            // requested and lands before the node in the graph's order, a
+            // finalize submit of it that does not land stops the graph, and
+            // a named input the peer cannot serve prunes (D14). When every
+            // named input is known the walk stops here, as the reference's.
+            admitted = admittance.outputs_to_admit.contains(&node.output_index);
+            // A node with no input to name stops here, the manager not
+            // asked (the reference's call count for such a node).
+            if admitted
+                && !tx
+                    .inputs
+                    .iter()
+                    .any(|input| input.get_source_txid().is_ok_and(|s| !s.is_empty()))
+            {
                 return Ok(None);
             }
 
@@ -675,6 +703,39 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         }
         for key in &to_remove {
             requested_inputs.remove(key);
+        }
+
+        // An admitted node's named inputs are requested only while their
+        // landing is unknown (E1D): one whose transaction has an applied row
+        // in the topic, or an output held there, has landed, and the walk
+        // stops as the reference's. A read that faults keeps the input: one
+        // round trip to the peer is the cheaper error.
+        if admitted {
+            let mut landed = Vec::new();
+            for outpoint in requested_inputs.keys() {
+                let Some((txid, _)) = crate::gasp::parse_outpoint(outpoint) else {
+                    continue;
+                };
+                let record = crate::types::AppliedTransaction {
+                    txid: txid.clone(),
+                    topic: self.topic.clone(),
+                };
+                let applied = matches!(
+                    self.storage.does_applied_transaction_exist(&record).await,
+                    Ok(true)
+                );
+                let holds = applied
+                    || matches!(
+                        self.storage.find_outputs_for_transaction(&txid, false).await,
+                        Ok(outputs) if outputs.iter().any(|o| o.topic == self.topic)
+                    );
+                if holds {
+                    landed.push(outpoint.clone());
+                }
+            }
+            for key in &landed {
+                requested_inputs.remove(key);
+            }
         }
 
         if requested_inputs.is_empty() {

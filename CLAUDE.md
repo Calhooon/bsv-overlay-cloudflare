@@ -257,15 +257,34 @@ failed, the cursor stayed, the next tick walks it again): one whose outputs
 landed is known to the walk and is never submitted again, so its applied row
 is written by its spender (H2) or by a later submit of it at the door.
 
-A successor that found no previous coin and admits nothing while a
-predecessor has NOT LANDED is reported as a fault (`predecessor_not_landed`)
-and not recorded as applied. Known two ways: the engine saw the predecessor
-fault (one invocation's memory), or the store says so
-(`Engine::unlanded_predecessor`, any invocation): a transaction whose body
-the submitted BEEF carries, with no applied row, no output held, spending a
-coin the topic holds (or a coin of another such transaction). "Landed" needs
+A successor that found no previous coin while a predecessor's landing is
+UNKNOWN is reported as a fault (`predecessor_not_landed`), nothing of it is
+written and it is not recorded as applied (#559 for one that admits nothing;
+lane E1D, bsv-low #575 and zanaadu-v2 #365, 2026-10-08, for one the manager
+admits WITHOUT its coin, the pf head manager's case: it was inserted and
+recorded, and the predecessor, landed later, stood unspent beside the tip).
+"Landed" is an applied row in the topic or an output held there. Known four
+ways: the engine saw the predecessor fault (one invocation's memory, every
+door, the finalize submit included), or the store says so
+(`Engine::unlanded_predecessor`, any invocation, never at a finalize submit)
+of an unlanded transaction that is a PREDECESSOR because (a) its body is in
+the BEEF and it spends a coin the topic holds (or a coin of another such
+transaction); (b) its body is in the BEEF, it spends no coin the topic holds,
+and a dry run of the manager over that body with no coins would admit the
+output the walk spends (the OPENER, E1D: the cure D17 named; a manager `Err`
+there is "not now", its typed refusal `NoAdmissibleOutputs` is not); or (c)
+its body is NOT in the BEEF (a PROVEN successor carries none) and the
+manager names the outpoint as overlay history (`identify_needed_inputs`,
+D13's word; an `Err` names nothing). A successor that admits nothing starts
+the walk from every input; one that admits starts it only from the inputs
+the manager NAMES, so a manager that names nothing (all 16 of this
+workspace) is answered as in the reference and its BEEF is not even parsed.
+"Landed" needs
 a clean answer, so a read that faults or the question running out of its
-reads is "not now" too (the delta fold, M1 and M2). Two bounds, both ours.
+reads is "not now" too (the delta fold, M1 and M2). Two bounds, both ours
+(E1D's reads, an absent named body's applied row and outputs, are counted in
+both as an unproven body's; a dry run reads nothing and runs at most once per
+body the reads reached).
 The question costs at most 256 store reads per SUBMIT over every body it
 reads, in every topic of the submit together (the third delta fold, M1:
 `PREDECESSOR_READS_PER_SUBMIT`; a later topic's question starts from what the
@@ -295,9 +314,23 @@ bsv-overlay-engine --features memory-storage --test gasp_topic_manager i559`,
 `fold559`, `delta559` (the delta lens's X4 to X9, each RED on `33e78fb`),
 `delta2_559` (the delta-2 lens's Y1 and Y2, a finalize over a node with 17
 landed parents, rows 2 and 6 of its table; the M1 and M2 pins RED on
-`e24f962`), `limit_opener` (its Y4, a limit pinned as it is) and `delta3_559`
-(the delta-3 lens's M1: the 256 reads of one submit to the read, and two
-topics sharing them; RED on `5ecf49c`).
+`e24f962`), `delta3_559` (the delta-3 lens's M1: the 256 reads of one submit
+to the read, and two topics sharing them; RED on `5ecf49c`) and `e1d` (lane
+E1D: `e1d_a` Zanaadu's run on the GASP path, `e1d_b` the door with a proven
+successor in both classes, `e1d_c` the opener with and without its body,
+each RED on `8d147d7`; `e1d_d` and `e1d_e` what did not change). The pin of
+the opener limit (`limit_opener`) is retired: `e1d_c` is its cure.
+
+The GASP walk re-asks the predecessor FIRST (E1D, an addition to D13): a
+PROVEN node whose own output the no-coin dry run ADMITS no longer ends the
+walk blindly (the reference stops there). Its manager's named inputs are
+asked, and those neither held nor landed are requested from the peer (or
+the chain fetcher), so the predecessor joins the graph and its finalize
+submit comes first; one that does not land stops the graph and the UTXO
+waits for the next tick (the gap guard); one the peer cannot serve prunes
+(D14). When every named input is held or landed, or the node spends
+nothing, the walk stops as the reference's. Pins `e1d_a`, `e1d_e`,
+`e_admitted_output_*` (the extra names call, stated).
 
 The limits, stated. (1) Two faults in one submit: an undo is separate calls,
 and one that faults too leaves the inserted output beside the kept coin
@@ -315,16 +348,25 @@ the inserts, as in the reference): on an insert fault the store keeps the old
 head while every lookup service was told it is spent, and an output that was
 inserted and undone was told as admitted, with no retraction. The replay
 heals it; after the dead letter the split stays until the next head. (4) The
-store's answer needs the predecessor's body in the BEEF: an unproven
-successor carries it, a PROVEN one does not, and one that arrives in a later
-invocation before the replay is recorded as in the reference, the chain then
-one behind its tip. And it never sees an OPENER as unlanded: "unlanded" needs
-a coin the topic holds somewhere up the walk, so a predecessor that spends no
-coin of the topic (a chain's genesis, the JOIN under `tm_pot`) is not one,
-its successor in a later invocation before the opener's replay is recorded,
-and the chain stops at the opener (pin `limit_opener`; the cure, a dry run of
-the manager over the candidate body with no coins, is the owner's call and is
-not built). It cannot tell a faulted predecessor from one nobody submitted
+store's answer for a body the BEEF does not carry is the manager's word: a
+manager that names nothing (or a predecessor it does not name) leaves a
+PROVEN successor recorded as in the reference, and a successor the manager
+admits without its coin is asked only of its named inputs, so the 16
+workspace managers' admitted successors (a SHIP update over an ad this node
+never saw) are recorded as in the reference, the phantom included. A named
+input that never lands (a decoy no peer serves, with the real predecessor
+landed and holding no coin) keeps its successor "not now" at the door,
+where GASP prunes it (D14). A finalize submit asks only the engine's memory,
+so a successor whose named predecessor the peer pruned is recorded as in
+the reference. The reference (ts-stack `Engine.submit`, `f999e0c1a`)
+records every topic that did not fail, whatever its predecessor: each
+"not now" here is a delta. At `/submit` an admitting successor's "not now"
+is the S2 queued ack (the STEAK names what will be admitted once its
+predecessor lands, and nothing is held until the replay); the dry runs and
+the names call are manager CPU inside the Worker's cap, whose breach is the
+platform's error and never a record. Pre-existing and not widened: a graph
+deeper than the budget (#555), the unbounded anchor verify (#557), a "not
+now" over a BEEF above 90,000 bytes answering 502 (#568). It cannot tell a faulted predecessor from one nobody submitted
 yet: the successor is "not now" until it lands. And a transaction that admits
 nothing, found no coin and carries more UNPROVEN, UNLANDED bodies than 16
 reads settle (five single-input ancestors, fewer with more inputs) is "not
@@ -353,7 +395,9 @@ argument under the reference's own name, `context: &TopicAdmittanceContext`
 The two GASP calls pass `TopicAdmittanceContext::DRY_RUN`: the needed-input
 walk over every proven node of a peer (`find_needed_inputs`) and the anchor
 replay of #551
-(`validate_graph_anchor`). `Engine::submit` passes `dry_run: false` (the queue
+(`validate_graph_anchor`), and so does the predecessor question's dry run
+of a candidate body (`unlanded_predecessor`, lane E1D: the opener cure,
+under the submit's own mode). `Engine::submit` passes `dry_run: false` (the queue
 replay, `/submit`, `/arc-ingest`, the peer crawler and the GASP finalize all go
 through it), and `Engine::submit_validate_only`, the only other caller, passes
 `true`: a validate-only call admits nothing. On a dry run a manager must
