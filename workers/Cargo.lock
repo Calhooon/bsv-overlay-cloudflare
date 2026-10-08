@@ -125,8 +125,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-cloudflare"
-version = "0.3.5"
-source = "git+https://github.com/Calhooon/bsv-middleware-cloudflare?rev=9394c74#9394c74ce438b770344ef026f7449fdab08187a1"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb6229a47255540ace9cd8a303765cff4d77ca7cb2cdb182d83f71e7fd230598"
 dependencies = [
  "async-trait",
  "base64",
