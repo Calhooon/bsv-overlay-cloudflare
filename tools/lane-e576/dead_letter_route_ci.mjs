@@ -18,7 +18,12 @@
  *  5. `/health/invariants.deadLetters`: the counts, the oldest parked, the last re-drive, the exhausted list.
  *  6-9. The lens fold (lane E576-f): the health's exhaustedCount / ceiling / stale fields; a stale re-drive returned
  *     and re-driven (M1); an exhausted letter forced by txid (L5); a bad-base64 replay dead-lettered and parked (N4).
+ * 10. The delta fold (lane E576-f2, D-M1): the table filled to the ceiling (`ceiling.full`, `near`); a REAL dead letter
+ *     is deferred (not parked; both deferral counters move); the discard lever's bearer and body; a discard of one
+ *     parked letter by key (its hash returned, a missing key `notFound`, `dead_letters_discarded_total`); the
+ *     deferred letter then PARKED on its next DLQ delivery.
  * On the base (`835b80c`) there is no route (the dispatch's 404) and no table: RED. On `f8b5525` legs 6-9: RED.
+ * On `28f5d0b` leg 10: RED (no discard route, no `near`, the ceiling never drains).
  *
  *   node tools/lane-e576/dead_letter_route_ci.mjs <overlay base> <overlay --persist-to dir>
  *
@@ -84,10 +89,10 @@ async function submit(beef) {
   })
   return { status: res.status, mutation: res.headers.get('x-overlay-mutation'), text: await res.text() }
 }
-async function lever(body, token = INTERNAL) {
+async function lever(body, token = INTERNAL, route = '/internal/redrive-dead-letters') {
   const headers = { 'Content-Type': 'application/json', Connection: 'close' }
   if (token !== null) headers.Authorization = `Bearer ${token}`
-  const res = await fetch(OVERLAY + '/internal/redrive-dead-letters', { method: 'POST', headers, body: JSON.stringify(body) })
+  const res = await fetch(OVERLAY + route, { method: 'POST', headers, body: JSON.stringify(body) })
   const text = await res.text()
   let json = null
   try { json = JSON.parse(text) } catch {}
@@ -260,6 +265,79 @@ const nbParked = await until('e576n parked again', () => {
   return r && r.status === 'parked' && /invalid base64/.test(r.fault ?? '') ? r : null
 })
 expect(!!nbParked, `a bad-base64 replay is handed back, dead-letters and parks again with its fault (within ${WAIT_MS / 1000} s)`, JSON.stringify({ ...(letter('e576n') ?? {}), message: '…' }))
+
+// ── bsv-low #576's delta fold (lane E576-f2) ────────────────────────────────
+// 10. D-M1: the ceiling drains by the operator's discard.
+const discard = (body, token = INTERNAL) => lever(body, token, '/internal/discard-dead-letters')
+const heldNow = Number(d1(`SELECT COUNT(*) AS c FROM mutation_dead_letters WHERE status IN ('parked', 'redriven')`)[0]?.c ?? 0)
+const fill = 2000 - heldNow
+if (fill > 0) {
+  d1(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${fill}) INSERT INTO mutation_dead_letters (txid, topics, message, fault, attempts, status, redrives, first_seen_at, parked_at, history) SELECT 'e576fill' || i, 'tm_collected', '{}', 'filler (never lands)', 0, 'parked', 3, 2, 2, '[]' FROM n`)
+}
+const hf = await health()
+expect(
+  hf.deadLetters?.ceiling?.full === true && hf.deadLetters?.ceiling?.near === true && hf.deadLetters?.ceiling?.nearAt === 1600 && hf.deadLetters?.ceiling?.room === 0,
+  'the table at the ceiling: health says full, near (from 1600), no room',
+  JSON.stringify(hf.deadLetters?.ceiling),
+)
+const deferred0 = hf.counters?.dead_letters_ceiling_deferred_total ?? NaN
+const deferrals0 = hf.counters?.dead_letters_ceiling_deferrals_total ?? NaN
+const discarded0 = hf.counters?.dead_letters_discarded_total ?? NaN
+const G2 = tx([], [output(COLLECTED_MARKER), output(nonceScript())])
+const g2 = txidOf(G2)
+const P2 = tx([input(g2, 0)], [output(COLLECTED_MARKER), output(nonceScript())])
+const p2 = txidOf(P2)
+const S2 = tx([input(p2, 0)], [output(nonceScript())])
+const s2 = txidOf(S2)
+const rg2 = await submit(beefV1(G2))
+d1(`INSERT INTO pot_evictions (txid, reason, evictedAt) VALUES ('${p2}', 'REJECTED (lane E576-f2, route tier)', ${Date.now()})`)
+const rs2 = await submit(beefV1(G2, P2, S2))
+expect(rg2.status === 200 && rs2.status === 200 && rs2.mutation === 'queued', `S2 (${s2.slice(0, 12)}…) is "not now": queued`, `${rg2.status} / ${rs2.status} ${rs2.mutation}`)
+let hd = null
+for (const t0 = Date.now(); Date.now() - t0 < WAIT_MS; await sleep(2_000)) {
+  const h = await health()
+  if ((h.counters?.dead_letters_ceiling_deferrals_total ?? 0) > deferrals0) { hd = h; break }
+}
+expect(
+  !!hd && (letter(s2)?.status ?? 'none') !== 'parked',
+  `S2 dead-lettered at the full ceiling is DEFERRED, not parked (within ${WAIT_MS / 1000} s)`,
+  JSON.stringify({ row: { ...(letter(s2) ?? {}), message: '…' }, counters: hd?.counters ? Object.fromEntries(Object.entries(hd.counters).filter(([k]) => k.startsWith('dead_letters'))) : null }),
+)
+expect(
+  !!hd && hd.counters.dead_letters_ceiling_deferred_total === deferred0 + 1,
+  'its first DLQ delivery counts ONE deferred letter (attempts == 1) and one deferral (D-L1)',
+  `${deferred0} -> ${hd?.counters?.dead_letters_ceiling_deferred_total}; deferrals ${deferrals0} -> ${hd?.counters?.dead_letters_ceiling_deferrals_total}`,
+)
+const dNone = await discard({ letters: [{ txid: 'e576fill1' }] }, null)
+const dWrong = await discard({ letters: [{ txid: 'e576fill1' }] }, 'not-the-token')
+const dEmpty = await discard({ letters: [] })
+const dOver = await discard({ letters: Array.from({ length: 51 }, (_, i) => ({ txid: `e576fill${i + 1}` })) })
+expect(
+  dNone.status === 401 && dWrong.status === 401 && dEmpty.status === 400 && dOver.status === 400 && letter('e576fill1')?.status === 'parked',
+  'the discard lever: 401 without the bearer, 400 on no letter and on 51; nothing moved',
+  `${dNone.status} ${dWrong.status} ${dEmpty.status} ${dOver.status}`,
+)
+const fillKey = fill > 0 ? 'e576fill1' : 'e576x'
+const dk = await discard({ letters: [{ txid: fillKey.toUpperCase(), topics: 'tm_collected' }, { txid: 'e576nope' }] })
+const gone = dk.json?.discarded ?? []
+expect(
+  dk.status === 200 && gone.length === 1 && gone[0].txid === fillKey && /^[0-9a-f]{64}$/.test(gone[0].sha256 ?? '') &&
+    (dk.json?.notFound ?? []).some((n) => n.txid === 'e576nope') && letter(fillKey) === undefined,
+  'a discard by key deletes that parked letter (its bytes hashed), a missing key is notFound',
+  dk.text.slice(0, 400),
+)
+const hx = await health()
+expect(
+  hx.counters?.dead_letters_discarded_total === discarded0 + 1 && hx.deadLetters?.ceiling?.full === false && hx.deadLetters?.ceiling?.room === 1,
+  'dead_letters_discarded_total moved; the ceiling has room for one',
+  JSON.stringify({ discarded: hx.counters?.dead_letters_discarded_total, ceiling: hx.deadLetters?.ceiling }),
+)
+const s2Parked = await until('S2 parked after the discard', () => {
+  const r = letter(s2)
+  return r && r.status === 'parked' ? r : null
+})
+expect(!!s2Parked, `the deferred letter is PARKED on its next DLQ delivery, now that there is room (within ${WAIT_MS / 1000} s)`, JSON.stringify({ ...(letter(s2) ?? {}), message: '…' }))
+d1(`DELETE FROM mutation_dead_letters WHERE txid LIKE 'e576fill%'`)
 
 } catch (e) {
   expect(false, 'the seeded legs ran (the table and the lever exist)', `${e.message ?? e}`.split('\n')[0])

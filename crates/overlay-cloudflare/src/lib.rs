@@ -364,6 +364,9 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
         }
         // bsv-low #576: the operator's bounded re-drive of the parked dead letters (bearer INTERNAL_TOKEN).
         (Method::Post, "/internal/redrive-dead-letters") => crate::dead_letters::internal_redrive(req, &env).await,
+        (Method::Post, "/internal/discard-dead-letters") => {
+            crate::dead_letters::internal_discard(req, &env).await
+        }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
 
@@ -2248,7 +2251,13 @@ async fn queue_handler(
                         ev.evicted_at_ms,
                         ev.reason
                     );
-                    crate::dead_letters::resolve(db, body, Some(&subject)).await;
+                    crate::dead_letters::resolve(
+                        db,
+                        body,
+                        Some(&subject),
+                        crate::dead_letters::Resolved::RefusedEvicted,
+                    )
+                    .await;
                     msg.ack();
                     continue;
                 }
@@ -2294,7 +2303,13 @@ async fn queue_handler(
                                 ev.evicted_at_ms,
                                 ev.reason
                             );
-                            crate::dead_letters::resolve(db, body, Some(&subject)).await;
+                            crate::dead_letters::resolve(
+                                db,
+                                body,
+                                Some(&subject),
+                                crate::dead_letters::Resolved::ReEvicted,
+                            )
+                            .await;
                             msg.ack();
                             continue;
                         }
@@ -2325,7 +2340,13 @@ async fn queue_handler(
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_APPLIED, 1)
                         .await;
-                    crate::dead_letters::resolve(db, body, Some(&subject)).await;
+                    crate::dead_letters::resolve(
+                        db,
+                        body,
+                        Some(&subject),
+                        crate::dead_letters::Resolved::Landed,
+                    )
+                    .await;
                 }
                 msg.ack();
             }

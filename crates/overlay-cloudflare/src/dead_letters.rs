@@ -12,7 +12,8 @@
 //!     attempt ([`note_failing_query`]). The note holds NO message bytes (the lens fold, M2): the queue still holds
 //!     them, and the DLQ consumer writes them if the letter dies. A note on a `parked` row changes nothing; on a
 //!     `redriven` row it keeps the status (the stale rule, step 3, still sees it). An ack of the replay DELETES the
-//!     row, whatever its status ([`resolve_query`]): its bytes landed, the row is a copy of nothing (the scoped
+//!     row, whatever its status ([`resolve_query`]): its bytes landed, or were refused under an open eviction
+//!     ([`Resolved`] says which, in the log line; the delta fold, D-L3), and the row is a copy of nothing (a scoped
 //!     delete of `storage-ownership.json`); a parked or re-driven letter so resolved is counted
 //!     `dead_letters_resolved_total`.
 //!  2. `parked`: the DLQ consumer (its own `queue` export in `lib.rs`, dispatched on the batch's queue name,
@@ -40,15 +41,27 @@
 //!     lever again, and `/health/invariants.deadLetters.exhausted` lists it; once the operator removed its cause,
 //!     `{"txid": k, "force": true}` re-drives it once more, recorded in its history (L5).
 //!
+//!  5. `discarded`: `POST /internal/discard-dead-letters` (the same bearer, [`parse_discard_request`]; the delta
+//!     fold, D-M1) deletes named PARKED letters, at most [`DISCARD_MAX_LETTERS`] per call, by key (a txid, and its
+//!     topics or every parked row of it), each logged `[dead-letters] DISCARDED` with the sha256 of its bytes and
+//!     counted `dead_letters_discarded_total`. It is the operator's way to make room under the ceiling: without it
+//!     a letter that can never land (exhausted, `undecodable:`, `unparsed:`, a body the engine refuses for good)
+//!     held its place for ever, and once [`PARKED_ROWS_CEILING`] of them had collected every new letter was lost.
+//!     A `redriven` letter (in flight) and a `failing` note are not discarded.
+//!
 //! The table is never wiped: once the DLQ message is acked the row is the only copy of the letter
-//! (`storage-ownership.json`: `never_wipe`, rebuild class `lost`); the one DELETE is the ack of landed bytes. Its
+//! (`storage-ownership.json`: `never_wipe`, rebuild class `lost`); its two DELETEs are the ack of a replay and the
+//! operator's discard by key. Its
 //! size is bounded (M2): a `failing` note is a key, a fault of at most [`FAULT_TEXT_MAX`] bytes and four integers;
 //! a letter's bytes are one queue message (the platform's 128 KB message limit) and a history of at most
 //! [`HISTORY_MAX`] entries; and at most [`PARKED_ROWS_CEILING`] letters hold bytes (`parked` or `redriven`): a NEW
-//! letter past it is not parked, it is handed back to the DLQ with the same backoff, counted
-//! `dead_letters_ceiling_deferred_total` and shown in the health block (a flood of a stranger's "not now" bodies,
-//! CLAUDE.md's limit (4), fills the ceiling and not the database; past ~48 h at the ceiling a deferred letter is
-//! LOST, logged as above). `failing` notes are not under the ceiling: one per key in flight, deleted at its ack or
+//! letter past it is not parked, it is handed back to the DLQ with the same backoff, counted (the letter once,
+//! `dead_letters_ceiling_deferred_total`, on its first DLQ delivery; every deferral,
+//! `dead_letters_ceiling_deferrals_total`; the delta fold, D-L1) and shown in the health block (a flood of a
+//! stranger's "not now" bodies, CLAUDE.md's limit (4), fills the ceiling and not the database; past ~48 h at the
+//! ceiling a deferred letter is LOST, logged as above). The ceiling does not drain by itself: only an ack and the
+//! operator's discard (step 5) take a letter out; the health block says `near` from [`CEILING_NEAR`] letters on
+//! and the DLQ consumer logs each park at or past it. `failing` notes are not under the ceiling: one per key in flight, deleted at its ack or
 //! promoted by its park; one whose message the platform dropped on the main queue stays, a small row, counted in the
 //! health block.
 //!
@@ -80,6 +93,11 @@ pub const HISTORY_MAX: u64 = 20;
 /// At most this many letters hold bytes (`parked` + `redriven`); a NEW letter past it is deferred (M2). About
 /// 2000 × (128 KB + 22 KB of history) ≈ 300 MB at the very worst, in the ONE shared `OVERLAY_DB`.
 pub const PARKED_ROWS_CEILING: u64 = 2000;
+/// From this many letters with bytes the health block says the ceiling is `near` and each park logs it (D-M1): 80 %
+/// of [`PARKED_ROWS_CEILING`], 400 letters of room for the operator to discard what can never land.
+pub const CEILING_NEAR: u64 = PARKED_ROWS_CEILING / 5 * 4;
+/// The discard lever's ceiling per call (D-M1): its statement returns each letter's bytes, to log their hash.
+pub const DISCARD_MAX_LETTERS: usize = 50;
 /// A re-drive claimed this long ago that neither resolved nor parked again is STALE: the lever returns it to the
 /// parked set (M1). The main queue's 1 + 3 deliveries of a re-driven message and its hop to the DLQ take seconds to
 /// minutes; a stale verdict that is wrong (the re-driven copy is still in flight, e.g. a DLQ park riding out a D1
@@ -150,6 +168,10 @@ pub const PARK_SQL: &str = concat!(
 /// goes, whatever its status (M2; `storage-ownership.json`'s `delete_scope`). The deleted row's status is returned.
 pub const RESOLVE_SQL: &str =
     "DELETE FROM mutation_dead_letters WHERE txid = ? AND topics = ? RETURNING status, parked_at";
+/// Binds: txid, topics (NULL: every parked row of the txid). The operator's discard (D-M1; the second scoped delete
+/// of `storage-ownership.json`): a PARKED letter only, its bytes returned to log their hash.
+pub const DISCARD_SQL: &str = "DELETE FROM mutation_dead_letters WHERE txid = ?1 AND (?2 IS NULL OR topics = ?2) AND status = 'parked' \
+     RETURNING txid, topics, redrives, fault, message";
 /// Binds: the redrive ceiling, limit. Oldest parked first. No bytes: the claim returns them (L3).
 pub const SELECT_PARKED_SQL: &str =
     "SELECT txid, topics, fault, redrives, redriven_at FROM mutation_dead_letters \
@@ -321,6 +343,14 @@ pub fn resolve_query(txid: &str, topics: &str) -> Query {
     Query::new(RESOLVE_SQL).bind(txid).bind(topics)
 }
 
+/// `topics: None` discards every parked row of `txid`.
+#[must_use]
+pub fn discard_query(txid: &str, topics: Option<&str>) -> Query {
+    Query::new(DISCARD_SQL)
+        .bind(txid)
+        .bind(topics.map_or(QVal::Null, |t| QVal::Text(t.to_string())))
+}
+
 #[must_use]
 pub fn ceiling_query(txid: &str, topics: &str) -> Query {
     Query::new(CEILING_SQL).bind(txid).bind(topics)
@@ -419,6 +449,58 @@ pub fn parse_redrive_request(raw: &[u8]) -> std::result::Result<RedriveRequest, 
     Ok(RedriveRequest { limit, txid, force })
 }
 
+/// One letter `POST /internal/discard-dead-letters` names: a txid (lowercased) and its topics key (`None`: every
+/// parked row of the txid).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscardKey {
+    pub txid: String,
+    pub topics: Option<String>,
+}
+
+/// PURE (D-M1): `{"letters": [{"txid": "<key>", "topics"?: "<sorted, comma-joined>"}, ...]}`, 1 to
+/// [`DISCARD_MAX_LETTERS`] of them (more is refused, not clamped: the operator names each letter). `Err` names what
+/// is wrong.
+pub fn parse_discard_request(raw: &[u8]) -> std::result::Result<Vec<DiscardKey>, &'static str> {
+    let v: serde_json::Value = serde_json::from_slice(raw).map_err(|_| "body must be JSON")?;
+    let letters = v
+        .as_object()
+        .ok_or("body must be a JSON object")?
+        .get("letters")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("letters must be an array")?;
+    if letters.is_empty() {
+        return Err("letters must name at least one letter");
+    }
+    if letters.len() > DISCARD_MAX_LETTERS {
+        return Err("letters names more than the lever discards per call");
+    }
+    let text = |v: &serde_json::Value| {
+        v.as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && t.len() <= 1024)
+            .map(str::to_string)
+    };
+    let mut keys = Vec::with_capacity(letters.len());
+    for l in letters {
+        let o = l.as_object().ok_or("each letter must be an object")?;
+        let txid = o
+            .get("txid")
+            .and_then(text)
+            .filter(|t| t.len() <= 128)
+            .ok_or("each letter needs a non-empty txid")?
+            .to_ascii_lowercase();
+        let topics = match o.get("topics") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(t) => Some(text(t).ok_or("topics must be a non-empty string")?),
+        };
+        let key = DiscardKey { txid, topics };
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
+}
+
 /// One parked row the lever read (no bytes: the claim returns them).
 #[derive(Deserialize, Debug, Clone)]
 pub struct ParkedRow {
@@ -475,6 +557,15 @@ struct ResolvedRow {
 }
 
 #[derive(Deserialize)]
+struct DiscardedRow {
+    txid: String,
+    topics: String,
+    redrives: f64,
+    fault: Option<String>,
+    message: String,
+}
+
+#[derive(Deserialize)]
 struct StaleRow {
     txid: String,
     topics: String,
@@ -500,10 +591,43 @@ pub async fn note_failing(
     }
 }
 
-/// The main consumer, on an ack: the letter's bytes landed (or need no replay); its row, if any, is deleted.
-/// Fail-soft (logged): a row left behind is shown by the health block (a `failing` note) or is re-selected by the
-/// lever (a parked or stale re-driven letter, whose re-drive is then a dedup).
-pub async fn resolve(db: &D1Database, body: &MutationMessage, subject: Option<&str>) {
+/// Why the main consumer acked a replay (D-L3: the log line says what happened, not "landed" for all three).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolved {
+    /// The replay was durable: its bytes landed.
+    Landed,
+    /// The replay was skipped: its subject is under an OPEN eviction, its bytes are refused and nothing was written.
+    RefusedEvicted,
+    /// The replay landed and an eviction that opened meanwhile took its rows out again.
+    ReEvicted,
+}
+
+impl Resolved {
+    /// The words of the `RESOLVED` log line.
+    #[must_use]
+    pub fn says(self) -> &'static str {
+        match self {
+            Self::Landed => "its bytes landed",
+            Self::RefusedEvicted => {
+                "its bytes were REFUSED under an open eviction (nothing written; a MINED proof readmits)"
+            }
+            Self::ReEvicted => {
+                "its bytes landed and were re-evicted under an eviction that opened meanwhile"
+            }
+        }
+    }
+}
+
+/// The main consumer, on an ack: the letter's bytes landed, or are refused under an open eviction (`why`); its row,
+/// if any, is deleted: no replay of it is wanted. Fail-soft (logged): a row left behind is shown by the health
+/// block (a `failing` note) or is re-selected by the lever (a parked or stale re-driven letter, whose re-drive is
+/// then a dedup, or a skip under the eviction).
+pub async fn resolve(
+    db: &D1Database,
+    body: &MutationMessage,
+    subject: Option<&str>,
+    why: Resolved,
+) {
     let (txid, topics) = letter_key(body, subject);
     match resolve_query(&txid, &topics)
         .fetch_all::<ResolvedRow>(db)
@@ -512,7 +636,11 @@ pub async fn resolve(db: &D1Database, body: &MutationMessage, subject: Option<&s
         Ok(rows) => {
             if let Some(r) = rows.first().filter(|r| r.parked_at.is_some()) {
                 crate::ops::bump_counter(db, crate::ops::COUNTER_DEAD_LETTERS_RESOLVED, 1).await;
-                worker::console_log!("[dead-letters] RESOLVED {txid} [{topics}] (was {}): its bytes landed; the row is gone", r.status);
+                worker::console_log!(
+                    "[dead-letters] RESOLVED {txid} [{topics}] (was {}): {}; the row is gone",
+                    r.status,
+                    why.says()
+                );
             }
         }
         Err(e) => {
@@ -559,8 +687,9 @@ fn letter_of(raw: worker::wasm_bindgen::JsValue, id: &str) -> Letter {
 
 /// What a park did.
 enum Parked {
-    /// A new park (or a re-park of a re-driven letter): `redrives` so far.
-    Park(u64),
+    /// A new park (or a re-park of a re-driven letter): `redrives` so far, and the letters with bytes after it when
+    /// that is at or past [`CEILING_NEAR`] (D-M1's threshold line).
+    Park(u64, Option<u64>),
     /// Another copy met its parked letter: which bytes were kept.
     Copy(String),
     /// The same bytes again: nothing written.
@@ -574,10 +703,14 @@ async fn park_one(db: &D1Database, l: &Letter, now: i64) -> std::result::Result<
         .fetch_optional::<CeilingRow>(db)
         .await
         .map_err(|e| format!("the ceiling read: {e}"))?;
+    let mut held_after = None;
     if let Some(c) = c {
+        let held = c.held.max(0.0) as u64;
         if c.known < 1.0 && c.held >= PARKED_ROWS_CEILING as f64 {
-            return Ok(Parked::Ceiling(c.held.max(0.0) as u64));
+            return Ok(Parked::Ceiling(held));
         }
+        let after = if c.known < 1.0 { held + 1 } else { held };
+        held_after = (after >= CEILING_NEAR).then_some(after);
     }
     let rows = park_query(
         &l.txid,
@@ -595,7 +728,35 @@ async fn park_one(db: &D1Database, l: &Letter, now: i64) -> std::result::Result<
         Some(r) if r.kind.as_deref() == Some("copy") => {
             Parked::Copy(r.kept.clone().unwrap_or_default())
         }
-        Some(r) => Parked::Park(r.redrives.max(0.0) as u64),
+        Some(r) => Parked::Park(r.redrives.max(0.0) as u64, held_after),
+    })
+}
+
+/// PURE (D-L2): the platform's `attempts` as the log lines print it, so a drill that parks cleanly reads it.
+#[must_use]
+pub fn attempts_text(attempts: Option<u32>) -> String {
+    attempts.map_or_else(|| "absent".to_string(), |a| a.to_string())
+}
+
+/// PURE (D-L1): what one ceiling deferral counts: `(letters, deliveries)`. The LETTER is counted on its first DLQ
+/// delivery by the platform's own count (`attempts == 1`, the count [`dlq_retry_plan`] reads too); every delivery
+/// is a deferral. An unreadable count counts the delivery only (stated).
+#[must_use]
+pub fn ceiling_deferral_counts(attempts: Option<u32>) -> (u64, u64) {
+    (u64::from(attempts == Some(1)), 1)
+}
+
+/// PURE (D-M1): the health block's `ceiling`: the letters with bytes, the maximum, the room left, `near` from
+/// [`CEILING_NEAR`] on and `full` at the maximum.
+#[must_use]
+pub fn ceiling_json(held: u64) -> serde_json::Value {
+    serde_json::json!({
+        "held": held,
+        "max": PARKED_ROWS_CEILING,
+        "room": PARKED_ROWS_CEILING.saturating_sub(held),
+        "nearAt": CEILING_NEAR,
+        "near": held >= CEILING_NEAR,
+        "full": held >= PARKED_ROWS_CEILING,
     })
 }
 
@@ -640,13 +801,14 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
             &id,
         );
         let (txid, topics) = (&letter.txid, &letter.topics);
+        let att = attempts_text(attempts);
         let now = worker::Date::now().as_millis() as i64;
         let outcome = match &db {
             Ok(db) => park_one(db, &letter, now).await,
             Err(e) => Err(e.clone()),
         };
         let fault = match outcome {
-            Ok(Parked::Park(redrives)) => {
+            Ok(Parked::Park(redrives, near)) => {
                 if let Ok(db) = &db {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_DEAD_LETTERS_PARKED, 1).await;
                     if redrives > 0 && letter.start_redrives == 0 {
@@ -659,28 +821,40 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
                     }
                 }
                 worker::console_log!(
-                    "[dead-letters] PARKED {txid} [{topics}] from {queue} (re-drives so far {redrives}/{MAX_REDRIVES}){}",
+                    "[dead-letters] PARKED {txid} [{topics}] from {queue} attempts={att} (re-drives so far {redrives}/{MAX_REDRIVES}){}",
                     if redrives >= MAX_REDRIVES { "; EXHAUSTED, the lever will not re-drive it unless forced" } else { "" }
                 );
+                if let Some(held) = near {
+                    worker::console_log!("[dead-letters] the ceiling is NEAR: {held}/{PARKED_ROWS_CEILING} letters hold bytes; past it every new letter is deferred and lost after ~48 h; discard what can never land (POST /internal/discard-dead-letters)");
+                }
                 let _ = m.ack();
                 continue;
             }
             Ok(Parked::Copy(kept)) => {
-                worker::console_log!("[dead-letters] another copy of the parked {txid} [{topics}] arrived: kept the {kept} bytes (the longer), a history entry; acked");
+                worker::console_log!("[dead-letters] another copy of the parked {txid} [{topics}] arrived attempts={att}: kept the {kept} bytes (the longer), a history entry; acked");
                 let _ = m.ack();
                 continue;
             }
             Ok(Parked::Redelivery) => {
-                worker::console_log!("[dead-letters] {txid} [{topics}] was already parked with these bytes (a DLQ redelivery): acked");
+                worker::console_log!("[dead-letters] {txid} [{topics}] was already parked with these bytes (a DLQ redelivery) attempts={att}: acked");
                 let _ = m.ack();
                 continue;
             }
             Ok(Parked::Ceiling(held)) => {
                 if let Ok(db) = &db {
+                    let (letters, deliveries) = ceiling_deferral_counts(attempts);
+                    if letters > 0 {
+                        crate::ops::bump_counter(
+                            db,
+                            crate::ops::COUNTER_DEAD_LETTERS_CEILING_DEFERRED,
+                            letters,
+                        )
+                        .await;
+                    }
                     crate::ops::bump_counter(
                         db,
-                        crate::ops::COUNTER_DEAD_LETTERS_CEILING_DEFERRED,
-                        1,
+                        crate::ops::COUNTER_DEAD_LETTERS_CEILING_DEFERRALS,
+                        deliveries,
                     )
                     .await;
                 }
@@ -702,7 +876,7 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
         } else {
             worker::console_log!(
                 "[dead-letters] NOT parked {txid} [{topics}] ({fault}); delivery {}/{}: handed back for {} s",
-                attempts.map_or_else(|| "?".to_string(), |a| a.to_string()),
+                att,
                 DLQ_MAX_RETRIES + 1,
                 plan.delay_s
             );
@@ -862,6 +1036,88 @@ pub async fn internal_redrive(mut req: Request, env: &Env) -> Result<Response> {
     }))
 }
 
+/// `POST /internal/discard-dead-letters` (bearer `INTERNAL_TOKEN`, D-M1): delete the named PARKED letters (see the
+/// module doc, step 5). Each discarded letter is logged with the sha256 and length of its bytes, its re-drives and
+/// its last fault, and counted; a key that names no parked row is answered `notFound` (a `redriven` letter in
+/// flight, a `failing` note, or nothing), and nothing else is touched.
+pub async fn internal_discard(mut req: Request, env: &Env) -> Result<Response> {
+    let authorization = req.headers().get("authorization").ok().flatten();
+    let secret = env.secret("INTERNAL_TOKEN").ok().map(|s| s.to_string());
+    if !crate::tip_pass::bearer_ok(authorization.as_deref(), secret.as_deref()) {
+        worker::console_log!("POST /internal/discard-dead-letters -> 401");
+        return Response::error("unauthorized", 401);
+    }
+    let raw = req.bytes().await?;
+    let keys = match parse_discard_request(&raw) {
+        Ok(k) => k,
+        Err(why) => {
+            return Response::error(
+                format!("{why}: {{\"letters\": [{{\"txid\": \"<key>\", \"topics\"?: \"<sorted, comma-joined>\"}}, ...]}} (1..{DISCARD_MAX_LETTERS})"),
+                400,
+            )
+        }
+    };
+    let db = env.d1("OVERLAY_DB")?;
+    crate::d1::ensure_overlay_migrations(&db)
+        .await
+        .map_err(worker::Error::from)?;
+    let mut discarded = Vec::new();
+    let mut not_found = Vec::new();
+    let mut faults = Vec::new();
+    for k in &keys {
+        match discard_query(&k.txid, k.topics.as_deref())
+            .fetch_all::<DiscardedRow>(&db)
+            .await
+        {
+            Ok(rows) if rows.is_empty() => {
+                not_found.push(serde_json::json!({"txid": k.txid, "topics": k.topics}));
+            }
+            Ok(rows) => {
+                for r in rows {
+                    let sha = hex::encode(bsv_rs::primitives::hash::sha256(r.message.as_bytes()));
+                    let redrives = r.redrives.max(0.0) as u64;
+                    worker::console_log!(
+                        "[dead-letters] DISCARDED {} [{}] sha256={sha} bytes={} by the operator (re-drives {redrives}/{MAX_REDRIVES}; its last fault: {}): its bytes are gone",
+                        r.txid,
+                        r.topics,
+                        r.message.len(),
+                        r.fault.as_deref().unwrap_or("none recorded")
+                    );
+                    discarded.push(serde_json::json!({
+                        "txid": r.txid, "topics": r.topics, "redrives": redrives, "fault": r.fault,
+                        "bytes": r.message.len(), "sha256": sha,
+                    }));
+                }
+            }
+            Err(e) => {
+                faults.push(serde_json::json!({"txid": k.txid, "topics": k.topics, "fault": format!("discard: {e}")}));
+            }
+        }
+    }
+    if !discarded.is_empty() {
+        crate::ops::bump_counter(
+            &db,
+            crate::ops::COUNTER_DEAD_LETTERS_DISCARDED,
+            discarded.len() as u64,
+        )
+        .await;
+    }
+    worker::console_log!(
+        "POST /internal/discard-dead-letters -> 200 (named={} discarded={} notFound={} faults={})",
+        keys.len(),
+        discarded.len(),
+        not_found.len(),
+        faults.len()
+    );
+    Response::from_json(&serde_json::json!({
+        "ok": true,
+        "discarded": discarded,
+        "notFound": not_found,
+        "faults": faults,
+        "maxLetters": DISCARD_MAX_LETTERS,
+    }))
+}
+
 #[derive(Deserialize)]
 struct StatusCountRow {
     status: String,
@@ -955,7 +1211,7 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
         "staleAfterMs": STALE_REDRIVE_MS,
         "oldestRedriven": oldest_redriven.as_ref().map(key_at),
         "parkedLast24h": counts.iter().map(|r| n(r.recent)).sum::<u64>(),
-        "ceiling": {"held": held, "max": PARKED_ROWS_CEILING, "full": held >= PARKED_ROWS_CEILING},
+        "ceiling": ceiling_json(held),
         "oldestParked": oldest.as_ref().map(key_at),
         "lastRedrive": last.as_ref().map(key_at),
         "maxRedrives": MAX_REDRIVES,
@@ -1932,6 +2188,266 @@ mod tests {
             )
             .is_empty(),
             "once per claim"
+        );
+    }
+
+    /// Fill the table to the ceiling with `parked` letters `k0..`, one of them `redriven` (`k1`); a `failing` note
+    /// beside them.
+    fn fill_to_the_ceiling(conn: &rusqlite::Connection) {
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..PARKED_ROWS_CEILING {
+            let st = if i == 1 { "redriven" } else { "parked" };
+            tx.execute(
+                "INSERT INTO mutation_dead_letters (txid, topics, message, status, redrives, first_seen_at, parked_at) VALUES (?1, 't', '{\"k\":1}', ?2, ?3, 1, 1)",
+                rusqlite::params![format!("k{i}"), st, if i == 0 { MAX_REDRIVES as i64 } else { 0 }],
+            )
+            .unwrap();
+        }
+        tx.execute("INSERT INTO mutation_dead_letters (txid, topics, message, status, first_seen_at) VALUES ('note', 't', '', 'failing', 1)", []).unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// D-M1 (the delta fold): the ceiling DRAINS. Full, a new letter is deferred; the operator discards a parked
+    /// letter by key (never a re-drive in flight, never a failing note, never another key); the next new letter is
+    /// parked. Health says `near` before `full`.
+    #[test]
+    fn e576f2_m1_a_discard_makes_room_under_the_ceiling() {
+        let conn = db();
+        fill_to_the_ceiling(&conn);
+        let read = |txid: &str| -> (u64, u64) {
+            let r = rows(&conn, &ceiling_query(txid, "tm_a,tm_b"));
+            (r[0][0].parse().unwrap(), r[0][1].parse().unwrap())
+        };
+        // the ceiling reached: a new letter is deferred, as the consumer's rule reads it
+        let (held, known) = read("new");
+        assert!(
+            known == 0 && held >= PARKED_ROWS_CEILING,
+            "deferred: {held}/{known}"
+        );
+        assert_eq!(ceiling_json(held)["full"], true);
+        // what the discard does NOT touch: an unknown key, a re-drive in flight, a failing note, another topic set
+        assert!(rows(&conn, &discard_query("nope", None)).is_empty());
+        assert!(
+            rows(&conn, &discard_query("k1", None)).is_empty(),
+            "a redriven letter is in flight"
+        );
+        assert!(
+            rows(&conn, &discard_query("note", None)).is_empty(),
+            "a failing note holds no bytes"
+        );
+        assert!(
+            rows(&conn, &discard_query("k2", Some("other"))).is_empty(),
+            "the key's topics must match"
+        );
+        assert!(exists(&conn, "k1") && exists(&conn, "note") && exists(&conn, "k2"));
+        // the operator discards one parked letter (the exhausted k0) by key: its row and bytes are returned
+        let gone = rows(&conn, &discard_query("k0", Some("t")));
+        assert_eq!(gone.len(), 1);
+        assert_eq!(
+            gone[0][..3],
+            ["k0".to_string(), "t".to_string(), MAX_REDRIVES.to_string()]
+        );
+        assert_eq!(gone[0][4], "{\"k\":1}", "its bytes, to log their hash");
+        assert!(!exists(&conn, "k0"));
+        // the next new letter is PARKED
+        let (held, known) = read("new");
+        assert_eq!((held, known), (PARKED_ROWS_CEILING - 1, 0));
+        assert!(
+            held < PARKED_ROWS_CEILING,
+            "the consumer's rule now parks it"
+        );
+        assert_eq!(dead_letter(&conn, "new", Some("x"), 5_000), 1);
+        assert_eq!(row(&conn, "new").0, "parked");
+        assert_eq!(read("new2").0, PARKED_ROWS_CEILING, "full again");
+        // by txid with no topics: every parked row of the txid, and only parked ones
+        let m = serde_json::to_string(&msg("AA==", &["tm_c"])).unwrap();
+        run(&conn, &park_query("new", "tm_c", &m, "f", 0, 6_000));
+        run(&conn, &park_query("new", "tm_d", &m, "f", 0, 6_000));
+        conn.execute("UPDATE mutation_dead_letters SET status = 'redriven' WHERE txid = 'new' AND topics = 'tm_d'", []).unwrap();
+        let gone = rows(&conn, &discard_query("new", None));
+        let mut keys: Vec<&str> = gone.iter().map(|r| r[1].as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["tm_a,tm_b", "tm_c"]);
+        assert!(exists(&conn, "new"), "the redriven tm_d row stays");
+        // the health block's threshold line
+        assert_eq!(CEILING_NEAR, 1600);
+        let j = ceiling_json(CEILING_NEAR - 1);
+        assert_eq!(
+            (j["near"].clone(), j["full"].clone(), j["room"].clone()),
+            (false.into(), false.into(), 401.into())
+        );
+        let j = ceiling_json(CEILING_NEAR);
+        assert_eq!(
+            (j["near"].clone(), j["full"].clone(), j["nearAt"].clone()),
+            (true.into(), false.into(), 1600.into())
+        );
+        assert_eq!(ceiling_json(PARKED_ROWS_CEILING + 5)["room"], 0);
+        // the scoped delete the ownership manifest grants (the checker's 120-character statement), the route, the
+        // counter and the DISCARDED line with the bytes' hash
+        let manifest = include_str!("../../../storage-ownership.json");
+        assert!(
+            manifest.contains(&" ".join_ws(DISCARD_SQL)[..120]),
+            "the delete_scope names DISCARD_SQL"
+        );
+        assert!(DISCARD_SQL.contains("AND status = 'parked'"));
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("(Method::Post, \"/internal/discard-dead-letters\") => {\n            crate::dead_letters::internal_discard(req, &env).await"));
+        let src = include_str!("dead_letters.rs");
+        let h = &src[src.find("pub async fn internal_discard(").unwrap()..];
+        let h = &h[..h.find("\n}\n").unwrap()];
+        assert!(
+            h.contains("tip_pass::bearer_ok(") && h.contains("-> 401"),
+            "the same bearer"
+        );
+        assert!(
+            h.contains("COUNTER_DEAD_LETTERS_DISCARDED")
+                && h.contains("[dead-letters] DISCARDED {} [{}] sha256={sha}")
+        );
+        let consumer = &src[src.find("pub async fn park_batch(").unwrap()..];
+        assert!(
+            consumer.contains("the ceiling is NEAR"),
+            "each park at or past the threshold logs it"
+        );
+    }
+
+    trait JoinWs {
+        fn join_ws(&self, s: &str) -> String;
+    }
+    impl JoinWs for str {
+        fn join_ws(&self, s: &str) -> String {
+            s.split_whitespace().collect::<Vec<_>>().join(self)
+        }
+    }
+
+    /// D-M1: the discard lever's body: named letters only, 1 to DISCARD_MAX_LETTERS, txids lowercased, duplicates
+    /// folded.
+    #[test]
+    fn e576f2_m1_the_discard_request_parse() {
+        assert_eq!(
+            parse_discard_request(br#"{"letters": [{"txid": " AB "}, {"txid": "cd", "topics": "tm_a,tm_b"}, {"txid": "ab"}]}"#).unwrap(),
+            vec![
+                DiscardKey { txid: "ab".into(), topics: None },
+                DiscardKey { txid: "cd".into(), topics: Some("tm_a,tm_b".into()) },
+            ]
+        );
+        let max: Vec<serde_json::Value> = (0..DISCARD_MAX_LETTERS)
+            .map(|i| serde_json::json!({"txid": format!("t{i}")}))
+            .collect();
+        assert_eq!(
+            parse_discard_request(serde_json::json!({"letters": max}).to_string().as_bytes())
+                .unwrap()
+                .len(),
+            DISCARD_MAX_LETTERS
+        );
+        let over: Vec<serde_json::Value> = (0..=DISCARD_MAX_LETTERS)
+            .map(|i| serde_json::json!({"txid": format!("t{i}")}))
+            .collect();
+        assert!(
+            parse_discard_request(serde_json::json!({"letters": over}).to_string().as_bytes())
+                .is_err(),
+            "more is refused, not clamped"
+        );
+        for bad in [
+            &b""[..],
+            b"{}",
+            br#"{"letters": []}"#,
+            br#"{"letters": [{}]}"#,
+            br#"{"letters": [{"txid": ""}]}"#,
+            br#"{"letters": [{"txid": "ab", "topics": ""}]}"#,
+            br#"{"letters": ["ab"]}"#,
+            br#"{"txid": "ab"}"#,
+        ] {
+            assert!(
+                parse_discard_request(bad).is_err(),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    /// D-L1 (the delta fold): a letter deferred at the ceiling on every one of its 1 + 100 DLQ deliveries is ONE
+    /// deferred letter and 101 deferrals; the consumer bumps the two counters apart.
+    #[test]
+    fn e576f2_l1_a_deferred_letter_counts_once() {
+        let (mut letters, mut deliveries) = (0, 0);
+        for a in 1..=DLQ_MAX_RETRIES + 1 {
+            let (l, d) = ceiling_deferral_counts(Some(a));
+            letters += l;
+            deliveries += d;
+        }
+        assert_eq!((letters, deliveries), (1, u64::from(DLQ_MAX_RETRIES) + 1));
+        assert_eq!(
+            ceiling_deferral_counts(None),
+            (0, 1),
+            "an unreadable count: the delivery only"
+        );
+        assert_ne!(
+            crate::ops::COUNTER_DEAD_LETTERS_CEILING_DEFERRED,
+            crate::ops::COUNTER_DEAD_LETTERS_CEILING_DEFERRALS
+        );
+        let src = include_str!("dead_letters.rs");
+        let body = &src[src.find("pub async fn park_batch(").unwrap()..];
+        let ceiling = &body[body.find("Ok(Parked::Ceiling(held)) => {").unwrap()
+            ..body.find("Err(e) => e,").unwrap()];
+        assert!(ceiling.contains("ceiling_deferral_counts(attempts)"));
+        assert!(ceiling.contains(
+            "COUNTER_DEAD_LETTERS_CEILING_DEFERRED,\n                            letters,"
+        ));
+        assert!(ceiling.contains(
+            "COUNTER_DEAD_LETTERS_CEILING_DEFERRALS,\n                        deliveries,"
+        ));
+    }
+
+    /// D-L2 (the delta fold): the PARKED, copy and redelivery lines (the acks of a clean park) print the platform's
+    /// `attempts`, or "absent", so a live drill that parks cleanly reads it.
+    #[test]
+    fn e576f2_l2_every_ack_line_prints_attempts() {
+        assert_eq!(attempts_text(None), "absent");
+        assert_eq!(attempts_text(Some(4)), "4");
+        let src = include_str!("dead_letters.rs");
+        let start = src.find("pub async fn park_batch(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("let att = attempts_text(attempts);"));
+        for line in [
+            "[dead-letters] PARKED ",
+            "[dead-letters] another copy of the parked ",
+            "was already parked with these bytes",
+        ] {
+            let at = body.find(line).unwrap_or_else(|| panic!("{line}"));
+            let end = at + body[at..].find('"').unwrap();
+            assert!(
+                body[at..end].contains("attempts={att}"),
+                "{line}: {}",
+                &body[at..end]
+            );
+        }
+    }
+
+    /// D-L3 (the delta fold): `resolve` says what happened: the eviction skip's bytes did NOT land.
+    #[test]
+    fn e576f2_l3_resolve_says_what_happened() {
+        assert!(Resolved::Landed.says().contains("landed"));
+        assert!(
+            !Resolved::RefusedEvicted.says().contains("landed")
+                && Resolved::RefusedEvicted.says().contains("REFUSED")
+        );
+        assert!(Resolved::ReEvicted.says().contains("re-evicted"));
+        let src = include_str!("dead_letters.rs");
+        let r = &src[src.find("pub async fn resolve(").unwrap()..];
+        let r = &r[..r.find("\n}\n").unwrap()];
+        assert!(r.contains("why.says()") && !r.contains("its bytes landed"));
+        let lib = include_str!("lib.rs");
+        let skip = lib.find("SKIPPED — under an open eviction").unwrap();
+        let reev = lib.find("outran an eviction").unwrap();
+        let next = |from: usize| lib[from..].find("crate::dead_letters::resolve(").unwrap() + from;
+        assert!(lib[next(skip)..next(skip) + 400]
+            .contains("crate::dead_letters::Resolved::RefusedEvicted,"));
+        assert!(
+            lib[next(reev)..next(reev) + 400].contains("crate::dead_letters::Resolved::ReEvicted,")
+        );
+        assert_eq!(
+            lib.matches("crate::dead_letters::Resolved::Landed").count(),
+            1
         );
     }
 

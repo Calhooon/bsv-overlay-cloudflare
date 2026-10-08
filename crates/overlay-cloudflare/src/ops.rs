@@ -190,9 +190,15 @@ pub const COUNTER_DEAD_LETTERS_STILL_FAILING: &str = "dead_letters_still_failing
 /// bsv-low #576 (lens fold, H1): a dead letter whose park faulted on its LAST DLQ delivery: the platform drops it
 /// (logged `[dead-letters] LOST` with its key and the sha256 of its bytes). Best effort: D1 is usually what faulted.
 pub const COUNTER_DEAD_LETTERS_LOST: &str = "dead_letters_lost_total";
-/// bsv-low #576 (lens fold, M2): a new letter NOT parked because the table holds the ceiling of letters with bytes
-/// ([`crate::dead_letters::PARKED_ROWS_CEILING`]); it is handed back to the DLQ with backoff, never acked.
+/// bsv-low #576 (lens fold, M2): a new LETTER not parked because the table holds the ceiling of letters with bytes
+/// ([`crate::dead_letters::PARKED_ROWS_CEILING`]); it is handed back to the DLQ with backoff, never acked. Counted
+/// once per letter, on its first DLQ delivery (`attempts == 1`; the delta fold, D-L1: it counted every delivery).
 pub const COUNTER_DEAD_LETTERS_CEILING_DEFERRED: &str = "dead_letters_ceiling_deferred_total";
+/// bsv-low #576 (the delta fold, D-L1): every DLQ DELIVERY deferred at the ceiling (up to 1 + 100 per letter).
+pub const COUNTER_DEAD_LETTERS_CEILING_DEFERRALS: &str = "dead_letters_ceiling_deferrals_total";
+/// bsv-low #576 (the delta fold, D-M1): parked letters the operator discarded by key
+/// (`POST /internal/discard-dead-letters`) to make room under the ceiling.
+pub const COUNTER_DEAD_LETTERS_DISCARDED: &str = "dead_letters_discarded_total";
 /// bsv-low #576 (lens fold, M1): re-drives claimed longer than [`crate::dead_letters::STALE_REDRIVE_MS`] ago and
 /// never resolved nor parked again, returned to the parked set by the lever.
 pub const COUNTER_DEAD_LETTERS_STALE_RETURNED: &str = "dead_letters_stale_returned_total";
@@ -890,6 +896,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_DEAD_LETTERS_STILL_FAILING,
         COUNTER_DEAD_LETTERS_LOST,
         COUNTER_DEAD_LETTERS_CEILING_DEFERRED,
+        COUNTER_DEAD_LETTERS_CEILING_DEFERRALS,
+        COUNTER_DEAD_LETTERS_DISCARDED,
         COUNTER_DEAD_LETTERS_STALE_RETURNED,
         COUNTER_DEAD_LETTERS_RESOLVED,
         COUNTER_ARC_INGEST_SEEN_LATCHED,
