@@ -472,8 +472,11 @@ does not bring a dead letter back). The lever, bsv-low #576 (built; see
 "The dead letters" below), parks `low-overlay-mutations-dlq` in D1
 (`mutation_dead_letters`) and re-drives it on
 `POST /internal/redrive-dead-letters`, at most 200 letters per call (default
-25), OLDEST first, so a predecessor's letter is replayed before its
-successors'; each replay is the same bytes through the same door,
+25), oldest PARKED first (the order the letters died, not chain order: a
+successor can die first, a re-parked predecessor moves to the back and the
+main queue runs a successor and its predecessor concurrently, so re-drive
+the predecessor BY TXID first, then the rest; lens N1); each replay is the
+same bytes through the same door,
 dedup-safe, and a letter is re-driven at most 3 times. What the lever
 does NOT heal: a predecessor that never lands whatever replays it, carried
 or absent (its manager fails it for good, its own walk refuses it, its
@@ -540,46 +543,110 @@ one written by a finalize over a predecessor the peer pruned, or one an
 eviction stripped of its predecessor's rows, is recorded over an unlanded
 predecessor: the pruned case is limit (4), the eviction L2's guard.
 
-## The dead letters (bsv-low #576)
+## The dead letters (bsv-low #576, and its lens fold of 2026-10-08)
 
 A mutation the queue dead-letters (a `/submit` or `/arc-ingest` replay that
 was not durable on any of its 1 + `max_retries` deliveries, an e1d "not now"
-over a predecessor that does not land included) is never lost and never
-re-driven blind (`dead_letters.rs`). The main consumer notes each failed
-replay's fault and attempt on a `failing` row (the platform gives a Rust
-consumer no delivery count) and resolves the row on an ack. The DLQ consumer
-(the same `#[event(queue)]`, branched on a queue name ending `-dlq`; bound in
-`wrangler.toml`, prod and beta of `wrangler.low.toml`, `max_batch_size = 10`,
-`max_retries = 10`, no DLQ of its own) PARKS the message as is in
-`mutation_dead_letters` (key: subject txid by D5 and the sorted topics; the
-fault, the attempts, `parked_at`, a history entry per park), once: a
-redelivery of a parked letter changes nothing. Nothing deletes from the table
-(never-wipe, rebuild `lost`: once the DLQ acks, the row is the only copy).
+over a predecessor that does not land included) is never lost unseen and
+never re-driven blind (`dead_letters.rs`). The main consumer notes each
+failed replay's fault and attempt on a SMALL `failing` row (no message
+bytes: the queue holds them) and DELETES the key's row on an ack (its bytes
+landed; the one scoped delete of this never-wipe table,
+`storage-ownership.json`'s `delete_scope`; a parked or re-driven letter so
+resolved is counted `dead_letters_resolved_total`). It hands back, never
+acks, a body that does not decode and a BEEF that is not base64 (lens N4:
+they were acked silently), so they dead-letter and are parked too.
+
+The DLQ consumer is the Worker's `queue` export, written out in `lib.rs` as
+worker-macros' `event(queue)` writes it, so it gets the platform's own
+message objects and reads `attempts` (workers-rs 0.8.5's `Message` hides
+it); it branches on a queue name ending `-dlq` (bound in `wrangler.toml`,
+prod and beta of `wrangler.low.toml`: `max_batch_size = 10`, `max_retries =
+100`, the platform's maximum, `retry_delay = 300`, no DLQ of its own). It
+PARKS the message as is in `mutation_dead_letters` (key: subject txid by D5
+and the sorted topics; the fault, the attempts, `parked_at`, a history entry
+per park, at most 20 kept). PARK FIRST, ACK AFTER: a message is acked only
+after its park answered. A park that faults (D1 down, the binding or the
+migrations included: the batch no longer throws) is handed back with 60 s
+doubling to 30 min from the platform's count (about 48 h over the 100
+retries; an hour's outage is ridden by the 6th); its LAST delivery's fault
+logs `[dead-letters] LOST <txid> [<topics>] sha256=<bytes' hash>` and counts
+`dead_letters_lost_total` (best effort: D1 is usually what faulted). Lens
+H1: Cloudflare's queue docs give `retry_delay` no default and the base set
+none, so a minute of D1 trouble lost every letter in the DLQ. A redelivery
+of the same bytes changes nothing; ANOTHER copy of a parked key (a resubmit,
+a different carried ancestry) keeps the LONGER bytes and leaves a `copy`
+history entry (lens L2). At most 2000 letters hold bytes (`parked` +
+`redriven`; a row is one queue message, at most 128 KB, and 20 history
+entries): a NEW letter past that is not parked, it is handed back with the
+same backoff, counted `dead_letters_ceiling_deferred_total`, shown as
+`ceiling.full`, and LOST after ~48 h at the ceiling (lens M2: a stranger's
+"not now" bodies, limit (4) above, fill the ceiling, not the shared D1).
 
 `POST /internal/redrive-dead-letters` (bearer `INTERNAL_TOKEN`, as
-`/internal/reorg`), body `{"limit"?: n, "txid"?: "<key>"}`: `limit` default
-25, clamped to 200; reads the oldest parked rows (or one txid's), claims each
-by a compare-and-set (`status = 'parked' AND redrives = <read>`) and only then
-sends it once to `MUTATION_QUEUE` as a fresh message (its attempt count reset
-to 0: 1 + `max_retries` deliveries again), stamped `reason = "redrive"` and
-its key, so a re-death parks the SAME row with its history. Two calls never
-enqueue one letter twice; a send fault reverts the claim. A letter re-driven
-`MAX_REDRIVES` (3) times that parks again is exhausted: never selected again,
-listed in `/health/invariants.deadLetters.exhausted` (with the counts by
-status, the oldest parked and the last re-drive). Counters
-`dead_letters_parked_total`, `dead_letters_redriven_total`,
-`dead_letters_still_failing_total`. Nothing re-drives on its own (S2: a dead
-letter is the operator's decision). Reference parity: ts-stack's
-`overlay-express` has no queue and no dead letter; this lifecycle is our
-platform's addition. Limits, stated: eleven D1 faults in a row on the DLQ
-consumer's park lose that letter (logged with its txid); a claimed letter
-whose send faulted and whose revert faulted too stays `redriven`, unsent,
-shown in the health counts. Pins: `cargo test --manifest-path
-workers/Cargo.toml -p bsv-overlay-cloudflare --lib e576`; the route tier
+`/internal/reorg`, compared in fixed time since the lens fold, L1), body
+`{"limit"?: n, "txid"?: "<key>", "force"?: true}`: `limit` default 25,
+clamped to 200. It first returns to `parked` every re-drive claimed more
+than 1 h ago that neither resolved nor parked again (a send that never
+left, an isolate that died after its claim, a re-driven message dropped on
+the way; lens M1), keeping its place and its spent re-drive, counted
+`dead_letters_stale_returned_total` and shown meanwhile as `staleRedriven`
+and `oldestRedriven`; a wrong verdict (the copy still in flight) sends a
+second copy, which is dedup-safe. Then it reads the oldest parked rows (or
+one txid's), claims each by a compare-and-set (`status = 'parked' AND
+redrives = <read>`) that RETURNS the bytes it claimed (lens L3), and only
+then sends those once to `MUTATION_QUEUE` as a fresh message (its attempt
+count reset to 0: 1 + `max_retries` deliveries again), stamped `reason =
+"redrive"` and its key, so a re-death parks the SAME row with its history.
+One claim is one enqueue; a send that answers an error but lands is
+reverted and can be sent again by a later call, two copies, dedup-safe
+(lens N2). A letter re-driven `MAX_REDRIVES` (3) times that parks again is
+exhausted: never selected again, listed in
+`/health/invariants.deadLetters.exhausted` (at most 20; `exhaustedCount` is
+the total) until the operator removes its cause and forces one more re-drive
+by txid (`"force": true`, recorded in its history; lens L5). The health
+block also shows the counts by status, `parkedLast24h`, the oldest parked
+and the last re-drive, from one index-only aggregate (lens L4, migrations
+166-167). Counters `dead_letters_parked_total`,
+`dead_letters_redriven_total`, `dead_letters_still_failing_total` and the
+four above. Nothing re-drives on its own (S2: a dead letter is the
+operator's decision).
+
+The register sentence (D17, lens N7): "A dead-lettered mutation is parked in
+D1 (`mutation_dead_letters`) by the worker's own DLQ consumer and re-driven
+only by the operator (`POST /internal/redrive-dead-letters`, bearer
+`INTERNAL_TOKEN`, at most 200 per call, oldest parked first, one enqueue per
+claim, at most 3 re-drives per letter then forced by txid, a stale claim
+returned after an hour, listed on `/health/invariants.deadLetters`).
+ts-stack's `overlay-express` has no queue and no dead letter (`Engine.submit`
+catches per topic and never replays): the whole lifecycle is our platform's
+addition, and so are its stated losses (a park that faults on every DLQ
+delivery for ~48 h, logged LOST; a new letter deferred at the ceiling for as
+long)."
+
+Limits, stated. The DLQ's retention must exceed the ~48 h window (the
+default is four days; the captain's `wrangler queues info` says). A
+`failing` note whose message the platform dropped stays, a small row,
+counted in `failing`. The stale rule cannot tell a lost re-drive from one
+whose replay is slow beyond an hour; its cost is a duplicate. Before deploy
+the DLQs must exist (`wrangler queues create overlay-mutations-dlq` for
+`wrangler.toml`, a NEW queue; the LOW ones were already the producers'
+`dead_letter_queue`) and no other worker may consume them (lens N3). The
+dead letters already in a DLQ at deploy park with `FAULT_UNRECORDED` (N5).
+The lever's budget at 200 letters is about 400 D1 queries and 200 sends,
+inside the paid plan's 1,000 queries per invocation; it is an operator route
+outside #499's census (N6). Pins: `cargo test --manifest-path
+workers/Cargo.toml -p bsv-overlay-cloudflare --lib e576` (the fold's
+`e576f_*`: H1's config and backoff, park-first and the LOST line, M1's
+stale return, M2's notes and acks and ceiling, L2 to L5, each RED on
+`f8b5525`; the main consumer's shape pin amended for N4) and
+`tip_pass::tests` (L1); the route tier
 `tools/lane-e576/dead_letter_route_ci.mjs` (`make ci-d1-budget`: a real
 "not now" successor dead-lettered and parked through the local queue, the
 lever's bearer, limit, one-enqueue claim and ceiling, a re-park with its
-history, the health block), RED on `835b80c`.
+history, the health block, RED on `835b80c`; the fold's legs 6 to 9, the
+new health fields, a stale re-drive returned and re-driven, a forced
+re-drive, a bad-base64 replay parked, RED on `f8b5525`).
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 

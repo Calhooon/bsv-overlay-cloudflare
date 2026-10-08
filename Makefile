@@ -398,7 +398,8 @@ ci-route: ci-d1-budget
 # Then bsv-low #576's dead-letter cell (`tools/lane-e576`, the overlay given `INTERNAL_TOKEN`): a real "not now"
 # successor dead-lettered through the local queue and PARKED in `mutation_dead_letters`, the lever's bearer, its
 # limit, its one-enqueue claim and its ceiling over seeded letters, a re-driven letter parked again with its
-# history, and `/health/invariants.deadLetters`.
+# history, and `/health/invariants.deadLetters`; the lens fold's legs: the new health fields, a stale re-drive
+# returned and re-driven, a forced re-drive of an exhausted letter, a bad-base64 replay dead-lettered and parked.
 #
 # Ports: LANE_BASE+9 (app layer) and LANE_BASE+10 (overlay), :8800 and :8801 by default; the same pre-flight,
 # bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network: no
