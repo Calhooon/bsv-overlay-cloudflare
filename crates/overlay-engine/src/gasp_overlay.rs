@@ -45,6 +45,13 @@ use tracing::{debug, error, warn};
 use crate::gasp::{GASPError, GASPStorage};
 use crate::storage::Storage;
 use crate::topic_manager::TopicManager;
+
+/// The most store reads [`OverlayGASPStorage::find_needed_inputs`] spends
+/// on asking whether an admitted node's named inputs have LANDED (E1D's
+/// re-ask; the E1D lens fold, L3): two per transaction at most (its applied
+/// row, then its held outputs). A transaction past it is requested from the
+/// peer. The figure is the door's own per-topic bound (`PREDECESSOR_READS`).
+const LANDED_READS_PER_NODE: usize = 16;
 use crate::types::{
     GASPInputRequest, GASPNode, GASPNodeResponse, GASPOutput, SubmitMode, TopicAdmittanceContext,
 };
@@ -709,33 +716,53 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         // landing is unknown (E1D): one whose transaction has an applied row
         // in the topic, or an output held there, has landed, and the walk
         // stops as the reference's. A read that faults keeps the input: one
-        // round trip to the peer is the cheaper error.
+        // round trip to the peer is the cheaper error. So does a transaction
+        // past [`LANDED_READS_PER_NODE`] (the E1D lens fold, L3: a manager
+        // names as many inputs as it likes, D14's decoys included, and each
+        // costs up to two reads): it is requested, and a landed one the peer
+        // serves is a dupe at its finalize submit.
         if admitted {
-            let mut landed = Vec::new();
-            for outpoint in requested_inputs.keys() {
+            let mut landed: HashSet<String> = HashSet::new();
+            let mut unlanded: HashSet<String> = HashSet::new();
+            let mut reads = 0usize;
+            let mut outpoints: Vec<&String> = requested_inputs.keys().collect();
+            outpoints.sort();
+            for outpoint in outpoints {
                 let Some((txid, _)) = crate::gasp::parse_outpoint(outpoint) else {
                     continue;
                 };
+                if landed.contains(&txid) || unlanded.contains(&txid) {
+                    continue;
+                }
+                if reads + 2 > LANDED_READS_PER_NODE {
+                    break;
+                }
+                reads += 1;
                 let record = crate::types::AppliedTransaction {
                     txid: txid.clone(),
                     topic: self.topic.clone(),
                 };
-                let applied = matches!(
+                let mut holds = matches!(
                     self.storage.does_applied_transaction_exist(&record).await,
                     Ok(true)
                 );
-                let holds = applied
-                    || matches!(
+                if !holds {
+                    reads += 1;
+                    holds = matches!(
                         self.storage.find_outputs_for_transaction(&txid, false).await,
                         Ok(outputs) if outputs.iter().any(|o| o.topic == self.topic)
                     );
+                }
                 if holds {
-                    landed.push(outpoint.clone());
+                    landed.insert(txid);
+                } else {
+                    unlanded.insert(txid);
                 }
             }
-            for key in &landed {
-                requested_inputs.remove(key);
-            }
+            requested_inputs.retain(|outpoint, _| {
+                crate::gasp::parse_outpoint(outpoint)
+                    .is_none_or(|(txid, _)| !landed.contains(&txid))
+            });
         }
 
         if requested_inputs.is_empty() {

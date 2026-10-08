@@ -46,7 +46,7 @@ The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` r
 |---|---|---|---|---|---|---|
 | `outputs` | overlay-cloudflare | none | none | chain | no | re-admission or a GASP peer re-feeds it; chain bytes |
 | `transactions` | overlay-cloudflare | none | low-app-layer | chain | no | the BEEF ancestry `/beef` and `/credit-beef` serve; a wipe is a re-fetch, not a loss |
-| `applied_transactions` | overlay-cloudflare | none | none | chain | no | dedup marks, re-derived on re-admission |
+| `applied_transactions` | overlay-cloudflare | none | none | chain | no | dedup marks, re-derived on re-admission; the successor rule reads a row as landed (bsv-low #575), so never wiped without `outputs` |
 | `low_records` | overlay-cloudflare | none | none | chain | no | lobby ads ride on chain |
 | `reveal_records` | overlay-cloudflare | none | none | chain | no | on chain; the tower's reveal scan falls back to the couriers, a wipe degrades, never concedes |
 | `pot_records` | overlay-cloudflare | low-app-layer: ALTER | low-app-layer | chain | **yes** | THE landing proof every credit reads (#470 section 3 item 7); every column re-derives from chain bytes only with a re-scan nobody has |
