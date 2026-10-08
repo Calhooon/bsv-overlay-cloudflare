@@ -2,6 +2,7 @@
 //! transactions to SHIP peers and to the BSV network via ARC.
 
 use async_trait::async_trait;
+use overlay_discovery::arcade_words::{arcade_verdict, ArcadeVerdict};
 use overlay_engine::broadcaster::{ArcBroadcaster, Broadcaster};
 use overlay_engine::types::TaggedBEEF;
 
@@ -986,7 +987,7 @@ pub(crate) const OVERLAY_USER_AGENT: &str = "low-overlay/1.0 (+https://bsvarcade
 /// it (btc-relay-rs arcade-v2-integration.md §4).
 pub(crate) const ARCADE_GATE_STATUS: &str = "SEEN_ON_NETWORK";
 
-/// Arcade statuses that are hard rejects — never wait these out, never admit.
+/// Arcade's hard rejects (REJECTED, DOUBLE_SPEND_ATTEMPTED) — never wait these out, never admit.
 ///
 /// #214 — **Arcade REJECTED is never authoritative uncorroborated.** On
 /// 2026-07-20/21 Arcade-v2-us-1's stale validator view reported REJECTED for
@@ -1001,9 +1002,14 @@ pub(crate) const ARCADE_GATE_STATUS: &str = "SEEN_ON_NETWORK";
 /// ladder, which treats a non-MINED Arcade answer as merely "no proof here",
 /// never as terminal).
 /// pub(crate) since INCIDENT D1-CALLBACK-FLOOD 2026-09-01: `/arc-ingest`
-/// matches webhook statuses against this same set to RECORD terminal verdicts
+/// matches webhook statuses against this same reading to RECORD terminal verdicts
 /// (evidence intake only — the corroboration bar above is unchanged).
-pub(crate) const ARCADE_FATAL_STATUSES: &[&str] = &["REJECTED", "DOUBLE_SPEND_ATTEMPTED"];
+/// P0-2d (bsv-stack-lean #52): read through the one verdict function
+/// (`overlay_discovery::arcade_words`), so a lower-case `rejected` is the same
+/// refusal as `REJECTED`.
+pub(crate) fn is_arcade_fatal(tx_status: &str) -> bool {
+    arcade_verdict(tx_status).is_refusal()
+}
 
 /// Give up waiting for propagation after this long — the tx was submitted but
 /// never became demonstrably SEEN, so the caller must NOT admit it (fail-closed).
@@ -1025,8 +1031,10 @@ const ARCADE_SEEN_GRACE_MS: u64 = 6_000;
 /// Poll `GET /tx/{txid}` at this cadence while gating.
 const ARCADE_POLL_INTERVAL_MS: u64 = 2_000;
 
-/// Rank Arcade lifecycle statuses so "target or better" comparisons work.
-/// Unknown statuses rank lowest (0).
+/// Rank ARC lifecycle statuses so "target or better" comparisons work.
+/// Unknown statuses rank lowest (0). Since P0-2d (bsv-stack-lean #52) only
+/// the ARC corroborator ranks with this; Arcade's words are read by
+/// [`classify_arcade_status`] through `overlay_discovery::arcade_words`.
 fn arcade_status_rank(status: &str) -> u8 {
     match status {
         "RECEIVED" => 1,
@@ -1065,22 +1073,22 @@ pub(crate) enum GateVerdict {
     Pending,
 }
 
-pub(crate) fn classify_arcade_status(status: &str, target: &str) -> GateVerdict {
-    // #267: the orphan check comes FIRST — the same orphan-before-anything
-    // ordering `arc_verdict`/`corroborator_verdict` use (and whose absence in
-    // the TS mirror is the client half of #267). `SEEN_IN_ORPHAN_MEMPOOL`
-    // contains "SEEN": any rule that consulted the text before the orphan
-    // check could mistake an orphan-pool view for a network accept.
-    if status.to_ascii_uppercase().contains("ORPHAN") {
-        return GateVerdict::Orphan;
+///
+/// P0-2d (bsv-stack-lean #52): one word, one verdict, through
+/// `overlay_discovery::arcade_words::arcade_verdict` (any letter case). The
+/// gate's bar is [`ARCADE_GATE_STATUS`] or better: seen, in a block
+/// (STUMP_PROCESSING) or mined. #267: the orphan check comes FIRST inside the
+/// verdict function — `SEEN_IN_ORPHAN_MEMPOOL` contains "SEEN", and an
+/// orphan-pool view is never a network accept. A word Arcade does not define
+/// is no answer: Pending (never admits, never refuses; the ladder ends at the
+/// second broadcaster).
+pub(crate) fn classify_arcade_status(status: &str) -> GateVerdict {
+    match arcade_verdict(status) {
+        ArcadeVerdict::Orphan => GateVerdict::Orphan,
+        v if v.is_refusal() => GateVerdict::Fatal,
+        v if v.network_holds() => GateVerdict::Reached,
+        _ => GateVerdict::Pending,
     }
-    if ARCADE_FATAL_STATUSES.contains(&status) {
-        return GateVerdict::Fatal;
-    }
-    if arcade_status_rank(target) > 0 && arcade_status_rank(status) >= arcade_status_rank(target) {
-        return GateVerdict::Reached;
-    }
-    GateVerdict::Pending
 }
 
 /// Async sleep via JS `setTimeout` (Cloudflare Workers runtime). Compiles on the
@@ -2299,11 +2307,7 @@ impl ArcadeBroadcaster {
             .as_ref()
             .is_some_and(|r| r.txid.eq_ignore_ascii_case(subject_txid));
         let probe_status = probe.as_ref().map(|r| r.tx_status.as_str()).unwrap_or("");
-        if probe_is_subject
-            && matches!(
-                classify_arcade_status(probe_status, ARCADE_GATE_STATUS),
-                GateVerdict::Reached
-            )
+        if probe_is_subject && matches!(classify_arcade_status(probe_status), GateVerdict::Reached)
         {
             gate_log(&format!(
                 "[arcade] {subject_txid} already >= {ARCADE_GATE_STATUS} (pre-flight probe) — ladder + callback re-registration skipped"
@@ -2321,12 +2325,7 @@ impl ArcadeBroadcaster {
         // not a corroborating broadcaster: a broadcaster answers a known txid
         // with its stored status, and that echo readmitted a refused JOIN's
         // evicted pot six hours after the network settled against it.
-        if probe_is_subject
-            && matches!(
-                classify_arcade_status(probe_status, ARCADE_GATE_STATUS),
-                GateVerdict::Fatal
-            )
-        {
+        if probe_is_subject && matches!(classify_arcade_status(probe_status), GateVerdict::Fatal) {
             let started = worker::js_sys::Date::now();
             let extra_info = probe.as_ref().map(|r| r.extra_info.as_str()).unwrap_or("");
             let (mut presence, mut source) = self.terminal_presence(subject_txid, started).await;
@@ -2462,7 +2461,7 @@ impl ArcadeBroadcaster {
                         parsed.txid
                     ));
                 }
-                match classify_arcade_status(&parsed.tx_status, ARCADE_GATE_STATUS) {
+                match classify_arcade_status(&parsed.tx_status) {
                     GateVerdict::Reached => {
                         worker::console_log!(
                             "[arcade] {subject_txid} accepted at {} (no poll needed)",
@@ -2643,7 +2642,7 @@ impl ArcadeBroadcaster {
                 // GATE on `tx_status` ONLY — never `extra_info` (stale-extraInfo
                 // trap, #213: a recovered orphan returns a healthy status with
                 // the OLD failure extraInfo still attached).
-                match classify_arcade_status(&resp.tx_status, ARCADE_GATE_STATUS) {
+                match classify_arcade_status(&resp.tx_status) {
                     GateVerdict::Reached => {
                         worker::console_log!(
                             "[arcade] {txid} reached {} (polled {waited} ms)",
@@ -2704,10 +2703,7 @@ impl ArcadeBroadcaster {
         match self.tx_status(txid).await {
             Some(r) => {
                 r.txid.eq_ignore_ascii_case(txid)
-                    && matches!(
-                        classify_arcade_status(&r.tx_status, "SEEN_ON_NETWORK"),
-                        GateVerdict::Reached
-                    )
+                    && matches!(classify_arcade_status(&r.tx_status), GateVerdict::Reached)
             }
             None => false,
         }
@@ -2720,7 +2716,7 @@ impl ArcadeBroadcaster {
     pub(crate) async fn witness_look(&self, txid: &str) -> WitnessLook {
         match self.tx_status(txid).await {
             Some(r) if r.txid.eq_ignore_ascii_case(txid) => {
-                match classify_arcade_status(&r.tx_status, ARCADE_GATE_STATUS) {
+                match classify_arcade_status(&r.tx_status) {
                     GateVerdict::Reached => WitnessLook::Seen(r.tx_status),
                     GateVerdict::Fatal => WitnessLook::Fatal(r.tx_status, r.extra_info),
                     GateVerdict::Orphan => WitnessLook::Orphan(r.tx_status),
@@ -4361,7 +4357,7 @@ mod tests {
         // hand. It must classify Orphan — and NEVER Reached, even though the
         // status text contains "SEEN" (the orphan check runs first).
         assert_eq!(
-            classify_arcade_status("SEEN_IN_ORPHAN_MEMPOOL", ARCADE_GATE_STATUS),
+            classify_arcade_status("SEEN_IN_ORPHAN_MEMPOOL"),
             GateVerdict::Orphan
         );
         // The rank stays 0: an orphan view can never satisfy the SEEN gate
@@ -4369,17 +4365,11 @@ mod tests {
         assert_eq!(arcade_status_rank("SEEN_IN_ORPHAN_MEMPOOL"), 0);
         // Healthy and fatal classifications are untouched.
         assert_eq!(
-            classify_arcade_status("SEEN_ON_NETWORK", ARCADE_GATE_STATUS),
+            classify_arcade_status("SEEN_ON_NETWORK"),
             GateVerdict::Reached
         );
-        assert_eq!(
-            classify_arcade_status("REJECTED", ARCADE_GATE_STATUS),
-            GateVerdict::Fatal
-        );
-        assert_eq!(
-            classify_arcade_status("RECEIVED", ARCADE_GATE_STATUS),
-            GateVerdict::Pending
-        );
+        assert_eq!(classify_arcade_status("REJECTED"), GateVerdict::Fatal);
+        assert_eq!(classify_arcade_status("RECEIVED"), GateVerdict::Pending);
     }
 
     #[test]
@@ -4866,27 +4856,21 @@ mod tests {
     #[test]
     fn arcade_classify_gates_on_seen_and_above() {
         assert_eq!(
-            classify_arcade_status("ACCEPTED_BY_NETWORK", ARCADE_GATE_STATUS),
+            classify_arcade_status("ACCEPTED_BY_NETWORK"),
             GateVerdict::Pending
         );
         assert_eq!(
-            classify_arcade_status("SEEN_ON_NETWORK", ARCADE_GATE_STATUS),
+            classify_arcade_status("SEEN_ON_NETWORK"),
             GateVerdict::Reached
         );
-        assert_eq!(
-            classify_arcade_status("MINED", ARCADE_GATE_STATUS),
-            GateVerdict::Reached
-        );
+        assert_eq!(classify_arcade_status("MINED"), GateVerdict::Reached);
     }
 
     #[test]
     fn arcade_classify_rejects_and_double_spend_are_fatal() {
+        assert_eq!(classify_arcade_status("REJECTED"), GateVerdict::Fatal);
         assert_eq!(
-            classify_arcade_status("REJECTED", ARCADE_GATE_STATUS),
-            GateVerdict::Fatal
-        );
-        assert_eq!(
-            classify_arcade_status("DOUBLE_SPEND_ATTEMPTED", ARCADE_GATE_STATUS),
+            classify_arcade_status("DOUBLE_SPEND_ATTEMPTED"),
             GateVerdict::Fatal
         );
     }
@@ -4927,7 +4911,7 @@ mod tests {
         let parsed: ArcadeStatusResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.txid, "abc123");
         assert_eq!(
-            classify_arcade_status(&parsed.tx_status, ARCADE_GATE_STATUS),
+            classify_arcade_status(&parsed.tx_status),
             GateVerdict::Pending
         );
     }

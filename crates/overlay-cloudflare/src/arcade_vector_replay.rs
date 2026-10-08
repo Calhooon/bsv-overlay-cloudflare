@@ -6,9 +6,8 @@
 //! status word on each surface, the intake refusals and the two reorg
 //! payloads (arcade@1ae1208). Its `engine_*` columns are the verdicts this
 //! crate must give:
-//! - `engine_gate`: [`classify_arcade_status`] against the gate's target, the
-//!   word every gate path (the submit echo, the poll, the probe, the witness
-//!   look) reads;
+//! - `engine_gate`: [`classify_arcade_status`], the reading every gate path
+//!   (the submit echo, the poll, the probe, the witness look) calls;
 //! - `engine_callback`: an `/arc-ingest` body through
 //!   [`classify_arc_ingest_body`] and [`callback_action`] (a body with a
 //!   `merklePath` is the proof arm and carries no callback column);
@@ -21,7 +20,6 @@
 use crate::admit_fast::{callback_action, CallbackAction};
 use crate::broadcaster::{
     classify_arcade_status, classify_submit_response, GateVerdict, SubmitOutcome,
-    ARCADE_GATE_STATUS,
 };
 use crate::proof_fetcher::{parse_arcade_proof_look, rfc3339_utc_ms, ArcadeProofLook};
 use crate::routes::{classify_arc_ingest_body, ArcIngestBody};
@@ -45,7 +43,7 @@ fn body(case: &serde_json::Value) -> String {
 }
 
 fn gate(word: &str) -> &'static str {
-    match classify_arcade_status(word, ARCADE_GATE_STATUS) {
+    match classify_arcade_status(word) {
         GateVerdict::Reached => "reached",
         GateVerdict::Fatal => "fatal",
         GateVerdict::Orphan => "orphan",
@@ -115,11 +113,17 @@ fn replay() -> (Vec<String>, usize) {
         }
         if expect.get("engine_submit").is_some() {
             let http = case["http"].as_u64().unwrap() as u16;
-            check("engine_submit", submit(classify_submit_response(http, &raw)));
+            check(
+                "engine_submit",
+                submit(classify_submit_response(http, &raw)),
+            );
         }
         if expect.get("engine_proof").is_some() {
             let http = case["http"].as_u64().unwrap() as u16;
-            check("engine_proof", proof(parse_arcade_proof_look(http, &raw, now_ms)));
+            check(
+                "engine_proof",
+                proof(parse_arcade_proof_look(http, &raw, now_ms)),
+            );
         }
         if case["surface"] == "push" && expect.get("engine_callback").is_none() {
             // a push with a path is the proof arm, never a status-only callback
@@ -128,7 +132,9 @@ fn replay() -> (Vec<String>, usize) {
                 classify_arc_ingest_body(&raw).unwrap(),
                 ArcIngestBody::Proof { .. }
             ) {
-                wrong.push(format!("{name}: a push with a merklePath read as status-only"));
+                wrong.push(format!(
+                    "{name}: a push with a merklePath read as status-only"
+                ));
             }
         }
     }
@@ -138,7 +144,10 @@ fn replay() -> (Vec<String>, usize) {
 #[test]
 fn every_engine_column_of_the_arcade_vector_holds() {
     let (wrong, checks) = replay();
-    assert_eq!(checks, 75, "the vector's engine columns (marker aside) and the proof-arm pushes");
+    assert_eq!(
+        checks, 75,
+        "the vector's engine columns (marker aside) and the proof-arm pushes"
+    );
     assert!(
         wrong.is_empty(),
         "{} of {checks} Arcade verdicts wrong in overlay-cloudflare:\n  {}",

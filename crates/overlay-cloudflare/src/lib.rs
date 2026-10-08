@@ -9,8 +9,6 @@ pub mod admit_fast;
 pub mod advert_lifecycle;
 pub mod advertiser;
 pub mod arcade_reorg;
-#[cfg(test)]
-mod arcade_vector_replay;
 pub mod ban_storage;
 pub mod broadcaster;
 pub mod chain_tracker;
@@ -2361,3 +2359,9 @@ mod tests {
         assert_eq!(out, None, "a hung step must yield to the deadline");
     }
 }
+
+// P0-2d (bsv-stack-lean #52): the Arcade status vector replayed through the
+// readings above. Declared last: the source pins read this file up to its
+// first `#[cfg(test)]`.
+#[cfg(test)]
+mod arcade_vector_replay;

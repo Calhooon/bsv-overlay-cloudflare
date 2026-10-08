@@ -56,21 +56,17 @@ pub enum CallbackAction {
     Ignore,
 }
 
-const SEEN_OR_BETTER: &[&str] = &[
-    "SEEN_ON_NETWORK",
-    "SEEN_MULTIPLE_NODES",
-    "MINED",
-    "IMMUTABLE",
-];
-
+/// P0-2d (bsv-stack-lean #52): through the one verdict function
+/// (`overlay_discovery::arcade_words`), the gate's own reading: seen, in a
+/// block (STUMP_PROCESSING) or mined triggers the live read; a refusal or any
+/// ORPHAN word is corroborated; pending, parked and an undefined word do
+/// nothing.
 pub fn callback_action(tx_status: &str) -> CallbackAction {
-    let s = tx_status.trim().to_ascii_uppercase();
-    if SEEN_OR_BETTER.contains(&s.as_str()) {
-        return CallbackAction::LatchSeen;
-    }
-    match s.as_str() {
-        "DOUBLE_SPEND_ATTEMPTED" | "REJECTED" | "SEEN_IN_ORPHAN_MEMPOOL" => {
-            CallbackAction::EvidenceCheck(s)
+    use overlay_discovery::arcade_words::{arcade_verdict, ArcadeVerdict};
+    match arcade_verdict(tx_status) {
+        v if v.network_holds() => CallbackAction::LatchSeen,
+        ArcadeVerdict::Rejected | ArcadeVerdict::Conflict | ArcadeVerdict::Orphan => {
+            CallbackAction::EvidenceCheck(tx_status.trim().to_ascii_uppercase())
         }
         _ => CallbackAction::Ignore,
     }

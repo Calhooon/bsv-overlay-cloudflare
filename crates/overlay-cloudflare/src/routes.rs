@@ -2599,7 +2599,7 @@ pub async fn arc_ingest(
                     hint.faults as u64,
                 )
                 .await;
-                if crate::broadcaster::ARCADE_FATAL_STATUSES.contains(&status_upper.as_str()) {
+                if crate::broadcaster::is_arcade_fatal(&status_upper) {
                     crate::ops::record_arc_terminal(
                         db,
                         &txid,
@@ -4868,8 +4868,7 @@ mod tests {
                 extra_info,
             } => {
                 assert_eq!(txid, CB_TXID);
-                assert!(crate::broadcaster::ARCADE_FATAL_STATUSES
-                    .contains(&tx_status.to_ascii_uppercase().as_str()));
+                assert!(crate::broadcaster::is_arcade_fatal(&tx_status));
                 assert_eq!(
                     extra_info.as_deref(),
                     Some("UTXO_SPENT (70): spent by deadbeef")
@@ -4885,8 +4884,7 @@ mod tests {
                 extra_info,
                 ..
             } => {
-                assert!(!crate::broadcaster::ARCADE_FATAL_STATUSES
-                    .contains(&tx_status.to_ascii_uppercase().as_str()));
+                assert!(!crate::broadcaster::is_arcade_fatal(&tx_status));
                 assert_eq!(extra_info, None);
             }
             other => panic!("got {other:?}"),
