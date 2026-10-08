@@ -984,7 +984,7 @@ pub(crate) const OVERLAY_USER_AGENT: &str = "low-overlay/1.0 (+https://bsvarcade
 /// Gate admission on this status (or better). `SEEN_ON_NETWORK` lands ~3s after
 /// submit and is reliable; `SEEN_MULTIPLE_NODES` is erratic so we do NOT gate on
 /// it (btc-relay-rs arcade-v2-integration.md §4).
-const ARCADE_GATE_STATUS: &str = "SEEN_ON_NETWORK";
+pub(crate) const ARCADE_GATE_STATUS: &str = "SEEN_ON_NETWORK";
 
 /// Arcade statuses that are hard rejects — never wait these out, never admit.
 ///
@@ -1045,7 +1045,7 @@ fn arcade_status_rank(status: &str) -> u8 {
 
 /// Classify one Arcade status against the gate target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GateVerdict {
+pub(crate) enum GateVerdict {
     /// Reached the target status (or better) → safe to admit.
     Reached,
     /// A fatal status (REJECTED / DOUBLE_SPEND_ATTEMPTED) → never admit.
@@ -1065,7 +1065,7 @@ enum GateVerdict {
     Pending,
 }
 
-fn classify_arcade_status(status: &str, target: &str) -> GateVerdict {
+pub(crate) fn classify_arcade_status(status: &str, target: &str) -> GateVerdict {
     // #267: the orphan check comes FIRST — the same orphan-before-anything
     // ordering `arc_verdict`/`corroborator_verdict` use (and whose absence in
     // the TS mirror is the client half of #267). `SEEN_IN_ORPHAN_MEMPOOL`
@@ -1220,7 +1220,7 @@ fn cascade_retryable(reason: &str) -> bool {
 
 /// Classified outcome of ONE Arcade EF submit POST (`POST /tx` | `POST /txs`).
 #[derive(Debug, PartialEq, Eq)]
-enum SubmitOutcome {
+pub(crate) enum SubmitOutcome {
     /// 2xx accept-for-processing — carries the response body for status parse.
     Processing(String),
     /// A SYNCHRONOUS, DEFINITIVE per-tx rejection (#213): `HTTP 400` carrying
@@ -1280,7 +1280,7 @@ enum GateStep {
 }
 
 /// Classify one Arcade submit HTTP response (#213). PURE — unit-tested.
-fn classify_submit_response(status: u16, body: &str) -> SubmitOutcome {
+pub(crate) fn classify_submit_response(status: u16, body: &str) -> SubmitOutcome {
     if (200..300).contains(&status) {
         return SubmitOutcome::Processing(body.to_string());
     }

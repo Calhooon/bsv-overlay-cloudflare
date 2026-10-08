@@ -9,6 +9,8 @@ pub mod admit_fast;
 pub mod advert_lifecycle;
 pub mod advertiser;
 pub mod arcade_reorg;
+#[cfg(test)]
+mod arcade_vector_replay;
 pub mod ban_storage;
 pub mod broadcaster;
 pub mod chain_tracker;
