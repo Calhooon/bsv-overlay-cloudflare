@@ -543,7 +543,7 @@ one written by a finalize over a predecessor the peer pruned, or one an
 eviction stripped of its predecessor's rows, is recorded over an unlanded
 predecessor: the pruned case is limit (4), the eviction L2's guard.
 
-## The dead letters (bsv-low #576, and its lens fold of 2026-10-08)
+## The dead letters (bsv-low #576, its lens fold and its delta fold of 2026-10-08)
 
 A mutation the queue dead-letters (a `/submit` or `/arc-ingest` replay that
 was not durable on any of its 1 + `max_retries` deliveries, an e1d "not now"
@@ -551,9 +551,10 @@ over a predecessor that does not land included) is never lost unseen and
 never re-driven blind (`dead_letters.rs`). The main consumer notes each
 failed replay's fault and attempt on a SMALL `failing` row (no message
 bytes: the queue holds them) and DELETES the key's row on an ack (its bytes
-landed; the one scoped delete of this never-wipe table,
-`storage-ownership.json`'s `delete_scope`; a parked or re-driven letter so
-resolved is counted `dead_letters_resolved_total`). It hands back, never
+landed, or were refused under an open eviction, and the `RESOLVED` line says
+which, delta fold D-L3; one of the two scoped deletes of this never-wipe
+table, `storage-ownership.json`'s `delete_scope`; a parked or re-driven
+letter so resolved is counted `dead_letters_resolved_total`). It hands back, never
 acks, a body that does not decode and a BEEF that is not base64 (lens N4:
 they were acked silently), so they dead-letter and are parked too.
 
@@ -576,12 +577,34 @@ H1: Cloudflare's queue docs give `retry_delay` no default and the base set
 none, so a minute of D1 trouble lost every letter in the DLQ. A redelivery
 of the same bytes changes nothing; ANOTHER copy of a parked key (a resubmit,
 a different carried ancestry) keeps the LONGER bytes and leaves a `copy`
-history entry (lens L2). At most 2000 letters hold bytes (`parked` +
+history entry (lens L2). The `PARKED`, copy and redelivery lines print the
+platform's `attempts=` (or `absent`; delta fold D-L2), so a drill that parks
+cleanly reads it. At most 2000 letters hold bytes (`parked` +
 `redriven`; a row is one queue message, at most 128 KB, and 20 history
 entries): a NEW letter past that is not parked, it is handed back with the
-same backoff, counted `dead_letters_ceiling_deferred_total`, shown as
-`ceiling.full`, and LOST after ~48 h at the ceiling (lens M2: a stranger's
-"not now" bodies, limit (4) above, fill the ceiling, not the shared D1).
+same backoff, counted once as a letter on its first DLQ delivery
+(`dead_letters_ceiling_deferred_total`, `attempts == 1`) and on every
+delivery (`dead_letters_ceiling_deferrals_total`, up to 101 per letter;
+delta fold D-L1), shown as `ceiling.full`, and LOST after ~48 h at the
+ceiling (lens M2: a stranger's "not now" bodies, limit (4) above, fill the
+ceiling, not the shared D1).
+
+The ceiling does not drain by itself (delta fold, D-M1): only an ack of a
+replay and the operator's discard take a letter out, and a letter that can
+never land (exhausted, `undecodable:`, `unparsed:`, a body the engine
+refuses for good) holds its place for ever. From 1600 letters (80 %) the
+health block says `ceiling.near` (with `nearAt`, `room`) and every park at
+or past it logs `[dead-letters] the ceiling is NEAR`. `POST
+/internal/discard-dead-letters` (the same bearer), body `{"letters":
+[{"txid": "<key>", "topics"?: "<sorted, comma-joined>"}, ...]}`, 1 to 50
+keys per call (more is a 400, not clamped), deletes those PARKED letters
+(no `topics`: every parked row of the txid; never a `redriven` letter in
+flight, never a `failing` note), the second scoped delete of the table
+(`DISCARD_SQL`), logs each `[dead-letters] DISCARDED <txid> [<topics>]
+sha256=<bytes' hash> bytes=<n>` with its re-drives and last fault, counts
+`dead_letters_discarded_total`, and answers `discarded` (with each hash),
+`notFound` and `faults`. A discarded letter's bytes exist nowhere after it:
+it is the operator's word, as a re-drive is.
 
 `POST /internal/redrive-dead-letters` (bearer `INTERNAL_TOKEN`, as
 `/internal/reorg`, compared in fixed time since the lens fold, L1), body
@@ -616,15 +639,27 @@ The register sentence (D17, lens N7): "A dead-lettered mutation is parked in
 D1 (`mutation_dead_letters`) by the worker's own DLQ consumer and re-driven
 only by the operator (`POST /internal/redrive-dead-letters`, bearer
 `INTERNAL_TOKEN`, at most 200 per call, oldest parked first, one enqueue per
-claim, at most 3 re-drives per letter then forced by txid, a stale claim
-returned after an hour, listed on `/health/invariants.deadLetters`).
-ts-stack's `overlay-express` has no queue and no dead letter (`Engine.submit`
-catches per topic and never replays): the whole lifecycle is our platform's
-addition, and so are its stated losses (a park that faults on every DLQ
-delivery for ~48 h, logged LOST; a new letter deferred at the ceiling for as
-long)."
+claim, at most 3 re-drives per letter then forced by txid, a claim older
+than an hour returned to the parked set by the NEXT lever call, listed on
+`/health/invariants.deadLetters`; at most 2000 letters hold bytes, a full
+ceiling drains only by an ack or the operator's discard by key, `POST
+/internal/discard-dead-letters`, at most 50 per call, each logged with the
+hash of its bytes). ts-stack's `overlay-express` has no queue and no dead
+letter (`Engine.submit` catches per topic and never replays): the whole
+lifecycle is our platform's addition, and so are its stated losses (a park
+that faults on every DLQ delivery for ~48 h, logged LOST, or for ~8.3 h
+with NO LOST line when the platform's `attempts` cannot be read, 101
+deliveries at the configured 300 s; a new letter deferred at the ceiling
+for as long, the ceiling filling for good with letters that never land
+unless the operator discards them; a discarded letter)."
 
-Limits, stated. The DLQ's retention must exceed the ~48 h window (the
+Limits, stated. The first deferral is read from `attempts == 1`: if the
+platform's count is absent, or does not restart at 1 on the DLQ move (the
+docs are silent; the drill's `attempts=` settles it),
+`dead_letters_ceiling_deferred_total` undercounts and the deferrals counter
+is the one to read. Exhausted letters still count toward the 2000 (the
+delta lens's optional separate cap is not built): the operator discards
+them. The DLQ's retention must exceed the ~48 h window (the
 default is four days; the captain's `wrangler queues info` says). A
 `failing` note whose message the platform dropped stays, a small row,
 counted in `failing`. The stale rule cannot tell a lost re-drive from one
@@ -635,7 +670,9 @@ the DLQs must exist (`wrangler queues create overlay-mutations-dlq` for
 dead letters already in a DLQ at deploy park with `FAULT_UNRECORDED` (N5).
 The lever's budget at 200 letters is about 400 D1 queries and 200 sends,
 inside the paid plan's 1,000 queries per invocation; it is an operator route
-outside #499's census (N6). Pins: `cargo test --manifest-path
+outside #499's census (N6); so is the discard lever (at most 50 deletes,
+each returning its letter's bytes, at most 128 KB, to hash them, and one
+counter). Pins: `cargo test --manifest-path
 workers/Cargo.toml -p bsv-overlay-cloudflare --lib e576` (the fold's
 `e576f_*`: H1's config and backoff, park-first and the LOST line, M1's
 stale return, M2's notes and acks and ceiling, L2 to L5, each RED on
@@ -646,7 +683,15 @@ stale return, M2's notes and acks and ceiling, L2 to L5, each RED on
 lever's bearer, limit, one-enqueue claim and ceiling, a re-park with its
 history, the health block, RED on `835b80c`; the fold's legs 6 to 9, the
 new health fields, a stale re-drive returned and re-driven, a forced
-re-drive, a bad-base64 replay parked, RED on `f8b5525`).
+re-drive, a bad-base64 replay parked, RED on `f8b5525`). The delta fold's
+pins `e576f2_*` (`m1` a full ceiling, a discard by key that spares a
+re-drive in flight, a failing note and another key, then the next letter
+parked, and the near line; `m1` the discard body; `l1` one letter, 101
+deferrals; `l2` `attempts=` on the three ack lines; `l3` the `RESOLVED`
+words per reason), each RED on `28f5d0b` (they do not compile there) and
+against its fix reverted alone, and the route tier's leg 10 (a
+full ceiling defers a real dead letter, the discard lever's bearer and
+body, a discard, the letter then parked; RED on `28f5d0b`).
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 
