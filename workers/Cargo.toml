@@ -42,11 +42,8 @@ async-trait = "0.1"
 hex = "0.4"
 tracing = "0.1"
 
-# bsv-low #441 (2026-09-10): the session lane needs bsv-middleware-cloudflare 0.3.4
-# (`session-lane`), NOT PUBLISHED yet. A git REV on the public lineage branch (never a
-# path to a sibling checkout, #439's class) until the publish, which replaces this
-# block with the registry 0.3.4 (the owner's word).
-[patch.crates-io]
-# 0.3.5 (bsv-low #493, 2026-09-20): the lane's 64-bit replay window rides as a decimal string across the
-# AuthSessionStore DO's storage put (a u64 as a JS number threw past 2^53 on the 54th laned call).
-bsv-middleware-cloudflare = { git = "https://github.com/Calhooon/bsv-middleware-cloudflare", rev = "9394c74" }
+# bsv-middleware-cloudflare: the registry release, no `[patch]` (bsv-low #577,
+# 2026-10-08). The session lane rode a git rev here from bsv-low #441 (0.3.4,
+# `session-lane`) to #493 (0.3.5, rev 9394c74) until 0.3.7 folded that branch into
+# main; the members ask "0.3" and the lock holds 0.3.8 (main c39642f, which wires
+# `verify_brc29_payment_output` into the middleware's own payment path). Never 0.3.7.
