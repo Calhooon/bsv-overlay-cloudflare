@@ -1485,7 +1485,7 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // -2026-09-01.md in bsv-low): terminal broadcast verdicts become STATE.
     //
     // `arc_terminal`: one row per txid whose broadcaster reported a TERMINAL
-    // status (REJECTED / DOUBLE_SPEND_ATTEMPTED — `ARCADE_FATAL_STATUSES`).
+    // status (REJECTED / DOUBLE_SPEND_ATTEMPTED — `broadcaster::is_arcade_fatal`).
     // Written by `/arc-ingest` (the webhook already DELIVERED this verdict
     // ~99M times while the handler counted-and-discarded it) and by the
     // retire classifier's own poll. EVIDENCE, not a verdict: a row here never

@@ -22,6 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::arcade_words::ArcadeBlockStatus;
 use crate::pot::reorg::RowKey;
 
 /// One block Arcade reports ORPHANED: the durable form of a
@@ -120,16 +121,17 @@ pub fn parse_block_status_page(body: &str) -> Result<BlockStatusPage, String> {
         ..Default::default()
     };
     for row in blocks {
-        let status = row
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        if status == "active" {
+        let status = crate::arcade_words::arcade_block_status(
+            row.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        );
+        if status == ArcadeBlockStatus::Active {
             if let Some(h) = row.get("blockHeight").and_then(serde_json::Value::as_u64) {
                 page.newest_height = Some(page.newest_height.map_or(h, |m| m.max(h)));
             }
         }
-        if status != "orphaned" {
+        if status != ArcadeBlockStatus::Orphaned {
             continue;
         }
         let hash = row

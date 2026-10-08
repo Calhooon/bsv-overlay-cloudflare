@@ -38,6 +38,7 @@ use std::rc::Rc;
 
 use async_trait::async_trait;
 use bsv_rs::transaction::{Beef, ChainTracker, MerklePath, MerklePathLeaf, Transaction};
+use overlay_discovery::arcade_words::{arcade_verdict, ArcadeVerdict};
 use overlay_engine::gasp::{AncestorFetcher, FetchedAncestor, GASPError};
 
 /// WoC mainnet base URL (mainnet only).
@@ -1037,7 +1038,8 @@ pub(crate) fn rung_step(verdict: &BumpVerdict) -> RungStep {
 fn parse_arcade_merklepath(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let status = v.get("txStatus").and_then(|s| s.as_str()).unwrap_or("");
-    if status != "MINED" && status != "IMMUTABLE" {
+    // P0-2d (bsv-stack-lean #52): the one verdict function, any letter case
+    if arcade_verdict(status) != ArcadeVerdict::Mined {
         return None;
     }
     let mp = v.get("merklePath").and_then(|m| m.as_str())?;
@@ -1053,8 +1055,8 @@ fn parse_arcade_merklepath(body: &str) -> Option<String> {
 pub enum ArcadeProofLook {
     /// MINED / IMMUTABLE with a `merklePath`: the BUMP hex (the caller judges it against chaintracks).
     Mined(String),
-    /// Arcade holds the tx on the network unmined (`SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES`, the overlay's own
-    /// `SEEN_OR_BETTER` bar) and said so within [`ARCADE_WORD_FRESH_MS`]: no proof exists anywhere yet. Carries the
+    /// Arcade holds the tx on the network unmined (`SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES`, the seen class of
+    /// `overlay_discovery::arcade_words::arcade_verdict`) and said so within [`ARCADE_WORD_FRESH_MS`]: no proof exists anywhere yet. Carries the
     /// status for the log line.
     KnownUnmined(String),
     /// Everything else — the ladder goes on to the couriers (the gate's HIGH-1 / HIGH-2, 2026-09-17): Arcade does
@@ -1087,14 +1089,17 @@ pub fn parse_arcade_proof_look(status: u16, body: &str, now_ms: i64) -> ArcadePr
         .unwrap_or("")
         .trim()
         .to_ascii_uppercase();
-    if tx_status == "MINED" || tx_status == "IMMUTABLE" {
-        return match parse_arcade_merklepath(body) {
-            Some(bump_hex) => ArcadeProofLook::Mined(bump_hex),
-            None => ArcadeProofLook::Unknown,
-        };
-    }
-    if tx_status != "SEEN_ON_NETWORK" && tx_status != "SEEN_MULTIPLE_NODES" {
-        return ArcadeProofLook::Unknown;
+    match arcade_verdict(&tx_status) {
+        ArcadeVerdict::Mined => {
+            return match parse_arcade_merklepath(body) {
+                Some(bump_hex) => ArcadeProofLook::Mined(bump_hex),
+                None => ArcadeProofLook::Unknown,
+            };
+        }
+        ArcadeVerdict::Seen => {}
+        // STUMP_PROCESSING is in a block with no path yet: the couriers may
+        // hold one, so the ladder asks on
+        _ => return ArcadeProofLook::Unknown,
     }
     let fresh = v
         .get("timestamp")
@@ -3677,7 +3682,7 @@ pub async fn run_rebroadcast_backstop(
 /// to [`retire_verdict`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArcadeLook {
-    /// A terminal status (`ARCADE_FATAL_STATUSES`), with the reason text.
+    /// A terminal status (`broadcaster::is_arcade_fatal`), with the reason text.
     Fatal(String, String),
     /// Arcade does not know the txid (definitive 404).
     Missing,
@@ -3785,13 +3790,7 @@ pub(crate) async fn arcade_look(
                 extra_info: String,
             }
             match serde_json::from_str::<Look>(&body) {
-                Ok(l)
-                    if crate::broadcaster::ARCADE_FATAL_STATUSES
-                        .contains(&l.tx_status.to_ascii_uppercase().as_str()) =>
-                {
-                    ArcadeLook::Fatal(l.tx_status.to_ascii_uppercase(), l.extra_info)
-                }
-                Ok(l) if !l.tx_status.is_empty() => ArcadeLook::Present,
+                Ok(l) => live_arcade_look(&l.tx_status, l.extra_info),
                 _ => ArcadeLook::Fault,
             }
         }
@@ -3799,6 +3798,19 @@ pub(crate) async fn arcade_look(
         _ => ArcadeLook::Fault,
     };
     fold_arcade_look(live, webhook_evidence)
+}
+
+/// PURE: one live Arcade word (a 2xx `GET /tx/{txid}`) through the one verdict
+/// function (P0-2d, bsv-stack-lean #52): a refusal is `Fatal` (any letter
+/// case); a word Arcade does not define, empty included, is no answer, a
+/// `Fault` (the webhook evidence and the both-indexer bar decide, as behind an
+/// outage); every other defined word, an ORPHAN view among them, is `Present`.
+pub fn live_arcade_look(tx_status: &str, extra_info: String) -> ArcadeLook {
+    match arcade_verdict(tx_status) {
+        v if v.is_refusal() => ArcadeLook::Fatal(tx_status.trim().to_ascii_uppercase(), extra_info),
+        ArcadeVerdict::Invalid => ArcadeLook::Fault,
+        _ => ArcadeLook::Present,
+    }
 }
 
 /// PURE: the live Arcade answer wins; webhook evidence only fills a FAULT.
@@ -4383,6 +4395,36 @@ pub(crate) mod tests {
             ArcadeLook::Fatal("REJECTED".into(), "planted".into())
         );
         assert_eq!(fold_arcade_look(ArcadeLook::Fault, None), ArcadeLook::Fault);
+    }
+
+    /// P0-2d (bsv-stack-lean #52): the live look reads the one verdict
+    /// function. A refusal in any case is Fatal; an ORPHAN view or any other
+    /// defined word is Present; a word Arcade does not define is no answer
+    /// (Fault: the webhook evidence and the both-indexer bar decide).
+    #[test]
+    fn live_arcade_look_reads_the_one_verdict() {
+        let x = || "x".to_string();
+        for w in ["REJECTED", "rejected", " DOUBLE_SPEND_ATTEMPTED "] {
+            assert_eq!(
+                live_arcade_look(w, x()),
+                ArcadeLook::Fatal(w.trim().to_ascii_uppercase(), x()),
+                "{w:?}"
+            );
+        }
+        for w in [
+            "RECEIVED",
+            "PENDING_RETRY",
+            "UNKNOWN",
+            "SEEN_ON_NETWORK",
+            "STUMP_PROCESSING",
+            "immutable",
+            "SEEN_IN_ORPHAN_MEMPOOL",
+        ] {
+            assert_eq!(live_arcade_look(w, x()), ArcadeLook::Present, "{w:?}");
+        }
+        for w in ["", "NOT_A_STATUS", "MINED_IN_STALE_BLOCK", "STORED"] {
+            assert_eq!(live_arcade_look(w, x()), ArcadeLook::Fault, "{w:?}");
+        }
     }
 
     /// A minimal valid single-tx-block BUMP proving `txid` as the sole tx —
