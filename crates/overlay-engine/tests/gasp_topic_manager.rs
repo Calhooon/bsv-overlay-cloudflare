@@ -7422,3 +7422,95 @@ async fn e1d_delta_l1_a_landing_never_takes_a_predecessors_off_chain_values() {
         assert_eq!(applied_rows(&store, &nodes).await, [true; 3]);
     }
 }
+
+// The E1D delta-2 fold, L2 (bsv-low #575). The door asks the caller's landing
+// guard BEFORE it lands a carried predecessor: on `f057acc` the landing was
+// guarded after the write only (the worker's eviction ledger moved an evicted
+// predecessor out again after it was written and its lookup services told,
+// and the successor stayed recorded over it). A refused body writes nothing,
+// the successor's topic is "not now" (as on `683dffd`) and the guard is asked
+// once per body, ancestors included; its own fault refuses too. RED on
+// `f057acc` with an inert `set_landing_guard` grafted (both bodies landed).
+#[tokio::test]
+async fn e1d_fold3_l2_the_door_asks_the_landing_guard_before_it_lands() {
+    let (_logs, _guard) = capture_logs();
+    type Asked = Rc<RefCell<Vec<String>>>;
+    let guarded = |store: &Rc<MemoryStorage>, refuse: String, fault: bool, asked: &Asked| {
+        let mut engine = shape_door(store, true);
+        let asked = asked.clone();
+        engine.set_landing_guard(Rc::new(move |txid: &str, topic: &str| {
+            asked.borrow_mut().push(txid.to_string());
+            assert_eq!(topic, TOPIC);
+            let answer = if txid != refuse {
+                Ok(())
+            } else if fault {
+                Err("the ledger could not be read".to_string())
+            } else {
+                Err("under an OPEN eviction".to_string())
+            };
+            Box::pin(async move { answer })
+        }));
+        engine
+    };
+    // The carried predecessor itself refused, by a row and by a fault.
+    for fault in [false, true] {
+        let nodes = chain(3);
+        let store = Rc::new(MemoryStorage::new());
+        assert!(
+            submitted(&shape_door(&store, true), &proven_beef(&nodes[0]))
+                .await
+                .is_durable()
+        );
+        let asked: Asked = Rc::default();
+        let door = guarded(&store, node_txid(&nodes[1]), fault, &asked);
+        let r = submitted(&door, &unproven_beef(&nodes, 2, 0)).await;
+        println!(
+            "E1D delta-2 L2 fault={fault}: durable {} ({}), landed {:?}, asked {}, rows {:?}",
+            r.is_durable(),
+            r.summary(),
+            r.landed_predecessors,
+            asked.borrow().len(),
+            rows(&store, &nodes).await
+        );
+        assert!(r.faults.iter().any(|f| f.site == "predecessor_not_landed"
+            && f.error.contains("refused by the landing guard")));
+        assert!(r.landed_predecessors.is_empty());
+        assert_eq!(*asked.borrow(), [node_txid(&nodes[1])]);
+        assert_eq!(rows(&store, &nodes).await, ["0:spent=false"]);
+        assert_eq!(applied_rows(&store, &nodes).await, [true, false, false]);
+    }
+    // An ancestor refused under a link the guard lets through: the link was
+    // only judged dry, nothing of either is written, each asked once.
+    let nodes = chain(4);
+    let store = Rc::new(MemoryStorage::new());
+    assert!(
+        submitted(&shape_door(&store, true), &proven_beef(&nodes[0]))
+            .await
+            .is_durable()
+    );
+    let asked: Asked = Rc::default();
+    let door = guarded(&store, node_txid(&nodes[1]), false, &asked);
+    let r = submitted(&door, &unproven_beef(&nodes, 3, 0)).await;
+    assert!(!r.is_durable());
+    assert!(r.landed_predecessors.is_empty());
+    assert_eq!(
+        *asked.borrow(),
+        [node_txid(&nodes[2]), node_txid(&nodes[1])]
+    );
+    assert_eq!(rows(&store, &nodes).await, ["0:spent=false"]);
+    assert_eq!(
+        applied_rows(&store, &nodes).await,
+        [true, false, false, false]
+    );
+    // A guard that lets every body through changes nothing: the chain lands.
+    let asked: Asked = Rc::default();
+    let door = guarded(&store, String::new(), false, &asked);
+    let r = submitted(&door, &unproven_beef(&nodes, 3, 0)).await;
+    assert!(r.is_durable(), "{}", r.summary());
+    assert_eq!(
+        *asked.borrow(),
+        [node_txid(&nodes[2]), node_txid(&nodes[1])]
+    );
+    assert_eq!(rows(&store, &nodes).await, ["3:spent=false"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 4]);
+}

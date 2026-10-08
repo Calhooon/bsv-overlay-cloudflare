@@ -806,10 +806,49 @@ pub async fn open_eviction(db: &D1Database, txid: &str) -> Result<Option<OpenEvi
     }))
 }
 
+/// THE PRE-WRITE GUARD over what the engine is about to LAND first from a submit's BEEF (bsv-low #575, the E1D
+/// delta-2 fold, L2; installed as `Engine::set_landing_guard` at every engine this worker builds): the subject's
+/// ungated arms refuse an evicted subject before their write, and a landing is refused the same way, at every door.
+/// An OPEN eviction of the body refuses it (counted, logged): nothing of it is written, no lookup service is told,
+/// and the successor's topic answers "not now" (the S2 queued ack; its replays ask again). An unreadable ledger
+/// refuses too (counted, fail-loud: a landing nobody can clear is not made blind).
+///
+/// A GATED door's accept of the successor does NOT readmit the predecessor's open row (unlike the subject's own,
+/// readmitted on that same accept): the accept is the network's word on the SUCCESSOR, whose EF carries the
+/// predecessor's outputs and not the predecessor, and an accept can be a pending one Arcade later reports
+/// `SEEN_IN_ORPHAN_MEMPOOL` (the pending watch keeps watching an orphan): it does not say the network holds the
+/// predecessor. Its row is readmitted by its OWN word (its submit at the gated door, a MINED proof, the operator's
+/// `/admin/readmit`); the successor converges on a replay after that, or waits for its dead letter's re-drive.
+pub async fn landing_guard(db: &D1Database, txid: &str, topic: &str) -> Result<(), String> {
+    match open_eviction(db, txid).await {
+        Ok(None) => Ok(()),
+        Ok(Some(ev)) => {
+            crate::ops::bump_counter(db, crate::ops::COUNTER_LANDING_REFUSED_EVICTED, 1).await;
+            worker::console_log!(
+                "{txid}, carried by a successor into {topic}, is under an OPEN eviction (at {} ms — {}): not landed, the successor waits",
+                ev.evicted_at_ms,
+                ev.reason
+            );
+            Err(format!(
+                "under an open eviction ({})",
+                refusal_status_word(&ev.reason)
+            ))
+        }
+        Err(e) => {
+            crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1).await;
+            worker::console_log!(
+                "the eviction ledger could not be read for {txid}, carried by a successor into {topic} ({e}): not landed"
+            );
+            Err(format!("the eviction ledger could not be read ({e})"))
+        }
+    }
+}
+
 /// THE WRITE-SIDE GUARD over what the engine LANDED first from a submit's BEEF (lane E1D's delta fold, L2;
 /// `MutationReport::landed_predecessors`): each landed predecessor is an admission write of its own, which no
-/// caller asked for and no door read the ledger for, so it is asked AFTER the write, as every admission writer's
-/// write is: a landed txid under an OPEN eviction is re-evicted (what the landing wrote moves to the twins), counted
+/// caller asked for, so it is asked AFTER the write too, as every admission writer's write is (the belt behind
+/// [`landing_guard`], which refused every row open before the landing): a landed txid under an OPEN eviction is
+/// re-evicted (what the landing wrote moves to the twins), counted
 /// and logged. An unreadable ledger is counted and logged (fail-loud) and changes no answer: a retry would not ask
 /// again (the subject's replay dedups and lands nothing). It never returns early, so the pot notes of a re-eviction
 /// ride the caller's own exit flush (the dispatch's one exit; the queue batch's end).

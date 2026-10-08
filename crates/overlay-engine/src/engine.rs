@@ -92,6 +92,9 @@ pub struct Engine {
     /// invocation's memory; across invocations the same question is put to
     /// the store ([`Engine::unlanded_predecessor`]).
     not_landed: std::cell::RefCell<HashSet<(String, String)>>,
+    /// Asked before the door lands a carried predecessor (bsv-low #575, the
+    /// E1D delta-2 fold, L2). See [`Engine::set_landing_guard`].
+    landing_guard: Option<LandingGuard>,
     /// Reference-parity spend verification on submit (2026-09-08). `true`
     /// (DEFAULT): every submit outside `HistoricalTxNoSpv` runs the
     /// reference's `Transaction.verify` walk: merkle paths against the chain
@@ -116,6 +119,16 @@ pub type SleepFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
 /// tests pass `ready(())` (instant deadline) or `pending()` (no deadline)
 /// to drive the race deterministically.
 pub type SleepFactory = std::rc::Rc<dyn Fn(u64) -> SleepFuture>;
+
+/// The answer of a [`LandingGuard`]: `Ok` lets the body land, `Err` says why
+/// it may not (the topic waits).
+pub type LandingGuardFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>;
+
+/// The caller's admission predicate over a carried predecessor the door is
+/// about to land: `(predecessor txid, topic)`. See
+/// [`Engine::set_landing_guard`].
+pub type LandingGuard = std::rc::Rc<dyn Fn(&str, &str) -> LandingGuardFuture>;
 
 /// The bound of ONE GASP finalize submit's storage calls and hooks (bsv-low
 /// #559, the lens fold of 2026-10-07, F2). The submit itself is never
@@ -752,6 +765,7 @@ impl Engine {
             finalize_submit_budget: None,
             finalize_gate: crate::gasp::SubmitGate::default(),
             not_landed: std::cell::RefCell::new(HashSet::new()),
+            landing_guard: None,
             verify_scripts: true,
             config,
         }
@@ -784,6 +798,23 @@ impl Engine {
     /// NOT call this — when unset, GASP ingest behavior is unchanged.
     pub fn set_ancestor_fetcher(&mut self, fetcher: std::rc::Rc<dyn crate::gasp::AncestorFetcher>) {
         self.ancestor_fetcher = Some(fetcher);
+    }
+
+    /// Set the admission predicate asked BEFORE the door lands a carried
+    /// predecessor (bsv-low #575, the E1D delta-2 fold, L2;
+    /// [`Engine::land_carried`]). It is asked once per body the landing
+    /// would submit, before that body's submit (a dry one included) and
+    /// before its reads are charged; an `Err` (the caller's refusal, or its
+    /// own read fault) ends the landing with nothing of that body written
+    /// and the successor's topic answers "not now", as on `683dffd`. The
+    /// worker installs its eviction ledger here: an OPEN eviction of the
+    /// body refuses it. Its read is not one of the submit's 256 (it is the
+    /// caller's store, at most one per landed body). Unset (default): every
+    /// carried predecessor may land. What the predicate cannot see (a row
+    /// opened while the landing writes) stays the caller's to guard after
+    /// the write ([`MutationReport::landed_predecessors`]).
+    pub fn set_landing_guard(&mut self, guard: LandingGuard) {
+        self.landing_guard = Some(guard);
     }
 
     /// Set the per-peer GASP sync budget (bsv-low#302).
@@ -1953,7 +1984,10 @@ impl Engine {
     /// at [`PREDECESSOR_READS_PER_SUBMIT`] reads, however deep the chain.
     /// Each body that lands is pushed on `landed` (the report's
     /// `landed_predecessors`, for the caller's admission guard; the delta
-    /// fold, L2). `Ok` once `predecessor` LANDED in `topic` (recorded there,
+    /// fold, L2). Each body is asked of the caller's landing guard first,
+    /// once ([`Engine::set_landing_guard`]; the delta-2 fold, L2): a refusal
+    /// ends the landing before that body is submitted.
+    /// `Ok` once `predecessor` LANDED in `topic` (recorded there,
     /// now or before); otherwise why not, at the first that did not.
     #[allow(clippy::too_many_arguments)]
     async fn land_carried(
@@ -1980,10 +2014,21 @@ impl Engine {
             HashSet::new()
         };
         let mut stack = vec![predecessor.to_string()];
+        let mut guarded: HashSet<String> = HashSet::new();
         while let Some(next) = stack.last().cloned() {
             let body = beef
                 .find_atomic_transaction(&next)
                 .ok_or_else(|| format!("{next}: its body is not in the BEEF"))?;
+            // The caller's admission predicate, before anything of this body
+            // is submitted (the delta-2 fold, L2).
+            if let Some(guard) = &self.landing_guard {
+                if guarded.insert(next.clone()) {
+                    bounded(bound, guard(&next, topic))
+                        .await
+                        .and_then(|answer| answer)
+                        .map_err(|why| format!("{next}: refused by the landing guard ({why})"))?;
+                }
+            }
             // Its validation (the applied row, one coin per input) and its
             // writes' one read of each coin it spends.
             let cost = 1 + 2 * body.inputs.len();

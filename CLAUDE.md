@@ -304,7 +304,7 @@ and the successor's topic is then judged again over the coin it now finds.
 The first that does not land ends it: the successor waits. Each link is
 ADMITTED once (the E1D delta fold, L4): a link blocked by the one under it is
 asked only a dry run and writes nothing, and is admitted for real once that
-one landed. Each body is WALKED once per submit: the successor's own SPV walk
+one landed. Each body is WALKED once per topic of the submit: the successor's own SPV walk
 already covered every body it reaches without crossing a proven one, so
 those are not walked again; a body reached only through a proven one gets
 its own walk, trusting what the submit already walked. The submit's 256
@@ -314,8 +314,10 @@ applied row, one coin per input, and its writes' one read per coin, charged
 before it starts) and each re-judgement of the successor after a landing
 (its applied row, one coin per input, charged BEFORE the landing: a landing
 whose re-judgement does not fit is not made). A carried chain too deep for
-them is "not now" with nothing written; a wide successor (more inputs than
-the 256 leave room to re-judge) lands nothing and waits. Not charged, and
+them is "not now"; the links that landed before the reads ran out stay
+landed and the replay goes on from them. A wide successor lands what the
+256 leave room for after each re-judgement (one per presentation at 240
+inputs, none at 252). Not charged, and
 stated: a landing's fault-path reads (the read-back of its coins, the undo of
 its outputs, one each) and the deep delete's walk of retained history (as in
 any submit). Nothing is landed into a topic whose manager or any lookup
@@ -329,13 +331,28 @@ nothing first (683dffd's answer for it). The worker's queue replay carries no
 off-chain values at all (`MutationMessage` has none): on LOW a faulted
 submit's values were already lost at its replay, before and after this. Each
 landed body is reported (`MutationReport::landed_predecessors`, ancestors
-first; the delta fold, L2) and the worker guards it like the subject's own
-write (`admit_fast::guard_landed`, at `/submit`, the queue replay and
-`/admin/readmit`): one under an OPEN eviction is re-evicted, counted
+first; the delta fold, L2). Before a body is landed the engine asks the
+caller's predicate (`Engine::set_landing_guard`, once per body, before its
+submit and its reads; the delta-2 fold, L2): the worker installs its
+eviction ledger (`admit_fast::landing_guard`) at every engine it builds, so
+a body under an OPEN eviction, or one whose ledger read faults, is not
+written, no lookup service is told, the successor's topic is "not now"
+(`landing_refused_evicted_total`; a fault `admit_fast_ledger_unreadable_total`).
+A gated door's accept of the successor does not readmit the predecessor's
+row: it is the network's word on the successor, whose EF carries the
+predecessor's outputs and not the predecessor, and a pending accept can turn
+out an orphan; the predecessor is readmitted by its own word (its gated
+submit, a MINED proof, `/admin/readmit`) and the successor's replay lands
+after that, or its dead letter waits for #576. After the write the worker
+still guards each landed body like the subject's own write
+(`admit_fast::guard_landed`, at `/submit`, the queue replay and
+`/admin/readmit`; the belt for a row opened while the landing wrote): one
+under an OPEN eviction is re-evicted, counted
 (`admit_fast_reevicted_after_write_total`); an unreadable ledger is counted
 and logged and asked no more (the retry dedups and lands nothing). The peer
-crawler guards neither its subjects nor its landings (pre-existing); a GASP
-finalize lands nothing. A subject that already HOLDS an output in the topic (its own
+crawler guards its subjects not at all (pre-existing) and its landings only
+before the write (its engine carries the predicate); a GASP finalize lands
+nothing. A subject that already HOLDS an output in the topic (its own
 earlier submit's leftover: the delete started and faulted, D17 M1) does not
 wait: its replay finishes it (the lens fold, L4: a proven head spend naming a
 decoy was "not now" on every replay); one read, only on the way to "not now".
