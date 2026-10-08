@@ -7464,13 +7464,13 @@ async fn e1d_fold3_l2_the_door_asks_the_landing_guard_before_it_lands() {
         let asked: Asked = Rc::default();
         let door = guarded(&store, node_txid(&nodes[1]), fault, &asked);
         let r = submitted(&door, &unproven_beef(&nodes, 2, 0)).await;
+        let held = rows(&store, &nodes).await;
         println!(
-            "E1D delta-2 L2 fault={fault}: durable {} ({}), landed {:?}, asked {}, rows {:?}",
+            "E1D delta-2 L2 fault={fault}: durable {} ({}), landed {:?}, asked {}, rows {held:?}",
             r.is_durable(),
             r.summary(),
             r.landed_predecessors,
             asked.borrow().len(),
-            rows(&store, &nodes).await
         );
         assert!(r.faults.iter().any(|f| f.site == "predecessor_not_landed"
             && f.error.contains("refused by the landing guard")));
