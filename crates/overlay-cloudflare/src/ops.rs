@@ -954,6 +954,10 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
     ] {
         obj[name] = json!(0);
     }
+    // bsv-low #555: the deferred GASP graphs' counters (by reason too) read 0 until they fire.
+    for name in crate::gasp_deferred::counter_names() {
+        obj[name] = json!(0);
+    }
     // 2026-09-04: every courier rung reads an explicit 0 until it is called.
     for rung in crate::proof_fetcher::COURIER_RUNGS {
         for kind in ["ok", "fault", "skipped"] {
@@ -1195,6 +1199,7 @@ pub async fn health_invariants(
     let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);
     let mut index_janitor = index_janitor_backlog(db).await;
     let dead_letters = crate::dead_letters::health_json(db).await;
+    let deferred_graphs = crate::gasp_deferred::health_json(db).await;
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);
     let body = json!({
@@ -1248,6 +1253,9 @@ pub async fn health_invariants(
         // bsv-low #576: the parked dead letters (count by status, the oldest parked, the last re-drive, the letters
         // past the re-drive ceiling); `readable: false` = the table is unreadable, distinct from none.
         "deadLetters": dead_letters,
+        // bsv-low #555: the GASP graphs deferred past their per-graph budget (count, the oldest, each with its
+        // topic, peer, outpoint, nodes, pending, calls, passes, reason, bytes, age); `readable: false` = unreadable.
+        "gasp": { "deferredGraphs": deferred_graphs },
     });
 
     let mut resp = Response::from_json(&body)?.with_status(status);

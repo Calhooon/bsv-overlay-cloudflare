@@ -817,6 +817,17 @@
    "why": "counters"
   },
   {
+   "name": "gasp_deferred_graphs",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the partial walks of GASP graphs deferred past their per-graph budget (bsv-low #555), one row per graph",
+   "why": "a cache of peer requests: a lost row costs the walk again from its root"
+  },
+  {
    "name": "ops_counters",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

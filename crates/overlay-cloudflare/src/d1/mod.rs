@@ -460,7 +460,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 165 → 167 for bsv-low #576's lens fold (2026-10-08, L4): the covering health index and the last-re-drive index.
 /// 167 → 169 for bsv-low #576's delta-2 fold (2026-10-08, D2-M1): `mutation_dead_letters.class` (one additive ALTER)
 /// and the per-class index.
-pub const OVERLAY_MIGRATION_COUNT: usize = 169;
+/// 169 → 170 for bsv-low #555 (2026-10-09): `gasp_deferred_graphs`, the deferred GASP graphs' walks.
+pub const OVERLAY_MIGRATION_COUNT: usize = 170;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1728,6 +1729,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // the ceiling and fault letters keep the rest. Additive ALTER; the runner ignores the re-run "duplicate column".
     crate::dead_letters::DEAD_LETTERS_CLASS_COLUMN,
     crate::dead_letters::DEAD_LETTERS_CLASS_INDEX,
+    // bsv-low #555 (2026-10-09): THE DEFERRED GASP GRAPHS. One row per graph whose walk passed its per-graph budget,
+    // replaced on every deferral, deleted when it converges or is dropped (`gasp_deferred.rs`). Transient.
+    crate::gasp_deferred::DEFERRED_GRAPHS_CREATE,
 ];
 
 // =============================================================================

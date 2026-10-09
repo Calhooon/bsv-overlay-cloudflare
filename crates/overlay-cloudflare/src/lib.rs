@@ -20,6 +20,7 @@ pub mod d1_storage;
 pub mod dead_letters;
 pub mod ef;
 pub mod error;
+pub mod gasp_deferred;
 pub mod gasp_remote;
 pub mod health_checker;
 pub mod hop_changes;
@@ -1103,6 +1104,18 @@ fn build_engine_with_storage(
         }),
         GASP_FINALIZE_SUBMIT_BUDGET_MS,
     );
+    // bsv-low #555 (measured as #582): a graph whose walk passes its OWN
+    // budget (inside the per-peer one) is DEFERRED with its walk kept in
+    // `gasp_deferred_graphs` and resumed next tick, so one deep graph neither
+    // restarts every tick nor holds the peer's other UTXOs. Same builder for
+    // the cron and /admin/startGASPSync.
+    engine.set_graph_budget(
+        std::rc::Rc::new(|ms| {
+            Box::pin(crate::broadcaster::sleep_ms(ms)) as overlay_engine::engine::SleepFuture
+        }),
+        crate::gasp_deferred::GASP_GRAPH_BUDGET_CALLS,
+        crate::gasp_deferred::GASP_GRAPH_BUDGET_MS,
+    );
 
     // Chain-backed proof fetcher (#192/#193): the courier ladder
     // (Arcade→WoC→Bitails) with a MANDATORY chaintracks re-verify before any
@@ -1301,14 +1314,25 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                 .values()
                 .map(|t| t.discarded_graphs)
                 .sum();
+            // bsv-low #555: graphs deferred past their per-graph budget (their
+            // walk kept), resumed from a record, converged, and records
+            // dropped (by reason in the counters and the per-topic line).
+            let sum = |f: fn(&overlay_engine::engine::TopicSyncResult) -> u64| -> u64 {
+                r.topics_synced.values().map(f).sum()
+            };
             worker::console_log!(
-                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={}",
+                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped_graphs={}",
                 r.topics_synced.len(),
                 total_peers,
                 total_errors,
                 total_pruned,
-                total_discarded
+                total_discarded,
+                sum(|t| t.deferred_graphs),
+                sum(|t| t.resumed_graphs),
+                sum(|t| t.converged_graphs),
+                sum(|t| t.dropped_graphs.len() as u64)
             );
+            crate::gasp_deferred::record_counters(&ops_db, &r.topics_synced).await;
             // bsv-low #552: what the tick got done under the per-peer
             // budget. Graphs are submitted as they finalize, so a peer
             // dropped at its deadline still counts the ones it finished;
@@ -1340,20 +1364,32 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                     || res.finalized_graphs > 0
                     || res.deadline_dropped_graphs > 0
                     || !res.cursor_moves.is_empty()
+                    || res.deferred_graphs > 0
+                    || res.resumed_graphs > 0
+                    || !res.dropped_graphs.is_empty()
                 {
                     let cursors: Vec<String> = res
                         .cursor_moves
                         .iter()
                         .map(|m| format!("{} {}->{}", m.peer, m.from, m.to))
                         .collect();
+                    let dropped: Vec<String> = res
+                        .dropped_graphs
+                        .iter()
+                        .map(|d| format!("{} {}", d.outpoint, d.reason))
+                        .collect();
                     worker::console_log!(
-                        "  Scheduled GASP topic={} sync_type={} pruned_inputs={} discarded_graphs={} finalized_graphs={} deadline_dropped_graphs={} cursors={:?} errors={:?}",
+                        "  Scheduled GASP topic={} sync_type={} pruned_inputs={} discarded_graphs={} finalized_graphs={} deadline_dropped_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped={:?} cursors={:?} errors={:?}",
                         topic,
                         res.sync_type,
                         res.pruned_inputs,
                         res.discarded_graphs,
                         res.finalized_graphs,
                         res.deadline_dropped_graphs,
+                        res.deferred_graphs,
+                        res.resumed_graphs,
+                        res.converged_graphs,
+                        dropped,
                         cursors,
                         res.errors
                     );

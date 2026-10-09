@@ -328,6 +328,19 @@ pub enum DropReason {
 }
 
 impl DropReason {
+    /// Every reason, for a caller that serves a counter per reason.
+    pub const ALL: [DropReason; 9] = [
+        Self::MaxPasses,
+        Self::TooBig,
+        Self::TooMany,
+        Self::StoreFault,
+        Self::NotServed,
+        Self::Held,
+        Self::NotHeld,
+        Self::RootProven,
+        Self::Refused,
+    ];
+
     /// The reason's name, as logged and counted.
     pub fn as_str(self) -> &'static str {
         match self {

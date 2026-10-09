@@ -882,6 +882,67 @@ impl Storage for D1Storage {
             .unwrap_or_default())
     }
 
+    async fn put_deferred_graph(
+        &self,
+        record: &overlay_engine::gasp::DeferredGraph,
+    ) -> Result<(), StorageError> {
+        let json = serde_json::to_string(record)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        Query::new(crate::gasp_deferred::DEFERRED_GRAPH_UPSERT_SQL)
+            .bind(record.peer.as_str())
+            .bind(record.topic.as_str())
+            .bind(record.outpoint.as_str())
+            .bind(record.score as f64)
+            .bind(record.nodes.len() as f64)
+            .bind(record.pending.len() as f64)
+            .bind(record.calls as f64)
+            .bind(f64::from(record.passes))
+            .bind(record.reason.as_str())
+            .bind(json.len() as f64)
+            .bind(json.as_str())
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)
+    }
+
+    async fn find_deferred_graphs(
+        &self,
+        host: &str,
+        topic: &str,
+    ) -> Result<Vec<overlay_engine::gasp::DeferredGraph>, StorageError> {
+        #[derive(Deserialize)]
+        struct RecordRow {
+            record: String,
+        }
+        let rows: Vec<RecordRow> = Query::new(crate::gasp_deferred::DEFERRED_GRAPHS_SELECT_SQL)
+            .bind(host)
+            .bind(topic)
+            .fetch_all(&self.db)
+            .await
+            .map_err(d1_err)?;
+        rows.iter()
+            .map(|r| {
+                serde_json::from_str(&r.record)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))
+            })
+            .collect()
+    }
+
+    async fn delete_deferred_graph(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<(), StorageError> {
+        Query::new(crate::gasp_deferred::DEFERRED_GRAPH_DELETE_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(outpoint)
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)
+    }
+
     async fn find_transactions_for_proof_check(
         &self,
         limit: u64,
