@@ -16,6 +16,7 @@ fn message(bytes: &[u8]) -> queue::MutationMessage {
         mode: "historical-tx".into(),
         reason: "boundary witness".into(),
         redrive: None,
+        ef_job: None,
     }
 }
 

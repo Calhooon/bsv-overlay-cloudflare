@@ -77,6 +77,8 @@ The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` r
 | `host_sync_state` | overlay-cloudflare | none | none | transient | no | a GASP cursor; the next sync walks again |
 | `gasp_peer_health` | overlay-cloudflare | none | none | transient | no | counters |
 | `gasp_deferred_graphs` | overlay-cloudflare | none | none | transient | no | bsv-low #555: the partial walks of GASP graphs deferred past their per-graph budget, one row per graph, replaced on each deferral, at most 256 rows and 64 MiB over every peer (the upsert's ceiling) and swept by the cron 30 h after its last write (the lens fold's M3); a lost row costs the walk again from its root |
+| `ef_deferred_jobs` | overlay-cloudflare | none | none | transient | no | NL-6c: one row per broadcast-gated submission whose EF work was past one request's budget (its reference, where its bytes rest, its state, its runs, the arm's answer); swept by the cron seven days after it settles; a lost row loses the caller's poll and the queued run |
+| `ef_deferred_chunks` | overlay-cloudflare | none | none | transient | no | NL-6c: a deferred submission's bytes at rest in D1, a chunk of at most 1,000,000 bytes a row, when no `BEEF_BLOBS` binding exists; deleted when the job settles |
 | `ops_counters` | overlay-cloudflare | low-app-layer: INSERT | none | transient | no | operator counters |
 | `ops_heartbeat` | overlay-cloudflare | none | none | transient | no | a heartbeat |
 | `submit_refusals` | overlay-cloudflare | none | low-app-layer | transient | no | a census window (#366) |

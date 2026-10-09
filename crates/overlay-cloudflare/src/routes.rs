@@ -19,43 +19,9 @@ use worker::{Context, Env, Request, Response};
 // Error → HTTP status mapping
 // =============================================================================
 
-/// Work bound for a broadcast-gated submit (#211/#209). Under subject-only
-/// submission the ACTUAL WORK is broadcasting the subject EF; a single LOW tx
-/// EF is a few KB even one level deep, so 256 KB is generous headroom and a
-/// body larger than this is not a LOW tx. (The OLD bound counted unproven txs
-/// and tripped on a player's accumulated unconfirmed ancestry — exactly the
-/// wrong thing to count once we submit the subject alone.)
-const MAX_SUBJECT_EF_BYTES: usize = 256 * 1024;
-/// Total-batch work bound. Subject-only submission means attempts 1–2 send just
-/// the subject, but the async-REJECTED fallback (attempt 3) re-submits the FULL
-/// ancestry batch (`concat_efs`) to ARC. Without a bound on THAT, a malicious
-/// client could pass the subject cap yet force a multi-MB ARC POST + ~40 s of
-/// worker poll per request (the abuse the old `>8`-count cap blocked). 2 MiB is
-/// generous for any legitimate LOW hand's whole ancestry, but caps the attacker.
-const MAX_BATCH_EF_BYTES: usize = 2 * 1024 * 1024;
-
 /// One callback's proof fits an 8 KiB hex field. 1 MiB also leaves ample
 /// space for status, competing-transaction and reorg metadata.
 pub(crate) const ARC_INGEST_BODY_MAX_BYTES: usize = 1024 * 1024;
-
-/// PURE (#211): the offending byte size when EITHER work bound is exceeded, else
-/// `None`. Bounds (a) the SUBJECT EF we broadcast first, and (b) the TOTAL batch
-/// bytes the fallback may re-submit — NOT the ancestry COUNT, which subject-only
-/// submission no longer makes the relevant quantity. A missing subject (already
-/// mined / not in batch) is 0 bytes → never over the subject cap. Evaluated
-/// BEFORE any ARC POST so an oversized batch never reaches the network.
-pub(crate) fn subject_ef_over_cap(efs: &[crate::ef::EfTx], subject_txid: &str) -> Option<usize> {
-    let subject_ef_bytes = efs
-        .iter()
-        .find(|e| e.txid == subject_txid)
-        .map(|e| e.ef.len())
-        .unwrap_or(0);
-    let total_ef_bytes: usize = efs.iter().map(|e| e.ef.len()).sum();
-    if total_ef_bytes > MAX_BATCH_EF_BYTES {
-        return Some(total_ef_bytes);
-    }
-    (subject_ef_bytes > MAX_SUBJECT_EF_BYTES).then_some(subject_ef_bytes)
-}
 
 fn engine_error_status(e: &EngineError) -> u16 {
     match e {
@@ -702,6 +668,98 @@ async fn submit_inner(
         (raw_body, None)
     };
 
+    // What the request carries besides its body: the mode header and the
+    // operator's credential (#347), read here so the arm below can run again
+    // without a request (NL-6c, a deferred job resumed by the queue).
+    let mode_header = req.headers().get("x-submit-mode").ok().flatten();
+    // A DEDICATED submit-operator credential, deliberately NOT the ADMIN_TOKEN
+    // that gates /admin/evictOutpoint, /admin/ban and /admin/startGASPSync
+    // (gate finding M1). Handing the watchtower the admin token would mean a
+    // tower compromise grants eviction of any outpoint from the index, which
+    // is precisely the primitive the enumeration-starvation money path needs.
+    // Unset ⇒ nobody can authenticate ⇒ fail closed.
+    let operator_authed = check_submit_operator_auth(&req, env);
+    submit_parts(
+        engine,
+        SubmitParts {
+            topics,
+            beef,
+            off_chain_values,
+            mode_header,
+            operator_authed,
+        },
+        hosting_url,
+        arcade_url,
+        taal_api_key,
+        ctx,
+        env,
+        crate::ef_deferred::WorkBudget::InRequest,
+    )
+    .await
+}
+
+/// NL-6c: a `/submit` as the arm reads it, the request's body split and its
+/// two headers read. Built by `submit_inner` from the request, and by the
+/// queue consumer from a deferred job's bytes at rest
+/// (`ef_deferred::run_job`), which carries no credential.
+pub(crate) struct SubmitParts {
+    pub(crate) topics: Vec<String>,
+    pub(crate) beef: Vec<u8>,
+    pub(crate) off_chain_values: Option<Vec<u8>>,
+    pub(crate) mode_header: Option<String>,
+    pub(crate) operator_authed: bool,
+}
+
+/// NL-6c: the queue consumer's run of a deferred broadcast-gated submission:
+/// the same arm as the request's, under [`crate::ef_deferred::WorkBudget::Resumed`]
+/// (no request budget is owed), and the same notes shipped on the way out as
+/// [`submit`] ships them.
+pub(crate) async fn submit_resumed(
+    engine: &Engine,
+    parts: SubmitParts,
+    hosting_url: Option<&str>,
+    arcade_url: Option<String>,
+    taal_api_key: Option<String>,
+    ctx: &Context,
+    env: &Env,
+) -> worker::Result<Response> {
+    let out = submit_parts(
+        engine,
+        parts,
+        hosting_url,
+        arcade_url,
+        taal_api_key,
+        ctx,
+        env,
+        crate::ef_deferred::WorkBudget::Resumed,
+    )
+    .await;
+    crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));
+    crate::lobby_changes::flush(env, |fut| ctx.wait_until(fut));
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_parts(
+    engine: &Engine,
+    parts: SubmitParts,
+    hosting_url: Option<&str>,
+    arcade_url: Option<String>,
+    taal_api_key: Option<String>,
+    ctx: &Context,
+    env: &Env,
+    // NL-6c: in the request the broadcast-gated arm keeps a work budget and
+    // defers the work past it; a resumed run owes none.
+    budget: crate::ef_deferred::WorkBudget,
+) -> worker::Result<Response> {
+    let SubmitParts {
+        topics,
+        beef,
+        off_chain_values,
+        mode_header,
+        operator_authed,
+    } = parts;
+
     // No door refuses here (NL-6): P0-5f refused a count or size breach at
     // this line, and no valid BEEF is a breach now. A body that does not
     // parse is still an ARRIVAL the #366 census counts
@@ -726,7 +784,6 @@ async fn submit_inner(
     // only read the resulting fields — it cannot re-derive, re-order or
     // second-guess them. The wiring is the defect class here, so it is not
     // allowed to live as inline branching (gate finding H1/M-5).
-    let mode_header = req.headers().get("x-submit-mode").ok().flatten();
     // Fail CLOSED on a typo: extensions are enabled ONLY on an explicit
     // "true". Both wrangler configs set it explicitly, so this is safe, and a
     // mangled value can no longer silently leave the ungated modes reachable.
@@ -758,13 +815,9 @@ async fn submit_inner(
     let admit_policy = crate::submit_gate::AdmitPolicy::parse(
         env.var("ADMIT_FAST").ok().map(|v| v.to_string()).as_deref(),
     );
-    // A DEDICATED submit-operator credential, deliberately NOT the ADMIN_TOKEN
-    // that gates /admin/evictOutpoint, /admin/ban and /admin/startGASPSync
-    // (gate finding M1). Handing the watchtower the admin token would mean a
-    // tower compromise grants eviction of any outpoint from the index — which
-    // is precisely the primitive the enumeration-starvation money path needs.
-    // Unset ⇒ nobody can authenticate ⇒ fail closed.
-    let operator_authed = check_submit_operator_auth(&req, env);
+    // `mode_header` and `operator_authed` are read with the request
+    // (`submit_inner`); a resumed deferral (NL-6c) carries no credential and
+    // runs the broadcast-gated arm, which none is needed for.
     // ONE derivation. The decision is computed EXACTLY once and everything
     // downstream — the counter, the refusal, the engine mode, the gate branch —
     // reads that single value.
@@ -1035,27 +1088,28 @@ async fn submit_inner(
             }
         }
         gated_subject = Some(subject_txid.clone());
-        // Work bound (#211/#209). The OLD cap counted unproven txs (`> 8`) and
-        // was hit ROUTINELY: a real player's funding coin accumulates deep
-        // unconfirmed ancestry, so a LOW BEEF can carry far more than 8 unproven
-        // ancestors even though only ONE tx (the subject) is being broadcast.
-        // Under subject-only submission (`broadcast_efs_gated`) that ancestry no
-        // longer counts — we bound the ACTUAL WORK instead: the byte size of the
-        // SUBJECT EF we broadcast. A body that large is not a LOW tx.
-        //
-        // A cap hit is RETRYABLE (429 + hint), not a flat 400 — a 400 makes the
-        // client permanently abandon the overlay for this submit; a 429 lets it
-        // fall back for THIS submit without giving up on the overlay wholesale.
-        if let Some(over_bytes) = subject_ef_over_cap(&efs, &subject_txid) {
-            worker::console_log!(
-                "POST /submit(broadcast-gated) -> 429 (EF work bound: {over_bytes} B > subject {MAX_SUBJECT_EF_BYTES} B / batch {MAX_BATCH_EF_BYTES} B)"
-            );
-            return json_error_retryable(
-                &format!(
-                    "broadcast-gated: EF too large ({over_bytes} B; subject cap {MAX_SUBJECT_EF_BYTES} B, batch cap {MAX_BATCH_EF_BYTES} B) — retry via fallback"
-                ),
-                429,
-            );
+        // The EF work budget (NL-6c; #211/#209 before it). The work of this
+        // arm is the subject's EF broadcast, the batch's on the async-REJECTED
+        // fallback, the SEEN poll and the door's walk, and it runs inside one
+        // request's CPU slice: the platform's bound. Until NL-6c a body past
+        // 256 KiB of subject EF or 2 MiB of batch EF was answered 429 "retry
+        // via fallback", a refusal of a valid submission for its size. Now the
+        // request does the work that fits its budget, as before, and DEFERS
+        // the rest: the bytes at rest (R2 when `BEEF_BLOBS` is bound, else D1
+        // chunks under its row bound), the reference on the queue, the
+        // consumer running this same arm under `WorkBudget::Resumed`, and the
+        // caller answered 202 with the reference it polls
+        // (`GET /submit-deferred/<reference>`). Never a 429 or a 413 for size.
+        let work = crate::ef_deferred::EfWork::of(&efs, &subject_txid);
+        if budget == crate::ef_deferred::WorkBudget::InRequest && !work.fits_request() {
+            return crate::ef_deferred::defer(
+                env,
+                &tagged_beef,
+                mode_header.as_deref().unwrap_or_default(),
+                &subject_txid,
+                work,
+            )
+            .await;
         }
         // ── bsv-low W-A / #437 STEP 2 (2026-09-09): EXECUTE THE SPEND AT THE
         // DOOR. The gated path's engine mode (`HistoricalTxNoSpv`) skips the
@@ -1226,7 +1280,9 @@ async fn submit_inner(
         // client belts; best-effort by construction. Accepted residuals
         // (review 2026-08-26): during the #347 lenient window an unauthed
         // structural-pass body gets a keyed TAAL relay (owner-accepted cost,
-        // 256KB-capped, no amplification loop); a hung socket can eat the
+        // no amplification loop; the 256 KB cap it was sized under is a
+        // deferral since NL-6c, so a larger body is relayed from the queue
+        // consumer's run instead of the request's); a hung socket can eat the
         // wait_until budget silently — convergence rides the #397 re-checks
         // and the backstop, by design.
         {
@@ -1429,9 +1485,10 @@ async fn submit_inner(
                 // callbacks and the completion / reconcile passes. Money views
                 // stay gated on the real witness. Accepted residual (gate
                 // LOW-2): a stranger CAN park an inert pending row through
-                // this arm (valid script+fee) — bounded by the subject EF byte
-                // cap, displaceable, evictable, excluded from every money view
-                // until witnessed.
+                // this arm (valid script+fee): displaceable, evictable,
+                // excluded from every money view until witnessed (the subject
+                // EF byte cap it was bounded by is a deferral since NL-6c, not
+                // a refusal).
                 worker::console_log!(
                     "broadcast-gated(arcade): {subject_txid} admitted PENDING ({pending}; {}) — SEEN unwitnessed; the pending watch owns the witness",
                     if admit_fast {
@@ -4782,16 +4839,16 @@ mod tests {
         assert_eq!(html_escape("safe"), "safe");
     }
 
-    // ── #211/#209: work-bound cap (replaces the old `efs.len() > 8`) ─────────
+    // ── #211/#209, then NL-6c: the EF work budget (a deferral, never a cap) ──
 
     use crate::ef::EfTx;
+    use crate::ef_deferred::{EfWork, IN_REQUEST_BATCH_EF_BYTES, IN_REQUEST_SUBJECT_EF_BYTES};
 
     #[test]
-    fn work_bound_cap_ignores_ancestry_depth_bounds_the_subject() {
+    fn the_work_budget_ignores_ancestry_depth_and_weighs_the_subject() {
         // #209: a deep unconfirmed ancestry (many small unproven ancestors)
-        // used to trip the old COUNT cap (`> 8`) even though only the SUBJECT is
-        // broadcast. The byte bound looks ONLY at the subject we submit, so a
-        // 20-ancestor batch with a normal-sized subject passes.
+        // used to trip the old COUNT cap (`> 8`) even though only the SUBJECT
+        // is broadcast. 20 ancestors and a 4 KB subject fit the request.
         let mut efs: Vec<EfTx> = (0..20)
             .map(|i| EfTx {
                 txid: format!("anc{i}"),
@@ -4802,67 +4859,27 @@ mod tests {
             txid: "subj".into(),
             ef: vec![0u8; 4096],
         });
-        assert_eq!(
-            subject_ef_over_cap(&efs, "subj"),
-            None,
-            "20 ancestors + a 4KB subject must NOT trip the bound"
-        );
-    }
-
-    #[test]
-    fn work_bound_cap_trips_only_on_an_oversized_subject() {
-        let efs = vec![EfTx {
+        assert!(EfWork::of(&efs, "subj").fits_request());
+        // one byte over the subject budget is deferred; at it, done in the request
+        let over = vec![EfTx {
             txid: "subj".into(),
-            ef: vec![0u8; MAX_SUBJECT_EF_BYTES + 1],
+            ef: vec![0u8; IN_REQUEST_SUBJECT_EF_BYTES + 1],
         }];
-        assert_eq!(
-            subject_ef_over_cap(&efs, "subj"),
-            Some(MAX_SUBJECT_EF_BYTES + 1),
-            "a subject one byte over the bound is capped"
-        );
-        // Exactly at the bound is allowed.
+        assert!(!EfWork::of(&over, "subj").fits_request());
         let at = vec![EfTx {
             txid: "subj".into(),
-            ef: vec![0u8; MAX_SUBJECT_EF_BYTES],
+            ef: vec![0u8; IN_REQUEST_SUBJECT_EF_BYTES],
         }];
-        assert_eq!(subject_ef_over_cap(&at, "subj"), None);
+        assert!(EfWork::of(&at, "subj").fits_request());
     }
 
     #[test]
-    fn work_bound_cap_absent_subject_is_never_over() {
-        // Subject already mined / not present → 0 bytes → never capped.
-        let efs = vec![EfTx {
-            txid: "other".into(),
-            ef: vec![0u8; 8],
-        }];
-        assert_eq!(subject_ef_over_cap(&efs, "subj"), None);
-    }
-
-    #[test]
-    fn work_bound_cap_bounds_the_total_batch_the_fallback_resubmits() {
-        // Adversarial review (2026-07-20): a NORMAL-sized subject that passes the
-        // subject cap, but a huge ancestry batch. Attempts 1–2 send only the
-        // subject; the async-REJECTED fallback (attempt 3) re-submits the WHOLE
-        // batch (`concat_efs`) to ARC. The subject cap alone would let an
-        // attacker force a multi-MB ARC POST + ~40 s of worker poll per request
-        // (a double-spend subject: 202 then async REJECTED → the fallback fires).
-        // The total-batch bound catches it BEFORE any ARC submit.
-        let mut efs = vec![EfTx {
-            txid: "subj".into(),
-            ef: vec![0u8; 4096],
-        }]; // subject fine
-        efs.push(EfTx {
-            txid: "fat-ancestor".into(),
-            ef: vec![0u8; MAX_BATCH_EF_BYTES],
-        });
-        let total = 4096 + MAX_BATCH_EF_BYTES;
-        assert_eq!(
-            subject_ef_over_cap(&efs, "subj"),
-            Some(total),
-            "an oversized TOTAL batch must be capped even when the subject is small"
-        );
-        // A total exactly at the bound is allowed — small subject + ancestry
-        // that sums (with the subject) to exactly the batch cap.
+    fn the_work_budget_weighs_the_batch_the_fallback_resubmits() {
+        // Adversarial review (2026-07-20): a normal subject over a huge
+        // ancestry; the async-REJECTED fallback re-submits the WHOLE batch
+        // (`concat_efs`), a multi-MB POST and ~40 s of poll. That work is
+        // past one request's slice and is deferred to the queue (NL-6c); it
+        // was answered 429 until then.
         let at = vec![
             EfTx {
                 txid: "subj".into(),
@@ -4870,23 +4887,78 @@ mod tests {
             },
             EfTx {
                 txid: "anc".into(),
-                ef: vec![0u8; MAX_BATCH_EF_BYTES - 4096],
+                ef: vec![0u8; IN_REQUEST_BATCH_EF_BYTES - 4096],
             },
         ];
+        assert!(
+            EfWork::of(&at, "subj").fits_request(),
+            "exactly at the batch budget"
+        );
+        let over = vec![
+            EfTx {
+                txid: "subj".into(),
+                ef: vec![0u8; 4096],
+            },
+            EfTx {
+                txid: "anc".into(),
+                ef: vec![0u8; IN_REQUEST_BATCH_EF_BYTES - 4096 + 1],
+            },
+        ];
+        assert!(!EfWork::of(&over, "subj").fits_request());
+    }
+
+    /// NL-6c source pins (comments stripped): the two caps are gone, the arm
+    /// answers no 429 for the EF's size, and the budget is weighed exactly
+    /// once, in the request only, with the deferral as its one consequence.
+    #[test]
+    fn the_gated_arm_defers_its_work_and_refuses_nothing_for_size() {
+        let src = code_only(include_str!("routes.rs"));
+        let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        for gone in [
+            ["MAX_SUBJECT_", "EF_BYTES"].concat(),
+            ["MAX_BATCH_", "EF_BYTES"].concat(),
+            ["subject_ef_", "over_cap"].concat(),
+            ["EF too ", "large"].concat(),
+        ] {
+            assert!(!prod.contains(&gone), "{gone} is gone (NL-6c)");
+        }
+        let weighed = ["EfWork::", "of(&efs, &subject_txid)"].concat();
         assert_eq!(
-            subject_ef_over_cap(&at, "subj"),
-            None,
-            "total exactly at the batch bound is allowed"
+            prod.matches(&weighed).count(),
+            1,
+            "the work is weighed once"
+        );
+        let deferral = [
+            "budget == crate::ef_deferred::WorkBudget::InRequest && !work.",
+            "fits_request()",
+        ]
+        .concat();
+        assert_eq!(
+            prod.matches(&deferral).count(),
+            1,
+            "past the budget, in the request only"
+        );
+        assert_eq!(
+            prod.matches("crate::ef_deferred::defer(").count(),
+            1,
+            "the deferral is the budget's one consequence"
+        );
+        let walk = ["engine.verify_scripts_", "only("].concat();
+        assert!(
+            prod.find(&deferral).unwrap() < prod.find(&walk).unwrap(),
+            "deferred before the door walk and the broadcast: the consumer runs both"
         );
     }
 
     #[test]
-    fn retryable_cap_error_body_carries_the_retryable_hint() {
-        // #211: a cap rejection must be retryable (429 + `retryable:true`), not
-        // a flat 400 that makes the client abandon the overlay for this submit.
+    fn retryable_error_body_carries_the_retryable_hint() {
+        // #211: a retryable fault (the eviction ledger unreadable, a 502) says
+        // so (`retryable:true`), not a flat 400 that makes the client abandon
+        // the overlay for this submit. The EF work bound that first used it
+        // is a deferral since NL-6c, never a refusal.
         let json = serde_json::to_string(&RetryableErrorBody {
             status: "error",
-            message: "subject EF too large — retry via fallback",
+            message: "the eviction ledger could not be read, retry",
             retryable: true,
         })
         .unwrap();

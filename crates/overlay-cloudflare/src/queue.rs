@@ -81,7 +81,29 @@ pub struct MutationMessage {
     /// re-drive's number), so a re-death parks the SAME row. Absent on every S2 replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redrive: Option<crate::dead_letters::RedriveTag>,
+    /// NL-6c: set on a DEFERRED EF JOB's message, the job's reference
+    /// (`ef_deferred`); its bytes rest in D1 or R2 and the message carries
+    /// none (`beef_b64` is empty). Absent on every replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ef_job: Option<String>,
 }
+
+/// NL-6c: the message that hands a deferred EF job to the consumer: its
+/// reference, never its bytes, so the queue's 128 KB message is no bound.
+#[must_use]
+pub fn ef_job_message(reference: &str) -> MutationMessage {
+    MutationMessage {
+        beef_b64: String::new(),
+        topics: Vec::new(),
+        mode: String::new(),
+        reason: EF_JOB_REASON.to_string(),
+        redrive: None,
+        ef_job: Some(reference.to_string()),
+    }
+}
+
+/// The reason stamped on a deferred EF job's message.
+pub const EF_JOB_REASON: &str = "ef-deferred";
 
 /// The reason stamped on an S2 replay message.
 pub const REPLAY_REASON_PHASE3_FAULT: &str = "phase3-fault";
@@ -136,6 +158,7 @@ pub fn replay_message(
         mode: mode_wire(mode).to_string(),
         reason: reason.to_string(),
         redrive: None,
+        ef_job: None,
     })
 }
 

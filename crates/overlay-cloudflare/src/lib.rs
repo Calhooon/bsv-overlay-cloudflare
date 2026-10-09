@@ -19,6 +19,7 @@ pub mod d1_discovery;
 pub mod d1_storage;
 pub mod dead_letters;
 pub mod ef;
+pub mod ef_deferred;
 pub mod error;
 pub mod gasp_deferred;
 pub mod gasp_remote;
@@ -185,6 +186,11 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
             // verified BEEF for a MINED txid the index never admitted — the credit
             // path's proof source when `/beef` has nothing to serve.
             p if p.starts_with("/beef-any/") => return routes::beef_any(&env, p).await,
+            // NL-6c: a deferred broadcast-gated submission's state and, once
+            // its run ended, the arm's answer.
+            p if p.starts_with(crate::ef_deferred::POLL_PREFIX) => {
+                return crate::ef_deferred::poll(&env, p).await
+            }
             _ => {}
         }
     }
@@ -1299,6 +1305,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // bsv-low #555 (the lens fold's M3): rows of deferred graphs nothing
     // will resume (a peer that never finishes a sync again) are swept first.
     crate::gasp_deferred::sweep_stale(&ops_db).await;
+    // NL-6c: deferred EF jobs whose run ended without settling go back to the
+    // queue; settled ones past their keep are swept with their bytes.
+    crate::ef_deferred::redrive(&env, &ops_db).await;
     match overlay_engine::gasp::race_or_deadline_guarded(
         engine.start_gasp_sync(),
         crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS),
@@ -2247,6 +2256,15 @@ async fn queue_handler(
             }
         };
         let body = &body;
+
+        // NL-6c: a deferred EF job carries its reference, never bytes; its run
+        // settles its own row (the arm's answer, or queued again for the cron),
+        // so the message is acked whatever the run did.
+        if let Some(reference) = body.ef_job.as_deref() {
+            crate::ef_deferred::run_job(&env, &ctx, &engine, reference).await;
+            msg.ack();
+            continue;
+        }
 
         let beef = match crate::queue::decode_replay_beef(&body.beef_b64) {
             Ok(b) => b,

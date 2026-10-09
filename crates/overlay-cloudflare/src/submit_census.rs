@@ -31,8 +31,11 @@
 //!
 //! 1. [`crate::ef::beef_to_ef_batch`] — the gated arm 400s on `Err` before any
 //!    network call (`Parse` / subject `EfConversion`).
-//! 2. [`crate::routes::subject_ef_over_cap`] — the gated arm 429s when either
-//!    EF work bound is exceeded, before any network call.
+//! 2. (none since NL-6c) the gated arm weighs the EF work against one
+//!    request's budget and DEFERS the work past it to its queue
+//!    (`crate::ef_deferred`); until NL-6c it answered 429, and the census
+//!    counted that `EfOverCap`. A deferral is not a refusal, so a body past the
+//!    budget is classified as every other body is, by the checks below.
 //! 3. empty `efs` (an all-proven "already mined" claim):
 //!    [`crate::ef::proven_subject_raw`] — `None` means the gated arm's
 //!    mined-claim corroboration has no body and refuses fail-closed (502,
@@ -53,7 +56,7 @@
 //!   honest population the tx was already broadcast by the wallet, and the
 //!   gated path admits an already-known tx idempotently.)
 //! * **`WouldHaveFailed`** — the gated arm would have refused these bytes
-//!   BEFORE any network call (flat 400 / 429 / fail-closed mined-claim 502).
+//!   BEFORE any network call (flat 400 / fail-closed mined-claim 502).
 //!   This is THE number the #347 flip reads: every count here is an honest
 //!   submit the flip would strand.
 //! * **`CouldNotEvaluate`** — the census could not honestly decide. Three
@@ -116,7 +119,8 @@ use crate::submit_gate::AdmissionPath;
 /// [`UnevalWhy::BodyOverEvalBound`] instead of being converted. The route's own
 /// body cap is 10 MB and the gated arm converts anything under it, but the
 /// census runs on the UNGATED path where this work is additive — 2 MiB matches
-/// the gated arm's total-batch EF bound scale (`MAX_BATCH_EF_BYTES`) and is
+/// the gated arm's in-request batch EF budget
+/// (`crate::ef_deferred::IN_REQUEST_BATCH_EF_BYTES`, a deferral since NL-6c) and is
 /// orders of magnitude above any honest LOW BEEF (a few KB; deep-ancestry
 /// recovery shapes are tens of KB).
 pub const MAX_CENSUS_EVAL_BYTES: usize = 2 * 1024 * 1024;
@@ -130,8 +134,11 @@ pub enum WouldFailWhy {
     /// subject, missing input source txs — THE bsv-low #351 class) — the
     /// gated arm 400s.
     SubjectEf,
-    /// An EF work bound would trip ([`crate::routes::subject_ef_over_cap`]) —
-    /// the gated arm 429s before any broadcast.
+    /// NOT PRODUCED since NL-6c: the gated arm answered 429 past its EF work
+    /// bound until then, and now defers that work to its queue
+    /// (`crate::ef_deferred`). Kept so the counter's name
+    /// (`submit_census_reason_ef_over_cap_total`) and its served key stay
+    /// readable with the counts taken before.
     EfOverCap,
     /// All-proven mined-claim shape with no extractable subject raw — the
     /// gated arm's corroboration has no body and fails closed (deterministic
@@ -219,13 +226,9 @@ pub fn census_verdict(beef_bytes: &[u8]) -> CensusVerdict {
             return CensusVerdict::WouldHaveFailed(WouldFailWhy::SubjectEf)
         }
     };
-    // Same bound, same function, same order as the gated arm (429 before any
-    // broadcast). With `efs` empty both sizes are 0, so this never fires on
-    // the mined-claim shape — matching the route, where the cap check runs
-    // before the mined-claim raw is even extracted.
-    if crate::routes::subject_ef_over_cap(&efs, &subject_txid).is_some() {
-        return CensusVerdict::WouldHaveFailed(WouldFailWhy::EfOverCap);
-    }
+    // NL-6c: no EF size check here. The gated arm defers work past one
+    // request's budget to its queue (`crate::ef_deferred`) and refuses
+    // nothing for it, so a body past the budget is not one it would refuse.
     if efs.is_empty() {
         // All-proven "already mined" claim. The gated arm corroborates the
         // claim against a real provider (bsv-low #268) — a network call this
