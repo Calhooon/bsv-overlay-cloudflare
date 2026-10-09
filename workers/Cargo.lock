@@ -169,12 +169,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsv-middleware-cloudflare"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1b9e6e2c1adbd5bb9c620f36840d1911f25fc194775d4fff0a057c0f7c558a7"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bsv-middleware-core",
+ "bsv-rs",
+ "console_error_panic_hook",
+ "futures",
+ "getrandom",
+ "hex",
+ "js-sys",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "worker",
+]
+
+[[package]]
+name = "bsv-middleware-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d195a392f9e9118effd87c72f2fcd91332bf1adf1be46b879d43ccdcdf6f1144"
+dependencies = [
+ "bsv-rs",
+ "getrandom",
+ "hex",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "bsv-overlay-cloudflare"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
- "bsv-middleware-cloudflare",
+ "bsv-middleware-cloudflare 0.3.8",
  "bsv-overlay-discovery",
  "bsv-overlay-engine",
  "bsv-rs",
@@ -908,7 +948,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
- "bsv-middleware-cloudflare",
+ "bsv-middleware-cloudflare 0.4.1",
  "bsv-overlay-cloudflare",
  "bsv-overlay-discovery",
  "bsv-overlay-engine",

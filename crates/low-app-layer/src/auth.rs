@@ -687,8 +687,14 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                     .await
                     .map(LaneAuthResult::Reference)
             };
-            // A malformed handshake makes `process_auth` return Err — map it
-            // to an honest 400 (the tower's V2 mapping), never a bare 500.
+            // bsv-low #588 (middleware 0.4.1): every authentication REFUSAL
+            // is the middleware's own 401 on the `Response` arm below (a
+            // malformed handshake, a signature that does not verify, NEW-1's
+            // identity that is not the session's; 0.3.8 raised those as `Err`
+            // and they were this 400). An `Err` is now a FAULT only (the
+            // session store, the server's key, the transport, the SDK); its
+            // answer here is unchanged: the 400 a 0.3.8 fault got, never a
+            // bare 500.
             let mut pending_offer: Option<LaneOffer> = None;
             let auth = match outcome {
                 Ok(LaneAuthResult::Laned {
@@ -768,9 +774,11 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                 },
                 // Handshake reply or a middleware refusal (401 / certificate
                 // flow) — return verbatim; the middleware already stamped its
-                // CORS. Count refusals (a handshake reply is not a refusal).
+                // CORS. Count refusals (a handshake reply is not a refusal; a
+                // handshake message the middleware REFUSED is one, a 401 since
+                // 0.4.1, counted as its `Err` was before, bsv-low #588).
                 AuthResult::Response(resp) => {
-                    if !is_handshake {
+                    if !is_handshake || resp.status_code() == 401 {
                         count_auth_refused();
                     }
                     Ok(FrontDoor::Reply(resp))

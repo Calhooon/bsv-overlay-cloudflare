@@ -48,3 +48,5 @@ tracing = "0.1"
 # `session-lane`) to #493 (0.3.5, rev 9394c74) until 0.3.7 folded that branch into
 # main; the members ask "0.3" and the lock holds 0.3.8 (main c39642f, which wires
 # `verify_brc29_payment_output` into the middleware's own payment path). Never 0.3.7.
+# Since bsv-low #588 (2026-10-09) `low-app-layer` asks `=0.4.1` (with `bsv-middleware-core` 0.1.0) and
+# `overlay-cloudflare` still asks "0.3": the lock holds BOTH 0.4.1 and 0.3.8, each over the one `worker` 0.8.5.
