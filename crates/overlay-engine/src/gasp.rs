@@ -359,11 +359,13 @@ impl DeferredGraph {
 pub enum DropReason {
     /// Deferred [`DEFERRED_GRAPH_MAX_PASSES`] times; the UTXO fails.
     MaxPasses,
-    /// Past [`DEFERRED_GRAPH_MAX_BYTES`]; the UTXO fails.
+    /// Past [`DEFERRED_GRAPH_MAX_BYTES`]; a walk the budget cut goes on
+    /// under the per-peer budget alone (L4), else the UTXO fails.
     TooBig,
-    /// Past [`DEFERRED_GRAPHS_PER_PEER_TOPIC`]; the UTXO fails.
+    /// Past [`DEFERRED_GRAPHS_PER_PEER_TOPIC`] or the storage's ceiling; as
+    /// [`Self::TooBig`].
     TooMany,
-    /// The record could not be written; the UTXO fails.
+    /// The record could not be written; as [`Self::TooBig`] (D-L2).
     StoreFault,
     /// A sync that ran to its end was not served the UTXO (spent at the peer).
     NotServed,

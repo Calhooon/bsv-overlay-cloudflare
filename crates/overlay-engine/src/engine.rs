@@ -888,14 +888,21 @@ impl Engine {
     /// Every resume of one sync shares ONE such budget (the lens fold's M1),
     /// so the deferred UTXOs, served first, leave the pass the rest; a walk
     /// that fetched nothing keeps no record and is a failed attempt for the
-    /// quarantine (H1); a walk that cannot be kept goes on under the
-    /// per-peer budget alone (L4).
+    /// quarantine (H1); a walk that cannot be kept, or whose save faulted,
+    /// goes on under the per-peer budget alone (L4, the delta fold's D-L2);
+    /// a FRESH walk's error keeps no record (D-M1). With a budget, a sync the
+    /// peer served work that finalized no graph and moved no cursor is
+    /// YIELDLESS, and past [`crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED`] in a
+    /// row each is a failed attempt (D-M2; the count is kept by
+    /// [`Storage::record_peer_sync_yield`]).
     ///
     /// Unset (the default) nothing is deferred and the walk is the one
     /// before #555 (parity: the reference has no budget and no deferral).
     /// The storage must KEEP records (the four required deferred-graph
     /// methods of [`Storage`]): over one that refuses every save, every
-    /// graph past the budget fails its UTXO, so do not set a budget there.
+    /// graph past the budget is walked from its root under the per-peer
+    /// budget alone on every pass, as before #555, so do not set a budget
+    /// there.
     pub fn set_graph_budget(&mut self, sleep: SleepFactory, max_calls: u32, budget_ms: u64) {
         self.graph_budget = Some((sleep, max_calls, budget_ms));
     }
