@@ -901,21 +901,59 @@ the peer, or chain fetches) or runs `ms` in one pass is DEFERRED: its partial
 walk is saved as ONE record (`gasp::DeferredGraph`: the nodes fetched with
 their proofs, the inputs still pending as a stack, the calls spent, the
 passes, the reason), keyed (peer, topic, root outpoint) and REPLACED on every
-deferral through three defaulted `Storage` methods (`put_deferred_graph`,
-`find_deferred_graphs`, `delete_deferred_graph`; the default keeps nothing,
-so such a storage fails the UTXO as before, and a wrapper must forward them).
-The UTXO is held below the cursor like a failed one (the gap guard) and is
-not walked again in that sync (#554); the pass goes on to the next UTXO and
-topic. The next sync that is served the UTXO RESUMES: the record's nodes are
-appended again (no request), an UNPROVEN root is asked again (one call: once
-its block lands the peer serves it proven, the record is dropped
+deferral. The UTXO is held below the cursor like a failed one (the gap guard)
+and is not walked again in that sync (#554); the pass goes on to the next
+UTXO and topic. The next sync that is served the UTXO RESUMES: the record's
+nodes are appended again (no request), an UNPROVEN root is asked again (one
+call: once its block lands the peer serves it proven, the record is dropped
 `root_proven` and the walk restarts from it, shorter), and only the pending
-inputs are asked, under the same budget. A walk the per-peer deadline (D16)
-cuts is deferred the same way (`peer_deadline`), and a deferral counts as
-progress for the quarantine. With a budget, every walk error defers the
-graph with its progress (`fault`), except the peer's definite "not held" for
-an input an UNPROVEN node needs (an SPV necessity): that fails the UTXO as in
+inputs are asked. A walk the per-peer deadline (D16) cuts is deferred the
+same way (`peer_deadline`). With a budget, every walk error defers the graph
+with its progress (`fault`), except the peer's definite "not held" for an
+input an UNPROVEN node needs (an SPV necessity): that fails the UTXO as in
 the reference (`not_held`).
+
+The storage keeps the records through FOUR REQUIRED `Storage` methods
+(`put_deferred_graph`, answering `Saved` or `AtCeiling`;
+`find_deferred_graphs`, the KEYS of a (peer, topic) lowest score first;
+`get_deferred_graph`, one record; `delete_deferred_graph`), mirrored by four
+required `GASPStorage` methods (the lens fold's M2, the house style of
+`identify_admissible_outputs`). With defaults, a storage or wrapper that did
+not forward them compiled, and a budget over it saved nothing: every graph
+past the call budget was walked from its root to the cap on every tick and
+never admitted (`store_fault`), a hard cap on graph size. Now a re-pin fails
+to compile until every impl and wrapper decides (measured: `E0046`, the four
+named). A backend that keeps no records answers none and refuses every save,
+and must not be given a budget. A sync reads the KEYS up front and a record
+only when its UTXO is served (L3: the whole records of a (peer, topic), up
+to 16 MiB of JSON, were one D1 result inside the 128 MB isolate); a key read
+that faults resumes nothing and takes the (peer, topic) as FULL for the sync
+(L6: the count read 0 and the 16 could be passed by 16 more).
+
+Progress, for #302's quarantine (the lens fold's H1): a walk PROGRESSED when
+its pass appended at least one node or completed the graph; one cut by the
+per-graph budget or the per-peer deadline having appended NOTHING is
+STALLED, and keeps no record (a record holds at least one node; nothing is
+lost by not saving it). A sync is a FAILED attempt when it stalled and
+nothing else got done (no walk progressed, no graph finalized, the cursor did
+not move), at the per-peer deadline and on a sync that ran to its end
+(`errors` names it). Before the fold a deferral of 0 nodes counted as a live
+peer: a peer that lists UTXOs and never answers a node request (or answers
+each with a quick 5xx) was never quarantined, and about eight such hosts on a
+SHIP-mode topic (peers from the permissionless `ls_ship`) took the worker's
+240 s pass on every tick. A sync whose UTXOs failed in any other way is
+unchanged (a sync that ran to its end is a success, as before #555).
+
+One budget for the resumes (the lens fold's M1): the cursor is held below
+the deferred UTXOs, so the peer serves them FIRST; with a budget each, two of
+them filled the per-peer budget (the worker's 15 s of 30 s, LOW's 60 s of
+120 s) and no UTXO above them was reached. Every resume of one sync now
+shares ONE per-graph budget, a deadline made at the first resume and one
+call count, so the resumes take at most one graph's budget and the first new
+UTXO keeps its own. A record served once that budget is spent is HELD BACK
+untouched (no read, no pass counted; `held_back_graphs`) for the next sync,
+oldest score first. The limit, stated: a record held back behind another's
+resumes waits for that one's convergence or its 60 passes.
 
 A walk with nothing pending is completed as any graph is: D15's anchor check
 over the WHOLE graph (the resumed nodes included), the finalize submits
@@ -936,39 +974,76 @@ Bounds, all stated in `gasp.rs`: `DEFAULT_GRAPH_BUDGET_CALLS` 100 and
 `DEFAULT_GRAPH_BUDGET_MS` 60 s (half of LOW's 120 s topic slice; at the
 measured 1.2 s a request the time binds first, about 50 nodes a pass); the
 Cloudflare worker sets 100 calls and 15 s (half its 30 s per-peer budget,
-`gasp_deferred.rs`). A record deferred `DEFERRED_GRAPH_MAX_PASSES` (60) times
-is dropped at its next resume (`max_passes`) and the UTXO fails (the gap
-guard asks again: the next pass walks it from its root, a new record); one
-past `DEFERRED_GRAPH_MAX_BYTES` (1 MiB of JSON) is dropped (`too_big`); at
-most `DEFERRED_GRAPHS_PER_PEER_TOPIC` (16) records per (peer, topic), a new
-deferral past it is not saved (`too_many`); a record whose UTXO a sync that
-ran to its end was not served (spent at the peer) is dropped (`not_served`),
-one the node now holds (`held`); a write that faults (`store_fault`). Each
-dropped UTXO fails as before #555.
+`gasp_deferred.rs`; with M1 the resumes of a pass together take at most that
+half). A record deferred `DEFERRED_GRAPH_MAX_PASSES` (60) times is dropped at
+its next resume (`max_passes`) and the UTXO fails (the gap guard asks again:
+the next pass walks it from its root, a new record); a record whose UTXO a
+sync that ran to its end was not served (spent at the peer) is dropped
+(`not_served`), one the node now holds (`held`); a write that faults
+(`store_fault`); a resumed record whose pass ends still holding no node (one
+saved before the fold) `no_progress`. A walk past its per-graph budget that
+cannot be KEPT, past `DEFERRED_GRAPH_MAX_BYTES` (1 MiB of JSON, `too_big`),
+past `DEFERRED_GRAPHS_PER_PEER_TOPIC` (16 per (peer, topic), `too_many`) or
+at the storage's ceiling (`AtCeiling`, counted `too_many`), is counted and
+then GOES ON under the per-peer budget alone, as every walk did before #555
+(the lens fold's L4: such a graph completed in one pass before #555 and was
+failed on every pass after it).
 
 The worker: `gasp_deferred_graphs` (migration 170, transient, one row per
-graph), `/health/invariants.gasp.deferredGraphs` (`count`, `oldest`, the
-oldest 20 as {topic, peer, outpoint, nodes, pending, calls, passes, reason,
-bytes, ageSecs}, the `budget`), the counters `gasp_graph_deferred_total`,
-`gasp_graph_resumed_total`, `gasp_graph_converged_total`,
-`gasp_graph_dropped_total` and `gasp_graph_dropped_<reason>_total` (bumped by
-the cron's pass; `/admin/startGASPSync` returns the same figures in its body
-and bumps none), and the `Scheduled: GASP sync:` line's `deferred_graphs`,
-`resumed_graphs`, `converged_graphs`, `dropped_graphs` (the per-topic line
-names each drop's outpoint and reason). `TopicSyncResult` carries
-`deferred_graphs`, `resumed_graphs`, `converged_graphs`, `dropped_graphs`.
+graph). Its upsert carries a GLOBAL ceiling in the statement itself (the
+lens fold's M3, as #576's `PARK_SQL`): a new key only under 256 rows
+(`DEFERRED_GRAPHS_MAX_ROWS`), and any save only while the rows' `bytes` stay
+within 64 MiB (`DEFERRED_GRAPHS_MAX_TOTAL_BYTES`); a refused save returns no
+row (`AtCeiling`). The cron sweeps, before its GASP sync, every row not
+written for 30 h (`DEFERRED_GRAPH_STALE_SECS`: twice 60 passes at `*/15`, so
+a record held back behind another's whole life survives), logs each and
+counts `gasp_graph_dropped_stale_total` (and `gasp_graph_dropped_total`):
+before the fold a peer that never finished a sync again (dark, quarantined,
+its advert revoked) kept its rows for good, and a stranger advertising hosts
+on a SHIP-mode topic could fill about 1.4 GB a day into the D1 the overlay
+shares with the app layer. The table stays transient, so its sweep needs no
+`delete_scope` (the ownership checker refuses one on a table that is not
+never-wipe). `/health/invariants.gasp.deferredGraphs` serves `count`,
+`totalBytes`, `oldest`, the oldest 20 as {topic, peer, outpoint, nodes,
+pending, calls, passes, reason, bytes, ageSecs}, and the `budget` (calls,
+ms, maxPasses, maxBytes, perPeerTopic, maxRows, maxTotalBytes, staleSecs);
+the counters `gasp_graph_deferred_total`, `gasp_graph_resumed_total`,
+`gasp_graph_converged_total`, `gasp_graph_dropped_total` and
+`gasp_graph_dropped_<reason>_total` (the reasons above and `stale`; bumped
+by the cron's pass; `/admin/startGASPSync` returns the same figures in its
+body and bumps none), and the `Scheduled: GASP sync:` line's
+`deferred_graphs`, `resumed_graphs`, `converged_graphs`, `dropped_graphs`,
+`stalled_graphs`, `held_back_graphs` (the per-topic line names each drop's
+outpoint and reason). `TopicSyncResult` carries the same six.
 
 Limits, stated. The reference (ts-stack `f999e0c1a`) has no budget and no
 deferral: all of it is an addition. A resumed graph's earlier nodes are the
 peer's bytes of an earlier pass (a transaction is immutable; a proof that
-arrived since is not re-asked, except the root's). "Converged" is counted
-when the graph's finalize landed, under a per-peer budget (the hook); without
-one, when it completed. Pins: `cargo test -p bsv-overlay-engine --features
+arrived since is not re-asked, except the root's). A PROVEN node saved before
+a reorg is re-appended as is (the lens fold's L1): the anchor check at
+completion re-checks against the chain tracker, so a stale proof is never
+admitted, but it is a REFUSAL and the cursor moves past that graph, where a
+fresh walk would have fetched the new proof; records live at most 60 passes
+(15 h at `*/15`). Not built: a refusal of a resumed graph that walks it once
+more from its root cannot be bounded without keeping a mark past the record's
+deletion. "Converged" is counted when the graph's finalize landed, under a
+per-peer budget (the hook); without one, when it completed; a graph restarted
+`root_proven` is counted dropped (`root_proven`) and its later landing is a
+fresh graph's, not counted `converged` (the lens's N1). Whether D1's binding
+takes a 1 MiB bound record is unverified (the lens's L5): the statements run
+under rusqlite and the route cell seeds its row with `wrangler d1 execute`,
+and local D1 does not enforce the platform's limits (2 MB a row; the 100 KB
+statement limit does not count bound values). `byte_size` serializes a record
+once more to measure it. Pins: `cargo test -p bsv-overlay-engine --features
 memory-storage --test gasp_topic_manager e555` (a to h and b2, each RED on
-`cf933e8` with the API grafted inert; pin B hangs there), the worker's
-`gasp_deferred::tests` (the shipped statements under real SQLite, the health
-view, the counters) and the route cell `tools/lane-e555/deferred_graphs_route_ci.mjs`
-(`make ci-d1-budget`).
+`cf933e8` with the API grafted inert, pin B hangs there; the lens fold's
+`e555f_h1` x2, `e555f_m1`, `e555f_l3`, `e555f_l4`, `e555f_l6`, each RED on
+`03e1e17` with the fold's test knobs grafted inert; `e555_b`, `b2` and `c`
+amended by H1, L4 and M1), the worker's `gasp_deferred::tests` (the shipped
+statements under real SQLite, the health view, the counters; the fold's
+`e555f_m3` ceiling and sweep, RED on `03e1e17`) and the route cell
+`tools/lane-e555/deferred_graphs_route_ci.mjs` (`make ci-d1-budget`; the
+fold's `totalBytes`, ceiling and counters, RED on `03e1e17`).
 
 ## Storage ownership (bsv-low #474)
 

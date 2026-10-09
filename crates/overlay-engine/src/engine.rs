@@ -885,10 +885,17 @@ impl Engine {
     /// [`crate::gasp::DEFAULT_GRAPH_BUDGET_CALLS`],
     /// [`crate::gasp::DEFAULT_GRAPH_BUDGET_MS`].
     ///
+    /// Every resume of one sync shares ONE such budget (the lens fold's M1),
+    /// so the deferred UTXOs, served first, leave the pass the rest; a walk
+    /// that fetched nothing keeps no record and is a failed attempt for the
+    /// quarantine (H1); a walk that cannot be kept goes on under the
+    /// per-peer budget alone (L4).
+    ///
     /// Unset (the default) nothing is deferred and the walk is the one
     /// before #555 (parity: the reference has no budget and no deferral).
-    /// A storage that keeps no records (the trait's default) defers nothing
-    /// either: a graph past the budget then fails its UTXO.
+    /// The storage must KEEP records (the four required deferred-graph
+    /// methods of [`Storage`]): over one that refuses every save, every
+    /// graph past the budget fails its UTXO, so do not set a budget there.
     pub fn set_graph_budget(&mut self, sleep: SleepFactory, max_calls: u32, budget_ms: u64) {
         self.graph_budget = Some((sleep, max_calls, budget_ms));
     }
