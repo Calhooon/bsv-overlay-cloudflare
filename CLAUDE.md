@@ -1416,7 +1416,7 @@ a BEEF (the owner's ruling of 2026-10-09). A limb is read BEFORE a step, so a
 pass always makes one request: a node bigger than the whole limb is walked,
 one a pass. The resumes of one sync share the limbs as they share the calls
 (M1); a walk the limbs cut that cannot be KEPT goes on under the per-peer
-budget alone (L4). The reference has no budget.
+budget alone (L4). The reference has no budget. Two residuals of the delta lens, stated: the engine's direct `set_graph_budget_limbs` is uncapped (a consumer that sets the bytes limb above its own record cap re-opens E586-L1; the worker's var is clamped to the cap), and the bytes var's floor of 1 lets an operator set the limb below one node's served size, where a `root_unproven` resume makes no progress until `max_passes` releases the record (bounded, self-healing, unreachable at the defaults: an operator who sets a limb smaller than a node has set it wrong).
 
 **The bytes limb sits under the record cap (the lens fold, E586-L1).** The
 default was 4 MiB, above the 1 MiB cap of a record

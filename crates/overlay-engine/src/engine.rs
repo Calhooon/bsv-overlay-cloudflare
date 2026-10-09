@@ -947,7 +947,11 @@ impl Engine {
     /// They bound what one pass adds to the pending graph and to its record
     /// while the anchor check and the finalize hold it in memory. No effect
     /// until [`Engine::set_graph_budget`] turns deferral on; the reference
-    /// has neither.
+    /// has neither. This setter is UNCAPPED (the delta lens's D-N1): a direct
+    /// consumer may set the bytes limb above its own record cap and re-open
+    /// E586-L1 (a pass whose record cannot be saved walks afresh); the worker's
+    /// `GASP_GRAPH_BUDGET_BYTES` var is the capped path (clamped to the cap).
+    /// Keep the bytes limb under the record cap you keep.
     pub fn set_graph_budget_limbs(&mut self, max_bytes_fetched: u64, max_nodes: u32) {
         self.graph_budget_limbs = (max_bytes_fetched, max_nodes);
     }
