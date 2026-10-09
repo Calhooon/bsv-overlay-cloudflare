@@ -216,9 +216,11 @@ if (reparked) {
   expect(
     // The fixture's bytes are refused by the replay's BEEF reader: before P0-5f (bsv-rs 0.3.35, the bounded
     // stranger readers, overlay a8a8d73) they parsed to a BEEF whose subject could not be derived; since, the
-    // bounded reader refuses them first ("reader underflow"). Either is the re-driven replay's own fault, and
-    // the history must carry the fault the row carries.
-    Number(reparked.redrives) === 1 && hist.length === 1 && hist[0].redrive === 1 && typeof hist[0].fault === 'string' && hist[0].fault.length > 0 && hist[0].fault === reparked.fault && /subject could not be derived|reader underflow/.test(hist[0].fault),
+    // bounded reader refuses them first ("reader underflow"). Since NL-6 (bsv-rs 0.4.0, the streaming door) the
+    // refusal names the invalid bytes: the fixture is three zero bytes, so the stream ends inside the four-byte
+    // version word ("invalid BEEF at byte 0: Truncated"). Each is the re-driven replay's own fault, and the
+    // history must carry the fault the row carries.
+    Number(reparked.redrives) === 1 && hist.length === 1 && hist[0].redrive === 1 && typeof hist[0].fault === 'string' && hist[0].fault.length > 0 && hist[0].fault === reparked.fault && /invalid BEEF at byte 0: Truncated/.test(hist[0].fault),
     "its history names the re-drive and the re-driven replay's fault",
     JSON.stringify({ ...reparked, message: '…' }),
   )
