@@ -41,9 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-#[cfg(test)]
-use bsv_rs::transaction::MerklePath;
-use bsv_rs::transaction::{Beef, ChainTracker, ChainTrackerError, Transaction};
+use bsv_rs::transaction::{Beef, ChainTracker, ChainTrackerError, MerklePath, Transaction};
 use tracing::{debug, error, warn};
 
 use crate::gasp::{GASPError, GASPStorage};
@@ -131,6 +129,18 @@ pub struct OverlayGASPStorage<'a> {
     /// Whether that peer is CONFIGURED (`SyncTarget::Peers`), written into
     /// each record saved (the delta-2 fold's D2-M2, [`Self::with_configured_peer`]).
     configured_peer: bool,
+    /// The graph the anchor check last PASSED, parsed and checked, kept for
+    /// its `finalize_graph` so a graph is parsed once (bsv-low #586). Dropped
+    /// by anything that changes or discards a pending graph.
+    anchored: Mutex<Option<AnchoredGraph>>,
+}
+
+/// A graph the anchor check passed: what `finalize_graph` assembles from.
+struct AnchoredGraph {
+    graph_id: String,
+    strict_beef: bool,
+    order: Vec<String>,
+    assembly: GraphAssembly,
 }
 
 /// Lends the engine's tracker to the anchor check and notes whether it
@@ -170,8 +180,284 @@ struct AnchorInput {
     root_beef: Vec<u8>,
     /// Inputs of the root's UNPROVEN ancestry that the graph does not carry.
     absent_sources: Vec<(String, u32)>,
-    /// The graph's BEEFs, ancestors first, root last.
-    ordered_beefs: Vec<Vec<u8>>,
+    /// The keys of the graph's nodes in finalize order: ancestors first,
+    /// root last. Each one's BEEF is assembled when the replay reaches it
+    /// and dropped after it (bsv-low #586): the check never holds the
+    /// graph's BEEFs together.
+    order: Vec<String>,
+    /// The graph's transactions and proofs, parsed once and CHECKED: every
+    /// BEEF of `order` can be assembled from it.
+    assembly: GraphAssembly,
+}
+
+/// One transaction of a pending graph, parsed once.
+struct ParsedTx {
+    tx: Transaction,
+    txid: String,
+}
+
+/// One node of a pending graph as its BEEFs need it.
+struct AssemblyNode {
+    /// Shared by every node of one transaction (one node per output index
+    /// an unproven spender asked for).
+    parsed: Rc<ParsedTx>,
+    /// The node's own proof. A proven node is a leaf of every BEEF.
+    proof: Option<MerklePath>,
+    /// Per input of an UNPROVEN node: the key of the node that holds its
+    /// source, when the graph has one. Empty for a proven node.
+    sources: Vec<Option<String>>,
+}
+
+/// A pending graph's BEEFs, assembled from its raw transactions and proofs
+/// parsed ONCE each (bsv-low #586, zanaadu-v2 #377).
+///
+/// Before it, `get_beef_for_node` hydrated a `source_transaction` tree by
+/// recursion: every reference to a shared ancestor rebuilt that ancestor's
+/// whole subtree (parse, raw bytes and hex of each transaction, cloned per
+/// parent), and serialized it at every level, so an unmined graph with
+/// fan-in cost its PATHS, not its transactions: Zanaadu measured 36x the
+/// fetched bytes on 13 nodes, each further unproven layer multiplying by its
+/// fan-in. The reference hydrates the same way (`OverlayGASPStorage.ts`
+/// `getBEEFForNode`, f999e0c1a: `hydrator` parses a node again for every
+/// input that reaches it; JavaScript shares nothing between the copies
+/// either), so it has the same multiplier.
+///
+/// Here a transaction is parsed once per graph (keyed by its bytes), a node
+/// names its sources by KEY, and a node's BEEF is the walk
+/// `Transaction::to_beef` made over the hydrated tree (`bsv-rs`
+/// `collect_ancestors`: depth first, inputs from the last to the first, a
+/// proven node a leaf, a txid collected once, a transaction after its
+/// sources; proofs deduplicated by height and root), made over the keys
+/// instead, then the SDK's own `Beef` (`merge_bump`, `merge_transaction`,
+/// `to_binary`, whose sort is the SDK's). The bytes are the ones the tree
+/// gave, for every graph: the frozen digests of `tests/gasp_topic_manager.rs`
+/// and of the witness hold.
+///
+/// Both walks keep their work on the heap (the recursion they replace used
+/// the stack, once per unproven link), and neither follows a link back into
+/// a node it is still inside.
+#[derive(Default)]
+struct GraphAssembly {
+    /// By the SHA-256 of a transaction's raw bytes.
+    txs: HashMap<[u8; 32], Rc<ParsedTx>>,
+    /// The transaction of each node key asked for.
+    parsed: HashMap<String, Rc<ParsedTx>>,
+    /// By node key.
+    nodes: HashMap<String, Rc<AssemblyNode>>,
+    /// (node key, strict) whose BEEF is known to assemble.
+    checked: HashSet<(String, bool)>,
+}
+
+impl GraphAssembly {
+    /// The transaction of the node `key`, parsed once per graph.
+    fn parsed_tx(
+        &mut self,
+        key: &str,
+        refs: &HashMap<String, PendingNode>,
+    ) -> Result<Rc<ParsedTx>, GASPError> {
+        if let Some(parsed) = self.parsed.get(key) {
+            return Ok(parsed.clone());
+        }
+        let pending = refs
+            .get(key)
+            .ok_or_else(|| GASPError::Other(format!("Node {key} not found in graph refs")))?;
+        let unparsed =
+            |e: bsv_rs::Error| GASPError::Other(format!("Failed to parse raw_tx for {key}: {e}"));
+        let raw = bsv_rs::primitives::from_hex(&pending.node.raw_tx).map_err(unparsed)?;
+        let parsed = match self.txs.entry(bsv_rs::primitives::hash::sha256(&raw)) {
+            std::collections::hash_map::Entry::Occupied(known) => known.get().clone(),
+            std::collections::hash_map::Entry::Vacant(new) => {
+                let tx = Transaction::from_binary(&raw).map_err(unparsed)?;
+                let txid = tx.id();
+                new.insert(Rc::new(ParsedTx { tx, txid })).clone()
+            }
+        };
+        self.parsed.insert(key.to_string(), parsed.clone());
+        Ok(parsed)
+    }
+
+    /// The node `key`: its transaction, its proof, and where the graph
+    /// holds each input's source.
+    fn node(
+        &mut self,
+        key: &str,
+        refs: &HashMap<String, PendingNode>,
+    ) -> Result<Rc<AssemblyNode>, GASPError> {
+        if let Some(node) = self.nodes.get(key) {
+            return Ok(node.clone());
+        }
+        let parsed = self.parsed_tx(key, refs)?;
+        let proof = match refs
+            .get(key)
+            .and_then(|pending| pending.node.proof.as_ref())
+        {
+            Some(proof_hex) => Some(
+                beef_limits::merkle_path_from_hex(proof_hex, beef_limits::PEER_PROOF_MAX_BYTES)
+                    .map_err(|e| {
+                        GASPError::Other(format!("Failed to parse proof for {key}: {e}"))
+                    })?,
+            ),
+            None => None,
+        };
+        // A proven node is a leaf. An unproven one takes each input's source
+        // from the node filed under that outpoint, when the graph has it.
+        let sources = if proof.is_some() {
+            Vec::new()
+        } else {
+            parsed
+                .tx
+                .inputs
+                .iter()
+                .map(|input| {
+                    let source_txid = input.get_source_txid().unwrap_or_default();
+                    if source_txid.is_empty() {
+                        return None;
+                    }
+                    let child_key = format!("{}.{}", source_txid, input.source_output_index);
+                    refs.contains_key(&child_key).then_some(child_key)
+                })
+                .collect()
+        };
+        let node = Rc::new(AssemblyNode {
+            parsed,
+            proof,
+            sources,
+        });
+        self.nodes.insert(key.to_string(), node.clone());
+        Ok(node)
+    }
+
+    /// Check that the BEEF of `key` can be assembled: every node it reaches
+    /// parses (its transaction, its proof), and under `strict` no unproven
+    /// node lacks a source (`to_beef(false)`'s rule; tolerant, a missing
+    /// source is left out silently, `to_beef(true)`). The errors are the ones
+    /// the hydrating recursion gave, in its order: a node on entry, its
+    /// sources in input order, its own missing source on the way out. A node
+    /// is checked once per graph.
+    fn check(
+        &mut self,
+        key: &str,
+        refs: &HashMap<String, PendingNode>,
+        strict: bool,
+    ) -> Result<(), GASPError> {
+        // (node key, the node, the next input to follow)
+        let mut stack: Vec<(String, Rc<AssemblyNode>, usize)> = Vec::new();
+        let mut inside: HashSet<String> = HashSet::new();
+        let mut entering: Option<String> = Some(key.to_string());
+        loop {
+            if let Some(key) = entering.take() {
+                if !self.checked.contains(&(key.clone(), strict)) && inside.insert(key.clone()) {
+                    let node = self.node(&key, refs)?;
+                    stack.push((key, node, 0));
+                }
+            }
+            let Some((_, node, next)) = stack.last_mut() else {
+                return Ok(());
+            };
+            if let Some(source) = node.sources.get(*next) {
+                *next += 1;
+                entering.clone_from(source);
+                continue;
+            }
+            let (key, node, _) = stack.pop().expect("the stack is not empty");
+            if strict {
+                if let Some(missing) = node.sources.iter().rposition(Option::is_none) {
+                    let source_txid = node.parsed.tx.inputs[missing]
+                        .source_txid
+                        .as_deref()
+                        .unwrap_or("unknown");
+                    // The SDK's own refusal, word for word (`to_beef(false)`).
+                    let e = bsv_rs::Error::TransactionError(format!(
+                        "Missing source transaction for input {missing} (txid: {source_txid}). \
+                         Set allow_partial=true to skip missing source transactions."
+                    ));
+                    return Err(GASPError::Other(format!(
+                        "Failed to serialize BEEF for {key}: {e}"
+                    )));
+                }
+            }
+            inside.remove(&key);
+            self.checked.insert((key, strict));
+        }
+    }
+
+    /// The txid of a checked node.
+    fn txid_of(&self, key: &str) -> Option<&str> {
+        self.nodes.get(key).map(|node| node.parsed.txid.as_str())
+    }
+
+    /// The BEEF of a CHECKED node: its transaction and its unproven
+    /// ancestry down to the first proven node of every branch, each
+    /// transaction once. Nothing is hydrated: the only copies made are the
+    /// ones the `Beef` being written holds, dropped with it.
+    fn beef_of(&self, key: &str) -> Vec<u8> {
+        struct Frame<'n> {
+            node: &'n AssemblyNode,
+            inputs_left: usize,
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut inside: HashSet<&str> = HashSet::new();
+        let mut ancestors: Vec<&AssemblyNode> = Vec::new();
+        let mut bumps: Vec<MerklePath> = Vec::new();
+        let mut bump_index_by_root: HashMap<String, usize> = HashMap::new();
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut entering: Option<&AssemblyNode> = self.nodes.get(key).map(Rc::as_ref);
+        loop {
+            if let Some(node) = entering.take() {
+                let txid = node.parsed.txid.as_str();
+                if seen.contains(txid) || inside.contains(txid) {
+                    // Already collected (or being collected): skip it.
+                } else if let Some(merkle_path) = &node.proof {
+                    // Proven: its proof and itself, and no further. Proofs
+                    // are deduplicated by block height and computed root.
+                    let root = merkle_path.compute_root(Some(txid)).unwrap_or_default();
+                    let slot = format!("{}:{}", merkle_path.block_height, root);
+                    match bump_index_by_root.get(&slot) {
+                        Some(&existing) if bumps[existing].combine(merkle_path).is_ok() => {}
+                        _ => {
+                            bump_index_by_root.insert(slot, bumps.len());
+                            bumps.push(merkle_path.clone());
+                        }
+                    }
+                    seen.insert(txid);
+                    ancestors.push(node);
+                } else {
+                    inside.insert(txid);
+                    stack.push(Frame {
+                        node,
+                        inputs_left: node.sources.len(),
+                    });
+                }
+            }
+            let Some(top) = stack.last_mut() else {
+                break;
+            };
+            if top.inputs_left == 0 {
+                let node = stack.pop().expect("the stack is not empty").node;
+                inside.remove(node.parsed.txid.as_str());
+                seen.insert(node.parsed.txid.as_str());
+                ancestors.push(node);
+                continue;
+            }
+            top.inputs_left -= 1;
+            if let Some(source) = &top.node.sources[top.inputs_left] {
+                entering = self.nodes.get(source).map(Rc::as_ref);
+            }
+        }
+
+        let mut beef = Beef::new();
+        for bump in bumps {
+            beef.merge_bump(bump);
+        }
+        for node in ancestors {
+            beef.merge_transaction(node.parsed.tx.clone());
+        }
+        // The writer grows by doubling: a graph's BEEFs are held together
+        // by the finalize, so each gives its slack back.
+        let mut bytes = beef.to_binary();
+        bytes.shrink_to_fit();
+        bytes
+    }
 }
 
 impl<'a> OverlayGASPStorage<'a> {
@@ -195,7 +481,29 @@ impl<'a> OverlayGASPStorage<'a> {
             verify_scripts: true,
             peer: String::new(),
             configured_peer: false,
+            anchored: Mutex::new(None),
         }
+    }
+
+    /// Keep a graph the anchor check passed for its finalize.
+    fn keep_anchored(&self, graph_id: &str, order: Vec<String>, assembly: GraphAssembly) {
+        *self
+            .anchored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(AnchoredGraph {
+            graph_id: graph_id.to_string(),
+            strict_beef: self.strict_beef,
+            order,
+            assembly,
+        });
+    }
+
+    /// Take the graph kept by the anchor check (leaving none).
+    fn take_anchored(&self) -> Option<AnchoredGraph> {
+        self.anchored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// Name the peer this instance syncs from, the key under which its
@@ -284,112 +592,64 @@ impl<'a> OverlayGASPStorage<'a> {
         self.finalized_sink.lock().unwrap().len()
     }
 
-    /// Build a BEEF for a single graph node.
-    ///
-    /// Recursively walks the node's children (input providers) to hydrate
-    /// source transactions or attach merkle proofs. Returns the node's
-    /// transaction serialized as BEEF bytes.
-    fn get_beef_for_node(
-        node_key: &str,
-        refs: &HashMap<String, PendingNode>,
-        strict_beef: bool,
-    ) -> Result<(Transaction, Vec<u8>), GASPError> {
-        let pending = refs
-            .get(node_key)
-            .ok_or_else(|| GASPError::Other(format!("Node {node_key} not found in graph refs")))?;
-
-        let mut tx = Transaction::from_hex(&pending.node.raw_tx)
-            .map_err(|e| GASPError::Other(format!("Failed to parse raw_tx for {node_key}: {e}")))?;
-
-        // If this node has a proof, attach the merkle path — this is a leaf.
-        if let Some(ref proof_hex) = pending.node.proof {
-            tx.merkle_path = Some(
-                beef_limits::merkle_path_from_hex(proof_hex, beef_limits::PEER_PROOF_MAX_BYTES)
-                    .map_err(|e| {
-                        GASPError::Other(format!("Failed to parse proof for {node_key}: {e}"))
-                    })?,
-            );
-        } else {
-            // No proof — hydrate each input's source transaction from children.
-            // Collect child keys first to avoid borrow conflicts.
-            let child_info: Vec<(usize, String)> = tx
-                .inputs
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, input)| {
-                    let source_txid = input.get_source_txid().unwrap_or_default();
-                    if source_txid.is_empty() {
-                        return None;
+    /// The keys of a graph's nodes in the order their BEEFs are finalized
+    /// (ancestors first, root last): depth first from the root over each
+    /// node's `children`, a node after its children, each key once. An
+    /// explicit stack (bsv-low #586; it was a recursion, in this order).
+    fn ordered_keys(graph_id: &str, refs: &HashMap<String, PendingNode>) -> Vec<String> {
+        let mut order: Vec<String> = Vec::new();
+        let mut visited: HashSet<&str> = HashSet::new();
+        // (node key, its children, the next child to visit)
+        let mut stack: Vec<(&str, &[String], usize)> = Vec::new();
+        let mut entering: Option<&str> = Some(graph_id);
+        loop {
+            if let Some(key) = entering.take() {
+                if visited.insert(key) {
+                    if let Some(pending) = refs.get(key) {
+                        stack.push((key, &pending.children, 0));
                     }
-                    let child_key = format!("{}.{}", source_txid, input.source_output_index);
-                    if refs.contains_key(&child_key) {
-                        Some((idx, child_key))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            for (input_idx, child_key) in child_info {
-                let (child_tx, _) = Self::get_beef_for_node(&child_key, refs, strict_beef)?;
-                tx.inputs[input_idx].source_transaction = Some(Box::new(child_tx));
+                }
+            }
+            let Some((key, children, next)) = stack.last_mut() else {
+                return order;
+            };
+            if let Some(child) = children.get(*next) {
+                *next += 1;
+                entering = Some(child.as_str());
+            } else {
+                order.push((*key).to_string());
+                stack.pop();
             }
         }
-
-        // `allow_partial`: in tolerant mode (default, byte-identical to today)
-        // we pass `true` so missing-ancestor inputs are dropped silently. When
-        // strict mode is enabled (only alongside ancestor hydration), pass
-        // `false` so a still-missing ancestor fails loud and the graph is
-        // discarded + retried rather than stored as a partial BEEF.
-        let allow_partial = !strict_beef;
-        let beef = tx.to_beef(allow_partial).map_err(|e| {
-            GASPError::Other(format!("Failed to serialize BEEF for {node_key}: {e}"))
-        })?;
-
-        Ok((tx, beef))
     }
 
-    /// Compute ordered BEEFs for a graph (ancestors first, root last).
+    /// Compute ordered BEEFs for a graph (ancestors first, root last), each
+    /// node's BEEF assembled from the graph's transactions parsed ONCE
+    /// ([`GraphAssembly`]).
     ///
-    /// Walks the graph depth-first from the root, collecting BEEFs from
-    /// leaf nodes (with proofs) up to the root.
+    /// `anchored`: the graph as the anchor check left it, already parsed and
+    /// checked; without one (a finalize with no anchor check before it) it is
+    /// parsed and checked here.
     fn compute_ordered_beefs(
         graph_id: &str,
         refs: &HashMap<String, PendingNode>,
         strict_beef: bool,
+        anchored: Option<AnchoredGraph>,
     ) -> Result<Vec<Vec<u8>>, GASPError> {
-        let mut beefs: Vec<Vec<u8>> = Vec::new();
-        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        fn hydrate(
-            node_key: &str,
-            refs: &HashMap<String, PendingNode>,
-            beefs: &mut Vec<Vec<u8>>,
-            visited: &mut std::collections::HashSet<String>,
-            strict_beef: bool,
-        ) -> Result<(), GASPError> {
-            if visited.contains(node_key) {
-                return Ok(());
+        let (order, assembly) = match anchored {
+            Some(kept) if kept.graph_id == graph_id && kept.strict_beef == strict_beef => {
+                (kept.order, kept.assembly)
             }
-            visited.insert(node_key.to_string());
-
-            let Some(pending) = refs.get(node_key) else {
-                return Ok(());
-            };
-
-            // First, recurse into children (they go before us in order)
-            for child_key in &pending.children {
-                hydrate(child_key, refs, beefs, visited, strict_beef)?;
+            _ => {
+                let mut assembly = GraphAssembly::default();
+                let order = Self::ordered_keys(graph_id, refs);
+                for key in &order {
+                    assembly.check(key, refs, strict_beef)?;
+                }
+                (order, assembly)
             }
-
-            // Then add our own BEEF
-            let (_, beef) = OverlayGASPStorage::get_beef_for_node(node_key, refs, strict_beef)?;
-            beefs.push(beef);
-            Ok(())
-        }
-
-        hydrate(graph_id, refs, &mut beefs, &mut visited, strict_beef)?;
-        Ok(beefs)
+        };
+        Ok(order.iter().map(|key| assembly.beef_of(key)).collect())
     }
 
     /// Everything `validate_graph_anchor` needs of the pending graph, read in
@@ -425,6 +685,7 @@ impl<'a> OverlayGASPStorage<'a> {
             )));
         }
 
+        let mut assembly = GraphAssembly::default();
         let mut absent_sources: Vec<(String, u32)> = Vec::new();
         let mut visited: HashSet<&str> = HashSet::new();
         // (node key, whether a path of UNPROVEN nodes leads from the root to it)
@@ -436,12 +697,9 @@ impl<'a> OverlayGASPStorage<'a> {
             let Some(pending) = refs.get(key) else {
                 continue;
             };
-            let tx = Transaction::from_hex(&pending.node.raw_tx).map_err(|e| {
-                unassembled(GASPError::Other(format!(
-                    "Failed to parse raw_tx for {key}: {e}"
-                )))
-            })?;
-            let spends: HashSet<String> = tx
+            let parsed = assembly.parsed_tx(key, refs).map_err(unassembled)?;
+            let spends: HashSet<String> = parsed
+                .tx
                 .inputs
                 .iter()
                 .filter_map(|input| {
@@ -475,15 +733,21 @@ impl<'a> OverlayGASPStorage<'a> {
         // says: it is never stored, sources the storage holds are merged into
         // it, and the verifier refuses any source still missing. The ordered
         // BEEFs are assembled exactly as `finalize_graph` will assemble them.
-        let (root_tx, root_beef) =
-            Self::get_beef_for_node(graph_id, refs, false).map_err(unassembled)?;
-        let ordered_beefs =
-            Self::compute_ordered_beefs(graph_id, refs, strict_beef).map_err(unassembled)?;
+        assembly.check(graph_id, refs, false).map_err(unassembled)?;
+        let root_beef = assembly.beef_of(graph_id);
+        let root_txid = assembly.txid_of(graph_id).unwrap_or_default().to_string();
+        let order = Self::ordered_keys(graph_id, refs);
+        for key in &order {
+            assembly
+                .check(key, refs, strict_beef)
+                .map_err(unassembled)?;
+        }
         Ok(AnchorInput {
-            root_txid: root_tx.id(),
+            root_txid,
             root_beef,
             absent_sources,
-            ordered_beefs,
+            order,
+            assembly,
         })
     }
 }
@@ -848,6 +1112,8 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             }
         };
 
+        // The pending graphs change: nothing kept of an anchor check holds.
+        self.take_anchored();
         let mut refs = self
             .pending_graphs
             .lock()
@@ -879,7 +1145,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
     /// steps. An `Err` is a discard: `GASPSync::complete_graph` drops the
     /// graph and NOTHING of it reaches the sink.
     ///
-    /// **1. Bitcoin.** The ROOT node's BEEF (`get_beef_for_node`) is verified
+    /// **1. Bitcoin.** The ROOT node's BEEF (`GraphAssembly::beef_of`) is verified
     /// by the engine's own check, `verify_spv_like_the_reference`: the
     /// reference's `spvTx.verify(this.engine.chainTracker)`. With a tracker
     /// every merkle root in that BEEF is checked against it and every unproven
@@ -1010,6 +1276,9 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             &anchor.root_txid,
         )
         .await;
+        // The checked copy has done its work (bsv-low #586: not held through
+        // the replay).
+        drop(root_beef);
         if let Err(e) = verdict {
             if tracker
                 .as_ref()
@@ -1024,12 +1293,16 @@ impl GASPStorage for OverlayGASPStorage<'_> {
 
         // ── 2. Overlay ──────────────────────────────────────────────────
         let Some(manager) = self.topic_manager else {
+            self.keep_anchored(graph_id, anchor.order, anchor.assembly);
             return Ok(());
         };
         let mut coins: HashSet<String> = HashSet::new();
         let mut spent: HashSet<String> = HashSet::new();
         let mut replayed: HashSet<String> = HashSet::new();
-        for beef in &anchor.ordered_beefs {
+        for key in &anchor.order {
+            // One node's BEEF at a time, the bytes `finalize_graph` will
+            // assemble, dropped when its turn is over (bsv-low #586).
+            let beef = &anchor.assembly.beef_of(key);
             // The parse `Engine::submit` makes of the same bytes at finalize.
             let subject = Beef::from_binary(beef)
                 .map(|mut b| crate::subject::subject_txid_of(&mut b))
@@ -1094,6 +1367,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
                     .to_string(),
             ));
         }
+        self.keep_anchored(graph_id, anchor.order, anchor.assembly);
         Ok(())
     }
 
@@ -1124,7 +1398,8 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         debug!("Finalizing graph {graph_id} ({node_count} nodes). Computing ordered BEEFs.");
 
         // Compute ordered BEEFs for the graph.
-        let beefs = Self::compute_ordered_beefs(graph_id, &refs, self.strict_beef)?;
+        let beefs =
+            Self::compute_ordered_beefs(graph_id, &refs, self.strict_beef, self.take_anchored())?;
 
         // Push to shared sink for later Engine submission.
         drop(refs);
@@ -1156,6 +1431,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
     /// Discard a temporary graph that failed validation.
     async fn discard_graph(&self, graph_id: &str) -> Result<(), GASPError> {
         debug!("Discarding graph: {graph_id}");
+        self.take_anchored();
         let mut refs = self
             .pending_graphs
             .lock()
@@ -1865,5 +2141,378 @@ mod tests {
         // Should be empty after draining
         let taken2 = gasp_storage.take_finalized_graphs();
         assert!(taken2.is_empty());
+    }
+
+    // ── bsv-low #586: the assembly gives the bytes the hydrated tree gave ──
+
+    /// `get_beef_for_node` as it was on `fbb7fa8`, verbatim: the hydrating
+    /// recursion [`GraphAssembly`] replaced. Kept as the reference the
+    /// assembly is compared with, byte for byte and error for error.
+    fn legacy_get_beef_for_node(
+        node_key: &str,
+        refs: &HashMap<String, PendingNode>,
+        strict_beef: bool,
+    ) -> Result<(Transaction, Vec<u8>), GASPError> {
+        let pending = refs
+            .get(node_key)
+            .ok_or_else(|| GASPError::Other(format!("Node {node_key} not found in graph refs")))?;
+
+        let mut tx = Transaction::from_hex(&pending.node.raw_tx)
+            .map_err(|e| GASPError::Other(format!("Failed to parse raw_tx for {node_key}: {e}")))?;
+
+        if let Some(ref proof_hex) = pending.node.proof {
+            tx.merkle_path = Some(
+                beef_limits::merkle_path_from_hex(proof_hex, beef_limits::PEER_PROOF_MAX_BYTES)
+                    .map_err(|e| {
+                        GASPError::Other(format!("Failed to parse proof for {node_key}: {e}"))
+                    })?,
+            );
+        } else {
+            let child_info: Vec<(usize, String)> = tx
+                .inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, input)| {
+                    let source_txid = input.get_source_txid().unwrap_or_default();
+                    if source_txid.is_empty() {
+                        return None;
+                    }
+                    let child_key = format!("{}.{}", source_txid, input.source_output_index);
+                    if refs.contains_key(&child_key) {
+                        Some((idx, child_key))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for (input_idx, child_key) in child_info {
+                let (child_tx, _) = legacy_get_beef_for_node(&child_key, refs, strict_beef)?;
+                tx.inputs[input_idx].source_transaction = Some(Box::new(child_tx));
+            }
+        }
+
+        let allow_partial = !strict_beef;
+        let beef = tx.to_beef(allow_partial).map_err(|e| {
+            GASPError::Other(format!("Failed to serialize BEEF for {node_key}: {e}"))
+        })?;
+
+        Ok((tx, beef))
+    }
+
+    /// `compute_ordered_beefs` as it was on `fbb7fa8`, verbatim.
+    fn legacy_compute_ordered_beefs(
+        graph_id: &str,
+        refs: &HashMap<String, PendingNode>,
+        strict_beef: bool,
+    ) -> Result<Vec<Vec<u8>>, GASPError> {
+        let mut beefs: Vec<Vec<u8>> = Vec::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        fn hydrate(
+            node_key: &str,
+            refs: &HashMap<String, PendingNode>,
+            beefs: &mut Vec<Vec<u8>>,
+            visited: &mut std::collections::HashSet<String>,
+            strict_beef: bool,
+        ) -> Result<(), GASPError> {
+            if visited.contains(node_key) {
+                return Ok(());
+            }
+            visited.insert(node_key.to_string());
+
+            let Some(pending) = refs.get(node_key) else {
+                return Ok(());
+            };
+
+            for child_key in &pending.children {
+                hydrate(child_key, refs, beefs, visited, strict_beef)?;
+            }
+
+            let (_, beef) = legacy_get_beef_for_node(node_key, refs, strict_beef)?;
+            beefs.push(beef);
+            Ok(())
+        }
+
+        hydrate(graph_id, refs, &mut beefs, &mut visited, strict_beef)?;
+        Ok(beefs)
+    }
+
+    /// A small deterministic generator (no dependency, the same graphs on
+    /// every run).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    fn pending(raw_tx: String, output_index: u32, proof: Option<String>) -> PendingNode {
+        PendingNode {
+            node: GASPNode {
+                graph_id: "g".to_string(),
+                raw_tx,
+                output_index,
+                proof,
+                tx_metadata: None,
+                output_metadata: None,
+                inputs: None,
+            },
+            spent_by: None,
+            children: Vec::new(),
+        }
+    }
+
+    /// A random pending graph: up to 9 transactions, each spending up to
+    /// four outputs of earlier ones (two outputs of one transaction too, the
+    /// diamond), some proven (two of a pair sharing one block, so their
+    /// proofs COMBINE), some referenced outpoints absent from the graph (a
+    /// partial BEEF, a strict refusal), and now and then a proof or a raw
+    /// transaction that does not parse. Returns the graph and its root key.
+    fn random_graph(rng: &mut Lcg) -> (HashMap<String, PendingNode>, String) {
+        use bsv_rs::transaction::{MerklePathLeaf, TransactionInput, TransactionOutput};
+        let count = 2 + rng.below(8) as usize;
+        let mut txs: Vec<Transaction> = Vec::new();
+        for i in 0..count {
+            let mut tx = Transaction::new();
+            let mut spent: HashSet<(usize, u32)> = HashSet::new();
+            if i > 0 {
+                for _ in 0..rng.below(5) {
+                    let source = rng.below(i as u64) as usize;
+                    let vout = rng.below(3) as u32;
+                    if spent.insert((source, vout)) {
+                        tx.inputs
+                            .push(TransactionInput::new(txs[source].id(), vout));
+                    }
+                }
+            }
+            for _ in 0..3 {
+                tx.outputs.push(TransactionOutput::new(
+                    1000 + i as u64,
+                    bsv_rs::script::LockingScript::from_hex("51").unwrap(),
+                ));
+            }
+            txs.push(tx);
+        }
+        // Proofs: a transaction alone in its block, or a pair in one block.
+        let mut proofs: Vec<Option<String>> = vec![None; count];
+        let mut i = 0;
+        while i < count {
+            match rng.below(5) {
+                0 => {
+                    let path = vec![vec![MerklePathLeaf::new_txid(0, txs[i].id())]];
+                    proofs[i] = Some(MerklePath::new(100 + i as u32, path).unwrap().to_hex());
+                }
+                1 if i + 1 < count => {
+                    let (a, b) = (txs[i].id(), txs[i + 1].id());
+                    let height = 100 + i as u32;
+                    let of_a = vec![vec![
+                        MerklePathLeaf::new_txid(0, a.clone()),
+                        MerklePathLeaf::new(1, b.clone()),
+                    ]];
+                    let of_b = vec![vec![
+                        MerklePathLeaf::new(0, a),
+                        MerklePathLeaf::new_txid(1, b),
+                    ]];
+                    proofs[i] = Some(MerklePath::new(height, of_a).unwrap().to_hex());
+                    proofs[i + 1] = Some(MerklePath::new(height, of_b).unwrap().to_hex());
+                    i += 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let root_key = format!("{}.0", txs[count - 1].id());
+        let mut refs: HashMap<String, PendingNode> = HashMap::new();
+        refs.insert(
+            root_key.clone(),
+            pending(txs[count - 1].to_hex(), 0, proofs[count - 1].clone()),
+        );
+        // Every referenced outpoint is a node, most of the time; a node is
+        // a child of the node(s) of its spender.
+        for (i, tx) in txs.iter().enumerate().rev() {
+            let own_keys: Vec<String> = (0..3)
+                .map(|vout| format!("{}.{vout}", tx.id()))
+                .filter(|key| refs.contains_key(key))
+                .collect();
+            if own_keys.is_empty() || proofs[i].is_some() && rng.below(3) > 0 {
+                continue;
+            }
+            for input in &tx.inputs {
+                let source_txid = input.get_source_txid().unwrap();
+                let source = txs.iter().position(|t| t.id() == source_txid).unwrap();
+                let key = format!("{source_txid}.{}", input.source_output_index);
+                if rng.below(6) == 0 {
+                    continue;
+                }
+                let mut node = pending(
+                    txs[source].to_hex(),
+                    input.source_output_index,
+                    proofs[source].clone(),
+                );
+                match rng.below(40) {
+                    0 => node.node.proof = Some("zz".to_string()),
+                    1 => node.node.raw_tx = "00".to_string(),
+                    _ => {}
+                }
+                refs.insert(key.clone(), node);
+                for own in &own_keys {
+                    let children = &mut refs.get_mut(own).unwrap().children;
+                    if !children.contains(&key) {
+                        children.push(key.clone());
+                    }
+                }
+            }
+        }
+        (refs, root_key)
+    }
+
+    // The assembly against the recursion it replaced, over 600 random
+    // graphs, tolerant and strict: the BEEF of every node, the ordered BEEFs
+    // of the graph, and every refusal, are the same bytes and the same words.
+    #[test]
+    fn e586_the_assembly_gives_the_hydrated_trees_bytes_and_errors() {
+        let mut rng = Lcg(0x586);
+        let (mut beefs, mut refusals, mut proven, mut partial) = (0, 0, 0, 0);
+        for _ in 0..600 {
+            let (refs, root_key) = random_graph(&mut rng);
+            for strict in [false, true] {
+                let mut keys: Vec<&String> = refs.keys().collect();
+                keys.sort();
+                for key in keys {
+                    let legacy = legacy_get_beef_for_node(key, &refs, strict)
+                        .map(|(_, beef)| beef)
+                        .map_err(|e| e.to_string());
+                    // A fresh assembly per node, and one shared by the graph
+                    // below (`compute_ordered_beefs`): both orders of use.
+                    let mut assembly = GraphAssembly::default();
+                    let ours = assembly
+                        .check(key, &refs, strict)
+                        .map(|()| assembly.beef_of(key))
+                        .map_err(|e| e.to_string());
+                    assert_eq!(ours, legacy, "node {key}, strict {strict}");
+                    match &ours {
+                        Ok(beef) => {
+                            beefs += 1;
+                            let parsed = Beef::from_binary(beef).unwrap();
+                            proven += usize::from(!parsed.bumps.is_empty());
+                            partial += usize::from(
+                                !strict && legacy_get_beef_for_node(key, &refs, true).is_err(),
+                            );
+                        }
+                        Err(_) => refusals += 1,
+                    }
+                }
+                let legacy = legacy_compute_ordered_beefs(&root_key, &refs, strict)
+                    .map_err(|e| e.to_string());
+                let ours =
+                    OverlayGASPStorage::compute_ordered_beefs(&root_key, &refs, strict, None)
+                        .map_err(|e| e.to_string());
+                assert_eq!(ours, legacy, "graph {root_key}, strict {strict}");
+            }
+        }
+        println!(
+            "#586: {beefs} BEEFs equal ({proven} with a proof, {partial} partial), {refusals} refusals equal"
+        );
+        // The generator reached every class.
+        assert!(beefs > 2000 && proven > 300 && partial > 100 && refusals > 300);
+    }
+
+    // A node unknown to the graph, and the SDK's own words for a missing
+    // source under `strict_beef`.
+    #[test]
+    fn e586_the_refusals_are_the_recursions_words() {
+        let parent = "ab".repeat(32);
+        let raw = make_valid_tx_hex(&parent, 3);
+        let key = format!("{}.0", Transaction::from_hex(&raw).unwrap().id());
+        let refs = HashMap::from([(key.clone(), pending(raw, 0, None))]);
+        let mut assembly = GraphAssembly::default();
+        assert_eq!(
+            assembly
+                .check("nope.0", &refs, false)
+                .unwrap_err()
+                .to_string(),
+            legacy_get_beef_for_node("nope.0", &refs, false)
+                .unwrap_err()
+                .to_string()
+        );
+        let strict = assembly.check(&key, &refs, true).unwrap_err().to_string();
+        assert_eq!(
+            strict,
+            legacy_get_beef_for_node(&key, &refs, true)
+                .unwrap_err()
+                .to_string()
+        );
+        assert!(strict.contains(&format!(
+            "Missing source transaction for input 0 (txid: {parent})"
+        )));
+        // Tolerant, the same node assembles: a partial BEEF of one transaction.
+        assembly.check(&key, &refs, false).unwrap();
+        assert_eq!(
+            assembly.beef_of(&key),
+            legacy_get_beef_for_node(&key, &refs, false).unwrap().1
+        );
+    }
+
+    // The walks keep their work on the heap. A chain of 20,000 unproven
+    // links is assembled; the recursion it replaced used the stack once per
+    // link. And a link back into a node the walk is still inside (the root
+    // is filed under the graph id the PEER names, so a peer can file a root
+    // under an outpoint its own ancestry spends) ends there: the recursion
+    // never returned.
+    #[test]
+    fn e586_a_deep_chain_and_a_cycle_do_not_use_the_stack() {
+        use bsv_rs::transaction::{TransactionInput, TransactionOutput};
+        let mut refs: HashMap<String, PendingNode> = HashMap::new();
+        let mut previous: Option<String> = None;
+        let mut tip = String::new();
+        for i in 0..20_000u64 {
+            let mut tx = Transaction::new();
+            if let Some(txid) = &previous {
+                tx.inputs.push(TransactionInput::new(txid.clone(), 0));
+            }
+            tx.outputs.push(TransactionOutput::new(
+                i,
+                bsv_rs::script::LockingScript::from_hex("51").unwrap(),
+            ));
+            let txid = tx.id();
+            tip = format!("{txid}.0");
+            let mut node = pending(tx.to_hex(), 0, None);
+            if let Some(below) = &previous {
+                node.children.push(format!("{below}.0"));
+            }
+            refs.insert(tip.clone(), node);
+            previous = Some(txid);
+        }
+        assert_eq!(OverlayGASPStorage::ordered_keys(&tip, &refs).len(), 20_000);
+        let mut assembly = GraphAssembly::default();
+        assembly.check(&tip, &refs, true).unwrap();
+        let beef = Beef::from_binary(&assembly.beef_of(&tip)).unwrap();
+        assert_eq!(beef.txs.len(), 20_000);
+
+        // root (filed under `decoy.0`) spends y.0; y spends `decoy.0`.
+        let decoy = "cd".repeat(32);
+        let y_raw = make_valid_tx_hex(&decoy, 0);
+        let y = Transaction::from_hex(&y_raw).unwrap().id();
+        let root_raw = make_valid_tx_hex(&y, 0);
+        let root_key = format!("{decoy}.0");
+        let mut root = pending(root_raw, 0, None);
+        root.children.push(format!("{y}.0"));
+        let refs = HashMap::from([
+            (root_key.clone(), root),
+            (format!("{y}.0"), pending(y_raw, 0, None)),
+        ]);
+        let mut assembly = GraphAssembly::default();
+        assembly.check(&root_key, &refs, true).unwrap();
+        let beef = Beef::from_binary(&assembly.beef_of(&root_key)).unwrap();
+        assert_eq!(beef.txs.len(), 2);
+        let beefs =
+            OverlayGASPStorage::compute_ordered_beefs(&root_key, &refs, true, None).unwrap();
+        assert_eq!(beefs.len(), 2);
     }
 }
