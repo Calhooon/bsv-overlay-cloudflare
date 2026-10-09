@@ -492,7 +492,8 @@ is the S2 queued ack (the STEAK names what will be admitted once its
 predecessor lands, and nothing is held until the replay); the dry runs and
 the names call are manager CPU inside the Worker's cap, whose breach is the
 platform's error and never a record. Pre-existing and not widened: a graph
-deeper than the budget (#555), the unbounded anchor verify (#557), a "not
+deeper than the budget (#555; deferred and resumed since, with a per-graph
+budget), the unbounded anchor verify (#557), a "not
 now" over a BEEF above 90,000 bytes answering 502 (#568). It cannot tell a faulted predecessor from one nobody submitted
 yet: the successor is "not now" until it lands. And a transaction that admits
 nothing, found no coin and carries more UNPROVEN, UNLANDED bodies than 16
@@ -871,14 +872,12 @@ the deadline. A dropped tick that finalized a graph or moved the cursor is a
 SUCCESSFUL attempt for the quarantine count. With NO budget nothing can drop
 the sync and the graphs are submitted after it, as before.
 
-The budget bounds a TICK. Nothing bounds a GRAPH (parity: the reference has
-no node cap). So a chain reaches a node over several ticks only as far as the
-peer lists it as several UTXOs (a record or a second output along the way,
-several shards); ONE graph whose own walk outlasts the budget (a head chain
-whose tip is its only UTXO) is still dropped whole on every tick, never
-admitted, each tick a failed attempt toward quarantine. Resuming a walk needs
-its fetched nodes persisted across ticks, which the `Storage` trait does not
-offer.
+The budget bounds a TICK. Without a per-graph budget nothing bounds a GRAPH
+(parity: the reference has no node cap): a chain reaches a node over several
+ticks only as far as the peer lists it as several UTXOs, and ONE graph whose
+own walk outlasts the budget (a head chain whose tip is its only UTXO) is
+dropped whole on every tick, never admitted. Since bsv-low #555 a per-graph
+budget DEFERS such a graph and resumes it (next section).
 
 `TopicSyncResult` reports `finalized_graphs`, `deadline_dropped_graphs` (at
 most one per peer per sync; the same count tick after tick with no
@@ -887,6 +886,89 @@ most one per peer per sync; the same count tick after tick with no
 carries the totals and the per-topic line the cursors (`discarded_graphs` is
 on the first totals line). Pins: `cargo test -p bsv-overlay-engine --features
 memory-storage --test gasp_topic_manager i552` (and `fold_high1`).
+
+## Deferred graphs (bsv-low #555, measured as #582)
+
+The measured case (beta, 2026-10-09): a 0-conf picture head set by a fleet
+wallet; LOW's node walked its unproven ancestry (every input an SPV necessity)
+at about 1.2 s a peer request to the end of each pass, admitted nothing, and
+the next pass restarted the same graph from its root; two thirds of the
+minute cron's ticks were skipped behind it.
+
+`Engine::set_graph_budget(sleep, calls, ms)` turns DEFERRAL on (unset: the
+walk is the one before #555). A graph whose walk makes `calls` requests (to
+the peer, or chain fetches) or runs `ms` in one pass is DEFERRED: its partial
+walk is saved as ONE record (`gasp::DeferredGraph`: the nodes fetched with
+their proofs, the inputs still pending as a stack, the calls spent, the
+passes, the reason), keyed (peer, topic, root outpoint) and REPLACED on every
+deferral through three defaulted `Storage` methods (`put_deferred_graph`,
+`find_deferred_graphs`, `delete_deferred_graph`; the default keeps nothing,
+so such a storage fails the UTXO as before, and a wrapper must forward them).
+The UTXO is held below the cursor like a failed one (the gap guard) and is
+not walked again in that sync (#554); the pass goes on to the next UTXO and
+topic. The next sync that is served the UTXO RESUMES: the record's nodes are
+appended again (no request), an UNPROVEN root is asked again (one call: once
+its block lands the peer serves it proven, the record is dropped
+`root_proven` and the walk restarts from it, shorter), and only the pending
+inputs are asked, under the same budget. A walk the per-peer deadline (D16)
+cuts is deferred the same way (`peer_deadline`), and a deferral counts as
+progress for the quarantine. With a budget, every walk error defers the
+graph with its progress (`fault`), except the peer's definite "not held" for
+an input an UNPROVEN node needs (an SPV necessity): that fails the UTXO as in
+the reference (`not_held`).
+
+A walk with nothing pending is completed as any graph is: D15's anchor check
+over the WHOLE graph (the resumed nodes included), the finalize submits
+ancestors first, stopping at the first that does not land (e1d: no
+successor is recorded over a predecessor that did not land). A completed
+graph whose finalize did not land keeps its record with nothing pending
+(`not_landed`): the next pass completes it again without one request. An
+anchor fault (`AnchorUnavailable`) keeps it too; an anchor REFUSAL deletes it
+(`refused`, the cursor moves, as before).
+
+The walk is an explicit stack (it was a recursion; the order is the same: an
+input's whole branch before its next sibling; D13's pin B, byte-identical request
+lists, holds) whose state lives in the `GASPSync`, outside the raced future:
+each step is committed only when it finished, so a deadline that drops the
+future leaves the walk as it was before that step.
+
+Bounds, all stated in `gasp.rs`: `DEFAULT_GRAPH_BUDGET_CALLS` 100 and
+`DEFAULT_GRAPH_BUDGET_MS` 60 s (half of LOW's 120 s topic slice; at the
+measured 1.2 s a request the time binds first, about 50 nodes a pass); the
+Cloudflare worker sets 100 calls and 15 s (half its 30 s per-peer budget,
+`gasp_deferred.rs`). A record deferred `DEFERRED_GRAPH_MAX_PASSES` (60) times
+is dropped at its next resume (`max_passes`) and the UTXO fails (the gap
+guard asks again: the next pass walks it from its root, a new record); one
+past `DEFERRED_GRAPH_MAX_BYTES` (1 MiB of JSON) is dropped (`too_big`); at
+most `DEFERRED_GRAPHS_PER_PEER_TOPIC` (16) records per (peer, topic), a new
+deferral past it is not saved (`too_many`); a record whose UTXO a sync that
+ran to its end was not served (spent at the peer) is dropped (`not_served`),
+one the node now holds (`held`); a write that faults (`store_fault`). Each
+dropped UTXO fails as before #555.
+
+The worker: `gasp_deferred_graphs` (migration 170, transient, one row per
+graph), `/health/invariants.gasp.deferredGraphs` (`count`, `oldest`, the
+oldest 20 as {topic, peer, outpoint, nodes, pending, calls, passes, reason,
+bytes, ageSecs}, the `budget`), the counters `gasp_graph_deferred_total`,
+`gasp_graph_resumed_total`, `gasp_graph_converged_total`,
+`gasp_graph_dropped_total` and `gasp_graph_dropped_<reason>_total` (bumped by
+the cron's pass; `/admin/startGASPSync` returns the same figures in its body
+and bumps none), and the `Scheduled: GASP sync:` line's `deferred_graphs`,
+`resumed_graphs`, `converged_graphs`, `dropped_graphs` (the per-topic line
+names each drop's outpoint and reason). `TopicSyncResult` carries
+`deferred_graphs`, `resumed_graphs`, `converged_graphs`, `dropped_graphs`.
+
+Limits, stated. The reference (ts-stack `f999e0c1a`) has no budget and no
+deferral: all of it is an addition. A resumed graph's earlier nodes are the
+peer's bytes of an earlier pass (a transaction is immutable; a proof that
+arrived since is not re-asked, except the root's). "Converged" is counted
+when the graph's finalize landed, under a per-peer budget (the hook); without
+one, when it completed. Pins: `cargo test -p bsv-overlay-engine --features
+memory-storage --test gasp_topic_manager e555` (a to h and b2, each RED on
+`cf933e8` with the API grafted inert; pin B hangs there), the worker's
+`gasp_deferred::tests` (the shipped statements under real SQLite, the health
+view, the counters) and the route cell `tools/lane-e555/deferred_graphs_route_ci.mjs`
+(`make ci-d1-budget`).
 
 ## Storage ownership (bsv-low #474)
 

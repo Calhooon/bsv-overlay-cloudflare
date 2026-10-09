@@ -850,10 +850,12 @@ impl Engine {
     /// quarantine count: a peer serving a long bootstrap is not a dead peer.
     /// One with no progress is a failed attempt, as before.
     ///
-    /// The budget bounds the work of a TICK. Nothing bounds a GRAPH (parity:
-    /// the reference has no node cap): one graph whose own walk outlasts the
-    /// budget is dropped on every tick (`deadline_dropped_graphs`) and never
-    /// admitted.
+    /// The budget bounds the work of a TICK. Without a per-graph budget
+    /// nothing bounds a GRAPH (parity: the reference has no node cap): one
+    /// graph whose own walk outlasts the budget is dropped on every tick
+    /// (`deadline_dropped_graphs`) and never admitted. With one
+    /// ([`Engine::set_graph_budget`], bsv-low #555) that walk is deferred
+    /// with its progress kept, here too, and resumed next tick.
     pub fn set_peer_sync_budget(&mut self, sleep: SleepFactory, budget_ms: u64) {
         self.peer_sync_budget = Some((sleep, budget_ms));
     }
@@ -5322,7 +5324,9 @@ pub struct TopicSyncResult {
     /// budget (bsv-low #552): at most one per peer per sync. NOTHING of such
     /// a graph was admitted; the next sync walks it again. The same root
     /// counted tick after tick with no `finalized_graphs` and no
-    /// `cursor_moves` is ONE graph whose walk outlasts the budget.
+    /// `cursor_moves` is ONE graph whose walk outlasts the budget (with a
+    /// per-graph budget it is also counted in `deferred_graphs` and resumed,
+    /// bsv-low #555).
     #[serde(default)]
     pub deadline_dropped_graphs: u64,
     /// Every persisted cursor that moved in this sync (bsv-low #552), one

@@ -570,8 +570,11 @@ pub trait AncestorFetcher {
     /// `maxNodesInGraph` in `Engine.startGASPSync`. A per-peer budget drops the
     /// sync future at its deadline: the graphs finalized before it stay
     /// admitted (bsv-low #552, [`FinalizedGraphHook`]), the graph in flight
-    /// is lost whole and walked again by the next sync. ONE graph whose own
-    /// walk outlasts the budget still never completes.
+    /// is lost whole and walked again by the next sync, unless a per-graph
+    /// budget is set (bsv-low #555, `Engine::set_graph_budget`): then a walk
+    /// past either budget is deferred with its fetched nodes kept and resumed
+    /// by the next sync, so ONE graph deeper than a pass converges over
+    /// passes. Without it such a graph still never completes.
     ///
     /// The implementation MUST verify that the returned bytes hash to the
     /// requested `txid` before returning them (integrity check) so a
@@ -1788,7 +1791,8 @@ impl<'a> GASPSync<'a> {
                 // deadline: graphs finalized before it stay admitted
                 // (bsv-low #552), the graph in flight is lost whole,
                 // and ONE graph whose own walk outlasts the budget
-                // still never completes.
+                // never completes unless a per-graph budget defers and
+                // resumes it (bsv-low #555).
                 //
                 // Every fetcher error fails the UTXO (the `?`):
                 // the fetcher arm never prunes, see the rule above.
