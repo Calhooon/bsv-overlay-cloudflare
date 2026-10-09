@@ -1601,35 +1601,16 @@ mod tests {
         let _ = crate::pot_changes::drain();
         let disagree = single_tx_bump(&orphaned, 965_773).to_hex();
         let fetcher = CourierStub(
-            [
-                (orphaned.clone(), Ok(Some(disagree))),
-                (quiet.clone(), Ok(None)),
-            ]
-            .into_iter()
-            .collect(),
+            [(orphaned.clone(), Ok(Some(disagree))), (quiet.clone(), Ok(None))]
+                .into_iter()
+                .collect(),
         );
         let tracker = MockChainTracker::new(965_775);
-        let s = reverify_window(
-            &store,
-            Some(&tracker),
-            Some(&fetcher),
-            965_771,
-            965_773,
-            None,
-            50,
-            false,
-        )
-        .await;
+        let s = reverify_window(&store, Some(&tracker), Some(&fetcher), 965_771, 965_773, None, 50, false).await;
         assert_eq!(s.stale, 1, "{s:?}");
         let noted = crate::pot_changes::drain();
-        assert!(
-            noted.contains(&(pot(64), 0)),
-            "the demoted pot is noted, got {noted:?}"
-        );
-        assert!(
-            !noted.contains(&(pot(65), 0)),
-            "the standing pot is not, got {noted:?}"
-        );
+        assert!(noted.contains(&(pot(64), 0)), "the demoted pot is noted, got {noted:?}");
+        assert!(!noted.contains(&(pot(65), 0)), "the standing pot is not, got {noted:?}");
     }
 
     /// bsv-low #484, through a REAL pass: the sweep that demotes a row at an orphaned height is reorg evidence
@@ -1640,40 +1621,13 @@ mod tests {
         let store = MemoryPotStorage::new();
         let orphaned = confirmed_pot_with_proofless_beef(&store, &pot(66), 965_771).await;
         let disagree = single_tx_bump(&orphaned, 965_773).to_hex();
-        let fetcher = CourierStub(
-            [(orphaned.clone(), Ok(Some(disagree)))]
-                .into_iter()
-                .collect(),
-        );
+        let fetcher = CourierStub([(orphaned.clone(), Ok(Some(disagree)))].into_iter().collect());
         let tracker = MockChainTracker::new(965_775);
-        let s = reverify_window(
-            &store,
-            Some(&tracker),
-            Some(&fetcher),
-            965_771,
-            965_773,
-            None,
-            50,
-            false,
-        )
-        .await;
+        let s = reverify_window(&store, Some(&tracker), Some(&fetcher), 965_771, 965_773, None, 50, false).await;
         assert_eq!(s.stale, 1, "{s:?}");
-        assert!(
-            crate::hop_probe_memos::reverify_rejudged(&s),
-            "a demotion at an orphaned height: {s:?}"
-        );
+        assert!(crate::hop_probe_memos::reverify_rejudged(&s), "a demotion at an orphaned height: {s:?}");
         // the next sweep finds nothing confirmed there: quiet, no evidence
-        let s2 = reverify_window(
-            &store,
-            Some(&tracker),
-            Some(&fetcher),
-            965_771,
-            965_773,
-            None,
-            50,
-            false,
-        )
-        .await;
+        let s2 = reverify_window(&store, Some(&tracker), Some(&fetcher), 965_771, 965_773, None, 50, false).await;
         assert!(!crate::hop_probe_memos::reverify_rejudged(&s2), "{s2:?}");
     }
 
