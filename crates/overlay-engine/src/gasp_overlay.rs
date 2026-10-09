@@ -121,6 +121,9 @@ pub struct OverlayGASPStorage<'a> {
     /// [`crate::engine::Engine::set_script_verification`], handed over so the
     /// anchor check obeys the same switch as `Engine::submit`. Default `true`.
     verify_scripts: bool,
+    /// The peer this instance syncs from: the key of its deferred graphs
+    /// (bsv-low #555, [`Self::with_peer`]).
+    peer: String,
 }
 
 /// Lends the engine's tracker to the anchor check and notes whether it
@@ -183,7 +186,17 @@ impl<'a> OverlayGASPStorage<'a> {
             strict_beef: false,
             chain_tracker: None,
             verify_scripts: true,
+            peer: String::new(),
         }
+    }
+
+    /// Name the peer this instance syncs from, the key under which its
+    /// deferred graphs are kept (bsv-low #555). `Engine::start_gasp_sync`
+    /// wires it.
+    #[must_use]
+    pub fn with_peer(mut self, peer: impl Into<String>) -> Self {
+        self.peer = peer.into();
+        self
     }
 
     /// Check merkle roots of the anchor against this chain tracker (the
@@ -1128,6 +1141,33 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             refs.remove(&key);
         }
         Ok(())
+    }
+
+    async fn load_deferred_graphs(&self) -> Result<Vec<crate::gasp::DeferredGraph>, GASPError> {
+        self.storage
+            .find_deferred_graphs(&self.peer, &self.topic)
+            .await
+            .map_err(|e| GASPError::StorageError(e.to_string()))
+    }
+
+    async fn save_deferred_graph(
+        &self,
+        record: &crate::gasp::DeferredGraph,
+    ) -> Result<(), GASPError> {
+        let mut record = record.clone();
+        record.peer.clone_from(&self.peer);
+        record.topic.clone_from(&self.topic);
+        self.storage
+            .put_deferred_graph(&record)
+            .await
+            .map_err(|e| GASPError::StorageError(e.to_string()))
+    }
+
+    async fn delete_deferred_graph(&self, outpoint: &str) -> Result<(), GASPError> {
+        self.storage
+            .delete_deferred_graph(&self.peer, &self.topic, outpoint)
+            .await
+            .map_err(|e| GASPError::StorageError(e.to_string()))
     }
 }
 

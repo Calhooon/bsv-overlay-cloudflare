@@ -79,6 +79,9 @@ pub struct Engine {
     /// exceeds the budget is DROPPED (loud log, failure recorded, cursor NOT
     /// advanced) and the loop continues with the next peer.
     peer_sync_budget: Option<(SleepFactory, u64)>,
+    /// The per-GRAPH GASP budget (bsv-low #555): the sleep, the calls, the
+    /// ms. `None`: no graph is deferred.
+    graph_budget: Option<(SleepFactory, u32, u64)>,
     /// The bound of one transaction's finalize submit (bsv-low #559), see
     /// [`Engine::set_finalize_submit_budget`].
     finalize_submit_budget: Option<(SleepFactory, u64)>,
@@ -762,6 +765,7 @@ impl Engine {
             gasp_remote_factory: None,
             ancestor_fetcher: None,
             peer_sync_budget: None,
+            graph_budget: None,
             finalize_submit_budget: None,
             finalize_gate: crate::gasp::SubmitGate::default(),
             not_landed: std::cell::RefCell::new(HashSet::new()),
@@ -852,6 +856,39 @@ impl Engine {
     /// admitted.
     pub fn set_peer_sync_budget(&mut self, sleep: SleepFactory, budget_ms: u64) {
         self.peer_sync_budget = Some((sleep, budget_ms));
+    }
+
+    /// Set the per-GRAPH GASP budget and turn DEFERRAL on (bsv-low #555).
+    ///
+    /// A graph whose walk makes `max_calls` requests (to the peer, or chain
+    /// fetches) or runs `budget_ms` in one pass is DEFERRED: its partial walk
+    /// (the nodes fetched with their proofs, the inputs still pending, the
+    /// calls spent, its age in passes) is saved as ONE record of the storage
+    /// ([`Storage::put_deferred_graph`], replaced on every deferral), its
+    /// UTXO is held below the cursor as a failed one is (the gap guard) and
+    /// not walked again in the sync (#554), and the sync goes on to the next
+    /// UTXO and topic. The next sync that is served that UTXO RESUMES the
+    /// walk from the record, asking only what is pending, under the same
+    /// budget; a graph so converges over passes and is then completed as
+    /// any graph is (#551's anchor check, the finalize submits, e1d's
+    /// rules). A walk cut by the per-peer deadline is deferred the same way.
+    ///
+    /// Bounds: a record deferred [`crate::gasp::DEFERRED_GRAPH_MAX_PASSES`]
+    /// times, or bigger than [`crate::gasp::DEFERRED_GRAPH_MAX_BYTES`], is
+    /// dropped with its reason and the UTXO fails as before (the gap guard
+    /// asks again, from the root); at most
+    /// [`crate::gasp::DEFERRED_GRAPHS_PER_PEER_TOPIC`] records per (peer,
+    /// topic). Keep `budget_ms` below the per-peer budget so that a deep
+    /// graph leaves the pass time for the UTXOs after it. Defaults offered:
+    /// [`crate::gasp::DEFAULT_GRAPH_BUDGET_CALLS`],
+    /// [`crate::gasp::DEFAULT_GRAPH_BUDGET_MS`].
+    ///
+    /// Unset (the default) nothing is deferred and the walk is the one
+    /// before #555 (parity: the reference has no budget and no deferral).
+    /// A storage that keeps no records (the trait's default) defers nothing
+    /// either: a graph past the budget then fails its UTXO.
+    pub fn set_graph_budget(&mut self, sleep: SleepFactory, max_calls: u32, budget_ms: u64) {
+        self.graph_budget = Some((sleep, max_calls, budget_ms));
     }
 
     /// Bound ONE transaction's GASP finalize submit (bsv-low #559, the delta
@@ -4664,6 +4701,10 @@ impl Engine {
             let mut finalized_graphs: u64 = 0;
             let mut deadline_dropped_graphs: u64 = 0;
             let mut cursor_moves: Vec<CursorMove> = Vec::new();
+            let mut deferred_graphs: u64 = 0;
+            let mut resumed_graphs: u64 = 0;
+            let mut converged_graphs: u64 = 0;
+            let mut dropped_graphs: Vec<DroppedDeferral> = Vec::new();
 
             // If we have a remote factory, actually run GASP sync
             if let Some(ref factory) = self.gasp_remote_factory {
@@ -4714,6 +4755,7 @@ impl Engine {
                     // Create storage adapter and remote
                     let mut gasp_storage =
                         OverlayGASPStorage::new(self.storage.as_ref(), topic, sink.clone())
+                            .with_peer(peer_url.as_str())
                             .with_strict_beef(hydration_on)
                             .with_script_verification(self.verify_scripts);
                     if let Some(manager) = self.managers.get(topic) {
@@ -4739,6 +4781,15 @@ impl Engine {
                         true, // unidirectional — overlay GASP is pull-only (submitNode throws); matches TS Engine.startGASPSync
                     )
                     .with_ancestor_fetcher(self.ancestor_fetcher.clone());
+                    // bsv-low #555: a graph past its own budget is deferred,
+                    // not dropped with the sync.
+                    if let Some((sleep, max_calls, budget_ms)) = &self.graph_budget {
+                        let (sleep, budget_ms) = (sleep.clone(), *budget_ms);
+                        sync = sync.with_graph_budget(crate::gasp::GraphBudget {
+                            max_calls: *max_calls,
+                            deadline: Box::new(move || sleep(budget_ms)),
+                        });
+                    }
                     // bsv-low #552: under a budget each graph is submitted as
                     // it finalizes, so the deadline cannot take it back. With
                     // no budget nothing can drop the sync, and the graphs are
@@ -4807,6 +4858,9 @@ impl Engine {
                             // UTXO is below the cursor too.
                             let in_flight = u64::from(sync.graph_in_flight());
                             deadline_dropped_graphs += in_flight;
+                            // bsv-low #555: the walk in hand is saved, so the
+                            // next tick resumes it instead of walking it again.
+                            sync.defer_in_flight().await;
                             let completed = sync.completed_cursor();
                             if completed > last_interaction {
                                 match self
@@ -4893,6 +4947,15 @@ impl Engine {
                         }
                     }
                     finalized_graphs += peer_finalized.get();
+                    let deferral = sync.deferral_stats();
+                    deferred_graphs += deferral.deferred;
+                    resumed_graphs += deferral.resumed;
+                    converged_graphs += deferral.converged;
+                    dropped_graphs.extend(deferral.dropped.into_iter().map(|d| DroppedDeferral {
+                        peer: peer_url.clone(),
+                        outpoint: d.outpoint,
+                        reason: d.reason.as_str().to_string(),
+                    }));
 
                     // bsv-low#302: record the attempt outcome (success resets
                     // the consecutive-failure count; timeout/error increments
@@ -4921,6 +4984,10 @@ impl Engine {
                     finalized_graphs,
                     deadline_dropped_graphs,
                     cursor_moves,
+                    deferred_graphs,
+                    resumed_graphs,
+                    converged_graphs,
+                    dropped_graphs,
                 },
             );
         }
@@ -5261,6 +5328,33 @@ pub struct TopicSyncResult {
     /// `GASPSync::completed_cursor`: past completed UTXOs only.
     #[serde(default)]
     pub cursor_moves: Vec<CursorMove>,
+    /// Graphs DEFERRED in this sync, summed over peers (bsv-low #555,
+    /// `Engine::set_graph_budget`): a new record, or a resumed graph
+    /// deferred again. Their UTXOs are held below the cursor.
+    #[serde(default)]
+    pub deferred_graphs: u64,
+    /// Graphs RESUMED from a record in this sync.
+    #[serde(default)]
+    pub resumed_graphs: u64,
+    /// Resumed graphs that completed and landed in this sync (their record
+    /// deleted).
+    #[serde(default)]
+    pub converged_graphs: u64,
+    /// Records deleted without converging, with their reason.
+    #[serde(default)]
+    pub dropped_graphs: Vec<DroppedDeferral>,
+}
+
+/// A deferred graph's record deleted without converging (bsv-low #555,
+/// [`TopicSyncResult::dropped_graphs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroppedDeferral {
+    /// The peer URL.
+    pub peer: String,
+    /// The graph's root outpoint.
+    pub outpoint: String,
+    /// [`crate::gasp::DropReason::as_str`].
+    pub reason: String,
 }
 
 /// One peer's persisted `last_interaction` cursor moving `from` -> `to` in a
@@ -7007,6 +7101,10 @@ mod tests {
                 finalized_graphs: 0,
                 deadline_dropped_graphs: 0,
                 cursor_moves: Vec::new(),
+                deferred_graphs: 0,
+                resumed_graphs: 0,
+                converged_graphs: 0,
+                dropped_graphs: Vec::new(),
             },
         );
 

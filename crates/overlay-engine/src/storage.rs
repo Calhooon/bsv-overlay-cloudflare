@@ -286,6 +286,49 @@ pub trait Storage {
         let _ = (host, topic);
         Ok(PeerSyncHealth::default())
     }
+
+    // ========================================================================
+    // Deferred GASP graphs (bsv-low #555)
+    // ========================================================================
+
+    /// Save (REPLACE) the record of one deferred GASP graph, keyed by
+    /// (`record.peer`, `record.topic`, `record.outpoint`). One row per graph:
+    /// a later deferral of the same graph overwrites it, never appends.
+    ///
+    /// Default: refused. A backend that keeps no records defers nothing: a
+    /// graph past its per-graph budget fails its UTXO as before #555 (and a
+    /// wrapper that does not forward these three methods turns deferral
+    /// off for the storage it wraps).
+    async fn put_deferred_graph(
+        &self,
+        record: &crate::gasp::DeferredGraph,
+    ) -> Result<(), StorageError> {
+        let _ = record;
+        Err(StorageError::Other(
+            "deferred GASP graphs are not kept by this storage".to_string(),
+        ))
+    }
+
+    /// The records of (`host`, `topic`), lowest score first. Default: none.
+    async fn find_deferred_graphs(
+        &self,
+        host: &str,
+        topic: &str,
+    ) -> Result<Vec<crate::gasp::DeferredGraph>, StorageError> {
+        let _ = (host, topic);
+        Ok(Vec::new())
+    }
+
+    /// Delete the record of the graph rooted at `outpoint`. Default: no-op.
+    async fn delete_deferred_graph(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<(), StorageError> {
+        let _ = (host, topic, outpoint);
+        Ok(())
+    }
 }
 
 /// Durable per-(host, topic) GASP sync health (bsv-low#302) — the input to
@@ -454,6 +497,27 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
     ) -> Result<PeerSyncHealth, StorageError> {
         (**self).get_peer_sync_health(host, topic).await
     }
+    async fn put_deferred_graph(
+        &self,
+        record: &crate::gasp::DeferredGraph,
+    ) -> Result<(), StorageError> {
+        (**self).put_deferred_graph(record).await
+    }
+    async fn find_deferred_graphs(
+        &self,
+        host: &str,
+        topic: &str,
+    ) -> Result<Vec<crate::gasp::DeferredGraph>, StorageError> {
+        (**self).find_deferred_graphs(host, topic).await
+    }
+    async fn delete_deferred_graph(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<(), StorageError> {
+        (**self).delete_deferred_graph(host, topic, outpoint).await
+    }
 }
 
 // ============================================================================
@@ -528,6 +592,12 @@ pub mod memory {
         /// can prove the `Rc` blanket forwards `mark_transaction_proven_at`
         /// (the trait default would drop the height).
         proven_at: Mutex<HashMap<String, Option<u64>>>,
+        /// Deferred GASP graphs (bsv-low #555) keyed by (host, topic,
+        /// outpoint): models the D1 `gasp_deferred_graphs` table.
+        deferred_graphs: Mutex<HashMap<(String, String, String), crate::gasp::DeferredGraph>>,
+        /// How many times a deferred graph was WRITTEN (a pin counts the
+        /// storage writes of a deferral).
+        deferred_graph_writes: Mutex<u64>,
     }
 
     impl MemoryStorage {
@@ -571,6 +641,24 @@ pub mod memory {
                 None => true, // unknown age → treated old → eligible
                 Some(created) => now.saturating_sub(*created) >= min_age_secs,
             }
+        }
+
+        /// Every deferred GASP graph held, any peer or topic (bsv-low #555).
+        pub fn deferred_graphs(&self) -> Vec<crate::gasp::DeferredGraph> {
+            let mut all: Vec<_> = self
+                .deferred_graphs
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect();
+            all.sort_by(|a, b| (a.score, &a.outpoint).cmp(&(b.score, &b.outpoint)));
+            all
+        }
+
+        /// How many deferred-graph writes were made (bsv-low #555).
+        pub fn deferred_graph_writes(&self) -> u64 {
+            *self.deferred_graph_writes.lock().unwrap()
         }
 
         /// Count total outputs (for testing assertions).
@@ -973,6 +1061,48 @@ pub mod memory {
                     secs_since_last_attempt: Some(now.saturating_sub(*attempt_at)),
                 })
                 .unwrap_or_default())
+        }
+
+        async fn put_deferred_graph(
+            &self,
+            record: &crate::gasp::DeferredGraph,
+        ) -> Result<(), StorageError> {
+            *self.deferred_graph_writes.lock().unwrap() += 1;
+            self.deferred_graphs.lock().unwrap().insert(
+                (
+                    record.peer.clone(),
+                    record.topic.clone(),
+                    record.outpoint.clone(),
+                ),
+                record.clone(),
+            );
+            Ok(())
+        }
+
+        async fn find_deferred_graphs(
+            &self,
+            host: &str,
+            topic: &str,
+        ) -> Result<Vec<crate::gasp::DeferredGraph>, StorageError> {
+            Ok(self
+                .deferred_graphs()
+                .into_iter()
+                .filter(|r| r.peer == host && r.topic == topic)
+                .collect())
+        }
+
+        async fn delete_deferred_graph(
+            &self,
+            host: &str,
+            topic: &str,
+            outpoint: &str,
+        ) -> Result<(), StorageError> {
+            self.deferred_graphs.lock().unwrap().remove(&(
+                host.to_string(),
+                topic.to_string(),
+                outpoint.to_string(),
+            ));
+            Ok(())
         }
     }
 }

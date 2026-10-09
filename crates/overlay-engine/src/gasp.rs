@@ -196,6 +196,212 @@ pub fn peer_sync_quarantined(health: &crate::storage::PeerSyncHealth) -> bool {
 }
 
 // ============================================================================
+// Deferred graphs (bsv-low #555)
+// ============================================================================
+
+/// Default per-GRAPH call budget (bsv-low #555): requests to the peer, or
+/// chain fetches, that ONE graph's walk may make in one pass before it is
+/// deferred. With [`DEFAULT_GRAPH_BUDGET_MS`]: at the 1.2 s per request
+/// measured on beta (2026-10-09, #582) 100 calls take about 120 s, so on a
+/// slow peer the time binds first (about 50 nodes a pass) and on a fast one
+/// the calls do, which also bounds how much a record grows per pass.
+pub const DEFAULT_GRAPH_BUDGET_CALLS: u32 = 100;
+
+/// Default per-GRAPH time budget, ms (bsv-low #555): half of the 120 s
+/// topic slice of LOW's node (one peer), so a deep graph takes at most half
+/// of its topic's slice and the UTXOs after it keep the other half. A caller
+/// keeps it BELOW its per-peer budget (`Engine::set_peer_sync_budget`); a
+/// graph the per-peer deadline cuts first is deferred all the same.
+pub const DEFAULT_GRAPH_BUDGET_MS: u64 = 60_000;
+
+/// A deferred graph whose record has been deferred this many passes is
+/// dropped at its next resume (reason `max_passes`) and its UTXO fails as a
+/// failed ingest does: the gap guard asks for it again and the next pass
+/// walks it from its root. One hour at a one-minute cadence, fifteen at
+/// `*/15`.
+pub const DEFERRED_GRAPH_MAX_PASSES: u32 = 60;
+
+/// The most bytes one record may hold (its JSON): 1 MiB, half of D1's 2 MB
+/// row. A record past it is dropped (reason `too_big`). The measured case
+/// (a 24 KB head over a wallet's small funding transactions, about 1 KB of
+/// hex each) fits about a thousand nodes.
+pub const DEFERRED_GRAPH_MAX_BYTES: usize = 1 << 20;
+
+/// The most records one (peer, topic) may hold. A new deferral past it is
+/// not saved (reason `too_many`) and its UTXO fails as today: a peer that
+/// serves many deep graphs costs at most 16 records.
+pub const DEFERRED_GRAPHS_PER_PEER_TOPIC: usize = 16;
+
+/// The per-graph budget of a [`GASPSync`] (bsv-low #555,
+/// `Engine::set_graph_budget`). Setting one turns deferral ON for that sync.
+pub struct GraphBudget<'a> {
+    /// Calls one graph may make in one pass ([`DEFAULT_GRAPH_BUDGET_CALLS`]).
+    pub max_calls: u32,
+    /// A fresh deadline for ONE graph's pass ([`DEFAULT_GRAPH_BUDGET_MS`]).
+    pub deadline: Box<dyn Fn() -> crate::engine::SleepFuture + 'a>,
+}
+
+/// One node a deferred walk has fetched and appended, in append order.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalkedNode {
+    /// The node as it was appended (the root's proof hydrated, if it was).
+    pub node: GASPNode,
+    /// `txid.outputIndex` of the node that spends it; `None` for the root.
+    pub spent_by: Option<String>,
+}
+
+/// One input a deferred walk has still to ask for.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingInput {
+    /// `txid.outputIndex` of the input (for the root, the UTXO itself).
+    pub outpoint: String,
+    /// The graph id the request carries (the root's outpoint).
+    pub graph_id: String,
+    /// Whether the input's metadata is asked for.
+    pub metadata: bool,
+    /// `txid.outputIndex` of the node that needs it; `None` for the root.
+    pub spent_by: Option<String>,
+    /// Whether that node is PROVEN: a named input the peer does not hold is
+    /// then pruned (the D8 rule), else it fails the graph.
+    pub parent_proven: bool,
+}
+
+/// The persisted partial walk of ONE graph (bsv-low #555): one record per
+/// (peer, topic, root outpoint), REPLACED on every deferral, never appended.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferredGraph {
+    /// The peer the graph is walked from.
+    pub peer: String,
+    /// The topic.
+    pub topic: String,
+    /// The root UTXO, `txid.outputIndex`.
+    pub outpoint: String,
+    /// The root UTXO's score at the peer.
+    pub score: u64,
+    /// The nodes fetched so far, with their proofs, in append order.
+    pub nodes: Vec<WalkedNode>,
+    /// The inputs still to ask for, a stack (the last is asked next).
+    pub pending: Vec<PendingInput>,
+    /// Calls spent on this graph over every pass.
+    pub calls: u64,
+    /// Passes that deferred it (its age, in passes).
+    pub passes: u32,
+    /// Why it was last deferred: `calls`, `time`, `fault`,
+    /// `anchor_unavailable`, `not_landed` or `peer_deadline`.
+    pub reason: String,
+}
+
+impl DeferredGraph {
+    /// The record's size as stored (its JSON), for
+    /// [`DEFERRED_GRAPH_MAX_BYTES`].
+    pub fn byte_size(&self) -> usize {
+        serde_json::to_vec(self).map_or(usize::MAX, |b| b.len())
+    }
+}
+
+/// Why a deferred graph's record was deleted without converging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropReason {
+    /// Deferred [`DEFERRED_GRAPH_MAX_PASSES`] times; the UTXO fails.
+    MaxPasses,
+    /// Past [`DEFERRED_GRAPH_MAX_BYTES`]; the UTXO fails.
+    TooBig,
+    /// Past [`DEFERRED_GRAPHS_PER_PEER_TOPIC`]; the UTXO fails.
+    TooMany,
+    /// The record could not be written; the UTXO fails.
+    StoreFault,
+    /// A sync that ran to its end was not served the UTXO (spent at the peer).
+    NotServed,
+    /// The node already holds the UTXO (it landed another way).
+    Held,
+    /// The peer answered it does not hold an input an UNPROVEN node needs;
+    /// the UTXO fails, as in the reference.
+    NotHeld,
+    /// The root came back PROVEN: the walk restarts from it, shorter.
+    RootProven,
+    /// The anchor check refused the graph (a final verdict, the cursor moves).
+    Refused,
+}
+
+impl DropReason {
+    /// The reason's name, as logged and counted.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxPasses => "max_passes",
+            Self::TooBig => "too_big",
+            Self::TooMany => "too_many",
+            Self::StoreFault => "store_fault",
+            Self::NotServed => "not_served",
+            Self::Held => "held",
+            Self::NotHeld => "not_held",
+            Self::RootProven => "root_proven",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// One record dropped in a sync.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DroppedGraph {
+    /// The root outpoint.
+    pub outpoint: String,
+    /// Why.
+    pub reason: DropReason,
+}
+
+/// What a sync did with deferred graphs (bsv-low #555).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeferralStats {
+    /// Graphs deferred (a new record, or a resumed one deferred again).
+    pub deferred: u64,
+    /// Graphs resumed from a record.
+    pub resumed: u64,
+    /// Resumed graphs that completed and landed (their record deleted).
+    pub converged: u64,
+    /// Records deleted without converging.
+    pub dropped: Vec<DroppedGraph>,
+}
+
+/// The walk of the graph in hand: its record (what a deferral saves) and
+/// the per-pass state. Lives in the [`GASPSync`], OUTSIDE the walk's
+/// future, so a deadline that drops the future leaves it whole.
+struct Walk {
+    record: DeferredGraph,
+    seen: std::collections::HashSet<String>,
+    calls_this_pass: u32,
+    resumed: bool,
+}
+
+/// How a graph's walk ended in this pass.
+enum WalkEnd {
+    /// Nothing is pending: complete the graph.
+    Done,
+    /// Deferred, with this reason.
+    Deferred(&'static str),
+}
+
+/// What one step of the walk got.
+enum StepOut {
+    Pruned,
+    Seen,
+    Appended {
+        node_id: String,
+        walked: WalkedNode,
+        children: Vec<PendingInput>,
+    },
+}
+
+/// How [`GASPSync::ingest_utxo`] ended for a UTXO.
+enum Ingested {
+    Completed,
+    Deferred,
+}
+
+// ============================================================================
 // GASPStorage trait
 // ============================================================================
 
@@ -245,6 +451,27 @@ pub trait GASPStorage {
 
     /// Discard a temporary graph that failed validation.
     async fn discard_graph(&self, graph_id: &str) -> Result<(), GASPError>;
+
+    /// The deferred graphs of this (peer, topic) (bsv-low #555). Default:
+    /// none.
+    async fn load_deferred_graphs(&self) -> Result<Vec<DeferredGraph>, GASPError> {
+        Ok(Vec::new())
+    }
+
+    /// Save (replace) the record of one deferred graph. Default: refused, so
+    /// a storage that keeps none fails the UTXO as before #555.
+    async fn save_deferred_graph(&self, record: &DeferredGraph) -> Result<(), GASPError> {
+        let _ = record;
+        Err(GASPError::StorageError(
+            "this storage keeps no deferred graphs".to_string(),
+        ))
+    }
+
+    /// Delete the record of the graph rooted at `outpoint`. Default: no-op.
+    async fn delete_deferred_graph(&self, outpoint: &str) -> Result<(), GASPError> {
+        let _ = outpoint;
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -546,6 +773,17 @@ pub struct GASPSync<'a> {
     completed_cursor: u64,
     /// See [`Self::graph_in_flight`].
     graph_in_flight: bool,
+    /// The per-graph budget (bsv-low #555). `None` (the default): no graph
+    /// is deferred and the walk is the one before #555.
+    graph_budget: Option<GraphBudget<'a>>,
+    /// The records of this (peer, topic) not yet resumed in this sync.
+    deferred: std::cell::RefCell<std::collections::HashMap<String, DeferredGraph>>,
+    /// How many records this (peer, topic) holds in storage.
+    held_records: std::cell::Cell<usize>,
+    /// The walk of the graph in hand (see [`Walk`]).
+    walk: std::cell::RefCell<Option<Walk>>,
+    /// See [`Self::deferral_stats`].
+    stats: std::cell::RefCell<DeferralStats>,
 }
 
 impl<'a> GASPSync<'a> {
@@ -573,7 +811,30 @@ impl<'a> GASPSync<'a> {
             finalized_hook: None,
             completed_cursor: last_interaction,
             graph_in_flight: false,
+            graph_budget: None,
+            deferred: std::cell::RefCell::new(std::collections::HashMap::new()),
+            held_records: std::cell::Cell::new(0),
+            walk: std::cell::RefCell::new(None),
+            stats: std::cell::RefCell::new(DeferralStats::default()),
         }
+    }
+
+    /// Bound each graph's walk by `budget` and DEFER a graph past it
+    /// (bsv-low #555): its partial walk is saved through
+    /// [`GASPStorage::save_deferred_graph`], its UTXO is held below the
+    /// cursor like a failed one, the sync goes on to the next UTXO, and the
+    /// next sync that is served the UTXO RESUMES the walk from the record,
+    /// asking only what is still pending. Without a budget nothing is
+    /// deferred and `sync` is unchanged.
+    #[must_use]
+    pub fn with_graph_budget(mut self, budget: GraphBudget<'a>) -> Self {
+        self.graph_budget = Some(budget);
+        self
+    }
+
+    /// What the last `sync` did with deferred graphs (bsv-low #555).
+    pub fn deferral_stats(&self) -> DeferralStats {
+        self.stats.borrow().clone()
     }
 
     /// Have `hook` called after every completed incoming UTXO (bsv-low #552,
@@ -670,6 +931,28 @@ impl<'a> GASPSync<'a> {
         self.discarded_graphs.set(0);
         self.completed_cursor = self.last_interaction;
         self.graph_in_flight = false;
+        self.walk.borrow_mut().take();
+        *self.stats.borrow_mut() = DeferralStats::default();
+        self.deferred.borrow_mut().clear();
+        self.held_records.set(0);
+        // bsv-low #555: the deferred graphs of this (peer, topic), resumed
+        // as the peer serves their UTXOs again (the cursor was held below
+        // them). A read fault resumes nothing this sync: those UTXOs are
+        // walked from their roots, and their records replaced.
+        if self.graph_budget.is_some() {
+            match self.storage.load_deferred_graphs().await {
+                Ok(records) => {
+                    self.held_records.set(records.len());
+                    self.deferred
+                        .borrow_mut()
+                        .extend(records.into_iter().map(|r| (r.outpoint.clone(), r)));
+                }
+                Err(e) => warn!(
+                    "{} Could not read the deferred graphs (bsv-low #555): {}",
+                    self.log_prefix, e
+                ),
+            }
+        }
 
         // Track what we already know
         let local_utxos = self.storage.find_known_utxos(0, None).await?;
@@ -745,6 +1028,11 @@ impl<'a> GASPSync<'a> {
 
                 let outpoint = format!("{}.{}", utxo.txid, utxo.output_index);
                 if known_outpoints.contains(&outpoint) {
+                    // A deferred graph whose UTXO the node now holds (it
+                    // landed another way): nothing to resume.
+                    if self.deferred.borrow_mut().remove(&outpoint).is_some() {
+                        self.drop_record(&outpoint, DropReason::Held).await;
+                    }
                     shared_outpoints.insert(outpoint.clone());
                     known_outpoints.remove(&outpoint);
                 } else if !shared_outpoints.contains(&outpoint)
@@ -759,16 +1047,35 @@ impl<'a> GASPSync<'a> {
                         initial_interaction,
                     );
                     self.graph_in_flight = true;
-                    let mut ingested = self.ingest_utxo(utxo, &outpoint).await;
+                    let ingested = self.ingest_utxo(utxo, &outpoint).await;
                     self.graph_in_flight = false;
-                    if ingested.is_ok() {
-                        if let Some(hook) = &self.finalized_hook {
-                            ingested = hook.graph_completed().await;
+                    let ingested = match ingested {
+                        Ok(Ingested::Completed) => {
+                            let landed = match &self.finalized_hook {
+                                Some(hook) => hook.graph_completed().await,
+                                None => Ok(()),
+                            };
+                            self.settle_completed(landed.is_ok()).await;
+                            landed.map(|()| true)
                         }
-                    }
+                        Ok(Ingested::Deferred) => Ok(false),
+                        Err(e) => {
+                            self.walk.borrow_mut().take();
+                            Err(e)
+                        }
+                    };
                     match ingested {
-                        Ok(()) => {
+                        Ok(true) => {
                             shared_outpoints.insert(outpoint);
+                        }
+                        // bsv-low #555: DEFERRED, its walk saved. Held below
+                        // the cursor like a failed UTXO (the gap guard) and
+                        // not walked again in this sync (#554); the next
+                        // sync resumes it. The sync goes on.
+                        Ok(false) => {
+                            let s = utxo.score as u64;
+                            min_failed_score = Some(min_failed_score.map_or(s, |cur| cur.min(s)));
+                            failed_outpoints.insert(outpoint);
                         }
                         Err(e) => {
                             warn!(
@@ -830,6 +1137,14 @@ impl<'a> GASPSync<'a> {
         }
         self.completed_cursor = self.last_interaction;
 
+        // bsv-low #555: a record whose UTXO a sync that ran to its end was
+        // not served (spent at the peer, or no longer listed): nothing will
+        // resume it.
+        let unserved: Vec<String> = self.deferred.borrow_mut().drain().map(|(k, _)| k).collect();
+        for outpoint in unserved {
+            self.drop_record(&outpoint, DropReason::NotServed).await;
+        }
+
         // Bidirectional: push our UTXOs to remote
         if !self.unidirectional {
             // Find local UTXOs the remote doesn't have
@@ -851,19 +1166,332 @@ impl<'a> GASPSync<'a> {
     }
 
     /// Request a UTXO's graph from remote and ingest it locally.
-    async fn ingest_utxo(&self, utxo: &GASPOutput, outpoint: &str) -> Result<(), GASPError> {
+    ///
+    /// With a per-graph budget (bsv-low #555, [`Self::with_graph_budget`]) a
+    /// walk past it is DEFERRED (`Ok(Ingested::Deferred)`): its record is
+    /// saved and the caller holds the UTXO below the cursor like a failed
+    /// one. A record of this UTXO saved by an earlier sync is RESUMED: its
+    /// nodes are appended again (no request) and only its pending inputs are
+    /// asked. Every walk error then defers too (the progress is kept), except
+    /// the peer's definite "not held" for an input an UNPROVEN node needs (an
+    /// SPV necessity, as in the reference): that one fails the UTXO and drops
+    /// the record. On `Completed` the walk stays in hand until
+    /// [`Self::settle_completed`] knows whether it landed.
+    async fn ingest_utxo(&self, utxo: &GASPOutput, outpoint: &str) -> Result<Ingested, GASPError> {
         debug!("{} Requesting node for {}", self.log_prefix, outpoint);
+        let fresh = || Walk {
+            record: DeferredGraph {
+                peer: String::new(),
+                topic: String::new(),
+                outpoint: outpoint.to_string(),
+                score: utxo.score as u64,
+                nodes: Vec::new(),
+                pending: vec![PendingInput {
+                    outpoint: outpoint.to_string(),
+                    graph_id: outpoint.to_string(),
+                    metadata: true,
+                    spent_by: None,
+                    parent_proven: false,
+                }],
+                calls: 0,
+                passes: 0,
+                reason: String::new(),
+            },
+            seen: std::collections::HashSet::new(),
+            calls_this_pass: 0,
+            resumed: false,
+        };
 
-        let node = self
-            .remote
-            .request_node(outpoint, &utxo.txid, utxo.output_index, true)
-            .await?;
+        let Some(budget) = &self.graph_budget else {
+            *self.walk.borrow_mut() = Some(fresh());
+            let walked = self.walk_graph(None).await;
+            let walk = self.walk.borrow_mut().take();
+            walked?;
+            self.complete_graph(&Self::graph_id_of(walk.as_ref(), outpoint))
+                .await?;
+            return Ok(Ingested::Completed);
+        };
 
-        self.process_incoming_node(&node, None, &mut std::collections::HashSet::new())
-            .await?;
-        self.complete_graph(&node.graph_id).await?;
+        let mut deadline = (budget.deadline)();
+        let record = self.deferred.borrow_mut().remove(outpoint);
+        let walk = match record {
+            None => fresh(),
+            Some(record) if record.passes >= DEFERRED_GRAPH_MAX_PASSES => {
+                let passes = record.passes;
+                self.drop_record(outpoint, DropReason::MaxPasses).await;
+                return Err(GASPError::Other(format!(
+                    "deferred graph {outpoint} dropped after {passes} passes (bsv-low #555)"
+                )));
+            }
+            Some(record) => {
+                self.stats.borrow_mut().resumed += 1;
+                info!(
+                    "{} Resuming deferred graph {} (bsv-low #555): {} nodes, {} pending, {} calls over {} passes",
+                    self.log_prefix,
+                    outpoint,
+                    record.nodes.len(),
+                    record.pending.len(),
+                    record.calls,
+                    record.passes
+                );
+                Walk {
+                    seen: record
+                        .nodes
+                        .iter()
+                        .filter_map(|w| Self::node_id(&w.node))
+                        .collect(),
+                    record,
+                    calls_this_pass: 0,
+                    resumed: true,
+                }
+            }
+        };
+        let resumed = walk.resumed;
+        let root_unproven = walk
+            .record
+            .nodes
+            .first()
+            .is_some_and(|w| w.node.proof.is_none());
+        *self.walk.borrow_mut() = Some(walk);
 
-        Ok(())
+        let ended = async {
+            if resumed && root_unproven {
+                // The root is asked again (one call): once its block lands
+                // the peer serves it PROVEN, and the walk from it is shorter
+                // than the unproven ancestry the record is still walking.
+                let root = PendingInput {
+                    outpoint: outpoint.to_string(),
+                    graph_id: outpoint.to_string(),
+                    metadata: true,
+                    spent_by: None,
+                    parent_proven: false,
+                };
+                match race_or_deadline(self.fetch_root(&root), deadline.as_mut()).await {
+                    None => return Ok(WalkEnd::Deferred("time")),
+                    Some(Ok(node)) if node.proof.is_some() => {
+                        let carried = self.walk.borrow().as_ref().map_or(0, |w| w.calls_this_pass);
+                        self.drop_record(outpoint, DropReason::RootProven).await;
+                        let mut restarted = fresh();
+                        restarted.calls_this_pass = carried;
+                        restarted.record.calls = u64::from(carried);
+                        *self.walk.borrow_mut() = Some(restarted);
+                    }
+                    // Unchanged, or not answered: the record goes on.
+                    Some(_) => {}
+                }
+            }
+            let nodes: Vec<WalkedNode> = self
+                .walk
+                .borrow()
+                .as_ref()
+                .map(|w| w.record.nodes.clone())
+                .unwrap_or_default();
+            for walked in &nodes {
+                self.storage
+                    .append_to_graph(&walked.node, walked.spent_by.as_deref())
+                    .await?;
+            }
+            self.walk_graph(Some(&mut deadline)).await
+        }
+        .await;
+
+        let graph_id = Self::graph_id_of(self.walk.borrow().as_ref(), outpoint);
+        let reason = match ended {
+            Ok(WalkEnd::Done) => match self.complete_graph(&graph_id).await {
+                Ok(true) => return Ok(Ingested::Completed),
+                Ok(false) => {
+                    // Refused by the anchor check: a verdict, the cursor
+                    // moves, nothing to resume.
+                    self.walk.borrow_mut().take();
+                    if resumed {
+                        self.drop_record(outpoint, DropReason::Refused).await;
+                    }
+                    return Ok(Ingested::Completed);
+                }
+                // `complete_graph` discarded the graph already.
+                Err(GASPError::AnchorUnavailable(_)) => "anchor_unavailable",
+                Err(_) => "fault",
+            },
+            Ok(WalkEnd::Deferred(reason)) => {
+                let _ = self.storage.discard_graph(&graph_id).await;
+                reason
+            }
+            Err(e @ GASPError::NodeNotFound(_)) => {
+                let _ = self.storage.discard_graph(&graph_id).await;
+                self.walk.borrow_mut().take();
+                if resumed {
+                    self.drop_record(outpoint, DropReason::NotHeld).await;
+                }
+                return Err(e);
+            }
+            Err(e) => {
+                warn!(
+                    "{} Walk of {} faulted, deferred with its progress: {}",
+                    self.log_prefix, outpoint, e
+                );
+                let _ = self.storage.discard_graph(&graph_id).await;
+                "fault"
+            }
+        };
+        self.save_walk(reason).await?;
+        Ok(Ingested::Deferred)
+    }
+
+    /// After a COMPLETED graph's hook (bsv-low #555): a graph that landed
+    /// deletes its record (a resumed one converged); one whose finalize did
+    /// not land keeps its walk as a record with nothing pending, so the next
+    /// pass completes it again without walking it again. No-op without a
+    /// per-graph budget.
+    async fn settle_completed(&self, landed: bool) {
+        if self.graph_budget.is_none() {
+            self.walk.borrow_mut().take();
+            return;
+        }
+        if landed {
+            let Some(walk) = self.walk.borrow_mut().take() else {
+                return;
+            };
+            if walk.resumed {
+                if let Err(e) = self
+                    .storage
+                    .delete_deferred_graph(&walk.record.outpoint)
+                    .await
+                {
+                    warn!(
+                        "{} Could not delete the record of converged graph {}: {}",
+                        self.log_prefix, walk.record.outpoint, e
+                    );
+                }
+                self.held_records
+                    .set(self.held_records.get().saturating_sub(1));
+                self.stats.borrow_mut().converged += 1;
+                info!(
+                    "{} Deferred graph {} CONVERGED after {} passes, {} calls, {} nodes (bsv-low #555)",
+                    self.log_prefix,
+                    walk.record.outpoint,
+                    walk.record.passes + 1,
+                    walk.record.calls,
+                    walk.record.nodes.len()
+                );
+            }
+        } else {
+            let _ = self.save_walk("not_landed").await;
+        }
+    }
+
+    /// Save the walk in hand as its graph's record (bsv-low #555), counting
+    /// a deferral; or drop it with its reason and answer `Err` (the UTXO
+    /// fails as before #555) when it is past a bound or cannot be written.
+    async fn save_walk(&self, reason: &'static str) -> Result<(), GASPError> {
+        let Some(mut walk) = self.walk.borrow_mut().take() else {
+            return Ok(());
+        };
+        walk.record.passes += 1;
+        walk.record.reason = reason.to_string();
+        let outpoint = walk.record.outpoint.clone();
+        if !walk.resumed && self.held_records.get() >= DEFERRED_GRAPHS_PER_PEER_TOPIC {
+            self.note_dropped(&outpoint, DropReason::TooMany);
+            return Err(GASPError::Other(format!(
+                "deferred graph {outpoint} not saved: {DEFERRED_GRAPHS_PER_PEER_TOPIC} records held (bsv-low #555)"
+            )));
+        }
+        let bytes = walk.record.byte_size();
+        if bytes > DEFERRED_GRAPH_MAX_BYTES {
+            if walk.resumed {
+                self.drop_record(&outpoint, DropReason::TooBig).await;
+            } else {
+                self.note_dropped(&outpoint, DropReason::TooBig);
+            }
+            return Err(GASPError::Other(format!(
+                "deferred graph {outpoint} dropped: {bytes} bytes (bsv-low #555)"
+            )));
+        }
+        match self.storage.save_deferred_graph(&walk.record).await {
+            Ok(()) => {
+                if !walk.resumed {
+                    self.held_records.set(self.held_records.get() + 1);
+                }
+                self.stats.borrow_mut().deferred += 1;
+                info!(
+                    "{} DEFERRED graph {} ({}): {} nodes, {} pending, {} calls ({} this pass), pass {}, {} bytes (bsv-low #555)",
+                    self.log_prefix,
+                    outpoint,
+                    reason,
+                    walk.record.nodes.len(),
+                    walk.record.pending.len(),
+                    walk.record.calls,
+                    walk.calls_this_pass,
+                    walk.record.passes,
+                    bytes
+                );
+                Ok(())
+            }
+            Err(e) => {
+                if walk.resumed {
+                    self.drop_record(&outpoint, DropReason::StoreFault).await;
+                } else {
+                    self.note_dropped(&outpoint, DropReason::StoreFault);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Delete a held record and count it dropped.
+    async fn drop_record(&self, outpoint: &str, reason: DropReason) {
+        if let Err(e) = self.storage.delete_deferred_graph(outpoint).await {
+            warn!(
+                "{} Could not delete the record of deferred graph {}: {}",
+                self.log_prefix, outpoint, e
+            );
+        }
+        self.held_records
+            .set(self.held_records.get().saturating_sub(1));
+        self.note_dropped(outpoint, reason);
+    }
+
+    fn note_dropped(&self, outpoint: &str, reason: DropReason) {
+        warn!(
+            "{} Deferred graph {} DROPPED ({}) (bsv-low #555)",
+            self.log_prefix,
+            outpoint,
+            reason.as_str()
+        );
+        self.stats.borrow_mut().dropped.push(DroppedGraph {
+            outpoint: outpoint.to_string(),
+            reason,
+        });
+    }
+
+    /// Save the walk of the graph that was in hand when a deadline dropped
+    /// `sync` (bsv-low #555): the per-peer deadline (D16) defers it like the
+    /// per-graph one, so the next pass resumes it instead of walking it
+    /// again. No-op without a per-graph budget or with no walk in hand.
+    pub async fn defer_in_flight(&self) {
+        if self.graph_budget.is_some() {
+            let _ = self.save_walk("peer_deadline").await;
+        }
+    }
+
+    /// The graph id of the walk in hand: its root's, else the outpoint.
+    fn graph_id_of(walk: Option<&Walk>, outpoint: &str) -> String {
+        walk.and_then(|w| w.record.nodes.first())
+            .map_or_else(|| outpoint.to_string(), |w| w.node.graph_id.clone())
+    }
+
+    /// `txid.outputIndex` of a node, its txid computed from its raw bytes.
+    fn node_id(node: &GASPNode) -> Option<String> {
+        bsv_rs::transaction::Transaction::from_hex(&node.raw_tx)
+            .ok()
+            .map(|tx| format!("{}.{}", tx.id(), node.output_index))
+    }
+
+    /// Count one call of the graph in hand.
+    fn count_call(&self) {
+        if let Some(w) = self.walk.borrow_mut().as_mut() {
+            w.calls_this_pass += 1;
+            w.record.calls += 1;
+        }
     }
 
     /// Push a local UTXO's graph to the remote.
@@ -882,216 +1510,368 @@ impl<'a> GASPSync<'a> {
         Ok(())
     }
 
-    /// Process an incoming node: append to graph, then recursively fetch needed inputs.
-    fn process_incoming_node<'b>(
-        &'b self,
-        node: &'b GASPNode,
-        spent_by: Option<&'b str>,
-        seen: &'b mut std::collections::HashSet<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GASPError>> + 'b>> {
-        Box::pin(async move {
-            // Key by the node's own TXID (computed from raw_tx), NOT graph_id (which
-            // is constant across a whole graph) and NOT the raw_tx hex. Mirrors TS
-            // @bsv/gasp processIncomingNode: nodeId = `${computeTXID(rawTx)}.${oi}`
-            // (GASP.js:319) and spentBy = compute36ByteStructure(computeTXID(rawTx), oi)
-            // (GASP.js:335). Matches the append-side key in gasp_overlay.rs
-            // (Transaction::from_hex(raw_tx).id()). Using graph_id/raw_tx here orphaned
-            // every child node → multi-node graphs never assembled → stranded sync.
-            let node_txid = match bsv_rs::transaction::Transaction::from_hex(&node.raw_tx) {
-                Ok(tx) => tx.id(),
-                Err(_) => node.raw_tx[..node.raw_tx.len().min(64)].to_string(),
+    /// Walk the graph in hand until nothing is pending (an explicit stack,
+    /// bsv-low #555; before it a recursion, in the same order: an input's
+    /// whole branch before its next sibling). Each step's result is
+    /// committed to the walk only once the step has finished, so a deadline
+    /// that drops this future leaves the walk as it was before that step.
+    /// With a per-graph budget the walk stops at its call count or its
+    /// `deadline` and answers `Deferred`; without one it runs to its end.
+    async fn walk_graph(
+        &self,
+        mut deadline: Option<&mut crate::engine::SleepFuture>,
+    ) -> Result<WalkEnd, GASPError> {
+        loop {
+            let (item, over_calls) = {
+                let walk = self.walk.borrow();
+                let Some(walk) = walk.as_ref() else {
+                    return Ok(WalkEnd::Done);
+                };
+                (
+                    walk.record.pending.last().cloned(),
+                    self.graph_budget
+                        .as_ref()
+                        .is_some_and(|b| walk.calls_this_pass >= b.max_calls),
+                )
             };
-            let node_id = format!("{}.{}", node_txid, node.output_index);
-            if seen.contains(&node_id) {
-                return Ok(());
+            let Some(item) = item else {
+                return Ok(WalkEnd::Done);
+            };
+            // One failed round trip per decoy: an outpoint pruned earlier in
+            // this sync is not asked for again, even when a later graph of
+            // the sync names it (two UTXOs of one decoy-bearing transaction).
+            if item.parent_proven && self.pruned.borrow().contains(&item.outpoint) {
+                debug!(
+                    "{} Input {} of {:?} was already pruned in this sync; not re-requested",
+                    self.log_prefix, item.outpoint, item.spent_by
+                );
+                if let Some(w) = self.walk.borrow_mut().as_mut() {
+                    w.record.pending.pop();
+                }
+                continue;
             }
-            seen.insert(node_id);
+            if over_calls {
+                return Ok(WalkEnd::Deferred("calls"));
+            }
+            let step = self.step(&item);
+            let out = match deadline.as_mut() {
+                Some(deadline) => match race_or_deadline(step, deadline.as_mut()).await {
+                    Some(out) => out,
+                    None => return Ok(WalkEnd::Deferred("time")),
+                },
+                None => step.await,
+            }?;
+            self.commit(out);
+        }
+    }
 
-            // GOD-TIER proof-anchoring (#126): if the peer served this node WITHOUT
-            // a merkle proof but the tx is mined, hydrate its OWN proof via the
-            // ancestor fetcher (WoC `/beef`). A proven node ends the walk UNLESS
-            // its topic manager names inputs needed for overlay history. Managers
-            // naming nothing still avoid the spent prior contract-state (a
-            // 2-tx-pattern template, or a covenant's previous UTXO). Without this,
-            // the walk reaches a spent input whose output
-            // record exists in storage (so `find_needed_inputs` strips it) but whose tx
-            // is absent from the in-memory graph, so `get_beef_for_node` fails "Missing
-            // source transaction" and the whole graph is discarded. Legacy beta's
-            // GASP-serve omits proofs, so this is required cross-stack. No-op when no
-            // fetcher is configured (production default unchanged) or the node already
-            // carries a proof (children fetched via the walk already do).
-            // Only the GRAPH ROOT arrives from the peer (spent_by == None); children
-            // come from the ancestry walk already carrying their proofs, so gate on
-            // the root to avoid redundant re-fetches.
-            let mut node_owned = node.clone();
-            if spent_by.is_none() && node_owned.proof.is_none() {
-                if let Some(fetcher) = &self.ancestor_fetcher {
+    /// Commit one finished step to the walk in hand: its item is no longer
+    /// pending, and an appended node's needed inputs are, the first of them
+    /// on top.
+    fn commit(&self, out: StepOut) {
+        let mut walk = self.walk.borrow_mut();
+        let Some(walk) = walk.as_mut() else {
+            return;
+        };
+        walk.record.pending.pop();
+        if let StepOut::Appended {
+            node_id,
+            walked,
+            children,
+        } = out
+        {
+            walk.seen.insert(node_id);
+            walk.record.nodes.push(walked);
+            walk.record.pending.extend(children.into_iter().rev());
+        }
+    }
+
+    /// The walk from a root already in hand (the lib tests' entry, from
+    /// before the walk was a stack): its proof hydrated, then every needed
+    /// input to the end.
+    #[cfg(test)]
+    async fn process_incoming_node(
+        &self,
+        node: &GASPNode,
+        _spent_by: Option<&str>,
+        _seen: &mut std::collections::HashSet<String>,
+    ) -> Result<(), GASPError> {
+        let root = PendingInput {
+            outpoint: node.graph_id.clone(),
+            graph_id: node.graph_id.clone(),
+            metadata: true,
+            spent_by: None,
+            parent_proven: false,
+        };
+        *self.walk.borrow_mut() = Some(Walk {
+            record: DeferredGraph {
+                peer: String::new(),
+                topic: String::new(),
+                outpoint: node.graph_id.clone(),
+                score: 0,
+                nodes: Vec::new(),
+                pending: vec![root.clone()],
+                calls: 0,
+                passes: 0,
+                reason: String::new(),
+            },
+            seen: std::collections::HashSet::new(),
+            calls_this_pass: 0,
+            resumed: false,
+        });
+        let node = self.hydrate_root(node.clone()).await;
+        let out = self.absorb(&root, node).await?;
+        self.commit(out);
+        self.walk_graph(None).await.map(|_| ())
+    }
+
+    /// The ROOT of a graph: the peer's node for the UTXO, its own proof
+    /// hydrated by the ancestor fetcher when it has none.
+    async fn fetch_root(&self, item: &PendingInput) -> Result<GASPNode, GASPError> {
+        let (txid, oi) = parse_outpoint(&item.outpoint)
+            .ok_or_else(|| GASPError::Other(format!("bad outpoint {}", item.outpoint)))?;
+        self.count_call();
+        let node = self
+            .remote
+            .request_node(&item.graph_id, &txid, oi, item.metadata)
+            .await?;
+        Ok(self.hydrate_root(node).await)
+    }
+
+    /// The root's own proof, hydrated by the ancestor fetcher when the peer
+    /// served it with none.
+    async fn hydrate_root(&self, mut node: GASPNode) -> GASPNode {
+        // GOD-TIER proof-anchoring (#126): if the peer served this node WITHOUT
+        // a merkle proof but the tx is mined, hydrate its OWN proof via the
+        // ancestor fetcher (WoC `/beef`). A proven node ends the walk UNLESS
+        // its topic manager names inputs needed for overlay history. Managers
+        // naming nothing still avoid the spent prior contract-state (a
+        // 2-tx-pattern template, or a covenant's previous UTXO). Without this,
+        // the walk reaches a spent input whose output
+        // record exists in storage (so `find_needed_inputs` strips it) but whose tx
+        // is absent from the in-memory graph, so `get_beef_for_node` fails "Missing
+        // source transaction" and the whole graph is discarded. Legacy beta's
+        // GASP-serve omits proofs, so this is required cross-stack. No-op when no
+        // fetcher is configured (production default unchanged) or the node already
+        // carries a proof (children fetched via the walk already do).
+        // Only the GRAPH ROOT arrives from the peer (spent_by == None); children
+        // come from the ancestry walk already carrying their proofs, so gate on
+        // the root to avoid redundant re-fetches.
+        if node.proof.is_none() {
+            if let Some(fetcher) = &self.ancestor_fetcher {
+                if let Some(node_txid) =
+                    Self::node_id(&node).and_then(|id| parse_outpoint(&id).map(|(txid, _)| txid))
+                {
+                    self.count_call();
                     if let Ok(root_fetch) = fetcher.fetch_ancestor(&node_txid).await {
                         if root_fetch.proof.is_some() {
-                            node_owned.proof = root_fetch.proof;
+                            node.proof = root_fetch.proof;
                         }
                     }
                 }
             }
-            let node = &node_owned;
+        }
+        node
+    }
 
-            self.storage.append_to_graph(node, spent_by).await?;
-
-            if let Some(needed) = self.storage.find_needed_inputs(node).await? {
-                // THE D8 DECOY RULE (zanaadu-v2 #314, the owner's ruling of
-                // 2026-10-06). A DELIBERATE DIVERGENCE from the reference.
+    /// One step of the walk: fetch `item`, append it to the graph, name its
+    /// needed inputs. Nothing of the walk is changed here (see
+    /// [`Self::walk_graph`]).
+    async fn step(&self, item: &PendingInput) -> Result<StepOut, GASPError> {
+        // THE D8 DECOY RULE (zanaadu-v2 #314, the owner's ruling of
+        // 2026-10-06). A DELIBERATE DIVERGENCE from the reference.
+        //
+        // The reference requests every needed input with no catch
+        // (`GASP.ts:602`, `await this.remote.requestNode(...)` inside
+        // `processIncomingNode`), so one input the peer cannot serve
+        // throws out of the walk and the per-UTXO catch in `sync`
+        // drops that whole UTXO: the graph is never completed.
+        //
+        // We keep that for an UNPROVEN parent and diverge for a PROVEN
+        // one. A proven parent needs no input for SPV; the only
+        // inputs `find_needed_inputs` returns for it are the ones its
+        // topic manager NAMED as history. A manager cannot always
+        // tell which input is the real one: a head covenant that
+        // signs under ANYONECANPAY lets a spender place a decoy
+        // witness-shaped input ahead of the real head input, and once
+        // mined it is permanent. The pairing is that such a manager
+        // names EVERY witness-shaped input, and the engine PRUNES the
+        // branch of a named input the PEER DEFINITELY DOES NOT HOLD
+        // instead of discarding the graph: warn, count, carry on with
+        // the parent's other named inputs, complete the graph with
+        // what it has. Under the reference's rule one decoy would
+        // strand the chain behind it on every sync, forever.
+        //
+        // An unproven parent's inputs are SPV necessities, not named
+        // history: a missing one still fails the UTXO (the `?` below),
+        // exactly as the reference does.
+        //
+        // THE CLASSIFICATION RULE. A named input is pruned only on a
+        // DEFINITE answer: the peer said it does not hold the
+        // outpoint, the typed class `GASPError::NodeNotFound`. Every
+        // other error (the request could not be sent, a timeout, a
+        // 5xx, a 429, a body that does not parse) is a fault of the
+        // moment and says nothing about what the peer holds: it
+        // fails the UTXO as the reference does, the per-UTXO arm of
+        // `sync` records it in the cursor gap guard, and the next
+        // sync asks again. Pruning on such a fault would cut the
+        // REAL head input, finalize a truncated graph, advance the
+        // cursor and never ask for that history again. The remote
+        // decides the class: the worker's maps HTTP 400 from
+        // `/requestForeignGASPNode` to `NodeNotFound` and nothing
+        // else (`gasp_remote.rs`), because 400 is what the reference
+        // peer answers for an outpoint it does not hold. Accepted
+        // residual: the reference answers the same masked 400 when
+        // its own storage faults inside `provideForeignGASPNode`, so
+        // that fault at a reference peer reads as "not held".
+        //
+        // THE FETCHER ARM NEVER PRUNES. A chain fetcher has no
+        // definite "cannot serve": every input of a mined transaction
+        // exists on chain, so each of its errors is a fault of the
+        // moment (its per-tick budget, a provider outage, a rate
+        // limit), whatever class it carries. With a real chain
+        // fetcher a decoy is SERVED from chain (one fetch, no failed
+        // round trip, no prune), so the prune lives on the peer arm,
+        // which is what runs when no fetcher is installed.
+        //
+        // NOTHING HERE BOUNDS THE DECOYS OF ONE PARENT. The manager's
+        // list has no cap, and each definite decoy is one sequential
+        // failed round trip inside the per-peer sync budget. A parent
+        // with enough of them exceeds that budget and the sync is
+        // dropped whole; what a dropped sync keeps is bsv-low #552's
+        // ground, and a cap on the list is the manager's choice.
+        let node = if item.spent_by.is_none() {
+            self.fetch_root(item).await?
+        } else {
+            let Some((txid, oi)) = parse_outpoint(&item.outpoint) else {
+                return Ok(StepOut::Pruned);
+            };
+            self.count_call();
+            match &self.ancestor_fetcher {
+                // OPT-IN ancestry hydration (off by default). When a
+                // fetcher is configured we KNOW the peer cannot serve
+                // ancestry — e.g. legacy beta stores minimal BEEFs and
+                // returns HTTP 400 "Incomplete SPV data!" for every
+                // ancestor — so we SKIP the doomed peer round-trip
+                // entirely and fetch the ancestor's raw tx from chain
+                // directly. Asking the peer first would cost one
+                // sequential request per ancestor (the ~90-deep
+                // user_registry chain → ~90 round-trips), enough to
+                // exhaust a worker invocation before the graph finalizes.
                 //
-                // The reference requests every needed input with no catch
-                // (`GASP.ts:602`, `await this.remote.requestNode(...)` inside
-                // `processIncomingNode`), so one input the peer cannot serve
-                // throws out of the walk and the per-UTXO catch in `sync`
-                // drops that whole UTXO: the graph is never completed.
+                // The fetcher returns the ancestor's rawtx and, when it
+                // is mined, its BUMP proof. A proven node ends the walk
+                // UNLESS its topic manager names inputs. Empty managers
+                // still stop at the first proven layer; managers needing
+                // history select their ancestors through this same
+                // fetcher. Without a proof, every input is requested
+                // as before.
+                // The transaction DAG (no cycles), `seen` keyed by
+                // `txid.outputIndex`, the already-known strip, and the
+                // manager naming nothing at genesis bound the walk.
+                // There is no node cap, matching the reference's
+                // undefined `maxNodesInGraph` in `Engine.startGASPSync`.
+                // A per-peer budget drops the sync future at its
+                // deadline: graphs finalized before it stay admitted
+                // (bsv-low #552), the graph in flight is lost whole,
+                // and ONE graph whose own walk outlasts the budget
+                // still never completes.
                 //
-                // We keep that for an UNPROVEN parent and diverge for a PROVEN
-                // one. A proven parent needs no input for SPV; the only
-                // inputs `find_needed_inputs` returns for it are the ones its
-                // topic manager NAMED as history. A manager cannot always
-                // tell which input is the real one: a head covenant that
-                // signs under ANYONECANPAY lets a spender place a decoy
-                // witness-shaped input ahead of the real head input, and once
-                // mined it is permanent. The pairing is that such a manager
-                // names EVERY witness-shaped input, and the engine PRUNES the
-                // branch of a named input the PEER DEFINITELY DOES NOT HOLD
-                // instead of discarding the graph: warn, count, carry on with
-                // the parent's other named inputs, complete the graph with
-                // what it has. Under the reference's rule one decoy would
-                // strand the chain behind it on every sync, forever.
-                //
-                // An unproven parent's inputs are SPV necessities, not named
-                // history: a missing one still fails the UTXO (the `?` below),
-                // exactly as the reference does.
-                //
-                // THE CLASSIFICATION RULE. A named input is pruned only on a
-                // DEFINITE answer: the peer said it does not hold the
-                // outpoint, the typed class `GASPError::NodeNotFound`. Every
-                // other error (the request could not be sent, a timeout, a
-                // 5xx, a 429, a body that does not parse) is a fault of the
-                // moment and says nothing about what the peer holds: it
-                // fails the UTXO as the reference does, the per-UTXO arm of
-                // `sync` records it in the cursor gap guard, and the next
-                // sync asks again. Pruning on such a fault would cut the
-                // REAL head input, finalize a truncated graph, advance the
-                // cursor and never ask for that history again. The remote
-                // decides the class: the worker's maps HTTP 400 from
-                // `/requestForeignGASPNode` to `NodeNotFound` and nothing
-                // else (`gasp_remote.rs`), because 400 is what the reference
-                // peer answers for an outpoint it does not hold. Accepted
-                // residual: the reference answers the same masked 400 when
-                // its own storage faults inside `provideForeignGASPNode`, so
-                // that fault at a reference peer reads as "not held".
-                //
-                // THE FETCHER ARM NEVER PRUNES. A chain fetcher has no
-                // definite "cannot serve": every input of a mined transaction
-                // exists on chain, so each of its errors is a fault of the
-                // moment (its per-tick budget, a provider outage, a rate
-                // limit), whatever class it carries. With a real chain
-                // fetcher a decoy is SERVED from chain (one fetch, no failed
-                // round trip, no prune), so the prune lives on the peer arm,
-                // which is what runs when no fetcher is installed.
-                //
-                // NOTHING HERE BOUNDS THE DECOYS OF ONE PARENT. The manager's
-                // list has no cap, and each definite decoy is one sequential
-                // failed round trip inside the per-peer sync budget. A parent
-                // with enough of them exceeds that budget and the sync is
-                // dropped whole; what a dropped sync keeps is bsv-low #552's
-                // ground, and a cap on the list is the manager's choice.
-                let prune_unserved = node.proof.is_some();
-                for (outpoint, input_req) in &needed.requested_inputs {
-                    if let Some((txid, oi)) = parse_outpoint(outpoint) {
-                        // One failed round trip per decoy: an outpoint pruned
-                        // earlier in this sync is not asked for again, even
-                        // when a later graph of the sync names it (two UTXOs
-                        // of one decoy-bearing transaction).
-                        if prune_unserved && self.pruned.borrow().contains(outpoint) {
-                            debug!(
-                                "{} Input {} of {}.{} was already pruned in this sync; not re-requested",
-                                self.log_prefix, outpoint, node_txid, node.output_index
-                            );
-                            continue;
-                        }
-                        let child_node = match &self.ancestor_fetcher {
-                            // OPT-IN ancestry hydration (off by default). When a
-                            // fetcher is configured we KNOW the peer cannot serve
-                            // ancestry — e.g. legacy beta stores minimal BEEFs and
-                            // returns HTTP 400 "Incomplete SPV data!" for every
-                            // ancestor — so we SKIP the doomed peer round-trip
-                            // entirely and fetch the ancestor's raw tx from chain
-                            // directly. Asking the peer first would cost one
-                            // sequential request per ancestor (the ~90-deep
-                            // user_registry chain → ~90 round-trips), enough to
-                            // exhaust a worker invocation before the graph finalizes.
-                            //
-                            // The fetcher returns the ancestor's rawtx and, when it
-                            // is mined, its BUMP proof. A proven node ends the walk
-                            // UNLESS its topic manager names inputs. Empty managers
-                            // still stop at the first proven layer; managers needing
-                            // history select their ancestors through this same
-                            // fetcher. Without a proof, every input is requested
-                            // as before.
-                            // The transaction DAG (no cycles), `seen` keyed by
-                            // `txid.outputIndex`, the already-known strip, and the
-                            // manager naming nothing at genesis bound the walk.
-                            // There is no node cap, matching the reference's
-                            // undefined `maxNodesInGraph` in `Engine.startGASPSync`.
-                            // A per-peer budget drops the sync future at its
-                            // deadline: graphs finalized before it stay admitted
-                            // (bsv-low #552), the graph in flight is lost whole,
-                            // and ONE graph whose own walk outlasts the budget
-                            // still never completes.
-                            //
-                            // Every fetcher error fails the UTXO (the `?`):
-                            // the fetcher arm never prunes, see the rule above.
-                            Some(fetcher) => {
-                                let ancestor = fetcher.fetch_ancestor(&txid).await?;
-                                GASPNode {
-                                    graph_id: node.graph_id.clone(),
-                                    raw_tx: ancestor.raw_tx,
-                                    output_index: oi,
-                                    proof: ancestor.proof,
-                                    tx_metadata: None,
-                                    output_metadata: None,
-                                    inputs: None,
-                                }
-                            }
-                            // Default / production: no fetcher → ask the peer.
-                            None => match self
-                                .remote
-                                .request_node(&node.graph_id, &txid, oi, input_req.metadata)
-                                .await
-                            {
-                                Ok(child_node) => child_node,
-                                // Proven parent and a DEFINITE "not held":
-                                // the D8 prune (see the rule above).
-                                Err(e @ GASPError::NodeNotFound(_)) if prune_unserved => {
-                                    warn!(
-                                        "{} Pruned input {} named by proven node {}.{}: the peer does not hold it: {}",
-                                        self.log_prefix, outpoint, node_txid, node.output_index, e
-                                    );
-                                    if self.pruned.borrow_mut().insert(outpoint.clone()) {
-                                        self.pruned_inputs.set(self.pruned_inputs.get() + 1);
-                                    }
-                                    continue;
-                                }
-                                // Any other error, and every error under an
-                                // unproven parent: propagate, as the
-                                // reference does.
-                                Err(e) => return Err(e),
-                            },
-                        };
-
-                        let spent_by_str = format!("{}.{}", node_txid, node.output_index);
-                        self.process_incoming_node(&child_node, Some(&spent_by_str), seen)
-                            .await?;
+                // Every fetcher error fails the UTXO (the `?`):
+                // the fetcher arm never prunes, see the rule above.
+                Some(fetcher) => {
+                    let ancestor = fetcher.fetch_ancestor(&txid).await?;
+                    GASPNode {
+                        graph_id: item.graph_id.clone(),
+                        raw_tx: ancestor.raw_tx,
+                        output_index: oi,
+                        proof: ancestor.proof,
+                        tx_metadata: None,
+                        output_metadata: None,
+                        inputs: None,
                     }
                 }
+                // Default / production: no fetcher → ask the peer.
+                None => match self
+                    .remote
+                    .request_node(&item.graph_id, &txid, oi, item.metadata)
+                    .await
+                {
+                    Ok(child_node) => child_node,
+                    // Proven parent and a DEFINITE "not held": the D8 prune
+                    // (see the rule above).
+                    Err(e @ GASPError::NodeNotFound(_)) if item.parent_proven => {
+                        warn!(
+                            "{} Pruned input {} named by proven node {}: the peer does not hold it: {}",
+                            self.log_prefix,
+                            item.outpoint,
+                            item.spent_by.as_deref().unwrap_or_default(),
+                            e
+                        );
+                        if self.pruned.borrow_mut().insert(item.outpoint.clone()) {
+                            self.pruned_inputs.set(self.pruned_inputs.get() + 1);
+                        }
+                        return Ok(StepOut::Pruned);
+                    }
+                    // Any other error, and every error under an unproven
+                    // parent: propagate, as the reference does.
+                    Err(e) => return Err(e),
+                },
             }
+        };
+        self.absorb(item, node).await
+    }
 
-            Ok(())
+    /// The node of `item`, fetched: append it to the graph and name its
+    /// needed inputs.
+    async fn absorb(&self, item: &PendingInput, node: GASPNode) -> Result<StepOut, GASPError> {
+        // Key by the node's own TXID (computed from raw_tx), NOT graph_id (which
+        // is constant across a whole graph) and NOT the raw_tx hex. Mirrors TS
+        // @bsv/gasp processIncomingNode: nodeId = `${computeTXID(rawTx)}.${oi}`
+        // (GASP.js:319) and spentBy = compute36ByteStructure(computeTXID(rawTx), oi)
+        // (GASP.js:335). Matches the append-side key in gasp_overlay.rs
+        // (Transaction::from_hex(raw_tx).id()). Using graph_id/raw_tx here orphaned
+        // every child node → multi-node graphs never assembled → stranded sync.
+        let node_txid = match bsv_rs::transaction::Transaction::from_hex(&node.raw_tx) {
+            Ok(tx) => tx.id(),
+            Err(_) => node.raw_tx[..node.raw_tx.len().min(64)].to_string(),
+        };
+        let node_id = format!("{}.{}", node_txid, node.output_index);
+        if self
+            .walk
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| w.seen.contains(&node_id))
+        {
+            return Ok(StepOut::Seen);
+        }
+
+        self.storage
+            .append_to_graph(&node, item.spent_by.as_deref())
+            .await?;
+
+        let mut children = Vec::new();
+        if let Some(needed) = self.storage.find_needed_inputs(&node).await? {
+            let parent_proven = node.proof.is_some();
+            for (outpoint, input_req) in &needed.requested_inputs {
+                if parse_outpoint(outpoint).is_some() {
+                    children.push(PendingInput {
+                        outpoint: outpoint.clone(),
+                        graph_id: node.graph_id.clone(),
+                        metadata: input_req.metadata,
+                        spent_by: Some(node_id.clone()),
+                        parent_proven,
+                    });
+                }
+            }
+        }
+        Ok(StepOut::Appended {
+            node_id,
+            walked: WalkedNode {
+                node,
+                spent_by: item.spent_by.clone(),
+            },
+            children,
         })
     }
 
@@ -1137,13 +1917,15 @@ impl<'a> GASPSync<'a> {
     }
 
     /// Validate and finalize a completed graph, or discard on failure.
-    async fn complete_graph(&self, graph_id: &str) -> Result<(), GASPError> {
+    /// `Ok(true)`: finalized; `Ok(false)`: refused by the anchor check and
+    /// discarded (a verdict: the cursor moves past it).
+    async fn complete_graph(&self, graph_id: &str) -> Result<bool, GASPError> {
         info!("{} Completing graph: {}", self.log_prefix, graph_id);
         match self.storage.validate_graph_anchor(graph_id).await {
             Ok(()) => {
                 self.storage.finalize_graph(graph_id).await?;
                 info!("{} Graph finalized: {}", self.log_prefix, graph_id);
-                Ok(())
+                Ok(true)
             }
             Err(e) => {
                 warn!(
@@ -1161,7 +1943,7 @@ impl<'a> GASPSync<'a> {
                     return Err(e);
                 }
                 self.discarded_graphs.set(self.discarded_graphs.get() + 1);
-                Ok(())
+                Ok(false)
             }
         }
     }
