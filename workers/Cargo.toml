@@ -34,7 +34,7 @@ repository = "https://github.com/Calhooon/bsv-overlay-cloudflare"
 # BSV SDK: crates.io. `overlay` feature = types + transaction + script +
 # wallet. `auth`/`http` deliberately left off; they pull reqwest/tokio-net
 # which fail on wasm32.
-bsv-rs = { version = "0.3.35", features = ["overlay"] }
+bsv-rs = { version = "0.4.0", features = ["overlay"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

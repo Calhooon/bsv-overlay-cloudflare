@@ -37,7 +37,7 @@ pub const QUEUE_BEEF_SIZE_LIMIT: usize = 90_000;
 /// existing retry/dead-letter lifecycle.
 pub(crate) fn decode_beef_b64(
     encoded: &str,
-    limits: &bsv_rs::transaction::BeefLimits,
+    limits: &overlay_engine::beef_limits::BeefLimits,
 ) -> Result<Vec<u8>, String> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let max_encoded_bytes = limits.max_bytes.div_ceil(3).saturating_mul(4);

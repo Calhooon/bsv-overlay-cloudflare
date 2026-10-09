@@ -5,7 +5,17 @@
 //! inputs (ts-stack@fb1b2da packages/overlays/overlay-express/src/OverlayExpress.ts
 //! 2655-2693; packages/overlays/overlay/src/Engine.ts 1711-1724).
 
-use bsv_rs::transaction::{Beef, BeefLimits, MerklePath, Transaction};
+use bsv_rs::transaction::{Beef, MerklePath, Transaction};
+
+/// A door's policy. bsv-rs 0.4.0 took `max_bytes` off its own `BeefLimits`
+/// and its limits refuse nothing (they are reserve hints), so the three
+/// numbers a door names live here and the checks below are this module's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeefLimits {
+    pub max_txs: usize,
+    pub max_bumps: usize,
+    pub max_bytes: usize,
+}
 
 /// Keep the Worker's existing decimal 10 MB request cap, including off-chain
 /// values. The reference Express default is 64 MiB binary, so this is our policy.
@@ -72,10 +82,52 @@ pub const STORED_PROOF_MAX_BYTES: usize = COURIER_PROOF_MAX_BYTES;
 pub const PEER_PROOF_MAX_BYTES: usize = COURIER_PROOF_MAX_BYTES;
 
 /// Refuse the body before constructing a reader. Each caller supplies its
-/// named policy; counts are then checked by the SDK on their prefixes.
+/// named policy. The BUMP count is checked on its prefix before the parse;
+/// the transaction count sits behind the BUMPs on the wire, so it is checked
+/// on the parse of a body the byte check has already bounded.
 pub fn parse_beef(bytes: &[u8], limits: &BeefLimits) -> bsv_rs::Result<Beef> {
     check_size(bytes.len(), limits.max_bytes, "BEEF")?;
-    Beef::from_binary_with_limits(bytes, limits)
+    if let Some(bump_count) = claimed_bump_count(bytes) {
+        if bump_count > limits.max_bumps as u64 {
+            return Err(bsv_rs::Error::BeefError(format!(
+                "BEEF claims {bump_count} BUMPs, over max_bumps {}",
+                limits.max_bumps
+            )));
+        }
+    }
+    let beef = Beef::from_binary(bytes)?;
+    if beef.txs.len() > limits.max_txs {
+        return Err(bsv_rs::Error::BeefError(format!(
+            "BEEF claims {} transactions, over max_txs {}",
+            beef.txs.len(),
+            limits.max_txs
+        )));
+    }
+    Ok(beef)
+}
+
+/// The BUMP count a body's prefix claims: behind the four-byte version, or
+/// behind the 36-byte BRC-95 header and the version. `None` where the prefix
+/// is too short to hold one; the parser names that fault.
+fn claimed_bump_count(bytes: &[u8]) -> Option<u64> {
+    const ATOMIC_MARKER: [u8; 4] = [0x01, 0x01, 0x01, 0x01];
+    let at = if bytes.get(..4)? == ATOMIC_MARKER {
+        ATOMIC_HEADER_BYTES + 4
+    } else {
+        4
+    };
+    let rest = bytes.get(at..)?;
+    let wide = |n: usize| {
+        let mut le = [0u8; 8];
+        le[..n].copy_from_slice(rest.get(1..1 + n)?);
+        Some(u64::from_le_bytes(le))
+    };
+    match *rest.first()? {
+        0xfd => wide(2),
+        0xfe => wide(4),
+        0xff => wide(8),
+        short => Some(u64::from(short)),
+    }
 }
 
 /// Link from the bounded parse, keeping the SDK's exact target selection:
@@ -109,9 +161,9 @@ pub fn merkle_path_from_hex(hex: &str, max_bytes: usize) -> bsv_rs::Result<Merkl
 /// themselves. A door refuses a breach before anything else looks at the body;
 /// a body under the limits that does not parse is an ARRIVAL the route still
 /// counts (the #366 census) and answers with its own parse error, as before
-/// the doors. The SDK names a breach only in its message ("over max_bumps",
-/// "over max_txs"; ours "over max_bytes"), bsv-rs 0.3.35 (caret, held by
-/// the lock); the pin below fails at the next bump that rewords it.
+/// the doors. The SDK named a breach only in its message ("over max_bumps",
+/// "over max_txs"; ours "over max_bytes") until 0.3.35; since the bump to
+/// 0.4.0 all three messages are this module's, and the pin below holds them.
 pub fn is_limit_breach(e: &bsv_rs::Error) -> bool {
     matches!(e, bsv_rs::Error::BeefError(msg) if msg.contains("over max_"))
 }

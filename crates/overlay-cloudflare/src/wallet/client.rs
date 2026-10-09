@@ -32,7 +32,6 @@
 
 use bsv_middleware_cloudflare::WorkerStorageClient;
 use bsv_rs::primitives::ec::PrivateKey;
-use bsv_rs::wallet::ProtoWallet;
 use serde_json::{json, Value};
 use worker::Env;
 
@@ -134,12 +133,18 @@ impl<'a> Wallet<'a> {
 
     /// Build a fresh [`WorkerStorageClient`] bound to our admin key.
     ///
-    /// Each call creates a new [`ProtoWallet`] + client pair, which triggers
+    /// Each call creates a new `ProtoWallet` + client pair, which triggers
     /// a fresh BRC-103 handshake on first RPC use. That's by design — see
     /// the module-level doc note about per-call clients.
-    fn make_storage_client(&self) -> WorkerStorageClient {
-        let wallet = ProtoWallet::new(Some(self.private_key.clone()));
-        WorkerStorageClient::new(wallet, &self.endpoint_url)
+    ///
+    /// The middleware (0.4.1) is built on bsv-rs 0.3 and takes that line's
+    /// wallet, so the admin key crosses the seam as its 32 bytes. A key the
+    /// 0.3 type refuses is an auth failure, never the anonymous wallet.
+    fn make_storage_client(&self) -> Result<WorkerStorageClient, &'static str> {
+        let key = bsv_rs_03::primitives::PrivateKey::from_bytes(&self.private_key.to_bytes())
+            .map_err(|_| ERR_WALLET_AUTH_FAILED)?;
+        let wallet = bsv_rs_03::wallet::ProtoWallet::new(Some(key));
+        Ok(WorkerStorageClient::new(wallet, &self.endpoint_url))
     }
 
     /// Call `createAction` on wallet-infra.
@@ -234,7 +239,7 @@ impl<'a> Wallet<'a> {
     /// to an empty object just to occupy the slot. See
     /// `rust-wallet-infra/src/dispatch.rs::extract_args`.
     async fn rpc(&self, method: &str, args: Value) -> Result<Value, &'static str> {
-        let mut client = self.make_storage_client();
+        let mut client = self.make_storage_client()?;
         client
             .rpc_call::<Value>(method, vec![json!({}), args])
             .await
