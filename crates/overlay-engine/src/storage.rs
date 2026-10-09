@@ -296,7 +296,11 @@ pub trait Storage {
     ///   seconds since its FIRST yieldless sync, on the backend's own clock
     ///   (0 on the sync that starts it). A streak whose LAST yieldless sync
     ///   is more than `crate::gasp::PEER_YIELDLESS_DECAY_SECS` old starts
-    ///   again (count 1, age 0): the decay.
+    ///   again (count 1, age 0): the decay. NOT for a peer whose
+    ///   [`Self::record_peer_sync_outcome`] count is above 0 (the delta-3
+    ///   fold's D3-M1): the decay equals the reprobe window, so a quarantined
+    ///   peer's probe would start a fresh streak, succeed and lift the
+    ///   quarantine; its probe continues the streak instead and fails.
     ///
     /// The engine calls it only with a per-graph budget, only for a sync
     /// the peer served work, and before [`Self::record_peer_sync_outcome`].
@@ -1200,15 +1204,24 @@ pub mod memory {
             yielded: bool,
         ) -> Result<PeerYieldStreak, StorageError> {
             let now = *self.clock_secs.lock().unwrap();
-            let mut held = self.peer_yieldless.lock().unwrap();
             let key = (host.to_string(), topic.to_string());
+            // The delta-3 fold's D3-M1: the decay only for a peer that is
+            // not failed (the worker's statement reads the same row).
+            let not_failed = self
+                .peer_health
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_none_or(|(fails, _)| *fails == 0);
+            let mut held = self.peer_yieldless.lock().unwrap();
             if yielded {
                 held.remove(&key);
                 return Ok(PeerYieldStreak::default());
             }
             let streak = held.entry(key).or_insert((0, now, now));
             if streak.0 == 0
-                || now.saturating_sub(streak.2) > crate::gasp::PEER_YIELDLESS_DECAY_SECS
+                || (not_failed
+                    && now.saturating_sub(streak.2) > crate::gasp::PEER_YIELDLESS_DECAY_SECS)
             {
                 *streak = (0, now, now);
             }

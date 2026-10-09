@@ -8808,27 +8808,48 @@ async fn e555d2_m2_spellings_of_one_server_are_one_origin_and_one_peer() {
     let mut adverts: Vec<String> = spellings.iter().map(|s| s.to_string()).collect();
     adverts.push("https://a.evil.example/?z".into());
     adverts.push("https://Overlay-US-1.bsvb.tech/".into());
+    adverts.push("https://evil.example:443/?y".into());
+    // One peer per canonical `scheme://host[:port]` (amended by the delta-3
+    // fold, D3-L1): the queries, fragments, users, trailing slash and dot and
+    // the default port collapse; the schemes and ports of one origin stay
+    // apart, under that origin's one health key.
     assert_eq!(
         ship_peers_by_origin(adverts),
         [
+            "http://evil.example",
             "https://a.evil.example",
             "https://evil.example",
+            "https://evil.example:8443",
             "https://overlay-us-1.bsvb.tech"
         ]
     );
-    // A stranger's dead port of an honest host loses to the host's own advert.
+    // D3-L1: a stranger's default-port spelling no longer displaces an
+    // honest overlay that serves on another port (on 9280aed this was
+    // `["https://h.example"]`, "the default port first").
     assert_eq!(
-        ship_peers_by_origin(["https://h.example:1".to_string(), "http://h.example".into()]),
-        ["https://h.example:1"],
-        "https first"
+        ship_peers_by_origin([
+            "https://h.example:8443".to_string(),
+            "https://h.example/?q".into()
+        ]),
+        ["https://h.example", "https://h.example:8443"],
+        "both stand"
     );
     assert_eq!(
         ship_peers_by_origin([
-            "https://h.example:1".to_string(),
-            "https://h.example/?q".into()
+            "https://h.example:8443".to_string(),
+            "http://h.example".into()
         ]),
-        ["https://h.example"],
-        "the default port first"
+        ["http://h.example", "https://h.example:8443"]
+    );
+    assert_eq!(
+        ship_peers_by_origin([
+            "https://h.example:8443/".to_string(),
+            "https://H.example:8443/?x".into(),
+            "http://h.example:80".into(),
+            "http://h.example/#y".into()
+        ]),
+        ["http://h.example", "https://h.example:8443"],
+        "spellings of one authority, one peer"
     );
 
     // The engine's writes: under the origin, nothing under the URL.
@@ -9009,4 +9030,116 @@ async fn e555d2_x_a_deadline_that_fell_due_is_never_polled_again() {
     let (topic, _) = node.tick().await;
     assert_eq!(topic.held_back_graphs, 2, "both held back, no panic");
     assert_eq!(node.store.deferred_graphs().len(), 2);
+}
+
+// ============================================================================
+// bsv-low #555, the delta-3 fold (the delta-3 lens on 9280aed): D3-M1 the
+// decay never fires for a failed peer; D3-L1 one SHIP peer per canonical
+// `scheme://host[:port]`.
+// ============================================================================
+
+use bsv_overlay_engine::gasp::PEER_QUARANTINE_REPROBE_SECS;
+
+// D3-M1 (the lens's DELTA3-1b). The hostile peer of e555d_m2_a (one fresh
+// root a tick, its input hanging) carried past its quarantine for 200 ticks
+// at `*/15`, the clock moving 901 s a tick (any sync of a second or cron
+// drift): the probe lands more than PEER_YIELDLESS_DECAY_SECS after the
+// peer's last yieldless sync. On 9280aed the probe started a fresh streak
+// (count 1, not failed), "progressed", reset the failures to 0 and the peer
+// was attended on 100 of the 200 ticks. Now a failed peer's streak does not
+// decay: every probe fails and re-arms the quarantine, one probe per reprobe
+// window (27 of 200 attended).
+#[tokio::test]
+async fn e555d3_m1_the_probe_of_a_quarantined_yieldless_peer_fails_and_rearms() {
+    let (_logs, _guard) = capture_logs();
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let store = Rc::new(MemoryStorage::new());
+    let mut node = Budgeted::over(
+        listing(&salted_chain(2, 0), &[(1, 0)]),
+        Box::new(HeadChainManager(state.clone())),
+        RequestClock::allowing(1000),
+        store.clone(),
+        Box::new(store),
+        true,
+    );
+    let quarantined_at = PEER_YIELDLESS_SYNCS_ALLOWED + PEER_QUARANTINE_THRESHOLD;
+    let probe_every = PEER_QUARANTINE_REPROBE_SECS.div_ceil(901);
+    let mut attended = 0u64;
+    let mut probes = 0u64;
+    for tick in 1..=200u64 {
+        if tick > 1 {
+            node.store.advance_clock(901);
+        }
+        let fresh = salted_chain(2, 100 + tick);
+        let genesis = vec![node_txid(&fresh[0])];
+        let mut remote = listing(&fresh, &[(1, 0)]);
+        remote.requests = node.requests.clone();
+        let _h = hanging(&mut node, remote, &genesis);
+        let before = node.failures().await;
+        let (_, sent) = node.tick().await;
+        let failures = node.failures().await;
+        if sent.is_empty() {
+            continue;
+        }
+        attended += 1;
+        if tick > quarantined_at {
+            probes += 1;
+            assert_eq!(
+                (tick - quarantined_at) % probe_every,
+                0,
+                "tick {tick}: attended only at a probe"
+            );
+            assert_eq!(
+                failures,
+                before + 1,
+                "tick {tick}: the probe continues the streak and fails"
+            );
+            assert!(
+                node.store.peer_yieldless_syncs(&peer_origin(PEER), TOPIC) > quarantined_at,
+                "tick {tick}: the streak did not decay"
+            );
+        }
+    }
+    let expected = quarantined_at + (200 - quarantined_at) / probe_every;
+    assert_eq!(attended, expected, "one probe per reprobe window");
+    assert!(probes >= 7);
+    assert!(state.borrow().admitted.is_empty());
+    println!(
+        "#555 delta-3 D3-M1: 901 s a tick, 200 ticks: {attended} attended ({probes} probes, each failed)"
+    );
+}
+
+// D3-M1, the model: a peer that is not failed still decays (D2-M1), a failed
+// one does not, and a success makes it decay again.
+#[tokio::test]
+async fn e555d3_m1_the_decay_is_only_for_a_peer_that_is_not_failed() {
+    let store = MemoryStorage::new();
+    let y = || store.record_peer_sync_yield("h", TOPIC, false);
+    assert_eq!(y().await.unwrap().yieldless_syncs, 1);
+    store
+        .record_peer_sync_outcome("h", TOPIC, false)
+        .await
+        .unwrap();
+    store.advance_clock(PEER_YIELDLESS_DECAY_SECS + 1);
+    assert_eq!(
+        y().await.unwrap(),
+        PeerYieldStreak {
+            yieldless_syncs: 2,
+            secs_since_first: Some(PEER_YIELDLESS_DECAY_SECS + 1)
+        },
+        "failed: the same streak past 6 h"
+    );
+    store
+        .record_peer_sync_outcome("h", TOPIC, true)
+        .await
+        .unwrap();
+    store.advance_clock(PEER_YIELDLESS_DECAY_SECS + 1);
+    assert_eq!(
+        y().await.unwrap(),
+        PeerYieldStreak {
+            yieldless_syncs: 1,
+            secs_since_first: Some(0)
+        },
+        "not failed: a new streak"
+    );
 }

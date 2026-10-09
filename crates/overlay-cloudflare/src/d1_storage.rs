@@ -121,8 +121,12 @@ pub(crate) const PEER_HEALTH_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health \
 /// yielded ends the streak (count 0, both stamps NULL); one that did not adds
 /// one and stamps `last_yieldless_at`, and starts a NEW streak (count 1,
 /// `first_yieldless_at` now) when there was none or its last yieldless sync
-/// is more than `?4` old (the decay). SQLite reads the OLD row in every `SET`
-/// expression. Returns the count and `secsSinceFirst`, the streak's age on
+/// is more than `?4` old (the decay) AND the peer is not failed
+/// (`consecutive_failures = 0`; the delta-3 fold's D3-M1: the decay equals
+/// the 6 h reprobe, so without that clause every probe of a peer quarantined
+/// by this bound started a new streak, succeeded and lifted the quarantine;
+/// the yield runs before the outcome, so the probe continues the streak and
+/// fails). SQLite reads the OLD row in every `SET` expression. Returns the count and `secsSinceFirst`, the streak's age on
 /// D1's clock. A new row's `last_attempt` is left NULL: the engine records
 /// the attempt itself next (`PEER_HEALTH_UPSERT_SQL`), which stamps it.
 pub(crate) const PEER_YIELD_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health \
@@ -131,10 +135,10 @@ pub(crate) const PEER_YIELD_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health \
              CASE WHEN ?3 THEN NULL ELSE unixepoch() END, CASE WHEN ?3 THEN NULL ELSE unixepoch() END) \
      ON CONFLICT(host, topic) DO UPDATE SET \
        yieldless_syncs = CASE WHEN ?3 THEN 0 \
-         WHEN last_yieldless_at IS NULL OR yieldless_syncs = 0 OR unixepoch() - last_yieldless_at > ?4 THEN 1 \
+         WHEN last_yieldless_at IS NULL OR yieldless_syncs = 0 OR (unixepoch() - last_yieldless_at > ?4 AND consecutive_failures = 0) THEN 1 \
          ELSE yieldless_syncs + 1 END, \
        first_yieldless_at = CASE WHEN ?3 THEN NULL \
-         WHEN last_yieldless_at IS NULL OR yieldless_syncs = 0 OR unixepoch() - last_yieldless_at > ?4 THEN unixepoch() \
+         WHEN last_yieldless_at IS NULL OR yieldless_syncs = 0 OR (unixepoch() - last_yieldless_at > ?4 AND consecutive_failures = 0) THEN unixepoch() \
          ELSE first_yieldless_at END, \
        last_yieldless_at = CASE WHEN ?3 THEN NULL ELSE unixepoch() END \
      RETURNING yieldless_syncs, (unixepoch() - first_yieldless_at) AS secsSinceFirst";
@@ -1596,6 +1600,93 @@ mod tests {
         let f = &f[..f.find("async fn get_peer_sync_health").unwrap()];
         assert!(f.contains("PEER_YIELDLESS_DECAY_SECS"));
         assert!(f.contains("secs_since_first"));
+    }
+
+    /// bsv-low #555, the delta-3 fold's D3-M1 (the lens's DELTA3-1 over the
+    /// SHIPPED statements): a hostile peer that "progresses" and never yields,
+    /// 200 ticks at `*/15`, each sync 15 s long, through the yield upsert, the
+    /// outcome upsert and the health read on the production schema, the clock
+    /// moved by shifting the row's stamps back. On 9280aed the probe of the
+    /// quarantined peer landed more than the 6 h decay after its last
+    /// yieldless stamp, started a fresh streak, succeeded and lifted the
+    /// quarantine: 100 of 200 ticks attended. Now its streak continues and the
+    /// probe fails: one probe per 6 h, 27 of 200.
+    #[test]
+    fn e555d3_m1_the_probe_of_a_quarantined_peer_continues_its_streak() {
+        use overlay_engine::gasp::{
+            yieldless_sync_failed, PEER_QUARANTINE_REPROBE_SECS, PEER_QUARANTINE_THRESHOLD,
+            PEER_YIELDLESS_DECAY_SECS,
+        };
+        use overlay_engine::storage::PeerYieldStreak;
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "{e}\n{sql}"
+                );
+            }
+        }
+        let (host, topic) = ("evil.example", "tm_ship");
+        let back = |secs: i64| {
+            conn.execute(
+                "UPDATE gasp_peer_health SET last_attempt = last_attempt - ?1, \
+                 last_success = last_success - ?1, first_yieldless_at = first_yieldless_at - ?1, \
+                 last_yieldless_at = last_yieldless_at - ?1",
+                [secs],
+            )
+            .unwrap();
+        };
+        let health = || -> (u64, Option<i64>) {
+            conn.query_row(PEER_HEALTH_SELECT_SQL, [host, topic], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get(1)?))
+            })
+            .unwrap_or((0, None))
+        };
+        let (tick, duration) = (900i64, 15i64);
+        let mut attended = Vec::new();
+        for k in 0..200i64 {
+            if k > 0 {
+                back(tick - duration);
+            }
+            let (fails, since) = health();
+            if fails >= PEER_QUARANTINE_THRESHOLD
+                && since.is_some_and(|s| s < PEER_QUARANTINE_REPROBE_SECS as i64)
+            {
+                continue;
+            }
+            attended.push(k);
+            back(duration);
+            let (count, age): (i64, Option<i64>) = conn
+                .query_row(
+                    PEER_YIELD_UPSERT_SQL,
+                    rusqlite::params![host, topic, false, PEER_YIELDLESS_DECAY_SECS as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            let failed = yieldless_sync_failed(&PeerYieldStreak {
+                yieldless_syncs: count as u64,
+                secs_since_first: age.map(|a| a as u64),
+            });
+            if attended.len() > 20 {
+                assert!(failed, "tick {k}: a probe continues the streak and fails");
+            }
+            conn.execute(
+                PEER_HEALTH_UPSERT_SQL,
+                rusqlite::params![host, topic, !failed],
+            )
+            .unwrap();
+        }
+        assert_eq!(attended.len(), 27, "one probe per 6 h: {attended:?}");
+        // The clause is in the shipped statement, in both CASEs.
+        assert_eq!(
+            PEER_YIELD_UPSERT_SQL
+                .matches("> ?4 AND consecutive_failures = 0")
+                .count(),
+            2
+        );
     }
 
     #[test]

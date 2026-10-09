@@ -5276,8 +5276,9 @@ impl Engine {
             }
         }
 
-        // One peer per normalized origin (bsv-low #555, the delta-2 fold's
-        // D2-M2): eight spellings of one server are one peer.
+        // One peer per canonical `scheme://host[:port]` (bsv-low #555, the
+        // delta-2 fold's D2-M2 and the delta-3 fold's D3-L1): eight spellings
+        // of one server are one peer; its ports share one origin's health.
         crate::gasp::ship_peers_by_origin(domains)
     }
 

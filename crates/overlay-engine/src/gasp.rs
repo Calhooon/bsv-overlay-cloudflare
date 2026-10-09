@@ -234,6 +234,14 @@ pub const PEER_YIELDLESS_SECS_ALLOWED: u64 = 3 * 3600;
 /// cost, stated: a peer yieldless for 3 h, quiet for 6 h, and so on, keeps
 /// its slice during the yieldless hours (a third of its ticks at most), as
 /// #302's own accepted residual of one success in every eight.
+///
+/// Only for a peer that is NOT failed (`consecutive_failures` 0; the delta-3
+/// fold's D3-M1). This window equals the reprobe's, so the probe of a peer
+/// quarantined by this bound always came more than 6 h after its last
+/// yieldless sync: it started a fresh streak (count 1, not failed), the sync
+/// "progressed", the failures went to 0 and the quarantine lifted at every
+/// probe (half the ticks at `*/15`). The probe of a failed peer continues
+/// its streak and fails, so it gets one probe per reprobe window.
 pub const PEER_YIELDLESS_DECAY_SECS: u64 = PEER_QUARANTINE_REPROBE_SECS;
 
 /// PURE rule of the yieldless bound (bsv-low #555, the delta-2 fold's
@@ -264,10 +272,12 @@ pub fn peer_origin(url: &str) -> String {
 
 /// `(scheme, host, port)` of a peer URL: the scheme lowercased (`https`
 /// when absent), the host as [`peer_origin`] gives it, the port as written
-/// (`None` when absent or empty).
+/// (`None` when absent, empty, or the scheme's default: `443` for `https`,
+/// `80` for `http`).
 fn peer_authority(url: &str) -> (String, String, Option<String>) {
     let url = url.trim();
     let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
+    let scheme = scheme.to_ascii_lowercase();
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let (host, port) = match host_port.strip_prefix('[') {
@@ -281,47 +291,46 @@ fn peer_authority(url: &str) -> (String, String, Option<String>) {
             None => (host_port.to_string(), None),
         },
     };
+    let default_port = match scheme.as_str() {
+        "https" => "443",
+        "http" => "80",
+        _ => "",
+    };
+    let port = port.filter(|p| !p.is_empty() && *p != default_port);
     (
-        scheme.to_ascii_lowercase(),
+        scheme,
         host.trim_end_matches('.').to_ascii_lowercase(),
-        port.filter(|p| !p.is_empty()).map(str::to_string),
+        port.map(str::to_string),
     )
 }
 
-/// The peers of a SHIP-discovered topic, ONE per [`peer_origin`] (bsv-low
-/// #555, the delta-2 fold's D2-M2): each advertised domain is canonicalized
-/// to `scheme://host[:port]` (the host lowercased; path, query, fragment and
-/// user dropped), and of the spellings of one origin the first by `https`,
-/// then no explicit port, then the string is kept. So eight adverts of one
-/// server (`/?1`, `/?2`, `/#x`, `:8443`, ...) are one peer synced once a
-/// tick, and a stranger's spelling of an honest host (a query, a dead port)
-/// cannot stand beside that host's own advert under its quarantine key.
-/// Stated: two overlays of one host on two ports, on one SHIP topic, are one
-/// peer (the default port's). Sorted, for a stable order.
+/// The peers of a SHIP-discovered topic, ONE per canonical authority
+/// `scheme://host[:port]` (bsv-low #555, the delta-2 fold's D2-M2 and the
+/// delta-3 fold's D3-L1): each advertised domain is canonicalized (the scheme
+/// and host lowercased; path, query, fragment, user, a trailing dot and the
+/// scheme's default port dropped) and spellings of one canonical form are
+/// one peer, synced once a tick. So `/?1`, `/?2`, `/#x`, a trailing slash
+/// and `:443` of one server are one peer. Distinct ports (or schemes) of one
+/// host stay distinct peers, so a stranger's default-port spelling cannot
+/// displace an honest overlay that serves on `:8443` (D3-L1: ranked by
+/// `https`, then no port, it did). They still share ONE quarantine, one
+/// yieldless streak and one share of the worker's ceiling, all keyed by
+/// [`peer_origin`]. Stated: a stranger's ports of its own host are one peer
+/// each, a per-peer slice each per tick, until their shared quarantine.
+/// Sorted, for a stable order.
 pub fn ship_peers_by_origin<I: IntoIterator<Item = String>>(domains: I) -> Vec<String> {
-    type Rank = (bool, bool, String);
-    let mut by_origin: std::collections::BTreeMap<String, (Rank, String)> =
-        std::collections::BTreeMap::new();
+    let mut peers = std::collections::BTreeSet::new();
     for domain in domains {
         let (scheme, origin, port) = peer_authority(&domain);
         if origin.is_empty() {
             continue;
         }
-        let canonical = match &port {
+        peers.insert(match port {
             Some(port) => format!("{scheme}://{origin}:{port}"),
             None => format!("{scheme}://{origin}"),
-        };
-        let candidate = (scheme != "https", port.is_some(), canonical.clone());
-        match by_origin.get(&origin) {
-            Some((kept, _)) if *kept <= candidate => {}
-            _ => {
-                by_origin.insert(origin, (candidate, canonical));
-            }
-        }
+        });
     }
-    let mut peers: Vec<String> = by_origin.into_values().map(|(_, url)| url).collect();
-    peers.sort();
-    peers
+    peers.into_iter().collect()
 }
 
 /// PURE quarantine rule (bsv-low#302): a peer is skipped IFF it has hit
