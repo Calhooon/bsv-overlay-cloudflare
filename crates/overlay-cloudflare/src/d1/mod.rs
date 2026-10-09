@@ -474,7 +474,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 182 → 185 for bsv-low #585 (2026-10-09, door 3; 179-181 before the land onto NL-6c and NL-6d):
 /// `mutation_dead_letters.r2_key` and `.r2_bytes` (a letter whose BEEF is held in R2) and the index the health block
 /// sums the bytes at rest from; two additive ALTERs, one index.
-pub const OVERLAY_MIGRATION_COUNT: usize = 185;
+/// 185 → 186 for bsv-low #585 (2026-10-09, door 3's fold; 182 before the land onto NL-6c and NL-6d):
+/// `beef_blob_sweep`, the one-row state of the orphan sweep over the queue's R2 objects (its cursor, the round in
+/// progress, the last complete count); one table.
+pub const OVERLAY_MIGRATION_COUNT: usize = 186;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1781,6 +1784,10 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::dead_letters::DEAD_LETTERS_R2_KEY_COLUMN,
     crate::dead_letters::DEAD_LETTERS_R2_BYTES_COLUMN,
     crate::dead_letters::DEAD_LETTERS_R2_INDEX,
+    // bsv-low #585 (door 3's fold): the orphan sweep of the queue's R2 objects keeps its cursor (the last key it
+    // handled), the round in progress and the last complete count of the objects at rest in ONE row
+    // (`beef_blob_sweep.rs`). Transient: a lost row restarts the round at the first key.
+    crate::beef_blob_sweep::SWEEP_STATE_CREATE,
 ];
 
 // =============================================================================

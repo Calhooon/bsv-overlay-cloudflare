@@ -10,6 +10,7 @@ pub mod advert_lifecycle;
 pub mod advertiser;
 pub mod arcade_reorg;
 pub mod ban_storage;
+pub mod beef_blob_sweep;
 pub mod broadcaster;
 pub mod chain_tracker;
 pub mod change_flush;
@@ -1302,6 +1303,23 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // graph is being submitted, and a submit dropped between its writes
     // leaves a head chain with no head. It waits for the transaction being
     // written and drops the sync at the boundary.
+    // bsv-low #585 (door 3's fold): one bounded pass of the orphan sweep over
+    // the queue's R2 objects (`beef_blob_sweep.rs`: at most 200 listed and 50
+    // deleted, the cursor at rest in D1). Before the GASP step, so a tick
+    // that step holds to its belt has swept. A dropped pass saved no cursor
+    // and is made again.
+    if race_or_deadline(
+        crate::beef_blob_sweep::sweep_pass(&env, &ops_db),
+        crate::broadcaster::sleep_ms(crate::beef_blob_sweep::SWEEP_BUDGET_MS),
+    )
+    .await
+    .is_none()
+    {
+        worker::console_log!(
+            "Scheduled: the R2 orphan sweep EXCEEDED its {} ms budget — dropped; continuing the tick",
+            crate::beef_blob_sweep::SWEEP_BUDGET_MS
+        );
+    }
     // bsv-low #555 (the lens fold's M3): rows of deferred graphs nothing
     // will resume (a peer that never finishes a sync again) are swept first.
     crate::gasp_deferred::sweep_stale(&ops_db).await;

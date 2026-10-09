@@ -905,14 +905,65 @@ routed around, never made a limit on a body.
   (another copy of a parked key carried more); (4) on the operator's discard.
   Counted `beef_blobs_deleted_total`; a delete that faults is logged
   `[beef-blobs]` with its key and counted `beef_blobs_delete_faults_total`.
+- **The orphan sweep (the d3 fold; `beef_blob_sweep.rs`).** An object NOTHING
+  names (the orphans below) is found by listing the bucket, since nothing
+  else knows it. CADENCE: the scheduled tick (`*/15`), one pass a tick,
+  before the GASP step, under a 30 s race (a dropped pass saved no cursor and
+  is made again). BOUND: a pass lists at most 200 objects under `mutations/`
+  (`SWEEP_MAX_OBJECTS`) from the key the last pass stopped at, and deletes at
+  most 50 (`SWEEP_MAX_DELETES`, a `head` and a `delete` each; a pass that
+  meets a 51st stops there). The cursor is the last KEY handled, at rest in
+  D1 (`beef_blob_sweep`, one row, transient, migration 182): R2 lists in key
+  order and a key outlives a listing token. An object is deleted when it is
+  BOTH older than the WINDOW by R2's own `uploaded` stamp AND named by no
+  dead letter row (`NAMED_KEYS_SQL`: every `mutation_dead_letters.r2_key`,
+  whatever the row's status; read only by a pass that listed an object past
+  the window). Just before its delete the object is read again and left if
+  it was written again since the listing (a re-presentation: the same key, a
+  new stamp, a new message). A state, listing or named-keys read that faults
+  deletes nothing and moves no cursor. THE WINDOW is 8 days
+  (`ORPHAN_WINDOW_S`, two `QUEUE_RETENTION_S` of 345,600 s, the platform's
+  default retention, which neither queue changes): what no queue message can
+  outlive. Every message naming an object was sent right after a write of it
+  (the door writes, then sends; the lever's re-drive sends without a write
+  and its row names the object from the park to the ack), lives at most one
+  retention in the main queue and one in the dead letter queue, and ends
+  there parked (a row), LOST (its object deleted) or dropped. #576's ~48 h of
+  backoff (172,860 s, pinned) is NOT the bound alone: it starts at the
+  letter's first DLQ delivery, after its whole life in the main queue, so a
+  letter deferred to its last delivery and parked there names an object
+  already older than 48 h, and an object swept under a live name is a replay
+  with no bytes. Counted `queue_r2_orphans_swept_total` and
+  `queue_r2_orphans_swept_bytes_total` (a read or delete that faulted:
+  `queue_r2_orphan_sweep_faults_total`), each logged `[beef-blobs] SWEPT
+  <key> bytes= age_s=`. `/health/invariants.queue.r2` serves the objects AT
+  REST from the listing: `atRest` {`objects`, `bytes`, `at`} of the last
+  COMPLETE round over the bucket (`null` before the first), `round` (the one
+  in progress, with `startAfter`), `sweep` {`windowSecs`,
+  `maxObjectsPerPass`, `maxDeletesPerPass`, `prefix`, `lastPassAt`,
+  `lastListed`, `lastSwept`}, `bound` and `readable`.
 
-Limits, stated. (1) ORPHANS: an object nothing names stays for good (there is
-no sweep and no expiry): a send that faulted after its write and was never
-re-presented; a delete that faulted; a batch that died between its acks and
-its deletes; a main-queue message or a dead letter the platform dropped
-without the LOST line (retention; `attempts` unreadable, the ~8.3 h case); a
-letter the operator deleted by SQL. Nothing lists them: the health block
-counts the letters' objects from D1, not the bucket's. (2) TWINS, cured (the
+Limits, stated. (1) ORPHANS, cured (the sweep above): a send that faulted
+after its write and was never re-presented, a delete that faulted, a batch
+that died between its acks and its deletes, a message or dead letter the
+platform dropped without the LOST line, a letter the operator deleted by SQL.
+What is left: an orphan costs its bytes for 8 days, and longer in a big
+bucket (a round is 200 objects a tick: 19,200 a day); `atRest` is as old as
+the last complete round and is the bucket's count, where `deadLetters.r2`
+is D1's count of the letters' objects (the difference is the messages still
+in a queue and the orphans not yet swept). The window rests on the queues'
+retention being the DEFAULT four days: it is set at `wrangler queues
+create`, not in a config, so nothing here reads it (`wrangler queues info`
+says; a queue given a longer retention needs `QUEUE_RETENTION_S` raised).
+Whether a message's retention restarts when it moves to the DLQ is not
+documented; the window takes the worse reading (it does). A re-presentation
+landing between the sweep's last read of an object and its delete
+(milliseconds) loses that object under a live message: a fault letter unless
+its subject landed (the twin rule). The sweep runs only from cron: on a
+worker whose scheduled event is not delivered nothing sweeps. Its cost a
+tick: one R2 list, one D1 read and one write, plus the dead letters' keys
+(at most the 2000 held rows) and two R2 calls an orphan when a page holds an
+object past the window. (2) TWINS, cured (the
 twin rule above); what is left: a twin whose first message was acked WITHOUT
 landing in every topic it names is a fault letter still (no instance known:
 the three acks are landed, refused under an eviction, re-evicted, and the two
@@ -949,7 +1000,21 @@ a `fault` letter; half landed is a fault; RED with the verdict put back to
 `*_the_verdict_reads_the_ledger_first_and_a_faulted_read_is_never_landed`
 (the other arms and the consumer's source shape; RED over `45aceff`'s
 `lib.rs`: "the consumer judges a MISSING object"). Neither compiles on
-`45aceff`. Amended: `e585_d3_the_write_precedes_the_send_and_the_ack_deletes`
+`45aceff`. The sweep's pins (`beef_blob_sweep::tests`, the pass run over a
+bucket in key order and the SHIPPED statements under real SQLite):
+`*_an_orphan_past_the_window_is_swept_a_named_and_a_young_one_are_not` (the
+object of a faulted send, to the millisecond of the window; one a parked
+letter names; a young one; one written again before its delete; a faulted
+named-keys read; the count at rest), `*_the_sweep_is_bounded_per_pass_and_resumes_from_the_key_at_rest`
+(450 objects, 130 orphans: passes of 50, 50, 30 and 0 deletes, 200 listed at
+most, the cursor read from D1, the health block) and
+`*_the_window_outlives_every_queue_message_and_the_cron_runs_the_pass` (the
+window against #576's backoff, the configs, the tick's wiring, the pass's
+order). The module does not exist on `45aceff`; RED over the tick without
+the pass ("the scheduled tick runs one bounded pass of the sweep") and
+against four revert mutants (no orphan named: `left: Pass { swept: [] ..`;
+the window ignored; the dead letters' keys ignored; no read before the
+delete). Amended: `e585_d3_the_write_precedes_the_send_and_the_ack_deletes`
 (one ack names no object) and
 `e576_the_main_consumer_notes_each_retry_and_resolves_each_ack` (four acks). Amended: three `e576*`
 pins for the statements' new `r2_key` column and `park_query_r2`. The route

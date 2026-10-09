@@ -230,6 +230,11 @@ pub const COUNTER_QUEUE_R2_TWIN_ACKED: &str = "queue_r2_twin_acked_total";
 /// replay's fault (a fault letter). `beef_blobs_missing_total` counts every missing read, these two its verdicts
 /// (the rest were acked under an open eviction).
 pub const COUNTER_QUEUE_R2_MISSING_FAULT: &str = "queue_r2_missing_fault_total";
+/// bsv-low #585 (door 3's fold): R2 objects the orphan sweep deleted (past the window, named by no dead letter),
+/// their bytes, and the sweep's reads and deletes that faulted (the object stays for the next round).
+pub const COUNTER_QUEUE_R2_ORPHANS_SWEPT: &str = "queue_r2_orphans_swept_total";
+pub const COUNTER_QUEUE_R2_ORPHANS_SWEPT_BYTES: &str = "queue_r2_orphans_swept_bytes_total";
+pub const COUNTER_QUEUE_R2_ORPHAN_SWEEP_FAULTS: &str = "queue_r2_orphan_sweep_faults_total";
 /// loop 18: an eviction pass that could not prove every table clean (a faulted read, a survivor after the
 /// second move) — the open marker stands; the write-side guard and the next eviction converge.
 pub const COUNTER_ADMIT_FAST_EVICT_INCOMPLETE: &str = "admit_fast_evict_incomplete_total";
@@ -934,6 +939,9 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_BEEF_BLOBS_MISSING,
         COUNTER_QUEUE_R2_TWIN_ACKED,
         COUNTER_QUEUE_R2_MISSING_FAULT,
+        COUNTER_QUEUE_R2_ORPHANS_SWEPT,
+        COUNTER_QUEUE_R2_ORPHANS_SWEPT_BYTES,
+        COUNTER_QUEUE_R2_ORPHAN_SWEEP_FAULTS,
         COUNTER_ARC_INGEST_SEEN_LATCHED,
         COUNTER_ARC_INGEST_EVICTED,
         COUNTER_ARC_INGEST_READMITTED,
@@ -1223,6 +1231,7 @@ pub async fn health_invariants(
     let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);
     let mut index_janitor = index_janitor_backlog(db).await;
     let dead_letters = crate::dead_letters::health_json(db, env).await;
+    let queue = crate::beef_blob_sweep::health_json(db, env).await;
     let deferred_graphs = crate::gasp_deferred::health_json(
         db,
         crate::gasp_deferred::graph_budget_limbs_from_env(env),
@@ -1281,6 +1290,9 @@ pub async fn health_invariants(
         // bsv-low #576: the parked dead letters (count by status, the oldest parked, the last re-drive, the letters
         // past the re-drive ceiling); `readable: false` = the table is unreadable, distinct from none.
         "deadLetters": dead_letters,
+        // bsv-low #585 (door 3's fold): the queue's R2 objects at rest as the orphan sweep's listing counted them
+        // (the last complete round and the one in progress) and the sweep's window, bounds and last pass.
+        "queue": queue,
         // bsv-low #555: the GASP graphs deferred past their per-graph budget (count, the oldest, each with its
         // topic, peer, outpoint, nodes, pending, calls, passes, reason, bytes, age); `readable: false` = unreadable.
         "gasp": { "deferredGraphs": deferred_graphs },

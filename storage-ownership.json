@@ -861,6 +861,17 @@
    "why": "D1's 2 MB row is routed around, not made a limit on a graph: a lost part drops its record, which costs the walk again from its root; transient"
   },
   {
+   "name": "beef_blob_sweep",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the one-row state of the orphan sweep over the queue's R2 objects (bsv-low #585, door 3's fold): the last key a pass handled, the objects and bytes counted by the round in progress, the last complete round's count, the last pass",
+   "why": "the cron's sweep lists BEEF_BLOBS 200 objects a pass and resumes from the key at rest; a lost row restarts the round at the first key and loses only the served count until a round completes; transient"
+  },
+  {
    "name": "ops_counters",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
