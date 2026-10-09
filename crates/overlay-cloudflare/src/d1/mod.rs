@@ -465,7 +465,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 171 → 175 for bsv-low #555's delta-2 fold (2026-10-09, D2-M1, D2-M2): `gasp_peer_health.first_yieldless_at` and
 /// `.last_yieldless_at` (the streak in time), `gasp_deferred_graphs.origin` and `.configured` (the share by origin and
 /// the reserve for configured peers); four additive ALTERs.
-pub const OVERLAY_MIGRATION_COUNT: usize = 175;
+/// 175 → 178 for NL-6c (2026-10-09): `ef_deferred_jobs`, its state index and `ef_deferred_chunks` (the broadcast-gated
+/// arm's deferred work and its bytes at rest).
+pub const OVERLAY_MIGRATION_COUNT: usize = 178;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1749,6 +1751,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // peers hold at most half the ceiling). `DEFERRED_GRAPH_UPSERT_SQL`.
     "ALTER TABLE gasp_deferred_graphs ADD COLUMN origin TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE gasp_deferred_graphs ADD COLUMN configured INTEGER NOT NULL DEFAULT 0",
+    // NL-6c (2026-10-09): THE DEFERRED EF WORK. A broadcast-gated submission whose EF work is past one request's
+    // budget is answered 202 with a reference; its bytes rest in `ef_deferred_chunks` (a chunk under D1's row bound a
+    // row; R2 instead when `BEEF_BLOBS` is bound), its job in `ef_deferred_jobs`, and the queue consumer runs the arm
+    // (`ef_deferred.rs`). Transient: a settled job is swept with its bytes after seven days.
+    crate::ef_deferred::JOBS_CREATE,
+    crate::ef_deferred::JOBS_INDEX,
+    crate::ef_deferred::CHUNKS_CREATE,
 ];
 
 // =============================================================================

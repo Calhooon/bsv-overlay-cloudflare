@@ -1674,6 +1674,7 @@ mod tests {
             mode: "historical-tx".to_string(),
             reason: "phase3-fault".to_string(),
             redrive: None,
+            ef_job: None,
         }
     }
 
@@ -2858,8 +2859,10 @@ mod tests {
         );
         assert_eq!(
             body.matches("msg.ack();").count(),
-            3,
-            "the only acks: the eviction skip, the re-eviction, the durable ack"
+            4,
+            "the only acks: the eviction skip, the re-eviction, the durable ack, and a deferred EF job's (NL-6c: \
+             its own row carries its runs and the cron hands it back, so it never rides the platform's retries \
+             or the dead letters)"
         );
     }
 

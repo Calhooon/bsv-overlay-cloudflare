@@ -856,7 +856,8 @@ where
 {
     // #267 hardening: WORK BOUND, checked before any submit. Over the cap
     // the whole corroboration is INCONCLUSIVE (Err → 502, the client's
-    // fallback — the same fail direction as the routes.rs 429 byte bound),
+    // fallback; the routes.rs 429 byte bound it once matched is a deferral
+    // to the queue since NL-6c),
     // never a truncated prime-loop whose partial corroboration could admit.
     if efs.len() > MAX_CORROBORATION_LEGS {
         return Err(format!(
