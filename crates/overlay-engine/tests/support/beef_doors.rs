@@ -113,10 +113,15 @@ pub fn invalid() -> Vec<(Vec<u8>, usize, &'static str)> {
     let (mut trailing, _) = body(1);
     let frame = trailing.len();
     trailing.push(0x00);
+    // The same body, cut inside the transaction's four-byte lock time.
+    let mut cut = trailing[..frame - 1].to_vec();
+    cut.shrink_to_fit();
     vec![
         (vec![0xde, 0xad, 0xbe, 0xef], 0, "BadVersion"),
         (tree_height_65, 10, "TreeHeightOver64"),
-        (claims_300_bumps, 7, "Truncated"),
+        // The stream ends where the first BUMP's height varint would start.
+        (claims_300_bumps, 7, "BadVarint"),
+        (cut, frame - 4, "Truncated"),
         (trailing, frame, "TrailingBytes"),
     ]
 }

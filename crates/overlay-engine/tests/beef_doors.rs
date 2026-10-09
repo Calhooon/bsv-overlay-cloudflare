@@ -188,8 +188,7 @@ fn the_courier_wire_bound_stays_and_is_checked_before_hex_decode() {
             at.to_hex()
         );
         assert!(merkle_path_from_hex(&over.to_hex(), cap)
-            .err()
-            .expect("one extra proof byte admitted")
+            .expect_err("one extra proof byte admitted")
             .to_string()
             .contains("max_bytes"));
         let invalid_hex = "z".repeat((cap + 1) * 2);
