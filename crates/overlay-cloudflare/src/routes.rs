@@ -1241,7 +1241,18 @@ async fn submit_inner(
                 .iter()
                 .map(|e| (e.txid.clone(), hex::encode(&e.ef)))
                 .collect();
-            if let (false, Ok(dual_db)) = (dual_legs.is_empty(), env.d1("OVERLAY_DB")) {
+            // NL-6c: `DUAL_BROADCAST=off` turns this leg off for a worker
+            // whose broadcaster is a local fixture (the route tier's NL-6c
+            // worker), so a CI witness never pushes bytes to TAAL or
+            // GorillaPool. Unset, or any other value: on, as before.
+            let dual_on = !env
+                .var("DUAL_BROADCAST")
+                .ok()
+                .map(|v| v.to_string())
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
+            if let (true, false, Ok(dual_db)) =
+                (dual_on, dual_legs.is_empty(), env.d1("OVERLAY_DB"))
+            {
                 let dual_key = taal_api_key.clone();
                 let dual_txid = subject_txid.clone();
                 let dual_env = env.clone();
