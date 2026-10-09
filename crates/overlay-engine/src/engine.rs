@@ -4664,7 +4664,7 @@ impl Engine {
 
         let mut topics_synced: HashMap<String, TopicSyncResult> = HashMap::new();
 
-        for (topic, target) in &self.config.sync_configuration {
+        for (topic, target) in sync_order(&self.config.sync_configuration) {
             let (peers, sync_type) = match target {
                 SyncTarget::Disabled => {
                     info!("[GASP SYNC] Topic {topic} is disabled — skipping");
@@ -4848,6 +4848,11 @@ impl Engine {
                     // refused graph is not a failed sync (the reference
                     // discards it and carries on).
                     discarded_graphs += sync.discarded_graphs();
+                    // Whether the sync ran (to its end, or to the deadline)
+                    // and whether it moved the cursor (bsv-low #555, the
+                    // delta fold's D-M2).
+                    let ran = !matches!(sync_outcome, Some(Err(_)));
+                    let mut advanced_cursor = false;
                     match sync_outcome {
                         None => {
                             let budget_ms = self.peer_sync_budget.as_ref().map_or(0, |(_, ms)| *ms);
@@ -4898,6 +4903,7 @@ impl Engine {
                             // (the lens fold's H1: a hung peer deferred with
                             // 0 nodes on every tick and was never
                             // quarantined).
+                            advanced_cursor = completed > last_interaction;
                             outcome_success = peer_finalized.get() > 0
                                 || completed > last_interaction
                                 || sync.deferral_stats().progressed > 0;
@@ -4957,6 +4963,7 @@ impl Engine {
                             // skipped). Under a budget the hook fails that
                             // one UTXO instead and the gap guard has already
                             // capped `sync.last_interaction` below it.
+                            advanced_cursor = landed && sync.last_interaction > last_interaction;
                             if !landed {
                                 warn!(
                                     "[GASP SYNC] a finalize submit for {topic} from {peer_url} did not land: the cursor stays at {last_interaction}"
@@ -4986,6 +4993,44 @@ impl Engine {
                             let msg = format!("{peer_url}: {e}");
                             warn!("[GASP SYNC] Sync failed: {msg}");
                             errors.push(msg);
+                        }
+                    }
+                    // bsv-low #555, the delta fold's D-M2: "progress" (a node
+                    // appended) is the peer's word. A sync the peer served
+                    // work that finalized no graph and moved no cursor is
+                    // YIELDLESS; past PEER_YIELDLESS_SYNCS_ALLOWED of them in
+                    // a row each is a FAILED attempt, so a peer that serves
+                    // one fresh root a tick and hangs on its input is
+                    // quarantined. A quiet sync (nothing served) leaves the
+                    // count; a fault of the count is fail-safe (no failure).
+                    // Only with a per-graph budget: without one nothing is
+                    // deferred and #302's rule is unchanged.
+                    if ran && self.graph_budget.is_some() {
+                        let yielded = peer_finalized.get() > 0 || advanced_cursor;
+                        if yielded || sync.graphs_attempted() > 0 {
+                            match self
+                                .storage
+                                .record_peer_sync_yield(peer_url, topic, yielded)
+                                .await
+                            {
+                                Ok(streak)
+                                    if !yielded
+                                        && streak > crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED
+                                        && outcome_success =>
+                                {
+                                    outcome_success = false;
+                                    let msg = format!(
+                                        "{peer_url}: {streak} consecutive syncs finalized no graph and moved no cursor (past {}; bsv-low #555)",
+                                        crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED
+                                    );
+                                    warn!("[GASP SYNC] {msg}");
+                                    errors.push(msg);
+                                }
+                                Ok(_) => {}
+                                Err(e) => warn!(
+                                    "[GASP SYNC] failed to record the yield of {peer_url}/{topic}: {e}"
+                                ),
+                            }
                         }
                     }
                     finalized_graphs += peer_finalized.get();
@@ -5589,6 +5634,19 @@ impl From<AdvertiserError> for EngineError {
 // Tests
 // ============================================================================
 
+/// The order `start_gasp_sync` takes its topics in (bsv-low #555, the delta
+/// fold's D-M1): topics with CONFIGURED peers (`SyncTarget::Peers`) first,
+/// then those whose peers `ls_ship` discovers (anyone may advertise a host
+/// there), each by name. The deferred-graph records share one storage
+/// ceiling; a place it frees goes to a configured peer before a discovered
+/// one, and a pass the outer deadline cuts has reached the configured peers.
+/// The map's own order was arbitrary.
+pub(crate) fn sync_order(config: &SyncConfiguration) -> Vec<(&String, &SyncTarget)> {
+    let mut order: Vec<(&String, &SyncTarget)> = config.iter().collect();
+    order.sort_by_key(|(topic, target)| (!matches!(target, SyncTarget::Peers(_)), topic.as_str()));
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5597,6 +5655,26 @@ mod tests {
     use crate::topic_manager::TopicManager as TopicManagerTrait;
     use async_trait::async_trait;
     use std::sync::Mutex;
+
+    // bsv-low #555, the delta fold's D-M1: the configured peers' topics are
+    // synced before the ls_ship-discovered ones, each class by name; the map's
+    // order was arbitrary.
+    #[test]
+    fn delta555_m1_configured_peers_are_synced_before_discovered_ones() {
+        let peers = |p: &str| SyncTarget::Peers(vec![p.to_string()]);
+        let config: SyncConfiguration = HashMap::from([
+            ("tm_a".to_string(), SyncTarget::Ship),
+            ("tm_z".to_string(), peers("https://z")),
+            ("tm_b".to_string(), SyncTarget::Ship),
+            ("tm_m".to_string(), peers("https://m")),
+            ("tm_off".to_string(), SyncTarget::Disabled),
+        ]);
+        let order: Vec<&str> = sync_order(&config)
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(order, vec!["tm_m", "tm_z", "tm_a", "tm_b", "tm_off"]);
+    }
 
     // ── Mock TopicManager ──────────────────────────────────────────────
 

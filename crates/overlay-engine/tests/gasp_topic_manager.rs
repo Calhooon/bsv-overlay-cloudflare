@@ -8341,3 +8341,287 @@ async fn e555f_l6_a_key_read_fault_saves_no_new_record() {
     assert_eq!(deferral(&topic), (0, 0, 0, vec!["too_many".to_string()]));
     assert_eq!(state.borrow().admitted.len(), 8);
 }
+
+// ============================================================================
+// bsv-low #555, the delta fold (docs/audit/E555-delta-2026-10-09.md): D-M1,
+// D-M2, D-L1, D-L2. Each pin is RED on 0974be5 (the test knobs grafted inert).
+// ============================================================================
+
+use bsv_overlay_engine::gasp::{PEER_QUARANTINE_THRESHOLD, PEER_YIELDLESS_SYNCS_ALLOWED};
+
+const STRANGER: &str = "mock://stranger";
+
+// Two peers of one topic, the stranger first: each its own remote.
+#[derive(Clone)]
+struct TwoPeers {
+    stranger: RecordingRemote,
+    honest: MeteredRemote,
+}
+
+impl GASPRemoteFactory for TwoPeers {
+    fn create_remote(&self, peer_url: &str, _topic: &str) -> Box<dyn GASPRemote> {
+        if peer_url == STRANGER {
+            Box::new(self.stranger.clone())
+        } else {
+            Box::new(self.honest.clone())
+        }
+    }
+}
+
+// D-M1 (the lens's DELTA-6). A stranger's peer lists 20 fabricated UTXOs,
+// serves each root and answers its input with a quick 5xx. On 0974be5 each
+// fresh walk was a `fault` deferral with ONE node: 16 records in one tick,
+// no time spent, rewritten every tick, and with the storage's ceiling full
+// the honest peer's deep graph beside it was refused its record (`too_many`),
+// walked from its root to the per-peer deadline on every tick and never
+// admitted. Now a fresh walk's fault keeps no record (the UTXO fails, as
+// before #555): the stranger holds none, and the honest graph is deferred
+// and converges.
+#[tokio::test]
+async fn e555d_m1_a_5xx_peer_keeps_no_record_and_an_honest_deep_graph_keeps_its_own() {
+    let (_logs, _guard) = capture_logs();
+    let fabricated: Vec<GASPNode> = (0..20).flat_map(|s| salted_chain(2, 700 + s)).collect();
+    let stranger = listing(
+        &fabricated,
+        &(0..20).map(|i| (2 * i + 1, 0)).collect::<Vec<_>>(),
+    );
+    stranger
+        .faults
+        .borrow_mut()
+        .extend((0..20).map(|i| node_txid(&fabricated[2 * i])));
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let store = Rc::new(MemoryStorage::new());
+    let clock = RequestClock::allowing(5);
+    let honest = RecordingRemote::new(&nodes, &[7]);
+    let requests = honest.requests.clone();
+    let mut engine = Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(HeadChainManager(state.clone())) as Box<dyn TopicManager>,
+        )]),
+        HashMap::new(),
+        Box::new(store.clone()),
+        None,
+        EngineConfig {
+            sync_configuration: HashMap::from([(
+                TOPIC.to_string(),
+                SyncTarget::Peers(vec![STRANGER.to_string(), PEER.to_string()]),
+            )]),
+            ..Default::default()
+        },
+    );
+    engine.set_gasp_remote_factory(Box::new(TwoPeers {
+        stranger,
+        honest: MeteredRemote {
+            inner: honest,
+            clock: clock.clone(),
+        },
+    }));
+    engine.set_peer_sync_budget(clock.budget(), 1);
+    engine.set_graph_budget(never(), 100, 60_000);
+    // The storage's ceiling: one record over every peer.
+    store.set_deferred_graph_ceiling(Some(1));
+
+    let mut ticks = 0;
+    while state.borrow().admitted.len() < 8 {
+        requests.borrow_mut().clear();
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced[TOPIC];
+        ticks += 1;
+        let stranger_records = store
+            .deferred_graphs()
+            .iter()
+            .filter(|r| r.peer == STRANGER)
+            .count();
+        assert_eq!(stranger_records, 0, "tick {ticks}: a 5xx keeps no record");
+        assert!(
+            !topic.dropped_graphs.iter().any(|d| d.reason == "too_many"),
+            "tick {ticks}: the honest graph is never refused its record: {:?}",
+            topic.dropped_graphs
+        );
+        assert!(ticks <= 3, "the honest graph converges");
+    }
+    assert!(store.deferred_graphs().is_empty());
+    assert_eq!(held(&store, &nodes).await, vec![(7, 0)]);
+    println!("#555 delta D-M1: a 5xx stranger kept 0 records; the honest graph converged in {ticks} ticks");
+}
+
+// D-M2 (the lens's DELTA-1). A hostile peer lists ONE fresh fabricated UTXO a
+// tick (only it), serves its root and hangs on its input: the fresh walk appends the
+// root and is deferred `time`, a walk that "progressed", so on 0974be5 every
+// sync was a success and the peer kept its slice for ever (failures 0 over
+// any number of ticks). Now a sync that finalized no graph and moved no
+// cursor is yieldless; past PEER_YIELDLESS_SYNCS_ALLOWED of them each is a
+// failed attempt, and the peer is quarantined PEER_QUARANTINE_THRESHOLD
+// syncs later.
+#[tokio::test]
+async fn e555d_m2_a_peer_serving_one_fresh_root_a_tick_is_quarantined() {
+    let (_logs, _guard) = capture_logs();
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let store = Rc::new(MemoryStorage::new());
+    let mut node = Budgeted::over(
+        listing(&salted_chain(2, 0), &[(1, 0)]),
+        Box::new(HeadChainManager(state.clone())),
+        RequestClock::allowing(1000),
+        store.clone(),
+        Box::new(store),
+        true,
+    );
+    let allowed = PEER_YIELDLESS_SYNCS_ALLOWED;
+    let mut tick = 0u64;
+    loop {
+        tick += 1;
+        // Only the fresh one is listed: the last tick's record is dropped
+        // `not_served` (16 held would send the 17th walk on, L4).
+        let fresh = salted_chain(2, 100 + tick);
+        let genesis = vec![node_txid(&fresh[0])];
+        let mut remote = listing(&fresh, &[(1, 0)]);
+        remote.requests = node.requests.clone();
+        let _h = hanging(&mut node, remote, &genesis);
+        let (topic, sent) = node.tick().await;
+        let failures = node.failures().await;
+        if tick <= allowed {
+            assert!(!sent.is_empty(), "tick {tick}: attempted");
+            assert_eq!(failures, 0, "tick {tick}: within the allowance");
+            assert_eq!(node.store.peer_yieldless_syncs(PEER, TOPIC), tick);
+            assert!(topic.errors.is_empty());
+        } else if tick <= allowed + PEER_QUARANTINE_THRESHOLD {
+            assert_eq!(failures, tick - allowed, "tick {tick}: a failed attempt");
+            assert!(topic
+                .errors
+                .iter()
+                .any(|e| e.contains("finalized no graph")));
+        } else {
+            assert!(sent.is_empty(), "tick {tick}: quarantined, skipped");
+            assert_eq!(failures, PEER_QUARANTINE_THRESHOLD);
+            break;
+        }
+    }
+    assert!(state.borrow().admitted.is_empty());
+    println!(
+        "#555 delta D-M2: a peer serving one fresh root a tick: {allowed} yieldless syncs allowed, quarantined at sync {}",
+        allowed + PEER_QUARANTINE_THRESHOLD
+    );
+}
+
+// D-M2, the other side: an honest deep graph converges inside the allowance
+// and its peer is never counted failed. (1) #582's shape: an UNPROVEN root
+// over a chain deeper than the budget; its block lands on the fourth tick,
+// the root comes back proven, the record is dropped `root_proven` and the
+// walk restarts from it (this manager names every link's predecessor, so the
+// restarted walk is not shorter here) and completes. (2) A chain walked to
+// its end: 3 calls a pass, 33 links, 11 passes. The count resets when the
+// graph lands.
+#[tokio::test]
+async fn e555d_m2_an_honest_deep_graph_converges_inside_the_allowance() {
+    let (_logs, _guard) = capture_logs();
+    // (1) The unproven root, mined on tick 4.
+    let nodes = chain(12);
+    let mut unproven = nodes.clone();
+    unproven[11].proof = None;
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&unproven, &[11]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    for tick in 1..=3u64 {
+        node.tick().await;
+        assert_eq!(node.store.peer_yieldless_syncs(PEER, TOPIC), tick);
+        assert_eq!(node.failures().await, 0);
+    }
+    let mut mined = RecordingRemote::new(&nodes, &[11]);
+    mined.requests = node.requests.clone();
+    node.engine.set_gasp_remote_factory(Box::new(MeteredRemote {
+        inner: mined,
+        clock: node.clock.clone(),
+    }));
+    let mut ticks = 3;
+    while held(&node.store, &nodes).await != vec![(11, 0)] {
+        node.tick().await;
+        ticks += 1;
+        assert_eq!(node.failures().await, 0, "tick {ticks}");
+        assert!(
+            ticks < PEER_YIELDLESS_SYNCS_ALLOWED,
+            "converged inside the allowance"
+        );
+    }
+    assert_eq!(node.store.peer_yieldless_syncs(PEER, TOPIC), 0, "reset");
+    let mined_at = ticks;
+
+    // (2) Walked to its end.
+    let nodes = chain(33);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[32]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    let mut ticks = 0;
+    while state.borrow().admitted.len() < 33 {
+        node.tick().await;
+        ticks += 1;
+        assert_eq!(node.failures().await, 0, "tick {ticks}");
+    }
+    assert_eq!(ticks, 11);
+    assert!(ticks < PEER_YIELDLESS_SYNCS_ALLOWED);
+    assert_eq!(node.store.peer_yieldless_syncs(PEER, TOPIC), 0);
+    println!("#555 delta D-M2: the unproven root converged on tick {mined_at}, a 33-link walk in 11; no failure");
+}
+
+// D-L1 (the lens's DELTA-4). A walk that cannot be kept (the storage's
+// ceiling) goes on under the per-peer budget alone; the per-peer deadline
+// then cuts it. On 0974be5 its drop was counted twice (`too_many` x2) and the
+// storage was asked a second time. Now once, one ask.
+#[tokio::test]
+async fn e555d_l1_a_walk_that_went_on_is_counted_and_saved_once() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[7]),
+        Box::new(HeadChainManager(state.clone())),
+        5,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    node.store.set_deferred_graph_ceiling(Some(0));
+    let (topic, _) = node.tick().await;
+    assert_eq!(topic.deadline_dropped_graphs, 1);
+    assert_eq!(
+        deferral(&topic).3,
+        vec!["too_many".to_string()],
+        "one graph, one drop"
+    );
+    assert_eq!(node.store.deferred_graph_put_attempts(), 1, "one ask");
+}
+
+// D-L2. A store FAULT at a deferral: on 0974be5 the UTXO failed, a graph the
+// per-peer budget would have completed in the pass. Now it goes on as the
+// other bounds do (counted `store_fault`) and completes.
+#[tokio::test]
+async fn e555d_l2_a_store_fault_at_a_deferral_goes_on_and_completes() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[7]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    node.store.set_deferred_graph_put_fault(true);
+    let (topic, sent) = node.tick().await;
+    assert_eq!(
+        sent,
+        txids(&nodes, &[7, 6, 5, 4, 3, 2, 1, 0]),
+        "the walk goes on"
+    );
+    assert_eq!(deferral(&topic), (0, 0, 0, vec!["store_fault".to_string()]));
+    assert_eq!(state.borrow().admitted.len(), 8, "admitted in the pass");
+    assert_eq!(held(&node.store, &nodes).await, vec![(7, 0)]);
+    assert_eq!(node.cursor().await, 1);
+    assert_eq!(node.store.deferred_graph_put_attempts(), 1);
+}

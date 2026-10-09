@@ -287,6 +287,27 @@ pub trait Storage {
         Ok(PeerSyncHealth::default())
     }
 
+    /// Record whether ONE GASP sync with `host` for `topic` YIELDED (it
+    /// finalized a graph or moved the cursor) or not, and answer the count
+    /// of consecutive yieldless syncs it now holds (bsv-low #555, the delta
+    /// fold's D-M2; `crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED`). `true`
+    /// resets the count to 0 and answers 0; `false` adds one. The engine
+    /// calls it only with a per-graph budget, only for a sync the peer served
+    /// work, and before [`Self::record_peer_sync_outcome`].
+    ///
+    /// Default: no-op answering 0, as the #302 pair: a backend without it
+    /// never counts a yieldless sync as failed (fail-safe, but a hostile
+    /// peer that serves one node a tick then keeps its slice).
+    async fn record_peer_sync_yield(
+        &self,
+        host: &str,
+        topic: &str,
+        yielded: bool,
+    ) -> Result<u64, StorageError> {
+        let _ = (host, topic, yielded);
+        Ok(0)
+    }
+
     // ========================================================================
     // Deferred GASP graphs (bsv-low #555)
     // ========================================================================
@@ -516,6 +537,14 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
     ) -> Result<PeerSyncHealth, StorageError> {
         (**self).get_peer_sync_health(host, topic).await
     }
+    async fn record_peer_sync_yield(
+        &self,
+        host: &str,
+        topic: &str,
+        yielded: bool,
+    ) -> Result<u64, StorageError> {
+        (**self).record_peer_sync_yield(host, topic, yielded).await
+    }
     async fn put_deferred_graph(
         &self,
         record: &crate::gasp::DeferredGraph,
@@ -633,6 +662,15 @@ pub mod memory {
         /// Test knob: a NEW record past this many held is refused
         /// `AtCeiling` (the worker's global ceiling).
         deferred_graph_ceiling: Mutex<Option<usize>>,
+        /// Test knob: every save of a deferred graph faults.
+        deferred_graph_put_fault: Mutex<bool>,
+        /// How many saves of a deferred graph were ASKED (written, refused
+        /// or faulted).
+        deferred_graph_put_attempts: Mutex<u64>,
+        /// Consecutive yieldless GASP syncs keyed by (host, topic): models
+        /// the D1 `gasp_peer_health.yieldless_syncs` column (bsv-low #555,
+        /// the delta fold's D-M2).
+        peer_yieldless: Mutex<HashMap<(String, String), u64>>,
     }
 
     impl MemoryStorage {
@@ -711,6 +749,29 @@ pub mod memory {
         /// worker's global ceiling does (a test knob, bsv-low #555).
         pub fn set_deferred_graph_ceiling(&self, ceiling: Option<usize>) {
             *self.deferred_graph_ceiling.lock().unwrap() = ceiling;
+        }
+
+        /// Make every save of a deferred graph fault, or not (a test knob,
+        /// bsv-low #555's delta fold, D-L2).
+        pub fn set_deferred_graph_put_fault(&self, fault: bool) {
+            *self.deferred_graph_put_fault.lock().unwrap() = fault;
+        }
+
+        /// How many saves of a deferred graph were asked, whatever their
+        /// answer (bsv-low #555's delta fold, D-L1).
+        pub fn deferred_graph_put_attempts(&self) -> u64 {
+            *self.deferred_graph_put_attempts.lock().unwrap()
+        }
+
+        /// The consecutive yieldless syncs held for (host, topic)
+        /// (bsv-low #555's delta fold, D-M2).
+        pub fn peer_yieldless_syncs(&self, host: &str, topic: &str) -> u64 {
+            *self
+                .peer_yieldless
+                .lock()
+                .unwrap()
+                .get(&(host.to_string(), topic.to_string()))
+                .unwrap_or(&0)
         }
 
         /// Count total outputs (for testing assertions).
@@ -1115,6 +1176,20 @@ pub mod memory {
                 .unwrap_or_default())
         }
 
+        async fn record_peer_sync_yield(
+            &self,
+            host: &str,
+            topic: &str,
+            yielded: bool,
+        ) -> Result<u64, StorageError> {
+            let mut held = self.peer_yieldless.lock().unwrap();
+            let count = held
+                .entry((host.to_string(), topic.to_string()))
+                .or_insert(0);
+            *count = if yielded { 0 } else { *count + 1 };
+            Ok(*count)
+        }
+
         async fn put_deferred_graph(
             &self,
             record: &crate::gasp::DeferredGraph,
@@ -1124,6 +1199,10 @@ pub mod memory {
                 record.topic.clone(),
                 record.outpoint.clone(),
             );
+            *self.deferred_graph_put_attempts.lock().unwrap() += 1;
+            if *self.deferred_graph_put_fault.lock().unwrap() {
+                return Err(StorageError::Database("deferred graph save faulted".into()));
+            }
             if let Some(ceiling) = *self.deferred_graph_ceiling.lock().unwrap() {
                 let held = self.deferred_graphs.lock().unwrap();
                 if !held.contains_key(&key) && held.len() >= ceiling {

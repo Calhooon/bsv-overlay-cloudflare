@@ -166,6 +166,30 @@ pub const PEER_QUARANTINE_THRESHOLD: u64 = 8;
 /// re-admits itself automatically on the first re-probe after it recovers.
 pub const PEER_QUARANTINE_REPROBE_SECS: u64 = 6 * 3600;
 
+/// Consecutive YIELDLESS syncs of a (peer, topic) allowed before each further
+/// one is a FAILED attempt for the quarantine (bsv-low #555, the delta fold's
+/// D-M2). A sync is yieldless when the peer served it work it did not hold
+/// ([`GASPSync::graphs_attempted`] > 0) and it finalized no graph and moved no
+/// cursor; it then counts a success only because a walk PROGRESSED (a node
+/// appended), and a node is the peer's word: a hostile peer that lists one
+/// fresh fabricated UTXO a tick, serves its root and hangs on its input kept
+/// its slice for ever. Past this many in a row such a sync is a failure, so
+/// that peer is quarantined after this many plus
+/// [`PEER_QUARANTINE_THRESHOLD`] syncs (20, 5 h at `*/15`) and gets one probe
+/// per [`PEER_QUARANTINE_REPROBE_SECS`] after that. A sync that finalized a
+/// graph or moved the cursor resets the count; a quiet one leaves it.
+///
+/// Why 12 (3 h at `*/15`): an honest deep graph converges well inside it. The
+/// measured one (#582) is an UNPROVEN head over unproven ancestry: its root
+/// is re-asked at each resume and the pass after its block lands restarts the
+/// walk from a proven root and completes it (`root_proven`), one or two passes
+/// at the ~10 min block interval, and 12 passes leave three hours of slow
+/// blocks. Walked to its end instead, 12 passes are about 150 nodes on the
+/// Cloudflare worker (15 s a pass at 1.2 s a request) and 600 on LOW's node
+/// (60 s). Applied only with a per-graph budget (`Engine::set_graph_budget`):
+/// without one no walk is deferred and the quarantine is the one of #302.
+pub const PEER_YIELDLESS_SYNCS_ALLOWED: u64 = 12;
+
 /// PURE quarantine rule (bsv-low#302): a peer is skipped IFF it has hit
 /// [`PEER_QUARANTINE_THRESHOLD`] consecutive failures AND its last attempt
 /// is younger than [`PEER_QUARANTINE_REPROBE_SECS`]. A peer with no
@@ -441,6 +465,12 @@ struct Walk {
     nodes_at_start: usize,
     /// Whether this pass was already counted progressed or stalled.
     counted: bool,
+    /// The walk could not be kept and GOES ON under the per-peer budget
+    /// alone (L4): its drop is counted once, when it went on, and it is
+    /// never saved again in this pass (the delta fold's D-L1: a per-peer
+    /// deadline that then cut it counted the drop twice and asked the
+    /// storage a second time).
+    gone_on: bool,
 }
 
 /// How a graph's walk ended in this pass.
@@ -476,7 +506,11 @@ enum Saved {
     /// Not kept, for this reason; the walk is handed back so the caller can
     /// go on with it (L4) or drop it.
     Unkept(DropReason, Box<Walk>),
-    Fault(GASPError),
+    /// The storage faulted (counted `store_fault`, a held record deleted);
+    /// the walk is handed back so the caller can go on with it (D-L2).
+    Fault(GASPError, Box<Walk>),
+    /// The walk had already gone on (D-L1): nothing saved, nothing counted.
+    WentOn,
 }
 
 // ============================================================================
@@ -870,6 +904,8 @@ pub struct GASPSync<'a> {
     walk: std::cell::RefCell<Option<Walk>>,
     /// See [`Self::deferral_stats`].
     stats: std::cell::RefCell<DeferralStats>,
+    /// See [`Self::graphs_attempted`].
+    graphs_attempted: std::cell::Cell<u64>,
 }
 
 impl<'a> GASPSync<'a> {
@@ -905,6 +941,7 @@ impl<'a> GASPSync<'a> {
             held_records: std::cell::Cell::new(0),
             walk: std::cell::RefCell::new(None),
             stats: std::cell::RefCell::new(DeferralStats::default()),
+            graphs_attempted: std::cell::Cell::new(0),
         }
     }
 
@@ -924,6 +961,14 @@ impl<'a> GASPSync<'a> {
     /// What the last `sync` did with deferred graphs (bsv-low #555).
     pub fn deferral_stats(&self) -> DeferralStats {
         self.stats.borrow().clone()
+    }
+
+    /// How many UTXOs the sync set out to ingest (a new walk, a resume, or a
+    /// record held back): the peer served it work it did not hold. A sync
+    /// that attempted none was quiet (bsv-low #555, the delta fold's D-M2:
+    /// a quiet sync never counts toward [`PEER_YIELDLESS_SYNCS_ALLOWED`]).
+    pub fn graphs_attempted(&self) -> u64 {
+        self.graphs_attempted.get()
     }
 
     /// Have `hook` called after every completed incoming UTXO (bsv-low #552,
@@ -1271,10 +1316,11 @@ impl<'a> GASPSync<'a> {
     /// saved and the caller holds the UTXO below the cursor like a failed
     /// one. A record of this UTXO saved by an earlier sync is RESUMED: its
     /// nodes are appended again (no request) and only its pending inputs are
-    /// asked. Every walk error then defers too (the progress is kept), except
-    /// the peer's definite "not held" for an input an UNPROVEN node needs (an
-    /// SPV necessity, as in the reference): that one fails the UTXO and drops
-    /// the record. On `Completed` the walk stays in hand until
+    /// asked. A RESUMED walk's error defers it again (the progress is kept),
+    /// except the peer's definite "not held" for an input an UNPROVEN node
+    /// needs (an SPV necessity, as in the reference): that one fails the UTXO
+    /// and drops the record. A FRESH walk's error keeps no record and fails
+    /// the UTXO, as before #555 (the delta fold's D-M1). On `Completed` the walk stays in hand until
     /// [`Self::settle_completed`] knows whether it landed.
     ///
     /// Every RESUME of one sync shares ONE per-graph budget (the lens fold's
@@ -1287,6 +1333,7 @@ impl<'a> GASPSync<'a> {
     /// pass counted) for the next sync.
     async fn ingest_utxo(&self, utxo: &GASPOutput, outpoint: &str) -> Result<Ingested, GASPError> {
         debug!("{} Requesting node for {}", self.log_prefix, outpoint);
+        self.graphs_attempted.set(self.graphs_attempted.get() + 1);
         let Some(budget) = &self.graph_budget else {
             *self.walk.borrow_mut() = Some(Self::fresh_walk(utxo.score as u64, outpoint, u32::MAX));
             let walked = self.walk_graph(None).await;
@@ -1361,6 +1408,7 @@ impl<'a> GASPSync<'a> {
             call_cap,
             nodes_at_start: 0,
             counted: false,
+            gone_on: false,
         }
     }
 
@@ -1420,6 +1468,7 @@ impl<'a> GASPSync<'a> {
                     resumed: true,
                     call_cap: cap,
                     counted: false,
+                    gone_on: false,
                 }
             }
         };
@@ -1526,6 +1575,23 @@ impl<'a> GASPSync<'a> {
                     }
                     return Err(e);
                 }
+                // A walk ERROR on a FRESH walk keeps no record (the delta
+                // fold's D-M1): a fault is not a budget cut, and before #555
+                // it failed the UTXO. A record then costs a peer a budget
+                // cut (`calls`, `time`, `peer_deadline`), never a quick 5xx:
+                // a stranger who answered each input with a 503 kept a
+                // one-node record per UTXO, 16 per (peer, topic) in one tick
+                // with no time spent, and filled the worker's ceiling. A
+                // RESUMED walk keeps its record (its progress was paid for).
+                Err(e) if !resumed => {
+                    warn!(
+                        "{} Walk of {} faulted: no record, the UTXO fails as before #555: {}",
+                        self.log_prefix, outpoint, e
+                    );
+                    let _ = self.storage.discard_graph(&graph_id).await;
+                    self.walk.borrow_mut().take();
+                    return Err(e);
+                }
                 Err(e) => {
                     warn!(
                         "{} Walk of {} faulted, deferred with its progress: {}",
@@ -1535,38 +1601,53 @@ impl<'a> GASPSync<'a> {
                     ("fault", false)
                 }
             };
-            match self.save_walk(reason, completed).await {
+            // Only a walk the per-graph budget cut may go on (L4).
+            let budget_cut = matches!(reason, "calls" | "time");
+            let (why, mut walk) = match self.save_walk(reason, completed).await {
                 Saved::Yes => {
                     let _ = self.storage.discard_graph(&graph_id).await;
                     return Ok(Ingested::Deferred);
                 }
-                Saved::Fault(e) => {
+                Saved::WentOn => {
                     let _ = self.storage.discard_graph(&graph_id).await;
-                    return Err(e);
+                    return Err(GASPError::Other(format!(
+                        "graph {outpoint} went on and did not complete (bsv-low #555)"
+                    )));
+                }
+                // A store FAULT at a deferral goes on as the other bounds do
+                // (the delta fold's D-L2; counted `store_fault` by
+                // `save_walk`): it failed the UTXO, a transient D1 fault
+                // failing a graph the per-peer budget would have completed.
+                Saved::Fault(e, walk) => {
+                    if !budget_cut {
+                        let _ = self.storage.discard_graph(&graph_id).await;
+                        return Err(e);
+                    }
+                    (DropReason::StoreFault, walk)
                 }
                 Saved::Unkept(why, mut walk) => {
                     self.unkept(why, &mut walk).await;
-                    let goes_on = matches!(reason, "calls" | "time")
-                        && matches!(why, DropReason::TooBig | DropReason::TooMany);
-                    if !goes_on {
+                    if !(budget_cut && matches!(why, DropReason::TooBig | DropReason::TooMany)) {
                         let _ = self.storage.discard_graph(&graph_id).await;
                         return Err(GASPError::Other(format!(
                             "deferred graph {outpoint} not kept: {} (bsv-low #555)",
                             why.as_str()
                         )));
                     }
-                    info!(
-                        "{} Graph {} cannot be kept ({}): its walk goes on under the per-peer budget alone (bsv-low #555)",
-                        self.log_prefix,
-                        outpoint,
-                        why.as_str()
-                    );
-                    walk.call_cap = u32::MAX;
-                    *self.walk.borrow_mut() = Some(*walk);
-                    // The graph in hand was never discarded: walk on.
-                    ended = self.walk_graph(None).await;
+                    (why, walk)
                 }
-            }
+            };
+            info!(
+                "{} Graph {} cannot be kept ({}): its walk goes on under the per-peer budget alone (bsv-low #555)",
+                self.log_prefix,
+                outpoint,
+                why.as_str()
+            );
+            walk.call_cap = u32::MAX;
+            walk.gone_on = true;
+            *self.walk.borrow_mut() = Some(*walk);
+            // The graph in hand was never discarded: walk on.
+            ended = self.walk_graph(None).await;
         }
     }
 
@@ -1614,14 +1695,20 @@ impl<'a> GASPSync<'a> {
 
     /// Save the walk in hand as its graph's record (bsv-low #555), counting
     /// a deferral; or hand it back UNKEPT with the reason (past a bound, or
-    /// holding no node), or answer the storage's fault (the UTXO then fails
-    /// as before #555). Counts the pass progressed or stalled (the lens
-    /// fold's H1), once per pass.
+    /// holding no node), or answer the storage's fault with the walk (a walk
+    /// the per-graph budget cut then goes on, D-L2; any other fails its
+    /// UTXO). A walk that already went on is neither saved nor counted again
+    /// (D-L1). Counts the pass progressed or stalled (the lens fold's H1),
+    /// once per pass.
     async fn save_walk(&self, reason: &'static str, completed: bool) -> Saved {
         let Some(mut walk) = self.walk.borrow_mut().take() else {
             // Nothing in hand: nothing to save.
             return Saved::Yes;
         };
+        if walk.gone_on {
+            // Its drop was counted when it went on (D-L1).
+            return Saved::WentOn;
+        }
         if !walk.counted {
             walk.counted = true;
             let mut stats = self.stats.borrow_mut();
@@ -1671,10 +1758,11 @@ impl<'a> GASPSync<'a> {
             Err(e) => {
                 if walk.resumed {
                     self.drop_record(&outpoint, DropReason::StoreFault).await;
+                    walk.resumed = false;
                 } else {
                     self.note_dropped(&outpoint, DropReason::StoreFault);
                 }
-                Saved::Fault(e)
+                Saved::Fault(e, Box::new(walk))
             }
         }
     }
@@ -1882,6 +1970,7 @@ impl<'a> GASPSync<'a> {
             call_cap: u32::MAX,
             nodes_at_start: 0,
             counted: false,
+            gone_on: false,
         });
         let node = self.hydrate_root(node.clone()).await;
         let out = self.absorb(&root, node).await?;
