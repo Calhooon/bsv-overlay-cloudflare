@@ -958,30 +958,75 @@ impl Storage for D1Storage {
         }
         let json = serde_json::to_string(record)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        let saved: Option<Saved> = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_UPSERT_SQL)
-            .bind(record.peer.as_str())
-            .bind(record.topic.as_str())
-            .bind(record.outpoint.as_str())
-            .bind(record.score as f64)
-            .bind(record.nodes.len() as f64)
-            .bind(record.pending.len() as f64)
-            .bind(record.calls as f64)
-            .bind(f64::from(record.passes))
-            .bind(record.reason.as_str())
-            .bind(json.len() as f64)
-            .bind(json.as_str())
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS)
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_TOTAL_BYTES as f64)
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS_PER_HOST)
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_BYTES_PER_HOST as f64)
-            .bind(overlay_engine::gasp::peer_origin(&record.peer).as_str())
-            .bind(record.configured)
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS)
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES as f64)
-            .fetch_optional(&self.db)
-            .await
-            .map_err(d1_err)?;
-        Ok(match saved {
+        // bsv-low #585: a record of any size. Past one row's room its further
+        // parts go first, under a new generation; the head row (the ceiling
+        // is read there) then names it, and the generation it replaced goes
+        // last. A refusal or a fault leaves the held record whole.
+        let plan = crate::gasp_deferred::chunk_plan(
+            &json,
+            crate::gasp_deferred::DEFERRED_GRAPH_CHUNK_BYTES,
+        );
+        let key = |sql: &'static str| {
+            Query::new(sql)
+                .bind(record.peer.as_str())
+                .bind(record.topic.as_str())
+                .bind(record.outpoint.as_str())
+                .bind(plan.gen.as_str())
+        };
+        let mut head: Result<Option<Saved>, String> = Ok(None);
+        for (i, part) in plan.rest.iter().enumerate() {
+            if let Err(e) = key(crate::gasp_deferred::DEFERRED_GRAPH_CHUNK_PUT_SQL)
+                .bind((i + 1) as f64)
+                .bind(*part)
+                .execute(&self.db)
+                .await
+            {
+                head = Err(e);
+                break;
+            }
+        }
+        if head.is_ok() {
+            head = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_UPSERT_SQL)
+                .bind(record.peer.as_str())
+                .bind(record.topic.as_str())
+                .bind(record.outpoint.as_str())
+                .bind(record.score as f64)
+                .bind(record.nodes.len() as f64)
+                .bind(record.pending.len() as f64)
+                .bind(record.calls as f64)
+                .bind(f64::from(record.passes))
+                .bind(record.reason.as_str())
+                .bind(json.len() as f64)
+                .bind(plan.head)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_TOTAL_BYTES as f64)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS_PER_HOST)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_BYTES_PER_HOST as f64)
+                .bind(overlay_engine::gasp::peer_origin(&record.peer).as_str())
+                .bind(record.configured)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES as f64)
+                .bind(plan.rest.len() as f64)
+                .bind(plan.gen.as_str())
+                .fetch_optional(&self.db)
+                .await;
+        }
+        // The parts of the generation the head does not name: the replaced
+        // one's after a save, this save's own after a refusal or a fault
+        // (best effort: a part left behind is the cron's to sweep).
+        let tidy = match head {
+            Ok(Some(_)) => crate::gasp_deferred::DEFERRED_GRAPH_CHUNKS_KEEP_SQL,
+            _ => crate::gasp_deferred::DEFERRED_GRAPH_CHUNKS_UNDO_SQL,
+        };
+        if matches!(head, Ok(Some(_))) || !plan.rest.is_empty() {
+            if let Err(e) = key(tidy).execute(&self.db).await {
+                worker::console_log!(
+                    "GASP deferred graph {}: parts of another generation not deleted: {e}",
+                    record.outpoint
+                );
+            }
+        }
+        Ok(match head.map_err(d1_err)? {
             Some(_) => overlay_engine::gasp::DeferredGraphSave::Saved,
             None => overlay_engine::gasp::DeferredGraphSave::AtCeiling,
         })
@@ -1021,6 +1066,12 @@ impl Storage for D1Storage {
         #[derive(Deserialize)]
         struct RecordRow {
             record: String,
+            chunks: Option<f64>,
+            gen: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct PartRow {
+            part: String,
         }
         let row: Option<RecordRow> = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_GET_SQL)
             .bind(host)
@@ -1029,10 +1080,38 @@ impl Storage for D1Storage {
             .fetch_optional(&self.db)
             .await
             .map_err(d1_err)?;
-        row.map(|r| {
-            serde_json::from_str(&r.record).map_err(|e| StorageError::Serialization(e.to_string()))
-        })
-        .transpose()
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        // bsv-low #585: the rest of a chunked record, one part a statement.
+        let mut json = row.record;
+        let gen = row.gen.unwrap_or_default();
+        for seq in 1..=row.chunks.unwrap_or(0.0).max(0.0) as u64 {
+            let part: Option<PartRow> =
+                Query::new(crate::gasp_deferred::DEFERRED_GRAPH_CHUNK_GET_SQL)
+                    .bind(host)
+                    .bind(topic)
+                    .bind(outpoint)
+                    .bind(gen.as_str())
+                    .bind(seq as f64)
+                    .fetch_optional(&self.db)
+                    .await
+                    .map_err(d1_err)?;
+            let Some(part) = part else {
+                // A part is gone (the table is transient): the record cannot
+                // be resumed and would fault every pass, so it goes, and the
+                // walk starts from its root as after any lost row.
+                worker::console_log!(
+                    "GASP deferred graph {outpoint} of {host} for {topic}: part {seq} of generation {gen} is missing, the record is dropped (bsv-low #585)"
+                );
+                self.delete_deferred_graph(host, topic, outpoint).await?;
+                return Ok(None);
+            };
+            json.push_str(&part.part);
+        }
+        serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
     async fn delete_deferred_graph(
@@ -1042,6 +1121,15 @@ impl Storage for D1Storage {
         outpoint: &str,
     ) -> Result<(), StorageError> {
         Query::new(crate::gasp_deferred::DEFERRED_GRAPH_DELETE_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(outpoint)
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)?;
+        // After the head: a part with no head is the cron's to sweep, a head
+        // with no part would be a torn record.
+        Query::new(crate::gasp_deferred::DEFERRED_GRAPH_CHUNKS_DELETE_SQL)
             .bind(host)
             .bind(topic)
             .bind(outpoint)

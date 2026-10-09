@@ -681,6 +681,10 @@ pub mod memory {
         /// Test knob: a NEW record past this many held is refused
         /// `AtCeiling` (the worker's global ceiling).
         deferred_graph_ceiling: Mutex<Option<usize>>,
+        /// Test knob: a save that would take the bytes of every record held
+        /// past this is refused `AtCeiling`, a held key's too (the worker's
+        /// byte bounds, bsv-low #585).
+        deferred_graph_byte_ceiling: Mutex<Option<usize>>,
         /// Test knob: every save of a deferred graph faults.
         deferred_graph_put_fault: Mutex<bool>,
         /// How many saves of a deferred graph were ASKED (written, refused
@@ -774,6 +778,13 @@ pub mod memory {
         /// worker's global ceiling does (a test knob, bsv-low #555).
         pub fn set_deferred_graph_ceiling(&self, ceiling: Option<usize>) {
             *self.deferred_graph_ceiling.lock().unwrap() = ceiling;
+        }
+
+        /// Refuse `AtCeiling` a save, new or a replacement, that would take
+        /// the bytes of every record held past this, as the worker's byte
+        /// bounds do (a test knob, bsv-low #585). The held record stays.
+        pub fn set_deferred_graph_byte_ceiling(&self, ceiling: Option<usize>) {
+            *self.deferred_graph_byte_ceiling.lock().unwrap() = ceiling;
         }
 
         /// Make every save of a deferred graph fault, or not (a test knob,
@@ -1249,6 +1260,17 @@ pub mod memory {
             if let Some(ceiling) = *self.deferred_graph_ceiling.lock().unwrap() {
                 let held = self.deferred_graphs.lock().unwrap();
                 if !held.contains_key(&key) && held.len() >= ceiling {
+                    return Ok(crate::gasp::DeferredGraphSave::AtCeiling);
+                }
+            }
+            if let Some(ceiling) = *self.deferred_graph_byte_ceiling.lock().unwrap() {
+                let held = self.deferred_graphs.lock().unwrap();
+                let others: usize = held
+                    .iter()
+                    .filter(|(k, _)| **k != key)
+                    .map(|(_, r)| r.byte_size())
+                    .sum();
+                if others + record.byte_size() > ceiling {
                     return Ok(crate::gasp::DeferredGraphSave::AtCeiling);
                 }
             }

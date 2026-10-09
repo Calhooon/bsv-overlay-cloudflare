@@ -1143,8 +1143,7 @@ sync that ran to its end was not served (spent at the peer) is dropped
 (`not_served`), one the node now holds (`held`); a write that faults
 (`store_fault`); a resumed record whose pass ends still holding no node (one
 saved before the fold) `no_progress`. A walk past its per-graph budget that
-cannot be KEPT, past `DEFERRED_GRAPH_MAX_BYTES` (1 MiB of JSON, `too_big`),
-past `DEFERRED_GRAPHS_PER_PEER_TOPIC` (16 per (peer, topic), `too_many`), at
+cannot be KEPT, past `DEFERRED_GRAPHS_PER_PEER_TOPIC` (16 per (peer, topic), `too_many`), at
 the storage's ceiling (`AtCeiling`, counted `too_many`) or whose save FAULTED
 (`store_fault`; the delta fold's D-L2: it failed the UTXO; a RESUMED walk's
 held record is KEPT through a faulted save, the delta-2 lens's D2-N2: it was
@@ -1204,7 +1203,7 @@ shares with the app layer. The table stays transient, so its sweep needs no
 never-wipe). `/health/invariants.gasp.deferredGraphs` serves `count`,
 `totalBytes`, `oldest`, the oldest 20 as {topic, peer, outpoint, nodes,
 pending, calls, passes, reason, bytes, ageSecs}, and the `budget` (calls,
-ms, maxPasses, maxBytes, perPeerTopic, maxRows, maxTotalBytes,
+ms, maxPasses, chunkBytes, perPeerTopic, maxRows, maxTotalBytes,
 maxRowsPerHost, maxBytesPerHost, discoveredMaxRows, discoveredMaxBytes,
 staleSecs);
 the counters `gasp_graph_deferred_total`, `gasp_graph_resumed_total`,
@@ -1230,7 +1229,8 @@ deletion. "Converged" is counted when the graph's finalize landed, under a
 per-peer budget (the hook); without one, when it completed; a graph restarted
 `root_proven` is counted dropped (`root_proven`) and its later landing is a
 fresh graph's, not counted `converged` (the lens's N1). Whether D1's binding
-takes a 1 MiB bound record is unverified (the lens's L5): the statements run
+takes a 1 MiB bound value (a record's row, or one part of a chunked record,
+bsv-low #585) is unverified (the lens's L5): the statements run
 under rusqlite and the route cell seeds its row with `wrangler d1 execute`,
 and local D1 does not enforce the platform's limits (2 MB a row; the 100 KB
 statement limit does not count bound values). `byte_size` serializes a record
@@ -1399,14 +1399,15 @@ source is always finalized before its spender.
 beside its calls and its time (`GraphBudget::max_bytes_fetched`,
 `max_nodes`; `Engine::set_graph_budget_limbs`, the defaults in force with
 `set_graph_budget`): the BYTES a graph's walk is served
-(`DEFAULT_GRAPH_BUDGET_BYTES`, seven eighths of the record cap, 917,504 while
-the cap is 1 MiB: the hex of each node's raw transaction and proof, as the
+(`DEFAULT_GRAPH_BUDGET_BYTES`, 917,504, a budget per pass and nothing else
+since bsv-low #585: the hex of each node's raw transaction and proof, as the
 peer sends it and as a record keeps it, every answer counted, a repeat too)
 and the NODES it appends (`DEFAULT_GRAPH_BUDGET_NODES`, 64). The worker's
 defaults are the engine's (`gasp_deferred.rs`, the consts
 `GASP_GRAPH_BUDGET_BYTES` and `GASP_GRAPH_BUDGET_NODES`), and an operator sets
 others with the VARS of the same names (`graph_budget_limbs`: a decimal
-integer, clamped, bytes to 1 ..= the record cap, nodes to 1 ..= the 100
+integer, clamped, bytes to at least 1 with no upper bound (#585: there is no
+record cap for it to sit under), nodes to 1 ..= the 100
 calls; unset, empty or not a number is the default; no rebuild). The limbs in
 force are served as `budget.bytesFetched` and `budget.nodes`. A limb reached DEFERS the graph exactly as the call budget
 does (reasons `bytes`, `nodes`): the record saved, the UTXO held below the
@@ -1416,50 +1417,86 @@ a BEEF (the owner's ruling of 2026-10-09). A limb is read BEFORE a step, so a
 pass always makes one request: a node bigger than the whole limb is walked,
 one a pass. The resumes of one sync share the limbs as they share the calls
 (M1); a walk the limbs cut that cannot be KEPT goes on under the per-peer
-budget alone (L4). The reference has no budget. Two residuals of the delta lens, stated: the engine's direct `set_graph_budget_limbs` is uncapped (a consumer that sets the bytes limb above its own record cap re-opens E586-L1; the worker's var is clamped to the cap), and the bytes var's floor of 1 lets an operator set the limb below one node's served size, where a `root_unproven` resume makes no progress until `max_passes` releases the record (bounded, self-healing, unreachable at the defaults: an operator who sets a limb smaller than a node has set it wrong).
+budget alone (L4). The reference has no budget. One residual of the delta lens, stated (its other, a limb above the record cap, went with the cap, #585): the bytes var's floor of 1 lets an operator set the limb below one node's served size, where a `root_unproven` resume makes no progress until `max_passes` releases the record (bounded, self-healing, unreachable at the defaults: an operator who sets a limb smaller than a node has set it wrong).
 
-**The bytes limb sits under the record cap (the lens fold, E586-L1).** The
-default was 4 MiB, above the 1 MiB cap of a record
-(`DEFERRED_GRAPH_MAX_BYTES`, bsv-low #585): a pass of 26 KB heads was cut only
-once its record no longer fitted (about 19 nodes), which is `too_big`, the
-limbs off and the walk gone on under the per-peer budget alone, so the limb
-bounded nothing at the size it was built for; and the worker's two limbs were
-compile-time. Now the default is DERIVED from the cap, seven eighths of it,
-in the engine (for a consumer that sets neither limb) and in the worker, and
-the pass the limb cuts leaves a record that fits: **18 heads of 26 KB a fresh
-pass** (17 on a resume of an unproven root, whose re-ask is served first). The
-overhead of a record over what it was served, measured (`e586f_l1_*`): the
-chain of 26 KB heads 942,750 bytes for 938,772 served (1.0042x; 105,826 under
-the cap); the witness's diamond chain 630,272 for 940,248 served (0.67x: a
-repeat is served and not kept; 1.0054x the hex it holds); 64 small proven
-nodes 29,501 for 15,804 of hex (1.87x: the JSON around a node, 214 to 281
-bytes, does not shrink with it, and the NODES limb is what bounds it). The
-margin, an eighth of the cap (131,072 bytes): 17,984 for the JSON of 64
-nodes, and 113,088 for the node that CROSSES the limb (the limb is read
-before a step, so a pass ends at most one node past it) and the inputs still
-pending.
+**A record has no byte bound (bsv-low #585, door 4; the owner's posture of
+2026-10-09).** A record was capped at 1 MiB (`DEFERRED_GRAPH_MAX_BYTES`, half
+of D1's 2 MB row): one past it was `too_big`, deleted, and its walk went on
+under the per-peer budget alone, so a graph whose unwalked ancestry
+outweighed the cap (36 links of 26 KB) never resumed past it. The cap, the
+reason `too_big` and its counter are gone. The rule: a graph of any size is
+deferred and resumed WHOLE; a platform bound (the row) is routed around, and
+what bounds a pass is its budget.
 
-Limits, stated. (1) The cap itself stands (#585 removes it; this fold only
-makes the limb defer BEFORE it), and a record is the walk of EVERY pass while
-the limb is per pass. So a graph whose unwalked ancestry outweighs the cap is
-cut again at a later pass with a record past it: `too_big`, counted once, and
-the walk goes on (L4), as before. At 26 KB a head: up to 35 links converge in
-two passes with every record under the cap; the 36th makes the second pass
-`too_big` (pinned, `e586f_l1_limit`). A crossing node of more than the 113,088
-left (a transaction past about 56 KB), or one with hundreds of inputs still
-pending, can do it at the first pass. A graph that fitted the old limbs in
-one pass (up to 64 nodes and 4 MiB served) now takes a pass per 917,504
-bytes served, a tick each, 15 min at `*/15` (the witness's fan-in, 2,221,528
-served, would take three; reasoned, not run under a budget). An operator who raises the var toward the cap spends the margin.
-(2) The walk asks an outpoint again for
+- The engine refuses no record for its size (`save_walk`). `byte_size` is
+  logged and is the storage's to budget.
+- The worker keeps a record in ROWS (`gasp_deferred.rs` `chunk_plan`,
+  `DEFERRED_GRAPH_CHUNK_BYTES` 1 MiB): its first part in its
+  `gasp_deferred_graphs` row, each further part a row of
+  `gasp_deferred_graph_chunks` (migrations 176-178: the table, the head's
+  `chunks` and `gen`). A record of at most 1 MiB is written exactly as before
+  (one row, no part). A save writes the parts of a NEW generation (16 hex of
+  the JSON's sha256), then the head row, where the ceiling is read, then
+  deletes the other generations; a read takes the head and each part by the
+  generation it names, one part a statement. A refusal or a fault midway
+  leaves the held record whole. A delete takes the head, then the parts; the
+  cron sweeps a part no head names once it is an hour old.
+- `AtCeiling` is a BUDGET of room, never the loss of a walk. The head row's
+  `bytes` is the whole record's, so the worker's byte bounds (64 MiB, 32 MiB
+  discovered, 8 MiB an origin) count a chunked record whole. A RESUMED walk
+  refused room KEEPS the record it holds (`Saved::Ceiling`; it was deleted,
+  and the graph walked from its root at the next pass): the pass is counted
+  `too_many`, a budget cut goes on under the per-peer budget alone (L4), and
+  a pass that does not finish resumes from the held record. A FRESH walk
+  refused room has no record to keep and is walked again, as before.
+- The bytes limb (917,504) is a budget per pass only. Its derivation (seven
+  eighths of the cap, the lens fold's E586-L1) and the var's clamp to the cap
+  are gone; the figure is kept for what it measures: **18 heads of 26 KB a
+  fresh pass** (17 on a resume of an unproven root, whose re-ask is served
+  first). The overheads measured under the old cap stand as measurements
+  (`e586f_l1_*`): the chain of 26 KB heads 942,750 bytes for 938,772 served
+  (1.0042x); the witness's diamond chain 630,272 for 940,248 served (0.67x:
+  a repeat is served and not kept); 64 small proven nodes 29,501 for 15,804
+  of hex (1.87x: the NODES limb is what bounds the JSON around a node).
+
+Measured (`e585_d4_*`): a 46-link unmined chain of 26 KB heads (2,399,076
+hex) under the default budget is three passes of 18, 18 and 12 requests, its
+record 942,750 then 1,832,700 bytes (1.75x the old cap), converged with no
+drop and no walk gone on; at its full 46 nodes a record of 2,406,975 bytes
+is one head row of 1,048,576 and two part rows (1,048,576 and 309,823).
+
+Limits, stated. (1) What is left of a size in this path is ROOM in the D1
+the overlay shares, per origin: a discovered origin's records together hold
+8 MiB, so ONE graph whose record outgrows that (about 160 heads of 26 KB)
+stops growing its record there; each later pass resumes from the held 8 MiB
+and walks the rest under the per-peer budget alone, and lands only if that
+budget (30 s on the worker) covers the rest. A configured peer's bound is
+the global 64 MiB. Raising a share is a constant; holding the nodes in R2
+(the worker has no R2 binding today) would remove it. (2) A record is read
+WHOLE into the isolate to resume (its JSON, then the parsed nodes, beside
+the pending graph it becomes): memory is the graph's, not an element's. The
+streaming reader (bsv-rs 0.4.0) does not apply to a walk in hand; a graph
+of tens of MiB is bounded by the isolate before the shares. (3) A save of a
+k MiB record is k + 2 statements, a read k + 1, each bound value at most
+1 MiB (L5 above: unverified on the platform). (4) The parts are written
+before the head's ceiling is read, so a refused save holds up to one
+record's bytes past the ceiling until its undo; a save that dies between
+its parts and its head leaves them an hour, for the cron. (5) A head whose
+part is gone (the table is transient) is dropped at its read and the graph
+walks from its root, as after any lost row. (6) A graph that fitted the old
+limbs in one pass (up to 64 nodes and 4 MiB served) takes a pass per
+917,504 bytes served, a tick each, 15 min at `*/15`. A FRESH walk whose
+first node alone is past the limb is cut on it (a pass always makes one
+request).
+(7) The walk asks an outpoint again for
 every parent that reaches it and drops the answer as seen AFTER the request
 (85 requests for the fan-in's 37 nodes), as the reference does; the calls and
-the bytes are charged for them. (3) A FRESH walk that faults has PAID for a
+the bytes are charged for them. (8) A FRESH walk that faults has PAID for a
 record at half its calls or half its time (D2-L1), not at half a limb.
-(4) Bytes are charged when a node is served, a node when its step commits: a
+(9) Bytes are charged when a node is served, a node when its step commits: a
 step the deadline drops has its bytes charged and its node asked again.
-(5) The witness is native; wasm32 was not measured here (Zanaadu's figure was
-13.4 MiB for the 24.1 MB). (6) A record's nodes are a second copy of the
+(10) The witness is native; wasm32 was not measured here (Zanaadu's figure was
+13.4 MiB for the 24.1 MB). (11) A record's nodes are a second copy of the
 pending graph's while a walk is in hand (before and after).
 
 **The assembly is a re-implementation, pinned (the lens, E586-L2).**
@@ -1502,13 +1539,26 @@ exist on `fbb7fa8`; RED against the limbs made inert and against the resumes
 not sharing them). The frozen digests of pin D, the `i551_*` and the `e555*`
 families hold unchanged. The lens fold: `--test gasp_topic_manager e586f`
 (`e586f_l1_a_graph_of_26kb_heads_*`: 35 links under the defaults nobody set,
-18 served, reason `bytes`, the record under the cap, converged by the second
-pass with no drop; RED on `589bc2d`, where all 35 are walked in one pass with
-no deferral; `e586f_l1_the_margin_*` the measured overheads; `e586f_l1_limit`;
-`e586f_n`) and the worker's
+18 served, reason `bytes`, converged by the second pass with no drop; RED on
+`589bc2d`, where all 35 are walked in one pass with no deferral;
+`e586f_l1_the_margin_*` the measured overheads; `e586f_n`;
+`e586f_l1_limit` is retired, #585's pin is its cure) and the worker's
 `gasp_deferred::tests::e586f_l1_the_limbs_default_under_the_record_cap_and_are_vars`
-(the derivation, the vars' parse and clamp, the wiring of the engine and the
-health block; `graph_budget_limbs` does not exist on `589bc2d`).
+(the default, the vars' parse and clamp, amended by #585: no upper clamp on
+the bytes; the wiring of the engine and the health block).
+
+Door 4's pins (bsv-low #585): `--test gasp_topic_manager e585_d4`
+(`*_a_46_node_unmined_graph_of_26kb_heads_is_deferred_and_resumed_whole`,
+RED on `e8ab762`: the second pass sends 29 requests, `too_big`, the walk
+gone on; `*_a_resumed_walk_refused_room_keeps_its_record`, RED on `e8ab762`
+(`too_big`) and against the `AtCeiling` arm reverted alone (the record
+deleted)), `e555_b2` rewritten (a record past 1 MiB is kept and resumed; RED
+on `e8ab762`), and the worker's `gasp_deferred::tests::e585_d4`
+(`*_a_record_past_a_row_is_chunked_saved_and_read_back_whole` and
+`*_a_refused_replacement_leaves_the_held_record_whole`: the shipped
+statements in the storage's order under real SQLite; they do not compile on
+`e8ab762`). The route cell binds the upsert's two new parameters and reads
+`budget.chunkBytes`; it was not run in this lane (`make ci-d1-budget`).
 
 ## Storage ownership (bsv-low #474)
 

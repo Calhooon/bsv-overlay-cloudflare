@@ -886,9 +886,9 @@ impl Engine {
     /// rules). A walk cut by the per-peer deadline is deferred the same way.
     ///
     /// Bounds: a record deferred [`crate::gasp::DEFERRED_GRAPH_MAX_PASSES`]
-    /// times, or bigger than [`crate::gasp::DEFERRED_GRAPH_MAX_BYTES`], is
-    /// dropped with its reason and the UTXO fails as before (the gap guard
-    /// asks again, from the root); at most
+    /// times is dropped with its reason and the UTXO fails as before (the
+    /// gap guard asks again, from the root); a record has no byte bound
+    /// (bsv-low #585); at most
     /// [`crate::gasp::DEFERRED_GRAPHS_PER_PEER_TOPIC`] records per (peer,
     /// topic). Keep `budget_ms` below the per-peer budget so that a deep
     /// graph leaves the pass time for the UTXOs after it. Defaults offered:

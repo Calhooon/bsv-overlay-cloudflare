@@ -406,25 +406,14 @@ pub const DEFAULT_GRAPH_BUDGET_MS: u64 = 60_000;
 /// A BUDGET PER PASS, not a limit: the walk makes at least one request a
 /// pass whatever its size, and what the pass leaves is resumed.
 ///
-/// SEVEN EIGHTHS of the record cap ([`DEFERRED_GRAPH_MAX_BYTES`]; 917,504
-/// bytes while the cap is 1 MiB), derived from it (the lens fold's E586-L1).
-/// It was 4 MiB, above the cap: a pass of 26 KB heads was cut only once its
-/// record no longer fitted (`too_big`), the limbs went off and the walk went
-/// on under the per-peer budget alone, so the limb bounded nothing at the
-/// size it was built for. Under the cap, the pass the limb cuts leaves a
-/// record that fits: 18 heads of 26 KB a pass. The margin (an eighth,
-/// 131,072 bytes) is for what a record holds beside the hex it was served,
-/// measured (`e586f_l1_*`): 214 to 281 bytes of JSON a node, its share of the
-/// pending inputs included (17,984 for the 64 nodes
-/// [`DEFAULT_GRAPH_BUDGET_NODES`] allows a pass), and the node that CROSSES
-/// the limb (the limb is read before a step, so a pass ends at most one node
-/// past it), which has the 113,088 left. What it does not cover, stated: a
-/// crossing node of more than that (a transaction past about 56 KB), or one
-/// with hundreds of inputs still pending; and the record is the walk of EVERY pass while the limb
-/// is per pass, so a graph whose unwalked ancestry outweighs the cap still
-/// ends `too_big` at a later pass and goes on (L4). The cap is #585's to
-/// remove; this default only makes the limb defer BEFORE it.
-pub const DEFAULT_GRAPH_BUDGET_BYTES: u64 = (DEFERRED_GRAPH_MAX_BYTES / 8 * 7) as u64;
+/// 917,504 bytes: a budget per pass and nothing else (bsv-low #585). It was
+/// derived from a 1 MiB cap on a record (seven eighths of it, the lens fold's
+/// E586-L1) so that the pass it cut left a record that fitted; a record has
+/// no cap since #585 (the storage keeps one of any size, the worker in
+/// chunks), so the figure is kept for what it measures, 18 heads of 26 KB a
+/// fresh pass, and no longer sits "under" anything. A consumer may set any
+/// other ([`GraphBudget::max_bytes_fetched`]).
+pub const DEFAULT_GRAPH_BUDGET_BYTES: u64 = 917_504;
 
 /// Default per-GRAPH node budget (bsv-low #586): the nodes ONE graph's walk
 /// may APPEND in one pass before it is deferred (five times the 12 of
@@ -440,18 +429,15 @@ pub const DEFAULT_GRAPH_BUDGET_NODES: u32 = 64;
 /// `*/15`.
 pub const DEFERRED_GRAPH_MAX_PASSES: u32 = 60;
 
-/// The most bytes one record may hold (its JSON): 1 MiB, half of D1's 2 MB
-/// row. A record past it is dropped (reason `too_big`). The measured case
-/// (a 24 KB head over a wallet's small funding transactions, about 1 KB of
-/// hex each) fits about a thousand nodes.
-pub const DEFERRED_GRAPH_MAX_BYTES: usize = 1 << 20;
-
 /// The most records one (peer, topic) may hold. A new deferral past it is
 /// not saved (reason `too_many`) and its walk goes on under the per-peer
 /// budget alone, as before #555 (the lens fold's L4): a peer that serves many
 /// deep graphs costs at most 16 records. A storage may refuse a record at a
 /// ceiling of its own ([`DeferredGraphSave::AtCeiling`]), counted `too_many`
-/// too (the worker's global ceiling, the lens fold's M3).
+/// too (the worker's global ceiling, the lens fold's M3). A record has NO
+/// byte bound (bsv-low #585: it had 1 MiB, `too_big`): a graph of any size
+/// is deferred and resumed whole, and the storage's ceiling is a BUDGET of
+/// room, under which a RESUMED walk keeps the record it holds.
 pub const DEFERRED_GRAPHS_PER_PEER_TOPIC: usize = 16;
 
 /// A RESUMED walk that faults having appended no node keeps its record (an
@@ -541,7 +527,11 @@ pub enum DeferredGraphSave {
     Saved,
     /// Refused at a ceiling of the storage's own (the worker's global count
     /// and byte bounds, the lens fold's M3): counted `too_many`, and the walk
-    /// goes on under the per-peer budget alone, as before #555.
+    /// goes on under the per-peer budget alone, as before #555. A BUDGET
+    /// signal, never the loss of a walk (bsv-low #585): the storage must
+    /// leave the record it HELD under that key as it was, and the engine
+    /// keeps it, so a resumed graph refused room resumes from that record at
+    /// the next pass and never walks from its root again.
     AtCeiling,
 }
 
@@ -612,8 +602,9 @@ pub struct DeferredGraph {
 }
 
 impl DeferredGraph {
-    /// The record's size as stored (its JSON), for
-    /// [`DEFERRED_GRAPH_MAX_BYTES`].
+    /// The record's size as stored (its JSON): what the deferral's log line
+    /// and a storage's byte budget read. Nothing refuses a record for it
+    /// (bsv-low #585).
     pub fn byte_size(&self) -> usize {
         serde_json::to_vec(self).map_or(usize::MAX, |b| b.len())
     }
@@ -625,13 +616,12 @@ impl DeferredGraph {
 pub enum DropReason {
     /// Deferred [`DEFERRED_GRAPH_MAX_PASSES`] times; the UTXO fails.
     MaxPasses,
-    /// Past [`DEFERRED_GRAPH_MAX_BYTES`]; a walk the budget cut goes on
-    /// under the per-peer budget alone (L4), else the UTXO fails.
-    TooBig,
-    /// Past [`DEFERRED_GRAPHS_PER_PEER_TOPIC`] or the storage's ceiling; as
-    /// [`Self::TooBig`].
+    /// Past [`DEFERRED_GRAPHS_PER_PEER_TOPIC`] or the storage's ceiling: a
+    /// walk the budget cut goes on under the per-peer budget alone (L4),
+    /// else the UTXO fails. A RESUMED walk's held record is KEPT (bsv-low
+    /// #585): the count is of the pass that found no room, not of a record.
     TooMany,
-    /// The record could not be written; as [`Self::TooBig`] (D-L2).
+    /// The record could not be written; as [`Self::TooMany`] (D-L2).
     StoreFault,
     /// A sync that ran to its end was not served the UTXO (spent at the peer).
     NotServed,
@@ -655,9 +645,8 @@ pub enum DropReason {
 
 impl DropReason {
     /// Every reason, for a caller that serves a counter per reason.
-    pub const ALL: [DropReason; 11] = [
+    pub const ALL: [DropReason; 10] = [
         Self::MaxPasses,
-        Self::TooBig,
         Self::TooMany,
         Self::StoreFault,
         Self::NotServed,
@@ -673,7 +662,6 @@ impl DropReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::MaxPasses => "max_passes",
-            Self::TooBig => "too_big",
             Self::TooMany => "too_many",
             Self::StoreFault => "store_fault",
             Self::NotServed => "not_served",
@@ -807,6 +795,10 @@ enum Saved {
     /// The storage faulted (counted `store_fault`, a held record deleted);
     /// the walk is handed back so the caller can go on with it (D-L2).
     Fault(GASPError, Box<Walk>),
+    /// A RESUMED walk the storage had no room for (`AtCeiling`; counted
+    /// `too_many`): the record it holds is KEPT as it was (bsv-low #585), and
+    /// the walk is handed back so the caller can go on with it.
+    Ceiling(Box<Walk>),
     /// The walk had already gone on (D-L1): nothing saved, nothing counted.
     WentOn,
 }
@@ -1885,8 +1877,7 @@ impl<'a> GASPSync<'a> {
 
     /// The end of a budgeted pass: complete the graph, defer it, or fail
     /// its UTXO. A walk past its per-graph budget that cannot be KEPT (past
-    /// [`DEFERRED_GRAPHS_PER_PEER_TOPIC`], [`DEFERRED_GRAPH_MAX_BYTES`] or
-    /// the storage's ceiling) goes on under the per-peer budget alone, as
+    /// [`DEFERRED_GRAPHS_PER_PEER_TOPIC`] or the storage's ceiling) goes on under the per-peer budget alone, as
     /// every walk did before #555 (the lens fold's L4: such a graph completed
     /// in one pass before #555, and was then failed on every pass).
     async fn finish_pass(
@@ -2006,9 +1997,22 @@ impl<'a> GASPSync<'a> {
                     }
                     (DropReason::StoreFault, walk)
                 }
+                // No room for a RESUMED walk (bsv-low #585): its held record
+                // stays, so what this pass adds is lost and nothing else. A
+                // budget cut goes on as the other bounds do; any other end
+                // fails the UTXO and the next pass resumes from the record.
+                Saved::Ceiling(walk) => {
+                    if !budget_cut {
+                        let _ = self.storage.discard_graph(&graph_id).await;
+                        return Err(GASPError::Other(format!(
+                            "deferred graph {outpoint} found no room, its record kept (bsv-low #585)"
+                        )));
+                    }
+                    (DropReason::TooMany, walk)
+                }
                 Saved::Unkept(why, mut walk) => {
                     self.unkept(why, &mut walk).await;
-                    if !(budget_cut && matches!(why, DropReason::TooBig | DropReason::TooMany)) {
+                    if !(budget_cut && why == DropReason::TooMany) {
                         let _ = self.storage.discard_graph(&graph_id).await;
                         return Err(GASPError::Other(format!(
                             "deferred graph {outpoint} not kept: {} (bsv-low #555)",
@@ -2113,10 +2117,9 @@ impl<'a> GASPSync<'a> {
         if !walk.resumed && self.held_records.get() >= DEFERRED_GRAPHS_PER_PEER_TOPIC {
             return Saved::Unkept(DropReason::TooMany, Box::new(walk));
         }
+        // No bound on a record's size (bsv-low #585): the figure is logged
+        // and is the storage's to budget.
         let bytes = walk.record.byte_size();
-        if bytes > DEFERRED_GRAPH_MAX_BYTES {
-            return Saved::Unkept(DropReason::TooBig, Box::new(walk));
-        }
         let outpoint = walk.record.outpoint.clone();
         match self.storage.save_deferred_graph(&walk.record).await {
             Ok(DeferredGraphSave::Saved) => {
@@ -2137,6 +2140,14 @@ impl<'a> GASPSync<'a> {
                     bytes
                 );
                 Saved::Yes
+            }
+            // The storage's ceiling is a budget of room, not a verdict on
+            // the graph (bsv-low #585): a RESUMED walk keeps the record it
+            // holds (it was deleted, and the graph walked from its root at
+            // the next pass); a fresh walk has none to keep.
+            Ok(DeferredGraphSave::AtCeiling) if walk.resumed => {
+                self.note_dropped(&outpoint, DropReason::TooMany);
+                Saved::Ceiling(Box::new(walk))
             }
             Ok(DeferredGraphSave::AtCeiling) => Saved::Unkept(DropReason::TooMany, Box::new(walk)),
             // The save is lost and counted `store_fault`. A RESUMED walk's

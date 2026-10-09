@@ -7924,12 +7924,13 @@ async fn e555_b_a_stuck_peer_is_deferred_each_pass_and_dropped_after_max_passes(
     println!("#555 PIN B: a hung node deferred {DEFERRED_GRAPH_MAX_PASSES} passes, dropped max_passes, then healed and converged");
 }
 
-// PIN B2. A record past DEFERRED_GRAPH_MAX_BYTES is not kept: counted
-// `too_big`, nothing is written. Amended by the lens fold (L4): its walk then
-// goes on under the per-peer budget alone, as before #555, so the graph
-// completes in the pass (it was failed on every pass, never admitted).
+// PIN B2, rewritten by bsv-low #585 (door 4). A record has NO byte bound: a
+// walk the budget cut whose record is past 1 MiB is KEPT and resumed, as any
+// other. Before #585 it was `too_big`: nothing written, the walk gone on
+// under the per-peer budget alone (L4). RED on `e8ab762`: `too_big`, no
+// record, no write.
 #[tokio::test]
-async fn e555_b2_a_record_past_its_byte_bound_is_dropped_too_big() {
+async fn e555_b2_a_record_past_a_megabyte_is_kept_and_resumed() {
     let (_logs, _guard) = capture_logs();
     let mut nodes = chain(4);
     // The tip carries a 655 KB second output (ten 64 KB pushes): its hex
@@ -7951,13 +7952,40 @@ async fn e555_b2_a_record_past_its_byte_bound_is_dropped_too_big() {
         1000,
     );
     node.engine.set_graph_budget(never(), 2, 60_000);
+    // The tip alone is past the bytes limb: the first pass is cut on it.
     let (topic, sent) = node.tick().await;
-    assert_eq!(sent, txids(&nodes, &[3, 2, 1, 0]), "the walk goes on");
+    assert_eq!(sent, txids(&nodes, &[3]));
     assert!(nodes[3].raw_tx.len() > 1 << 20, "{}", nodes[3].raw_tx.len());
-    assert_eq!(deferral(&topic), (0, 0, 0, vec!["too_big".to_string()]));
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]), "deferred, no drop");
+    let records = node.store.deferred_graphs();
+    assert_eq!((records.len(), records[0].reason.as_str()), (1, "bytes"));
+    assert!(
+        records[0].byte_size() > 1 << 20,
+        "{}",
+        records[0].byte_size()
+    );
+    assert_eq!(node.store.deferred_graph_writes(), 1);
+    assert!(state.borrow().admitted.is_empty());
+    // Resumed from the record, the tip never asked again, until it lands.
+    let mut asked = Vec::new();
+    let mut converged = 0;
+    for _ in 0..3 {
+        let (topic, sent) = node.tick().await;
+        assert!(
+            topic.dropped_graphs.is_empty(),
+            "{:?}",
+            topic.dropped_graphs
+        );
+        asked.extend(sent);
+        converged += topic.converged_graphs;
+        if converged > 0 {
+            break;
+        }
+    }
+    assert_eq!(asked, txids(&nodes, &[2, 1, 0]), "only what was pending");
+    assert_eq!(converged, 1);
     assert!(node.store.deferred_graphs().is_empty());
-    assert_eq!(node.store.deferred_graph_writes(), 0);
-    assert_eq!(state.borrow().admitted.len(), 4, "admitted in the pass");
+    assert_eq!(state.borrow().admitted.len(), 4, "admitted whole");
     assert_eq!(node.cursor().await, 1);
 }
 
@@ -9853,9 +9881,12 @@ async fn e586_e_a_deferred_record_holds_raw_nodes_and_weighs_what_was_fetched() 
 // leaves a record that fits.
 // ============================================================================
 
-use bsv_overlay_engine::gasp::{
-    DEFAULT_GRAPH_BUDGET_BYTES, DEFAULT_GRAPH_BUDGET_NODES, DEFERRED_GRAPH_MAX_BYTES,
-};
+use bsv_overlay_engine::gasp::{DEFAULT_GRAPH_BUDGET_BYTES, DEFAULT_GRAPH_BUDGET_NODES};
+
+// The record cap these pins were written under (1 MiB, `too_big`), removed by
+// bsv-low #585: a record has no byte bound. Kept here as the figure the
+// measurements below are stated against, and nothing else.
+const DEFERRED_GRAPH_MAX_BYTES: usize = 1 << 20;
 
 // What one tick was SERVED, as the bytes limb counts it (every answer).
 fn served_this_tick(nodes: &[GASPNode], sent: &[String]) -> u64 {
@@ -9923,9 +9954,8 @@ async fn e586f_l1_a_graph_of_26kb_heads_fills_the_bytes_limb_first_and_its_recor
     assert_eq!(node.cursor().await, 0, "held below the deferred UTXO");
     assert!(state.borrow().admitted.is_empty());
     assert_eq!(
-        DEFAULT_GRAPH_BUDGET_BYTES,
-        (DEFERRED_GRAPH_MAX_BYTES / 8 * 7) as u64,
-        "seven eighths of the record cap"
+        DEFAULT_GRAPH_BUDGET_BYTES, 917_504,
+        "a budget per pass; no longer derived from a record cap (bsv-low #585)"
     );
     assert_eq!(DEFAULT_GRAPH_BUDGET_NODES, 64);
     println!(
@@ -10022,31 +10052,111 @@ async fn e586f_l1_the_margin_under_the_cap_covers_the_measured_overhead() {
     );
 }
 
-// The limit, STATED (the record cap is #585's to remove, not this fold's): a
-// record is the walk of EVERY pass, the limb a budget per pass. A graph whose
-// unwalked ancestry is more than the cap holds (36 links of ~26 KB: 18 the
-// first pass, 17 the second, one left) is cut again with a record past the
-// cap: `too_big`, counted once, and the walk goes on under the per-peer
-// budget alone, as before #586 (L4). It still lands; nothing is refused.
+// bsv-low #585, DOOR 4: the limit `e586f_l1_limit` stated is gone. A record is
+// the walk of EVERY pass and has no byte bound: a 46-link unmined graph of
+// ~26 KB heads (about 2.4 MB of hex, 1.2 MB of raw transactions) is deferred
+// by the bytes limb at each pass (18 heads, then 17 under the re-asked root),
+// its record past 1 MiB from the second pass on, and resumed to completion at
+// the third. No drop, no walk "gone on": every pass runs under its budget.
+// RED on `e8ab762`: the second pass is `too_big`, its record deleted and the
+// walk gone on under the per-peer budget alone (the old pin's 36 links).
 #[tokio::test]
-async fn e586f_l1_limit_a_graph_past_what_the_cap_holds_goes_on_at_its_second_pass() {
+async fn e585_d4_a_46_node_unmined_graph_of_26kb_heads_is_deferred_and_resumed_whole() {
     let (_logs, _guard) = capture_logs();
-    let nodes = fat_unmined_chain(36);
-    let (node, state) = under_default_limbs(&nodes, 35);
+    let nodes = fat_unmined_chain(46);
+    let hex: u64 = nodes.iter().map(served_bytes).sum();
+    let (node, state) = under_default_limbs(&nodes, 45);
+
     let (topic, sent) = node.tick().await;
     assert_eq!((sent.len(), deferral(&topic)), (18, (1, 0, 0, vec![])));
-    assert!(node.store.deferred_graphs()[0].byte_size() <= DEFERRED_GRAPH_MAX_BYTES);
+    let first = node.store.deferred_graphs()[0].byte_size();
+    assert!(first <= DEFERRED_GRAPH_MAX_BYTES, "{first}");
+
     let (topic, sent) = node.tick().await;
+    assert_eq!(sent.len(), 18, "the root again, then 17 under the limb");
     assert_eq!(
-        sent.len(),
-        19,
-        "the root again, 17 under the limb, one gone on"
+        deferral(&topic),
+        (1, 1, 0, vec![]),
+        "deferred again, no drop"
     );
-    assert_eq!(topic.dropped_graphs.len(), 1);
-    assert_eq!(topic.dropped_graphs[0].reason, "too_big");
+    assert!(topic.errors.is_empty(), "{:?}", topic.errors);
+    assert_eq!(topic.finalized_graphs, 0, "no walk went on past its budget");
+    let records = node.store.deferred_graphs();
+    assert_eq!((records.len(), records[0].nodes.len()), (1, 35));
+    assert_eq!(records[0].reason, "bytes");
+    let second = records[0].byte_size();
+    assert!(
+        second > DEFERRED_GRAPH_MAX_BYTES,
+        "past the old cap: {second}"
+    );
+    assert!(state.borrow().admitted.is_empty());
+    assert_eq!(node.cursor().await, 0, "held below the deferred UTXO");
+
+    let (topic, sent) = node.tick().await;
+    let mut expected = vec![45];
+    expected.extend((0..11).rev());
+    assert_eq!(sent, txids(&nodes, &expected), "only what was pending");
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]), "converged, no drop");
     assert_eq!(topic.finalized_graphs, 1);
-    assert_eq!(state.borrow().admitted.len(), 36);
+    assert!(topic.errors.is_empty());
+    assert!(node.store.deferred_graphs().is_empty());
+    assert_eq!(state.borrow().admitted.len(), 46);
     assert_eq!(node.cursor().await, 1);
+    println!(
+        "#585 DOOR 4: 46 links, {hex} hex served once each; records of {first} then {second} bytes ({:.2}x the old 1 MiB cap); 18 + 18 + 12 requests over three passes, converged",
+        second as f64 / DEFERRED_GRAPH_MAX_BYTES as f64
+    );
+}
+
+// bsv-low #585, DOOR 4: the storage's ceiling is a BUDGET of room, never the
+// loss of a walk. A RESUMED walk whose bigger record finds no room (the
+// worker's byte bounds; `AtCeiling`) KEEPS the record it holds: the pass is
+// counted `too_many` and goes on under the per-peer budget alone (L4), and a
+// pass that does not finish resumes from the held record. Here the peer's
+// deadline cuts the walk that went on, and the next pass resumes from the
+// record, never from the root. RED on `e8ab762` (the knob grafted):
+// the held record is DELETED at the refusal.
+#[tokio::test]
+async fn e585_d4_a_resumed_walk_refused_room_keeps_its_record() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = fat_unmined_chain(46);
+    let (node, state) = under_default_limbs(&nodes, 45);
+    let (topic, _) = node.tick().await;
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    let held = node.store.deferred_graphs()[0].clone();
+    // Room for the record held, none for the second pass's.
+    node.store
+        .set_deferred_graph_byte_ceiling(Some(held.byte_size() + 1));
+    // The tick may spend the list, the 18 requests of a pass and three more:
+    // the walk that goes on at the refusal is cut by the per-peer deadline.
+    node.clock.allowance.set(1 + 18 + 3);
+    let (topic, _) = node.tick().await;
+    assert_eq!(
+        topic.dropped_graphs.len(),
+        1,
+        "the pass that found no room is counted"
+    );
+    assert_eq!(topic.dropped_graphs[0].reason, "too_many");
+    let records = node.store.deferred_graphs();
+    assert_eq!(records.len(), 1, "the held record is KEPT");
+    assert_eq!(
+        (records[0].nodes.len(), records[0].passes),
+        (held.nodes.len(), held.passes),
+        "as it was"
+    );
+    assert!(state.borrow().admitted.is_empty());
+    assert_eq!(node.cursor().await, 0);
+    // Room again: the next pass RESUMES from the held record (18 nodes in
+    // hand: the root's re-ask and the pending inputs, never the 18 again).
+    node.store.set_deferred_graph_byte_ceiling(None);
+    node.clock.allowance.set(100_000);
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent.len(), 18, "the root again, then 17 under the limb");
+    assert_eq!(sent[1], node_txid(&nodes[27]), "from where the record ends");
+    assert_eq!(deferral(&topic), (1, 1, 0, vec![]));
+    let (topic, _) = node.tick().await;
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]));
+    assert_eq!(state.borrow().admitted.len(), 46);
 }
 
 // The NOTE of the lens (the `root_proven` restart). The walk that restarts

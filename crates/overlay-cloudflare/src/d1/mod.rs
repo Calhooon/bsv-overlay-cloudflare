@@ -468,7 +468,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 175 → 178 for NL-6c (2026-10-09): `ef_deferred_jobs`, its state index and `ef_deferred_chunks` (the broadcast-gated
 /// arm's deferred work and its bytes at rest).
 /// 178 → 179 for NL-6d (2026-10-10): `ef_deferred_jobs.legs_from`, the corroboration's cursor (one additive ALTER).
-pub const OVERLAY_MIGRATION_COUNT: usize = 179;
+/// 179 → 182 for bsv-low #585 (2026-10-09, door 4; 176-178 before the land onto NL-6c and NL-6d):
+/// `gasp_deferred_graph_chunks` and `gasp_deferred_graphs.chunks` and `.gen` (a deferred graph's record of any size,
+/// chunked across rows); one table, two additive ALTERs.
+pub const OVERLAY_MIGRATION_COUNT: usize = 182;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1762,6 +1765,12 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // NL-6d (2026-10-10): THE CORROBORATION'S CURSOR. A deferred job's run reads the #267 corroboration's ancestors
     // from the leg the last invocation reached (`legs_from`), never from the first again.
     crate::ef_deferred::JOBS_ADD_LEGS_FROM,
+    // bsv-low #585 (door 4): a deferred graph's record has NO byte bound. One past a row's room keeps its first part
+    // in its `gasp_deferred_graphs` row and the rest in these rows, under the generation the head names
+    // (`gasp_deferred.rs`, `chunk_plan`). Transient, as the head table.
+    crate::gasp_deferred::DEFERRED_GRAPH_CHUNKS_CREATE,
+    crate::gasp_deferred::DEFERRED_GRAPHS_CHUNKS_COLUMN,
+    crate::gasp_deferred::DEFERRED_GRAPHS_GEN_COLUMN,
 ];
 
 // =============================================================================
