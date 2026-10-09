@@ -4707,6 +4707,8 @@ impl Engine {
             let mut resumed_graphs: u64 = 0;
             let mut converged_graphs: u64 = 0;
             let mut dropped_graphs: Vec<DroppedDeferral> = Vec::new();
+            let mut stalled_graphs: u64 = 0;
+            let mut held_back_graphs: u64 = 0;
 
             // If we have a remote factory, actually run GASP sync
             if let Some(ref factory) = self.gasp_remote_factory {
@@ -4882,12 +4884,16 @@ impl Engine {
                             }
                             // A tick that finalized a graph or moved the
                             // cursor reached a live peer: not a failed
-                            // attempt for the quarantine count.
-                            // So did one that DEFERRED a graph (bsv-low
-                            // #555): its walk is saved and resumed.
+                            // attempt for the quarantine count. So did one
+                            // whose walk PROGRESSED (bsv-low #555: it
+                            // appended a node, or completed its graph). A
+                            // deferral that fetched nothing is no progress
+                            // (the lens fold's H1: a hung peer deferred with
+                            // 0 nodes on every tick and was never
+                            // quarantined).
                             outcome_success = peer_finalized.get() > 0
                                 || completed > last_interaction
-                                || sync.deferral_stats().deferred > 0;
+                                || sync.deferral_stats().progressed > 0;
                             warn!(
                                 "[GASP SYNC] {peer_url} for {topic} at the deadline: finalized_graphs={} deadline_dropped_graphs={in_flight} cursor {last_interaction} -> {} (bsv-low #552)",
                                 peer_finalized.get(),
@@ -4901,6 +4907,30 @@ impl Engine {
                             let landed = self
                                 .submit_finalized_graphs(&sink, peer_url, topic, &peer_finalized)
                                 .await;
+                            // bsv-low #555, the lens fold's H1: a sync that
+                            // ran to its end with walks the per-graph budget
+                            // cut having FETCHED NOTHING, and nothing else
+                            // got done (no walk progressed, no graph
+                            // finalized, the cursor did not move), reached
+                            // a peer that does not answer: a FAILED attempt.
+                            // Before #555 such a peer held the sync to the
+                            // per-peer deadline, a failure; the per-graph
+                            // budget had made it an `Ok` sync. A sync whose
+                            // UTXOs failed in any other way is unchanged.
+                            let stats = sync.deferral_stats();
+                            if stats.stalled > 0
+                                && stats.progressed == 0
+                                && peer_finalized.get() == 0
+                                && !(landed && sync.last_interaction > last_interaction)
+                            {
+                                outcome_success = false;
+                                let msg = format!(
+                                    "{peer_url}: {} graph walk(s) cut by the per-graph budget with nothing fetched (bsv-low #555)",
+                                    stats.stalled
+                                );
+                                warn!("[GASP SYNC] {msg}");
+                                errors.push(msg);
+                            }
 
                             // Advance the persisted cursor when it moved forward — i.e.
                             // the peer reported UTXOs at a higher score than our last
@@ -4956,6 +4986,8 @@ impl Engine {
                     deferred_graphs += deferral.deferred;
                     resumed_graphs += deferral.resumed;
                     converged_graphs += deferral.converged;
+                    stalled_graphs += deferral.stalled;
+                    held_back_graphs += deferral.held_back;
                     dropped_graphs.extend(deferral.dropped.into_iter().map(|d| DroppedDeferral {
                         peer: peer_url.clone(),
                         outpoint: d.outpoint,
@@ -4993,6 +5025,8 @@ impl Engine {
                     resumed_graphs,
                     converged_graphs,
                     dropped_graphs,
+                    stalled_graphs,
+                    held_back_graphs,
                 },
             );
         }
@@ -5350,6 +5384,17 @@ pub struct TopicSyncResult {
     /// Records deleted without converging, with their reason.
     #[serde(default)]
     pub dropped_graphs: Vec<DroppedDeferral>,
+    /// Walks the per-graph budget (or the per-peer deadline) cut having
+    /// fetched NOTHING in their pass (bsv-low #555, the lens fold's H1). A
+    /// peer's sync whose only outcome was these is a failed attempt for the
+    /// quarantine count.
+    #[serde(default)]
+    pub stalled_graphs: u64,
+    /// Records NOT resumed in this sync: the resumes of a peer's pass share
+    /// ONE per-graph budget and had spent it (the lens fold's M1). Held for
+    /// the next sync, untouched.
+    #[serde(default)]
+    pub held_back_graphs: u64,
 }
 
 /// A deferred graph's record deleted without converging (bsv-low #555,
@@ -7112,6 +7157,8 @@ mod tests {
                 resumed_graphs: 0,
                 converged_graphs: 0,
                 dropped_graphs: Vec::new(),
+                stalled_graphs: 0,
+                held_back_graphs: 0,
             },
         );
 
@@ -8940,6 +8987,37 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Storage for FaultingStorage {
+        async fn put_deferred_graph(
+            &self,
+            record: &crate::gasp::DeferredGraph,
+        ) -> Result<crate::gasp::DeferredGraphSave, StorageError> {
+            self.inner.put_deferred_graph(record).await
+        }
+        async fn find_deferred_graphs(
+            &self,
+            host: &str,
+            topic: &str,
+        ) -> Result<Vec<crate::gasp::DeferredGraphKey>, StorageError> {
+            self.inner.find_deferred_graphs(host, topic).await
+        }
+        async fn get_deferred_graph(
+            &self,
+            host: &str,
+            topic: &str,
+            outpoint: &str,
+        ) -> Result<Option<crate::gasp::DeferredGraph>, StorageError> {
+            self.inner.get_deferred_graph(host, topic, outpoint).await
+        }
+        async fn delete_deferred_graph(
+            &self,
+            host: &str,
+            topic: &str,
+            outpoint: &str,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .delete_deferred_graph(host, topic, outpoint)
+                .await
+        }
         async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
             if self.fail_insert_output.get() {
                 return Err(StorageError::Database(

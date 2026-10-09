@@ -824,8 +824,8 @@
    "readers": [],
    "rebuild_class": "transient",
    "never_wipe": false,
-   "holds": "the partial walks of GASP graphs deferred past their per-graph budget (bsv-low #555), one row per graph",
-   "why": "a cache of peer requests: a lost row costs the walk again from its root"
+   "holds": "the partial walks of GASP graphs deferred past their per-graph budget (bsv-low #555), one row per graph, at most 256 rows and 64 MiB of records over every peer (the upsert's ceiling) and swept by the cron 30 h after its last write (the lens fold's M3)",
+   "why": "a cache of peer requests: a lost row costs the walk again from its root; transient, so its sweep needs no delete_scope (the checker refuses one on a table that is not never-wipe)"
   },
   {
    "name": "ops_counters",

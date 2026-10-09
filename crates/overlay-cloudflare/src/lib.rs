@@ -1288,6 +1288,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // graph is being submitted, and a submit dropped between its writes
     // leaves a head chain with no head. It waits for the transaction being
     // written and drops the sync at the boundary.
+    // bsv-low #555 (the lens fold's M3): rows of deferred graphs nothing
+    // will resume (a peer that never finishes a sync again) are swept first.
+    crate::gasp_deferred::sweep_stale(&ops_db).await;
     match overlay_engine::gasp::race_or_deadline_guarded(
         engine.start_gasp_sync(),
         crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS),
@@ -1321,7 +1324,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                 r.topics_synced.values().map(f).sum()
             };
             worker::console_log!(
-                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped_graphs={}",
+                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped_graphs={} stalled_graphs={} held_back_graphs={}",
                 r.topics_synced.len(),
                 total_peers,
                 total_errors,
@@ -1330,7 +1333,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                 sum(|t| t.deferred_graphs),
                 sum(|t| t.resumed_graphs),
                 sum(|t| t.converged_graphs),
-                sum(|t| t.dropped_graphs.len() as u64)
+                sum(|t| t.dropped_graphs.len() as u64),
+                sum(|t| t.stalled_graphs),
+                sum(|t| t.held_back_graphs)
             );
             crate::gasp_deferred::record_counters(&ops_db, &r.topics_synced).await;
             // bsv-low #552: what the tick got done under the per-peer
@@ -1367,6 +1372,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                     || res.deferred_graphs > 0
                     || res.resumed_graphs > 0
                     || !res.dropped_graphs.is_empty()
+                    || res.stalled_graphs > 0
+                    || res.held_back_graphs > 0
                 {
                     let cursors: Vec<String> = res
                         .cursor_moves
@@ -1379,7 +1386,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                         .map(|d| format!("{} {}", d.outpoint, d.reason))
                         .collect();
                     worker::console_log!(
-                        "  Scheduled GASP topic={} sync_type={} pruned_inputs={} discarded_graphs={} finalized_graphs={} deadline_dropped_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped={:?} cursors={:?} errors={:?}",
+                        "  Scheduled GASP topic={} sync_type={} pruned_inputs={} discarded_graphs={} finalized_graphs={} deadline_dropped_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} stalled_graphs={} held_back_graphs={} dropped={:?} cursors={:?} errors={:?}",
                         topic,
                         res.sync_type,
                         res.pruned_inputs,
@@ -1389,6 +1396,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                         res.deferred_graphs,
                         res.resumed_graphs,
                         res.converged_graphs,
+                        res.stalled_graphs,
+                        res.held_back_graphs,
                         dropped,
                         cursors,
                         res.errors

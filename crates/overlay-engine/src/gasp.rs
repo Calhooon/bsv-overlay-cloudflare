@@ -228,8 +228,11 @@ pub const DEFERRED_GRAPH_MAX_PASSES: u32 = 60;
 pub const DEFERRED_GRAPH_MAX_BYTES: usize = 1 << 20;
 
 /// The most records one (peer, topic) may hold. A new deferral past it is
-/// not saved (reason `too_many`) and its UTXO fails as today: a peer that
-/// serves many deep graphs costs at most 16 records.
+/// not saved (reason `too_many`) and its walk goes on under the per-peer
+/// budget alone, as before #555 (the lens fold's L4): a peer that serves many
+/// deep graphs costs at most 16 records. A storage may refuse a record at a
+/// ceiling of its own ([`DeferredGraphSave::AtCeiling`]), counted `too_many`
+/// too (the worker's global ceiling, the lens fold's M3).
 pub const DEFERRED_GRAPHS_PER_PEER_TOPIC: usize = 16;
 
 /// The per-graph budget of a [`GASPSync`] (bsv-low #555,
@@ -239,6 +242,30 @@ pub struct GraphBudget<'a> {
     pub max_calls: u32,
     /// A fresh deadline for ONE graph's pass ([`DEFAULT_GRAPH_BUDGET_MS`]).
     pub deadline: Box<dyn Fn() -> crate::engine::SleepFuture + 'a>,
+}
+
+/// The key of one held record (bsv-low #555): what a sync loads up front.
+/// The record itself is read only when the peer serves its UTXO
+/// ([`GASPStorage::get_deferred_graph`]), so at most one record is in memory
+/// at a time (the lens fold's L3: the up-front load held up to 16 of them).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferredGraphKey {
+    /// The root UTXO, `txid.outputIndex`.
+    pub outpoint: String,
+    /// The root UTXO's score at the peer.
+    pub score: u64,
+}
+
+/// What a storage did with a record it was asked to save (bsv-low #555).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredGraphSave {
+    /// Saved (replaced).
+    Saved,
+    /// Refused at a ceiling of the storage's own (the worker's global count
+    /// and byte bounds, the lens fold's M3): counted `too_many`, and the walk
+    /// goes on under the per-peer budget alone, as before #555.
+    AtCeiling,
 }
 
 /// One node a deferred walk has fetched and appended, in append order.
@@ -325,11 +352,15 @@ pub enum DropReason {
     RootProven,
     /// The anchor check refused the graph (a final verdict, the cursor moves).
     Refused,
+    /// A resumed record whose pass ended still holding no node (a record
+    /// saved before the lens fold's H1, which saves none such); the UTXO
+    /// fails.
+    NoProgress,
 }
 
 impl DropReason {
     /// Every reason, for a caller that serves a counter per reason.
-    pub const ALL: [DropReason; 9] = [
+    pub const ALL: [DropReason; 10] = [
         Self::MaxPasses,
         Self::TooBig,
         Self::TooMany,
@@ -339,6 +370,7 @@ impl DropReason {
         Self::NotHeld,
         Self::RootProven,
         Self::Refused,
+        Self::NoProgress,
     ];
 
     /// The reason's name, as logged and counted.
@@ -353,6 +385,7 @@ impl DropReason {
             Self::NotHeld => "not_held",
             Self::RootProven => "root_proven",
             Self::Refused => "refused",
+            Self::NoProgress => "no_progress",
         }
     }
 }
@@ -377,6 +410,18 @@ pub struct DeferralStats {
     pub converged: u64,
     /// Records deleted without converging.
     pub dropped: Vec<DroppedGraph>,
+    /// Walks of the sync that ended unfinished (deferred, or dropped at a
+    /// bound) having appended at least one node in their pass, or that
+    /// completed the graph (the lens fold's H1): the peer answered.
+    pub progressed: u64,
+    /// Walks of the sync that ended unfinished having appended NO node in
+    /// their pass (a hung or failing peer; the lens fold's H1). A sync whose
+    /// only outcome was these is a FAILED attempt for #302's quarantine.
+    pub stalled: u64,
+    /// Records NOT resumed this sync because the resumes of the pass had
+    /// spent their shared budget (the lens fold's M1); held, untouched, for
+    /// the next sync.
+    pub held_back: u64,
 }
 
 /// The walk of the graph in hand: its record (what a deferral saves) and
@@ -387,6 +432,15 @@ struct Walk {
     seen: std::collections::HashSet<String>,
     calls_this_pass: u32,
     resumed: bool,
+    /// The calls this pass may make: the per-graph budget, or what the
+    /// resumes of the pass have left of their shared one (M1); `u32::MAX`
+    /// once a walk that cannot be kept goes on under the per-peer budget
+    /// alone (L4).
+    call_cap: u32,
+    /// `record.nodes.len()` when the pass started (H1).
+    nodes_at_start: usize,
+    /// Whether this pass was already counted progressed or stalled.
+    counted: bool,
 }
 
 /// How a graph's walk ended in this pass.
@@ -412,6 +466,17 @@ enum StepOut {
 enum Ingested {
     Completed,
     Deferred,
+    /// A record not resumed: the pass's resumes spent their shared budget.
+    HeldBack,
+}
+
+/// What [`GASPSync::save_walk`] did with the walk in hand.
+enum Saved {
+    Yes,
+    /// Not kept, for this reason; the walk is handed back so the caller can
+    /// go on with it (L4) or drop it.
+    Unkept(DropReason, Box<Walk>),
+    Fault(GASPError),
 }
 
 // ============================================================================
@@ -465,26 +530,23 @@ pub trait GASPStorage {
     /// Discard a temporary graph that failed validation.
     async fn discard_graph(&self, graph_id: &str) -> Result<(), GASPError>;
 
-    /// The deferred graphs of this (peer, topic) (bsv-low #555). Default:
-    /// none.
-    async fn load_deferred_graphs(&self) -> Result<Vec<DeferredGraph>, GASPError> {
-        Ok(Vec::new())
-    }
+    /// The keys of the deferred graphs of this (peer, topic), lowest score
+    /// first (bsv-low #555). REQUIRED, as the three below (the lens fold's
+    /// M2): a storage that keeps no records says so here, by answering none
+    /// and refusing every save, and its graphs past the budget then fail.
+    async fn load_deferred_graphs(&self) -> Result<Vec<DeferredGraphKey>, GASPError>;
 
-    /// Save (replace) the record of one deferred graph. Default: refused, so
-    /// a storage that keeps none fails the UTXO as before #555.
-    async fn save_deferred_graph(&self, record: &DeferredGraph) -> Result<(), GASPError> {
-        let _ = record;
-        Err(GASPError::StorageError(
-            "this storage keeps no deferred graphs".to_string(),
-        ))
-    }
+    /// The record of the graph rooted at `outpoint`, if one is held.
+    async fn get_deferred_graph(&self, outpoint: &str) -> Result<Option<DeferredGraph>, GASPError>;
 
-    /// Delete the record of the graph rooted at `outpoint`. Default: no-op.
-    async fn delete_deferred_graph(&self, outpoint: &str) -> Result<(), GASPError> {
-        let _ = outpoint;
-        Ok(())
-    }
+    /// Save (replace) the record of one deferred graph.
+    async fn save_deferred_graph(
+        &self,
+        record: &DeferredGraph,
+    ) -> Result<DeferredGraphSave, GASPError>;
+
+    /// Delete the record of the graph rooted at `outpoint`.
+    async fn delete_deferred_graph(&self, outpoint: &str) -> Result<(), GASPError>;
 }
 
 // ============================================================================
@@ -792,8 +854,16 @@ pub struct GASPSync<'a> {
     /// The per-graph budget (bsv-low #555). `None` (the default): no graph
     /// is deferred and the walk is the one before #555.
     graph_budget: Option<GraphBudget<'a>>,
-    /// The records of this (peer, topic) not yet resumed in this sync.
-    deferred: std::cell::RefCell<std::collections::HashMap<String, DeferredGraph>>,
+    /// The roots of this (peer, topic)'s records not yet resumed in this
+    /// sync (their keys; a record is read when its UTXO is served).
+    deferred: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// ONE deadline for every resume of the sync (the lens fold's M1), made
+    /// at the first resume.
+    resume_deadline: std::cell::RefCell<Option<crate::engine::SleepFuture>>,
+    /// The calls every resume of the sync may still make together (M1).
+    resume_calls_left: std::cell::Cell<u32>,
+    /// Calls made by the sync's walks so far.
+    calls_made: std::cell::Cell<u64>,
     /// How many records this (peer, topic) holds in storage.
     held_records: std::cell::Cell<usize>,
     /// The walk of the graph in hand (see [`Walk`]).
@@ -828,7 +898,10 @@ impl<'a> GASPSync<'a> {
             completed_cursor: last_interaction,
             graph_in_flight: false,
             graph_budget: None,
-            deferred: std::cell::RefCell::new(std::collections::HashMap::new()),
+            deferred: std::cell::RefCell::new(std::collections::HashSet::new()),
+            resume_deadline: std::cell::RefCell::new(None),
+            resume_calls_left: std::cell::Cell::new(0),
+            calls_made: std::cell::Cell::new(0),
             held_records: std::cell::Cell::new(0),
             walk: std::cell::RefCell::new(None),
             stats: std::cell::RefCell::new(DeferralStats::default()),
@@ -951,22 +1024,31 @@ impl<'a> GASPSync<'a> {
         *self.stats.borrow_mut() = DeferralStats::default();
         self.deferred.borrow_mut().clear();
         self.held_records.set(0);
+        self.resume_deadline.borrow_mut().take();
+        self.resume_calls_left
+            .set(self.graph_budget.as_ref().map_or(0, |b| b.max_calls));
         // bsv-low #555: the deferred graphs of this (peer, topic), resumed
         // as the peer serves their UTXOs again (the cursor was held below
-        // them). A read fault resumes nothing this sync: those UTXOs are
-        // walked from their roots, and their records replaced.
+        // them). Only their keys: a record is read when its UTXO is served
+        // (the lens fold's L3). A read fault resumes nothing this sync: those
+        // UTXOs are walked from their roots and their records replaced, and
+        // the (peer, topic) is taken as FULL, so no new record is saved over
+        // a count not known (the lens fold's L6).
         if self.graph_budget.is_some() {
             match self.storage.load_deferred_graphs().await {
-                Ok(records) => {
-                    self.held_records.set(records.len());
+                Ok(keys) => {
+                    self.held_records.set(keys.len());
                     self.deferred
                         .borrow_mut()
-                        .extend(records.into_iter().map(|r| (r.outpoint.clone(), r)));
+                        .extend(keys.into_iter().map(|k| k.outpoint));
                 }
-                Err(e) => warn!(
-                    "{} Could not read the deferred graphs (bsv-low #555): {}",
-                    self.log_prefix, e
-                ),
+                Err(e) => {
+                    self.held_records.set(DEFERRED_GRAPHS_PER_PEER_TOPIC);
+                    warn!(
+                        "{} Could not read the deferred graphs (bsv-low #555): {}",
+                        self.log_prefix, e
+                    );
+                }
             }
         }
 
@@ -1046,7 +1128,7 @@ impl<'a> GASPSync<'a> {
                 if known_outpoints.contains(&outpoint) {
                     // A deferred graph whose UTXO the node now holds (it
                     // landed another way): nothing to resume.
-                    if self.deferred.borrow_mut().remove(&outpoint).is_some() {
+                    if self.deferred.borrow_mut().remove(&outpoint) {
                         self.drop_record(&outpoint, DropReason::Held).await;
                     }
                     shared_outpoints.insert(outpoint.clone());
@@ -1074,7 +1156,7 @@ impl<'a> GASPSync<'a> {
                             self.settle_completed(landed.is_ok()).await;
                             landed.map(|()| true)
                         }
-                        Ok(Ingested::Deferred) => Ok(false),
+                        Ok(Ingested::Deferred | Ingested::HeldBack) => Ok(false),
                         Err(e) => {
                             self.walk.borrow_mut().take();
                             Err(e)
@@ -1084,10 +1166,11 @@ impl<'a> GASPSync<'a> {
                         Ok(true) => {
                             shared_outpoints.insert(outpoint);
                         }
-                        // bsv-low #555: DEFERRED, its walk saved. Held below
-                        // the cursor like a failed UTXO (the gap guard) and
-                        // not walked again in this sync (#554); the next
-                        // sync resumes it. The sync goes on.
+                        // bsv-low #555: DEFERRED, its walk saved (or a
+                        // record held back for the next sync, M1). Held
+                        // below the cursor like a failed UTXO (the gap
+                        // guard) and not walked again in this sync (#554);
+                        // the next sync resumes it. The sync goes on.
                         Ok(false) => {
                             let s = utxo.score as u64;
                             min_failed_score = Some(min_failed_score.map_or(s, |cur| cur.min(s)));
@@ -1156,7 +1239,7 @@ impl<'a> GASPSync<'a> {
         // bsv-low #555: a record whose UTXO a sync that ran to its end was
         // not served (spent at the peer, or no longer listed): nothing will
         // resume it.
-        let unserved: Vec<String> = self.deferred.borrow_mut().drain().map(|(k, _)| k).collect();
+        let unserved: Vec<String> = self.deferred.borrow_mut().drain().collect();
         for outpoint in unserved {
             self.drop_record(&outpoint, DropReason::NotServed).await;
         }
@@ -1193,14 +1276,73 @@ impl<'a> GASPSync<'a> {
     /// SPV necessity, as in the reference): that one fails the UTXO and drops
     /// the record. On `Completed` the walk stays in hand until
     /// [`Self::settle_completed`] knows whether it landed.
+    ///
+    /// Every RESUME of one sync shares ONE per-graph budget (the lens fold's
+    /// M1): one deadline, made at the first resume, and one call count. The
+    /// cursor is held below the deferred UTXOs, so the peer serves them
+    /// first; with a budget each, two of them took the whole per-peer budget
+    /// and no UTXO above them was reached. Now the resumes of a pass take at
+    /// most one graph's budget and the first new UTXO keeps its own. A record
+    /// served once that budget is spent is HELD BACK untouched (no read, no
+    /// pass counted) for the next sync.
     async fn ingest_utxo(&self, utxo: &GASPOutput, outpoint: &str) -> Result<Ingested, GASPError> {
         debug!("{} Requesting node for {}", self.log_prefix, outpoint);
-        let fresh = || Walk {
+        let Some(budget) = &self.graph_budget else {
+            *self.walk.borrow_mut() = Some(Self::fresh_walk(utxo.score as u64, outpoint, u32::MAX));
+            let walked = self.walk_graph(None).await;
+            let walk = self.walk.borrow_mut().take();
+            walked?;
+            self.complete_graph(&Self::graph_id_of(walk.as_ref(), outpoint))
+                .await?;
+            return Ok(Ingested::Completed);
+        };
+
+        if !self.deferred.borrow_mut().remove(outpoint) {
+            let mut deadline = (budget.deadline)();
+            return self
+                .ingest_budgeted(utxo, outpoint, &mut deadline, budget.max_calls, false)
+                .await;
+        }
+        let mut deadline = self
+            .resume_deadline
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| (budget.deadline)());
+        let cap = self.resume_calls_left.get();
+        if cap == 0 || Self::due(&mut deadline).await {
+            *self.resume_deadline.borrow_mut() = Some(deadline);
+            self.stats.borrow_mut().held_back += 1;
+            info!(
+                "{} Deferred graph {} held back: the resumes of this pass spent their budget (bsv-low #555)",
+                self.log_prefix, outpoint
+            );
+            return Ok(Ingested::HeldBack);
+        }
+        let before = self.calls_made.get();
+        let ingested = self
+            .ingest_budgeted(utxo, outpoint, &mut deadline, cap, true)
+            .await;
+        let spent = u32::try_from(self.calls_made.get() - before).unwrap_or(u32::MAX);
+        self.resume_calls_left.set(cap.saturating_sub(spent));
+        *self.resume_deadline.borrow_mut() = Some(deadline);
+        ingested
+    }
+
+    /// Whether `deadline` has fallen due (polled once, with the task's own
+    /// waker).
+    async fn due(deadline: &mut crate::engine::SleepFuture) -> bool {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(deadline.as_mut().poll(cx).is_ready()))
+            .await
+    }
+
+    /// A walk from the root `outpoint`, nothing fetched yet.
+    fn fresh_walk(score: u64, outpoint: &str, call_cap: u32) -> Walk {
+        Walk {
             record: DeferredGraph {
                 peer: String::new(),
                 topic: String::new(),
                 outpoint: outpoint.to_string(),
-                score: utxo.score as u64,
+                score,
                 nodes: Vec::new(),
                 pending: vec![PendingInput {
                     outpoint: outpoint.to_string(),
@@ -1216,22 +1358,38 @@ impl<'a> GASPSync<'a> {
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
             resumed: false,
-        };
+            call_cap,
+            nodes_at_start: 0,
+            counted: false,
+        }
+    }
 
-        let Some(budget) = &self.graph_budget else {
-            *self.walk.borrow_mut() = Some(fresh());
-            let walked = self.walk_graph(None).await;
-            let walk = self.walk.borrow_mut().take();
-            walked?;
-            self.complete_graph(&Self::graph_id_of(walk.as_ref(), outpoint))
-                .await?;
-            return Ok(Ingested::Completed);
+    /// One pass of a graph's walk under the per-graph budget: `deadline`,
+    /// and `cap` calls. `from_record`: a record of it is held (its key was
+    /// loaded); it is read now.
+    async fn ingest_budgeted(
+        &self,
+        utxo: &GASPOutput,
+        outpoint: &str,
+        deadline: &mut crate::engine::SleepFuture,
+        cap: u32,
+        from_record: bool,
+    ) -> Result<Ingested, GASPError> {
+        let score = utxo.score as u64;
+        // A read fault fails the UTXO and keeps the record for the next sync.
+        let record = if from_record {
+            let record = self.storage.get_deferred_graph(outpoint).await?;
+            if record.is_none() {
+                // Deleted since the keys were read (the worker's sweep).
+                self.held_records
+                    .set(self.held_records.get().saturating_sub(1));
+            }
+            record
+        } else {
+            None
         };
-
-        let mut deadline = (budget.deadline)();
-        let record = self.deferred.borrow_mut().remove(outpoint);
         let walk = match record {
-            None => fresh(),
+            None => Self::fresh_walk(score, outpoint, cap),
             Some(record) if record.passes >= DEFERRED_GRAPH_MAX_PASSES => {
                 let passes = record.passes;
                 self.drop_record(outpoint, DropReason::MaxPasses).await;
@@ -1256,9 +1414,12 @@ impl<'a> GASPSync<'a> {
                         .iter()
                         .filter_map(|w| Self::node_id(&w.node))
                         .collect(),
+                    nodes_at_start: record.nodes.len(),
                     record,
                     calls_this_pass: 0,
                     resumed: true,
+                    call_cap: cap,
+                    counted: false,
                 }
             }
         };
@@ -1287,7 +1448,7 @@ impl<'a> GASPSync<'a> {
                     Some(Ok(node)) if node.proof.is_some() => {
                         let carried = self.walk.borrow().as_ref().map_or(0, |w| w.calls_this_pass);
                         self.drop_record(outpoint, DropReason::RootProven).await;
-                        let mut restarted = fresh();
+                        let mut restarted = Self::fresh_walk(score, outpoint, cap);
                         restarted.calls_this_pass = carried;
                         restarted.record.calls = u64::from(carried);
                         *self.walk.borrow_mut() = Some(restarted);
@@ -1296,68 +1457,117 @@ impl<'a> GASPSync<'a> {
                     Some(_) => {}
                 }
             }
-            let nodes: Vec<WalkedNode> = self
-                .walk
-                .borrow()
-                .as_ref()
-                .map(|w| w.record.nodes.clone())
-                .unwrap_or_default();
-            for walked in &nodes {
-                self.storage
-                    .append_to_graph(&walked.node, walked.spent_by.as_deref())
-                    .await?;
-            }
-            self.walk_graph(Some(&mut deadline)).await
+            self.append_walked().await?;
+            self.walk_graph(Some(&mut *deadline)).await
         }
         .await;
+        self.finish_pass(outpoint, ended).await
+    }
 
-        let graph_id = Self::graph_id_of(self.walk.borrow().as_ref(), outpoint);
-        // Whether a record of this graph is still held: not after a
-        // `root_proven` restart, whose walk is fresh.
-        let resumed = self.walk.borrow().as_ref().is_some_and(|w| w.resumed);
-        let reason = match ended {
-            Ok(WalkEnd::Done) => match self.complete_graph(&graph_id).await {
-                Ok(true) => return Ok(Ingested::Completed),
-                Ok(false) => {
-                    // Refused by the anchor check: a verdict, the cursor
-                    // moves, nothing to resume.
+    /// Append the walk's fetched nodes to the graph (a resume, or a walk
+    /// that goes on after its graph was discarded).
+    async fn append_walked(&self) -> Result<(), GASPError> {
+        let nodes: Vec<WalkedNode> = self
+            .walk
+            .borrow()
+            .as_ref()
+            .map(|w| w.record.nodes.clone())
+            .unwrap_or_default();
+        for walked in &nodes {
+            self.storage
+                .append_to_graph(&walked.node, walked.spent_by.as_deref())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The end of a budgeted pass: complete the graph, defer it, or fail
+    /// its UTXO. A walk past its per-graph budget that cannot be KEPT (past
+    /// [`DEFERRED_GRAPHS_PER_PEER_TOPIC`], [`DEFERRED_GRAPH_MAX_BYTES`] or
+    /// the storage's ceiling) goes on under the per-peer budget alone, as
+    /// every walk did before #555 (the lens fold's L4: such a graph completed
+    /// in one pass before #555, and was then failed on every pass).
+    async fn finish_pass(
+        &self,
+        outpoint: &str,
+        mut ended: Result<WalkEnd, GASPError>,
+    ) -> Result<Ingested, GASPError> {
+        loop {
+            let graph_id = Self::graph_id_of(self.walk.borrow().as_ref(), outpoint);
+            // Whether a record of this graph is still held: not after a
+            // `root_proven` restart, whose walk is fresh.
+            let resumed = self.walk.borrow().as_ref().is_some_and(|w| w.resumed);
+            let (reason, completed) = match ended {
+                Ok(WalkEnd::Done) => match self.complete_graph(&graph_id).await {
+                    Ok(true) => return Ok(Ingested::Completed),
+                    Ok(false) => {
+                        // Refused by the anchor check: a verdict, the cursor
+                        // moves, nothing to resume.
+                        self.walk.borrow_mut().take();
+                        if resumed {
+                            self.drop_record(outpoint, DropReason::Refused).await;
+                        }
+                        return Ok(Ingested::Completed);
+                    }
+                    // `complete_graph` discarded the graph already.
+                    Err(GASPError::AnchorUnavailable(_)) => ("anchor_unavailable", true),
+                    // A finalize fault: the graph is still in hand.
+                    Err(_) => {
+                        let _ = self.storage.discard_graph(&graph_id).await;
+                        ("fault", true)
+                    }
+                },
+                Ok(WalkEnd::Deferred(reason)) => (reason, false),
+                Err(e @ GASPError::NodeNotFound(_)) => {
+                    let _ = self.storage.discard_graph(&graph_id).await;
                     self.walk.borrow_mut().take();
                     if resumed {
-                        self.drop_record(outpoint, DropReason::Refused).await;
+                        self.drop_record(outpoint, DropReason::NotHeld).await;
                     }
-                    return Ok(Ingested::Completed);
+                    return Err(e);
                 }
-                // `complete_graph` discarded the graph already.
-                Err(GASPError::AnchorUnavailable(_)) => "anchor_unavailable",
-                // A finalize fault: the graph is still in hand.
-                Err(_) => {
+                Err(e) => {
+                    warn!(
+                        "{} Walk of {} faulted, deferred with its progress: {}",
+                        self.log_prefix, outpoint, e
+                    );
                     let _ = self.storage.discard_graph(&graph_id).await;
-                    "fault"
+                    ("fault", false)
                 }
-            },
-            Ok(WalkEnd::Deferred(reason)) => {
-                let _ = self.storage.discard_graph(&graph_id).await;
-                reason
-            }
-            Err(e @ GASPError::NodeNotFound(_)) => {
-                let _ = self.storage.discard_graph(&graph_id).await;
-                self.walk.borrow_mut().take();
-                if resumed {
-                    self.drop_record(outpoint, DropReason::NotHeld).await;
+            };
+            match self.save_walk(reason, completed).await {
+                Saved::Yes => {
+                    let _ = self.storage.discard_graph(&graph_id).await;
+                    return Ok(Ingested::Deferred);
                 }
-                return Err(e);
+                Saved::Fault(e) => {
+                    let _ = self.storage.discard_graph(&graph_id).await;
+                    return Err(e);
+                }
+                Saved::Unkept(why, mut walk) => {
+                    self.unkept(why, &mut walk).await;
+                    let goes_on = matches!(reason, "calls" | "time")
+                        && matches!(why, DropReason::TooBig | DropReason::TooMany);
+                    if !goes_on {
+                        let _ = self.storage.discard_graph(&graph_id).await;
+                        return Err(GASPError::Other(format!(
+                            "deferred graph {outpoint} not kept: {} (bsv-low #555)",
+                            why.as_str()
+                        )));
+                    }
+                    info!(
+                        "{} Graph {} cannot be kept ({}): its walk goes on under the per-peer budget alone (bsv-low #555)",
+                        self.log_prefix,
+                        outpoint,
+                        why.as_str()
+                    );
+                    walk.call_cap = u32::MAX;
+                    *self.walk.borrow_mut() = Some(*walk);
+                    // The graph in hand was never discarded: walk on.
+                    ended = self.walk_graph(None).await;
+                }
             }
-            Err(e) => {
-                warn!(
-                    "{} Walk of {} faulted, deferred with its progress: {}",
-                    self.log_prefix, outpoint, e
-                );
-                let _ = self.storage.discard_graph(&graph_id).await;
-                "fault"
-            }
-        };
-        self.save_walk(reason).await?;
-        Ok(Ingested::Deferred)
+        }
     }
 
     /// After a COMPLETED graph's hook (bsv-low #555): a graph that landed
@@ -1397,40 +1607,48 @@ impl<'a> GASPSync<'a> {
                     walk.record.nodes.len()
                 );
             }
-        } else {
-            let _ = self.save_walk("not_landed").await;
+        } else if let Saved::Unkept(why, mut walk) = self.save_walk("not_landed", true).await {
+            self.unkept(why, &mut walk).await;
         }
     }
 
     /// Save the walk in hand as its graph's record (bsv-low #555), counting
-    /// a deferral; or drop it with its reason and answer `Err` (the UTXO
-    /// fails as before #555) when it is past a bound or cannot be written.
-    async fn save_walk(&self, reason: &'static str) -> Result<(), GASPError> {
+    /// a deferral; or hand it back UNKEPT with the reason (past a bound, or
+    /// holding no node), or answer the storage's fault (the UTXO then fails
+    /// as before #555). Counts the pass progressed or stalled (the lens
+    /// fold's H1), once per pass.
+    async fn save_walk(&self, reason: &'static str, completed: bool) -> Saved {
         let Some(mut walk) = self.walk.borrow_mut().take() else {
-            return Ok(());
+            // Nothing in hand: nothing to save.
+            return Saved::Yes;
         };
+        if !walk.counted {
+            walk.counted = true;
+            let mut stats = self.stats.borrow_mut();
+            if completed || walk.record.nodes.len() > walk.nodes_at_start {
+                stats.progressed += 1;
+            } else {
+                stats.stalled += 1;
+            }
+        }
         walk.record.passes += 1;
         walk.record.reason = reason.to_string();
-        let outpoint = walk.record.outpoint.clone();
+        // H1: a walk that holds no node is never kept (nothing would be lost
+        // by not keeping it, and an empty record took one of the 16 places
+        // for up to 60 passes, L2): its UTXO fails as before #555.
+        if walk.record.nodes.is_empty() {
+            return Saved::Unkept(DropReason::NoProgress, Box::new(walk));
+        }
         if !walk.resumed && self.held_records.get() >= DEFERRED_GRAPHS_PER_PEER_TOPIC {
-            self.note_dropped(&outpoint, DropReason::TooMany);
-            return Err(GASPError::Other(format!(
-                "deferred graph {outpoint} not saved: {DEFERRED_GRAPHS_PER_PEER_TOPIC} records held (bsv-low #555)"
-            )));
+            return Saved::Unkept(DropReason::TooMany, Box::new(walk));
         }
         let bytes = walk.record.byte_size();
         if bytes > DEFERRED_GRAPH_MAX_BYTES {
-            if walk.resumed {
-                self.drop_record(&outpoint, DropReason::TooBig).await;
-            } else {
-                self.note_dropped(&outpoint, DropReason::TooBig);
-            }
-            return Err(GASPError::Other(format!(
-                "deferred graph {outpoint} dropped: {bytes} bytes (bsv-low #555)"
-            )));
+            return Saved::Unkept(DropReason::TooBig, Box::new(walk));
         }
+        let outpoint = walk.record.outpoint.clone();
         match self.storage.save_deferred_graph(&walk.record).await {
-            Ok(()) => {
+            Ok(DeferredGraphSave::Saved) => {
                 if !walk.resumed {
                     self.held_records.set(self.held_records.get() + 1);
                 }
@@ -1447,16 +1665,35 @@ impl<'a> GASPSync<'a> {
                     walk.record.passes,
                     bytes
                 );
-                Ok(())
+                Saved::Yes
             }
+            Ok(DeferredGraphSave::AtCeiling) => Saved::Unkept(DropReason::TooMany, Box::new(walk)),
             Err(e) => {
                 if walk.resumed {
                     self.drop_record(&outpoint, DropReason::StoreFault).await;
                 } else {
                     self.note_dropped(&outpoint, DropReason::StoreFault);
                 }
-                Err(e)
+                Saved::Fault(e)
             }
+        }
+    }
+
+    /// A walk [`Self::save_walk`] did not keep: its held record (if any) is
+    /// deleted with the reason, else the reason is counted; a fresh walk
+    /// that fetched nothing was never a record and is only logged.
+    async fn unkept(&self, why: DropReason, walk: &mut Walk) {
+        let outpoint = walk.record.outpoint.clone();
+        if walk.resumed {
+            self.drop_record(&outpoint, why).await;
+            walk.resumed = false;
+        } else if why == DropReason::NoProgress {
+            warn!(
+                "{} Walk of {} fetched nothing: not kept, the UTXO fails (bsv-low #555)",
+                self.log_prefix, outpoint
+            );
+        } else {
+            self.note_dropped(&outpoint, why);
         }
     }
 
@@ -1492,7 +1729,9 @@ impl<'a> GASPSync<'a> {
     /// again. No-op without a per-graph budget or with no walk in hand.
     pub async fn defer_in_flight(&self) {
         if self.graph_budget.is_some() {
-            let _ = self.save_walk("peer_deadline").await;
+            if let Saved::Unkept(why, mut walk) = self.save_walk("peer_deadline", false).await {
+                self.unkept(why, &mut walk).await;
+            }
         }
     }
 
@@ -1511,6 +1750,7 @@ impl<'a> GASPSync<'a> {
 
     /// Count one call of the graph in hand.
     fn count_call(&self) {
+        self.calls_made.set(self.calls_made.get() + 1);
         if let Some(w) = self.walk.borrow_mut().as_mut() {
             w.calls_this_pass += 1;
             w.record.calls += 1;
@@ -1552,9 +1792,7 @@ impl<'a> GASPSync<'a> {
                 };
                 (
                     walk.record.pending.last().cloned(),
-                    self.graph_budget
-                        .as_ref()
-                        .is_some_and(|b| walk.calls_this_pass >= b.max_calls),
+                    self.graph_budget.is_some() && walk.calls_this_pass >= walk.call_cap,
                 )
             };
             let Some(item) = item else {
@@ -1641,6 +1879,9 @@ impl<'a> GASPSync<'a> {
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
             resumed: false,
+            call_cap: u32::MAX,
+            nodes_at_start: 0,
+            counted: false,
         });
         let node = self.hydrate_root(node.clone()).await;
         let out = self.absorb(&root, node).await?;
@@ -2179,6 +2420,27 @@ mod tests {
 
     #[async_trait(?Send)]
     impl GASPStorage for MockGASPStorage {
+        // Keeps no deferred graphs (bsv-low #555): never given a per-graph budget.
+        async fn load_deferred_graphs(
+            &self,
+        ) -> Result<Vec<crate::gasp::DeferredGraphKey>, GASPError> {
+            Ok(Vec::new())
+        }
+        async fn get_deferred_graph(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::gasp::DeferredGraph>, GASPError> {
+            Ok(None)
+        }
+        async fn save_deferred_graph(
+            &self,
+            _: &crate::gasp::DeferredGraph,
+        ) -> Result<crate::gasp::DeferredGraphSave, GASPError> {
+            Err(GASPError::StorageError("keeps no deferred graphs".into()))
+        }
+        async fn delete_deferred_graph(&self, _: &str) -> Result<(), GASPError> {
+            Ok(())
+        }
         async fn find_known_utxos(
             &self,
             since: u64,
@@ -2421,6 +2683,27 @@ mod tests {
 
         #[async_trait(?Send)]
         impl GASPStorage for FailValidationStorage {
+            // Keeps no deferred graphs (bsv-low #555): never given a per-graph budget.
+            async fn load_deferred_graphs(
+                &self,
+            ) -> Result<Vec<crate::gasp::DeferredGraphKey>, GASPError> {
+                Ok(Vec::new())
+            }
+            async fn get_deferred_graph(
+                &self,
+                _: &str,
+            ) -> Result<Option<crate::gasp::DeferredGraph>, GASPError> {
+                Ok(None)
+            }
+            async fn save_deferred_graph(
+                &self,
+                _: &crate::gasp::DeferredGraph,
+            ) -> Result<crate::gasp::DeferredGraphSave, GASPError> {
+                Err(GASPError::StorageError("keeps no deferred graphs".into()))
+            }
+            async fn delete_deferred_graph(&self, _: &str) -> Result<(), GASPError> {
+                Ok(())
+            }
             async fn find_known_utxos(
                 &self,
                 _: u64,
@@ -2502,6 +2785,27 @@ mod tests {
 
     #[async_trait(?Send)]
     impl GASPStorage for RecordingStorage {
+        // Keeps no deferred graphs (bsv-low #555): never given a per-graph budget.
+        async fn load_deferred_graphs(
+            &self,
+        ) -> Result<Vec<crate::gasp::DeferredGraphKey>, GASPError> {
+            Ok(Vec::new())
+        }
+        async fn get_deferred_graph(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::gasp::DeferredGraph>, GASPError> {
+            Ok(None)
+        }
+        async fn save_deferred_graph(
+            &self,
+            _: &crate::gasp::DeferredGraph,
+        ) -> Result<crate::gasp::DeferredGraphSave, GASPError> {
+            Err(GASPError::StorageError("keeps no deferred graphs".into()))
+        }
+        async fn delete_deferred_graph(&self, _: &str) -> Result<(), GASPError> {
+            Ok(())
+        }
         async fn find_known_utxos(
             &self,
             _: u64,

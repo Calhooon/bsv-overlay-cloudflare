@@ -885,10 +885,15 @@ impl Storage for D1Storage {
     async fn put_deferred_graph(
         &self,
         record: &overlay_engine::gasp::DeferredGraph,
-    ) -> Result<(), StorageError> {
+    ) -> Result<overlay_engine::gasp::DeferredGraphSave, StorageError> {
+        #[derive(Deserialize)]
+        struct Saved {
+            #[allow(dead_code)]
+            outpoint: String,
+        }
         let json = serde_json::to_string(record)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        Query::new(crate::gasp_deferred::DEFERRED_GRAPH_UPSERT_SQL)
+        let saved: Option<Saved> = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_UPSERT_SQL)
             .bind(record.peer.as_str())
             .bind(record.topic.as_str())
             .bind(record.outpoint.as_str())
@@ -900,32 +905,63 @@ impl Storage for D1Storage {
             .bind(record.reason.as_str())
             .bind(json.len() as f64)
             .bind(json.as_str())
-            .execute(&self.db)
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS)
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_TOTAL_BYTES as f64)
+            .fetch_optional(&self.db)
             .await
-            .map_err(d1_err)
+            .map_err(d1_err)?;
+        Ok(match saved {
+            Some(_) => overlay_engine::gasp::DeferredGraphSave::Saved,
+            None => overlay_engine::gasp::DeferredGraphSave::AtCeiling,
+        })
     }
 
     async fn find_deferred_graphs(
         &self,
         host: &str,
         topic: &str,
-    ) -> Result<Vec<overlay_engine::gasp::DeferredGraph>, StorageError> {
+    ) -> Result<Vec<overlay_engine::gasp::DeferredGraphKey>, StorageError> {
         #[derive(Deserialize)]
-        struct RecordRow {
-            record: String,
+        struct KeyRow {
+            outpoint: String,
+            score: f64,
         }
-        let rows: Vec<RecordRow> = Query::new(crate::gasp_deferred::DEFERRED_GRAPHS_SELECT_SQL)
+        let rows: Vec<KeyRow> = Query::new(crate::gasp_deferred::DEFERRED_GRAPHS_SELECT_SQL)
             .bind(host)
             .bind(topic)
             .fetch_all(&self.db)
             .await
             .map_err(d1_err)?;
-        rows.iter()
-            .map(|r| {
-                serde_json::from_str(&r.record)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))
+        Ok(rows
+            .into_iter()
+            .map(|r| overlay_engine::gasp::DeferredGraphKey {
+                outpoint: r.outpoint,
+                score: r.score.max(0.0) as u64,
             })
-            .collect()
+            .collect())
+    }
+
+    async fn get_deferred_graph(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<Option<overlay_engine::gasp::DeferredGraph>, StorageError> {
+        #[derive(Deserialize)]
+        struct RecordRow {
+            record: String,
+        }
+        let row: Option<RecordRow> = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_GET_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(outpoint)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(d1_err)?;
+        row.map(|r| {
+            serde_json::from_str(&r.record).map_err(|e| StorageError::Serialization(e.to_string()))
+        })
+        .transpose()
     }
 
     async fn delete_deferred_graph(

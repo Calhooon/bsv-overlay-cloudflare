@@ -1143,9 +1143,19 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         Ok(())
     }
 
-    async fn load_deferred_graphs(&self) -> Result<Vec<crate::gasp::DeferredGraph>, GASPError> {
+    async fn load_deferred_graphs(&self) -> Result<Vec<crate::gasp::DeferredGraphKey>, GASPError> {
         self.storage
             .find_deferred_graphs(&self.peer, &self.topic)
+            .await
+            .map_err(|e| GASPError::StorageError(e.to_string()))
+    }
+
+    async fn get_deferred_graph(
+        &self,
+        outpoint: &str,
+    ) -> Result<Option<crate::gasp::DeferredGraph>, GASPError> {
+        self.storage
+            .get_deferred_graph(&self.peer, &self.topic, outpoint)
             .await
             .map_err(|e| GASPError::StorageError(e.to_string()))
     }
@@ -1153,7 +1163,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
     async fn save_deferred_graph(
         &self,
         record: &crate::gasp::DeferredGraph,
-    ) -> Result<(), GASPError> {
+    ) -> Result<crate::gasp::DeferredGraphSave, GASPError> {
         let mut record = record.clone();
         record.peer.clone_from(&self.peer);
         record.topic.clone_from(&self.topic);

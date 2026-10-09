@@ -294,41 +294,60 @@ pub trait Storage {
     /// Save (REPLACE) the record of one deferred GASP graph, keyed by
     /// (`record.peer`, `record.topic`, `record.outpoint`). One row per graph:
     /// a later deferral of the same graph overwrites it, never appends.
+    /// `AtCeiling`: refused at a bound of the storage's own (the worker's
+    /// global ceiling), counted `too_many`; the walk then goes on under the
+    /// per-peer budget alone, as before #555.
     ///
-    /// Default: refused. A backend that keeps no records defers nothing: a
-    /// graph past its per-graph budget fails its UTXO as before #555 (and a
-    /// wrapper that does not forward these three methods turns deferral
-    /// off for the storage it wraps).
+    /// The four deferred-graph methods are REQUIRED (the lens fold's M2,
+    /// the house style of `TopicManager::identify_admissible_outputs`): with
+    /// a default, a storage or WRAPPER that did not forward them compiled,
+    /// and `Engine::set_graph_budget` over it saved nothing, walked every
+    /// graph past the call budget from its root on every tick and never
+    /// admitted it (`store_fault`), a hard cap on graph size worse than no
+    /// budget. A wrapper forwards all four to the storage it wraps:
+    ///
+    /// ```ignore
+    /// async fn put_deferred_graph(&self, record: &DeferredGraph)
+    ///     -> Result<DeferredGraphSave, StorageError> {
+    ///     self.inner.put_deferred_graph(record).await
+    /// }
+    /// // and the same for find_deferred_graphs, get_deferred_graph and
+    /// // delete_deferred_graph.
+    /// ```
+    ///
+    /// A backend that keeps no records answers none from
+    /// `find_deferred_graphs` and `get_deferred_graph` and an `Err` from
+    /// this one: every graph past the budget then fails its UTXO, so it
+    /// must not be given a per-graph budget.
     async fn put_deferred_graph(
         &self,
         record: &crate::gasp::DeferredGraph,
-    ) -> Result<(), StorageError> {
-        let _ = record;
-        Err(StorageError::Other(
-            "deferred GASP graphs are not kept by this storage".to_string(),
-        ))
-    }
+    ) -> Result<crate::gasp::DeferredGraphSave, StorageError>;
 
-    /// The records of (`host`, `topic`), lowest score first. Default: none.
+    /// The KEYS of the records of (`host`, `topic`), lowest score first. A
+    /// sync reads these up front and each record only when its UTXO is
+    /// served (the lens fold's L3).
     async fn find_deferred_graphs(
         &self,
         host: &str,
         topic: &str,
-    ) -> Result<Vec<crate::gasp::DeferredGraph>, StorageError> {
-        let _ = (host, topic);
-        Ok(Vec::new())
-    }
+    ) -> Result<Vec<crate::gasp::DeferredGraphKey>, StorageError>;
 
-    /// Delete the record of the graph rooted at `outpoint`. Default: no-op.
+    /// The record of the graph of (`host`, `topic`) rooted at `outpoint`.
+    async fn get_deferred_graph(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<Option<crate::gasp::DeferredGraph>, StorageError>;
+
+    /// Delete the record of the graph rooted at `outpoint`.
     async fn delete_deferred_graph(
         &self,
         host: &str,
         topic: &str,
         outpoint: &str,
-    ) -> Result<(), StorageError> {
-        let _ = (host, topic, outpoint);
-        Ok(())
-    }
+    ) -> Result<(), StorageError>;
 }
 
 /// Durable per-(host, topic) GASP sync health (bsv-low#302) — the input to
@@ -500,15 +519,23 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
     async fn put_deferred_graph(
         &self,
         record: &crate::gasp::DeferredGraph,
-    ) -> Result<(), StorageError> {
+    ) -> Result<crate::gasp::DeferredGraphSave, StorageError> {
         (**self).put_deferred_graph(record).await
     }
     async fn find_deferred_graphs(
         &self,
         host: &str,
         topic: &str,
-    ) -> Result<Vec<crate::gasp::DeferredGraph>, StorageError> {
+    ) -> Result<Vec<crate::gasp::DeferredGraphKey>, StorageError> {
         (**self).find_deferred_graphs(host, topic).await
+    }
+    async fn get_deferred_graph(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<Option<crate::gasp::DeferredGraph>, StorageError> {
+        (**self).get_deferred_graph(host, topic, outpoint).await
     }
     async fn delete_deferred_graph(
         &self,
@@ -598,6 +625,14 @@ pub mod memory {
         /// How many times a deferred graph was WRITTEN (a pin counts the
         /// storage writes of a deferral).
         deferred_graph_writes: Mutex<u64>,
+        /// How many single records were READ (bsv-low #555, the lens
+        /// fold's L3).
+        deferred_graph_reads: Mutex<u64>,
+        /// Test knob: the key read of the deferred graphs faults.
+        deferred_graph_keys_fault: Mutex<bool>,
+        /// Test knob: a NEW record past this many held is refused
+        /// `AtCeiling` (the worker's global ceiling).
+        deferred_graph_ceiling: Mutex<Option<usize>>,
     }
 
     impl MemoryStorage {
@@ -659,6 +694,23 @@ pub mod memory {
         /// How many deferred-graph writes were made (bsv-low #555).
         pub fn deferred_graph_writes(&self) -> u64 {
             *self.deferred_graph_writes.lock().unwrap()
+        }
+
+        /// How many single records were read (bsv-low #555).
+        pub fn deferred_graph_reads(&self) -> u64 {
+            *self.deferred_graph_reads.lock().unwrap()
+        }
+
+        /// Make the key read of the deferred graphs fault, or not (a test
+        /// knob, bsv-low #555).
+        pub fn set_deferred_graph_keys_fault(&self, fault: bool) {
+            *self.deferred_graph_keys_fault.lock().unwrap() = fault;
+        }
+
+        /// Refuse a NEW record `AtCeiling` once this many are held, as the
+        /// worker's global ceiling does (a test knob, bsv-low #555).
+        pub fn set_deferred_graph_ceiling(&self, ceiling: Option<usize>) {
+            *self.deferred_graph_ceiling.lock().unwrap() = ceiling;
         }
 
         /// Count total outputs (for testing assertions).
@@ -1066,7 +1118,18 @@ pub mod memory {
         async fn put_deferred_graph(
             &self,
             record: &crate::gasp::DeferredGraph,
-        ) -> Result<(), StorageError> {
+        ) -> Result<crate::gasp::DeferredGraphSave, StorageError> {
+            let key = (
+                record.peer.clone(),
+                record.topic.clone(),
+                record.outpoint.clone(),
+            );
+            if let Some(ceiling) = *self.deferred_graph_ceiling.lock().unwrap() {
+                let held = self.deferred_graphs.lock().unwrap();
+                if !held.contains_key(&key) && held.len() >= ceiling {
+                    return Ok(crate::gasp::DeferredGraphSave::AtCeiling);
+                }
+            }
             *self.deferred_graph_writes.lock().unwrap() += 1;
             self.deferred_graphs.lock().unwrap().insert(
                 (
@@ -1076,19 +1139,41 @@ pub mod memory {
                 ),
                 record.clone(),
             );
-            Ok(())
+            Ok(crate::gasp::DeferredGraphSave::Saved)
         }
 
         async fn find_deferred_graphs(
             &self,
             host: &str,
             topic: &str,
-        ) -> Result<Vec<crate::gasp::DeferredGraph>, StorageError> {
+        ) -> Result<Vec<crate::gasp::DeferredGraphKey>, StorageError> {
+            if *self.deferred_graph_keys_fault.lock().unwrap() {
+                return Err(StorageError::Database("deferred graph keys: fault".into()));
+            }
             Ok(self
                 .deferred_graphs()
                 .into_iter()
                 .filter(|r| r.peer == host && r.topic == topic)
+                .map(|r| crate::gasp::DeferredGraphKey {
+                    outpoint: r.outpoint,
+                    score: r.score,
+                })
                 .collect())
+        }
+
+        async fn get_deferred_graph(
+            &self,
+            host: &str,
+            topic: &str,
+            outpoint: &str,
+        ) -> Result<Option<crate::gasp::DeferredGraph>, StorageError> {
+            *self.deferred_graph_reads.lock().unwrap() += 1;
+            Ok(self
+                .deferred_graphs
+                .lock()
+                .unwrap()
+                .get(&(host.to_string(), topic.to_string(), outpoint.to_string()))
+                .cloned())
         }
 
         async fn delete_deferred_graph(

@@ -8,6 +8,9 @@
  *     oldest, and its {topic, peer, outpoint, nodes, pending, calls, passes, reason, bytes, ageSecs}.
  *  3. Its delete (the converge / drop) empties the block again.
  * On the base (`cf933e8`) there is no `gasp` block and no table: RED.
+ * The lens fold (bsv-low #555, M3): the block names `totalBytes` and the global ceiling (256 rows, 64 MiB) and the
+ * stale sweep's age (30 h); `gasp_graph_dropped_stale_total` and `..._no_progress_total` are served from 0. RED on
+ * `03e1e17` (no `totalBytes`, no ceiling, neither counter).
  *
  *   node tools/lane-e555/deferred_graphs_route_ci.mjs <overlay base> <overlay --persist-to dir>
  *
@@ -64,9 +67,16 @@ expect(
   'the budget the worker runs under: 100 calls, 15 s, 60 passes, 1 MiB, 16 per peer and topic',
   JSON.stringify(block0?.budget),
 )
+expect(
+  block0?.totalBytes === 0 && block0?.budget?.maxRows === 256 && block0?.budget?.maxTotalBytes === 67108864 &&
+    block0?.budget?.staleSecs === 108000,
+  'the global ceiling (256 rows, 64 MiB), the stale age (30 h) and totalBytes 0',
+  JSON.stringify(block0),
+)
 const names = [
   'gasp_graph_deferred_total', 'gasp_graph_resumed_total', 'gasp_graph_converged_total', 'gasp_graph_dropped_total',
-  ...['max_passes', 'too_big', 'too_many', 'store_fault', 'not_served', 'held', 'not_held', 'root_proven', 'refused']
+  ...['max_passes', 'too_big', 'too_many', 'store_fault', 'not_served', 'held', 'not_held', 'root_proven', 'refused',
+    'no_progress', 'stale']
     .map((r) => `gasp_graph_dropped_${r}_total`),
 ]
 const missing = names.filter((n) => typeof h0.counters?.[n] !== 'number')
@@ -83,6 +93,7 @@ const h1 = await health()
 const block1 = h1.gasp?.deferredGraphs
 const g = block1?.graphs?.[0]
 expect(block1?.count === 1 && block1?.oldest?.outpoint === OUTPOINT, 'the row is counted and is the oldest', JSON.stringify(block1))
+expect(block1?.totalBytes === 51000, 'totalBytes sums the rows', JSON.stringify(block1?.totalBytes))
 expect(
   g?.topic === 'tm_collected' && g?.peer === 'https://peer.example' && g?.nodes === 40 && g?.pending === 3 &&
     g?.calls === 120 && g?.passes === 3 && g?.reason === 'time' && g?.bytes === 51000 && g?.ageSecs >= 300,

@@ -45,30 +45,113 @@ pub const DEFERRED_GRAPHS_CREATE: &str = "CREATE TABLE IF NOT EXISTS gasp_deferr
         PRIMARY KEY (host, topic, outpoint)
     )";
 
-/// Save (replace) one record. Binds: `?1` host, `?2` topic, `?3` outpoint,
-/// `?4` score, `?5` nodes, `?6` pending, `?7` calls, `?8` passes, `?9`
-/// reason, `?10` bytes, `?11` record. `created_at` is kept from the first
-/// deferral (the age); the backend owns the clock.
+/// The most rows the table holds over EVERY peer and topic (bsv-low #555, the
+/// lens fold's M3). The engine bounds records per (peer, topic) at 16, and SHIP
+/// mode takes its peers from the permissionless `ls_ship`: a stranger who
+/// advertises many hosts could fill the one D1 the overlay shares with the app
+/// layer (about 1.4 GB a day by the lens's count). A NEW key past this is
+/// refused in the upsert itself ([`DEFERRED_GRAPH_UPSERT_SQL`]), counted
+/// `too_many`, and its walk goes on under the per-peer budget alone.
+pub const DEFERRED_GRAPHS_MAX_ROWS: u32 = 256;
+
+/// The most bytes of `record` the table holds over every row (64 MiB): a save,
+/// new or a replacement, that would take the sum past it is refused, as
+/// [`DEFERRED_GRAPHS_MAX_ROWS`]. The measured picture graph is about 0.5 MiB.
+pub const DEFERRED_GRAPHS_MAX_TOTAL_BYTES: u64 = 64 << 20;
+
+/// A row not written for this long is swept by the cron
+/// ([`DEFERRED_GRAPHS_SWEEP_SQL`], counted `gasp_graph_dropped_stale_total`):
+/// twice `DEFERRED_GRAPH_MAX_PASSES` (60) at the `*/15` cadence of all three
+/// configs, 30 h. A live record is rewritten on every pass that resumes it and
+/// is dropped by the engine at 60 passes; twice that covers a record HELD BACK
+/// behind another's resumes for that one's whole life (the lens fold's M1). A
+/// row past it belongs to a peer that never finishes a sync again (dark,
+/// quarantined, its advert revoked), which nothing else would ever delete.
+pub const DEFERRED_GRAPH_STALE_SECS: u64 =
+    2 * overlay_engine::gasp::DEFERRED_GRAPH_MAX_PASSES as u64 * 15 * 60;
+
+/// Save (replace) one record, under the table's global ceiling. Binds: `?1`
+/// host, `?2` topic, `?3` outpoint, `?4` score, `?5` nodes, `?6` pending, `?7`
+/// calls, `?8` passes, `?9` reason, `?10` bytes, `?11` record, `?12`
+/// [`DEFERRED_GRAPHS_MAX_ROWS`], `?13` [`DEFERRED_GRAPHS_MAX_TOTAL_BYTES`].
+/// `created_at` is kept from the first deferral (the age); the backend owns
+/// the clock. The `WHERE` of the `SELECT` re-reads the ceiling in the one
+/// statement (as #576's `PARK_SQL`): a held key always replaces within the byte
+/// bound, a new key only under the row bound too. A refused save returns NO
+/// row (`AtCeiling`).
 pub const DEFERRED_GRAPH_UPSERT_SQL: &str = "INSERT INTO gasp_deferred_graphs \
      (host, topic, outpoint, score, nodes, pending, calls, passes, reason, bytes, record, created_at, updated_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, unixepoch(), unixepoch()) \
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, unixepoch(), unixepoch() \
+     WHERE (EXISTS (SELECT 1 FROM gasp_deferred_graphs WHERE host = ?1 AND topic = ?2 AND outpoint = ?3) \
+       OR (SELECT COUNT(*) FROM gasp_deferred_graphs) < ?12) \
+     AND (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs \
+       WHERE NOT (host = ?1 AND topic = ?2 AND outpoint = ?3)) + ?10 <= ?13 \
      ON CONFLICT(host, topic, outpoint) DO UPDATE SET \
        score = excluded.score, nodes = excluded.nodes, pending = excluded.pending, \
        calls = excluded.calls, passes = excluded.passes, reason = excluded.reason, \
-       bytes = excluded.bytes, record = excluded.record, updated_at = unixepoch()";
+       bytes = excluded.bytes, record = excluded.record, updated_at = unixepoch() \
+     RETURNING outpoint";
 
-/// The records of one (peer, topic), lowest score first.
-pub const DEFERRED_GRAPHS_SELECT_SQL: &str = "SELECT record FROM gasp_deferred_graphs \
+/// The KEYS of one (peer, topic)'s records, lowest score first: a sync reads
+/// these up front, and each record only when its UTXO is served (the lens
+/// fold's L3: the whole records of a (peer, topic), up to 16 MiB, were read
+/// in one result).
+pub const DEFERRED_GRAPHS_SELECT_SQL: &str = "SELECT outpoint, score FROM gasp_deferred_graphs \
      WHERE host = ?1 AND topic = ?2 ORDER BY score, outpoint";
+
+/// One record.
+pub const DEFERRED_GRAPH_GET_SQL: &str = "SELECT record FROM gasp_deferred_graphs \
+     WHERE host = ?1 AND topic = ?2 AND outpoint = ?3";
 
 /// Delete one record (converged or dropped).
 pub const DEFERRED_GRAPH_DELETE_SQL: &str = "DELETE FROM gasp_deferred_graphs \
      WHERE host = ?1 AND topic = ?2 AND outpoint = ?3";
 
+/// The cron's sweep of stale rows. Binds: `?1` [`DEFERRED_GRAPH_STALE_SECS`].
+pub const DEFERRED_GRAPHS_SWEEP_SQL: &str = "DELETE FROM gasp_deferred_graphs \
+     WHERE updated_at < unixepoch() - ?1 RETURNING host, topic, outpoint";
+
+/// Rows swept for age: also counted in [`COUNTER_GASP_GRAPH_DROPPED`].
+pub const COUNTER_GASP_GRAPH_DROPPED_STALE: &str = "gasp_graph_dropped_stale_total";
+
+/// Sweep the rows older than [`DEFERRED_GRAPH_STALE_SECS`] (the cron, before
+/// its GASP sync): each logged, counted `stale` and in all drops. Best effort.
+pub async fn sweep_stale(db: &D1Database) {
+    #[derive(Deserialize)]
+    struct Swept {
+        host: String,
+        topic: String,
+        outpoint: String,
+    }
+    match Query::new(DEFERRED_GRAPHS_SWEEP_SQL)
+        .bind(DEFERRED_GRAPH_STALE_SECS as f64)
+        .fetch_all::<Swept>(db)
+        .await
+    {
+        Ok(rows) if !rows.is_empty() => {
+            for r in &rows {
+                worker::console_log!(
+                    "Scheduled: GASP deferred graph {} of {} for {} SWEPT (stale past {} s, bsv-low #555)",
+                    r.outpoint,
+                    r.host,
+                    r.topic,
+                    DEFERRED_GRAPH_STALE_SECS
+                );
+            }
+            let n = rows.len() as u64;
+            crate::ops::bump_counter(db, COUNTER_GASP_GRAPH_DROPPED_STALE, n).await;
+            crate::ops::bump_counter(db, COUNTER_GASP_GRAPH_DROPPED, n).await;
+        }
+        Ok(_) => {}
+        Err(e) => worker::console_log!("Scheduled: GASP deferred graph sweep failed: {e}"),
+    }
+}
+
 /// The health block lists at most this many graphs, oldest first.
 pub const HEALTH_LIST_MAX: u32 = 20;
 
-const HEALTH_COUNT_SQL: &str = "SELECT COUNT(*) AS c FROM gasp_deferred_graphs";
+const HEALTH_COUNT_SQL: &str =
+    "SELECT COUNT(*) AS c, COALESCE(SUM(bytes), 0) AS b FROM gasp_deferred_graphs";
 
 const HEALTH_LIST_SQL: &str =
     "SELECT host, topic, outpoint, nodes, pending, calls, passes, reason, bytes, \
@@ -97,6 +180,7 @@ pub fn counter_names() -> Vec<String> {
         COUNTER_GASP_GRAPH_RESUMED.to_string(),
         COUNTER_GASP_GRAPH_CONVERGED.to_string(),
         COUNTER_GASP_GRAPH_DROPPED.to_string(),
+        COUNTER_GASP_GRAPH_DROPPED_STALE.to_string(),
     ];
     names.extend(
         overlay_engine::gasp::DropReason::ALL
@@ -157,10 +241,11 @@ pub struct HealthRow {
 #[derive(Deserialize)]
 struct CountRow {
     c: f64,
+    b: f64,
 }
 
-/// PURE: the health block from the count and the oldest rows.
-pub fn health_view(count: u64, rows: &[HealthRow]) -> serde_json::Value {
+/// PURE: the health block from the count, the bytes held and the oldest rows.
+pub fn health_view(count: u64, total_bytes: u64, rows: &[HealthRow]) -> serde_json::Value {
     let n = |v: f64| v.max(0.0) as u64;
     let graphs: Vec<serde_json::Value> = rows
         .iter()
@@ -182,6 +267,7 @@ pub fn health_view(count: u64, rows: &[HealthRow]) -> serde_json::Value {
     serde_json::json!({
         "readable": true,
         "count": count,
+        "totalBytes": total_bytes,
         "oldest": graphs.first().cloned(),
         "graphs": graphs,
         "listed": rows.len(),
@@ -191,6 +277,9 @@ pub fn health_view(count: u64, rows: &[HealthRow]) -> serde_json::Value {
             "maxPasses": overlay_engine::gasp::DEFERRED_GRAPH_MAX_PASSES,
             "maxBytes": overlay_engine::gasp::DEFERRED_GRAPH_MAX_BYTES,
             "perPeerTopic": overlay_engine::gasp::DEFERRED_GRAPHS_PER_PEER_TOPIC,
+            "maxRows": DEFERRED_GRAPHS_MAX_ROWS,
+            "maxTotalBytes": DEFERRED_GRAPHS_MAX_TOTAL_BYTES,
+            "staleSecs": DEFERRED_GRAPH_STALE_SECS,
         },
     })
 }
@@ -206,7 +295,7 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
     else {
         return serde_json::json!({"readable": false});
     };
-    let count = count.map_or(0, |r| r.c.max(0.0) as u64);
+    let (count, total_bytes) = count.map_or((0, 0), |r| (r.c.max(0.0) as u64, r.b.max(0.0) as u64));
     let rows = if count > 0 {
         match Query::new(HEALTH_LIST_SQL)
             .bind(HEALTH_LIST_MAX)
@@ -219,7 +308,7 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
     } else {
         Vec::new()
     };
-    health_view(count, &rows)
+    health_view(count, total_bytes, &rows)
 }
 
 #[cfg(test)]
@@ -279,11 +368,18 @@ mod tests {
         }
     }
 
-    fn upsert(conn: &rusqlite::Connection, r: &DeferredGraph) {
+    /// The shipped upsert as `D1Storage::put_deferred_graph` binds it, under
+    /// the given ceiling: `true` = saved (a row returned).
+    fn upsert_under(
+        conn: &rusqlite::Connection,
+        r: &DeferredGraph,
+        max_rows: u32,
+        max_bytes: u64,
+    ) -> bool {
         let json = serde_json::to_string(r).unwrap();
-        conn.execute(
-            DEFERRED_GRAPH_UPSERT_SQL,
-            rusqlite::params![
+        let mut stmt = conn.prepare(DEFERRED_GRAPH_UPSERT_SQL).unwrap();
+        let mut rows = stmt
+            .query(rusqlite::params![
                 r.peer,
                 r.topic,
                 r.outpoint,
@@ -294,20 +390,145 @@ mod tests {
                 r.passes as i64,
                 r.reason,
                 json.len() as i64,
-                json
-            ],
-        )
-        .unwrap();
+                json,
+                max_rows,
+                max_bytes as i64
+            ])
+            .unwrap();
+        rows.next().unwrap().is_some()
     }
 
+    fn upsert(conn: &rusqlite::Connection, r: &DeferredGraph) {
+        assert!(upsert_under(
+            conn,
+            r,
+            DEFERRED_GRAPHS_MAX_ROWS,
+            DEFERRED_GRAPHS_MAX_TOTAL_BYTES
+        ));
+    }
+
+    /// The keys, then each record by the get statement.
     fn select(conn: &rusqlite::Connection) -> Vec<DeferredGraph> {
         let mut stmt = conn.prepare(DEFERRED_GRAPHS_SELECT_SQL).unwrap();
-        stmt.query_map(rusqlite::params!["https://peer", "tm_x"], |row| {
-            row.get::<_, String>(0)
-        })
-        .unwrap()
-        .map(|j| serde_json::from_str(&j.unwrap()).unwrap())
-        .collect()
+        let keys: Vec<String> = stmt
+            .query_map(rusqlite::params!["https://peer", "tm_x"], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        keys.iter()
+            .map(|k| {
+                let json: String = conn
+                    .query_row(
+                        DEFERRED_GRAPH_GET_SQL,
+                        rusqlite::params!["https://peer", "tm_x", k],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                serde_json::from_str(&json).unwrap()
+            })
+            .collect()
+    }
+
+    fn rows(conn: &rusqlite::Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT outpoint FROM gasp_deferred_graphs ORDER BY outpoint")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// bsv-low #555, the lens fold's M3: the global ceiling is read in the
+    /// upsert itself. Under a 3-row bound a fourth NEW key returns no row
+    /// (`AtCeiling`) and writes nothing; a held key still replaces; under a
+    /// byte bound a new key and a replacement that would pass it are both
+    /// refused, the held row unchanged. On 03e1e17 the upsert had no ceiling
+    /// (it wrote every row and returned none).
+    #[test]
+    fn e555f_m3_the_upsert_refuses_past_the_global_ceiling() {
+        let conn = sqlite();
+        for (i, o) in ["a.0", "b.0", "c.0"].iter().enumerate() {
+            assert!(upsert_under(&conn, &record(o, i as u64, 1, 1), 3, 1 << 20));
+        }
+        assert!(
+            !upsert_under(&conn, &record("d.0", 9, 1, 1), 3, 1 << 20),
+            "a 4th key"
+        );
+        assert_eq!(rows(&conn), ["a.0", "b.0", "c.0"]);
+        assert!(
+            upsert_under(&conn, &record("b.0", 1, 5, 2), 3, 1 << 20),
+            "held: replaced"
+        );
+        assert_eq!(select(&conn)[1].passes, 2);
+        // Bytes: what the three hold now, plus one more small record, is the bound.
+        let held: i64 = conn
+            .query_row("SELECT SUM(bytes) FROM gasp_deferred_graphs", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let small = serde_json::to_string(&record("e.0", 9, 1, 1))
+            .unwrap()
+            .len() as u64;
+        let bound = held as u64 + small;
+        assert!(
+            !upsert_under(&conn, &record("f.0", 9, 9, 1), 9, bound),
+            "too many bytes"
+        );
+        assert!(
+            !upsert_under(&conn, &record("a.0", 0, 9, 2), 9, held as u64),
+            "a growth past it"
+        );
+        assert_eq!(select(&conn)[0].nodes.len(), 1, "the held row unchanged");
+        assert!(
+            upsert_under(&conn, &record("e.0", 9, 1, 1), 9, bound),
+            "exactly at the bound"
+        );
+        assert_eq!(rows(&conn), ["a.0", "b.0", "c.0", "e.0"]);
+        // The shipped bounds.
+        assert_eq!(
+            (DEFERRED_GRAPHS_MAX_ROWS, DEFERRED_GRAPHS_MAX_TOTAL_BYTES),
+            (256, 64 << 20)
+        );
+    }
+
+    /// bsv-low #555, the lens fold's M3: the cron's sweep deletes the rows not
+    /// written for [`DEFERRED_GRAPH_STALE_SECS`] (30 h) and returns each, and
+    /// leaves the others; the cron calls it before its GASP sync and counts
+    /// it. On 03e1e17 nothing deleted a row whose peer never synced again.
+    #[test]
+    fn e555f_m3_the_sweep_deletes_stale_rows_only() {
+        let conn = sqlite();
+        upsert(&conn, &record("old.0", 1, 1, 1));
+        upsert(&conn, &record("new.0", 2, 1, 1));
+        conn.execute(
+            "UPDATE gasp_deferred_graphs SET updated_at = unixepoch() - ?1 WHERE outpoint = 'old.0'",
+            [DEFERRED_GRAPH_STALE_SECS as i64 + 1],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE gasp_deferred_graphs SET updated_at = unixepoch() - ?1 WHERE outpoint = 'new.0'",
+            [DEFERRED_GRAPH_STALE_SECS as i64 - 60],
+        )
+        .unwrap();
+        let mut stmt = conn.prepare(DEFERRED_GRAPHS_SWEEP_SQL).unwrap();
+        let swept: Vec<String> = stmt
+            .query_map([DEFERRED_GRAPH_STALE_SECS as i64], |row| row.get(2))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(swept, ["old.0"]);
+        assert_eq!(rows(&conn), ["new.0"]);
+        assert_eq!(DEFERRED_GRAPH_STALE_SECS, 108_000);
+        let lib = include_str!("lib.rs");
+        let sweep = lib
+            .find("crate::gasp_deferred::sweep_stale(&ops_db).await;")
+            .unwrap();
+        let sync = lib.find("engine.start_gasp_sync(),\n        crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS)").unwrap();
+        assert!(sweep < sync, "the cron sweeps before its GASP sync");
+        assert!(counter_names().contains(&COUNTER_GASP_GRAPH_DROPPED_STALE.to_string()));
     }
 
     /// bsv-low #555: the shipped statements under real SQLite over the shipped
@@ -325,8 +546,17 @@ mod tests {
         )
         .unwrap();
         upsert(&conn, &record("a.0", 1, 6, 2));
-        let count: i64 = conn.query_row(HEALTH_COUNT_SQL, [], |r| r.get(0)).unwrap();
+        let (count, bytes): (i64, i64) = conn
+            .query_row(HEALTH_COUNT_SQL, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
         assert_eq!(count, 2, "replaced, never appended");
+        let a = serde_json::to_string(&record("a.0", 1, 6, 2))
+            .unwrap()
+            .len();
+        let b = serde_json::to_string(&record("b.0", 2, 1, 1))
+            .unwrap()
+            .len();
+        assert_eq!(bytes as usize, a + b, "totalBytes");
         let back = select(&conn);
         assert_eq!(
             back.iter()
@@ -376,9 +606,22 @@ mod tests {
             bytes: 51_000.0,
             age_secs: Some(180.0),
         };
-        let v = health_view(1, &[row]);
+        let v = health_view(1, 51_000, &[row]);
         assert_eq!(v["readable"], true);
         assert_eq!(v["count"], 1);
+        assert_eq!(v["totalBytes"], 51_000);
+        assert_eq!(
+            (
+                v["budget"]["maxRows"].clone(),
+                v["budget"]["maxTotalBytes"].clone(),
+                v["budget"]["staleSecs"].clone()
+            ),
+            (
+                serde_json::json!(256),
+                serde_json::json!(64u64 << 20),
+                serde_json::json!(108_000)
+            )
+        );
         assert_eq!(v["oldest"]["outpoint"], "a.0");
         assert_eq!(
             v["graphs"][0],
@@ -388,7 +631,7 @@ mod tests {
         );
         assert_eq!(v["budget"]["calls"], GASP_GRAPH_BUDGET_CALLS);
         assert_eq!(v["budget"]["ms"], GASP_GRAPH_BUDGET_MS);
-        let none = health_view(0, &[]);
+        let none = health_view(0, 0, &[]);
         assert_eq!(
             (none["count"].clone(), none["oldest"].clone()),
             (serde_json::json!(0), serde_json::Value::Null)
@@ -419,6 +662,8 @@ mod tests {
                     reason: (*r).into(),
                 })
                 .collect(),
+            stalled_graphs: 0,
+            held_back_graphs: 0,
         };
         let results = std::collections::HashMap::from([
             ("tm_a".to_string(), topic(2, 1, 0, &["max_passes"])),
@@ -439,7 +684,7 @@ mod tests {
             ]
         );
         let names = counter_names();
-        assert_eq!(names.len(), 4 + 9);
+        assert_eq!(names.len(), 5 + 10);
         assert!(names.contains(&"gasp_graph_dropped_root_proven_total".to_string()));
     }
 }
