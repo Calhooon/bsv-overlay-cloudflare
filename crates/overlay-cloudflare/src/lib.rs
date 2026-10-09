@@ -2661,3 +2661,8 @@ mod arcade_vector_replay;
 
 #[cfg(test)]
 mod beef_door_replay;
+
+// bsv-low #585 (E585-land): the stored-rows reader, a native test-only tool
+// that reads a D1 export through the Worker's own readers.
+#[cfg(test)]
+mod stored_rows;
