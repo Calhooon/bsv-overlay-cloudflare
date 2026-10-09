@@ -1620,10 +1620,18 @@ async fn p2pkh_hop_chain(key: &PrivateKey, hops: usize, sats: u64) -> Transactio
 }
 
 /// What the door charges LOW's shapes: every one under a QUARTER of the work
-/// budget. The two covenant legs are real mainnet bytes; no JOIN is among
-/// this file's fixtures, so the JOIN is built here in its shape (nine seats,
-/// each coin three unproven P2PKH hops deep, joined by one transaction), and
-/// the 30-hop ancestry is the one `DoorBudget`'s doc names.
+/// budget, and of the memory limb. The two covenant legs are real mainnet
+/// bytes. LOW's JOIN is TWO seats (bsv-low `low-spend/tests/
+/// template_tx_sizes.rs:76`, "the app's JOIN shape: two P2PKH hops"; the
+/// real funding fixture here is one: two P2PKH inputs, the 3,150 byte pot
+/// lock, no change), built here over the real pot lock with each seat's coin
+/// 40 unproven P2PKH hops deep: the deepest unproven ancestry the fleet's
+/// record names (bsv-low `DECISION-LOG-spite-relay-2026-07.md:1327`: a
+/// JOIN-funding hop whose BEEF dragged "its entire ~40-tx" ancestry, before
+/// the harness fetched proofs; an honest seat's chain since is shallower).
+/// The nine-seat JOIN three hops deep is NOT LOW's shape (the delta lens
+/// E585-D12-DELTA-N5): it is kept as a STRESS shape. The 30-hop ancestry is
+/// the one `DoorBudget`'s doc names.
 #[tokio::test]
 async fn door_low_shapes_sit_under_a_quarter_of_the_work_budget() {
     let engine = engine(None);
@@ -1655,9 +1663,37 @@ async fn door_low_shapes_sit_under_a_quarter_of_the_work_budget() {
         rows.push((name, leg.beef.len(), stats));
     }
 
-    // The JOIN: nine seats' coins, each three unproven hops deep.
     let key = PrivateKey::from_hex(&"11".repeat(32)).expect("a fixed key");
     let lock = P2PKH::new().lock(&key.public_key().hash160()).unwrap();
+
+    // LOW's JOIN: two seats, each coin 40 unproven hops deep, paying the
+    // real pot lock and no change.
+    let pot_lock = Transaction::from_hex(ENFORCED_FUNDING_HEX.trim())
+        .expect("the real JOIN")
+        .outputs[0]
+        .locking_script
+        .clone();
+    let mut join = Transaction::new();
+    for seat in 0..2 {
+        let tip = p2pkh_hop_chain(&key, 40, 10_000 + seat).await;
+        join.add_input_from_tx(tip, 0, P2PKH::unlock(&key, SignOutputs::All, false))
+            .unwrap();
+    }
+    join.outputs.push(TransactionOutput::new(19_000, pot_lock));
+    join.sign().await.expect("the JOIN signs");
+    let join_beef = join.to_beef(false).expect("the JOIN's BEEF");
+    let stats = engine
+        .verify_scripts_only(&join_beef, &join.id())
+        .await
+        .expect("LOW's JOIN passes the door");
+    assert_eq!(stats.inputs_executed, 2 + 2 * 40);
+    rows.push((
+        "LOW's JOIN: two seats, 40 hops each (real pot lock)",
+        join_beef.len(),
+        stats,
+    ));
+
+    // A STRESS shape, not LOW's: nine seats' coins, each three hops deep.
     let mut join = Transaction::new();
     for seat in 0..9 {
         // A stake per seat, so the nine ancestries are nine.
@@ -1674,7 +1710,7 @@ async fn door_low_shapes_sit_under_a_quarter_of_the_work_budget() {
         .expect("the JOIN passes the door");
     assert_eq!(stats.inputs_executed, 9 + 9 * 3);
     rows.push((
-        "a JOIN of nine seats, three hops each",
+        "stress: a JOIN of nine seats, three hops each",
         join_beef.len(),
         stats,
     ));
@@ -1692,12 +1728,14 @@ async fn door_low_shapes_sit_under_a_quarter_of_the_work_budget() {
     for (name, body, stats) in &rows {
         println!(
             "door, LOW shape: {name}: body {body} bytes, {} inputs, {} hash ops, {} signature \
-             checks, work {} = {:.1} % of the budget",
+             checks, work {} = {:.1} % of the budget, memory {} = {:.2} % of the limb",
             stats.inputs_executed,
             stats.hash_ops,
             stats.sig_ops,
             stats.work_bytes,
-            stats.work_bytes as f64 * 100.0 / DoorBudget::DEFAULT.max_work_bytes as f64
+            stats.work_bytes as f64 * 100.0 / DoorBudget::DEFAULT.max_work_bytes as f64,
+            stats.memory_bytes,
+            stats.memory_bytes as f64 * 100.0 / DoorBudget::DEFAULT.max_memory_bytes as f64
         );
         assert!(
             stats.work_bytes < quarter,
@@ -1705,8 +1743,14 @@ async fn door_low_shapes_sit_under_a_quarter_of_the_work_budget() {
             stats.work_bytes,
             DoorBudget::DEFAULT.max_work_bytes
         );
+        assert!(
+            stats.memory_bytes < DoorBudget::DEFAULT.max_memory_bytes / 4,
+            "{name} is charged {} of a memory limb of {}",
+            stats.memory_bytes,
+            DoorBudget::DEFAULT.max_memory_bytes
+        );
     }
     // The 30 hops and the settle together, the shape the budget was sized for.
-    let together = rows[0].2.work_bytes + rows[3].2.work_bytes;
+    let together = rows[0].2.work_bytes + rows[4].2.work_bytes;
     assert!(together < quarter, "{together}");
 }

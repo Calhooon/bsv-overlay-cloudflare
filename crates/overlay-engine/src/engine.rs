@@ -541,7 +541,20 @@ pub struct DoorBudget {
     /// lens E585-D12-L3): what the index, the stream's element in hand and
     /// the walk's layout of a transaction hold, estimated from the frame's
     /// lengths and counts by [`crate::stream_sizing::estimate`] BEFORE the
-    /// stream is opened.
+    /// stream is opened; and, per input, what its two scripts hold once
+    /// parsed and run (the delta lens E585-D12-DELTA-M1: bsv-rs's chunk
+    /// records, their clones, a signature's subscript, the empty stack
+    /// entries the interpreter's memory limit does not count), charged from
+    /// the scripts' chunk count and bytes BEFORE either is parsed
+    /// (`script_door::script_parse_charge`, 512 bytes a chunk and 8 a byte).
+    ///
+    /// How the two compose: the frame's estimate is the most the walk holds
+    /// at any moment apart from the input being run (what is kept, and the
+    /// heaviest transaction in hand, counted once with its raw bytes and the
+    /// interpreter's raw copies of the unlocking script); the scripts' charge
+    /// is the EXPANSION of one input's scripts past those bytes, held while
+    /// that input runs and released after it. An input is run only while the
+    /// frame's estimate plus its own charge is within this limb.
     pub max_memory_bytes: u64,
 }
 
@@ -554,13 +567,19 @@ impl DoorBudget {
     ///
     /// THE FLOOR, 64 KiB (half the hash charge), chosen against LOW's shapes
     /// as the pin `door_low_shapes_sit_under_a_quarter_of_the_work_budget`
-    /// measures them: the real covenant settle and refund (5 hash opcodes, 4
-    /// signature checks: a CHECKSIG and the stated `OP_3` CHECKMULTISIG)
-    /// 924,112 bytes each, 1.4 % of the budget (676,284 before the floor); a
-    /// JOIN of nine seats whose coins are three unproven P2PKH hops deep (36
-    /// inputs; built in the pin, no JOIN is among its fixtures) 7,082,619,
-    /// 10.6 % (4,740,838); a coin 30 P2PKH hops deep 5,902,188, 8.8 %
-    /// (3,941,856). A P2PKH input is charged 196,739 bytes (a hash opcode at
+    /// measures them (work, of the 64 MiB; memory, the frame's and the
+    /// largest input's scripts, of the 48 MiB limb; work before the floor in
+    /// brackets):
+    ///
+    /// | shape | inputs | work | memory |
+    /// |---|---|---|---|
+    /// | the real covenant settle (5 hash opcodes, 4 checks: a CHECKSIG and the stated `OP_3` CHECKMULTISIG) | 1 | 924,112, 1.4 % (676,284) | 1,282,178, 2.55 % |
+    /// | the real covenant refund | 1 | 924,112, 1.4 % (676,284) | 1,282,178, 2.55 % |
+    /// | LOW's JOIN: two seats (bsv-low `template_tx_sizes.rs:76`), the real pot lock, each coin 40 unproven P2PKH hops deep (the deepest the fleet's record names) | 82 | 16,132,638, 24.0 % | 67,026, 0.13 % |
+    /// | STRESS, not LOW's shape: nine seats, three hops each | 36 | 7,082,619, 10.6 % (4,740,838) | 36,420, 0.07 % |
+    /// | a coin 30 P2PKH hops deep | 30 | 5,902,188, 8.8 % (3,941,856) | 23,720, 0.05 % |
+    ///
+    /// A P2PKH input is charged 196,739 bytes (a hash opcode at
     /// the element limit, a check at the floor, its 131 script bytes): 341 of
     /// them are the budget, 85 a quarter of it. The bound on EC verifications
     /// per walk is 64 MiB / 64 KiB = 1,024 (1,023 with their script bytes):
@@ -577,10 +596,15 @@ impl DoorBudget {
     /// it lets through, by the door's charges (`script_door::DOOR_CHARGES`,
     /// each an upper bound: the pins measure 1.3 to 5.3 times the heap the
     /// walk reaches): a BUMP of up to 72,944 leaves (690 bytes a level-0
-    /// leaf); a single transaction of up to about 12 MB (4 bytes a byte); a
-    /// 10 MB body of one-input, one-output P2PKH transactions (191 bytes,
-    /// charged 570: 30 MB). What it stops: 111,848 transactions of no input
-    /// and no output, whatever follows them.
+    /// leaf); a single transaction of up to about 12 MB (4 bytes a byte)
+    /// whose walked inputs' scripts are few chunks (a script is charged 520
+    /// bytes a one-byte opcode and 8 a pushed byte: an input whose two
+    /// scripts are about 96,000 opcodes, or a 1 MB `OP_NOP` lock, is past
+    /// the limb before it is parsed, the network judges; LOW's covenant leg,
+    /// 6,608 script bytes, is charged 1.3 MB); a 10 MB body of one-input,
+    /// one-output P2PKH transactions (191 bytes, charged 570: 30 MB). What it
+    /// stops: 111,848 transactions of no input and no output, whatever
+    /// follows them.
     ///
     /// THE OPEN RESIDUAL (the W-A gate's delta-verify, 2026-09-09, measured):
     /// the interpreter itself meters nothing, so two classes stay charged
@@ -639,8 +663,9 @@ pub struct WalkStats {
     pub sig_ops: usize,
     /// The static work estimate charged against the budget.
     pub work_bytes: u64,
-    /// The memory estimate charged against the budget, made from the frame
-    /// before the stream was opened.
+    /// The memory estimate charged against the budget: the frame's, made
+    /// before the stream was opened, plus the largest charge of one walked
+    /// input's scripts, made before they were parsed.
     pub memory_bytes: u64,
     /// Whether the SUBJECT's own inputs were all executed (an ancestor may
     /// still have faulted afterwards).

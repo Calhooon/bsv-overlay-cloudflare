@@ -51,6 +51,13 @@
 //! COUNT and a BUMP's LEAVES, not its bytes (an index entry per transaction,
 //! a `Leaf` and four table entries per leaf while the stream computes a
 //! root). It is estimated by the sizing read and never spent past the limb.
+//! And per input, what the SCRIPTS cost once parsed (the delta lens
+//! E585-D12-DELTA-M1): bsv-rs cuts a script into one 32 byte record per
+//! chunk, several times over, and the interpreter can push up to three
+//! stack entries per opcode, so a script of one-byte opcodes is about 32 to
+//! 230 bytes of heap a byte. That is charged from the script's chunk count
+//! ([`script_parse_charge`]), beside the frame's estimate, BEFORE the input's
+//! scripts are parsed.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -60,7 +67,7 @@ use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript}
 use bsv_rs::transaction::beef_stream::{display_hex, BeefStream, Element, Hash32};
 
 use crate::engine::{script_census, DoorBudget, DoorLimb, EngineError, WalkStats};
-use crate::stream_sizing::{self, StreamCharges};
+use crate::stream_sizing::{self, Admission, StreamCharges};
 
 /// What the door holds per thing of a BEEF, for the sizing read: the stream's
 /// own element ([`StreamCharges::STREAM`]) and the door's.
@@ -81,7 +88,8 @@ use crate::stream_sizing::{self, StreamCharges};
 /// record of 64 bytes an input and 32 an output three times: 3 bytes a byte,
 /// 192 an input, 96 an output), and one more copy for the interpreter's own
 /// serialization of the outputs: 4 bytes a byte, 360 an input, 168 an output.
-/// A BUMP leaf is the stream's.
+/// A BUMP leaf is the stream's. What an input's scripts hold once PARSED is
+/// not a frame charge: it is charged per input ([`script_parse_charge`]).
 pub(crate) const DOOR_CHARGES: StreamCharges = StreamCharges {
     kept_tx: 450,
     kept_input: 96,
@@ -92,6 +100,97 @@ pub(crate) const DOOR_CHARGES: StreamCharges = StreamCharges {
     tx_output: 168,
     bump_leaf: StreamCharges::STREAM.bump_leaf,
 };
+
+/// What one input's two scripts hold once parsed and run, per CHUNK of each
+/// (the delta lens E585-D12-DELTA-M1). bsv-rs 0.4.0 cuts a script into one
+/// `ScriptChunk` of 32 bytes per chunk (natively; 16 on wasm32): the census
+/// parses and clones both scripts, `Spend::new` parses and clones them again
+/// and holds them, a reached signature check clones the script and its chunks
+/// once more for the subscript, and the interpreter pushes up to three stack
+/// entries of 24 bytes per opcode (`OP_3DUP`), which its memory limit does
+/// not count when they are empty. Measured (`tests/script_door_parse.rs`,
+/// the peak of the live heap of a walk over one input whose lock is 262,145
+/// chunks, one past a power of two so every growing buffer is at its
+/// slackest; bytes a chunk, the frame's own 4 a byte included): `OP_NOP`
+/// 98.0, `OP_0` 169.0, `OP_NOP`s then a reached `OP_CHECKSIG` 162.0,
+/// `OP_3DUP` 241.0, and 258.0 with a reached `OP_CHECKSIG` after them, the
+/// worst measured. Pushes cost less a byte (`0x01 xx OP_DROP` 66.7, `0x01 xx`
+/// unlocking 62.5). The charge is 512 a chunk (520 with the byte's 8): 2.0
+/// times the worst measured, and above the three parts at their worst at
+/// once (the records and their clone up to 96, three stack entries in a
+/// buffer that grows up to 216, the subscript's copies about 100).
+pub(crate) const SCRIPT_CHARGE_PER_CHUNK: u64 = 512;
+
+/// What one input's two scripts hold once parsed and run, per BYTE of each,
+/// past the frame's own charge of the transaction in hand (the delta lens
+/// E585-D12-DELTA-M1): a pushed byte's copies in the chunk records, their
+/// clone and the subscript's. Measured: ten 100,000 byte pushes dropped, then
+/// a reached `OP_CHECKSIG`, 6.7 bytes a byte of peak, the frame's 4 included
+/// (2.7 past it). Charged 8. The frame (`DOOR_CHARGES.tx_byte`) already
+/// counts the transaction in hand, the interpreter's raw copies of the
+/// unlocking script among them; this counts what the PARSE adds.
+pub(crate) const SCRIPT_CHARGE_PER_BYTE: u64 = 8;
+
+/// The chunks bsv-rs 0.4.0's `Script::parse_chunks` cuts `script` into,
+/// counted with no allocation: a push (`0x01..=0x4b`, `OP_PUSHDATA1/2/4`) is
+/// one chunk with its data, cut short at the script's end as the SDK cuts it;
+/// an `OP_RETURN` outside a conditional is one chunk with everything after it;
+/// any other byte is one chunk. Pinned against the SDK's own parse
+/// (`e585f2_m1_the_chunk_count_is_the_sdks`): re-proven at every bsv-rs bump.
+pub(crate) fn chunk_count(script: &[u8]) -> u64 {
+    use bsv_rs::script::op::{
+        OP_ENDIF, OP_IF, OP_NOTIF, OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4, OP_RETURN, OP_VERIF,
+        OP_VERNOTIF,
+    };
+    let len = script.len();
+    let (mut at, mut chunks, mut depth) = (0usize, 0u64, 0usize);
+    let width = |at: usize, n: usize| {
+        (0..n).fold(0usize, |acc, i| {
+            acc | usize::from(script.get(at + i).copied().unwrap_or(0)) << (8 * i)
+        })
+    };
+    while at < len {
+        let op = script[at];
+        at += 1;
+        chunks += 1;
+        if op == OP_RETURN && depth == 0 {
+            break;
+        }
+        if matches!(op, OP_IF | OP_NOTIF | OP_VERIF | OP_VERNOTIF) {
+            depth += 1;
+        } else if op == OP_ENDIF {
+            depth = depth.saturating_sub(1);
+        }
+        let header = match op {
+            OP_PUSHDATA1 => 1,
+            OP_PUSHDATA2 => 2,
+            OP_PUSHDATA4 => 4,
+            _ => 0,
+        };
+        let pushed = if op > 0 && op < OP_PUSHDATA1 {
+            usize::from(op)
+        } else if header > 0 {
+            let n = width(at, header);
+            at = (at + header).min(len);
+            n
+        } else {
+            0
+        };
+        at = at.saturating_add(pushed).min(len);
+    }
+    chunks
+}
+
+/// What one input's scripts hold once parsed and run, beside the frame's
+/// estimate: [`SCRIPT_CHARGE_PER_CHUNK`] a chunk and
+/// [`SCRIPT_CHARGE_PER_BYTE`] a byte of both scripts.
+pub(crate) fn script_parse_charge(unlocking: &[u8], locking: &[u8]) -> u64 {
+    (chunk_count(unlocking) + chunk_count(locking))
+        .saturating_mul(SCRIPT_CHARGE_PER_CHUNK)
+        .saturating_add(
+            ((unlocking.len() + locking.len()) as u64).saturating_mul(SCRIPT_CHARGE_PER_BYTE),
+        )
+}
 
 /// Where a raw transaction lies in the body.
 #[derive(Debug, Clone, Copy)]
@@ -301,20 +400,23 @@ pub(crate) fn walk(
         limb: DoorLimb::Memory,
         what,
     };
-    if let Some(at) = sized.over_at {
+    let admission = sized.admission();
+    if admission == Admission::Over {
         return Err(over_memory(format!(
             "estimated memory {} bytes exceeds the door memory budget of {} (the element at byte \
-             {at} of the BEEF)",
-            sized.bytes, budget.max_memory_bytes
+             {} of the BEEF)",
+            sized.bytes,
+            budget.max_memory_bytes,
+            sized.over_at.unwrap_or_default()
         )));
     }
     stats.memory_bytes = sized.bytes;
     let index = DoorIndex::read(beef_bytes)?;
-    if !sized.read {
+    if admission == Admission::Unfollowed {
         // The stream read a frame the sizing read did not follow, so what was
-        // just held was never estimated. No body is known to do this (the pin
-        // `e585f_l3_the_sizing_follows_every_frame_the_stream_reads`); if a
-        // later SDK reads a frame this reader does not, the walk stops here.
+        // just held was never estimated (`Admission::Unfollowed`, the rule
+        // the census follows too). No body is known to do this; if a later
+        // SDK reads a frame this reader does not, the walk stops here.
         return Err(over_memory(
             "the sizing read did not follow a BEEF the stream read: memory not estimated".into(),
         ));
@@ -427,8 +529,27 @@ pub(crate) fn walk(
                     format!("satoshi total overflows in transaction {txid}"),
                 )
             })?;
-            // The door's static charge for this input (nothing has run yet).
             let unlocking_bytes = &raw[input.script.clone()];
+            // The memory of this input's scripts once parsed and run, beside
+            // the frame's estimate, charged BEFORE either is parsed (the
+            // delta lens E585-D12-DELTA-M1). It is held for this input only.
+            let held = sized
+                .bytes
+                .saturating_add(script_parse_charge(unlocking_bytes, locking_bytes));
+            if held > budget.max_memory_bytes {
+                return Err(EngineError::ScriptWalkOverBudget {
+                    at_txid: txid.clone(),
+                    subject_judged: judged,
+                    limb: DoorLimb::Memory,
+                    what: format!(
+                        "estimated memory {held} bytes exceeds the door memory budget of {} \
+                         (the scripts of input {vin} of {txid}, before their parse)",
+                        budget.max_memory_bytes
+                    ),
+                });
+            }
+            stats.memory_bytes = stats.memory_bytes.max(held);
+            // The door's static charge for this input (nothing has run yet).
             let (bytes, hash_ops, sig_ops) =
                 script_census(unlocking_bytes, locking_bytes, budget.memory_limit).map_err(
                     |e| {
@@ -768,6 +889,122 @@ mod tests {
         assert!(
             read >= 500 && refused >= 500,
             "{read} read, {refused} refused"
+        );
+    }
+
+    /// ONE ADMISSION RULE (the delta lens E585-D12-DELTA-N1), the door's and
+    /// the census's: a frame followed within the limit is `Open`, one past it
+    /// `Over`, one the sizing read did not follow `Unfollowed`.
+    #[test]
+    fn e585f2_n1_the_admission_rule() {
+        use stream_sizing::Admission;
+        let body = {
+            let mut beef = bsv_rs::transaction::Beef::new();
+            beef.merge_raw_tx(raw_tx(1, &[&[0x51]]), None);
+            beef.to_binary()
+        };
+        let at = |bytes: &[u8], limit| stream_sizing::estimate(bytes, &DOOR_CHARGES, limit);
+        assert_eq!(at(&body, u64::MAX).admission(), Admission::Open);
+        assert_eq!(at(&body, 1).admission(), Admission::Over);
+        assert_eq!(
+            at(&body[..body.len() - 1], u64::MAX).admission(),
+            Admission::Unfollowed
+        );
+        // The door answers an unfollowed frame the stream refuses with the
+        // stream's own refusal, as before the rule.
+        assert!(matches!(
+            walk(&body[..body.len() - 1], "00", DoorBudget::DEFAULT),
+            Err(EngineError::BeefParseError(_))
+        ));
+    }
+
+    /// THE CHUNK COUNT IS THE SDK'S (the delta lens E585-D12-DELTA-M1). The
+    /// memory limb charges an input's scripts by their chunk count before
+    /// either is parsed; the count is a second reader of the script, so it is
+    /// held equal to bsv-rs's own parse over every edge the parser has (each
+    /// push width cut short, an `OP_RETURN` inside and outside a conditional,
+    /// an `OP_ENDIF` with no `OP_IF`) and 20,000 random scripts biased toward
+    /// those bytes. Re-run at every bsv-rs bump.
+    #[test]
+    fn e585f2_m1_the_chunk_count_is_the_sdks() {
+        use bsv_rs::script::op::*;
+        let sdk = |bytes: &[u8]| {
+            Script::from_binary(bytes)
+                .expect("any bytes are a script")
+                .chunks()
+                .len() as u64
+        };
+        let mut edges: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![OP_NOP; 10],
+            vec![0x4b],
+            vec![0x05, 1, 2],
+            vec![OP_PUSHDATA1],
+            vec![OP_PUSHDATA1, 9, 1],
+            vec![OP_PUSHDATA2, 0x01],
+            vec![OP_PUSHDATA2, 0x02, 0x00, 7, 7, OP_1],
+            vec![OP_PUSHDATA4, 1, 0, 0],
+            vec![OP_PUSHDATA4, 1, 0, 0, 0, 9, OP_2],
+            vec![OP_1, OP_RETURN, OP_1, 0x05, OP_2],
+            vec![OP_RETURN],
+            vec![OP_IF, OP_RETURN, OP_ENDIF, OP_1],
+            vec![
+                OP_NOTIF, OP_VERIF, OP_ENDIF, OP_RETURN, OP_1, OP_ENDIF, OP_RETURN, 1, 2,
+            ],
+            vec![OP_ENDIF, OP_ENDIF, OP_RETURN, 0x01],
+            vec![OP_VERNOTIF, OP_ENDIF, OP_RETURN],
+        ];
+        let interesting = [
+            0x00,
+            0x01,
+            0x02,
+            0x4b,
+            OP_PUSHDATA1,
+            OP_PUSHDATA2,
+            OP_PUSHDATA4,
+            OP_RETURN,
+            OP_IF,
+            OP_NOTIF,
+            OP_VERIF,
+            OP_VERNOTIF,
+            OP_ENDIF,
+            OP_NOP,
+            OP_1,
+            0xff,
+        ];
+        let mut seed: u64 = 0x5eed_e585;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..20_000 {
+            let len = next() % 40;
+            let script: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = next();
+                    if r % 3 == 0 {
+                        (r >> 8) as u8
+                    } else {
+                        interesting[(r >> 8) % interesting.len()]
+                    }
+                })
+                .collect();
+            edges.push(script);
+        }
+        for script in &edges {
+            assert_eq!(
+                chunk_count(script),
+                sdk(script),
+                "{}",
+                bsv_rs::primitives::to_hex(script)
+            );
+        }
+        // The charge: a chunk and a byte of each script, both scripts.
+        assert_eq!(
+            script_parse_charge(&[OP_1], &[OP_NOP, OP_NOP]),
+            3 * SCRIPT_CHARGE_PER_CHUNK + 3 * SCRIPT_CHARGE_PER_BYTE
         );
     }
 

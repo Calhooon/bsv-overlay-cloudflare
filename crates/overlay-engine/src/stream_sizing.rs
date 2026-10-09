@@ -88,6 +88,38 @@ pub struct StreamEstimate {
     pub read: bool,
 }
 
+/// What a reader of the stream does with the estimate, before it opens the
+/// stream. ONE rule for every reader (the script door and the census; the
+/// delta lens E585-D12-DELTA-N1, Rule 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// The frame was followed to its end within the limit: open the stream.
+    Open,
+    /// The estimate passed the limit: do NOT open the stream.
+    Over,
+    /// The frame was not followed to its end, under the limit. The stream
+    /// refuses every such frame today (the pin
+    /// `e585f_l3_the_sizing_follows_every_frame_the_stream_reads`, re-run at
+    /// every bsv-rs bump), so the reader opens it and takes its refusal; a
+    /// read the stream DOES make of such bytes was not estimated, and the
+    /// reader answers it as over the limit, after the fact.
+    Unfollowed,
+}
+
+impl StreamEstimate {
+    /// The rule of [`Admission`].
+    #[must_use]
+    pub fn admission(&self) -> Admission {
+        if self.over_at.is_some() {
+            Admission::Over
+        } else if self.read {
+            Admission::Open
+        } else {
+            Admission::Unfollowed
+        }
+    }
+}
+
 /// Estimates what a read of `body` holds under `charges`, stopping at the
 /// first element that takes it past `limit`.
 #[must_use]

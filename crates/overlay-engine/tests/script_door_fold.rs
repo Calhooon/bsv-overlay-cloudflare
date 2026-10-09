@@ -512,29 +512,38 @@ fn funding_of(outputs: Vec<TransactionOutput>) -> Transaction {
     proven(tx)
 }
 
-/// A MIXED transaction: inputs 0 and 2 check no signature (run with no copy
-/// of the transaction), input 1 is a P2PKH signed SIGHASH_ALL.
-async fn mixed_transaction() -> Transaction {
+/// A MIXED transaction of three inputs (the table's has `signed` 1): input
+/// `signed` is a P2PKH signed
+/// SIGHASH_ALL | FORKID (`<sig> <key>` over `OP_DUP OP_HASH160 <pkh>
+/// OP_EQUALVERIFY OP_CHECKSIG`), the other two check no signature (`0x01
+/// 0x42` over `OP_DROP OP_1`) and are run with no copy of the transaction.
+async fn mixed_transaction_signed_at(signed: usize) -> Transaction {
     let key = fixed_key();
     let p2pkh = P2PKH::new()
         .lock(&key.public_key().hash160())
         .expect("a P2PKH lock");
-    let funding = funding_of(vec![
-        TransactionOutput::new(1_000, open_lock()),
-        TransactionOutput::new(1_000, p2pkh),
-        TransactionOutput::new(1_000, open_lock()),
-    ]);
+    let funding = funding_of(
+        (0..3)
+            .map(|i| {
+                let lock = if i == signed {
+                    p2pkh.clone()
+                } else {
+                    open_lock()
+                };
+                TransactionOutput::new(1_000, lock)
+            })
+            .collect(),
+    );
     let mut tx = Transaction::new();
-    tx.add_input_from_tx(funding.clone(), 0, open_unlock())
-        .expect("input 0");
-    tx.add_input_from_tx(
-        funding.clone(),
-        1,
-        P2PKH::unlock(&key, SignOutputs::All, false),
-    )
-    .expect("input 1");
-    tx.add_input_from_tx(funding, 2, open_unlock())
-        .expect("input 2");
+    for i in 0..3 {
+        let unlock = if i == signed {
+            P2PKH::unlock(&key, SignOutputs::All, false)
+        } else {
+            open_unlock()
+        };
+        tx.add_input_from_tx(funding.clone(), i as u32, unlock)
+            .expect("an input");
+    }
     tx.outputs.push(TransactionOutput::new(2_500, open_lock()));
     tx.outputs.push(TransactionOutput::new(400, open_lock()));
     tx.sign().await.expect("the mixed transaction signs");
@@ -547,38 +556,54 @@ fn beef_and_subject(tx: &Transaction) -> (Vec<u8>, String) {
 }
 
 /// The mixed transaction, intact and with one thing changed after signing.
-async fn mixed_bodies() -> Vec<(&'static str, Vec<u8>, String)> {
-    let mut bodies = Vec::new();
-    let intact = mixed_transaction().await;
-    let (beef, subject) = beef_and_subject(&intact);
-    bodies.push(("mixed: intact", beef, subject));
+async fn mixed_bodies() -> Vec<(String, Vec<u8>, String)> {
+    mixed_bodies_signed_at(1).await
+}
 
-    let mut tx = mixed_transaction().await;
-    tx.inputs[0].sequence = 7;
+/// The mixed transaction with its signed input at `signed`, intact and with
+/// one thing changed after signing (the names of the bodies with the signed
+/// input at 1 are the table's).
+async fn mixed_bodies_signed_at(signed: usize) -> Vec<(String, Vec<u8>, String)> {
+    let (prefix, sigless) = if signed == 1 {
+        ("mixed", 0)
+    } else {
+        ("mixed, signed first", 1)
+    };
+    let mut bodies = Vec::new();
+    let intact = mixed_transaction_signed_at(signed).await;
+    let (beef, subject) = beef_and_subject(&intact);
+    bodies.push((format!("{prefix}: intact"), beef, subject));
+
+    let mut tx = mixed_transaction_signed_at(signed).await;
+    tx.inputs[sigless].sequence = 7;
     let (beef, subject) = beef_and_subject(&tx);
     bodies.push((
-        "mixed: the sequence of sig-less input 0 changed",
+        format!("{prefix}: the sequence of sig-less input {sigless} changed"),
         beef,
         subject,
     ));
 
-    let mut tx = mixed_transaction().await;
+    let mut tx = mixed_transaction_signed_at(signed).await;
     tx.lock_time = 9;
     let (beef, subject) = beef_and_subject(&tx);
-    bodies.push(("mixed: the lock time changed", beef, subject));
+    bodies.push((format!("{prefix}: the lock time changed"), beef, subject));
 
-    let mut tx = mixed_transaction().await;
+    let mut tx = mixed_transaction_signed_at(signed).await;
     tx.outputs[1].satoshis = Some(399);
     let (beef, subject) = beef_and_subject(&tx);
-    bodies.push(("mixed: an output's value changed", beef, subject));
+    bodies.push((
+        format!("{prefix}: an output's value changed"),
+        beef,
+        subject,
+    ));
 
-    let mut tx = mixed_transaction().await;
-    tx.inputs[0].unlocking_script = Some(UnlockingScript::from_script(
+    let mut tx = mixed_transaction_signed_at(signed).await;
+    tx.inputs[sigless].unlocking_script = Some(UnlockingScript::from_script(
         Script::from_binary(&[0x01, 0x43]).expect("a script"),
     ));
     let (beef, subject) = beef_and_subject(&tx);
     bodies.push((
-        "mixed: the unlocking script of sig-less input 0 changed",
+        format!("{prefix}: the unlocking script of sig-less input {sigless} changed"),
         beef,
         subject,
     ));
@@ -586,25 +611,41 @@ async fn mixed_bodies() -> Vec<(&'static str, Vec<u8>, String)> {
 }
 
 /// THE PIN (N4). The signed input's digest carries the sig-less inputs as
-/// they are in the bytes: changing the sequence of sig-less input 0 (or the
+/// they are in the bytes: changing the sequence of a sig-less input (or the
 /// lock time, or an output) after signing is refused AT THE SIGNED INPUT, by
-/// the interpreter. Changing input 0's unlocking script is not (BIP-143
-/// covers no other input's script), as in the reference.
+/// the interpreter. Changing a sig-less input's unlocking script is not
+/// (BIP-143 covers no other input's script), as in the reference. The
+/// scripts: the mixed transaction's, a P2PKH signed SIGHASH_ALL | FORKID
+/// beside two sig-less `0x01 0x42` over `OP_DROP OP_1`, the signed input
+/// FIRST and then at 1.
+///
+/// RED, by its own assertion (the delta lens E585-D12-DELTA-N3), against the
+/// mutant that runs EVERY input with no copy of its transaction (`if true ||
+/// sig_ops == 0`): "mixed, signed first: intact:
+/// Err(ScriptVerificationFailed { .., input_index: 0, .. })", the digest made
+/// over no other input and no output. The bodies with the signed input first
+/// come first: with it at 1 the mutant's digest indexes an input list of one
+/// and panics inside bsv-rs, which is not this pin's verdict.
 #[test]
 fn e585f_n4_a_tampered_sig_less_input_is_refused_at_the_signed_input() {
     one_at_a_time(async {
         let engine = engine();
-        for (name, beef, subject) in mixed_bodies().await {
-            let verdict = engine.verify_scripts_only(&beef, &subject).await;
-            let accepted = name.ends_with("intact") || name.contains("unlocking script");
-            match verdict {
-                Ok(stats) if accepted => {
-                    assert_eq!((stats.inputs_executed, stats.sig_ops), (3, 1), "{name}");
+        for signed in [0usize, 1] {
+            for (name, beef, subject) in mixed_bodies_signed_at(signed).await {
+                let verdict = engine.verify_scripts_only(&beef, &subject).await;
+                let accepted = name.ends_with("intact") || name.contains("unlocking script");
+                match verdict {
+                    Ok(stats) if accepted => {
+                        assert_eq!((stats.inputs_executed, stats.sig_ops), (3, 1), "{name}");
+                    }
+                    Err(EngineError::ScriptVerificationFailed { input_index, .. }) if !accepted => {
+                        assert_eq!(
+                            input_index as usize, signed,
+                            "{name}: refused at the signed input"
+                        );
+                    }
+                    other => panic!("{name}: {other:?}"),
                 }
-                Err(EngineError::ScriptVerificationFailed { input_index, .. }) if !accepted => {
-                    assert_eq!(input_index, 1, "{name}: refused at the signed input");
-                }
-                other => panic!("{name}: {other:?}"),
             }
         }
     });
@@ -669,11 +710,28 @@ fn outcome(verdict: &Result<WalkStats, EngineError>) -> String {
 /// and sequence opcodes (NOPs since Genesis), `OP_CODESEPARATOR`, a hash and
 /// `OP_VER`, at transaction versions 1 and 2, with a lock time and a
 /// sequence set: what the interpreter reads without a signature is passed on
-/// both paths.
+/// both paths. The scripts: the seven locks of [`reader_locks`], each spent
+/// by `0x01 0x42`, bare and behind `OP_0 OP_IF OP_CHECKSIG OP_ENDIF`.
+///
+/// The pairs guard the SDK (a future introspection opcode would part them),
+/// not the shortcut's condition: under the mutant that runs every input
+/// with no copy both sides lose it and stay equal. So the pin first holds a
+/// CONTROL that needs the copy (the delta lens E585-D12-DELTA-N3): a P2PKH
+/// signed SIGHASH_ALL | FORKID first, beside two sig-less inputs, is walked
+/// `OK inputs=3`. RED, by that assertion, against the mutant: "the control
+/// needs its transaction: REFUSED input 0: The top stack element must be
+/// truthy after script evaluation.".
 #[test]
 fn e585f_n4_a_script_is_judged_the_same_with_and_without_its_transaction() {
     one_at_a_time(async {
         let engine = engine();
+        let control = mixed_transaction_signed_at(0).await;
+        let (beef, subject) = beef_and_subject(&control);
+        let control = outcome(&engine.verify_scripts_only(&beef, &subject).await);
+        assert_eq!(
+            control, "OK inputs=3",
+            "the control needs its transaction: {control}"
+        );
         let (mut accepted, mut refused) = (0, 0);
         for version in [1u32, 2] {
             for (name, lock) in reader_locks() {
@@ -960,7 +1018,7 @@ async fn table_bodies() -> Vec<(String, Vec<u8>, String)> {
     );
 
     for (name, beef, subject) in mixed_bodies().await {
-        add(name, (beef, subject));
+        add(&name, (beef, subject));
     }
     add(
         "CHECKMULTISIG, key count computed",
