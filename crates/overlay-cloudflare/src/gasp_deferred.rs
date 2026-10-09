@@ -1,7 +1,9 @@
 //! bsv-low #555: the DEFERRED GASP graphs (measured on beta as #582).
 //!
 //! A graph whose walk passes its per-graph budget (`Engine::set_graph_budget`,
-//! [`GASP_GRAPH_BUDGET_CALLS`] calls or [`GASP_GRAPH_BUDGET_MS`] in one pass) is
+//! [`GASP_GRAPH_BUDGET_CALLS`] calls or [`GASP_GRAPH_BUDGET_MS`] in one pass;
+//! since bsv-low #586 [`GASP_GRAPH_BUDGET_BYTES`] served or
+//! [`GASP_GRAPH_BUDGET_NODES`] appended, `Engine::set_graph_budget_limbs`) is
 //! deferred by the engine: its partial walk is kept as ONE row of
 //! `gasp_deferred_graphs` per (peer, topic, root outpoint), REPLACED on every
 //! deferral, deleted when the graph converges or is dropped, and resumed by the
@@ -23,6 +25,19 @@ pub const GASP_GRAPH_BUDGET_CALLS: u32 = overlay_engine::gasp::DEFAULT_GRAPH_BUD
 /// the peer's other UTXOs the other half. Under the per-peer budget, as
 /// `Engine::set_graph_budget` asks.
 pub const GASP_GRAPH_BUDGET_MS: u64 = 15_000;
+
+/// Bytes one graph may be SERVED in one pass on this worker (bsv-low #586):
+/// the hex of each node's raw transaction and proof, as the peer sends it and
+/// a record keeps it. The engine's default
+/// ([`overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_BYTES`], 4 MiB). Reached, the
+/// graph is DEFERRED as at the calls (reason `bytes`), never dropped or
+/// refused: a budget per pass, not a limit.
+pub const GASP_GRAPH_BUDGET_BYTES: u64 = overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_BYTES;
+
+/// Nodes one graph may APPEND in one pass on this worker (bsv-low #586). The
+/// engine's default ([`overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_NODES`],
+/// 64). Reached, the graph is deferred (reason `nodes`).
+pub const GASP_GRAPH_BUDGET_NODES: u32 = overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_NODES;
 
 /// The table: one row per deferred graph. `record` is the engine's
 /// `DeferredGraph` as JSON (at most `DEFERRED_GRAPH_MAX_BYTES`, under D1's 2 MB
@@ -323,6 +338,8 @@ pub fn health_view(count: u64, total_bytes: u64, rows: &[HealthRow]) -> serde_js
         "budget": {
             "calls": GASP_GRAPH_BUDGET_CALLS,
             "ms": GASP_GRAPH_BUDGET_MS,
+            "bytesFetched": GASP_GRAPH_BUDGET_BYTES,
+            "nodes": GASP_GRAPH_BUDGET_NODES,
             "maxPasses": overlay_engine::gasp::DEFERRED_GRAPH_MAX_PASSES,
             "maxBytes": overlay_engine::gasp::DEFERRED_GRAPH_MAX_BYTES,
             "perPeerTopic": overlay_engine::gasp::DEFERRED_GRAPHS_PER_PEER_TOPIC,
@@ -943,6 +960,9 @@ mod tests {
         );
         assert_eq!(v["budget"]["calls"], GASP_GRAPH_BUDGET_CALLS);
         assert_eq!(v["budget"]["ms"], GASP_GRAPH_BUDGET_MS);
+        // bsv-low #586: the two limbs, the engine's defaults.
+        assert_eq!(v["budget"]["bytesFetched"], 4u64 << 20);
+        assert_eq!(v["budget"]["nodes"], 64);
         let none = health_view(0, 0, &[]);
         assert_eq!(
             (none["count"].clone(), none["oldest"].clone()),

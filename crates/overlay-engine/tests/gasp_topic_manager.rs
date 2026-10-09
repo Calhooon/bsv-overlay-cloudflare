@@ -9463,3 +9463,173 @@ async fn e555d4_l2_a_quarantined_peer_gone_quiet_is_attended_and_a_yield_lifts_i
     node.tick().await;
     assert_eq!(node.failures().await, 0, "no graph budget: unchanged");
 }
+
+// ============================================================================
+// bsv-low #586 (zanaadu-v2 #377): the per-graph budget's BYTES and NODES limbs.
+// A graph whose walk is served `max_bytes_fetched` bytes in one pass, or
+// appends `max_nodes` nodes, is DEFERRED exactly as at the call budget: the
+// record saved, the cursor held, the walk resumed next pass. Never a drop,
+// never a refusal. `Engine::set_graph_budget_limbs` does not exist on
+// `fbb7fa8`: these pins do not compile there.
+// ============================================================================
+
+// The bytes the peer serves for a node, as the limb counts them: the hex of
+// its raw transaction and of its proof.
+fn served_bytes(node: &GASPNode) -> u64 {
+    (node.raw_tx.len() + node.proof.as_ref().map_or(0, String::len)) as u64
+}
+
+// PIN B. The 8 proven links of #555's pin A, the call budget far above them
+// (100): the BYTES limb is what five nodes weigh. Tick 1 is served five and
+// defers with the reason `bytes`; tick 2 resumes from the record, asks only
+// the three still pending, and the graph lands whole.
+#[tokio::test]
+async fn e586_b_a_graph_past_the_bytes_limb_defers_and_completes_over_two_passes() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[7]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 100, 60_000);
+    let five: u64 = nodes[3..].iter().map(served_bytes).sum();
+    node.engine.set_graph_budget_limbs(five, 64);
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[7, 6, 5, 4, 3]));
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    assert!(topic.errors.is_empty(), "a deferral is not an error");
+    assert_eq!(topic.discarded_graphs, 0, "nothing is discarded");
+    let records = node.store.deferred_graphs();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        record_shape(&records[0]),
+        (5, vec![outpoint_of(&nodes[2])], 5, 1, "bytes".into())
+    );
+    assert_eq!(node.cursor().await, 0, "held below the deferred UTXO");
+    assert!(state.borrow().admitted.is_empty());
+    assert_eq!(node.failures().await, 0, "progress is not a failed attempt");
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[2, 1, 0]), "only what was pending");
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]));
+    assert_eq!(topic.finalized_graphs, 1);
+    assert!(node.store.deferred_graphs().is_empty());
+    assert_eq!(
+        state.borrow().admitted,
+        txids(&nodes, &[0, 1, 2, 3, 4, 5, 6, 7])
+    );
+    assert_eq!(held(&node.store, &nodes).await, vec![(7, 0)]);
+    assert_eq!(node.cursor().await, 1);
+    println!("#586 PIN B: 8 links under a bytes limb of {five} (five nodes): 2 ticks, 8 requests");
+}
+
+// PIN C. The same under the NODES limb: five nodes appended, deferred with
+// the reason `nodes`, completed by the next pass.
+#[tokio::test]
+async fn e586_c_a_graph_past_the_nodes_limb_defers_and_completes_over_two_passes() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[7]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 100, 60_000);
+    node.engine.set_graph_budget_limbs(u64::MAX, 5);
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[7, 6, 5, 4, 3]));
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    assert!(topic.errors.is_empty());
+    assert_eq!(topic.discarded_graphs, 0);
+    let records = node.store.deferred_graphs();
+    assert_eq!(
+        record_shape(&records[0]),
+        (5, vec![outpoint_of(&nodes[2])], 5, 1, "nodes".into())
+    );
+    assert_eq!(node.cursor().await, 0);
+    assert!(state.borrow().admitted.is_empty());
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[2, 1, 0]));
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]));
+    assert_eq!(topic.finalized_graphs, 1);
+    assert!(node.store.deferred_graphs().is_empty());
+    assert_eq!(
+        state.borrow().admitted,
+        txids(&nodes, &[0, 1, 2, 3, 4, 5, 6, 7])
+    );
+    assert_eq!(node.cursor().await, 1);
+}
+
+// PIN D. A limb is a budget per PASS, never a size limit: with a bytes limb
+// of ONE byte every node is bigger than the whole budget, and each pass still
+// walks one. The 8 links land on the eighth tick, one request a tick, through
+// one record; no pass is an error, a drop or a discarded graph. And the
+// resumes of one sync SHARE the limb (M1): two deferred graphs of one topic
+// under a nodes limb of 2 resume as one budget, the second held back.
+#[tokio::test]
+async fn e586_d_a_node_bigger_than_the_limb_is_walked_and_resumes_share_the_limb() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[7]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 100, 60_000);
+    node.engine.set_graph_budget_limbs(1, 64);
+    for tick in 0..7 {
+        let (topic, sent) = node.tick().await;
+        assert_eq!(sent, txids(&nodes, &[7 - tick]), "tick {tick}: one node");
+        assert_eq!(deferral(&topic).0, 1, "tick {tick}: deferred");
+        assert_eq!(deferral(&topic).3, Vec::<String>::new(), "tick {tick}");
+        assert!(topic.errors.is_empty(), "tick {tick}");
+        assert_eq!(topic.discarded_graphs, 0, "tick {tick}");
+        let records = node.store.deferred_graphs();
+        assert_eq!((records.len(), records[0].nodes.len()), (1, tick + 1));
+        assert_eq!(records[0].reason, "bytes");
+    }
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[0]));
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]));
+    assert_eq!(state.borrow().admitted.len(), 8);
+    assert_eq!(node.cursor().await, 1);
+
+    // Two chains of 6, both tips listed, a nodes limb of 2.
+    let (one, two) = (salted_chain(6, 1), salted_chain(6, 2));
+    let all: Vec<GASPNode> = one.iter().chain(&two).cloned().collect();
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&all, &[5, 11]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 100, 60_000);
+    node.engine.set_graph_budget_limbs(u64::MAX, 2);
+    // Tick 1: each fresh walk has its own limb.
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&all, &[5, 4, 11, 10]));
+    assert_eq!(deferral(&topic), (2, 0, 0, vec![]));
+    // Tick 2: the resumes share ONE limb of 2; the second record is held
+    // back untouched.
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&all, &[3, 2]));
+    assert_eq!((topic.resumed_graphs, topic.held_back_graphs), (1, 1));
+    let passes: Vec<u32> = node
+        .store
+        .deferred_graphs()
+        .iter()
+        .map(|r| r.passes)
+        .collect();
+    assert_eq!(
+        passes.iter().sum::<u32>(),
+        3,
+        "one record resumed: {passes:?}"
+    );
+}

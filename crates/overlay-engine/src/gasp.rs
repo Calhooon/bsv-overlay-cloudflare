@@ -399,6 +399,20 @@ pub const DEFAULT_GRAPH_BUDGET_CALLS: u32 = 100;
 /// graph the per-peer deadline cuts first is deferred all the same.
 pub const DEFAULT_GRAPH_BUDGET_MS: u64 = 60_000;
 
+/// Default per-GRAPH bytes budget (bsv-low #586): the bytes of the nodes ONE
+/// graph's walk may be SERVED in one pass before it is deferred, counted as
+/// the peer serves them and as a record keeps them (the hex of each node's
+/// raw transaction and of its proof, every answer counted, a repeat too).
+/// 4 MiB: seven times Zanaadu's largest legitimate graph (12 nodes, 565 KB
+/// fetched). A BUDGET PER PASS, not a limit: the walk makes at least one
+/// request a pass whatever its size, and what the pass leaves is resumed.
+pub const DEFAULT_GRAPH_BUDGET_BYTES: u64 = 4 << 20;
+
+/// Default per-GRAPH node budget (bsv-low #586): the nodes ONE graph's walk
+/// may APPEND in one pass before it is deferred (five times those 12). As
+/// [`DEFAULT_GRAPH_BUDGET_BYTES`], a budget per pass that resumes.
+pub const DEFAULT_GRAPH_BUDGET_NODES: u32 = 64;
+
 /// A deferred graph whose record has been deferred this many passes is
 /// dropped at its next resume (reason `max_passes`) and its UTXO fails as a
 /// failed ingest does: the gap guard asks for it again and the next pass
@@ -434,12 +448,57 @@ pub const DEFERRED_GRAPH_MAX_IDLE_FAULTS: u32 = 3;
 pub struct GraphBudget<'a> {
     /// Calls one graph may make in one pass ([`DEFAULT_GRAPH_BUDGET_CALLS`]).
     pub max_calls: u32,
+    /// Bytes one graph may be served in one pass
+    /// ([`DEFAULT_GRAPH_BUDGET_BYTES`], bsv-low #586). Reached, the graph is
+    /// DEFERRED as at `max_calls` (reason `bytes`): never dropped, never
+    /// refused.
+    pub max_bytes_fetched: u64,
+    /// Nodes one graph may append in one pass
+    /// ([`DEFAULT_GRAPH_BUDGET_NODES`], bsv-low #586). Reached, the graph is
+    /// deferred (reason `nodes`).
+    pub max_nodes: u32,
     /// A fresh deadline for ONE graph's pass ([`DEFAULT_GRAPH_BUDGET_MS`]).
     pub deadline: Box<dyn Fn() -> crate::engine::SleepFuture + 'a>,
     /// A fresh deadline for HALF of it (the delta-2 fold's D2-L1): a FRESH
     /// walk that faults once this fell due, or after half its calls, has
     /// paid for a record and keeps one. `None`: the calls alone decide.
     pub half_deadline: Option<Box<dyn Fn() -> crate::engine::SleepFuture + 'a>>,
+}
+
+impl GraphBudget<'_> {
+    /// What one pass of one graph may spend.
+    fn pass(&self) -> PassCap {
+        PassCap {
+            calls: self.max_calls,
+            bytes: self.max_bytes_fetched,
+            nodes: self.max_nodes,
+        }
+    }
+}
+
+/// What one pass of a graph's walk may still spend of the per-graph budget's
+/// three counted limbs (its time is a deadline): calls made, bytes served,
+/// nodes appended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassCap {
+    calls: u32,
+    bytes: u64,
+    nodes: u32,
+}
+
+impl PassCap {
+    /// No bound: a sync with no per-graph budget, or a walk that goes on
+    /// under the per-peer budget alone (L4).
+    const NONE: PassCap = PassCap {
+        calls: u32::MAX,
+        bytes: u64::MAX,
+        nodes: u32::MAX,
+    };
+
+    /// Whether a limb is spent to nothing.
+    fn spent(self) -> bool {
+        self.calls == 0 || self.bytes == 0 || self.nodes == 0
+    }
 }
 
 /// The key of one held record (bsv-low #555): what a sync loads up front.
@@ -514,7 +573,7 @@ pub struct DeferredGraph {
     pub calls: u64,
     /// Passes that deferred it (its age, in passes).
     pub passes: u32,
-    /// Why it was last deferred: `calls`, `time`, `fault`,
+    /// Why it was last deferred: `calls`, `time`, `bytes`, `nodes`, `fault`,
     /// `anchor_unavailable`, `not_landed` or `peer_deadline`.
     pub reason: String,
     /// Whether the peer is a CONFIGURED one (`SyncTarget::Peers`), not one
@@ -642,6 +701,22 @@ pub struct DeferralStats {
     pub held_back: u64,
 }
 
+impl Walk {
+    /// The counted limb this pass has spent, if any: its name is the
+    /// deferral's reason.
+    fn over(&self) -> Option<&'static str> {
+        if self.calls_this_pass >= self.cap.calls {
+            Some("calls")
+        } else if self.bytes_this_pass >= self.cap.bytes {
+            Some("bytes")
+        } else if self.nodes_this_pass >= self.cap.nodes {
+            Some("nodes")
+        } else {
+            None
+        }
+    }
+}
+
 /// The walk of the graph in hand: its record (what a deferral saves) and
 /// the per-pass state. Lives in the [`GASPSync`], OUTSIDE the walk's
 /// future, so a deadline that drops the future leaves it whole.
@@ -649,12 +724,17 @@ struct Walk {
     record: DeferredGraph,
     seen: std::collections::HashSet<String>,
     calls_this_pass: u32,
+    /// Bytes served to this pass (bsv-low #586; see
+    /// [`DEFAULT_GRAPH_BUDGET_BYTES`] for what is counted).
+    bytes_this_pass: u64,
+    /// Nodes this pass appended (bsv-low #586).
+    nodes_this_pass: u32,
     resumed: bool,
-    /// The calls this pass may make: the per-graph budget, or what the
-    /// resumes of the pass have left of their shared one (M1); `u32::MAX`
+    /// What this pass may spend: the per-graph budget, or what the resumes
+    /// of the pass have left of their shared one (M1); [`PassCap::NONE`]
     /// once a walk that cannot be kept goes on under the per-peer budget
     /// alone (L4).
-    call_cap: u32,
+    cap: PassCap,
     /// `record.nodes.len()` when the pass started (H1).
     nodes_at_start: usize,
     /// Whether this pass was already counted progressed or stalled.
@@ -1092,10 +1172,14 @@ pub struct GASPSync<'a> {
     /// ONE deadline for every resume of the sync (the lens fold's M1), made
     /// at the first resume.
     resume_deadline: std::cell::RefCell<Option<crate::engine::SleepFuture>>,
-    /// The calls every resume of the sync may still make together (M1).
-    resume_calls_left: std::cell::Cell<u32>,
+    /// What every resume of the sync may still spend together (M1).
+    resume_left: std::cell::Cell<PassCap>,
     /// Calls made by the sync's walks so far.
     calls_made: std::cell::Cell<u64>,
+    /// Bytes served to the sync's walks so far (bsv-low #586).
+    bytes_fetched: std::cell::Cell<u64>,
+    /// Nodes appended by the sync's walks so far (bsv-low #586).
+    nodes_appended: std::cell::Cell<u64>,
     /// How many records this (peer, topic) holds in storage.
     held_records: std::cell::Cell<usize>,
     /// The walk of the graph in hand (see [`Walk`]).
@@ -1134,8 +1218,10 @@ impl<'a> GASPSync<'a> {
             graph_budget: None,
             deferred: std::cell::RefCell::new(std::collections::HashSet::new()),
             resume_deadline: std::cell::RefCell::new(None),
-            resume_calls_left: std::cell::Cell::new(0),
+            resume_left: std::cell::Cell::new(PassCap::NONE),
             calls_made: std::cell::Cell::new(0),
+            bytes_fetched: std::cell::Cell::new(0),
+            nodes_appended: std::cell::Cell::new(0),
             held_records: std::cell::Cell::new(0),
             walk: std::cell::RefCell::new(None),
             stats: std::cell::RefCell::new(DeferralStats::default()),
@@ -1268,8 +1354,11 @@ impl<'a> GASPSync<'a> {
         self.deferred.borrow_mut().clear();
         self.held_records.set(0);
         self.resume_deadline.borrow_mut().take();
-        self.resume_calls_left
-            .set(self.graph_budget.as_ref().map_or(0, |b| b.max_calls));
+        self.resume_left.set(
+            self.graph_budget
+                .as_ref()
+                .map_or(PassCap::NONE, GraphBudget::pass),
+        );
         // bsv-low #555: the deferred graphs of this (peer, topic), resumed
         // as the peer serves their UTXOs again (the cursor was held below
         // them). Only their keys: a record is read when its UTXO is served
@@ -1533,7 +1622,8 @@ impl<'a> GASPSync<'a> {
         debug!("{} Requesting node for {}", self.log_prefix, outpoint);
         self.graphs_attempted.set(self.graphs_attempted.get() + 1);
         let Some(budget) = &self.graph_budget else {
-            *self.walk.borrow_mut() = Some(Self::fresh_walk(utxo.score as u64, outpoint, u32::MAX));
+            *self.walk.borrow_mut() =
+                Some(Self::fresh_walk(utxo.score as u64, outpoint, PassCap::NONE));
             let walked = self.walk_graph(None).await;
             let walk = self.walk.borrow_mut().take();
             walked?;
@@ -1545,7 +1635,7 @@ impl<'a> GASPSync<'a> {
         if !self.deferred.borrow_mut().remove(outpoint) {
             let mut deadline = latched((budget.deadline)());
             return self
-                .ingest_budgeted(utxo, outpoint, &mut deadline, budget.max_calls, false)
+                .ingest_budgeted(utxo, outpoint, &mut deadline, budget.pass(), false)
                 .await;
         }
         let mut deadline = self
@@ -1553,8 +1643,8 @@ impl<'a> GASPSync<'a> {
             .borrow_mut()
             .take()
             .unwrap_or_else(|| latched((budget.deadline)()));
-        let cap = self.resume_calls_left.get();
-        if cap == 0 || Self::due(&mut deadline).await {
+        let cap = self.resume_left.get();
+        if cap.spent() || Self::due(&mut deadline).await {
             *self.resume_deadline.borrow_mut() = Some(deadline);
             self.stats.borrow_mut().held_back += 1;
             info!(
@@ -1563,12 +1653,26 @@ impl<'a> GASPSync<'a> {
             );
             return Ok(Ingested::HeldBack);
         }
-        let before = self.calls_made.get();
+        let before = (
+            self.calls_made.get(),
+            self.bytes_fetched.get(),
+            self.nodes_appended.get(),
+        );
         let ingested = self
             .ingest_budgeted(utxo, outpoint, &mut deadline, cap, true)
             .await;
-        let spent = u32::try_from(self.calls_made.get() - before).unwrap_or(u32::MAX);
-        self.resume_calls_left.set(cap.saturating_sub(spent));
+        let narrowed = |spent: u64| u32::try_from(spent).unwrap_or(u32::MAX);
+        self.resume_left.set(PassCap {
+            calls: cap
+                .calls
+                .saturating_sub(narrowed(self.calls_made.get() - before.0)),
+            bytes: cap
+                .bytes
+                .saturating_sub(self.bytes_fetched.get() - before.1),
+            nodes: cap
+                .nodes
+                .saturating_sub(narrowed(self.nodes_appended.get() - before.2)),
+        });
         *self.resume_deadline.borrow_mut() = Some(deadline);
         ingested
     }
@@ -1581,7 +1685,7 @@ impl<'a> GASPSync<'a> {
     }
 
     /// A walk from the root `outpoint`, nothing fetched yet.
-    fn fresh_walk(score: u64, outpoint: &str, call_cap: u32) -> Walk {
+    fn fresh_walk(score: u64, outpoint: &str, cap: PassCap) -> Walk {
         Walk {
             record: DeferredGraph {
                 peer: String::new(),
@@ -1604,8 +1708,10 @@ impl<'a> GASPSync<'a> {
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
+            bytes_this_pass: 0,
+            nodes_this_pass: 0,
             resumed: false,
-            call_cap,
+            cap,
             nodes_at_start: 0,
             counted: false,
             gone_on: false,
@@ -1614,14 +1720,14 @@ impl<'a> GASPSync<'a> {
     }
 
     /// One pass of a graph's walk under the per-graph budget: `deadline`,
-    /// and `cap` calls. `from_record`: a record of it is held (its key was
+    /// and `cap` (calls, bytes, nodes). `from_record`: a record of it is held (its key was
     /// loaded); it is read now.
     async fn ingest_budgeted(
         &self,
         utxo: &GASPOutput,
         outpoint: &str,
         deadline: &mut crate::engine::SleepFuture,
-        cap: u32,
+        cap: PassCap,
         from_record: bool,
     ) -> Result<Ingested, GASPError> {
         let score = utxo.score as u64;
@@ -1680,8 +1786,10 @@ impl<'a> GASPSync<'a> {
                     nodes_at_start: record.nodes.len(),
                     record,
                     calls_this_pass: 0,
+                    bytes_this_pass: 0,
+                    nodes_this_pass: 0,
                     resumed: true,
-                    call_cap: cap,
+                    cap,
                     counted: false,
                     gone_on: false,
                     half: None,
@@ -1711,10 +1819,15 @@ impl<'a> GASPSync<'a> {
                 match race_or_deadline(self.fetch_root(&root), deadline.as_mut()).await {
                     None => return Ok(WalkEnd::Deferred("time")),
                     Some(Ok(node)) if node.proof.is_some() => {
-                        let carried = self.walk.borrow().as_ref().map_or(0, |w| w.calls_this_pass);
+                        let (carried, carried_bytes) = self
+                            .walk
+                            .borrow()
+                            .as_ref()
+                            .map_or((0, 0), |w| (w.calls_this_pass, w.bytes_this_pass));
                         self.drop_record(outpoint, DropReason::RootProven).await;
                         let mut restarted = Self::fresh_walk(score, outpoint, cap);
                         restarted.calls_this_pass = carried;
+                        restarted.bytes_this_pass = carried_bytes;
                         restarted.record.calls = u64::from(carried);
                         *self.walk.borrow_mut() = Some(restarted);
                     }
@@ -1846,7 +1959,7 @@ impl<'a> GASPSync<'a> {
                 }
             };
             // Only a walk the per-graph budget cut may go on (L4).
-            let budget_cut = matches!(reason, "calls" | "time");
+            let budget_cut = matches!(reason, "calls" | "time" | "bytes" | "nodes");
             let (why, mut walk) = match self.save_walk(reason, completed).await {
                 Saved::Yes => {
                     let _ = self.storage.discard_graph(&graph_id).await;
@@ -1887,7 +2000,7 @@ impl<'a> GASPSync<'a> {
                 outpoint,
                 why.as_str()
             );
-            walk.call_cap = u32::MAX;
+            walk.cap = PassCap::NONE;
             walk.gone_on = true;
             *self.walk.borrow_mut() = Some(*walk);
             // The graph in hand was never discarded: walk on.
@@ -2114,6 +2227,16 @@ impl<'a> GASPSync<'a> {
             .map(|tx| format!("{}.{}", tx.id(), node.output_index))
     }
 
+    /// Count a node the graph in hand was SERVED (bsv-low #586): the bytes
+    /// the peer sent for it, which are the bytes a record keeps of it.
+    fn count_fetched(&self, node: &GASPNode) {
+        let bytes = (node.raw_tx.len() + node.proof.as_ref().map_or(0, String::len)) as u64;
+        self.bytes_fetched.set(self.bytes_fetched.get() + bytes);
+        if let Some(w) = self.walk.borrow_mut().as_mut() {
+            w.bytes_this_pass += bytes;
+        }
+    }
+
     /// Count one call of the graph in hand.
     fn count_call(&self) {
         self.calls_made.set(self.calls_made.get() + 1);
@@ -2144,21 +2267,24 @@ impl<'a> GASPSync<'a> {
     /// whole branch before its next sibling). Each step's result is
     /// committed to the walk only once the step has finished, so a deadline
     /// that drops this future leaves the walk as it was before that step.
-    /// With a per-graph budget the walk stops at its call count or its
-    /// `deadline` and answers `Deferred`; without one it runs to its end.
+    /// With a per-graph budget the walk stops at a counted limb of it (its
+    /// calls; the bytes it was served or the nodes it appended, bsv-low #586)
+    /// or at its `deadline`, and answers `Deferred` with the limb's name;
+    /// without one it runs to its end. A limb is read BEFORE a step, so a
+    /// pass always makes one: no node is too big to walk.
     async fn walk_graph(
         &self,
         mut deadline: Option<&mut crate::engine::SleepFuture>,
     ) -> Result<WalkEnd, GASPError> {
         loop {
-            let (item, over_calls) = {
+            let (item, over) = {
                 let walk = self.walk.borrow();
                 let Some(walk) = walk.as_ref() else {
                     return Ok(WalkEnd::Done);
                 };
                 (
                     walk.record.pending.last().cloned(),
-                    self.graph_budget.is_some() && walk.calls_this_pass >= walk.call_cap,
+                    self.graph_budget.as_ref().and_then(|_| walk.over()),
                 )
             };
             let Some(item) = item else {
@@ -2177,8 +2303,8 @@ impl<'a> GASPSync<'a> {
                 }
                 continue;
             }
-            if over_calls {
-                return Ok(WalkEnd::Deferred("calls"));
+            if let Some(limb) = over {
+                return Ok(WalkEnd::Deferred(limb));
             }
             let step = self.step(&item);
             let out = match deadline.as_mut() {
@@ -2208,6 +2334,8 @@ impl<'a> GASPSync<'a> {
         } = out
         {
             walk.seen.insert(node_id);
+            walk.nodes_this_pass += 1;
+            self.nodes_appended.set(self.nodes_appended.get() + 1);
             walk.record.nodes.push(*walked);
             walk.record.pending.extend(children.into_iter().rev());
         }
@@ -2246,8 +2374,10 @@ impl<'a> GASPSync<'a> {
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
+            bytes_this_pass: 0,
+            nodes_this_pass: 0,
             resumed: false,
-            call_cap: u32::MAX,
+            cap: PassCap::NONE,
             nodes_at_start: 0,
             counted: false,
             gone_on: false,
@@ -2269,6 +2399,7 @@ impl<'a> GASPSync<'a> {
             .remote
             .request_node(&item.graph_id, &txid, oi, item.metadata)
             .await?;
+        self.count_fetched(&node);
         Ok(self.hydrate_root(node).await)
     }
 
@@ -2416,7 +2547,7 @@ impl<'a> GASPSync<'a> {
                 // the fetcher arm never prunes, see the rule above.
                 Some(fetcher) => {
                     let ancestor = fetcher.fetch_ancestor(&txid).await?;
-                    GASPNode {
+                    let node = GASPNode {
                         graph_id: item.graph_id.clone(),
                         raw_tx: ancestor.raw_tx,
                         output_index: oi,
@@ -2424,7 +2555,9 @@ impl<'a> GASPSync<'a> {
                         tx_metadata: None,
                         output_metadata: None,
                         inputs: None,
-                    }
+                    };
+                    self.count_fetched(&node);
+                    node
                 }
                 // Default / production: no fetcher → ask the peer.
                 None => match self
@@ -2432,7 +2565,10 @@ impl<'a> GASPSync<'a> {
                     .request_node(&item.graph_id, &txid, oi, item.metadata)
                     .await
                 {
-                    Ok(child_node) => child_node,
+                    Ok(child_node) => {
+                        self.count_fetched(&child_node);
+                        child_node
+                    }
                     // Proven parent and a DEFINITE "not held": the D8 prune
                     // (see the rule above).
                     Err(e @ GASPError::NodeNotFound(_)) if item.parent_proven => {

@@ -84,6 +84,10 @@ pub struct Engine {
     /// The per-GRAPH GASP budget (bsv-low #555): the sleep, the calls, the
     /// ms. `None`: no graph is deferred.
     graph_budget: Option<(SleepFactory, u32, u64)>,
+    /// The per-graph budget's bytes and nodes limbs (bsv-low #586,
+    /// [`Engine::set_graph_budget_limbs`]): in force once a graph budget is
+    /// set.
+    graph_budget_limbs: (u64, u32),
     /// The bound of one transaction's finalize submit (bsv-low #559), see
     /// [`Engine::set_finalize_submit_budget`].
     finalize_submit_budget: Option<(SleepFactory, u64)>,
@@ -768,6 +772,10 @@ impl Engine {
             ancestor_fetcher: None,
             peer_sync_budget: None,
             graph_budget: None,
+            graph_budget_limbs: (
+                crate::gasp::DEFAULT_GRAPH_BUDGET_BYTES,
+                crate::gasp::DEFAULT_GRAPH_BUDGET_NODES,
+            ),
             finalize_submit_budget: None,
             finalize_gate: crate::gasp::SubmitGate::default(),
             not_landed: std::cell::RefCell::new(HashSet::new()),
@@ -913,8 +921,34 @@ impl Engine {
     /// graph past the budget is walked from its root under the per-peer
     /// budget alone on every pass, as before #555, so do not set a budget
     /// there.
+    ///
+    /// The budget has two more limbs (bsv-low #586), in force with it at
+    /// their defaults: the bytes one graph may be SERVED in one pass
+    /// ([`crate::gasp::DEFAULT_GRAPH_BUDGET_BYTES`], 4 MiB) and the nodes it
+    /// may APPEND ([`crate::gasp::DEFAULT_GRAPH_BUDGET_NODES`], 64);
+    /// [`Engine::set_graph_budget_limbs`] names others.
     pub fn set_graph_budget(&mut self, sleep: SleepFactory, max_calls: u32, budget_ms: u64) {
         self.graph_budget = Some((sleep, max_calls, budget_ms));
+    }
+
+    /// The bytes and nodes limbs of the per-graph budget (bsv-low #586,
+    /// zanaadu-v2 #377): a graph whose walk is SERVED `max_bytes_fetched`
+    /// bytes in one pass (the hex of each node's raw transaction and proof,
+    /// as the peer sends it and a record keeps it, every answer counted), or
+    /// APPENDS `max_nodes` nodes, is DEFERRED exactly as at the call budget
+    /// (reason `bytes` or `nodes`): its record saved, its UTXO held below
+    /// the cursor, the walk resumed by the next pass from what is pending.
+    /// Never a drop, a refusal or a discarded graph: these are budgets PER
+    /// PASS, not limits on a graph or a BEEF. A pass always makes one
+    /// request whatever a node's size; the resumes of one sync share one
+    /// such budget, as they share its calls (M1); a walk that cannot be
+    /// KEPT goes on under the per-peer budget alone (L4), as at the calls.
+    /// They bound what one pass adds to the pending graph and to its record
+    /// while the anchor check and the finalize hold it in memory. No effect
+    /// until [`Engine::set_graph_budget`] turns deferral on; the reference
+    /// has neither.
+    pub fn set_graph_budget_limbs(&mut self, max_bytes_fetched: u64, max_nodes: u32) {
+        self.graph_budget_limbs = (max_bytes_fetched, max_nodes);
     }
 
     /// Bound ONE transaction's GASP finalize submit (bsv-low #559, the delta
@@ -4842,6 +4876,8 @@ impl Engine {
                         let half_sleep = sleep.clone();
                         sync = sync.with_graph_budget(crate::gasp::GraphBudget {
                             max_calls: *max_calls,
+                            max_bytes_fetched: self.graph_budget_limbs.0,
+                            max_nodes: self.graph_budget_limbs.1,
                             deadline: Box::new(move || sleep(budget_ms)),
                             half_deadline: Some(Box::new(move || half_sleep(budget_ms / 2))),
                         });
