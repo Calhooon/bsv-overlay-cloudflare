@@ -33,7 +33,7 @@ bsv-rs = { workspace = true, features = ["wasm"] }
 # itself on 0.2.0). This crate uses exactly two items from it —
 # `init_panic_hook()` and `WorkerStorageClient` — and both are unchanged
 # across the bump: 0.1 → 0.3 needed ZERO source edits here.
-bsv-middleware-cloudflare = "0.3"
+bsv-middleware-cloudflare = "=0.4.1"
 async-trait.workspace = true
 base64 = "0.22"
 hex.workspace = true
