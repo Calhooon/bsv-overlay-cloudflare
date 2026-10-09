@@ -22,6 +22,7 @@
 //! away), retries with the platform's backoff, and dead-letters after
 //! `max_retries` — a dropped write is REDELIVERED, not vanished.
 
+use overlay_engine::beef_limits;
 use overlay_engine::types::SubmitMode;
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,27 @@ use serde::{Deserialize, Serialize};
 /// to 128KB; base64 encoding inflates ~33%, so we cap at 90KB raw to leave
 /// headroom for the rest of the JSON envelope.
 pub const QUEUE_BEEF_SIZE_LIMIT: usize = 90_000;
+
+/// Decode a queue/letter's BEEF only after bounding its encoded length.
+/// Validate decoded bytes under that door's policy before returning them to
+/// any subject reader or admission path. A replay failure keeps the consumer's
+/// existing retry/dead-letter lifecycle.
+pub(crate) fn decode_beef_b64(
+    encoded: &str,
+    limits: &bsv_rs::transaction::BeefLimits,
+) -> Result<Vec<u8>, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let max_encoded_bytes = limits.max_bytes.div_ceil(3).saturating_mul(4);
+    beef_limits::check_size(encoded.len(), max_encoded_bytes, "base64 BEEF")
+        .map_err(|e| e.to_string())?;
+    let bytes = STANDARD.decode(encoded).map_err(|e| e.to_string())?;
+    beef_limits::parse_beef(&bytes, limits).map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
+pub(crate) fn decode_replay_beef(encoded: &str) -> Result<Vec<u8>, String> {
+    decode_beef_b64(encoded, &beef_limits::QUEUE_BEEF_LIMITS)
+}
 
 /// A mutation message enqueued for reliable processing.
 ///

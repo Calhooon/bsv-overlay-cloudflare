@@ -107,6 +107,8 @@
 //! producer-side facts, never an audit log (same posture as
 //! `submit_gate::counters_json`).
 
+use overlay_engine::beef_limits;
+
 use crate::ef::{beef_to_ef_batch, proven_subject_raw, EfError};
 use crate::submit_gate::AdmissionPath;
 
@@ -269,7 +271,7 @@ pub fn census_verdict(beef_bytes: &[u8]) -> CensusVerdict {
 /// must not manufacture a verdict.
 fn beef_has_entries_outside_subject_ancestry(beef_bytes: &[u8], subject_txid: &str) -> bool {
     use std::collections::{HashMap, HashSet};
-    let Ok(beef) = bsv_rs::transaction::Beef::from_binary(beef_bytes) else {
+    let Ok(beef) = beef_limits::parse_beef(beef_bytes, &beef_limits::CENSUS_BEEF_LIMITS) else {
         return false;
     };
     // Entries with transaction data (mirrors the gated arm's source map:

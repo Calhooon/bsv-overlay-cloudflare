@@ -41,6 +41,7 @@ pub mod submit_refusals;
 pub mod tip_pass;
 pub mod wallet;
 
+use overlay_engine::beef_limits;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -2167,7 +2168,6 @@ async fn queue_handler(
     env: Env,
     ctx: worker::Context,
 ) -> worker::Result<()> {
-    use base64::{engine::general_purpose::STANDARD, Engine as B64Engine};
     use overlay_engine::types::{SubmitMode, TaggedBEEF};
     use worker::MessageExt;
 
@@ -2196,7 +2196,7 @@ async fn queue_handler(
         };
         let body = &body;
 
-        let beef = match STANDARD.decode(&body.beef_b64) {
+        let beef = match crate::queue::decode_replay_beef(&body.beef_b64) {
             Ok(b) => b,
             Err(e) => {
                 worker::console_log!(
@@ -2231,9 +2231,10 @@ async fn queue_handler(
         // JOIN carrying a txid-only hop — the F-D class — is judged too; the gate's MEDIUM-3); a body that does not
         // parse is retried, never silently written. An open eviction skips the replay (acked: the twin holds the
         // rows, a MINED proof readmits); an unreadable ledger retries the replay later (never a blind write).
-        let subject: Option<String> = bsv_rs::transaction::beef::Beef::from_binary(&tagged_beef.beef)
-            .ok()
-            .and_then(|mut named| crate::ef::subject_txid_of(&mut named));
+        let subject: Option<String> =
+            beef_limits::parse_beef(&tagged_beef.beef, &beef_limits::QUEUE_BEEF_LIMITS)
+                .ok()
+                .and_then(|mut named| crate::ef::subject_txid_of(&mut named));
         let Some(subject) = subject else {
             worker::console_log!("Queue: the replay's subject could not be derived (an unparsable BEEF or no unique tip) — retrying");
             if let Some(db) = &counters {

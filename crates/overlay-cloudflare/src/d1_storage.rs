@@ -8,6 +8,7 @@
 //! - BLOBs read via hex() SQL function, decoded with hex::decode()
 //! - JSON arrays (outputsConsumed, consumedBy) stored as TEXT, parsed with serde_json
 
+use overlay_engine::beef_limits;
 use std::rc::Rc;
 
 use async_trait::async_trait;
@@ -357,7 +358,7 @@ impl D1Storage {
     /// as proofless so it stays in the candidate set, where the engine re-parses
     /// + skips defensively).
     fn beef_has_proof(txid: &str, beef: &[u8]) -> bool {
-        bsv_rs::transaction::Beef::from_binary(beef)
+        beef_limits::parse_beef(beef, &beef_limits::STORED_BEEF_LIMITS)
             .ok()
             .and_then(|b| {
                 b.find_txid(txid)

@@ -5,6 +5,7 @@
 
 use overlay_discovery::ship::storage::SHIPStorage;
 use overlay_discovery::slap::storage::SLAPStorage;
+use overlay_engine::beef_limits;
 use overlay_engine::engine::{Engine, EngineError};
 use overlay_engine::health_checker::JanitorConfig;
 use overlay_engine::types::{
@@ -32,6 +33,10 @@ const MAX_SUBJECT_EF_BYTES: usize = 256 * 1024;
 /// worker poll per request (the abuse the old `>8`-count cap blocked). 2 MiB is
 /// generous for any legitimate LOW hand's whole ancestry, but caps the attacker.
 const MAX_BATCH_EF_BYTES: usize = 2 * 1024 * 1024;
+
+/// One callback's proof fits an 8 KiB hex field. 1 MiB also leaves ample
+/// space for status, competing-transaction and reorg metadata.
+pub(crate) const ARC_INGEST_BODY_MAX_BYTES: usize = 1024 * 1024;
 
 /// PURE (#211): the offending byte size when EITHER work bound is exceeded, else
 /// `None`. Bounds (a) the SUBJECT EF we broadcast first, and (b) the TOTAL batch
@@ -644,7 +649,7 @@ async fn submit_inner(
     let raw_body = req.bytes().await?;
 
     // Input validation
-    if raw_body.len() > 10_000_000 {
+    if raw_body.len() > beef_limits::SUBMIT_BODY_MAX_BYTES {
         worker::console_log!(
             "POST /submit -> 413 (BEEF too large: {} bytes)",
             raw_body.len()
@@ -682,6 +687,12 @@ async fn submit_inner(
     } else {
         (raw_body, None)
     };
+
+    // Refuse count/size violations before the census, mode selection, EF
+    // conversion or any other parse. Keep the route's parse-error response.
+    if let Err(e) = beef_limits::parse_beef(&beef, &beef_limits::SUBMIT_BEEF_LIMITS) {
+        return json_error(&format!("BEEF parse error: {e}"), 400);
+    }
 
     // `mut`: the broadcast-gated mined-claim arm strips the subject's
     // unverified bump before storage (#268 gate M1).
@@ -959,7 +970,7 @@ async fn submit_inner(
         // Loop-2 hardening (2026-09-05): name the subject rule's work when it
         // disagrees with the old sorted-last — the log line a mis-targeted
         // admission would have needed (pair-17's JOIN admitted a HOP for 200).
-        if let Ok(mut named) = bsv_rs::transaction::beef::Beef::from_binary(&gated_beef) {
+        if let Ok(mut named) = beef_limits::parse_beef(&gated_beef, &beef_limits::EF_BEEF_LIMITS) {
             let tip = crate::ef::subject_txid_of(&mut named);
             let last = crate::ef::sorted_last_txid_of(&named);
             if tip.is_some() && tip != last {
@@ -1506,7 +1517,9 @@ async fn submit_inner(
     // push (`readmit_if_evicted`) and the operator's `/admin/readmit`. The subject by the ONE rule (D5). ──
     let mut ungated_subject: Option<String> = None;
     if gated_subject.is_none() {
-        if let Ok(mut named) = bsv_rs::transaction::beef::Beef::from_binary(&tagged_beef.beef) {
+        if let Ok(mut named) =
+            beef_limits::parse_beef(&tagged_beef.beef, &beef_limits::EF_BEEF_LIMITS)
+        {
             if let Some(subject) = crate::ef::subject_txid_of(&mut named) {
                 ungated_subject = Some(subject.clone());
                 if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
@@ -1815,7 +1828,7 @@ async fn submit_inner(
             // reference's sorted-last; loop-2 hardening 2026-09-05: the
             // sorted-last alone named a HOP the subject of an incomplete JOIN
             // BEEF and this belt then saw "not funding-shaped").
-            let subject = bsv_rs::transaction::beef::Beef::from_binary(&tagged_beef.beef)
+            let subject = beef_limits::parse_beef(&tagged_beef.beef, &beef_limits::EF_BEEF_LIMITS)
                 .ok()
                 .and_then(|mut b| {
                     let subject_txid = crate::ef::subject_txid_of(&mut b)?;
@@ -1898,7 +1911,11 @@ async fn submit_inner(
         // `tracing::debug!` calls inside `identify_admissible_outputs` are
         // silent under the CF worker's default log config).
         if steak.contains_key("tm_uhrp") {
-            if let Ok(tx) = bsv_rs::transaction::Transaction::from_beef(&tagged_beef.beef, None) {
+            if let Ok(tx) = beef_limits::transaction_from_beef(
+                &tagged_beef.beef,
+                None,
+                &beef_limits::EF_BEEF_LIMITS,
+            ) {
                 let now = (js_sys::Date::now() / 1000.0) as u64;
                 for (i, output) in tx.outputs.iter().enumerate() {
                     match overlay_discovery::uhrp::topic_manager::UHRPTopicManager::validate_uhrp_output(output, now) {
@@ -1927,8 +1944,11 @@ async fn submit_inner(
             if !steak.contains_key(topic) {
                 continue;
             }
-            let Ok(tx) = bsv_rs::transaction::Transaction::from_beef(&tagged_beef.beef, None)
-            else {
+            let Ok(tx) = beef_limits::transaction_from_beef(
+                &tagged_beef.beef,
+                None,
+                &beef_limits::EF_BEEF_LIMITS,
+            ) else {
                 worker::console_log!("{} diag: Transaction::from_beef FAILED", topic);
                 continue;
             };
@@ -2011,12 +2031,15 @@ async fn submit_inner(
                 // The same subject rule as the gate (loop-2 hardening): a
                 // bare `from_beef(_, None)` takes the wire-last tx, which an
                 // SDK-sorted incomplete BEEF fills with a fully-sourced HOP.
-                let named = bsv_rs::transaction::beef::Beef::from_binary(&beef_for_seen)
+                let named = beef_limits::parse_beef(&beef_for_seen, &beef_limits::EF_BEEF_LIMITS)
                     .ok()
                     .and_then(|mut b| crate::ef::subject_txid_of(&mut b));
-                let subject =
-                    bsv_rs::transaction::Transaction::from_beef(&beef_for_seen, named.as_deref())
-                        .map(|t| t.id());
+                let subject = beef_limits::transaction_from_beef(
+                    &beef_for_seen,
+                    named.as_deref(),
+                    &beef_limits::EF_BEEF_LIMITS,
+                )
+                .map(|t| t.id());
                 if let Ok(subject) = subject {
                     if seen_arcade.network_witnessed(&subject).await {
                         crate::ops::latch_network_seen(&seen_db, &subject).await;
@@ -2208,8 +2231,12 @@ fn serialize_aggregated_lookup(
             Some(bytes) if bytes.len() == 32 => bytes,
             _ => {
                 // Fallback: parse the BEEF and hash — the pre-#289 path.
-                let tx = bsv_rs::transaction::Transaction::from_beef(&output.beef, None)
-                    .map_err(|e| format!("Failed to parse BEEF: {e}"))?;
+                let tx = beef_limits::transaction_from_beef(
+                    &output.beef,
+                    None,
+                    &beef_limits::STORED_BEEF_LIMITS,
+                )
+                .map_err(|e| format!("Failed to parse BEEF: {e}"))?;
                 let txid_hex = tx.id();
                 let bytes = hex::decode(&txid_hex)
                     .map_err(|e| format!("Failed to decode txid hex: {e}"))?;
@@ -2241,7 +2268,7 @@ fn serialize_aggregated_lookup(
         }
 
         // Merge this output's BEEF into the accumulator
-        let parsed = Beef::from_binary(&output.beef)
+        let parsed = beef_limits::parse_beef(&output.beef, &beef_limits::STORED_BEEF_LIMITS)
             .map_err(|e| format!("Failed to parse BEEF for merging: {e}"))?;
         match &mut merged_beef {
             Some(acc) => acc.merge_beef(&parsed),
@@ -2387,6 +2414,8 @@ pub(crate) enum ArcIngestBody {
 /// the pre-#228 fail-closed path. `txid` is always required — a body without
 /// one is malformed (400), same as before.
 pub(crate) fn classify_arc_ingest_body(raw: &str) -> Result<ArcIngestBody, String> {
+    beef_limits::check_size(raw.len(), ARC_INGEST_BODY_MAX_BYTES, "arc-ingest body")
+        .map_err(|e| e.to_string())?;
     #[derive(Deserialize)]
     struct Body {
         txid: String,
@@ -2471,6 +2500,9 @@ pub async fn arc_ingest(
         Ok(t) => t,
         Err(e) => return json_error(&format!("Invalid arc-ingest body: {e}"), 400),
     };
+    if raw.len() > ARC_INGEST_BODY_MAX_BYTES {
+        return json_error("arc-ingest body too large (max 1MiB)", 413);
+    }
     let body = match classify_arc_ingest_body(&raw) {
         Ok(b) => b,
         Err(e) => return json_error(&format!("Invalid arc-ingest body: {e}"), 400),

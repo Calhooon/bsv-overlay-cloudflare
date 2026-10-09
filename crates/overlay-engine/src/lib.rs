@@ -25,8 +25,8 @@
 #![allow(clippy::let_and_return)] // sometimes clearer
 
 pub mod advertiser;
-pub mod broadcaster;
 pub mod beef_limits;
+pub mod broadcaster;
 pub mod builder;
 pub mod engine;
 pub mod gasp;

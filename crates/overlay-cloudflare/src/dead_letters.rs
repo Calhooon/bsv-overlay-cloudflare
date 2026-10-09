@@ -70,6 +70,7 @@
 
 use crate::d1::{QVal, Query};
 use crate::queue::MutationMessage;
+use overlay_engine::beef_limits;
 use serde::{Deserialize, Serialize};
 use worker::{D1Database, Env, Request, Response, Result};
 
@@ -1180,9 +1181,9 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
 /// The subject by the ONE rule (D5), as the main consumer derives it.
 #[must_use]
 pub fn subject_of(body: &MutationMessage) -> Option<String> {
-    use base64::{engine::general_purpose::STANDARD, Engine as B64Engine};
-    let beef = STANDARD.decode(&body.beef_b64).ok()?;
-    let mut named = bsv_rs::transaction::beef::Beef::from_binary(&beef).ok()?;
+    let beef = crate::queue::decode_beef_b64(&body.beef_b64, &beef_limits::DEAD_LETTER_BEEF_LIMITS)
+        .ok()?;
+    let mut named = beef_limits::parse_beef(&beef, &beef_limits::DEAD_LETTER_BEEF_LIMITS).ok()?;
     crate::ef::subject_txid_of(&mut named)
 }
 

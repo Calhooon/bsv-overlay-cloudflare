@@ -49,6 +49,7 @@
 
 use crate::d1_ledger::Counted;
 use bsv_rs::transaction::{Beef, MerklePath};
+use overlay_engine::beef_limits;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
 use worker::Env;
@@ -234,7 +235,7 @@ pub fn judge_bump(claimed: &str, canonical: Option<&str>) -> BumpVerdict {
 /// the subject is absent, or on any parse/serialize fault: the caller must
 /// then refuse, never serve.
 pub fn strip_bumps(beef_bytes: &[u8], subject: &str, refuted: &[usize]) -> Option<Vec<u8>> {
-    let mut beef = Beef::from_binary(beef_bytes).ok()?;
+    let mut beef = beef_limits::parse_beef(beef_bytes, &beef_limits::APP_BEEF_LIMITS).ok()?;
     if refuted.is_empty() || beef.find_txid(subject).is_none() {
         return None;
     }
@@ -294,6 +295,18 @@ pub enum Guarded {
     /// A refuted bump could not be stripped honestly: refuse (503), naming
     /// the refuted height.
     Refuted { height: u64 },
+    /// A legacy/client row is outside the parser policy: never serve it as
+    /// the passthrough used for other malformed rows (HTTP 413).
+    OverLimit,
+}
+
+/// Preserve the malformed-row passthrough, while refusing parser limits.
+pub(crate) fn parse_for_serving(bytes: &[u8]) -> Result<Option<Beef>, Guarded> {
+    match beef_limits::parse_beef(bytes, &beef_limits::APP_BEEF_LIMITS) {
+        Ok(beef) => Ok(Some(beef)),
+        Err(bsv_rs::Error::BeefError(e)) if e.contains("over max_") => Err(Guarded::OverLimit),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Latch a present height this isolate learned from the chaintracks
@@ -375,8 +388,10 @@ pub async fn guard_served_beef(
     bytes: &[u8],
     verified: bool,
 ) -> Guarded {
-    let Ok(beef) = Beef::from_binary(bytes) else {
-        return Guarded::Serve(bytes.to_vec()); // unparseable: passthrough, as compaction does
+    let beef = match parse_for_serving(bytes) {
+        Ok(Some(beef)) => beef,
+        Ok(None) => return Guarded::Serve(bytes.to_vec()),
+        Err(verdict) => return verdict,
     };
     if beef.bumps.is_empty() {
         return Guarded::Serve(bytes.to_vec());

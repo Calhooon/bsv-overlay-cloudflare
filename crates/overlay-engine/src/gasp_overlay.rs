@@ -33,13 +33,17 @@
 //!
 //! Ported from `~/bsv/overlay-services/src/GASP/OverlayGASPStorage.ts` (388 lines).
 
+use crate::beef_limits;
+
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use bsv_rs::transaction::{Beef, ChainTracker, ChainTrackerError, MerklePath, Transaction};
+#[cfg(test)]
+use bsv_rs::transaction::MerklePath;
+use bsv_rs::transaction::{Beef, ChainTracker, ChainTrackerError, Transaction};
 use tracing::{debug, error, warn};
 
 use crate::gasp::{GASPError, GASPStorage};
@@ -271,9 +275,12 @@ impl<'a> OverlayGASPStorage<'a> {
 
         // If this node has a proof, attach the merkle path — this is a leaf.
         if let Some(ref proof_hex) = pending.node.proof {
-            tx.merkle_path = Some(MerklePath::from_hex(proof_hex).map_err(|e| {
-                GASPError::Other(format!("Failed to parse proof for {node_key}: {e}"))
-            })?);
+            tx.merkle_path = Some(
+                beef_limits::merkle_path_from_hex(proof_hex, beef_limits::PEER_PROOF_MAX_BYTES)
+                    .map_err(|e| {
+                        GASPError::Other(format!("Failed to parse proof for {node_key}: {e}"))
+                    })?,
+            );
         } else {
             // No proof — hydrate each input's source transaction from children.
             // Collect child keys first to avoid borrow conflicts.
@@ -511,7 +518,11 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         if let Some(output) = output {
             if let Some(ref beef) = output.beef {
                 // Parse the BEEF to extract raw transaction hex
-                match bsv_rs::transaction::Transaction::from_beef(beef, None) {
+                match beef_limits::transaction_from_beef(
+                    beef,
+                    None,
+                    &beef_limits::STORED_BEEF_LIMITS,
+                ) {
                     Ok(tx) => {
                         let mut node = GASPNode {
                             graph_id: graph_id.to_string(),
@@ -548,7 +559,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             GASPError::NodeNotFound(format!("No BEEF data for {txid}.{output_index}"))
         })?;
 
-        let tx = bsv_rs::transaction::Transaction::from_beef(beef, None)
+        let tx = beef_limits::transaction_from_beef(beef, None, &beef_limits::STORED_BEEF_LIMITS)
             .map_err(|e| GASPError::Other(format!("BEEF parse error: {e}")))?;
 
         let mut node = GASPNode {
@@ -594,7 +605,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             let mut tx = Transaction::from_hex(&node.raw_tx)
                 .map_err(|e| GASPError::Other(format!("Failed to parse raw_tx: {e}")))?;
             tx.merkle_path = Some(
-                MerklePath::from_hex(proof_hex)
+                beef_limits::merkle_path_from_hex(proof_hex, beef_limits::PEER_PROOF_MAX_BYTES)
                     .map_err(|e| GASPError::Other(format!("Failed to parse proof: {e}")))?,
             );
 
@@ -951,7 +962,9 @@ impl GASPStorage for OverlayGASPStorage<'_> {
                     .await
                     .map_err(|e| unavailable(format!("reading {txid}.{output_index}: {e}")))?;
                 if let Some(stored) = held.and_then(|output| output.beef) {
-                    if let Ok(stored) = Beef::from_binary(&stored) {
+                    if let Ok(stored) =
+                        beef_limits::parse_beef(&stored, &beef_limits::STORED_BEEF_LIMITS)
+                    {
                         merged.merge_beef(&stored);
                     }
                 }

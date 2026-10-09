@@ -43,6 +43,7 @@
 //! exists or the new beef is LONGER.
 
 use async_trait::async_trait;
+use overlay_engine::beef_limits;
 use serde::{Deserialize, Serialize};
 
 /// A pot-spend record as stored in the index.
@@ -980,7 +981,7 @@ pub trait PotStorage {
 /// (the verifying writers record it as the row's `proofHeight`, the
 /// revalidation sweep's window anchor; round-2 review M4).
 pub fn pot_beef_bump_height(txid: &str, beef: &[u8]) -> Option<u64> {
-    let parsed = bsv_rs::transaction::Beef::from_binary(beef).ok()?;
+    let parsed = beef_limits::parse_beef(beef, &beef_limits::STORED_BEEF_LIMITS).ok()?;
     let btx = parsed.find_txid(txid)?;
     let bump = parsed.bumps.get(btx.bump_index()?)?;
     Some(u64::from(bump.block_height))
@@ -991,7 +992,7 @@ pub fn pot_beef_bump_height(txid: &str, beef: &[u8]) -> Option<u64> {
 /// no-op — fail-closed). Shared by the in-memory and D1 pot stores so the
 /// candidate query and the compaction write agree on "proven".
 pub fn pot_beef_has_proof(txid: &str, beef: &[u8]) -> bool {
-    bsv_rs::transaction::Beef::from_binary(beef)
+    beef_limits::parse_beef(beef, &beef_limits::STORED_BEEF_LIMITS)
         .ok()
         .and_then(|b| {
             b.find_txid(txid)
@@ -1170,7 +1171,11 @@ impl MemoryPotStorage {
             }
             // Hash-bound parse: the stored key must be the subject txid, so
             // a garbled row can never latch some other tx's identity.
-            let Ok(tx) = bsv_rs::transaction::Transaction::from_beef(bytes, Some(txid)) else {
+            let Ok(tx) = beef_limits::transaction_from_beef(
+                bytes,
+                Some(txid),
+                &beef_limits::STORED_BEEF_LIMITS,
+            ) else {
                 continue;
             };
             let conflicts = tx.inputs.iter().any(|i| {

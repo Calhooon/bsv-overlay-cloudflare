@@ -12,13 +12,14 @@ use bsv_rs::transaction::{Beef, BeefLimits, MerklePath, Transaction};
 pub const SUBMIT_BODY_MAX_BYTES: usize = 10_000_000;
 /// BRC-95 adds a four-byte marker and a 32-byte subject to a plain BEEF.
 pub const ATOMIC_HEADER_BYTES: usize = 36;
-/// A subject plus up to 255 funded inputs/ancestor bodies per invocation.
-/// This intentionally admits accumulated wallet ancestry rather than the old
-/// eight-unproven-transaction gate. It is a policy cap, not a protocol maximum.
-const MAX_SUBMISSION_TXS: usize = 256;
+/// The engine supports 256 direct inputs (`engine.rs` at cf933e8, line 552),
+/// and its existing GASP wide-parent test carries 256 proven parents plus
+/// their subject. 512 admits that shape and another 255 ancestry bodies.
+/// This is application policy, not a protocol maximum.
+const MAX_SUBMISSION_TXS: usize = 512;
 /// Every carried body may be proven in a different block: one BUMP per body.
 /// A BUMP can also prove several bodies, so this covers the unshared case.
-const MAX_SUBMISSION_BUMPS: usize = 256;
+const MAX_SUBMISSION_BUMPS: usize = 512;
 
 /// HTTP submit: the whole request has already been capped at 10 MB.
 pub const SUBMIT_BEEF_LIMITS: BeefLimits = BeefLimits {
@@ -59,9 +60,10 @@ pub const CENSUS_BEEF_LIMITS: BeefLimits = BeefLimits {
     ..SUBMIT_BEEF_LIMITS
 };
 
-/// A single proof with 64 tree levels needs only a few KB. 64 KiB leaves
-/// headroom for honest shared proofs while bounding decode/parse allocations.
-pub const COURIER_PROOF_MAX_BYTES: usize = 64 * 1024;
+/// An 8 KiB canonical JSON hex field reserves two bytes for quotes and two
+/// hex characters per decoded byte. A 64-level branch needs less than 3 KiB;
+/// this also admits a shared 120-leaf proof within the field budget.
+pub const COURIER_PROOF_MAX_BYTES: usize = (8 * 1024 - 2) / 2;
 /// A pushed proof uses the same envelope as one fetched from a courier.
 pub const PUSH_PROOF_MAX_BYTES: usize = COURIER_PROOF_MAX_BYTES;
 /// Stored proofs are rechecked under the same envelope on every parse.
@@ -69,9 +71,11 @@ pub const STORED_PROOF_MAX_BYTES: usize = COURIER_PROOF_MAX_BYTES;
 /// GASP's proof field is a single proof, under the courier envelope.
 pub const PEER_PROOF_MAX_BYTES: usize = COURIER_PROOF_MAX_BYTES;
 
-/// Parse a door's BEEF. The witness commit preserves the old unbounded reader.
-pub fn parse_beef(bytes: &[u8], _limits: &BeefLimits) -> bsv_rs::Result<Beef> {
-    Beef::from_binary(bytes)
+/// Refuse the body before constructing a reader. Each caller supplies its
+/// named policy; counts are then checked by the SDK on their prefixes.
+pub fn parse_beef(bytes: &[u8], limits: &BeefLimits) -> bsv_rs::Result<Beef> {
+    check_size(bytes.len(), limits.max_bytes, "BEEF")?;
+    Beef::from_binary_with_limits(bytes, limits)
 }
 
 /// Link from the bounded parse, keeping the SDK's exact target selection:
@@ -83,7 +87,9 @@ pub fn transaction_from_beef(
     limits: &BeefLimits,
 ) -> bsv_rs::Result<Transaction> {
     let parsed = parse_beef(bytes, limits)?;
-    let target = txid.map(str::to_string).or_else(|| parsed.atomic_txid.clone())
+    let target = txid
+        .map(str::to_string)
+        .or_else(|| parsed.atomic_txid.clone())
         .or_else(|| parsed.txs.last().map(bsv_rs::transaction::BeefTx::txid))
         .ok_or_else(|| bsv_rs::Error::TransactionError("No transactions in BEEF".into()))?;
     parsed.find_atomic_transaction(&target).ok_or_else(|| {
@@ -91,8 +97,20 @@ pub fn transaction_from_beef(
     })
 }
 
-/// Bound hex before decoding, then parse the proof. The witness preserves the
-/// old reader until the red tests have been recorded.
-pub fn merkle_path_from_hex(hex: &str, _max_bytes: usize) -> bsv_rs::Result<MerklePath> {
-    MerklePath::from_hex(hex)
+/// Bound hex before allocating decoded bytes, then parse the proof.
+pub fn merkle_path_from_hex(hex: &str, max_bytes: usize) -> bsv_rs::Result<MerklePath> {
+    check_size(hex.len(), max_bytes.saturating_mul(2), "merkle proof hex")?;
+    let bytes = bsv_rs::primitives::from_hex(hex)?;
+    MerklePath::from_binary(&bytes)
+}
+
+/// Shared pre-read/pre-decode length check. A malformed body over the cap is
+/// refused for size without asking its parser to look at it.
+pub fn check_size(size: usize, max_bytes: usize, kind: &str) -> bsv_rs::Result<()> {
+    if size > max_bytes {
+        return Err(bsv_rs::Error::BeefError(format!(
+            "{kind} of {size} bytes is over max_bytes {max_bytes}"
+        )));
+    }
+    Ok(())
 }

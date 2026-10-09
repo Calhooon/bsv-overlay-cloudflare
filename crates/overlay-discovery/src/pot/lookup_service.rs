@@ -32,7 +32,8 @@
 //! `low-app-layer`'s `/beef/:txid` serves.
 
 use async_trait::async_trait;
-use bsv_rs::transaction::{Beef, ChainTracker, MerklePath, Transaction};
+use bsv_rs::transaction::{ChainTracker, MerklePath, Transaction};
+use overlay_engine::beef_limits;
 use overlay_engine::lookup_service::{LookupService, LookupServiceError};
 use overlay_engine::types::*;
 use std::rc::Rc;
@@ -99,7 +100,10 @@ impl PotLookupService {
         spending_txid: &str,
     ) -> Option<u64> {
         let tracker = self.chain_tracker.as_ref()?;
-        let beef = match Beef::from_binary(spending_atomic_beef) {
+        let beef = match beef_limits::parse_beef(
+            spending_atomic_beef,
+            &beef_limits::DISCOVERY_BEEF_LIMITS,
+        ) {
             Ok(b) => b,
             Err(e) => {
                 debug!("POT: spending beef re-parse for SPV failed — unconfirmed: {e}");
@@ -185,7 +189,11 @@ impl LookupService for PotLookupService {
         // Parse the funding tx out of the BEEF (same subject-tx selection the
         // topic manager used to admit it). Unparseable → no-op, never a
         // spurious record.
-        let tx = match Transaction::from_beef(atomic_beef, None) {
+        let tx = match beef_limits::transaction_from_beef(
+            atomic_beef,
+            None,
+            &beef_limits::DISCOVERY_BEEF_LIMITS,
+        ) {
             Ok(tx) => tx,
             Err(e) => {
                 debug!("POT: admitted beef did not parse — skipped: {e}");
@@ -315,7 +323,11 @@ impl LookupService for PotLookupService {
         // Derive the SPENDING txid from the beef's subject tx. Unparseable →
         // no-op (the engine parsed this beef to process the submission, so a
         // delivered payload always parses in practice).
-        let spending_tx = match Transaction::from_beef(spending_atomic_beef, None) {
+        let spending_tx = match beef_limits::transaction_from_beef(
+            spending_atomic_beef,
+            None,
+            &beef_limits::DISCOVERY_BEEF_LIMITS,
+        ) {
             Ok(tx) => tx,
             Err(e) => {
                 debug!("POT: spending beef did not parse — skipped: {e}");

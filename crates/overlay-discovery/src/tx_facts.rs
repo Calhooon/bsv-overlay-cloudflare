@@ -8,7 +8,8 @@
 //! the OPPONENT's, which the player's device never held. Nothing money-gating
 //! reads them. A missing ancestor is an honest `fee_sats: None`, never an
 //! estimate (the client's own estimate is labelled ≈ and stays its own).
-use bsv_rs::transaction::Beef;
+
+use overlay_engine::beef_limits;
 
 /// What one admitted tx can prove about itself from its own BEEF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +25,7 @@ pub struct TxFacts {
 /// BEEF does not parse or does not carry the subject.
 #[must_use]
 pub fn facts_from_atomic_beef(atomic_beef: &[u8], txid: &str) -> Option<TxFacts> {
-    let beef = Beef::from_binary(atomic_beef).ok()?;
+    let beef = beef_limits::parse_beef(atomic_beef, &beef_limits::DISCOVERY_BEEF_LIMITS).ok()?;
     let subject = beef.find_txid(txid)?;
     let tx = subject.tx()?;
     let size_bytes = subject

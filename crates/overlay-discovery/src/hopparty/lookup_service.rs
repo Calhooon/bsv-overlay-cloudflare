@@ -32,7 +32,7 @@
 //! record is NEVER removed (mirrors `ls_potparty`'s permanence).
 
 use async_trait::async_trait;
-use bsv_rs::transaction::Transaction;
+use overlay_engine::beef_limits;
 use overlay_engine::lookup_service::{LookupService, LookupServiceError};
 use overlay_engine::types::*;
 use std::rc::Rc;
@@ -100,7 +100,11 @@ impl LookupService for HoppartyLookupService {
         // Parse the CONTAINING tx out of the BEEF (the same subject-tx
         // selection the topic manager used). Unparseable → no-op, never a
         // spurious record (the `ls_pot` posture).
-        let tx = match Transaction::from_beef(atomic_beef, None) {
+        let tx = match beef_limits::transaction_from_beef(
+            atomic_beef,
+            None,
+            &beef_limits::DISCOVERY_BEEF_LIMITS,
+        ) {
             Ok(tx) => tx,
             Err(e) => {
                 debug!("HOPPARTY: admitted beef did not parse — skipped: {e}");

@@ -38,6 +38,8 @@
 //! live look at 2..18 s: SEEN latches `network_seen` (counted, with its
 //! latency); a FATAL look runs the same evidence check and a corroborated
 //! refusal EVICTS; silence is counted and left to the callbacks and the passes.
+use overlay_engine::beef_limits;
+
 use crate::d1::{QVal, Query};
 use async_trait::async_trait;
 use worker::D1Database;
@@ -1946,7 +1948,7 @@ pub async fn confirm_spend_now_rows(
         Ok(None) => return ConfirmNow::Unmined,
         Err(e) => return ConfirmNow::Fault(format!("proof read: {e}")),
     };
-    let height = bsv_rs::transaction::MerklePath::from_hex(&bump_hex)
+    let height = beef_limits::merkle_path_from_hex(&bump_hex, beef_limits::COURIER_PROOF_MAX_BYTES)
         .ok()
         .map(|mp| u64::from(mp.block_height));
     let (mut confirmed, mut cas_missed, mut cas_faults) = (0usize, 0usize, 0usize);

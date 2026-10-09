@@ -891,6 +891,7 @@ dependencies = [
  "bsv-middleware-cloudflare",
  "bsv-overlay-cloudflare",
  "bsv-overlay-discovery",
+ "bsv-overlay-engine",
  "bsv-rs",
  "console_error_panic_hook",
  "futures-util",

@@ -15,6 +15,7 @@
 //! (the map's transactions are themselves flat/unlinked, so the clones stay
 //! shallow — exactly enough for `to_ef`).
 
+use overlay_engine::beef_limits;
 use std::collections::HashMap;
 
 use bsv_rs::transaction::{Beef, Transaction};
@@ -62,7 +63,8 @@ pub use overlay_engine::subject::{sorted_last_txid_of, subject_txid_of};
 /// broadcast fails with missing-inputs, which is exactly the right signal.
 /// Only the SUBJECT failing to convert is an error.
 pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfError> {
-    let mut beef = Beef::from_binary(beef_bytes).map_err(|e| EfError::Parse(e.to_string()))?;
+    let mut beef = beef_limits::parse_beef(beef_bytes, &beef_limits::EF_BEEF_LIMITS)
+        .map_err(|e| EfError::Parse(e.to_string()))?;
     // The subject is order-independent (atomic name → unique tip → the
     // reference's sorted-last); the sort below only orders the EF legs.
     let subject_txid = subject_txid_of(&mut beef).unwrap_or_default();
@@ -134,7 +136,7 @@ pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfErro
 /// txid-only hop was refused 400 while the hop was on the network — this is
 /// the list the route completes from the courier ladder before converting.
 pub fn missing_source_txids(beef_bytes: &[u8]) -> Vec<String> {
-    let Ok(mut beef) = Beef::from_binary(beef_bytes) else {
+    let Ok(mut beef) = beef_limits::parse_beef(beef_bytes, &beef_limits::EF_BEEF_LIMITS) else {
         return Vec::new();
     };
     let subject_txid = subject_txid_of(&mut beef).unwrap_or_default();
@@ -172,7 +174,7 @@ pub fn missing_source_txids(beef_bytes: &[u8]) -> Vec<String> {
 /// merged). Returns the re-serialized BEEF; a BEEF that does not parse, or a
 /// batch with nothing verified, comes back byte-identical.
 pub fn merge_raw_sources(beef_bytes: &[u8], raws: &[(String, String)]) -> Vec<u8> {
-    let Ok(mut beef) = Beef::from_binary(beef_bytes) else {
+    let Ok(mut beef) = beef_limits::parse_beef(beef_bytes, &beef_limits::EF_BEEF_LIMITS) else {
         return beef_bytes.to_vec();
     };
     let mut merged = 0usize;
@@ -218,7 +220,12 @@ pub fn merge_raw_sources(beef_bytes: &[u8], raws: &[(String, String)]) -> Vec<u8
 /// the caller REFUSES admission (fail-closed: never store an unverified
 /// mined-claim verbatim).
 pub fn strip_subject_bump(beef_bytes: &[u8], subject_txid: &str) -> Option<Vec<u8>> {
-    let mut tx = Transaction::from_beef(beef_bytes, Some(subject_txid)).ok()?;
+    let mut tx = beef_limits::transaction_from_beef(
+        beef_bytes,
+        Some(subject_txid),
+        &beef_limits::EF_BEEF_LIMITS,
+    )
+    .ok()?;
     if !tx.id().eq_ignore_ascii_case(subject_txid) {
         return None; // content-addressing belt — never rebuild the wrong tx
     }
@@ -261,7 +268,7 @@ pub fn strip_subject_bump(beef_bytes: &[u8], subject_txid: &str) -> Option<Vec<u
 /// txid-only entry with no tx data — the caller then refuses admission
 /// (fail-closed: an unverifiable claim never admits).
 pub fn proven_subject_raw(beef_bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut beef = Beef::from_binary(beef_bytes).ok()?;
+    let mut beef = beef_limits::parse_beef(beef_bytes, &beef_limits::EF_BEEF_LIMITS).ok()?;
     let subject_txid = subject_txid_of(&mut beef)?;
     let subject = beef
         .txs

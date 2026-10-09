@@ -39,6 +39,7 @@
 //! Ported/adapted from `~/bsv/zanaadu/overlay/src/beef_compaction.rs`.
 
 use bsv_rs::transaction::Beef;
+use overlay_engine::beef_limits;
 
 /// Diagnostic log that maps to `worker::console_log!` in the CF Worker
 /// (wasm32) build and to `eprintln!` on the host build (so the host-target
@@ -69,7 +70,7 @@ macro_rules! compaction_log {
 /// non-self-contained BEEF.
 pub fn compact_beef(subject_txid: &str, beef: &[u8]) -> Vec<u8> {
     // 1. Parse. On parse error, passthrough (never drop a BEEF we can't parse).
-    let mut parsed = match Beef::from_binary(beef) {
+    let mut parsed = match beef_limits::parse_beef(beef, &beef_limits::APP_BEEF_LIMITS) {
         Ok(b) => b,
         Err(e) => {
             compaction_log!(

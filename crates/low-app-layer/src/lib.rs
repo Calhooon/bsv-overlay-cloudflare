@@ -464,3 +464,6 @@ mod d1_ledger_door_pins {
         assert!(overlay.contains(&squash("crate::d1_ledger::boot(ensure_overlay_migrations(&db))")), "the overlay's migrations are keyed (boot)");
     }
 }
+
+#[cfg(test)]
+mod beef_door_replay;

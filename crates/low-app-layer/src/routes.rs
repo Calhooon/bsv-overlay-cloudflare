@@ -20,6 +20,7 @@
 //! of client chunk size. A chunk's D1 error still surfaces as the same 503.
 
 use crate::d1_ledger::Counted;
+use overlay_engine::beef_limits;
 use serde::Deserialize;
 use worker::wasm_bindgen::JsValue;
 use worker::{console_warn, Headers, Method, Request, RequestInit, Response, Result, RouteContext};
@@ -342,6 +343,7 @@ pub(crate) enum LoadFault {
     /// bsv-low M19 R2: a bump the current header refutes could not be
     /// stripped (a trimmed store): 503 until the overlay re-anchors.
     Refuted(u64),
+    OverLimit,
 }
 
 /// Load ONE stored BEEF by txid, with the same trust/guard/compaction
@@ -414,6 +416,7 @@ async fn load_stored_beef(
                 crate::beef_guard::Guarded::Refuted { height } => {
                     return Err(LoadFault::Refuted(height))
                 }
+                crate::beef_guard::Guarded::OverLimit => return Err(LoadFault::OverLimit),
             };
             // Serve-time compaction (#192/#193, P4), licensed ONLY by the
             // row's VERIFIED proof latch (bsv-low#304): trimming decides
@@ -438,6 +441,7 @@ fn load_fault_response(fault: LoadFault) -> Result<Response> {
     match fault {
         LoadFault::Db => json_error("database query failed", 503),
         LoadFault::Refuted(height) => json_error(&crate::beef_guard::refuted_body(height), 503),
+        LoadFault::OverLimit => json_error("stored BEEF exceeds parser limits", 413),
     }
 }
 
@@ -473,7 +477,7 @@ pub async fn credit_beef(_req: Request, ctx: RouteContext<AuthState>) -> Result<
         Ok(None) => return json_error(&format!("BEEF not found for txid: {txid}"), 404),
         Err(fault) => return load_fault_response(fault),
     };
-    let acc = match bsv_rs::transaction::Beef::from_binary(&subject) {
+    let acc = match beef_limits::parse_beef(&subject, &beef_limits::APP_BEEF_LIMITS) {
         Ok(b) => b,
         Err(e) => {
             console_warn!("[credit-beef] stored subject BEEF unparseable for {txid}: {e}");
@@ -3365,7 +3369,7 @@ pub(crate) async fn owed_recompute(
                     continue;
                 }
             };
-            let Ok(beef) = bsv_rs::transaction::Beef::from_binary(&bytes) else {
+            let Ok(beef) = beef_limits::parse_beef(&bytes, &beef_limits::APP_BEEF_LIMITS) else {
                 continue;
             };
             let Some(tx) = beef.find_txid(&sp).and_then(|t| t.tx().cloned()) else {
@@ -3678,9 +3682,12 @@ impl crate::owed::HomeWalkWorld for HomeWalkCouriers<'_> {
     }
     async fn stored_spender(&mut self, spender_txid: &str) -> Option<Vec<u8>> {
         match load_stored_beef(self.env, self.db, spender_txid).await {
-            Ok(Some(bytes)) => bsv_rs::transaction::Beef::from_binary(&bytes)
+            Ok(Some(bytes)) => beef_limits::parse_beef(&bytes, &beef_limits::APP_BEEF_LIMITS)
                 .ok()
-                .and_then(|beef| beef.find_txid(spender_txid).and_then(|t| t.tx().map(bsv_rs::transaction::Transaction::to_binary))),
+                .and_then(|beef| {
+                    beef.find_txid(spender_txid)
+                        .and_then(|t| t.tx().map(bsv_rs::transaction::Transaction::to_binary))
+                }),
             _ => None,
         }
     }
@@ -5913,10 +5920,11 @@ async fn arcade_confirmation_look(
             None,
         )),
         ArcadeWord::Mined { bump_hex, height } => {
-            let claimed = bsv_rs::transaction::MerklePath::from_hex(&bump_hex)
-                .ok()
-                .and_then(|mp| mp.compute_root(Some(txid_lc)).ok())
-                .map(|r| r.to_ascii_lowercase())?;
+            let claimed =
+                beef_limits::merkle_path_from_hex(&bump_hex, beef_limits::COURIER_PROOF_MAX_BYTES)
+                    .ok()
+                    .and_then(|mp| mp.compute_root(Some(txid_lc)).ok())
+                    .map(|r| r.to_ascii_lowercase())?;
             let canonical = crate::beef_guard::canonical_root(env, height).await?;
             if claimed != canonical {
                 console_warn!(

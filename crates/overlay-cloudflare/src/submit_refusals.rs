@@ -48,6 +48,7 @@
 //! read alone.
 
 use crate::d1::{QVal, Query};
+use overlay_engine::beef_limits;
 use worker::*;
 
 /// Migration 161: the ledger, ONE row per hop outpoint. `refusedTxid` is the newest refused subject that named
@@ -105,7 +106,7 @@ pub struct SignedSpend {
 /// a source the BEEF does not carry, a non-P2PKH source, or a script that does not verify contributes nothing. A
 /// subject with more than `SUBMIT_REFUSAL_MAX_INPUTS` inputs is not a JOIN: nothing is judged.
 pub fn signed_p2pkh_spends(beef_bytes: &[u8], subject_txid: &str) -> Vec<SignedSpend> {
-    let Ok(beef) = bsv_rs::transaction::Beef::from_binary(beef_bytes) else {
+    let Ok(beef) = beef_limits::parse_beef(beef_bytes, &beef_limits::EF_BEEF_LIMITS) else {
         return Vec::new();
     };
     let Some(tx) = beef.find_txid(subject_txid).and_then(|t| t.tx().cloned()) else {

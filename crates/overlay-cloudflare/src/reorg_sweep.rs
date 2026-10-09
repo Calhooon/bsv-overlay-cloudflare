@@ -20,6 +20,7 @@
 //! Fail-safe on every uncertain arm: a header-source fault is counted and
 //! changes nothing; no header source examines nothing.
 
+use overlay_engine::beef_limits;
 use std::collections::HashMap;
 
 use bsv_rs::transaction::{Beef, ChainTracker, MerklePath};
@@ -73,10 +74,11 @@ pub(crate) async fn verify_bump_memoized(
     bump_hex: &str,
     txid: &str,
 ) -> Result<bool, String> {
-    let bump = match MerklePath::from_hex(bump_hex) {
-        Ok(b) => b,
-        Err(_) => return Ok(false),
-    };
+    let bump =
+        match beef_limits::merkle_path_from_hex(bump_hex, beef_limits::STORED_PROOF_MAX_BYTES) {
+            Ok(b) => b,
+            Err(_) => return Ok(false),
+        };
     let root = match bump.compute_root(Some(txid)) {
         Ok(r) => r,
         Err(_) => return Ok(false),
@@ -104,7 +106,7 @@ pub const WALK_TRANSACTIONS: &str = "transactions";
 /// What a stored BEEF's OWN bump for `txid` anchors it to (height + the
 /// root it computes), if the BEEF parses and carries one.
 pub fn stored_bump_anchor(stored_beef: &[u8], txid: &str) -> Option<BumpAnchor> {
-    let beef = Beef::from_binary(stored_beef).ok()?;
+    let beef = beef_limits::parse_beef(stored_beef, &beef_limits::STORED_BEEF_LIMITS).ok()?;
     let bump = own_bump(&beef, txid)?;
     let root = bump.compute_root(Some(txid)).ok()?.to_ascii_lowercase();
     Some(BumpAnchor {
@@ -127,7 +129,7 @@ fn own_bump<'a>(beef: &'a Beef, txid: &str) -> Option<&'a MerklePath> {
 
 /// The hex of a stored BEEF's OWN bump for `txid`, if any.
 pub(crate) fn stored_bump_hex(stored_beef: &[u8], txid: &str) -> Option<String> {
-    let beef = Beef::from_binary(stored_beef).ok()?;
+    let beef = beef_limits::parse_beef(stored_beef, &beef_limits::STORED_BEEF_LIMITS).ok()?;
     own_bump(&beef, txid).map(MerklePath::to_hex)
 }
 
@@ -262,7 +264,7 @@ enum LadderReanchor {
 
 /// The anchor a verified pushed proof names for `txid`.
 fn pushed_anchor(hex: &str, txid: &str) -> Option<BumpAnchor> {
-    let mp = MerklePath::from_hex(hex).ok()?;
+    let mp = beef_limits::merkle_path_from_hex(hex, beef_limits::STORED_PROOF_MAX_BYTES).ok()?;
     let root = mp.compute_root(Some(txid)).ok()?.to_ascii_lowercase();
     Some(BumpAnchor {
         height: u64::from(mp.block_height),
@@ -698,9 +700,10 @@ async fn courier_recheck(
             return;
         }
     };
-    let proof_height = MerklePath::from_hex(&proof_hex)
-        .ok()
-        .map(|mp| u64::from(mp.block_height));
+    let proof_height =
+        beef_limits::merkle_path_from_hex(&proof_hex, beef_limits::STORED_PROOF_MAX_BYTES)
+            .ok()
+            .map(|mp| u64::from(mp.block_height));
     match proof_height {
         Some(h) if rec.spent_height == Some(h) => {
             // agree: heal by stitching the proof into the stored BEEF (needs
