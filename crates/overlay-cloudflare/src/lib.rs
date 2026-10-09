@@ -2484,3 +2484,6 @@ mod tests {
 // first `#[cfg(test)]`.
 #[cfg(test)]
 mod arcade_vector_replay;
+
+#[cfg(test)]
+mod beef_door_replay;

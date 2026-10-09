@@ -26,6 +26,7 @@
 
 pub mod advertiser;
 pub mod broadcaster;
+pub mod beef_limits;
 pub mod builder;
 pub mod engine;
 pub mod gasp;
