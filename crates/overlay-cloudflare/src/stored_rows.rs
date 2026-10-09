@@ -211,6 +211,9 @@ fn rows(db: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Option<V
 }
 
 /// Load one JSON file of `wrangler d1 execute --json` as table `table`.
+// `#[cfg(test)]` again on the item: the module is test-only (lib.rs), and
+// the ownership checker reads an item's own attribute.
+#[cfg(test)]
 fn load_json(db: &Connection, table: &str, json: &str) -> Result<(), String> {
     let parsed: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
     let results: Vec<&serde_json::Value> = match &parsed {
@@ -281,6 +284,9 @@ fn r2_object(dir: Option<&Path>, key: &str) -> Option<Vec<u8>> {
 
 /// Read every stored BEEF of the export `inputs` (and the R2 objects in
 /// `r2_dir`) through the Worker's readers.
+// `#[cfg(test)]` again on the item: the module is test-only (lib.rs), and
+// the ownership checker reads an item's own attribute.
+#[cfg(test)]
 pub(crate) fn read_export(inputs: &[PathBuf], r2_dir: Option<&Path>) -> Result<Summary, String> {
     let db = Connection::open_in_memory().map_err(|e| e.to_string())?;
     for path in inputs {
