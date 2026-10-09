@@ -1312,6 +1312,9 @@ impl<'a> GASPSync<'a> {
         .await;
 
         let graph_id = Self::graph_id_of(self.walk.borrow().as_ref(), outpoint);
+        // Whether a record of this graph is still held: not after a
+        // `root_proven` restart, whose walk is fresh.
+        let resumed = self.walk.borrow().as_ref().is_some_and(|w| w.resumed);
         let reason = match ended {
             Ok(WalkEnd::Done) => match self.complete_graph(&graph_id).await {
                 Ok(true) => return Ok(Ingested::Completed),
@@ -1326,7 +1329,11 @@ impl<'a> GASPSync<'a> {
                 }
                 // `complete_graph` discarded the graph already.
                 Err(GASPError::AnchorUnavailable(_)) => "anchor_unavailable",
-                Err(_) => "fault",
+                // A finalize fault: the graph is still in hand.
+                Err(_) => {
+                    let _ = self.storage.discard_graph(&graph_id).await;
+                    "fault"
+                }
             },
             Ok(WalkEnd::Deferred(reason)) => {
                 let _ = self.storage.discard_graph(&graph_id).await;
