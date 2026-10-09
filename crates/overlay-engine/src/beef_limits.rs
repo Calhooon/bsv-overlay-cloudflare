@@ -104,6 +104,18 @@ pub fn merkle_path_from_hex(hex: &str, max_bytes: usize) -> bsv_rs::Result<Merkl
     MerklePath::from_binary(&bytes)
 }
 
+/// Whether a bounded parse failed on a LIMIT (the size cap of [`check_size`],
+/// the SDK's `max_txs` / `max_bumps` prefix counts) rather than on the bytes
+/// themselves. A door refuses a breach before anything else looks at the body;
+/// a body under the limits that does not parse is an ARRIVAL the route still
+/// counts (the #366 census) and answers with its own parse error, as before
+/// the doors. The SDK names a breach only in its message ("over max_bumps",
+/// "over max_txs"; ours "over max_bytes"), bsv-rs 0.3.35 (caret, held by
+/// the lock); the pin below fails at the next bump that rewords it.
+pub fn is_limit_breach(e: &bsv_rs::Error) -> bool {
+    matches!(e, bsv_rs::Error::BeefError(msg) if msg.contains("over max_"))
+}
+
 /// Shared pre-read/pre-decode length check. A malformed body over the cap is
 /// refused for size without asking its parser to look at it.
 pub fn check_size(size: usize, max_bytes: usize, kind: &str) -> bsv_rs::Result<()> {
@@ -113,4 +125,28 @@ pub fn check_size(size: usize, max_bytes: usize, kind: &str) -> bsv_rs::Result<(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod limit_breach_pin {
+    use super::*;
+
+    #[test]
+    fn a_size_breach_is_a_breach() {
+        let e = check_size(11, 10, "BEEF").unwrap_err();
+        assert!(is_limit_breach(&e), "{e}");
+    }
+
+    #[test]
+    fn a_count_breach_is_a_breach_and_garbage_is_not() {
+        // A BEEF prefix (version 4022206465 LE) claiming 300 BUMPs under a cap of 1.
+        let mut bin = vec![0x01, 0x00, 0xbe, 0xef];
+        bin.extend_from_slice(&[0xfd, 0x2c, 0x01]); // varint 300
+        let tight = BeefLimits { max_txs: 1, max_bumps: 1, max_bytes: SUBMIT_BODY_MAX_BYTES };
+        let e = parse_beef(&bin, &tight).unwrap_err();
+        assert!(is_limit_breach(&e), "a count breach must classify as a breach: {e}");
+        let garbage = [0xde, 0xad, 0xbe, 0xef];
+        let e = parse_beef(&garbage, &SUBMIT_BEEF_LIMITS).unwrap_err();
+        assert!(!is_limit_breach(&e), "garbage under the limits is a parse fault, not a breach: {e}");
+    }
 }

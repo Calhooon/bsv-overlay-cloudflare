@@ -689,9 +689,16 @@ async fn submit_inner(
     };
 
     // Refuse count/size violations before the census, mode selection, EF
-    // conversion or any other parse. Keep the route's parse-error response.
+    // conversion or any other parse. ONLY a breach of the limits is refused
+    // here: a body under them that does not parse is still an ARRIVAL the
+    // #366 census counts (`wouldHaveFailed(parse)`) and the route answers it
+    // with its own parse error further down, through the same bounded
+    // readers, as before P0-5f (the door at a8a8d73 refused every parse
+    // fault here and the census never saw one; found by `make ci-route`).
     if let Err(e) = beef_limits::parse_beef(&beef, &beef_limits::SUBMIT_BEEF_LIMITS) {
-        return json_error(&format!("BEEF parse error: {e}"), 400);
+        if beef_limits::is_limit_breach(&e) {
+            return json_error(&format!("BEEF parse error: {e}"), 400);
+        }
     }
 
     // `mut`: the broadcast-gated mined-claim arm strips the subject's
