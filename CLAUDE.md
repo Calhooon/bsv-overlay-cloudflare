@@ -998,12 +998,21 @@ skipped the tick its block landed, then waited for the 6 h probe (DELTA2-1).
 The DECAY (`PEER_YIELDLESS_DECAY_SECS`, 6 h): a yieldless sync more than 6 h
 after the streak's LAST one starts a new streak, so an honest peer's rare
 graphs that never land, hours apart, are not counted across days; quiet syncs
-between leave the streak. Its cost, stated: a peer yieldless for 3 h, quiet
+between leave the streak. The decay applies only to a peer that is NOT
+failed (`consecutive_failures` 0; the delta-3 fold's D3-M1): it equals the 6 h
+reprobe, so on `9280aed` the probe of a peer quarantined by this bound always
+came more than 6 h after its last yieldless sync (a sync lasts seconds), started
+a fresh streak, "progressed", reset the failures and lifted the quarantine at
+every probe (100 of 200 ticks at `*/15`, 940 of 3000 at one a minute, over the
+shipped SQL). The yield runs before the outcome, so the probe now continues
+the streak and fails (27 of 200). Its cost: a peer that failed for any reason
+(a hang, #302) keeps its old streak past 6 h quiet until it succeeds once.
+Stated too: a peer yieldless for 3 h, quiet
 for 6 h, and so on, keeps its slice in the yieldless hours (a third of its
 ticks at most), as #302's residual. At `*/15` a hostile peer is still counted
 failed from its 13th yieldless sync (3 h) and quarantined at its 20th (5 h);
 at one tick a minute from 3 h on and quarantined 8 ticks later; then one
-probe per 6 h. Why 12 and 3 h: an honest deep graph converges inside both.
+probe per 6 h, each probe failed. Why 12 and 3 h: an honest deep graph converges inside both.
 The measured one (#582) is an unproven head; the pass after its block lands
 restarts from the proven root (`root_proven`), one or two passes after a block
 that comes in ~10 min on average (past 3 h about once in 10^8 by the
@@ -1023,15 +1032,22 @@ spelling it advertised: `is_advertisable_uri` passes `/?1`, `/?2`, `:8443`,
 `/#x`, a trailing slash (DELTA2-3), each with its own share, its own
 quarantine and a fresh streak. The engine passes the origin to the three
 peer-health methods; the cursor and the records stay keyed by the URL the
-peer is synced at. A SHIP topic's peers are ONE per origin
-(`gasp::ship_peers_by_origin`): each advert is canonicalized to
-`scheme://host[:port]` and of the spellings of one origin the `https`, then
-default-port, then first by string is synced, so a stranger's spelling of an
-honest host (a query, a dead port) cannot stand beside that host's advert
-under its key; every spelling of our own origin is ourselves. Stated: a
+peer is synced at. A SHIP topic's peers are ONE per canonical authority
+(`gasp::ship_peers_by_origin`, the delta-3 fold's D3-L1): each advert is
+canonicalized to `scheme://host[:port]` (the scheme's default port dropped)
+and the spellings of one form (a query, a fragment, a user, a trailing slash
+or dot, `:443`) are one peer; every spelling of our own origin is ourselves.
+Distinct ports and schemes of one host stay distinct peers under that
+origin's ONE quarantine, streak and share: on `9280aed` one origin kept one
+peer, ranked `https` then no port, so a stranger's default-port spelling
+(`https://honest.example/?x`) DISPLACED an honest overlay serving on `:8443`.
+Stated: a stranger's ports of its own host are one peer each, a per-peer
+slice each per tick, until their shared quarantine (bounded by the outer
+240 s, after the configured topics; the URL-keyed peers before the delta-2
+fold took every spelling). A
 SUBDOMAIN is another origin (no public suffix list; the reserve below is what
 protects configured peers from it); two overlays of one host on two ports on
-one SHIP topic are one peer; two configured URLs of one host on one topic
+one SHIP topic are two peers sharing one quarantine; two configured URLs of one host on one topic
 share one quarantine; a peer's health rows written before the fold (keyed by
 URL) are left behind and its streak starts afresh; a SHIP peer whose advert
 ends in `/` gets a new cursor key (`https://h`) and is listed again from 0
@@ -1225,6 +1241,38 @@ statements, read verbatim out of the Rust source with literal binds, on local
 D1. Stated (D2-N3, the delta-2 lens): `gasp_peer_health` is not served on
 `/health/invariants`; an operator sees a streak only in the per-topic
 `errors` line once it is past both bounds.
+
+The delta-3 fold (the delta-3 lens on `9280aed`). D3-M1 and D3-L1 above.
+Its NOTEs, stated:
+- D3-N1: the engine's pins modelled a zero-duration sync (the yield and the
+  attempt stamped at one instant, 900 s a tick), on the `>` boundary D1 never
+  hits; that is how D3-M1 passed. A pin at a timing boundary steps past it
+  (`e555d3_m1` runs 901 s a tick).
+- D3-N2: `idle_faults` counts PASSES, not time: at one tick a minute a 3-minute
+  partial outage of an honest peer (it lists, its node requests 5xx) drops
+  its record; a flapping 5xx at rate p drops one about p^3 a pass. The cost
+  is that record's progress; a fresh walk keeps a new record once it paid
+  half its budget (D2-L1), and an unproven head restarts `root_proven`.
+- D3-N3: D2-L1 halves a FAST stranger's price of a record (50 tiny nodes and
+  a 503 keep a `fault` record), bounded as the `calls` records are: one
+  origin's 32 rows inside the discovered 128; configured peers unaffected.
+- D3-N4: the worker's configured peers (9 (peer, topic) pairs x 16) can hold
+  144 rows, past the 128 reserved while the discovered half is full, and in
+  bytes past the 64 MiB global; a configured save has no per-origin share, so
+  one configured peer's records can crowd out another's (that save is
+  `too_many` and the walk goes on, L4). In practice only `tm_uhrp` defers.
+  `storage-ownership.json`'s `holds` for `gasp_deferred_graphs` does not name
+  the discovered half (cosmetic).
+
+Pins, each RED on `9280aed`'s sources (the tests over them):
+`e555d3_m1_the_probe_of_a_quarantined_yieldless_peer_fails_and_rearms`
+(DELTA3-1b, 901 s a tick, 27 of 200 attended, every probe failed; RED at tick
+44, failures 0), `e555d3_m1_the_decay_is_only_for_a_peer_that_is_not_failed`
+(the model), `e555d2_m2_spellings_of_one_server_are_one_origin_and_one_peer`
+(amended: ports and schemes stand apart, `:443` collapses), and the worker's
+`d1_storage::tests::e555d3_m1_the_probe_of_a_quarantined_peer_continues_its_streak`
+(the lens's sequence over the SHIPPED statements, 15 s syncs at `*/15`: 27 of
+200; RED at tick 44).
 
 ## Storage ownership (bsv-low #474)
 
