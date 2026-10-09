@@ -67,7 +67,7 @@ door!(dead_letter, DEAD_LETTER_BEEF_LIMITS);
 door!(census, CENSUS_BEEF_LIMITS);
 
 #[tokio::test]
-async fn actual_core_submit_refuses_counts_even_without_spv() {
+async fn actual_core_submit_at_and_one_over_every_bound_without_spv() {
     let engine = Engine::new(
         HashMap::new(),
         HashMap::new(),
@@ -75,10 +75,21 @@ async fn actual_core_submit_refuses_counts_even_without_spv() {
         None,
         EngineConfig::default(),
     );
-    for (bytes, _) in [shapes::transactions(513), shapes::bumps(513)] {
+    for (at, over) in [
+        (shapes::transactions(512).0, shapes::transactions(513).0),
+        (shapes::bumps(512).0, shapes::bumps(513).0),
+        (
+            shapes::sized_body(ENGINE_BEEF_LIMITS.max_bytes).0,
+            shapes::sized_body(ENGINE_BEEF_LIMITS.max_bytes + 1).0,
+        ),
+    ] {
+        assert!(engine
+            .submit(&TaggedBEEF::new(at, vec![]), SubmitMode::HistoricalTxNoSpv)
+            .await
+            .is_ok());
         let result = engine
             .submit(
-                &TaggedBEEF::new(bytes, vec![]),
+                &TaggedBEEF::new(over, vec![]),
                 SubmitMode::HistoricalTxNoSpv,
             )
             .await;
@@ -90,10 +101,19 @@ async fn actual_core_submit_refuses_counts_even_without_spv() {
 }
 
 #[test]
-fn actual_stored_stitch_refuses_counts() {
-    for (bytes, id) in [shapes::transactions(513), shapes::bumps(513)] {
-        let proof = MerklePath::from_coinbase_txid(&id, 800_000);
-        assert!(Engine::stitch_proof_into_stored_beef(&bytes, &id, &proof).is_none());
+fn actual_stored_stitch_at_and_one_over_every_bound() {
+    for (at, over) in [
+        (shapes::transactions(512), shapes::transactions(513)),
+        (shapes::bumps(512), shapes::bumps(513)),
+        (
+            shapes::sized_body(STORED_BEEF_LIMITS.max_bytes),
+            shapes::sized_body(STORED_BEEF_LIMITS.max_bytes + 1),
+        ),
+    ] {
+        let proof = MerklePath::from_coinbase_txid(&at.1, 800_000);
+        assert!(Engine::stitch_proof_into_stored_beef(&at.0, &at.1, &proof).is_some());
+        let proof = MerklePath::from_coinbase_txid(&over.1, 800_000);
+        assert!(Engine::stitch_proof_into_stored_beef(&over.0, &over.1, &proof).is_none());
     }
 }
 
