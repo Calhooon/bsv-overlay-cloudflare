@@ -497,18 +497,6 @@ impl MutationReport {
     }
 }
 
-/// What a merkle path proves during the linear submit walk
-/// ([`Engine::verify_beef_linear`] and [`Engine::verify_scripts_only`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RootPolicy {
-    /// The reference's `tx.verify(chainTracker)`: a proven transaction's root
-    /// is checked against the chain tracker when one is configured.
-    AgainstTracker,
-    /// The reference's `tx.verify('scripts only')`: a proven transaction is
-    /// trusted as-is; no root is computed and no tracker is consulted.
-    AcceptUnchecked,
-}
-
 /// The DOOR's static work bound (bsv-low W-A gate MED-1, 2026-09-09). Bitcoin
 /// script has no loops: every opcode runs at most once, so an input's work is
 /// bounded BEFORE execution by its opcode census times the interpreter's
@@ -518,16 +506,20 @@ enum RootPolicy {
 /// outputs). The estimate is computed from the bytes; nothing executes past
 /// the budget, and a budget breach is the DOOR's verdict (inconclusive: the
 /// network judges), never the interpreter's.
+///
+/// THE ONE LIMB (bsv-low #585, door 1). Until #585 the budget also counted
+/// the BODY: 64 unproven transactions, 256 inputs per transaction, 512 KB per
+/// transaction, and the parse's own size and counts. A valid BEEF is never
+/// left unjudged for its size or its counts, so those are gone: the walk
+/// reads the body through the streaming reader ([`crate::script_door`]), its
+/// memory is one element and an index entry per element, and what a Worker's
+/// CPU slice bounds is the WORK, which is this budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DoorBudget {
-    /// Unproven transactions the walk may execute (the subject + its ancestry).
-    pub max_unproven_txs: usize,
-    /// Inputs per unproven transaction (the walk clones the other inputs per
-    /// input: O(n²) in a transaction's inputs).
-    pub max_inputs_per_tx: usize,
-    /// Serialized bytes of one unproven transaction (bounds every preimage).
-    pub max_tx_bytes: usize,
-    /// The interpreter's stack memory limit: bounds every element.
+    /// The interpreter's stack memory limit: bounds every element, and is the
+    /// unit of the work estimate (a hash-class opcode is charged one element).
+    /// Not a bound on the BEEF: a script that trips it is "the network
+    /// judges", as a breach of the work is.
     pub memory_limit: usize,
     /// The whole walk's estimated work, in bytes hashed or pushed.
     pub max_work_bytes: u64,
@@ -553,11 +545,10 @@ impl DoorBudget {
     /// the request proceeds); all of them cost the beta overlay CPU until
     /// bsv-rs meters work dynamically (a `work_limit` charged per op with the
     /// real operand sizes, and a pre-allocation check in NUM2BIN) — OWED
-    /// before any PROD flip of `SCRIPT_VERIFY_NETWORK_GATED`.
+    /// before any PROD flip of `SCRIPT_VERIFY_NETWORK_GATED`. Since #585 the
+    /// count of such rounds is bounded by the body alone (the script bytes
+    /// are charged, the transactions and inputs are not counted).
     pub const DEFAULT: DoorBudget = DoorBudget {
-        max_unproven_txs: 64,
-        max_inputs_per_tx: 256,
-        max_tx_bytes: 512 * 1024,
         memory_limit: 128 * 1024,
         max_work_bytes: 64 * 1024 * 1024,
     };
@@ -585,22 +576,13 @@ pub struct WalkStats {
     pub subject_judged: bool,
 }
 
-/// How the linear walk is run: the reference's walk (no budget; structural
-/// faults are `SpvError`) or the door's (`'scripts only'`, a budget, and the
-/// door's own error classes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WalkPolicy {
-    roots: RootPolicy,
-    budget: Option<DoorBudget>,
-}
-
 /// Static opcode census of one input's scripts: (bytes, hash ops, sig ops).
 ///
 /// A CHECKMULTISIG is weighted by its KEY COUNT: the small-int push that
 /// precedes it when the script states the count (the Poc5 covenant's
 /// `OP_3`), else the most 33-byte keys the element limit admits (the count is
 /// a computed value the census cannot see; bsv-rs allows up to `i32::MAX`).
-fn script_census(
+pub(crate) fn script_census(
     unlocking: &[u8],
     locking: &[u8],
     memory_limit: usize,
@@ -1034,7 +1016,10 @@ impl Engine {
     ///
     /// Runs under [`DoorBudget::DEFAULT`]: the work is bounded statically
     /// before anything executes, and the interpreter's stack memory limit is
-    /// the budget's element limit.
+    /// the budget's element limit. The body is read through the streaming
+    /// reader ([`crate::script_door`], bsv-low #585): no bound on its size,
+    /// its transactions or a transaction's inputs or bytes; the work budget
+    /// is the one limb.
     ///
     /// Errors: [`EngineError::ScriptVerificationFailed`] is the INTERPRETER's
     /// verdict and the only refusal; [`EngineError::ScriptWalkInconclusive`]
@@ -1043,22 +1028,17 @@ impl Engine {
     /// the door's own bound (the static budget or the memory limit) — both
     /// name whether the SUBJECT was judged before the fault, and a caller with
     /// a stronger bar behind it does not refuse on either.
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_self,
+        reason = "the door's callers await it on an engine; 'scripts only' asks no tracker and reads no state"
+    )]
     pub async fn verify_scripts_only(
         &self,
         beef_bytes: &[u8],
         subject_txid: &str,
     ) -> Result<WalkStats, EngineError> {
-        Self::verify_beef_linear_with(
-            self.chain_tracker.as_deref(),
-            beef_bytes,
-            subject_txid,
-            WalkPolicy {
-                roots: RootPolicy::AcceptUnchecked,
-                budget: Some(DoorBudget::DEFAULT),
-            },
-            &HashSet::new(),
-        )
-        .await
+        crate::script_door::walk(beef_bytes, subject_txid, DoorBudget::DEFAULT)
     }
 
     // ========================================================================
@@ -2655,6 +2635,12 @@ impl Engine {
     /// source looked up by txid, plus the reference's value rule (outputs
     /// never exceed inputs). No source objects are cloned or linked.
     ///
+    /// The tracker is an ARGUMENT, not `self`'s: the GASP anchor check
+    /// ([`verify_spv_like_the_reference`]) runs this same walk from
+    /// `OverlayGASPStorage`, which borrows the engine's tracker. The DOOR's
+    /// walk (`'scripts only'` under a work budget) was this one with a policy
+    /// until bsv-low #585; it reads the stream now ([`crate::script_door`]).
+    ///
     /// Why not bsv-rs `Transaction::verify`: it walks `source_transaction`
     /// links that `from_beef` builds by CLONING, once per input. Two inputs
     /// sourcing the same unproven parent (a covenant head output plus that
@@ -2670,44 +2656,8 @@ impl Engine {
         subject_txid: &str,
         trusted: &HashSet<String>,
     ) -> Result<(), EngineError> {
-        Self::verify_beef_linear_with(
-            chain_tracker,
-            beef_bytes,
-            subject_txid,
-            WalkPolicy {
-                roots: RootPolicy::AgainstTracker,
-                budget: None,
-            },
-            trusted,
-        )
-        .await
-        .map(|_| ())
-    }
-
-    /// The linear walk of [`Engine::verify_beef_linear`], parameterised by what
-    /// a merkle path means (checked against the chain tracker — the reference's
-    /// `tx.verify(chainTracker)` — or trusted unchecked, its `'scripts only'`)
-    /// and by an optional door budget (see [`DoorBudget`]). With a budget the
-    /// structural faults become [`EngineError::ScriptWalkInconclusive`] and a
-    /// bound breach [`EngineError::ScriptWalkOverBudget`], each naming whether
-    /// the subject was judged; without one they are `SpvError`, as before.
-    ///
-    /// The tracker is an ARGUMENT, not `self`'s: the GASP anchor check
-    /// ([`verify_spv_like_the_reference`]) runs this same walk from
-    /// `OverlayGASPStorage`, which borrows the engine's tracker.
-    async fn verify_beef_linear_with(
-        chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
-        beef_bytes: &[u8],
-        subject_txid: &str,
-        policy: WalkPolicy,
-        trusted: &HashSet<String>,
-    ) -> Result<WalkStats, EngineError> {
         use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
         use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
-
-        let roots = policy.roots;
-        let budget = policy.budget;
-        let mut stats = WalkStats::default();
 
         let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
             .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
@@ -2725,29 +2675,9 @@ impl Engine {
         // leaf of each BUMP to one root, so the root from any of them is it.
         let proven_in = proven_index(&beef);
         let mut checked: HashSet<usize> = HashSet::new();
-        // A structural fault: the reference walk's `SpvError`; the door's
-        // `ScriptWalkInconclusive` naming the transaction and whether the
-        // subject had already been judged.
-        let fault = |at_txid: &str, subject_judged: bool, msg: String| -> EngineError {
-            if budget.is_some() {
-                EngineError::ScriptWalkInconclusive {
-                    at_txid: at_txid.to_string(),
-                    subject_judged,
-                    reason: msg,
-                }
-            } else {
-                EngineError::SpvError(format!("Unable to verify SPV information: {msg}"))
-            }
-        };
+        // A structural fault is the reference walk's `SpvError`.
         let spv =
             |msg: String| EngineError::SpvError(format!("Unable to verify SPV information: {msg}"));
-        let over = |at_txid: &str, subject_judged: bool, what: String| -> EngineError {
-            EngineError::ScriptWalkOverBudget {
-                at_txid: at_txid.to_string(),
-                subject_judged,
-                what,
-            }
-        };
 
         // A trusted transaction (one an earlier walk of the same submit
         // passed over) is neither checked nor descended again.
@@ -2757,22 +2687,10 @@ impl Engine {
             if !seen.insert(txid.clone()) {
                 continue;
             }
-            let judged = stats.subject_judged;
             let Some(tx) = by_txid.get(&txid).copied() else {
-                return Err(fault(
-                    &txid,
-                    judged,
-                    format!("transaction {txid} is not in the BEEF"),
-                ));
+                return Err(spv(format!("transaction {txid} is not in the BEEF")));
             };
             if let Some(&at) = proven_in.get(txid.as_str()) {
-                if roots == RootPolicy::AcceptUnchecked {
-                    // 'scripts only': a proven transaction is trusted as-is —
-                    // no root computed, no tracker asked (the reference adds it
-                    // to the verified set and stops). The caller's bar is the
-                    // network's acceptance, never this proof.
-                    continue;
-                }
                 if checked.contains(&at) {
                     continue; // its BUMP's root is the chain's, asked once
                 }
@@ -2805,44 +2723,6 @@ impl Engine {
             }
 
             // Unproven: the value rule and every input's script, sources by txid.
-            // The door's bounds, judged from the BYTES before anything runs.
-            let tx_bytes = tx.to_binary().len();
-            if let Some(b) = budget {
-                stats.unproven_txs += 1;
-                if stats.unproven_txs > b.max_unproven_txs {
-                    return Err(over(
-                        &txid,
-                        judged,
-                        format!(
-                            "more than {} unproven transactions to execute",
-                            b.max_unproven_txs
-                        ),
-                    ));
-                }
-                if tx.inputs.len() > b.max_inputs_per_tx {
-                    return Err(over(
-                        &txid,
-                        judged,
-                        format!(
-                            "transaction {txid} has {} inputs (limit {})",
-                            tx.inputs.len(),
-                            b.max_inputs_per_tx
-                        ),
-                    ));
-                }
-                if tx_bytes > b.max_tx_bytes {
-                    return Err(over(
-                        &txid,
-                        judged,
-                        format!(
-                            "transaction {txid} is {tx_bytes} bytes (limit {})",
-                            b.max_tx_bytes
-                        ),
-                    ));
-                }
-            } else {
-                stats.unproven_txs += 1;
-            }
             let outputs: Vec<TxOutput> = tx
                 .outputs
                 .iter()
@@ -2854,79 +2734,32 @@ impl Engine {
             let mut input_total: u64 = 0;
             for (vin, input) in tx.inputs.iter().enumerate() {
                 let Some(src_txid) = input.source_txid.clone() else {
-                    return Err(fault(
-                        &txid,
-                        judged,
-                        format!("input {vin} of transaction {txid} names no source"),
-                    ));
+                    return Err(spv(format!(
+                        "input {vin} of transaction {txid} names no source"
+                    )));
                 };
                 let Some(source) = by_txid.get(&src_txid).copied() else {
-                    return Err(fault(
-                        &txid,
-                        judged,
-                        format!("input {vin} of transaction {txid} has no source transaction"),
-                    ));
+                    return Err(spv(format!(
+                        "input {vin} of transaction {txid} has no source transaction"
+                    )));
                 };
                 let Some(source_output) = source.outputs.get(input.source_output_index as usize)
                 else {
-                    return Err(fault(
-                        &txid,
-                        judged,
-                        format!(
-                            "input {vin} of transaction {txid}: source output index out of bounds"
-                        ),
-                    ));
+                    return Err(spv(format!(
+                        "input {vin} of transaction {txid}: source output index out of bounds"
+                    )));
                 };
                 let source_sats = source_output.satoshis.unwrap_or(0);
-                input_total = input_total.checked_add(source_sats).ok_or_else(|| {
-                    fault(
-                        &txid,
-                        judged,
-                        format!("satoshi total overflows in transaction {txid}"),
-                    )
-                })?;
+                input_total = input_total
+                    .checked_add(source_sats)
+                    .ok_or_else(|| spv(format!("satoshi total overflows in transaction {txid}")))?;
                 let Some(unlocking) = input.unlocking_script.as_ref() else {
-                    return Err(fault(
-                        &txid,
-                        judged,
-                        format!(
-                            "input {vin} of transaction {txid} is missing its unlocking script"
-                        ),
-                    ));
+                    return Err(spv(format!(
+                        "input {vin} of transaction {txid} is missing its unlocking script"
+                    )));
                 };
-                // The door's static charge for this input (nothing has run yet).
                 let unlocking_bytes = unlocking.to_binary();
                 let locking_bytes = source_output.locking_script.to_binary();
-                if let Some(b) = budget {
-                    let (bytes, hash_ops, sig_ops) =
-                        script_census(&unlocking_bytes, &locking_bytes, b.memory_limit).map_err(
-                            |e| {
-                                fault(
-                                    &txid,
-                                    judged,
-                                    format!("input {vin} of transaction {txid}: {e}"),
-                                )
-                            },
-                        )?;
-                    stats.script_bytes += bytes;
-                    stats.hash_ops += hash_ops;
-                    stats.sig_ops += sig_ops;
-                    stats.work_bytes += bytes as u64
-                        + (hash_ops as u64) * (b.memory_limit as u64)
-                        + (sig_ops as u64) * (tx_bytes as u64);
-                    if stats.work_bytes > b.max_work_bytes {
-                        return Err(over(
-                            &txid,
-                            judged,
-                            format!(
-                                "estimated work {} bytes exceeds the door budget of {} (input {vin} of {txid})",
-                                stats.work_bytes, b.max_work_bytes
-                            ),
-                        ));
-                    }
-                } else {
-                    stats.script_bytes += unlocking_bytes.len() + locking_bytes.len();
-                }
                 let other_inputs: Vec<TxInput> = tx
                     .inputs
                     .iter()
@@ -2946,14 +2779,14 @@ impl Engine {
                 let source_txid_bytes = input
                     .get_source_txid_bytes()
                     .map_err(|e| spv(format!("input {vin} of transaction {txid}: {e}")))?;
-                let locking_script =
-                    LockingScript::from_script(Script::from_binary(&locking_bytes).map_err(
-                        |e| fault(&txid, judged, format!("locking script of {src_txid}: {e}")),
-                    )?);
-                let unlocking_script =
-                    UnlockingScript::from_script(Script::from_binary(&unlocking_bytes).map_err(
-                        |e| fault(&txid, judged, format!("unlocking script of {txid}: {e}")),
-                    )?);
+                let locking_script = LockingScript::from_script(
+                    Script::from_binary(&locking_bytes)
+                        .map_err(|e| spv(format!("locking script of {src_txid}: {e}")))?,
+                );
+                let unlocking_script = UnlockingScript::from_script(
+                    Script::from_binary(&unlocking_bytes)
+                        .map_err(|e| spv(format!("unlocking script of {txid}: {e}")))?,
+                );
                 let mut spend = Spend::new(SpendParams {
                     source_txid: source_txid_bytes,
                     source_output_index: input.source_output_index,
@@ -2966,9 +2799,8 @@ impl Engine {
                     unlocking_script,
                     input_sequence: input.sequence,
                     lock_time: tx.lock_time,
-                    memory_limit: budget.map(|b| b.memory_limit),
+                    memory_limit: None,
                 });
-                stats.inputs_executed += 1;
                 match spend.validate() {
                     Ok(true) => {}
                     Ok(false) => {
@@ -2977,20 +2809,6 @@ impl Engine {
                             input_index: vin as u32,
                             reason: "script evaluated to false".into(),
                         });
-                    }
-                    // The door's OWN limit tripping inside the interpreter (the
-                    // stack memory limit is the budget's element bound) is the
-                    // door's verdict, never the network's: over budget, not
-                    // refused. bsv-rs 0.3.23 reports it as its own class
-                    // (`resource_limit`, the ts-sdk's `ScriptResourceLimitError`:
-                    // the stack budget, the alt stack, NUM2BIN's element-size
-                    // pre-check), so no wording is matched.
-                    Err(e) if budget.is_some() && e.is_resource_limit() => {
-                        return Err(over(
-                            &txid,
-                            judged,
-                            format!("input {vin} of transaction {txid}: {}", e.message),
-                        ));
                     }
                     Err(e) => {
                         return Err(EngineError::ScriptVerificationFailed {
@@ -3002,32 +2820,20 @@ impl Engine {
                 }
                 queue.push(src_txid);
             }
-            if txid == subject_txid {
-                stats.subject_judged = true;
-            }
             let mut output_total: u64 = 0;
             for output in &tx.outputs {
                 output_total = output_total
                     .checked_add(output.satoshis.unwrap_or(0))
-                    .ok_or_else(|| {
-                        fault(
-                            &txid,
-                            stats.subject_judged,
-                            format!("satoshi total overflows in transaction {txid}"),
-                        )
-                    })?;
+                    .ok_or_else(|| spv(format!("satoshi total overflows in transaction {txid}")))?;
             }
             if output_total > input_total {
-                return Err(fault(
-                    &txid,
-                    stats.subject_judged,
-                    format!(
+                return Err(spv(format!(
                         "transaction {txid} creates {output_total} sats from {input_total} sats of inputs"
                     ),
                 ));
             }
         }
-        Ok(stats)
+        Ok(())
     }
 
     /// The pre-2026-09-08 SPV block, kept as the

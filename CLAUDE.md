@@ -152,6 +152,98 @@ script_verification -- --nocapture`. Measured natively, release profile
 in `Transaction::verify` (2.1 s in a debug build). Workers wasm is slower
 than native; budget CPU accordingly for big covenant legs.
 
+## The script door reads the stream (D8, bsv-low #585 door 1)
+
+`Engine::verify_scripts_only` is the walk the gated `/submit` runs before a
+broadcast (register row D8): the reference's `tx.verify('scripts only')`, every
+unproven transaction the subject reaches executed, a proven one trusted as it
+stands, no tracker asked. Its verdicts are unchanged: only the INTERPRETER
+refuses (`ScriptVerificationFailed`, the route's 400 `script-refused`); a
+structural fault is `ScriptWalkInconclusive` and the door's own bound
+`ScriptWalkOverBudget`, and on both the request goes on and the network judges
+(counted, `submit_script_walk_*_total`).
+
+**The rule.** A valid BEEF is never left unjudged for its size or its counts.
+Until #585 the door had four bounds on the BODY: 64 unproven transactions, 256
+inputs per transaction, 512 KB per transaction (`DoorBudget`), and the parse's
+own (`beef_limits::parse_beef`, `ENGINE_BEEF_LIMITS`). All four are gone from
+the door. `script_door.rs` reads the bytes the caller holds twice:
+
+1. THE INDEX: bsv-rs 0.4.0's `BeefStream` cuts the body one element at a time;
+   the door keeps, per raw transaction, its txid and the place of its bytes
+   (offset, length), and per BUMP the txids its level 0 carries. Measured: 78
+   bytes per element (1,500 elements, 117,376 bytes).
+2. THE WALK, from the subject, in the order of the walk before #585. A
+   transaction is read IN PLACE at its offset (its fields' places, no script
+   copied), a source's output by the offset of that output (one word per
+   output of a source the walk spent from). No whole-body copy, no hydrated
+   `Beef`.
+
+The door does not use `BeefIndex`: it serves no lookup and no offset, and its
+fold refuses bodies the door has always walked (an input naming no EARLIER
+element, a transaction nothing spends; pin (h)'s parent-and-child BEEF with no
+funding).
+
+**The one limb is the work budget** (`DoorBudget`: `max_work_bytes` 64 MiB,
+and `memory_limit` 128 KB, the interpreter's element limit, which is the unit
+of the estimate and not a bound on the BEEF). Charged per input from the bytes
+before that input runs, by the formula of before #585: script bytes + hash
+opcodes x 128 KB + signature checks x the transaction's bytes. A breach, and
+the interpreter's own memory limit tripping, are "the network judges", counted
+`submit_script_walk_over_budget_total`, never a refusal. What the count
+bounds held down is otherwise linear in the body or already charged: each
+element is cut once, each judged transaction laid out once, each source's
+outputs located once; and an input whose scripts hold no signature check is
+run with NO copy of its transaction (the interpreter reads the other inputs
+and the outputs only for a signature's digest; that copy per input was the
+O(n^2) the 256-input bound was for), while one that does is charged its
+transaction's bytes per check. As before #585 a P2PKH input is charged about
+131 KB (one hash opcode at the element limit), so about 490 of them in one
+walk are the budget.
+
+Measured (native, debug profile, `tests/script_door_stream.rs`): a 2,122,796
+byte BEEF whose subject is 2,112,195 bytes with 300 inputs over 100 unproven
+parents (101 unproven transactions, 400 inputs executed) is walked in about
+0.2 s, peak heap of the walk 3,889,524 bytes beside the caller's body: 1.84x
+its largest element, which is the stream's one element in hand (the SDK's copy
+of the transaction being cut, with its buffer's slack), not the body's
+elements.
+
+Parity for bodies under the old bounds: the 31 pins of `script_verification`
+unchanged, and 27 deterministic bodies run on `d6d2774` and here (the real
+covenant legs intact and tampered, a subject that is proven, absent or not a
+txid, a P2PKH diamond chain, the value rule, a missing funding, the budget, the
+memory trip, a false script) give the same `WalkStats` and the same errors to
+the byte, except a BEEF cut short: `BeefParseError` on both, in the stream's
+words (`invalid BEEF at byte 7066: Truncated { needed: 25 }`), which the route
+treats as it did (the walk could not run, the network judges).
+
+Limits, stated. (1) The door is reached through the gated route, whose own
+bounds stand BEFORE it and are not this door's: the request's 10 MB, the EF
+conversion's parse (`ef.rs`, `beef_limits::parse_beef` with `EF_BEEF_LIMITS`:
+10,000,036 bytes, 512 transactions, 512 BUMPs; NL-6's), and the route's EF
+work bound (`routes.rs` `MAX_SUBJECT_EF_BYTES` 256 KB, `MAX_BATCH_EF_BYTES`
+2 MB: a 429 "retry via fallback" before the door). The pin's 2 MB subject
+passes the DOOR; through the route it meets that 429 first. (2) The body is the
+caller's `&[u8]`: the door adds one element and the index beside it, it does
+not make the route stream its request. (3) A body the stream refuses for its
+bytes (trailing bytes, a BUMP whose nodes disagree) that `Beef::from_binary`
+parsed is now `BeefParseError` at the door (the network judges), where it was
+walked. (4) A transaction's length is its raw bytes (it was the SDK's
+re-serialization: the same for canonical varints), and a script is the raw
+bytes (it was the SDK's parse written back). (5) wasm32 was not measured. (6)
+The open residual of the work estimate (bignum rounds, a computed multisig key
+count) is as before, and is now bounded by the body alone.
+
+Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
+script_door_stream -- --nocapture` (`e585_d1_a` the 2 MB / 300-input body
+walked, `e585_d1_b` 300 REAL signatures over 101 unproven transactions and a
+corrupted one refused at input 299, `e585_d1_c` the work budget stopping 300
+digests of 2 MB from the bytes, `e585_d1_d` the index pass; each RED on
+`d6d2774`: `ScriptWalkOverBudget ... has 300 inputs (limit 256)`) and `--lib
+e585_d1` (the door's layout of a transaction against the SDK's parse; the
+index per element).
+
 ## GASP anchor check (bsv-low #551)
 
 The `historical-tx-no-spv` skip above rests on

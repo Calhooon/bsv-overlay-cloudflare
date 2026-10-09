@@ -33,6 +33,7 @@ pub mod gasp;
 pub mod gasp_overlay;
 pub mod health_checker;
 pub mod lookup_service;
+mod script_door;
 pub mod storage;
 pub mod subject;
 pub mod topic_manager;
