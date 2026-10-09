@@ -22,8 +22,12 @@
  *     is deferred (not parked; both deferral counters move); the discard lever's bearer and body; a discard of one
  *     parked letter by key (its hash returned, a missing key `notFound`, `dead_letters_discarded_total`); the
  *     deferred letter then PARKED on its next DLQ delivery.
+ * 11. The delta-2 fold (lane E576-f3, D2-M1): the real e1d letters are class `not_now`; the not-now share filled
+ *     (1000 seeded, a stranger's flood); `classes` in the health; a REAL "not now" dead letter is deferred at the
+ *     share (its own counter, not the ceiling's); the same key as a FAULT letter is then parked, the share still full.
  * On the base (`835b80c`) there is no route (the dispatch's 404) and no table: RED. On `f8b5525` legs 6-9: RED.
- * On `28f5d0b` leg 10: RED (no discard route, no `near`, the ceiling never drains).
+ * On `28f5d0b` leg 10: RED (no discard route, no `near`, the ceiling never drains). On `66d069f` leg 11: RED (no
+ * `class` column: the seeding fails; no `classes`, the not-now letter parks).
  *
  *   node tools/lane-e576/dead_letter_route_ci.mjs <overlay base> <overlay --persist-to dir>
  *
@@ -338,6 +342,64 @@ const s2Parked = await until('S2 parked after the discard', () => {
 })
 expect(!!s2Parked, `the deferred letter is PARKED on its next DLQ delivery, now that there is room (within ${WAIT_MS / 1000} s)`, JSON.stringify({ ...(letter(s2) ?? {}), message: '…' }))
 d1(`DELETE FROM mutation_dead_letters WHERE txid LIKE 'e576fill%'`)
+
+// ── bsv-low #576's delta-2 fold (lane E576-f3) ──────────────────────────────
+// 11. D2-M1: a stranger's "not now" letters hold at most half the ceiling; a fault letter still parks.
+const classOf = (txid) => letter(txid)?.class
+expect(
+  classOf(s) === 'not_now' && classOf(s2) === 'not_now',
+  'the real e1d letters (S, S2) are noted and parked as class not_now by the main consumer',
+  `${classOf(s)} / ${classOf(s2)}`,
+)
+const notNowNow = Number(d1(`SELECT COUNT(*) AS c FROM mutation_dead_letters WHERE class = 'not_now' AND status IN ('parked', 'redriven')`)[0]?.c ?? 0)
+const flood = 1000 - notNowNow
+if (flood > 0) {
+  d1(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${flood}) INSERT INTO mutation_dead_letters (txid, topics, message, fault, attempts, status, redrives, first_seen_at, parked_at, history, class) SELECT 'e576flood' || i, 'tm_collected', '{}', 'a stranger''s not now', 4, 'parked', 0, 2, 2, '[]', 'not_now' FROM n`)
+}
+const hc = await health()
+const cls = hc.deadLetters?.classes
+expect(
+  cls?.notNow?.held === 1000 && cls?.notNow?.max === 1000 && cls?.notNow?.full === true && cls?.fault?.kept === 1000 && cls?.fault?.room > 0 &&
+    hc.deadLetters?.ceiling?.full === false && cls?.notNow?.perTxid === 1 && cls?.notNow?.perDay === 200,
+  'the health names the classes apart: the not-now share full, room left for fault letters',
+  JSON.stringify(cls),
+)
+const nnDeferrals0 = hc.counters?.dead_letters_not_now_deferrals_total ?? NaN
+const ceilDeferrals0 = hc.counters?.dead_letters_ceiling_deferrals_total ?? NaN
+const G3 = tx([], [output(COLLECTED_MARKER), output(nonceScript())])
+const g3 = txidOf(G3)
+const P3 = tx([input(g3, 0)], [output(COLLECTED_MARKER), output(nonceScript())])
+const p3 = txidOf(P3)
+const S3 = tx([input(p3, 0)], [output(nonceScript())])
+const s3 = txidOf(S3)
+const rg3 = await submit(beefV1(G3))
+d1(`INSERT INTO pot_evictions (txid, reason, evictedAt) VALUES ('${p3}', 'REJECTED (lane E576-f3, route tier)', ${Date.now()})`)
+const rs3 = await submit(beefV1(G3, P3, S3))
+expect(rg3.status === 200 && rs3.status === 200 && rs3.mutation === 'queued', `S3 (${s3.slice(0, 12)}…) is "not now": queued`, `${rg3.status} / ${rs3.status} ${rs3.mutation}`)
+let hn = null
+for (const t0 = Date.now(); Date.now() - t0 < WAIT_MS; await sleep(2_000)) {
+  const h = await health()
+  if ((h.counters?.dead_letters_not_now_deferrals_total ?? 0) > nnDeferrals0) { hn = h; break }
+}
+expect(
+  !!hn && (letter(s3)?.status ?? 'none') === 'failing' && classOf(s3) === 'not_now' && hn.counters.dead_letters_ceiling_deferrals_total === ceilDeferrals0,
+  `S3 dead-lettered over the full not-now share is DEFERRED (counted apart from the ceiling's), not parked (within ${WAIT_MS / 1000} s)`,
+  JSON.stringify({ row: { ...(letter(s3) ?? {}), message: '…' }, nn: hn?.counters?.dead_letters_not_now_deferrals_total, ceil: hn?.counters?.dead_letters_ceiling_deferrals_total }),
+)
+// The same key as a FAULT letter (a storage refusal of a real admission: here its note's class set by hand, the
+// only way the route tier can make a D1 fault) is PARKED on its next DLQ delivery, the not-now share still full.
+d1(`UPDATE mutation_dead_letters SET class = 'fault' WHERE txid = '${s3}' AND status = 'failing'`)
+const s3Parked = await until('S3 parked as a fault letter', () => {
+  const r = letter(s3)
+  return r && r.status === 'parked' ? r : null
+})
+const hp = await health()
+expect(
+  !!s3Parked && hp.deadLetters?.classes?.notNow?.held === 1000 && hp.deadLetters?.classes?.fault?.held >= 1,
+  `a fault letter is PARKED while a flood holds the whole not-now share (within ${WAIT_MS / 1000} s)`,
+  JSON.stringify({ row: { ...(letter(s3) ?? {}), message: '…' }, classes: hp.deadLetters?.classes }),
+)
+d1(`DELETE FROM mutation_dead_letters WHERE txid LIKE 'e576flood%'`)
 
 } catch (e) {
   expect(false, 'the seeded legs ran (the table and the lever exist)', `${e.message ?? e}`.split('\n')[0])
