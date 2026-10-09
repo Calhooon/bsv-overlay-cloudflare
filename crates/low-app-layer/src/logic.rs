@@ -3,6 +3,7 @@
 //! and unit-tests natively (`cargo test -p low-app-layer`), and the route
 //! handlers in `routes.rs` are thin worker glue over these functions.
 
+use overlay_engine::beef_limits;
 use serde_json::json;
 
 /// Hard cap on outpoints per `/utxo-status` request. Over the cap → 400
@@ -451,7 +452,7 @@ pub struct PotsViewEntry {
 /// BEEF's own txid index is computed by hashing each carried tx, so a hit
 /// here is hash-consistent by construction — the client still re-verifies.
 pub fn extract_raw_tx_hex(beef_bytes: &[u8], txid: &str) -> Option<String> {
-    let mut beef = bsv_rs::transaction::Beef::from_binary(beef_bytes).ok()?;
+    let mut beef = beef_limits::parse_beef(beef_bytes, &beef_limits::APP_BEEF_LIMITS).ok()?;
     let btx = beef.find_txid_mut(&txid.to_ascii_lowercase())?;
     btx.raw_tx_or_compute().map(hex::encode)
 }

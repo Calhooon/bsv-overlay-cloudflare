@@ -100,6 +100,7 @@
 //! real settle txid can never flip the reported winner when the honest side
 //! never published (adversarial-review finding, 2026-07-22).
 
+use overlay_engine::beef_limits;
 use serde_json::json;
 
 use crate::logic::ResultMarkerRow;
@@ -281,7 +282,7 @@ fn is_p2pkh(s: &[u8]) -> bool {
 /// (`transactions.has_proof` / `pot_beefs.proof_verified`) — use
 /// [`verified_beef_block_height`].
 pub fn beef_block_height(beef_bytes: &[u8], txid: &str) -> Option<u64> {
-    let beef = bsv_rs::transaction::Beef::from_binary(beef_bytes).ok()?;
+    let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::APP_BEEF_LIMITS).ok()?;
     let btx = beef.find_txid(&txid.to_ascii_lowercase())?;
     let bump = beef.bumps.get(btx.bump_index()?)?;
     Some(u64::from(bump.block_height))

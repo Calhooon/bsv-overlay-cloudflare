@@ -6,6 +6,8 @@
 //!
 //! Ported from `~/bsv/overlay-services/src/Engine.ts` (1,337 lines).
 
+use crate::beef_limits;
+
 use bsv_rs::transaction::{Beef, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1156,10 +1158,11 @@ impl Engine {
         // admitted the pot (loop-2 fleet, 2026-09-05; the live proof after
         // the engine's own subject fix). A body that cannot be re-serialized
         // (never, for a parsed subject) is handed through as submitted.
-        let subject_named_beef: Vec<u8> = bsv_rs::transaction::Beef::from_binary(&tagged_beef.beef)
-            .ok()
-            .and_then(|mut b| b.to_binary_atomic(&txid).ok())
-            .unwrap_or_else(|| tagged_beef.beef.clone());
+        let subject_named_beef: Vec<u8> =
+            beef_limits::parse_beef(&tagged_beef.beef, &beef_limits::ENGINE_BEEF_LIMITS)
+                .ok()
+                .and_then(|mut b| b.to_binary_atomic(&txid).ok())
+                .unwrap_or_else(|| tagged_beef.beef.clone());
 
         // The successor rule, asked of every topic that found no coin before
         // anything of this submit is written ([`Engine::successors_waiting`]):
@@ -2001,7 +2004,7 @@ impl Engine {
         question_reads: &mut usize,
         landed: &mut Vec<(String, String)>,
     ) -> Result<(), String> {
-        let beef = Beef::from_binary(beef_bytes)
+        let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
             .map_err(|e| format!("the BEEF could not be read again ({e})"))?;
         let mode = match mode {
             SubmitMode::CurrentTx => SubmitMode::HistoricalTx,
@@ -2280,7 +2283,7 @@ impl Engine {
             return None;
         }
         let direct: HashSet<String> = ask.iter().cloned().collect();
-        let beef = Beef::from_binary(beef_bytes).ok()?;
+        let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS).ok()?;
         // Each body the BEEF carries, and whether the BEEF says it is
         // proven (a bump index: its word, no proof is checked here).
         let bodies: HashMap<String, (&Transaction, bool)> = beef
@@ -2606,7 +2609,7 @@ impl Engine {
         let budget = policy.budget;
         let mut stats = WalkStats::default();
 
-        let beef = Beef::from_binary(beef_bytes)
+        let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
             .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
         let mut by_txid: HashMap<String, &Transaction> = HashMap::new();
         for btx in &beef.txs {
@@ -2925,7 +2928,7 @@ impl Engine {
         let Some(chain_tracker) = chain_tracker else {
             return Ok(());
         };
-        let mut beef = Beef::from_binary(beef_bytes)
+        let mut beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
             .map_err(|e| EngineError::SpvError(format!("BEEF parse error: {e}")))?;
         let validation = beef.verify_valid(false);
         if !validation.valid {
@@ -3171,12 +3174,17 @@ impl Engine {
         // with a fully-sourced ancestor; the engine then judged a hop, admitted
         // nothing and the pot never entered the index while its JOIN mined.
         let subject = {
-            let mut b = bsv_rs::transaction::Beef::from_binary(&tagged_beef.beef)
-                .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+            let mut b =
+                beef_limits::parse_beef(&tagged_beef.beef, &beef_limits::ENGINE_BEEF_LIMITS)
+                    .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
             crate::subject::subject_txid_of(&mut b)
         };
-        let tx = Transaction::from_beef(&tagged_beef.beef, subject.as_deref())
-            .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+        let tx = beef_limits::transaction_from_beef(
+            &tagged_beef.beef,
+            subject.as_deref(),
+            &beef_limits::ENGINE_BEEF_LIMITS,
+        )
+        .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
         let txid = tx.id();
 
         // SPV verification, skipped ONLY for HistoricalTxNoSpv, exactly the
@@ -3540,7 +3548,7 @@ impl Engine {
             // survive, and so does any ancestry that arrived inside the submitted
             // bytes but was never admitted as an output of its own (a foreign
             // parent), which the `outputs_consumed` walk below cannot see.
-            let mut acc = Beef::from_binary(beef_data)
+            let mut acc = beef_limits::parse_beef(beef_data, &beef_limits::STORED_BEEF_LIMITS)
                 .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
 
             // For each consumed output, recursively hydrate and embed as source transaction
@@ -3701,11 +3709,15 @@ impl Engine {
 
             // The stored body's SUBJECT by the same order-independent rule
             // (`subject.rs`) — a plain stored body's last tx can be an ancestor.
-            let root = bsv_rs::transaction::Beef::from_binary(beef_data)
+            let root = beef_limits::parse_beef(beef_data, &beef_limits::STORED_BEEF_LIMITS)
                 .ok()
                 .and_then(|mut b| crate::subject::subject_txid_of(&mut b));
-            let root_tx = Transaction::from_beef(beef_data, root.as_deref())
-                .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+            let root_tx = beef_limits::transaction_from_beef(
+                beef_data,
+                root.as_deref(),
+                &beef_limits::STORED_BEEF_LIMITS,
+            )
+            .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
 
             // Search the transaction tree for the requested txid
             if let Some(node) = Self::search_tx_tree(&root_tx, graph_id, txid, output_index) {
@@ -3796,7 +3808,11 @@ impl Engine {
         output_index: u32,
     ) -> Option<GASPNode> {
         // Try parsing BEEF with the specific txid
-        if let Ok(tx) = Transaction::from_beef(beef_data, Some(target_txid)) {
+        if let Ok(tx) = beef_limits::transaction_from_beef(
+            beef_data,
+            Some(target_txid),
+            &beef_limits::STORED_BEEF_LIMITS,
+        ) {
             if tx.id() == target_txid {
                 let mut node = GASPNode {
                     graph_id: graph_id.to_string(),
@@ -3852,7 +3868,7 @@ impl Engine {
             None
         } else {
             Some(
-                bsv_rs::transaction::MerklePath::from_hex(proof_hex)
+                beef_limits::merkle_path_from_hex(proof_hex, beef_limits::PUSH_PROOF_MAX_BYTES)
                     .map_err(|e| EngineError::Other(format!("Invalid merkle proof hex: {e}")))?,
             )
         };
@@ -3974,7 +3990,7 @@ impl Engine {
         for cand in candidates {
             // Parse the stored BEEF; skip anything unparseable (don't error the
             // whole pass on one bad row).
-            let beef = match bsv_rs::transaction::Beef::from_binary(&cand.beef) {
+            let beef = match beef_limits::parse_beef(&cand.beef, &beef_limits::STORED_BEEF_LIMITS) {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] unparseable BEEF, skipping");
@@ -4047,9 +4063,10 @@ impl Engine {
             };
 
             // Pull the block height out of the BUMP so the output rows update too.
-            let block_height = bsv_rs::transaction::MerklePath::from_hex(&proof_hex)
-                .ok()
-                .map(|mp| mp.block_height);
+            let block_height =
+                beef_limits::merkle_path_from_hex(&proof_hex, beef_limits::COURIER_PROOF_MAX_BYTES)
+                    .ok()
+                    .map(|mp| mp.block_height);
 
             match self
                 .handle_new_merkle_proof(&cand.txid, &proof_hex, block_height)
@@ -4122,7 +4139,7 @@ impl Engine {
         txid: &str,
         proof: &bsv_rs::transaction::MerklePath,
     ) -> Option<Vec<u8>> {
-        let mut beef = bsv_rs::transaction::Beef::from_binary(stored).ok()?;
+        let mut beef = beef_limits::parse_beef(stored, &beef_limits::STORED_BEEF_LIMITS).ok()?;
         beef.find_txid(txid)?;
         let i = beef.merge_bump(proof.clone());
         // Does the merged bump actually prove `txid` (a flagged txid leaf)?
@@ -4455,7 +4472,7 @@ impl Engine {
             // the body every WholeTx service receives NAMES the subject (BRC-95
             // atomic prefix) — the same rule as the live submit path
             let subject_named: Option<Vec<u8>> = output.beef.as_ref().map(|beef| {
-                bsv_rs::transaction::Beef::from_binary(beef)
+                beef_limits::parse_beef(beef, &beef_limits::STORED_BEEF_LIMITS)
                     .ok()
                     .and_then(|mut b| b.to_binary_atomic(&txid).ok())
                     .unwrap_or_else(|| beef.clone())

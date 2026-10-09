@@ -38,10 +38,10 @@
 //!   discover the union of interested peers, then the BEEF is submitted
 //!   once per peer with the full topic list (mirrors SHIPBroadcaster).
 
+use overlay_engine::beef_limits;
 use std::collections::HashSet;
 
 use bsv_rs::script::templates::PushDrop;
-use bsv_rs::transaction::Transaction;
 use overlay_engine::types::TaggedBEEF;
 use worker::{Fetch, Headers, Method, Request, RequestInit};
 
@@ -177,7 +177,11 @@ async fn discover_peers_from_tracker(tracker: &str, topic: &str) -> Result<Vec<S
 
     let mut urls = Vec::new();
     for out in answer.outputs {
-        let tx = match Transaction::from_beef(&out.beef, None) {
+        let tx = match beef_limits::transaction_from_beef(
+            &out.beef,
+            None,
+            &beef_limits::PEER_BEEF_LIMITS,
+        ) {
             Ok(t) => t,
             Err(_) => continue,
         };

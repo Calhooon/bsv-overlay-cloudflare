@@ -6,6 +6,9 @@
 //! Ported from `~/bsv/overlay-services/src/storage/Storage.ts`.
 //! Reference implementation: `~/bsv/overlay-services/src/storage/knex/KnexStorage.ts`.
 
+#[cfg(feature = "memory-storage")]
+use crate::beef_limits;
+
 use async_trait::async_trait;
 
 use crate::types::{AppliedTransaction, Outpoint, Output};
@@ -681,7 +684,7 @@ pub mod memory {
             // write by inspecting whether the new BEEF proves the target tx.
             // (The proof-completion stitch calls back here with a proven BEEF,
             // which is how a row legitimately flips proofless → proven.)
-            let has_proof = bsv_rs::transaction::Beef::from_binary(beef)
+            let has_proof = beef_limits::parse_beef(beef, &beef_limits::STORED_BEEF_LIMITS)
                 .ok()
                 .and_then(|b| {
                     b.find_txid(txid)

@@ -51,6 +51,7 @@
 //! that the wallet then rejects for reasons the client cannot see.
 
 use bsv_rs::transaction::Beef;
+use overlay_engine::beef_limits;
 use std::collections::HashSet;
 
 /// Hard cap on parent BEEFs fetched for one request. A LOW credit chain is
@@ -114,7 +115,7 @@ pub fn wanted_parents(beef: &Beef) -> Wanted {
 /// resolved parent (so the walk reports `complete: false` rather than serving
 /// an ancestry with a silent hole).
 pub fn merge_parent(acc: &mut Beef, parent_bytes: &[u8]) -> bool {
-    match Beef::from_binary(parent_bytes) {
+    match beef_limits::parse_beef(parent_bytes, &beef_limits::APP_BEEF_LIMITS) {
         Ok(parent) => {
             acc.merge_beef(&parent);
             true

@@ -32,6 +32,7 @@
 //! / `tokio` — so this stays `wasm32-unknown-unknown`-clean. bsv-rs is used only
 //! for the wasm-clean `transaction` surface.
 
+use overlay_engine::beef_limits;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -973,10 +974,11 @@ pub(crate) async fn verify_bump_outcome(
     let Some(tracker) = tracker else {
         return BumpVerdict::Invalid; // No header source → nothing is a proven fact.
     };
-    let bump = match MerklePath::from_hex(bump_hex) {
-        Ok(b) => b,
-        Err(_) => return BumpVerdict::Invalid,
-    };
+    let bump =
+        match beef_limits::merkle_path_from_hex(bump_hex, beef_limits::COURIER_PROOF_MAX_BYTES) {
+            Ok(b) => b,
+            Err(_) => return BumpVerdict::Invalid,
+        };
     let root = match bump.compute_root(Some(txid)) {
         Ok(r) => r,
         Err(_) => return BumpVerdict::Invalid,
@@ -1368,7 +1370,7 @@ pub async fn complete_pot_beef_proofs(
         // `find_bump` (the FIRST bump CONTAINING the txid — a stale orphan
         // bump, or one where the txid is only a sibling hash). Matches
         // engine.rs and reorg_sweep.rs.
-        let stored_bump = bsv_rs::transaction::Beef::from_binary(&stored_beef)
+        let stored_bump = beef_limits::parse_beef(&stored_beef, &beef_limits::STORED_BEEF_LIMITS)
             .ok()
             .and_then(|b| own_bump_hex(&b, &txid));
         if let Some(bump_hex) = stored_bump {
@@ -1785,13 +1787,20 @@ pub(crate) fn stitch_and_trim_pot_beef(
     stored_beef: &[u8],
     bump_hex: &str,
 ) -> Option<Vec<u8>> {
-    use bsv_rs::transaction::{Beef, MerklePath, Transaction};
+    use bsv_rs::transaction::Beef;
 
     // Rebuild the subject tx (with its ancestry) from the stored BEEF and set
     // its own merkle path — mirrors the engine's `update_input_proofs` for the
     // subject-is-txid case.
-    let mut tx = Transaction::from_beef(stored_beef, Some(txid)).ok()?;
-    tx.merkle_path = Some(MerklePath::from_hex(bump_hex).ok()?);
+    let mut tx = beef_limits::transaction_from_beef(
+        stored_beef,
+        Some(txid),
+        &beef_limits::STORED_BEEF_LIMITS,
+    )
+    .ok()?;
+    tx.merkle_path = Some(
+        beef_limits::merkle_path_from_hex(bump_hex, beef_limits::COURIER_PROOF_MAX_BYTES).ok()?,
+    );
     let proven_beef = tx.to_beef(true).ok()?;
 
     // Trim: BFS from tips, drop ancestry now reachable only through a proven tx.
@@ -2076,9 +2085,16 @@ pub fn is_p2pkh_script(script: &[u8]) -> bool {
 /// txid's; `None` when the bytes do not parse, name another tx, or lack the
 /// output.
 pub fn funding_output_script(bytes: &[u8], txid: &str, vout: u32) -> Option<Vec<u8>> {
-    let tx = Transaction::from_beef(bytes, Some(txid))
-        .or_else(|_| Transaction::from_binary(bytes))
-        .ok()?;
+    beef_limits::check_size(
+        bytes.len(),
+        beef_limits::STORED_BEEF_LIMITS.max_bytes,
+        "funding body",
+    )
+    .ok()?;
+    let tx =
+        beef_limits::transaction_from_beef(bytes, Some(txid), &beef_limits::STORED_BEEF_LIMITS)
+            .or_else(|_| Transaction::from_binary(bytes))
+            .ok()?;
     if !tx.id().eq_ignore_ascii_case(txid) {
         return None;
     }
@@ -2211,7 +2227,8 @@ pub(crate) fn assemble_spender_beef(
     bump_hex: &str,
     txid: &str,
 ) -> Result<Vec<u8>, String> {
-    let bump = MerklePath::from_hex(bump_hex).map_err(|e| format!("bump parse: {e}"))?;
+    let bump = beef_limits::merkle_path_from_hex(bump_hex, beef_limits::COURIER_PROOF_MAX_BYTES)
+        .map_err(|e| format!("bump parse: {e}"))?;
     let raw = hex::decode(raw_hex).map_err(|e| format!("raw decode: {e}"))?;
     let mut beef = Beef::new();
     let bump_index = beef.merge_bump(bump);
@@ -2257,7 +2274,8 @@ pub(crate) fn assemble_ancestry_beef(
         let bump_index = match bump_hex {
             Some(b) => {
                 let bump =
-                    MerklePath::from_hex(b).map_err(|e| format!("{txid}: bump parse: {e}"))?;
+                    beef_limits::merkle_path_from_hex(b, beef_limits::COURIER_PROOF_MAX_BYTES)
+                        .map_err(|e| format!("{txid}: bump parse: {e}"))?;
                 Some(beef.merge_bump(bump))
             }
             None => None,
@@ -2526,9 +2544,12 @@ pub async fn complete_spend_confirmations(
                 // along: the block height is a fact of the just-verified
                 // BUMP (None keeps the stored value — same-pointer
                 // COALESCE semantics).
-                let spent_height = MerklePath::from_hex(&bump_hex)
-                    .ok()
-                    .map(|mp| u64::from(mp.block_height));
+                let spent_height = beef_limits::merkle_path_from_hex(
+                    &bump_hex,
+                    beef_limits::COURIER_PROOF_MAX_BYTES,
+                )
+                .ok()
+                .map(|mp| u64::from(mp.block_height));
                 match pot_storage
                     .mark_confirmed_for_spender(
                         &rec.txid,
@@ -2681,9 +2702,10 @@ pub async fn complete_spend_confirmations(
         // — bytes-finality with the EXACT `output_spent` rule (#371: the
         //   column means one thing regardless of writer; parse failure ⇒
         //   None = not parsed, never a guess).
-        let spent_height = MerklePath::from_hex(&bump_hex)
-            .ok()
-            .map(|mp| u64::from(mp.block_height));
+        let spent_height =
+            beef_limits::merkle_path_from_hex(&bump_hex, beef_limits::COURIER_PROOF_MAX_BYTES)
+                .ok()
+                .map(|mp| u64::from(mp.block_height));
         let spender_final = Transaction::from_hex(&raw)
             .ok()
             .map(|tx| !(tx.lock_time > 0 && tx.inputs.iter().any(|i| i.sequence < 0xffff_ffff)));
@@ -2846,7 +2868,11 @@ pub async fn backfill_decoded_params(
         };
         // 2. Hash-bound parse: select the subject by the row's own txid
         //    (BEEF txids are computed from the raw bytes at parse time).
-        let Ok(tx) = Transaction::from_beef(&beef, Some(&row.txid)) else {
+        let Ok(tx) = beef_limits::transaction_from_beef(
+            &beef,
+            Some(&row.txid),
+            &beef_limits::STORED_BEEF_LIMITS,
+        ) else {
             push_log(&format!(
                 "[params-backfill] {} stored beef unparseable — left a candidate",
                 row.txid
@@ -2917,7 +2943,11 @@ pub async fn backfill_decoded_params(
         let Ok(Some(spender_beef)) = pot_storage.get_beef(spending_txid).await else {
             continue; // no spender bytes — the read-path fallback covers it
         };
-        let Ok(spending_tx) = Transaction::from_beef(&spender_beef, Some(spending_txid)) else {
+        let Ok(spending_tx) = beef_limits::transaction_from_beef(
+            &spender_beef,
+            Some(spending_txid),
+            &beef_limits::STORED_BEEF_LIMITS,
+        ) else {
             continue;
         };
         let Some((pot_input_index, pot_input_sequence)) =
@@ -3040,7 +3070,11 @@ pub async fn backfill_spender_payouts(
             summary.missing_beef += 1;
             continue; // stays a candidate — the bytes can still arrive
         };
-        let Ok(spending_tx) = Transaction::from_beef(&spender_beef, Some(spending_txid)) else {
+        let Ok(spending_tx) = beef_limits::transaction_from_beef(
+            &spender_beef,
+            Some(spending_txid),
+            &beef_limits::STORED_BEEF_LIMITS,
+        ) else {
             summary.missing_beef += 1;
             continue; // unparseable stored bytes — longer-wins may repair
         };
@@ -3189,7 +3223,11 @@ pub async fn backfill_settle_signers(
             summary.missing_beef += 1;
             continue; // stays a candidate — the bytes can still arrive
         };
-        let Ok(spending_tx) = Transaction::from_beef(&spender_beef, Some(spending_txid)) else {
+        let Ok(spending_tx) = beef_limits::transaction_from_beef(
+            &spender_beef,
+            Some(spending_txid),
+            &beef_limits::STORED_BEEF_LIMITS,
+        ) else {
             summary.missing_beef += 1;
             continue; // unparseable stored bytes — longer-wins may repair
         };
@@ -4101,10 +4139,11 @@ pub async fn apply_pushed_proof_to_pot_stores(
     // but a structurally malformed one (unparseable, or not containing this
     // txid's leaf) must latch NOTHING here either — fail-closed, the poll
     // backstop keeps covering the rows.
-    let structurally_ok = bsv_rs::transaction::MerklePath::from_hex(bump_hex)
-        .ok()
-        .and_then(|mp| mp.compute_root(Some(txid)).ok())
-        .is_some();
+    let structurally_ok =
+        beef_limits::merkle_path_from_hex(bump_hex, beef_limits::PUSH_PROOF_MAX_BYTES)
+            .ok()
+            .and_then(|mp| mp.compute_root(Some(txid)).ok())
+            .is_some();
     if !structurally_ok {
         push_log(&format!(
             "[arc-ingest] {txid} pushed bump is malformed — nothing latched"
@@ -4129,16 +4168,17 @@ pub async fn apply_pushed_proof_to_pot_stores(
     // anchor (the 2026-09-07 class: Arcade pushed the 34 MB block's proofs
     // within 5 s, then re-anchored to the canonical block 36 min later):
     // the push REPLACES it — the verified latch is no longer a reason to skip.
-    let pushed_anchor = bsv_rs::transaction::MerklePath::from_hex(bump_hex)
-        .ok()
-        .and_then(|mp| {
-            mp.compute_root(Some(txid))
-                .ok()
-                .map(|root| overlay_discovery::pot::reorg::BumpAnchor {
-                    height: u64::from(mp.block_height),
-                    root: root.to_ascii_lowercase(),
+    let pushed_anchor =
+        beef_limits::merkle_path_from_hex(bump_hex, beef_limits::PUSH_PROOF_MAX_BYTES)
+            .ok()
+            .and_then(|mp| {
+                mp.compute_root(Some(txid)).ok().map(|root| {
+                    overlay_discovery::pot::reorg::BumpAnchor {
+                        height: u64::from(mp.block_height),
+                        root: root.to_ascii_lowercase(),
+                    }
                 })
-        });
+            });
     let pushed_height = pushed_anchor.as_ref().map(|a| a.height);
     match pot_storage.get_beef(txid).await {
         Ok(Some(stored_beef)) => {
@@ -4181,9 +4221,10 @@ pub async fn apply_pushed_proof_to_pot_stores(
     // #284: a confirm-only latch — no spender raw in hand → verdict = None
     // (the stored verdict/verdictTxid are left UNCHANGED); the spentHeight
     // rides along from the (route-verified, structurally re-checked) bump.
-    let spent_height = bsv_rs::transaction::MerklePath::from_hex(bump_hex)
-        .ok()
-        .map(|mp| u64::from(mp.block_height));
+    let spent_height =
+        beef_limits::merkle_path_from_hex(bump_hex, beef_limits::PUSH_PROOF_MAX_BYTES)
+            .ok()
+            .map(|mp| u64::from(mp.block_height));
     match pot_storage.find_unconfirmed_by_spending_txid(txid).await {
         Ok(records) => {
             for rec in records {

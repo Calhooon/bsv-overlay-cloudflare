@@ -696,7 +696,7 @@ async fn d_only_named_inputs_are_requested_and_already_known_ones_are_stripped()
     let passed = Transaction::from_beef(&manager.needed.borrow()[0], None).unwrap();
     assert_eq!(passed.id(), node_txid(&nodes[2]));
     assert_eq!(
-        passed.merkle_path.unwrap().to_hex(),
+        passed.merkle_path.as_ref().unwrap().to_hex(),
         nodes[2].proof.clone().unwrap()
     );
 
