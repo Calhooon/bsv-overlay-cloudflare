@@ -923,11 +923,20 @@ mod tests {
             touched_ms: Some(now - day),
         };
         assert_eq!(reput.age_ms(), now - day);
-        assert!(!past_window(&reput, now, ORPHAN_WINDOW_S), "re-put yesterday: young");
+        assert!(
+            !past_window(&reput, now, ORPHAN_WINDOW_S),
+            "re-put yesterday: young"
+        );
         let named = HashSet::new();
-        assert!(plan_pass(std::slice::from_ref(&reput), &named, now, ORPHAN_WINDOW_S, 50)
-            .orphans
-            .is_empty());
+        assert!(plan_pass(
+            std::slice::from_ref(&reput),
+            &named,
+            now,
+            ORPHAN_WINDOW_S,
+            50
+        )
+        .orphans
+        .is_empty());
         let old = Listed {
             touched_ms: Some(now - 10 * day),
             ..reput.clone()
@@ -937,19 +946,29 @@ mod tests {
             touched_ms: None,
             ..old.clone()
         };
-        assert!(past_window(&unstamped, now, ORPHAN_WINDOW_S), "an object from before the stamp: uploaded");
+        assert!(
+            past_window(&unstamped, now, ORPHAN_WINDOW_S),
+            "an object from before the stamp: uploaded"
+        );
         let stale_touch = Listed {
             touched_ms: Some(now - 20 * day),
             ..old.clone()
         };
-        assert_eq!(stale_touch.age_ms(), old.uploaded_ms, "the later of the two");
+        assert_eq!(
+            stale_touch.age_ms(),
+            old.uploaded_ms,
+            "the later of the two"
+        );
         // re-stamped between the listing and the delete, with `uploaded` unchanged: left
         assert!(still_orphan(&old, Some(&old)));
         assert!(!still_orphan(&old, Some(&reput)));
         // the put writes the stamp; the list reads it
         assert_eq!(
             queue::touched_meta(1_234),
-            std::collections::HashMap::from([(queue::TOUCHED_META.to_string(), "1234".to_string())])
+            std::collections::HashMap::from([(
+                queue::TOUCHED_META.to_string(),
+                "1234".to_string()
+            )])
         );
         let code = |s: &str| {
             s.lines()

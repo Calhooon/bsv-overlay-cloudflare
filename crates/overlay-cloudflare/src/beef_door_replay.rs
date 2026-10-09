@@ -294,8 +294,15 @@ mod twin {
             Ok(bytes.clone())
         }
 
-        async fn judge_missing(&self, topics: &[String], r: &queue::BeefRef) -> queue::MissingVerdict {
-            let applied = r.txid.as_deref().map_or_else(Vec::new, |t| applied(self.conn, t));
+        async fn judge_missing(
+            &self,
+            topics: &[String],
+            r: &queue::BeefRef,
+        ) -> queue::MissingVerdict {
+            let applied = r
+                .txid
+                .as_deref()
+                .map_or_else(Vec::new, |t| applied(self.conn, t));
             queue::missing_verdict(r.txid.as_deref(), topics, &Ok(false), &Ok(applied))
         }
     }
@@ -342,7 +349,13 @@ mod twin {
                 .insert(m.r2.as_ref().unwrap().key.clone(), beef.to_vec());
         }
 
-        fn note(&self, m: &queue::MutationMessage, subject: Option<&str>, fault: &str, class: Option<dead_letters::LetterClass>) {
+        fn note(
+            &self,
+            m: &queue::MutationMessage,
+            subject: Option<&str>,
+            fault: &str,
+            class: Option<dead_letters::LetterClass>,
+        ) {
             let (txid, topics) = dead_letters::letter_key(m, subject);
             let q = match class {
                 Some(c) => dead_letters::note_failing_query(&txid, &topics, fault, 10, c),
@@ -378,7 +391,14 @@ mod twin {
                 } else if replay.fails.contains(&t.as_str()) {
                 } else if replay.not_now {
                     let fault = format!("not durable: {t}/{}: not now", dead_letters::SITE_NOT_NOW);
-                    self.note(m, Some(&subject), &fault, Some(dead_letters::LetterClass::of_sites([dead_letters::SITE_NOT_NOW])));
+                    self.note(
+                        m,
+                        Some(&subject),
+                        &fault,
+                        Some(dead_letters::LetterClass::of_sites([
+                            dead_letters::SITE_NOT_NOW,
+                        ])),
+                    );
                     return Delivered::Fault(fault);
                 } else {
                     self.conn
@@ -387,7 +407,8 @@ mod twin {
                     applied.push(t.clone());
                 }
             }
-            let left = m.r2.is_some() && queue::landed_ack_leaves_object(&m.topics, &applied, &deduped);
+            let left =
+                m.r2.is_some() && queue::landed_ack_leaves_object(&m.topics, &applied, &deduped);
             if !left {
                 if let Some(r) = &m.r2 {
                     self.bucket.remove(&r.key);
@@ -563,16 +584,24 @@ mod twin {
         // below); the handler only acts on its step
         let start = q.find("pub(crate) async fn read_for_replay<").unwrap();
         let f = &q[start..start + q[start..].find("\n}\n").unwrap()];
-        assert!(f.contains("Err(f @ BlobFault::Missing(_)) => match p.judge_missing(&body.topics, r).await"));
+        assert!(f.contains(
+            "Err(f @ BlobFault::Missing(_)) => match p.judge_missing(&body.topics, r).await"
+        ));
         let lib = code(include_str!("lib.rs"));
         let start = lib.find("async fn queue_handler(").unwrap();
         let h = &lib[start..start + lib[start..].find("\n}\n").unwrap()];
         assert!(h.contains("crate::queue::read_for_replay(&ports, body).await"));
-        assert!(!h.contains("judge_missing") && !h.contains("read_beef"), "the handler reads nothing itself");
+        assert!(
+            !h.contains("judge_missing") && !h.contains("read_beef"),
+            "the handler reads nothing itself"
+        );
         let arm = h
             .find("crate::queue::ReadStep::Acked(verdict) => {")
             .expect("the handler acks only the verdict's ack");
-        let end = arm + h[arm..].find("crate::queue::ReadStep::Fault { fault, missing } => {").unwrap();
+        let end = arm
+            + h[arm..]
+                .find("crate::queue::ReadStep::Fault { fault, missing } => {")
+                .unwrap();
         let fault_arm = &h[end..end + h[end..].find("msg.retry();").unwrap()];
         let arm = &h[arm..end];
         assert!(arm.contains("crate::ops::COUNTER_QUEUE_R2_TWIN_ACKED"));
@@ -615,8 +644,7 @@ mod twin {
         let topics = vec!["tm_a".to_string()];
         let (beef, id) = shapes::sized_body(500_000);
         assert_eq!(
-            QUEUE_BEEF_LIMITS.max_bytes,
-            ENGINE_BEEF_LIMITS.max_bytes,
+            QUEUE_BEEF_LIMITS.max_bytes, ENGINE_BEEF_LIMITS.max_bytes,
             "the queue parses what the engine admits"
         );
         let m = keyed(&beef, &topics);
@@ -655,13 +683,24 @@ mod twin {
         };
         assert!(fault.contains(dead_letters::SITE_NOT_NOW), "{fault}");
         c.park(&m);
-        assert_eq!(c.letters(), vec![(id.clone(), "parked".to_string(), "not_now".to_string())]);
+        assert_eq!(
+            c.letters(),
+            vec![(id.clone(), "parked".to_string(), "not_now".to_string())]
+        );
         let (key, bytes): (String, i64) = c
             .conn
-            .query_row("SELECT r2_key, r2_bytes FROM mutation_dead_letters", [], |x| Ok((x.get(0)?, x.get(1)?)))
+            .query_row(
+                "SELECT r2_key, r2_bytes FROM mutation_dead_letters",
+                [],
+                |x| Ok((x.get(0)?, x.get(1)?)),
+            )
             .unwrap();
         assert_eq!((key.as_str(), bytes), (r.key.as_str(), 500_000));
-        assert_eq!(c.bucket.get(&r.key), Some(&beef), "the parked letter's bytes are at rest in R2");
+        assert_eq!(
+            c.bucket.get(&r.key),
+            Some(&beef),
+            "the parked letter's bytes are at rest in R2"
+        );
 
         // another 500 KB body that lands: acked, its object deleted by the ack
         let (other, _) = shapes::sized_body(500_001);
@@ -669,7 +708,10 @@ mod twin {
         c.put(&o, &other);
         assert_eq!(c.deliver(&o, LANDS), Delivered::Landed { left: false });
         assert!(!c.bucket.contains_key(&o.r2.as_ref().unwrap().key));
-        assert!(c.bucket.contains_key(&r.key), "the parked letter's object is untouched");
+        assert!(
+            c.bucket.contains_key(&r.key),
+            "the parked letter's object is untouched"
+        );
     }
 
     /// E585-D3-L1: the lens's sequence. Twins M1 and M2 name [tm_a, tm_b]. M1 lands tm_a while tm_b's manager
@@ -700,13 +742,28 @@ mod twin {
         );
         assert_eq!(first, Delivered::Landed { left: true });
         assert!(kept, "M1's ack left the object for its twin");
-        assert!(!c.bucket.contains_key(&key), "M2's ack (nothing new written) deletes it");
+        assert!(
+            !c.bucket.contains_key(&key),
+            "M2's ack (nothing new written) deletes it"
+        );
         assert!(c.letters().is_empty(), "no letter");
         // the rule itself: a landing with no failed topic, a dupe-only replay, and a replay that wrote nothing
         let t = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-        assert!(!queue::landed_ack_leaves_object(&topics, &t(&["tm_a", "tm_b"]), &[]));
-        assert!(!queue::landed_ack_leaves_object(&topics, &t(&["tm_a"]), &t(&["tm_b"])));
-        assert!(!queue::landed_ack_leaves_object(&topics, &[], &t(&["tm_a"])));
+        assert!(!queue::landed_ack_leaves_object(
+            &topics,
+            &t(&["tm_a", "tm_b"]),
+            &[]
+        ));
+        assert!(!queue::landed_ack_leaves_object(
+            &topics,
+            &t(&["tm_a"]),
+            &t(&["tm_b"])
+        ));
+        assert!(!queue::landed_ack_leaves_object(
+            &topics,
+            &[],
+            &t(&["tm_a"])
+        ));
         assert!(!queue::landed_ack_leaves_object(&topics, &[], &[]));
         assert!(queue::landed_ack_leaves_object(&topics, &t(&["tm_b"]), &[]));
     }
@@ -741,7 +798,8 @@ mod twin {
         let start = src.find("pub async fn park_batch(").unwrap();
         let f = &src[start..start + src[start..].find("\n}\n").unwrap()];
         let (decided, matched) = (
-            f.find("let deferred = lost_deletes_object(&outcome);").unwrap(),
+            f.find("let deferred = lost_deletes_object(&outcome);")
+                .unwrap(),
             f.find("let fault = match outcome {").unwrap(),
         );
         assert!(decided < matched, "decided over the park's own outcome");
@@ -763,7 +821,11 @@ mod twin {
             async fn read_beef(&self, _: &queue::BeefRef) -> Result<Vec<u8>, queue::BlobFault> {
                 self.0.clone()
             }
-            async fn judge_missing(&self, _: &[String], _: &queue::BeefRef) -> queue::MissingVerdict {
+            async fn judge_missing(
+                &self,
+                _: &[String],
+                _: &queue::BeefRef,
+            ) -> queue::MissingVerdict {
                 self.1.clone()
             }
         }
@@ -773,11 +835,20 @@ mod twin {
         let key = m.r2.as_ref().unwrap().key.clone();
         let missing = || Err(queue::BlobFault::Missing(key.clone()));
         let step = |p: Fixed| block_on(queue::read_for_replay(&p, &m));
-        let unlanded = queue::MissingVerdict::Fault("aa holds no applied row in [tm_a]: its bytes did not land".into());
-        let queue::ReadStep::Fault { fault, missing: true } = step(Fixed(missing(), unlanded)) else {
+        let unlanded = queue::MissingVerdict::Fault(
+            "aa holds no applied row in [tm_a]: its bytes did not land".into(),
+        );
+        let queue::ReadStep::Fault {
+            fault,
+            missing: true,
+        } = step(Fixed(missing(), unlanded))
+        else {
             panic!("an unlanded missing object is acked: an ack over a dropped write")
         };
-        assert!(fault.contains("MISSING") && fault.contains("did not land"), "{fault}");
+        assert!(
+            fault.contains("MISSING") && fault.contains("did not land"),
+            "{fault}"
+        );
         for v in [queue::MissingVerdict::Twin, queue::MissingVerdict::Evicted] {
             assert_eq!(step(Fixed(missing(), v.clone())), queue::ReadStep::Acked(v));
         }
@@ -786,7 +857,10 @@ mod twin {
             queue::ReadStep::Bytes(beef.clone()),
             "the object read: no verdict asked"
         );
-        for f in [queue::BlobFault::Read("503".into()), queue::BlobFault::Refused("hashes to".into())] {
+        for f in [
+            queue::BlobFault::Read("503".into()),
+            queue::BlobFault::Refused("hashes to".into()),
+        ] {
             assert!(matches!(
                 step(Fixed(Err(f), queue::MissingVerdict::Twin)),
                 queue::ReadStep::Fault { missing: false, .. }
@@ -795,7 +869,10 @@ mod twin {
         let mut inline = message(b"not base64 at all");
         inline.beef_b64 = "%%".into();
         assert!(matches!(
-            block_on(queue::read_for_replay(&Fixed(missing(), queue::MissingVerdict::Twin), &inline)),
+            block_on(queue::read_for_replay(
+                &Fixed(missing(), queue::MissingVerdict::Twin),
+                &inline
+            )),
             queue::ReadStep::Fault { missing: false, .. }
         ));
     }
@@ -820,12 +897,15 @@ mod twin {
         for _ in 0..4 {
             assert!(matches!(c.deliver(&l, not_now), Delivered::Fault(_)));
         }
-        assert_eq!(c.letters(), vec![(id.clone(), "failing".to_string(), "not_now".to_string())]);
+        assert_eq!(
+            c.letters(),
+            vec![(id.clone(), "failing".to_string(), "not_now".to_string())]
+        );
         // the re-presentation's write, then L's LOST on its deferral
         c.put(&m2, &beef);
-        assert!(dead_letters::lost_deletes_object(&Ok(dead_letters::Parked::NotNowBound(
-            dead_letters::Deferral::NotNowDay(200)
-        ))));
+        assert!(dead_letters::lost_deletes_object(&Ok(
+            dead_letters::Parked::NotNowBound(dead_letters::Deferral::NotNowDay(200))
+        )));
         c.bucket.remove(&key);
         for _ in 0..4 {
             let Delivered::Fault(fault) = c.deliver(&m2, not_now) else {
@@ -839,11 +919,16 @@ mod twin {
             "the missing object did not promote the letter"
         );
         c.park(&m2);
-        assert_eq!(c.letters(), vec![(id, "parked".to_string(), "not_now".to_string())]);
+        assert_eq!(
+            c.letters(),
+            vec![(id, "parked".to_string(), "not_now".to_string())]
+        );
         // a fresh row (no earlier note) is a fault letter: an unknown is honest
         let (other, other_id) = shapes::sized_body(500_001);
         let o = keyed(&other, &topics);
         assert!(matches!(c.deliver(&o, LANDS), Delivered::Fault(_)));
-        assert!(c.letters().contains(&(other_id, "failing".to_string(), "fault".to_string())));
+        assert!(c
+            .letters()
+            .contains(&(other_id, "failing".to_string(), "fault".to_string())));
     }
 }

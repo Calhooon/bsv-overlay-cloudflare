@@ -520,7 +520,12 @@ pub fn note_failing_query(
 
 /// [`NOTE_FAILING_KEEP_CLASS_SQL`]'s query (E585-D3-L4).
 #[must_use]
-pub fn note_failing_keeping_class_query(txid: &str, topics: &str, fault: &str, now_ms: i64) -> Query {
+pub fn note_failing_keeping_class_query(
+    txid: &str,
+    topics: &str,
+    fault: &str,
+    now_ms: i64,
+) -> Query {
     Query::new(NOTE_FAILING_KEEP_CLASS_SQL)
         .bind(txid)
         .bind(topics)
