@@ -219,10 +219,18 @@ F was chosen against LOW's shapes, as the pin
 `door_low_shapes_sit_under_a_quarter_of_the_work_budget` measures them (before
 the floor in brackets): the real covenant settle and refund (5 hash opcodes, 4
 signature checks: a CHECKSIG and the stated `OP_3` CHECKMULTISIG) 924,112
-bytes each, 1.4 % of the budget (676,284); a JOIN of nine seats whose coins
-are three unproven P2PKH hops deep, 36 inputs, 7,082,619, 10.6 % (4,740,838);
-a coin 30 P2PKH hops deep 5,902,188, 8.8 % (3,941,856). No JOIN is among the
-fixtures of `script_verification`: the JOIN is built in the pin, in its shape.
+bytes each, 1.4 % of the budget (676,284); a coin 30 P2PKH hops deep
+5,902,188, 8.8 % (3,941,856). LOW's JOIN is TWO seats (bsv-low
+`template_tx_sizes.rs:76`; the real funding fixture of the covenant legs is
+one: two P2PKH inputs, the 3,150 byte pot lock, no change). The pin builds it
+over the real pot lock with each seat's coin 40 unproven P2PKH hops deep, the
+deepest unproven ancestry the fleet's record names (bsv-low
+`DECISION-LOG-spite-relay-2026-07.md:1327`, a JOIN-funding hop's "~40-tx"
+ancestry, before the harness fetched proofs): 82 inputs, 16,132,638, 24.0 %
+(the delta lens's E585-D12-DELTA-N5; at 42 hops a seat it is past a quarter,
+and it walks to its end up to 169 hops a seat). The nine-seat JOIN three
+hops deep (36 inputs, 7,082,619, 10.6 %; 4,740,838 before the floor) is NOT
+LOW's shape: it is kept as a STRESS shape.
 A P2PKH input is charged 196,739 bytes (it was 131,394), so 341 of them in one
 walk are the budget (it was about 490) and 85 a quarter of it. At 128 KiB the
 same shapes would be 14.1 % and 11.7 %, and 256 P2PKH inputs the budget: the
@@ -256,14 +264,45 @@ under the estimate for six shapes, 1.3 to 5.3 times over. A breach is
 `submit_script_walk_over_memory_total`, the stream never opened (the call
 holds 250 bytes on both lens bodies), the network judges.
 
+**The scripts' parse is the limb's too** (the delta lens's E585-D12-DELTA-M1).
+bsv-rs cuts a script into one 32 byte `ScriptChunk` per chunk (natively; 16
+on wasm32), and the door's census and `Spend` each parse and clone both
+scripts, a reached signature check clones them again for its subscript, and
+the interpreter pushes up to three EMPTY stack entries per opcode (`OP_3DUP`),
+which its 128 KB memory limit does not count. None of it is a frame charge:
+until the fold a 1 MB `OP_NOP` lock was estimated 4.0 MB and peaked at 67.5
+MB, walked `Ok`, and an 8 MB one 540 MB (on a PROVEN source too: never bounded
+before #585; on an unproven one #585 had lifted the 512 KB stop). Each input's
+two scripts (the locking script of the source it spends, proven or not, and
+its own unlocking script) are now charged, beside the frame's estimate and
+BEFORE either is parsed (`script_door::script_parse_charge`, from a chunk count
+that allocates nothing and is pinned equal to bsv-rs's parse,
+`e585f2_m1_the_chunk_count_is_the_sdks`), 512 bytes a chunk and 8 a byte. A
+breach is the memory limb, and the input is never parsed. Measured, the peak
+of the live heap a script byte (native, a lock of 262,145 chunks so every
+growing buffer is at its slackest, the frame's own 4 included): `OP_NOP` 98,
+`OP_0` 169, `OP_NOP`s then a reached `OP_CHECKSIG` 162, `OP_3DUP` 241 and with
+a reached `OP_CHECKSIG` 258 (the worst), `0x01 xx OP_DROP` 66.7, `0x01 xx`
+unlocking 62.5, ten 100,000 byte pushes then `OP_CHECKSIG` 6.7. So 520 a
+one-byte opcode is 2.0 times the worst; 8 a byte is 3 times the pushes' 2.7
+past the frame. How it composes: the frame's estimate is the most the walk
+holds apart from the input being run (the heaviest transaction in hand counted
+once, the interpreter's raw copies of the unlocking script among its 4 bytes a
+byte); the scripts' charge is the EXPANSION of one input past those bytes,
+held while it runs. `WalkStats::memory_bytes` is the frame's plus the largest
+input's charge. What it costs a valid BEEF: an input whose two scripts are
+about 96,000 opcodes (or a 1 MB `OP_NOP` lock) is left to the network; data
+pushes are 8 bytes a byte (a 1 MB push is 8 MB); LOW's covenant leg (6,608
+script bytes) is charged 1,282,178 in all, 2.55 % of the limb.
+
 The default's arithmetic: a 128 MB isolate, less the request's body (up to the
 route's 10 MB), the completed BEEF the route hands the door (a second copy of
 up to as much) and the EF batch (the route's 2 MB bound, twice while it is
 serialized), 24 MB, less 56 MB left for the module, the runtime, the
 allocator's fragmentation and what a native estimate does not see of wasm32:
 48 MiB, three eighths of the isolate. It lets through a BUMP of up to 72,944
-leaves (690 bytes a level-0 leaf), a single transaction of up to about 12 MB,
-and a 10 MB body of one-input, one-output P2PKH transactions (191 bytes each,
+leaves (690 bytes a level-0 leaf), a single transaction of up to about 12 MB
+whose walked inputs' scripts are few chunks (above), and a 10 MB body of one-input, one-output P2PKH transactions (191 bytes each,
 charged 570: 30 MB). It stops 111,848 transactions of no input and no output.
 
 Measured (native, debug profile, `tests/script_door_stream.rs`): a 2,122,796
@@ -325,7 +364,22 @@ follow would be walked unestimated. The pin
 `e585f_l3_the_sizing_follows_every_frame_the_stream_reads` holds it over three
 frames, every cut and three changes of every byte (5,358 bodies the stream
 reads), and if a later SDK reads a frame it does not, the walk answers "over
-budget" rather than run unestimated. Re-run it at every bsv-rs bump.
+budget" rather than run unestimated. Re-run it at every bsv-rs bump. The
+"over budget" is answered AFTER that read (the delta lens's E585-D12-DELTA-N1):
+the index is built, then the frame is found unfollowed. The door and the census
+share the rule (`stream_sizing::StreamEstimate::admission`: `Open`, `Over`,
+`Unfollowed`; a frame the sizing does not follow is given to the stream, which
+refuses every such frame today, and a read it DOES make is over the limb).
+Checking before the stream would turn every malformed body (a BEEF cut short)
+from the stream's parse fault into a memory breach, the table's rows with it.
+The bound of that unestimated read, if a later SDK makes one: one pass of the
+stream over the caller's body, one element in hand and the index (the census:
+its two passes), which follows the element count and the BUMP leaves (the
+lens's 108 MB for a 9.8 MB body), made once before the answer. (9) The
+scripts' charge rests on bsv-rs 0.4.0's parser and interpreter (a chunk of 32
+bytes, the clones of `Spend::new` and the subscript, empty stack entries
+uncounted): `e585f2_m1_the_scripts_charge_is_above_the_measured_heap` and the
+chunk-count pin are re-run at every bsv-rs bump.
 
 Pins. `cargo test -p bsv-overlay-engine --features memory-storage --test
 script_door_stream -- --nocapture`: `e585_d1_a` the 2 MB / 300-input body
@@ -335,7 +389,8 @@ its 400 inputs sat at 98 %) and a corrupted one refused at the last input,
 `e585_d1_c` the work budget stopping 300 digests of 2 MB from the bytes,
 `e585_d1_d` the index pass. On `d6d2774` a, b and c are RED for the bounds
 (`ScriptWalkOverBudget ... has 300 inputs (limit 256)`; b, resized, for its
-66th unproven transaction, reasoned from the code and not run) and d for its
+65th unproven transaction, run by the delta lens: "more than 64 unproven
+transactions to execute") and d for its
 heap bound (355,684 bytes beside the chunk against 133,368 allowed), not for
 that word (the lens's N3). `--lib e585` (the door's layout of a transaction
 against the SDK's parse; the index per element; the fold's two above).
@@ -351,9 +406,30 @@ and `e585f_m1_the_work_budget_bounds_*` (RED: 152 bytes a check);
 SIGNED INPUT, and seven scripts that read the lock time, the sequence, the
 version (`OP_VER`), a hash or `OP_CODESEPARATOR` are judged the same with and
 without the copy of their transaction at versions 1 and 2 (green on `8c92671`,
-where the shortcut already was; RED against the shortcut taken for every
-input). Below the marked line: `e585f_a_breach_names_its_limb` and
+where the shortcut already was). Against the shortcut taken for EVERY input
+both are RED by their own assertion (the delta lens's E585-D12-DELTA-N3): the
+first walks the mixed transaction (a P2PKH signed SIGHASH_ALL | FORKID beside
+two sig-less `0x01 0x42` over `OP_DROP OP_1`) with the signed input FIRST,
+then at 1 ("mixed, signed first: intact: Err(ScriptVerificationFailed { ..,
+input_index: 0, .. })"; with it at 1 alone the mutant panicked inside bsv-rs);
+the second's pairs (the seven reader locks spent by `0x01 0x42`, bare and
+behind `OP_0 OP_IF OP_CHECKSIG OP_ENDIF`) guard the SDK, not the shortcut, so
+it holds a CONTROL first, that same signed-first transaction walked `OK
+inputs=3` ("the control needs its transaction: REFUSED input 0: .."). Below
+the marked line: `e585f_a_breach_names_its_limb` and
 `e585f_l3_the_memory_estimate_is_above_the_measured_heap`.
+`--test script_door_parse -- --nocapture` (the delta lens's DELTA-M1, the file
+run on `74c2c15` as it stands): a 1 MB `OP_NOP` lock on an UNPROVEN source and
+on a PROVEN one, an 8 MB lock, and the route's shape (a small subject over an
+unproven parent whose unlocking script is 1.9 MB of `OP_1`), each stopped at
+the memory limb before any parse, at a peak of 1,584,568, 1,587,388,
+12,581,644 and 3,151,800 bytes (the pin holds the peak under 4 bytes a byte of
+the body and a MiB, and under the limb); RED on `74c2c15`: walked `Ok` at
+67,555,578, 67,555,578 and 540,436,602, and the 1.9 MB parent at 136,364,598
+before the interpreter's stack limit tripped (`limb: Work`). And
+`e585f2_m1_the_scripts_charge_is_above_the_measured_heap` (eight shapes, each
+stopped by a limb equal to its own measured peak; RED on `74c2c15`, `OP_NOP`
+walked under 25,691,292).
 
 ## The census reads the stream (bsv-low #366; #585 door 2; the doors lens fold of 2026-10-09)
 
@@ -391,9 +467,11 @@ broadcast. Until the fold they were `could-not-evaluate(subject-ambiguous)`,
 which is the reason of a poisoned sort and not of a stricter reader: a client
 that emits a trailing byte sat in that bucket with no way to tell why. Now,
 when the stream refuses bytes the arm's parse accepted, the ancestry is
-answered from THE ARM'S OWN PARSE (`beef_limits::parse_beef` under
-`EF_BEEF_LIMITS`, the call `beef_to_ef_batch` made a moment before, and the
-check of before #585 over it): the verdict is the arm's, `gated-ready` where
+answered from THE ARM'S OWN PARSE (`ef::parse_as_the_arm`,
+`beef_limits::parse_beef` under `EF_BEEF_LIMITS`: the FUNCTION
+`beef_to_ef_batch` calls, a moment before, on the same bytes, so the two
+cannot drift by a change on one side alone; the delta lens's E585-D12-DELTA-N2;
+and the check of before #585 over it): the verdict is the arm's, `gated-ready` where
 the arm would pass, and a stray entry is still the third state. Each such body
 is counted on `submit_census_stream_refused_total` BESIDE its verdict's
 counters (served as `submitReadinessCensus.streamRefused`; how it was read,
@@ -409,7 +487,12 @@ lens's wide BUMP (2^18 leaves in 9.8 MB) the SDK's BUMP element, 108 MB
 natively, twice in sequence. Its own table is small. It is bounded the same
 way: `stream_sizing::estimate` under `CENSUS_CHARGES` (the stream's element,
 128 bytes a transaction and 24 an input kept) against `CENSUS_MEMORY_BYTES`,
-the door's 48 MiB, before the stream is opened. Past it the ancestry is NOT
+the door's 48 MiB, before the stream is opened, under the DOOR'S rule
+(`StreamEstimate::admission`, one function; the delta lens's E585-D12-DELTA-N1:
+before the fold the census did not look at an unfollowed frame at all; now a
+read the stream makes of a frame the sizing did not follow is
+`ancestry-over-memory`, after that read, as at the door, limit (8) of the door
+above). Past it the ancestry is NOT
 read and the verdict is `could-not-evaluate(ancestry-over-memory)`
 (`submit_census_reason_ancestry_over_memory_total`,
 `reasons.ancestryOverMemory`): no green, and no fallback to the arm's parse,
@@ -426,7 +509,11 @@ non-answer is RED), and through `census_reading_under` with a body: a valid
 BEEF whose BUMP carries 2^12 leaves is `gated-ready` under a budget that holds
 its read and `ancestry-over-memory` one byte under it. After the L1 fold no
 body reaches the other non-answer (`Unread`) through `census_verdict`: the
-fallback is the parse step (1) already made of the same bytes.
+fallback is the parse step (1) already made of the same bytes. The mapping of
+the fallback's answer is one function too, `ancestry_of_the_arms_answer`
+(no answer is `Unread`), pinned by `e585f2_n2_the_fallbacks_non_answer_is_never_green`
+(RED against the delta lens's surviving mutant, `None` mapped to `Covered`:
+"left: Covered, right: Unread").
 
 Where it meets NL-6's size refusal, stated and left: `ef.rs`
 `beef_to_ef_batch` and `proven_subject_raw` parse with
@@ -435,8 +522,8 @@ transactions, 512 BUMPs) and hydrate a `Beef`. A body past those is
 `would-fail(parse)` here, which is TRUE of the gated arm (it refuses those
 bytes at that call), so it is a classification and not a stop; the census
 adds no size or count check of its own, and follows the arm when NL-6 moves
-`ef.rs` (its fallback names the arm's parse call and limits and moves with
-them). `would-fail(ef-over-cap)` is likewise the arm's own 429
+`ef.rs` (its fallback CALLS `ef::parse_as_the_arm`, the arm's own parse, and
+moves with it). `would-fail(ef-over-cap)` is likewise the arm's own 429
 (`MAX_SUBJECT_EF_BYTES` 256 KB, `MAX_BATCH_EF_BYTES` 2 MB), mirrored. The
 memory of a census pass is therefore the arm's hydrated parse plus the small
 index; only the index and the stream's element are #585's. The arm's parse of
