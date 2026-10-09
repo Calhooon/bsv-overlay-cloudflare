@@ -142,11 +142,21 @@ mod limit_breach_pin {
         // A BEEF prefix (version 4022206465 LE) claiming 300 BUMPs under a cap of 1.
         let mut bin = vec![0x01, 0x00, 0xbe, 0xef];
         bin.extend_from_slice(&[0xfd, 0x2c, 0x01]); // varint 300
-        let tight = BeefLimits { max_txs: 1, max_bumps: 1, max_bytes: SUBMIT_BODY_MAX_BYTES };
+        let tight = BeefLimits {
+            max_txs: 1,
+            max_bumps: 1,
+            max_bytes: SUBMIT_BODY_MAX_BYTES,
+        };
         let e = parse_beef(&bin, &tight).unwrap_err();
-        assert!(is_limit_breach(&e), "a count breach must classify as a breach: {e}");
+        assert!(
+            is_limit_breach(&e),
+            "a count breach must classify as a breach: {e}"
+        );
         let garbage = [0xde, 0xad, 0xbe, 0xef];
         let e = parse_beef(&garbage, &SUBMIT_BEEF_LIMITS).unwrap_err();
-        assert!(!is_limit_breach(&e), "garbage under the limits is a parse fault, not a breach: {e}");
+        assert!(
+            !is_limit_breach(&e),
+            "garbage under the limits is a parse fault, not a breach: {e}"
+        );
     }
 }
