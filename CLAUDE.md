@@ -572,8 +572,12 @@ after its park answered. A park that faults (D1 down, the binding or the
 migrations included: the batch no longer throws) is handed back with 60 s
 doubling to 30 min from the platform's count (about 48 h over the 100
 retries; an hour's outage is ridden by the 6th); its LAST delivery's fault
-logs `[dead-letters] LOST <txid> [<topics>] sha256=<bytes' hash>` and counts
-`dead_letters_lost_total` (best effort: D1 is usually what faulted). Lens
+logs `[dead-letters] LOST <txid> [<topics>] sha256=<bytes' hash> class=<class>`
+and counts it BY CLASS (the delta-3 fold, D3-L3): `dead_letters_lost_total`
+for a `fault` letter or one whose class was not read (the honest loss to
+alarm on), `dead_letters_lost_not_now_total` for a `not_now` one (the
+designed fate of a flood's tail); both are served from 0 in the counters
+(best effort: D1 is usually what faulted). Lens
 H1: Cloudflare's queue docs give `retry_delay` no default and the base set
 none, so a minute of D1 trouble lost every letter in the DLQ. A redelivery
 of the same bytes changes nothing; ANOTHER copy of a parked key (a resubmit,
@@ -604,7 +608,8 @@ and for a letter no note reached (an unknown is treated as an honest letter).
 A NEW `not_now` letter is deferred like a letter at the ceiling (the same
 backoff, LOST after ~48 h; counted on every delivery,
 `dead_letters_not_now_deferrals_total`, apart from the ceiling's counters)
-at any of three bounds (`ceiling_verdict`):
+at any of three bounds (`ceiling_verdict`, and again inside the park's own
+statement, below):
 - `NOT_NOW_PER_TXID` = 1: one `not_now` letter per txid over all its topic
   sets. Another topic set waits until that letter resolves or is discarded.
   An honest successor is presented under one topic set.
@@ -616,6 +621,22 @@ at any of three bounds (`ceiling_verdict`):
   room too. The gated door carries no caller identity ("not a per-identity
   handshake", `submit_gate.rs`), so the bound is per day, not per source. The
   share then fills in five days at the soonest, not at door speed.
+
+The bounds hold under ONE consumer of the DLQ, and they hold under several too
+(the delta-3 fold, D3-L1). The delta-3 lens ran the read and the park as two
+consumers interleave them: 3 letters of one txid and a share of 1,004. Two
+changes fix that:
+- Every DLQ consumer is ONE consumer (`max_concurrency = 1` in `wrangler.toml`
+  and in prod and beta of `wrangler.low.toml`; the DLQ is low-volume by nature).
+- `PARK_SQL` is an `INSERT ... SELECT` whose `WHERE` re-reads the bounds of
+  `ceiling_verdict`. D1 runs one statement at a time, so two parks that both
+  read room put ONE letter in it. A park that returns no row is read again
+  (`unparked`): a redelivery of held bytes (acked), the deferral it now is, or,
+  when the room freed again since, a fault handed back with the backoff (never
+  an ack).
+
+The read before the park still gives the NEAR line and the deferral's words.
+The count the NEAR line prints can be one letter off under a race.
 
 A key that already holds bytes is never deferred: a copy, or a re-park of a
 re-driven letter whose replay is now "not now". One row per (txid, topics) was
@@ -762,6 +783,31 @@ Each is RED on `66d069f` (97 compile errors with the module grafted) and
 against its fix reverted alone (8 mutants). Route leg 11: the real e1d letters
 are `not_now`; the share is filled; a real "not now" letter is deferred,
 counted apart; the same key as a fault letter is then parked.
+
+The delta-3 fold's pins `e576f4_*`:
+- `l1_interleaved_parks_never_overshoot_a_bound`: reads of room, then parks, at
+  each of the four bounds; a held key at the full ceiling; a refusal whose room
+  freed is not acked; the statement's literals; `max_concurrency = 1` in all
+  three configs.
+- `l2_every_failed_replay_path_notes_its_class`: six notes, only the "not
+  durable" one by the report's sites, `predecessor_not_landed` as the engine
+  writes it.
+- `l2_the_last_note_wins`: both directions.
+- `l2_the_migration_makes_existing_rows_fault_letters`.
+- `l2_the_health_reads_both_classes_and_the_day`: `class_counts` over the real
+  read, one `day_cutoff`.
+- `l2_each_deferral_counts_under_its_class`: and the per-txid bound counts
+  `not_now` letters only.
+- `l2_the_discard_spans_both_classes`.
+- `l3_lost_is_counted_by_class`.
+
+The module does not compile on `f918b72` (33 errors). Over `f918b72`'s
+`PARK_SQL` and configs, with only the new helpers grafted, `l1` fails. Each pin
+is RED against a revert mutant of its wiring (15 mutants; the lens's A to F
+among them). Two earlier pins were amended:
+- `e576f2_m1_a`: it seeded past a full ceiling through the park, which now
+  refuses.
+- `e576f_h1`: the LOST counter is `class.lost_counter()`.
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 
