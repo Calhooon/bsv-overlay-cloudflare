@@ -244,6 +244,67 @@ digests of 2 MB from the bytes, `e585_d1_d` the index pass; each RED on
 e585_d1` (the door's layout of a transaction against the SDK's parse; the
 index per element).
 
+## The census reads the stream (bsv-low #366; #585 door 2)
+
+`submit_census::census_verdict` classifies every `/submit` served on an
+UNGATED path: would the same bytes have survived the gated arm's pre-network
+structural checks? Measurement only: a log line and durable counters
+(`/health/invariants.submitReadinessCensus`), never a refusal, never a change
+of any request's answer. Three states: `gated-ready`, `would-fail(reason)`,
+`could-not-evaluate(reason)`.
+
+**The rule.** A body is CLASSIFIED whatever its size. Until #585 a body over
+2 MiB was `could-not-evaluate(body-over-eval-bound)`: not looked at. That
+stop is gone (`MAX_CENSUS_EVAL_BYTES`, the verdict's variant), and so is the
+census's own bounded parse (`CENSUS_BEEF_LIMITS`). The third state has two
+reasons left: `mined-claim-unverified` and `subject-ambiguous`.
+
+The verdict is two things. (1) The gated arm's OWN functions, called on the
+same bytes in the arm's order (`ef::beef_to_ef_batch`,
+`routes::subject_ef_over_cap`, `ef::proven_subject_raw`): no second spelling
+of the arm's checks, as before. (2) The census's one addition, the ancestry
+check behind a green (is any data-carrying transaction outside the subject's
+in-BEEF ancestor closure?), which read a hydrated BEEF and now reads the
+STREAM: `AncestryShape`, two reads through bsv-rs 0.4.0's `BeefStream`, one
+element in hand, into a number per raw transaction and a pair per input that
+spends another transaction of the BEEF. Measured: 143 bytes for the 5,243,030
+byte pin (2 transactions, 1 BUMP); 74 bytes per element over a 1,000
+transaction chain. Bytes the streaming reader refuses, where the arm's parser
+took them, are a non-answer and a non-answer is no green
+(`could-not-evaluate(subject-ambiguous)`).
+
+Where it meets NL-6's size refusal, stated and left: `ef.rs`
+`beef_to_ef_batch` and `proven_subject_raw` parse with
+`beef_limits::parse_beef(.., EF_BEEF_LIMITS)` (10,000,036 bytes, 512
+transactions, 512 BUMPs) and hydrate a `Beef`. A body past those is
+`would-fail(parse)` here, which is TRUE of the gated arm (it refuses those
+bytes at that call), so it is a classification and not a stop; the census
+adds no size or count check of its own, and follows the arm when NL-6 moves
+`ef.rs`. `would-fail(ef-over-cap)` is likewise the arm's own 429
+(`MAX_SUBJECT_EF_BYTES` 256 KB, `MAX_BATCH_EF_BYTES` 2 MB), mirrored. The
+memory of a census pass is therefore the arm's hydrated parse plus the small
+index; only the index is #585's.
+
+Limits, stated. The classification is synchronous on every ungated submit,
+and a body between 2 MiB and the route's 10 MB is now WORK where it was
+skipped: the arm's parse, the subject's EF conversion, and two stream reads
+(each hashes every transaction once); not measured on wasm32. The durable row
+`submit_census_reason_body_over_eval_bound_total` stays in the read table
+(`reasons.bodyOverEvalBound`: a total counted before is still served) and is
+never bumped again.
+
+Pins: `cargo test --manifest-path workers/Cargo.toml -p
+bsv-overlay-cloudflare --lib e585_d2 -- --nocapture` (`e585_d2_a`: a 5 MB
+valid BEEF is `gated-ready`, one whose SUBJECT is the 5 MB is
+`would-fail(ef-over-cap)`, one with two tips is
+`could-not-evaluate(subject-ambiguous)`; RED on `d6d2774`, grafted:
+`CouldNotEvaluate(BodyOverEvalBound)`; `e585_d2_the_streams_ancestry_*`: the
+stream's answer equals the hydrated parse's, kept verbatim in the test, for
+every transaction of every body named as the subject, the client fixture's
+bodies and a source written after its spender included;
+`e585_d2_the_ancestry_index_*`). The pre-#585 pin
+`census_over_eval_bound_is_uneval_not_a_guess` is retired: it pinned the stop.
+
 ## GASP anchor check (bsv-low #551)
 
 The `historical-tx-no-spv` skip above rests on

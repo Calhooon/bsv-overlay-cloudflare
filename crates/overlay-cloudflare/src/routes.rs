@@ -929,9 +929,10 @@ async fn submit_parts(
                 state_counter
             );
             // Precisely (gate LOW-1): the CLASSIFICATION above is SYNCHRONOUS
-            // on every ungated submit — ~2 `Beef::from_binary` parses, the
-            // subject's EF conversions and an ancestry BFS, all bounded by
-            // `MAX_CENSUS_EVAL_BYTES` — and only the durable D1 WRITE below
+            // on every ungated submit — the gated arm's own parse, the
+            // subject's EF conversions and an ancestry walk over the stream's
+            // index, with no stop by size (bsv-low #585) — and only the
+            // durable D1 WRITE below
             // is backgrounded (`ctx.wait_until`). A D1 fault can only lose a
             // count, never a submit (`bump_counter` logs and swallows its own
             // errors; a missing binding logs and loses the count, never the
