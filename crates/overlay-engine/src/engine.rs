@@ -924,7 +924,8 @@ impl Engine {
     ///
     /// The budget has two more limbs (bsv-low #586), in force with it at
     /// their defaults: the bytes one graph may be SERVED in one pass
-    /// ([`crate::gasp::DEFAULT_GRAPH_BUDGET_BYTES`], 4 MiB) and the nodes it
+    /// ([`crate::gasp::DEFAULT_GRAPH_BUDGET_BYTES`], seven eighths of the
+    /// record cap so a pass it cuts leaves a record that fits) and the nodes it
     /// may APPEND ([`crate::gasp::DEFAULT_GRAPH_BUDGET_NODES`], 64);
     /// [`Engine::set_graph_budget_limbs`] names others.
     pub fn set_graph_budget(&mut self, sleep: SleepFactory, max_calls: u32, budget_ms: u64) {

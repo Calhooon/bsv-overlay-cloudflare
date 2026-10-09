@@ -9638,17 +9638,28 @@ async fn e586_d_a_node_bigger_than_the_limb_is_walked_and_resumes_share_the_limb
 // really spends the `OP_1` output of the one before and carries a head
 // transaction's worth of data.
 fn fat_unmined_chain(length: usize) -> Vec<GASPNode> {
+    fat_unmined(length, 1)
+}
+
+// The same, each link spending `each` `OP_1` outputs of the one before
+// (`each` 2: the diamond chain of the #586 witness, a covenant output and the
+// change, where a transaction is a node once per output index spent).
+fn fat_unmined(length: usize, each: u32) -> Vec<GASPNode> {
     let mut nodes = Vec::new();
-    let mut previous = None;
+    let mut previous: Option<String> = None;
     for height in 0..length {
         let mut tx = Transaction::new();
-        if let Some(txid) = previous {
-            tx.inputs.push(spending(txid, 0));
+        if let Some(txid) = &previous {
+            for vout in 0..each {
+                tx.inputs.push(spending(txid.clone(), vout));
+            }
         }
-        tx.outputs.push(TransactionOutput::new(
-            1000,
-            LockingScript::from_hex("51").unwrap(),
-        ));
+        for _ in 0..each {
+            tx.outputs.push(TransactionOutput::new(
+                1000,
+                LockingScript::from_hex("51").unwrap(),
+            ));
+        }
         // OP_FALSE OP_RETURN <26,000 bytes>
         let mut data = String::from("006a4d9065");
         data.push_str(&format!("{height:02x}").repeat(26_000));
@@ -9768,5 +9779,210 @@ async fn e586_e_a_deferred_record_holds_raw_nodes_and_weighs_what_was_fetched() 
     assert_eq!(topic.discarded_graphs, 0);
     assert!(node.store.deferred_graphs().is_empty());
     assert_eq!(state.borrow().admitted.len(), 8);
+    assert_eq!(node.cursor().await, 1);
+}
+
+// ============================================================================
+// bsv-low #586, the lens fold (E586-L1): the bytes limb's DEFAULT sits UNDER
+// the record cap. At 4 MiB (and 64 nodes) a pass of 26 KB heads was cut only
+// once its record was past `DEFERRED_GRAPH_MAX_BYTES` (1 MiB, about 19 such
+// nodes): `too_big`, the limbs off, the walk gone on under the per-peer budget
+// alone. The default is now seven eighths of the cap, so the pass a limb cuts
+// leaves a record that fits.
+// ============================================================================
+
+use bsv_overlay_engine::gasp::{
+    DEFAULT_GRAPH_BUDGET_BYTES, DEFAULT_GRAPH_BUDGET_NODES, DEFERRED_GRAPH_MAX_BYTES,
+};
+
+// What one tick was SERVED, as the bytes limb counts it (every answer).
+fn served_this_tick(nodes: &[GASPNode], sent: &[String]) -> u64 {
+    let by_txid: HashMap<String, u64> = nodes
+        .iter()
+        .map(|n| (node_txid(n), served_bytes(n)))
+        .collect();
+    sent.iter().map(|txid| by_txid[txid]).sum()
+}
+
+// The hex a record holds (each node's raw transaction and proof) and what
+// the rest of its JSON weighs: (record bytes, node hex, the rest).
+fn record_weight(record: &DeferredGraph) -> (u64, u64, u64) {
+    let bytes = record.byte_size() as u64;
+    let hex: u64 = record.nodes.iter().map(|w| served_bytes(&w.node)).sum();
+    (bytes, hex, bytes - hex)
+}
+
+// A node under the ENGINE's defaults: a per-graph budget whose calls and time
+// are far away, and the two limbs nobody set.
+fn under_default_limbs(nodes: &[GASPNode], tip: usize) -> (Budgeted, Rc<RefCell<HeadState>>) {
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(nodes, &[tip]),
+        Box::new(AdmitsOutputZero(state.clone())),
+        100_000,
+    );
+    node.engine.set_graph_budget(never(), 100, 60_000);
+    (node, state)
+}
+
+// PIN L1. 35 links of ~26 KB (34 unmined heads over a proven genesis) under
+// the DEFAULT limbs, set by nobody. The bytes limb is reached FIRST (18 heads,
+// far under the 64 nodes and the 100 calls): tick 1 defers with the reason
+// `bytes` and a record UNDER the cap; tick 2 resumes from it (the unproven
+// root asked again, then only what is pending: never a fresh walk twice) and
+// the graph lands whole. Nothing is `too_big`, no walk goes on.
+#[tokio::test]
+async fn e586f_l1_a_graph_of_26kb_heads_fills_the_bytes_limb_first_and_its_record_fits() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = fat_unmined_chain(35);
+    let head = served_bytes(&nodes[34]);
+    let (node, state) = under_default_limbs(&nodes, 34);
+
+    let (topic, sent) = node.tick().await;
+    let per_pass = sent.len();
+    assert_eq!(per_pass, 18, "26 KB heads a fresh pass is served");
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    assert!(topic.errors.is_empty());
+    let records = node.store.deferred_graphs();
+    assert_eq!(
+        records[0].reason, "bytes",
+        "the bytes limb is reached first"
+    );
+    assert_eq!(records[0].nodes.len(), 18);
+    let (bytes, hex, rest) = record_weight(&records[0]);
+    assert!(
+        bytes as usize <= DEFERRED_GRAPH_MAX_BYTES,
+        "the record fits: {bytes}"
+    );
+    // The limb is read before a step: the pass ends on the node that
+    // crosses it, at most one node past the limb.
+    let served = served_this_tick(&nodes, &sent);
+    assert!(served >= DEFAULT_GRAPH_BUDGET_BYTES && served < DEFAULT_GRAPH_BUDGET_BYTES + head);
+    assert_eq!(node.cursor().await, 0, "held below the deferred UTXO");
+    assert!(state.borrow().admitted.is_empty());
+    assert_eq!(
+        DEFAULT_GRAPH_BUDGET_BYTES,
+        (DEFERRED_GRAPH_MAX_BYTES / 8 * 7) as u64,
+        "seven eighths of the record cap"
+    );
+    assert_eq!(DEFAULT_GRAPH_BUDGET_NODES, 64);
+    println!(
+        "#586 FOLD L1 (chain): limb {DEFAULT_GRAPH_BUDGET_BYTES}, {per_pass} heads of {head} hex served ({served}); record {bytes} = {hex} hex + {rest} ({:.4}x the hex, {:.4}x the served), {} bytes under the cap",
+        bytes as f64 / hex as f64,
+        bytes as f64 / served as f64,
+        DEFERRED_GRAPH_MAX_BYTES as u64 - bytes
+    );
+
+    // Tick 2: the root again (it is unproven), then the 17 still unwalked.
+    let (topic, sent) = node.tick().await;
+    let mut expected = vec![34];
+    expected.extend((0..17).rev());
+    assert_eq!(sent, txids(&nodes, &expected), "only what was pending");
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]), "converged, no drop");
+    assert_eq!(topic.finalized_graphs, 1);
+    assert!(topic.errors.is_empty());
+    assert_eq!(topic.discarded_graphs, 0);
+    assert!(node.store.deferred_graphs().is_empty());
+    assert_eq!(state.borrow().admitted.len(), 35);
+    assert_eq!(node.cursor().await, 1);
+}
+
+// The overhead of a record over the bytes it was served, MEASURED on the
+// shapes the default's margin (an eighth of the cap, 131,072 bytes) must
+// cover. (1) The #586 witness's diamond chain (7 transactions of ~26 KB, each
+// spending two outputs of the one before: 13 nodes, 23 requests): a record
+// holds a transaction once per OUTPOINT and the limb counts every answer, a
+// repeat too, so the record is lighter than what was served. (2) Small proven
+// nodes, where the JSON around a node outweighs its hex: the NODES limb (64)
+// is what bounds that.
+#[tokio::test]
+async fn e586f_l1_the_margin_under_the_cap_covers_the_measured_overhead() {
+    let (_logs, _guard) = capture_logs();
+    let margin = (DEFERRED_GRAPH_MAX_BYTES as u64) - DEFAULT_GRAPH_BUDGET_BYTES;
+    assert_eq!(margin, 131_072);
+
+    // (1) The diamond chain: deferred by the bytes limb, converged by the
+    // next pass, every record under the cap.
+    let nodes = fat_unmined(7, 2);
+    let (node, state) = under_default_limbs(&nodes, 6);
+    let (topic, sent) = node.tick().await;
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    let records = node.store.deferred_graphs();
+    assert_eq!(records[0].reason, "bytes");
+    let (bytes, hex, rest) = record_weight(&records[0]);
+    let served = served_this_tick(&nodes, &sent);
+    assert!(bytes as usize <= DEFERRED_GRAPH_MAX_BYTES);
+    assert!(bytes < served, "repeats are served and not kept");
+    println!(
+        "#586 FOLD L1 (diamond): {} requests served {served}; record of {} nodes, {} pending: {bytes} = {hex} hex + {rest} ({:.4}x the hex, {:.4}x the served)",
+        sent.len(),
+        records[0].nodes.len(),
+        records[0].pending.len(),
+        bytes as f64 / hex as f64,
+        bytes as f64 / served as f64
+    );
+    let per_node = rest / records[0].nodes.len() as u64;
+    let (topic, _) = node.tick().await;
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]));
+    assert_eq!(topic.finalized_graphs, 1);
+    assert_eq!(state.borrow().admitted.len(), 7, "the seven transactions");
+
+    // (2) 200 small proven links: the nodes limb cuts each pass at 64, and
+    // what is not hex is most of the record.
+    let small = chain(200);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&small, &[199]),
+        Box::new(HeadChainManager(state.clone())),
+        100_000,
+    );
+    node.engine.set_graph_budget(never(), 100, 60_000);
+    let (topic, _) = node.tick().await;
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    let records = node.store.deferred_graphs();
+    assert_eq!(
+        (records[0].reason.as_str(), records[0].nodes.len()),
+        ("nodes", 64)
+    );
+    let (bytes, hex, rest) = record_weight(&records[0]);
+    let small_per_node = rest / 64;
+    println!(
+        "#586 FOLD L1 (small nodes): record of 64 nodes: {bytes} = {hex} hex + {rest} ({:.4}x the hex), {small_per_node} bytes of JSON a node (the diamond: {per_node})",
+        bytes as f64 / hex as f64
+    );
+    // The margin: the JSON of the 64 nodes one pass may append, and what is
+    // left for the node that crosses the limb and the pending inputs.
+    let json_of_a_pass = u64::from(DEFAULT_GRAPH_BUDGET_NODES) * small_per_node.max(per_node);
+    assert!(json_of_a_pass * 4 < margin, "{json_of_a_pass} of {margin}");
+    println!(
+        "#586 FOLD L1 (margin): {margin} bytes; 64 nodes of JSON take {json_of_a_pass}; {} are left for the crossing node and the pending inputs",
+        margin - json_of_a_pass
+    );
+}
+
+// The limit, STATED (the record cap is #585's to remove, not this fold's): a
+// record is the walk of EVERY pass, the limb a budget per pass. A graph whose
+// unwalked ancestry is more than the cap holds (36 links of ~26 KB: 18 the
+// first pass, 17 the second, one left) is cut again with a record past the
+// cap: `too_big`, counted once, and the walk goes on under the per-peer
+// budget alone, as before #586 (L4). It still lands; nothing is refused.
+#[tokio::test]
+async fn e586f_l1_limit_a_graph_past_what_the_cap_holds_goes_on_at_its_second_pass() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = fat_unmined_chain(36);
+    let (node, state) = under_default_limbs(&nodes, 35);
+    let (topic, sent) = node.tick().await;
+    assert_eq!((sent.len(), deferral(&topic)), (18, (1, 0, 0, vec![])));
+    assert!(node.store.deferred_graphs()[0].byte_size() <= DEFERRED_GRAPH_MAX_BYTES);
+    let (topic, sent) = node.tick().await;
+    assert_eq!(
+        sent.len(),
+        19,
+        "the root again, 17 under the limb, one gone on"
+    );
+    assert_eq!(topic.dropped_graphs.len(), 1);
+    assert_eq!(topic.dropped_graphs[0].reason, "too_big");
+    assert_eq!(topic.finalized_graphs, 1);
+    assert_eq!(state.borrow().admitted.len(), 36);
     assert_eq!(node.cursor().await, 1);
 }

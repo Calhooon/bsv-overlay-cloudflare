@@ -403,14 +403,34 @@ pub const DEFAULT_GRAPH_BUDGET_MS: u64 = 60_000;
 /// graph's walk may be SERVED in one pass before it is deferred, counted as
 /// the peer serves them and as a record keeps them (the hex of each node's
 /// raw transaction and of its proof, every answer counted, a repeat too).
-/// 4 MiB: seven times Zanaadu's largest legitimate graph (12 nodes, 565 KB
-/// fetched). A BUDGET PER PASS, not a limit: the walk makes at least one
-/// request a pass whatever its size, and what the pass leaves is resumed.
-pub const DEFAULT_GRAPH_BUDGET_BYTES: u64 = 4 << 20;
+/// A BUDGET PER PASS, not a limit: the walk makes at least one request a
+/// pass whatever its size, and what the pass leaves is resumed.
+///
+/// SEVEN EIGHTHS of the record cap ([`DEFERRED_GRAPH_MAX_BYTES`]; 917,504
+/// bytes while the cap is 1 MiB), derived from it (the lens fold's E586-L1).
+/// It was 4 MiB, above the cap: a pass of 26 KB heads was cut only once its
+/// record no longer fitted (`too_big`), the limbs went off and the walk went
+/// on under the per-peer budget alone, so the limb bounded nothing at the
+/// size it was built for. Under the cap, the pass the limb cuts leaves a
+/// record that fits: 18 heads of 26 KB a pass. The margin (an eighth,
+/// 131,072 bytes) is for what a record holds beside the hex it was served,
+/// measured (`e586f_l1_*`): 214 to 281 bytes of JSON a node, its share of the
+/// pending inputs included (17,984 for the 64 nodes
+/// [`DEFAULT_GRAPH_BUDGET_NODES`] allows a pass), and the node that CROSSES
+/// the limb (the limb is read before a step, so a pass ends at most one node
+/// past it), which has the 113,088 left. What it does not cover, stated: a
+/// crossing node of more than that (a transaction past about 56 KB), or one
+/// with hundreds of inputs still pending; and the record is the walk of EVERY pass while the limb
+/// is per pass, so a graph whose unwalked ancestry outweighs the cap still
+/// ends `too_big` at a later pass and goes on (L4). The cap is #585's to
+/// remove; this default only makes the limb defer BEFORE it.
+pub const DEFAULT_GRAPH_BUDGET_BYTES: u64 = (DEFERRED_GRAPH_MAX_BYTES / 8 * 7) as u64;
 
 /// Default per-GRAPH node budget (bsv-low #586): the nodes ONE graph's walk
-/// may APPEND in one pass before it is deferred (five times those 12). As
-/// [`DEFAULT_GRAPH_BUDGET_BYTES`], a budget per pass that resumes.
+/// may APPEND in one pass before it is deferred (five times the 12 of
+/// Zanaadu's largest legitimate graph). As [`DEFAULT_GRAPH_BUDGET_BYTES`], a
+/// budget per pass that resumes; it also bounds the JSON a pass adds to a
+/// record around its nodes' hex, which the bytes limb does not count.
 pub const DEFAULT_GRAPH_BUDGET_NODES: u32 = 64;
 
 /// A deferred graph whose record has been deferred this many passes is
