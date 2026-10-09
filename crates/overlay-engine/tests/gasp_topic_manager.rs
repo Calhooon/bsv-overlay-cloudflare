@@ -9633,3 +9633,140 @@ async fn e586_d_a_node_bigger_than_the_limb_is_walked_and_resumes_share_the_limb
         "one record resumed: {passes:?}"
     );
 }
+
+// A chain of UNPROVEN ~26 KB transactions over a proven genesis: each link
+// really spends the `OP_1` output of the one before and carries a head
+// transaction's worth of data.
+fn fat_unmined_chain(length: usize) -> Vec<GASPNode> {
+    let mut nodes = Vec::new();
+    let mut previous = None;
+    for height in 0..length {
+        let mut tx = Transaction::new();
+        if let Some(txid) = previous {
+            tx.inputs.push(spending(txid, 0));
+        }
+        tx.outputs.push(TransactionOutput::new(
+            1000,
+            LockingScript::from_hex("51").unwrap(),
+        ));
+        // OP_FALSE OP_RETURN <26,000 bytes>
+        let mut data = String::from("006a4d9065");
+        data.push_str(&format!("{height:02x}").repeat(26_000));
+        tx.outputs.push(TransactionOutput::new(
+            0,
+            LockingScript::from_hex(&data).unwrap(),
+        ));
+        let txid = tx.id();
+        let proof = (height == 0).then(|| honest_proof(&txid, 100));
+        nodes.push(node_of(&tx, 0, proof));
+        previous = Some(txid);
+    }
+    nodes
+}
+
+// THE RECORD PIN. What a deferral saves is the RAW nodes: each one's
+// `rawTx` hex as the peer served it, its `proof` hex, who spends it, and the
+// inputs still pending. No serialized BEEF, no hydrated transaction: nothing
+// in the record's JSON is a BEEF, its keys are the ones named here, and its
+// size is the bytes fetched (1.00x, plus its keys). Seven unmined ~26 KB
+// links under a nodes limb of 4: four nodes saved, and the next pass
+// completes the graph from them (the anchor check runs every script).
+#[tokio::test]
+async fn e586_e_a_deferred_record_holds_raw_nodes_and_weighs_what_was_fetched() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = fat_unmined_chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[7]),
+        Box::new(AdmitsOutputZero(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 100, 60_000);
+    node.engine.set_graph_budget_limbs(u64::MAX, 4);
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[7, 6, 5, 4]));
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    let records = node.store.deferred_graphs();
+    assert_eq!(
+        record_shape(&records[0]),
+        (4, vec![outpoint_of(&nodes[3])], 4, 1, "nodes".into())
+    );
+    let fetched: u64 = nodes[4..].iter().map(served_bytes).sum();
+
+    let json = serde_json::to_value(&records[0]).unwrap();
+    let keys = |v: &serde_json::Value| -> Vec<String> {
+        let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        keys(&json),
+        [
+            "calls",
+            "configured",
+            "idleFaults",
+            "nodes",
+            "outpoint",
+            "passes",
+            "peer",
+            "pending",
+            "reason",
+            "score",
+            "topic"
+        ]
+    );
+    for (walked, served) in json["nodes"].as_array().unwrap().iter().zip([7, 6, 5, 4]) {
+        assert_eq!(keys(walked), ["node", "spentBy"]);
+        // An unproven node: its graph, its output index, its raw bytes.
+        assert_eq!(keys(&walked["node"]), ["graphID", "outputIndex", "rawTx"]);
+        assert_eq!(
+            walked["node"]["rawTx"], nodes[served].raw_tx,
+            "raw, as served"
+        );
+        assert_eq!(walked["node"]["graphID"], outpoint_of(&nodes[7]));
+    }
+    assert_eq!(json["nodes"][0]["spentBy"], serde_json::Value::Null);
+    assert_eq!(json["nodes"][1]["spentBy"], outpoint_of(&nodes[7]));
+    assert_eq!(
+        keys(&json["pending"][0]),
+        ["graphId", "metadata", "outpoint", "parentProven", "spentBy"]
+    );
+    // Nothing in it is a BEEF (BRC-62 `0100beef`, BRC-96 `0200beef`, the
+    // atomic `01010101`): every long string is a raw transaction.
+    fn strings<'v>(v: &'v serde_json::Value, out: &mut Vec<&'v str>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s),
+            serde_json::Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|x| strings(x, out)),
+            _ => {}
+        }
+    }
+    let mut all = Vec::new();
+    strings(&json, &mut all);
+    let long: Vec<&str> = all.into_iter().filter(|s| s.len() > 200).collect();
+    assert_eq!(long.len(), 4, "the four raw transactions and nothing else");
+    for s in &long {
+        assert!(s.starts_with("01000000"), "a raw transaction");
+        assert!(!s.contains("0100beef") && !s.contains("0200beef"));
+        Transaction::from_hex(s).unwrap();
+    }
+    let bytes = records[0].byte_size() as u64;
+    let ratio = bytes as f64 / fetched as f64;
+    println!(
+        "#586 PIN E: a record of 4 unmined nodes is {bytes} bytes for {fetched} fetched ({ratio:.4}x)"
+    );
+    assert!(bytes >= fetched && ratio < 1.01, "{ratio}");
+
+    // The next pass asks the unproven root again (one request), then what
+    // is pending, and completes the graph from the record's raw nodes.
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[7, 3, 2, 1, 0]));
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]));
+    assert_eq!(topic.finalized_graphs, 1);
+    assert!(topic.errors.is_empty());
+    assert_eq!(topic.discarded_graphs, 0);
+    assert!(node.store.deferred_graphs().is_empty());
+    assert_eq!(state.borrow().admitted.len(), 8);
+    assert_eq!(node.cursor().await, 1);
+}
