@@ -19,7 +19,7 @@ help:
 	@echo "  test             cargo test of BOTH workspaces (root: engine crates + harness; workers/: the LOW workers)"
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
 	@echo "  ownership        The storage ownership check (bsv-low #474): every SQL statement against storage-ownership.json (part of ci)"
-	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799)"
+	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c)"
 	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; :LANE_BASE+9, +10)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
@@ -229,7 +229,7 @@ ROUTE_UP_TRIES ?= 60
 ROUTE_UP_SLEEP ?= 3
 ci-route: ci-d1-budget
 	@set -e; \
-	B=$${LANE_BASE:-8791}; P1=$$B; P2=$$((B+1)); P3=$$((B+2)); P4=$$((B+3)); P5=$$((B+4)); P6=$$((B+5)); P7=$$((B+6)); P8=$$((B+7)); P9=$$((B+8)); \
+	B=$${LANE_BASE:-8791}; P1=$$B; P2=$$((B+1)); P3=$$((B+2)); P4=$$((B+3)); P5=$$((B+4)); P6=$$((B+5)); P7=$$((B+6)); P8=$$((B+7)); P9=$$((B+8)); P10=$$((B+11)); P11=$$((B+12)); \
 	strict_log=/tmp/lane347-route-strict.log; \
 	kill_log=/tmp/lane347-route-kill.log; \
 	lenient_log=/tmp/lane366-route-lenient.log; \
@@ -237,6 +237,7 @@ ci-route: ci-d1-budget
 	seen_log=/tmp/lane371-route-seen.log; \
 	door_log=/tmp/lane-script-route-door.log; \
 	door_off_log=/tmp/lane-script-route-door-off.log; \
+	ef_log=/tmp/lane-nl6c-route-ef-$$B.log; \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -282,7 +283,9 @@ ci-route: ci-d1-budget
 	preflight $$P7; \
 	preflight $$P8; \
 	preflight $$P9; \
-	owned_ports="$$P1 $$P2 $$P3 $$P4 $$P5 $$P6 $$P7 $$P8 $$P9"; \
+	preflight $$P10; \
+	preflight $$P11; \
+	owned_ports="$$P1 $$P2 $$P3 $$P4 $$P5 $$P6 $$P7 $$P8 $$P9 $$P10 $$P11"; \
 	wait_up() { \
 	  _port=$$1; _log=$$2; _label=$$3; _i=0; _t0=$$(date +%s); \
 	  while [ $$_i -lt $(ROUTE_UP_TRIES) ]; do \
@@ -368,7 +371,18 @@ ci-route: ci-d1-budget
 	) > "$$door_off_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up $$P9 "$$door_off_log" "script door (kill switch)"; \
-	echo "→ all seven up"; \
+	echo "→ starting wrangler dev :$$P10 (NL-6c, the EF work bound: ARCADE_URL → the lane-nl6c fixture on :$$P11, DUAL_BROADCAST=off)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$P10 --ip 127.0.0.1 \
+	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
+	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
+	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
+	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:true \
+	    --var ARCADE_URL:http://127.0.0.1:$$P11 \
+	    --var DUAL_BROADCAST:off \
+	) > "$$ef_log" 2>&1 & \
+	job_pids="$$job_pids $$!"; \
+	wait_up $$P10 "$$ef_log" "EF work bound"; \
+	echo "→ all eight up"; \
 	KILL_SWITCH_BASE=http://127.0.0.1:$$P2 \
 	  node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:$$P1; \
 	CENSUS_LENIENT_BASE=http://127.0.0.1:$$P3 \
@@ -380,7 +394,9 @@ ci-route: ci-d1-budget
 	  node tools/lane-script/script_refusal_route_ci.mjs http://127.0.0.1:$$P7; \
 	EXPECT_DOOR=off FIXTURE_PORT=$$P8 \
 	  node tools/lane-script/script_refusal_route_ci.mjs http://127.0.0.1:$$P9; \
-	node tools/lane-nl6/submit_any_size_ci.mjs http://127.0.0.1:$$P1
+	node tools/lane-nl6/submit_any_size_ci.mjs http://127.0.0.1:$$P1; \
+	FIXTURE_PORT=$$P11 \
+	  node tools/lane-nl6c/ef_work_bound_ci.mjs http://127.0.0.1:$$P10
 
 # bsv-low #499: THE D1 BUDGET TIER. A prerequisite of `ci-route` (so part of `ci`), in its own block.
 #
