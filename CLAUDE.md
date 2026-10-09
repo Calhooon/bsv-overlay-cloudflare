@@ -1352,15 +1352,21 @@ routed around, never made a limit on a body.
 - **The orphan sweep (the d3 fold; `beef_blob_sweep.rs`).** An object NOTHING
   names (the orphans below) is found by listing the bucket, since nothing
   else knows it. CADENCE: the scheduled tick (`*/15`), one pass a tick,
-  before the GASP step, under a 30 s race (a dropped pass saved no cursor and
-  is made again). THE LEVER (the fold-4, E585-D3-DELTA2-L1): `POST
+  before the GASP step, under a 30 s race (a dropped pass keeps and counts
+  the deletes it made, saved no cursor unless its save was in flight, and its
+  page is listed again). THE LEVER (the fold-4, E585-D3-DELTA2-L1): `POST
   /internal/beef-blob-sweep` (bearer `INTERNAL_TOKEN` in fixed time, as the
   #576 levers; body empty or `{}`, else 400; 401 without the bearer) runs ONE
   pass through `beef_blob_sweep::run_pass`, the function the tick calls (the
   same race, bounds, cursor row and counters), and answers it: `ok`,
-  `stopped` (why a pass ended before its plan: no binding, a state, listing or
-  named-keys read fault, the 30 s budget; then 503, nothing swept, no cursor
-  moved), `listed`, `handled`, `unreadable`, `unreadableKey`, `deleted`,
+  `stopped` (why a pass ended early, then 503: no binding, a state, listing or
+  named-keys read fault, each with nothing swept and no cursor moved; or the
+  30 s budget, the fold-5's E585-D3-DELTA3-L1: the deletes made before the
+  drop are real, each logged SWEPT, and are answered in `deleted` and
+  `deletedBytes` and counted, the counters bumped from what the pass did
+  after the race; `cursorAfter` is null, and `stopped` says whether the
+  cursor's save was in flight at the drop, a statement that may land after
+  it, which `queue.r2.round.startAfter` then shows), `listed`, `handled`, `unreadable`, `unreadableKey`, `deleted`,
   `deletedBytes`, `faults`, `cursorBefore`, `cursorAfter`, `lastPassAt`,
   `roundComplete` and the `budget`. For an operator after a bulk discard or an
   R2 audit (one call a page of 200; call until `roundComplete`), and for the
@@ -1618,6 +1624,30 @@ FAIL, never the reverse), N6 and N8 (no change asked), N4 (the fold-3's RED
 wording: the L1 pin reaches its source assertion only with the fold's rule
 body grafted too), and the e1d and e555 cells' unretried CLI calls (N7, the
 class of M2, not asked).
+
+The fold-5 (the door 3 delta-3 lens, E585-D3-DELTA3-L1 and L2). The pass is
+one function over a port (`beef_blob_sweep::SweepPort`: the bucket, the state,
+the dead letters' keys, the counters, the clock, the log; the worker's is
+`WorkerSweep`, R2 and D1), `sweep_pass`, raced and counted by
+`run_pass_with`, which `run_pass` calls; the lib's tests run both as shipped
+over a model port (the shape of `read_for_replay`). L1: the pass records each
+step in a `PassProgress` as it lands, so a pass the budget drops answers its
+deletes and its listing, and the counters are bumped from that answer after
+the race, ran or dropped (they were bumped inside the pass after its save, so
+a dropped pass's deletes were never counted). L2: the N3 pin ran a model pass;
+it now runs the shipped one. Pins (`--lib e585_d3f5` and `e585_d3f4_n3`):
+`beef_blob_sweep::tests::e585_d3f5_l1_a_pass_the_budget_drops_answers_and_counts_its_deletes`
+(four orphans, the third `head` never answers: `deleted` 2 of 201 bytes, the
+counters by two, no save; dropped in its save: four, "IN FLIGHT"; RED with
+`14f4b2c`'s drop answer grafted into `run_pass_with`: `left: (Number(0),
+Number(0)) right: (Number(2), Number(201))`), and `e585_d3f4_n3` over the
+shipped pass (RED against the lens's mutant B, the shipped pass stopping on
+any unreadable entry, written as a struct literal: `the orphans on both sides
+are swept, left: []`; 661 passed, that one failed). Amended: the window pin's
+source checks follow the port (three fail-closed stops in the pass, the
+binding's in `run_pass`). Stated: the state row's `lastSwept` and
+`lastListed` are not written by a dropped pass (no save); its counters and its
+answer carry it.
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 

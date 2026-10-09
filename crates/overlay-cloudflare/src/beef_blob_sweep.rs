@@ -50,9 +50,14 @@
 //! empty or `{}`, anything else a 400) runs ONE pass through [`run_pass`], the very function the scheduled tick
 //! calls: the same bounds, the same `SWEEP_BUDGET_MS` race, the same cursor row and the same counters. It answers
 //! the pass ([`pass_json`]): what it listed, deleted and could not read, its faults, the cursor before and after,
-//! `lastPassAt`; 200 for a pass that ran, 503 for one that stopped before its plan (nothing swept, no cursor
-//! moved: `stopped` says why). For an operator after a bulk discard or an R2 audit, and for the route tier, which
-//! no longer fires the whole production tick (its peers, WhatsOnChain, the broadcasters) to test one pass.
+//! `lastPassAt`; 200 for a pass that ran, 503 for one that stopped (`stopped` says why). A pass stopped by a
+//! missing binding or a state, listing or named-keys read that faulted swept nothing and moved no cursor. A pass
+//! the 30 s budget DROPPED (the d3 fold-5, E585-D3-DELTA3-L1) answers the deletes it made before the drop
+//! (`deleted`, `deletedBytes`, each logged SWEPT, and counted: the counters are bumped from what the pass did,
+//! after the race) and `cursorAfter: null`: no cursor saved, unless its save was in flight at the drop, which
+//! `stopped` then says (the statement may land after it; the health block's `round.startAfter` tells). For an
+//! operator after a bulk discard or an R2 audit, and for the route tier, which no longer fires the whole
+//! production tick (its peers, WhatsOnChain, the broadcasters) to test one pass.
 //!
 //! ## An object the sweep cannot read (the d3 fold-4, the delta-2 lens's N3)
 //!
@@ -68,6 +73,7 @@
 
 use crate::d1::Query;
 use serde::Deserialize;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::{js_sys, D1Database, Env};
@@ -80,7 +86,8 @@ pub const SWEEP_MAX_OBJECTS: u32 = 200;
 /// one it handled and the next pass goes on from there.
 pub const SWEEP_MAX_DELETES: usize = 50;
 /// The pass's wall-clock slice in the scheduled tick (one list, at most three D1 statements and 100 R2 calls). A
-/// dropped pass wrote no cursor and is made again.
+/// dropped pass keeps (and counts) the deletes it made, saved no cursor unless its save was in flight, and its
+/// page is listed again by the next pass.
 pub const SWEEP_BUDGET_MS: u64 = 30_000;
 /// Cloudflare Queues' default message retention, four days. Neither the mutation queue nor its dead letter queue
 /// sets another (it is set at `wrangler queues create`, not in a wrangler config: the operator's `wrangler queues
@@ -503,7 +510,9 @@ async fn head_of(bucket: &worker::Bucket, key: &str) -> Result<Option<Listed>, S
 /// What one pass did: the lever's answer ([`pass_json`]) and the tick's log line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PassOutcome {
-    /// Why the pass ended before its plan (nothing swept, no cursor moved); `None` for a pass that ran.
+    /// Why the pass ended before its plan; `None` for a pass that ran. A pass stopped by a missing binding or a
+    /// state, listing or named-keys read swept nothing and moved no cursor; one the budget DROPPED keeps what it
+    /// did before the drop (its deletes, counted) and says whether its cursor's save was in flight.
     pub stopped: Option<String>,
     /// The entries the listing returned, the objects the pass handled, the entries it could not read and the first
     /// of their keys.
@@ -534,61 +543,144 @@ impl PassOutcome {
     }
 }
 
+/// What a pass has done SO FAR (the d3 fold-5, E585-D3-DELTA3-L1): written by [`sweep_pass`] as each step lands
+/// (a delete the moment it answered), read by [`run_pass_with`] when the budget drops the pass, so a dropped pass
+/// answers and counts the deletes it made before the drop.
+#[derive(Debug, Default)]
+pub struct PassProgress {
+    out: RefCell<PassOutcome>,
+    /// The save of the cursor was started and has not answered.
+    saving: Cell<bool>,
+}
+
+impl PassProgress {
+    /// The outcome of a pass the budget dropped: what it did up to the drop, no cursor after it (the body cannot
+    /// know whether a save in flight landed: it says so).
+    #[must_use]
+    pub fn dropped(&self) -> PassOutcome {
+        let mut o = self.out.borrow().clone();
+        let cursor = if self.saving.get() {
+            "its cursor's save was IN FLIGHT and may have landed (read /health/invariants.queue.r2.round.startAfter)"
+        } else {
+            "no cursor saved (the next pass lists again from the cursor at rest)"
+        };
+        o.stopped = Some(format!(
+            "the pass EXCEEDED its {SWEEP_BUDGET_MS} ms budget: dropped after {} deletes of {} bytes (each logged SWEPT and counted); {cursor}",
+            o.swept, o.swept_bytes
+        ));
+        o.cursor_after = None;
+        o.last_pass_at = None;
+        o.round_complete = false;
+        o
+    }
+}
+
+/// What one pass needs of the platform (the d3 fold-5, E585-D3-DELTA3-L2): the bucket, the state at rest, the dead
+/// letters' keys, the counters, the clock and the log. The worker's ([`WorkerSweep`]) is R2 and D1; a native test
+/// gives its own, so the shipped pass ([`sweep_pass`], [`run_pass_with`]) runs in the lib's tests as is.
+pub(crate) trait SweepPort {
+    async fn read_state(&self) -> Result<SweepState, String>;
+    async fn list_page(&self, start_after: &str) -> Result<(Vec<Entry>, bool), String>;
+    async fn named_keys(&self) -> Result<HashSet<String>, String>;
+    async fn head(&self, key: &str) -> Result<Option<Listed>, String>;
+    async fn delete(&self, key: &str) -> Result<(), String>;
+    async fn save(&self, next: &SweepState) -> Result<(), String>;
+    async fn bump(&self, counter: &str, delta: u64);
+    fn now_ms(&self) -> i64;
+    fn log(&self, line: &str);
+}
+
+/// The worker's [`SweepPort`]: `BEEF_BLOBS` and `OVERLAY_DB`.
+pub(crate) struct WorkerSweep<'a> {
+    pub bucket: &'a worker::Bucket,
+    pub db: &'a D1Database,
+}
+
+impl SweepPort for WorkerSweep<'_> {
+    async fn read_state(&self) -> Result<SweepState, String> {
+        read_state(self.db).await
+    }
+
+    async fn list_page(&self, start_after: &str) -> Result<(Vec<Entry>, bool), String> {
+        list_page(self.bucket, start_after).await
+    }
+
+    async fn named_keys(&self) -> Result<HashSet<String>, String> {
+        #[derive(Deserialize)]
+        struct Named {
+            r2_key: String,
+        }
+        Query::new(NAMED_KEYS_SQL)
+            .fetch_all::<Named>(self.db)
+            .await
+            .map(|rows| rows.into_iter().map(|r| r.r2_key).collect())
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<Listed>, String> {
+        head_of(self.bucket, key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        self.bucket.delete(key).await.map_err(|e| e.to_string())
+    }
+
+    async fn save(&self, next: &SweepState) -> Result<(), String> {
+        save_query(next).execute(self.db).await
+    }
+
+    async fn bump(&self, counter: &str, delta: u64) {
+        crate::ops::bump_counter(self.db, counter, delta).await;
+    }
+
+    fn now_ms(&self) -> i64 {
+        worker::Date::now().as_millis() as i64
+    }
+
+    fn log(&self, line: &str) {
+        worker::console_log!("{line}");
+    }
+}
+
 /// ONE PASS of the sweep (the module doc). Fail-closed: a state, listing or named-keys read that faults deletes
 /// nothing and moves no cursor; a delete that faults leaves its object for the next round; an entry that does not
-/// read is skipped and counted. Called only through [`run_pass`].
-pub async fn sweep_pass(env: &Env, db: &D1Database) -> PassOutcome {
-    let bucket = match env.bucket(crate::queue::BEEF_BLOBS_BINDING) {
-        Ok(b) => b,
-        Err(e) => {
-            worker::console_log!(
-                "[beef-blobs] the orphan sweep found no {} binding ({e}); nothing listed",
-                crate::queue::BEEF_BLOBS_BINDING
-            );
-            return PassOutcome::stopped(
-                format!("no {} binding", crate::queue::BEEF_BLOBS_BINDING),
-                None,
-            );
-        }
-    };
-    let state = match read_state(db).await {
+/// read is skipped and counted. Each step is recorded in `progress` as it lands. Called only through
+/// [`run_pass_with`].
+pub(crate) async fn sweep_pass<P: SweepPort>(p: &P, progress: &PassProgress) -> PassOutcome {
+    let state = match p.read_state().await {
         Ok(s) => s,
         Err(e) => {
-            worker::console_log!(
+            p.log(&format!(
                 "[beef-blobs] the orphan sweep's state could not be read ({e}); nothing listed"
-            );
+            ));
             return PassOutcome::stopped(format!("the state did not read: {e}"), None);
         }
     };
     let before = Some(state.start_after.clone());
-    let (entries, truncated) = match list_page(&bucket, &state.start_after).await {
-        Ok(p) => p,
+    progress.out.borrow_mut().cursor_before = before.clone();
+    let (entries, truncated) = match p.list_page(&state.start_after).await {
+        Ok(page) => page,
         Err(e) => {
-            worker::console_log!(
+            p.log(&format!(
                 "[beef-blobs] the orphan sweep's listing faulted ({e}); nothing swept"
-            );
+            ));
             return PassOutcome::stopped(format!("the listing faulted: {e}"), before);
         }
     };
     let listed_count = entries.len() as u64;
     let page = split_page(entries);
     for k in &page.unreadable {
-        worker::console_log!(
+        p.log(&format!(
             "[beef-blobs] the orphan sweep could not read the listed object {}; skipped (counted, never swept)",
             k.as_deref().unwrap_or("<no key>")
-        );
+        ));
     }
     let listed = &page.listed;
-    let now = worker::Date::now().as_millis() as i64;
+    let now = p.now_ms();
     let named: HashSet<String> = if any_past_window(listed, now, ORPHAN_WINDOW_S) {
-        #[derive(Deserialize)]
-        struct Named {
-            r2_key: String,
-        }
-        match Query::new(NAMED_KEYS_SQL).fetch_all::<Named>(db).await {
-            Ok(rows) => rows.into_iter().map(|r| r.r2_key).collect(),
+        match p.named_keys().await {
+            Ok(named) => named,
             Err(e) => {
-                worker::console_log!("[beef-blobs] the orphan sweep could not read the dead letters' keys ({e}); nothing swept");
+                p.log(&format!("[beef-blobs] the orphan sweep could not read the dead letters' keys ({e}); nothing swept"));
                 return PassOutcome::stopped(
                     format!("the dead letters' keys did not read: {e}"),
                     before,
@@ -599,100 +691,126 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) -> PassOutcome {
         HashSet::new()
     };
     let plan = plan_pass(listed, &named, now, ORPHAN_WINDOW_S, SWEEP_MAX_DELETES);
+    {
+        let mut out = progress.out.borrow_mut();
+        out.listed = listed_count;
+        out.handled = plan.handled as u64;
+        out.unreadable = page.unreadable.len() as u64;
+        out.unreadable_key = page.unreadable.iter().flatten().next().cloned();
+    }
     let mut swept: HashSet<String> = HashSet::new();
-    let (mut swept_bytes, mut faults) = (0u64, 0u64);
     for o in plan.orphans.iter().map(|i| &listed[*i]) {
-        let head = match head_of(&bucket, o.key.as_str()).await {
+        let head = match p.head(&o.key).await {
             Ok(h) => h,
             Err(e) => {
-                faults += 1;
-                worker::console_log!(
+                progress.out.borrow_mut().faults += 1;
+                p.log(&format!(
                     "[beef-blobs] the orphan sweep's read of {} faulted ({e}); the object stays",
                     o.key
-                );
+                ));
                 continue;
             }
         };
         if !still_orphan(o, head.as_ref()) {
             continue;
         }
-        match bucket.delete(o.key.as_str()).await {
+        match p.delete(&o.key).await {
             Ok(()) => {
                 swept.insert(o.key.clone());
-                swept_bytes += o.bytes;
-                worker::console_log!(
+                {
+                    let mut out = progress.out.borrow_mut();
+                    out.swept += 1;
+                    out.swept_bytes += o.bytes;
+                }
+                p.log(&format!(
                     "[beef-blobs] SWEPT {} bytes={} age_s={} (an orphan: past the {ORPHAN_WINDOW_S} s window, no dead letter names it)",
                     o.key,
                     o.bytes,
                     now.saturating_sub(o.age_ms()) / 1000
-                );
+                ));
             }
             Err(e) => {
-                faults += 1;
-                worker::console_log!(
+                progress.out.borrow_mut().faults += 1;
+                p.log(&format!(
                     "[beef-blobs] the orphan sweep's delete of {} faulted ({e}); the object stays",
                     o.key
-                );
+                ));
             }
         }
     }
     let next = after_pass(&state, &page, &plan, &swept, truncated, now);
-    let saved = match save_query(&next).execute(db).await {
-        Ok(_) => true,
+    progress.saving.set(true);
+    let saved = match p.save(&next).await {
+        Ok(()) => true,
         Err(e) => {
-            worker::console_log!("[beef-blobs] the orphan sweep's state could not be saved ({e}); the next pass lists this page again");
+            p.log(&format!("[beef-blobs] the orphan sweep's state could not be saved ({e}); the next pass lists this page again"));
             false
         }
     };
-    crate::ops::bump_counter(
-        db,
-        crate::ops::COUNTER_QUEUE_R2_ORPHANS_SWEPT,
-        swept.len() as u64,
-    )
-    .await;
-    crate::ops::bump_counter(
-        db,
+    progress.saving.set(false);
+    let mut out = progress.out.borrow().clone();
+    out.unreadable = next.last_unreadable;
+    out.unreadable_key = next.last_unreadable_key.clone();
+    out.round_complete = saved && next.full_at == Some(now);
+    out.cursor_after = saved.then(|| next.start_after.clone());
+    out.last_pass_at = saved.then_some(now);
+    out
+}
+
+/// ONE bounded pass over a port (the d3 fold-5): [`sweep_pass`] raced against `deadline`, then the counters bumped
+/// from what the pass DID, whether it ran or was dropped (E585-D3-DELTA3-L1: the counters were bumped inside the
+/// pass after its save, so a dropped pass's deletes, each logged SWEPT, were never counted).
+pub(crate) async fn run_pass_with<P: SweepPort, D: std::future::Future<Output = ()>>(
+    p: &P,
+    deadline: D,
+) -> PassOutcome {
+    let progress = PassProgress::default();
+    let out = overlay_engine::gasp::race_or_deadline(sweep_pass(p, &progress), deadline)
+        .await
+        .unwrap_or_else(|| progress.dropped());
+    p.bump(crate::ops::COUNTER_QUEUE_R2_ORPHANS_SWEPT, out.swept)
+        .await;
+    p.bump(
         crate::ops::COUNTER_QUEUE_R2_ORPHANS_SWEPT_BYTES,
-        swept_bytes,
+        out.swept_bytes,
     )
     .await;
-    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_R2_ORPHAN_SWEEP_FAULTS, faults).await;
-    crate::ops::bump_counter(
-        db,
+    p.bump(crate::ops::COUNTER_QUEUE_R2_ORPHAN_SWEEP_FAULTS, out.faults)
+        .await;
+    p.bump(
         crate::ops::COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE,
-        next.last_unreadable,
+        out.unreadable,
     )
     .await;
-    PassOutcome {
-        stopped: None,
-        listed: listed_count,
-        handled: plan.handled as u64,
-        unreadable: next.last_unreadable,
-        unreadable_key: next.last_unreadable_key.clone(),
-        swept: swept.len() as u64,
-        swept_bytes,
-        faults,
-        cursor_before: before,
-        round_complete: saved && next.full_at == Some(now),
-        cursor_after: saved.then(|| next.start_after.clone()),
-        last_pass_at: saved.then_some(now),
-    }
+    out
 }
 
 /// ONE bounded pass, as the scheduled tick and the operator's lever both run it (the d3 fold-4, DELTA2-L1): the
-/// pass under its [`SWEEP_BUDGET_MS`] race (a dropped pass saved no cursor and is made again), and one log line.
+/// pass under its [`SWEEP_BUDGET_MS`] race ([`run_pass_with`]: a dropped pass answers and counts its deletes up to
+/// the drop and saved no cursor, unless its save was in flight), and one log line.
 pub async fn run_pass(env: &Env, db: &D1Database, by: &str) -> PassOutcome {
-    let out = overlay_engine::gasp::race_or_deadline(
-        sweep_pass(env, db),
-        crate::broadcaster::sleep_ms(SWEEP_BUDGET_MS),
-    )
-    .await
-    .unwrap_or_else(|| {
-        PassOutcome::stopped(
-            format!("the pass EXCEEDED its {SWEEP_BUDGET_MS} ms budget: dropped, no cursor saved"),
-            None,
-        )
-    });
+    let out = match env.bucket(crate::queue::BEEF_BLOBS_BINDING) {
+        Ok(bucket) => {
+            run_pass_with(
+                &WorkerSweep {
+                    bucket: &bucket,
+                    db,
+                },
+                crate::broadcaster::sleep_ms(SWEEP_BUDGET_MS),
+            )
+            .await
+        }
+        Err(e) => {
+            worker::console_log!(
+                "[beef-blobs] the orphan sweep found no {} binding ({e}); nothing listed",
+                crate::queue::BEEF_BLOBS_BINDING
+            );
+            PassOutcome::stopped(
+                format!("no {} binding", crate::queue::BEEF_BLOBS_BINDING),
+                None,
+            )
+        }
+    };
     worker::console_log!("[beef-blobs] sweep pass ({by}): {}", pass_json(&out));
     out
 }
@@ -736,7 +854,7 @@ pub fn parse_sweep_request(raw: &[u8]) -> bool {
 
 /// `POST /internal/beef-blob-sweep` (bearer `INTERNAL_TOKEN`, as the #576 levers; the d3 fold-4, DELTA2-L1): ONE
 /// pass through [`run_pass`], the scheduled tick's own function. 200 with [`pass_json`] for a pass that ran, 503
-/// with it for one that stopped before its plan.
+/// with it for one that stopped (before its plan, or dropped by the budget with its deletes so far).
 pub async fn internal_sweep(
     mut req: worker::Request,
     env: &Env,
@@ -935,55 +1053,141 @@ mod tests {
         named_read: bool,
     }
 
-    /// ONE PASS as `sweep_pass` makes it, over the bucket above and the SHIPPED statements under real SQLite: the
-    /// state read, the listing from the key at rest, the named keys (read only for a page with an object past
-    /// the window; `named_faults` is that read faulting), the plan, the read before each delete, the state saved.
-    /// `between` runs after the listing and before the deletes (a re-presentation landing meanwhile).
-    fn pass(
-        conn: &rusqlite::Connection,
-        bucket: &mut Bucket,
+    /// A change to the bucket between the listing and the deletes.
+    type Between<'a> = Option<Box<dyn FnOnce(&mut Bucket) + 'a>>;
+
+    /// The test's [`SweepPort`] (the d3 fold-5, E585-D3-DELTA3-L2): the bucket above, the SHIPPED statements under
+    /// real SQLite for the state and the dead letters' keys, the counters in a map (zero skipped, as
+    /// `ops::bump_counter`). `named_faults` is the named-keys read faulting; `between` runs at the first `head` (a
+    /// re-presentation landing between the listing and the deletes); `hang_after_deletes` makes the next `head`
+    /// after that many deletes never answer, and `hang_on_save` the save (a pass the budget drops there).
+    struct Model<'a> {
+        conn: &'a rusqlite::Connection,
+        bucket: RefCell<Bucket>,
         now: i64,
         named_faults: bool,
-        between: impl FnOnce(&mut Bucket),
-    ) -> Pass {
-        let st = state(conn);
-        let (entries, truncated) = bucket.list(&st.start_after, SWEEP_MAX_OBJECTS as usize);
-        let page = split_page(entries);
-        let listed = &page.listed;
-        let mut out = Pass::default();
-        let named: HashSet<String> = if any_past_window(listed, now, ORPHAN_WINDOW_S) {
-            out.named_read = true;
-            if named_faults {
-                return out;
+        between: RefCell<Between<'a>>,
+        hang_after_deletes: Option<usize>,
+        hang_on_save: bool,
+        named_read: Cell<bool>,
+        deleted: RefCell<Vec<(String, u64)>>,
+        counters: RefCell<BTreeMap<String, u64>>,
+    }
+
+    impl<'a> Model<'a> {
+        fn new(conn: &'a rusqlite::Connection, bucket: Bucket, now: i64) -> Self {
+            Self {
+                conn,
+                bucket: RefCell::new(bucket),
+                now,
+                named_faults: false,
+                between: RefCell::new(None),
+                hang_after_deletes: None,
+                hang_on_save: false,
+                named_read: Cell::new(false),
+                deleted: RefCell::new(Vec::new()),
+                counters: RefCell::new(BTreeMap::new()),
             }
-            conn.prepare(NAMED_KEYS_SQL)
+        }
+        fn counter(&self, name: &str) -> u64 {
+            self.counters.borrow().get(name).copied().unwrap_or(0)
+        }
+    }
+
+    impl SweepPort for Model<'_> {
+        async fn read_state(&self) -> Result<SweepState, String> {
+            Ok(state(self.conn))
+        }
+        async fn list_page(&self, start_after: &str) -> Result<(Vec<Entry>, bool), String> {
+            Ok(self
+                .bucket
+                .borrow_mut()
+                .list(start_after, SWEEP_MAX_OBJECTS as usize))
+        }
+        async fn named_keys(&self) -> Result<HashSet<String>, String> {
+            self.named_read.set(true);
+            if self.named_faults {
+                return Err("D1 down".into());
+            }
+            Ok(self
+                .conn
+                .prepare(NAMED_KEYS_SQL)
                 .unwrap()
                 .query_map([], |r| r.get::<_, String>(0))
                 .unwrap()
                 .map(Result::unwrap)
-                .collect()
-        } else {
-            HashSet::new()
-        };
-        let plan = plan_pass(listed, &named, now, ORPHAN_WINDOW_S, SWEEP_MAX_DELETES);
-        between(bucket);
-        let mut swept = HashSet::new();
-        for o in plan.orphans.iter().map(|i| &listed[*i]) {
-            let head = bucket.head(&o.key);
-            if !still_orphan(o, head.as_ref()) {
-                continue;
-            }
-            bucket.objects.remove(&o.key);
-            bucket.deletes += 1;
-            swept.insert(o.key.clone());
-            out.swept.push(o.key.clone());
-            out.swept_bytes += o.bytes;
+                .collect())
         }
-        exec(
-            conn,
-            &save_query(&after_pass(&st, &page, &plan, &swept, truncated, now)),
-        );
-        out
+        async fn head(&self, key: &str) -> Result<Option<Listed>, String> {
+            if let Some(f) = self.between.borrow_mut().take() {
+                f(&mut self.bucket.borrow_mut());
+            }
+            if self
+                .hang_after_deletes
+                .is_some_and(|n| self.deleted.borrow().len() >= n)
+            {
+                std::future::pending::<()>().await;
+            }
+            Ok(self.bucket.borrow_mut().head(key))
+        }
+        async fn delete(&self, key: &str) -> Result<(), String> {
+            let mut b = self.bucket.borrow_mut();
+            let (bytes, _) = b.objects.remove(key).unwrap();
+            b.deletes += 1;
+            self.deleted.borrow_mut().push((key.to_string(), bytes));
+            Ok(())
+        }
+        async fn save(&self, next: &SweepState) -> Result<(), String> {
+            if self.hang_on_save {
+                std::future::pending::<()>().await;
+            }
+            exec(self.conn, &save_query(next));
+            Ok(())
+        }
+        async fn bump(&self, counter: &str, delta: u64) {
+            if delta > 0 {
+                *self
+                    .counters
+                    .borrow_mut()
+                    .entry(counter.to_string())
+                    .or_default() += delta;
+            }
+        }
+        fn now_ms(&self) -> i64 {
+            self.now
+        }
+        fn log(&self, _line: &str) {}
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// ONE PASS, the SHIPPED one ([`run_pass_with`] over [`sweep_pass`], no deadline) over the model port: the state
+    /// read, the listing from the key at rest, the named keys (read only for a page with an object past the window;
+    /// `named_faults` is that read faulting), the plan, the read before each delete, the state saved, the counters.
+    /// `between` runs after the listing and before the deletes (a re-presentation landing meanwhile).
+    fn pass<'a>(
+        conn: &'a rusqlite::Connection,
+        bucket: &mut Bucket,
+        now: i64,
+        named_faults: bool,
+        between: impl FnOnce(&mut Bucket) + 'a,
+    ) -> Pass {
+        let mut m = Model::new(conn, std::mem::take(bucket), now);
+        m.named_faults = named_faults;
+        *m.between.borrow_mut() = Some(Box::new(between));
+        block_on(run_pass_with(&m, std::future::pending::<()>()));
+        *bucket = m.bucket.into_inner();
+        let deleted = m.deleted.into_inner();
+        Pass {
+            swept: deleted.iter().map(|(k, _)| k.clone()).collect(),
+            swept_bytes: deleted.iter().map(|(_, b)| b).sum(),
+            named_read: m.named_read.get(),
+        }
     }
 
     /// The door's write of a body past the room, and the key its message would name.
@@ -1265,15 +1469,27 @@ mod tests {
 
         let me = include_str!("beef_blob_sweep.rs");
         let me = &me[..me.find("#[cfg(test)]").unwrap()];
-        let start = me.find("pub async fn run_pass(").unwrap();
-        let run = squash(&me[start..start + me[start..].find("\n}\n").unwrap()]);
+        let item = |head: &str| {
+            let start = me
+                .find(head)
+                .unwrap_or_else(|| panic!("no `{head}` in the source"));
+            squash(&me[start..start + me[start..].find("\n}\n").unwrap()])
+        };
+        let run = item("pub async fn run_pass(");
         assert!(
-            run.contains("overlay_engine::gasp::race_or_deadline(sweep_pass(env,db),crate::broadcaster::sleep_ms(SWEEP_BUDGET_MS),)"),
+            run.contains("run_pass_with(&WorkerSweep{bucket:&bucket,db,},crate::broadcaster::sleep_ms(SWEEP_BUDGET_MS),)"),
             "the pass runs under its budget"
         );
-        let start = me.find("pub async fn sweep_pass(").unwrap();
-        let f = squash(&me[start..start + me[start..].find("\n}\n").unwrap()]);
-        assert!(f.contains("list_page(&bucket,&state.start_after).await"));
+        assert!(
+            run.contains("PassOutcome::stopped(format!(\"no{}binding\",crate::queue::BEEF_BLOBS_BINDING),None,)"),
+            "no binding: nothing is listed"
+        );
+        let with = item("pub(crate) async fn run_pass_with<");
+        assert!(with.contains(
+            "overlay_engine::gasp::race_or_deadline(sweep_pass(p,&progress),deadline).await.unwrap_or_else(||progress.dropped());"
+        ));
+        let f = item("pub(crate) async fn sweep_pass<");
+        assert!(f.contains("p.list_page(&state.start_after).await"));
         let page = squash(
             &me[me.find("async fn list_page(").unwrap()..me.find("async fn head_of(").unwrap()],
         );
@@ -1284,20 +1500,36 @@ mod tests {
         assert!(f.contains("plan_pass(listed,&named,now,ORPHAN_WINDOW_S,SWEEP_MAX_DELETES)"));
         assert!(f.contains("after_pass(&state,&page,&plan,&swept,truncated,now)"));
         let (named, head, check, delete, save) = (
-            f.find("Query::new(NAMED_KEYS_SQL)").unwrap(),
-            f.find("head_of(&bucket,o.key.as_str())").unwrap(),
+            f.find("p.named_keys().await").unwrap(),
+            f.find("p.head(&o.key).await").unwrap(),
             f.find("if!still_orphan(o,head.as_ref()){continue;}")
                 .unwrap(),
-            f.find("bucket.delete(o.key.as_str())").unwrap(),
-            f.find("save_query(&next).execute(db)").unwrap(),
+            f.find("p.delete(&o.key).await").unwrap(),
+            f.find("p.save(&next).await").unwrap(),
         );
         assert!(named < head && head < check && check < delete && delete < save);
-        assert_eq!(f.matches("bucket.delete(").count(), 1);
+        assert_eq!(f.matches(".delete(").count(), 1);
         assert_eq!(
             f[..delete].matches("returnPassOutcome::stopped(").count(),
-            4,
-            "no binding, a state read, a listing or a named-keys read that faults: nothing is deleted"
+            3,
+            "a state read, a listing or a named-keys read that faults: nothing is deleted"
         );
+        // the worker's port is the shipped statements and R2 calls
+        let port = squash(
+            &me[me.find("impl SweepPort for WorkerSweep<'_> {").unwrap()
+                ..me.find("pub(crate) async fn sweep_pass<").unwrap()],
+        );
+        for call in [
+            "read_state(self.db).await",
+            "list_page(self.bucket,start_after).await",
+            "Query::new(NAMED_KEYS_SQL).fetch_all::<Named>(self.db)",
+            "head_of(self.bucket,key).await",
+            "self.bucket.delete(key).await",
+            "save_query(next).execute(self.db).await",
+            "crate::ops::bump_counter(self.db,counter,delta).await;",
+        ] {
+            assert!(port.contains(call), "the worker's port: {call}");
+        }
     }
 
     /// The d3 fold-2 (the lens's L3 and N2 (b)): the sweep's age is the LATER of R2's `uploaded` and the writer's
@@ -1604,9 +1836,10 @@ mod tests {
             "one unreadable object fails the whole page"
         );
         assert!(page.contains("None=>Entry::Unreadable("));
-        let f = item(me, "pub async fn sweep_pass(");
+        let f = item(me, "pub(crate) async fn sweep_pass<");
         assert!(f.contains("letpage=split_page(entries);"));
-        assert!(f.contains("COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE,next.last_unreadable,"));
+        assert!(item(me, "pub(crate) async fn run_pass_with<")
+            .contains("COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE,out.unreadable,"));
         assert_eq!(
             crate::ops::COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE,
             "queue_r2_orphan_sweep_unreadable_total"
@@ -1614,7 +1847,9 @@ mod tests {
         assert!(crate::d1::OVERLAY_MIGRATIONS.contains(&SWEEP_STATE_UNREADABLE_COLUMN));
         assert!(crate::d1::OVERLAY_MIGRATIONS.contains(&SWEEP_STATE_UNREADABLE_KEY_COLUMN));
 
-        // the model pass over the shipped statements
+        // the SHIPPED pass (`sweep_pass`, through `run_pass_with`) over the model port and the shipped statements
+        // (the d3 fold-5, E585-D3-DELTA3-L2: it ran a model pass, and a shipped pass that stopped on an
+        // unreadable entry passed every pin)
         let conn = db();
         let mut bucket = Bucket::default();
         let t0 = 1_800_000_000_000i64;
@@ -1710,5 +1945,95 @@ mod tests {
             ),
             (k(30), 2, None)
         );
+    }
+
+    /// The d3 fold-5 (the door 3 delta-3 lens, E585-D3-DELTA3-L1): a pass the budget DROPS answers and counts the
+    /// deletes it made before the drop. Four orphans past the window; the pass deletes two, then its third `head`
+    /// never answers and the deadline drops it. The answer is `deleted: 2` with their bytes, `cursorAfter: null`,
+    /// a `stopped` that says no cursor was saved, and the counters moved by two; the state at rest is untouched. A
+    /// pass dropped in its SAVE says the save was in flight, with all four deletes counted. A pass that runs counts
+    /// once, as before. RED on `14f4b2c`'s rule (its `run_pass` answer on a drop, `PassOutcome::stopped(".. dropped,
+    /// no cursor saved", None)`, grafted into `run_pass_with`, its counters bumped inside the pass after the save):
+    /// `deleted` 0 and the counters unmoved.
+    #[test]
+    fn e585_d3f5_l1_a_pass_the_budget_drops_answers_and_counts_its_deletes() {
+        use crate::ops::{
+            COUNTER_QUEUE_R2_ORPHANS_SWEPT as SWEPT, COUNTER_QUEUE_R2_ORPHANS_SWEPT_BYTES as BYTES,
+        };
+        let conn = db();
+        let t0 = 1_800_000_000_000i64;
+        let now = t0 + WINDOW_MS + 1;
+        let k = |i: u64| format!("{SWEEP_PREFIX}{i:064x}/{:032x}", 0);
+        let orphans = || {
+            let mut b = Bucket::default();
+            for i in 0..4 {
+                b.put(&k(i), 100 + i, t0);
+            }
+            b
+        };
+
+        // dropped at the third head: two deletes made
+        let mut m = Model::new(&conn, orphans(), now);
+        m.hang_after_deletes = Some(2);
+        let out = block_on(run_pass_with(&m, std::future::ready(())));
+        let j = pass_json(&out);
+        assert_eq!(
+            (&j["deleted"], &j["deletedBytes"]),
+            (&serde_json::json!(2), &serde_json::json!(201)),
+            "the deletes made before the drop: {j}"
+        );
+        assert_eq!(j["ok"], false);
+        assert_eq!(j["cursorBefore"], "");
+        assert_eq!(j["cursorAfter"], serde_json::Value::Null);
+        assert_eq!(j["lastPassAt"], serde_json::Value::Null);
+        let why = out.stopped.clone().unwrap();
+        assert!(
+            why.contains("EXCEEDED")
+                && why.contains("dropped after 2 deletes of 201 bytes")
+                && why.contains("no cursor saved"),
+            "{why}"
+        );
+        assert_eq!(
+            (m.counter(SWEPT), m.counter(BYTES)),
+            (2, 201),
+            "the counters carry the dropped pass's deletes"
+        );
+        assert_eq!(m.bucket.borrow().objects.len(), 2, "the deletes were real");
+        assert_eq!(state(&conn), SweepState::default(), "no save was started");
+
+        // dropped in its save: four deletes, the save in flight
+        let mut m = Model::new(&conn, orphans(), now);
+        m.hang_on_save = true;
+        let out = block_on(run_pass_with(&m, std::future::ready(())));
+        assert_eq!((out.swept, out.swept_bytes), (4, 406));
+        assert!(
+            out.stopped
+                .as_deref()
+                .unwrap()
+                .contains("IN FLIGHT and may have landed"),
+            "{:?}",
+            out.stopped
+        );
+        assert_eq!(out.cursor_after, None);
+        assert_eq!((m.counter(SWEPT), m.counter(BYTES)), (4, 406));
+
+        // a pass that runs is counted once, with its cursor
+        let m = Model::new(&conn, orphans(), now);
+        let out = block_on(run_pass_with(&m, std::future::ready(())));
+        assert_eq!(out.stopped, None);
+        assert_eq!((out.swept, m.counter(SWEPT), m.counter(BYTES)), (4, 4, 406));
+        assert_eq!(out.cursor_after.as_deref(), Some(""));
+        assert!(out.round_complete);
+        // a pass stopped before its plan counts nothing and keeps its old words
+        let mut m = Model::new(&conn, orphans(), now);
+        m.named_faults = true;
+        let out = block_on(run_pass_with(&m, std::future::ready(())));
+        assert!(out
+            .stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("the dead letters' keys did not read"));
+        assert_eq!((out.swept, m.counter(SWEPT)), (0, 0));
+        assert_eq!(m.bucket.borrow().objects.len(), 4);
     }
 }
