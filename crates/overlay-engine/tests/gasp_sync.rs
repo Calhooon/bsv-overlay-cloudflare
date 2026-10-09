@@ -52,6 +52,27 @@ impl TrackingGASPStorage {
 
 #[async_trait(?Send)]
 impl GASPStorage for TrackingGASPStorage {
+    // Keeps no deferred graphs (bsv-low #555): never given a per-graph budget.
+    async fn load_deferred_graphs(
+        &self,
+    ) -> Result<Vec<bsv_overlay_engine::gasp::DeferredGraphKey>, GASPError> {
+        Ok(Vec::new())
+    }
+    async fn get_deferred_graph(
+        &self,
+        _: &str,
+    ) -> Result<Option<bsv_overlay_engine::gasp::DeferredGraph>, GASPError> {
+        Ok(None)
+    }
+    async fn save_deferred_graph(
+        &self,
+        _: &bsv_overlay_engine::gasp::DeferredGraph,
+    ) -> Result<bsv_overlay_engine::gasp::DeferredGraphSave, GASPError> {
+        Err(GASPError::StorageError("keeps no deferred graphs".into()))
+    }
+    async fn delete_deferred_graph(&self, _: &str) -> Result<(), GASPError> {
+        Ok(())
+    }
     async fn find_known_utxos(
         &self,
         since: u64,
@@ -608,6 +629,27 @@ async fn ts_gasp_graph_validation_failure_discards() {
 
     #[async_trait(?Send)]
     impl GASPStorage for SharedTrackingStorage {
+        // Keeps no deferred graphs (bsv-low #555): never given a per-graph budget.
+        async fn load_deferred_graphs(
+            &self,
+        ) -> Result<Vec<bsv_overlay_engine::gasp::DeferredGraphKey>, GASPError> {
+            Ok(Vec::new())
+        }
+        async fn get_deferred_graph(
+            &self,
+            _: &str,
+        ) -> Result<Option<bsv_overlay_engine::gasp::DeferredGraph>, GASPError> {
+            Ok(None)
+        }
+        async fn save_deferred_graph(
+            &self,
+            _: &bsv_overlay_engine::gasp::DeferredGraph,
+        ) -> Result<bsv_overlay_engine::gasp::DeferredGraphSave, GASPError> {
+            Err(GASPError::StorageError("keeps no deferred graphs".into()))
+        }
+        async fn delete_deferred_graph(&self, _: &str) -> Result<(), GASPError> {
+            Ok(())
+        }
         async fn find_known_utxos(
             &self,
             _: u64,
@@ -708,6 +750,27 @@ async fn ts_gasp_deep_utxo_ancestor_chain() {
 
     #[async_trait(?Send)]
     impl GASPStorage for AncestorChainStorage {
+        // Keeps no deferred graphs (bsv-low #555): never given a per-graph budget.
+        async fn load_deferred_graphs(
+            &self,
+        ) -> Result<Vec<bsv_overlay_engine::gasp::DeferredGraphKey>, GASPError> {
+            Ok(Vec::new())
+        }
+        async fn get_deferred_graph(
+            &self,
+            _: &str,
+        ) -> Result<Option<bsv_overlay_engine::gasp::DeferredGraph>, GASPError> {
+            Ok(None)
+        }
+        async fn save_deferred_graph(
+            &self,
+            _: &bsv_overlay_engine::gasp::DeferredGraph,
+        ) -> Result<bsv_overlay_engine::gasp::DeferredGraphSave, GASPError> {
+            Err(GASPError::StorageError("keeps no deferred graphs".into()))
+        }
+        async fn delete_deferred_graph(&self, _: &str) -> Result<(), GASPError> {
+            Ok(())
+        }
         async fn find_known_utxos(
             &self,
             _since: u64,
@@ -816,6 +879,27 @@ async fn ts_gasp_cyclic_reference_prevention() {
 
     #[async_trait(?Send)]
     impl GASPStorage for CyclicStorage {
+        // Keeps no deferred graphs (bsv-low #555): never given a per-graph budget.
+        async fn load_deferred_graphs(
+            &self,
+        ) -> Result<Vec<bsv_overlay_engine::gasp::DeferredGraphKey>, GASPError> {
+            Ok(Vec::new())
+        }
+        async fn get_deferred_graph(
+            &self,
+            _: &str,
+        ) -> Result<Option<bsv_overlay_engine::gasp::DeferredGraph>, GASPError> {
+            Ok(None)
+        }
+        async fn save_deferred_graph(
+            &self,
+            _: &bsv_overlay_engine::gasp::DeferredGraph,
+        ) -> Result<bsv_overlay_engine::gasp::DeferredGraphSave, GASPError> {
+            Err(GASPError::StorageError("keeps no deferred graphs".into()))
+        }
+        async fn delete_deferred_graph(&self, _: &str) -> Result<(), GASPError> {
+            Ok(())
+        }
         async fn find_known_utxos(
             &self,
             _: u64,

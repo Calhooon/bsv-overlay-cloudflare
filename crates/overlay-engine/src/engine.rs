@@ -81,6 +81,9 @@ pub struct Engine {
     /// exceeds the budget is DROPPED (loud log, failure recorded, cursor NOT
     /// advanced) and the loop continues with the next peer.
     peer_sync_budget: Option<(SleepFactory, u64)>,
+    /// The per-GRAPH GASP budget (bsv-low #555): the sleep, the calls, the
+    /// ms. `None`: no graph is deferred.
+    graph_budget: Option<(SleepFactory, u32, u64)>,
     /// The bound of one transaction's finalize submit (bsv-low #559), see
     /// [`Engine::set_finalize_submit_budget`].
     finalize_submit_budget: Option<(SleepFactory, u64)>,
@@ -764,6 +767,7 @@ impl Engine {
             gasp_remote_factory: None,
             ancestor_fetcher: None,
             peer_sync_budget: None,
+            graph_budget: None,
             finalize_submit_budget: None,
             finalize_gate: crate::gasp::SubmitGate::default(),
             not_landed: std::cell::RefCell::new(HashSet::new()),
@@ -848,12 +852,69 @@ impl Engine {
     /// quarantine count: a peer serving a long bootstrap is not a dead peer.
     /// One with no progress is a failed attempt, as before.
     ///
-    /// The budget bounds the work of a TICK. Nothing bounds a GRAPH (parity:
-    /// the reference has no node cap): one graph whose own walk outlasts the
-    /// budget is dropped on every tick (`deadline_dropped_graphs`) and never
-    /// admitted.
+    /// The budget bounds the work of a TICK. Without a per-graph budget
+    /// nothing bounds a GRAPH (parity: the reference has no node cap): one
+    /// graph whose own walk outlasts the budget is dropped on every tick
+    /// (`deadline_dropped_graphs`) and never admitted. With one
+    /// ([`Engine::set_graph_budget`], bsv-low #555) that walk is deferred
+    /// with its progress kept, here too, and resumed next tick.
     pub fn set_peer_sync_budget(&mut self, sleep: SleepFactory, budget_ms: u64) {
         self.peer_sync_budget = Some((sleep, budget_ms));
+    }
+
+    /// Set the per-GRAPH GASP budget and turn DEFERRAL on (bsv-low #555).
+    ///
+    /// A graph whose walk makes `max_calls` requests (to the peer, or chain
+    /// fetches) or runs `budget_ms` in one pass is DEFERRED: its partial walk
+    /// (the nodes fetched with their proofs, the inputs still pending, the
+    /// calls spent, its age in passes) is saved as ONE record of the storage
+    /// ([`Storage::put_deferred_graph`], replaced on every deferral), its
+    /// UTXO is held below the cursor as a failed one is (the gap guard) and
+    /// not walked again in the sync (#554), and the sync goes on to the next
+    /// UTXO and topic. The next sync that is served that UTXO RESUMES the
+    /// walk from the record, asking only what is pending, under the same
+    /// budget; a graph so converges over passes and is then completed as
+    /// any graph is (#551's anchor check, the finalize submits, e1d's
+    /// rules). A walk cut by the per-peer deadline is deferred the same way.
+    ///
+    /// Bounds: a record deferred [`crate::gasp::DEFERRED_GRAPH_MAX_PASSES`]
+    /// times, or bigger than [`crate::gasp::DEFERRED_GRAPH_MAX_BYTES`], is
+    /// dropped with its reason and the UTXO fails as before (the gap guard
+    /// asks again, from the root); at most
+    /// [`crate::gasp::DEFERRED_GRAPHS_PER_PEER_TOPIC`] records per (peer,
+    /// topic). Keep `budget_ms` below the per-peer budget so that a deep
+    /// graph leaves the pass time for the UTXOs after it. Defaults offered:
+    /// [`crate::gasp::DEFAULT_GRAPH_BUDGET_CALLS`],
+    /// [`crate::gasp::DEFAULT_GRAPH_BUDGET_MS`].
+    ///
+    /// Every resume of one sync shares ONE such budget (the lens fold's M1),
+    /// so the deferred UTXOs, served first, leave the pass the rest; a walk
+    /// that fetched nothing keeps no record and is a failed attempt for the
+    /// quarantine (H1); a walk that cannot be kept, or whose save faulted,
+    /// goes on under the per-peer budget alone (L4, the delta fold's D-L2);
+    /// a FRESH walk's error keeps no record (D-M1). With a budget, a sync the
+    /// peer served work that finalized no graph and moved no cursor is
+    /// YIELDLESS, and past [`crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED`] in a
+    /// row AND [`crate::gasp::PEER_YIELDLESS_SECS_ALLOWED`] since the streak
+    /// began each is a failed attempt (D-M2, the delta-2 fold's D2-M1; the
+    /// streak is kept by [`Storage::record_peer_sync_yield`], keyed on the
+    /// peer's [`crate::gasp::peer_origin`] as its quarantine is). A FRESH
+    /// walk that faults after half its calls or half its time keeps its
+    /// record (D2-L1); a RESUMED one that faults having appended nothing
+    /// [`crate::gasp::DEFERRED_GRAPH_MAX_IDLE_FAULTS`] passes in a row is
+    /// dropped (D2-M2). Each record says whether its peer is configured
+    /// (`SyncTarget::Peers`), for a storage that reserves part of its
+    /// ceiling for those (the worker reserves half).
+    ///
+    /// Unset (the default) nothing is deferred and the walk is the one
+    /// before #555 (parity: the reference has no budget and no deferral).
+    /// The storage must KEEP records (the four required deferred-graph
+    /// methods of [`Storage`]): over one that refuses every save, every
+    /// graph past the budget is walked from its root under the per-peer
+    /// budget alone on every pass, as before #555, so do not set a budget
+    /// there.
+    pub fn set_graph_budget(&mut self, sleep: SleepFactory, max_calls: u32, budget_ms: u64) {
+        self.graph_budget = Some((sleep, max_calls, budget_ms));
     }
 
     /// Bound ONE transaction's GASP finalize submit (bsv-low #559, the delta
@@ -4635,7 +4696,10 @@ impl Engine {
 
         let mut topics_synced: HashMap<String, TopicSyncResult> = HashMap::new();
 
-        for (topic, target) in &self.config.sync_configuration {
+        for (topic, target) in sync_order(&self.config.sync_configuration) {
+            // A CONFIGURED topic's peers are reserved part of a storage's
+            // deferred-graph ceiling (bsv-low #555, the delta-2 fold's D2-M2).
+            let configured_peers = matches!(target, SyncTarget::Peers(_));
             let (peers, sync_type) = match target {
                 SyncTarget::Disabled => {
                     info!("[GASP SYNC] Topic {topic} is disabled — skipping");
@@ -4681,6 +4745,12 @@ impl Engine {
             let mut finalized_graphs: u64 = 0;
             let mut deadline_dropped_graphs: u64 = 0;
             let mut cursor_moves: Vec<CursorMove> = Vec::new();
+            let mut deferred_graphs: u64 = 0;
+            let mut resumed_graphs: u64 = 0;
+            let mut converged_graphs: u64 = 0;
+            let mut dropped_graphs: Vec<DroppedDeferral> = Vec::new();
+            let mut stalled_graphs: u64 = 0;
+            let mut held_back_graphs: u64 = 0;
 
             // If we have a remote factory, actually run GASP sync
             if let Some(ref factory) = self.gasp_remote_factory {
@@ -4691,9 +4761,16 @@ impl Engine {
                     // keeps growing) until the re-probe window opens. A
                     // health-read FAULT treats the peer as healthy: broken
                     // bookkeeping must never silence a live peer.
+                    //
+                    // The peer's health (its quarantine, its yieldless
+                    // streak) is keyed on its NORMALIZED ORIGIN (bsv-low
+                    // #555, the delta-2 fold's D2-M2): keyed on the URL, one
+                    // server was a fresh peer for every spelling it
+                    // advertised.
+                    let health_key = crate::gasp::peer_origin(peer_url);
                     let health = self
                         .storage
-                        .get_peer_sync_health(peer_url, topic)
+                        .get_peer_sync_health(&health_key, topic)
                         .await
                         .unwrap_or_default();
                     if crate::gasp::peer_sync_quarantined(&health) {
@@ -4731,6 +4808,8 @@ impl Engine {
                     // Create storage adapter and remote
                     let mut gasp_storage =
                         OverlayGASPStorage::new(self.storage.as_ref(), topic, sink.clone())
+                            .with_peer(peer_url.as_str())
+                            .with_configured_peer(configured_peers)
                             .with_strict_beef(hydration_on)
                             .with_script_verification(self.verify_scripts);
                     if let Some(manager) = self.managers.get(topic) {
@@ -4756,6 +4835,17 @@ impl Engine {
                         true, // unidirectional — overlay GASP is pull-only (submitNode throws); matches TS Engine.startGASPSync
                     )
                     .with_ancestor_fetcher(self.ancestor_fetcher.clone());
+                    // bsv-low #555: a graph past its own budget is deferred,
+                    // not dropped with the sync.
+                    if let Some((sleep, max_calls, budget_ms)) = &self.graph_budget {
+                        let (sleep, budget_ms) = (sleep.clone(), *budget_ms);
+                        let half_sleep = sleep.clone();
+                        sync = sync.with_graph_budget(crate::gasp::GraphBudget {
+                            max_calls: *max_calls,
+                            deadline: Box::new(move || sleep(budget_ms)),
+                            half_deadline: Some(Box::new(move || half_sleep(budget_ms / 2))),
+                        });
+                    }
                     // bsv-low #552: under a budget each graph is submitted as
                     // it finalizes, so the deadline cannot take it back. With
                     // no budget nothing can drop the sync, and the graphs are
@@ -4803,6 +4893,11 @@ impl Engine {
                     // refused graph is not a failed sync (the reference
                     // discards it and carries on).
                     discarded_graphs += sync.discarded_graphs();
+                    // Whether the sync ran (to its end, or to the deadline)
+                    // and whether it moved the cursor (bsv-low #555, the
+                    // delta fold's D-M2).
+                    let ran = !matches!(sync_outcome, Some(Err(_)));
+                    let mut advanced_cursor = false;
                     match sync_outcome {
                         None => {
                             let budget_ms = self.peer_sync_budget.as_ref().map_or(0, |(_, ms)| *ms);
@@ -4824,6 +4919,9 @@ impl Engine {
                             // UTXO is below the cursor too.
                             let in_flight = u64::from(sync.graph_in_flight());
                             deadline_dropped_graphs += in_flight;
+                            // bsv-low #555: the walk in hand is saved, so the
+                            // next tick resumes it instead of walking it again.
+                            sync.defer_in_flight().await;
                             let completed = sync.completed_cursor();
                             if completed > last_interaction {
                                 match self
@@ -4843,9 +4941,17 @@ impl Engine {
                             }
                             // A tick that finalized a graph or moved the
                             // cursor reached a live peer: not a failed
-                            // attempt for the quarantine count.
-                            outcome_success =
-                                peer_finalized.get() > 0 || completed > last_interaction;
+                            // attempt for the quarantine count. So did one
+                            // whose walk PROGRESSED (bsv-low #555: it
+                            // appended a node, or completed its graph). A
+                            // deferral that fetched nothing is no progress
+                            // (the lens fold's H1: a hung peer deferred with
+                            // 0 nodes on every tick and was never
+                            // quarantined).
+                            advanced_cursor = completed > last_interaction;
+                            outcome_success = peer_finalized.get() > 0
+                                || completed > last_interaction
+                                || sync.deferral_stats().progressed > 0;
                             warn!(
                                 "[GASP SYNC] {peer_url} for {topic} at the deadline: finalized_graphs={} deadline_dropped_graphs={in_flight} cursor {last_interaction} -> {} (bsv-low #552)",
                                 peer_finalized.get(),
@@ -4859,6 +4965,30 @@ impl Engine {
                             let landed = self
                                 .submit_finalized_graphs(&sink, peer_url, topic, &peer_finalized)
                                 .await;
+                            // bsv-low #555, the lens fold's H1: a sync that
+                            // ran to its end with walks the per-graph budget
+                            // cut having FETCHED NOTHING, and nothing else
+                            // got done (no walk progressed, no graph
+                            // finalized, the cursor did not move), reached
+                            // a peer that does not answer: a FAILED attempt.
+                            // Before #555 such a peer held the sync to the
+                            // per-peer deadline, a failure; the per-graph
+                            // budget had made it an `Ok` sync. A sync whose
+                            // UTXOs failed in any other way is unchanged.
+                            let stats = sync.deferral_stats();
+                            if stats.stalled > 0
+                                && stats.progressed == 0
+                                && peer_finalized.get() == 0
+                                && !(landed && sync.last_interaction > last_interaction)
+                            {
+                                outcome_success = false;
+                                let msg = format!(
+                                    "{peer_url}: {} graph walk(s) cut by the per-graph budget with nothing fetched (bsv-low #555)",
+                                    stats.stalled
+                                );
+                                warn!("[GASP SYNC] {msg}");
+                                errors.push(msg);
+                            }
 
                             // Advance the persisted cursor when it moved forward — i.e.
                             // the peer reported UTXOs at a higher score than our last
@@ -4878,6 +5008,7 @@ impl Engine {
                             // skipped). Under a budget the hook fails that
                             // one UTXO instead and the gap guard has already
                             // capped `sync.last_interaction` below it.
+                            advanced_cursor = landed && sync.last_interaction > last_interaction;
                             if !landed {
                                 warn!(
                                     "[GASP SYNC] a finalize submit for {topic} from {peer_url} did not land: the cursor stays at {last_interaction}"
@@ -4909,15 +5040,91 @@ impl Engine {
                             errors.push(msg);
                         }
                     }
+                    // bsv-low #555, the delta fold's D-M2: "progress" (a node
+                    // appended) is the peer's word. A sync the peer served
+                    // work that finalized no graph and moved no cursor is
+                    // YIELDLESS; past PEER_YIELDLESS_SYNCS_ALLOWED of them in
+                    // a row each is a FAILED attempt, so a peer that serves
+                    // one fresh root a tick and hangs on its input is
+                    // quarantined. A quiet sync (nothing served) leaves the
+                    // count; a fault of the count is fail-safe (no failure).
+                    // Only with a per-graph budget: without one nothing is
+                    // deferred and #302's rule is unchanged.
+                    if ran && self.graph_budget.is_some() {
+                        let yielded = peer_finalized.get() > 0 || advanced_cursor;
+                        if yielded || sync.graphs_attempted() > 0 {
+                            match self
+                                .storage
+                                .record_peer_sync_yield(&health_key, topic, yielded)
+                                .await
+                            {
+                                Ok(streak)
+                                    if !yielded
+                                        && crate::gasp::yieldless_sync_failed(&streak)
+                                        && outcome_success =>
+                                {
+                                    outcome_success = false;
+                                    let msg = format!(
+                                        "{peer_url}: {} consecutive syncs over {} s finalized no graph and moved no cursor (past {} and {} s; bsv-low #555)",
+                                        streak.yieldless_syncs,
+                                        streak.secs_since_first.unwrap_or(0),
+                                        crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED,
+                                        crate::gasp::PEER_YIELDLESS_SECS_ALLOWED
+                                    );
+                                    warn!("[GASP SYNC] {msg}");
+                                    errors.push(msg);
+                                }
+                                Ok(_) => {}
+                                Err(e) => warn!(
+                                    "[GASP SYNC] failed to record the yield of {peer_url}/{topic}: {e}"
+                                ),
+                            }
+                        }
+                    }
                     finalized_graphs += peer_finalized.get();
+                    let deferral = sync.deferral_stats();
+                    deferred_graphs += deferral.deferred;
+                    resumed_graphs += deferral.resumed;
+                    converged_graphs += deferral.converged;
+                    stalled_graphs += deferral.stalled;
+                    held_back_graphs += deferral.held_back;
+                    dropped_graphs.extend(deferral.dropped.into_iter().map(|d| DroppedDeferral {
+                        peer: peer_url.clone(),
+                        outpoint: d.outpoint,
+                        reason: d.reason.as_str().to_string(),
+                    }));
 
                     // bsv-low#302: record the attempt outcome (success resets
                     // the consecutive-failure count; timeout/error increments
                     // it). Best-effort — a bookkeeping fault must never fail
                     // the sync pass itself.
-                    if let Err(e) = self
+                    //
+                    // bsv-low #555, the delta-4 fold's D4-L2: with a
+                    // per-graph budget, a peer that was at the quarantine
+                    // threshold when this sync began is re-admitted only by
+                    // a YIELD (a graph finalized, the cursor moved). A sync
+                    // that did not fail and yielded nothing (an empty
+                    // listing at its probe, a walk that only progressed) is
+                    // NOT RECORDED: the failures stay, and so does the
+                    // last-attempt stamp, so the peer is attended again on
+                    // the next tick and its next failure re-arms the
+                    // quarantine at once. Recorded as a success, a hostile
+                    // peer's empty listing at each probe reset its failures
+                    // and (the decay being for a peer that is not failed)
+                    // its yieldless streak: 100 of 200 ticks. A health read
+                    // that faulted read 0 failures: the old rule, fail-safe.
+                    if outcome_success
+                        && !(peer_finalized.get() > 0 || advanced_cursor)
+                        && self.graph_budget.is_some()
+                        && health.consecutive_failures >= crate::gasp::PEER_QUARANTINE_THRESHOLD
+                    {
+                        info!(
+                            "[GASP SYNC] {peer_url} for {topic}: a sync with no yield does not lift its quarantine ({} consecutive failed syncs kept; bsv-low #555)",
+                            health.consecutive_failures
+                        );
+                    } else if let Err(e) = self
                         .storage
-                        .record_peer_sync_outcome(peer_url, topic, outcome_success)
+                        .record_peer_sync_outcome(&health_key, topic, outcome_success)
                         .await
                     {
                         warn!(
@@ -4938,6 +5145,12 @@ impl Engine {
                     finalized_graphs,
                     deadline_dropped_graphs,
                     cursor_moves,
+                    deferred_graphs,
+                    resumed_graphs,
+                    converged_graphs,
+                    dropped_graphs,
+                    stalled_graphs,
+                    held_back_graphs,
                 },
             );
         }
@@ -5088,8 +5301,14 @@ impl Engine {
                 .await
             {
                 if let Some(domain) = parse_ship_domain_from_script(&output.output_script) {
+                    // Every spelling of our own origin is ourselves (the
+                    // delta-2 fold's D2-M2: `https://us/?x` passed the
+                    // string compare).
                     if let Some(ref our_url) = self.config.hosting_url {
-                        if domain.trim_end_matches('/') == our_url.trim_end_matches('/') {
+                        if domain.trim_end_matches('/') == our_url.trim_end_matches('/')
+                            || crate::gasp::peer_origin(&domain)
+                                == crate::gasp::peer_origin(our_url)
+                        {
                             continue;
                         }
                     }
@@ -5098,9 +5317,10 @@ impl Engine {
             }
         }
 
-        let mut peers: Vec<String> = domains.into_iter().collect();
-        peers.sort();
-        peers
+        // One peer per normalized origin (bsv-low #555, the delta-2 fold's
+        // D2-M2, restored by the delta-4 fold's D4-M1): eight spellings of
+        // one server are one peer, the one its health row is keyed by.
+        crate::gasp::ship_peers_by_origin(domains)
     }
 
     // ========================================================================
@@ -5269,7 +5489,9 @@ pub struct TopicSyncResult {
     /// budget (bsv-low #552): at most one per peer per sync. NOTHING of such
     /// a graph was admitted; the next sync walks it again. The same root
     /// counted tick after tick with no `finalized_graphs` and no
-    /// `cursor_moves` is ONE graph whose walk outlasts the budget.
+    /// `cursor_moves` is ONE graph whose walk outlasts the budget (with a
+    /// per-graph budget it is also counted in `deferred_graphs` and resumed,
+    /// bsv-low #555).
     #[serde(default)]
     pub deadline_dropped_graphs: u64,
     /// Every persisted cursor that moved in this sync (bsv-low #552), one
@@ -5278,6 +5500,44 @@ pub struct TopicSyncResult {
     /// `GASPSync::completed_cursor`: past completed UTXOs only.
     #[serde(default)]
     pub cursor_moves: Vec<CursorMove>,
+    /// Graphs DEFERRED in this sync, summed over peers (bsv-low #555,
+    /// `Engine::set_graph_budget`): a new record, or a resumed graph
+    /// deferred again. Their UTXOs are held below the cursor.
+    #[serde(default)]
+    pub deferred_graphs: u64,
+    /// Graphs RESUMED from a record in this sync.
+    #[serde(default)]
+    pub resumed_graphs: u64,
+    /// Resumed graphs that completed and landed in this sync (their record
+    /// deleted).
+    #[serde(default)]
+    pub converged_graphs: u64,
+    /// Records deleted without converging, with their reason.
+    #[serde(default)]
+    pub dropped_graphs: Vec<DroppedDeferral>,
+    /// Walks the per-graph budget (or the per-peer deadline) cut having
+    /// fetched NOTHING in their pass (bsv-low #555, the lens fold's H1). A
+    /// peer's sync whose only outcome was these is a failed attempt for the
+    /// quarantine count.
+    #[serde(default)]
+    pub stalled_graphs: u64,
+    /// Records NOT resumed in this sync: the resumes of a peer's pass share
+    /// ONE per-graph budget and had spent it (the lens fold's M1). Held for
+    /// the next sync, untouched.
+    #[serde(default)]
+    pub held_back_graphs: u64,
+}
+
+/// A deferred graph's record deleted without converging (bsv-low #555,
+/// [`TopicSyncResult::dropped_graphs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroppedDeferral {
+    /// The peer URL.
+    pub peer: String,
+    /// The graph's root outpoint.
+    pub outpoint: String,
+    /// [`crate::gasp::DropReason::as_str`].
+    pub reason: String,
 }
 
 /// One peer's persisted `last_interaction` cursor moving `from` -> `to` in a
@@ -5453,6 +5713,19 @@ impl From<AdvertiserError> for EngineError {
 // Tests
 // ============================================================================
 
+/// The order `start_gasp_sync` takes its topics in (bsv-low #555, the delta
+/// fold's D-M1): topics with CONFIGURED peers (`SyncTarget::Peers`) first,
+/// then those whose peers `ls_ship` discovers (anyone may advertise a host
+/// there), each by name. The deferred-graph records share one storage
+/// ceiling; a place it frees goes to a configured peer before a discovered
+/// one, and a pass the outer deadline cuts has reached the configured peers.
+/// The map's own order was arbitrary.
+pub(crate) fn sync_order(config: &SyncConfiguration) -> Vec<(&String, &SyncTarget)> {
+    let mut order: Vec<(&String, &SyncTarget)> = config.iter().collect();
+    order.sort_by_key(|(topic, target)| (!matches!(target, SyncTarget::Peers(_)), topic.as_str()));
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5461,6 +5734,26 @@ mod tests {
     use crate::topic_manager::TopicManager as TopicManagerTrait;
     use async_trait::async_trait;
     use std::sync::Mutex;
+
+    // bsv-low #555, the delta fold's D-M1: the configured peers' topics are
+    // synced before the ls_ship-discovered ones, each class by name; the map's
+    // order was arbitrary.
+    #[test]
+    fn delta555_m1_configured_peers_are_synced_before_discovered_ones() {
+        let peers = |p: &str| SyncTarget::Peers(vec![p.to_string()]);
+        let config: SyncConfiguration = HashMap::from([
+            ("tm_a".to_string(), SyncTarget::Ship),
+            ("tm_z".to_string(), peers("https://z")),
+            ("tm_b".to_string(), SyncTarget::Ship),
+            ("tm_m".to_string(), peers("https://m")),
+            ("tm_off".to_string(), SyncTarget::Disabled),
+        ]);
+        let order: Vec<&str> = sync_order(&config)
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(order, vec!["tm_m", "tm_z", "tm_a", "tm_b", "tm_off"]);
+    }
 
     // ── Mock TopicManager ──────────────────────────────────────────────
 
@@ -7024,6 +7317,12 @@ mod tests {
                 finalized_graphs: 0,
                 deadline_dropped_graphs: 0,
                 cursor_moves: Vec::new(),
+                deferred_graphs: 0,
+                resumed_graphs: 0,
+                converged_graphs: 0,
+                dropped_graphs: Vec::new(),
+                stalled_graphs: 0,
+                held_back_graphs: 0,
             },
         );
 
@@ -7455,12 +7754,12 @@ mod tests {
 
         // Health bookkeeping: timeout = failure, completion = success.
         let hang_health = store
-            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .get_peer_sync_health("hang.example.com", "tm_test")
             .await
             .unwrap();
         assert_eq!(hang_health.consecutive_failures, 1);
         let good_health = store
-            .get_peer_sync_health("https://good.example.com", "tm_test")
+            .get_peer_sync_health("good.example.com", "tm_test")
             .await
             .unwrap();
         assert_eq!(good_health.consecutive_failures, 0);
@@ -7504,7 +7803,7 @@ mod tests {
             );
         }
         let health = store
-            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .get_peer_sync_health("hang.example.com", "tm_test")
             .await
             .unwrap();
         assert_eq!(
@@ -7533,7 +7832,7 @@ mod tests {
         );
         // The probe failed again → failure count kept growing → re-armed.
         let health = store
-            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .get_peer_sync_health("hang.example.com", "tm_test")
             .await
             .unwrap();
         assert_eq!(
@@ -7555,7 +7854,7 @@ mod tests {
         let result = engine.start_gasp_sync().await.unwrap();
         assert!(result.topics_synced["tm_test"].errors.is_empty());
         let health = store
-            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .get_peer_sync_health("hang.example.com", "tm_test")
             .await
             .unwrap();
         assert_eq!(health.consecutive_failures, 0, "success fully re-admits");
@@ -8852,6 +9151,64 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Storage for FaultingStorage {
+        async fn put_deferred_graph(
+            &self,
+            record: &crate::gasp::DeferredGraph,
+        ) -> Result<crate::gasp::DeferredGraphSave, StorageError> {
+            self.inner.put_deferred_graph(record).await
+        }
+        async fn find_deferred_graphs(
+            &self,
+            host: &str,
+            topic: &str,
+        ) -> Result<Vec<crate::gasp::DeferredGraphKey>, StorageError> {
+            self.inner.find_deferred_graphs(host, topic).await
+        }
+        async fn get_deferred_graph(
+            &self,
+            host: &str,
+            topic: &str,
+            outpoint: &str,
+        ) -> Result<Option<crate::gasp::DeferredGraph>, StorageError> {
+            self.inner.get_deferred_graph(host, topic, outpoint).await
+        }
+        async fn delete_deferred_graph(
+            &self,
+            host: &str,
+            topic: &str,
+            outpoint: &str,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .delete_deferred_graph(host, topic, outpoint)
+                .await
+        }
+        async fn record_peer_sync_outcome(
+            &self,
+            host: &str,
+            topic: &str,
+            success: bool,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .record_peer_sync_outcome(host, topic, success)
+                .await
+        }
+        async fn get_peer_sync_health(
+            &self,
+            host: &str,
+            topic: &str,
+        ) -> Result<crate::storage::PeerSyncHealth, StorageError> {
+            self.inner.get_peer_sync_health(host, topic).await
+        }
+        async fn record_peer_sync_yield(
+            &self,
+            host: &str,
+            topic: &str,
+            yielded: bool,
+        ) -> Result<crate::storage::PeerYieldStreak, StorageError> {
+            self.inner
+                .record_peer_sync_yield(host, topic, yielded)
+                .await
+        }
         async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
             if self.fail_insert_output.get() {
                 return Err(StorageError::Database(

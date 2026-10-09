@@ -115,6 +115,35 @@ pub(crate) const PEER_HEALTH_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health \
        last_attempt = unixepoch(), \
        last_success = CASE WHEN ?3 THEN unixepoch() ELSE last_success END";
 
+/// The SHIPPED upsert behind `record_peer_sync_yield` (bsv-low #555, the
+/// delta fold's D-M2 and the delta-2 fold's D2-M1): the YIELDLESS streak of a
+/// (host, topic), `host` the peer's normalized origin. Binds: `?1` host, `?2`
+/// topic, `?3` yielded (1/0), `?4` `PEER_YIELDLESS_DECAY_SECS`. A sync that
+/// yielded ends the streak (count 0, both stamps NULL); one that did not adds
+/// one and stamps `last_yieldless_at`, and starts a NEW streak (count 1,
+/// `first_yieldless_at` now) when there was none or its last yieldless sync
+/// is more than `?4` old (the decay) AND the peer is not failed
+/// (`consecutive_failures = 0`; the delta-3 fold's D3-M1: the decay equals
+/// the 6 h reprobe, so without that clause every probe of a peer quarantined
+/// by this bound started a new streak, succeeded and lifted the quarantine;
+/// the yield runs before the outcome, so the probe continues the streak and
+/// fails). SQLite reads the OLD row in every `SET` expression. Returns the count and `secsSinceFirst`, the streak's age on
+/// D1's clock. A new row's `last_attempt` is left NULL: the engine records
+/// the attempt itself next (`PEER_HEALTH_UPSERT_SQL`), which stamps it.
+pub(crate) const PEER_YIELD_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health \
+     (host, topic, consecutive_failures, yieldless_syncs, first_yieldless_at, last_yieldless_at) \
+     VALUES (?1, ?2, 0, CASE WHEN ?3 THEN 0 ELSE 1 END, \
+             CASE WHEN ?3 THEN NULL ELSE unixepoch() END, CASE WHEN ?3 THEN NULL ELSE unixepoch() END) \
+     ON CONFLICT(host, topic) DO UPDATE SET \
+       yieldless_syncs = CASE WHEN ?3 THEN 0 \
+         WHEN last_yieldless_at IS NULL OR yieldless_syncs = 0 OR (unixepoch() - last_yieldless_at > ?4 AND consecutive_failures = 0) THEN 1 \
+         ELSE yieldless_syncs + 1 END, \
+       first_yieldless_at = CASE WHEN ?3 THEN NULL \
+         WHEN last_yieldless_at IS NULL OR yieldless_syncs = 0 OR (unixepoch() - last_yieldless_at > ?4 AND consecutive_failures = 0) THEN unixepoch() \
+         ELSE first_yieldless_at END, \
+       last_yieldless_at = CASE WHEN ?3 THEN NULL ELSE unixepoch() END \
+     RETURNING yieldless_syncs, (unixepoch() - first_yieldless_at) AS secsSinceFirst";
+
 /// The SHIPPED health read (bsv-low#302). Age is computed relative in SQL
 /// (`unixepoch() - last_attempt`) so wasm and the rusqlite test agree on
 /// semantics without any host clock in the engine.
@@ -864,6 +893,34 @@ impl Storage for D1Storage {
             .map_err(d1_err)
     }
 
+    async fn record_peer_sync_yield(
+        &self,
+        host: &str,
+        topic: &str,
+        yielded: bool,
+    ) -> Result<overlay_engine::storage::PeerYieldStreak, StorageError> {
+        #[derive(Deserialize)]
+        struct Streak {
+            yieldless_syncs: f64,
+            #[serde(rename = "secsSinceFirst")]
+            secs_since_first: Option<f64>,
+        }
+        let row: Option<Streak> = Query::new(PEER_YIELD_UPSERT_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(yielded)
+            .bind(overlay_engine::gasp::PEER_YIELDLESS_DECAY_SECS as f64)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(d1_err)?;
+        Ok(row.map_or_else(Default::default, |r| {
+            overlay_engine::storage::PeerYieldStreak {
+                yieldless_syncs: r.yieldless_syncs.max(0.0) as u64,
+                secs_since_first: r.secs_since_first.map(|s| s.max(0.0) as u64),
+            }
+        }))
+    }
+
     async fn get_peer_sync_health(
         &self,
         host: &str,
@@ -881,6 +938,109 @@ impl Storage for D1Storage {
                 secs_since_last_attempt: r.secs_since.map(|s| s.max(0.0) as u64),
             })
             .unwrap_or_default())
+    }
+
+    async fn put_deferred_graph(
+        &self,
+        record: &overlay_engine::gasp::DeferredGraph,
+    ) -> Result<overlay_engine::gasp::DeferredGraphSave, StorageError> {
+        #[derive(Deserialize)]
+        struct Saved {
+            #[allow(dead_code)]
+            outpoint: String,
+        }
+        let json = serde_json::to_string(record)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let saved: Option<Saved> = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_UPSERT_SQL)
+            .bind(record.peer.as_str())
+            .bind(record.topic.as_str())
+            .bind(record.outpoint.as_str())
+            .bind(record.score as f64)
+            .bind(record.nodes.len() as f64)
+            .bind(record.pending.len() as f64)
+            .bind(record.calls as f64)
+            .bind(f64::from(record.passes))
+            .bind(record.reason.as_str())
+            .bind(json.len() as f64)
+            .bind(json.as_str())
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS)
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_TOTAL_BYTES as f64)
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS_PER_HOST)
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_BYTES_PER_HOST as f64)
+            .bind(overlay_engine::gasp::peer_origin(&record.peer).as_str())
+            .bind(record.configured)
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS)
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES as f64)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(d1_err)?;
+        Ok(match saved {
+            Some(_) => overlay_engine::gasp::DeferredGraphSave::Saved,
+            None => overlay_engine::gasp::DeferredGraphSave::AtCeiling,
+        })
+    }
+
+    async fn find_deferred_graphs(
+        &self,
+        host: &str,
+        topic: &str,
+    ) -> Result<Vec<overlay_engine::gasp::DeferredGraphKey>, StorageError> {
+        #[derive(Deserialize)]
+        struct KeyRow {
+            outpoint: String,
+            score: f64,
+        }
+        let rows: Vec<KeyRow> = Query::new(crate::gasp_deferred::DEFERRED_GRAPHS_SELECT_SQL)
+            .bind(host)
+            .bind(topic)
+            .fetch_all(&self.db)
+            .await
+            .map_err(d1_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| overlay_engine::gasp::DeferredGraphKey {
+                outpoint: r.outpoint,
+                score: r.score.max(0.0) as u64,
+            })
+            .collect())
+    }
+
+    async fn get_deferred_graph(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<Option<overlay_engine::gasp::DeferredGraph>, StorageError> {
+        #[derive(Deserialize)]
+        struct RecordRow {
+            record: String,
+        }
+        let row: Option<RecordRow> = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_GET_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(outpoint)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(d1_err)?;
+        row.map(|r| {
+            serde_json::from_str(&r.record).map_err(|e| StorageError::Serialization(e.to_string()))
+        })
+        .transpose()
+    }
+
+    async fn delete_deferred_graph(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<(), StorageError> {
+        Query::new(crate::gasp_deferred::DEFERRED_GRAPH_DELETE_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(outpoint)
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)
     }
 
     async fn find_transactions_for_proof_check(
@@ -1311,6 +1471,223 @@ mod tests {
             )
             .ok();
         assert_eq!(missing, None);
+    }
+
+    /// bsv-low #555, the delta fold's D-M2: the SHIPPED yield upsert on the
+    /// production schema (migration 171). A yieldless sync adds one and
+    /// returns the count, a yielding one resets it to 0; the first call for
+    /// a pair makes its row, and the attempt upsert that follows stamps the
+    /// row's `last_attempt` without touching the count. On 0974be5 there is
+    /// no `yieldless_syncs` column and nothing counted a yieldless sync.
+    #[test]
+    fn e555d_m2_peer_yield_upsert_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "{e}\n{sql}"
+                );
+            }
+        }
+        let yield_ = |yielded: bool| -> i64 {
+            conn.query_row(
+                PEER_YIELD_UPSERT_SQL,
+                rusqlite::params![
+                    "https://hostile",
+                    "tm_test",
+                    yielded,
+                    overlay_engine::gasp::PEER_YIELDLESS_DECAY_SECS as i64
+                ],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(yield_(false), 1, "a new row");
+        conn.execute(
+            PEER_HEALTH_UPSERT_SQL,
+            rusqlite::params!["https://hostile", "tm_test", true],
+        )
+        .unwrap();
+        let (fails, age): (i64, Option<i64>) = conn
+            .query_row(
+                PEER_HEALTH_SELECT_SQL,
+                rusqlite::params!["https://hostile", "tm_test"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fails, 0);
+        assert!(age.is_some(), "the attempt stamped it");
+        assert_eq!(yield_(false), 2, "the attempt left the count");
+        assert_eq!(yield_(false), 3);
+        assert_eq!(yield_(true), 0, "a yield resets it");
+        assert_eq!(yield_(false), 1);
+        let storage = include_str!("d1_storage.rs");
+        let f = &storage[storage.find("async fn record_peer_sync_yield").unwrap()..];
+        assert!(
+            f[..f.find("async fn get_peer_sync_health").unwrap()].contains("PEER_YIELD_UPSERT_SQL")
+        );
+    }
+
+    /// bsv-low #555, the delta-2 fold's D2-M1: the shipped yield upsert
+    /// keeps the streak IN TIME. Its first yieldless sync stamps
+    /// `first_yieldless_at`, and `secsSinceFirst` is the streak's age on
+    /// D1's clock; later yieldless syncs keep the start; a yield clears both
+    /// stamps; a yieldless sync more than `PEER_YIELDLESS_DECAY_SECS` after
+    /// the LAST one starts a new streak (count 1, age 0). The clock is moved
+    /// by shifting the row's stamps back. On ef423da the statement kept a
+    /// count only (no age: the bound was in syncs, 12 minutes at one tick a
+    /// minute).
+    #[test]
+    fn e555d2_m1_the_yield_upsert_keeps_the_streak_in_time() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "{e}\n{sql}"
+                );
+            }
+        }
+        let decay = overlay_engine::gasp::PEER_YIELDLESS_DECAY_SECS as i64;
+        let yield_ = |yielded: bool| -> (i64, Option<i64>) {
+            conn.query_row(
+                PEER_YIELD_UPSERT_SQL,
+                rusqlite::params!["evil.example", "tm_ship", yielded, decay],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let back = |secs: i64| {
+            conn.execute(
+                "UPDATE gasp_peer_health SET first_yieldless_at = first_yieldless_at - ?1, \
+                 last_yieldless_at = last_yieldless_at - ?1",
+                [secs],
+            )
+            .unwrap();
+        };
+        assert_eq!(yield_(false), (1, Some(0)), "a new streak");
+        back(3 * 3600);
+        assert_eq!(yield_(false), (2, Some(3 * 3600)), "its age from the FIRST");
+        back(decay);
+        assert_eq!(
+            yield_(false),
+            (3, Some(3 * 3600 + decay)),
+            "6 h exactly: the same streak"
+        );
+        back(decay + 1);
+        assert_eq!(
+            yield_(false),
+            (1, Some(0)),
+            "past 6 h since the last: a new streak"
+        );
+        assert_eq!(yield_(true), (0, None), "a yield ends it");
+        let stamps: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT first_yieldless_at, last_yieldless_at FROM gasp_peer_health",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stamps, (None, None));
+        assert_eq!(yield_(false), (1, Some(0)));
+        // The worker binds the decay and reads the age.
+        let storage = include_str!("d1_storage.rs");
+        let f = &storage[storage.find("async fn record_peer_sync_yield").unwrap()..];
+        let f = &f[..f.find("async fn get_peer_sync_health").unwrap()];
+        assert!(f.contains("PEER_YIELDLESS_DECAY_SECS"));
+        assert!(f.contains("secs_since_first"));
+    }
+
+    /// bsv-low #555, the delta-3 fold's D3-M1 (the lens's DELTA3-1 over the
+    /// SHIPPED statements): a hostile peer that "progresses" and never yields,
+    /// 200 ticks at `*/15`, each sync 15 s long, through the yield upsert, the
+    /// outcome upsert and the health read on the production schema, the clock
+    /// moved by shifting the row's stamps back. On 9280aed the probe of the
+    /// quarantined peer landed more than the 6 h decay after its last
+    /// yieldless stamp, started a fresh streak, succeeded and lifted the
+    /// quarantine: 100 of 200 ticks attended. Now its streak continues and the
+    /// probe fails: one probe per 6 h, 27 of 200.
+    #[test]
+    fn e555d3_m1_the_probe_of_a_quarantined_peer_continues_its_streak() {
+        use overlay_engine::gasp::{
+            yieldless_sync_failed, PEER_QUARANTINE_REPROBE_SECS, PEER_QUARANTINE_THRESHOLD,
+            PEER_YIELDLESS_DECAY_SECS,
+        };
+        use overlay_engine::storage::PeerYieldStreak;
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "{e}\n{sql}"
+                );
+            }
+        }
+        let (host, topic) = ("evil.example", "tm_ship");
+        let back = |secs: i64| {
+            conn.execute(
+                "UPDATE gasp_peer_health SET last_attempt = last_attempt - ?1, \
+                 last_success = last_success - ?1, first_yieldless_at = first_yieldless_at - ?1, \
+                 last_yieldless_at = last_yieldless_at - ?1",
+                [secs],
+            )
+            .unwrap();
+        };
+        let health = || -> (u64, Option<i64>) {
+            conn.query_row(PEER_HEALTH_SELECT_SQL, [host, topic], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get(1)?))
+            })
+            .unwrap_or((0, None))
+        };
+        let (tick, duration) = (900i64, 15i64);
+        let mut attended = Vec::new();
+        for k in 0..200i64 {
+            if k > 0 {
+                back(tick - duration);
+            }
+            let (fails, since) = health();
+            if fails >= PEER_QUARANTINE_THRESHOLD
+                && since.is_some_and(|s| s < PEER_QUARANTINE_REPROBE_SECS as i64)
+            {
+                continue;
+            }
+            attended.push(k);
+            back(duration);
+            let (count, age): (i64, Option<i64>) = conn
+                .query_row(
+                    PEER_YIELD_UPSERT_SQL,
+                    rusqlite::params![host, topic, false, PEER_YIELDLESS_DECAY_SECS as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            let failed = yieldless_sync_failed(&PeerYieldStreak {
+                yieldless_syncs: count as u64,
+                secs_since_first: age.map(|a| a as u64),
+            });
+            if attended.len() > 20 {
+                assert!(failed, "tick {k}: a probe continues the streak and fails");
+            }
+            conn.execute(
+                PEER_HEALTH_UPSERT_SQL,
+                rusqlite::params![host, topic, !failed],
+            )
+            .unwrap();
+        }
+        assert_eq!(attended.len(), 27, "one probe per 6 h: {attended:?}");
+        // The clause is in the shipped statement, in both CASEs.
+        assert_eq!(
+            PEER_YIELD_UPSERT_SQL
+                .matches("> ?4 AND consecutive_failures = 0")
+                .count(),
+            2
+        );
     }
 
     #[test]

@@ -492,7 +492,8 @@ is the S2 queued ack (the STEAK names what will be admitted once its
 predecessor lands, and nothing is held until the replay); the dry runs and
 the names call are manager CPU inside the Worker's cap, whose breach is the
 platform's error and never a record. Pre-existing and not widened: a graph
-deeper than the budget (#555), the unbounded anchor verify (#557), a "not
+deeper than the budget (#555; deferred and resumed since, with a per-graph
+budget), the unbounded anchor verify (#557), a "not
 now" over a BEEF above 90,000 bytes answering 502 (#568). It cannot tell a faulted predecessor from one nobody submitted
 yet: the successor is "not now" until it lands. And a transaction that admits
 nothing, found no coin and carries more UNPROVEN, UNLANDED bodies than 16
@@ -871,14 +872,12 @@ the deadline. A dropped tick that finalized a graph or moved the cursor is a
 SUCCESSFUL attempt for the quarantine count. With NO budget nothing can drop
 the sync and the graphs are submitted after it, as before.
 
-The budget bounds a TICK. Nothing bounds a GRAPH (parity: the reference has
-no node cap). So a chain reaches a node over several ticks only as far as the
-peer lists it as several UTXOs (a record or a second output along the way,
-several shards); ONE graph whose own walk outlasts the budget (a head chain
-whose tip is its only UTXO) is still dropped whole on every tick, never
-admitted, each tick a failed attempt toward quarantine. Resuming a walk needs
-its fetched nodes persisted across ticks, which the `Storage` trait does not
-offer.
+The budget bounds a TICK. Without a per-graph budget nothing bounds a GRAPH
+(parity: the reference has no node cap): a chain reaches a node over several
+ticks only as far as the peer lists it as several UTXOs, and ONE graph whose
+own walk outlasts the budget (a head chain whose tip is its only UTXO) is
+dropped whole on every tick, never admitted. Since bsv-low #555 a per-graph
+budget DEFERS such a graph and resumes it (next section).
 
 `TopicSyncResult` reports `finalized_graphs`, `deadline_dropped_graphs` (at
 most one per peer per sync; the same count tick after tick with no
@@ -887,6 +886,455 @@ most one per peer per sync; the same count tick after tick with no
 carries the totals and the per-topic line the cursors (`discarded_graphs` is
 on the first totals line). Pins: `cargo test -p bsv-overlay-engine --features
 memory-storage --test gasp_topic_manager i552` (and `fold_high1`).
+
+## Deferred graphs (bsv-low #555, measured as #582)
+
+The measured case (beta, 2026-10-09): a 0-conf picture head set by a fleet
+wallet; LOW's node walked its unproven ancestry (every input an SPV necessity)
+at about 1.2 s a peer request to the end of each pass, admitted nothing, and
+the next pass restarted the same graph from its root; two thirds of the
+minute cron's ticks were skipped behind it.
+
+`Engine::set_graph_budget(sleep, calls, ms)` turns DEFERRAL on (unset: the
+walk is the one before #555). A graph whose walk makes `calls` requests (to
+the peer, or chain fetches) or runs `ms` in one pass is DEFERRED: its partial
+walk is saved as ONE record (`gasp::DeferredGraph`: the nodes fetched with
+their proofs, the inputs still pending as a stack, the calls spent, the
+passes, the reason), keyed (peer, topic, root outpoint) and REPLACED on every
+deferral. The UTXO is held below the cursor like a failed one (the gap guard)
+and is not walked again in that sync (#554); the pass goes on to the next
+UTXO and topic. The next sync that is served the UTXO RESUMES: the record's
+nodes are appended again (no request), an UNPROVEN root is asked again (one
+call: once its block lands the peer serves it proven, the record is dropped
+`root_proven` and the walk restarts from it, shorter), and only the pending
+inputs are asked. A walk the per-peer deadline (D16) cuts is deferred the
+same way (`peer_deadline`). With a budget, a walk error of a RESUMED graph
+defers it again with its progress (`fault`), except the peer's definite "not
+held" for an input an UNPROVEN node needs (an SPV necessity): that fails the
+UTXO as in the reference (`not_held`). A walk error of a FRESH walk keeps NO
+record and fails the UTXO, as before #555 (the delta fold's D-M1: a fault is
+not a budget cut; a stranger whose peer served each fabricated root and
+answered its input with a quick 503 kept a one-node record per UTXO, 16 per
+(peer, topic) in one tick with no time spent). A record is made only by a
+budget cut (`calls`, `time`, `peer_deadline`), or by a fresh walk that faults
+after it PAID half of one (the delta-2 fold's D2-L1: half its per-graph calls,
+or half its time, `GraphBudget::half_deadline`; with no record an honest flaky
+peer's deep graph got one only on a clean first pass, (1-p)^100). It costs a
+SLOW peer the per-graph budget's time (the worker's 15 s), and a FAST one only
+its calls (100 tiny responses, milliseconds: the delta-2 lens's DELTA2-2). A
+RESUMED walk that faults having appended no node keeps its record (an honest
+transient 5xx) and counts an idle fault; at `DEFERRED_GRAPH_MAX_IDLE_FAULTS`
+(3) in a row the record is dropped (`idle_faults`) and the UTXO fails; a pass
+that appends resets the count (the delta-2 fold's D2-M2: a quick 503 a tick
+was a free re-deferral that held a stranger's row for its 60 passes).
+
+Every per-graph deadline is LATCHED (`gasp::latched`, found by the delta-2
+fold): the worker's sleeps are `async fn` futures, which panic when polled
+after they completed, and the resumes' shared deadline (M1 below) is kept
+after it fell due and polled again by the next record served. On `ef423da`
+two records of one (peer, topic) and a spent resume budget panicked the sync
+("`async fn` resumed after completion", a trap in wasm), on every tick while
+both were held; the test factories were all re-pollable (`e555d2_x`).
+
+The storage keeps the records through FOUR REQUIRED `Storage` methods
+(`put_deferred_graph`, answering `Saved` or `AtCeiling`;
+`find_deferred_graphs`, the KEYS of a (peer, topic) lowest score first;
+`get_deferred_graph`, one record; `delete_deferred_graph`), mirrored by four
+required `GASPStorage` methods (the lens fold's M2, the house style of
+`identify_admissible_outputs`). With defaults, a storage or wrapper that did
+not forward them compiled, and a budget over it saved nothing: every graph
+past the call budget was walked from its root to the cap on every tick and
+never admitted (`store_fault`), a hard cap on graph size. Now a re-pin fails
+to compile until every impl and wrapper decides (measured: `E0046`, the four
+named). A backend that keeps no records answers none and refuses every save,
+and must not be given a budget. The three peer-health methods
+(`record_peer_sync_outcome`, `get_peer_sync_health`, `record_peer_sync_yield`)
+are REQUIRED too (the delta-2 fold's D2-L2: with defaults the test wrapper
+`ScriptedStore` did not forward the yield, and a consumer's wrapper that did
+not would turn the bound off unseen); a backend that keeps no peer health
+answers the old defaults. Their `host` is the peer's NORMALIZED ORIGIN, not
+its URL (D2-M2, below). A sync reads the KEYS up front and a record
+only when its UTXO is served (L3: the whole records of a (peer, topic), up
+to 16 MiB of JSON, were one D1 result inside the 128 MB isolate); a key read
+that faults resumes nothing and takes the (peer, topic) as FULL for the sync
+(L6: the count read 0 and the 16 could be passed by 16 more).
+
+Progress, for #302's quarantine (the lens fold's H1): a walk PROGRESSED when
+its pass appended at least one node or completed the graph; one cut by the
+per-graph budget or the per-peer deadline having appended NOTHING is
+STALLED, and keeps no record (a record holds at least one node; nothing is
+lost by not saving it). A sync is a FAILED attempt when it stalled and
+nothing else got done (no walk progressed, no graph finalized, the cursor did
+not move), at the per-peer deadline and on a sync that ran to its end
+(`errors` names it). Before the fold a deferral of 0 nodes counted as a live
+peer: a peer that lists UTXOs and never answers a node request (or answers
+each with a quick 5xx) was never quarantined, and about eight such hosts on a
+SHIP-mode topic (peers from the permissionless `ls_ship`) took the worker's
+240 s pass on every tick. A sync whose UTXOs failed in any other way is
+unchanged (a sync that ran to its end is a success, as before #555).
+
+What that catches, and what it does not (the delta fold's D-M2). "Progressed"
+is the PEER's word: a node appended is whatever the peer chose to serve. The
+H1 rule quarantines a BROKEN peer (hung, or failing with nothing served), not
+a hostile one: a peer that lists one fresh fabricated UTXO a tick, serves its
+root and hangs on its input "progressed" on every tick and kept its slice (30
+s of the worker's pass per (host, topic)) for ever. Bounded since: with a
+per-graph budget, a sync the peer served work it did not hold
+(`GASPSync::graphs_attempted`) that finalized no graph and moved no cursor is
+YIELDLESS; the yieldless STREAK is kept per (origin, topic)
+(`Storage::record_peer_sync_yield`, answering `PeerYieldStreak`: the count and
+the seconds since its first yieldless sync, on the storage's clock; the
+worker's `gasp_peer_health.yieldless_syncs`, `first_yieldless_at` and
+`last_yieldless_at`, migrations 171-173). A sync that finalized or moved the
+cursor ends it; a quiet one (nothing served) leaves it. A yieldless sync is a
+FAILED attempt (`errors` names it) only past BOTH bounds
+(`gasp::yieldless_sync_failed`, the delta-2 fold's D2-M1): more than
+`PEER_YIELDLESS_SYNCS_ALLOWED` (12) in the streak AND at least
+`PEER_YIELDLESS_SECS_ALLOWED` (3 h) since it began. Counted in syncs alone, 12
+was 3 h at `*/15` and 12 MINUTES at LOW's beta node (one tick a minute): an
+honest peer whose only new work was #582's unproven head, waiting past 20 min
+for its block (about one block in seven), was quarantined at sync 20 and
+skipped the tick its block landed, then waited for the 6 h probe (DELTA2-1).
+The DECAY (`PEER_YIELDLESS_DECAY_SECS`, 6 h): a yieldless sync more than 6 h
+after the streak's LAST one starts a new streak, so an honest peer's rare
+graphs that never land, hours apart, are not counted across days; quiet syncs
+between leave the streak. The decay applies only to a peer that is NOT
+failed (`consecutive_failures` 0; the delta-3 fold's D3-M1): it equals the 6 h
+reprobe, so on `9280aed` the probe of a peer quarantined by this bound always
+came more than 6 h after its last yieldless sync (a sync lasts seconds), started
+a fresh streak, "progressed", reset the failures and lifted the quarantine at
+every probe (100 of 200 ticks at `*/15`, 940 of 3000 at one a minute, over the
+shipped SQL). The yield runs before the outcome, so the probe now continues
+the streak and fails (27 of 200). Its cost: a peer that failed for any reason
+(a hang, #302) keeps its old streak past 6 h quiet until it yields once (at the threshold an empty listing is no longer a success; D5-L1 below).
+Stated too: a peer yieldless for 3 h, quiet
+for 6 h, and so on, keeps its slice in the yieldless hours (a third of its
+ticks at most), as #302's residual. At `*/15` a hostile peer is still counted
+failed from its 13th yieldless sync (3 h) and quarantined at its 20th (5 h);
+at one tick a minute from 3 h on and quarantined 8 ticks later; then one
+probe per 6 h, and each probe that serves work fails.
+
+A QUARANTINED peer is re-admitted only by a YIELD (the delta-4 fold's D4-L2;
+with a per-graph budget). A peer that was at the quarantine threshold (8
+failures) when its sync began, and whose sync did not fail and yielded
+nothing (an EMPTY listing at its probe; a walk that only progressed), is NOT
+RECORDED: `record_peer_sync_outcome` is not called, so its failures stay and
+its last-attempt stamp stays. The peer is then attended on every tick (the
+reprobe window stays open) until it yields, which lifts the quarantine and
+clears the streak, or fails, which re-arms the quarantine for 6 h at once.
+Before the fold (on `9280aed` too) the empty probe was a success: failures 0,
+the next yieldless sync a fresh streak, and a hostile peer that answered the
+first listing after its six silent hours with an empty list kept 100 of 200
+ticks at `*/15` (the delta-4 lens's DELTA4-2, engine and shipped SQL). Now
+its slices with work are one per reprobe window (27 of 200; 7 empty probes,
+each a listing request and nothing else). The honest side, stated: a
+quarantined peer that has gone QUIET is not stranded and needs no exit of its
+own (no "N empty probes lift it"): it is asked its listing on every tick and
+its first new UTXO that lands lifts it; until then one failed sync (a
+timeout) costs it 6 h, where a peer below the threshold has eight. The delta-5 lens's D5-L1, stated and accepted (LOW): the streak does not decay while the failures are above 0, so a peer quarantined by the yieldless bound and then quiet keeps a streak past both bounds, and its next graph that needs more than one pass is a FAILED sync at every pass, each re-arming the 6 h quarantine (measured: a 9-link graph at 3 calls a pass converged in 12 h where the base took 180 s; the same peer quarantined by eight timeouts instead converged in 180 s). Nothing is lost (6 h is inside the 30 h sweep; the graph lands at the probe), the common honest quarantine (timeouts) is unaffected, and a decay here would reopen D4-L2 (a hostile peer can go quiet for 6 h too), so no code changes. Below the
+threshold nothing changed: an empty listing is a success and resets the
+failures (#302's accepted residual, one success in every 8 ticks, stands,
+and an empty listing is such a success). A health read that faults reads 0
+failures, the old rule. The delta-4 lens's D4-N1, stated: a row with an old
+streak past 12 that no yield ever cleared (its graph vanished), then one
+failed sync, then fresh yieldless work: the first such sync continues the old
+streak (the decay is not for a failed peer) and fails at once, and each after
+it until a yield; eight in a row quarantine the peer until a probe that
+yields. Reasoned, not run; the path is narrow.
+
+Why 12 and 3 h: an honest deep graph converges inside both.
+The measured one (#582) is an unproven head; the pass after its block lands
+restarts from the proven root (`root_proven`), one or two passes after a block
+that comes in ~10 min on average (past 3 h about once in 10^8 by the
+exponential model); walked to its end instead, 12 passes are about 150 nodes
+on the worker (15 s a pass at 1.2 s a request) and 600 on LOW's node (60 s).
+Its cost: an honest peer whose only new work is a graph that never lands (a
+UTXO that fails every pass, a deferral past 12 passes and 3 h with no other
+graph finalized) is quarantined too, its next new UTXO waiting up to 6 h for
+the probe; the reprobe re-admits it the first time it yields. Without a
+per-graph budget nothing changes (#302's rule alone).
+
+The KEY of a peer's quarantine, its streak and its share of the worker's
+ceiling is its NORMALIZED ORIGIN (`gasp::peer_origin`: the host, lowercased,
+no scheme, user, port, path, query, fragment or trailing dot; the delta-2
+fold's D2-M2). Keyed on the URL string, one server was a new peer for every
+spelling it advertised: `is_advertisable_uri` passes `/?1`, `/?2`, `:8443`,
+`/#x`, a trailing slash (DELTA2-3), each with its own share, its own
+quarantine and a fresh streak. The engine passes the origin to the three
+peer-health methods; the cursor and the records stay keyed by the URL the
+peer is synced at. A SHIP topic's peers are ONE PER ORIGIN
+(`gasp::ship_peers_by_origin`, D2-M2's rule, restored by the delta-4 fold's
+D4-M1): each advert is canonicalized to `scheme://host[:port]` (the scheme's
+default port dropped, so `:443` is no explicit port), and of the spellings of
+one origin the first by `https`, then no explicit port, then the string is
+the peer; every spelling of our own origin is ourselves. The delta-3 fold
+(`c8a39fd`) kept one peer per `scheme://host[:port]` while the failures stayed
+on ONE row per origin, and the delta-4 lens ran it (DELTA4-1): eight stranger
+adverts of DEAD PORTS of an honest host's name quarantined the honest peer
+(synced on 4 of 96 ticks), and seven were never quarantined (the honest
+success reset the shared count every tick: 672 dead-port slices in 96 ticks,
+seven 30 s slices of the 240 s belt). One peer per origin has neither: the
+honest default-port advert is the peer, on 96 of 96 ticks, and no dead port
+is asked. It also closes the lens's D4-L1 (`:0443`, `:00443`, `:08443`,
+`https+bsvauth://h:443`, `wss://h` were each a peer: they are spellings of
+one origin). The LIMIT, stated (the delta-3 lens's D3-L1, open by decision):
+two overlays of one host on two ports, on one SHIP topic, are one peer (the
+default port's), so a stranger's default-port spelling
+(`https://honest.example/?x`) DISPLACES an honest overlay that serves only on
+`:8443` for that topic. No instance today: this repository's discovered
+topics have no such host, and a Cloudflare-hosted overlay serves 443. An
+overlay that must be synced on another port is given as a CONFIGURED peer
+(`SyncTarget::Peers` is not deduplicated). A
+SUBDOMAIN is another origin (no public suffix list; the reserve below is what
+protects configured peers from it); two overlays of one host on two ports on
+one SHIP topic are one peer; two configured URLs of one host on one topic
+are two peers sharing one quarantine (so D4-M1's shape exists for an
+operator's own configuration: eight dead configured ports of a host silence
+its live one); a peer's health rows written before the fold (keyed by
+URL) are left behind and its streak starts afresh; a SHIP peer whose advert
+ends in `/` gets a new cursor key (`https://h`) and is listed again from 0
+once (its held UTXOs are skipped).
+
+What a hostile peer can still do, stated: re-list a UTXO the node already
+HOLDS at a score just above the cursor, then a fabricated one that hangs; the
+cursor moves every tick (a yield), and the peer keeps its slice. That route
+was open before #555 (the delta lens's DELTA-5, with no graph budget), and so
+was #302's own accepted residual (one real success in every 8 ticks). Its cost
+to the node is one per-peer budget slice per (host, topic) per tick inside
+the 240 s outer belt; to the peer, keeping a listing and a hung socket per
+tick. #302's quarantine is a defence against broken peers, not an adversarial
+one.
+
+One budget for the resumes (the lens fold's M1): the cursor is held below
+the deferred UTXOs, so the peer serves them FIRST; with a budget each, two of
+them filled the per-peer budget (the worker's 15 s of 30 s, LOW's 60 s of
+120 s) and no UTXO above them was reached. Every resume of one sync now
+shares ONE per-graph budget, a deadline made at the first resume and one
+call count, so the resumes take at most one graph's budget and the first new
+UTXO keeps its own. A record served once that budget is spent is HELD BACK
+untouched (no read, no pass counted; `held_back_graphs`) for the next sync,
+oldest score first. The limit, stated: a record held back behind another's
+resumes waits for that one's convergence or its 60 passes.
+
+A walk with nothing pending is completed as any graph is: D15's anchor check
+over the WHOLE graph (the resumed nodes included), the finalize submits
+ancestors first, stopping at the first that does not land (e1d: no
+successor is recorded over a predecessor that did not land). A completed
+graph whose finalize did not land keeps its record with nothing pending
+(`not_landed`): the next pass completes it again without one request. An
+anchor fault (`AnchorUnavailable`) keeps it too; an anchor REFUSAL deletes it
+(`refused`, the cursor moves, as before).
+
+The walk is an explicit stack (it was a recursion; the order is the same: an
+input's whole branch before its next sibling; D13's pin B, byte-identical request
+lists, holds) whose state lives in the `GASPSync`, outside the raced future:
+each step is committed only when it finished, so a deadline that drops the
+future leaves the walk as it was before that step.
+
+Bounds, all stated in `gasp.rs`: `DEFAULT_GRAPH_BUDGET_CALLS` 100 and
+`DEFAULT_GRAPH_BUDGET_MS` 60 s (half of LOW's 120 s topic slice; at the
+measured 1.2 s a request the time binds first, about 50 nodes a pass); the
+Cloudflare worker sets 100 calls and 15 s (half its 30 s per-peer budget,
+`gasp_deferred.rs`; with M1 the resumes of a pass together take at most that
+half). A record deferred `DEFERRED_GRAPH_MAX_PASSES` (60) times is dropped at
+its next resume (`max_passes`) and the UTXO fails (the gap guard asks again:
+the next pass walks it from its root, a new record); a record whose UTXO a
+sync that ran to its end was not served (spent at the peer) is dropped
+(`not_served`), one the node now holds (`held`); a write that faults
+(`store_fault`); a resumed record whose pass ends still holding no node (one
+saved before the fold) `no_progress`. A walk past its per-graph budget that
+cannot be KEPT, past `DEFERRED_GRAPH_MAX_BYTES` (1 MiB of JSON, `too_big`),
+past `DEFERRED_GRAPHS_PER_PEER_TOPIC` (16 per (peer, topic), `too_many`), at
+the storage's ceiling (`AtCeiling`, counted `too_many`) or whose save FAULTED
+(`store_fault`; the delta fold's D-L2: it failed the UTXO; a RESUMED walk's
+held record is KEPT through a faulted save, the delta-2 lens's D2-N2: it was
+deleted, and one transient D1 fault threw away every earlier pass), is
+counted and then GOES ON under the per-peer budget alone, as every walk did before #555
+(the lens fold's L4: such a graph completed in one pass before #555 and was
+failed on every pass after it). A walk that went on is counted ONCE and the
+storage is asked once (the delta fold's D-L1): a per-peer deadline that then
+cuts it, or a completion that does not land, saves nothing and counts
+nothing more (it counted `too_many` twice and upserted twice).
+
+The worker: `gasp_deferred_graphs` (migration 170, transient, one row per
+graph). Its upsert carries a GLOBAL ceiling in the statement itself (the
+lens fold's M3, as #576's `PARK_SQL`): a new key only under 256 rows
+(`DEFERRED_GRAPHS_MAX_ROWS`), and any save only while the rows' `bytes` stay
+within 64 MiB (`DEFERRED_GRAPHS_MAX_TOTAL_BYTES`); a refused save returns no
+row (`AtCeiling`). Half of it is RESERVED for CONFIGURED peers (the delta-2
+fold's D2-M2; each record carries `configured`, set by the storage adapter
+from `SyncTarget::Peers`; migrations 174-175 add `origin` and `configured`):
+the records of DISCOVERED peers together hold at most 128 rows
+(`DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS`) and 32 MiB
+(`DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES`), and a configured peer's save is
+checked against the global bounds only. The discovered half is SHARED by
+origin (the delta fold's D-M1, keyed by origin since D2-M2): one origin holds
+at most 32 rows (`DEFERRED_GRAPHS_MAX_ROWS_PER_HOST`, an eighth) and 8 MiB
+(`DEFERRED_GRAPHS_MAX_BYTES_PER_HOST`) over all its topics, in the same
+statement. It was one pool: four (host, topic) pairs of a stranger's hosts
+held the 64 MiB, then (the delta-2 lens's DELTA2-4) eight spellings of one
+server held all 256 rows within two ticks at no cost (a fast peer pays
+`calls`, not time) and a configured peer's deferral (`overlay-us-1.bsvb.tech`,
+`tm_uhrp`) was refused: #582's graph walked from its root again. A row saved
+before the fold holds origin '' and counts as discovered until its next save.
+The engine takes the topics
+with CONFIGURED peers (`SyncTarget::Peers`) before those whose peers
+`ls_ship` discovers (`engine::sync_order`, each class by name; the map's order
+was arbitrary), so a place the ceiling frees goes to a configured peer first
+and a pass the outer 240 s cuts has reached them (the delta-2 lens's D2-N1,
+stated: the worker's nine configured peer syncs, `tm_ship` x4, `tm_slap` x4,
+`tm_uhrp` x1, at 30 s each are 270 s, past the 240 s belt, so while the bsvb
+peers are slow, until their quarantine, the SHIP topics after them are cut on
+every tick; today those topics have no other host). The limit, stated: FOUR
+origins (four subdomains of one server, `a.evil.example` ..; SHIP-mode hosts
+are anyone's to advertise) fill the DISCOVERED half for the price of their
+calls, and an honest discovered peer is then refused (`too_many`) and walks
+from its root as before #555; configured peers keep their half. Its signal is
+a count at 128 discovered rows or `totalBytes` near 32 MiB on
+`/health/invariants.gasp.deferredGraphs` while `gasp_graph_dropped_too_many_total`
+rises. The cron sweeps, before its GASP sync, every row not
+written for 30 h (`DEFERRED_GRAPH_STALE_SECS`: twice 60 passes at `*/15`, so
+a record held back behind another's whole life survives), logs each and
+counts `gasp_graph_dropped_stale_total` (and `gasp_graph_dropped_total`):
+before the fold a peer that never finished a sync again (dark, quarantined,
+its advert revoked) kept its rows for good, and a stranger advertising hosts
+on a SHIP-mode topic could fill about 1.4 GB a day into the D1 the overlay
+shares with the app layer. The table stays transient, so its sweep needs no
+`delete_scope` (the ownership checker refuses one on a table that is not
+never-wipe). `/health/invariants.gasp.deferredGraphs` serves `count`,
+`totalBytes`, `oldest`, the oldest 20 as {topic, peer, outpoint, nodes,
+pending, calls, passes, reason, bytes, ageSecs}, and the `budget` (calls,
+ms, maxPasses, maxBytes, perPeerTopic, maxRows, maxTotalBytes,
+maxRowsPerHost, maxBytesPerHost, discoveredMaxRows, discoveredMaxBytes,
+staleSecs);
+the counters `gasp_graph_deferred_total`, `gasp_graph_resumed_total`,
+`gasp_graph_converged_total`, `gasp_graph_dropped_total` and
+`gasp_graph_dropped_<reason>_total` (the reasons above and `stale`; bumped
+by the cron's pass; `/admin/startGASPSync` returns the same figures in its
+body and bumps none), and the `Scheduled: GASP sync:` line's
+`deferred_graphs`, `resumed_graphs`, `converged_graphs`, `dropped_graphs`,
+`stalled_graphs`, `held_back_graphs` (the per-topic line names each drop's
+outpoint and reason). `TopicSyncResult` carries the same six.
+
+Limits, stated. The reference (ts-stack `f999e0c1a`) has no budget and no
+deferral: all of it is an addition. A resumed graph's earlier nodes are the
+peer's bytes of an earlier pass (a transaction is immutable; a proof that
+arrived since is not re-asked, except the root's). A PROVEN node saved before
+a reorg is re-appended as is (the lens fold's L1): the anchor check at
+completion re-checks against the chain tracker, so a stale proof is never
+admitted, but it is a REFUSAL and the cursor moves past that graph, where a
+fresh walk would have fetched the new proof; records live at most 60 passes
+(15 h at `*/15`). Not built: a refusal of a resumed graph that walks it once
+more from its root cannot be bounded without keeping a mark past the record's
+deletion. "Converged" is counted when the graph's finalize landed, under a
+per-peer budget (the hook); without one, when it completed; a graph restarted
+`root_proven` is counted dropped (`root_proven`) and its later landing is a
+fresh graph's, not counted `converged` (the lens's N1). Whether D1's binding
+takes a 1 MiB bound record is unverified (the lens's L5): the statements run
+under rusqlite and the route cell seeds its row with `wrangler d1 execute`,
+and local D1 does not enforce the platform's limits (2 MB a row; the 100 KB
+statement limit does not count bound values). `byte_size` serializes a record
+once more to measure it. Pins: `cargo test -p bsv-overlay-engine --features
+memory-storage --test gasp_topic_manager e555` (a to h and b2, each RED on
+`cf933e8` with the API grafted inert, pin B hangs there; the lens fold's
+`e555f_h1` x2, `e555f_m1`, `e555f_l3`, `e555f_l4`, `e555f_l6`, each RED on
+`03e1e17` with the fold's test knobs grafted inert; `e555_b`, `b2` and `c`
+amended by H1, L4 and M1), the worker's `gasp_deferred::tests` (the shipped
+statements under real SQLite, the health view, the counters; the fold's
+`e555f_m3` ceiling and sweep, RED on `03e1e17`) and the route cell
+`tools/lane-e555/deferred_graphs_route_ci.mjs` (`make ci-d1-budget`; the
+fold's `totalBytes`, ceiling and counters, RED on `03e1e17`). The delta
+fold's pins, each RED on `0974be5` with its test knobs grafted inert:
+`e555d_m1` (a 5xx stranger and an honest deep graph beside it under a
+one-record ceiling: no stranger record, the honest graph deferred and
+converged), `e555d_m2` x2 (the hostile peer counted failed from its 13th
+yieldless sync and skipped after its 20th; an honest unproven-root graph and
+a 33-link walk converge inside 12 with no failure), `e555d_l1` (one
+`too_many`, one save asked), `e555d_l2` (a faulted save goes on and the
+graph lands in the pass); the engine's `delta555_m1` (the topic order); the
+worker's `e555d_m1_the_upsert_shares_the_ceiling_by_host` and
+`e555d_m2_peer_yield_upsert_real_sqlite`; the route cell's per-host budget
+and `yieldless_syncs` column (`e555d_m2_a` amended by the delta-2 fold: its
+clock advances 15 min a tick). The delta-2 fold's pins:
+- `e555d2_m1_an_honest_unproven_head_at_one_tick_a_minute_*` (DELTA2-1 at one
+  tick a minute: 30 yieldless syncs, no failure; the block lands and the
+  graph converges; a second streak past 3 h fails), RED on `ef423da` (failed
+  at tick 13);
+- `e555d2_m1_the_streak_carries_its_age_and_decays_*` (the model and the pure
+  rule), and the worker's `e555d2_m1_the_yield_upsert_keeps_the_streak_in_time`
+  (the shipped statement under real SQLite);
+- `e555d2_m2_spellings_of_one_server_are_one_origin_and_one_peer` (the key,
+  the SHIP dedup, the health written under the origin);
+- `e555d2_m2_a_configured_peers_record_says_so`, and the worker's
+  `e555d2_m2_a_configured_peer_saves_with_the_discovered_half_full` (DELTA2-4
+  inverted: eight spellings take one share of 32 rows, four subdomains fill
+  the discovered half, the configured peer saves to the global 256);
+- `e555d2_m2_a_resumed_walk_that_faults_idle_is_dropped_after_three`, RED on
+  `ef423da` (the record kept);
+- `e555d2_l1_a_fresh_walk_that_paid_half_its_budget_keeps_its_record`, RED on
+  `ef423da` (no record);
+- `e555d2_x_a_deadline_that_fell_due_is_never_polled_again`, RED on `ef423da`
+  (the panic).
+
+The old-API pins were grafted onto `ef423da` and run there; the others use
+the fold's new API (`peer_origin`, `PeerYieldStreak`, `configured`, the
+19-bind upsert) and do not compile there. The route cell runs the two shipped
+statements, read verbatim out of the Rust source with literal binds, on local
+D1. Stated (D2-N3, the delta-2 lens): `gasp_peer_health` is not served on
+`/health/invariants`; an operator sees a streak only in the per-topic
+`errors` line once it is past both bounds.
+
+The delta-3 fold (the delta-3 lens on `9280aed`). D3-M1 and D3-L1 above.
+Its NOTEs, stated:
+- D3-N1: the engine's pins modelled a zero-duration sync (the yield and the
+  attempt stamped at one instant, 900 s a tick), on the `>` boundary D1 never
+  hits; that is how D3-M1 passed. A pin at a timing boundary steps past it
+  (`e555d3_m1` runs 901 s a tick).
+- D3-N2: `idle_faults` counts PASSES, not time: at one tick a minute a 3-minute
+  partial outage of an honest peer (it lists, its node requests 5xx) drops
+  its record; a flapping 5xx at rate p drops one about p^3 a pass. The cost
+  is that record's progress; a fresh walk keeps a new record once it paid
+  half its budget (D2-L1), and an unproven head restarts `root_proven`.
+- D3-N3: D2-L1 halves a FAST stranger's price of a record (50 tiny nodes and
+  a 503 keep a `fault` record), bounded as the `calls` records are: one
+  origin's 32 rows inside the discovered 128; configured peers unaffected.
+- D3-N4: the worker's configured peers (9 (peer, topic) pairs x 16) can hold
+  144 rows, past the 128 reserved while the discovered half is full, and in
+  bytes past the 64 MiB global; a configured save has no per-origin share, so
+  one configured peer's records can crowd out another's (that save is
+  `too_many` and the walk goes on, L4). In practice only `tm_uhrp` defers.
+  `storage-ownership.json`'s `holds` for `gasp_deferred_graphs` does not name
+  the discovered half (cosmetic).
+
+Pins, each RED on `9280aed`'s sources (the tests over them):
+`e555d3_m1_the_probe_of_a_quarantined_yieldless_peer_fails_and_rearms`
+(DELTA3-1b, 901 s a tick, 27 of 200 attended, every probe failed; RED at tick
+44, failures 0), `e555d3_m1_the_decay_is_only_for_a_peer_that_is_not_failed`
+(the model), `e555d2_m2_spellings_of_one_server_are_one_origin_and_one_peer`
+(amended: ports and schemes stand apart, `:443` collapses), and the worker's
+`d1_storage::tests::e555d3_m1_the_probe_of_a_quarantined_peer_continues_its_streak`
+(the lens's sequence over the SHIPPED statements, 15 s syncs at `*/15`: 27 of
+200; RED at tick 44).
+
+The delta-4 fold (the delta-4 lens on `2c8ab50`): D4-M1, D4-L1, D4-L2 and
+D4-N1 above. Pins, each RED on `2c8ab50`'s sources (`gasp.rs` and `engine.rs`
+put back in place, the tests over them):
+- `e555d4_m1_dead_port_adverts_of_an_honest_host_do_not_silence_it`
+  (DELTA4-1: 8, 12, 7 and 1 dead-port adverts, the honest peer on 96 of 96
+  ticks and no dead-port slice; RED `(4, 32)` at eight);
+- `e555d2_m2_spellings_of_one_server_are_one_origin_and_one_peer` (amended
+  back: one peer per origin, D3-L1's displacement as the stated limit, the
+  port spellings of D4-L1; RED, five peers);
+- `e555d4_l2_an_empty_listing_at_the_probe_does_not_lift_the_quarantine`
+  (DELTA4-2, 901 s a tick, 200 ticks: 27 slices with work, 7 empty probes,
+  none lifted; RED at tick 44, failures 0);
+- `e555d4_l2_a_quarantined_peer_gone_quiet_is_attended_and_a_yield_lifts_it`
+  (five quiet ticks attended with the failures kept, a landing graph lifts
+  it; seven failures and a quiet sync reset; no per-graph budget, #302's rule
+  alone; RED at the first quiet tick).
+
+The worker's sources did not change: the three shipped peer-health statements
+are `2c8ab50`'s, and the rule is the engine's (a call it does not make).
 
 ## Storage ownership (bsv-low #474)
 
