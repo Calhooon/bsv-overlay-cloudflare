@@ -12,13 +12,21 @@
  *     health block shows the bytes at rest.
  *  2. A: its predecessor's eviction lifted, the lever re-drives the KEY, the consumer re-reads R2 and the letter
  *     LANDS (the row is gone, the subject is applied); its object is gone after the ack.
- *  3. B: its object deleted out from under it, the re-driven replay finds it MISSING and the letter parks again as
- *     a FAULT letter (never "not now"), `beef_blobs_missing_total` moved.
+ *  3. B: its object deleted out from under it, the re-driven replay finds it MISSING and the letter parks again,
+ *     KEEPING its class (`not_now`: the fold-2, E585-D3-L4; a missing object never promotes a letter), its fault
+ *     naming the MISSING object, `beef_blobs_missing_total` moved.
  *  4. C: the operator's discard deletes the row AND the object (`r2Key`, `r2Deleted`).
- *  5. A 500 KB VALID submission. When the consumer's policy admits it (`r2.replayMaxBytes`, NL-6's
- *     `QUEUE_BEEF_LIMITS`): acked `queued`, parked by key, re-driven from R2, landed, its object gone. While that
- *     policy still stops at 90,000 bytes the door refuses it (502 naming the policy, nothing written): this leg
- *     then says so and passes on the refusal; it turns into the full leg, unedited, when the policy lifts.
+ *  5. A 500 KB VALID submission (the fold-2, E585-D3-M1, #568: the door refuses no body for its size): acked
+ *     `queued`, parked by key, re-driven from R2, landed, its object gone. On `bc32851` it was the door's 502.
+ *  6. E, the TWIN ack (the fold-2, E585-D3-L3): a parked keyed letter whose subject then LANDS by another road (its
+ *     predecessor readmitted, its bytes presented again at the door, durable), its object deleted, re-driven: the
+ *     consumer finds the object MISSING and the subject applied, ACKS it as a twin: no letter,
+ *     `queue_r2_twin_acked_total` moved.
+ *  7. The SWEEP under `wrangler dev --test-scheduled` (`/__scheduled`): a young object is untouched, the
+ *     `beef_blob_sweep` row advanced (`last_pass_at`), `/health/invariants.queue.r2.atRest` served.
+ *  8. A put TWICE (N2 (b)): the same "not now" bytes presented twice write one key twice, and its
+ *     `customMetadata.touched` stamp MOVED (read from the local bucket's own store); whether `uploaded` moved too is
+ *     printed as a NOTE (the sweep no longer depends on it).
  * On the base (`6926f2c`): no `r2` health block, no bucket, and every body past 90,000 bytes is the door's 502.
  *
  *   node tools/lane-e585/beef_blobs_route_ci.mjs <overlay base> <overlay --persist-to dir>
@@ -27,6 +35,7 @@
  */
 import { createHash, randomFillSync } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
+import { readdirSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const OVERLAY = process.argv[2] ?? 'http://127.0.0.1:8801'
@@ -131,6 +140,33 @@ function r2del(key) {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
 }
+function r2put(key, bytes) {
+  const file = `${STATE}/e585f2-put.bin`
+  writeFileSync(file, bytes)
+  execFileSync('npx', ['wrangler', 'r2', 'object', 'put', `${BUCKET}/${key}`, '--file', file, '--local', '--persist-to', STATE], {
+    cwd: CRATE,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+}
+/** The local bucket's own row of the object whose key starts with `prefix` (miniflare's `_mf_objects`). */
+function r2meta(prefix) {
+  const files = []
+  const walk = (d) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      if (e.isDirectory()) walk(`${d}/${e.name}`)
+      else if (e.name.endsWith('.sqlite')) files.push(`${d}/${e.name}`)
+    }
+  }
+  try { walk(`${STATE}/v3/r2`) } catch { return null }
+  for (const f of files) {
+    try {
+      const out = execFileSync('sqlite3', ['-json', f, `SELECT key, uploaded, custom_metadata FROM _mf_objects WHERE key LIKE '${prefix}%'`], { encoding: 'utf8' })
+      const row = out.trim() ? JSON.parse(out)[0] : null
+      if (row) return { key: row.key, uploaded: Number(row.uploaded), custom: JSON.parse(row.custom_metadata || '{}') }
+    } catch {}
+  }
+  return null
+}
 async function health() {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -178,26 +214,26 @@ expect(
 )
 const c0 = h0.counters ?? {}
 
-// 1. Three ~8 KB "not now" letters, by key.
-const [A, B, C] = [await chain(8_000, 'A'), await chain(8_000, 'B'), await chain(8_000, 'C')]
+// 1. Four ~8 KB "not now" letters, by key (E is leg 6's twin).
+const [A, B, C, E] = [await chain(8_000, 'A'), await chain(8_000, 'B'), await chain(8_000, 'C'), await chain(8_000, 'E')]
 expect(
-  [A, B, C].every((x) => x.rg.status === 200 && x.rs.status === 200 && x.rs.mutation === 'queued'),
-  'three ~8 KB "not now" successors past the room are acked: queued',
-  [A, B, C].map((x) => `${x.rg.status}/${x.rs.status} ${x.rs.mutation}: ${x.rs.text.slice(0, 120)}`).join(' | '),
+  [A, B, C, E].every((x) => x.rg.status === 200 && x.rs.status === 200 && x.rs.mutation === 'queued'),
+  'four ~8 KB "not now" successors past the room are acked: queued',
+  [A, B, C, E].map((x) => `${x.rg.status}/${x.rs.status} ${x.rs.mutation}: ${x.rs.text.slice(0, 120)}`).join(' | '),
 )
 expect(
-  ((await health()).counters?.beef_blobs_written_total ?? NaN) === (c0.beef_blobs_written_total ?? NaN) + 3,
-  'each was written to R2 before its ack (beef_blobs_written_total moved by three)',
+  ((await health()).counters?.beef_blobs_written_total ?? NaN) === (c0.beef_blobs_written_total ?? NaN) + 4,
+  'each was written to R2 before its ack (beef_blobs_written_total moved by four)',
   `${c0.beef_blobs_written_total} -> ${(await health()).counters?.beef_blobs_written_total}`,
 )
-for (const x of [A, B, C]) {
+for (const x of [A, B, C, E]) {
   x.row = await until(() => {
     const r = letter(x.s)
     return r && r.status === 'parked' ? r : null
   })
 }
-expect([A, B, C].every((x) => !!x.row), `each dead-letters after its replays and PARKS (within ${WAIT_MS / 1000} s)`, [A, B, C].map((x) => brief(letter(x.s))).join(' | '))
-for (const x of [A, B, C]) {
+expect([A, B, C, E].every((x) => !!x.row), `each dead-letters after its replays and PARKS (within ${WAIT_MS / 1000} s)`, [A, B, C, E].map((x) => brief(letter(x.s))).join(' | '))
+for (const x of [A, B, C, E]) {
   if (!x.row) continue
   const m = JSON.parse(x.row.message)
   x.key = x.row.r2_key
@@ -245,9 +281,9 @@ if (B.row) {
   })
   const h3 = await health()
   expect(
-    !!again && again.class === 'fault' && /MISSING/.test(again.fault ?? '') && again.r2_key === B.key &&
+    !!again && again.class === 'not_now' && /MISSING/.test(again.fault ?? '') && again.r2_key === B.key &&
       (h3.counters?.beef_blobs_missing_total ?? 0) >= (c0.beef_blobs_missing_total ?? 0) + 1,
-    `B: a missing object is a FAULT letter, parked again with its key (never "not now"; within ${WAIT_MS / 1000} s)`,
+    `B: a missing object is the replay's fault, parked again with its key and its class KEPT (not_now; within ${WAIT_MS / 1000} s)`,
     `${brief(letter(B.s))} missing=${h3.counters?.beef_blobs_missing_total}`,
   )
   await lever({ letters: [{ txid: B.s }] }, '/internal/discard-dead-letters')
@@ -285,13 +321,76 @@ if (D.beef.length <= max) {
     expect((rd.json?.redriven ?? []).length === 1 && !!landed && Number(applied) >= 1 && !!gone, 're-driven from R2 it LANDS, and its object is gone after the ack', `${rd.text.slice(0, 200)} ${brief(letter(D.s))} applied=${applied}`)
   }
 } else {
-  const written = (await health()).counters?.beef_blobs_written_total ?? NaN
+  expect(false, `a ${D.beef.length} B submission is carried (the door refuses no body for its size, #568)`, `replayMaxBytes is ${max}; ${D.rs.status}: ${D.rs.text.slice(0, 300)}; written0 ${written0}`)
+}
+
+// 6. E: the twin ack. Its subject lands by another road, its object goes, its re-drive is acked as a twin.
+if (E.row) {
+  d1(`DELETE FROM pot_evictions WHERE txid = '${E.p}'`)
+  const again = await submit(E.beef)
+  const applied = Number(d1(`SELECT COUNT(*) AS c FROM applied_transactions WHERE txid = '${E.s}'`)[0]?.c ?? 0)
+  expect(again.status === 200 && again.mutation === null && applied >= 1, 'E: its predecessor readmitted, its bytes presented again LAND at the door (durable, no queue)', `${again.status} ${again.mutation}: ${again.text.slice(0, 200)} applied=${applied}`)
+  r2del(E.key)
+  const twin0 = (await health()).counters?.queue_r2_twin_acked_total ?? 0
+  const re = await lever({ txid: E.s })
+  expect((re.json?.redriven ?? []).length === 1, 'E: its object deleted, the lever re-drives the key', re.text.slice(0, 300))
+  const gone = await until(() => (letter(E.s) === undefined ? true : null))
+  const h6 = await health()
   expect(
-    D.rs.status === 502 && /QUEUE_BEEF_LIMITS/.test(D.rs.text) && written === written0 && letter(D.s) === undefined,
-    `a ${D.beef.length} B submission: the consumer's policy stops at ${max} B, so the door refuses it (502 naming the policy, nothing written, nothing acked)`,
-    `${D.rs.status}: ${D.rs.text.slice(0, 300)}; written ${written0} -> ${written}`,
+    !!gone && (h6.counters?.queue_r2_twin_acked_total ?? 0) >= twin0 + 1,
+    `E: MISSING and landed, the replay is ACKED as a twin: no letter, queue_r2_twin_acked_total moved (within ${WAIT_MS / 1000} s)`,
+    `${brief(letter(E.s))}; twin ${twin0} -> ${h6.counters?.queue_r2_twin_acked_total}`,
   )
-  lines.push(`NOTE  the 500 KB leg passed on the REFUSAL: QUEUE_BEEF_LIMITS.max_bytes is ${max}. It becomes the full leg (acked, parked by key, re-driven, landed, object gone) when that policy lifts (NL-6).`)
+}
+
+// 7. The sweep, through the scheduled event (`wrangler dev --test-scheduled`).
+{
+  const young = `mutations/${'e5'.repeat(32)}/${'0'.repeat(32)}`
+  r2put(young, Buffer.from('a young object nothing names'))
+  const before = d1('SELECT last_pass_at FROM beef_blob_sweep WHERE id = 1')[0]?.last_pass_at ?? 0
+  const t0 = Date.now()
+  fetch(OVERLAY + '/__scheduled?cron=' + encodeURIComponent('*/15 * * * *'), { headers: { Connection: 'close' }, signal: AbortSignal.timeout(WAIT_MS) }).catch(() => {})
+  const row = await until(() => {
+    const r = d1('SELECT last_pass_at, last_listed, last_swept, full_objects FROM beef_blob_sweep WHERE id = 1')[0]
+    return r && Number(r.last_pass_at) > Number(before) && Number(r.last_pass_at) >= t0 - 60_000 ? r : null
+  })
+  const h7 = await health()
+  const at = h7.queue?.r2
+  expect(
+    !!row && Number(row.last_listed) >= 1 && Number(row.last_swept) === 0 && r2get(young) !== null,
+    `the scheduled tick ran one sweep pass: the beef_blob_sweep row advanced, the young object untouched (within ${WAIT_MS / 1000} s)`,
+    `${JSON.stringify(row)}; young ${r2get(young) ? 'kept' : 'GONE'}`,
+  )
+  expect(
+    at?.bound === true && at?.readable === true && typeof at?.atRest?.objects === 'number' && at.atRest.objects >= 1 && typeof at?.sweep?.lastPassAt === 'number',
+    '/health/invariants.queue.r2 serves the objects at rest (atRest) and the pass',
+    JSON.stringify(at),
+  )
+  r2del(young)
+}
+
+// 8. A put twice: the touched stamp moves.
+{
+  const F = await chain(8_000, 'F')
+  const key = `mutations/${F.sha}/`
+  const first = r2meta(key)
+  await sleep(1_100)
+  const again = await submit(F.beef)
+  const second = r2meta(key)
+  const t1 = Number(first?.custom?.touched), t2 = Number(second?.custom?.touched)
+  expect(
+    F.rs.mutation === 'queued' && again.mutation === 'queued' && first && second && first.key === second.key && t2 > t1,
+    'the same "not now" bytes presented twice write one key twice, and its customMetadata.touched MOVED',
+    `${F.rs.status} ${F.rs.mutation} / ${again.status} ${again.mutation}; ${JSON.stringify(first)} -> ${JSON.stringify(second)}`,
+  )
+  if (first && second) {
+    lines.push(`NOTE  N2 (b), local R2: on the re-put \`uploaded\` ${second.uploaded > first.uploaded ? 'MOVED' : 'did NOT move'} (${first.uploaded} -> ${second.uploaded}); the sweep reads the later of it and touched`)
+  }
+  const parked = await until(() => {
+    const r = letter(F.s)
+    return r && r.status === 'parked' ? r : null
+  })
+  if (parked) await lever({ letters: [{ txid: F.s }] }, '/internal/discard-dead-letters')
 }
 } catch (e) {
   expect(false, 'the cell ran to its end', `${e.message ?? e}`.split('\n')[0])

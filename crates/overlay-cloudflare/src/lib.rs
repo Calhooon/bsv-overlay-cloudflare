@@ -2294,81 +2294,71 @@ async fn queue_handler(
         // topics and mode shares the object and the first ack deleted it, so a subject under an open eviction or
         // with an applied row in every topic named is acked (a dupe, no letter, nothing to delete: the object is
         // gone); one not shown landed is the replay's FAULT, as before.
-        let read = match &body.r2 {
-            None => crate::queue::decode_replay_beef(&body.beef_b64)
-                .map_err(|e| format!("invalid base64 BEEF ({e})")),
-            Some(r) => match crate::queue::read_beef(&env, r).await {
-                Ok(b) => Ok(b),
-                Err(f @ crate::queue::BlobFault::Missing(_)) => {
-                    let verdict = match &counters {
-                        Some(db) => {
-                            crate::ops::bump_counter(db, crate::ops::COUNTER_BEEF_BLOBS_MISSING, 1)
-                                .await;
-                            crate::queue::judge_missing(db, &body.topics, r).await
-                        }
-                        None => crate::queue::MissingVerdict::Fault(
-                            "OVERLAY_DB binding unavailable".to_string(),
-                        ),
-                    };
-                    match verdict {
-                        crate::queue::MissingVerdict::Fault(e) => {
-                            if let Some(db) = &counters {
-                                crate::ops::bump_counter(
-                                    db,
-                                    crate::ops::COUNTER_QUEUE_R2_MISSING_FAULT,
-                                    1,
-                                )
-                                .await;
-                            }
-                            Err(format!("{}; {e}", f.says()))
-                        }
-                        acked => {
-                            let (why, counter) = if acked == crate::queue::MissingVerdict::Twin {
-                                (
-                                    crate::dead_letters::Resolved::Twin,
-                                    crate::ops::COUNTER_QUEUE_R2_TWIN_ACKED,
-                                )
-                            } else {
-                                (
-                                    crate::dead_letters::Resolved::RefusedEvicted,
-                                    crate::ops::COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
-                                )
-                            };
-                            worker::console_log!(
-                                "Queue: the R2 object {} is MISSING and its replay is acked: {}",
-                                r.key,
-                                why.says()
-                            );
-                            if let Some(db) = &counters {
-                                crate::ops::bump_counter(db, counter, 1).await;
-                                let row_object =
-                                    crate::dead_letters::resolve(db, body, r.txid.as_deref(), why)
-                                        .await;
-                                acked_objects.extend(row_object);
-                            }
-                            msg.ack();
-                            continue;
-                        }
-                    }
-                }
-                Err(f) => Err(f.says()),
-            },
+        // The d3 fold-2 (E585-D3-L3): the read and the use of the verdict are `read_for_replay`, run as is by the
+        // lib's tests; this arm only acts on its step. Its MISSING fault notes KEEP the letter's class (L4).
+        let ports = crate::queue::WorkerBytes {
+            env: &env,
+            db: counters.as_ref(),
         };
-        let beef = match read {
-            Ok(b) => b,
-            Err(fault) => {
+        let step = crate::queue::read_for_replay(&ports, body).await;
+        if let (
+            crate::queue::ReadStep::Acked(_)
+            | crate::queue::ReadStep::Fault {
+                missing: true,
+                ..
+            },
+            Some(db),
+        ) = (&step, &counters)
+        {
+            crate::ops::bump_counter(db, crate::ops::COUNTER_BEEF_BLOBS_MISSING, 1).await;
+        }
+        let beef = match step {
+            crate::queue::ReadStep::Bytes(b) => b,
+            crate::queue::ReadStep::Acked(verdict) => {
+                let (why, counter) = if verdict == crate::queue::MissingVerdict::Twin {
+                    (
+                        crate::dead_letters::Resolved::Twin,
+                        crate::ops::COUNTER_QUEUE_R2_TWIN_ACKED,
+                    )
+                } else {
+                    (
+                        crate::dead_letters::Resolved::RefusedEvicted,
+                        crate::ops::COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
+                    )
+                };
+                let subject = body.r2.as_ref().and_then(|r| r.txid.as_deref());
+                worker::console_log!(
+                    "Queue: the R2 object of {} is MISSING and its replay is acked: {}",
+                    subject.unwrap_or("?"),
+                    why.says()
+                );
+                if let Some(db) = &counters {
+                    crate::ops::bump_counter(db, counter, 1).await;
+                    let row_object = crate::dead_letters::resolve(db, body, subject, why).await;
+                    acked_objects.extend(row_object);
+                }
+                msg.ack();
+                continue;
+            }
+            crate::queue::ReadStep::Fault { fault, missing } => {
                 worker::console_log!("Queue: {fault} — retrying; it dead-letters and is parked");
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
                         .await;
-                    crate::dead_letters::note_failing(
-                        db,
-                        body,
-                        None,
-                        &fault,
-                        crate::dead_letters::LetterClass::Fault,
-                    )
-                    .await;
+                    if missing {
+                        crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_R2_MISSING_FAULT, 1)
+                            .await;
+                        crate::dead_letters::note_failing_keeping_class(db, body, None, &fault).await;
+                    } else {
+                        crate::dead_letters::note_failing(
+                            db,
+                            body,
+                            None,
+                            &fault,
+                            crate::dead_letters::LetterClass::Fault,
+                        )
+                        .await;
+                    }
                 }
                 msg.retry();
                 continue;
@@ -2500,6 +2490,21 @@ async fn queue_handler(
                     body.reason,
                     report.applied_topics
                 );
+                // the d3 fold-2 (E585-D3-L1): a replay that wrote a topic while another it names FAILED leaves its
+                // object for a twin in flight (the twin's own ack deletes it; the sweep is the backstop)
+                let leaves = body.r2.is_some()
+                    && crate::queue::landed_ack_leaves_object(
+                        &body.topics,
+                        &report.applied_topics,
+                        &report.deduped_topics,
+                    );
+                if leaves {
+                    worker::console_log!(
+                        "Queue: {subject} landed with a FAILED topic (applied={:?}, deduped={:?}): its R2 object stays for a twin",
+                        report.applied_topics,
+                        report.deduped_topics
+                    );
+                }
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_APPLIED, 1)
                         .await;
@@ -2510,9 +2515,13 @@ async fn queue_handler(
                         crate::dead_letters::Resolved::Landed,
                     )
                     .await;
-                    acked_objects.extend(row_object);
+                    if !leaves {
+                        acked_objects.extend(row_object);
+                    }
                 }
-                acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));
+                if !leaves {
+                    acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));
+                }
                 msg.ack();
             }
             Ok((_steak, report)) => {

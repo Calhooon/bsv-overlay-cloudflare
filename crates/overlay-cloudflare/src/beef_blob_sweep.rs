@@ -13,12 +13,14 @@
 //! `beef_blob_sweep`: R2 lists in key order, and a key outlives any listing token), and deletes each object that
 //! is both
 //!
-//! 1. OLDER than [`ORPHAN_WINDOW_S`] by R2's own `uploaded` stamp, and
+//! 1. OLDER than [`ORPHAN_WINDOW_S`] by its AGE STAMP ([`Listed::age_ms`]): the LATER of R2's `uploaded` and the
+//!    writer's own `customMetadata.touched` (`queue::TOUCHED_META`, written by every put; the d3 fold-2, N2 (b):
+//!    whether the platform renews `uploaded` on a re-put of a key is not documented, and no longer decides), and
 //! 2. named by NO dead letter row (`mutation_dead_letters.r2_key`, whatever the row's status),
 //!
 //! at most [`SWEEP_MAX_DELETES`] a pass (a pass that meets more stops there and the next goes on from it). Before
 //! each delete the object is read again (`head`): one written again since the listing (a client's
-//! re-presentation writes the same key and a new stamp) is left.
+//! re-presentation writes the same key and a new `touched` stamp) is left.
 //!
 //! ## Why the window is what no queue message can outlive
 //!
@@ -84,6 +86,18 @@ pub struct Listed {
     pub bytes: u64,
     /// R2's `uploaded` stamp, ms.
     pub uploaded_ms: i64,
+    /// The writer's `customMetadata.touched` stamp, ms (`queue::TOUCHED_META`); `None` on an object written before
+    /// the d3 fold-2, or one whose stamp does not parse.
+    pub touched_ms: Option<i64>,
+}
+
+impl Listed {
+    /// The object's AGE STAMP: the later of `uploaded` and `touched`.
+    #[must_use]
+    pub fn age_ms(&self) -> i64 {
+        self.touched_ms
+            .map_or(self.uploaded_ms, |t| t.max(self.uploaded_ms))
+    }
 }
 
 /// The state at rest (`beef_blob_sweep`).
@@ -107,7 +121,7 @@ pub struct SweepState {
 /// PURE: is the object past the window?
 #[must_use]
 pub fn past_window(o: &Listed, now_ms: i64, window_s: u64) -> bool {
-    now_ms.saturating_sub(o.uploaded_ms) > (window_s as i64).saturating_mul(1000)
+    now_ms.saturating_sub(o.age_ms()) > (window_s as i64).saturating_mul(1000)
 }
 
 /// PURE: does the page hold an object past the window (the only case the named keys are read for)?
@@ -153,11 +167,12 @@ pub fn plan_pass(
     }
 }
 
-/// PURE: the read just before a delete. The object is deleted only if it is still there under the stamp the
-/// listing gave: one written again since (the same key, a new stamp, a new message naming it) is left.
+/// PURE: the read just before a delete. The object is deleted only if it is still there under the stamps the
+/// listing gave: one written again since (the same key, a new `touched` or `uploaded`, a new message naming it) is
+/// left.
 #[must_use]
 pub fn still_orphan(listed: &Listed, head: Option<&Listed>) -> bool {
-    head.is_some_and(|h| h.uploaded_ms == listed.uploaded_ms)
+    head.is_some_and(|h| h.uploaded_ms == listed.uploaded_ms && h.age_ms() == listed.age_ms())
 }
 
 /// PURE: the state after a pass. `handled` are the page's objects the pass handled, `swept` the keys it deleted,
@@ -262,6 +277,10 @@ fn listed_of(o: &worker::Object) -> Listed {
         key: o.key(),
         bytes: o.size(),
         uploaded_ms: o.uploaded().as_millis() as i64,
+        touched_ms: o.custom_metadata().ok().and_then(|m| {
+            m.get(crate::queue::TOUCHED_META)
+                .and_then(|t| t.parse::<i64>().ok())
+        }),
     }
 }
 
@@ -288,7 +307,11 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) {
             return;
         }
     };
-    let mut list = bucket.list().prefix(SWEEP_PREFIX).limit(SWEEP_MAX_OBJECTS);
+    let mut list = bucket
+        .list()
+        .prefix(SWEEP_PREFIX)
+        .limit(SWEEP_MAX_OBJECTS)
+        .include(vec![worker::Include::CustomMetadata]);
     if !state.start_after.is_empty() {
         list = list.start_after(state.start_after.as_str());
     }
@@ -344,7 +367,7 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) {
                     "[beef-blobs] SWEPT {} bytes={} age_s={} (an orphan: past the {ORPHAN_WINDOW_S} s window, no dead letter names it)",
                     o.key,
                     o.bytes,
-                    now.saturating_sub(o.uploaded_ms) / 1000
+                    now.saturating_sub(o.age_ms()) / 1000
                 );
             }
             Err(e) => {
@@ -507,6 +530,7 @@ mod tests {
                     key: k.clone(),
                     bytes: *b,
                     uploaded_ms: *u,
+                    touched_ms: Some(*u),
                 })
                 .collect();
             (page, it.next().is_some())
@@ -517,6 +541,7 @@ mod tests {
                 key: key.to_string(),
                 bytes: *b,
                 uploaded_ms: *u,
+                touched_ms: Some(*u),
             })
         }
     }
@@ -593,9 +618,7 @@ mod tests {
             SubmitMode::HistoricalTx,
             queue::REPLAY_REASON_PHASE3_FAULT,
             queue::QUEUE_MESSAGE_ROOM_MIN,
-            &overlay_engine::beef_limits::SUBMIT_BEEF_LIMITS,
-        )
-        .unwrap() else {
+        ) else {
             panic!("8 KB rides by key under the lowest room")
         };
         let r = m.r2.as_ref().unwrap();
@@ -881,5 +904,66 @@ mod tests {
             4,
             "no binding, a state read, a listing or a named-keys read that faults: nothing is deleted"
         );
+    }
+
+    /// The d3 fold-2 (the lens's L3 and N2 (b)): the sweep's age is the LATER of R2's `uploaded` and the writer's
+    /// own `customMetadata.touched`, which every put writes. If the platform does NOT renew `uploaded` when a key
+    /// is written again, a re-presentation after day 8 left the object past the window under a live message: swept
+    /// within one round. With the stamp, it is young; and an object re-stamped between the listing and its delete is
+    /// left. The list asks for the custom metadata, and the put writes it. RED with the age read from `uploaded`
+    /// alone (`bc32851`'s rule): the re-put object is past the window.
+    #[test]
+    fn e585_d3f2_l3_the_age_is_the_later_of_uploaded_and_touched() {
+        let day = 86_400_000i64;
+        let now = 20 * day;
+        let reput = Listed {
+            key: format!("{SWEEP_PREFIX}aa/bb"),
+            bytes: 9,
+            uploaded_ms: now - 10 * day,
+            touched_ms: Some(now - day),
+        };
+        assert_eq!(reput.age_ms(), now - day);
+        assert!(!past_window(&reput, now, ORPHAN_WINDOW_S), "re-put yesterday: young");
+        let named = HashSet::new();
+        assert!(plan_pass(std::slice::from_ref(&reput), &named, now, ORPHAN_WINDOW_S, 50)
+            .orphans
+            .is_empty());
+        let old = Listed {
+            touched_ms: Some(now - 10 * day),
+            ..reput.clone()
+        };
+        assert!(past_window(&old, now, ORPHAN_WINDOW_S));
+        let unstamped = Listed {
+            touched_ms: None,
+            ..old.clone()
+        };
+        assert!(past_window(&unstamped, now, ORPHAN_WINDOW_S), "an object from before the stamp: uploaded");
+        let stale_touch = Listed {
+            touched_ms: Some(now - 20 * day),
+            ..old.clone()
+        };
+        assert_eq!(stale_touch.age_ms(), old.uploaded_ms, "the later of the two");
+        // re-stamped between the listing and the delete, with `uploaded` unchanged: left
+        assert!(still_orphan(&old, Some(&old)));
+        assert!(!still_orphan(&old, Some(&reput)));
+        // the put writes the stamp; the list reads it
+        assert_eq!(
+            queue::touched_meta(1_234),
+            std::collections::HashMap::from([(queue::TOUCHED_META.to_string(), "1234".to_string())])
+        );
+        let code = |s: &str| {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let q = code(include_str!("queue.rs"));
+        let start = q.find("async fn put_beef(").unwrap();
+        let f = &q[start..start + q[start..].find("\n}\n").unwrap()];
+        assert!(f.contains(".custom_metadata(touched_meta(now_ms))"));
+        let src = code(include_str!("beef_blob_sweep.rs"));
+        let src = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(src.contains(".include(vec![worker::Include::CustomMetadata])"));
+        assert!(src.contains("m.get(crate::queue::TOUCHED_META)"));
     }
 }

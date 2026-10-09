@@ -493,11 +493,11 @@ predecessor lands, and nothing is held until the replay); the dry runs and
 the names call are manager CPU inside the Worker's cap, whose breach is the
 platform's error and never a record. Pre-existing and not widened: a graph
 deeper than the budget (#555; deferred and resumed since, with a per-graph
-budget), the unbounded anchor verify (#557), a "not
-now" over a BEEF above 90,000 bytes answering 502 (#568; since #585 door 3
-that figure is the CONSUMER's `QUEUE_BEEF_LIMITS`, read by the door, and a
-body past the queue's inline room rides by key in R2, "The queued BEEF in R2"
-below). It cannot tell a faulted predecessor from one nobody submitted
+budget), the unbounded anchor verify (#557). A "not
+now" over a BEEF above 90,000 bytes answered 502 on every presentation
+(#568): CLOSED by #585 door 3 and its fold-2 (a body past the queue's inline
+room rides by key in R2, and the door refuses none for its size; "The queued
+BEEF in R2" below). It cannot tell a faulted predecessor from one nobody submitted
 yet: the successor is "not now" until it lands. And a transaction that admits
 nothing, found no coin and carries more UNPROVEN, UNLANDED bodies than 16
 reads settle (six single-input ancestors or more: five are settled, measured
@@ -663,6 +663,9 @@ What the split does NOT do, stated:
 - A stranger who can make a FAULT-class letter at will is outside this bound
   (a storage fault, a body the replay cannot parse that the door accepted).
   None is known; the door builds every enqueued message from bytes it parsed.
+  One was found and closed (#585 door 3's lens, E585-D3-L4): a re-presented
+  twin whose R2 object the LOST of a deferred "not now" letter deleted was
+  noted `fault` by the missing object; that note now KEEPS the row's class.
 
 The ceiling does not drain by itself (delta fold, D-M1): only an ack of a
 replay and the operator's discard take a letter out, and a letter that can
@@ -852,20 +855,28 @@ routed around, never made a limit on a body.
   failed send is (S2: an ack is never an ack over a dropped write). A send that
   faults AFTER the write deletes nothing (a twin's message may name the
   object; the client's re-presentation writes the same key).
-- **The consumer's policy is read by the door.** A body the replay would
-  refuse for its size (`beef_limits::QUEUE_BEEF_LIMITS.max_bytes`, 90,000 until
-  NL-6 lifts it) is refused at the door, the same 502 as before, naming the
-  policy: an ack over a message whose every replay is a refusal would be an
-  ack over a dropped write. It is that policy's bound, read by name; the R2
-  path adds no cap. UNTIL NL-6 LANDS THE DOOR THEREFORE CHANGES NOTHING ABOVE
-  90,000 BYTES; what it changes today is a message past the room under that
-  size (a long topic list, a lowered room).
+- **No body is refused for its size (the fold-2, E585-D3-M1, #568 closed).**
+  As built at `bc32851` the door refused a body past the consumer's
+  `QUEUE_BEEF_LIMITS.max_bytes` (90,000) BEFORE choosing a carriage, so no
+  object was ever written and a "not now" over a large BEEF still answered
+  502 (the lens's word: a "long topic list" never reached R2 either, the route
+  caps topics at 100). Now `plan_replay` refuses nothing by bytes and
+  `QUEUE_BEEF_LIMITS.max_bytes` is the engine's own
+  (`ENGINE_BEEF_LIMITS.max_bytes`, what `/submit` admitted; the one constant
+  NL-6's rebase meets). A valid 500 KB "not now" body is acked `queued`
+  (200, `X-Overlay-Mutation: queued`), its object written under its key,
+  read by the consumer, parked by key with its bytes at rest.
 - **The consumer.** A keyed message's object is read, checked (length, sha256,
   the key naming that sha256, then `QUEUE_BEEF_LIMITS` as an inline body's
   bytes are) and replayed exactly as an inline body: the same eviction read,
   `submit_with_report`, landing guard and write-side guard. A read fault and
   a mismatch are the replay's FAULT, class `fault`, never "not now": handed
   back, dead-lettered, parked. A MISSING object is judged (the twin, below).
+  The read and the use of the verdict are ONE function,
+  `queue::read_for_replay` over a `ReplayBytes` port (the fold-2,
+  E585-D3-L3), which the handler calls and the lib's tests run as is: the
+  lens's mutant C1 (the verdict discarded, every missing object acked) passed
+  all 643 pins on `bc32851` and is RED now.
 - **The twin (the d3 fold).** Two messages of the same bytes, topics and mode
   (a client's retry of a large JOIN) name ONE object, and the first ack
   deletes it. A message whose object is MISSING on read
@@ -882,7 +893,10 @@ routed around, never made a limit on a body.
   (3) Otherwise (a topic without the row, a message naming no subject, a
   ledger or applied read that faulted) it is the replay's FAULT as before,
   counted apart (`queue_r2_missing_fault_total`): handed back, dead-lettered,
-  parked as a `fault` letter. Such a letter is no longer stuck for good: its
+  parked. Its note KEEPS the row's class (`NOTE_FAILING_KEEP_CLASS_SQL`; a
+  fresh row is a `fault` letter; the fold-2, E585-D3-L4): a missing object
+  is a fact about the bucket, and a "not now" letter stays inside its
+  bounds. Such a letter is no longer stuck for good: its
   re-drive is judged again and acks once the subject has landed by any road
   (the client's re-presentation, a GASP peer). The deletion stays on the
   ack. A REFERENCE COUNT was not chosen: the object has two writers (the
@@ -898,10 +912,19 @@ routed around, never made a limit on a body.
 - **The deletion rule** (the captain's decision; never a bucket expiry): an
   object is deleted (1) on the consumer's ACK, all three of them (landed,
   refused under an open eviction, re-evicted), after the batch's loop, with
-  the object of the letter row that ack deleted; (2) when its dead letter is
-  LOST, which is the DLQ's last delivery (the platform's `attempts` past 100)
-  of a letter that was not parked: its park faulted, or it was deferred at the
-  ceiling or at a not-now bound for the ~48 h; (3) when the copy rule drops it
+  the object of the letter row that ack deleted, except a LANDED ack that
+  wrote a topic while another it names FAILED (the manager erred: durable,
+  no applied row; `queue::landed_ack_leaves_object`, the fold-2,
+  E585-D3-L1): that one LEAVES the object, so a twin in flight reads the
+  bytes and replays as the first did (the landed topic a dupe, the failed one
+  failing again, nothing written) and its ack deletes them; the sweep is the
+  backstop; (2) when its dead letter is LOST, which is the DLQ's last
+  delivery (the platform's `attempts` past 100) of a letter that was DEFERRED
+  at the ceiling or at a not-now bound for the ~48 h (a clean read said no
+  row holds the key). A LOST letter whose park FAULTED leaves its object to
+  the sweep (`dead_letters::lost_deletes_object`, the fold-2, E585-D3-L2: a
+  statement can land after its caller was told it failed, #559 limit 5, and
+  a twin's row may hold the key); (3) when the copy rule drops it
   (another copy of a parked key carried more); (4) on the operator's discard.
   Counted `beef_blobs_deleted_total`; a delete that faults is logged
   `[beef-blobs]` with its key and counted `beef_blobs_delete_faults_total`.
@@ -915,12 +938,15 @@ routed around, never made a limit on a body.
   meets a 51st stops there). The cursor is the last KEY handled, at rest in
   D1 (`beef_blob_sweep`, one row, transient, migration 182): R2 lists in key
   order and a key outlives a listing token. An object is deleted when it is
-  BOTH older than the WINDOW by R2's own `uploaded` stamp AND named by no
+  BOTH older than the WINDOW by its AGE STAMP, the LATER of R2's `uploaded`
+  and our own `customMetadata.touched` that every put writes (the fold-2,
+  E585-D3-N2 (b): whether R2 renews `uploaded` on a re-put of a key is not
+  documented and no longer decides), AND named by no
   dead letter row (`NAMED_KEYS_SQL`: every `mutation_dead_letters.r2_key`,
   whatever the row's status; read only by a pass that listed an object past
   the window). Just before its delete the object is read again and left if
   it was written again since the listing (a re-presentation: the same key, a
-  new stamp, a new message). A state, listing or named-keys read that faults
+  new `touched` stamp, a new message). A state, listing or named-keys read that faults
   deletes nothing and moves no cursor. THE WINDOW is 8 days
   (`ORPHAN_WINDOW_S`, two `QUEUE_RETENTION_S` of 345,600 s, the platform's
   default retention, which neither queue changes): what no queue message can
@@ -965,11 +991,16 @@ tick: one R2 list, one D1 read and one write, plus the dead letters' keys
 (at most the 2000 held rows) and two R2 calls an orphan when a page holds an
 object past the window. (2) TWINS, cured (the
 twin rule above); what is left: a twin whose first message was acked WITHOUT
-landing in every topic it names is a fault letter still (no instance known:
-the three acks are landed, refused under an eviction, re-evicted, and the two
-eviction acks are read again by the twin's own verdict while the eviction is
-open; one closed in between, with nothing landed, parks the twin as a fault
-letter whose re-drive acks once the readmitted subject lands). A twin acked
+landing in every topic it names is a fault letter still. The lens found an
+instance (E585-D3-L1): a landed ack with a FAILED topic (the manager erred;
+durable, no applied row), whose twin then read MISSING and no row in that
+topic, a `fault` letter for good over bytes that did land; the fold-2 cures
+it by leaving the object on that ack (the deletion rule). What remains: a
+THIRD twin, after the second's ack deleted it, is that fault letter (it
+re-drives to the same verdict until the operator discards it); and an
+eviction closed between the two eviction acks, with nothing landed, parks the
+twin as a fault letter whose re-drive acks once the readmitted subject
+lands. A twin acked
 as a dupe told no lookup service anything and landed no carried predecessor:
 the first message's replay did. "Landed" reads `applied_transactions`, so
 limit (7) of the faulted-submit section holds here too (never wipe it
@@ -1023,9 +1054,27 @@ overlay at `MUTATION_QUEUE_INLINE_ROOM:4096`): three ~8 KB "not now" letters
 written to the local R2, parked by key, the object byte for byte; one
 re-driven from R2 and LANDED, its object gone after the ack; one whose object
 was deleted parked again as a fault; one discarded with its object; and a
-500 KB submission, which passes on the door's REFUSAL while `replayMaxBytes`
-is 90,000 and becomes the full leg (acked, parked, re-driven, landed, object
-gone), unedited, when NL-6 lifts it.
+500 KB submission, which on `bc32851` passed on the door's REFUSAL and is
+now the full leg (acked, parked, re-driven, landed, object gone).
+
+The fold-2's pins (the door 3 lens, `--lib e585_d3f2`; RED quoted on
+`bc32851` or against `bc32851`'s rule grafted alone):
+`beef_door_replay::twin::e585_d3f2_m1_*` (a valid 500 KB "not now" body
+keyed under the SHIPPED policy, acked queued, read, parked `not_now` by key
+with its object at rest; a landing one acked and its object deleted; on
+`bc32851` the door step is `Err("BEEF too large for the mutation queue's
+replay (500000 B > 90000 B, ...)")`), `*_l1_*` (the lens's twins over a
+failed topic; RED: `left: Fault(".. is MISSING ..; .. holds no applied row in
+[tm_b] ..")`), `*_l2_*` (LOST deletes only on a deferral), `*_l3_*`
+(`read_for_replay` run over every verdict; RED under mutant C1: "an unlanded
+missing object is acked"), `*_l4_*` (the lens's LOST-then-twin sequence;
+RED: `left: [(.., "failing", "fault")]`) and
+`beef_blob_sweep::tests::e585_d3f2_l3_the_age_is_the_later_of_uploaded_and_touched`.
+Amended: `e585_d3_the_write_precedes_the_send_and_the_ack_deletes`,
+`e585_d3f_*` (the model consumer runs the shipped `read_for_replay`). The
+route cell's new legs (6 to 8: the twin ack, the sweep under
+`/__scheduled`, a put twice moves `touched`) and leg 3's class (`not_now`
+kept) were written in the fold-2 and not run there (`make ci-d1-budget`).
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 

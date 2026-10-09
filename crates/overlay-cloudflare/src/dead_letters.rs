@@ -216,6 +216,14 @@ macro_rules! history_append {
 pub const NOTE_FAILING_SQL: &str = "INSERT INTO mutation_dead_letters (txid, topics, message, fault, attempts, status, first_seen_at, class) VALUES (?, ?, '', ?, 1, 'failing', ?, ?) \
      ON CONFLICT(txid, topics) DO UPDATE SET fault = excluded.fault, attempts = mutation_dead_letters.attempts + 1, class = excluded.class \
      WHERE mutation_dead_letters.status != 'parked'";
+/// Binds: txid, topics, fault, now. [`NOTE_FAILING_SQL`] for a replay whose R2 object is MISSING and not shown landed
+/// (the d3 fold-2, E585-D3-L4): the row KEEPS its class (a new row is a `fault` letter, an unknown is honest). A
+/// missing object is a fact about the bucket, not about the letter: a stranger's "not now" letter LOST at a
+/// not-now bound deletes its object under a twin he re-presented, and with the class overwritten that twin parked
+/// as a FAULT letter, outside every not-now bound (#576 D2-M1's 1000 places, one per timed re-presentation).
+pub const NOTE_FAILING_KEEP_CLASS_SQL: &str = "INSERT INTO mutation_dead_letters (txid, topics, message, fault, attempts, status, first_seen_at, class) VALUES (?, ?, '', ?, 1, 'failing', ?, 'fault') \
+     ON CONFLICT(txid, topics) DO UPDATE SET fault = excluded.fault, attempts = mutation_dead_letters.attempts + 1 \
+     WHERE mutation_dead_letters.status != 'parked'";
 /// Binds: txid, topics, message, fault (used when the row holds none), redrives (for a fresh row), now (twice), the
 /// 24 h cutoff ([`day_cutoff`]). A row already parked with these very bytes is untouched (no row returned): a DLQ
 /// redelivery parks once. Another copy of a parked key keeps the longer bytes and appends a `copy` entry (`kind`
@@ -508,6 +516,16 @@ pub fn note_failing_query(
         .bind(bounded_fault(fault))
         .bind(now_ms)
         .bind(class.as_str())
+}
+
+/// [`NOTE_FAILING_KEEP_CLASS_SQL`]'s query (E585-D3-L4).
+#[must_use]
+pub fn note_failing_keeping_class_query(txid: &str, topics: &str, fault: &str, now_ms: i64) -> Query {
+    Query::new(NOTE_FAILING_KEEP_CLASS_SQL)
+        .bind(txid)
+        .bind(topics)
+        .bind(bounded_fault(fault))
+        .bind(now_ms)
 }
 
 /// `redrives` is the count a FRESH row starts at: 0, or [`MAX_REDRIVES`] for a letter that can never be re-driven
@@ -922,6 +940,23 @@ pub async fn note_failing(
     }
 }
 
+/// [`note_failing`] for a MISSING object not shown landed: the row keeps its class (E585-D3-L4).
+pub async fn note_failing_keeping_class(
+    db: &D1Database,
+    body: &MutationMessage,
+    subject: Option<&str>,
+    fault: &str,
+) {
+    let (txid, topics) = letter_key(body, subject);
+    let now = worker::Date::now().as_millis() as i64;
+    if let Err(e) = note_failing_keeping_class_query(&txid, &topics, fault, now)
+        .execute(db)
+        .await
+    {
+        worker::console_log!("[dead-letters] the failing note of {txid} [{topics}] faulted ({e}); its park will say the fault was not recorded");
+    }
+}
+
 /// Why the main consumer acked a replay (D-L3: the log line says what happened, not "landed" for all three).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolved {
@@ -1167,8 +1202,9 @@ pub fn classes_json(fault_held: u64, not_now_held: u64, not_now_day: u64) -> ser
 }
 
 /// PURE (bsv-low #585, door 3): the health block's `r2`: the letters with bytes whose BEEF is an R2 object and the
-/// bytes at rest there (`None`: unread), whether the bucket is bound, the inline room in force, and the size past
-/// which the door refuses a replay because the consumer's policy would (`beef_limits::QUEUE_BEEF_LIMITS`).
+/// bytes at rest there (`None`: unread), whether the bucket is bound, the inline room in force, and the replay's
+/// parse limit (`beef_limits::QUEUE_BEEF_LIMITS`, the engine's own since the d3 fold-2: the door refuses nothing
+/// for its size).
 #[must_use]
 pub fn r2_json(at_rest: Option<(u64, u64)>, bound: bool, room: usize) -> serde_json::Value {
     serde_json::json!({
@@ -1247,6 +1283,7 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
         if let Some(key) = dropped {
             crate::queue::delete_beefs(env, &[key], "the lighter copy of a parked letter").await;
         }
+        let deferred = lost_deletes_object(&outcome);
         let fault = match outcome {
             Ok(Parked::Park(redrives, near)) => {
                 if let Ok(db) = &db {
@@ -1326,15 +1363,21 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
             if let Ok(db) = &db {
                 crate::ops::bump_counter(db, class.lost_counter(), 1).await;
             }
-            // door 3 (the deletion rule): the queue gives the letter up here and no row names its object
+            // door 3 (the deletion rule): the queue gives the letter up here. Only a DEFERRAL's clean read said no
+            // row names its object; a park that FAULTED may have landed (#559 limit 5), so its object is left to
+            // the sweep, which reads the named keys before it deletes (the d3 fold-2, E585-D3-L2)
             if let Some((key, bytes)) = &letter.r2 {
-                worker::console_log!("[dead-letters] LOST {txid} [{topics}]: its BEEF ({bytes} B) was the R2 object {key}, deleted with it");
-                crate::queue::delete_beefs(
-                    env,
-                    std::slice::from_ref(key),
-                    "its dead letter is LOST",
-                )
-                .await;
+                if deferred {
+                    worker::console_log!("[dead-letters] LOST {txid} [{topics}]: its BEEF ({bytes} B) was the R2 object {key}, deleted with it");
+                    crate::queue::delete_beefs(
+                        env,
+                        std::slice::from_ref(key),
+                        "its dead letter is LOST",
+                    )
+                    .await;
+                } else {
+                    worker::console_log!("[dead-letters] LOST {txid} [{topics}]: its BEEF ({bytes} B) is the R2 object {key}, LEFT to the orphan sweep (the park faulted and may have landed)");
+                }
             }
         } else {
             worker::console_log!(
@@ -1347,6 +1390,15 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
         retry_after(&m, plan.delay_s);
     }
     Ok(())
+}
+
+/// PURE (the d3 fold-2, E585-D3-L2): does a LOST letter's R2 object go with it? Only on a DEFERRAL
+/// ([`Parked::Ceiling`], [`Parked::NotNowBound`]): a clean read said no row holds the key. An `Err` (the ceiling
+/// read or the park statement faulted) may be a park that landed after its caller was told it failed (#559 limit 5),
+/// or a twin's row may hold the key: the object is left to the sweep, which reads the named keys first.
+#[must_use]
+pub fn lost_deletes_object(outcome: &std::result::Result<Parked, String>) -> bool {
+    matches!(outcome, Ok(Parked::Ceiling(_) | Parked::NotNowBound(_)))
 }
 
 /// The subject by the ONE rule (D5), as the main consumer derives it.

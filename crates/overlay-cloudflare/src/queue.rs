@@ -32,7 +32,11 @@
 //!   mode), so an ack of one message never deletes the bytes of another
 //!   topic set's.
 //! * THE WRITE comes before the enqueue; a write that faults (or a missing
-//!   binding) is the producer's 502, as a failed send is. A send that faults
+//!   binding) is the producer's 502, as a failed send is. No body is refused
+//!   for its size (the d3 fold-2, E585-D3-M1): the consumer's policy is the
+//!   engine's own (`QUEUE_BEEF_LIMITS`), so whatever `/submit` admitted rides.
+//!   Every write stamps the object's `customMetadata.touched` ([`TOUCHED_META`],
+//!   ms): the orphan sweep judges age by the later of it and R2's `uploaded`. A send that faults
 //!   after the write leaves the object (the client's re-presentation writes
 //!   the same key again): never deleted here, a twin's message may name it.
 //! * THE READ: the consumer fetches the object, checks its length and sha256
@@ -52,9 +56,15 @@
 //!   with no transaction across them, so a count could be wrong in both
 //!   directions; the applied rows are the fact the count would stand for.
 //! * THE DELETION RULE: an object is deleted on the consumer's ACK (at the
-//!   end of its batch), when its dead letter is LOST (the DLQ's last
-//!   delivery, not parked) or dropped as the lighter copy of a parked key,
-//!   and on the operator's discard. Never by a bucket expiry rule.
+//!   end of its batch), when its dead letter is LOST on a DEFERRAL (the DLQ's
+//!   last delivery, a clean read said no row holds it; a park that FAULTED
+//!   leaves it to the sweep, E585-D3-L2) or dropped as the lighter copy of a
+//!   parked key, and on the operator's discard. Never by a bucket expiry rule.
+//!   One ack LEAVES it (E585-D3-L1, [`landed_ack_leaves_object`]): a durable
+//!   replay that wrote a topic while another named topic FAILED (its manager
+//!   erred: no applied row, no fault), since a twin in flight would read it
+//!   MISSING and be judged unlanded in the failed topic; the twin replays the
+//!   bytes as the first did and its ack (nothing new written) deletes them.
 //!   `dead_letters.rs` holds the last three.
 
 use overlay_engine::beef_limits;
@@ -98,12 +108,11 @@ pub fn inline_room(var: Option<&str>) -> usize {
 /// A replay failure keeps the consumer's existing retry/dead-letter
 /// lifecycle. `_door` names where the reader stands; nothing of it is read.
 ///
-/// The bytes arrive whole, base64 in one message: the platform's 128 KB
-/// message is the bound today, held by the PRODUCER ([`QUEUE_BEEF_SIZE_LIMIT`],
-/// bsv-low #585 door 3). When the message carries a reference instead, this
-/// is the site that reads the object's body through `beef_limits::fold_beef`
-/// from the R2 binding that door adds (buckets `low-overlay-beefs-beta` and
-/// `low-overlay-beefs`); the Worker has no R2 binding at this commit.
+/// An inline body arrives whole, base64 in one message, under the platform's
+/// 128 KB message; a body past that room rides by key in R2 (bsv-low #585
+/// door 3) and its object's bytes are read through the same door by
+/// [`check_replay_blob`]. Neither the producer nor the replay refuses a body
+/// for its size.
 pub(crate) fn decode_beef_b64(
     encoded: &str,
     _door: &overlay_engine::beef_limits::BeefLimits,
@@ -337,35 +346,28 @@ fn inline_message(
 }
 
 /// PURE: the replay message for an admission whose Phase-3 writes did not all land, and how it rides (bsv-low
-/// #585, door 3). Inline while its worst form fits `room` (no change below it); past it, by key. `replay_limits`
-/// is the CONSUMER's policy (`beef_limits::QUEUE_BEEF_LIMITS` at the door): a body the replay would refuse for its
-/// size is refused HERE (`Err`, the route's 502), since an ack over a message whose every replay is a refusal is
-/// an ack over a dropped write. That is the consumer's bound read by name, no cap of the producer's: it lifts
-/// when that policy does.
+/// #585, door 3). Inline while its worst form fits `room` (no change below it); past it, by key. It refuses
+/// NOTHING for its size (the d3 fold-2, E585-D3-M1: the base refused a body past the consumer's 90,000 bytes
+/// here, so no object was ever written and a "not now" over a large BEEF answered 502 on every presentation,
+/// #568): the consumer parses under `beef_limits::QUEUE_BEEF_LIMITS`, the engine's own, which is what `/submit`
+/// admitted. The subject is read under that policy too; a body it does not name is keyed by its hash.
+#[must_use]
 pub fn plan_replay(
     beef: &[u8],
     topics: &[String],
     mode: SubmitMode,
     reason: &str,
     room: usize,
-    replay_limits: &bsv_rs::transaction::BeefLimits,
-) -> Result<Carriage, String> {
-    if beef.len() > replay_limits.max_bytes {
-        return Err(format!(
-            "BEEF too large for the mutation queue's replay ({} B > {} B, the consumer's QUEUE_BEEF_LIMITS)",
-            beef.len(),
-            replay_limits.max_bytes
-        ));
-    }
+) -> Carriage {
     if inline_worst_len(beef.len(), topics, mode, reason) <= room {
-        return Ok(Carriage::Inline(inline_message(beef, topics, mode, reason)));
+        return Carriage::Inline(inline_message(beef, topics, mode, reason));
     }
     let sha256 = hex::encode(bsv_rs::primitives::hash::sha256(beef));
-    let txid = beef_limits::parse_beef(beef, replay_limits)
+    let txid = beef_limits::parse_beef(beef, &beef_limits::QUEUE_BEEF_LIMITS)
         .ok()
         .and_then(|mut named| crate::ef::subject_txid_of(&mut named))
         .map(|t| t.to_ascii_lowercase());
-    Ok(Carriage::R2(MutationMessage {
+    Carriage::R2(MutationMessage {
         beef_b64: String::new(),
         r2: Some(BeefRef {
             key: r2_key(&sha256, topics, mode_wire(mode)),
@@ -378,7 +380,7 @@ pub fn plan_replay(
         reason: reason.to_string(),
         redrive: None,
         ef_job: None,
-    }))
+    })
 }
 
 /// The ack decision for a submit whose Phase 3 reported `durable` (S2).
@@ -528,6 +530,86 @@ pub async fn judge_missing(
     missing_verdict(Some(subject), topics, &evicted, &applied)
 }
 
+/// What the main consumer's read of a message's bytes needs of the platform (the d3 fold-2, E585-D3-L3): the
+/// object, and the verdict over a MISSING one. The worker's ([`WorkerBytes`]) is R2 and D1; a native test gives
+/// its own, so the consumer's use of the verdict ([`read_for_replay`]) runs in the lib's tests.
+pub(crate) trait ReplayBytes {
+    async fn read_beef(&self, r: &BeefRef) -> Result<Vec<u8>, BlobFault>;
+    async fn judge_missing(&self, topics: &[String], r: &BeefRef) -> MissingVerdict;
+}
+
+/// The worker's [`ReplayBytes`]: `BEEF_BLOBS` and `OVERLAY_DB` (absent: a MISSING object is a fault).
+pub(crate) struct WorkerBytes<'a> {
+    pub env: &'a worker::Env,
+    pub db: Option<&'a worker::D1Database>,
+}
+
+impl ReplayBytes for WorkerBytes<'_> {
+    async fn read_beef(&self, r: &BeefRef) -> Result<Vec<u8>, BlobFault> {
+        read_beef(self.env, r).await
+    }
+
+    async fn judge_missing(&self, topics: &[String], r: &BeefRef) -> MissingVerdict {
+        match self.db {
+            Some(db) => judge_missing(db, topics, r).await,
+            None => MissingVerdict::Fault("OVERLAY_DB binding unavailable".to_string()),
+        }
+    }
+}
+
+/// What the main consumer does with a message before its replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadStep {
+    /// The bytes to replay (inline, or the R2 object read and checked).
+    Bytes(Vec<u8>),
+    /// The object is MISSING and the verdict ACKS it ([`MissingVerdict::Twin`] or [`MissingVerdict::Evicted`]):
+    /// no replay, no note, nothing of the message's to delete.
+    Acked(MissingVerdict),
+    /// The replay's fault: noted and handed back. `missing`: the object was MISSING and the verdict did not show it
+    /// landed; that note KEEPS the letter's class (E585-D3-L4: a missing object never promotes a "not now" letter).
+    Fault { fault: String, missing: bool },
+}
+
+/// The consumer's read of a message's bytes, and its use of the verdict over a MISSING object: a
+/// [`MissingVerdict::Fault`] is the replay's fault and NEVER an ack (the lens's mutant C1 acked every missing
+/// object). `queue_handler` runs exactly this.
+pub(crate) async fn read_for_replay<P: ReplayBytes>(p: &P, body: &MutationMessage) -> ReadStep {
+    let Some(r) = &body.r2 else {
+        return match decode_replay_beef(&body.beef_b64) {
+            Ok(b) => ReadStep::Bytes(b),
+            Err(e) => ReadStep::Fault {
+                fault: format!("invalid base64 BEEF ({e})"),
+                missing: false,
+            },
+        };
+    };
+    match p.read_beef(r).await {
+        Ok(b) => ReadStep::Bytes(b),
+        Err(f @ BlobFault::Missing(_)) => match p.judge_missing(&body.topics, r).await {
+            MissingVerdict::Fault(e) => ReadStep::Fault {
+                fault: format!("{}; {e}", f.says()),
+                missing: true,
+            },
+            acked => ReadStep::Acked(acked),
+        },
+        Err(f) => ReadStep::Fault {
+            fault: f.says(),
+            missing: false,
+        },
+    }
+}
+
+/// PURE (the d3 fold-2, E585-D3-L1): does the `Landed` ack of a keyed message LEAVE its object? Yes when the
+/// replay WROTE a topic (`applied`) while another topic it names FAILED (neither applied nor `deduped`: its manager
+/// erred, a durable report with no fault and no applied row). A twin of it in flight would find the object MISSING
+/// and no applied row in the failed topic: a fault letter for good over bytes that did land. Left, the twin reads
+/// them and replays as the first did (the landed topic a dupe, the failed one failing again: durable, nothing
+/// written), and THAT ack deletes them. The sweep is the backstop for an object no twin follows (8 days).
+#[must_use]
+pub fn landed_ack_leaves_object(topics: &[String], applied: &[String], deduped: &[String]) -> bool {
+    !applied.is_empty() && topics.iter().any(|t| !applied.contains(t) && !deduped.contains(t))
+}
+
 /// The consumer's read of a keyed message's bytes: the object, checked ([`check_replay_blob`]).
 pub async fn read_beef(env: &worker::Env, r: &BeefRef) -> Result<Vec<u8>, BlobFault> {
     let bucket = env
@@ -550,15 +632,28 @@ pub async fn read_beef(env: &worker::Env, r: &BeefRef) -> Result<Vec<u8>, BlobFa
     Ok(bytes)
 }
 
+/// The object's own write stamp (the d3 fold-2, E585-D3-L3 and N2 (b)): `customMetadata.touched`, the writer's
+/// clock in ms, written by EVERY put. The orphan sweep reads the later of it and R2's `uploaded`, so whether the
+/// platform renews `uploaded` when a key is written again no longer decides an orphan's age.
+pub const TOUCHED_META: &str = "touched";
+
+/// PURE: the custom metadata of a put at `now_ms`.
+#[must_use]
+pub fn touched_meta(now_ms: i64) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([(TOUCHED_META.to_string(), now_ms.to_string())])
+}
+
 /// The producer's write, BEFORE the enqueue. R2 checks the sha256 it is given against what it stored.
 async fn put_beef(env: &worker::Env, r: &BeefRef, beef: &[u8]) -> Result<(), String> {
     let bucket = env
         .bucket(BEEF_BLOBS_BINDING)
         .map_err(|e| format!("{BEEF_BLOBS_BINDING} binding unavailable: {e}"))?;
     let digest = bsv_rs::primitives::hash::sha256(beef).to_vec();
+    let now_ms = worker::Date::now().as_millis() as i64;
     match bucket
         .put(r.key.as_str(), beef.to_vec())
         .sha256(digest)
+        .custom_metadata(touched_meta(now_ms))
         .execute()
         .await
     {
@@ -618,9 +713,9 @@ pub async fn delete_beefs(env: &worker::Env, keys: &[String], why: &str) -> Vec<
 }
 
 /// Enqueue the S2 replay for an undurable admission. `Err` names why the
-/// bytes are NOT in the queue (a body the replay's policy refuses, a missing
-/// binding, an R2 write or a send that faulted) so the route can refuse with
-/// the reason. A body past the inline room is written to R2 BEFORE the send.
+/// bytes are NOT in the queue (a missing binding, an R2 write or a send that
+/// faulted) so the route can refuse with the reason; never the body's size. A
+/// body past the inline room is written to R2 BEFORE the send.
 pub async fn enqueue_replay(
     env: &worker::Env,
     beef: &[u8],
@@ -633,14 +728,7 @@ pub async fn enqueue_replay(
             .map(|v| v.to_string())
             .as_deref(),
     );
-    let carriage = plan_replay(
-        beef,
-        topics,
-        mode,
-        REPLAY_REASON_PHASE3_FAULT,
-        room,
-        &beef_limits::QUEUE_BEEF_LIMITS,
-    )?;
+    let carriage = plan_replay(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room);
     if let Carriage::R2(msg) = &carriage {
         if let Some(r) = &msg.r2 {
             put_beef(env, r, beef).await?;
@@ -691,10 +779,6 @@ mod tests {
         );
     }
 
-    fn wide() -> bsv_rs::transaction::BeefLimits {
-        beef_limits::SUBMIT_BEEF_LIMITS
-    }
-
     fn pattern(n: usize) -> Vec<u8> {
         (0..n)
             .map(|i| (i.wrapping_mul(31).wrapping_add(7) & 0xff) as u8)
@@ -716,9 +800,7 @@ mod tests {
                 SubmitMode::HistoricalTxNoSpv,
                 REPLAY_REASON_PHASE3_FAULT,
                 QUEUE_MESSAGE_ROOM,
-                &wide(),
-            )
-            .unwrap();
+            );
             let Carriage::Inline(msg) = &plan else {
                 panic!("{n} B rides inline, got {plan:?}")
             };
@@ -740,21 +822,17 @@ mod tests {
                 );
             }
         }
-        // under the consumer's policy as it stands, too: everything the old 90,000-byte cap let through is inline
-        let at_old_cap = pattern(90_000);
-        if beef_limits::QUEUE_BEEF_LIMITS.max_bytes >= 90_000 {
-            assert!(matches!(
-                plan_replay(
-                    &at_old_cap,
-                    &topics,
-                    SubmitMode::HistoricalTx,
-                    "x",
-                    QUEUE_MESSAGE_ROOM,
-                    &beef_limits::QUEUE_BEEF_LIMITS
-                ),
-                Ok(Carriage::Inline(_))
-            ));
-        }
+        // everything the old 90,000-byte cap let through is inline
+        assert!(matches!(
+            plan_replay(
+                &pattern(90_000),
+                &topics,
+                SubmitMode::HistoricalTx,
+                "x",
+                QUEUE_MESSAGE_ROOM,
+            ),
+            Carriage::Inline(_)
+        ));
     }
 
     /// Door 3: the room is measured on the real envelope in its WORST form (the lever's re-driven message), with no
@@ -804,9 +882,8 @@ mod tests {
                 mode,
                 REPLAY_REASON_PHASE3_FAULT,
                 QUEUE_MESSAGE_ROOM,
-                &wide()
             ),
-            Ok(Carriage::Inline(_))
+            Carriage::Inline(_)
         ));
         assert!(matches!(
             plan_replay(
@@ -815,9 +892,8 @@ mod tests {
                 mode,
                 REPLAY_REASON_PHASE3_FAULT,
                 QUEUE_MESSAGE_ROOM,
-                &wide()
             ),
-            Ok(Carriage::R2(_))
+            Carriage::R2(_)
         ));
         let low: Vec<String> = (0..13).map(|i| format!("tm_low_topic_{i:02}")).collect();
         assert!(
@@ -851,9 +927,7 @@ mod tests {
             SubmitMode::CurrentTx,
             REPLAY_REASON_PHASE3_FAULT,
             QUEUE_MESSAGE_ROOM,
-            &wide(),
-        )
-        .unwrap();
+        );
         let Carriage::R2(msg) = &plan else {
             panic!("500 KB rides by key, got inline")
         };
@@ -899,25 +973,6 @@ mod tests {
         assert!(check_blob(&other, &beef)
             .unwrap_err()
             .contains("does not name"));
-        // the consumer's policy, by name: the door refuses what the replay would refuse, and carries it once the
-        // policy admits it (no cap of the door's own)
-        let at_the_door = plan_replay(
-            &beef,
-            &topics,
-            SubmitMode::CurrentTx,
-            REPLAY_REASON_PHASE3_FAULT,
-            QUEUE_MESSAGE_ROOM,
-            &beef_limits::QUEUE_BEEF_LIMITS,
-        );
-        if beef_limits::QUEUE_BEEF_LIMITS.max_bytes >= beef.len() {
-            assert_eq!(at_the_door.unwrap(), plan);
-        } else {
-            let e = at_the_door.unwrap_err();
-            assert!(
-                e.contains("QUEUE_BEEF_LIMITS") && e.contains("500000 B"),
-                "{e}"
-            );
-        }
     }
 
     /// Door 3: one object per (bytes, topics, mode): the topic ORDER does not matter, another topic set or mode is
@@ -976,13 +1031,14 @@ mod tests {
         let lib = code(include_str!("lib.rs"));
         let start = lib.find("async fn queue_handler(").unwrap();
         let h = &lib[start..start + lib[start..].find("\n}\n").unwrap()];
-        assert!(h.contains("crate::queue::read_beef(&env, r).await"));
+        assert!(h.contains("crate::queue::read_for_replay(&ports, body).await"));
         assert_eq!(
             h.matches("acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));")
                 .count()
                 + 1,
             h.matches("msg.ack();").count(),
-            "every ack deletes its object, but the one of a message whose object was MISSING (the d3 fold)"
+            "every ack deletes its object, but the one of a message whose object was MISSING (the d3 fold); the Landed \
+             one unless a failed topic leaves it for a twin (the d3 fold-2, L1)"
         );
         let (last_ack, delete) = (
             h.rfind("msg.ack();").unwrap(),

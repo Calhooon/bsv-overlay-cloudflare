@@ -386,7 +386,7 @@
    "rebuild_class": "chain",
    "never_wipe": false,
    "holds": "the engine's applied-transaction marks",
-   "why": "dedup marks, re-derived on re-admission; the successor rule reads a row as landed (bsv-low #575), so never wiped without outputs"
+   "why": "dedup marks, re-derived on re-admission; the successor rule reads a row as landed (bsv-low #575), and so does the queue consumer's twin rule for a message whose R2 object is MISSING (bsv-low #585 door 3, queue.rs TWIN_APPLIED_SQL), so never wiped without outputs"
   },
   {
    "name": "low_records",
@@ -1302,6 +1302,14 @@
     "owner": "low-watchtower",
     "holds": "BRC-103 sessions",
     "never_wipe": false
+   }
+  ],
+  "overlay-cloudflare": [
+   {
+    "store": "R2 BEEF_BLOBS (low-overlay-beefs, low-overlay-beefs-beta; overlay-beefs for wrangler.toml), keys `mutations/<sha256>/<scope>`",
+    "owner": "overlay-cloudflare",
+    "holds": "the queued BEEF of a replay past the queue's inline room (bsv-low #585 door 3): the ONLY copy of a parked keyed dead letter's bytes (`mutation_dead_letters.r2_key`). Deleted only by the deletion rule (an ack, a LOST deferral, the copy rule, the operator's discard) and the orphan sweep (past 8 days, named by no row); no bucket expiry rule",
+    "never_wipe": true
    }
   ],
   "low-relay (rust-message-box)": [

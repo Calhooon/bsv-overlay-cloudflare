@@ -46,7 +46,7 @@ The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` r
 |---|---|---|---|---|---|---|
 | `outputs` | overlay-cloudflare | none | none | chain | no | re-admission or a GASP peer re-feeds it; chain bytes |
 | `transactions` | overlay-cloudflare | none | low-app-layer | chain | no | the BEEF ancestry `/beef` and `/credit-beef` serve; a wipe is a re-fetch, not a loss |
-| `applied_transactions` | overlay-cloudflare | none | none | chain | no | dedup marks, re-derived on re-admission; the successor rule reads a row as landed (bsv-low #575), so never wiped without `outputs` |
+| `applied_transactions` | overlay-cloudflare | none | none | chain | no | dedup marks, re-derived on re-admission; the successor rule reads a row as landed (bsv-low #575), and so does the queue consumer's twin rule for a message whose R2 object is MISSING (bsv-low #585 door 3, `TWIN_APPLIED_SQL`), so never wiped without `outputs` |
 | `low_records` | overlay-cloudflare | none | none | chain | no | lobby ads ride on chain |
 | `reveal_records` | overlay-cloudflare | none | none | chain | no | on chain; the tower's reveal scan falls back to the couriers, a wipe degrades, never concedes |
 | `pot_records` | overlay-cloudflare | low-app-layer: ALTER | low-app-layer | chain | **yes** | THE landing proof every credit reads (#470 section 3 item 7); every column re-derives from chain bytes only with a re-scan nobody has |
@@ -177,6 +177,12 @@ No cross-worker access exists today: each store below is read and written only b
 | store | owner | holds | never-wipe |
 |---|---|---|---|
 | the header store behind the `CHAINTRACKS` service binding (the overlay's and the identity node's) | rust-chaintracks | the block headers every merkle proof is checked against (#470 section 3 item 9) | **yes** |
+
+### The overlay (`overlay-cloudflare`)
+
+| store | owner | holds | never-wipe |
+|---|---|---|---|
+| R2 `BEEF_BLOBS` (`low-overlay-beefs`, `low-overlay-beefs-beta`; `overlay-beefs` for `wrangler.toml`), keys `mutations/<sha256>/<scope>` (bsv-low #585 door 3) | overlay-cloudflare | the queued BEEF of a replay past the queue's inline room: the ONLY copy of a parked keyed dead letter's bytes (`mutation_dead_letters.r2_key`). Deleted only by the deletion rule (an ack, a LOST deferral, the copy rule, the operator's discard) and the orphan sweep (past 8 days, named by no row); no bucket expiry rule | **yes** (a wipe turns every parked keyed letter into a fault letter with no bytes) |
 
 ### The relay (`~/bsv/rust-message-box`, `low-relay`)
 

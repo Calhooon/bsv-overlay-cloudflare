@@ -422,8 +422,10 @@ ci-route: ci-d1-budget
 # returned and re-driven, a forced re-drive of an exhausted letter, a bad-base64 replay dead-lettered and parked.
 # Then bsv-low #585 door 3's cell (`tools/lane-e585`, the overlay given `MUTATION_QUEUE_INLINE_ROOM:4096`, which
 # leaves every other cell's sub-kilobyte messages inline): ~8 KB "not now" letters written to the local R2 bucket,
-# parked by KEY, re-driven from R2 and landed (the object gone after the ack), a missing object parked as a fault,
-# a discard deleting the object, and a 500 KB submission under the consumer's policy as it stands.
+# parked by KEY, re-driven from R2 and landed (the object gone after the ack), a missing object parked again with its
+# class kept, a discard deleting the object, a 500 KB "not now" submission carried whole (#568), and the d3 fold-2's
+# legs: a twin acked over a missing object, the orphan sweep through `/__scheduled` (the overlay runs with
+# `--test-scheduled`), and a put twice moving the object's `touched` stamp.
 #
 # Ports: LANE_BASE+9 (app layer) and LANE_BASE+10 (overlay), :8800 and :8801 by default; the same pre-flight,
 # bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network: no
@@ -488,7 +490,7 @@ ci-d1-budget:
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PA/health "$$app_log" "app layer"; \
 	echo "→ starting wrangler dev :$$PO (the overlay, tm_collected, ARCADE_URL a closed port)…"; \
-	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$PO --ip 127.0.0.1 --persist-to "$$ov_state" \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --test-scheduled --port $$PO --ip 127.0.0.1 --persist-to "$$ov_state" \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \

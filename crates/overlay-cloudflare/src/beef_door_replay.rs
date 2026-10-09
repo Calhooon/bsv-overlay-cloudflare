@@ -160,9 +160,7 @@ fn e585_d3_a_valid_500kb_beef_is_keyed_by_its_subject_and_replays_under_the_cons
         SubmitMode::HistoricalTx,
         queue::REPLAY_REASON_PHASE3_FAULT,
         queue::QUEUE_MESSAGE_ROOM,
-        &SUBMIT_BEEF_LIMITS,
-    )
-    .unwrap();
+    );
     let queue::Carriage::R2(msg) = plan else {
         panic!("500 KB rides by key")
     };
@@ -187,9 +185,7 @@ fn e585_d3_a_valid_500kb_beef_is_keyed_by_its_subject_and_replays_under_the_cons
         SubmitMode::HistoricalTx,
         queue::REPLAY_REASON_PHASE3_FAULT,
         queue::QUEUE_MESSAGE_ROOM_MIN,
-        &QUEUE_BEEF_LIMITS,
-    )
-    .unwrap();
+    );
     let queue::Carriage::R2(msg) = plan else {
         panic!("8 KB rides by key under a 1 KB room")
     };
@@ -206,9 +202,8 @@ fn e585_d3_a_valid_500kb_beef_is_keyed_by_its_subject_and_replays_under_the_cons
             SubmitMode::HistoricalTx,
             queue::REPLAY_REASON_PHASE3_FAULT,
             queue::QUEUE_MESSAGE_ROOM,
-            &QUEUE_BEEF_LIMITS
         ),
-        Ok(queue::Carriage::Inline(_))
+        queue::Carriage::Inline(_)
     ));
 }
 
@@ -262,63 +257,161 @@ mod twin {
     /// What one delivery of a keyed message came to at the main consumer.
     #[derive(Debug, PartialEq, Eq)]
     enum Delivered {
-        /// Read, replayed, durable: acked, its object deleted (the deletion rule).
-        Landed,
+        /// Read, replayed, durable: acked. `left`: its object was LEFT (the d3 fold-2, L1), else deleted.
+        Landed { left: bool },
         /// Its object was MISSING and the verdict acked it: no note, no letter.
         Acked(queue::MissingVerdict),
         /// Handed back with this fault noted (it dead-letters and is parked).
         Fault(String),
     }
 
-    /// The consumer as `queue_handler` runs a keyed message, over a bucket and the shipped statements: the read,
-    /// the check, the replay (its landing is the storage's applied rows), the ack's delete; and, on a MISSING
-    /// object, the REAL verdict over the REAL read of the applied rows.
+    /// The replay as the engine reports it, per topic the message names: already applied (a dupe), FAILED (the
+    /// manager erred: no row, no fault), "not now" (`predecessor_not_landed`, a fault), or landed.
+    #[derive(Clone, Copy)]
+    struct Replay<'a> {
+        fails: &'a [&'a str],
+        not_now: bool,
+    }
+    const LANDS: Replay<'static> = Replay {
+        fails: &[],
+        not_now: false,
+    };
+
+    /// The platform under the consumer's read: a bucket and the storage's applied rows, read by the SHIPPED
+    /// statement and judged by the SHIPPED verdict.
+    struct Ports<'a> {
+        bucket: &'a HashMap<String, Vec<u8>>,
+        conn: &'a rusqlite::Connection,
+    }
+
+    impl queue::ReplayBytes for Ports<'_> {
+        async fn read_beef(&self, r: &queue::BeefRef) -> Result<Vec<u8>, queue::BlobFault> {
+            let bytes = self
+                .bucket
+                .get(&r.key)
+                .ok_or_else(|| queue::BlobFault::Missing(r.key.clone()))?;
+            queue::check_replay_blob(r, bytes).map_err(queue::BlobFault::Refused)?;
+            Ok(bytes.clone())
+        }
+
+        async fn judge_missing(&self, topics: &[String], r: &queue::BeefRef) -> queue::MissingVerdict {
+            let applied = r.txid.as_deref().map_or_else(Vec::new, |t| applied(self.conn, t));
+            queue::missing_verdict(r.txid.as_deref(), topics, &Ok(false), &Ok(applied))
+        }
+    }
+
+    fn applied(conn: &rusqlite::Connection, txid: &str) -> Vec<String> {
+        conn.prepare(queue::TWIN_APPLIED_SQL)
+            .unwrap()
+            .query_map([txid], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// The consumer as `queue_handler` runs a message: the SHIPPED read and use of the verdict
+    /// (`queue::read_for_replay`), the replay (its landing is the storage's applied rows), the SHIPPED ack rule
+    /// (`queue::landed_ack_leaves_object`) and the notes by the SHIPPED statements, as the handler's arms call them.
     struct Consumer {
         bucket: HashMap<String, Vec<u8>>,
         conn: rusqlite::Connection,
     }
 
     impl Consumer {
-        fn applied(&self, txid: &str) -> Vec<String> {
-            self.conn
-                .prepare(queue::TWIN_APPLIED_SQL)
-                .unwrap()
-                .query_map([txid], |r| r.get::<_, String>(0))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
+        fn new() -> Self {
+            Self {
+                bucket: HashMap::new(),
+                conn: db(),
+            }
         }
 
-        fn deliver(&mut self, m: &queue::MutationMessage, lands_in: &[&str]) -> Delivered {
-            let r = m.r2.as_ref().unwrap();
-            let Some(bytes) = self.bucket.get(&r.key) else {
-                let fault = queue::BlobFault::Missing(r.key.clone());
-                let applied = r.txid.as_deref().map_or_else(Vec::new, |t| self.applied(t));
-                return match queue::missing_verdict(
-                    r.txid.as_deref(),
-                    &m.topics,
-                    &Ok(false),
-                    &Ok(applied),
-                ) {
-                    queue::MissingVerdict::Fault(e) => {
-                        Delivered::Fault(format!("{}; {e}", fault.says()))
-                    }
-                    acked => Delivered::Acked(acked),
-                };
+        fn applied(&self, txid: &str) -> Vec<String> {
+            applied(&self.conn, txid)
+        }
+
+        /// The door's write of a keyed message's object (`put_beef`), before its send.
+        fn put(&mut self, m: &queue::MutationMessage, beef: &[u8]) {
+            self.bucket
+                .insert(m.r2.as_ref().unwrap().key.clone(), beef.to_vec());
+        }
+
+        fn note(&self, m: &queue::MutationMessage, subject: Option<&str>, fault: &str, class: Option<dead_letters::LetterClass>) {
+            let (txid, topics) = dead_letters::letter_key(m, subject);
+            let q = match class {
+                Some(c) => dead_letters::note_failing_query(&txid, &topics, fault, 10, c),
+                None => dead_letters::note_failing_keeping_class_query(&txid, &topics, fault, 10),
             };
-            queue::check_blob(r, bytes).unwrap();
-            let subject = r.txid.clone().unwrap();
-            for topic in lands_in {
-                self.conn
-                    .execute(APPLIED_INSERT, [subject.as_str(), topic])
-                    .unwrap();
+            run(&self.conn, &q);
+        }
+
+        fn deliver(&mut self, m: &queue::MutationMessage, replay: Replay<'_>) -> Delivered {
+            let step = block_on(queue::read_for_replay(
+                &Ports {
+                    bucket: &self.bucket,
+                    conn: &self.conn,
+                },
+                m,
+            ));
+            let bytes = match step {
+                queue::ReadStep::Bytes(b) => b,
+                queue::ReadStep::Acked(v) => return Delivered::Acked(v),
+                queue::ReadStep::Fault { fault, missing } => {
+                    let class = (!missing).then_some(dead_letters::LetterClass::Fault);
+                    self.note(m, None, &fault, class);
+                    return Delivered::Fault(fault);
+                }
+            };
+            let mut named = beef_limits::parse_beef(&bytes, &QUEUE_BEEF_LIMITS).unwrap();
+            let subject = ef::subject_txid_of(&mut named).unwrap();
+            let held = self.applied(&subject);
+            let (mut applied, mut deduped) = (Vec::new(), Vec::new());
+            for t in &m.topics {
+                if held.contains(t) {
+                    deduped.push(t.clone());
+                } else if replay.fails.contains(&t.as_str()) {
+                } else if replay.not_now {
+                    let fault = format!("not durable: {t}/{}: not now", dead_letters::SITE_NOT_NOW);
+                    self.note(m, Some(&subject), &fault, Some(dead_letters::LetterClass::of_sites([dead_letters::SITE_NOT_NOW])));
+                    return Delivered::Fault(fault);
+                } else {
+                    self.conn
+                        .execute(APPLIED_INSERT, [subject.as_str(), t.as_str()])
+                        .unwrap();
+                    applied.push(t.clone());
+                }
             }
-            if m.topics.iter().all(|t| lands_in.contains(&t.as_str())) {
-                self.bucket.remove(&r.key);
-                Delivered::Landed
-            } else {
-                Delivered::Fault("not durable".to_string())
+            let left = m.r2.is_some() && queue::landed_ack_leaves_object(&m.topics, &applied, &deduped);
+            if !left {
+                if let Some(r) = &m.r2 {
+                    self.bucket.remove(&r.key);
+                }
             }
+            Delivered::Landed { left }
+        }
+
+        /// The DLQ consumer's park of `m` (its key, no bytes read), by the shipped statement.
+        fn park(&self, m: &queue::MutationMessage) {
+            let (txid, tkey) = dead_letters::letter_key(m, None);
+            let r = m.r2.as_ref().unwrap();
+            run(
+                &self.conn,
+                &dead_letters::park_query_r2(
+                    &txid,
+                    &tkey,
+                    &serde_json::to_string(m).unwrap(),
+                    dead_letters::FAULT_UNRECORDED,
+                    0,
+                    20,
+                    Some((r.key.as_str(), r.bytes)),
+                ),
+            );
         }
 
         fn letters(&self) -> Vec<(String, String, String)> {
@@ -339,9 +432,7 @@ mod twin {
             SubmitMode::HistoricalTx,
             queue::REPLAY_REASON_PHASE3_FAULT,
             queue::QUEUE_MESSAGE_ROOM,
-            &SUBMIT_BEEF_LIMITS,
-        )
-        .unwrap() else {
+        ) else {
             panic!("500 KB rides by key")
         };
         m
@@ -360,22 +451,19 @@ mod twin {
         let (first, second) = (keyed(&beef, &topics), keyed(&beef, &topics));
         assert_eq!(first, second, "the same bytes, topics and mode: twins");
         let key = first.r2.as_ref().unwrap().key.clone();
-        let mut c = Consumer {
-            bucket: HashMap::new(),
-            conn: db(),
-        };
+        let mut c = Consumer::new();
         // the door: each submission's write, then its send
-        c.bucket.insert(key.clone(), beef.clone());
-        c.bucket.insert(key.clone(), beef.clone());
+        c.put(&first, &beef);
+        c.put(&second, &beef);
         assert_eq!(c.bucket.len(), 1, "one object for the two");
 
-        assert_eq!(c.deliver(&first, &["tm_a", "tm_b"]), Delivered::Landed);
+        assert_eq!(c.deliver(&first, LANDS), Delivered::Landed { left: false });
         assert!(
             !c.bucket.contains_key(&key),
             "the ack deleted the object (the deletion rule stays on the ack)"
         );
         assert_eq!(
-            c.deliver(&second, &[]),
+            c.deliver(&second, LANDS),
             Delivered::Acked(queue::MissingVerdict::Twin),
             "the second twin is a dupe: on 45aceff it parks as a fault"
         );
@@ -385,39 +473,16 @@ mod twin {
         let (other, other_id) = shapes::sized_body(500_001);
         assert_ne!(other_id, id);
         let third = keyed(&other, &topics);
-        let Delivered::Fault(fault) = c.deliver(&third, &[]) else {
+        let Delivered::Fault(fault) = c.deliver(&third, LANDS) else {
             panic!("a missing object nothing shows landed is a fault")
         };
         assert!(
             fault.contains("MISSING") && fault.contains("holds no applied row in [tm_a,tm_b]"),
             "{fault}"
         );
-        // noted and parked as the consumers do: a FAULT letter, never "not now"
-        let r = third.r2.as_ref().unwrap();
-        let (txid, tkey) = dead_letters::letter_key(&third, None);
-        assert_eq!(txid, other_id);
-        run(
-            &c.conn,
-            &dead_letters::note_failing_query(
-                &txid,
-                &tkey,
-                &fault,
-                10,
-                dead_letters::LetterClass::Fault,
-            ),
-        );
-        run(
-            &c.conn,
-            &dead_letters::park_query_r2(
-                &txid,
-                &tkey,
-                &serde_json::to_string(&third).unwrap(),
-                dead_letters::FAULT_UNRECORDED,
-                0,
-                20,
-                Some((r.key.as_str(), r.bytes)),
-            ),
-        );
+        // noted (no earlier note: a FAULT letter, an unknown is honest) and parked as the consumers do
+        assert_eq!(dead_letters::letter_key(&third, None).0, other_id);
+        c.park(&third);
         assert_eq!(
             c.letters(),
             vec![(other_id.clone(), "parked".to_string(), "fault".to_string())]
@@ -427,7 +492,7 @@ mod twin {
         c.conn
             .execute(APPLIED_INSERT, [other_id.as_str(), "tm_a"])
             .unwrap();
-        let Delivered::Fault(fault) = c.deliver(&third, &[]) else {
+        let Delivered::Fault(fault) = c.deliver(&third, LANDS) else {
             panic!("half landed is a fault")
         };
         assert!(fault.contains("holds no applied row in [tm_b]"), "{fault}");
@@ -436,7 +501,7 @@ mod twin {
             .execute(APPLIED_INSERT, [other_id.as_str(), "tm_b"])
             .unwrap();
         assert_eq!(
-            c.deliver(&third, &[]),
+            c.deliver(&third, LANDS),
             Delivered::Acked(queue::MissingVerdict::Twin)
         );
     }
@@ -494,26 +559,38 @@ mod twin {
         assert!(f.contains("crate::admit_fast::open_eviction(db, subject)"));
         assert!(f.contains("Query::new(TWIN_APPLIED_SQL)"));
         assert!(f.contains("missing_verdict(Some(subject), topics, &evicted, &applied)"));
+        // the d3 fold-2 (L3): the read and the use of the verdict are `read_for_replay` (run natively by the pins
+        // below); the handler only acts on its step
+        let start = q.find("pub(crate) async fn read_for_replay<").unwrap();
+        let f = &q[start..start + q[start..].find("\n}\n").unwrap()];
+        assert!(f.contains("Err(f @ BlobFault::Missing(_)) => match p.judge_missing(&body.topics, r).await"));
         let lib = code(include_str!("lib.rs"));
         let start = lib.find("async fn queue_handler(").unwrap();
         let h = &lib[start..start + lib[start..].find("\n}\n").unwrap()];
+        assert!(h.contains("crate::queue::read_for_replay(&ports, body).await"));
+        assert!(!h.contains("judge_missing") && !h.contains("read_beef"), "the handler reads nothing itself");
         let arm = h
-            .find("Err(f @ crate::queue::BlobFault::Missing(_)) =>")
-            .expect("the consumer judges a MISSING object");
-        let end = arm + h[arm..].find("Err(f) => Err(f.says()),").unwrap();
+            .find("crate::queue::ReadStep::Acked(verdict) => {")
+            .expect("the handler acks only the verdict's ack");
+        let end = arm + h[arm..].find("crate::queue::ReadStep::Fault { fault, missing } => {").unwrap();
+        let fault_arm = &h[end..end + h[end..].find("msg.retry();").unwrap()];
         let arm = &h[arm..end];
-        assert!(arm.contains("crate::queue::judge_missing(db, &body.topics, r).await"));
         assert!(arm.contains("crate::ops::COUNTER_QUEUE_R2_TWIN_ACKED"));
-        assert!(arm.contains("crate::ops::COUNTER_QUEUE_R2_MISSING_FAULT"));
         assert!(arm.contains("crate::dead_letters::Resolved::Twin"));
         assert_eq!(arm.matches("msg.ack();").count(), 1);
         assert!(
             !arm.contains("note_failing") && !arm.contains("msg.retry()"),
-            "a twin is acked with no note; the fault falls through to the one note below"
+            "a twin is acked with no note"
         );
         assert!(
             !arm.contains("body.r2.as_ref().map(|r| r.key.clone())"),
             "nothing of the message's to delete: its object is gone"
+        );
+        assert!(
+            !fault_arm.contains("msg.ack()")
+                && fault_arm.contains("crate::ops::COUNTER_QUEUE_R2_MISSING_FAULT")
+                && fault_arm.contains("crate::dead_letters::note_failing_keeping_class(db, body, None, &fault)"),
+            "a fault is noted (a MISSING one keeping the letter's class, L4) and handed back, never acked"
         );
         assert_eq!(
             crate::ops::COUNTER_QUEUE_R2_TWIN_ACKED,
@@ -523,5 +600,250 @@ mod twin {
             crate::ops::COUNTER_QUEUE_R2_MISSING_FAULT,
             "queue_r2_missing_fault_total"
         );
+    }
+
+    // ── bsv-low #585, the d3 fold-2 (the door 3 lens's M1, L1, L2, L3, L4) ────────────────────────────────────────
+
+    /// E585-D3-M1 (#568): the door never refuses a body for its size. A VALID 500 KB BEEF whose replay is "not now"
+    /// is carried by key under the SHIPPED policy (the route's `enqueue_replay` plans exactly this), the door's ack
+    /// is the queued one (the route answers it with `X-Overlay-Mutation: queued`), its object is the bytes under the
+    /// key; the consumer READS it, notes the not-now class, and the DLQ parks the letter with its key while the
+    /// object stays at rest. A 500 KB body that lands is acked and its object deleted. RED on `bc32851`: the plan
+    /// answered `Err("BEEF too large for the mutation queue's replay (500000 B > 90000 B, ...)")`, the route's 502.
+    #[test]
+    fn e585_d3f2_m1_a_500kb_not_now_body_is_queued_by_key_and_parked_with_its_bytes_at_rest() {
+        let topics = vec!["tm_a".to_string()];
+        let (beef, id) = shapes::sized_body(500_000);
+        assert_eq!(
+            QUEUE_BEEF_LIMITS.max_bytes,
+            ENGINE_BEEF_LIMITS.max_bytes,
+            "the queue parses what the engine admits"
+        );
+        let m = keyed(&beef, &topics);
+        let r = m.r2.clone().unwrap();
+        let sha = hex::encode(bsv_rs::primitives::hash::sha256(&beef));
+        assert_eq!(r.key, queue::r2_key(&sha, &topics, "historical-tx"));
+        assert_eq!((r.bytes, r.txid.as_deref()), (500_000, Some(id.as_str())));
+        assert_eq!(
+            queue::mutation_ack(false, Some(Ok(()))),
+            queue::MutationAck::Queued,
+            "the enqueue answered: the door acks queued"
+        );
+        let code = |s: &str| {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let q = code(include_str!("queue.rs"));
+        let start = q.find("pub async fn enqueue_replay(").unwrap();
+        let f = &q[start..start + q[start..].find("\n}\n").unwrap()];
+        assert!(f.contains("plan_replay(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room)"));
+        assert!(!f.contains("max_bytes") && !q.contains("too large for the mutation queue"));
+        assert!(include_str!("routes.rs").contains(r#"h.set("X-Overlay-Mutation", "queued")"#));
+
+        let mut c = Consumer::new();
+        c.put(&m, &beef);
+        let Delivered::Fault(fault) = c.deliver(
+            &m,
+            Replay {
+                fails: &[],
+                not_now: true,
+            },
+        ) else {
+            panic!("the replay is not now")
+        };
+        assert!(fault.contains(dead_letters::SITE_NOT_NOW), "{fault}");
+        c.park(&m);
+        assert_eq!(c.letters(), vec![(id.clone(), "parked".to_string(), "not_now".to_string())]);
+        let (key, bytes): (String, i64) = c
+            .conn
+            .query_row("SELECT r2_key, r2_bytes FROM mutation_dead_letters", [], |x| Ok((x.get(0)?, x.get(1)?)))
+            .unwrap();
+        assert_eq!((key.as_str(), bytes), (r.key.as_str(), 500_000));
+        assert_eq!(c.bucket.get(&r.key), Some(&beef), "the parked letter's bytes are at rest in R2");
+
+        // another 500 KB body that lands: acked, its object deleted by the ack
+        let (other, _) = shapes::sized_body(500_001);
+        let o = keyed(&other, &topics);
+        c.put(&o, &other);
+        assert_eq!(c.deliver(&o, LANDS), Delivered::Landed { left: false });
+        assert!(!c.bucket.contains_key(&o.r2.as_ref().unwrap().key));
+        assert!(c.bucket.contains_key(&r.key), "the parked letter's object is untouched");
+    }
+
+    /// E585-D3-L1: the lens's sequence. Twins M1 and M2 name [tm_a, tm_b]. M1 lands tm_a while tm_b's manager
+    /// ERRS (a failed topic: no applied row, no fault, durable): acked, and its object LEFT. M2 reads the bytes and
+    /// replays as M1 did (tm_a a dupe, tm_b failing again: durable, nothing written): acked, and THAT ack deletes the
+    /// object. No letter. RED on `bc32851` (every durable ack deleted the object): M2 reads it MISSING, holds no
+    /// applied row in [tm_b], and is a `fault` letter over bytes that landed.
+    #[test]
+    fn e585_d3f2_l1_a_twin_of_a_landing_with_a_failed_topic_reads_the_bytes() {
+        let topics = vec!["tm_a".to_string(), "tm_b".to_string()];
+        let (beef, id) = shapes::sized_body(500_000);
+        let (m1, m2) = (keyed(&beef, &topics), keyed(&beef, &topics));
+        let key = m1.r2.as_ref().unwrap().key.clone();
+        let mut c = Consumer::new();
+        c.put(&m1, &beef);
+        c.put(&m2, &beef);
+        let b_errs = Replay {
+            fails: &["tm_b"],
+            not_now: false,
+        };
+        let first = c.deliver(&m1, b_errs);
+        assert_eq!(c.applied(&id), vec!["tm_a".to_string()]);
+        let kept = c.bucket.contains_key(&key);
+        assert_eq!(
+            c.deliver(&m2, b_errs),
+            Delivered::Landed { left: false },
+            "M2 reads the bytes and acks as M1 did"
+        );
+        assert_eq!(first, Delivered::Landed { left: true });
+        assert!(kept, "M1's ack left the object for its twin");
+        assert!(!c.bucket.contains_key(&key), "M2's ack (nothing new written) deletes it");
+        assert!(c.letters().is_empty(), "no letter");
+        // the rule itself: a landing with no failed topic, a dupe-only replay, and a replay that wrote nothing
+        let t = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(!queue::landed_ack_leaves_object(&topics, &t(&["tm_a", "tm_b"]), &[]));
+        assert!(!queue::landed_ack_leaves_object(&topics, &t(&["tm_a"]), &t(&["tm_b"])));
+        assert!(!queue::landed_ack_leaves_object(&topics, &[], &t(&["tm_a"])));
+        assert!(!queue::landed_ack_leaves_object(&topics, &[], &[]));
+        assert!(queue::landed_ack_leaves_object(&topics, &t(&["tm_b"]), &[]));
+    }
+
+    /// E585-D3-L2: on the DLQ's last delivery a letter's object goes with it only on a DEFERRAL (a clean read said
+    /// no row holds the key); a park whose read or statement FAULTED may have landed (#559 limit 5), so its object is
+    /// LEFT to the sweep. RED on `bc32851`: every outcome that reached the LOST line deleted the object.
+    #[test]
+    fn e585_d3f2_l2_lost_deletes_the_object_only_on_a_deferral() {
+        use dead_letters::{lost_deletes_object, Deferral, Parked};
+        assert!(lost_deletes_object(&Ok(Parked::Ceiling(2000))));
+        for d in [
+            Deferral::NotNowShare(1000),
+            Deferral::NotNowTxid(1),
+            Deferral::NotNowDay(200),
+        ] {
+            assert!(lost_deletes_object(&Ok(Parked::NotNowBound(d))));
+        }
+        assert!(
+            !lost_deletes_object(&Err("D1_ERROR: the park statement timed out".to_string())),
+            "a faulted park keeps the object"
+        );
+        assert!(!lost_deletes_object(&Ok(Parked::Park(0, None))));
+        assert!(!lost_deletes_object(&Ok(Parked::Redelivery)));
+        let code = |s: &str| {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let src = code(include_str!("dead_letters.rs"));
+        let start = src.find("pub async fn park_batch(").unwrap();
+        let f = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let (decided, matched) = (
+            f.find("let deferred = lost_deletes_object(&outcome);").unwrap(),
+            f.find("let fault = match outcome {").unwrap(),
+        );
+        assert!(decided < matched, "decided over the park's own outcome");
+        let lost = f.find("if plan.last {").unwrap();
+        let gate = f[lost..].find("if deferred {").unwrap() + lost;
+        let delete = f[lost..].find("\"its dead letter is LOST\"").unwrap() + lost;
+        assert!(gate < delete, "the LOST delete is under the deferral");
+        assert_eq!(f.matches("\"its dead letter is LOST\"").count(), 1);
+    }
+
+    /// E585-D3-L3: the consumer's use of the verdict, RUN: `read_for_replay` is what `queue_handler` calls. A MISSING
+    /// object the verdict does not show landed is the replay's FAULT (noted, handed back: a letter), never an ack;
+    /// only Twin and Evicted ack. The lens's mutant C1 (call `judge_missing`, discard it, ack every missing object
+    /// as a twin) passed every pin on `bc32851` (643/0); here it fails the first assertion.
+    #[test]
+    fn e585_d3f2_l3_an_unlanded_missing_object_is_a_fault_never_an_ack() {
+        struct Fixed(Result<Vec<u8>, queue::BlobFault>, queue::MissingVerdict);
+        impl queue::ReplayBytes for Fixed {
+            async fn read_beef(&self, _: &queue::BeefRef) -> Result<Vec<u8>, queue::BlobFault> {
+                self.0.clone()
+            }
+            async fn judge_missing(&self, _: &[String], _: &queue::BeefRef) -> queue::MissingVerdict {
+                self.1.clone()
+            }
+        }
+        let topics = vec!["tm_a".to_string()];
+        let (beef, _) = shapes::sized_body(500_000);
+        let m = keyed(&beef, &topics);
+        let key = m.r2.as_ref().unwrap().key.clone();
+        let missing = || Err(queue::BlobFault::Missing(key.clone()));
+        let step = |p: Fixed| block_on(queue::read_for_replay(&p, &m));
+        let unlanded = queue::MissingVerdict::Fault("aa holds no applied row in [tm_a]: its bytes did not land".into());
+        let queue::ReadStep::Fault { fault, missing: true } = step(Fixed(missing(), unlanded)) else {
+            panic!("an unlanded missing object is acked: an ack over a dropped write")
+        };
+        assert!(fault.contains("MISSING") && fault.contains("did not land"), "{fault}");
+        for v in [queue::MissingVerdict::Twin, queue::MissingVerdict::Evicted] {
+            assert_eq!(step(Fixed(missing(), v.clone())), queue::ReadStep::Acked(v));
+        }
+        assert_eq!(
+            step(Fixed(Ok(beef.clone()), queue::MissingVerdict::Twin)),
+            queue::ReadStep::Bytes(beef.clone()),
+            "the object read: no verdict asked"
+        );
+        for f in [queue::BlobFault::Read("503".into()), queue::BlobFault::Refused("hashes to".into())] {
+            assert!(matches!(
+                step(Fixed(Err(f), queue::MissingVerdict::Twin)),
+                queue::ReadStep::Fault { missing: false, .. }
+            ));
+        }
+        let mut inline = message(b"not base64 at all");
+        inline.beef_b64 = "%%".into();
+        assert!(matches!(
+            block_on(queue::read_for_replay(&Fixed(missing(), queue::MissingVerdict::Twin), &inline)),
+            queue::ReadStep::Fault { missing: false, .. }
+        ));
+    }
+
+    /// E585-D3-L4: the lens's sequence. A stranger's large "not now" letter L is deferred at a not-now bound (a
+    /// `failing` note, class `not_now`, no bytes held). Seconds before L's last DLQ delivery he re-presents the same
+    /// bytes: the door writes the key again and M2 is queued. L is LOST on its deferral and deletes the object. M2
+    /// reads it MISSING, its subject unlanded: the replay's fault, and the note KEEPS the row's class. M2 parks as a
+    /// `not_now` letter, inside the not-now bounds. RED on `bc32851` (the note wrote class `fault`): `fault`.
+    #[test]
+    fn e585_d3f2_l4_a_missing_object_keeps_a_not_now_letters_class() {
+        let topics = vec!["tm_a".to_string()];
+        let (beef, id) = shapes::sized_body(500_000);
+        let (l, m2) = (keyed(&beef, &topics), keyed(&beef, &topics));
+        let key = l.r2.as_ref().unwrap().key.clone();
+        let mut c = Consumer::new();
+        c.put(&l, &beef);
+        let not_now = Replay {
+            fails: &[],
+            not_now: true,
+        };
+        for _ in 0..4 {
+            assert!(matches!(c.deliver(&l, not_now), Delivered::Fault(_)));
+        }
+        assert_eq!(c.letters(), vec![(id.clone(), "failing".to_string(), "not_now".to_string())]);
+        // the re-presentation's write, then L's LOST on its deferral
+        c.put(&m2, &beef);
+        assert!(dead_letters::lost_deletes_object(&Ok(dead_letters::Parked::NotNowBound(
+            dead_letters::Deferral::NotNowDay(200)
+        ))));
+        c.bucket.remove(&key);
+        for _ in 0..4 {
+            let Delivered::Fault(fault) = c.deliver(&m2, not_now) else {
+                panic!("M2's object is missing and its subject unlanded")
+            };
+            assert!(fault.contains("MISSING"), "{fault}");
+        }
+        assert_eq!(
+            c.letters(),
+            vec![(id.clone(), "failing".to_string(), "not_now".to_string())],
+            "the missing object did not promote the letter"
+        );
+        c.park(&m2);
+        assert_eq!(c.letters(), vec![(id, "parked".to_string(), "not_now".to_string())]);
+        // a fresh row (no earlier note) is a fault letter: an unknown is honest
+        let (other, other_id) = shapes::sized_body(500_001);
+        let o = keyed(&other, &topics);
+        assert!(matches!(c.deliver(&o, LANDS), Delivered::Fault(_)));
+        assert!(c.letters().contains(&(other_id, "failing".to_string(), "fault".to_string())));
     }
 }
