@@ -1714,7 +1714,7 @@ mod tests {
         let lib = include_str!("lib.rs");
         assert!(
             squash_src(lib).contains(
-                "(Method::Post,\"/internal/beef-blob-sweep\")=>crate::beef_blob_sweep::internal_sweep(req,&env).await,"
+                "(Method::Post,\"/internal/beef-blob-sweep\")=>{crate::beef_blob_sweep::internal_sweep(req,&env).await}"
             ),
             "the router sends POST /internal/beef-blob-sweep to the lever"
         );

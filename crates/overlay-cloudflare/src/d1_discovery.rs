@@ -1804,18 +1804,6 @@ struct PotBeefProofRow {
     beef: Option<String>,
 }
 
-/// Decode a `hex(beef)` read-back (SQLite `hex()` emits UPPERCASE;
-/// `hex::decode` accepts either case). Empty/undecodable → `None` — an
-/// unusable row is never served as bytes.
-fn decode_pot_beef_hex(row_beef: Option<String>) -> Option<Vec<u8>> {
-    let bytes = hex::decode(row_beef?).ok()?;
-    if bytes.is_empty() {
-        None
-    } else {
-        Some(bytes)
-    }
-}
-
 /// The `store_beef` write gate — longer-wins, never-clobber (the "vanishing
 /// table" lesson, see `d1_storage.rs::insert_output`): write only when the
 /// incoming beef is non-empty AND (no row exists OR the incoming beef is
@@ -3121,7 +3109,7 @@ impl PotStorage for D1PotStorage {
         }
         fn keyed(rows: Vec<KeyedBeefRow>, out: &mut Vec<(RowKey, String, Vec<u8>)>) {
             for r in rows {
-                let Some(beef) = decode_pot_beef_hex(r.beef) else {
+                let Some(beef) = crate::d1::beef_of_hex_column(r.beef) else {
                     continue;
                 };
                 let key = RowKey {
@@ -3302,7 +3290,7 @@ impl PotStorage for D1PotStorage {
                 .fetch_optional(&self.db)
                 .await
                 .map_err(pot_err)?;
-        Ok(row.and_then(|r| decode_pot_beef_hex(r.beef)))
+        Ok(row.and_then(|r| crate::d1::beef_of_hex_column(r.beef)))
     }
 
     async fn find_pot_beefs_for_proof_check(
@@ -3326,7 +3314,7 @@ impl PotStorage for D1PotStorage {
             Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
         Ok(rows
             .into_iter()
-            .filter_map(|r| decode_pot_beef_hex(r.beef).map(|beef| (r.txid, beef)))
+            .filter_map(|r| crate::d1::beef_of_hex_column(r.beef).map(|beef| (r.txid, beef)))
             .collect())
     }
 
@@ -8659,18 +8647,18 @@ mod tests {
     fn pot_beef_hex_readback_decodes() {
         // SQLite hex() emits UPPERCASE — must decode; lowercase too.
         assert_eq!(
-            decode_pot_beef_hex(Some("BEEF".into())),
+            crate::d1::beef_of_hex_column(Some("BEEF".into())),
             Some(vec![0xBE, 0xEF])
         );
         assert_eq!(
-            decode_pot_beef_hex(Some("beef".into())),
+            crate::d1::beef_of_hex_column(Some("beef".into())),
             Some(vec![0xbe, 0xef])
         );
         // NULL column / empty / undecodable → None (never served as bytes).
-        assert_eq!(decode_pot_beef_hex(None), None);
-        assert_eq!(decode_pot_beef_hex(Some("".into())), None);
-        assert_eq!(decode_pot_beef_hex(Some("abc".into())), None);
-        assert_eq!(decode_pot_beef_hex(Some("zz".into())), None);
+        assert_eq!(crate::d1::beef_of_hex_column(None), None);
+        assert_eq!(crate::d1::beef_of_hex_column(Some("".into())), None);
+        assert_eq!(crate::d1::beef_of_hex_column(Some("abc".into())), None);
+        assert_eq!(crate::d1::beef_of_hex_column(Some("zz".into())), None);
     }
 
     #[test]

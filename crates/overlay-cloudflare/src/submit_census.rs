@@ -81,19 +81,19 @@
 //! the read table (a total already counted is not un-counted) and is never
 //! bumped again.
 //!
-//! ## The stream is the census's reader, not its judge (the doors lens L1)
+//! ## One reader (the doors lens L1; the land lens E585-LAND-L2)
 //!
 //! Over the parser of before NL-6 the streaming reader was stricter than the
-//! gated arm's: a byte after the frame's end, a BUMP leaf flag with unknown
-//! bits, a V2 format byte other than 0, 1 or 2, a BUMP whose nodes disagree.
-//! The fold answered such a body from THE ARM'S OWN PARSE
-//! (`ef::parse_as_the_arm`, `beef_limits::parse_beef`: the function
-//! `ef::beef_to_ef_batch` calls, so the two cannot drift), never
-//! `subject-ambiguous` for a difference between two readers, and counted it on
-//! [`COUNTER_STREAM_REFUSED`]. Since NL-6 (`fc019c8`) the arm's parse runs the
-//! same streaming door, so it refuses those bytes first and the census
-//! answers `would-fail(parse)`; the fallback stays and is not reached by any
-//! body the stream refuses (pinned, `e585f_l1_*`).
+//! gated arm's (a byte after the frame's end, a BUMP leaf flag with unknown
+//! bits, a V2 format byte other than 0, 1 or 2, a BUMP whose nodes disagree),
+//! and the doors lens fold answered such a body from a second, hydrated parse
+//! of the arm. Since NL-6 (`fc019c8`) the arm's parse (`beef_limits::parse_beef`
+//! in `ef::beef_to_ef_batch`) runs the same bsv-rs decoder as the stream, so
+//! it refuses those bytes first and the census answers `would-fail(parse)` at
+//! step 1. The fallback, its second spelling of the ancestry check and its
+//! counter are gone: a stream that refuses the bytes is NO ANSWER
+//! (`Ancestry::Unread`), the third state, never a green (pinned,
+//! `e585f_l1_*`, `e585f2_n2_*`).
 //!
 //! ## The memory of the ancestry read (the doors lens L3)
 //!
@@ -162,7 +162,7 @@ use std::collections::HashMap;
 use bsv_rs::transaction::beef_stream::{BeefStream, Element, Hash32};
 use overlay_engine::stream_sizing::{self, Admission, StreamCharges};
 
-use crate::ef::{self, beef_to_ef_batch, proven_subject_raw, EfError};
+use crate::ef::{beef_to_ef_batch, proven_subject_raw, EfError};
 use crate::submit_gate::AdmissionPath;
 
 /// Why the gated arm would have refused these bytes before any network call.
@@ -256,11 +256,6 @@ impl CensusVerdict {
     }
 }
 
-/// Bumped once for every classified body whose ancestry the streaming reader
-/// refused and the gated arm's own parse answered (the doors lens L1). Not a
-/// state and not a reason: the body's verdict is counted as any other.
-pub const COUNTER_STREAM_REFUSED: &str = "submit_census_stream_refused_total";
-
 /// What the ancestry read may hold beside the body: the script door's memory
 /// limb (48 MiB, three eighths of the isolate; the arithmetic is
 /// `DoorBudget::DEFAULT`'s).
@@ -277,16 +272,6 @@ pub const CENSUS_CHARGES: StreamCharges = StreamCharges {
     ..StreamCharges::STREAM
 };
 
-/// A classified body: its verdict, and how its ancestry was read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CensusReading {
-    /// The classification.
-    pub verdict: CensusVerdict,
-    /// The streaming reader refused the bytes and the gated arm's own parse
-    /// answered the ancestry ([`COUNTER_STREAM_REFUSED`]).
-    pub stream_refused: bool,
-}
-
 /// Classify one arriving `/submit` body: would it have survived the
 /// `broadcast-gated` path's pre-network structural checks?
 ///
@@ -297,27 +282,16 @@ pub struct CensusReading {
 /// A body of any size is classified (bsv-low #585): there is no stop by size
 /// here.
 pub fn census_verdict(beef_bytes: &[u8]) -> CensusVerdict {
-    census_reading(beef_bytes).verdict
+    census_verdict_under(beef_bytes, CENSUS_MEMORY_BYTES)
 }
 
-/// [`census_verdict`], and how the ancestry was read.
-pub fn census_reading(beef_bytes: &[u8]) -> CensusReading {
-    census_reading_under(beef_bytes, CENSUS_MEMORY_BYTES)
-}
-
-/// [`census_reading`] with the ancestry read's memory budget named.
-pub fn census_reading_under(beef_bytes: &[u8], memory_bytes: u64) -> CensusReading {
-    let decided = |verdict| CensusReading {
-        verdict,
-        stream_refused: false,
-    };
+/// [`census_verdict`] with the ancestry read's memory budget named.
+pub fn census_verdict_under(beef_bytes: &[u8], memory_bytes: u64) -> CensusVerdict {
     let (efs, subject_txid) = match beef_to_ef_batch(beef_bytes) {
         Ok(v) => v,
-        Err(EfError::Parse(_)) => {
-            return decided(CensusVerdict::WouldHaveFailed(WouldFailWhy::Parse))
-        }
+        Err(EfError::Parse(_)) => return CensusVerdict::WouldHaveFailed(WouldFailWhy::Parse),
         Err(EfError::EfConversion(_)) => {
-            return decided(CensusVerdict::WouldHaveFailed(WouldFailWhy::SubjectEf))
+            return CensusVerdict::WouldHaveFailed(WouldFailWhy::SubjectEf)
         }
     };
     // NL-6c: no EF size check here. The gated arm defers work past one
@@ -328,10 +302,10 @@ pub fn census_reading_under(beef_bytes: &[u8], memory_bytes: u64) -> CensusReadi
         // claim against a real provider (bsv-low #268) — a network call this
         // census must not make — UNLESS the subject raw cannot even be
         // extracted, in which case the arm fails closed deterministically.
-        return decided(match proven_subject_raw(beef_bytes) {
+        return match proven_subject_raw(beef_bytes) {
             Some(_) => CensusVerdict::CouldNotEvaluate(UnevalWhy::MinedClaimUnverified),
             None => CensusVerdict::WouldHaveFailed(WouldFailWhy::MinedClaimUnextractable),
-        });
+        };
     }
     // A structural GREEN is only honest if the sorted-last entry actually IS
     // the subject. In an honest submit the subject is the TIP of its own
@@ -342,11 +316,7 @@ pub fn census_reading_under(beef_bytes: &[u8], memory_bytes: u64) -> CensusReadi
     // `UnevalWhy::SubjectAmbiguous`. Only the green needs this guard: a
     // structural refusal (above) stands regardless of which tx the caller
     // meant.
-    let (ancestry, stream_refused) = subject_ancestry(beef_bytes, &subject_txid, memory_bytes);
-    CensusReading {
-        verdict: verdict_of_ancestry(ancestry),
-        stream_refused,
-    }
+    verdict_of_ancestry(subject_ancestry(beef_bytes, &subject_txid, memory_bytes))
 }
 
 /// What the ancestry check found, or why it found nothing.
@@ -358,7 +328,7 @@ enum Ancestry {
     Stray,
     /// Not read: the read would hold more than the memory budget.
     OverMemory,
-    /// No reader answered.
+    /// The stream refused the bytes: no answer.
     Unread,
 }
 
@@ -376,7 +346,7 @@ fn verdict_of_ancestry(ancestry: Ancestry) -> CensusVerdict {
 }
 
 /// Is any data-carrying BEEF entry OUTSIDE the sorted-last subject's in-BEEF
-/// ancestor closure? And was the streaming reader refused the bytes?
+/// ancestor closure?
 ///
 /// An honest submit's subject is the tip of its own ancestry, so the closure
 /// covers the whole body — including the recovery shape whose unconvertible
@@ -392,17 +362,10 @@ fn verdict_of_ancestry(ancestry: Ancestry) -> CensusVerdict {
 ///
 /// Read from the STREAM (bsv-low #585), never from a hydrated BEEF: the
 /// answer needs only which transactions carry data and which of them spend
-/// which ([`AncestryShape`]). Bytes the streaming reader refuses are read
-/// from the gated arm's own parse instead (the module doc); a read past the
-/// memory budget is not made.
-fn subject_ancestry(beef_bytes: &[u8], subject_txid: &str, memory_bytes: u64) -> (Ancestry, bool) {
-    let found = |outside: bool| {
-        if outside {
-            Ancestry::Stray
-        } else {
-            Ancestry::Covered
-        }
-    };
+/// which ([`AncestryShape`]). Bytes the streaming reader refuses are no
+/// answer (`Unread`; one reader, the module doc); a read past the memory
+/// budget is not made.
+fn subject_ancestry(beef_bytes: &[u8], subject_txid: &str, memory_bytes: u64) -> Ancestry {
     match AncestryShape::read(beef_bytes, memory_bytes) {
         StreamRead::Shape(shape) => {
             let subject = bsv_rs::primitives::from_hex(subject_txid)
@@ -412,73 +375,22 @@ fn subject_ancestry(beef_bytes: &[u8], subject_txid: &str, memory_bytes: u64) ->
                     wire.reverse();
                     wire
                 });
-            (found(shape.has_entry_outside(subject.as_ref())), false)
-        }
-        StreamRead::OverMemory => (Ancestry::OverMemory, false),
-        StreamRead::Refused => (
-            ancestry_of_the_arms_answer(outside_ancestry_by_the_arms_parse(
-                beef_bytes,
-                subject_txid,
-            )),
-            true,
-        ),
-    }
-}
-
-/// The fallback's answer as an [`Ancestry`]: a stray or a covered ancestry
-/// when the arm's parse answered, and NO answer (`Unread`, never a green) when
-/// it did not. Unreachable today (the census reaches the fallback only after
-/// `ef::beef_to_ef_batch` took the same bytes through the same
-/// `ef::parse_as_the_arm`), and pinned at the function so that it stays a
-/// non-answer if it ever is reached (the delta lens E585-D12-DELTA-N2).
-fn ancestry_of_the_arms_answer(outside: Option<bool>) -> Ancestry {
-    match outside {
-        Some(true) => Ancestry::Stray,
-        Some(false) => Ancestry::Covered,
-        None => Ancestry::Unread,
-    }
-}
-
-/// The ancestry check over the gated arm's OWN parse (`ef::parse_as_the_arm`,
-/// the call `ef::beef_to_ef_batch` made a moment ago on the same bytes): the
-/// check of before #585, for bytes the streaming reader refuses. `None` when
-/// that parse does not answer, which the caller reaches only after it did.
-fn outside_ancestry_by_the_arms_parse(beef_bytes: &[u8], subject_txid: &str) -> Option<bool> {
-    use std::collections::HashSet;
-    let beef = ef::parse_as_the_arm(beef_bytes).ok()?;
-    // Entries with transaction data (mirrors the gated arm's source map:
-    // `if let Some(tx) = btx.tx()`). Txid-only stubs carry nothing that could
-    // be mis-broadcast, so they are neither closure members nor strays.
-    let mut txs: HashMap<String, &bsv_rs::transaction::Transaction> = HashMap::new();
-    for btx in &beef.txs {
-        if let Some(tx) = btx.tx() {
-            txs.insert(btx.txid(), tx);
-        }
-    }
-    // BFS the subject's ancestor closure over in-BEEF edges.
-    let mut closure: HashSet<String> = HashSet::new();
-    let mut frontier = vec![subject_txid.to_string()];
-    while let Some(txid) = frontier.pop() {
-        if !closure.insert(txid.clone()) {
-            continue;
-        }
-        if let Some(tx) = txs.get(&txid) {
-            for input in &tx.inputs {
-                if let Some(src) = &input.source_txid {
-                    if txs.contains_key(src) && !closure.contains(src) {
-                        frontier.push(src.clone());
-                    }
-                }
+            if shape.has_entry_outside(subject.as_ref()) {
+                Ancestry::Stray
+            } else {
+                Ancestry::Covered
             }
         }
+        StreamRead::OverMemory => Ancestry::OverMemory,
+        StreamRead::Refused => Ancestry::Unread,
     }
-    Some(txs.keys().any(|txid| !closure.contains(txid)))
 }
 
 /// What a read of the stream came to.
 enum StreamRead {
     Shape(AncestryShape),
-    /// The streaming reader refuses the bytes.
+    /// The streaming reader refuses the bytes (unreachable through
+    /// [`census_verdict`]: step 1's parse is the same decoder).
     Refused,
     /// The read would hold more than the budget: the stream was not opened.
     OverMemory,
@@ -1100,9 +1012,9 @@ mod tests {
     /// The stream's answer alone, `None` when the reader refuses the bytes.
     fn outside_ancestry_by_the_stream(beef_bytes: &[u8], subject_txid: &str) -> Option<bool> {
         match subject_ancestry(beef_bytes, subject_txid, CENSUS_MEMORY_BYTES) {
-            (Ancestry::Covered, false) => Some(false),
-            (Ancestry::Stray, false) => Some(true),
-            _ => None,
+            Ancestry::Covered => Some(false),
+            Ancestry::Stray => Some(true),
+            Ancestry::OverMemory | Ancestry::Unread => None,
         }
     }
 
@@ -1185,13 +1097,6 @@ mod tests {
                     .expect("the stream reads a body the SDK parses");
                 let by_parse = outside_ancestry_by_the_hydrated_parse(body, subject);
                 assert_eq!(by_stream, by_parse, "subject {subject}");
-                // The fallback (the arm's own parse) is the check of before
-                // #585 too, on every body.
-                assert_eq!(
-                    outside_ancestry_by_the_arms_parse(body, subject),
-                    Some(by_parse),
-                    "subject {subject}"
-                );
                 asked += 1;
                 if by_stream {
                     strays += 1;
@@ -1248,22 +1153,26 @@ mod tests {
         bodies
     }
 
-    /// THE PIN (L1), over NL-6 (E585-land). The doors lens's L1 was a body
-    /// the streaming reader refused and the gated arm's parser converted.
-    /// NL-6 (`fc019c8`) put every reader of the Worker, `ef::beef_to_ef_batch`
-    /// included, through the same streaming door, so that class is EMPTY: the
-    /// arm refuses those bytes at its own parse and the census answers
-    /// `would-fail(parse)` before it reads the ancestry. The fold's fallback
-    /// to the arm's parse stays as written and is unreachable here; its
-    /// counter is never bumped by these bodies.
+    /// The census module's own source, its tests cut off: what the shape
+    /// pins read.
+    fn census_source() -> &'static str {
+        let whole = include_str!("submit_census.rs");
+        &whole[..whole.find("\nmod tests {").expect("the tests module")]
+    }
+
+    /// THE PIN (L1), over NL-6 (E585-land; re-stated by the land lens
+    /// E585-LAND-L2). The doors lens's L1 was a body the streaming reader
+    /// refused and the gated arm's parser converted. NL-6 (`fc019c8`) put
+    /// every reader of the Worker, `ef::beef_to_ef_batch` included, through
+    /// the same decoder, so that class is EMPTY: the arm refuses those bytes
+    /// at its own parse and the census answers `would-fail(parse)` at step 1,
+    /// before it reads the ancestry. There is one reader: no second parse of
+    /// the arm in the census, and no counter of stream refusals.
     #[test]
     fn e585f_l1_a_body_the_stream_alone_refuses_is_the_arms_verdict() {
         assert_eq!(
-            census_reading(&ancestry_carrying_beef()),
-            CensusReading {
-                verdict: CensusVerdict::GatedReady,
-                stream_refused: false,
-            },
+            census_verdict(&ancestry_carrying_beef()),
+            CensusVerdict::GatedReady,
             "the honest body is read from the stream"
         );
         let bodies = stream_refused_bodies();
@@ -1275,12 +1184,9 @@ mod tests {
                 "{name}: the arm's parse is the stream (NL-6)"
             );
             assert_eq!(
-                census_reading(body),
-                CensusReading {
-                    verdict: CensusVerdict::WouldHaveFailed(WouldFailWhy::Parse),
-                    stream_refused: false,
-                },
-                "{name}: the arm's own verdict, the fallback not reached"
+                census_verdict(body),
+                CensusVerdict::WouldHaveFailed(WouldFailWhy::Parse),
+                "{name}: the arm's own verdict"
             );
         }
         // Two tips behind a trailing byte: the arm refuses the bytes first.
@@ -1296,15 +1202,26 @@ mod tests {
         let mut two_tips = beef.to_binary();
         two_tips.push(0x00);
         assert_eq!(
-            census_reading(&two_tips),
-            CensusReading {
-                verdict: CensusVerdict::WouldHaveFailed(WouldFailWhy::Parse),
-                stream_refused: false,
-            }
+            census_verdict(&two_tips),
+            CensusVerdict::WouldHaveFailed(WouldFailWhy::Parse)
         );
-        // Its counter is in the census's own namespace, so the health block's
-        // one read (`LIKE 'submit_census_%'`) serves it.
-        assert!(COUNTER_STREAM_REFUSED.starts_with("submit_census_"));
+        // One reader (Rule 10): the census holds no second parse of the arm
+        // and counts no stream refusal. RED on `e2c561c`, which carried the
+        // fallback (`outside_ancestry_by_the_arms_parse` over
+        // `ef::parse_as_the_arm`) and `COUNTER_STREAM_REFUSED`.
+        let source = census_source();
+        for gone in [
+            "parse_as_the_arm",
+            "outside_ancestry_by_the_arms_parse",
+            "ancestry_of_the_arms_answer",
+            "stream_refused",
+            "Beef::from_binary(",
+        ] {
+            assert!(
+                !source.contains(gone),
+                "the census reads the ancestry through ONE reader, the stream: `{gone}` is a second"
+            );
+        }
     }
 
     /// A funding with a BUMP of `2^levels` level-0 leaves, and an unmined
@@ -1348,44 +1265,39 @@ mod tests {
         body
     }
 
-    /// THE PIN (L2). A body the census cannot evaluate is never guessed
-    /// green. At the verdict's one seam, every non-answer is the third state
-    /// (the mutant `=> CensusVerdict::GatedReady` on either arm fails here);
-    /// and through `census_reading`, with a body: a valid BEEF whose BUMP
-    /// carries 2^12 leaves is `gated-ready` under the census's budget and,
-    /// under a budget its read would pass, `could-not-evaluate(ancestry-
-    /// over-memory)`: not read, not green, and not answered by the arm's
-    /// parse either. After the L1 fold no body reaches the OTHER non-answer
-    /// (`Unread`) through `census_verdict`: the fallback is the parse step 1
-    /// already made of the same bytes. It is pinned at the seam.
+    /// THE PIN (the delta lens E585-D12-DELTA-N2, re-stated by the land
+    /// lens E585-LAND-L2): a stream refusal is `Unread`, the third state,
+    /// never a green. The fallback that once answered it from the arm's
+    /// parse is gone (one reader); the lens's mutant now is the refusal
+    /// mapped to `Covered`, RED here.
     #[test]
     fn e585f2_n2_the_fallbacks_non_answer_is_never_green() {
-        // THE PIN (the delta lens E585-D12-DELTA-N2). The fallback maps the
-        // arm's parse's answer; no answer is `Unread`, the third state, never
-        // a green. RED against the lens's mutant (`None` mapped to
-        // `Covered`). The fallback is reached only through
-        // `ef::parse_as_the_arm`, the call `beef_to_ef_batch` makes.
-        assert_eq!(ancestry_of_the_arms_answer(Some(false)), Ancestry::Covered);
-        assert_eq!(ancestry_of_the_arms_answer(Some(true)), Ancestry::Stray);
-        assert_eq!(ancestry_of_the_arms_answer(None), Ancestry::Unread);
-        assert_eq!(
-            verdict_of_ancestry(ancestry_of_the_arms_answer(None)),
-            CensusVerdict::CouldNotEvaluate(UnevalWhy::SubjectAmbiguous)
-        );
-        // Over NL-6 (E585-land) the arm's parse is the streaming door: a body
-        // the stream refuses is refused by `ef::parse_as_the_arm` too, so the
-        // fallback, if it is reached, has NO answer, and that is `Unread`
-        // (counted as stream-refused), never a green.
         let mut trailing = ancestry_carrying_beef();
         trailing.push(0x00);
-        assert!(ef::parse_as_the_arm(&trailing).is_err());
-        assert!(beef_to_ef_batch(&trailing).is_err());
+        assert!(AncestryShape::read_the_stream(&trailing).is_none());
         let subject = beef_to_ef_batch(&ancestry_carrying_beef())
             .expect("the arm takes the honest body")
             .1;
         assert_eq!(
             subject_ancestry(&trailing, &subject, CENSUS_MEMORY_BYTES),
-            (Ancestry::Unread, true)
+            Ancestry::Unread
+        );
+        assert_eq!(
+            verdict_of_ancestry(subject_ancestry(&trailing, &subject, CENSUS_MEMORY_BYTES)),
+            CensusVerdict::CouldNotEvaluate(UnevalWhy::SubjectAmbiguous)
+        );
+        // The refusal maps straight to the non-answer, in the source too.
+        // RED on `e2c561c`: "StreamRead::Refused => (" sent it to the
+        // fallback.
+        assert!(
+            census_source().contains("StreamRead::Refused => Ancestry::Unread,"),
+            "a stream refusal is no answer, mapped at the one seam"
+        );
+        // Through `census_verdict` step 1 answers first (the same decoder).
+        assert!(beef_to_ef_batch(&trailing).is_err());
+        assert_eq!(
+            census_verdict(&trailing),
+            CensusVerdict::WouldHaveFailed(WouldFailWhy::Parse)
         );
     }
 
@@ -1418,18 +1330,12 @@ mod tests {
         let needed = stream_sizing::estimate(&body, &CENSUS_CHARGES, u64::MAX).bytes;
         assert!(needed > 4096 * 512, "{needed} bytes for 4096 leaves");
         assert_eq!(
-            census_reading_under(&body, needed),
-            CensusReading {
-                verdict: CensusVerdict::GatedReady,
-                stream_refused: false,
-            }
+            census_verdict_under(&body, needed),
+            CensusVerdict::GatedReady
         );
         assert_eq!(
-            census_reading_under(&body, needed - 1),
-            CensusReading {
-                verdict: CensusVerdict::CouldNotEvaluate(UnevalWhy::AncestryOverMemory),
-                stream_refused: false,
-            }
+            census_verdict_under(&body, needed - 1),
+            CensusVerdict::CouldNotEvaluate(UnevalWhy::AncestryOverMemory)
         );
         // The reason has its own durable row, under every path.
         let (_, reason) = census_counters(

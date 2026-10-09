@@ -291,10 +291,24 @@ fn e585f2_m1_a_19mb_push_only_unproven_parent_is_never_parsed() {
 /// 100,000 byte pushes then a reached `OP_CHECKSIG` (the per-byte charge).
 /// Measured on the fold (debug; the bytes a script byte, the frame's
 /// included): `OP_NOP` 98.0, `OP_0` 169.0, `OP_NOP` then `OP_CHECKSIG` 162.0,
-/// `OP_3DUP` 241.0, `OP_3DUP` then `OP_CHECKSIG` 258.0 (the worst; charged
-/// 520), `0x01 xx OP_DROP` 66.7, `0x01 xx` unlocking 62.5, the pushes 6.7.
+/// `OP_3DUP` 241.0, `OP_3DUP` then `OP_CHECKSIG` 258.0, `0x01 xx OP_DROP`
+/// 66.7, `0x01 xx` unlocking 62.5, the pushes 6.7.
 /// RED on `74c2c15`: "OP_NOP: walked under a memory limb of its own peak
 /// (25691292): Ok(WalkStats { .., memory_bytes: 1050622, .. })".
+///
+/// THE ERROR PATH (the doors delta-2 lens E585-D12-DELTA2-L1): bsv-rs's
+/// `Spend::error` CLONES the stack, the alt stack and the if-stack into the
+/// error, so a script that fails after building a stack of empty entries
+/// (uncounted by the interpreter's 128 KB limit) holds a third copy on top
+/// of the doubled buffer. `OP_0` x3, `OP_3DUP` x 262,145, `OP_VERIFY`
+/// (refused) is 265.0 a byte; with 349,526 `OP_3DUP`s the stack is
+/// 1,048,581 entries, just past a power of two, and the shape is 297.0 a
+/// byte, THE WORST KNOWN: the charge, 520 a one-byte opcode with the frame's
+/// 4, is 1.76 times it natively (about 3.5 times on wasm32 by arithmetic, a
+/// chunk 16 bytes and a `Vec` 12 there; not run). The pin asserts the worst
+/// it measures is that shape's and holds the charge's margin over it. RED on
+/// `e2c561c` by the shape's absence: "the worst shape measured is 258.0 a
+/// script byte, the error path's 297 is not among the shapes".
 #[test]
 fn e585f2_m1_the_scripts_charge_is_above_the_measured_heap() {
     one_at_a_time(async {
@@ -345,7 +359,19 @@ fn e585f2_m1_the_scripts_charge_is_above_the_measured_heap() {
                 [pushes, checksig.clone()].concat(),
                 vec![],
             ),
+            (
+                "OP_3DUP then a refused OP_VERIFY",
+                [vec![OP_0; 3], vec![OP_3DUP; n], vec![OP_VERIFY]].concat(),
+                vec![],
+            ),
+            (
+                // 3 + 3 x 349,526 = 1,048,581 entries: 2^20 + 5.
+                "OP_3DUP to a stack just past 2^20 then a refused OP_VERIFY",
+                [vec![OP_0; 3], vec![OP_3DUP; 349_526], vec![OP_VERIFY]].concat(),
+                vec![],
+            ),
         ];
+        let mut worst = (0.0f64, "");
         for (name, lock, unlock) in &shapes {
             let (body, subject) = on_a_proven_source(lock, unlock);
             let lifted = DoorBudget {
@@ -354,6 +380,9 @@ fn e585f2_m1_the_scripts_charge_is_above_the_measured_heap() {
             };
             let (free, peak) = walked(&body, &subject, lifted).await;
             let script = (lock.len() + unlock.len()) as f64;
+            if peak as f64 / script > worst.0 {
+                worst = (peak as f64 / script, name);
+            }
             println!(
                 "e585f2_m1 measured {name}: scripts {script} bytes, peak {peak} bytes = {:.1} a \
                  script byte; {}",
@@ -379,5 +408,26 @@ fn e585f2_m1_the_scripts_charge_is_above_the_measured_heap() {
                 "{name}: walked under a memory limb of its own peak ({peak}): {bounded:?}"
             );
         }
+        // The pin holds the worst known shape (DELTA2-L1), and the charge's
+        // margin over it: 520 a one-byte opcode and the frame's 4.
+        println!(
+            "e585f2_m1 the worst measured: {} at {:.1} a script byte; the charge 524 is {:.2}x it",
+            worst.1,
+            worst.0,
+            524.0 / worst.0
+        );
+        assert!(
+            worst.0 >= 290.0,
+            "the worst shape measured is {:.1} a script byte, the error path's 297 is not among \
+             the shapes",
+            worst.0
+        );
+        assert!(
+            524.0 / worst.0 >= 1.7,
+            "the charge is {:.2}x the worst ({}, {:.1} a byte)",
+            524.0 / worst.0,
+            worst.1,
+            worst.0
+        );
     });
 }

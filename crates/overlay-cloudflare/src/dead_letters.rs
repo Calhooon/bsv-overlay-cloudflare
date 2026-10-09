@@ -1207,9 +1207,10 @@ pub fn classes_json(fault_held: u64, not_now_held: u64, not_now_day: u64) -> ser
 }
 
 /// PURE (bsv-low #585, door 3): the health block's `r2`: the letters with bytes whose BEEF is an R2 object and the
-/// bytes at rest there (`None`: unread), whether the bucket is bound, the inline room in force, and the replay's
-/// parse limit (`beef_limits::QUEUE_BEEF_LIMITS`, the engine's own since the d3 fold-2: the door refuses nothing
-/// for its size).
+/// bytes at rest there (`None`: unread), whether the bucket is bound, the inline room in force, and
+/// `replayMaxBytes`, the value `beef_limits::QUEUE_BEEF_LIMITS` NAMES (the engine's own since the d3 fold-2). Since
+/// NL-6 `parse_beef` reads no limit, so that figure bounds nothing: no replay is refused for its size. It stays
+/// served because the route cell (`tools/lane-e585/beef_blobs_route_ci.mjs`) reads it.
 #[must_use]
 pub fn r2_json(at_rest: Option<(u64, u64)>, bound: bool, room: usize) -> serde_json::Value {
     serde_json::json!({

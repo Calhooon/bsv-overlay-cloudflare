@@ -84,8 +84,8 @@ between `Cargo.toml` and its hand-kept mirror in `workers/Cargo.toml`.
 ## Dependencies
 
 - `bsv-rs` — BSV SDK for Rust (crates.io, `overlay` feature)
-- `bsv-middleware-cloudflare` — BRC-103/104 auth middleware for CF Workers (crates.io), pinned exactly `=0.3.8` since 2026-10-08 (bsv-low #577; the git `[patch]` to the session-lane branch is gone) — the same lineage the low-watchtower and low-app-layer pin. `low-app-layer` asks `0.3.8` and the workers' lock holds the registry 0.3.8 (main `c39642f`) with no `[patch]` (bsv-low #577); its session lane (D12) rode a git rev of the `session-lane` branch until 0.3.7 folded it into main. Never 0.3.7. Since 2026-10-09 (bsv-low #588) `low-app-layer` pins `=0.4.1` (a major bump: 0.4.0 moved the rules to `bsv-middleware-core` 0.1.0, re-exported at the 0.3 paths, the `AuthSessionStore` DO and the session lane unchanged; 0.4.1 answers every authentication refusal as its own 401 `{"status":"error","code":"ERR_INVALID_AUTH"|...}` where 0.3.8 raised four as `Err`, which the app layer's front door rendered 400 `authentication handshake failed: ...`; an `Err` is now a fault only and is still that 400) while `overlay-cloudflare` still asks `"0.both workers crates pin =0.4.1, so the lock holds ONE middleware (0.4.1) beside bsv-middleware-core 0.1.0.8.5
-- `worker` — Cloudflare Workers Rust SDK, pinned `0.8`
+- `bsv-middleware-cloudflare`: BRC-103/104 auth middleware for CF Workers (crates.io), pinned exactly `=0.4.1` in both workers crates since 2026-10-09 (bsv-low #588: `low-app-layer` at `b7777bd`, `overlay-cloudflare` at `2749841`, which links only `init_panic_hook`), so the workers' lock holds ONE middleware (0.4.1) beside `bsv-middleware-core` 0.1.0, the same lineage the low-watchtower pins. 0.4.0 was a major bump: it moved the rules to `bsv-middleware-core` 0.1.0, re-exported at the 0.3 paths, the `AuthSessionStore` DO and the session lane (D12) unchanged; 0.4.1 answers every authentication refusal as its own 401 `{"status":"error","code":"ERR_INVALID_AUTH"|...}` where 0.3.8 raised four as `Err`, which the app layer's front door rendered 400 `authentication handshake failed: ...`; an `Err` is now a fault only and is still that 400. Before it, `=0.3.8` from 2026-10-08 (bsv-low #577: the registry 0.3.8, main `c39642f`, the git `[patch]` to the session-lane branch gone; 0.3.7 had folded the session lane into main). Never 0.3.7.
+- `worker`: Cloudflare Workers Rust SDK, pinned `0.8` (the workers' lock holds 0.8.5)
 
 **THE WORKSPACE MAY HOLD EXACTLY ONE `worker` VERSION** (bsv-low #348). `worker-build`, which runs only at DEPLOY time, resolves `worker` from the *workspace* `Cargo.lock` (the workers' one, `workers/Cargo.lock`; the root lock holds no `worker`) and takes the LOWEST version it finds there, for every crate, regardless of which crate directory it was invoked from; its per-crate disambiguation is dead code (off-by-one in `Lockfile::get_package_version`, verified in worker-build 0.7.5 / 0.8.4 / 0.8.5). Plain `cargo build` is perfectly happy with two majors, so a split is invisible to every native gate: `low-app-layer` sat undeployable for a month with `make ci` green throughout. If a crate ever needs a different `worker`, it must leave the workspace *and* stop depending on anything in it: a path dev-dep drags the other version straight back into the lock. `make ci-deploy` (part of `make ci`) is what enforces this: a lock/pin preflight plus a real `wrangler deploy --dry-run` of all three deployable configs.
 
@@ -282,10 +282,19 @@ breach is the memory limb, and the input is never parsed. Measured, the peak
 of the live heap a script byte (native, a lock of 262,145 chunks so every
 growing buffer is at its slackest, the frame's own 4 included): `OP_NOP` 98,
 `OP_0` 169, `OP_NOP`s then a reached `OP_CHECKSIG` 162, `OP_3DUP` 241 and with
-a reached `OP_CHECKSIG` 258 (the worst), `0x01 xx OP_DROP` 66.7, `0x01 xx`
-unlocking 62.5, ten 100,000 byte pushes then `OP_CHECKSIG` 6.7. So 520 a
-one-byte opcode is 2.0 times the worst; 8 a byte is 3 times the pushes' 2.7
-past the frame. How it composes: the frame's estimate is the most the walk
+a reached `OP_CHECKSIG` 258, `0x01 xx OP_DROP` 66.7, `0x01 xx` unlocking 62.5,
+ten 100,000 byte pushes then `OP_CHECKSIG` 6.7. THE WORST known is an ERROR
+path (the doors delta-2 lens E585-D12-DELTA2-L1): bsv-rs's `Spend::error`
+clones the stack into the error, so `OP_3DUP`s over empty entries (uncounted
+by the interpreter's 128 KB limit) then a refused `OP_VERIFY` is 265 a byte at
+262,145 `OP_3DUP`s and 297 at 349,526 (a stack of 1,048,581 entries, just past
+a power of two: the doubled buffer and the clone at once). So 520 a one-byte
+opcode (524 with the frame's 4) is 1.76 times the worst natively, and about
+3.5 times on wasm32 by arithmetic (a chunk 16 bytes and a `Vec` 12 there,
+about 150 a byte; not run); 8 a byte is 3 times the pushes' 2.7 past the
+frame. The interpreter's own limit covers the element BYTES (a trip is `limb:
+Work`); this charge covers what it does not count: the chunk records and
+their clones, the subscript, the stack ENTRIES and the error's clone of them. How it composes: the frame's estimate is the most the walk
 holds apart from the input being run (the heaviest transaction in hand counted
 once, the interpreter's raw copies of the unlocking script among its 4 bytes a
 byte); the scripts' charge is the EXPANSION of one input past those bytes,
@@ -295,10 +304,11 @@ about 96,000 opcodes (or a 1 MB `OP_NOP` lock) is left to the network; data
 pushes are 8 bytes a byte (a 1 MB push is 8 MB); LOW's covenant leg (6,608
 script bytes) is charged 1,282,178 in all, 2.55 % of the limb.
 
-The default's arithmetic: a 128 MB isolate, less the request's body (up to the
-route's 10 MB), the completed BEEF the route hands the door (a second copy of
-up to as much) and the EF batch (the route's 2 MB bound, twice while it is
-serialized), 24 MB, less 56 MB left for the module, the runtime, the
+The default's arithmetic: a 128 MB isolate, less, for a 10 MB request (the
+figure the arithmetic is made at: since NL-6 the route caps no body, so a
+heavier one is the isolate's), the request's body, the completed BEEF the
+route hands the door (a second copy of up to as much) and the EF batch (the
+route's 2 MB bound, twice while it is serialized), 24 MB, less 56 MB left for the module, the runtime, the
 allocator's fragmentation and what a native estimate does not see of wasm32:
 48 MiB, three eighths of the isolate. It lets through a BUMP of up to 72,944
 leaves (690 bytes a level-0 leaf), a single transaction of up to about 12 MB
@@ -331,20 +341,30 @@ what `d6d2774` answered that the stream does not: a BEEF cut short is
 Truncated { needed: 25 }`), and limit (3) below.
 
 Limits, stated. (1) The door is reached through the gated route, whose own
-bounds stand BEFORE it and are not this door's: the request's 10 MB, the EF
-conversion's parse (`ef.rs`, `beef_limits::parse_beef` with `EF_BEEF_LIMITS`:
-10,000,036 bytes, 512 transactions, 512 BUMPs; NL-6's), and the route's EF
-work bound (`routes.rs` `MAX_SUBJECT_EF_BYTES` 256 KB, `MAX_BATCH_EF_BYTES`
-2 MB: a 429 "retry via fallback" before the door). The pin's 2 MB subject
-passes the DOOR; through the route it meets that 429 first. Those parses
-HYDRATE the body before the door is reached (the lens's N8, NL-6's file: 190
-MB natively for the wide BUMP, which no count of theirs refuses): the door's
-memory limb bounds the door, not the route. (2) The body is the caller's
+steps stand BEFORE it and are not this door's. Since NL-6 the route caps no
+request and its parses (`ef::missing_source_txids`, the subject's log line,
+`ef::beef_to_ef_batch`: `beef_limits::parse_beef`, the streaming door, then a
+HYDRATED `Beef`; `EF_BEEF_LIMITS` is a name only, no count or size is
+compared) refuse invalid bytes only; then the route's EF work bound
+(`routes.rs` `MAX_SUBJECT_EF_BYTES` 256 KB, `MAX_BATCH_EF_BYTES` 2 MB: a 429
+"retry via fallback" before the door, #211, the one size answer left on the
+path). The pin's 2 MB subject passes the DOOR; through the route it meets that
+429 first. Those parses hydrate the body before the door's limb is read, and
+nothing but the isolate bounds them (the land lens E585-LAND-M1, measured
+natively, release: a 9,900,010 byte body of 900,000 minimal transactions
+peaks at 1,427,616,056 bytes in the route's parse and EF conversion, then
+answers the 429; the wide BUMP, 2^18 leaves in 9,830,056 bytes, 190,320,572
+in each of its three parses, then the door stops at its memory limb in 250
+bytes; on wasm32 both die in the route, the platform's error; identical on
+`7730e20`, NL-6's, the stack-lean captain's NL-6c): the door's memory limb
+bounds the door, not the route. (2) The body is the caller's
 `&[u8]`: the door adds one element and the index beside it, it does not make
 the route stream its request. (3) A body the stream refuses for its bytes
 (trailing bytes, a BUMP whose nodes disagree, a BUMP leaf flag or a V2 format
 byte with unknown bits) that `Beef::from_binary` parsed is `BeefParseError` at
-the door (the network judges), where it was walked. A subject txid in upper
+the door (the network judges), where it was walked. Through the route no such
+body reaches the door since NL-6: the route's own parse is the same decoder
+and refuses those bytes first. A subject txid in upper
 case is walked (it was "not in the BEEF"), and so is a transaction with a
 non-canonical varint (the SDK's txid was of its re-serialization). (4) A
 transaction's length is its raw bytes (it was the SDK's re-serialization: the
@@ -427,9 +447,15 @@ the memory limb before any parse, at a peak of 1,584,568, 1,587,388,
 the body and a MiB, and under the limb); RED on `74c2c15`: walked `Ok` at
 67,555,578, 67,555,578 and 540,436,602, and the 1.9 MB parent at 136,364,598
 before the interpreter's stack limit tripped (`limb: Work`). And
-`e585f2_m1_the_scripts_charge_is_above_the_measured_heap` (eight shapes, each
+`e585f2_m1_the_scripts_charge_is_above_the_measured_heap` (ten shapes, each
 stopped by a limb equal to its own measured peak; RED on `74c2c15`, `OP_NOP`
-walked under 25,691,292).
+walked under 25,691,292; the land fold-6 added the two error-path shapes and
+asserts the worst it measures is past 290 a byte with the charge at least 1.7
+times it: "the worst measured: OP_3DUP to a stack just past 2^20 then a
+refused OP_VERIFY at 297.0 a script byte; the charge 524 is 1.76x it", peak
+103,810,642; RED on `e2c561c` by the shape's absence, "the worst shape
+measured is 258.0 a script byte, the error path's 297 is not among the
+shapes").
 
 ## The census reads the stream (bsv-low #366; #585 door 2; the doors lens fold of 2026-10-09)
 
@@ -459,27 +485,21 @@ spends another transaction of the BEEF. Measured: 143 bytes for the 5,243,030
 byte pin (2 transactions, 1 BUMP); 74 bytes per element over a 1,000
 transaction chain.
 
-**The stream is the census's reader, not its judge** (the lens's E585-D12-L1).
-The streaming reader is stricter than the arm's parser: a byte after the
-frame's end, a BUMP leaf flag or a V2 format byte with unknown bits, a BUMP
-whose nodes disagree. The arm takes those bytes, converts them and would
-broadcast. Until the fold they were `could-not-evaluate(subject-ambiguous)`,
-which is the reason of a poisoned sort and not of a stricter reader: a client
-that emits a trailing byte sat in that bucket with no way to tell why. Now,
-when the stream refuses bytes the arm's parse accepted, the ancestry is
-answered from THE ARM'S OWN PARSE (`ef::parse_as_the_arm`,
-`beef_limits::parse_beef` under `EF_BEEF_LIMITS`: the FUNCTION
-`beef_to_ef_batch` calls, a moment before, on the same bytes, so the two
-cannot drift by a change on one side alone; the delta lens's E585-D12-DELTA-N2;
-and the check of before #585 over it): the verdict is the arm's, `gated-ready` where
-the arm would pass, and a stray entry is still the third state. Each such body
-is counted on `submit_census_stream_refused_total` BESIDE its verdict's
-counters (served as `submitReadinessCensus.streamRefused`; how it was read,
-not a fourth state), and its log line says so.
-Over NL-6 (`fc019c8`, the rebase E585-land) that class is EMPTY: the arm's
-`parse_beef` runs the same streaming door, refuses those bytes first, and the
-census answers `would-fail(parse)` before it reads the ancestry. The fallback
-and its counter stay as written, unreached (`e585f_l1_*` pins the union).
+**One reader** (the lens's E585-D12-L1; the land lens E585-LAND-L2, the land
+fold-6). Over the parser of before NL-6 the streaming reader was stricter than
+the arm's (a byte after the frame's end, a BUMP leaf flag or a V2 format byte
+with unknown bits, a BUMP whose nodes disagree): the arm took those bytes and
+would broadcast, and the doors lens fold answered their ancestry from a second,
+hydrated parse of the arm, counted apart. Since NL-6 (`fc019c8`) the arm's
+parse runs the same bsv-rs decoder as the stream, so it refuses those bytes
+first and the census answers `would-fail(parse)` at step (1). The fallback, its
+second spelling of the ancestry check (`outside_ancestry_by_the_arms_parse`
+over `ef::parse_as_the_arm`) and its counter are GONE (Rule 10, one reader): a
+stream that refuses the bytes is NO ANSWER (`Ancestry::Unread`), the third
+state, never a green. `submit_census_stream_refused_total` and its health field
+`submitReadinessCensus.streamRefused` are removed with it: they were added in
+this land (not on `7730e20`), never deployed, and read by no dashboard, cell or
+repository (a durable row of that name, if any, is simply no longer served).
 
 **The memory of the ancestry read** (the lens's E585-D12-L3). `AncestryShape`
 reads the same stream as the door, twice, so it holds the same element: on the
@@ -495,50 +515,53 @@ read the stream makes of a frame the sizing did not follow is
 above). Past it the ancestry is NOT
 read and the verdict is `could-not-evaluate(ancestry-over-memory)`
 (`submit_census_reason_ancestry_over_memory_total`,
-`reasons.ancestryOverMemory`): no green, and no fallback to the arm's parse,
-whose hydrated form of such a body is heavier still. On the lens's two bodies:
-the wide BUMP is `ancestry-over-memory` (151 MB by the estimate; up to 87,381
-leaves are read); the 900,000 minimal transactions are `would-fail(parse)`,
-the arm's own refusal (over `max_txs` 512), before any stream read.
+`submitReadinessCensus.wouldFailAndUnevalReasons.ancestryOverMemory`): no
+green. On the lens's two bodies: the wide BUMP is `ancestry-over-memory` (151
+MB by the estimate; up to 87,381 leaves are read), after the arm's own parse
+at step (1) held 190 MB natively; the 900,000 minimal transactions are
+`would-fail(ef-over-cap)`, the arm's 429 (#211, NL-6's to fix), after its
+whole-body parse and EF conversion (1,427,616,056 bytes natively, the land
+lens E585-LAND-M1) and before any stream read: no body is refused for its
+transaction count since NL-6.
 
 **No green on a non-answer** (the lens's E585-D12-L2). The verdict's last step
 is one function, `verdict_of_ancestry`: a covered ancestry is the only green;
 a stray, a read not made for its memory and a read no reader answered are the
 third state. Pinned there (the mutant that answers `GatedReady` on either
-non-answer is RED), and through `census_reading_under` with a body: a valid
+non-answer is RED), and through `census_verdict_under` with a body: a valid
 BEEF whose BUMP carries 2^12 leaves is `gated-ready` under a budget that holds
-its read and `ancestry-over-memory` one byte under it. After the L1 fold no
-body reaches the other non-answer (`Unread`) through `census_verdict`: the
-fallback is the parse step (1) already made of the same bytes. The mapping of
-the fallback's answer is one function too, `ancestry_of_the_arms_answer`
-(no answer is `Unread`), pinned by `e585f2_n2_the_fallbacks_non_answer_is_never_green`
-(RED against the delta lens's surviving mutant, `None` mapped to `Covered`:
-"left: Covered, right: Unread").
+its read and `ancestry-over-memory` one byte under it. No body reaches the
+other non-answer (`Unread`) through `census_verdict`: step (1)'s parse is the
+same decoder as the stream. A stream refusal maps straight to it
+(`StreamRead::Refused => Ancestry::Unread`), pinned by
+`e585f2_n2_the_fallbacks_non_answer_is_never_green` (re-stated by the land
+fold-6: RED against the refusal mapped to `Covered`, and by the shape on
+`e2c561c`, where the refusal went to the fallback: "a stream refusal is no
+answer, mapped at the one seam").
 
-Where it meets NL-6's size refusal, stated and left: `ef.rs`
-`beef_to_ef_batch` and `proven_subject_raw` parse with
-`beef_limits::parse_beef(.., EF_BEEF_LIMITS)` (10,000,036 bytes, 512
-transactions, 512 BUMPs) and hydrate a `Beef`. A body past those is
-`would-fail(parse)` here, which is TRUE of the gated arm (it refuses those
-bytes at that call), so it is a classification and not a stop; the census
-adds no size or count check of its own, and follows the arm when NL-6 moves
-`ef.rs` (its fallback CALLS `ef::parse_as_the_arm`, the arm's own parse, and
-moves with it). `would-fail(ef-over-cap)` is likewise the arm's own 429
-(`MAX_SUBJECT_EF_BYTES` 256 KB, `MAX_BATCH_EF_BYTES` 2 MB), mirrored. The
-memory of a census pass is therefore the arm's hydrated parse plus the small
-index; only the index and the stream's element are #585's. The arm's parse of
-the wide BUMP is 190 MB natively (the lens's N8) and runs in step (1), BEFORE
-the census's own bound is reached: on wasm32 that body is the isolate's to
-survive, with or without the census's limb.
+Where it meets NL-6, stated: `ef.rs` `beef_to_ef_batch` and
+`proven_subject_raw` parse with `beef_limits::parse_beef`, the streaming door,
+which refuses INVALID bytes only, then hydrate a `Beef` (`EF_BEEF_LIMITS` is a
+name only: no count or size is compared). So no body is `would-fail(parse)`
+for its size or its counts; the census adds no size or count check of its
+own and calls the arm's functions, so it moves with `ef.rs`.
+`would-fail(ef-over-cap)` is the arm's own 429 (`MAX_SUBJECT_EF_BYTES` 256
+KB, `MAX_BATCH_EF_BYTES` 2 MB), mirrored. The memory of a census pass is
+therefore the arm's hydrated parse and EF conversion plus the small index;
+only the index and the stream's element are #585's. The arm's parse runs in
+step (1), BEFORE the census's own bound is reached, and nothing but the
+isolate bounds it (the land lens E585-LAND-M1: 190 MB natively for the wide
+BUMP, 1.43 GB for the 900,000 minimal transactions): on wasm32 such a body is
+the isolate's to survive, with or without the census's limb.
 
 Limits, stated. The classification is synchronous on every ungated submit,
-and a body between 2 MiB and the route's 10 MB is now WORK where it was
-skipped: the arm's parse, the subject's EF conversion, the sizing read and two
-stream reads (each hashes every transaction once), and for bytes the stream
-refuses the arm's parse a second time; not measured on wasm32. The durable row
-`submit_census_reason_body_over_eval_bound_total` stays in the read table
-(`reasons.bodyOverEvalBound`: a total counted before is still served) and is
-never bumped again. `beef_limits::CENSUS_BEEF_LIMITS` has no production caller
+and a body past 2 MiB (the route caps no body since NL-6) is now WORK where it
+was skipped: the arm's parse, the subject's EF conversion, the sizing read and
+two stream reads (each hashes every transaction once); not measured on
+wasm32. The durable row `submit_census_reason_body_over_eval_bound_total`
+stays in the read table
+(`submitReadinessCensus.wouldFailAndUnevalReasons.bodyOverEvalBound`: a total
+counted before is still served) and is never bumped again. `beef_limits::CENSUS_BEEF_LIMITS` has no production caller
 left (the lens's N6: NL-6's file, theirs to drop).
 
 Pins: `cargo test --manifest-path workers/Cargo.toml -p
@@ -547,14 +570,16 @@ MB valid BEEF is `gated-ready`, one whose SUBJECT is the 5 MB is
 `would-fail(ef-over-cap)`, one with two tips is
 `could-not-evaluate(subject-ambiguous)`; RED on `d6d2774`, grafted:
 `CouldNotEvaluate(BodyOverEvalBound)`), `e585_d2_the_streams_ancestry_*` (the
-stream's answer AND the fallback's equal the hydrated parse's, kept verbatim
-in the test, for every transaction of every body named as the subject, the
-client fixture's bodies and a source written after its spender included),
+stream's answer equals the hydrated parse's, kept verbatim in the test, for
+every transaction of every body named as the subject, the client fixture's
+bodies and a source written after its spender included),
 `e585_d2_the_ancestry_index_*`. The fold's:
-`e585f_l1_a_body_the_stream_alone_refuses_is_the_arms_verdict` (a trailing
-byte and a flag byte with unknown bits: `gated-ready`, counted apart; a stray
-behind a trailing byte still the third state; RED on `8c92671`, the trailing
-body grafted: `CouldNotEvaluate(SubjectAmbiguous)`),
+`e585f_l1_a_body_the_stream_alone_refuses_is_the_arms_verdict` (re-stated
+over NL-6 and by the land fold-6: a trailing byte and a flag byte with unknown
+bits, and two tips behind a trailing byte, are `would-fail(parse)` at step
+(1); the census source holds no second reader; RED on `e2c561c` by the shape:
+"the census reads the ancestry through ONE reader, the stream:
+`parse_as_the_arm` is a second"), `e585f2_n2_*` (above),
 `e585f_l2_a_body_the_census_cannot_evaluate_is_never_guessed_green` (RED
 against both mutants) and `e585f_l3_the_ancestry_read_is_not_made_past_its_memory`.
 The pre-#585 pin `census_over_eval_bound_is_uneval_not_a_guess` is retired: it
@@ -1274,14 +1299,16 @@ routed around, never made a limit on a body.
   object was ever written and a "not now" over a large BEEF still answered
   502 (the lens's word: a "long topic list" never reached R2 either, the route
   caps topics at 100). Now `plan_replay` refuses nothing by bytes and
-  `QUEUE_BEEF_LIMITS.max_bytes` is the engine's own
-  (`ENGINE_BEEF_LIMITS.max_bytes`, what `/submit` admitted; the one constant
-  NL-6's rebase meets). A valid 500 KB "not now" body is acked `queued`
+  `QUEUE_BEEF_LIMITS.max_bytes` names the engine's own
+  (`ENGINE_BEEF_LIMITS.max_bytes`; the one constant NL-6's rebase meets), a
+  name only: NL-6's `parse_beef` reads no limit, so it bounds nothing. A valid 500 KB "not now" body is acked `queued`
   (200, `X-Overlay-Mutation: queued`), its object written under its key,
   read by the consumer, parked by key with its bytes at rest.
 - **The consumer.** A keyed message's object is read, checked (length, sha256,
-  the key naming that sha256, then `QUEUE_BEEF_LIMITS` as an inline body's
-  bytes are) and replayed exactly as an inline body: the same eviction read,
+  the key naming that sha256, then the parse an inline body's bytes get,
+  `beef_limits::parse_beef`, which refuses invalid bytes only;
+  `queue::replay_object`, the one function the R2 read and the stored-rows
+  reader call) and replayed exactly as an inline body: the same eviction read,
   `submit_with_report`, landing guard and write-side guard. A read fault and
   a mismatch are the replay's FAULT, class `fault`, never "not now": handed
   back, dead-lettered, parked. A MISSING object is judged (the twin, below).
@@ -1321,7 +1348,9 @@ routed around, never made a limit on a body.
   is a few hundred bytes); the lever re-drives the key and the consumer
   re-reads R2; `/health/invariants.deadLetters.r2` serves `bound`, `letters`
   and `bytes` (the bytes at rest, an index-only sum, migrations 179-181),
-  `inlineRoom` and `replayMaxBytes`.
+  `inlineRoom` and `replayMaxBytes` (the value `QUEUE_BEEF_LIMITS` names,
+  10,000,036; it bounds nothing since NL-6 and stays served because the route
+  cell reads it).
 - **The deletion rule** (the captain's decision; never a bucket expiry): an
   object is deleted (1) on the consumer's ACK, all three of them (landed,
   refused under an open eviction, re-evicted), after the batch's loop, with
@@ -2398,6 +2427,31 @@ on `e8ab762`), and the worker's `gasp_deferred::tests::e585_d4`
 statements in the storage's order under real SQLite; they do not compile on
 `e8ab762`). The route cell binds the upsert's two new parameters and reads
 `budget.chunkBytes`; it was not run in this lane (`make ci-d1-budget`).
+
+## The stored-rows reader (bsv-low #585, E585-land; the land fold-6)
+
+`crates/overlay-cloudflare/src/stored_rows.rs` (test-only) reads a D1 export
+(and the queue bucket's objects saved in a directory) natively, before a
+deploy of the streaming door, so a stored BEEF the door would refuse is named
+first. Every path CALLS the Worker's own read (the land lens E585-LAND-L3):
+the stored BEEFs (`transactions`, `transactions_evicted`, `pot_beefs`) by the
+Worker's `hex(beef) AS beef` and `d1::beef_of_hex_column` (so a BEEF stored as
+hex TEXT is its ASCII bytes and refused, as at the Worker), then
+`beef_limits::read_beef`, `own_proof` and `transaction_from_beef`; a parked
+letter as the lever re-drives it (`dead_letters::redrive_message`) and the
+consumer reads it (`queue::read_for_replay`, its R2 object through
+`queue::replay_object`; the `r2_key` column is not read); a deferred record by
+`gasp_deferred::read_deferred_graph` over the shipped statements and D1's
+column types. The run prints a `SUMMARY` and a `VERDICT` line and FAILS on any
+refusal and on any `UNREAD` row (an object not in the directory, a record's
+part missing). Run: `STORED_ROWS_INPUT=<export.sql> STORED_ROWS_R2_DIR=<dir>
+cargo test --manifest-path workers/Cargo.toml -p bsv-overlay-cloudflare --lib
+stored_rows::read_the_export -- --ignored --nocapture`. Pins
+`stored_rows::self_test` (`e585_land_f6_l3_*`: a letter through the consumer's
+own read, a deferred record as the Worker reads it, hex TEXT refused, an
+unread row failing the run; each RED on `e2c561c`, grafted). Left, stated: a
+table or column the export lacks reads as empty, and the deferred tables are
+given their own migrations first, as the Worker's first request would.
 
 ## Storage ownership (bsv-low #474)
 

@@ -336,6 +336,78 @@ pub const DEFERRED_GRAPHS_SELECT_SQL: &str = "SELECT outpoint, score FROM gasp_d
 pub const DEFERRED_GRAPH_GET_SQL: &str = "SELECT record, chunks, gen FROM gasp_deferred_graphs \
      WHERE host = ?1 AND topic = ?2 AND outpoint = ?3";
 
+/// One record's head row as [`DEFERRED_GRAPH_GET_SQL`] gives it.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub(crate) struct DeferredHead {
+    pub record: String,
+    pub chunks: Option<f64>,
+    pub gen: Option<String>,
+}
+
+/// The rows a deferred record is read from, each by its shipped statement
+/// ([`DEFERRED_GRAPH_GET_SQL`], [`DEFERRED_GRAPH_CHUNK_GET_SQL`]): the
+/// worker's are D1's (`d1_storage`), the stored-rows reader's an export's
+/// (`stored_rows`, the land lens E585-LAND-L3). A column of another type than
+/// the row's field is the port's `Fault`, as D1's deserialization faults.
+pub(crate) trait DeferredRows {
+    type Fault;
+    async fn head(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<Option<DeferredHead>, Self::Fault>;
+    async fn part(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+        gen: &str,
+        seq: u64,
+    ) -> Result<Option<String>, Self::Fault>;
+}
+
+/// What [`read_deferred_graph`] found.
+#[derive(Debug)]
+pub(crate) enum DeferredRead {
+    /// No head row.
+    Absent,
+    /// The record, whole.
+    Record(overlay_engine::gasp::DeferredGraph),
+    /// Part `seq` of generation `gen` is gone: the record cannot be resumed
+    /// (the worker drops it).
+    PartMissing { seq: u64, gen: String },
+    /// The JSON does not parse as a record.
+    Unparsed(String),
+}
+
+/// THE read of one deferred record (bsv-low #585 door 4): its head, then
+/// each further part of its generation, one a statement, then the parse.
+/// ONE function, called by the worker's `get_deferred_graph` and by the
+/// stored-rows reader, so the reader reads a record as the worker does.
+pub(crate) async fn read_deferred_graph<P: DeferredRows>(
+    rows: &P,
+    host: &str,
+    topic: &str,
+    outpoint: &str,
+) -> Result<DeferredRead, P::Fault> {
+    let Some(head) = rows.head(host, topic, outpoint).await? else {
+        return Ok(DeferredRead::Absent);
+    };
+    let mut json = head.record;
+    let gen = head.gen.unwrap_or_default();
+    for seq in 1..=head.chunks.unwrap_or(0.0).max(0.0) as u64 {
+        let Some(part) = rows.part(host, topic, outpoint, &gen, seq).await? else {
+            return Ok(DeferredRead::PartMissing { seq, gen });
+        };
+        json.push_str(&part);
+    }
+    Ok(match serde_json::from_str(&json) {
+        Ok(record) => DeferredRead::Record(record),
+        Err(e) => DeferredRead::Unparsed(e.to_string()),
+    })
+}
+
 /// Delete one record (converged or dropped).
 pub const DEFERRED_GRAPH_DELETE_SQL: &str = "DELETE FROM gasp_deferred_graphs \
      WHERE host = ?1 AND topic = ?2 AND outpoint = ?3";
@@ -1310,8 +1382,17 @@ mod tests {
         let get_src = &get_src[..get_src
             .find("async fn find_transactions_for_proof_check")
             .unwrap()];
-        assert!(get_src.contains("DEFERRED_GRAPH_CHUNK_GET_SQL"));
+        // The read is `read_deferred_graph` over D1's rows (the land lens
+        // E585-LAND-L3: one read, the stored-rows reader's too), and a torn
+        // record is dropped.
+        assert!(get_src.contains("read_deferred_graph(&D1DeferredRows(&self.db)"));
         assert!(get_src.contains("DEFERRED_GRAPH_CHUNKS_DELETE_SQL"));
+        let rows_src = &storage[storage
+            .find("impl crate::gasp_deferred::DeferredRows for D1DeferredRows")
+            .unwrap()..];
+        let rows_src = &rows_src[..rows_src.find("\n}\n").unwrap()];
+        assert!(rows_src.contains("DEFERRED_GRAPH_GET_SQL"));
+        assert!(rows_src.contains("DEFERRED_GRAPH_CHUNK_GET_SQL"));
     }
 
     /// bsv-low #585, DOOR 4: the ceiling is a BUDGET of room and a refusal
@@ -1492,8 +1573,8 @@ mod tests {
         );
         assert_eq!(v["budget"]["calls"], GASP_GRAPH_BUDGET_CALLS);
         assert_eq!(v["budget"]["ms"], GASP_GRAPH_BUDGET_MS);
-        // bsv-low #586: the two limbs, the engine's defaults (the bytes
-        // under the record cap since the lens fold's E586-L1).
+        // bsv-low #586: the two limbs, the engine's defaults (a budget per
+        // pass; no record cap since bsv-low #585 door 4).
         assert_eq!(v["budget"]["bytesFetched"], 917_504);
         assert_eq!(v["budget"]["nodes"], 64);
         // The limbs served are the ones the worker runs with (the vars).

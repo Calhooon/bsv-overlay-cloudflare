@@ -378,7 +378,9 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
         }
         // bsv-low #585 (door 3's fold-4): ONE bounded pass of the R2 orphan sweep on demand, the tick's own
         // function (bearer INTERNAL_TOKEN; body empty or {}).
-        (Method::Post, "/internal/beef-blob-sweep") => crate::beef_blob_sweep::internal_sweep(req, &env).await,
+        (Method::Post, "/internal/beef-blob-sweep") => {
+            crate::beef_blob_sweep::internal_sweep(req, &env).await
+        }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
 
@@ -1131,7 +1133,7 @@ fn build_engine_with_storage(
     // that many bytes, or appending that many nodes, in one pass is deferred
     // and resumed like one past its calls: a budget per pass, never a limit.
     // The vars GASP_GRAPH_BUDGET_BYTES / GASP_GRAPH_BUDGET_NODES, clamped;
-    // unset, the defaults (the bytes under the record cap, E586-L1).
+    // unset, the defaults (a budget per pass; no record cap since #585).
     let (limb_bytes, limb_nodes) = crate::gasp_deferred::graph_budget_limbs_from_env(env);
     engine.set_graph_budget_limbs(limb_bytes, limb_nodes);
 
@@ -2295,11 +2297,7 @@ async fn queue_handler(
         };
         let step = crate::queue::read_for_replay(&ports, body).await;
         if let (
-            crate::queue::ReadStep::Acked(_)
-            | crate::queue::ReadStep::Fault {
-                missing: true,
-                ..
-            },
+            crate::queue::ReadStep::Acked(_) | crate::queue::ReadStep::Fault { missing: true, .. },
             Some(db),
         ) = (&step, &counters)
         {
@@ -2341,7 +2339,8 @@ async fn queue_handler(
                     if missing {
                         crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_R2_MISSING_FAULT, 1)
                             .await;
-                        crate::dead_letters::note_failing_keeping_class(db, body, None, &fault).await;
+                        crate::dead_letters::note_failing_keeping_class(db, body, None, &fault)
+                            .await;
                     } else {
                         crate::dead_letters::note_failing(
                             db,

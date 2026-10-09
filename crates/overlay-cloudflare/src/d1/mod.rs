@@ -232,6 +232,24 @@ impl WhereBuilder {
 // Migration helper
 // =============================================================================
 
+/// Decode a stored BEEF's `hex(beef) AS beef` read-back (SQLite `hex()` emits
+/// UPPERCASE; `hex::decode` accepts either case). Empty or undecodable is
+/// `None`: an unusable row is never served as bytes. `hex()` of a TEXT value
+/// is the hex of its UTF-8 bytes, so a BEEF stored as hex TEXT reads back as
+/// those ASCII bytes and the door refuses it. ONE function for the read-backs
+/// of `transactions` and `pot_beefs` and for the stored-rows reader
+/// (`stored_rows`, the land lens E585-LAND-L3), so the reader types a column
+/// exactly as the Worker does.
+#[must_use]
+pub fn beef_of_hex_column(row_beef: Option<String>) -> Option<Vec<u8>> {
+    let bytes = hex::decode(row_beef?).ok()?;
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes)
+    }
+}
+
 /// Run a list of SQL migration statements against D1.
 ///
 /// The runner executes EVERY statement on EVERY cold start and propagates

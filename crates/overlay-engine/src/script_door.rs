@@ -113,12 +113,19 @@ pub(crate) const DOOR_CHARGES: StreamCharges = StreamCharges {
 /// chunks, one past a power of two so every growing buffer is at its
 /// slackest; bytes a chunk, the frame's own 4 a byte included): `OP_NOP`
 /// 98.0, `OP_0` 169.0, `OP_NOP`s then a reached `OP_CHECKSIG` 162.0,
-/// `OP_3DUP` 241.0, and 258.0 with a reached `OP_CHECKSIG` after them, the
-/// worst measured. Pushes cost less a byte (`0x01 xx OP_DROP` 66.7, `0x01 xx`
-/// unlocking 62.5). The charge is 512 a chunk (520 with the byte's 8): 2.0
-/// times the worst measured, and above the three parts at their worst at
-/// once (the records and their clone up to 96, three stack entries in a
-/// buffer that grows up to 216, the subscript's copies about 100).
+/// `OP_3DUP` 241.0, and 258.0 with a reached `OP_CHECKSIG` after them. The
+/// WORST known is an error path (the doors delta-2 lens E585-D12-DELTA2-L1):
+/// bsv-rs's `Spend::error` clones the stack into the error, so `OP_3DUP`s
+/// over empty entries to a stack just past a power of two (1,048,581
+/// entries) and then a refused `OP_VERIFY` is 297.0 a byte. Pushes cost less
+/// a byte (`0x01 xx OP_DROP` 66.7, `0x01 xx` unlocking 62.5). The charge is
+/// 512 a chunk (520 with the byte's 8, 524 with the frame's 4): 1.76 times
+/// the worst known natively, and about 3.5 times on wasm32 by arithmetic (a
+/// chunk 16 bytes and a `Vec` 12 there, about 150 a byte; not run). The
+/// interpreter's own 128 KB limit covers the element BYTES; this charge
+/// covers what it does not count: the records and their clones, the
+/// subscript, the stack ENTRIES (24 bytes natively, at most three net per
+/// opcode, in a buffer that doubles) and the error's clone of them.
 pub(crate) const SCRIPT_CHARGE_PER_CHUNK: u64 = 512;
 
 /// What one input's two scripts hold once parsed and run, per BYTE of each,

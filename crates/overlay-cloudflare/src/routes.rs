@@ -622,17 +622,18 @@ async fn submit_inner(
     // What does NOT stream today, said at the site: the body is read WHOLE
     // (`req.bytes()`), because everything below takes it whole (the engine's
     // `TaggedBEEF` holds a `Vec<u8>`, D1 stores the BEEF as a row's blob,
-    // the queue carries it base64 in one message), and this Worker has no R2
-    // binding to rest the bytes in. The doors stream over the held value.
-    // The irreducible bound left is the platform's (one isolate's memory and
-    // CPU slice, the plan's request-body limit), not a number of ours. When
-    // bsv-low #585 door 3 adds the R2 binding (buckets
-    // `low-overlay-beefs-beta` and `low-overlay-beefs`), THIS is the site
-    // that pipes `req.stream()` to the object and reads it back through
-    // `beef_limits::fold_beef`, one element in hand, and `d1_storage.rs`
-    // `insert_output` / `update_transaction_beef` are the sites whose row
-    // then holds a reference (D1's row bound is the platform's, routed
-    // around in R2, never a refusal).
+    // the queue carries it base64 in one message, or by key in R2 past its
+    // inline room). The doors stream over the held value. The irreducible
+    // bound left is the platform's (one isolate's memory and CPU slice, the
+    // plan's request-body limit), not a number of ours. bsv-low #585 door 3
+    // bound R2 (`BEEF_BLOBS`) for the QUEUE's carriage only (`queue.rs`: a
+    // replay past the message's room is written there before its send); the
+    // request itself is still read whole here and parsed whole below (the
+    // gated arm's `parse_beef` hydrates it, the land lens E585-LAND-M1).
+    // Streaming the request into R2 would start at THIS site (`req.stream()`
+    // to the object, read back through `beef_limits::fold_beef`), with
+    // `d1_storage.rs` `insert_output` / `update_transaction_beef` the sites
+    // whose row would then hold a reference; not built.
     let raw_body = req.bytes().await?;
 
     // Input validation
@@ -914,16 +915,11 @@ async fn submit_parts(
             // RESIDUAL (named): this counts only submits that ARRIVE. An
             // overlay outage is exactly when the client is least ready; that
             // slice stays with the client-side warn (bsv-low #351).
-            let reading = crate::submit_census::census_reading(&tagged_beef.beef);
-            let verdict = reading.verdict;
+            let verdict = crate::submit_census::census_verdict(&tagged_beef.beef);
             let (state_counter, reason_counter) =
                 crate::submit_census::census_counters(path, lenient_unbarred, verdict);
-            // bsv-low #585 (the doors lens L1): bytes the streaming reader
-            // refuses and the gated arm's parser takes are classified from
-            // the arm's own parse, and counted apart.
-            let stream_refused = reading.stream_refused;
             worker::console_log!(
-                "POST /submit census(#366): path={} population={} verdict={} → {}{}",
+                "POST /submit census(#366): path={} population={} verdict={} → {}",
                 path.as_str(),
                 if lenient_unbarred {
                     "client"
@@ -931,12 +927,7 @@ async fn submit_parts(
                     "operator"
                 },
                 verdict.as_str(),
-                state_counter,
-                if stream_refused {
-                    " (the streaming reader refused the bytes; the ancestry is the gated arm's parse)"
-                } else {
-                    ""
-                }
+                state_counter
             );
             // Precisely (gate LOW-1): the CLASSIFICATION above is SYNCHRONOUS
             // on every ungated submit — the gated arm's own parse, the
@@ -952,14 +943,6 @@ async fn submit_parts(
                     crate::ops::bump_counter(&census_db, state_counter, 1).await;
                     if let Some(reason) = reason_counter {
                         crate::ops::bump_counter(&census_db, reason, 1).await;
-                    }
-                    if stream_refused {
-                        crate::ops::bump_counter(
-                            &census_db,
-                            crate::submit_census::COUNTER_STREAM_REFUSED,
-                            1,
-                        )
-                        .await;
                     }
                 }),
                 Err(e) => {
@@ -2159,8 +2142,8 @@ async fn submit_parts(
     // never-broadcast attacker subject gets no row and stays behind the
     // merkle bar; a corroboration fault degrades to exactly the pre-#371
     // behaviour. Bounded: one subject parse + one GET per ADMITTED ungated
-    // submit, off the critical path (`wait_until`); the beef clone is capped
-    // by the 10MB body bound above (typical LOW BEEFs are KB-scale).
+    // submit, off the critical path (`wait_until`); the beef clone is the
+    // body's size (no body bound since NL-6; typical LOW BEEFs are KB-scale).
     if corroborate_seen_after_submit {
         if let Ok(seen_db) = env.d1("OVERLAY_DB") {
             let beef_for_seen = tagged_beef.beef.clone();

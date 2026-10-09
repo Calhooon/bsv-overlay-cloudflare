@@ -49,17 +49,6 @@ pub struct EfTx {
 /// captured bodies).
 pub use overlay_engine::subject::{sorted_last_txid_of, subject_txid_of};
 
-/// The gated arm's parse of a submitted BEEF: the one call
-/// [`beef_to_ef_batch`] makes, under NL-6's `EF_BEEF_LIMITS`. The census
-/// reads a body the streaming reader refuses through this same function
-/// (`submit_census`, the delta lens E585-D12-DELTA-N2), so the two cannot
-/// drift apart by a change of limits or of parser on one side alone.
-pub fn parse_as_the_arm(
-    beef_bytes: &[u8],
-) -> Result<bsv_rs::transaction::Beef, impl std::fmt::Display> {
-    beef_limits::parse_beef(beef_bytes, &beef_limits::EF_BEEF_LIMITS)
-}
-
 /// `(efs, subject_txid)` — EF entries for **unproven** transactions in
 /// dependency order, plus the txid of the BEEF's subject (last) transaction.
 /// `efs` is empty when every transaction already carries a merkle proof
@@ -74,7 +63,8 @@ pub fn parse_as_the_arm(
 /// broadcast fails with missing-inputs, which is exactly the right signal.
 /// Only the SUBJECT failing to convert is an error.
 pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfError> {
-    let mut beef = parse_as_the_arm(beef_bytes).map_err(|e| EfError::Parse(e.to_string()))?;
+    let mut beef = beef_limits::parse_beef(beef_bytes, &beef_limits::EF_BEEF_LIMITS)
+        .map_err(|e| EfError::Parse(e.to_string()))?;
     // The subject is order-independent (atomic name → unique tip → the
     // reference's sorted-last); the sort below only orders the EF legs.
     let subject_txid = subject_txid_of(&mut beef).unwrap_or_default();

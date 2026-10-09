@@ -587,12 +587,17 @@ impl DoorBudget {
     /// (1.4 to 1.8 s in a debug build), and the lens's 17,000 stop at the
     /// 1,024th in 108 ms. wasm32 was not measured.
     ///
-    /// THE MEMORY, 48 MiB: three eighths of a 128 MB isolate. Beside it stand
-    /// the request's body (up to the route's 10 MB), the completed BEEF the
-    /// route hands the door (a second copy of up to as much) and the EF batch
-    /// (the route's 2 MB bound, twice while it is serialized): 24 MB, which
-    /// leaves 56 MB for the module, the runtime, the allocator's
-    /// fragmentation and what a native estimate does not see of wasm32. What
+    /// THE MEMORY, 48 MiB: three eighths of a 128 MB isolate. Beside it stand,
+    /// for a 10 MB request (the figure the arithmetic is made at: since NL-6
+    /// the route caps no body, so a heavier one is the isolate's), the
+    /// request's body, the completed BEEF the route hands the door (a second
+    /// copy of up to as much) and the EF batch (the route's 2 MB bound, twice
+    /// while it is serialized): 24 MB, which leaves 56 MB for the module, the
+    /// runtime, the allocator's fragmentation and what a native estimate does
+    /// not see of wasm32. The limb bounds the DOOR alone: the route's own
+    /// hydrated parses before it are bounded by the isolate only (the land
+    /// lens E585-LAND-M1: 1.43 GB natively for a 9.9 MB body of 900,000
+    /// minimal transactions, before the route's 429). What
     /// it lets through, by the door's charges (`script_door::DOOR_CHARGES`,
     /// each an upper bound: the pins measure 1.3 to 5.3 times the heap the
     /// walk reaches): a BUMP of up to 72,944 leaves (690 bytes a level-0
@@ -1002,8 +1007,8 @@ impl Engine {
     ///
     /// The budget has two more limbs (bsv-low #586), in force with it at
     /// their defaults: the bytes one graph may be SERVED in one pass
-    /// ([`crate::gasp::DEFAULT_GRAPH_BUDGET_BYTES`], seven eighths of the
-    /// record cap so a pass it cuts leaves a record that fits) and the nodes it
+    /// ([`crate::gasp::DEFAULT_GRAPH_BUDGET_BYTES`], a budget per pass only:
+    /// a record has no byte bound since bsv-low #585 door 4) and the nodes it
     /// may APPEND ([`crate::gasp::DEFAULT_GRAPH_BUDGET_NODES`], 64);
     /// [`Engine::set_graph_budget_limbs`] names others.
     pub fn set_graph_budget(&mut self, sleep: SleepFactory, max_calls: u32, budget_ms: u64) {
@@ -1025,11 +1030,11 @@ impl Engine {
     /// They bound what one pass adds to the pending graph and to its record
     /// while the anchor check and the finalize hold it in memory. No effect
     /// until [`Engine::set_graph_budget`] turns deferral on; the reference
-    /// has neither. This setter is UNCAPPED (the delta lens's D-N1): a direct
-    /// consumer may set the bytes limb above its own record cap and re-open
-    /// E586-L1 (a pass whose record cannot be saved walks afresh); the worker's
-    /// `GASP_GRAPH_BUDGET_BYTES` var is the capped path (clamped to the cap).
-    /// Keep the bytes limb under the record cap you keep.
+    /// has neither. This setter is UNCAPPED, as the worker's
+    /// `GASP_GRAPH_BUDGET_BYTES` var is (bsv-low #585 door 4: the engine keeps
+    /// no record cap for the limb to sit under). A consumer whose STORAGE caps
+    /// a record must keep the bytes limb under that cap, or a pass whose
+    /// record cannot be saved walks afresh (E586-L1).
     pub fn set_graph_budget_limbs(&mut self, max_bytes_fetched: u64, max_nodes: u32) {
         self.graph_budget_limbs = (max_bytes_fetched, max_nodes);
     }

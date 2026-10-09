@@ -320,14 +320,11 @@ impl D1Storage {
         Ok(rows
             .into_iter()
             .filter_map(|r| {
-                r.beef
-                    .and_then(|h| hex::decode(h).ok())
-                    .filter(|b| !b.is_empty())
-                    .map(|beef| RebroadcastCandidate {
-                        tx: TransactionBeef { txid: r.txid, beef },
-                        attempts: r.attempts.unwrap_or(0.0) as i64,
-                        last_ms: r.last_ms.unwrap_or(0.0) as i64,
-                    })
+                crate::d1::beef_of_hex_column(r.beef).map(|beef| RebroadcastCandidate {
+                    tx: TransactionBeef { txid: r.txid, beef },
+                    attempts: r.attempts.unwrap_or(0.0) as i64,
+                    last_ms: r.last_ms.unwrap_or(0.0) as i64,
+                })
             })
             .collect())
     }
@@ -1063,41 +1060,11 @@ impl Storage for D1Storage {
         topic: &str,
         outpoint: &str,
     ) -> Result<Option<overlay_engine::gasp::DeferredGraph>, StorageError> {
-        #[derive(Deserialize)]
-        struct RecordRow {
-            record: String,
-            chunks: Option<f64>,
-            gen: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct PartRow {
-            part: String,
-        }
-        let row: Option<RecordRow> = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_GET_SQL)
-            .bind(host)
-            .bind(topic)
-            .bind(outpoint)
-            .fetch_optional(&self.db)
-            .await
-            .map_err(d1_err)?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        // bsv-low #585: the rest of a chunked record, one part a statement.
-        let mut json = row.record;
-        let gen = row.gen.unwrap_or_default();
-        for seq in 1..=row.chunks.unwrap_or(0.0).max(0.0) as u64 {
-            let part: Option<PartRow> =
-                Query::new(crate::gasp_deferred::DEFERRED_GRAPH_CHUNK_GET_SQL)
-                    .bind(host)
-                    .bind(topic)
-                    .bind(outpoint)
-                    .bind(gen.as_str())
-                    .bind(seq as f64)
-                    .fetch_optional(&self.db)
-                    .await
-                    .map_err(d1_err)?;
-            let Some(part) = part else {
+        use crate::gasp_deferred::{read_deferred_graph, DeferredRead};
+        match read_deferred_graph(&D1DeferredRows(&self.db), host, topic, outpoint).await? {
+            DeferredRead::Absent => Ok(None),
+            DeferredRead::Record(record) => Ok(Some(record)),
+            DeferredRead::PartMissing { seq, gen } => {
                 // A part is gone (the table is transient): the record cannot
                 // be resumed and would fault every pass, so it goes, and the
                 // walk starts from its root as after any lost row.
@@ -1105,13 +1072,10 @@ impl Storage for D1Storage {
                     "GASP deferred graph {outpoint} of {host} for {topic}: part {seq} of generation {gen} is missing, the record is dropped (bsv-low #585)"
                 );
                 self.delete_deferred_graph(host, topic, outpoint).await?;
-                return Ok(None);
-            };
-            json.push_str(&part.part);
+                Ok(None)
+            }
+            DeferredRead::Unparsed(e) => Err(StorageError::Serialization(e)),
         }
-        serde_json::from_str(&json)
-            .map(Some)
-            .map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
     async fn delete_deferred_graph(
@@ -1175,12 +1139,57 @@ impl Storage for D1Storage {
         Ok(rows
             .into_iter()
             .filter_map(|r| {
-                r.beef
-                    .and_then(|h| hex::decode(h).ok())
-                    .filter(|b| !b.is_empty())
+                crate::d1::beef_of_hex_column(r.beef)
                     .map(|beef| TransactionBeef { txid: r.txid, beef })
             })
             .collect())
+    }
+}
+
+/// The worker's [`crate::gasp_deferred::DeferredRows`]: D1, by the shipped
+/// statements.
+struct D1DeferredRows<'a>(&'a D1Database);
+
+impl crate::gasp_deferred::DeferredRows for D1DeferredRows<'_> {
+    type Fault = StorageError;
+
+    async fn head(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<Option<crate::gasp_deferred::DeferredHead>, StorageError> {
+        Query::new(crate::gasp_deferred::DEFERRED_GRAPH_GET_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(outpoint)
+            .fetch_optional(self.0)
+            .await
+            .map_err(d1_err)
+    }
+
+    async fn part(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+        gen: &str,
+        seq: u64,
+    ) -> Result<Option<String>, StorageError> {
+        #[derive(Deserialize)]
+        struct PartRow {
+            part: String,
+        }
+        let part: Option<PartRow> = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_CHUNK_GET_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(outpoint)
+            .bind(gen)
+            .bind(seq as f64)
+            .fetch_optional(self.0)
+            .await
+            .map_err(d1_err)?;
+        Ok(part.map(|p| p.part))
     }
 }
 

@@ -659,12 +659,14 @@ pub async fn read_beef(env: &worker::Env, r: &BeefRef) -> Result<Vec<u8>, BlobFa
     let bucket = env
         .bucket(BEEF_BLOBS_BINDING)
         .map_err(|e| BlobFault::Read(format!("{BEEF_BLOBS_BINDING} binding unavailable: {e}")))?;
-    let object = bucket
+    let Some(object) = bucket
         .get(r.key.as_str())
         .execute()
         .await
         .map_err(|e| BlobFault::Read(e.to_string()))?
-        .ok_or_else(|| BlobFault::Missing(r.key.clone()))?;
+    else {
+        return replay_object(r, None);
+    };
     let body = object
         .body()
         .ok_or_else(|| BlobFault::Read(format!("the object {} has no body", r.key)))?;
@@ -672,6 +674,15 @@ pub async fn read_beef(env: &worker::Env, r: &BeefRef) -> Result<Vec<u8>, BlobFa
         .bytes()
         .await
         .map_err(|e| BlobFault::Read(e.to_string()))?;
+    replay_object(r, Some(bytes))
+}
+
+/// What the replay makes of the object a store gave for `r` (`None`: no object under the key): MISSING, the bytes
+/// [`check_replay_blob`] refuses, or the bytes. ONE function, called by the worker's R2 read ([`read_beef`]) and by
+/// the stored-rows reader's (`stored_rows`, the land lens E585-LAND-L3), so the reader can neither accept an object
+/// the replay refuses nor refuse one it accepts.
+pub(crate) fn replay_object(r: &BeefRef, got: Option<Vec<u8>>) -> Result<Vec<u8>, BlobFault> {
+    let bytes = got.ok_or_else(|| BlobFault::Missing(r.key.clone()))?;
     check_replay_blob(r, &bytes).map_err(BlobFault::Refused)?;
     Ok(bytes)
 }
