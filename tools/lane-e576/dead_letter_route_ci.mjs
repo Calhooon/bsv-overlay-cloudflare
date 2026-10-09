@@ -214,7 +214,11 @@ expect(!!reparked, `a re-driven letter that fails again parks AGAIN on its own r
 if (reparked) {
   const hist = JSON.parse(reparked.history)
   expect(
-    Number(reparked.redrives) === 1 && hist.length === 1 && hist[0].redrive === 1 && /subject could not be derived/.test(hist[0].fault ?? ''),
+    // The fixture's bytes are refused by the replay's BEEF reader: before P0-5f (bsv-rs 0.3.35, the bounded
+    // stranger readers, overlay a8a8d73) they parsed to a BEEF whose subject could not be derived; since, the
+    // bounded reader refuses them first ("reader underflow"). Either is the re-driven replay's own fault, and
+    // the history must carry the fault the row carries.
+    Number(reparked.redrives) === 1 && hist.length === 1 && hist[0].redrive === 1 && typeof hist[0].fault === 'string' && hist[0].fault.length > 0 && hist[0].fault === reparked.fault && /subject could not be derived|reader underflow/.test(hist[0].fault),
     "its history names the re-drive and the re-driven replay's fault",
     JSON.stringify({ ...reparked, message: '…' }),
   )
