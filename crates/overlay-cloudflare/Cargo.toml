@@ -34,6 +34,12 @@ bsv-rs = { workspace = true, features = ["wasm"] }
 # `init_panic_hook()` and `WorkerStorageClient` — and both are unchanged
 # across the bump: 0.1 → 0.3 needed ZERO source edits here.
 bsv-middleware-cloudflare = "=0.4.1"
+# The middleware's own SDK (NL-6, 2026-10-09). `bsv-middleware-cloudflare` 0.4.1 is
+# built on bsv-rs 0.3 and its `WorkerStorageClient::new` takes THAT line's
+# `ProtoWallet`, so the one wallet handed across the seam (`wallet/client.rs`)
+# is built from this crate. It leaves with the middleware's move to 0.4
+# (Calhooon/bsv-middleware-cloudflare #50); nothing else here may use it.
+bsv-rs-03 = { package = "bsv-rs", version = "0.3.35", default-features = false, features = ["wallet"] }
 async-trait.workspace = true
 base64 = "0.22"
 hex.workspace = true
