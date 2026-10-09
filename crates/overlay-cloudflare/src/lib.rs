@@ -2270,21 +2270,70 @@ async fn queue_handler(
         }
 
         // bsv-low #585 (door 3): a message that names an R2 object replays THAT object's bytes, read and checked
-        // (length, sha256, the consumer's own BEEF policy), exactly as an inline body from here on. A missing
-        // object, a read fault and a mismatch are the replay's FAULT (never "not now"): handed back, dead-lettered,
-        // parked with the key.
+        // (length, sha256, the consumer's own BEEF policy), exactly as an inline body from here on. A read fault
+        // and a mismatch are the replay's FAULT (never "not now"): handed back, dead-lettered, parked with the key.
+        // A MISSING object (the d3 fold, the twin) is judged by the message's SUBJECT: a twin of the same bytes,
+        // topics and mode shares the object and the first ack deleted it, so a subject under an open eviction or
+        // with an applied row in every topic named is acked (a dupe, no letter, nothing to delete: the object is
+        // gone); one not shown landed is the replay's FAULT, as before.
         let read = match &body.r2 {
             None => crate::queue::decode_replay_beef(&body.beef_b64)
                 .map_err(|e| format!("invalid base64 BEEF ({e})")),
             Some(r) => match crate::queue::read_beef(&env, r).await {
                 Ok(b) => Ok(b),
-                Err(f) => {
-                    if let (crate::queue::BlobFault::Missing(_), Some(db)) = (&f, &counters) {
-                        crate::ops::bump_counter(db, crate::ops::COUNTER_BEEF_BLOBS_MISSING, 1)
-                            .await;
+                Err(f @ crate::queue::BlobFault::Missing(_)) => {
+                    let verdict = match &counters {
+                        Some(db) => {
+                            crate::ops::bump_counter(db, crate::ops::COUNTER_BEEF_BLOBS_MISSING, 1)
+                                .await;
+                            crate::queue::judge_missing(db, &body.topics, r).await
+                        }
+                        None => crate::queue::MissingVerdict::Fault(
+                            "OVERLAY_DB binding unavailable".to_string(),
+                        ),
+                    };
+                    match verdict {
+                        crate::queue::MissingVerdict::Fault(e) => {
+                            if let Some(db) = &counters {
+                                crate::ops::bump_counter(
+                                    db,
+                                    crate::ops::COUNTER_QUEUE_R2_MISSING_FAULT,
+                                    1,
+                                )
+                                .await;
+                            }
+                            Err(format!("{}; {e}", f.says()))
+                        }
+                        acked => {
+                            let (why, counter) = if acked == crate::queue::MissingVerdict::Twin {
+                                (
+                                    crate::dead_letters::Resolved::Twin,
+                                    crate::ops::COUNTER_QUEUE_R2_TWIN_ACKED,
+                                )
+                            } else {
+                                (
+                                    crate::dead_letters::Resolved::RefusedEvicted,
+                                    crate::ops::COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
+                                )
+                            };
+                            worker::console_log!(
+                                "Queue: the R2 object {} is MISSING and its replay is acked: {}",
+                                r.key,
+                                why.says()
+                            );
+                            if let Some(db) = &counters {
+                                crate::ops::bump_counter(db, counter, 1).await;
+                                let row_object =
+                                    crate::dead_letters::resolve(db, body, r.txid.as_deref(), why)
+                                        .await;
+                                acked_objects.extend(row_object);
+                            }
+                            msg.ack();
+                            continue;
+                        }
                     }
-                    Err(f.says())
                 }
+                Err(f) => Err(f.says()),
             },
         };
         let beef = match read {

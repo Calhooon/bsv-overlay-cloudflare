@@ -223,6 +223,13 @@ pub const COUNTER_BEEF_BLOBS_DELETED: &str = "beef_blobs_deleted_total";
 pub const COUNTER_BEEF_BLOBS_DELETE_FAULTS: &str = "beef_blobs_delete_faults_total";
 /// bsv-low #585 (door 3): a replay whose R2 object was MISSING at the consumer's read (a fault letter).
 pub const COUNTER_BEEF_BLOBS_MISSING: &str = "beef_blobs_missing_total";
+/// bsv-low #585 (the d3 fold): a replay whose R2 object was MISSING and whose subject's applied rows show its
+/// bytes landed (a twin of an acked message): acked as a dupe, no letter.
+pub const COUNTER_QUEUE_R2_TWIN_ACKED: &str = "queue_r2_twin_acked_total";
+/// bsv-low #585 (the d3 fold): a replay whose R2 object was MISSING and whose subject is NOT shown landed: the
+/// replay's fault (a fault letter). `beef_blobs_missing_total` counts every missing read, these two its verdicts
+/// (the rest were acked under an open eviction).
+pub const COUNTER_QUEUE_R2_MISSING_FAULT: &str = "queue_r2_missing_fault_total";
 /// loop 18: an eviction pass that could not prove every table clean (a faulted read, a survivor after the
 /// second move) — the open marker stands; the write-side guard and the next eviction converge.
 pub const COUNTER_ADMIT_FAST_EVICT_INCOMPLETE: &str = "admit_fast_evict_incomplete_total";
@@ -925,6 +932,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_BEEF_BLOBS_DELETED,
         COUNTER_BEEF_BLOBS_DELETE_FAULTS,
         COUNTER_BEEF_BLOBS_MISSING,
+        COUNTER_QUEUE_R2_TWIN_ACKED,
+        COUNTER_QUEUE_R2_MISSING_FAULT,
         COUNTER_ARC_INGEST_SEEN_LATCHED,
         COUNTER_ARC_INGEST_EVICTED,
         COUNTER_ARC_INGEST_READMITTED,

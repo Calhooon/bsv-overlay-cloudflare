@@ -931,6 +931,9 @@ pub enum Resolved {
     RefusedEvicted,
     /// The replay landed and an eviction that opened meanwhile took its rows out again.
     ReEvicted,
+    /// bsv-low #585 (the d3 fold): the message's R2 object was gone (a twin's ack deleted it) and its subject holds
+    /// an applied row in every topic it names: a dupe, nothing written.
+    Twin,
 }
 
 impl Resolved {
@@ -944,6 +947,9 @@ impl Resolved {
             }
             Self::ReEvicted => {
                 "its bytes landed and were re-evicted under an eviction that opened meanwhile"
+            }
+            Self::Twin => {
+                "its R2 object was gone and its subject's applied rows show its bytes landed (a twin; nothing written)"
             }
         }
     }
@@ -3067,15 +3073,15 @@ mod tests {
         );
         let resolves = body.matches("crate::dead_letters::resolve(").count();
         assert_eq!(
-            resolves, 3,
-            "the eviction skip, the re-eviction and the durable ack"
+            resolves, 4,
+            "the eviction skip, the re-eviction, the durable ack, and (bsv-low #585, the d3 fold) the twin whose R2 object was gone"
         );
         assert_eq!(
             body.matches("msg.ack();").count(),
-            4,
-            "the only acks: the eviction skip, the re-eviction, the durable ack, and a deferred EF job's (NL-6c: \
-             its own row carries its runs and the cron hands it back, so it never rides the platform's retries \
-             or the dead letters)"
+            5,
+            "the only acks: the eviction skip, the re-eviction, the durable ack, the twin (bsv-low #585 door 3), and a \
+             deferred EF job's (NL-6c: its own row carries its runs and the cron hands it back, so it never rides \
+             the platform's retries or the dead letters)"
         );
     }
 

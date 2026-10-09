@@ -863,9 +863,33 @@ routed around, never made a limit on a body.
 - **The consumer.** A keyed message's object is read, checked (length, sha256,
   the key naming that sha256, then `QUEUE_BEEF_LIMITS` as an inline body's
   bytes are) and replayed exactly as an inline body: the same eviction read,
-  `submit_with_report`, landing guard and write-side guard. A MISSING object
-  (`beef_blobs_missing_total`), a read fault and a mismatch are the replay's
-  FAULT, class `fault`, never "not now": handed back, dead-lettered, parked.
+  `submit_with_report`, landing guard and write-side guard. A read fault and
+  a mismatch are the replay's FAULT, class `fault`, never "not now": handed
+  back, dead-lettered, parked. A MISSING object is judged (the twin, below).
+- **The twin (the d3 fold).** Two messages of the same bytes, topics and mode
+  (a client's retry of a large JOIN) name ONE object, and the first ack
+  deletes it. A message whose object is MISSING on read
+  (`beef_blobs_missing_total`, every one) is judged by its SUBJECT, the
+  message's own `r2.txid` (`queue::judge_missing`, two D1 reads at most,
+  `missing_verdict`): (1) under an OPEN eviction it is acked as the replay
+  with its bytes would be (that check reads the subject alone;
+  `queue_replay_skipped_evicted_total`); (2) with an applied row in EVERY
+  topic the message names (`TWIN_APPLIED_SQL`, one read of
+  `applied_transactions`) it is a DUPE: acked, counted
+  `queue_r2_twin_acked_total`, its note or parked row deleted (`RESOLVED ...
+  a twin`), no letter. That is the engine's own dedup rule: the replay with
+  the bytes would have written nothing in a topic that holds the row.
+  (3) Otherwise (a topic without the row, a message naming no subject, a
+  ledger or applied read that faulted) it is the replay's FAULT as before,
+  counted apart (`queue_r2_missing_fault_total`): handed back, dead-lettered,
+  parked as a `fault` letter. Such a letter is no longer stuck for good: its
+  re-drive is judged again and acks once the subject has landed by any road
+  (the client's re-presentation, a GASP peer). The deletion stays on the
+  ack. A REFERENCE COUNT was not chosen: the object has two writers (the
+  door, the lever's re-drive) and its names live in the queue and in D1
+  while the object lives in R2, with no transaction across them; a count
+  could be wrong both ways (an object deleted under a live message, or kept
+  for good), and the applied rows are the fact a count would stand for.
 - **The dead letters.** The DLQ consumer parks the KEY without a read (the row
   is a few hundred bytes); the lever re-drives the key and the consumer
   re-reads R2; `/health/invariants.deadLetters.r2` serves `bound`, `letters`
@@ -888,12 +912,17 @@ re-presented; a delete that faulted; a batch that died between its acks and
 its deletes; a main-queue message or a dead letter the platform dropped
 without the LOST line (retention; `attempts` unreadable, the ~8.3 h case); a
 letter the operator deleted by SQL. Nothing lists them: the health block
-counts the letters' objects from D1, not the bucket's. (2) TWINS: two messages
-of the same bytes, topics and mode (a client re-presenting a "not now"
-successor) name ONE object, and the first ack deletes it; the other, if it is
-in a later batch, finds it MISSING and becomes a fault letter that can never
-re-drive, to be discarded. The cure, not built: on a missing object, an ack
-when the subject's applied rows show its bytes landed. (3) The whole object is
+counts the letters' objects from D1, not the bucket's. (2) TWINS, cured (the
+twin rule above); what is left: a twin whose first message was acked WITHOUT
+landing in every topic it names is a fault letter still (no instance known:
+the three acks are landed, refused under an eviction, re-evicted, and the two
+eviction acks are read again by the twin's own verdict while the eviction is
+open; one closed in between, with nothing landed, parks the twin as a fault
+letter whose re-drive acks once the readmitted subject lands). A twin acked
+as a dupe told no lookup service anything and landed no carried predecessor:
+the first message's replay did. "Landed" reads `applied_transactions`, so
+limit (7) of the faulted-submit section holds here too (never wipe it
+alone). (3) The whole object is
 read into the isolate (its bytes, then the parse): memory is the body's.
 (4) Whether the platform counts a message's 128 KB as this JSON is not
 verified; 4,000 bytes are left under the decimal reading. (5) R2 costs a
@@ -909,7 +938,20 @@ checked under the consumer's policy; a keyed letter parked, re-driven, MISSING
 as a fault, discarded; the copy rule; the write before the send and every ack
 deleting; LOST and the discard deleting; the three configs' bindings). None
 compiles on `6926f2c`, whose own pin asserts `None` past 90,000 bytes; each is
-RED against a revert mutant of its rule (five run). Amended: three `e576*`
+RED against a revert mutant of its rule (five run). The twin's pins, `--lib
+e585_d3f` (`beef_door_replay::twin`):
+`*_a_twin_whose_object_is_gone_is_a_dupe_and_an_unlanded_one_a_fault` (two
+identical valid 500 KB submissions, one object; the first lands and its ack
+deletes it; the second reads none, finds the applied rows over the shipped
+read and is acked with no letter; a third whose bytes never landed parks as
+a `fault` letter; half landed is a fault; RED with the verdict put back to
+`45aceff`'s rule: `left: Fault(".. is MISSING ..") right: Acked(Twin)`) and
+`*_the_verdict_reads_the_ledger_first_and_a_faulted_read_is_never_landed`
+(the other arms and the consumer's source shape; RED over `45aceff`'s
+`lib.rs`: "the consumer judges a MISSING object"). Neither compiles on
+`45aceff`. Amended: `e585_d3_the_write_precedes_the_send_and_the_ack_deletes`
+(one ack names no object) and
+`e576_the_main_consumer_notes_each_retry_and_resolves_each_ack` (four acks). Amended: three `e576*`
 pins for the statements' new `r2_key` column and `park_query_r2`. The route
 cell `tools/lane-e585/beef_blobs_route_ci.mjs` (`make ci-d1-budget`, the
 overlay at `MUTATION_QUEUE_INLINE_ROOM:4096`): three ~8 KB "not now" letters

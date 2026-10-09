@@ -37,9 +37,20 @@
 //!   the same key again): never deleted here, a twin's message may name it.
 //! * THE READ: the consumer fetches the object, checks its length and sha256
 //!   against the message's (and the key's), then replays it exactly as an
-//!   inline body. A MISSING object, a read fault and a mismatch are each the
-//!   replay's FAULT (class `fault`, never "not now"): handed back,
-//!   dead-lettered, parked with the key.
+//!   inline body. A read fault and a mismatch are each the replay's FAULT
+//!   (class `fault`, never "not now"): handed back, dead-lettered, parked
+//!   with the key.
+//! * THE TWIN (the d3 fold): two messages of the same bytes, topics and mode
+//!   (a client re-presenting a large JOIN) name ONE object, and the first
+//!   ack deletes it. A message whose object is MISSING is therefore judged
+//!   by its SUBJECT ([`missing_verdict`]): under an open eviction it is
+//!   acked as the replay with bytes would be; with an applied row in every
+//!   topic it names it is a DUPE (the engine's own dedup rule: the replay
+//!   with bytes would write nothing), acked, no letter; otherwise it is the
+//!   replay's FAULT, as before. The rule holds no reference count: the
+//!   object's writers are the door and the lever, in two stores (R2 and D1)
+//!   with no transaction across them, so a count could be wrong in both
+//!   directions; the applied rows are the fact the count would stand for.
 //! * THE DELETION RULE: an object is deleted on the consumer's ACK (at the
 //!   end of its batch), when its dead letter is LOST (the DLQ's last
 //!   delivery, not parked) or dropped as the lighter copy of a parked key,
@@ -422,6 +433,99 @@ impl BlobFault {
             Self::Refused(e) => format!("the R2 object was refused ({e})"),
         }
     }
+}
+
+/// The applied rows of one subject (the d3 fold's twin verdict). Bind: the txid. One read, by `idx_applied`.
+pub const TWIN_APPLIED_SQL: &str = "SELECT topic FROM applied_transactions WHERE txid = ?1";
+
+/// What the consumer does with a keyed message whose R2 object is MISSING (the d3 fold).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingVerdict {
+    /// Every topic the message names holds an applied row of its subject: a twin's replay (or the subject's own
+    /// earlier submit) landed these bytes. A DUPE: acked, no letter.
+    Twin,
+    /// The subject is under an OPEN eviction: acked, exactly as the replay with its bytes would be (that check
+    /// reads the subject alone).
+    Evicted,
+    /// Not shown landed: the replay's FAULT (class `fault`), as every missing object was before the fold. The
+    /// text is appended to [`BlobFault::says`].
+    Fault(String),
+}
+
+/// PURE: the verdict over a MISSING object. `subject` is the message's ([`BeefRef::txid`]); `evicted` the
+/// eviction ledger's answer for it; `applied` the topics holding an applied row of it ([`TWIN_APPLIED_SQL`]). A
+/// read that faulted is never "landed": the message is handed back and asked again at its next delivery.
+#[must_use]
+pub fn missing_verdict(
+    subject: Option<&str>,
+    topics: &[String],
+    evicted: &Result<bool, String>,
+    applied: &Result<Vec<String>, String>,
+) -> MissingVerdict {
+    let Some(subject) = subject else {
+        return MissingVerdict::Fault(
+            "the message names no subject, so nothing shows its bytes landed".to_string(),
+        );
+    };
+    match evicted {
+        Ok(true) => return MissingVerdict::Evicted,
+        Ok(false) => {}
+        Err(e) => {
+            return MissingVerdict::Fault(format!(
+                "the eviction ledger could not be read for {subject} ({e})"
+            ))
+        }
+    }
+    let applied = match applied {
+        Ok(a) => a,
+        Err(e) => {
+            return MissingVerdict::Fault(format!(
+                "the applied rows of {subject} could not be read ({e})"
+            ))
+        }
+    };
+    let unlanded: Vec<&str> = topics
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !applied.iter().any(|a| a == t))
+        .collect();
+    if topics.is_empty() || !unlanded.is_empty() {
+        return MissingVerdict::Fault(format!(
+            "{subject} holds no applied row in [{}]: its bytes did not land",
+            unlanded.join(",")
+        ));
+    }
+    MissingVerdict::Twin
+}
+
+/// The consumer's judgement of a keyed message whose object is MISSING: two D1 reads at most (the eviction
+/// ledger, then the subject's applied rows), then [`missing_verdict`].
+pub async fn judge_missing(
+    db: &worker::D1Database,
+    topics: &[String],
+    r: &BeefRef,
+) -> MissingVerdict {
+    #[derive(Deserialize)]
+    struct Applied {
+        topic: String,
+    }
+    let Some(subject) = r.txid.as_deref() else {
+        return missing_verdict(None, topics, &Ok(false), &Ok(Vec::new()));
+    };
+    let evicted = crate::admit_fast::open_eviction(db, subject)
+        .await
+        .map(|e| e.is_some());
+    let applied = if evicted == Ok(false) {
+        crate::d1::Query::new(TWIN_APPLIED_SQL)
+            .bind(subject.to_ascii_lowercase().as_str())
+            .fetch_all::<Applied>(db)
+            .await
+            .map(|rows| rows.into_iter().map(|a| a.topic).collect())
+            .map_err(|e| e.to_string())
+    } else {
+        Ok(Vec::new())
+    };
+    missing_verdict(Some(subject), topics, &evicted, &applied)
 }
 
 /// The consumer's read of a keyed message's bytes: the object, checked ([`check_replay_blob`]).
@@ -875,9 +979,10 @@ mod tests {
         assert!(h.contains("crate::queue::read_beef(&env, r).await"));
         assert_eq!(
             h.matches("acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));")
-                .count(),
+                .count()
+                + 1,
             h.matches("msg.ack();").count(),
-            "every ack deletes its object"
+            "every ack deletes its object, but the one of a message whose object was MISSING (the d3 fold)"
         );
         let (last_ack, delete) = (
             h.rfind("msg.ack();").unwrap(),
