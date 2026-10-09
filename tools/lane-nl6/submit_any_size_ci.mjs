@@ -59,8 +59,19 @@ async function submit(body, { token } = {}) {
     'x-submit-mode': 'historical-tx-no-spv',
   }
   if (token) headers['Authorization'] = `Bearer ${token}`
-  const res = await fetch(`${BASE}/submit`, { method: 'POST', headers, body })
-  return { status: res.status, text: await res.text() }
+  // `wrangler dev` answers 503 "Your worker restarted mid-request" from its
+  // own proxy when it reloads the worker, and retries only GET and HEAD. That
+  // answer is the dev server's, not the route's, so a POST that meets it is
+  // sent again (and the retry is printed). Any other 503 is not retried.
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(`${BASE}/submit`, { method: 'POST', headers, body })
+    const text = await res.text()
+    if (res.status === 503 && /restarted mid-request/.test(text) && attempt < 3) {
+      console.log(`      (wrangler dev reloaded the worker; sending the ${body.length}-byte body again)`)
+      continue
+    }
+    return { status: res.status, text }
+  }
 }
 
 let failures = 0
@@ -68,6 +79,11 @@ function expect(label, ok, got) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}  → ${got}`)
   if (!ok) failures++
 }
+
+// Size is no bar and no pass: an unauthenticated body over the former cap
+// meets the same gate as a small one (401), not a size refusal.
+const unauth = await submit(paddedBeef(FORMER_CAP + 1))
+expect('unauthenticated, 10,000,001 bytes: the gate answers (401), not a size refusal', unauth.status === 401, `status=${unauth.status}`)
 
 // The control: the same shape under the former cap is read (200, nothing admitted).
 const under = await submit(paddedBeef(100_000), { token: 'ci-submit-tok' })
@@ -83,10 +99,20 @@ for (const size of [FORMER_CAP + 1, 12 * 1024 * 1024]) {
   )
 }
 
-// Size is no bar and no pass: an unauthenticated body over the former cap
-// meets the same gate as a small one (401), not a size refusal.
-const unauth = await submit(paddedBeef(FORMER_CAP + 1))
-expect('unauthenticated, 10,000,001 bytes: the gate answers (401), not a size refusal', unauth.status === 401, `status=${unauth.status}`)
+// Invalid bytes are what a door refuses, and it names them: the offset and
+// the kind. A valid body and one byte after its frame, and a bad version word.
+const trailing = Buffer.concat([paddedBeef(100_000), Buffer.from([0x00])])
+for (const [label, body, named] of [
+  ['a byte after the frame', trailing, 'invalid BEEF at byte 100000: TrailingBytes'],
+  ['a bad version word', Buffer.from([0xde, 0xad, 0xbe, 0xef]), 'invalid BEEF at byte 0: BadVersion'],
+]) {
+  const r = await submit(body, { token: 'ci-submit-tok' })
+  expect(
+    `operator, ${label}: refused as "${named}"`,
+    r.status === 400 && r.text.includes(named),
+    `status=${r.status} ${r.text.slice(0, 160)}`,
+  )
+}
 
 if (failures) {
   console.error(`\nNL-6 submit-any-size route witness: ${failures} expectation(s) FAILED.`)

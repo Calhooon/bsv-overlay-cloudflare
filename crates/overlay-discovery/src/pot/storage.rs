@@ -981,10 +981,9 @@ pub trait PotStorage {
 /// (the verifying writers record it as the row's `proofHeight`, the
 /// revalidation sweep's window anchor; round-2 review M4).
 pub fn pot_beef_bump_height(txid: &str, beef: &[u8]) -> Option<u64> {
-    let parsed = beef_limits::parse_beef(beef, &beef_limits::STORED_BEEF_LIMITS).ok()?;
-    let btx = parsed.find_txid(txid)?;
-    let bump = parsed.bumps.get(btx.bump_index()?)?;
-    Some(u64::from(bump.block_height))
+    // Streaming folds over the stored bytes: one element in hand, no `Beef`
+    // built (NL-6).
+    beef_limits::own_bump(beef, txid).map(|bump| u64::from(bump.block_height))
 }
 
 /// Whether `beef` carries a merkle proof for `txid`'s OWN tx (not an
@@ -992,13 +991,8 @@ pub fn pot_beef_bump_height(txid: &str, beef: &[u8]) -> Option<u64> {
 /// no-op — fail-closed). Shared by the in-memory and D1 pot stores so the
 /// candidate query and the compaction write agree on "proven".
 pub fn pot_beef_has_proof(txid: &str, beef: &[u8]) -> bool {
-    beef_limits::parse_beef(beef, &beef_limits::STORED_BEEF_LIMITS)
-        .ok()
-        .and_then(|b| {
-            b.find_txid(txid)
-                .map(bsv_rs::transaction::BeefTx::has_proof)
-        })
-        .unwrap_or(false)
+    // A streaming fold: one element in hand, no `Beef` built (NL-6).
+    beef_limits::has_proof(beef, txid)
 }
 
 /// POT storage errors.

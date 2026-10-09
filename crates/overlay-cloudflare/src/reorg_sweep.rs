@@ -23,7 +23,7 @@
 use overlay_engine::beef_limits;
 use std::collections::HashMap;
 
-use bsv_rs::transaction::{Beef, ChainTracker, MerklePath};
+use bsv_rs::transaction::ChainTracker;
 use overlay_discovery::pot::reorg::{
     classify_reverify, next_sweep_window, BumpAnchor, ReverifyVerdict, RowKey, SweepState,
 };
@@ -74,11 +74,10 @@ pub(crate) async fn verify_bump_memoized(
     bump_hex: &str,
     txid: &str,
 ) -> Result<bool, String> {
-    let bump =
-        match beef_limits::merkle_path_from_hex(bump_hex, beef_limits::STORED_PROOF_MAX_BYTES) {
-            Ok(b) => b,
-            Err(_) => return Ok(false),
-        };
+    let bump = match beef_limits::proof_from_hex(bump_hex) {
+        Ok(b) => b,
+        Err(_) => return Ok(false),
+    };
     let root = match bump.compute_root(Some(txid)) {
         Ok(r) => r,
         Err(_) => return Ok(false),
@@ -106,8 +105,7 @@ pub const WALK_TRANSACTIONS: &str = "transactions";
 /// What a stored BEEF's OWN bump for `txid` anchors it to (height + the
 /// root it computes), if the BEEF parses and carries one.
 pub fn stored_bump_anchor(stored_beef: &[u8], txid: &str) -> Option<BumpAnchor> {
-    let beef = beef_limits::parse_beef(stored_beef, &beef_limits::STORED_BEEF_LIMITS).ok()?;
-    let bump = own_bump(&beef, txid)?;
+    let bump = beef_limits::own_bump(stored_beef, txid)?;
     let root = bump.compute_root(Some(txid)).ok()?.to_ascii_lowercase();
     Some(BumpAnchor {
         height: u64::from(bump.block_height),
@@ -115,22 +113,17 @@ pub fn stored_bump_anchor(stored_beef: &[u8], txid: &str) -> Option<BumpAnchor> 
     })
 }
 
+/// The hex of a stored BEEF's OWN bump for `txid`, if any.
+///
 /// The tx's OWN bump (its `bump_index`), NEVER `find_bump` (bsv-low M19 R2
 /// round 3, review HIGH-1): `find_bump` returns the FIRST bump whose path
 /// contains the txid, which after a same-height reorg is the STALE orphan
 /// bump the subject was moved off. `bump_index` is the one the stitch (now
-/// fixed) actually anchored the subject to.
-fn own_bump<'a>(beef: &'a Beef, txid: &str) -> Option<&'a MerklePath> {
-    let bi = beef
-        .find_txid(txid)
-        .and_then(bsv_rs::transaction::BeefTx::bump_index)?;
-    beef.bumps.get(bi)
-}
-
-/// The hex of a stored BEEF's OWN bump for `txid`, if any.
+/// fixed) actually anchored the subject to. Read by streaming folds over the
+/// stored bytes (`beef_limits::own_bump`: one element in hand, no `Beef`
+/// built; NL-6), as [`stored_bump_anchor`] reads it.
 pub(crate) fn stored_bump_hex(stored_beef: &[u8], txid: &str) -> Option<String> {
-    let beef = beef_limits::parse_beef(stored_beef, &beef_limits::STORED_BEEF_LIMITS).ok()?;
-    own_bump(&beef, txid).map(MerklePath::to_hex)
+    beef_limits::own_bump(stored_beef, txid).map(|bump| bump.to_hex())
 }
 
 /// What one bounded pass over a window of confirmations found and did.
@@ -264,7 +257,7 @@ enum LadderReanchor {
 
 /// The anchor a verified pushed proof names for `txid`.
 fn pushed_anchor(hex: &str, txid: &str) -> Option<BumpAnchor> {
-    let mp = beef_limits::merkle_path_from_hex(hex, beef_limits::STORED_PROOF_MAX_BYTES).ok()?;
+    let mp = beef_limits::proof_from_hex(hex).ok()?;
     let root = mp.compute_root(Some(txid)).ok()?.to_ascii_lowercase();
     Some(BumpAnchor {
         height: u64::from(mp.block_height),
@@ -700,10 +693,9 @@ async fn courier_recheck(
             return;
         }
     };
-    let proof_height =
-        beef_limits::merkle_path_from_hex(&proof_hex, beef_limits::STORED_PROOF_MAX_BYTES)
-            .ok()
-            .map(|mp| u64::from(mp.block_height));
+    let proof_height = beef_limits::proof_from_hex(&proof_hex)
+        .ok()
+        .map(|mp| u64::from(mp.block_height));
     match proof_height {
         Some(h) if rec.spent_height == Some(h) => {
             // agree: heal by stitching the proof into the stored BEEF (needs
@@ -1374,7 +1366,7 @@ mod tests {
     use super::*;
     use crate::proof_fetcher::apply_pushed_proof_to_pot_stores;
     use crate::proof_fetcher::tests::{real_spender_raw, single_tx_bump};
-    use bsv_rs::transaction::{ChainTrackerError, MockChainTracker, Transaction};
+    use bsv_rs::transaction::{Beef, ChainTrackerError, MockChainTracker, Transaction};
     use overlay_discovery::pot::storage::{MemoryPotStorage, PotRecord};
     use std::sync::Mutex;
 
@@ -1609,16 +1601,35 @@ mod tests {
         let _ = crate::pot_changes::drain();
         let disagree = single_tx_bump(&orphaned, 965_773).to_hex();
         let fetcher = CourierStub(
-            [(orphaned.clone(), Ok(Some(disagree))), (quiet.clone(), Ok(None))]
-                .into_iter()
-                .collect(),
+            [
+                (orphaned.clone(), Ok(Some(disagree))),
+                (quiet.clone(), Ok(None)),
+            ]
+            .into_iter()
+            .collect(),
         );
         let tracker = MockChainTracker::new(965_775);
-        let s = reverify_window(&store, Some(&tracker), Some(&fetcher), 965_771, 965_773, None, 50, false).await;
+        let s = reverify_window(
+            &store,
+            Some(&tracker),
+            Some(&fetcher),
+            965_771,
+            965_773,
+            None,
+            50,
+            false,
+        )
+        .await;
         assert_eq!(s.stale, 1, "{s:?}");
         let noted = crate::pot_changes::drain();
-        assert!(noted.contains(&(pot(64), 0)), "the demoted pot is noted, got {noted:?}");
-        assert!(!noted.contains(&(pot(65), 0)), "the standing pot is not, got {noted:?}");
+        assert!(
+            noted.contains(&(pot(64), 0)),
+            "the demoted pot is noted, got {noted:?}"
+        );
+        assert!(
+            !noted.contains(&(pot(65), 0)),
+            "the standing pot is not, got {noted:?}"
+        );
     }
 
     /// bsv-low #484, through a REAL pass: the sweep that demotes a row at an orphaned height is reorg evidence
@@ -1629,13 +1640,40 @@ mod tests {
         let store = MemoryPotStorage::new();
         let orphaned = confirmed_pot_with_proofless_beef(&store, &pot(66), 965_771).await;
         let disagree = single_tx_bump(&orphaned, 965_773).to_hex();
-        let fetcher = CourierStub([(orphaned.clone(), Ok(Some(disagree)))].into_iter().collect());
+        let fetcher = CourierStub(
+            [(orphaned.clone(), Ok(Some(disagree)))]
+                .into_iter()
+                .collect(),
+        );
         let tracker = MockChainTracker::new(965_775);
-        let s = reverify_window(&store, Some(&tracker), Some(&fetcher), 965_771, 965_773, None, 50, false).await;
+        let s = reverify_window(
+            &store,
+            Some(&tracker),
+            Some(&fetcher),
+            965_771,
+            965_773,
+            None,
+            50,
+            false,
+        )
+        .await;
         assert_eq!(s.stale, 1, "{s:?}");
-        assert!(crate::hop_probe_memos::reverify_rejudged(&s), "a demotion at an orphaned height: {s:?}");
+        assert!(
+            crate::hop_probe_memos::reverify_rejudged(&s),
+            "a demotion at an orphaned height: {s:?}"
+        );
         // the next sweep finds nothing confirmed there: quiet, no evidence
-        let s2 = reverify_window(&store, Some(&tracker), Some(&fetcher), 965_771, 965_773, None, 50, false).await;
+        let s2 = reverify_window(
+            &store,
+            Some(&tracker),
+            Some(&fetcher),
+            965_771,
+            965_773,
+            None,
+            50,
+            false,
+        )
+        .await;
         assert!(!crate::hop_probe_memos::reverify_rejudged(&s2), "{s2:?}");
     }
 

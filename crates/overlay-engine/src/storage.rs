@@ -908,13 +908,8 @@ pub mod memory {
             // write by inspecting whether the new BEEF proves the target tx.
             // (The proof-completion stitch calls back here with a proven BEEF,
             // which is how a row legitimately flips proofless → proven.)
-            let has_proof = beef_limits::parse_beef(beef, &beef_limits::STORED_BEEF_LIMITS)
-                .ok()
-                .and_then(|b| {
-                    b.find_txid(txid)
-                        .map(bsv_rs::transaction::BeefTx::has_proof)
-                })
-                .unwrap_or(false);
+            // A streaming fold: one element in hand, no `Beef` built.
+            let has_proof = beef_limits::has_proof(beef, txid);
             if has_proof {
                 self.proven.lock().unwrap().insert(txid.to_string());
             }

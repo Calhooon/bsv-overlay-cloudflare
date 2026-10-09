@@ -31,20 +31,26 @@ use serde::{Deserialize, Serialize};
 /// headroom for the rest of the JSON envelope.
 pub const QUEUE_BEEF_SIZE_LIMIT: usize = 90_000;
 
-/// Decode a queue/letter's BEEF only after bounding its encoded length.
-/// Validate decoded bytes under that door's policy before returning them to
-/// any subject reader or admission path. A replay failure keeps the consumer's
-/// existing retry/dead-letter lifecycle.
+/// Decode a queue/letter's BEEF and read it through the streaming door
+/// before returning it to any subject reader or admission path: invalid
+/// bytes are refused with their offset and kind, and a valid BEEF is read
+/// whatever its length (NL-6; the CONSUMER never bounds what it was handed).
+/// A replay failure keeps the consumer's existing retry/dead-letter
+/// lifecycle. `_door` names where the reader stands; nothing of it is read.
+///
+/// The bytes arrive whole, base64 in one message: the platform's 128 KB
+/// message is the bound today, held by the PRODUCER ([`QUEUE_BEEF_SIZE_LIMIT`],
+/// bsv-low #585 door 3). When the message carries a reference instead, this
+/// is the site that reads the object's body through `beef_limits::fold_beef`
+/// from the R2 binding that door adds (buckets `low-overlay-beefs-beta` and
+/// `low-overlay-beefs`); the Worker has no R2 binding at this commit.
 pub(crate) fn decode_beef_b64(
     encoded: &str,
-    limits: &overlay_engine::beef_limits::BeefLimits,
+    _door: &overlay_engine::beef_limits::BeefLimits,
 ) -> Result<Vec<u8>, String> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let max_encoded_bytes = limits.max_bytes.div_ceil(3).saturating_mul(4);
-    beef_limits::check_size(encoded.len(), max_encoded_bytes, "base64 BEEF")
-        .map_err(|e| e.to_string())?;
     let bytes = STANDARD.decode(encoded).map_err(|e| e.to_string())?;
-    beef_limits::parse_beef(&bytes, limits).map_err(|e| e.to_string())?;
+    beef_limits::read_beef(&bytes).map_err(|refusal| refusal.to_string())?;
     Ok(bytes)
 }
 
@@ -270,7 +276,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v.reason, "");
-        assert_eq!(v.redrive, None, "bsv-low #576: a message from before the lever parses too");
+        assert_eq!(
+            v.redrive, None,
+            "bsv-low #576: a message from before the lever parses too"
+        );
         assert_eq!(v.topics, vec!["tm_pot".to_string()]);
     }
 }

@@ -4088,9 +4088,10 @@ impl Engine {
         summary.scanned = candidates.len();
 
         for cand in candidates {
-            // Parse the stored BEEF; skip anything unparseable (don't error the
-            // whole pass on one bad row).
-            let beef = match beef_limits::parse_beef(&cand.beef, &beef_limits::STORED_BEEF_LIMITS) {
+            // Read the stored BEEF for the subject's OWN bump by streaming
+            // folds (one element in hand, no `Beef` built: NL-6); skip
+            // anything unparseable (don't error the whole pass on one bad row).
+            let own_bump = match beef_limits::own_proof(&cand.beef, &cand.txid) {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] unparseable BEEF, skipping");
@@ -4112,45 +4113,38 @@ impl Engine {
             // fetch+stitch path below, which overwrites the bump with a
             // chaintracks-verified one (or leaves the row proofless for retry).
             // Fail-closed throughout.
-            if beef
-                .find_txid(&cand.txid)
-                .is_some_and(bsv_rs::transaction::BeefTx::has_proof)
+            // the tx's OWN bump (its `bump_index`), never `find_bump`
+            // (the FIRST bump containing the txid — the stale one after a
+            // same-height reorg; review HIGH-1).
+            if let Some(bump_hex) = own_bump
+                .as_ref()
+                .map(bsv_rs::transaction::MerklePath::to_hex)
             {
-                // the tx's OWN bump (its `bump_index`), never `find_bump`
-                // (the FIRST bump containing the txid — the stale one after a
-                // same-height reorg; review HIGH-1).
-                let stored_bump = beef
-                    .find_txid(&cand.txid)
-                    .and_then(bsv_rs::transaction::BeefTx::bump_index)
-                    .and_then(|bi| beef.bumps.get(bi))
-                    .map(bsv_rs::transaction::MerklePath::to_hex);
-                if let Some(bump_hex) = stored_bump {
-                    if fetcher.verify_proof(&cand.txid, &bump_hex).await {
-                        // Idempotent + best-effort: a failure here is logged, not
-                        // fatal — the row simply lingers one more tick.
-                        // bsv-low M19 R2 round 3 (review MED-2): latch WITH the
-                        // anchor height (from the tx's OWN verified bump) so the
-                        // revalidation sweep's transactions leg can window this
-                        // row — `mark_transaction_proven` alone left every
-                        // fast-path row anchorless, in no window forever.
-                        let height = bsv_rs::transaction::MerklePath::from_hex(&bump_hex)
-                            .ok()
-                            .map(|mp| u64::from(mp.block_height));
-                        if let Err(e) = self
-                            .storage
-                            .mark_transaction_proven_at(&cand.txid, height)
-                            .await
-                        {
-                            warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] failed to mark verified-proven row");
-                        } else {
-                            summary.already_proven += 1;
-                        }
-                        continue;
+                if fetcher.verify_proof(&cand.txid, &bump_hex).await {
+                    // Idempotent + best-effort: a failure here is logged, not
+                    // fatal — the row simply lingers one more tick.
+                    // bsv-low M19 R2 round 3 (review MED-2): latch WITH the
+                    // anchor height (from the tx's OWN verified bump) so the
+                    // revalidation sweep's transactions leg can window this
+                    // row — `mark_transaction_proven` alone left every
+                    // fast-path row anchorless, in no window forever.
+                    let height = bsv_rs::transaction::MerklePath::from_hex(&bump_hex)
+                        .ok()
+                        .map(|mp| u64::from(mp.block_height));
+                    if let Err(e) = self
+                        .storage
+                        .mark_transaction_proven_at(&cand.txid, height)
+                        .await
+                    {
+                        warn!(txid = %cand.txid, error = %e, "[PROOF COMPLETION] failed to mark verified-proven row");
+                    } else {
+                        summary.already_proven += 1;
                     }
-                    warn!(txid = %cand.txid, "[PROOF COMPLETION] stored structural bump FAILED chaintracks re-verify — not trusting it, refetching");
+                    continue;
                 }
-                // Unverifiable structural bump → treat as proofless (fall through).
+                warn!(txid = %cand.txid, "[PROOF COMPLETION] stored structural bump FAILED chaintracks re-verify — not trusting it, refetching");
             }
+            // Unverifiable structural bump → treat as proofless (fall through).
             summary.proofless += 1;
 
             // Fetch this tx's own VERIFIED bump from chain — PROOF ONLY (the raw
