@@ -1,5 +1,58 @@
 # Changelog
 
+## Unreleased: the EF work bound is a deferral, not a refusal (NL-6c, 2026-10-09)
+
+The posture, the same charter's: **a valid submission is never refused for its
+size; where the platform has a bound (here one request's CPU slice) the design
+routes around it, with the bytes at rest and the remaining work resumable.**
+
+- **The 429 is gone.** The broadcast-gated arm of `/submit` answered 429 "EF
+  too large ... retry via fallback" when the subject's Extended Format passed
+  256 KiB or the batch's passed 2 MiB (`MAX_SUBJECT_EF_BYTES`,
+  `MAX_BATCH_EF_BYTES`, `subject_ef_over_cap` in `routes.rs`, #211/#209). All
+  three are gone.
+- **A work budget, routed past.** The request keeps a budget of the same two
+  numbers (`ef_deferred::IN_REQUEST_SUBJECT_EF_BYTES`,
+  `IN_REQUEST_BATCH_EF_BYTES`). Work within it is done in the request and
+  answered as before. Past it the submission's bytes go to rest (R2 under
+  `ef-deferred/` when the `BEEF_BLOBS` binding exists, else D1 in chunks of
+  1,000,000 bytes, under D1's 2,000,000-byte row), the mutation queue carries
+  the job's reference (never the bytes, so the queue's 128 KB message is no
+  bound), and the caller is answered **202** with
+  `{"accepted": true, "deferred": true, "reference", "poll", "subjectTxid",
+  "work", "budget"}` and a `Location` header.
+- **The queue consumer finishes the work** by running the same arm (the
+  route's body is now `submit_parts`, under `WorkBudget::Resumed`), and the
+  job keeps the arm's answer: **`GET /submit-deferred/<reference>`** serves
+  `{state: queued | running | done | failed, attempts, answer: {status,
+  body}}`, where `body` is the STEAK or the refusal the request would have
+  answered. A run that does not settle (the invocation ended, a 5xx or a 429
+  answer) is handed back to the queue by the cron after 10 quiet minutes, up
+  to 5 runs; a settled job and its bytes are swept after 7 days. The same
+  submission sent again while its job is open names the same reference.
+- **The ceiling not routed past, named:** the request still reads its body
+  whole and converts it to EF before it knows the work's size, and the
+  consumer holds the bytes whole to run the arm; one submission is bounded by
+  one isolate's memory (128 MB) and the plan's request-body limit (100 MB on
+  the Free and Pro plans). Resumption is at the job's grain: a step that
+  cannot finish in one consumer invocation fails its 5 runs and the job ends
+  `failed` with its last answer.
+- **For clients:** a broadcast-gated submit can now answer 202 instead of 200.
+  A 202 body is not a STEAK; poll the reference. Nothing that answered 200
+  before answers otherwise.
+- **For operators:** migrations 175 to 178 (`ef_deferred_jobs`, its state
+  index, `ef_deferred_chunks`), applied on boot. The cron (`*/15`) is the
+  hand-back; with no cron a job whose first run does not settle waits.
+  `DUAL_BROADCAST=off` turns off the post-response TAAL/GorillaPool push (for
+  a worker whose broadcaster is a fixture; unset, it is on).
+- **The census** no longer counts a body past the budget as `would-fail`; its
+  `efOverCap` reason is no longer produced and its counter stays served.
+- **The witness:** `tools/lane-nl6c/ef_work_bound_ci.mjs` in `make ci-route`
+  (its own worker at `LANE_BASE+11`, a fixture Arcade at `+12`, nothing sent
+  to a real host): a 300,140-byte body over the subject budget and a
+  2,200,282-byte body over the batch budget, each 202 with a reference that
+  reaches `done` with the arm's 200 after the consumer asked the broadcaster.
+
 ## Unreleased: a BEEF of any size (NL-6, 2026-10-09)
 
 The posture, from the charter "a BEEF of any size" (bsv-stack-lean
