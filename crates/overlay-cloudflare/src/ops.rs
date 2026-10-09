@@ -199,6 +199,9 @@ pub const COUNTER_DEAD_LETTERS_CEILING_DEFERRALS: &str = "dead_letters_ceiling_d
 /// bsv-low #576 (the delta fold, D-M1): parked letters the operator discarded by key
 /// (`POST /internal/discard-dead-letters`) to make room under the ceiling.
 pub const COUNTER_DEAD_LETTERS_DISCARDED: &str = "dead_letters_discarded_total";
+/// bsv-low #576 (the delta-2 fold, D2-M1): every DLQ DELIVERY of a "not now" letter deferred at one of its class's
+/// bounds (the not-now share, its txid's bound, the day's bound), apart from the whole ceiling's deferrals.
+pub const COUNTER_DEAD_LETTERS_NOT_NOW_DEFERRALS: &str = "dead_letters_not_now_deferrals_total";
 /// bsv-low #576 (lens fold, M1): re-drives claimed longer than [`crate::dead_letters::STALE_REDRIVE_MS`] ago and
 /// never resolved nor parked again, returned to the parked set by the lever.
 pub const COUNTER_DEAD_LETTERS_STALE_RETURNED: &str = "dead_letters_stale_returned_total";
@@ -898,6 +901,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_DEAD_LETTERS_CEILING_DEFERRED,
         COUNTER_DEAD_LETTERS_CEILING_DEFERRALS,
         COUNTER_DEAD_LETTERS_DISCARDED,
+        COUNTER_DEAD_LETTERS_NOT_NOW_DEFERRALS,
         COUNTER_DEAD_LETTERS_STALE_RETURNED,
         COUNTER_DEAD_LETTERS_RESOLVED,
         COUNTER_ARC_INGEST_SEEN_LATCHED,

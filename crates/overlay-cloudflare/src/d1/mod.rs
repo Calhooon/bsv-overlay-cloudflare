@@ -458,7 +458,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 162 → 163 for bsv-low #492 (2026-10-07, the B3 lens fold M1): `collected_markers_v2.payTxid` (one additive ALTER).
 /// 163 → 165 for bsv-low #576 (2026-10-08): `mutation_dead_letters` + its status index (the parked dead letters).
 /// 165 → 167 for bsv-low #576's lens fold (2026-10-08, L4): the covering health index and the last-re-drive index.
-pub const OVERLAY_MIGRATION_COUNT: usize = 167;
+/// 167 → 169 for bsv-low #576's delta-2 fold (2026-10-08, D2-M1): `mutation_dead_letters.class` (one additive ALTER)
+/// and the per-class index.
+pub const OVERLAY_MIGRATION_COUNT: usize = 169;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1722,6 +1724,10 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // is one index step. The lens fold also lets an ack DELETE a letter whose bytes landed (M2, a scoped delete).
     crate::dead_letters::DEAD_LETTERS_HEALTH_INDEX,
     crate::dead_letters::DEAD_LETTERS_REDRIVEN_INDEX,
+    // bsv-low #576's delta-2 fold (D2-M1): each letter's CLASS, so a stranger's "not now" letters hold at most half
+    // the ceiling and fault letters keep the rest. Additive ALTER; the runner ignores the re-run "duplicate column".
+    crate::dead_letters::DEAD_LETTERS_CLASS_COLUMN,
+    crate::dead_letters::DEAD_LETTERS_CLASS_INDEX,
 ];
 
 // =============================================================================

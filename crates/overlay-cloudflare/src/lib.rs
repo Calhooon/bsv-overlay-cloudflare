@@ -2210,6 +2210,7 @@ async fn queue_handler(
                         body,
                         None,
                         &format!("invalid base64 BEEF ({e})"),
+                        crate::dead_letters::LetterClass::Fault,
                     )
                     .await;
                 }
@@ -2237,7 +2238,7 @@ async fn queue_handler(
             worker::console_log!("Queue: the replay's subject could not be derived (an unparsable BEEF or no unique tip) — retrying");
             if let Some(db) = &counters {
                 crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1).await;
-                crate::dead_letters::note_failing(db, body, None, "the replay's subject could not be derived (an unparsable BEEF or no unique tip)").await;
+                crate::dead_letters::note_failing(db, body, None, "the replay's subject could not be derived (an unparsable BEEF or no unique tip)", crate::dead_letters::LetterClass::Fault).await;
             }
             msg.retry();
             continue;
@@ -2267,7 +2268,7 @@ async fn queue_handler(
                     worker::console_log!(
                         "Queue: the eviction ledger could not be read for {subject} ({e}) — retrying the replay later"
                     );
-                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("the eviction ledger could not be read ({e})")).await;
+                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("the eviction ledger could not be read ({e})"), crate::dead_letters::LetterClass::Fault).await;
                     msg.retry();
                     continue;
                 }
@@ -2324,6 +2325,7 @@ async fn queue_handler(
                                 body,
                                 Some(&subject),
                                 &format!("the eviction ledger could not be read after the replay's write ({e})"),
+                                crate::dead_letters::LetterClass::Fault,
                             )
                             .await;
                             msg.retry();
@@ -2359,7 +2361,7 @@ async fn queue_handler(
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
                         .await;
-                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("not durable: {}", report.summary()))
+                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("not durable: {}", report.summary()), crate::dead_letters::LetterClass::of_sites(report.faults.iter().map(|f| f.site)))
                         .await;
                 }
                 msg.retry();
@@ -2369,7 +2371,7 @@ async fn queue_handler(
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
                         .await;
-                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("failed: {e}")).await;
+                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("failed: {e}"), crate::dead_letters::LetterClass::Fault).await;
                 }
                 msg.retry();
             }
