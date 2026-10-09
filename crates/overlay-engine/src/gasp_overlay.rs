@@ -287,18 +287,16 @@ impl GraphAssembly {
             return Ok(node.clone());
         }
         let parsed = self.parsed_tx(key, refs)?;
-        let proof = match refs
-            .get(key)
-            .and_then(|pending| pending.node.proof.as_ref())
-        {
-            Some(proof_hex) => Some(
-                beef_limits::merkle_path_from_hex(proof_hex, beef_limits::PEER_PROOF_MAX_BYTES)
-                    .map_err(|e| {
-                        GASPError::Other(format!("Failed to parse proof for {key}: {e}"))
-                    })?,
-            ),
-            None => None,
-        };
+        let proof =
+            match refs
+                .get(key)
+                .and_then(|pending| pending.node.proof.as_ref())
+            {
+                Some(proof_hex) => Some(beef_limits::proof_from_hex(proof_hex).map_err(|e| {
+                    GASPError::Other(format!("Failed to parse proof for {key}: {e}"))
+                })?),
+                None => None,
+            };
         // A proven node is a leaf. An unproven one takes each input's source
         // from the node filed under that outpoint, when the graph has it.
         let sources = if proof.is_some() {
@@ -897,7 +895,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             let mut tx = Transaction::from_hex(&node.raw_tx)
                 .map_err(|e| GASPError::Other(format!("Failed to parse raw_tx: {e}")))?;
             tx.merkle_path = Some(
-                beef_limits::merkle_path_from_hex(proof_hex, beef_limits::PEER_PROOF_MAX_BYTES)
+                beef_limits::proof_from_hex(proof_hex)
                     .map_err(|e| GASPError::Other(format!("Failed to parse proof: {e}")))?,
             );
 
@@ -1247,7 +1245,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         // ── 1. Bitcoin ──────────────────────────────────────────────────
         let mut root_beef = anchor.root_beef;
         if !anchor.absent_sources.is_empty() {
-            let mut merged = Beef::from_binary(&root_beef)
+            let mut merged = beef_limits::parse_beef(&root_beef, &beef_limits::PEER_BEEF_LIMITS)
                 .map_err(|e| refused(format!("root BEEF does not parse: {e}")))?;
             for (txid, output_index) in &anchor.absent_sources {
                 let held = self
@@ -1304,11 +1302,15 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             // assemble, dropped when its turn is over (bsv-low #586).
             let beef = &anchor.assembly.beef_of(key);
             // The parse `Engine::submit` makes of the same bytes at finalize.
-            let subject = Beef::from_binary(beef)
+            let subject = beef_limits::parse_beef(beef, &beef_limits::PEER_BEEF_LIMITS)
                 .map(|mut b| crate::subject::subject_txid_of(&mut b))
                 .map_err(|e| refused(format!("a graph BEEF does not parse: {e}")))?;
-            let tx = Transaction::from_beef(beef, subject.as_deref())
-                .map_err(|e| refused(format!("a graph BEEF does not parse: {e}")))?;
+            let tx = beef_limits::transaction_from_beef(
+                beef,
+                subject.as_deref(),
+                &beef_limits::PEER_BEEF_LIMITS,
+            )
+            .map_err(|e| refused(format!("a graph BEEF does not parse: {e}")))?;
             let txid = tx.id();
             // Two outputs of one transaction are two nodes with one BEEF.
             if !replayed.insert(txid.clone()) {
@@ -2161,12 +2163,9 @@ mod tests {
             .map_err(|e| GASPError::Other(format!("Failed to parse raw_tx for {node_key}: {e}")))?;
 
         if let Some(ref proof_hex) = pending.node.proof {
-            tx.merkle_path = Some(
-                beef_limits::merkle_path_from_hex(proof_hex, beef_limits::PEER_PROOF_MAX_BYTES)
-                    .map_err(|e| {
-                        GASPError::Other(format!("Failed to parse proof for {node_key}: {e}"))
-                    })?,
-            );
+            tx.merkle_path = Some(beef_limits::proof_from_hex(proof_hex).map_err(|e| {
+                GASPError::Other(format!("Failed to parse proof for {node_key}: {e}"))
+            })?);
         } else {
             let child_info: Vec<(usize, String)> = tx
                 .inputs

@@ -386,14 +386,10 @@ impl D1Storage {
     /// re-parsing the entire table each tick. Unparseable BEEF → `false` (treat
     /// as proofless so it stays in the candidate set, where the engine re-parses
     /// + skips defensively).
-    fn beef_has_proof(txid: &str, beef: &[u8]) -> bool {
-        beef_limits::parse_beef(beef, &beef_limits::STORED_BEEF_LIMITS)
-            .ok()
-            .and_then(|b| {
-                b.find_txid(txid)
-                    .map(bsv_rs::transaction::BeefTx::has_proof)
-            })
-            .unwrap_or(false)
+    pub(crate) fn beef_has_proof(txid: &str, beef: &[u8]) -> bool {
+        // A streaming fold over the bytes about to be written: one element
+        // in hand, no `Beef` built (NL-6).
+        beef_limits::has_proof(beef, txid)
     }
 }
 
@@ -403,6 +399,17 @@ fn d1_err(e: String) -> StorageError {
 
 #[async_trait(?Send)]
 impl Storage for D1Storage {
+    // NL-6, bytes at rest: `insert_output` and `update_transaction_beef`
+    // write the BEEF into the `transactions` row's blob, and the readers
+    // (`find_output*` with `include_beef`) hand it back whole. D1's row bound
+    // is the platform's; this crate never compares a BEEF against it, so a
+    // BEEF over it surfaces as the write's own D1 error, not as a refusal of
+    // ours. The route around it is the charter's: the bytes at rest in R2
+    // and a reference in the row, read back through `beef_limits::fold_beef`
+    // over the object's body. These two writers and those readers are the
+    // sites that take the R2 binding bsv-low #585 door 3 adds (buckets
+    // `low-overlay-beefs-beta` and `low-overlay-beefs`); the Worker has no
+    // R2 binding at this commit and this lane adds none.
     async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
         // INSERT OR IGNORE — dedup on (txid, outputIndex, topic) unique index
         Query::new(
