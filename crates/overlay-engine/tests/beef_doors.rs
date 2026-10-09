@@ -1,4 +1,6 @@
-//! P0-5f: honest-shaped witnesses, one at each bound and one over.
+//! NL-6: the P0-5f door witnesses, inverted (the charter "a BEEF of any
+//! size"). A valid BEEF over each former budget is read at every door; invalid
+//! bytes are refused with the offset and the kind.
 use bsv_overlay_engine::beef_limits::*;
 use bsv_overlay_engine::engine::{Engine, EngineConfig, EngineError};
 use bsv_overlay_engine::storage::memory::MemoryStorage;
@@ -9,48 +11,48 @@ use std::collections::HashMap;
 #[path = "support/beef_doors.rs"]
 mod shapes;
 
+/// The refusal a door gives: `invalid BEEF at byte <offset>: <kind> ...`.
+fn names(error: &str, offset: usize, kind: &str) -> bool {
+    error.contains(&format!("invalid BEEF at byte {offset}: {kind}"))
+}
+
 macro_rules! door {
     ($name:ident, $policy:ident) => {
         mod $name {
             use super::*;
             #[test]
-            fn transactions_at_and_one_over() {
-                let (at, _) = shapes::transactions($policy.max_txs);
-                assert_eq!(
-                    parse_beef(&at, &$policy).unwrap().txs.len(),
-                    $policy.max_txs
-                );
-                let (over, _) = shapes::transactions($policy.max_txs + 1);
-                assert!(parse_beef(&over, &$policy)
-                    .err()
-                    .expect("one extra transaction was admitted")
-                    .to_string()
-                    .contains("max_txs"));
+            fn transactions_over_the_former_count_are_read() {
+                for count in [$policy.max_txs + 1, 4 * $policy.max_txs] {
+                    let (over, _) = shapes::transactions(count);
+                    assert_eq!(parse_beef(&over, &$policy).unwrap().txs.len(), count);
+                }
             }
             #[test]
-            fn bumps_at_and_one_over() {
-                let (at, _) = shapes::bumps($policy.max_bumps);
-                assert_eq!(
-                    parse_beef(&at, &$policy).unwrap().bumps.len(),
-                    $policy.max_bumps
-                );
-                let (over, _) = shapes::bumps($policy.max_bumps + 1);
-                assert!(parse_beef(&over, &$policy)
-                    .err()
-                    .expect("one extra proof was admitted")
-                    .to_string()
-                    .contains("max_bumps"));
+            fn bumps_over_the_former_count_are_read() {
+                for count in [$policy.max_bumps + 1, 4 * $policy.max_bumps] {
+                    let (over, _) = shapes::bumps(count);
+                    assert_eq!(parse_beef(&over, &$policy).unwrap().bumps.len(), count);
+                }
             }
             #[test]
-            fn bytes_at_and_one_over() {
-                let (at, _) = shapes::sized_body($policy.max_bytes);
-                assert!(parse_beef(&at, &$policy).is_ok());
-                let (over, _) = shapes::sized_body($policy.max_bytes + 1);
-                assert!(parse_beef(&over, &$policy)
-                    .err()
-                    .expect("one extra byte was admitted")
-                    .to_string()
-                    .contains("max_bytes"));
+            fn bytes_over_the_former_budget_are_read() {
+                let (over, id) = shapes::sized_body($policy.max_bytes + 1);
+                assert!(parse_beef(&over, &$policy).is_ok());
+                assert_eq!(
+                    transaction_from_beef(&over, None, &$policy).unwrap().id(),
+                    id
+                );
+            }
+            #[test]
+            fn invalid_bytes_are_refused_with_the_offset_and_the_kind() {
+                for (bytes, offset, kind) in shapes::invalid() {
+                    let error = parse_beef(&bytes, &$policy)
+                        .err()
+                        .expect("invalid bytes were read")
+                        .to_string();
+                    assert!(names(&error, offset, kind), "{offset} {kind}: {error}");
+                    assert!(!error.contains("max_"), "{error}");
+                }
             }
         }
     };
@@ -66,8 +68,40 @@ door!(queue, QUEUE_BEEF_LIMITS);
 door!(dead_letter, DEAD_LETTER_BEEF_LIMITS);
 door!(census, CENSUS_BEEF_LIMITS);
 
+/// The four former budgets by their numbers, whatever the constants say.
+#[test]
+fn a_valid_beef_over_each_former_budget_is_read() {
+    for (bytes, door) in [
+        (10_000_001, SUBMIT_BEEF_LIMITS),
+        (12 * 1024 * 1024, SUBMIT_BEEF_LIMITS),
+        (2 * 1024 * 1024 + 1, CENSUS_BEEF_LIMITS),
+        (90_001, QUEUE_BEEF_LIMITS),
+    ] {
+        let (body, id) = shapes::sized_body(bytes);
+        assert_eq!(
+            transaction_from_beef(&body, None, &door).unwrap().id(),
+            id,
+            "{bytes} bytes"
+        );
+    }
+    assert_eq!(
+        parse_beef(&shapes::transactions(513).0, &SUBMIT_BEEF_LIMITS)
+            .unwrap()
+            .txs
+            .len(),
+        513
+    );
+    assert_eq!(
+        parse_beef(&shapes::bumps(513).0, &SUBMIT_BEEF_LIMITS)
+            .unwrap()
+            .bumps
+            .len(),
+        513
+    );
+}
+
 #[tokio::test]
-async fn actual_core_submit_at_and_one_over_every_bound_without_spv() {
+async fn actual_core_submit_over_every_former_bound_without_spv() {
     let engine = Engine::new(
         HashMap::new(),
         HashMap::new(),
@@ -75,45 +109,46 @@ async fn actual_core_submit_at_and_one_over_every_bound_without_spv() {
         None,
         EngineConfig::default(),
     );
-    for (at, over) in [
-        (shapes::transactions(512).0, shapes::transactions(513).0),
-        (shapes::bumps(512).0, shapes::bumps(513).0),
-        (
-            shapes::sized_body(ENGINE_BEEF_LIMITS.max_bytes).0,
-            shapes::sized_body(ENGINE_BEEF_LIMITS.max_bytes + 1).0,
-        ),
+    for over in [
+        shapes::transactions(513).0,
+        shapes::bumps(513).0,
+        shapes::sized_body(ENGINE_BEEF_LIMITS.max_bytes + 1).0,
     ] {
-        assert!(engine
-            .submit(&TaggedBEEF::new(at, vec![]), SubmitMode::HistoricalTxNoSpv)
-            .await
-            .is_ok());
         let result = engine
             .submit(
                 &TaggedBEEF::new(over, vec![]),
                 SubmitMode::HistoricalTxNoSpv,
             )
             .await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+    for (bytes, offset, kind) in shapes::invalid() {
+        let result = engine
+            .submit(
+                &TaggedBEEF::new(bytes, vec![]),
+                SubmitMode::HistoricalTxNoSpv,
+            )
+            .await;
         assert!(
-            matches!(result, Err(EngineError::BeefParseError(ref e)) if e.contains("max_")),
-            "{result:?}"
+            matches!(result, Err(EngineError::BeefParseError(ref e)) if names(e, offset, kind)),
+            "{offset} {kind}: {result:?}"
         );
     }
 }
 
 #[test]
-fn actual_stored_stitch_at_and_one_over_every_bound() {
-    for (at, over) in [
-        (shapes::transactions(512), shapes::transactions(513)),
-        (shapes::bumps(512), shapes::bumps(513)),
-        (
-            shapes::sized_body(STORED_BEEF_LIMITS.max_bytes),
-            shapes::sized_body(STORED_BEEF_LIMITS.max_bytes + 1),
-        ),
+fn actual_stored_stitch_over_every_former_bound() {
+    for over in [
+        shapes::transactions(513),
+        shapes::bumps(513),
+        shapes::sized_body(STORED_BEEF_LIMITS.max_bytes + 1),
     ] {
-        let proof = MerklePath::from_coinbase_txid(&at.1, 800_000);
-        assert!(Engine::stitch_proof_into_stored_beef(&at.0, &at.1, &proof).is_some());
         let proof = MerklePath::from_coinbase_txid(&over.1, 800_000);
-        assert!(Engine::stitch_proof_into_stored_beef(&over.0, &over.1, &proof).is_none());
+        assert!(Engine::stitch_proof_into_stored_beef(&over.0, &over.1, &proof).is_some());
+    }
+    for (bytes, _, _) in shapes::invalid() {
+        let proof = MerklePath::from_coinbase_txid(&"11".repeat(32), 800_000);
+        assert!(Engine::stitch_proof_into_stored_beef(&bytes, &"11".repeat(32), &proof).is_none());
     }
 }
 
@@ -131,8 +166,10 @@ fn target_selection_matches_the_sdk() {
     assert!(transaction_from_beef(&atomic, Some(&"ff".repeat(32)), &ENGINE_BEEF_LIMITS).is_err());
 }
 
+/// The courier's and the push's proof field is a wire bound (an 8 KiB JSON
+/// hex field), not a BEEF refusal: it stays, checked before the hex decode.
 #[test]
-fn proof_reader_checks_size_before_hex_decode() {
+fn the_courier_wire_bound_stays_and_is_checked_before_hex_decode() {
     let (_, id) = shapes::body(1);
     let proof = MerklePath::from_coinbase_txid(&id, 800_000);
     let hex = proof.to_hex();
@@ -142,14 +179,19 @@ fn proof_reader_checks_size_before_hex_decode() {
         .expect_err("one extra proof byte admitted")
         .to_string()
         .contains("max_bytes"));
-    for cap in [
-        COURIER_PROOF_MAX_BYTES,
-        PUSH_PROOF_MAX_BYTES,
-        STORED_PROOF_MAX_BYTES,
-        PEER_PROOF_MAX_BYTES,
-    ] {
-        assert!(merkle_path_from_hex(&hex, cap).is_ok());
-        assert!(check_size(cap * 2, cap * 2, "proof hex").is_ok());
+    let (at, over) = shapes::proof_boundaries();
+    for cap in [COURIER_PROOF_MAX_BYTES, PUSH_PROOF_MAX_BYTES] {
+        assert_eq!(at.to_binary().len(), cap);
+        assert_eq!(over.to_binary().len(), cap + 1);
+        assert_eq!(
+            merkle_path_from_hex(&at.to_hex(), cap).unwrap().to_hex(),
+            at.to_hex()
+        );
+        assert!(merkle_path_from_hex(&over.to_hex(), cap)
+            .err()
+            .expect("one extra proof byte admitted")
+            .to_string()
+            .contains("max_bytes"));
         let invalid_hex = "z".repeat((cap + 1) * 2);
         assert!(merkle_path_from_hex(&invalid_hex, cap)
             .err()
@@ -160,40 +202,17 @@ fn proof_reader_checks_size_before_hex_decode() {
 }
 
 #[test]
-fn production_proof_fields_at_and_one_over() {
-    let (at, over) = shapes::proof_boundaries();
-    for cap in [
-        COURIER_PROOF_MAX_BYTES,
-        PUSH_PROOF_MAX_BYTES,
-        STORED_PROOF_MAX_BYTES,
-        PEER_PROOF_MAX_BYTES,
-    ] {
-        assert_eq!(at.to_binary().len(), cap);
-        assert_eq!(over.to_binary().len(), cap + 1);
-        assert_eq!(
-            merkle_path_from_hex(&at.to_hex(), cap).unwrap().to_hex(),
-            at.to_hex()
-        );
-        let error = match merkle_path_from_hex(&over.to_hex(), cap) {
-            Err(error) => error,
-            Ok(_) => panic!("one extra proof byte admitted"),
-        };
-        assert!(error.to_string().contains("max_bytes"));
-    }
-}
-
-#[test]
-fn atomic_header_allowance_is_exact() {
+fn the_atomic_form_of_a_body_at_the_former_cap_is_read_at_the_submit_door() {
     let (plain, id) = shapes::sized_body(SUBMIT_BODY_MAX_BYTES);
     let mut beef = Beef::from_binary(&plain).unwrap();
     let atomic = beef.to_binary_atomic(&id).unwrap();
-    assert_eq!(atomic.len(), ENGINE_BEEF_LIMITS.max_bytes);
+    assert_eq!(atomic.len(), SUBMIT_BODY_MAX_BYTES + ATOMIC_HEADER_BYTES);
     assert!(transaction_from_beef(&atomic, None, &ENGINE_BEEF_LIMITS).is_ok());
-    assert!(parse_beef(&atomic, &SUBMIT_BEEF_LIMITS).is_err());
+    assert!(parse_beef(&atomic, &SUBMIT_BEEF_LIMITS).is_ok());
 }
 
 #[test]
-fn bounded_linking_and_source_debug_preserve_the_subject() {
+fn linking_and_source_debug_preserve_the_subject() {
     use bsv_rs::script::{LockingScript, UnlockingScript};
     use bsv_rs::transaction::{Transaction, TransactionInput, TransactionOutput};
     let (bytes, parent_id) = shapes::body(1);
@@ -213,15 +232,15 @@ fn bounded_linking_and_source_debug_preserve_the_subject() {
     for bytes in [&plain, &atomic] {
         for target in [None, Some(id.as_str()), Some(parent_id.as_str())] {
             let expected = Transaction::from_beef(bytes, target).unwrap();
-            let bounded = transaction_from_beef(bytes, target, &ENGINE_BEEF_LIMITS).unwrap();
-            assert_eq!(bounded.to_hex(), expected.to_hex());
-            assert_eq!(bounded.id(), expected.id());
-            if bounded.id() == id {
+            let linked = transaction_from_beef(bytes, target, &ENGINE_BEEF_LIMITS).unwrap();
+            assert_eq!(linked.to_hex(), expected.to_hex());
+            assert_eq!(linked.id(), expected.id());
+            if linked.id() == id {
                 assert_eq!(
-                    bounded.inputs[0].source_transaction.as_ref().unwrap().id(),
+                    linked.inputs[0].source_transaction.as_ref().unwrap().id(),
                     parent_id
                 );
-                let debug = format!("{bounded:?}");
+                let debug = format!("{linked:?}");
                 assert!(
                     debug.contains(&format!("source_transaction: Some(\"{parent_id}\")")),
                     "{debug}"

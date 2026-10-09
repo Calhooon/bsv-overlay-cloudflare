@@ -379,7 +379,8 @@ ci-route: ci-d1-budget
 	FIXTURE_PORT=$$P8 \
 	  node tools/lane-script/script_refusal_route_ci.mjs http://127.0.0.1:$$P7; \
 	EXPECT_DOOR=off FIXTURE_PORT=$$P8 \
-	  node tools/lane-script/script_refusal_route_ci.mjs http://127.0.0.1:$$P9
+	  node tools/lane-script/script_refusal_route_ci.mjs http://127.0.0.1:$$P9; \
+	node tools/lane-nl6/submit_any_size_ci.mjs http://127.0.0.1:$$P1
 
 # bsv-low #499: THE D1 BUDGET TIER. A prerequisite of `ci-route` (so part of `ci`), in its own block.
 #

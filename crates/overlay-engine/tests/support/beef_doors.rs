@@ -1,4 +1,5 @@
-//! Small boundary shapes only. No deep ancestry or large-leaf BUMP.
+//! Small shapes only. No deep ancestry or large-leaf BUMP: the sizes and
+//! counts here cross the former bounds (P0-5f) and nothing more.
 #![allow(dead_code)]
 
 use bsv_rs::script::{LockingScript, UnlockingScript};
@@ -40,7 +41,7 @@ pub fn sized_body(size: usize) -> (Vec<u8>, String) {
 /// A proven subject and unrelated txid-only funding references, an ordinary
 /// partial BEEF shape. No input chain is built or linked.
 pub fn transactions(count: usize) -> (Vec<u8>, String) {
-    assert!((1..=513).contains(&count));
+    assert!(count >= 1);
     let (bytes, id) = body(1);
     let mut beef = Beef::from_binary(&bytes).unwrap();
     for n in 1..count {
@@ -51,7 +52,7 @@ pub fn transactions(count: usize) -> (Vec<u8>, String) {
 
 /// Distinct blocks, each with a single-leaf proof. Never a many-leaf BUMP.
 pub fn bumps(count: usize) -> (Vec<u8>, String) {
-    assert!((1..=513).contains(&count));
+    assert!(count >= 1);
     let (bytes, id) = body(1);
     let mut beef = Beef::from_binary(&bytes).unwrap();
     for n in 1..count {
@@ -96,4 +97,26 @@ pub fn proof_boundaries() -> (MerklePath, MerklePath) {
     assert_eq!(at.to_binary().len(), 4095);
     assert_eq!(over.to_binary().len(), 4096);
     (at, over)
+}
+
+/// Invalid bytes, each with the offset and the kind the door must name
+/// (bsv-rs 0.4.0 `Refusal`: `invalid BEEF at byte <offset>: <kind> ...`).
+/// None is over any former bound: every one is refused for its bytes.
+pub fn invalid() -> Vec<(Vec<u8>, usize, &'static str)> {
+    // `0200BEEF`, one BUMP at height 800,000 whose tree-height byte is 65.
+    let mut tree_height_65 = vec![0x02, 0x00, 0xbe, 0xef, 0x01];
+    tree_height_65.extend_from_slice(&[0xfe, 0x00, 0x35, 0x0c, 0x00]);
+    tree_height_65.push(65);
+    // The prefix claims 300 BUMPs and carries none.
+    let claims_300_bumps = vec![0x02, 0x00, 0xbe, 0xef, 0xfd, 0x2c, 0x01];
+    // A valid body and one byte after its frame.
+    let (mut trailing, _) = body(1);
+    let frame = trailing.len();
+    trailing.push(0x00);
+    vec![
+        (vec![0xde, 0xad, 0xbe, 0xef], 0, "BadVersion"),
+        (tree_height_65, 10, "TreeHeightOver64"),
+        (claims_300_bumps, 7, "Truncated"),
+        (trailing, frame, "TrailingBytes"),
+    ]
 }
