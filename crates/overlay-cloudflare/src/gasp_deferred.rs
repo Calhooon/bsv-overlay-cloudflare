@@ -64,14 +64,33 @@ pub const DEFERRED_GRAPHS_MAX_TOTAL_BYTES: u64 = 64 << 20;
 /// one pool over every peer, and four (host, topic) pairs of a stranger's
 /// hosts held all of it; every honest deferral after them was refused
 /// (`too_many`) and walked from its root on every tick, the case #555 was
-/// built for. With the share, eight hosts are needed to fill it. A NEW key
-/// past it is refused in the upsert, as the global bounds.
+/// built for. A NEW key past it is refused in the upsert, as the global
+/// bounds. A "host" is the peer's NORMALIZED ORIGIN (`origin`,
+/// `overlay_engine::gasp::peer_origin`; the delta-2 fold's D2-M2): keyed on
+/// the URL string, eight adverts of one server (`/?1` .. `/?8`) were eight
+/// hosts and filled the ceiling. Applies to DISCOVERED peers only: a
+/// configured peer's save is checked against the global bounds alone.
 pub const DEFERRED_GRAPHS_MAX_ROWS_PER_HOST: u32 = DEFERRED_GRAPHS_MAX_ROWS / 8;
+
+/// The most rows the records of DISCOVERED peers (`ls_ship`, `configured =
+/// 0`) hold together: half of [`DEFERRED_GRAPHS_MAX_ROWS`] (bsv-low #555, the
+/// delta-2 fold's D2-M2). The other half is RESERVED for configured peers
+/// (`SyncTarget::Peers`), whose saves are checked against the global bounds
+/// only: a stranger's adverts, any number of hosts and spellings, no longer
+/// refuse a configured peer's deferral (#582's picture graph back to the
+/// pre-#555 walk). A record costs a FAST peer only the `calls` budget (100
+/// tiny responses, milliseconds), not the 15 s.
+pub const DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS: u32 = DEFERRED_GRAPHS_MAX_ROWS / 2;
 
 /// The most bytes of `record` ONE host holds over all its topics (8 MiB, an
 /// eighth of [`DEFERRED_GRAPHS_MAX_TOTAL_BYTES`]; about sixteen of the
 /// measured picture graph). A save past it is refused, as the global bound.
 pub const DEFERRED_GRAPHS_MAX_BYTES_PER_HOST: u64 = DEFERRED_GRAPHS_MAX_TOTAL_BYTES / 8;
+
+/// The most bytes the records of DISCOVERED peers hold together: half of
+/// [`DEFERRED_GRAPHS_MAX_TOTAL_BYTES`] (32 MiB), as
+/// [`DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS`].
+pub const DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES: u64 = DEFERRED_GRAPHS_MAX_TOTAL_BYTES / 2;
 
 /// A row not written for this long is swept by the cron
 /// ([`DEFERRED_GRAPHS_SWEEP_SQL`], counted `gasp_graph_dropped_stale_total`):
@@ -85,30 +104,41 @@ pub const DEFERRED_GRAPH_STALE_SECS: u64 =
     2 * overlay_engine::gasp::DEFERRED_GRAPH_MAX_PASSES as u64 * 15 * 60;
 
 /// Save (replace) one record, under the table's global ceiling. Binds: `?1`
-/// host, `?2` topic, `?3` outpoint, `?4` score, `?5` nodes, `?6` pending, `?7`
-/// calls, `?8` passes, `?9` reason, `?10` bytes, `?11` record, `?12`
-/// [`DEFERRED_GRAPHS_MAX_ROWS`], `?13` [`DEFERRED_GRAPHS_MAX_TOTAL_BYTES`],
-/// `?14` [`DEFERRED_GRAPHS_MAX_ROWS_PER_HOST`], `?15`
-/// [`DEFERRED_GRAPHS_MAX_BYTES_PER_HOST`]. `created_at` is kept from the
+/// host (the peer URL, the key), `?2` topic, `?3` outpoint, `?4` score, `?5`
+/// nodes, `?6` pending, `?7` calls, `?8` passes, `?9` reason, `?10` bytes,
+/// `?11` record, `?12` [`DEFERRED_GRAPHS_MAX_ROWS`], `?13`
+/// [`DEFERRED_GRAPHS_MAX_TOTAL_BYTES`], `?14`
+/// [`DEFERRED_GRAPHS_MAX_ROWS_PER_HOST`], `?15`
+/// [`DEFERRED_GRAPHS_MAX_BYTES_PER_HOST`], `?16` origin
+/// (`overlay_engine::gasp::peer_origin` of the host), `?17` configured
+/// (1/0), `?18` [`DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS`], `?19`
+/// [`DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES`]. `created_at` is kept from the
 /// first deferral (the age); the backend owns the clock. The `WHERE` of the
 /// `SELECT` re-reads the ceiling in the one statement (as #576's `PARK_SQL`):
-/// a held key always replaces within the byte bounds (the table's and its
-/// host's), a new key only under the row bounds too. A refused save returns
-/// NO row (`AtCeiling`).
+/// a held key always replaces within the byte bounds, a new key only under
+/// the row bounds too. A CONFIGURED peer's save is checked against the
+/// global bounds only; a DISCOVERED peer's also against its origin's share
+/// and the discovered half (the delta-2 fold's D2-M2). A refused save
+/// returns NO row (`AtCeiling`).
 pub const DEFERRED_GRAPH_UPSERT_SQL: &str = "INSERT INTO gasp_deferred_graphs \
-     (host, topic, outpoint, score, nodes, pending, calls, passes, reason, bytes, record, created_at, updated_at) \
-     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, unixepoch(), unixepoch() \
+     (host, topic, outpoint, score, nodes, pending, calls, passes, reason, bytes, record, created_at, updated_at, \
+      origin, configured) \
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, unixepoch(), unixepoch(), ?16, ?17 \
      WHERE (EXISTS (SELECT 1 FROM gasp_deferred_graphs WHERE host = ?1 AND topic = ?2 AND outpoint = ?3) \
        OR ((SELECT COUNT(*) FROM gasp_deferred_graphs) < ?12 \
-         AND (SELECT COUNT(*) FROM gasp_deferred_graphs WHERE host = ?1) < ?14)) \
+         AND (?17 OR ((SELECT COUNT(*) FROM gasp_deferred_graphs WHERE origin = ?16 AND configured = 0) < ?14 \
+           AND (SELECT COUNT(*) FROM gasp_deferred_graphs WHERE configured = 0) < ?18)))) \
      AND (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs \
        WHERE NOT (host = ?1 AND topic = ?2 AND outpoint = ?3)) + ?10 <= ?13 \
-     AND (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs \
-       WHERE host = ?1 AND NOT (topic = ?2 AND outpoint = ?3)) + ?10 <= ?15 \
+     AND (?17 OR ((SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs \
+         WHERE origin = ?16 AND configured = 0 AND NOT (host = ?1 AND topic = ?2 AND outpoint = ?3)) + ?10 <= ?15 \
+       AND (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs \
+         WHERE configured = 0 AND NOT (host = ?1 AND topic = ?2 AND outpoint = ?3)) + ?10 <= ?19)) \
      ON CONFLICT(host, topic, outpoint) DO UPDATE SET \
        score = excluded.score, nodes = excluded.nodes, pending = excluded.pending, \
        calls = excluded.calls, passes = excluded.passes, reason = excluded.reason, \
-       bytes = excluded.bytes, record = excluded.record, updated_at = unixepoch() \
+       bytes = excluded.bytes, record = excluded.record, updated_at = unixepoch(), \
+       origin = excluded.origin, configured = excluded.configured \
      RETURNING outpoint";
 
 /// The KEYS of one (peer, topic)'s records, lowest score first: a sync reads
@@ -300,6 +330,8 @@ pub fn health_view(count: u64, total_bytes: u64, rows: &[HealthRow]) -> serde_js
             "maxTotalBytes": DEFERRED_GRAPHS_MAX_TOTAL_BYTES,
             "maxRowsPerHost": DEFERRED_GRAPHS_MAX_ROWS_PER_HOST,
             "maxBytesPerHost": DEFERRED_GRAPHS_MAX_BYTES_PER_HOST,
+            "discoveredMaxRows": DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS,
+            "discoveredMaxBytes": DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES,
             "staleSecs": DEFERRED_GRAPH_STALE_SECS,
         },
     })
@@ -386,6 +418,8 @@ mod tests {
             calls: nodes as u64,
             passes,
             reason: "calls".into(),
+            configured: false,
+            idle_faults: 0,
         }
     }
 
@@ -409,6 +443,24 @@ mod tests {
         host_rows: u32,
         host_bytes: u64,
     ) -> bool {
+        upsert_reserved(
+            conn, r, max_rows, max_bytes, host_rows, host_bytes, max_rows, max_bytes,
+        )
+    }
+
+    /// The same, with the discovered peers' half too (the delta-2 fold's
+    /// D2-M2), bound as `D1Storage::put_deferred_graph` binds it.
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_reserved(
+        conn: &rusqlite::Connection,
+        r: &DeferredGraph,
+        max_rows: u32,
+        max_bytes: u64,
+        host_rows: u32,
+        host_bytes: u64,
+        discovered_rows: u32,
+        discovered_bytes: u64,
+    ) -> bool {
         let json = serde_json::to_string(r).unwrap();
         let mut stmt = conn.prepare(DEFERRED_GRAPH_UPSERT_SQL).unwrap();
         let mut rows = stmt
@@ -427,7 +479,11 @@ mod tests {
                 max_rows,
                 max_bytes as i64,
                 host_rows,
-                host_bytes as i64
+                host_bytes as i64,
+                overlay_engine::gasp::peer_origin(&r.peer),
+                r.configured,
+                discovered_rows,
+                discovered_bytes as i64
             ])
             .unwrap();
         rows.next().unwrap().is_some()
@@ -590,6 +646,160 @@ mod tests {
         let put = &put[..put.find("async fn find_deferred_graphs").unwrap()];
         assert!(put.contains("DEFERRED_GRAPHS_MAX_ROWS_PER_HOST"));
         assert!(put.contains("DEFERRED_GRAPHS_MAX_BYTES_PER_HOST"));
+    }
+
+    /// bsv-low #555, the delta-2 fold's D2-M2 (the lens's DELTA2-4, inverted).
+    /// On ef423da eight spellings of one server (`https://evil.example/?0` ..
+    /// `?7`), 16 records over two topics each, took all 256 rows, and a
+    /// CONFIGURED peer (`overlay-us-1.bsvb.tech`, `tm_uhrp`) was then refused.
+    /// Now the spellings are ONE origin and share one share (32 rows), the
+    /// discovered peers together hold at most half the rows (128, here with
+    /// four subdomains), and the configured peer still saves, up to the
+    /// global bound. Bytes: the discovered half refuses a discovered growth
+    /// that a configured record of the same size passes.
+    #[test]
+    fn e555d2_m2_a_configured_peer_saves_with_the_discovered_half_full() {
+        let conn = sqlite();
+        let save = |host: &str, topic: &str, o: &str, configured: bool| {
+            let mut r = record(o, 1, 1, 1);
+            r.peer = host.into();
+            r.topic = topic.into();
+            r.configured = configured;
+            let json = serde_json::to_string(&r).unwrap();
+            let mut stmt = conn.prepare(DEFERRED_GRAPH_UPSERT_SQL).unwrap();
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    r.peer,
+                    r.topic,
+                    r.outpoint,
+                    r.score as f64,
+                    r.nodes.len() as i64,
+                    r.pending.len() as i64,
+                    r.calls as i64,
+                    r.passes as i64,
+                    r.reason,
+                    json.len() as i64,
+                    json,
+                    DEFERRED_GRAPHS_MAX_ROWS,
+                    DEFERRED_GRAPHS_MAX_TOTAL_BYTES as i64,
+                    DEFERRED_GRAPHS_MAX_ROWS_PER_HOST,
+                    DEFERRED_GRAPHS_MAX_BYTES_PER_HOST as i64,
+                    overlay_engine::gasp::peer_origin(&r.peer),
+                    r.configured,
+                    DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS,
+                    DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES as i64
+                ])
+                .unwrap();
+            rows.next().unwrap().is_some()
+        };
+        // DELTA2-4's flood: 8 spellings x 2 topics x 16 records.
+        let mut saved = 0;
+        for spelling in 0..8 {
+            for topic in ["tm_ship", "tm_slap"] {
+                for i in 0..16 {
+                    let host = format!("https://evil.example/?{spelling}");
+                    saved += u32::from(save(
+                        &host,
+                        topic,
+                        &format!("{spelling}{topic}{i}.0"),
+                        false,
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            saved, DEFERRED_GRAPHS_MAX_ROWS_PER_HOST,
+            "eight spellings, one share"
+        );
+        // Three more servers by subdomain fill the discovered half.
+        for sub in ["a", "b", "c", "d"] {
+            for i in 0..32 {
+                save(
+                    &format!("https://{sub}.evil.example"),
+                    "tm_ship",
+                    &format!("{sub}{i}.0"),
+                    false,
+                );
+            }
+        }
+        let held = rows(&conn).len() as u32;
+        assert_eq!(
+            held, DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS,
+            "the discovered half"
+        );
+        assert!(
+            !save("https://e.evil.example", "tm_ship", "e0.0", false),
+            "a 6th discovered host"
+        );
+        // The configured peer still saves, up to the global bound.
+        for i in 0..(DEFERRED_GRAPHS_MAX_ROWS - held) {
+            assert!(
+                save(
+                    "https://overlay-us-1.bsvb.tech",
+                    "tm_uhrp",
+                    &format!("u{i}.0"),
+                    true
+                ),
+                "configured record {i}"
+            );
+        }
+        assert!(
+            !save(
+                "https://overlay-us-1.bsvb.tech",
+                "tm_uhrp",
+                "u-last.0",
+                true
+            ),
+            "the global bound"
+        );
+        assert_eq!(
+            (
+                DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS,
+                DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES
+            ),
+            (128, 32 << 20)
+        );
+        // Bytes: a discovered host at the discovered byte half; a configured
+        // record of the same size passes it.
+        let conn2 = sqlite();
+        let shaped = |host: &str, o: &str, configured: bool| {
+            let mut r = record(o, 1, 1, 1);
+            r.peer = host.into();
+            r.configured = configured;
+            r
+        };
+        let size = serde_json::to_string(&shaped("https://s1", "s1.0", false))
+            .unwrap()
+            .len() as u64;
+        let bytes = |host: &str, o: &str, configured: bool| {
+            upsert_reserved(
+                &conn2,
+                &shaped(host, o, configured),
+                99,
+                99 << 20,
+                99,
+                99 << 20,
+                99,
+                size,
+            )
+        };
+        assert!(bytes("https://s1", "s1.0", false));
+        assert!(
+            !bytes("https://s2", "s2.0", false),
+            "past the discovered bytes"
+        );
+        assert!(
+            bytes("https://configured", "c1.0", true),
+            "configured: global bytes only"
+        );
+        // The worker binds the origin, the class and the half.
+        let storage = include_str!("d1_storage.rs");
+        let put = &storage[storage.find("async fn put_deferred_graph").unwrap()..];
+        let put = &put[..put.find("async fn find_deferred_graphs").unwrap()];
+        assert!(put.contains("peer_origin(&record.peer)"));
+        assert!(put.contains(".bind(record.configured)"));
+        assert!(put.contains("DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS"));
+        assert!(put.contains("DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES"));
     }
 
     /// bsv-low #555, the lens fold's M3: the cron's sweep deletes the rows not
@@ -786,7 +996,9 @@ mod tests {
             ]
         );
         let names = counter_names();
-        assert_eq!(names.len(), 5 + 10);
+        assert_eq!(names.len(), 5 + 11);
         assert!(names.contains(&"gasp_graph_dropped_root_proven_total".to_string()));
+        // The delta-2 fold's D2-M2: a resumed walk dropped after its idle faults.
+        assert!(names.contains(&"gasp_graph_dropped_idle_faults_total".to_string()));
     }
 }

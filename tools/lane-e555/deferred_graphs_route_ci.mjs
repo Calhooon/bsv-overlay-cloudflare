@@ -13,12 +13,19 @@
  * `03e1e17` (no `totalBytes`, no ceiling, neither counter).
  * The delta fold (bsv-low #555, D-M1 and D-M2): the block names the per-host share of the ceiling (32 rows, 8 MiB),
  * and the migrations gave `gasp_peer_health` its `yieldless_syncs` column. RED on `0974be5` (neither).
+ * The delta-2 fold (bsv-low #555, D2-M1 and D2-M2): the block names the discovered peers' half (128 rows, 32 MiB);
+ * `gasp_graph_dropped_idle_faults_total` is served; the migrations gave `gasp_peer_health` its streak stamps and
+ * `gasp_deferred_graphs` its `origin` and `configured`; and the two SHIPPED statements, read verbatim out of the Rust
+ * source with their binds as literals, run on local D1: the upsert under small bounds (two spellings of one origin
+ * share one share, the discovered half refuses a new host, a configured peer saves to the global bound) and the
+ * yield upsert (count, age, a yield). RED on `ef423da` (no fields, no columns, the statements' binds absent).
  *
  *   node tools/lane-e555/deferred_graphs_route_ci.mjs <overlay base> <overlay --persist-to dir>
  *
  * Exit 0 = every expectation held.
  */
 import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const OVERLAY = process.argv[2] ?? 'http://127.0.0.1:8801'
@@ -85,11 +92,72 @@ expect(yieldless[0]?.n === 1, 'gasp_peer_health.yieldless_syncs exists (migratio
 const names = [
   'gasp_graph_deferred_total', 'gasp_graph_resumed_total', 'gasp_graph_converged_total', 'gasp_graph_dropped_total',
   ...['max_passes', 'too_big', 'too_many', 'store_fault', 'not_served', 'held', 'not_held', 'root_proven', 'refused',
-    'no_progress', 'stale']
+    'no_progress', 'idle_faults', 'stale']
     .map((r) => `gasp_graph_dropped_${r}_total`),
 ]
 const missing = names.filter((n) => typeof h0.counters?.[n] !== 'number')
 expect(missing.length === 0, `every gasp_graph_*_total counter is served (${names.length})`, `missing: ${missing}`)
+
+// The delta-2 fold (D2-M1, D2-M2).
+expect(
+  block0?.budget?.discoveredMaxRows === 128 && block0?.budget?.discoveredMaxBytes === 33554432,
+  "the discovered peers' half of the ceiling (128 rows, 32 MiB)",
+  JSON.stringify(block0?.budget),
+)
+const columns = (table) => d1(`SELECT name FROM pragma_table_info('${table}')`).map((r) => r.name)
+const health_cols = columns('gasp_peer_health')
+const graph_cols = columns('gasp_deferred_graphs')
+expect(
+  health_cols.includes('first_yieldless_at') && health_cols.includes('last_yieldless_at') &&
+    graph_cols.includes('origin') && graph_cols.includes('configured'),
+  'migrations 172-175: the streak stamps, origin and configured',
+  JSON.stringify({ health_cols, graph_cols }),
+)
+// The shipped statements, verbatim from the Rust source, binds as literals.
+function shipped(file, name) {
+  const src = readFileSync(new URL(`../../crates/overlay-cloudflare/src/${file}`, import.meta.url), 'utf8')
+  const m = src.match(new RegExp(`const ${name}: &str =\\s*"((?:[^"\\\\]|\\\\.)*)"`, 's'))
+  if (!m) throw new Error(`${name} not found in ${file}`)
+  return m[1].replace(/\\\n\s*/g, '')
+}
+const lit = (v) => (typeof v === 'string' ? `'${v.replaceAll("'", "''")}'` : String(v))
+const bound = (sql, binds) => binds.reduceRight((q, v, i) => q.replaceAll(`?${i + 1}`, lit(v)), sql)
+const UPSERT = shipped('gasp_deferred.rs', 'DEFERRED_GRAPH_UPSERT_SQL')
+const T = 'tm_e555d2'
+// Bounds: 4 rows, 2 discovered, 1 per discovered origin; bytes far above.
+const save = (host, origin, outpoint, configured) =>
+  d1(bound(UPSERT, [host, T, outpoint, 1, 1, 1, 1, 1, 'calls', 10, '{}', 4, 1e9, 1, 1e9, origin, configured ? 1 : 0, 2,
+    1e9])).length === 1
+d1(`DELETE FROM gasp_deferred_graphs WHERE topic = '${T}'`)
+const saves = [
+  save('https://evil.example/?1', 'evil.example', 'q1.0', false),
+  save('https://evil.example/?2', 'evil.example', 'q2.0', false),
+  save('https://a.evil.example', 'a.evil.example', 'a1.0', false),
+  save('https://b.evil.example', 'b.evil.example', 'b1.0', false),
+  save('https://configured.example', 'configured.example', 'c1.0', true),
+  save('https://configured.example', 'configured.example', 'c2.0', true),
+  save('https://configured.example', 'configured.example', 'c3.0', true),
+]
+expect(
+  JSON.stringify(saves) === JSON.stringify([true, false, true, false, true, true, false]),
+  'the shipped upsert on local D1: one share per origin, the discovered half, configured to the global bound',
+  JSON.stringify(saves),
+)
+d1(`DELETE FROM gasp_deferred_graphs WHERE topic = '${T}'`)
+const YIELD = shipped('d1_storage.rs', 'PEER_YIELD_UPSERT_SQL')
+d1(`DELETE FROM gasp_peer_health WHERE topic = '${T}'`)
+const y = (yielded) => d1(bound(YIELD, ['evil.example', T, yielded ? 1 : 0, 21600]))[0]
+const y1 = y(false)
+d1(`UPDATE gasp_peer_health SET first_yieldless_at = first_yieldless_at - 3600, last_yieldless_at = last_yieldless_at - 60 WHERE topic = '${T}'`)
+const y2 = y(false)
+const y3 = y(true)
+expect(
+  y1?.yieldless_syncs === 1 && y1?.secsSinceFirst === 0 && y2?.yieldless_syncs === 2 && y2?.secsSinceFirst >= 3600 &&
+    y3?.yieldless_syncs === 0 && y3?.secsSinceFirst === null,
+  'the shipped yield upsert on local D1: the count, the age from the first, a yield ends it',
+  JSON.stringify([y1, y2, y3]),
+)
+d1(`DELETE FROM gasp_peer_health WHERE topic = '${T}'`)
 
 // 2. A deferred graph's row, aged five minutes.
 const OUTPOINT = 'e555'.repeat(16) + '.0'

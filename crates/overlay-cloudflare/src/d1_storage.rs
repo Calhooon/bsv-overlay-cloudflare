@@ -115,17 +115,29 @@ pub(crate) const PEER_HEALTH_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health \
        last_success = CASE WHEN ?3 THEN unixepoch() ELSE last_success END";
 
 /// The SHIPPED upsert behind `record_peer_sync_yield` (bsv-low #555, the
-/// delta fold's D-M2): the consecutive YIELDLESS syncs of a (host, topic).
-/// Binds: `?1` host, `?2` topic, `?3` yielded (1/0). A sync that yielded
-/// resets the count to 0, one that did not adds one; the new count is
-/// returned. A new row's `last_attempt` is left NULL: the engine records the
-/// attempt itself next (`PEER_HEALTH_UPSERT_SQL`), which stamps it.
+/// delta fold's D-M2 and the delta-2 fold's D2-M1): the YIELDLESS streak of a
+/// (host, topic), `host` the peer's normalized origin. Binds: `?1` host, `?2`
+/// topic, `?3` yielded (1/0), `?4` `PEER_YIELDLESS_DECAY_SECS`. A sync that
+/// yielded ends the streak (count 0, both stamps NULL); one that did not adds
+/// one and stamps `last_yieldless_at`, and starts a NEW streak (count 1,
+/// `first_yieldless_at` now) when there was none or its last yieldless sync
+/// is more than `?4` old (the decay). SQLite reads the OLD row in every `SET`
+/// expression. Returns the count and `secsSinceFirst`, the streak's age on
+/// D1's clock. A new row's `last_attempt` is left NULL: the engine records
+/// the attempt itself next (`PEER_HEALTH_UPSERT_SQL`), which stamps it.
 pub(crate) const PEER_YIELD_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health \
-     (host, topic, consecutive_failures, yieldless_syncs) \
-     VALUES (?1, ?2, 0, CASE WHEN ?3 THEN 0 ELSE 1 END) \
+     (host, topic, consecutive_failures, yieldless_syncs, first_yieldless_at, last_yieldless_at) \
+     VALUES (?1, ?2, 0, CASE WHEN ?3 THEN 0 ELSE 1 END, \
+             CASE WHEN ?3 THEN NULL ELSE unixepoch() END, CASE WHEN ?3 THEN NULL ELSE unixepoch() END) \
      ON CONFLICT(host, topic) DO UPDATE SET \
-       yieldless_syncs = CASE WHEN ?3 THEN 0 ELSE yieldless_syncs + 1 END \
-     RETURNING yieldless_syncs";
+       yieldless_syncs = CASE WHEN ?3 THEN 0 \
+         WHEN last_yieldless_at IS NULL OR yieldless_syncs = 0 OR unixepoch() - last_yieldless_at > ?4 THEN 1 \
+         ELSE yieldless_syncs + 1 END, \
+       first_yieldless_at = CASE WHEN ?3 THEN NULL \
+         WHEN last_yieldless_at IS NULL OR yieldless_syncs = 0 OR unixepoch() - last_yieldless_at > ?4 THEN unixepoch() \
+         ELSE first_yieldless_at END, \
+       last_yieldless_at = CASE WHEN ?3 THEN NULL ELSE unixepoch() END \
+     RETURNING yieldless_syncs, (unixepoch() - first_yieldless_at) AS secsSinceFirst";
 
 /// The SHIPPED health read (bsv-low#302). Age is computed relative in SQL
 /// (`unixepoch() - last_attempt`) so wasm and the rusqlite test agree on
@@ -881,19 +893,27 @@ impl Storage for D1Storage {
         host: &str,
         topic: &str,
         yielded: bool,
-    ) -> Result<u64, StorageError> {
+    ) -> Result<overlay_engine::storage::PeerYieldStreak, StorageError> {
         #[derive(Deserialize)]
-        struct Count {
+        struct Streak {
             yieldless_syncs: f64,
+            #[serde(rename = "secsSinceFirst")]
+            secs_since_first: Option<f64>,
         }
-        let row: Option<Count> = Query::new(PEER_YIELD_UPSERT_SQL)
+        let row: Option<Streak> = Query::new(PEER_YIELD_UPSERT_SQL)
             .bind(host)
             .bind(topic)
             .bind(yielded)
+            .bind(overlay_engine::gasp::PEER_YIELDLESS_DECAY_SECS as f64)
             .fetch_optional(&self.db)
             .await
             .map_err(d1_err)?;
-        Ok(row.map_or(0, |r| r.yieldless_syncs.max(0.0) as u64))
+        Ok(row.map_or_else(Default::default, |r| {
+            overlay_engine::storage::PeerYieldStreak {
+                yieldless_syncs: r.yieldless_syncs.max(0.0) as u64,
+                secs_since_first: r.secs_since_first.map(|s| s.max(0.0) as u64),
+            }
+        }))
     }
 
     async fn get_peer_sync_health(
@@ -942,6 +962,10 @@ impl Storage for D1Storage {
             .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_TOTAL_BYTES as f64)
             .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS_PER_HOST)
             .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_BYTES_PER_HOST as f64)
+            .bind(overlay_engine::gasp::peer_origin(&record.peer).as_str())
+            .bind(record.configured)
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS)
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES as f64)
             .fetch_optional(&self.db)
             .await
             .map_err(d1_err)?;
@@ -1466,7 +1490,12 @@ mod tests {
         let yield_ = |yielded: bool| -> i64 {
             conn.query_row(
                 PEER_YIELD_UPSERT_SQL,
-                rusqlite::params!["https://hostile", "tm_test", yielded],
+                rusqlite::params![
+                    "https://hostile",
+                    "tm_test",
+                    yielded,
+                    overlay_engine::gasp::PEER_YIELDLESS_DECAY_SECS as i64
+                ],
                 |r| r.get(0),
             )
             .unwrap()
@@ -1495,6 +1524,78 @@ mod tests {
         assert!(
             f[..f.find("async fn get_peer_sync_health").unwrap()].contains("PEER_YIELD_UPSERT_SQL")
         );
+    }
+
+    /// bsv-low #555, the delta-2 fold's D2-M1: the shipped yield upsert
+    /// keeps the streak IN TIME. Its first yieldless sync stamps
+    /// `first_yieldless_at`, and `secsSinceFirst` is the streak's age on
+    /// D1's clock; later yieldless syncs keep the start; a yield clears both
+    /// stamps; a yieldless sync more than `PEER_YIELDLESS_DECAY_SECS` after
+    /// the LAST one starts a new streak (count 1, age 0). The clock is moved
+    /// by shifting the row's stamps back. On ef423da the statement kept a
+    /// count only (no age: the bound was in syncs, 12 minutes at one tick a
+    /// minute).
+    #[test]
+    fn e555d2_m1_the_yield_upsert_keeps_the_streak_in_time() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "{e}\n{sql}"
+                );
+            }
+        }
+        let decay = overlay_engine::gasp::PEER_YIELDLESS_DECAY_SECS as i64;
+        let yield_ = |yielded: bool| -> (i64, Option<i64>) {
+            conn.query_row(
+                PEER_YIELD_UPSERT_SQL,
+                rusqlite::params!["evil.example", "tm_ship", yielded, decay],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let back = |secs: i64| {
+            conn.execute(
+                "UPDATE gasp_peer_health SET first_yieldless_at = first_yieldless_at - ?1, \
+                 last_yieldless_at = last_yieldless_at - ?1",
+                [secs],
+            )
+            .unwrap();
+        };
+        assert_eq!(yield_(false), (1, Some(0)), "a new streak");
+        back(3 * 3600);
+        assert_eq!(yield_(false), (2, Some(3 * 3600)), "its age from the FIRST");
+        back(decay);
+        assert_eq!(
+            yield_(false),
+            (3, Some(3 * 3600 + decay)),
+            "6 h exactly: the same streak"
+        );
+        back(decay + 1);
+        assert_eq!(
+            yield_(false),
+            (1, Some(0)),
+            "past 6 h since the last: a new streak"
+        );
+        assert_eq!(yield_(true), (0, None), "a yield ends it");
+        let stamps: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT first_yieldless_at, last_yieldless_at FROM gasp_peer_health",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stamps, (None, None));
+        assert_eq!(yield_(false), (1, Some(0)));
+        // The worker binds the decay and reads the age.
+        let storage = include_str!("d1_storage.rs");
+        let f = &storage[storage.find("async fn record_peer_sync_yield").unwrap()..];
+        let f = &f[..f.find("async fn get_peer_sync_health").unwrap()];
+        assert!(f.contains("PEER_YIELDLESS_DECAY_SECS"));
+        assert!(f.contains("secs_since_first"));
     }
 
     #[test]

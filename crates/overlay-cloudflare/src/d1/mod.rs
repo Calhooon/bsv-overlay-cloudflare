@@ -462,7 +462,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// and the per-class index.
 /// 169 → 170 for bsv-low #555 (2026-10-09): `gasp_deferred_graphs`, the deferred GASP graphs' walks.
 /// 170 → 171 for bsv-low #555's delta fold (2026-10-09, D-M2): `gasp_peer_health.yieldless_syncs` (one additive ALTER).
-pub const OVERLAY_MIGRATION_COUNT: usize = 171;
+/// 171 → 175 for bsv-low #555's delta-2 fold (2026-10-09, D2-M1, D2-M2): `gasp_peer_health.first_yieldless_at` and
+/// `.last_yieldless_at` (the streak in time), `gasp_deferred_graphs.origin` and `.configured` (the share by origin and
+/// the reserve for configured peers); four additive ALTERs.
+pub const OVERLAY_MIGRATION_COUNT: usize = 175;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1737,6 +1740,15 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // that finalized no graph and moved no cursor (`PEER_YIELD_UPSERT_SQL`); past 12 each is a failed attempt for the
     // quarantine. Additive ALTER; the runner ignores the re-run "duplicate column" error.
     "ALTER TABLE gasp_peer_health ADD COLUMN yieldless_syncs INTEGER NOT NULL DEFAULT 0",
+    // bsv-low #555's delta-2 fold (D2-M1): the yieldless streak in TIME. Its first yieldless sync (the age the bound
+    // reads) and its last (the 6 h decay), `unixepoch()`; NULL with no streak (`PEER_YIELD_UPSERT_SQL`).
+    "ALTER TABLE gasp_peer_health ADD COLUMN first_yieldless_at INTEGER",
+    "ALTER TABLE gasp_peer_health ADD COLUMN last_yieldless_at INTEGER",
+    // bsv-low #555's delta-2 fold (D2-M2): a deferred graph's peer by NORMALIZED ORIGIN (the per-host share's key; a
+    // row saved before it holds '' until its next save) and whether the peer is CONFIGURED (records of discovered
+    // peers hold at most half the ceiling). `DEFERRED_GRAPH_UPSERT_SQL`.
+    "ALTER TABLE gasp_deferred_graphs ADD COLUMN origin TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE gasp_deferred_graphs ADD COLUMN configured INTEGER NOT NULL DEFAULT 0",
 ];
 
 // =============================================================================
