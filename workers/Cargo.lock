@@ -124,6 +124,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsv-low-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aae2424609dcaa1144d7d46715d531c396cbc9dae430574effbe289bfe82ba13"
+dependencies = [
+ "k256",
+ "sha2",
+]
+
+[[package]]
+name = "bsv-low-wire"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc3a7014b9af5bde09c7a98499bca5a0c257c545e19b3cf85a9d7ab1fcc1c60e"
+dependencies = [
+ "k256",
+ "sha2",
+]
+
+[[package]]
 name = "bsv-middleware-cloudflare"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -906,33 +926,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "low-core"
-version = "0.1.0"
-dependencies = [
- "k256",
- "sha2",
-]
-
-[[package]]
 name = "low-proof-replay"
 version = "0.1.0"
 dependencies = [
+ "bsv-low-core",
+ "bsv-low-wire",
  "bsv-overlay-discovery",
  "bsv-overlay-engine",
  "flate2",
  "hex",
- "low-core",
- "low-wire",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "low-wire"
-version = "0.1.0"
-dependencies = [
- "k256",
- "sha2",
 ]
 
 [[package]]

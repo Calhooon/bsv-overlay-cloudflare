@@ -1,10 +1,11 @@
 # The LOW workers' workspace (bsv-low #553, 2026-10-06): the two deployable
 # workers and the `LOW/proof/v1` replay they share. These three crates link
-# `low-core` and `low-wire` by PATH from the private `bsv-low` checkout that
-# must sit beside this repository (`../bsv-low`), so they cannot be members
-# of the root workspace: that one has to load from a fresh clone alone (it is
-# what a consumer pins by git rev). The engine crates are path dependencies
-# of these, never the reverse.
+# `low-core` and `low-wire`: since 2026-10-09 from crates.io (`bsv-low-core`,
+# `bsv-low-wire`, published from the private `bsv-low`, pinned by exact
+# version in `crates/low-proof-replay`); before that by PATH from the sister
+# checkout, which is why these three are a workspace of their own and not
+# members of the root one (that one is what a consumer pins by git rev). The
+# engine crates are path dependencies of these, never the reverse.
 #
 # A virtual manifest, so neither worker owns the other. Each member names it
 # with `package.workspace`. ONE `Cargo.lock` (`workers/Cargo.lock`) serves
