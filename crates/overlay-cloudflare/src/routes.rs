@@ -914,11 +914,16 @@ async fn submit_parts(
             // RESIDUAL (named): this counts only submits that ARRIVE. An
             // overlay outage is exactly when the client is least ready; that
             // slice stays with the client-side warn (bsv-low #351).
-            let verdict = crate::submit_census::census_verdict(&tagged_beef.beef);
+            let reading = crate::submit_census::census_reading(&tagged_beef.beef);
+            let verdict = reading.verdict;
             let (state_counter, reason_counter) =
                 crate::submit_census::census_counters(path, lenient_unbarred, verdict);
+            // bsv-low #585 (the doors lens L1): bytes the streaming reader
+            // refuses and the gated arm's parser takes are classified from
+            // the arm's own parse, and counted apart.
+            let stream_refused = reading.stream_refused;
             worker::console_log!(
-                "POST /submit census(#366): path={} population={} verdict={} → {}",
+                "POST /submit census(#366): path={} population={} verdict={} → {}{}",
                 path.as_str(),
                 if lenient_unbarred {
                     "client"
@@ -926,7 +931,12 @@ async fn submit_parts(
                     "operator"
                 },
                 verdict.as_str(),
-                state_counter
+                state_counter,
+                if stream_refused {
+                    " (the streaming reader refused the bytes; the ancestry is the gated arm's parse)"
+                } else {
+                    ""
+                }
             );
             // Precisely (gate LOW-1): the CLASSIFICATION above is SYNCHRONOUS
             // on every ungated submit — the gated arm's own parse, the
@@ -942,6 +952,14 @@ async fn submit_parts(
                     crate::ops::bump_counter(&census_db, state_counter, 1).await;
                     if let Some(reason) = reason_counter {
                         crate::ops::bump_counter(&census_db, reason, 1).await;
+                    }
+                    if stream_refused {
+                        crate::ops::bump_counter(
+                            &census_db,
+                            crate::submit_census::COUNTER_STREAM_REFUSED,
+                            1,
+                        )
+                        .await;
                     }
                 }),
                 Err(e) => {

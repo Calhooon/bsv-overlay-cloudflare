@@ -355,7 +355,7 @@ where the shortcut already was; RED against the shortcut taken for every
 input). Below the marked line: `e585f_a_breach_names_its_limb` and
 `e585f_l3_the_memory_estimate_is_above_the_measured_heap`.
 
-## The census reads the stream (bsv-low #366; #585 door 2)
+## The census reads the stream (bsv-low #366; #585 door 2; the doors lens fold of 2026-10-09)
 
 `submit_census::census_verdict` classifies every `/submit` served on an
 UNGATED path: would the same bytes have survived the gated arm's pre-network
@@ -367,8 +367,9 @@ of any request's answer. Three states: `gated-ready`, `would-fail(reason)`,
 **The rule.** A body is CLASSIFIED whatever its size. Until #585 a body over
 2 MiB was `could-not-evaluate(body-over-eval-bound)`: not looked at. That
 stop is gone (`MAX_CENSUS_EVAL_BYTES`, the verdict's variant), and so is the
-census's own bounded parse (`CENSUS_BEEF_LIMITS`). The third state has two
-reasons left: `mined-claim-unverified` and `subject-ambiguous`.
+census's own bounded parse (`CENSUS_BEEF_LIMITS`). The third state has three
+reasons: `mined-claim-unverified`, `subject-ambiguous` and
+`ancestry-over-memory`.
 
 The verdict is two things. (1) The gated arm's OWN functions, called on the
 same bytes in the arm's order (`ef::beef_to_ef_batch`,
@@ -380,9 +381,52 @@ STREAM: `AncestryShape`, two reads through bsv-rs 0.4.0's `BeefStream`, one
 element in hand, into a number per raw transaction and a pair per input that
 spends another transaction of the BEEF. Measured: 143 bytes for the 5,243,030
 byte pin (2 transactions, 1 BUMP); 74 bytes per element over a 1,000
-transaction chain. Bytes the streaming reader refuses, where the arm's parser
-took them, are a non-answer and a non-answer is no green
-(`could-not-evaluate(subject-ambiguous)`).
+transaction chain.
+
+**The stream is the census's reader, not its judge** (the lens's E585-D12-L1).
+The streaming reader is stricter than the arm's parser: a byte after the
+frame's end, a BUMP leaf flag or a V2 format byte with unknown bits, a BUMP
+whose nodes disagree. The arm takes those bytes, converts them and would
+broadcast. Until the fold they were `could-not-evaluate(subject-ambiguous)`,
+which is the reason of a poisoned sort and not of a stricter reader: a client
+that emits a trailing byte sat in that bucket with no way to tell why. Now,
+when the stream refuses bytes the arm's parse accepted, the ancestry is
+answered from THE ARM'S OWN PARSE (`beef_limits::parse_beef` under
+`EF_BEEF_LIMITS`, the call `beef_to_ef_batch` made a moment before, and the
+check of before #585 over it): the verdict is the arm's, `gated-ready` where
+the arm would pass, and a stray entry is still the third state. Each such body
+is counted on `submit_census_stream_refused_total` BESIDE its verdict's
+counters (served as `submitReadinessCensus.streamRefused`; how it was read,
+not a fourth state), and its log line says so.
+Over NL-6 (`fc019c8`, the rebase E585-land) that class is EMPTY: the arm's
+`parse_beef` runs the same streaming door, refuses those bytes first, and the
+census answers `would-fail(parse)` before it reads the ancestry. The fallback
+and its counter stay as written, unreached (`e585f_l1_*` pins the union).
+
+**The memory of the ancestry read** (the lens's E585-D12-L3). `AncestryShape`
+reads the same stream as the door, twice, so it holds the same element: on the
+lens's wide BUMP (2^18 leaves in 9.8 MB) the SDK's BUMP element, 108 MB
+natively, twice in sequence. Its own table is small. It is bounded the same
+way: `stream_sizing::estimate` under `CENSUS_CHARGES` (the stream's element,
+128 bytes a transaction and 24 an input kept) against `CENSUS_MEMORY_BYTES`,
+the door's 48 MiB, before the stream is opened. Past it the ancestry is NOT
+read and the verdict is `could-not-evaluate(ancestry-over-memory)`
+(`submit_census_reason_ancestry_over_memory_total`,
+`reasons.ancestryOverMemory`): no green, and no fallback to the arm's parse,
+whose hydrated form of such a body is heavier still. On the lens's two bodies:
+the wide BUMP is `ancestry-over-memory` (151 MB by the estimate; up to 87,381
+leaves are read); the 900,000 minimal transactions are `would-fail(parse)`,
+the arm's own refusal (over `max_txs` 512), before any stream read.
+
+**No green on a non-answer** (the lens's E585-D12-L2). The verdict's last step
+is one function, `verdict_of_ancestry`: a covered ancestry is the only green;
+a stray, a read not made for its memory and a read no reader answered are the
+third state. Pinned there (the mutant that answers `GatedReady` on either
+non-answer is RED), and through `census_reading_under` with a body: a valid
+BEEF whose BUMP carries 2^12 leaves is `gated-ready` under a budget that holds
+its read and `ancestry-over-memory` one byte under it. After the L1 fold no
+body reaches the other non-answer (`Unread`) through `census_verdict`: the
+fallback is the parse step (1) already made of the same bytes.
 
 Where it meets NL-6's size refusal, stated and left: `ef.rs`
 `beef_to_ef_batch` and `proven_subject_raw` parse with
@@ -391,30 +435,43 @@ transactions, 512 BUMPs) and hydrate a `Beef`. A body past those is
 `would-fail(parse)` here, which is TRUE of the gated arm (it refuses those
 bytes at that call), so it is a classification and not a stop; the census
 adds no size or count check of its own, and follows the arm when NL-6 moves
-`ef.rs`. `would-fail(ef-over-cap)` is likewise the arm's own 429
+`ef.rs` (its fallback names the arm's parse call and limits and moves with
+them). `would-fail(ef-over-cap)` is likewise the arm's own 429
 (`MAX_SUBJECT_EF_BYTES` 256 KB, `MAX_BATCH_EF_BYTES` 2 MB), mirrored. The
 memory of a census pass is therefore the arm's hydrated parse plus the small
-index; only the index is #585's.
+index; only the index and the stream's element are #585's. The arm's parse of
+the wide BUMP is 190 MB natively (the lens's N8) and runs in step (1), BEFORE
+the census's own bound is reached: on wasm32 that body is the isolate's to
+survive, with or without the census's limb.
 
 Limits, stated. The classification is synchronous on every ungated submit,
 and a body between 2 MiB and the route's 10 MB is now WORK where it was
-skipped: the arm's parse, the subject's EF conversion, and two stream reads
-(each hashes every transaction once); not measured on wasm32. The durable row
+skipped: the arm's parse, the subject's EF conversion, the sizing read and two
+stream reads (each hashes every transaction once), and for bytes the stream
+refuses the arm's parse a second time; not measured on wasm32. The durable row
 `submit_census_reason_body_over_eval_bound_total` stays in the read table
 (`reasons.bodyOverEvalBound`: a total counted before is still served) and is
-never bumped again.
+never bumped again. `beef_limits::CENSUS_BEEF_LIMITS` has no production caller
+left (the lens's N6: NL-6's file, theirs to drop).
 
 Pins: `cargo test --manifest-path workers/Cargo.toml -p
-bsv-overlay-cloudflare --lib e585_d2 -- --nocapture` (`e585_d2_a`: a 5 MB
-valid BEEF is `gated-ready`, one whose SUBJECT is the 5 MB is
+bsv-overlay-cloudflare --lib e585 -- --nocapture`. Door 2's: `e585_d2_a` (a 5
+MB valid BEEF is `gated-ready`, one whose SUBJECT is the 5 MB is
 `would-fail(ef-over-cap)`, one with two tips is
 `could-not-evaluate(subject-ambiguous)`; RED on `d6d2774`, grafted:
-`CouldNotEvaluate(BodyOverEvalBound)`; `e585_d2_the_streams_ancestry_*`: the
-stream's answer equals the hydrated parse's, kept verbatim in the test, for
-every transaction of every body named as the subject, the client fixture's
-bodies and a source written after its spender included;
-`e585_d2_the_ancestry_index_*`). The pre-#585 pin
-`census_over_eval_bound_is_uneval_not_a_guess` is retired: it pinned the stop.
+`CouldNotEvaluate(BodyOverEvalBound)`), `e585_d2_the_streams_ancestry_*` (the
+stream's answer AND the fallback's equal the hydrated parse's, kept verbatim
+in the test, for every transaction of every body named as the subject, the
+client fixture's bodies and a source written after its spender included),
+`e585_d2_the_ancestry_index_*`. The fold's:
+`e585f_l1_a_body_the_stream_alone_refuses_is_the_arms_verdict` (a trailing
+byte and a flag byte with unknown bits: `gated-ready`, counted apart; a stray
+behind a trailing byte still the third state; RED on `8c92671`, the trailing
+body grafted: `CouldNotEvaluate(SubjectAmbiguous)`),
+`e585f_l2_a_body_the_census_cannot_evaluate_is_never_guessed_green` (RED
+against both mutants) and `e585f_l3_the_ancestry_read_is_not_made_past_its_memory`.
+The pre-#585 pin `census_over_eval_bound_is_uneval_not_a_guess` is retired: it
+pinned the stop.
 
 ## GASP anchor check (bsv-low #551)
 

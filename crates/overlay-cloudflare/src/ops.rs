@@ -1142,6 +1142,11 @@ pub async fn census_json(db: &D1Database) -> serde_json::Value {
         // is never folded into either decided state.
         "byMode": serde_json::Value::Object(by_mode),
         "wouldFailAndUnevalReasons": serde_json::Value::Object(reasons),
+        // bsv-low #585 (the doors lens L1): bodies whose bytes the streaming
+        // reader refused and the gated arm's own parse answered. Each is
+        // ALSO in its state's count above: this is how they were read, not a
+        // fourth state.
+        "streamRefused": value_of(crate::submit_census::COUNTER_STREAM_REFUSED),
         // Monotonic totals — durable across isolate recycling (D1), unlike
         // the per-isolate submitAdmission soak counters.
         "semantics": "monotonic totals; 'last N' is a delta between reads",
