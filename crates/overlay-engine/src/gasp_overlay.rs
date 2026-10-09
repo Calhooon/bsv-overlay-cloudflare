@@ -124,6 +124,9 @@ pub struct OverlayGASPStorage<'a> {
     /// The peer this instance syncs from: the key of its deferred graphs
     /// (bsv-low #555, [`Self::with_peer`]).
     peer: String,
+    /// Whether that peer is CONFIGURED (`SyncTarget::Peers`), written into
+    /// each record saved (the delta-2 fold's D2-M2, [`Self::with_configured_peer`]).
+    configured_peer: bool,
 }
 
 /// Lends the engine's tracker to the anchor check and notes whether it
@@ -187,6 +190,7 @@ impl<'a> OverlayGASPStorage<'a> {
             chain_tracker: None,
             verify_scripts: true,
             peer: String::new(),
+            configured_peer: false,
         }
     }
 
@@ -196,6 +200,17 @@ impl<'a> OverlayGASPStorage<'a> {
     #[must_use]
     pub fn with_peer(mut self, peer: impl Into<String>) -> Self {
         self.peer = peer.into();
+        self
+    }
+
+    /// Say whether the peer is a CONFIGURED one (`SyncTarget::Peers`) or
+    /// one `ls_ship` discovered (bsv-low #555, the delta-2 fold's D2-M2):
+    /// each record saved carries it (`DeferredGraph::configured`), so a
+    /// storage can reserve part of its ceiling for configured peers.
+    /// Default `false`. `Engine::start_gasp_sync` wires it.
+    #[must_use]
+    pub fn with_configured_peer(mut self, configured: bool) -> Self {
+        self.configured_peer = configured;
         self
     }
 
@@ -1167,6 +1182,7 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         let mut record = record.clone();
         record.peer.clone_from(&self.peer);
         record.topic.clone_from(&self.topic);
+        record.configured = self.configured_peer;
         self.storage
             .put_deferred_graph(&record)
             .await

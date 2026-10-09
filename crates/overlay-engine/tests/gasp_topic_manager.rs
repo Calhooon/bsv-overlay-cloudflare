@@ -2680,7 +2680,7 @@ impl Budgeted {
 
     async fn failures(&self) -> u64 {
         self.store
-            .get_peer_sync_health(PEER, TOPIC)
+            .get_peer_sync_health(&peer_origin(PEER), TOPIC)
             .await
             .unwrap()
             .consecutive_failures
@@ -3496,6 +3496,16 @@ impl Storage for ScriptedStore {
         topic: &str,
     ) -> Result<PeerSyncHealth, StorageError> {
         self.inner.get_peer_sync_health(host, topic).await
+    }
+    async fn record_peer_sync_yield(
+        &self,
+        host: &str,
+        topic: &str,
+        yielded: bool,
+    ) -> Result<bsv_overlay_engine::storage::PeerYieldStreak, StorageError> {
+        self.inner
+            .record_peer_sync_yield(host, topic, yielded)
+            .await
     }
     async fn put_deferred_graph(
         &self,
@@ -7552,7 +7562,7 @@ async fn e1d_fold3_l2_the_door_asks_the_landing_guard_before_it_lands() {
 // pass from the record, never restarted. The other graphs of the pass go on.
 // ============================================================================
 
-use bsv_overlay_engine::gasp::{DeferredGraph, DEFERRED_GRAPH_MAX_PASSES};
+use bsv_overlay_engine::gasp::{peer_origin, DeferredGraph, DEFERRED_GRAPH_MAX_PASSES};
 
 // A per-graph deadline that never falls due: the call count binds.
 fn never() -> bsv_overlay_engine::engine::SleepFactory {
@@ -7827,7 +7837,7 @@ async fn e555_b_a_stuck_peer_is_deferred_each_pass_and_dropped_after_max_passes(
         assert_eq!(node.store.deferred_graphs()[0].passes, pass);
         assert_eq!(node.failures().await, 1, "pass {pass}: nothing fetched");
         node.store
-            .record_peer_sync_outcome(PEER, TOPIC, true)
+            .record_peer_sync_outcome(&peer_origin(PEER), TOPIC, true)
             .await
             .unwrap();
     }
@@ -8454,7 +8464,9 @@ async fn e555d_m1_a_5xx_peer_keeps_no_record_and_an_honest_deep_graph_keeps_its_
 // any number of ticks). Now a sync that finalized no graph and moved no
 // cursor is yieldless; past PEER_YIELDLESS_SYNCS_ALLOWED of them each is a
 // failed attempt, and the peer is quarantined PEER_QUARANTINE_THRESHOLD
-// syncs later.
+// syncs later. Amended by the delta-2 fold (D2-M1): the bound is in time
+// too, so the storage's clock advances 15 min a tick (`*/15`): the 13th
+// yieldless sync is also the first 3 h after the streak began.
 #[tokio::test]
 async fn e555d_m2_a_peer_serving_one_fresh_root_a_tick_is_quarantined() {
     let (_logs, _guard) = capture_logs();
@@ -8472,6 +8484,9 @@ async fn e555d_m2_a_peer_serving_one_fresh_root_a_tick_is_quarantined() {
     let mut tick = 0u64;
     loop {
         tick += 1;
+        if tick > 1 {
+            node.store.advance_clock(15 * 60);
+        }
         // Only the fresh one is listed: the last tick's record is dropped
         // `not_served` (16 held would send the 17th walk on, L4).
         let fresh = salted_chain(2, 100 + tick);
@@ -8624,4 +8639,374 @@ async fn e555d_l2_a_store_fault_at_a_deferral_goes_on_and_completes() {
     assert_eq!(held(&node.store, &nodes).await, vec![(7, 0)]);
     assert_eq!(node.cursor().await, 1);
     assert_eq!(node.store.deferred_graph_put_attempts(), 1);
+}
+
+// ============================================================================
+// bsv-low #555, the delta-2 fold (the delta-2 lens on ef423da): D2-M1 the
+// yieldless bound in time, D2-M2 the share and the health keyed on the
+// normalized origin, configured peers reserved, a resumed idle fault bounded,
+// D2-L1 a fresh walk that paid keeps its record.
+// ============================================================================
+
+use bsv_overlay_engine::gasp::{
+    ship_peers_by_origin, DEFERRED_GRAPH_MAX_IDLE_FAULTS, PEER_YIELDLESS_DECAY_SECS,
+    PEER_YIELDLESS_SECS_ALLOWED,
+};
+use bsv_overlay_engine::storage::PeerYieldStreak;
+
+// D2-M1 (the lens's DELTA2-1, at one tick a MINUTE, LOW's beta cadence). An
+// honest peer whose only new work is #582's shape: an UNPROVEN head over a
+// chain deeper than the per-graph budget, which cannot complete before its
+// block. Every sync is yieldless. On ef423da the 13th (13 minutes) was a
+// failed attempt and the peer was quarantined at the 20th, then skipped the
+// tick its block landed. Now no failure for 30 minutes of yieldless syncs;
+// the block lands, the graph converges, the streak ends. And the bound still
+// bites: a second node's streak, yieldless for 3 h, fails its next sync.
+#[tokio::test]
+async fn e555d2_m1_an_honest_unproven_head_at_one_tick_a_minute_is_not_failed_before_three_hours() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(100);
+    let mut unproven = nodes.clone();
+    unproven[99].proof = None;
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&unproven, &[99]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    for tick in 1..=30u64 {
+        if tick > 1 {
+            node.store.advance_clock(60);
+        }
+        let (topic, sent) = node.tick().await;
+        assert!(!sent.is_empty(), "tick {tick}: synced");
+        assert_eq!(
+            node.failures().await,
+            0,
+            "tick {tick}: no failure inside 3 h: {:?}",
+            topic.errors
+        );
+        assert_eq!(node.store.peer_yieldless_syncs(PEER, TOPIC), tick);
+    }
+    // The block lands: the root is served proven.
+    let mut mined = RecordingRemote::new(&nodes, &[99]);
+    mined.requests = node.requests.clone();
+    node.engine.set_gasp_remote_factory(Box::new(MeteredRemote {
+        inner: mined,
+        clock: node.clock.clone(),
+    }));
+    let mut ticks = 30;
+    while held(&node.store, &nodes).await != vec![(99, 0)] {
+        node.store.advance_clock(60);
+        let (_, sent) = node.tick().await;
+        ticks += 1;
+        assert!(!sent.is_empty(), "tick {ticks}: never skipped");
+        assert_eq!(node.failures().await, 0, "tick {ticks}");
+        assert!(ticks < 80, "converges");
+    }
+    assert_eq!(
+        node.store.peer_yieldless_syncs(PEER, TOPIC),
+        0,
+        "a yield ends the streak"
+    );
+
+    // The time bound bites: 14 yieldless syncs, the last 3 h after the first.
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&unproven, &[99]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    for tick in 1..=13u64 {
+        if tick > 1 {
+            node.store.advance_clock(60);
+        }
+        node.tick().await;
+        assert_eq!(node.failures().await, 0, "tick {tick}");
+    }
+    node.store.advance_clock(PEER_YIELDLESS_SECS_ALLOWED);
+    let (topic, _) = node.tick().await;
+    assert_eq!(node.failures().await, 1, "past both bounds");
+    assert!(topic
+        .errors
+        .iter()
+        .any(|e| e.contains("finalized no graph")));
+    println!("#555 delta-2 D2-M1: 30 yieldless syncs at one a minute, no failure; converged on tick {ticks}; a 3 h streak fails");
+}
+
+// D2-M1, the streak's own rules over MemoryStorage (the model of the
+// worker's `PEER_YIELD_UPSERT_SQL`): the age is counted from the FIRST
+// yieldless sync; a yield ends the streak; a yieldless sync more than
+// PEER_YIELDLESS_DECAY_SECS after the LAST one starts a new streak (quiet
+// syncs between leave it).
+#[tokio::test]
+async fn e555d2_m1_the_streak_carries_its_age_and_decays_after_six_quiet_hours() {
+    let store = MemoryStorage::new();
+    let streak = |n: u64, age: u64| PeerYieldStreak {
+        yieldless_syncs: n,
+        secs_since_first: Some(age),
+    };
+    let y = |yielded: bool| store.record_peer_sync_yield("h", TOPIC, yielded);
+    assert_eq!(y(false).await.unwrap(), streak(1, 0));
+    store.advance_clock(600);
+    assert_eq!(y(false).await.unwrap(), streak(2, 600));
+    store.advance_clock(PEER_YIELDLESS_DECAY_SECS);
+    assert_eq!(
+        y(false).await.unwrap(),
+        streak(3, 600 + PEER_YIELDLESS_DECAY_SECS),
+        "6 h exactly: the same streak"
+    );
+    store.advance_clock(PEER_YIELDLESS_DECAY_SECS + 1);
+    assert_eq!(
+        y(false).await.unwrap(),
+        streak(1, 0),
+        "past 6 h quiet: a new streak"
+    );
+    assert_eq!(
+        y(true).await.unwrap(),
+        PeerYieldStreak::default(),
+        "a yield ends it"
+    );
+    assert_eq!(y(false).await.unwrap(), streak(1, 0));
+    // The pure rule: both bounds, and an unknown age never past.
+    use bsv_overlay_engine::gasp::yieldless_sync_failed as failed;
+    assert!(!failed(&streak(13, PEER_YIELDLESS_SECS_ALLOWED - 1)));
+    assert!(!failed(&streak(12, PEER_YIELDLESS_SECS_ALLOWED)));
+    assert!(failed(&streak(13, PEER_YIELDLESS_SECS_ALLOWED)));
+    assert!(!failed(&PeerYieldStreak {
+        yieldless_syncs: 1000,
+        secs_since_first: None
+    }));
+}
+
+// D2-M2 (the lens's DELTA2-3): seven spellings of one server passed
+// `is_advertisable_uri` and were seven "hosts", each with its own share of the
+// worker's ceiling, its own quarantine and a fresh yieldless streak. Now a
+// peer's health and share are keyed on its normalized origin, and the SHIP
+// peers of a topic are one per origin (the https, default-port spelling
+// first). A subdomain is another host (stated). And the engine writes the
+// health under the origin, never the URL.
+#[tokio::test]
+async fn e555d2_m2_spellings_of_one_server_are_one_origin_and_one_peer() {
+    let spellings = [
+        "https://evil.example",
+        "https://evil.example/",
+        "https://evil.example/?1",
+        "https://evil.example/?2",
+        "https://evil.example:8443",
+        "https://EVIL.example/#x",
+        "http://user@evil.example.:80/a?b#c",
+    ];
+    for s in spellings {
+        assert_eq!(peer_origin(s), "evil.example", "{s}");
+    }
+    assert_eq!(peer_origin("https://a.evil.example"), "a.evil.example");
+    assert_eq!(peer_origin("https://[::1]:8443/x"), "[::1]");
+    assert_eq!(peer_origin(PEER), "head-chain");
+    let mut adverts: Vec<String> = spellings.iter().map(|s| s.to_string()).collect();
+    adverts.push("https://a.evil.example/?z".into());
+    adverts.push("https://Overlay-US-1.bsvb.tech/".into());
+    assert_eq!(
+        ship_peers_by_origin(adverts),
+        [
+            "https://a.evil.example",
+            "https://evil.example",
+            "https://overlay-us-1.bsvb.tech"
+        ]
+    );
+    // A stranger's dead port of an honest host loses to the host's own advert.
+    assert_eq!(
+        ship_peers_by_origin(["https://h.example:1".to_string(), "http://h.example".into()]),
+        ["https://h.example:1"],
+        "https first"
+    );
+    assert_eq!(
+        ship_peers_by_origin([
+            "https://h.example:1".to_string(),
+            "https://h.example/?q".into()
+        ]),
+        ["https://h.example"],
+        "the default port first"
+    );
+
+    // The engine's writes: under the origin, nothing under the URL.
+    let nodes = chain(4);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[3]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.tick().await;
+    let by_url = node.store.get_peer_sync_health(PEER, TOPIC).await.unwrap();
+    let by_origin = node
+        .store
+        .get_peer_sync_health(&peer_origin(PEER), TOPIC)
+        .await
+        .unwrap();
+    assert_eq!(
+        by_url.secs_since_last_attempt, None,
+        "nothing under the URL"
+    );
+    assert_eq!(
+        by_origin.secs_since_last_attempt,
+        Some(0),
+        "the attempt, under the origin"
+    );
+}
+
+// D2-M2: a record says whether its peer is CONFIGURED (`SyncTarget::Peers`),
+// so the worker's ceiling can reserve half of itself for those peers (the
+// statement's pin is the worker's `e555d2_m2_*`). A record saved before the
+// fold reads as a discovered peer's, with no idle faults.
+#[tokio::test]
+async fn e555d2_m2_a_configured_peers_record_says_so() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[7]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    node.tick().await;
+    let records = node.store.deferred_graphs();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].configured, "SyncTarget::Peers");
+    let mut old = serde_json::to_value(&records[0]).unwrap();
+    let fields = old.as_object_mut().unwrap();
+    fields.remove("configured");
+    fields.remove("idleFaults");
+    let old: DeferredGraph = serde_json::from_value(old).unwrap();
+    assert!(!old.configured);
+    assert_eq!(old.idle_faults, 0);
+}
+
+// D2-M2: a RESUMED walk's quick fault was a free re-deferral (`gasp.rs:1588`
+// exempted only fresh walks): a stranger's record was rewritten for one 503 a
+// tick and held its place for 60 passes. Now a resumed pass that faults
+// having appended nothing is IDLE; the record is kept (an honest transient
+// 5xx) until DEFERRED_GRAPH_MAX_IDLE_FAULTS in a row, then dropped
+// `idle_faults` and the UTXO fails. A pass that appends resets the count.
+#[tokio::test]
+async fn e555d2_m2_a_resumed_walk_that_faults_idle_is_dropped_after_three() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let remote = RecordingRemote::new(&nodes, &[7]);
+    let faults = remote.faults.clone();
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(remote, Box::new(HeadChainManager(state.clone())), 1000);
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    node.tick().await;
+    assert_eq!(record_shape(&node.store.deferred_graphs()[0]).4, "calls");
+    // Node 4 is the next pending input: the peer 503s it.
+    faults.borrow_mut().insert(node_txid(&nodes[4]));
+    for idle in 1..DEFERRED_GRAPH_MAX_IDLE_FAULTS {
+        let (topic, _) = node.tick().await;
+        let records = node.store.deferred_graphs();
+        assert_eq!(records.len(), 1, "idle {idle}: kept");
+        assert_eq!(
+            (records[0].idle_faults, records[0].reason.as_str()),
+            (idle, "fault")
+        );
+        assert!(topic.dropped_graphs.is_empty());
+    }
+    let (topic, _) = node.tick().await;
+    assert!(node.store.deferred_graphs().is_empty(), "dropped");
+    assert_eq!(deferral(&topic).3, vec!["idle_faults".to_string()]);
+    // A pass that appends resets the count: heal, fault one node deeper.
+    faults.borrow_mut().clear();
+    node.tick().await; // fresh: 7, 6, 5
+    node.tick().await; // resumed: 4, 3, 2
+    faults.borrow_mut().insert(node_txid(&nodes[1]));
+    node.tick().await;
+    assert_eq!(node.store.deferred_graphs()[0].idle_faults, 1);
+    faults.borrow_mut().clear();
+    node.tick().await;
+    assert_eq!(held(&node.store, &nodes).await, vec![(7, 0)], "converged");
+}
+
+// D2-L1. A FRESH walk's fault kept no record (the delta fold's D-M1), which
+// threw an honest flaky peer's whole pass away: a deep graph got its first
+// record only on a clean pass, (1-p)^100. Now a fresh walk that faults after
+// HALF its per-graph calls, or once half its time fell due, keeps its record
+// (it paid, as a budget cut does); one that faults sooner keeps none (D-M1
+// unchanged).
+#[tokio::test]
+async fn e555d2_l1_a_fresh_walk_that_paid_half_its_budget_keeps_its_record() {
+    let (_logs, _guard) = capture_logs();
+    let run = |calls: u32, fault_at: usize, sleep: bsv_overlay_engine::engine::SleepFactory| async move {
+        let nodes = chain(8);
+        let remote = RecordingRemote::new(&nodes, &[7]);
+        remote
+            .faults
+            .borrow_mut()
+            .insert(node_txid(&nodes[fault_at]));
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let mut node = Budgeted::new(remote, Box::new(HeadChainManager(state.clone())), 1000);
+        node.engine.set_graph_budget(sleep, calls, 60_000);
+        let (topic, _) = node.tick().await;
+        (
+            node.store
+                .deferred_graphs()
+                .iter()
+                .map(record_shape)
+                .collect::<Vec<_>>(),
+            deferral(&topic),
+        )
+    };
+    // 4 calls: 7 and 6 answered, the third (5) faults: half spent, kept.
+    let (records, _) = run(4, 5, never()).await;
+    assert_eq!(records.len(), 1, "paid by calls");
+    assert_eq!((records[0].0, records[0].4.as_str()), (2, "fault"));
+    // 6 calls: the second (6) faults, one answered: under half, none.
+    let (records, _) = run(6, 6, never()).await;
+    assert!(records.is_empty(), "under half: D-M1");
+    // 100 calls, half the TIME due at once: the second call faults, kept.
+    let half_due: bsv_overlay_engine::engine::SleepFactory = Rc::new(|ms| {
+        if ms == 30_000 {
+            Box::pin(std::future::ready(()))
+        } else {
+            Box::pin(std::future::pending::<()>())
+        }
+    });
+    let (records, _) = run(100, 6, half_due).await;
+    assert_eq!(records.len(), 1, "paid by time");
+    assert_eq!(records[0].0, 1);
+}
+
+// Found by the delta-2 fold (not in the lens): the worker's deadlines are
+// `async fn` futures (`broadcaster::sleep_ms`), and an `async fn` future
+// polled again after it completed PANICS ("`async fn` resumed after
+// completion"; in wasm the isolate traps). The shared resume deadline of the
+// lens fold's M1 is kept after it fell due and polled again by the next
+// record's resume: two records of one (peer, topic) and a spent resume
+// budget crashed the sync, on every tick while both were held. The test
+// factories were all re-pollable `poll_fn`s. Now every per-graph deadline is
+// LATCHED (Ready for good once it fell due).
+#[tokio::test]
+async fn e555d2_x_a_deadline_that_fell_due_is_never_polled_again() {
+    let (_logs, _guard) = capture_logs();
+    let a = salted_chain(12, 1);
+    let b = salted_chain(12, 2);
+    let nodes: Vec<GASPNode> = a.iter().chain(b.iter()).cloned().collect();
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        listing(&nodes, &[(11, 0), (23, 0)]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    node.tick().await;
+    assert_eq!(node.store.deferred_graphs().len(), 2);
+    // Every deadline an `async` block that is due at once, as an `async fn`
+    // sleep whose time has passed.
+    let spent: bsv_overlay_engine::engine::SleepFactory = Rc::new(|_| Box::pin(async {}));
+    node.engine.set_graph_budget(spent, 3, 60_000);
+    let (topic, _) = node.tick().await;
+    assert_eq!(topic.held_back_graphs, 2, "both held back, no panic");
+    assert_eq!(node.store.deferred_graphs().len(), 2);
 }

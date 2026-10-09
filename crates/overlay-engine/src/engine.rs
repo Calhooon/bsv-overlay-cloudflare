@@ -893,8 +893,16 @@ impl Engine {
     /// a FRESH walk's error keeps no record (D-M1). With a budget, a sync the
     /// peer served work that finalized no graph and moved no cursor is
     /// YIELDLESS, and past [`crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED`] in a
-    /// row each is a failed attempt (D-M2; the count is kept by
-    /// [`Storage::record_peer_sync_yield`]).
+    /// row AND [`crate::gasp::PEER_YIELDLESS_SECS_ALLOWED`] since the streak
+    /// began each is a failed attempt (D-M2, the delta-2 fold's D2-M1; the
+    /// streak is kept by [`Storage::record_peer_sync_yield`], keyed on the
+    /// peer's [`crate::gasp::peer_origin`] as its quarantine is). A FRESH
+    /// walk that faults after half its calls or half its time keeps its
+    /// record (D2-L1); a RESUMED one that faults having appended nothing
+    /// [`crate::gasp::DEFERRED_GRAPH_MAX_IDLE_FAULTS`] passes in a row is
+    /// dropped (D2-M2). Each record says whether its peer is configured
+    /// (`SyncTarget::Peers`), for a storage that reserves part of its
+    /// ceiling for those (the worker reserves half).
     ///
     /// Unset (the default) nothing is deferred and the walk is the one
     /// before #555 (parity: the reference has no budget and no deferral).
@@ -4672,6 +4680,9 @@ impl Engine {
         let mut topics_synced: HashMap<String, TopicSyncResult> = HashMap::new();
 
         for (topic, target) in sync_order(&self.config.sync_configuration) {
+            // A CONFIGURED topic's peers are reserved part of a storage's
+            // deferred-graph ceiling (bsv-low #555, the delta-2 fold's D2-M2).
+            let configured_peers = matches!(target, SyncTarget::Peers(_));
             let (peers, sync_type) = match target {
                 SyncTarget::Disabled => {
                     info!("[GASP SYNC] Topic {topic} is disabled — skipping");
@@ -4733,9 +4744,16 @@ impl Engine {
                     // keeps growing) until the re-probe window opens. A
                     // health-read FAULT treats the peer as healthy: broken
                     // bookkeeping must never silence a live peer.
+                    //
+                    // The peer's health (its quarantine, its yieldless
+                    // streak) is keyed on its NORMALIZED ORIGIN (bsv-low
+                    // #555, the delta-2 fold's D2-M2): keyed on the URL, one
+                    // server was a fresh peer for every spelling it
+                    // advertised.
+                    let health_key = crate::gasp::peer_origin(peer_url);
                     let health = self
                         .storage
-                        .get_peer_sync_health(peer_url, topic)
+                        .get_peer_sync_health(&health_key, topic)
                         .await
                         .unwrap_or_default();
                     if crate::gasp::peer_sync_quarantined(&health) {
@@ -4774,6 +4792,7 @@ impl Engine {
                     let mut gasp_storage =
                         OverlayGASPStorage::new(self.storage.as_ref(), topic, sink.clone())
                             .with_peer(peer_url.as_str())
+                            .with_configured_peer(configured_peers)
                             .with_strict_beef(hydration_on)
                             .with_script_verification(self.verify_scripts);
                     if let Some(manager) = self.managers.get(topic) {
@@ -4803,9 +4822,11 @@ impl Engine {
                     // not dropped with the sync.
                     if let Some((sleep, max_calls, budget_ms)) = &self.graph_budget {
                         let (sleep, budget_ms) = (sleep.clone(), *budget_ms);
+                        let half_sleep = sleep.clone();
                         sync = sync.with_graph_budget(crate::gasp::GraphBudget {
                             max_calls: *max_calls,
                             deadline: Box::new(move || sleep(budget_ms)),
+                            half_deadline: Some(Box::new(move || half_sleep(budget_ms / 2))),
                         });
                     }
                     // bsv-low #552: under a budget each graph is submitted as
@@ -5017,18 +5038,21 @@ impl Engine {
                         if yielded || sync.graphs_attempted() > 0 {
                             match self
                                 .storage
-                                .record_peer_sync_yield(peer_url, topic, yielded)
+                                .record_peer_sync_yield(&health_key, topic, yielded)
                                 .await
                             {
                                 Ok(streak)
                                     if !yielded
-                                        && streak > crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED
+                                        && crate::gasp::yieldless_sync_failed(&streak)
                                         && outcome_success =>
                                 {
                                     outcome_success = false;
                                     let msg = format!(
-                                        "{peer_url}: {streak} consecutive syncs finalized no graph and moved no cursor (past {}; bsv-low #555)",
-                                        crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED
+                                        "{peer_url}: {} consecutive syncs over {} s finalized no graph and moved no cursor (past {} and {} s; bsv-low #555)",
+                                        streak.yieldless_syncs,
+                                        streak.secs_since_first.unwrap_or(0),
+                                        crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED,
+                                        crate::gasp::PEER_YIELDLESS_SECS_ALLOWED
                                     );
                                     warn!("[GASP SYNC] {msg}");
                                     errors.push(msg);
@@ -5059,7 +5083,7 @@ impl Engine {
                     // the sync pass itself.
                     if let Err(e) = self
                         .storage
-                        .record_peer_sync_outcome(peer_url, topic, outcome_success)
+                        .record_peer_sync_outcome(&health_key, topic, outcome_success)
                         .await
                     {
                         warn!(
@@ -5236,8 +5260,14 @@ impl Engine {
                 .await
             {
                 if let Some(domain) = parse_ship_domain_from_script(&output.output_script) {
+                    // Every spelling of our own origin is ourselves (the
+                    // delta-2 fold's D2-M2: `https://us/?x` passed the
+                    // string compare).
                     if let Some(ref our_url) = self.config.hosting_url {
-                        if domain.trim_end_matches('/') == our_url.trim_end_matches('/') {
+                        if domain.trim_end_matches('/') == our_url.trim_end_matches('/')
+                            || crate::gasp::peer_origin(&domain)
+                                == crate::gasp::peer_origin(our_url)
+                        {
                             continue;
                         }
                     }
@@ -5246,9 +5276,9 @@ impl Engine {
             }
         }
 
-        let mut peers: Vec<String> = domains.into_iter().collect();
-        peers.sort();
-        peers
+        // One peer per normalized origin (bsv-low #555, the delta-2 fold's
+        // D2-M2): eight spellings of one server are one peer.
+        crate::gasp::ship_peers_by_origin(domains)
     }
 
     // ========================================================================
@@ -7682,12 +7712,12 @@ mod tests {
 
         // Health bookkeeping: timeout = failure, completion = success.
         let hang_health = store
-            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .get_peer_sync_health("hang.example.com", "tm_test")
             .await
             .unwrap();
         assert_eq!(hang_health.consecutive_failures, 1);
         let good_health = store
-            .get_peer_sync_health("https://good.example.com", "tm_test")
+            .get_peer_sync_health("good.example.com", "tm_test")
             .await
             .unwrap();
         assert_eq!(good_health.consecutive_failures, 0);
@@ -7731,7 +7761,7 @@ mod tests {
             );
         }
         let health = store
-            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .get_peer_sync_health("hang.example.com", "tm_test")
             .await
             .unwrap();
         assert_eq!(
@@ -7760,7 +7790,7 @@ mod tests {
         );
         // The probe failed again → failure count kept growing → re-armed.
         let health = store
-            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .get_peer_sync_health("hang.example.com", "tm_test")
             .await
             .unwrap();
         assert_eq!(
@@ -7782,7 +7812,7 @@ mod tests {
         let result = engine.start_gasp_sync().await.unwrap();
         assert!(result.topics_synced["tm_test"].errors.is_empty());
         let health = store
-            .get_peer_sync_health("https://hang.example.com", "tm_test")
+            .get_peer_sync_health("hang.example.com", "tm_test")
             .await
             .unwrap();
         assert_eq!(health.consecutive_failures, 0, "success fully re-admits");
@@ -9108,6 +9138,33 @@ mod tests {
         ) -> Result<(), StorageError> {
             self.inner
                 .delete_deferred_graph(host, topic, outpoint)
+                .await
+        }
+        async fn record_peer_sync_outcome(
+            &self,
+            host: &str,
+            topic: &str,
+            success: bool,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .record_peer_sync_outcome(host, topic, success)
+                .await
+        }
+        async fn get_peer_sync_health(
+            &self,
+            host: &str,
+            topic: &str,
+        ) -> Result<crate::storage::PeerSyncHealth, StorageError> {
+            self.inner.get_peer_sync_health(host, topic).await
+        }
+        async fn record_peer_sync_yield(
+            &self,
+            host: &str,
+            topic: &str,
+            yielded: bool,
+        ) -> Result<crate::storage::PeerYieldStreak, StorageError> {
+            self.inner
+                .record_peer_sync_yield(host, topic, yielded)
                 .await
         }
         async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {

@@ -254,6 +254,15 @@ pub trait Storage {
     // GASP peer health (bsv-low#302 — dead-peer quarantine)
     // ========================================================================
 
+    // The three peer-health methods are REQUIRED (bsv-low #555, the
+    // delta-2 fold's D2-L2): with defaults a wrapper that did not forward
+    // one compiled and silently turned the quarantine or the yieldless bound
+    // off. A backend that keeps no peer health answers as the old defaults
+    // did (`Ok(())`, `PeerSyncHealth::default()`, `PeerYieldStreak::default()`):
+    // fail-safe, every peer keeps being attempted. `host` is the peer's
+    // NORMALIZED ORIGIN (`crate::gasp::peer_origin`), not its URL: the engine
+    // passes it (the delta-2 fold's D2-M2).
+
     /// Record the outcome of ONE GASP sync attempt with `host` for `topic`
     /// (bsv-low#302). `success = true` resets the consecutive-failure count
     /// to 0 (full re-admission); `false` increments it. The backend stamps
@@ -261,52 +270,42 @@ pub trait Storage {
     /// time. Quarantine-SKIPPED peers are NOT recorded (a skip is not an
     /// attempt; the last-attempt age must keep growing so the re-probe
     /// window opens).
-    ///
-    /// Default: no-op — a backend without durable peer health never
-    /// quarantines anything (fail-safe: every peer keeps being attempted).
     async fn record_peer_sync_outcome(
         &self,
         host: &str,
         topic: &str,
         success: bool,
-    ) -> Result<(), StorageError> {
-        let _ = (host, topic, success);
-        Ok(())
-    }
+    ) -> Result<(), StorageError>;
 
     /// Current sync health of the (host, topic) pairing (bsv-low#302). The
     /// backend answers with its consecutive-failure count and the AGE of
     /// the last attempt (relative seconds, so the engine needs no clock of
-    /// its own). Default: pristine — never attempted, never quarantined.
+    /// its own). Pristine: never attempted, never quarantined.
     async fn get_peer_sync_health(
         &self,
         host: &str,
         topic: &str,
-    ) -> Result<PeerSyncHealth, StorageError> {
-        let _ = (host, topic);
-        Ok(PeerSyncHealth::default())
-    }
+    ) -> Result<PeerSyncHealth, StorageError>;
 
     /// Record whether ONE GASP sync with `host` for `topic` YIELDED (it
-    /// finalized a graph or moved the cursor) or not, and answer the count
-    /// of consecutive yieldless syncs it now holds (bsv-low #555, the delta
-    /// fold's D-M2; `crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED`). `true`
-    /// resets the count to 0 and answers 0; `false` adds one. The engine
-    /// calls it only with a per-graph budget, only for a sync the peer served
-    /// work, and before [`Self::record_peer_sync_outcome`].
+    /// finalized a graph or moved the cursor) or not, and answer the
+    /// yieldless STREAK it now holds (bsv-low #555, the delta fold's D-M2 and
+    /// the delta-2 fold's D2-M1; `crate::gasp::yieldless_sync_failed`):
+    /// - `true` ends the streak: count 0, no start; answers that.
+    /// - `false` adds one to the streak and answers its count and the
+    ///   seconds since its FIRST yieldless sync, on the backend's own clock
+    ///   (0 on the sync that starts it). A streak whose LAST yieldless sync
+    ///   is more than `crate::gasp::PEER_YIELDLESS_DECAY_SECS` old starts
+    ///   again (count 1, age 0): the decay.
     ///
-    /// Default: no-op answering 0, as the #302 pair: a backend without it
-    /// never counts a yieldless sync as failed (fail-safe, but a hostile
-    /// peer that serves one node a tick then keeps its slice).
+    /// The engine calls it only with a per-graph budget, only for a sync
+    /// the peer served work, and before [`Self::record_peer_sync_outcome`].
     async fn record_peer_sync_yield(
         &self,
         host: &str,
         topic: &str,
         yielded: bool,
-    ) -> Result<u64, StorageError> {
-        let _ = (host, topic, yielded);
-        Ok(0)
-    }
+    ) -> Result<PeerYieldStreak, StorageError>;
 
     // ========================================================================
     // Deferred GASP graphs (bsv-low #555)
@@ -369,6 +368,17 @@ pub trait Storage {
         topic: &str,
         outpoint: &str,
     ) -> Result<(), StorageError>;
+}
+
+/// A (host, topic)'s yieldless streak (bsv-low #555, the delta-2 fold's
+/// D2-M1) — the input to [`crate::gasp::yieldless_sync_failed`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerYieldStreak {
+    /// Consecutive yieldless syncs (0 after a yield).
+    pub yieldless_syncs: u64,
+    /// Seconds since the streak's first yieldless sync. `None` = no streak,
+    /// or a backend with no clock: never past the time bound.
+    pub secs_since_first: Option<u64>,
 }
 
 /// Durable per-(host, topic) GASP sync health (bsv-low#302) — the input to
@@ -542,7 +552,7 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
         host: &str,
         topic: &str,
         yielded: bool,
-    ) -> Result<u64, StorageError> {
+    ) -> Result<PeerYieldStreak, StorageError> {
         (**self).record_peer_sync_yield(host, topic, yielded).await
     }
     async fn put_deferred_graph(
@@ -667,11 +677,17 @@ pub mod memory {
         /// How many saves of a deferred graph were ASKED (written, refused
         /// or faulted).
         deferred_graph_put_attempts: Mutex<u64>,
-        /// Consecutive yieldless GASP syncs keyed by (host, topic): models
-        /// the D1 `gasp_peer_health.yieldless_syncs` column (bsv-low #555,
-        /// the delta fold's D-M2).
-        peer_yieldless: Mutex<HashMap<(String, String), u64>>,
+        /// The yieldless streak keyed by (host, topic): `(count,
+        /// first_at, last_at)` on the logical clock. Models the D1
+        /// `gasp_peer_health` columns `yieldless_syncs`, `first_yieldless_at`
+        /// and `last_yieldless_at` (bsv-low #555, the delta fold's D-M2 and
+        /// the delta-2 fold's D2-M1).
+        peer_yieldless: Mutex<HashMap<(String, String), YieldStreakRow>>,
     }
+
+    /// `(count, first_at, last_at)` of a yieldless streak, on the logical
+    /// clock.
+    type YieldStreakRow = (u64, u64, u64);
 
     impl MemoryStorage {
         pub fn new() -> Self {
@@ -764,14 +780,15 @@ pub mod memory {
         }
 
         /// The consecutive yieldless syncs held for (host, topic)
-        /// (bsv-low #555's delta fold, D-M2).
+        /// (bsv-low #555's delta fold, D-M2). `host` may be a peer URL: it
+        /// is read under its [`crate::gasp::peer_origin`], the key the
+        /// engine writes (the delta-2 fold's D2-M2).
         pub fn peer_yieldless_syncs(&self, host: &str, topic: &str) -> u64 {
-            *self
-                .peer_yieldless
+            self.peer_yieldless
                 .lock()
                 .unwrap()
-                .get(&(host.to_string(), topic.to_string()))
-                .unwrap_or(&0)
+                .get(&(crate::gasp::peer_origin(host), topic.to_string()))
+                .map_or(0, |(count, _, _)| *count)
         }
 
         /// Count total outputs (for testing assertions).
@@ -1181,13 +1198,26 @@ pub mod memory {
             host: &str,
             topic: &str,
             yielded: bool,
-        ) -> Result<u64, StorageError> {
+        ) -> Result<PeerYieldStreak, StorageError> {
+            let now = *self.clock_secs.lock().unwrap();
             let mut held = self.peer_yieldless.lock().unwrap();
-            let count = held
-                .entry((host.to_string(), topic.to_string()))
-                .or_insert(0);
-            *count = if yielded { 0 } else { *count + 1 };
-            Ok(*count)
+            let key = (host.to_string(), topic.to_string());
+            if yielded {
+                held.remove(&key);
+                return Ok(PeerYieldStreak::default());
+            }
+            let streak = held.entry(key).or_insert((0, now, now));
+            if streak.0 == 0
+                || now.saturating_sub(streak.2) > crate::gasp::PEER_YIELDLESS_DECAY_SECS
+            {
+                *streak = (0, now, now);
+            }
+            streak.0 += 1;
+            streak.2 = now;
+            Ok(PeerYieldStreak {
+                yieldless_syncs: streak.0,
+                secs_since_first: Some(now.saturating_sub(streak.1)),
+            })
         }
 
         async fn put_deferred_graph(

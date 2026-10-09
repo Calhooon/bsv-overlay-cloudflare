@@ -51,6 +51,26 @@ where
     .await
 }
 
+/// `deadline`, LATCHED: once it fell due it answers `Ready` on every poll and
+/// its inner future is never polled again (bsv-low #555, found by the
+/// delta-2 fold). The worker's sleeps are `async fn` futures, which PANIC
+/// when polled after they completed, and a per-graph deadline is polled
+/// again after it fell due (the shared resume deadline, kept for the next
+/// record; the half deadline of D2-L1).
+pub fn latched(deadline: crate::engine::SleepFuture) -> crate::engine::SleepFuture {
+    let mut inner = Some(deadline);
+    Box::pin(std::future::poll_fn(move |cx| {
+        let Some(deadline) = inner.as_mut() else {
+            return std::task::Poll::Ready(());
+        };
+        if deadline.as_mut().poll(cx).is_ready() {
+            inner = None;
+            return std::task::Poll::Ready(());
+        }
+        std::task::Poll::Pending
+    }))
+}
+
 /// What makes a deadline COOPERATIVE around a write (bsv-low #552, the lens
 /// fold's HIGH-1). `Engine::submit` is several storage writes (mark spent,
 /// delete the stale coin, insert the outputs, notify, record applied), each
@@ -179,16 +199,130 @@ pub const PEER_QUARANTINE_REPROBE_SECS: u64 = 6 * 3600;
 /// per [`PEER_QUARANTINE_REPROBE_SECS`] after that. A sync that finalized a
 /// graph or moved the cursor resets the count; a quiet one leaves it.
 ///
-/// Why 12 (3 h at `*/15`): an honest deep graph converges well inside it. The
+/// The bound is in SYNCS AND in TIME (the delta-2 fold's D2-M1): a yieldless
+/// sync is a failure only when the streak holds more than this many syncs
+/// AND began at least [`PEER_YIELDLESS_SECS_ALLOWED`] ago
+/// ([`yieldless_sync_failed`]). Counted in syncs alone, 12 was three hours at
+/// `*/15` and twelve minutes at LOW's one tick a minute, under the tail of a
+/// block interval: an honest peer whose only new work was #582's unproven
+/// head was quarantined while it waited for its block.
+///
+/// Why 12 and 3 h: an honest deep graph converges well inside both. The
 /// measured one (#582) is an UNPROVEN head over unproven ancestry: its root
 /// is re-asked at each resume and the pass after its block lands restarts the
 /// walk from a proven root and completes it (`root_proven`), one or two passes
-/// at the ~10 min block interval, and 12 passes leave three hours of slow
-/// blocks. Walked to its end instead, 12 passes are about 150 nodes on the
-/// Cloudflare worker (15 s a pass at 1.2 s a request) and 600 on LOW's node
-/// (60 s). Applied only with a per-graph budget (`Engine::set_graph_budget`):
-/// without one no walk is deferred and the quarantine is the one of #302.
+/// after a block that comes in ~10 min on average (past 3 h about once in
+/// 10^8 blocks by the exponential model, at any cadence). Walked to its end
+/// instead, 12 passes are about 150 nodes on the Cloudflare worker (15 s a
+/// pass at 1.2 s a request) and 600 on LOW's node (60 s). Applied only with a
+/// per-graph budget (`Engine::set_graph_budget`): without one no walk is
+/// deferred and the quarantine is the one of #302.
 pub const PEER_YIELDLESS_SYNCS_ALLOWED: u64 = 12;
+
+/// The AGE a yieldless streak must reach, seconds since its first yieldless
+/// sync, before a yieldless sync is a failure (3 h; the delta-2 fold's
+/// D2-M1, see [`PEER_YIELDLESS_SYNCS_ALLOWED`]). The storage keeps the
+/// streak's start ([`crate::storage::PeerYieldStreak`]) on its own clock.
+pub const PEER_YIELDLESS_SECS_ALLOWED: u64 = 3 * 3600;
+
+/// The DECAY of a yieldless streak (the delta-2 fold's D2-M1): a yieldless
+/// sync more than this long (6 h, [`PEER_QUARANTINE_REPROBE_SECS`]) after the
+/// streak's LAST yieldless sync starts a new streak (count 1, its start now)
+/// instead of adding to the old one. Quiet syncs in between leave the streak
+/// as it is (a quiet sync is not a yield), so an honest peer whose rare
+/// graphs that never land are hours apart is not counted across days. The
+/// cost, stated: a peer yieldless for 3 h, quiet for 6 h, and so on, keeps
+/// its slice during the yieldless hours (a third of its ticks at most), as
+/// #302's own accepted residual of one success in every eight.
+pub const PEER_YIELDLESS_DECAY_SECS: u64 = PEER_QUARANTINE_REPROBE_SECS;
+
+/// PURE rule of the yieldless bound (bsv-low #555, the delta-2 fold's
+/// D2-M1): a yieldless sync is a FAILED attempt IFF its streak holds more
+/// than [`PEER_YIELDLESS_SYNCS_ALLOWED`] syncs AND is at least
+/// [`PEER_YIELDLESS_SECS_ALLOWED`] old. A streak of unknown age (a backend
+/// with no clock) is never past (fail-safe, as #302's unknown attempt age).
+pub fn yieldless_sync_failed(streak: &crate::storage::PeerYieldStreak) -> bool {
+    streak.yieldless_syncs > PEER_YIELDLESS_SYNCS_ALLOWED
+        && streak
+            .secs_since_first
+            .is_some_and(|secs| secs >= PEER_YIELDLESS_SECS_ALLOWED)
+}
+
+/// The NORMALIZED ORIGIN of a peer URL (bsv-low #555, the delta-2 fold's
+/// D2-M2): its host, lowercased, with no scheme, user, port, path, query or
+/// fragment, and no trailing dot. The key of a peer's quarantine and
+/// yieldless streak (the engine passes it to the three peer-health methods
+/// of [`crate::storage::Storage`]) and of its share of a storage's deferred
+/// graph ceiling (the worker's `origin` column): keyed on the URL string, one
+/// server was eight "hosts" for eight adverts (`?1`, `:8443`, a trailing
+/// slash, `#x`), each with its own share and a fresh streak. A subdomain is
+/// another host still (no public suffix list here): stated. The cursor and
+/// the deferred records stay keyed by the URL the peer is synced at.
+pub fn peer_origin(url: &str) -> String {
+    peer_authority(url).1
+}
+
+/// `(scheme, host, port)` of a peer URL: the scheme lowercased (`https`
+/// when absent), the host as [`peer_origin`] gives it, the port as written
+/// (`None` when absent or empty).
+fn peer_authority(url: &str) -> (String, String, Option<String>) {
+    let url = url.trim();
+    let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let (host, port) = match host_port.strip_prefix('[') {
+        // `[::1]:8443`: the bracketed address, brackets kept.
+        Some(v6) => match v6.split_once(']') {
+            Some((addr, after)) => (format!("[{addr}]"), after.strip_prefix(':')),
+            None => (host_port.to_string(), None),
+        },
+        None => match host_port.split_once(':') {
+            Some((host, port)) => (host.to_string(), Some(port)),
+            None => (host_port.to_string(), None),
+        },
+    };
+    (
+        scheme.to_ascii_lowercase(),
+        host.trim_end_matches('.').to_ascii_lowercase(),
+        port.filter(|p| !p.is_empty()).map(str::to_string),
+    )
+}
+
+/// The peers of a SHIP-discovered topic, ONE per [`peer_origin`] (bsv-low
+/// #555, the delta-2 fold's D2-M2): each advertised domain is canonicalized
+/// to `scheme://host[:port]` (the host lowercased; path, query, fragment and
+/// user dropped), and of the spellings of one origin the first by `https`,
+/// then no explicit port, then the string is kept. So eight adverts of one
+/// server (`/?1`, `/?2`, `/#x`, `:8443`, ...) are one peer synced once a
+/// tick, and a stranger's spelling of an honest host (a query, a dead port)
+/// cannot stand beside that host's own advert under its quarantine key.
+/// Stated: two overlays of one host on two ports, on one SHIP topic, are one
+/// peer (the default port's). Sorted, for a stable order.
+pub fn ship_peers_by_origin<I: IntoIterator<Item = String>>(domains: I) -> Vec<String> {
+    type Rank = (bool, bool, String);
+    let mut by_origin: std::collections::BTreeMap<String, (Rank, String)> =
+        std::collections::BTreeMap::new();
+    for domain in domains {
+        let (scheme, origin, port) = peer_authority(&domain);
+        if origin.is_empty() {
+            continue;
+        }
+        let canonical = match &port {
+            Some(port) => format!("{scheme}://{origin}:{port}"),
+            None => format!("{scheme}://{origin}"),
+        };
+        let candidate = (scheme != "https", port.is_some(), canonical.clone());
+        match by_origin.get(&origin) {
+            Some((kept, _)) if *kept <= candidate => {}
+            _ => {
+                by_origin.insert(origin, (candidate, canonical));
+            }
+        }
+    }
+    let mut peers: Vec<String> = by_origin.into_values().map(|(_, url)| url).collect();
+    peers.sort();
+    peers
+}
 
 /// PURE quarantine rule (bsv-low#302): a peer is skipped IFF it has hit
 /// [`PEER_QUARANTINE_THRESHOLD`] consecutive failures AND its last attempt
@@ -259,6 +393,15 @@ pub const DEFERRED_GRAPH_MAX_BYTES: usize = 1 << 20;
 /// too (the worker's global ceiling, the lens fold's M3).
 pub const DEFERRED_GRAPHS_PER_PEER_TOPIC: usize = 16;
 
+/// A RESUMED walk that faults having appended no node keeps its record (an
+/// honest peer's transient 5xx), but not for free (bsv-low #555, the
+/// delta-2 fold's D2-M2): at this many such passes in a row the record is
+/// dropped (reason `idle_faults`) and the UTXO fails, as a fresh walk's
+/// fault does. Before the fold a stranger's record was rewritten for one
+/// quick 503 a tick and held its place for its 60 passes (and the sync is
+/// yieldless, so it counts against the yieldless bound too).
+pub const DEFERRED_GRAPH_MAX_IDLE_FAULTS: u32 = 3;
+
 /// The per-graph budget of a [`GASPSync`] (bsv-low #555,
 /// `Engine::set_graph_budget`). Setting one turns deferral ON for that sync.
 pub struct GraphBudget<'a> {
@@ -266,6 +409,10 @@ pub struct GraphBudget<'a> {
     pub max_calls: u32,
     /// A fresh deadline for ONE graph's pass ([`DEFAULT_GRAPH_BUDGET_MS`]).
     pub deadline: Box<dyn Fn() -> crate::engine::SleepFuture + 'a>,
+    /// A fresh deadline for HALF of it (the delta-2 fold's D2-L1): a FRESH
+    /// walk that faults once this fell due, or after half its calls, has
+    /// paid for a record and keeps one. `None`: the calls alone decide.
+    pub half_deadline: Option<Box<dyn Fn() -> crate::engine::SleepFuture + 'a>>,
 }
 
 /// The key of one held record (bsv-low #555): what a sync loads up front.
@@ -343,6 +490,19 @@ pub struct DeferredGraph {
     /// Why it was last deferred: `calls`, `time`, `fault`,
     /// `anchor_unavailable`, `not_landed` or `peer_deadline`.
     pub reason: String,
+    /// Whether the peer is a CONFIGURED one (`SyncTarget::Peers`), not one
+    /// `ls_ship` discovered (bsv-low #555, the delta-2 fold's D2-M2): a
+    /// storage reserves part of its ceiling for these (the worker: records
+    /// of discovered peers hold at most half of it). Set by the storage
+    /// adapter on every save; `false` in a record saved before the fold.
+    #[serde(default)]
+    pub configured: bool,
+    /// Consecutive RESUMED passes that faulted having appended no node
+    /// (the delta-2 fold's D2-M2): the record is dropped (`idle_faults`)
+    /// when it reaches [`DEFERRED_GRAPH_MAX_IDLE_FAULTS`]; a pass that
+    /// appends a node resets it.
+    #[serde(default)]
+    pub idle_faults: u32,
 }
 
 impl DeferredGraph {
@@ -382,11 +542,14 @@ pub enum DropReason {
     /// saved before the lens fold's H1, which saves none such); the UTXO
     /// fails.
     NoProgress,
+    /// [`DEFERRED_GRAPH_MAX_IDLE_FAULTS`] resumed passes in a row faulted
+    /// having appended no node (the delta-2 fold's D2-M2); the UTXO fails.
+    IdleFaults,
 }
 
 impl DropReason {
     /// Every reason, for a caller that serves a counter per reason.
-    pub const ALL: [DropReason; 10] = [
+    pub const ALL: [DropReason; 11] = [
         Self::MaxPasses,
         Self::TooBig,
         Self::TooMany,
@@ -397,6 +560,7 @@ impl DropReason {
         Self::RootProven,
         Self::Refused,
         Self::NoProgress,
+        Self::IdleFaults,
     ];
 
     /// The reason's name, as logged and counted.
@@ -412,6 +576,7 @@ impl DropReason {
             Self::RootProven => "root_proven",
             Self::Refused => "refused",
             Self::NoProgress => "no_progress",
+            Self::IdleFaults => "idle_faults",
         }
     }
 }
@@ -473,6 +638,10 @@ struct Walk {
     /// deadline that then cut it counted the drop twice and asked the
     /// storage a second time).
     gone_on: bool,
+    /// A FRESH walk's half-budget deadline, started with the walk (the
+    /// delta-2 fold's D2-L1); `None` for a resumed walk or with no
+    /// [`GraphBudget::half_deadline`].
+    half: Option<crate::engine::SleepFuture>,
 }
 
 /// How a graph's walk ended in this pass.
@@ -1347,7 +1516,7 @@ impl<'a> GASPSync<'a> {
         };
 
         if !self.deferred.borrow_mut().remove(outpoint) {
-            let mut deadline = (budget.deadline)();
+            let mut deadline = latched((budget.deadline)());
             return self
                 .ingest_budgeted(utxo, outpoint, &mut deadline, budget.max_calls, false)
                 .await;
@@ -1356,7 +1525,7 @@ impl<'a> GASPSync<'a> {
             .resume_deadline
             .borrow_mut()
             .take()
-            .unwrap_or_else(|| (budget.deadline)());
+            .unwrap_or_else(|| latched((budget.deadline)()));
         let cap = self.resume_calls_left.get();
         if cap == 0 || Self::due(&mut deadline).await {
             *self.resume_deadline.borrow_mut() = Some(deadline);
@@ -1403,6 +1572,8 @@ impl<'a> GASPSync<'a> {
                 calls: 0,
                 passes: 0,
                 reason: String::new(),
+                configured: false,
+                idle_faults: 0,
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
@@ -1411,6 +1582,7 @@ impl<'a> GASPSync<'a> {
             nodes_at_start: 0,
             counted: false,
             gone_on: false,
+            half: None,
         }
     }
 
@@ -1439,7 +1611,21 @@ impl<'a> GASPSync<'a> {
             None
         };
         let walk = match record {
-            None => Self::fresh_walk(score, outpoint, cap),
+            None => {
+                let mut walk = Self::fresh_walk(score, outpoint, cap);
+                // D2-L1: the half-budget clock starts with the walk (polled
+                // once now, so a timer that starts on its first poll runs).
+                if let Some(half) = self
+                    .graph_budget
+                    .as_ref()
+                    .and_then(|b| b.half_deadline.as_ref())
+                {
+                    let mut half = latched(half());
+                    let _ = Self::due(&mut half).await;
+                    walk.half = Some(half);
+                }
+                walk
+            }
             Some(record) if record.passes >= DEFERRED_GRAPH_MAX_PASSES => {
                 let passes = record.passes;
                 self.drop_record(outpoint, DropReason::MaxPasses).await;
@@ -1471,6 +1657,7 @@ impl<'a> GASPSync<'a> {
                     call_cap: cap,
                     counted: false,
                     gone_on: false,
+                    half: None,
                 }
             }
         };
@@ -1585,7 +1772,13 @@ impl<'a> GASPSync<'a> {
                 // one-node record per UTXO, 16 per (peer, topic) in one tick
                 // with no time spent, and filled the worker's ceiling. A
                 // RESUMED walk keeps its record (its progress was paid for).
-                Err(e) if !resumed => {
+                //
+                // Unless it PAID (the delta-2 fold's D2-L1): a fresh walk
+                // that faults after half its per-graph calls or half its
+                // time keeps its record as a budget cut would, so an honest
+                // flaky peer's deep graph is not walked from its root on
+                // every tick ((1-p)^100 a clean pass at a fault rate p).
+                Err(e) if !resumed && !self.walk_paid().await => {
                     warn!(
                         "{} Walk of {} faulted: no record, the UTXO fails as before #555: {}",
                         self.log_prefix, outpoint, e
@@ -1595,6 +1788,28 @@ impl<'a> GASPSync<'a> {
                     return Err(e);
                 }
                 Err(e) => {
+                    // D2-M2: a RESUMED pass that faulted having appended
+                    // nothing is idle; at DEFERRED_GRAPH_MAX_IDLE_FAULTS in a
+                    // row the record goes and the UTXO fails.
+                    let idle = {
+                        let mut guard = self.walk.borrow_mut();
+                        guard.as_mut().map_or(0, |w| {
+                            if w.resumed && w.record.nodes.len() <= w.nodes_at_start {
+                                w.record.idle_faults += 1;
+                            }
+                            w.record.idle_faults
+                        })
+                    };
+                    if idle >= DEFERRED_GRAPH_MAX_IDLE_FAULTS {
+                        warn!(
+                            "{} Walk of {} faulted with nothing appended {} passes in a row: dropped: {}",
+                            self.log_prefix, outpoint, idle, e
+                        );
+                        let _ = self.storage.discard_graph(&graph_id).await;
+                        self.walk.borrow_mut().take();
+                        self.drop_record(outpoint, DropReason::IdleFaults).await;
+                        return Err(e);
+                    }
                     warn!(
                         "{} Walk of {} faulted, deferred with its progress: {}",
                         self.log_prefix, outpoint, e
@@ -1722,6 +1937,9 @@ impl<'a> GASPSync<'a> {
         }
         walk.record.passes += 1;
         walk.record.reason = reason.to_string();
+        if walk.record.nodes.len() > walk.nodes_at_start {
+            walk.record.idle_faults = 0;
+        }
         // H1: a walk that holds no node is never kept (nothing would be lost
         // by not keeping it, and an empty record took one of the 16 places
         // for up to 60 passes, L2): its UTXO fails as before #555.
@@ -1757,13 +1975,14 @@ impl<'a> GASPSync<'a> {
                 Saved::Yes
             }
             Ok(DeferredGraphSave::AtCeiling) => Saved::Unkept(DropReason::TooMany, Box::new(walk)),
+            // The save is lost and counted `store_fault`. A RESUMED walk's
+            // held record is KEPT (the delta-2 lens's D2-N2: it was deleted,
+            // and one transient D1 fault threw away every earlier pass of a
+            // walk the per-peer budget did not then finish): the next pass
+            // resumes from it, losing this pass only; a walk that goes on
+            // and lands deletes it as a converged one.
             Err(e) => {
-                if walk.resumed {
-                    self.drop_record(&outpoint, DropReason::StoreFault).await;
-                    walk.resumed = false;
-                } else {
-                    self.note_dropped(&outpoint, DropReason::StoreFault);
-                }
+                self.note_dropped(&outpoint, DropReason::StoreFault);
                 Saved::Fault(e, Box::new(walk))
             }
         }
@@ -1785,6 +2004,36 @@ impl<'a> GASPSync<'a> {
         } else {
             self.note_dropped(&outpoint, why);
         }
+    }
+
+    /// Whether the walk in hand has PAID for a record (the delta-2 fold's
+    /// D2-L1): half its per-graph calls made in this pass, or its half
+    /// deadline fallen due. A walk that holds no node never has.
+    async fn walk_paid(&self) -> bool {
+        let Some(budget) = &self.graph_budget else {
+            return false;
+        };
+        let mut half = {
+            let mut guard = self.walk.borrow_mut();
+            let Some(walk) = guard.as_mut() else {
+                return false;
+            };
+            if walk.record.nodes.is_empty() {
+                return false;
+            }
+            if u64::from(walk.calls_this_pass) * 2 >= u64::from(budget.max_calls) {
+                return true;
+            }
+            match walk.half.take() {
+                Some(half) => half,
+                None => return false,
+            }
+        };
+        let paid = Self::due(&mut half).await;
+        if let Some(walk) = self.walk.borrow_mut().as_mut() {
+            walk.half = Some(half);
+        }
+        paid
     }
 
     /// Delete a held record and count it dropped.
@@ -1965,6 +2214,8 @@ impl<'a> GASPSync<'a> {
                 calls: 0,
                 passes: 0,
                 reason: String::new(),
+                configured: false,
+                idle_faults: 0,
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
@@ -1973,6 +2224,7 @@ impl<'a> GASPSync<'a> {
             nodes_at_start: 0,
             counted: false,
             gone_on: false,
+            half: None,
         });
         let node = self.hydrate_root(node.clone()).await;
         let out = self.absorb(&root, node).await?;
