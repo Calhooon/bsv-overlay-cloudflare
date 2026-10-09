@@ -1399,13 +1399,16 @@ source is always finalized before its spender.
 beside its calls and its time (`GraphBudget::max_bytes_fetched`,
 `max_nodes`; `Engine::set_graph_budget_limbs`, the defaults in force with
 `set_graph_budget`): the BYTES a graph's walk is served
-(`DEFAULT_GRAPH_BUDGET_BYTES`, 4 MiB: the hex of each node's raw transaction
-and proof, as the peer sends it and as a record keeps it, every answer
-counted, a repeat too) and the NODES it appends
-(`DEFAULT_GRAPH_BUDGET_NODES`, 64). The worker names them
-`GASP_GRAPH_BUDGET_BYTES` and `GASP_GRAPH_BUDGET_NODES` (`gasp_deferred.rs`,
-the engine's defaults) and serves them as `budget.bytesFetched` and
-`budget.nodes`. A limb reached DEFERS the graph exactly as the call budget
+(`DEFAULT_GRAPH_BUDGET_BYTES`, seven eighths of the record cap, 917,504 while
+the cap is 1 MiB: the hex of each node's raw transaction and proof, as the
+peer sends it and as a record keeps it, every answer counted, a repeat too)
+and the NODES it appends (`DEFAULT_GRAPH_BUDGET_NODES`, 64). The worker's
+defaults are the engine's (`gasp_deferred.rs`, the consts
+`GASP_GRAPH_BUDGET_BYTES` and `GASP_GRAPH_BUDGET_NODES`), and an operator sets
+others with the VARS of the same names (`graph_budget_limbs`: a decimal
+integer, clamped, bytes to 1 ..= the record cap, nodes to 1 ..= the 100
+calls; unset, empty or not a number is the default; no rebuild). The limbs in
+force are served as `budget.bytesFetched` and `budget.nodes`. A limb reached DEFERS the graph exactly as the call budget
 does (reasons `bytes`, `nodes`): the record saved, the UTXO held below the
 cursor, the walk resumed by the next pass from what is pending. Never a drop,
 a refusal or a discarded graph: a budget PER PASS, not a limit on a graph or
@@ -1415,13 +1418,40 @@ one a pass. The resumes of one sync share the limbs as they share the calls
 (M1); a walk the limbs cut that cannot be KEPT goes on under the per-peer
 budget alone (L4). The reference has no budget.
 
-Limits, stated. (1) The record's cap is still 1 MiB (`DEFERRED_GRAPH_MAX_BYTES`,
-bsv-low #585), under the bytes limb's 4 MiB: a pass the bytes limb cuts whose
-APPENDED nodes weigh more than 1 MiB cannot be kept (`too_big`) and goes on
-(L4), as before, so at the defaults the bytes limb defers only a pass most of
-whose bytes were repeats, and 64 nodes of 26 KB (3.3 MiB of hex) are not kept
-either. Until #585 lifts the cap, a caller that wants every such graph
-deferred sets the limbs under it. (2) The walk asks an outpoint again for
+**The bytes limb sits under the record cap (the lens fold, E586-L1).** The
+default was 4 MiB, above the 1 MiB cap of a record
+(`DEFERRED_GRAPH_MAX_BYTES`, bsv-low #585): a pass of 26 KB heads was cut only
+once its record no longer fitted (about 19 nodes), which is `too_big`, the
+limbs off and the walk gone on under the per-peer budget alone, so the limb
+bounded nothing at the size it was built for; and the worker's two limbs were
+compile-time. Now the default is DERIVED from the cap, seven eighths of it,
+in the engine (for a consumer that sets neither limb) and in the worker, and
+the pass the limb cuts leaves a record that fits: **18 heads of 26 KB a fresh
+pass** (17 on a resume of an unproven root, whose re-ask is served first). The
+overhead of a record over what it was served, measured (`e586f_l1_*`): the
+chain of 26 KB heads 942,750 bytes for 938,772 served (1.0042x; 105,826 under
+the cap); the witness's diamond chain 630,272 for 940,248 served (0.67x: a
+repeat is served and not kept; 1.0054x the hex it holds); 64 small proven
+nodes 29,501 for 15,804 of hex (1.87x: the JSON around a node, 214 to 281
+bytes, does not shrink with it, and the NODES limb is what bounds it). The
+margin, an eighth of the cap (131,072 bytes): 17,984 for the JSON of 64
+nodes, and 113,088 for the node that CROSSES the limb (the limb is read
+before a step, so a pass ends at most one node past it) and the inputs still
+pending.
+
+Limits, stated. (1) The cap itself stands (#585 removes it; this fold only
+makes the limb defer BEFORE it), and a record is the walk of EVERY pass while
+the limb is per pass. So a graph whose unwalked ancestry outweighs the cap is
+cut again at a later pass with a record past it: `too_big`, counted once, and
+the walk goes on (L4), as before. At 26 KB a head: up to 35 links converge in
+two passes with every record under the cap; the 36th makes the second pass
+`too_big` (pinned, `e586f_l1_limit`). A crossing node of more than the 113,088
+left (a transaction past about 56 KB), or one with hundreds of inputs still
+pending, can do it at the first pass. A graph that fitted the old limbs in
+one pass (up to 64 nodes and 4 MiB served) now takes a pass per 917,504
+bytes served, a tick each, 15 min at `*/15` (the witness's fan-in, 2,221,528
+served, would take three; reasoned, not run under a budget). An operator who raises the var toward the cap spends the margin.
+(2) The walk asks an outpoint again for
 every parent that reaches it and drops the answer as seen AFTER the request
 (85 requests for the fan-in's 37 nodes), as the reference does; the calls and
 the bytes are charged for them. (3) A FRESH walk that faults has PAID for a
@@ -1431,6 +1461,33 @@ step the deadline drops has its bytes charged and its node asked again.
 (5) The witness is native; wasm32 was not measured here (Zanaadu's figure was
 13.4 MiB for the 24.1 MB). (6) A record's nodes are a second copy of the
 pending graph's while a walk is in hand (before and after).
+
+**The assembly is a re-implementation, pinned (the lens, E586-L2).**
+`GraphAssembly::beef_of` does not call `Transaction::to_beef`: that needs the
+hydrated `source_transaction` tree the assembly exists to avoid. It
+re-implements bsv-rs 0.3.35's ancestor collection (`collect_ancestors`: the
+depth-first walk, inputs last to first, the proofs deduplicated by height and
+root and combined) over the graph's keys, then hands the SDK's own `Beef` the
+result. The byte parity with `to_beef` is therefore a PIN, not a delegation:
+`--lib e586` (the recursion kept verbatim, 3,097 BEEFs and 385 refusals) and
+the frozen digests (`e586_a`, `i551_c`, `i551_e`). A bsv-rs bump that changes
+the collection order, the dedup or `clone_for_beef` moves `to_beef` and not
+`beef_of`: both pins are re-proven at EVERY bsv-rs bump, and a red one there
+is the SDK having moved, to be followed here. No correctness rests on it (a
+node is emitted after its sources, and `from_beef` parses any valid order).
+The finalize's OUTPUT is not bounded by the limbs: one BEEF per node, each
+with its whole unproven ancestry, is O(N^2) bytes over an unproven chain of N
+(the lens measured a 64-node single-input chain of 26 KB: 54,242,624 bytes of
+BEEFs, a finalize peak of 59,325,046). That is the reference's shape and the
+submit's. What the limbs bound is what one PASS adds to the pending graph and
+its record; a graph completes with every node of every pass in hand.
+
+The `root_proven` restart (the lens's NOTE): the walk that restarts from a
+root served proven is fresh, its PASS is not, and what the pass spent of all
+three counted limbs is carried to it (calls and bytes were; the nodes are
+now, 0 today since the re-ask appends nothing). Pin `e586f_n`: RED against
+the bytes carry dropped and against a wrong nodes carry; it cannot be RED on
+`589bc2d`, where the value carried is 0.
 
 Pins: `cargo test -p bsv-overlay-engine --test gasp_fanin_memory --
 --nocapture` (`e586_a`, RED on `fbb7fa8`: 49.10x); `--lib e586` (the
@@ -1443,7 +1500,15 @@ two resumes share one limb, `e586_e` a record holds raw nodes, no BEEF, and
 weighs 1.0059x what was fetched; `Engine::set_graph_budget_limbs` does not
 exist on `fbb7fa8`; RED against the limbs made inert and against the resumes
 not sharing them). The frozen digests of pin D, the `i551_*` and the `e555*`
-families hold unchanged.
+families hold unchanged. The lens fold: `--test gasp_topic_manager e586f`
+(`e586f_l1_a_graph_of_26kb_heads_*`: 35 links under the defaults nobody set,
+18 served, reason `bytes`, the record under the cap, converged by the second
+pass with no drop; RED on `589bc2d`, where all 35 are walked in one pass with
+no deferral; `e586f_l1_the_margin_*` the measured overheads; `e586f_l1_limit`;
+`e586f_n`) and the worker's
+`gasp_deferred::tests::e586f_l1_the_limbs_default_under_the_record_cap_and_are_vars`
+(the derivation, the vars' parse and clamp, the wiring of the engine and the
+health block; `graph_budget_limbs` does not exist on `589bc2d`).
 
 ## Storage ownership (bsv-low #474)
 
