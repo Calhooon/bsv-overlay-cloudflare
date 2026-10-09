@@ -2,7 +2,7 @@
 /**
  * bsv-low #585, door 3 (lane E585-d3): a queued replay whose message would pass the queue's inline room rides BY
  * KEY, its BEEF in R2 (`BEEF_BLOBS`), at the route, on a real (local) queue, D1 and R2. Part of `make ci-route`
- * (through `make ci-d1-budget`, the LAST cell, after the dead-letter and deferred-graph cells, on the same overlay worker, which is started with
+ * (through `make ci-d1-budget`, after the dead-letter and deferred-graph cells, on the same overlay worker, which is started with
  * `MUTATION_QUEUE_INLINE_ROOM:4096` so an 8 KB body takes the R2 path under the consumer's policy as it stands).
  *
  *  0. `/health/invariants.deadLetters.r2`: the bucket bound, the room in force, the consumer's policy.
@@ -22,11 +22,14 @@
  *     predecessor readmitted, its bytes presented again at the door, durable), its object deleted, re-driven: the
  *     consumer finds the object MISSING and the subject applied, ACKS it as a twin: no letter,
  *     `queue_r2_twin_acked_total` moved.
- *  7. The SWEEP under `wrangler dev --test-scheduled` (`/__scheduled`): a young object is untouched, the
- *     `beef_blob_sweep` row advanced (`last_pass_at`), `/health/invariants.queue.r2.atRest` served.
- *     The tick runs WHOLE and goes on in the background past the leg (its GASP step syncs the worker's hard-coded
- *     peers over the network and defers real graphs), so this cell is the LAST of `ci-d1-budget` (the d3 fold-3).
- *     Its object is put with NO custom metadata on purpose (E585-D3-DELTA-M1).
+ *  7. The SWEEP through the operator's lever `POST /internal/beef-blob-sweep` (the d3 fold-4, E585-D3-DELTA2-L1):
+ *     401 without the bearer, 400 on a body that is not empty or `{}`, then ONE pass, the scheduled tick's own
+ *     function, from a cursor seeded just before a young object: the answer names the pass (`listed`, `deleted`,
+ *     `faults`, `cursorBefore` the seeded key, `cursorAfter` '' as the round completed, `lastPassAt`), the young
+ *     object is untouched, the `beef_blob_sweep` row and `/health/invariants.queue.r2` agree with the answer. No
+ *     scheduled tick is fired: the overlay no longer runs `--test-scheduled`, so no CI cell reaches the worker's
+ *     live peers, WhatsOnChain or a broadcaster, and nothing writes in the background after the leg. Its object is
+ *     put with NO custom metadata on purpose (E585-D3-DELTA-M1).
  *  8. A put TWICE (N2 (b)): the same "not now" bytes presented twice write one key twice, and its
  *     `customMetadata.touched` stamp MOVED (read from the local bucket's own store); whether `uploaded` moved too is
  *     printed as a NOTE (the sweep no longer depends on it).
@@ -361,31 +364,53 @@ if (E.row) {
   )
 }
 
-// 7. The sweep, through the scheduled event (`wrangler dev --test-scheduled`).
+// 7. The sweep, through the operator's lever (the d3 fold-4, E585-D3-DELTA2-L1): one pass of the tick's own function.
 {
   // The object is put WITHOUT custom metadata ON PURPOSE (the d3 fold-3, E585-D3-DELTA-M1): an unstamped object (an
   // operator's CLI put, one written before the stamp) is the one whose metadata read could throw through wasm and
   // wedge the scheduled tick before its GASP step. Locally miniflare answers `{}` for it, so this leg shows the pass
   // runs over it and ages it by `uploaded`; the platform's own answer is the beta check of the fold-3 REPORT.
   const young = `mutations/${'e5'.repeat(32)}/${'0'.repeat(32)}`
+  const seeded = `mutations/${'e4'.repeat(32)}/${'f'.repeat(32)}`
   r2put(young, Buffer.from('a young object nothing names, with no customMetadata'))
-  const before = d1('SELECT last_pass_at FROM beef_blob_sweep WHERE id = 1')[0]?.last_pass_at ?? 0
+  const sweep = '/internal/beef-blob-sweep'
+  const anon = await fetch(OVERLAY + sweep, { method: 'POST', headers: { Connection: 'close' } })
+  await anon.text()
+  const bad = await lever({ limit: 5 }, sweep)
+  expect(
+    anon.status === 401 && bad.status === 400,
+    'the sweep lever refuses a call with no bearer (401) and a body that is not empty or {} (400)',
+    `${anon.status} / ${bad.status} ${bad.text}`,
+  )
+  // the cursor at rest, seeded just before the young object: this pass lists it and ends the round
+  d1(`INSERT INTO beef_blob_sweep (id, start_after) VALUES (1, '${seeded}') ON CONFLICT(id) DO UPDATE SET start_after = excluded.start_after`)
+  // no pass has run yet (the tier fires no tick): the column is NULL, which the CLI renders as the string "null"
+  const before = Number(d1('SELECT last_pass_at FROM beef_blob_sweep WHERE id = 1')[0]?.last_pass_at) || 0
   const t0 = Date.now()
-  fetch(OVERLAY + '/__scheduled?cron=' + encodeURIComponent('*/15 * * * *'), { headers: { Connection: 'close' }, signal: AbortSignal.timeout(WAIT_MS) }).catch(() => {})
-  const row = await until(() => {
-    const r = d1('SELECT last_pass_at, last_listed, last_swept, full_objects FROM beef_blob_sweep WHERE id = 1')[0]
-    return r && Number(r.last_pass_at) > Number(before) && Number(r.last_pass_at) >= t0 - 60_000 ? r : null
-  })
+  const r = await lever({}, sweep)
+  const j = r.json ?? {}
+  expect(
+    r.status === 200 && j.ok === true && j.stopped === null &&
+      j.listed >= 1 && j.deleted === 0 && j.faults === 0 && j.unreadable === 0 &&
+      j.cursorBefore === seeded && j.cursorAfter === '' && j.roundComplete === true &&
+      typeof j.lastPassAt === 'number' && j.lastPassAt > before && j.lastPassAt >= t0 - 60_000 &&
+      j.budget?.maxObjectsPerPass === 200 && j.budget?.maxDeletesPerPass === 50,
+    'the lever ran ONE pass from the cursor at rest: listed, nothing deleted, the cursor moved from the seeded key to the end of the round, lastPassAt',
+    `${r.status} ${r.text}`,
+  )
+  const row = d1('SELECT start_after, last_pass_at, last_listed, last_swept FROM beef_blob_sweep WHERE id = 1')[0]
+  expect(
+    !!row && row.start_after === '' && Number(row.last_pass_at) === j.lastPassAt && Number(row.last_listed) === j.handled &&
+      Number(row.last_swept) === 0 && r2get(young) !== null,
+    'the pass saved the same cursor row the tick saves, and the young object is untouched',
+    `${JSON.stringify(row)}; young ${r2get(young) ? 'kept' : 'GONE'}`,
+  )
   const h7 = await health()
   const at = h7.queue?.r2
   expect(
-    !!row && Number(row.last_listed) >= 1 && Number(row.last_swept) === 0 && r2get(young) !== null,
-    `the scheduled tick ran one sweep pass: the beef_blob_sweep row advanced, the young object untouched (within ${WAIT_MS / 1000} s)`,
-    `${JSON.stringify(row)}; young ${r2get(young) ? 'kept' : 'GONE'}`,
-  )
-  expect(
-    at?.bound === true && at?.readable === true && typeof at?.atRest?.objects === 'number' && at.atRest.objects >= 1 && typeof at?.sweep?.lastPassAt === 'number',
-    '/health/invariants.queue.r2 serves the objects at rest (atRest) and the pass',
+    at?.bound === true && at?.readable === true && typeof at?.atRest?.objects === 'number' && at.atRest.objects >= 1 &&
+      at?.sweep?.lastPassAt === j.lastPassAt && at?.sweep?.lastUnreadable === 0 && at?.sweep?.lever === 'POST /internal/beef-blob-sweep',
+    "/health/invariants.queue.r2 serves the objects at rest (atRest) and the lever's pass",
     JSON.stringify(at),
   )
   r2del(young)

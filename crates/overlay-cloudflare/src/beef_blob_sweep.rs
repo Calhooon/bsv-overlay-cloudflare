@@ -43,6 +43,28 @@
 //! `queue_r2_orphan_sweep_faults_total`), each sweep logged `[beef-blobs] SWEPT`. `/health/invariants.queue.r2`
 //! serves the objects AT REST from the listing itself: the count and bytes of the last complete round over the
 //! bucket, and the round in progress.
+//!
+//! ## The operator's lever (the d3 fold-4, E585-D3-DELTA2-L1)
+//!
+//! `POST /internal/beef-blob-sweep` (bearer `INTERNAL_TOKEN`, compared in fixed time, as the #576 levers; the body
+//! empty or `{}`, anything else a 400) runs ONE pass through [`run_pass`], the very function the scheduled tick
+//! calls: the same bounds, the same `SWEEP_BUDGET_MS` race, the same cursor row and the same counters. It answers
+//! the pass ([`pass_json`]): what it listed, deleted and could not read, its faults, the cursor before and after,
+//! `lastPassAt`; 200 for a pass that ran, 503 for one that stopped before its plan (nothing swept, no cursor
+//! moved: `stopped` says why). For an operator after a bulk discard or an R2 audit, and for the route tier, which
+//! no longer fires the whole production tick (its peers, WhatsOnChain, the broadcasters) to test one pass.
+//!
+//! ## An object the sweep cannot read (the d3 fold-4, the delta-2 lens's N3)
+//!
+//! A listed object whose key or `uploaded` date does not read is SKIPPED and COUNTED, never swept: the pass goes
+//! on over the rest of its page, the cursor passes it (by its key, when the key reads), the next round meets it
+//! again, `queue_r2_orphan_sweep_unreadable_total` counts it and `/health/invariants.queue.r2.sweep` names the
+//! last pass's count and its first key (`lastUnreadable`, `lastUnreadableKey`). Before the fold one such object
+//! failed the whole page closed on every pass: the sweep stalled at it for good, with nothing counted. A `head`
+//! that faults before a delete was already a counted fault that leaves the object and goes on. The operator
+//! deletes an unreadable object by hand (`wrangler r2 object delete`) if it is the door's. Limit, stated: a page
+//! of [`SWEEP_MAX_OBJECTS`] entries NONE of whose keys read leaves the cursor where it was (no key to pass), so
+//! that round stalls there, counted on every pass.
 
 use crate::d1::Query;
 use serde::Deserialize;
@@ -70,11 +92,17 @@ pub const ORPHAN_WINDOW_S: u64 = 2 * QUEUE_RETENTION_S;
 
 /// The sweep's state at rest: one row. Transient (a lost row restarts the round at the first key).
 pub const SWEEP_STATE_CREATE: &str = "CREATE TABLE IF NOT EXISTS beef_blob_sweep (id INTEGER PRIMARY KEY CHECK (id = 1), start_after TEXT NOT NULL DEFAULT '', round_objects INTEGER NOT NULL DEFAULT 0, round_bytes INTEGER NOT NULL DEFAULT 0, round_started_at INTEGER, full_objects INTEGER, full_bytes INTEGER, full_at INTEGER, last_pass_at INTEGER, last_listed INTEGER NOT NULL DEFAULT 0, last_swept INTEGER NOT NULL DEFAULT 0)";
-pub const SWEEP_STATE_SQL: &str = "SELECT start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at, last_pass_at, last_listed, last_swept FROM beef_blob_sweep WHERE id = 1";
+/// The d3 fold-4 (the delta-2 lens's N3): the last pass's unreadable entries, counted and named. Additive ALTERs; the
+/// runner ignores the re-run "duplicate column".
+pub const SWEEP_STATE_UNREADABLE_COLUMN: &str =
+    "ALTER TABLE beef_blob_sweep ADD COLUMN last_unreadable INTEGER NOT NULL DEFAULT 0";
+pub const SWEEP_STATE_UNREADABLE_KEY_COLUMN: &str =
+    "ALTER TABLE beef_blob_sweep ADD COLUMN last_unreadable_key TEXT";
+pub const SWEEP_STATE_SQL: &str = "SELECT start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at, last_pass_at, last_listed, last_swept, last_unreadable, last_unreadable_key FROM beef_blob_sweep WHERE id = 1";
 /// Binds: start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at,
-/// last_pass_at, last_listed, last_swept.
-pub const SWEEP_STATE_SAVE_SQL: &str = "INSERT INTO beef_blob_sweep (id, start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at, last_pass_at, last_listed, last_swept) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-     ON CONFLICT(id) DO UPDATE SET start_after = excluded.start_after, round_objects = excluded.round_objects, round_bytes = excluded.round_bytes, round_started_at = excluded.round_started_at, full_objects = excluded.full_objects, full_bytes = excluded.full_bytes, full_at = excluded.full_at, last_pass_at = excluded.last_pass_at, last_listed = excluded.last_listed, last_swept = excluded.last_swept";
+/// last_pass_at, last_listed, last_swept, last_unreadable, last_unreadable_key.
+pub const SWEEP_STATE_SAVE_SQL: &str = "INSERT INTO beef_blob_sweep (id, start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at, last_pass_at, last_listed, last_swept, last_unreadable, last_unreadable_key) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+     ON CONFLICT(id) DO UPDATE SET start_after = excluded.start_after, round_objects = excluded.round_objects, round_bytes = excluded.round_bytes, round_started_at = excluded.round_started_at, full_objects = excluded.full_objects, full_bytes = excluded.full_bytes, full_at = excluded.full_at, last_pass_at = excluded.last_pass_at, last_listed = excluded.last_listed, last_swept = excluded.last_swept, last_unreadable = excluded.last_unreadable, last_unreadable_key = excluded.last_unreadable_key";
 /// Every object a dead letter row names, whatever its status (at most the ceiling's 2000 rows hold one). Read
 /// only by a pass that listed an object past the window.
 pub const NAMED_KEYS_SQL: &str =
@@ -117,6 +145,9 @@ pub struct SweepState {
     pub last_pass_at: Option<i64>,
     pub last_listed: u64,
     pub last_swept: u64,
+    /// The entries the last pass could not read (skipped, never swept), and the first of their keys that read.
+    pub last_unreadable: u64,
+    pub last_unreadable_key: Option<String>,
 }
 
 /// PURE: is the object past the window?
@@ -216,6 +247,73 @@ pub fn next_state(
     next
 }
 
+/// One entry of a listing (the d3 fold-4, N3): an object, or one whose key or `uploaded` date does not read (its
+/// key when that reads).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entry {
+    Object(Listed),
+    Unreadable(Option<String>),
+}
+
+/// A listed page, split: the objects a pass plans over, the entries it skips, and the last key on the page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Page {
+    pub listed: Vec<Listed>,
+    /// Each unreadable entry's key, `None` where the key itself does not read.
+    pub unreadable: Vec<Option<String>>,
+    /// The last key the page names, an unreadable entry's included (R2 lists in key order).
+    pub last_key: Option<String>,
+}
+
+/// PURE (the d3 fold-4, N3): the page a pass plans over. An unreadable entry is skipped and counted, never fails the
+/// page, and its key (when it reads) still moves the cursor past it.
+#[must_use]
+pub fn split_page(entries: Vec<Entry>) -> Page {
+    let mut page = Page::default();
+    for e in entries {
+        match e {
+            Entry::Object(o) => {
+                page.last_key = Some(o.key.clone());
+                page.listed.push(o);
+            }
+            Entry::Unreadable(k) => {
+                if let Some(k) = &k {
+                    page.last_key = Some(k.clone());
+                }
+                page.unreadable.push(k);
+            }
+        }
+    }
+    page
+}
+
+/// PURE: the state after a pass over a split page ([`next_state`] over the handled objects, then the unreadable
+/// entries). When the plan handled its whole page, the cursor is the page's LAST KEY, so an unreadable entry at the
+/// end of a truncated page is passed too; a pass the delete budget stopped keeps [`next_state`]'s cursor (the
+/// last handled object) and meets the rest of the page, unreadable entries included, on the next pass.
+#[must_use]
+pub fn after_pass(
+    state: &SweepState,
+    page: &Page,
+    plan: &PassPlan,
+    swept: &HashSet<String>,
+    truncated: bool,
+    now_ms: i64,
+) -> SweepState {
+    let whole = plan.handled == page.listed.len();
+    let more = truncated || !whole;
+    let mut next = next_state(state, &page.listed[..plan.handled], swept, more, now_ms);
+    if more && whole {
+        if let Some(k) = &page.last_key {
+            next.start_after = k.clone();
+            next.round_started_at = next.round_started_at.or(Some(now_ms));
+        }
+    }
+    next.last_unreadable = page.unreadable.len() as u64;
+    next.last_unreadable_key = page.unreadable.iter().flatten().next().cloned();
+    next
+}
+
 #[derive(Deserialize)]
 struct StateRow {
     start_after: String,
@@ -228,6 +326,8 @@ struct StateRow {
     last_pass_at: Option<f64>,
     last_listed: f64,
     last_swept: f64,
+    last_unreadable: Option<f64>,
+    last_unreadable_key: Option<String>,
 }
 
 impl From<StateRow> for SweepState {
@@ -244,6 +344,8 @@ impl From<StateRow> for SweepState {
             last_pass_at: r.last_pass_at.map(|v| v as i64),
             last_listed: n(r.last_listed),
             last_swept: n(r.last_swept),
+            last_unreadable: r.last_unreadable.map_or(0, n),
+            last_unreadable_key: r.last_unreadable_key,
         }
     }
 }
@@ -263,6 +365,12 @@ pub fn save_query(s: &SweepState) -> Query {
         .bind(opt(s.last_pass_at))
         .bind(s.last_listed)
         .bind(s.last_swept)
+        .bind(s.last_unreadable)
+        .bind(
+            s.last_unreadable_key
+                .as_deref()
+                .map_or(crate::d1::QVal::Null, crate::d1::QVal::from),
+        )
 }
 
 async fn read_state(db: &D1Database) -> Result<SweepState, String> {
@@ -298,7 +406,8 @@ fn touched_field(o: &JsValue) -> Option<String> {
 }
 
 /// One raw R2 object (`R2Object`, from `list` or `head`), every field read through `Reflect`. `None` when its key
-/// or its `uploaded` date cannot be read (the platform's contract broken; the caller fails closed). Never throws.
+/// or its `uploaded` date cannot be read (the platform's contract broken: the listing skips and counts it, a
+/// `head` is a counted fault). Never throws.
 fn listed_of_js(o: &JsValue) -> Option<Listed> {
     let get = |k: &str| js_sys::Reflect::get(o, &JsValue::from_str(k)).ok();
     let key = get("key")?.as_string()?;
@@ -336,12 +445,12 @@ async fn bucket_call(
 }
 
 /// The page a pass lists: at most [`SWEEP_MAX_OBJECTS`] under [`SWEEP_PREFIX`] after `start_after`, with the
-/// custom metadata, and whether the bucket holds more. An object whose key or date does not read is a listing
-/// fault (nothing swept, no cursor moved, logged).
+/// custom metadata, and whether the bucket holds more. An object whose key or date does not read is an
+/// [`Entry::Unreadable`] (the d3 fold-4, N3: skipped and counted by the pass, never a fault of the page).
 async fn list_page(
     bucket: &worker::Bucket,
     start_after: &str,
-) -> Result<(Vec<Listed>, bool), String> {
+) -> Result<(Vec<Entry>, bool), String> {
     let set = |o: &js_sys::Object, k: &str, v: &JsValue| {
         js_sys::Reflect::set(o, &JsValue::from_str(k), v)
             .map(|_| ())
@@ -364,9 +473,15 @@ async fn list_page(
         .ok_or("the listing holds no objects array")?;
     let listed = objects
         .iter()
-        .map(|o| listed_of_js(&o))
-        .collect::<Option<Vec<_>>>()
-        .ok_or("a listed object's key or upload date does not read")?;
+        .map(|o| match listed_of_js(&o) {
+            Some(l) => Entry::Object(l),
+            None => Entry::Unreadable(
+                js_sys::Reflect::get(&o, &JsValue::from_str("key"))
+                    .ok()
+                    .and_then(|k| k.as_string()),
+            ),
+        })
+        .collect();
     let truncated = js_sys::Reflect::get(&page, &JsValue::from_str("truncated"))
         .ok()
         .and_then(|v| v.as_bool())
@@ -385,10 +500,44 @@ async fn head_of(bucket: &worker::Bucket, key: &str) -> Result<Option<Listed>, S
         .ok_or_else(|| format!("the head of {key} does not read"))
 }
 
-/// ONE PASS of the sweep (the module doc), from the scheduled tick. Fail-closed: a state, listing or named-keys
-/// read that faults deletes nothing and moves no cursor; a delete that faults leaves its object for the next
-/// round.
-pub async fn sweep_pass(env: &Env, db: &D1Database) {
+/// What one pass did: the lever's answer ([`pass_json`]) and the tick's log line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PassOutcome {
+    /// Why the pass ended before its plan (nothing swept, no cursor moved); `None` for a pass that ran.
+    pub stopped: Option<String>,
+    /// The entries the listing returned, the objects the pass handled, the entries it could not read and the first
+    /// of their keys.
+    pub listed: u64,
+    pub handled: u64,
+    pub unreadable: u64,
+    pub unreadable_key: Option<String>,
+    pub swept: u64,
+    pub swept_bytes: u64,
+    /// `head`s and deletes that faulted (each object stays for the next round).
+    pub faults: u64,
+    /// The cursor at rest before the pass (`None`: the state did not read) and after it (`None`: not saved).
+    pub cursor_before: Option<String>,
+    pub cursor_after: Option<String>,
+    /// The pass's stamp, as saved (`None`: not saved).
+    pub last_pass_at: Option<i64>,
+    /// This pass ended a round over the whole bucket (`atRest` was renewed).
+    pub round_complete: bool,
+}
+
+impl PassOutcome {
+    fn stopped(why: String, cursor_before: Option<String>) -> Self {
+        Self {
+            stopped: Some(why),
+            cursor_before,
+            ..Self::default()
+        }
+    }
+}
+
+/// ONE PASS of the sweep (the module doc). Fail-closed: a state, listing or named-keys read that faults deletes
+/// nothing and moves no cursor; a delete that faults leaves its object for the next round; an entry that does not
+/// read is skipped and counted. Called only through [`run_pass`].
+pub async fn sweep_pass(env: &Env, db: &D1Database) -> PassOutcome {
     let bucket = match env.bucket(crate::queue::BEEF_BLOBS_BINDING) {
         Ok(b) => b,
         Err(e) => {
@@ -396,7 +545,10 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) {
                 "[beef-blobs] the orphan sweep found no {} binding ({e}); nothing listed",
                 crate::queue::BEEF_BLOBS_BINDING
             );
-            return;
+            return PassOutcome::stopped(
+                format!("no {} binding", crate::queue::BEEF_BLOBS_BINDING),
+                None,
+            );
         }
     };
     let state = match read_state(db).await {
@@ -405,20 +557,30 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) {
             worker::console_log!(
                 "[beef-blobs] the orphan sweep's state could not be read ({e}); nothing listed"
             );
-            return;
+            return PassOutcome::stopped(format!("the state did not read: {e}"), None);
         }
     };
-    let (listed, truncated) = match list_page(&bucket, &state.start_after).await {
+    let before = Some(state.start_after.clone());
+    let (entries, truncated) = match list_page(&bucket, &state.start_after).await {
         Ok(p) => p,
         Err(e) => {
             worker::console_log!(
                 "[beef-blobs] the orphan sweep's listing faulted ({e}); nothing swept"
             );
-            return;
+            return PassOutcome::stopped(format!("the listing faulted: {e}"), before);
         }
     };
+    let listed_count = entries.len() as u64;
+    let page = split_page(entries);
+    for k in &page.unreadable {
+        worker::console_log!(
+            "[beef-blobs] the orphan sweep could not read the listed object {}; skipped (counted, never swept)",
+            k.as_deref().unwrap_or("<no key>")
+        );
+    }
+    let listed = &page.listed;
     let now = worker::Date::now().as_millis() as i64;
-    let named: HashSet<String> = if any_past_window(&listed, now, ORPHAN_WINDOW_S) {
+    let named: HashSet<String> = if any_past_window(listed, now, ORPHAN_WINDOW_S) {
         #[derive(Deserialize)]
         struct Named {
             r2_key: String,
@@ -427,13 +589,16 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) {
             Ok(rows) => rows.into_iter().map(|r| r.r2_key).collect(),
             Err(e) => {
                 worker::console_log!("[beef-blobs] the orphan sweep could not read the dead letters' keys ({e}); nothing swept");
-                return;
+                return PassOutcome::stopped(
+                    format!("the dead letters' keys did not read: {e}"),
+                    before,
+                );
             }
         }
     } else {
         HashSet::new()
     };
-    let plan = plan_pass(&listed, &named, now, ORPHAN_WINDOW_S, SWEEP_MAX_DELETES);
+    let plan = plan_pass(listed, &named, now, ORPHAN_WINDOW_S, SWEEP_MAX_DELETES);
     let mut swept: HashSet<String> = HashSet::new();
     let (mut swept_bytes, mut faults) = (0u64, 0u64);
     for o in plan.orphans.iter().map(|i| &listed[*i]) {
@@ -471,11 +636,14 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) {
             }
         }
     }
-    let more = truncated || plan.handled < listed.len();
-    let next = next_state(&state, &listed[..plan.handled], &swept, more, now);
-    if let Err(e) = save_query(&next).execute(db).await {
-        worker::console_log!("[beef-blobs] the orphan sweep's state could not be saved ({e}); the next pass lists this page again");
-    }
+    let next = after_pass(&state, &page, &plan, &swept, truncated, now);
+    let saved = match save_query(&next).execute(db).await {
+        Ok(_) => true,
+        Err(e) => {
+            worker::console_log!("[beef-blobs] the orphan sweep's state could not be saved ({e}); the next pass lists this page again");
+            false
+        }
+    };
     crate::ops::bump_counter(
         db,
         crate::ops::COUNTER_QUEUE_R2_ORPHANS_SWEPT,
@@ -489,6 +657,108 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) {
     )
     .await;
     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_R2_ORPHAN_SWEEP_FAULTS, faults).await;
+    crate::ops::bump_counter(
+        db,
+        crate::ops::COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE,
+        next.last_unreadable,
+    )
+    .await;
+    PassOutcome {
+        stopped: None,
+        listed: listed_count,
+        handled: plan.handled as u64,
+        unreadable: next.last_unreadable,
+        unreadable_key: next.last_unreadable_key.clone(),
+        swept: swept.len() as u64,
+        swept_bytes,
+        faults,
+        cursor_before: before,
+        round_complete: saved && next.full_at == Some(now),
+        cursor_after: saved.then(|| next.start_after.clone()),
+        last_pass_at: saved.then_some(now),
+    }
+}
+
+/// ONE bounded pass, as the scheduled tick and the operator's lever both run it (the d3 fold-4, DELTA2-L1): the
+/// pass under its [`SWEEP_BUDGET_MS`] race (a dropped pass saved no cursor and is made again), and one log line.
+pub async fn run_pass(env: &Env, db: &D1Database, by: &str) -> PassOutcome {
+    let out = overlay_engine::gasp::race_or_deadline(
+        sweep_pass(env, db),
+        crate::broadcaster::sleep_ms(SWEEP_BUDGET_MS),
+    )
+    .await
+    .unwrap_or_else(|| {
+        PassOutcome::stopped(
+            format!("the pass EXCEEDED its {SWEEP_BUDGET_MS} ms budget: dropped, no cursor saved"),
+            None,
+        )
+    });
+    worker::console_log!("[beef-blobs] sweep pass ({by}): {}", pass_json(&out));
+    out
+}
+
+/// PURE: the lever's body for one pass.
+#[must_use]
+pub fn pass_json(o: &PassOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "ok": o.stopped.is_none(),
+        "stopped": o.stopped,
+        "listed": o.listed,
+        "handled": o.handled,
+        "unreadable": o.unreadable,
+        "unreadableKey": o.unreadable_key,
+        "deleted": o.swept,
+        "deletedBytes": o.swept_bytes,
+        "faults": o.faults,
+        "cursorBefore": o.cursor_before,
+        "cursorAfter": o.cursor_after,
+        "lastPassAt": o.last_pass_at,
+        "roundComplete": o.round_complete,
+        "budget": {
+            "maxObjectsPerPass": SWEEP_MAX_OBJECTS,
+            "maxDeletesPerPass": SWEEP_MAX_DELETES,
+            "windowSecs": ORPHAN_WINDOW_S,
+            "budgetMs": SWEEP_BUDGET_MS,
+        },
+    })
+}
+
+/// PURE: the lever's body must be empty (whitespace) or a JSON object with no fields (`{}`); a pass takes no
+/// argument.
+#[must_use]
+pub fn parse_sweep_request(raw: &[u8]) -> bool {
+    raw.iter().all(u8::is_ascii_whitespace)
+        || serde_json::from_slice::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| v.as_object().map(serde_json::Map::is_empty))
+            .unwrap_or(false)
+}
+
+/// `POST /internal/beef-blob-sweep` (bearer `INTERNAL_TOKEN`, as the #576 levers; the d3 fold-4, DELTA2-L1): ONE
+/// pass through [`run_pass`], the scheduled tick's own function. 200 with [`pass_json`] for a pass that ran, 503
+/// with it for one that stopped before its plan.
+pub async fn internal_sweep(
+    mut req: worker::Request,
+    env: &Env,
+) -> worker::Result<worker::Response> {
+    let authorization = req.headers().get("authorization").ok().flatten();
+    let secret = env.secret("INTERNAL_TOKEN").ok().map(|s| s.to_string());
+    if !crate::tip_pass::bearer_ok(authorization.as_deref(), secret.as_deref()) {
+        worker::console_log!("POST /internal/beef-blob-sweep -> 401");
+        return worker::Response::error("unauthorized", 401);
+    }
+    let raw = req.bytes().await?;
+    if !parse_sweep_request(&raw) {
+        return worker::Response::error("body must be empty or {}: a pass takes no argument", 400);
+    }
+    let db = env.d1("OVERLAY_DB")?;
+    crate::d1::ensure_overlay_migrations(&db)
+        .await
+        .map_err(worker::Error::from)?;
+    let out = run_pass(env, &db, "lever").await;
+    let status = if out.stopped.is_none() { 200 } else { 503 };
+    worker::console_log!("POST /internal/beef-blob-sweep -> {status}");
+    Ok(worker::Response::from_json(&pass_json(&out))?.with_status(status))
 }
 
 /// PURE: `/health/invariants.queue`: the R2 objects at rest as the sweep's listing counted them. `atRest` is the
@@ -504,6 +774,9 @@ pub fn queue_json(state: Option<&SweepState>, bound: bool) -> serde_json::Value 
         "lastPassAt": state.and_then(|s| s.last_pass_at),
         "lastListed": state.map(|s| s.last_listed),
         "lastSwept": state.map(|s| s.last_swept),
+        "lastUnreadable": state.map(|s| s.last_unreadable),
+        "lastUnreadableKey": state.and_then(|s| s.last_unreadable_key.clone()),
+        "lever": "POST /internal/beef-blob-sweep",
     });
     serde_json::json!({ "r2": {
         "bound": bound,
@@ -587,6 +860,8 @@ mod tests {
                 last_pass_at: r.get(7)?,
                 last_listed: r.get::<_, i64>(8)? as u64,
                 last_swept: r.get::<_, i64>(9)? as u64,
+                last_unreadable: r.get::<_, i64>(10)? as u64,
+                last_unreadable_key: r.get(11)?,
             })
         })
         .or_else(|e| match e {
@@ -600,6 +875,9 @@ mod tests {
     #[derive(Default)]
     struct Bucket {
         objects: BTreeMap<String, (u64, i64)>,
+        /// Keys whose listing entry does not read (the d3 fold-4, N3); `KEYLESS` marks one whose key does not read
+        /// either.
+        broken: HashSet<String>,
         lists: usize,
         heads: usize,
         deletes: usize,
@@ -609,20 +887,29 @@ mod tests {
         fn put(&mut self, key: &str, bytes: u64, at_ms: i64) {
             self.objects.insert(key.to_string(), (bytes, at_ms));
         }
-        fn list(&mut self, start_after: &str, limit: usize) -> (Vec<Listed>, bool) {
+        fn list(&mut self, start_after: &str, limit: usize) -> (Vec<Entry>, bool) {
             self.lists += 1;
+            let broken = &self.broken;
             let mut it = self
                 .objects
                 .iter()
                 .filter(|(k, _)| k.starts_with(SWEEP_PREFIX) && k.as_str() > start_after);
-            let page: Vec<Listed> = it
+            let page: Vec<Entry> = it
                 .by_ref()
                 .take(limit)
-                .map(|(k, (b, u))| Listed {
-                    key: k.clone(),
-                    bytes: *b,
-                    uploaded_ms: *u,
-                    touched_ms: Some(*u),
+                .map(|(k, (b, u))| {
+                    if broken.contains(&format!("{KEYLESS}{k}")) {
+                        Entry::Unreadable(None)
+                    } else if broken.contains(k) {
+                        Entry::Unreadable(Some(k.clone()))
+                    } else {
+                        Entry::Object(Listed {
+                            key: k.clone(),
+                            bytes: *b,
+                            uploaded_ms: *u,
+                            touched_ms: Some(*u),
+                        })
+                    }
                 })
                 .collect();
             (page, it.next().is_some())
@@ -637,6 +924,8 @@ mod tests {
             })
         }
     }
+
+    const KEYLESS: &str = "keyless:";
 
     /// What one pass did.
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -658,9 +947,11 @@ mod tests {
         between: impl FnOnce(&mut Bucket),
     ) -> Pass {
         let st = state(conn);
-        let (listed, truncated) = bucket.list(&st.start_after, SWEEP_MAX_OBJECTS as usize);
+        let (entries, truncated) = bucket.list(&st.start_after, SWEEP_MAX_OBJECTS as usize);
+        let page = split_page(entries);
+        let listed = &page.listed;
         let mut out = Pass::default();
-        let named: HashSet<String> = if any_past_window(&listed, now, ORPHAN_WINDOW_S) {
+        let named: HashSet<String> = if any_past_window(listed, now, ORPHAN_WINDOW_S) {
             out.named_read = true;
             if named_faults {
                 return out;
@@ -674,7 +965,7 @@ mod tests {
         } else {
             HashSet::new()
         };
-        let plan = plan_pass(&listed, &named, now, ORPHAN_WINDOW_S, SWEEP_MAX_DELETES);
+        let plan = plan_pass(listed, &named, now, ORPHAN_WINDOW_S, SWEEP_MAX_DELETES);
         between(bucket);
         let mut swept = HashSet::new();
         for o in plan.orphans.iter().map(|i| &listed[*i]) {
@@ -688,10 +979,9 @@ mod tests {
             out.swept.push(o.key.clone());
             out.swept_bytes += o.bytes;
         }
-        let more = truncated || plan.handled < listed.len();
         exec(
             conn,
-            &save_query(&next_state(&st, &listed[..plan.handled], &swept, more, now)),
+            &save_query(&after_pass(&st, &page, &plan, &swept, truncated, now)),
         );
         out
     }
@@ -962,7 +1252,7 @@ mod tests {
         let start = lib.find("async fn scheduled(").unwrap();
         let tick = squash(&lib[start..start + lib[start..].find("\n}\n").unwrap()]);
         let sweep = tick
-            .find("race_or_deadline(crate::beef_blob_sweep::sweep_pass(&env,&ops_db),crate::broadcaster::sleep_ms(crate::beef_blob_sweep::SWEEP_BUDGET_MS),)")
+            .find("crate::beef_blob_sweep::run_pass(&env,&ops_db,\"tick\").await;")
             .expect("the scheduled tick runs one bounded pass of the sweep");
         assert!(
             sweep < tick.find("engine.start_gasp_sync()").unwrap(),
@@ -975,6 +1265,12 @@ mod tests {
 
         let me = include_str!("beef_blob_sweep.rs");
         let me = &me[..me.find("#[cfg(test)]").unwrap()];
+        let start = me.find("pub async fn run_pass(").unwrap();
+        let run = squash(&me[start..start + me[start..].find("\n}\n").unwrap()]);
+        assert!(
+            run.contains("overlay_engine::gasp::race_or_deadline(sweep_pass(env,db),crate::broadcaster::sleep_ms(SWEEP_BUDGET_MS),)"),
+            "the pass runs under its budget"
+        );
         let start = me.find("pub async fn sweep_pass(").unwrap();
         let f = squash(&me[start..start + me[start..].find("\n}\n").unwrap()]);
         assert!(f.contains("list_page(&bucket,&state.start_after).await"));
@@ -984,8 +1280,9 @@ mod tests {
         assert!(page.contains("set(&opts,\"prefix\",&JsValue::from_str(SWEEP_PREFIX))?;"));
         assert!(page.contains("set(&opts,\"limit\",&JsValue::from(SWEEP_MAX_OBJECTS))?;"));
         assert!(page.contains("set(&opts,\"startAfter\",&JsValue::from_str(start_after))?;"));
-        assert!(f.contains("ifany_past_window(&listed,now,ORPHAN_WINDOW_S)"));
-        assert!(f.contains("plan_pass(&listed,&named,now,ORPHAN_WINDOW_S,SWEEP_MAX_DELETES)"));
+        assert!(f.contains("ifany_past_window(listed,now,ORPHAN_WINDOW_S)"));
+        assert!(f.contains("plan_pass(listed,&named,now,ORPHAN_WINDOW_S,SWEEP_MAX_DELETES)"));
+        assert!(f.contains("after_pass(&state,&page,&plan,&swept,truncated,now)"));
         let (named, head, check, delete, save) = (
             f.find("Query::new(NAMED_KEYS_SQL)").unwrap(),
             f.find("head_of(&bucket,o.key.as_str())").unwrap(),
@@ -997,7 +1294,7 @@ mod tests {
         assert!(named < head && head < check && check < delete && delete < save);
         assert_eq!(f.matches("bucket.delete(").count(), 1);
         assert_eq!(
-            f[..delete].matches("return;").count(),
+            f[..delete].matches("returnPassOutcome::stopped(").count(),
             4,
             "no binding, a state read, a listing or a named-keys read that faults: nothing is deleted"
         );
@@ -1156,5 +1453,262 @@ mod tests {
         // every R2 object the sweep reads goes through the guarded reader, the list's and the head's
         assert_eq!(src.matches("listed_of_js(&o)").count(), 2);
         assert!(!src.contains("bucket.head(") && !src.contains(".list()"));
+    }
+
+    fn squash_src(s: &str) -> String {
+        s.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<String>()
+    }
+
+    fn item(src: &str, head: &str) -> String {
+        let start = src
+            .find(head)
+            .unwrap_or_else(|| panic!("no `{head}` in the source"));
+        squash_src(&src[start..start + src[start..].find("\n}\n").unwrap()])
+    }
+
+    /// The d3 fold-4 (the door 3 delta-2 lens, E585-D3-DELTA2-L1): `POST /internal/beef-blob-sweep` runs ONE pass
+    /// through `run_pass`, the very function the scheduled tick calls, so the route tier tests the shipped pass
+    /// without firing the whole production tick (its live peers, WhatsOnChain, the broadcasters). The router sends
+    /// the route to the lever; the lever checks the bearer first, refuses a body that is not empty or `{}`, and
+    /// runs `run_pass` with no listing, plan or delete of its own; the tick runs `run_pass` too. RED on `1d1f7fe`:
+    /// "the router sends POST /internal/beef-blob-sweep to the lever"; RED against a lever that runs its own
+    /// listing (`list_page(` in the handler): "the lever runs the tick's pass, never its own listing".
+    #[test]
+    fn e585_d3f4_l1_the_lever_runs_the_scheduled_pass_function() {
+        let lib = include_str!("lib.rs");
+        assert!(
+            squash_src(lib).contains(
+                "(Method::Post,\"/internal/beef-blob-sweep\")=>crate::beef_blob_sweep::internal_sweep(req,&env).await,"
+            ),
+            "the router sends POST /internal/beef-blob-sweep to the lever"
+        );
+        let tick = item(lib, "async fn scheduled(");
+        assert_eq!(
+            tick.matches("crate::beef_blob_sweep::run_pass(&env,&ops_db,\"tick\").await;")
+                .count(),
+            1,
+            "the tick runs the same function"
+        );
+        assert!(
+            !tick.contains("sweep_pass("),
+            "the tick calls the pass only through run_pass"
+        );
+        let me = include_str!("beef_blob_sweep.rs");
+        let me = &me[..me.find("#[cfg(test)]").unwrap()];
+        let h = item(me, "pub async fn internal_sweep(");
+        let (auth, body, run) = (
+            h.find("if!crate::tip_pass::bearer_ok(authorization.as_deref(),secret.as_deref()){")
+                .expect("the bearer, compared in fixed time"),
+            h.find("if!parse_sweep_request(&raw){").expect("the body"),
+            h.find("letout=run_pass(env,&db,\"lever\").await;")
+                .expect("the lever runs the tick's pass"),
+        );
+        assert!(auth < body && body < run);
+        assert!(h.contains("returnworker::Response::error(\"unauthorized\",401);"));
+        for own in [
+            "list_page(",
+            "sweep_pass(",
+            "plan_pass(",
+            ".delete(",
+            "save_query(",
+        ] {
+            assert!(
+                !h.contains(own),
+                "the lever runs the tick's pass, never its own listing ({own})"
+            );
+        }
+        assert!(h.contains("Response::from_json(&pass_json(&out))?.with_status(status)"));
+        // exactly two callers of the pass: the tick and the lever
+        let workers: usize = [lib, me]
+            .iter()
+            .map(|f| squash_src(f).matches("run_pass(").count())
+            .sum();
+        assert_eq!(workers, 3, "the definition, the tick and the lever");
+
+        // the body: empty or {}, nothing else
+        for ok in ["", "  \n", "{}", " { } "] {
+            assert!(parse_sweep_request(ok.as_bytes()), "{ok:?}");
+        }
+        for bad in ["{\"limit\": 5}", "[]", "null", "x", "{"] {
+            assert!(!parse_sweep_request(bad.as_bytes()), "{bad:?}");
+        }
+        // the answer names the pass
+        let ran = PassOutcome {
+            listed: 7,
+            handled: 7,
+            unreadable: 1,
+            unreadable_key: Some("mutations/zz".into()),
+            swept: 2,
+            swept_bytes: 300,
+            faults: 1,
+            cursor_before: Some(String::new()),
+            cursor_after: Some("mutations/ab".into()),
+            last_pass_at: Some(42),
+            ..PassOutcome::default()
+        };
+        let j = pass_json(&ran);
+        for (k, v) in [
+            ("ok", serde_json::json!(true)),
+            ("stopped", serde_json::json!(null)),
+            ("listed", serde_json::json!(7)),
+            ("unreadable", serde_json::json!(1)),
+            ("unreadableKey", serde_json::json!("mutations/zz")),
+            ("deleted", serde_json::json!(2)),
+            ("deletedBytes", serde_json::json!(300)),
+            ("faults", serde_json::json!(1)),
+            ("cursorBefore", serde_json::json!("")),
+            ("cursorAfter", serde_json::json!("mutations/ab")),
+            ("lastPassAt", serde_json::json!(42)),
+            ("roundComplete", serde_json::json!(false)),
+        ] {
+            assert_eq!(j[k], v, "{k}");
+        }
+        assert_eq!(j["budget"]["maxObjectsPerPass"], SWEEP_MAX_OBJECTS);
+        assert_eq!(j["budget"]["maxDeletesPerPass"], SWEEP_MAX_DELETES);
+        let stopped = pass_json(&PassOutcome::stopped(
+            "the listing faulted: x".into(),
+            Some("k".into()),
+        ));
+        assert_eq!(stopped["ok"], false);
+        assert_eq!(
+            stopped["cursorAfter"],
+            serde_json::Value::Null,
+            "no cursor moved"
+        );
+        assert_eq!(stopped["lastPassAt"], serde_json::Value::Null);
+        assert_eq!(
+            queue_json(None, true)["r2"]["sweep"]["lever"],
+            "POST /internal/beef-blob-sweep"
+        );
+    }
+
+    /// The d3 fold-4 (the delta-2 lens's N3): a listed object whose key or `uploaded` date does not read is
+    /// SKIPPED and COUNTED: the pass sweeps the orphans on both sides of it, the cursor passes it (by its key, even
+    /// as the last entry of a truncated page), the next round meets it again, and the state at rest names it
+    /// (`lastUnreadable`, `lastUnreadableKey`) for the health block. RED on `1d1f7fe`: "one unreadable object
+    /// fails the whole page" (its `list_page` collects `Option<Vec<_>>`, so the sweep stalled at the object on every
+    /// pass, nothing counted).
+    #[test]
+    fn e585_d3f4_n3_an_unreadable_object_is_skipped_counted_and_passed() {
+        let me = include_str!("beef_blob_sweep.rs");
+        let me = &me[..me.find("#[cfg(test)]").unwrap()];
+        let page = squash_src(
+            &me[me.find("async fn list_page(").unwrap()..me.find("async fn head_of(").unwrap()],
+        );
+        assert!(
+            !page.contains("collect::<Option<Vec<_>>>()"),
+            "one unreadable object fails the whole page"
+        );
+        assert!(page.contains("None=>Entry::Unreadable("));
+        let f = item(me, "pub async fn sweep_pass(");
+        assert!(f.contains("letpage=split_page(entries);"));
+        assert!(f.contains("COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE,next.last_unreadable,"));
+        assert_eq!(
+            crate::ops::COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE,
+            "queue_r2_orphan_sweep_unreadable_total"
+        );
+        assert!(crate::d1::OVERLAY_MIGRATIONS.contains(&SWEEP_STATE_UNREADABLE_COLUMN));
+        assert!(crate::d1::OVERLAY_MIGRATIONS.contains(&SWEEP_STATE_UNREADABLE_KEY_COLUMN));
+
+        // the model pass over the shipped statements
+        let conn = db();
+        let mut bucket = Bucket::default();
+        let t0 = 1_800_000_000_000i64;
+        let now = t0 + WINDOW_MS + 1;
+        let k = |i: u32| format!("{SWEEP_PREFIX}{i:064x}/{:032x}", 0);
+        for i in 0..5 {
+            bucket.put(&k(i), 100, t0);
+        }
+        bucket.broken.insert(k(1));
+        bucket.broken.insert(format!("{KEYLESS}{}", k(3)));
+        let p = pass(&conn, &mut bucket, now, false, |_| {});
+        assert_eq!(
+            p.swept,
+            vec![k(0), k(2), k(4)],
+            "the orphans on both sides are swept"
+        );
+        let st = state(&conn);
+        assert_eq!(
+            (st.last_unreadable, st.last_unreadable_key.as_deref()),
+            (2, Some(k(1).as_str()))
+        );
+        assert!(st.start_after.is_empty(), "the round is complete");
+        assert_eq!(
+            st.full_objects,
+            Some(0),
+            "an unreadable object is not counted at rest"
+        );
+        assert!(
+            bucket.objects.contains_key(&k(1)) && bucket.objects.contains_key(&k(3)),
+            "never swept"
+        );
+        let h = queue_json(Some(&st), true);
+        assert_eq!(h["r2"]["sweep"]["lastUnreadable"], 2);
+        assert_eq!(h["r2"]["sweep"]["lastUnreadableKey"], k(1));
+        // the next round meets it again, counted again
+        pass(&conn, &mut bucket, now, false, |_| {});
+        assert_eq!(state(&conn).last_unreadable, 2);
+        // a clean pass clears the name
+        bucket.broken.clear();
+        pass(&conn, &mut bucket, now, false, |_| {});
+        let st = state(&conn);
+        assert_eq!((st.last_unreadable, st.last_unreadable_key), (0, None));
+
+        // a truncated page whose LAST entry does not read: the cursor passes it by its key
+        let mut entries: Vec<Entry> = (0..3)
+            .map(|i| {
+                Entry::Object(Listed {
+                    key: k(10 + i),
+                    bytes: 1,
+                    uploaded_ms: now,
+                    touched_ms: None,
+                })
+            })
+            .collect();
+        entries.push(Entry::Unreadable(Some(k(20))));
+        let page = split_page(entries);
+        let plan = plan_pass(
+            &page.listed,
+            &HashSet::new(),
+            now,
+            ORPHAN_WINDOW_S,
+            SWEEP_MAX_DELETES,
+        );
+        let next = after_pass(
+            &SweepState::default(),
+            &page,
+            &plan,
+            &HashSet::new(),
+            true,
+            now,
+        );
+        assert_eq!(next.start_after, k(20));
+        assert_eq!(next.round_objects, 3);
+        // a page with no key that reads stays where it was (the stated limit), counted
+        let page = split_page(vec![Entry::Unreadable(None); 2]);
+        let plan = plan_pass(
+            &page.listed,
+            &HashSet::new(),
+            now,
+            ORPHAN_WINDOW_S,
+            SWEEP_MAX_DELETES,
+        );
+        let at = SweepState {
+            start_after: k(30),
+            ..SweepState::default()
+        };
+        let next = after_pass(&at, &page, &plan, &HashSet::new(), true, now);
+        assert_eq!(
+            (
+                next.start_after,
+                next.last_unreadable,
+                next.last_unreadable_key
+            ),
+            (k(30), 2, None)
+        );
     }
 }

@@ -477,7 +477,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 185 → 186 for bsv-low #585 (2026-10-09, door 3's fold; 182 before the land onto NL-6c and NL-6d):
 /// `beef_blob_sweep`, the one-row state of the orphan sweep over the queue's R2 objects (its cursor, the round in
 /// progress, the last complete count); one table.
-pub const OVERLAY_MIGRATION_COUNT: usize = 186;
+/// 186 → 188 for bsv-low #585 (2026-10-09, door 3's fold-4; 183-184 before the land onto NL-6c and NL-6d):
+/// `beef_blob_sweep.last_unreadable` and `.last_unreadable_key` (the listed objects the last pass could not read,
+/// skipped and named); two additive ALTERs.
+pub const OVERLAY_MIGRATION_COUNT: usize = 188;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1788,6 +1791,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // handled), the round in progress and the last complete count of the objects at rest in ONE row
     // (`beef_blob_sweep.rs`). Transient: a lost row restarts the round at the first key.
     crate::beef_blob_sweep::SWEEP_STATE_CREATE,
+    // bsv-low #585 (door 3's fold-4): the last pass's unreadable entries, skipped and named in the health block.
+    crate::beef_blob_sweep::SWEEP_STATE_UNREADABLE_COLUMN,
+    crate::beef_blob_sweep::SWEEP_STATE_UNREADABLE_KEY_COLUMN,
 ];
 
 // =============================================================================

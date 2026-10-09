@@ -1097,7 +1097,12 @@ sha256=<bytes' hash> bytes=<n>` with its re-drives and last fault, counts
 it is the operator's word, as a re-drive is. A discarded letter whose BEEF is
 an R2 object has that object deleted with its row (`r2Key`, `r2Bytes`,
 `r2Deleted`, and `r2Fault` when the delete faulted: the row is gone, the
-object stays, `wrangler r2 object delete` takes it).
+object stays, `wrangler r2 object delete` takes it). A discarded keyed
+letter's object is deleted at once; an object nothing names any more (a bulk
+discard whose deletes faulted, an R2 audit) is the orphan sweep's, and the
+third lever of the same bearer, `POST /internal/beef-blob-sweep` (bsv-low
+#585 door 3's fold-4; "The queued BEEF in R2" below), runs one pass of it on
+demand.
 
 `POST /internal/redrive-dead-letters` (bearer `INTERNAL_TOKEN`, as
 `/internal/reorg`, compared in fixed time since the lens fold, L1), body
@@ -1348,11 +1353,22 @@ routed around, never made a limit on a body.
   names (the orphans below) is found by listing the bucket, since nothing
   else knows it. CADENCE: the scheduled tick (`*/15`), one pass a tick,
   before the GASP step, under a 30 s race (a dropped pass saved no cursor and
-  is made again). BOUND: a pass lists at most 200 objects under `mutations/`
+  is made again). THE LEVER (the fold-4, E585-D3-DELTA2-L1): `POST
+  /internal/beef-blob-sweep` (bearer `INTERNAL_TOKEN` in fixed time, as the
+  #576 levers; body empty or `{}`, else 400; 401 without the bearer) runs ONE
+  pass through `beef_blob_sweep::run_pass`, the function the tick calls (the
+  same race, bounds, cursor row and counters), and answers it: `ok`,
+  `stopped` (why a pass ended before its plan: no binding, a state, listing or
+  named-keys read fault, the 30 s budget; then 503, nothing swept, no cursor
+  moved), `listed`, `handled`, `unreadable`, `unreadableKey`, `deleted`,
+  `deletedBytes`, `faults`, `cursorBefore`, `cursorAfter`, `lastPassAt`,
+  `roundComplete` and the `budget`. For an operator after a bulk discard or an
+  R2 audit (one call a page of 200; call until `roundComplete`), and for the
+  route tier, which no longer fires the production tick. BOUND: a pass lists at most 200 objects under `mutations/`
   (`SWEEP_MAX_OBJECTS`) from the key the last pass stopped at, and deletes at
   most 50 (`SWEEP_MAX_DELETES`, a `head` and a `delete` each; a pass that
   meets a 51st stops there). The cursor is the last KEY handled, at rest in
-  D1 (`beef_blob_sweep`, one row, transient, migration 182): R2 lists in key
+  D1 (`beef_blob_sweep`, one row, transient, migrations 182-184): R2 lists in key
   order and a key outlives a listing token. An object is deleted when it is
   BOTH older than the WINDOW by its AGE STAMP, the LATER of R2's `uploaded`
   and our own `customMetadata.touched` that every put writes (the fold-2,
@@ -1375,10 +1391,27 @@ routed around, never made a limit on a body.
   until the object was deleted by hand. The platform's answer for an unstamped
   object under `include` (`undefined` or `{}`) is not documented and miniflare
   always answers `{}`; the native pin proves the parse, the fallback and the
-  source shape, beta the platform (a CLI put with no metadata, the next tick).
-  An object whose key or `uploaded` date does not read fails the listing
-  closed (nothing swept, no cursor moved, logged): a broken platform contract,
-  never a throw. THE WINDOW is 8 days
+  source shape, beta the platform (the beta check below).
+  AN OBJECT THE SWEEP CANNOT READ (its key or `uploaded` date does not read: a
+  broken platform contract, never a throw) is SKIPPED and COUNTED (the fold-4,
+  the delta-2 lens's N3): the pass goes on over the rest of its page, the
+  cursor passes it by its key, the next round meets it again,
+  `queue_r2_orphan_sweep_unreadable_total` counts it on every pass and the
+  health block names the last pass's count and first key; it is never swept
+  (the operator deletes it by hand if it is the door's). Before the fold one
+  such object failed the whole page closed on every pass, nothing counted: the
+  sweep stalled at it for good. A page of 200 entries none of whose keys read
+  still leaves the cursor where it was (stated). THE BETA CHECK (after the
+  first deploy carrying the sweep): put one object with NO metadata under
+  `mutations/zz/` (`wrangler r2 object put`); it sorts after every hex key,
+  so it is listed only when a round reaches the bucket's end: call the lever
+  until its answer says `roundComplete: true` (or watch
+  `/health/invariants.queue.r2.round.startAfter` pass `mutations/f` and
+  `atRest.at` move); the answer's `unreadable` 0 and `stopped` null, then
+  the next `*/15` tick moves `queue.r2.sweep.lastPassAt` and the tail shows
+  `Scheduled: GASP sync` (the tick survived the sweep). Read `lastPassAt`,
+  not the fault counter: a listing fault or a throw never bumps a counter
+  and leaves `lastPassAt` unmoved. Then delete the object by hand. THE WINDOW is 8 days
   (`ORPHAN_WINDOW_S`, two `QUEUE_RETENTION_S` of 345,600 s, the platform's
   default retention, which neither queue changes): what no queue message can
   outlive. Every message naming an object was sent right after a write of it
@@ -1392,13 +1425,15 @@ routed around, never made a limit on a body.
   already older than 48 h, and an object swept under a live name is a replay
   with no bytes. Counted `queue_r2_orphans_swept_total` and
   `queue_r2_orphans_swept_bytes_total` (a read or delete that faulted:
-  `queue_r2_orphan_sweep_faults_total`), each logged `[beef-blobs] SWEPT
+  `queue_r2_orphan_sweep_faults_total`; an object that does not read:
+  `queue_r2_orphan_sweep_unreadable_total`), each logged `[beef-blobs] SWEPT
   <key> bytes= age_s=`. `/health/invariants.queue.r2` serves the objects AT
   REST from the listing: `atRest` {`objects`, `bytes`, `at`} of the last
   COMPLETE round over the bucket (`null` before the first), `round` (the one
   in progress, with `startAfter`), `sweep` {`windowSecs`,
   `maxObjectsPerPass`, `maxDeletesPerPass`, `prefix`, `lastPassAt`,
-  `lastListed`, `lastSwept`}, `bound` and `readable`.
+  `lastListed`, `lastSwept`, `lastUnreadable`, `lastUnreadableKey`,
+  `lever`}, `bound` and `readable`.
 
 Limits, stated. (1) ORPHANS, cured (the sweep above): a send that faulted
 after its write and was never re-presented, a delete that faulted, a batch
@@ -1552,6 +1587,37 @@ the worker's hard-coded `tm_ship`/`tm_slap`/`tm_uhrp` peers over the network
 and DEFERS real graphs; run before the e555 cell it put 18 rows under that
 cell's counts (the re-run's 4 e555 FAILs; the delta lens's N8 read it as
 harmless).
+
+The fold-4 (the door 3 delta-2 lens, E585-D3-DELTA2-L1 and its NOTEs). Leg 7
+fired the WHOLE production tick from CI (`/__scheduled` under
+`--test-scheduled`): live SHIP/SLAP/UHRP peers, WhatsOnChain, and, had the
+tick reached its rebroadcast backstop, the tier's own transactions posted to
+ARC; only the cell's place kept the assertions deterministic. Now leg 7 calls
+the sweep's lever (above): 401 and 400, then one pass from a cursor seeded
+before a young object, its answer, the cursor row and the health block agreeing,
+the object untouched. `ci-d1-budget` runs no `--test-scheduled`, no cell fires
+a tick and the order of the cells is free. `ci-route`'s own seven logs carry the
+port base too (`/tmp/lane347-route-<LANE_BASE>-strict.log` and the rest; the
+lens's N7). Pins (`--lib e585_d3f4`):
+`beef_blob_sweep::tests::e585_d3f4_l1_the_lever_runs_the_scheduled_pass_function`
+(the route, the bearer before the body before `run_pass`, no listing, plan,
+delete or save of its own, the tick calling `run_pass`, the body's parse and
+the answer's fields; RED on `1d1f7fe`: "the router sends POST
+/internal/beef-blob-sweep to the lever"; RED against a lever that lists for
+itself: "the lever runs the tick's pass, never its own listing (list_page()")
+and `*_e585_d3f4_n3_an_unreadable_object_is_skipped_counted_and_passed` (a
+keyed and a keyless unreadable entry between orphans: the orphans swept, the
+two counted, the first key named, the round complete; a truncated page ending
+on one passes it; a keyless page stays, counted; RED on `1d1f7fe`: "one
+unreadable object fails the whole page"). Amended:
+`e585_d3f_the_window_outlives_every_queue_message_and_the_cron_runs_the_pass`
+(the tick calls `run_pass`, which races `sweep_pass`). Left, stated: the
+lens's N1 (the strict worker's `wasm-opt` SIGKILL, a host memory matter), N5
+(wrangler unpinned; a changed not-found text turns a true not-found into a
+FAIL, never the reverse), N6 and N8 (no change asked), N4 (the fold-3's RED
+wording: the L1 pin reaches its source assertion only with the fold's rule
+body grafted too), and the e1d and e555 cells' unretried CLI calls (N7, the
+class of M2, not asked).
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 

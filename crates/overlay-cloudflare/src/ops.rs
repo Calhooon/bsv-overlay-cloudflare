@@ -250,6 +250,9 @@ pub const COUNTER_QUEUE_R2_MISSING_FAULT: &str = "queue_r2_missing_fault_total";
 pub const COUNTER_QUEUE_R2_ORPHANS_SWEPT: &str = "queue_r2_orphans_swept_total";
 pub const COUNTER_QUEUE_R2_ORPHANS_SWEPT_BYTES: &str = "queue_r2_orphans_swept_bytes_total";
 pub const COUNTER_QUEUE_R2_ORPHAN_SWEEP_FAULTS: &str = "queue_r2_orphan_sweep_faults_total";
+/// bsv-low #585 (door 3's fold-4, the delta-2 lens's N3): listed objects the sweep could not read (a key or an
+/// `uploaded` date that does not read), skipped and never swept; each pass that meets one counts it again.
+pub const COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE: &str = "queue_r2_orphan_sweep_unreadable_total";
 /// loop 18: an eviction pass that could not prove every table clean (a faulted read, a survivor after the
 /// second move) — the open marker stands; the write-side guard and the next eviction converge.
 pub const COUNTER_ADMIT_FAST_EVICT_INCOMPLETE: &str = "admit_fast_evict_incomplete_total";
@@ -958,6 +961,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_QUEUE_R2_ORPHANS_SWEPT,
         COUNTER_QUEUE_R2_ORPHANS_SWEPT_BYTES,
         COUNTER_QUEUE_R2_ORPHAN_SWEEP_FAULTS,
+        COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE,
         COUNTER_ARC_INGEST_SEEN_LATCHED,
         COUNTER_ARC_INGEST_EVICTED,
         COUNTER_ARC_INGEST_READMITTED,

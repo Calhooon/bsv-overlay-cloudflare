@@ -376,6 +376,9 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
         (Method::Post, "/internal/discard-dead-letters") => {
             crate::dead_letters::internal_discard(req, &env).await
         }
+        // bsv-low #585 (door 3's fold-4): ONE bounded pass of the R2 orphan sweep on demand, the tick's own
+        // function (bearer INTERNAL_TOKEN; body empty or {}).
+        (Method::Post, "/internal/beef-blob-sweep") => crate::beef_blob_sweep::internal_sweep(req, &env).await,
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
 
@@ -1307,19 +1310,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // the queue's R2 objects (`beef_blob_sweep.rs`: at most 200 listed and 50
     // deleted, the cursor at rest in D1). Before the GASP step, so a tick
     // that step holds to its belt has swept. A dropped pass saved no cursor
-    // and is made again.
-    if race_or_deadline(
-        crate::beef_blob_sweep::sweep_pass(&env, &ops_db),
-        crate::broadcaster::sleep_ms(crate::beef_blob_sweep::SWEEP_BUDGET_MS),
-    )
-    .await
-    .is_none()
-    {
-        worker::console_log!(
-            "Scheduled: the R2 orphan sweep EXCEEDED its {} ms budget — dropped; continuing the tick",
-            crate::beef_blob_sweep::SWEEP_BUDGET_MS
-        );
-    }
+    // and is made again. `run_pass` is the bounded pass the operator's lever
+    // (`POST /internal/beef-blob-sweep`) runs too (the d3 fold-4).
+    crate::beef_blob_sweep::run_pass(&env, &ops_db, "tick").await;
     // bsv-low #555 (the lens fold's M3): rows of deferred graphs nothing
     // will resume (a peer that never finishes a sync again) are swept first.
     crate::gasp_deferred::sweep_stale(&ops_db).await;

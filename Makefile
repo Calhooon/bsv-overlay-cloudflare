@@ -230,14 +230,14 @@ ROUTE_UP_SLEEP ?= 3
 ci-route: ci-d1-budget
 	@set -e; \
 	B=$${LANE_BASE:-8791}; P1=$$B; P2=$$((B+1)); P3=$$((B+2)); P4=$$((B+3)); P5=$$((B+4)); P6=$$((B+5)); P7=$$((B+6)); P8=$$((B+7)); P9=$$((B+8)); P10=$$((B+11)); P11=$$((B+12)); \
-	strict_log=/tmp/lane347-route-strict.log; \
-	kill_log=/tmp/lane347-route-kill.log; \
-	lenient_log=/tmp/lane366-route-lenient.log; \
-	arc_log=/tmp/lane-arc-ingest-route.log; \
-	seen_log=/tmp/lane371-route-seen.log; \
-	door_log=/tmp/lane-script-route-door.log; \
-	door_off_log=/tmp/lane-script-route-door-off.log; \
-	ef_log=/tmp/lane-nl6c-route-ef-$$B.log; \
+	strict_log=/tmp/lane347-route-$$B-strict.log; \
+	kill_log=/tmp/lane347-route-$$B-kill.log; \
+	lenient_log=/tmp/lane366-route-$$B-lenient.log; \
+	arc_log=/tmp/lane-arc-ingest-route-$$B.log; \
+	seen_log=/tmp/lane371-route-$$B-seen.log; \
+	door_log=/tmp/lane-script-route-$$B-door.log; \
+	door_off_log=/tmp/lane-script-route-$$B-door-off.log; \
+	ef_log=/tmp/lane-nl6c-route-$$B-ef.log; \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -424,18 +424,22 @@ ci-route: ci-d1-budget
 # leaves every other cell's sub-kilobyte messages inline): ~8 KB "not now" letters written to the local R2 bucket,
 # parked by KEY, re-driven from R2 and landed (the object gone after the ack), a missing object parked again with its
 # class kept, a discard deleting the object, a 500 KB "not now" submission carried whole (#568), and the d3 fold-2's
-# legs: a twin acked over a missing object, the orphan sweep through `/__scheduled` (the overlay runs with
-# `--test-scheduled`), and a put twice moving the object's `touched` stamp.
+# legs: a twin acked over a missing object, the orphan sweep through the operator's lever
+# `POST /internal/beef-blob-sweep` (the d3 fold-4: one pass of the tick's own function; no scheduled tick is fired, so
+# the overlay runs without `--test-scheduled`), and a put twice moving the object's `touched` stamp.
 #
 # Ports: LANE_BASE+9 (app layer) and LANE_BASE+10 (overlay), :8800 and :8801 by default; the same pre-flight,
 # bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network: no
 # fixture pot is spent and no hop filed (no courier), the app layer's service bindings are absent (its tip reads
 # answer 503 and the views serve without a tip), and the overlay's ARCADE_URL is a closed local port. The logs carry
 # the port base (`/tmp/lane499-d1-<LANE_BASE>-app.log`, `-overlay.log`, `-seed.log`; the d3 fold-3, E585-D3-DELTA-M2):
-# two tiers on different bases never overwrite each other's logs. The e585 cell runs LAST: its leg 7 fires the whole
-# scheduled tick (`/__scheduled`), whose GASP step syncs the worker's hard-coded peers over the network and DEFERS real
-# graphs into `gasp_deferred_graphs` in the background; run before the e555 cell it put 18 rows under that cell's
-# counts (the captain's re-run of the d3 fold-2, 2026-10-09: 4 e555 FAILs). Nothing runs after it.
+# two tiers on different bases never overwrite each other's logs (`ci-route`'s own logs too, the d3 fold-4:
+# `/tmp/lane347-route-<LANE_BASE>-strict.log` and the rest). No cell fires the scheduled tick (the d3 fold-4,
+# E585-D3-DELTA2-L1): the d3 fold-2's leg 7 did (`/__scheduled` under `--test-scheduled`), and the whole production
+# tick synced the worker's hard-coded peers over the network, deferred real graphs into `gasp_deferred_graphs` in the
+# background (18 rows under the e555 cell's counts in the captain's re-run of the fold-2) and could reach the
+# rebroadcast backstop's broadcasters; the cell ran last only to keep its writes away from the others. Leg 7 now
+# runs one pass of the sweep through its lever, synchronously, and the order of the cells is free again.
 ci-d1-budget:
 	@set -e; \
 	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); \
@@ -495,7 +499,7 @@ ci-d1-budget:
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PA/health "$$app_log" "app layer"; \
 	echo "→ starting wrangler dev :$$PO (the overlay, tm_collected, ARCADE_URL a closed port)…"; \
-	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --test-scheduled --port $$PO --ip 127.0.0.1 --persist-to "$$ov_state" \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$PO --ip 127.0.0.1 --persist-to "$$ov_state" \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
