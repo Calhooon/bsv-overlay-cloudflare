@@ -403,7 +403,7 @@ enum StepOut {
     Seen,
     Appended {
         node_id: String,
-        walked: WalkedNode,
+        walked: Box<WalkedNode>,
         children: Vec<PendingInput>,
     },
 }
@@ -1594,7 +1594,7 @@ impl<'a> GASPSync<'a> {
         } = out
         {
             walk.seen.insert(node_id);
-            walk.record.nodes.push(walked);
+            walk.record.nodes.push(*walked);
             walk.record.pending.extend(children.into_iter().rev());
         }
     }
@@ -1880,10 +1880,10 @@ impl<'a> GASPSync<'a> {
         }
         Ok(StepOut::Appended {
             node_id,
-            walked: WalkedNode {
+            walked: Box::new(WalkedNode {
                 node,
                 spent_by: item.spent_by.clone(),
-            },
+            }),
             children,
         })
     }
