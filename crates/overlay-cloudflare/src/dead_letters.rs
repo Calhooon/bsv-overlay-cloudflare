@@ -176,12 +176,24 @@ macro_rules! history_append {
 pub const NOTE_FAILING_SQL: &str = "INSERT INTO mutation_dead_letters (txid, topics, message, fault, attempts, status, first_seen_at, class) VALUES (?, ?, '', ?, 1, 'failing', ?, ?) \
      ON CONFLICT(txid, topics) DO UPDATE SET fault = excluded.fault, attempts = mutation_dead_letters.attempts + 1, class = excluded.class \
      WHERE mutation_dead_letters.status != 'parked'";
-/// Binds: txid, topics, message, fault (used when the row holds none), redrives (for a fresh row), now (twice).
-/// A row already parked with these very bytes is untouched (no row returned): a DLQ redelivery parks once. Another
-/// copy of a parked key keeps the longer bytes and appends a `copy` entry (`kind` returned).
+/// Binds: txid, topics, message, fault (used when the row holds none), redrives (for a fresh row), now (twice), the
+/// 24 h cutoff ([`day_cutoff`]). A row already parked with these very bytes is untouched (no row returned): a DLQ
+/// redelivery parks once. Another copy of a parked key keeps the longer bytes and appends a `copy` entry (`kind`
+/// returned).
+///
+/// The delta-3 fold (D3-L1): the statement RE-READS the bounds of [`ceiling_verdict`] itself (`WHERE` of the
+/// `SELECT`): a key that holds bytes always parks; a new letter only under [`PARKED_ROWS_CEILING`], and a "not now"
+/// one only under [`NOT_NOW_PER_TXID`], [`NOT_NOW_MAX`] and [`NOT_NOW_PER_DAY`]. D1 runs one statement at a time, so
+/// two consumers that both read room before either parked no longer both park; the one refused gets no row back.
 pub const PARK_SQL: &str = concat!(
     "INSERT INTO mutation_dead_letters (txid, topics, message, fault, attempts, status, redrives, first_seen_at, parked_at, history) \
-     VALUES (?1, ?2, ?3, ?4, 0, 'parked', ?5, ?6, ?6, json_array(json_object('parkedAt', ?6, 'fault', ?4, 'attempts', 0, 'redrive', ?5, 'kind', 'park'))) \
+     SELECT ?1, ?2, ?3, ?4, 0, 'parked', ?5, ?6, ?6, json_array(json_object('parkedAt', ?6, 'fault', ?4, 'attempts', 0, 'redrive', ?5, 'kind', 'park')) \
+     WHERE EXISTS (SELECT 1 FROM mutation_dead_letters WHERE txid = ?1 AND topics = ?2 AND status IN ('parked', 'redriven')) \
+     OR ((SELECT COUNT(*) FROM mutation_dead_letters WHERE status IN ('parked', 'redriven')) < 2000 \
+     AND (COALESCE((SELECT class FROM mutation_dead_letters WHERE txid = ?1 AND topics = ?2), 'fault') != 'not_now' \
+     OR ((SELECT COUNT(*) FROM mutation_dead_letters WHERE txid = ?1 AND class = 'not_now' AND status IN ('parked', 'redriven')) < 1 \
+     AND (SELECT COUNT(*) FROM mutation_dead_letters WHERE class = 'not_now' AND status IN ('parked', 'redriven')) < 1000 \
+     AND (SELECT COUNT(*) FROM mutation_dead_letters WHERE class = 'not_now' AND status IN ('parked', 'redriven') AND parked_at >= ?7) < 200))) \
      ON CONFLICT(txid, topics) DO UPDATE SET status = 'parked', \
      parked_at = CASE WHEN mutation_dead_letters.status = 'parked' THEN mutation_dead_letters.parked_at ELSE excluded.parked_at END, \
      message = CASE WHEN length(excluded.message) > length(mutation_dead_letters.message) THEN excluded.message ELSE mutation_dead_letters.message END, \
@@ -393,6 +405,26 @@ impl LetterClass {
             Self::Fault => "fault",
         }
     }
+
+    /// PURE: the class a column value names; anything but `not_now` is a fault letter (an unknown is honest).
+    #[must_use]
+    pub fn of_column(v: &str) -> Self {
+        if v == Self::NotNow.as_str() {
+            Self::NotNow
+        } else {
+            Self::Fault
+        }
+    }
+
+    /// PURE (the delta-3 fold, D3-L3): the counter a LOST letter of this class bumps, so
+    /// `dead_letters_lost_total` keeps meaning an HONEST loss and a stranger's flood's tail is counted apart.
+    #[must_use]
+    pub fn lost_counter(self) -> &'static str {
+        match self {
+            Self::NotNow => crate::ops::COUNTER_DEAD_LETTERS_LOST_NOT_NOW,
+            Self::Fault => crate::ops::COUNTER_DEAD_LETTERS_LOST,
+        }
+    }
 }
 
 #[must_use]
@@ -429,6 +461,14 @@ pub fn park_query(
         .bind(bounded_fault(fault))
         .bind(redrives)
         .bind(now_ms)
+        .bind(day_cutoff(now_ms))
+}
+
+/// PURE (the delta-3 fold, D3-L2): the start of the trailing day of [`NOT_NOW_PER_DAY`] at `now_ms`, for the park,
+/// its ceiling read and the health block alike.
+#[must_use]
+pub fn day_cutoff(now_ms: i64) -> i64 {
+    now_ms - 86_400_000
 }
 
 #[must_use]
@@ -865,7 +905,8 @@ fn letter_of(raw: worker::wasm_bindgen::JsValue, id: &str) -> Letter {
 }
 
 /// What a park did.
-enum Parked {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Parked {
     /// A new park (or a re-park of a re-driven letter): `redrives` so far, and the letters with bytes after it when
     /// that is at or past [`CEILING_NEAR`] (D-M1's threshold line).
     Park(u64, Option<u64>),
@@ -879,13 +920,20 @@ enum Parked {
     NotNowBound(Deferral),
 }
 
-async fn park_one(db: &D1Database, l: &Letter, now: i64) -> std::result::Result<Parked, String> {
-    let c = ceiling_query(&l.txid, &l.topics, now - 86_400_000)
+/// `class` is set to the letter's class as the ceiling read found it (left `Fault` when unread; D3-L3's LOST count).
+async fn park_one(
+    db: &D1Database,
+    l: &Letter,
+    now: i64,
+    class: &mut LetterClass,
+) -> std::result::Result<Parked, String> {
+    let c = ceiling_query(&l.txid, &l.topics, day_cutoff(now))
         .fetch_optional::<CeilingRow>(db)
         .await
         .map_err(|e| format!("the ceiling read: {e}"))?;
     let mut held_after = None;
     if let Some(c) = c {
+        *class = LetterClass::of_column(&c.class);
         match ceiling_verdict(&c) {
             Ok(near) => held_after = near,
             Err(Deferral::Ceiling(held)) => return Ok(Parked::Ceiling(held)),
@@ -904,12 +952,40 @@ async fn park_one(db: &D1Database, l: &Letter, now: i64) -> std::result::Result<
     .await
     .map_err(|e| format!("the park: {e}"))?;
     Ok(match rows.first() {
-        None => Parked::Redelivery,
+        None => {
+            // D3-L1: no row is a redelivery of held bytes, or the park's own re-read of the bounds refused a letter
+            // another consumer took the room of since this one's read: read again to say which
+            let again = ceiling_query(&l.txid, &l.topics, day_cutoff(now))
+                .fetch_optional::<CeilingRow>(db)
+                .await
+                .map_err(|e| format!("the ceiling re-read after a refused park: {e}"))?;
+            return unparked(again.as_ref());
+        }
         Some(r) if r.kind.as_deref() == Some("copy") => {
             Parked::Copy(r.kept.clone().unwrap_or_default())
         }
         Some(r) => Parked::Park(r.redrives.max(0.0) as u64, held_after),
     })
+}
+
+/// PURE (the delta-3 fold, D3-L1): what a park that returned no row was, from the ceiling read made after it. The
+/// key holds bytes: a redelivery (acked). A bound holds: the deferral it is (another consumer parked into the room
+/// this one read). Neither (the room freed again since): a fault, handed back with the backoff, never acked.
+pub fn unparked(again: Option<&CeilingRow>) -> std::result::Result<Parked, String> {
+    let Some(c) = again else {
+        return Err("the ceiling re-read after a refused park answered no row".to_string());
+    };
+    if c.known >= 1.0 {
+        return Ok(Parked::Redelivery);
+    }
+    match ceiling_verdict(c) {
+        Err(Deferral::Ceiling(held)) => Ok(Parked::Ceiling(held)),
+        Err(d) => Ok(Parked::NotNowBound(d)),
+        Ok(_) => Err(
+            "the park was refused by a bound another consumer reached, and the room freed since"
+                .to_string(),
+        ),
+    }
 }
 
 /// PURE (D-L2): the platform's `attempts` as the log lines print it, so a drill that parks cleanly reads it.
@@ -1005,8 +1081,9 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
         let (txid, topics) = (&letter.txid, &letter.topics);
         let att = attempts_text(attempts);
         let now = worker::Date::now().as_millis() as i64;
+        let mut class = LetterClass::Fault;
         let outcome = match &db {
-            Ok(db) => park_one(db, &letter, now).await,
+            Ok(db) => park_one(db, &letter, now, &mut class).await,
             Err(e) => Err(e.clone()),
         };
         let fault = match outcome {
@@ -1079,12 +1156,13 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
         if plan.last {
             let h = bsv_rs::primitives::hash::sha256(letter.message.as_bytes());
             worker::console_log!(
-                "[dead-letters] LOST {txid} [{topics}] sha256={} after {} DLQ deliveries ({fault}): the platform drops it now and its bytes are NOT in D1",
+                "[dead-letters] LOST {txid} [{topics}] sha256={} class={} after {} DLQ deliveries ({fault}): the platform drops it now and its bytes are NOT in D1",
                 hex::encode(h),
+                class.as_str(),
                 attempts.unwrap_or(0)
             );
             if let Ok(db) = &db {
-                crate::ops::bump_counter(db, crate::ops::COUNTER_DEAD_LETTERS_LOST, 1).await;
+                crate::ops::bump_counter(db, class.lost_counter(), 1).await;
             }
         } else {
             worker::console_log!(
@@ -1358,10 +1436,23 @@ struct StatusCountRow {
 }
 
 #[derive(Deserialize)]
-struct ClassCountRow {
-    class: String,
-    c: f64,
-    recent: Option<f64>,
+pub struct ClassCountRow {
+    pub class: String,
+    pub c: f64,
+    pub recent: Option<f64>,
+}
+
+/// PURE (the delta-3 fold, D3-L2): [`HEALTH_CLASSES_SQL`]'s rows as `(fault held, not-now held, not-now parked in
+/// the last 24 h)`, the arguments of [`classes_json`].
+#[must_use]
+pub fn class_counts(rows: &[ClassCountRow]) -> (u64, u64, u64) {
+    let n = |v: f64| v.max(0.0) as u64;
+    let of = |c: LetterClass| rows.iter().find(|r| r.class == c.as_str());
+    (
+        of(LetterClass::Fault).map_or(0, |r| n(r.c)),
+        of(LetterClass::NotNow).map_or(0, |r| n(r.c)),
+        of(LetterClass::NotNow).map_or(0, |r| n(r.recent.unwrap_or(0.0))),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1389,7 +1480,7 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
     let Ok(counts) = Query::new(HEALTH_COUNTS_SQL)
         .bind(MAX_REDRIVES)
         .bind(now - STALE_REDRIVE_MS)
-        .bind(now - 86_400_000)
+        .bind(day_cutoff(now))
         .fetch_all::<StatusCountRow>(db)
         .await
     else {
@@ -1437,11 +1528,11 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
         Vec::new()
     };
     let classes: Vec<ClassCountRow> = Query::new(HEALTH_CLASSES_SQL)
-        .bind(now - 86_400_000)
+        .bind(day_cutoff(now))
         .fetch_all(db)
         .await
         .unwrap_or_default();
-    let class = |c: LetterClass| classes.iter().find(|r| r.class == c.as_str());
+    let (fault_held, not_now_held, not_now_day) = class_counts(&classes);
     let key_at = |r: &KeyAtRow| serde_json::json!({"txid": r.txid, "topics": r.topics, "at": r.at.map(|v| v as i64)});
     let held = count("parked") + count("redriven");
     serde_json::json!({
@@ -1454,11 +1545,7 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
         "oldestRedriven": oldest_redriven.as_ref().map(key_at),
         "parkedLast24h": counts.iter().map(|r| n(r.recent)).sum::<u64>(),
         "ceiling": ceiling_json(held),
-        "classes": classes_json(
-            class(LetterClass::Fault).map_or(0, |r| r.c.max(0.0) as u64),
-            class(LetterClass::NotNow).map_or(0, |r| r.c.max(0.0) as u64),
-            class(LetterClass::NotNow).map_or(0, |r| n(r.recent)),
-        ),
+        "classes": classes_json(fault_held, not_now_held, not_now_day),
         "oldestParked": oldest.as_ref().map(key_at),
         "lastRedrive": last.as_ref().map(key_at),
         "maxRedrives": MAX_REDRIVES,
@@ -2083,7 +2170,7 @@ mod tests {
         assert!(!fault_path.contains(".ack("), "the fault path never acks");
         assert!(
             fault_path.contains("[dead-letters] LOST")
-                && fault_path.contains("COUNTER_DEAD_LETTERS_LOST")
+                && fault_path.contains("bump_counter(db, class.lost_counter(), 1)")
         );
         assert!(fault_path.contains("retry_after(&m, plan.delay_s)"));
         assert_eq!(
@@ -2537,9 +2624,21 @@ mod tests {
         assert_eq!(row(&conn, "new").0, "parked");
         assert_eq!(read("new2").0, PARKED_ROWS_CEILING, "full again");
         // by txid with no topics: every parked row of the txid, and only parked ones
+        // (the delta-3 fold, D3-L1: the park re-reads the ceiling itself, so it no longer seeds past a full table:
+        // the two rows go in raw)
         let m = serde_json::to_string(&msg("AA==", &["tm_c"])).unwrap();
-        run(&conn, &park_query("new", "tm_c", &m, "f", 0, 6_000));
-        run(&conn, &park_query("new", "tm_d", &m, "f", 0, 6_000));
+        assert_eq!(
+            run(&conn, &park_query("new", "tm_c", &m, "f", 0, 6_000)),
+            0,
+            "full: the park itself refuses a new letter"
+        );
+        for t in ["tm_c", "tm_d"] {
+            conn.execute(
+                "INSERT INTO mutation_dead_letters (txid, topics, message, status, first_seen_at, parked_at) VALUES ('new', ?1, ?2, 'parked', 6000, 6000)",
+                rusqlite::params![t, m],
+            )
+            .unwrap();
+        }
         conn.execute("UPDATE mutation_dead_letters SET status = 'redriven' WHERE txid = 'new' AND topics = 'tm_d'", []).unwrap();
         let gone = rows(&conn, &discard_query("new", None, DISCARD_MAX_LETTERS));
         let mut keys: Vec<&str> = gone.iter().map(|r| r[1].as_str()).collect();
@@ -3180,5 +3279,480 @@ mod tests {
             verdict.contains("return Ok(near_after(held, true));")
                 && verdict.contains("Ok(near_after(held, false))")
         );
+    }
+
+    // ── bsv-low #576's delta-3 fold (lane E576-f4) ──────────────────────────
+
+    /// The DLQ consumer's two steps apart, as two consumers interleave them: the note and the ceiling read (the
+    /// verdict), then, later, the park; what the park returned, and (no row) what [`unparked`] makes of it.
+    fn read_then(
+        conn: &rusqlite::Connection,
+        txid: &str,
+        topics: &str,
+        class: LetterClass,
+        now: i64,
+    ) -> std::result::Result<Option<u64>, Deferral> {
+        run(
+            conn,
+            &note_failing_query(txid, topics, "the last replay's fault", now - 1, class),
+        );
+        ceiling_verdict(&ceiling_row(conn, txid, topics, now))
+    }
+
+    fn park_now(
+        conn: &rusqlite::Connection,
+        txid: &str,
+        topics: &str,
+        now: i64,
+    ) -> std::result::Result<Parked, String> {
+        let m = serde_json::to_string(&msg("AA==", &[topics])).unwrap();
+        if run(
+            conn,
+            &park_query(txid, topics, &m, FAULT_UNRECORDED, 0, now),
+        ) == 1
+        {
+            return Ok(Parked::Park(0, None));
+        }
+        unparked(Some(&ceiling_row(conn, txid, topics, now)))
+    }
+
+    fn seed(conn: &rusqlite::Connection, n: u64, prefix: &str, class: LetterClass, parked_at: i64) {
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..n {
+            tx.execute(
+                "INSERT INTO mutation_dead_letters (txid, topics, message, status, first_seen_at, parked_at, class) VALUES (?1, 't', '{}', 'parked', 1, ?2, ?3)",
+                rusqlite::params![format!("{prefix}{i}"), parked_at, class.as_str()],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    /// D3-L1 (the delta-3 fold): the bounds are re-read by the park's own statement. Consumers that all read room
+    /// before any parked (the delta-3 lens's `d3_p1`: 3 letters of one txid, a share of 1004) park ONE letter into
+    /// that room; the others get no row and are the deferral they now are. Every DLQ consumer is one consumer.
+    #[test]
+    fn e576f4_l1_interleaved_parks_never_overshoot_a_bound() {
+        const DAY: i64 = 86_400_000;
+        // one txid, three topic sets, three reads of room, then three parks
+        let conn = db();
+        let now = 10 * DAY;
+        for t in ["tm_a", "tm_b", "tm_c"] {
+            assert_eq!(
+                read_then(&conn, "aa", t, LetterClass::NotNow, now),
+                Ok(None)
+            );
+        }
+        assert_eq!(
+            park_now(&conn, "aa", "tm_a", now),
+            Ok(Parked::Park(0, None))
+        );
+        for t in ["tm_b", "tm_c"] {
+            assert_eq!(
+                park_now(&conn, "aa", t, now),
+                Ok(Parked::NotNowBound(Deferral::NotNowTxid(1))),
+                "{t}"
+            );
+        }
+        assert_eq!(held_by_class(&conn, LetterClass::NotNow), 1);
+        // the share: 999 held (older than a day), five reads of room, five parks
+        let conn = db();
+        seed(&conn, NOT_NOW_MAX - 1, "old", LetterClass::NotNow, 1);
+        for i in 0..5 {
+            assert!(read_then(&conn, &format!("s{i}"), "t", LetterClass::NotNow, now).is_ok());
+        }
+        let parked = (0..5)
+            .filter(|i| park_now(&conn, &format!("s{i}"), "t", now) == Ok(Parked::Park(0, None)))
+            .count();
+        assert_eq!(parked, 1);
+        assert_eq!(
+            held_by_class(&conn, LetterClass::NotNow),
+            NOT_NOW_MAX,
+            "not 1004"
+        );
+        assert_eq!(
+            unparked(Some(&ceiling_row(&conn, "s4", "t", now))),
+            Ok(Parked::NotNowBound(Deferral::NotNowShare(NOT_NOW_MAX)))
+        );
+        // the day: 199 parked today, three reads, three parks
+        let conn = db();
+        seed(
+            &conn,
+            NOT_NOW_PER_DAY - 1,
+            "today",
+            LetterClass::NotNow,
+            now - 5,
+        );
+        for i in 0..3 {
+            assert!(read_then(&conn, &format!("d{i}"), "t", LetterClass::NotNow, now).is_ok());
+        }
+        assert_eq!(park_now(&conn, "d0", "t", now), Ok(Parked::Park(0, None)));
+        assert_eq!(
+            park_now(&conn, "d1", "t", now),
+            Ok(Parked::NotNowBound(Deferral::NotNowDay(NOT_NOW_PER_DAY)))
+        );
+        // the whole ceiling, any class: 1999 held, two fault letters read room
+        let conn = db();
+        seed(&conn, PARKED_ROWS_CEILING - 1, "f", LetterClass::Fault, 1);
+        for k in ["x", "y"] {
+            assert!(read_then(&conn, k, "t", LetterClass::Fault, now).is_ok());
+        }
+        assert_eq!(park_now(&conn, "x", "t", now), Ok(Parked::Park(0, None)));
+        assert_eq!(
+            park_now(&conn, "y", "t", now),
+            Ok(Parked::Ceiling(PARKED_ROWS_CEILING))
+        );
+        // a held key still parks at the full ceiling (a copy: the longer bytes), and the same bytes again are a
+        // redelivery, not a deferral
+        let longer = serde_json::to_string(&msg("AAAAAAAA", &["t"])).unwrap();
+        assert_eq!(
+            run(
+                &conn,
+                &park_query("x", "t", &longer, FAULT_UNRECORDED, 0, now + 1)
+            ),
+            1
+        );
+        assert_eq!(
+            run(
+                &conn,
+                &park_query("x", "t", &longer, FAULT_UNRECORDED, 0, now + 2)
+            ),
+            0
+        );
+        assert_eq!(
+            unparked(Some(&ceiling_row(&conn, "x", "t", now + 2))),
+            Ok(Parked::Redelivery)
+        );
+        // a refusal whose room freed again since is handed back, never acked as a redelivery
+        run(&conn, &discard_query("f0", None, 1));
+        assert!(unparked(Some(&ceiling_row(&conn, "y", "t", now + 3))).is_err());
+        assert!(unparked(None).is_err());
+        // the statement's literals are the constants
+        for bound in [
+            format!("('parked', 'redriven')) < {PARKED_ROWS_CEILING} "),
+            format!("('parked', 'redriven')) < {NOT_NOW_PER_TXID} "),
+            format!("('parked', 'redriven')) < {NOT_NOW_MAX} "),
+            format!("parked_at >= ?7) < {NOT_NOW_PER_DAY}))"),
+        ] {
+            assert!(PARK_SQL.contains(&bound), "{bound}");
+        }
+        // the park's no-row arm asks the re-read
+        let src = include_str!("dead_letters.rs");
+        let park = &src[src.find("async fn park_one(").unwrap()..];
+        let park = &park[..park.find("\n}\n").unwrap()];
+        assert!(park.contains("return unparked(again.as_ref());"));
+        // one consumer of every DLQ
+        let low = include_str!("../wrangler.low.toml");
+        let generic = include_str!("../wrangler.toml");
+        for (cfg, dlq) in [
+            (low, "low-overlay-mutations-dlq"),
+            (low, "low-overlay-mutations-beta-dlq"),
+            (generic, "overlay-mutations-dlq"),
+        ] {
+            assert_eq!(
+                consumer_block(cfg, dlq)
+                    .get("max_concurrency")
+                    .map(String::as_str),
+                Some("1"),
+                "{dlq}: max_concurrency"
+            );
+        }
+    }
+
+    /// D3-L2: every failed replay path of the main consumer notes a class, and only the engine's report can make it
+    /// "not now": every other hand-back (bad base64, no subject, the two ledger faults, a submit `Err`) is a fault
+    /// letter; the engine's not-now site is the constant's.
+    #[test]
+    fn e576f4_l2_every_failed_replay_path_notes_its_class() {
+        let src = include_str!("lib.rs");
+        let start = src.find("async fn queue_handler(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let calls: Vec<&str> = body
+            .split("crate::dead_letters::note_failing(")
+            .skip(1)
+            .map(|c| &c[..c.find(".await").unwrap()])
+            .collect();
+        assert_eq!(
+            calls.len(),
+            6,
+            "bad base64, no subject, two ledger faults, not durable, failed"
+        );
+        let of_report =
+            "crate::dead_letters::LetterClass::of_sites(report.faults.iter().map(|f| f.site))";
+        let mut by_report = 0;
+        for c in &calls {
+            if c.contains(of_report) {
+                assert!(c.contains("\"not durable: {}\""), "{c}");
+                by_report += 1;
+            } else {
+                assert!(c.contains("crate::dead_letters::LetterClass::Fault"), "{c}");
+            }
+        }
+        assert_eq!(by_report, 1);
+        assert!(
+            !src.contains("LetterClass::NotNow"),
+            "the main consumer never names not-now itself"
+        );
+        let engine = include_str!("../../overlay-engine/src/engine.rs");
+        assert!(engine.contains(&format!("report.fault(topic, \"{SITE_NOT_NOW}\"")));
+    }
+
+    /// D3-L2: the last note wins, in both directions (an honest letter whose last replay faulted at storage leaves
+    /// the not-now share); a parked letter's class is not moved by a note.
+    #[test]
+    fn e576f4_l2_the_last_note_wins() {
+        let conn = db();
+        let class = |txid: &str| -> String {
+            conn.query_row(
+                "SELECT class FROM mutation_dead_letters WHERE txid = ?1",
+                [txid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        for (txid, seq, last) in [
+            (
+                "a",
+                vec![LetterClass::NotNow, LetterClass::NotNow, LetterClass::Fault],
+                "fault",
+            ),
+            (
+                "b",
+                vec![LetterClass::Fault, LetterClass::NotNow],
+                "not_now",
+            ),
+            (
+                "c",
+                vec![LetterClass::Fault, LetterClass::NotNow, LetterClass::Fault],
+                "fault",
+            ),
+        ] {
+            for (i, c) in seq.iter().enumerate() {
+                run(
+                    &conn,
+                    &note_failing_query(txid, "t", "f", 10 + i as i64, *c),
+                );
+            }
+            assert_eq!(class(txid), last, "{txid}");
+            assert_eq!(ceiling_row(&conn, txid, "t", 100).class, last);
+        }
+        let m = serde_json::to_string(&msg("AA==", &["t"])).unwrap();
+        run(&conn, &park_query("a", "t", &m, FAULT_UNRECORDED, 0, 200));
+        run(
+            &conn,
+            &note_failing_query("a", "t", "f", 300, LetterClass::NotNow),
+        );
+        assert_eq!(class("a"), "fault", "a parked row is not touched by a note");
+    }
+
+    /// D3-L2: the migration makes every row that predates it a FAULT letter, whatever its status, and runs once.
+    #[test]
+    fn e576f4_l2_the_migration_makes_existing_rows_fault_letters() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute(DEAD_LETTERS_CREATE, []).unwrap();
+        for (k, st) in [("p", "parked"), ("f", "failing"), ("r", "redriven")] {
+            conn.execute(
+                "INSERT INTO mutation_dead_letters (txid, topics, message, status, first_seen_at, parked_at) VALUES (?1, 't', '{}', ?2, 1, 1)",
+                rusqlite::params![k, st],
+            )
+            .unwrap();
+        }
+        conn.execute(DEAD_LETTERS_CLASS_COLUMN, []).unwrap();
+        conn.execute(DEAD_LETTERS_CLASS_INDEX, []).unwrap();
+        let classes: Vec<String> = conn
+            .prepare("SELECT class FROM mutation_dead_letters ORDER BY txid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(classes, vec!["fault"; 3]);
+        assert_eq!(ceiling_row(&conn, "f", "t", 10).class, "fault");
+        let again = conn
+            .execute(DEAD_LETTERS_CLASS_COLUMN, [])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            crate::d1::migration_error_is_benign(DEAD_LETTERS_CLASS_COLUMN, &again),
+            "{again}"
+        );
+        let m = include_str!("d1/mod.rs");
+        let at = |k: &str| m.find(&format!("crate::dead_letters::{k},")).unwrap();
+        assert!(at("DEAD_LETTERS_CREATE") < at("DEAD_LETTERS_CLASS_COLUMN"));
+    }
+
+    /// D3-L2: the health block's two classes over the real read: each class's held letters and the not-now letters
+    /// of the last 24 h (parked letters a day old and more, and failing notes, are not counted); the health and the
+    /// park share one cutoff.
+    #[test]
+    fn e576f4_l2_the_health_reads_both_classes_and_the_day() {
+        const DAY: i64 = 86_400_000;
+        let now = 10 * DAY;
+        assert_eq!(day_cutoff(now), now - DAY);
+        let conn = db();
+        seed(&conn, 7, "f", LetterClass::Fault, now - 1);
+        seed(&conn, 5, "old", LetterClass::NotNow, now - DAY - 1);
+        seed(&conn, 3, "new", LetterClass::NotNow, now - DAY);
+        run(
+            &conn,
+            &note_failing_query("note", "t", "f", now, LetterClass::NotNow),
+        );
+        let mut stmt = conn.prepare(HEALTH_CLASSES_SQL).unwrap();
+        let read: Vec<ClassCountRow> = stmt
+            .query_map([day_cutoff(now)], |r| {
+                Ok(ClassCountRow {
+                    class: r.get(0)?,
+                    c: r.get::<_, i64>(1)? as f64,
+                    recent: r.get::<_, Option<i64>>(2)?.map(|v| v as f64),
+                })
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(class_counts(&read), (7, 8, 3));
+        assert_eq!(class_counts(&[]), (0, 0, 0));
+        let j = classes_json(7, 8, 3);
+        assert_eq!(
+            (
+                j["fault"]["held"].clone(),
+                j["notNow"]["held"].clone(),
+                j["notNow"]["parkedLast24h"].clone()
+            ),
+            (7.into(), 8.into(), 3.into())
+        );
+        assert_eq!(j["fault"]["room"], PARKED_ROWS_CEILING - 15);
+        // the wiring: the health block binds the same cutoff and serves what class_counts read
+        let src = include_str!("dead_letters.rs");
+        let h = &src[src.find("pub async fn health_json(").unwrap()..];
+        let h = &h[..h.find("\n}\n").unwrap()];
+        assert_eq!(h.matches(".bind(day_cutoff(now))").count(), 2);
+        assert!(h.contains("let (fault_held, not_now_held, not_now_day) = class_counts(&classes);"));
+        assert!(h.contains("\"classes\": classes_json(fault_held, not_now_held, not_now_day),"));
+        // ... and so do the park and its ceiling read
+        let park = &src[src.find("async fn park_one(").unwrap()..];
+        let park = &park[..park.find("\n}\n").unwrap()];
+        assert_eq!(park.matches("day_cutoff(now)").count(), 2);
+        let pq = &src[src.find("pub fn park_query(").unwrap()..];
+        assert!(pq[..pq.find("\n}\n").unwrap()].contains(".bind(day_cutoff(now_ms))"));
+    }
+
+    /// D3-L2: each deferral is counted under its own class's counter only, and the per-txid bound counts only
+    /// "not now" letters of the txid (a fault letter of the same txid does not hold its place).
+    #[test]
+    fn e576f4_l2_each_deferral_counts_under_its_class() {
+        let src = include_str!("dead_letters.rs");
+        let body = &src[src.find("pub async fn park_batch(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let ceiling = &body[body.find("Ok(Parked::Ceiling(held)) => {").unwrap()
+            ..body.find("Ok(Parked::NotNowBound(d)) => {").unwrap()];
+        let not_now = &body[body.find("Ok(Parked::NotNowBound(d)) => {").unwrap()
+            ..body.find("Err(e) => e,").unwrap()];
+        assert!(ceiling.contains("COUNTER_DEAD_LETTERS_CEILING_DEFERRALS"));
+        assert!(!ceiling.contains("NOT_NOW"));
+        assert!(not_now.contains("COUNTER_DEAD_LETTERS_NOT_NOW_DEFERRALS"));
+        assert!(!not_now.contains("CEILING"));
+        let conn = db();
+        let now = 1_000_000;
+        assert_eq!(
+            dies(&conn, "cc", "tm_x", LetterClass::Fault, "AA==", now),
+            Ok(None)
+        );
+        assert_eq!(
+            dies(&conn, "cc", "tm_y", LetterClass::NotNow, "AA==", now + 1),
+            Ok(None),
+            "a fault letter of the txid holds no not-now place"
+        );
+        assert_eq!(
+            dies(&conn, "cc", "tm_z", LetterClass::NotNow, "AA==", now + 2),
+            Err(Deferral::NotNowTxid(1))
+        );
+        assert_eq!(
+            dies(&conn, "cc", "tm_w", LetterClass::Fault, "AA==", now + 3),
+            Ok(None)
+        );
+        let held: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mutation_dead_letters WHERE txid = 'cc' AND status = 'parked'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(held, 3, "the park's own bound agrees: tm_x, tm_y and tm_w");
+    }
+
+    /// D3-L2: the operator's discard takes parked letters of BOTH classes, and the room it frees is each class's.
+    #[test]
+    fn e576f4_l2_the_discard_spans_both_classes() {
+        let conn = db();
+        let now = 1_000_000;
+        assert_eq!(
+            dies(&conn, "dd", "tm_a", LetterClass::NotNow, "AA==", now),
+            Ok(None)
+        );
+        for t in ["tm_b", "tm_c"] {
+            assert_eq!(
+                dies(&conn, "dd", t, LetterClass::Fault, "AA==", now + 1),
+                Ok(None)
+            );
+        }
+        assert_eq!(
+            dies(&conn, "dd", "tm_d", LetterClass::NotNow, "AA==", now + 2),
+            Err(Deferral::NotNowTxid(1))
+        );
+        assert_eq!(
+            rows(
+                &conn,
+                &discard_query("dd", Some("tm_a"), DISCARD_MAX_LETTERS)
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            dies(&conn, "dd", "tm_d", LetterClass::NotNow, "AA==", now + 3),
+            Ok(None),
+            "the discarded not-now letter freed its txid's place"
+        );
+        let gone = rows(&conn, &discard_query("dd", None, DISCARD_MAX_LETTERS));
+        let mut keys: Vec<&str> = gone.iter().map(|r| r[1].as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["tm_b", "tm_c", "tm_d"]);
+        assert_eq!(
+            (
+                held_by_class(&conn, LetterClass::Fault),
+                held_by_class(&conn, LetterClass::NotNow)
+            ),
+            (0, 0)
+        );
+    }
+
+    /// D3-L3 (the delta-3 fold): a LOST letter is counted by its class, so `dead_letters_lost_total` keeps meaning
+    /// an honest loss; both counters are served from 0; the class is the ceiling read's (a fault when unread).
+    #[test]
+    fn e576f4_l3_lost_is_counted_by_class() {
+        assert_eq!(
+            LetterClass::NotNow.lost_counter(),
+            "dead_letters_lost_not_now_total"
+        );
+        assert_eq!(LetterClass::Fault.lost_counter(), "dead_letters_lost_total");
+        assert_eq!(LetterClass::of_column("not_now"), LetterClass::NotNow);
+        assert_eq!(LetterClass::of_column("fault"), LetterClass::Fault);
+        assert_eq!(
+            LetterClass::of_column(""),
+            LetterClass::Fault,
+            "an unknown is honest"
+        );
+        let ops = include_str!("ops.rs");
+        assert!(ops.contains(
+            "        COUNTER_DEAD_LETTERS_LOST,\n        COUNTER_DEAD_LETTERS_LOST_NOT_NOW,\n"
+        ));
+        let src = include_str!("dead_letters.rs");
+        let park = &src[src.find("async fn park_one(").unwrap()..];
+        let park = &park[..park.find("\n}\n").unwrap()];
+        assert!(park.contains("*class = LetterClass::of_column(&c.class);"));
+        let body = &src[src.find("pub async fn park_batch(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("let mut class = LetterClass::Fault;"));
+        let fault_path = &body[body.find("let plan = dlq_retry_plan(attempts);").unwrap()..];
+        assert!(
+            fault_path.contains("sha256={} class={}") && fault_path.contains("class.as_str(),")
+        );
+        assert!(fault_path.contains("bump_counter(db, class.lost_counter(), 1)"));
+        assert!(!fault_path.contains("COUNTER_DEAD_LETTERS_LOST,"));
     }
 }

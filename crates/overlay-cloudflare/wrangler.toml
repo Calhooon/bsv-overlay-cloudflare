@@ -109,6 +109,9 @@ queue = "overlay-mutations-dlq"
 max_batch_size = 10
 max_retries = 100
 retry_delay = 300
+# bsv-low #576 (the delta-3 fold, D3-L1): ONE consumer, so the not-now bounds and the ceiling are not
+# overshot by consumers reading the same room at once (the park also re-reads them in its own statement)
+max_concurrency = 1
 
 [triggers]
 crons = ["*/15 * * * *"]

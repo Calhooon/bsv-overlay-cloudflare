@@ -189,7 +189,12 @@ pub const COUNTER_DEAD_LETTERS_REDRIVEN: &str = "dead_letters_redriven_total";
 pub const COUNTER_DEAD_LETTERS_STILL_FAILING: &str = "dead_letters_still_failing_total";
 /// bsv-low #576 (lens fold, H1): a dead letter whose park faulted on its LAST DLQ delivery: the platform drops it
 /// (logged `[dead-letters] LOST` with its key and the sha256 of its bytes). Best effort: D1 is usually what faulted.
+/// Since the delta-3 fold (D3-L3) a FAULT letter only, or one whose class was not read: the honest loss to alarm on.
 pub const COUNTER_DEAD_LETTERS_LOST: &str = "dead_letters_lost_total";
+/// bsv-low #576 (the delta-3 fold, D3-L3): a "not now" letter LOST (deferred at a bound or at the ceiling for its
+/// ~48 h, or its park faulting): the designed fate of a stranger's flood's tail, counted apart from
+/// [`COUNTER_DEAD_LETTERS_LOST`].
+pub const COUNTER_DEAD_LETTERS_LOST_NOT_NOW: &str = "dead_letters_lost_not_now_total";
 /// bsv-low #576 (lens fold, M2): a new LETTER not parked because the table holds the ceiling of letters with bytes
 /// ([`crate::dead_letters::PARKED_ROWS_CEILING`]); it is handed back to the DLQ with backoff, never acked. Counted
 /// once per letter, on its first DLQ delivery (`attempts == 1`; the delta fold, D-L1: it counted every delivery).
@@ -898,6 +903,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_DEAD_LETTERS_REDRIVEN,
         COUNTER_DEAD_LETTERS_STILL_FAILING,
         COUNTER_DEAD_LETTERS_LOST,
+        COUNTER_DEAD_LETTERS_LOST_NOT_NOW,
         COUNTER_DEAD_LETTERS_CEILING_DEFERRED,
         COUNTER_DEAD_LETTERS_CEILING_DEFERRALS,
         COUNTER_DEAD_LETTERS_DISCARDED,
