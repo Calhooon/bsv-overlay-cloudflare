@@ -1336,6 +1336,115 @@ put back in place, the tests over them):
 The worker's sources did not change: the three shipped peer-health statements
 are `2c8ab50`'s, and the rule is the engine's (a call it does not make).
 
+### The assembly and the two limbs (bsv-low #586, zanaadu-v2 #377)
+
+The measured case (Zanaadu, 2026-10-09): the two Worker memory kills of the
+e1d bootstrap came after the anchor check of an UNMINED graph. An unproven
+node asks for every input, so a transaction is a node once per output index
+spent, and `get_beef_for_node` rebuilt a shared ancestor once per REFERENCE: a
+`source_transaction` tree by recursion, a cloned subtree per parent, each
+`Transaction` holding its parse, its raw bytes and its hex, serialized at
+every level. The cost followed the graph's PATHS: 13 nodes, 659 KB fetched,
+24.1 MB native (36x), doubling with every unproven link of a chain whose
+transactions spend two outputs of the one before (a covenant output and the
+change, a wallet's ordinary second spend).
+
+**The assembly rule.** A node's BEEF is assembled from the graph's raw
+transactions and proofs parsed ONCE each (`gasp_overlay.rs` `GraphAssembly`):
+a transaction is parsed once per graph (keyed by its bytes), a node names its
+sources by KEY, and the BEEF is the walk `Transaction::to_beef` made over the
+hydrated tree (bsv-rs `collect_ancestors`: depth first, inputs from the last
+to the first, a proven node a leaf, a txid once, proofs deduplicated by height
+and root) made over the keys, then the SDK's own `Beef` (`merge_bump`,
+`merge_transaction`, `to_binary`, whose sort is the SDK's). Nothing is
+hydrated. The bytes are the ones the tree gave, for every graph. The anchor
+check assembles ONE node's BEEF at a time for its replay and drops it (it held
+them all), and keeps the checked assembly for `finalize_graph`, so a graph is
+parsed once; anything that changes or discards a pending graph drops it. The
+walks are explicit stacks (the recursion used the stack once per unproven
+link) and a link back into a node being walked ends there (the root is filed
+under the graph id the PEER names, so the recursion could be made not to
+return; reasoned, not run on the base).
+
+The witness, `tests/gasp_fanin_memory.rs` (`e586_a`): the peak growth of the
+LIVE HEAP (a counting global allocator, native, debug profile) inside
+`validate_graph_anchor` and `finalize_graph`, through the real walk and
+adapter, over unmined ~26 KB transactions whose bottom spends held coins:
+
+| graph | fetched | anchor check, base | now | finalize net of its BEEFs, base | now |
+|---|---|---|---|---|---|
+| the diamond chain (7 transactions, 13 nodes, 23 requests) | 600,934 | 29,505,006 (49.10x) | 2,146,543 (3.57x) | 24.32x | 0.97x |
+| a layered fan-in (13 transactions, 37 nodes, 85 requests) | 2,221,528 | 25,872,174 (11.65x) | 4,771,057 (2.15x) | 5.70x | 0.51x |
+| the diamond chain, 13 links (25 nodes, 47 requests) | 1,228,006 | not run (64 times the 7-link tree) | 4,078,103 (3.32x) | | 0.91x |
+
+The pin is at most 4.0x and 1.5x, and the digests of the finalized BEEFs,
+frozen on `fbb7fa8`. What is left, stated: a parsed `Transaction` is 2.0x its
+raw bytes (52,860 for 26,118: the SDK keeps the raw bytes beside the parse);
+the anchor's Bitcoin check and the replay hand the SDK one BEEF, whose linked
+form holds a transaction once per REFERENCE (a full link and bare stubs,
+linear in the references, bsv-rs `add_input_proof`); and the finalize hands on
+one BEEF per NODE, each holding its whole unproven ancestry (1,280,389 bytes
+for the diamond's 182,886 of raw transactions; the sum grows with the square
+of an unproven chain's depth). That last is the shape of the submit, one BEEF
+per transaction, in the reference too. The reference
+(`OverlayGASPStorage.ts` `getBEEFForNode`, f999e0c1a) hydrates as the base
+did, a node parsed again for every input that reaches it, so it has the same
+multiplier; its `computeOrderedBEEFsForGraph` means to drop a repeated BEEF
+(`beefs.includes(currentBEEF)`) and compares arrays by identity, so it drops
+none, as here. The ORDER of sibling BEEFs is the order of a `HashMap`
+(`GASPNodeResponse::requested_inputs`), run to run, before and after; a
+source is always finalized before its spender.
+
+**The two limbs.** The per-graph budget counts two more things per pass
+beside its calls and its time (`GraphBudget::max_bytes_fetched`,
+`max_nodes`; `Engine::set_graph_budget_limbs`, the defaults in force with
+`set_graph_budget`): the BYTES a graph's walk is served
+(`DEFAULT_GRAPH_BUDGET_BYTES`, 4 MiB: the hex of each node's raw transaction
+and proof, as the peer sends it and as a record keeps it, every answer
+counted, a repeat too) and the NODES it appends
+(`DEFAULT_GRAPH_BUDGET_NODES`, 64). The worker names them
+`GASP_GRAPH_BUDGET_BYTES` and `GASP_GRAPH_BUDGET_NODES` (`gasp_deferred.rs`,
+the engine's defaults) and serves them as `budget.bytesFetched` and
+`budget.nodes`. A limb reached DEFERS the graph exactly as the call budget
+does (reasons `bytes`, `nodes`): the record saved, the UTXO held below the
+cursor, the walk resumed by the next pass from what is pending. Never a drop,
+a refusal or a discarded graph: a budget PER PASS, not a limit on a graph or
+a BEEF (the owner's ruling of 2026-10-09). A limb is read BEFORE a step, so a
+pass always makes one request: a node bigger than the whole limb is walked,
+one a pass. The resumes of one sync share the limbs as they share the calls
+(M1); a walk the limbs cut that cannot be KEPT goes on under the per-peer
+budget alone (L4). The reference has no budget.
+
+Limits, stated. (1) The record's cap is still 1 MiB (`DEFERRED_GRAPH_MAX_BYTES`,
+bsv-low #585), under the bytes limb's 4 MiB: a pass the bytes limb cuts whose
+APPENDED nodes weigh more than 1 MiB cannot be kept (`too_big`) and goes on
+(L4), as before, so at the defaults the bytes limb defers only a pass most of
+whose bytes were repeats, and 64 nodes of 26 KB (3.3 MiB of hex) are not kept
+either. Until #585 lifts the cap, a caller that wants every such graph
+deferred sets the limbs under it. (2) The walk asks an outpoint again for
+every parent that reaches it and drops the answer as seen AFTER the request
+(85 requests for the fan-in's 37 nodes), as the reference does; the calls and
+the bytes are charged for them. (3) A FRESH walk that faults has PAID for a
+record at half its calls or half its time (D2-L1), not at half a limb.
+(4) Bytes are charged when a node is served, a node when its step commits: a
+step the deadline drops has its bytes charged and its node asked again.
+(5) The witness is native; wasm32 was not measured here (Zanaadu's figure was
+13.4 MiB for the 24.1 MB). (6) A record's nodes are a second copy of the
+pending graph's while a walk is in hand (before and after).
+
+Pins: `cargo test -p bsv-overlay-engine --test gasp_fanin_memory --
+--nocapture` (`e586_a`, RED on `fbb7fa8`: 49.10x); `--lib e586` (the
+assembly against the recursion kept verbatim, 3,097 BEEFs and 385 refusals
+over 600 random graphs, tolerant and strict; the refusals' words; a
+20,000-link chain and a cycle); `--test gasp_topic_manager e586` (`e586_b` a
+graph past the bytes limb defers and completes over two passes, `e586_c` the
+same for nodes, `e586_d` a node bigger than the limb is walked one a pass and
+two resumes share one limb, `e586_e` a record holds raw nodes, no BEEF, and
+weighs 1.0059x what was fetched; `Engine::set_graph_budget_limbs` does not
+exist on `fbb7fa8`; RED against the limbs made inert and against the resumes
+not sharing them). The frozen digests of pin D, the `i551_*` and the `e555*`
+families hold unchanged.
+
 ## Storage ownership (bsv-low #474)
 
 The overlay and the app layer share ONE D1 per environment (`OVERLAY_DB`).

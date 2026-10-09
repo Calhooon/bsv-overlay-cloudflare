@@ -2414,7 +2414,7 @@ impl<'a> GASPSync<'a> {
         // 2-tx-pattern template, or a covenant's previous UTXO). Without this,
         // the walk reaches a spent input whose output
         // record exists in storage (so `find_needed_inputs` strips it) but whose tx
-        // is absent from the in-memory graph, so `get_beef_for_node` fails "Missing
+        // is absent from the in-memory graph, so the node's BEEF fails "Missing
         // source transaction" and the whole graph is discarded. Legacy beta's
         // GASP-serve omits proofs, so this is required cross-stack. No-op when no
         // fetcher is configured (production default unchanged) or the node already

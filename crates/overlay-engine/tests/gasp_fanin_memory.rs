@@ -330,7 +330,10 @@ impl GASPStorage for Measuring<'_> {
         let verdict = self.inner.validate_graph_anchor(graph_id).await;
         let mut m = self.measured.borrow_mut();
         m.anchor_peak = peak_over(entry);
-        m.anchor = Some(verdict.as_ref().map(|()| ()).map_err(ToString::to_string));
+        m.anchor = Some(match &verdict {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        });
         verdict
     }
     async fn finalize_graph(&self, graph_id: &str) -> Result<(), GASPError> {
