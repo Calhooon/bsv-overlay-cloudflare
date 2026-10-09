@@ -153,7 +153,8 @@ const y2 = y(false)
 const y3 = y(true)
 expect(
   y1?.yieldless_syncs === 1 && y1?.secsSinceFirst === 0 && y2?.yieldless_syncs === 2 && y2?.secsSinceFirst >= 3600 &&
-    y3?.yieldless_syncs === 0 && y3?.secsSinceFirst === null,
+    // `wrangler d1 execute --json` renders every SQL NULL as the string "null" (`SELECT NULL` included).
+    y3?.yieldless_syncs === 0 && (y3?.secsSinceFirst === null || y3?.secsSinceFirst === 'null'),
   'the shipped yield upsert on local D1: the count, the age from the first, a yield ends it',
   JSON.stringify([y1, y2, y3]),
 )
