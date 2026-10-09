@@ -2,7 +2,7 @@
 /**
  * bsv-low #585, door 3 (lane E585-d3): a queued replay whose message would pass the queue's inline room rides BY
  * KEY, its BEEF in R2 (`BEEF_BLOBS`), at the route, on a real (local) queue, D1 and R2. Part of `make ci-route`
- * (through `make ci-d1-budget`, after the dead-letter cell, on the same overlay worker, which is started with
+ * (through `make ci-d1-budget`, the LAST cell, after the dead-letter and deferred-graph cells, on the same overlay worker, which is started with
  * `MUTATION_QUEUE_INLINE_ROOM:4096` so an 8 KB body takes the R2 path under the consumer's policy as it stands).
  *
  *  0. `/health/invariants.deadLetters.r2`: the bucket bound, the room in force, the consumer's policy.
@@ -24,6 +24,9 @@
  *     `queue_r2_twin_acked_total` moved.
  *  7. The SWEEP under `wrangler dev --test-scheduled` (`/__scheduled`): a young object is untouched, the
  *     `beef_blob_sweep` row advanced (`last_pass_at`), `/health/invariants.queue.r2.atRest` served.
+ *     The tick runs WHOLE and goes on in the background past the leg (its GASP step syncs the worker's hard-coded
+ *     peers over the network and defers real graphs), so this cell is the LAST of `ci-d1-budget` (the d3 fold-3).
+ *     Its object is put with NO custom metadata on purpose (E585-D3-DELTA-M1).
  *  8. A put TWICE (N2 (b)): the same "not now" bytes presented twice write one key twice, and its
  *     `customMetadata.touched` stamp MOVED (read from the local bucket's own store); whether `uploaded` moved too is
  *     printed as a NOTE (the sweep no longer depends on it).
@@ -34,7 +37,7 @@
  * Exit 0 = every expectation held.
  */
 import { createHash, randomFillSync } from 'node:crypto'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { readdirSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
@@ -114,39 +117,54 @@ async function lever(body, route = '/internal/redrive-dead-letters') {
   try { json = JSON.parse(text) } catch {}
   return { status: res.status, text, json }
 }
-function d1(sql) {
-  const out = execFileSync(
-    'npx',
-    ['wrangler', 'd1', 'execute', 'OVERLAY_DB', '--local', '--persist-to', STATE, '--json', '--command', sql],
-    { cwd: CRATE, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
-  )
-  return JSON.parse(out)[0]?.results ?? []
-}
-/** The local bucket's object under `key`, or null when it holds none. */
-function r2get(key) {
-  try {
-    return execFileSync('npx', ['wrangler', 'r2', 'object', 'get', `${BUCKET}/${key}`, '--local', '--persist-to', STATE, '--pipe'], {
-      cwd: CRATE,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      maxBuffer: 64 * 1024 * 1024,
-    })
-  } catch {
-    return null
+/**
+ * One `npx wrangler ...` call (the d3 fold-3, E585-D3-DELTA-M2). Each call starts a second Miniflare over the running
+ * dev server's persist dir, which can fail on its own (a lock, a slow start): the call is made up to `CLI_TRIES`
+ * times with a growing pause, and on the last failure it THROWS with the child's status and its stderr IN FULL, so
+ * the FAIL line names the cause (the fold-2's cell piped stderr away and printed one line of `e.message`).
+ * `isNotFound(result)` lets a caller take a definite answer (r2get's "no such object") as a result, never a retry.
+ */
+const CLI_TRIES = Number(process.env.E585_CLI_TRIES ?? 4)
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+function cli(args, { isNotFound } = {}) {
+  let last
+  for (let attempt = 1; attempt <= CLI_TRIES; attempt++) {
+    const r = spawnSync('npx', ['wrangler', ...args], { cwd: CRATE, maxBuffer: 64 * 1024 * 1024 })
+    const out = { status: r.status, stdout: r.stdout ?? Buffer.alloc(0), stderr: `${r.stderr ?? ''}`, error: r.error }
+    if (!r.error && r.status === 0) return out
+    if (!r.error && isNotFound?.(out)) return { ...out, notFound: true }
+    last = out
+    if (attempt < CLI_TRIES) sleepSync(750 * attempt)
   }
+  throw new Error(
+    `npx wrangler ${args.join(' ')} failed ${CLI_TRIES} times; last: status ${last.status}${last.error ? ` (${last.error.message})` : ''}\n` +
+      `--- its stderr ---\n${last.stderr}--- its stdout ---\n${last.stdout.toString().slice(0, 2000)}`,
+  )
+}
+function d1(sql) {
+  const out = cli(['d1', 'execute', 'OVERLAY_DB', '--local', '--persist-to', STATE, '--json', '--command', sql])
+  return JSON.parse(out.stdout.toString('utf8'))[0]?.results ?? []
+}
+/**
+ * The local bucket's object under `key`, or null when it holds NONE: wrangler's own not-found answer ("The specified
+ * key does not exist.", its local `get`'s `UserError`). Any other failure is a failed call and THROWS (a FAIL), so
+ * legs 2, 4 and 5 assert a deletion only on a true not-found, never on a CLI that did not answer.
+ */
+const R2_NOT_FOUND = /The specified key does not exist/
+function r2get(key) {
+  const r = cli(['r2', 'object', 'get', `${BUCKET}/${key}`, '--local', '--persist-to', STATE, '--pipe'], {
+    isNotFound: (o) => R2_NOT_FOUND.test(o.stderr) || R2_NOT_FOUND.test(o.stdout.toString('utf8')),
+  })
+  return r.notFound ? null : r.stdout
 }
 function r2del(key) {
-  execFileSync('npx', ['wrangler', 'r2', 'object', 'delete', `${BUCKET}/${key}`, '--local', '--persist-to', STATE], {
-    cwd: CRATE,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  cli(['r2', 'object', 'delete', `${BUCKET}/${key}`, '--local', '--persist-to', STATE])
 }
+/** Writes `bytes` under `key` with NO custom metadata (see leg 7). */
 function r2put(key, bytes) {
   const file = `${STATE}/e585f2-put.bin`
   writeFileSync(file, bytes)
-  execFileSync('npx', ['wrangler', 'r2', 'object', 'put', `${BUCKET}/${key}`, '--file', file, '--local', '--persist-to', STATE], {
-    cwd: CRATE,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  cli(['r2', 'object', 'put', `${BUCKET}/${key}`, '--file', file, '--local', '--persist-to', STATE])
 }
 /** The local bucket's own row of the object whose key starts with `prefix` (miniflare's `_mf_objects`). */
 function r2meta(prefix) {
@@ -345,8 +363,12 @@ if (E.row) {
 
 // 7. The sweep, through the scheduled event (`wrangler dev --test-scheduled`).
 {
+  // The object is put WITHOUT custom metadata ON PURPOSE (the d3 fold-3, E585-D3-DELTA-M1): an unstamped object (an
+  // operator's CLI put, one written before the stamp) is the one whose metadata read could throw through wasm and
+  // wedge the scheduled tick before its GASP step. Locally miniflare answers `{}` for it, so this leg shows the pass
+  // runs over it and ages it by `uploaded`; the platform's own answer is the beta check of the fold-3 REPORT.
   const young = `mutations/${'e5'.repeat(32)}/${'0'.repeat(32)}`
-  r2put(young, Buffer.from('a young object nothing names'))
+  r2put(young, Buffer.from('a young object nothing names, with no customMetadata'))
   const before = d1('SELECT last_pass_at FROM beef_blob_sweep WHERE id = 1')[0]?.last_pass_at ?? 0
   const t0 = Date.now()
   fetch(OVERLAY + '/__scheduled?cron=' + encodeURIComponent('*/15 * * * *'), { headers: { Connection: 'close' }, signal: AbortSignal.timeout(WAIT_MS) }).catch(() => {})
@@ -393,7 +415,8 @@ if (E.row) {
   if (parked) await lever({ letters: [{ txid: F.s }] }, '/internal/discard-dead-letters')
 }
 } catch (e) {
-  expect(false, 'the cell ran to its end', `${e.message ?? e}`.split('\n')[0])
+  // the whole message: a CLI failure carries its stderr in full (the d3 fold-3, E585-D3-DELTA-M2)
+  expect(false, 'the cell ran to its end', `${e.message ?? e}`.split('\n').join('\n      '))
 }
 
 console.log('── lane E585-d3: a queued BEEF past the room rides by key, in R2 ──')

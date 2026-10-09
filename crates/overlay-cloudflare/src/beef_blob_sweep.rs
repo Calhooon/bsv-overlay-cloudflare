@@ -47,7 +47,8 @@
 use crate::d1::Query;
 use serde::Deserialize;
 use std::collections::HashSet;
-use worker::{D1Database, Env};
+use worker::wasm_bindgen::{JsCast, JsValue};
+use worker::{js_sys, D1Database, Env};
 
 /// The objects the door writes (`queue::r2_key`); nothing else in the bucket is listed or touched.
 pub const SWEEP_PREFIX: &str = "mutations/";
@@ -272,16 +273,116 @@ async fn read_state(db: &D1Database) -> Result<SweepState, String> {
         .unwrap_or_default())
 }
 
-fn listed_of(o: &worker::Object) -> Listed {
-    Listed {
-        key: o.key(),
-        bytes: o.size(),
-        uploaded_ms: o.uploaded().as_millis() as i64,
-        touched_ms: o.custom_metadata().ok().and_then(|m| {
-            m.get(crate::queue::TOUCHED_META)
-                .and_then(|t| t.parse::<i64>().ok())
-        }),
+/// PURE (the d3 fold-3, E585-D3-DELTA-M1): the `touched` stamp from the value the listing gave for
+/// `customMetadata.touched`, `None` when the field, or the whole `customMetadata`, is absent, or does not parse:
+/// the object is then aged by `uploaded` alone (the fold-2 rule).
+#[must_use]
+pub fn touched_ms_of(stamp: Option<&str>) -> Option<i64> {
+    stamp.and_then(|t| t.parse::<i64>().ok())
+}
+
+/// The raw `customMetadata.touched` of one listed or headed object, read through `Reflect` with a guard (the d3
+/// fold-3, E585-D3-DELTA-M1). workers-rs 0.8.5's `Object::custom_metadata` unwraps the getter and then calls
+/// `js_sys::Object::keys` (no `catch`) on what may be `undefined` (an object written with no custom metadata: the
+/// platform's answer under `include` is not documented, miniflare always answers `{}`): a JS `TypeError` through
+/// the wasm frame, which no `.ok()` sees, ended the scheduled tick before its GASP step on every tick. Here
+/// anything but an object is "no stamp", and `Reflect::get` is a `catch` binding.
+fn touched_field(o: &JsValue) -> Option<String> {
+    let meta = js_sys::Reflect::get(o, &JsValue::from_str("customMetadata")).ok()?;
+    if !meta.is_object() {
+        return None;
     }
+    js_sys::Reflect::get(&meta, &JsValue::from_str(crate::queue::TOUCHED_META))
+        .ok()?
+        .as_string()
+}
+
+/// One raw R2 object (`R2Object`, from `list` or `head`), every field read through `Reflect`. `None` when its key
+/// or its `uploaded` date cannot be read (the platform's contract broken; the caller fails closed). Never throws.
+fn listed_of_js(o: &JsValue) -> Option<Listed> {
+    let get = |k: &str| js_sys::Reflect::get(o, &JsValue::from_str(k)).ok();
+    let key = get("key")?.as_string()?;
+    let bytes = get("size")
+        .and_then(|v| v.as_f64())
+        .map_or(0, |s| s.max(0.0) as u64);
+    let uploaded = get("uploaded")?.dyn_into::<js_sys::Date>().ok()?.get_time();
+    if !uploaded.is_finite() {
+        return None;
+    }
+    Some(Listed {
+        key,
+        bytes,
+        uploaded_ms: uploaded as i64,
+        touched_ms: touched_ms_of(touched_field(o).as_deref()),
+    })
+}
+
+/// Calls `method(arg)` on the bucket's JS object and awaits its promise; every step a `catch`ed `Result`.
+async fn bucket_call(
+    bucket: &worker::Bucket,
+    method: &str,
+    arg: &JsValue,
+) -> Result<JsValue, String> {
+    let this: &JsValue = bucket.as_ref();
+    let js = |e: JsValue| worker::Error::from(e).to_string();
+    let f = js_sys::Reflect::get(this, &JsValue::from_str(method))
+        .map_err(js)?
+        .dyn_into::<js_sys::Function>()
+        .map_err(js)?;
+    let promise = js_sys::Promise::resolve(&f.call1(this, arg).map_err(js)?);
+    worker::wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(js)
+}
+
+/// The page a pass lists: at most [`SWEEP_MAX_OBJECTS`] under [`SWEEP_PREFIX`] after `start_after`, with the
+/// custom metadata, and whether the bucket holds more. An object whose key or date does not read is a listing
+/// fault (nothing swept, no cursor moved, logged).
+async fn list_page(
+    bucket: &worker::Bucket,
+    start_after: &str,
+) -> Result<(Vec<Listed>, bool), String> {
+    let set = |o: &js_sys::Object, k: &str, v: &JsValue| {
+        js_sys::Reflect::set(o, &JsValue::from_str(k), v)
+            .map(|_| ())
+            .map_err(|e| worker::Error::from(e).to_string())
+    };
+    let opts = js_sys::Object::new();
+    set(&opts, "prefix", &JsValue::from_str(SWEEP_PREFIX))?;
+    set(&opts, "limit", &JsValue::from(SWEEP_MAX_OBJECTS))?;
+    let include = js_sys::Array::new();
+    include.push(&JsValue::from_str("customMetadata"));
+    set(&opts, "include", &include)?;
+    if !start_after.is_empty() {
+        set(&opts, "startAfter", &JsValue::from_str(start_after))?;
+    }
+    let page = bucket_call(bucket, "list", &opts).await?;
+    let objects = js_sys::Reflect::get(&page, &JsValue::from_str("objects"))
+        .ok()
+        .filter(js_sys::Array::is_array)
+        .map(|v| v.unchecked_into::<js_sys::Array>())
+        .ok_or("the listing holds no objects array")?;
+    let listed = objects
+        .iter()
+        .map(|o| listed_of_js(&o))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("a listed object's key or upload date does not read")?;
+    let truncated = js_sys::Reflect::get(&page, &JsValue::from_str("truncated"))
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok((listed, truncated))
+}
+
+/// The read just before a delete: `None` when the object is gone.
+async fn head_of(bucket: &worker::Bucket, key: &str) -> Result<Option<Listed>, String> {
+    let o = bucket_call(bucket, "head", &JsValue::from_str(key)).await?;
+    if o.is_null() || o.is_undefined() {
+        return Ok(None);
+    }
+    listed_of_js(&o)
+        .map(Some)
+        .ok_or_else(|| format!("the head of {key} does not read"))
 }
 
 /// ONE PASS of the sweep (the module doc), from the scheduled tick. Fail-closed: a state, listing or named-keys
@@ -307,15 +408,7 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) {
             return;
         }
     };
-    let mut list = bucket
-        .list()
-        .prefix(SWEEP_PREFIX)
-        .limit(SWEEP_MAX_OBJECTS)
-        .include(vec![worker::Include::CustomMetadata]);
-    if !state.start_after.is_empty() {
-        list = list.start_after(state.start_after.as_str());
-    }
-    let page = match list.execute().await {
+    let (listed, truncated) = match list_page(&bucket, &state.start_after).await {
         Ok(p) => p,
         Err(e) => {
             worker::console_log!(
@@ -324,7 +417,6 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) {
             return;
         }
     };
-    let listed: Vec<Listed> = page.objects().iter().map(listed_of).collect();
     let now = worker::Date::now().as_millis() as i64;
     let named: HashSet<String> = if any_past_window(&listed, now, ORPHAN_WINDOW_S) {
         #[derive(Deserialize)]
@@ -345,8 +437,8 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) {
     let mut swept: HashSet<String> = HashSet::new();
     let (mut swept_bytes, mut faults) = (0u64, 0u64);
     for o in plan.orphans.iter().map(|i| &listed[*i]) {
-        let head = match bucket.head(o.key.as_str()).await {
-            Ok(h) => h.as_ref().map(listed_of),
+        let head = match head_of(&bucket, o.key.as_str()).await {
+            Ok(h) => h,
             Err(e) => {
                 faults += 1;
                 worker::console_log!(
@@ -379,7 +471,7 @@ pub async fn sweep_pass(env: &Env, db: &D1Database) {
             }
         }
     }
-    let more = page.truncated() || plan.handled < listed.len();
+    let more = truncated || plan.handled < listed.len();
     let next = next_state(&state, &listed[..plan.handled], &swept, more, now);
     if let Err(e) = save_query(&next).execute(db).await {
         worker::console_log!("[beef-blobs] the orphan sweep's state could not be saved ({e}); the next pass lists this page again");
@@ -885,13 +977,18 @@ mod tests {
         let me = &me[..me.find("#[cfg(test)]").unwrap()];
         let start = me.find("pub async fn sweep_pass(").unwrap();
         let f = squash(&me[start..start + me[start..].find("\n}\n").unwrap()]);
-        assert!(f.contains(".list().prefix(SWEEP_PREFIX).limit(SWEEP_MAX_OBJECTS)"));
-        assert!(f.contains("list.start_after(state.start_after.as_str())"));
+        assert!(f.contains("list_page(&bucket,&state.start_after).await"));
+        let page = squash(
+            &me[me.find("async fn list_page(").unwrap()..me.find("async fn head_of(").unwrap()],
+        );
+        assert!(page.contains("set(&opts,\"prefix\",&JsValue::from_str(SWEEP_PREFIX))?;"));
+        assert!(page.contains("set(&opts,\"limit\",&JsValue::from(SWEEP_MAX_OBJECTS))?;"));
+        assert!(page.contains("set(&opts,\"startAfter\",&JsValue::from_str(start_after))?;"));
         assert!(f.contains("ifany_past_window(&listed,now,ORPHAN_WINDOW_S)"));
         assert!(f.contains("plan_pass(&listed,&named,now,ORPHAN_WINDOW_S,SWEEP_MAX_DELETES)"));
         let (named, head, check, delete, save) = (
             f.find("Query::new(NAMED_KEYS_SQL)").unwrap(),
-            f.find("bucket.head(o.key.as_str())").unwrap(),
+            f.find("head_of(&bucket,o.key.as_str())").unwrap(),
             f.find("if!still_orphan(o,head.as_ref()){continue;}")
                 .unwrap(),
             f.find("bucket.delete(o.key.as_str())").unwrap(),
@@ -982,7 +1079,82 @@ mod tests {
         assert!(f.contains(".custom_metadata(touched_meta(now_ms))"));
         let src = code(include_str!("beef_blob_sweep.rs"));
         let src = &src[..src.find("#[cfg(test)]").unwrap()];
-        assert!(src.contains(".include(vec![worker::Include::CustomMetadata])"));
-        assert!(src.contains("m.get(crate::queue::TOUCHED_META)"));
+        assert!(src.contains("include.push(&JsValue::from_str(\"customMetadata\"));"));
+        assert!(src.contains("touched_ms: touched_ms_of(touched_field(o).as_deref()),"));
+    }
+
+    /// E585-D3-DELTA-M1, the d3 fold-3: an object with NO custom metadata (an operator's CLI put, the route cell's
+    /// leg 7, anything written before the stamp) never throws in the sweep and is aged by `uploaded` alone.
+    ///
+    /// What this proves natively: the stamp's parse ([`touched_ms_of`]) over an absent field, an absent
+    /// `customMetadata`, an empty and a malformed value; that age falls back to `uploaded`; and, by the source,
+    /// that the sweep reads no metadata through workers-rs (`custom_metadata()`, whose `js_sys::Object::keys` over
+    /// `undefined` threw through the wasm frame) and reads it only behind `is_object()` through `Reflect`, a
+    /// `catch` binding. What it cannot: `js_sys` does not run off wasm32, so no native test executes the guard,
+    /// and the platform's actual answer for an unstamped object (`undefined` or `{}`) is beta's to show (the
+    /// fold-3 REPORT's check). RED on `4f592f0` (with `touched_ms_of` grafted into its `beef_blob_sweep.rs`): "the
+    /// sweep reads customMetadata through workers-rs's Object::keys".
+    #[test]
+    fn e585_d3f3_m1_an_unstamped_object_never_throws_and_ages_by_uploaded() {
+        assert_eq!(
+            touched_ms_of(None),
+            None,
+            "no customMetadata, or no touched field"
+        );
+        assert_eq!(touched_ms_of(Some("")), None);
+        assert_eq!(touched_ms_of(Some("yesterday")), None);
+        assert_eq!(touched_ms_of(Some("1.5e12")), None);
+        assert_eq!(touched_ms_of(Some("1234")), Some(1234));
+        let day = 86_400_000i64;
+        let now = 20 * day;
+        let unstamped = Listed {
+            key: format!("{SWEEP_PREFIX}aa/bb"),
+            bytes: 9,
+            uploaded_ms: now - 10 * day,
+            touched_ms: touched_ms_of(None),
+        };
+        assert_eq!(unstamped.age_ms(), unstamped.uploaded_ms);
+        assert_eq!(
+            plan_pass(
+                std::slice::from_ref(&unstamped),
+                &HashSet::new(),
+                now,
+                ORPHAN_WINDOW_S,
+                50
+            )
+            .orphans,
+            vec![0],
+            "an unstamped orphan past the window by `uploaded` is swept, not a throw"
+        );
+
+        let code = |s: &str| {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let src = code(include_str!("beef_blob_sweep.rs"));
+        let src = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(
+            !src.contains("custom_metadata()") && !src.contains("Object::keys"),
+            "the sweep reads customMetadata through workers-rs's Object::keys"
+        );
+        let f = &src[src.find("fn touched_field(").unwrap()..src.find("fn listed_of_js(").unwrap()];
+        let (read, guard, touched) = (
+            f.find("Reflect::get(o, &JsValue::from_str(\"customMetadata\")).ok()?")
+                .unwrap(),
+            f.find("if !meta.is_object() {\n        return None;\n    }")
+                .expect("the guard"),
+            f.find("Reflect::get(&meta, &JsValue::from_str(crate::queue::TOUCHED_META))")
+                .unwrap(),
+        );
+        assert!(read < guard && guard < touched);
+        assert!(
+            f.contains(".as_string()"),
+            "a stamp that is not a string is no stamp"
+        );
+        // every R2 object the sweep reads goes through the guarded reader, the list's and the head's
+        assert_eq!(src.matches("listed_of_js(&o)").count(), 2);
+        assert!(!src.contains("bucket.head(") && !src.contains(".list()"));
     }
 }

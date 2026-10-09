@@ -430,11 +430,16 @@ ci-route: ci-d1-budget
 # Ports: LANE_BASE+9 (app layer) and LANE_BASE+10 (overlay), :8800 and :8801 by default; the same pre-flight,
 # bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network: no
 # fixture pot is spent and no hop filed (no courier), the app layer's service bindings are absent (its tip reads
-# answer 503 and the views serve without a tip), and the overlay's ARCADE_URL is a closed local port.
+# answer 503 and the views serve without a tip), and the overlay's ARCADE_URL is a closed local port. The logs carry
+# the port base (`/tmp/lane499-d1-<LANE_BASE>-app.log`, `-overlay.log`, `-seed.log`; the d3 fold-3, E585-D3-DELTA-M2):
+# two tiers on different bases never overwrite each other's logs. The e585 cell runs LAST: its leg 7 fires the whole
+# scheduled tick (`/__scheduled`), whose GASP step syncs the worker's hard-coded peers over the network and DEFERS real
+# graphs into `gasp_deferred_graphs` in the background; run before the e555 cell it put 18 rows under that cell's
+# counts (the captain's re-run of the d3 fold-2, 2026-10-09: 4 e555 FAILs). Nothing runs after it.
 ci-d1-budget:
 	@set -e; \
 	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); \
-	app_log=/tmp/lane499-d1-app.log; ov_log=/tmp/lane499-d1-overlay.log; \
+	app_log=/tmp/lane499-d1-$$B-app.log; ov_log=/tmp/lane499-d1-$$B-overlay.log; seed_log=/tmp/lane499-d1-$$B-seed.log; \
 	state=$$(mktemp -d /tmp/lane499-d1-state.XXXXXX); ov_state=$$(mktemp -d /tmp/lane499-d1-ovstate.XXXXXX); \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
@@ -480,8 +485,8 @@ ci-d1-budget:
 	}; \
 	echo "→ ci-d1-budget: the fixture D1 (seed + wrangler d1 execute --local)…"; \
 	cargo run -q $(WORKERS) -p low-app-layer --example d1_budget_seed > "$$state/seed.sql"; \
-	( cd crates/low-app-layer && npx wrangler d1 execute low-overlay-db --local --persist-to "$$state" --file "$$state/seed.sql" ) > /tmp/lane499-d1-seed.log 2>&1 \
-	  || { echo "✗ ci-d1-budget: the seed did not load"; cat /tmp/lane499-d1-seed.log; exit 1; }; \
+	( cd crates/low-app-layer && npx wrangler d1 execute low-overlay-db --local --persist-to "$$state" --file "$$state/seed.sql" ) > "$$seed_log" 2>&1 \
+	  || { echo "✗ ci-d1-budget: the seed did not load"; cat "$$seed_log"; exit 1; }; \
 	echo "→ starting wrangler dev :$$PA (the app layer on the fixture D1)…"; \
 	( cd crates/low-app-layer && exec npx wrangler dev --local --port $$PA --ip 127.0.0.1 --persist-to "$$state" \
 	    --var AUTH_ENFORCE:false --var SESSION_LANE:false \
@@ -506,8 +511,8 @@ ci-d1-budget:
 	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO; \
 	node tools/lane-e1d/landing_guard_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e576/dead_letter_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
-	node tools/lane-e585/beef_blobs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
-	node tools/lane-e555/deferred_graphs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"
+	node tools/lane-e555/deferred_graphs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
+	node tools/lane-e585/beef_blobs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`

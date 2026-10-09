@@ -1233,13 +1233,21 @@ routed around, never made a limit on a body.
 - **The deletion rule** (the captain's decision; never a bucket expiry): an
   object is deleted (1) on the consumer's ACK, all three of them (landed,
   refused under an open eviction, re-evicted), after the batch's loop, with
-  the object of the letter row that ack deleted, except a LANDED ack that
-  wrote a topic while another it names FAILED (the manager erred: durable,
-  no applied row; `queue::landed_ack_leaves_object`, the fold-2,
-  E585-D3-L1): that one LEAVES the object, so a twin in flight reads the
-  bytes and replays as the first did (the landed topic a dupe, the failed one
-  failing again, nothing written) and its ack deletes them; the sweep is the
-  backstop; (2) when its dead letter is LOST, which is the DLQ's last
+  the object of the letter row that ack deleted, except a LANDED ack with a
+  named topic that FAILED (the manager erred: durable, no applied row),
+  whatever the other topics did (`queue::landed_ack`, the ONE decision the
+  handler calls with the replay's report; the fold-2, E585-D3-L1, and the
+  fold-3, E585-D3-DELTA-L1 and L2): that one LEAVES the object, so a twin in
+  flight reads the bytes and replays as the first did (a landed topic a
+  dupe, the failed one failing again, nothing written) and acks; an object
+  so left that nothing names is the sweep's (8 days). Only an ack whose
+  every topic is applied or deduped deletes, and a twin after it finds the
+  applied rows in every topic (a dupe without the bytes). The fold-2 rule
+  also needed a topic APPLIED, so an ack whose EVERY topic failed deleted
+  and its twin was a fault letter for good (DELTA-L2 (1)); "a failed-only ack
+  must delete, or no twin ever would" does not hold: the sweep ends a left
+  object, where the delete bought only a fault letter holding a place until
+  the operator's discard; (2) when its dead letter is LOST, which is the DLQ's last
   delivery (the platform's `attempts` past 100) of a letter that was DEFERRED
   at the ceiling or at a not-now bound for the ~48 h (a clean read said no
   row holds the key). A LOST letter whose park FAULTED leaves its object to
@@ -1268,7 +1276,22 @@ routed around, never made a limit on a body.
   the window). Just before its delete the object is read again and left if
   it was written again since the listing (a re-presentation: the same key, a
   new `touched` stamp, a new message). A state, listing or named-keys read that faults
-  deletes nothing and moves no cursor. THE WINDOW is 8 days
+  deletes nothing and moves no cursor. THE STAMP'S READ never throws (the
+  fold-3, E585-D3-DELTA-M1): the sweep lists and heads through the bucket's
+  raw JS object (`list_page`, `head_of`, every field by `Reflect`, a `catch`
+  binding) and reads `customMetadata.touched` only behind `is_object()`, so
+  an object with NO custom metadata (an operator's CLI put, one written before
+  the stamp) has no stamp and is aged by `uploaded` alone. workers-rs 0.8.5's
+  `Object::custom_metadata` calls `js_sys::Object::keys` (no `catch`) on what
+  may be `undefined`: a `TypeError` through the wasm frame that no `.ok()`
+  sees, which ended the scheduled tick before its GASP step on every tick
+  until the object was deleted by hand. The platform's answer for an unstamped
+  object under `include` (`undefined` or `{}`) is not documented and miniflare
+  always answers `{}`; the native pin proves the parse, the fallback and the
+  source shape, beta the platform (a CLI put with no metadata, the next tick).
+  An object whose key or `uploaded` date does not read fails the listing
+  closed (nothing swept, no cursor moved, logged): a broken platform contract,
+  never a throw. THE WINDOW is 8 days
   (`ORPHAN_WINDOW_S`, two `QUEUE_RETENTION_S` of 345,600 s, the platform's
   default retention, which neither queue changes): what no queue message can
   outlive. Every message naming an object was sent right after a write of it
@@ -1316,12 +1339,25 @@ landing in every topic it names is a fault letter still. The lens found an
 instance (E585-D3-L1): a landed ack with a FAILED topic (the manager erred;
 durable, no applied row), whose twin then read MISSING and no row in that
 topic, a `fault` letter for good over bytes that did land; the fold-2 cures
-it by leaving the object on that ack (the deletion rule). What remains: a
-THIRD twin, after the second's ack deleted it, is that fault letter (it
-re-drives to the same verdict until the operator discards it); and an
-eviction closed between the two eviction acks, with nothing landed, parks the
-twin as a fault letter whose re-drive acks once the readmitted subject
-lands. A twin acked
+it by leaving the object on that ack (the deletion rule), and the fold-3 leaves it
+whatever the other topics did (DELTA-L2 (1): an ack whose EVERY topic failed
+deleted). The fold-2's "third twin" is cured with it: an ack that leaves
+nothing behind is one whose every topic holds its row, so every later twin
+is a dupe. What remains: (a) an eviction closed between the two eviction
+acks, with nothing landed, parks the twin as a fault letter whose re-drive
+acks once the readmitted subject lands; (b) a twin of a RE-DRIVE
+(DELTA-L2 (2), kept): the lever sends without a put, so a parked letter's
+object can be past the 8-day window while its row names it; the stale return
+(a claim older than 1 h) can put two copies in flight; the first lands with
+a failed topic and LEAVES the object, but its ack's `resolve` deleted the
+row, so nothing names it and a sweep pass between the two reads deletes it;
+the second copy is then a `fault` letter for good. No bytes are lost (the
+first copy's replay ran every topic: the landed ones hold their rows, the
+failed one failed as the second's would), it re-drives to the same verdict,
+and the operator's discard ends it. Narrow: a stale return, a failed topic
+and a sweep pass inside one consumer's backoff. The cure not taken: a
+leaving ack of a re-drive re-puts its bytes (an R2 write of the whole body
+per such ack, to move `touched`). A twin acked
 as a dupe told no lookup service anything and landed no carried predecessor:
 the first message's replay did. "Landed" reads `applied_transactions`, so
 limit (7) of the faulted-submit section holds here too (never wipe it
@@ -1396,6 +1432,39 @@ Amended: `e585_d3_the_write_precedes_the_send_and_the_ack_deletes`,
 route cell's new legs (6 to 8: the twin ack, the sweep under
 `/__scheduled`, a put twice moves `touched`) and leg 3's class (`not_now`
 kept) were written in the fold-2 and not run there (`make ci-d1-budget`).
+The captain's re-run of the fold-2's tier passed every leg of this cell (0
+to 8); the first run's leg-6 CLI failure left no stderr and did not recur.
+
+The fold-3's pins (the door 3 delta lens; RED on `4f592f0`, the graft
+named): `beef_blob_sweep::tests::e585_d3f3_m1_an_unstamped_object_never_throws_and_ages_by_uploaded`
+(the stamp's parse over an absent, empty and malformed value, the age by
+`uploaded`, an unstamped orphan swept, and the source: no `custom_metadata()`
+or `Object::keys`, the `is_object()` guard before the field, both readers
+through `listed_of_js`; RED on `4f592f0`'s sweep with `touched_ms_of`
+grafted: "the sweep reads customMetadata through workers-rs's Object::keys";
+`js_sys` does not run off wasm32, so the guard itself is not executed
+natively), `beef_door_replay::twin::e585_d3f3_l1_the_landed_ack_is_one_decision_the_handler_calls_as_is`
+(`queue::landed_ack` over every arm and the handler's call; RED on
+`4f592f0`'s `lib.rs`: "the handler calls the shipped decision with the
+replay's report"; the delta lens's mutant G RED: `left: LandedAck { leaves:
+false, .. }`; its G2 is an equivalent mutant now, the rule reading `applied`
+and `deduped` alike) and `*_e585_d3f3_l2_a_twin_of_an_ack_whose_every_topic_failed_reads_the_bytes`
+(RED with `4f592f0`'s rule grafted: `left: Landed { left: false }`).
+Amended: `e585_d3f2_l1` (the second twin's ack now LEAVES the object: its
+topic failed again) and `e585_d3_the_write_precedes_the_send_and_the_ack_deletes`
+(the Landed ack deletes what `landed_ack` says). The route cell (the fold-3,
+E585-D3-DELTA-M2): every wrangler CLI call is retried (4 tries, a growing
+pause) and its last failure THROWS with the child's stderr in full; `r2get`
+answers null only on wrangler's own "The specified key does not exist.", so
+a deletion is asserted only on a true not-found; leg 7 puts its object with
+NO custom metadata on purpose (the M1 path). `ci-d1-budget`'s logs carry the
+port base (`/tmp/lane499-d1-<LANE_BASE>-app.log`, `-overlay.log`,
+`-seed.log`). The cell runs LAST in `ci-d1-budget`: leg 7's whole
+scheduled tick goes on in the background into its GASP step, which syncs
+the worker's hard-coded `tm_ship`/`tm_slap`/`tm_uhrp` peers over the network
+and DEFERS real graphs; run before the e555 cell it put 18 rows under that
+cell's counts (the re-run's 4 e555 FAILs; the delta lens's N8 read it as
+harmless).
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 

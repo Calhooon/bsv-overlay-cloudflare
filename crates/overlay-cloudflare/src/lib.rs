@@ -2490,38 +2490,30 @@ async fn queue_handler(
                     body.reason,
                     report.applied_topics
                 );
-                // the d3 fold-2 (E585-D3-L1): a replay that wrote a topic while another it names FAILED leaves its
-                // object for a twin in flight (the twin's own ack deletes it; the sweep is the backstop)
-                let leaves = body.r2.is_some()
-                    && crate::queue::landed_ack_leaves_object(
-                        &body.topics,
-                        &report.applied_topics,
-                        &report.deduped_topics,
-                    );
-                if leaves {
+                let row_object = if let Some(db) = &counters {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_APPLIED, 1)
+                        .await;
+                    crate::dead_letters::resolve(
+                        db,
+                        body,
+                        Some(&subject),
+                        crate::dead_letters::Resolved::Landed,
+                    )
+                    .await
+                } else {
+                    None
+                };
+                // the d3 fold-3 (E585-D3-DELTA-L1): the ack's ONE decision over R2; a replay with a named topic that
+                // FAILED leaves its object for a twin in flight (the sweep is the backstop)
+                let ack = crate::queue::landed_ack(body, &report, row_object);
+                if ack.leaves {
                     worker::console_log!(
                         "Queue: {subject} landed with a FAILED topic (applied={:?}, deduped={:?}): its R2 object stays for a twin",
                         report.applied_topics,
                         report.deduped_topics
                     );
                 }
-                if let Some(db) = &counters {
-                    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_APPLIED, 1)
-                        .await;
-                    let row_object = crate::dead_letters::resolve(
-                        db,
-                        body,
-                        Some(&subject),
-                        crate::dead_letters::Resolved::Landed,
-                    )
-                    .await;
-                    if !leaves {
-                        acked_objects.extend(row_object);
-                    }
-                }
-                if !leaves {
-                    acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));
-                }
+                acked_objects.extend(ack.delete);
                 msg.ack();
             }
             Ok((_steak, report)) => {

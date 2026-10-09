@@ -60,11 +60,12 @@
 //!   last delivery, a clean read said no row holds it; a park that FAULTED
 //!   leaves it to the sweep, E585-D3-L2) or dropped as the lighter copy of a
 //!   parked key, and on the operator's discard. Never by a bucket expiry rule.
-//!   One ack LEAVES it (E585-D3-L1, [`landed_ack_leaves_object`]): a durable
-//!   replay that wrote a topic while another named topic FAILED (its manager
-//!   erred: no applied row, no fault), since a twin in flight would read it
-//!   MISSING and be judged unlanded in the failed topic; the twin replays the
-//!   bytes as the first did and its ack (nothing new written) deletes them.
+//!   One ack LEAVES it (E585-D3-L1 and DELTA-L2, [`landed_ack`]): a durable
+//!   replay with a named topic that FAILED (its manager erred: no applied
+//!   row, no fault), whatever the others did, since a twin in flight would
+//!   read it MISSING and be judged unlanded in the failed topic; the twin
+//!   replays the bytes as the first did. An object so left that nothing
+//!   names is the sweep's (8 days).
 //!   `dead_letters.rs` holds the last three.
 
 use overlay_engine::beef_limits;
@@ -599,15 +600,58 @@ pub(crate) async fn read_for_replay<P: ReplayBytes>(p: &P, body: &MutationMessag
     }
 }
 
-/// PURE (the d3 fold-2, E585-D3-L1): does the `Landed` ack of a keyed message LEAVE its object? Yes when the
-/// replay WROTE a topic (`applied`) while another topic it names FAILED (neither applied nor `deduped`: its manager
-/// erred, a durable report with no fault and no applied row). A twin of it in flight would find the object MISSING
-/// and no applied row in the failed topic: a fault letter for good over bytes that did land. Left, the twin reads
-/// them and replays as the first did (the landed topic a dupe, the failed one failing again: durable, nothing
-/// written), and THAT ack deletes them. The sweep is the backstop for an object no twin follows (8 days).
+/// PURE (the d3 fold-2, E585-D3-L1; widened by the d3 fold-3, E585-D3-DELTA-L2): does the `Landed` ack of a keyed
+/// message LEAVE its object? Yes when a topic it names FAILED (neither applied nor `deduped`: its manager erred, a
+/// durable report with no fault and no applied row), whatever the other topics did. A twin of it in flight would
+/// find the object MISSING and no applied row in the failed topic: a fault letter for good, where its replay with
+/// the bytes acks (the failed topic failing again: durable, nothing written). Left, the twin reads them and acks as
+/// the first did. An ack whose every topic is applied or deduped DELETES: a twin then finds the applied rows in
+/// every topic and is a dupe without the bytes (`judge_missing`). The fold-2 rule also needed a topic APPLIED, so
+/// an ack whose every topic failed deleted and its twin was a fault letter (DELTA-L2 (1)); "a failed-only ack must
+/// delete, or no twin ever would" does not hold: a left object nothing names is the sweep's after 8 days, and a
+/// deleting ack bought only a fault letter that holds a place until the operator's discard. The rule reads
+/// `applied` and `deduped` alike (a topic in neither failed), so the two cannot be swapped wrongly.
 #[must_use]
 pub fn landed_ack_leaves_object(topics: &[String], applied: &[String], deduped: &[String]) -> bool {
-    !applied.is_empty() && topics.iter().any(|t| !applied.contains(t) && !deduped.contains(t))
+    topics
+        .iter()
+        .any(|t| !applied.contains(t) && !deduped.contains(t))
+}
+
+/// What a `Landed` ack does with R2 (the d3 fold-3, E585-D3-DELTA-L1): `leaves` whether it leaves the message's
+/// object ([`landed_ack_leaves_object`]), `delete` the objects it deletes at the end of the batch (the message's own
+/// and `row_object`, the object of the parked letter row the ack resolved; both left when `leaves`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandedAck {
+    pub leaves: bool,
+    pub delete: Vec<String>,
+}
+
+/// PURE (the d3 fold-3, E585-D3-DELTA-L1): the ONE decision of a `Landed` ack over R2, which `queue_handler`
+/// calls as is with the replay's own report (an inline message deletes only a resolved row's object, and leaves
+/// nothing). The fold-2 rule was called inline in the handler with two slices of the report, and neither its call
+/// nor its argument order was pinned (the delta lens's mutants G and G2, green at 647/0).
+#[must_use]
+pub fn landed_ack(
+    m: &MutationMessage,
+    report: &overlay_engine::engine::MutationReport,
+    row_object: Option<String>,
+) -> LandedAck {
+    let leaves = m.r2.is_some()
+        && landed_ack_leaves_object(&m.topics, &report.applied_topics, &report.deduped_topics);
+    if leaves {
+        return LandedAck {
+            leaves,
+            delete: Vec::new(),
+        };
+    }
+    LandedAck {
+        leaves,
+        delete: row_object
+            .into_iter()
+            .chain(m.r2.as_ref().map(|r| r.key.clone()))
+            .collect(),
+    }
 }
 
 /// The consumer's read of a keyed message's bytes: the object, checked ([`check_replay_blob`]).
@@ -1035,12 +1079,13 @@ mod tests {
         assert_eq!(
             h.matches("acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));")
                 .count()
-                + 2,
+                + 3,
             h.matches("msg.ack();").count(),
-            "every ack deletes its object, but the one of a message whose object was MISSING (the d3 fold) and a \
-             deferred EF job's (NL-6c: its message names a job, never an object); the Landed one unless a failed \
-             topic leaves it for a twin (the d3 fold-2, L1)"
+            "every ack deletes its object, but the one of a message whose object was MISSING (the d3 fold), a \
+             deferred EF job's (NL-6c: its message names a job, never an object), and the Landed one, which deletes \
+             what `landed_ack` says (a failed topic leaves it for a twin; the d3 fold-2, L1, and fold-3, DELTA-L1)"
         );
+        assert_eq!(h.matches("acked_objects.extend(ack.delete);").count(), 1);
         let (last_ack, delete) = (
             h.rfind("msg.ack();").unwrap(),
             h.find("crate::queue::delete_beefs(&env, &acked_objects")
@@ -1095,7 +1140,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v.reason, "");
-        assert_eq!(v.redrive, None, "bsv-low #576: a message from before the lever parses too");
+        assert_eq!(
+            v.redrive, None,
+            "bsv-low #576: a message from before the lever parses too"
+        );
         assert_eq!(v.r2, None, "bsv-low #585: and one from before door 3");
         assert_eq!(v.topics, vec!["tm_pot".to_string()]);
     }

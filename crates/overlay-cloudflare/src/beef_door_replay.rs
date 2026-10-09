@@ -325,7 +325,7 @@ mod twin {
 
     /// The consumer as `queue_handler` runs a message: the SHIPPED read and use of the verdict
     /// (`queue::read_for_replay`), the replay (its landing is the storage's applied rows), the SHIPPED ack rule
-    /// (`queue::landed_ack_leaves_object`) and the notes by the SHIPPED statements, as the handler's arms call them.
+    /// (`queue::landed_ack`) and the notes by the SHIPPED statements, as the handler's arms call them.
     struct Consumer {
         bucket: HashMap<String, Vec<u8>>,
         conn: rusqlite::Connection,
@@ -407,14 +407,16 @@ mod twin {
                     applied.push(t.clone());
                 }
             }
-            let left =
-                m.r2.is_some() && queue::landed_ack_leaves_object(&m.topics, &applied, &deduped);
-            if !left {
-                if let Some(r) = &m.r2 {
-                    self.bucket.remove(&r.key);
-                }
+            let report = overlay_engine::engine::MutationReport {
+                applied_topics: applied,
+                deduped_topics: deduped,
+                ..Default::default()
+            };
+            let ack = queue::landed_ack(m, &report, None);
+            for k in &ack.delete {
+                self.bucket.remove(k);
             }
-            Delivered::Landed { left }
+            Delivered::Landed { left: ack.leaves }
         }
 
         /// The DLQ consumer's park of `m` (its key, no bytes read), by the shipped statement.
@@ -737,17 +739,19 @@ mod twin {
         let kept = c.bucket.contains_key(&key);
         assert_eq!(
             c.deliver(&m2, b_errs),
-            Delivered::Landed { left: false },
+            Delivered::Landed { left: true },
             "M2 reads the bytes and acks as M1 did"
         );
         assert_eq!(first, Delivered::Landed { left: true });
         assert!(kept, "M1's ack left the object for its twin");
+        // the d3 fold-3 (DELTA-L2): M2's tm_b failed again, so its ack LEAVES the object too (a third twin reads
+        // it); nothing names it, so it is the sweep's after 8 days. On the fold-2 M2's ack deleted it.
         assert!(
-            !c.bucket.contains_key(&key),
-            "M2's ack (nothing new written) deletes it"
+            c.bucket.contains_key(&key),
+            "M2's ack (tm_b failed again) leaves it"
         );
         assert!(c.letters().is_empty(), "no letter");
-        // the rule itself: a landing with no failed topic, a dupe-only replay, and a replay that wrote nothing
+        // the rule itself: a landing with no failed topic and a dupe-only replay delete; any failed topic leaves
         let t = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
         assert!(!queue::landed_ack_leaves_object(
             &topics,
@@ -762,10 +766,142 @@ mod twin {
         assert!(!queue::landed_ack_leaves_object(
             &topics,
             &[],
-            &t(&["tm_a"])
+            &t(&["tm_a", "tm_b"])
         ));
-        assert!(!queue::landed_ack_leaves_object(&topics, &[], &[]));
+        assert!(queue::landed_ack_leaves_object(&topics, &[], &t(&["tm_a"])));
+        assert!(queue::landed_ack_leaves_object(&topics, &[], &[]));
         assert!(queue::landed_ack_leaves_object(&topics, &t(&["tm_b"]), &[]));
+    }
+
+    /// E585-D3-DELTA-L2 (1), the d3 fold-3: twins M1 and M2 name [tm_a, tm_b] and EVERY topic's manager errs (a
+    /// durable report, no applied row, no fault). M1 is acked and its object LEFT; M2 reads the bytes, fails both
+    /// topics again and is acked with no letter; the object is the sweep's. RED with `4f592f0`'s rule
+    /// (`!applied.is_empty() && ..`) grafted into `landed_ack_leaves_object`: M1's ack deletes the object, M2
+    /// reads it MISSING, holds no applied row in either topic and is a `fault` letter for good.
+    #[test]
+    fn e585_d3f3_l2_a_twin_of_an_ack_whose_every_topic_failed_reads_the_bytes() {
+        let topics = vec!["tm_a".to_string(), "tm_b".to_string()];
+        let (beef, id) = shapes::sized_body(500_000);
+        let (m1, m2) = (keyed(&beef, &topics), keyed(&beef, &topics));
+        let key = m1.r2.as_ref().unwrap().key.clone();
+        let mut c = Consumer::new();
+        c.put(&m1, &beef);
+        c.put(&m2, &beef);
+        let all_err = Replay {
+            fails: &["tm_a", "tm_b"],
+            not_now: false,
+        };
+        assert_eq!(c.deliver(&m1, all_err), Delivered::Landed { left: true });
+        assert!(c.applied(&id).is_empty(), "nothing landed");
+        assert!(
+            c.bucket.contains_key(&key),
+            "M1's ack left the object for its twin"
+        );
+        assert_eq!(
+            c.deliver(&m2, all_err),
+            Delivered::Landed { left: true },
+            "M2 reads the bytes and acks as M1 did"
+        );
+        assert!(c.letters().is_empty(), "no letter");
+        // a transient manager error: a twin that then lands both topics deletes the object
+        assert_eq!(c.deliver(&m2, LANDS), Delivered::Landed { left: false });
+        assert!(!c.bucket.contains_key(&key));
+    }
+
+    /// E585-D3-DELTA-L1, the d3 fold-3: the `Landed` ack's decision over R2 is ONE function,
+    /// `queue::landed_ack`, run here over every arm and called as is by `queue_handler` with the replay's own
+    /// report. The delta lens's mutant G (`leaves` turned off) is RED in the first arm; its G2 (the report's
+    /// `applied` and `deduped` swapped) is now an equivalent mutant (the rule reads both alike: a topic in neither
+    /// failed) and cannot be written at the handler, which passes the report whole. RED on `4f592f0`: the handler
+    /// calls no `landed_ack` (the function does not exist there; with it grafted into `queue.rs`, the source
+    /// assertion fails).
+    #[test]
+    fn e585_d3f3_l1_the_landed_ack_is_one_decision_the_handler_calls_as_is() {
+        let topics = vec!["tm_a".to_string(), "tm_b".to_string()];
+        let (beef, _) = shapes::sized_body(500_000);
+        let m = keyed(&beef, &topics);
+        let key = m.r2.as_ref().unwrap().key.clone();
+        let t = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let rep = |a: &[&str], d: &[&str]| overlay_engine::engine::MutationReport {
+            applied_topics: t(a),
+            deduped_topics: t(d),
+            ..Default::default()
+        };
+        let row = || Some("mutations/row/obj".to_string());
+        let leave = queue::LandedAck {
+            leaves: true,
+            delete: vec![],
+        };
+        let both = queue::LandedAck {
+            leaves: false,
+            delete: vec!["mutations/row/obj".to_string(), key.clone()],
+        };
+        assert_eq!(
+            queue::landed_ack(&m, &rep(&["tm_a"], &[]), row()),
+            leave,
+            "tm_b failed: left"
+        );
+        assert_eq!(
+            queue::landed_ack(&m, &rep(&[], &["tm_a"]), row()),
+            leave,
+            "deduped and failed: left"
+        );
+        assert_eq!(
+            queue::landed_ack(&m, &rep(&[], &[]), row()),
+            leave,
+            "every topic failed: left"
+        );
+        assert_eq!(
+            queue::landed_ack(&m, &rep(&["tm_a", "tm_b"], &[]), row()),
+            both
+        );
+        assert_eq!(
+            queue::landed_ack(&m, &rep(&["tm_b"], &["tm_a"]), row()),
+            both
+        );
+        assert_eq!(
+            queue::landed_ack(&m, &rep(&[], &["tm_a", "tm_b"]), row()),
+            both,
+            "a dupe deletes"
+        );
+        assert_eq!(
+            queue::landed_ack(&m, &rep(&["tm_a", "tm_b"], &[]), None).delete,
+            vec![key.clone()]
+        );
+        let inline = queue::MutationMessage {
+            r2: None,
+            ..m.clone()
+        };
+        assert_eq!(
+            queue::landed_ack(&inline, &rep(&["tm_a"], &[]), row()),
+            queue::LandedAck {
+                leaves: false,
+                delete: vec!["mutations/row/obj".to_string()],
+            },
+            "an inline message leaves nothing and deletes only its resolved row's object"
+        );
+        let squash = |s: &str| {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<String>()
+        };
+        let lib = include_str!("lib.rs");
+        let start = lib.find("async fn queue_handler(").unwrap();
+        let h = squash(&lib[start..start + lib[start..].find("\n}\n").unwrap()]);
+        let (call, extend, ack) = (
+            h.find("letack=crate::queue::landed_ack(body,&report,row_object);")
+                .expect("the handler calls the shipped decision with the replay's report"),
+            h.find("acked_objects.extend(ack.delete);")
+                .expect("and deletes what it says"),
+            h.find("Resolved::Landed").unwrap(),
+        );
+        assert!(ack < call && call < extend);
+        assert!(
+            !h.contains("landed_ack_leaves_object"),
+            "no second, inline use of the rule"
+        );
     }
 
     /// E585-D3-L2: on the DLQ's last delivery a letter's object goes with it only on a DEFERRAL (a clean read said
