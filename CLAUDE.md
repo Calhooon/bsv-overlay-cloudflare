@@ -1006,7 +1006,7 @@ a fresh streak, "progressed", reset the failures and lifted the quarantine at
 every probe (100 of 200 ticks at `*/15`, 940 of 3000 at one a minute, over the
 shipped SQL). The yield runs before the outcome, so the probe now continues
 the streak and fails (27 of 200). Its cost: a peer that failed for any reason
-(a hang, #302) keeps its old streak past 6 h quiet until it succeeds once.
+(a hang, #302) keeps its old streak past 6 h quiet until it yields once (at the threshold an empty listing is no longer a success; D5-L1 below).
 Stated too: a peer yieldless for 3 h, quiet
 for 6 h, and so on, keeps its slice in the yieldless hours (a third of its
 ticks at most), as #302's residual. At `*/15` a hostile peer is still counted
@@ -1031,7 +1031,7 @@ each a listing request and nothing else). The honest side, stated: a
 quarantined peer that has gone QUIET is not stranded and needs no exit of its
 own (no "N empty probes lift it"): it is asked its listing on every tick and
 its first new UTXO that lands lifts it; until then one failed sync (a
-timeout) costs it 6 h, where a peer below the threshold has eight. Below the
+timeout) costs it 6 h, where a peer below the threshold has eight. The delta-5 lens's D5-L1, stated and accepted (LOW): the streak does not decay while the failures are above 0, so a peer quarantined by the yieldless bound and then quiet keeps a streak past both bounds, and its next graph that needs more than one pass is a FAILED sync at every pass, each re-arming the 6 h quarantine (measured: a 9-link graph at 3 calls a pass converged in 12 h where the base took 180 s; the same peer quarantined by eight timeouts instead converged in 180 s). Nothing is lost (6 h is inside the 30 h sweep; the graph lands at the probe), the common honest quarantine (timeouts) is unaffected, and a decay here would reopen D4-L2 (a hostile peer can go quiet for 6 h too), so no code changes. Below the
 threshold nothing changed: an empty listing is a success and resets the
 failures (#302's accepted residual, one success in every 8 ticks, stands,
 and an empty listing is such a success). A health read that faults reads 0
