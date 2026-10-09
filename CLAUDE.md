@@ -152,7 +152,7 @@ script_verification -- --nocapture`. Measured natively, release profile
 in `Transaction::verify` (2.1 s in a debug build). Workers wasm is slower
 than native; budget CPU accordingly for big covenant legs.
 
-## The script door reads the stream (D8, bsv-low #585 door 1)
+## The script door reads the stream (D8, bsv-low #585 door 1; the doors lens fold of 2026-10-09)
 
 `Engine::verify_scripts_only` is the walk the gated `/submit` runs before a
 broadcast (register row D8): the reference's `tx.verify('scripts only')`, every
@@ -163,12 +163,18 @@ structural fault is `ScriptWalkInconclusive` and the door's own bound
 `ScriptWalkOverBudget`, and on both the request goes on and the network judges
 (counted, `submit_script_walk_*_total`).
 
-**The rule.** A valid BEEF is never left unjudged for its size or its counts.
-Until #585 the door had four bounds on the BODY: 64 unproven transactions, 256
-inputs per transaction, 512 KB per transaction (`DoorBudget`), and the parse's
-own (`beef_limits::parse_beef`, `ENGINE_BEEF_LIMITS`). All four are gone from
-the door. `script_door.rs` reads the bytes the caller holds twice:
+**The rule.** A valid BEEF is never REFUSED for its size or its counts, and
+never left unjudged for a count of the body. Until #585 the door had four
+bounds on the BODY: 64 unproven transactions, 256 inputs per transaction, 512
+KB per transaction (`DoorBudget`), and the parse's own (`beef_limits::parse_beef`,
+`ENGINE_BEEF_LIMITS`). All four are gone from the door. What it has is a
+BUDGET of two limbs, each estimated from the bytes before it is spent, each a
+breach that is "the network judges" and never a refusal. `script_door.rs`
+reads the bytes the caller holds three times:
 
+0. THE SIZING (`stream_sizing::estimate`): the frame's lengths and counts,
+   with no allocation and no hash, give what the next two reads will hold.
+   Past the memory limb the stream is not opened.
 1. THE INDEX: bsv-rs 0.4.0's `BeefStream` cuts the body one element at a time;
    the door keeps, per raw transaction, its txid and the place of its bytes
    (offset, length), and per BUMP the txids its level 0 carries. Measured: 78
@@ -184,39 +190,106 @@ fold refuses bodies the door has always walked (an input naming no EARLIER
 element, a transaction nothing spends; pin (h)'s parent-and-child BEEF with no
 funding).
 
-**The one limb is the work budget** (`DoorBudget`: `max_work_bytes` 64 MiB,
-and `memory_limit` 128 KB, the interpreter's element limit, which is the unit
-of the estimate and not a bound on the BEEF). Charged per input from the bytes
-before that input runs, by the formula of before #585: script bytes + hash
-opcodes x 128 KB + signature checks x the transaction's bytes. A breach, and
-the interpreter's own memory limit tripping, are "the network judges", counted
-`submit_script_walk_over_budget_total`, never a refusal. What the count
-bounds held down is otherwise linear in the body or already charged: each
-element is cut once, each judged transaction laid out once, each source's
-outputs located once; and an input whose scripts hold no signature check is
-run with NO copy of its transaction (the interpreter reads the other inputs
-and the outputs only for a signature's digest; that copy per input was the
-O(n^2) the 256-input bound was for), while one that does is charged its
-transaction's bytes per check. As before #585 a P2PKH input is charged about
-131 KB (one hash opcode at the element limit), so about 490 of them in one
-walk are the budget.
+**The work limb** (`DoorBudget::max_work_bytes` 64 MiB; `memory_limit` 128 KB
+is the interpreter's element limit, the unit of the estimate and not a bound on
+the BEEF). Charged per input from the bytes before that input runs: script
+bytes + hash opcodes x 128 KB + signature checks x `max(the transaction's
+bytes, sig_check_floor)`. A breach, and the interpreter's own memory limit
+tripping, are counted `submit_script_walk_over_budget_total`. What the count
+bounds held down is otherwise linear in the body: each element is cut once,
+each judged transaction laid out once, each source's outputs located once; and
+an input whose scripts hold no signature check is run with NO copy of its
+transaction (the interpreter reads the other inputs and the outputs only for a
+signature's digest; that copy per input was the O(n^2) the 256-input bound was
+for).
+
+**The signature floor** (`DoorBudget::sig_check_floor`, 64 KiB; the lens's
+E585-D12-M1). Until the fold a check was charged its transaction's bytes
+alone. The digest follows the transaction; the EC verification behind it does
+not (about 90 us native, whatever the transaction weighs), and the 64
+transactions and 256 inputs #585 removed were what bounded the verifications
+of SMALL transactions: a chain of 106 byte `OP_CHECKSIG OP_NOT` transactions
+bought a verification for 152 bytes of budget, and 17,000 of them (1.8 MB)
+walked `Ok` at 3.9 % of it (90,000 at 20 %, 9.6 s native, by the lens). With
+the floor the budget bounds the EC verifications of one walk at 64 MiB / 64
+KiB = 1,024. Measured natively: 1,000 walk in 87 ms in the release profile
+(1.4 to 1.8 s in a debug build), and the 17,000 stop at the 1,024th in 108 ms.
+
+F was chosen against LOW's shapes, as the pin
+`door_low_shapes_sit_under_a_quarter_of_the_work_budget` measures them (before
+the floor in brackets): the real covenant settle and refund (5 hash opcodes, 4
+signature checks: a CHECKSIG and the stated `OP_3` CHECKMULTISIG) 924,112
+bytes each, 1.4 % of the budget (676,284); a JOIN of nine seats whose coins
+are three unproven P2PKH hops deep, 36 inputs, 7,082,619, 10.6 % (4,740,838);
+a coin 30 P2PKH hops deep 5,902,188, 8.8 % (3,941,856). No JOIN is among the
+fixtures of `script_verification`: the JOIN is built in the pin, in its shape.
+A P2PKH input is charged 196,739 bytes (it was 131,394), so 341 of them in one
+walk are the budget (it was about 490) and 85 a quarter of it. At 128 KiB the
+same shapes would be 14.1 % and 11.7 %, and 256 P2PKH inputs the budget: the
+lower floor keeps more of a valid BEEF judged for a bound of 0.1 s.
+
+What the floor changes for a body under the old bounds (the frozen table, 13
+of its 39 rows): the `work` figure of every walked input with a signature
+check; and a CHECKMULTISIG whose key count is a COMPUTED value, which was
+charged the most keys the element limit admits (3,971) at its transaction's
+bytes and run, is now 260 MB by the estimate and never run at the door (the
+network judges). That closes one of `DoorBudget`'s three open residuals.
+
+**The memory limb** (`DoorBudget::max_memory_bytes`, 48 MiB; the lens's
+E585-D12-L3). What the door holds beside the body follows the body's element
+COUNT and a BUMP's LEAVES, not its bytes. Measured natively by the lens and
+again by the fold's pin: 77,086,752 bytes of heap for a 9,900,010 byte body of
+900,000 minimal transactions (the index, 49 bytes a bucket, its tables
+doubling), and 108,544,792 for a 9,830,056 byte body holding ONE BUMP of 2^18
+leaves (the SDK's `Leaf`s, `bump_root`'s tables, the proven set), each beside
+the body in a 128 MB isolate. The sizing read charges, before anything is
+allocated (`script_door::DOOR_CHARGES`, each derived from a size and pinned
+against it by `e585f_l3_the_charges_are_derived_from_the_sizes`): KEPT, 450
+bytes a raw transaction, 96 an input, 24 an output, 114 a txid a BUMP proves;
+IN HAND, the heaviest element, a BUMP at 576 bytes a leaf or a raw transaction
+at 4 bytes a byte, 360 an input and 168 an output (the stream's element, then
+the walk's layout and a signed input's digest view). Each is an UPPER bound
+(a growing buffer three times its contents, a hash table three times its
+buckets at the fullest load, native sizes): the pin holds the measured peak
+under the estimate for six shapes, 1.3 to 5.3 times over. A breach is
+`ScriptWalkOverBudget { limb: DoorLimb::Memory }`, counted
+`submit_script_walk_over_memory_total`, the stream never opened (the call
+holds 250 bytes on both lens bodies), the network judges.
+
+The default's arithmetic: a 128 MB isolate, less the request's body (up to the
+route's 10 MB), the completed BEEF the route hands the door (a second copy of
+up to as much) and the EF batch (the route's 2 MB bound, twice while it is
+serialized), 24 MB, less 56 MB left for the module, the runtime, the
+allocator's fragmentation and what a native estimate does not see of wasm32:
+48 MiB, three eighths of the isolate. It lets through a BUMP of up to 72,944
+leaves (690 bytes a level-0 leaf), a single transaction of up to about 12 MB,
+and a 10 MB body of one-input, one-output P2PKH transactions (191 bytes each,
+charged 570: 30 MB). It stops 111,848 transactions of no input and no output.
 
 Measured (native, debug profile, `tests/script_door_stream.rs`): a 2,122,796
 byte BEEF whose subject is 2,112,195 bytes with 300 inputs over 100 unproven
 parents (101 unproven transactions, 400 inputs executed) is walked in about
-0.2 s, peak heap of the walk 3,889,524 bytes beside the caller's body: 1.84x
-its largest element, which is the stream's one element in hand (the SDK's copy
-of the transaction being cut, with its buffer's slack), not the body's
-elements.
+0.2 s, peak heap of the walk 3,889,524 bytes beside the caller's body (8.6 MB
+by the estimate): 1.84x its largest element, which is the stream's one element
+in hand (the SDK's copy of the transaction being cut, with its buffer's
+slack). That ratio is of a transaction that is mostly one script: a
+transaction of 200,000 empty outputs is 5.9x its bytes (10.7 MB for 1.8 MB),
+which is what the per-output charge is for.
 
 Parity for bodies under the old bounds: the 31 pins of `script_verification`
-unchanged, and 27 deterministic bodies run on `d6d2774` and here (the real
-covenant legs intact and tampered, a subject that is proven, absent or not a
-txid, a P2PKH diamond chain, the value rule, a missing funding, the budget, the
-memory trip, a false script) give the same `WalkStats` and the same errors to
-the byte, except a BEEF cut short: `BeefParseError` on both, in the stream's
-words (`invalid BEEF at byte 7066: Truncated { needed: 25 }`), which the route
-treats as it did (the walk could not run, the network judges).
+unchanged, and the table `tests/script_door_fold.rs` `e585f_n2` (the lens's
+N2: 39 deterministic bodies, the door's answer frozen per body, statistics and
+error text, and the SHA-256 of the whole). It holds the real covenant legs
+intact and tampered, P2PKH in its V1, V2 and atomic frames, a subject that is
+proven, absent, not a txid or in upper case, a diamond chain, the value rule, a
+funding that is txid-only or absent, a mixed transaction tampered four ways,
+the budget's edge on both limbs, the memory trip, `OP_NUM2BIN`, a false script,
+and a BEEF cut short, with a trailing byte, with a BUMP flag of unknown bits.
+Run on `8c92671` it differs on 13 rows, the fold and nothing else (above).
+The lane's 27 bodies run on `d6d2774` were a one-off and are not in the tree;
+what `d6d2774` answered that the stream does not: a BEEF cut short is
+`BeefParseError` on both, in the stream's words (`invalid BEEF at byte 297:
+Truncated { needed: 25 }`), and limit (3) below.
 
 Limits, stated. (1) The door is reached through the gated route, whose own
 bounds stand BEFORE it and are not this door's: the request's 10 MB, the EF
@@ -224,25 +297,63 @@ conversion's parse (`ef.rs`, `beef_limits::parse_beef` with `EF_BEEF_LIMITS`:
 10,000,036 bytes, 512 transactions, 512 BUMPs; NL-6's), and the route's EF
 work bound (`routes.rs` `MAX_SUBJECT_EF_BYTES` 256 KB, `MAX_BATCH_EF_BYTES`
 2 MB: a 429 "retry via fallback" before the door). The pin's 2 MB subject
-passes the DOOR; through the route it meets that 429 first. (2) The body is the
-caller's `&[u8]`: the door adds one element and the index beside it, it does
-not make the route stream its request. (3) A body the stream refuses for its
-bytes (trailing bytes, a BUMP whose nodes disagree) that `Beef::from_binary`
-parsed is now `BeefParseError` at the door (the network judges), where it was
-walked. (4) A transaction's length is its raw bytes (it was the SDK's
-re-serialization: the same for canonical varints), and a script is the raw
-bytes (it was the SDK's parse written back). (5) wasm32 was not measured. (6)
-The open residual of the work estimate (bignum rounds, a computed multisig key
-count) is as before, and is now bounded by the body alone.
+passes the DOOR; through the route it meets that 429 first. Those parses
+HYDRATE the body before the door is reached (the lens's N8, NL-6's file: 190
+MB natively for the wide BUMP, which no count of theirs refuses): the door's
+memory limb bounds the door, not the route. (2) The body is the caller's
+`&[u8]`: the door adds one element and the index beside it, it does not make
+the route stream its request. (3) A body the stream refuses for its bytes
+(trailing bytes, a BUMP whose nodes disagree, a BUMP leaf flag or a V2 format
+byte with unknown bits) that `Beef::from_binary` parsed is `BeefParseError` at
+the door (the network judges), where it was walked. A subject txid in upper
+case is walked (it was "not in the BEEF"), and so is a transaction with a
+non-canonical varint (the SDK's txid was of its re-serialization). (4) A
+transaction's length is its raw bytes (it was the SDK's re-serialization: the
+same for canonical varints), and a script is the raw bytes (it was the SDK's
+parse written back). (5) wasm32 was not measured: neither the time of 1,024
+verifications nor the heap under the 48 MiB. (6) The open residuals of the
+work estimate are as before and bounded by the body alone: bignum rounds,
+`OP_NUM2BIN`'s allocation, and an opcode that copies an element (`OP_DUP`,
+`OP_CAT`, `OP_PICK`: charged its one script byte, up to 128 KB copied; the
+lens's N7). (7) The memory estimate is conservative, so a valid BEEF can be
+left to the network that would have fitted: the walk's own tables are charged
+to every transaction though only a walked one pays them, so 10 MB of
+one-input, one-output transactions under about 113 bytes each is past the
+limb. (8) The sizing read
+is a second reader of the frame: a frame the stream reads that it does not
+follow would be walked unestimated. The pin
+`e585f_l3_the_sizing_follows_every_frame_the_stream_reads` holds it over three
+frames, every cut and three changes of every byte (5,358 bodies the stream
+reads), and if a later SDK reads a frame it does not, the walk answers "over
+budget" rather than run unestimated. Re-run it at every bsv-rs bump.
 
-Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
-script_door_stream -- --nocapture` (`e585_d1_a` the 2 MB / 300-input body
-walked, `e585_d1_b` 300 REAL signatures over 101 unproven transactions and a
-corrupted one refused at input 299, `e585_d1_c` the work budget stopping 300
-digests of 2 MB from the bytes, `e585_d1_d` the index pass; each RED on
-`d6d2774`: `ScriptWalkOverBudget ... has 300 inputs (limit 256)`) and `--lib
-e585_d1` (the door's layout of a transaction against the SDK's parse; the
-index per element).
+Pins. `cargo test -p bsv-overlay-engine --features memory-storage --test
+script_door_stream -- --nocapture`: `e585_d1_a` the 2 MB / 300-input body
+walked, `e585_d1_b` 260 REAL signatures over 66 unproven transactions walked
+at 76 % of the work budget (the pin asks for a fifth of it left; the lens's N5:
+its 400 inputs sat at 98 %) and a corrupted one refused at the last input,
+`e585_d1_c` the work budget stopping 300 digests of 2 MB from the bytes,
+`e585_d1_d` the index pass. On `d6d2774` a, b and c are RED for the bounds
+(`ScriptWalkOverBudget ... has 300 inputs (limit 256)`; b, resized, for its
+66th unproven transaction, reasoned from the code and not run) and d for its
+heap bound (355,684 bytes beside the chunk against 133,368 allowed), not for
+that word (the lens's N3). `--lib e585` (the door's layout of a transaction
+against the SDK's parse; the index per element; the fold's two above).
+`--test script_door_fold -- --nocapture`, each run on `8c92671` (the file cut
+at its marked line): `e585f_m1_a_chain_of_17000_*` (RED: walked, `Ok(WalkStats
+{ unproven_txs: 17000, inputs_executed: 17000, .., work_bytes: 2584000 })`)
+and `e585f_m1_the_work_budget_bounds_*` (RED: 152 bytes a check);
+`e585f_l3_900000_minimal_transactions_*` and `e585f_l3_one_bump_of_2_18_*`
+(RED: walked, the call's heap at 77,086,752 and 108,544,792 bytes);
+`e585f_n2_*` the table (RED on its 13 rows); `e585f_n4_*` the lens's N4, the
+`sig_ops == 0` shortcut: a mixed transaction whose sig-less input's sequence
+(or the lock time, or an output) is changed after signing is refused AT THE
+SIGNED INPUT, and seven scripts that read the lock time, the sequence, the
+version (`OP_VER`), a hash or `OP_CODESEPARATOR` are judged the same with and
+without the copy of their transaction at versions 1 and 2 (green on `8c92671`,
+where the shortcut already was; RED against the shortcut taken for every
+input). Below the marked line: `e585f_a_breach_names_its_limb` and
+`e585f_l3_the_memory_estimate_is_above_the_measured_heap`.
 
 ## The census reads the stream (bsv-low #366; #585 door 2)
 

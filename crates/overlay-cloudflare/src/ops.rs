@@ -78,6 +78,21 @@ pub const COUNTER_SUBMIT_SCRIPT_WALK_ANCESTOR_INCONCLUSIVE: &str =
 /// network's; the request proceeds to the network gate. Sustained non-zero on
 /// honest traffic means the budget is too tight for a real shape.
 pub const COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET: &str = "submit_script_walk_over_budget_total";
+/// …whose door walk was not made because it would hold more MEMORY than the
+/// door's budget beside the body (`DoorBudget::max_memory_bytes`, bsv-low
+/// #585: the estimate is made from the frame's lengths and counts before the
+/// stream is opened: a BUMP of tens of thousands of leaves, a hundred
+/// thousand tiny transactions) — the door's verdict, never the network's;
+/// the request proceeds to the network gate.
+pub const COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY: &str = "submit_script_walk_over_memory_total";
+
+/// The counter of a door walk past its own bound, by the limb it passed.
+pub fn script_walk_over_counter(limb: overlay_engine::engine::DoorLimb) -> &'static str {
+    match limb {
+        overlay_engine::engine::DoorLimb::Work => COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET,
+        overlay_engine::engine::DoorLimb::Memory => COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY,
+    }
+}
 /// Non-MINED `/arc-ingest` status callbacks (X-FullStatusUpdates bodies with
 /// no merklePath) acknowledged-and-ignored (#228). A count here is NORMAL
 /// operation, not an error — it proves the webhook stream is alive.
@@ -898,6 +913,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_SCRIPT_WALK_INCONCLUSIVE: 0,
         COUNTER_SUBMIT_SCRIPT_WALK_ANCESTOR_INCONCLUSIVE: 0,
         COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET: 0,
+        COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY: 0,
         COUNTER_QUEUE_MUTATION_APPLIED: 0,
         COUNTER_QUEUE_MUTATION_RETRIED: 0,
         // 2026-09-04: the discovery pass — seeded to 0 for the same reason.

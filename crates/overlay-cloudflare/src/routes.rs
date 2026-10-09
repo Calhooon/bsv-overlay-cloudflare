@@ -1203,15 +1203,19 @@ async fn submit_parts(
                 Err(EngineError::ScriptWalkOverBudget {
                     at_txid,
                     subject_judged,
+                    limb,
                     what,
                 }) => {
                     // The DOOR's own bound, never the network's verdict: the
-                    // request proceeds and the network judges.
+                    // request proceeds and the network judges. Each limb of
+                    // the budget has its counter (bsv-low #585, the doors
+                    // lens L3: the memory limb stops a walk before the stream
+                    // is opened).
                     script_walk_desc = format!("over-budget at={at_txid} judged={subject_judged}");
                     worker::console_log!(
-                        "POST /submit(broadcast-gated): door walk OVER BUDGET at {at_txid} (subject {subject_txid} judged: {subject_judged}; {what}) — the door's bound, the network judges"
+                        "POST /submit(broadcast-gated): door walk OVER BUDGET ({limb:?}) at {at_txid} (subject {subject_txid} judged: {subject_judged}; {what}) — the door's bound, the network judges"
                     );
-                    count(crate::ops::COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET);
+                    count(crate::ops::script_walk_over_counter(limb));
                 }
                 Err(EngineError::ScriptWalkInconclusive {
                     at_txid,

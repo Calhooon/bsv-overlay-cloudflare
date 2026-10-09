@@ -4,8 +4,10 @@
 //! broadcast) had four bounds on the BODY: 64 unproven transactions, 256
 //! inputs per transaction, 512 KB per transaction, and the parse's own size
 //! and counts. A valid BEEF past any of them was left unjudged ("over
-//! budget: the network judges"). They are gone. The one limb that stays is
-//! the WORK budget, the interpreter's estimated work.
+//! budget: the network judges"). They are gone. What stays is the budget's
+//! two limbs: the WORK the interpreter will do and the MEMORY the door holds
+//! beside the body (the fold of the doors lens, `e585f_*` below and in
+//! `script_door_fold.rs`).
 //!
 //! THE PIN (`e585_d1_a`): a valid BEEF whose subject is a 2 MB transaction
 //! with 300 inputs, each spending an output of one of 100 UNPROVEN parents
@@ -24,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use bsv_overlay_engine::builder::EngineBuilder;
-use bsv_overlay_engine::engine::{DoorBudget, Engine, EngineError};
+use bsv_overlay_engine::engine::{DoorBudget, DoorLimb, Engine, EngineError};
 use bsv_overlay_engine::storage::memory::MemoryStorage;
 use bsv_rs::primitives::PrivateKey;
 use bsv_rs::script::op::*;
@@ -180,9 +182,19 @@ async fn wide_body(
     unlock: impl Fn() -> ScriptTemplateUnlock,
     data: usize,
 ) -> Body {
-    let funding = proven_funding(&lock, PARENTS, 10_000);
+    wide_body_of(PARENTS, lock, unlock, data).await
+}
+
+/// [`wide_body`] over `parents` unproven parents.
+async fn wide_body_of(
+    parents: usize,
+    lock: LockingScript,
+    unlock: impl Fn() -> ScriptTemplateUnlock,
+    data: usize,
+) -> Body {
+    let funding = proven_funding(&lock, parents, 10_000);
     let mut subject = Transaction::new();
-    for vout in 0..PARENTS {
+    for vout in 0..parents {
         let mut parent = Transaction::new();
         parent
             .add_input_from_tx(funding.clone(), vout as u32, unlock())
@@ -208,7 +220,7 @@ async fn wide_body(
             .push(TransactionOutput::new(0, data_lock(data)));
     }
     subject.sign().await.expect("the subject signs");
-    assert_eq!(subject.inputs.len(), SUBJECT_INPUTS);
+    assert_eq!(subject.inputs.len(), parents * OUTPUTS_PER_PARENT);
     Body {
         beef: subject.to_beef(false).expect("the BEEF of the subject"),
         subject_txid: subject.id(),
@@ -246,6 +258,13 @@ fn e585_d1_a_a_2mb_transaction_with_300_unproven_inputs_is_walked() {
             stats.work_bytes < DoorBudget::DEFAULT.max_work_bytes,
             "{stats:?}"
         );
+        // The memory limb's estimate of this body, made before the stream was
+        // opened, is above what the walk then held and far inside the limb.
+        assert!(
+            stats.memory_bytes < DoorBudget::DEFAULT.max_memory_bytes / 4,
+            "{stats:?}"
+        );
+        assert!(peak as u64 <= stats.memory_bytes, "{peak} bytes, {stats:?}");
         println!(
             "e585_d1_a: body {} bytes, subject {} bytes with {} inputs, {} unproven transactions; \
              walked in {took:?} {stats:?}; peak heap of the walk {peak} bytes ({:.3}x its largest \
@@ -267,17 +286,33 @@ fn e585_d1_a_a_2mb_transaction_with_300_unproven_inputs_is_walked() {
     });
 }
 
-/// The same 300 inputs with REAL signatures, in a small subject: every one is
+/// The unproven parents of the signed body: 66 unproven transactions and 260
+/// signed inputs, past the 64 transactions the old door stopped at.
+const SIGNED_PARENTS: usize = 65;
+
+/// The same shape with REAL signatures, in a small subject: every one is
 /// checked (the other inputs and the outputs are in each digest), inside the
-/// work budget. RED on `d6d2774`: `ScriptWalkOverBudget`.
+/// work budget WITH A MARGIN. A P2PKH input is charged a hash opcode at the
+/// element limit and a signature check at the floor, about 197 KB, so the 260
+/// are about 51 MB of the 64 MiB: the pin asks for a fifth of the budget left
+/// (the lens's N5: 400 inputs sat at 98 % of it before the floor, and would
+/// be past it now). RED on `d6d2774`: `ScriptWalkOverBudget` (more than 64
+/// unproven transactions).
 #[test]
-fn e585_d1_b_300_signed_inputs_over_101_unproven_transactions_are_walked() {
+fn e585_d1_b_260_signed_inputs_over_66_unproven_transactions_are_walked() {
     one_at_a_time(async {
         let key = PrivateKey::random();
         let lock = P2PKH::new()
             .lock(&key.public_key().hash160())
             .expect("a P2PKH lock");
-        let body = wide_body(lock, || P2PKH::unlock(&key, SignOutputs::All, false), 0).await;
+        let body = wide_body_of(
+            SIGNED_PARENTS,
+            lock,
+            || P2PKH::unlock(&key, SignOutputs::All, false),
+            0,
+        )
+        .await;
+        let inputs = SIGNED_PARENTS * OUTPUTS_PER_PARENT;
         let engine = engine();
 
         let at_entry = mark();
@@ -286,19 +321,27 @@ fn e585_d1_b_300_signed_inputs_over_101_unproven_transactions_are_walked() {
             .await;
         let peak = peak_over(at_entry);
 
-        let stats = verdict.expect("300 valid signatures are 300 valid spends");
+        let stats = verdict.expect("260 valid signatures are 260 valid spends");
         assert!(stats.subject_judged, "{stats:?}");
-        assert_eq!(stats.unproven_txs, PARENTS + 1);
-        assert_eq!(stats.inputs_executed, SUBJECT_INPUTS + PARENTS);
-        assert_eq!(stats.sig_ops, SUBJECT_INPUTS + PARENTS);
+        assert_eq!(stats.unproven_txs, SIGNED_PARENTS + 1);
+        assert_eq!(stats.inputs_executed, inputs + SIGNED_PARENTS);
+        assert_eq!(stats.sig_ops, inputs + SIGNED_PARENTS);
+        let budget = DoorBudget::DEFAULT.max_work_bytes;
         println!(
-            "e585_d1_b: body {} bytes, subject {} bytes; walked {stats:?}; peak heap {peak} bytes",
+            "e585_d1_b: body {} bytes, subject {} bytes; walked {stats:?}; peak heap {peak} \
+             bytes; work {:.1} % of the budget",
             body.beef.len(),
-            body.subject_raw.len()
+            body.subject_raw.len(),
+            stats.work_bytes as f64 * 100.0 / budget as f64
+        );
+        assert!(
+            stats.work_bytes <= budget / 5 * 4,
+            "a fifth of the budget is left: {} of {budget}",
+            stats.work_bytes
         );
 
         // A signature that does not verify is still the interpreter's verdict,
-        // at input 299 of a transaction the old door never opened.
+        // at the last input of a transaction the old door never opened.
         let mut beef = body.beef.clone();
         let subject_at = body.subject_at();
         let last_script = find_last_input_script(&beef[subject_at..]) + subject_at;
@@ -310,7 +353,7 @@ fn e585_d1_b_300_signed_inputs_over_101_unproven_transactions_are_walked() {
             .expect_err("a corrupted signature is refused");
         match &err {
             EngineError::ScriptVerificationFailed { input_index, .. } => {
-                assert_eq!(*input_index as usize, SUBJECT_INPUTS - 1, "{err}")
+                assert_eq!(*input_index as usize, inputs - 1, "{err}")
             }
             other => panic!("expected the interpreter's verdict, got {other}"),
         }
@@ -333,13 +376,13 @@ fn unreached_checksig_lock() -> LockingScript {
     LockingScript::from_script(script)
 }
 
-/// THE ONE LIMB. A 2 MB subject whose 300 inputs each hold a signature check
+/// THE WORK LIMB. A 2 MB subject whose 300 inputs each hold a signature check
 /// is 300 digests of 2 MB by the estimate: about 600 MB of work against a
 /// budget of 64 MB. The door's answer is the one it always was: over budget,
 /// the network judges, never a refusal; and it is given from the bytes, at
 /// the input whose charge crosses the budget, before that input runs.
 #[test]
-fn e585_d1_c_the_work_budget_is_the_one_limb() {
+fn e585_d1_c_the_work_budget_stops_300_digests_of_2mb() {
     one_at_a_time(async {
         let body = wide_body(unreached_checksig_lock(), open_unlock, TWO_MB).await;
         let err = engine()
@@ -350,8 +393,10 @@ fn e585_d1_c_the_work_budget_is_the_one_limb() {
             EngineError::ScriptWalkOverBudget {
                 at_txid,
                 subject_judged,
+                limb,
                 what,
             } => {
+                assert_eq!(*limb, DoorLimb::Work);
                 assert_eq!(at_txid, &body.subject_txid);
                 assert!(!*subject_judged);
                 let crossing = DoorBudget::DEFAULT.max_work_bytes as usize / body.subject_raw.len();
@@ -365,8 +410,8 @@ fn e585_d1_c_the_work_budget_is_the_one_limb() {
             other => panic!("expected the door's own bound, got {other}"),
         }
 
-        // The same lock under a SMALL subject: the 400 inputs are charged one
-        // digest of a small transaction each, and are walked.
+        // The same lock under a SMALL subject: the 400 inputs are charged the
+        // floor of a signature check each (26 MB), and are walked.
         let small = wide_body(unreached_checksig_lock(), open_unlock, 0).await;
         let stats = engine()
             .verify_scripts_only(&small.beef, &small.subject_txid)

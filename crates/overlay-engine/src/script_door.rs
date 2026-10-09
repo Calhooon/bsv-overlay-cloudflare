@@ -9,8 +9,12 @@
 //! A valid BEEF is never refused, or left unjudged, for its size or its
 //! counts: those bounds are gone.
 //!
-//! The walk is two reads of the bytes the caller already holds:
+//! The walk is three reads of the bytes the caller already holds:
 //!
+//! 0. THE SIZING ([`crate::stream_sizing`], the doors lens E585-D12-L3). The
+//!    frame's lengths and counts, read with no allocation and no hash, give
+//!    what the two reads below will hold ([`DOOR_CHARGES`]). Past the
+//!    budget's memory limb the stream is not opened: "the network judges".
 //! 1. THE INDEX. bsv-rs 0.4.0's `BeefStream` cuts the body into its elements
 //!    one at a time. Of each raw transaction the door keeps its txid, the
 //!    offset of its bytes and their length; of each BUMP, the txids its level
@@ -26,17 +30,27 @@
 //! EARLIER element, a transaction no later one spends). The door asks less:
 //! which bytes are a transaction, and which txids a BUMP carries.
 //!
-//! THE ONE LIMB is the work budget ([`crate::engine::DoorBudget`]): the
-//! estimate of what the interpreter will hash and push, charged per input
-//! before anything runs, as before. Past it the door's answer is the one it
-//! always was, "the network judges", never a refusal. Every other cost of the
-//! walk is linear in the body: each element is cut once, each judged
-//! transaction is laid out once, each source's outputs are located once, and
-//! an input that checks no signature is run with no copy of its transaction
-//! (the interpreter reads the other inputs and the outputs only to build a
-//! signature's digest; the copy of them per input was what the inputs bound
-//! held down, and an input that DOES check a signature is charged its
-//! transaction's bytes per check, which covers the copy).
+//! TWO LIMBS ([`crate::engine::DoorBudget`]), each a budget whose breach is
+//! the answer the door always gave, "the network judges", never a refusal.
+//!
+//! THE WORK: the estimate of what the interpreter will hash, push and verify,
+//! charged per input before anything runs. A signature check is charged its
+//! transaction's bytes or the budget's floor, whichever is more (the doors
+//! lens E585-D12-M1: the digest follows the transaction, the EC verification
+//! does not, and the counts #585 removed were what bounded the verifications
+//! of small transactions). Every other cost of the walk is linear in the
+//! body: each element is cut once, each judged transaction is laid out once,
+//! each source's outputs are located once, and an input that checks no
+//! signature is run with no copy of its transaction (the interpreter reads
+//! the other inputs and the outputs only to build a signature's digest; the
+//! copy of them per input was what the inputs bound held down, and an input
+//! that DOES check a signature is charged at least its transaction's bytes
+//! per check, which covers the copy).
+//!
+//! THE MEMORY: what the door holds beside the body follows the body's element
+//! COUNT and a BUMP's LEAVES, not its bytes (an index entry per transaction,
+//! a `Leaf` and four table entries per leaf while the stream computes a
+//! root). It is estimated by the sizing read and never spent past the limb.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -45,7 +59,39 @@ use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
 use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
 use bsv_rs::transaction::beef_stream::{display_hex, BeefStream, Element, Hash32};
 
-use crate::engine::{script_census, DoorBudget, EngineError, WalkStats};
+use crate::engine::{script_census, DoorBudget, DoorLimb, EngineError, WalkStats};
+use crate::stream_sizing::{self, StreamCharges};
+
+/// What the door holds per thing of a BEEF, for the sizing read: the stream's
+/// own element ([`StreamCharges::STREAM`]) and the door's.
+///
+/// KEPT, per raw transaction: its entry in the index (a bucket of 49 bytes in
+/// a table that doubles: three tables' worth at the fullest load, 168), and,
+/// charged to every transaction though only a walked one pays them, its mark
+/// in the walk's `seen` (114) and its entry in the walk's `sources` (168):
+/// 450. Per input: the walk's queue (32 bytes, a growing buffer: 96). Per
+/// output: a source's output offsets (a word, a growing buffer: 24). Per txid
+/// a BUMP proves: its bucket in the proven set (33 bytes, as the index: 114).
+///
+/// IN HAND, a raw transaction: the heavier of the stream's element (3 bytes a
+/// byte, 192 an input, 72 an output) and the walk's own view of it, which is
+/// the layout (an input's place 56 bytes and an output's 24, growing buffers:
+/// 168 and 72) beside the digest view of an input that checks a signature
+/// (the scripts copied once for the view and twice for the interpreter, and a
+/// record of 64 bytes an input and 32 an output three times: 3 bytes a byte,
+/// 192 an input, 96 an output), and one more copy for the interpreter's own
+/// serialization of the outputs: 4 bytes a byte, 360 an input, 168 an output.
+/// A BUMP leaf is the stream's.
+pub(crate) const DOOR_CHARGES: StreamCharges = StreamCharges {
+    kept_tx: 450,
+    kept_input: 96,
+    kept_output: 24,
+    kept_proven: 114,
+    tx_byte: 4,
+    tx_input: 360,
+    tx_output: 168,
+    bump_leaf: StreamCharges::STREAM.bump_leaf,
+};
 
 /// Where a raw transaction lies in the body.
 #[derive(Debug, Clone, Copy)]
@@ -103,21 +149,21 @@ impl DoorIndex {
     }
 }
 
-/// A reader over one raw transaction (BRC-12).
-struct Fields<'a> {
-    raw: &'a [u8],
-    at: usize,
+/// A reader over one raw transaction (BRC-12), or over a frame's fields.
+pub(crate) struct Fields<'a> {
+    pub(crate) raw: &'a [u8],
+    pub(crate) at: usize,
 }
 
 impl<'a> Fields<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.at.checked_add(n)?;
         let bytes = self.raw.get(self.at..end)?;
         self.at = end;
         Some(bytes)
     }
 
-    fn u32(&mut self) -> Option<u32> {
+    pub(crate) fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 
@@ -125,7 +171,7 @@ impl<'a> Fields<'a> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 
-    fn varint(&mut self) -> Option<u64> {
+    pub(crate) fn varint(&mut self) -> Option<u64> {
         let lead = *self.take(1)?.first()?;
         let wide = |bytes: &[u8]| {
             let mut le = [0u8; 8];
@@ -141,7 +187,7 @@ impl<'a> Fields<'a> {
     }
 
     /// A script: its length, then its place in the raw bytes.
-    fn script(&mut self) -> Option<Range<usize>> {
+    pub(crate) fn script(&mut self) -> Option<Range<usize>> {
         let len = usize::try_from(self.varint()?).ok()?;
         let start = self.at;
         self.take(len)?;
@@ -240,14 +286,39 @@ fn output_at(raw: &[u8], at: usize) -> Option<(u64, &[u8])> {
 }
 
 /// The door's walk: `'scripts only'` from `subject_txid` over `beef_bytes`,
-/// under the work budget.
+/// under the budget.
 pub(crate) fn walk(
     beef_bytes: &[u8],
     subject_txid: &str,
     budget: DoorBudget,
 ) -> Result<WalkStats, EngineError> {
     let mut stats = WalkStats::default();
+    // The memory limb, from the frame alone: nothing is allocated before it.
+    let sized = stream_sizing::estimate(beef_bytes, &DOOR_CHARGES, budget.max_memory_bytes);
+    let over_memory = |what: String| EngineError::ScriptWalkOverBudget {
+        at_txid: subject_txid.to_string(),
+        subject_judged: false,
+        limb: DoorLimb::Memory,
+        what,
+    };
+    if let Some(at) = sized.over_at {
+        return Err(over_memory(format!(
+            "estimated memory {} bytes exceeds the door memory budget of {} (the element at byte \
+             {at} of the BEEF)",
+            sized.bytes, budget.max_memory_bytes
+        )));
+    }
+    stats.memory_bytes = sized.bytes;
     let index = DoorIndex::read(beef_bytes)?;
+    if !sized.read {
+        // The stream read a frame the sizing read did not follow, so what was
+        // just held was never estimated. No body is known to do this (the pin
+        // `e585f_l3_the_sizing_follows_every_frame_the_stream_reads`); if a
+        // later SDK reads a frame this reader does not, the walk stops here.
+        return Err(over_memory(
+            "the sizing read did not follow a BEEF the stream read: memory not estimated".into(),
+        ));
+    }
 
     let fault =
         |at_txid: &str, subject_judged: bool, reason: String| EngineError::ScriptWalkInconclusive {
@@ -259,6 +330,7 @@ pub(crate) fn walk(
         |at_txid: &str, subject_judged: bool, what: String| EngineError::ScriptWalkOverBudget {
             at_txid: at_txid.to_string(),
             subject_judged,
+            limb: DoorLimb::Work,
             what,
         };
 
@@ -372,7 +444,7 @@ pub(crate) fn walk(
             stats.sig_ops += sig_ops;
             stats.work_bytes += bytes as u64
                 + (hash_ops as u64) * (budget.memory_limit as u64)
-                + (sig_ops as u64) * (tx_bytes as u64);
+                + (sig_ops as u64) * (tx_bytes as u64).max(budget.sig_check_floor);
             if stats.work_bytes > budget.max_work_bytes {
                 return Err(over(
                     &txid,
@@ -386,7 +458,7 @@ pub(crate) fn walk(
             // The interpreter reads the other inputs and the outputs for one
             // thing, a signature's digest. An input whose scripts hold no
             // signature check is run without them; one that does was just
-            // charged this transaction's bytes per check.
+            // charged at least this transaction's bytes per check.
             let (other_inputs, outputs) = if sig_ops == 0 {
                 (Vec::new(), Vec::new())
             } else {
@@ -621,6 +693,116 @@ mod tests {
         assert!(
             held <= elements * 128,
             "the index holds {held} bytes for {elements} elements"
+        );
+    }
+
+    /// THE SIZING READ FOLLOWS EVERY FRAME THE STREAM READS (the doors lens
+    /// E585-D12-L3). The memory limb is charged by a second reader of the
+    /// frame; a frame the stream reads and that reader does not would be
+    /// walked unestimated. Over a body in its three frames (V1, V2 with a
+    /// txid-only entry, atomic), every cut of it and three changes of every
+    /// byte: whenever the stream reads the bytes, the sizing read followed
+    /// them to their end.
+    #[test]
+    fn e585f_l3_the_sizing_follows_every_frame_the_stream_reads() {
+        use bsv_rs::transaction::{Beef, MerklePath, MerklePathLeaf, Transaction, BEEF_V1};
+        let build = |version: Option<u32>| {
+            let mut beef = version.map_or_else(Beef::new, Beef::with_version);
+            let proven = raw_tx(1, &[&[0x51], &[0x52, 0x53]]);
+            let proven_txid = Transaction::from_binary(&proven).expect("a tx").id();
+            let bump = MerklePath::new(
+                800_000,
+                vec![
+                    vec![
+                        MerklePathLeaf::new_txid(2, proven_txid.clone()),
+                        MerklePathLeaf::new_duplicate(3),
+                    ],
+                    vec![MerklePathLeaf::new(0, "11".repeat(32))],
+                ],
+            )
+            .expect("a BUMP of two levels");
+            let at = beef.merge_bump(bump);
+            beef.merge_raw_tx(proven, Some(at));
+            beef.merge_raw_tx(raw_tx(2, &[&[0x6a; 70], &[]]), None);
+            let last = raw_tx(3, &[&[0x51]]);
+            let last_txid = Transaction::from_binary(&last).expect("a tx").id();
+            beef.merge_raw_tx(last, None);
+            (beef, proven_txid, last_txid)
+        };
+        let (mut v2, proven_txid, last_txid) = build(None);
+        let atomic = v2.to_binary_atomic(&last_txid).expect("atomic");
+        let plain = v2.to_binary();
+        v2.make_txid_only(&proven_txid);
+        let with_stub = v2.to_binary();
+        let v1 = build(Some(BEEF_V1)).0.to_binary();
+
+        let (mut read, mut refused) = (0usize, 0usize);
+        let mut check = |bytes: &[u8]| {
+            let followed = stream_sizing::estimate(bytes, &DOOR_CHARGES, u64::MAX);
+            assert_eq!(followed.over_at, None);
+            if DoorIndex::read(bytes).is_ok() {
+                read += 1;
+                assert!(
+                    followed.read && followed.bytes > 0,
+                    "the stream reads {} and the sizing read does not: {followed:?}",
+                    bsv_rs::primitives::to_hex(bytes)
+                );
+            } else {
+                refused += 1;
+            }
+        };
+        for body in [&plain, &with_stub, &atomic, &v1] {
+            check(body);
+            for cut in 0..body.len() {
+                check(&body[..cut]);
+            }
+            for at in 0..body.len() {
+                for flip in [0x01u8, 0x80, 0xff] {
+                    let mut changed = body.clone();
+                    changed[at] ^= flip;
+                    check(&changed);
+                }
+            }
+        }
+        println!("e585f_l3 sizing: {read} bodies the stream reads, {refused} it refuses");
+        assert!(
+            read >= 500 && refused >= 500,
+            "{read} read, {refused} refused"
+        );
+    }
+
+    /// The door's charges, against the sizes they are derived from: a change
+    /// of the SDK's element or of the door's own records is seen here.
+    #[test]
+    fn e585f_l3_the_charges_are_derived_from_the_sizes() {
+        use bsv_rs::transaction::beef_stream::{InputRef, Leaf, OutputRef};
+        use std::mem::size_of;
+        // A growing buffer holds its old and its new allocation while it
+        // moves (3x its contents); a table of buckets of `b` bytes and a
+        // control byte holds up to 16/7 buckets an entry, and three such
+        // tables' worth while it doubles.
+        let grown = |bytes: usize| 3 * bytes as u64;
+        let table = |bucket: usize| (3 * 8 * (bucket + 1)).div_ceil(7) as u64;
+        assert_eq!(size_of::<Leaf>(), 56);
+        assert_eq!(grown(size_of::<InputRef>()), StreamCharges::STREAM.tx_input);
+        assert_eq!(
+            grown(size_of::<OutputRef>()),
+            StreamCharges::STREAM.tx_output
+        );
+        assert_eq!(table(size_of::<(Hash32, Place)>()), 168);
+        assert_eq!(table(size_of::<Hash32>()), 114);
+        assert_eq!(table(size_of::<(Hash32, Box<[usize]>)>()), 168);
+        assert_eq!(DOOR_CHARGES.kept_tx, 168 + 114 + 168);
+        assert_eq!(DOOR_CHARGES.kept_proven, 114);
+        assert_eq!(DOOR_CHARGES.kept_input, grown(size_of::<Hash32>()));
+        assert_eq!(DOOR_CHARGES.kept_output, grown(size_of::<usize>()));
+        assert_eq!(
+            DOOR_CHARGES.tx_input,
+            grown(size_of::<InputAt>()) + grown(size_of::<TxInput>())
+        );
+        assert_eq!(
+            DOOR_CHARGES.tx_output,
+            grown(size_of::<OutputAt>()) + grown(size_of::<TxOutput>())
         );
     }
 }

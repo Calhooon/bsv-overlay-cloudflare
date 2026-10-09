@@ -502,18 +502,22 @@ impl MutationReport {
 /// bounded BEFORE execution by its opcode census times the interpreter's
 /// element limit (the stack memory limit bounds every element, and every
 /// CAT / NUM2BIN / SPLIT result with it) plus its signature checks times the
-/// transaction's own size (a BIP-143 preimage hashes the prevouts and the
-/// outputs). The estimate is computed from the bytes; nothing executes past
-/// the budget, and a budget breach is the DOOR's verdict (inconclusive: the
-/// network judges), never the interpreter's.
+/// transaction's own size or a floor, whichever is more (a BIP-143 preimage
+/// hashes the prevouts and the outputs; the EC verification costs the same
+/// whatever the transaction weighs). The estimate is computed from the bytes;
+/// nothing executes past the budget, and a budget breach is the DOOR's
+/// verdict (inconclusive: the network judges), never the interpreter's.
 ///
-/// THE ONE LIMB (bsv-low #585, door 1). Until #585 the budget also counted
-/// the BODY: 64 unproven transactions, 256 inputs per transaction, 512 KB per
-/// transaction, and the parse's own size and counts. A valid BEEF is never
-/// left unjudged for its size or its counts, so those are gone: the walk
-/// reads the body through the streaming reader ([`crate::script_door`]), its
-/// memory is one element and an index entry per element, and what a Worker's
-/// CPU slice bounds is the WORK, which is this budget.
+/// THE BODY IS NOT COUNTED (bsv-low #585, door 1). Until #585 the budget also
+/// counted the BODY: 64 unproven transactions, 256 inputs per transaction,
+/// 512 KB per transaction, and the parse's own size and counts. A valid BEEF
+/// is never left unjudged for its size or its counts, so those are gone: the
+/// walk reads the body through the streaming reader ([`crate::script_door`]).
+///
+/// TWO LIMBS, both a budget whose breach is "the network judges" and never a
+/// refusal: the WORK the interpreter will do, and the MEMORY the door will
+/// hold beside the caller's body. Each is estimated from the bytes before it
+/// is spent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DoorBudget {
     /// The interpreter's stack memory limit: bounds every element, and is the
@@ -523,22 +527,66 @@ pub struct DoorBudget {
     pub memory_limit: usize,
     /// The whole walk's estimated work, in bytes hashed or pushed.
     pub max_work_bytes: u64,
+    /// The least a signature check is charged (the doors lens E585-D12-M1).
+    /// A check is charged `max(its transaction's bytes, this)`: the digest
+    /// hashes about the transaction, and the EC verification behind it costs
+    /// the same whatever the transaction weighs (about 95 us native). Charged
+    /// the transaction's bytes alone, a 106 byte `OP_CHECKSIG OP_NOT`
+    /// transaction bought a verification for 106 bytes of budget: 90,000 of
+    /// them walked at a fifth of the budget in 9.6 s. With the floor the
+    /// budget bounds the EC verifications of one walk at
+    /// `max_work_bytes / sig_check_floor`.
+    pub sig_check_floor: u64,
+    /// The whole walk's estimated memory beside the body, in bytes (the doors
+    /// lens E585-D12-L3): what the index, the stream's element in hand and
+    /// the walk's layout of a transaction hold, estimated from the frame's
+    /// lengths and counts by [`crate::stream_sizing::estimate`] BEFORE the
+    /// stream is opened.
+    pub max_memory_bytes: u64,
 }
 
 impl DoorBudget {
-    /// Sized for LOW's real shapes with a wide margin: a 30-deep P2PKH hop
-    /// ancestry plus one 3.5 KB OP_PUSH_TX covenant spend estimates under
-    /// 8 MB. What the static census BOUNDS: hashing (hash-class ops × the
-    /// element limit) and signature checks (× the transaction's size; a
+    /// Sized for LOW's real shapes with a wide margin. What the static census
+    /// BOUNDS: hashing (hash-class ops × the element limit) and signature
+    /// checks (× the transaction's size or the floor, whichever is more; a
     /// CHECKMULTISIG weighted by its static key count when the count is a
     /// small-int push, else by the most keys the element limit admits).
     ///
+    /// THE FLOOR, 64 KiB (half the hash charge), chosen against LOW's shapes
+    /// as the pin `door_low_shapes_sit_under_a_quarter_of_the_work_budget`
+    /// measures them: the real covenant settle and refund (5 hash opcodes, 4
+    /// signature checks: a CHECKSIG and the stated `OP_3` CHECKMULTISIG)
+    /// 924,112 bytes each, 1.4 % of the budget (676,284 before the floor); a
+    /// JOIN of nine seats whose coins are three unproven P2PKH hops deep (36
+    /// inputs; built in the pin, no JOIN is among its fixtures) 7,082,619,
+    /// 10.6 % (4,740,838); a coin 30 P2PKH hops deep 5,902,188, 8.8 %
+    /// (3,941,856). A P2PKH input is charged 196,739 bytes (a hash opcode at
+    /// the element limit, a check at the floor, its 131 script bytes): 341 of
+    /// them are the budget, 85 a quarter of it. The bound on EC verifications
+    /// per walk is 64 MiB / 64 KiB = 1,024 (1,023 with their script bytes):
+    /// measured natively, 1,000 of them walk in 87 ms in the release profile
+    /// (1.4 to 1.8 s in a debug build), and the lens's 17,000 stop at the
+    /// 1,024th in 108 ms. wasm32 was not measured.
+    ///
+    /// THE MEMORY, 48 MiB: three eighths of a 128 MB isolate. Beside it stand
+    /// the request's body (up to the route's 10 MB), the completed BEEF the
+    /// route hands the door (a second copy of up to as much) and the EF batch
+    /// (the route's 2 MB bound, twice while it is serialized): 24 MB, which
+    /// leaves 56 MB for the module, the runtime, the allocator's
+    /// fragmentation and what a native estimate does not see of wasm32. What
+    /// it lets through, by the door's charges (`script_door::DOOR_CHARGES`,
+    /// each an upper bound: the pins measure 1.3 to 5.3 times the heap the
+    /// walk reaches): a BUMP of up to 72,944 leaves (690 bytes a level-0
+    /// leaf); a single transaction of up to about 12 MB (4 bytes a byte); a
+    /// 10 MB body of one-input, one-output P2PKH transactions (191 bytes,
+    /// charged 570: 30 MB). What it stops: 111,848 transactions of no input
+    /// and no output, whatever follows them.
+    ///
     /// THE OPEN RESIDUAL (the W-A gate's delta-verify, 2026-09-09, measured):
-    /// the interpreter itself meters nothing, so three classes stay charged
+    /// the interpreter itself meters nothing, so two classes stay charged
     /// only by their script bytes — bignum arithmetic (`OP_MUL`/`OP_DIV`/
     /// `OP_MOD` on operands up to the element limit: ~1.3 ms per 30 KB×30 KB
-    /// round, linear in rounds), a CHECKMULTISIG whose key count is a computed
-    /// value (~80 µs per EC verify per key tried), and `OP_NUM2BIN`, which
+    /// round, linear in rounds) and `OP_NUM2BIN`, which
     /// allocates its size operand BEFORE the memory limit is consulted (up to
     /// bsv-rs's 1 GB element size: an isolate kill, not a refusal). None of
     /// them can refuse a spend (a breach and a trip are the door's bound and
@@ -547,11 +595,31 @@ impl DoorBudget {
     /// real operand sizes, and a pre-allocation check in NUM2BIN) — OWED
     /// before any PROD flip of `SCRIPT_VERIFY_NETWORK_GATED`. Since #585 the
     /// count of such rounds is bounded by the body alone (the script bytes
-    /// are charged, the transactions and inputs are not counted).
+    /// are charged, the transactions and inputs are not counted). A third,
+    /// as before #585 (the doors lens N7): an opcode that copies an element
+    /// (`OP_DUP`, `OP_CAT`, `OP_PICK`) is charged its one script byte and can
+    /// copy up to the element limit. The class the floor CLOSED: a
+    /// CHECKMULTISIG whose key count is a computed value was charged the most
+    /// keys the element limit admits (3,971) at its transaction's bytes and
+    /// run (~80 µs per key tried); at the floor those are 260 MB, past the
+    /// budget, so such an input is never run at the door (the network
+    /// judges). LOW's covenant states its count (`OP_3`).
     pub const DEFAULT: DoorBudget = DoorBudget {
         memory_limit: 128 * 1024,
         max_work_bytes: 64 * 1024 * 1024,
+        sig_check_floor: 64 * 1024,
+        max_memory_bytes: 48 * 1024 * 1024,
     };
+}
+
+/// Which limb of the [`DoorBudget`] a walk went past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoorLimb {
+    /// The static work estimate, or the interpreter's own memory limit
+    /// tripping inside one input.
+    Work,
+    /// The estimate of what the door holds beside the body.
+    Memory,
 }
 
 /// What the walk did (the door's cost instrument, since `Date.now()` is
@@ -571,6 +639,9 @@ pub struct WalkStats {
     pub sig_ops: usize,
     /// The static work estimate charged against the budget.
     pub work_bytes: u64,
+    /// The memory estimate charged against the budget, made from the frame
+    /// before the stream was opened.
+    pub memory_bytes: u64,
     /// Whether the SUBJECT's own inputs were all executed (an ancestor may
     /// still have faulted afterwards).
     pub subject_judged: bool,
@@ -1018,8 +1089,8 @@ impl Engine {
     /// before anything executes, and the interpreter's stack memory limit is
     /// the budget's element limit. The body is read through the streaming
     /// reader ([`crate::script_door`], bsv-low #585): no bound on its size,
-    /// its transactions or a transaction's inputs or bytes; the work budget
-    /// is the one limb.
+    /// its transactions or a transaction's inputs or bytes; the budget's two
+    /// limbs are the work and the memory beside the body.
     ///
     /// Errors: [`EngineError::ScriptVerificationFailed`] is the INTERPRETER's
     /// verdict and the only refusal; [`EngineError::ScriptWalkInconclusive`]
@@ -1039,6 +1110,23 @@ impl Engine {
         subject_txid: &str,
     ) -> Result<WalkStats, EngineError> {
         crate::script_door::walk(beef_bytes, subject_txid, DoorBudget::DEFAULT)
+    }
+
+    /// [`Engine::verify_scripts_only`] under a budget the caller names (the
+    /// pins measure the door with a limb lifted; a caller with another
+    /// platform's ceiling sets its own).
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_self,
+        reason = "the twin of `verify_scripts_only`"
+    )]
+    pub async fn verify_scripts_only_under(
+        &self,
+        beef_bytes: &[u8],
+        subject_txid: &str,
+        budget: DoorBudget,
+    ) -> Result<WalkStats, EngineError> {
+        crate::script_door::walk(beef_bytes, subject_txid, budget)
     }
 
     // ========================================================================
@@ -5554,12 +5642,14 @@ pub enum EngineError {
     },
 
     /// The DOOR walk exceeded its own bound ([`DoorBudget`]: the static work
-    /// estimate, or the interpreter's memory limit tripping): the door's
-    /// verdict, never the network's — the request proceeds to the network.
+    /// estimate, the interpreter's memory limit tripping, or the estimate of
+    /// the door's own memory; `limb` says which): the door's verdict, never
+    /// the network's — the request proceeds to the network.
     #[error("script walk over budget at {at_txid} (subject judged: {subject_judged}): {what}")]
     ScriptWalkOverBudget {
         at_txid: String,
         subject_judged: bool,
+        limb: DoorLimb,
         what: String,
     },
 
