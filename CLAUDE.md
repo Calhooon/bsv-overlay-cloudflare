@@ -959,3 +959,5 @@ CLOUDFLARE_API_TOKEN="<token>" CLOUDFLARE_ACCOUNT_ID="<id>" wrangler deploy
 - **Extensions**: set `ENABLE_EXTENSIONS=true` to register UHRP / Agent /
   DmDelegation topic managers + lookup services beyond the mainline
   SHIP/SLAP baseline.
+
+- **Stated limit (bsv-low #581, the delta-4 lens D4-L1):** with one dead-letter consumer and up to 101 deliveries per held-back "not now" letter, a flood can delay honest fault letters and let them expire at the queue's retention; the fix when it matters is a queue per class.
