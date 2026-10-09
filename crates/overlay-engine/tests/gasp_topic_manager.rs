@@ -3497,6 +3497,29 @@ impl Storage for ScriptedStore {
     ) -> Result<PeerSyncHealth, StorageError> {
         self.inner.get_peer_sync_health(host, topic).await
     }
+    async fn put_deferred_graph(
+        &self,
+        record: &bsv_overlay_engine::gasp::DeferredGraph,
+    ) -> Result<(), StorageError> {
+        self.inner.put_deferred_graph(record).await
+    }
+    async fn find_deferred_graphs(
+        &self,
+        host: &str,
+        topic: &str,
+    ) -> Result<Vec<bsv_overlay_engine::gasp::DeferredGraph>, StorageError> {
+        self.inner.find_deferred_graphs(host, topic).await
+    }
+    async fn delete_deferred_graph(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .delete_deferred_graph(host, topic, outpoint)
+            .await
+    }
 }
 
 // The topic's UTXOs as sorted `(index into nodes, output index)`.
@@ -7513,4 +7536,592 @@ async fn e1d_fold3_l2_the_door_asks_the_landing_guard_before_it_lands() {
     );
     assert_eq!(rows(&store, &nodes).await, ["3:spent=false"]);
     assert_eq!(applied_rows(&store, &nodes).await, [true; 4]);
+}
+
+// ============================================================================
+// bsv-low #555 (measured as #582): a graph deeper than its PER-GRAPH budget is
+// DEFERRED, its partial walk persisted as ONE record, and RESUMED by the next
+// pass from the record, never restarted. The other graphs of the pass go on.
+// ============================================================================
+
+use bsv_overlay_engine::gasp::{DeferredGraph, DEFERRED_GRAPH_MAX_PASSES};
+
+// A per-graph deadline that never falls due: the call count binds.
+fn never() -> bsv_overlay_engine::engine::SleepFactory {
+    Rc::new(|_| Box::pin(std::future::pending::<()>()))
+}
+
+// `chain`, its every transaction made distinct by `salt` (two chains of one
+// node would otherwise share their genesis).
+fn salted_chain(length: usize, salt: u64) -> Vec<GASPNode> {
+    let mut nodes = Vec::new();
+    let mut previous = None;
+    for height in 0..length {
+        let mut tx = Transaction::new();
+        if let Some(txid) = previous {
+            tx.inputs.push(TransactionInput::new(txid, 0));
+        }
+        tx.outputs.push(TransactionOutput::new(
+            1000 + salt,
+            LockingScript::from_hex("76a914000000000000000000000000000000000000000088ac").unwrap(),
+        ));
+        let txid = tx.id();
+        nodes.push(node_of(
+            &tx,
+            0,
+            Some(honest_proof(&txid, 100 + height as u32)),
+        ));
+        previous = Some(txid);
+    }
+    nodes
+}
+
+fn outpoint_of(node: &GASPNode) -> String {
+    format!("{}.0", node_txid(node))
+}
+
+fn record_shape(r: &DeferredGraph) -> (usize, Vec<String>, u64, u32, String) {
+    (
+        r.nodes.len(),
+        r.pending.iter().map(|p| p.outpoint.clone()).collect(),
+        r.calls,
+        r.passes,
+        r.reason.clone(),
+    )
+}
+
+fn deferral(topic: &bsv_overlay_engine::engine::TopicSyncResult) -> (u64, u64, u64, Vec<String>) {
+    (
+        topic.deferred_graphs,
+        topic.resumed_graphs,
+        topic.converged_graphs,
+        topic
+            .dropped_graphs
+            .iter()
+            .map(|d| d.reason.clone())
+            .collect(),
+    )
+}
+
+// PIN A. One head chain of 8 proven links, the tip listed; the manager names
+// each link's predecessor. The per-graph budget is THREE calls, the per-peer
+// budget far above it. On cf933e8 nothing bounds a graph and nothing persists
+// a walk (the API grafted inert: the walk runs to its end inside the per-peer
+// budget, so this pin's per-tick request list is red at tick 1). Now the
+// graph converges in three ticks, each node asked ONCE, through exactly one
+// record, replaced (two writes) and deleted at convergence.
+#[tokio::test]
+async fn e555_a_a_graph_deeper_than_its_budget_converges_in_three_ticks_through_one_record() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[7]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[7, 6, 5]));
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    assert!(topic.errors.is_empty(), "a deferral is not an error");
+    let records = node.store.deferred_graphs();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        (records[0].peer.as_str(), records[0].topic.as_str()),
+        (PEER, TOPIC)
+    );
+    assert_eq!(records[0].outpoint, outpoint_of(&nodes[7]));
+    assert_eq!(records[0].score, 1);
+    assert_eq!(
+        record_shape(&records[0]),
+        (3, vec![outpoint_of(&nodes[4])], 3, 1, "calls".into())
+    );
+    assert!(
+        records[0].nodes.iter().all(|w| w.node.proof.is_some()),
+        "the nodes are kept with their proofs"
+    );
+    assert_eq!(node.store.deferred_graph_writes(), 1);
+    assert_eq!(node.cursor().await, 0, "held below the deferred UTXO");
+    assert!(state.borrow().admitted.is_empty());
+    assert_eq!(node.failures().await, 0, "progress is not a failed attempt");
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[4, 3, 2]), "only what was pending");
+    assert_eq!(deferral(&topic), (1, 1, 0, vec![]));
+    let records = node.store.deferred_graphs();
+    assert_eq!(records.len(), 1, "replaced, never appended");
+    assert_eq!(
+        record_shape(&records[0]),
+        (6, vec![outpoint_of(&nodes[1])], 6, 2, "calls".into())
+    );
+    assert_eq!(node.store.deferred_graph_writes(), 2);
+    assert_eq!(node.cursor().await, 0);
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[1, 0]));
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]));
+    assert_eq!(topic.finalized_graphs, 1);
+    assert!(
+        node.store.deferred_graphs().is_empty(),
+        "deleted at convergence"
+    );
+    assert_eq!(node.store.deferred_graph_writes(), 2);
+    assert_eq!(
+        state.borrow().admitted,
+        txids(&nodes, &[0, 1, 2, 3, 4, 5, 6, 7])
+    );
+    assert_eq!(held(&node.store, &nodes).await, vec![(7, 0)]);
+    assert_eq!(applied_rows(&node.store, &nodes).await, [true; 8]);
+    assert_eq!(node.cursor().await, 1);
+    assert_eq!(topic.cursor_moves, moved(0, 1));
+
+    let (topic, sent) = node.tick().await;
+    assert!(sent.is_empty(), "held: nothing to walk");
+    assert_eq!(deferral(&topic), (0, 0, 0, vec![]));
+    println!(
+        "#555 PIN A: 8 links under a 3-call graph budget: 3 ticks, 8 requests, 1 record, 2 writes"
+    );
+}
+
+// A peer that never answers for the txids in `hangs` (a hung request) and
+// raises `flag` when one is asked, so the per-graph deadline falls due.
+#[derive(Clone)]
+struct HangingRemote {
+    inner: MeteredRemote,
+    hangs: Rc<RefCell<HashSet<String>>>,
+    flag: Rc<Cell<bool>>,
+}
+
+impl GASPRemoteFactory for HangingRemote {
+    fn create_remote(&self, _peer_url: &str, _topic: &str) -> Box<dyn GASPRemote> {
+        Box::new(self.clone())
+    }
+}
+
+#[async_trait(?Send)]
+impl GASPRemote for HangingRemote {
+    async fn get_initial_response(
+        &self,
+        request: &GASPInitialRequest,
+    ) -> Result<GASPInitialResponse, GASPError> {
+        self.inner.get_initial_response(request).await
+    }
+    async fn get_initial_reply(
+        &self,
+        response: &GASPInitialResponse,
+    ) -> Result<GASPInitialReply, GASPError> {
+        self.inner.get_initial_reply(response).await
+    }
+    async fn request_node(
+        &self,
+        graph_id: &str,
+        txid: &str,
+        output_index: u32,
+        metadata: bool,
+    ) -> Result<GASPNode, GASPError> {
+        if self.hangs.borrow().contains(txid) {
+            self.inner
+                .inner
+                .requests
+                .borrow_mut()
+                .push((txid.to_string(), output_index, metadata));
+            self.flag.set(true);
+            std::future::pending::<()>().await;
+        }
+        self.inner
+            .request_node(graph_id, txid, output_index, metadata)
+            .await
+    }
+    async fn submit_node(&self, node: &GASPNode) -> Result<Option<GASPNodeResponse>, GASPError> {
+        self.inner.submit_node(node).await
+    }
+}
+
+// The per-graph deadline: due once a hung request raised the flag.
+fn hang_deadline(flag: Rc<Cell<bool>>) -> bsv_overlay_engine::engine::SleepFactory {
+    Rc::new(move |_| {
+        flag.set(false);
+        let flag = flag.clone();
+        Box::pin(std::future::poll_fn(move |_| {
+            if flag.get() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }))
+    })
+}
+
+fn hanging(
+    node: &mut Budgeted,
+    remote: RecordingRemote,
+    hangs: &[String],
+) -> Rc<RefCell<HashSet<String>>> {
+    let set = Rc::new(RefCell::new(hangs.iter().cloned().collect::<HashSet<_>>()));
+    let flag = Rc::new(Cell::new(false));
+    node.engine.set_gasp_remote_factory(Box::new(HangingRemote {
+        inner: MeteredRemote {
+            inner: remote,
+            clock: node.clock.clone(),
+        },
+        hangs: set.clone(),
+        flag: flag.clone(),
+    }));
+    node.engine
+        .set_graph_budget(hang_deadline(flag), 100, 60_000);
+    set
+}
+
+// PIN B. A stuck peer: it never answers for link 3 (a hung request). The
+// per-graph TIME budget defers the graph at that request; each pass after it
+// asks link 3 alone, once; after DEFERRED_GRAPH_MAX_PASSES passes the record
+// is dropped (`max_passes`) and the UTXO fails as before #555 (the gap guard
+// asks again: the next pass walks it from its root). When the peer heals, the
+// graph converges from the record. On cf933e8 (the API grafted inert) the
+// first tick hangs at link 3 forever: no per-graph deadline exists.
+#[tokio::test]
+async fn e555_b_a_stuck_peer_is_deferred_each_pass_and_dropped_after_max_passes() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let remote = RecordingRemote::new(&nodes, &[7]);
+    let store = Rc::new(MemoryStorage::new());
+    let mut node = Budgeted::over(
+        remote.clone(),
+        Box::new(HeadChainManager(state.clone())),
+        RequestClock::allowing(1000),
+        store.clone(),
+        Box::new(store),
+        false,
+    );
+    let hangs = hanging(&mut node, remote, &[node_txid(&nodes[3])]);
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[7, 6, 5, 4, 3]));
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    assert_eq!(
+        record_shape(&node.store.deferred_graphs()[0]),
+        (4, vec![outpoint_of(&nodes[3])], 5, 1, "time".into())
+    );
+    for pass in 2..=DEFERRED_GRAPH_MAX_PASSES {
+        let (topic, sent) = node.tick().await;
+        assert_eq!(
+            sent,
+            txids(&nodes, &[3]),
+            "pass {pass}: the stuck node alone"
+        );
+        assert_eq!(deferral(&topic), (1, 1, 0, vec![]));
+        assert_eq!(node.store.deferred_graphs()[0].passes, pass);
+    }
+    // The pass after the last: dropped with its reason, nothing asked, the
+    // UTXO failed (held below the cursor), no record left.
+    let (topic, sent) = node.tick().await;
+    assert!(sent.is_empty());
+    assert_eq!(deferral(&topic), (0, 0, 0, vec!["max_passes".to_string()]));
+    assert_eq!(topic.dropped_graphs[0].outpoint, outpoint_of(&nodes[7]));
+    assert!(node.store.deferred_graphs().is_empty());
+    assert_eq!(node.cursor().await, 0);
+    // The next pass walks it from its root, a new record.
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[7, 6, 5, 4, 3]));
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    // The peer heals: the graph converges from the record.
+    hangs.borrow_mut().clear();
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[3, 2, 1, 0]));
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]));
+    assert_eq!(state.borrow().admitted.len(), 8);
+    assert_eq!(held(&node.store, &nodes).await, vec![(7, 0)]);
+    assert!(node.store.deferred_graphs().is_empty());
+    println!("#555 PIN B: a hung node deferred {DEFERRED_GRAPH_MAX_PASSES} passes, dropped max_passes, then healed and converged");
+}
+
+// PIN B2. A record past DEFERRED_GRAPH_MAX_BYTES is not kept: dropped
+// `too_big`, the UTXO fails as before #555, nothing is written.
+#[tokio::test]
+async fn e555_b2_a_record_past_its_byte_bound_is_dropped_too_big() {
+    let (_logs, _guard) = capture_logs();
+    let mut nodes = chain(4);
+    // The tip carries a 655 KB second output (ten 64 KB pushes): its hex
+    // alone is past 1 MiB.
+    let mut tip = Transaction::new();
+    tip.inputs
+        .push(TransactionInput::new(node_txid(&nodes[2]), 0));
+    tip.outputs.push(plain_output());
+    tip.outputs.push(TransactionOutput::new(
+        0,
+        LockingScript::from_hex(&format!("4dffff{}", "00".repeat(65_535)).repeat(10)).unwrap(),
+    ));
+    let tip_txid = tip.id();
+    nodes[3] = node_of(&tip, 0, Some(honest_proof(&tip_txid, 103)));
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[3]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 2, 60_000);
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[3, 2]));
+    assert!(nodes[3].raw_tx.len() > 1 << 20, "{}", nodes[3].raw_tx.len());
+    assert_eq!(deferral(&topic), (0, 0, 0, vec!["too_big".to_string()]));
+    assert!(node.store.deferred_graphs().is_empty());
+    assert_eq!(node.store.deferred_graph_writes(), 0);
+    assert_eq!(node.cursor().await, 0, "the UTXO failed: held");
+}
+
+// PIN C. Two deferred graphs on one topic resume IN ORDER (by their score,
+// the order the peer serves them), each from its own record.
+#[tokio::test]
+async fn e555_c_two_deferred_graphs_on_one_topic_resume_in_order() {
+    let (_logs, _guard) = capture_logs();
+    let a = salted_chain(5, 1);
+    let b = salted_chain(5, 2);
+    let nodes: Vec<GASPNode> = a.iter().chain(b.iter()).cloned().collect();
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        listing(&nodes, &[(4, 0), (9, 0)]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[4, 3, 2, 9, 8, 7]));
+    assert_eq!(deferral(&topic), (2, 0, 0, vec![]));
+    let records = node.store.deferred_graphs();
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| (r.score, r.outpoint.clone()))
+            .collect::<Vec<_>>(),
+        vec![(1, outpoint_of(&nodes[4])), (2, outpoint_of(&nodes[9]))]
+    );
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[1, 0, 6, 5]), "a's pending, then b's");
+    assert_eq!(deferral(&topic), (0, 2, 2, vec![]));
+    assert!(node.store.deferred_graphs().is_empty());
+    assert_eq!(held(&node.store, &nodes).await, vec![(4, 0), (9, 0)]);
+    assert_eq!(node.cursor().await, 2);
+}
+
+// PIN D. #554 across a resume: the deferred UTXO is served AGAIN by the next
+// page of the same sync (the responder serves `score >= since`); it is
+// resumed once and written once per sync, never walked a second time there.
+#[tokio::test]
+async fn e555_d_a_deferred_utxo_is_resumed_once_per_sync_though_served_twice() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[7]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    node.tick().await;
+    let writes = node.store.deferred_graph_writes();
+    let (topic, sent) = node.tick().await;
+    // Two pages (the second re-serves the UTXO) and three node requests.
+    assert_eq!(
+        node.clock.spent.get(),
+        2 + 3,
+        "the UTXO was served by both pages"
+    );
+    assert_eq!(sent, txids(&nodes, &[4, 3, 2]));
+    assert_eq!((topic.resumed_graphs, topic.deferred_graphs), (1, 1));
+    assert_eq!(node.store.deferred_graph_writes(), writes + 1);
+}
+
+// PIN E. e1d's rule over a RESUMED graph: the finalize submit of link 1
+// FAULTS (a D1 outage) on the tick that completes the resumed walk. Nothing
+// after it is submitted (links 2 and 3 are never recorded over a predecessor
+// that did not land), the old head stays, and the walk is KEPT (`not_landed`,
+// nothing pending): the next tick completes it again without one request and
+// lands the chain.
+#[tokio::test]
+async fn e555_e_a_resumed_graph_whose_finalize_does_not_land_records_no_successor() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(4);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let store = Rc::new(MemoryStorage::new());
+    let scripted = ScriptedStore::armed(&store, node_txid(&nodes[1]), 0, InsertEvent::Faults);
+    let outage = scripted.armed.clone();
+    let mut node = Budgeted::over(
+        RecordingRemote::new(&nodes, &[3]),
+        Box::new(HeadChainManager(state.clone())),
+        RequestClock::allowing(1000),
+        store,
+        Box::new(scripted),
+        true,
+    );
+    node.engine.set_graph_budget(never(), 2, 60_000);
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[3, 2]));
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[1, 0]));
+    assert_eq!(deferral(&topic), (1, 1, 0, vec![]));
+    assert!(
+        row_exists(&node.store, &nodes[0]).await,
+        "the old head stays (marked spent until the replay, #559)"
+    );
+    assert!(!row_exists(&node.store, &nodes[2]).await && !row_exists(&node.store, &nodes[3]).await);
+    assert_eq!(
+        applied_rows(&node.store, &nodes).await,
+        [true, false, false, false],
+        "no successor recorded over the link that did not land"
+    );
+    let records = node.store.deferred_graphs();
+    assert_eq!(
+        record_shape(&records[0]),
+        (4, vec![], 4, 2, "not_landed".into())
+    );
+    assert_eq!(node.cursor().await, 0);
+
+    outage.borrow_mut().take();
+    let (topic, sent) = node.tick().await;
+    assert!(sent.is_empty(), "completed again from the record, no walk");
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]));
+    assert_eq!(held(&node.store, &nodes).await, vec![(3, 0)]);
+    assert_eq!(applied_rows(&node.store, &nodes).await, [true; 4]);
+    assert!(node.store.deferred_graphs().is_empty());
+}
+
+// PIN G. The other graphs of a pass complete while one is deferred: a deep
+// graph listed FIRST no longer holds the pass, the one after it is admitted
+// in the same tick, and the cursor stays below the deferred one.
+#[tokio::test]
+async fn e555_g_the_other_graphs_of_a_pass_complete_while_one_is_deferred() {
+    let (_logs, _guard) = capture_logs();
+    let deep = salted_chain(8, 1);
+    let shallow = salted_chain(1, 2);
+    let nodes: Vec<GASPNode> = deep.iter().chain(shallow.iter()).cloned().collect();
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        listing(&nodes, &[(7, 0), (8, 0)]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[7, 6, 5, 8]));
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    assert_eq!(topic.finalized_graphs, 1);
+    assert_eq!(
+        held(&node.store, &nodes).await,
+        vec![(8, 0)],
+        "the shallow graph is in"
+    );
+    assert_eq!(node.cursor().await, 0, "below the deferred graph");
+
+    let (_, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[4, 3, 2]), "the held one is not asked");
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[1, 0]));
+    assert_eq!(topic.converged_graphs, 1);
+    assert_eq!(held(&node.store, &nodes).await, vec![(7, 0), (8, 0)]);
+    assert_eq!(node.cursor().await, 2);
+}
+
+// PIN H. The per-PEER deadline (D16) that cuts a walk defers it too: pin F's
+// graph (8 links, a tick of five calls), which on cf933e8 is dropped whole
+// on every tick and never admitted, converges in two ticks.
+#[tokio::test]
+async fn e555_h_a_walk_cut_by_the_per_peer_deadline_is_deferred_and_converges() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(8);
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&nodes, &[7]),
+        Box::new(HeadChainManager(state.clone())),
+        5,
+    );
+    node.engine.set_graph_budget(never(), 100, 60_000);
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[7, 6, 5, 4, 3]));
+    assert_eq!(topic.deadline_dropped_graphs, 1);
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    assert_eq!(
+        record_shape(&node.store.deferred_graphs()[0]),
+        (
+            4,
+            vec![outpoint_of(&nodes[3])],
+            5,
+            1,
+            "peer_deadline".into()
+        )
+    );
+    assert_eq!(node.failures().await, 0, "a deferral is progress");
+
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[3, 2, 1, 0]), "only what was pending");
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]));
+    assert_eq!(state.borrow().admitted.len(), 8);
+    assert_eq!(held(&node.store, &nodes).await, vec![(7, 0)]);
+}
+
+// PIN F. The two other ends of a record. (1) The measured case's way out:
+// the root was served UNPROVEN (its every input an SPV necessity) and is
+// re-asked at each resume; once its block lands the peer serves it PROVEN,
+// the record is dropped (`root_proven`) and the walk restarts from the
+// proven root. (2) A record whose UTXO a completed sync is no longer served
+// (spent at the peer) is dropped (`not_served`).
+#[tokio::test]
+async fn e555_f_a_root_proven_since_restarts_and_an_unserved_record_is_dropped() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(6);
+    let mut unproven = nodes.clone();
+    unproven[5].proof = None;
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(
+        RecordingRemote::new(&unproven, &[5]),
+        Box::new(HeadChainManager(state.clone())),
+        1000,
+    );
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[5, 4, 3]));
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    assert!(node.store.deferred_graphs()[0].nodes[0]
+        .node
+        .proof
+        .is_none());
+
+    // The block lands: the peer serves the root with its proof.
+    let mut mined = RecordingRemote::new(&nodes, &[5]);
+    mined.requests = node.requests.clone();
+    node.engine.set_gasp_remote_factory(Box::new(MeteredRemote {
+        inner: mined,
+        clock: node.clock.clone(),
+    }));
+    let (topic, sent) = node.tick().await;
+    assert_eq!(
+        sent,
+        txids(&nodes, &[5, 5, 4]),
+        "the re-ask, then the walk from it"
+    );
+    assert_eq!(deferral(&topic), (1, 1, 0, vec!["root_proven".to_string()]));
+    let record = &node.store.deferred_graphs()[0];
+    assert!(record.nodes[0].node.proof.is_some());
+    assert_eq!(record.passes, 1, "a new record");
+
+    // The peer no longer lists the UTXO.
+    let mut spent = RecordingRemote::new(&nodes, &[]);
+    spent.requests = node.requests.clone();
+    node.engine.set_gasp_remote_factory(Box::new(MeteredRemote {
+        inner: spent,
+        clock: node.clock.clone(),
+    }));
+    let (topic, sent) = node.tick().await;
+    assert!(sent.is_empty());
+    assert_eq!(deferral(&topic), (0, 0, 0, vec!["not_served".to_string()]));
+    assert!(node.store.deferred_graphs().is_empty());
 }

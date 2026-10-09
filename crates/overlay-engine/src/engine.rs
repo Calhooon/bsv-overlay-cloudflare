@@ -4881,8 +4881,11 @@ impl Engine {
                             // A tick that finalized a graph or moved the
                             // cursor reached a live peer: not a failed
                             // attempt for the quarantine count.
-                            outcome_success =
-                                peer_finalized.get() > 0 || completed > last_interaction;
+                            // So did one that DEFERRED a graph (bsv-low
+                            // #555): its walk is saved and resumed.
+                            outcome_success = peer_finalized.get() > 0
+                                || completed > last_interaction
+                                || sync.deferral_stats().deferred > 0;
                             warn!(
                                 "[GASP SYNC] {peer_url} for {topic} at the deadline: finalized_graphs={} deadline_dropped_graphs={in_flight} cursor {last_interaction} -> {} (bsv-low #552)",
                                 peer_finalized.get(),
