@@ -496,7 +496,8 @@ deeper than the budget (#555), the unbounded anchor verify (#557), a "not
 now" over a BEEF above 90,000 bytes answering 502 (#568). It cannot tell a faulted predecessor from one nobody submitted
 yet: the successor is "not now" until it lands. And a transaction that admits
 nothing, found no coin and carries more UNPROVEN, UNLANDED bodies than 16
-reads settle (five single-input ancestors, fewer with more inputs) is "not
+reads settle (six single-input ancestors or more: five are settled, measured
+by the #576 delta-2 lens; fewer with more inputs) is "not
 now" on every submit, where the reference records it: three retries and a
 dead letter each. So is one whose question needs more than 256 reads over
 the submit's topics, whatever its bodies are (a landed body costs one read by
@@ -543,7 +544,7 @@ one written by a finalize over a predecessor the peer pruned, or one an
 eviction stripped of its predecessor's rows, is recorded over an unlanded
 predecessor: the pruned case is limit (4), the eviction L2's guard.
 
-## The dead letters (bsv-low #576, its lens fold and its delta fold of 2026-10-08)
+## The dead letters (bsv-low #576, its lens fold, delta fold and delta-2 fold of 2026-10-08)
 
 A mutation the queue dead-letters (a `/submit` or `/arc-ingest` replay that
 was not durable on any of its 1 + `max_retries` deliveries, an e1d "not now"
@@ -589,6 +590,52 @@ delta fold D-L1), shown as `ceiling.full`, and LOST after ~48 h at the
 ceiling (lens M2: a stranger's "not now" bodies, limit (4) above, fill the
 ceiling, not the shared D1).
 
+The ceiling is split by CLASS (the delta-2 fold, D2-M1). The delta-2 lens ran
+it: a subject with six unproven, unconfirmed ancestors is "not now" on every
+presentation through the PUBLIC gated door, one letter per topic subset (up
+to 8,191 on LOW's 13 topics) and per sibling subject. The 3 retries bound
+the deliveries of a letter, not the number of letters, so a stranger filled
+the 2000 places and every HONEST letter after them (a D1 fault on a real
+admission that the door had acked "queued") was lost after ~48 h. Each row
+now carries `class` (migrations 168-169), written by the main consumer's note
+of each failed replay (the last note wins): `not_now` when EVERY fault of the
+replay is the engine's `predecessor_not_landed`; `fault` for anything else,
+and for a letter no note reached (an unknown is treated as an honest letter).
+A NEW `not_now` letter is deferred like a letter at the ceiling (the same
+backoff, LOST after ~48 h; counted on every delivery,
+`dead_letters_not_now_deferrals_total`, apart from the ceiling's counters)
+at any of three bounds (`ceiling_verdict`):
+- `NOT_NOW_PER_TXID` = 1: one `not_now` letter per txid over all its topic
+  sets. Another topic set waits until that letter resolves or is discarded.
+  An honest successor is presented under one topic set.
+- `NOT_NOW_MAX` = 1000: half the ceiling. Fault letters always keep 1000
+  places, however long a flood runs; fault letters themselves may fill all
+  2000.
+- `NOT_NOW_PER_DAY` = 200: new `not_now` letters parked in a trailing 24 h,
+  counted from the held letters' `parked_at`, so a discard frees the day's
+  room too. The gated door carries no caller identity ("not a per-identity
+  handshake", `submit_gate.rs`), so the bound is per day, not per source. The
+  share then fills in five days at the soonest, not at door speed.
+
+A key that already holds bytes is never deferred: a copy, or a re-park of a
+re-driven letter whose replay is now "not now". One row per (txid, topics) was
+already the primary key. A re-presentation collapses onto that row: the
+history grows (capped at 20 entries), the rows do not. A "not now" letter
+keeps its bytes. The cheaper byte-less form was not taken because nothing
+could re-read the body after the queue's ack. The health block names the
+classes apart: `classes.fault` {`held`, `kept` (1000), `room`} and
+`classes.notNow` {`held`, `max`, `full`, `perTxid`, `perDay`,
+`parkedLast24h`, `dayFull`}.
+
+What the split does NOT do, stated:
+- Honest "not now" letters share the 1000 places and the 200 a day with a
+  stranger's. During a flood an honest successor's letter waits and can be
+  LOST. That letter converges again only when its client re-presents it after
+  its predecessor lands, or when a GASP peer brings it in.
+- A stranger who can make a FAULT-class letter at will is outside this bound
+  (a storage fault, a body the replay cannot parse that the door accepted).
+  None is known; the door builds every enqueued message from bytes it parsed.
+
 The ceiling does not drain by itself (delta fold, D-M1): only an ack of a
 replay and the operator's discard take a letter out, and a letter that can
 never land (exhausted, `undecodable:`, `unparsed:`, a body the engine
@@ -598,12 +645,16 @@ or past it logs `[dead-letters] the ceiling is NEAR`. `POST
 /internal/discard-dead-letters` (the same bearer), body `{"letters":
 [{"txid": "<key>", "topics"?: "<sorted, comma-joined>"}, ...]}`, 1 to 50
 keys per call (more is a 400, not clamped), deletes those PARKED letters
-(no `topics`: every parked row of the txid; never a `redriven` letter in
-flight, never a `failing` note), the second scoped delete of the table
+(no `topics`: the parked rows of the txid; never a `redriven` letter in
+flight, never a `failing` note), at most 50 ROWS per call over all its keys,
+oldest parked first (the delta-2 fold, D2-L1: a txid alone deleted all its
+rows in one statement, 120 in the lens's run, every row's bytes returned at
+once), the second scoped delete of the table
 (`DISCARD_SQL`), logs each `[dead-letters] DISCARDED <txid> [<topics>]
 sha256=<bytes' hash> bytes=<n>` with its re-drives and last fault, counts
 `dead_letters_discarded_total`, and answers `discarded` (with each hash),
-`notFound` and `faults`. A discarded letter's bytes exist nowhere after it:
+`notFound`, `faults`, `notTried` (keys past the call's 50 rows) and `more`
+(a txid alone that may hold more rows: call again). A discarded letter's bytes exist nowhere after it:
 it is the operator's word, as a re-drive is.
 
 `POST /internal/redrive-dead-letters` (bearer `INTERNAL_TOKEN`, as
@@ -641,9 +692,11 @@ only by the operator (`POST /internal/redrive-dead-letters`, bearer
 `INTERNAL_TOKEN`, at most 200 per call, oldest parked first, one enqueue per
 claim, at most 3 re-drives per letter then forced by txid, a claim older
 than an hour returned to the parked set by the NEXT lever call, listed on
-`/health/invariants.deadLetters`; at most 2000 letters hold bytes, a full
+`/health/invariants.deadLetters`; at most 2000 letters hold bytes, of which
+at most 1000 are "not now" letters (one per txid, 200 new a day), so a
+stranger's flood of them leaves 1000 places to fault letters; a full
 ceiling drains only by an ack or the operator's discard by key, `POST
-/internal/discard-dead-letters`, at most 50 per call, each logged with the
+/internal/discard-dead-letters`, at most 50 letters per call, each logged with the
 hash of its bytes). ts-stack's `overlay-express` has no queue and no dead
 letter (`Engine.submit` catches per topic and never replays): the whole
 lifecycle is our platform's addition, and so are its stated losses (a park
@@ -651,7 +704,9 @@ that faults on every DLQ delivery for ~48 h, logged LOST, or for ~8.3 h
 with NO LOST line when the platform's `attempts` cannot be read, 101
 deliveries at the configured 300 s; a new letter deferred at the ceiling
 for as long, the ceiling filling for good with letters that never land
-unless the operator discards them; a discarded letter)."
+unless the operator discards them; a "not now" letter deferred at its
+class's bounds for as long, an honest one included during a flood; a
+discarded letter)."
 
 Limits, stated. The first deferral is read from `attempts == 1`: if the
 platform's count is absent, or does not restart at 1 on the DLQ move (the
@@ -691,7 +746,22 @@ deferrals; `l2` `attempts=` on the three ack lines; `l3` the `RESOLVED`
 words per reason), each RED on `28f5d0b` (they do not compile there) and
 against its fix reverted alone, and the route tier's leg 10 (a
 full ceiling defers a real dead letter, the discard lever's bearer and
-body, a discard, the letter then parked; RED on `28f5d0b`).
+body, a discard, the letter then parked; RED on `28f5d0b`). The delta-2
+fold's pins `e576f3_*`:
+- `m1_a_strangers_flood_leaves_room_for_a_fault_letter`: eight days of a
+  flood held to 200 a day and 1000 in all, then a fault letter parked, fault
+  letters up to 2000, the NEAR count, the `classes` health, the wiring.
+- `m1_one_txid_holds_one_not_now_letter`: five other topic sets deferred, ten
+  re-presentations on one row, fault letters not bounded per txid, the class
+  of a replay.
+- `l1`: 120 rows of one txid taken 50 at a time, oldest first.
+- `l2`: NEAR at 1600 and not at 1599, over the real read, its log line in a
+  bounded slice.
+
+Each is RED on `66d069f` (97 compile errors with the module grafted) and
+against its fix reverted alone (8 mutants). Route leg 11: the real e1d letters
+are `not_now`; the share is filled; a real "not now" letter is deferred,
+counted apart; the same key as a fault letter is then parked.
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 
