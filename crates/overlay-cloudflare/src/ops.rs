@@ -1199,7 +1199,11 @@ pub async fn health_invariants(
     let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);
     let mut index_janitor = index_janitor_backlog(db).await;
     let dead_letters = crate::dead_letters::health_json(db).await;
-    let deferred_graphs = crate::gasp_deferred::health_json(db).await;
+    let deferred_graphs = crate::gasp_deferred::health_json(
+        db,
+        crate::gasp_deferred::graph_budget_limbs_from_env(env),
+    )
+    .await;
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);
     let body = json!({

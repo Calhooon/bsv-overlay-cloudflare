@@ -28,16 +28,62 @@ pub const GASP_GRAPH_BUDGET_MS: u64 = 15_000;
 
 /// Bytes one graph may be SERVED in one pass on this worker (bsv-low #586):
 /// the hex of each node's raw transaction and proof, as the peer sends it and
-/// a record keeps it. The engine's default
-/// ([`overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_BYTES`], 4 MiB). Reached, the
-/// graph is DEFERRED as at the calls (reason `bytes`), never dropped or
-/// refused: a budget per pass, not a limit.
+/// a record keeps it. Reached, the graph is DEFERRED as at the calls (reason
+/// `bytes`), never dropped or refused: a budget per pass, not a limit.
+///
+/// The DEFAULT, and the engine's
+/// ([`overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_BYTES`]): seven eighths of
+/// the record cap (`DEFERRED_GRAPH_MAX_BYTES`), 917,504 bytes while the cap is
+/// 1 MiB, so the pass it cuts leaves a record that FITS (the lens fold's
+/// E586-L1; it was 4 MiB, and a pass of 26 KB heads was cut only once its
+/// record was `too_big`). 18 heads of 26 KB a pass. An operator names another
+/// with the var of the same name ([`graph_budget_limbs`]).
 pub const GASP_GRAPH_BUDGET_BYTES: u64 = overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_BYTES;
 
 /// Nodes one graph may APPEND in one pass on this worker (bsv-low #586). The
-/// engine's default ([`overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_NODES`],
-/// 64). Reached, the graph is deferred (reason `nodes`).
+/// DEFAULT, the engine's ([`overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_NODES`],
+/// 64). Reached, the graph is deferred (reason `nodes`). The var of the same
+/// name sets another ([`graph_budget_limbs`]).
 pub const GASP_GRAPH_BUDGET_NODES: u32 = overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_NODES;
+
+/// The names of the two vars (`[vars]` of a wrangler config): the consts'.
+pub const GASP_GRAPH_BUDGET_BYTES_VAR: &str = "GASP_GRAPH_BUDGET_BYTES";
+pub const GASP_GRAPH_BUDGET_NODES_VAR: &str = "GASP_GRAPH_BUDGET_NODES";
+
+/// The most the bytes var may name: the record cap itself. Above it the limb
+/// is the lens's E586-L1 again (a pass is cut only once its record cannot be
+/// kept); between the default and it, the operator spends the margin.
+pub const GASP_GRAPH_BUDGET_BYTES_MAX: u64 = overlay_engine::gasp::DEFERRED_GRAPH_MAX_BYTES as u64;
+
+/// The two limbs this worker runs with, (bytes, nodes), from the vars
+/// `GASP_GRAPH_BUDGET_BYTES` and `GASP_GRAPH_BUDGET_NODES` as the operator
+/// set them (the lens fold's E586-L1: they were compile-time, so the remedy
+/// `CLAUDE.md` named, "set the limbs under the cap", needed a rebuild). A
+/// decimal integer, CLAMPED: bytes to 1 ..= [`GASP_GRAPH_BUDGET_BYTES_MAX`],
+/// nodes to 1 ..= [`GASP_GRAPH_BUDGET_CALLS`] (a node appended is a call
+/// made, so more would never be reached). Unset, empty or not a number: the
+/// default const. Never 0: a limb of 0 is spent before the pass's first
+/// request, and the walk would append nothing on every pass.
+pub fn graph_budget_limbs(bytes: Option<&str>, nodes: Option<&str>) -> (u64, u32) {
+    let named = |v: Option<&str>| v.and_then(|v| v.trim().parse::<u64>().ok());
+    (
+        named(bytes).map_or(GASP_GRAPH_BUDGET_BYTES, |b| {
+            b.clamp(1, GASP_GRAPH_BUDGET_BYTES_MAX)
+        }),
+        named(nodes).map_or(GASP_GRAPH_BUDGET_NODES, |n| {
+            n.clamp(1, u64::from(GASP_GRAPH_BUDGET_CALLS)) as u32
+        }),
+    )
+}
+
+/// [`graph_budget_limbs`] over this worker's environment.
+pub fn graph_budget_limbs_from_env(env: &worker::Env) -> (u64, u32) {
+    let var = |name: &str| env.var(name).ok().map(|v| v.to_string());
+    graph_budget_limbs(
+        var(GASP_GRAPH_BUDGET_BYTES_VAR).as_deref(),
+        var(GASP_GRAPH_BUDGET_NODES_VAR).as_deref(),
+    )
+}
 
 /// The table: one row per deferred graph. `record` is the engine's
 /// `DeferredGraph` as JSON (at most `DEFERRED_GRAPH_MAX_BYTES`, under D1's 2 MB
@@ -309,7 +355,12 @@ struct CountRow {
 }
 
 /// PURE: the health block from the count, the bytes held and the oldest rows.
-pub fn health_view(count: u64, total_bytes: u64, rows: &[HealthRow]) -> serde_json::Value {
+pub fn health_view(
+    count: u64,
+    total_bytes: u64,
+    rows: &[HealthRow],
+    limbs: (u64, u32),
+) -> serde_json::Value {
     let n = |v: f64| v.max(0.0) as u64;
     let graphs: Vec<serde_json::Value> = rows
         .iter()
@@ -338,8 +389,8 @@ pub fn health_view(count: u64, total_bytes: u64, rows: &[HealthRow]) -> serde_js
         "budget": {
             "calls": GASP_GRAPH_BUDGET_CALLS,
             "ms": GASP_GRAPH_BUDGET_MS,
-            "bytesFetched": GASP_GRAPH_BUDGET_BYTES,
-            "nodes": GASP_GRAPH_BUDGET_NODES,
+            "bytesFetched": limbs.0,
+            "nodes": limbs.1,
             "maxPasses": overlay_engine::gasp::DEFERRED_GRAPH_MAX_PASSES,
             "maxBytes": overlay_engine::gasp::DEFERRED_GRAPH_MAX_BYTES,
             "perPeerTopic": overlay_engine::gasp::DEFERRED_GRAPHS_PER_PEER_TOPIC,
@@ -358,7 +409,7 @@ pub fn health_view(count: u64, total_bytes: u64, rows: &[HealthRow]) -> serde_js
 /// of the oldest [`HEALTH_LIST_MAX`] graphs {topic, peer, outpoint, nodes,
 /// pending, calls, passes, reason, bytes, ageSecs}. `readable: false` when
 /// the table cannot be read (a pre-migration isolate), distinct from none.
-pub async fn health_json(db: &D1Database) -> serde_json::Value {
+pub async fn health_json(db: &D1Database, limbs: (u64, u32)) -> serde_json::Value {
     let Ok(count) = Query::new(HEALTH_COUNT_SQL)
         .fetch_optional::<CountRow>(db)
         .await
@@ -378,7 +429,7 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
     } else {
         Vec::new()
     };
-    health_view(count, total_bytes, &rows)
+    health_view(count, total_bytes, &rows, limbs)
 }
 
 #[cfg(test)]
@@ -917,6 +968,65 @@ mod tests {
     /// bsv-low #555: the health block names the count, the oldest and each
     /// graph {topic, peer, outpoint, nodes, pending, calls, passes, reason,
     /// bytes, ageSecs}, with the budget it runs under.
+    // bsv-low #586, the lens fold (E586-L1). The worker's default bytes limb
+    // sits UNDER the record cap (seven eighths of it, the engine's default),
+    // so the pass it cuts leaves a record that fits; and the two limbs are
+    // vars an operator sets, clamped, the consts their defaults. RED on
+    // `589bc2d`: the default was 4 MiB and `graph_budget_limbs` did not exist.
+    #[test]
+    fn e586f_l1_the_limbs_default_under_the_record_cap_and_are_vars() {
+        let cap = overlay_engine::gasp::DEFERRED_GRAPH_MAX_BYTES as u64;
+        assert_eq!(GASP_GRAPH_BUDGET_BYTES, cap / 8 * 7);
+        assert_eq!(GASP_GRAPH_BUDGET_BYTES, 917_504, "while the cap is 1 MiB");
+        assert_eq!(
+            GASP_GRAPH_BUDGET_BYTES,
+            overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_BYTES
+        );
+        assert_eq!(GASP_GRAPH_BUDGET_NODES, 64);
+        // A 26 KB head is 52,236 hex bytes (the #586 witness's): the limb is
+        // read before a step, so a fresh pass is served 18 and its record
+        // (1.0059x what it was served, the lane's pin E) fits.
+        let heads = GASP_GRAPH_BUDGET_BYTES.div_ceil(52_236);
+        assert_eq!(heads, 18);
+        assert!(heads * 52_236 * 10_059 / 10_000 < cap);
+
+        // Unset, empty, not a number: the defaults.
+        let defaults = (GASP_GRAPH_BUDGET_BYTES, GASP_GRAPH_BUDGET_NODES);
+        assert_eq!(graph_budget_limbs(None, None), defaults);
+        assert_eq!(graph_budget_limbs(Some(""), Some("  ")), defaults);
+        assert_eq!(graph_budget_limbs(Some("4MiB"), Some("-3")), defaults);
+        assert_eq!(graph_budget_limbs(Some("1e6"), Some("6.5")), defaults);
+        // Named: taken as is inside the clamp, each on its own.
+        assert_eq!(
+            graph_budget_limbs(Some("400000"), Some("12")),
+            (400_000, 12)
+        );
+        assert_eq!(graph_budget_limbs(Some(" 400000 "), None), (400_000, 64));
+        assert_eq!(graph_budget_limbs(None, Some("12")), (917_504, 12));
+        // Clamped: never 0 (no step would be made), never past the record
+        // cap (E586-L1 again), never more nodes than calls.
+        assert_eq!(graph_budget_limbs(Some("0"), Some("0")), (1, 1));
+        assert_eq!(
+            graph_budget_limbs(Some("4194304"), Some("5000")),
+            (cap, GASP_GRAPH_BUDGET_CALLS)
+        );
+        assert_eq!(
+            graph_budget_limbs(Some("18446744073709551615"), Some("4294967296")),
+            (cap, GASP_GRAPH_BUDGET_CALLS)
+        );
+        assert_eq!(GASP_GRAPH_BUDGET_BYTES_VAR, "GASP_GRAPH_BUDGET_BYTES");
+        assert_eq!(GASP_GRAPH_BUDGET_NODES_VAR, "GASP_GRAPH_BUDGET_NODES");
+
+        // The wiring: the engine and the health block both take the vars.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains(
+            "let (limb_bytes, limb_nodes) = crate::gasp_deferred::graph_budget_limbs_from_env(env);\n    engine.set_graph_budget_limbs(limb_bytes, limb_nodes);"
+        ));
+        assert!(!lib.contains("gasp_deferred::GASP_GRAPH_BUDGET_BYTES"));
+        let ops = include_str!("ops.rs");
+        assert!(ops.contains("crate::gasp_deferred::graph_budget_limbs_from_env(env)"));
+    }
+
     #[test]
     fn e555_the_health_block_names_each_deferred_graph() {
         let row = HealthRow {
@@ -931,7 +1041,12 @@ mod tests {
             bytes: 51_000.0,
             age_secs: Some(180.0),
         };
-        let v = health_view(1, 51_000, &[row]);
+        let v = health_view(
+            1,
+            51_000,
+            &[row],
+            (GASP_GRAPH_BUDGET_BYTES, GASP_GRAPH_BUDGET_NODES),
+        );
         assert_eq!(v["readable"], true);
         assert_eq!(v["count"], 1);
         assert_eq!(v["totalBytes"], 51_000);
@@ -960,10 +1075,20 @@ mod tests {
         );
         assert_eq!(v["budget"]["calls"], GASP_GRAPH_BUDGET_CALLS);
         assert_eq!(v["budget"]["ms"], GASP_GRAPH_BUDGET_MS);
-        // bsv-low #586: the two limbs, the engine's defaults.
-        assert_eq!(v["budget"]["bytesFetched"], 4u64 << 20);
+        // bsv-low #586: the two limbs, the engine's defaults (the bytes
+        // under the record cap since the lens fold's E586-L1).
+        assert_eq!(v["budget"]["bytesFetched"], 917_504);
         assert_eq!(v["budget"]["nodes"], 64);
-        let none = health_view(0, 0, &[]);
+        // The limbs served are the ones the worker runs with (the vars).
+        let tuned = health_view(0, 0, &[], (400_000, 12));
+        assert_eq!(tuned["budget"]["bytesFetched"], 400_000);
+        assert_eq!(tuned["budget"]["nodes"], 12);
+        let none = health_view(
+            0,
+            0,
+            &[],
+            (GASP_GRAPH_BUDGET_BYTES, GASP_GRAPH_BUDGET_NODES),
+        );
         assert_eq!(
             (none["count"].clone(), none["oldest"].clone()),
             (serde_json::json!(0), serde_json::Value::Null)

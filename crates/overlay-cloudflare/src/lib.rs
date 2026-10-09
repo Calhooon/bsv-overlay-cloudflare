@@ -1120,10 +1120,10 @@ fn build_engine_with_storage(
     // bsv-low #586: the same budget's bytes and nodes limbs. A graph served
     // that many bytes, or appending that many nodes, in one pass is deferred
     // and resumed like one past its calls: a budget per pass, never a limit.
-    engine.set_graph_budget_limbs(
-        crate::gasp_deferred::GASP_GRAPH_BUDGET_BYTES,
-        crate::gasp_deferred::GASP_GRAPH_BUDGET_NODES,
-    );
+    // The vars GASP_GRAPH_BUDGET_BYTES / GASP_GRAPH_BUDGET_NODES, clamped;
+    // unset, the defaults (the bytes under the record cap, E586-L1).
+    let (limb_bytes, limb_nodes) = crate::gasp_deferred::graph_budget_limbs_from_env(env);
+    engine.set_graph_budget_limbs(limb_bytes, limb_nodes);
 
     // Chain-backed proof fetcher (#192/#193): the courier ladder
     // (Arcade→WoC→Bitails) with a MANDATORY chaintracks re-verify before any
