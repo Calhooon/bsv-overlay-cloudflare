@@ -1012,7 +1012,37 @@ for 6 h, and so on, keeps its slice in the yieldless hours (a third of its
 ticks at most), as #302's residual. At `*/15` a hostile peer is still counted
 failed from its 13th yieldless sync (3 h) and quarantined at its 20th (5 h);
 at one tick a minute from 3 h on and quarantined 8 ticks later; then one
-probe per 6 h, each probe failed. Why 12 and 3 h: an honest deep graph converges inside both.
+probe per 6 h, and each probe that serves work fails.
+
+A QUARANTINED peer is re-admitted only by a YIELD (the delta-4 fold's D4-L2;
+with a per-graph budget). A peer that was at the quarantine threshold (8
+failures) when its sync began, and whose sync did not fail and yielded
+nothing (an EMPTY listing at its probe; a walk that only progressed), is NOT
+RECORDED: `record_peer_sync_outcome` is not called, so its failures stay and
+its last-attempt stamp stays. The peer is then attended on every tick (the
+reprobe window stays open) until it yields, which lifts the quarantine and
+clears the streak, or fails, which re-arms the quarantine for 6 h at once.
+Before the fold (on `9280aed` too) the empty probe was a success: failures 0,
+the next yieldless sync a fresh streak, and a hostile peer that answered the
+first listing after its six silent hours with an empty list kept 100 of 200
+ticks at `*/15` (the delta-4 lens's DELTA4-2, engine and shipped SQL). Now
+its slices with work are one per reprobe window (27 of 200; 7 empty probes,
+each a listing request and nothing else). The honest side, stated: a
+quarantined peer that has gone QUIET is not stranded and needs no exit of its
+own (no "N empty probes lift it"): it is asked its listing on every tick and
+its first new UTXO that lands lifts it; until then one failed sync (a
+timeout) costs it 6 h, where a peer below the threshold has eight. Below the
+threshold nothing changed: an empty listing is a success and resets the
+failures (#302's accepted residual, one success in every 8 ticks, stands,
+and an empty listing is such a success). A health read that faults reads 0
+failures, the old rule. The delta-4 lens's D4-N1, stated: a row with an old
+streak past 12 that no yield ever cleared (its graph vanished), then one
+failed sync, then fresh yieldless work: the first such sync continues the old
+streak (the decay is not for a failed peer) and fails at once, and each after
+it until a yield; eight in a row quarantine the peer until a probe that
+yields. Reasoned, not run; the path is narrow.
+
+Why 12 and 3 h: an honest deep graph converges inside both.
 The measured one (#582) is an unproven head; the pass after its block lands
 restarts from the proven root (`root_proven`), one or two passes after a block
 that comes in ~10 min on average (past 3 h about once in 10^8 by the
@@ -1032,23 +1062,35 @@ spelling it advertised: `is_advertisable_uri` passes `/?1`, `/?2`, `:8443`,
 `/#x`, a trailing slash (DELTA2-3), each with its own share, its own
 quarantine and a fresh streak. The engine passes the origin to the three
 peer-health methods; the cursor and the records stay keyed by the URL the
-peer is synced at. A SHIP topic's peers are ONE per canonical authority
-(`gasp::ship_peers_by_origin`, the delta-3 fold's D3-L1): each advert is
-canonicalized to `scheme://host[:port]` (the scheme's default port dropped)
-and the spellings of one form (a query, a fragment, a user, a trailing slash
-or dot, `:443`) are one peer; every spelling of our own origin is ourselves.
-Distinct ports and schemes of one host stay distinct peers under that
-origin's ONE quarantine, streak and share: on `9280aed` one origin kept one
-peer, ranked `https` then no port, so a stranger's default-port spelling
-(`https://honest.example/?x`) DISPLACED an honest overlay serving on `:8443`.
-Stated: a stranger's ports of its own host are one peer each, a per-peer
-slice each per tick, until their shared quarantine (bounded by the outer
-240 s, after the configured topics; the URL-keyed peers before the delta-2
-fold took every spelling). A
+peer is synced at. A SHIP topic's peers are ONE PER ORIGIN
+(`gasp::ship_peers_by_origin`, D2-M2's rule, restored by the delta-4 fold's
+D4-M1): each advert is canonicalized to `scheme://host[:port]` (the scheme's
+default port dropped, so `:443` is no explicit port), and of the spellings of
+one origin the first by `https`, then no explicit port, then the string is
+the peer; every spelling of our own origin is ourselves. The delta-3 fold
+(`c8a39fd`) kept one peer per `scheme://host[:port]` while the failures stayed
+on ONE row per origin, and the delta-4 lens ran it (DELTA4-1): eight stranger
+adverts of DEAD PORTS of an honest host's name quarantined the honest peer
+(synced on 4 of 96 ticks), and seven were never quarantined (the honest
+success reset the shared count every tick: 672 dead-port slices in 96 ticks,
+seven 30 s slices of the 240 s belt). One peer per origin has neither: the
+honest default-port advert is the peer, on 96 of 96 ticks, and no dead port
+is asked. It also closes the lens's D4-L1 (`:0443`, `:00443`, `:08443`,
+`https+bsvauth://h:443`, `wss://h` were each a peer: they are spellings of
+one origin). The LIMIT, stated (the delta-3 lens's D3-L1, open by decision):
+two overlays of one host on two ports, on one SHIP topic, are one peer (the
+default port's), so a stranger's default-port spelling
+(`https://honest.example/?x`) DISPLACES an honest overlay that serves only on
+`:8443` for that topic. No instance today: this repository's discovered
+topics have no such host, and a Cloudflare-hosted overlay serves 443. An
+overlay that must be synced on another port is given as a CONFIGURED peer
+(`SyncTarget::Peers` is not deduplicated). A
 SUBDOMAIN is another origin (no public suffix list; the reserve below is what
 protects configured peers from it); two overlays of one host on two ports on
-one SHIP topic are two peers sharing one quarantine; two configured URLs of one host on one topic
-share one quarantine; a peer's health rows written before the fold (keyed by
+one SHIP topic are one peer; two configured URLs of one host on one topic
+are two peers sharing one quarantine (so D4-M1's shape exists for an
+operator's own configuration: eight dead configured ports of a host silence
+its live one); a peer's health rows written before the fold (keyed by
 URL) are left behind and its streak starts afresh; a SHIP peer whose advert
 ends in `/` gets a new cursor key (`https://h`) and is listed again from 0
 once (its held UTXOs are skipped).
@@ -1273,6 +1315,26 @@ Pins, each RED on `9280aed`'s sources (the tests over them):
 `d1_storage::tests::e555d3_m1_the_probe_of_a_quarantined_peer_continues_its_streak`
 (the lens's sequence over the SHIPPED statements, 15 s syncs at `*/15`: 27 of
 200; RED at tick 44).
+
+The delta-4 fold (the delta-4 lens on `2c8ab50`): D4-M1, D4-L1, D4-L2 and
+D4-N1 above. Pins, each RED on `2c8ab50`'s sources (`gasp.rs` and `engine.rs`
+put back in place, the tests over them):
+- `e555d4_m1_dead_port_adverts_of_an_honest_host_do_not_silence_it`
+  (DELTA4-1: 8, 12, 7 and 1 dead-port adverts, the honest peer on 96 of 96
+  ticks and no dead-port slice; RED `(4, 32)` at eight);
+- `e555d2_m2_spellings_of_one_server_are_one_origin_and_one_peer` (amended
+  back: one peer per origin, D3-L1's displacement as the stated limit, the
+  port spellings of D4-L1; RED, five peers);
+- `e555d4_l2_an_empty_listing_at_the_probe_does_not_lift_the_quarantine`
+  (DELTA4-2, 901 s a tick, 200 ticks: 27 slices with work, 7 empty probes,
+  none lifted; RED at tick 44, failures 0);
+- `e555d4_l2_a_quarantined_peer_gone_quiet_is_attended_and_a_yield_lifts_it`
+  (five quiet ticks attended with the failures kept, a landing graph lifts
+  it; seven failures and a quiet sync reset; no per-graph budget, #302's rule
+  alone; RED at the first quiet tick).
+
+The worker's sources did not change: the three shipped peer-health statements
+are `2c8ab50`'s, and the rule is the engine's (a call it does not make).
 
 ## Storage ownership (bsv-low #474)
 
