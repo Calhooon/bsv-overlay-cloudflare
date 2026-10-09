@@ -64,10 +64,25 @@ async function submit(body, { token } = {}) {
   // answer is the dev server's, not the route's, so a POST that meets it is
   // sent again (and the retry is printed). Any other 503 is not retried.
   for (let attempt = 1; ; attempt++) {
-    const res = await fetch(`${BASE}/submit`, { method: 'POST', headers, body })
+    let res
+    try {
+      res = await fetch(`${BASE}/submit`, { method: 'POST', headers, body })
+    } catch (e) {
+      // The dev server drops the connection while it reloads the worker after
+      // a large body (ECONNRESET, EPIPE, a refused connect); that is the dev
+      // server's, not the route's, so the body is sent again after a pause.
+      const code = e && e.cause && e.cause.code
+      if (attempt < 6 && /^(ECONNRESET|EPIPE|ECONNREFUSED|UND_ERR_SOCKET)$/.test(String(code))) {
+        console.log(`      (wrangler dev dropped the connection, ${code}; sending the ${body.length}-byte body again after a pause)`)
+        await new Promise((r) => setTimeout(r, 1500 * attempt))
+        continue
+      }
+      throw e
+    }
     const text = await res.text()
-    if (res.status === 503 && /restarted mid-request/.test(text) && attempt < 3) {
+    if (res.status === 503 && /restarted mid-request/.test(text) && attempt < 6) {
       console.log(`      (wrangler dev reloaded the worker; sending the ${body.length}-byte body again)`)
+      await new Promise((r) => setTimeout(r, 1000))
       continue
     }
     return { status: res.status, text }
