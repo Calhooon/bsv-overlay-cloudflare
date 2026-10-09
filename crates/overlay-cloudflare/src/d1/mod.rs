@@ -471,7 +471,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 179 → 182 for bsv-low #585 (2026-10-09, door 4; 176-178 before the land onto NL-6c and NL-6d):
 /// `gasp_deferred_graph_chunks` and `gasp_deferred_graphs.chunks` and `.gen` (a deferred graph's record of any size,
 /// chunked across rows); one table, two additive ALTERs.
-pub const OVERLAY_MIGRATION_COUNT: usize = 182;
+/// 182 → 185 for bsv-low #585 (2026-10-09, door 3; 179-181 before the land onto NL-6c and NL-6d):
+/// `mutation_dead_letters.r2_key` and `.r2_bytes` (a letter whose BEEF is held in R2) and the index the health block
+/// sums the bytes at rest from; two additive ALTERs, one index.
+pub const OVERLAY_MIGRATION_COUNT: usize = 185;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1771,6 +1774,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::gasp_deferred::DEFERRED_GRAPH_CHUNKS_CREATE,
     crate::gasp_deferred::DEFERRED_GRAPHS_CHUNKS_COLUMN,
     crate::gasp_deferred::DEFERRED_GRAPHS_GEN_COLUMN,
+    // bsv-low #585 (door 3): a dead letter whose BEEF is in R2 (`BEEF_BLOBS`) names its object's key and length
+    // beside the message that carries them, so the ack, the park and the discard find the object without reading
+    // the message, and the health block sums the bytes at rest from an index. NULL for an inline letter. Additive
+    // ALTERs; the runner ignores the re-run "duplicate column".
+    crate::dead_letters::DEAD_LETTERS_R2_KEY_COLUMN,
+    crate::dead_letters::DEAD_LETTERS_R2_BYTES_COLUMN,
+    crate::dead_letters::DEAD_LETTERS_R2_INDEX,
 ];
 
 // =============================================================================

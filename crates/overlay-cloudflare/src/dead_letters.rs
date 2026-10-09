@@ -65,6 +65,12 @@
 //! promoted by its park; one whose message the platform dropped on the main queue stays, a small row, counted in the
 //! health block.
 //!
+//! bsv-low #585 (door 3): a letter whose BEEF is past the queue's inline room carries its R2 key, not its bytes
+//! (`queue::BeefRef`; the row's `r2_key` / `r2_bytes`). The park writes the key without reading the object, the
+//! re-drive sends the key and the main consumer re-reads R2, the health block sums the bytes at rest, and the
+//! object is deleted with the letter: at its LOST line, when the copy rule drops it, at the operator's discard,
+//! and (by the main consumer) at the ack that resolves it. `queue.rs` holds the rule.
+//!
 //! Reference parity: ts-stack's `overlay-express` has no queue and no dead letter (`Engine.submit` catches per topic
 //! and never replays); this whole lifecycle is our platform's addition.
 
@@ -159,9 +165,42 @@ pub const DEAD_LETTERS_CLASS_COLUMN: &str =
 /// Migration (the delta-2 fold): the ceiling's per-class counts and the health block's `classes` read this index.
 pub const DEAD_LETTERS_CLASS_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_mutation_dead_letters_class ON mutation_dead_letters(status, class, parked_at)";
 
+/// Migration (bsv-low #585, door 3): the R2 object of a letter whose BEEF is not inline ([`crate::queue::BeefRef`]):
+/// its key, and (next) its length. NULL for an inline letter and for a `failing` note.
+pub const DEAD_LETTERS_R2_KEY_COLUMN: &str =
+    "ALTER TABLE mutation_dead_letters ADD COLUMN r2_key TEXT";
+pub const DEAD_LETTERS_R2_BYTES_COLUMN: &str =
+    "ALTER TABLE mutation_dead_letters ADD COLUMN r2_bytes INTEGER";
+/// Migration (door 3): the health block's bytes at rest ([`HEALTH_R2_SQL`]) read this index only.
+pub const DEAD_LETTERS_R2_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_mutation_dead_letters_r2 ON mutation_dead_letters(status, r2_bytes)";
+
+/// PURE SQL (door 3): what a message CARRIES, for the copy rule: a keyed letter's BEEF as its base64 would weigh, an
+/// inline one's message. `$t` is the row (`excluded` or the table).
+macro_rules! carried {
+    ($t:literal) => {
+        concat!(
+            "COALESCE(",
+            $t,
+            ".r2_bytes * 4 / 3, length(",
+            $t,
+            ".message))"
+        )
+    };
+}
+/// PURE SQL: the arriving copy carries more than the held one.
+macro_rules! new_carries_more {
+    () => {
+        concat!(
+            carried!("excluded"),
+            " > ",
+            carried!("mutation_dead_letters")
+        )
+    };
+}
+
 /// The capped history append: `$h` is replaced by the column, `$e` by the entry (both SQL expressions).
 macro_rules! history_append {
-    ($entry:literal) => {
+    ($entry:expr) => {
         concat!(
             "json_insert(CASE WHEN json_array_length(mutation_dead_letters.history) >= 20 THEN json_remove(mutation_dead_letters.history, '$[0]') ELSE mutation_dead_letters.history END, '$[#]', ",
             $entry,
@@ -186,9 +225,13 @@ pub const NOTE_FAILING_SQL: &str = "INSERT INTO mutation_dead_letters (txid, top
 /// `SELECT`): a key that holds bytes always parks; a new letter only under [`PARKED_ROWS_CEILING`], and a "not now"
 /// one only under [`NOT_NOW_PER_TXID`], [`NOT_NOW_MAX`] and [`NOT_NOW_PER_DAY`]. D1 runs one statement at a time, so
 /// two consumers that both read room before either parked no longer both park; the one refused gets no row back.
+///
+/// bsv-low #585 (door 3): binds 8 and 9 are the letter's R2 key and length (NULL for an inline letter), kept with the
+/// message they belong to; "the longer bytes" of the copy rule is what a message CARRIES (`carried!`); the kept
+/// row's key is returned.
 pub const PARK_SQL: &str = concat!(
-    "INSERT INTO mutation_dead_letters (txid, topics, message, fault, attempts, status, redrives, first_seen_at, parked_at, history) \
-     SELECT ?1, ?2, ?3, ?4, 0, 'parked', ?5, ?6, ?6, json_array(json_object('parkedAt', ?6, 'fault', ?4, 'attempts', 0, 'redrive', ?5, 'kind', 'park')) \
+    "INSERT INTO mutation_dead_letters (txid, topics, message, fault, attempts, status, redrives, first_seen_at, parked_at, history, r2_key, r2_bytes) \
+     SELECT ?1, ?2, ?3, ?4, 0, 'parked', ?5, ?6, ?6, json_array(json_object('parkedAt', ?6, 'fault', ?4, 'attempts', 0, 'redrive', ?5, 'kind', 'park')), ?8, ?9 \
      WHERE EXISTS (SELECT 1 FROM mutation_dead_letters WHERE txid = ?1 AND topics = ?2 AND status IN ('parked', 'redriven')) \
      OR ((SELECT COUNT(*) FROM mutation_dead_letters WHERE status IN ('parked', 'redriven')) < 2000 \
      AND (COALESCE((SELECT class FROM mutation_dead_letters WHERE txid = ?1 AND topics = ?2), 'fault') != 'not_now' \
@@ -197,26 +240,37 @@ pub const PARK_SQL: &str = concat!(
      AND (SELECT COUNT(*) FROM mutation_dead_letters WHERE class = 'not_now' AND status IN ('parked', 'redriven') AND parked_at >= ?7) < 200))) \
      ON CONFLICT(txid, topics) DO UPDATE SET status = 'parked', \
      parked_at = CASE WHEN mutation_dead_letters.status = 'parked' THEN mutation_dead_letters.parked_at ELSE excluded.parked_at END, \
-     message = CASE WHEN length(excluded.message) > length(mutation_dead_letters.message) THEN excluded.message ELSE mutation_dead_letters.message END, \
+     message = CASE WHEN ",
+    new_carries_more!(),
+    " THEN excluded.message ELSE mutation_dead_letters.message END, \
+     r2_key = CASE WHEN ",
+    new_carries_more!(),
+    " THEN excluded.r2_key ELSE mutation_dead_letters.r2_key END, \
+     r2_bytes = CASE WHEN ",
+    new_carries_more!(),
+    " THEN excluded.r2_bytes ELSE mutation_dead_letters.r2_bytes END, \
      fault = COALESCE(mutation_dead_letters.fault, excluded.fault), \
      history = ",
-    history_append!(
-        "json_object('parkedAt', excluded.parked_at, 'fault', COALESCE(mutation_dead_letters.fault, excluded.fault), 'attempts', mutation_dead_letters.attempts, 'redrive', mutation_dead_letters.redrives, 'kind', CASE WHEN mutation_dead_letters.status = 'parked' THEN 'copy' ELSE 'park' END, 'kept', CASE WHEN length(excluded.message) > length(mutation_dead_letters.message) THEN 'new' ELSE 'old' END)"
-    ),
+    history_append!(concat!(
+        "json_object('parkedAt', excluded.parked_at, 'fault', COALESCE(mutation_dead_letters.fault, excluded.fault), 'attempts', mutation_dead_letters.attempts, 'redrive', mutation_dead_letters.redrives, 'kind', CASE WHEN mutation_dead_letters.status = 'parked' THEN 'copy' ELSE 'park' END, 'kept', CASE WHEN ",
+        new_carries_more!(),
+        " THEN 'new' ELSE 'old' END)"
+    )),
     " WHERE mutation_dead_letters.status != 'parked' OR mutation_dead_letters.message != excluded.message \
-     RETURNING redrives, json_extract(history, '$[#-1].kind') AS kind, json_extract(history, '$[#-1].kept') AS kept"
+     RETURNING redrives, json_extract(history, '$[#-1].kind') AS kind, json_extract(history, '$[#-1].kept') AS kept, r2_key"
 );
 /// Binds: txid, topics. The ack of landed bytes (their replay, their re-drive, or another copy of them): the row
 /// goes, whatever its status (M2; `storage-ownership.json`'s `delete_scope`). The deleted row's status is returned.
+/// Its R2 key too (door 3): the acked row's object is deleted with it.
 pub const RESOLVE_SQL: &str =
-    "DELETE FROM mutation_dead_letters WHERE txid = ? AND topics = ? RETURNING status, parked_at";
+    "DELETE FROM mutation_dead_letters WHERE txid = ? AND topics = ? RETURNING status, parked_at, r2_key";
 /// Binds: txid, topics (NULL: every parked row of the txid), the rows this call may still delete. The operator's
 /// discard (D-M1; the second scoped delete of `storage-ownership.json`): a PARKED letter only, its bytes returned to
 /// log their hash, at most `?3` rows, oldest parked first (the delta-2 fold, D2-L1: a key with no topics deleted
 /// every row of the txid in one statement, its bytes all returned at once).
 pub const DISCARD_SQL: &str = "DELETE FROM mutation_dead_letters WHERE txid = ?1 AND (?2 IS NULL OR topics = ?2) AND status = 'parked' \
      AND rowid IN (SELECT rowid FROM mutation_dead_letters WHERE txid = ?1 AND (?2 IS NULL OR topics = ?2) AND status = 'parked' \
-     ORDER BY parked_at, topics LIMIT ?3) RETURNING txid, topics, redrives, fault, message";
+     ORDER BY parked_at, topics LIMIT ?3) RETURNING txid, topics, redrives, fault, message, r2_key, r2_bytes";
 /// Binds: the redrive ceiling, limit. Oldest parked first. No bytes: the claim returns them (L3).
 pub const SELECT_PARKED_SQL: &str =
     "SELECT txid, topics, fault, redrives, redriven_at FROM mutation_dead_letters \
@@ -261,7 +315,13 @@ pub const CEILING_SQL: &str = "SELECT (SELECT COUNT(*) FROM mutation_dead_letter
      COALESCE((SELECT class FROM mutation_dead_letters WHERE txid = ?1 AND topics = ?2), 'fault') AS class, \
      (SELECT COUNT(*) FROM mutation_dead_letters WHERE class = 'not_now' AND status IN ('parked', 'redriven')) AS not_now, \
      (SELECT COUNT(*) FROM mutation_dead_letters WHERE txid = ?1 AND class = 'not_now' AND status IN ('parked', 'redriven')) AS not_now_txid, \
-     (SELECT COUNT(*) FROM mutation_dead_letters WHERE class = 'not_now' AND status IN ('parked', 'redriven') AND parked_at >= ?3) AS not_now_day";
+     (SELECT COUNT(*) FROM mutation_dead_letters WHERE class = 'not_now' AND status IN ('parked', 'redriven') AND parked_at >= ?3) AS not_now_day, \
+     (SELECT r2_key FROM mutation_dead_letters WHERE txid = ?1 AND topics = ?2) AS r2_key";
+/// The health block's bytes at rest in R2 (door 3): the letters with bytes whose BEEF is an object, and the sum of
+/// their lengths. An index-only read of `idx_mutation_dead_letters_r2`.
+pub const HEALTH_R2_SQL: &str =
+    "SELECT COUNT(*) AS c, COALESCE(SUM(r2_bytes), 0) AS b FROM mutation_dead_letters \
+     WHERE status IN ('parked', 'redriven') AND r2_bytes IS NOT NULL";
 /// The health block's one aggregate (L4: an index-only read of `idx_mutation_dead_letters_health`). Binds: the
 /// redrive ceiling, the stale cutoff, the 24 h cutoff.
 pub const HEALTH_COUNTS_SQL: &str = "SELECT status, COUNT(*) AS c, MAX(redriven_at) AS last_redrive, \
@@ -342,9 +402,15 @@ pub fn letter_key(body: &MutationMessage, subject: Option<&str>) -> (String, Str
     if let Some(tag) = &body.redrive {
         return (tag.txid.clone(), tag.topics.clone());
     }
-    let txid = match subject {
-        Some(s) => s.to_ascii_lowercase(),
-        None => {
+    // door 3: a keyed message names its letter without its bytes (the producer's subject, or the BEEF's own hash),
+    // the same in both consumers whether or not the object can be read
+    let txid = match (&body.r2, subject) {
+        (Some(r), _) => match &r.txid {
+            Some(t) => t.to_ascii_lowercase(),
+            None => format!("unparsed:{}", r.sha256.get(..32).unwrap_or(&r.sha256)),
+        },
+        (None, Some(s)) => s.to_ascii_lowercase(),
+        (None, None) => {
             let h = bsv_rs::primitives::hash::sha256(body.beef_b64.as_bytes());
             format!("unparsed:{}", hex::encode(&h[..16]))
         }
@@ -455,6 +521,20 @@ pub fn park_query(
     redrives: u64,
     now_ms: i64,
 ) -> Query {
+    park_query_r2(txid, topics, message, fault, redrives, now_ms, None)
+}
+
+/// [`park_query`] for a letter whose BEEF is in R2 (door 3): `r2` is its object's key and length.
+#[must_use]
+pub fn park_query_r2(
+    txid: &str,
+    topics: &str,
+    message: &str,
+    fault: &str,
+    redrives: u64,
+    now_ms: i64,
+    r2: Option<(&str, u64)>,
+) -> Query {
     Query::new(PARK_SQL)
         .bind(txid)
         .bind(topics)
@@ -463,6 +543,22 @@ pub fn park_query(
         .bind(redrives)
         .bind(now_ms)
         .bind(day_cutoff(now_ms))
+        .bind(r2.map_or(QVal::Null, |(k, _)| QVal::Text(k.to_string())))
+        .bind(r2.map_or(QVal::Null, |(_, b)| QVal::Int(b as i64)))
+}
+
+/// PURE (door 3): the R2 object nothing names after a park that met a held row: the copy rule kept one message and
+/// dropped the other, and the dropped one's object (when it has one, and is not the kept one's) goes with it.
+/// `kept` is the park's own word (`new`, `old`; `None` on a fresh row), `held` the row's key before the park, `new`
+/// the arriving letter's.
+#[must_use]
+pub fn dropped_object(kept: Option<&str>, held: Option<&str>, new: Option<&str>) -> Option<String> {
+    let dropped = match kept {
+        Some("new") => held.filter(|h| Some(*h) != new),
+        Some("old") => new.filter(|n| Some(*n) != held),
+        _ => None,
+    };
+    dropped.map(str::to_string)
 }
 
 /// PURE (the delta-3 fold, D3-L2): the start of the trailing day of [`NOT_NOW_PER_DAY`] at `now_ms`, for the park,
@@ -678,6 +774,12 @@ struct ParkedReturn {
 }
 
 #[derive(Deserialize)]
+struct R2AtRestRow {
+    c: f64,
+    b: f64,
+}
+
+#[derive(Deserialize)]
 struct ClaimedRow {
     redrives: f64,
     message: String,
@@ -692,6 +794,9 @@ pub struct CeilingRow {
     pub not_now: f64,
     pub not_now_txid: f64,
     pub not_now_day: f64,
+    /// Door 3: the R2 key of the row this key holds, if any ([`dropped_object`]).
+    #[serde(default)]
+    pub r2_key: Option<String>,
 }
 
 /// Why a new letter is not parked (handed back to the DLQ with the backoff, and LOST after ~48 h if it stays so).
@@ -773,6 +878,8 @@ pub fn ceiling_verdict(c: &CeilingRow) -> std::result::Result<Option<u64>, Defer
 struct ResolvedRow {
     status: String,
     parked_at: Option<f64>,
+    #[serde(default)]
+    r2_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -782,6 +889,10 @@ struct DiscardedRow {
     redrives: f64,
     fault: Option<String>,
     message: String,
+    #[serde(default)]
+    r2_key: Option<String>,
+    #[serde(default)]
+    r2_bytes: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -842,18 +953,22 @@ impl Resolved {
 /// if any, is deleted: no replay of it is wanted. Fail-soft (logged): a row left behind is shown by the health
 /// block (a `failing` note) or is re-selected by the lever (a parked or stale re-driven letter, whose re-drive is
 /// then a dedup, or a skip under the eviction).
+///
+/// Door 3: answers the R2 key the deleted row named, if any: the consumer deletes that object with the acked
+/// message's own (a parked copy under another mode names another object, and its row is gone).
 pub async fn resolve(
     db: &D1Database,
     body: &MutationMessage,
     subject: Option<&str>,
     why: Resolved,
-) {
+) -> Option<String> {
     let (txid, topics) = letter_key(body, subject);
     match resolve_query(&txid, &topics)
         .fetch_all::<ResolvedRow>(db)
         .await
     {
         Ok(rows) => {
+            let key = rows.first().and_then(|r| r.r2_key.clone());
             if let Some(r) = rows.first().filter(|r| r.parked_at.is_some()) {
                 crate::ops::bump_counter(db, crate::ops::COUNTER_DEAD_LETTERS_RESOLVED, 1).await;
                 worker::console_log!(
@@ -862,9 +977,11 @@ pub async fn resolve(
                     why.says()
                 );
             }
+            key
         }
         Err(e) => {
-            worker::console_log!("[dead-letters] the resolve of {txid} [{topics}] faulted ({e})")
+            worker::console_log!("[dead-letters] the resolve of {txid} [{topics}] faulted ({e})");
+            None
         }
     }
 }
@@ -876,12 +993,19 @@ struct Letter {
     message: String,
     fault: String,
     start_redrives: u64,
+    /// Door 3: the R2 object holding the letter's BEEF (key, length); the row parks the KEY, the bytes stay in R2.
+    r2: Option<(String, u64)>,
 }
 
 fn letter_of(raw: worker::wasm_bindgen::JsValue, id: &str) -> Letter {
     match worker::serde_wasm_bindgen::from_value::<MutationMessage>(raw.clone()) {
         Ok(body) => {
-            let subject = subject_of(&body);
+            // a keyed letter is named by its message (no R2 read here: `letter_key`)
+            let subject = if body.r2.is_some() {
+                None
+            } else {
+                subject_of(&body)
+            };
             let (txid, topics) = letter_key(&body, subject.as_deref());
             Letter {
                 txid,
@@ -889,6 +1013,7 @@ fn letter_of(raw: worker::wasm_bindgen::JsValue, id: &str) -> Letter {
                 message: serde_json::to_string(&body).unwrap_or_default(),
                 fault: FAULT_UNRECORDED.to_string(),
                 start_redrives: 0,
+                r2: body.r2.as_ref().map(|r| (r.key.clone(), r.bytes)),
             }
         }
         Err(e) => Letter {
@@ -901,6 +1026,7 @@ fn letter_of(raw: worker::wasm_bindgen::JsValue, id: &str) -> Letter {
                 "the dead letter does not decode as a mutation message ({e}); never re-drivable"
             ),
             start_redrives: MAX_REDRIVES,
+            r2: None,
         },
     }
 }
@@ -922,36 +1048,45 @@ pub enum Parked {
 }
 
 /// `class` is set to the letter's class as the ceiling read found it (left `Fault` when unread; D3-L3's LOST count).
+/// `dropped` (door 3) is set to the R2 key the park left unnamed ([`dropped_object`]).
 async fn park_one(
     db: &D1Database,
     l: &Letter,
     now: i64,
     class: &mut LetterClass,
+    dropped: &mut Option<String>,
 ) -> std::result::Result<Parked, String> {
     let c = ceiling_query(&l.txid, &l.topics, day_cutoff(now))
         .fetch_optional::<CeilingRow>(db)
         .await
         .map_err(|e| format!("the ceiling read: {e}"))?;
     let mut held_after = None;
+    let mut held_key = None;
     if let Some(c) = c {
         *class = LetterClass::of_column(&c.class);
+        held_key = c.r2_key.clone();
         match ceiling_verdict(&c) {
             Ok(near) => held_after = near,
             Err(Deferral::Ceiling(held)) => return Ok(Parked::Ceiling(held)),
             Err(d) => return Ok(Parked::NotNowBound(d)),
         }
     }
-    let rows = park_query(
+    let new_key = l.r2.as_ref().map(|(k, _)| k.as_str());
+    let rows = park_query_r2(
         &l.txid,
         &l.topics,
         &l.message,
         &l.fault,
         l.start_redrives,
         now,
+        l.r2.as_ref().map(|(k, b)| (k.as_str(), *b)),
     )
     .fetch_all::<ParkedReturn>(db)
     .await
     .map_err(|e| format!("the park: {e}"))?;
+    if let Some(r) = rows.first() {
+        *dropped = dropped_object(r.kept.as_deref(), held_key.as_deref(), new_key);
+    }
     Ok(match rows.first() {
         None => {
             // D3-L1: no row is a redelivery of held bytes, or the park's own re-read of the bounds refused a letter
@@ -1025,6 +1160,20 @@ pub fn classes_json(fault_held: u64, not_now_held: u64, not_now_day: u64) -> ser
     })
 }
 
+/// PURE (bsv-low #585, door 3): the health block's `r2`: the letters with bytes whose BEEF is an R2 object and the
+/// bytes at rest there (`None`: unread), whether the bucket is bound, the inline room in force, and the size past
+/// which the door refuses a replay because the consumer's policy would (`beef_limits::QUEUE_BEEF_LIMITS`).
+#[must_use]
+pub fn r2_json(at_rest: Option<(u64, u64)>, bound: bool, room: usize) -> serde_json::Value {
+    serde_json::json!({
+        "bound": bound,
+        "letters": at_rest.map(|(c, _)| c),
+        "bytes": at_rest.map(|(_, b)| b),
+        "inlineRoom": room,
+        "replayMaxBytes": beef_limits::QUEUE_BEEF_LIMITS.max_bytes,
+    })
+}
+
 /// PURE (D-M1): the health block's `ceiling`: the letters with bytes, the maximum, the room left, `near` from
 /// [`CEILING_NEAR`] on and `full` at the maximum.
 #[must_use]
@@ -1083,10 +1232,15 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
         let att = attempts_text(attempts);
         let now = worker::Date::now().as_millis() as i64;
         let mut class = LetterClass::Fault;
+        let mut dropped = None;
         let outcome = match &db {
-            Ok(db) => park_one(db, &letter, now, &mut class).await,
+            Ok(db) => park_one(db, &letter, now, &mut class, &mut dropped).await,
             Err(e) => Err(e.clone()),
         };
+        // door 3: the copy rule dropped a message whose BEEF is an R2 object: nothing names it now
+        if let Some(key) = dropped {
+            crate::queue::delete_beefs(env, &[key], "the lighter copy of a parked letter").await;
+        }
         let fault = match outcome {
             Ok(Parked::Park(redrives, near)) => {
                 if let Ok(db) = &db {
@@ -1101,8 +1255,9 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
                     }
                 }
                 worker::console_log!(
-                    "[dead-letters] PARKED {txid} [{topics}] from {queue} attempts={att} (re-drives so far {redrives}/{MAX_REDRIVES}){}",
-                    if redrives >= MAX_REDRIVES { "; EXHAUSTED, the lever will not re-drive it unless forced" } else { "" }
+                    "[dead-letters] PARKED {txid} [{topics}] from {queue} attempts={att} (re-drives so far {redrives}/{MAX_REDRIVES}){}{}",
+                    if redrives >= MAX_REDRIVES { "; EXHAUSTED, the lever will not re-drive it unless forced" } else { "" },
+                    letter.r2.as_ref().map_or_else(String::new, |(k, b)| format!("; its BEEF ({b} B) is the R2 object {k}, not in D1"))
                 );
                 if let Some(held) = near {
                     worker::console_log!("{}", near_line(held));
@@ -1164,6 +1319,16 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
             );
             if let Ok(db) = &db {
                 crate::ops::bump_counter(db, class.lost_counter(), 1).await;
+            }
+            // door 3 (the deletion rule): the queue gives the letter up here and no row names its object
+            if let Some((key, bytes)) = &letter.r2 {
+                worker::console_log!("[dead-letters] LOST {txid} [{topics}]: its BEEF ({bytes} B) was the R2 object {key}, deleted with it");
+                crate::queue::delete_beefs(
+                    env,
+                    std::slice::from_ref(key),
+                    "its dead letter is LOST",
+                )
+                .await;
             }
         } else {
             worker::console_log!(
@@ -1387,10 +1552,29 @@ pub async fn internal_discard(mut req: Request, env: &Env) -> Result<Response> {
                         r.message.len(),
                         r.fault.as_deref().unwrap_or("none recorded")
                     );
-                    discarded.push(serde_json::json!({
+                    // door 3 (the deletion rule): the discarded letter's BEEF in R2 goes with its row
+                    let mut entry = serde_json::json!({
                         "txid": r.txid, "topics": r.topics, "redrives": redrives, "fault": r.fault,
                         "bytes": r.message.len(), "sha256": sha,
-                    }));
+                    });
+                    if let Some(key) = &r.r2_key {
+                        let fault = crate::queue::delete_beefs(
+                            env,
+                            std::slice::from_ref(key),
+                            "the operator's discard",
+                        )
+                        .await
+                        .into_iter()
+                        .next()
+                        .map(|(_, e)| e);
+                        entry["r2Key"] = serde_json::json!(key);
+                        entry["r2Bytes"] = serde_json::json!(r.r2_bytes.map(|b| b.max(0.0) as u64));
+                        entry["r2Deleted"] = serde_json::json!(fault.is_none());
+                        if let Some(e) = fault {
+                            entry["r2Fault"] = serde_json::json!(e);
+                        }
+                    }
+                    discarded.push(entry);
                 }
             }
             Err(e) => {
@@ -1476,7 +1660,7 @@ struct ExhaustedRow {
 /// `/health/invariants.deadLetters`: the count by status, the exhausted, stale and recent counts, the ceiling, the
 /// oldest parked, the oldest re-drive in flight, the last re-drive, the exhausted letters. `readable: false` when
 /// the table cannot be read (a pre-migration isolate), distinct from an empty one.
-pub async fn health_json(db: &D1Database) -> serde_json::Value {
+pub async fn health_json(db: &D1Database, env: &Env) -> serde_json::Value {
     let now = worker::Date::now().as_millis() as i64;
     let Ok(counts) = Query::new(HEALTH_COUNTS_SQL)
         .bind(MAX_REDRIVES)
@@ -1534,6 +1718,17 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
         .await
         .unwrap_or_default();
     let (fault_held, not_now_held, not_now_day) = class_counts(&classes);
+    let r2 = Query::new(HEALTH_R2_SQL)
+        .fetch_optional::<R2AtRestRow>(db)
+        .await
+        .ok()
+        .flatten();
+    let room = crate::queue::inline_room(
+        env.var(crate::queue::QUEUE_MESSAGE_ROOM_VAR)
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
     let key_at = |r: &KeyAtRow| serde_json::json!({"txid": r.txid, "topics": r.topics, "at": r.at.map(|v| v as i64)});
     let held = count("parked") + count("redriven");
     serde_json::json!({
@@ -1547,6 +1742,11 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
         "parkedLast24h": counts.iter().map(|r| n(r.recent)).sum::<u64>(),
         "ceiling": ceiling_json(held),
         "classes": classes_json(fault_held, not_now_held, not_now_day),
+        "r2": r2_json(
+            r2.as_ref().map(|r| (r.c.max(0.0) as u64, r.b.max(0.0) as u64)),
+            env.bucket(crate::queue::BEEF_BLOBS_BINDING).is_ok(),
+            room,
+        ),
         "oldestParked": oldest.as_ref().map(key_at),
         "lastRedrive": last.as_ref().map(key_at),
         "maxRedrives": MAX_REDRIVES,
@@ -1585,6 +1785,9 @@ mod tests {
         conn.execute(DEAD_LETTERS_REDRIVEN_INDEX, []).unwrap();
         conn.execute(DEAD_LETTERS_CLASS_COLUMN, []).unwrap();
         conn.execute(DEAD_LETTERS_CLASS_INDEX, []).unwrap();
+        conn.execute(DEAD_LETTERS_R2_KEY_COLUMN, []).unwrap();
+        conn.execute(DEAD_LETTERS_R2_BYTES_COLUMN, []).unwrap();
+        conn.execute(DEAD_LETTERS_R2_INDEX, []).unwrap();
         conn
     }
 
@@ -1670,6 +1873,7 @@ mod tests {
     fn msg(beef: &str, topics: &[&str]) -> MutationMessage {
         MutationMessage {
             beef_b64: beef.to_string(),
+            r2: None,
             topics: topics.iter().map(|t| (*t).to_string()).collect(),
             mode: "historical-tx".to_string(),
             reason: "phase3-fault".to_string(),
@@ -1911,8 +2115,12 @@ mod tests {
         let gone = rows(&conn, &resolve_query(&k, &t));
         assert_eq!(
             gone,
-            vec![vec!["redriven".to_string(), "1000".to_string()]],
-            "the re-driven letter's row is deleted"
+            vec![vec![
+                "redriven".to_string(),
+                "1000".to_string(),
+                String::new()
+            ]],
+            "the re-driven letter's row is deleted (its R2 key answered: none, an inline letter; bsv-low #585)"
         );
         assert!(!exists(&conn, "aa"));
         assert!(lever(&conn, &all(25), 4_000).is_empty());
@@ -1932,7 +2140,7 @@ mod tests {
         let gone = rows(&conn, &resolve_query(&k, &t));
         assert_eq!(
             gone,
-            vec![vec!["failing".to_string(), String::new()]],
+            vec![vec!["failing".to_string(), String::new(), String::new()]],
             "a note: no parked_at, not counted resolved"
         );
         // a new episode of the key starts from nothing
@@ -2387,14 +2595,19 @@ mod tests {
         );
         assert_eq!(
             r,
-            vec![vec!["0".to_string(), "copy".to_string(), "new".to_string()]]
+            vec![vec![
+                "0".to_string(),
+                "copy".to_string(),
+                "new".to_string(),
+                String::new()
+            ]]
         );
         assert_eq!(message_of(&conn, "aa"), long);
         let r = rows(
             &conn,
             &park_query("aa", "tm_a", &short, FAULT_UNRECORDED, 0, 3),
         );
-        assert_eq!(r[0][1..], ["copy".to_string(), "old".to_string()]);
+        assert_eq!(r[0][1..3], ["copy".to_string(), "old".to_string()]);
         assert_eq!(
             message_of(&conn, "aa"),
             long,
@@ -2879,6 +3092,7 @@ mod tests {
             not_now: f(3),
             not_now_txid: f(4),
             not_now_day: f(5),
+            r2_key: Some(r[6].clone()).filter(|k| !k.is_empty()),
         }
     }
 
@@ -3233,6 +3447,7 @@ mod tests {
                 not_now: 0.0,
                 not_now_txid: 0.0,
                 not_now_day: 0.0,
+                r2_key: None,
             })
         };
         assert_eq!(at(1598.0, 0.0), Ok(None));
@@ -3563,6 +3778,12 @@ mod tests {
         }
         conn.execute(DEAD_LETTERS_CLASS_COLUMN, []).unwrap();
         conn.execute(DEAD_LETTERS_CLASS_INDEX, []).unwrap();
+        // bsv-low #585 (door 3): the later additive ALTERs, which the ceiling's read names too; existing rows hold
+        // no R2 key
+        conn.execute(DEAD_LETTERS_R2_KEY_COLUMN, []).unwrap();
+        conn.execute(DEAD_LETTERS_R2_BYTES_COLUMN, []).unwrap();
+        conn.execute(DEAD_LETTERS_R2_INDEX, []).unwrap();
+        assert_eq!(ceiling_row(&conn, "p", "t", 10).r2_key, None);
         let classes: Vec<String> = conn
             .prepare("SELECT class FROM mutation_dead_letters ORDER BY txid")
             .unwrap()
@@ -3636,7 +3857,7 @@ mod tests {
         let park = &src[src.find("async fn park_one(").unwrap()..];
         let park = &park[..park.find("\n}\n").unwrap()];
         assert_eq!(park.matches("day_cutoff(now)").count(), 2);
-        let pq = &src[src.find("pub fn park_query(").unwrap()..];
+        let pq = &src[src.find("pub fn park_query_r2(").unwrap()..];
         assert!(pq[..pq.find("\n}\n").unwrap()].contains(".bind(day_cutoff(now_ms))"));
     }
 
@@ -3758,5 +3979,355 @@ mod tests {
         );
         assert!(fault_path.contains("bump_counter(db, class.lost_counter(), 1)"));
         assert!(!fault_path.contains("COUNTER_DEAD_LETTERS_LOST,"));
+    }
+
+    // ── bsv-low #585, door 3: a letter whose BEEF is an R2 object ────────────
+
+    fn keyed(
+        sha: &str,
+        bytes: u64,
+        topics: &[&str],
+        mode: &str,
+        txid: Option<&str>,
+    ) -> MutationMessage {
+        let topics: Vec<String> = topics.iter().map(|t| t.to_string()).collect();
+        MutationMessage {
+            beef_b64: String::new(),
+            r2: Some(crate::queue::BeefRef {
+                key: crate::queue::r2_key(sha, &topics, mode),
+                sha256: sha.to_string(),
+                bytes,
+                txid: txid.map(str::to_string),
+            }),
+            topics,
+            mode: mode.to_string(),
+            reason: "phase3-fault".to_string(),
+            redrive: None,
+            ef_job: None,
+        }
+    }
+
+    /// The DLQ consumer's park of `m`, as `park_one` makes it: the ceiling read's held key, the park, and the object
+    /// the park left unnamed. Answers (kind, kept, the row's key, dropped).
+    fn park_keyed(
+        conn: &rusqlite::Connection,
+        m: &MutationMessage,
+        now: i64,
+    ) -> (String, String, String, Option<String>) {
+        let (txid, topics) = letter_key(m, None);
+        let held = ceiling_row(conn, &txid, &topics, now).r2_key;
+        let r2 = m.r2.as_ref().map(|r| (r.key.as_str(), r.bytes));
+        let json = serde_json::to_string(m).unwrap();
+        let mut out = rows(
+            conn,
+            &park_query_r2(&txid, &topics, &json, FAULT_UNRECORDED, 0, now, r2),
+        );
+        assert_eq!(out.len(), 1, "parked");
+        let r = out.remove(0);
+        let dropped = dropped_object(
+            Some(r[2].as_str()).filter(|k| !k.is_empty()),
+            held.as_deref(),
+            r2.map(|(k, _)| k),
+        );
+        (r[1].clone(), r[2].clone(), r[3].clone(), dropped)
+    }
+
+    fn r2_cols(
+        conn: &rusqlite::Connection,
+        txid: &str,
+    ) -> (Option<String>, Option<i64>, i64, String, String) {
+        conn.query_row(
+            "SELECT r2_key, r2_bytes, length(message), status, class FROM mutation_dead_letters WHERE txid = ?1",
+            [txid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    /// Door 3: a 500 KB "not now" letter parks its KEY (the bytes stay in R2: the row is a few hundred bytes), the
+    /// health block sums the bytes at rest from an index, the lever re-drives the key (the consumer re-reads R2), a
+    /// re-driven replay whose object is MISSING is a FAULT letter on the same row, and the operator's discard
+    /// answers the key it must delete.
+    #[test]
+    fn e585_d3_a_keyed_letter_parks_its_key_and_redrives_from_it() {
+        let conn = db();
+        let m = keyed(
+            &"ab".repeat(32),
+            500_000,
+            &["tm_a"],
+            "historical-tx",
+            Some("S1"),
+        );
+        let r = m.r2.clone().unwrap();
+        let (txid, topics) = letter_key(&m, None);
+        assert_eq!(
+            (txid.as_str(), topics.as_str()),
+            ("s1", "tm_a"),
+            "named by the message, no bytes read"
+        );
+        assert_eq!(letter_key(&m, Some("other")).0, "s1");
+        run(
+            &conn,
+            &note_failing_query(
+                &txid,
+                &topics,
+                "not durable: predecessor_not_landed",
+                10,
+                LetterClass::NotNow,
+            ),
+        );
+        let (kind, kept, key, dropped) = park_keyed(&conn, &m, 20);
+        assert_eq!(
+            (kind.as_str(), kept.as_str(), key.as_str(), dropped),
+            ("park", "new", r.key.as_str(), None)
+        );
+        let (k, b, len, status, class) = r2_cols(&conn, "s1");
+        assert_eq!(
+            (k.as_deref(), b, status.as_str(), class.as_str()),
+            (Some(r.key.as_str()), Some(500_000), "parked", "not_now")
+        );
+        assert!(len < 400, "the row holds the key, not the bytes: {len}");
+        assert_eq!(
+            rows(&conn, &Query::new(HEALTH_R2_SQL)),
+            vec![vec!["1".to_string(), "500000".to_string()]]
+        );
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {HEALTH_R2_SQL}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("COVERING INDEX idx_mutation_dead_letters_r2")),
+            "{plan:?}"
+        );
+        // a DLQ redelivery of the same message parks once
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            run(
+                &conn,
+                &park_query_r2(
+                    "s1",
+                    "tm_a",
+                    &json,
+                    FAULT_UNRECORDED,
+                    0,
+                    21,
+                    Some((&r.key, r.bytes))
+                )
+            ),
+            0
+        );
+        // the lever: the claimed message is the key, stamped; nothing of the body is in it
+        let sent = lever(&conn, &parse_redrive_request(b"{}").unwrap(), 30);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].r2.as_ref(), Some(&r));
+        assert!(sent[0].beef_b64.is_empty());
+        assert_eq!(
+            (
+                sent[0].reason.as_str(),
+                sent[0].redrive.as_ref().map(|t| t.n)
+            ),
+            (REASON_REDRIVE, Some(1))
+        );
+        assert_eq!(
+            letter_key(&sent[0], None),
+            ("s1".to_string(), "tm_a".to_string())
+        );
+        // its replay finds the object MISSING: a fault note (the class flips), handed back, dead-lettered, parked
+        // again on its row with its key
+        let missing = crate::queue::BlobFault::Missing(r.key.clone()).says();
+        run(
+            &conn,
+            &note_failing_query("s1", "tm_a", &missing, 40, LetterClass::Fault),
+        );
+        let (kind, kept, key, dropped) = park_keyed(&conn, &sent[0], 50);
+        assert_eq!(
+            (kind.as_str(), kept.as_str(), key.as_str(), dropped),
+            ("park", "old", r.key.as_str(), None)
+        );
+        let (k, _, _, status, class) = r2_cols(&conn, "s1");
+        assert_eq!(
+            (k.as_deref(), status.as_str(), class.as_str()),
+            (Some(r.key.as_str()), "parked", "fault"),
+            "never not now"
+        );
+        assert!(row(&conn, "s1").3.unwrap().contains("MISSING"));
+        // the discard answers the key and the length: the lever deletes that object
+        let d = rows(&conn, &discard_query("s1", None, 50));
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            (d[0][5].as_str(), d[0][6].as_str()),
+            (r.key.as_str(), "500000")
+        );
+        assert_eq!(
+            rows(&conn, &Query::new(HEALTH_R2_SQL)),
+            vec![vec!["0".to_string(), "0".to_string()]]
+        );
+        // a keyed message whose producer derived no subject is named by its bytes' hash
+        let anon = keyed(&"cd".repeat(32), 200_000, &["tm_a"], "historical-tx", None);
+        assert_eq!(
+            letter_key(&anon, None).0,
+            format!("unparsed:{}", "cd".repeat(16))
+        );
+    }
+
+    /// Door 3: another copy of a parked key keeps the message that CARRIES more (a keyed letter by its BEEF's
+    /// length, an inline one by its message), the row's key follows the kept message, and the object of the dropped
+    /// one is named for deletion; the ack of the key answers the row's object.
+    #[test]
+    fn e585_d3_the_copy_rule_weighs_what_is_carried_and_names_the_dropped_object() {
+        let conn = db();
+        let inline = msg(&"A".repeat(1_000), &["tm_a"]);
+        run(
+            &conn,
+            &park_query(
+                "c1",
+                "tm_a",
+                &serde_json::to_string(&inline).unwrap(),
+                "f",
+                0,
+                10,
+            ),
+        );
+        assert_eq!(r2_cols(&conn, "c1").0, None);
+        let k1 = keyed(
+            &"01".repeat(32),
+            200_000,
+            &["tm_a"],
+            "historical-tx",
+            Some("c1"),
+        );
+        let k2 = keyed(
+            &"02".repeat(32),
+            300_000,
+            &["tm_a"],
+            "historical-tx",
+            Some("c1"),
+        );
+        let k3 = keyed(
+            &"03".repeat(32),
+            150_000,
+            &["tm_a"],
+            "historical-tx",
+            Some("c1"),
+        );
+        let key = |m: &MutationMessage| m.r2.as_ref().unwrap().key.clone();
+        // a keyed copy carries more than the inline letter: kept, nothing of the old one is in R2
+        assert_eq!(
+            park_keyed(&conn, &k1, 20),
+            ("copy".into(), "new".into(), key(&k1), None)
+        );
+        // a heavier keyed copy: kept, the held object is dropped
+        assert_eq!(
+            park_keyed(&conn, &k2, 30),
+            ("copy".into(), "new".into(), key(&k2), Some(key(&k1)))
+        );
+        // a lighter keyed copy: the held one stays, the arriving object is dropped
+        assert_eq!(
+            park_keyed(&conn, &k3, 40),
+            ("copy".into(), "old".into(), key(&k2), Some(key(&k3)))
+        );
+        assert_eq!(r2_cols(&conn, "c1").1, Some(300_000));
+        // an inline copy (a longer JSON than the keyed message, a lighter body): the keyed letter stays
+        let held = ceiling_row(&conn, "c1", "tm_a", 50).r2_key;
+        let big_inline = msg(&"B".repeat(120_000), &["tm_a"]);
+        let out = rows(
+            &conn,
+            &park_query(
+                "c1",
+                "tm_a",
+                &serde_json::to_string(&big_inline).unwrap(),
+                "f",
+                0,
+                50,
+            ),
+        );
+        assert_eq!(
+            (out[0][1].as_str(), out[0][2].as_str(), out[0][3].as_str()),
+            ("copy", "old", key(&k2).as_str())
+        );
+        assert_eq!(dropped_object(Some("old"), held.as_deref(), None), None);
+        // the ack of the key: the row goes and answers its object
+        let gone = rows(&conn, &resolve_query("c1", "tm_a"));
+        assert_eq!(
+            (gone[0][0].as_str(), gone[0][2].as_str()),
+            ("parked", key(&k2).as_str())
+        );
+        // the pure rule
+        assert_eq!(
+            dropped_object(None, Some("h"), Some("n")),
+            None,
+            "a fresh row drops nothing"
+        );
+        assert_eq!(
+            dropped_object(Some("new"), Some("k"), Some("k")),
+            None,
+            "the same object"
+        );
+        assert_eq!(dropped_object(Some("old"), Some("k"), Some("k")), None);
+        assert_eq!(
+            dropped_object(Some("new"), Some("h"), None),
+            Some("h".into()),
+            "an inline copy replaced a keyed letter"
+        );
+    }
+
+    /// Door 3, the deletion rule in the dead letters: LOST deletes the letter's object, the discard deletes each
+    /// discarded letter's, the DLQ consumer parks the key without reading the object, and nothing here names an
+    /// expiry. The health block serves the bytes at rest, the room and the consumer's policy.
+    #[test]
+    fn e585_d3_lost_and_discard_delete_the_object_and_the_park_reads_none() {
+        let squash = |s: &str| {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<String>()
+        };
+        let all = include_str!("dead_letters.rs");
+        let all = &all[..all.find("#[cfg(test)]").unwrap()];
+        let item = |name: &str| {
+            let start = all.find(name).unwrap();
+            squash(&all[start..start + all[start..].find("\n}\n").unwrap()])
+        };
+        let park = item("pub async fn park_batch(");
+        let lost = park.find("ifplan.last{").unwrap();
+        let not_lost = lost + park[lost..].find("}else{").unwrap();
+        assert!(park[lost..not_lost].contains(
+            "crate::queue::delete_beefs(env,std::slice::from_ref(key),\"itsdeadletterisLOST\",)"
+        ));
+        assert_eq!(
+            park.matches("delete_beefs(").count(),
+            2,
+            "LOST, and the lighter copy of a parked key"
+        );
+        assert!(item("pub async fn internal_discard(").contains(
+            "crate::queue::delete_beefs(env,std::slice::from_ref(key),\"theoperator'sdiscard\",)"
+        ));
+        assert!(
+            !squash(all).contains("read_beef("),
+            "the dead letters park and re-drive the KEY; only the consumer reads R2"
+        );
+        assert!(DISCARD_SQL
+            .ends_with("RETURNING txid, topics, redrives, fault, message, r2_key, r2_bytes"));
+        assert!(RESOLVE_SQL.ends_with("RETURNING status, parked_at, r2_key"));
+        let h = r2_json(Some((3, 1_500_000)), true, 4096);
+        assert_eq!(
+            (
+                h["letters"].as_u64(),
+                h["bytes"].as_u64(),
+                h["bound"].as_bool(),
+                h["inlineRoom"].as_u64()
+            ),
+            (Some(3), Some(1_500_000), Some(true), Some(4096))
+        );
+        assert_eq!(
+            h["replayMaxBytes"].as_u64(),
+            Some(beef_limits::QUEUE_BEEF_LIMITS.max_bytes as u64)
+        );
+        assert!(r2_json(None, false, 1)["bytes"].is_null());
     }
 }

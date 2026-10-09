@@ -12,6 +12,7 @@ mod shapes;
 fn message(bytes: &[u8]) -> queue::MutationMessage {
     queue::MutationMessage {
         beef_b64: STANDARD.encode(bytes),
+        r2: None,
         topics: vec!["tm_test".into()],
         mode: "historical-tx".into(),
         reason: "boundary witness".into(),
@@ -141,4 +142,72 @@ fn arc_callback_body_at_and_one_over() {
         Ok(_) => panic!("one extra body byte admitted"),
     };
     assert!(error.contains("max_bytes"), "{error}");
+}
+
+/// bsv-low #585 (door 3): a VALID 500 KB BEEF past the queue's room is carried by key and named by its SUBJECT (the
+/// letter's key in both consumers, no bytes read); the object's bytes pass the replay's check exactly when the
+/// consumer's policy admits them (`QUEUE_BEEF_LIMITS`, NL-6's: no cap of the R2 path's own). A body that policy
+/// admits today, sent by key under a lowered room, passes it now, and its subject read from the object is the
+/// message's.
+#[test]
+fn e585_d3_a_valid_500kb_beef_is_keyed_by_its_subject_and_replays_under_the_consumers_policy() {
+    use overlay_engine::types::SubmitMode;
+    let topics = vec!["tm_test".to_string()];
+    let (beef, id) = shapes::sized_body(500_000);
+    let plan = queue::plan_replay(
+        &beef,
+        &topics,
+        SubmitMode::HistoricalTx,
+        queue::REPLAY_REASON_PHASE3_FAULT,
+        queue::QUEUE_MESSAGE_ROOM,
+        &SUBMIT_BEEF_LIMITS,
+    )
+    .unwrap();
+    let queue::Carriage::R2(msg) = plan else {
+        panic!("500 KB rides by key")
+    };
+    let r = msg.r2.clone().unwrap();
+    assert_eq!(r.txid.as_deref(), Some(id.as_str()));
+    assert_eq!(
+        dead_letters::letter_key(&msg, None),
+        (id.clone(), "tm_test".to_string())
+    );
+    queue::check_blob(&r, &beef).unwrap();
+    let replay = queue::check_replay_blob(&r, &beef);
+    if QUEUE_BEEF_LIMITS.max_bytes >= beef.len() {
+        replay.unwrap();
+    } else {
+        assert!(replay.unwrap_err().contains("max_bytes"));
+    }
+
+    let (small, small_id) = shapes::body(8_000);
+    let plan = queue::plan_replay(
+        &small,
+        &topics,
+        SubmitMode::HistoricalTx,
+        queue::REPLAY_REASON_PHASE3_FAULT,
+        queue::QUEUE_MESSAGE_ROOM_MIN,
+        &QUEUE_BEEF_LIMITS,
+    )
+    .unwrap();
+    let queue::Carriage::R2(msg) = plan else {
+        panic!("8 KB rides by key under a 1 KB room")
+    };
+    let r = msg.r2.clone().unwrap();
+    queue::check_replay_blob(&r, &small).unwrap();
+    let mut named = beef_limits::parse_beef(&small, &QUEUE_BEEF_LIMITS).unwrap();
+    assert_eq!(ef::subject_txid_of(&mut named), Some(small_id.clone()));
+    assert_eq!(r.txid, Some(small_id));
+    // the same body under the default room is inline: the door changed nothing below it
+    assert!(matches!(
+        queue::plan_replay(
+            &small,
+            &topics,
+            SubmitMode::HistoricalTx,
+            queue::REPLAY_REASON_PHASE3_FAULT,
+            queue::QUEUE_MESSAGE_ROOM,
+            &QUEUE_BEEF_LIMITS
+        ),
+        Ok(queue::Carriage::Inline(_))
+    ));
 }

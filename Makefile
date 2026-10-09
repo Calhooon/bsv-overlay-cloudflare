@@ -420,6 +420,10 @@ ci-route: ci-d1-budget
 # limit, its one-enqueue claim and its ceiling over seeded letters, a re-driven letter parked again with its
 # history, and `/health/invariants.deadLetters`; the lens fold's legs: the new health fields, a stale re-drive
 # returned and re-driven, a forced re-drive of an exhausted letter, a bad-base64 replay dead-lettered and parked.
+# Then bsv-low #585 door 3's cell (`tools/lane-e585`, the overlay given `MUTATION_QUEUE_INLINE_ROOM:4096`, which
+# leaves every other cell's sub-kilobyte messages inline): ~8 KB "not now" letters written to the local R2 bucket,
+# parked by KEY, re-driven from R2 and landed (the object gone after the ack), a missing object parked as a fault,
+# a discard deleting the object, and a 500 KB submission under the consumer's policy as it stands.
 #
 # Ports: LANE_BASE+9 (app layer) and LANE_BASE+10 (overlay), :8800 and :8801 by default; the same pre-flight,
 # bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network: no
@@ -491,6 +495,7 @@ ci-d1-budget:
 	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:true \
 	    --var ARCADE_URL:http://127.0.0.1:9 \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
+	    --var MUTATION_QUEUE_INLINE_ROOM:4096 \
 	) > "$$ov_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PO/listTopicManagers "$$ov_log" "overlay"; \
@@ -499,6 +504,7 @@ ci-d1-budget:
 	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO; \
 	node tools/lane-e1d/landing_guard_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e576/dead_letter_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
+	node tools/lane-e585/beef_blobs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e555/deferred_graphs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the

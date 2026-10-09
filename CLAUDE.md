@@ -494,7 +494,10 @@ the names call are manager CPU inside the Worker's cap, whose breach is the
 platform's error and never a record. Pre-existing and not widened: a graph
 deeper than the budget (#555; deferred and resumed since, with a per-graph
 budget), the unbounded anchor verify (#557), a "not
-now" over a BEEF above 90,000 bytes answering 502 (#568). It cannot tell a faulted predecessor from one nobody submitted
+now" over a BEEF above 90,000 bytes answering 502 (#568; since #585 door 3
+that figure is the CONSUMER's `QUEUE_BEEF_LIMITS`, read by the door, and a
+body past the queue's inline room rides by key in R2, "The queued BEEF in R2"
+below). It cannot tell a faulted predecessor from one nobody submitted
 yet: the successor is "not now" until it lands. And a transaction that admits
 nothing, found no coin and carries more UNPROVEN, UNLANDED bodies than 16
 reads settle (six single-input ancestors or more: five are settled, measured
@@ -583,11 +586,14 @@ H1: Cloudflare's queue docs give `retry_delay` no default and the base set
 none, so a minute of D1 trouble lost every letter in the DLQ. A redelivery
 of the same bytes changes nothing; ANOTHER copy of a parked key (a resubmit,
 a different carried ancestry) keeps the LONGER bytes and leaves a `copy`
-history entry (lens L2). The `PARKED`, copy and redelivery lines print the
+history entry (lens L2; since #585 door 3 "longer" is what a message
+CARRIES: a keyed letter weighs its BEEF, an inline one its message, and the
+dropped copy's R2 object is deleted). The `PARKED`, copy and redelivery lines print the
 platform's `attempts=` (or `absent`; delta fold D-L2), so a drill that parks
 cleanly reads it. At most 2000 letters hold bytes (`parked` +
 `redriven`; a row is one queue message, at most 128 KB, and 20 history
-entries): a NEW letter past that is not parked, it is handed back with the
+entries; a letter whose BEEF is past the queue's inline room holds its R2
+KEY, `r2_key` / `r2_bytes`, and the bytes stay in R2, #585 door 3): a NEW letter past that is not parked, it is handed back with the
 same backoff, counted once as a letter on its first DLQ delivery
 (`dead_letters_ceiling_deferred_total`, `attempts == 1`) and on every
 delivery (`dead_letters_ceiling_deferrals_total`, up to 101 per letter;
@@ -677,7 +683,10 @@ sha256=<bytes' hash> bytes=<n>` with its re-drives and last fault, counts
 `dead_letters_discarded_total`, and answers `discarded` (with each hash),
 `notFound`, `faults`, `notTried` (keys past the call's 50 rows) and `more`
 (a txid alone that may hold more rows: call again). A discarded letter's bytes exist nowhere after it:
-it is the operator's word, as a re-drive is.
+it is the operator's word, as a re-drive is. A discarded letter whose BEEF is
+an R2 object has that object deleted with its row (`r2Key`, `r2Bytes`,
+`r2Deleted`, and `r2Fault` when the delete faulted: the row is gone, the
+object stays, `wrangler r2 object delete` takes it).
 
 `POST /internal/redrive-dead-letters` (bearer `INTERNAL_TOKEN`, as
 `/internal/reorg`, compared in fixed time since the lens fold, L1), body
@@ -809,6 +818,107 @@ among them). Two earlier pins were amended:
 - `e576f2_m1_a`: it seeded past a full ceiling through the park, which now
   refuses.
 - `e576f_h1`: the LOST counter is `class.lost_counter()`.
+
+## The queued BEEF in R2 (bsv-low #585, door 3, 2026-10-09)
+
+The queue producer capped the raw BEEF at 90,000 bytes (`queue.rs`
+`QUEUE_BEEF_SIZE_LIMIT`: its base64 inside the platform's 128 KB message). A
+faulted or "not now" submission above it was never queued: the door answered
+502 (`BEEF too large for the mutation queue`) on every presentation, and the
+admission was never held. The cap is gone. The rule: a queued submission of
+any size the consumer admits is carried WHOLE; the platform's message bound is
+routed around, never made a limit on a body.
+
+- **The binding.** `BEEF_BLOBS`, an R2 bucket, in all three overlay configs:
+  `overlay-beefs` (`wrangler.toml`; create it before a deploy, `wrangler r2
+  bucket create overlay-beefs`), `low-overlay-beefs` (prod) and
+  `low-overlay-beefs-beta` (`wrangler.low.toml`). A bucket name is not an
+  account identifier and is committed. The bucket gets NO expiry (lifecycle)
+  rule: a parked letter's bytes live there.
+- **The room.** `QUEUE_MESSAGE_ROOM`, 124,000 bytes, measured on the real
+  message JSON in its WORST form (`inline_worst_len`: as produced, or as the
+  lever re-drives it, the reason `redrive` and the letter's key added). A
+  message that fits is INLINE, byte for byte what it was (the frozen digest of
+  the 90,000-byte case). At two topics the room is about 92,700 raw bytes. The
+  var `MUTATION_QUEUE_INLINE_ROOM` only LOWERS it (1,024 to 124,000; the route
+  tier runs at 4,096).
+- **The producer.** A message past the room is written to R2 FIRST, under
+  `mutations/<sha256 of the BEEF>/<32 hex of sha256(sorted topics, "\n",
+  mode)>` (one object per bytes, topics and mode; R2 checks the sha256 it is
+  given), and the message carries `r2: {beefR2Key, sha256, bytes, txid}` in
+  place of `beef_b64` (`txid` is the subject by D5, so both consumers name the
+  letter without reading the object; absent, the letter is `unparsed:` and the
+  hash). A write that faults, or a missing binding, is the door's 502, as a
+  failed send is (S2: an ack is never an ack over a dropped write). A send that
+  faults AFTER the write deletes nothing (a twin's message may name the
+  object; the client's re-presentation writes the same key).
+- **The consumer's policy is read by the door.** A body the replay would
+  refuse for its size (`beef_limits::QUEUE_BEEF_LIMITS.max_bytes`, 90,000 until
+  NL-6 lifts it) is refused at the door, the same 502 as before, naming the
+  policy: an ack over a message whose every replay is a refusal would be an
+  ack over a dropped write. It is that policy's bound, read by name; the R2
+  path adds no cap. UNTIL NL-6 LANDS THE DOOR THEREFORE CHANGES NOTHING ABOVE
+  90,000 BYTES; what it changes today is a message past the room under that
+  size (a long topic list, a lowered room).
+- **The consumer.** A keyed message's object is read, checked (length, sha256,
+  the key naming that sha256, then `QUEUE_BEEF_LIMITS` as an inline body's
+  bytes are) and replayed exactly as an inline body: the same eviction read,
+  `submit_with_report`, landing guard and write-side guard. A MISSING object
+  (`beef_blobs_missing_total`), a read fault and a mismatch are the replay's
+  FAULT, class `fault`, never "not now": handed back, dead-lettered, parked.
+- **The dead letters.** The DLQ consumer parks the KEY without a read (the row
+  is a few hundred bytes); the lever re-drives the key and the consumer
+  re-reads R2; `/health/invariants.deadLetters.r2` serves `bound`, `letters`
+  and `bytes` (the bytes at rest, an index-only sum, migrations 179-181),
+  `inlineRoom` and `replayMaxBytes`.
+- **The deletion rule** (the captain's decision; never a bucket expiry): an
+  object is deleted (1) on the consumer's ACK, all three of them (landed,
+  refused under an open eviction, re-evicted), after the batch's loop, with
+  the object of the letter row that ack deleted; (2) when its dead letter is
+  LOST, which is the DLQ's last delivery (the platform's `attempts` past 100)
+  of a letter that was not parked: its park faulted, or it was deferred at the
+  ceiling or at a not-now bound for the ~48 h; (3) when the copy rule drops it
+  (another copy of a parked key carried more); (4) on the operator's discard.
+  Counted `beef_blobs_deleted_total`; a delete that faults is logged
+  `[beef-blobs]` with its key and counted `beef_blobs_delete_faults_total`.
+
+Limits, stated. (1) ORPHANS: an object nothing names stays for good (there is
+no sweep and no expiry): a send that faulted after its write and was never
+re-presented; a delete that faulted; a batch that died between its acks and
+its deletes; a main-queue message or a dead letter the platform dropped
+without the LOST line (retention; `attempts` unreadable, the ~8.3 h case); a
+letter the operator deleted by SQL. Nothing lists them: the health block
+counts the letters' objects from D1, not the bucket's. (2) TWINS: two messages
+of the same bytes, topics and mode (a client re-presenting a "not now"
+successor) name ONE object, and the first ack deletes it; the other, if it is
+in a later batch, finds it MISSING and becomes a fault letter that can never
+re-drive, to be discarded. The cure, not built: on a missing object, an ack
+when the subject's applied rows show its bytes landed. (3) The whole object is
+read into the isolate (its bytes, then the parse): memory is the body's.
+(4) Whether the platform counts a message's 128 KB as this JSON is not
+verified; 4,000 bytes are left under the decimal reading. (5) R2 costs a
+write per keyed submission and a read per replay of it (up to four, and four
+more per re-drive).
+
+Pins: `cargo test --manifest-path workers/Cargo.toml -p bsv-overlay-cloudflare
+--lib e585_d3` (ten: the inline message byte-identical and its frozen digest;
+the room on the real envelope, to the byte; a 500 KB body by key, read back
+byte for byte, refused on a flipped byte, a short read and a foreign key; the
+key per bytes, topics and mode; a valid 500 KB BEEF keyed by its subject and
+checked under the consumer's policy; a keyed letter parked, re-driven, MISSING
+as a fault, discarded; the copy rule; the write before the send and every ack
+deleting; LOST and the discard deleting; the three configs' bindings). None
+compiles on `6926f2c`, whose own pin asserts `None` past 90,000 bytes; each is
+RED against a revert mutant of its rule (five run). Amended: three `e576*`
+pins for the statements' new `r2_key` column and `park_query_r2`. The route
+cell `tools/lane-e585/beef_blobs_route_ci.mjs` (`make ci-d1-budget`, the
+overlay at `MUTATION_QUEUE_INLINE_ROOM:4096`): three ~8 KB "not now" letters
+written to the local R2, parked by key, the object byte for byte; one
+re-driven from R2 and LANDED, its object gone after the ack; one whose object
+was deleted parked again as a fault; one discarded with its object; and a
+500 KB submission, which passes on the door's REFUSAL while `replayMaxBytes`
+is 90,000 and becomes the full leg (acked, parked, re-driven, landed, object
+gone), unedited, when NL-6 lifts it.
 
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 
@@ -1618,6 +1728,8 @@ wrangler d1 create bsv-overlay   # paste returned database_id into wrangler.toml
 wrangler secret put ADMIN_TOKEN
 wrangler secret put SERVER_PRIVATE_KEY
 wrangler secret put TAAL_API_KEY   # optional — enables /arc-ingest
+wrangler queues create overlay-mutations-dlq   # the dead letters (#576)
+wrangler r2 bucket create overlay-beefs        # queued BEEFs past the inline room (#585 door 3); no expiry rule
 
 # Deploy
 cd crates/overlay-cloudflare

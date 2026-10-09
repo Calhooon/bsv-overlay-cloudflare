@@ -2240,6 +2240,9 @@ async fn queue_handler(
     // that does not decode and one whose BEEF is not base64 are handed back like any fault, dead-letter after their
     // replays and are PARKED (the undecodable one exhausted), where the platform used to ack them silently.
     let counters = env.d1("OVERLAY_DB").ok();
+    // bsv-low #585 (door 3, the deletion rule): the R2 objects of the messages this batch ACKED, deleted after the
+    // loop (a batch that dies midway leaves objects nothing names, never a redelivery that finds its bytes gone).
+    let mut acked_objects: Vec<String> = Vec::new();
     for msg in batch.raw_iter() {
         let body: crate::queue::MutationMessage = match worker::serde_wasm_bindgen::from_value(
             msg.body(),
@@ -2266,12 +2269,28 @@ async fn queue_handler(
             continue;
         }
 
-        let beef = match crate::queue::decode_replay_beef(&body.beef_b64) {
+        // bsv-low #585 (door 3): a message that names an R2 object replays THAT object's bytes, read and checked
+        // (length, sha256, the consumer's own BEEF policy), exactly as an inline body from here on. A missing
+        // object, a read fault and a mismatch are the replay's FAULT (never "not now"): handed back, dead-lettered,
+        // parked with the key.
+        let read = match &body.r2 {
+            None => crate::queue::decode_replay_beef(&body.beef_b64)
+                .map_err(|e| format!("invalid base64 BEEF ({e})")),
+            Some(r) => match crate::queue::read_beef(&env, r).await {
+                Ok(b) => Ok(b),
+                Err(f) => {
+                    if let (crate::queue::BlobFault::Missing(_), Some(db)) = (&f, &counters) {
+                        crate::ops::bump_counter(db, crate::ops::COUNTER_BEEF_BLOBS_MISSING, 1)
+                            .await;
+                    }
+                    Err(f.says())
+                }
+            },
+        };
+        let beef = match read {
             Ok(b) => b,
-            Err(e) => {
-                worker::console_log!(
-                    "Queue: invalid base64 BEEF ({e}) — retrying; it dead-letters and is parked"
-                );
+            Err(fault) => {
+                worker::console_log!("Queue: {fault} — retrying; it dead-letters and is parked");
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
                         .await;
@@ -2279,7 +2298,7 @@ async fn queue_handler(
                         db,
                         body,
                         None,
-                        &format!("invalid base64 BEEF ({e})"),
+                        &fault,
                         crate::dead_letters::LetterClass::Fault,
                     )
                     .await;
@@ -2323,13 +2342,15 @@ async fn queue_handler(
                         ev.evicted_at_ms,
                         ev.reason
                     );
-                    crate::dead_letters::resolve(
+                    let row_object = crate::dead_letters::resolve(
                         db,
                         body,
                         Some(&subject),
                         crate::dead_letters::Resolved::RefusedEvicted,
                     )
                     .await;
+                    acked_objects.extend(row_object);
+                    acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));
                     msg.ack();
                     continue;
                 }
@@ -2375,13 +2396,15 @@ async fn queue_handler(
                                 ev.evicted_at_ms,
                                 ev.reason
                             );
-                            crate::dead_letters::resolve(
+                            let row_object = crate::dead_letters::resolve(
                                 db,
                                 body,
                                 Some(&subject),
                                 crate::dead_letters::Resolved::ReEvicted,
                             )
                             .await;
+                            acked_objects.extend(row_object);
+                            acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));
                             msg.ack();
                             continue;
                         }
@@ -2413,14 +2436,16 @@ async fn queue_handler(
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_APPLIED, 1)
                         .await;
-                    crate::dead_letters::resolve(
+                    let row_object = crate::dead_letters::resolve(
                         db,
                         body,
                         Some(&subject),
                         crate::dead_letters::Resolved::Landed,
                     )
                     .await;
+                    acked_objects.extend(row_object);
                 }
+                acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));
                 msg.ack();
             }
             Ok((_steak, report)) => {
@@ -2448,6 +2473,8 @@ async fn queue_handler(
             }
         }
     }
+
+    crate::queue::delete_beefs(&env, &acked_objects, "its replay was acked").await;
 
     // W2-P4: ship the pot rows this batch changed (off the critical path).
     crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut));

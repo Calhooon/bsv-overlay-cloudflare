@@ -212,6 +212,17 @@ pub const COUNTER_DEAD_LETTERS_NOT_NOW_DEFERRALS: &str = "dead_letters_not_now_d
 pub const COUNTER_DEAD_LETTERS_STALE_RETURNED: &str = "dead_letters_stale_returned_total";
 /// bsv-low #576 (lens fold, M2): parked or re-driven letters whose bytes later landed (the row is deleted).
 pub const COUNTER_DEAD_LETTERS_RESOLVED: &str = "dead_letters_resolved_total";
+/// bsv-low #585 (door 3): a queued replay's BEEF written to R2 (`BEEF_BLOBS`) because its inline message would pass
+/// the room (`queue::QUEUE_MESSAGE_ROOM`); the write comes before the enqueue.
+pub const COUNTER_BEEF_BLOBS_WRITTEN: &str = "beef_blobs_written_total";
+/// bsv-low #585 (door 3): R2 objects deleted by the deletion rule (the consumer's ack, a LOST or dropped dead
+/// letter, the operator's discard).
+pub const COUNTER_BEEF_BLOBS_DELETED: &str = "beef_blobs_deleted_total";
+/// bsv-low #585 (door 3): a delete of the rule that faulted: the object stays and nothing names it (its key is in
+/// the `[beef-blobs]` log line).
+pub const COUNTER_BEEF_BLOBS_DELETE_FAULTS: &str = "beef_blobs_delete_faults_total";
+/// bsv-low #585 (door 3): a replay whose R2 object was MISSING at the consumer's read (a fault letter).
+pub const COUNTER_BEEF_BLOBS_MISSING: &str = "beef_blobs_missing_total";
 /// loop 18: an eviction pass that could not prove every table clean (a faulted read, a survivor after the
 /// second move) — the open marker stands; the write-side guard and the next eviction converge.
 pub const COUNTER_ADMIT_FAST_EVICT_INCOMPLETE: &str = "admit_fast_evict_incomplete_total";
@@ -910,6 +921,10 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_DEAD_LETTERS_NOT_NOW_DEFERRALS,
         COUNTER_DEAD_LETTERS_STALE_RETURNED,
         COUNTER_DEAD_LETTERS_RESOLVED,
+        COUNTER_BEEF_BLOBS_WRITTEN,
+        COUNTER_BEEF_BLOBS_DELETED,
+        COUNTER_BEEF_BLOBS_DELETE_FAULTS,
+        COUNTER_BEEF_BLOBS_MISSING,
         COUNTER_ARC_INGEST_SEEN_LATCHED,
         COUNTER_ARC_INGEST_EVICTED,
         COUNTER_ARC_INGEST_READMITTED,
@@ -1198,7 +1213,7 @@ pub async fn health_invariants(
     let status = if strict && dead { 503 } else { 200 };
     let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);
     let mut index_janitor = index_janitor_backlog(db).await;
-    let dead_letters = crate::dead_letters::health_json(db).await;
+    let dead_letters = crate::dead_letters::health_json(db, env).await;
     let deferred_graphs = crate::gasp_deferred::health_json(
         db,
         crate::gasp_deferred::graph_budget_limbs_from_env(env),
