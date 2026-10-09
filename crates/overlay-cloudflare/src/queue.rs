@@ -276,10 +276,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v.reason, "");
-        assert_eq!(
-            v.redrive, None,
-            "bsv-low #576: a message from before the lever parses too"
-        );
+        assert_eq!(v.redrive, None, "bsv-low #576: a message from before the lever parses too");
         assert_eq!(v.topics, vec!["tm_pot".to_string()]);
     }
 }

@@ -3067,11 +3067,8 @@ pub async fn backfill_spender_payouts(
             summary.missing_beef += 1;
             continue; // unparseable stored bytes — longer-wins may repair
         };
-        let (pay_a, pay_b) = spend_payouts(
-            &spending_tx,
-            row.pay_pkh_a.as_deref(),
-            row.pay_pkh_b.as_deref(),
-        );
+        let (pay_a, pay_b) =
+            spend_payouts(&spending_tx, row.pay_pkh_a.as_deref(), row.pay_pkh_b.as_deref());
         if pay_a.is_none() && pay_b.is_none() {
             continue; // cannot happen per the query (a home is decoded); leave it alone
         }
@@ -3735,8 +3732,7 @@ pub const TX_ANY_VERDICT_UPSERT_SQL: &str = "INSERT INTO tx_any_verdicts (txid, 
 /// never answers `present: false` from a stale word.
 pub const TX_ANY_VERDICT_DELETE_SQL: &str = "DELETE FROM tx_any_verdicts WHERE txid = ?";
 /// The GC of request-time absences past their window (the second gate's LOW-1), one statement per retire tick.
-pub const TX_ANY_VERDICT_GC_SQL: &str =
-    "DELETE FROM tx_any_verdicts WHERE kind = 'absent' AND verdictAtMs < ?";
+pub const TX_ANY_VERDICT_GC_SQL: &str = "DELETE FROM tx_any_verdicts WHERE kind = 'absent' AND verdictAtMs < ?";
 /// A request-time absence's window (mirrors the app layer's `VERDICT_MEMO_MAX_AGE_MS`).
 pub const TX_ANY_ABSENT_WINDOW_MS: i64 = 5 * 60_000;
 
@@ -4355,23 +4351,11 @@ pub(crate) mod tests {
     /// bsv-low #451 slice C (iv): the memo kind a retire reason names.
     #[test]
     fn a_retire_reason_names_its_memo_kind() {
-        assert_eq!(
-            verdict_kind_of_retire_reason("arcade REJECTED: UTXO_SPENT (70): x"),
-            "refused"
-        );
-        assert_eq!(
-            verdict_kind_of_retire_reason("network-absent 172800s: arcade 404 + both indexers 404"),
-            "retired"
-        );
+        assert_eq!(verdict_kind_of_retire_reason("arcade REJECTED: UTXO_SPENT (70): x"), "refused");
+        assert_eq!(verdict_kind_of_retire_reason("network-absent 172800s: arcade 404 + both indexers 404"), "retired");
         let bind_marks = TX_ANY_VERDICT_UPSERT_SQL.matches('?').count();
-        assert_eq!(
-            bind_marks, 4,
-            "txid, verdictAtMs, kind, evidence — judged {TX_ANY_VERDICT_UPSERT_SQL}"
-        );
-        assert!(
-            TX_ANY_VERDICT_UPSERT_SQL.contains("WHERE tx_any_verdicts.kind IS NOT 'unconfirmable'"),
-            "the janitor never downgrades a proven input conflict (MEDIUM-3c)"
-        );
+        assert_eq!(bind_marks, 4, "txid, verdictAtMs, kind, evidence — judged {TX_ANY_VERDICT_UPSERT_SQL}");
+        assert!(TX_ANY_VERDICT_UPSERT_SQL.contains("WHERE tx_any_verdicts.kind IS NOT 'unconfirmable'"), "the janitor never downgrades a proven input conflict (MEDIUM-3c)");
         assert_eq!(TX_ANY_VERDICT_DELETE_SQL.matches('?').count(), 1);
         assert_eq!(TX_ANY_VERDICT_GC_SQL.matches('?').count(), 1);
     }
@@ -6650,8 +6634,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn payouts_backfill_missing_spender_beef_stays_a_candidate_and_undecoded_rows_are_not_candidates(
-    ) {
+    async fn payouts_backfill_missing_spender_beef_stays_a_candidate_and_undecoded_rows_are_not_candidates() {
         let store = MemoryPotStorage::new();
         let (_, p) = real_key_params();
         let pot_txid = hex::encode([0x47u8; 32]);
@@ -6660,15 +6643,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .mark_spent(
-                &pot_txid,
-                0,
-                &hex::encode([0x48u8; 32]),
-                false,
-                None,
-                None,
-                None,
-            )
+            .mark_spent(&pot_txid, 0, &hex::encode([0x48u8; 32]), false, None, None, None)
             .await
             .unwrap();
         // A spent row with NO decoded home (a hop outpoint, a bare pot): never a candidate.
@@ -6682,26 +6657,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .mark_spent(
-                &bare,
-                0,
-                &hex::encode([0x4au8; 32]),
-                false,
-                None,
-                None,
-                None,
-            )
+            .mark_spent(&bare, 0, &hex::encode([0x4au8; 32]), false, None, None, None)
             .await
             .unwrap();
 
         let s = backfill_spender_payouts(&store, 20).await;
         assert_eq!((s.scanned, s.measured, s.missing_beef), (1, 0, 1));
         let s2 = backfill_spender_payouts(&store, 20).await;
-        assert_eq!(
-            (s2.scanned, s2.missing_beef),
-            (1, 1),
-            "no bytes yet: still a candidate, never latched out"
-        );
+        assert_eq!((s2.scanned, s2.missing_beef), (1, 1), "no bytes yet: still a candidate, never latched out");
     }
 
     #[tokio::test]
@@ -6970,10 +6933,7 @@ pub(crate) mod tests {
         let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
         assert_eq!(s.displaced, 1);
         let noted = crate::pot_changes::drain();
-        assert!(
-            noted.contains(&("potd".to_string(), 0)),
-            "the displaced pot is noted, got {noted:?}"
-        );
+        assert!(noted.contains(&("potd".to_string(), 0)), "the displaced pot is noted, got {noted:?}");
     }
 
     /// bsv-low #523: the MISSING-SPEND discovery pass (both the scheduled one and the by-outpoints one share
@@ -6997,9 +6957,7 @@ pub(crate) mod tests {
         let spender = "22".repeat(32);
         let fetcher = MockProofFetcher {
             minable: Default::default(),
-            spender_hints: [((pot.clone(), 0u32), spender.clone())]
-                .into_iter()
-                .collect(),
+            spender_hints: [((pot.clone(), 0u32), spender.clone())].into_iter().collect(),
             binding_raw: [(spender.clone(), "00".to_string())].into_iter().collect(),
             hint_fault: false,
             real_bumps: Default::default(),
@@ -7007,10 +6965,7 @@ pub(crate) mod tests {
         let s = discover_spends_for_outpoints(&store, &fetcher, &[(pot.clone(), 0)]).await;
         assert_eq!(s.discovered, 1);
         let noted = crate::pot_changes::drain();
-        assert!(
-            noted.contains(&(pot.clone(), 0)),
-            "the discovered pot is noted, got {noted:?}"
-        );
+        assert!(noted.contains(&(pot.clone(), 0)), "the discovered pot is noted, got {noted:?}");
         // already spent: nothing to discover, nothing noted
         let s2 = discover_spends_for_outpoints(&store, &fetcher, &[(pot.clone(), 0)]).await;
         assert_eq!(s2.discovered, 0);
@@ -7584,32 +7539,14 @@ pub(crate) mod tests {
     fn spend_rung_order_rotates_the_healthy_pair_and_keeps_bitails_terminal() {
         for start in 0..7usize {
             let order = spend_rung_order(start);
-            assert_eq!(
-                order.len(),
-                3,
-                "start {start}: every rung once — judged {order:?}"
-            );
-            assert_ne!(
-                order[0], 2,
-                "start {start}: pruned Bitails never opens the ladder — judged {order:?}"
-            );
-            assert_eq!(
-                order[2], 2,
-                "start {start}: Bitails is the terminal rung — judged {order:?}"
-            );
+            assert_eq!(order.len(), 3, "start {start}: every rung once — judged {order:?}");
+            assert_ne!(order[0], 2, "start {start}: pruned Bitails never opens the ladder — judged {order:?}");
+            assert_eq!(order[2], 2, "start {start}: Bitails is the terminal rung — judged {order:?}");
             let mut pair = order[..2].to_vec();
             pair.sort_unstable();
-            assert_eq!(
-                pair,
-                vec![0, 1],
-                "start {start}: the healthy pair both asked — judged {order:?}"
-            );
+            assert_eq!(pair, vec![0, 1], "start {start}: the healthy pair both asked — judged {order:?}");
         }
-        assert_ne!(
-            spend_rung_order(0)[0],
-            spend_rung_order(1)[0],
-            "the pair ROTATES between ticks"
-        );
+        assert_ne!(spend_rung_order(0)[0], spend_rung_order(1)[0], "the pair ROTATES between ticks");
     }
 
     /// bsv-low #451 slice B (the gate's HIGH-1 / HIGH-2): only a FRESH SEEN stops the proof ladder; the orphan view,
@@ -7618,138 +7555,42 @@ pub(crate) mod tests {
     fn parse_arcade_proof_look_allow_list_and_freshness() {
         let now = 1_789_683_775_142_i64; // 2026-09-17T22:22:55.142Z
         let mined = r#"{"txStatus":"MINED","merklePath":"fe0a0b0c","blockHeight":965000,"timestamp":"2026-01-01T00:00:00Z"}"#;
-        assert_eq!(
-            parse_arcade_proof_look(200, mined, now),
-            ArcadeProofLook::Mined("fe0a0b0c".into())
-        );
+        assert_eq!(parse_arcade_proof_look(200, mined, now), ArcadeProofLook::Mined("fe0a0b0c".into()));
         for st in ["SEEN_ON_NETWORK", "seen_multiple_nodes"] {
             let body = format!(r#"{{"txStatus":"{st}","timestamp":"2026-09-17T22:10:00Z"}}"#);
-            assert_eq!(
-                parse_arcade_proof_look(200, &body, now),
-                ArcadeProofLook::KnownUnmined(st.to_ascii_uppercase()),
-                "a fresh SEEN stops the ladder — judged {body}"
-            );
+            assert_eq!(parse_arcade_proof_look(200, &body, now), ArcadeProofLook::KnownUnmined(st.to_ascii_uppercase()), "a fresh SEEN stops the ladder — judged {body}");
         }
         let stale = r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"2026-09-17T21:52:00Z"}"#;
-        assert_eq!(
-            parse_arcade_proof_look(200, stale, now),
-            ArcadeProofLook::Unknown,
-            "31 minutes old: the couriers are asked"
-        );
-        assert_eq!(
-            parse_arcade_proof_look(200, r#"{"txStatus":"SEEN_ON_NETWORK"}"#, now),
-            ArcadeProofLook::Unknown,
-            "no stamp: not fresh"
-        );
-        assert_eq!(
-            parse_arcade_proof_look(
-                200,
-                r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"0001-01-01T00:00:00Z"}"#,
-                now
-            ),
-            ArcadeProofLook::Unknown
-        );
-        for st in [
-            "SEEN_IN_ORPHAN_MEMPOOL",
-            "MINED_IN_STALE_BLOCK",
-            "RECEIVED",
-            "STORED",
-            "ANNOUNCED_TO_NETWORK",
-            "REQUESTED_BY_NETWORK",
-            "SENT_TO_NETWORK",
-            "ACCEPTED_BY_NETWORK",
-            "REJECTED",
-            "DOUBLE_SPEND_ATTEMPTED",
-            "",
-        ] {
+        assert_eq!(parse_arcade_proof_look(200, stale, now), ArcadeProofLook::Unknown, "31 minutes old: the couriers are asked");
+        assert_eq!(parse_arcade_proof_look(200, r#"{"txStatus":"SEEN_ON_NETWORK"}"#, now), ArcadeProofLook::Unknown, "no stamp: not fresh");
+        assert_eq!(parse_arcade_proof_look(200, r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"0001-01-01T00:00:00Z"}"#, now), ArcadeProofLook::Unknown);
+        for st in ["SEEN_IN_ORPHAN_MEMPOOL", "MINED_IN_STALE_BLOCK", "RECEIVED", "STORED", "ANNOUNCED_TO_NETWORK", "REQUESTED_BY_NETWORK", "SENT_TO_NETWORK", "ACCEPTED_BY_NETWORK", "REJECTED", "DOUBLE_SPEND_ATTEMPTED", ""] {
             let body = format!(r#"{{"txStatus":"{st}","timestamp":"2026-09-17T22:22:00Z"}}"#);
-            assert_eq!(
-                parse_arcade_proof_look(200, &body, now),
-                ArcadeProofLook::Unknown,
-                "not on the allow-list: ask on — judged {body}"
-            );
+            assert_eq!(parse_arcade_proof_look(200, &body, now), ArcadeProofLook::Unknown, "not on the allow-list: ask on — judged {body}");
         }
-        assert_eq!(
-            parse_arcade_proof_look(200, r#"{"txStatus":"MINED"}"#, now),
-            ArcadeProofLook::Unknown,
-            "MINED without a path: ask on"
-        );
-        assert_eq!(
-            parse_arcade_proof_look(
-                404,
-                r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"2026-09-17T22:22:00Z"}"#,
-                now
-            ),
-            ArcadeProofLook::Unknown,
-            "a 404 body is not a look"
-        );
-        assert_eq!(
-            parse_arcade_proof_look(200, "not json", now),
-            ArcadeProofLook::Unknown
-        );
-        assert_eq!(
-            parse_arcade_proof_look(503, "", now),
-            ArcadeProofLook::Unknown
-        );
+        assert_eq!(parse_arcade_proof_look(200, r#"{"txStatus":"MINED"}"#, now), ArcadeProofLook::Unknown, "MINED without a path: ask on");
+        assert_eq!(parse_arcade_proof_look(404, r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"2026-09-17T22:22:00Z"}"#, now), ArcadeProofLook::Unknown, "a 404 body is not a look");
+        assert_eq!(parse_arcade_proof_look(200, "not json", now), ArcadeProofLook::Unknown);
+        assert_eq!(parse_arcade_proof_look(503, "", now), ArcadeProofLook::Unknown);
     }
 
     /// bsv-low #451 slice B: Arcade's status stamp read as an instant (the freshness bound rests on it).
     #[test]
     fn rfc3339_utc_ms_reads_arcade_stamps() {
-        assert_eq!(
-            rfc3339_utc_ms("2026-09-17T22:22:55.142485Z"),
-            Some(1_789_683_775_142)
-        );
-        assert_eq!(
-            rfc3339_utc_ms("2026-09-17T22:22:55Z"),
-            Some(1_789_683_775_000)
-        );
-        assert_eq!(
-            rfc3339_utc_ms("2026-01-01T00:00:00Z"),
-            Some(1_767_225_600_000)
-        );
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55.142485Z"), Some(1_789_683_775_142));
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55Z"), Some(1_789_683_775_000));
+        assert_eq!(rfc3339_utc_ms("2026-01-01T00:00:00Z"), Some(1_767_225_600_000));
         assert_eq!(rfc3339_utc_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(
-            rfc3339_utc_ms("2026-09-17T22:22:55+00:00"),
-            Some(1_789_683_775_000)
-        );
-        assert_eq!(
-            rfc3339_utc_ms("0001-01-01T00:00:00Z").map(|v| v < 0),
-            Some(true),
-            "Arcade's zero stamp is far in the past, never fresh"
-        );
-        for bad in [
-            "",
-            "2026-09-17",
-            "2026-09-17T22:22:55",
-            "2026-13-01T00:00:00Z",
-            "2026-09-17T25:00:00Z",
-            "not a time",
-            "2026-09-17T22:22:55.abcZ",
-            "2026-09-31T00:00:00Z",
-            "2026-02-29T00:00:00Z",
-            "2026-04-31T00:00:00Z",
-            "2026-09-00T00:00:00Z",
-            "2026-09-17T-1:00:00Z",
-            "2026-09-17T22:+5:00Z",
-            "2026-09-17T22:22:-0Z",
-        ] {
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55+00:00"), Some(1_789_683_775_000));
+        assert_eq!(rfc3339_utc_ms("0001-01-01T00:00:00Z").map(|v| v < 0), Some(true), "Arcade's zero stamp is far in the past, never fresh");
+        for bad in ["", "2026-09-17", "2026-09-17T22:22:55", "2026-13-01T00:00:00Z", "2026-09-17T25:00:00Z", "not a time", "2026-09-17T22:22:55.abcZ",
+                    "2026-09-31T00:00:00Z", "2026-02-29T00:00:00Z", "2026-04-31T00:00:00Z", "2026-09-00T00:00:00Z", "2026-09-17T-1:00:00Z", "2026-09-17T22:+5:00Z", "2026-09-17T22:22:-0Z"] {
             assert_eq!(rfc3339_utc_ms(bad), None, "judged {bad:?}");
         }
         // the delta-verify's LOW-C: the day is bound by its month, leap years included
-        assert_eq!(
-            rfc3339_utc_ms("2024-02-29T00:00:00Z"),
-            Some(1_709_164_800_000)
-        );
-        assert!(
-            rfc3339_utc_ms("2000-02-29T00:00:00Z").is_some(),
-            "400-year leap"
-        );
-        assert_eq!(
-            rfc3339_utc_ms("1900-02-29T00:00:00Z"),
-            None,
-            "100-year non-leap"
-        );
+        assert_eq!(rfc3339_utc_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
+        assert!(rfc3339_utc_ms("2000-02-29T00:00:00Z").is_some(), "400-year leap");
+        assert_eq!(rfc3339_utc_ms("1900-02-29T00:00:00Z"), None, "100-year non-leap");
         assert_eq!(days_in_month(2026, 2), 28);
         assert_eq!(days_in_month(2028, 2), 29);
         assert_eq!(days_in_month(2026, 13), 0);
