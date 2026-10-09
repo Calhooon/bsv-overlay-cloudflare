@@ -461,7 +461,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 167 → 169 for bsv-low #576's delta-2 fold (2026-10-08, D2-M1): `mutation_dead_letters.class` (one additive ALTER)
 /// and the per-class index.
 /// 169 → 170 for bsv-low #555 (2026-10-09): `gasp_deferred_graphs`, the deferred GASP graphs' walks.
-pub const OVERLAY_MIGRATION_COUNT: usize = 170;
+/// 170 → 171 for bsv-low #555's delta fold (2026-10-09, D-M2): `gasp_peer_health.yieldless_syncs` (one additive ALTER).
+pub const OVERLAY_MIGRATION_COUNT: usize = 171;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1732,6 +1733,10 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // bsv-low #555 (2026-10-09): THE DEFERRED GASP GRAPHS. One row per graph whose walk passed its per-graph budget,
     // replaced on every deferral, deleted when it converges or is dropped (`gasp_deferred.rs`). Transient.
     crate::gasp_deferred::DEFERRED_GRAPHS_CREATE,
+    // bsv-low #555's delta fold (D-M2): the consecutive YIELDLESS syncs of a (host, topic), syncs the peer served work
+    // that finalized no graph and moved no cursor (`PEER_YIELD_UPSERT_SQL`); past 12 each is a failed attempt for the
+    // quarantine. Additive ALTER; the runner ignores the re-run "duplicate column" error.
+    "ALTER TABLE gasp_peer_health ADD COLUMN yieldless_syncs INTEGER NOT NULL DEFAULT 0",
 ];
 
 // =============================================================================

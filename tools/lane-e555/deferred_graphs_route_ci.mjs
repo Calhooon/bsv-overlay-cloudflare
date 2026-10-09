@@ -11,6 +11,8 @@
  * The lens fold (bsv-low #555, M3): the block names `totalBytes` and the global ceiling (256 rows, 64 MiB) and the
  * stale sweep's age (30 h); `gasp_graph_dropped_stale_total` and `..._no_progress_total` are served from 0. RED on
  * `03e1e17` (no `totalBytes`, no ceiling, neither counter).
+ * The delta fold (bsv-low #555, D-M1 and D-M2): the block names the per-host share of the ceiling (32 rows, 8 MiB),
+ * and the migrations gave `gasp_peer_health` its `yieldless_syncs` column. RED on `0974be5` (neither).
  *
  *   node tools/lane-e555/deferred_graphs_route_ci.mjs <overlay base> <overlay --persist-to dir>
  *
@@ -73,6 +75,13 @@ expect(
   'the global ceiling (256 rows, 64 MiB), the stale age (30 h) and totalBytes 0',
   JSON.stringify(block0),
 )
+expect(
+  block0?.budget?.maxRowsPerHost === 32 && block0?.budget?.maxBytesPerHost === 8388608,
+  'the per-host share of the ceiling (32 rows, 8 MiB)',
+  JSON.stringify(block0?.budget),
+)
+const yieldless = d1(`SELECT COUNT(*) AS n FROM pragma_table_info('gasp_peer_health') WHERE name = 'yieldless_syncs'`)
+expect(yieldless[0]?.n === 1, 'gasp_peer_health.yieldless_syncs exists (migration 171)', JSON.stringify(yieldless))
 const names = [
   'gasp_graph_deferred_total', 'gasp_graph_resumed_total', 'gasp_graph_converged_total', 'gasp_graph_dropped_total',
   ...['max_passes', 'too_big', 'too_many', 'store_fault', 'not_served', 'held', 'not_held', 'root_proven', 'refused',

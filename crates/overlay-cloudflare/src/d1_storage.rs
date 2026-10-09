@@ -114,6 +114,19 @@ pub(crate) const PEER_HEALTH_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health \
        last_attempt = unixepoch(), \
        last_success = CASE WHEN ?3 THEN unixepoch() ELSE last_success END";
 
+/// The SHIPPED upsert behind `record_peer_sync_yield` (bsv-low #555, the
+/// delta fold's D-M2): the consecutive YIELDLESS syncs of a (host, topic).
+/// Binds: `?1` host, `?2` topic, `?3` yielded (1/0). A sync that yielded
+/// resets the count to 0, one that did not adds one; the new count is
+/// returned. A new row's `last_attempt` is left NULL: the engine records the
+/// attempt itself next (`PEER_HEALTH_UPSERT_SQL`), which stamps it.
+pub(crate) const PEER_YIELD_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health \
+     (host, topic, consecutive_failures, yieldless_syncs) \
+     VALUES (?1, ?2, 0, CASE WHEN ?3 THEN 0 ELSE 1 END) \
+     ON CONFLICT(host, topic) DO UPDATE SET \
+       yieldless_syncs = CASE WHEN ?3 THEN 0 ELSE yieldless_syncs + 1 END \
+     RETURNING yieldless_syncs";
+
 /// The SHIPPED health read (bsv-low#302). Age is computed relative in SQL
 /// (`unixepoch() - last_attempt`) so wasm and the rusqlite test agree on
 /// semantics without any host clock in the engine.
@@ -863,6 +876,26 @@ impl Storage for D1Storage {
             .map_err(d1_err)
     }
 
+    async fn record_peer_sync_yield(
+        &self,
+        host: &str,
+        topic: &str,
+        yielded: bool,
+    ) -> Result<u64, StorageError> {
+        #[derive(Deserialize)]
+        struct Count {
+            yieldless_syncs: f64,
+        }
+        let row: Option<Count> = Query::new(PEER_YIELD_UPSERT_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(yielded)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(d1_err)?;
+        Ok(row.map_or(0, |r| r.yieldless_syncs.max(0.0) as u64))
+    }
+
     async fn get_peer_sync_health(
         &self,
         host: &str,
@@ -907,6 +940,8 @@ impl Storage for D1Storage {
             .bind(json.as_str())
             .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS)
             .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_TOTAL_BYTES as f64)
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS_PER_HOST)
+            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_BYTES_PER_HOST as f64)
             .fetch_optional(&self.db)
             .await
             .map_err(d1_err)?;
@@ -1407,6 +1442,59 @@ mod tests {
             )
             .ok();
         assert_eq!(missing, None);
+    }
+
+    /// bsv-low #555, the delta fold's D-M2: the SHIPPED yield upsert on the
+    /// production schema (migration 171). A yieldless sync adds one and
+    /// returns the count, a yielding one resets it to 0; the first call for
+    /// a pair makes its row, and the attempt upsert that follows stamps the
+    /// row's `last_attempt` without touching the count. On 0974be5 there is
+    /// no `yieldless_syncs` column and nothing counted a yieldless sync.
+    #[test]
+    fn e555d_m2_peer_yield_upsert_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "{e}\n{sql}"
+                );
+            }
+        }
+        let yield_ = |yielded: bool| -> i64 {
+            conn.query_row(
+                PEER_YIELD_UPSERT_SQL,
+                rusqlite::params!["https://hostile", "tm_test", yielded],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(yield_(false), 1, "a new row");
+        conn.execute(
+            PEER_HEALTH_UPSERT_SQL,
+            rusqlite::params!["https://hostile", "tm_test", true],
+        )
+        .unwrap();
+        let (fails, age): (i64, Option<i64>) = conn
+            .query_row(
+                PEER_HEALTH_SELECT_SQL,
+                rusqlite::params!["https://hostile", "tm_test"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fails, 0);
+        assert!(age.is_some(), "the attempt stamped it");
+        assert_eq!(yield_(false), 2, "the attempt left the count");
+        assert_eq!(yield_(false), 3);
+        assert_eq!(yield_(true), 0, "a yield resets it");
+        assert_eq!(yield_(false), 1);
+        let storage = include_str!("d1_storage.rs");
+        let f = &storage[storage.find("async fn record_peer_sync_yield").unwrap()..];
+        assert!(
+            f[..f.find("async fn get_peer_sync_health").unwrap()].contains("PEER_YIELD_UPSERT_SQL")
+        );
     }
 
     #[test]

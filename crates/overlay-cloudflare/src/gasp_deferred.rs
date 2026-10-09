@@ -59,6 +59,20 @@ pub const DEFERRED_GRAPHS_MAX_ROWS: u32 = 256;
 /// [`DEFERRED_GRAPHS_MAX_ROWS`]. The measured picture graph is about 0.5 MiB.
 pub const DEFERRED_GRAPHS_MAX_TOTAL_BYTES: u64 = 64 << 20;
 
+/// The most rows ONE host holds over all its topics (bsv-low #555, the delta
+/// fold's D-M1): an eighth of [`DEFERRED_GRAPHS_MAX_ROWS`]. The ceiling was
+/// one pool over every peer, and four (host, topic) pairs of a stranger's
+/// hosts held all of it; every honest deferral after them was refused
+/// (`too_many`) and walked from its root on every tick, the case #555 was
+/// built for. With the share, eight hosts are needed to fill it. A NEW key
+/// past it is refused in the upsert, as the global bounds.
+pub const DEFERRED_GRAPHS_MAX_ROWS_PER_HOST: u32 = DEFERRED_GRAPHS_MAX_ROWS / 8;
+
+/// The most bytes of `record` ONE host holds over all its topics (8 MiB, an
+/// eighth of [`DEFERRED_GRAPHS_MAX_TOTAL_BYTES`]; about sixteen of the
+/// measured picture graph). A save past it is refused, as the global bound.
+pub const DEFERRED_GRAPHS_MAX_BYTES_PER_HOST: u64 = DEFERRED_GRAPHS_MAX_TOTAL_BYTES / 8;
+
 /// A row not written for this long is swept by the cron
 /// ([`DEFERRED_GRAPHS_SWEEP_SQL`], counted `gasp_graph_dropped_stale_total`):
 /// twice `DEFERRED_GRAPH_MAX_PASSES` (60) at the `*/15` cadence of all three
@@ -73,19 +87,24 @@ pub const DEFERRED_GRAPH_STALE_SECS: u64 =
 /// Save (replace) one record, under the table's global ceiling. Binds: `?1`
 /// host, `?2` topic, `?3` outpoint, `?4` score, `?5` nodes, `?6` pending, `?7`
 /// calls, `?8` passes, `?9` reason, `?10` bytes, `?11` record, `?12`
-/// [`DEFERRED_GRAPHS_MAX_ROWS`], `?13` [`DEFERRED_GRAPHS_MAX_TOTAL_BYTES`].
-/// `created_at` is kept from the first deferral (the age); the backend owns
-/// the clock. The `WHERE` of the `SELECT` re-reads the ceiling in the one
-/// statement (as #576's `PARK_SQL`): a held key always replaces within the byte
-/// bound, a new key only under the row bound too. A refused save returns NO
-/// row (`AtCeiling`).
+/// [`DEFERRED_GRAPHS_MAX_ROWS`], `?13` [`DEFERRED_GRAPHS_MAX_TOTAL_BYTES`],
+/// `?14` [`DEFERRED_GRAPHS_MAX_ROWS_PER_HOST`], `?15`
+/// [`DEFERRED_GRAPHS_MAX_BYTES_PER_HOST`]. `created_at` is kept from the
+/// first deferral (the age); the backend owns the clock. The `WHERE` of the
+/// `SELECT` re-reads the ceiling in the one statement (as #576's `PARK_SQL`):
+/// a held key always replaces within the byte bounds (the table's and its
+/// host's), a new key only under the row bounds too. A refused save returns
+/// NO row (`AtCeiling`).
 pub const DEFERRED_GRAPH_UPSERT_SQL: &str = "INSERT INTO gasp_deferred_graphs \
      (host, topic, outpoint, score, nodes, pending, calls, passes, reason, bytes, record, created_at, updated_at) \
      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, unixepoch(), unixepoch() \
      WHERE (EXISTS (SELECT 1 FROM gasp_deferred_graphs WHERE host = ?1 AND topic = ?2 AND outpoint = ?3) \
-       OR (SELECT COUNT(*) FROM gasp_deferred_graphs) < ?12) \
+       OR ((SELECT COUNT(*) FROM gasp_deferred_graphs) < ?12 \
+         AND (SELECT COUNT(*) FROM gasp_deferred_graphs WHERE host = ?1) < ?14)) \
      AND (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs \
        WHERE NOT (host = ?1 AND topic = ?2 AND outpoint = ?3)) + ?10 <= ?13 \
+     AND (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs \
+       WHERE host = ?1 AND NOT (topic = ?2 AND outpoint = ?3)) + ?10 <= ?15 \
      ON CONFLICT(host, topic, outpoint) DO UPDATE SET \
        score = excluded.score, nodes = excluded.nodes, pending = excluded.pending, \
        calls = excluded.calls, passes = excluded.passes, reason = excluded.reason, \
@@ -279,6 +298,8 @@ pub fn health_view(count: u64, total_bytes: u64, rows: &[HealthRow]) -> serde_js
             "perPeerTopic": overlay_engine::gasp::DEFERRED_GRAPHS_PER_PEER_TOPIC,
             "maxRows": DEFERRED_GRAPHS_MAX_ROWS,
             "maxTotalBytes": DEFERRED_GRAPHS_MAX_TOTAL_BYTES,
+            "maxRowsPerHost": DEFERRED_GRAPHS_MAX_ROWS_PER_HOST,
+            "maxBytesPerHost": DEFERRED_GRAPHS_MAX_BYTES_PER_HOST,
             "staleSecs": DEFERRED_GRAPH_STALE_SECS,
         },
     })
@@ -376,6 +397,18 @@ mod tests {
         max_rows: u32,
         max_bytes: u64,
     ) -> bool {
+        upsert_shared(conn, r, max_rows, max_bytes, max_rows, max_bytes)
+    }
+
+    /// The same, with the per-host share too.
+    fn upsert_shared(
+        conn: &rusqlite::Connection,
+        r: &DeferredGraph,
+        max_rows: u32,
+        max_bytes: u64,
+        host_rows: u32,
+        host_bytes: u64,
+    ) -> bool {
         let json = serde_json::to_string(r).unwrap();
         let mut stmt = conn.prepare(DEFERRED_GRAPH_UPSERT_SQL).unwrap();
         let mut rows = stmt
@@ -392,18 +425,22 @@ mod tests {
                 json.len() as i64,
                 json,
                 max_rows,
-                max_bytes as i64
+                max_bytes as i64,
+                host_rows,
+                host_bytes as i64
             ])
             .unwrap();
         rows.next().unwrap().is_some()
     }
 
     fn upsert(conn: &rusqlite::Connection, r: &DeferredGraph) {
-        assert!(upsert_under(
+        assert!(upsert_shared(
             conn,
             r,
             DEFERRED_GRAPHS_MAX_ROWS,
-            DEFERRED_GRAPHS_MAX_TOTAL_BYTES
+            DEFERRED_GRAPHS_MAX_TOTAL_BYTES,
+            DEFERRED_GRAPHS_MAX_ROWS_PER_HOST,
+            DEFERRED_GRAPHS_MAX_BYTES_PER_HOST
         ));
     }
 
@@ -492,6 +529,67 @@ mod tests {
             (DEFERRED_GRAPHS_MAX_ROWS, DEFERRED_GRAPHS_MAX_TOTAL_BYTES),
             (256, 64 << 20)
         );
+    }
+
+    /// bsv-low #555, the delta fold's D-M1: the ceiling is SHARED by host. A
+    /// stranger's host at its share (2 rows here, over two topics) is refused
+    /// a new key and a growth past its byte share, and still replaces a held
+    /// key within it; another host still saves, up to the global bounds. On
+    /// 0974be5 the upsert had no per-host bound: one host could take the
+    /// whole ceiling and every other host's deferral was refused.
+    #[test]
+    fn e555d_m1_the_upsert_shares_the_ceiling_by_host() {
+        let conn = sqlite();
+        let on = |host: &str, topic: &str, o: &str, nodes: usize, bytes: u64| {
+            let mut r = record(o, 1, nodes, 1);
+            r.peer = host.into();
+            r.topic = topic.into();
+            upsert_shared(&conn, &r, 5, 1 << 20, 2, bytes)
+        };
+        assert!(on("https://stranger", "tm_x", "s1.0", 1, 1 << 20));
+        assert!(on("https://stranger", "tm_y", "s2.0", 1, 1 << 20));
+        assert!(
+            !on("https://stranger", "tm_z", "s3.0", 1, 1 << 20),
+            "past its rows"
+        );
+        assert!(
+            on("https://stranger", "tm_x", "s1.0", 2, 1 << 20),
+            "held: replaced"
+        );
+        let one = serde_json::to_string(&record("s1.0", 1, 2, 1))
+            .unwrap()
+            .len() as u64;
+        let two = serde_json::to_string(&record("s2.0", 1, 1, 1))
+            .unwrap()
+            .len() as u64;
+        assert!(
+            !on("https://stranger", "tm_y", "s2.0", 9, one + two),
+            "a growth past its bytes"
+        );
+        assert!(
+            on("https://honest", "tm_x", "h1.0", 1, 1 << 20),
+            "another host saves"
+        );
+        assert!(on("https://honest", "tm_x", "h2.0", 1, 1 << 20));
+        assert!(on("https://third", "tm_x", "t1.0", 1, 1 << 20));
+        assert!(
+            !on("https://fourth", "tm_x", "f1.0", 1, 1 << 20),
+            "the global rows"
+        );
+        assert_eq!(rows(&conn), ["h1.0", "h2.0", "s1.0", "s2.0", "t1.0"]);
+        assert_eq!(
+            (
+                DEFERRED_GRAPHS_MAX_ROWS_PER_HOST,
+                DEFERRED_GRAPHS_MAX_BYTES_PER_HOST
+            ),
+            (32, 8 << 20)
+        );
+        // The worker binds the shares.
+        let storage = include_str!("d1_storage.rs");
+        let put = &storage[storage.find("async fn put_deferred_graph").unwrap()..];
+        let put = &put[..put.find("async fn find_deferred_graphs").unwrap()];
+        assert!(put.contains("DEFERRED_GRAPHS_MAX_ROWS_PER_HOST"));
+        assert!(put.contains("DEFERRED_GRAPHS_MAX_BYTES_PER_HOST"));
     }
 
     /// bsv-low #555, the lens fold's M3: the cron's sweep deletes the rows not
@@ -614,12 +712,16 @@ mod tests {
             (
                 v["budget"]["maxRows"].clone(),
                 v["budget"]["maxTotalBytes"].clone(),
-                v["budget"]["staleSecs"].clone()
+                v["budget"]["staleSecs"].clone(),
+                v["budget"]["maxRowsPerHost"].clone(),
+                v["budget"]["maxBytesPerHost"].clone()
             ),
             (
                 serde_json::json!(256),
                 serde_json::json!(64u64 << 20),
-                serde_json::json!(108_000)
+                serde_json::json!(108_000),
+                serde_json::json!(32),
+                serde_json::json!(8u64 << 20)
             )
         );
         assert_eq!(v["oldest"]["outpoint"], "a.0");
