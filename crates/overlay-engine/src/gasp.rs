@@ -198,6 +198,10 @@ pub const PEER_QUARANTINE_REPROBE_SECS: u64 = 6 * 3600;
 /// [`PEER_QUARANTINE_THRESHOLD`] syncs (20, 5 h at `*/15`) and gets one probe
 /// per [`PEER_QUARANTINE_REPROBE_SECS`] after that. A sync that finalized a
 /// graph or moved the cursor resets the count; a quiet one leaves it.
+/// A quarantined peer is re-admitted only by such a yield (the delta-4
+/// fold's D4-L2): its sync that did not fail and yielded nothing, an empty
+/// listing at its probe included, is not recorded, so its failures stay and
+/// it is attended on each tick until it yields or fails again.
 ///
 /// The bound is in SYNCS AND in TIME (the delta-2 fold's D2-M1): a yieldless
 /// sync is a failure only when the streak holds more than this many syncs
@@ -304,33 +308,47 @@ fn peer_authority(url: &str) -> (String, String, Option<String>) {
     )
 }
 
-/// The peers of a SHIP-discovered topic, ONE per canonical authority
-/// `scheme://host[:port]` (bsv-low #555, the delta-2 fold's D2-M2 and the
-/// delta-3 fold's D3-L1): each advertised domain is canonicalized (the scheme
+/// The peers of a SHIP-discovered topic, ONE per [`peer_origin`] (bsv-low
+/// #555, the delta-2 fold's D2-M2; restored by the delta-4 fold, D4-M1): each
+/// advertised domain is canonicalized to `scheme://host[:port]` (the scheme
 /// and host lowercased; path, query, fragment, user, a trailing dot and the
-/// scheme's default port dropped) and spellings of one canonical form are
-/// one peer, synced once a tick. So `/?1`, `/?2`, `/#x`, a trailing slash
-/// and `:443` of one server are one peer. Distinct ports (or schemes) of one
-/// host stay distinct peers, so a stranger's default-port spelling cannot
-/// displace an honest overlay that serves on `:8443` (D3-L1: ranked by
-/// `https`, then no port, it did). They still share ONE quarantine, one
-/// yieldless streak and one share of the worker's ceiling, all keyed by
-/// [`peer_origin`]. Stated: a stranger's ports of its own host are one peer
-/// each, a per-peer slice each per tick, until their shared quarantine.
-/// Sorted, for a stable order.
+/// scheme's default port dropped), and of the spellings of one origin the
+/// first by `https`, then no explicit port, then the string is kept. So
+/// eight adverts of one server (`/?1`, `/?2`, `/#x`, `:8443`, ...) are one
+/// peer synced once a tick, and a stranger's spelling of an honest host (a
+/// query, a dead port) cannot stand beside that host's own advert under its
+/// quarantine key. The delta-3 fold kept one peer per `scheme://host[:port]`
+/// while the failures stayed on one row per origin (D4-M1): eight adverts of
+/// dead ports of an honest host's name quarantined the honest peer, and
+/// seven were never quarantined, a slice each on every tick. The LIMIT,
+/// stated (the delta-3 lens's D3-L1): two overlays of one host on two ports,
+/// on one SHIP topic, are one peer (the default port's), so a stranger's
+/// default-port spelling displaces an honest overlay that serves only on
+/// another port. Sorted, for a stable order.
 pub fn ship_peers_by_origin<I: IntoIterator<Item = String>>(domains: I) -> Vec<String> {
-    let mut peers = std::collections::BTreeSet::new();
+    type Rank = (bool, bool, String);
+    let mut by_origin: std::collections::BTreeMap<String, (Rank, String)> =
+        std::collections::BTreeMap::new();
     for domain in domains {
         let (scheme, origin, port) = peer_authority(&domain);
         if origin.is_empty() {
             continue;
         }
-        peers.insert(match port {
+        let canonical = match &port {
             Some(port) => format!("{scheme}://{origin}:{port}"),
             None => format!("{scheme}://{origin}"),
-        });
+        };
+        let candidate = (scheme != "https", port.is_some(), canonical.clone());
+        match by_origin.get(&origin) {
+            Some((kept, _)) if *kept <= candidate => {}
+            _ => {
+                by_origin.insert(origin, (candidate, canonical));
+            }
+        }
     }
-    peers.into_iter().collect()
+    let mut peers: Vec<String> = by_origin.into_values().map(|(_, url)| url).collect();
+    peers.sort();
+    peers
 }
 
 /// PURE quarantine rule (bsv-low#302): a peer is skipped IFF it has hit

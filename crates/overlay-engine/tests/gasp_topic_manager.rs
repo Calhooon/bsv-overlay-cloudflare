@@ -8809,37 +8809,34 @@ async fn e555d2_m2_spellings_of_one_server_are_one_origin_and_one_peer() {
     adverts.push("https://a.evil.example/?z".into());
     adverts.push("https://Overlay-US-1.bsvb.tech/".into());
     adverts.push("https://evil.example:443/?y".into());
-    // One peer per canonical `scheme://host[:port]` (amended by the delta-3
-    // fold, D3-L1): the queries, fragments, users, trailing slash and dot and
-    // the default port collapse; the schemes and ports of one origin stay
-    // apart, under that origin's one health key.
+    // One peer per ORIGIN (amended back by the delta-4 fold, D4-M1: the
+    // delta-3 fold kept one per `scheme://host[:port]`, five peers here, on
+    // one failure row per host): `https` first, then no explicit port.
     assert_eq!(
         ship_peers_by_origin(adverts),
         [
-            "http://evil.example",
             "https://a.evil.example",
             "https://evil.example",
-            "https://evil.example:8443",
             "https://overlay-us-1.bsvb.tech"
         ]
     );
-    // D3-L1: a stranger's default-port spelling no longer displaces an
-    // honest overlay that serves on another port (on 9280aed this was
-    // `["https://h.example"]`, "the default port first").
+    // D3-L1, a stated LIMIT again: a stranger's default-port spelling
+    // displaces an honest overlay that serves only on another port.
     assert_eq!(
         ship_peers_by_origin([
             "https://h.example:8443".to_string(),
             "https://h.example/?q".into()
         ]),
-        ["https://h.example", "https://h.example:8443"],
-        "both stand"
+        ["https://h.example"],
+        "the default port first"
     );
     assert_eq!(
         ship_peers_by_origin([
             "https://h.example:8443".to_string(),
             "http://h.example".into()
         ]),
-        ["http://h.example", "https://h.example:8443"]
+        ["https://h.example:8443"],
+        "https first"
     );
     assert_eq!(
         ship_peers_by_origin([
@@ -8848,8 +8845,28 @@ async fn e555d2_m2_spellings_of_one_server_are_one_origin_and_one_peer() {
             "http://h.example:80".into(),
             "http://h.example/#y".into()
         ]),
-        ["http://h.example", "https://h.example:8443"],
-        "spellings of one authority, one peer"
+        ["https://h.example:8443"]
+    );
+    // The scheme's default port is no explicit port (kept from the delta-3
+    // fold): `:443` alone is the peer `https://h.example`, one cursor key.
+    assert_eq!(
+        ship_peers_by_origin(["https://h.example:443/?y".to_string()]),
+        ["https://h.example"]
+    );
+    // D4-L1: the spellings of a port are spellings of one origin, one peer.
+    assert_eq!(
+        ship_peers_by_origin(
+            [
+                "https://h.example:0443",
+                "https://h.example:00443/",
+                "https://h.example:08443",
+                "https+bsvauth://h.example:443",
+                "wss://h.example",
+                "https://h.example"
+            ]
+            .map(String::from)
+        ),
+        ["https://h.example"]
     );
 
     // The engine's writes: under the origin, nothing under the URL.
@@ -9142,4 +9159,307 @@ async fn e555d3_m1_the_decay_is_only_for_a_peer_that_is_not_failed() {
         },
         "not failed: a new streak"
     );
+}
+
+// ============================================================================
+// bsv-low #555, the delta-4 fold (the delta-4 lens on 2c8ab50)
+// ============================================================================
+
+use bsv_overlay_engine::gasp::peer_sync_quarantined;
+
+// A SHIP topic's remotes by URL: the honest peer answers on its default
+// port (an empty listing, a successful sync), every other URL is a dead port
+// (the listing request fails).
+struct ByPort {
+    honest: RecordingRemote,
+    made: Rc<RefCell<Vec<String>>>,
+}
+
+struct DeadPort;
+
+impl GASPRemoteFactory for ByPort {
+    fn create_remote(&self, peer_url: &str, _topic: &str) -> Box<dyn GASPRemote> {
+        self.made.borrow_mut().push(peer_url.to_string());
+        if peer_url == "https://honest.example" {
+            Box::new(self.honest.clone())
+        } else {
+            Box::new(DeadPort)
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl GASPRemote for DeadPort {
+    async fn get_initial_response(
+        &self,
+        _request: &GASPInitialRequest,
+    ) -> Result<GASPInitialResponse, GASPError> {
+        Err(GASPError::RemoteError("connection refused".into()))
+    }
+    async fn get_initial_reply(
+        &self,
+        _response: &GASPInitialResponse,
+    ) -> Result<GASPInitialReply, GASPError> {
+        Err(GASPError::RemoteError("connection refused".into()))
+    }
+    async fn request_node(
+        &self,
+        _graph_id: &str,
+        _txid: &str,
+        _output_index: u32,
+        _metadata: bool,
+    ) -> Result<GASPNode, GASPError> {
+        Err(GASPError::RemoteError("connection refused".into()))
+    }
+    async fn submit_node(&self, _node: &GASPNode) -> Result<Option<GASPNodeResponse>, GASPError> {
+        Err(GASPError::RemoteError("connection refused".into()))
+    }
+}
+
+// (the honest peer's syncs, the dead ports' slices) over 96 ticks at `*/15`,
+// the peers being what `ship_peers_by_origin` makes of the honest advert and
+// `dead_ports` stranger adverts of dead ports of the same host.
+async fn dead_port_adverts(dead_ports: u16) -> (usize, usize) {
+    let mut adverts = vec!["https://honest.example".to_string()];
+    adverts.extend((0..dead_ports).map(|p| format!("https://honest.example:{}", 9000 + p)));
+    let peers = ship_peers_by_origin(adverts);
+    let store = Rc::new(MemoryStorage::new());
+    let made = Rc::new(RefCell::new(Vec::new()));
+    let mut engine = Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(HeadChainManager(Rc::new(
+                RefCell::new(HeadState::default()),
+            ))) as Box<dyn TopicManager>,
+        )]),
+        HashMap::new(),
+        Box::new(store.clone()),
+        None,
+        EngineConfig {
+            sync_configuration: HashMap::from([(TOPIC.to_string(), SyncTarget::Peers(peers))]),
+            ..Default::default()
+        },
+    );
+    engine.set_gasp_remote_factory(Box::new(ByPort {
+        honest: RecordingRemote::new(&[], &[]),
+        made: made.clone(),
+    }));
+    for tick in 0..96 {
+        if tick > 0 {
+            store.advance_clock(900);
+        }
+        engine.start_gasp_sync().await.unwrap();
+    }
+    let made = made.borrow();
+    let honest = made
+        .iter()
+        .filter(|u| *u == "https://honest.example")
+        .count();
+    (honest, made.len() - honest)
+}
+
+// D4-M1 (the lens's DELTA4-1). A stranger advertises dead ports of an honest
+// host's name on a SHIP topic. On 2c8ab50 each port was a peer and all of
+// them wrote ONE failure row (the origin's): eight quarantined the honest
+// peer (synced on 4 of 96 ticks), seven were never quarantined (672 dead-port
+// slices in 96 ticks). One peer per origin: the honest advert is the peer,
+// attended on every tick, and no dead port is ever asked.
+#[tokio::test]
+async fn e555d4_m1_dead_port_adverts_of_an_honest_host_do_not_silence_it() {
+    let (_logs, _guard) = capture_logs();
+    for dead_ports in [8, 12, 7, 1] {
+        let (honest, dead) = dead_port_adverts(dead_ports).await;
+        assert_eq!(
+            (honest, dead),
+            (96, 0),
+            "{dead_ports} dead-port adverts: the honest peer on every tick, no dead-port slice"
+        );
+    }
+}
+
+// D4-L2 (the lens's DELTA4-2). The hostile peer of e555d3_m1 (one fresh root
+// a tick, its input hanging; 901 s a tick, 200 ticks), which now answers its
+// PROBE with an empty listing. On 2c8ab50 (and on 9280aed) that sync was a
+// success: the failures went to 0, the next yieldless sync began a fresh
+// streak, and the peer kept 100 of the 200 ticks. Now a peer at the
+// quarantine threshold is re-admitted only by a yield: the empty probe is
+// not recorded (the failures stay, the last attempt stays), the next sync
+// that serves work continues the streak, fails and re-arms the quarantine.
+#[tokio::test]
+async fn e555d4_l2_an_empty_listing_at_the_probe_does_not_lift_the_quarantine() {
+    let (_logs, _guard) = capture_logs();
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let store = Rc::new(MemoryStorage::new());
+    let mut node = Budgeted::over(
+        listing(&salted_chain(2, 0), &[(1, 0)]),
+        Box::new(HeadChainManager(state.clone())),
+        RequestClock::allowing(1000),
+        store.clone(),
+        Box::new(store),
+        true,
+    );
+    let quarantined_at = PEER_YIELDLESS_SYNCS_ALLOWED + PEER_QUARANTINE_THRESHOLD;
+    let probe_every = PEER_QUARANTINE_REPROBE_SECS.div_ceil(901);
+    let origin = peer_origin(PEER);
+    let (mut hostile_slices, mut empty_probes) = (0u64, 0u64);
+    let mut was_skipped = false;
+    for tick in 1..=200u64 {
+        if tick > 1 {
+            node.store.advance_clock(901);
+        }
+        let health = node
+            .store
+            .get_peer_sync_health(&origin, TOPIC)
+            .await
+            .unwrap();
+        let skipped = peer_sync_quarantined(&health);
+        let probe = was_skipped && !skipped;
+        was_skipped = skipped;
+        let fresh = salted_chain(2, 100 + tick);
+        let genesis = vec![node_txid(&fresh[0])];
+        // The peer's answer to the first listing after its silent hours: none.
+        let mut remote = listing(&fresh, if probe { &[] } else { &[(1, 0)] });
+        remote.requests = node.requests.clone();
+        let _h = hanging(&mut node, remote, &genesis);
+        let before = health.consecutive_failures;
+        let (topic, sent) = node.tick().await;
+        let after = node
+            .store
+            .get_peer_sync_health(&origin, TOPIC)
+            .await
+            .unwrap();
+        if skipped {
+            assert!(sent.is_empty(), "tick {tick}: quarantined, not asked");
+            continue;
+        }
+        if probe {
+            empty_probes += 1;
+            assert!(sent.is_empty() && topic.errors.is_empty(), "tick {tick}");
+            assert_eq!(
+                after.consecutive_failures, before,
+                "tick {tick}: an empty probe keeps the failures"
+            );
+            assert!(before >= PEER_QUARANTINE_THRESHOLD);
+            assert!(
+                after.secs_since_last_attempt >= Some(PEER_QUARANTINE_REPROBE_SECS),
+                "tick {tick}: and is not recorded as an attempt"
+            );
+            continue;
+        }
+        hostile_slices += 1;
+        if tick > quarantined_at {
+            assert_eq!(
+                after.consecutive_failures,
+                before + 1,
+                "tick {tick}: the sync after the empty probe continues the streak and fails"
+            );
+            assert!(peer_sync_quarantined(&after), "tick {tick}: re-armed");
+            assert!(
+                node.store.peer_yieldless_syncs(&origin, TOPIC) > quarantined_at,
+                "tick {tick}: the streak did not decay"
+            );
+        }
+    }
+    assert!(empty_probes >= 7);
+    assert!(
+        hostile_slices <= quarantined_at + (200 - quarantined_at) / probe_every,
+        "{hostile_slices} hostile slices: at most one per reprobe window"
+    );
+    assert!(state.borrow().admitted.is_empty());
+    println!(
+        "#555 delta-4 D4-L2: 901 s a tick, 200 ticks: {hostile_slices} hostile slices, {empty_probes} empty probes (none lifted the quarantine)"
+    );
+}
+
+// D4-L2, the honest side. A quarantined peer that has gone QUIET is not
+// stranded: its empty probe is not recorded, so the reprobe window stays
+// open and it is attended on every tick after it; the first sync that yields
+// lifts the quarantine and clears the streak. What did not change: below the
+// threshold an empty listing is a success (it resets the failures), and with
+// no per-graph budget #302's rule is the whole rule.
+#[tokio::test]
+async fn e555d4_l2_a_quarantined_peer_gone_quiet_is_attended_and_a_yield_lifts_it() {
+    let (_logs, _guard) = capture_logs();
+    let origin = peer_origin(PEER);
+    let fail = |store: Rc<MemoryStorage>, n: u64| {
+        let origin = origin.clone();
+        async move {
+            for _ in 0..n {
+                store
+                    .record_peer_sync_outcome(&origin, TOPIC, false)
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    let quiet = |node: &mut Budgeted| {
+        let mut remote = listing(&salted_chain(2, 1), &[]);
+        remote.requests = node.requests.clone();
+        hanging(node, remote, &[])
+    };
+    let new_node = |budgeted_graphs: bool| {
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let store = Rc::new(MemoryStorage::new());
+        let mut node = Budgeted::over(
+            listing(&salted_chain(2, 1), &[]),
+            Box::new(HeadChainManager(state.clone())),
+            RequestClock::allowing(1000),
+            store.clone(),
+            Box::new(store),
+            true,
+        );
+        if budgeted_graphs {
+            let _ = quiet(&mut node);
+        }
+        (node, state)
+    };
+
+    // Quarantined (eight failed syncs), then quiet past the reprobe window.
+    let (mut node, state) = new_node(true);
+    fail(node.store.clone(), PEER_QUARANTINE_THRESHOLD).await;
+    node.tick().await;
+    assert_eq!(node.failures().await, 8, "skipped: quarantined");
+    node.store.advance_clock(PEER_QUARANTINE_REPROBE_SECS);
+    for tick in 1..=5 {
+        let health = node
+            .store
+            .get_peer_sync_health(&origin, TOPIC)
+            .await
+            .unwrap();
+        assert!(
+            !peer_sync_quarantined(&health),
+            "quiet tick {tick}: attended"
+        );
+        let (topic, _) = node.tick().await;
+        assert!(topic.errors.is_empty());
+        assert_eq!(node.failures().await, 8, "quiet tick {tick}: not lifted");
+        node.store.advance_clock(60);
+    }
+    // Its first sync that yields (a graph lands, the cursor moves) lifts it.
+    let fresh = salted_chain(2, 7);
+    let mut remote = listing(&fresh, &[(1, 0)]);
+    remote.requests = node.requests.clone();
+    let _h = hanging(&mut node, remote, &[]);
+    let (topic, _) = node.tick().await;
+    assert_eq!((topic.finalized_graphs, topic.cursor_moves.len()), (1, 1));
+    assert_eq!(state.borrow().admitted.len(), 2);
+    assert_eq!(node.failures().await, 0, "a yield lifts the quarantine");
+    assert_eq!(node.store.peer_yieldless_syncs(&origin, TOPIC), 0);
+
+    // Below the threshold an empty listing is a success, as before.
+    let (node, _) = new_node(true);
+    fail(node.store.clone(), PEER_QUARANTINE_THRESHOLD - 1).await;
+    node.tick().await;
+    assert_eq!(
+        node.failures().await,
+        0,
+        "seven failures, then a quiet sync"
+    );
+
+    // With no per-graph budget, #302's rule alone: the empty probe lifts it.
+    let (node, _) = new_node(false);
+    fail(node.store.clone(), PEER_QUARANTINE_THRESHOLD).await;
+    node.store.advance_clock(PEER_QUARANTINE_REPROBE_SECS);
+    node.tick().await;
+    assert_eq!(node.failures().await, 0, "no graph budget: unchanged");
 }

@@ -269,7 +269,9 @@ pub trait Storage {
     /// its own clock for the attempt time — the engine never supplies wall
     /// time. Quarantine-SKIPPED peers are NOT recorded (a skip is not an
     /// attempt; the last-attempt age must keep growing so the re-probe
-    /// window opens).
+    /// window opens). Nor is, with a per-graph budget, a sync of a peer at
+    /// the quarantine threshold that did not fail and yielded nothing (bsv-low
+    /// #555, the delta-4 fold's D4-L2): only a yield re-admits that peer.
     async fn record_peer_sync_outcome(
         &self,
         host: &str,

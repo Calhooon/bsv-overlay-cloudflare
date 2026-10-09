@@ -5081,7 +5081,31 @@ impl Engine {
                     // the consecutive-failure count; timeout/error increments
                     // it). Best-effort — a bookkeeping fault must never fail
                     // the sync pass itself.
-                    if let Err(e) = self
+                    //
+                    // bsv-low #555, the delta-4 fold's D4-L2: with a
+                    // per-graph budget, a peer that was at the quarantine
+                    // threshold when this sync began is re-admitted only by
+                    // a YIELD (a graph finalized, the cursor moved). A sync
+                    // that did not fail and yielded nothing (an empty
+                    // listing at its probe, a walk that only progressed) is
+                    // NOT RECORDED: the failures stay, and so does the
+                    // last-attempt stamp, so the peer is attended again on
+                    // the next tick and its next failure re-arms the
+                    // quarantine at once. Recorded as a success, a hostile
+                    // peer's empty listing at each probe reset its failures
+                    // and (the decay being for a peer that is not failed)
+                    // its yieldless streak: 100 of 200 ticks. A health read
+                    // that faulted read 0 failures: the old rule, fail-safe.
+                    if outcome_success
+                        && !(peer_finalized.get() > 0 || advanced_cursor)
+                        && self.graph_budget.is_some()
+                        && health.consecutive_failures >= crate::gasp::PEER_QUARANTINE_THRESHOLD
+                    {
+                        info!(
+                            "[GASP SYNC] {peer_url} for {topic}: a sync with no yield does not lift its quarantine ({} consecutive failed syncs kept; bsv-low #555)",
+                            health.consecutive_failures
+                        );
+                    } else if let Err(e) = self
                         .storage
                         .record_peer_sync_outcome(&health_key, topic, outcome_success)
                         .await
@@ -5276,9 +5300,9 @@ impl Engine {
             }
         }
 
-        // One peer per canonical `scheme://host[:port]` (bsv-low #555, the
-        // delta-2 fold's D2-M2 and the delta-3 fold's D3-L1): eight spellings
-        // of one server are one peer; its ports share one origin's health.
+        // One peer per normalized origin (bsv-low #555, the delta-2 fold's
+        // D2-M2, restored by the delta-4 fold's D4-M1): eight spellings of
+        // one server are one peer, the one its health row is keyed by.
         crate::gasp::ship_peers_by_origin(domains)
     }
 
