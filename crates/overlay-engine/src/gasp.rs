@@ -1839,15 +1839,19 @@ impl<'a> GASPSync<'a> {
                 match race_or_deadline(self.fetch_root(&root), deadline.as_mut()).await {
                     None => return Ok(WalkEnd::Deferred("time")),
                     Some(Ok(node)) if node.proof.is_some() => {
-                        let (carried, carried_bytes) = self
-                            .walk
-                            .borrow()
-                            .as_ref()
-                            .map_or((0, 0), |w| (w.calls_this_pass, w.bytes_this_pass));
+                        // The walk is fresh, the PASS is not: what it spent
+                        // of every counted limb goes with it (the re-ask
+                        // appends nothing, so the nodes are 0 today; carried
+                        // all the same, so a limb is never forgotten here).
+                        let (carried, carried_bytes, carried_nodes) =
+                            self.walk.borrow().as_ref().map_or((0, 0, 0), |w| {
+                                (w.calls_this_pass, w.bytes_this_pass, w.nodes_this_pass)
+                            });
                         self.drop_record(outpoint, DropReason::RootProven).await;
                         let mut restarted = Self::fresh_walk(score, outpoint, cap);
                         restarted.calls_this_pass = carried;
                         restarted.bytes_this_pass = carried_bytes;
+                        restarted.nodes_this_pass = carried_nodes;
                         restarted.record.calls = u64::from(carried);
                         *self.walk.borrow_mut() = Some(restarted);
                     }

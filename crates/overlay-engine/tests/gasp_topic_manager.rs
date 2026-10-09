@@ -9986,3 +9986,61 @@ async fn e586f_l1_limit_a_graph_past_what_the_cap_holds_goes_on_at_its_second_pa
     assert_eq!(state.borrow().admitted.len(), 36);
     assert_eq!(node.cursor().await, 1);
 }
+
+// The NOTE of the lens (the `root_proven` restart). The walk that restarts
+// from a root served PROVEN is fresh, but its PASS is not: what the pass
+// already spent of each counted limb is carried to it. The re-ask of the root
+// is a call and its bytes; it appends nothing, so the nodes it carries are 0
+// (the record's own nodes were appended by earlier passes), and the restarted
+// walk appends exactly the nodes limb.
+#[tokio::test]
+async fn e586f_n_a_root_proven_restart_carries_what_the_pass_spent_of_every_limb() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = chain(6);
+    let mut unproven = nodes.clone();
+    unproven[5].proof = None;
+    // (bytes limb, nodes limb) of the restarting pass, what it sends after
+    // the block landed, and the reason it defers with.
+    let two_and_a_root = 2 * served_bytes(&nodes[5]) + served_bytes(&nodes[4]);
+    let cases = [
+        // The re-ask (root), the root again, node 4: the limb, with the
+        // re-ask's bytes. Not carried, node 3 would be served too.
+        ((two_and_a_root, 64), vec![5, 5, 4], "bytes"),
+        // Two nodes appended by the restarted walk: the root and node 4.
+        ((u64::MAX, 2), vec![5, 5, 4], "nodes"),
+    ];
+    for ((bytes, max_nodes), sends, reason) in cases {
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let mut node = Budgeted::new(
+            RecordingRemote::new(&unproven, &[5]),
+            Box::new(HeadChainManager(state.clone())),
+            1000,
+        );
+        node.engine.set_graph_budget(never(), 100, 60_000);
+        node.engine.set_graph_budget_limbs(u64::MAX, 2);
+        let (topic, sent) = node.tick().await;
+        assert_eq!(sent, txids(&nodes, &[5, 4]));
+        assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+
+        // The block lands: the peer serves the root with its proof.
+        let mut mined = RecordingRemote::new(&nodes, &[5]);
+        mined.requests = node.requests.clone();
+        node.engine.set_gasp_remote_factory(Box::new(MeteredRemote {
+            inner: mined,
+            clock: node.clock.clone(),
+        }));
+        node.engine.set_graph_budget_limbs(bytes, max_nodes);
+        let (topic, sent) = node.tick().await;
+        assert_eq!(sent, txids(&nodes, &sends), "{reason}");
+        assert_eq!(
+            deferral(&topic),
+            (1, 1, 0, vec!["root_proven".to_string()]),
+            "{reason}"
+        );
+        let record = &node.store.deferred_graphs()[0];
+        assert_eq!(
+            record_shape(record),
+            (2, vec![outpoint_of(&nodes[3])], 3, 1, reason.to_string())
+        );
+    }
+}
