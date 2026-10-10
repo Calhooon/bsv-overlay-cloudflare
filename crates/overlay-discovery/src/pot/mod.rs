@@ -107,9 +107,9 @@ pub mod topic_manager;
 // its consumers keep compiling with unchanged call sites).
 pub use covenant::{
     classify_covenant, covenant_params_from_hex, encode_covenant_param_pushes,
-    extract_covenant_params, is_bare_2of3_lock, is_p2pkh_lock, p2pkh_input_signed, p2pkh_lock, CovenantParams, PotVerdict, RawInput,
-    P2PKH_UNLOCK_MAX_BYTES,
-    RawTx, LOCKTIME_THRESHOLD, TEMPLATE_RAKE_DIVISOR,
+    extract_covenant_params, is_bare_2of3_lock, is_p2pkh_lock, p2pkh_input_signed, p2pkh_lock,
+    CovenantParams, PotVerdict, RawInput, RawTx, LOCKTIME_THRESHOLD, P2PKH_UNLOCK_MAX_BYTES,
+    TEMPLATE_RAKE_DIVISOR,
 };
 pub use spend_signers::{classify_spend_signers, settle_signers_for_spend, SettleSigners};
 // bsv-low #468: the one payout measure, shared by the live `outputSpent` hook and the historic backfill.

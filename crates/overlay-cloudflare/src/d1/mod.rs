@@ -232,6 +232,28 @@ impl WhereBuilder {
 // Migration helper
 // =============================================================================
 
+/// Decode a stored BEEF's `hex(beef) AS beef` read-back (SQLite `hex()` emits
+/// UPPERCASE; `hex::decode` accepts either case). Empty or undecodable is
+/// `None`: an unusable row is never served as bytes. `hex()` of a TEXT value
+/// is the hex of its UTF-8 bytes, so a BEEF stored as hex TEXT reads back as
+/// those ASCII bytes and the door refuses it. ONE function for EVERY Worker
+/// read-back of a stored BEEF (`transactions`, `pot_beefs`) and for the
+/// stored-rows reader (`stored_rows`, the land lens E585-LAND-L3), so the
+/// reader types a column exactly as the Worker does. Two callers keep an
+/// EMPTY read-back as an empty BEEF, as they always did (the land delta lens
+/// E585-LAND-DELTA-L1): `d1_storage` `OutputRow::into_output` (the engine's
+/// `Output.beef`) and `reorg_sweep`'s transactions leg; each says why at its
+/// call. Pinned by `tests::every_hex_beef_read_back_calls_the_one_reader`.
+#[must_use]
+pub fn beef_of_hex_column(row_beef: Option<String>) -> Option<Vec<u8>> {
+    let bytes = hex::decode(row_beef?).ok()?;
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes)
+    }
+}
+
 /// Run a list of SQL migration statements against D1.
 ///
 /// The runner executes EVERY statement on EVERY cold start and propagates
@@ -468,7 +490,19 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 175 → 178 for NL-6c (2026-10-09): `ef_deferred_jobs`, its state index and `ef_deferred_chunks` (the broadcast-gated
 /// arm's deferred work and its bytes at rest).
 /// 178 → 179 for NL-6d (2026-10-10): `ef_deferred_jobs.legs_from`, the corroboration's cursor (one additive ALTER).
-pub const OVERLAY_MIGRATION_COUNT: usize = 179;
+/// 179 → 182 for bsv-low #585 (2026-10-09, door 4; 176-178 before the land onto NL-6c and NL-6d):
+/// `gasp_deferred_graph_chunks` and `gasp_deferred_graphs.chunks` and `.gen` (a deferred graph's record of any size,
+/// chunked across rows); one table, two additive ALTERs.
+/// 182 → 185 for bsv-low #585 (2026-10-09, door 3; 179-181 before the land onto NL-6c and NL-6d):
+/// `mutation_dead_letters.r2_key` and `.r2_bytes` (a letter whose BEEF is held in R2) and the index the health block
+/// sums the bytes at rest from; two additive ALTERs, one index.
+/// 185 → 186 for bsv-low #585 (2026-10-09, door 3's fold; 182 before the land onto NL-6c and NL-6d):
+/// `beef_blob_sweep`, the one-row state of the orphan sweep over the queue's R2 objects (its cursor, the round in
+/// progress, the last complete count); one table.
+/// 186 → 188 for bsv-low #585 (2026-10-09, door 3's fold-4; 183-184 before the land onto NL-6c and NL-6d):
+/// `beef_blob_sweep.last_unreadable` and `.last_unreadable_key` (the listed objects the last pass could not read,
+/// skipped and named); two additive ALTERs.
+pub const OVERLAY_MIGRATION_COUNT: usize = 188;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1762,6 +1796,26 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // NL-6d (2026-10-10): THE CORROBORATION'S CURSOR. A deferred job's run reads the #267 corroboration's ancestors
     // from the leg the last invocation reached (`legs_from`), never from the first again.
     crate::ef_deferred::JOBS_ADD_LEGS_FROM,
+    // bsv-low #585 (door 4): a deferred graph's record has NO byte bound. One past a row's room keeps its first part
+    // in its `gasp_deferred_graphs` row and the rest in these rows, under the generation the head names
+    // (`gasp_deferred.rs`, `chunk_plan`). Transient, as the head table.
+    crate::gasp_deferred::DEFERRED_GRAPH_CHUNKS_CREATE,
+    crate::gasp_deferred::DEFERRED_GRAPHS_CHUNKS_COLUMN,
+    crate::gasp_deferred::DEFERRED_GRAPHS_GEN_COLUMN,
+    // bsv-low #585 (door 3): a dead letter whose BEEF is in R2 (`BEEF_BLOBS`) names its object's key and length
+    // beside the message that carries them, so the ack, the park and the discard find the object without reading
+    // the message, and the health block sums the bytes at rest from an index. NULL for an inline letter. Additive
+    // ALTERs; the runner ignores the re-run "duplicate column".
+    crate::dead_letters::DEAD_LETTERS_R2_KEY_COLUMN,
+    crate::dead_letters::DEAD_LETTERS_R2_BYTES_COLUMN,
+    crate::dead_letters::DEAD_LETTERS_R2_INDEX,
+    // bsv-low #585 (door 3's fold): the orphan sweep of the queue's R2 objects keeps its cursor (the last key it
+    // handled), the round in progress and the last complete count of the objects at rest in ONE row
+    // (`beef_blob_sweep.rs`). Transient: a lost row restarts the round at the first key.
+    crate::beef_blob_sweep::SWEEP_STATE_CREATE,
+    // bsv-low #585 (door 3's fold-4): the last pass's unreadable entries, skipped and named in the health block.
+    crate::beef_blob_sweep::SWEEP_STATE_UNREADABLE_COLUMN,
+    crate::beef_blob_sweep::SWEEP_STATE_UNREADABLE_KEY_COLUMN,
 ];
 
 // =============================================================================
@@ -1771,6 +1825,308 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bsv-low #585, the land delta lens E585-LAND-DELTA-L1 (Rule 10, one
+    /// spelling): no production source of the Worker decodes a stored BEEF's
+    /// hex read-back on its own; each read-back of `hex(beef)` calls
+    /// [`beef_of_hex_column`]. RED on `6c7f527`: `d1_storage.rs:73` and
+    /// `reorg_sweep.rs:1008` (`hex::decode(h)` of the row's `beef`).
+    ///
+    /// The land fold-8 (E585-LAND-DELTA2-L1): the pin scans STATEMENTS, not
+    /// lines. A line holding both was the only stray it saw, so the old decode
+    /// put back over three lines (`beef: self` / `.beef` / `.and_then(|h|
+    /// hex::decode(h).ok()),`) stayed green. Each production file is cut into
+    /// statements (a `;`, a `,`, a `{` or a `}` outside any `(` or `[`;
+    /// strings and comments blanked), and a statement that holds
+    /// `hex::decode` and names a read-back column is a stray. The names: `beef`,
+    /// and every name a `hex(..beef)` of that file's SQL is read back AS (the
+    /// column's own name when it has no `AS`). The one-line match is kept.
+    ///
+    /// The limit, stated: a stray is found only by a NAME in its statement. A
+    /// decode of a value whose binding is named otherwise and that a `hex(`
+    /// column of its own file does not name (a row read in one statement, its
+    /// field moved into `let h = ...;`, and `hex::decode(h)` in the next, or
+    /// SQL written in another file under another alias) is not seen; nor is one
+    /// inside a macro body the scanner cannot cut. The behaviour pin
+    /// (`output_row_beef_read_back_keeps_its_answers`) cannot see it either:
+    /// both decoders agree on every hex input.
+    #[test]
+    fn every_hex_beef_read_back_calls_the_one_reader() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src") {
+                let p = e.expect("entry").path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        // `beef` as a whole identifier (a row's field or a binding), not
+        // `beef_hex` or `row_beef`.
+        fn names_beef(code: &str) -> bool {
+            code.match_indices("beef").any(|(i, _)| {
+                let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                !code[..i].chars().next_back().is_some_and(word)
+                    && !code[i + 4..].chars().next().is_some_and(word)
+            })
+        }
+        fn names_word(code: &str, w: &str) -> bool {
+            code.match_indices(w).any(|(i, _)| {
+                let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                !code[..i].chars().next_back().is_some_and(word)
+                    && !code[i + w.len()..].chars().next().is_some_and(word)
+            })
+        }
+        // The names a file's SQL reads a stored BEEF back AS: `hex(beef)`,
+        // `hex(t.beef)` and the like, then the `AS` alias when there is one.
+        fn hex_beef_names(text: &str) -> std::collections::BTreeSet<String> {
+            let mut names = std::collections::BTreeSet::from(["beef".to_string()]);
+            let lower = text.to_ascii_lowercase();
+            for (i, _) in lower.match_indices("hex(") {
+                if lower[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                {
+                    continue;
+                }
+                let rest = &lower[i + 4..];
+                let Some(close) = rest.find(')') else {
+                    continue;
+                };
+                let col = rest[..close].trim();
+                let col = col.rsplit('.').next().unwrap_or(col);
+                if col != "beef" {
+                    continue;
+                }
+                let after = text[i + 4 + close + 1..].trim_start();
+                let alias = after
+                    .strip_prefix("AS ")
+                    .or_else(|| after.strip_prefix("as "))
+                    .map(|a| {
+                        a.trim_start()
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                            .collect::<String>()
+                    });
+                if let Some(a) = alias.filter(|a| !a.is_empty()) {
+                    names.insert(a);
+                }
+            }
+            names
+        }
+        // The file cut into statements: (first line, code). A statement ends
+        // at a `;`, a `,`, a `{` or a `}` outside every `(` and `[` (a call's
+        // arguments and a closure's block inside them stay one statement);
+        // comments are dropped, string and char literals blanked to `""`.
+        fn statements(text: &str) -> Vec<(usize, String)> {
+            let b: Vec<char> = text.chars().collect();
+            let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+            let mut out = Vec::new();
+            let (mut cur, mut start, mut line, mut i) = (String::new(), 0usize, 1usize, 0usize);
+            let mut stack: Vec<char> = Vec::new();
+            let flush = |cur: &mut String, start: usize, out: &mut Vec<(usize, String)>| {
+                let code = cur.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !code.is_empty() {
+                    out.push((start, code));
+                }
+                cur.clear();
+            };
+            while i < b.len() {
+                let c = b[i];
+                let next = b.get(i + 1).copied();
+                if c == '\n' {
+                    line += 1;
+                }
+                if c == '/' && next == Some('/') {
+                    while i < b.len() && b[i] != '\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if c == '/' && next == Some('*') {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                        line += usize::from(b[i] == '\n');
+                        i += 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                // a raw string: r"..", r#".."#, br#".."#
+                let prev_ident =
+                    i > 0 && ident(b[i - 1]) && !(b[i - 1] == 'b' && (i < 2 || !ident(b[i - 2])));
+                if c == 'r' && !prev_ident && matches!(next, Some('#') | Some('"')) {
+                    let mut j = i + 1;
+                    while b.get(j) == Some(&'#') {
+                        j += 1;
+                    }
+                    if b.get(j) == Some(&'"') {
+                        let hashes = j - i - 1;
+                        j += 1;
+                        while j < b.len()
+                            && !(b[j] == '"' && (0..hashes).all(|k| b.get(j + 1 + k) == Some(&'#')))
+                        {
+                            line += usize::from(b[j] == '\n');
+                            j += 1;
+                        }
+                        if cur.trim().is_empty() {
+                            start = line;
+                        }
+                        cur.push_str("\"\"");
+                        i = j + 1 + hashes;
+                        continue;
+                    }
+                }
+                if c == '"' {
+                    let mut j = i + 1;
+                    while j < b.len() && b[j] != '"' {
+                        line += usize::from(b[j] == '\n');
+                        j += if b[j] == '\\' { 2 } else { 1 };
+                    }
+                    if cur.trim().is_empty() {
+                        start = line;
+                    }
+                    cur.push_str("\"\"");
+                    i = j + 1;
+                    continue;
+                }
+                // a char literal ('x', '\n', '{'); a lifetime is kept
+                if c == '\'' && (next == Some('\\') || b.get(i + 2) == Some(&'\'')) {
+                    let mut j = i + 1;
+                    if next == Some('\\') {
+                        j += 2;
+                    }
+                    while j < b.len() && b[j] != '\'' {
+                        j += 1;
+                    }
+                    cur.push_str("' '");
+                    i = j + 1;
+                    continue;
+                }
+                let nested = stack.iter().any(|d| *d != '{');
+                match c {
+                    '(' | '[' => stack.push(c),
+                    ')' | ']' => {
+                        stack.pop();
+                    }
+                    '{' | '}' if !nested => {
+                        if c == '{' {
+                            stack.push(c);
+                        } else {
+                            stack.pop();
+                        }
+                        flush(&mut cur, start, &mut out);
+                        i += 1;
+                        continue;
+                    }
+                    '{' => stack.push(c),
+                    '}' => {
+                        stack.pop();
+                    }
+                    ';' | ',' if !nested => {
+                        flush(&mut cur, start, &mut out);
+                        i += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if cur.trim().is_empty() && !c.is_whitespace() {
+                    start = line;
+                }
+                cur.push(c);
+                i += 1;
+            }
+            flush(&mut cur, start, &mut out);
+            out
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(files.len() > 5, "the crate's sources are walked");
+        let mut strays = Vec::new();
+        let mut callers = std::collections::BTreeSet::new();
+        for f in &files {
+            let name = f
+                .strip_prefix(&src)
+                .expect("under src")
+                .display()
+                .to_string();
+            let text = std::fs::read_to_string(f).expect("read source");
+            // production code only: a test module is the last item of a file
+            let prod = &text[..text.find("#[cfg(test)]").unwrap_or(text.len())];
+            for (i, line) in prod.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("beef_of_hex_column(") && name != "d1/mod.rs" {
+                    callers.insert(name.clone());
+                }
+                if name != "d1/mod.rs" && code.contains("hex::decode") && names_beef(code) {
+                    strays.push(format!("{name}:{}: {}", i + 1, line.trim()));
+                }
+            }
+            if name == "d1/mod.rs" {
+                continue;
+            }
+            let read_back = hex_beef_names(prod);
+            for (line, code) in statements(prod) {
+                let at = format!("{name}:{line}: ");
+                if code.contains("hex::decode")
+                    && read_back.iter().any(|n| names_word(&code, n))
+                    && !strays.iter().any(|s| s.starts_with(&at))
+                {
+                    strays.push(format!("{at}{code}"));
+                }
+            }
+        }
+        assert!(
+            strays.is_empty(),
+            "a stored BEEF's hex read-back decoded outside d1::beef_of_hex_column:\n{}",
+            strays.join("\n")
+        );
+        for site in ["d1_storage.rs", "d1_discovery.rs", "reorg_sweep.rs"] {
+            assert!(
+                callers.contains(site),
+                "{site} reads `hex(beef)` through the one reader"
+            );
+        }
+        // the pin bites on the form it was written for, and not on a hex
+        // argument that is not a stored row's
+        assert!(names_beef(
+            "beef: self.beef.and_then(|h| hex::decode(h).ok()),"
+        ));
+        assert!(names_beef(
+            "let Some(beef) = r.beef.and_then(|h| hex::decode(h).ok()) else {"
+        ));
+        assert!(!names_beef("let beef_bytes = hex::decode(beef_hex.trim())"));
+        // the statement cut: the lens's three-line stray is ONE statement, and
+        // its neighbour field (`output_script`, decoded on its own) is another
+        let lens = "Output {\n    output_script: self\n        .output_script\n        \
+                    .and_then(|h| hex::decode(h).ok())\n        .unwrap_or_default(),\n    \
+                    beef: self\n        .beef\n        .and_then(|h| hex::decode(h).ok()),\n    \
+                    score: self.score, // beef\n}";
+        let cut = statements(lens);
+        assert_eq!(
+            cut.iter().map(|(l, c)| (*l, c.as_str())).collect::<Vec<_>>(),
+            [
+                (1, "Output"),
+                (2, "output_script: self .output_script .and_then(|h| hex::decode(h).ok()) .unwrap_or_default()"),
+                (6, "beef: self .beef .and_then(|h| hex::decode(h).ok())"),
+                (9, "score: self.score"),
+            ]
+        );
+        // a closure's block inside a call stays in its statement; strings,
+        // chars and comments do not cut it
+        let cut = statements("let x = r.tx_beef.map(|h| {\n let s = \"a;b,{\"; // ;\n hex::decode(h) /* , */ });\nlet c = ';';");
+        assert_eq!(cut.len(), 2, "{cut:?}");
+        assert!(cut[0].1.contains("tx_beef") && cut[0].1.contains("hex::decode"));
+        // the SQL's alias widens the names, and only for a `hex(..beef)`
+        let names = hex_beef_names(
+            "\"SELECT hex(t.beef) AS tx_beef, hex(bundle) AS bundle, HEX(p.beef) raw\"",
+        );
+        assert_eq!(names.into_iter().collect::<Vec<_>>(), ["beef", "tx_beef"]);
+        assert!(names_word(&cut[0].1, "tx_beef"));
+    }
 
     #[test]
     fn qval_conversions() {

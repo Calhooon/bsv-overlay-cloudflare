@@ -307,19 +307,37 @@ pub const P2PKH_UNLOCK_MAX_BYTES: usize = 512;
 /// carried the bytes, and independent of whether the transaction is mined, admitted or refused elsewhere. Anything
 /// that is not a canonical P2PKH lock, an oversized or absent unlocking script, or a script that does not verify is
 /// `false`. One signature check: the cost is bounded by construction.
-pub fn p2pkh_input_signed(tx: &bsv_rs::transaction::Transaction, vin: usize, lock: &[u8], sats: u64) -> bool {
+pub fn p2pkh_input_signed(
+    tx: &bsv_rs::transaction::Transaction,
+    vin: usize,
+    lock: &[u8],
+    sats: u64,
+) -> bool {
     use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
     use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
     if !is_p2pkh_lock(lock) {
         return false;
     }
-    let Some(input) = tx.inputs.get(vin) else { return false };
-    let Some(unlocking_bytes) = input.unlocking_script.as_ref().map(bsv_rs::UnlockingScript::to_binary) else { return false };
+    let Some(input) = tx.inputs.get(vin) else {
+        return false;
+    };
+    let Some(unlocking_bytes) = input
+        .unlocking_script
+        .as_ref()
+        .map(bsv_rs::UnlockingScript::to_binary)
+    else {
+        return false;
+    };
     if unlocking_bytes.is_empty() || unlocking_bytes.len() > P2PKH_UNLOCK_MAX_BYTES {
         return false;
     }
-    let Ok(source_txid) = input.get_source_txid_bytes() else { return false };
-    let (Ok(lock), Ok(unlock)) = (Script::from_binary(lock), Script::from_binary(&unlocking_bytes)) else {
+    let Ok(source_txid) = input.get_source_txid_bytes() else {
+        return false;
+    };
+    let (Ok(lock), Ok(unlock)) = (
+        Script::from_binary(lock),
+        Script::from_binary(&unlocking_bytes),
+    ) else {
         return false;
     };
     let other_inputs: Vec<TxInput> = tx
@@ -330,11 +348,22 @@ pub fn p2pkh_input_signed(tx: &bsv_rs::transaction::Transaction, vin: usize, loc
         .map(|(_, inp)| TxInput {
             txid: inp.get_source_txid_bytes().unwrap_or([0u8; 32]),
             output_index: inp.source_output_index,
-            script: inp.unlocking_script.as_ref().map(bsv_rs::UnlockingScript::to_binary).unwrap_or_default(),
+            script: inp
+                .unlocking_script
+                .as_ref()
+                .map(bsv_rs::UnlockingScript::to_binary)
+                .unwrap_or_default(),
             sequence: inp.sequence,
         })
         .collect();
-    let outputs: Vec<TxOutput> = tx.outputs.iter().map(|o| TxOutput { satoshis: o.satoshis.unwrap_or(0), script: o.locking_script.to_binary() }).collect();
+    let outputs: Vec<TxOutput> = tx
+        .outputs
+        .iter()
+        .map(|o| TxOutput {
+            satoshis: o.satoshis.unwrap_or(0),
+            script: o.locking_script.to_binary(),
+        })
+        .collect();
     let mut spend = Spend::new(SpendParams {
         source_txid,
         source_output_index: input.source_output_index,

@@ -230,14 +230,14 @@ ROUTE_UP_SLEEP ?= 3
 ci-route: ci-d1-budget
 	@set -e; \
 	B=$${LANE_BASE:-8791}; P1=$$B; P2=$$((B+1)); P3=$$((B+2)); P4=$$((B+3)); P5=$$((B+4)); P6=$$((B+5)); P7=$$((B+6)); P8=$$((B+7)); P9=$$((B+8)); P10=$$((B+11)); P11=$$((B+12)); \
-	strict_log=/tmp/lane347-route-strict.log; \
-	kill_log=/tmp/lane347-route-kill.log; \
-	lenient_log=/tmp/lane366-route-lenient.log; \
-	arc_log=/tmp/lane-arc-ingest-route.log; \
-	seen_log=/tmp/lane371-route-seen.log; \
-	door_log=/tmp/lane-script-route-door.log; \
-	door_off_log=/tmp/lane-script-route-door-off.log; \
-	ef_log=/tmp/lane-nl6c-route-ef-$$B.log; \
+	strict_log=/tmp/lane347-route-$$B-strict.log; \
+	kill_log=/tmp/lane347-route-$$B-kill.log; \
+	lenient_log=/tmp/lane366-route-$$B-lenient.log; \
+	arc_log=/tmp/lane-arc-ingest-route-$$B.log; \
+	seen_log=/tmp/lane371-route-$$B-seen.log; \
+	door_log=/tmp/lane-script-route-$$B-door.log; \
+	door_off_log=/tmp/lane-script-route-$$B-door-off.log; \
+	ef_log=/tmp/lane-nl6c-route-$$B-ef.log; \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -420,15 +420,30 @@ ci-route: ci-d1-budget
 # limit, its one-enqueue claim and its ceiling over seeded letters, a re-driven letter parked again with its
 # history, and `/health/invariants.deadLetters`; the lens fold's legs: the new health fields, a stale re-drive
 # returned and re-driven, a forced re-drive of an exhausted letter, a bad-base64 replay dead-lettered and parked.
+# Then bsv-low #585 door 3's cell (`tools/lane-e585`, the overlay given `MUTATION_QUEUE_INLINE_ROOM:4096`, which
+# leaves every other cell's sub-kilobyte messages inline): ~8 KB "not now" letters written to the local R2 bucket,
+# parked by KEY, re-driven from R2 and landed (the object gone after the ack), a missing object parked again with its
+# class kept, a discard deleting the object, a 500 KB "not now" submission carried whole (#568), and the d3 fold-2's
+# legs: a twin acked over a missing object, the orphan sweep through the operator's lever
+# `POST /internal/beef-blob-sweep` (the d3 fold-4: one pass of the tick's own function; no scheduled tick is fired, so
+# the overlay runs without `--test-scheduled`), and a put twice moving the object's `touched` stamp.
 #
 # Ports: LANE_BASE+9 (app layer) and LANE_BASE+10 (overlay), :8800 and :8801 by default; the same pre-flight,
 # bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network: no
 # fixture pot is spent and no hop filed (no courier), the app layer's service bindings are absent (its tip reads
-# answer 503 and the views serve without a tip), and the overlay's ARCADE_URL is a closed local port.
+# answer 503 and the views serve without a tip), and the overlay's ARCADE_URL is a closed local port. The logs carry
+# the port base (`/tmp/lane499-d1-<LANE_BASE>-app.log`, `-overlay.log`, `-seed.log`; the d3 fold-3, E585-D3-DELTA-M2):
+# two tiers on different bases never overwrite each other's logs (`ci-route`'s own logs too, the d3 fold-4:
+# `/tmp/lane347-route-<LANE_BASE>-strict.log` and the rest). No cell fires the scheduled tick (the d3 fold-4,
+# E585-D3-DELTA2-L1): the d3 fold-2's leg 7 did (`/__scheduled` under `--test-scheduled`), and the whole production
+# tick synced the worker's hard-coded peers over the network, deferred real graphs into `gasp_deferred_graphs` in the
+# background (18 rows under the e555 cell's counts in the captain's re-run of the fold-2) and could reach the
+# rebroadcast backstop's broadcasters; the cell ran last only to keep its writes away from the others. Leg 7 now
+# runs one pass of the sweep through its lever, synchronously, and the order of the cells is free again.
 ci-d1-budget:
 	@set -e; \
 	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); \
-	app_log=/tmp/lane499-d1-app.log; ov_log=/tmp/lane499-d1-overlay.log; \
+	app_log=/tmp/lane499-d1-$$B-app.log; ov_log=/tmp/lane499-d1-$$B-overlay.log; seed_log=/tmp/lane499-d1-$$B-seed.log; \
 	state=$$(mktemp -d /tmp/lane499-d1-state.XXXXXX); ov_state=$$(mktemp -d /tmp/lane499-d1-ovstate.XXXXXX); \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
@@ -474,8 +489,8 @@ ci-d1-budget:
 	}; \
 	echo "→ ci-d1-budget: the fixture D1 (seed + wrangler d1 execute --local)…"; \
 	cargo run -q $(WORKERS) -p low-app-layer --example d1_budget_seed > "$$state/seed.sql"; \
-	( cd crates/low-app-layer && npx wrangler d1 execute low-overlay-db --local --persist-to "$$state" --file "$$state/seed.sql" ) > /tmp/lane499-d1-seed.log 2>&1 \
-	  || { echo "✗ ci-d1-budget: the seed did not load"; cat /tmp/lane499-d1-seed.log; exit 1; }; \
+	( cd crates/low-app-layer && npx wrangler d1 execute low-overlay-db --local --persist-to "$$state" --file "$$state/seed.sql" ) > "$$seed_log" 2>&1 \
+	  || { echo "✗ ci-d1-budget: the seed did not load"; cat "$$seed_log"; exit 1; }; \
 	echo "→ starting wrangler dev :$$PA (the app layer on the fixture D1)…"; \
 	( cd crates/low-app-layer && exec npx wrangler dev --local --port $$PA --ip 127.0.0.1 --persist-to "$$state" \
 	    --var AUTH_ENFORCE:false --var SESSION_LANE:false \
@@ -491,6 +506,7 @@ ci-d1-budget:
 	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:true \
 	    --var ARCADE_URL:http://127.0.0.1:9 \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
+	    --var MUTATION_QUEUE_INLINE_ROOM:4096 \
 	) > "$$ov_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PO/listTopicManagers "$$ov_log" "overlay"; \
@@ -499,7 +515,8 @@ ci-d1-budget:
 	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO; \
 	node tools/lane-e1d/landing_guard_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e576/dead_letter_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
-	node tools/lane-e555/deferred_graphs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"
+	node tools/lane-e555/deferred_graphs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
+	node tools/lane-e585/beef_blobs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`

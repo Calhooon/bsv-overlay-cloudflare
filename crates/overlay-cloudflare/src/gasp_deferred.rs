@@ -4,12 +4,16 @@
 //! [`GASP_GRAPH_BUDGET_CALLS`] calls or [`GASP_GRAPH_BUDGET_MS`] in one pass;
 //! since bsv-low #586 [`GASP_GRAPH_BUDGET_BYTES`] served or
 //! [`GASP_GRAPH_BUDGET_NODES`] appended, `Engine::set_graph_budget_limbs`) is
-//! deferred by the engine: its partial walk is kept as ONE row of
-//! `gasp_deferred_graphs` per (peer, topic, root outpoint), REPLACED on every
-//! deferral, deleted when the graph converges or is dropped, and resumed by the
-//! next pass that is served its UTXO. This module holds the table, its three
-//! statements (the `Storage` methods in `d1_storage.rs` run them), the health
-//! block `/health/invariants.gasp.deferredGraphs` and the counters.
+//! deferred by the engine: its partial walk is kept as ONE record per (peer,
+//! topic, root outpoint), REPLACED on every deferral, deleted when the graph
+//! converges or is dropped, and resumed by the next pass that is served its
+//! UTXO. A record is one row of `gasp_deferred_graphs` and, when its JSON is
+//! past [`DEFERRED_GRAPH_CHUNK_BYTES`], the rows of
+//! `gasp_deferred_graph_chunks` that hold the rest (bsv-low #585: a record has
+//! no byte bound; D1's 2 MB row is routed around, not made a limit on a
+//! graph). This module holds the tables, their statements (the `Storage`
+//! methods in `d1_storage.rs` run them), the health block
+//! `/health/invariants.gasp.deferredGraphs` and the counters.
 
 use serde::Deserialize;
 use worker::D1Database;
@@ -31,13 +35,12 @@ pub const GASP_GRAPH_BUDGET_MS: u64 = 15_000;
 /// a record keeps it. Reached, the graph is DEFERRED as at the calls (reason
 /// `bytes`), never dropped or refused: a budget per pass, not a limit.
 ///
-/// The DEFAULT, and the engine's
-/// ([`overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_BYTES`]): seven eighths of
-/// the record cap (`DEFERRED_GRAPH_MAX_BYTES`), 917,504 bytes while the cap is
-/// 1 MiB, so the pass it cuts leaves a record that FITS (the lens fold's
-/// E586-L1; it was 4 MiB, and a pass of 26 KB heads was cut only once its
-/// record was `too_big`). 18 heads of 26 KB a pass. An operator names another
-/// with the var of the same name ([`graph_budget_limbs`]).
+/// The DEFAULT is the engine's
+/// ([`overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_BYTES`], 917,504: 18 heads
+/// of 26 KB a fresh pass). It was seven eighths of a 1 MiB cap on a record;
+/// a record has no cap since bsv-low #585, so it is a budget per pass and
+/// nothing else. An operator names another with the var of the same name
+/// ([`graph_budget_limbs`]).
 pub const GASP_GRAPH_BUDGET_BYTES: u64 = overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_BYTES;
 
 /// Nodes one graph may APPEND in one pass on this worker (bsv-low #586). The
@@ -50,16 +53,13 @@ pub const GASP_GRAPH_BUDGET_NODES: u32 = overlay_engine::gasp::DEFAULT_GRAPH_BUD
 pub const GASP_GRAPH_BUDGET_BYTES_VAR: &str = "GASP_GRAPH_BUDGET_BYTES";
 pub const GASP_GRAPH_BUDGET_NODES_VAR: &str = "GASP_GRAPH_BUDGET_NODES";
 
-/// The most the bytes var may name: the record cap itself. Above it the limb
-/// is the lens's E586-L1 again (a pass is cut only once its record cannot be
-/// kept); between the default and it, the operator spends the margin.
-pub const GASP_GRAPH_BUDGET_BYTES_MAX: u64 = overlay_engine::gasp::DEFERRED_GRAPH_MAX_BYTES as u64;
-
 /// The two limbs this worker runs with, (bytes, nodes), from the vars
 /// `GASP_GRAPH_BUDGET_BYTES` and `GASP_GRAPH_BUDGET_NODES` as the operator
 /// set them (the lens fold's E586-L1: they were compile-time, so the remedy
 /// `CLAUDE.md` named, "set the limbs under the cap", needed a rebuild). A
-/// decimal integer, CLAMPED: bytes to 1 ..= [`GASP_GRAPH_BUDGET_BYTES_MAX`],
+/// decimal integer, CLAMPED: bytes to at least 1 (no upper bound since
+/// bsv-low #585: there is no record cap for the limb to sit under; a limb
+/// nobody reaches leaves the calls, the time and the nodes to cut the pass),
 /// nodes to 1 ..= [`GASP_GRAPH_BUDGET_CALLS`] (a node appended is a call
 /// made, so more would never be reached). Unset, empty or not a number: the
 /// default const. Never 0: a limb of 0 is spent before the pass's first
@@ -67,9 +67,7 @@ pub const GASP_GRAPH_BUDGET_BYTES_MAX: u64 = overlay_engine::gasp::DEFERRED_GRAP
 pub fn graph_budget_limbs(bytes: Option<&str>, nodes: Option<&str>) -> (u64, u32) {
     let named = |v: Option<&str>| v.and_then(|v| v.trim().parse::<u64>().ok());
     (
-        named(bytes).map_or(GASP_GRAPH_BUDGET_BYTES, |b| {
-            b.clamp(1, GASP_GRAPH_BUDGET_BYTES_MAX)
-        }),
+        named(bytes).map_or(GASP_GRAPH_BUDGET_BYTES, |b| b.max(1)),
         named(nodes).map_or(GASP_GRAPH_BUDGET_NODES, |n| {
             n.clamp(1, u64::from(GASP_GRAPH_BUDGET_CALLS)) as u32
         }),
@@ -86,9 +84,12 @@ pub fn graph_budget_limbs_from_env(env: &worker::Env) -> (u64, u32) {
 }
 
 /// The table: one row per deferred graph. `record` is the engine's
-/// `DeferredGraph` as JSON (at most `DEFERRED_GRAPH_MAX_BYTES`, under D1's 2 MB
-/// row); the other columns are its summary for the health block. Transient:
-/// a lost row costs the walk again from its root, nothing else.
+/// `DeferredGraph` as JSON, or its first [`DEFERRED_GRAPH_CHUNK_BYTES`] when
+/// the JSON is longer (`chunks` then counts the rows of
+/// [`DEFERRED_GRAPH_CHUNKS_CREATE`] that hold the rest, under `gen`); `bytes`
+/// is the WHOLE record's size and the other columns are its summary for the
+/// health block. Transient: a lost row costs the walk again from its root,
+/// nothing else.
 pub const DEFERRED_GRAPHS_CREATE: &str = "CREATE TABLE IF NOT EXISTS gasp_deferred_graphs (
         host TEXT NOT NULL,
         topic TEXT NOT NULL,
@@ -106,6 +107,118 @@ pub const DEFERRED_GRAPHS_CREATE: &str = "CREATE TABLE IF NOT EXISTS gasp_deferr
         PRIMARY KEY (host, topic, outpoint)
     )";
 
+/// The most one row holds of a record's JSON (bsv-low #585): 1 MiB, half of
+/// D1's 2 MB row and the size a record was capped at before (so a record up
+/// to it is written exactly as it was: one row, one statement). A longer
+/// record is CHUNKED: its first part in its `gasp_deferred_graphs` row, each
+/// further part a row of `gasp_deferred_graph_chunks`. Never a limit on a
+/// record: a platform bound routed around.
+pub const DEFERRED_GRAPH_CHUNK_BYTES: usize = 1 << 20;
+
+/// The further parts of a record past [`DEFERRED_GRAPH_CHUNK_BYTES`] (bsv-low
+/// #585), one row per part: `seq` from 1 (part 0 is the head row's `record`),
+/// `gen` the generation the head row names. A save writes the parts of a NEW
+/// generation first, then the head row (the ceiling is read there), then
+/// deletes the other generations: a reader always finds the parts of the
+/// generation its head names, and a save that faults or is refused midway
+/// leaves the held record whole. Transient, as the head table.
+pub const DEFERRED_GRAPH_CHUNKS_CREATE: &str =
+    "CREATE TABLE IF NOT EXISTS gasp_deferred_graph_chunks (
+        host TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        outpoint TEXT NOT NULL,
+        gen TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        part TEXT NOT NULL,
+        written_at INTEGER NOT NULL,
+        PRIMARY KEY (host, topic, outpoint, gen, seq)
+    )";
+
+/// The head row's two columns for a chunked record: how many rows of
+/// [`DEFERRED_GRAPH_CHUNKS_CREATE`] hold its further parts (0: the record is
+/// whole in `record`, every row written before bsv-low #585 included), and
+/// their generation.
+pub const DEFERRED_GRAPHS_CHUNKS_COLUMN: &str =
+    "ALTER TABLE gasp_deferred_graphs ADD COLUMN chunks INTEGER NOT NULL DEFAULT 0";
+pub const DEFERRED_GRAPHS_GEN_COLUMN: &str =
+    "ALTER TABLE gasp_deferred_graphs ADD COLUMN gen TEXT NOT NULL DEFAULT ''";
+
+/// A record's JSON cut for its rows (bsv-low #585).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkPlan<'a> {
+    /// Part 0: the head row's `record`.
+    pub head: &'a str,
+    /// Parts 1.., each a row of `gasp_deferred_graph_chunks` at its `seq`.
+    pub rest: Vec<&'a str>,
+    /// The generation of `rest`: 16 hex of the JSON's sha256 (`''` with no
+    /// further part). By content, so a save of the very JSON held rewrites
+    /// its own parts with the same bytes and can never tear it.
+    pub gen: String,
+}
+
+/// PURE: cut a record's JSON into parts of at most `chunk` bytes, on
+/// character boundaries (the concatenation is the JSON, byte for byte). A
+/// JSON of at most `chunk` bytes is one part, no generation: the row a
+/// record always was.
+pub fn chunk_plan(json: &str, chunk: usize) -> ChunkPlan<'_> {
+    let chunk = chunk.max(4);
+    let mut parts = Vec::new();
+    let mut at = 0;
+    while json.len() - at > chunk {
+        let mut end = at + chunk;
+        while !json.is_char_boundary(end) {
+            end -= 1;
+        }
+        parts.push(&json[at..end]);
+        at = end;
+    }
+    parts.push(&json[at..]);
+    let head = parts.remove(0);
+    let gen = if parts.is_empty() {
+        String::new()
+    } else {
+        hex::encode(&bsv_rs::primitives::hash::sha256(json.as_bytes())[..8])
+    };
+    ChunkPlan {
+        head,
+        rest: parts,
+        gen,
+    }
+}
+
+/// One further part of a record. Binds: `?1` host, `?2` topic, `?3`
+/// outpoint, `?4` gen, `?5` seq, `?6` part.
+pub const DEFERRED_GRAPH_CHUNK_PUT_SQL: &str = "INSERT OR REPLACE INTO gasp_deferred_graph_chunks      (host, topic, outpoint, gen, seq, part, written_at)      VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())";
+
+/// One further part, read by the generation the head row names. Binds as
+/// [`DEFERRED_GRAPH_CHUNK_PUT_SQL`]'s first five. One part a statement: a
+/// result is never more than one row's bytes.
+pub const DEFERRED_GRAPH_CHUNK_GET_SQL: &str = "SELECT part FROM gasp_deferred_graph_chunks      WHERE host = ?1 AND topic = ?2 AND outpoint = ?3 AND gen = ?4 AND seq = ?5";
+
+/// After a head row was SAVED: delete every part of another generation (the
+/// record it replaced). Binds: `?1` host, `?2` topic, `?3` outpoint, `?4` the
+/// saved generation (`''`: every part).
+pub const DEFERRED_GRAPH_CHUNKS_KEEP_SQL: &str = "DELETE FROM gasp_deferred_graph_chunks      WHERE host = ?1 AND topic = ?2 AND outpoint = ?3 AND gen != ?4";
+
+/// After a head row was REFUSED (`AtCeiling`) or its save faulted: take back
+/// the parts just written, unless the held head names that very generation
+/// (a save of the JSON already held). Binds as
+/// [`DEFERRED_GRAPH_CHUNKS_KEEP_SQL`].
+pub const DEFERRED_GRAPH_CHUNKS_UNDO_SQL: &str = "DELETE FROM gasp_deferred_graph_chunks      WHERE host = ?1 AND topic = ?2 AND outpoint = ?3 AND gen = ?4        AND NOT EXISTS (SELECT 1 FROM gasp_deferred_graphs          WHERE host = ?1 AND topic = ?2 AND outpoint = ?3 AND gen = ?4)";
+
+/// Delete every part of one record (converged or dropped), after its head.
+pub const DEFERRED_GRAPH_CHUNKS_DELETE_SQL: &str =
+    "DELETE FROM gasp_deferred_graph_chunks      WHERE host = ?1 AND topic = ?2 AND outpoint = ?3";
+
+/// A part no head row names is left alone this long before the cron sweeps
+/// it: a save in flight (its parts written, its head not yet) is never older.
+pub const DEFERRED_GRAPH_ORPHAN_CHUNK_SECS: u64 = 3600;
+
+/// The cron's sweep of parts no head row names (a swept head's, a save that
+/// died between its parts and its head). Binds: `?1`
+/// [`DEFERRED_GRAPH_ORPHAN_CHUNK_SECS`].
+pub const DEFERRED_GRAPH_CHUNKS_SWEEP_SQL: &str = "DELETE FROM gasp_deferred_graph_chunks      WHERE written_at < unixepoch() - ?1        AND NOT EXISTS (SELECT 1 FROM gasp_deferred_graphs g          WHERE g.host = gasp_deferred_graph_chunks.host            AND g.topic = gasp_deferred_graph_chunks.topic            AND g.outpoint = gasp_deferred_graph_chunks.outpoint            AND g.gen = gasp_deferred_graph_chunks.gen)";
+
 /// The most rows the table holds over EVERY peer and topic (bsv-low #555, the
 /// lens fold's M3). The engine bounds records per (peer, topic) at 16, and SHIP
 /// mode takes its peers from the permissionless `ls_ship`: a stranger who
@@ -115,9 +228,13 @@ pub const DEFERRED_GRAPHS_CREATE: &str = "CREATE TABLE IF NOT EXISTS gasp_deferr
 /// `too_many`, and its walk goes on under the per-peer budget alone.
 pub const DEFERRED_GRAPHS_MAX_ROWS: u32 = 256;
 
-/// The most bytes of `record` the table holds over every row (64 MiB): a save,
+/// The most bytes of records the store holds over every graph (64 MiB, the
+/// sum of `bytes`, each a WHOLE record, its chunk rows included): a save,
 /// new or a replacement, that would take the sum past it is refused, as
 /// [`DEFERRED_GRAPHS_MAX_ROWS`]. The measured picture graph is about 0.5 MiB.
+/// A BUDGET of room in the D1 the overlay shares, not a limit on a graph
+/// (bsv-low #585): a refused replacement leaves the record held as it was,
+/// the engine keeps it, and the walk goes on under the per-peer budget.
 pub const DEFERRED_GRAPHS_MAX_TOTAL_BYTES: u64 = 64 << 20;
 
 /// The most rows ONE host holds over all its topics (bsv-low #555, the delta
@@ -173,7 +290,11 @@ pub const DEFERRED_GRAPH_STALE_SECS: u64 =
 /// [`DEFERRED_GRAPHS_MAX_BYTES_PER_HOST`], `?16` origin
 /// (`overlay_engine::gasp::peer_origin` of the host), `?17` configured
 /// (1/0), `?18` [`DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS`], `?19`
-/// [`DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES`]. `created_at` is kept from the
+/// [`DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES`], `?20` chunks (the rows of
+/// `gasp_deferred_graph_chunks` holding the rest of the record, 0 for a
+/// record whole in `?11`), `?21` their generation; `?10` is the WHOLE
+/// record's size, `?11` its first part (bsv-low #585, [`chunk_plan`]).
+/// `created_at` is kept from the
 /// first deferral (the age); the backend owns the clock. The `WHERE` of the
 /// `SELECT` re-reads the ceiling in the one statement (as #576's `PARK_SQL`):
 /// a held key always replaces within the byte bounds, a new key only under
@@ -183,8 +304,8 @@ pub const DEFERRED_GRAPH_STALE_SECS: u64 =
 /// returns NO row (`AtCeiling`).
 pub const DEFERRED_GRAPH_UPSERT_SQL: &str = "INSERT INTO gasp_deferred_graphs \
      (host, topic, outpoint, score, nodes, pending, calls, passes, reason, bytes, record, created_at, updated_at, \
-      origin, configured) \
-     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, unixepoch(), unixepoch(), ?16, ?17 \
+      origin, configured, chunks, gen) \
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, unixepoch(), unixepoch(), ?16, ?17, ?20, ?21 \
      WHERE (EXISTS (SELECT 1 FROM gasp_deferred_graphs WHERE host = ?1 AND topic = ?2 AND outpoint = ?3) \
        OR ((SELECT COUNT(*) FROM gasp_deferred_graphs) < ?12 \
          AND (?17 OR ((SELECT COUNT(*) FROM gasp_deferred_graphs WHERE origin = ?16 AND configured = 0) < ?14 \
@@ -199,7 +320,8 @@ pub const DEFERRED_GRAPH_UPSERT_SQL: &str = "INSERT INTO gasp_deferred_graphs \
        score = excluded.score, nodes = excluded.nodes, pending = excluded.pending, \
        calls = excluded.calls, passes = excluded.passes, reason = excluded.reason, \
        bytes = excluded.bytes, record = excluded.record, updated_at = unixepoch(), \
-       origin = excluded.origin, configured = excluded.configured \
+       origin = excluded.origin, configured = excluded.configured, \
+       chunks = excluded.chunks, gen = excluded.gen \
      RETURNING outpoint";
 
 /// The KEYS of one (peer, topic)'s records, lowest score first: a sync reads
@@ -209,9 +331,82 @@ pub const DEFERRED_GRAPH_UPSERT_SQL: &str = "INSERT INTO gasp_deferred_graphs \
 pub const DEFERRED_GRAPHS_SELECT_SQL: &str = "SELECT outpoint, score FROM gasp_deferred_graphs \
      WHERE host = ?1 AND topic = ?2 ORDER BY score, outpoint";
 
-/// One record.
-pub const DEFERRED_GRAPH_GET_SQL: &str = "SELECT record FROM gasp_deferred_graphs \
+/// One record's head row: its first part, and where the rest is
+/// ([`DEFERRED_GRAPH_CHUNK_GET_SQL`], `seq` 1 ..= `chunks` under `gen`).
+pub const DEFERRED_GRAPH_GET_SQL: &str = "SELECT record, chunks, gen FROM gasp_deferred_graphs \
      WHERE host = ?1 AND topic = ?2 AND outpoint = ?3";
+
+/// One record's head row as [`DEFERRED_GRAPH_GET_SQL`] gives it.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub(crate) struct DeferredHead {
+    pub record: String,
+    pub chunks: Option<f64>,
+    pub gen: Option<String>,
+}
+
+/// The rows a deferred record is read from, each by its shipped statement
+/// ([`DEFERRED_GRAPH_GET_SQL`], [`DEFERRED_GRAPH_CHUNK_GET_SQL`]): the
+/// worker's are D1's (`d1_storage`), the stored-rows reader's an export's
+/// (`stored_rows`, the land lens E585-LAND-L3). A column of another type than
+/// the row's field is the port's `Fault`, as D1's deserialization faults.
+pub(crate) trait DeferredRows {
+    type Fault;
+    async fn head(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<Option<DeferredHead>, Self::Fault>;
+    async fn part(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+        gen: &str,
+        seq: u64,
+    ) -> Result<Option<String>, Self::Fault>;
+}
+
+/// What [`read_deferred_graph`] found.
+#[derive(Debug)]
+pub(crate) enum DeferredRead {
+    /// No head row.
+    Absent,
+    /// The record, whole.
+    Record(overlay_engine::gasp::DeferredGraph),
+    /// Part `seq` of generation `gen` is gone: the record cannot be resumed
+    /// (the worker drops it).
+    PartMissing { seq: u64, gen: String },
+    /// The JSON does not parse as a record.
+    Unparsed(String),
+}
+
+/// THE read of one deferred record (bsv-low #585 door 4): its head, then
+/// each further part of its generation, one a statement, then the parse.
+/// ONE function, called by the worker's `get_deferred_graph` and by the
+/// stored-rows reader, so the reader reads a record as the worker does.
+pub(crate) async fn read_deferred_graph<P: DeferredRows>(
+    rows: &P,
+    host: &str,
+    topic: &str,
+    outpoint: &str,
+) -> Result<DeferredRead, P::Fault> {
+    let Some(head) = rows.head(host, topic, outpoint).await? else {
+        return Ok(DeferredRead::Absent);
+    };
+    let mut json = head.record;
+    let gen = head.gen.unwrap_or_default();
+    for seq in 1..=head.chunks.unwrap_or(0.0).max(0.0) as u64 {
+        let Some(part) = rows.part(host, topic, outpoint, &gen, seq).await? else {
+            return Ok(DeferredRead::PartMissing { seq, gen });
+        };
+        json.push_str(&part);
+    }
+    Ok(match serde_json::from_str(&json) {
+        Ok(record) => DeferredRead::Record(record),
+        Err(e) => DeferredRead::Unparsed(e.to_string()),
+    })
+}
 
 /// Delete one record (converged or dropped).
 pub const DEFERRED_GRAPH_DELETE_SQL: &str = "DELETE FROM gasp_deferred_graphs \
@@ -254,6 +449,14 @@ pub async fn sweep_stale(db: &D1Database) {
         }
         Ok(_) => {}
         Err(e) => worker::console_log!("Scheduled: GASP deferred graph sweep failed: {e}"),
+    }
+    // The parts no head names: the swept rows' and a dead save's (#585).
+    if let Err(e) = Query::new(DEFERRED_GRAPH_CHUNKS_SWEEP_SQL)
+        .bind(DEFERRED_GRAPH_ORPHAN_CHUNK_SECS as f64)
+        .execute(db)
+        .await
+    {
+        worker::console_log!("Scheduled: GASP deferred graph chunk sweep failed: {e}");
     }
 }
 
@@ -392,7 +595,7 @@ pub fn health_view(
             "bytesFetched": limbs.0,
             "nodes": limbs.1,
             "maxPasses": overlay_engine::gasp::DEFERRED_GRAPH_MAX_PASSES,
-            "maxBytes": overlay_engine::gasp::DEFERRED_GRAPH_MAX_BYTES,
+            "chunkBytes": DEFERRED_GRAPH_CHUNK_BYTES,
             "perPeerTopic": overlay_engine::gasp::DEFERRED_GRAPHS_PER_PEER_TOPIC,
             "maxRows": DEFERRED_GRAPHS_MAX_ROWS,
             "maxTotalBytes": DEFERRED_GRAPHS_MAX_TOTAL_BYTES,
@@ -529,32 +732,128 @@ mod tests {
         discovered_rows: u32,
         discovered_bytes: u64,
     ) -> bool {
+        put(
+            conn,
+            r,
+            [
+                u64::from(max_rows),
+                max_bytes,
+                u64::from(host_rows),
+                host_bytes,
+                u64::from(discovered_rows),
+                discovered_bytes,
+            ],
+            DEFERRED_GRAPH_CHUNK_BYTES,
+        )
+    }
+
+    /// `D1Storage::put_deferred_graph`, statement for statement, under the
+    /// given bounds (rows, bytes, an origin's rows and bytes, the discovered
+    /// rows and bytes) and chunk size: the further parts of a new
+    /// generation, the head row, then the parts of the generation the head
+    /// does not name. `true` = saved.
+    fn put(conn: &rusqlite::Connection, r: &DeferredGraph, bounds: [u64; 6], chunk: usize) -> bool {
         let json = serde_json::to_string(r).unwrap();
-        let mut stmt = conn.prepare(DEFERRED_GRAPH_UPSERT_SQL).unwrap();
-        let mut rows = stmt
-            .query(rusqlite::params![
-                r.peer,
-                r.topic,
-                r.outpoint,
-                r.score as f64,
-                r.nodes.len() as i64,
-                r.pending.len() as i64,
-                r.calls as i64,
-                r.passes as i64,
-                r.reason,
-                json.len() as i64,
-                json,
-                max_rows,
-                max_bytes as i64,
-                host_rows,
-                host_bytes as i64,
-                overlay_engine::gasp::peer_origin(&r.peer),
-                r.configured,
-                discovered_rows,
-                discovered_bytes as i64
-            ])
+        let plan = chunk_plan(&json, chunk);
+        for (i, part) in plan.rest.iter().enumerate() {
+            conn.execute(
+                DEFERRED_GRAPH_CHUNK_PUT_SQL,
+                rusqlite::params![r.peer, r.topic, r.outpoint, plan.gen, (i + 1) as i64, part],
+            )
             .unwrap();
-        rows.next().unwrap().is_some()
+        }
+        let saved = {
+            let mut stmt = conn.prepare(DEFERRED_GRAPH_UPSERT_SQL).unwrap();
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    r.peer,
+                    r.topic,
+                    r.outpoint,
+                    r.score as f64,
+                    r.nodes.len() as i64,
+                    r.pending.len() as i64,
+                    r.calls as i64,
+                    r.passes as i64,
+                    r.reason,
+                    json.len() as i64,
+                    plan.head,
+                    bounds[0] as i64,
+                    bounds[1] as i64,
+                    bounds[2] as i64,
+                    bounds[3] as i64,
+                    overlay_engine::gasp::peer_origin(&r.peer),
+                    r.configured,
+                    bounds[4] as i64,
+                    bounds[5] as i64,
+                    plan.rest.len() as i64,
+                    plan.gen
+                ])
+                .unwrap();
+            rows.next().unwrap().is_some()
+        };
+        if saved || !plan.rest.is_empty() {
+            let tidy = if saved {
+                DEFERRED_GRAPH_CHUNKS_KEEP_SQL
+            } else {
+                DEFERRED_GRAPH_CHUNKS_UNDO_SQL
+            };
+            conn.execute(
+                tidy,
+                rusqlite::params![r.peer, r.topic, r.outpoint, plan.gen],
+            )
+            .unwrap();
+        }
+        saved
+    }
+
+    /// `D1Storage::get_deferred_graph`, statement for statement: the head
+    /// row, then each further part by the generation it names. `Err` names
+    /// a missing part (the storage drops the record there).
+    fn get(conn: &rusqlite::Connection, r: &DeferredGraph) -> Option<Result<DeferredGraph, u64>> {
+        use rusqlite::OptionalExtension;
+        let key = rusqlite::params![r.peer, r.topic, r.outpoint];
+        let (mut json, chunks, gen): (String, i64, String) = conn
+            .query_row(DEFERRED_GRAPH_GET_SQL, key, |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()
+            .unwrap()?;
+        for seq in 1..=chunks {
+            let part: Option<String> = conn
+                .query_row(
+                    DEFERRED_GRAPH_CHUNK_GET_SQL,
+                    rusqlite::params![r.peer, r.topic, r.outpoint, gen, seq],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+            match part {
+                Some(part) => json.push_str(&part),
+                None => return Some(Err(seq as u64)),
+            }
+        }
+        Some(Ok(serde_json::from_str(&json).unwrap()))
+    }
+
+    /// `D1Storage::delete_deferred_graph`: the head, then its parts.
+    fn delete(conn: &rusqlite::Connection, r: &DeferredGraph) {
+        let key = rusqlite::params![r.peer, r.topic, r.outpoint];
+        conn.execute(DEFERRED_GRAPH_DELETE_SQL, key).unwrap();
+        conn.execute(DEFERRED_GRAPH_CHUNKS_DELETE_SQL, key).unwrap();
+    }
+
+    /// (seq, gen, bytes) of every part row, in order.
+    fn parts(conn: &rusqlite::Connection) -> Vec<(i64, String, usize)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, gen, length(CAST(part AS BLOB)) FROM gasp_deferred_graph_chunks \
+                 ORDER BY outpoint, gen, seq",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
     }
 
     fn upsert(conn: &rusqlite::Connection, r: &DeferredGraph) {
@@ -755,7 +1054,9 @@ mod tests {
                     overlay_engine::gasp::peer_origin(&r.peer),
                     r.configured,
                     DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS,
-                    DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES as i64
+                    DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES as i64,
+                    0,
+                    ""
                 ])
                 .unwrap();
             rows.next().unwrap().is_some()
@@ -965,30 +1266,227 @@ mod tests {
         );
     }
 
+    /// A record of `nodes` nodes, each a raw transaction of `hex` hex chars.
+    fn fat_record(outpoint: &str, nodes: usize, hex: usize, passes: u32) -> DeferredGraph {
+        let mut r = record(outpoint, 1, nodes, passes);
+        for (i, w) in r.nodes.iter_mut().enumerate() {
+            w.node.raw_tx = format!("{i:04x}").repeat(hex / 4);
+        }
+        r
+    }
+
+    /// bsv-low #585, DOOR 4: a record of ANY size is saved and read back
+    /// whole. 46 nodes of 26 KB (the engine pin's graph at its end: 2.4 MB of
+    /// JSON, past D1's 2 MB row and twice the old 1 MiB cap) are one head row
+    /// and two part rows, none past [`DEFERRED_GRAPH_CHUNK_BYTES`]; the read
+    /// is the record, byte for byte; `bytes` is the whole record's, so the
+    /// byte bounds count it whole. A replacement writes a new generation and
+    /// leaves no part of the old; a record back under a row's room leaves no
+    /// part at all; a delete takes the parts with the head. A record of at
+    /// most a row's room is written as before #585 (no part, no generation).
+    /// RED on `e8ab762`: no chunk table, no `chunk_plan`; the engine refused
+    /// the record before the storage saw it (`too_big`).
+    #[test]
+    fn e585_d4_a_record_past_a_row_is_chunked_saved_and_read_back_whole() {
+        let conn = sqlite();
+        let big = fat_record("big.0", 46, 52_236, 2);
+        let json = serde_json::to_string(&big).unwrap();
+        assert!(json.len() > 2_000_000, "past D1's row: {}", json.len());
+        upsert(&conn, &big);
+        let rows_of = parts(&conn);
+        assert_eq!(rows_of.len(), 2, "{rows_of:?}");
+        assert_eq!(
+            rows_of.iter().map(|p| p.0).collect::<Vec<_>>(),
+            [1, 2],
+            "seq from 1"
+        );
+        let (head_len, bytes, chunks, gen): (i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT length(CAST(record AS BLOB)), bytes, chunks, gen FROM gasp_deferred_graphs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(head_len as usize, DEFERRED_GRAPH_CHUNK_BYTES);
+        assert_eq!((bytes as usize, chunks), (json.len(), 2));
+        assert_eq!(gen.len(), 16);
+        assert!(rows_of
+            .iter()
+            .all(|p| p.1 == gen && p.2 <= DEFERRED_GRAPH_CHUNK_BYTES));
+        assert_eq!(
+            head_len as usize + rows_of.iter().map(|p| p.2).sum::<usize>(),
+            json.len()
+        );
+        let back = get(&conn, &big).unwrap().unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json, "byte for byte");
+        println!(
+            "#585 DOOR 4 (worker): a record of {} bytes is 1 head row of {head_len} and {} part rows of {:?}",
+            json.len(),
+            rows_of.len(),
+            rows_of.iter().map(|p| p.2).collect::<Vec<_>>()
+        );
+
+        // A replacement: a new generation, no part of the old left.
+        let mut bigger = fat_record("big.0", 70, 52_236, 3);
+        bigger.reason = "bytes".into();
+        upsert(&conn, &bigger);
+        let rows_of = parts(&conn);
+        assert_eq!(rows_of.len(), 3);
+        assert!(
+            rows_of.iter().all(|p| p.1 != gen),
+            "the old generation is gone"
+        );
+        assert_eq!(get(&conn, &bigger).unwrap().unwrap().nodes.len(), 70);
+        assert_eq!(rows(&conn), ["big.0"], "one head row per graph");
+        // The same JSON again rewrites its own generation and tears nothing.
+        upsert(&conn, &bigger);
+        assert_eq!(parts(&conn), rows_of);
+        assert_eq!(get(&conn, &bigger).unwrap().unwrap().nodes.len(), 70);
+
+        // Back under a row's room: one row, as before #585.
+        let small = record("big.0", 1, 3, 4);
+        upsert(&conn, &small);
+        assert!(parts(&conn).is_empty());
+        let (chunks, gen): (i64, String) = conn
+            .query_row("SELECT chunks, gen FROM gasp_deferred_graphs", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((chunks, gen.as_str()), (0, ""));
+        assert_eq!(get(&conn, &small).unwrap().unwrap().passes, 4);
+
+        // A delete takes the parts with the head.
+        upsert(&conn, &big);
+        assert_eq!(parts(&conn).len(), 2);
+        delete(&conn, &big);
+        assert!(rows(&conn).is_empty() && parts(&conn).is_empty());
+        assert!(get(&conn, &big).is_none());
+
+        // The plan cuts on character boundaries and concatenates to the JSON.
+        let odd = "aé".repeat(1000);
+        let plan = chunk_plan(&odd, 64);
+        assert!(plan.rest.iter().all(|p| p.len() <= 64) && plan.head.len() <= 64);
+        assert_eq!(format!("{}{}", plan.head, plan.rest.concat()), odd);
+        assert_eq!(chunk_plan("{}", 64).rest.len(), 0);
+        assert_eq!(chunk_plan("{}", 64).gen, "");
+
+        // The storage runs these statements in this order.
+        let storage = include_str!("d1_storage.rs");
+        let put_src = &storage[storage.find("async fn put_deferred_graph").unwrap()..];
+        let put_src = &put_src[..put_src.find("async fn find_deferred_graphs").unwrap()];
+        let at = |needle: &str| put_src.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(at("DEFERRED_GRAPH_CHUNK_PUT_SQL") < at("DEFERRED_GRAPH_UPSERT_SQL"));
+        assert!(at("DEFERRED_GRAPH_UPSERT_SQL") < at("DEFERRED_GRAPH_CHUNKS_KEEP_SQL"));
+        assert!(at("DEFERRED_GRAPH_UPSERT_SQL") < at("DEFERRED_GRAPH_CHUNKS_UNDO_SQL"));
+        let get_src = &storage[storage.find("async fn get_deferred_graph").unwrap()..];
+        let get_src = &get_src[..get_src
+            .find("async fn find_transactions_for_proof_check")
+            .unwrap()];
+        // The read is `read_deferred_graph` over D1's rows (the land lens
+        // E585-LAND-L3: one read, the stored-rows reader's too), and a torn
+        // record is dropped.
+        assert!(get_src.contains("read_deferred_graph(&D1DeferredRows(&self.db)"));
+        assert!(get_src.contains("DEFERRED_GRAPH_CHUNKS_DELETE_SQL"));
+        let rows_src = &storage[storage
+            .find("impl crate::gasp_deferred::DeferredRows for D1DeferredRows")
+            .unwrap()..];
+        let rows_src = &rows_src[..rows_src.find("\n}\n").unwrap()];
+        assert!(rows_src.contains("DEFERRED_GRAPH_GET_SQL"));
+        assert!(rows_src.contains("DEFERRED_GRAPH_CHUNK_GET_SQL"));
+    }
+
+    /// bsv-low #585, DOOR 4: the ceiling is a BUDGET of room and a refusal
+    /// loses nothing held. A chunked replacement the byte bound refuses
+    /// (`AtCeiling`) leaves the record held WHOLE under its own generation
+    /// (the new parts are taken back, the old never touched), so the engine,
+    /// which keeps a resumed walk's record at `AtCeiling`, resumes from it. A
+    /// part with no head is swept by the cron once it is an hour old, and a
+    /// head whose part is gone reads as a missing part (the storage then
+    /// drops the record; the table is transient).
+    #[test]
+    fn e585_d4_a_refused_replacement_leaves_the_held_record_whole() {
+        let conn = sqlite();
+        let held = fat_record("big.0", 46, 52_236, 2);
+        let held_len = serde_json::to_string(&held).unwrap().len() as u64;
+        upsert(&conn, &held);
+        let before = parts(&conn);
+        // The global bytes leave room for the held record and no more.
+        let bigger = fat_record("big.0", 70, 52_236, 3);
+        assert!(
+            !upsert_under(&conn, &bigger, 256, held_len + 1),
+            "AtCeiling"
+        );
+        assert_eq!(parts(&conn), before, "the held generation, and only it");
+        let back = get(&conn, &held).unwrap().unwrap();
+        assert_eq!((back.nodes.len(), back.passes), (46, 2), "held whole");
+        // A NEW key refused room leaves nothing behind.
+        let other = fat_record("other.0", 46, 52_236, 1);
+        assert!(!upsert_under(&conn, &other, 256, held_len + 1));
+        assert_eq!(parts(&conn), before);
+        assert_eq!(rows(&conn), ["big.0"]);
+
+        // The cron's sweep: an orphan part an hour old goes; a young one (a
+        // save in flight) and every part a head names stay.
+        for (gen, age) in [
+            ("dead", DEFERRED_GRAPH_ORPHAN_CHUNK_SECS as i64 + 1),
+            ("inflight", 5),
+        ] {
+            conn.execute(
+                "INSERT INTO gasp_deferred_graph_chunks (host, topic, outpoint, gen, seq, part, written_at) \
+                 VALUES ('https://peer', 'tm_x', 'big.0', ?1, 1, 'x', unixepoch() - ?2)",
+                rusqlite::params![gen, age],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE gasp_deferred_graph_chunks SET written_at = unixepoch() - 99999 WHERE gen NOT IN ('dead', 'inflight')",
+            [],
+        )
+        .unwrap();
+        let swept = conn
+            .execute(
+                DEFERRED_GRAPH_CHUNKS_SWEEP_SQL,
+                [DEFERRED_GRAPH_ORPHAN_CHUNK_SECS as i64],
+            )
+            .unwrap();
+        assert_eq!(swept, 1, "the dead save's part alone");
+        assert_eq!(parts(&conn).len(), before.len() + 1);
+        assert_eq!(get(&conn, &held).unwrap().unwrap().nodes.len(), 46);
+        let lib = include_str!("gasp_deferred.rs");
+        let sweep = &lib[lib.find("pub async fn sweep_stale").unwrap()..];
+        assert!(sweep[..sweep.find("/// The health block lists").unwrap()]
+            .contains("DEFERRED_GRAPH_CHUNKS_SWEEP_SQL"));
+
+        // A head whose part is gone names the part; the storage drops it.
+        conn.execute(
+            "DELETE FROM gasp_deferred_graph_chunks WHERE seq = 2 AND gen NOT IN ('dead', 'inflight')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(get(&conn, &held).unwrap().unwrap_err(), 2);
+    }
+
     /// bsv-low #555: the health block names the count, the oldest and each
     /// graph {topic, peer, outpoint, nodes, pending, calls, passes, reason,
     /// bytes, ageSecs}, with the budget it runs under.
-    // bsv-low #586, the lens fold (E586-L1). The worker's default bytes limb
-    // sits UNDER the record cap (seven eighths of it, the engine's default),
-    // so the pass it cuts leaves a record that fits; and the two limbs are
-    // vars an operator sets, clamped, the consts their defaults. RED on
-    // `589bc2d`: the default was 4 MiB and `graph_budget_limbs` did not exist.
+    // bsv-low #586, the lens fold (E586-L1), amended by bsv-low #585 (door 4).
+    // The two limbs are vars an operator sets, clamped, the consts their
+    // defaults. The bytes limb's default is the engine's 917,504 (18 heads of
+    // 26 KB a fresh pass): it was seven eighths of a 1 MiB record cap and the
+    // var was clamped to that cap; a record has no cap now, so the default is
+    // a budget per pass and the var has no upper clamp. RED on `e8ab762`: the
+    // var is clamped to 1,048,576.
     #[test]
     fn e586f_l1_the_limbs_default_under_the_record_cap_and_are_vars() {
-        let cap = overlay_engine::gasp::DEFERRED_GRAPH_MAX_BYTES as u64;
-        assert_eq!(GASP_GRAPH_BUDGET_BYTES, cap / 8 * 7);
-        assert_eq!(GASP_GRAPH_BUDGET_BYTES, 917_504, "while the cap is 1 MiB");
+        assert_eq!(GASP_GRAPH_BUDGET_BYTES, 917_504);
         assert_eq!(
             GASP_GRAPH_BUDGET_BYTES,
             overlay_engine::gasp::DEFAULT_GRAPH_BUDGET_BYTES
         );
         assert_eq!(GASP_GRAPH_BUDGET_NODES, 64);
         // A 26 KB head is 52,236 hex bytes (the #586 witness's): the limb is
-        // read before a step, so a fresh pass is served 18 and its record
-        // (1.0059x what it was served, the lane's pin E) fits.
-        let heads = GASP_GRAPH_BUDGET_BYTES.div_ceil(52_236);
-        assert_eq!(heads, 18);
-        assert!(heads * 52_236 * 10_059 / 10_000 < cap);
+        // read before a step, so a fresh pass is served 18.
+        assert_eq!(GASP_GRAPH_BUDGET_BYTES.div_ceil(52_236), 18);
 
         // Unset, empty, not a number: the defaults.
         let defaults = (GASP_GRAPH_BUDGET_BYTES, GASP_GRAPH_BUDGET_NODES);
@@ -1003,16 +1501,16 @@ mod tests {
         );
         assert_eq!(graph_budget_limbs(Some(" 400000 "), None), (400_000, 64));
         assert_eq!(graph_budget_limbs(None, Some("12")), (917_504, 12));
-        // Clamped: never 0 (no step would be made), never past the record
-        // cap (E586-L1 again), never more nodes than calls.
+        // Clamped: never 0 (no step would be made), never more nodes than
+        // calls. The bytes have no upper clamp (no record cap, #585).
         assert_eq!(graph_budget_limbs(Some("0"), Some("0")), (1, 1));
         assert_eq!(
             graph_budget_limbs(Some("4194304"), Some("5000")),
-            (cap, GASP_GRAPH_BUDGET_CALLS)
+            (4_194_304, GASP_GRAPH_BUDGET_CALLS)
         );
         assert_eq!(
             graph_budget_limbs(Some("18446744073709551615"), Some("4294967296")),
-            (cap, GASP_GRAPH_BUDGET_CALLS)
+            (u64::MAX, GASP_GRAPH_BUDGET_CALLS)
         );
         assert_eq!(GASP_GRAPH_BUDGET_BYTES_VAR, "GASP_GRAPH_BUDGET_BYTES");
         assert_eq!(GASP_GRAPH_BUDGET_NODES_VAR, "GASP_GRAPH_BUDGET_NODES");
@@ -1075,8 +1573,8 @@ mod tests {
         );
         assert_eq!(v["budget"]["calls"], GASP_GRAPH_BUDGET_CALLS);
         assert_eq!(v["budget"]["ms"], GASP_GRAPH_BUDGET_MS);
-        // bsv-low #586: the two limbs, the engine's defaults (the bytes
-        // under the record cap since the lens fold's E586-L1).
+        // bsv-low #586: the two limbs, the engine's defaults (a budget per
+        // pass; no record cap since bsv-low #585 door 4).
         assert_eq!(v["budget"]["bytesFetched"], 917_504);
         assert_eq!(v["budget"]["nodes"], 64);
         // The limbs served are the ones the worker runs with (the vars).
@@ -1141,7 +1639,9 @@ mod tests {
             ]
         );
         let names = counter_names();
-        assert_eq!(names.len(), 5 + 11);
+        assert_eq!(names.len(), 5 + 10);
+        // bsv-low #585: nothing is dropped for its size.
+        assert!(!names.contains(&"gasp_graph_dropped_too_big_total".to_string()));
         assert!(names.contains(&"gasp_graph_dropped_root_proven_total".to_string()));
         // The delta-2 fold's D2-M2: a resumed walk dropped after its idle faults.
         assert!(names.contains(&"gasp_graph_dropped_idle_faults_total".to_string()));

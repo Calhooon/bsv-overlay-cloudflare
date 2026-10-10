@@ -174,7 +174,7 @@ if (sParked) {
     JSON.stringify({ ...sParked, message: '…' }),
   )
   const m = JSON.parse(sParked.message)
-  expect(Buffer.from(m.beef_b64, 'base64').equals(beefV1(G, P, S)), 'the parked message is the queued bytes as they were', m.beef_b64.slice(0, 40))
+  expect(Buffer.from(m.beef_b64, 'base64').equals(beefV1(G, P, S)) && !('r2' in m), 'the parked message is the queued bytes as they were (inline: under the room, bsv-low #585)', m.beef_b64.slice(0, 40))
 }
 const h1 = await health()
 expect((h1.counters?.dead_letters_parked_total ?? NaN) >= parked0 + 1, 'dead_letters_parked_total moved', `${parked0} -> ${h1.counters?.dead_letters_parked_total}`)

@@ -386,7 +386,7 @@
    "rebuild_class": "chain",
    "never_wipe": false,
    "holds": "the engine's applied-transaction marks",
-   "why": "dedup marks, re-derived on re-admission; the successor rule reads a row as landed (bsv-low #575), so never wiped without outputs"
+   "why": "dedup marks, re-derived on re-admission; the successor rule reads a row as landed (bsv-low #575), and so does the queue consumer's twin rule for a message whose R2 object is MISSING (bsv-low #585 door 3, queue.rs TWIN_APPLIED_SQL), so never wiped without outputs"
   },
   {
    "name": "low_records",
@@ -846,8 +846,30 @@
    "readers": [],
    "rebuild_class": "transient",
    "never_wipe": false,
-   "holds": "the partial walks of GASP graphs deferred past their per-graph budget (bsv-low #555), one row per graph, at most 256 rows and 64 MiB of records over every peer (the upsert's ceiling) and swept by the cron 30 h after its last write (the lens fold's M3)",
+   "holds": "the partial walks of GASP graphs deferred past their per-graph budget (bsv-low #555), one row per graph, at most 256 rows and 64 MiB of records over every peer (the upsert's ceiling; `bytes` is a whole record's, its parts in gasp_deferred_graph_chunks included) and swept by the cron 30 h after its last write (the lens fold's M3); a record has no byte bound (bsv-low #585) and the row holds its first 1 MiB",
    "why": "a cache of peer requests: a lost row costs the walk again from its root; transient, so its sweep needs no delete_scope (the checker refuses one on a table that is not never-wipe)"
+  },
+  {
+   "name": "gasp_deferred_graph_chunks",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the further parts of a deferred GASP graph's record past one row's room (bsv-low #585), 1 MiB a row, keyed by the graph, the generation its gasp_deferred_graphs row names and a sequence; written before the head row, deleted with it, and a part no head names is swept by the cron after an hour",
+   "why": "D1's 2 MB row is routed around, not made a limit on a graph: a lost part drops its record, which costs the walk again from its root; transient"
+  },
+  {
+   "name": "beef_blob_sweep",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the one-row state of the orphan sweep over the queue's R2 objects (bsv-low #585, door 3's fold): the last key a pass handled, the objects and bytes counted by the round in progress, the last complete round's count, the last pass and the entries it could not read (the fold-4)",
+   "why": "the cron's sweep (and the operator's lever POST /internal/beef-blob-sweep, the same pass) lists BEEF_BLOBS 200 objects a pass and resumes from the key at rest; a lost row restarts the round at the first key and loses only the served count until a round completes; transient"
   },
   {
    "name": "ops_counters",
@@ -896,8 +918,8 @@
    "readers": [],
    "rebuild_class": "lost",
    "never_wipe": true,
-   "holds": "the dead-lettered mutation messages (bytes, topics, mode), their last fault, attempts, status, re-drives and park history",
-   "why": "bsv-low #576: once the DLQ consumer acks a dead letter this row is its only copy, and the operator's lever re-drives from it; the lens fold (M2): a DELETE is the ack of the letter's LANDED bytes (a row then copies nothing); the delta fold (D-M1): the other is the operator's discard of a parked letter by key, so the ceiling can drain; bounded rows (2000 letters with bytes) and bytes per row (one queue message, 20 history entries)", "delete_scope": [{"crate": "overlay-cloudflare", "file": "crates/overlay-cloudflare/src/dead_letters.rs", "statement": "DELETE FROM mutation_dead_letters WHERE txid = ? AND topics = ? RETURNING status, parked_at", "why": "dead_letters::resolve (RESOLVE_SQL): the main consumer acked a replay of this key, so its bytes LANDED (durable, or refused under an open eviction); the row, a failing note or a parked / re-driven letter, is a copy of nothing"}, {"crate": "overlay-cloudflare", "file": "crates/overlay-cloudflare/src/dead_letters.rs", "statement": "DELETE FROM mutation_dead_letters WHERE txid = ?1 AND (?2 IS NULL OR topics = ?2) AND status = 'parked' AND rowid IN (SE", "why": "dead_letters::internal_discard (DISCARD_SQL, the delta fold D-M1): POST /internal/discard-dead-letters, bearer INTERNAL_TOKEN, the operator discards a named PARKED letter (never a redriven one in flight, never a failing note) to make room under the 2000-letter ceiling, at most 50 keys and (the delta-2 fold, D2-L1) 50 rows per call, oldest parked first, each logged DISCARDED with the sha256 of its bytes and counted dead_letters_discarded_total"}]
+   "holds": "the dead-lettered mutation messages (bytes, or since bsv-low #585 door 3 the R2 key of a BEEF past the queue's inline room, in `r2_key` / `r2_bytes`; topics, mode), their last fault, attempts, status, re-drives and park history",
+   "why": "bsv-low #576: once the DLQ consumer acks a dead letter this row is its only copy, and the operator's lever re-drives from it; the lens fold (M2): a DELETE is the ack of the letter's LANDED bytes (a row then copies nothing); the delta fold (D-M1): the other is the operator's discard of a parked letter by key, so the ceiling can drain; bounded rows (2000 letters with bytes) and bytes per row (one queue message, 20 history entries)", "delete_scope": [{"crate": "overlay-cloudflare", "file": "crates/overlay-cloudflare/src/dead_letters.rs", "statement": "DELETE FROM mutation_dead_letters WHERE txid = ? AND topics = ? RETURNING status, parked_at, r2_key", "why": "dead_letters::resolve (RESOLVE_SQL): the main consumer acked a replay of this key, so its bytes LANDED (durable, or refused under an open eviction); the row, a failing note or a parked / re-driven letter, is a copy of nothing"}, {"crate": "overlay-cloudflare", "file": "crates/overlay-cloudflare/src/dead_letters.rs", "statement": "DELETE FROM mutation_dead_letters WHERE txid = ?1 AND (?2 IS NULL OR topics = ?2) AND status = 'parked' AND rowid IN (SE", "why": "dead_letters::internal_discard (DISCARD_SQL, the delta fold D-M1): POST /internal/discard-dead-letters, bearer INTERNAL_TOKEN, the operator discards a named PARKED letter (never a redriven one in flight, never a failing note) to make room under the 2000-letter ceiling, at most 50 keys and (the delta-2 fold, D2-L1) 50 rows per call, oldest parked first, each logged DISCARDED with the sha256 of its bytes and counted dead_letters_discarded_total"}]
   },
   {
    "name": "banned_hosts",
@@ -1280,6 +1302,14 @@
     "owner": "low-watchtower",
     "holds": "BRC-103 sessions",
     "never_wipe": false
+   }
+  ],
+  "overlay-cloudflare": [
+   {
+    "store": "R2 BEEF_BLOBS (low-overlay-beefs, low-overlay-beefs-beta; overlay-beefs for wrangler.toml), keys `mutations/<sha256>/<scope>`",
+    "owner": "overlay-cloudflare",
+    "holds": "the queued BEEF of a replay past the queue's inline room (bsv-low #585 door 3): the ONLY copy of a parked keyed dead letter's bytes (`mutation_dead_letters.r2_key`). Deleted only by the deletion rule (an ack, a LOST deferral, the copy rule, the operator's discard) and the orphan sweep (past 8 days, named by no row); no bucket expiry rule",
+    "never_wipe": true
    }
   ],
   "low-relay (rust-message-box)": [

@@ -10,6 +10,7 @@ pub mod advert_lifecycle;
 pub mod advertiser;
 pub mod arcade_reorg;
 pub mod ban_storage;
+pub mod beef_blob_sweep;
 pub mod broadcaster;
 pub mod chain_tracker;
 pub mod change_flush;
@@ -374,6 +375,11 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
         (Method::Post, "/internal/redrive-dead-letters") => crate::dead_letters::internal_redrive(req, &env).await,
         (Method::Post, "/internal/discard-dead-letters") => {
             crate::dead_letters::internal_discard(req, &env).await
+        }
+        // bsv-low #585 (door 3's fold-4): ONE bounded pass of the R2 orphan sweep on demand, the tick's own
+        // function (bearer INTERNAL_TOKEN; body empty or {}).
+        (Method::Post, "/internal/beef-blob-sweep") => {
+            crate::beef_blob_sweep::internal_sweep(req, &env).await
         }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
@@ -1127,7 +1133,7 @@ fn build_engine_with_storage(
     // that many bytes, or appending that many nodes, in one pass is deferred
     // and resumed like one past its calls: a budget per pass, never a limit.
     // The vars GASP_GRAPH_BUDGET_BYTES / GASP_GRAPH_BUDGET_NODES, clamped;
-    // unset, the defaults (the bytes under the record cap, E586-L1).
+    // unset, the defaults (a budget per pass; no record cap since #585).
     let (limb_bytes, limb_nodes) = crate::gasp_deferred::graph_budget_limbs_from_env(env);
     engine.set_graph_budget_limbs(limb_bytes, limb_nodes);
 
@@ -1293,6 +1299,25 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // default), GASP sync is a near-no-op: `start_gasp_sync` iterates
     // configured topics only. That's fine — calling it keeps the wire
     // connected so adding topic peers later Just Works.
+    // bsv-low #585 (door 3's fold): one bounded pass of the orphan sweep over
+    // the queue's R2 objects (`beef_blob_sweep.rs`: at most 200 listed and 50
+    // deleted, the cursor at rest in D1). Before the GASP step, so a tick
+    // that step holds to its belt has swept. A dropped pass saved no cursor
+    // and is made again. `run_pass` is the bounded pass the operator's lever
+    // (`POST /internal/beef-blob-sweep`) runs too (the d3 fold-4).
+    crate::beef_blob_sweep::run_pass(&env, &ops_db, "tick").await;
+    // bsv-low #555 (the lens fold's M3): rows of deferred graphs nothing
+    // will resume (a peer that never finishes a sync again) are swept first.
+    crate::gasp_deferred::sweep_stale(&ops_db).await;
+    // NL-6c: deferred EF jobs whose run ended without settling go back to the
+    // queue; settled ones past their keep are swept with their bytes.
+    crate::ef_deferred::redrive(&env, &ops_db).await;
+    // The order (bsv-low #585 land2): the sweep's pass (its own 30 s race),
+    // the stale graphs, the EF jobs' hand-back and keep sweep (no race of its
+    // own: two D1 reads, up to 20 quiet jobs re-sent and touched, up to 50
+    // settled jobs deleted with their bytes; the jobs RUN on the queue
+    // consumer), then
+    // the GASP step under its 240 s belt, which bounds that step alone.
     // #257: BOUNDED — an unbounded GASP sync (dead SHIP-discovered peers, no
     // per-fetch timeout) hung every cron to the 15-min kill since deploy day;
     // see the budget consts. A timeout drops the sync (cursors persist only
@@ -1302,12 +1327,6 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // graph is being submitted, and a submit dropped between its writes
     // leaves a head chain with no head. It waits for the transaction being
     // written and drops the sync at the boundary.
-    // bsv-low #555 (the lens fold's M3): rows of deferred graphs nothing
-    // will resume (a peer that never finishes a sync again) are swept first.
-    crate::gasp_deferred::sweep_stale(&ops_db).await;
-    // NL-6c: deferred EF jobs whose run ended without settling go back to the
-    // queue; settled ones past their keep are swept with their bytes.
-    crate::ef_deferred::redrive(&env, &ops_db).await;
     match overlay_engine::gasp::race_or_deadline_guarded(
         engine.start_gasp_sync(),
         crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS),
@@ -2240,6 +2259,9 @@ async fn queue_handler(
     // that does not decode and one whose BEEF is not base64 are handed back like any fault, dead-letter after their
     // replays and are PARKED (the undecodable one exhausted), where the platform used to ack them silently.
     let counters = env.d1("OVERLAY_DB").ok();
+    // bsv-low #585 (door 3, the deletion rule): the R2 objects of the messages this batch ACKED, deleted after the
+    // loop (a batch that dies midway leaves objects nothing names, never a redelivery that finds its bytes gone).
+    let mut acked_objects: Vec<String> = Vec::new();
     for msg in batch.raw_iter() {
         let body: crate::queue::MutationMessage = match worker::serde_wasm_bindgen::from_value(
             msg.body(),
@@ -2266,23 +2288,75 @@ async fn queue_handler(
             continue;
         }
 
-        let beef = match crate::queue::decode_replay_beef(&body.beef_b64) {
-            Ok(b) => b,
-            Err(e) => {
+        // bsv-low #585 (door 3): a message that names an R2 object replays THAT object's bytes, read and checked
+        // (length, sha256, the consumer's own BEEF policy), exactly as an inline body from here on. A read fault
+        // and a mismatch are the replay's FAULT (never "not now"): handed back, dead-lettered, parked with the key.
+        // A MISSING object (the d3 fold, the twin) is judged by the message's SUBJECT: a twin of the same bytes,
+        // topics and mode shares the object and the first ack deleted it, so a subject under an open eviction or
+        // with an applied row in every topic named is acked (a dupe, no letter, nothing to delete: the object is
+        // gone); one not shown landed is the replay's FAULT, as before.
+        // The d3 fold-2 (E585-D3-L3): the read and the use of the verdict are `read_for_replay`, run as is by the
+        // lib's tests; this arm only acts on its step. Its MISSING fault notes KEEP the letter's class (L4).
+        let ports = crate::queue::WorkerBytes {
+            env: &env,
+            db: counters.as_ref(),
+        };
+        let step = crate::queue::read_for_replay(&ports, body).await;
+        if let (
+            crate::queue::ReadStep::Acked(_) | crate::queue::ReadStep::Fault { missing: true, .. },
+            Some(db),
+        ) = (&step, &counters)
+        {
+            crate::ops::bump_counter(db, crate::ops::COUNTER_BEEF_BLOBS_MISSING, 1).await;
+        }
+        let beef = match step {
+            crate::queue::ReadStep::Bytes(b) => b,
+            crate::queue::ReadStep::Acked(verdict) => {
+                let (why, counter) = if verdict == crate::queue::MissingVerdict::Twin {
+                    (
+                        crate::dead_letters::Resolved::Twin,
+                        crate::ops::COUNTER_QUEUE_R2_TWIN_ACKED,
+                    )
+                } else {
+                    (
+                        crate::dead_letters::Resolved::RefusedEvicted,
+                        crate::ops::COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
+                    )
+                };
+                let subject = body.r2.as_ref().and_then(|r| r.txid.as_deref());
                 worker::console_log!(
-                    "Queue: invalid base64 BEEF ({e}) — retrying; it dead-letters and is parked"
+                    "Queue: the R2 object of {} is MISSING and its replay is acked: {}",
+                    subject.unwrap_or("?"),
+                    why.says()
                 );
+                if let Some(db) = &counters {
+                    crate::ops::bump_counter(db, counter, 1).await;
+                    let row_object = crate::dead_letters::resolve(db, body, subject, why).await;
+                    acked_objects.extend(row_object);
+                }
+                msg.ack();
+                continue;
+            }
+            crate::queue::ReadStep::Fault { fault, missing } => {
+                worker::console_log!("Queue: {fault} — retrying; it dead-letters and is parked");
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
                         .await;
-                    crate::dead_letters::note_failing(
-                        db,
-                        body,
-                        None,
-                        &format!("invalid base64 BEEF ({e})"),
-                        crate::dead_letters::LetterClass::Fault,
-                    )
-                    .await;
+                    if missing {
+                        crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_R2_MISSING_FAULT, 1)
+                            .await;
+                        crate::dead_letters::note_failing_keeping_class(db, body, None, &fault)
+                            .await;
+                    } else {
+                        crate::dead_letters::note_failing(
+                            db,
+                            body,
+                            None,
+                            &fault,
+                            crate::dead_letters::LetterClass::Fault,
+                        )
+                        .await;
+                    }
                 }
                 msg.retry();
                 continue;
@@ -2323,13 +2397,15 @@ async fn queue_handler(
                         ev.evicted_at_ms,
                         ev.reason
                     );
-                    crate::dead_letters::resolve(
+                    let row_object = crate::dead_letters::resolve(
                         db,
                         body,
                         Some(&subject),
                         crate::dead_letters::Resolved::RefusedEvicted,
                     )
                     .await;
+                    acked_objects.extend(row_object);
+                    acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));
                     msg.ack();
                     continue;
                 }
@@ -2375,13 +2451,15 @@ async fn queue_handler(
                                 ev.evicted_at_ms,
                                 ev.reason
                             );
-                            crate::dead_letters::resolve(
+                            let row_object = crate::dead_letters::resolve(
                                 db,
                                 body,
                                 Some(&subject),
                                 crate::dead_letters::Resolved::ReEvicted,
                             )
                             .await;
+                            acked_objects.extend(row_object);
+                            acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));
                             msg.ack();
                             continue;
                         }
@@ -2410,7 +2488,7 @@ async fn queue_handler(
                     body.reason,
                     report.applied_topics
                 );
-                if let Some(db) = &counters {
+                let row_object = if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_APPLIED, 1)
                         .await;
                     crate::dead_letters::resolve(
@@ -2419,8 +2497,21 @@ async fn queue_handler(
                         Some(&subject),
                         crate::dead_letters::Resolved::Landed,
                     )
-                    .await;
+                    .await
+                } else {
+                    None
+                };
+                // the d3 fold-3 (E585-D3-DELTA-L1): the ack's ONE decision over R2; a replay with a named topic that
+                // FAILED leaves its object for a twin in flight (the sweep is the backstop)
+                let ack = crate::queue::landed_ack(body, &report, row_object);
+                if ack.leaves {
+                    worker::console_log!(
+                        "Queue: {subject} landed with a FAILED topic (applied={:?}, deduped={:?}): its R2 object stays for a twin",
+                        report.applied_topics,
+                        report.deduped_topics
+                    );
                 }
+                acked_objects.extend(ack.delete);
                 msg.ack();
             }
             Ok((_steak, report)) => {
@@ -2448,6 +2539,8 @@ async fn queue_handler(
             }
         }
     }
+
+    crate::queue::delete_beefs(&env, &acked_objects, "its replay was acked").await;
 
     // W2-P4: ship the pot rows this batch changed (off the critical path).
     crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut));
@@ -2558,3 +2651,8 @@ mod arcade_vector_replay;
 
 #[cfg(test)]
 mod beef_door_replay;
+
+// bsv-low #585 (E585-land): the stored-rows reader, a native test-only tool
+// that reads a D1 export through the Worker's own readers.
+#[cfg(test)]
+mod stored_rows;

@@ -87,11 +87,10 @@ pub const PEER_BEEF_LIMITS: BeefLimits = ENGINE_BEEF_LIMITS;
 pub const DISCOVERY_BEEF_LIMITS: BeefLimits = ENGINE_BEEF_LIMITS;
 /// App-layer reads and parent merges (LOW's; #585 re-wires them).
 pub const APP_BEEF_LIMITS: BeefLimits = STORED_BEEF_LIMITS;
-/// The queue consumer. The 90 KB is the PRODUCER's envelope under the
-/// platform's 128 KB message (`queue.rs`, LOW's door 3); it is not a refusal
-/// of a BEEF the consumer was handed.
+/// The queue's byte bound is the engine's: a body past the platform's 128 KB
+/// message rides by key in R2 (bsv-low #585 door 3).
 pub const QUEUE_BEEF_LIMITS: BeefLimits = BeefLimits {
-    max_bytes: 90_000,
+    max_bytes: ENGINE_BEEF_LIMITS.max_bytes,
     ..SUBMIT_BEEF_LIMITS
 };
 /// A dead letter holds the queue's payload.

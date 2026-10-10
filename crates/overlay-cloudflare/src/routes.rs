@@ -622,17 +622,18 @@ async fn submit_inner(
     // What does NOT stream today, said at the site: the body is read WHOLE
     // (`req.bytes()`), because everything below takes it whole (the engine's
     // `TaggedBEEF` holds a `Vec<u8>`, D1 stores the BEEF as a row's blob,
-    // the queue carries it base64 in one message), and this Worker has no R2
-    // binding to rest the bytes in. The doors stream over the held value.
-    // The irreducible bound left is the platform's (one isolate's memory and
-    // CPU slice, the plan's request-body limit), not a number of ours. When
-    // bsv-low #585 door 3 adds the R2 binding (buckets
-    // `low-overlay-beefs-beta` and `low-overlay-beefs`), THIS is the site
-    // that pipes `req.stream()` to the object and reads it back through
-    // `beef_limits::fold_beef`, one element in hand, and `d1_storage.rs`
-    // `insert_output` / `update_transaction_beef` are the sites whose row
-    // then holds a reference (D1's row bound is the platform's, routed
-    // around in R2, never a refusal).
+    // the queue carries it base64 in one message, or by key in R2 past its
+    // inline room). The doors stream over the held value. The irreducible
+    // bound left is the platform's (one isolate's memory and CPU slice, the
+    // plan's request-body limit), not a number of ours. bsv-low #585 door 3
+    // bound R2 (`BEEF_BLOBS`) for the QUEUE's carriage only (`queue.rs`: a
+    // replay past the message's room is written there before its send); the
+    // request itself is still read whole here and parsed whole below (the
+    // gated arm's `parse_beef` hydrates it, the land lens E585-LAND-M1).
+    // Streaming the request into R2 would start at THIS site (`req.stream()`
+    // to the object, read back through `beef_limits::fold_beef`), with
+    // `d1_storage.rs` `insert_output` / `update_transaction_beef` the sites
+    // whose row would then hold a reference; not built.
     let raw_body = req.bytes().await?;
 
     // Input validation
@@ -929,9 +930,10 @@ async fn submit_parts(
                 state_counter
             );
             // Precisely (gate LOW-1): the CLASSIFICATION above is SYNCHRONOUS
-            // on every ungated submit — ~2 `Beef::from_binary` parses, the
-            // subject's EF conversions and an ancestry BFS, all bounded by
-            // `MAX_CENSUS_EVAL_BYTES` — and only the durable D1 WRITE below
+            // on every ungated submit — the gated arm's own parse, the
+            // subject's EF conversions and an ancestry walk over the stream's
+            // index, with no stop by size (bsv-low #585) — and only the
+            // durable D1 WRITE below
             // is backgrounded (`ctx.wait_until`). A D1 fault can only lose a
             // count, never a submit (`bump_counter` logs and swallows its own
             // errors; a missing binding logs and loses the count, never the
@@ -1202,15 +1204,19 @@ async fn submit_parts(
                 Err(EngineError::ScriptWalkOverBudget {
                     at_txid,
                     subject_judged,
+                    limb,
                     what,
                 }) => {
                     // The DOOR's own bound, never the network's verdict: the
-                    // request proceeds and the network judges.
+                    // request proceeds and the network judges. Each limb of
+                    // the budget has its counter (bsv-low #585, the doors
+                    // lens L3: the memory limb stops a walk before the stream
+                    // is opened).
                     script_walk_desc = format!("over-budget at={at_txid} judged={subject_judged}");
                     worker::console_log!(
-                        "POST /submit(broadcast-gated): door walk OVER BUDGET at {at_txid} (subject {subject_txid} judged: {subject_judged}; {what}) — the door's bound, the network judges"
+                        "POST /submit(broadcast-gated): door walk OVER BUDGET ({limb:?}) at {at_txid} (subject {subject_txid} judged: {subject_judged}; {what}) — the door's bound, the network judges"
                     );
-                    count(crate::ops::COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET);
+                    count(crate::ops::script_walk_over_counter(limb));
                 }
                 Err(EngineError::ScriptWalkInconclusive {
                     at_txid,
@@ -2136,8 +2142,8 @@ async fn submit_parts(
     // never-broadcast attacker subject gets no row and stays behind the
     // merkle bar; a corroboration fault degrades to exactly the pre-#371
     // behaviour. Bounded: one subject parse + one GET per ADMITTED ungated
-    // submit, off the critical path (`wait_until`); the beef clone is capped
-    // by the 10MB body bound above (typical LOW BEEFs are KB-scale).
+    // submit, off the critical path (`wait_until`); the beef clone is the
+    // body's size (no body bound since NL-6; typical LOW BEEFs are KB-scale).
     if corroborate_seen_after_submit {
         if let Ok(seen_db) = env.d1("OVERLAY_DB") {
             let beef_for_seen = tagged_beef.beef.clone();

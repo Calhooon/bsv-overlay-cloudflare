@@ -1592,3 +1592,165 @@ async fn door_num2bin_oversized_element_is_the_doors_bound_before_any_allocation
         other => panic!("expected the door's bound, got {other}"),
     }
 }
+
+// ============================================================================
+// (i): LOW's real shapes against the work budget (bsv-low #585, the doors
+// lens E585-D12-M1). A signature check is charged at least the door's floor
+// (`DoorBudget::sig_check_floor`), so the budget bounds the EC verifications
+// of a walk; these are the bodies the floor was chosen against.
+// ============================================================================
+
+/// A chain of `hops` unproven one-input P2PKH transactions over a proven
+/// funding: the ancestry of a seat that hopped its coin `hops` times.
+async fn p2pkh_hop_chain(key: &PrivateKey, hops: usize, sats: u64) -> Transaction {
+    let lock = P2PKH::new().lock(&key.public_key().hash160()).unwrap();
+    let mut prev = proven_funding(lock.clone(), sats);
+    for hop in 0..hops {
+        let mut tx = Transaction::new();
+        tx.add_input_from_tx(prev, 0, P2PKH::unlock(key, SignOutputs::All, false))
+            .unwrap();
+        tx.outputs.push(TransactionOutput::new(
+            sats - 10 * (hop as u64 + 1),
+            lock.clone(),
+        ));
+        tx.sign().await.expect("the hop signs");
+        prev = tx;
+    }
+    prev
+}
+
+/// What the door charges LOW's shapes: every one under a QUARTER of the work
+/// budget, and of the memory limb. The two covenant legs are real mainnet
+/// bytes. LOW's JOIN is TWO seats (bsv-low `low-spend/tests/
+/// template_tx_sizes.rs:76`, "the app's JOIN shape: two P2PKH hops"; the
+/// real funding fixture here is one: two P2PKH inputs, the 3,150 byte pot
+/// lock, no change), built here over the real pot lock with each seat's coin
+/// 40 unproven P2PKH hops deep: the deepest unproven ancestry the fleet's
+/// record names (bsv-low `DECISION-LOG-spite-relay-2026-07.md:1327`: a
+/// JOIN-funding hop whose BEEF dragged "its entire ~40-tx" ancestry, before
+/// the harness fetched proofs; an honest seat's chain since is shallower).
+/// The nine-seat JOIN three hops deep is NOT LOW's shape (the delta lens
+/// E585-D12-DELTA-N5): it is kept as a STRESS shape. The 30-hop ancestry is
+/// the one `DoorBudget`'s doc names.
+#[tokio::test]
+async fn door_low_shapes_sit_under_a_quarter_of_the_work_budget() {
+    let engine = engine(None);
+    let quarter = DoorBudget::DEFAULT.max_work_bytes / 4;
+    let mut rows: Vec<(&str, usize, WalkStats)> = Vec::new();
+
+    let settle = real_covenant_leg(
+        ENFORCED_FUNDING_HEX,
+        ENFORCED_FUNDING_TXID,
+        ENFORCED_SETTLE_HEX,
+        ENFORCED_SETTLE_TXID,
+        None,
+    );
+    let refund = real_covenant_leg(
+        REFUND_FUNDING_HEX,
+        REFUND_FUNDING_TXID,
+        REFUND_HEX,
+        REFUND_TXID,
+        None,
+    );
+    for (name, leg) in [
+        ("the covenant settle (CHECKMULTISIG, real)", &settle),
+        ("the covenant refund (real)", &refund),
+    ] {
+        let stats = engine
+            .verify_scripts_only(&leg.beef, &leg.subject_txid)
+            .await
+            .expect("a real covenant leg passes the door");
+        rows.push((name, leg.beef.len(), stats));
+    }
+
+    let key = PrivateKey::from_hex(&"11".repeat(32)).expect("a fixed key");
+    let lock = P2PKH::new().lock(&key.public_key().hash160()).unwrap();
+
+    // LOW's JOIN: two seats, each coin 40 unproven hops deep, paying the
+    // real pot lock and no change.
+    let pot_lock = Transaction::from_hex(ENFORCED_FUNDING_HEX.trim())
+        .expect("the real JOIN")
+        .outputs[0]
+        .locking_script
+        .clone();
+    let mut join = Transaction::new();
+    for seat in 0..2 {
+        let tip = p2pkh_hop_chain(&key, 40, 10_000 + seat).await;
+        join.add_input_from_tx(tip, 0, P2PKH::unlock(&key, SignOutputs::All, false))
+            .unwrap();
+    }
+    join.outputs.push(TransactionOutput::new(19_000, pot_lock));
+    join.sign().await.expect("the JOIN signs");
+    let join_beef = join.to_beef(false).expect("the JOIN's BEEF");
+    let stats = engine
+        .verify_scripts_only(&join_beef, &join.id())
+        .await
+        .expect("LOW's JOIN passes the door");
+    assert_eq!(stats.inputs_executed, 2 + 2 * 40);
+    rows.push((
+        "LOW's JOIN: two seats, 40 hops each (real pot lock)",
+        join_beef.len(),
+        stats,
+    ));
+
+    // A STRESS shape, not LOW's: nine seats' coins, each three hops deep.
+    let mut join = Transaction::new();
+    for seat in 0..9 {
+        // A stake per seat, so the nine ancestries are nine.
+        let tip = p2pkh_hop_chain(&key, 3, 10_000 + seat).await;
+        join.add_input_from_tx(tip, 0, P2PKH::unlock(&key, SignOutputs::All, false))
+            .unwrap();
+    }
+    join.outputs.push(TransactionOutput::new(80_000, lock));
+    join.sign().await.expect("the JOIN signs");
+    let join_beef = join.to_beef(false).expect("the JOIN's BEEF");
+    let stats = engine
+        .verify_scripts_only(&join_beef, &join.id())
+        .await
+        .expect("the JOIN passes the door");
+    assert_eq!(stats.inputs_executed, 9 + 9 * 3);
+    rows.push((
+        "stress: a JOIN of nine seats, three hops each",
+        join_beef.len(),
+        stats,
+    ));
+
+    // A coin 30 unproven hops deep.
+    let tip = p2pkh_hop_chain(&key, 30, 10_000).await;
+    let hops_beef = tip.to_beef(false).expect("the chain's BEEF");
+    let stats = engine
+        .verify_scripts_only(&hops_beef, &tip.id())
+        .await
+        .expect("30 hops pass the door");
+    assert_eq!(stats.inputs_executed, 30);
+    rows.push(("a coin 30 P2PKH hops deep", hops_beef.len(), stats));
+
+    for (name, body, stats) in &rows {
+        println!(
+            "door, LOW shape: {name}: body {body} bytes, {} inputs, {} hash ops, {} signature \
+             checks, work {} = {:.1} % of the budget, memory {} = {:.2} % of the limb",
+            stats.inputs_executed,
+            stats.hash_ops,
+            stats.sig_ops,
+            stats.work_bytes,
+            stats.work_bytes as f64 * 100.0 / DoorBudget::DEFAULT.max_work_bytes as f64,
+            stats.memory_bytes,
+            stats.memory_bytes as f64 * 100.0 / DoorBudget::DEFAULT.max_memory_bytes as f64
+        );
+        assert!(
+            stats.work_bytes < quarter,
+            "{name} is charged {} of a budget of {}",
+            stats.work_bytes,
+            DoorBudget::DEFAULT.max_work_bytes
+        );
+        assert!(
+            stats.memory_bytes < DoorBudget::DEFAULT.max_memory_bytes / 4,
+            "{name} is charged {} of a memory limb of {}",
+            stats.memory_bytes,
+            DoorBudget::DEFAULT.max_memory_bytes
+        );
+    }
+    // The 30 hops and the settle together, the shape the budget was sized for.
+    let together = rows[0].2.work_bytes + rows[4].2.work_bytes;
+    assert!(together < quarter, "{together}");
+}

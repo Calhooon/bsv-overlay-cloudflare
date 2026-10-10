@@ -78,6 +78,21 @@ pub const COUNTER_SUBMIT_SCRIPT_WALK_ANCESTOR_INCONCLUSIVE: &str =
 /// network's; the request proceeds to the network gate. Sustained non-zero on
 /// honest traffic means the budget is too tight for a real shape.
 pub const COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET: &str = "submit_script_walk_over_budget_total";
+/// …whose door walk was not made because it would hold more MEMORY than the
+/// door's budget beside the body (`DoorBudget::max_memory_bytes`, bsv-low
+/// #585: the estimate is made from the frame's lengths and counts before the
+/// stream is opened: a BUMP of tens of thousands of leaves, a hundred
+/// thousand tiny transactions) — the door's verdict, never the network's;
+/// the request proceeds to the network gate.
+pub const COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY: &str = "submit_script_walk_over_memory_total";
+
+/// The counter of a door walk past its own bound, by the limb it passed.
+pub fn script_walk_over_counter(limb: overlay_engine::engine::DoorLimb) -> &'static str {
+    match limb {
+        overlay_engine::engine::DoorLimb::Work => COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET,
+        overlay_engine::engine::DoorLimb::Memory => COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY,
+    }
+}
 /// Non-MINED `/arc-ingest` status callbacks (X-FullStatusUpdates bodies with
 /// no merklePath) acknowledged-and-ignored (#228). A count here is NORMAL
 /// operation, not an error — it proves the webhook stream is alive.
@@ -212,6 +227,32 @@ pub const COUNTER_DEAD_LETTERS_NOT_NOW_DEFERRALS: &str = "dead_letters_not_now_d
 pub const COUNTER_DEAD_LETTERS_STALE_RETURNED: &str = "dead_letters_stale_returned_total";
 /// bsv-low #576 (lens fold, M2): parked or re-driven letters whose bytes later landed (the row is deleted).
 pub const COUNTER_DEAD_LETTERS_RESOLVED: &str = "dead_letters_resolved_total";
+/// bsv-low #585 (door 3): a queued replay's BEEF written to R2 (`BEEF_BLOBS`) because its inline message would pass
+/// the room (`queue::QUEUE_MESSAGE_ROOM`); the write comes before the enqueue.
+pub const COUNTER_BEEF_BLOBS_WRITTEN: &str = "beef_blobs_written_total";
+/// bsv-low #585 (door 3): R2 objects deleted by the deletion rule (the consumer's ack, a LOST or dropped dead
+/// letter, the operator's discard).
+pub const COUNTER_BEEF_BLOBS_DELETED: &str = "beef_blobs_deleted_total";
+/// bsv-low #585 (door 3): a delete of the rule that faulted: the object stays and nothing names it (its key is in
+/// the `[beef-blobs]` log line).
+pub const COUNTER_BEEF_BLOBS_DELETE_FAULTS: &str = "beef_blobs_delete_faults_total";
+/// bsv-low #585 (door 3): a replay whose R2 object was MISSING at the consumer's read (a fault letter).
+pub const COUNTER_BEEF_BLOBS_MISSING: &str = "beef_blobs_missing_total";
+/// bsv-low #585 (the d3 fold): a replay whose R2 object was MISSING and whose subject's applied rows show its
+/// bytes landed (a twin of an acked message): acked as a dupe, no letter.
+pub const COUNTER_QUEUE_R2_TWIN_ACKED: &str = "queue_r2_twin_acked_total";
+/// bsv-low #585 (the d3 fold): a replay whose R2 object was MISSING and whose subject is NOT shown landed: the
+/// replay's fault (a fault letter). `beef_blobs_missing_total` counts every missing read, these two its verdicts
+/// (the rest were acked under an open eviction).
+pub const COUNTER_QUEUE_R2_MISSING_FAULT: &str = "queue_r2_missing_fault_total";
+/// bsv-low #585 (door 3's fold): R2 objects the orphan sweep deleted (past the window, named by no dead letter),
+/// their bytes, and the sweep's reads and deletes that faulted (the object stays for the next round).
+pub const COUNTER_QUEUE_R2_ORPHANS_SWEPT: &str = "queue_r2_orphans_swept_total";
+pub const COUNTER_QUEUE_R2_ORPHANS_SWEPT_BYTES: &str = "queue_r2_orphans_swept_bytes_total";
+pub const COUNTER_QUEUE_R2_ORPHAN_SWEEP_FAULTS: &str = "queue_r2_orphan_sweep_faults_total";
+/// bsv-low #585 (door 3's fold-4, the delta-2 lens's N3): listed objects the sweep could not read (a key or an
+/// `uploaded` date that does not read), skipped and never swept; each pass that meets one counts it again.
+pub const COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE: &str = "queue_r2_orphan_sweep_unreadable_total";
 /// loop 18: an eviction pass that could not prove every table clean (a faulted read, a survivor after the
 /// second move) — the open marker stands; the write-side guard and the next eviction converge.
 pub const COUNTER_ADMIT_FAST_EVICT_INCOMPLETE: &str = "admit_fast_evict_incomplete_total";
@@ -875,6 +916,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_SCRIPT_WALK_INCONCLUSIVE: 0,
         COUNTER_SUBMIT_SCRIPT_WALK_ANCESTOR_INCONCLUSIVE: 0,
         COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET: 0,
+        COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY: 0,
         COUNTER_QUEUE_MUTATION_APPLIED: 0,
         COUNTER_QUEUE_MUTATION_RETRIED: 0,
         // 2026-09-04: the discovery pass — seeded to 0 for the same reason.
@@ -910,6 +952,16 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_DEAD_LETTERS_NOT_NOW_DEFERRALS,
         COUNTER_DEAD_LETTERS_STALE_RETURNED,
         COUNTER_DEAD_LETTERS_RESOLVED,
+        COUNTER_BEEF_BLOBS_WRITTEN,
+        COUNTER_BEEF_BLOBS_DELETED,
+        COUNTER_BEEF_BLOBS_DELETE_FAULTS,
+        COUNTER_BEEF_BLOBS_MISSING,
+        COUNTER_QUEUE_R2_TWIN_ACKED,
+        COUNTER_QUEUE_R2_MISSING_FAULT,
+        COUNTER_QUEUE_R2_ORPHANS_SWEPT,
+        COUNTER_QUEUE_R2_ORPHANS_SWEPT_BYTES,
+        COUNTER_QUEUE_R2_ORPHAN_SWEEP_FAULTS,
+        COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE,
         COUNTER_ARC_INGEST_SEEN_LATCHED,
         COUNTER_ARC_INGEST_EVICTED,
         COUNTER_ARC_INGEST_READMITTED,
@@ -1198,7 +1250,8 @@ pub async fn health_invariants(
     let status = if strict && dead { 503 } else { 200 };
     let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);
     let mut index_janitor = index_janitor_backlog(db).await;
-    let dead_letters = crate::dead_letters::health_json(db).await;
+    let dead_letters = crate::dead_letters::health_json(db, env).await;
+    let queue = crate::beef_blob_sweep::health_json(db, env).await;
     let deferred_graphs = crate::gasp_deferred::health_json(
         db,
         crate::gasp_deferred::graph_budget_limbs_from_env(env),
@@ -1257,6 +1310,9 @@ pub async fn health_invariants(
         // bsv-low #576: the parked dead letters (count by status, the oldest parked, the last re-drive, the letters
         // past the re-drive ceiling); `readable: false` = the table is unreadable, distinct from none.
         "deadLetters": dead_letters,
+        // bsv-low #585 (door 3's fold): the queue's R2 objects at rest as the orphan sweep's listing counted them
+        // (the last complete round and the one in progress) and the sweep's window, bounds and last pass.
+        "queue": queue,
         // bsv-low #555: the GASP graphs deferred past their per-graph budget (count, the oldest, each with its
         // topic, peer, outpoint, nodes, pending, calls, passes, reason, bytes, age); `readable: false` = unreadable.
         "gasp": { "deferredGraphs": deferred_graphs },

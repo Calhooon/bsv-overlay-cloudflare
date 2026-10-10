@@ -70,7 +70,15 @@ impl OutputRow {
                 .consumed_by
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default(),
-            beef: self.beef.and_then(|h| hex::decode(h).ok()),
+            // The stored BEEF by the one reader (`d1::beef_of_hex_column`). An
+            // EMPTY read-back (`hex(NULL)` is '' under the LEFT JOIN when the
+            // output's `transactions` row is gone, or an `X''` BLOB) stays an
+            // empty BEEF here, as it always was: the engine's callers judge it
+            // (the lookup skips it, the GASP and history reads refuse it in
+            // their own words). Only text `hex()` never emits reads differently.
+            beef: self
+                .beef
+                .map(|h| crate::d1::beef_of_hex_column(Some(h)).unwrap_or_default()),
             block_height: self.block_height.map(|h| h as u32),
             score: self.score,
         }
@@ -320,14 +328,11 @@ impl D1Storage {
         Ok(rows
             .into_iter()
             .filter_map(|r| {
-                r.beef
-                    .and_then(|h| hex::decode(h).ok())
-                    .filter(|b| !b.is_empty())
-                    .map(|beef| RebroadcastCandidate {
-                        tx: TransactionBeef { txid: r.txid, beef },
-                        attempts: r.attempts.unwrap_or(0.0) as i64,
-                        last_ms: r.last_ms.unwrap_or(0.0) as i64,
-                    })
+                crate::d1::beef_of_hex_column(r.beef).map(|beef| RebroadcastCandidate {
+                    tx: TransactionBeef { txid: r.txid, beef },
+                    attempts: r.attempts.unwrap_or(0.0) as i64,
+                    last_ms: r.last_ms.unwrap_or(0.0) as i64,
+                })
             })
             .collect())
     }
@@ -958,30 +963,75 @@ impl Storage for D1Storage {
         }
         let json = serde_json::to_string(record)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        let saved: Option<Saved> = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_UPSERT_SQL)
-            .bind(record.peer.as_str())
-            .bind(record.topic.as_str())
-            .bind(record.outpoint.as_str())
-            .bind(record.score as f64)
-            .bind(record.nodes.len() as f64)
-            .bind(record.pending.len() as f64)
-            .bind(record.calls as f64)
-            .bind(f64::from(record.passes))
-            .bind(record.reason.as_str())
-            .bind(json.len() as f64)
-            .bind(json.as_str())
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS)
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_TOTAL_BYTES as f64)
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS_PER_HOST)
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_BYTES_PER_HOST as f64)
-            .bind(overlay_engine::gasp::peer_origin(&record.peer).as_str())
-            .bind(record.configured)
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS)
-            .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES as f64)
-            .fetch_optional(&self.db)
-            .await
-            .map_err(d1_err)?;
-        Ok(match saved {
+        // bsv-low #585: a record of any size. Past one row's room its further
+        // parts go first, under a new generation; the head row (the ceiling
+        // is read there) then names it, and the generation it replaced goes
+        // last. A refusal or a fault leaves the held record whole.
+        let plan = crate::gasp_deferred::chunk_plan(
+            &json,
+            crate::gasp_deferred::DEFERRED_GRAPH_CHUNK_BYTES,
+        );
+        let key = |sql: &'static str| {
+            Query::new(sql)
+                .bind(record.peer.as_str())
+                .bind(record.topic.as_str())
+                .bind(record.outpoint.as_str())
+                .bind(plan.gen.as_str())
+        };
+        let mut head: Result<Option<Saved>, String> = Ok(None);
+        for (i, part) in plan.rest.iter().enumerate() {
+            if let Err(e) = key(crate::gasp_deferred::DEFERRED_GRAPH_CHUNK_PUT_SQL)
+                .bind((i + 1) as f64)
+                .bind(*part)
+                .execute(&self.db)
+                .await
+            {
+                head = Err(e);
+                break;
+            }
+        }
+        if head.is_ok() {
+            head = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_UPSERT_SQL)
+                .bind(record.peer.as_str())
+                .bind(record.topic.as_str())
+                .bind(record.outpoint.as_str())
+                .bind(record.score as f64)
+                .bind(record.nodes.len() as f64)
+                .bind(record.pending.len() as f64)
+                .bind(record.calls as f64)
+                .bind(f64::from(record.passes))
+                .bind(record.reason.as_str())
+                .bind(json.len() as f64)
+                .bind(plan.head)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_TOTAL_BYTES as f64)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS_PER_HOST)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_BYTES_PER_HOST as f64)
+                .bind(overlay_engine::gasp::peer_origin(&record.peer).as_str())
+                .bind(record.configured)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_ROWS)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES as f64)
+                .bind(plan.rest.len() as f64)
+                .bind(plan.gen.as_str())
+                .fetch_optional(&self.db)
+                .await;
+        }
+        // The parts of the generation the head does not name: the replaced
+        // one's after a save, this save's own after a refusal or a fault
+        // (best effort: a part left behind is the cron's to sweep).
+        let tidy = match head {
+            Ok(Some(_)) => crate::gasp_deferred::DEFERRED_GRAPH_CHUNKS_KEEP_SQL,
+            _ => crate::gasp_deferred::DEFERRED_GRAPH_CHUNKS_UNDO_SQL,
+        };
+        if matches!(head, Ok(Some(_))) || !plan.rest.is_empty() {
+            if let Err(e) = key(tidy).execute(&self.db).await {
+                worker::console_log!(
+                    "GASP deferred graph {}: parts of another generation not deleted: {e}",
+                    record.outpoint
+                );
+            }
+        }
+        Ok(match head.map_err(d1_err)? {
             Some(_) => overlay_engine::gasp::DeferredGraphSave::Saved,
             None => overlay_engine::gasp::DeferredGraphSave::AtCeiling,
         })
@@ -1018,21 +1068,22 @@ impl Storage for D1Storage {
         topic: &str,
         outpoint: &str,
     ) -> Result<Option<overlay_engine::gasp::DeferredGraph>, StorageError> {
-        #[derive(Deserialize)]
-        struct RecordRow {
-            record: String,
+        use crate::gasp_deferred::{read_deferred_graph, DeferredRead};
+        match read_deferred_graph(&D1DeferredRows(&self.db), host, topic, outpoint).await? {
+            DeferredRead::Absent => Ok(None),
+            DeferredRead::Record(record) => Ok(Some(record)),
+            DeferredRead::PartMissing { seq, gen } => {
+                // A part is gone (the table is transient): the record cannot
+                // be resumed and would fault every pass, so it goes, and the
+                // walk starts from its root as after any lost row.
+                worker::console_log!(
+                    "GASP deferred graph {outpoint} of {host} for {topic}: part {seq} of generation {gen} is missing, the record is dropped (bsv-low #585)"
+                );
+                self.delete_deferred_graph(host, topic, outpoint).await?;
+                Ok(None)
+            }
+            DeferredRead::Unparsed(e) => Err(StorageError::Serialization(e)),
         }
-        let row: Option<RecordRow> = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_GET_SQL)
-            .bind(host)
-            .bind(topic)
-            .bind(outpoint)
-            .fetch_optional(&self.db)
-            .await
-            .map_err(d1_err)?;
-        row.map(|r| {
-            serde_json::from_str(&r.record).map_err(|e| StorageError::Serialization(e.to_string()))
-        })
-        .transpose()
     }
 
     async fn delete_deferred_graph(
@@ -1042,6 +1093,15 @@ impl Storage for D1Storage {
         outpoint: &str,
     ) -> Result<(), StorageError> {
         Query::new(crate::gasp_deferred::DEFERRED_GRAPH_DELETE_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(outpoint)
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)?;
+        // After the head: a part with no head is the cron's to sweep, a head
+        // with no part would be a torn record.
+        Query::new(crate::gasp_deferred::DEFERRED_GRAPH_CHUNKS_DELETE_SQL)
             .bind(host)
             .bind(topic)
             .bind(outpoint)
@@ -1087,12 +1147,57 @@ impl Storage for D1Storage {
         Ok(rows
             .into_iter()
             .filter_map(|r| {
-                r.beef
-                    .and_then(|h| hex::decode(h).ok())
-                    .filter(|b| !b.is_empty())
+                crate::d1::beef_of_hex_column(r.beef)
                     .map(|beef| TransactionBeef { txid: r.txid, beef })
             })
             .collect())
+    }
+}
+
+/// The worker's [`crate::gasp_deferred::DeferredRows`]: D1, by the shipped
+/// statements.
+struct D1DeferredRows<'a>(&'a D1Database);
+
+impl crate::gasp_deferred::DeferredRows for D1DeferredRows<'_> {
+    type Fault = StorageError;
+
+    async fn head(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+    ) -> Result<Option<crate::gasp_deferred::DeferredHead>, StorageError> {
+        Query::new(crate::gasp_deferred::DEFERRED_GRAPH_GET_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(outpoint)
+            .fetch_optional(self.0)
+            .await
+            .map_err(d1_err)
+    }
+
+    async fn part(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoint: &str,
+        gen: &str,
+        seq: u64,
+    ) -> Result<Option<String>, StorageError> {
+        #[derive(Deserialize)]
+        struct PartRow {
+            part: String,
+        }
+        let part: Option<PartRow> = Query::new(crate::gasp_deferred::DEFERRED_GRAPH_CHUNK_GET_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(outpoint)
+            .bind(gen)
+            .bind(seq as f64)
+            .fetch_optional(self.0)
+            .await
+            .map_err(d1_err)?;
+        Ok(part.map(|p| p.part))
     }
 }
 
@@ -1745,6 +1850,34 @@ mod tests {
         assert_eq!(output.satoshis, 0);
         assert!(output.block_height.is_none());
         assert_eq!(output.beef.unwrap(), vec![0xBE, 0xEF]);
+    }
+
+    /// E585-LAND-DELTA-L1: routed through `d1::beef_of_hex_column`, the
+    /// read-back answers as before: '' (`hex(NULL)` under the LEFT JOIN, or
+    /// an `X''` BLOB) is an EMPTY BEEF, NULL none, hex in either case bytes.
+    #[test]
+    fn output_row_beef_read_back_keeps_its_answers() {
+        let read = |beef: Option<&str>| {
+            OutputRow {
+                txid: "abc".into(),
+                output_index: 0.0,
+                output_script: None,
+                topic: "t".into(),
+                satoshis: None,
+                outputs_consumed: None,
+                consumed_by: None,
+                spent: None,
+                block_height: None,
+                score: None,
+                beef: beef.map(String::from),
+            }
+            .into_output()
+            .beef
+        };
+        assert_eq!(read(Some("")), Some(vec![]));
+        assert_eq!(read(None), None);
+        assert_eq!(read(Some("BEEF")), Some(vec![0xBE, 0xEF]));
+        assert_eq!(read(Some("beef")), Some(vec![0xBE, 0xEF]));
     }
 
     #[test]

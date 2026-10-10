@@ -82,6 +82,17 @@ ENABLE_EXTENSIONS = "true"
 #   Required by CloudflareAdvertiser to sign SHIP/SLAP PushDrop tokens.
 #   Same key that identifies this overlay to peers on BRC-103 auth calls.
 
+# bsv-low #585 (door 3): the BEEF of a queued replay whose message would pass
+# the queue's inline room (queue.rs, QUEUE_MESSAGE_ROOM) is written here FIRST
+# and the message carries its key; the consumer and the dead letters read it
+# back. An object is deleted by the worker (the consumer's ack, a LOST dead
+# letter, the operator's discard): give the bucket NO expiry (lifecycle) rule,
+# a parked letter's bytes live here until its re-drive lands or it is discarded.
+# Create the bucket before deploying: `wrangler r2 bucket create overlay-beefs`.
+[[r2_buckets]]
+binding = "BEEF_BLOBS"
+bucket_name = "overlay-beefs"
+
 [[queues.producers]]
 queue = "overlay-mutations"
 binding = "MUTATION_QUEUE"

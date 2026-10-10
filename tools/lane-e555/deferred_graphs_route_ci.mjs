@@ -72,8 +72,9 @@ expect(block0?.readable === true, 'gasp.deferredGraphs is served (the table exis
 expect(block0?.count === 0 && block0?.oldest === null, 'no deferred graph yet', JSON.stringify(block0))
 expect(
   block0?.budget?.calls === 100 && block0?.budget?.ms === 15000 && block0?.budget?.maxPasses === 60 &&
-    block0?.budget?.maxBytes === 1048576 && block0?.budget?.perPeerTopic === 16,
-  'the budget the worker runs under: 100 calls, 15 s, 60 passes, 1 MiB, 16 per peer and topic',
+    block0?.budget?.maxBytes === undefined && block0?.budget?.chunkBytes === 1048576 &&
+    block0?.budget?.perPeerTopic === 16,
+  'the budget the worker runs under: 100 calls, 15 s, 60 passes, no record cap (1 MiB a row, #585), 16 per peer and topic',
   JSON.stringify(block0?.budget),
 )
 expect(
@@ -91,7 +92,7 @@ const yieldless = d1(`SELECT COUNT(*) AS n FROM pragma_table_info('gasp_peer_hea
 expect(yieldless[0]?.n === 1, 'gasp_peer_health.yieldless_syncs exists (migration 171)', JSON.stringify(yieldless))
 const names = [
   'gasp_graph_deferred_total', 'gasp_graph_resumed_total', 'gasp_graph_converged_total', 'gasp_graph_dropped_total',
-  ...['max_passes', 'too_big', 'too_many', 'store_fault', 'not_served', 'held', 'not_held', 'root_proven', 'refused',
+  ...['max_passes', 'too_many', 'store_fault', 'not_served', 'held', 'not_held', 'root_proven', 'refused',
     'no_progress', 'idle_faults', 'stale']
     .map((r) => `gasp_graph_dropped_${r}_total`),
 ]
@@ -127,7 +128,7 @@ const T = 'tm_e555d2'
 // Bounds: 4 rows, 2 discovered, 1 per discovered origin; bytes far above.
 const save = (host, origin, outpoint, configured) =>
   d1(bound(UPSERT, [host, T, outpoint, 1, 1, 1, 1, 1, 'calls', 10, '{}', 4, 1e9, 1, 1e9, origin, configured ? 1 : 0, 2,
-    1e9])).length === 1
+    1e9, 0, ''])).length === 1
 d1(`DELETE FROM gasp_deferred_graphs WHERE topic = '${T}'`)
 const saves = [
   save('https://evil.example/?1', 'evil.example', 'q1.0', false),
