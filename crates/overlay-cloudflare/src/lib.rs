@@ -2281,7 +2281,8 @@ async fn queue_handler(
 
         // NL-6c: a deferred EF job carries its reference, never bytes; its run
         // settles its own row (the arm's answer, or queued again for the cron),
-        // so the message is acked whatever the run did.
+        // so the message is acked once the run returns. A run that kills the
+        // isolate never reaches the ack: the bound is `ef_deferred::run_job`'s doc (N4).
         if let Some(reference) = body.ef_job.as_deref() {
             crate::ef_deferred::run_job(&env, &ctx, &engine, reference).await;
             msg.ack();

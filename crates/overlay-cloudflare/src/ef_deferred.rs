@@ -738,9 +738,24 @@ async fn settle_job(db: &D1Database, reference: &str, state: &str, status: u16, 
     }
 }
 
-/// The consumer's run of one deferred job. Never asks the platform to retry:
-/// the job's own row carries its attempts, and the cron hands a job that did
-/// not settle back to the queue ([`redrive`]).
+/// The consumer's run of one deferred job. The job's own row carries its
+/// attempts, and the cron hands a job that did not settle back to the queue
+/// ([`redrive`]); the consumer acks the message once this returns, whatever
+/// the run did.
+///
+/// **The bound when a run never returns** (N4, LOW's E585 land2 lens,
+/// `docs/audit/E585-land2-lens-2026-10-10.md`). A run that kills the isolate
+/// (the very work deferred: its memory, its CPU) never reaches the ack, so
+/// the platform redelivers the message (the mutation queue's `max_retries` =
+/// 3, no `retry_delay`, `wrangler.toml`). A redelivery that finds the row
+/// `running` and touched less than [`JOB_RESUME_AFTER_MS`] ago takes nothing
+/// and is acked (the live-run guard below). A redelivery later than that
+/// (the platform's delay is its own) is a [`JOB_TAKE_SQL`], one of the
+/// [`JOB_ATTEMPTS`]; after `max_retries` the message dead-letters and the
+/// dead letter consumer parks it as an `unparsed:` fault letter (its body
+/// carries no BEEF and no `r2`), counted against the ceiling's 2,000 rows.
+/// The job is not lost: its row and bytes stay, the cron hands it back while
+/// it is open, and a re-drive of the letter takes the `ef_job` branch again.
 pub async fn run_job(
     env: &Env,
     ctx: &Context,

@@ -3138,8 +3138,8 @@ mod tests {
             body.matches("msg.ack();").count(),
             5,
             "the only acks: the eviction skip, the re-eviction, the durable ack, the twin (bsv-low #585 door 3), and a \
-             deferred EF job's (NL-6c: its own row carries its runs and the cron hands it back, so it never rides \
-             the platform's retries or the dead letters)"
+             deferred EF job's once `run_job` returns (NL-6c; a run that kills the isolate never reaches it, and the \
+             bound then, redeliveries, takes and an `unparsed:` letter, is `ef_deferred::run_job`'s doc, N4)"
         );
     }
 
