@@ -2717,6 +2717,14 @@ impl Engine {
                 by_txid.insert(btx.txid(), tx);
             }
         }
+        // Each BUMP's level 0 indexed once (the first BUMP that carries a
+        // txid, as `Beef::find_bump` picks), and each BUMP's root computed
+        // and asked of the tracker once (NL-6e). Per proven transaction, as
+        // until NL-6e, a BUMP of n leaves spent by n proven transactions was
+        // walked n times. The door (`parse_beef`) has climbed every hashed
+        // leaf of each BUMP to one root, so the root from any of them is it.
+        let proven_in = proven_index(&beef);
+        let mut checked: HashSet<usize> = HashSet::new();
         // A structural fault: the reference walk's `SpvError`; the door's
         // `ScriptWalkInconclusive` naming the transaction and whether the
         // subject had already been judged.
@@ -2757,7 +2765,7 @@ impl Engine {
                     format!("transaction {txid} is not in the BEEF"),
                 ));
             };
-            if let Some(mp) = beef.find_bump(&txid) {
+            if let Some(&at) = proven_in.get(txid.as_str()) {
                 if roots == RootPolicy::AcceptUnchecked {
                     // 'scripts only': a proven transaction is trusted as-is —
                     // no root computed, no tracker asked (the reference adds it
@@ -2765,6 +2773,10 @@ impl Engine {
                     // network's acceptance, never this proof.
                     continue;
                 }
+                if checked.contains(&at) {
+                    continue; // its BUMP's root is the chain's, asked once
+                }
+                let mp = &beef.bumps[at];
                 let root = mp
                     .compute_root(Some(&txid))
                     .map_err(|e| spv(format!("invalid merkle path for transaction {txid}: {e}")))?;
@@ -2788,6 +2800,7 @@ impl Engine {
                         }
                     }
                 }
+                checked.insert(at);
                 continue; // proven: trusted, no ancestry needed (the reference stops here too)
             }
 
@@ -3017,10 +3030,19 @@ impl Engine {
         Ok(stats)
     }
 
-    /// The pre-2026-09-08 SPV block, kept verbatim as the
+    /// The pre-2026-09-08 SPV block, kept as the
     /// [`Engine::set_script_verification`] `false` escape hatch: BEEF
     /// structural validity plus every root against the chain tracker, and
     /// NOTHING when no tracker is configured. It never executes a script.
+    ///
+    /// The structure is the streaming reader's
+    /// ([`beef_limits::structure_roots`], bsv-rs 0.4.2): one element in hand,
+    /// each BUMP walked once, linear in its leaves (NL-6e). Until NL-6e it
+    /// was `Beef::verify_valid`, whose root check at bsv-rs 0.4.0 walked a
+    /// BUMP once per leaf: one BUMP of 8,192 leaves gave no answer in 120 s
+    /// (bsv-stack-lean NL-8 W1). The reader reads the wire's order, where
+    /// `verify_valid` sorted first: an input that names a later transaction
+    /// is refused here.
     async fn verify_spv_structurally(
         chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
         beef_bytes: &[u8],
@@ -3028,16 +3050,19 @@ impl Engine {
         let Some(chain_tracker) = chain_tracker else {
             return Ok(());
         };
-        let mut beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
-            .map_err(|e| EngineError::SpvError(format!("BEEF parse error: {e}")))?;
-        let validation = beef.verify_valid(false);
-        if !validation.valid {
-            return Err(EngineError::SpvError(
-                "BEEF internal proof validation failed".into(),
-            ));
-        }
-        for (height, root) in &validation.roots {
-            match chain_tracker.is_valid_root_for_height(root, *height).await {
+        let roots = beef_limits::structure_roots(beef_bytes)
+            .map_err(|r| EngineError::SpvError(format!("BEEF structure refused: {r}")))?;
+        let mut asked: HashSet<(u64, &str)> = HashSet::new();
+        for (height, root) in &roots {
+            if !asked.insert((*height, root.as_str())) {
+                continue;
+            }
+            let Ok(height) = u32::try_from(*height) else {
+                return Err(EngineError::SpvError(format!(
+                    "Merkle root {root} invalid for block height {height}"
+                )));
+            };
+            match chain_tracker.is_valid_root_for_height(root, height).await {
                 Ok(true) => {}
                 Ok(false) => {
                     return Err(EngineError::SpvError(format!(
@@ -5419,6 +5444,21 @@ async fn verify_spv_trusting(
     }
 }
 
+/// The BUMP that proves each txid of `beef`: the first BUMP whose level 0
+/// carries it, as `Beef::find_bump` picks, built in one pass over the BUMPs'
+/// leaves (NL-6e; `find_bump` per transaction scans them all each time).
+fn proven_index(beef: &Beef) -> HashMap<&str, usize> {
+    let mut proven: HashMap<&str, usize> = HashMap::new();
+    for (at, bump) in beef.bumps.iter().enumerate() {
+        for leaf in bump.path.first().into_iter().flatten() {
+            if let Some(hash) = leaf.hash.as_deref() {
+                proven.entry(hash).or_insert(at);
+            }
+        }
+    }
+    proven
+}
+
 /// The transactions the SPV walk of `from` passes over in `beef`
 /// ([`Engine::verify_beef_linear_with`]'s traversal, nothing checked): `from`
 /// and every source the BEEF carries, a proven transaction included and not
@@ -5429,10 +5469,11 @@ fn walk_cover(beef: &Beef, from: &str) -> HashSet<String> {
         .iter()
         .filter_map(|btx| btx.tx().map(|tx| (btx.txid(), tx)))
         .collect();
+    let proven = proven_index(beef);
     let mut cover = HashSet::new();
     let mut queue = vec![from.to_string()];
     while let Some(txid) = queue.pop() {
-        if !cover.insert(txid.clone()) || beef.find_bump(&txid).is_some() {
+        if !cover.insert(txid.clone()) || proven.contains_key(txid.as_str()) {
             continue;
         }
         if let Some(tx) = bodies.get(&txid) {
@@ -9747,5 +9788,162 @@ mod tests {
             vec!["tm_test".to_string()],
             "a real admission still dedups"
         );
+    }
+
+    // ── NL-6e: the SPV walk is linear in a BUMP's leaves (NL-8 W1) ─────
+
+    /// Named and generous (a debug build on a loaded machine): the walk at
+    /// bsv-rs 0.4.0 took 30 to 36 s at 4,096 leaves in release and gave no
+    /// answer in 120 s at 8,192 (NL-8 W1).
+    const WIDE_BUMP_WALK_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The wide BUMP's height (NL-8's `wide k` row).
+    const WIDE_HEIGHT: u32 = 800_001;
+
+    /// `2^k` txids, display hex: the double SHA-256 of `i` (NL-8's probe).
+    fn wide_leaves(k: u32) -> Vec<String> {
+        (0..1u32 << k)
+            .map(|i| {
+                let mut id = bsv_rs::primitives::sha256d(&i.to_le_bytes()).to_vec();
+                id.reverse();
+                hex::encode(id)
+            })
+            .collect()
+    }
+
+    /// One BUMP at [`WIDE_HEIGHT`] whose level 0 carries `txids` as hashed
+    /// leaves and whose `k - 1` upper levels are empty: every node above
+    /// level 0 is computed from it. Its root, by one walk.
+    fn wide_bump(txids: &[String]) -> (bsv_rs::transaction::MerklePath, String) {
+        let k = txids.len().trailing_zeros() as usize;
+        let mut levels = vec![Vec::new(); k];
+        levels[0] = txids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| bsv_rs::transaction::MerklePathLeaf::new_txid(i as u64, id.clone()))
+            .collect();
+        let bump = bsv_rs::transaction::MerklePath::new(WIDE_HEIGHT, levels).unwrap();
+        let root = bump.compute_root(None).unwrap();
+        (bump, root)
+    }
+
+    /// NL-8 W1's bytes: a V1 BEEF of the one wide BUMP and no transaction
+    /// (`wide_14` at `2^k` leaves, byte for byte the runner's probe).
+    fn w1_bytes(k: u32) -> (Vec<u8>, String) {
+        let (bump, root) = wide_bump(&wide_leaves(k));
+        let mut beef = vec![0x01, 0x00, 0xbe, 0xef, 0x01];
+        beef.extend_from_slice(&bump.to_binary());
+        beef.push(0x00);
+        (beef, root)
+    }
+
+    /// The entry, [`verify_spv_like_the_reference`], on its own thread under
+    /// a tracker that carries `root` at [`WIDE_HEIGHT`]: its answer and its
+    /// time, or a panic naming the bound.
+    fn walk_within_bound(
+        bytes: Vec<u8>,
+        root: String,
+        verify_scripts: bool,
+        subject: String,
+        what: &str,
+    ) -> (Result<(), String>, std::time::Duration) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut tracker = bsv_rs::transaction::MockChainTracker::new(WIDE_HEIGHT + 10);
+            tracker.add_root(WIDE_HEIGHT, root);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let started = std::time::Instant::now();
+            let verdict = runtime.block_on(verify_spv_like_the_reference(
+                Some(&tracker),
+                verify_scripts,
+                &bytes,
+                &subject,
+            ));
+            let _ = tx.send((verdict.map_err(|e| e.to_string()), started.elapsed()));
+        });
+        rx.recv_timeout(WIDE_BUMP_WALK_BOUND).unwrap_or_else(|_| {
+            panic!("{what}: no answer from the walk within {WIDE_BUMP_WALK_BOUND:?}")
+        })
+    }
+
+    /// The escape hatch's structural walk (`verify_scripts` false) on NL-8
+    /// W1's bytes, 4,096 and 8,192 leaves: accepted, the one root asked of
+    /// the tracker, well inside the bound.
+    #[test]
+    fn nl6e_the_structural_walk_is_linear_in_a_bump_s_leaves() {
+        for k in [12u32, 13] {
+            let (bytes, root) = w1_bytes(k);
+            let what = format!("2^{k} leaves, {} bytes, structural", bytes.len());
+            let (verdict, took) = walk_within_bound(bytes, root, false, String::new(), &what);
+            println!(
+                "NL-6e W1 {what}: {verdict:?} in {:.3} s",
+                took.as_secs_f64()
+            );
+            assert_eq!(verdict, Ok(()), "{what}");
+        }
+    }
+
+    /// The default walk (scripts run, `verify_scripts` true) over `2^k`
+    /// proven parents in the one wide BUMP, each spent by a binary tree of
+    /// two-input transactions whose root is the subject: every parent's
+    /// root is the BUMP's, asked of the tracker, the inputs `2^(k+1) - 2`.
+    fn proven_fan_in(k: u32) -> (Vec<u8>, String, String) {
+        use bsv_rs::script::{LockingScript, UnlockingScript};
+        use bsv_rs::transaction::{TransactionInput, TransactionOutput};
+        let op_true = || LockingScript::from_binary(&[0x51]).unwrap();
+        let spending = |txid: &str| {
+            let mut input = TransactionInput::new(txid.to_string(), 0);
+            input.unlocking_script = Some(UnlockingScript::from_binary(&[]).unwrap());
+            input
+        };
+        let parents: Vec<Transaction> = (0..1u32 << k)
+            .map(|i| {
+                let mut tx = Transaction::new();
+                // A coinbase's null outpoint, a distinct index each.
+                let mut input = TransactionInput::new("00".repeat(32), u32::MAX - i);
+                input.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
+                tx.inputs.push(input);
+                tx.outputs.push(TransactionOutput::new(1, op_true()));
+                tx
+            })
+            .collect();
+        let ids: Vec<String> = parents.iter().map(Transaction::id).collect();
+        let (bump, root) = wide_bump(&ids);
+        let mut beef = Beef::new();
+        let at = beef.merge_bump(bump);
+        for parent in &parents {
+            beef.merge_raw_tx(parent.to_binary(), Some(at));
+        }
+        let mut layer = ids;
+        while layer.len() > 1 {
+            layer = layer
+                .chunks(2)
+                .map(|pair| {
+                    let mut tx = Transaction::new();
+                    tx.inputs.push(spending(&pair[0]));
+                    tx.inputs.push(spending(&pair[1]));
+                    tx.outputs.push(TransactionOutput::new(0, op_true()));
+                    beef.merge_raw_tx(tx.to_binary(), None);
+                    tx.id()
+                })
+                .collect();
+        }
+        (beef.to_binary(), root, layer.remove(0))
+    }
+
+    #[test]
+    fn nl6e_the_script_walk_is_linear_in_a_bump_s_leaves() {
+        for k in [12u32, 13] {
+            let (bytes, root, subject) = proven_fan_in(k);
+            let what = format!("2^{k} proven parents, {} bytes, scripts", bytes.len());
+            let (verdict, took) = walk_within_bound(bytes, root, true, subject, &what);
+            println!(
+                "NL-6e fan-in {what}: {verdict:?} in {:.3} s",
+                took.as_secs_f64()
+            );
+            assert_eq!(verdict, Ok(()), "{what}");
+        }
     }
 }
