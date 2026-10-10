@@ -269,6 +269,15 @@ const PREDECESSOR_READS_PER_SUBMIT: usize = 256;
 /// topic of a carried predecessor's own submit ([`Engine::submit_counted`]).
 type Counted = (Steak, MutationReport, HashMap<String, String>);
 
+/// What the landings of carried predecessors take from their successor's
+/// submit (the E592 lens fold, M1): its breach policy, and whether its own
+/// walk RAN (only then are the bodies it reached trusted).
+#[derive(Debug, Clone, Copy)]
+struct Landing {
+    policy: WalkBreachPolicy,
+    subject_walk_ran: bool,
+}
+
 struct NotNow {
     why: String,
     carried: Option<String>,
@@ -456,10 +465,18 @@ pub struct MutationReport {
     /// worker's eviction ledger, bsv-low #513) guards these too.
     pub landed_predecessors: Vec<(String, String)>,
     /// The submit's own script walk could not run within the engine's
-    /// budget (bsv-low #592): the submit went on as under
-    /// `HistoricalTxNoSpv`. `None` when it ran (or the mode does not walk).
-    /// A caller counts it; it never makes a report undurable.
+    /// budget (bsv-low #592) and the submit went on as under
+    /// `HistoricalTxNoSpv` ([`WalkBreachPolicy::NetworkAccepted`] only; under
+    /// `NotNow` a breach is [`EngineError::WalkCouldNotRun`]). `None` when it
+    /// ran (or the mode does not walk). A caller counts it; it never makes a
+    /// report undurable.
     pub walk_could_not_run: Option<WalkCouldNotRun>,
+    /// The walks of the carried predecessors this submit tried to land
+    /// ([`Engine::land_carried`]) that could not run within the budget (the
+    /// E592 lens fold, L3): under `NotNow` each one's landing did not happen
+    /// (the successor waits), under `NetworkAccepted` each went on. Counted
+    /// by the caller beside `walk_could_not_run`.
+    pub landed_walks_could_not_run: Vec<WalkCouldNotRun>,
 }
 
 /// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): what [`Engine::renotify_admitted`] did.
@@ -709,13 +726,41 @@ impl WalkLimb {
     }
 }
 
+/// What a submit does when its own script walk could not run within the
+/// engine's [`DoorBudget`] (bsv-low #592; the E592 lens fold, H1, the owner's
+/// ruling 3a read with the lens): a breach is NEVER an admission without the
+/// network's word on record.
+///
+/// The work limb is a static estimate from the bytes, and a LOCK can be made
+/// to pass it cheaply (a bare `OP_CHECKMULTISIG` in a fabricated parent's
+/// lock is charged 3,971 keys). So a breach says nothing about whether the
+/// spend is valid, and on a path where nothing else judges it an admission
+/// would admit a spend nobody checked: the lens's forged spend of a held coin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalkBreachPolicy {
+    /// "Not now" ([`EngineError::WalkCouldNotRun`]): nothing judged, nothing
+    /// written, never a final refusal. Every door but one: the ungated
+    /// modes, `/admin/readmit`, the peer crawler, a library consumer's
+    /// submit; the GASP anchor HOLDS its UTXO the same way.
+    #[default]
+    NotNow,
+    /// The network's ACCEPT of these bytes is on record (the queue's replay
+    /// of a gated submission, whose producer broadcast them and marked the
+    /// message): the submit goes on exactly as under `HistoricalTxNoSpv`,
+    /// reported on [`MutationReport::walk_could_not_run`]. The roots the walk
+    /// reached are still checked, and a bad one is still the `SpvError` it is.
+    NetworkAccepted,
+}
+
 /// A submit whose own script walk COULD NOT RUN within the engine's
 /// [`DoorBudget`] (bsv-low #592, the owner's ruling 3a of 2026-10-10). Shaped
-/// like [`EngineError::ScriptWalkOverBudget`], and NOT an error: the submit
-/// went on as under `HistoricalTxNoSpv` (the topic managers judged it, the
-/// network judges its validity), and this says so on its
-/// [`MutationReport`]. The reference (`Engine.submit`, `tx.verify`) has no
-/// budget; this is the platform's addition, on the door's lineage (D8).
+/// like [`EngineError::ScriptWalkOverBudget`]. Under
+/// [`WalkBreachPolicy::NotNow`] it is carried by
+/// [`EngineError::WalkCouldNotRun`] (not now); under
+/// [`WalkBreachPolicy::NetworkAccepted`] the submit went on as under
+/// `HistoricalTxNoSpv` and this says so on its [`MutationReport`]. The
+/// reference (`Engine.submit`, `tx.verify`) has no budget; this is the
+/// platform's addition, on the door's lineage (D8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkCouldNotRun {
     /// The submitted transaction.
@@ -1216,7 +1261,9 @@ impl Engine {
     /// is an explicit ask) and of [`Engine::submit`]'s mode (`HistoricalTxNoSpv`
     /// still skips, as the reference does).
     ///
-    /// Runs under [`DoorBudget::DEFAULT`]: the work is bounded statically
+    /// Runs under the engine's budget ([`Engine::set_walk_budget`], the
+    /// submit's own; [`DoorBudget::DEFAULT`] unless set: one budget per
+    /// engine, the E592 lens fold's NOTE-2): the work is bounded statically
     /// before anything executes, and the interpreter's stack memory limit is
     /// the budget's element limit. The body is read through the streaming
     /// reader ([`crate::script_door`], bsv-low #585): no bound on its size,
@@ -1232,15 +1279,14 @@ impl Engine {
     /// a stronger bar behind it does not refuse on either.
     #[allow(
         clippy::unused_async,
-        clippy::unused_self,
-        reason = "the door's callers await it on an engine; 'scripts only' asks no tracker and reads no state"
+        reason = "the door's callers await it on an engine; 'scripts only' asks no tracker"
     )]
     pub async fn verify_scripts_only(
         &self,
         beef_bytes: &[u8],
         subject_txid: &str,
     ) -> Result<WalkStats, EngineError> {
-        crate::script_door::walk(beef_bytes, subject_txid, DoorBudget::DEFAULT)
+        crate::script_door::walk(beef_bytes, subject_txid, self.walk_budget)
     }
 
     /// [`Engine::verify_scripts_only`] under a budget the caller names (the
@@ -1291,6 +1337,7 @@ impl Engine {
                 &TopicAdmittanceContext::DRY_RUN,
                 None,
                 None,
+                WalkBreachPolicy::NotNow,
             )
             .await?;
         Ok(steak)
@@ -1362,12 +1409,34 @@ impl Engine {
     /// judged without the coin an unlanded predecessor has yet to leave is
     /// reported as a fault (`predecessor_not_landed`), not recorded as
     /// applied.
+    ///
+    /// A walk that could not run within the engine's budget is "not now"
+    /// here ([`WalkBreachPolicy::NotNow`], [`EngineError::WalkCouldNotRun`]):
+    /// never an admission. [`Engine::submit_with_report_under`] names the
+    /// policy.
     pub async fn submit_with_report(
         &self,
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
     ) -> Result<(Steak, MutationReport), EngineError> {
-        self.submit_bounded(tagged_beef, mode, None, false).await
+        self.submit_with_report_under(tagged_beef, mode, WalkBreachPolicy::NotNow)
+            .await
+    }
+
+    /// [`Engine::submit_with_report`] under an explicit
+    /// [`WalkBreachPolicy`] (the E592 lens fold, H1): what a walk that could
+    /// not run within the budget does. `NetworkAccepted` is for a caller that
+    /// holds the network's accept of these very bytes (the queue's replay of
+    /// a gated submission) and for nothing else: it admits a breached body
+    /// with its scripts unrun.
+    pub async fn submit_with_report_under(
+        &self,
+        tagged_beef: &TaggedBEEF,
+        mode: SubmitMode,
+        policy: WalkBreachPolicy,
+    ) -> Result<(Steak, MutationReport), EngineError> {
+        self.submit_bounded(tagged_beef, mode, None, false, policy)
+            .await
     }
 
     /// [`Engine::submit_with_report`] with every storage call, lookup hook
@@ -1381,6 +1450,7 @@ impl Engine {
         mode: SubmitMode,
         bound: Option<&CallBound>,
         finalize: bool,
+        policy: WalkBreachPolicy,
     ) -> Result<(Steak, MutationReport), EngineError> {
         // The reads the store's predecessor question has made in this
         // submit, every topic together ([`PREDECESSOR_READS_PER_SUBMIT`]),
@@ -1393,6 +1463,7 @@ impl Engine {
             finalize,
             None,
             &mut question_reads,
+            policy,
         )
         .await
         .map(|(steak, report, _)| (steak, report))
@@ -1419,11 +1490,20 @@ impl Engine {
         finalize: bool,
         carried: Option<&'a HashSet<String>>,
         question_reads: &'a mut usize,
+        policy: WalkBreachPolicy,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Counted, EngineError>> + 'a>>
     {
         Box::pin(async move {
-            self.submit_counted_inner(tagged_beef, mode, bound, finalize, carried, question_reads)
-                .await
+            self.submit_counted_inner(
+                tagged_beef,
+                mode,
+                bound,
+                finalize,
+                carried,
+                question_reads,
+                policy,
+            )
+            .await
         })
     }
 
@@ -1435,6 +1515,7 @@ impl Engine {
         finalize: bool,
         walked: Option<&HashSet<String>>,
         question_reads: &mut usize,
+        policy: WalkBreachPolicy,
     ) -> Result<Counted, EngineError> {
         // A submit is a real admission, never a dry run; a carried
         // predecessor's is judged dry until its topic is known not to wait.
@@ -1445,7 +1526,7 @@ impl Engine {
             TopicAdmittanceContext::default()
         };
         let (mut validations, mut steak, tx, txid, could_not_run) = self
-            .run_validation(tagged_beef, mode, &context, bound, walked)
+            .run_validation(tagged_beef, mode, &context, bound, walked, policy)
             .await?;
         let mut report = MutationReport {
             walk_could_not_run: could_not_run,
@@ -1470,6 +1551,12 @@ impl Engine {
         // anything of this submit is written ([`Engine::successors_waiting`]):
         // the topics that must wait, each with why.
         let mut blocked: HashMap<String, String> = HashMap::new();
+        // The landing trusts the subject's walk only if it RAN (the E592
+        // lens fold, M1): after a breach nothing it reaches was walked.
+        let landing = Landing {
+            policy,
+            subject_walk_ran: report.walk_could_not_run.is_none(),
+        };
         let waits = self
             .successors_waiting(
                 &tx,
@@ -1485,6 +1572,8 @@ impl Engine {
                 &mut blocked,
                 question_reads,
                 &mut report.landed_predecessors,
+                landing,
+                &mut report.landed_walks_could_not_run,
             )
             .await;
         // A carried predecessor's topic that does not wait is judged again,
@@ -2087,6 +2176,8 @@ impl Engine {
         blocked: &mut HashMap<String, String>,
         question_reads: &mut usize,
         landed: &mut Vec<(String, String)>,
+        landing: Landing,
+        landed_breaches: &mut Vec<WalkCouldNotRun>,
     ) -> HashMap<String, String> {
         let mut waits = HashMap::new();
         let spent: Vec<(String, u32)> = tx
@@ -2198,6 +2289,8 @@ impl Engine {
                         bound,
                         question_reads,
                         landed,
+                        landing,
+                        landed_breaches,
                     )
                     .await
                 {
@@ -2305,6 +2398,8 @@ impl Engine {
         bound: Option<&CallBound>,
         question_reads: &mut usize,
         landed: &mut Vec<(String, String)>,
+        landing: Landing,
+        landed_breaches: &mut Vec<WalkCouldNotRun>,
     ) -> Result<(), String> {
         let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
             .map_err(|e| format!("the BEEF could not be read again ({e})"))?;
@@ -2313,7 +2408,11 @@ impl Engine {
             other => other,
         };
         let walks = mode != SubmitMode::HistoricalTxNoSpv;
-        let mut walked: HashSet<String> = if walks {
+        // The trust set is what a walk that RAN covered (the E592 lens fold,
+        // M1): a subject whose walk breached covered nothing, so each carried
+        // predecessor is walked by its own submit (and its own breach is
+        // reported, `landed_breaches`), never trusted by a breached walk.
+        let mut walked: HashSet<String> = if walks && landing.subject_walk_ran {
             walk_cover(&beef, subject)
         } else {
             HashSet::new()
@@ -2347,12 +2446,33 @@ impl Engine {
                 .to_atomic_beef(true)
                 .map_err(|e| format!("{next}: its BEEF could not be built ({e})"))?;
             let tagged = TaggedBEEF::new(atomic, vec![topic.to_string()]);
-            let (_, report, blocked) = self
-                .submit_counted(&tagged, mode, bound, false, Some(&walked), question_reads)
+            let (_, report, blocked) = match self
+                .submit_counted(
+                    &tagged,
+                    mode,
+                    bound,
+                    false,
+                    Some(&walked),
+                    question_reads,
+                    landing.policy,
+                )
                 .await
-                .map_err(|e| format!("{next}: {e}"))?;
-            // Its walk passed, so did that of every body it reaches.
-            if walks && !walked.contains(&next) {
+            {
+                Ok(counted) => counted,
+                // Its walk could not run and nothing stands in for it: it does
+                // not land now, and the successor waits (counted, L3).
+                Err(EngineError::WalkCouldNotRun(stop)) => {
+                    let why = format!("{next}: {}", EngineError::WalkCouldNotRun(stop.clone()));
+                    landed_breaches.push(stop);
+                    return Err(why);
+                }
+                Err(e) => return Err(format!("{next}: {e}")),
+            };
+            // Its walk passed, so did that of every body it reaches; a walk
+            // that went on past a breach (`NetworkAccepted`) passed nothing.
+            if let Some(stop) = &report.walk_could_not_run {
+                landed_breaches.push(stop.clone());
+            } else if walks && !walked.contains(&next) {
                 walked.extend(walk_cover(&beef, &next));
             }
             let landed_now = report.applied_topics.iter().any(|t| t == topic);
@@ -2913,15 +3033,14 @@ impl Engine {
             // A structural fault (a source missing, the value rule, ...):
             // the reference walk's `SpvError`, in the same words as before.
             Err(EngineError::ScriptWalkInconclusive { reason, .. }) => return Err(spv(reason)),
-            // The budget, not the transaction: the walk COULD NOT RUN. This is
-            // NOT a refusal, and it must never become one. The bytes are a
-            // BEEF the walk was not given the room to judge, which says
-            // nothing about whether its scripts are valid; refusing it would
-            // refuse a valid BEEF for its size (the owner's posture), and on
-            // the queue's replay it would dead-letter an admission the gated
-            // door already broadcast. So the submit goes on exactly as under
-            // `HistoricalTxNoSpv` (the topic managers judge it, the network
-            // judges its validity), and the caller is told, to count it.
+            // The budget, not the transaction: the walk COULD NOT RUN. Not a
+            // refusal: the bytes are a BEEF the walk was not given the room
+            // to judge, which says nothing about whether its scripts are
+            // valid (refusing would refuse a valid BEEF for its size, the
+            // owner's posture). Not an admission either: the caller's
+            // [`WalkBreachPolicy`] decides, and only the network's word on
+            // record lets the submit go on (the E592 lens fold, H1). The roots
+            // the walk reached are checked first, below.
             Err(EngineError::ScriptWalkOverBudget {
                 at_txid,
                 subject_judged,
@@ -2933,6 +3052,20 @@ impl Engine {
                     DoorLimb::Work if trace.interpreter_tripped => WalkLimb::InterpreterMemory,
                     DoorLimb::Work => WalkLimb::OverWork,
                 };
+                // THE ROOTS OF A BREACHED WALK (the E592 lens fold, H1): every
+                // proven transaction it reached, and every proven source an
+                // input read, whatever the scripts' verdict. A bad root is
+                // the `SpvError` it is on a walk that ran: a breach never
+                // skips a proof the walk relied on. Their cost is a tracker
+                // question per BUMP, which the budget does not bound and
+                // does not need to (the clean walk asks the same).
+                let reached: Vec<String> = trace
+                    .proven
+                    .iter()
+                    .chain(&trace.proven_sources)
+                    .cloned()
+                    .collect();
+                Self::check_reached_roots(chain_tracker, beef_bytes, &reached).await?;
                 return Ok(Some(WalkCouldNotRun {
                     subject_txid: subject_txid.to_string(),
                     at_txid,
@@ -2950,14 +3083,28 @@ impl Engine {
         // accepted (`'scripts only'`). The walk trusted them as it went; the
         // reference checks them in the same walk, so a body with BOTH a bad
         // script and a bad root now names the script.
-        if trace.proven.is_empty() {
-            return Ok(None);
+        Self::check_reached_roots(chain_tracker, beef_bytes, &trace.proven).await?;
+        Ok(None)
+    }
+
+    /// The roots of `reached` (display txids, in order; a repeat or a second
+    /// transaction of one BUMP asks nothing more), each BUMP's root computed
+    /// and asked of the tracker once. None reached: the body is not parsed.
+    async fn check_reached_roots(
+        chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
+        beef_bytes: &[u8],
+        reached: &[String],
+    ) -> Result<(), EngineError> {
+        let spv =
+            |msg: String| EngineError::SpvError(format!("Unable to verify SPV information: {msg}"));
+        if reached.is_empty() {
+            return Ok(());
         }
         let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
             .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
         let proven_in = proven_index(&beef);
         let mut checked: HashSet<usize> = HashSet::new();
-        for txid in &trace.proven {
+        for txid in reached {
             let Some(&at) = proven_in.get(txid.as_str()) else {
                 return Err(spv(format!("transaction {txid} is not in the BEEF")));
             };
@@ -2989,7 +3136,7 @@ impl Engine {
                 }
             }
         }
-        Ok(None)
+        Ok(())
     }
 
     /// The pre-2026-09-08 SPV block, kept as the
@@ -3247,6 +3394,7 @@ impl Engine {
         context: &TopicAdmittanceContext,
         bound: Option<&CallBound>,
         walked: Option<&HashSet<String>>,
+        policy: WalkBreachPolicy,
     ) -> Result<Validated, EngineError> {
         // Validate all topics are supported
         for topic in &tagged_beef.topics {
@@ -3291,8 +3439,11 @@ impl Engine {
         //
         // The walk runs under the engine's budget (bsv-low #592,
         // [`Engine::set_walk_budget`]): one that could not run within it is
-        // NOT a refusal (see `verify_beef_linear`); this submit goes on as
-        // under `HistoricalTxNoSpv` and the report says so.
+        // NOT a refusal (see `verify_beef_linear`), and NOT an admission
+        // unless the caller holds the network's accept of these bytes (the
+        // E592 lens fold, H1, [`WalkBreachPolicy`]): "not now" before any
+        // manager is asked, or, under `NetworkAccepted`, this submit goes on
+        // as under `HistoricalTxNoSpv` and the report says so.
         let mut could_not_run = None;
         if mode != SubmitMode::HistoricalTxNoSpv {
             match walked {
@@ -3310,15 +3461,31 @@ impl Engine {
                 }
             }
         }
-        if let Some(stop) = &could_not_run {
-            warn!(
-                "submit: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): not a refusal, the submit goes on as historical-tx-no-spv and the network judges (bsv-low #592)",
-                stop.subject_txid,
-                stop.limb.as_str(),
-                stop.at_txid,
-                stop.subject_judged,
-                stop.what
-            );
+        if let Some(stop) = could_not_run.take() {
+            match policy {
+                WalkBreachPolicy::NotNow => {
+                    warn!(
+                        "submit: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): not now, nothing judged or written; present it proven (bsv-low #592, E592 fold)",
+                        stop.subject_txid,
+                        stop.limb.as_str(),
+                        stop.at_txid,
+                        stop.subject_judged,
+                        stop.what
+                    );
+                    return Err(EngineError::WalkCouldNotRun(stop));
+                }
+                WalkBreachPolicy::NetworkAccepted => {
+                    warn!(
+                        "submit: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): the network accepted these bytes, the submit goes on as historical-tx-no-spv (bsv-low #592)",
+                        stop.subject_txid,
+                        stop.limb.as_str(),
+                        stop.at_txid,
+                        stop.subject_judged,
+                        stop.what
+                    );
+                    could_not_run = Some(stop);
+                }
+            }
         }
 
         let mut steak = Steak::new();
@@ -4779,6 +4946,7 @@ impl Engine {
             let mut errors = Vec::new();
             let mut pruned_inputs: u64 = 0;
             let mut discarded_graphs: u64 = 0;
+            let mut anchor_walk_held_graphs: u64 = 0;
             let mut finalized_graphs: u64 = 0;
             let mut deadline_dropped_graphs: u64 = 0;
             let mut cursor_moves: Vec<CursorMove> = Vec::new();
@@ -4933,6 +5101,7 @@ impl Engine {
                     // refused graph is not a failed sync (the reference
                     // discards it and carries on).
                     discarded_graphs += sync.discarded_graphs();
+                    anchor_walk_held_graphs += sync.anchor_walk_held();
                     // Whether the sync ran (to its end, or to the deadline)
                     // and whether it moved the cursor (bsv-low #555, the
                     // delta fold's D-M2).
@@ -5182,6 +5351,7 @@ impl Engine {
                     errors,
                     pruned_inputs,
                     discarded_graphs,
+                    anchor_walk_held_graphs,
                     finalized_graphs,
                     deadline_dropped_graphs,
                     cursor_moves,
@@ -5267,6 +5437,7 @@ impl Engine {
                         SubmitMode::HistoricalTxNoSpv,
                         bound.as_ref(),
                         true,
+                        WalkBreachPolicy::NotNow,
                     )
                     .await
                 };
@@ -5539,6 +5710,13 @@ pub struct TopicSyncResult {
     /// over this topic's peers. Not errors, and nothing of them was admitted.
     #[serde(default)]
     pub discarded_graphs: u64,
+    /// Graphs HELD because their anchor's script walk could not run within
+    /// the engine's walk budget (bsv-low #592; the E592 lens fold, H1 and
+    /// L3; `GASPSync::anchor_walk_held`), summed over this topic's peers.
+    /// Nothing of them was finalized; each UTXO stays below its cursor until
+    /// the peer serves its root proven. Not errors and not discarded.
+    #[serde(default)]
+    pub anchor_walk_held_graphs: u64,
     /// Graphs that passed the anchor check and were handed to submit, summed
     /// over this topic's peers (bsv-low #552). Under a per-peer budget a
     /// graph is counted, and submitted, the moment it finalizes, so the
@@ -5747,6 +5925,22 @@ pub enum EngineError {
         limb: DoorLimb,
         what: String,
     },
+
+    /// The submit's own script walk COULD NOT RUN within the engine's
+    /// [`DoorBudget`] (bsv-low #592) and nothing on record stands in for it
+    /// ([`WalkBreachPolicy::NotNow`], every door but the queue replay of a
+    /// gated submission; the E592 lens fold, H1). NOT NOW: nothing was
+    /// judged, nothing written, and it is NOT a refusal either: the budget
+    /// says nothing about the transaction. The way out is the subject
+    /// PROVEN: a proven transaction is not walked, so an honest body too
+    /// big to walk unmined lands once its block is mined (a client retries
+    /// after the block, not at once).
+    #[error(
+        "the script walk could not run within the budget ({}: {}); not now: present the subject proven, after its block",
+        .0.limb.as_str(),
+        .0.what
+    )]
+    WalkCouldNotRun(WalkCouldNotRun),
 
     #[error("{0}")]
     Other(String),
@@ -7381,6 +7575,7 @@ mod tests {
                 errors: vec![],
                 pruned_inputs: 0,
                 discarded_graphs: 0,
+                anchor_walk_held_graphs: 0,
                 finalized_graphs: 0,
                 deadline_dropped_graphs: 0,
                 cursor_moves: Vec::new(),

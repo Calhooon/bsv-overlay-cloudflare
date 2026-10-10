@@ -188,6 +188,51 @@ pub(crate) fn chunk_count(script: &[u8]) -> u64 {
     chunks
 }
 
+/// bsv-rs's own words for an unlocking script that is not push-only
+/// (`Spend::validate`).
+pub(crate) const NOT_PUSH_ONLY: &str =
+    "Unlocking scripts can only contain push operations, and no other opcodes.";
+
+/// Whether `script` is push-only as bsv-rs 0.4.3's `Script::is_push_only`
+/// reads it (every chunk's opcode at most `OP_16`), with no allocation: the
+/// chunks are cut as [`chunk_count`] cuts them (a push cut short at the end
+/// is one push chunk, as the SDK cuts it). Pinned against the SDK
+/// (`e592f_h1_push_only_is_the_sdks`): re-proven at every bsv-rs bump.
+pub(crate) fn push_only(script: &[u8]) -> bool {
+    use bsv_rs::script::op::{OP_16, OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4};
+    let len = script.len();
+    let mut at = 0usize;
+    let width = |at: usize, n: usize| {
+        (0..n).fold(0usize, |acc, i| {
+            acc | usize::from(script.get(at + i).copied().unwrap_or(0)) << (8 * i)
+        })
+    };
+    while at < len {
+        let op = script[at];
+        at += 1;
+        if op > OP_16 {
+            return false;
+        }
+        let header = match op {
+            OP_PUSHDATA1 => 1,
+            OP_PUSHDATA2 => 2,
+            OP_PUSHDATA4 => 4,
+            _ => 0,
+        };
+        let pushed = if op > 0 && op < OP_PUSHDATA1 {
+            usize::from(op)
+        } else if header > 0 {
+            let n = width(at, header);
+            at = (at + header).min(len);
+            n
+        } else {
+            0
+        };
+        at = at.saturating_add(pushed).min(len);
+    }
+    true
+}
+
 /// What one input's scripts hold once parsed and run, beside the frame's
 /// estimate: [`SCRIPT_CHARGE_PER_CHUNK`] a chunk and
 /// [`SCRIPT_CHARGE_PER_BYTE`] a byte of both scripts.
@@ -413,9 +458,17 @@ pub(crate) fn walk(
 /// passed; the door asks nothing), and whether a breach of the work limb was
 /// the interpreter's own memory limit tripping (the door's error says `Work`
 /// for both).
+///
+/// `proven_sources` (the E592 lens fold, H1): every PROVEN source whose
+/// output an input read, in that order, recorded when it is read and before
+/// that input is charged. A walk that breaches at an input over a proven
+/// source has read its lock but not yet reached it as a transaction (it is
+/// queued only once the input ran); the submit checks its root all the same,
+/// so a breach never skips the root of a proof the walk relied on.
 #[derive(Debug, Default)]
 pub(crate) struct WalkTrace {
     pub(crate) proven: Vec<String>,
+    pub(crate) proven_sources: Vec<String>,
     pub(crate) interpreter_tripped: bool,
 }
 
@@ -578,7 +631,24 @@ pub(crate) fn walk_trusting(
                     format!("satoshi total overflows in transaction {txid}"),
                 )
             })?;
+            if index.proven.contains(&input.prev) {
+                trace.proven_sources.push(display_hex(&input.prev));
+            }
             let unlocking_bytes = &raw[input.script.clone()];
+            // A STATIC refusal is the interpreter's own, before any charge
+            // (the E592 lens fold, H1): an unlocking script that is not
+            // push-only is refused by bsv-rs's `Spend::validate` before it
+            // runs a byte, at every transaction version (its
+            // `REQUIRE_PUSH_ONLY_UNLOCKING`, the reference's rule), in these
+            // words. Charged first, a one-byte `OP_CHECKMULTISIG` unlock was
+            // estimated 260 MB of work and the walk "could not run".
+            if !push_only(unlocking_bytes) {
+                return Err(EngineError::ScriptVerificationFailed {
+                    subject_txid: txid.clone(),
+                    input_index: vin as u32,
+                    reason: NOT_PUSH_ONLY.into(),
+                });
+            }
             // The memory of this input's scripts once parsed and run, beside
             // the frame's estimate, charged BEFORE either is parsed (the
             // delta lens E585-D12-DELTA-M1). It is held for this input only.
@@ -975,6 +1045,43 @@ mod tests {
     /// push width cut short, an `OP_RETURN` inside and outside a conditional,
     /// an `OP_ENDIF` with no `OP_IF`) and 20,000 random scripts biased toward
     /// those bytes. Re-run at every bsv-rs bump.
+    /// The E592 lens fold, H1: the door's static push-only read is the SDK's
+    /// own (`Script::is_push_only`, which `Spend::validate` asks first), over
+    /// every one- and two-byte script and pseudo-random scripts with cut-short
+    /// pushes. Re-proven at every bsv-rs bump.
+    #[test]
+    fn e592f_h1_push_only_is_the_sdks() {
+        let mut scripts: Vec<Vec<u8>> = Vec::new();
+        for a in 0..=255u8 {
+            scripts.push(vec![a]);
+            for b in 0..=255u8 {
+                scripts.push(vec![a, b]);
+            }
+        }
+        let mut seed: u64 = 0x5eed_e592;
+        for _ in 0..20_000 {
+            let mut script = Vec::new();
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            for _ in 0..(seed >> 58) as usize {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                // mostly pushes, sometimes an opcode past OP_16
+                let byte = if seed % 7 == 0 {
+                    (seed >> 40) as u8
+                } else {
+                    ((seed >> 40) % 0x61) as u8
+                };
+                script.push(byte);
+            }
+            scripts.push(script);
+        }
+        for script in &scripts {
+            let sdk = Script::from_binary(script).map(|s| s.is_push_only());
+            if let Ok(sdk) = sdk {
+                assert_eq!(push_only(script), sdk, "{}", hex::encode(script));
+            }
+        }
+    }
+
     #[test]
     fn e585f2_m1_the_chunk_count_is_the_sdks() {
         use bsv_rs::script::op::*;

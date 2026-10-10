@@ -1232,17 +1232,32 @@ impl GASPStorage for OverlayGASPStorage<'_> {
     /// merkle paths are not checked, here or in the reference; they are bound
     /// to the verified root by txid instead. Step 2 is one manager call per
     /// transaction and one storage read per input that is not already a coin
-    /// of the set, which is what the finalize submits cost again. The walk is
-    /// the unbudgeted reference walk, the one `Engine::submit` runs on a
-    /// client's BEEF: `DoorBudget` is NOT applied. That budget belongs to the
-    /// `broadcast-gated` door, whose breach means "inconclusive, the network
-    /// judges"; there is no stronger bar behind this check, so a breach could
-    /// only be a refusal, and a refusal here is final for that UTXO. What
-    /// bounds a peer's graph is what bounded it before: the per-peer sync
-    /// budget (which cannot interrupt a script already running). The
-    /// reference serialises this method behind `acquireAnchorValidationSlot`
-    /// (at most 4 at once); here graphs are completed one at a time by one
-    /// sync on one thread, so there is nothing to serialise.
+    /// of the set, which is what the finalize submits cost again.
+    ///
+    /// Since bsv-low #592 the walk runs under the engine's walk budget
+    /// (`DoorBudget`, the door's two limbs, estimated from the bytes before
+    /// anything runs). A breach is no verdict on the graph, and nothing
+    /// stands behind this check (no network accepted these bytes, and the
+    /// finalize submits them `historical-tx-no-spv`), so a breach is never
+    /// the replay's to judge (the E592 lens fold, H1: as built at `4060ffd`
+    /// it went on, and a peer's root that spent a held coin with no
+    /// signature was finalized). It is HELD: `GASPError::AnchorWalkHeld`,
+    /// the graph not finalized, the UTXO failed (or, under a per-graph
+    /// budget, its record kept with nothing pending), the cursor below it,
+    /// counted (`GASPSync::anchor_walk_held`). The roots the walk reached are
+    /// checked first, so a bad proof is still the refusal it is. The hold
+    /// ends when the peer serves the root PROVEN: #555's resume re-asks an
+    /// unproven root, a proven one restarts the walk (`root_proven`), and a
+    /// proven root is trusted without a script run. So an honest 0-conf graph
+    /// too big to walk lands after its block; a forgery never lands. What a
+    /// forging peer costs: its own slot (the UTXO held below the cursor, its
+    /// record re-asked each pass up to `DEFERRED_GRAPH_MAX_PASSES`), inside
+    /// its per-peer budget, and, as it never yields a finalized graph or a
+    /// cursor move on that UTXO, D16's yieldless bound quarantines it if it
+    /// serves nothing else. The reference serialises this method behind
+    /// `acquireAnchorValidationSlot` (at most 4 at once); here graphs are
+    /// completed one at a time by one sync on one thread, so there is
+    /// nothing to serialise.
     async fn validate_graph_anchor(&self, graph_id: &str) -> Result<(), GASPError> {
         let anchor = {
             let refs = self
@@ -1292,22 +1307,27 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         // the replay).
         drop(root_beef);
         // A walk that could not run within the budget (bsv-low #592) is not
-        // a verdict on the graph: the anchor goes on to its replay through
-        // the topic manager, as the submit goes on as historical-tx-no-spv.
-        // Refusing would refuse a valid graph for its size; holding the
-        // cursor would ask again forever. Before #592 this walk had no bound
-        // at all (#557).
-        let verdict = verdict.map(|could_not_run| {
-            if let Some(stop) = could_not_run {
+        // a verdict on the graph, and nothing else judges it: HELD until the
+        // root is served proven (the E592 lens fold, H1; the doc above).
+        let verdict = match verdict {
+            Ok(Some(stop)) => {
                 warn!(
-                    "GASP anchor: the script walk of {} could not run ({}: at {}; {}): not a refusal, the replay judges the graph (bsv-low #592)",
+                    "GASP anchor: the script walk of {} could not run ({}: at {}; {}): held, the graph is not finalized until its root is served proven (bsv-low #592, E592 fold)",
                     stop.subject_txid,
                     stop.limb.as_str(),
                     stop.at_txid,
                     stop.what
                 );
+                return Err(GASPError::AnchorWalkHeld(format!(
+                    "graph {graph_id}: the script walk of {} could not run within the budget ({}: {})",
+                    stop.subject_txid,
+                    stop.limb.as_str(),
+                    stop.what
+                )));
             }
-        });
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
         if let Err(e) = verdict {
             if tracker
                 .as_ref()

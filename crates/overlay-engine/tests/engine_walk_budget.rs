@@ -10,9 +10,12 @@
 //!
 //! Now the walk is the door's stream walk under the engine's `DoorBudget`
 //! (`Engine::set_walk_budget`, `DoorBudget::DEFAULT` unless set). A breach is
-//! "the walk could not run" (`MutationReport::walk_could_not_run`): counted by
-//! the caller, logged by the engine, and the submit goes on exactly as under
-//! `historical-tx-no-spv`. Never a refusal.
+//! "the walk could not run", never a refusal and (since the E592 lens fold,
+//! H1) never an admission without the network's word: "not now"
+//! (`EngineError::WalkCouldNotRun`) under `WalkBreachPolicy::NotNow`, every
+//! door's default; under `NetworkAccepted` (the queue replay of a gated
+//! submission) the submit goes on exactly as under `historical-tx-no-spv`
+//! and says so on `MutationReport::walk_could_not_run`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,7 +23,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bsv_overlay_engine::builder::EngineBuilder;
-use bsv_overlay_engine::engine::{DoorBudget, Engine, EngineError, WalkLimb};
+use bsv_overlay_engine::engine::{DoorBudget, Engine, EngineError, WalkBreachPolicy, WalkLimb};
 use bsv_overlay_engine::storage::memory::MemoryStorage;
 use bsv_overlay_engine::topic_manager::{TopicManager, TopicManagerError};
 use bsv_overlay_engine::types::*;
@@ -121,22 +124,40 @@ async fn submitted(
     >,
     usize,
 ) {
+    submitted_under(engine, body, mode, WalkBreachPolicy::NotNow).await
+}
+
+/// [`submitted`] under an explicit breach policy.
+async fn submitted_under(
+    engine: &Engine,
+    body: &[u8],
+    mode: SubmitMode,
+    policy: WalkBreachPolicy,
+) -> (
+    Result<
+        (Steak, bsv_overlay_engine::engine::MutationReport),
+        bsv_overlay_engine::engine::EngineError,
+    >,
+    usize,
+) {
     let tagged = TaggedBEEF::new(body.to_vec(), vec![TOPIC.to_string()]);
     let at_entry = LIVE.load(Ordering::Relaxed);
     PEAK.store(at_entry, Ordering::Relaxed);
-    let answer = engine.submit_with_report(&tagged, mode).await;
+    let answer = engine.submit_with_report_under(&tagged, mode, policy).await;
     (
         answer,
         PEAK.load(Ordering::Relaxed).saturating_sub(at_entry),
     )
 }
 
-/// THE PIN (a): the witness through `Engine::submit_with_report` under
-/// `historical-tx`, the queue replay's mode. The walk could not run (the
-/// parent's input is charged about 996 MB parsed, past the 48 MiB limb, and
-/// is never parsed), the report says so with the subject and the limb, the
-/// admission is the one `historical-tx-no-spv` makes of the same bytes, and
-/// the submit's peak is under the memory limb plus the body.
+/// THE PIN (a): the witness through `Engine::submit_with_report_under`
+/// under `historical-tx`, the queue replay's mode. The walk could not run
+/// (the parent's input is charged about 996 MB parsed, past the 48 MiB limb,
+/// and is never parsed). Under `NotNow` (every door's default; the E592 lens
+/// fold) that is `EngineError::WalkCouldNotRun` naming the subject and the
+/// limb, nothing written. Under `NetworkAccepted` (the gated replay) the
+/// report says so, the admission is the one `historical-tx-no-spv` makes of
+/// the same bytes. Both peaks are under the memory limb plus the body.
 ///
 /// RED on `54dbb16` (run there with the report's new field unread): "the
 /// submit held 217765812 bytes (the memory limb plus the body is 52231890):
@@ -146,20 +167,41 @@ fn e592_a_the_witness_under_historical_tx_is_walked_within_the_limbs() {
     one_at_a_time(async {
         let (body, subject) = witness();
         let engine = engine();
-        let (answer, peak) = submitted(&engine, &body, SubmitMode::HistoricalTx).await;
+        let (not_now, not_now_peak) = submitted(&engine, &body, SubmitMode::HistoricalTx).await;
+        println!(
+            "e592_a: body {} bytes, NotNow: the submit's peak {not_now_peak} bytes ({:.1}x the body); {:?}",
+            body.len(),
+            not_now_peak as f64 / body.len() as f64,
+            not_now.as_ref().map(|(_, report)| report)
+        );
+        match not_now {
+            Err(EngineError::WalkCouldNotRun(stop)) => {
+                assert_eq!(stop.subject_txid, subject);
+                assert_eq!(stop.limb, WalkLimb::OverMemory);
+            }
+            other => panic!("not now, nothing written: {other:?}"),
+        }
+        let bound = DoorBudget::DEFAULT.max_memory_bytes as usize + body.len();
+        assert!(not_now_peak <= bound, "not now held {not_now_peak} bytes");
+        let (answer, peak) = submitted_under(
+            &engine,
+            &body,
+            SubmitMode::HistoricalTx,
+            WalkBreachPolicy::NetworkAccepted,
+        )
+        .await;
         println!(
             "e592_a: body {} bytes, the submit's peak {peak} bytes ({:.1}x the body); {:?}",
             body.len(),
             peak as f64 / body.len() as f64,
             answer.as_ref().map(|(_, report)| report)
         );
-        let bound = DoorBudget::DEFAULT.max_memory_bytes as usize + body.len();
         assert!(
             peak <= bound,
             "the submit held {peak} bytes (the memory limb plus the body is {bound}): {:?}",
             answer.as_ref().map(|(_, report)| report)
         );
-        let (steak, report) = answer.expect("never a refusal: the walk could not run");
+        let (steak, report) = answer.expect("the network accepted it: the walk could not run");
         let stop = report
             .walk_could_not_run
             .clone()
@@ -200,10 +242,11 @@ fn engine_fresh() -> Engine {
 /// estimate passes 64 MiB from the bytes (the shape of
 /// `door_over_budget_is_inconclusive_*`). The interpreter's memory limit:
 /// `<12 x (OP_DUP OP_CAT)>` over an 8 KB push (the shape of
-/// `door_memory_limit_trip_*`). Each is admitted, `current-tx` as
-/// `historical-tx`, and each names its limb.
+/// `door_memory_limit_trip_*`). Each is not now under `NotNow` and admitted
+/// under `NetworkAccepted`, `current-tx` as `historical-tx`, and each names
+/// its limb.
 #[test]
-fn e592_a_each_limb_is_named_and_the_submit_goes_on() {
+fn e592_a_each_limb_is_named_not_now_or_goes_on_by_the_policy() {
     one_at_a_time(async {
         let n = (DoorBudget::DEFAULT.max_work_bytes / DoorBudget::DEFAULT.memory_limit as u64)
             as usize
@@ -227,7 +270,16 @@ fn e592_a_each_limb_is_named_and_the_submit_goes_on() {
         ] {
             let (body, subject) = on_a_proven_source(&lock, &unlock);
             for mode in [SubmitMode::HistoricalTx, SubmitMode::CurrentTx] {
-                let (answer, _) = submitted(&engine(), &body, mode).await;
+                match submitted(&engine(), &body, mode).await.0 {
+                    Err(EngineError::WalkCouldNotRun(stop)) => {
+                        assert_eq!(stop.limb, limb, "{name} {mode:?}");
+                        assert_eq!(stop.subject_txid, subject);
+                    }
+                    other => panic!("{name} {mode:?}: not now: {other:?}"),
+                }
+                let (answer, _) =
+                    submitted_under(&engine(), &body, mode, WalkBreachPolicy::NetworkAccepted)
+                        .await;
                 let (_, report) = answer.unwrap_or_else(|e| panic!("{name} {mode:?}: {e}"));
                 let stop = report.walk_could_not_run.clone().expect(name);
                 assert_eq!(stop.limb, limb, "{name} {mode:?}");
@@ -337,12 +389,13 @@ fn e592_the_budget_is_configured_on_the_engine() {
             .build();
         assert_eq!(built.walk_budget(), tight);
         let (body, _) = on_a_proven_source(&[OP_DROP, OP_1], &[0x01, 0x42]);
-        let (answer, _) = submitted(&built, &body, SubmitMode::HistoricalTx).await;
-        let (_, report) = answer.expect("admitted");
-        assert_eq!(
-            report.walk_could_not_run.map(|stop| stop.limb),
-            Some(WalkLimb::OverMemory),
-            "a 1 KiB memory limb stops even a small body"
-        );
+        match submitted(&built, &body, SubmitMode::HistoricalTx).await.0 {
+            Err(EngineError::WalkCouldNotRun(stop)) => assert_eq!(
+                stop.limb,
+                WalkLimb::OverMemory,
+                "a 1 KiB memory limb stops even a small body"
+            ),
+            other => panic!("not now: {other:?}"),
+        }
     });
 }
