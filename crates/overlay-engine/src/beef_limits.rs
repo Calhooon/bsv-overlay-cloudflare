@@ -2,7 +2,7 @@
 //!
 //! The posture (the charter "a BEEF of any size", 2026-10-09): a valid BEEF is
 //! never refused for its size or its counts. A door reads the bytes through
-//! bsv-rs 0.4.0's [`BeefStream`], one element in hand, and refuses invalid
+//! bsv-rs 0.4.2's [`BeefStream`], one element in hand, and refuses invalid
 //! bytes only; a refusal names the offset of the byte and the kind
 //! ([`Refusal`], [`Kind`]). No function in this module compares a BEEF's
 //! length or its counts against anything.
@@ -22,12 +22,13 @@
 //! is a second copy of a body the layer above read whole. That is the bound
 //! the platform sets (one isolate), not a refusal of this module.
 //!
-//! The door is the frame and the elements alone (bsv-rs 0.4.0's
+//! The door is the frame and the elements alone (bsv-rs 0.4.2's
 //! `BeefDecoder`): the version, the varints, each BUMP's tree height (at
 //! most 64, the format's rule) and the agreement of its nodes, each
-//! transaction's fields, no byte after the frame. Whether a root is the
-//! chain's and whether an input names an element are the SPV walk's
-//! questions (`engine.rs`), asked after the door, as before.
+//! transaction's fields and at least one input, no byte after the frame.
+//! Whether a root is the chain's and whether an input names an element are
+//! the SPV walk's questions (`engine.rs`), asked after the door; the walk's
+//! structure is [`structure_roots`], the same reader's.
 //!
 //! The submit shape is a subject, its unconfirmed ancestors and proven funding
 //! inputs (ts-stack@fb1b2da packages/overlays/overlay-express/src/OverlayExpress.ts
@@ -35,8 +36,11 @@
 
 use std::io::Read;
 
-use bsv_rs::transaction::beef_stream::{display_hex, Step, StreamError};
-use bsv_rs::transaction::{Beef, BeefDecoder, BeefStream, Element, MerklePath, Transaction};
+use bsv_rs::transaction::beef_stream::{display_hex, Hash32, Step, StreamError};
+use bsv_rs::transaction::{
+    verify_stream_structure, Beef, BeefDecoder, BeefStream, Element, Headers, MerklePath,
+    Transaction, Verdict,
+};
 
 pub use bsv_rs::transaction::beef_stream::StreamError as DoorError;
 pub use bsv_rs::transaction::{Kind, Reason, Refusal};
@@ -210,6 +214,38 @@ pub fn read_beef(bytes: &[u8]) -> Result<BeefRead, Refusal> {
 
 fn refused(refusal: &Refusal) -> bsv_rs::Error {
     bsv_rs::Error::BeefError(refusal.to_string())
+}
+
+/// Carries every root: [`structure_roots`] hands the roots back and its
+/// caller asks the chain, whose tracker answers asynchronously.
+struct EveryRoot;
+
+impl Headers for EveryRoot {
+    fn carries(&self, _height: u64, _root: &Hash32) -> bool {
+        true
+    }
+}
+
+/// The BEEF's structure on the streaming reader's rules (bsv-rs 0.4.2
+/// `verify_stream_structure`, the Lean's validity but the chain): one pass,
+/// one element in hand, each BUMP's root walked once, linear in its leaves;
+/// each input of an unproven transaction resolved against the elements
+/// before it (the wire's order); each txid-only entry proven by a BUMP of
+/// this BEEF; an atomic BEEF held to its subject. The answer is each BUMP's
+/// block height and root (display hex), in BUMP order, for the caller to ask
+/// of the chain, or the refusal with the offset and the kind.
+pub fn structure_roots(bytes: &[u8]) -> Result<Vec<(u64, String)>, Refusal> {
+    match verify_stream_structure(bytes, EveryRoot, None) {
+        Ok(Verdict::Valid { roots, .. }) => Ok(roots
+            .iter()
+            .map(|(height, root)| (*height, display_hex(root)))
+            .collect()),
+        Ok(Verdict::Invalid { offset, reason, .. }) => Err(Refusal { offset, reason }),
+        // The structure-only reader runs no script, and a slice never fails.
+        Ok(Verdict::SpendRefused { .. }) | Err(_) => {
+            unreachable!("the structure check of held bytes ran a script or failed to read")
+        }
+    }
 }
 
 /// The streaming door, then the in-memory [`Beef`] for a caller that builds
@@ -486,6 +522,55 @@ mod door_pin {
             assert!(merkle_path_from_hex(&at.to_hex(), bound).is_ok());
             assert!(merkle_path_from_hex(&over.to_hex(), bound).is_err());
         }
+    }
+
+    /// The structure check (NL-6e): each BUMP's height and root for the
+    /// chain, or the reader's refusal with its offset and kind; the wire's
+    /// order is read as written.
+    #[test]
+    fn the_structure_check_answers_the_roots_or_the_refusal() {
+        let (bytes, id) = shapes::body(1);
+        let beef = Beef::from_binary(&bytes).unwrap();
+        let root = beef
+            .find_bump(&id)
+            .unwrap()
+            .compute_root(Some(&id))
+            .unwrap();
+        assert_eq!(structure_roots(&bytes).unwrap(), vec![(800_000, root)]);
+        for (bytes, offset, _) in shapes::no_input() {
+            let refusal = structure_roots(&bytes).unwrap_err();
+            assert_eq!(
+                (refusal.offset, refusal.kind()),
+                (offset as u64, Kind::NoInputs)
+            );
+        }
+        for (bytes, offset, kind) in shapes::invalid() {
+            let refusal = structure_roots(&bytes).unwrap_err();
+            assert_eq!(refusal.offset, offset as u64, "{kind}");
+        }
+        // A child written before its parent: the in-memory check sorts and
+        // accepts it; the reader refuses the child's input at its first byte
+        // (after the version and the input count).
+        let parent = Transaction::from_binary(beef.txs[0].raw_tx().unwrap()).unwrap();
+        let mut child = Transaction::new();
+        let mut input = bsv_rs::transaction::TransactionInput::new(id.clone(), 0);
+        input.unlocking_script = Some(bsv_rs::script::UnlockingScript::new());
+        child.inputs.push(input);
+        child.outputs.push(parent.outputs[0].clone());
+        let mut wire = vec![0x01, 0x00, 0xbe, 0xef, 0x01];
+        wire.extend_from_slice(&beef.bumps[0].to_binary());
+        wire.push(0x02);
+        let child_at = wire.len();
+        wire.extend_from_slice(&child.to_binary());
+        wire.push(0x00);
+        wire.extend_from_slice(&parent.to_binary());
+        wire.extend_from_slice(&[0x01, 0x00]);
+        assert!(Beef::from_binary(&wire).unwrap().is_valid(false));
+        let refusal = structure_roots(&wire).unwrap_err();
+        assert_eq!(
+            (refusal.offset, refusal.kind()),
+            (child_at as u64 + 5, Kind::InputNamesNoElement)
+        );
     }
 
     #[test]
