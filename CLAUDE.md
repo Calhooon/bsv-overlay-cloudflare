@@ -247,7 +247,19 @@ operations, and no other opcodes."; `script_door::push_only`, no allocation,
 pinned equal to bsv-rs's `Script::is_push_only` by `e592f_h1_push_only_is_the_sdks`).
 bsv-rs 0.4.3 enforces it at EVERY transaction version (`REQUIRE_PUSH_ONLY_UNLOCKING`,
 `Spend::new`, not version-conditional, unlike MINIMALDATA/LOW_S/CLEANSTACK/NULLDUMMY),
-so the check is applied to v1 and v2 alike. The census may still over-estimate
+so the check is applied to v1 and v2 alike. It holds across the WHOLE walk,
+not per input (the E592 delta lens, D1-L1): a PRE-PASS reads the unlocking
+script of every input of every transaction the walk can reach, in the walk's
+order, before any charge (`script_door::first_not_push_only`, O(script
+bytes), no parse), so a non-push unlocking script on input 1, or on an
+unproven ancestor, is refused even when input 0's lock would breach the
+census first (it was `WalkCouldNotRun`); the per-input check stays as the
+belt. The pre-pass reads only the unlocking scripts, so it can name a
+refusal where the walk would have stopped earlier at a structural fault (a
+source output out of bounds, the value rule): both are bodies the network
+refuses. Pin `e592_d1_l1_a_non_push_unlock_anywhere_is_refused_before_a_breach`
+(`--test engine_walk_budget`, under both policies; RED with the pre-pass
+inert). The census may still over-estimate
 a hostile LOCK (a bare `OP_CHECKMULTISIG`, 513 hash opcodes): that is the
 policy's case, "not now", not a refusal. What a breach costs now: an unlocking
 script can no longer trip the work limb (it is push-only, so no hash or
@@ -267,7 +279,10 @@ breached landing went past (`NetworkAccepted`) is not added to the trust set.
 
 **Every walking door counts** (E592-L3): `ops::note_engine_walk` (a breach
 that went on, and every landing's) and `ops::note_engine_walk_not_now` (a "not
-now") at the queue, `/submit`, `/admin/readmit` and the peer crawl, into
+now") at the queue, `/submit`, `/admin/readmit` and the peer crawl (counted INSIDE the crawl as each
+submit returns, the cron's and `/admin/crawlPeers`' alike, so a crawl the
+cron drops at `PEER_CRAWL_BUDGET_MS` keeps what it finished; they were
+counted after the race and lost with it: the E592 delta lens, NOTE-3), into
 `submit_engine_walk_over_budget_total` (work, interpreter memory) or
 `submit_engine_walk_over_memory_total`; the anchor's hold into
 `gasp_anchor_walk_held_total` and `anchor_walk_held_graphs` on both GASP sync
@@ -801,7 +816,7 @@ budget its UTXO fails; with none the peer's whole cursor stays for the tick).
 Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
 gasp_topic_manager i551` (and `fold_medium`).
 
-The anchor verify ran peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557); since #592 it walks under the engine's `DoorBudget`. Since the E592 lens fold a breach is HELD, never replayed: `GASPError::AnchorWalkHeld`, the graph not finalized, the UTXO failed (or, under a per-graph budget, its record kept with nothing pending, reason `anchor_walk_held`), the cursor below it, counted (`GASPSync::anchor_walk_held`, `anchor_walk_held_graphs`, the worker's `gasp_anchor_walk_held_total`). The roots the walk reached are checked first, so a bad proof is still a refusal. The hold ends when the peer serves the root PROVEN: #555's resume re-asks an unproven root and a proven one restarts the walk (`root_proven`), which trusts the proof and runs no script; so an honest 0-conf graph too big to walk lands after its block, a forgery never. What a forging peer costs: its own slot (the UTXO held below the cursor, its record re-asked each pass up to `DEFERRED_GRAPH_MAX_PASSES`) inside its per-peer budget, and D16's yieldless bound quarantines it if it never yields. Not pinned by a test peer in the lane (stated).
+The anchor verify ran peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557); since #592 it walks under the engine's `DoorBudget`. Since the E592 lens fold a breach is HELD, never replayed: `GASPError::AnchorWalkHeld`, the graph not finalized, the UTXO failed (or, under a per-graph budget, its record kept with nothing pending, reason `anchor_walk_held`), the cursor below it, counted (`GASPSync::anchor_walk_held`, `anchor_walk_held_graphs`, the worker's `gasp_anchor_walk_held_total`). The roots the walk reached are checked first, so a bad proof is still a refusal. The hold ends when the peer serves the root PROVEN: #555's resume re-asks an unproven root and a proven one restarts the walk (`root_proven`), which trusts the proof and runs no script; so an honest 0-conf graph too big to walk lands after its block, a forgery never. What a forging peer costs: its own slot (the UTXO held below the cursor, its record re-asked each pass up to `DEFERRED_GRAPH_MAX_PASSES`) inside its per-peer budget, and D16's yieldless bound quarantines it if it never yields and serves nothing else, which holds ONLY with a per-graph budget (`set_graph_budget`, as the worker sets): the yieldless bound exists only there (the E592 delta lens, D1-L2). With NO per-graph budget (a library consumer that sets none) the held UTXO fails on every sync, the sync runs to its end and counts as a success under #302, the cursor stays below that UTXO for good, and the graph is fetched and its walk estimated again on every tick; nothing is admitted, the cost is ours, the residual D15 states for `AnchorUnavailable`. Not pinned by a test peer in the lane (stated).
 
 ## A faulted submit leaves one head (bsv-low #559, lens fold and three delta folds of 2026-10-07)
 
