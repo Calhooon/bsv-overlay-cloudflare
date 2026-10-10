@@ -139,6 +139,11 @@ fn layered(widths: &[usize], each: usize) -> Graph {
     assert_eq!(widths[0], 1);
     let bottom = *widths.last().unwrap();
     let mut funding = Transaction::new();
+    // A coinbase's null outpoint: a transaction with no input is refused
+    // since bsv-rs 0.4.1 (NL-8 W6), the stored funding's BEEF with it.
+    funding
+        .inputs
+        .push(spending(&"00".repeat(32), u32::MAX as usize));
     for _ in 0..bottom * each {
         funding
             .outputs
@@ -507,11 +512,14 @@ async fn witness(graph: &Graph) -> Witness {
     }
 }
 
-/// The finalized bytes of the two graphs, frozen on `fbb7fa8`.
+/// The finalized bytes of the two graphs, frozen on `fbb7fa8`. Re-frozen by
+/// NL-6e (bsv-rs 0.4.2): the funding spends a coinbase's null outpoint, a
+/// transaction with no input being refused since 0.4.1 (NL-8 W6), so every
+/// txid moved; the same digests on main 1119225 (bsv-rs 0.4.0) and on the bump.
 const E586_DIAMOND_BEEFS_DIGEST: &str =
-    "af04de85a5fb1913ba1afbb9ecc8653059d0021ee60c06b8bb69fd5ed480704e";
+    "2494189d8d5ad5ec71592810c356541cb3437395a443c834a4803b055c031f2e";
 const E586_FAN_IN_BEEFS_DIGEST: &str =
-    "8431154523b114f2a525d82c819de89746e2c7d9b160670e8375c0804234b36d";
+    "ac343008a2de9ffa5254bf2326dc53eaa65418f36942d03118cafdd538b1207b";
 
 /// The anchor check may grow the live heap by at most this many times the
 /// bytes fetched; the finalize by this many, net of the BEEFs it hands on.

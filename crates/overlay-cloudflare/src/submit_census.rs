@@ -610,11 +610,33 @@ mod tests {
     /// names the real subject and its structural refusal is the answer.
     #[test]
     fn a_poisoned_subject_sort_is_uneval_never_a_green() {
-        // A COMPLETE in-BEEF parent (no inputs of its own to be missing —
-        // the same shape as the fixture's funded test parent; a parent with
-        // its own absent ancestry would join the subject in the front group
-        // and the trap would not spring).
+        // A COMPLETE in-BEEF parent (no inputs of its own to be missing;
+        // a parent with its own absent ancestry would join the subject in
+        // the front group and the trap would not spring). Since bsv-rs 0.4.1
+        // a transaction has an input (NL-8 W6), so the parent spends a
+        // proven grandparent, itself a coinbase's null outpoint spender.
+        let mut grandparent = Transaction::new();
+        grandparent
+            .add_input(bsv_rs::transaction::TransactionInput::new(
+                "00".repeat(32),
+                u32::MAX,
+            ))
+            .unwrap();
+        grandparent
+            .add_output(bsv_rs::transaction::TransactionOutput {
+                satoshis: Some(6_000),
+                locking_script: bsv_rs::script::LockingScript::from_binary(&[0x51]).unwrap(),
+                change: false,
+            })
+            .unwrap();
+        grandparent.merkle_path = Some(bsv_rs::transaction::MerklePath::from_coinbase_txid(
+            &grandparent.id(),
+            900_000,
+        ));
         let mut parent = Transaction::new();
+        let mut spend = bsv_rs::transaction::TransactionInput::new(grandparent.id(), 0);
+        spend.source_transaction = Some(Box::new(grandparent.clone()));
+        parent.add_input(spend).unwrap();
         parent
             .add_output(bsv_rs::transaction::TransactionOutput {
                 satoshis: Some(5_000),
@@ -638,6 +660,7 @@ mod tests {
             ))
             .unwrap();
         let mut beef = Beef::new();
+        beef.merge_transaction(grandparent);
         beef.merge_transaction(parent);
         beef.merge_transaction(real_subject);
         // Precondition of the trap: the sorted-last entry is the ANCESTOR.
@@ -811,12 +834,31 @@ mod tests {
         );
         let mut saw = (false, false, false); // (ready-unmined, ready-proven, not-ready)
         let mut not_ready_hard_fails = 0usize;
+        // Bodies the door refuses for a transaction with no input (bsv-rs
+        // 0.4.1 `NoInputs`, bsv-stack-lean NL-8 W6). The committed fixture's
+        // ready-unmined body carries a funded parent with no input; the census
+        // refuses it at the parse, never a green. The emitter now gives every
+        // source transaction an input; the fixture is regenerated from the
+        // bsv-low checkout (its header), after which this set is empty.
+        let mut door_refused_ready: Vec<String> = Vec::new();
         for case in cases {
             let label = case["label"].as_str().unwrap();
             let body = hex::decode(case["beefHex"].as_str().unwrap()).unwrap();
             let client_ready = case["client"]["ready"].as_bool().unwrap();
             let proven = case["subjectProven"].as_bool().unwrap();
             let got = census_verdict(&body);
+            let no_input = beef_limits::read_beef(&body)
+                .err()
+                .is_some_and(|r| r.kind() == beef_limits::Kind::NoInputs);
+            if client_ready && no_input {
+                assert_eq!(
+                    got,
+                    CensusVerdict::WouldHaveFailed(WouldFailWhy::Parse),
+                    "{label}"
+                );
+                door_refused_ready.push(label.to_string());
+                continue;
+            }
             match (client_ready, proven) {
                 (true, false) => {
                     saw.0 = true;
@@ -841,6 +883,15 @@ mod tests {
                 }
             }
         }
+        assert_eq!(
+            door_refused_ready,
+            ["ready-unmined: funded parent + spending subject"],
+            "the door's refusals among the ready cases"
+        );
+        // Until the regeneration the ready-unmined row is not proven against
+        // the client here; the census's own ready path stays proven natively
+        // (`ancestry_carrying_beef` answers `GatedReady` above).
+        saw.0 |= !door_refused_ready.is_empty();
         assert!(
             saw.0 && saw.1 && saw.2,
             "fixture must cover all three mapping rows (got ready-unmined={}, ready-proven={}, not-ready={})",

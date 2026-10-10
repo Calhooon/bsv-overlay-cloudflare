@@ -24,3 +24,14 @@ fn discovery_reader_refuses_invalid_bytes() {
         assert!(facts_from_atomic_beef(&bytes, &id).is_none());
     }
 }
+
+/// NL-8 W6: discovery reads no transaction with no input, and no such
+/// transaction as proven (bsv-rs 0.4.0 answered `true` for the anchor).
+#[test]
+fn discovery_refuses_a_transaction_with_no_input() {
+    use bsv_overlay_discovery::pot::storage::pot_beef_has_proof;
+    for (bytes, _, id) in shapes::no_input() {
+        assert!(facts_from_atomic_beef(&bytes, &id).is_none());
+        assert!(!pot_beef_has_proof(&id, &bytes), "{id}");
+    }
+}

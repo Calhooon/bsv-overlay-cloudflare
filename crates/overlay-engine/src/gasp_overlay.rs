@@ -1536,8 +1536,28 @@ mod tests {
     }
 
     /// Build a coinbase-like tx (no meaningful inputs).
+    /// A raw transaction with no input, read by `Transaction::from_hex`
+    /// alone (no BEEF door, which refuses it since bsv-rs 0.4.1).
+    fn make_no_input_tx_hex() -> String {
+        let mut tx = Transaction::new();
+        tx.outputs.push(bsv_rs::transaction::TransactionOutput::new(
+            5000,
+            bsv_rs::script::LockingScript::from_hex(
+                "76a914000000000000000000000000000000000000000088ac",
+            )
+            .unwrap(),
+        ));
+        tx.to_hex()
+    }
+
     fn make_coinbase_tx_hex() -> String {
         let mut tx = Transaction::new();
+        // A coinbase's null outpoint: a transaction with no input is refused
+        // since bsv-rs 0.4.1 (NL-8 W6).
+        let mut input = bsv_rs::transaction::TransactionInput::new("00".repeat(32), u32::MAX);
+        input.unlocking_script =
+            Some(bsv_rs::script::UnlockingScript::from_binary(&[0x51]).unwrap());
+        tx.inputs.push(input);
         tx.outputs.push(bsv_rs::transaction::TransactionOutput::new(
             5000,
             bsv_rs::script::LockingScript::from_hex(
@@ -1759,7 +1779,7 @@ mod tests {
         let store = MemoryStorage::new();
         let gasp_storage = OverlayGASPStorage::new(&store, "tm_test", make_sink());
 
-        let raw_tx = make_coinbase_tx_hex();
+        let raw_tx = make_no_input_tx_hex();
         let node = GASPNode {
             graph_id: "abc.0".to_string(),
             raw_tx,

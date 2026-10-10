@@ -43,8 +43,21 @@ const OUT = resolve(
 /** The client suite's `walletAtomicBeef` construction (overlay.gatedReadiness
  *  .test.ts): a funded parent + the child that spends it — the shape a real
  *  wallet `createAction` AtomicBEEF has. */
+/** A coinbase's null outpoint. A transaction with no input is refused by the
+ *  overlay's door since bsv-rs 0.4.1 (bsv-stack-lean NL-8 W6), so every
+ *  source transaction here spends one. */
+function coinbaseInput() {
+  return {
+    sourceTXID: '00'.repeat(32),
+    sourceOutputIndex: 0xffffffff,
+    unlockingScript: UnlockingScript.fromHex('51'),
+    sequence: 0xffffffff,
+  }
+}
+
 function fundedParentAndChild(): { parent: Transaction; subject: Transaction } {
   const parent = new Transaction()
+  parent.addInput(coinbaseInput())
   parent.addOutput({ satoshis: 5_000, lockingScript: LockingScript.fromHex('51') })
   const subject = new Transaction()
   subject.addInput({
@@ -121,8 +134,10 @@ function record(label: string, beefBytes: number[] | Uint8Array, subjectTxid: st
 //    residual shape the issue names).
 {
   const present = new Transaction()
+  present.addInput(coinbaseInput())
   present.addOutput({ satoshis: 3_000, lockingScript: LockingScript.fromHex('51') })
   const absent = new Transaction()
+  absent.addInput(coinbaseInput())
   absent.addOutput({ satoshis: 2_000, lockingScript: LockingScript.fromHex('51') })
   const subject = new Transaction()
   for (const src of [present, absent]) {

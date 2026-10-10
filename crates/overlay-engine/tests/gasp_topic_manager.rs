@@ -26,6 +26,33 @@ use bsv_rs::transaction::{
 
 const TOPIC: &str = "tm_head_chain";
 
+/// A genesis transaction's one input: a coinbase's null outpoint. A
+/// transaction with no input is not a transaction (bsv-rs 0.4.1 `NoInputs`,
+/// NL-8 W6), so the first transaction of a chain spends this.
+fn coinbase_input() -> TransactionInput {
+    genesis_input(0)
+}
+
+/// The input of the `n`th genesis of one graph: an outpoint of the all-zero
+/// txid, which is no coin, at an index of its own, so two geneses of one
+/// graph do not spend one outpoint.
+fn genesis_input(n: u32) -> TransactionInput {
+    let mut input = TransactionInput::new("00".repeat(32), u32::MAX - n);
+    input.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
+    input
+}
+
+/// Whether an input spends a coin: an outpoint of the all-zero txid does
+/// not, and no manager asks a peer for it.
+fn spends_a_coin(input: &TransactionInput) -> bool {
+    input.get_source_txid().ok() != Some("00".repeat(32))
+}
+
+/// A chain's first transaction: it spends no coin.
+fn is_genesis(tx: &Transaction) -> bool {
+    !tx.inputs.iter().any(spends_a_coin)
+}
+
 fn chain(length: usize) -> Vec<GASPNode> {
     let mut nodes = Vec::new();
     let mut previous = None;
@@ -33,6 +60,8 @@ fn chain(length: usize) -> Vec<GASPNode> {
         let mut tx = Transaction::new();
         if let Some(txid) = previous {
             tx.inputs.push(TransactionInput::new(txid, 0));
+        } else {
+            tx.inputs.push(coinbase_input());
         }
         tx.outputs.push(TransactionOutput::new(
             1000,
@@ -188,7 +217,7 @@ impl TopicManager for HeadChainManager {
         let extends_head = previous_coins
             .chunks_exact(4)
             .any(|index| u32::from_le_bytes(index.try_into().unwrap()) == 0);
-        if !tx.inputs.is_empty() && !extends_head {
+        if !is_genesis(tx) && !extends_head {
             return Ok(AdmittanceInstructions::default());
         }
         if mode == SubmitMode::HistoricalTxNoSpv {
@@ -213,6 +242,7 @@ impl TopicManager for HeadChainManager {
         Ok(tx
             .inputs
             .first()
+            .filter(|i| spends_a_coin(i))
             .map(|i| Outpoint::new(i.get_source_txid().unwrap(), i.source_output_index))
             .into_iter()
             .collect())
@@ -635,7 +665,10 @@ async fn c_needed_input_error_logs_outpoint_and_only_cuts_off_that_node() {
     assert_eq!(graphs.len(), 1, "only the independent graph finalizes");
     assert_eq!(graph_txids(&graphs[0]), vec![node_txid(&nodes[0])]);
     assert_eq!(cursor, 2);
-    assert_eq!(manager.needed.borrow().len(), 2);
+    // Nodes 2, 1 and 0: the genesis spends an outpoint of the all-zero txid,
+    // an input to name, so its manager is asked too (a node with no input to
+    // name is not; no transaction has none since bsv-rs 0.4.1, NL-8 W6).
+    assert_eq!(manager.needed.borrow().len(), 3);
     let outpoint = format!("{}.0", node_txid(&nodes[1]));
     assert!(
         logs.lock()
@@ -976,6 +1009,8 @@ fn decoy_chain_with_tip_outputs(
             tx.inputs.push(witness_input(txid, 0));
             tx.inputs
                 .push(TransactionInput::new("fe".repeat(32), height as u32));
+        } else {
+            tx.inputs.push(coinbase_input());
         }
         let outputs = if height + 1 == length { tip_outputs } else { 1 };
         for _ in 0..outputs {
@@ -1037,7 +1072,7 @@ impl TopicManager for DecoyHeadManager {
             let index = u32::from_le_bytes(index.try_into().unwrap()) as usize;
             tx.inputs.get(index).is_some_and(witness_shaped)
         });
-        if !tx.inputs.is_empty() && !extends_head {
+        if !is_genesis(tx) && !extends_head {
             return Ok(AdmittanceInstructions::default());
         }
         if mode == SubmitMode::HistoricalTxNoSpv {
@@ -1596,6 +1631,8 @@ fn scripted_chain(length: usize, locking: &str, unproven_from: usize) -> Vec<GAS
         let mut tx = Transaction::new();
         if let Some(txid) = previous {
             tx.inputs.push(spending(txid, 0));
+        } else {
+            tx.inputs.push(coinbase_input());
         }
         tx.outputs.push(TransactionOutput::new(
             1000,
@@ -1848,10 +1885,15 @@ async fn i551_b_a_root_the_manager_refuses_at_the_end_admits_nothing() {
 // PIN C. The E1 head chain and the D8 decoy chain under a tracker that knows
 // the fixture roots: the same walk, the same admission order, and the admitted
 // set byte for byte what the base (39081dd, no anchor check) admitted.
+// Re-frozen by NL-6e (bsv-rs 0.4.2): each genesis now spends an outpoint of
+// the all-zero txid, a transaction with no input being refused since 0.4.1
+// (NL-8 W6), so every txid moved. These digests are this test file's on
+// main 1119225 (bsv-rs 0.4.0) and on the bump alike, the sets of 39081dd
+// having been equal to main's on the old fixtures.
 const I551_C_HEAD_BASE_DIGEST: &str =
-    "8615f5ec72dcbf835876a5065b6a507ac220b30fb230738b8fbaa0a4d896e864";
+    "6569e2d2015430cf0dad8b0ce2a76834be24af32baba0d3064bff1ae5cf9fb0c";
 const I551_C_DECOY_BASE_DIGEST: &str =
-    "47e0ff752b9c7220194f6448673bc13995fb3ada7104923b0e9ea7b02d9bb7a8";
+    "927cfb8bfdf6c011c022eb91e048fbcfdab2c0e00595aee18b038605bbbc7b9e";
 
 #[tokio::test]
 async fn i551_c_head_chain_and_decoy_chain_admit_byte_for_byte_under_a_tracker() {
@@ -1942,7 +1984,10 @@ async fn i551_d_no_tracker_runs_the_scripts_only_walk() {
 // interpreter accepts). Frozen on the base (39081dd): the requests and the
 // cursor of every workspace manager, and the finalized BEEF bytes of the
 // manager-less adapter and of a manager that admits what it is shown.
-const I551_E_BASE_DIGEST: &str = "500553a385745ca37de407de5d03e6f89d2ce262531b3542108fda86423fac74";
+// Re-frozen by NL-6e as PIN C was (the genesis spends an outpoint of the
+// all-zero txid): the same digest on main 1119225 (bsv-rs 0.4.0) and on the
+// bump.
+const I551_E_BASE_DIGEST: &str = "587851a68a649fa096eef50dc8a4b20a8a3b9f4a82213e91f931ae088c91711f";
 
 #[tokio::test]
 async fn i551_e_managers_naming_nothing_walk_and_finalize_byte_for_byte() {
@@ -2045,7 +2090,7 @@ impl TopicManager for RetainingHeadManager {
                 .borrow_mut()
                 .push((tx.id(), previous_coins.to_vec()));
         }
-        if !tx.inputs.is_empty() && previous_coins.is_empty() {
+        if !is_genesis(tx) && previous_coins.is_empty() {
             return Ok(AdmittanceInstructions::default());
         }
         if mode == SubmitMode::HistoricalTxNoSpv {
@@ -2053,7 +2098,7 @@ impl TopicManager for RetainingHeadManager {
         }
         Ok(AdmittanceInstructions {
             outputs_to_admit: vec![0],
-            coins_to_retain: if self.retain && !tx.inputs.is_empty() {
+            coins_to_retain: if self.retain && !is_genesis(tx) {
                 vec![0]
             } else {
                 vec![]
@@ -2071,6 +2116,7 @@ impl TopicManager for RetainingHeadManager {
         Ok(tx
             .inputs
             .iter()
+            .filter(|i| spends_a_coin(i))
             .map(|i| Outpoint::new(i.get_source_txid().unwrap(), i.source_output_index))
             .collect())
     }
@@ -2145,6 +2191,7 @@ async fn i551_f_coins_to_retain_does_not_move_the_replay_and_a_double_spend_is_r
         )
     };
     let mut a = Transaction::new();
+    a.inputs.push(coinbase_input());
     a.outputs.push(coin(1000));
     let mut x = Transaction::new();
     x.inputs.push(TransactionInput::new(a.id(), 0));
@@ -2240,10 +2287,13 @@ async fn i551_h_a_transaction_served_in_place_of_a_named_input_refuses_the_graph
         )
     };
     let mut x = Transaction::new();
+    x.inputs.push(coinbase_input());
     x.outputs.push(coin(1000));
     let mut w = Transaction::new();
+    w.inputs.push(genesis_input(1));
     w.outputs.push(coin(999));
     let mut forged = Transaction::new();
+    forged.inputs.push(genesis_input(2));
     forged.outputs.push(coin(777));
     let mut r = Transaction::new();
     r.inputs.push(TransactionInput::new(x.id(), 0));
@@ -2517,6 +2567,8 @@ fn recorded_chain(length: usize, records: &[usize]) -> Vec<GASPNode> {
         let mut tx = Transaction::new();
         if let Some(txid) = previous {
             tx.inputs.push(TransactionInput::new(txid, 0));
+        } else {
+            tx.inputs.push(coinbase_input());
         }
         tx.outputs.push(plain_output());
         if records.contains(&height) {
@@ -2571,7 +2623,7 @@ impl TopicManager for RecordedHeadManager {
             .chunks_exact(4)
             .any(|index| u32::from_le_bytes(index.try_into().unwrap()) == 0)
             && tx.inputs[0].source_output_index == 0;
-        if !tx.inputs.is_empty() && !extends_head {
+        if !is_genesis(tx) && !extends_head {
             return Ok(AdmittanceInstructions::default());
         }
         if mode == SubmitMode::HistoricalTxNoSpv {
@@ -2592,6 +2644,7 @@ impl TopicManager for RecordedHeadManager {
         Ok(tx
             .inputs
             .first()
+            .filter(|i| spends_a_coin(i))
             .map(|i| Outpoint::new(i.get_source_txid().unwrap(), i.source_output_index))
             .into_iter()
             .collect())
@@ -6108,6 +6161,8 @@ async fn delta2_559_m2_a_finalize_over_a_twenty_deep_chain_completes_and_asks_th
         let mut tx = Transaction::new();
         if let Some(txid) = previous {
             tx.inputs.push(spending(txid, 0));
+        } else {
+            tx.inputs.push(coinbase_input());
         }
         tx.outputs
             .push(op_1_output(if height == 21 { 777 } else { 1000 }));
@@ -6320,6 +6375,7 @@ impl TopicManager for ShapeHeadManager {
         Ok(tx
             .inputs
             .first()
+            .filter(|i| spends_a_coin(i))
             .map(|i| Outpoint::new(i.get_source_txid().unwrap(), i.source_output_index))
             .into_iter()
             .collect())
@@ -6950,6 +7006,7 @@ impl TopicManager for NamesEveryInput {
         Ok(tx
             .inputs
             .iter()
+            .filter(|i| spends_a_coin(i))
             .map(|i| Outpoint::new(i.get_source_txid().unwrap(), i.source_output_index))
             .collect())
     }
@@ -6974,6 +7031,7 @@ impl TopicManager for NamesEveryInput {
 async fn e1d_fold_l4_a_replay_whose_outputs_are_held_finishes_over_a_named_decoy() {
     let (_logs, _guard) = capture_logs();
     let mut genesis = Transaction::new();
+    genesis.inputs.push(coinbase_input());
     genesis.outputs.push(plain_output());
     let genesis = proven(&genesis, 700);
     let mut head = Transaction::new();
@@ -7578,6 +7636,8 @@ fn salted_chain(length: usize, salt: u64) -> Vec<GASPNode> {
         let mut tx = Transaction::new();
         if let Some(txid) = previous {
             tx.inputs.push(TransactionInput::new(txid, 0));
+        } else {
+            tx.inputs.push(coinbase_input());
         }
         tx.outputs.push(TransactionOutput::new(
             1000 + salt,
@@ -9653,6 +9713,8 @@ fn fat_unmined(length: usize, each: u32) -> Vec<GASPNode> {
             for vout in 0..each {
                 tx.inputs.push(spending(txid.clone(), vout));
             }
+        } else {
+            tx.inputs.push(coinbase_input());
         }
         for _ in 0..each {
             tx.outputs.push(TransactionOutput::new(

@@ -125,3 +125,52 @@ pub fn invalid() -> Vec<(Vec<u8>, usize, &'static str)> {
         (trailing, frame, "TrailingBytes"),
     ]
 }
+
+/// A raw transaction with no input (NL-8 W6, the Lean's `noInputs`): version,
+/// an input count of zero, one `OP_TRUE` output, the lock time. Its txid in
+/// display hex beside it.
+fn no_input_tx(tag: u8) -> (Vec<u8>, String) {
+    let mut raw = vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x01];
+    raw.extend_from_slice(&u64::from(tag).to_le_bytes());
+    raw.extend_from_slice(&[0x01, 0x51]);
+    raw.extend_from_slice(&[0x00; 4]);
+    let mut id = bsv_rs::primitives::sha256d(&raw).to_vec();
+    id.reverse();
+    (raw, hex::encode(id))
+}
+
+/// The three no-input shapes of NL-8 W6, each with the offset of the
+/// transaction the reader refuses (`NoInputs`) and its txid: a V1 BEEF whose
+/// one transaction has no input; the same under the atomic prefix; a proven
+/// transaction with no input, its BUMP the block of one transaction (the
+/// anchor discovery read as proven at bsv-rs 0.4.0).
+pub fn no_input() -> Vec<(Vec<u8>, usize, String)> {
+    let v1 = [0x01, 0x00, 0xbe, 0xef];
+    let (raw, id) = no_input_tx(1);
+    let mut plain = v1.to_vec();
+    plain.extend_from_slice(&[0x00, 0x01]);
+    let at = plain.len();
+    plain.extend_from_slice(&raw);
+    plain.push(0x00);
+
+    let mut atomic = vec![0x01, 0x01, 0x01, 0x01];
+    let mut wire = hex::decode(&id).unwrap();
+    wire.reverse();
+    atomic.extend_from_slice(&wire);
+    let atomic_at = atomic.len() + at;
+    atomic.extend_from_slice(&plain);
+
+    let (raw, anchor_id) = no_input_tx(2);
+    let mut anchor = v1.to_vec();
+    anchor.push(0x01);
+    anchor.extend_from_slice(&MerklePath::from_coinbase_txid(&anchor_id, 800_006).to_binary());
+    anchor.push(0x01);
+    let anchor_at = anchor.len();
+    anchor.extend_from_slice(&raw);
+    anchor.extend_from_slice(&[0x01, 0x00]);
+    vec![
+        (plain, at, id.clone()),
+        (atomic, atomic_at, id),
+        (anchor, anchor_at, anchor_id),
+    ]
+}

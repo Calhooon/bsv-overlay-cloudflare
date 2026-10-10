@@ -54,6 +54,16 @@ macro_rules! door {
                     assert!(!error.contains("max_"), "{error}");
                 }
             }
+            #[test]
+            fn a_transaction_with_no_input_is_refused() {
+                for (bytes, offset, _) in shapes::no_input() {
+                    let error = parse_beef(&bytes, &$policy)
+                        .err()
+                        .expect("a transaction with no input was read")
+                        .to_string();
+                    assert!(names(&error, offset, "NoInputs"), "{offset}: {error}");
+                }
+            }
         }
     };
 }
@@ -248,4 +258,31 @@ fn linking_and_source_debug_preserve_the_subject() {
         }
     }
     assert!(transaction_from_beef(&Beef::new().to_binary(), None, &ENGINE_BEEF_LIMITS).is_err());
+}
+
+/// NL-8 W6: the three no-input rows are refused at every entry of the door
+/// (bsv-rs 0.4.1's `NoInputs`, the Lean's `noInputs`), at the transaction's first byte.
+#[test]
+fn a_transaction_with_no_input_is_refused_at_every_entry() {
+    for (bytes, offset, id) in shapes::no_input() {
+        let refusal = read_beef(&bytes)
+            .expect_err("read_beef read a transaction with no input")
+            .to_string();
+        assert!(names(&refusal, offset, "NoInputs"), "read_beef: {refusal}");
+        let streamed = match fold_beef(&bytes[..], |_| {}) {
+            Err(DoorError::Refused(r)) => r.to_string(),
+            other => format!("{other:?}"),
+        };
+        assert!(
+            names(&streamed, offset, "NoInputs"),
+            "fold_beef: {streamed}"
+        );
+        for target in [None, Some(id.as_str())] {
+            let error = transaction_from_beef(&bytes, target, &ENGINE_BEEF_LIMITS)
+                .expect_err("transaction_from_beef linked a transaction with no input")
+                .to_string();
+            assert!(names(&error, offset, "NoInputs"), "{error}");
+        }
+        assert!(!has_proof(&bytes, &id) && own_bump(&bytes, &id).is_none());
+    }
 }
