@@ -10216,3 +10216,328 @@ async fn e586f_n_a_root_proven_restart_carries_what_the_pass_spent_of_every_limb
         );
     }
 }
+
+// ============================================================================
+// bsv-low #592 (the delta lens's question 8): the GASP anchor check under
+// the engine's walk budget. A walk that could not run is HELD — the graph is
+// not finalized, nothing is admitted, and (under a per-graph budget) its
+// record is kept with nothing pending, the cursor below its UTXO — and the
+// roots the walk reached before the breach are checked first, so a bad root
+// is still the refusal it is.
+// ============================================================================
+
+// A lock one input past the work limb: a 1-byte push, 612 OP_SHA256s (612
+// x 128 KiB = 80,216,064 bytes of budget over the door's default 64 MiB),
+// then OP_DROP OP_1. The script is VALID on its face (the push feeds every
+// hash, the drop clears it, OP_1 leaves true): on the base, which ran the
+// anchor's scripts with no budget, it runs green and the graph is finalized.
+fn heavy_lock_hex() -> String {
+    use bsv_rs::script::op::{OP_DROP, OP_SHA256};
+    let mut lock = vec![0x01, 0x42];
+    lock.extend(std::iter::repeat(OP_SHA256).take(612));
+    lock.extend_from_slice(&[OP_DROP, bsv_rs::script::op::OP_1]);
+    hex::encode(lock)
+}
+
+// The graph of pins 4 and 5: a PROVEN funding output under `heavy_lock_hex`,
+// spent by an UNPROVEN parent, spent by an UNPROVEN tip the peer lists. The
+// anchor check's walk of the tip reads the funding's lock at the parent's
+// input 0 and cannot run it (OverWork); the funding is the one proven
+// source the walk reached, so its root is the one question the tracker gets.
+fn anchored_heavy_graph() -> Vec<GASPNode> {
+    let heavy = heavy_lock_hex();
+    let mut funding = Transaction::new();
+    funding.inputs.push(coinbase_input());
+    funding.outputs.push(TransactionOutput::new(
+        1000,
+        LockingScript::from_hex(&heavy).unwrap(),
+    ));
+    let funding_txid = funding.id();
+    let mut parent = Transaction::new();
+    parent.inputs.push(spending(funding_txid.clone(), 0));
+    parent.outputs.push(TransactionOutput::new(
+        1000,
+        LockingScript::from_hex("51").unwrap(),
+    ));
+    let parent_txid = parent.id();
+    let mut tip = Transaction::new();
+    tip.inputs.push(spending(parent_txid.clone(), 0));
+    tip.outputs.push(TransactionOutput::new(
+        1000,
+        LockingScript::from_hex("51").unwrap(),
+    ));
+    vec![
+        node_of(&funding, 0, Some(honest_proof(&funding_txid, 100))),
+        node_of(&parent, 0, None),
+        node_of(&tip, 0, None),
+    ]
+}
+
+// Admits output 0 of everything and NAMES input 0 (`identify_needed_inputs`):
+// a PROVEN node's fetch children come only from the names, so with the trait
+// default (what `AdmitsOutputZero` answers) a root served proven is a LEAF
+// and its ancestry is never re-served after `root_proven`. A coinbase
+// prevout is no name (it would name an absent predecessor, E1D). Pin 4's
+// fetch walk is unchanged by the names: an UNPROVEN node asks all its inputs
+// (SPV necessity) and the funding names nothing.
+struct AdmitsZeroNamesFirst(Rc<RefCell<HeadState>>);
+
+#[async_trait(?Send)]
+impl TopicManager for AdmitsZeroNamesFirst {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+
+    async fn identify_admissible_outputs(
+        &self,
+        tx: &Transaction,
+        _previous_coins: &[u8],
+        _off_chain_values: Option<&[u8]>,
+        mode: SubmitMode,
+        _context: &TopicAdmittanceContext,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        if mode == SubmitMode::HistoricalTxNoSpv {
+            self.0.borrow_mut().admitted.push(tx.id());
+        }
+        Ok(AdmittanceInstructions {
+            outputs_to_admit: vec![0],
+            ..Default::default()
+        })
+    }
+
+    async fn identify_needed_inputs(
+        &self,
+        beef: &[u8],
+        _off_chain_values: Option<&[u8]>,
+    ) -> Result<Vec<Outpoint>, TopicManagerError> {
+        let tx = Transaction::from_beef(beef, None).unwrap();
+        Ok(tx
+            .inputs
+            .first()
+            .filter(|i| spends_a_coin(i))
+            .map(|i| Outpoint::new(i.get_source_txid().unwrap(), i.source_output_index))
+            .into_iter()
+            .collect())
+    }
+
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+// One engine that syncs the same peer tick after tick, its anchor check under
+// the engine's default walk budget, a per-graph budget (so a held graph
+// keeps its record, bsv-low #555) and a chain tracker the anchor asks of
+// the roots its walk reaches.
+struct Anchored {
+    engine: Engine,
+    store: Rc<MemoryStorage>,
+    requests: Requests,
+}
+
+impl Anchored {
+    fn new(
+        requests: Requests,
+        factory: Box<dyn GASPRemoteFactory>,
+        tracker: Option<Box<dyn ChainTracker>>,
+        state: Rc<RefCell<HeadState>>,
+    ) -> Self {
+        let store = Rc::new(MemoryStorage::new());
+        let mut engine = Engine::with_chain_tracker(
+            HashMap::from([(
+                TOPIC.to_string(),
+                Box::new(AdmitsZeroNamesFirst(state)) as Box<dyn TopicManager>,
+            )]),
+            HashMap::new(),
+            Box::new(store.clone()),
+            None,
+            None,
+            tracker,
+            EngineConfig {
+                sync_configuration: HashMap::from([(
+                    TOPIC.to_string(),
+                    SyncTarget::Peers(vec![PEER.to_string()]),
+                )]),
+                ..Default::default()
+            },
+        );
+        engine.set_gasp_remote_factory(factory);
+        engine.set_graph_budget(never(), 100, 60_000);
+        Self {
+            engine,
+            store,
+            requests,
+        }
+    }
+
+    async fn tick(&self) -> (bsv_overlay_engine::engine::TopicSyncResult, Vec<String>) {
+        self.requests.borrow_mut().clear();
+        let result = self.engine.start_gasp_sync().await.unwrap();
+        let sent = self.requests.borrow().iter().map(|r| r.0.clone()).collect();
+        (result.topics_synced[TOPIC].clone(), sent)
+    }
+
+    async fn cursor(&self) -> u64 {
+        self.store.get_last_interaction(PEER, TOPIC).await.unwrap()
+    }
+
+    async fn failures(&self) -> u64 {
+        self.store
+            .get_peer_sync_health(&peer_origin(PEER), TOPIC)
+            .await
+            .unwrap()
+            .consecutive_failures
+    }
+}
+
+// PIN 4 (the delta lens's Q8). A root whose anchor walk breaches, every root
+// it reached ACCEPTED: HELD — `anchor_walk_held_graphs` at 1, nothing
+// finalized, nothing admitted, the record kept with nothing pending, the
+// cursor below the UTXO, the peer not failed. The same walk with the
+// funding's root REJECTED (a tracker that knows nothing): the breach never
+// answers, the bad root is the refusal it is — the graph discarded, the
+// cursor past it, no record. RED on 0313648: the base ran the same script
+// (it is valid) with no budget and finalized the graph, admitting the tip.
+#[tokio::test]
+async fn e592_q8_4_an_anchor_walk_that_cannot_run_holds_the_graph_and_a_rejected_root_refuses_it() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = anchored_heavy_graph();
+    for (tracker, holds) in [
+        (KnownRoots::of(&nodes), true),
+        (KnownRoots::default(), false),
+    ] {
+        let state = Rc::new(RefCell::new(HeadState::default()));
+        let remote = RecordingRemote::new(&nodes, &[2]);
+        let requests = remote.requests.clone();
+        let anchored = Anchored::new(
+            requests,
+            Box::new(remote),
+            Some(Box::new(tracker.clone())),
+            state.clone(),
+        );
+        let (topic, sent) = anchored.tick().await;
+        assert_eq!(sent, txids(&nodes, &[2, 1, 0]), "the fetch walk is whole");
+        assert!(
+            topic.errors.is_empty(),
+            "neither a hold nor a refusal is a peer error"
+        );
+        assert_eq!(
+            tracker.asked.load(Ordering::SeqCst),
+            1,
+            "the roots the walk reached are checked before the breach answers: the funding's"
+        );
+        assert_eq!(held(&anchored.store, &nodes).await, vec![]);
+        assert_eq!(applied_rows(&anchored.store, &nodes).await, [false; 3]);
+        assert!(state.borrow().admitted.is_empty());
+        if holds {
+            assert_eq!(topic.anchor_walk_held_graphs, 1);
+            assert_eq!(topic.finalized_graphs, 0, "held, never finalized");
+            assert_eq!(topic.discarded_graphs, 0);
+            assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+            let records = anchored.store.deferred_graphs();
+            assert_eq!(records.len(), 1, "the held graph keeps its record");
+            assert_eq!(
+                (records[0].peer.as_str(), records[0].topic.as_str()),
+                (PEER, TOPIC)
+            );
+            assert_eq!(records[0].outpoint, outpoint_of(&nodes[2]));
+            assert_eq!(
+                record_shape(&records[0]),
+                (3, vec![], 3, 1, "anchor_walk_held".to_string()),
+                "the whole graph, nothing pending"
+            );
+            assert_eq!(anchored.cursor().await, 0, "the cursor below the UTXO");
+            assert_eq!(
+                anchored.failures().await,
+                0,
+                "a hold is not a failed attempt"
+            );
+        } else {
+            assert_eq!(topic.anchor_walk_held_graphs, 0);
+            assert_eq!(topic.discarded_graphs, 1, "the bad root refused the graph");
+            assert_eq!(topic.finalized_graphs, 0);
+            assert_eq!(deferral(&topic), (0, 0, 0, vec![]));
+            assert!(
+                anchored.store.deferred_graphs().is_empty(),
+                "a refused graph keeps no record"
+            );
+            assert_eq!(anchored.cursor().await, 1, "the cursor moves past it");
+            assert_eq!(topic.cursor_moves, moved(0, 1));
+        }
+    }
+}
+
+// PIN 5 (the delta lens's Q8). The hold ends when the peer serves the root
+// PROVEN. Tick 1 holds as pin 4; tick 2 re-asks the tip, the peer serves it
+// with a proof, the record is dropped `root_proven` and the walk restarts
+// fresh: the tip is PROVEN, so the walk trusts it and runs NO script (the
+// funding's heavy lock is still what the peer serves, and the graph still
+// finalizes — the only way that happens), one root question is asked (the
+// tip's own), and the graph is finalized ancestors-first: the tip's output
+// held, every row applied, the cursor past it, the record gone. RED on
+// 0313648: the base finalized the same graph at TICK 1.
+#[tokio::test]
+async fn e592_q8_5_a_root_served_proven_lifts_the_hold_and_finalizes_with_no_script_run() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = anchored_heavy_graph();
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    // The tracker knows the funding's root (tick 1) and the tip's, which
+    // the peer serves proven at height 102 once its block lands.
+    let tracker = KnownRoots::of(&nodes);
+    let tip = node_txid(&nodes[2]);
+    tracker.roots.lock().unwrap().insert((102, tip.clone()));
+    let remote = RecordingRemote::new(&nodes, &[2]);
+    let requests = remote.requests.clone();
+    let mut anchored = Anchored::new(
+        requests,
+        Box::new(remote),
+        Some(Box::new(tracker.clone())),
+        state.clone(),
+    );
+
+    // TICK 1: the hold of pin 4.
+    let (topic, sent) = anchored.tick().await;
+    assert_eq!(sent, txids(&nodes, &[2, 1, 0]));
+    assert_eq!(topic.anchor_walk_held_graphs, 1);
+    assert_eq!(topic.finalized_graphs, 0);
+    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    assert_eq!(anchored.cursor().await, 0);
+    let asked_after_hold = tracker.asked.load(Ordering::SeqCst);
+    assert_eq!(asked_after_hold, 1);
+
+    // TICK 2: the block lands; the peer serves the tip with its proof.
+    let mut mined = nodes.clone();
+    mined[2].proof = Some(honest_proof(&tip, 102));
+    let mut served = RecordingRemote::new(&mined, &[2]);
+    served.requests = anchored.requests.clone();
+    anchored.engine.set_gasp_remote_factory(Box::new(served));
+    let (topic, sent) = anchored.tick().await;
+    // The root is asked again (the resume's re-ask), then the fresh walk
+    // re-fetches the whole graph.
+    assert_eq!(sent, txids(&nodes, &[2, 2, 1, 0]));
+    assert_eq!(
+        deferral(&topic),
+        (0, 1, 0, vec!["root_proven".to_string()]),
+        "resumed, its record dropped root_proven, the restart not counted converged"
+    );
+    assert_eq!(topic.finalized_graphs, 1);
+    assert_eq!(topic.anchor_walk_held_graphs, 0);
+    assert!(topic.errors.is_empty());
+    assert!(
+        anchored.store.deferred_graphs().is_empty(),
+        "the record is gone"
+    );
+    assert_eq!(
+        tracker.asked.load(Ordering::SeqCst) - asked_after_hold,
+        1,
+        "one root question (the tip's own): no script ran"
+    );
+    assert_eq!(held(&anchored.store, &nodes).await, vec![(2, 0)]);
+    assert_eq!(applied_rows(&anchored.store, &nodes).await, [true; 3]);
+    assert_eq!(state.borrow().admitted, txids(&nodes, &[0, 1, 2]));
+    assert_eq!(anchored.cursor().await, 1);
+    assert_eq!(topic.cursor_moves, moved(0, 1));
+}

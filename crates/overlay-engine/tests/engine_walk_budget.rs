@@ -18,18 +18,30 @@
 //! and says so on `MutationReport::walk_could_not_run`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bsv_overlay_engine::builder::EngineBuilder;
-use bsv_overlay_engine::engine::{DoorBudget, Engine, EngineError, WalkBreachPolicy, WalkLimb};
+use bsv_overlay_engine::engine::{
+    DoorBudget, DoorLimb, Engine, EngineError, WalkBreachPolicy, WalkLimb,
+};
 use bsv_overlay_engine::storage::memory::MemoryStorage;
+use bsv_overlay_engine::storage::Storage;
 use bsv_overlay_engine::topic_manager::{TopicManager, TopicManagerError};
 use bsv_overlay_engine::types::*;
-use bsv_rs::primitives::sha256d;
+use bsv_rs::primitives::{sha256d, PrivateKey};
 use bsv_rs::script::op::*;
-use bsv_rs::transaction::Transaction;
+use bsv_rs::script::templates::P2PKH;
+use bsv_rs::script::{
+    LockingScript, Script, ScriptTemplate, ScriptTemplateUnlock, SignOutputs, SigningContext,
+    UnlockingScript,
+};
+use bsv_rs::transaction::{
+    ChainTracker, MerklePath, MerklePathLeaf, MockChainTracker, Transaction, TransactionInput,
+    TransactionOutput,
+};
 
 // ── The counting allocator (as `gasp_fanin_memory.rs`) ──────────────────
 
@@ -520,6 +532,649 @@ fn e592_d1_l1_a_non_push_unlock_anywhere_is_refused_before_a_breach() {
                 }
                 other => panic!("the ancestor's refusal, {policy:?}: {other:?}"),
             }
+        }
+    });
+}
+
+// ── The delta lens's conformance pins on invalid bodies (question 8,
+// 2026-10-10) ─────────────────────────────────────────────────────────────
+//
+// Deterministic, network-free, test-built bodies over `MemoryStorage`: each
+// states what the engine answers on a malformed or unverifiable body under
+// the owner's ruling 3a — a static refusal is the interpreter's or the SPV
+// check's verdict, a breach is "the walk could not run" (or, under the
+// network's accept, a report on the walk), and nothing is admitted
+// unverified. Pins 1 and 3 here (and 4, in `gasp_topic_manager.rs`) are RED
+// on `0313648`: the pre-E592-fold submit went on as `historical-tx-no-spv`
+// on a breach, so it admitted these bodies where these refuse or report.
+
+/// Block height of every fabricated single-transaction BUMP here (the same
+/// height `beef_v1` writes for the BEEF's own BUMP).
+const HEIGHT: u32 = 800_000;
+
+/// The census-heavy lock: `n` `OP_SHA256`s whose estimate alone passes the
+/// work limb (`n` = the limb over the per-hash 128 KiB, plus a hundred),
+/// so the charge of one input reading it breaches before that input runs.
+fn heavy_hash_lock() -> Vec<u8> {
+    let n = (DoorBudget::DEFAULT.max_work_bytes / DoorBudget::DEFAULT.memory_limit as u64) as usize
+        + 100;
+    [vec![OP_SHA256; n], vec![OP_DROP, OP_1]].concat()
+}
+
+/// `OP_DROP OP_TRUE`, unlocked by any push: a valid spend with no signature
+/// check and no hash opcode (the plain control's lock).
+fn open_lock() -> LockingScript {
+    let mut script = Script::new();
+    script.write_opcode(OP_DROP).write_opcode(OP_TRUE);
+    LockingScript::from_script(script)
+}
+
+/// The push of `0x42` eight times, as an unlock template.
+fn open_unlock() -> ScriptTemplateUnlock {
+    ScriptTemplateUnlock::new(
+        |_ctx: &SigningContext| {
+            let mut script = Script::new();
+            script.write_bin(&[0x42; 8]);
+            Ok(UnlockingScript::from_script(script))
+        },
+        || 16,
+    )
+}
+
+/// A BRC-74 BUMP for a block containing only `txid`; its root IS the txid.
+fn single_tx_block_proof(txid: &str) -> MerklePath {
+    MerklePath::new(
+        HEIGHT,
+        vec![vec![MerklePathLeaf::new_txid(0, txid.to_string())]],
+    )
+    .expect("a one-leaf BUMP is valid")
+}
+
+/// A chain tracker that knows exactly one (height, root): the fabricated
+/// single-transaction block of a fixture's funding tx.
+fn tracker_knowing(funding_txid: &str) -> Box<dyn ChainTracker> {
+    let mut tracker = MockChainTracker::new(HEIGHT + 10);
+    tracker.add_root(HEIGHT, funding_txid.to_string());
+    Box::new(tracker)
+}
+
+/// A chain tracker that knows nothing (every root it is asked is rejected).
+fn tracker_knowing_nothing() -> Box<dyn ChainTracker> {
+    Box::new(MockChainTracker::new(HEIGHT + 10))
+}
+
+/// The engine over `store` (an `Rc<MemoryStorage>` is itself a `Storage`, so
+/// the test keeps a handle to assert on what was written) with an optional
+/// chain tracker.
+fn engine_over(store: Rc<MemoryStorage>, tracker: Option<Box<dyn ChainTracker>>) -> Engine {
+    let mut builder =
+        EngineBuilder::new(Box::new(store)).with_topic(TOPIC, Box::new(AdmitOutputZero));
+    if let Some(tracker) = tracker {
+        builder = builder.with_chain_tracker(tracker);
+    }
+    builder.build()
+}
+
+/// Whether the topic still holds `txid:vout` unspent.
+async fn held_unspent(store: &Rc<MemoryStorage>, txid: &str, vout: u32) -> bool {
+    store
+        .find_output(txid, vout, Some(TOPIC), Some(false), false)
+        .await
+        .expect("the storage reads")
+        .is_some()
+}
+
+/// Whether the topic holds an applied row for `txid`.
+async fn applied_row(store: &Rc<MemoryStorage>, txid: &str) -> bool {
+    store
+        .does_applied_transaction_exist(&AppliedTransaction {
+            txid: txid.to_string(),
+            topic: TOPIC.to_string(),
+        })
+        .await
+        .expect("the storage reads")
+}
+
+/// THE DELTA LENS'S PIN 1: a non-push unlocking script on an otherwise
+/// well-formed spend is `ScriptVerificationFailed` with the interpreter's
+/// own words, whatever the breach policy. Nothing of the refused body is
+/// written: the held output stays unspent and no applied row appears.
+///
+/// Input 0 of the spend reads a census-heavy lock (a breach on a body the
+/// pre-pass does not refuse); input 1's unlocking script carries one
+/// non-push opcode, so the walk's push-only pre-pass refuses the body
+/// before any charge. RED on `0313648`: the pre-fold submit walked with no
+/// pre-pass and went on as `historical-tx-no-spv` on the breach, admitting
+/// the spend unverified — the heavy coin spent, an applied row written.
+#[test]
+fn e592_q8_1_a_non_push_unlock_refuses_and_writes_nothing() {
+    one_at_a_time(async {
+        let heavy = heavy_hash_lock();
+        let spendable = [OP_DROP, OP_1];
+        let push = [0x01, 0x42];
+        let not_push = [0x01, 0x42, OP_NOP];
+        let funding = raw_tx(
+            &[(&[0xaa; 32], 0, &[])],
+            &[(1_000, &heavy), (1_000, &spendable)],
+        );
+        let funding_txid = display(&sha256d(&funding));
+
+        for policy in [WalkBreachPolicy::NotNow, WalkBreachPolicy::NetworkAccepted] {
+            // The heavy coin is held first: the funding alone, PROVEN (the
+            // walk trusts it), its output 0 admitted.
+            let store = Rc::new(MemoryStorage::new());
+            let engine = engine_over(store.clone(), None);
+            submitted(
+                &engine,
+                &beef_v1(&[funding.clone()]),
+                SubmitMode::HistoricalTx,
+            )
+            .await
+            .0
+            .expect("the proven funding alone is admitted");
+            assert!(
+                held_unspent(&store, &funding_txid, 0).await,
+                "the heavy coin is held, {policy:?}"
+            );
+
+            // The refused spend: input 1's unlocking script is not push-only.
+            let subject = raw_tx(
+                &[
+                    (&sha256d(&funding), 0, &push),
+                    (&sha256d(&funding), 1, &not_push),
+                ],
+                &[(1_500, &[OP_1])],
+            );
+            let subject_txid = display(&sha256d(&subject));
+            match submitted_under(
+                &engine,
+                &beef_v1(&[funding.clone(), subject]),
+                SubmitMode::HistoricalTx,
+                policy,
+            )
+            .await
+            .0
+            {
+                Err(EngineError::ScriptVerificationFailed {
+                    subject_txid: at,
+                    input_index,
+                    reason,
+                }) => {
+                    assert_eq!(at, subject_txid);
+                    assert_eq!(input_index, 1, "the non-push input, {policy:?}");
+                    assert_eq!(
+                        reason,
+                        "Unlocking scripts can only contain push operations, and no other opcodes."
+                    );
+                }
+                other => panic!("a static refusal, {policy:?}: {other:?}"),
+            }
+            assert!(
+                held_unspent(&store, &funding_txid, 0).await,
+                "the refused spend leaves the held output unspent, {policy:?}"
+            );
+            assert!(
+                !applied_row(&store, &subject_txid).await,
+                "nothing of the refused body is written, {policy:?}"
+            );
+        }
+    });
+}
+
+/// A "mined" funding transaction of one throwaway input (never verified: the
+/// tx carries a merkle path, so the walk trusts it) and two outputs: 0
+/// under `first`, 1 a real P2PKH to `key`.
+fn two_output_funding(first: LockingScript, key: &PrivateKey) -> Transaction {
+    let mut tx = Transaction::new();
+    tx.inputs.push(TransactionInput {
+        source_txid: Some("aa".repeat(32)),
+        source_output_index: 0,
+        unlocking_script: Some(UnlockingScript::from_script(Script::new())),
+        ..Default::default()
+    });
+    tx.outputs.push(TransactionOutput::new(10_000, first));
+    tx.outputs.push(TransactionOutput::new(
+        10_000,
+        P2PKH::new().lock(&key.public_key().hash160()).unwrap(),
+    ));
+    let txid = tx.id();
+    tx.merkle_path = Some(single_tx_block_proof(&txid));
+    tx
+}
+
+/// Flip one bit of `input`'s unlocking script at `offset`, after signing
+/// (`script_verification.rs`'s `flip_unlocking_byte` reaches input 0; this
+/// one reaches any input).
+fn flip_unlocking_byte_of(tx: &mut Transaction, input: usize, offset: usize) {
+    let mut bytes = tx.inputs[input]
+        .unlocking_script
+        .as_ref()
+        .unwrap()
+        .to_binary();
+    bytes[offset] ^= 0x01;
+    tx.inputs[input].unlocking_script = Some(UnlockingScript::from_script(
+        Script::from_binary(&bytes).unwrap(),
+    ));
+    tx.invalidate_caches();
+}
+
+/// Pin 2's body: a signed two-input spend of one proven funding transaction
+/// (input 0 of the `first` lock, input 1 the P2PKH), then one bit of
+/// input 1's DER signature flipped after signing: DER stays well-formed, the
+/// signature no longer verifies.
+async fn two_input_spend_over(first: LockingScript) -> (Vec<u8>, String) {
+    let key = PrivateKey::random();
+    let funding = two_output_funding(first, &key);
+    let mut tx = Transaction::new();
+    tx.add_input_from_tx(funding.clone(), 0, open_unlock())
+        .unwrap();
+    tx.add_input_from_tx(funding, 1, P2PKH::unlock(&key, SignOutputs::All, false))
+        .unwrap();
+    tx.outputs.push(TransactionOutput::new(15_000, open_lock()));
+    tx.sign().await.expect("template signing");
+    flip_unlocking_byte_of(&mut tx, 1, 10);
+    let txid = tx.id();
+    let beef = tx.to_beef(false).expect("the two-input spend's BEEF");
+    (beef, txid)
+}
+
+/// THE DELTA LENS'S PIN 2 (reading (b)): the charges are per input, in
+/// order, before the input runs. A spend whose input 0 reads a census-heavy
+/// lock answers `WalkCouldNotRun` BEFORE input 1's corrupted signature is
+/// executed — the charge of input 0 comes first and input 0 never ran; the
+/// control (a plain lock on input 0) is refused AT input 1 by the
+/// interpreter, which is the same order seen from the other side. Nothing
+/// is written either way.
+#[test]
+fn e592_q8_2_the_charge_at_input_0_precedes_input_1s_invalid_signature() {
+    one_at_a_time(async {
+        // The heavy arm: the charge of input 0 breaches before input 1 runs.
+        let (body, subject_txid) = two_input_spend_over(LockingScript::from_script(
+            Script::from_binary(&heavy_hash_lock()).unwrap(),
+        ))
+        .await;
+        let store = Rc::new(MemoryStorage::new());
+        let engine = engine_over(store.clone(), None);
+        match submitted(&engine, &body, SubmitMode::HistoricalTx).await.0 {
+            Err(EngineError::WalkCouldNotRun(stop)) => {
+                assert_eq!(stop.subject_txid, subject_txid);
+                assert_eq!(
+                    stop.at_txid, subject_txid,
+                    "the stop is at the subject's input 0"
+                );
+                assert!(
+                    !stop.subject_judged,
+                    "input 0 never ran: its charge came first"
+                );
+                assert_eq!(stop.limb, WalkLimb::OverWork);
+                assert!(
+                    stop.what.contains("(input 0 of "),
+                    "the charge names its input: {}",
+                    stop.what
+                );
+            }
+            other => panic!("the heavy lock on input 0: {other:?}"),
+        }
+        assert!(
+            !applied_row(&store, &subject_txid).await,
+            "nothing of a walk that could not run is written"
+        );
+
+        // The control: input 0 runs (a plain lock), so input 1's corrupted
+        // signature is reached and refused.
+        let (body, subject_txid) = two_input_spend_over(open_lock()).await;
+        let store = Rc::new(MemoryStorage::new());
+        let engine = engine_over(store.clone(), None);
+        match submitted(&engine, &body, SubmitMode::HistoricalTx).await.0 {
+            Err(EngineError::ScriptVerificationFailed {
+                subject_txid: at,
+                input_index,
+                reason,
+            }) => {
+                assert_eq!(at, subject_txid);
+                assert_eq!(
+                    input_index, 1,
+                    "input 0 ran; the corrupted signature is what refused"
+                );
+                // The P2PKH lock's `OP_CHECKSIG` pushes false (the corrupted
+                // signature fails the EC check) and the interpreter's truthy
+                // rule is what names it.
+                assert_eq!(
+                    reason,
+                    "The top stack element must be truthy after script evaluation."
+                );
+            }
+            other => panic!("the plain lock on input 0: {other:?}"),
+        }
+        assert!(
+            !applied_row(&store, &subject_txid).await,
+            "nothing of the refused body is written"
+        );
+    });
+}
+
+/// THE DELTA LENS'S PIN 3: the roots of a breached walk are checked (both
+/// policies). A breach whose reached proven transaction carries a merkle
+/// root the chain tracker rejects is the `SpvError` a walk that RAN would
+/// answer — the root check preempts the breach, never the reverse. The
+/// control (a plain lock, a walk that runs to its end) is the same
+/// `SpvError`; with a tracker that knows the root, the breach is the
+/// answer under `NotNow` and a report under `NetworkAccepted`, and a clean
+/// walk over an accepted root is admitted with nothing to report.
+///
+/// RED on `0313648`: the pre-fold submit went on as `historical-tx-no-spv`
+/// on the breach and asked no root, so the heavy arms were admitted
+/// unverified.
+#[test]
+fn e592_q8_3_the_roots_of_a_breached_walk_are_checked() {
+    one_at_a_time(async {
+        for (name, lock) in [
+            ("the heavy lock (a breach)", heavy_hash_lock()),
+            ("a plain lock (the control)", vec![OP_DROP, OP_1]),
+        ] {
+            let funding = one_in_one_out(&[0xaa; 32], &[], 1_000, &lock);
+            let funding_txid = display(&sha256d(&funding));
+            let subject = one_in_one_out(&sha256d(&funding), &[0x01, 0x42], 900, &[OP_1]);
+            let body = beef_v1(&[funding, subject]);
+            let root = single_tx_block_proof(&funding_txid)
+                .compute_root(Some(&funding_txid))
+                .expect("the funding's root");
+            let rejected = format!(
+                "Invalid merkle path for transaction {funding_txid}: \
+                 root {root} is not valid for block height {HEIGHT}"
+            );
+            for knows in [true, false] {
+                for policy in [WalkBreachPolicy::NotNow, WalkBreachPolicy::NetworkAccepted] {
+                    let tracker = if knows {
+                        tracker_knowing(&funding_txid)
+                    } else {
+                        tracker_knowing_nothing()
+                    };
+                    let engine = engine_over(Rc::new(MemoryStorage::new()), Some(tracker));
+                    match submitted_under(&engine, &body, SubmitMode::HistoricalTx, policy)
+                        .await
+                        .0
+                    {
+                        Err(EngineError::SpvError(why)) => {
+                            assert!(!knows, "a tracker that knows the root, {name}, {policy:?}");
+                            assert_eq!(why, rejected, "{name}, {policy:?}");
+                        }
+                        Err(EngineError::WalkCouldNotRun(stop)) => {
+                            assert!(knows, "{name}, {policy:?}");
+                            assert_eq!(stop.limb, WalkLimb::OverWork, "{name}, {policy:?}");
+                            assert!(!stop.subject_judged, "the charge of input 0, {name}");
+                        }
+                        Ok((_, report)) => {
+                            assert!(knows, "{name}, {policy:?}");
+                            if name.starts_with("the heavy") {
+                                assert_eq!(
+                                    report.walk_could_not_run.map(|stop| stop.limb),
+                                    Some(WalkLimb::OverWork),
+                                    "the breach goes on under the network's accept, {policy:?}"
+                                );
+                                assert_eq!(
+                                    policy,
+                                    WalkBreachPolicy::NetworkAccepted,
+                                    "not now under NotNow, {name}"
+                                );
+                            } else {
+                                assert_eq!(
+                                    report.walk_could_not_run, None,
+                                    "a clean walk over an accepted root, {policy:?}"
+                                );
+                            }
+                        }
+                        other => panic!("{name}, knows {knows}, {policy:?}: {other:?}"),
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Pin 6's manager: admits output 0 when the transaction has exactly one
+/// output, NAMES its input 0's outpoint (so the engine's predecessor
+/// question fires for a carried predecessor), reads no off-chain values (so
+/// the door may land a carried body first), and re-admits the same
+/// transaction idempotently.
+struct AdmitsOneOutput;
+
+#[async_trait(?Send)]
+impl TopicManager for AdmitsOneOutput {
+    async fn identify_admissible_outputs(
+        &self,
+        tx: &Transaction,
+        _: &[u8],
+        _: Option<&[u8]>,
+        _: SubmitMode,
+        _context: &TopicAdmittanceContext,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        if tx.outputs.len() != 1 {
+            return Ok(AdmittanceInstructions::default());
+        }
+        Ok(AdmittanceInstructions {
+            outputs_to_admit: vec![0],
+            coins_to_retain: vec![],
+            coins_removed: None,
+        })
+    }
+    async fn identify_needed_inputs(
+        &self,
+        beef: &[u8],
+        _off_chain_values: Option<&[u8]>,
+    ) -> Result<Vec<Outpoint>, TopicManagerError> {
+        let tx = Transaction::from_beef(beef, None).expect("the door's BEEF parses");
+        Ok(tx
+            .inputs
+            .first()
+            .filter(|i| {
+                i.get_source_txid()
+                    .is_ok_and(|txid| txid != "00".repeat(32))
+            })
+            .map(|i| Outpoint::new(i.get_source_txid().unwrap(), i.source_output_index))
+            .into_iter()
+            .collect())
+    }
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+    async fn get_documentation(&self) -> String {
+        "admits one output".into()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata {
+            name: "admit-one".into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Pin 6's engine: the store is held by the test, the manager names its
+/// inputs.
+fn engine_naming(store: Rc<MemoryStorage>) -> Engine {
+    EngineBuilder::new(Box::new(store))
+        .with_topic(TOPIC, Box::new(AdmitsOneOutput))
+        .build()
+}
+
+/// THE DELTA LENS'S PIN 6 (E592-M1): the landing trusts only a walk that
+/// ran. A successor under `NetworkAccepted` whose own walk breaches carries
+/// a predecessor; the predecessor is walked by its own submit (its breach
+/// reported on `landed_walks_could_not_run`), never trusted, and lands;
+/// the successor is then judged over the coin it now finds. Under `NotNow`
+/// nothing lands and nothing is written.
+#[test]
+fn e592_q8_6_a_breached_landing_walks_its_predecessor_and_never_trusts_it() {
+    one_at_a_time(async {
+        let heavy = heavy_hash_lock();
+        // The funding's own input is a coinbase-shaped prevout (the all-zero
+        // txid the manager's names filter excludes), so its own admission
+        // names nothing and needs no predecessor.
+        let funding = one_in_one_out(&[0x00; 32], &[], 2_000, &heavy);
+        let funding_txid = display(&sha256d(&funding));
+        let predecessor =
+            one_in_one_out(&sha256d(&funding), &[0x01, 0x42], 1_000, &[OP_DROP, OP_1]);
+        let predecessor_txid = display(&sha256d(&predecessor));
+        let subject = one_in_one_out(&sha256d(&predecessor), &[0x01, 0x42], 900, &[OP_1]);
+        let subject_txid = display(&sha256d(&subject));
+        let body = beef_v1(&[funding.clone(), predecessor, subject]);
+
+        // Under `NotNow`: the successor's own walk breaches at the
+        // predecessor's input (the heavy lock of the funding), the submit is
+        // "not now", nothing lands, nothing is written.
+        let store = Rc::new(MemoryStorage::new());
+        let engine = engine_naming(store.clone());
+        submitted(
+            &engine,
+            &beef_v1(&[funding.clone()]),
+            SubmitMode::HistoricalTx,
+        )
+        .await
+        .0
+        .expect("the proven funding alone is admitted");
+        match submitted(&engine, &body, SubmitMode::HistoricalTx).await.0 {
+            Err(EngineError::WalkCouldNotRun(stop)) => {
+                assert_eq!(stop.subject_txid, subject_txid);
+                assert_eq!(
+                    stop.at_txid, predecessor_txid,
+                    "the breach is at the predecessor's input 0"
+                );
+                assert!(
+                    stop.subject_judged,
+                    "the subject's own input finished first"
+                );
+                assert_eq!(stop.limb, WalkLimb::OverWork);
+            }
+            other => panic!("not now, nothing lands: {other:?}"),
+        }
+        assert!(
+            held_unspent(&store, &funding_txid, 0).await,
+            "the held coin is unspent under NotNow"
+        );
+        assert!(
+            !applied_row(&store, &predecessor_txid).await,
+            "nothing lands"
+        );
+        assert!(!applied_row(&store, &subject_txid).await, "nothing lands");
+
+        // Under `NetworkAccepted`: the same submit goes on, the predecessor is
+        // landed by its own submit (which breaches at its own input 0 and
+        // goes on too, reported, never trusted), and both are applied.
+        let store = Rc::new(MemoryStorage::new());
+        let engine = engine_naming(store.clone());
+        submitted(
+            &engine,
+            &beef_v1(&[funding.clone()]),
+            SubmitMode::HistoricalTx,
+        )
+        .await
+        .0
+        .expect("the proven funding alone is admitted");
+        let (answer, _) = submitted_under(
+            &engine,
+            &body,
+            SubmitMode::HistoricalTx,
+            WalkBreachPolicy::NetworkAccepted,
+        )
+        .await;
+        let (_, report) = answer.expect("the network accepted it: the walk could not run");
+        let stop_a = report
+            .walk_could_not_run
+            .clone()
+            .expect("the subject's own breach is reported");
+        assert_eq!(stop_a.subject_txid, subject_txid);
+        assert_eq!(stop_a.at_txid, predecessor_txid);
+        assert_eq!(stop_a.limb, WalkLimb::OverWork);
+        assert_eq!(
+            report.landed_predecessors,
+            vec![(predecessor_txid.clone(), TOPIC.to_string())],
+            "the carried predecessor is landed first, and reported"
+        );
+        assert_eq!(
+            report.landed_walks_could_not_run.len(),
+            1,
+            "the landing's own breach is reported, never trusted: {:?}",
+            report.landed_walks_could_not_run
+        );
+        let stop_b = &report.landed_walks_could_not_run[0];
+        assert_eq!(stop_b.subject_txid, predecessor_txid);
+        assert_eq!(
+            stop_b.at_txid, predecessor_txid,
+            "the predecessor's own input 0"
+        );
+        assert!(
+            !stop_b.subject_judged,
+            "the predecessor's input 0 never ran"
+        );
+        assert_eq!(stop_b.limb, WalkLimb::OverWork);
+        assert!(
+            report.faults.is_empty(),
+            "no storage fault: {:?}",
+            report.faults
+        );
+        assert_eq!(report.applied_topics, vec![TOPIC.to_string()]);
+        assert!(
+            applied_row(&store, &predecessor_txid).await,
+            "the predecessor landed"
+        );
+        assert!(
+            applied_row(&store, &subject_txid).await,
+            "the successor landed"
+        );
+        assert!(
+            held_unspent(&store, &subject_txid, 0).await,
+            "the successor's output is held"
+        );
+        assert!(
+            !held_unspent(&store, &funding_txid, 0).await,
+            "the landed predecessor spent the held coin"
+        );
+    });
+}
+
+/// THE DELTA LENS'S PIN 7: the engine-side equality of the door's budget
+/// and the submit's — `Engine::verify_scripts_only` (the gated door's walk)
+/// runs under the ENGINE's `walk_budget`, not a hard-coded default. A lock
+/// of 406 `OP_SHA256`s (under the default 64 MiB work limb, past a 32 MiB
+/// one) is walked by the default engine and is "not now" under a tighter
+/// one, at the door and at the submit alike.
+#[test]
+fn e592_q8_7_the_doors_walk_runs_under_the_engines_budget() {
+    one_at_a_time(async {
+        let lock = [vec![OP_SHA256; 406], vec![OP_DROP, OP_1]].concat();
+        let (body, subject) = on_a_proven_source(&lock, &[0x01, 0x42]);
+
+        // The default: the door walks it, and so does the submit.
+        let engine = engine();
+        engine
+            .verify_scripts_only(&body, &subject)
+            .await
+            .expect("406 hashes are under the default work limb");
+        let (answer, _) = submitted(&engine, &body, SubmitMode::HistoricalTx).await;
+        let (_, report) = answer.expect("the submit walks it too");
+        assert_eq!(report.walk_could_not_run, None);
+
+        // A tighter engine: the door's walk and the submit's walk answer the
+        // same "over budget".
+        let tight = DoorBudget {
+            max_work_bytes: DoorBudget::DEFAULT.max_work_bytes / 2,
+            ..DoorBudget::DEFAULT
+        };
+        let engine = EngineBuilder::new(Box::new(MemoryStorage::new()))
+            .with_topic(TOPIC, Box::new(AdmitOutputZero))
+            .with_walk_budget(tight)
+            .build();
+        match engine.verify_scripts_only(&body, &subject).await {
+            Err(EngineError::ScriptWalkOverBudget { limb, .. }) => {
+                assert_eq!(limb, DoorLimb::Work);
+            }
+            other => panic!("the door under the engine's tight budget: {other:?}"),
+        }
+        match submitted(&engine, &body, SubmitMode::HistoricalTx).await.0 {
+            Err(EngineError::WalkCouldNotRun(stop)) => {
+                assert_eq!(stop.limb, WalkLimb::OverWork);
+            }
+            other => panic!("the submit under the engine's tight budget: {other:?}"),
         }
     });
 }
