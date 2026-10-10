@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased: a corroboration of any number of legs is read one leg at a time, never refused for its count (NL-6d, 2026-10-10)
+
+The posture, the charter's (bsv-stack-lean `docs/charters/beef-of-any-size.md`,
+issue #60): **never a count refusal of what the network accepts; where one
+request cannot finish the work, it is deferred and resumed, never restarted.**
+
+- **The leg cap is gone.** The #267 ancestry-primed corroboration refused a
+  batch of more than 32 EF legs before any submit (`MAX_CORROBORATION_LEGS`,
+  `broadcaster.rs`): inconclusive, 502, nothing admitted; a job the NL-6c
+  deferral had queued answered the same 502 on each run and ended `failed`
+  after five. The constant and its refusal are gone.
+- **One leg at a time, in windows.** The corroboration posts each ancestor to
+  the corroborating host in ancestry order from a cursor, at most
+  `IN_REQUEST_CORROBORATION_LEGS` (32, the #267 sizing of a request's serial
+  POSTs, now a routing number) in the request and `RUN_CORROBORATION_LEGS`
+  (256) in each consumer run. Only the subject's verdict after every ancestor
+  was primed decides; a walk that pauses never posts the deciding attempt, so a
+  partial corroboration cannot admit.
+- **Deferred past the window, resumed from the leg reached.** A walk with legs
+  left in the request is deferred as NL-6c defers: 202 with a reference and the
+  poll path, the body naming `legsFrom` and the leg budget. In a run it answers
+  202 `{resumeAt}`; the consumer records the cursor (`ef_deferred_jobs.legs_from`,
+  migration 179, forward only), clears the run's attempt (a run that advanced
+  is no failed run) and hands the job straight back to the queue. The poll
+  serves `legsFrom`. A run resumed mid-walk does not push the #413
+  dual-broadcast legs again.
+- **A switch for the route tier:** `CORROBORATOR_URL` routes both corroborating
+  hosts (TAAL, then GorillaPool) to one base, so the CI witness posts nothing
+  to a real host. Unset in production: the hosts are as before.
+- **The witness** (`tools/lane-nl6d`, a leg of `make ci-route` on the NL-6c
+  worker): 33 legs answered 200 in the request; 1,000 legs answered 202, done
+  200 after the request and four runs, each of the 999 ancestors posted once;
+  40 legs past the byte budget: every ancestor once and the subject accepted.
+  Red at the witness commit: 502 for 33 and 1,000 legs, the deferred job's
+  run 502 again.
+- **The ceilings not routed past, named.** One leg is one POST: an ancestor the
+  corroborating host cannot answer inside one invocation is the grain this does
+  not divide. The EF batch is still held whole in memory (NL-6c's ceiling: one
+  isolate, 128 MB). After the corroboration, an admission the engine's landing
+  guard calls "not now" (an unproven chain deeper than its 16 predecessor
+  reads) is replayed through the mutation queue with its bytes in the message;
+  a BEEF over `QUEUE_BEEF_SIZE_LIMIT` (90,000 B) cannot be queued and the arm
+  answers 502 "admission not durable", in the request and on every run of a
+  deferred job. That bound is the S2 replay's, not the count's; it is left as
+  found. So is the rebroadcast backstop's own leg cap (`REBROADCAST_MAX_LEGS`,
+  32), a skip, not an answer to a caller.
+- **The cost, stated:** the corroborating work is linear in the legs handed in,
+  and past the request's window it runs on the queue: a body of N unproven legs
+  costs about N corroborator POSTs and N / 256 consumer runs, each re-running
+  the ladder up to the corroboration. #267 bounded that work by refusing; the
+  posture bounds it by the bytes the caller sent.
+
 ## Unreleased: bsv-rs 0.4.3; a transaction with no output is invalid bytes (NL-6f, 2026-10-10)
 
 - **bsv-rs #59.** Both workspaces pin bsv-rs **0.4.3** (the workers' lock keeps
