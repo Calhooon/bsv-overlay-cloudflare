@@ -824,7 +824,7 @@
    "readers": [],
    "rebuild_class": "transient",
    "never_wipe": false,
-   "holds": "NL-6c: one row per broadcast-gated submission whose EF work was past one request's budget: its reference (the sha256 of what was submitted), where its bytes rest, its state, its runs and the arm's answer once a run ended; a settled row is swept by the cron seven days after its last write",
+   "holds": "NL-6c: one row per broadcast-gated submission whose EF work was past one request's budget: its reference (the sha256 of what was submitted), where its bytes rest, its state, its runs, the corroboration's cursor (legs_from, NL-6d) and the arm's answer once a run ended; a settled row is swept by the cron seven days after its last write",
    "why": "the deferral's ledger: a lost row loses the caller's poll and the queued run of a submission the network has not been handed; transient, so its sweep needs no delete_scope"
   },
   {

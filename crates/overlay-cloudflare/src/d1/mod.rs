@@ -467,7 +467,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// the reserve for configured peers); four additive ALTERs.
 /// 175 → 178 for NL-6c (2026-10-09): `ef_deferred_jobs`, its state index and `ef_deferred_chunks` (the broadcast-gated
 /// arm's deferred work and its bytes at rest).
-pub const OVERLAY_MIGRATION_COUNT: usize = 178;
+/// 178 → 179 for NL-6d (2026-10-10): `ef_deferred_jobs.legs_from`, the corroboration's cursor (one additive ALTER).
+pub const OVERLAY_MIGRATION_COUNT: usize = 179;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1758,6 +1759,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::ef_deferred::JOBS_CREATE,
     crate::ef_deferred::JOBS_INDEX,
     crate::ef_deferred::CHUNKS_CREATE,
+    // NL-6d (2026-10-10): THE CORROBORATION'S CURSOR. A deferred job's run reads the #267 corroboration's ancestors
+    // from the leg the last invocation reached (`legs_from`), never from the first again.
+    crate::ef_deferred::JOBS_ADD_LEGS_FROM,
 ];
 
 // =============================================================================
