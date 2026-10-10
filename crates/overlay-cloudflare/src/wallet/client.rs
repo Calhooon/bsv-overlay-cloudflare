@@ -131,18 +131,25 @@ impl<'a> Wallet<'a> {
         self.private_key.public_key().to_hex()
     }
 
+    /// The [`ProtoWallet`] the storage client authenticates as: the admin key
+    /// itself, never the anonymous wallet.
+    ///
+    /// [`ProtoWallet`]: bsv_rs::wallet::ProtoWallet
+    fn admin_proto_wallet(&self) -> bsv_rs::wallet::ProtoWallet {
+        bsv_rs::wallet::ProtoWallet::new(Some(self.private_key.clone()))
+    }
+
     /// Build a fresh [`WorkerStorageClient`] bound to our admin key.
     ///
     /// Each call creates a new `ProtoWallet` + client pair, which triggers
     /// a fresh BRC-103 handshake on first RPC use. That's by design — see
     /// the module-level doc note about per-call clients.
     ///
-    /// The middleware (0.4.1) is built on bsv-rs 0.3 and takes that line's
-    /// wallet, so the admin key crosses the seam as its 32 bytes. A key the
-    /// 0.3 type refuses is an auth failure, never the anonymous wallet.
-    fn make_storage_client(&self) -> Result<WorkerStorageClient, &'static str> {
-        let wallet = bsv_rs::wallet::ProtoWallet::new(Some(self.private_key.clone()));
-        Ok(WorkerStorageClient::new(wallet, &self.endpoint_url))
+    /// The middleware (0.5.0) is built on the workspace's bsv-rs (0.4.3), so
+    /// the `ProtoWallet` is built from the admin key as it is held here and
+    /// handed to `WorkerStorageClient::new` as is: no conversion, no refusal.
+    fn make_storage_client(&self) -> WorkerStorageClient {
+        WorkerStorageClient::new(self.admin_proto_wallet(), &self.endpoint_url)
     }
 
     /// Call `createAction` on wallet-infra.
@@ -237,7 +244,7 @@ impl<'a> Wallet<'a> {
     /// to an empty object just to occupy the slot. See
     /// `rust-wallet-infra/src/dispatch.rs::extract_args`.
     async fn rpc(&self, method: &str, args: Value) -> Result<Value, &'static str> {
-        let mut client = self.make_storage_client()?;
+        let mut client = self.make_storage_client();
         client
             .rpc_call::<Value>(method, vec![json!({}), args])
             .await
@@ -301,6 +308,24 @@ mod tests {
         assert_eq!(
             classify_rpc_error("Storage server returned 500: internal"),
             ERR_WALLET_UNAVAILABLE
+        );
+    }
+
+    // ── The admin key's crossing into the storage client ────────────────────
+
+    #[test]
+    fn the_storage_client_wallet_is_the_admin_key_never_the_anonymous_wallet() {
+        let key = PrivateKey::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000007",
+        )
+        .unwrap();
+        let wallet = Wallet::new(key.clone(), "https://storage.invalid".to_string());
+        let proto = wallet.admin_proto_wallet();
+        assert_eq!(proto.identity_key().to_hex(), key.public_key().to_hex());
+        assert_eq!(proto.identity_key().to_hex(), wallet.identity_key_hex());
+        assert_ne!(
+            proto.identity_key().to_hex(),
+            bsv_rs::wallet::ProtoWallet::anyone().identity_key().to_hex()
         );
     }
 
