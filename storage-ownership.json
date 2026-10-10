@@ -879,7 +879,7 @@
    "readers": [],
    "rebuild_class": "transient",
    "never_wipe": false,
-   "holds": "the one-row state of the pass over the deferred EF jobs' R2 objects (ef-deferred/, N5 of LOW's E585 land2 lens): the last key a pass handled, the objects and bytes counted by the round in progress, the last complete round's count, the last pass",
+   "holds": "the one-row state of the pass over the deferred EF jobs' R2 objects (ef-deferred/, N5 of LOW's E585 land2 lens): the last key a pass handled, the objects and bytes counted by the round in progress, the last complete round's count, the last pass and what it swept (an object no ef_deferred_jobs row names, past the seven-day keep, L1 (b))",
    "why": "the cron's pass lists BEEF_BLOBS under ef-deferred/ 200 objects a pass and resumes from the key at rest, so /health/invariants.queue.r2.efDeferred serves a count never listed at the health call; a lost row restarts the round at the first key and loses only the served count until a round completes; transient"
   },
   {
