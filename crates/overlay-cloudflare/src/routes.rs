@@ -3513,10 +3513,13 @@ async fn readmit_spend_discovery(
 /// drift on what gets crawled.
 pub async fn admin_crawl_peers(
     engine: &Engine,
+    env: &Env,
     peers: &[crate::peer_crawler::PeerConfig],
 ) -> worker::Result<Response> {
     worker::console_log!("POST /admin/crawlPeers ({} peers)", peers.len());
-    let result = crate::peer_crawler::crawl_peers(engine, peers, "admin").await;
+    // E592 NOTE-3: the operator's crawl counts its walks that could not run, as the cron's does.
+    let db = env.d1("OVERLAY_DB").ok();
+    let result = crate::peer_crawler::crawl_peers(engine, peers, "admin", db.as_ref()).await;
     let total_attempted: usize = result.attempted.values().sum();
     let total_admitted: usize = result.admitted_by.values().sum();
     let err_count =

@@ -66,8 +66,9 @@ pub struct CrawlResult {
     /// enumerate records).
     pub peer_errors: HashMap<String, String>,
     /// The engine walks of this crawl that could not run within the budget (bsv-low #592; the E592 lens fold, L3):
-    /// a subject's (not now, nothing admitted, crawled again next tick) and a carried predecessor's landing's. The
-    /// cron counts each (`ops::note_engine_walk_not_now`).
+    /// a subject's (not now, nothing admitted, crawled again next tick) and a carried predecessor's landing's. Each
+    /// is COUNTED inside the crawl as its submit returns (`crawl_peers`' `db`; the E592 delta lens, NOTE-3), so a
+    /// crawl the cron drops at its budget keeps the counts of the submits it finished; this list is the report.
     pub walks_could_not_run: Vec<overlay_engine::engine::WalkCouldNotRun>,
 }
 
@@ -93,12 +94,22 @@ pub(crate) struct OutputEntry {
 /// `origin` is just for log prefixing ("cron" vs "admin") so you can
 /// tell at a glance whether a log line came from the 15-min cron or
 /// from an operator-triggered `/admin/crawlPeers`.
-pub async fn crawl_peers(engine: &Engine, peers: &[PeerConfig], origin: &str) -> CrawlResult {
+///
+/// `db` is where each walk that could not run is counted, as its submit
+/// returns (`ops::note_engine_walk`, `ops::note_engine_walk_not_now`): the
+/// cron races the crawl against `PEER_CRAWL_BUDGET_MS` and a count made after
+/// the race was lost with a dropped crawl (the E592 delta lens, NOTE-3).
+pub async fn crawl_peers(
+    engine: &Engine,
+    peers: &[PeerConfig],
+    origin: &str,
+    db: Option<&worker::D1Database>,
+) -> CrawlResult {
     let mut result = CrawlResult::default();
     for peer in peers {
         for (service, topic) in &peer.service_to_topic {
             let key = format!("{}|{}", peer.peer_url, service);
-            match crawl_one(engine, &peer.peer_url, service, topic, origin).await {
+            match crawl_one(engine, &peer.peer_url, service, topic, origin, db).await {
                 Ok((attempted, admitted, errors, walks)) => {
                     result.walks_could_not_run.extend(walks);
                     result.attempted.insert(key.clone(), attempted);
@@ -139,6 +150,7 @@ async fn crawl_one(
     service: &str,
     topic: &str,
     origin: &str,
+    db: Option<&worker::D1Database>,
 ) -> Result<CrawledOne, String> {
     let outputs = fetch_lookup(peer_url, service).await?;
     let mut admitted_total: usize = 0;
@@ -159,6 +171,9 @@ async fn crawl_one(
             Ok((steak, report)) => {
                 let admitted: usize = steak.values().map(|a| a.outputs_to_admit.len()).sum();
                 admitted_total += admitted;
+                if let Some(db) = db.filter(|_| !report.landed_walks_could_not_run.is_empty()) {
+                    crate::ops::note_engine_walk(db, &report, "peer-crawl").await;
+                }
                 walks.extend(report.landed_walks_could_not_run);
             }
             Err(overlay_engine::engine::EngineError::WalkCouldNotRun(stop)) => {
@@ -169,6 +184,9 @@ async fn crawl_one(
                     peer = peer_url,
                     service = service,
                 );
+                if let Some(db) = db {
+                    crate::ops::note_engine_walk_not_now(db, &stop, "peer-crawl").await;
+                }
                 walks.push(stop);
             }
             Err(e) => {

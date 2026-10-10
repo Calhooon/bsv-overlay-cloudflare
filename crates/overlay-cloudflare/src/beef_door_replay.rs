@@ -1322,11 +1322,43 @@ mod e592 {
         );
         assert!(lib.contains("engine.set_walk_budget(WORKER_WALK_BUDGET);"));
         // the crawl's walks (E592 L3) and the GASP anchor's hold
-        assert!(lib.contains("crate::ops::note_engine_walk_not_now(&db, stop, \"peer-crawl\")"));
         assert!(lib.contains("anchor_walk_held_graphs={}"));
+        // E592 NOTE-3: the crawl counts INSIDE the raced future, as each submit returns, never after the race
+        // (a crawl dropped at its budget lost them); the cron and the operator's crawl both hand it the D1. RED on
+        // `d899aa1`'s sources: the cron's crawl is handed no D1.
+        assert!(lib
+            .contains("peer_crawler::crawl_peers(&engine, &peers, \"cron\", crawl_db.as_ref()),"));
+        let after_race = &lib[lib
+            .find("peer_crawler::crawl_peers(&engine, &peers, \"cron\"")
+            .expect("the cron's crawl")..];
+        let after_race = &after_race[..after_race
+            .find("// BEEF proof completion")
+            .expect("the next step")];
+        assert!(
+            !after_race.contains("note_engine_walk"),
+            "the cron counts nothing after the race: the crawl did"
+        );
         let crawler = include_str!("peer_crawler.rs");
-        assert!(crawler.contains(".submit_with_report(&tagged, SubmitMode::CurrentTx)"));
-        assert!(crawler.contains("walks.extend(report.landed_walks_could_not_run);"));
+        let submit = crawler
+            .find(".submit_with_report(&tagged, SubmitMode::CurrentTx)")
+            .expect("the crawl's submit");
+        let tail = &crawler[submit..];
+        let pushed = tail.find("walks.push(stop);").expect("the not-now stop");
+        let not_now = tail
+            .find("crate::ops::note_engine_walk_not_now(db, &stop, \"peer-crawl\").await;")
+            .expect("a not-now counted as the submit returns");
+        assert!(not_now < pushed);
+        let extended = tail
+            .find("walks.extend(report.landed_walks_could_not_run);")
+            .expect("the landings' stops");
+        let landed = tail
+            .find("crate::ops::note_engine_walk(db, &report, \"peer-crawl\").await;")
+            .expect("a landing's breach counted as the submit returns");
+        assert!(landed < extended);
+        let routes_src = include_str!("routes.rs");
+        assert!(routes_src.contains(
+            "crate::peer_crawler::crawl_peers(engine, peers, \"admin\", db.as_ref()).await;"
+        ));
 
         let routes = include_str!("routes.rs");
         let submit = routes

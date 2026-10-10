@@ -222,7 +222,7 @@ pub struct MutationMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ef_job: Option<String>,
     /// The E592 lens fold (bsv-low #592): set by the BROADCAST-GATED arm's producer alone (`/submit` under
-    /// `ProceedWithNetworkGate`, the route's `enqueue_replay_gated`): the network accepted these bytes before the
+    /// `ProceedWithNetworkGate`: `enqueue_replay(.., gated)` with `gated_subject.is_some()`): the network accepted these bytes before the
     /// message was sent. Its consumer replays under `WalkBreachPolicy::NetworkAccepted` ([`replay_breach_policy`]):
     /// a walk past the engine's budget goes on as `historical-tx-no-spv`. A message without it is NOT gated (its
     /// walk past the budget is "not now"), whatever its mode: an ungated `historical-tx` fault replays under the

@@ -440,7 +440,7 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
                 // bsv-low PLAN-PRE-LOOP4 §H4: re-notify (or re-submit, subject-named) a txid the index never came to know
                 "/admin/readmit" => admin_readmit(&engine, &env, req).await,
                 "/admin/remove-token" => admin_remove_token(&engine, req).await,
-                "/admin/crawlPeers" => admin_crawl_peers(&engine, &non_gasp_peers()).await,
+                "/admin/crawlPeers" => admin_crawl_peers(&engine, &env, &non_gasp_peers()).await,
                 "/admin/janitor" => {
                     admin_janitor(
                         ship_storage.as_ref(),
@@ -1470,8 +1470,11 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     let peers = non_gasp_peers();
     // #257: bounded like GASP sync — crawl submits are dupe-checked, so a
     // dropped crawl re-does nothing next tick.
+    // E592 NOTE-3: each walk that could not run is counted inside the crawl, as its submit returns, so a crawl
+    // dropped at its budget keeps the counts of what it finished.
+    let crawl_db = env.d1("OVERLAY_DB").ok();
     match race_or_deadline(
-        peer_crawler::crawl_peers(&engine, &peers, "cron"),
+        peer_crawler::crawl_peers(&engine, &peers, "cron", crawl_db.as_ref()),
         crate::broadcaster::sleep_ms(PEER_CRAWL_BUDGET_MS),
     )
     .await
@@ -1480,14 +1483,6 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             "Scheduled: peer-crawl EXCEEDED its {PEER_CRAWL_BUDGET_MS} ms budget — dropped (bsv-low#257); continuing the tick"
         ),
         Some(crawl_result) => {
-            // the E592 lens fold (L3): the crawl's walks that could not run are counted like every door's
-            if !crawl_result.walks_could_not_run.is_empty() {
-                if let Ok(db) = env.d1("OVERLAY_DB") {
-                    for stop in &crawl_result.walks_could_not_run {
-                        crate::ops::note_engine_walk_not_now(&db, stop, "peer-crawl").await;
-                    }
-                }
-            }
             let total_attempted: usize = crawl_result.attempted.values().sum();
             let total_admitted: usize = crawl_result.admitted_by.values().sum();
             worker::console_log!(
