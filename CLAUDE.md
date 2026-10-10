@@ -313,7 +313,7 @@ allocator's fragmentation and what a native estimate does not see of wasm32:
 48 MiB, three eighths of the isolate. It lets through a BUMP of up to 72,944
 leaves (690 bytes a level-0 leaf), a single transaction of up to about 12 MB
 whose walked inputs' scripts are few chunks (above), and a 10 MB body of one-input, one-output P2PKH transactions (191 bytes each,
-charged 570: 30 MB). It stops 111,848 transactions of no input and no output.
+charged 570: 30 MB). It stops about 89,770 one-input, one-output transactions of 60 bytes (5.4 MB; the L3 pin); a transaction with no input or no output is invalid bytes since bsv-rs 0.4.2 / 0.4.3 and refused by every parse first.
 
 Measured (native, debug profile, `tests/script_door_stream.rs`): a 2,122,796
 byte BEEF whose subject is 2,112,195 bytes with 300 inputs over 100 unproven
@@ -345,15 +345,19 @@ steps stand BEFORE it and are not this door's. Since NL-6 the route caps no
 request and its parses (`ef::missing_source_txids`, the subject's log line,
 `ef::beef_to_ef_batch`: `beef_limits::parse_beef`, the streaming door, then a
 HYDRATED `Beef`; `EF_BEEF_LIMITS` is a name only, no count or size is
-compared) refuse invalid bytes only; then the route's EF work bound
-(`routes.rs` `MAX_SUBJECT_EF_BYTES` 256 KB, `MAX_BATCH_EF_BYTES` 2 MB: a 429
-"retry via fallback" before the door, #211, the one size answer left on the
-path). The pin's 2 MB subject passes the DOOR; through the route it meets that
-429 first. Those parses hydrate the body before the door's limb is read, and
+compared) refuse invalid bytes only (since bsv-rs 0.4.2 / 0.4.3 a transaction
+with no input or no output among them); then the route's EF work budget
+(`ef_deferred.rs` `IN_REQUEST_SUBJECT_EF_BYTES` 256 KiB,
+`IN_REQUEST_BATCH_EF_BYTES` 2 MiB): past it NL-6c DEFERS the work (202 and a
+poll, the job run by the queue consumer through the same arm, the door
+included), never a 429. The pin's 2 MB subject passes the DOOR; through the
+route it is deferred, and the job's run meets the door. Those parses hydrate the body before the door's limb is read, and
 nothing but the isolate bounds them (the land lens E585-LAND-M1, measured
-natively, release: a 9,900,010 byte body of 900,000 minimal transactions
-peaks at 1,427,616,056 bytes in the route's parse and EF conversion, then
-answers the 429; the wide BUMP, 2^18 leaves in 9,830,056 bytes, 190,320,572
+natively, release, on `7730e20`: a 9,900,010 byte body of 900,000 minimal
+transactions peaked at 1,427,616,056 bytes in the route's parse and EF
+conversion; since bsv-rs 0.4.2 the route's parse refuses that body at its
+first element, `NoInputs`; a body of as many VALID transactions was not
+measured through the route; the wide BUMP, 2^18 leaves in 9,830,056 bytes, 190,320,572
 in each of its three parses, then the door stops at its memory limb in 250
 bytes; on wasm32 both die in the route, the platform's error; identical on
 `7730e20`, NL-6's, the stack-lean captain's NL-6c): the door's memory limb
@@ -518,9 +522,11 @@ read and the verdict is `could-not-evaluate(ancestry-over-memory)`
 `submitReadinessCensus.wouldFailAndUnevalReasons.ancestryOverMemory`): no
 green. On the lens's two bodies: the wide BUMP is `ancestry-over-memory` (151
 MB by the estimate; up to 87,381 leaves are read), after the arm's own parse
-at step (1) held 190 MB natively; the 900,000 minimal transactions are
-`would-fail(ef-over-cap)`, the arm's 429 (#211, NL-6's to fix), after its
-whole-body parse and EF conversion (1,427,616,056 bytes natively, the land
+at step (1) held 190 MB natively; the 900,000 minimal transactions of the lens
+are `would-fail(parse)` since bsv-rs 0.4.2 (`NoInputs`, the arm's own parse at
+step (1)): no body is refused for its transaction count (before 0.4.2 they were
+`would-fail(ef-over-cap)`, the arm's 429, after its whole-body parse and EF
+conversion of 1,427,616,056 bytes natively, the land
 lens E585-LAND-M1) and before any stream read: no body is refused for its
 transaction count since NL-6.
 
@@ -545,8 +551,10 @@ which refuses INVALID bytes only, then hydrate a `Beef` (`EF_BEEF_LIMITS` is a
 name only: no count or size is compared). So no body is `would-fail(parse)`
 for its size or its counts; the census adds no size or count check of its
 own and calls the arm's functions, so it moves with `ef.rs`.
-`would-fail(ef-over-cap)` is the arm's own 429 (`MAX_SUBJECT_EF_BYTES` 256
-KB, `MAX_BATCH_EF_BYTES` 2 MB), mirrored. The memory of a census pass is
+The census has no EF-size check since NL-6c (the arm defers that work, 202,
+and refuses nothing for it): a body past the EF budget is classified like any
+other; `submit_census_reason_ef_over_cap_total` stays in the read table, never
+bumped again. The memory of a census pass is
 therefore the arm's hydrated parse and EF conversion plus the small index;
 only the index and the stream's element are #585's. The arm's parse runs in
 step (1), BEFORE the census's own bound is reached, and nothing but the
@@ -567,7 +575,8 @@ left (the lens's N6: NL-6's file, theirs to drop).
 Pins: `cargo test --manifest-path workers/Cargo.toml -p
 bsv-overlay-cloudflare --lib e585 -- --nocapture`. Door 2's: `e585_d2_a` (a 5
 MB valid BEEF is `gated-ready`, one whose SUBJECT is the 5 MB is
-`would-fail(ef-over-cap)`, one with two tips is
+`gated-ready` too (until NL-6c it was `would-fail(ef-over-cap)`, the arm's
+429; the arm now defers it), one with two tips is
 `could-not-evaluate(subject-ambiguous)`; RED on `d6d2774`, grafted:
 `CouldNotEvaluate(BodyOverEvalBound)`), `e585_d2_the_streams_ancestry_*` (the
 stream's answer equals the hydrated parse's, kept verbatim in the test, for
@@ -1693,7 +1702,9 @@ bytes rest, and under what bound:
   the body needs (under D1's 2,000,000-byte row). No path compares the body's
   length with a cap: the bound is the platform's (one isolate holds the body
   whole, the plan's request-body limit), named in `ef_deferred.rs`. The
-  consumer reads them back with a length check (`load`), deletes them when the
+  consumer reads them back with a length check (`load`) and the reference
+  check at the run (`run_job`: the sha256 of the topics, the BEEF and the
+  off-chain values recomputed over what was read), deletes them when the
   job settles (`release`), and the cron sweeps a settled job and its bytes
   after 7 days (`redrive`).
 - **The job's "not now" replay** (the arm's admission after the corroboration,
@@ -1707,18 +1718,25 @@ bytes rest, and under what bound:
 
 So the three are one rule in what they refuse (nothing, for size). Not unified,
 stated as a follow-up: the job's object is keyed by its reference, not by
-door 3's `mutations/<sha256>/<scope>`, and its read checks the length, not the
-sha256 (`ef_deferred.rs` `load`, the `bytes.len() != total` check); and an
-`ef-deferred/` object whose job row was never written (the R2 `put` landed,
-`JOB_UPSERT_SQL` faulted: `ef_deferred.rs` `defer`) is named by no job and no
-sweep lists its prefix, so it stays until an operator deletes it (the request
-answered an error; the client's re-presentation writes the same key over it).
+door 3's `mutations/<sha256>/<scope>`. Its bytes are checked twice at the run:
+the length (`load`), then the reference, the sha256 of the topics, the BEEF and
+the off-chain values framed by length, recomputed over what was read
+(`run_job`); a mismatch fails the job and releases the bytes, so no object is
+replayed as another submission's. The R2 put is given no checksum (door 3's
+is), so a corrupted upload is found at the run, not refused at the put. A job's
+bytes whose row was never written (the R2 `put` or the D1 chunks landed,
+`JOB_UPSERT_SQL` faulted: `ef_deferred.rs` `put_at_rest`) are named by no job
+and no sweep reads them (the orphan sweep lists `mutations/` only), so they
+stay until an operator deletes them (the request answered 503, retryable; the
+client's re-presentation writes the same key, or deletes and rewrites the same
+chunks).
 
 The scheduled tick, in order (`lib.rs` `scheduled`): the ad sync; the R2
 orphan sweep's one pass under its own 30 s race (`SWEEP_BUDGET_MS`, door 3's
 fold); the stale deferred graphs (#555); the deferred EF jobs' hand-back and
-keep sweep (`ef_deferred::redrive`, NL-6c/6d: quiet jobs sent to the queue
-again, a D1 read and one send per job, no race of its own); then the GASP step
+keep sweep (`ef_deferred::redrive`, NL-6c/6d: two D1 reads; up to 20 quiet jobs sent to
+the queue again, a send and a touch each; up to 50 jobs settled over 7 days
+ago deleted with their bytes, two deletes each; no race of its own); then the GASP step
 under its guarded 240 s belt (`GASP_SYNC_BUDGET_MS`), and the passes after it.
 The 240 s belt bounds the GASP step alone: the sweep and the hand-back run
 before it, outside it. The jobs' RUNS are the queue consumer's
