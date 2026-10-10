@@ -1397,4 +1397,236 @@ mod e592 {
             "submit_engine_walk_over_budget_total"
         );
     }
+
+    /// PIN 8 (the delta lens's question 8, M2): the composition the other seven pins leave
+    /// apart. A REAL engine's `WalkCouldNotRun` on the witness drives a `not_now` dead letter
+    /// through the SHIPPED `NOTE_FAILING_SQL` and `PARK_SQL` on rusqlite, and #576's three
+    /// not-now bounds gate it.
+    ///
+    /// The witness's UNMARKED replay (an ungated fault's replay: no gated mark, the same bytes
+    /// the gated arm would mark) through the Worker's engine is `WalkCouldNotRun` (the memory
+    /// limb), so `queue::replay_error_class` is `NotNow`. That class, noted and parked as the
+    /// DLQ consumer does it, lands a `class = 'not_now'` row; a SECOND topic set of the same
+    /// txid is deferred (per txid), and the not-now share (1000) and the day's bound (200) each
+    /// defer it too — `ceiling_verdict` names the bound, the shipped `PARK_SQL` returns no row.
+    /// Deterministic, network-free.
+    ///
+    /// Does not compile on `0313648`: the base has no `WalkBreachPolicy`, no `WalkCouldNotRun`
+    /// and no `MutationMessage::gated`/`replay_breach_policy`, so the unmarked-replay half
+    /// cannot be written there (the same reason `e592_b` cannot).
+    #[test]
+    fn e592_q8_8_the_unmarked_replays_not_now_letter_parks_through_park_sql() {
+        use crate::d1::{QVal, Query};
+
+        fn binds(q: &Query) -> Vec<rusqlite::types::Value> {
+            q.params()
+                .iter()
+                .map(|p| match p {
+                    QVal::Null => rusqlite::types::Value::Null,
+                    QVal::Int(i) => rusqlite::types::Value::Integer(*i),
+                    QVal::Text(s) => rusqlite::types::Value::Text(s.clone()),
+                    QVal::Bool(b) => rusqlite::types::Value::Integer(i64::from(*b)),
+                    QVal::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+                    QVal::Float(f) => rusqlite::types::Value::Real(*f),
+                })
+                .collect()
+        }
+        // Run a statement; every row it RETURNs, each column as text (NULL as ""). A write with
+        // no RETURNING (the note) answers none; a `PARK_SQL` whose WHERE defers answers none too.
+        fn rows(conn: &rusqlite::Connection, q: &Query) -> Vec<Vec<String>> {
+            let mut stmt = conn.prepare(q.sql()).unwrap();
+            let cols = stmt.column_count();
+            if cols == 0 {
+                stmt.execute(rusqlite::params_from_iter(binds(q).iter()))
+                    .unwrap();
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            let mut rs = stmt
+                .query(rusqlite::params_from_iter(binds(q).iter()))
+                .unwrap();
+            while let Some(r) = rs.next().unwrap() {
+                out.push(
+                    (0..cols)
+                        .map(|i| match r.get::<_, rusqlite::types::Value>(i).unwrap() {
+                            rusqlite::types::Value::Null => String::new(),
+                            rusqlite::types::Value::Integer(v) => v.to_string(),
+                            rusqlite::types::Value::Real(v) => v.to_string(),
+                            rusqlite::types::Value::Text(s) => s,
+                            rusqlite::types::Value::Blob(_) => "<blob>".into(),
+                        })
+                        .collect(),
+                );
+            }
+            out
+        }
+        // The shipped dead-letter schema (the DLQ consumer's migrations), as `dead_letters`' own tests build it.
+        fn schema() -> rusqlite::Connection {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            for m in [
+                dead_letters::DEAD_LETTERS_CREATE,
+                dead_letters::DEAD_LETTERS_INDEX,
+                dead_letters::DEAD_LETTERS_HEALTH_INDEX,
+                dead_letters::DEAD_LETTERS_REDRIVEN_INDEX,
+                dead_letters::DEAD_LETTERS_CLASS_COLUMN,
+                dead_letters::DEAD_LETTERS_CLASS_INDEX,
+                dead_letters::DEAD_LETTERS_R2_KEY_COLUMN,
+                dead_letters::DEAD_LETTERS_R2_BYTES_COLUMN,
+                dead_letters::DEAD_LETTERS_R2_INDEX,
+            ] {
+                conn.execute(m, []).unwrap();
+            }
+            conn
+        }
+        // The DLQ lifecycle of one failed replay: the main consumer's note of its class, then the ceiling read, its
+        // shipped verdict, and the shipped `PARK_SQL` (always run, so its own WHERE is what defers). Returns the
+        // typed verdict (the bound's name) and the rows `PARK_SQL` returned (1 parked, 0 deferred).
+        fn note_and_park(
+            conn: &rusqlite::Connection,
+            key: &str,
+            topics: &str,
+            class: dead_letters::LetterClass,
+            message: &str,
+            now: i64,
+        ) -> (
+            std::result::Result<Option<u64>, dead_letters::Deferral>,
+            usize,
+        ) {
+            rows(
+                conn,
+                &dead_letters::note_failing_query(
+                    key,
+                    topics,
+                    "the witness replay's walk could not run",
+                    now - 1,
+                    class,
+                ),
+            );
+            let r = rows(
+                conn,
+                &dead_letters::ceiling_query(key, topics, dead_letters::day_cutoff(now)),
+            )
+            .remove(0);
+            let f = |i: usize| r[i].parse::<f64>().unwrap();
+            let verdict = dead_letters::ceiling_verdict(&dead_letters::CeilingRow {
+                held: f(0),
+                known: f(1),
+                class: r[2].clone(),
+                not_now: f(3),
+                not_now_txid: f(4),
+                not_now_day: f(5),
+                r2_key: Some(r[6].clone()).filter(|k| !k.is_empty()),
+            });
+            let parked = rows(
+                conn,
+                &dead_letters::park_query(
+                    key,
+                    topics,
+                    message,
+                    dead_letters::FAULT_UNRECORDED,
+                    0,
+                    now,
+                ),
+            )
+            .len();
+            (verdict, parked)
+        }
+        // Seed N parked `not_now` letters of distinct keys at `parked_at`, bypassing the bounds (a stranger's flood
+        // already at rest), so a fresh presentation meets a bound.
+        fn seed_not_now(conn: &rusqlite::Connection, n: usize, parked_at: i64) {
+            for i in 0..n {
+                conn.execute(
+                    "INSERT INTO mutation_dead_letters (txid, topics, message, status, first_seen_at, parked_at, class) \
+                     VALUES (?1, ?2, '{}', 'parked', ?3, ?3, 'not_now')",
+                    rusqlite::params![format!("seed{i}"), format!("t{i}"), parked_at],
+                )
+                .unwrap();
+            }
+        }
+
+        // The witness's UNMARKED replay message, planned exactly as the route's fault replay plans it (by key:
+        // 1.9 MB past the inline room), run through the REAL Worker engine under its walk budget.
+        let (beef, subject) = walk_witness::witness();
+        let topics = vec!["tm_test".to_string()];
+        let unmarked = queue::plan_replay(
+            &beef,
+            &topics,
+            SubmitMode::HistoricalTx,
+            queue::REPLAY_REASON_PHASE3_FAULT,
+            queue::QUEUE_MESSAGE_ROOM,
+        )
+        .message()
+        .clone();
+        assert!(!unmarked.gated, "an ungated fault's replay");
+        let err = match replay(&worker_engine(), &unmarked, &beef) {
+            Err(e) => e,
+            other => panic!("the unmarked replay past the budget is not now: {other:?}"),
+        };
+        match &err {
+            overlay_engine::engine::EngineError::WalkCouldNotRun(stop) => {
+                assert_eq!(stop.subject_txid, subject);
+                assert_eq!(stop.limb, WalkLimb::OverMemory);
+            }
+            other => panic!("the unmarked replay past the budget is not now: {other:?}"),
+        }
+        let class = queue::replay_error_class(&err);
+        assert_eq!(class, dead_letters::LetterClass::NotNow);
+
+        // The letter's key, as both DLQ consumers name it (door 3's keyed message: the subject by D5).
+        let (key, key_topics) = dead_letters::letter_key(&unmarked, Some(&subject));
+        assert_eq!(key_topics, "tm_test");
+        let message = serde_json::to_string(&unmarked).unwrap();
+        let now = 1_000_000_000;
+
+        // (1) end to end: the not_now letter parks, and the stored row's class is 'not_now'.
+        let conn = schema();
+        assert_eq!(
+            note_and_park(&conn, &key, &key_topics, class, &message, now),
+            (Ok(None), 1),
+            "the witness letter parks"
+        );
+        let stored: String = conn
+            .query_row(
+                "SELECT class FROM mutation_dead_letters WHERE txid = ?1 AND topics = ?2 AND status = 'parked'",
+                rusqlite::params![key, key_topics],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "not_now", "PARK_SQL kept the replay's class");
+
+        // (2) per txid: a SECOND topic set of the same txid is deferred (PARK_SQL returns no row).
+        assert_eq!(
+            note_and_park(&conn, &key, "tm_other", class, &message, now + 1),
+            (Err(dead_letters::Deferral::NotNowTxid(1)), 0),
+            "a second topic set of the same txid is deferred"
+        );
+
+        // (3) the not-now share (1000): with the share full of a stranger's letters, the witness letter defers.
+        let conn = schema();
+        seed_not_now(&conn, dead_letters::NOT_NOW_MAX as usize, now);
+        assert_eq!(
+            note_and_park(&conn, &key, &key_topics, class, &message, now),
+            (
+                Err(dead_letters::Deferral::NotNowShare(
+                    dead_letters::NOT_NOW_MAX
+                )),
+                0
+            ),
+            "the not-now share bounds the witness letter"
+        );
+
+        // (4) per day (200): with the day's new letters full (the share not), the witness letter defers.
+        let conn = schema();
+        seed_not_now(&conn, dead_letters::NOT_NOW_PER_DAY as usize, now);
+        assert_eq!(
+            note_and_park(&conn, &key, &key_topics, class, &message, now),
+            (
+                Err(dead_letters::Deferral::NotNowDay(
+                    dead_letters::NOT_NOW_PER_DAY
+                )),
+                0
+            ),
+            "the per-day bound bounds the witness letter"
+        );
+    }
 }

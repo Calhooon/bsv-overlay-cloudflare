@@ -666,7 +666,7 @@ fn e592_q8_1_a_non_push_unlock_refuses_and_writes_nothing() {
             let engine = engine_over(store.clone(), None);
             submitted(
                 &engine,
-                &beef_v1(&[funding.clone()]),
+                &beef_v1(std::slice::from_ref(&funding)),
                 SubmitMode::HistoricalTx,
             )
             .await
@@ -763,7 +763,9 @@ fn flip_unlocking_byte_of(tx: &mut Transaction, input: usize, offset: usize) {
 /// input 1's DER signature flipped after signing: DER stays well-formed, the
 /// signature no longer verifies.
 async fn two_input_spend_over(first: LockingScript) -> (Vec<u8>, String) {
-    let key = PrivateKey::random();
+    // A fixed scalar, so the body (and its flipped-byte witness) is
+    // reproducible run to run; the verdict never depends on the key.
+    let key = PrivateKey::from_bytes(&[1; 32]).expect("a fixed nonzero scalar");
     let funding = two_output_funding(first, &key);
     let mut tx = Transaction::new();
     tx.add_input_from_tx(funding.clone(), 0, open_unlock())
@@ -901,6 +903,12 @@ fn e592_q8_3_the_roots_of_a_breached_walk_are_checked() {
                         }
                         Err(EngineError::WalkCouldNotRun(stop)) => {
                             assert!(knows, "{name}, {policy:?}");
+                            assert_eq!(
+                                policy,
+                                WalkBreachPolicy::NotNow,
+                                "a WalkCouldNotRun refusal is NotNow's alone \
+                                 (NetworkAccepted goes on), {name}"
+                            );
                             assert_eq!(stop.limb, WalkLimb::OverWork, "{name}, {policy:?}");
                             assert!(!stop.subject_judged, "the charge of input 0, {name}");
                         }
@@ -1026,7 +1034,7 @@ fn e592_q8_6_a_breached_landing_walks_its_predecessor_and_never_trusts_it() {
         let engine = engine_naming(store.clone());
         submitted(
             &engine,
-            &beef_v1(&[funding.clone()]),
+            &beef_v1(std::slice::from_ref(&funding)),
             SubmitMode::HistoricalTx,
         )
         .await
@@ -1064,7 +1072,7 @@ fn e592_q8_6_a_breached_landing_walks_its_predecessor_and_never_trusts_it() {
         let engine = engine_naming(store.clone());
         submitted(
             &engine,
-            &beef_v1(&[funding.clone()]),
+            &beef_v1(std::slice::from_ref(&funding)),
             SubmitMode::HistoricalTx,
         )
         .await

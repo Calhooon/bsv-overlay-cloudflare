@@ -10229,12 +10229,13 @@ async fn e586f_n_a_root_proven_restart_carries_what_the_pass_spent_of_every_limb
 // A lock one input past the work limb: a 1-byte push, 612 OP_SHA256s (612
 // x 128 KiB = 80,216,064 bytes of budget over the door's default 64 MiB),
 // then OP_DROP OP_1. The script is VALID on its face (the push feeds every
-// hash, the drop clears it, OP_1 leaves true): on the base, which ran the
-// anchor's scripts with no budget, it runs green and the graph is finalized.
+// hash, the drop clears it, OP_1 leaves true): on the base the walk breached
+// and the anchor went on as `historical-tx-no-spv` with no root asked:
+// finalized, the rejected-root arm included.
 fn heavy_lock_hex() -> String {
     use bsv_rs::script::op::{OP_DROP, OP_SHA256};
     let mut lock = vec![0x01, 0x42];
-    lock.extend(std::iter::repeat(OP_SHA256).take(612));
+    lock.extend(std::iter::repeat_n(OP_SHA256, 612));
     lock.extend_from_slice(&[OP_DROP, bsv_rs::script::op::OP_1]);
     hex::encode(lock)
 }
@@ -10399,8 +10400,9 @@ impl Anchored {
 // cursor below the UTXO, the peer not failed. The same walk with the
 // funding's root REJECTED (a tracker that knows nothing): the breach never
 // answers, the bad root is the refusal it is — the graph discarded, the
-// cursor past it, no record. RED on 0313648: the base ran the same script
-// (it is valid) with no budget and finalized the graph, admitting the tip.
+// cursor past it, no record. RED on 0313648: on the base the walk breached
+// and the anchor went on as `historical-tx-no-spv` with no root asked:
+// finalized, the rejected-root arm included.
 #[tokio::test]
 async fn e592_q8_4_an_anchor_walk_that_cannot_run_holds_the_graph_and_a_rejected_root_refuses_it() {
     let (_logs, _guard) = capture_logs();
