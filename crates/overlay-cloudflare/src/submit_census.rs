@@ -659,6 +659,17 @@ mod tests {
                 0,
             ))
             .unwrap();
+        // Since bsv-rs 0.4.3 a transaction has an output (bsv-rs #59): a
+        // subject with none is refused at the parse (`NoOutputs` at its first
+        // byte), before the EF step this cell is about. It is meant well
+        // formed, its absent source the only fault, so it pays one output.
+        real_subject
+            .add_output(bsv_rs::transaction::TransactionOutput {
+                satoshis: Some(4_000),
+                locking_script: bsv_rs::script::LockingScript::from_binary(&[0x51]).unwrap(),
+                change: false,
+            })
+            .unwrap();
         let mut beef = Beef::new();
         beef.merge_transaction(grandparent);
         beef.merge_transaction(parent);
