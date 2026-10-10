@@ -1157,8 +1157,19 @@ fn build_engine_with_storage(
             as overlay_engine::engine::LandingGuardFuture
     }));
 
+    // bsv-low #592: the engine's own script walk (every submit that walks: the queue's historical-tx replay, the
+    // ungated modes, `/admin/readmit`, the peer crawler's current-tx; and the GASP anchor check) runs under the
+    // door's budget, the instance the gated door walks under. A breach is counted (`ops::note_engine_walk`), never
+    // a refusal.
+    engine.set_walk_budget(WORKER_WALK_BUDGET);
+
     engine
 }
+
+/// The budget of the engine's own script walk in this Worker (bsv-low #592, `Engine::set_walk_budget`): the door's
+/// own, `DoorBudget::DEFAULT`, under which the gated door walks (`verify_scripts_only`); pinned equal
+/// (`beef_door_replay::e592`). Three eighths of a 128 MB isolate for the memory limb.
+pub const WORKER_WALK_BUDGET: overlay_engine::engine::DoorBudget = overlay_engine::engine::DoorBudget::DEFAULT;
 
 /// PURE (bsv-low#257): race `fut` against `deadline`; `None` = the deadline
 /// won and `fut` was DROPPED (its in-flight work cancelled). Injectable
@@ -2428,6 +2439,11 @@ async fn queue_handler(
         }
 
         let replayed = engine.submit_with_report(&tagged_beef, mode).await;
+        // bsv-low #592: the replay's walk (historical-tx) runs under the engine's budget; one that could not run
+        // is counted and the replay goes on as historical-tx-no-spv, so it is acked, never dead-lettered for its size
+        if let (Ok((_, report)), Some(db)) = (&replayed, &counters) {
+            crate::ops::note_engine_walk(db, report, "Queue").await;
+        }
         // lane E1D's delta fold (L2): what the engine landed first from the BEEF (written whole, whatever the
         // subject's own report) is guarded like the replay's own write; the batch's end flush ships the notes
         if let (Ok((_, report)), Some(db)) = (&replayed, &counters) {

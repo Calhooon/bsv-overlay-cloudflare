@@ -1690,6 +1690,12 @@ async fn submit_parts(
         }
     };
     let engine_submit_ms = js_sys::Date::now() - engine_started;
+    // bsv-low #592: a walk the engine's budget could not hold is counted, never refused
+    if mutation_report.walk_could_not_run.is_some() {
+        if let Ok(db) = env.d1("OVERLAY_DB") {
+            crate::ops::note_engine_walk(&db, &mutation_report, "POST /submit").await;
+        }
+    }
     // lane E1D's delta fold (L2): what the engine landed first from the BEEF is guarded like the subject's write
     if !mutation_report.landed_predecessors.is_empty() {
         if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
@@ -3364,6 +3370,12 @@ pub async fn admin_readmit(
             if !report.landed_predecessors.is_empty() {
                 if let Ok(db) = env.d1("OVERLAY_DB") {
                     crate::admit_fast::guard_landed(&db, &report.landed_predecessors, "POST /admin/readmit").await;
+                }
+            }
+            // bsv-low #592: a walk the engine's budget could not hold is counted, never refused
+            if report.walk_could_not_run.is_some() {
+                if let Ok(db) = env.d1("OVERLAY_DB") {
+                    crate::ops::note_engine_walk(&db, &report, "POST /admin/readmit").await;
                 }
             }
             let admitted = steak

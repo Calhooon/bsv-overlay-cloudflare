@@ -86,6 +86,49 @@ pub const COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET: &str = "submit_script_walk_ove
 /// the request proceeds to the network gate.
 pub const COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY: &str = "submit_script_walk_over_memory_total";
 
+/// Submits whose ENGINE walk could not run within the engine's budget
+/// (bsv-low #592: `Engine::submit`'s own script walk, every mode but
+/// `historical-tx-no-spv`, the queue's `historical-tx` replay of every gated
+/// submit and the ungated modes): the static work estimate, or the
+/// interpreter's own memory limit tripping. NOT a refusal: the submit went on
+/// as under `historical-tx-no-spv` (the topic managers judged it, the network
+/// judges its validity), and was acked as such. Sustained non-zero on honest
+/// traffic means the budget is too tight for a real shape.
+pub const COUNTER_SUBMIT_ENGINE_WALK_OVER_BUDGET: &str = "submit_engine_walk_over_budget_total";
+/// …whose engine walk was not made because it would hold more MEMORY than
+/// the budget's limb beside the body (the 1.9 MB push-only unproven parent
+/// that killed the consumer's isolate on every redelivery before #592).
+pub const COUNTER_SUBMIT_ENGINE_WALK_OVER_MEMORY: &str = "submit_engine_walk_over_memory_total";
+
+/// The counter of an engine walk that could not run, by the limb it passed.
+pub fn engine_walk_over_counter(limb: overlay_engine::engine::WalkLimb) -> &'static str {
+    match limb.door_limb() {
+        overlay_engine::engine::DoorLimb::Work => COUNTER_SUBMIT_ENGINE_WALK_OVER_BUDGET,
+        overlay_engine::engine::DoorLimb::Memory => COUNTER_SUBMIT_ENGINE_WALK_OVER_MEMORY,
+    }
+}
+
+/// Count and log a submit whose engine walk could not run (bsv-low #592),
+/// at `door` (`POST /submit`, `Queue`, `POST /admin/readmit`). Nothing when
+/// the walk ran.
+pub async fn note_engine_walk(
+    db: &D1Database,
+    report: &overlay_engine::engine::MutationReport,
+    door: &str,
+) {
+    if let Some(stop) = &report.walk_could_not_run {
+        worker::console_log!(
+            "{door}: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}) — not a refusal, admitted as historical-tx-no-spv, the network judges",
+            stop.subject_txid,
+            stop.limb.as_str(),
+            stop.at_txid,
+            stop.subject_judged,
+            stop.what
+        );
+        bump_counter(db, engine_walk_over_counter(stop.limb), 1).await;
+    }
+}
+
 /// The counter of a door walk past its own bound, by the limb it passed.
 pub fn script_walk_over_counter(limb: overlay_engine::engine::DoorLimb) -> &'static str {
     match limb {
@@ -917,6 +960,9 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_SCRIPT_WALK_ANCESTOR_INCONCLUSIVE: 0,
         COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET: 0,
         COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY: 0,
+        // bsv-low #592: the engine's own walk under the same two limbs.
+        COUNTER_SUBMIT_ENGINE_WALK_OVER_BUDGET: 0,
+        COUNTER_SUBMIT_ENGINE_WALK_OVER_MEMORY: 0,
         COUNTER_QUEUE_MUTATION_APPLIED: 0,
         COUNTER_QUEUE_MUTATION_RETRIED: 0,
         // 2026-09-04: the discovery pass — seeded to 0 for the same reason.

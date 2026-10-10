@@ -9,6 +9,9 @@ use overlay_engine::beef_limits;
 #[path = "../../overlay-engine/tests/support/beef_doors.rs"]
 mod shapes;
 
+#[path = "../../overlay-engine/tests/support/walk_witness.rs"]
+mod walk_witness;
+
 fn message(bytes: &[u8]) -> queue::MutationMessage {
     queue::MutationMessage {
         beef_b64: STANDARD.encode(bytes),
@@ -1066,5 +1069,150 @@ mod twin {
         assert!(c
             .letters()
             .contains(&(other_id, "failing".to_string(), "fault".to_string())));
+    }
+}
+
+// ── bsv-low #592: the queue replay under the engine's walk budget ────────────
+
+mod e592 {
+    use super::*;
+    use async_trait::async_trait;
+    use overlay_engine::builder::EngineBuilder;
+    use overlay_engine::engine::{DoorBudget, WalkLimb};
+    use overlay_engine::storage::memory::MemoryStorage;
+    use overlay_engine::topic_manager::{TopicManager, TopicManagerError};
+    use overlay_engine::types::*;
+
+    use super::walk_witness;
+
+    struct AdmitOutputZero;
+
+    #[async_trait(?Send)]
+    impl TopicManager for AdmitOutputZero {
+        async fn identify_admissible_outputs(
+            &self,
+            _: &bsv_rs::transaction::Transaction,
+            _: &[u8],
+            _: Option<&[u8]>,
+            _: SubmitMode,
+            _context: &TopicAdmittanceContext,
+        ) -> Result<AdmittanceInstructions, TopicManagerError> {
+            Ok(AdmittanceInstructions {
+                outputs_to_admit: vec![0],
+                coins_to_retain: vec![],
+                coins_removed: None,
+            })
+        }
+        async fn get_documentation(&self) -> String {
+            "admits output 0".into()
+        }
+        async fn get_metadata(&self) -> ServiceMetadata {
+            ServiceMetadata {
+                name: "admit-zero".into(),
+                ..Default::default()
+            }
+        }
+    }
+
+    /// THE PIN (b), bsv-low #592: the witness (a valid BEEF whose unproven parent carries 1.9 MB of push-only
+    /// unlocking script, the body that passed the gated door, broadcast and admitted, then killed the consumer's
+    /// isolate on every redelivery) through the consumer's re-submit path as `queue_handler` runs it: the message
+    /// the door enqueues (`plan_replay`, by key: 1.9 MB is past the inline room), its bytes read back by the
+    /// consumer's own check (`replay_object`), the replay's mode (`replay_submit_mode`), a REAL engine's
+    /// `submit_with_report` under the Worker's budget, then the ack decision (`is_durable`, `landed_ack`). The walk
+    /// could not run (the memory limb); the replay is APPLIED and durable, so the handler acks it and deletes its
+    /// object: no retry, no dead letter. The counter it bumps is `submit_engine_walk_over_memory_total`.
+    /// RED on `54dbb16`: the engine there walks the parent with no charge (217,765,812 bytes natively, an isolate
+    /// kill on Workers: the redelivery loop); natively it answers `Ok` with no word of the walk, and the field this
+    /// pin reads does not exist there (it does not compile).
+    #[test]
+    fn e592_b_the_replay_of_the_witness_is_acked_as_applied_never_dead_lettered() {
+        let (beef, subject) = walk_witness::witness();
+        let topics = vec!["tm_test".to_string()];
+        let queue::Carriage::R2(m) = queue::plan_replay(
+            &beef,
+            &topics,
+            SubmitMode::HistoricalTx,
+            queue::REPLAY_REASON_PHASE3_FAULT,
+            queue::QUEUE_MESSAGE_ROOM,
+        ) else {
+            panic!("1.9 MB rides by key")
+        };
+        let r = m.r2.clone().unwrap();
+        assert_eq!(r.txid.as_deref(), Some(subject.as_str()));
+        queue::check_replay_blob(&r, &beef).expect("the consumer's own check of the object's bytes");
+        let mode = queue::replay_submit_mode(&m.mode);
+        assert_eq!(mode, SubmitMode::HistoricalTx, "the replay walks");
+
+        assert_eq!(crate::WORKER_WALK_BUDGET, DoorBudget::DEFAULT);
+        let engine = EngineBuilder::new(Box::new(MemoryStorage::new()))
+            .with_topic("tm_test", Box::new(AdmitOutputZero))
+            .with_walk_budget(crate::WORKER_WALK_BUDGET)
+            .build();
+        let tagged = TaggedBEEF {
+            beef: beef.clone(),
+            topics: m.topics.clone(),
+            off_chain_values: None,
+        };
+        let (_, report) = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(engine.submit_with_report(&tagged, mode))
+            .expect("never a refusal for the walk's size");
+        let stop = report.walk_could_not_run.clone().expect("the walk could not run");
+        assert_eq!(stop.subject_txid, subject);
+        assert_eq!(stop.limb, WalkLimb::OverMemory);
+        assert_eq!(
+            crate::ops::engine_walk_over_counter(stop.limb),
+            "submit_engine_walk_over_memory_total"
+        );
+        assert!(report.is_durable(), "the handler acks a durable report: no retry, no dead letter");
+        assert_eq!(report.applied_topics, topics, "acked as applied");
+        let ack = queue::landed_ack(&m, &report, None);
+        assert!(!ack.leaves, "every topic applied: the ack deletes the object");
+        assert_eq!(ack.delete, vec![r.key.clone()]);
+    }
+
+    /// The wiring (source shape), for (b) and (d): the queue consumer counts the replay's report right after its
+    /// `submit_with_report`, the synchronous `/submit` (the ungated modes, under `SUBMIT_ENFORCE`'s operator bar)
+    /// and `/admin/readmit` count theirs, the engine the Worker builds walks under the Worker's budget, and the
+    /// gated door under the same instance. The route itself (an ungated `historical-tx` of the witness answering
+    /// as before and bumping the counter) is the captain's route tier: not run in this lane.
+    #[test]
+    fn e592_d_every_door_that_walks_counts_the_engine_walk() {
+        let lib = include_str!("lib.rs");
+        let replay = lib
+            .find("let replayed = engine.submit_with_report(&tagged_beef, mode).await;")
+            .expect("the queue's replay");
+        let note = lib[replay..]
+            .find("crate::ops::note_engine_walk(db, report, \"Queue\")")
+            .expect("the queue counts the replay's walk");
+        assert!(note < 600, "right after the replay's submit");
+        assert!(lib.contains("engine.set_walk_budget(WORKER_WALK_BUDGET);"));
+
+        let routes = include_str!("routes.rs");
+        let submit = routes
+            .find("let (steak, mutation_report) = match engine.submit_with_report(&tagged_beef, mode).await {")
+            .expect("the synchronous submit");
+        assert!(routes[submit..]
+            .contains("crate::ops::note_engine_walk(&db, &mutation_report, \"POST /submit\")"));
+        assert!(routes.contains("crate::ops::note_engine_walk(&db, &report, \"POST /admin/readmit\")"));
+        // The gated door walks under `DoorBudget::DEFAULT` (`verify_scripts_only`); the engine under the
+        // Worker's instance, which is that budget: one budget for every walk of this Worker.
+        assert!(routes.contains("engine.verify_scripts_only(&gated_beef, &subject_txid).await"));
+        assert_eq!(crate::WORKER_WALK_BUDGET, DoorBudget::DEFAULT);
+
+        // The counters are served from 0 and named by their limb.
+        let ops = include_str!("ops.rs");
+        assert!(ops.contains("COUNTER_SUBMIT_ENGINE_WALK_OVER_BUDGET: 0,"));
+        assert!(ops.contains("COUNTER_SUBMIT_ENGINE_WALK_OVER_MEMORY: 0,"));
+        assert_eq!(
+            crate::ops::engine_walk_over_counter(WalkLimb::OverWork),
+            "submit_engine_walk_over_budget_total"
+        );
+        assert_eq!(
+            crate::ops::engine_walk_over_counter(WalkLimb::InterpreterMemory),
+            "submit_engine_walk_over_budget_total"
+        );
     }
 }
