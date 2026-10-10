@@ -1347,7 +1347,7 @@ routed around, never made a limit on a body.
 - **The dead letters.** The DLQ consumer parks the KEY without a read (the row
   is a few hundred bytes); the lever re-drives the key and the consumer
   re-reads R2; `/health/invariants.deadLetters.r2` serves `bound`, `letters`
-  and `bytes` (the bytes at rest, an index-only sum, migrations 179-181),
+  and `bytes` (the bytes at rest, an index-only sum, migrations 183-185),
   `inlineRoom` and `replayMaxBytes` (the value `QUEUE_BEEF_LIMITS` names,
   10,000,036; it bounds nothing since NL-6 and stays served because the route
   cell reads it).
@@ -1403,7 +1403,7 @@ routed around, never made a limit on a body.
   (`SWEEP_MAX_OBJECTS`) from the key the last pass stopped at, and deletes at
   most 50 (`SWEEP_MAX_DELETES`, a `head` and a `delete` each; a pass that
   meets a 51st stops there). The cursor is the last KEY handled, at rest in
-  D1 (`beef_blob_sweep`, one row, transient, migrations 182-184): R2 lists in key
+  D1 (`beef_blob_sweep`, one row, transient, migrations 186-188): R2 lists in key
   order and a key outlives a listing token. An object is deleted when it is
   BOTH older than the WINDOW by its AGE STAMP, the LATER of R2's `uploaded`
   and our own `customMetadata.touched` that every put writes (the fold-2,
@@ -2301,7 +2301,7 @@ what bounds a pass is its budget.
 - The worker keeps a record in ROWS (`gasp_deferred.rs` `chunk_plan`,
   `DEFERRED_GRAPH_CHUNK_BYTES` 1 MiB): its first part in its
   `gasp_deferred_graphs` row, each further part a row of
-  `gasp_deferred_graph_chunks` (migrations 176-178: the table, the head's
+  `gasp_deferred_graph_chunks` (migrations 180-182: the table, the head's
   `chunks` and `gen`). A record of at most 1 MiB is written exactly as before
   (one row, no part). A save writes the parts of a NEW generation (16 hex of
   the JSON's sha256), then the head row, where the ceiling is read, then

@@ -443,7 +443,7 @@ pub(crate) fn read_export(inputs: &[PathBuf], r2_dir: Option<&Path>) -> Result<S
     let mut s = Summary::default();
 
     // The deferred tables' own migrations, as the Worker's first request
-    // applies them (an export taken before migrations 176-178 lacks them),
+    // applies them (an export taken before migrations 180-182 lacks them),
     // under the Worker's own tolerance of a re-run `ADD COLUMN`. A table the
     // export does not hold is not created: there is nothing of it to read.
     if rows(&db, "SELECT 1 FROM gasp_deferred_graphs LIMIT 0", &[]).is_some() {
