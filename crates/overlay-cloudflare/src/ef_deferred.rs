@@ -479,7 +479,10 @@ pub async fn defer(
                 work.batch_ef_bytes,
                 work.legs
             );
-            let mut resp = json_answer(&deferral_body(&reference, subject_txid, work, legs_from), 202)?;
+            let mut resp = json_answer(
+                &deferral_body(&reference, subject_txid, work, legs_from),
+                202,
+            )?;
             let _ = resp
                 .headers_mut()
                 .set("Location", &format!("{POLL_PREFIX}{reference}"));
@@ -1108,7 +1111,10 @@ mod tests {
         let body = deferral_body(&r, "subj", work, 32);
         assert_eq!(body["legsFrom"], 32);
         assert_eq!(body["work"]["legs"], 1_000);
-        assert_eq!(body["budget"]["corroborationLegs"], IN_REQUEST_CORROBORATION_LEGS);
+        assert_eq!(
+            body["budget"]["corroborationLegs"],
+            IN_REQUEST_CORROBORATION_LEGS
+        );
         assert_eq!(body["accepted"], true);
         assert_eq!(body["deferred"], true);
         assert_eq!(body["reference"], r);
@@ -1184,7 +1190,10 @@ mod tests {
         assert_eq!(resume_point(202, "{\"status\":\"accepted\"}"), None);
         assert_eq!(resume_point(202, "not json"), None);
         for word in ["cap", "too large", "429", "413", "502"] {
-            assert!(!body.contains(word), "the paused answer carries no refusal word: {word}");
+            assert!(
+                !body.contains(word),
+                "the paused answer carries no refusal word: {word}"
+            );
         }
     }
 
@@ -1193,11 +1202,27 @@ mod tests {
     #[test]
     fn the_cursor_moves_forward_only_and_an_advancing_run_is_no_failed_attempt() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(&format!("{JOBS_CREATE}; {JOBS_INDEX}; {JOBS_ADD_LEGS_FROM};"))
-            .unwrap();
+        conn.execute_batch(&format!(
+            "{JOBS_CREATE}; {JOBS_INDEX}; {JOBS_ADD_LEGS_FROM};"
+        ))
+        .unwrap();
         conn.execute(
             JOB_UPSERT_SQL,
-            rusqlite::params!["r1", "subj", "[]", "broadcast-gated", 0, 10, 10, "d1", 1, 147, 60_000, 1, 32],
+            rusqlite::params![
+                "r1",
+                "subj",
+                "[]",
+                "broadcast-gated",
+                0,
+                10,
+                10,
+                "d1",
+                1,
+                147,
+                60_000,
+                1,
+                32
+            ],
         )
         .unwrap();
         let read = || -> (String, i64, i64) {
@@ -1209,11 +1234,16 @@ mod tests {
             .unwrap()
         };
         assert_eq!(read(), ("queued".into(), 0, 32), "the request's cursor");
-        conn.execute(JOB_TAKE_SQL, rusqlite::params!["r1", 2]).unwrap();
+        conn.execute(JOB_TAKE_SQL, rusqlite::params!["r1", 2])
+            .unwrap();
         assert_eq!(read(), ("running".into(), 1, 32));
         conn.execute(JOB_ADVANCE_SQL, rusqlite::params!["r1", 288, 202, "{}", 3])
             .unwrap();
-        assert_eq!(read(), ("queued".into(), 0, 288), "advanced: queued, no attempt spent");
+        assert_eq!(
+            read(),
+            ("queued".into(), 0, 288),
+            "advanced: queued, no attempt spent"
+        );
         conn.execute(JOB_ADVANCE_SQL, rusqlite::params!["r1", 100, 202, "{}", 4])
             .unwrap();
         assert_eq!(read(), ("queued".into(), 0, 288), "never back");
