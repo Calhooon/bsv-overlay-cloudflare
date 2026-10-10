@@ -3764,12 +3764,12 @@ mod tests {
             })
             .await;
         assert_eq!(walk, LegWalk::Paused { reached: 7 });
-        let order = order.borrow();
+        let posted = order.borrow().clone();
         assert_eq!(
-            *order,
+            posted,
             (4..7).map(|i| hex::encode(&efs[i].ef)).collect::<Vec<_>>()
         );
-        assert!(!order.contains(&subject_hex));
+        assert!(!posted.contains(&subject_hex));
         // a zero budget still reads a leg, so a run always advances its cursor
         let walk = corroborate_batch_with(
             &efs,
