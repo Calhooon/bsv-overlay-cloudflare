@@ -63,15 +63,16 @@ const u64 = (n) => {
 }
 const sha256d = (buf) => createHash('sha256').update(createHash('sha256').update(buf).digest()).digest()
 
-/** Zero-input funded "parent" (complete: nothing for the sort to miss). A
+/** Funded "parent" spending a coinbase's null outpoint (a transaction with no
+ *  input is refused at the door since bsv-rs 0.4.1, NL-8 W6) (complete: nothing for the sort to miss). A
  *  random nonce output keeps each run's txid distinct (no dedupe). */
-function zeroInputParent() {
+function fundedParent() {
   const nonce = Buffer.alloc(8)
   randomFillSync(nonce)
   const nonceScript = Buffer.concat([Buffer.from([0x00, 0x6a]), Buffer.from([8]), nonce])
   return Buffer.concat([
     u32(1),
-    varint(0), // zero inputs
+    varint(1), Buffer.alloc(32), u32(0xffffffff), varint(0), u32(0xffffffff),
     varint(2),
     u64(5000), Buffer.from([1, 0x51]), // 5000 sats, OP_TRUE
     u64(0), varint(nonceScript.length), nonceScript,
@@ -201,7 +202,7 @@ async function expectCensus({ base, label, body, mode, token, wantStatus, cellMo
 }
 
 // ── the run ───────────────────────────────────────────────────────────────
-const parentRaw = zeroInputParent()
+const parentRaw = fundedParent()
 const ancestryBody = beefV1(parentRaw, childOf(parentRaw))
 const noAncestryBody = beefV1(junkInputTx())
 const garbage = Buffer.from([0xde, 0xad, 0xbe, 0xef])

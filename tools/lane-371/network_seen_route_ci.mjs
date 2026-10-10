@@ -79,15 +79,17 @@ const u64 = (n) => {
 const sha256d = (buf) =>
   createHash('sha256').update(createHash('sha256').update(buf).digest()).digest()
 
-/** Zero-input funded "parent" — complete, EF-trivial (no sources to inline).
- *  A random nonce output keeps each run's txid distinct. */
-function zeroInputParent() {
+/** Funded "parent" spending a coinbase's null outpoint (a transaction with no
+ *  input is refused at the door since bsv-rs 0.4.1, NL-8 W6), submitted alone
+ *  on the operator's ungated path. A random nonce output keeps each run's txid
+ *  distinct. */
+function fundedParent() {
   const nonce = Buffer.alloc(8)
   randomFillSync(nonce)
   const nonceScript = Buffer.concat([Buffer.from([0x00, 0x6a]), Buffer.from([8]), nonce])
   return Buffer.concat([
     u32(1),
-    varint(0),
+    varint(1), Buffer.alloc(32), u32(0xffffffff), varint(0), u32(0xffffffff),
     varint(2),
     u64(5000), Buffer.from([1, 0x51]),
     u64(0), varint(nonceScript.length), nonceScript,
@@ -185,7 +187,7 @@ try {
   const afterGated = base0
 
   // ── 1. UNGATED admitted + fixture-known: backgrounded latch, +1. ──
-  const knownParent = zeroInputParent()
+  const knownParent = fundedParent()
   const knownTxid = txidOf(knownParent)
   allowlist.add(knownTxid)
   const u = await postSubmit(beefV1(knownParent), { mode: 'historical-tx-no-spv', token: OP_TOKEN })
@@ -204,7 +206,7 @@ try {
   const afterKnown = await seenTotal()
 
   // ── 3. UNGATED unknown subject: corroborated, refused, count holds. ──
-  const unknownParent = zeroInputParent()
+  const unknownParent = fundedParent()
   const unknownTxid = txidOf(unknownParent) // deliberately NOT allowlisted
   const u2 = await postSubmit(beefV1(unknownParent), { mode: 'historical-tx-no-spv', token: OP_TOKEN })
   if (u2.status !== 200) {
