@@ -40,7 +40,10 @@ worker = { version = "0.8", features = ["d1"] }
 # DO untouched) and 0.4.1 answers every authentication refusal as its own 401 (`AuthResult::Response`), where 0.3.8
 # raised four of them as `Err` (see `auth::front_door`). Never 0.3.7, which shipped without the payment path's
 # output check; the payment path (0.4.0's fail-closed BRC-29) is not linked into a route here: the app layer never charges.
-bsv-middleware-cloudflare = "=0.4.1"
+# Exactly 0.5.0 (align-engine-050, 2026-10-10): `bsv-middleware-core` 0.2.0 and bsv-rs 0.4, one SDK in the lock. 0.5.0
+# moves the payment verdict (`PaymentVerifyError::Unverifiable { reason }`; `BadTransaction`, `MissingOutput`,
+# `BadBeef` gone); none of the auth, session-lane or signing items this crate calls moved, and it compiled unchanged.
+bsv-middleware-cloudflare = "=0.5.0"
 serde.workspace = true
 # bsv-low #532: `raw_value` so the identity views pass the resolver's JSON through byte for byte.
 serde_json = { workspace = true, features = ["raw_value"] }

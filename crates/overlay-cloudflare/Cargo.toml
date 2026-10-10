@@ -33,7 +33,10 @@ bsv-rs = { workspace = true, features = ["wasm"] }
 # itself on 0.2.0). This crate uses exactly two items from it —
 # `init_panic_hook()` and `WorkerStorageClient` — and both are unchanged
 # across the bump: 0.1 → 0.3 needed ZERO source edits here.
-bsv-middleware-cloudflare = "=0.4.1"
+# Exactly 0.5.0 (align-engine-050, 2026-10-10): built on bsv-rs 0.4, so
+# `WorkerStorageClient::new` takes the workspace's own `ProtoWallet`
+# (`wallet/client.rs`); the payment verdict's move does not touch this crate.
+bsv-middleware-cloudflare = "=0.5.0"
 # The middleware's own SDK (NL-6, 2026-10-09). `bsv-middleware-cloudflare` 0.4.1 is
 # built on bsv-rs 0.3 and its `WorkerStorageClient::new` takes THAT line's
 # `ProtoWallet`, so the one wallet handed across the seam (`wallet/client.rs`)
