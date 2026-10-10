@@ -90,6 +90,8 @@ const padScript = (n) => {
 }
 const output = (script) => Buffer.concat([u64(0), varint(script.length), script])
 const input = (txid, vout) => Buffer.concat([Buffer.from(txid, 'hex').reverse(), u32(vout), varint(0), u32(0xffffffff)])
+/** A coinbase's null outpoint: a transaction with no input is refused at the door since bsv-rs 0.4.2 (NL-8 W6). */
+const coinbaseInput = () => input('00'.repeat(32), 0xffffffff)
 const tx = (inputs, outputs) =>
   Buffer.concat([u32(1), varint(inputs.length), ...inputs, varint(outputs.length), ...outputs, u32(0)])
 const beefV1 = (...raws) =>
@@ -212,7 +214,7 @@ async function until(pred) {
 }
 /** G (admitted), P (spends G, under an OPEN eviction), S (spends P, padded to about `pad` bytes): S is "not now". */
 async function chain(pad, why) {
-  const G = tx([], [output(COLLECTED_MARKER), output(padScript(8))])
+  const G = tx([coinbaseInput()], [output(COLLECTED_MARKER), output(padScript(8))])
   const g = txidOf(G)
   const P = tx([input(g, 0)], [output(COLLECTED_MARKER), output(padScript(8))])
   const p = txidOf(P)
