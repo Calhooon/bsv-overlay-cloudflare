@@ -2436,7 +2436,12 @@ deploy of the streaming door, so a stored BEEF the door would refuse is named
 first. Every path CALLS the Worker's own read (the land lens E585-LAND-L3):
 the stored BEEFs (`transactions`, `transactions_evicted`, `pot_beefs`) by the
 Worker's `hex(beef) AS beef` and `d1::beef_of_hex_column` (so a BEEF stored as
-hex TEXT is its ASCII bytes and refused, as at the Worker), then
+hex TEXT is its ASCII bytes and refused, as at the Worker; the one reader of
+EVERY Worker read-back of that column since the land fold-7, E585-LAND-DELTA-L1,
+`OutputRow::into_output` and `reorg_sweep`'s transactions leg included, which
+keep an empty read-back as an empty BEEF as before; pinned by
+`d1::tests::every_hex_beef_read_back_calls_the_one_reader`, RED on `6c7f527`),
+then
 `beef_limits::read_beef`, `own_proof` and `transaction_from_beef`; a parked
 letter as the lever re-drives it (`dead_letters::redrive_message`) and the
 consumer reads it (`queue::read_for_replay`, its R2 object through

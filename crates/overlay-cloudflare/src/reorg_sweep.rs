@@ -1005,7 +1005,13 @@ impl ProvenTxStore for D1ProvenTxStore<'_> {
         }
         fn keyed(rows: Vec<Row>, out: &mut Vec<(RowKey, String, Vec<u8>)>) {
             for r in rows {
-                let Some(beef) = r.beef.and_then(|h| hex::decode(h).ok()) else {
+                // The stored BEEF by the one reader (`d1::beef_of_hex_column`).
+                // An EMPTY read-back stays an empty BEEF, as it always was: the
+                // leg counts it `no_bump` and its cursor passes it.
+                let Some(beef) = r
+                    .beef
+                    .map(|h| crate::d1::beef_of_hex_column(Some(h)).unwrap_or_default())
+                else {
                     continue;
                 };
                 out.push((

@@ -70,7 +70,15 @@ impl OutputRow {
                 .consumed_by
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default(),
-            beef: self.beef.and_then(|h| hex::decode(h).ok()),
+            // The stored BEEF by the one reader (`d1::beef_of_hex_column`). An
+            // EMPTY read-back (`hex(NULL)` is '' under the LEFT JOIN when the
+            // output's `transactions` row is gone, or an `X''` BLOB) stays an
+            // empty BEEF here, as it always was: the engine's callers judge it
+            // (the lookup skips it, the GASP and history reads refuse it in
+            // their own words). Only text `hex()` never emits reads differently.
+            beef: self
+                .beef
+                .map(|h| crate::d1::beef_of_hex_column(Some(h)).unwrap_or_default()),
             block_height: self.block_height.map(|h| h as u32),
             score: self.score,
         }
@@ -1842,6 +1850,34 @@ mod tests {
         assert_eq!(output.satoshis, 0);
         assert!(output.block_height.is_none());
         assert_eq!(output.beef.unwrap(), vec![0xBE, 0xEF]);
+    }
+
+    /// E585-LAND-DELTA-L1: routed through `d1::beef_of_hex_column`, the
+    /// read-back answers as before: '' (`hex(NULL)` under the LEFT JOIN, or
+    /// an `X''` BLOB) is an EMPTY BEEF, NULL none, hex in either case bytes.
+    #[test]
+    fn output_row_beef_read_back_keeps_its_answers() {
+        let read = |beef: Option<&str>| {
+            OutputRow {
+                txid: "abc".into(),
+                output_index: 0.0,
+                output_script: None,
+                topic: "t".into(),
+                satoshis: None,
+                outputs_consumed: None,
+                consumed_by: None,
+                spent: None,
+                block_height: None,
+                score: None,
+                beef: beef.map(String::from),
+            }
+            .into_output()
+            .beef
+        };
+        assert_eq!(read(Some("")), Some(vec![]));
+        assert_eq!(read(None), None);
+        assert_eq!(read(Some("BEEF")), Some(vec![0xBE, 0xEF]));
+        assert_eq!(read(Some("beef")), Some(vec![0xBE, 0xEF]));
     }
 
     #[test]

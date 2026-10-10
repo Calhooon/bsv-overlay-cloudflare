@@ -236,10 +236,14 @@ impl WhereBuilder {
 /// UPPERCASE; `hex::decode` accepts either case). Empty or undecodable is
 /// `None`: an unusable row is never served as bytes. `hex()` of a TEXT value
 /// is the hex of its UTF-8 bytes, so a BEEF stored as hex TEXT reads back as
-/// those ASCII bytes and the door refuses it. ONE function for the read-backs
-/// of `transactions` and `pot_beefs` and for the stored-rows reader
-/// (`stored_rows`, the land lens E585-LAND-L3), so the reader types a column
-/// exactly as the Worker does.
+/// those ASCII bytes and the door refuses it. ONE function for EVERY Worker
+/// read-back of a stored BEEF (`transactions`, `pot_beefs`) and for the
+/// stored-rows reader (`stored_rows`, the land lens E585-LAND-L3), so the
+/// reader types a column exactly as the Worker does. Two callers keep an
+/// EMPTY read-back as an empty BEEF, as they always did (the land delta lens
+/// E585-LAND-DELTA-L1): `d1_storage` `OutputRow::into_output` (the engine's
+/// `Output.beef`) and `reorg_sweep`'s transactions leg; each says why at its
+/// call. Pinned by `tests::every_hex_beef_read_back_calls_the_one_reader`.
 #[must_use]
 pub fn beef_of_hex_column(row_beef: Option<String>) -> Option<Vec<u8>> {
     let bytes = hex::decode(row_beef?).ok()?;
@@ -1821,6 +1825,79 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bsv-low #585, the land delta lens E585-LAND-DELTA-L1 (Rule 10, one
+    /// spelling): no production source of the Worker decodes a stored BEEF's
+    /// hex read-back on its own; each read-back of `hex(beef)` calls
+    /// [`beef_of_hex_column`]. RED on `6c7f527`: `d1_storage.rs:73` and
+    /// `reorg_sweep.rs:1008` (`hex::decode(h)` of the row's `beef`).
+    #[test]
+    fn every_hex_beef_read_back_calls_the_one_reader() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src") {
+                let p = e.expect("entry").path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        // `beef` as a whole identifier (a row's field or a binding), not
+        // `beef_hex` or `row_beef`.
+        fn names_beef(code: &str) -> bool {
+            code.match_indices("beef").any(|(i, _)| {
+                let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                !code[..i].chars().next_back().is_some_and(word)
+                    && !code[i + 4..].chars().next().is_some_and(word)
+            })
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(files.len() > 5, "the crate's sources are walked");
+        let mut strays = Vec::new();
+        let mut callers = std::collections::BTreeSet::new();
+        for f in &files {
+            let name = f
+                .strip_prefix(&src)
+                .expect("under src")
+                .display()
+                .to_string();
+            let text = std::fs::read_to_string(f).expect("read source");
+            // production code only: a test module is the last item of a file
+            let prod = &text[..text.find("#[cfg(test)]").unwrap_or(text.len())];
+            for (i, line) in prod.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("beef_of_hex_column(") && name != "d1/mod.rs" {
+                    callers.insert(name.clone());
+                }
+                if name != "d1/mod.rs" && code.contains("hex::decode") && names_beef(code) {
+                    strays.push(format!("{name}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            strays.is_empty(),
+            "a stored BEEF's hex read-back decoded outside d1::beef_of_hex_column:\n{}",
+            strays.join("\n")
+        );
+        for site in ["d1_storage.rs", "d1_discovery.rs", "reorg_sweep.rs"] {
+            assert!(
+                callers.contains(site),
+                "{site} reads `hex(beef)` through the one reader"
+            );
+        }
+        // the pin bites on the form it was written for, and not on a hex
+        // argument that is not a stored row's
+        assert!(names_beef(
+            "beef: self.beef.and_then(|h| hex::decode(h).ok()),"
+        ));
+        assert!(names_beef(
+            "let Some(beef) = r.beef.and_then(|h| hex::decode(h).ok()) else {"
+        ));
+        assert!(!names_beef("let beef_bytes = hex::decode(beef_hex.trim())"));
+    }
 
     #[test]
     fn qval_conversions() {
