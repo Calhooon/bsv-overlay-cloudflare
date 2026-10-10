@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased: bsv-rs 0.4.2; the SPV walk is linear in a BUMP's leaves (NL-6e, 2026-10-10)
+
+The no-limits program's replay (bsv-stack-lean NL-8) named two findings at the
+engine; both close here.
+
+- **W6, a transaction with no input.** Both workspaces pin bsv-rs **0.4.2** (the
+  workers' lock keeps 0.3.35 for the middleware bridge). Every door
+  (`read_beef`, `fold_beef`, `parse_beef` at each of the ten doors,
+  `transaction_from_beef`) refuses a transaction with no input as
+  `invalid BEEF at byte <offset>: NoInputs`, at the transaction's first byte;
+  discovery's `pot_beef_has_proof` no longer reads a proven transaction with no
+  input as proven. At 0.4.0 all of them read the three no-input rows.
+- **W1, the walk's time.** The escape hatch's structural walk
+  (`verify_scripts` false) is the streaming reader's structure check,
+  `beef_limits::structure_roots` (bsv-rs 0.4.2 `verify_stream_structure`): one
+  element in hand, each BUMP walked once, each distinct height and root asked of
+  the tracker after. It was `Beef::verify_valid`, whose root check at 0.4.0
+  walked a BUMP once per leaf. The script walk (the default, and the script
+  door's budgeted walk) computes and asks each BUMP's root once; it did so per
+  proven transaction. Measured at the entry (`verify_spv_like_the_reference`,
+  release): one BUMP of 4,096 and 8,192 leaves 45.9 s and 157.5 s before,
+  0.006 s and 0.012 s now; 4,096 and 8,192 proven parents in one BUMP under the
+  script walk 41.0 s and 127.6 s before, 0.088 s and 0.174 s now.
+- **What the structural walk now answers otherwise than at 0.4.0:** it refuses
+  an input naming a transaction written after it (the reader reads the wire's
+  order; the in-memory check sorted first), and an atomic BEEF whose subject
+  is not its last transaction or that carries a transaction its subject does
+  not descend from; it accepts a txid-only entry a BUMP of the BEEF proves,
+  where it refused every txid-only entry. Each refusal names the offset and
+  the kind.
+- **For callers of bsv-rs through this workspace:** 0.4.2's `Beef::from_binary`
+  refuses a byte after the frame, and `verify_valid`'s `allow_txid_only`
+  decides nothing (bsv-rs's CHANGELOG). Test fixtures that built a
+  transaction with no input now spend an outpoint of the all-zero txid; the
+  pinned digests they feed were re-frozen on main and on the bump alike. The
+  census's parity fixture (the TS client's, regenerated from the bsv-low
+  checkout) still carries a funded parent with no input, which the census now
+  refuses at the parse; its emitter gives every source an input for the next
+  regeneration.
+
 ## Unreleased: the EF work bound is a deferral, not a refusal (NL-6c, 2026-10-09)
 
 The posture, the same charter's: **a valid submission is never refused for its
