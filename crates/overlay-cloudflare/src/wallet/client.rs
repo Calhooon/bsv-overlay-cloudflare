@@ -141,9 +141,7 @@ impl<'a> Wallet<'a> {
     /// wallet, so the admin key crosses the seam as its 32 bytes. A key the
     /// 0.3 type refuses is an auth failure, never the anonymous wallet.
     fn make_storage_client(&self) -> Result<WorkerStorageClient, &'static str> {
-        let key = bsv_rs_03::primitives::PrivateKey::from_bytes(&self.private_key.to_bytes())
-            .map_err(|_| ERR_WALLET_AUTH_FAILED)?;
-        let wallet = bsv_rs_03::wallet::ProtoWallet::new(Some(key));
+        let wallet = bsv_rs::wallet::ProtoWallet::new(Some(self.private_key.clone()));
         Ok(WorkerStorageClient::new(wallet, &self.endpoint_url))
     }
 

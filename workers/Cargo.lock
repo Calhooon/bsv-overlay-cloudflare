@@ -145,14 +145,14 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-cloudflare"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1b9e6e2c1adbd5bb9c620f36840d1911f25fc194775d4fff0a057c0f7c558a7"
+checksum = "d8afd1a28ce57eeb69aa5486d87d3bb4effd6347bf1a011f387e803c19a54b59"
 dependencies = [
  "async-trait",
  "base64",
  "bsv-middleware-core",
- "bsv-rs 0.3.35",
+ "bsv-rs 0.4.3",
  "console_error_panic_hook",
  "futures",
  "getrandom",
@@ -170,11 +170,11 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-core"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d195a392f9e9118effd87c72f2fcd91332bf1adf1be46b879d43ccdcdf6f1144"
+checksum = "4f9c7fc9420eb1ae014400de7eaf7529b66a3105ef9df0016f0d8b1f5c8a1006"
 dependencies = [
- "bsv-rs 0.3.35",
+ "bsv-rs 0.4.3",
  "getrandom",
  "hex",
  "hmac",
@@ -249,11 +249,9 @@ dependencies = [
  "bs58",
  "cbc",
  "futures",
- "futures-timer",
  "getrandom",
  "hex",
  "hmac",
- "js-sys",
  "k256",
  "lazy_static",
  "num-bigint",
@@ -269,7 +267,6 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror 1.0.69",
- "tokio",
  "urlencoding",
 ]
 
