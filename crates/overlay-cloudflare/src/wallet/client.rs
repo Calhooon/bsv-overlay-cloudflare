@@ -325,7 +325,9 @@ mod tests {
         assert_eq!(proto.identity_key().to_hex(), wallet.identity_key_hex());
         assert_ne!(
             proto.identity_key().to_hex(),
-            bsv_rs::wallet::ProtoWallet::anyone().identity_key().to_hex()
+            bsv_rs::wallet::ProtoWallet::anyone()
+                .identity_key()
+                .to_hex()
         );
     }
 
