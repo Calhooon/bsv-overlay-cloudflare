@@ -777,11 +777,18 @@ fn fold_refuse_bar(
 /// corroborator proves network acceptance by the same means the client's
 /// direct-ARC fallback would, and a re-broadcast of an already-accepted tx
 /// is idempotent (already-known = accept).
+///
+/// `host`: NL-6d, both hosts' base replaced by one (`CORROBORATOR_URL`, the
+/// route tier's local fixture, so a CI witness never posts to TAAL or
+/// GorillaPool); `None` in production.
 pub(crate) async fn corroborate_tx_hex(
     taal_api_key: Option<&str>,
+    host: Option<&str>,
     tx_hex: &str,
 ) -> Result<ArcOutcome, String> {
-    let taal = match post_arc_raw(WorkerArcBroadcaster::ARC_URL, taal_api_key, tx_hex).await {
+    let taal_url = host.unwrap_or(WorkerArcBroadcaster::ARC_URL);
+    let gp_url = host.unwrap_or(GORILLAPOOL_ARC_URL);
+    let taal = match post_arc_raw(taal_url, taal_api_key, tx_hex).await {
         Ok((status, body)) => corroborator_verdict(status, &body),
         Err(e) => Err(e),
     };
@@ -798,7 +805,7 @@ pub(crate) async fn corroborate_tx_hex(
             Ok(ArcOutcome::AcceptedPending(_)) => unreachable!("corroborators never pend"),
         }
     );
-    let gp = match post_arc_raw(GORILLAPOOL_ARC_URL, None, tx_hex).await {
+    let gp = match post_arc_raw(gp_url, None, tx_hex).await {
         Ok((status, body)) => corroborator_verdict(status, &body),
         Err(e) => Err(e),
     };
@@ -2009,6 +2016,8 @@ pub struct ArcadeBroadcaster {
     terminal_judged: std::cell::Cell<Option<TerminalJudgement>>,
     /// #519: the WoC key the presence read carries (the same one `evidence_check` reads; none installed today).
     woc_api_key: Option<String>,
+    /// NL-6d: one base for both corroborating hosts (`CORROBORATOR_URL`, a local fixture); `None` in production.
+    corroborator_url: Option<String>,
 }
 
 impl ArcadeBroadcaster {
@@ -2030,7 +2039,18 @@ impl ArcadeBroadcaster {
             terminal_ms: std::cell::Cell::new(0.0),
             terminal_judged: std::cell::Cell::new(None),
             woc_api_key: None,
+            corroborator_url: None,
         }
+    }
+
+    /// NL-6d: route both corroborating hosts to one base (`CORROBORATOR_URL`; the route tier's fixture). Empty or
+    /// unset: TAAL then GorillaPool, as before.
+    #[must_use]
+    pub fn with_corroborator_url(mut self, url: Option<String>) -> Self {
+        self.corroborator_url = url
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty());
+        self
     }
 
     /// #519: the WoC API key for the terminal judgement's presence read (`evidence_check` reads the same secret).
@@ -2130,6 +2150,7 @@ impl ArcadeBroadcaster {
         let started = worker::js_sys::Date::now();
         let res = corroborate_tx_hex(
             self.corroborator_taal_key.as_deref(),
+            self.corroborator_url.as_deref(),
             &hex::encode(&subject_ef.ef),
         )
         .await;
@@ -2149,6 +2170,7 @@ impl ArcadeBroadcaster {
         let started = worker::js_sys::Date::now();
         let res = corroborate_tx_hex(
             self.corroborator_taal_key.as_deref(),
+            self.corroborator_url.as_deref(),
             &hex::encode(subject_raw),
         )
         .await;
@@ -2179,9 +2201,11 @@ impl ArcadeBroadcaster {
     ) -> Result<ArcOutcome, String> {
         let started = worker::js_sys::Date::now();
         let key = self.corroborator_taal_key.clone();
+        let host = self.corroborator_url.clone();
         let res = corroborate_batch_with(efs, subject_txid, |tx_hex| {
             let key = key.clone();
-            async move { corroborate_tx_hex(key.as_deref(), &tx_hex).await }
+            let host = host.clone();
+            async move { corroborate_tx_hex(key.as_deref(), host.as_deref(), &tx_hex).await }
         })
         .await;
         self.corroborate_ms

@@ -19,7 +19,7 @@ help:
 	@echo "  test             cargo test of BOTH workspaces (root: engine crates + harness; workers/: the LOW workers)"
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
 	@echo "  ownership        The storage ownership check (bsv-low #474): every SQL statement against storage-ownership.json (part of ci)"
-	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c)"
+	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c and NL-6d)"
 	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; :LANE_BASE+9, +10)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
@@ -371,7 +371,7 @@ ci-route: ci-d1-budget
 	) > "$$door_off_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up $$P9 "$$door_off_log" "script door (kill switch)"; \
-	echo "→ starting wrangler dev :$$P10 (NL-6c, the EF work bound: ARCADE_URL → the lane-nl6c fixture on :$$P11, DUAL_BROADCAST=off)…"; \
+	echo "→ starting wrangler dev :$$P10 (NL-6c, the EF work bound, and NL-6d, the corroboration legs: ARCADE_URL and CORROBORATOR_URL → the fixture on :$$P11, DUAL_BROADCAST=off)…"; \
 	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$P10 --ip 127.0.0.1 \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
@@ -379,6 +379,7 @@ ci-route: ci-d1-budget
 	    --var SUBMIT_ENFORCE:true --var ENABLE_EXTENSIONS:true \
 	    --var ARCADE_URL:http://127.0.0.1:$$P11 \
 	    --var DUAL_BROADCAST:off \
+	    --var CORROBORATOR_URL:http://127.0.0.1:$$P11 \
 	) > "$$ef_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up $$P10 "$$ef_log" "EF work bound"; \
@@ -396,7 +397,9 @@ ci-route: ci-d1-budget
 	  node tools/lane-script/script_refusal_route_ci.mjs http://127.0.0.1:$$P9; \
 	node tools/lane-nl6/submit_any_size_ci.mjs http://127.0.0.1:$$P1; \
 	FIXTURE_PORT=$$P11 \
-	  node tools/lane-nl6c/ef_work_bound_ci.mjs http://127.0.0.1:$$P10
+	  node tools/lane-nl6c/ef_work_bound_ci.mjs http://127.0.0.1:$$P10; \
+	FIXTURE_PORT=$$P11 \
+	  node tools/lane-nl6d/corroboration_legs_ci.mjs http://127.0.0.1:$$P10
 
 # bsv-low #499: THE D1 BUDGET TIER. A prerequisite of `ci-route` (so part of `ci`), in its own block.
 #
