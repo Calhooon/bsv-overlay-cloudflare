@@ -1678,6 +1678,53 @@ binding's in `run_pass`). Stated: the state row's `lastSwept` and
 `lastListed` are not written by a dropped pass (no save); its counters and its
 answer carry it.
 
+### Door 3 and the deferred EF jobs (NL-6c, NL-6d; the land onto `0eda4df`)
+
+Main's NL-6c defers the broadcast-gated arm's EF work past one request's
+budget to the queue, and NL-6d defers a corroboration's legs the same way: ONE
+job (`ef_deferred_jobs`, its `legs_from` the corroboration's cursor). Where its
+bytes rest, and under what bound:
+
+- **The job's bytes** never ride the message (`ef_job_message` carries the
+  reference; `r2` and `beef_b64` are empty). They rest whole, written BEFORE
+  the enqueue (`ef_deferred::defer`): in R2 under `ef-deferred/<reference>`
+  when `BEEF_BLOBS` is bound (now in all three configs, door 3's binding), or
+  in D1 as `ef_deferred_chunks` rows of at most 1,000,000 bytes, as many as
+  the body needs (under D1's 2,000,000-byte row). No path compares the body's
+  length with a cap: the bound is the platform's (one isolate holds the body
+  whole, the plan's request-body limit), named in `ef_deferred.rs`. The
+  consumer reads them back with a length check (`load`), deletes them when the
+  job settles (`release`), and the cron sweeps a settled job and its bytes
+  after 7 days (`redrive`).
+- **The job's "not now" replay** (the arm's admission after the corroboration,
+  a run included) goes through `queue::enqueue_replay`, which is door 3's
+  `plan_replay`: inline under the room, by key under `mutations/` past it,
+  never refused for its size. NL-6d's stated 502 ("a BEEF over
+  `QUEUE_BEEF_SIZE_LIMIT` cannot be queued", in the request and on every run of
+  a deferred job) is closed by door 3 here: that constant no longer exists.
+- **The orphan sweep** lists `mutations/` only (`SWEEP_PREFIX`), so it never
+  names, reads or deletes a job's `ef-deferred/` object, live or settled.
+
+So the three are one rule in what they refuse (nothing, for size). Not unified,
+stated as a follow-up: the job's object is keyed by its reference, not by
+door 3's `mutations/<sha256>/<scope>`, and its read checks the length, not the
+sha256 (`ef_deferred.rs` `load`, the `bytes.len() != total` check); and an
+`ef-deferred/` object whose job row was never written (the R2 `put` landed,
+`JOB_UPSERT_SQL` faulted: `ef_deferred.rs` `defer`) is named by no job and no
+sweep lists its prefix, so it stays until an operator deletes it (the request
+answered an error; the client's re-presentation writes the same key over it).
+
+The scheduled tick, in order (`lib.rs` `scheduled`): the ad sync; the R2
+orphan sweep's one pass under its own 30 s race (`SWEEP_BUDGET_MS`, door 3's
+fold); the stale deferred graphs (#555); the deferred EF jobs' hand-back and
+keep sweep (`ef_deferred::redrive`, NL-6c/6d: quiet jobs sent to the queue
+again, a D1 read and one send per job, no race of its own); then the GASP step
+under its guarded 240 s belt (`GASP_SYNC_BUDGET_MS`), and the passes after it.
+The 240 s belt bounds the GASP step alone: the sweep and the hand-back run
+before it, outside it. The jobs' RUNS are the queue consumer's
+(`ef_deferred::run_job`), never the tick's. `POST /internal/beef-blob-sweep`
+runs one pass of the same sweep function on demand.
+
 ## The dry-run option (bsv-low #530 E1, zanaadu-v2 #314)
 
 `TopicManager::identify_admissible_outputs` takes the reference's fifth

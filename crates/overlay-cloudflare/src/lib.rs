@@ -1299,15 +1299,6 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // default), GASP sync is a near-no-op: `start_gasp_sync` iterates
     // configured topics only. That's fine — calling it keeps the wire
     // connected so adding topic peers later Just Works.
-    // #257: BOUNDED — an unbounded GASP sync (dead SHIP-discovered peers, no
-    // per-fetch timeout) hung every cron to the 15-min kill since deploy day;
-    // see the budget consts. A timeout drops the sync (cursors persist only
-    // per completed peer — idempotent redo next tick) and the tick moves on.
-    // The race is the GUARDED one over the engine's finalize gate (bsv-low
-    // #552, the lens fold's HIGH-1): this belt can fall due while a peer's
-    // graph is being submitted, and a submit dropped between its writes
-    // leaves a head chain with no head. It waits for the transaction being
-    // written and drops the sync at the boundary.
     // bsv-low #585 (door 3's fold): one bounded pass of the orphan sweep over
     // the queue's R2 objects (`beef_blob_sweep.rs`: at most 200 listed and 50
     // deleted, the cursor at rest in D1). Before the GASP step, so a tick
@@ -1321,6 +1312,19 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // NL-6c: deferred EF jobs whose run ended without settling go back to the
     // queue; settled ones past their keep are swept with their bytes.
     crate::ef_deferred::redrive(&env, &ops_db).await;
+    // The order (bsv-low #585 land2): the sweep's pass (its own 30 s race),
+    // the stale graphs, the EF jobs' hand-back (no race of its own: a read
+    // and one send per quiet job; the jobs RUN on the queue consumer), then
+    // the GASP step under its 240 s belt, which bounds that step alone.
+    // #257: BOUNDED — an unbounded GASP sync (dead SHIP-discovered peers, no
+    // per-fetch timeout) hung every cron to the 15-min kill since deploy day;
+    // see the budget consts. A timeout drops the sync (cursors persist only
+    // per completed peer — idempotent redo next tick) and the tick moves on.
+    // The race is the GUARDED one over the engine's finalize gate (bsv-low
+    // #552, the lens fold's HIGH-1): this belt can fall due while a peer's
+    // graph is being submitted, and a submit dropped between its writes
+    // leaves a head chain with no head. It waits for the transaction being
+    // written and drops the sync at the boundary.
     match overlay_engine::gasp::race_or_deadline_guarded(
         engine.start_gasp_sync(),
         crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS),
