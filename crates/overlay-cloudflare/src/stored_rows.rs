@@ -804,6 +804,7 @@ mod self_test {
             mode: "historical-tx".into(),
             reason: queue::REPLAY_REASON_PHASE3_FAULT.into(),
             redrive: None,
+            ef_job: None,
         };
         let (_, keyed) = &fixtures[3];
         let sha = hex::encode(bsv_rs::primitives::hash::sha256(keyed));

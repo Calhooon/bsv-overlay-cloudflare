@@ -353,7 +353,11 @@ fn e585f_m1_the_work_budget_bounds_the_ec_verifications_of_a_walk() {
 // ── L3: the memory limb ─────────────────────────────────────────────────
 
 /// The lens's first body: `n` minimal transactions (10 bytes: a version, no
-/// input, no output, a lock time). The subject is the first.
+/// input, no output, a lock time). The subject is the first. Invalid bytes
+/// since bsv-rs 0.4.2 (NL-6e: a transaction with no input is refused at
+/// every door; 0.4.3, NL-6f, refuses one with no output too): the frozen
+/// table keeps it as the door's refusal; the L3 pins use
+/// [`minimal_valid_transactions`].
 fn minimal_transactions(n: u32) -> (Vec<u8>, String) {
     let mut body = vec![0x01, 0x00, 0xbe, 0xef, 0x00];
     body.extend(varint(u64::from(n)));
@@ -362,6 +366,38 @@ fn minimal_transactions(n: u32) -> (Vec<u8>, String) {
         body.push(0x00);
     }
     (body, display(&wire_txid(&raw_tx(0, &[], &[], 0))))
+}
+
+/// The lens's first body under bsv-rs 0.4.3's rules (bsv-low #585 land2):
+/// `n` minimal VALID transactions (60 bytes: a version, one input with an
+/// empty unlock, one empty output of 0 satoshis, a lock time), beside a
+/// proven funding and a subject that spends it, so the walk answers.
+fn minimal_valid_transactions(n: u32) -> (Vec<u8>, String) {
+    let funding = funding_raw(&[(1_000, OPEN_LOCK.to_vec())]);
+    let funding_txid = wire_txid(&funding);
+    let subject = raw_tx(
+        1,
+        &[spend(funding_txid, 0, &OPEN_UNLOCK)],
+        &[(900, vec![OP_1])],
+        0,
+    );
+    let mut body = vec![0x01, 0x00, 0xbe, 0xef, 0x01];
+    body.extend_from_slice(&one_leaf_bump(&funding_txid));
+    body.extend(varint(u64::from(n) + 2));
+    body.extend_from_slice(&funding);
+    body.extend_from_slice(&[0x01, 0x00]);
+    for i in 0..n {
+        body.extend_from_slice(&raw_tx(
+            2,
+            &[spend([0xbb; 32], i, &[])],
+            &[(0, Vec::new())],
+            0,
+        ));
+        body.push(0x00);
+    }
+    body.extend_from_slice(&subject);
+    body.push(0x00);
+    (body, display(&wire_txid(&subject)))
 }
 
 /// `OP_DROP OP_1`, spent by any push.
@@ -443,13 +479,16 @@ async fn stopped_at_the_memory_limb(name: &str, body: &[u8], subject: &str) {
 
 /// THE PIN (L3), the element count. 900,000 minimal transactions in 9.9 MB
 /// are an index of 77 MB: past the memory limb, stopped from the frame, the
-/// network judges. RED on `8c92671`: walked, `Ok(WalkStats { unproven_txs: 1,
+/// network judges. Since the land onto bsv-rs 0.4.3 the 900,000 are the
+/// smallest VALID transactions (one input, one output; 54.9 MB), the 10-byte
+/// ones being invalid bytes now; they are stopped at the element that crosses
+/// the limb (byte 5,386,293), the call's heap at 250 bytes. RED on `8c92671`: walked, `Ok(WalkStats { unproven_txs: 1,
 /// inputs_executed: 0, .. })`, the call's heap peaking at 77,089,816 bytes.
 #[test]
 fn e585f_l3_900000_minimal_transactions_stop_at_the_memory_limb() {
     one_at_a_time(async {
-        let (body, subject) = minimal_transactions(900_000);
-        assert_eq!(body.len(), 9_900_010);
+        let (body, subject) = minimal_valid_transactions(900_000);
+        assert_eq!(body.len(), 54_900_179);
         stopped_at_the_memory_limb("900,000 minimal transactions", &body, &subject).await;
     });
 }
@@ -1146,13 +1185,15 @@ const TABLE: &[&str] = &[
     "six sig-less readers, version 2 | OK txs=1 inputs=6 bytes=38 hash=1 sig=0 work=131110 judged=true",
     "5 bare signature checks | OK txs=5 inputs=5 bytes=230 hash=0 sig=5 work=327910 judged=true",
     "1,100 bare signature checks | OVER script walk over budget at 1bde628f079f00365ef5ea90d00a6798c32b669fe26814777fc7712c4a837118 (subject judged: true): estimated work 67155968 bytes exceeds the door budget of 67108864 (input 0 of 1bde628f079f00365ef5ea90d00a6798c32b669fe26814777fc7712c4a837118)",
-    "2,000 minimal transactions | OK txs=1 inputs=0 bytes=0 hash=0 sig=0 work=0 judged=true",
+    "2,000 minimal transactions | PARSE BEEF parsing failed: invalid BEEF at byte 8: NoInputs",
     "one BUMP of 2^10 leaves | OK txs=1 inputs=1 bytes=4 hash=0 sig=0 work=4 judged=true",
     "one BUMP of 2^17 leaves | OVER script walk over budget at 57b7478b7f84560e965a831cfb84ad2022982a8e355e76f68d4a6c33cef7bea0 (subject judged: false): estimated memory 50332050 bytes exceeds the door memory budget of 50331648 (the element at byte 5 of the BEEF)",
 ];
 
 /// The SHA-256 of the rows, each followed by a line feed.
-const TABLE_DIGEST: &str = "dc166ec499abe55d55e80cfac0943eb4e352f793d3ec641bc0fbd73e446d3e9b";
+/// Re-frozen on the land onto bsv-rs 0.4.3 (bsv-low #585 land2): one row moved, the 2,000 minimal transactions,
+/// now the door's refusal of a transaction with no input (NL-6e).
+const TABLE_DIGEST: &str = "92b869b234ae19b95315a92ce3ac8f999a32c69786db638ba88993b7cff2ebc4";
 
 /// THE PIN (N2). The parity of the door, kept in the tree: a body table with
 /// the door's answer frozen per body, statistics and error text, and the
@@ -1245,7 +1286,7 @@ fn e585f_a_breach_names_its_limb() {
 fn e585f_l3_the_memory_estimate_is_above_the_measured_heap() {
     one_at_a_time(async {
         let mut shapes: Vec<(&str, Vec<u8>, String)> = Vec::new();
-        let (body, subject) = minimal_transactions(900_000);
+        let (body, subject) = minimal_valid_transactions(900_000);
         shapes.push(("900,000 minimal transactions", body, subject));
         let (body, subject) = wide_bump(18);
         shapes.push(("one BUMP of 2^18 leaves", body, subject));

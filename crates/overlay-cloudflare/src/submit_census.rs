@@ -721,6 +721,7 @@ pub fn census_counters(
 mod tests {
     use super::*;
     use bsv_rs::transaction::{Beef, Transaction};
+    use overlay_engine::beef_limits;
 
     // The SAME committed real-mainnet fixtures the ef.rs suite uses — the
     // census must be exercised through the shapes the gated arm actually
