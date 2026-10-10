@@ -1943,6 +1943,7 @@ mod tests {
             reason: "phase3-fault".to_string(),
             redrive: None,
             ef_job: None,
+            gated: false,
         }
     }
 
@@ -3767,6 +3768,10 @@ mod tests {
             if c.contains(of_report) {
                 assert!(c.contains("\"not durable: {}\""), "{c}");
                 by_report += 1;
+            } else if c.contains("crate::queue::replay_error_class(&e)") {
+                // the E592 lens fold: an engine error is classed by `replay_error_class` (a walk past the budget is
+                // `not_now`, any other a `fault`)
+                assert!(c.contains("\"failed: {e}\""), "{c}");
             } else {
                 assert!(c.contains("crate::dead_letters::LetterClass::Fault"), "{c}");
             }
@@ -4068,6 +4073,7 @@ mod tests {
             reason: "phase3-fault".to_string(),
             redrive: None,
             ef_job: None,
+            gated: false,
         }
     }
 

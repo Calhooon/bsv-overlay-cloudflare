@@ -221,6 +221,40 @@ pub struct MutationMessage {
     /// none (`beef_b64` is empty). Absent on every replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ef_job: Option<String>,
+    /// The E592 lens fold (bsv-low #592): set by the BROADCAST-GATED arm's producer alone (`/submit` under
+    /// `ProceedWithNetworkGate`, the route's `enqueue_replay_gated`): the network accepted these bytes before the
+    /// message was sent. Its consumer replays under `WalkBreachPolicy::NetworkAccepted` ([`replay_breach_policy`]):
+    /// a walk past the engine's budget goes on as `historical-tx-no-spv`. A message without it is NOT gated (its
+    /// walk past the budget is "not now"), whatever its mode: an ungated `historical-tx` fault replays under the
+    /// same mode. Absent on the wire when false, so every other message is byte for byte what it was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gated: bool,
+}
+
+/// The engine's breach policy for the replay of `msg` (the E592 lens fold, H1): `NetworkAccepted` only for a message
+/// the gated arm's producer marked, `NotNow` for every other (never inferred from the mode).
+#[must_use]
+pub fn replay_breach_policy(msg: &MutationMessage) -> overlay_engine::engine::WalkBreachPolicy {
+    if msg.gated {
+        overlay_engine::engine::WalkBreachPolicy::NetworkAccepted
+    } else {
+        overlay_engine::engine::WalkBreachPolicy::NotNow
+    }
+}
+
+/// The dead letter class of a replay the engine answered with an error (the E592 lens fold): a walk past the budget
+/// is "not now" (the same bytes breach again until they arrive proven), parked under #576's `not_now` class (one per
+/// txid, 200 a day); any other error is a `fault`.
+#[must_use]
+pub fn replay_error_class(
+    e: &overlay_engine::engine::EngineError,
+) -> crate::dead_letters::LetterClass {
+    match e {
+        overlay_engine::engine::EngineError::WalkCouldNotRun(_) => {
+            crate::dead_letters::LetterClass::NotNow
+        }
+        _ => crate::dead_letters::LetterClass::Fault,
+    }
 }
 
 /// NL-6c: the message that hands a deferred EF job to the consumer: its
@@ -235,6 +269,7 @@ pub fn ef_job_message(reference: &str) -> MutationMessage {
         reason: EF_JOB_REASON.to_string(),
         redrive: None,
         ef_job: Some(reference.to_string()),
+        gated: false,
     }
 }
 
@@ -297,6 +332,7 @@ pub fn inline_worst_len(
             reason: reason.to_string(),
             redrive,
             ef_job: None,
+            gated: false,
         };
         serde_json::to_string(&m).map_or(usize::MAX, |j| j.len() - 1)
     };
@@ -343,6 +379,7 @@ fn inline_message(
         reason: reason.to_string(),
         redrive: None,
         ef_job: None,
+        gated: false,
     }
 }
 
@@ -360,9 +397,34 @@ pub fn plan_replay(
     reason: &str,
     room: usize,
 ) -> Carriage {
-    if inline_worst_len(beef.len(), topics, mode, reason) <= room {
-        return Carriage::Inline(inline_message(beef, topics, mode, reason));
+    plan_replay_gated(beef, topics, mode, reason, room, false)
+}
+
+/// [`plan_replay`] for a message marked [`MutationMessage::gated`] when `gated` (the E592 lens fold). The room is
+/// measured on the marked envelope; an unmarked message is planned byte for byte as before.
+#[must_use]
+pub fn plan_replay_gated(
+    beef: &[u8],
+    topics: &[String],
+    mode: SubmitMode,
+    reason: &str,
+    room: usize,
+    gated: bool,
+) -> Carriage {
+    let mark = |mut carriage: Carriage| {
+        match &mut carriage {
+            Carriage::Inline(m) | Carriage::R2(m) => m.gated = gated,
+        }
+        carriage
+    };
+    let gated_extra = if gated { ",\"gated\":true".len() } else { 0 };
+    if inline_worst_len(beef.len(), topics, mode, reason).saturating_add(gated_extra) <= room {
+        return mark(Carriage::Inline(inline_message(beef, topics, mode, reason)));
     }
+    mark(plan_keyed(beef, topics, mode, reason))
+}
+
+fn plan_keyed(beef: &[u8], topics: &[String], mode: SubmitMode, reason: &str) -> Carriage {
     let sha256 = hex::encode(bsv_rs::primitives::hash::sha256(beef));
     let txid = beef_limits::parse_beef(beef, &beef_limits::QUEUE_BEEF_LIMITS)
         .ok()
@@ -381,6 +443,7 @@ pub fn plan_replay(
         reason: reason.to_string(),
         redrive: None,
         ef_job: None,
+        gated: false,
     })
 }
 
@@ -771,11 +834,15 @@ pub async fn delete_beefs(env: &worker::Env, keys: &[String], why: &str) -> Vec<
 /// bytes are NOT in the queue (a missing binding, an R2 write or a send that
 /// faulted) so the route can refuse with the reason; never the body's size. A
 /// body past the inline room is written to R2 BEFORE the send.
+///
+/// `gated` marks the message [`MutationMessage::gated`]: the broadcast-gated arm's producer alone sets it (the E592
+/// lens fold), the network having accepted these bytes.
 pub async fn enqueue_replay(
     env: &worker::Env,
     beef: &[u8],
     topics: &[String],
     mode: SubmitMode,
+    gated: bool,
 ) -> Result<(), String> {
     let room = inline_room(
         env.var(QUEUE_MESSAGE_ROOM_VAR)
@@ -783,7 +850,7 @@ pub async fn enqueue_replay(
             .map(|v| v.to_string())
             .as_deref(),
     );
-    let carriage = plan_replay(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room);
+    let carriage = plan_replay_gated(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room, gated);
     if let Carriage::R2(msg) = &carriage {
         if let Some(r) = &msg.r2 {
             put_beef(env, r, beef).await?;

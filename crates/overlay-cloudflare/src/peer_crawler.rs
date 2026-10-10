@@ -65,6 +65,10 @@ pub struct CrawlResult {
     /// Peer-level errors (lookup failed entirely; couldn't even
     /// enumerate records).
     pub peer_errors: HashMap<String, String>,
+    /// The engine walks of this crawl that could not run within the budget (bsv-low #592; the E592 lens fold, L3):
+    /// a subject's (not now, nothing admitted, crawled again next tick) and a carried predecessor's landing's. The
+    /// cron counts each (`ops::note_engine_walk_not_now`).
+    pub walks_could_not_run: Vec<overlay_engine::engine::WalkCouldNotRun>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,7 +99,8 @@ pub async fn crawl_peers(engine: &Engine, peers: &[PeerConfig], origin: &str) ->
         for (service, topic) in &peer.service_to_topic {
             let key = format!("{}|{}", peer.peer_url, service);
             match crawl_one(engine, &peer.peer_url, service, topic, origin).await {
-                Ok((attempted, admitted, errors)) => {
+                Ok((attempted, admitted, errors, walks)) => {
+                    result.walks_could_not_run.extend(walks);
                     result.attempted.insert(key.clone(), attempted);
                     result.admitted_by.insert(key.clone(), admitted);
                     if !errors.is_empty() {
@@ -117,7 +122,15 @@ pub async fn crawl_peers(engine: &Engine, peers: &[PeerConfig], origin: &str) ->
     result
 }
 
-/// Crawl one (peer, service) and return `(attempted, admitted, errors)`.
+/// What one (peer, service) crawl did: attempted, admitted, the submit errors, and the walks that could not run.
+type CrawledOne = (
+    usize,
+    usize,
+    Vec<String>,
+    Vec<overlay_engine::engine::WalkCouldNotRun>,
+);
+
+/// Crawl one (peer, service) and return `(attempted, admitted, errors, walks)`.
 /// Errs only if the lookup itself failed; per-output submit failures are
 /// bundled into the `errors` vec and keep the crawl going.
 async fn crawl_one(
@@ -126,20 +139,37 @@ async fn crawl_one(
     service: &str,
     topic: &str,
     origin: &str,
-) -> Result<(usize, usize, Vec<String>), String> {
+) -> Result<CrawledOne, String> {
     let outputs = fetch_lookup(peer_url, service).await?;
     let mut admitted_total: usize = 0;
     let mut errors: Vec<String> = Vec::new();
+    let mut walks: Vec<overlay_engine::engine::WalkCouldNotRun> = Vec::new();
     for (i, entry) in outputs.iter().enumerate() {
         let tagged = TaggedBEEF {
             beef: entry.beef.clone(),
             topics: vec![topic.to_string()],
             off_chain_values: None,
         };
-        match engine.submit(&tagged, SubmitMode::CurrentTx).await {
-            Ok(steak) => {
+        // The E592 lens fold (H1, L3): the report is kept, so a carried predecessor's walk past the budget is
+        // counted; the subject's own is "not now" (nothing admitted, counted, crawled again next tick).
+        match engine
+            .submit_with_report(&tagged, SubmitMode::CurrentTx)
+            .await
+        {
+            Ok((steak, report)) => {
                 let admitted: usize = steak.values().map(|a| a.outputs_to_admit.len()).sum();
                 admitted_total += admitted;
+                walks.extend(report.landed_walks_could_not_run);
+            }
+            Err(overlay_engine::engine::EngineError::WalkCouldNotRun(stop)) => {
+                worker::console_log!(
+                    "[{origin}] peer-crawl: {peer}/{service} output[{i}]: the walk of {} could not run ({}): not now, retried next crawl",
+                    stop.subject_txid,
+                    stop.limb.as_str(),
+                    peer = peer_url,
+                    service = service,
+                );
+                walks.push(stop);
             }
             Err(e) => {
                 let msg = format!("output[{i}] submit failed: {e}");
@@ -160,7 +190,7 @@ async fn crawl_one(
         admitted = admitted_total,
         errs = errors.len(),
     );
-    Ok((outputs.len(), admitted_total, errors))
+    Ok((outputs.len(), admitted_total, errors, walks))
 }
 
 /// POST `{peer_url}/lookup` with a `findAll` query and parse the

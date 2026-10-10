@@ -3419,8 +3419,10 @@ mod tests {
     fn e1d_delta_l2_every_submit_with_a_report_guards_what_it_landed() {
         for (file, src) in [("routes.rs", include_str!("routes.rs")), ("lib.rs", include_str!("lib.rs"))] {
             // a call, never a comment that names one
+            // the E592 lens fold: the queue's replay names its breach policy (`submit_with_report_under`)
             let calls: Vec<usize> = src
                 .match_indices(".submit_with_report(")
+                .chain(src.match_indices(".submit_with_report_under("))
                 .map(|(at, _)| at)
                 .filter(|&at| !src[src[..at].rfind('\n').map_or(0, |nl| nl + 1)..at].trim_start().starts_with("//"))
                 .collect();

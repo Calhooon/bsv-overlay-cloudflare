@@ -90,10 +90,11 @@ pub const COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY: &str = "submit_script_walk_ove
 /// (bsv-low #592: `Engine::submit`'s own script walk, every mode but
 /// `historical-tx-no-spv`, the queue's `historical-tx` replay of every gated
 /// submit and the ungated modes): the static work estimate, or the
-/// interpreter's own memory limit tripping. NOT a refusal: the submit went on
-/// as under `historical-tx-no-spv` (the topic managers judged it, the network
-/// judges its validity), and was acked as such. Sustained non-zero on honest
-/// traffic means the budget is too tight for a real shape.
+/// interpreter's own memory limit tripping. NOT a refusal: "not now" on every
+/// door where nothing stands in for the walk (the E592 lens fold), and on the
+/// queue's replay of a gated submission (the network's accept on record) the
+/// submit went on as under `historical-tx-no-spv`. Sustained non-zero on
+/// honest traffic means the budget is too tight for a real shape.
 pub const COUNTER_SUBMIT_ENGINE_WALK_OVER_BUDGET: &str = "submit_engine_walk_over_budget_total";
 /// …whose engine walk was not made because it would hold more MEMORY than
 /// the budget's limb beside the body (the 1.9 MB push-only unproven parent
@@ -108,9 +109,9 @@ pub fn engine_walk_over_counter(limb: overlay_engine::engine::WalkLimb) -> &'sta
     }
 }
 
-/// Count and log a submit whose engine walk could not run (bsv-low #592),
-/// at `door` (`POST /submit`, `Queue`, `POST /admin/readmit`). Nothing when
-/// the walk ran.
+/// Count and log the engine walks of a submit that could not run (bsv-low #592) and WENT ON (the gated replay,
+/// `WalkBreachPolicy::NetworkAccepted`), and those of its carried predecessors' landings (the E592 lens fold, L3),
+/// at `door` (`POST /submit`, `Queue`, `POST /admin/readmit`, `peer-crawl`). Nothing when every walk ran.
 pub async fn note_engine_walk(
     db: &D1Database,
     report: &overlay_engine::engine::MutationReport,
@@ -118,7 +119,7 @@ pub async fn note_engine_walk(
 ) {
     if let Some(stop) = &report.walk_could_not_run {
         worker::console_log!(
-            "{door}: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): not a refusal, admitted as historical-tx-no-spv, the network judges",
+            "{door}: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): the network accepted these bytes, admitted as historical-tx-no-spv",
             stop.subject_txid,
             stop.limb.as_str(),
             stop.at_txid,
@@ -127,6 +128,33 @@ pub async fn note_engine_walk(
         );
         bump_counter(db, engine_walk_over_counter(stop.limb), 1).await;
     }
+    for stop in &report.landed_walks_could_not_run {
+        worker::console_log!(
+            "{door}: a carried predecessor's walk could not run ({} for {}; {}): counted with its landing",
+            stop.limb.as_str(),
+            stop.subject_txid,
+            stop.what
+        );
+        bump_counter(db, engine_walk_over_counter(stop.limb), 1).await;
+    }
+}
+
+/// Count and log a submit whose engine walk could not run and was answered NOT NOW (the E592 lens fold: nothing on
+/// record stands in for the walk), at `door`.
+pub async fn note_engine_walk_not_now(
+    db: &D1Database,
+    stop: &overlay_engine::engine::WalkCouldNotRun,
+    door: &str,
+) {
+    worker::console_log!(
+        "{door}: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): not now, nothing admitted; present it proven",
+        stop.subject_txid,
+        stop.limb.as_str(),
+        stop.at_txid,
+        stop.subject_judged,
+        stop.what
+    );
+    bump_counter(db, engine_walk_over_counter(stop.limb), 1).await;
 }
 
 /// The counter of a door walk past its own bound, by the limb it passed.
