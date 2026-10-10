@@ -68,7 +68,9 @@ pub struct CrawlResult {
     /// The engine walks of this crawl that could not run within the budget (bsv-low #592; the E592 lens fold, L3):
     /// a subject's (not now, nothing admitted, crawled again next tick) and a carried predecessor's landing's. Each
     /// is COUNTED inside the crawl as its submit returns (`crawl_peers`' `db`; the E592 delta lens, NOTE-3), so a
-    /// crawl the cron drops at its budget keeps the counts of the submits it finished; this list is the report.
+    /// crawl the cron drops at its budget keeps the counts of the submits it finished. This list is for tests and
+    /// future callers: neither the cron's log line nor `/admin/crawlPeers` serves it (the E592 delta-2 lens, NOTE-4);
+    /// the counters and the per-stop log lines carry the record.
     pub walks_could_not_run: Vec<overlay_engine::engine::WalkCouldNotRun>,
 }
 

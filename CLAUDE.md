@@ -248,16 +248,23 @@ pinned equal to bsv-rs's `Script::is_push_only` by `e592f_h1_push_only_is_the_sd
 bsv-rs 0.4.3 enforces it at EVERY transaction version (`REQUIRE_PUSH_ONLY_UNLOCKING`,
 `Spend::new`, not version-conditional, unlike MINIMALDATA/LOW_S/CLEANSTACK/NULLDUMMY),
 so the check is applied to v1 and v2 alike. It holds across the WHOLE walk,
-not per input (the E592 delta lens, D1-L1): a PRE-PASS reads the unlocking
+not per input (the E592 delta lens, D1-L1), once the frame's memory limb
+admits the stream (a body over that limb at the frame answers
+`WalkCouldNotRun` before any script is read; the delta-2 lens, NOTE-3): a PRE-PASS reads the unlocking
 script of every input of every transaction the walk can reach, in the walk's
 order, before any charge (`script_door::first_not_push_only`, O(script
 bytes), no parse), so a non-push unlocking script on input 1, or on an
 unproven ancestor, is refused even when input 0's lock would breach the
 census first (it was `WalkCouldNotRun`); the per-input check stays as the
-belt. The pre-pass reads only the unlocking scripts, so it can name a
+belt, unreachable while the pre-pass visits a superset of what the walk
+executes, so no pin guards it (the delta-2 lens, NOTE-2, a mutant run). The pre-pass reads only the unlocking scripts, so it can name a
 refusal where the walk would have stopped earlier at a structural fault (a
 source output out of bounds, the value rule): both are bodies the network
-refuses. Pin `e592_d1_l1_a_non_push_unlock_anywhere_is_refused_before_a_breach`
+refuses. At the gated door the pre-pass therefore refuses (400
+`script-refused`, `submit_script_refused_total`, nothing broadcast) a body
+that before it was left to the network for a breach or a structural fault;
+reference parity (the SDK's `Spend` refuses a non-push unlock at every
+version); LOW's own spends never take this path (the delta-2 lens, NOTE-1). Pin `e592_d1_l1_a_non_push_unlock_anywhere_is_refused_before_a_breach`
 (`--test engine_walk_budget`, under both policies; RED with the pre-pass
 inert). The census may still over-estimate
 a hostile LOCK (a bare `OP_CHECKMULTISIG`, 513 hash opcodes): that is the
