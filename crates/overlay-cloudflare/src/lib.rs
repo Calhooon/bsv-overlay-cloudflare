@@ -1169,7 +1169,8 @@ fn build_engine_with_storage(
 /// The budget of the engine's own script walk in this Worker (bsv-low #592, `Engine::set_walk_budget`): the door's
 /// own, `DoorBudget::DEFAULT`, under which the gated door walks (`verify_scripts_only`); pinned equal
 /// (`beef_door_replay::e592`). Three eighths of a 128 MB isolate for the memory limb.
-pub const WORKER_WALK_BUDGET: overlay_engine::engine::DoorBudget = overlay_engine::engine::DoorBudget::DEFAULT;
+pub const WORKER_WALK_BUDGET: overlay_engine::engine::DoorBudget =
+    overlay_engine::engine::DoorBudget::DEFAULT;
 
 /// PURE (bsv-low#257): race `fut` against `deadline`; `None` = the deadline
 /// won and `fut` was DROPPED (its in-flight work cancelled). Injectable

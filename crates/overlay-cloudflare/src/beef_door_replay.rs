@@ -1140,7 +1140,8 @@ mod e592 {
         };
         let r = m.r2.clone().unwrap();
         assert_eq!(r.txid.as_deref(), Some(subject.as_str()));
-        queue::check_replay_blob(&r, &beef).expect("the consumer's own check of the object's bytes");
+        queue::check_replay_blob(&r, &beef)
+            .expect("the consumer's own check of the object's bytes");
         let mode = queue::replay_submit_mode(&m.mode);
         assert_eq!(mode, SubmitMode::HistoricalTx, "the replay walks");
 
@@ -1159,17 +1160,26 @@ mod e592 {
             .unwrap()
             .block_on(engine.submit_with_report(&tagged, mode))
             .expect("never a refusal for the walk's size");
-        let stop = report.walk_could_not_run.clone().expect("the walk could not run");
+        let stop = report
+            .walk_could_not_run
+            .clone()
+            .expect("the walk could not run");
         assert_eq!(stop.subject_txid, subject);
         assert_eq!(stop.limb, WalkLimb::OverMemory);
         assert_eq!(
             crate::ops::engine_walk_over_counter(stop.limb),
             "submit_engine_walk_over_memory_total"
         );
-        assert!(report.is_durable(), "the handler acks a durable report: no retry, no dead letter");
+        assert!(
+            report.is_durable(),
+            "the handler acks a durable report: no retry, no dead letter"
+        );
         assert_eq!(report.applied_topics, topics, "acked as applied");
         let ack = queue::landed_ack(&m, &report, None);
-        assert!(!ack.leaves, "every topic applied: the ack deletes the object");
+        assert!(
+            !ack.leaves,
+            "every topic applied: the ack deletes the object"
+        );
         assert_eq!(ack.delete, vec![r.key.clone()]);
     }
 
@@ -1196,7 +1206,9 @@ mod e592 {
             .expect("the synchronous submit");
         assert!(routes[submit..]
             .contains("crate::ops::note_engine_walk(&db, &mutation_report, \"POST /submit\")"));
-        assert!(routes.contains("crate::ops::note_engine_walk(&db, &report, \"POST /admin/readmit\")"));
+        assert!(
+            routes.contains("crate::ops::note_engine_walk(&db, &report, \"POST /admin/readmit\")")
+        );
         // The gated door walks under `DoorBudget::DEFAULT` (`verify_scripts_only`); the engine under the
         // Worker's instance, which is that budget: one budget for every walk of this Worker.
         assert!(routes.contains("engine.verify_scripts_only(&gated_beef, &subject_txid).await"));

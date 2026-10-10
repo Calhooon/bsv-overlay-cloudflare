@@ -115,14 +115,20 @@ async fn submitted(
     body: &[u8],
     mode: SubmitMode,
 ) -> (
-    Result<(Steak, bsv_overlay_engine::engine::MutationReport), bsv_overlay_engine::engine::EngineError>,
+    Result<
+        (Steak, bsv_overlay_engine::engine::MutationReport),
+        bsv_overlay_engine::engine::EngineError,
+    >,
     usize,
 ) {
     let tagged = TaggedBEEF::new(body.to_vec(), vec![TOPIC.to_string()]);
     let at_entry = LIVE.load(Ordering::Relaxed);
     PEAK.store(at_entry, Ordering::Relaxed);
     let answer = engine.submit_with_report(&tagged, mode).await;
-    (answer, PEAK.load(Ordering::Relaxed).saturating_sub(at_entry))
+    (
+        answer,
+        PEAK.load(Ordering::Relaxed).saturating_sub(at_entry),
+    )
 }
 
 /// THE PIN (a): the witness through `Engine::submit_with_report` under
@@ -161,7 +167,10 @@ fn e592_a_the_witness_under_historical_tx_is_walked_within_the_limbs() {
         assert_eq!(stop.subject_txid, subject);
         assert_eq!(stop.limb, WalkLimb::OverMemory);
         assert!(stop.subject_judged, "the subject's own input ran first");
-        assert!(report.is_durable(), "a breach never makes a report undurable");
+        assert!(
+            report.is_durable(),
+            "a breach never makes a report undurable"
+        );
         assert_eq!(report.applied_topics, vec![TOPIC.to_string()]);
 
         // The same bytes under historical-tx-no-spv, on a fresh engine: the
@@ -173,7 +182,11 @@ fn e592_a_the_witness_under_historical_tx_is_walked_within_the_limbs() {
                 .get(TOPIC)
                 .map(|a| (a.outputs_to_admit.clone(), a.coins_to_retain.clone()))
         };
-        assert_eq!(admitted(&steak), admitted(&no_spv_steak), "the admission is no-spv's");
+        assert_eq!(
+            admitted(&steak),
+            admitted(&no_spv_steak),
+            "the admission is no-spv's"
+        );
         assert_eq!(no_spv_report.applied_topics, report.applied_topics);
         assert_eq!(no_spv_report.walk_could_not_run, None);
     });
@@ -199,8 +212,18 @@ fn e592_a_each_limb_is_named_and_the_submit_goes_on() {
         let cat_lock = [[OP_DUP, OP_CAT].repeat(12), vec![OP_DROP, OP_1]].concat();
         let eight_kb = [&[OP_PUSHDATA2][..], &8192u16.to_le_bytes(), &[0x42; 8192]].concat();
         for (name, lock, unlock, limb) in [
-            ("hash-heavy", hash_lock, vec![0x01, 0x42], WalkLimb::OverWork),
-            ("OP_CAT doubling", cat_lock, eight_kb, WalkLimb::InterpreterMemory),
+            (
+                "hash-heavy",
+                hash_lock,
+                vec![0x01, 0x42],
+                WalkLimb::OverWork,
+            ),
+            (
+                "OP_CAT doubling",
+                cat_lock,
+                eight_kb,
+                WalkLimb::InterpreterMemory,
+            ),
         ] {
             let (body, subject) = on_a_proven_source(&lock, &unlock);
             for mode in [SubmitMode::HistoricalTx, SubmitMode::CurrentTx] {
@@ -210,7 +233,11 @@ fn e592_a_each_limb_is_named_and_the_submit_goes_on() {
                 assert_eq!(stop.limb, limb, "{name} {mode:?}");
                 assert_eq!(stop.subject_txid, subject);
                 assert!(!stop.subject_judged);
-                assert_eq!(report.applied_topics, vec![TOPIC.to_string()], "{name} {mode:?}");
+                assert_eq!(
+                    report.applied_topics,
+                    vec![TOPIC.to_string()],
+                    "{name} {mode:?}"
+                );
             }
         }
     });
@@ -234,7 +261,10 @@ fn e592_c_a_clean_false_and_a_structural_fault_are_unchanged() {
             }) => {
                 assert_eq!(subject_txid, subject);
                 assert_eq!(input_index, 0);
-                assert_eq!(reason, "The top stack element must be truthy after script evaluation.");
+                assert_eq!(
+                    reason,
+                    "The top stack element must be truthy after script evaluation."
+                );
             }
             other => panic!("a clean false is refused: {other:?}"),
         }
@@ -244,12 +274,7 @@ fn e592_c_a_clean_false_and_a_structural_fault_are_unchanged() {
         let parent = one_in_one_out(&sha256d(&funding), &[0x01, 0x42], 900, &[OP_DROP, OP_1]);
         let subject = one_in_one_out(&sha256d(&parent), &[0x01, 0x42], 800, &[OP_1]);
         // A V1 BEEF of no BUMP and the subject alone: its one tip.
-        let lacking = [
-            &[0x01, 0x00, 0xbe, 0xef, 0x00, 0x01][..],
-            &subject,
-            &[0x00],
-        ]
-        .concat();
+        let lacking = [&[0x01, 0x00, 0xbe, 0xef, 0x00, 0x01][..], &subject, &[0x00]].concat();
         let (answer, _) = submitted(&engine(), &lacking, SubmitMode::HistoricalTx).await;
         match answer {
             Err(EngineError::SpvError(why)) => assert_eq!(
@@ -265,9 +290,12 @@ fn e592_c_a_clean_false_and_a_structural_fault_are_unchanged() {
         // The value rule: an unproven spend creating satoshis.
         let greedy = one_in_one_out(&sha256d(&funding), &[0x01, 0x42], 5_000, &[OP_1]);
         let greedy_txid = display(&sha256d(&greedy));
-        let (answer, _) =
-            submitted(&engine(), &beef_v1(&[funding.clone(), greedy]), SubmitMode::HistoricalTx)
-                .await;
+        let (answer, _) = submitted(
+            &engine(),
+            &beef_v1(&[funding.clone(), greedy]),
+            SubmitMode::HistoricalTx,
+        )
+        .await;
         match answer {
             Err(EngineError::SpvError(why)) => assert_eq!(
                 why,

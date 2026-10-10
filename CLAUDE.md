@@ -150,7 +150,92 @@ script_verification -- --nocapture`. Measured natively, release profile
 (2026-09-08): the real 3150-byte Poc5 covenant settle is ~1 ms end to end; a
 ~7 KB lock / ~20 KB unlock / ~7000-opcode spend that hashes 46 MB is 137 ms
 in `Transaction::verify` (2.1 s in a debug build). Workers wasm is slower
-than native; budget CPU accordingly for big covenant legs.
+than native; budget CPU accordingly for big covenant legs. (Since #592 that
+spend is past the submit's work limb at submit: below.)
+
+### The submit's walk takes the door's two limbs (bsv-low #592; the owner's ruling 3a of 2026-10-10)
+
+Until #592 the walk above ran with no memory charge and no work bound:
+219.7 MB natively (217,765,812 measured by the pin) for a valid BEEF whose
+unproven parent carries 1.9 MB of push-only unlocking script, an isolate kill
+on Workers (128 MB). The door below bounded the gated arm's pre-broadcast
+walk only. The reach was every mode that walks: the ungated modes
+(operator-only under `SUBMIT_ENFORCE`), `/admin/readmit`, the peer crawler,
+the GASP anchor check (#557), and above all the QUEUE REPLAY: every gated
+submit enqueues its replay (S2) and the consumer re-submits it under
+`historical-tx`, which walks (the gated arm's own synchronous admission is
+no-spv and does not). A stranger's valid 1.9 MB parent passed the door,
+broadcast, admitted, then killed the consumer's isolate on each redelivery
+until it dead-lettered.
+
+**One walker.** `Engine::submit`'s walk (`verify_beef_linear`, every mode but
+`HistoricalTxNoSpv`) and the GASP anchor check (`verify_spv_like_the_reference`)
+now run the DOOR's stream walk (`script_door::walk_trusting`, the function
+`verify_scripts_only` runs) under the engine's `DoorBudget`: the same two limbs
+(64 MiB of work, 48 MiB of memory), the same estimates charged from the bytes
+before anything is parsed or run, the same 128 KB interpreter element limit.
+The walk and `DoorBudget` were already in `overlay-engine` (since #585), so
+nothing moved; the worker's door is unchanged byte for byte. What the submit
+adds after the walk: the roots of the proven transactions it reached, in its
+order, asked of the chain tracker once per BUMP (computed and accepted with
+none). A body with BOTH a refused script and a bad root now names the script
+(the old walk checked them in one order; stated, not pinned).
+
+**The budget is configuration.** `EngineBuilder::with_walk_budget` /
+`Engine::set_walk_budget`, `DoorBudget::DEFAULT` unless set (a library
+consumer, Zanaadu, gets 64 MiB / 48 MiB). The worker sets
+`WORKER_WALK_BUDGET` (`lib.rs`, equal to `DoorBudget::DEFAULT`, under which
+the gated door walks; pinned equal) and the engine hands it to the GASP
+anchor check (`OverlayGASPStorage::with_walk_budget`).
+
+**A breach is "the walk could not run"**, never a refusal and never a dropped
+submit: `MutationReport::walk_could_not_run: Option<WalkCouldNotRun>`
+(`subject_txid`, `at_txid`, `subject_judged`, `limb`: `WalkLimb::OverWork`,
+`OverMemory` or `InterpreterMemory`, the interpreter's own limit tripping;
+`what`, the estimate in the door's words). The submit goes on exactly as under
+`HistoricalTxNoSpv` (the topic managers judge it, the network judges its
+validity); the report stays durable, so the queue ACKS the replay and it never
+dead-letters for the walk's size. The engine logs one line with the subject
+and the limb; the worker counts it (`ops::note_engine_walk`) at the queue
+replay, the synchronous `/submit` and `/admin/readmit`:
+`submit_engine_walk_over_budget_total` (work, interpreter memory) and
+`submit_engine_walk_over_memory_total`, served from 0, beside the door's
+`submit_script_walk_*`. The GASP anchor logs a breach and goes on to its
+replay through the topic manager (refusing would refuse a valid graph for its
+size; holding the cursor would ask again for ever). A clean FALSE from the
+interpreter is the refusal it was (`ScriptVerificationFailed`, the
+interpreter's own words); a structural fault is the `SpvError` it was, in the
+same words. The operator bar is unchanged. The reference (`Engine.submit`,
+`tx.verify`) has no budget: this is the platform's addition, on D8's lineage.
+
+What it costs a valid BEEF: every spend the door leaves to the network is now
+admitted at submit WITHOUT its scripts run (the hash-heavy and `OP_CAT`
+shapes, a 1 MB `OP_NOP` lock, more than 1,024 signature checks in one walk,
+the ~7000-opcode spend above: 2,330 SHA256s are 2,330 elements of 128 KB,
+past 64 MiB); an element past 128 KB, which the old walk ran (bsv-rs's
+default limit), is `InterpreterMemory`. Measured natively (debug), the
+witness through `submit_with_report` under `historical-tx`: 217,765,812 bytes
+before, 15,212,156 after (the walk stops at the parent's input, charged 996
+MB parsed, before its parse; the rest is the route's hydrated parses of the
+1.9 MB body). Not measured on wasm32.
+
+Pins: `cargo test -p bsv-overlay-engine --test engine_walk_budget --
+--nocapture` (`e592_a_the_witness_*`, RED on `54dbb16` with the report's
+field unread: "the submit held 217765812 bytes (the memory limb plus the body
+is 52231890): Ok(MutationReport { faults: [], applied_topics: [\"tm_test\"],
+.. })"; `e592_a_each_limb_*`, `e592_the_budget_*` (new API, they do not
+compile there); `e592_c_*`, parity, green on `54dbb16` and after: a clean
+false, a missing source and the value rule in the same words); the worker's
+`--lib e592` (`beef_door_replay::e592`: `e592_b` the witness through the
+consumer's own path, `plan_replay` by key, `check_replay_blob`,
+`replay_submit_mode`, a REAL engine over `MemoryStorage` (a dev-dependency
+feature), `is_durable`, `landed_ack`: acked as applied, its object deleted,
+no dead letter; `e592_d` the wiring of every door's count). The route itself
+(an ungated `historical-tx` of the witness answering as before and bumping
+the counter) is the route tier's, not run in the lane. Amended:
+`script_verification`'s `door_over_budget_*` (renamed `..._and_the_submit_goes_on`:
+the submit admits it as could-not-run, `OverWork`) and
+`large_spend_verification_cost` (the submit's walk is past the work limb).
 
 ## The script door reads the stream (D8, bsv-low #585 door 1; the doors lens fold of 2026-10-09)
 
@@ -632,7 +717,7 @@ budget its UTXO fails; with none the peer's whole cursor stays for the tick).
 Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
 gasp_topic_manager i551` (and `fold_medium`).
 
-The anchor verify runs peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557).
+The anchor verify ran peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557); since #592 it walks under the engine's `DoorBudget` and a breach goes on to the replay (above, "The submit's walk takes the door's two limbs").
 
 ## A faulted submit leaves one head (bsv-low #559, lens fold and three delta folds of 2026-10-07)
 

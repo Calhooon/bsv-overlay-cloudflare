@@ -118,7 +118,7 @@ pub async fn note_engine_walk(
 ) {
     if let Some(stop) = &report.walk_could_not_run {
         worker::console_log!(
-            "{door}: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}) — not a refusal, admitted as historical-tx-no-spv, the network judges",
+            "{door}: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): not a refusal, admitted as historical-tx-no-spv, the network judges",
             stop.subject_txid,
             stop.limb.as_str(),
             stop.at_txid,

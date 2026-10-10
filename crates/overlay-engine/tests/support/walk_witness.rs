@@ -80,4 +80,3 @@ pub fn on_a_proven_source(lock: &[u8], unlock: &[u8]) -> (Vec<u8>, String) {
     let subject_txid = display(&sha256d(&subject));
     (beef_v1(&[funding, subject]), subject_txid)
 }
-

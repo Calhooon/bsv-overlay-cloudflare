@@ -603,7 +603,9 @@ impl DoorBudget {
     /// copy of up to as much) and the EF batch (the route's 2 MB bound, twice
     /// while it is serialized): 24 MB, which leaves 56 MB for the module, the
     /// runtime, the allocator's fragmentation and what a native estimate does
-    /// not see of wasm32. The limb bounds the DOOR alone: the route's own
+    /// not see of wasm32. The limb bounds the walk (the door's, and since
+    /// bsv-low #592 the submit's own and the GASP anchor's under
+    /// [`Engine::set_walk_budget`]) and nothing else: the route's own
     /// hydrated parses before it are bounded by the isolate only (the land
     /// lens E585-LAND-M1: 1.43 GB natively for a 9.9 MB body of 900,000
     /// minimal transactions, before the route's 429). What
