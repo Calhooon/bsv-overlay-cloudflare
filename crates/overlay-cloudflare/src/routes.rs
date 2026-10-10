@@ -1324,7 +1324,11 @@ async fn submit_parts(
                 (dual_on, dual_legs.is_empty(), env.d1("OVERLAY_DB"))
             {
                 let dual_key = taal_api_key.clone();
-                let dual_host = env.var("CORROBORATOR_URL").ok().map(|v| v.to_string()).filter(|u| !u.trim().is_empty());
+                let dual_host = env
+                    .var("CORROBORATOR_URL")
+                    .ok()
+                    .map(|v| v.to_string())
+                    .filter(|u| !u.trim().is_empty());
                 let dual_txid = subject_txid.clone();
                 let dual_env = env.clone();
                 ctx.wait_until(async move {

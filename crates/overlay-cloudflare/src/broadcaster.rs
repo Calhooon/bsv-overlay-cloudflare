@@ -895,7 +895,9 @@ where
     // verdicts discarded (they only prime). Ancestry order is preserved; the
     // subject is skipped here and decided last. NL-6d: one leg at a time from
     // the cursor, at most the window's budget of them.
-    let end = from.saturating_add(window.budget.max(1)).min(ancestors.len());
+    let end = from
+        .saturating_add(window.budget.max(1))
+        .min(ancestors.len());
     for ef in &ancestors[from..end] {
         let _ = submit_one(hex::encode(&ef.ef)).await;
     }
@@ -3327,7 +3329,11 @@ mod tests {
     // semantics are proven natively.
 
     /// NL-6d: the walk with a window that covers every ancestor, answered as the corroboration's verdict.
-    async fn whole_batch<F, Fut>(efs: &[EfTx], subject: &str, submit_one: F) -> Result<ArcOutcome, String>
+    async fn whole_batch<F, Fut>(
+        efs: &[EfTx],
+        subject: &str,
+        submit_one: F,
+    ) -> Result<ArcOutcome, String>
     where
         F: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = Result<ArcOutcome, String>>,
@@ -3662,7 +3668,10 @@ mod tests {
             let all = primed.borrow().len() == ancestors;
             async move {
                 if is_subject && !all {
-                    corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_IN_ORPHAN_MEMPOOL"}"#)
+                    corroborator_verdict(
+                        200,
+                        r#"{"txid":"subject","txStatus":"SEEN_IN_ORPHAN_MEMPOOL"}"#,
+                    )
                 } else {
                     corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#)
                 }
@@ -3680,8 +3689,15 @@ mod tests {
         assert_eq!(efs.len(), 33);
         let primed = std::cell::RefCell::new(std::collections::HashMap::new());
         let (walk, posts) = walk_once(&efs, &subject, LegWindow::in_request(), &primed).await;
-        assert_eq!(walk, LegWalk::Decided(Ok(ArcOutcome::Accepted("subject".into()))));
-        assert_eq!(posts, 1 + 32 + 1, "the subject first, each ancestor once, the subject last");
+        assert_eq!(
+            walk,
+            LegWalk::Decided(Ok(ArcOutcome::Accepted("subject".into())))
+        );
+        assert_eq!(
+            posts,
+            1 + 32 + 1,
+            "the subject first, each ancestor once, the subject last"
+        );
         assert!(primed.borrow().values().all(|n| *n == 1));
     }
 
@@ -3695,7 +3711,12 @@ mod tests {
         let (efs, subject) = chain_batch(999);
         let primed = std::cell::RefCell::new(std::collections::HashMap::new());
         let (walk, _) = walk_once(&efs, &subject, LegWindow::in_request(), &primed).await;
-        assert_eq!(walk, LegWalk::Paused { reached: IN_REQUEST_CORROBORATION_LEGS });
+        assert_eq!(
+            walk,
+            LegWalk::Paused {
+                reached: IN_REQUEST_CORROBORATION_LEGS
+            }
+        );
         let mut cursor = IN_REQUEST_CORROBORATION_LEGS;
         let mut runs = 0;
         let verdict = loop {
@@ -3707,14 +3728,21 @@ mod tests {
             };
             match walk_once(&efs, &subject, window, &primed).await.0 {
                 LegWalk::Paused { reached } => {
-                    assert_eq!(reached, cursor + RUN_CORROBORATION_LEGS, "a run reads its whole window");
+                    assert_eq!(
+                        reached,
+                        cursor + RUN_CORROBORATION_LEGS,
+                        "a run reads its whole window"
+                    );
                     cursor = reached;
                 }
                 LegWalk::Decided(v) => break v,
             }
         };
         assert_eq!(verdict, Ok(ArcOutcome::Accepted("subject".into())));
-        assert_eq!(runs, (999 - IN_REQUEST_CORROBORATION_LEGS).div_ceil(RUN_CORROBORATION_LEGS));
+        assert_eq!(
+            runs,
+            (999 - IN_REQUEST_CORROBORATION_LEGS).div_ceil(RUN_CORROBORATION_LEGS)
+        );
         let primed = primed.borrow();
         assert_eq!(primed.len(), 999, "every ancestor read");
         assert!(primed.values().all(|n| *n == 1), "no ancestor read twice");
@@ -3727,21 +3755,35 @@ mod tests {
         let (efs, subject) = chain_batch(10);
         let subject_hex = hex::encode([0xffu8, 0xff, 0xff]);
         let order = std::cell::RefCell::new(Vec::<String>::new());
-        let walk = corroborate_batch_with(&efs, &subject, LegWindow { from: 4, budget: 3 }, |tx_hex| {
-            order.borrow_mut().push(tx_hex);
-            async { corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#) }
-        })
-        .await;
+        let walk =
+            corroborate_batch_with(&efs, &subject, LegWindow { from: 4, budget: 3 }, |tx_hex| {
+                order.borrow_mut().push(tx_hex);
+                async {
+                    corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#)
+                }
+            })
+            .await;
         assert_eq!(walk, LegWalk::Paused { reached: 7 });
         let order = order.borrow();
-        assert_eq!(*order, (4..7).map(|i| hex::encode(&efs[i].ef)).collect::<Vec<_>>());
+        assert_eq!(
+            *order,
+            (4..7).map(|i| hex::encode(&efs[i].ef)).collect::<Vec<_>>()
+        );
         assert!(!order.contains(&subject_hex));
         // a zero budget still reads a leg, so a run always advances its cursor
-        let walk = corroborate_batch_with(&efs, &subject, LegWindow { from: 9, budget: 0 }, |_tx_hex| async {
-            corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#)
-        })
+        let walk = corroborate_batch_with(
+            &efs,
+            &subject,
+            LegWindow { from: 9, budget: 0 },
+            |_tx_hex| async {
+                corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#)
+            },
+        )
         .await;
-        assert_eq!(walk, LegWalk::Decided(Ok(ArcOutcome::Accepted("subject".into()))));
+        assert_eq!(
+            walk,
+            LegWalk::Decided(Ok(ArcOutcome::Accepted("subject".into())))
+        );
     }
 
     #[test]
