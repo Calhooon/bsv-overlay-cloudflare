@@ -70,6 +70,14 @@
 //! deletes an unreadable object by hand (`wrangler r2 object delete`) if it is the door's. Limit, stated: a page
 //! of [`SWEEP_MAX_OBJECTS`] entries NONE of whose keys read leaves the cursor where it was (no key to pass), so
 //! that round stalls there, counted on every pass.
+//!
+//! ## The deferred EF jobs' objects (N5, LOW's E585 land2 lens)
+//!
+//! The NL-6c deferral puts a job's bytes under [`EF_SWEEP_PREFIX`] (`ef_deferred::R2_PREFIX`), a prefix the pass
+//! above never lists. Their own pass ([`ef_sweep_pass`], on the same tick, under the same [`SWEEP_BUDGET_MS`]) lists
+//! that prefix [`SWEEP_MAX_OBJECTS`] at a time from its own key at rest (`ef_deferred_sweep`, the same one-row
+//! shape) and counts the objects and bytes as the pass above counts `atRest`; `/health/invariants.queue.r2.
+//! efDeferred` serves that count, never a listing at the health call.
 
 use crate::d1::Query;
 use serde::Deserialize;
@@ -114,6 +122,15 @@ pub const SWEEP_STATE_SAVE_SQL: &str = "INSERT INTO beef_blob_sweep (id, start_a
 /// only by a pass that listed an object past the window.
 pub const NAMED_KEYS_SQL: &str =
     "SELECT r2_key FROM mutation_dead_letters WHERE r2_key IS NOT NULL";
+
+/// N5: the deferred EF jobs' objects, listed and counted by their own pass ([`ef_sweep_pass`]).
+pub const EF_SWEEP_PREFIX: &str = crate::ef_deferred::R2_PREFIX;
+/// N5: that pass's state at rest, the same one-row shape as `beef_blob_sweep`. Transient.
+pub const EF_SWEEP_STATE_CREATE: &str = "CREATE TABLE IF NOT EXISTS ef_deferred_sweep (id INTEGER PRIMARY KEY CHECK (id = 1), start_after TEXT NOT NULL DEFAULT '', round_objects INTEGER NOT NULL DEFAULT 0, round_bytes INTEGER NOT NULL DEFAULT 0, round_started_at INTEGER, full_objects INTEGER, full_bytes INTEGER, full_at INTEGER, last_pass_at INTEGER, last_listed INTEGER NOT NULL DEFAULT 0, last_swept INTEGER NOT NULL DEFAULT 0, last_unreadable INTEGER NOT NULL DEFAULT 0, last_unreadable_key TEXT)";
+pub const EF_SWEEP_STATE_SQL: &str = "SELECT start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at, last_pass_at, last_listed, last_swept, last_unreadable, last_unreadable_key FROM ef_deferred_sweep WHERE id = 1";
+/// Binds as [`SWEEP_STATE_SAVE_SQL`].
+pub const EF_SWEEP_STATE_SAVE_SQL: &str = "INSERT INTO ef_deferred_sweep (id, start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at, last_pass_at, last_listed, last_swept, last_unreadable, last_unreadable_key) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+     ON CONFLICT(id) DO UPDATE SET start_after = excluded.start_after, round_objects = excluded.round_objects, round_bytes = excluded.round_bytes, round_started_at = excluded.round_started_at, full_objects = excluded.full_objects, full_bytes = excluded.full_bytes, full_at = excluded.full_at, last_pass_at = excluded.last_pass_at, last_listed = excluded.last_listed, last_swept = excluded.last_swept, last_unreadable = excluded.last_unreadable, last_unreadable_key = excluded.last_unreadable_key";
 
 /// One listed object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,8 +377,14 @@ impl From<StateRow> for SweepState {
 /// The save of the state at rest ([`SWEEP_STATE_SAVE_SQL`]).
 #[must_use]
 pub fn save_query(s: &SweepState) -> Query {
+    save_query_to(SWEEP_STATE_SAVE_SQL, s)
+}
+
+/// The save of a state at rest by `sql` ([`SWEEP_STATE_SAVE_SQL`] or [`EF_SWEEP_STATE_SAVE_SQL`]: the same binds).
+#[must_use]
+pub fn save_query_to(sql: &str, s: &SweepState) -> Query {
     let opt = |v: Option<i64>| v.map_or(crate::d1::QVal::Null, crate::d1::QVal::Int);
-    Query::new(SWEEP_STATE_SAVE_SQL)
+    Query::new(sql)
         .bind(s.start_after.as_str())
         .bind(s.round_objects)
         .bind(s.round_bytes)
@@ -381,7 +404,11 @@ pub fn save_query(s: &SweepState) -> Query {
 }
 
 async fn read_state(db: &D1Database) -> Result<SweepState, String> {
-    Ok(Query::new(SWEEP_STATE_SQL)
+    read_state_from(db, SWEEP_STATE_SQL).await
+}
+
+async fn read_state_from(db: &D1Database, sql: &str) -> Result<SweepState, String> {
+    Ok(Query::new(sql)
         .fetch_optional::<StateRow>(db)
         .await?
         .map(SweepState::from)
@@ -458,13 +485,22 @@ async fn list_page(
     bucket: &worker::Bucket,
     start_after: &str,
 ) -> Result<(Vec<Entry>, bool), String> {
+    list_page_under(bucket, SWEEP_PREFIX, start_after).await
+}
+
+/// [`list_page`] under `prefix` (N5: [`EF_SWEEP_PREFIX`] for the deferred EF jobs' pass).
+async fn list_page_under(
+    bucket: &worker::Bucket,
+    prefix: &str,
+    start_after: &str,
+) -> Result<(Vec<Entry>, bool), String> {
     let set = |o: &js_sys::Object, k: &str, v: &JsValue| {
         js_sys::Reflect::set(o, &JsValue::from_str(k), v)
             .map(|_| ())
             .map_err(|e| worker::Error::from(e).to_string())
     };
     let opts = js_sys::Object::new();
-    set(&opts, "prefix", &JsValue::from_str(SWEEP_PREFIX))?;
+    set(&opts, "prefix", &JsValue::from_str(prefix))?;
     set(&opts, "limit", &JsValue::from(SWEEP_MAX_OBJECTS))?;
     let include = js_sys::Array::new();
     include.push(&JsValue::from_str("customMetadata"));
@@ -879,11 +915,137 @@ pub async fn internal_sweep(
     Ok(worker::Response::from_json(&pass_json(&out))?.with_status(status))
 }
 
+/// N5: what one pass over the deferred EF jobs' objects needs of the platform: the bucket under
+/// [`EF_SWEEP_PREFIX`], its state at rest, the clock and the log. The worker's is [`WorkerEfSweep`]; a native test
+/// gives its own.
+pub(crate) trait EfSweepPort {
+    async fn read_state(&self) -> Result<SweepState, String>;
+    async fn list_page(&self, start_after: &str) -> Result<(Vec<Entry>, bool), String>;
+    async fn save(&self, next: &SweepState) -> Result<(), String>;
+    fn now_ms(&self) -> i64;
+    fn log(&self, line: &str);
+}
+
+/// The worker's [`EfSweepPort`]: `BEEF_BLOBS` under [`EF_SWEEP_PREFIX`] and `OVERLAY_DB`.
+pub(crate) struct WorkerEfSweep<'a> {
+    pub bucket: &'a worker::Bucket,
+    pub db: &'a D1Database,
+}
+
+impl EfSweepPort for WorkerEfSweep<'_> {
+    async fn read_state(&self) -> Result<SweepState, String> {
+        read_state_from(self.db, EF_SWEEP_STATE_SQL).await
+    }
+
+    async fn list_page(&self, start_after: &str) -> Result<(Vec<Entry>, bool), String> {
+        list_page_under(self.bucket, EF_SWEEP_PREFIX, start_after).await
+    }
+
+    async fn save(&self, next: &SweepState) -> Result<(), String> {
+        save_query_to(EF_SWEEP_STATE_SAVE_SQL, next)
+            .execute(self.db)
+            .await
+    }
+
+    fn now_ms(&self) -> i64 {
+        worker::Date::now().as_millis() as i64
+    }
+
+    fn log(&self, line: &str) {
+        worker::console_log!("{line}");
+    }
+}
+
+/// N5: ONE PASS over the deferred EF jobs' objects: the page after the key at rest, counted into the round (the
+/// objects and bytes at rest, as [`next_state`] counts the door's), the state saved. Fail-closed as
+/// [`sweep_pass`]: a state read or a listing that faults moves no cursor.
+pub(crate) async fn ef_sweep_pass<P: EfSweepPort>(p: &P) -> PassOutcome {
+    let state = match p.read_state().await {
+        Ok(s) => s,
+        Err(e) => {
+            p.log(&format!(
+                "[ef-deferred] the pass's state could not be read ({e}); nothing listed"
+            ));
+            return PassOutcome::stopped(format!("the state did not read: {e}"), None);
+        }
+    };
+    let before = Some(state.start_after.clone());
+    let (entries, truncated) = match p.list_page(&state.start_after).await {
+        Ok(page) => page,
+        Err(e) => {
+            p.log(&format!(
+                "[ef-deferred] the pass's listing faulted ({e}); nothing counted"
+            ));
+            return PassOutcome::stopped(format!("the listing faulted: {e}"), before);
+        }
+    };
+    let listed = entries.len() as u64;
+    let page = split_page(entries);
+    let now = p.now_ms();
+    let plan = PassPlan {
+        handled: page.listed.len(),
+        orphans: Vec::new(),
+    };
+    let swept: HashSet<String> = HashSet::new();
+    let next = after_pass(&state, &page, &plan, &swept, truncated, now);
+    let saved = match p.save(&next).await {
+        Ok(()) => true,
+        Err(e) => {
+            p.log(&format!("[ef-deferred] the pass's state could not be saved ({e}); the next pass lists this page again"));
+            false
+        }
+    };
+    PassOutcome {
+        stopped: None,
+        listed,
+        handled: plan.handled as u64,
+        unreadable: next.last_unreadable,
+        unreadable_key: next.last_unreadable_key.clone(),
+        cursor_before: before,
+        cursor_after: saved.then(|| next.start_after.clone()),
+        last_pass_at: saved.then_some(now),
+        round_complete: saved && next.full_at == Some(now),
+        ..PassOutcome::default()
+    }
+}
+
+/// N5: the scheduled tick's pass over the deferred EF jobs' objects, under its [`SWEEP_BUDGET_MS`] race, and one
+/// log line. No binding: nothing is listed (the jobs rest in D1).
+pub async fn run_ef_deferred_pass(env: &Env, db: &D1Database) -> PassOutcome {
+    let out = match env.bucket(crate::queue::BEEF_BLOBS_BINDING) {
+        Ok(bucket) => overlay_engine::gasp::race_or_deadline(
+            ef_sweep_pass(&WorkerEfSweep {
+                bucket: &bucket,
+                db,
+            }),
+            crate::broadcaster::sleep_ms(SWEEP_BUDGET_MS),
+        )
+        .await
+        .unwrap_or_else(|| {
+            PassOutcome::stopped(
+                format!("the pass EXCEEDED its {SWEEP_BUDGET_MS} ms budget"),
+                None,
+            )
+        }),
+        Err(_) => PassOutcome::stopped(
+            format!("no {} binding", crate::queue::BEEF_BLOBS_BINDING),
+            None,
+        ),
+    };
+    worker::console_log!("[ef-deferred] sweep pass (tick): {}", pass_json(&out));
+    out
+}
+
 /// PURE: `/health/invariants.queue`: the R2 objects at rest as the sweep's listing counted them. `atRest` is the
 /// last COMPLETE round over the bucket (`null` before the first), `round` the one in progress; `state` `None` is
-/// an unreadable table (`readable: false`), distinct from a sweep that never ran (`lastPassAt: null`).
+/// an unreadable table (`readable: false`), distinct from a sweep that never ran (`lastPassAt: null`). N5: `ef` is the
+/// deferred EF jobs' pass's state, rendered beside as `efDeferred` (its own `atRest` and `round`, the same shapes).
 #[must_use]
-pub fn queue_json(state: Option<&SweepState>, bound: bool) -> serde_json::Value {
+pub fn queue_json(
+    state: Option<&SweepState>,
+    ef: Option<&SweepState>,
+    bound: bool,
+) -> serde_json::Value {
     let sweep = serde_json::json!({
         "windowSecs": ORPHAN_WINDOW_S,
         "maxObjectsPerPass": SWEEP_MAX_OBJECTS,
@@ -907,14 +1069,29 @@ pub fn queue_json(state: Option<&SweepState>, bound: bool) -> serde_json::Value 
             "startedAt": s.round_started_at, "startAfter": s.start_after,
         })),
         "sweep": sweep,
+        "efDeferred": {
+            "prefix": EF_SWEEP_PREFIX,
+            "readable": ef.is_some(),
+            "atRest": ef.and_then(|s| Some(serde_json::json!({
+                "objects": s.full_objects?, "bytes": s.full_bytes?, "at": s.full_at,
+            }))),
+            "round": ef.map(|s| serde_json::json!({
+                "objects": s.round_objects, "bytes": s.round_bytes,
+                "startedAt": s.round_started_at, "startAfter": s.start_after,
+            })),
+            "lastPassAt": ef.and_then(|s| s.last_pass_at),
+            "lastSwept": ef.map(|s| s.last_swept),
+        },
     }})
 }
 
-/// `/health/invariants.queue` (one D1 read).
+/// `/health/invariants.queue` (two D1 reads: the door's pass's state and the deferred EF jobs' pass's, N5).
 pub async fn health_json(db: &D1Database, env: &Env) -> serde_json::Value {
     let state = read_state(db).await.ok();
+    let ef = read_state_from(db, EF_SWEEP_STATE_SQL).await.ok();
     queue_json(
         state.as_ref(),
+        ef.as_ref(),
         env.bucket(crate::queue::BEEF_BLOBS_BINDING).is_ok(),
     )
 }
@@ -1389,15 +1566,15 @@ mod tests {
             "the last complete count stands meanwhile"
         );
         // the health block
-        let j = queue_json(Some(&state(&conn)), true);
+        let j = queue_json(Some(&state(&conn)), None, true);
         assert_eq!(j["r2"]["atRest"]["objects"], 320);
         assert_eq!(j["r2"]["round"]["objects"], 200);
         assert_eq!(j["r2"]["sweep"]["windowSecs"], ORPHAN_WINDOW_S);
         assert_eq!(j["r2"]["sweep"]["maxObjectsPerPass"], 200);
         assert_eq!(j["r2"]["sweep"]["maxDeletesPerPass"], 50);
-        let never = queue_json(Some(&SweepState::default()), true);
+        let never = queue_json(Some(&SweepState::default()), None, true);
         assert!(never["r2"]["atRest"].is_null() && never["r2"]["sweep"]["lastPassAt"].is_null());
-        assert_eq!(queue_json(None, false)["r2"]["readable"], false);
+        assert_eq!(queue_json(None, None, false)["r2"]["readable"], false);
     }
 
     /// The fold: the window is what no queue message can outlive, and the wiring. Two retentions (the main queue,
@@ -1493,7 +1670,8 @@ mod tests {
         let page = squash(
             &me[me.find("async fn list_page(").unwrap()..me.find("async fn head_of(").unwrap()],
         );
-        assert!(page.contains("set(&opts,\"prefix\",&JsValue::from_str(SWEEP_PREFIX))?;"));
+        assert!(page.contains("list_page_under(bucket,SWEEP_PREFIX,start_after).await"));
+        assert!(page.contains("set(&opts,\"prefix\",&JsValue::from_str(prefix))?;"));
         assert!(page.contains("set(&opts,\"limit\",&JsValue::from(SWEEP_MAX_OBJECTS))?;"));
         assert!(page.contains("set(&opts,\"startAfter\",&JsValue::from_str(start_after))?;"));
         assert!(f.contains("ifany_past_window(listed,now,ORPHAN_WINDOW_S)"));
@@ -1813,7 +1991,7 @@ mod tests {
         );
         assert_eq!(stopped["lastPassAt"], serde_json::Value::Null);
         assert_eq!(
-            queue_json(None, true)["r2"]["sweep"]["lever"],
+            queue_json(None, None, true)["r2"]["sweep"]["lever"],
             "POST /internal/beef-blob-sweep"
         );
     }
@@ -1881,7 +2059,7 @@ mod tests {
             bucket.objects.contains_key(&k(1)) && bucket.objects.contains_key(&k(3)),
             "never swept"
         );
-        let h = queue_json(Some(&st), true);
+        let h = queue_json(Some(&st), None, true);
         assert_eq!(h["r2"]["sweep"]["lastUnreadable"], 2);
         assert_eq!(h["r2"]["sweep"]["lastUnreadableKey"], k(1));
         // the next round meets it again, counted again
@@ -2035,5 +2213,162 @@ mod tests {
             .starts_with("the dead letters' keys did not read"));
         assert_eq!((out.swept, m.counter(SWEPT)), (0, 0));
         assert_eq!(m.bucket.borrow().objects.len(), 4);
+    }
+
+    /// N5 (LOW's E585 land2 lens): the deferred EF jobs' objects (`ef-deferred/`) are on the health figure beside
+    /// the door's `atRest`, from their own pass's count at rest, never from a listing at the health call. RED on
+    /// `54dbb16`: `efDeferred` is absent (null).
+    #[test]
+    fn n5_the_ef_deferred_objects_are_rendered_beside_at_rest() {
+        let door = SweepState {
+            full_objects: Some(320),
+            full_bytes: Some(9_000),
+            full_at: Some(5),
+            ..SweepState::default()
+        };
+        let ef = SweepState {
+            full_objects: Some(3),
+            full_bytes: Some(3_000_123),
+            full_at: Some(7),
+            round_objects: 1,
+            round_bytes: 1_000_000,
+            round_started_at: Some(8),
+            start_after: "ef-deferred/aa".into(),
+            last_pass_at: Some(8),
+            ..SweepState::default()
+        };
+        let j = queue_json(Some(&door), Some(&ef), true);
+        assert_eq!(
+            j["r2"]["atRest"]["objects"], 320,
+            "the door's figure is unchanged"
+        );
+        let e = &j["r2"]["efDeferred"];
+        assert_eq!(e["prefix"], "ef-deferred/");
+        assert_eq!(e["readable"], true);
+        assert_eq!(e["atRest"]["objects"], 3);
+        assert_eq!(e["atRest"]["bytes"], 3_000_123);
+        assert_eq!(e["atRest"]["at"], 7);
+        assert_eq!(e["round"]["objects"], 1);
+        assert_eq!(e["round"]["bytes"], 1_000_000);
+        assert_eq!(e["round"]["startAfter"], "ef-deferred/aa");
+        assert_eq!(e["lastPassAt"], 8);
+        // before the first complete round: no figure, a round; an unreadable table: readable false
+        let first = queue_json(Some(&door), Some(&SweepState::default()), true);
+        assert!(first["r2"]["efDeferred"]["atRest"].is_null());
+        assert_eq!(first["r2"]["efDeferred"]["round"]["objects"], 0);
+        let unread = queue_json(Some(&door), None, true);
+        assert_eq!(unread["r2"]["efDeferred"]["readable"], false);
+        assert!(unread["r2"]["efDeferred"]["atRest"].is_null());
+        // the health call reads the state at rest, never lists
+        let me = include_str!("beef_blob_sweep.rs");
+        let me = &me[..me.find("#[cfg(test)]").unwrap()];
+        let h = item(me, "pub async fn health_json(");
+        assert!(h.contains("read_state_from(db,EF_SWEEP_STATE_SQL).await.ok()"));
+        assert!(
+            !h.contains("list_page"),
+            "never a listing at the health call"
+        );
+    }
+
+    /// The test's [`EfSweepPort`]: objects under `ef-deferred/` (key -> (bytes, uploaded ms)), the SHIPPED state
+    /// statements under real SQLite.
+    struct EfModel<'a> {
+        conn: &'a rusqlite::Connection,
+        objects: RefCell<BTreeMap<String, (u64, i64)>>,
+        now: i64,
+    }
+
+    impl EfSweepPort for EfModel<'_> {
+        async fn read_state(&self) -> Result<SweepState, String> {
+            Ok(ef_state(self.conn))
+        }
+        async fn list_page(&self, start_after: &str) -> Result<(Vec<Entry>, bool), String> {
+            let objects = self.objects.borrow();
+            let mut it = objects
+                .iter()
+                .filter(|(k, _)| k.starts_with(EF_SWEEP_PREFIX) && k.as_str() > start_after);
+            let page = it
+                .by_ref()
+                .take(SWEEP_MAX_OBJECTS as usize)
+                .map(|(k, (b, u))| {
+                    Entry::Object(Listed {
+                        key: k.clone(),
+                        bytes: *b,
+                        uploaded_ms: *u,
+                        touched_ms: Some(*u),
+                    })
+                })
+                .collect();
+            Ok((page, it.next().is_some()))
+        }
+        async fn save(&self, next: &SweepState) -> Result<(), String> {
+            exec(self.conn, &save_query_to(EF_SWEEP_STATE_SAVE_SQL, next));
+            Ok(())
+        }
+        fn now_ms(&self) -> i64 {
+            self.now
+        }
+        fn log(&self, _line: &str) {}
+    }
+
+    fn ef_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute(EF_SWEEP_STATE_CREATE, []).unwrap();
+        conn
+    }
+
+    fn ef_state(conn: &rusqlite::Connection) -> SweepState {
+        let n = |v: Option<i64>| v.map(|v| v as u64);
+        conn.query_row(EF_SWEEP_STATE_SQL, [], |r| {
+            Ok(SweepState {
+                start_after: r.get(0)?,
+                round_objects: r.get::<_, i64>(1)? as u64,
+                round_bytes: r.get::<_, i64>(2)? as u64,
+                round_started_at: r.get(3)?,
+                full_objects: n(r.get(4)?),
+                full_bytes: n(r.get(5)?),
+                full_at: r.get(6)?,
+                last_pass_at: r.get(7)?,
+                last_listed: r.get::<_, i64>(8)? as u64,
+                last_swept: r.get::<_, i64>(9)? as u64,
+                last_unreadable: r.get::<_, i64>(10)? as u64,
+                last_unreadable_key: r.get(11)?,
+            })
+        })
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(SweepState::default()),
+            e => Err(e),
+        })
+        .unwrap()
+    }
+
+    /// N5: the pass over `ef-deferred/` counts its objects and bytes into the round and, at the round's end, the
+    /// figure at rest, 200 a pass from the key at rest; the door's `mutations/` objects are not its.
+    #[test]
+    fn n5_the_ef_deferred_pass_counts_its_prefix_across_pages() {
+        let conn = ef_db();
+        let mut objects = BTreeMap::new();
+        for i in 0..250u64 {
+            objects.insert(format!("ef-deferred/{i:064x}"), (1_000 + i, 1));
+        }
+        objects.insert("mutations/x".to_string(), (9_999_999, 1));
+        let m = EfModel {
+            conn: &conn,
+            objects: RefCell::new(objects),
+            now: 100,
+        };
+        let first = block_on(ef_sweep_pass(&m));
+        assert_eq!((first.listed, first.round_complete), (200, false));
+        let st = ef_state(&conn);
+        assert_eq!(st.round_objects, 200);
+        assert_eq!(st.full_objects, None);
+        let second = block_on(ef_sweep_pass(&m));
+        assert_eq!((second.listed, second.round_complete), (50, true));
+        let st = ef_state(&conn);
+        let bytes: u64 = (0..250u64).map(|i| 1_000 + i).sum();
+        assert_eq!((st.full_objects, st.full_bytes), (Some(250), Some(bytes)));
+        assert_eq!(st.start_after, "", "the next round starts at the first key");
+        let j = queue_json(None, Some(&st), true);
+        assert_eq!(j["r2"]["efDeferred"]["atRest"]["objects"], 250);
     }
 }

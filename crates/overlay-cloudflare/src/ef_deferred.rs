@@ -113,7 +113,8 @@ pub const POLL_PREFIX: &str = "/submit-deferred/";
 
 /// The R2 binding bsv-low #585 door 3 adds (`BEEF_BLOBS`); the deferred
 /// bytes live under their own prefix, which that door's orphan sweep does not
-/// list.
+/// list: their own pass does (`beef_blob_sweep::ef_sweep_pass`, N5), counting
+/// them for `/health/invariants.queue.r2.efDeferred`.
 pub const BEEF_BLOBS_BINDING: &str = "BEEF_BLOBS";
 pub const R2_PREFIX: &str = "ef-deferred/";
 

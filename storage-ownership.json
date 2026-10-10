@@ -872,6 +872,17 @@
    "why": "the cron's sweep (and the operator's lever POST /internal/beef-blob-sweep, the same pass) lists BEEF_BLOBS 200 objects a pass and resumes from the key at rest; a lost row restarts the round at the first key and loses only the served count until a round completes; transient"
   },
   {
+   "name": "ef_deferred_sweep",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the one-row state of the pass over the deferred EF jobs' R2 objects (ef-deferred/, N5 of LOW's E585 land2 lens): the last key a pass handled, the objects and bytes counted by the round in progress, the last complete round's count, the last pass",
+   "why": "the cron's pass lists BEEF_BLOBS under ef-deferred/ 200 objects a pass and resumes from the key at rest, so /health/invariants.queue.r2.efDeferred serves a count never listed at the health call; a lost row restarts the round at the first key and loses only the served count until a round completes; transient"
+  },
+  {
    "name": "ops_counters",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
