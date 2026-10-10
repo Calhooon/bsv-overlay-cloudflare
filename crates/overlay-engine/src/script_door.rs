@@ -554,6 +554,16 @@ pub(crate) fn walk_trusting(
             Some(wire)
         })
         .collect();
+    // THE STATIC PRE-PASS (the E592 delta lens, D1-L1): before any charge,
+    // every unlocking script of every transaction this walk can reach is read
+    // for push-only. The per-input check below made "a static refusal is a
+    // refusal, never a breach" true per input only: a non-push unlocking
+    // script on input 1 (or on an ancestor) was never read when input 0's
+    // lock breached the census first, and the answer was "the walk could not
+    // run". Now the interpreter's refusal is answered whatever a lock costs.
+    if let Some(refused) = first_not_push_only(beef_bytes, &index, subject, &seen) {
+        return Err(refused);
+    }
     let mut queue: Vec<Hash32> = vec![subject];
     while let Some(wire_txid) = queue.pop() {
         if !seen.insert(wire_txid) {
@@ -636,7 +646,8 @@ pub(crate) fn walk_trusting(
             }
             let unlocking_bytes = &raw[input.script.clone()];
             // A STATIC refusal is the interpreter's own, before any charge
-            // (the E592 lens fold, H1): an unlocking script that is not
+            // (the E592 lens fold, H1; the pre-pass above already read every
+            // reachable one, so this is the belt): an unlocking script that is not
             // push-only is refused by bsv-rs's `Spend::validate` before it
             // runs a byte, at every transaction version (its
             // `REQUIRE_PUSH_ONLY_UNLOCKING`, the reference's rule), in these
@@ -817,6 +828,54 @@ pub(crate) fn walk_trusting(
         }
     }
     Ok(stats)
+}
+
+/// The first unlocking script that is not push-only among the transactions
+/// a walk from `subject` can reach, in the walk's own order (the subject's
+/// inputs first to last, then its unproven sources depth first, the last
+/// input's first), as the interpreter's refusal. O(script bytes): no charge,
+/// no parse of a script, one layout of a transaction at a time. A proven
+/// transaction is not descended (the walk trusts it), nor one in `trusted`;
+/// a transaction the BEEF lacks or that does not lay out ends that branch
+/// (the walk answers its own fault there). It reads only the unlocking
+/// scripts, so it can answer a refusal where the walk would have stopped at a
+/// structural fault EARLIER in its order (a source output out of bounds, the
+/// value rule): both are a body the network refuses; the refusal names the
+/// input the interpreter refuses.
+fn first_not_push_only(
+    beef_bytes: &[u8],
+    index: &DoorIndex,
+    subject: Hash32,
+    trusted: &HashSet<Hash32>,
+) -> Option<EngineError> {
+    let mut seen = trusted.clone();
+    let mut queue: Vec<Hash32> = vec![subject];
+    while let Some(wire_txid) = queue.pop() {
+        if !seen.insert(wire_txid) || index.proven.contains(&wire_txid) {
+            continue;
+        }
+        let tx = index.raw(beef_bytes, &wire_txid).and_then(|raw| {
+            let tx = Layout::of(raw)?;
+            Some((raw, tx))
+        });
+        let Some((raw, tx)) = tx else { continue };
+        for (vin, input) in tx.inputs.iter().enumerate() {
+            if !push_only(&raw[input.script.clone()]) {
+                return Some(EngineError::ScriptVerificationFailed {
+                    subject_txid: display_hex(&wire_txid),
+                    input_index: vin as u32,
+                    reason: NOT_PUSH_ONLY.into(),
+                });
+            }
+        }
+        queue.extend(
+            tx.inputs
+                .iter()
+                .map(|input| input.prev)
+                .filter(|prev| index.raw(beef_bytes, prev).is_some()),
+        );
+    }
+    None
 }
 
 #[cfg(test)]

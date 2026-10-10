@@ -1254,7 +1254,15 @@ impl GASPStorage for OverlayGASPStorage<'_> {
     /// record re-asked each pass up to `DEFERRED_GRAPH_MAX_PASSES`), inside
     /// its per-peer budget, and, as it never yields a finalized graph or a
     /// cursor move on that UTXO, D16's yieldless bound quarantines it if it
-    /// serves nothing else. The reference serialises this method behind
+    /// serves nothing else, and ONLY with a per-graph budget
+    /// (`Engine::set_graph_budget`): the yieldless bound exists only there
+    /// (the E592 delta lens, D1-L2). With NO per-graph budget (a library
+    /// consumer that sets none) there is no record and no yieldless count:
+    /// the held UTXO fails on every sync, the sync runs to its end and is a
+    /// success under #302, the cursor stays below that UTXO for good, and
+    /// the graph is fetched and its walk estimated again on every tick;
+    /// nothing is admitted, and the cost is ours, the residual D15 states for
+    /// `AnchorUnavailable`. The reference serialises this method behind
     /// `acquireAnchorValidationSlot` (at most 4 at once); here graphs are
     /// completed one at a time by one sync on one thread, so there is
     /// nothing to serialise.

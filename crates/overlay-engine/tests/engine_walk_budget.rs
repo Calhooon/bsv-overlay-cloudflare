@@ -399,3 +399,127 @@ fn e592_the_budget_is_configured_on_the_engine() {
         }
     });
 }
+
+/// A raw version 2 transaction of `inputs` (source, output index, unlocking
+/// script) and `outputs` (satoshis, locking script).
+fn raw_tx(inputs: &[(&[u8; 32], u32, &[u8])], outputs: &[(u64, &[u8])]) -> Vec<u8> {
+    let mut raw = 2u32.to_le_bytes().to_vec();
+    raw.extend(walk_witness::varint(inputs.len() as u64));
+    for (prev, vout, unlock) in inputs {
+        raw.extend_from_slice(*prev);
+        raw.extend_from_slice(&vout.to_le_bytes());
+        raw.extend(walk_witness::varint(unlock.len() as u64));
+        raw.extend_from_slice(unlock);
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+    }
+    raw.extend(walk_witness::varint(outputs.len() as u64));
+    for (sats, lock) in outputs {
+        raw.extend_from_slice(&sats.to_le_bytes());
+        raw.extend(walk_witness::varint(lock.len() as u64));
+        raw.extend_from_slice(lock);
+    }
+    raw.extend_from_slice(&0u32.to_le_bytes());
+    raw
+}
+
+/// The E592 delta lens's D1-L1: a static refusal is a refusal across the
+/// WHOLE walk, not per input. Input 0 of the subject spends a lock whose
+/// census breaches the work limb (the hash-heavy shape above); input 1 (or
+/// an unproven ancestor's input) carries an unlocking script holding one
+/// non-push opcode. The answer is the interpreter's refusal of that input,
+/// under both policies, never "the walk could not run" and never an
+/// admission: the walk's push-only pre-pass reads every reachable unlocking
+/// script before any charge. The control (input 1 push-only) shows input 0
+/// alone breaches.
+///
+/// RED with the pre-pass made inert (`d899aa1`'s walk): "refused true,
+/// NotNow: Err(WalkCouldNotRun(.. limb: OverWork, what: \"estimated work
+/// 80216680 bytes exceeds the door budget of 67108864 (input 0 of ..)\"".
+#[test]
+fn e592_d1_l1_a_non_push_unlock_anywhere_is_refused_before_a_breach() {
+    one_at_a_time(async {
+        let n = (DoorBudget::DEFAULT.max_work_bytes / DoorBudget::DEFAULT.memory_limit as u64)
+            as usize
+            + 100;
+        let hash_lock = [vec![OP_SHA256; n], vec![OP_DROP, OP_1]].concat();
+        let spendable = [OP_DROP, OP_1];
+        let push = [0x01, 0x42];
+        let not_push = [0x01, 0x42, OP_NOP];
+        let funding = raw_tx(
+            &[(&[0xaa; 32], 0, &[])],
+            &[(1_000, &hash_lock), (1_000, &spendable)],
+        );
+        let funding_id = sha256d(&funding);
+
+        // Input 1 of the subject itself; then the control.
+        for (unlock_1, refused) in [(&not_push[..], true), (&push[..], false)] {
+            let subject = raw_tx(
+                &[(&funding_id, 0, &push), (&funding_id, 1, unlock_1)],
+                &[(1_500, &[OP_1])],
+            );
+            let subject_txid = display(&sha256d(&subject));
+            let body = beef_v1(&[funding.clone(), subject]);
+            for policy in [WalkBreachPolicy::NotNow, WalkBreachPolicy::NetworkAccepted] {
+                let (answer, _) =
+                    submitted_under(&engine(), &body, SubmitMode::HistoricalTx, policy).await;
+                match answer {
+                    Err(EngineError::ScriptVerificationFailed {
+                        subject_txid: at,
+                        input_index,
+                        reason,
+                    }) if refused => {
+                        assert_eq!(at, subject_txid);
+                        assert_eq!(input_index, 1);
+                        assert_eq!(
+                            reason,
+                            "Unlocking scripts can only contain push operations, and no other opcodes."
+                        );
+                    }
+                    Err(EngineError::WalkCouldNotRun(stop))
+                        if !refused && policy == WalkBreachPolicy::NotNow =>
+                    {
+                        assert_eq!(
+                            stop.limb,
+                            WalkLimb::OverWork,
+                            "the control breaches at input 0"
+                        );
+                    }
+                    Ok((_, report)) if !refused => {
+                        assert_eq!(
+                            report.walk_could_not_run.map(|stop| stop.limb),
+                            Some(WalkLimb::OverWork),
+                            "the control goes on under the network's accept"
+                        );
+                    }
+                    other => panic!("refused {refused}, {policy:?}: {other:?}"),
+                }
+            }
+        }
+
+        // An unproven ancestor's input: the subject's input 0 breaches, its
+        // input 1 spends a parent whose own unlocking script is not push-only.
+        let parent = raw_tx(&[(&funding_id, 1, &not_push)], &[(900, &spendable)]);
+        let parent_txid = display(&sha256d(&parent));
+        let subject = raw_tx(
+            &[(&funding_id, 0, &push), (&sha256d(&parent), 0, &push)],
+            &[(1_500, &[OP_1])],
+        );
+        let body = beef_v1(&[funding, parent, subject]);
+        for policy in [WalkBreachPolicy::NotNow, WalkBreachPolicy::NetworkAccepted] {
+            match submitted_under(&engine(), &body, SubmitMode::HistoricalTx, policy)
+                .await
+                .0
+            {
+                Err(EngineError::ScriptVerificationFailed {
+                    subject_txid: at,
+                    input_index,
+                    ..
+                }) => {
+                    assert_eq!(at, parent_txid, "the refused input is the parent's");
+                    assert_eq!(input_index, 0);
+                }
+                other => panic!("the ancestor's refusal, {policy:?}: {other:?}"),
+            }
+        }
+    });
+}
