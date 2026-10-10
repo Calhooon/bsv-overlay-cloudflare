@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased: the workers on bsv-middleware-cloudflare 0.5.0, the bsv-rs 0.3 bridge gone, the Arcade vector at the toolbox 0.7.4's bytes, LOW's N3, N4, N5 and L1 (align-engine-050, 2026-10-10)
+
+The four findings are LOW's, in their own words at `docs/audit/E585-land2-lens-2026-10-10.md`
+(the E585 land2 lens over `54dbb16`).
+
+- **bsv-middleware-cloudflare 0.5.0** (`=0.5.0` in `overlay-cloudflare` and `low-app-layer`, was `=0.4.1`;
+  with `bsv-middleware-core` 0.2.0, both on bsv-rs 0.4). The API moves of its CHANGELOG this workspace meets:
+  `WorkerStorageClient::new` takes bsv-rs 0.4's `ProtoWallet`. The payment verdict's move
+  (`PaymentVerifyError::Unverifiable { reason }`; `BadTransaction`, `MissingOutput`, `BadBeef` gone) touches no
+  call site here; `low-app-layer` compiled unchanged.
+- **The bridge gone.** `bsv-rs-03` (the bsv-rs 0.3.35 dependency that built the one wallet 0.4.1 took) leaves
+  `overlay-cloudflare`; `make_storage_client` hands 0.5.0's `WorkerStorageClient::new` a `ProtoWallet` built from
+  the admin key as held (the workspace bsv-rs 0.4.3): no conversion, no refusal. The workers' lock holds one
+  bsv-rs (`cargo tree -d`: no duplicate `bsv-*` crate in either workspace). New test: the storage client's wallet
+  is the admin key, never the anonymous wallet.
+- **The Arcade status vector** (`crates/overlay-discovery/vectors/arcade_status_verdicts.json`) is
+  bsv-wallet-toolbox-rs 0.7.4's file byte for byte (tag `v0.7.4`, main `623f890`; the same bytes at
+  bsv-wallet-cli main `636c6dd`; sha256 `80d2ac72112d…`, pinned whole by
+  `the_vector_is_the_toolbox_0_7_4_bytes`; the rule is `cmp`). What moved from the engine's copy at `54dbb16`
+  (`7bf85a94cd0b…`): the `toolbox_push` expects of four cases and the `outcomes` block; no `engine_*` field.
+- **N3, the settled-jobs sweep.** `JOB_DELETE_SQL` was unconditional and the sweep released the bytes before the
+  delete: a re-presentation of the same submission landing between the sweep's select and its delete (bytes
+  re-put, row upserted to `queued`) lost both, the job's message found no row and the 202's poll answered 404.
+  Now `DELETE ... WHERE reference = ?1 AND state IN ('done','failed') AND updated_at < ?2 RETURNING at_rest`,
+  the row first, the bytes released only for a row that came back.
+- **N4, the deferred job's ack, as a bound.** The pin's sentence that a deferred EF job's message never rides the
+  platform's retries or the dead letters held only when `run_job` returns. `run_job`'s doc states the bound: a
+  run that kills the isolate never reaches the ack; the platform redelivers (`max_retries` 3, no `retry_delay`); a
+  redelivery inside `JOB_RESUME_AFTER_MS` of the take is acked untaken (the live-run guard), a later one is a
+  `JOB_TAKE` of the five `JOB_ATTEMPTS`; after `max_retries` the message dead-letters as an `unparsed:` fault
+  letter counted against the 2,000, whose re-drive takes the `ef_job` branch again. No code.
+- **N5, the deferred bytes on the health figure.** A pass over `ef-deferred/` on the tick (`ef_sweep_pass`, its
+  own 30 s race, 200 objects a pass from its own key at rest in `ef_deferred_sweep`, migration 189) counts the
+  objects and bytes as the door's pass counts `atRest`; `/health/invariants.queue.r2.efDeferred` renders that
+  count (`atRest`, `round`, `lastPassAt`) beside `atRest`, never from a listing at the health call.
+- **L1 (a), the deferred put's digest.** The R2 put of `ef-deferred/<reference>` hands R2 the sha256 of the
+  stored stream through the put's checksum option, as door 3's put does, and the `touched` stamp: a corrupted
+  upload is refused at the put. (The reference hashes the framed submission, topics included, so it is not the
+  object's digest.)
+- **L1 (b), the rowless bytes.** The pass over `ef-deferred/` deletes an object no `ef_deferred_jobs` row names
+  once it is older than `JOB_KEEP_MS` (seven days) by its age stamp, each read again before its delete, at most
+  50 a pass: bytes whose row was never written, or whose release faulted after N3's delete. Limit, stated: a
+  re-presentation whose put lands between that read and the delete loses its bytes (door 3's window); its run
+  fails and the caller re-presents.
+- **The engine's version** is unchanged.
+
 ## Unreleased: a corroboration of any number of legs is read one leg at a time, never refused for its count (NL-6d, 2026-10-10)
 
 The posture, the charter's (bsv-stack-lean `docs/charters/beef-of-any-size.md`,
