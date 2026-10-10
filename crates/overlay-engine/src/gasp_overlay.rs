@@ -123,6 +123,10 @@ pub struct OverlayGASPStorage<'a> {
     /// [`crate::engine::Engine::set_script_verification`], handed over so the
     /// anchor check obeys the same switch as `Engine::submit`. Default `true`.
     verify_scripts: bool,
+    /// [`crate::engine::Engine::set_walk_budget`], handed over so the anchor
+    /// check's script walk runs under the same two limbs as `Engine::submit`
+    /// (bsv-low #592). Default [`crate::engine::DoorBudget::DEFAULT`].
+    walk_budget: crate::engine::DoorBudget,
     /// The peer this instance syncs from: the key of its deferred graphs
     /// (bsv-low #555, [`Self::with_peer`]).
     peer: String,
@@ -477,6 +481,7 @@ impl<'a> OverlayGASPStorage<'a> {
             strict_beef: false,
             chain_tracker: None,
             verify_scripts: true,
+            walk_budget: crate::engine::DoorBudget::DEFAULT,
             peer: String::new(),
             configured_peer: false,
             anchored: Mutex::new(None),
@@ -540,6 +545,14 @@ impl<'a> OverlayGASPStorage<'a> {
     #[must_use]
     pub fn with_script_verification(mut self, enabled: bool) -> Self {
         self.verify_scripts = enabled;
+        self
+    }
+
+    /// Carry [`crate::engine::Engine::set_walk_budget`] into the anchor
+    /// check (bsv-low #592).
+    #[must_use]
+    pub fn with_walk_budget(mut self, budget: crate::engine::DoorBudget) -> Self {
+        self.walk_budget = budget;
         self
     }
 
@@ -1272,11 +1285,29 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             self.verify_scripts,
             &root_beef,
             &anchor.root_txid,
+            self.walk_budget,
         )
         .await;
         // The checked copy has done its work (bsv-low #586: not held through
         // the replay).
         drop(root_beef);
+        // A walk that could not run within the budget (bsv-low #592) is not
+        // a verdict on the graph: the anchor goes on to its replay through
+        // the topic manager, as the submit goes on as historical-tx-no-spv.
+        // Refusing would refuse a valid graph for its size; holding the
+        // cursor would ask again forever. Before #592 this walk had no bound
+        // at all (#557).
+        let verdict = verdict.map(|could_not_run| {
+            if let Some(stop) = could_not_run {
+                warn!(
+                    "GASP anchor: the script walk of {} could not run ({}: at {}; {}): not a refusal, the replay judges the graph (bsv-low #592)",
+                    stop.subject_txid,
+                    stop.limb.as_str(),
+                    stop.at_txid,
+                    stop.what
+                );
+            }
+        });
         if let Err(e) = verdict {
             if tracker
                 .as_ref()

@@ -785,13 +785,23 @@ async fn large_spend_verification_cost() {
         .expect("the expensive spend is valid");
     let verify_ms = started.elapsed().as_millis();
 
-    // The whole submit (parse + verify + admission), with a chain tracker.
+    // The whole submit (parse + walk + admission), with a chain tracker.
+    // Since bsv-low #592 the submit's walk runs under the door's budget: 2330
+    // SHA256 rounds are charged 2330 elements of 128 KB, past the 64 MiB work
+    // limb, so the walk could not run and the spend is admitted as under
+    // historical-tx-no-spv. `Transaction::verify` above is the measure of the
+    // interpreter's own cost.
     let engine = engine(Some(tracker_knowing(&fixture.funding_txid)));
     let started = Instant::now();
-    engine
-        .submit(&tagged(&fixture), SubmitMode::CurrentTx)
+    let (_, report) = engine
+        .submit_with_report(&tagged(&fixture), SubmitMode::CurrentTx)
         .await
         .expect("the expensive spend is admitted");
+    assert_eq!(
+        report.walk_could_not_run.map(|stop| stop.limb),
+        Some(bsv_overlay_engine::engine::WalkLimb::OverWork),
+        "the submit's walk is bounded by the work limb"
+    );
     let submit_ms = started.elapsed().as_millis();
 
     println!(
@@ -1357,7 +1367,7 @@ async fn door_stats_describe_the_real_covenant_leg() {
 }
 
 #[tokio::test]
-async fn door_over_budget_is_inconclusive_never_a_refusal_and_the_reference_walk_is_untouched() {
+async fn door_over_budget_is_inconclusive_never_a_refusal_and_the_submit_goes_on() {
     // 600 hash ops × the 128 KB element limit ≈ 77 MB of estimated work: over
     // the 64 MB budget from the BYTES alone, before anything executes.
     let n = (DoorBudget::DEFAULT.max_work_bytes / DoorBudget::DEFAULT.memory_limit as u64) as usize
@@ -1385,13 +1395,19 @@ async fn door_over_budget_is_inconclusive_never_a_refusal_and_the_reference_walk
         ),
         "the door's own bound, never the interpreter's verdict: {err}"
     );
-    // The reference walk (`submit`) has no budget: the same valid spend is admitted.
+    // The submit's walk runs under the same budget since bsv-low #592: it
+    // could not run, which is not a refusal, and the same valid spend is
+    // admitted as under historical-tx-no-spv (the network judges).
     let storage = Rc::new(MemoryStorage::new());
     let reference = engine_with(Rc::clone(&storage), None);
-    reference
-        .submit(&tagged(&heavy), SubmitMode::CurrentTx)
+    let (_, report) = reference
+        .submit_with_report(&tagged(&heavy), SubmitMode::CurrentTx)
         .await
-        .expect("the reference walk admits a valid spend whatever its cost");
+        .expect("a valid spend past the budget is admitted, never refused");
+    assert_eq!(
+        report.walk_could_not_run.map(|stop| stop.limb),
+        Some(bsv_overlay_engine::engine::WalkLimb::OverWork)
+    );
     assert!(is_admitted(&storage, &heavy.subject_txid).await);
 }
 

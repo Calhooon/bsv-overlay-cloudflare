@@ -35,6 +35,7 @@ pub struct EngineBuilder {
     slap_trackers: Vec<String>,
     suppress_default_sync_ads: bool,
     verify_scripts: bool,
+    walk_budget: crate::engine::DoorBudget,
 }
 
 impl EngineBuilder {
@@ -53,6 +54,7 @@ impl EngineBuilder {
             slap_trackers: Vec::new(),
             suppress_default_sync_ads: true,
             verify_scripts: true,
+            walk_budget: crate::engine::DoorBudget::DEFAULT,
         }
     }
 
@@ -138,6 +140,14 @@ impl EngineBuilder {
         self
     }
 
+    /// The budget of the submit's own script walk (bsv-low #592): the door's
+    /// two limbs, [`crate::engine::DoorBudget::DEFAULT`] unless set. See
+    /// [`Engine::set_walk_budget`].
+    pub fn with_walk_budget(mut self, budget: crate::engine::DoorBudget) -> Self {
+        self.walk_budget = budget;
+        self
+    }
+
     /// Build the Engine.
     pub fn build(self) -> Engine {
         let mut engine = Engine::with_all(
@@ -157,6 +167,7 @@ impl EngineBuilder {
             },
         );
         engine.set_script_verification(self.verify_scripts);
+        engine.set_walk_budget(self.walk_budget);
         engine
     }
 }

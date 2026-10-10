@@ -398,6 +398,39 @@ pub(crate) fn walk(
     subject_txid: &str,
     budget: DoorBudget,
 ) -> Result<WalkStats, EngineError> {
+    walk_trusting(
+        beef_bytes,
+        subject_txid,
+        budget,
+        &HashSet::new(),
+        &mut WalkTrace::default(),
+    )
+}
+
+/// What a walk saw beside its statistics, for the engine's submit (bsv-low
+/// #592): the PROVEN transactions it reached, in the order it reached them
+/// (the submit asks the chain tracker for their roots once the scripts
+/// passed; the door asks nothing), and whether a breach of the work limb was
+/// the interpreter's own memory limit tripping (the door's error says `Work`
+/// for both).
+#[derive(Debug, Default)]
+pub(crate) struct WalkTrace {
+    pub(crate) proven: Vec<String>,
+    pub(crate) interpreter_tripped: bool,
+}
+
+/// [`walk`] trusting `trusted` (display txids an earlier walk of the same
+/// submit passed over: neither checked nor descended), and recording what it
+/// reached in `trace`. The door trusts nothing; the engine's submit trusts
+/// what a carried predecessor's landing already walked (the E1D delta fold,
+/// L4). One walker for both (bsv-low #592).
+pub(crate) fn walk_trusting(
+    beef_bytes: &[u8],
+    subject_txid: &str,
+    budget: DoorBudget,
+    trusted: &HashSet<String>,
+    trace: &mut WalkTrace,
+) -> Result<WalkStats, EngineError> {
     let mut stats = WalkStats::default();
     // The memory limb, from the frame alone: nothing is allocated before it.
     let sized = stream_sizing::estimate(beef_bytes, &DOOR_CHARGES, budget.max_memory_bytes);
@@ -460,7 +493,14 @@ pub(crate) fn walk(
 
     // The outputs of each source the walk spent from, by offset.
     let mut sources: HashMap<Hash32, Box<[usize]>> = HashMap::new();
-    let mut seen: HashSet<Hash32> = HashSet::new();
+    let mut seen: HashSet<Hash32> = trusted
+        .iter()
+        .filter_map(|txid| {
+            let mut wire = Hash32::try_from(bsv_rs::primitives::from_hex(txid).ok()?).ok()?;
+            wire.reverse();
+            Some(wire)
+        })
+        .collect();
     let mut queue: Vec<Hash32> = vec![subject];
     while let Some(wire_txid) = queue.pop() {
         if !seen.insert(wire_txid) {
@@ -478,7 +518,9 @@ pub(crate) fn walk(
         if index.proven.contains(&wire_txid) {
             // 'scripts only': a proven transaction is trusted as-is, no root
             // computed, no tracker asked. The caller's bar is the network's
-            // acceptance, never this proof.
+            // acceptance, never this proof. The engine's submit asks the
+            // tracker for its root once the walk passed (bsv-low #592).
+            trace.proven.push(txid);
             continue;
         }
 
@@ -664,6 +706,7 @@ pub(crate) fn walk(
                 // the stack budget, the alt stack, NUM2BIN's element-size
                 // pre-check), so no wording is matched.
                 Err(e) if e.is_resource_limit() => {
+                    trace.interpreter_tripped = true;
                     return Err(over(
                         &txid,
                         judged,

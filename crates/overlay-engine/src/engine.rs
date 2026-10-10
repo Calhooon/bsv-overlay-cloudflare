@@ -116,6 +116,10 @@ pub struct Engine {
     /// invalid spend on structure alone. See
     /// [`Engine::set_script_verification`].
     verify_scripts: bool,
+    /// The two limbs of the submit's own script walk (bsv-low #592): the
+    /// door's [`DoorBudget`], [`DoorBudget::DEFAULT`] unless set. See
+    /// [`Engine::set_walk_budget`].
+    walk_budget: DoorBudget,
     config: EngineConfig,
 }
 
@@ -451,6 +455,11 @@ pub struct MutationReport {
     /// caller asked for: a caller that guards its admission writes (the
     /// worker's eviction ledger, bsv-low #513) guards these too.
     pub landed_predecessors: Vec<(String, String)>,
+    /// The submit's own script walk could not run within the engine's
+    /// budget (bsv-low #592): the submit went on as under
+    /// `HistoricalTxNoSpv`. `None` when it ran (or the mode does not walk).
+    /// A caller counts it; it never makes a report undurable.
+    pub walk_could_not_run: Option<WalkCouldNotRun>,
 }
 
 /// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): what [`Engine::renotify_admitted`] did.
@@ -649,6 +658,74 @@ pub enum DoorLimb {
     Work,
     /// The estimate of what the door holds beside the body.
     Memory,
+}
+
+/// What [`Engine::run_validation`] answers: the topics' validations, the
+/// preliminary STEAK, the subject and its txid, and whether the walk could
+/// not run within the budget (bsv-low #592).
+type Validated = (
+    Vec<TopicValidation>,
+    Steak,
+    Transaction,
+    String,
+    Option<WalkCouldNotRun>,
+);
+
+/// Which limb of the [`DoorBudget`] a submit's own walk went past (bsv-low
+/// #592): the [`DoorLimb`] of the door's error, with the interpreter's own
+/// memory limit told apart from the static work estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkLimb {
+    /// The static work estimate.
+    OverWork,
+    /// The estimate of what the walk holds beside the body.
+    OverMemory,
+    /// The interpreter's own memory limit (the budget's element limit)
+    /// tripping inside one input.
+    InterpreterMemory,
+}
+
+impl WalkLimb {
+    /// The door's word for the same limb ([`DoorLimb`]: the interpreter's
+    /// trip is `Work` there).
+    #[must_use]
+    pub fn door_limb(self) -> DoorLimb {
+        match self {
+            WalkLimb::OverWork | WalkLimb::InterpreterMemory => DoorLimb::Work,
+            WalkLimb::OverMemory => DoorLimb::Memory,
+        }
+    }
+
+    /// The limb's name in a log line and a counter's reason.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WalkLimb::OverWork => "over_work",
+            WalkLimb::OverMemory => "over_memory",
+            WalkLimb::InterpreterMemory => "interpreter_memory",
+        }
+    }
+}
+
+/// A submit whose own script walk COULD NOT RUN within the engine's
+/// [`DoorBudget`] (bsv-low #592, the owner's ruling 3a of 2026-10-10). Shaped
+/// like [`EngineError::ScriptWalkOverBudget`], and NOT an error: the submit
+/// went on as under `HistoricalTxNoSpv` (the topic managers judged it, the
+/// network judges its validity), and this says so on its
+/// [`MutationReport`]. The reference (`Engine.submit`, `tx.verify`) has no
+/// budget; this is the platform's addition, on the door's lineage (D8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkCouldNotRun {
+    /// The submitted transaction.
+    pub subject_txid: String,
+    /// The transaction the walk stopped at.
+    pub at_txid: String,
+    /// Whether the subject's own inputs had all executed before the stop.
+    pub subject_judged: bool,
+    /// The limb it went past.
+    pub limb: WalkLimb,
+    /// The estimate against the limb, in the door's words.
+    pub what: String,
 }
 
 /// What the walk did (the door's cost instrument, since `Date.now()` is
@@ -864,6 +941,7 @@ impl Engine {
             not_landed: std::cell::RefCell::new(HashSet::new()),
             landing_guard: None,
             verify_scripts: true,
+            walk_budget: DoorBudget::DEFAULT,
             config,
         }
     }
@@ -1097,6 +1175,27 @@ impl Engine {
         self.verify_scripts
     }
 
+    /// The budget of the submit's own script walk (bsv-low #592, the owner's
+    /// ruling 3a of 2026-10-10). Every submit that walks (every mode but
+    /// `HistoricalTxNoSpv`), and the GASP anchor check, read the BEEF through
+    /// the door's stream walk ([`crate::script_door`]) under this budget's
+    /// two limbs, the work and the memory, each estimated from the bytes
+    /// before it is spent. A breach is "the walk could not run"
+    /// ([`WalkCouldNotRun`], on [`MutationReport::walk_could_not_run`]),
+    /// never a refusal: the submit goes on as under `HistoricalTxNoSpv`.
+    /// A library consumer that sets nothing gets [`DoorBudget::DEFAULT`]
+    /// (64 MiB of work, 48 MiB of memory). Prefer
+    /// [`crate::builder::EngineBuilder::with_walk_budget`].
+    pub fn set_walk_budget(&mut self, budget: DoorBudget) {
+        self.walk_budget = budget;
+    }
+
+    /// The budget of the submit's own script walk, see
+    /// [`Engine::set_walk_budget`].
+    pub fn walk_budget(&self) -> DoorBudget {
+        self.walk_budget
+    }
+
     /// The reference's `tx.verify('scripts only')` over a BEEF: every unproven
     /// transaction from `subject_txid` down executes every input's unlocking
     /// script against its source output and obeys the value rule, while a
@@ -1183,7 +1282,7 @@ impl Engine {
         // A validate-only call admits nothing: a dry run by its own name. A
         // manager that writes on admission must not write here, or the real
         // submit that follows meets a head this call already advanced.
-        let (_validations, steak, _tx, _txid) = self
+        let (_validations, steak, _tx, _txid, _could_not_run) = self
             .run_validation(
                 tagged_beef,
                 mode,
@@ -1343,10 +1442,13 @@ impl Engine {
         } else {
             TopicAdmittanceContext::default()
         };
-        let (mut validations, mut steak, tx, txid) = self
+        let (mut validations, mut steak, tx, txid, could_not_run) = self
             .run_validation(tagged_beef, mode, &context, bound, walked)
             .await?;
-        let mut report = MutationReport::default();
+        let mut report = MutationReport {
+            walk_could_not_run: could_not_run,
+            ..MutationReport::default()
+        };
         // The body every LOOKUP SERVICE receives NAMES the subject (BRC-95
         // atomic prefix over the WHOLE submitted body — bsv-rs's
         // `to_binary_atomic` sorts, names, never prunes). Lookup services
@@ -2746,18 +2848,30 @@ impl Engine {
         }
     }
 
-    /// The reference's `tx.verify(chainTracker)` on submit, walked LINEARLY
-    /// over the BEEF's own transaction map: every txid once, a transaction the
-    /// BEEF proves (a BUMP) checked by its root against the chain tracker and
-    /// not descended, an unproven one script-checked on every input with its
-    /// source looked up by txid, plus the reference's value rule (outputs
-    /// never exceed inputs). No source objects are cloned or linked.
+    /// The reference's `tx.verify(chainTracker)` on submit: every unproven
+    /// transaction from the subject down has every input's script executed
+    /// against its source output and obeys the value rule; a proven one is
+    /// not descended, and its BUMP's root is checked against the chain
+    /// tracker (computed and accepted with none).
+    ///
+    /// Since bsv-low #592 (the owner's ruling 3a of 2026-10-10) the scripts
+    /// are walked by the DOOR's stream walk ([`crate::script_door`]) under
+    /// `budget`, the engine's [`DoorBudget`]: one walker, the same estimates
+    /// charged from the bytes before anything is parsed or run. Before it this
+    /// was a walk of its own over a hydrated `Beef` with no memory charge and
+    /// no interpreter limit: 219.7 MB natively on a 1.9 MB push-only unproven
+    /// parent, an isolate kill on Workers, met by every `historical-tx` replay
+    /// of the queue. The roots are then asked for the proven transactions the
+    /// walk reached, in its order, once per BUMP.
+    ///
+    /// `Ok(Some(_))` is a walk that COULD NOT RUN within the budget, never a
+    /// refusal (below, at the match). The interpreter's refusal and a
+    /// structural fault are what they were: `ScriptVerificationFailed`, and
+    /// `SpvError` in the same words.
     ///
     /// The tracker is an ARGUMENT, not `self`'s: the GASP anchor check
     /// ([`verify_spv_like_the_reference`]) runs this same walk from
-    /// `OverlayGASPStorage`, which borrows the engine's tracker. The DOOR's
-    /// walk (`'scripts only'` under a work budget) was this one with a policy
-    /// until bsv-low #585; it reads the stream now ([`crate::script_door`]).
+    /// `OverlayGASPStorage`, which borrows the engine's tracker.
     ///
     /// Why not bsv-rs `Transaction::verify`: it walks `source_transaction`
     /// links that `from_beef` builds by CLONING, once per input. Two inputs
@@ -2766,192 +2880,114 @@ impl Engine {
     /// leave the second clone bare ("Input 0 has no source transaction"), and
     /// re-linking every clone materializes the ancestry EXPONENTIALLY along a
     /// diamond chain: a 12-deep unmined chain of head spends took a Worker past
-    /// its memory on beta (zanaadu, 2026-09-08). A map keyed by txid is what the
-    /// TypeScript SDK effectively has (its inputs share one object), in O(n).
+    /// its memory on beta (zanaadu, 2026-09-08). The stream walk reads each
+    /// transaction once, in place, keyed by txid.
     async fn verify_beef_linear(
         chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
         beef_bytes: &[u8],
         subject_txid: &str,
         trusted: &HashSet<String>,
-    ) -> Result<(), EngineError> {
-        use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
-        use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
-
-        let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
-            .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
-        let mut by_txid: HashMap<String, &Transaction> = HashMap::new();
-        for btx in &beef.txs {
-            if let Some(tx) = btx.tx() {
-                by_txid.insert(btx.txid(), tx);
-            }
-        }
-        // Each BUMP's level 0 indexed once (the first BUMP that carries a
-        // txid, as `Beef::find_bump` picks), and each BUMP's root computed
-        // and asked of the tracker once (NL-6e). Per proven transaction, as
-        // until NL-6e, a BUMP of n leaves spent by n proven transactions was
-        // walked n times. The door (`parse_beef`) has climbed every hashed
-        // leaf of each BUMP to one root, so the root from any of them is it.
-        let proven_in = proven_index(&beef);
-        let mut checked: HashSet<usize> = HashSet::new();
+        budget: DoorBudget,
+    ) -> Result<Option<WalkCouldNotRun>, EngineError> {
         // A structural fault is the reference walk's `SpvError`.
         let spv =
             |msg: String| EngineError::SpvError(format!("Unable to verify SPV information: {msg}"));
 
-        // A trusted transaction (one an earlier walk of the same submit
-        // passed over) is neither checked nor descended again.
-        let mut seen: HashSet<String> = trusted.clone();
-        let mut queue: Vec<String> = vec![subject_txid.to_string()];
-        while let Some(txid) = queue.pop() {
-            if !seen.insert(txid.clone()) {
-                continue;
+        // THE SCRIPTS (bsv-low #592): the door's own stream walk, under the
+        // engine's budget. One walker (Rule 10): the door and the submit run
+        // the same function, the same estimates and the same interpreter
+        // limit; the submit adds the roots below.
+        let mut trace = crate::script_door::WalkTrace::default();
+        match crate::script_door::walk_trusting(
+            beef_bytes,
+            subject_txid,
+            budget,
+            trusted,
+            &mut trace,
+        ) {
+            Ok(_) => {}
+            // The interpreter's verdict, the reference's refusal: unchanged.
+            Err(refused @ EngineError::ScriptVerificationFailed { .. }) => return Err(refused),
+            // A structural fault (a source missing, the value rule, ...):
+            // the reference walk's `SpvError`, in the same words as before.
+            Err(EngineError::ScriptWalkInconclusive { reason, .. }) => return Err(spv(reason)),
+            // The budget, not the transaction: the walk COULD NOT RUN. This is
+            // NOT a refusal, and it must never become one. The bytes are a
+            // BEEF the walk was not given the room to judge, which says
+            // nothing about whether its scripts are valid; refusing it would
+            // refuse a valid BEEF for its size (the owner's posture), and on
+            // the queue's replay it would dead-letter an admission the gated
+            // door already broadcast. So the submit goes on exactly as under
+            // `HistoricalTxNoSpv` (the topic managers judge it, the network
+            // judges its validity), and the caller is told, to count it.
+            Err(EngineError::ScriptWalkOverBudget {
+                at_txid,
+                subject_judged,
+                limb,
+                what,
+            }) => {
+                let limb = match limb {
+                    DoorLimb::Memory => WalkLimb::OverMemory,
+                    DoorLimb::Work if trace.interpreter_tripped => WalkLimb::InterpreterMemory,
+                    DoorLimb::Work => WalkLimb::OverWork,
+                };
+                return Ok(Some(WalkCouldNotRun {
+                    subject_txid: subject_txid.to_string(),
+                    at_txid,
+                    subject_judged,
+                    limb,
+                    what,
+                }));
             }
-            let Some(tx) = by_txid.get(&txid).copied() else {
+            Err(other) => return Err(other),
+        }
+
+        // THE ROOTS: every proven transaction the walk reached, in the order
+        // it reached them, its BUMP's root computed and asked of the tracker
+        // once per BUMP (NL-6e). With no tracker the roots are computed and
+        // accepted (`'scripts only'`). The walk trusted them as it went; the
+        // reference checks them in the same walk, so a body with BOTH a bad
+        // script and a bad root now names the script.
+        if trace.proven.is_empty() {
+            return Ok(None);
+        }
+        let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
+            .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+        let proven_in = proven_index(&beef);
+        let mut checked: HashSet<usize> = HashSet::new();
+        for txid in &trace.proven {
+            let Some(&at) = proven_in.get(txid.as_str()) else {
                 return Err(spv(format!("transaction {txid} is not in the BEEF")));
             };
-            if let Some(&at) = proven_in.get(txid.as_str()) {
-                if checked.contains(&at) {
-                    continue; // its BUMP's root is the chain's, asked once
-                }
-                let mp = &beef.bumps[at];
-                let root = mp
-                    .compute_root(Some(&txid))
-                    .map_err(|e| spv(format!("invalid merkle path for transaction {txid}: {e}")))?;
-                if let Some(tracker) = chain_tracker {
-                    match tracker
-                        .is_valid_root_for_height(&root, mp.block_height)
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            return Err(EngineError::SpvError(format!(
-                                "Invalid merkle path for transaction {txid}: root {root} is not valid for block height {}",
-                                mp.block_height
-                            )));
-                        }
-                        Err(e) => {
-                            return Err(EngineError::SpvError(format!(
-                                "Chain tracker error at height {}: {e}",
-                                mp.block_height
-                            )));
-                        }
-                    }
-                }
-                checked.insert(at);
-                continue; // proven: trusted, no ancestry needed (the reference stops here too)
+            if !checked.insert(at) {
+                continue; // its BUMP's root is the chain's, asked once
             }
-
-            // Unproven: the value rule and every input's script, sources by txid.
-            let outputs: Vec<TxOutput> = tx
-                .outputs
-                .iter()
-                .map(|o| TxOutput {
-                    satoshis: o.satoshis.unwrap_or(0),
-                    script: o.locking_script.to_binary(),
-                })
-                .collect();
-            let mut input_total: u64 = 0;
-            for (vin, input) in tx.inputs.iter().enumerate() {
-                let Some(src_txid) = input.source_txid.clone() else {
-                    return Err(spv(format!(
-                        "input {vin} of transaction {txid} names no source"
-                    )));
-                };
-                let Some(source) = by_txid.get(&src_txid).copied() else {
-                    return Err(spv(format!(
-                        "input {vin} of transaction {txid} has no source transaction"
-                    )));
-                };
-                let Some(source_output) = source.outputs.get(input.source_output_index as usize)
-                else {
-                    return Err(spv(format!(
-                        "input {vin} of transaction {txid}: source output index out of bounds"
-                    )));
-                };
-                let source_sats = source_output.satoshis.unwrap_or(0);
-                input_total = input_total
-                    .checked_add(source_sats)
-                    .ok_or_else(|| spv(format!("satoshi total overflows in transaction {txid}")))?;
-                let Some(unlocking) = input.unlocking_script.as_ref() else {
-                    return Err(spv(format!(
-                        "input {vin} of transaction {txid} is missing its unlocking script"
-                    )));
-                };
-                let unlocking_bytes = unlocking.to_binary();
-                let locking_bytes = source_output.locking_script.to_binary();
-                let other_inputs: Vec<TxInput> = tx
-                    .inputs
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != vin)
-                    .map(|(_, inp)| TxInput {
-                        txid: inp.get_source_txid_bytes().unwrap_or([0u8; 32]),
-                        output_index: inp.source_output_index,
-                        script: inp
-                            .unlocking_script
-                            .as_ref()
-                            .map(bsv_rs::UnlockingScript::to_binary)
-                            .unwrap_or_default(),
-                        sequence: inp.sequence,
-                    })
-                    .collect();
-                let source_txid_bytes = input
-                    .get_source_txid_bytes()
-                    .map_err(|e| spv(format!("input {vin} of transaction {txid}: {e}")))?;
-                let locking_script = LockingScript::from_script(
-                    Script::from_binary(&locking_bytes)
-                        .map_err(|e| spv(format!("locking script of {src_txid}: {e}")))?,
-                );
-                let unlocking_script = UnlockingScript::from_script(
-                    Script::from_binary(&unlocking_bytes)
-                        .map_err(|e| spv(format!("unlocking script of {txid}: {e}")))?,
-                );
-                let mut spend = Spend::new(SpendParams {
-                    source_txid: source_txid_bytes,
-                    source_output_index: input.source_output_index,
-                    source_satoshis: source_sats,
-                    locking_script,
-                    transaction_version: tx.version.cast_signed(),
-                    other_inputs,
-                    outputs: outputs.clone(),
-                    input_index: vin,
-                    unlocking_script,
-                    input_sequence: input.sequence,
-                    lock_time: tx.lock_time,
-                    memory_limit: None,
-                });
-                match spend.validate() {
+            let mp = &beef.bumps[at];
+            let root = mp
+                .compute_root(Some(txid))
+                .map_err(|e| spv(format!("invalid merkle path for transaction {txid}: {e}")))?;
+            if let Some(tracker) = chain_tracker {
+                match tracker
+                    .is_valid_root_for_height(&root, mp.block_height)
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => {
-                        return Err(EngineError::ScriptVerificationFailed {
-                            subject_txid: txid.clone(),
-                            input_index: vin as u32,
-                            reason: "script evaluated to false".into(),
-                        });
+                        return Err(EngineError::SpvError(format!(
+                            "Invalid merkle path for transaction {txid}: root {root} is not valid for block height {}",
+                            mp.block_height
+                        )));
                     }
                     Err(e) => {
-                        return Err(EngineError::ScriptVerificationFailed {
-                            subject_txid: txid.clone(),
-                            input_index: vin as u32,
-                            reason: e.message.clone(),
-                        });
+                        return Err(EngineError::SpvError(format!(
+                            "Chain tracker error at height {}: {e}",
+                            mp.block_height
+                        )));
                     }
                 }
-                queue.push(src_txid);
-            }
-            let mut output_total: u64 = 0;
-            for output in &tx.outputs {
-                output_total = output_total
-                    .checked_add(output.satoshis.unwrap_or(0))
-                    .ok_or_else(|| spv(format!("satoshi total overflows in transaction {txid}")))?;
-            }
-            if output_total > input_total {
-                return Err(spv(format!(
-                        "transaction {txid} creates {output_total} sats from {input_total} sats of inputs"
-                    ),
-                ));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// The pre-2026-09-08 SPV block, kept as the
@@ -3209,7 +3245,7 @@ impl Engine {
         context: &TopicAdmittanceContext,
         bound: Option<&CallBound>,
         walked: Option<&HashSet<String>>,
-    ) -> Result<(Vec<TopicValidation>, Steak, Transaction, String), EngineError> {
+    ) -> Result<Validated, EngineError> {
         // Validate all topics are supported
         for topic in &tagged_beef.topics {
             if !self.managers.contains_key(topic) {
@@ -3250,20 +3286,37 @@ impl Engine {
         // A predecessor the door lands first (`walked`, the E1D delta fold,
         // L4) is not walked again when this submit's walks already passed
         // over it, and its walk trusts what they passed over.
+        //
+        // The walk runs under the engine's budget (bsv-low #592,
+        // [`Engine::set_walk_budget`]): one that could not run within it is
+        // NOT a refusal (see `verify_beef_linear`); this submit goes on as
+        // under `HistoricalTxNoSpv` and the report says so.
+        let mut could_not_run = None;
         if mode != SubmitMode::HistoricalTxNoSpv {
             match walked {
                 Some(walked) if walked.contains(&txid) => {}
                 trusted => {
-                    verify_spv_trusting(
+                    could_not_run = verify_spv_trusting(
                         self.chain_tracker.as_deref(),
                         self.verify_scripts,
                         &tagged_beef.beef,
                         &txid,
                         trusted.unwrap_or(&HashSet::new()),
+                        self.walk_budget,
                     )
                     .await?;
                 }
             }
+        }
+        if let Some(stop) = &could_not_run {
+            warn!(
+                "submit: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): not a refusal, the submit goes on as historical-tx-no-spv and the network judges (bsv-low #592)",
+                stop.subject_txid,
+                stop.limb.as_str(),
+                stop.at_txid,
+                stop.subject_judged,
+                stop.what
+            );
         }
 
         let mut steak = Steak::new();
@@ -3404,7 +3457,7 @@ impl Engine {
             }
         }
 
-        Ok((validations, steak, tx, txid))
+        Ok((validations, steak, tx, txid, could_not_run))
     }
 
     // ========================================================================
@@ -4793,7 +4846,8 @@ impl Engine {
                             .with_peer(peer_url.as_str())
                             .with_configured_peer(configured_peers)
                             .with_strict_beef(hydration_on)
-                            .with_script_verification(self.verify_scripts);
+                            .with_script_verification(self.verify_scripts)
+                            .with_walk_budget(self.walk_budget);
                     if let Some(manager) = self.managers.get(topic) {
                         gasp_storage = gasp_storage.with_topic_manager(manager.as_ref());
                     }
@@ -5330,22 +5384,28 @@ impl Engine {
 /// `verify_scripts` is `false` ([`Engine::set_script_verification`]'s escape
 /// hatch).
 ///
-/// There is ONE verifier. `Engine::submit` calls this with its own tracker
-/// and switch; the GASP anchor check
+/// There is ONE verifier. `Engine::submit` calls this with its own tracker,
+/// switch and walk budget; the GASP anchor check
 /// (`OverlayGASPStorage::validate_graph_anchor`, bsv-low #551) calls it with
-/// the same two, handed over by `Engine::start_gasp_sync`.
+/// the same three, handed over by `Engine::start_gasp_sync`.
+///
+/// `Ok(Some(_))` is a walk that COULD NOT RUN within `budget` (bsv-low #592):
+/// not a verdict on the transaction. The caller goes on as it would without a
+/// walk and says so.
 pub(crate) async fn verify_spv_like_the_reference(
     chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
     verify_scripts: bool,
     beef_bytes: &[u8],
     subject_txid: &str,
-) -> Result<(), EngineError> {
+    budget: DoorBudget,
+) -> Result<Option<WalkCouldNotRun>, EngineError> {
     verify_spv_trusting(
         chain_tracker,
         verify_scripts,
         beef_bytes,
         subject_txid,
         &HashSet::new(),
+        budget,
     )
     .await
 }
@@ -5360,11 +5420,14 @@ async fn verify_spv_trusting(
     beef_bytes: &[u8],
     subject_txid: &str,
     trusted: &HashSet<String>,
-) -> Result<(), EngineError> {
+    budget: DoorBudget,
+) -> Result<Option<WalkCouldNotRun>, EngineError> {
     if verify_scripts {
-        Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid, trusted).await
+        Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid, trusted, budget).await
     } else {
-        Engine::verify_spv_structurally(chain_tracker, beef_bytes).await
+        Engine::verify_spv_structurally(chain_tracker, beef_bytes)
+            .await
+            .map(|()| None)
     }
 }
 
@@ -9786,8 +9849,14 @@ mod tests {
                 verify_scripts,
                 &bytes,
                 &subject,
+                DoorBudget::DEFAULT,
             ));
-            let _ = tx.send((verdict.map_err(|e| e.to_string()), started.elapsed()));
+            let verdict = match verdict {
+                Ok(None) => Ok(()),
+                Ok(Some(stop)) => Err(format!("the walk could not run: {stop:?}")),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send((verdict, started.elapsed()));
         });
         rx.recv_timeout(WIDE_BUMP_WALK_BOUND).unwrap_or_else(|_| {
             panic!("{what}: no answer from the walk within {WIDE_BUMP_WALK_BOUND:?}")
