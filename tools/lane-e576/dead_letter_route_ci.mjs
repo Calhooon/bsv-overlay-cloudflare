@@ -74,6 +74,8 @@ const nonceScript = () => {
 }
 const output = (script) => Buffer.concat([u64(0), varint(script.length), script])
 const input = (txid, vout) => Buffer.concat([Buffer.from(txid, 'hex').reverse(), u32(vout), varint(0), u32(0xffffffff)])
+/** A coinbase's null outpoint: a transaction with no input is refused at the door since bsv-rs 0.4.1 (NL-8 W6). */
+const coinbaseInput = () => input('00'.repeat(32), 0xffffffff)
 const tx = (inputs, outputs) =>
   Buffer.concat([u32(1), varint(inputs.length), ...inputs, varint(outputs.length), ...outputs, u32(0)])
 const beefV1 = (...raws) =>
@@ -148,7 +150,7 @@ expect(h0.deadLetters?.readable === true, '/health/invariants.deadLetters is ser
 const parked0 = h0.counters?.dead_letters_parked_total ?? NaN
 
 // 2. A real dead letter of the e1d class.
-const G = tx([], [output(COLLECTED_MARKER), output(nonceScript())])
+const G = tx([coinbaseInput()], [output(COLLECTED_MARKER), output(nonceScript())])
 const g = txidOf(G)
 const P = tx([input(g, 0)], [output(COLLECTED_MARKER), output(nonceScript())])
 const p = txidOf(P)
@@ -293,7 +295,7 @@ expect(
 const deferred0 = hf.counters?.dead_letters_ceiling_deferred_total ?? NaN
 const deferrals0 = hf.counters?.dead_letters_ceiling_deferrals_total ?? NaN
 const discarded0 = hf.counters?.dead_letters_discarded_total ?? NaN
-const G2 = tx([], [output(COLLECTED_MARKER), output(nonceScript())])
+const G2 = tx([coinbaseInput()], [output(COLLECTED_MARKER), output(nonceScript())])
 const g2 = txidOf(G2)
 const P2 = tx([input(g2, 0)], [output(COLLECTED_MARKER), output(nonceScript())])
 const p2 = txidOf(P2)
@@ -372,7 +374,7 @@ expect(
 )
 const nnDeferrals0 = hc.counters?.dead_letters_not_now_deferrals_total ?? NaN
 const ceilDeferrals0 = hc.counters?.dead_letters_ceiling_deferrals_total ?? NaN
-const G3 = tx([], [output(COLLECTED_MARKER), output(nonceScript())])
+const G3 = tx([coinbaseInput()], [output(COLLECTED_MARKER), output(nonceScript())])
 const g3 = txidOf(G3)
 const P3 = tx([input(g3, 0)], [output(COLLECTED_MARKER), output(nonceScript())])
 const p3 = txidOf(P3)

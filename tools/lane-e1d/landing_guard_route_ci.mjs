@@ -7,7 +7,8 @@
  *
  * The delta fold's pin (`admit_fast::tests::e1d_delta_l2_…`) read the source and executed no eviction. This drives
  * the real route on a real (local) D1:
- *  1. G: a zero-input transaction with one tm_collected marker, submitted by the operator (`historical-tx-no-spv`):
+ *  1. G: a transaction spending a coinbase's null outpoint (a transaction with no input is refused at the door
+ *     since bsv-rs 0.4.1, NL-8 W6) with one tm_collected marker, submitted by the operator (`historical-tx-no-spv`):
  *     its output is a coin the topic holds.
  *  2. P spends G's coin (its own marker); it is NEVER submitted. An OPEN eviction row is written for P in
  *     `pot_evictions` (as a corroborated refusal of P leaves it).
@@ -116,7 +117,7 @@ async function counter(name) {
   }
 }
 
-const G = tx([], [output(COLLECTED_MARKER), output(nonceScript())])
+const G = tx([input('00'.repeat(32), 0xffffffff)], [output(COLLECTED_MARKER), output(nonceScript())])
 const g = txidOf(G)
 const P = tx([input(g, 0)], [output(COLLECTED_MARKER), output(nonceScript())])
 const p = txidOf(P)
