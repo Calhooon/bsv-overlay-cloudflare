@@ -855,66 +855,100 @@ pub(crate) async fn corroborate_tx_hex(
 async fn corroborate_batch_with<F, Fut>(
     efs: &[EfTx],
     subject_txid: &str,
+    window: LegWindow,
     mut submit_one: F,
-) -> Result<ArcOutcome, String>
+) -> LegWalk
 where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<ArcOutcome, String>>,
 {
-    // #267 hardening: WORK BOUND, checked before any submit. Over the cap
-    // the whole corroboration is INCONCLUSIVE (Err → 502, the client's
-    // fallback; the routes.rs 429 byte bound it once matched is a deferral
-    // to the queue since NL-6c),
-    // never a truncated prime-loop whose partial corroboration could admit.
-    if efs.len() > MAX_CORROBORATION_LEGS {
-        return Err(format!(
-            "corroboration leg cap: {} EF legs > {MAX_CORROBORATION_LEGS} — inconclusive, refusing to corroborate (and therefore to admit)",
-            efs.len()
-        ));
-    }
-
-    let subject_ef = efs
-        .iter()
-        .find(|e| e.txid == subject_txid)
-        .ok_or_else(|| format!("subject {subject_txid} not present in EF batch"))?;
+    // NL-6d: no count refuses here. Until NL-6d a batch of more than 32 legs
+    // (`MAX_CORROBORATION_LEGS`) was inconclusive before any submit (502,
+    // nothing admitted), and a deferred job answered that 502 on each of its
+    // runs. Now the ancestors are read one at a time from the window's
+    // cursor; past the window's budget the walk PAUSES at the leg it reached
+    // and the caller defers the rest (the request to the queue, a run to the
+    // next run), never a partial corroboration that could admit: only the
+    // subject's verdict after EVERY ancestor was primed decides.
+    let Some(subject_ef) = efs.iter().find(|e| e.txid == subject_txid) else {
+        return LegWalk::Decided(Err(format!(
+            "subject {subject_txid} not present in EF batch"
+        )));
+    };
+    let ancestors: Vec<&EfTx> = efs.iter().filter(|e| e.txid != subject_txid).collect();
+    let from = window.from.min(ancestors.len());
 
     // SUBJECT-FIRST (#272): only a genuine ACCEPT short-circuits — the same
     // strict bar as everywhere ([`corroborator_verdict`]'s SEEN-or-better /
     // already-known). Anything else (inconclusive, transport, or a rejection
     // that may be a missing-parent artifact of the corroborator's own view)
-    // falls through to the primed attempt, whose verdict is final.
-    let first = submit_one(hex::encode(&subject_ef.ef)).await;
-    if matches!(first, Ok(ArcOutcome::Accepted(_))) {
-        return first;
+    // falls through to the primed attempt, whose verdict is final. A walk
+    // resumed past its first leg has asked it already (NL-6d).
+    if from == 0 {
+        let first = submit_one(hex::encode(&subject_ef.ef)).await;
+        if matches!(first, Ok(ArcOutcome::Accepted(_))) {
+            return LegWalk::Decided(first);
+        }
     }
 
     // Prime the corroborator's mempool with each ANCESTOR — best-effort,
     // verdicts discarded (they only prime). Ancestry order is preserved; the
-    // subject is skipped here and decided last.
-    for ef in efs {
-        if ef.txid == subject_txid {
-            continue;
-        }
+    // subject is skipped here and decided last. NL-6d: one leg at a time from
+    // the cursor, at most the window's budget of them.
+    let end = from.saturating_add(window.budget.max(1)).min(ancestors.len());
+    for ef in &ancestors[from..end] {
         let _ = submit_one(hex::encode(&ef.ef)).await;
+    }
+    if end < ancestors.len() {
+        return LegWalk::Paused { reached: end };
     }
 
     // ONLY the subject's (primed) verdict decides accept/reject — a primed
     // parent can never admit on its own (the #192/#193 invariant: admission
     // still requires a REAL network-accept marker on the SUBJECT).
-    submit_one(hex::encode(&subject_ef.ef)).await
+    LegWalk::Decided(submit_one(hex::encode(&subject_ef.ef)).await)
 }
 
-/// #267 hardening (review finding, DoS): bound the corroboration work.
-/// [`corroborate_batch_with`] primes each ancestor with its own SERIAL POST;
-/// the only pre-existing bound is routes.rs's BYTE cap (2 MB batch), which at
-/// ~100 B minimal txs still admits a batch of ~20k legs — and the #267 orphan
-/// shortcut makes that max-work path attacker-reachable (a fabricated-parent
-/// subject is free to construct and lands on the ancestry rungs by design).
-/// Real LOW ancestry runs ~8 unproven legs deep (#211 observed subjects 8+
-/// ancestors deep); 32 gives 4× headroom while bounding the worst case to
-/// ~32 serial corroborator POSTs (~10 s). Over the cap → inconclusive
-/// Err/502 with ZERO submits, never a partial corroboration that could admit.
-const MAX_CORROBORATION_LEGS: usize = 32;
+/// NL-6d: where a corroboration's ancestor walk starts and how many ancestors
+/// one invocation reads. The request reads from 0 under
+/// `ef_deferred::IN_REQUEST_CORROBORATION_LEGS`; a deferred job's run reads
+/// from the leg the last invocation reached under
+/// `ef_deferred::RUN_CORROBORATION_LEGS`. A routing window, never a refusal:
+/// a walk past it pauses ([`LegWalk::Paused`]) and the caller defers.
+///
+/// The bound it replaces, said so it is not lost: #267's
+/// `MAX_CORROBORATION_LEGS` (32) bounded the serial POSTs one request makes
+/// (~32 POSTs, ~10 s) by refusing any larger batch (502, nothing admitted);
+/// the request's window keeps that work bound and the rest of the walk runs
+/// on the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegWindow {
+    /// Ancestors already primed by an earlier invocation (the job's cursor).
+    pub from: usize,
+    /// Ancestors this invocation reads at most (at least one is always read).
+    pub budget: usize,
+}
+
+impl LegWindow {
+    /// The request's window: from the first ancestor, the request's budget.
+    pub const fn in_request() -> Self {
+        Self {
+            from: 0,
+            budget: crate::ef_deferred::IN_REQUEST_CORROBORATION_LEGS,
+        }
+    }
+}
+
+/// NL-6d: what one invocation's walk of a corroboration came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LegWalk {
+    /// Every ancestor was primed (or the subject-first attempt accepted): the
+    /// subject's verdict, the corroboration's answer.
+    Decided(Result<ArcOutcome, String>),
+    /// The window's budget was spent with ancestors left: `reached` ancestors
+    /// are primed (in ancestry order); the next invocation starts there.
+    Paused { reached: usize },
+}
 
 /// PURE (#216/#267): does this EF batch carry UNPROVEN ancestry — legs beyond
 /// the subject itself? The one signal, used two ways:
@@ -2018,6 +2052,10 @@ pub struct ArcadeBroadcaster {
     woc_api_key: Option<String>,
     /// NL-6d: one base for both corroborating hosts (`CORROBORATOR_URL`, a local fixture); `None` in production.
     corroborator_url: Option<String>,
+    /// NL-6d: the window of ancestors this invocation's corroboration reads ([`LegWindow`]).
+    legs: LegWindow,
+    /// NL-6d: set when a corroboration's walk paused at this many primed ancestors (the caller defers the rest).
+    legs_paused: std::cell::Cell<Option<usize>>,
 }
 
 impl ArcadeBroadcaster {
@@ -2040,7 +2078,23 @@ impl ArcadeBroadcaster {
             terminal_judged: std::cell::Cell::new(None),
             woc_api_key: None,
             corroborator_url: None,
+            legs: LegWindow::in_request(),
+            legs_paused: std::cell::Cell::new(None),
         }
+    }
+
+    /// NL-6d: the corroboration's ancestor window for this invocation (default: the request's,
+    /// [`LegWindow::in_request`]).
+    #[must_use]
+    pub fn with_leg_window(mut self, window: LegWindow) -> Self {
+        self.legs = window;
+        self
+    }
+
+    /// NL-6d: `Some(reached)` when a corroboration of this invocation paused with `reached` ancestors primed: the
+    /// ladder answered `Err` for it, and the caller defers the rest of the walk from there (never a 502 for a count).
+    pub fn corroboration_paused_at(&self) -> Option<usize> {
+        self.legs_paused.get()
     }
 
     /// NL-6d: route both corroborating hosts to one base (`CORROBORATOR_URL`; the route tier's fixture). Empty or
@@ -2202,12 +2256,32 @@ impl ArcadeBroadcaster {
         let started = worker::js_sys::Date::now();
         let key = self.corroborator_taal_key.clone();
         let host = self.corroborator_url.clone();
-        let res = corroborate_batch_with(efs, subject_txid, |tx_hex| {
+        let walk = corroborate_batch_with(efs, subject_txid, self.legs, |tx_hex| {
             let key = key.clone();
             let host = host.clone();
             async move { corroborate_tx_hex(key.as_deref(), host.as_deref(), &tx_hex).await }
         })
         .await;
+        let res = match walk {
+            LegWalk::Decided(res) => res,
+            // NL-6d: the window's budget is spent with ancestors left. The ladder reads this as inconclusive (no
+            // admit, no refusal); the route reads `corroboration_paused_at` first and defers the rest.
+            LegWalk::Paused { reached } => {
+                self.legs_paused.set(Some(reached));
+                gate_log(&format!(
+                    "[arcade] {subject_txid} corroboration paused at ancestor {reached} of {} (this invocation's \
+                     window: from {}, {} legs); the rest is deferred (NL-6d)",
+                    efs.len().saturating_sub(1),
+                    self.legs.from,
+                    self.legs.budget
+                ));
+                Err(format!(
+                    "corroboration of {subject_txid} paused at ancestor {reached} of {}: the rest of the walk is \
+                     deferred, not refused (NL-6d)",
+                    efs.len().saturating_sub(1)
+                ))
+            }
+        };
         self.corroborate_ms
             .set(self.corroborate_ms.get() + (worker::js_sys::Date::now() - started));
         res
@@ -3252,6 +3326,22 @@ mod tests {
     // `corroborate_tx_hex` into), so ordering + the strict "subject decides"
     // semantics are proven natively.
 
+    /// NL-6d: the walk with a window that covers every ancestor, answered as the corroboration's verdict.
+    async fn whole_batch<F, Fut>(efs: &[EfTx], subject: &str, submit_one: F) -> Result<ArcOutcome, String>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<ArcOutcome, String>>,
+    {
+        let window = LegWindow {
+            from: 0,
+            budget: usize::MAX,
+        };
+        match corroborate_batch_with(efs, subject, window, submit_one).await {
+            LegWalk::Decided(res) => res,
+            LegWalk::Paused { reached } => panic!("a whole window paused at {reached}"),
+        }
+    }
+
     /// A parent + subject EF batch (ancestry order, subject last). Subject EF
     /// bytes `[4,5]` (hex "0405"); parent `[1,2,3]` (hex "010203").
     fn parent_and_subject() -> (Vec<EfTx>, String) {
@@ -3282,7 +3372,7 @@ mod tests {
         let (efs, subject) = parent_and_subject();
         let subject_hex = hex::encode([4u8, 5]);
         let parent_seen = std::cell::Cell::new(false);
-        let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+        let out = whole_batch(&efs, &subject, |tx_hex| {
             let is_subject = tx_hex == subject_hex;
             if !is_subject {
                 parent_seen.set(true);
@@ -3316,7 +3406,7 @@ mod tests {
         // rejects the subject ⇒ Rejected, no matter how the parents fared.
         let (efs, subject) = parent_and_subject();
         let subject_hex = hex::encode([4u8, 5]);
-        let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+        let out = whole_batch(&efs, &subject, |tx_hex| {
             let is_subject = tx_hex == subject_hex;
             async move {
                 if is_subject {
@@ -3339,7 +3429,7 @@ mod tests {
         // healthy parent prime.
         let (efs, subject) = parent_and_subject();
         let subject_hex = hex::encode([4u8, 5]);
-        let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+        let out = whole_batch(&efs, &subject, |tx_hex| {
             let is_subject = tx_hex == subject_hex;
             async move {
                 if is_subject {
@@ -3364,7 +3454,7 @@ mod tests {
         let (efs, subject) = parent_and_subject();
         let subject_hex = hex::encode([4u8, 5]);
         for status in ["RECEIVED", "STORED", "ACCEPTED_BY_NETWORK", ""] {
-            let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+            let out = whole_batch(&efs, &subject, |tx_hex| {
                 let is_subject = tx_hex == subject_hex;
                 let status = status.to_string();
                 async move {
@@ -3395,7 +3485,7 @@ mod tests {
         // only primes the mempool. The subject's real SEEN still admits.
         let (efs, subject) = parent_and_subject();
         let subject_hex = hex::encode([4u8, 5]);
-        let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+        let out = whole_batch(&efs, &subject, |tx_hex| {
             let is_subject = tx_hex == subject_hex;
             async move {
                 if is_subject {
@@ -3433,7 +3523,7 @@ mod tests {
             }, // subject last
         ];
         let order = std::cell::RefCell::new(Vec::<String>::new());
-        let out = corroborate_batch_with(&efs, "subject", |tx_hex| {
+        let out = whole_batch(&efs, "subject", |tx_hex| {
             order.borrow_mut().push(tx_hex.clone());
             async move {
                 corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#)
@@ -3470,7 +3560,7 @@ mod tests {
         ];
         let order = std::cell::RefCell::new(Vec::<String>::new());
         let primed = std::cell::Cell::new(false);
-        let out = corroborate_batch_with(&efs, "subject", |tx_hex| {
+        let out = whole_batch(&efs, "subject", |tx_hex| {
             order.borrow_mut().push(tx_hex.clone());
             let is_subject = tx_hex == hex::encode([0xccu8]);
             if !is_subject {
@@ -3509,7 +3599,7 @@ mod tests {
             txid: "parent".into(),
             ef: vec![1, 2, 3],
         }];
-        let out = corroborate_batch_with(&efs, "subject", |_tx_hex| async {
+        let out = whole_batch(&efs, "subject", |_tx_hex| async {
             corroborator_verdict(200, r#"{"txStatus":"SEEN_ON_NETWORK"}"#)
         })
         .await;
@@ -3535,10 +3625,10 @@ mod tests {
         assert!(has_unproven_ancestry(9));
     }
 
-    // ── #267 hardening: the corroboration leg cap (work bound) ──────────────
+    // ── NL-6d: the legs read one at a time, the window routes, never refuses ─
 
     /// `count` parent legs + the subject leg, through the real batch producer.
-    fn capped_batch(count: usize) -> (Vec<EfTx>, String) {
+    fn chain_batch(count: usize) -> (Vec<EfTx>, String) {
         let mut efs: Vec<EfTx> = (0..count)
             .map(|i| EfTx {
                 txid: format!("p{i}"),
@@ -3552,50 +3642,116 @@ mod tests {
         (efs, "subject".to_string())
     }
 
-    #[tokio::test]
-    async fn batch_over_the_leg_cap_is_inconclusive_with_zero_submits() {
-        // One leg over the cap → inconclusive Err (→ 502, client fallback)
-        // BEFORE any submit: a truncated/partial corroboration must never
-        // exist, let alone admit. The routes.rs byte bound alone admits ~20k
-        // minimal legs — this is the serial-POST work bound.
-        let (efs, subject) = capped_batch(MAX_CORROBORATION_LEGS); // +subject ⇒ cap+1 legs
-        assert_eq!(efs.len(), MAX_CORROBORATION_LEGS + 1);
-        let submits = std::cell::Cell::new(0usize);
-        let out = corroborate_batch_with(&efs, &subject, |_tx_hex| {
-            submits.set(submits.get() + 1);
-            async { corroborator_verdict(200, r#"{"txid":"x","txStatus":"SEEN_ON_NETWORK"}"#) }
-        })
-        .await;
-        let err = out.expect_err("over-cap batch must be inconclusive, never corroborated");
-        assert!(err.contains("leg cap"), "{err}");
-        assert_eq!(
-            submits.get(),
-            0,
-            "zero submits over the cap — no partial corroboration"
-        );
-        // …and the #267 accept-claim fold on that Err refuses the admit.
-        assert!(corroborated_accept_claim(Err(err), &subject).is_err());
-    }
-
-    #[tokio::test]
-    async fn batch_at_the_leg_cap_still_corroborates_and_subject_decides() {
-        // Exactly at the cap the corroboration runs in full and the subject's
-        // verdict decides, as ever.
-        let (efs, subject) = capped_batch(MAX_CORROBORATION_LEGS - 1); // +subject ⇒ cap legs
-        assert_eq!(efs.len(), MAX_CORROBORATION_LEGS);
+    /// One invocation of the walk under `window` against a corroborator that answers the subject an orphan view
+    /// until every ancestor in `primed` (shared across invocations) was posted. Returns the walk and the posts.
+    async fn walk_once(
+        efs: &[EfTx],
+        subject: &str,
+        window: LegWindow,
+        primed: &std::cell::RefCell<std::collections::HashMap<String, usize>>,
+    ) -> (LegWalk, usize) {
         let subject_hex = hex::encode([0xffu8, 0xff, 0xff]);
-        let out = corroborate_batch_with(&efs, &subject, |tx_hex| {
+        let ancestors = efs.len() - 1;
+        let posts = std::cell::Cell::new(0usize);
+        let walk = corroborate_batch_with(efs, subject, window, |tx_hex| {
+            posts.set(posts.get() + 1);
             let is_subject = tx_hex == subject_hex;
+            if !is_subject {
+                *primed.borrow_mut().entry(tx_hex).or_default() += 1;
+            }
+            let all = primed.borrow().len() == ancestors;
             async move {
-                if is_subject {
-                    corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#)
+                if is_subject && !all {
+                    corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_IN_ORPHAN_MEMPOOL"}"#)
                 } else {
-                    corroborator_verdict(200, r#"{"txid":"p","txStatus":"SEEN_ON_NETWORK"}"#)
+                    corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#)
                 }
             }
         })
         .await;
-        assert_eq!(out.unwrap(), ArcOutcome::Accepted("subject".into()));
+        (walk, posts.get())
+    }
+
+    #[tokio::test]
+    async fn thirty_three_legs_are_read_whole_in_the_requests_window() {
+        // NL-6d: the batch the old leg cap refused (33 legs > 32: a 502 with zero submits) is read whole in the
+        // request's window, each ancestor once, and the subject decides.
+        let (efs, subject) = chain_batch(32);
+        assert_eq!(efs.len(), 33);
+        let primed = std::cell::RefCell::new(std::collections::HashMap::new());
+        let (walk, posts) = walk_once(&efs, &subject, LegWindow::in_request(), &primed).await;
+        assert_eq!(walk, LegWalk::Decided(Ok(ArcOutcome::Accepted("subject".into()))));
+        assert_eq!(posts, 1 + 32 + 1, "the subject first, each ancestor once, the subject last");
+        assert!(primed.borrow().values().all(|n| *n == 1));
+    }
+
+    #[tokio::test]
+    async fn a_thousand_legs_pause_at_each_window_and_resume_from_the_leg_reached() {
+        // NL-6d: 999 ancestors. The request reads its window and pauses; each run resumes from the cursor the last
+        // one reached and reads the run's window; the last run primes the rest and the subject decides. No ancestor
+        // is posted twice (no run starts over), none is skipped, and no invocation answers before every ancestor was
+        // read.
+        use crate::ef_deferred::{IN_REQUEST_CORROBORATION_LEGS, RUN_CORROBORATION_LEGS};
+        let (efs, subject) = chain_batch(999);
+        let primed = std::cell::RefCell::new(std::collections::HashMap::new());
+        let (walk, _) = walk_once(&efs, &subject, LegWindow::in_request(), &primed).await;
+        assert_eq!(walk, LegWalk::Paused { reached: IN_REQUEST_CORROBORATION_LEGS });
+        let mut cursor = IN_REQUEST_CORROBORATION_LEGS;
+        let mut runs = 0;
+        let verdict = loop {
+            runs += 1;
+            assert!(runs < 100, "the walk must finish");
+            let window = LegWindow {
+                from: cursor,
+                budget: RUN_CORROBORATION_LEGS,
+            };
+            match walk_once(&efs, &subject, window, &primed).await.0 {
+                LegWalk::Paused { reached } => {
+                    assert_eq!(reached, cursor + RUN_CORROBORATION_LEGS, "a run reads its whole window");
+                    cursor = reached;
+                }
+                LegWalk::Decided(v) => break v,
+            }
+        };
+        assert_eq!(verdict, Ok(ArcOutcome::Accepted("subject".into())));
+        assert_eq!(runs, (999 - IN_REQUEST_CORROBORATION_LEGS).div_ceil(RUN_CORROBORATION_LEGS));
+        let primed = primed.borrow();
+        assert_eq!(primed.len(), 999, "every ancestor read");
+        assert!(primed.values().all(|n| *n == 1), "no ancestor read twice");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_walk_skips_the_subject_first_attempt_and_a_paused_walk_never_decides() {
+        // NL-6d: a walk resumed past its first leg posts no subject-first attempt (the first invocation made it), and
+        // a walk that pauses never posts the subject's deciding attempt: a partial corroboration cannot admit.
+        let (efs, subject) = chain_batch(10);
+        let subject_hex = hex::encode([0xffu8, 0xff, 0xff]);
+        let order = std::cell::RefCell::new(Vec::<String>::new());
+        let walk = corroborate_batch_with(&efs, &subject, LegWindow { from: 4, budget: 3 }, |tx_hex| {
+            order.borrow_mut().push(tx_hex);
+            async { corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#) }
+        })
+        .await;
+        assert_eq!(walk, LegWalk::Paused { reached: 7 });
+        let order = order.borrow();
+        assert_eq!(*order, (4..7).map(|i| hex::encode(&efs[i].ef)).collect::<Vec<_>>());
+        assert!(!order.contains(&subject_hex));
+        // a zero budget still reads a leg, so a run always advances its cursor
+        let walk = corroborate_batch_with(&efs, &subject, LegWindow { from: 9, budget: 0 }, |_tx_hex| async {
+            corroborator_verdict(200, r#"{"txid":"subject","txStatus":"SEEN_ON_NETWORK"}"#)
+        })
+        .await;
+        assert_eq!(walk, LegWalk::Decided(Ok(ArcOutcome::Accepted("subject".into()))));
+    }
+
+    #[test]
+    fn no_count_refuses_a_corroboration() {
+        // NL-6d source pin: the leg cap and its refusal are gone from the producer.
+        let src = include_str!("broadcaster.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("the test module")];
+        assert!(!prod.contains(&["const MAX_CORROBORATION", "_LEGS"].concat()));
+        assert!(!prod.contains(&["corroboration leg", " cap:"].concat()));
+        assert!(!prod.contains(&["efs.len() > MAX_", "CORROBORATION"].concat()));
     }
 
     // ── #267: corroborate-on-accept — Arcade's ACCEPT is never authoritative
@@ -3675,7 +3831,7 @@ mod tests {
         let (efs, subject) = parent_and_subject();
         let subject_hex = hex::encode([4u8, 5]);
         for status in ["RECEIVED", "STORED", "ACCEPTED_BY_NETWORK", ""] {
-            let corroborated = corroborate_batch_with(&efs, &subject, |tx_hex| {
+            let corroborated = whole_batch(&efs, &subject, |tx_hex| {
                 let is_subject = tx_hex == subject_hex;
                 let status = status.to_string();
                 async move {
@@ -3708,7 +3864,7 @@ mod tests {
         // refused (Err → 502), never admitted.
         let (efs, subject) = parent_and_subject();
         let subject_hex = hex::encode([4u8, 5]);
-        let corroborated = corroborate_batch_with(&efs, &subject, |tx_hex| {
+        let corroborated = whole_batch(&efs, &subject, |tx_hex| {
             let is_subject = tx_hex == subject_hex;
             async move {
                 if is_subject {

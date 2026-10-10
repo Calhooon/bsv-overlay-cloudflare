@@ -33,6 +33,20 @@
 //!    dedupes a re-presented subject; every engine write is `INSERT OR
 //!    IGNORE` / `OR REPLACE`).
 //!
+//! 6. **The corroboration's legs** (NL-6d, bsv-stack-lean #60): the #267
+//!    ancestry-primed corroboration posts each ancestor to the corroborating
+//!    host, one at a time. The request reads at most
+//!    [`IN_REQUEST_CORROBORATION_LEGS`] of them; a walk with more left PAUSES
+//!    at the leg it reached and the request defers the job with that leg as
+//!    its cursor (`legs_from`); each run reads at most
+//!    [`RUN_CORROBORATION_LEGS`] from the cursor and, when legs are left,
+//!    records the leg it reached, answers nothing to the job's attempts and
+//!    hands the job straight back to the queue. A run that advanced never
+//!    counts toward [`JOB_ATTEMPTS`]; no run starts over. Until NL-6d a
+//!    corroboration of more than 32 legs was refused (`MAX_CORROBORATION_LEGS`,
+//!    502), and a deferred job answered that 502 on every run and ended
+//!    `failed`.
+//!
 //! **The ceiling this does not route past, named.** The request still reads
 //! its body whole (`req.bytes()`, `routes.rs`), and the arm converts it to EF
 //! before it knows the work's size; the consumer holds the bytes whole again
@@ -41,9 +55,12 @@
 //! and its copies; NL-6 saw `wrangler dev` reload its worker after a 12 MiB
 //! body) and the plan's request-body limit (100 MB on the Free and Pro
 //! plans). Past those the platform ends the request; no number of ours does.
-//! Resumption is at the job's grain, not inside a step: a step that cannot
-//! finish in one consumer invocation fails the same way on each of the
-//! [`JOB_ATTEMPTS`] runs and the job ends `failed` with its last answer.
+//! Resumption is at the job's grain, and inside the corroboration's walk at
+//! the leg's (NL-6d); any other step that cannot finish in one consumer
+//! invocation fails the same way on each of the [`JOB_ATTEMPTS`] runs and the
+//! job ends `failed` with its last answer. One leg is one POST: a single
+//! ancestor the corroborating host cannot answer within an invocation is the
+//! grain this does not divide.
 
 use serde::{Deserialize, Serialize};
 use worker::{Context, D1Database, Env, Response};
@@ -58,6 +75,17 @@ pub const IN_REQUEST_SUBJECT_EF_BYTES: usize = 256 * 1024;
 /// The request's budget for the whole EF batch (the async-REJECTED fallback
 /// re-submits every leg), bytes: past it the work is deferred.
 pub const IN_REQUEST_BATCH_EF_BYTES: usize = 2 * 1024 * 1024;
+
+/// NL-6d: the ancestors one request posts to the corroborating host at most
+/// (the #267 sizing of the request's serial work: ~32 POSTs, ~10 s). Past it
+/// the walk pauses and the job is deferred from the leg it reached; a routing
+/// number, never a refusal.
+pub const IN_REQUEST_CORROBORATION_LEGS: usize = 32;
+
+/// NL-6d: the ancestors one consumer run posts at most before it hands the job
+/// to the next run (each a POST of at most two hosts, well inside one
+/// invocation's 15-minute wall at a host's answer time).
+pub const RUN_CORROBORATION_LEGS: usize = 256;
 
 /// One chunk of bytes at rest in D1: half of D1's 2,000,000-byte bound on a
 /// row, so a chunk and its row's other columns always fit.
@@ -90,11 +118,31 @@ pub const BEEF_BLOBS_BINDING: &str = "BEEF_BLOBS";
 pub const R2_PREFIX: &str = "ef-deferred/";
 
 /// Where the arm runs: in the request, under the budget, or resumed by the
-/// consumer, which owes no request budget.
+/// consumer, which owes no request budget. NL-6d: a resumed run carries the
+/// corroboration's cursor, the ancestors earlier invocations primed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkBudget {
     InRequest,
-    Resumed,
+    Resumed { from_leg: usize },
+}
+
+impl WorkBudget {
+    /// PURE. NL-6d: the corroboration's ancestor window of this invocation.
+    pub fn legs(self) -> crate::broadcaster::LegWindow {
+        match self {
+            Self::InRequest => crate::broadcaster::LegWindow::in_request(),
+            Self::Resumed { from_leg } => crate::broadcaster::LegWindow {
+                from: from_leg,
+                budget: RUN_CORROBORATION_LEGS,
+            },
+        }
+    }
+
+    /// PURE. NL-6d: a run that resumes a walk past its first leg (an earlier
+    /// invocation already presented the work).
+    pub fn resumed_mid_walk(self) -> bool {
+        matches!(self, Self::Resumed { from_leg } if from_leg > 0)
+    }
 }
 
 /// The EF work of one gated submission, by its two numbers.
@@ -103,6 +151,8 @@ pub enum WorkBudget {
 pub struct EfWork {
     pub subject_ef_bytes: usize,
     pub batch_ef_bytes: usize,
+    /// NL-6d: the EF legs (the subject and its unproven ancestors).
+    pub legs: usize,
 }
 
 impl EfWork {
@@ -115,6 +165,7 @@ impl EfWork {
                 .find(|e| e.txid == subject_txid)
                 .map_or(0, |e| e.ef.len()),
             batch_ef_bytes: efs.iter().map(|e| e.ef.len()).sum(),
+            legs: efs.len(),
         }
     }
 
@@ -182,8 +233,14 @@ pub fn job_open(state: &str, updated_at: i64, now: i64) -> bool {
     matches!(state, "queued" | "running") && now - updated_at < JOB_RESUME_AFTER_MS
 }
 
-/// PURE. The 202's body.
-pub fn deferral_body(reference: &str, subject_txid: &str, work: EfWork) -> serde_json::Value {
+/// PURE. The 202's body. `legs_from`: the corroboration's ancestors the
+/// request already primed (NL-6d; 0 when the request deferred for its bytes).
+pub fn deferral_body(
+    reference: &str,
+    subject_txid: &str,
+    work: EfWork,
+    legs_from: usize,
+) -> serde_json::Value {
     serde_json::json!({
         "status": "accepted",
         "accepted": true,
@@ -192,13 +249,37 @@ pub fn deferral_body(reference: &str, subject_txid: &str, work: EfWork) -> serde
         "poll": format!("{POLL_PREFIX}{reference}"),
         "subjectTxid": subject_txid,
         "work": work,
+        "legsFrom": legs_from,
         "budget": {
             "subjectEfBytes": IN_REQUEST_SUBJECT_EF_BYTES,
             "batchEfBytes": IN_REQUEST_BATCH_EF_BYTES,
+            "corroborationLegs": IN_REQUEST_CORROBORATION_LEGS,
         },
-        "message": "the EF work of this submission is past one request's budget: its bytes are at rest and the \
+        "message": "the work of this submission is past one request's budget: its bytes are at rest and the \
                     overlay finishes the broadcast-gated work on its queue; poll the reference for the answer",
     })
+}
+
+/// PURE. NL-6d: a resumed run's answer when its corroboration paused with
+/// legs left: `resumeAt` is the cursor the next run starts from.
+pub fn paused_body(reached: usize, work: EfWork) -> serde_json::Value {
+    serde_json::json!({
+        "status": "accepted",
+        "accepted": true,
+        "deferred": true,
+        "resumeAt": reached,
+        "work": work,
+        "message": "the corroboration's walk reached the end of this run's window; the next run resumes it",
+    })
+}
+
+/// PURE. NL-6d: the cursor a run's answer hands the next run, if it paused.
+pub fn resume_point(status: u16, body: &str) -> Option<usize> {
+    if status != 202 {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("resumeAt")?.as_u64().map(|n| n as usize)
 }
 
 /// PURE. The poll's reference from its path, 64 lowercase hex or nothing.
@@ -244,19 +325,23 @@ pub const CHUNKS_CREATE: &str = "CREATE TABLE IF NOT EXISTS ef_deferred_chunks (
         PRIMARY KEY (reference, idx)
     )";
 
+/// NL-6d: the corroboration's cursor, the ancestors earlier invocations primed.
+pub const JOBS_ADD_LEGS_FROM: &str =
+    "ALTER TABLE ef_deferred_jobs ADD COLUMN legs_from INTEGER NOT NULL DEFAULT 0";
+
 const JOB_READ_SQL: &str = "SELECT reference, subject_txid, topics, submit_mode, has_off_chain, beef_len, bytes, \
-     at_rest, chunks, subject_ef_bytes, batch_ef_bytes, state, attempts, status, answer, created_at, updated_at \
-     FROM ef_deferred_jobs WHERE reference = ?1";
+     at_rest, chunks, subject_ef_bytes, batch_ef_bytes, state, attempts, status, answer, created_at, updated_at, \
+     legs_from FROM ef_deferred_jobs WHERE reference = ?1";
 
 /// A new or re-presented job: queued, its attempts and answer cleared.
 const JOB_UPSERT_SQL: &str = "INSERT INTO ef_deferred_jobs (reference, subject_txid, topics, submit_mode, \
      has_off_chain, beef_len, bytes, at_rest, chunks, subject_ef_bytes, batch_ef_bytes, state, attempts, status, \
-     answer, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', 0, NULL, NULL, \
-     ?12, ?12) ON CONFLICT(reference) DO UPDATE SET subject_txid = excluded.subject_txid, topics = excluded.topics, \
+     answer, created_at, updated_at, legs_from) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', 0, NULL, \
+     NULL, ?12, ?12, ?13) ON CONFLICT(reference) DO UPDATE SET subject_txid = excluded.subject_txid, topics = excluded.topics, \
      submit_mode = excluded.submit_mode, has_off_chain = excluded.has_off_chain, beef_len = excluded.beef_len, \
      bytes = excluded.bytes, at_rest = excluded.at_rest, chunks = excluded.chunks, \
      subject_ef_bytes = excluded.subject_ef_bytes, batch_ef_bytes = excluded.batch_ef_bytes, state = 'queued', \
-     attempts = 0, status = NULL, answer = NULL, updated_at = excluded.updated_at";
+     attempts = 0, status = NULL, answer = NULL, updated_at = excluded.updated_at, legs_from = excluded.legs_from";
 
 /// The consumer takes a run: `running`, one more attempt.
 const JOB_TAKE_SQL: &str =
@@ -267,6 +352,13 @@ const JOB_TAKE_SQL: &str =
 const JOB_SETTLE_SQL: &str =
     "UPDATE ef_deferred_jobs SET state = ?2, status = ?3, answer = ?4, updated_at = ?5 \
      WHERE reference = ?1";
+
+/// NL-6d: a run whose corroboration advanced: queued again from the leg it
+/// reached, its attempts cleared (a run that advanced is no failed run). Only
+/// forward: a cursor never moves back.
+const JOB_ADVANCE_SQL: &str =
+    "UPDATE ef_deferred_jobs SET state = 'queued', legs_from = ?2, attempts = 0, status = ?3, answer = ?4, \
+     updated_at = ?5 WHERE reference = ?1 AND legs_from < ?2";
 
 /// The cron hands a quiet open job to the queue again and marks the hand-off:
 /// `queued` (a `running` row this quiet is a run that ended without settling),
@@ -312,6 +404,9 @@ pub struct Job {
     pub answer: Option<String>,
     pub created_at: f64,
     pub updated_at: f64,
+    /// NL-6d: the corroboration's cursor.
+    #[serde(default)]
+    pub legs_from: f64,
 }
 
 impl Job {
@@ -335,6 +430,7 @@ impl Job {
             },
             "attempts": self.attempts as i64,
             "maxAttempts": JOB_ATTEMPTS,
+            "legsFrom": self.legs_from as i64,
             "createdAt": self.created_at as i64,
             "updatedAt": self.updated_at as i64,
             "answer": answer,
@@ -373,15 +469,17 @@ pub async fn defer(
     submit_mode: &str,
     subject_txid: &str,
     work: EfWork,
+    legs_from: usize,
 ) -> worker::Result<Response> {
-    match put_at_rest(env, tagged, submit_mode, subject_txid, work).await {
+    match put_at_rest(env, tagged, submit_mode, subject_txid, work, legs_from).await {
         Ok(reference) => {
             worker::console_log!(
-                "POST /submit(broadcast-gated) -> 202 (NL-6c: EF work {} B subject / {} B batch past the request's budget {IN_REQUEST_SUBJECT_EF_BYTES} / {IN_REQUEST_BATCH_EF_BYTES}; deferred as {reference})",
+                "POST /submit(broadcast-gated) -> 202 (NL-6c/NL-6d: EF work {} B subject / {} B batch, {} legs, {legs_from} primed; past the request's budget {IN_REQUEST_SUBJECT_EF_BYTES} / {IN_REQUEST_BATCH_EF_BYTES} B, {IN_REQUEST_CORROBORATION_LEGS} legs; deferred as {reference})",
                 work.subject_ef_bytes,
-                work.batch_ef_bytes
+                work.batch_ef_bytes,
+                work.legs
             );
-            let mut resp = json_answer(&deferral_body(&reference, subject_txid, work), 202)?;
+            let mut resp = json_answer(&deferral_body(&reference, subject_txid, work, legs_from), 202)?;
             let _ = resp
                 .headers_mut()
                 .set("Location", &format!("{POLL_PREFIX}{reference}"));
@@ -411,6 +509,7 @@ async fn put_at_rest(
     submit_mode: &str,
     subject_txid: &str,
     work: EfWork,
+    legs_from: usize,
 ) -> Result<String, String> {
     let db = env
         .d1("OVERLAY_DB")
@@ -478,6 +577,7 @@ async fn put_at_rest(
         .bind(work.subject_ef_bytes as i64)
         .bind(work.batch_ef_bytes as i64)
         .bind(now)
+        .bind(legs_from as i64)
         .execute(&db)
         .await?;
     if let Err(e) = send_job(env, &reference).await {
@@ -486,6 +586,25 @@ async fn put_at_rest(
         );
     }
     Ok(reference)
+}
+
+/// NL-6d: the arm's corroboration paused with `reached` ancestors primed and
+/// legs left. In the request: the job is deferred from that leg (the 202 of
+/// [`defer`]). In a run: answered 202 with `resumeAt`, which [`run_job`] turns
+/// into the job's cursor and the next run.
+pub async fn pause(
+    env: &Env,
+    tagged: &overlay_engine::types::TaggedBEEF,
+    submit_mode: &str,
+    subject_txid: &str,
+    work: EfWork,
+    budget: WorkBudget,
+    reached: usize,
+) -> worker::Result<Response> {
+    match budget {
+        WorkBudget::InRequest => defer(env, tagged, submit_mode, subject_txid, work, reached).await,
+        WorkBudget::Resumed { .. } => json_answer(&paused_body(reached, work), 202),
+    }
 }
 
 async fn send_job(env: &Env, reference: &str) -> Result<(), String> {
@@ -718,6 +837,7 @@ pub async fn run_job(
     let hosting_url = env.var("HOSTING_URL").ok().map(|v| v.to_string());
     let arcade_url = env.var("ARCADE_URL").ok().map(|v| v.to_string());
     let taal_api_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
+    let from_leg = job.legs_from.max(0.0) as usize;
     let (status, text) = match crate::routes::submit_resumed(
         engine,
         parts,
@@ -726,6 +846,7 @@ pub async fn run_job(
         taal_api_key,
         ctx,
         env,
+        from_leg,
     )
     .await
     {
@@ -739,7 +860,43 @@ pub async fn run_job(
                 .to_string(),
         ),
     };
-    match settle(status) {
+    // NL-6d: the corroboration's walk advanced and has legs left: the cursor
+    // moves forward, the run is no failed attempt, and the job goes straight
+    // back to the queue (the cron hands it back if that send faults).
+    if let Some(reached) = resume_point(status, &text) {
+        if reached > from_leg {
+            worker::console_log!(
+                "NL-6d: job {reference} read the corroboration's legs {from_leg} to {reached}; the next run resumes at {reached}"
+            );
+            if let Err(e) = Query::new(JOB_ADVANCE_SQL)
+                .bind(reference)
+                .bind(reached as i64)
+                .bind(status as i64)
+                .bind(text.as_str())
+                .bind(now_ms())
+                .execute(&db)
+                .await
+            {
+                worker::console_log!(
+                    "NL-6d: job {reference} could not record its cursor {reached} ({e}); the cron hands it back"
+                );
+                return;
+            }
+            if let Err(e) = send_job(env, reference).await {
+                worker::console_log!(
+                    "NL-6d: job {reference} is at leg {reached} but not queued ({e}); the cron hands it back"
+                );
+            }
+            return;
+        }
+    }
+    // a paused answer that did not advance is no verdict: the job is queued again
+    let settled = if resume_point(status, &text).is_some() {
+        Settle::Again
+    } else {
+        settle(status)
+    };
+    match settled {
         Settle::Done => {
             worker::console_log!(
                 "NL-6c: job {reference} done ({status}) for {}",
@@ -847,7 +1004,8 @@ mod tests {
             mined,
             EfWork {
                 subject_ef_bytes: 0,
-                batch_ef_bytes: 0
+                batch_ef_bytes: 0,
+                legs: 0,
             }
         );
         assert!(mined.fits_request());
@@ -944,9 +1102,13 @@ mod tests {
         let work = EfWork {
             subject_ef_bytes: 300_087,
             batch_ef_bytes: 300_087,
+            legs: 1_000,
         };
         let r = "ab".repeat(32);
-        let body = deferral_body(&r, "subj", work);
+        let body = deferral_body(&r, "subj", work, 32);
+        assert_eq!(body["legsFrom"], 32);
+        assert_eq!(body["work"]["legs"], 1_000);
+        assert_eq!(body["budget"]["corroborationLegs"], IN_REQUEST_CORROBORATION_LEGS);
         assert_eq!(body["accepted"], true);
         assert_eq!(body["deferred"], true);
         assert_eq!(body["reference"], r);
@@ -982,7 +1144,9 @@ mod tests {
             answer: None,
             created_at: 1.0,
             updated_at: 1.0,
+            legs_from: 288.0,
         };
+        assert_eq!(job.poll_body()["legsFrom"], 288);
         assert!(job.poll_body()["answer"].is_null());
         job.state = "done".into();
         job.status = Some(200.0);
@@ -998,13 +1162,99 @@ mod tests {
         assert_eq!(job.poll_body()["answer"]["body"], "not json");
     }
 
+    #[test]
+    fn a_run_carries_the_corroborations_cursor_and_a_paused_answer_names_the_next() {
+        // NL-6d: the request's window starts at the first ancestor; a run's starts at the job's cursor.
+        let r = WorkBudget::InRequest.legs();
+        assert_eq!((r.from, r.budget), (0, IN_REQUEST_CORROBORATION_LEGS));
+        let run = WorkBudget::Resumed { from_leg: 288 }.legs();
+        assert_eq!((run.from, run.budget), (288, RUN_CORROBORATION_LEGS));
+        assert!(!WorkBudget::InRequest.resumed_mid_walk());
+        assert!(!WorkBudget::Resumed { from_leg: 0 }.resumed_mid_walk());
+        assert!(WorkBudget::Resumed { from_leg: 1 }.resumed_mid_walk());
+        // the paused answer round-trips its cursor, and only a 202 carries one
+        let work = EfWork {
+            subject_ef_bytes: 147,
+            batch_ef_bytes: 60_000,
+            legs: 1_000,
+        };
+        let body = paused_body(544, work).to_string();
+        assert_eq!(resume_point(202, &body), Some(544));
+        assert_eq!(resume_point(200, &body), None);
+        assert_eq!(resume_point(202, "{\"status\":\"accepted\"}"), None);
+        assert_eq!(resume_point(202, "not json"), None);
+        for word in ["cap", "too large", "429", "413", "502"] {
+            assert!(!body.contains(word), "the paused answer carries no refusal word: {word}");
+        }
+    }
+
+    /// NL-6d on real SQLite: a run that advanced moves the cursor forward and clears its attempts; a stale cursor
+    /// never moves it back; a re-presented job starts from the cursor its request reached.
+    #[test]
+    fn the_cursor_moves_forward_only_and_an_advancing_run_is_no_failed_attempt() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!("{JOBS_CREATE}; {JOBS_INDEX}; {JOBS_ADD_LEGS_FROM};"))
+            .unwrap();
+        conn.execute(
+            JOB_UPSERT_SQL,
+            rusqlite::params!["r1", "subj", "[]", "broadcast-gated", 0, 10, 10, "d1", 1, 147, 60_000, 1, 32],
+        )
+        .unwrap();
+        let read = || -> (String, i64, i64) {
+            conn.query_row(
+                "SELECT state, attempts, legs_from FROM ef_deferred_jobs WHERE reference = 'r1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(read(), ("queued".into(), 0, 32), "the request's cursor");
+        conn.execute(JOB_TAKE_SQL, rusqlite::params!["r1", 2]).unwrap();
+        assert_eq!(read(), ("running".into(), 1, 32));
+        conn.execute(JOB_ADVANCE_SQL, rusqlite::params!["r1", 288, 202, "{}", 3])
+            .unwrap();
+        assert_eq!(read(), ("queued".into(), 0, 288), "advanced: queued, no attempt spent");
+        conn.execute(JOB_ADVANCE_SQL, rusqlite::params!["r1", 100, 202, "{}", 4])
+            .unwrap();
+        assert_eq!(read(), ("queued".into(), 0, 288), "never back");
+        let got: Job = {
+            let mut st = conn.prepare(JOB_READ_SQL).unwrap();
+            st.query_row(rusqlite::params!["r1"], |r| {
+                Ok(Job {
+                    reference: r.get(0)?,
+                    subject_txid: r.get(1)?,
+                    topics: r.get(2)?,
+                    submit_mode: r.get(3)?,
+                    has_off_chain: r.get::<_, i64>(4)? as f64,
+                    beef_len: r.get::<_, i64>(5)? as f64,
+                    bytes: r.get::<_, i64>(6)? as f64,
+                    at_rest: r.get(7)?,
+                    chunks: r.get::<_, i64>(8)? as f64,
+                    subject_ef_bytes: r.get::<_, i64>(9)? as f64,
+                    batch_ef_bytes: r.get::<_, i64>(10)? as f64,
+                    state: r.get(11)?,
+                    attempts: r.get::<_, i64>(12)? as f64,
+                    status: r.get::<_, Option<i64>>(13)?.map(|v| v as f64),
+                    answer: r.get(14)?,
+                    created_at: r.get::<_, i64>(15)? as f64,
+                    updated_at: r.get::<_, i64>(16)? as f64,
+                    legs_from: r.get::<_, i64>(17)? as f64,
+                })
+            })
+            .unwrap()
+        };
+        assert_eq!(got.legs_from, 288.0, "the read names the cursor");
+    }
+
     /// The statements run on real SQLite: the tables, the upsert's
     /// re-presentation, the take, the settle and the chunks' hex read.
     #[test]
     fn the_statements_run_on_sqlite() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(&format!("{JOBS_CREATE}; {JOBS_INDEX}; {CHUNKS_CREATE};"))
-            .unwrap();
+        conn.execute_batch(&format!(
+            "{JOBS_CREATE}; {JOBS_INDEX}; {CHUNKS_CREATE}; {JOBS_ADD_LEGS_FROM};"
+        ))
+        .unwrap();
         let up = |now: i64| {
             conn.execute(
                 JOB_UPSERT_SQL,
@@ -1020,7 +1270,8 @@ mod tests {
                     1,
                     300_087,
                     300_087,
-                    now
+                    now,
+                    0
                 ],
             )
             .unwrap();

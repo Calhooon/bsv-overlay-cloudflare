@@ -714,6 +714,9 @@ pub(crate) struct SubmitParts {
 /// the same arm as the request's, under [`crate::ef_deferred::WorkBudget::Resumed`]
 /// (no request budget is owed), and the same notes shipped on the way out as
 /// [`submit`] ships them.
+/// NL-6d: `from_leg`, the job's corroboration cursor (the ancestors earlier
+/// invocations primed).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn submit_resumed(
     engine: &Engine,
     parts: SubmitParts,
@@ -722,6 +725,7 @@ pub(crate) async fn submit_resumed(
     taal_api_key: Option<String>,
     ctx: &Context,
     env: &Env,
+    from_leg: usize,
 ) -> worker::Result<Response> {
     let out = submit_parts(
         engine,
@@ -731,7 +735,7 @@ pub(crate) async fn submit_resumed(
         taal_api_key,
         ctx,
         env,
-        crate::ef_deferred::WorkBudget::Resumed,
+        crate::ef_deferred::WorkBudget::Resumed { from_leg },
     )
     .await;
     crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));
@@ -1108,6 +1112,7 @@ async fn submit_parts(
                 mode_header.as_deref().unwrap_or_default(),
                 &subject_txid,
                 work,
+                0,
             )
             .await;
         }
@@ -1259,7 +1264,10 @@ async fn submit_parts(
                 .with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|s| s.to_string()))
                 // NL-6d: `CORROBORATOR_URL` routes both corroborating hosts to one base (the route tier's local
                 // fixture); unset in production.
-                .with_corroborator_url(env.var("CORROBORATOR_URL").ok().map(|v| v.to_string()));
+                .with_corroborator_url(env.var("CORROBORATOR_URL").ok().map(|v| v.to_string()))
+                // NL-6d: the #267 corroboration reads its ancestors one at a time within this invocation's window
+                // (the request's, or a run's from the job's cursor) and pauses past it; never a count refusal.
+                .with_leg_window(budget.legs());
         if let Some(h) = hosting_url {
             arcade = arcade.with_callback(format!("{}/arc-ingest", h.trim_end_matches('/')));
         }
@@ -1309,6 +1317,9 @@ async fn submit_parts(
                 .ok()
                 .map(|v| v.to_string())
                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
+            // NL-6d: a run that resumes a corroboration mid-walk does not push the legs again (the invocation
+            // that first presented the work did).
+            let dual_on = dual_on && !budget.resumed_mid_walk();
             if let (true, false, Ok(dual_db)) =
                 (dual_on, dual_legs.is_empty(), env.d1("OVERLAY_DB"))
             {
@@ -1359,6 +1370,21 @@ async fn submit_parts(
                 }
             })
             .await;
+        // NL-6d: the corroboration's walk paused with ancestors left (the ladder read it as inconclusive): never a
+        // 502 for a count. In the request the job is deferred from the leg reached (202 and a reference); in a run
+        // the answer names the next run's cursor.
+        if let Some(reached) = arcade.corroboration_paused_at() {
+            return crate::ef_deferred::pause(
+                env,
+                &tagged_beef,
+                mode_header.as_deref().unwrap_or_default(),
+                &subject_txid,
+                work,
+                budget,
+                reached,
+            )
+            .await;
+        }
         // #519: the terminal judgement, counted for the operator (which arm fired), its wall-clock its own segment
         let terminal_ms = arcade.terminal_ms();
         if let Some(judgement) = arcade.terminal_judgement() {

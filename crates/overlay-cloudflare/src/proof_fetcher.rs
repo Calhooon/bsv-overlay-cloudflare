@@ -3312,9 +3312,11 @@ pub const REBROADCAST_MIN_AGE_SECS: u64 = 5 * 60;
 /// truly dead.
 pub const REBROADCAST_MAX_CANDIDATE_AGE_SECS: u64 = 14 * 24 * 3600;
 
-/// Per-candidate EF-leg cap for the ancestry-first rebroadcast — mirrors the
-/// corroboration leg cap's rationale (bound serial POST work; real LOW
-/// ancestry runs ~8 unproven legs). Over the cap the candidate is SKIPPED
+/// Per-candidate EF-leg cap for the ancestry-first rebroadcast, sized as the
+/// #267 corroboration's leg cap was (bound serial POST work; real LOW
+/// ancestry runs ~8 unproven legs). That cap is a routing window since NL-6d
+/// (the rest of the walk deferred, never refused); this one is left as found,
+/// a count bound of its own under the posture. Over the cap the candidate is SKIPPED
 /// (counted, retried on a later tick when its ancestry may have compacted),
 /// never partially rebroadcast out of order.
 pub const REBROADCAST_MAX_LEGS: usize = 32;
