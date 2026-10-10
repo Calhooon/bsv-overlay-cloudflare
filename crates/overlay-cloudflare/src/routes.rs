@@ -1256,7 +1256,10 @@ async fn submit_parts(
                 // the pending watch below (nothing polled on the wire).
                 .with_fast_answer(admit_fast)
                 // #519: the terminal judgement's WoC read carries the same key the evidence check reads
-                .with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|s| s.to_string()));
+                .with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|s| s.to_string()))
+                // NL-6d: `CORROBORATOR_URL` routes both corroborating hosts to one base (the route tier's local
+                // fixture); unset in production.
+                .with_corroborator_url(env.var("CORROBORATOR_URL").ok().map(|v| v.to_string()));
         if let Some(h) = hosting_url {
             arcade = arcade.with_callback(format!("{}/arc-ingest", h.trim_end_matches('/')));
         }
@@ -1310,6 +1313,7 @@ async fn submit_parts(
                 (dual_on, dual_legs.is_empty(), env.d1("OVERLAY_DB"))
             {
                 let dual_key = taal_api_key.clone();
+                let dual_host = env.var("CORROBORATOR_URL").ok().map(|v| v.to_string()).filter(|u| !u.trim().is_empty());
                 let dual_txid = subject_txid.clone();
                 let dual_env = env.clone();
                 ctx.wait_until(async move {
@@ -1317,7 +1321,7 @@ async fn submit_parts(
                         Err("subject leg never pushed".to_string());
                     for (leg_txid, hex_body) in &dual_legs {
                         let res =
-                            crate::broadcaster::corroborate_tx_hex(dual_key.as_deref(), hex_body).await;
+                            crate::broadcaster::corroborate_tx_hex(dual_key.as_deref(), dual_host.as_deref(), hex_body).await;
                         if *leg_txid == dual_txid {
                             subject_outcome = res;
                         }
