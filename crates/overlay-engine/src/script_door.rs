@@ -1065,7 +1065,7 @@ mod tests {
             for _ in 0..(seed >> 58) as usize {
                 seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 // mostly pushes, sometimes an opcode past OP_16
-                let byte = if seed % 7 == 0 {
+                let byte = if seed.is_multiple_of(7) {
                     (seed >> 40) as u8
                 } else {
                     ((seed >> 40) % 0x61) as u8

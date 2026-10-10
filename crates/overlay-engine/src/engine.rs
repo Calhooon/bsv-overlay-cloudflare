@@ -1482,6 +1482,7 @@ impl Engine {
     /// DRY RUN first, and for real only once its topic is not blocked: a
     /// link blocked below is judged twice and admitted once. Boxed: the
     /// landing is a submit of its own.
+    #[allow(clippy::too_many_arguments)]
     fn submit_counted<'a>(
         &'a self,
         tagged_beef: &'a TaggedBEEF,
@@ -1507,6 +1508,7 @@ impl Engine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn submit_counted_inner(
         &self,
         tagged_beef: &TaggedBEEF,
