@@ -1036,9 +1036,10 @@ mod tests {
         assert!(ready.len() > FIVE_MB, "{} bytes", ready.len());
         assert_eq!(census_verdict(&ready), CensusVerdict::GatedReady);
 
-        // Would-fail, by the gated arm's own reason: the SUBJECT is the 5 MB
-        // transaction, and the arm answers 429 at its EF work bound before
-        // any broadcast.
+        // The SUBJECT is the 5 MB transaction: until NL-6c the arm answered
+        // 429 at its EF work bound before any broadcast (would-fail); it now
+        // defers that work to its queue and refuses nothing for it, so the
+        // census reads it gated-ready, classified all the same.
         let parent = proven(funding(&[(5_000, vec![0x51])]));
         let mut subject = spending(&parent, 0);
         subject.add_output(out(4_000, &[0x51])).unwrap();
@@ -1048,10 +1049,7 @@ mod tests {
         beef.merge_transaction(subject);
         let heavy_subject = beef.to_binary();
         assert!(heavy_subject.len() > FIVE_MB);
-        assert_eq!(
-            census_verdict(&heavy_subject),
-            CensusVerdict::WouldHaveFailed(WouldFailWhy::EfOverCap)
-        );
+        assert_eq!(census_verdict(&heavy_subject), CensusVerdict::GatedReady);
 
         // The third state, by its own reason and not by size: the 5 MB ready
         // body with a second, unrelated tip. Which tip the route would
@@ -1132,8 +1130,10 @@ mod tests {
         let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
         for case in fixture["cases"].as_array().unwrap() {
             let body = hex::decode(case["beefHex"].as_str().unwrap()).unwrap();
-            // A case the gated arm's parser refuses never reaches the check.
-            if Beef::from_binary(&body).is_ok() {
+            // A case the gated arm's parser refuses never reaches the check
+            // (the streaming door: since bsv-rs 0.4.2 it refuses a transaction
+            // with no input, which the SDK's `from_binary` still builds).
+            if beef_limits::parse_beef(&body, &beef_limits::EF_BEEF_LIMITS).is_ok() {
                 bodies.push(body);
             }
         }

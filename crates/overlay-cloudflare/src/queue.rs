@@ -1035,10 +1035,11 @@ mod tests {
         assert_eq!(
             h.matches("acked_objects.extend(body.r2.as_ref().map(|r| r.key.clone()));")
                 .count()
-                + 1,
+                + 2,
             h.matches("msg.ack();").count(),
-            "every ack deletes its object, but the one of a message whose object was MISSING (the d3 fold); the Landed \
-             one unless a failed topic leaves it for a twin (the d3 fold-2, L1)"
+            "every ack deletes its object, but the one of a message whose object was MISSING (the d3 fold) and a \
+             deferred EF job's (NL-6c: its message names a job, never an object); the Landed one unless a failed \
+             topic leaves it for a twin (the d3 fold-2, L1)"
         );
         let (last_ack, delete) = (
             h.rfind("msg.ack();").unwrap(),
