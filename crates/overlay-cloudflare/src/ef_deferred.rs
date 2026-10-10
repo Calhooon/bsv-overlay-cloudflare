@@ -754,7 +754,7 @@ async fn settle_job(db: &D1Database, reference: &str, state: &str, status: u16, 
 /// the run did.
 ///
 /// **The bound when a run never returns** (N4, LOW's E585 land2 lens,
-/// `docs/audit/E585-land2-lens-2026-10-10.md`). A run that kills the isolate
+/// bsv-low's `docs/audit/E585-land2-lens-2026-10-10.md`). A run that kills the isolate
 /// (the very work deferred: its memory, its CPU) never reaches the ack, so
 /// the platform redelivers the message (the mutation queue's `max_retries` =
 /// 3, no `retry_delay`, `wrangler.toml`). A redelivery that finds the row
@@ -1405,7 +1405,7 @@ mod tests {
         assert_eq!(swept, None, "a queued job is never swept");
     }
 
-    /// N3 (LOW's E585 land2 lens, `docs/audit/E585-land2-lens-2026-10-10.md`): the sweep selects the settled
+    /// N3 (LOW's E585 land2 lens, bsv-low's `docs/audit/E585-land2-lens-2026-10-10.md`): the sweep selects the settled
     /// jobs, then deletes them one by one. A re-presentation of the same submission landing between the two
     /// re-puts the bytes and upserts the row to `queued`; the delete, bound as the sweep binds it, must leave
     /// that row (and so its bytes) alone and hand back no `at_rest` to release.

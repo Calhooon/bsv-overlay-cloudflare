@@ -43,7 +43,7 @@ worker = { version = "0.8", features = ["d1"] }
 # Exactly 0.5.0 (align-engine-050, 2026-10-10): `bsv-middleware-core` 0.2.0 and bsv-rs 0.4, one SDK in the lock. 0.5.0
 # moves the payment verdict (`PaymentVerifyError::Unverifiable { reason }`; `BadTransaction`, `MissingOutput`,
 # `BadBeef` gone); none of the auth, session-lane or signing items this crate calls moved, and it compiled unchanged.
-bsv-middleware-cloudflare = "=0.5.0"
+bsv-middleware-cloudflare = "=0.5.1"
 serde.workspace = true
 # bsv-low #532: `raw_value` so the identity views pass the resolver's JSON through byte for byte.
 serde_json = { workspace = true, features = ["raw_value"] }
