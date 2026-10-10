@@ -374,7 +374,12 @@ const JOBS_EXPIRED_SQL: &str =
     "SELECT reference, at_rest FROM ef_deferred_jobs WHERE state IN ('done', 'failed') \
      AND updated_at < ?1 ORDER BY updated_at LIMIT 50";
 
-const JOB_DELETE_SQL: &str = "DELETE FROM ef_deferred_jobs WHERE reference = ?1";
+/// The sweep's delete of one settled job, conditional (N3, LOW's E585 land2 lens): a re-presentation that
+/// landed between the sweep's select and this delete upserted the row to `queued` and re-put the bytes, so the
+/// row is deleted only while it is still settled and past the cutoff, and its bytes are released only when a
+/// row came back.
+const JOB_DELETE_SQL: &str = "DELETE FROM ef_deferred_jobs WHERE reference = ?1 \
+     AND state IN ('done', 'failed') AND updated_at < ?2 RETURNING at_rest";
 
 const CHUNK_INSERT_SQL: &str =
     "INSERT OR REPLACE INTO ef_deferred_chunks (reference, idx, bytes) VALUES (?1, ?2, ?3)";
@@ -929,7 +934,6 @@ pub async fn redrive(env: &Env, db: &D1Database) {
     #[derive(Deserialize)]
     struct Expired {
         reference: String,
-        at_rest: String,
     }
     let now = now_ms();
     match Query::new(JOBS_QUIET_SQL)
@@ -963,12 +967,28 @@ pub async fn redrive(env: &Env, db: &D1Database) {
         .await
     {
         Ok(rows) => {
+            #[derive(Deserialize)]
+            struct Deleted {
+                at_rest: String,
+            }
             for r in rows {
-                release(env, db, &r.reference, &r.at_rest).await;
-                let _ = Query::new(JOB_DELETE_SQL)
+                // N3: the row first, conditionally; the bytes only for a row that came back
+                match Query::new(JOB_DELETE_SQL)
                     .bind(r.reference.as_str())
-                    .execute(db)
-                    .await;
+                    .bind(now - JOB_KEEP_MS)
+                    .fetch_optional::<Deleted>(db)
+                    .await
+                {
+                    Ok(Some(d)) => release(env, db, &r.reference, &d.at_rest).await,
+                    Ok(None) => worker::console_log!(
+                        "Scheduled: NL-6c job {} was re-presented after the sweep's read; kept with its bytes",
+                        r.reference
+                    ),
+                    Err(e) => worker::console_log!(
+                        "Scheduled: NL-6c settled job {} not swept ({e}); the next pass tries",
+                        r.reference
+                    ),
+                }
             }
         }
         Err(e) => worker::console_log!("Scheduled: NL-6c settled jobs unreadable: {e}"),
@@ -1354,7 +1374,106 @@ mod tests {
         assert_eq!(quiet, vec!["r1".to_string()]);
         conn.execute(CHUNKS_DELETE_SQL, rusqlite::params!["r1"])
             .unwrap();
-        conn.execute(JOB_DELETE_SQL, rusqlite::params!["r1"])
+        let swept: Option<String> = conn
+            .query_row(JOB_DELETE_SQL, rusqlite::params!["r1", 10], |r| r.get(0))
+            .ok();
+        assert_eq!(swept, None, "a queued job is never swept");
+    }
+
+    /// N3 (LOW's E585 land2 lens, `docs/audit/E585-land2-lens-2026-10-10.md`): the sweep selects the settled
+    /// jobs, then deletes them one by one. A re-presentation of the same submission landing between the two
+    /// re-puts the bytes and upserts the row to `queued`; the delete, bound as the sweep binds it, must leave
+    /// that row (and so its bytes) alone and hand back no `at_rest` to release.
+    #[test]
+    fn a_re_presentation_between_the_sweeps_select_and_delete_survives_the_sweep() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "{JOBS_CREATE}; {JOBS_INDEX}; {CHUNKS_CREATE}; {JOBS_ADD_LEGS_FROM};"
+        ))
+        .unwrap();
+        let up = |now: i64| {
+            conn.execute(
+                JOB_UPSERT_SQL,
+                rusqlite::params![
+                    "r1",
+                    "subj",
+                    "[]",
+                    "broadcast-gated",
+                    0,
+                    10,
+                    10,
+                    "r2",
+                    1,
+                    300_087,
+                    300_087,
+                    now,
+                    0
+                ],
+            )
             .unwrap();
+        };
+        up(1);
+        conn.execute(JOB_TAKE_SQL, rusqlite::params!["r1", 2])
+            .unwrap();
+        conn.execute(
+            JOB_SETTLE_SQL,
+            rusqlite::params!["r1", "done", 200, "{}", 3],
+        )
+        .unwrap();
+        let cutoff = 100i64;
+        // the sweep's select: r1 is settled and past the cutoff
+        let expired: Vec<String> = conn
+            .prepare(JOBS_EXPIRED_SQL)
+            .unwrap()
+            .query_map(rusqlite::params![cutoff], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(expired, vec!["r1".to_string()]);
+        // the re-presentation lands between the select and the delete
+        up(200);
+        // the sweep's delete, bound as the sweep binds it
+        let mut del = conn.prepare(JOB_DELETE_SQL).unwrap();
+        let binds: [&dyn rusqlite::ToSql; 2] = [&"r1", &cutoff];
+        let mut rows = del.query(&binds[..del.parameter_count()]).unwrap();
+        let mut released = Vec::new();
+        while let Some(r) = rows.next().unwrap() {
+            released.push(r.get::<_, String>(0).unwrap());
+        }
+        drop(rows);
+        drop(del);
+        let state: Option<String> = conn
+            .query_row(
+                "SELECT state FROM ef_deferred_jobs WHERE reference = 'r1'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(
+            state.as_deref(),
+            Some("queued"),
+            "the re-presented job survives the sweep (its poll answers, its message finds a row)"
+        );
+        assert!(
+            released.is_empty(),
+            "no bytes are released for a row the sweep did not delete"
+        );
+        // and a job still settled past the cutoff is deleted, its at_rest handed back
+        conn.execute(JOB_TAKE_SQL, rusqlite::params!["r1", 201])
+            .unwrap();
+        conn.execute(
+            JOB_SETTLE_SQL,
+            rusqlite::params!["r1", "failed", 503, "{}", 202],
+        )
+        .unwrap();
+        let mut del = conn.prepare(JOB_DELETE_SQL).unwrap();
+        let later = 300i64;
+        let binds: [&dyn rusqlite::ToSql; 2] = [&"r1", &later];
+        let mut rows = del.query(&binds[..del.parameter_count()]).unwrap();
+        let mut released = Vec::new();
+        while let Some(r) = rows.next().unwrap() {
+            released.push(r.get::<_, String>(0).unwrap());
+        }
+        assert_eq!(released, vec!["r2".to_string()]);
     }
 }
