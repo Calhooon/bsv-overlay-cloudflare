@@ -78,6 +78,14 @@
 //! that prefix [`SWEEP_MAX_OBJECTS`] at a time from its own key at rest (`ef_deferred_sweep`, the same one-row
 //! shape) and counts the objects and bytes as the pass above counts `atRest`; `/health/invariants.queue.r2.
 //! efDeferred` serves that count, never a listing at the health call.
+//!
+//! It deletes (L1 (b)) an object NO job row names (`ef_deferred_jobs.reference`, whatever the row's state) once it
+//! is older than `ef_deferred::JOB_KEEP_MS` by its age stamp: bytes whose row was never written (the put landed, the
+//! row's upsert faulted), or whose release faulted after the row's delete (N3's order), are named by no job and read
+//! by no run. At most [`SWEEP_MAX_DELETES`] a pass, each read again (`head`) before its delete: one written again
+//! since the listing (a re-presentation re-puts the key with a new `touched` stamp, then upserts the row) is left.
+//! Limit, stated: a re-presentation whose put lands between that `head` and the delete loses its bytes (the window
+//! of door 3's sweep): its run fails "the R2 object is gone" and the caller re-presents.
 
 use crate::d1::Query;
 use serde::Deserialize;
@@ -125,6 +133,11 @@ pub const NAMED_KEYS_SQL: &str =
 
 /// N5: the deferred EF jobs' objects, listed and counted by their own pass ([`ef_sweep_pass`]).
 pub const EF_SWEEP_PREFIX: &str = crate::ef_deferred::R2_PREFIX;
+/// L1 (b): a rowless object under [`EF_SWEEP_PREFIX`] older than this is deleted: a settled job's keep.
+pub const EF_ORPHAN_WINDOW_S: u64 = (crate::ef_deferred::JOB_KEEP_MS / 1000) as u64;
+/// L1 (b): which of the listed references a job row names (one bind: a JSON array of references).
+pub const EF_JOB_ROWS_SQL: &str =
+    "SELECT reference FROM ef_deferred_jobs WHERE reference IN (SELECT value FROM json_each(?1))";
 /// N5: that pass's state at rest, the same one-row shape as `beef_blob_sweep`. Transient.
 pub const EF_SWEEP_STATE_CREATE: &str = "CREATE TABLE IF NOT EXISTS ef_deferred_sweep (id INTEGER PRIMARY KEY CHECK (id = 1), start_after TEXT NOT NULL DEFAULT '', round_objects INTEGER NOT NULL DEFAULT 0, round_bytes INTEGER NOT NULL DEFAULT 0, round_started_at INTEGER, full_objects INTEGER, full_bytes INTEGER, full_at INTEGER, last_pass_at INTEGER, last_listed INTEGER NOT NULL DEFAULT 0, last_swept INTEGER NOT NULL DEFAULT 0, last_unreadable INTEGER NOT NULL DEFAULT 0, last_unreadable_key TEXT)";
 pub const EF_SWEEP_STATE_SQL: &str = "SELECT start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at, last_pass_at, last_listed, last_swept, last_unreadable, last_unreadable_key FROM ef_deferred_sweep WHERE id = 1";
@@ -916,11 +929,15 @@ pub async fn internal_sweep(
 }
 
 /// N5: what one pass over the deferred EF jobs' objects needs of the platform: the bucket under
-/// [`EF_SWEEP_PREFIX`], its state at rest, the clock and the log. The worker's is [`WorkerEfSweep`]; a native test
-/// gives its own.
+/// [`EF_SWEEP_PREFIX`], its state at rest, the job rows (L1 (b)), the clock and the log. The worker's is
+/// [`WorkerEfSweep`]; a native test gives its own.
 pub(crate) trait EfSweepPort {
     async fn read_state(&self) -> Result<SweepState, String>;
     async fn list_page(&self, start_after: &str) -> Result<(Vec<Entry>, bool), String>;
+    /// L1 (b): the keys among `keys` whose reference a job row names.
+    async fn keys_with_rows(&self, keys: &[String]) -> Result<HashSet<String>, String>;
+    async fn head(&self, key: &str) -> Result<Option<Listed>, String>;
+    async fn delete(&self, key: &str) -> Result<(), String>;
     async fn save(&self, next: &SweepState) -> Result<(), String>;
     fn now_ms(&self) -> i64;
     fn log(&self, line: &str);
@@ -941,6 +958,35 @@ impl EfSweepPort for WorkerEfSweep<'_> {
         list_page_under(self.bucket, EF_SWEEP_PREFIX, start_after).await
     }
 
+    async fn keys_with_rows(&self, keys: &[String]) -> Result<HashSet<String>, String> {
+        #[derive(Deserialize)]
+        struct Row {
+            reference: String,
+        }
+        let refs: Vec<&str> = keys
+            .iter()
+            .filter_map(|k| k.strip_prefix(EF_SWEEP_PREFIX))
+            .collect();
+        let refs = serde_json::to_string(&refs).map_err(|e| e.to_string())?;
+        Query::new(EF_JOB_ROWS_SQL)
+            .bind(refs)
+            .fetch_all::<Row>(self.db)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|r| format!("{EF_SWEEP_PREFIX}{}", r.reference))
+                    .collect()
+            })
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<Listed>, String> {
+        head_of(self.bucket, key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        self.bucket.delete(key).await.map_err(|e| e.to_string())
+    }
+
     async fn save(&self, next: &SweepState) -> Result<(), String> {
         save_query_to(EF_SWEEP_STATE_SAVE_SQL, next)
             .execute(self.db)
@@ -956,9 +1002,10 @@ impl EfSweepPort for WorkerEfSweep<'_> {
     }
 }
 
-/// N5: ONE PASS over the deferred EF jobs' objects: the page after the key at rest, counted into the round (the
-/// objects and bytes at rest, as [`next_state`] counts the door's), the state saved. Fail-closed as
-/// [`sweep_pass`]: a state read or a listing that faults moves no cursor.
+/// N5: ONE PASS over the deferred EF jobs' objects: the page after the key at rest, the rowless objects past
+/// [`EF_ORPHAN_WINDOW_S`] deleted (L1 (b), each read again first), the rest counted into the round (the objects
+/// and bytes at rest, as [`next_state`] counts the door's), the state saved. Fail-closed as [`sweep_pass`]: a
+/// state read, a listing or a rows read that faults deletes nothing and moves no cursor.
 pub(crate) async fn ef_sweep_pass<P: EfSweepPort>(p: &P) -> PassOutcome {
     let state = match p.read_state().await {
         Ok(s) => s,
@@ -982,11 +1029,69 @@ pub(crate) async fn ef_sweep_pass<P: EfSweepPort>(p: &P) -> PassOutcome {
     let listed = entries.len() as u64;
     let page = split_page(entries);
     let now = p.now_ms();
-    let plan = PassPlan {
-        handled: page.listed.len(),
-        orphans: Vec::new(),
+    let stale: Vec<String> = page
+        .listed
+        .iter()
+        .filter(|o| past_window(o, now, EF_ORPHAN_WINDOW_S))
+        .map(|o| o.key.clone())
+        .collect();
+    let with_rows = if stale.is_empty() {
+        HashSet::new()
+    } else {
+        match p.keys_with_rows(&stale).await {
+            Ok(k) => k,
+            Err(e) => {
+                p.log(&format!(
+                    "[ef-deferred] the pass could not read the job rows ({e}); nothing swept"
+                ));
+                return PassOutcome::stopped(format!("the job rows did not read: {e}"), before);
+            }
+        }
     };
-    let swept: HashSet<String> = HashSet::new();
+    let plan = plan_pass(
+        &page.listed,
+        &with_rows,
+        now,
+        EF_ORPHAN_WINDOW_S,
+        SWEEP_MAX_DELETES,
+    );
+    let mut swept: HashSet<String> = HashSet::new();
+    let (mut swept_bytes, mut faults) = (0u64, 0u64);
+    for o in plan.orphans.iter().map(|i| &page.listed[*i]) {
+        let head = match p.head(&o.key).await {
+            Ok(h) => h,
+            Err(e) => {
+                faults += 1;
+                p.log(&format!(
+                    "[ef-deferred] the read of {} faulted ({e}); the object stays",
+                    o.key
+                ));
+                continue;
+            }
+        };
+        if !still_orphan(o, head.as_ref()) {
+            continue;
+        }
+        match p.delete(&o.key).await {
+            Ok(()) => {
+                swept.insert(o.key.clone());
+                swept_bytes += o.bytes;
+                p.log(&format!(
+                    "[ef-deferred] SWEPT {} bytes={} age_s={} (no job row names it, past the {EF_ORPHAN_WINDOW_S} s keep)",
+                    o.key,
+                    o.bytes,
+                    now.saturating_sub(o.age_ms()) / 1000
+                ));
+            }
+            Err(e) => {
+                faults += 1;
+                p.log(&format!(
+                    "[ef-deferred] the delete of {} faulted ({e}); the object stays",
+                    o.key
+                ));
+            }
+        }
+    }
     let next = after_pass(&state, &page, &plan, &swept, truncated, now);
     let saved = match p.save(&next).await {
         Ok(()) => true,
@@ -1005,7 +1110,9 @@ pub(crate) async fn ef_sweep_pass<P: EfSweepPort>(p: &P) -> PassOutcome {
         cursor_after: saved.then(|| next.start_after.clone()),
         last_pass_at: saved.then_some(now),
         round_complete: saved && next.full_at == Some(now),
-        ..PassOutcome::default()
+        swept: swept.len() as u64,
+        swept_bytes,
+        faults,
     }
 }
 
@@ -2276,6 +2383,8 @@ mod tests {
         conn: &'a rusqlite::Connection,
         objects: RefCell<BTreeMap<String, (u64, i64)>>,
         now: i64,
+        /// The references a job row names.
+        rows: RefCell<HashSet<String>>,
     }
 
     impl EfSweepPort for EfModel<'_> {
@@ -2300,6 +2409,29 @@ mod tests {
                 })
                 .collect();
             Ok((page, it.next().is_some()))
+        }
+        async fn keys_with_rows(&self, keys: &[String]) -> Result<HashSet<String>, String> {
+            let rows = self.rows.borrow();
+            Ok(keys
+                .iter()
+                .filter(|k| {
+                    k.strip_prefix(EF_SWEEP_PREFIX)
+                        .is_some_and(|r| rows.contains(r))
+                })
+                .cloned()
+                .collect())
+        }
+        async fn head(&self, key: &str) -> Result<Option<Listed>, String> {
+            Ok(self.objects.borrow().get(key).map(|(b, u)| Listed {
+                key: key.to_string(),
+                bytes: *b,
+                uploaded_ms: *u,
+                touched_ms: Some(*u),
+            }))
+        }
+        async fn delete(&self, key: &str) -> Result<(), String> {
+            self.objects.borrow_mut().remove(key);
+            Ok(())
         }
         async fn save(&self, next: &SweepState) -> Result<(), String> {
             exec(self.conn, &save_query_to(EF_SWEEP_STATE_SAVE_SQL, next));
@@ -2356,6 +2488,7 @@ mod tests {
             conn: &conn,
             objects: RefCell::new(objects),
             now: 100,
+            rows: RefCell::new(HashSet::new()),
         };
         let first = block_on(ef_sweep_pass(&m));
         assert_eq!((first.listed, first.round_complete), (200, false));
@@ -2370,5 +2503,70 @@ mod tests {
         assert_eq!(st.start_after, "", "the next round starts at the first key");
         let j = queue_json(None, Some(&st), true);
         assert_eq!(j["r2"]["efDeferred"]["atRest"]["objects"], 250);
+    }
+
+    /// L1 (b) (LOW's E585 land2 lens): bytes whose job row was never written (the R2 put landed, the row's upsert
+    /// faulted) are named by no job and read by no sweep. The pass over `ef-deferred/` deletes an object that NO job
+    /// row names once it is older than `JOB_KEEP_MS` by its age stamp; an object a row names stays whatever its age,
+    /// and a young rowless one (a put whose upsert is still in flight) stays. RED before L1: the rowless stale object
+    /// stays.
+    #[test]
+    fn l1b_a_rowless_ef_deferred_object_past_the_keep_is_deleted() {
+        let conn = ef_db();
+        let keep = crate::ef_deferred::JOB_KEEP_MS;
+        let now = 10 * keep;
+        let key = |c: char| format!("ef-deferred/{}", c.to_string().repeat(64));
+        let mut objects = BTreeMap::new();
+        objects.insert(key('a'), (10, 1)); // a row names it, old
+        objects.insert(key('b'), (20, 1)); // no row, old: the orphan
+        objects.insert(key('c'), (30, now - 1_000)); // no row, young
+        let m = EfModel {
+            conn: &conn,
+            objects: RefCell::new(objects),
+            now,
+            rows: RefCell::new(HashSet::new()),
+        };
+        *m.rows.borrow_mut() = HashSet::from(["a".repeat(64)]);
+        let out = block_on(ef_sweep_pass(&m));
+        let left: Vec<String> = m.objects.borrow().keys().cloned().collect();
+        assert_eq!(
+            left,
+            vec![key('a'), key('c')],
+            "the rowless stale object is deleted, nothing else"
+        );
+        assert_eq!((out.swept, out.swept_bytes), (1, 20));
+        let st = ef_state(&conn);
+        assert_eq!(
+            (st.full_objects, st.full_bytes),
+            (Some(2), Some(40)),
+            "the deleted one is not at rest"
+        );
+        assert_eq!(st.last_swept, 1);
+        // the shipped rows statement on real SQLite: a row names its reference, whatever its state
+        let jobs = rusqlite::Connection::open_in_memory().unwrap();
+        jobs.execute_batch(&format!(
+            "{}; {};",
+            crate::ef_deferred::JOBS_CREATE,
+            crate::ef_deferred::JOBS_ADD_LEGS_FROM
+        ))
+        .unwrap();
+        jobs.execute(
+            "INSERT INTO ef_deferred_jobs (reference, subject_txid, topics, submit_mode, has_off_chain, beef_len, \
+             bytes, at_rest, chunks, subject_ef_bytes, batch_ef_bytes, state, created_at, updated_at) \
+             VALUES (?1, 's', '[]', 'm', 0, 1, 1, 'r2', 1, 1, 1, 'done', 1, 1)",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+        let named: Vec<String> = jobs
+            .prepare(EF_JOB_ROWS_SQL)
+            .unwrap()
+            .query_map(
+                [serde_json::json!(["a".repeat(64), "b".repeat(64)]).to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(named, vec!["a".repeat(64)]);
     }
 }

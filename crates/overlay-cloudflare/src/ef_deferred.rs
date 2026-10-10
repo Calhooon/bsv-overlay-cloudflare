@@ -114,7 +114,8 @@ pub const POLL_PREFIX: &str = "/submit-deferred/";
 /// The R2 binding bsv-low #585 door 3 adds (`BEEF_BLOBS`); the deferred
 /// bytes live under their own prefix, which that door's orphan sweep does not
 /// list: their own pass does (`beef_blob_sweep::ef_sweep_pass`, N5), counting
-/// them for `/health/invariants.queue.r2.efDeferred`.
+/// them for `/health/invariants.queue.r2.efDeferred` and deleting an object no
+/// job row names past [`JOB_KEEP_MS`] (L1 (b)).
 pub const BEEF_BLOBS_BINDING: &str = "BEEF_BLOBS";
 pub const R2_PREFIX: &str = "ef-deferred/";
 
@@ -549,8 +550,16 @@ async fn put_at_rest(
     };
     let (at_rest, chunks) = match env.bucket(BEEF_BLOBS_BINDING) {
         Ok(bucket) => {
+            // L1 (a): R2 checks the sha256 it is given against what it stored (door 3's rule,
+            // `queue::put_beef`), so a corrupted upload is refused here, never found at the run; the
+            // digest is of the stored stream (the reference hashes the framed submission). The
+            // `touched` stamp ages the object for the pass over the prefix (L1 (b)).
+            let stored = span(0, total);
+            let digest = bsv_rs::primitives::hash::sha256(&stored).to_vec();
             bucket
-                .put(format!("{R2_PREFIX}{reference}"), span(0, total))
+                .put(format!("{R2_PREFIX}{reference}"), stored)
+                .sha256(digest)
+                .custom_metadata(crate::queue::touched_meta(now))
                 .execute()
                 .await
                 .map_err(|e| format!("R2 put: {e}"))?;
@@ -1491,5 +1500,30 @@ mod tests {
             released.push(r.get::<_, String>(0).unwrap());
         }
         assert_eq!(released, vec!["r2".to_string()]);
+    }
+
+    /// L1 (a) (LOW's E585 land2 lens): the R2 put of `ef-deferred/<reference>` hands R2 the sha256 of the bytes it
+    /// stores, through the put's checksum option, as door 3's put does (`queue::put_beef`), so a corrupted upload is
+    /// refused at the put, not found at the run; and the writer's `touched` stamp, which the pass over the prefix
+    /// ages an object by. (The reference is the sha256 of the framed submission, topics included, so it is not the
+    /// object's digest: the digest is taken of the stored stream.) RED on `54dbb16`: the put has neither.
+    #[test]
+    fn l1a_the_deferred_put_hands_r2_the_digest_of_its_bytes() {
+        let code: String = include_str!("ef_deferred.rs")
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<String>()
+            .split_whitespace()
+            .collect();
+        let start = code.find("asyncfnput_at_rest(").unwrap();
+        let f = &code[start..start + code[start..].find("asyncfnsend_job(").unwrap()];
+        assert!(
+            f.contains("letstored=span(0,total);letdigest=bsv_rs::primitives::hash::sha256(&stored).to_vec();"),
+            "the digest of the stored stream"
+        );
+        assert!(
+            f.contains(".put(format!(\"{R2_PREFIX}{reference}\"),stored).sha256(digest).custom_metadata(crate::queue::touched_meta(now)).execute()"),
+            "the put carries the digest and the touched stamp"
+        );
     }
 }

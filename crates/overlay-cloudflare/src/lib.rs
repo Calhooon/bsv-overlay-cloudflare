@@ -1313,7 +1313,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // queue; settled ones past their keep are swept with their bytes.
     crate::ef_deferred::redrive(&env, &ops_db).await;
     // N5 (LOW's E585 land2 lens): one bounded pass over the deferred EF jobs'
-    // R2 objects (`ef-deferred/`), counted for the health figure.
+    // R2 objects (`ef-deferred/`), counted for the health figure; an object no
+    // job row names, past the keep, is deleted (L1 (b)).
     crate::beef_blob_sweep::run_ef_deferred_pass(&env, &ops_db).await;
     // The order (bsv-low #585 land2): the sweep's pass (its own 30 s race),
     // the stale graphs, the EF jobs' hand-back and keep sweep (no race of its
