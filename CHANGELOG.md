@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased: bsv-rs 0.4.3; a transaction with no output is invalid bytes (NL-6f, 2026-10-10)
+
+- **bsv-rs #59.** Both workspaces pin bsv-rs **0.4.3** (the workers' lock keeps
+  0.3.35 for the middleware bridge). The reader, and with it every door of this
+  workspace that reads a BEEF (`read_beef`, `fold_beef`, `parse_beef`,
+  `transaction_from_beef`, the census), refuses a transaction with no output as
+  `invalid BEEF at byte <offset>: NoOutputs`, at the transaction's first byte,
+  as it refuses one with no input since 0.4.2. `Beef::verify_valid` and
+  `Transaction::verify` refuse both shapes too, as the TypeScript reference's
+  `Transaction.verify` does.
+- **The one fixture it moved:** the census cell
+  `a_poisoned_subject_sort_is_uneval_never_a_green` built its real subject with
+  two inputs and no output, so the census answered `Parse` before the EF step
+  the cell is about. The subject now pays one output and the verdict is
+  `SubjectEf` again. No other test moved.
+
 ## Unreleased: bsv-rs 0.4.2; the SPV walk is linear in a BUMP's leaves (NL-6e, 2026-10-10)
 
 The no-limits program's replay (bsv-stack-lean NL-8) named two findings at the
