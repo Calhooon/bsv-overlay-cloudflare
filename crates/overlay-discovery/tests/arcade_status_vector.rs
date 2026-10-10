@@ -15,11 +15,27 @@
 //! only beside the bsv-low sources (`crates/low-proof-replay/Cargo.toml:21-22`).
 //! Every one of those readings calls `arcade_words::arcade_verdict`, whose
 //! classes are replayed here against the vector's `words`.
+//!
+//! The copy's source (align-engine-050, 2026-10-10): bsv-wallet-toolbox-rs
+//! 0.7.4 (tag `v0.7.4`, main `623f890`), `tests/vectors/
+//! arcade_status_verdicts.json`, the same bytes bsv-wallet-cli carries at main
+//! `636c6dd` (`tests/vectors/`). The rule is `cmp`: this file is that file
+//! byte for byte (sha256 `80d2ac72112d…`, pinned whole below), never an edit
+//! here. A change is made in the toolbox's copy and copied back.
 
 use bsv_overlay_discovery::arcade_words::{arcade_verdict, ArcadeVerdict};
 use bsv_overlay_discovery::pot::reorg::{arcade_reorg_marker, ArcadeReorgMarker};
 
 const VECTOR: &str = include_str!("../vectors/arcade_status_verdicts.json");
+
+/// sha256 of bsv-wallet-toolbox-rs 0.7.4's `tests/vectors/arcade_status_verdicts.json`.
+const TOOLBOX_074_SHA256: &str = "80d2ac72112d0f39d1d5e4512a4ce10bbc71234cc8edc6270b1cebe599f6a954";
+
+#[test]
+fn the_vector_is_the_toolbox_0_7_4_bytes() {
+    let got = hex::encode(bsv_rs::primitives::sha256(VECTOR.as_bytes()));
+    assert_eq!(got, TOOLBOX_074_SHA256);
+}
 
 #[test]
 fn every_arcade_push_body_reads_its_reorg_marker_and_no_other_extra_info_does() {
