@@ -1,17 +1,19 @@
 # Changelog
 
-## Unreleased: the workers on bsv-middleware-cloudflare 0.5.0, the bsv-rs 0.3 bridge gone, the Arcade vector at the toolbox 0.7.4's bytes, LOW's N3, N4, N5 and L1 (align-engine-050, 2026-10-10)
+## Unreleased: the workers on bsv-middleware-cloudflare 0.5.1, the bsv-rs 0.3 bridge gone, the Arcade vector at the toolbox 0.7.4's bytes, LOW's N3, N4, N5 and L1 (align-engine-050, 2026-10-10)
 
-The four findings are LOW's, in their own words at `docs/audit/E585-land2-lens-2026-10-10.md`
+The four findings are LOW's, in their own words at bsv-low's `docs/audit/E585-land2-lens-2026-10-10.md`
 (the E585 land2 lens over `54dbb16`).
 
-- **bsv-middleware-cloudflare 0.5.0** (`=0.5.0` in `overlay-cloudflare` and `low-app-layer`, was `=0.4.1`;
-  with `bsv-middleware-core` 0.2.0, both on bsv-rs 0.4). The API moves of its CHANGELOG this workspace meets:
+- **bsv-middleware-cloudflare 0.5.1** (`=0.5.1` in `overlay-cloudflare` and `low-app-layer`, was `=0.4.1`;
+  with `bsv-middleware-core` 0.2.1, both on bsv-rs 0.4; the lane pinned 0.5.0 and the captain took 0.5.1 the
+  hour it published: bsv-rs 0.4.1 as the floor, a transaction with no input the reader's `NoInputs` word through
+  `PaymentVerifyError::Unverifiable`, the refusal class unchanged, the 22 vectors passing unchanged). The API moves of its CHANGELOG this workspace meets:
   `WorkerStorageClient::new` takes bsv-rs 0.4's `ProtoWallet`. The payment verdict's move
   (`PaymentVerifyError::Unverifiable { reason }`; `BadTransaction`, `MissingOutput`, `BadBeef` gone) touches no
   call site here; `low-app-layer` compiled unchanged.
 - **The bridge gone.** `bsv-rs-03` (the bsv-rs 0.3.35 dependency that built the one wallet 0.4.1 took) leaves
-  `overlay-cloudflare`; `make_storage_client` hands 0.5.0's `WorkerStorageClient::new` a `ProtoWallet` built from
+  `overlay-cloudflare`; `make_storage_client` hands 0.5.1's `WorkerStorageClient::new` a `ProtoWallet` built from
   the admin key as held (the workspace bsv-rs 0.4.3): no conversion, no refusal. The workers' lock holds one
   bsv-rs (`cargo tree -d`: no duplicate `bsv-*` crate in either workspace). New test: the storage client's wallet
   is the admin key, never the anonymous wallet.
