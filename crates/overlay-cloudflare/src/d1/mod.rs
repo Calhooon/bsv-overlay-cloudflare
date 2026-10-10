@@ -502,7 +502,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 186 → 188 for bsv-low #585 (2026-10-09, door 3's fold-4; 183-184 before the land onto NL-6c and NL-6d):
 /// `beef_blob_sweep.last_unreadable` and `.last_unreadable_key` (the listed objects the last pass could not read,
 /// skipped and named); two additive ALTERs.
-pub const OVERLAY_MIGRATION_COUNT: usize = 188;
+/// 188 → 189 for N5 (align-engine-050, 2026-10-10, LOW's E585 land2 lens): `ef_deferred_sweep`, the one-row state of
+/// the pass over the deferred EF jobs' R2 objects (its cursor, the round, the last complete count); one table.
+pub const OVERLAY_MIGRATION_COUNT: usize = 189;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1816,6 +1818,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // bsv-low #585 (door 3's fold-4): the last pass's unreadable entries, skipped and named in the health block.
     crate::beef_blob_sweep::SWEEP_STATE_UNREADABLE_COLUMN,
     crate::beef_blob_sweep::SWEEP_STATE_UNREADABLE_KEY_COLUMN,
+    // N5 (align-engine-050, LOW's E585 land2 lens): the one-row state of the pass over the deferred EF jobs' R2
+    // objects (`ef-deferred/`), the same shape as `beef_blob_sweep`. Transient.
+    crate::beef_blob_sweep::EF_SWEEP_STATE_CREATE,
 ];
 
 // =============================================================================

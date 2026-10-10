@@ -1312,11 +1312,14 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // NL-6c: deferred EF jobs whose run ended without settling go back to the
     // queue; settled ones past their keep are swept with their bytes.
     crate::ef_deferred::redrive(&env, &ops_db).await;
+    // N5 (LOW's E585 land2 lens): one bounded pass over the deferred EF jobs'
+    // R2 objects (`ef-deferred/`), counted for the health figure.
+    crate::beef_blob_sweep::run_ef_deferred_pass(&env, &ops_db).await;
     // The order (bsv-low #585 land2): the sweep's pass (its own 30 s race),
     // the stale graphs, the EF jobs' hand-back and keep sweep (no race of its
     // own: two D1 reads, up to 20 quiet jobs re-sent and touched, up to 50
     // settled jobs deleted with their bytes; the jobs RUN on the queue
-    // consumer), then
+    // consumer), the EF jobs' objects' pass (its own 30 s race, N5), then
     // the GASP step under its 240 s belt, which bounds that step alone.
     // #257: BOUNDED — an unbounded GASP sync (dead SHIP-discovered peers, no
     // per-fetch timeout) hung every cron to the 15-min kill since deploy day;
