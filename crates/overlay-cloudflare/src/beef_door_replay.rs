@@ -1413,7 +1413,10 @@ mod e592 {
     ///
     /// Does not compile on `0313648`: the base has no `WalkBreachPolicy`, no `WalkCouldNotRun`
     /// and no `MutationMessage::gated`/`replay_breach_policy`, so the unmarked-replay half
-    /// cannot be written there (the same reason `e592_b` cannot).
+    /// cannot be written there (the same reason `e592_b` cannot). With the replay grafted onto
+    /// the base's `submit_with_report`, the unmarked replay is admitted unwalked (the answer
+    /// mutant B reproduces on the tip), so the record names the behaviour, not only "does not
+    /// compile".
     #[test]
     fn e592_q8_8_the_unmarked_replays_not_now_letter_parks_through_park_sql() {
         use crate::d1::{QVal, Query};
@@ -1602,8 +1605,10 @@ mod e592 {
         );
 
         // (3) the not-now share (1000): with the share full of a stranger's letters, the witness letter defers.
+        // Seed PAST the trailing day (`now - 86_400_001`), so the per-day clause (`< 200`) counts none of them and
+        // the share clause (`< 1000`) is the one PARK_SQL refuses on; otherwise the day clause masks it (mutant F).
         let conn = schema();
-        seed_not_now(&conn, dead_letters::NOT_NOW_MAX as usize, now);
+        seed_not_now(&conn, dead_letters::NOT_NOW_MAX as usize, now - 86_400_001);
         assert_eq!(
             note_and_park(&conn, &key, &key_topics, class, &message, now),
             (
