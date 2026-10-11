@@ -23,7 +23,7 @@ use worker::{Context, Env, Request, Response};
 /// space for status, competing-transaction and reorg metadata.
 pub(crate) const ARC_INGEST_BODY_MAX_BYTES: usize = 1024 * 1024;
 
-fn engine_error_status(e: &EngineError) -> u16 {
+pub(crate) fn engine_error_status(e: &EngineError) -> u16 {
     match e {
         EngineError::UnsupportedTopic(_) => 400,
         EngineError::LookupServiceNotFound(_) => 400, // matches mainline overlay-express 2.2.0
@@ -47,7 +47,54 @@ fn engine_error_status(e: &EngineError) -> u16 {
         // surfaces one answers a 400 rather than a 500.
         EngineError::ScriptWalkInconclusive { .. } => 400,
         EngineError::ScriptWalkOverBudget { .. } => 400,
+        // The submit's own walk could not run within the budget and nothing on
+        // record stands in for it (bsv-low #592, the E592 lens fold): not now,
+        // never a refusal. The doors answer it with `walk_not_now`.
+        EngineError::WalkCouldNotRun(_) => 503,
     }
+}
+
+/// The word of a "not now" for a walk past the engine's budget (the E592 lens fold).
+pub const WALK_NOT_NOW_CODE: &str = "walk-could-not-run";
+/// When a client may present it again: after a block, not at once (the way out is the subject PROVEN).
+pub const WALK_NOT_NOW_RETRY_AFTER_S: u32 = 600;
+
+/// PURE: the body of the "not now" a door answers when the submit's own script walk could not run within the
+/// engine's budget (bsv-low #592; the E592 lens fold, H1). Retryable, never a refusal: the budget says nothing about
+/// the transaction. The way out: present the subject PROVEN (a proven transaction is not walked), so an honest body
+/// too big to walk unmined lands after its block. A client retries after the block, not at once.
+pub fn walk_not_now_body(stop: &overlay_engine::engine::WalkCouldNotRun) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "code": WALK_NOT_NOW_CODE,
+        "limb": stop.limb.as_str(),
+        "retryable": true,
+        "retryAfterSecs": WALK_NOT_NOW_RETRY_AFTER_S,
+        "message": format!(
+            "not now: the script walk of {} could not run within the budget ({}: {}); nothing was admitted; present it again PROVEN, after its block",
+            stop.subject_txid,
+            stop.limb.as_str(),
+            stop.what
+        ),
+    })
+}
+
+/// The door's answer for [`walk_not_now_body`] at `door`: counted (`ops::note_engine_walk_not_now`), logged, 503
+/// with `Retry-After`. Nothing was written and nothing is queued: the same unproven bytes would breach again.
+async fn walk_not_now(
+    env: &worker::Env,
+    stop: &overlay_engine::engine::WalkCouldNotRun,
+    door: &str,
+) -> worker::Result<Response> {
+    if let Ok(db) = env.d1("OVERLAY_DB") {
+        crate::ops::note_engine_walk_not_now(&db, stop, door).await;
+    }
+    worker::console_log!("{door} -> 503 (walk-could-not-run, {}; not now)", stop.limb.as_str());
+    let mut resp = json_response(&walk_not_now_body(stop), 503)?;
+    let _ = resp
+        .headers_mut()
+        .set("Retry-After", &WALK_NOT_NOW_RETRY_AFTER_S.to_string());
+    Ok(resp)
 }
 
 // =============================================================================
@@ -1683,6 +1730,8 @@ async fn submit_parts(
     let engine_started = js_sys::Date::now();
     let (steak, mutation_report) = match engine.submit_with_report(&tagged_beef, mode).await {
         Ok(v) => v,
+        // E592 fold: a walk past the budget is NOT NOW (nothing written or queued), counted
+        Err(EngineError::WalkCouldNotRun(stop)) => return walk_not_now(env, &stop, "POST /submit").await,
         Err(e) => {
             let status = engine_error_status(&e);
             worker::console_log!("POST /submit -> {} (submit failed)", status);
@@ -1690,6 +1739,14 @@ async fn submit_parts(
         }
     };
     let engine_submit_ms = js_sys::Date::now() - engine_started;
+    // bsv-low #592: a walk the engine's budget could not hold (a carried predecessor's landing included) is counted
+    if mutation_report.walk_could_not_run.is_some()
+        || !mutation_report.landed_walks_could_not_run.is_empty()
+    {
+        if let Ok(db) = env.d1("OVERLAY_DB") {
+            crate::ops::note_engine_walk(&db, &mutation_report, "POST /submit").await;
+        }
+    }
     // lane E1D's delta fold (L2): what the engine landed first from the BEEF is guarded like the subject's write
     if !mutation_report.landed_predecessors.is_empty() {
         if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
@@ -1823,7 +1880,17 @@ async fn submit_parts(
                 crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_FAULT, 1).await;
             });
         }
-        Some(crate::queue::enqueue_replay(env, &tagged_beef.beef, &tagged_beef.topics, mode).await)
+        // the E592 lens fold: the gated arm's message says the network accepted these bytes (`gated`), and only it
+        Some(
+            crate::queue::enqueue_replay(
+                env,
+                &tagged_beef.beef,
+                &tagged_beef.topics,
+                mode,
+                gated_subject.is_some(),
+            )
+            .await,
+        )
     };
     let mutation_queued = match crate::queue::mutation_ack(
         mutation_report.is_durable(),
@@ -3366,6 +3433,13 @@ pub async fn admin_readmit(
                     crate::admit_fast::guard_landed(&db, &report.landed_predecessors, "POST /admin/readmit").await;
                 }
             }
+            // bsv-low #592: a walk the engine's budget could not hold (a landing's included) is counted
+            if report.walk_could_not_run.is_some() || !report.landed_walks_could_not_run.is_empty()
+            {
+                if let Ok(db) = env.d1("OVERLAY_DB") {
+                    crate::ops::note_engine_walk(&db, &report, "POST /admin/readmit").await;
+                }
+            }
             let admitted = steak
                 .get(&topic)
                 .map(|a| a.outputs_to_admit.clone())
@@ -3383,6 +3457,9 @@ pub async fn admin_readmit(
                 "faults": report.faults.iter().map(|f| format!("{}:{}: {}", f.topic, f.site, f.error)).collect::<Vec<_>>(),
             }))
         }
+        // the E592 lens fold: not now, counted, the way out named (readmit's BEEF carries the subject's proof, so
+        // this is reached only by a proof the engine does not take as the subject's)
+        Err(EngineError::WalkCouldNotRun(stop)) => walk_not_now(env, &stop, "POST /admin/readmit").await,
         Err(e) => {
             let status = engine_error_status(&e);
             worker::console_log!("POST /admin/readmit -> {status} (resubmit: {e})");
@@ -3436,10 +3513,13 @@ async fn readmit_spend_discovery(
 /// drift on what gets crawled.
 pub async fn admin_crawl_peers(
     engine: &Engine,
+    env: &Env,
     peers: &[crate::peer_crawler::PeerConfig],
 ) -> worker::Result<Response> {
     worker::console_log!("POST /admin/crawlPeers ({} peers)", peers.len());
-    let result = crate::peer_crawler::crawl_peers(engine, peers, "admin").await;
+    // E592 NOTE-3: the operator's crawl counts its walks that could not run, as the cron's does.
+    let db = env.d1("OVERLAY_DB").ok();
+    let result = crate::peer_crawler::crawl_peers(engine, peers, "admin", db.as_ref()).await;
     let total_attempted: usize = result.attempted.values().sum();
     let total_admitted: usize = result.admitted_by.values().sum();
     let err_count =
@@ -5381,7 +5461,9 @@ mod tests {
         let consumer = &consumer[..consumer.find("#[cfg(test)]").unwrap_or(consumer.len())];
         let q_guard_needle = ["crate::admit_fast::open_", "eviction(db, &subject)"].concat();
         let q_guard = consumer.find(&q_guard_needle).expect("the consumer's guard");
-        let q_write = consumer.find(&write_needle).expect("the consumer's write");
+        // the E592 lens fold: the consumer's write names its breach policy
+        let q_write_needle = ["engine.submit_with_report_", "under(&tagged_beef, mode, policy)"].concat();
+        let q_write = consumer.find(&q_write_needle).expect("the consumer's write");
         assert!(q_guard < q_write, "a replay asks the ledger before it writes");
         let q_after = consumer[q_write..].find(&q_guard_needle).expect("the consumer's post-write guard") + q_write;
         let q_reevict = ["crate::admit_fast::evict_txid_", "everywhere(db, &subject, &ev.reason, now_ms)"].concat();

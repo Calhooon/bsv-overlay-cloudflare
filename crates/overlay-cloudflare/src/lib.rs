@@ -440,7 +440,7 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
                 // bsv-low PLAN-PRE-LOOP4 §H4: re-notify (or re-submit, subject-named) a txid the index never came to know
                 "/admin/readmit" => admin_readmit(&engine, &env, req).await,
                 "/admin/remove-token" => admin_remove_token(&engine, req).await,
-                "/admin/crawlPeers" => admin_crawl_peers(&engine, &non_gasp_peers()).await,
+                "/admin/crawlPeers" => admin_crawl_peers(&engine, &env, &non_gasp_peers()).await,
                 "/admin/janitor" => {
                     admin_janitor(
                         ship_storage.as_ref(),
@@ -1157,8 +1157,20 @@ fn build_engine_with_storage(
             as overlay_engine::engine::LandingGuardFuture
     }));
 
+    // bsv-low #592: the engine's own script walk (every submit that walks: the queue's historical-tx replay, the
+    // ungated modes, `/admin/readmit`, the peer crawler's current-tx; and the GASP anchor check) runs under the
+    // door's budget, the instance the gated door walks under. A breach is counted (`ops::note_engine_walk`), never
+    // a refusal.
+    engine.set_walk_budget(WORKER_WALK_BUDGET);
+
     engine
 }
+
+/// The budget of the engine's own script walk in this Worker (bsv-low #592, `Engine::set_walk_budget`): the door's
+/// own, `DoorBudget::DEFAULT`, under which the gated door walks (`verify_scripts_only`); pinned equal
+/// (`beef_door_replay::e592`). Three eighths of a 128 MB isolate for the memory limb.
+pub const WORKER_WALK_BUDGET: overlay_engine::engine::DoorBudget =
+    overlay_engine::engine::DoorBudget::DEFAULT;
 
 /// PURE (bsv-low#257): race `fut` against `deadline`; `None` = the deadline
 /// won and `fut` was DROPPED (its in-flight work cancelled). Injectable
@@ -1364,12 +1376,13 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                 r.topics_synced.values().map(f).sum()
             };
             worker::console_log!(
-                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped_graphs={} stalled_graphs={} held_back_graphs={}",
+                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={} anchor_walk_held_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped_graphs={} stalled_graphs={} held_back_graphs={}",
                 r.topics_synced.len(),
                 total_peers,
                 total_errors,
                 total_pruned,
                 total_discarded,
+                sum(|t| t.anchor_walk_held_graphs),
                 sum(|t| t.deferred_graphs),
                 sum(|t| t.resumed_graphs),
                 sum(|t| t.converged_graphs),
@@ -1406,6 +1419,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                 if !res.errors.is_empty()
                     || res.pruned_inputs > 0
                     || res.discarded_graphs > 0
+                    || res.anchor_walk_held_graphs > 0
                     || res.finalized_graphs > 0
                     || res.deadline_dropped_graphs > 0
                     || !res.cursor_moves.is_empty()
@@ -1426,11 +1440,12 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                         .map(|d| format!("{} {}", d.outpoint, d.reason))
                         .collect();
                     worker::console_log!(
-                        "  Scheduled GASP topic={} sync_type={} pruned_inputs={} discarded_graphs={} finalized_graphs={} deadline_dropped_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} stalled_graphs={} held_back_graphs={} dropped={:?} cursors={:?} errors={:?}",
+                        "  Scheduled GASP topic={} sync_type={} pruned_inputs={} discarded_graphs={} anchor_walk_held_graphs={} finalized_graphs={} deadline_dropped_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} stalled_graphs={} held_back_graphs={} dropped={:?} cursors={:?} errors={:?}",
                         topic,
                         res.sync_type,
                         res.pruned_inputs,
                         res.discarded_graphs,
+                        res.anchor_walk_held_graphs,
                         res.finalized_graphs,
                         res.deadline_dropped_graphs,
                         res.deferred_graphs,
@@ -1455,8 +1470,11 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     let peers = non_gasp_peers();
     // #257: bounded like GASP sync — crawl submits are dupe-checked, so a
     // dropped crawl re-does nothing next tick.
+    // E592 NOTE-3: each walk that could not run is counted inside the crawl, as its submit returns, so a crawl
+    // dropped at its budget keeps the counts of what it finished.
+    let crawl_db = env.d1("OVERLAY_DB").ok();
     match race_or_deadline(
-        peer_crawler::crawl_peers(&engine, &peers, "cron"),
+        peer_crawler::crawl_peers(&engine, &peers, "cron", crawl_db.as_ref()),
         crate::broadcaster::sleep_ms(PEER_CRAWL_BUDGET_MS),
     )
     .await
@@ -2427,7 +2445,20 @@ async fn queue_handler(
             }
         }
 
-        let replayed = engine.submit_with_report(&tagged_beef, mode).await;
+        // bsv-low #592 and the E592 lens fold: the replay's walk runs under the engine's budget. A walk past it goes
+        // on as historical-tx-no-spv ONLY on a message the gated arm's producer marked (`gated`: the network accepted
+        // these bytes), acked and never dead-lettered for its size; on any other it is "not now", retried, then
+        // parked as a `not_now` letter (#576's class: one per txid, 200 a day), never admitted unrun.
+        let policy = crate::queue::replay_breach_policy(body);
+        let replayed = engine.submit_with_report_under(&tagged_beef, mode, policy).await;
+        if let (Ok((_, report)), Some(db)) = (&replayed, &counters) {
+            crate::ops::note_engine_walk(db, report, "Queue").await;
+        }
+        if let (Err(overlay_engine::engine::EngineError::WalkCouldNotRun(stop)), Some(db)) =
+            (&replayed, &counters)
+        {
+            crate::ops::note_engine_walk_not_now(db, stop, "Queue").await;
+        }
         // lane E1D's delta fold (L2): what the engine landed first from the BEEF (written whole, whatever the
         // subject's own report) is guarded like the replay's own write; the batch's end flush ships the notes
         if let (Ok((_, report)), Some(db)) = (&replayed, &counters) {
@@ -2538,7 +2569,7 @@ async fn queue_handler(
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
                         .await;
-                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("failed: {e}"), crate::dead_letters::LetterClass::Fault).await;
+                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("failed: {e}"), crate::queue::replay_error_class(&e)).await;
                 }
                 msg.retry();
             }

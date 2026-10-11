@@ -785,13 +785,42 @@ async fn large_spend_verification_cost() {
         .expect("the expensive spend is valid");
     let verify_ms = started.elapsed().as_millis();
 
-    // The whole submit (parse + verify + admission), with a chain tracker.
+    // The whole submit (parse + walk + admission), with a chain tracker.
+    // Since bsv-low #592 the submit's walk runs under the door's budget: 2330
+    // SHA256 rounds are charged 2330 elements of 128 KB, past the 64 MiB work
+    // limb, so the walk could not run. Since the E592 lens fold that is "not
+    // now" (nothing judged or written) unless the network's accept is on
+    // record (`WalkBreachPolicy::NetworkAccepted`, the gated replay), where
+    // the spend is admitted as under historical-tx-no-spv. Its funding is
+    // proven, so presented PROVEN itself (after its block) it is admitted
+    // with no walk. `Transaction::verify` above is the measure of the
+    // interpreter's own cost.
     let engine = engine(Some(tracker_knowing(&fixture.funding_txid)));
     let started = Instant::now();
-    engine
-        .submit(&tagged(&fixture), SubmitMode::CurrentTx)
+    match engine
+        .submit_with_report(&tagged(&fixture), SubmitMode::CurrentTx)
         .await
-        .expect("the expensive spend is admitted");
+    {
+        Err(EngineError::WalkCouldNotRun(stop)) => assert_eq!(
+            stop.limb,
+            bsv_overlay_engine::engine::WalkLimb::OverWork,
+            "the submit's walk is bounded by the work limb"
+        ),
+        other => panic!("not now on an ungated submit: {other:?}"),
+    }
+    let (_, report) = engine
+        .submit_with_report_under(
+            &tagged(&fixture),
+            SubmitMode::CurrentTx,
+            bsv_overlay_engine::engine::WalkBreachPolicy::NetworkAccepted,
+        )
+        .await
+        .expect("with the network's accept on record the expensive spend is admitted");
+    assert_eq!(
+        report.walk_could_not_run.map(|stop| stop.limb),
+        Some(bsv_overlay_engine::engine::WalkLimb::OverWork),
+        "the submit's walk is bounded by the work limb"
+    );
     let submit_ms = started.elapsed().as_millis();
 
     println!(
@@ -1357,7 +1386,7 @@ async fn door_stats_describe_the_real_covenant_leg() {
 }
 
 #[tokio::test]
-async fn door_over_budget_is_inconclusive_never_a_refusal_and_the_reference_walk_is_untouched() {
+async fn door_over_budget_is_inconclusive_never_a_refusal_and_the_submit_is_not_now() {
     // 600 hash ops × the 128 KB element limit ≈ 77 MB of estimated work: over
     // the 64 MB budget from the BYTES alone, before anything executes.
     let n = (DoorBudget::DEFAULT.max_work_bytes / DoorBudget::DEFAULT.memory_limit as u64) as usize
@@ -1385,13 +1414,35 @@ async fn door_over_budget_is_inconclusive_never_a_refusal_and_the_reference_walk
         ),
         "the door's own bound, never the interpreter's verdict: {err}"
     );
-    // The reference walk (`submit`) has no budget: the same valid spend is admitted.
+    // The submit's walk runs under the same budget since bsv-low #592: it
+    // could not run, which is not a refusal. Under `current-tx` nothing on
+    // record judges it, so it is NOT NOW (the E592 lens fold, H1): nothing
+    // written. Only with the network's accept on record (the gated replay)
+    // is the same valid spend admitted as under historical-tx-no-spv.
     let storage = Rc::new(MemoryStorage::new());
     let reference = engine_with(Rc::clone(&storage), None);
-    reference
-        .submit(&tagged(&heavy), SubmitMode::CurrentTx)
+    match reference
+        .submit_with_report(&tagged(&heavy), SubmitMode::CurrentTx)
         .await
-        .expect("the reference walk admits a valid spend whatever its cost");
+    {
+        Err(EngineError::WalkCouldNotRun(stop)) => {
+            assert_eq!(stop.limb, bsv_overlay_engine::engine::WalkLimb::OverWork);
+        }
+        other => panic!("not now, never a refusal and never an admission: {other:?}"),
+    }
+    assert!(!is_admitted(&storage, &heavy.subject_txid).await);
+    let (_, report) = reference
+        .submit_with_report_under(
+            &tagged(&heavy),
+            SubmitMode::CurrentTx,
+            bsv_overlay_engine::engine::WalkBreachPolicy::NetworkAccepted,
+        )
+        .await
+        .expect("a valid spend past the budget the network accepted is admitted");
+    assert_eq!(
+        report.walk_could_not_run.map(|stop| stop.limb),
+        Some(bsv_overlay_engine::engine::WalkLimb::OverWork)
+    );
     assert!(is_admitted(&storage, &heavy.subject_txid).await);
 }
 

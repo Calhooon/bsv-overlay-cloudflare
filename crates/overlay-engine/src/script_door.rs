@@ -188,6 +188,51 @@ pub(crate) fn chunk_count(script: &[u8]) -> u64 {
     chunks
 }
 
+/// bsv-rs's own words for an unlocking script that is not push-only
+/// (`Spend::validate`).
+pub(crate) const NOT_PUSH_ONLY: &str =
+    "Unlocking scripts can only contain push operations, and no other opcodes.";
+
+/// Whether `script` is push-only as bsv-rs 0.4.3's `Script::is_push_only`
+/// reads it (every chunk's opcode at most `OP_16`), with no allocation: the
+/// chunks are cut as [`chunk_count`] cuts them (a push cut short at the end
+/// is one push chunk, as the SDK cuts it). Pinned against the SDK
+/// (`e592f_h1_push_only_is_the_sdks`): re-proven at every bsv-rs bump.
+pub(crate) fn push_only(script: &[u8]) -> bool {
+    use bsv_rs::script::op::{OP_16, OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4};
+    let len = script.len();
+    let mut at = 0usize;
+    let width = |at: usize, n: usize| {
+        (0..n).fold(0usize, |acc, i| {
+            acc | usize::from(script.get(at + i).copied().unwrap_or(0)) << (8 * i)
+        })
+    };
+    while at < len {
+        let op = script[at];
+        at += 1;
+        if op > OP_16 {
+            return false;
+        }
+        let header = match op {
+            OP_PUSHDATA1 => 1,
+            OP_PUSHDATA2 => 2,
+            OP_PUSHDATA4 => 4,
+            _ => 0,
+        };
+        let pushed = if op > 0 && op < OP_PUSHDATA1 {
+            usize::from(op)
+        } else if header > 0 {
+            let n = width(at, header);
+            at = (at + header).min(len);
+            n
+        } else {
+            0
+        };
+        at = at.saturating_add(pushed).min(len);
+    }
+    true
+}
+
 /// What one input's scripts hold once parsed and run, beside the frame's
 /// estimate: [`SCRIPT_CHARGE_PER_CHUNK`] a chunk and
 /// [`SCRIPT_CHARGE_PER_BYTE`] a byte of both scripts.
@@ -398,6 +443,47 @@ pub(crate) fn walk(
     subject_txid: &str,
     budget: DoorBudget,
 ) -> Result<WalkStats, EngineError> {
+    walk_trusting(
+        beef_bytes,
+        subject_txid,
+        budget,
+        &HashSet::new(),
+        &mut WalkTrace::default(),
+    )
+}
+
+/// What a walk saw beside its statistics, for the engine's submit (bsv-low
+/// #592): the PROVEN transactions it reached, in the order it reached them
+/// (the submit asks the chain tracker for their roots once the scripts
+/// passed; the door asks nothing), and whether a breach of the work limb was
+/// the interpreter's own memory limit tripping (the door's error says `Work`
+/// for both).
+///
+/// `proven_sources` (the E592 lens fold, H1): every PROVEN source whose
+/// output an input read, in that order, recorded when it is read and before
+/// that input is charged. A walk that breaches at an input over a proven
+/// source has read its lock but not yet reached it as a transaction (it is
+/// queued only once the input ran); the submit checks its root all the same,
+/// so a breach never skips the root of a proof the walk relied on.
+#[derive(Debug, Default)]
+pub(crate) struct WalkTrace {
+    pub(crate) proven: Vec<String>,
+    pub(crate) proven_sources: Vec<String>,
+    pub(crate) interpreter_tripped: bool,
+}
+
+/// [`walk`] trusting `trusted` (display txids an earlier walk of the same
+/// submit passed over: neither checked nor descended), and recording what it
+/// reached in `trace`. The door trusts nothing; the engine's submit trusts
+/// what a carried predecessor's landing already walked (the E1D delta fold,
+/// L4). One walker for both (bsv-low #592).
+pub(crate) fn walk_trusting(
+    beef_bytes: &[u8],
+    subject_txid: &str,
+    budget: DoorBudget,
+    trusted: &HashSet<String>,
+    trace: &mut WalkTrace,
+) -> Result<WalkStats, EngineError> {
     let mut stats = WalkStats::default();
     // The memory limb, from the frame alone: nothing is allocated before it.
     let sized = stream_sizing::estimate(beef_bytes, &DOOR_CHARGES, budget.max_memory_bytes);
@@ -460,7 +546,24 @@ pub(crate) fn walk(
 
     // The outputs of each source the walk spent from, by offset.
     let mut sources: HashMap<Hash32, Box<[usize]>> = HashMap::new();
-    let mut seen: HashSet<Hash32> = HashSet::new();
+    let mut seen: HashSet<Hash32> = trusted
+        .iter()
+        .filter_map(|txid| {
+            let mut wire = Hash32::try_from(bsv_rs::primitives::from_hex(txid).ok()?).ok()?;
+            wire.reverse();
+            Some(wire)
+        })
+        .collect();
+    // THE STATIC PRE-PASS (the E592 delta lens, D1-L1): before any charge,
+    // every unlocking script of every transaction this walk can reach is read
+    // for push-only. The per-input check below made "a static refusal is a
+    // refusal, never a breach" true per input only: a non-push unlocking
+    // script on input 1 (or on an ancestor) was never read when input 0's
+    // lock breached the census first, and the answer was "the walk could not
+    // run". Now the interpreter's refusal is answered whatever a lock costs.
+    if let Some(refused) = first_not_push_only(beef_bytes, &index, subject, &seen) {
+        return Err(refused);
+    }
     let mut queue: Vec<Hash32> = vec![subject];
     while let Some(wire_txid) = queue.pop() {
         if !seen.insert(wire_txid) {
@@ -478,7 +581,9 @@ pub(crate) fn walk(
         if index.proven.contains(&wire_txid) {
             // 'scripts only': a proven transaction is trusted as-is, no root
             // computed, no tracker asked. The caller's bar is the network's
-            // acceptance, never this proof.
+            // acceptance, never this proof. The engine's submit asks the
+            // tracker for its root once the walk passed (bsv-low #592).
+            trace.proven.push(txid);
             continue;
         }
 
@@ -536,7 +641,25 @@ pub(crate) fn walk(
                     format!("satoshi total overflows in transaction {txid}"),
                 )
             })?;
+            if index.proven.contains(&input.prev) {
+                trace.proven_sources.push(display_hex(&input.prev));
+            }
             let unlocking_bytes = &raw[input.script.clone()];
+            // A STATIC refusal is the interpreter's own, before any charge
+            // (the E592 lens fold, H1; the pre-pass above already read every
+            // reachable one, so this is the belt): an unlocking script that is not
+            // push-only is refused by bsv-rs's `Spend::validate` before it
+            // runs a byte, at every transaction version (its
+            // `REQUIRE_PUSH_ONLY_UNLOCKING`, the reference's rule), in these
+            // words. Charged first, a one-byte `OP_CHECKMULTISIG` unlock was
+            // estimated 260 MB of work and the walk "could not run".
+            if !push_only(unlocking_bytes) {
+                return Err(EngineError::ScriptVerificationFailed {
+                    subject_txid: txid.clone(),
+                    input_index: vin as u32,
+                    reason: NOT_PUSH_ONLY.into(),
+                });
+            }
             // The memory of this input's scripts once parsed and run, beside
             // the frame's estimate, charged BEFORE either is parsed (the
             // delta lens E585-D12-DELTA-M1). It is held for this input only.
@@ -664,6 +787,7 @@ pub(crate) fn walk(
                 // the stack budget, the alt stack, NUM2BIN's element-size
                 // pre-check), so no wording is matched.
                 Err(e) if e.is_resource_limit() => {
+                    trace.interpreter_tripped = true;
                     return Err(over(
                         &txid,
                         judged,
@@ -704,6 +828,54 @@ pub(crate) fn walk(
         }
     }
     Ok(stats)
+}
+
+/// The first unlocking script that is not push-only among the transactions
+/// a walk from `subject` can reach, in the walk's own order (the subject's
+/// inputs first to last, then its unproven sources depth first, the last
+/// input's first), as the interpreter's refusal. O(script bytes): no charge,
+/// no parse of a script, one layout of a transaction at a time. A proven
+/// transaction is not descended (the walk trusts it), nor one in `trusted`;
+/// a transaction the BEEF lacks or that does not lay out ends that branch
+/// (the walk answers its own fault there). It reads only the unlocking
+/// scripts, so it can answer a refusal where the walk would have stopped at a
+/// structural fault EARLIER in its order (a source output out of bounds, the
+/// value rule): both are a body the network refuses; the refusal names the
+/// input the interpreter refuses.
+fn first_not_push_only(
+    beef_bytes: &[u8],
+    index: &DoorIndex,
+    subject: Hash32,
+    trusted: &HashSet<Hash32>,
+) -> Option<EngineError> {
+    let mut seen = trusted.clone();
+    let mut queue: Vec<Hash32> = vec![subject];
+    while let Some(wire_txid) = queue.pop() {
+        if !seen.insert(wire_txid) || index.proven.contains(&wire_txid) {
+            continue;
+        }
+        let tx = index.raw(beef_bytes, &wire_txid).and_then(|raw| {
+            let tx = Layout::of(raw)?;
+            Some((raw, tx))
+        });
+        let Some((raw, tx)) = tx else { continue };
+        for (vin, input) in tx.inputs.iter().enumerate() {
+            if !push_only(&raw[input.script.clone()]) {
+                return Some(EngineError::ScriptVerificationFailed {
+                    subject_txid: display_hex(&wire_txid),
+                    input_index: vin as u32,
+                    reason: NOT_PUSH_ONLY.into(),
+                });
+            }
+        }
+        queue.extend(
+            tx.inputs
+                .iter()
+                .map(|input| input.prev)
+                .filter(|prev| index.raw(beef_bytes, prev).is_some()),
+        );
+    }
+    None
 }
 
 #[cfg(test)]
@@ -932,6 +1104,43 @@ mod tests {
     /// push width cut short, an `OP_RETURN` inside and outside a conditional,
     /// an `OP_ENDIF` with no `OP_IF`) and 20,000 random scripts biased toward
     /// those bytes. Re-run at every bsv-rs bump.
+    /// The E592 lens fold, H1: the door's static push-only read is the SDK's
+    /// own (`Script::is_push_only`, which `Spend::validate` asks first), over
+    /// every one- and two-byte script and pseudo-random scripts with cut-short
+    /// pushes. Re-proven at every bsv-rs bump.
+    #[test]
+    fn e592f_h1_push_only_is_the_sdks() {
+        let mut scripts: Vec<Vec<u8>> = Vec::new();
+        for a in 0..=255u8 {
+            scripts.push(vec![a]);
+            for b in 0..=255u8 {
+                scripts.push(vec![a, b]);
+            }
+        }
+        let mut seed: u64 = 0x5eed_e592;
+        for _ in 0..20_000 {
+            let mut script = Vec::new();
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            for _ in 0..(seed >> 58) as usize {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                // mostly pushes, sometimes an opcode past OP_16
+                let byte = if seed.is_multiple_of(7) {
+                    (seed >> 40) as u8
+                } else {
+                    ((seed >> 40) % 0x61) as u8
+                };
+                script.push(byte);
+            }
+            scripts.push(script);
+        }
+        for script in &scripts {
+            let sdk = Script::from_binary(script).map(|s| s.is_push_only());
+            if let Ok(sdk) = sdk {
+                assert_eq!(push_only(script), sdk, "{}", hex::encode(script));
+            }
+        }
+    }
+
     #[test]
     fn e585f2_m1_the_chunk_count_is_the_sdks() {
         use bsv_rs::script::op::*;

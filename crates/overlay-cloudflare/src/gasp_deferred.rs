@@ -481,6 +481,10 @@ pub const COUNTER_GASP_GRAPH_CONVERGED: &str = "gasp_graph_converged_total";
 /// own counter, [`dropped_counter_name`].
 pub const COUNTER_GASP_GRAPH_DROPPED: &str = "gasp_graph_dropped_total";
 
+/// Graphs HELD because their GASP anchor's script walk could not run within the engine's walk budget (bsv-low #592;
+/// the E592 lens fold, H1 and L3): not finalized, the UTXO below its cursor until the root is served proven.
+pub const COUNTER_GASP_ANCHOR_WALK_HELD: &str = "gasp_anchor_walk_held_total";
+
 /// The counter of one drop reason: `gasp_graph_dropped_<reason>_total`.
 pub fn dropped_counter_name(reason: &str) -> String {
     format!("gasp_graph_dropped_{reason}_total")
@@ -494,6 +498,7 @@ pub fn counter_names() -> Vec<String> {
         COUNTER_GASP_GRAPH_CONVERGED.to_string(),
         COUNTER_GASP_GRAPH_DROPPED.to_string(),
         COUNTER_GASP_GRAPH_DROPPED_STALE.to_string(),
+        COUNTER_GASP_ANCHOR_WALK_HELD.to_string(),
     ];
     names.extend(
         overlay_engine::gasp::DropReason::ALL
@@ -517,6 +522,9 @@ pub fn counter_deltas(
         *deltas
             .entry(COUNTER_GASP_GRAPH_CONVERGED.into())
             .or_default() += r.converged_graphs;
+        *deltas
+            .entry(COUNTER_GASP_ANCHOR_WALK_HELD.into())
+            .or_default() += r.anchor_walk_held_graphs;
         for d in &r.dropped_graphs {
             *deltas.entry(COUNTER_GASP_GRAPH_DROPPED.into()).or_default() += 1;
             *deltas.entry(dropped_counter_name(&d.reason)).or_default() += 1;
@@ -1603,6 +1611,7 @@ mod tests {
             errors: vec![],
             pruned_inputs: 0,
             discarded_graphs: 0,
+            anchor_walk_held_graphs: deferred / 2,
             finalized_graphs: 0,
             deadline_dropped_graphs: 0,
             cursor_moves: vec![],
@@ -1630,6 +1639,7 @@ mod tests {
         assert_eq!(
             counter_deltas(&results),
             vec![
+                ("gasp_anchor_walk_held_total".to_string(), 1),
                 ("gasp_graph_converged_total".to_string(), 1),
                 ("gasp_graph_deferred_total".to_string(), 2),
                 ("gasp_graph_dropped_max_passes_total".to_string(), 2),
@@ -1639,7 +1649,9 @@ mod tests {
             ]
         );
         let names = counter_names();
-        assert_eq!(names.len(), 5 + 10);
+        // the E592 lens fold: the anchor's hold is seeded beside them
+        assert_eq!(names.len(), 6 + 10);
+        assert!(names.contains(&COUNTER_GASP_ANCHOR_WALK_HELD.to_string()));
         // bsv-low #585: nothing is dropped for its size.
         assert!(!names.contains(&"gasp_graph_dropped_too_big_total".to_string()));
         assert!(names.contains(&"gasp_graph_dropped_root_proven_total".to_string()));

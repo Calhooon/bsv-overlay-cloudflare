@@ -584,7 +584,9 @@ pub struct DeferredGraph {
     /// Passes that deferred it (its age, in passes).
     pub passes: u32,
     /// Why it was last deferred: `calls`, `time`, `bytes`, `nodes`, `fault`,
-    /// `anchor_unavailable`, `not_landed` or `peer_deadline`.
+    /// `anchor_unavailable`, `anchor_walk_held` (the E592 lens fold: the
+    /// anchor's walk past the budget, held until the root is served proven),
+    /// `not_landed` or `peer_deadline`.
     pub reason: String,
     /// Whether the peer is a CONFIGURED one (`SyncTarget::Peers`), not one
     /// `ls_ship` discovered (bsv-low #555, the delta-2 fold's D2-M2): a
@@ -1168,6 +1170,9 @@ pub struct GASPSync<'a> {
     /// Graphs REFUSED by `validate_graph_anchor` and discarded in the last
     /// `sync` (bsv-low #551). Cleared at the start of each `sync`.
     discarded_graphs: std::cell::Cell<u64>,
+    /// Graphs whose anchor walk could not run within the budget and were
+    /// HELD (the E592 lens fold): [`GASPSync::anchor_walk_held`].
+    anchor_walk_held: std::cell::Cell<u64>,
     /// Called after every completed incoming UTXO (bsv-low #552). `None`
     /// (the default): nothing is called and `sync` runs as it always did.
     finalized_hook: Option<Box<dyn FinalizedGraphHook + 'a>>,
@@ -1224,6 +1229,7 @@ impl<'a> GASPSync<'a> {
             pruned: std::cell::RefCell::new(std::collections::HashSet::new()),
             pruned_inputs: std::cell::Cell::new(0),
             discarded_graphs: std::cell::Cell::new(0),
+            anchor_walk_held: std::cell::Cell::new(0),
             finalized_hook: None,
             completed_cursor: last_interaction,
             graph_in_flight: false,
@@ -1320,6 +1326,15 @@ impl<'a> GASPSync<'a> {
         self.discarded_graphs.get()
     }
 
+    /// How many graphs this orchestrator's last `sync` HELD because their
+    /// anchor's script walk could not run within the engine's walk budget
+    /// (`GASPError::AnchorWalkHeld`; bsv-low #592, the E592 lens fold): not
+    /// finalized, the UTXO failed and the cursor kept below it, until the
+    /// peer serves the root proven. Not counted in `discarded_graphs`.
+    pub fn anchor_walk_held(&self) -> u64 {
+        self.anchor_walk_held.get()
+    }
+
     /// How many manager-named inputs this orchestrator pruned because the
     /// peer answered that it does not hold them (the D8 decoy rule, see
     /// `process_incoming_node`). Counted per DISTINCT outpoint per `sync`
@@ -1359,6 +1374,7 @@ impl<'a> GASPSync<'a> {
         self.pruned.borrow_mut().clear();
         self.pruned_inputs.set(0);
         self.discarded_graphs.set(0);
+        self.anchor_walk_held.set(0);
         self.completed_cursor = self.last_interaction;
         self.graph_in_flight = false;
         self.walk.borrow_mut().take();
@@ -1904,6 +1920,8 @@ impl<'a> GASPSync<'a> {
                     }
                     // `complete_graph` discarded the graph already.
                     Err(GASPError::AnchorUnavailable(_)) => ("anchor_unavailable", true),
+                    // The same hold, for a walk past the budget (E592 fold).
+                    Err(GASPError::AnchorWalkHeld(_)) => ("anchor_walk_held", true),
                     // A finalize fault: the graph is still in hand.
                     Err(_) => {
                         let _ = self.storage.discard_graph(&graph_id).await;
@@ -2748,6 +2766,12 @@ impl<'a> GASPSync<'a> {
                 if matches!(e, GASPError::AnchorUnavailable(_)) {
                     return Err(e);
                 }
+                // A walk past the budget: held the same way, counted apart
+                // (the E592 lens fold, H1 and L3).
+                if matches!(e, GASPError::AnchorWalkHeld(_)) {
+                    self.anchor_walk_held.set(self.anchor_walk_held.get() + 1);
+                    return Err(e);
+                }
                 self.discarded_graphs.set(self.discarded_graphs.get() + 1);
                 Ok(false)
             }
@@ -2802,6 +2826,17 @@ pub enum GASPError {
     /// UTXO, so the cursor gap guard asks for it again (bsv-low #551).
     #[error("anchor unavailable: {0}")]
     AnchorUnavailable(String),
+
+    /// The anchor's script walk could not run within the engine's walk
+    /// budget (bsv-low #592; the E592 lens fold, H1): no verdict, and
+    /// nothing stands in for one (no network accepted these bytes). Held
+    /// exactly as [`GASPError::AnchorUnavailable`] holds: the graph is not
+    /// finalized, the UTXO fails and the cursor stays below it, until the
+    /// peer serves its root PROVEN (#555's `root_proven` restart, whose walk
+    /// trusts the proof and runs no script). Counted apart
+    /// (`GASPSync::anchor_walk_held`).
+    #[error("anchor walk held: {0}")]
+    AnchorWalkHeld(String),
 
     /// Generic error.
     #[error("{0}")]

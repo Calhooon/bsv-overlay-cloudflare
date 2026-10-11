@@ -150,7 +150,198 @@ script_verification -- --nocapture`. Measured natively, release profile
 (2026-09-08): the real 3150-byte Poc5 covenant settle is ~1 ms end to end; a
 ~7 KB lock / ~20 KB unlock / ~7000-opcode spend that hashes 46 MB is 137 ms
 in `Transaction::verify` (2.1 s in a debug build). Workers wasm is slower
-than native; budget CPU accordingly for big covenant legs.
+than native; budget CPU accordingly for big covenant legs. (Since #592 that
+spend is past the submit's work limb at submit: below.)
+
+### The submit's walk takes the door's two limbs (bsv-low #592; the owner's ruling 3a of 2026-10-10)
+
+Until #592 the walk above ran with no memory charge and no work bound:
+219.7 MB natively (217,765,812 measured by the pin) for a valid BEEF whose
+unproven parent carries 1.9 MB of push-only unlocking script, an isolate kill
+on Workers (128 MB). The door below bounded the gated arm's pre-broadcast
+walk only. The reach was every mode that walks: the ungated modes
+(operator-only under `SUBMIT_ENFORCE`), `/admin/readmit`, the peer crawler,
+the GASP anchor check (#557), and above all the QUEUE REPLAY: every gated
+submit enqueues its replay (S2) and the consumer re-submits it under
+`historical-tx`, which walks (the gated arm's own synchronous admission is
+no-spv and does not). A stranger's valid 1.9 MB parent passed the door,
+broadcast, admitted, then killed the consumer's isolate on each redelivery
+until it dead-lettered.
+
+**One walker.** `Engine::submit`'s walk (`verify_beef_linear`, every mode but
+`HistoricalTxNoSpv`) and the GASP anchor check (`verify_spv_like_the_reference`)
+now run the DOOR's stream walk (`script_door::walk_trusting`, the function
+`verify_scripts_only` runs) under the engine's `DoorBudget`: the same two limbs
+(64 MiB of work, 48 MiB of memory), the same estimates charged from the bytes
+before anything is parsed or run, the same 128 KB interpreter element limit.
+The walk and `DoorBudget` were already in `overlay-engine` (since #585), so
+nothing moved; the worker's door is unchanged byte for byte. What the submit
+adds after the walk: the roots of the proven transactions it reached, in its
+order, asked of the chain tracker once per BUMP (computed and accepted with
+none). A body with BOTH a refused script and a bad root now names the script
+(the old walk checked them in one order; stated, not pinned).
+
+**The budget is configuration.** `EngineBuilder::with_walk_budget` /
+`Engine::set_walk_budget`, `DoorBudget::DEFAULT` unless set (a library
+consumer, Zanaadu, gets 64 MiB / 48 MiB). The worker sets
+`WORKER_WALK_BUDGET` (`lib.rs`, equal to `DoorBudget::DEFAULT`, under which
+the gated door walks; pinned equal) and the engine hands it to the GASP
+anchor check (`OverlayGASPStorage::with_walk_budget`).
+
+**A breach is "the walk could not run"**, never a refusal, and (the E592 lens
+fold, 2026-10-10) NEVER AN ADMISSION WITHOUT THE NETWORK'S WORD. As built at
+`4060ffd` the submit went on as `HistoricalTxNoSpv` on every walking path, and
+the lens found that NOT SOUND (E592-H1): the work limb is a static estimate
+from the bytes, a one-byte unlocking script `OP_CHECKMULTISIG` was charged
+3,971 keys (about 260 MB) and passed it before anything ran, and the roots
+were skipped with the scripts, so a stranger could spend a held coin with no
+signature on the ungated modes (public wherever `SUBMIT_ENFORCE` is unset, as
+in `wrangler.toml`), the peer crawler and the GASP anchor. The rule now is the
+caller's `WalkBreachPolicy`, an explicit engine argument, never inferred from
+the mode:
+
+- `NotNow` (every door's default: `Engine::submit`, `submit_with_report`):
+  `EngineError::WalkCouldNotRun(WalkCouldNotRun)` before any manager is asked.
+  Nothing judged, nothing written, never a final refusal. The way out is the
+  subject PROVEN: a proven transaction is not walked, so an honest body too
+  big to walk unmined lands after its block.
+  - The ungated `/submit` (`current-tx`, `historical-tx`) and `/admin/readmit`
+    answer 503 `{"code":"walk-could-not-run","limb":..,"retryable":true,
+    "retryAfterSecs":600}` with `Retry-After: 600` (`routes::walk_not_now`):
+    nothing written and NOTHING QUEUED (the same unproven bytes would breach
+    again). A client retries after the block, not at once.
+  - The peer crawler keeps the report (`submit_with_report`), counts the stop
+    (`CrawlResult::walks_could_not_run`), admits nothing, and crawls it again
+    next tick.
+  - The queue replay of a message WITHOUT the gated mark: the error is classed
+    `not_now` (`queue::replay_error_class`), so after its retries it rests as
+    a parked `not_now` letter under #576's bounds (one per txid, 200 a day),
+    never a `fault` letter and never an admission.
+  - The GASP anchor HOLDS (`GASPError::AnchorWalkHeld`): below.
+- `NetworkAccepted` (`Engine::submit_with_report_under`): the network's accept
+  of these very bytes is on record. Used by ONE caller: the queue consumer, for
+  a message the broadcast-gated arm's producer marked (`MutationMessage::gated`,
+  `"gated":true` on the wire only when set; `queue::replay_breach_policy`). The
+  submit goes on exactly as under `HistoricalTxNoSpv`, reported on
+  `MutationReport::walk_could_not_run` (`subject_txid`, `at_txid`,
+  `subject_judged`, `limb`: `OverWork`, `OverMemory` or `InterpreterMemory`;
+  `what`), durable, acked, never dead-lettered for the walk's size.
+
+Stated, found by the fold: the gated arm submits, and enqueues its S2 replay,
+under its engine mode `HistoricalTxNoSpv` (`SubmitAction::engine_mode`, `AdmissionPath::NetworkGated`),
+so its replay message carries `historical-tx-no-spv` and does NOT walk. #592's
+premise that "the consumer re-submits it under `historical-tx`" does not hold
+on this tip; the `NetworkAccepted` arm is the rule for a gated message that
+walks, and no production message reaches it today. What walks in the queue is
+an UNGATED submit's fault replay (its own mode), which is now "not now".
+
+**The roots of a breached walk are checked** (both policies): every proven
+transaction the walk reached and every proven SOURCE an input read before the
+breach (`WalkTrace::proven_sources`, recorded when the input reads its lock),
+once per BUMP; a bad root is the `SpvError` it is on a walk that ran.
+
+**A static refusal is a refusal, never a breach.** An unlocking script that is
+not push-only is refused BEFORE any charge, in the interpreter's own words
+(`ScriptVerificationFailed`, "Unlocking scripts can only contain push
+operations, and no other opcodes."; `script_door::push_only`, no allocation,
+pinned equal to bsv-rs's `Script::is_push_only` by `e592f_h1_push_only_is_the_sdks`).
+bsv-rs 0.4.3 enforces it at EVERY transaction version (`REQUIRE_PUSH_ONLY_UNLOCKING`,
+`Spend::new`, not version-conditional, unlike MINIMALDATA/LOW_S/CLEANSTACK/NULLDUMMY),
+so the check is applied to v1 and v2 alike. It holds across the WHOLE walk,
+not per input (the E592 delta lens, D1-L1), once the frame's memory limb
+admits the stream (a body over that limb at the frame answers
+`WalkCouldNotRun` before any script is read; the delta-2 lens, NOTE-3): a PRE-PASS reads the unlocking
+script of every input of every transaction the walk can reach, in the walk's
+order, before any charge (`script_door::first_not_push_only`, O(script
+bytes), no parse), so a non-push unlocking script on input 1, or on an
+unproven ancestor, is refused even when input 0's lock would breach the
+census first (it was `WalkCouldNotRun`); the per-input check stays as the
+belt, unreachable while the pre-pass visits a superset of what the walk
+executes, so no pin guards it (the delta-2 lens, NOTE-2, a mutant run). The pre-pass reads only the unlocking scripts, so it can name a
+refusal where the walk would have stopped earlier at a structural fault (a
+source output out of bounds, the value rule): both are bodies the network
+refuses. At the gated door the pre-pass therefore refuses (400
+`script-refused`, `submit_script_refused_total`, nothing broadcast) a body
+that before it was left to the network for a breach or a structural fault;
+reference parity (the SDK's `Spend` refuses a non-push unlock at every
+version); LOW's own spends never take this path (the delta-2 lens, NOTE-1). Pin `e592_d1_l1_a_non_push_unlock_anywhere_is_refused_before_a_breach`
+(`--test engine_walk_budget`, under both policies; RED with the pre-pass
+inert). The census may still over-estimate
+a hostile LOCK (a bare `OP_CHECKMULTISIG`, 513 hash opcodes): that is the
+policy's case, "not now", not a refusal. What a breach costs now: an unlocking
+script can no longer trip the work limb (it is push-only, so no hash or
+signature opcode is charged in it); a breach needs a LOCK, i.e. a source
+output in the walk, at least one byte of lock in a fabricated parent
+(`OP_CHECKMULTISIG`, charged 3,971 keys at the 64 KiB floor). Its effect is
+"not now" everywhere but a message the network accepted. Not measured in this
+lane: the smallest such body in bytes.
+
+**The landing trusts only a walk that ran** (E592-M1): the carried
+predecessors' trust set is `walk_cover` of the subject only when the subject's
+walk ran (`Landing::subject_walk_ran`); after a breach each carried predecessor
+is walked by its own submit, and a landing's own breach is reported on
+`MutationReport::landed_walks_could_not_run` (under `NotNow` that landing does
+not happen and the successor waits) and counted by the worker. A body a
+breached landing went past (`NetworkAccepted`) is not added to the trust set.
+
+**Every walking door counts** (E592-L3): `ops::note_engine_walk` (a breach
+that went on, and every landing's) and `ops::note_engine_walk_not_now` (a "not
+now") at the queue, `/submit`, `/admin/readmit` and the peer crawl (counted INSIDE the crawl as each
+submit returns, the cron's and `/admin/crawlPeers`' alike, so a crawl the
+cron drops at `PEER_CRAWL_BUDGET_MS` keeps what it finished; they were
+counted after the race and lost with it: the E592 delta lens, NOTE-3), into
+`submit_engine_walk_over_budget_total` (work, interpreter memory) or
+`submit_engine_walk_over_memory_total`; the anchor's hold into
+`gasp_anchor_walk_held_total` and `anchor_walk_held_graphs` on both GASP sync
+lines (`TopicSyncResult::anchor_walk_held_graphs`). A clean FALSE from the
+interpreter is the refusal it was; a structural fault is the `SpvError` it
+was, in the same words. The reference (`Engine.submit`, `tx.verify`) has no
+budget: this is the platform's addition, on D8's lineage.
+
+**One budget per engine** (the lens's NOTE-2): `Engine::verify_scripts_only`
+(the gated door) now walks under the engine's `walk_budget`, not a hard-coded
+`DoorBudget::DEFAULT`; the worker builds its engine under
+`WORKER_WALK_BUDGET` (= `DoorBudget::DEFAULT`, pinned).
+
+What it costs: the cost of the budget falls on bodies the walk cannot hold,
+and none of them is now admitted unrun except under the network's accept. A
+VALID body past the limbs (the hash-heavy and `OP_CAT` shapes, a 1 MB `OP_NOP`
+lock, more than 1,024 signature checks in one walk, the ~7000-opcode spend
+above, an element past 128 KB) is "not now" on the ungated doors until it is
+presented proven; an INVALID one is never admitted (it was, as built at
+`4060ffd`). Measured natively (debug), the witness under `historical-tx`:
+217,765,812 bytes on `54dbb16`; 13,312,867 under `NotNow` and 15,211,772
+under `NetworkAccepted` on this tip. The bulk is the ENGINE's own submit, not
+any route (the lens's L1; pin (a) calls `Engine::submit_with_report_under`
+directly): `run_validation`'s `parse_beef` and `transaction_from_beef` of the
+1.9 MB body, and, when it goes on, the atomic BEEF built for the lookup
+services and the stored copy; the walk itself adds hundreds of bytes (the lens
+measured 764 against no-spv). Not measured on wasm32.
+
+Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
+engine_walk_budget -- --nocapture` (`e592_a_the_witness_*`: not now under
+`NotNow`, goes on under `NetworkAccepted`, both peaks under the limb plus the
+body; RED on `54dbb16` with the report's field unread: "the submit held
+217765812 bytes (the memory limb plus the body is 52231890): Ok(MutationReport
+{ faults: [], applied_topics: [\"tm_test\"], .. })";
+`e592_a_each_limb_is_named_not_now_or_goes_on_by_the_policy`,
+`e592_the_budget_*`; `e592_c_*`, parity); `--lib e592f` (`push_only` against
+the SDK); `--test script_verification` (`door_over_budget_*_and_the_submit_is_not_now`,
+`large_spend_verification_cost`: not now, then admitted under
+`NetworkAccepted`). The worker's `--lib e592` (`beef_door_replay::e592`:
+`e592_b_the_gated_replay_goes_on_and_an_unmarked_one_is_not_now`, the
+witness's message by key with and without the mark, the mark on the wire only
+when set, the policy read off the message, a REAL engine under the Worker's
+budget: marked, applied, acked, its object deleted; unmarked, `WalkCouldNotRun`,
+classed `not_now`, nothing written; `e592f_the_route_answers_*`, the 503 body;
+`e592_d` the wiring of every door's count, the gated mark set by the gated arm
+alone). Each new pin uses API this fold adds and does not compile on `4060ffd`.
+Not committed, stated: the lens's four reproduction bodies (a forged spend of a
+held coin) and a GASP-level pin over a test peer serving such a root; the
+classes they reach are pinned by the policy pins above and the anchor's hold
+by its code path, not by a forged body. The route tier (an ungated
+`historical-tx` of the witness answering 503 and bumping the counter) is not
+run in the lane.
 
 ## The script door reads the stream (D8, bsv-low #585 door 1; the doors lens fold of 2026-10-09)
 
@@ -632,7 +823,7 @@ budget its UTXO fails; with none the peer's whole cursor stays for the tick).
 Pins: `cargo test -p bsv-overlay-engine --features memory-storage --test
 gasp_topic_manager i551` (and `fold_medium`).
 
-The anchor verify runs peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557).
+The anchor verify ran peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557); since #592 it walks under the engine's `DoorBudget`. Since the E592 lens fold a breach is HELD, never replayed: `GASPError::AnchorWalkHeld`, the graph not finalized, the UTXO failed (or, under a per-graph budget, its record kept with nothing pending, reason `anchor_walk_held`), the cursor below it, counted (`GASPSync::anchor_walk_held`, `anchor_walk_held_graphs`, the worker's `gasp_anchor_walk_held_total`). The roots the walk reached are checked first, so a bad proof is still a refusal. The hold ends when the peer serves the root PROVEN: #555's resume re-asks an unproven root and a proven one restarts the walk (`root_proven`), which trusts the proof and runs no script; so an honest 0-conf graph too big to walk lands after its block, a forgery never. What a forging peer costs: its own slot (the UTXO held below the cursor, its record re-asked each pass up to `DEFERRED_GRAPH_MAX_PASSES`) inside its per-peer budget, and D16's yieldless bound quarantines it if it never yields and serves nothing else, which holds ONLY with a per-graph budget (`set_graph_budget`, as the worker sets): the yieldless bound exists only there (the E592 delta lens, D1-L2). With NO per-graph budget (a library consumer that sets none) the held UTXO fails on every sync, the sync runs to its end and counts as a success under #302, the cursor stays below that UTXO for good, and the graph is fetched and its walk estimated again on every tick; nothing is admitted, the cost is ours, the residual D15 states for `AnchorUnavailable`. Not pinned by a test peer in the lane (stated).
 
 ## A faulted submit leaves one head (bsv-low #559, lens fold and three delta folds of 2026-10-07)
 

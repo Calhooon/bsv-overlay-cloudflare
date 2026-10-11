@@ -805,6 +805,7 @@ mod self_test {
             reason: queue::REPLAY_REASON_PHASE3_FAULT.into(),
             redrive: None,
             ef_job: None,
+            gated: false,
         };
         let (_, keyed) = &fixtures[3];
         let sha = hex::encode(bsv_rs::primitives::hash::sha256(keyed));

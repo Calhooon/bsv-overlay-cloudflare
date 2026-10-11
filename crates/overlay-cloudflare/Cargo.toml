@@ -61,6 +61,9 @@ worker = { version = "0.8", features = ["d1", "queue"] }
 js-sys = "0.3"
 
 [dev-dependencies]
+# bsv-low #592: the queue replay pin runs a REAL engine over `MemoryStorage`
+# (the engine's own test store; test-only, never in the wasm32 build).
+overlay-engine = { package = "bsv-overlay-engine", version = "0.1", path = "../overlay-engine", features = ["memory-storage"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 # Real SQLite (bundled — no system dependency, deterministic version) so the
 # identity-scoped read-window tests EXECUTE the exact shipped SQL against the

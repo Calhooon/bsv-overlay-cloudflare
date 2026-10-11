@@ -116,6 +116,10 @@ pub struct Engine {
     /// invalid spend on structure alone. See
     /// [`Engine::set_script_verification`].
     verify_scripts: bool,
+    /// The two limbs of the submit's own script walk (bsv-low #592): the
+    /// door's [`DoorBudget`], [`DoorBudget::DEFAULT`] unless set. See
+    /// [`Engine::set_walk_budget`].
+    walk_budget: DoorBudget,
     config: EngineConfig,
 }
 
@@ -264,6 +268,15 @@ const PREDECESSOR_READS_PER_SUBMIT: usize = 256;
 /// A submit's STEAK and report, and the carried predecessor that blocks each
 /// topic of a carried predecessor's own submit ([`Engine::submit_counted`]).
 type Counted = (Steak, MutationReport, HashMap<String, String>);
+
+/// What the landings of carried predecessors take from their successor's
+/// submit (the E592 lens fold, M1): its breach policy, and whether its own
+/// walk RAN (only then are the bodies it reached trusted).
+#[derive(Debug, Clone, Copy)]
+struct Landing {
+    policy: WalkBreachPolicy,
+    subject_walk_ran: bool,
+}
 
 struct NotNow {
     why: String,
@@ -451,6 +464,19 @@ pub struct MutationReport {
     /// caller asked for: a caller that guards its admission writes (the
     /// worker's eviction ledger, bsv-low #513) guards these too.
     pub landed_predecessors: Vec<(String, String)>,
+    /// The submit's own script walk could not run within the engine's
+    /// budget (bsv-low #592) and the submit went on as under
+    /// `HistoricalTxNoSpv` ([`WalkBreachPolicy::NetworkAccepted`] only; under
+    /// `NotNow` a breach is [`EngineError::WalkCouldNotRun`]). `None` when it
+    /// ran (or the mode does not walk). A caller counts it; it never makes a
+    /// report undurable.
+    pub walk_could_not_run: Option<WalkCouldNotRun>,
+    /// The walks of the carried predecessors this submit tried to land
+    /// ([`Engine::land_carried`]) that could not run within the budget (the
+    /// E592 lens fold, L3): under `NotNow` each one's landing did not happen
+    /// (the successor waits), under `NetworkAccepted` each went on. Counted
+    /// by the caller beside `walk_could_not_run`.
+    pub landed_walks_could_not_run: Vec<WalkCouldNotRun>,
 }
 
 /// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): what [`Engine::renotify_admitted`] did.
@@ -594,7 +620,9 @@ impl DoorBudget {
     /// copy of up to as much) and the EF batch (the route's 2 MB bound, twice
     /// while it is serialized): 24 MB, which leaves 56 MB for the module, the
     /// runtime, the allocator's fragmentation and what a native estimate does
-    /// not see of wasm32. The limb bounds the DOOR alone: the route's own
+    /// not see of wasm32. The limb bounds the walk (the door's, and since
+    /// bsv-low #592 the submit's own and the GASP anchor's under
+    /// [`Engine::set_walk_budget`]) and nothing else: the route's own
     /// hydrated parses before it are bounded by the isolate only (the land
     /// lens E585-LAND-M1: 1.43 GB natively for a 9.9 MB body of 900,000
     /// minimal transactions, before the route's 429). What
@@ -649,6 +677,102 @@ pub enum DoorLimb {
     Work,
     /// The estimate of what the door holds beside the body.
     Memory,
+}
+
+/// What [`Engine::run_validation`] answers: the topics' validations, the
+/// preliminary STEAK, the subject and its txid, and whether the walk could
+/// not run within the budget (bsv-low #592).
+type Validated = (
+    Vec<TopicValidation>,
+    Steak,
+    Transaction,
+    String,
+    Option<WalkCouldNotRun>,
+);
+
+/// Which limb of the [`DoorBudget`] a submit's own walk went past (bsv-low
+/// #592): the [`DoorLimb`] of the door's error, with the interpreter's own
+/// memory limit told apart from the static work estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkLimb {
+    /// The static work estimate.
+    OverWork,
+    /// The estimate of what the walk holds beside the body.
+    OverMemory,
+    /// The interpreter's own memory limit (the budget's element limit)
+    /// tripping inside one input.
+    InterpreterMemory,
+}
+
+impl WalkLimb {
+    /// The door's word for the same limb ([`DoorLimb`]: the interpreter's
+    /// trip is `Work` there).
+    #[must_use]
+    pub fn door_limb(self) -> DoorLimb {
+        match self {
+            WalkLimb::OverWork | WalkLimb::InterpreterMemory => DoorLimb::Work,
+            WalkLimb::OverMemory => DoorLimb::Memory,
+        }
+    }
+
+    /// The limb's name in a log line and a counter's reason.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WalkLimb::OverWork => "over_work",
+            WalkLimb::OverMemory => "over_memory",
+            WalkLimb::InterpreterMemory => "interpreter_memory",
+        }
+    }
+}
+
+/// What a submit does when its own script walk could not run within the
+/// engine's [`DoorBudget`] (bsv-low #592; the E592 lens fold, H1, the owner's
+/// ruling 3a read with the lens): a breach is NEVER an admission without the
+/// network's word on record.
+///
+/// The work limb is a static estimate from the bytes, and a LOCK can be made
+/// to pass it cheaply (a bare `OP_CHECKMULTISIG` in a fabricated parent's
+/// lock is charged 3,971 keys). So a breach says nothing about whether the
+/// spend is valid, and on a path where nothing else judges it an admission
+/// would admit a spend nobody checked: the lens's forged spend of a held coin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalkBreachPolicy {
+    /// "Not now" ([`EngineError::WalkCouldNotRun`]): nothing judged, nothing
+    /// written, never a final refusal. Every door but one: the ungated
+    /// modes, `/admin/readmit`, the peer crawler, a library consumer's
+    /// submit; the GASP anchor HOLDS its UTXO the same way.
+    #[default]
+    NotNow,
+    /// The network's ACCEPT of these bytes is on record (the queue's replay
+    /// of a gated submission, whose producer broadcast them and marked the
+    /// message): the submit goes on exactly as under `HistoricalTxNoSpv`,
+    /// reported on [`MutationReport::walk_could_not_run`]. The roots the walk
+    /// reached are still checked, and a bad one is still the `SpvError` it is.
+    NetworkAccepted,
+}
+
+/// A submit whose own script walk COULD NOT RUN within the engine's
+/// [`DoorBudget`] (bsv-low #592, the owner's ruling 3a of 2026-10-10). Shaped
+/// like [`EngineError::ScriptWalkOverBudget`]. Under
+/// [`WalkBreachPolicy::NotNow`] it is carried by
+/// [`EngineError::WalkCouldNotRun`] (not now); under
+/// [`WalkBreachPolicy::NetworkAccepted`] the submit went on as under
+/// `HistoricalTxNoSpv` and this says so on its [`MutationReport`]. The
+/// reference (`Engine.submit`, `tx.verify`) has no budget; this is the
+/// platform's addition, on the door's lineage (D8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkCouldNotRun {
+    /// The submitted transaction.
+    pub subject_txid: String,
+    /// The transaction the walk stopped at.
+    pub at_txid: String,
+    /// Whether the subject's own inputs had all executed before the stop.
+    pub subject_judged: bool,
+    /// The limb it went past.
+    pub limb: WalkLimb,
+    /// The estimate against the limb, in the door's words.
+    pub what: String,
 }
 
 /// What the walk did (the door's cost instrument, since `Date.now()` is
@@ -864,6 +988,7 @@ impl Engine {
             not_landed: std::cell::RefCell::new(HashSet::new()),
             landing_guard: None,
             verify_scripts: true,
+            walk_budget: DoorBudget::DEFAULT,
             config,
         }
     }
@@ -1097,6 +1222,27 @@ impl Engine {
         self.verify_scripts
     }
 
+    /// The budget of the submit's own script walk (bsv-low #592, the owner's
+    /// ruling 3a of 2026-10-10). Every submit that walks (every mode but
+    /// `HistoricalTxNoSpv`), and the GASP anchor check, read the BEEF through
+    /// the door's stream walk ([`crate::script_door`]) under this budget's
+    /// two limbs, the work and the memory, each estimated from the bytes
+    /// before it is spent. A breach is "the walk could not run"
+    /// ([`WalkCouldNotRun`], on [`MutationReport::walk_could_not_run`]),
+    /// never a refusal: the submit goes on as under `HistoricalTxNoSpv`.
+    /// A library consumer that sets nothing gets [`DoorBudget::DEFAULT`]
+    /// (64 MiB of work, 48 MiB of memory). Prefer
+    /// [`crate::builder::EngineBuilder::with_walk_budget`].
+    pub fn set_walk_budget(&mut self, budget: DoorBudget) {
+        self.walk_budget = budget;
+    }
+
+    /// The budget of the submit's own script walk, see
+    /// [`Engine::set_walk_budget`].
+    pub fn walk_budget(&self) -> DoorBudget {
+        self.walk_budget
+    }
+
     /// The reference's `tx.verify('scripts only')` over a BEEF: every unproven
     /// transaction from `subject_txid` down executes every input's unlocking
     /// script against its source output and obeys the value rule, while a
@@ -1115,7 +1261,9 @@ impl Engine {
     /// is an explicit ask) and of [`Engine::submit`]'s mode (`HistoricalTxNoSpv`
     /// still skips, as the reference does).
     ///
-    /// Runs under [`DoorBudget::DEFAULT`]: the work is bounded statically
+    /// Runs under the engine's budget ([`Engine::set_walk_budget`], the
+    /// submit's own; [`DoorBudget::DEFAULT`] unless set: one budget per
+    /// engine, the E592 lens fold's NOTE-2): the work is bounded statically
     /// before anything executes, and the interpreter's stack memory limit is
     /// the budget's element limit. The body is read through the streaming
     /// reader ([`crate::script_door`], bsv-low #585): no bound on its size,
@@ -1131,15 +1279,14 @@ impl Engine {
     /// a stronger bar behind it does not refuse on either.
     #[allow(
         clippy::unused_async,
-        clippy::unused_self,
-        reason = "the door's callers await it on an engine; 'scripts only' asks no tracker and reads no state"
+        reason = "the door's callers await it on an engine; 'scripts only' asks no tracker"
     )]
     pub async fn verify_scripts_only(
         &self,
         beef_bytes: &[u8],
         subject_txid: &str,
     ) -> Result<WalkStats, EngineError> {
-        crate::script_door::walk(beef_bytes, subject_txid, DoorBudget::DEFAULT)
+        crate::script_door::walk(beef_bytes, subject_txid, self.walk_budget)
     }
 
     /// [`Engine::verify_scripts_only`] under a budget the caller names (the
@@ -1183,13 +1330,14 @@ impl Engine {
         // A validate-only call admits nothing: a dry run by its own name. A
         // manager that writes on admission must not write here, or the real
         // submit that follows meets a head this call already advanced.
-        let (_validations, steak, _tx, _txid) = self
+        let (_validations, steak, _tx, _txid, _could_not_run) = self
             .run_validation(
                 tagged_beef,
                 mode,
                 &TopicAdmittanceContext::DRY_RUN,
                 None,
                 None,
+                WalkBreachPolicy::NotNow,
             )
             .await?;
         Ok(steak)
@@ -1261,12 +1409,34 @@ impl Engine {
     /// judged without the coin an unlanded predecessor has yet to leave is
     /// reported as a fault (`predecessor_not_landed`), not recorded as
     /// applied.
+    ///
+    /// A walk that could not run within the engine's budget is "not now"
+    /// here ([`WalkBreachPolicy::NotNow`], [`EngineError::WalkCouldNotRun`]):
+    /// never an admission. [`Engine::submit_with_report_under`] names the
+    /// policy.
     pub async fn submit_with_report(
         &self,
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
     ) -> Result<(Steak, MutationReport), EngineError> {
-        self.submit_bounded(tagged_beef, mode, None, false).await
+        self.submit_with_report_under(tagged_beef, mode, WalkBreachPolicy::NotNow)
+            .await
+    }
+
+    /// [`Engine::submit_with_report`] under an explicit
+    /// [`WalkBreachPolicy`] (the E592 lens fold, H1): what a walk that could
+    /// not run within the budget does. `NetworkAccepted` is for a caller that
+    /// holds the network's accept of these very bytes (the queue's replay of
+    /// a gated submission) and for nothing else: it admits a breached body
+    /// with its scripts unrun.
+    pub async fn submit_with_report_under(
+        &self,
+        tagged_beef: &TaggedBEEF,
+        mode: SubmitMode,
+        policy: WalkBreachPolicy,
+    ) -> Result<(Steak, MutationReport), EngineError> {
+        self.submit_bounded(tagged_beef, mode, None, false, policy)
+            .await
     }
 
     /// [`Engine::submit_with_report`] with every storage call, lookup hook
@@ -1280,6 +1450,7 @@ impl Engine {
         mode: SubmitMode,
         bound: Option<&CallBound>,
         finalize: bool,
+        policy: WalkBreachPolicy,
     ) -> Result<(Steak, MutationReport), EngineError> {
         // The reads the store's predecessor question has made in this
         // submit, every topic together ([`PREDECESSOR_READS_PER_SUBMIT`]),
@@ -1292,6 +1463,7 @@ impl Engine {
             finalize,
             None,
             &mut question_reads,
+            policy,
         )
         .await
         .map(|(steak, report, _)| (steak, report))
@@ -1310,6 +1482,7 @@ impl Engine {
     /// DRY RUN first, and for real only once its topic is not blocked: a
     /// link blocked below is judged twice and admitted once. Boxed: the
     /// landing is a submit of its own.
+    #[allow(clippy::too_many_arguments)]
     fn submit_counted<'a>(
         &'a self,
         tagged_beef: &'a TaggedBEEF,
@@ -1318,14 +1491,24 @@ impl Engine {
         finalize: bool,
         carried: Option<&'a HashSet<String>>,
         question_reads: &'a mut usize,
+        policy: WalkBreachPolicy,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Counted, EngineError>> + 'a>>
     {
         Box::pin(async move {
-            self.submit_counted_inner(tagged_beef, mode, bound, finalize, carried, question_reads)
-                .await
+            self.submit_counted_inner(
+                tagged_beef,
+                mode,
+                bound,
+                finalize,
+                carried,
+                question_reads,
+                policy,
+            )
+            .await
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn submit_counted_inner(
         &self,
         tagged_beef: &TaggedBEEF,
@@ -1334,6 +1517,7 @@ impl Engine {
         finalize: bool,
         walked: Option<&HashSet<String>>,
         question_reads: &mut usize,
+        policy: WalkBreachPolicy,
     ) -> Result<Counted, EngineError> {
         // A submit is a real admission, never a dry run; a carried
         // predecessor's is judged dry until its topic is known not to wait.
@@ -1343,10 +1527,13 @@ impl Engine {
         } else {
             TopicAdmittanceContext::default()
         };
-        let (mut validations, mut steak, tx, txid) = self
-            .run_validation(tagged_beef, mode, &context, bound, walked)
+        let (mut validations, mut steak, tx, txid, could_not_run) = self
+            .run_validation(tagged_beef, mode, &context, bound, walked, policy)
             .await?;
-        let mut report = MutationReport::default();
+        let mut report = MutationReport {
+            walk_could_not_run: could_not_run,
+            ..MutationReport::default()
+        };
         // The body every LOOKUP SERVICE receives NAMES the subject (BRC-95
         // atomic prefix over the WHOLE submitted body — bsv-rs's
         // `to_binary_atomic` sorts, names, never prunes). Lookup services
@@ -1366,6 +1553,12 @@ impl Engine {
         // anything of this submit is written ([`Engine::successors_waiting`]):
         // the topics that must wait, each with why.
         let mut blocked: HashMap<String, String> = HashMap::new();
+        // The landing trusts the subject's walk only if it RAN (the E592
+        // lens fold, M1): after a breach nothing it reaches was walked.
+        let landing = Landing {
+            policy,
+            subject_walk_ran: report.walk_could_not_run.is_none(),
+        };
         let waits = self
             .successors_waiting(
                 &tx,
@@ -1381,6 +1574,8 @@ impl Engine {
                 &mut blocked,
                 question_reads,
                 &mut report.landed_predecessors,
+                landing,
+                &mut report.landed_walks_could_not_run,
             )
             .await;
         // A carried predecessor's topic that does not wait is judged again,
@@ -1983,6 +2178,8 @@ impl Engine {
         blocked: &mut HashMap<String, String>,
         question_reads: &mut usize,
         landed: &mut Vec<(String, String)>,
+        landing: Landing,
+        landed_breaches: &mut Vec<WalkCouldNotRun>,
     ) -> HashMap<String, String> {
         let mut waits = HashMap::new();
         let spent: Vec<(String, u32)> = tx
@@ -2094,6 +2291,8 @@ impl Engine {
                         bound,
                         question_reads,
                         landed,
+                        landing,
+                        landed_breaches,
                     )
                     .await
                 {
@@ -2201,6 +2400,8 @@ impl Engine {
         bound: Option<&CallBound>,
         question_reads: &mut usize,
         landed: &mut Vec<(String, String)>,
+        landing: Landing,
+        landed_breaches: &mut Vec<WalkCouldNotRun>,
     ) -> Result<(), String> {
         let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
             .map_err(|e| format!("the BEEF could not be read again ({e})"))?;
@@ -2209,7 +2410,11 @@ impl Engine {
             other => other,
         };
         let walks = mode != SubmitMode::HistoricalTxNoSpv;
-        let mut walked: HashSet<String> = if walks {
+        // The trust set is what a walk that RAN covered (the E592 lens fold,
+        // M1): a subject whose walk breached covered nothing, so each carried
+        // predecessor is walked by its own submit (and its own breach is
+        // reported, `landed_breaches`), never trusted by a breached walk.
+        let mut walked: HashSet<String> = if walks && landing.subject_walk_ran {
             walk_cover(&beef, subject)
         } else {
             HashSet::new()
@@ -2243,12 +2448,33 @@ impl Engine {
                 .to_atomic_beef(true)
                 .map_err(|e| format!("{next}: its BEEF could not be built ({e})"))?;
             let tagged = TaggedBEEF::new(atomic, vec![topic.to_string()]);
-            let (_, report, blocked) = self
-                .submit_counted(&tagged, mode, bound, false, Some(&walked), question_reads)
+            let (_, report, blocked) = match self
+                .submit_counted(
+                    &tagged,
+                    mode,
+                    bound,
+                    false,
+                    Some(&walked),
+                    question_reads,
+                    landing.policy,
+                )
                 .await
-                .map_err(|e| format!("{next}: {e}"))?;
-            // Its walk passed, so did that of every body it reaches.
-            if walks && !walked.contains(&next) {
+            {
+                Ok(counted) => counted,
+                // Its walk could not run and nothing stands in for it: it does
+                // not land now, and the successor waits (counted, L3).
+                Err(EngineError::WalkCouldNotRun(stop)) => {
+                    let why = format!("{next}: {}", EngineError::WalkCouldNotRun(stop.clone()));
+                    landed_breaches.push(stop);
+                    return Err(why);
+                }
+                Err(e) => return Err(format!("{next}: {e}")),
+            };
+            // Its walk passed, so did that of every body it reaches; a walk
+            // that went on past a breach (`NetworkAccepted`) passed nothing.
+            if let Some(stop) = &report.walk_could_not_run {
+                landed_breaches.push(stop.clone());
+            } else if walks && !walked.contains(&next) {
                 walked.extend(walk_cover(&beef, &next));
             }
             let landed_now = report.applied_topics.iter().any(|t| t == topic);
@@ -2746,18 +2972,30 @@ impl Engine {
         }
     }
 
-    /// The reference's `tx.verify(chainTracker)` on submit, walked LINEARLY
-    /// over the BEEF's own transaction map: every txid once, a transaction the
-    /// BEEF proves (a BUMP) checked by its root against the chain tracker and
-    /// not descended, an unproven one script-checked on every input with its
-    /// source looked up by txid, plus the reference's value rule (outputs
-    /// never exceed inputs). No source objects are cloned or linked.
+    /// The reference's `tx.verify(chainTracker)` on submit: every unproven
+    /// transaction from the subject down has every input's script executed
+    /// against its source output and obeys the value rule; a proven one is
+    /// not descended, and its BUMP's root is checked against the chain
+    /// tracker (computed and accepted with none).
+    ///
+    /// Since bsv-low #592 (the owner's ruling 3a of 2026-10-10) the scripts
+    /// are walked by the DOOR's stream walk ([`crate::script_door`]) under
+    /// `budget`, the engine's [`DoorBudget`]: one walker, the same estimates
+    /// charged from the bytes before anything is parsed or run. Before it this
+    /// was a walk of its own over a hydrated `Beef` with no memory charge and
+    /// no interpreter limit: 219.7 MB natively on a 1.9 MB push-only unproven
+    /// parent, an isolate kill on Workers, met by every `historical-tx` replay
+    /// of the queue. The roots are then asked for the proven transactions the
+    /// walk reached, in its order, once per BUMP.
+    ///
+    /// `Ok(Some(_))` is a walk that COULD NOT RUN within the budget, never a
+    /// refusal (below, at the match). The interpreter's refusal and a
+    /// structural fault are what they were: `ScriptVerificationFailed`, and
+    /// `SpvError` in the same words.
     ///
     /// The tracker is an ARGUMENT, not `self`'s: the GASP anchor check
     /// ([`verify_spv_like_the_reference`]) runs this same walk from
-    /// `OverlayGASPStorage`, which borrows the engine's tracker. The DOOR's
-    /// walk (`'scripts only'` under a work budget) was this one with a policy
-    /// until bsv-low #585; it reads the stream now ([`crate::script_door`]).
+    /// `OverlayGASPStorage`, which borrows the engine's tracker.
     ///
     /// Why not bsv-rs `Transaction::verify`: it walks `source_transaction`
     /// links that `from_beef` builds by CLONING, once per input. Two inputs
@@ -2766,189 +3004,138 @@ impl Engine {
     /// leave the second clone bare ("Input 0 has no source transaction"), and
     /// re-linking every clone materializes the ancestry EXPONENTIALLY along a
     /// diamond chain: a 12-deep unmined chain of head spends took a Worker past
-    /// its memory on beta (zanaadu, 2026-09-08). A map keyed by txid is what the
-    /// TypeScript SDK effectively has (its inputs share one object), in O(n).
+    /// its memory on beta (zanaadu, 2026-09-08). The stream walk reads each
+    /// transaction once, in place, keyed by txid.
     async fn verify_beef_linear(
         chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
         beef_bytes: &[u8],
         subject_txid: &str,
         trusted: &HashSet<String>,
-    ) -> Result<(), EngineError> {
-        use bsv_rs::primitives::bsv::sighash::{TxInput, TxOutput};
-        use bsv_rs::script::{LockingScript, Script, Spend, SpendParams, UnlockingScript};
-
-        let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
-            .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
-        let mut by_txid: HashMap<String, &Transaction> = HashMap::new();
-        for btx in &beef.txs {
-            if let Some(tx) = btx.tx() {
-                by_txid.insert(btx.txid(), tx);
-            }
-        }
-        // Each BUMP's level 0 indexed once (the first BUMP that carries a
-        // txid, as `Beef::find_bump` picks), and each BUMP's root computed
-        // and asked of the tracker once (NL-6e). Per proven transaction, as
-        // until NL-6e, a BUMP of n leaves spent by n proven transactions was
-        // walked n times. The door (`parse_beef`) has climbed every hashed
-        // leaf of each BUMP to one root, so the root from any of them is it.
-        let proven_in = proven_index(&beef);
-        let mut checked: HashSet<usize> = HashSet::new();
+        budget: DoorBudget,
+    ) -> Result<Option<WalkCouldNotRun>, EngineError> {
         // A structural fault is the reference walk's `SpvError`.
         let spv =
             |msg: String| EngineError::SpvError(format!("Unable to verify SPV information: {msg}"));
 
-        // A trusted transaction (one an earlier walk of the same submit
-        // passed over) is neither checked nor descended again.
-        let mut seen: HashSet<String> = trusted.clone();
-        let mut queue: Vec<String> = vec![subject_txid.to_string()];
-        while let Some(txid) = queue.pop() {
-            if !seen.insert(txid.clone()) {
-                continue;
+        // THE SCRIPTS (bsv-low #592): the door's own stream walk, under the
+        // engine's budget. One walker (Rule 10): the door and the submit run
+        // the same function, the same estimates and the same interpreter
+        // limit; the submit adds the roots below.
+        let mut trace = crate::script_door::WalkTrace::default();
+        match crate::script_door::walk_trusting(
+            beef_bytes,
+            subject_txid,
+            budget,
+            trusted,
+            &mut trace,
+        ) {
+            Ok(_) => {}
+            // The interpreter's verdict, the reference's refusal: unchanged.
+            Err(refused @ EngineError::ScriptVerificationFailed { .. }) => return Err(refused),
+            // A structural fault (a source missing, the value rule, ...):
+            // the reference walk's `SpvError`, in the same words as before.
+            Err(EngineError::ScriptWalkInconclusive { reason, .. }) => return Err(spv(reason)),
+            // The budget, not the transaction: the walk COULD NOT RUN. Not a
+            // refusal: the bytes are a BEEF the walk was not given the room
+            // to judge, which says nothing about whether its scripts are
+            // valid (refusing would refuse a valid BEEF for its size, the
+            // owner's posture). Not an admission either: the caller's
+            // [`WalkBreachPolicy`] decides, and only the network's word on
+            // record lets the submit go on (the E592 lens fold, H1). The roots
+            // the walk reached are checked first, below.
+            Err(EngineError::ScriptWalkOverBudget {
+                at_txid,
+                subject_judged,
+                limb,
+                what,
+            }) => {
+                let limb = match limb {
+                    DoorLimb::Memory => WalkLimb::OverMemory,
+                    DoorLimb::Work if trace.interpreter_tripped => WalkLimb::InterpreterMemory,
+                    DoorLimb::Work => WalkLimb::OverWork,
+                };
+                // THE ROOTS OF A BREACHED WALK (the E592 lens fold, H1): every
+                // proven transaction it reached, and every proven source an
+                // input read, whatever the scripts' verdict. A bad root is
+                // the `SpvError` it is on a walk that ran: a breach never
+                // skips a proof the walk relied on. Their cost is a tracker
+                // question per BUMP, which the budget does not bound and
+                // does not need to (the clean walk asks the same).
+                let reached: Vec<String> = trace
+                    .proven
+                    .iter()
+                    .chain(&trace.proven_sources)
+                    .cloned()
+                    .collect();
+                Self::check_reached_roots(chain_tracker, beef_bytes, &reached).await?;
+                return Ok(Some(WalkCouldNotRun {
+                    subject_txid: subject_txid.to_string(),
+                    at_txid,
+                    subject_judged,
+                    limb,
+                    what,
+                }));
             }
-            let Some(tx) = by_txid.get(&txid).copied() else {
+            Err(other) => return Err(other),
+        }
+
+        // THE ROOTS: every proven transaction the walk reached, in the order
+        // it reached them, its BUMP's root computed and asked of the tracker
+        // once per BUMP (NL-6e). With no tracker the roots are computed and
+        // accepted (`'scripts only'`). The walk trusted them as it went; the
+        // reference checks them in the same walk, so a body with BOTH a bad
+        // script and a bad root now names the script.
+        Self::check_reached_roots(chain_tracker, beef_bytes, &trace.proven).await?;
+        Ok(None)
+    }
+
+    /// The roots of `reached` (display txids, in order; a repeat or a second
+    /// transaction of one BUMP asks nothing more), each BUMP's root computed
+    /// and asked of the tracker once. None reached: the body is not parsed.
+    async fn check_reached_roots(
+        chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
+        beef_bytes: &[u8],
+        reached: &[String],
+    ) -> Result<(), EngineError> {
+        let spv =
+            |msg: String| EngineError::SpvError(format!("Unable to verify SPV information: {msg}"));
+        if reached.is_empty() {
+            return Ok(());
+        }
+        let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
+            .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+        let proven_in = proven_index(&beef);
+        let mut checked: HashSet<usize> = HashSet::new();
+        for txid in reached {
+            let Some(&at) = proven_in.get(txid.as_str()) else {
                 return Err(spv(format!("transaction {txid} is not in the BEEF")));
             };
-            if let Some(&at) = proven_in.get(txid.as_str()) {
-                if checked.contains(&at) {
-                    continue; // its BUMP's root is the chain's, asked once
-                }
-                let mp = &beef.bumps[at];
-                let root = mp
-                    .compute_root(Some(&txid))
-                    .map_err(|e| spv(format!("invalid merkle path for transaction {txid}: {e}")))?;
-                if let Some(tracker) = chain_tracker {
-                    match tracker
-                        .is_valid_root_for_height(&root, mp.block_height)
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            return Err(EngineError::SpvError(format!(
-                                "Invalid merkle path for transaction {txid}: root {root} is not valid for block height {}",
-                                mp.block_height
-                            )));
-                        }
-                        Err(e) => {
-                            return Err(EngineError::SpvError(format!(
-                                "Chain tracker error at height {}: {e}",
-                                mp.block_height
-                            )));
-                        }
-                    }
-                }
-                checked.insert(at);
-                continue; // proven: trusted, no ancestry needed (the reference stops here too)
+            if !checked.insert(at) {
+                continue; // its BUMP's root is the chain's, asked once
             }
-
-            // Unproven: the value rule and every input's script, sources by txid.
-            let outputs: Vec<TxOutput> = tx
-                .outputs
-                .iter()
-                .map(|o| TxOutput {
-                    satoshis: o.satoshis.unwrap_or(0),
-                    script: o.locking_script.to_binary(),
-                })
-                .collect();
-            let mut input_total: u64 = 0;
-            for (vin, input) in tx.inputs.iter().enumerate() {
-                let Some(src_txid) = input.source_txid.clone() else {
-                    return Err(spv(format!(
-                        "input {vin} of transaction {txid} names no source"
-                    )));
-                };
-                let Some(source) = by_txid.get(&src_txid).copied() else {
-                    return Err(spv(format!(
-                        "input {vin} of transaction {txid} has no source transaction"
-                    )));
-                };
-                let Some(source_output) = source.outputs.get(input.source_output_index as usize)
-                else {
-                    return Err(spv(format!(
-                        "input {vin} of transaction {txid}: source output index out of bounds"
-                    )));
-                };
-                let source_sats = source_output.satoshis.unwrap_or(0);
-                input_total = input_total
-                    .checked_add(source_sats)
-                    .ok_or_else(|| spv(format!("satoshi total overflows in transaction {txid}")))?;
-                let Some(unlocking) = input.unlocking_script.as_ref() else {
-                    return Err(spv(format!(
-                        "input {vin} of transaction {txid} is missing its unlocking script"
-                    )));
-                };
-                let unlocking_bytes = unlocking.to_binary();
-                let locking_bytes = source_output.locking_script.to_binary();
-                let other_inputs: Vec<TxInput> = tx
-                    .inputs
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != vin)
-                    .map(|(_, inp)| TxInput {
-                        txid: inp.get_source_txid_bytes().unwrap_or([0u8; 32]),
-                        output_index: inp.source_output_index,
-                        script: inp
-                            .unlocking_script
-                            .as_ref()
-                            .map(bsv_rs::UnlockingScript::to_binary)
-                            .unwrap_or_default(),
-                        sequence: inp.sequence,
-                    })
-                    .collect();
-                let source_txid_bytes = input
-                    .get_source_txid_bytes()
-                    .map_err(|e| spv(format!("input {vin} of transaction {txid}: {e}")))?;
-                let locking_script = LockingScript::from_script(
-                    Script::from_binary(&locking_bytes)
-                        .map_err(|e| spv(format!("locking script of {src_txid}: {e}")))?,
-                );
-                let unlocking_script = UnlockingScript::from_script(
-                    Script::from_binary(&unlocking_bytes)
-                        .map_err(|e| spv(format!("unlocking script of {txid}: {e}")))?,
-                );
-                let mut spend = Spend::new(SpendParams {
-                    source_txid: source_txid_bytes,
-                    source_output_index: input.source_output_index,
-                    source_satoshis: source_sats,
-                    locking_script,
-                    transaction_version: tx.version.cast_signed(),
-                    other_inputs,
-                    outputs: outputs.clone(),
-                    input_index: vin,
-                    unlocking_script,
-                    input_sequence: input.sequence,
-                    lock_time: tx.lock_time,
-                    memory_limit: None,
-                });
-                match spend.validate() {
+            let mp = &beef.bumps[at];
+            let root = mp
+                .compute_root(Some(txid))
+                .map_err(|e| spv(format!("invalid merkle path for transaction {txid}: {e}")))?;
+            if let Some(tracker) = chain_tracker {
+                match tracker
+                    .is_valid_root_for_height(&root, mp.block_height)
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => {
-                        return Err(EngineError::ScriptVerificationFailed {
-                            subject_txid: txid.clone(),
-                            input_index: vin as u32,
-                            reason: "script evaluated to false".into(),
-                        });
+                        return Err(EngineError::SpvError(format!(
+                            "Invalid merkle path for transaction {txid}: root {root} is not valid for block height {}",
+                            mp.block_height
+                        )));
                     }
                     Err(e) => {
-                        return Err(EngineError::ScriptVerificationFailed {
-                            subject_txid: txid.clone(),
-                            input_index: vin as u32,
-                            reason: e.message.clone(),
-                        });
+                        return Err(EngineError::SpvError(format!(
+                            "Chain tracker error at height {}: {e}",
+                            mp.block_height
+                        )));
                     }
                 }
-                queue.push(src_txid);
-            }
-            let mut output_total: u64 = 0;
-            for output in &tx.outputs {
-                output_total = output_total
-                    .checked_add(output.satoshis.unwrap_or(0))
-                    .ok_or_else(|| spv(format!("satoshi total overflows in transaction {txid}")))?;
-            }
-            if output_total > input_total {
-                return Err(spv(format!(
-                        "transaction {txid} creates {output_total} sats from {input_total} sats of inputs"
-                    ),
-                ));
             }
         }
         Ok(())
@@ -3209,7 +3396,8 @@ impl Engine {
         context: &TopicAdmittanceContext,
         bound: Option<&CallBound>,
         walked: Option<&HashSet<String>>,
-    ) -> Result<(Vec<TopicValidation>, Steak, Transaction, String), EngineError> {
+        policy: WalkBreachPolicy,
+    ) -> Result<Validated, EngineError> {
         // Validate all topics are supported
         for topic in &tagged_beef.topics {
             if !self.managers.contains_key(topic) {
@@ -3250,18 +3438,54 @@ impl Engine {
         // A predecessor the door lands first (`walked`, the E1D delta fold,
         // L4) is not walked again when this submit's walks already passed
         // over it, and its walk trusts what they passed over.
+        //
+        // The walk runs under the engine's budget (bsv-low #592,
+        // [`Engine::set_walk_budget`]): one that could not run within it is
+        // NOT a refusal (see `verify_beef_linear`), and NOT an admission
+        // unless the caller holds the network's accept of these bytes (the
+        // E592 lens fold, H1, [`WalkBreachPolicy`]): "not now" before any
+        // manager is asked, or, under `NetworkAccepted`, this submit goes on
+        // as under `HistoricalTxNoSpv` and the report says so.
+        let mut could_not_run = None;
         if mode != SubmitMode::HistoricalTxNoSpv {
             match walked {
                 Some(walked) if walked.contains(&txid) => {}
                 trusted => {
-                    verify_spv_trusting(
+                    could_not_run = verify_spv_trusting(
                         self.chain_tracker.as_deref(),
                         self.verify_scripts,
                         &tagged_beef.beef,
                         &txid,
                         trusted.unwrap_or(&HashSet::new()),
+                        self.walk_budget,
                     )
                     .await?;
+                }
+            }
+        }
+        if let Some(stop) = could_not_run.take() {
+            match policy {
+                WalkBreachPolicy::NotNow => {
+                    warn!(
+                        "submit: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): not now, nothing judged or written; present it proven (bsv-low #592, E592 fold)",
+                        stop.subject_txid,
+                        stop.limb.as_str(),
+                        stop.at_txid,
+                        stop.subject_judged,
+                        stop.what
+                    );
+                    return Err(EngineError::WalkCouldNotRun(stop));
+                }
+                WalkBreachPolicy::NetworkAccepted => {
+                    warn!(
+                        "submit: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): the network accepted these bytes, the submit goes on as historical-tx-no-spv (bsv-low #592)",
+                        stop.subject_txid,
+                        stop.limb.as_str(),
+                        stop.at_txid,
+                        stop.subject_judged,
+                        stop.what
+                    );
+                    could_not_run = Some(stop);
                 }
             }
         }
@@ -3404,7 +3628,7 @@ impl Engine {
             }
         }
 
-        Ok((validations, steak, tx, txid))
+        Ok((validations, steak, tx, txid, could_not_run))
     }
 
     // ========================================================================
@@ -4724,6 +4948,7 @@ impl Engine {
             let mut errors = Vec::new();
             let mut pruned_inputs: u64 = 0;
             let mut discarded_graphs: u64 = 0;
+            let mut anchor_walk_held_graphs: u64 = 0;
             let mut finalized_graphs: u64 = 0;
             let mut deadline_dropped_graphs: u64 = 0;
             let mut cursor_moves: Vec<CursorMove> = Vec::new();
@@ -4793,7 +5018,8 @@ impl Engine {
                             .with_peer(peer_url.as_str())
                             .with_configured_peer(configured_peers)
                             .with_strict_beef(hydration_on)
-                            .with_script_verification(self.verify_scripts);
+                            .with_script_verification(self.verify_scripts)
+                            .with_walk_budget(self.walk_budget);
                     if let Some(manager) = self.managers.get(topic) {
                         gasp_storage = gasp_storage.with_topic_manager(manager.as_ref());
                     }
@@ -4877,6 +5103,7 @@ impl Engine {
                     // refused graph is not a failed sync (the reference
                     // discards it and carries on).
                     discarded_graphs += sync.discarded_graphs();
+                    anchor_walk_held_graphs += sync.anchor_walk_held();
                     // Whether the sync ran (to its end, or to the deadline)
                     // and whether it moved the cursor (bsv-low #555, the
                     // delta fold's D-M2).
@@ -5126,6 +5353,7 @@ impl Engine {
                     errors,
                     pruned_inputs,
                     discarded_graphs,
+                    anchor_walk_held_graphs,
                     finalized_graphs,
                     deadline_dropped_graphs,
                     cursor_moves,
@@ -5211,6 +5439,7 @@ impl Engine {
                         SubmitMode::HistoricalTxNoSpv,
                         bound.as_ref(),
                         true,
+                        WalkBreachPolicy::NotNow,
                     )
                     .await
                 };
@@ -5330,22 +5559,28 @@ impl Engine {
 /// `verify_scripts` is `false` ([`Engine::set_script_verification`]'s escape
 /// hatch).
 ///
-/// There is ONE verifier. `Engine::submit` calls this with its own tracker
-/// and switch; the GASP anchor check
+/// There is ONE verifier. `Engine::submit` calls this with its own tracker,
+/// switch and walk budget; the GASP anchor check
 /// (`OverlayGASPStorage::validate_graph_anchor`, bsv-low #551) calls it with
-/// the same two, handed over by `Engine::start_gasp_sync`.
+/// the same three, handed over by `Engine::start_gasp_sync`.
+///
+/// `Ok(Some(_))` is a walk that COULD NOT RUN within `budget` (bsv-low #592):
+/// not a verdict on the transaction. The caller goes on as it would without a
+/// walk and says so.
 pub(crate) async fn verify_spv_like_the_reference(
     chain_tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
     verify_scripts: bool,
     beef_bytes: &[u8],
     subject_txid: &str,
-) -> Result<(), EngineError> {
+    budget: DoorBudget,
+) -> Result<Option<WalkCouldNotRun>, EngineError> {
     verify_spv_trusting(
         chain_tracker,
         verify_scripts,
         beef_bytes,
         subject_txid,
         &HashSet::new(),
+        budget,
     )
     .await
 }
@@ -5360,11 +5595,14 @@ async fn verify_spv_trusting(
     beef_bytes: &[u8],
     subject_txid: &str,
     trusted: &HashSet<String>,
-) -> Result<(), EngineError> {
+    budget: DoorBudget,
+) -> Result<Option<WalkCouldNotRun>, EngineError> {
     if verify_scripts {
-        Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid, trusted).await
+        Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid, trusted, budget).await
     } else {
-        Engine::verify_spv_structurally(chain_tracker, beef_bytes).await
+        Engine::verify_spv_structurally(chain_tracker, beef_bytes)
+            .await
+            .map(|()| None)
     }
 }
 
@@ -5474,6 +5712,13 @@ pub struct TopicSyncResult {
     /// over this topic's peers. Not errors, and nothing of them was admitted.
     #[serde(default)]
     pub discarded_graphs: u64,
+    /// Graphs HELD because their anchor's script walk could not run within
+    /// the engine's walk budget (bsv-low #592; the E592 lens fold, H1 and
+    /// L3; `GASPSync::anchor_walk_held`), summed over this topic's peers.
+    /// Nothing of them was finalized; each UTXO stays below its cursor until
+    /// the peer serves its root proven. Not errors and not discarded.
+    #[serde(default)]
+    pub anchor_walk_held_graphs: u64,
     /// Graphs that passed the anchor check and were handed to submit, summed
     /// over this topic's peers (bsv-low #552). Under a per-peer budget a
     /// graph is counted, and submitted, the moment it finalizes, so the
@@ -5682,6 +5927,22 @@ pub enum EngineError {
         limb: DoorLimb,
         what: String,
     },
+
+    /// The submit's own script walk COULD NOT RUN within the engine's
+    /// [`DoorBudget`] (bsv-low #592) and nothing on record stands in for it
+    /// ([`WalkBreachPolicy::NotNow`], every door but the queue replay of a
+    /// gated submission; the E592 lens fold, H1). NOT NOW: nothing was
+    /// judged, nothing written, and it is NOT a refusal either: the budget
+    /// says nothing about the transaction. The way out is the subject
+    /// PROVEN: a proven transaction is not walked, so an honest body too
+    /// big to walk unmined lands once its block is mined (a client retries
+    /// after the block, not at once).
+    #[error(
+        "the script walk could not run within the budget ({}: {}); not now: present the subject proven, after its block",
+        .0.limb.as_str(),
+        .0.what
+    )]
+    WalkCouldNotRun(WalkCouldNotRun),
 
     #[error("{0}")]
     Other(String),
@@ -7316,6 +7577,7 @@ mod tests {
                 errors: vec![],
                 pruned_inputs: 0,
                 discarded_graphs: 0,
+                anchor_walk_held_graphs: 0,
                 finalized_graphs: 0,
                 deadline_dropped_graphs: 0,
                 cursor_moves: Vec::new(),
@@ -9786,8 +10048,14 @@ mod tests {
                 verify_scripts,
                 &bytes,
                 &subject,
+                DoorBudget::DEFAULT,
             ));
-            let _ = tx.send((verdict.map_err(|e| e.to_string()), started.elapsed()));
+            let verdict = match verdict {
+                Ok(None) => Ok(()),
+                Ok(Some(stop)) => Err(format!("the walk could not run: {stop:?}")),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send((verdict, started.elapsed()));
         });
         rx.recv_timeout(WIDE_BUMP_WALK_BOUND).unwrap_or_else(|_| {
             panic!("{what}: no answer from the walk within {WIDE_BUMP_WALK_BOUND:?}")

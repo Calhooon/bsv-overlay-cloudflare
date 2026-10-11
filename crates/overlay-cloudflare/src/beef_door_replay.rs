@@ -9,6 +9,9 @@ use overlay_engine::beef_limits;
 #[path = "../../overlay-engine/tests/support/beef_doors.rs"]
 mod shapes;
 
+#[path = "../../overlay-engine/tests/support/walk_witness.rs"]
+mod walk_witness;
+
 fn message(bytes: &[u8]) -> queue::MutationMessage {
     queue::MutationMessage {
         beef_b64: STANDARD.encode(bytes),
@@ -18,6 +21,7 @@ fn message(bytes: &[u8]) -> queue::MutationMessage {
         reason: "boundary witness".into(),
         redrive: None,
         ef_job: None,
+        gated: false,
     }
 }
 
@@ -668,7 +672,8 @@ mod twin {
         let q = code(include_str!("queue.rs"));
         let start = q.find("pub async fn enqueue_replay(").unwrap();
         let f = &q[start..start + q[start..].find("\n}\n").unwrap()];
-        assert!(f.contains("plan_replay(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room)"));
+        // the E592 fold: the producer plans the marked or unmarked message (`plan_replay` is the unmarked one)
+        assert!(f.contains("plan_replay_gated(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room, gated)"));
         assert!(!f.contains("max_bytes") && !q.contains("too large for the mutation queue"));
         assert!(include_str!("routes.rs").contains(r#"h.set("X-Overlay-Mutation", "queued")"#));
 
@@ -1066,5 +1071,567 @@ mod twin {
         assert!(c
             .letters()
             .contains(&(other_id, "failing".to_string(), "fault".to_string())));
+    }
+}
+
+// ── bsv-low #592: the queue replay under the engine's walk budget ────────────
+
+mod e592 {
+    use super::*;
+    use async_trait::async_trait;
+    use overlay_engine::builder::EngineBuilder;
+    use overlay_engine::engine::{DoorBudget, WalkLimb};
+    use overlay_engine::storage::memory::MemoryStorage;
+    use overlay_engine::topic_manager::{TopicManager, TopicManagerError};
+    use overlay_engine::types::*;
+
+    use super::walk_witness;
+
+    struct AdmitOutputZero;
+
+    #[async_trait(?Send)]
+    impl TopicManager for AdmitOutputZero {
+        async fn identify_admissible_outputs(
+            &self,
+            _: &bsv_rs::transaction::Transaction,
+            _: &[u8],
+            _: Option<&[u8]>,
+            _: SubmitMode,
+            _context: &TopicAdmittanceContext,
+        ) -> Result<AdmittanceInstructions, TopicManagerError> {
+            Ok(AdmittanceInstructions {
+                outputs_to_admit: vec![0],
+                coins_to_retain: vec![],
+                coins_removed: None,
+            })
+        }
+        async fn get_documentation(&self) -> String {
+            "admits output 0".into()
+        }
+        async fn get_metadata(&self) -> ServiceMetadata {
+            ServiceMetadata {
+                name: "admit-zero".into(),
+                ..Default::default()
+            }
+        }
+    }
+
+    fn worker_engine() -> overlay_engine::engine::Engine {
+        EngineBuilder::new(Box::new(MemoryStorage::new()))
+            .with_topic("tm_test", Box::new(AdmitOutputZero))
+            .with_walk_budget(crate::WORKER_WALK_BUDGET)
+            .build()
+    }
+
+    fn replay(
+        engine: &overlay_engine::engine::Engine,
+        m: &queue::MutationMessage,
+        beef: &[u8],
+    ) -> Result<(Steak, overlay_engine::engine::MutationReport), overlay_engine::engine::EngineError>
+    {
+        let tagged = TaggedBEEF {
+            beef: beef.to_vec(),
+            topics: m.topics.clone(),
+            off_chain_values: None,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(engine.submit_with_report_under(
+                &tagged,
+                queue::replay_submit_mode(&m.mode),
+                queue::replay_breach_policy(m),
+            ))
+    }
+
+    /// THE PIN (b), bsv-low #592 and the E592 lens fold: the witness (a valid BEEF whose unproven parent carries
+    /// 1.9 MB of push-only unlocking script) through the consumer's re-submit path as `queue_handler` runs it: the
+    /// message (`plan_replay_gated`, by key: past the inline room), its bytes read back by the consumer's own check,
+    /// the replay's mode, the policy read off the message (`replay_breach_policy`), a REAL engine under the
+    /// Worker's budget, then the ack decision.
+    ///
+    /// WITH the gated arm's mark (`gated`: the network accepted these bytes): the walk could not run (the memory
+    /// limb) and the replay goes on as historical-tx-no-spv: APPLIED, durable, acked, its object deleted, no dead
+    /// letter. WITHOUT it (an ungated fault's replay, the same mode): NOT NOW, nothing admitted, the replay's error
+    /// classed `not_now`, so after its retries it rests as a parked `not_now` letter (#576: one per txid, 200 a day),
+    /// never a `fault` letter and never an admission. The mark is on the wire only when set.
+    /// RED on `4060ffd`: `queue::plan_replay_gated`, `MutationMessage::gated` and `replay_breach_policy` do not exist
+    /// there (it does not compile); with the unmarked replay run on `4060ffd`'s engine it is admitted unwalked.
+    #[test]
+    fn e592_b_the_gated_replay_goes_on_and_an_unmarked_one_is_not_now() {
+        let (beef, subject) = walk_witness::witness();
+        let topics = vec!["tm_test".to_string()];
+        let plan = |gated| {
+            queue::plan_replay_gated(
+                &beef,
+                &topics,
+                SubmitMode::HistoricalTx,
+                queue::REPLAY_REASON_PHASE3_FAULT,
+                queue::QUEUE_MESSAGE_ROOM,
+                gated,
+            )
+        };
+        let queue::Carriage::R2(marked) = plan(true) else {
+            panic!("1.9 MB rides by key")
+        };
+        let queue::Carriage::R2(unmarked) = plan(false) else {
+            panic!("1.9 MB rides by key")
+        };
+        assert!(marked.gated && !unmarked.gated);
+        // the mark is on the wire only when set; an unmarked message is what `plan_replay` always made
+        let wire = serde_json::to_string(&marked).unwrap();
+        assert!(wire.contains("\"gated\":true"), "{wire}");
+        let unmarked_wire = serde_json::to_string(&unmarked).unwrap();
+        assert!(!unmarked_wire.contains("gated"), "{unmarked_wire}");
+        assert_eq!(
+            queue::plan_replay(
+                &beef,
+                &topics,
+                SubmitMode::HistoricalTx,
+                queue::REPLAY_REASON_PHASE3_FAULT,
+                queue::QUEUE_MESSAGE_ROOM,
+            ),
+            plan(false)
+        );
+        let parsed: queue::MutationMessage = serde_json::from_str(&wire).unwrap();
+        assert!(parsed.gated, "the consumer reads the mark back");
+        let r = marked.r2.clone().unwrap();
+        assert_eq!(r.txid.as_deref(), Some(subject.as_str()));
+        queue::check_replay_blob(&r, &beef)
+            .expect("the consumer's own check of the object's bytes");
+        assert_eq!(
+            queue::replay_submit_mode(&marked.mode),
+            SubmitMode::HistoricalTx,
+            "the replay walks"
+        );
+        assert_eq!(crate::WORKER_WALK_BUDGET, DoorBudget::DEFAULT);
+
+        // marked: goes on
+        let (_, report) =
+            replay(&worker_engine(), &marked, &beef).expect("the network's accept on record");
+        let stop = report
+            .walk_could_not_run
+            .clone()
+            .expect("the walk could not run");
+        assert_eq!(stop.subject_txid, subject);
+        assert_eq!(stop.limb, WalkLimb::OverMemory);
+        assert_eq!(
+            crate::ops::engine_walk_over_counter(stop.limb),
+            "submit_engine_walk_over_memory_total"
+        );
+        assert!(
+            report.is_durable(),
+            "the handler acks a durable report: no retry, no dead letter"
+        );
+        assert_eq!(report.applied_topics, topics, "acked as applied");
+        let ack = queue::landed_ack(&marked, &report, None);
+        assert!(
+            !ack.leaves,
+            "every topic applied: the ack deletes the object"
+        );
+        assert_eq!(ack.delete, vec![r.key.clone()]);
+
+        // unmarked: not now, a `not_now` letter, nothing admitted
+        let engine = worker_engine();
+        match replay(&engine, &unmarked, &beef) {
+            Err(e @ overlay_engine::engine::EngineError::WalkCouldNotRun(_)) => {
+                assert_eq!(
+                    queue::replay_error_class(&e),
+                    dead_letters::LetterClass::NotNow
+                );
+                assert_eq!(dead_letters::LetterClass::NotNow.as_str(), "not_now");
+            }
+            other => panic!("an unmarked replay past the budget is not now: {other:?}"),
+        }
+        let none = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // nothing of the subject was written: the same bytes under no-spv on the SAME engine are new
+                engine
+                    .submit_with_report(
+                        &TaggedBEEF::new(beef.clone(), topics.clone()),
+                        SubmitMode::HistoricalTxNoSpv,
+                    )
+                    .await
+            })
+            .expect("no-spv admits");
+        assert!(
+            none.1.deduped_topics.is_empty(),
+            "the not-now replay wrote nothing"
+        );
+        // any other replay error stays a fault letter
+        assert_eq!(
+            queue::replay_error_class(&overlay_engine::engine::EngineError::Other("x".into())),
+            dead_letters::LetterClass::Fault
+        );
+    }
+
+    /// The route's "not now" (the E592 lens fold): retryable, the word and the limb, the way out named, a client
+    /// told to come back after a block, not at once.
+    #[test]
+    fn e592f_the_route_answers_a_walk_past_the_budget_not_now() {
+        let stop = overlay_engine::engine::WalkCouldNotRun {
+            subject_txid: "ab".repeat(32),
+            at_txid: "cd".repeat(32),
+            subject_judged: true,
+            limb: WalkLimb::OverMemory,
+            what: "estimated memory".into(),
+        };
+        let body = crate::routes::walk_not_now_body(&stop);
+        assert_eq!(body["code"], "walk-could-not-run");
+        assert_eq!(body["limb"], "over_memory");
+        assert_eq!(body["retryable"], true);
+        assert_eq!(body["retryAfterSecs"], 600);
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains("nothing was admitted") && message.contains("PROVEN, after its block")
+        );
+        assert_eq!(
+            crate::routes::engine_error_status(
+                &overlay_engine::engine::EngineError::WalkCouldNotRun(stop)
+            ),
+            503
+        );
+    }
+
+    /// The wiring (source shape), for (b) and (d): the queue consumer counts the replay's report right after its
+    /// `submit_with_report`, the synchronous `/submit` (the ungated modes, under `SUBMIT_ENFORCE`'s operator bar)
+    /// and `/admin/readmit` count theirs, the engine the Worker builds walks under the Worker's budget, and the
+    /// gated door under the same instance. The route itself (an ungated `historical-tx` of the witness answering
+    /// as before and bumping the counter) is the captain's route tier: not run in this lane.
+    #[test]
+    fn e592_d_every_door_that_walks_counts_the_engine_walk() {
+        let lib = include_str!("lib.rs");
+        let replay = lib
+            .find("let policy = crate::queue::replay_breach_policy(body);\n        let replayed = engine.submit_with_report_under(&tagged_beef, mode, policy).await;")
+            .expect("the queue's replay, its policy read off the message");
+        let tail = &lib[replay..];
+        assert!(
+            tail.find("crate::ops::note_engine_walk(db, report, \"Queue\")")
+                .expect("counted")
+                < 400
+        );
+        assert!(
+            tail.find("crate::ops::note_engine_walk_not_now(db, stop, \"Queue\")")
+                .expect("not now counted")
+                < 600
+        );
+        assert!(
+            lib.contains("&format!(\"failed: {e}\"), crate::queue::replay_error_class(&e)).await;")
+        );
+        assert!(lib.contains("engine.set_walk_budget(WORKER_WALK_BUDGET);"));
+        // the crawl's walks (E592 L3) and the GASP anchor's hold
+        assert!(lib.contains("anchor_walk_held_graphs={}"));
+        // E592 NOTE-3: the crawl counts INSIDE the raced future, as each submit returns, never after the race
+        // (a crawl dropped at its budget lost them); the cron and the operator's crawl both hand it the D1. RED on
+        // `d899aa1`'s sources: the cron's crawl is handed no D1.
+        assert!(lib
+            .contains("peer_crawler::crawl_peers(&engine, &peers, \"cron\", crawl_db.as_ref()),"));
+        let after_race = &lib[lib
+            .find("peer_crawler::crawl_peers(&engine, &peers, \"cron\"")
+            .expect("the cron's crawl")..];
+        let after_race = &after_race[..after_race
+            .find("// BEEF proof completion")
+            .expect("the next step")];
+        assert!(
+            !after_race.contains("note_engine_walk"),
+            "the cron counts nothing after the race: the crawl did"
+        );
+        let crawler = include_str!("peer_crawler.rs");
+        let submit = crawler
+            .find(".submit_with_report(&tagged, SubmitMode::CurrentTx)")
+            .expect("the crawl's submit");
+        let tail = &crawler[submit..];
+        let pushed = tail.find("walks.push(stop);").expect("the not-now stop");
+        let not_now = tail
+            .find("crate::ops::note_engine_walk_not_now(db, &stop, \"peer-crawl\").await;")
+            .expect("a not-now counted as the submit returns");
+        assert!(not_now < pushed);
+        let extended = tail
+            .find("walks.extend(report.landed_walks_could_not_run);")
+            .expect("the landings' stops");
+        let landed = tail
+            .find("crate::ops::note_engine_walk(db, &report, \"peer-crawl\").await;")
+            .expect("a landing's breach counted as the submit returns");
+        assert!(landed < extended);
+        let routes_src = include_str!("routes.rs");
+        assert!(routes_src.contains(
+            "crate::peer_crawler::crawl_peers(engine, peers, \"admin\", db.as_ref()).await;"
+        ));
+
+        let routes = include_str!("routes.rs");
+        let submit = routes
+            .find("let (steak, mutation_report) = match engine.submit_with_report(&tagged_beef, mode).await {")
+            .expect("the synchronous submit");
+        let tail = &routes[submit..];
+        assert!(tail.contains(
+            "Err(EngineError::WalkCouldNotRun(stop)) => return walk_not_now(env, &stop, \"POST /submit\").await,"
+        ));
+        assert!(
+            tail.contains("crate::ops::note_engine_walk(&db, &mutation_report, \"POST /submit\")")
+        );
+        assert!(
+            routes.contains("crate::ops::note_engine_walk(&db, &report, \"POST /admin/readmit\")")
+        );
+        assert!(routes.contains("walk_not_now(env, &stop, \"POST /admin/readmit\").await"));
+        assert!(routes.contains("crate::ops::note_engine_walk_not_now(&db, stop, door).await;"));
+        // only the gated arm marks its replay
+        assert!(routes.contains("gated_subject.is_some(),\n            )\n            .await,"));
+        // The gated door walks under the ENGINE's budget (`verify_scripts_only` reads it: one budget per engine,
+        // the E592 lens fold's NOTE-2), and the Worker's engine is built under the door's default.
+        assert!(routes.contains("engine.verify_scripts_only(&gated_beef, &subject_txid).await"));
+        assert_eq!(crate::WORKER_WALK_BUDGET, DoorBudget::DEFAULT);
+
+        // The counters are served from 0 and named by their limb.
+        let ops = include_str!("ops.rs");
+        assert!(ops.contains("COUNTER_SUBMIT_ENGINE_WALK_OVER_BUDGET: 0,"));
+        assert!(ops.contains("COUNTER_SUBMIT_ENGINE_WALK_OVER_MEMORY: 0,"));
+        assert!(ops.contains("for stop in &report.landed_walks_could_not_run {"));
+        assert_eq!(
+            crate::ops::engine_walk_over_counter(WalkLimb::OverWork),
+            "submit_engine_walk_over_budget_total"
+        );
+        assert_eq!(
+            crate::ops::engine_walk_over_counter(WalkLimb::InterpreterMemory),
+            "submit_engine_walk_over_budget_total"
+        );
+    }
+
+    /// PIN 8 (the delta lens's question 8, M2): the composition the other seven pins leave
+    /// apart. A REAL engine's `WalkCouldNotRun` on the witness drives a `not_now` dead letter
+    /// through the SHIPPED `NOTE_FAILING_SQL` and `PARK_SQL` on rusqlite, and #576's three
+    /// not-now bounds gate it.
+    ///
+    /// The witness's UNMARKED replay (an ungated fault's replay: no gated mark, the same bytes
+    /// the gated arm would mark) through the Worker's engine is `WalkCouldNotRun` (the memory
+    /// limb), so `queue::replay_error_class` is `NotNow`. That class, noted and parked as the
+    /// DLQ consumer does it, lands a `class = 'not_now'` row; a SECOND topic set of the same
+    /// txid is deferred (per txid), and the not-now share (1000) and the day's bound (200) each
+    /// defer it too — `ceiling_verdict` names the bound, the shipped `PARK_SQL` returns no row.
+    /// Deterministic, network-free.
+    ///
+    /// Does not compile on `0313648`: the base has no `WalkBreachPolicy`, no `WalkCouldNotRun`
+    /// and no `MutationMessage::gated`/`replay_breach_policy`, so the unmarked-replay half
+    /// cannot be written there (the same reason `e592_b` cannot). With the replay grafted onto
+    /// the base's `submit_with_report`, the unmarked replay is admitted unwalked (the answer
+    /// mutant B reproduces on the tip), so the record names the behaviour, not only "does not
+    /// compile".
+    #[test]
+    fn e592_q8_8_the_unmarked_replays_not_now_letter_parks_through_park_sql() {
+        use crate::d1::{QVal, Query};
+
+        fn binds(q: &Query) -> Vec<rusqlite::types::Value> {
+            q.params()
+                .iter()
+                .map(|p| match p {
+                    QVal::Null => rusqlite::types::Value::Null,
+                    QVal::Int(i) => rusqlite::types::Value::Integer(*i),
+                    QVal::Text(s) => rusqlite::types::Value::Text(s.clone()),
+                    QVal::Bool(b) => rusqlite::types::Value::Integer(i64::from(*b)),
+                    QVal::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+                    QVal::Float(f) => rusqlite::types::Value::Real(*f),
+                })
+                .collect()
+        }
+        // Run a statement; every row it RETURNs, each column as text (NULL as ""). A write with
+        // no RETURNING (the note) answers none; a `PARK_SQL` whose WHERE defers answers none too.
+        fn rows(conn: &rusqlite::Connection, q: &Query) -> Vec<Vec<String>> {
+            let mut stmt = conn.prepare(q.sql()).unwrap();
+            let cols = stmt.column_count();
+            if cols == 0 {
+                stmt.execute(rusqlite::params_from_iter(binds(q).iter()))
+                    .unwrap();
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            let mut rs = stmt
+                .query(rusqlite::params_from_iter(binds(q).iter()))
+                .unwrap();
+            while let Some(r) = rs.next().unwrap() {
+                out.push(
+                    (0..cols)
+                        .map(|i| match r.get::<_, rusqlite::types::Value>(i).unwrap() {
+                            rusqlite::types::Value::Null => String::new(),
+                            rusqlite::types::Value::Integer(v) => v.to_string(),
+                            rusqlite::types::Value::Real(v) => v.to_string(),
+                            rusqlite::types::Value::Text(s) => s,
+                            rusqlite::types::Value::Blob(_) => "<blob>".into(),
+                        })
+                        .collect(),
+                );
+            }
+            out
+        }
+        // The shipped dead-letter schema (the DLQ consumer's migrations), as `dead_letters`' own tests build it.
+        fn schema() -> rusqlite::Connection {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            for m in [
+                dead_letters::DEAD_LETTERS_CREATE,
+                dead_letters::DEAD_LETTERS_INDEX,
+                dead_letters::DEAD_LETTERS_HEALTH_INDEX,
+                dead_letters::DEAD_LETTERS_REDRIVEN_INDEX,
+                dead_letters::DEAD_LETTERS_CLASS_COLUMN,
+                dead_letters::DEAD_LETTERS_CLASS_INDEX,
+                dead_letters::DEAD_LETTERS_R2_KEY_COLUMN,
+                dead_letters::DEAD_LETTERS_R2_BYTES_COLUMN,
+                dead_letters::DEAD_LETTERS_R2_INDEX,
+            ] {
+                conn.execute(m, []).unwrap();
+            }
+            conn
+        }
+        // The DLQ lifecycle of one failed replay: the main consumer's note of its class, then the ceiling read, its
+        // shipped verdict, and the shipped `PARK_SQL` (always run, so its own WHERE is what defers). Returns the
+        // typed verdict (the bound's name) and the rows `PARK_SQL` returned (1 parked, 0 deferred).
+        fn note_and_park(
+            conn: &rusqlite::Connection,
+            key: &str,
+            topics: &str,
+            class: dead_letters::LetterClass,
+            message: &str,
+            now: i64,
+        ) -> (
+            std::result::Result<Option<u64>, dead_letters::Deferral>,
+            usize,
+        ) {
+            rows(
+                conn,
+                &dead_letters::note_failing_query(
+                    key,
+                    topics,
+                    "the witness replay's walk could not run",
+                    now - 1,
+                    class,
+                ),
+            );
+            let r = rows(
+                conn,
+                &dead_letters::ceiling_query(key, topics, dead_letters::day_cutoff(now)),
+            )
+            .remove(0);
+            let f = |i: usize| r[i].parse::<f64>().unwrap();
+            let verdict = dead_letters::ceiling_verdict(&dead_letters::CeilingRow {
+                held: f(0),
+                known: f(1),
+                class: r[2].clone(),
+                not_now: f(3),
+                not_now_txid: f(4),
+                not_now_day: f(5),
+                r2_key: Some(r[6].clone()).filter(|k| !k.is_empty()),
+            });
+            let parked = rows(
+                conn,
+                &dead_letters::park_query(
+                    key,
+                    topics,
+                    message,
+                    dead_letters::FAULT_UNRECORDED,
+                    0,
+                    now,
+                ),
+            )
+            .len();
+            (verdict, parked)
+        }
+        // Seed N parked `not_now` letters of distinct keys at `parked_at`, bypassing the bounds (a stranger's flood
+        // already at rest), so a fresh presentation meets a bound.
+        fn seed_not_now(conn: &rusqlite::Connection, n: usize, parked_at: i64) {
+            for i in 0..n {
+                conn.execute(
+                    "INSERT INTO mutation_dead_letters (txid, topics, message, status, first_seen_at, parked_at, class) \
+                     VALUES (?1, ?2, '{}', 'parked', ?3, ?3, 'not_now')",
+                    rusqlite::params![format!("seed{i}"), format!("t{i}"), parked_at],
+                )
+                .unwrap();
+            }
+        }
+
+        // The witness's UNMARKED replay message, planned exactly as the route's fault replay plans it (by key:
+        // 1.9 MB past the inline room), run through the REAL Worker engine under its walk budget.
+        let (beef, subject) = walk_witness::witness();
+        let topics = vec!["tm_test".to_string()];
+        let unmarked = queue::plan_replay(
+            &beef,
+            &topics,
+            SubmitMode::HistoricalTx,
+            queue::REPLAY_REASON_PHASE3_FAULT,
+            queue::QUEUE_MESSAGE_ROOM,
+        )
+        .message()
+        .clone();
+        assert!(!unmarked.gated, "an ungated fault's replay");
+        let err = match replay(&worker_engine(), &unmarked, &beef) {
+            Err(e) => e,
+            other => panic!("the unmarked replay past the budget is not now: {other:?}"),
+        };
+        match &err {
+            overlay_engine::engine::EngineError::WalkCouldNotRun(stop) => {
+                assert_eq!(stop.subject_txid, subject);
+                assert_eq!(stop.limb, WalkLimb::OverMemory);
+            }
+            other => panic!("the unmarked replay past the budget is not now: {other:?}"),
+        }
+        let class = queue::replay_error_class(&err);
+        assert_eq!(class, dead_letters::LetterClass::NotNow);
+
+        // The letter's key, as both DLQ consumers name it (door 3's keyed message: the subject by D5).
+        let (key, key_topics) = dead_letters::letter_key(&unmarked, Some(&subject));
+        assert_eq!(key_topics, "tm_test");
+        let message = serde_json::to_string(&unmarked).unwrap();
+        let now = 1_000_000_000;
+
+        // (1) end to end: the not_now letter parks, and the stored row's class is 'not_now'.
+        let conn = schema();
+        assert_eq!(
+            note_and_park(&conn, &key, &key_topics, class, &message, now),
+            (Ok(None), 1),
+            "the witness letter parks"
+        );
+        let stored: String = conn
+            .query_row(
+                "SELECT class FROM mutation_dead_letters WHERE txid = ?1 AND topics = ?2 AND status = 'parked'",
+                rusqlite::params![key, key_topics],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "not_now", "PARK_SQL kept the replay's class");
+
+        // (2) per txid: a SECOND topic set of the same txid is deferred (PARK_SQL returns no row).
+        assert_eq!(
+            note_and_park(&conn, &key, "tm_other", class, &message, now + 1),
+            (Err(dead_letters::Deferral::NotNowTxid(1)), 0),
+            "a second topic set of the same txid is deferred"
+        );
+
+        // (3) the not-now share (1000): with the share full of a stranger's letters, the witness letter defers.
+        // Seed PAST the trailing day (`now - 86_400_001`), so the per-day clause (`< 200`) counts none of them and
+        // the share clause (`< 1000`) is the one PARK_SQL refuses on; otherwise the day clause masks it (mutant F).
+        let conn = schema();
+        seed_not_now(&conn, dead_letters::NOT_NOW_MAX as usize, now - 86_400_001);
+        assert_eq!(
+            note_and_park(&conn, &key, &key_topics, class, &message, now),
+            (
+                Err(dead_letters::Deferral::NotNowShare(
+                    dead_letters::NOT_NOW_MAX
+                )),
+                0
+            ),
+            "the not-now share bounds the witness letter"
+        );
+
+        // (4) per day (200): with the day's new letters full (the share not), the witness letter defers.
+        let conn = schema();
+        seed_not_now(&conn, dead_letters::NOT_NOW_PER_DAY as usize, now);
+        assert_eq!(
+            note_and_park(&conn, &key, &key_topics, class, &message, now),
+            (
+                Err(dead_letters::Deferral::NotNowDay(
+                    dead_letters::NOT_NOW_PER_DAY
+                )),
+                0
+            ),
+            "the per-day bound bounds the witness letter"
+        );
     }
 }

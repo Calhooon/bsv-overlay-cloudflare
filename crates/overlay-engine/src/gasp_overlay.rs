@@ -123,6 +123,10 @@ pub struct OverlayGASPStorage<'a> {
     /// [`crate::engine::Engine::set_script_verification`], handed over so the
     /// anchor check obeys the same switch as `Engine::submit`. Default `true`.
     verify_scripts: bool,
+    /// [`crate::engine::Engine::set_walk_budget`], handed over so the anchor
+    /// check's script walk runs under the same two limbs as `Engine::submit`
+    /// (bsv-low #592). Default [`crate::engine::DoorBudget::DEFAULT`].
+    walk_budget: crate::engine::DoorBudget,
     /// The peer this instance syncs from: the key of its deferred graphs
     /// (bsv-low #555, [`Self::with_peer`]).
     peer: String,
@@ -477,6 +481,7 @@ impl<'a> OverlayGASPStorage<'a> {
             strict_beef: false,
             chain_tracker: None,
             verify_scripts: true,
+            walk_budget: crate::engine::DoorBudget::DEFAULT,
             peer: String::new(),
             configured_peer: false,
             anchored: Mutex::new(None),
@@ -540,6 +545,14 @@ impl<'a> OverlayGASPStorage<'a> {
     #[must_use]
     pub fn with_script_verification(mut self, enabled: bool) -> Self {
         self.verify_scripts = enabled;
+        self
+    }
+
+    /// Carry [`crate::engine::Engine::set_walk_budget`] into the anchor
+    /// check (bsv-low #592).
+    #[must_use]
+    pub fn with_walk_budget(mut self, budget: crate::engine::DoorBudget) -> Self {
+        self.walk_budget = budget;
         self
     }
 
@@ -1219,17 +1232,40 @@ impl GASPStorage for OverlayGASPStorage<'_> {
     /// merkle paths are not checked, here or in the reference; they are bound
     /// to the verified root by txid instead. Step 2 is one manager call per
     /// transaction and one storage read per input that is not already a coin
-    /// of the set, which is what the finalize submits cost again. The walk is
-    /// the unbudgeted reference walk, the one `Engine::submit` runs on a
-    /// client's BEEF: `DoorBudget` is NOT applied. That budget belongs to the
-    /// `broadcast-gated` door, whose breach means "inconclusive, the network
-    /// judges"; there is no stronger bar behind this check, so a breach could
-    /// only be a refusal, and a refusal here is final for that UTXO. What
-    /// bounds a peer's graph is what bounded it before: the per-peer sync
-    /// budget (which cannot interrupt a script already running). The
-    /// reference serialises this method behind `acquireAnchorValidationSlot`
-    /// (at most 4 at once); here graphs are completed one at a time by one
-    /// sync on one thread, so there is nothing to serialise.
+    /// of the set, which is what the finalize submits cost again.
+    ///
+    /// Since bsv-low #592 the walk runs under the engine's walk budget
+    /// (`DoorBudget`, the door's two limbs, estimated from the bytes before
+    /// anything runs). A breach is no verdict on the graph, and nothing
+    /// stands behind this check (no network accepted these bytes, and the
+    /// finalize submits them `historical-tx-no-spv`), so a breach is never
+    /// the replay's to judge (the E592 lens fold, H1: as built at `4060ffd`
+    /// it went on, and a peer's root that spent a held coin with no
+    /// signature was finalized). It is HELD: `GASPError::AnchorWalkHeld`,
+    /// the graph not finalized, the UTXO failed (or, under a per-graph
+    /// budget, its record kept with nothing pending), the cursor below it,
+    /// counted (`GASPSync::anchor_walk_held`). The roots the walk reached are
+    /// checked first, so a bad proof is still the refusal it is. The hold
+    /// ends when the peer serves the root PROVEN: #555's resume re-asks an
+    /// unproven root, a proven one restarts the walk (`root_proven`), and a
+    /// proven root is trusted without a script run. So an honest 0-conf graph
+    /// too big to walk lands after its block; a forgery never lands. What a
+    /// forging peer costs: its own slot (the UTXO held below the cursor, its
+    /// record re-asked each pass up to `DEFERRED_GRAPH_MAX_PASSES`), inside
+    /// its per-peer budget, and, as it never yields a finalized graph or a
+    /// cursor move on that UTXO, D16's yieldless bound quarantines it if it
+    /// serves nothing else, and ONLY with a per-graph budget
+    /// (`Engine::set_graph_budget`): the yieldless bound exists only there
+    /// (the E592 delta lens, D1-L2). With NO per-graph budget (a library
+    /// consumer that sets none) there is no record and no yieldless count:
+    /// the held UTXO fails on every sync, the sync runs to its end and is a
+    /// success under #302, the cursor stays below that UTXO for good, and
+    /// the graph is fetched and its walk estimated again on every tick;
+    /// nothing is admitted, and the cost is ours, the residual D15 states for
+    /// `AnchorUnavailable`. The reference serialises this method behind
+    /// `acquireAnchorValidationSlot` (at most 4 at once); here graphs are
+    /// completed one at a time by one sync on one thread, so there is
+    /// nothing to serialise.
     async fn validate_graph_anchor(&self, graph_id: &str) -> Result<(), GASPError> {
         let anchor = {
             let refs = self
@@ -1272,11 +1308,34 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             self.verify_scripts,
             &root_beef,
             &anchor.root_txid,
+            self.walk_budget,
         )
         .await;
         // The checked copy has done its work (bsv-low #586: not held through
         // the replay).
         drop(root_beef);
+        // A walk that could not run within the budget (bsv-low #592) is not
+        // a verdict on the graph, and nothing else judges it: HELD until the
+        // root is served proven (the E592 lens fold, H1; the doc above).
+        let verdict = match verdict {
+            Ok(Some(stop)) => {
+                warn!(
+                    "GASP anchor: the script walk of {} could not run ({}: at {}; {}): held, the graph is not finalized until its root is served proven (bsv-low #592, E592 fold)",
+                    stop.subject_txid,
+                    stop.limb.as_str(),
+                    stop.at_txid,
+                    stop.what
+                );
+                return Err(GASPError::AnchorWalkHeld(format!(
+                    "graph {graph_id}: the script walk of {} could not run within the budget ({}: {})",
+                    stop.subject_txid,
+                    stop.limb.as_str(),
+                    stop.what
+                )));
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
         if let Err(e) = verdict {
             if tracker
                 .as_ref()
