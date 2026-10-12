@@ -2582,6 +2582,52 @@ struct OwedStateD1 {
     markerless_progress: Option<String>,
 }
 
+async fn owed_party_cursor(
+    db: &worker::D1Database,
+    identity: &str,
+    started_ms: i64,
+    sources: &[crate::owed_cursor::Source],
+) -> std::result::Result<Vec<serde_json::Value>, String> {
+    use crate::owed_cursor::{candidates_sql, Cursor};
+    let mut candidates = Vec::new();
+    for source in sources {
+        let mut cursor = Cursor::default();
+        loop {
+            if worker::Date::now().as_millis() as i64 - started_ms
+                > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS
+            {
+                return Err(
+                    "owed candidate cursor exceeded time budget; previous snapshot stands".into(),
+                );
+            }
+            let (nulls, seek) = cursor.phase();
+            let mut binds = vec![JsValue::from_str(identity)];
+            if seek {
+                binds.extend(
+                    cursor
+                        .bind_numbers(nulls)
+                        .into_iter()
+                        .map(|n| JsValue::from_f64(n as f64)),
+                );
+            }
+            let rows = db
+                .prepare(candidates_sql(*source, nulls, seek, cursor.next_stamp))
+                .bind(&binds)
+                .map_err(|e| format!("owed candidate cursor bind: {e}"))?
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<serde_json::Value>())
+                .map_err(|e| format!("owed candidate cursor: {e}"))?;
+            let more = cursor.advance(&rows, nulls);
+            candidates.extend(rows);
+            if !more {
+                break;
+            }
+        }
+    }
+    Ok(candidates)
+}
+
 pub(crate) async fn owed_recompute(
     env: &worker::Env,
     db: &worker::D1Database,
@@ -2649,93 +2695,94 @@ async fn owed_recompute_inner(
     let mut spender_reads = 0usize;
     let mut courier_reads = 0usize;
     let mut budget_cut = false;
-    let mut binds: Vec<JsValue> = vec![JsValue::from_str(identity_lc)];
-    if let Some(ms) = era {
-        binds.push(era_bind(ms));
-    }
-
-    // 1. the results view: my pots, my seat, the spend, the verdict, the money facts — EVERY page (a lived-in
-    //    identity holds more than one; a page left unread would be a false "nothing owed" for its older pots)
-    let mut walk_cut = false;
-    let mut results: Vec<crate::results::ResultEntry> = Vec::new();
-    {
-        let mut after = 0usize;
-        let mut more = true;
-        for _page in 0..OWED_WALK_MAX_PAGES {
-            let (page, truncated) = gather_result_entries(db, identity_lc, era, after).await?;
-            let n = page.len();
-            results.extend(page);
-            more = truncated && n > 0;
-            if !more {
-                break;
-            }
-            after += crate::results::RESULTS_MAX_ROWS;
-        }
-        walk_cut |= more;
-    }
-
-    // 2. the refund view (the gate + the backup presence + the landing bar)
-    let refunds: Vec<crate::refund_view::RefundEntry> = {
-        let mut all: Vec<crate::refund_view::RefundEntry> = Vec::new();
-        let mut after = 0usize;
-        let mut more = true;
-        for _page in 0..OWED_WALK_MAX_PAGES {
-            let stmt = db
-                .prepare(crate::refund_view::refund_view_sql(era, after))
-                .bind(&binds)
-                .map_err(|e| format!("owed refund bind: {e}"))?;
-            let rows: Vec<crate::refund_view::RefundViewRow> = stmt
+    // #638: read the identity's metadata once by createdAt, preserve the global
+    // anti-flood selection, then hydrate only the selected pots in bounded chunks.
+    let candidates = owed_party_cursor(
+        db,
+        identity_lc,
+        started_ms,
+        &[
+            crate::owed_cursor::Source::Party,
+            crate::owed_cursor::Source::Link,
+        ],
+    )
+    .await?;
+    let selected =
+        crate::owed_cursor::select(candidates, era, crate::results::RESULTS_UNKNOWN_POT_QUOTA);
+    let (party_pages, mut walk_cut) =
+        crate::owed_cursor::party_walk(&selected, OWED_WALK_MAX_PAGES);
+    let mut results = Vec::new();
+    let mut refunds = Vec::new();
+    for page in party_pages {
+        let mut result_rows = Vec::new();
+        let mut refund_rows = Vec::new();
+        for chunk in page.chunks(crate::owed_cursor::PAGE) {
+            let encoded = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
+            let sql = crate::owed_cursor::hydrate_sql(&crate::results::results_sql(None, 0));
+            let rows = db
+                .prepare(sql)
+                .bind(&[JsValue::from_str(&encoded)])
+                .map_err(|e| format!("owed results cursor bind: {e}"))?
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<ResultsRowD1>())
+                .map_err(|e| format!("owed results cursor: {e}"))?
+                .into_iter()
+                .map(ResultsRowD1::into_row)
+                .collect::<Vec<_>>();
+            result_rows.extend(rows);
+            let sql =
+                crate::owed_cursor::hydrate_sql(&crate::refund_view::refund_view_sql(None, 0));
+            let rows = db
+                .prepare(sql)
+                .bind(&[JsValue::from_str(&encoded)])
+                .map_err(|e| format!("owed refund cursor bind: {e}"))?
                 .counted_all()
                 .await
                 .and_then(|r| r.results::<RefundViewRowD1>())
-                .map_err(|e| format!("owed refund query: {e}"))?
+                .map_err(|e| format!("owed refund cursor: {e}"))?
                 .into_iter()
                 .map(RefundViewRowD1::into_row)
-                .collect();
-            let truncated = rows.len() > crate::refund_view::REFUND_VIEW_MAX_ROWS;
-            let page = crate::refund_view::assemble_refund_view(rows, tip);
-            let n = page.len();
-            all.extend(page);
-            more = truncated && n > 0;
-            if !more {
-                break;
-            }
-            after += crate::refund_view::REFUND_VIEW_MAX_ROWS;
+                .collect::<Vec<_>>();
+            refund_rows.extend(rows);
         }
-        walk_cut |= more;
-        all
-    };
+        results.extend(
+            gather_result_rows(db, identity_lc, result_rows, false)
+                .await?
+                .0,
+        );
+        refunds.extend(crate::refund_view::assemble_refund_view(refund_rows, tip));
+    }
 
-    // 3. the hops view, unscoped (my funded outpoints)
-    let mut hops: Vec<crate::hops_view::HopEntry> = {
-        let mut all: Vec<crate::hops_view::HopEntry> = Vec::new();
-        let mut after = 0usize;
-        let mut more = true;
-        for _page in 0..OWED_WALK_MAX_PAGES {
-            let stmt = db
-                .prepare(crate::hops_view::hops_view_sql(false, era, after))
-                .bind(&binds)
-                .map_err(|e| format!("owed hops bind: {e}"))?;
-            let rows: Vec<crate::hops_view::HopsViewRow> = stmt
-                .counted_all()
-                .await
-                .and_then(|r| r.results::<HopsViewRowD1>())
-                .map_err(|e| format!("owed hops query: {e}"))?
-                .into_iter()
-                .map(HopsViewRowD1::into_row)
-                .collect();
-            let (page, truncated) = crate::hops_view::assemble_hops_view(rows);
-            let n = page.len();
-            all.extend(page);
-            more = truncated && n > 0;
-            if !more {
-                break;
-            }
-            after += crate::hops_view::HOPS_VIEW_MAX_OUTPOINTS;
-        }
-        walk_cut |= more;
-        all
-    };
+    // 3. Same cursor discipline for the funded hop outpoints and their oldest marker rows.
+    let candidates = owed_party_cursor(
+        db,
+        identity_lc,
+        started_ms,
+        &[crate::owed_cursor::Source::Hop],
+    )
+    .await?;
+    let selected_hops = crate::owed_cursor::select_hops(candidates, era, now_ms / 1000);
+    let (hop_pages, hop_cut) = crate::owed_cursor::hop_walk(&selected_hops, OWED_WALK_MAX_PAGES);
+    walk_cut |= hop_cut;
+    let selected_hops: Vec<_> = hop_pages.into_iter().flatten().collect();
+    let mut hops = Vec::new();
+    for chunk in selected_hops.chunks(crate::owed_cursor::PAGE) {
+        let encoded = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
+        let rows = db
+            .prepare(crate::owed_cursor::hydrate_hops_sql())
+            .bind(&[JsValue::from_str(&encoded)])
+            .map_err(|e| format!("owed hops cursor bind: {e}"))?
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<HopsViewRowD1>())
+            .map_err(|e| format!("owed hops cursor: {e}"))?
+            .into_iter()
+            .map(HopsViewRowD1::into_row)
+            .collect();
+        hops.extend(crate::hops_view::assemble_hops_view(rows).0);
+    }
+
 
     // 4. the VALID filed refunds per pot, sized by MY home (the committed pay pkh of my seat)
     let my_pkh_by_pot: HashMap<String, String> = results
@@ -4514,6 +4561,16 @@ async fn gather_result_entries(
     let truncated = rows.len() > crate::results::RESULTS_MAX_ROWS;
     rows.truncate(crate::results::RESULTS_MAX_ROWS);
 
+    gather_result_rows(db, identity_lc, rows, truncated).await
+}
+
+async fn gather_result_rows(
+    db: &worker::D1Database,
+    identity_lc: &str,
+    rows: Vec<crate::results::ResultsRow>,
+    truncated: bool,
+) -> std::result::Result<(Vec<crate::results::ResultEntry>, bool), String> {
+    let mut rows = rows;
     // #406 (2026-08-27) — the PAGE OVERLAY, page-batched. The nested
     // window query is left byte-identical (adding a column inside it
     // emptied the page — see the decision log); instead ONE PK-indexed

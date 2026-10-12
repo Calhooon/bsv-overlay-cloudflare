@@ -488,9 +488,10 @@ ci-d1-budget:
 	  return 1; \
 	}; \
 	echo "→ ci-d1-budget: the fixture D1 (seed + wrangler d1 execute --local)…"; \
-	cargo run -q $(WORKERS) -p low-app-layer --example d1_budget_seed > "$$state/seed.sql"; \
+	D1_CURSOR_PIN_SQL="$$state/cursor.sql" cargo run -q $(WORKERS) -p low-app-layer --example d1_budget_seed > "$$state/seed.sql"; \
 	( cd crates/low-app-layer && npx wrangler d1 execute low-overlay-db --local --persist-to "$$state" --file "$$state/seed.sql" ) > "$$seed_log" 2>&1 \
 	  || { echo "✗ ci-d1-budget: the seed did not load"; cat "$$seed_log"; exit 1; }; \
+	node tools/lane-499/cursor_pin.mjs "$$state/cursor.sql.expected.json" "$$state"; \
 	echo "→ starting wrangler dev :$$PA (the app layer on the fixture D1)…"; \
 	( cd crates/low-app-layer && exec npx wrangler dev --local --port $$PA --ip 127.0.0.1 --persist-to "$$state" \
 	    --var AUTH_ENFORCE:false --var SESSION_LANE:false \
