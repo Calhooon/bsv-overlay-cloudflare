@@ -3177,16 +3177,7 @@ async fn owed_recompute_inner(
             .map(|e| (e.pot_txid.to_ascii_lowercase(), e.pot_vout))
             .collect();
         for chunk in unspent.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-            let pairs = (0..chunk.len())
-                .map(|i| format!("(lower(potTxid) = ?{} AND potVout = ?{})", 2 * i + 1, 2 * i + 2))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            let sql = format!(
-                "SELECT potTxid, potVout, refundRawHex FROM potrefund_records \
-                 WHERE refundValid = 1 AND refundRawHex IS NOT NULL AND ({pairs}) \
-                 ORDER BY createdAt DESC, rowid DESC LIMIT {}",
-                chunk.len() * 4
-            );
+            let sql = crate::owed::valid_refunds_sql(chunk.len());
             let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
             for (t, v) in chunk {
                 b.push(JsValue::from_str(t));
@@ -3513,12 +3504,11 @@ async fn owed_recompute_inner(
         txid: String,
     }
     for chunk in spenders.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-        let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
         // COVENANT rows only (the audit's silent class, 2026-09-19): `pot_records` also holds every `tm_lowfund` P2PKH
         // output — a seat's own sweep admitted under it read as "a pot took the hop" and the row vanished
         // L23R2-H1/L4/#499: txids are stored and bound lowercase; exact IN rides the primary key. Wrapping
         // the key in lower() scanned every pot row for a rebuilt hop's competitor (312 rows in the route pin).
-        let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_records WHERE lockKind = 'covenant' AND txid IN ({placeholders})");
+        let sql = crate::owed::covenant_spenders_sql(chunk.len());
         let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
         match db.prepare(&sql).bind(&b) {
             Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<TxidRowD1>()) {

@@ -6047,3 +6047,15 @@ pub(crate) mod tests {
         assert_eq!(routes.matches(&squash("owed_recompute(env, db, identity_lc,")).count(), 2, "the walk's two callers (the push and the read's compute)");
     }
 }
+
+/// bsv-low #638: bounded stored-key lookup for decoded spender pots.
+pub fn covenant_spenders_sql(n: usize) -> String {
+    let placeholders = (1..=n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+    format!("SELECT DISTINCT txid AS txid FROM pot_records WHERE lockKind = 'covenant' AND txid IN ({placeholders})")
+}
+
+/// bsv-low #638: valid backup bytes for a chunk of pot outpoints.
+pub fn valid_refunds_sql(n: usize) -> String {
+    let pairs = (0..n).map(|i| format!("(potTxid = ?{} AND potVout = ?{})", 2 * i + 1, 2 * i + 2)).collect::<Vec<_>>().join(" OR ");
+    format!("SELECT potTxid, potVout, refundRawHex FROM potrefund_records WHERE refundValid = 1 AND refundRawHex IS NOT NULL AND ({pairs}) ORDER BY createdAt DESC, rowid DESC LIMIT {}", n * 4)
+}
