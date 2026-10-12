@@ -126,6 +126,12 @@ static TALLY: [[AtomicU64; 4]; 5] = [
 /// The isolate's calls by caller.
 static BY_CALLER: [AtomicU64; 6] = [z(), z(), z(), z(), z(), z()];
 
+/// Semantic outcomes share the existing batched durable counter flush.
+pub fn note_presence(name: &str) {
+    PENDING.with(|p| *p.borrow_mut().entry(name.to_string()).or_insert(0) += 1);
+    PENDING_CALLS.with(|c| c.set(c.get() + 1));
+}
+
 /// Count one courier call: the isolate tally, this request's pending durable deltas, and the log line.
 pub fn note(url: &str, caller: &str, status: Option<u16>, ms: f64) {
     let provider = provider_of(url);

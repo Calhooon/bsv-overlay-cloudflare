@@ -15,11 +15,12 @@ own arms; the pre-flight terminal branch still asks the #519/#602 ladder.
 `broadcast_efs_gated_with` passes `AcceptedPending` without corroborating:
 STORED at TAAL/GorillaPool cannot refuse a first-party stored acceptance.
 `routes.rs`'s `AcceptedPending` arm admits with network_seen unlatched,
-starts the pending watch and counts `submit_fast_admitted_total` (existing).
+starts the pending watch; the fold counts echoes separately and labels fast-echo.
 An already applied topic remains the engine's idempotent submit.
-Pins `ns2_612_*`: two concurrent ladder futures for one subject and a
-never-admitted known-SEEN subject, with STORED corroborators: RED 101,
-then GREEN. All 86 broadcaster tests GREEN, including terminal #519 pins.
+Original pins `ns2_612_*`: independent ladder futures (no shared engine state),
+with STORED corroborator closures that are never called. Original RED 101
+was a missing-helper compile RED; it did not prove the production change.
+The fold adds a pure decision pin and a Reached-arm source pin. All 86 broadcaster tests GREEN, including terminal #519 pins.
 Native futures verify admission outcomes, not concurrent D1 route writes.
 Captain's lens should read the pending arm, watch and engine deduplication.
 
@@ -27,23 +28,27 @@ Captain's lens should read the pending arm, watch and engine deduplication.
 
 `crates/low-app-layer/src/routes.rs`: `resolve_tx_any` preserves proven
 index hits and terminal memos; unproven held bytes use the existing
-`arcade_confirmation_look`. Index misses use `tx_any_external_leg`, now
-Arcade-first through the injected `tx_any_presence_leg_via` port.
+`arcade_confirmation_look`. Index misses use `tx_any_external_leg`: the fold asks Arcade only for held
+bytes or a locally named submit. Foreign subjects go straight to couriers.
 `txany.rs`: `parse_arcade_subject_word` refuses mismatched/missing txids,
 faults, orphan/pre-network/terminal words and stale or unstamped hints.
-SEEN_ON_NETWORK, SEEN_MULTIPLE_NODES and ACCEPTED give present/unconfirmed.
+SEEN_ON_NETWORK and SEEN_MULTIPLE_NODES give present/unconfirmed.
 `FirstPartyPresent` permits a positive hint with no courier bytes; held
 bytes remain preferred, other raw goes through `tx_any_courier_raw_via`
 and must hash to the subject. Bad bytes are withheld, never substituted.
 MINED/IMMUTABLE require a bounded BUMP whose subject root matches
 `beef_guard::canonical_root`; only then is confirmed/height served.
-Courier-mined answers still carry claimedHeight, not a proven height.
+The fold requires a courier-mined proof bound to subject, height and our
+header root. Unmined foreign answers are timed courier hints, present:null.
+Their raw remains served for display/retry, while the shared fact-reader
+guard excludes it from both owed read paths and the cached spender path.
 `tx_any_courier_leg_via` refuses Bitails 404 as absence corroboration.
-A real request-time absence needs Arcade 404 (the same endpoint must
-serve a known subject's usable word) and WoC 404 behind its healthy route.
-Unknowns never satisfy the Absent memo writer's existing two-source guard.
+The fold removes the request-time Absent writer: only WoC is established
+as a general mempool-capable source; BananaBlocks is unprobed. Arcade
+404 is never-carried, Bitails pruned. One capable source is counted unknown.
+Arcade health uses a HELD verified anchor, with success memoised per isolate.
 Five-minute memo TTL remains; old WoC+Bitails Absent evidence is ignored.
-Counters: existing courier tally records Arcade calls; no new counter.
+Counters: courier tally plus held-anchor outcomes and one-capable-source unknown.
 Endpoint follows the existing client: `${ARCADE_URL}/tx/{txid}`; no live
 request was made to verify a different `/v1/tx` alias.
 Pins `ns2_614_*`: RED 101, then GREEN; 453 app-layer native tests passed,
@@ -51,16 +56,17 @@ including existing courier-mined and memo lifetime tests.
 Captain's lens should read both Arcade consumers, proof verification,
 raw verification, absence health probes and the memo read/write guards.
 
-## Verification limits
+## Original verification limits (fold results are in the fold REPORT)
 
 Route tier and actual concurrent D1 writes remain unverified; that tier's
-existing harness starts background Bash processes, forbidden in this lane.
+fold runs the make targets in the foreground under the host load gate.
 Live Arcade responses, freshness stamps and health anchor retention are
 unverified. A missing anchor fails safe to unknown, never absence.
 Changed hunks are rustfmt formatted; full worker-workspace fmt check exits
 1 on pre-existing drift (also reproduced on the base's d1_budget_seed.rs).
-Both #614 pins were also grafted onto 4634090 with only the native port:
-RED 101, each answered present:false. Restored branch: six pins GREEN 0.
+The original #614 RED claim is superseded by NS2P-L4: its fixtures did
+not serve the Bitails anchor, so base answered unknown. The fold serves
+the anchor and checks the base courier function in a neutered copy.
 Final package-scoped clippy (both workers, all targets, -D warnings): 0.
 Release wasm32 builds (both workers): 0, launched at 1-minute load 11.18.
 Broadcaster tests: 0 (86); app-layer tests: 0 (453); diff whitespace: 0.

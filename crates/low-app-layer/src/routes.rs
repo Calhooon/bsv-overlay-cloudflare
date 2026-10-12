@@ -3301,7 +3301,10 @@ pub(crate) async fn owed_recompute(
         }
         /// A tx-any answer's raw, parsed and re-checked against the txid it was asked for (content-addressed).
         fn parse_answer(a: &TxAnyCached, sp: &str) -> Option<CourierSpenderBytes> {
-            courier_spender_bytes_of_raw(&hex::decode(a.raw_hex.as_deref()?).ok()?, sp)
+            courier_spender_bytes_of_raw(
+                &hex::decode(crate::txany::fact_reader_raw_hex(a)?).ok()?,
+                sp,
+            )
         }
         // phase 1: the index's bytes (D1), a parsed courier memo, or the isolate's tx-any cache — no courier asked
         let mut wanted: Vec<String> = Vec::new();
@@ -3663,11 +3666,13 @@ impl crate::owed::HomeWalkWorld for HomeWalkCouriers<'_> {
         }
     }
     fn cached_spender(&mut self, spender_txid: &str) -> Option<Option<Vec<u8>>> {
-        tx_any_cached(spender_txid, worker::Date::now().as_millis() as f64).map(|a| a.raw_hex.and_then(|h| hex::decode(h).ok()))
+        tx_any_cached(spender_txid, worker::Date::now().as_millis() as f64)
+            .map(|a| crate::txany::fact_reader_raw_hex(&a).and_then(|h| hex::decode(h).ok()))
     }
     async fn resolve_spender(&mut self, spender_txid: &str) -> Option<Vec<u8>> {
         let now_f = worker::Date::now().as_millis() as f64;
-        resolve_tx_any(None, None, spender_txid, now_f, "owed", self.env).await.raw_hex.and_then(|h| hex::decode(h).ok())
+        let answer = resolve_tx_any(None, None, spender_txid, now_f, "owed", self.env).await;
+        crate::txany::fact_reader_raw_hex(&answer).and_then(|h| hex::decode(h).ok())
     }
 }
 
@@ -5242,27 +5247,6 @@ async fn read_verdict_memos(
     out
 }
 
-/// Remember a verdict (one upsert). Fail-soft: a failure only forgets (logged).
-async fn write_verdict_memo(env: &worker::Env, memo: &crate::txany::VerdictMemo) {
-    let Ok(db) = env.d1("OVERLAY_DB") else { return };
-    let binds = [
-        JsValue::from_str(&memo.txid),
-        JsValue::from_f64(memo.verdict_at_ms as f64),
-        JsValue::from_str(&memo.input_outpoint),
-        JsValue::from_str(&memo.spender_txid),
-        JsValue::from_str(memo.kind.as_str()),
-        JsValue::from_str(&memo.evidence),
-    ];
-    match db.prepare(crate::txany::VERDICT_MEMO_UPSERT_SQL).bind(&binds) {
-        Ok(stmt) => {
-            if let Err(e) = stmt.counted_run().await {
-                console_warn!("[tx-any] verdict memo write failed for {}: {e}", memo.txid);
-            }
-        }
-        Err(e) => console_warn!("[tx-any] verdict memo bind failed for {}: {e}", memo.txid),
-    }
-}
-
 // ── /live-view — per-identity live-hand view (bsv-low #252 stage 2a step 3) ─
 
 /// `/live-view` joined row as D1 returns it (the `live_view_sql` shape): the
@@ -5891,16 +5875,8 @@ async fn arcade_confirmation_look(
             None,
         )),
         ArcadeWord::Mined { bump_hex, height } => {
-            let claimed =
-                beef_limits::merkle_path_from_hex(&bump_hex, beef_limits::COURIER_PROOF_MAX_BYTES)
-                    .ok()
-                    .and_then(|mp| mp.compute_root(Some(txid_lc)).ok())
-                    .map(|r| r.to_ascii_lowercase())?;
             let canonical = crate::beef_guard::canonical_root(env, height).await?;
-            if claimed != canonical {
-                console_warn!(
-                    "[tx-any] {txid_lc}: arcade's MINED claim at {height} does not compute the canonical root (claimed {claimed}, chaintracks holds {canonical}) — the couriers decide"
-                );
+            if !crate::txany::mined_proof_matches(txid_lc, &bump_hex, height, &canonical) {
                 return None;
             }
             Some((
@@ -6464,6 +6440,7 @@ thread_local! {
     /// The same memo for WoC's tx route (the second gate's MEDIUM-3a): a WoC 404 reads as ABSENT only behind a
     /// route that served the known-mined anchor this isolate — a rotten or rate-limited route is a fault, never
     /// an absence (and never a memo).
+    static ARCADE_ROUTE_HEALTHY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static WOC_ROUTE_HEALTHY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
@@ -6539,8 +6516,45 @@ async fn tx_any_index_leg(
     (None, None)
 }
 
-/// The break-glass leg asks Arcade first, then couriers for bytes or unknown
-/// presence. Only two capable sources can corroborate absence (#614).
+const TX_ANY_OURS_SQL: &str = "SELECT txid FROM transactions WHERE txid = ? UNION ALL SELECT txid FROM pot_beefs WHERE txid = ? UNION ALL SELECT refusedTxid AS txid FROM submit_refusals WHERE refusedTxid = ? LIMIT 1";
+const TX_ANY_HELD_ANCHOR_SQL: &str = "SELECT t.txid FROM transactions t INNER JOIN network_seen n ON n.txid = t.txid WHERE t.has_proof = 1 LIMIT 1";
+
+/// Scope is local evidence, never Arcade's answer. A DB fault cannot turn a
+/// foreign subject into ours. A submit refusal names a subject we attempted.
+async fn tx_any_scope(env: &worker::Env, txid: &str) -> (bool, Option<String>) {
+    #[derive(serde::Deserialize)]
+    struct Id {
+        txid: String,
+    }
+    let Ok(db) = env.d1("OVERLAY_DB") else {
+        return (false, None);
+    };
+    let ours = db
+        .prepare(TX_ANY_OURS_SQL)
+        .bind(&[
+            JsValue::from_str(txid),
+            JsValue::from_str(txid),
+            JsValue::from_str(txid),
+        ])
+        .ok();
+    let ours = match ours {
+        Some(stmt) => stmt.counted_first::<Id>().await.ok().flatten().is_some(),
+        None => false,
+    };
+    let anchor = if ours && !ARCADE_ROUTE_HEALTHY.with(std::cell::Cell::get) {
+        db.prepare(TX_ANY_HELD_ANCHOR_SQL)
+            .counted_first::<Id>()
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.txid)
+    } else {
+        None
+    };
+    (ours, anchor)
+}
+
+/// Foreign subjects go directly to couriers; their silence is never Arcade's vote.
 async fn tx_any_external_leg(
     txid_lc: &str,
     caller: &'static str,
@@ -6550,28 +6564,30 @@ async fn tx_any_external_leg(
     crate::txany::AbsenceCorroboration,
     Option<u64>,
 ) {
+    let (ours, anchor) = tx_any_scope(env, txid_lc).await;
     tx_any_presence_leg_via(
         txid_lc,
         worker::Date::now().as_millis() as i64,
+        ours,
+        anchor.as_deref(),
         |url: String| async move { provider_get(caller, &url).await },
         |bump: String, height| async move {
-            let root =
-                beef_limits::merkle_path_from_hex(&bump, beef_limits::COURIER_PROOF_MAX_BYTES)
-                    .ok()
-                    .and_then(|mp| mp.compute_root(Some(txid_lc)).ok());
-            match (root, crate::beef_guard::canonical_root(env, height).await) {
-                (Some(root), Some(canonical)) => root.eq_ignore_ascii_case(&canonical),
-                _ => false,
-            }
+            crate::beef_guard::canonical_root(env, height)
+                .await
+                .is_some_and(|root| {
+                    crate::txany::mined_proof_matches(txid_lc, &bump, height, &root)
+                })
         },
     )
     .await
 }
 
-/// Arcade's live hint is first; a MINED word requires the injected proof check.
+/// Arcade is first only for OURS; a foreign mined claim requires the same proof check.
 async fn tx_any_presence_leg_via<G, F, V, VF>(
     txid: &str,
     now_ms: i64,
+    ours: bool,
+    held_anchor: Option<&str>,
     get: G,
     verify: V,
 ) -> (
@@ -6586,7 +6602,11 @@ where
     VF: std::future::Future<Output = bool>,
 {
     use crate::txany::{AbsenceCorroboration, ArcadeWord, TxObservation};
-    let response = get(format!("{}/tx/{txid}", arcade_url())).await;
+    let response = if ours {
+        get(format!("{}/tx/{txid}", arcade_url())).await
+    } else {
+        None
+    };
     let word = response
         .as_ref()
         .map(|(status, body)| crate::txany::parse_arcade_subject_word(*status, body, txid, now_ms))
@@ -6606,30 +6626,68 @@ where
             height,
         );
     }
-    // Arcade can see unmined subjects; Bitails cannot. A missing response
-    // counts only after this endpoint serves a known subject's usable word.
-    let arcade_absent = if matches!(response, Some((404, _))) {
-        match get(format!(
-            "{}/tx/{}",
-            arcade_url(),
-            crate::txany::KNOWN_MINED_TXID
-        ))
-        .await
-        {
-            Some((status, body)) => {
-                crate::txany::parse_arcade_subject_word(
-                    status,
-                    &body,
-                    crate::txany::KNOWN_MINED_TXID,
-                    now_ms,
-                ) != ArcadeWord::Unknown
-            }
-            _ => false,
+    // A HELD, verified anchor proves the store route works, never that the
+    // store can see a foreign mempool subject. Memoise success per isolate (N4).
+    if ours
+        && matches!(response, Some((404, _)))
+        && !ARCADE_ROUTE_HEALTHY.with(std::cell::Cell::get)
+    {
+        if let Some(anchor) = held_anchor {
+            let healthy = get(format!("{}/tx/{anchor}", arcade_url()))
+                .await
+                .is_some_and(|(status, body)| {
+                    crate::txany::parse_arcade_subject_word(status, &body, anchor, now_ms)
+                        != ArcadeWord::Unknown
+                });
+            crate::courier::note_presence(if healthy {
+                "tx_any_arcade_anchor_ok_total"
+            } else {
+                "tx_any_arcade_anchor_unknown_total"
+            });
+            ARCADE_ROUTE_HEALTHY.with(|c| c.set(healthy));
+        } else {
+            crate::courier::note_presence("tx_any_arcade_anchor_unavailable_total");
         }
-    } else {
-        false
-    };
-    tx_any_courier_leg_via(txid, arcade_absent, get).await
+    }
+    let (mut observation, absence, claimed_height) =
+        tx_any_courier_leg_via(txid, &get).await;
+    if let TxObservation::Present { confirmed, raw_hex } = observation {
+        if confirmed {
+            let proven = if let Some(height) = claimed_height {
+                match get(format!("{WOC_BASE}/tx/{txid}/proof/tsc")).await {
+                    Some((200, body)) => match crate::txany::courier_tsc_bump(&body, height) {
+                        Some(bump) => verify(bump, height).await,
+                        None => false,
+                    },
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            observation = if proven {
+                TxObservation::Present {
+                    confirmed: true,
+                    raw_hex,
+                }
+            } else {
+                TxObservation::Fault
+            };
+        } else {
+            observation = TxObservation::CourierHint {
+                raw_hex,
+                source: "woc",
+                observed_at_ms: now_ms,
+            };
+        }
+    }
+    if observation == TxObservation::Absent {
+        // WoC's node is one capable source. BananaBlocks is the convention's
+        // second candidate; its mempool capability is unprobed. Bitails is
+        // pruned and Arcade is a submitted-bytes store, so neither supplies
+        // the missing vote. UNKNOWN, counted, no request-time Absent memo.
+        crate::courier::note_presence("tx_any_one_capable_source_unknown_total");
+    }
+    (observation, absence, claimed_height)
 }
 
 /// The raw body is optional for a first-party hint, and always hash checked.
@@ -6666,14 +6724,13 @@ where
     G: Fn(String) -> F,
     F: std::future::Future<Output = Option<(u16, Vec<u8>)>>,
 {
-    tx_any_courier_leg_via(txid, false, get).await
+    tx_any_courier_leg_via(txid, get).await
 }
 
 /// The external leg over a courier GET port (`get(url)` answers `provider_get`'s `(status, body)`): production passes
 /// `provider_get`, the pins a captured body (bsv-low #606).
 async fn tx_any_courier_leg_via<G, F>(
     txid_lc: &str,
-    arcade_absent: bool,
     get: G,
 ) -> (
     crate::txany::TxObservation,
@@ -6747,12 +6804,8 @@ where
         _ => TxObservation::Fault,
     };
 
-    // A pruned Bitails 404 says nothing about an unmined subject (#614).
-    let absence = if woc == TxObservation::Absent && arcade_absent {
-        AbsenceCorroboration::CorroboratedAbsent
-    } else {
-        AbsenceCorroboration::Unknown
-    };
+    // No second general mempool-capable source has been established.
+    let absence = AbsenceCorroboration::Unknown;
     (woc, absence, claimed_height)
 }
 
@@ -6799,7 +6852,7 @@ async fn resolve_tx_any(
     // (our own broadcaster) and otherwise answers the honest `null` — the overlay's dead-letter pass corroborates
     // its absence in the background, bounded per tick, and writes the memo; only an index-UNKNOWN row without a
     // memo (a tx never admitted — the client's own record of a broadcast the overlay refused) still opens the
-    // break-glass at request time: Arcade first, then capable couriers; real absence lives five minutes.
+    // break-glass at request time: scoped Arcade or couriers; one capable absence source is unknown.
     let answer = if index_raw.is_some() && index_height.is_some() {
         crate::txany::decide_tx_any(
             index_raw,
@@ -6850,25 +6903,14 @@ async fn resolve_tx_any(
         ) {
             a.height = claimed_height; // verified against our canonical headers above
         }
-        // the courier's claimed height rides a CONFIRMED external answer only (display-tier; `height` stays proven)
-        if a.confirmed == Some(true) && a.height.is_none() {
-            a.claimed_height = claimed_height;
-        }
-        if a.present == Some(false) && absence == crate::txany::AbsenceCorroboration::CorroboratedAbsent {
-            write_verdict_memo(
-                env,
-                &crate::txany::VerdictMemo {
-                    txid: key.to_string(),
-                    verdict_at_ms: now as i64,
-                    input_outpoint: String::new(),
-                    spender_txid: String::new(),
-                    kind: crate::txany::VerdictKind::Absent,
-                    evidence:
-                        "request-time break-glass: arcade 404 + woc 404 behind healthy routes"
-                            .to_string(),
-                },
-            )
-            .await;
+        if matches!(
+            external,
+            crate::txany::TxObservation::Present {
+                confirmed: true,
+                ..
+            }
+        ) {
+            a.height = claimed_height; // only the proof-checked foreign path reaches this
         }
         a
     };
@@ -7577,13 +7619,18 @@ mod e606_tests {
     #[test]
     fn ns2_614_arcade_seen_outranks_courier_404s() {
         WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
-        let (txid, raw) = competitor();
+        let (txid, _raw) = competitor();
         let now = crate::txany::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
         let get = |url: String| {
             let body = if url.contains("/tx/hash/") {
                 (404, vec![])
-            } else if url.contains("/hex") {
-                (200, hex::encode(&raw).into_bytes())
+            } else if url
+                == format!(
+                    "{BITAILS_BASE}/download/tx/{}",
+                    crate::txany::KNOWN_MINED_TXID
+                )
+            {
+                (200, vec![1])
             } else if url.starts_with(&arcade_url()) {
                 (
                     200,
@@ -7597,22 +7644,51 @@ mod e606_tests {
             };
             async move { Some(body) }
         };
-        let (obs, absence, _) = run(tx_any_presence_leg_via(&txid, now, get, |_, _| async {
-            false
-        }));
+        let (obs, absence, _) = run(tx_any_presence_leg_via(
+            &txid,
+            now,
+            true,
+            None,
+            get,
+            |_, _| async { false },
+        ));
         let a = crate::txany::decide_tx_any(None, None, Some(&obs), absence);
+        let would_write_absent_memo = a.present == Some(false)
+            && absence == crate::txany::AbsenceCorroboration::CorroboratedAbsent;
+        eprintln!(
+            "pair13 present={:?}, base request-time Absent writer guard={would_write_absent_memo}",
+            a.present
+        );
+        assert!(!would_write_absent_memo);
         assert_eq!(a.present, Some(true));
         assert_eq!(a.confirmed, Some(false));
-        assert_eq!(a.raw_hex, Some(hex::encode(raw)));
+        assert_eq!(a.raw_hex, None);
+        assert_eq!(absence, crate::txany::AbsenceCorroboration::Unknown);
     }
 
     #[test]
     fn ns2_614_arcade_unknown_and_two_404s_are_unknown_not_memoable() {
         WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
-        let get = |_: String| async { Some((404, vec![])) };
-        let (obs, absence, _) = run(tx_any_presence_leg_via(&tx(0x11), 0, get, |_, _| async {
-            false
-        }));
+        let get = |url: String| async move {
+            if url
+                == format!(
+                    "{BITAILS_BASE}/download/tx/{}",
+                    crate::txany::KNOWN_MINED_TXID
+                )
+            {
+                Some((200, vec![1]))
+            } else {
+                Some((404, vec![]))
+            }
+        };
+        let (obs, absence, _) = run(tx_any_presence_leg_via(
+            &tx(0x11),
+            0,
+            true,
+            None,
+            get,
+            |_, _| async { false },
+        ));
         let a = crate::txany::decide_tx_any(None, None, Some(&obs), absence);
         assert_eq!(a.present, None);
         assert_eq!(absence, crate::txany::AbsenceCorroboration::Unknown);
@@ -7638,9 +7714,14 @@ mod e606_tests {
             };
             async move { Some(body) }
         };
-        let (obs, absence, _) = run(tx_any_presence_leg_via(&txid, now, get, |_, _| async {
-            false
-        }));
+        let (obs, absence, _) = run(tx_any_presence_leg_via(
+            &txid,
+            now,
+            true,
+            None,
+            get,
+            |_, _| async { false },
+        ));
         let a = crate::txany::decide_tx_any(None, None, Some(&obs), absence);
         assert_eq!(a.present, Some(true));
         assert_eq!(a.confirmed, Some(false));
@@ -7666,15 +7747,25 @@ mod e606_tests {
             };
             async move { Some(body) }
         };
-        let (obs, absence, height) = run(tx_any_presence_leg_via(&txid, now, get, |_, _| async {
-            true
-        }));
+        let (obs, absence, height) = run(tx_any_presence_leg_via(
+            &txid,
+            now,
+            true,
+            None,
+            get,
+            |_, _| async { true },
+        ));
         let a = crate::txany::decide_tx_any(None, None, Some(&obs), absence);
         assert_eq!(a.confirmed, Some(true));
         assert_eq!(height, Some(970733));
-        let (obs, absence, height) = run(tx_any_presence_leg_via(&txid, now, get, |_, _| async {
-            false
-        }));
+        let (obs, absence, height) = run(tx_any_presence_leg_via(
+            &txid,
+            now,
+            true,
+            None,
+            get,
+            |_, _| async { false },
+        ));
         assert_eq!(
             crate::txany::decide_tx_any(None, None, Some(&obs), absence).present,
             None
@@ -7696,16 +7787,199 @@ mod e606_tests {
             };
             async move { Some(body) }
         };
-        let (obs, absence, _) = run(tx_any_presence_leg_via(&txid, now, get, |_, _| async {
-            false
-        }));
-        assert_eq!(
-            absence,
-            crate::txany::AbsenceCorroboration::CorroboratedAbsent
-        );
+        let (obs, absence, _) = run(tx_any_presence_leg_via(
+            &txid,
+            now,
+            true,
+            None,
+            get,
+            |_, _| async { false },
+        ));
+        assert_eq!(absence, crate::txany::AbsenceCorroboration::Unknown);
         assert_eq!(
             crate::txany::decide_tx_any(None, None, Some(&obs), absence).present,
-            Some(false)
+            None
+        );
+    }
+
+    #[test]
+    fn ns2_m1_scope_and_held_anchor_use_local_rows() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE transactions (txid TEXT PRIMARY KEY, has_proof INTEGER); CREATE TABLE network_seen (txid TEXT PRIMARY KEY); CREATE TABLE pot_beefs (txid TEXT PRIMARY KEY); CREATE TABLE submit_refusals (refusedTxid TEXT);
+            INSERT INTO transactions VALUES ('unverified',0); INSERT INTO network_seen VALUES ('unverified'); INSERT INTO submit_refusals VALUES ('submitted');").unwrap();
+        let missing: rusqlite::Result<String> =
+            db.query_row(TX_ANY_HELD_ANCHOR_SQL, [], |r| r.get(0));
+        assert!(
+            matches!(missing, Err(rusqlite::Error::QueryReturnedNoRows)),
+            "an unverified row is not a HELD anchor"
+        );
+        db.execute_batch(
+            "INSERT INTO transactions VALUES ('held',1); INSERT INTO network_seen VALUES ('held');",
+        )
+        .unwrap();
+        for (id, expected) in [("held", true), ("submitted", true), ("foreign", false)] {
+            let exists = db
+                .prepare(TX_ANY_OURS_SQL)
+                .unwrap()
+                .exists([id, id, id])
+                .unwrap();
+            assert_eq!(exists, expected);
+        }
+        let anchor: String = db
+            .query_row(TX_ANY_HELD_ANCHOR_SQL, [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(anchor, "held");
+    }
+
+    #[test]
+    fn ns2_m1_l4_production_binds_both_arcade_consumers_and_has_no_absent_writer() {
+        let src = include_str!("routes.rs");
+        let indexed = &src[src.find("async fn arcade_confirmation_look(").unwrap()
+            ..src.find("async fn provider_get(").unwrap()];
+        let external = &src[src.find("async fn tx_any_external_leg(").unwrap()
+            ..src.find("async fn tx_any_presence_leg_via<").unwrap()];
+        for consumer in [indexed, external] {
+            assert!(consumer.contains("crate::txany::mined_proof_matches("));
+            assert!(consumer.contains("crate::beef_guard::canonical_root(env, height)"));
+        }
+        let resolve = &src[src.find("async fn resolve_tx_any(").unwrap()
+            ..src.find("pub async fn tx_any(").unwrap()];
+        assert!(!resolve.contains("write_verdict_memo("));
+        assert!(external.contains("tx_any_scope(env, txid_lc)"));
+        assert!(
+            src[..src.find("pub async fn tx_any(").unwrap()]
+                .matches("crate::txany::fact_reader_raw_hex")
+                .count()
+                >= 3
+        );
+    }
+
+    #[test]
+    fn ns2_m1_foreign_unmined_is_a_timed_courier_hint_without_arcade() {
+        let (txid, raw) = competitor();
+        let urls = std::cell::RefCell::new(Vec::new());
+        let get = |url: String| {
+            urls.borrow_mut().push(url.clone());
+            let response = if url.contains("/tx/hash/") {
+                (200, mempool_body(&txid))
+            } else if url.ends_with("/hex") {
+                (200, hex::encode(&raw).into_bytes())
+            } else {
+                (404, vec![])
+            };
+            std::future::ready(Some(response))
+        };
+        let (obs, absence, _) = run(tx_any_presence_leg_via(
+            &txid,
+            1234,
+            false,
+            None,
+            get,
+            |_, _| async { panic!("unmined hint has no proof") },
+        ));
+        let a = decide_tx_any(None, None, Some(&obs), absence);
+        assert_eq!(a.present, None);
+        assert_eq!(a.hint_source, Some("woc"));
+        assert_eq!(crate::txany::fact_reader_raw_hex(&a), None);
+        assert_eq!(a.observed_at_ms, Some(1234));
+        assert_eq!(a.raw_hex, Some(hex::encode(raw)));
+        assert!(!urls
+            .borrow()
+            .iter()
+            .any(|url| url.starts_with(&arcade_url())));
+        assert_eq!(crate::txany::tx_any_value(&txid, &a)["tier"], "hint");
+    }
+
+    #[test]
+    fn ns2_m1_held_anchor_probe_is_memoised_but_never_a_second_absence_vote() {
+        ARCADE_ROUTE_HEALTHY.with(|c| c.set(false));
+        WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
+        let subject = tx(0x11);
+        let held = tx(0x22); // fixture: overlay HELD, network_seen, verified BUMP.
+        let anchor_reads = std::cell::Cell::new(0);
+        let now = crate::txany::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
+        let get = |url: String| {
+            let response = if url == format!("{}/tx/{held}", arcade_url()) {
+                anchor_reads.set(anchor_reads.get() + 1);
+                (
+                    200,
+                    serde_json::json!({"txid":held,"txStatus":"SEEN_ON_NETWORK",
+                    "timestamp":"2026-10-12T18:15:00Z"})
+                    .to_string()
+                    .into_bytes(),
+                )
+            } else {
+                (404, vec![])
+            };
+            std::future::ready(Some(response))
+        };
+        for _ in 0..2 {
+            let (obs, absence, _) = run(tx_any_presence_leg_via(
+                &subject,
+                now,
+                true,
+                Some(&held),
+                get,
+                |_, _| async { false },
+            ));
+            assert_eq!(decide_tx_any(None, None, Some(&obs), absence).present, None);
+            assert_eq!(absence, AbsenceCorroboration::Unknown);
+        }
+        assert_eq!(anchor_reads.get(), 1);
+        ARCADE_ROUTE_HEALTHY.with(|c| c.set(false));
+    }
+
+    #[test]
+    fn ns2_m1_mined_foreign_uses_checked_courier_proof_never_arcade() {
+        let (txid, raw) = competitor();
+        let sibling = tx(0x44);
+        let proof = serde_json::json!({"index":0,"txOrId":txid,"nodes":[sibling]})
+            .to_string()
+            .into_bytes();
+        let bump = crate::txany::courier_tsc_bump(&proof, 970733).unwrap();
+        let mp = bsv_rs::transaction::MerklePath::from_hex(&bump).unwrap();
+        let root = mp.compute_root(Some(&txid)).unwrap();
+        let get = |url: String| {
+            assert!(!url.starts_with(&arcade_url()));
+            let response = if url.contains("/tx/hash/") {
+                (200, mined_body(&txid))
+            } else if url.ends_with("/proof/tsc") {
+                (200, proof.clone())
+            } else if url.ends_with("/hex") {
+                (200, hex::encode(&raw).into_bytes())
+            } else {
+                (404, vec![])
+            };
+            std::future::ready(Some(response))
+        };
+        let (obs, absence, height) = run(tx_any_presence_leg_via(
+            &txid,
+            1234,
+            false,
+            None,
+            get,
+            |bump, height| {
+                std::future::ready(crate::txany::mined_proof_matches(
+                    &txid, &bump, height, &root,
+                ))
+            },
+        ));
+        let a = decide_tx_any(None, None, Some(&obs), absence);
+        assert_eq!(a.present, Some(true));
+        assert_eq!(a.confirmed, Some(true));
+        assert_eq!(height, Some(970733));
+        assert_eq!(a.hint_source, None);
+        let (obs, absence, _) = run(tx_any_presence_leg_via(
+            &txid,
+            1234,
+            false,
+            None,
+            get,
+            |_, _| async { false },
+        ));
+        assert_eq!(
+            decide_tx_any(None, None, Some(&obs), absence).confirmed,
+            None
         );
     }
 
