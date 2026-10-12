@@ -316,7 +316,7 @@ pub const HOPSWEEPS_FOR_IDENTITY_SQL: &str = "SELECT hopTxid, hopVout, sweepTxid
 /// bsv-low #517: the filed sweeps the index holds PROVEN, one chunk of txids per ask (the caller closes the `IN (`
 /// list with its placeholders). `has_proof = 1` is the latch only the chaintracks-verified stitch sets (the admit
 /// path always writes 0; a refuted bump resets it), `proofHeight` the block that bump names.
-pub const SWEEP_PROOFS_SQL_HEAD: &str = "SELECT lower(txid) AS txid, proofHeight FROM transactions WHERE has_proof = 1 AND txid IN (";
+pub const SWEEP_PROOFS_SQL_HEAD: &str = "SELECT lower(txid) AS txid, proofHeight FROM transactions WHERE +has_proof = 1 AND txid IN (";
 
 /// PURE: the proof read for `n` sweep txids (`?1..?n`), prepared against the shipped schema at representative arities
 /// in `tests/sql_prepares_sqlite.rs` (the crate's #323 rule: a `contains` pin is never the only thing behind a query).

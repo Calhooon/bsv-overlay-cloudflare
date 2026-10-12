@@ -660,9 +660,9 @@ pub fn party_candidates_sql() -> String {
              AND hop.spent = 1 AND hop.spendingTxid IS NOT NULL \
              AND pot.paramsDecoded = 1 AND pot.recoveryHeight IS NOT NULL \
              AND pot.pubA IS NOT NULL AND pot.pubB IS NOT NULL \
-             AND lower(hp.seatSettlePubkey) IN (lower(pot.pubA), lower(pot.pubB)) \
+             AND hp.seatSettlePubkey IN (pot.pubA, pot.pubB) \
              AND NOT EXISTS (SELECT 1 FROM potparty_records x \
-                              WHERE x.identity = hp.identity \
+                              WHERE +x.identity = hp.identity \
                                 AND x.potTxid = pot.txid AND x.potVout = pot.outputIndex))",
         vout = LEADERBOARD_POT_VOUT,
     )
