@@ -16,8 +16,8 @@ workspace = "../../workers"
 [lib]
 # `cdylib` for the Cloudflare Workers wasm32 build (worker-build consumes
 # this). `rlib` added so `cargo test -p overlay-cloudflare` can run the
-# crate's own unit tests , e.g. `peer_crawler::tests::parse_output_list_*`
-# , which are pure-Rust fixtures that don't need the worker runtime.
+# crate's own unit tests, e.g. `peer_crawler::tests::parse_output_list_*`
+#, which are pure-Rust fixtures that don't need the worker runtime.
 # Without `rlib`, cargo's test harness can't link, so tests are silently
 # skipped (the "running 0 tests" symptom).
 crate-type = ["cdylib", "rlib"]
@@ -33,11 +33,11 @@ overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path =
 low-proof-replay = { version = "0.1", path = "../low-proof-replay" }
 bsv-rs = { workspace = true, features = ["wasm"] }
 # 0.3 (bsv-low #348, was 0.1). Bumped because it is the only middleware line
-# compatible with `worker 0.8` , and it is the SAME major the low-watchtower
+# compatible with `worker 0.8`, and it is the SAME major the low-watchtower
 # and low-app-layer already pin, so the fleet is now on one middleware lineage
 # (the documented lineage trap: a stale pin is how the relay once stranded
-# itself on 0.2.0). This crate uses exactly two items from it ,
-# `init_panic_hook()` and `WorkerStorageClient` , and both are unchanged
+# itself on 0.2.0). This crate uses exactly two items from it,
+# `init_panic_hook()` and `WorkerStorageClient`, and both are unchanged
 # across the bump: 0.1 → 0.3 needed ZERO source edits here.
 # Exactly 0.5.0 (align-engine-050, 2026-10-10): built on bsv-rs 0.4, so
 # `WorkerStorageClient::new` takes the workspace's own `ProtoWallet`
@@ -50,12 +50,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-# 0.8 (bsv-low #348, was 0.7). NOT a preference , a hard constraint of the
+# 0.8 (bsv-low #348, was 0.7). NOT a preference, a hard constraint of the
 # deploy toolchain: `worker-build` resolves `worker` from the WORKSPACE
 # Cargo.lock and takes the LOWEST version it finds there (its per-crate
 # disambiguation is dead code, an off-by-one in
 # `Lockfile::get_package_version` present from 0.7.5 through 0.8.5). So while
-# this crate sat on 0.7 the sibling `low-app-layer` , which needs 0.8 , could
+# this crate sat on 0.7 the sibling `low-app-layer`, which needs 0.8, could
 # not be deployed AT ALL, for a month, with `make ci` green the whole time.
 # THE WORKSPACE MAY HOLD EXACTLY ONE `worker` VERSION. If a crate here ever
 # needs a different one, it has to leave the workspace *and* stop depending on
@@ -71,7 +71,7 @@ js-sys = "0.3"
 # (the engine's own test store; test-only, never in the wasm32 build).
 overlay-engine = { package = "bsv-overlay-engine", version = "0.1", path = "../overlay-engine", features = ["memory-storage"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
-# Real SQLite (bundled , no system dependency, deterministic version) so the
+# Real SQLite (bundled, no system dependency, deterministic version) so the
 # identity-scoped read-window tests EXECUTE the exact shipped SQL against the
 # production `OVERLAY_MIGRATIONS` schema instead of merely pinning the string
 # (bsv-low #281). Test-only: never linked into the wasm32 Worker build.

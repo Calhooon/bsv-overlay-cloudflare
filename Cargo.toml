@@ -2,11 +2,10 @@
 # clone of this repository ALONE must build `bsv-overlay-engine` and
 # `bsv-overlay-discovery`, and a crate that names them by git rev must
 # resolve with no `[patch]`. So no member here may carry a path dependency
-# that leaves the repository. The three crates that link LOW's private
-# `bsv-low` checkout (the two deployable workers and the proof replay they
-# share) are a SECOND workspace, `workers/Cargo.toml`, with its own
-# `Cargo.lock`; they are excluded here because cargo loads every member's
-# path dependencies, optional or not, before it builds anything.
+# that leaves the repository. The two deployable workers and their proof replay live in a second
+# workspace, `workers/Cargo.toml`, with its own `Cargo.lock`. The separation
+# dates from their external path dependencies; those dependencies now resolve
+# from crates.io, so both workspaces build from this repository alone.
 [workspace]
 members = [
     "crates/overlay-engine",
