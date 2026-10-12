@@ -1,0 +1,13 @@
+[package]
+name = "bsv-worker-build-info"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+workspace = "../../workers"
+
+[features]
+build = []
+
+[dependencies]
+serde_json.workspace = true

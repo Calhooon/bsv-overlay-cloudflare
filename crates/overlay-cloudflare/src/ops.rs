@@ -1337,6 +1337,7 @@ pub async fn health_invariants(
         "ok": !dead,
         "service": "low-overlay",
         "check": "proof-completion",
+        "build": bsv_worker_build_info::build_json!(),
         "strict": strict,
         // bsv-low (2026-09-04): the index janitor — the live backlog by row
         // kind; its pass totals are the `missing_spend_*` counters below.

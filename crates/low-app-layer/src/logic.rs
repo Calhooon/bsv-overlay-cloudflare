@@ -1169,7 +1169,7 @@ pub fn tip_body(height: u64) -> String {
 
 /// Assemble the `/health` wire body.
 pub fn health_body() -> String {
-    json!({ "ok": true, "service": "low-app-layer" }).to_string()
+    json!({ "ok": true, "service": "low-app-layer", "build": bsv_worker_build_info::build_json!() }).to_string()
 }
 
 // ── /epoch — the storage-epoch directive (bsv-low THE ORDER item 2,
@@ -3254,6 +3254,7 @@ mod tests {
         let h: serde_json::Value = serde_json::from_str(&health_body()).unwrap();
         assert_eq!(h["ok"], true);
         assert_eq!(h["service"], "low-app-layer");
+        assert!(h["build"].is_object(), "health must carry build metadata: {h}");
     }
 
     /// `/epoch` (bsv-low THE ORDER item 2, + #375): the wire shape is

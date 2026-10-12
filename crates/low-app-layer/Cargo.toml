@@ -14,7 +14,11 @@ workspace = "../../workers"
 # helper unit tests natively (same rationale as overlay-cloudflare's lib).
 crate-type = ["cdylib", "rlib"]
 
+[build-dependencies]
+bsv-worker-build-info = { path = "../worker-build-info", features = ["build"] }
+
 [dependencies]
+bsv-worker-build-info = { path = "../worker-build-info" }
 getrandom = { version = "0.2", features = ["js"] }
 # worker 0.8 (bsv-low #318): `bsv-middleware-cloudflare` 0.3 — the canonical
 # BRC-103/104 middleware, the SAME major the low-watchtower pins — requires

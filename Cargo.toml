@@ -14,6 +14,7 @@ members = [
     "parity-harness",
 ]
 exclude = [
+    "crates/worker-build-info",
     "crates/overlay-cloudflare",
     "crates/low-app-layer",
     "crates/low-proof-replay",

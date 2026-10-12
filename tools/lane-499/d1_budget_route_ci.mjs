@@ -30,6 +30,7 @@
  *
  * Exit 0 = every expectation held.
  */
+import { assertBuildInfo } from '../assert-build-info.mjs'
 import { createHash, randomFillSync } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 
@@ -119,7 +120,9 @@ const txidOf = (raw) => Buffer.from(sha256d(raw)).reverse().toString('hex')
 async function appHealth() {
   const r = await get(APP, '/health')
   if (r.status !== 200) throw new Error(`GET /health -> ${r.status}`)
-  return JSON.parse(r.text)
+  const body = JSON.parse(r.text)
+  assertBuildInfo(body)
+  return body
 }
 async function pollFor(predicate, timeoutMs = 20_000, stepMs = 100) {
   const t0 = Date.now()
@@ -185,7 +188,14 @@ const measured = {}
 // ── 3. the health surfaces carry the running maxima ────────────────────────
 {
   const app = (await appHealth()).d1Budget
-  const ov = JSON.parse((await get(OVERLAY, '/health/invariants')).text).d1Budget
+  const overlayHealth = JSON.parse((await get(OVERLAY, '/health/invariants')).text)
+  assertBuildInfo(overlayHealth)
+  for (const route of ['/health', '/health/live', '/health/ready']) {
+    const response = await get(OVERLAY, route)
+    if (response.status !== 200) throw new Error(`${route} -> ${response.status}`)
+    assertBuildInfo(JSON.parse(response.text))
+  }
+  const ov = overlayHealth.d1Budget
   const surfaces = { '/utxo-status': app, '/pots-view': app, '/results': app, '/results:view': app, '/owed': app, '/submit': ov }
   for (const [route, budget] of Object.entries(surfaces)) {
     const m = measured[route]
