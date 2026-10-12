@@ -848,8 +848,18 @@ async fn l23_r2_delta_missing_beef_faults_one_candidate_and_keeps_other_rows() {
             overlap[0], same_outpoint,
             "a candidate fault cannot mask an independently judged payout on the same UTXO"
         );
+        for marker in ["unknown", "unverified"] {
+            let mut swept = same_outpoint.clone();
+            swept.facts = serde_json::json!({"markerVerified":marker,"claim":"internalize"});
+            let mut overlap = vec![swept.clone()];
+            merge_markerless_faults(&mut overlap, faulty.faults.clone());
+            assert_eq!(
+                overlap[0], swept,
+                "a candidate fault cannot take a swept hop's press before marker latch"
+            );
+        }
         let mut planted = same_outpoint;
-        planted.facts = serde_json::json!({"markerVerified":"unknown","claim":"sweep-hop"});
+        planted.facts = serde_json::json!({"markerVerified":"unknown","claim":null});
         let mut unlatched = vec![planted];
         merge_markerless_faults(&mut unlatched, faulty.faults.clone());
         assert_eq!(unlatched[0].family, OwedFamily::Unbound);
