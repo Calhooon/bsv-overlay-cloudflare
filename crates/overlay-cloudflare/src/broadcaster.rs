@@ -4660,8 +4660,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ns2_m2_reached_echo_decision() {
+        assert_eq!(reached_submit_echo(false), GateStep::Accepted);
+        assert_eq!(reached_submit_echo(true), GateStep::SyncAccepted);
+        assert!(matches!(ladder_step(reached_submit_echo(true), "subject"),
+            Ladder::Return(ArcOutcome::AcceptedPending(_))));
+    }
+
     #[tokio::test]
-    async fn ns2_612_known_seen_with_stored_corroborators_admits_pending() {
+    async fn ns2_612_stored_seen_decision_admits_pending_without_corroborating() {
         for legs in [1, 2] {
             let out = broadcast_efs_gated_with(
                 legs,
@@ -4677,7 +4685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ns2_612_concurrent_first_and_known_seen_submit_both_admit_pending() {
+    async fn ns2_612_independent_first_and_echo_decisions_both_admit_pending() {
         let first = broadcast_efs_gated_with(
             2,
             "subject",
@@ -4717,6 +4725,9 @@ mod tests {
             .find("GateVerdict::Reached =>")
             .expect("the SEEN echo arm");
         let fatal = f.find("GateVerdict::Fatal =>").expect("the fatal echo arm");
+        let arm = &f[reached..fatal];
+        assert!(arm.contains("reached_submit_echo(self.fast_answer)"));
+        assert!(!arm.contains("GateStep::Accepted"));
         let orphan = f
             .find("GateVerdict::Orphan =>")
             .expect("the orphan echo arm");
