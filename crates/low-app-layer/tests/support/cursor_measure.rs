@@ -43,6 +43,13 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
     let mut expected = Vec::new();
     let mut party = Vec::new();
     let mut hops = Vec::new();
+    let (expanded, rows) = query(
+        db,
+        &owed_cursor::initial_party_sql(),
+        &[Value::Text(identity.into())],
+    );
+    sql.push_str(&format!("{expanded};\n"));
+    expected.push(json!({"name":"combined initial party cursor","rows":rows,"sql":expanded,"ceiling":owed_cursor::PAGE_READ_CEILING}));
     for source in [Source::Party, Source::Link, Source::Hop] {
         for _ in 0..1 {
             let mut cursor = owed_cursor::Cursor::default();
@@ -75,6 +82,11 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
             "results",
             owed_cursor::select(party.clone(), None, 10),
             owed_cursor::hydrate_sql(&low_app_layer::results::results_sql(None, 0)),
+        ),
+        (
+            "paired hydration",
+            owed_cursor::select(party.clone(), None, 10),
+            owed_cursor::hydrate_party_pair_sql(),
         ),
         (
             "refund",

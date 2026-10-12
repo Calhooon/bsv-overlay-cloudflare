@@ -437,3 +437,29 @@ impl Cursor {
         }
     }
 }
+
+pub const INITIAL_PAGE: usize = 16;
+
+/// One bounded initial read for the two party-shaped sources. This avoids an
+/// empty-source statement on small identities, while keeping the statement below 287.
+pub fn initial_party_sql() -> String {
+    let columns = "identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,seatSettlePubkey,seatSigHex,sigHex,createdAt,markerRowid,sigValid,cursorRowid,potCreatedAt,unknownPot";
+    [Source::Party, Source::Link]
+        .into_iter()
+        .enumerate()
+        .map(|(i, source)| {
+            let sql = candidates_sql(source, true, false, false)
+                .replace(&format!("LIMIT {PAGE}"), &format!("LIMIT {INITIAL_PAGE}"));
+            format!("SELECT {i} AS sourceTag,{columns} FROM ({sql})")
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+/// Results and refund projections share one bounded spine read, with separate
+/// proof joins so each production mapper still receives its original proof flag.
+pub fn hydrate_party_pair_sql() -> String {
+    let sql = hydrate_sql(&crate::results::results_sql(None, 0));
+    sql.replacen("FROM (SELECT",", w.potCreatedAt AS potAdmittedAt, w.markerCreatedAt AS firstPartyMarkerAt, w.firstSpentAt AS firstSpentAt, EXISTS(SELECT 1 FROM potrefund_records pr WHERE pr.potTxid=w.potTxid AND pr.potVout=w.potVout) AS backupMarkerPresent, refund_sb.proof_verified AS refundSpenderProofVerified FROM (SELECT",1)
+        .replace("LEFT JOIN network_seen ns", "LEFT JOIN pot_beefs refund_sb ON w.spendingTxid IS NOT NULL AND refund_sb.txid=lower(w.spendingTxid) LEFT JOIN network_seen ns")
+}
