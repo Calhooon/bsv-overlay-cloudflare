@@ -3203,25 +3203,19 @@ pub fn note_recompute_write_superseded() {
     RECOMPUTE_WRITES_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// bsv-low #499: the recomputes ONE identity may run on ONE isolate inside one window (the brain's per-identity
-/// recompute, bounded). Past it a recompute is SHED: the hook's or the read's ask runs nothing, the reader is served
-/// the snapshot `owed_rows` holds, and the shed is counted (`recomputeShed` on `/health`). Nothing new is persisted:
-/// a hook marks the identity stale BEFORE it asks, and a shed marks it stale AGAIN ([`owed_shed_plan`], one one-row
-/// UPDATE), so the first read after the window recomputes (the read's own staleness rule). The second mark is the
-/// lens fold's M1: a walk in flight when the 13th hook marked stale writes `stale = 0` over that mark (its write is
-/// stamped at its START, before the hook's change), and the folded rerun of that hook is the shed one; without the
-/// re-mark the list served the walk's older rows as fresh for up to 15 minutes. What a shed costs, stated: no push
-/// (`owed-changed` is sent by a walk only), so a change that lands while its identity is over the ceiling reaches
-/// the page at the page's next read past the window (mount, a tip, a socket reconnect, an event; the page has no
-/// timer). The ceiling is PER ISOLATE: hooks reach whichever isolate the platform picks, so the fleet bound is 12
-/// times the live isolates (a brake on one isolate's herd, not a D1 budget). A walk on ANOTHER isolate that began
-/// before the shed and lands after it still clears the re-mark (the isolate-local lock cannot see it); its rows
-/// are then at most that walk's start old, and the 5 and 15 minute age rules still recompute.
+/// bsv-low #499: the recomputes ONE identity may run on ONE isolate; #648 keeps twelve ordinary walks per
+/// fixed 60-second window. A shed
+/// keeps and re-marks the stored snapshot stale (the #499 in-flight write race), and reserves ONE deferred walk
+/// at the window's end. The durable alarm runs the SAME recompute and owed-changed push, without spending the
+/// next window's ordinary admissions: ceiling + 1 walks charged to each identity/window, never one timer per ask.
+/// Reads name an exhausted refresh as refresh:"shed" with retryAfterMs, so an old snapshot cannot pose as fresh.
+/// The fleet bound scales with live isolates; this is a storm brake, not a fleet D1 budget. A first read without
+/// a snapshot is counted too. Cross-isolate older writes still use the snapshot write guard and the age rules.
 ///
-/// Why 12: one hand drives at most a handful per seat (the JOIN's `pot-changed` and `hop-changed`, the settle's
-/// `pot-changed`, the seat's filings, a block's tip), the in-flight lock already folds twins, and a claim reruns
-/// at most `OWED_RERUNS_PER_CLAIM` more; 12 a minute is a recompute every 5 s held for a minute, which no honest
-/// table reaches and a hook storm (the 2026-09-01 callback flood, the loop-11 t=0 herd) does.
+/// Why keep 12: the 2026-09-01 callback flood must not fan out into unbounded walks. The old honest-table premise
+/// was false: the 2026-10-12 spec-identity-none 50-second hand drove 19 pushes and at least twelve counted walks
+/// for its winner before the settle. Filing triggers amplified mounted-device reads; filings now schedule the
+/// coalesced walk themselves. Honest traffic can reach the ceiling: a shed is a bounded delay, never silence.
 pub const OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW: u32 = 12;
 /// The window of [`OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW`]: one minute, fixed from the first recompute in it.
 pub const OWED_RECOMPUTE_RATE_WINDOW_MS: i64 = 60_000;
@@ -8834,5 +8828,15 @@ pub(crate) mod tests {
         assert!(!hook.contains("owed_changed_event_body(id, \"filing\", 0"), "no bare trigger to every device");
         assert!(hook.contains("owed_identities_by_marker"), "walk both pot parties, not just the filer");
     }
+
+    #[test]
+    fn ns2_premise_records_the_honest_hand_and_the_bounded_delay() {
+        let code = include_str!("owed.rs");
+        let comment = &code[code.find("/// bsv-low #499: the recomputes ONE identity").unwrap()..code.find("pub const OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW").unwrap()];
+        assert!(comment.contains("19 pushes") && comment.contains("50-second"), "the measured honest hand replaces the false premise");
+        assert!(comment.contains("ceiling + 1") && comment.contains("alarm"), "state the bounded deferred rule");
+        assert!(!comment.contains("which no honest"));
+    }
+
 
 }
