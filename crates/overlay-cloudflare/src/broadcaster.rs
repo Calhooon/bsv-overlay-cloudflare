@@ -1529,7 +1529,7 @@ enum SubmitRung {
     /// [`ARCADE_WAIT_TIMEOUT_MS`] (its wait is about Arcade re-validating,
     /// not about the tracker).
     SubjectOnly { graced: bool },
-    /// `POST /txs` of the full ancestry batch (attempt 3). Full budget.
+    /// Ancestors first, then subject, each alone at `/tx` (attempt 3). Full budget.
     FullBatch,
 }
 
@@ -2048,13 +2048,11 @@ pub fn admission_has_broadcaster_witness(terminal: Option<TerminalJudgement>) ->
     terminal.is_none()
 }
 
-/// Concatenate an EF batch (dependency order) into a single `POST /txs` body.
-fn concat_efs(efs: &[EfTx]) -> Vec<u8> {
-    let mut concat = Vec::with_capacity(efs.iter().map(|e| e.ef.len()).sum());
-    for e in efs {
-        concat.extend_from_slice(&e.ef);
-    }
-    concat
+/// Full-batch rung: preserve ancestor order, then submit the subject alone.
+fn full_batch_legs<'a>(efs: &'a [EfTx], subject_txid: &'a str) -> impl Iterator<Item = &'a EfTx> {
+    efs.iter()
+        .filter(move |e| e.txid != subject_txid)
+        .chain(efs.iter().filter(move |e| e.txid == subject_txid))
 }
 
 /// Human-readable fatal reason for a status response, folding in the captured
@@ -2361,9 +2359,6 @@ impl ArcadeBroadcaster {
     fn tx_endpoint(&self) -> String {
         format!("{}/tx", self.base_url)
     }
-    fn txs_endpoint(&self) -> String {
-        format!("{}/txs", self.base_url)
-    }
     fn status_endpoint(&self, txid: &str) -> String {
         format!("{}/tx/{}", self.base_url, txid)
     }
@@ -2564,16 +2559,29 @@ impl ArcadeBroadcaster {
                         .await
                     }
                     SubmitRung::FullBatch => {
-                        let concat = concat_efs(efs);
-                        self.submit_once_and_gate(
-                            &self.txs_endpoint(),
-                            &concat,
-                            subject_txid,
-                            efs.len(),
-                            ARCADE_WAIT_TIMEOUT_MS,
-                            register_callback,
-                        )
-                        .await
+                        // bsv-low #640: Arcade stores one callback pair per POST.
+                        // Each /tx body must carry only the leg named by its token.
+                        for leg in full_batch_legs(efs, subject_txid) {
+                            if leg.txid == subject_txid {
+                                return self.submit_once_and_gate(
+                                    &self.tx_endpoint(),
+                                    &leg.ef,
+                                    &leg.txid,
+                                    1,
+                                    ARCADE_WAIT_TIMEOUT_MS,
+                                    register_callback,
+                                ).await;
+                            }
+                            // Independently avoid adding registrations for known ancestors.
+                            let known = self.tx_status(&leg.txid).await
+                                .is_some_and(|r| r.txid.eq_ignore_ascii_case(&leg.txid));
+                            // Priming is best effort, as in the ancestry corroborator.
+                            // Only the subject's answer decides the ladder's verdict.
+                            let _ = self.submit_ef(
+                                &self.tx_endpoint(), &leg.txid, &leg.ef, !known,
+                            ).await;
+                        }
+                        Err(format!("subject {subject_txid} has no EF leg"))
                     }
                 }
             },
@@ -2752,8 +2760,8 @@ impl ArcadeBroadcaster {
         let headers = worker::Headers::new();
         let _ = headers.set("Content-Type", "application/octet-stream");
         let _ = headers.set("User-Agent", OVERLAY_USER_AGENT);
-        // Subject txid doubles as the callback token — scopes the status stream
-        // and (P2.5) authenticates the MINED webhook to /arc-ingest.
+        // Each leg's own txid scopes its status stream and authenticates
+        // its MINED webhook to /arc-ingest (bsv-low #640).
         // `register_callback == false` (INCIDENT D1-CALLBACK-FLOOD 2026-09-01:
         // a re-present of a subject Arcade already holds) sends NEITHER
         // callback header: Arcade accumulates one registration per POST, and
@@ -4918,24 +4926,44 @@ mod tests {
     }
 
     #[test]
-    fn concat_efs_is_dependency_order_concatenation() {
-        // Subject-only vs full-batch bodies: attempt 1 submits ONE tx (the
-        // subject's EF); the fallback batch is the concatenation of all legs.
+    fn arcreg_full_batch_two_ancestors_use_their_own_tokens() {
+        use crate::routes::{classify_arc_callback_auth, ArcCallbackAuth};
         let efs = vec![
             EfTx {
-                txid: "parent".into(),
-                ef: vec![1, 2, 3],
+                txid: "a".repeat(64),
+                ef: vec![3],
             },
             EfTx {
-                txid: "subject".into(),
-                ef: vec![4, 5],
+                txid: "b".repeat(64),
+                ef: vec![1],
+            },
+            EfTx {
+                txid: "c".repeat(64),
+                ef: vec![2],
             },
         ];
-        let subject_only = &efs.iter().find(|e| e.txid == "subject").unwrap().ef;
-        assert_eq!(subject_only.len(), 2, "subject-only body is the subject EF");
-        let batch = concat_efs(&efs);
-        assert_eq!(batch, vec![1, 2, 3, 4, 5], "batch concatenates in order");
-        assert_eq!(batch.len(), 5);
+        let subject = &efs[0].txid;
+        let legs: Vec<_> = full_batch_legs(&efs, subject).collect();
+        assert_eq!(
+            legs.iter().map(|e| e.ef.as_slice()).collect::<Vec<_>>(),
+            vec![&[1][..], &[2][..], &[3][..]],
+            "ancestors first, subject last"
+        );
+        for leg in legs {
+            let auth = format!("Bearer {}", leg.txid);
+            assert_eq!(
+                classify_arc_callback_auth(Some(&auth), None, &leg.txid),
+                ArcCallbackAuth::Authorized,
+                "each ancestor's own bearer is accepted"
+            );
+            if leg.txid != *subject {
+                assert_eq!(
+                    classify_arc_callback_auth(Some(&format!("Bearer {subject}")), None, &leg.txid),
+                    ArcCallbackAuth::BadToken,
+                    "the old batch token is refused"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5417,7 +5445,6 @@ mod tests {
             format!("{ARCADE_DEFAULT_URL}/tx")
         );
         let b = ArcadeBroadcaster::new("https://h.example");
-        assert_eq!(b.txs_endpoint(), "https://h.example/txs");
         assert_eq!(
             b.status_endpoint("deadbeef"),
             "https://h.example/tx/deadbeef"
