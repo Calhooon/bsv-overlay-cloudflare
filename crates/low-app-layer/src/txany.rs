@@ -14,23 +14,24 @@
 //!      (historical-tx / GASP sync / peer crawl) are ungated by design, so
 //!      the PRESENCE question falls through to the external leg alongside
 //!      the confirmation question — the raw is still served either way.
-//!   2. **Break-glass external leg (WoC + Bitails, SERVER-SIDE).** Only for
+//!   2. **Break-glass external leg (Arcade, then couriers, server-side).** For
 //!      txids the index has never seen: legacy pre-overlay-era txs (the
 //!      2026-07-21 incident class) and foreign txs. The trust bars of the
 //!      client code this replaces are preserved server-side:
-//!        - POSITIVE presence requires the raw bytes fetched AND hash-verified
-//!          against the txid (never a bare pointer/claim — the raw is also
-//!          returned so the caller gets verified bytes for free);
+//!        - A courier's POSITIVE needs raw bytes hash-verified against the
+//!          txid. First-party presence is a hint even if couriers have no
+//!          bytes; any raw served beside it is still hash checked;
 //!        - `confirmed` carries WoC's `confirmations >= 1` claim — the exact
 //!          trust the client's `wocTxConfirmed` placed in a direct WoC read;
 //!        - `claimedHeight` (bsv-low #527, 2026-09-21) carries WoC's `blockheight` beside a CONFIRMED external
 //!          answer as a claim, never a proof: DISPLAY-TIER dating of a tx the index no longer holds (a closed
 //!          table advert against the written-off era); `height` stays the chaintracks-verified word;
-//!        - NEGATIVE (provably absent) requires BOTH indexers to answer a
-//!          definitive 404 AND the Bitails tx route to prove itself healthy
-//!          against a known-mined anchor (the client's
-//!          `bitailsConclusively404` route-rot guard, ported verbatim) — one
-//!          provider's 404, or a 404 on a rotten route, is never absence;
+//!        - Arcade is FIRST for an unmined subject, including an index miss.
+//!          Its fresh SEEN or ACCEPTED word is a presence hint; MINED needs
+//!          its proof checked against our headers before confirmation.
+//!        - NEGATIVE needs Arcade and WoC definitive 404s behind healthy
+//!          routes. Bitails is pruned: its unmined 404 is "could not look".
+//!          A known-mined anchor cannot prove that Bitails sees the mempool;
 //!        - anything else is the honest unknown (`present: null`) — the
 //!          callers' fail-safe "unknown ⇒ retry, never a conclusion".
 //!
@@ -68,19 +69,13 @@ pub fn tx_any_cache_ttl_ms(answer: &TxAnyAnswer) -> f64 {
     }
 }
 
-/// bsv-low #451 slice B: Arcade's `GET /tx/{txid}` as the FIRST external witness for a tx the index holds WITHOUT a
-/// verified bump (the JOIN's first minutes; a MINED push not yet landed). Arcade is the broadcaster whose SEEN is the
-/// index's own admission witness (CLAUDE.md D1), so its live word is exactly the network presence the external leg
-/// exists to establish. THE GATE'S RULES (2026-09-17, HIGH-1 / HIGH-2 / MEDIUM-1): an ALLOW-LIST, never a deny-list
-/// — only `SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES` are the network holding it (the overlay's own `SEEN_OR_BETTER`
-/// bar; the orphan view `SEEN_IN_ORPHAN_MEMPOOL` and the pre-network ranks RECEIVED / STORED / ANNOUNCED /
-/// REQUESTED / SENT are NOT — the #267 hole was admitting on exactly that view, and a STORED tx can have mined
-/// through the client's direct-ARC fallback while Arcade never sends it); a SEEN word counts only while its status
-/// stamp is younger than [`ARCADE_WORD_FRESH_MS`] (a wedged or lagging Arcade must not hold the confirmation
-/// question forever: the couriers are each other's fallbacks on every chain question, the 2026-09-04 ruling); a
-/// MINED / IMMUTABLE word is a CLAIM — its `merklePath` + `blockHeight` come back for the caller to verify against
-/// chaintracks before `confirmed` leaves the server (the index refused Arcade's pushed bump once on the D7 class,
-/// and the client latches `confirmed` durably). Everything else is `Unknown`: the couriers decide, as before.
+/// Arcade is the first external source for subjects without a verified bump,
+/// whether or not the overlay holds their bytes. Fresh SEEN_ON_NETWORK,
+/// SEEN_MULTIPLE_NODES and ACCEPTED are presence hints. Orphan and pre-network
+/// words do not count. A hint expires after ARCADE_WORD_FRESH_MS so a wedged
+/// broadcaster cannot hold the question forever. MINED and IMMUTABLE carry
+/// a merkle path and height that the caller must verify against our headers
+/// before serving confirmation. Unknown words defer to capable couriers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArcadeWord {
     /// The network holds it unmined, said within the freshness window.
@@ -95,8 +90,8 @@ pub enum ArcadeWord {
 /// `PUSH_BACKSTOP_MIN_AGE_SECS` on the overlay — after this long the push has had its chance).
 pub const ARCADE_WORD_FRESH_MS: i64 = 30 * 60 * 1_000;
 
-/// The two statuses that mean "the network holds it" (mirrors the overlay's `SEEN_OR_BETTER` minus the mined pair).
-pub const ARCADE_SEEN_STATUSES: &[&str] = &["SEEN_ON_NETWORK", "SEEN_MULTIPLE_NODES"];
+/// First-party unmined presence hints. No status here writes a chain word.
+pub const ARCADE_SEEN_STATUSES: &[&str] = &["SEEN_ON_NETWORK", "SEEN_MULTIPLE_NODES", "ACCEPTED"];
 
 /// PURE: the three-way read of one Arcade body at `now_ms`.
 pub fn parse_arcade_word(status: u16, body: &str, now_ms: i64) -> ArcadeWord {
@@ -141,6 +136,24 @@ pub fn parse_arcade_word(status: u16, body: &str, now_ms: i64) -> ArcadeWord {
     } else {
         ArcadeWord::Unknown
     }
+}
+
+/// Bind the hint to the asked subject before using its word.
+pub fn parse_arcade_subject_word(status: u16, body: &[u8], txid: &str, now_ms: i64) -> ArcadeWord {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return ArcadeWord::Unknown;
+    };
+    if !v
+        .get("txid")
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| id.eq_ignore_ascii_case(txid))
+    {
+        return ArcadeWord::Unknown;
+    }
+    std::str::from_utf8(body)
+        .ok()
+        .map(|body| parse_arcade_word(status, body, now_ms))
+        .unwrap_or(ArcadeWord::Unknown)
 }
 
 /// PURE: an RFC 3339 UTC instant (`YYYY-MM-DDTHH:MM:SS[.frac](Z|+00:00)`, the shape Arcade stamps) as ms since the
@@ -231,14 +244,13 @@ pub struct VerdictMemo {
 }
 
 /// The kinds of negative a memo can hold. `Unconfirmable` = an input a DIFFERENT confirmed tx spent (the subject can
-/// never confirm); `Absent` = corroborated network absence (Arcade 404 + both indexers 404, past the janitor's age
-/// bar); `Refused` = Arcade's terminal refusal corroborated by both indexers' absence. Every kind answers
+/// never confirm); `Absent` = request-time Arcade and WoC absence, with both routes healthy; `Refused` = Arcade's terminal refusal corroborated by both indexers' absence. Every kind answers
 /// `present: false`; only `Unconfirmable` sets the client's `unconfirmable` flag (the refund rebroadcast retirement
 /// reads it, and only an input conflict earns it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerdictKind {
     Unconfirmable,
-    /// The request-time break-glass's corroborated double-404 for a tx the index never admitted — a YOUNG tx can
+    /// Request-time Arcade and WoC absence for a tx the index never admitted. A young tx can
     /// double-404 for seconds, so this kind lives only `VERDICT_MEMO_MAX_AGE_MS` (the second gate's MEDIUM-3a).
     Absent,
     /// Arcade's terminal refusal corroborated by both indexers' absence — the eviction's or the retire pass's word.
@@ -302,6 +314,10 @@ pub const VERDICT_MEMO_MAX_AGE_MS: i64 = 5 * 60_000;
 /// inside `max_age_ms`.
 pub fn verdict_memo_answers(memo: &VerdictMemo, txid: &str, now_ms: i64, max_age_ms: i64) -> bool {
     let age = now_ms - memo.verdict_at_ms;
+    // Retire the old request-time false absence immediately after an upgrade.
+    if memo.kind == VerdictKind::Absent && memo.evidence.contains("woc 404 + bitails 404") {
+        return false;
+    }
     if memo.txid != txid.to_ascii_lowercase() || age < 0 {
         return false;
     }
@@ -340,18 +356,24 @@ pub enum TxObservation {
         confirmed: bool,
         raw_hex: Option<String>,
     },
+    /// Our broadcaster's hint. Presence does not require a courier to hold bytes.
+    /// Confirmation is set only after proof verification against our headers.
+    FirstPartyPresent {
+        confirmed: bool,
+        raw_hex: Option<String>,
+    },
     /// WoC definitive 404 — "this txid is not in my index".
     Absent,
     /// Transport / 5xx / rate-limit / malformed body.
     Fault,
 }
 
-/// Bitails' corroboration of an ABSENT claim (negatives are never one
+/// A capable second source corroborates an ABSENT claim (negatives are never one
 /// provider's word — the #212/#213/#214 lesson).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbsenceCorroboration {
-    /// Bitails 404 for the txid AND its tx route proved healthy against the
-    /// known-mined anchor.
+    /// Arcade and WoC 404 for the txid, each behind a healthy route.
+    /// Bitails cannot corroborate absence of an unmined subject.
     CorroboratedAbsent,
     /// Anything else — fault, 200 (contradiction), rotten route.
     Unknown,
@@ -443,7 +465,10 @@ pub fn decide_tx_any(
         //    still served. Fail-safe either way: the client's
         //    positive-anywhere-outranks-negatives read stays intact.
         return match external {
-            Some(TxObservation::Present { confirmed, .. }) => TxAnyAnswer {
+            Some(
+                TxObservation::Present { confirmed, .. }
+                | TxObservation::FirstPartyPresent { confirmed, .. },
+            ) => TxAnyAnswer {
                 present: Some(true),
                 confirmed: Some(*confirmed),
                 height: None,
@@ -476,6 +501,15 @@ pub fn decide_tx_any(
     }
     // Break-glass external leg (legacy / foreign txids only).
     match external {
+        Some(TxObservation::FirstPartyPresent { confirmed, raw_hex }) => TxAnyAnswer {
+            present: Some(true),
+            confirmed: Some(*confirmed),
+            height: None,
+            raw_hex: raw_hex.clone(),
+            source: Some("external"),
+            unconfirmable: false,
+            claimed_height: None,
+        },
         Some(TxObservation::Present { confirmed, raw_hex }) => match raw_hex {
             // Positive presence ONLY with hash-verified bytes in hand — a
             // bare WoC pointer whose raw could not be fetched/verified is an
@@ -748,6 +782,58 @@ mod tests {
 
     /// bsv-low #451 slice C (iii): a verdict memo answers for its own txid inside the hour, never older, never
     /// from the future, never for another txid.
+    #[test]
+    fn ns2_614_subject_binding_and_accepted_hint() {
+        let now = rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
+        for status in ["ACCEPTED", "SEEN_ON_NETWORK", "SEEN_MULTIPLE_NODES"] {
+            let body = json!({"txid":"ab".repeat(32), "txStatus":status,
+                "timestamp":"2026-10-12T18:15:00Z"})
+            .to_string();
+            assert_eq!(
+                parse_arcade_subject_word(200, body.as_bytes(), &"ab".repeat(32), now),
+                ArcadeWord::SeenFresh
+            );
+            assert_eq!(
+                parse_arcade_subject_word(200, body.as_bytes(), &"cd".repeat(32), now),
+                ArcadeWord::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn ns2_614_only_the_old_false_absence_memo_is_ignored() {
+        let now = 1000;
+        let mut memo = VerdictMemo {
+            txid: "ab".repeat(32),
+            verdict_at_ms: now,
+            input_outpoint: String::new(),
+            spender_txid: String::new(),
+            kind: VerdictKind::Absent,
+            evidence: "request-time break-glass: woc 404 + bitails 404 behind a healthy route"
+                .into(),
+        };
+        assert!(!verdict_memo_answers(
+            &memo,
+            &memo.txid,
+            now,
+            VERDICT_MEMO_MAX_AGE_MS
+        ));
+        memo.evidence =
+            "request-time break-glass: arcade 404 + woc 404 behind healthy routes".into();
+        assert!(verdict_memo_answers(
+            &memo,
+            &memo.txid,
+            now,
+            VERDICT_MEMO_MAX_AGE_MS
+        ));
+        assert!(!verdict_memo_answers(
+            &memo,
+            &memo.txid,
+            now + VERDICT_MEMO_MAX_AGE_MS,
+            VERDICT_MEMO_MAX_AGE_MS
+        ));
+    }
+
     #[test]
     fn a_verdict_memo_answers_inside_the_hour_for_its_own_txid() {
         let now = 1_789_683_775_142_i64;

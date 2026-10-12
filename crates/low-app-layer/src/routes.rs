@@ -5882,7 +5882,7 @@ async fn arcade_confirmation_look(
     let url = format!("{}/tx/{txid_lc}", arcade_url());
     let (status, body) = provider_get(caller, &url).await?;
     let now_ms = worker::Date::now().as_millis() as i64;
-    match crate::txany::parse_arcade_word(status, std::str::from_utf8(&body).ok()?, now_ms) {
+    match crate::txany::parse_arcade_subject_word(status, &body, txid_lc, now_ms) {
         ArcadeWord::SeenFresh => Some((
             TxObservation::Present {
                 confirmed: false,
@@ -6461,10 +6461,6 @@ thread_local! {
     /// pattern (and rationale) as `SPENT_ANY_CACHE` above.
     static TX_ANY_CACHE: std::cell::RefCell<std::collections::HashMap<String, (f64, TxAnyCached)>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
-    /// Bitails tx-route health memo: `Some(true)` once the known-mined anchor
-    /// served (SUCCESS memoized only — a probe fault re-probes next time).
-    /// Ported from the client's `bitailsRouteHealthy` route-rot guard.
-    static BITAILS_ROUTE_HEALTHY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// The same memo for WoC's tx route (the second gate's MEDIUM-3a): a WoC 404 reads as ABSENT only behind a
     /// route that served the known-mined anchor this isolate — a rotten or rate-limited route is a fault, never
     /// an absence (and never a memo).
@@ -6543,27 +6539,141 @@ async fn tx_any_index_leg(
     (None, None)
 }
 
-/// The BREAK-GLASS external leg: WoC presence/confirmations + hash-verified
-/// raw (WoC hex, Bitails binary fallback); absence corroborated by a Bitails
-/// 404 behind a healthy route. See `txany.rs` for the full bar.
+/// The break-glass leg asks Arcade first, then couriers for bytes or unknown
+/// presence. Only two capable sources can corroborate absence (#614).
 async fn tx_any_external_leg(
     txid_lc: &str,
     caller: &'static str,
+    env: &worker::Env,
 ) -> (
     crate::txany::TxObservation,
     crate::txany::AbsenceCorroboration,
     Option<u64>,
 ) {
-    tx_any_external_leg_via(txid_lc, |url: String| async move {
-        provider_get(caller, &url).await
-    })
+    tx_any_presence_leg_via(
+        txid_lc,
+        worker::Date::now().as_millis() as i64,
+        |url: String| async move { provider_get(caller, &url).await },
+        |bump: String, height| async move {
+            let root =
+                beef_limits::merkle_path_from_hex(&bump, beef_limits::COURIER_PROOF_MAX_BYTES)
+                    .ok()
+                    .and_then(|mp| mp.compute_root(Some(txid_lc)).ok());
+            match (root, crate::beef_guard::canonical_root(env, height).await) {
+                (Some(root), Some(canonical)) => root.eq_ignore_ascii_case(&canonical),
+                _ => false,
+            }
+        },
+    )
     .await
+}
+
+/// Arcade's live hint is first; a MINED word requires the injected proof check.
+async fn tx_any_presence_leg_via<G, F, V, VF>(
+    txid: &str,
+    now_ms: i64,
+    get: G,
+    verify: V,
+) -> (
+    crate::txany::TxObservation,
+    crate::txany::AbsenceCorroboration,
+    Option<u64>,
+)
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<Output = Option<(u16, Vec<u8>)>>,
+    V: Fn(String, u64) -> VF,
+    VF: std::future::Future<Output = bool>,
+{
+    use crate::txany::{AbsenceCorroboration, ArcadeWord, TxObservation};
+    let response = get(format!("{}/tx/{txid}", arcade_url())).await;
+    let word = response
+        .as_ref()
+        .map(|(status, body)| crate::txany::parse_arcade_subject_word(*status, body, txid, now_ms))
+        .unwrap_or(ArcadeWord::Unknown);
+    let confirmation = match word {
+        ArcadeWord::SeenFresh => Some((false, None)),
+        ArcadeWord::Mined { bump_hex, height } if verify(bump_hex.clone(), height).await => {
+            Some((true, Some(height)))
+        }
+        _ => None,
+    };
+    if let Some((confirmed, height)) = confirmation {
+        let raw_hex = tx_any_courier_raw_via(txid, &get).await;
+        return (
+            TxObservation::FirstPartyPresent { confirmed, raw_hex },
+            AbsenceCorroboration::Unknown,
+            height,
+        );
+    }
+    // Arcade can see unmined subjects; Bitails cannot. A missing response
+    // counts only after this endpoint serves a known subject's usable word.
+    let arcade_absent = if matches!(response, Some((404, _))) {
+        match get(format!(
+            "{}/tx/{}",
+            arcade_url(),
+            crate::txany::KNOWN_MINED_TXID
+        ))
+        .await
+        {
+            Some((status, body)) => {
+                crate::txany::parse_arcade_subject_word(
+                    status,
+                    &body,
+                    crate::txany::KNOWN_MINED_TXID,
+                    now_ms,
+                ) != ArcadeWord::Unknown
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    tx_any_courier_leg_via(txid, arcade_absent, get).await
+}
+
+/// The raw body is optional for a first-party hint, and always hash checked.
+async fn tx_any_courier_raw_via<G, F>(txid: &str, get: &G) -> Option<String>
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<Output = Option<(u16, Vec<u8>)>>,
+{
+    if let Some((200, body)) = get(format!("{WOC_BASE}/tx/{txid}/hex")).await {
+        if let Some(raw) = std::str::from_utf8(&body)
+            .ok()
+            .and_then(|h| hex::decode(h.trim()).ok())
+            .and_then(|raw| crate::txany::verify_raw_bytes(&raw, txid))
+        {
+            return Some(raw);
+        }
+    }
+    match get(format!("{BITAILS_BASE}/download/tx/{txid}")).await {
+        Some((200, body)) => crate::txany::verify_raw_bytes(&body, txid),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+async fn tx_any_external_leg_via<G, F>(
+    txid: &str,
+    get: G,
+) -> (
+    crate::txany::TxObservation,
+    crate::txany::AbsenceCorroboration,
+    Option<u64>,
+)
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<Output = Option<(u16, Vec<u8>)>>,
+{
+    tx_any_courier_leg_via(txid, false, get).await
 }
 
 /// The external leg over a courier GET port (`get(url)` answers `provider_get`'s `(status, body)`): production passes
 /// `provider_get`, the pins a captured body (bsv-low #606).
-async fn tx_any_external_leg_via<G, F>(
+async fn tx_any_courier_leg_via<G, F>(
     txid_lc: &str,
+    arcade_absent: bool,
     get: G,
 ) -> (
     crate::txany::TxObservation,
@@ -6637,33 +6747,12 @@ where
         _ => TxObservation::Fault,
     };
 
-    let mut absence = AbsenceCorroboration::Unknown;
-    if woc == TxObservation::Absent {
-        // Corroborate: Bitails must ALSO definitively 404 the txid…
-        let bitails_404 = matches!(
-            get(format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await,
-            Some((404, _))
-        );
-        if bitails_404 {
-            // …and its tx route must prove healthy against the known-mined
-            // anchor (route-rot would otherwise fake absence for every txid).
-            if BITAILS_ROUTE_HEALTHY.with(std::cell::Cell::get) != Some(true) {
-                if let Some((200, body)) = get(format!(
-                    "{BITAILS_BASE}/download/tx/{}",
-                    crate::txany::KNOWN_MINED_TXID
-                ))
-                .await
-                {
-                    if !body.is_empty() {
-                        BITAILS_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
-                    }
-                }
-            }
-            if BITAILS_ROUTE_HEALTHY.with(std::cell::Cell::get) == Some(true) {
-                absence = AbsenceCorroboration::CorroboratedAbsent;
-            }
-        }
-    }
+    // A pruned Bitails 404 says nothing about an unmined subject (#614).
+    let absence = if woc == TxObservation::Absent && arcade_absent {
+        AbsenceCorroboration::CorroboratedAbsent
+    } else {
+        AbsenceCorroboration::Unknown
+    };
     (woc, absence, claimed_height)
 }
 
@@ -6710,7 +6799,7 @@ async fn resolve_tx_any(
     // (our own broadcaster) and otherwise answers the honest `null` — the overlay's dead-letter pass corroborates
     // its absence in the background, bounded per tick, and writes the memo; only an index-UNKNOWN row without a
     // memo (a tx never admitted — the client's own record of a broadcast the overlay refused) still opens the
-    // break-glass at request time, and its corroborated absence is memoised for an hour so it is bought once.
+    // break-glass at request time: Arcade first, then capable couriers; real absence lives five minutes.
     let answer = if index_raw.is_some() && index_height.is_some() {
         crate::txany::decide_tx_any(
             index_raw,
@@ -6750,8 +6839,17 @@ async fn resolve_tx_any(
         }
     } else {
         // the one break-glass left at request time: a tx the index never admitted
-        let (external, absence, claimed_height) = tx_any_external_leg(key, caller).await;
+        let (external, absence, claimed_height) = tx_any_external_leg(key, caller, env).await;
         let mut a = crate::txany::decide_tx_any(index_raw, index_height, Some(&external), absence);
+        if matches!(
+            external,
+            crate::txany::TxObservation::FirstPartyPresent {
+                confirmed: true,
+                ..
+            }
+        ) {
+            a.height = claimed_height; // verified against our canonical headers above
+        }
         // the courier's claimed height rides a CONFIRMED external answer only (display-tier; `height` stays proven)
         if a.confirmed == Some(true) && a.height.is_none() {
             a.claimed_height = claimed_height;
@@ -6765,7 +6863,9 @@ async fn resolve_tx_any(
                     input_outpoint: String::new(),
                     spender_txid: String::new(),
                     kind: crate::txany::VerdictKind::Absent,
-                    evidence: "request-time break-glass: woc 404 + bitails 404 behind a healthy route".to_string(),
+                    evidence:
+                        "request-time break-glass: arcade 404 + woc 404 behind healthy routes"
+                            .to_string(),
                 },
             )
             .await;
@@ -7474,6 +7574,141 @@ mod e606_tests {
         let raw = t.to_binary();
         (t.id().to_ascii_lowercase(), raw)
     }
+    #[test]
+    fn ns2_614_arcade_seen_outranks_courier_404s() {
+        WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
+        let (txid, raw) = competitor();
+        let now = crate::txany::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
+        let get = |url: String| {
+            let body = if url.contains("/tx/hash/") {
+                (404, vec![])
+            } else if url.contains("/hex") {
+                (200, hex::encode(&raw).into_bytes())
+            } else if url.starts_with(&arcade_url()) {
+                (
+                    200,
+                    serde_json::json!({"txid":txid,"txStatus":"SEEN_ON_NETWORK",
+                    "timestamp":"2026-10-12T18:15:00Z"})
+                    .to_string()
+                    .into_bytes(),
+                )
+            } else {
+                (404, vec![])
+            };
+            async move { Some(body) }
+        };
+        let (obs, absence, _) = run(tx_any_presence_leg_via(&txid, now, get, |_, _| async {
+            false
+        }));
+        let a = crate::txany::decide_tx_any(None, None, Some(&obs), absence);
+        assert_eq!(a.present, Some(true));
+        assert_eq!(a.confirmed, Some(false));
+        assert_eq!(a.raw_hex, Some(hex::encode(raw)));
+    }
+
+    #[test]
+    fn ns2_614_arcade_unknown_and_two_404s_are_unknown_not_memoable() {
+        WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
+        let get = |_: String| async { Some((404, vec![])) };
+        let (obs, absence, _) = run(tx_any_presence_leg_via(&tx(0x11), 0, get, |_, _| async {
+            false
+        }));
+        let a = crate::txany::decide_tx_any(None, None, Some(&obs), absence);
+        assert_eq!(a.present, None);
+        assert_eq!(absence, crate::txany::AbsenceCorroboration::Unknown);
+    }
+
+    #[test]
+    fn ns2_614_seen_without_courier_bytes_is_still_a_presence_hint() {
+        let txid = tx(0x11);
+        let now = crate::txany::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
+        let urls = std::cell::RefCell::new(Vec::new());
+        let get = |url: String| {
+            urls.borrow_mut().push(url.clone());
+            let body = if url.starts_with(&arcade_url()) {
+                (
+                    200,
+                    serde_json::json!({"txid":txid,"txStatus":"SEEN_ON_NETWORK",
+                    "timestamp":"2026-10-12T18:15:00Z"})
+                    .to_string()
+                    .into_bytes(),
+                )
+            } else {
+                (404, vec![])
+            };
+            async move { Some(body) }
+        };
+        let (obs, absence, _) = run(tx_any_presence_leg_via(&txid, now, get, |_, _| async {
+            false
+        }));
+        let a = crate::txany::decide_tx_any(None, None, Some(&obs), absence);
+        assert_eq!(a.present, Some(true));
+        assert_eq!(a.confirmed, Some(false));
+        assert_eq!(a.raw_hex, None);
+        assert_eq!(urls.borrow()[0], format!("{}/tx/{txid}", arcade_url()));
+    }
+
+    #[test]
+    fn ns2_614_mined_needs_verified_proof_and_real_absence_needs_capable_sources() {
+        let txid = tx(0x11);
+        let now = crate::txany::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
+        let get = |url: String| {
+            let body = if url.starts_with(&arcade_url()) {
+                (
+                    200,
+                    serde_json::json!({"txid":txid,"txStatus":"MINED",
+                    "blockHeight":970733,"merklePath":"aa"})
+                    .to_string()
+                    .into_bytes(),
+                )
+            } else {
+                (404, vec![])
+            };
+            async move { Some(body) }
+        };
+        let (obs, absence, height) = run(tx_any_presence_leg_via(&txid, now, get, |_, _| async {
+            true
+        }));
+        let a = crate::txany::decide_tx_any(None, None, Some(&obs), absence);
+        assert_eq!(a.confirmed, Some(true));
+        assert_eq!(height, Some(970733));
+        let (obs, absence, height) = run(tx_any_presence_leg_via(&txid, now, get, |_, _| async {
+            false
+        }));
+        assert_eq!(
+            crate::txany::decide_tx_any(None, None, Some(&obs), absence).present,
+            None
+        );
+        assert_eq!(height, None);
+
+        WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
+        let get = |url: String| {
+            let body = if url == format!("{}/tx/{}", arcade_url(), crate::txany::KNOWN_MINED_TXID) {
+                (
+                    200,
+                    serde_json::json!({"txid":crate::txany::KNOWN_MINED_TXID,
+                    "txStatus":"MINED","blockHeight":958886,"merklePath":"aa"})
+                    .to_string()
+                    .into_bytes(),
+                )
+            } else {
+                (404, vec![])
+            };
+            async move { Some(body) }
+        };
+        let (obs, absence, _) = run(tx_any_presence_leg_via(&txid, now, get, |_, _| async {
+            false
+        }));
+        assert_eq!(
+            absence,
+            crate::txany::AbsenceCorroboration::CorroboratedAbsent
+        );
+        assert_eq!(
+            crate::txany::decide_tx_any(None, None, Some(&obs), absence).present,
+            Some(false)
+        );
+    }
+
     /// WoC's `/tx/hash` body for a MEMPOOL transaction, the keys as probed live 2026-10-12 (no `confirmations`).
     fn mempool_body(txid: &str) -> Vec<u8> {
         serde_json::json!({"hash": txid, "locktime": 0, "size": 85, "txid": txid, "version": 1,
