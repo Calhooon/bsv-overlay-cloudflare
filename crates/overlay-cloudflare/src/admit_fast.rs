@@ -1641,6 +1641,12 @@ pub async fn confirmed_conflict_pass(
         let Some(raw) =
             crate::d1::beef_of_hex_column(row.beef).and_then(|b| crate::ef::proven_subject_raw(&b))
         else {
+            // #602 delta LOW-B: a pot the pass cannot read is a fault, never skipped unseen.
+            worker::console_log!(
+                "[conflict] {} stored BEEF does not read, retried next pass",
+                row.txid.get(..16).unwrap_or(&row.txid)
+            );
+            summary.note(&Err("stored BEEF does not read".into()));
             continue;
         };
         let result = converge_confirmed_conflict(

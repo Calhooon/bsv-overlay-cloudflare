@@ -162,3 +162,21 @@ fn e602_fold_a_witnessed_accept_starts_no_watch() {
     let routes = source("routes.rs");
     assert!(routes.contains("letneeds_watch=!arcade.admission_is_witnessed();"));
 }
+
+#[test]
+fn e602_delta_the_conflict_pass_bumps_its_counters_on_both_exits() {
+    let admit_fast = source("admit_fast.rs");
+    let start = admit_fast
+        .find("pubasyncfnconfirmed_conflict_pass(")
+        .unwrap();
+    let end = admit_fast[start..]
+        .find("asyncfnbump_conflict_counters(")
+        .unwrap();
+    let pass = &admit_fast[start..start + end];
+    assert_eq!(
+        pass.matches("bump_conflict_counters(db,&summary).await;")
+            .count(),
+        2,
+        "the read fault and the loop's end each bump the conflict counters"
+    );
+}

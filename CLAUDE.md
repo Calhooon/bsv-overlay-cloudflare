@@ -858,7 +858,10 @@ courier-mined subject's watch cannot latch while Arcade stays terminal: its
 accept latches at once and starts no watch. The courier's `blockheight` is
 trusted as the chain's word, unverified against chaintracks, for the #214
 admission and for a competitor's confirmation: an orphaned block's height
-admits or evicts once, and a MINED push reverses it. The race word applies
+evicts once, reversed by the pot's MINED push; or admits once, taken back by
+the conflict pass when a competitor mines or by the retire pass when both
+couriers go clean. A candidate whose stored BEEF does not read is counted a
+fault and logged (`[conflict] <txid prefix>`). The race word applies
 to EVERY Arcade-terminal status, not only a conflict-shaped one: an aged,
 non-conflict REJECTED subject one node still holds is the 422.
 
