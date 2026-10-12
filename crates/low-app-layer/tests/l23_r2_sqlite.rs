@@ -896,11 +896,11 @@ fn l23_r2_delta_readmitted_or_unlatched_join_retires_its_carried_row() {
         }
     }
     for i in 1..=10 {
-        let join = format!("{i:064x}");
+        let join = format!("{:064x}", i + 10);
         db.execute("INSERT INTO potparty_records_evicted(identity,potTxid,sigValid,seatSettlePubkey) VALUES ('me',?1,1,'K')",[&join]).unwrap();
         db.execute("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES (?1,'REJECTED',1000,'[]')",[&join]).unwrap();
     }
-    let join = format!("{:064x}", 1);
+    let join = format!("{:064x}", 11);
     let row = OwedRow {
         identity: "me".into(),
         outpoint: "hop:0".into(),
@@ -921,6 +921,11 @@ fn l23_r2_delta_readmitted_or_unlatched_join_retires_its_carried_row() {
             .collect::<Result<std::collections::HashSet<_>, _>>()
             .unwrap()
     };
+    db.execute(
+        "UPDATE potparty_records_evicted SET potTxid=upper(potTxid)",
+        [],
+    )
+    .unwrap();
     let (selected, total) = markerless_plan(&read_candidates(&db, "me", &join));
     assert_eq!(total, 10);
     assert!(markerless_should_carry(
@@ -949,7 +954,7 @@ fn l23_r2_delta_readmitted_or_unlatched_join_retires_its_carried_row() {
     )
     .unwrap();
     db.execute(
-        "UPDATE potparty_records_evicted SET sigValid=0 WHERE potTxid=?1",
+        "UPDATE potparty_records_evicted SET sigValid=0 WHERE lower(potTxid)=?1",
         [&join],
     )
     .unwrap();
