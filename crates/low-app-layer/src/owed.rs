@@ -831,6 +831,168 @@ pub fn evicted_pot_homes(
     homes.into_iter().filter_map(|(g, p)| p.map(|p| (g, p))).collect()
 }
 
+/// How many evicted JOINs one recompute reads back for [`markerless_released_hops`] (each a twin read and one stored
+/// BEEF): evictions are rare and a seat's own are rarer; the rest wait for the next pass.
+pub const OWED_MARKERLESS_JOINS_PER_RECOMPUTE: usize = 8;
+
+/// PURE: the released outpoints the hops view does not hold, by the evicted txid that released them (the
+/// candidates [`markerless_released_hops`] judges; the route reads only these JOINs back).
+pub fn unheld_released_by_eviction(evictions: &[(String, Option<String>)], hops: &[HopEntry]) -> Vec<(String, Vec<(String, u32)>)> {
+    let held: HashSet<String> = hops.iter().map(|h| outpoint_key(&h.hop_txid, h.hop_vout)).collect();
+    let mut out: std::collections::BTreeMap<String, Vec<(String, u32)>> = std::collections::BTreeMap::new();
+    for (evicted, released) in evictions {
+        if evicted.len() != 64 || !evicted.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Some(raw) = released.as_deref() else { continue };
+        let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(raw) else { continue };
+        for e in entries {
+            let (Some(txid), Some(vout)) = (e.get("txid").and_then(Value::as_str), e.get("vout").and_then(Value::as_u64)) else { continue };
+            let Ok(vout) = u32::try_from(vout) else { continue };
+            if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) || held.contains(&outpoint_key(txid, vout)) {
+                continue;
+            }
+            out.entry(evicted.to_ascii_lowercase()).or_default().push((txid.to_ascii_lowercase(), vout));
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// PURE: the outputs at `outpoints` as the evicted JOIN's own stored BEEF carries them (each hop is the JOIN's
+/// ancestor in that BEEF; the BEEF's txid index is computed by hashing, so a hit is hash-consistent). An outpoint
+/// whose transaction is absent, txid-only or short of the vout is simply not named.
+pub fn hop_outputs_from_join_beef(beef: &[u8], outpoints: &[(String, u32)]) -> HashMap<String, (Vec<u8>, u64)> {
+    let mut out = HashMap::new();
+    for (txid, vout) in outpoints {
+        let Some(raw) = crate::logic::extract_raw_tx_hex(beef, txid).and_then(|h| hex::decode(h).ok()) else { continue };
+        let Ok(tx) = bsv_rs::transaction::Transaction::from_binary(&raw) else { continue };
+        let Some(o) = tx.outputs.get(*vout as usize) else { continue };
+        let Some(sats) = o.satoshis else { continue };
+        out.insert(outpoint_key(txid, *vout), (o.locking_script.to_binary(), sats));
+    }
+    out
+}
+
+/// One of THIS identity's party rows in the `potparty_records_evicted` twin (the eviction moved it there with its
+/// pot): `sigValid = 1` (the identity's own signature and the seat signature under `seat_settle_pubkey`, both
+/// verified at admission), read with `identity = ?` by the route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictedSeat {
+    pub pot_txid: String,
+    pub game_id: String,
+    pub opponent_identity: String,
+    pub seat_settle_pubkey: String,
+}
+
+/// PURE (loop 23's pair 13, bsv-low #610): the hops an eviction RELEASED that this identity's hops view does not hold,
+/// rebuilt from the evicted JOIN itself so the derivation tells their story.
+///
+/// The hops view is fed by the seat's `LOW/hopparty/v1` marker, a best-effort submit: under the fleet's burst p28's
+/// marker submit was refused 502 once (`tm_hopparty`, the corroboration ladder's STORED echoes) and never re-presented,
+/// so the hop had NO row, `released_hops_by_eviction` intersected the ledger with nothing, and the owed list said
+/// nothing for a hand the network refused. The released hop's owed row rests on the eviction ledger and the evicted
+/// twin's party row; the seat's hopparty marker names the hop faster, never alone.
+///
+/// Keyed on the UTXO the ledger names, never a name: a released outpoint is mine only when (1) my own party row of
+/// that evicted JOIN (`seats`, `sigValid = 1`) names the settle key K, (2) the JOIN's twin lock committed K on exactly
+/// one seat (`twin_keys`, every row of the JOIN agreeing), and (3) the outpoint's output, read from the evicted JOIN's
+/// own stored BEEF (`hop_outputs`: the hop transaction carried as the JOIN's ancestor), is the standard P2PKH to
+/// hash160(K). Only K spends that output, and only I signed for K. The rebuilt entry carries no spend word
+/// (`Unknown`, `spent: None`): the eviction released the index's pointer, so the chain rung judges it, and the
+/// marker attestation is the party row's (`Verified`; no marker txid: there is no hop marker to fetch). An outpoint
+/// the hops view already holds is left to it; two of my seats in one JOIN, or two JOINs naming one outpoint for
+/// different games or keys, name nothing (never a guess).
+pub fn markerless_released_hops(
+    evictions: &[(String, Option<String>)],
+    hops: &[HopEntry],
+    seats: &[EvictedSeat],
+    twin_keys: &[(String, u32, crate::results::CommittedKeys)],
+    hop_outputs: &HashMap<String, (Vec<u8>, u64)>,
+) -> Vec<HopEntry> {
+    let held: HashSet<String> = hops.iter().map(|h| outpoint_key(&h.hop_txid, h.hop_vout)).collect();
+    let mut keys_by_txid: HashMap<String, Option<&crate::results::CommittedKeys>> = HashMap::new();
+    for (txid, _vout, keys) in twin_keys {
+        keys_by_txid
+            .entry(txid.to_ascii_lowercase())
+            .and_modify(|k| {
+                if k.is_some_and(|x| x != keys) {
+                    *k = None;
+                }
+            })
+            .or_insert(Some(keys));
+    }
+    let mut seat_by_txid: HashMap<String, Option<&EvictedSeat>> = HashMap::new();
+    for s in seats {
+        seat_by_txid
+            .entry(s.pot_txid.to_ascii_lowercase())
+            .and_modify(|held| {
+                if held.is_some_and(|x| !x.seat_settle_pubkey.eq_ignore_ascii_case(&s.seat_settle_pubkey) || !x.game_id.eq_ignore_ascii_case(&s.game_id)) {
+                    *held = None;
+                }
+            })
+            .or_insert(Some(s));
+    }
+    let mut out: std::collections::BTreeMap<String, Option<HopEntry>> = std::collections::BTreeMap::new();
+    for (evicted, released) in evictions {
+        let evicted = evicted.to_ascii_lowercase();
+        let Some(Some(seat)) = seat_by_txid.get(&evicted) else { continue };
+        let Some(Some(keys)) = keys_by_txid.get(&evicted) else { continue };
+        let my_key = seat.seat_settle_pubkey.to_ascii_lowercase();
+        if (my_key == keys.pub_a) == (my_key == keys.pub_b) {
+            continue; // neither committed key is mine, or both are: no seat
+        }
+        let Ok(key_bytes) = hex::decode(&my_key) else { continue };
+        if key_bytes.len() != 33 {
+            continue;
+        }
+        let my_lock = overlay_discovery::pot::p2pkh_lock(&bsv_rs::primitives::hash::hash160(&key_bytes));
+        let Some(raw) = released.as_deref() else { continue };
+        let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(raw) else { continue };
+        for e in entries {
+            let (Some(txid), Some(vout)) = (e.get("txid").and_then(Value::as_str), e.get("vout").and_then(Value::as_u64)) else { continue };
+            let Ok(vout) = u32::try_from(vout) else { continue };
+            if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let key = outpoint_key(txid, vout);
+            if held.contains(&key) {
+                continue;
+            }
+            let Some((lock, sats)) = hop_outputs.get(&key) else { continue };
+            if *lock != my_lock {
+                continue; // the other seat's hop (or not a hop of K): not mine
+            }
+            let entry = HopEntry {
+                game_id: seat.game_id.to_ascii_lowercase(),
+                hop_txid: txid.to_ascii_lowercase(),
+                hop_vout: vout,
+                hop_sats: *sats,
+                opponent_identity: seat.opponent_identity.clone(),
+                seat_settle_pubkey: my_key.clone(),
+                seat_sig_hex: String::new(),
+                identity_sig_hex: String::new(),
+                marker_txid: String::new(),
+                marker_vout: 0,
+                spent: None,
+                spending_txid: None,
+                spent_confirmed: None,
+                status: HopStatus::Unknown,
+                status_source: None,
+                marker_verified: MarkerVerification::Verified,
+                marker_created_at: None,
+            };
+            out.entry(key)
+                .and_modify(|held| {
+                    if held.as_ref().is_some_and(|x| x.game_id != entry.game_id || x.seat_settle_pubkey != entry.seat_settle_pubkey) {
+                        *held = None;
+                    }
+                })
+                .or_insert(Some(entry));
+        }
+    }
+    out.into_values().flatten().collect()
+}
+
 /// The refund's output to `pay_pkh` (hex, 20 bytes), summed — `None` when the
 /// raw does not parse or the pkh is not 20 bytes.
 pub fn refund_output_sats(raw_hex: &str, pay_pkh_hex: &str) -> Option<u64> {
@@ -2536,6 +2698,78 @@ pub(crate) mod tests {
         assert!(evicted_pot_homes(&released2, &two, &disagree).is_empty());
         // seat B by the same rule
         assert_eq!(evicted_pot_homes(&released, &[my_hop(&pub_b)], &twin), vec![(tx(0x01), "dd".repeat(20))]);
+    }
+
+    /// Loop 23's pair 13 (bsv-low #610, `spec-admit-fast-join-refused`:752): p28's `tm_hopparty` submit was refused
+    /// 502 once and never re-presented, so its hops view held NO entry for the game's hop; the JOIN was evicted, the
+    /// competitor (p2's own spend of its hop to its wallet) mined, and `/owed` served no row for the game for six
+    /// minutes. The captured shape: hops view empty for the game, the ledger naming both hops, p28's twin party row,
+    /// the twin lock committing p28's key as seat B. RED at `18a6fd7`: the derivation over that hops view yields no row
+    /// (asserted first below) and `markerless_released_hops` does not exist. GREEN: the hop is rebuilt from the
+    /// evicted JOIN and its story is "spent outside this game".
+    #[test]
+    fn l23_r2_a_released_hop_with_no_marker_row_is_rebuilt_from_the_evicted_join_and_reads_spent_outside_this_game() {
+        use crate::results::CommittedKeys;
+        let pub_a = format!("02{}", "aa".repeat(32));
+        let pub_b = format!("03{}", "bb".repeat(32)); // p28, seat B
+        let keys = CommittedKeys { pub_a: pub_a.clone(), pub_b: pub_b.clone(), pay_pkh_a: "cc".repeat(20), pay_pkh_b: "dd".repeat(20) };
+        let (join, competitor, my_hop, their_hop) = (tx(0x0c), tx(0x0d), tx(0x07), tx(0x08));
+        let lock_of = |k: &str| overlay_discovery::pot::p2pkh_lock(&bsv_rs::primitives::hash::hash160(&hex::decode(k).unwrap()));
+        let ledger = [(
+            join.clone(),
+            Some(format!(r#"[{{"table":"pot_records","txid":"{their_hop}","vout":0}},{{"table":"pot_records","txid":"{my_hop}","vout":0}}]"#)),
+        )];
+        let seat = EvictedSeat { pot_txid: join.to_ascii_uppercase(), game_id: tx(0x01), opponent_identity: OPP.to_string(), seat_settle_pubkey: pub_b.clone() };
+        let twin = [(join.clone(), 0u32, keys.clone())];
+        let outputs: HashMap<String, (Vec<u8>, u64)> =
+            [(format!("{my_hop}:0"), (lock_of(&pub_b), 20_190u64)), (format!("{their_hop}:0"), (lock_of(&pub_a), 20_190u64))].into_iter().collect();
+        let mined = chain_confirmed(&format!("{my_hop}:0"), true, Some(true), Some(&competitor), Some(true));
+        let elsewhere = pays(&competitor, &[(0, &"99".repeat(20), 20_170, Some(false))]);
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+
+        // the captured shape, before the fix: no hop entry, so no row at all (the story hidden)
+        let before = derive_owed_rows(&inputs(&[], &[], &[], &v, &c, &no_pots, Some(970_754)));
+        assert!(before.iter().all(|r| r.game_id != tx(0x01)), "{before:?}");
+
+        // the fix: the ledger + my twin party row + the JOIN's own bytes rebuild MY hop only
+        let hops = markerless_released_hops(&ledger, &[], std::slice::from_ref(&seat), &twin, &outputs);
+        assert_eq!(hops.len(), 1, "{hops:?}");
+        assert_eq!((hops[0].hop_txid.as_str(), hops[0].hop_sats, hops[0].game_id.as_str()), (my_hop.as_str(), 20_190, tx(0x01).as_str()));
+        assert_eq!((hops[0].status, hops[0].spent), (HopStatus::Unknown, None));
+        // the route's own downstream reads, unchanged, over the rebuilt view
+        let refused = refused_hop_outpoints_of(&released_hop_outpoints(&ledger), &hops);
+        let pkhs: HashMap<String, String> = evicted_pot_homes(&released_hops_by_eviction(&ledger, &hops), &hops, &twin).into_iter().collect();
+        assert_eq!(pkhs.get(&tx(0x01)).map(String::as_str), Some("dd".repeat(20).as_str()));
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(970_754));
+        i.evicted_hop_outpoints = &refused;
+        i.hop_chain = &mined;
+        i.spender_outputs = &elsewhere;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].game_id, tx(0x01));
+        assert_eq!(rows[0].facts["spendKind"], "spent-elsewhere");
+        assert_eq!(rows[0].reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
+
+        // the bindings, each necessary: a hop the view already holds is left to it
+        let mut held = hop(HopStatus::Unspent, None, Some(60_000));
+        held.hop_txid = my_hop.clone();
+        assert!(markerless_released_hops(&ledger, &[held], std::slice::from_ref(&seat), &twin, &outputs).is_empty());
+        // no party row of mine for that JOIN (a stranger's eviction), or no twin lock: nothing
+        assert!(markerless_released_hops(&ledger, &[], &[], &twin, &outputs).is_empty());
+        assert!(markerless_released_hops(&ledger, &[], std::slice::from_ref(&seat), &[], &outputs).is_empty());
+        // my party row naming a key the lock did not commit, or committed on both seats: nothing
+        let stranger_key = EvictedSeat { seat_settle_pubkey: format!("02{}", "ee".repeat(32)), ..seat.clone() };
+        assert!(markerless_released_hops(&ledger, &[], &[stranger_key], &twin, &outputs).is_empty());
+        let both = [(join.clone(), 0u32, CommittedKeys { pub_a: pub_b.clone(), ..keys.clone() })];
+        assert!(markerless_released_hops(&ledger, &[], std::slice::from_ref(&seat), &both, &outputs).is_empty());
+        // the JOIN's bytes not read (no output known), or the output not paying hash160(K): nothing
+        assert!(markerless_released_hops(&ledger, &[], std::slice::from_ref(&seat), &twin, &HashMap::new()).is_empty());
+        let swapped: HashMap<String, (Vec<u8>, u64)> = [(format!("{my_hop}:0"), (lock_of(&pub_a), 20_190u64))].into_iter().collect();
+        assert!(markerless_released_hops(&ledger, &[], std::slice::from_ref(&seat), &twin, &swapped).is_empty());
+        // two of my party rows in one JOIN that disagree name nothing
+        let other_game = EvictedSeat { game_id: tx(0x02), ..seat.clone() };
+        assert!(markerless_released_hops(&ledger, &[], &[seat.clone(), other_game], &twin, &outputs).is_empty());
     }
 
     /// The E606 lens's M1 (bsv-low #605): a CONFLICT eviction re-points my hop at the confirmed competitor BEFORE the
