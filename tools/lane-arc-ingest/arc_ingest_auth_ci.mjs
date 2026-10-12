@@ -124,6 +124,8 @@ async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, want
   assertCountersServed(before)
   const logStart = readFileSync(WORKER_LOG, 'utf8').length
   const ua = `arcreg-ci/640-${newTxid().slice(0, 51)}`
+  // L2 cuts User-Agent to 64 characters; keep the 65-character boundary probe.
+  const loggedUa = ua.slice(0, 64)
   const res = await postIngest({ txid, txStatus }, { ...headers, 'User-Agent': ua })
   if (res.status !== wantStatus) {
     fail(label, `expected HTTP ${wantStatus}, got ${res.status}: ${res.text.slice(0, 200)}`)
@@ -150,13 +152,13 @@ async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, want
     let line
     for (let i = 0; i < 10; i++) {
       delta = readFileSync(WORKER_LOG, 'utf8').slice(logStart)
-      line = delta.split('\n').find((l) => l.includes('POST /arc-ingest txid=') && l.includes(ua))
+      line = delta.split('\n').find((l) => l.includes('POST /arc-ingest txid=') && l.includes(`ua=${JSON.stringify(loggedUa)}`))
       if (line) break
       await new Promise((r) => setTimeout(r, 100))
     }
     if (!line || !line.includes(`txid=${JSON.stringify(txid)}`)
       || !line.includes(`txStatus=${JSON.stringify(txStatus)}`)
-      || !line.includes(`ua=${JSON.stringify(ua)}`) || !line.includes('-> 401 (')) {
+      || !line.includes(`ua=${JSON.stringify(loggedUa)}`) || !line.includes('-> 401 (')) {
       fail(label, 'refusal log must name the pushed txid, status and User-Agent on one 401 line')
       return
     }
