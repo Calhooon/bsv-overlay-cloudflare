@@ -2813,17 +2813,17 @@ pub(crate) async fn owed_recompute(
         let mut unheld = crate::owed::unheld_released_by_eviction(&eviction_rows, &hops);
         unheld.truncate(crate::owed::OWED_MARKERLESS_JOINS_PER_RECOMPUTE);
         if !unheld.is_empty() {
-            let placeholders = (2..=unheld.len() + 1).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
             let mut b: Vec<JsValue> = vec![JsValue::from_str(identity_lc)];
             b.extend(unheld.iter().map(|(t, _)| JsValue::from_str(t)));
             // the eviction moves a party row keyed by `txid` OR `potTxid` (`admit_fast` SHADOW_TABLES); the twin
             // keeps the source's columns and casing
-            let sql = format!(
-                "SELECT lower(potTxid) AS potTxid, gameId, opponentIdentity, seatSettlePubkey FROM potparty_records_evicted \
-                 WHERE identity = ?1 AND sigValid = 1 AND seatSettlePubkey IS NOT NULL AND lower(potTxid) IN ({placeholders})"
-            );
+            let sql = crate::owed::markerless_seats_sql(unheld.len());
             let seats: Vec<crate::owed::EvictedSeat> = match db.prepare(&sql).bind(&b) {
-                Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<EvictedSeatD1>()) {
+                Ok(stmt) => match stmt
+                    .counted_all()
+                    .await
+                    .and_then(|r| r.results::<EvictedSeatD1>())
+                {
                     Ok(rows) => rows
                         .into_iter()
                         .map(|r| crate::owed::EvictedSeat {
@@ -2843,12 +2843,14 @@ pub(crate) async fn owed_recompute(
                     Vec::new()
                 }
             };
-            let mine: HashSet<String> = seats.iter().map(|s| s.pot_txid.to_ascii_lowercase()).collect();
+            let mine: HashSet<String> = seats
+                .iter()
+                .map(|s| s.pot_txid.to_ascii_lowercase())
+                .collect();
             let mut twin_keys: Vec<(String, u32, crate::results::CommittedKeys)> = Vec::new();
             let mut outputs: HashMap<String, (Vec<u8>, u64)> = HashMap::new();
             for (evicted, outpoints) in unheld.iter().filter(|(t, _)| mine.contains(t)) {
-                let keys_sql = "SELECT lower(txid) AS txid, outputIndex, pubA, pubB, payPkhA, payPkhB FROM pot_records_evicted \
-                                WHERE lockKind = 'covenant' AND paramsDecoded = 1 AND txid = ?1";
+                let keys_sql = crate::owed::MARKERLESS_KEYS_SQL;
                 match db.prepare(keys_sql).bind(&[JsValue::from_str(evicted)]) {
                     Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<EvictedKeysD1>()) {
                         Ok(rows) => twin_keys.extend(rows.into_iter().filter_map(|r| {
@@ -2866,7 +2868,7 @@ pub(crate) async fn owed_recompute(
                     Err(e) => console_warn!("[owed] evicted keys bind failed: {e}"),
                 }
                 // `pot_beefs` is never moved by an eviction: the JOIN's own bytes carry its hops as ancestors
-                match db.prepare("SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?1").bind(&[JsValue::from_str(evicted)]) {
+                match db.prepare(crate::owed::MARKERLESS_BEEF_SQL).bind(&[JsValue::from_str(evicted)]) {
                     Ok(stmt) => match stmt.counted_first::<BeefRow>().await {
                         Ok(row) => {
                             if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
@@ -2878,7 +2880,13 @@ pub(crate) async fn owed_recompute(
                     Err(e) => console_warn!("[owed] evicted JOIN bytes bind failed: {e}"),
                 }
             }
-            let rebuilt = crate::owed::markerless_released_hops(&eviction_rows, &hops, &seats, &twin_keys, &outputs);
+            let rebuilt = crate::owed::markerless_released_hops(
+                &eviction_rows,
+                &hops,
+                &seats,
+                &twin_keys,
+                &outputs,
+            );
             if !rebuilt.is_empty() {
                 worker::console_log!(
                     "[owed] recompute for {}…: {} released hop(s) with no marker row rebuilt from the evicted JOIN",
