@@ -35,6 +35,9 @@ fn opponent(i: u32) -> String {
 #[path = "../tests/support/d1_fleet.rs"]
 mod d1_fleet;
 
+#[path = "../tests/support/cursor_measure.rs"]
+mod cursor_measure;
+
 fn main() {
     let conn = Connection::open_in_memory().expect("open in-memory sqlite");
     for sql in OVERLAY_MIGRATIONS {
@@ -80,12 +83,23 @@ fn main() {
         let stranger = format!("02{i:064x}");
         pot('c', &stranger, i);
     }
+    // Exercise the hop-seat and valid-backup legs on A's unchanged eight outpoints.
+    // Synthetic decoded columns and a latched seat marker, no transaction is broadcast.
+    rows.push(format!("UPDATE pot_records SET lockKind='covenant', paramsDecoded=1, pubA='{ID_A}', pubB='{ID_B}', pubTower='{ID_A}', payPkhA='{}', payPkhB='{}', rakePkh='{}', stakeA=1, stakeB=1, feeSats=1, recoveryHeight=958846, potSats=2 WHERE txid LIKE 'aa%'", "11".repeat(20),"22".repeat(20),"33".repeat(20)));
+    rows.push(format!("UPDATE potparty_records SET seatSettlePubkey='{ID_A}', seatSigHex='00', sigValid=1 WHERE identity='{ID_A}'"));
     rows.extend(d1_fleet::rows(now_s));
     rows.extend(l23_r2_route_rows(now_s));
     for r in &rows {
-        d1_fleet::execute_row(&conn, r);
+        if r.starts_with("UPDATE ") {
+            conn.execute_batch(r).unwrap();
+        } else {
+            d1_fleet::execute_row(&conn, r);
+        }
         out.push_str(r);
         out.push_str(";\n");
+    }
+    if let Ok(path) = std::env::var("D1_CURSOR_PIN_SQL") {
+        cursor_measure::write(&conn, &path, now_s, d1_fleet::WHALE);
     }
     print!("{out}");
 }
