@@ -8826,4 +8826,13 @@ pub(crate) mod tests {
         assert!(code.contains("crate::owed::mark_shed_refresh(&mut body, refresh_retry)"), "a shed read must mark its served snapshot");
     }
 
+    #[test]
+    fn ns2_filing_runs_a_coalesced_walk_instead_of_amplifying_device_reads() {
+        let code = include_str!("record_post.rs");
+        let hook = &code[code.find("if !row_written {").unwrap()..];
+        assert!(hook.contains("owed_recompute_and_push_coalesced"), "a filing must walk once before announcing its snapshot");
+        assert!(!hook.contains("owed_changed_event_body(id, \"filing\", 0"), "no bare trigger to every device");
+        assert!(hook.contains("owed_identities_by_marker"), "walk both pot parties, not just the filer");
+    }
+
 }
