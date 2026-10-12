@@ -81,16 +81,65 @@ impl ShadowDb for Sqlite {
 }
 #[async_trait(?Send)]
 impl ConflictEviction for Sqlite {
-    async fn evict_conflict(&self, txid: &str, reason: &str, now_ms: u64) -> Result<(), String> {
-        let result = evict_core(self, txid, reason, now_ms).await;
+    async fn evict_conflict(
+        &self,
+        txid: &str,
+        reason: &str,
+        now_ms: u64,
+        repointed: &[ReleasedSpend],
+    ) -> Result<(), String> {
+        let txid = txid.to_ascii_lowercase();
+        let result = evict_core(self, &txid, reason, now_ms).await;
         assert!(result.faults.is_empty(), "{:?}", result.faults);
         assert!(result.yielded_to_readmission.is_none());
-        // bsv-low #605: the production eviction (`evict_txid_everywhere`) then releases the evicted tx's unconfirmed
-        // pointers with the shipped statement; modelled here so the pin sees what the release leaves
+        // bsv-low #605: the production eviction (`evict_txid_everywhere_repointed`) then releases the evicted tx's
+        // unconfirmed pointers, adds the re-pointed outpoints, merges with the ledger's list and closes the ledger
+        // row, each with the shipped statement; modelled here so the pins see what the release and the ledger leave
         let cols = self.columns("pot_records").await?;
+        let mut released: Vec<ReleasedSpend> = {
+            let mut q = self.0.prepare(&select_pot_spends_sql(&cols)).unwrap();
+            let rows = q
+                .query_map([&txid], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows.into_iter()
+                .filter(|(_, _, confirmed)| *confirmed == 0)
+                .map(|(t, v, _)| ReleasedSpend {
+                    table: "pot_records".into(),
+                    txid: t.to_ascii_lowercase(),
+                    vout: v as u32,
+                })
+                .collect()
+        };
         self.exec(
             &release_pot_spends_sql(&cols),
-            vec![QVal::Text(txid.to_ascii_lowercase())],
+            vec![QVal::Text(txid.clone())],
+        )
+        .await?;
+        released.extend(repointed.iter().cloned());
+        let existing: Option<String> = self
+            .0
+            .query_row(RELEASED_SPENDS_SQL, [&txid], |r| r.get(0))
+            .optional()
+            .unwrap()
+            .flatten();
+        let merged = merge_released(existing.as_deref(), &released);
+        self.exec(
+            CLOSE_EVICTION_MARKER_SQL,
+            vec![
+                QVal::Text(txid.clone()),
+                QVal::Text(reason.into()),
+                QVal::Int(now_ms as i64),
+                QVal::Int(result.moved as i64),
+                QVal::Text(serde_json::to_string(&merged).unwrap()),
+            ],
         )
         .await
     }
@@ -379,6 +428,26 @@ async fn e605_a_conflict_eviction_leaves_the_hop_spent_by_the_confirmed_competit
     assert_eq!(
         (summary.scanned, summary.evicted, summary.faults),
         (1, 1, 0)
+    );
+    // the E606 lens's M1: the ledger still NAMES the re-pointed hop beside the released one, so the app layer's
+    // `evicted_pot_homes` finds the game's home and the owed story reads "spent outside this game" (on `7b285f8` the
+    // list held `other_hop` alone)
+    let ledger: String =
+        db.0.query_row(RELEASED_SPENDS_SQL, [&txid], |r| r.get(0))
+            .unwrap();
+    let mut named: Vec<(String, u32)> = serde_json::from_str::<Vec<ReleasedSpend>>(&ledger)
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            assert_eq!(r.table, "pot_records");
+            (r.txid, r.vout)
+        })
+        .collect();
+    named.sort();
+    assert_eq!(
+        named,
+        vec![(hop.clone(), 0), (other_hop.clone(), 0)],
+        "releasedSpends names both hops: {ledger}"
     );
     // the #186 chaser's confirm CAS (the shipped statement) latches the pointer once the competitor's proof verifies
     let latched: Option<String> =

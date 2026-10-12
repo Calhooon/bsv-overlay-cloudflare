@@ -6361,11 +6361,30 @@ thread_local! {
     /// The wave after fleet loop 11 (2026-09-19): a hop spender the index never held (the seat's OWN competitor
     /// broadcast around the overlay, a sweep filed elsewhere), PARSED once per isolate from the tx-any resolver's
     /// raw — its input outpoints and its outputs — content-addressed (the bytes hashed to the txid before they were
-    /// kept), so the memo can never go stale; bounded, cleared wholesale when full.
-    static OWED_SPENDER_OUTPUTS_MEMO: std::cell::RefCell<std::collections::HashMap<String, CourierSpenderBytes>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// kept), so the memo can never go stale; bounded by count AND by bytes (the E606 lens's L4: a spender's
+    /// parse follows its input and output counts), cleared wholesale when either is full. The `usize` is the
+    /// entries' weight (`courier_spender_bytes_weight`).
+    static OWED_SPENDER_OUTPUTS_MEMO: std::cell::RefCell<(std::collections::HashMap<String, CourierSpenderBytes>, usize)> =
+        std::cell::RefCell::new((std::collections::HashMap::new(), 0));
 }
 const OWED_SPENDER_OUTPUTS_MEMO_MAX: usize = 256;
+/// The memo's byte bound (the E606 lens's L4): 4 MiB of the isolate's 128 MB, by the native-size estimate below.
+const OWED_SPENDER_OUTPUTS_MEMO_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// PURE: an UPPER estimate of what one memo entry holds (its key, each input's txid string and vout, each output's
+/// fields and pkh string), native sizes with the strings' heap bytes; the bound's unit.
+fn courier_spender_bytes_weight(txid_lc: &str, b: &CourierSpenderBytes) -> usize {
+    let s = std::mem::size_of::<String>();
+    let inputs: usize = b.inputs.iter().map(|(t, _)| s + t.len() + 8).sum();
+    let outputs: usize = b
+        .outputs
+        .iter()
+        .map(|o| {
+            std::mem::size_of::<crate::owed::SpenderOutput>()
+                + o.pkh_hex.as_ref().map_or(0, String::len)
+        })
+        .sum();
+    2 * s + txid_lc.len() + inputs + outputs
+}
 /// A courier-fetched spender, parsed once: the outpoints it SPENDS (the gate's L5: the story stands only for a hop
 /// the transaction really consumes — the courier's pointer alone is not that proof) and its outputs.
 #[derive(Clone)]
@@ -6414,15 +6433,26 @@ fn owed_pay_vout_memo_put(key: &str, vout: u32) {
     });
 }
 fn owed_spender_outputs_memo_get(txid_lc: &str) -> Option<CourierSpenderBytes> {
-    OWED_SPENDER_OUTPUTS_MEMO.with(|m| m.borrow().get(txid_lc).cloned())
+    OWED_SPENDER_OUTPUTS_MEMO.with(|m| m.borrow().0.get(txid_lc).cloned())
 }
 fn owed_spender_outputs_memo_put(txid_lc: &str, bytes: &CourierSpenderBytes) {
     OWED_SPENDER_OUTPUTS_MEMO.with(|m| {
-        let mut m = m.borrow_mut();
-        if m.len() >= OWED_SPENDER_OUTPUTS_MEMO_MAX {
-            m.clear();
+        let (map, weight) = &mut *m.borrow_mut();
+        let w = courier_spender_bytes_weight(txid_lc, bytes);
+        if w > OWED_SPENDER_OUTPUTS_MEMO_MAX_BYTES {
+            return; // one spender past the whole bound is not kept (it is re-read when asked again)
         }
-        m.insert(txid_lc.to_string(), bytes.clone());
+        if map.contains_key(txid_lc) {
+            return; // content-addressed: the entry it would replace is the same parse
+        }
+        if map.len() >= OWED_SPENDER_OUTPUTS_MEMO_MAX
+            || *weight + w > OWED_SPENDER_OUTPUTS_MEMO_MAX_BYTES
+        {
+            map.clear();
+            *weight = 0;
+        }
+        map.insert(txid_lc.to_string(), bytes.clone());
+        *weight += w;
     });
 }
 
@@ -7657,5 +7687,69 @@ mod e606_tests {
                 && rung.contains("owed_spender_outputs_memo_put("),
             "the rung memoises its verified raw"
         );
+    }
+
+    /// The E606 lens's L4: the spender memo is bounded by bytes beside its count. Entries of many outputs fill the
+    /// byte bound before the 256 entries and clear it; one entry past the whole bound is not kept; a re-put of a held
+    /// key does not double its weight.
+    #[test]
+    fn e606_l4_the_spender_memo_is_bounded_by_bytes() {
+        let wide = CourierSpenderBytes {
+            inputs: vec![(tx(0x07), 0)],
+            outputs: (0..2_000u32)
+                .map(|vout| crate::owed::SpenderOutput {
+                    vout,
+                    pkh_hex: Some("99".repeat(20)),
+                    sats: 1,
+                    spent: None,
+                    pot_lock: false,
+                })
+                .collect(),
+        };
+        let w = courier_spender_bytes_weight(&tx(0x01), &wide);
+        assert!(
+            w > 2_000 * 40 && w < OWED_SPENDER_OUTPUTS_MEMO_MAX_BYTES / 8,
+            "{w}"
+        );
+        let per_bound = OWED_SPENDER_OUTPUTS_MEMO_MAX_BYTES / w;
+        assert!(
+            per_bound < OWED_SPENDER_OUTPUTS_MEMO_MAX,
+            "the bytes bind first for this shape"
+        );
+        let held = || OWED_SPENDER_OUTPUTS_MEMO.with(|m| (m.borrow().0.len(), m.borrow().1));
+        for i in 0..per_bound {
+            owed_spender_outputs_memo_put(&format!("{i:064x}"), &wide);
+        }
+        assert_eq!(held(), (per_bound, per_bound * w));
+        owed_spender_outputs_memo_put(&format!("{:064x}", 0), &wide);
+        assert_eq!(
+            held(),
+            (per_bound, per_bound * w),
+            "a held key is not counted twice"
+        );
+        owed_spender_outputs_memo_put(&format!("{:064x}", per_bound), &wide);
+        assert_eq!(
+            held(),
+            (1, w),
+            "past the bytes the memo is cleared wholesale, then holds the new entry"
+        );
+        let huge = CourierSpenderBytes {
+            inputs: Vec::new(),
+            outputs: (0..200_000u32)
+                .map(|vout| crate::owed::SpenderOutput {
+                    vout,
+                    pkh_hex: Some("99".repeat(20)),
+                    sats: 1,
+                    spent: None,
+                    pot_lock: false,
+                })
+                .collect(),
+        };
+        owed_spender_outputs_memo_put(&tx(0x0f), &huge);
+        assert!(
+            owed_spender_outputs_memo_get(&tx(0x0f)).is_none(),
+            "one entry past the whole bound is not kept"
+        );
+        assert_eq!(held(), (1, w));
     }
 }

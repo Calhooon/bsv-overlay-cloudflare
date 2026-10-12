@@ -1218,6 +1218,22 @@ pub async fn evict_txid_everywhere(
     reason: &str,
     asked_ms: u64,
 ) -> EvictionOutcome {
+    evict_txid_everywhere_repointed(db, txid, reason, asked_ms, &[]).await
+}
+
+/// [`evict_txid_everywhere`] for the conflict pass (bsv-low #605, the E606 lens's M1): `repointed` are the outpoints
+/// the pass wrote the confirmed competitor on BEFORE this eviction (`record_conflict_spender`), so the release no
+/// longer finds them; they are merged into the ledger's `releasedSpends` beside the released ones, because the app
+/// layer keys an evicted game's home on exactly that list (`owed.rs` `evicted_pot_homes`). The readmission's re-mark
+/// of such an entry is a guarded no-op (`remark_pot_spend_sql`: `spendingTxid IS NULL`; the pointer is the
+/// competitor's); the way back is the chaser's displacement.
+pub async fn evict_txid_everywhere_repointed(
+    db: &D1Database,
+    txid: &str,
+    reason: &str,
+    asked_ms: u64,
+    repointed: &[ReleasedSpend],
+) -> EvictionOutcome {
     let txid = txid.to_ascii_lowercase();
     // THE STAMP POLICY (round 4 of the gate): the ledger's stamp is `asked_ms`, the moment the refusal's EVIDENCE
     // began (the callback's arrival, the watch's look) — a readmission whose stamp is newer than that (the
@@ -1261,11 +1277,12 @@ pub async fn evict_txid_everywhere(
     }
     // the spends it left on the rows it consumed (its hops, its pot) — released, and MERGED with the ledger's
     // list; NOT when the pass yielded to a readmission (the readmission re-marked them: they stand)
-    let released = if core.yielded_to_readmission.is_some() {
+    let mut released = if core.yielded_to_readmission.is_some() {
         Vec::new()
     } else {
         release_spends_of(db, &txid).await
     };
+    released.extend(repointed.iter().cloned());
     let existing_json = match Query::new(RELEASED_SPENDS_SQL)
         .bind(txid.as_str())
         .fetch_optional::<ReleasedJsonRow>(db)
@@ -1547,7 +1564,15 @@ impl ConflictPresence for CourierConflictPresence {
 /// the outpoint it took, before the eviction releases that outpoint's pointer.
 #[async_trait(?Send)]
 pub trait ConflictEviction {
-    async fn evict_conflict(&self, txid: &str, reason: &str, now_ms: u64) -> Result<(), String>;
+    /// `repointed`: the outpoints [`Self::record_conflict_spender`] moved to the competitor, which the ledger's
+    /// `releasedSpends` must still name (the E606 lens's M1).
+    async fn evict_conflict(
+        &self,
+        txid: &str,
+        reason: &str,
+        now_ms: u64,
+        repointed: &[ReleasedSpend],
+    ) -> Result<(), String>;
     async fn record_conflict_spender(
         &self,
         outpoint_txid: &str,
@@ -1568,8 +1593,14 @@ impl ConflictEviction for D1Database {
     ) -> Result<bool, String> {
         record_conflict_spender(self, outpoint_txid, vout, evicted, competitor).await
     }
-    async fn evict_conflict(&self, txid: &str, reason: &str, now_ms: u64) -> Result<(), String> {
-        let result = evict_txid_everywhere(self, txid, reason, now_ms).await;
+    async fn evict_conflict(
+        &self,
+        txid: &str,
+        reason: &str,
+        now_ms: u64,
+        repointed: &[ReleasedSpend],
+    ) -> Result<(), String> {
+        let result = evict_txid_everywhere_repointed(self, txid, reason, now_ms, repointed).await;
         if !result.yielded {
             write_refused_verdict(self, txid, now_ms as i64, reason).await;
         }
@@ -1646,17 +1677,37 @@ pub async fn converge_confirmed_conflict(
             }
             // bsv-low #605: the competitor is the outpoint's spender, written BEFORE the eviction releases the
             // evicted tx's pointers (the release then passes this row by); a fault writes nothing and evicts nothing,
-            // the next pass asks again. A miss (a confirmed pointer, another spender's) is logged and the eviction
-            // goes on as before.
-            if !store
+            // the next pass asks again. A miss (no such row, e.g. the JOIN's plain wallet funding; a confirmed
+            // pointer; another spender's) leaves the eviction to go on as before. The re-pointed outpoint is handed
+            // to the eviction so its ledger still names it (the E606 lens's M1). Stated, filed: a write of the
+            // evicted tx's pointer landing between this re-point and the release (milliseconds; `mark_spent_sql`
+            // has no from-guard) resets the hop, which the release then nulls (the repair pass's class, bsv-low
+            // #607); and the stale mark of a hop whose first judgement had no bytes (bsv-low #608).
+            let repointed = if store
                 .record_conflict_spender(parent, vout, txid, &competitor)
                 .await?
             {
-                crate::proof_fetcher::push_log(&format!(
-                    "[conflict] {txid}: {parent}:{vout} not re-pointed at {competitor} (no unconfirmed row named the evicted tx or none)"
-                ));
-            }
-            store.evict_conflict(txid, &format!("input {parent}:{vout} spent by confirmed competitor {competitor} at {height}"), now_ms).await?;
+                vec![ReleasedSpend {
+                    table: "pot_records".into(),
+                    txid: parent.to_ascii_lowercase(),
+                    vout,
+                }]
+            } else {
+                Vec::new()
+            };
+            store
+                .evict_conflict(
+                    txid,
+                    &format!("input {parent}:{vout} spent by confirmed competitor {competitor} at {height}"),
+                    now_ms,
+                    &repointed,
+                )
+                .await?;
+            // one line per eviction (the lens's L2: the miss was logged on its own for every plain funding input)
+            crate::proof_fetcher::push_log(&format!(
+                "[conflict] {txid}: evicted, {parent}:{vout} taken by {competitor} at {height}; re-pointed: {}",
+                if repointed.is_empty() { "no (no unconfirmed pot row named the evicted tx or none)" } else { "yes" }
+            ));
             return Ok(true);
         }
     }
@@ -3263,6 +3314,48 @@ mod tests {
         assert_eq!(count(&conn, "applied_transactions", "txid", &pot), 2);
         assert_eq!(count(&conn, "outputs", "txid", &pot), 1);
         assert_eq!(count(&conn, "pot_records_evicted", "txid", &pot), 0);
+    }
+
+    /// The E606 lens's M1 (structural; `e605_a` runs the shipped statements over the test store): the D1 conflict
+    /// eviction hands the re-pointed outpoints to the wrapper, which adds them to the released list BEFORE the merge
+    /// and the close, so the ledger's `releasedSpends` still names the hop the competitor took.
+    #[test]
+    fn e606_m1_the_conflict_eviction_writes_the_repointed_hop_into_the_ledger() {
+        let src = include_str!("admit_fast.rs");
+        let imp = &src[src.find("impl ConflictEviction for D1Database").unwrap()..];
+        let imp = &imp[..imp
+            .find("pub async fn converge_confirmed_conflict")
+            .unwrap()];
+        assert!(
+            imp.contains("evict_txid_everywhere_repointed(self, txid, reason, now_ms, repointed)"),
+            "the D1 store hands the re-pointed outpoints to the eviction"
+        );
+        let w = &src[src
+            .find("pub async fn evict_txid_everywhere_repointed(")
+            .unwrap()..];
+        let w = &w[..w.find("struct EvictedRow").unwrap()];
+        let release = w.find("release_spends_of(db, &txid)").expect("the release");
+        let add = w
+            .find("released.extend(repointed.iter().cloned())")
+            .expect("the re-pointed added");
+        let merge = w.find("merge_released(").expect("the merge");
+        let close = w
+            .find("Query::new(CLOSE_EVICTION_MARKER_SQL)")
+            .expect("the close");
+        assert!(
+            release < add && add < merge && merge < close,
+            "release, add, merge, close"
+        );
+        let pass = &src[src
+            .find("pub async fn converge_confirmed_conflict(")
+            .unwrap()..];
+        let pass: String = pass[..pass.find("\n}\n").unwrap()]
+            .split_whitespace()
+            .collect();
+        assert!(
+            pass.contains("now_ms,&repointed,)"),
+            "the pass hands what it re-pointed to the eviction"
+        );
     }
 
     /// Structural (loop 18): the OPEN marker is written BEFORE the table loop, the verification pass runs
