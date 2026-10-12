@@ -1857,8 +1857,14 @@ where
             Ok(step) => step,
             Err(error) => return (Err(error), None),
         };
-        if let GateStep::SyncRejected(reason) = step {
-            return (Ok(ArcOutcome::Rejected(reason)), None);
+        // Route synchronous refusals through the request ladder's exact arms:
+        // cascade-retryable ancestor views cannot become definitive refusals.
+        if let GateStep::SyncRejected(reason) = &step {
+            if let Ladder::Return(outcome) =
+                ladder_step(GateStep::SyncRejected(reason.clone()), subject_txid)
+            {
+                return (Ok(outcome), None);
+            }
         }
         *first_step.borrow_mut() = Some(step);
         let walk = corroborate(CorroborationKind::WithAncestry).await;
@@ -4651,6 +4657,81 @@ mod tests {
                 SubmitRung::FullBatch
             ]
         );
+    }
+
+    /// A stale ancestor word on a deferred job's first run must leave the job
+    /// retryable, without the route's durable refusal / 422 arm.
+    #[tokio::test]
+    async fn arcregd2_h1_first_run_cascade_refusal_leaves_job_pending() {
+        let asks = std::cell::Cell::new(0);
+        let (answer, paused) = broadcast_efs_gated_in_window_with(
+            81,
+            "subject",
+            LegWindow {
+                from: 0,
+                budget: crate::ef_deferred::RUN_CORROBORATION_LEGS,
+            },
+            |_, _| async {
+                Ok(GateStep::SyncRejected(
+                    "error: parent rejected (ancestor 00aa): retryable".into(),
+                ))
+            },
+            |_| {
+                asks.set(asks.get() + 1);
+                async { LegWalk::Paused { reached: 32 } }
+            },
+        )
+        .await;
+        let status = match &answer {
+            Ok(ArcOutcome::Rejected(_)) => 422,
+            Err(_) => 502,
+            other => panic!("unexpected answer: {other:?}"),
+        };
+        assert_eq!(
+            crate::ef_deferred::settle(status),
+            crate::ef_deferred::Settle::Again,
+            "first-run stale view must not finish the job with a durable refusal: {answer:?}"
+        );
+        assert!(
+            answer.is_err(),
+            "only Rejected enters the route's durable refusal arm"
+        );
+        assert_eq!(paused, Some(32));
+        assert_eq!(asks.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn arcregd2_h1_run_refusals_use_request_ladder_arms() {
+        for (reason, accepted, expected_asks) in [
+            ("error: parent rejected (ancestor 00aa): retryable", true, 2),
+            ("transaction failed validation: script", false, 0),
+        ] {
+            let asks = std::cell::Cell::new(0);
+            let (answer, paused) = broadcast_efs_gated_in_window_with(
+                81,
+                "subject",
+                LegWindow {
+                    from: 32,
+                    budget: crate::ef_deferred::RUN_CORROBORATION_LEGS,
+                },
+                |_, _| async { Ok(GateStep::SyncRejected(reason.into())) },
+                |_| {
+                    asks.set(asks.get() + 1);
+                    async { LegWalk::Decided(Ok(ArcOutcome::Accepted("subject".into()))) }
+                },
+            )
+            .await;
+            assert_eq!(paused, None);
+            assert_eq!(asks.get(), expected_asks, "{answer:?}");
+            assert_eq!(
+                matches!(answer, Ok(ArcOutcome::Accepted(_))),
+                accepted,
+                "{answer:?}"
+            );
+            if !accepted {
+                assert!(matches!(answer, Ok(ArcOutcome::Rejected(_))));
+            }
+        }
     }
 
     #[tokio::test]

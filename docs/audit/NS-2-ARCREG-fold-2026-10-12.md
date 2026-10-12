@@ -245,3 +245,20 @@ Unverified: live Arcade orphan/proof delivery; the production platform default
 (the code assumes 1,000), the variable storage/binding tail; the full CI tiers
 outside the requested cells; the captain's second delta and LOW register pickup.
 Cleanup removes only this lane's target and neutered copy; logs remain in /tmp.
+
+## ARCREGD2-H1 fold (NS-2-ARCREG-FOLD-5)
+
+The consumer wrapper routes synchronous refusals through `ladder_step`'s
+request arms. A cascade-retryable ancestor word retries and is never a
+ definitive refusal; body-only script/fee failures retain the ladder's
+validation arm. Arcade-terminal network status still uses #519's fresh
+indexer judgement; one broadcaster's stored word evicts nothing.
+
+Two native pins RED on the reviewed wrapper (exit 101): the first byte-deferred
+run's stale ancestor word answered Rejected / 422 / Done, and the corroborator
+was never asked. GREEN (exit 0): the paused walk leaves the job retryable with
+no Rejected outcome to enter the route's durable-refusal arm; a completing
+walk corroborates acceptance, and a non-cascade validation failure uses the
+same terminal arm as a request. All 14 existing pins plus these two pass.
+Evidence: `/tmp/ns2-arcreg-fold-5/h1-{red,green}.log`. These are native seams,
+not an end-to-end queue / D1 refusal-record trace.
