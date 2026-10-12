@@ -134,6 +134,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsv-low-proof-replay"
+version = "0.1.0"
+dependencies = [
+ "bsv-low-core",
+ "bsv-low-wire",
+ "bsv-overlay-discovery",
+ "bsv-overlay-engine",
+ "flate2",
+ "hex",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "bsv-low-wire"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -189,6 +203,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bsv-low-proof-replay",
  "bsv-middleware-cloudflare",
  "bsv-overlay-discovery",
  "bsv-overlay-engine",
@@ -196,7 +211,6 @@ dependencies = [
  "bsv-worker-build-info",
  "hex",
  "js-sys",
- "bsv-low-proof-replay",
  "rusqlite",
  "serde",
  "serde_json",
@@ -931,6 +945,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bsv-low-proof-replay",
  "bsv-middleware-cloudflare",
  "bsv-overlay-cloudflare",
  "bsv-overlay-discovery",
@@ -941,26 +956,11 @@ dependencies = [
  "futures-util",
  "getrandom",
  "hex",
- "bsv-low-proof-replay",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
  "worker",
-]
-
-[[package]]
-name = "bsv-low-proof-replay"
-version = "0.1.0"
-dependencies = [
- "bsv-low-core",
- "bsv-low-wire",
- "bsv-overlay-discovery",
- "bsv-overlay-engine",
- "flate2",
- "hex",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

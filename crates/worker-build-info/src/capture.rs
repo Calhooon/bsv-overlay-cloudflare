@@ -86,22 +86,32 @@ pub fn rfc3339_utc(secs: u64) -> String {
     )
 }
 
+// Cargo packages include their resolved lock beside the normalized manifest.
+// Repository builds retain the shared workers lock and its exact versions.
+fn build_lock(manifest: &Path) -> PathBuf {
+    let packaged = manifest.join("Cargo.lock");
+    if packaged.is_file() {
+        return packaged;
+    }
+    manifest
+        .parent()
+        .and_then(Path::parent)
+        .expect("Worker lives under crates/ or carries a packaged Cargo.lock")
+        .join("workers/Cargo.lock")
+}
+
 /// Run from each deployable crate's build.rs, never from the shared crate's.
 pub fn emit() {
     let manifest = PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"),
     );
-    let root = manifest
-        .parent()
-        .and_then(Path::parent)
-        .expect("Worker lives under crates/");
-    let lock = root.join("workers/Cargo.lock");
+    let lock = build_lock(&manifest);
     println!("cargo:rerun-if-env-changed=BUILD_LIB_REV");
     println!("cargo:rerun-if-changed={}", lock.display());
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=build.rs");
     let text = std::fs::read_to_string(&lock)
-        .expect("read workers/Cargo.lock for exact build crate versions");
+        .expect("read build Cargo.lock for exact build crate versions");
     for (name, env) in CRATES {
         let version = lock_version(&text, name).unwrap_or_else(|message| panic!("{message}"));
         println!("cargo:rustc-env={env}={version}");
@@ -159,6 +169,18 @@ mod tests {
         for (name, _) in CRATES {
             assert!(lock_version(actual, name).is_ok());
         }
+    }
+
+    #[test]
+    fn lock_location_supports_repository_and_packaged_worker() {
+        let scratch = std::env::temp_dir().join(format!("build-lock-{}", std::process::id()));
+        let manifest = scratch.join("crates/worker");
+        std::fs::create_dir_all(&manifest).unwrap();
+        assert_eq!(build_lock(&manifest), scratch.join("workers/Cargo.lock"));
+        let packaged = manifest.join("Cargo.lock");
+        std::fs::write(&packaged, "packaged lock").unwrap();
+        assert_eq!(build_lock(&manifest), packaged);
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[test]
