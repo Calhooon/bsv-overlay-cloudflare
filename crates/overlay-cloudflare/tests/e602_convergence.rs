@@ -85,7 +85,23 @@ impl ConflictEviction for Sqlite {
         let result = evict_core(self, txid, reason, now_ms).await;
         assert!(result.faults.is_empty(), "{:?}", result.faults);
         assert!(result.yielded_to_readmission.is_none());
-        Ok(())
+        // bsv-low #605: the production eviction (`evict_txid_everywhere`) then releases the evicted tx's unconfirmed
+        // pointers with the shipped statement; modelled here so the pin sees what the release leaves
+        let cols = self.columns("pot_records").await?;
+        self.exec(
+            &release_pot_spends_sql(&cols),
+            vec![QVal::Text(txid.to_ascii_lowercase())],
+        )
+        .await
+    }
+    async fn record_conflict_spender(
+        &self,
+        outpoint_txid: &str,
+        vout: u32,
+        evicted: &str,
+        competitor: &str,
+    ) -> Result<bool, String> {
+        record_conflict_spender(self, outpoint_txid, vout, evicted, competitor).await
     }
 }
 struct Evidence {
@@ -273,4 +289,155 @@ async fn e602_fold_the_conflict_counters_exist_and_move_on_one_eviction() {
     ] {
         assert!(served.contains(name), "{name} served from 0");
     }
+}
+
+/// bsv-low #605: the conflict pass writes the confirmed competitor as the HOP's spender before the eviction releases
+/// the evicted JOIN's pointers, so the hop reads `spent = 1, spendingTxid = <competitor>` (unconfirmed; the #186
+/// chaser's CAS latches it), the JOIN's other input (a hop the competitor did not take) is released as before, a
+/// CONFIRMED pointer never moves, the pot's rows are in the twins and the pass's counters are the #602 ones.
+/// Under the REAL shipped schema. RED on `22742afd` with the port's method grafted inert (the call removed): the hop
+/// reads `(0, None)`.
+#[tokio::test]
+async fn e605_a_conflict_eviction_leaves_the_hop_spent_by_the_confirmed_competitor() {
+    use bsv_rs::transaction::TransactionInput;
+    let db = Sqlite(Connection::open_in_memory().unwrap());
+    for sql in OVERLAY_MIGRATIONS {
+        if let Err(e) = db.0.execute_batch(sql) {
+            assert!(e.to_string().contains("duplicate column"), "{e}");
+        }
+    }
+    let (hop, other_hop) = ("aa".repeat(32), "bb".repeat(32));
+    let mut join = spending(&hop, 40_000);
+    join.inputs
+        .push(TransactionInput::new(other_hop.clone(), 0));
+    let txid = join.id();
+    let raw = join.to_binary();
+    let competitor = spending(&hop, 20_190);
+    let competitor_txid = competitor.id();
+    // the JOIN's pot row, and the two hops it spent (unconfirmed, with the verdict group riding the pointer)
+    db.0.execute(
+        "INSERT INTO pot_records(txid,outputIndex,spent,createdAt) VALUES (?,0,0,1)",
+        [&txid],
+    )
+    .unwrap();
+    for h in [&hop, &other_hop] {
+        db.0.execute(
+            "INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,spentConfirmed,spentAt,spentHeight,spenderFinal,verdict,verdictTxid,createdAt) VALUES (?1,0,1,?2,0,5,970700,1,'x',?2,1)",
+            rusqlite::params![h, &txid],
+        )
+        .unwrap();
+    }
+    let evidence = Evidence {
+        raw: competitor.to_hex(),
+        height: Some(970_710),
+    };
+    let mut summary = ConflictPassSummary::default();
+    summary.note(&converge_confirmed_conflict(&db, &evidence, &evidence, &txid, &raw, 3000).await);
+    type HopRow = (
+        i64,
+        Option<String>,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    );
+    let row = |h: &str| -> HopRow {
+        db.0.query_row(
+            "SELECT spent, spendingTxid, spentConfirmed, spentHeight, verdict, spenderFinal, spentAt FROM pot_records WHERE txid=? AND outputIndex=0",
+            [h],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        )
+        .unwrap()
+    };
+    let (spent, spender, confirmed, height, verdict, fin, at) = row(&hop);
+    assert_eq!(
+        (spent, spender.as_deref(), confirmed),
+        (1, Some(competitor_txid.as_str()), 0),
+        "the hop is spent by the confirmed competitor, unconfirmed until the chaser latches it"
+    );
+    assert_eq!(
+        (height, verdict, fin),
+        (None, None, None),
+        "the evicted JOIN's facts left with it"
+    );
+    assert!(
+        at.is_some_and(|a| a > 5),
+        "spentAt restamped: the chaser's age gate starts now"
+    );
+    // the JOIN's other input, which the competitor did not take: released as before
+    assert_eq!(row(&other_hop).0, 0);
+    assert_eq!(row(&other_hop).1, None);
+    // the pot's rows are in the twins, and the pass counted as #602 counts
+    assert_eq!(db.count("pot_records", "txid", &txid).await.unwrap(), 0);
+    assert_eq!(
+        db.count("pot_records_evicted", "txid", &txid)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        (summary.scanned, summary.evicted, summary.faults),
+        (1, 1, 0)
+    );
+    // the #186 chaser's confirm CAS (the shipped statement) latches the pointer once the competitor's proof verifies
+    let latched: Option<String> =
+        db.0.query_row(
+            bsv_overlay_cloudflare::d1_discovery::confirm_spend_cas_sql(),
+            rusqlite::params![970_710i64, &hop, 0i64, &competitor_txid],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(latched.as_deref(), Some(hop.as_str()));
+    assert_eq!((row(&hop).2, row(&hop).3), (1, Some(970_710)));
+}
+
+/// bsv-low #605: the guard. A CONFIRMED pointer never moves on the pass's word, another spender's pointer is not
+/// taken, an already-released row (none) is re-pointed, and a miss leaves the eviction to go on.
+#[tokio::test]
+async fn e605_b_the_record_is_guarded_on_the_evicted_pointer_and_unconfirmed() {
+    let db = Sqlite(Connection::open_in_memory().unwrap());
+    for sql in OVERLAY_MIGRATIONS {
+        if let Err(e) = db.0.execute_batch(sql) {
+            assert!(e.to_string().contains("duplicate column"), "{e}");
+        }
+    }
+    let (join, comp, other) = ("ab".repeat(32), "cd".repeat(32), "ef".repeat(32));
+    let (confirmed, foreign, released) = ("01".repeat(32), "02".repeat(32), "03".repeat(32));
+    db.0.execute("INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,spentConfirmed,createdAt) VALUES (?1,0,1,?2,1,1)", rusqlite::params![&confirmed, &join]).unwrap();
+    db.0.execute("INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,spentConfirmed,createdAt) VALUES (?1,0,1,?2,0,1)", rusqlite::params![&foreign, &other]).unwrap();
+    db.0.execute("INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,spentConfirmed,createdAt) VALUES (?1,0,0,NULL,0,1)", rusqlite::params![&released]).unwrap();
+    assert!(!record_conflict_spender(&db, &confirmed, 0, &join, &comp)
+        .await
+        .unwrap());
+    assert!(!record_conflict_spender(&db, &foreign, 0, &join, &comp)
+        .await
+        .unwrap());
+    assert!(
+        !record_conflict_spender(&db, &"04".repeat(32), 0, &join, &comp)
+            .await
+            .unwrap(),
+        "no such row"
+    );
+    assert!(record_conflict_spender(
+        &db,
+        &released.to_ascii_uppercase(),
+        0,
+        &join.to_ascii_uppercase(),
+        &comp.to_ascii_uppercase()
+    )
+    .await
+    .unwrap());
+    let pointer = |h: &str| -> (i64, Option<String>, i64) {
+        db.0.query_row(
+            "SELECT spent, spendingTxid, spentConfirmed FROM pot_records WHERE txid=?",
+            [h],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(pointer(&confirmed), (1, Some(join.clone()), 1));
+    assert_eq!(pointer(&foreign), (1, Some(other.clone()), 0));
+    assert_eq!(pointer(&released), (1, Some(comp.clone()), 0));
 }

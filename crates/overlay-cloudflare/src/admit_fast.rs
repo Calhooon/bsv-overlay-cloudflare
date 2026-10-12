@@ -364,6 +364,75 @@ pub fn remark_pot_spend_sql(cols: &[ColumnInfo]) -> (String, bool) {
     )
 }
 
+/// PURE (bsv-low #605): write a CONFIRMED competitor as the spender of one outpoint the evicted tx consumed (binds:
+/// the competitor txid, the outpoint's txid, its vout, the evicted txid; all lowercase), BEFORE the eviction releases
+/// that tx's pointers, so the release (`WHERE spendingTxid = <evicted>`) no longer finds the row and the hop is never
+/// served `spent:false, spendingTxid:null` while the pass knows its spender. Guarded: only a row whose pointer is the
+/// evicted tx or none, and only an UNCONFIRMED one (a `spentConfirmed = 1` pointer never moves on a courier's word).
+/// The pointer is UNCONFIRMED: the conflict pass holds a courier's claimed height, never a verified proof, so the
+/// #186 chaser latches it once the competitor's proof verifies (its candidates are `spent = 1, spentConfirmed = 0`
+/// rows aged on `spentAt`). The verdict group and the old spender's height and finality are cleared (they were the
+/// evicted tx's). `RETURNING 1 AS v` turns a hit into a row.
+pub fn record_conflict_spender_sql(cols: &[ColumnInfo]) -> String {
+    let has = |n: &str| cols.iter().any(|c| c.name == n);
+    let mut sets = vec!["spent = 1".to_string(), "spendingTxid = ?".to_string()];
+    for (col, val) in [
+        ("spentAt", "unixepoch()"),
+        ("firstSpentAt", "COALESCE(firstSpentAt, unixepoch())"),
+        ("spentHeight", "NULL"),
+        ("spenderFinal", "NULL"),
+        ("verdict", "NULL"),
+        ("verdictTxid", "NULL"),
+        ("settleSigners", "NULL"),
+    ] {
+        if has(col) {
+            sets.push(format!("{col} = {val}"));
+        }
+    }
+    let guard = if has("spentConfirmed") {
+        " AND COALESCE(spentConfirmed, 0) = 0"
+    } else {
+        ""
+    };
+    format!(
+        "UPDATE pot_records SET {} WHERE txid = ? AND outputIndex = ? AND (spendingTxid = ? OR spendingTxid IS NULL){guard} RETURNING 1 AS v",
+        sets.join(", ")
+    )
+}
+
+/// bsv-low #605: run [`record_conflict_spender_sql`] for one outpoint; `Ok(true)` when the row now names the
+/// competitor, `Ok(false)` when no row matched (no such row, a confirmed pointer, or another spender's), `Err` on a
+/// read or write fault. The pots room hears the change.
+pub async fn record_conflict_spender(
+    db: &dyn ShadowDb,
+    outpoint_txid: &str,
+    vout: u32,
+    evicted: &str,
+    competitor: &str,
+) -> Result<bool, String> {
+    let cols = db.columns("pot_records").await?;
+    if !cols.iter().any(|c| c.name == "spendingTxid") {
+        return Ok(false);
+    }
+    let outpoint_txid = outpoint_txid.to_ascii_lowercase();
+    let hit = db
+        .query_i64(
+            &record_conflict_spender_sql(&cols),
+            vec![
+                QVal::Text(competitor.to_ascii_lowercase()),
+                QVal::Text(outpoint_txid.clone()),
+                QVal::Int(i64::from(vout)),
+                QVal::Text(evicted.to_ascii_lowercase()),
+            ],
+        )
+        .await?
+        .is_some();
+    if hit {
+        crate::pot_changes::note(&outpoint_txid, vout);
+    }
+    Ok(hit)
+}
+
 #[derive(serde::Deserialize)]
 struct PotSpendRow {
     txid: String,
@@ -1474,14 +1543,31 @@ impl ConflictPresence for CourierConflictPresence {
     }
 }
 
-/// The only mutation port is the existing reversible eviction.
+/// The mutation port: the existing reversible eviction, and (bsv-low #605) the competitor written as the spender of
+/// the outpoint it took, before the eviction releases that outpoint's pointer.
 #[async_trait(?Send)]
 pub trait ConflictEviction {
     async fn evict_conflict(&self, txid: &str, reason: &str, now_ms: u64) -> Result<(), String>;
+    async fn record_conflict_spender(
+        &self,
+        outpoint_txid: &str,
+        vout: u32,
+        evicted: &str,
+        competitor: &str,
+    ) -> Result<bool, String>;
 }
 
 #[async_trait(?Send)]
 impl ConflictEviction for D1Database {
+    async fn record_conflict_spender(
+        &self,
+        outpoint_txid: &str,
+        vout: u32,
+        evicted: &str,
+        competitor: &str,
+    ) -> Result<bool, String> {
+        record_conflict_spender(self, outpoint_txid, vout, evicted, competitor).await
+    }
     async fn evict_conflict(&self, txid: &str, reason: &str, now_ms: u64) -> Result<(), String> {
         let result = evict_txid_everywhere(self, txid, reason, now_ms).await;
         if !result.yielded {
@@ -1557,6 +1643,18 @@ pub async fn converge_confirmed_conflict(
         {
             if height == 0 {
                 continue;
+            }
+            // bsv-low #605: the competitor is the outpoint's spender, written BEFORE the eviction releases the
+            // evicted tx's pointers (the release then passes this row by); a fault writes nothing and evicts nothing,
+            // the next pass asks again. A miss (a confirmed pointer, another spender's) is logged and the eviction
+            // goes on as before.
+            if !store
+                .record_conflict_spender(parent, vout, txid, &competitor)
+                .await?
+            {
+                crate::proof_fetcher::push_log(&format!(
+                    "[conflict] {txid}: {parent}:{vout} not re-pointed at {competitor} (no unconfirmed row named the evicted tx or none)"
+                ));
             }
             store.evict_conflict(txid, &format!("input {parent}:{vout} spent by confirmed competitor {competitor} at {height}"), now_ms).await?;
             return Ok(true);
