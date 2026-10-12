@@ -58,3 +58,17 @@ The L1 wiring pin drives rung 1 orphan → rung 3 echoed Pending →
 `AcceptedPending`, with zero corroborations. Source pins tie the real rung's
 one-transaction body to the echo fast return and the route's pending watch;
 the Worker Fetch runtime cannot run in native unit tests.
+
+## L2: bounded refusal line (D1 register continuation)
+
+`/arc-ingest`'s refusal line names the pushed txid (64 hex or `other`),
+`txStatus` (at most 80 characters), User-Agent (at most 64 characters), and
+bearer shape (`64-hex` or `other`) plus its byte length, never its value:
+`POST /arc-ingest txid=".." txStatus=".." ua=".." bearer=64-hex bearerLen=64 -> 401 (<why>)`.
+Fields are debug-quoted on one line; the formatter receives only bearer
+shape metadata. Both no-token and bad-token arms use it; their counters are
+unchanged. With two mismatching credentials, shape describes Authorization's
+Bearer candidate first, then X-CallbackToken; absent/malformed schemes have
+shape `other`, length 0. The auth classifier still compares both candidates.
+The pin covers a near-1-MiB body, huge status/UA, malformed headers, both
+shape words and absence of the credential's value.

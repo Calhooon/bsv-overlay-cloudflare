@@ -2709,17 +2709,47 @@ pub(crate) fn is_unknown_txid_for_proof_ingest(e: &EngineError) -> bool {
     matches!(e, EngineError::Other(m) if m.contains("Could not find matching transaction outputs"))
 }
 
-/// bsv-low #640: identify a refused push without receiving any credential.
+/// Only shape metadata crosses into the refusal formatter, never a credential.
+#[derive(Clone, Copy)]
+struct ArcBearerShape {
+    kind: &'static str,
+    len: usize,
+}
+
+fn arc_bearer_shape(authorization: Option<&str>, callback_token: Option<&str>) -> ArcBearerShape {
+    let token = authorization
+        .and_then(bearer_credential)
+        .or_else(|| callback_token.map(str::trim).filter(|t| !t.is_empty()))
+        .unwrap_or("");
+    ArcBearerShape {
+        kind: if is_hex_txid(token) {
+            "64-hex"
+        } else {
+            "other"
+        },
+        len: token.len(),
+    }
+}
+
+fn is_hex_txid(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// #640: bounded fields plus bearer shape and byte length, never its value.
 fn arc_ingest_refusal_log(
     txid: &str,
     tx_status: &str,
     user_agent: Option<&str>,
     why: &str,
+    bearer: ArcBearerShape,
 ) -> String {
-    // Debug quoting keeps untrusted status and User-Agent on one log line.
+    let txid = if is_hex_txid(txid) { txid } else { "other" };
+    let tx_status: String = tx_status.chars().take(80).collect();
+    let ua: String = user_agent.unwrap_or("").chars().take(64).collect();
+    // Debug quoting keeps all untrusted fields on one bounded log line.
     format!(
-        "POST /arc-ingest txid={txid:?} txStatus={tx_status:?} ua={:?} -> 401 ({why})",
-        user_agent.unwrap_or("")
+        "POST /arc-ingest txid={txid:?} txStatus={tx_status:?} ua={ua:?} bearer={} bearerLen={} -> 401 ({why})",
+        bearer.kind, bearer.len,
     )
 }
 
@@ -2789,7 +2819,13 @@ pub async fn arc_ingest(
             };
             worker::console_log!(
                 "{}",
-                arc_ingest_refusal_log(&txid, tx_status, user_agent.as_deref(), why)
+                arc_ingest_refusal_log(
+                    &txid,
+                    tx_status,
+                    user_agent.as_deref(),
+                    why,
+                    arc_bearer_shape(authorization.as_deref(), callback_token.as_deref())
+                )
             );
             if let Some(db) = ops_db {
                 crate::ops::bump_counter(db, counter, 1).await;
@@ -5406,14 +5442,16 @@ mod tests {
             "MINED",
             Some("arcade-test/640"),
             "token presented but != subject txid",
+            arc_bearer_shape(Some(&format!("Bearer {wrong}")), None),
         );
-        assert_eq!(line, format!("POST /arc-ingest txid={CB_TXID:?} txStatus=\"MINED\" ua=\"arcade-test/640\" -> 401 (token presented but != subject txid)"));
+        assert_eq!(line, format!("POST /arc-ingest txid={CB_TXID:?} txStatus=\"MINED\" ua=\"arcade-test/640\" bearer=64-hex bearerLen=64 -> 401 (token presented but != subject txid)"));
         assert!(!line.contains(&wrong));
         let escaped = arc_ingest_refusal_log(
             CB_TXID,
             "REJECTED\nspoof",
             Some("courier\nspoof"),
             "no token",
+            arc_bearer_shape(None, None),
         );
         assert_eq!(
             escaped.lines().count(),
@@ -5428,15 +5466,65 @@ mod tests {
             refusal.contains("req.headers().get(\"user-agent\")"),
             "UA read before body consumption"
         );
+        let compact: String = refusal.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            refusal
-                .contains("arc_ingest_refusal_log(&txid, tx_status, user_agent.as_deref(), why)"),
+            compact.contains("arc_ingest_refusal_log(&txid,tx_status,user_agent.as_deref(),why,arc_bearer_shape(authorization.as_deref(),callback_token.as_deref())"),
             "the route emits the pinned line"
         );
         assert!(
             refusal.contains("ArcIngestBody::Proof { tx_status, .. }"),
             "MINED pushed status is retained"
         );
+    }
+
+    #[test]
+    fn arcreg_l2_megabyte_body_and_malformed_header_are_bounded() {
+        let mut raw = serde_json::json!({
+            "txid": "x".repeat(ARC_INGEST_BODY_MAX_BYTES - 100), "txStatus": "MINED",
+        })
+        .to_string();
+        raw.push_str(&" ".repeat(ARC_INGEST_BODY_MAX_BYTES - raw.len()));
+        assert_eq!(raw.len(), ARC_INGEST_BODY_MAX_BYTES);
+        let body = classify_arc_ingest_body(&raw).unwrap();
+        let (txid, status) = match &body {
+            ArcIngestBody::StatusOnly {
+                txid, tx_status, ..
+            } => (txid, tx_status),
+            _ => panic!("status-only body"),
+        };
+        let bad_header = "Basic malformed-secret-that-must-not-be-logged";
+        assert_eq!(
+            classify_arc_callback_auth(Some(bad_header), None, txid),
+            ArcCallbackAuth::NoToken
+        );
+        let ua = "u".repeat(ARC_INGEST_BODY_MAX_BYTES);
+        let line = arc_ingest_refusal_log(
+            txid,
+            status,
+            Some(&ua),
+            "no token",
+            arc_bearer_shape(Some(bad_header), None),
+        );
+        assert!(line.contains("txid=\"other\" txStatus=\"MINED\""));
+        assert!(line.contains(&format!("ua={:?} bearer=other bearerLen=0", "u".repeat(64))));
+        assert!(line.len() < 256);
+        assert!(!line.contains(bad_header));
+        let wrong = "sensitive-credential-value";
+        let line = arc_ingest_refusal_log(
+            CB_TXID,
+            &"\n".repeat(ARC_INGEST_BODY_MAX_BYTES),
+            Some(&ua),
+            "bad token",
+            arc_bearer_shape(Some(&format!("Bearer {wrong}")), None),
+        );
+        assert!(line.contains(&format!("bearer=other bearerLen={}", wrong.len())));
+        assert!(!line.contains(wrong));
+        assert!(line.len() < 512);
+        assert_eq!(line.lines().count(), 1);
+        let shape = arc_bearer_shape(None, Some(&"A".repeat(64)));
+        assert_eq!((shape.kind, shape.len), ("64-hex", 64));
+        let shape = arc_bearer_shape(Some("Bearer"), None);
+        assert_eq!((shape.kind, shape.len), ("other", 0));
     }
 
     #[test]
