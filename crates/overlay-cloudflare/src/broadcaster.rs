@@ -2134,15 +2134,25 @@ where
         .min(crate::ef_deferred::RUN_CORROBORATION_LEGS)
         .max(1);
     let ancestors = nearest_registration_legs(efs, subject_txid, budget);
-    let skipped = efs
+    let mut skipped = efs
         .iter()
         .filter(|e| e.txid != subject_txid)
         .count()
         .saturating_sub(ancestors.len());
     for leg in ancestors.into_iter().take(budget) {
-        let known = look(leg)
+        let status = look(leg)
             .await
-            .is_some_and(|r| r.txid.eq_ignore_ascii_case(&leg.txid));
+            .filter(|r| r.txid.eq_ignore_ascii_case(&leg.txid));
+        // TERMINAL AT ARCADE → NEVER RE-FEED IT, as for the subject (#519).
+        // A mismatched status response cannot suppress this leg's registration.
+        if status
+            .as_ref()
+            .is_some_and(|r| classify_arcade_status(&r.tx_status) == GateVerdict::Fatal)
+        {
+            skipped += 1;
+            continue;
+        }
+        let known = status.is_some();
         post(leg, !known).await;
     }
     // An ancestor's refusal or timeout never prevents the subject's own POST.
@@ -4472,6 +4482,65 @@ mod tests {
             assert!(out.is_ok());
         }
         assert_eq!(subject_posts.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn arcreg_l3_terminal_ancestors_are_not_registered_or_refed() {
+        let ids: Vec<_> = (1..=4).map(|i| format!("{i:064x}")).collect();
+        let mut efs: Vec<_> = ids
+            .iter()
+            .map(|id| EfTx {
+                txid: id.clone(),
+                ef: arcreg_ef(&[]),
+            })
+            .collect();
+        efs.push(EfTx {
+            txid: "subject".into(),
+            ef: arcreg_ef(&ids),
+        });
+        let posts = std::cell::RefCell::new(Vec::new());
+        let (out, skipped) = register_full_batch_with(
+            &efs,
+            "subject",
+            LegWindow::in_request(),
+            |leg| {
+                let (txid, status) = if leg.txid == ids[0] {
+                    (leg.txid.clone(), "REJECTED")
+                } else if leg.txid == ids[1] {
+                    (leg.txid.clone(), "DOUBLE_SPEND_ATTEMPTED")
+                } else if leg.txid == ids[2] {
+                    (leg.txid.clone(), "RECEIVED")
+                } else {
+                    ("wrong-identity".into(), "REJECTED")
+                };
+                async move {
+                    Some(ArcadeStatusResponse {
+                        txid,
+                        tx_status: status.into(),
+                        extra_info: String::new(),
+                    })
+                }
+            },
+            |leg, register| {
+                posts.borrow_mut().push((leg.txid.clone(), register));
+                async {}
+            },
+            |leg| {
+                posts.borrow_mut().push((leg.txid.clone(), true));
+                async { Ok(GateStep::SyncAccepted) }
+            },
+        )
+        .await;
+        assert!(out.is_ok());
+        assert_eq!(skipped, 2);
+        assert_eq!(
+            *posts.borrow(),
+            vec![
+                (ids[2].clone(), false),
+                (ids[3].clone(), true),
+                ("subject".into(), true)
+            ]
+        );
     }
 
     #[test]
