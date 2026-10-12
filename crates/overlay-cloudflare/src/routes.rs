@@ -1373,9 +1373,10 @@ async fn submit_parts(
                 .ok()
                 .map(|v| v.to_string())
                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
-            // NL-6d: a run that resumes a corroboration mid-walk does not push the legs again (the invocation
-            // that first presented the work did).
-            let dual_on = dual_on && !budget.resumed_mid_walk();
+            // ARCREGD-H2: every consumer run uses the bounded foreground walk.
+            // An unbounded duplicate push in wait_until spends the same
+            // invocation's subrequests, including a byte-deferred first run.
+            let dual_on = dual_on && matches!(budget, crate::ef_deferred::WorkBudget::InRequest);
             if let (true, false, Ok(dual_db)) =
                 (dual_on, dual_legs.is_empty(), env.d1("OVERLAY_DB"))
             {
@@ -1441,8 +1442,8 @@ async fn submit_parts(
                 .await;
             }
         }
-        // NL-6d: the corroboration's walk paused with ancestors left (the ladder read it as inconclusive): never a
-        // 502 for a count. In the request the job is deferred from the leg reached (202 and a reference); in a run
+        // NL-6d / ARCREGD-H2: a paused walk stopped the ladder, never a 502
+        // for a count. The request defers from the cursor (202); in a run
         // the answer names the next run's cursor.
         if let Some(reached) = arcade.corroboration_paused_at() {
             return crate::ef_deferred::pause(

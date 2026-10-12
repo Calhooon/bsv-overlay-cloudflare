@@ -10,12 +10,14 @@ Registration shares NL-6d's sizing constants: 32 ancestors in a request,
 is always posted, then only its answer decides admission. Ancestors are
 selected breadth-first from the subject's EF input references, nearest first,
 with duplicates excluded; scripts are skipped as borrowed bytes, not parsed
-or hydrated. The cursor remains the corroborator's; registration uses the
-nearest ancestors on each invocation. ARCREGD-H1 separates the acts: the
+or hydrated. The cursor remains the corroborator's; registration selects the nearest
+ancestors on each invocation. A consumer reserves its one walk first;
+registration spends only the unused portion of the same 256-leg allowance.
+A paused walk ends the pass before rung 3. ARCREGD-H1 separates the acts: the
 FEED is every unproven leg in one non-registering `/txs` body, parents first,
 as in the base. Matching terminal reads suppress those legs in both acts.
 REGISTRATION alone is windowed; the subject is always posted and registered
-under its register-once rule, then the nearest 32 ancestors (256 in a run)
+under its register-once rule, then the nearest 32 ancestors (the unused portion of 256 in a run)
 are the selection. Unselected ancestors are fed but remain unregistered and
 counted by `arc_registration_legs_skipped_total`; their proofs retain the
 poll/courier backstop.
@@ -28,8 +30,12 @@ have a two-second deadline, including response-body reads. Faults, refusals
 and timeouts are best effort and cannot prevent the subject's own POST.
 
 Rung-3 calls before this fold: `2N + 1`, unbounded. After: at most
-`2 min(N, 32) + 2 = 66` in requests, `514` in consumer runs, plus unchanged
-subject polling. For 100 ancestors: 32 registered, subject registered, 68
+`2 min(N, 32) + 2 = 66` in requests. Consumer registrations use
+only the remainder of the 256 shared legs: walk plus registration is at most
+512 ancestor calls, plus at most 40 subject/probe/feed/poll calls (552).
+This includes two fallback hosts per corroborated leg and initial polls at
+time zero. The request's background dual push remains its existing path;
+every consumer run suppresses it, including a byte-deferred run at cursor 0. For 100 ancestors: 32 registered, subject registered, 68
 skipped, 66 calls (formerly 201). For 80: 32 plus subject, 48 skipped,
 66 calls (formerly 161). Known ancestors omit callback headers; terminal
 skips are described below when folded. The pre-#640 batch was one POST.
@@ -63,7 +69,11 @@ admit-fast an echoed Pending answers `AcceptedPending`, with the pending
 watch armed by the route). A witnessed acceptance keeps the two-witness bar
 for unproven ancestry. This confirms review §5 with the owner's 32/256 cap
 and nearest-first registration choice, with the base's complete parents-first
-feed restored by ARCREGD-H1.
+feed restored by ARCREGD-H1. ARCREGD-H2: a paused walk stops the ladder for
+that pass; each consumer run shares 256 ancestor legs between one walk and
+registrations, reuses the exhaustion word, and spends at most 552 broadcaster
+subrequests under the assumed 1,000 default (448 left for binding calls,
+whose size-dependent tail remains unverified under the house's #571 bound).
 
 The L1 wiring pin drives rung 1 orphan → rung 3 echoed Pending →
 `AcceptedPending`, with zero corroborations. Source pins tie the real rung's
@@ -134,7 +144,7 @@ choice, terminal skip, bounded log/shape wording and pending-watch sentence.
 The captain owns LOW's register/design pickup and the light delta. No deploy
 or spend is part of this lane. Arcade's live windowed behaviour is unverified.
 
-## Final verification and owed work
+## Earlier fold verification (historical, superseded below)
 
 Changed Rust hunks formatted with rustfmt; package clippy `--all-targets -D warnings`
 GREEN. `cargo test --manifest-path workers/Cargo.toml -p bsv-overlay-cloudflare`
@@ -167,3 +177,71 @@ parents-first order and exactly one feed call. Both pins are RED on a
 neutered copy restoring the reviewed head's capped, nearest-first feed;
 GREEN on the fold. The nine earlier ARCREG pins remain GREEN, with the
 source pin now requiring the non-registering whole `/txs` body.
+
+## ARCREGD-H2 fold (NS-2-ARCREG-FOLD-4)
+
+The typed transport seam preserves pause as a signal. In a consumer it
+presents the subject once, then walks before the orphan shortcut; on pause
+no later rung or registration runs.
+After a completed walk, only the unused portion of 256 is available for
+registration, even on an inconclusive word. Exhaustion reuses that word;
+a request's paused pre-batch walk likewise blocks every later rung.
+Consumer runs suppress the unbounded #413 duplicate push in `wait_until`,
+including the first run of a byte-deferred job. The foreground walk supplies
+the witness instead. The request's direct orphan feed is unchanged.
+
+The 300-ancestor model includes two hosts per walked leg, the nearest
+registrations and a conservative allowance for polls/probes/subject calls.
+The GREEN runs spend 548 and 552 modeled calls (32 to 288 to 300).
+On the reviewed control-flow mutant it spends over 1,000 each run, cannot
+persist its cursor and ends failed after five runs. On the fold the cursor
+advances 32 to 288 to 300 in two runs, at most 552 calls each. The independent
+pre-batch-pause and shared-budget/cache pins are also RED then GREEN.
+This native budget model is not a platform-limit or real queue execution.
+
+**D1 delta register addition (verbatim):**
+
+Rung 3 feeds every unproven leg whole and parents-first in one non-registering
+`/txs` body; only registration is windowed: the subject always, then the
+nearest 32 ancestors per request. A paused walk stops the pass. Each consumer
+run shares 256 ancestor legs between one walk and registrations and reuses
+the exhaustion word: at most 552 broadcaster subrequests under the assumed
+1,000 default, leaving 448 for binding calls (the house's #571 bound).
+
+The broadcaster figure bounds fetches, not arbitrary storage: D1 chunks,
+admission topics and background binding work still depend on the body.
+Cloudflare's actual platform limit and live Arcade delivery remain unverified.
+The second delta and LOW's register pickup belong to the captain.
+
+## FOLD-4 final verification
+
+Changed Rust hunks formatted; no Cargo.lock change. Rust 1.95.0 (the
+repository's declared toolchain floor): package clippy `--all-targets -- -D warnings`
+exit 0; package test exit 0, 718 passed and one pre-existing ignored test
+(704 unit tests, including all nine earlier ARCREG pins plus five delta pins).
+The machine's default Rust 1.98 clippy found three pre-existing warnings
+(two formatting borrows, `change_flush::post_body`'s unit error); Rust 1.95
+passed without lint suppressions or unrelated code changes.
+
+RED evidence outside the tree: H1's capped/nearest feed mutant fails both
+40-hop pins (exit 101); its independent reversed complete feed fails the
+order pin (101). H2's reviewed-control-flow mutant fails all three pins
+(101): 1,062 modeled calls a run, cursor stuck at 32 for five runs, failed.
+Followed by GREEN on the lane's fourteen ARCREG pins (exit 0); H2's job
+spends 548 then 552 modeled calls, cursor 32 to 288 to 300.
+
+The exact `make ci-route` cells were run under a foreground Python supervisor
+with owned process groups and teardown, not background Bash: ARC-auth exit 0,
+NL-6c EF-work exit 0, NL-6d corroboration exit 0. Node 22.23.3 via nvm;
+`WASM_BINDGEN_BIN=~/bsv/targets/wbg-0.2.126/bin/wasm-bindgen`;
+`LANE_BASE=14860` (free through +12). Fresh load gates: 4.79 for ARC-auth,
+3.18 for corroboration, both below 24. Isolated local persistence, no deploy
+or spend. Logs: `/tmp/ns2-arcreg-fold-4/{arc-auth,ef-work,corroboration}-cell.log`.
+The actual 1,000-leg local job reached done; every ancestor was corroborated
+once across five subject presentations. Native budget pins do not claim to
+exercise Cloudflare's production API ceiling.
+
+Unverified: live Arcade orphan/proof delivery; the production platform default
+(the code assumes 1,000), the variable storage/binding tail; the full CI tiers
+outside the requested cells; the captain's second delta and LOW register pickup.
+Cleanup removes only this lane's target and neutered copy; logs remain in /tmp.

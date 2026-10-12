@@ -82,9 +82,17 @@ pub const IN_REQUEST_BATCH_EF_BYTES: usize = 2 * 1024 * 1024;
 /// number, never a refusal.
 pub const IN_REQUEST_CORROBORATION_LEGS: usize = 32;
 
-/// NL-6d: the ancestors one consumer run posts at most before it hands the job
-/// to the next run (each a POST of at most two hosts, well inside one
-/// invocation's 15-minute wall at a host's answer time).
+/// NL-6d / ARCREGD-H2: one consumer pass shares 256 ancestors between its
+/// single walk and subsequent registrations. A paused walk ends the pass;
+/// exhaustion reuses its word and the consumer never dual-pushes in wait_until.
+/// Subrequest arithmetic: at most 2 * 256 = 512 ancestor calls (two hosts
+/// per walked leg, or GET + POST per registered leg), plus at most 40 for
+/// subject attempts, polls, probe and the one whole /txs feed: 552 broadcaster
+/// fetches per run, leaving 448 for bindings under the assumed Cloudflare
+/// paid default of 1,000 subrequests, within the 15-minute wall. The house's
+/// #571 measured a spent default below about 3,200 API calls; bindings count
+/// too, so this is a broadcaster bound, not a promise for arbitrary storage
+/// chunks or admission topics. Neither overlay config raises the default.
 pub const RUN_CORROBORATION_LEGS: usize = 256;
 
 /// One chunk of bytes at rest in D1: half of D1's 2,000,000-byte bound on a
