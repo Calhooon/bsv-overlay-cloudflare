@@ -331,14 +331,17 @@ async fn l23_r2_synthetic_ninth_eviction_twin_only_25h_late_filing_and_planted_m
 fn read_candidates(db: &Connection, me: &str, cursor: &str) -> Vec<MarkerlessCandidate> {
     db.prepare(MARKERLESS_CANDIDATES_SQL)
         .unwrap()
-        .query_map(rusqlite::params![me, cursor, OWED_MARKERLESS_JOINS_PER_RECOMPUTE], |r| {
-            Ok(MarkerlessCandidate {
-                txid: r.get(0)?,
-                released_spends: r.get(1)?,
-                evicted_at: r.get(2)?,
-                total: r.get(3)?,
-            })
-        })
+        .query_map(
+            rusqlite::params![me, cursor, OWED_MARKERLESS_JOINS_PER_RECOMPUTE],
+            |r| {
+                Ok(MarkerlessCandidate {
+                    txid: r.get(0)?,
+                    released_spends: r.get(1)?,
+                    evicted_at: r.get(2)?,
+                    total: r.get(3)?,
+                })
+            },
+        )
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
