@@ -916,6 +916,20 @@ mod tests {
     fn ns2_l3_every_presence_word_is_in_tracker_vocabulary() {
         let vocabulary: serde_json::Value =
             serde_json::from_str(include_str!("../tests/vectors/arcade_vocabulary.json")).unwrap();
+        // The recorded SDK corpus includes deliberate invalid-response cases;
+        // successful recorded words must be in the complete tracker vocabulary.
+        // SEEN_MULTIPLE_NODES is in Verdict::from_arc_body, beyond that corpus.
+        let recorded: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/arc_tx_status_verdicts.json"))
+                .unwrap();
+        for case in recorded["cases"].as_array().unwrap() {
+            if case["expect"]["result"] == "success" {
+                assert!(vocabulary["words"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&case["body"]["txStatus"]));
+            }
+        }
         for word in ARCADE_SEEN_STATUSES {
             assert!(vocabulary["words"]
                 .as_array()
