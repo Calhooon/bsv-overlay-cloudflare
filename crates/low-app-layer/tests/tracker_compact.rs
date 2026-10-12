@@ -335,3 +335,20 @@ fn owed_clock_reasks_aged_hint_rows_at_writes_and_never_age_polls_chain_words() 
         .unwrap();
     assert!(matches!(state.reask(), Some(bsv_tracker::Reask::Age)));
 }
+
+#[test]
+fn ns3_h2_main_fields_survive_tracker_decoration() {
+    let id = "01".repeat(32);
+    for tier in ["first-party", "proven", "hint", "unknown"] {
+        let before = json!({"tier":tier,"hintSource":"woc","observedAtMs":123,"confirmed":false,"height":null});
+        let mut subject = before.clone();
+        runtime::decorate(&mut subject, Some(&id), &Default::default());
+        let mut batch = json!({"answers":{id.clone():before.clone()}});
+        runtime::decorate(&mut batch, None, &Default::default());
+        for value in [&subject, &batch["answers"][&id]] {
+            for (key, expected) in before.as_object().unwrap() { assert_eq!(&value[key], expected, "main key {key}"); }
+            assert_eq!(value["tracker"]["word"], "unknown");
+            assert!(value.get("word").is_none());
+        }
+    }
+}

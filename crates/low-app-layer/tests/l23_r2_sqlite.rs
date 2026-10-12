@@ -360,6 +360,7 @@ fn derive_for_hops(
         .into_iter()
         .collect();
     derive_owed_rows(&OwedInputs {
+        spender_words: None,
         identity_lc: me,
         tip: Some(970754),
         now_ms: 25 * 60 * 60 * 1000,
