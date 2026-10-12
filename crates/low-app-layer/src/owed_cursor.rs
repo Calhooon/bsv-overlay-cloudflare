@@ -399,6 +399,19 @@ pub struct Cursor {
     pub next_stamp: bool,
 }
 impl Cursor {
+    /// A compound UNION ALL does not promise the order of each returned arm.
+    pub fn start(&mut self, rows: &[Value]) {
+        self.last = rows
+            .iter()
+            .map(|row| {
+                (
+                    number(row, "createdAt"),
+                    number(row, "cursorRowid").unwrap(),
+                )
+            })
+            .max();
+    }
+
     pub fn bind_numbers(&self, nulls: bool) -> Vec<i64> {
         match self.last {
             None => vec![],

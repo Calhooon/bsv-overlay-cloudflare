@@ -367,3 +367,26 @@ fn created_at_cursor_union_equals_unpaged_ranked_views_byte_for_byte() {
         );
     }
 }
+
+#[test]
+fn initial_cursor_uses_maximum_even_when_union_arm_rows_are_reordered() {
+    let rows = vec![
+        serde_json::json!({"createdAt": 10, "cursorRowid": 9}),
+        serde_json::json!({"createdAt": null, "cursorRowid": 100}),
+        serde_json::json!({"createdAt": 10, "cursorRowid": 3}),
+    ];
+    let mut cursor = low_app_layer::owed_cursor::Cursor::default();
+    cursor.start(&rows);
+    assert_eq!(
+        cursor.last,
+        Some((Some(10), 9)),
+        "cursor must use maximum, not last UNION arm row"
+    );
+    cursor.start(&[
+        rows[1].clone(),
+        serde_json::json!({"createdAt": null, "cursorRowid": 2}),
+    ]);
+    assert_eq!(cursor.last, Some((None, 100)));
+    cursor.start(&[]);
+    assert_eq!(cursor.last, None);
+}
