@@ -2578,9 +2578,41 @@ struct OwedStateD1 {
     stale: Option<f64>,
     #[serde(default)]
     truncated: Option<f64>,
+    #[serde(rename = "markerlessProgress", default)]
+    markerless_progress: Option<String>,
 }
 
 pub(crate) async fn owed_recompute(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    identity_lc: &str,
+    source: &str,
+    tip_hint: Option<u64>,
+) -> std::result::Result<OwedComputed, String> {
+    let result = owed_recompute_inner(env, db, identity_lc, source, tip_hint).await;
+    if result
+        .as_ref()
+        .is_err_and(|e| e.starts_with("markerless evidence:"))
+    {
+        // L2/#608: even a detached failed refresh leaves a visible could-not-judge mark on the snapshot.
+        // No synthetic outpoint is invented. Proven older rows stand, with their press withheld this pass.
+        let mut statements = Vec::new();
+        for sql in [
+            "UPDATE owed_state SET stale = 1, truncated = 1 WHERE identity = ?1",
+            "UPDATE owed_rows SET family = 'unbound', facts = json_set(facts, '$.claim', NULL, '$.claimable', json('false'), '$.markerlessReadFault', json('true')), reason = 'could not judge this pass: markerless evidence read fault' WHERE identity = ?1 AND json_extract(facts, '$.markerlessEvidence') = 1",
+        ] {
+            if let Ok(stmt) = db.prepare(sql).bind(&[JsValue::from_str(identity_lc)]) { statements.push(stmt); }
+        }
+        if let Err(e) = crate::d1_ledger::counted_batch(db, statements).await {
+            console_warn!(
+                "[owed] could-not-judge mark failed; the read fault is still counted: {e}"
+            );
+        }
+    }
+    result
+}
+
+async fn owed_recompute_inner(
     env: &worker::Env,
     db: &worker::D1Database,
     identity_lc: &str,
@@ -2757,7 +2789,7 @@ pub(crate) async fn owed_recompute(
     // results view (the eviction moves the party rows out of it), intersected with the identity's OWN hops — the hop
     // outpoints the network's refusal freed (`released_hop_outpoints` / `refused_hop_outpoints_of`: the UTXO key of
     // the refusal, never the game's name). A faulted read names nothing (the pre-change sentence stands).
-    let eviction_rows: Vec<(String, Option<String>)> = {
+    let mut eviction_rows: Vec<(String, Option<String>)> = {
         #[derive(Deserialize)]
         struct EvictionRowD1 {
             txid: String,
@@ -2779,11 +2811,73 @@ pub(crate) async fn owed_recompute(
             }
         }
     };
-    // 4a-0. loop 23's pair 13 (bsv-low #610): a hop the eviction RELEASED that the hops view does not hold (the seat's
-    //       best-effort `tm_hopparty` marker never landed) is rebuilt out of the evicted transaction itself: my own twin party
-    //       row of that JOIN (`sigValid = 1`, the settle key K), the twin lock committing K, and the JOIN's own stored
-    //       BEEF showing the released output paying hash160(K) (`owed::markerless_released_hops`). Keyed on the UTXO
-    //       the ledger names; bounded per recompute; a faulted read names nothing (the hop stays unseen this pass).
+    // H1/M4: the ring is this identity's permanent twin/live evidence, not the global 24h window.
+    // L2: an evidence read fault aborts the compute, counted; it never writes a fresh empty answer.
+    let markerless_fault = |e: String| {
+        crate::owed::note_markerless_read_fault();
+        format!("markerless evidence: could not judge: {e}")
+    };
+    let cursor_target = crate::owed::markerless_cursor_target(identity_lc);
+    let cursor_key = crate::hops_view::probe_memo_key(&cursor_target.0, cursor_target.1);
+    #[derive(Deserialize)]
+    struct CursorD1 {
+        #[serde(rename = "spendingTxid")]
+        cursor: Option<String>,
+    }
+    let cursor = db
+        .prepare("SELECT spendingTxid FROM hop_chain_probes WHERE outpoint = ?1")
+        .bind(&[JsValue::from_str(&cursor_key)])
+        .map_err(|e| markerless_fault(e.to_string()))?
+        .counted_first::<CursorD1>()
+        .await
+        .map_err(|e| markerless_fault(e.to_string()))?
+        .and_then(|r| r.cursor)
+        .map(|raw| crate::owed::markerless_cursor_of(&raw))
+        .unwrap_or_default();
+    let candidates = db
+        .prepare(crate::owed::MARKERLESS_CANDIDATES_SQL)
+        .bind(&[JsValue::from_str(identity_lc), JsValue::from_str(&cursor)])
+        .map_err(|e| markerless_fault(e.to_string()))?
+        .counted_all()
+        .await
+        .and_then(|r| r.results::<crate::owed::MarkerlessCandidate>())
+        .map_err(|e| markerless_fault(e.to_string()))?;
+    let (selected, markerless_total) = crate::owed::markerless_plan(&candidates);
+    let markerless_cut = markerless_total > selected.len();
+    walk_cut |= markerless_cut;
+    let markerless_next = selected.last().map(|r| r.txid.clone());
+    let mut markerless_previous = Vec::new();
+    if markerless_cut {
+        markerless_previous = db
+            .prepare(crate::owed::OWED_ROWS_READ_SQL)
+            .bind(&[JsValue::from_str(identity_lc)])
+            .map_err(|e| markerless_fault(e.to_string()))?
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<OwedRowD1>())
+            .map_err(|e| markerless_fault(e.to_string()))?
+            .into_iter()
+            .filter_map(OwedRowD1::into_row)
+            .filter(|r| r.facts.get("markerlessEvidence").is_some())
+            .collect();
+    }
+    worker::console_log!(
+        "[owed] markerless candidates={}, examined={}, deferred={}, cursor={}",
+        markerless_total,
+        selected.len(),
+        markerless_total.saturating_sub(selected.len()),
+        markerless_next.as_deref().unwrap_or("")
+    );
+    let selected_ledger: Vec<_> = selected
+        .iter()
+        .map(|r| (r.txid.clone(), r.released_spends.clone()))
+        .collect();
+    for r in &selected_ledger {
+        if !eviction_rows.iter().any(|(t, _)| t == &r.0) {
+            eviction_rows.push(r.clone());
+        }
+    }
+    let mut markerless_rebuilt_keys = HashSet::new();
     {
         #[derive(Deserialize)]
         struct EvictedSeatD1 {
@@ -2810,91 +2904,126 @@ pub(crate) async fn owed_recompute(
             #[serde(rename = "payPkhB", default)]
             pay_pkh_b: Option<String>,
         }
-        let mut unheld = crate::owed::unheld_released_by_eviction(&eviction_rows, &hops);
-        unheld.truncate(crate::owed::OWED_MARKERLESS_JOINS_PER_RECOMPUTE);
+        let unheld = crate::owed::unheld_released_by_eviction(&selected_ledger, &hops);
         if !unheld.is_empty() {
             let mut b: Vec<JsValue> = vec![JsValue::from_str(identity_lc)];
             b.extend(unheld.iter().map(|(t, _)| JsValue::from_str(t)));
-            // the eviction moves a party row keyed by `txid` OR `potTxid` (`admit_fast` SHADOW_TABLES); the twin
-            // keeps the source's columns and casing
-            let sql = crate::owed::markerless_seats_sql(unheld.len());
-            let seats: Vec<crate::owed::EvictedSeat> = match db.prepare(&sql).bind(&b) {
-                Ok(stmt) => match stmt
-                    .counted_all()
-                    .await
-                    .and_then(|r| r.results::<EvictedSeatD1>())
-                {
-                    Ok(rows) => rows
-                        .into_iter()
-                        .map(|r| crate::owed::EvictedSeat {
-                            pot_txid: r.pot_txid,
-                            game_id: r.game_id,
-                            opponent_identity: r.opponent_identity,
-                            seat_settle_pubkey: r.seat_settle_pubkey,
-                        })
-                        .collect(),
-                    Err(e) => {
-                        console_warn!("[owed] evicted seats read failed (a markerless released hop stays unseen this pass): {e}");
-                        Vec::new()
-                    }
-                },
-                Err(e) => {
-                    console_warn!("[owed] evicted seats bind failed: {e}");
-                    Vec::new()
-                }
-            };
-            let mine: HashSet<String> = seats
-                .iter()
-                .map(|s| s.pot_txid.to_ascii_lowercase())
+            let seats: Vec<crate::owed::EvictedSeat> = db
+                .prepare(crate::owed::markerless_seats_sql(unheld.len()))
+                .bind(&b)
+                .map_err(|e| markerless_fault(e.to_string()))?
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<EvictedSeatD1>())
+                .map_err(|e| markerless_fault(e.to_string()))?
+                .into_iter()
+                .map(|r| crate::owed::EvictedSeat {
+                    pot_txid: r.pot_txid,
+                    game_id: r.game_id,
+                    opponent_identity: r.opponent_identity,
+                    seat_settle_pubkey: r.seat_settle_pubkey,
+                })
                 .collect();
             let mut twin_keys: Vec<(String, u32, crate::results::CommittedKeys)> = Vec::new();
             let mut outputs: HashMap<String, (Vec<u8>, u64)> = HashMap::new();
-            for (evicted, outpoints) in unheld.iter().filter(|(t, _)| mine.contains(t)) {
-                let keys_sql = crate::owed::MARKERLESS_KEYS_SQL;
-                match db.prepare(keys_sql).bind(&[JsValue::from_str(evicted)]) {
-                    Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<EvictedKeysD1>()) {
-                        Ok(rows) => twin_keys.extend(rows.into_iter().filter_map(|r| {
-                            let keys = crate::results::CommittedKeys::from_columns(
-                                r.pub_a.as_deref(),
-                                r.pub_b.as_deref(),
-                                r.pay_pkh_a.as_deref(),
-                                r.pay_pkh_b.as_deref(),
-                            )?;
-                            let vout = u32::try_from(r.output_index as i64).ok()?;
-                            Some((r.txid.to_ascii_lowercase(), vout, keys))
-                        })),
-                        Err(e) => console_warn!("[owed] evicted keys read failed (a markerless released hop stays unseen this pass): {e}"),
-                    },
-                    Err(e) => console_warn!("[owed] evicted keys bind failed: {e}"),
-                }
-                // `pot_beefs` is never moved by an eviction: the JOIN's own bytes carry its hops as ancestors
-                match db.prepare(crate::owed::MARKERLESS_BEEF_SQL).bind(&[JsValue::from_str(evicted)]) {
-                    Ok(stmt) => match stmt.counted_first::<BeefRow>().await {
-                        Ok(row) => {
-                            if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
-                                outputs.extend(crate::owed::hop_outputs_from_join_beef(&bytes, outpoints));
-                            }
-                        }
-                        Err(e) => console_warn!("[owed] evicted transaction bytes read failed (a markerless released hop stays unseen this pass): {e}"),
-                    },
-                    Err(e) => console_warn!("[owed] evicted transaction bytes bind failed: {e}"),
+            // L4: read the hop's own index first; the stored JOIN is parsed once below.
+            #[derive(Deserialize)]
+            struct HopIndexD1 {
+                spent: Option<f64>,
+                #[serde(rename = "spendingTxid")]
+                spending_txid: Option<String>,
+                #[serde(rename = "spentConfirmed")]
+                spent_confirmed: Option<f64>,
+            }
+            let mut hop_index = HashMap::new();
+            let index_targets: Vec<_> = unheld.iter().flat_map(|(_, points)| points).collect();
+            let index_count = index_targets
+                .len()
+                .min(crate::owed::OWED_MARKERLESS_INDEX_READS_PER_RECOMPUTE);
+            if index_targets.len() > index_count {
+                walk_cut = true;
+                console_warn!("[owed] {} hop index word(s) deferred by the 256-read class; their rows remain could-not-judge until the chain rung answers", index_targets.len() - index_count);
+            }
+            for (txid, vout) in index_targets.into_iter().take(index_count) {
+                let row = db.prepare("SELECT spent, spendingTxid, spentConfirmed FROM pot_records WHERE txid = ?1 AND outputIndex = ?2")
+                    .bind(&[JsValue::from_str(txid), JsValue::from_f64(f64::from(*vout))])
+                    .map_err(|e| markerless_fault(e.to_string()))?.counted_first::<HopIndexD1>()
+                    .await.map_err(|e| markerless_fault(e.to_string()))?;
+                if let Some(row) = row {
+                    hop_index.insert(outpoint_key(txid, *vout), row);
                 }
             }
-            let rebuilt = crate::owed::markerless_released_hops(
+            for (evicted, outpoints) in &unheld {
+                let rows = db
+                    .prepare(crate::owed::MARKERLESS_KEYS_SQL)
+                    .bind(&[JsValue::from_str(evicted)])
+                    .map_err(|e| markerless_fault(e.to_string()))?
+                    .counted_all()
+                    .await
+                    .and_then(|r| r.results::<EvictedKeysD1>())
+                    .map_err(|e| markerless_fault(e.to_string()))?;
+                twin_keys.extend(rows.into_iter().filter_map(|r| {
+                    let keys = crate::results::CommittedKeys::from_columns(
+                        r.pub_a.as_deref(),
+                        r.pub_b.as_deref(),
+                        r.pay_pkh_a.as_deref(),
+                        r.pay_pkh_b.as_deref(),
+                    )?;
+                    Some((
+                        r.txid.to_ascii_lowercase(),
+                        u32::try_from(r.output_index as i64).ok()?,
+                        keys,
+                    ))
+                }));
+                let row = db
+                    .prepare(crate::owed::MARKERLESS_BEEF_SQL)
+                    .bind(&[JsValue::from_str(evicted)])
+                    .map_err(|e| markerless_fault(e.to_string()))?
+                    .counted_first::<BeefRow>()
+                    .await
+                    .map_err(|e| markerless_fault(e.to_string()))?;
+                let bytes = row
+                    .and_then(|r| r.beef)
+                    .and_then(|h| decode_beef_hex(&h))
+                    .ok_or_else(|| markerless_fault("stored ancestor bytes unavailable".into()))?;
+                outputs.extend(crate::owed::hop_outputs_from_join_beef(&bytes, outpoints));
+            }
+            let mut rebuilt = crate::owed::markerless_released_hops(
                 &eviction_rows,
                 &hops,
                 &seats,
                 &twin_keys,
                 &outputs,
             );
-            if !rebuilt.is_empty() {
-                worker::console_log!(
-                    "[owed] recompute for {}…: {} released hop(s) with no marker row rebuilt out of the evicted transaction",
-                    &identity_lc[..identity_lc.len().min(12)],
-                    rebuilt.len()
-                );
-                hops.extend(rebuilt);
+            for h in &mut rebuilt {
+                let row = hop_index.remove(&outpoint_key(&h.hop_txid, h.hop_vout));
+                if let Some(r) = row {
+                    h.spent = r.spent.map(|v| v != 0.0);
+                    h.spending_txid = r.spending_txid;
+                    h.spent_confirmed = r.spent_confirmed.map(|v| v != 0.0);
+                    let (status, source) = crate::hops_view::derive_hop_status(
+                        h.spent,
+                        h.spent_confirmed,
+                        None,
+                        None,
+                        None,
+                    );
+                    h.status = status;
+                    h.status_source = source;
+                }
+                h.marker_created_at = selected
+                    .iter()
+                    .filter(|r| {
+                        r.released_spends
+                            .as_deref()
+                            .is_some_and(|raw| raw.contains(&h.hop_txid))
+                    })
+                    .map(|r| r.evicted_at as i64)
+                    .max();
+                markerless_rebuilt_keys.insert(outpoint_key(&h.hop_txid, h.hop_vout));
             }
+            let ignored = crate::owed::merge_markerless_hops(&mut hops, rebuilt);
+            crate::owed::note_markerless_ignored_markers(ignored);
         }
     }
     let evicted_hop_outpoints: HashSet<String> =
@@ -3562,6 +3691,42 @@ pub(crate) async fn owed_recompute(
     let home_spends = owed_home_spend_walk(env, db, identity_lc, &crate::owed::courier_home_outputs(&inputs), now_ms, started_ms).await;
     inputs.home_spends = &home_spends;
     let mut rows = derive_owed_rows(&inputs);
+    // H1/L2: a deferred older row keeps a counted "could not judge" sentence, with its press cleared.
+    // The next cursor page refreshes it from evidence; no bounded pass silently erases the tail.
+    for r in &mut rows {
+        if markerless_rebuilt_keys.contains(&r.outpoint) {
+            r.facts["markerlessEvidence"] = serde_json::json!(true);
+            r.facts["markerlessJoin"] = serde_json::json!(selected
+                .iter()
+                .find(|c| c
+                    .released_spends
+                    .as_deref()
+                    .is_some_and(|raw| raw.contains(r.facts["hopTxid"].as_str().unwrap_or("!"))))
+                .map(|c| &c.txid));
+            r.facts["markerlessCandidates"] = serde_json::json!(markerless_total);
+            r.facts["markerlessExamined"] = serde_json::json!(selected.len());
+            r.facts["markerlessCursor"] = serde_json::json!(markerless_next);
+        }
+    }
+    let current: HashSet<_> = rows.iter().map(|r| r.outpoint.clone()).collect();
+    for mut r in markerless_previous {
+        if !current.contains(&r.outpoint)
+            && !selected
+                .iter()
+                .any(|c| r.facts["markerlessJoin"].as_str() == Some(c.txid.as_str()))
+        {
+            r.family = crate::owed::OwedFamily::Unbound;
+            r.facts["claim"] = serde_json::Value::Null;
+            r.facts["claimable"] = serde_json::json!(false);
+            r.facts["markerlessCandidates"] = serde_json::json!(markerless_total);
+            r.facts["markerlessExamined"] = serde_json::json!(selected.len());
+            r.facts["markerlessCursor"] = serde_json::json!(markerless_next);
+            r.reason = Some(
+                "could not judge this pass: permanent evidence lies past the cursor bound".into(),
+            );
+            rows.push(r);
+        }
+    }
     for row in &mut rows {
         let spender = row.facts["chainSpender"]
             .as_str()
@@ -3609,8 +3774,30 @@ pub(crate) async fn owed_recompute(
             .collect();
         stmts.push(db.prepare(*sql).bind(&b).map_err(|e| format!("owed write bind: {e}"))?);
     }
-    debug_assert!(stmts.len() <= 3 + crate::owed::OWED_MAX_ROWS, "the batch stays under the row cap + the three bookends");
-    let written = crate::d1_ledger::counted_batch(db, stmts).await.map_err(|e| format!("owed write: {e}"))?;
+    // H1: advance the durable cursor in the SAME atomic snapshot batch, never after a failed write.
+    if let Some(next) = &markerless_next {
+        let progress = serde_json::json!({"cursor": next, "candidates": markerless_total, "examined": selected.len()}).to_string();
+        {
+            let cursor_binds = [
+                JsValue::from_str(&cursor_key),
+                JsValue::from_f64(now_ms as f64),
+                JsValue::from_str(&progress),
+                JsValue::from_str(identity_lc),
+            ];
+            let cursor_stmt = db
+                .prepare(crate::owed::MARKERLESS_CURSOR_UPSERT_SQL)
+                .bind(&cursor_binds)
+                .map_err(|e| markerless_fault(e.to_string()))?;
+            stmts.insert(stmts.len() - 1, cursor_stmt);
+        }
+    }
+    debug_assert!(
+        stmts.len() <= 4 + crate::owed::OWED_MAX_ROWS,
+        "the batch stays under the row cap + the bookends and cursor"
+    );
+    let written = crate::d1_ledger::counted_batch(db, stmts)
+        .await
+        .map_err(|e| format!("owed write: {e}"))?;
     #[derive(Deserialize)]
     struct StampD1 {
         #[serde(rename = "computedAtMs")]
@@ -4059,7 +4246,14 @@ async fn owed_compute_on_read(
         Err(e) => {
             crate::owed::note_recompute_fault();
             console_warn!("[owed] compute on read ({source}) failed: {e}");
-            Err(json_error("the owed list could not be computed", 503))
+            Err(json_error(
+                if e.starts_with("markerless evidence:") {
+                    "could not judge the owed list: markerless evidence read fault"
+                } else {
+                    "the owed list could not be computed"
+                },
+                503,
+            ))
         }
     }
 }
@@ -4099,6 +4293,10 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             return json_error("database query failed", 503);
         }
     };
+    let progress = state
+        .as_ref()
+        .and_then(|s| s.markerless_progress.as_deref())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
     let (rows, tip, computed_at_ms, walk_cut) = match state {
         None => {
             // MEDIUM-5: a public read must not WRITE state keyed on a claimable name — an identity with no party row
@@ -4203,7 +4401,12 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                         } else {
                             match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now).await {
                                 Ok(v) => v,
-                                Err(_) => (rows, prev_tip, st.computed_at_ms as i64, cut),
+                                Err(_) => (
+                                    crate::owed::markerless_faulted_rows(rows),
+                                    prev_tip,
+                                    st.computed_at_ms as i64,
+                                    true,
+                                ),
                             }
                         }
                     }
@@ -4214,8 +4417,26 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
         }
     };
     let truncated = walk_cut || rows.len() > crate::owed::OWED_MAX_ROWS;
-    let served: Vec<crate::owed::OwedRow> = rows.into_iter().take(crate::owed::OWED_MAX_ROWS).collect();
-    json_response(crate::owed::owed_body(&identity, tip, &served, computed_at_ms, truncated), 200)
+    let served: Vec<crate::owed::OwedRow> =
+        rows.into_iter().take(crate::owed::OWED_MAX_ROWS).collect();
+    let mut body: serde_json::Value = serde_json::from_str(&crate::owed::owed_body(
+        &identity,
+        tip,
+        &served,
+        computed_at_ms,
+        truncated,
+    ))
+    .map_err(|e| worker::Error::RustError(e.to_string()))?;
+    let progress = served.iter().find(|r| r.facts.get("markerlessCandidates").is_some()).map(|r| serde_json::json!({"candidates": r.facts["markerlessCandidates"], "examined": r.facts["markerlessExamined"], "cursor": r.facts["markerlessCursor"]})).or(progress);
+    if let Some(progress) = progress {
+        body["markerlessProgress"] = progress;
+    }
+    if truncated {
+        body["judgement"] = serde_json::json!(
+            "could not judge the complete list this pass: bounded or faulted evidence read"
+        );
+    }
+    json_response(body.to_string(), 200)
 }
 
 async fn gather_result_entries(

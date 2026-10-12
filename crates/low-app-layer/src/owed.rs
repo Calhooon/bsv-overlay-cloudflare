@@ -839,14 +839,92 @@ pub fn markerless_seats_sql(count: usize) -> String {
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("SELECT lower(potTxid) AS potTxid, gameId, opponentIdentity, seatSettlePubkey FROM potparty_records_evicted WHERE identity = ?1 AND sigValid = 1 AND seatSettlePubkey IS NOT NULL AND lower(potTxid) IN ({placeholders})")
+    format!("SELECT lower(potTxid) AS potTxid, gameId, opponentIdentity, seatSettlePubkey FROM potparty_records_evicted WHERE identity = ?1 AND sigValid = 1 AND seatSettlePubkey IS NOT NULL AND lower(potTxid) IN ({placeholders}) UNION SELECT lower(potTxid), gameId, opponentIdentity, seatSettlePubkey FROM potparty_records WHERE identity = ?1 AND sigValid = 1 AND seatSettlePubkey IS NOT NULL AND lower(potTxid) IN ({placeholders})")
 }
 pub const MARKERLESS_KEYS_SQL: &str = "SELECT lower(txid) AS txid, outputIndex, pubA, pubB, payPkhA, payPkhB FROM pot_records_evicted WHERE lockKind = 'covenant' AND paramsDecoded = 1 AND txid = ?1";
 pub const MARKERLESS_BEEF_SQL: &str = "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?1";
 
+// H1/M4/L3: permanent, identity-owned candidates FIRST. Late filings remain live. The ledger's
+// readmitted word ends a release; its age never does. COUNT is over this identity's distinct JOINs.
+// N2: sigValid is the overlay/filing door's latched verdict under the single canonical-DER gate.
+pub const MARKERLESS_CANDIDATES_SQL: &str = "WITH mine AS (SELECT lower(potTxid) AS txid FROM potparty_records_evicted WHERE identity = ?1 AND sigValid = 1 AND seatSettlePubkey IS NOT NULL UNION SELECT lower(potTxid) FROM potparty_records WHERE identity = ?1 AND sigValid = 1 AND seatSettlePubkey IS NOT NULL) SELECT e.txid, e.releasedSpends, e.evictedAt, COUNT(*) OVER () AS total FROM mine JOIN pot_evictions e ON e.txid = mine.txid WHERE e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL ORDER BY CASE WHEN e.txid > ?2 THEN 0 ELSE 1 END, e.txid LIMIT 9";
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MarkerlessCandidate {
+    pub txid: String,
+    #[serde(rename = "releasedSpends")]
+    pub released_spends: Option<String>,
+    #[serde(rename = "evictedAt")]
+    pub evicted_at: f64,
+    pub total: f64,
+}
+
+/// The route uses this selection verbatim; the SQL already ordered the ring after the durable cursor.
+pub fn markerless_plan(candidates: &[MarkerlessCandidate]) -> (Vec<MarkerlessCandidate>, usize) {
+    let total = candidates.first().map_or(0, |r| r.total as usize);
+    (
+        candidates
+            .iter()
+            .take(OWED_MARKERLESS_JOINS_PER_RECOMPUTE)
+            .cloned()
+            .collect(),
+        total,
+    )
+}
+
+/// A failed inline refresh serves the older evidence as a could-not-judge sentence, never a fresh press.
+pub fn markerless_faulted_rows(mut rows: Vec<OwedRow>) -> Vec<OwedRow> {
+    for r in rows
+        .iter_mut()
+        .filter(|r| r.facts["markerlessEvidence"] == Value::Bool(true))
+    {
+        r.family = OwedFamily::Unbound;
+        r.facts["claim"] = Value::Null;
+        r.facts["claimable"] = Value::Bool(false);
+        r.facts["markerlessReadFault"] = Value::Bool(true);
+        r.reason = Some("could not judge this pass: markerless evidence read fault".into());
+    }
+    rows
+}
+
+/// The durable position and counted progress share the existing, spared cursor row (no schema change).
+pub fn markerless_cursor_of(raw: &str) -> String {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|r| r["cursor"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| raw.to_owned())
+}
+
+/// The cursor shares the snapshot's monotonic guard, even when a newer snapshot wrote no cursor.
+pub const MARKERLESS_CURSOR_UPSERT_SQL: &str = "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) SELECT ?1, ?2, 0, ?3, NULL WHERE NOT EXISTS (SELECT 1 FROM owed_state WHERE identity = ?4 AND computedAtMs > ?2) ON CONFLICT(outpoint) DO UPDATE SET probedAtMs = excluded.probedAtMs, spendingTxid = excluded.spendingTxid WHERE excluded.probedAtMs >= hop_chain_probes.probedAtMs";
+
+/// Reuse the spared cursor namespace, with a disjoint key from the home-output walk.
+pub fn markerless_cursor_target(identity: &str) -> (String, u32) {
+    (format!("{HOME_WALK_CURSOR_PREFIX}markerless:{identity}"), 0)
+}
+
+/// Verified evidence wins over a planted marker; count discarded attestations, never accept their key.
+pub fn merge_markerless_hops(hops: &mut Vec<HopEntry>, rebuilt: Vec<HopEntry>) -> usize {
+    let keys: HashSet<_> = rebuilt
+        .iter()
+        .map(|h| outpoint_key(&h.hop_txid, h.hop_vout))
+        .collect();
+    let before = hops.len();
+    hops.retain(|h| {
+        h.marker_verified == MarkerVerification::Verified
+            || !keys.contains(&outpoint_key(&h.hop_txid, h.hop_vout))
+    });
+    let ignored = before - hops.len();
+    hops.extend(rebuilt);
+    ignored
+}
+
 /// How many evicted JOINs one recompute reads back for [`markerless_released_hops`] (each a twin read and one stored
-/// BEEF): evictions are rare and a seat's own are rarer; the rest wait for the next pass.
+/// BEEF). N3: a valid seat pays one candidate/cursor read, one seats read, two reads per JOIN,
+/// and at most 128 indexed hop-row reads; at most eight JOINs per pass, counted and cursor-paged under #499.
 pub const OWED_MARKERLESS_JOINS_PER_RECOMPUTE: usize = 8;
+/// A malformed/large release list must not turn the eight-JOIN bound into unbounded index reads.
+pub const OWED_MARKERLESS_INDEX_READS_PER_RECOMPUTE: usize = 128;
 
 /// PURE: the released outpoints the hops view does not hold, by the evicted txid that released them (the
 /// candidates [`markerless_released_hops`] judges; the route reads only these JOINs back).
@@ -856,6 +934,7 @@ pub fn unheld_released_by_eviction(
 ) -> Vec<(String, Vec<(String, u32)>)> {
     let held: HashSet<String> = hops
         .iter()
+        .filter(|h| h.marker_verified == MarkerVerification::Verified)
         .map(|h| outpoint_key(&h.hop_txid, h.hop_vout))
         .collect();
     let mut out: std::collections::BTreeMap<String, Vec<(String, u32)>> =
@@ -902,9 +981,16 @@ pub fn hop_outputs_from_join_beef(
     outpoints: &[(String, u32)],
 ) -> HashMap<String, (Vec<u8>, u64)> {
     let mut out = HashMap::new();
+    let Ok(mut parsed) = overlay_engine::beef_limits::parse_beef(
+        beef,
+        &overlay_engine::beef_limits::APP_BEEF_LIMITS,
+    ) else {
+        return out;
+    };
     for (txid, vout) in outpoints {
-        let Some(raw) =
-            crate::logic::extract_raw_tx_hex(beef, txid).and_then(|h| hex::decode(h).ok())
+        let Some(raw) = parsed
+            .find_txid_mut(&txid.to_ascii_lowercase())
+            .and_then(|t| t.raw_tx_or_compute())
         else {
             continue;
         };
@@ -923,7 +1009,7 @@ pub fn hop_outputs_from_join_beef(
     out
 }
 
-/// One of THIS identity's party rows in the `potparty_records_evicted` twin (the eviction moved it there with its
+/// One of THIS identity's party rows in the permanent twin or a late live filing (the eviction moved it with its
 /// pot): `sigValid = 1` (the identity's own signature and the seat signature under `seat_settle_pubkey`, both
 /// verified at admission), read with `identity = ?` by the route.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -943,6 +1029,7 @@ pub struct EvictedSeat {
 /// nothing for a hand the network refused. The released hop's owed row rests on the eviction ledger and the evicted
 /// twin's party row; the seat's hopparty marker names the hop faster, never alone.
 ///
+/// N1: the markerless sweep filing door still answers 425; the fire-and-forget press broadcasts unchanged.
 /// Keyed on the UTXO the ledger names, never a name: a released outpoint is mine only when (1) my own party row of
 /// that evicted JOIN (`seats`, `sigValid = 1`) names the settle key K, (2) the JOIN's twin lock committed K on exactly
 /// one seat (`twin_keys`, every row of the JOIN agreeing), and (3) the outpoint's output, read from the evicted JOIN's
@@ -961,6 +1048,7 @@ pub fn markerless_released_hops(
 ) -> Vec<HopEntry> {
     let held: HashSet<String> = hops
         .iter()
+        .filter(|h| h.marker_verified == MarkerVerification::Verified)
         .map(|h| outpoint_key(&h.hop_txid, h.hop_vout))
         .collect();
     let mut keys_by_txid: HashMap<String, Option<&crate::results::CommittedKeys>> = HashMap::new();
@@ -2288,7 +2376,7 @@ pub fn superseded_read_snapshot(stored: Option<OwedSnapshot>, own: OwedSnapshot)
     stored.unwrap_or_else(|| (superseded_fallback_rows(own.0), own.1, own.2, own.3))
 }
 
-pub const OWED_STATE_READ_SQL: &str = "SELECT identity, computedAtMs, tip, rows, stale, truncated FROM owed_state WHERE identity = ?1";
+pub const OWED_STATE_READ_SQL: &str = "SELECT s.identity, s.computedAtMs, s.tip, s.rows, s.stale, s.truncated, c.spendingTxid AS markerlessProgress FROM owed_state s LEFT JOIN hop_chain_probes c ON c.outpoint = 'homecursor:markerless:' || s.identity || '.0' WHERE s.identity = ?1";
 pub const OWED_ROWS_READ_SQL: &str = "SELECT identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason FROM owed_rows WHERE identity = ?1 ORDER BY CASE family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END, COALESCE(atHeight, 0) DESC, outpoint ASC LIMIT 501";
 /// HIGH-4: the tip flips the gate — every identity party to an UNSPENT pot whose recovery height the new tip has
 /// reached (a small band below it, so a missed block still lands) is marked STALE; its next read recomputes.
@@ -2298,7 +2386,7 @@ pub const OWED_STALE_ON_TIP_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE i
 /// EVICTED pot's row is gone; a released HOP is a P2PKH row) is attributed through the seats' OWN markers — the
 /// party rows naming the pot and the hop rows naming the hop — so an eviction re-derives both seats' owed rows at
 /// once instead of at the next cadence (up to 5 minutes, with a live Rejoin press on a hand the network refused).
-pub const OWED_ATTRIBUTE_BY_POT_SQL: &str = "SELECT DISTINCT identity FROM potparty_records WHERE potTxid = ?1 AND potVout = ?2";
+pub const OWED_ATTRIBUTE_BY_POT_SQL: &str = "SELECT DISTINCT identity FROM potparty_records WHERE potTxid = ?1 AND potVout = ?2 UNION SELECT identity FROM potparty_records_evicted WHERE potTxid = ?1 AND potVout = ?2";
 pub const OWED_ATTRIBUTE_BY_HOP_SQL: &str = "SELECT DISTINCT identity FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2";
 /// Fleet loop 15 (2026-09-20, the review's MED-2): the REFUND-BACKUP filing names the pot too (`idx_potrefund_pot`) —
 /// the one marker a seat killed at the funding still filed (its party marker never was), so a pot with no party
@@ -2316,7 +2404,7 @@ pub const OWED_STALE_FOR_POT_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE 
 pub const OWED_STALE_FOR_IDENTITY_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE identity = ?1";
 /// MEDIUM-5: the probe before a first-read compute — an identity with no party row and no hop row has nothing to
 /// derive and gets NO state row written (a public read must not write state keyed on a claimable name).
-pub const OWED_IDENTITY_PROBE_SQL: &str = "SELECT 1 AS present FROM potparty_records WHERE identity = ?1 UNION ALL SELECT 1 FROM hopparty_records WHERE identity = ?1 LIMIT 1";
+pub const OWED_IDENTITY_PROBE_SQL: &str = "SELECT 1 AS present FROM potparty_records WHERE identity = ?1 UNION ALL SELECT 1 FROM hopparty_records WHERE identity = ?1 UNION ALL SELECT 1 FROM potparty_records_evicted WHERE identity = ?1 LIMIT 1";
 /// HIGH-4: the read's staleness rule — a list with an OPEN row (anything but a confirmed payout) is re-derived after
 /// this age; any list after `OWED_RECOMPUTE_ANY_AFTER_MS` (a stranded hop crosses its window with no other trigger).
 pub const OWED_RECOMPUTE_OPEN_AFTER_MS: i64 = 5 * 60 * 1000;
@@ -2438,6 +2526,15 @@ pub fn note_sweep_proofs_read_fault() {
 /// for the pass) and no cursor (the ring is walked from its head). Always the safe direction, now counted: here
 /// for the isolate (`/health.owed.probeMemoReadFaults`) and in the overlay's `ops_counters` under
 /// [`COUNTER_PROBE_MEMO_READ_FAULTS`], served on the overlay's `/health/invariants.counters`.
+static MARKERLESS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
+static MARKERLESS_IGNORED_MARKERS: AtomicU64 = AtomicU64::new(0);
+pub fn note_markerless_read_fault() {
+    MARKERLESS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
+pub fn note_markerless_ignored_markers(n: usize) {
+    MARKERLESS_IGNORED_MARKERS.fetch_add(n as u64, Ordering::Relaxed);
+}
+
 static PROBE_MEMO_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub fn note_probe_memo_read_fault() {
     PROBE_MEMO_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
@@ -2595,6 +2692,8 @@ pub fn owed_health_json() -> Value {
         "potSpendersReadFaults": POT_SPENDERS_READ_FAULTS.load(Ordering::Relaxed),
         "hopSweepsReadFaults": HOP_SWEEPS_READ_FAULTS.load(Ordering::Relaxed),
         "sweepProofsReadFaults": SWEEP_PROOFS_READ_FAULTS.load(Ordering::Relaxed),
+        "markerlessReadFaults": MARKERLESS_READ_FAULTS.load(Ordering::Relaxed),
+        "markerlessIgnoredMarkers": MARKERLESS_IGNORED_MARKERS.load(Ordering::Relaxed),
         "probeMemoReadFaults": PROBE_MEMO_READ_FAULTS.load(Ordering::Relaxed),
         "sweepProofContradictions": SWEEP_PROOF_CONTRADICTIONS.load(Ordering::Relaxed),
         "spenderReadFaults": SPENDER_READ_FAULTS.load(Ordering::Relaxed),
@@ -4764,6 +4863,13 @@ pub(crate) mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         conn.execute_batch(OWED_ROWS_CREATE).unwrap();
         conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        conn.execute_batch(
+            bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
+                .iter()
+                .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS hop_chain_probes "))
+                .unwrap(),
+        )
+        .unwrap();
         let row = |outpoint: &str, family: OwedFamily| OwedRow {
             identity: ME.to_string(),
             outpoint: outpoint.to_string(),
@@ -5109,6 +5215,13 @@ pub(crate) mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         conn.execute_batch(OWED_ROWS_CREATE).unwrap();
         conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        conn.execute_batch(
+            bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
+                .iter()
+                .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS hop_chain_probes "))
+                .unwrap(),
+        )
+        .unwrap();
         let row = |outpoint: String, family: OwedFamily| OwedRow {
             identity: ME.to_string(),
             outpoint,
@@ -5609,6 +5722,13 @@ pub(crate) mod tests {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         conn.execute_batch(OWED_ROWS_CREATE).unwrap();
         conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        conn.execute_batch(
+            bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
+                .iter()
+                .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS hop_chain_probes "))
+                .unwrap(),
+        )
+        .unwrap();
         let row = |n: u8, family: OwedFamily, facts: Value| OwedRow {
             identity: ME.to_string(),
             outpoint: format!("{}:0", tx(n)),
@@ -5688,6 +5808,13 @@ pub(crate) mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         conn.execute_batch(OWED_ROWS_CREATE).unwrap();
         conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        conn.execute_batch(
+            bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
+                .iter()
+                .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS hop_chain_probes "))
+                .unwrap(),
+        )
+        .unwrap();
         let payout = OwedRow {
             identity: ME.to_string(),
             outpoint: format!("{}:0", tx(0x21)),
