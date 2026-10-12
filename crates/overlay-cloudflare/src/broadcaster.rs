@@ -2048,11 +2048,9 @@ pub fn admission_has_broadcaster_witness(terminal: Option<TerminalJudgement>) ->
     terminal.is_none()
 }
 
-/// Full-batch rung: preserve ancestor order, then submit the subject alone.
-fn full_batch_legs<'a>(
-    efs: &'a [EfTx],
-    subject_txid: &'a str,
-) -> impl DoubleEndedIterator<Item = &'a EfTx> {
+/// Index the full batch with ancestors before the subject; registration
+/// selects by input distance rather than by this dependency order.
+fn full_batch_legs<'a>(efs: &'a [EfTx], subject_txid: &'a str) -> impl Iterator<Item = &'a EfTx> {
     efs.iter()
         .filter(move |e| e.txid != subject_txid)
         .chain(efs.iter().filter(move |e| e.txid == subject_txid))
@@ -2131,8 +2129,7 @@ where
 {
     let budget = window
         .budget
-        .min(crate::ef_deferred::RUN_CORROBORATION_LEGS)
-        .max(1);
+        .clamp(1, crate::ef_deferred::RUN_CORROBORATION_LEGS);
     let ancestors = nearest_registration_legs(efs, subject_txid, budget);
     let mut skipped = efs
         .iter()
@@ -4397,7 +4394,7 @@ mod tests {
             let mut efs: Vec<_> = (0..n)
                 .map(|i| EfTx {
                     txid: format!("{i:064x}"),
-                    ef: arcreg_ef(&if i == 0 {
+                    ef: arcreg_ef(&if i == 0 || (n == 80 && i == 40) {
                         vec![]
                     } else {
                         vec![format!("{:064x}", i - 1)]
@@ -4406,7 +4403,11 @@ mod tests {
                 .collect();
             efs.push(EfTx {
                 txid: "subject".into(),
-                ef: arcreg_ef(&[format!("{:064x}", n - 1)]),
+                ef: arcreg_ef(&if n == 80 {
+                    vec![format!("{:064x}", 39), format!("{:064x}", 79)]
+                } else {
+                    vec![format!("{:064x}", n - 1)]
+                }),
             });
             let calls = std::cell::RefCell::new(Vec::new());
             let (out, skipped) = register_full_batch_with(
@@ -4435,10 +4436,13 @@ mod tests {
                 2 * budget + 1,
                 "bounded GET + POST + subject"
             );
-            assert_eq!(calls.borrow()[0], format!("GET {:064x}", n - 1));
+            assert_eq!(
+                calls.borrow()[0],
+                format!("GET {:064x}", if n == 80 { 39 } else { n - 1 })
+            );
             assert_eq!(
                 calls.borrow()[2 * (budget - 1)],
-                format!("GET {:064x}", n - budget)
+                format!("GET {:064x}", if n == 80 { 64 } else { n - budget })
             );
             assert_eq!(calls.borrow().last().unwrap(), "POST subject");
         }
@@ -4446,32 +4450,49 @@ mod tests {
 
     #[tokio::test]
     async fn arcreg_h1_subject_survives_every_ancestor_fault_or_timeout() {
-        let efs = vec![
-            EfTx {
-                txid: "a".repeat(64),
+        let ids: Vec<_> = (0..32).map(|i| format!("{i:064x}")).collect();
+        let mut efs: Vec<_> = ids
+            .iter()
+            .map(|id| EfTx {
+                txid: id.clone(),
                 ef: arcreg_ef(&[]),
-            },
-            EfTx {
-                txid: "subject".into(),
-                ef: arcreg_ef(&["a".repeat(64)]),
-            },
-        ];
+            })
+            .collect();
+        efs.push(EfTx {
+            txid: "subject".into(),
+            ef: arcreg_ef(&ids),
+        });
+        let ancestor_posts = std::cell::Cell::new(0);
         let subject_posts = std::cell::Cell::new(0);
         for timeout in [false, true] {
             let (out, _) = register_full_batch_with(
                 &efs,
                 "subject",
                 LegWindow::in_request(),
-                |_| async { None },
-                |_, _| async move {
+                |_| async move {
                     if timeout {
-                        assert!(overlay_engine::gasp::race_or_deadline(
-                            std::future::pending::<()>(),
+                        overlay_engine::gasp::race_or_deadline(
+                            std::future::pending::<Option<ArcadeStatusResponse>>(),
                             async {},
                         )
                         .await
-                        .is_none());
-                    } // transport failures / refusals are discarded by the production adapter
+                        .flatten()
+                    } else {
+                        None
+                    }
+                },
+                |_, _| {
+                    ancestor_posts.set(ancestor_posts.get() + 1);
+                    async move {
+                        if timeout {
+                            assert!(overlay_engine::gasp::race_or_deadline(
+                                std::future::pending::<()>(),
+                                async {},
+                            )
+                            .await
+                            .is_none());
+                        } // transport failures / refusals are discarded by the production adapter
+                    }
                 },
                 |_| {
                     subject_posts.set(subject_posts.get() + 1);
@@ -4482,6 +4503,7 @@ mod tests {
             assert!(out.is_ok());
         }
         assert_eq!(subject_posts.get(), 2);
+        assert_eq!(ancestor_posts.get(), 64);
     }
 
     #[tokio::test]

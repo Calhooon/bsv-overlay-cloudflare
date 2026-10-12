@@ -72,7 +72,7 @@ shape metadata. Both no-token and bad-token arms use it; their counters are
 unchanged. With two mismatching credentials, shape describes Authorization's
 Bearer candidate first, then X-CallbackToken; absent/malformed schemes have
 shape `other`, length 0. The auth classifier still compares both candidates.
-The pin covers a near-1-MiB body, huge status/UA, malformed headers, both
+The pin covers a 1-MiB body, huge status/UA, malformed headers, both
 shape words and absence of the credential's value.
 
 ## L3: terminal ancestor skip
@@ -85,3 +85,67 @@ ancestors are primed without registration. A mismatched terminal response
 is an unknown look, not permission to suppress a leg. The seam pin covers
 both terminal statuses, a known pending leg, a mismatched response and the
 subject still posted last.
+
+## NOTEs and register continuation
+
+N1: `register_full_batch_with` is the rung's transport seam. Behavioural
+pins exercise window counts, body/token dispatch selection, known/terminal
+statuses and reaching the subject. Source pins tie the seam to Worker Fetch,
+two-second deadlines, the actual per-leg token/body and the subject gate.
+The L1 echo/watch linkage remains a wiring plus source pin, the module's
+native-test shape; no native test claims to execute Worker Fetch.
+N2: the subject's existing per-ladder register-once guard is unchanged;
+probe faults can still re-register known txids, as before, within the cap.
+N3: the ci-route cell and Makefile are unchanged by this fold. The cell still
+reads the existing P4 worker log and pins ancestor auth, not live proof delivery.
+N4: both refusal arms use the bounded formatter; auth and refusal counters are unchanged.
+N5: `arc_ingest_unknown_txid_total` now also counts ancestors' registered
+MINED proof pushes for txids no topic holds, stated in its counter doc.
+The six new pins and the three existing arcreg pins are retained.
+
+## RED / GREEN evidence
+
+All mutations are in `~/bsv/ns2-arcreg-fold-neuter`, never the lane tree.
+The unmodified lane follows each RED run with GREEN.
+
+- H1: three seam pins RED with unlimited/wrong-order selection and subject
+  dispatch neutered; GREEN (100 and 80 ancestors, 300 under the run window,
+  both JOIN seats' nearest parents, ancestor faults/timeouts).
+- L1: rung-3 Pending/watch pin RED with subject body length changed to 2;
+  GREEN with length 1, `AcceptedPending`, no corroborations and watch armed.
+- L2: bounded-body/header pin and existing refusal-log pin RED with field
+  bounds and shape words neutered; GREEN with 1-MiB body and malformed header.
+- L3: terminal-ancestor pin RED with terminal skip neutered; GREEN for both
+  terminal statuses, a known pending ancestor and a mismatched identity.
+- Existing per-leg source and own-token pins: refreshed RED with dispatch
+  token and subject-last ordering neutered, then GREEN on the lane.
+
+D1 register text above is review §5 confirmed with the owner's window
+choice, terminal skip, bounded log/shape wording and pending-watch sentence.
+The captain owns LOW's register/design pickup and the light delta. No deploy
+or spend is part of this lane. Arcade's live windowed behaviour is unverified.
+
+## Final verification and owed work
+
+Changed Rust hunks formatted with rustfmt; package clippy `--all-targets -D warnings`
+GREEN. `cargo test --manifest-path workers/Cargo.toml -p bsv-overlay-cloudflare`
+GREEN: 713 passed, 1 pre-existing ignored stored-row export test (699 unit tests,
+90 broadcaster tests including the fold's pins, all nine arcreg pins).
+No Cargo.lock change. The wasm-bindgen belt CLI is 0.2.126, matching the lock.
+
+Route tier OWED: `uptime` at its actual gate was 24.46 (16:50 local), above
+24; neither `ci-d1-budget` nor `ci-route` started a worker. A prior 19.27
+reading was not used to bypass the fresh gate.
+
+Known constraint conflict: the unchanged ci-route cell creates a 77-character
+User-Agent and requires the entire value in the refusal log; L2 requires the
+log to cut it to 64. The existing assertion would therefore fail. The owner's
+instruction to leave the cell unchanged is respected; clarification was
+requested. A one-line fixture-only patch is prepared outside the tree at
+`/tmp/ns2-arcreg-ua64.patch` (13-character prefix + 51 random hex characters).
+Its JavaScript syntax check passed. The Makefile, tier, ports and cell remain
+unchanged. Approving that fixture change is needed before an all-GREEN route
+run; no native test substitutes for the owed route tier.
+
+Unverified: the captain's light delta and LOW register/design pickup;
+Arcade's live windowed registration; route behaviour (owed). No deploy or spend.
