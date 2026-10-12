@@ -1004,14 +1004,15 @@ pub async fn read_markerless_candidate(
 }
 
 /// Missing evidence cannot replace a row independently judged from other evidence for the same UTXO.
-/// Unverified/Unknown marker rows and older candidate faults may be replaced by the current fault sentence.
+/// Unverified/Unknown marker sentences without a claim and older candidate faults may be replaced.
 pub fn merge_markerless_faults(rows: &mut Vec<OwedRow>, faults: Vec<OwedRow>) {
     for fault in faults {
         if let Some(index) = rows.iter().position(|r| r.outpoint == fault.outpoint) {
-            let replace = matches!(
+            let replace = (matches!(
                 rows[index].facts["markerVerified"].as_str(),
                 Some("unknown" | "unverified")
-            ) || rows[index].facts["markerlessReadFault"] == true;
+            ) && rows[index].facts["claim"].is_null())
+                || rows[index].facts["markerlessReadFault"] == true;
             if !replace {
                 continue;
             }
