@@ -6,6 +6,8 @@
 
 ## 0.1.0 (prepared, unpublished)
 
+- bsv-rs 0.4.5 in both workspaces: the lone leaf at offset 0 only; the LOCAL work bound; no behavior change under the defaults.
+
 - Registry packages for `bsv-overlay-engine`, `bsv-overlay-discovery`,
   `bsv-low-proof-replay`, `bsv-worker-build-info` and `bsv-overlay-cloudflare`, in that dependency order.
 - Engine behavior is the e592 release at `engine-e592-2026-10-10`.

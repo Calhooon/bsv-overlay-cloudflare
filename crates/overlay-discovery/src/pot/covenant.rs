@@ -377,6 +377,7 @@ pub fn p2pkh_input_signed(
         input_sequence: input.sequence,
         lock_time: tx.lock_time,
         memory_limit: None,
+        work_limit: None,
     });
     matches!(spend.validate(), Ok(true))
 }
