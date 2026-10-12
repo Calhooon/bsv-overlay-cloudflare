@@ -161,3 +161,20 @@ rows read and two to four written at the beta fixture's shape. A bulk update
 multiplies that cost per affected row. The `/submit` fixture still measures 13
 writes against its unchanged 15-write ceiling. These lookup rows move the join
 cost to the source write; the write census must count that maintenance too.
+
+## #638 merged measurement (D1BD-M1/L3, 2026-10-12)
+
+On the branch rebased onto main `17418b1`, the complete merged fixture measures
+`/owed` first read at **331 rows read, 18 rows written, 30 statements**. The
+28-statement pin reds (30 > 28); the captain authorizes a reset to the measured
+**30**, with the 528-read and 20-write ceilings unchanged. Main's markerless
+reads and the branch's cursor/hydration statements are both present. The trade
+is #638's original **15,323 → 311** rows-read reduction (about fifty-fold) for
+two additional statements; with main's appended fixture and markerless reads,
+the measured merged tip is **331** rather than the branch-only 311.
+
+The same merged run measures `/results:view` 256 reads / 8 statements, served
+`/owed` 18 reads / 2 statements, detached `owed-recompute` max 216 over 24 walks,
+and 177 identical cursor/hydration pages, max 160/287 reads. Refund, recovery,
+and backup reads are 143, 401, and 10. These merged figures supersede the
+branch-only and inherited recorded baselines for this landing.
