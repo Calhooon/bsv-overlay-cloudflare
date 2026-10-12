@@ -2866,6 +2866,24 @@ async fn owed_recompute_inner(
             .filter(|r| r.facts.get("markerlessEvidence").is_some())
             .collect();
     }
+    #[derive(Deserialize)]
+    struct PreviousCandidateD1 {
+        txid: String,
+    }
+    let markerless_active: HashSet<String> = if markerless_previous.is_empty() {
+        HashSet::new()
+    } else {
+        db.prepare(crate::owed::MARKERLESS_PREVIOUS_CANDIDATES_SQL)
+            .bind(&[JsValue::from_str(identity_lc)])
+            .map_err(|e| markerless_fault(e.to_string()))?
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<PreviousCandidateD1>())
+            .map_err(|e| markerless_fault(e.to_string()))?
+            .into_iter()
+            .map(|r| r.txid)
+            .collect()
+    };
     worker::console_log!(
         "[owed] markerless candidates={}, examined={}, deferred={}, cursor={}",
         markerless_total,
@@ -2993,7 +3011,7 @@ async fn owed_recompute_inner(
                 let candidate = selected
                     .iter()
                     .find(|r| r.txid == *evicted)
-                    .expect("selected ledger's JOIN");
+                    .expect("candidate is in the page");
                 let evidence = crate::owed::read_markerless_candidate(
                     &mut reads,
                     identity_lc,
@@ -3740,11 +3758,7 @@ async fn owed_recompute_inner(
     let mut markerless_carried = 0;
     let current: HashSet<_> = rows.iter().map(|r| r.outpoint.clone()).collect();
     for mut r in markerless_previous {
-        if !current.contains(&r.outpoint)
-            && !selected
-                .iter()
-                .any(|c| r.facts["markerlessJoin"].as_str() == Some(c.txid.as_str()))
-        {
+        if crate::owed::markerless_should_carry(&r, &current, &selected, &markerless_active) {
             r.family = crate::owed::OwedFamily::Unbound;
             r.facts["claim"] = serde_json::Value::Null;
             r.facts["claimable"] = serde_json::json!(false);

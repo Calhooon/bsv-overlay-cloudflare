@@ -856,3 +856,75 @@ async fn l23_r2_delta_missing_beef_faults_one_candidate_and_keeps_other_rows() {
         "malformed bytes are the same candidate fault"
     );
 }
+
+#[test]
+fn l23_r2_delta_readmitted_or_unlatched_join_retires_its_carried_row() {
+    let db = Connection::open_in_memory().unwrap();
+    for sql in OVERLAY_MIGRATIONS {
+        if let Err(e) = db.execute_batch(sql) {
+            assert!(e.to_string().contains("duplicate column"), "{e}");
+        }
+    }
+    for i in 1..=10 {
+        let join = format!("{i:064x}");
+        db.execute("INSERT INTO potparty_records_evicted(identity,potTxid,sigValid,seatSettlePubkey) VALUES ('me',?1,1,'K')",[&join]).unwrap();
+        db.execute("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES (?1,'REJECTED',1000,'[]')",[&join]).unwrap();
+    }
+    let join = format!("{:064x}", 1);
+    let row = OwedRow {
+        identity: "me".into(),
+        outpoint: "hop:0".into(),
+        family: OwedFamily::Unbound,
+        game_id: "game".into(),
+        sats: None,
+        opponent_identity: None,
+        at_height: None,
+        facts: serde_json::json!({"markerlessEvidence":true,"markerlessJoin":join}),
+        reason: Some("could not judge".into()),
+    };
+    db.execute("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs) VALUES ('me','hop:0','unbound','game',?1,1000)",[row.facts.to_string()]).unwrap();
+    let active = || {
+        db.prepare(MARKERLESS_PREVIOUS_CANDIDATES_SQL)
+            .unwrap()
+            .query_map(["me"], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .unwrap()
+    };
+    let (selected, total) = markerless_plan(&read_candidates(&db, "me", &join));
+    assert_eq!(total, 10);
+    assert!(markerless_should_carry(
+        &row,
+        &Default::default(),
+        &selected,
+        &active()
+    ));
+    db.execute(
+        "UPDATE pot_evictions SET readmittedAt=2000 WHERE txid=?1",
+        [&join],
+    )
+    .unwrap();
+    assert_eq!(
+        markerless_plan(&read_candidates(&db, "me", &join)).1,
+        9,
+        "seat still exceeds eight candidates"
+    );
+    assert!(
+        !markerless_should_carry(&row, &Default::default(), &selected, &active()),
+        "readmitted JOIN retires on recompute"
+    );
+    db.execute(
+        "UPDATE pot_evictions SET readmittedAt=NULL WHERE txid=?1",
+        [&join],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE potparty_records_evicted SET sigValid=0 WHERE potTxid=?1",
+        [&join],
+    )
+    .unwrap();
+    assert!(
+        !markerless_should_carry(&row, &Default::default(), &selected, &active()),
+        "JOIN no longer belongs to signed candidate set"
+    );
+}
