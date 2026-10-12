@@ -32,3 +32,29 @@ skips are described below when folded. The pre-#640 batch was one POST.
 Pins use an injectable transport seam plus source checks connecting the seam,
 timeout adapters, body/token identity and subject gate to production.
 Arcade's live behaviour on this windowed registration remains unverified.
+
+## L1: rung-3 echo and D1 register text
+
+**Since #640 (2026-10-12, overlay `lane/ns-2-arcreg`): a callback's token
+is the txid of the ONE transaction its POST carries.** The ladder's
+full-batch rung (attempt 3, reached on an orphan view or an inconclusive
+pre-batch corroboration) posts at most 32 unproven ancestors per request,
+256 per consumer run, NEAREST the subject first, each alone to Arcade `/tx`
+under its own txid and registered only when Arcade's own status read does
+not hold it; their answers are discarded. Then it posts the subject alone
+under its own txid with the register-once rule unchanged. The `/txs` body
+that registered every ancestor under the SUBJECT's token is gone. The rest
+remain unregistered and counted; their proofs remain the backstop poll's
+and the couriers'. An ancestor's MINED push now arrives as its own: D6's
+`unknown_txid` ack for a hop, the stitch and `readmit_if_evicted` for a held
+pot, never a 401. The subject's rung-3 POST is a one-transaction body, so
+the echoed-status short-circuit applies there as on rungs 1 and 2 (under
+admit-fast an echoed Pending answers `AcceptedPending`, with the pending
+watch armed by the route). A witnessed acceptance keeps the two-witness bar
+for unproven ancestry. This confirms review §5 with the owner's 32/256 cap
+and nearest-first choice in place of its proposed pause or 128-leg tail.
+
+The L1 wiring pin drives rung 1 orphan → rung 3 echoed Pending →
+`AcceptedPending`, with zero corroborations. Source pins tie the real rung's
+one-transaction body to the echo fast return and the route's pending watch;
+the Worker Fetch runtime cannot run in native unit tests.
