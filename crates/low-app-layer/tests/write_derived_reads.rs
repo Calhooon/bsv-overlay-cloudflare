@@ -2,6 +2,9 @@
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use rusqlite::Connection;
 
+#[path = "support/d1_fleet.rs"]
+mod d1_fleet;
+
 #[test]
 fn hop_and_pot_writes_derive_links_and_seat_lookups_in_both_arrival_orders() {
     let db = Connection::open_in_memory().unwrap();
@@ -66,14 +69,20 @@ fn a_cold_start_does_not_rewalk_the_fleet_after_the_backfill() {
             assert!(e.to_string().contains("duplicate column"));
         }
     }
+    for row in d1_fleet::rows(1_790_000_000) {
+        d1_fleet::execute_row(&db, &row);
+    }
+    let mut scans = Vec::new();
     for sql in [
         bsv_overlay_cloudflare::derived_hops::LINKS_BACKFILL,
         bsv_overlay_cloudflare::derived_hops::SEATS_BACKFILL,
     ] {
         let mut stmt = db.prepare(sql).unwrap();
-        stmt.execute([]).unwrap();
-        assert_eq!(stmt.get_status(rusqlite::StatementStatus::FullscanStep), 0);
+        assert_eq!(stmt.execute([]).unwrap(), 0);
+        scans.push(stmt.get_status(rusqlite::StatementStatus::FullscanStep));
     }
+    println!("stamped populated replay fullscan steps: {scans:?}");
+    assert_eq!(scans, [0, 0], "stamped replay must skip both fleet scans");
     for sql in OVERLAY_MIGRATIONS {
         if let Err(e) = db.execute_batch(sql) {
             assert!(e.to_string().contains("duplicate column"), "{e}: {sql}");
@@ -113,5 +122,54 @@ fn a_changed_pot_drives_its_links_from_the_spender_index() {
     assert!(
         !details.iter().any(|s| s.starts_with("SCAN ")),
         "{details:?}"
+    );
+}
+
+#[test]
+fn populated_backfills_are_byte_identical_to_source_triggers() {
+    let db = Connection::open_in_memory().unwrap();
+    for sql in OVERLAY_MIGRATIONS {
+        if let Err(e) = db.execute_batch(sql) {
+            assert!(e.to_string().contains("duplicate column"), "{e}: {sql}");
+        }
+    }
+    for row in d1_fleet::rows(1_790_000_000) {
+        d1_fleet::execute_row(&db, &row);
+    }
+    let dump = |table: &str| {
+        let order = if table == "hop_pot_links" {
+            "5,3,4"
+        } else {
+            "1,2,3"
+        };
+        let mut stmt = db
+            .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
+            .unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |r| {
+            (0..columns)
+                .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
+    };
+    let links = dump("hop_pot_links");
+    let seats = dump("pot_hop_seats");
+    db.execute_batch(
+        "DELETE FROM hop_pot_links; DELETE FROM pot_hop_seats; DELETE FROM view_derivation_state;",
+    )
+    .unwrap();
+    db.execute_batch(bsv_overlay_cloudflare::derived_hops::LINKS_BACKFILL)
+        .unwrap();
+    db.execute_batch(bsv_overlay_cloudflare::derived_hops::SEATS_BACKFILL)
+        .unwrap();
+    assert_eq!(links, dump("hop_pot_links"));
+    assert_eq!(seats, dump("pot_hop_seats"));
+    println!(
+        "Leg B byte-identical: {} links, {} seats",
+        links.len(),
+        seats.len()
     );
 }
