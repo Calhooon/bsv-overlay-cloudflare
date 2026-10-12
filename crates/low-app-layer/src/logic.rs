@@ -641,7 +641,7 @@ pub fn decode_beef_hex(hex_str: &str) -> Option<Vec<u8>> {
 /// `?2` for the same reason. `rowid` is exposed as `markerRowid` (a
 /// compound subquery has no implicit rowid).
 pub fn party_candidates_sql() -> String {
-    format!(
+    String::from(
         "(SELECT identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, \
                  seatSettlePubkey, seatSigHex, sigHex, createdAt, rowid AS markerRowid, sigValid \
             FROM potparty_records WHERE identity = ?1 \
@@ -652,19 +652,10 @@ pub fn party_candidates_sql() -> String {
                  hp.seatSettlePubkey AS seatSettlePubkey, hp.seatSigHex AS seatSigHex, \
                  hp.identitySigHex AS sigHex, hp.createdAt AS createdAt, \
                  hp.rowid AS markerRowid, hp.markerValid AS sigValid \
-            FROM hopparty_records hp \
-            JOIN pot_records hop ON hop.txid = hp.txid AND hop.outputIndex = hp.hopVout \
-            JOIN pot_records pot ON pot.txid = lower(hop.spendingTxid) \
-                 AND pot.outputIndex = {vout} \
-           WHERE hp.identity = ?1 AND hp.markerValid = 1 \
-             AND hop.spent = 1 AND hop.spendingTxid IS NOT NULL \
-             AND pot.paramsDecoded = 1 AND pot.recoveryHeight IS NOT NULL \
-             AND pot.pubA IS NOT NULL AND pot.pubB IS NOT NULL \
-             AND hp.seatSettlePubkey IN (pot.pubA, pot.pubB) \
-             AND NOT EXISTS (SELECT 1 FROM potparty_records x \
-                              WHERE +x.identity = hp.identity \
-                                AND x.potTxid = pot.txid AND x.potVout = pot.outputIndex))",
-        vout = LEADERBOARD_POT_VOUT,
+            FROM hop_pot_links link \
+            JOIN hopparty_records hp ON hp.rowid = link.markerRowid \
+            JOIN pot_records pot ON pot.txid = link.potTxid AND pot.outputIndex = link.potVout \
+           WHERE link.identity = ?1)",
     )
 }
 
@@ -3688,7 +3679,7 @@ mod tests {
         // the numbered identity bind: one BIND, three `?1` placeholders.
         assert!(sql.contains("WHERE pp.identity = ?1"));
         assert!(
-            sql.contains("FROM hopparty_records hp"),
+            sql.contains("FROM hop_pot_links link"),
             "the hop-proven arm is present"
         );
         assert_eq!(sql.matches("?1").count(), 3, "identity bind reused thrice");

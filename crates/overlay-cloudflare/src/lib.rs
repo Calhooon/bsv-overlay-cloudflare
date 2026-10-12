@@ -18,6 +18,7 @@ pub mod d1;
 pub mod d1_ledger;
 pub mod d1_discovery;
 pub mod d1_storage;
+pub mod derived_hops;
 pub mod dead_letters;
 pub mod ef;
 pub mod ef_deferred;

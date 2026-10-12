@@ -420,7 +420,8 @@ mod tests {
             );
             assert!(
                 plan.iter()
-                    .any(|l| l.contains("SEARCH hp USING INDEX idx_hopparty_identity")),
+                    .any(|l| l
+                        .contains("SEARCH link USING INDEX idx_hop_pot_links_identity_created")),
                 "the hopparty arm is an identity-index search:\n{joined}"
             );
             assert!(

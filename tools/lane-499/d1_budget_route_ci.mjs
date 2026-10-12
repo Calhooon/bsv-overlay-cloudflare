@@ -60,8 +60,8 @@ const fail = (label, why) => {
 /** The figures of segment `name` in a Server-Timing value (the shape `d1_ledger::named_segment` writes). */
 function segment(header, name) {
   for (const seg of (header ?? '').split(',')) {
-    const m = seg.trim().match(new RegExp(`^${name};desc="reads=(\\d+) writes=(\\d+) stmts=(\\d+)"$`))
-    if (m) return { reads: Number(m[1]), writes: Number(m[2]), stmts: Number(m[3]) }
+    const m = seg.trim().match(new RegExp(`^${name};desc="reads=(\\d+) writes=(\\d+) stmts=(\\d+)(?: maxReads=(\\d+))?"$`))
+    if (m) return { reads: Number(m[1]), writes: Number(m[2]), stmts: Number(m[3]), maxReads: m[4] === undefined ? null : Number(m[4]) }
   }
   return null
 }
@@ -85,6 +85,8 @@ function check(name, got) {
     fail(`${name}: has a ceiling`, `no entry in ceilings.json (measured ${JSON.stringify(got)})`)
     return
   }
+  if (got.maxReads === null) fail(`${name}: per-statement rows-read figure`, 'maxReads absent')
+  else if (got.maxReads > (c.ceiling.maxReads ?? c.ceiling.reads)) fail(`${name}: per-statement rows-read ceiling`, `largest statement ${got.maxReads} > ${c.ceiling.maxReads ?? c.ceiling.reads}`)
   const over = ['reads', 'writes', 'stmts'].filter((k) => got[k] > c.ceiling[k])
   if (over.length === 0) pass(`${name}: reads ${got.reads}/${c.ceiling.reads}, writes ${got.writes}/${c.ceiling.writes}, stmts ${got.stmts}/${c.ceiling.stmts}`)
   else fail(`${name}: within its D1 ceiling`, over.map((k) => `${k} ${got[k]} > ${c.ceiling[k]}`).join(', ') + ` (${c.route})`)

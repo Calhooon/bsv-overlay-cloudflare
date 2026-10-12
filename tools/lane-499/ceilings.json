@@ -40,7 +40,8 @@
       "ceiling": {
         "reads": 287,
         "writes": 0,
-        "stmts": 8
+        "stmts": 8,
+        "maxReads": 287
       },
       "censusKey": "/results:view"
     },
@@ -68,7 +69,8 @@
       "ceiling": {
         "reads": 528,
         "writes": 20,
-        "stmts": 28
+        "stmts": 28,
+        "maxReads": 528
       },
       "censusKey": "/owed"
     },

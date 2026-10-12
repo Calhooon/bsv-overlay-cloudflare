@@ -4603,7 +4603,7 @@ async fn gather_result_entries(
     // The fund-time fallback: a seat whose end-of-hand potparty marker never
     // landed still published the same committed key at hop time. Best-effort —
     // an empty map is exactly the previous behaviour.
-    let hop_markers = results_hop_seat_markers(db, &params_by_pot).await;
+    let hop_markers = results_hop_seat_markers(db, &params_by_pot, &rows).await;
     // Brain-cutover M2: the published hand markers for this page's games —
     // the read the CLIENT used to make against `ls_hand` (plus an ECDSA per
     // row on its main thread, #401). BEST-EFFORT with the same discipline as
@@ -4881,6 +4881,7 @@ async fn results_hand_markers(
 async fn results_hop_seat_markers(
     db: &worker::D1Database,
     params_by_pot: &std::collections::HashMap<(String, u32), crate::results::CovenantParams>,
+    source_rows: &[crate::results::ResultsRow],
 ) -> std::collections::HashMap<(String, u32), Vec<crate::results::HopSeatRow>> {
     let mut out: std::collections::HashMap<(String, u32), Vec<crate::results::HopSeatRow>> =
         std::collections::HashMap::new();
@@ -4889,43 +4890,70 @@ async fn results_hop_seat_markers(
     }
     let mut keys: Vec<&(String, u32)> = params_by_pot.keys().collect();
     keys.sort_unstable();
-    for chunk in keys.chunks(crate::results::SEAT_MARKERS_CHUNK_POTS) {
-        let sql = crate::results::hop_seat_markers_sql(chunk.len());
-        let mut binds: Vec<JsValue> =
-            Vec::with_capacity(chunk.len() * crate::results::HOP_SEAT_BINDS_PER_POT);
-        for k in chunk {
-            let p = &params_by_pot[*k];
-            binds.push(JsValue::from_str(&hex::encode(p.pub_a)));
-            binds.push(JsValue::from_str(&hex::encode(p.pub_b)));
-        }
-        let Ok(stmt) = db.prepare(&sql).bind(&binds) else {
-            continue;
-        };
-        match stmt.counted_all().await.and_then(|r| r.results::<HopSeatRowD1>()) {
-            Ok(rows) => {
-                let hops: Vec<crate::results::HopSeatRow> = rows
-                    .into_iter()
-                    .map(|r| crate::results::HopSeatRow {
-                        identity: r.identity,
-                        seat_settle_pubkey: r.seat_settle_pubkey,
-                        marker_valid: r.marker_valid.map(|v| v != 0.0),
-                        txid: r.txid,
-                        hop_vout: r.hop_vout.map_or(0, |v| v as u32),
-                        hop_sats: r.hop_sats.map(|v| v as u64),
-                        size_bytes: r.size_bytes.map(|v| v as u64),
-                        fee_sats: r.fee_sats.map(|v| v as u64),
-                    })
-                    .collect();
-                // Every pot in the chunk gets the chunk's rows; the committed-key
-                // match inside `fill_seats_from_hop_markers` decides which apply.
-                for k in chunk {
-                    out.entry((*k).clone())
-                        .or_default()
-                        .extend(hops.iter().cloned());
+    let legacy: std::collections::HashSet<(String, u32)> = source_rows
+        .iter()
+        .filter(|r| r.pub_a.is_none() || r.pub_b.is_none())
+        .map(|r| (r.pot_txid.to_ascii_lowercase(), r.pot_vout))
+        .collect();
+    for use_legacy in [false, true] {
+        let group: Vec<_> = keys
+            .iter()
+            .copied()
+            .filter(|k| legacy.contains(*k) == use_legacy)
+            .collect();
+        for chunk in group.chunks(crate::results::SEAT_MARKERS_CHUNK_POTS) {
+            let sql = if use_legacy {
+                crate::results::legacy_hop_seat_markers_sql(chunk.len())
+            } else {
+                crate::results::hop_seat_markers_sql(chunk.len())
+            };
+            let mut binds: Vec<JsValue> =
+                Vec::with_capacity(chunk.len() * crate::results::HOP_SEAT_BINDS_PER_POT);
+            for k in chunk {
+                if use_legacy {
+                    let p = &params_by_pot[*k];
+                    binds.push(JsValue::from_str(&hex::encode(p.pub_a)));
+                    binds.push(JsValue::from_str(&hex::encode(p.pub_b)));
+                } else {
+                    binds.push(JsValue::from_str(&k.0));
+                    binds.push(JsValue::from_f64(f64::from(k.1)));
                 }
             }
-            Err(e) => {
-                console_warn!("[results] hop seat fallback query failed (binding unchanged): {e}");
+            let Ok(stmt) = db.prepare(&sql).bind(&binds) else {
+                continue;
+            };
+            match stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<HopSeatRowD1>())
+            {
+                Ok(rows) => {
+                    let hops: Vec<crate::results::HopSeatRow> = rows
+                        .into_iter()
+                        .map(|r| crate::results::HopSeatRow {
+                            identity: r.identity,
+                            seat_settle_pubkey: r.seat_settle_pubkey,
+                            marker_valid: r.marker_valid.map(|v| v != 0.0),
+                            txid: r.txid,
+                            hop_vout: r.hop_vout.map_or(0, |v| v as u32),
+                            hop_sats: r.hop_sats.map(|v| v as u64),
+                            size_bytes: r.size_bytes.map(|v| v as u64),
+                            fee_sats: r.fee_sats.map(|v| v as u64),
+                        })
+                        .collect();
+                    // Every pot in the chunk gets the chunk's rows; the committed-key
+                    // match inside `fill_seats_from_hop_markers` decides which apply.
+                    for k in chunk {
+                        out.entry((*k).clone())
+                            .or_default()
+                            .extend(hops.iter().cloned());
+                    }
+                }
+                Err(e) => {
+                    console_warn!(
+                        "[results] hop seat fallback query failed (binding unchanged): {e}"
+                    );
+                }
             }
         }
     }
@@ -8865,3 +8893,7 @@ mod e606_tests {
         assert_eq!(held(), (1, w));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/served_bodies.rs"]
+mod ns2_d1bound_compat;

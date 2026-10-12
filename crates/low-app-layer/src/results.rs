@@ -670,32 +670,19 @@ pub fn fill_seats_from_hop_markers(
     }
 }
 
-/// Binds per pot for [`hop_seat_markers_sql`]: (pubA, pubB).
+/// Binds per pot for [`hop_seat_markers_sql`]: (potTxid, potVout).
 pub const HOP_SEAT_BINDS_PER_POT: usize = 2;
 
-/// Fetch hop seat markers for `pots` pots, filtered to each pot's OWN
-/// COMMITTED settle keys — the same F2 shape [`seat_markers_sql`] uses, and
-/// for the same reason: the lock is the authority, so a row naming a key the
-/// pot never committed is never even loaded.
-///
-/// Filtering by the committed keys is also implicitly GAME-SCOPED: a seat
-/// settle key is derived per (seat, gameId), so it cannot collide across
-/// games — which is why this needs no gameId bind and works even for a pot
-/// whose potparty markers are entirely absent.
+/// Fetch the seat markers derived for each decoded pot at its source writes.
 pub fn hop_seat_markers_sql(pots: usize) -> String {
-    let mut sql = String::from(
-        "SELECT identity AS identity, seatSettlePubkey AS seatSettlePubkey, \
-                markerValid AS markerValid, txid AS txid, hopVout AS hopVout, \
-                hopSats AS hopSats, sizeBytes AS sizeBytes, feeSats AS feeSats \
-         FROM hopparty_records WHERE ",
-    );
-    for i in 0..pots {
-        if i > 0 {
-            sql.push_str(" OR ");
-        }
-        sql.push_str("seatSettlePubkey IN (?, ?)");
-    }
-    sql
+    let pairs = vec!["(seat.potTxid = ? AND seat.potVout = ?)"; pots].join(" OR ");
+    format!("SELECT DISTINCT hp.identity AS identity, hp.seatSettlePubkey AS seatSettlePubkey, hp.markerValid AS markerValid, hp.txid AS txid, hp.hopVout AS hopVout, hp.hopSats AS hopSats, hp.sizeBytes AS sizeBytes, hp.feeSats AS feeSats FROM pot_hop_seats seat JOIN hopparty_records hp ON hp.rowid = seat.markerRowid WHERE {pairs}")
+}
+
+/// Legacy pots without stored keys retain their indexed key lookup until decoded backfill lands.
+pub fn legacy_hop_seat_markers_sql(pots: usize) -> String {
+    let pairs = vec!["seatSettlePubkey IN (?, ?)"; pots].join(" OR ");
+    format!("SELECT identity AS identity, seatSettlePubkey AS seatSettlePubkey, markerValid AS markerValid, txid AS txid, hopVout AS hopVout, hopSats AS hopSats, sizeBytes AS sizeBytes, feeSats AS feeSats FROM hopparty_records WHERE {pairs}")
 }
 
 /// bsv-low P4 slice 2: one tx's money facts as served — size and exact fee,
@@ -6840,7 +6827,7 @@ mod courier_ladder_2026_09_04 {
         }
         for needle in [
             "SEARCH potparty_records USING INDEX idx_potparty_identity",
-            "SEARCH hp USING INDEX idx_hopparty_identity",
+            "SEARCH link USING INDEX idx_hop_pot_links_identity_created",
             "SEARCH r USING INDEX sqlite_autoindex_pot_records_1 (txid=? AND outputIndex=?)",
         ] {
             assert!(
