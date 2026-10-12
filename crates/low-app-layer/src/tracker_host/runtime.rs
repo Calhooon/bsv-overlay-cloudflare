@@ -53,9 +53,6 @@ pub fn decorate(value: &mut Value, subject: Option<&str>, views: &BTreeMap<Strin
             .cloned()
             .unwrap_or_else(|| super::served::fields(&State::new(id)));
         if let Some(obj) = value.as_object_mut() {
-            for k in ["word", "tier", "verifyPath"] {
-                obj.insert(k.into(), f[k].clone());
-            }
             obj.insert("tracker".into(), f);
         }
     }
@@ -247,7 +244,7 @@ pub async fn event(
         });
     if matches!(kind, "fallback" | "tick") && !first_party && legacy.is_none() {
         let (observation, absence, claimed_height) =
-            crate::routes::tx_any_external_leg(txid, "tracker-write").await;
+            crate::routes::tx_any_external_leg(txid, "tracker-write", env).await;
         let mut answer = crate::txany::decide_tx_any(None, None, Some(&observation), absence);
         answer.claimed_height = claimed_height;
         legacy = Some(crate::txany::tx_any_body(txid, &answer));
@@ -377,33 +374,8 @@ pub async fn ingest(
 /// Batch reads include stored foreign words even after the byte index has
 /// dropped them. Unknown ids keep the existing batch fallback contract.
 pub async fn batch_body(env: &worker::Env, raw: &str, ids: &[String]) -> worker::Result<String> {
-    let mut value: Value = serde_json::from_str(raw)?;
+    let value: Value = serde_json::from_str(raw)?;
     let rows = stored::read(env, ids).await?;
-    for (id, row) in &rows {
-        let answer = row
-            .legacy_body
-            .as_ref()
-            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-            .unwrap_or_else(|| {
-                crate::txany::tx_any_value(
-                    id,
-                    &crate::txany::TxAnyAnswer {
-                        present: matches!(row.word.as_str(), "announced" | "seen" | "mined")
-                            .then_some(true),
-                        confirmed: Some(row.word == "mined"),
-                        height: row.height.map(|h| h as u64),
-                        ..Default::default()
-                    },
-                )
-            });
-        value["answers"][id] = answer;
-    }
-    if let Some(unknown) = value["unknown"].as_array_mut() {
-        unknown.retain(|id| !id.as_str().is_some_and(|id| rows.contains_key(id)));
-    }
-    if let Some(reasons) = value["reasons"].as_object_mut() {
-        reasons.retain(|id, _| !rows.contains_key(id));
-    }
     body_loaded(env, value, None, rows).await
 }
 

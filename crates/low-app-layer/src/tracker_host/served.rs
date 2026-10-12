@@ -26,7 +26,7 @@ pub fn fields(state: &State) -> Value {
         .iter()
         .map(|h| json!({"source":h.source,"status":format!("{:?}",h.status),"observed":h.observed}))
         .collect();
-    let mut v = json!({"word":word,"tier":tier,"height":state.word().height(),"verifyPath":verify,"suspect":state.suspect(),"hints":hints});
+    let mut v = json!({"word":word,"tier":tier,"height":state.word().height(),"verifyPath":verify,"source":state.hints().first().map(|h| &h.source),"at":state.hints().first().map(|h| h.observed),"suspect":state.suspect(),"hints":hints});
     match state.word() {
         Word::Rejected { reason } => v["reason"] = json!(reason),
         Word::Conflicted { competitors } => v["competitors"] = json!(competitors),
@@ -36,13 +36,10 @@ pub fn fields(state: &State) -> Value {
 }
 
 /// Preserve every legacy field and type. `tracker` is the complete tuple;
-/// top-level word/tier/verifyPath are convenient additive projections.
+/// main owns every legacy top-level field.
 pub fn transaction(value: &mut Value, state: &State) {
     let f = fields(state);
     if let Some(obj) = value.as_object_mut() {
-        for key in ["word", "tier", "verifyPath"] {
-            obj.insert(key.into(), f[key].clone());
-        }
         obj.insert("tracker".into(), f);
     }
 }

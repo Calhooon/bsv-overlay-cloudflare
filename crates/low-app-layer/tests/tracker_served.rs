@@ -36,9 +36,9 @@ fn ns3_captured_tx_body_preserves_old_fields_and_badges_only_checked_state() {
     for (key, value) in before.as_object().unwrap() {
         assert_eq!(&after[key], value);
     }
-    assert_eq!(after["word"], "seen");
-    assert_eq!(after["tier"], "hint");
-    assert!(after["verifyPath"].is_null());
+    assert_eq!(after["tracker"]["word"], "seen");
+    assert_eq!(after["tracker"]["tier"], "hint");
+    assert!(after["tracker"]["verifyPath"].is_null());
     // Finding: the old courier flag says confirmed, the tracker says seen.
     assert_eq!(after["confirmed"], true);
     s.step(
@@ -50,9 +50,9 @@ fn ns3_captured_tx_body_preserves_old_fields_and_badges_only_checked_state() {
     )
     .unwrap();
     served::transaction(&mut after, &s);
-    assert_eq!(after["word"], "mined");
+    assert_eq!(after["tracker"]["word"], "mined");
     assert_eq!(after["tracker"]["height"], 10);
-    assert_eq!(after["verifyPath"]["root"], id);
+    assert_eq!(after["tracker"]["verifyPath"]["root"], id);
 }
 #[test]
 fn ns3_spender_fields_use_spender_subject_and_keep_legacy_body() {
@@ -78,7 +78,7 @@ fn ns3_route_body_boundary_adds_words_to_single_batch_and_spenders() {
         &Default::default(),
     ))
     .unwrap();
-    assert_eq!(single["word"], "unknown");
+    assert_eq!(single["tracker"]["word"], "unknown");
     assert_eq!(single["confirmed"], true);
     let batch =
         json!({"answers":{id.clone():{"height":null}},"rows":[{"facts":{"spendingTxid":id}}]});

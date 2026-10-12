@@ -52,7 +52,7 @@ impl Row {
         } else {
             Value::Null
         };
-        json!({"word":self.word,"tier":self.tier,"height":self.height.map(|h| h as u32),"verifyPath":verify,"hintSource":self.hint_source,"hintAt":self.hint_at.map(|t| t as u64)})
+        json!({"word":self.word,"tier":self.tier,"height":self.height.map(|h| h as u32),"verifyPath":verify,"source":self.hint_source,"at":self.hint_at.map(|t| t as u64)})
     }
     /// One retained proof seeds a fresh State against its recorded snapshot;
     /// the only current evidence input is Recheck. No historical input replay.
@@ -91,8 +91,8 @@ impl Row {
             .step(&params, current, Input::Evidence(Evidence::Recheck))
             .err();
         let mut view = served::fields(&state);
-        view["hintSource"] = json!(self.hint_source);
-        view["hintAt"] = json!(self.hint_at.map(|t| t as u64));
+        view["source"] = json!(self.hint_source);
+        view["at"] = json!(self.hint_at.map(|t| t as u64));
         if let Some(e) = fault {
             view["verifyPath"] = Value::Null;
             view["cannotCheck"] = json!(e.to_string());

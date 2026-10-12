@@ -7643,30 +7643,8 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         return json_error("invalid txid (expect 64 hex chars)", 400);
     }
     let key = txid.to_ascii_lowercase();
-    let mut stored =
+    let stored =
         crate::tracker_host::stored::read(&ctx.env, std::slice::from_ref(&key)).await?;
-    if let Some(row) = stored.remove(&key) {
-        let legacy = match row.legacy_body.clone() {
-            Some(body) => body,
-            None => {
-                let (raw, _) = tx_any_index_leg(&ctx, &key).await;
-                let answer = TxAnyCached {
-                    raw_hex: raw,
-                    present: matches!(row.word.as_str(), "announced" | "seen" | "mined")
-                        .then_some(true),
-                    confirmed: Some(row.word == "mined"),
-                    height: row.height.map(|h| h as u64),
-                    ..Default::default()
-                };
-                crate::txany::tx_any_body(&key, &answer)
-            }
-        };
-        let mut value = serde_json::from_str(&legacy)?;
-        let rows = std::collections::BTreeMap::from([(key.clone(), row)]);
-        let views = crate::tracker_host::runtime::views(&ctx.env, &rows).await;
-        crate::tracker_host::runtime::decorate(&mut value, Some(&key), &views);
-        return json_response(value.to_string(), 200);
-    }
     let now = worker::Date::now().as_millis() as f64;
     let answer = match tx_any_cached(&key, now) {
         Some(a) => a,
@@ -7676,11 +7654,12 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         }
     };
     let legacy = crate::txany::tx_any_body(&key, &answer);
-    let row =
-        crate::tracker_host::runtime::event(&ctx.env, &key, "fallback", None, Some(legacy.clone()))
-            .await?;
+    let mut rows = stored;
+    if !rows.contains_key(&key) {
+        let row = crate::tracker_host::runtime::event(&ctx.env, &key, "fallback", None, Some(legacy.clone())).await?;
+        rows.insert(key.clone(), row);
+    }
     let mut value = serde_json::from_str(&legacy)?;
-    let rows = std::collections::BTreeMap::from([(key.clone(), row)]);
     let views = crate::tracker_host::runtime::views(&ctx.env, &rows).await;
     crate::tracker_host::runtime::decorate(&mut value, Some(&key), &views);
     json_response(value.to_string(), 200)

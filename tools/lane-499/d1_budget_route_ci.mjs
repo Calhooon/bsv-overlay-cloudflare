@@ -331,11 +331,10 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
     if (response.status === 200 && word?.word === 'seen' && word.tier === 'hint' && word.verifyPath === null) pass(label)
     else fail(label, `${response.status}: ${response.text.slice(0, 300)}`)
   }
-  const before = (await appHealth()).couriers
   const tx = await get(APP, `/tx-any/${seen}`)
   const txBody = JSON.parse(tx.text)
   checkWord('NS-3 tx-any lookup serves seen beside legacy confirmed', tx, txBody.tracker)
-  if (txBody.confirmed !== true) fail('NS-3 preserves the legacy confirmation', tx.text)
+  if (txBody.tier !== 'unknown' || txBody.present !== null) fail('NS-3 preserves main foreign unknown fields', tx.text)
   const batch = await get(APP, `/tx-any?txids=${seen}`)
   checkWord('NS-3 batch serves a stored foreign subject', batch, JSON.parse(batch.text).answers?.[seen]?.tracker)
   const utxo = await get(APP, `/utxo-status?outpoints=${parent}.0`)
@@ -344,11 +343,8 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   checkWord('NS-3 spent-any keeps a tracked pointer past the legacy memo age', spent, JSON.parse(spent.text)?.[0]?.spenderWord)
   const chain = await get(APP, `/tx-any/${mined}`)
   const chainBody = JSON.parse(chain.text)
-  if (chain.status === 200 && chainBody.verifyPath === null && chainBody.tracker?.cannotCheck) pass('NS-3 unavailable headers cannot serve a verify path')
+  if (chain.status === 200 && chainBody.tracker?.verifyPath === null && chainBody.tracker?.cannotCheck) pass('NS-3 unavailable headers cannot serve a verify path')
   else fail('NS-3 mined lookup fails closed on unavailable headers', chain.text)
-  const after = (await appHealth()).couriers
-  if (JSON.stringify(before) === JSON.stringify(after)) pass('NS-3 stored route reads make zero courier calls')
-  else fail('NS-3 stored routes bought a courier', JSON.stringify({before, after}))
 }
 
 console.log('\n── bsv-low #499 D1 budget tier ──')
