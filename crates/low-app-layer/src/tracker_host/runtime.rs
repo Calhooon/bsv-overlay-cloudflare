@@ -130,7 +130,7 @@ pub async fn views(env: &worker::Env, rows: &BTreeMap<String, Row>) -> BTreeMap<
         .collect()
 }
 pub async fn body(env: &worker::Env, raw: &str, subject: Option<&str>) -> worker::Result<String> {
-    let mut value: Value =
+    let value: Value =
         serde_json::from_str(raw).map_err(|e| worker::Error::RustError(e.to_string()))?;
     let mut ids = BTreeSet::new();
     subjects(&value, &mut ids);
@@ -138,11 +138,25 @@ pub async fn body(env: &worker::Env, raw: &str, subject: Option<&str>) -> worker
         ids.insert(id.into());
     }
     let ids: Vec<_> = ids.into_iter().collect();
-    let mut rows = stored::read(env, &ids).await?;
+    let rows = stored::read(env, &ids).await?;
+    body_loaded(env, value, subject, rows).await
+}
+pub async fn body_loaded(
+    env: &worker::Env,
+    mut value: Value,
+    subject: Option<&str>,
+    mut rows: BTreeMap<String, Row>,
+) -> worker::Result<String> {
+    let mut ids = BTreeSet::new();
+    subjects(&value, &mut ids);
+    if let Some(id) = subject {
+        ids.insert(id.into());
+    }
+
     for id in ids {
-        if !rows.contains_key(&id) {
-            let row = event(env, &id, "fallback", None, None).await?;
-            rows.insert(id, row);
+        if let std::collections::btree_map::Entry::Vacant(entry) = rows.entry(id) {
+            let row = event(env, entry.key(), "fallback", None, None).await?;
+            entry.insert(row);
         }
     }
     let views = views(env, &rows).await;
@@ -189,6 +203,12 @@ pub async fn event(
     legacy: Option<String>,
 ) -> worker::Result<Row> {
     let old = stored::read(env, &[txid.into()]).await?.remove(txid);
+    if kind == "fallback" {
+        if let Some(old) = old {
+            return Ok(old);
+        }
+    }
+    let mut legacy = legacy;
     let mut state = stored::seed_hint(old.as_ref(), txid);
     let params = Params { age_threshold: 60 };
     let empty = HeaderSnapshot {
@@ -196,9 +216,45 @@ pub async fn event(
         headers: Default::default(),
     };
     let now = super::WorkerClock.now();
+    if kind == "tick" || kind == "retire" {
+        state
+            .step(&params, &empty, Input::Host(HostAction::Tick(now)))
+            .expect("clock input");
+    }
+    if kind == "tick"
+        && matches!(
+            state.word(),
+            bsv_tracker::Word::Unknown | bsv_tracker::Word::Built
+        )
+    {
+        state
+            .step(&params, &empty, Input::Host(HostAction::SpendAttempt))
+            .expect("owed input reask");
+    }
     let (held, proof) = held_proof(env, txid).await?;
+    let first_party = held
+        || matches!(kind, "submit" | "accepted" | "seen")
+        || old.as_ref().is_some_and(|row| {
+            row.hint_source.as_deref() == Some("arcade")
+                || row.word == "built"
+                || row
+                    .legacy_body
+                    .as_ref()
+                    .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                    .is_some_and(|body| {
+                        matches!(body["source"].as_str(), Some("index" | "index+external"))
+                    })
+        });
+    if matches!(kind, "fallback" | "tick") && !first_party && legacy.is_none() {
+        let (observation, absence, claimed_height) =
+            crate::routes::tx_any_external_leg(txid, "tracker-write").await;
+        let mut answer = crate::txany::decide_tx_any(None, None, Some(&observation), absence);
+        answer.claimed_height = claimed_height;
+        legacy = Some(crate::txany::tx_any_body(txid, &answer));
+    }
     if (held
         || kind == "seen"
+        || kind == "accepted"
         || legacy.as_ref().is_some_and(|s| {
             serde_json::from_str::<Value>(s)
                 .ok()
@@ -209,6 +265,15 @@ pub async fn event(
         state
             .step(&params, &empty, Input::Host(HostAction::Build))
             .expect("host input");
+    }
+    if kind == "accepted" {
+        state
+            .step(
+                &params,
+                &empty,
+                Input::Hint(Hint::new("arcade", HintStatus::Accepted, now)),
+            )
+            .expect("admission hint input");
     }
     if kind == "seen" {
         state
@@ -222,7 +287,7 @@ pub async fn event(
     let arc = crate::routes::arcade_url();
     // Public callback is a trigger; live GET owns its hint. A callback's
     // merkle path is independently checked evidence even if GET faults.
-    if held || kind != "fallback" {
+    if first_party || kind == "callback" {
         if let Some((200, bytes)) =
             crate::routes::provider_get("tracker-write", &format!("{arc}/tx/{txid}")).await
         {
@@ -233,7 +298,7 @@ pub async fn event(
             }
         }
     }
-    if kind == "fallback" {
+    if matches!(kind, "fallback" | "tick") {
         if let Some(value) = legacy
             .as_ref()
             .and_then(|s| serde_json::from_str::<Value>(s).ok())
@@ -273,7 +338,7 @@ pub async fn event(
     if !checked && (kind == "fallback" || state.reask().is_some()) {
         let proof = super::execute_reask(
             txid,
-            held,
+            first_party,
             &arc,
             &Reask::Age,
             |url| async move { crate::routes::provider_get("tracker-write", &url).await },
@@ -307,4 +372,46 @@ pub async fn ingest(
     let kind = frame["kind"].as_str().unwrap_or("refresh");
     event(env, &id, kind, frame.get("body"), None).await?;
     worker::Response::from_json(&json!({"ok":true}))
+}
+
+/// Batch reads include stored foreign words even after the byte index has
+/// dropped them. Unknown ids keep the existing batch fallback contract.
+pub async fn batch_body(env: &worker::Env, raw: &str, ids: &[String]) -> worker::Result<String> {
+    let mut value: Value = serde_json::from_str(raw)?;
+    let rows = stored::read(env, ids).await?;
+    for (id, row) in &rows {
+        let answer = row
+            .legacy_body
+            .as_ref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .unwrap_or_else(|| {
+                crate::txany::tx_any_value(
+                    id,
+                    &crate::txany::TxAnyAnswer {
+                        present: matches!(row.word.as_str(), "announced" | "seen" | "mined")
+                            .then_some(true),
+                        confirmed: Some(row.word == "mined"),
+                        height: row.height.map(|h| h as u64),
+                        ..Default::default()
+                    },
+                )
+            });
+        value["answers"][id] = answer;
+    }
+    if let Some(unknown) = value["unknown"].as_array_mut() {
+        unknown.retain(|id| !id.as_str().is_some_and(|id| rows.contains_key(id)));
+    }
+    if let Some(reasons) = value["reasons"].as_object_mut() {
+        reasons.retain(|id, _| !rows.contains_key(id));
+    }
+    body_loaded(env, value, None, rows).await
+}
+
+/// Host pacing for the owed WRITE event. Chain words are never age-polled.
+/// The tracker decides the resulting Reask from Tick/SpendAttempt inputs.
+pub fn owed_reask_due(row: &Row, now: u64) -> bool {
+    matches!(
+        row.word.as_str(),
+        "unknown" | "built" | "announced" | "seen"
+    ) && now.saturating_sub(row.updated_at as u64) >= 60
 }

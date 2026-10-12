@@ -1601,6 +1601,7 @@ async fn submit_parts(
                 }
             }
             Ok(crate::broadcaster::ArcOutcome::AcceptedPending(pending)) => {
+                crate::tracker_events::note(&subject_txid, "accepted", None);
                 // #397 / admit-fast step 3 (2026-09-15): the subject is
                 // admitted on Arcade's SYNCHRONOUS validation — under
                 // `ADMIT_FAST` for EVERY gated subject (the fast answer: the
@@ -2229,7 +2230,11 @@ async fn submit_parts(
         }
     }
 
-    if let Some(txid) = crate::beef_limits::parse_beef(&tagged_beef.beef, &crate::beef_limits::EF_BEEF_LIMITS).ok().and_then(|mut beef| crate::ef::subject_txid_of(&mut beef)) {
+    if let Some(txid) =
+        crate::beef_limits::parse_beef(&tagged_beef.beef, &crate::beef_limits::EF_BEEF_LIMITS)
+            .ok()
+            .and_then(|mut beef| crate::ef::subject_txid_of(&mut beef))
+    {
         crate::tracker_events::note(&txid, "submit", None);
     }
     // Mainnet SHIP fan-out — discover tm_X peers via SLAP trackers and POST

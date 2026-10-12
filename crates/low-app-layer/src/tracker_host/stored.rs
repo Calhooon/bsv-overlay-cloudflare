@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use worker::wasm_bindgen::JsValue;
 
 pub const CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
-pub const UPSERT: &str = "INSERT INTO tx_words (txid,word,tier,height,proof_root,proof_height,proof_hex,header_hash,hint_source,hint_at,updated_at,legacy_body) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(txid) DO UPDATE SET word=excluded.word,tier=excluded.tier,height=excluded.height,proof_root=excluded.proof_root,proof_height=excluded.proof_height,proof_hex=excluded.proof_hex,header_hash=excluded.header_hash,hint_source=excluded.hint_source,hint_at=excluded.hint_at,updated_at=excluded.updated_at,legacy_body=COALESCE(excluded.legacy_body,tx_words.legacy_body) WHERE tx_words.updated_at <= excluded.updated_at";
+pub const UPSERT: &str = "INSERT INTO tx_words (txid,word,tier,height,proof_root,proof_height,proof_hex,header_hash,hint_source,hint_at,updated_at,legacy_body) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(txid) DO UPDATE SET word=excluded.word,tier=excluded.tier,height=excluded.height,proof_root=excluded.proof_root,proof_height=excluded.proof_height,proof_hex=excluded.proof_hex,header_hash=excluded.header_hash,hint_source=CASE WHEN excluded.hint_at IS NULL OR tx_words.hint_at > excluded.hint_at THEN tx_words.hint_source ELSE COALESCE(excluded.hint_source,tx_words.hint_source) END,hint_at=CASE WHEN excluded.hint_at IS NULL THEN tx_words.hint_at ELSE MAX(COALESCE(tx_words.hint_at,0),excluded.hint_at) END,updated_at=MAX(tx_words.updated_at,excluded.updated_at),legacy_body=COALESCE(excluded.legacy_body,tx_words.legacy_body) WHERE (excluded.tier = 'chain' AND tx_words.tier <> 'chain') OR (tx_words.updated_at <= excluded.updated_at AND (tx_words.tier <> 'chain' OR excluded.tier = 'chain') AND NOT (tx_words.word = 'seen' AND excluded.word IN ('unknown','built','announced')) AND NOT (tx_words.word = 'announced' AND excluded.word IN ('unknown','built')) AND NOT (tx_words.word = 'built' AND excluded.word = 'unknown') AND (tx_words.word <> 'abandoned' OR excluded.word = 'abandoned' OR excluded.tier = 'chain') AND (tx_words.word <> 'mined' OR excluded.word IN ('mined','stale')))";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
     pub txid: String,
@@ -48,11 +48,11 @@ impl Row {
     }
     pub fn view(&self) -> Value {
         let verify = if self.word == "mined" {
-            json!({"root":self.proof_root,"height":self.proof_height,"headerHash":self.header_hash,"merklePath":self.proof_hex})
+            json!({"root":self.proof_root,"height":self.proof_height.map(|h| h as u32),"headerHash":self.header_hash,"merklePath":self.proof_hex})
         } else {
             Value::Null
         };
-        json!({"word":self.word,"tier":self.tier,"height":self.height,"verifyPath":verify,"hintSource":self.hint_source,"hintAt":self.hint_at})
+        json!({"word":self.word,"tier":self.tier,"height":self.height.map(|h| h as u32),"verifyPath":verify,"hintSource":self.hint_source,"hintAt":self.hint_at.map(|t| t as u64)})
     }
     /// One retained proof seeds a fresh State against its recorded snapshot;
     /// the only current evidence input is Recheck. No historical input replay.
@@ -91,6 +91,8 @@ impl Row {
             .step(&params, current, Input::Evidence(Evidence::Recheck))
             .err();
         let mut view = served::fields(&state);
+        view["hintSource"] = json!(self.hint_source);
+        view["hintAt"] = json!(self.hint_at.map(|t| t as u64));
         if let Some(e) = fault {
             view["verifyPath"] = Value::Null;
             view["cannotCheck"] = json!(e.to_string());
@@ -113,6 +115,7 @@ pub fn seed_hint(row: Option<&Row>, txid: &str) -> State {
         }
         let input = match row.word.as_str() {
             "built" => Some(Input::Host(HostAction::Build)),
+            "abandoned" => Some(Input::Host(HostAction::Abandon)),
             "announced" => Some(Input::Hint(Hint::new(
                 row.hint_source.as_deref().unwrap_or("stored"),
                 HintStatus::Accepted,
@@ -135,23 +138,24 @@ pub fn read_sql(n: usize) -> String {
     let marks = vec!["?"; n].join(",");
     format!("SELECT * FROM tx_words WHERE txid IN ({marks})")
 }
+/// One JSON bind, one indexed lookup statement even for a fleet-sized list.
+pub const READ: &str =
+    "SELECT tx_words.* FROM json_each(?1) AS wanted JOIN tx_words ON tx_words.txid = wanted.value";
 pub async fn read(env: &worker::Env, ids: &[String]) -> worker::Result<BTreeMap<String, Row>> {
     let mut rows = BTreeMap::new();
     if ids.is_empty() {
         return Ok(rows);
     }
-    let db = env.d1("OVERLAY_DB")?;
-    for chunk in ids.chunks(90) {
-        let binds: Vec<_> = chunk.iter().map(|id| JsValue::from_str(id)).collect();
-        for row in db
-            .prepare(read_sql(chunk.len()))
-            .bind(&binds)?
-            .counted_all()
-            .await?
-            .results::<Row>()?
-        {
-            rows.insert(row.txid.clone(), row);
-        }
+    let keys = serde_json::to_string(ids).map_err(|e| worker::Error::RustError(e.to_string()))?;
+    for row in env
+        .d1("OVERLAY_DB")?
+        .prepare(READ)
+        .bind(&[JsValue::from_str(&keys)])?
+        .counted_all()
+        .await?
+        .results::<Row>()?
+    {
+        rows.insert(row.txid.clone(), row);
     }
     Ok(rows)
 }

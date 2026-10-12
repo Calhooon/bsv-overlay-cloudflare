@@ -1496,38 +1496,69 @@ pub async fn pay_vout_pass(world: &mut impl PayVoutWorld, wanted: &[(String, Str
 /// The hop's NON-POT spender named by the index (a recorded spend) or the chain rung (a word of spent), with the
 /// confirmation the source carried; `None` when nothing names a spender, or the spender IS a covenant pot (the JOIN
 /// took it: the pot's own row tells the story).
-
 fn spender_mined(i: &OwedInputs, txid: Option<&str>, legacy: bool) -> bool {
     match i.spender_words {
         None => legacy, // pre-tracker fixture oracle only
-        Some(words) => txid.and_then(|id| words.get(&id.to_ascii_lowercase())).is_some_and(|v| v["word"] == "mined" && !v["verifyPath"].is_null()),
+        Some(words) => txid
+            .and_then(|id| words.get(&id.to_ascii_lowercase()))
+            .is_some_and(|v| v["word"] == "mined" && !v["verifyPath"].is_null()),
     }
 }
 /// The coin judgement's tracker input; a competitor only wins on a checked
 /// mined word, never on a courier's positive height or a SEEN pointer.
 pub fn spender_coin_word(word: &Value, txid: &str, intended: Option<&str>) -> Value {
     let checked = word["word"] == "mined" && !word["verifyPath"].is_null();
-    let coin = if checked && intended.is_some_and(|t| !t.eq_ignore_ascii_case(txid)) { "lost" }
-        else if checked { "spent" } else if word["word"] == "stale" { "suspended" } else { "pending" };
+    let coin = if checked && intended.is_some_and(|t| !t.eq_ignore_ascii_case(txid)) {
+        "lost"
+    } else if checked {
+        "spent"
+    } else if word["word"] == "stale" {
+        "suspended"
+    } else {
+        "pending"
+    };
     json!({"word":coin,"txid":txid,"height":word["height"]})
 }
 fn owed_words(i: &OwedInputs, facts: &mut Value, txid: Option<&str>, intended: Option<&str>) {
     if let (Some(words), Some(id)) = (i.spender_words, txid) {
-        let word = words.get(&id.to_ascii_lowercase()).cloned().unwrap_or_else(|| crate::tracker_host::served::fields(&bsv_tracker::State::new(id)));
-        facts["coinWord"] = spender_coin_word(&word,id,intended);
+        let word = words
+            .get(&id.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| crate::tracker_host::served::fields(&bsv_tracker::State::new(id)));
+        facts["coinWord"] = spender_coin_word(&word, id, intended);
         facts["spenderWord"] = word;
     }
 }
-fn tracker_confirmed_by_other(i: &OwedInputs, h: &HopEntry, word: Option<&HopChainWord>, sweep: &str) -> bool {
-    let Some(_) = i.spender_words else { return confirmed_by_other(h,word,sweep); };
-    [h.spending_txid.as_deref(), word.and_then(|w| w.spending_txid.as_deref())].into_iter().flatten().any(|id| !id.eq_ignore_ascii_case(sweep) && spender_mined(i,Some(id),false))
+fn tracker_confirmed_by_other(
+    i: &OwedInputs,
+    h: &HopEntry,
+    word: Option<&HopChainWord>,
+    sweep: &str,
+) -> bool {
+    let Some(_) = i.spender_words else {
+        return confirmed_by_other(h, word, sweep);
+    };
+    [
+        h.spending_txid.as_deref(),
+        word.and_then(|w| w.spending_txid.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|id| !id.eq_ignore_ascii_case(sweep) && spender_mined(i, Some(id), false))
 }
 
 fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(String, bool)> {
     if h.spent == Some(true) {
         if let Some(s) = h.spending_txid.as_deref() {
             let s = s.to_ascii_lowercase();
-            return if i.pot_spenders.contains(&s) || pointer_refuted(i, &s, h) { None } else { Some((s.clone(), spender_mined(i, Some(&s), h.spent_confirmed == Some(true)))) };
+            return if i.pot_spenders.contains(&s) || pointer_refuted(i, &s, h) {
+                None
+            } else {
+                Some((
+                    s.clone(),
+                    spender_mined(i, Some(&s), h.spent_confirmed == Some(true)),
+                ))
+            };
         }
     }
     let w = i.hop_chain.get(outpoint)?;
@@ -1538,7 +1569,10 @@ fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(Stri
     if i.pot_spenders.contains(&s) || pointer_refuted(i, &s, h) {
         return None;
     }
-    Some((s.clone(), spender_mined(i, Some(&s), w.spent_confirmed == Some(true))))
+    Some((
+        s.clone(),
+        spender_mined(i, Some(&s), w.spent_confirmed == Some(true)),
+    ))
 }
 
 /// The games whose `collected` filings the recompute must read: every SPENT pot the results name AND every hop the
@@ -1667,8 +1701,10 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
         // sweep "unconfirmed" seven minutes after the mine, memoised five more; three blocks passed in nine minutes).
         // the gate's LOW-1 (Rule 6): the proof never outranks a CONTRADICTING confirmed word; the ladder below decides
         // (counted once per hop in the row pass: this fn also runs in the candidates pre-pass)
-        let contradicted = tracker_confirmed_by_other(i, h, i.hop_chain.get(&outpoint), &filed.sweep_txid);
-        let index_word = spender_mined(i, Some(&filed.sweep_txid), filed.index_proven) && !contradicted;
+        let contradicted =
+            tracker_confirmed_by_other(i, h, i.hop_chain.get(&outpoint), &filed.sweep_txid);
+        let index_word =
+            spender_mined(i, Some(&filed.sweep_txid), filed.index_proven) && !contradicted;
         if index_word || named_by_index || by_chain.is_some() {
             // the index's proof, OR its hop-row word, OR the chain rung's (a spend the index recorded before its block
             // and never re-checked read "not mined yet" for days on the pair: the recompute now probes such hops and
@@ -1676,7 +1712,13 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
             // the gate's LOW-3 (2026-09-19): the confirming chain word must NAME the filed sweep (`by_chain` does) — a
             // hop the JOIN took after all (evicted, then readmitted on its mine) reads spent+confirmed by a DIFFERENT
             // tx, and that must never turn the sweep's payout claimable for a tx that can never mine
-            let confirmed = spender_mined(i, Some(&filed.sweep_txid), index_word || (named_by_index && h.spent_confirmed == Some(true)) || by_chain.and_then(|w| w.spent_confirmed) == Some(true));
+            let confirmed = spender_mined(
+                i,
+                Some(&filed.sweep_txid),
+                index_word
+                    || (named_by_index && h.spent_confirmed == Some(true))
+                    || by_chain.and_then(|w| w.spent_confirmed) == Some(true),
+            );
             return Some(SweptHome {
                 sweep_txid: filed.sweep_txid.clone(),
                 raw_hex: Some(filed.raw_hex.clone()),
@@ -1854,7 +1896,12 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             "settleTxid": e.settle_txid,
             "committedKeys": crate::results::CommittedKeys::to_json(e.committed_keys.as_ref()),
         });
-        owed_words(i, &mut base_facts, e.settle_txid.as_deref(), e.settle_txid.as_deref());
+        owed_words(
+            i,
+            &mut base_facts,
+            e.settle_txid.as_deref(),
+            e.settle_txid.as_deref(),
+        );
         // bsv-low #518 (loop 20's pre-flight, 2026-09-21): a JOIN the network REFUSED (evicted, never readmitted)
         // never formed a pot — not a row on ANY arm, whatever its pot row says (a row that outran its eviction
         // before #513 read "unspent" here and the brain offered a refund for a pot the network never held). The
@@ -1891,7 +1938,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     // NOTE-22: the press is offered only once the spend is CONFIRMED (the credit path's landing bar).
                     // the review's LOW-1 (2026-09-20): a spend with a VERIFIED proof height is mined whatever the flag says
                     // (the landing bar's third arm, the unbound arm's L1 rule) — never a chain wait said by machine on a mined tx
-                    let confirmed = spender_mined(i, e.settle_txid.as_deref(), e.spent_confirmed == Some(true) || e.at_height.is_some());
+                    let confirmed = spender_mined(
+                        i,
+                        e.settle_txid.as_deref(),
+                        e.spent_confirmed == Some(true) || e.at_height.is_some(),
+                    );
                     facts["claimable"] = json!(confirmed);
                     if !confirmed {
                         facts["claimReason"] = json!(UNCONFIRMED_PAYOUT_REASON);
@@ -1927,8 +1978,13 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     let mut facts = base_facts.clone();
                     // the gate's L1: a spend with a VERIFIED proof height is mined (the landing bar's third arm),
                     // whatever `spentConfirmed` says — a classification gap on a mined tx is not a block wait
-                    let awaiting_block =
-                        e.verdict.is_none() && e.settle_txid.is_some() && !spender_mined(i, e.settle_txid.as_deref(), e.spent_confirmed == Some(true) || e.at_height.is_some());
+                    let awaiting_block = e.verdict.is_none()
+                        && e.settle_txid.is_some()
+                        && !spender_mined(
+                            i,
+                            e.settle_txid.as_deref(),
+                            e.spent_confirmed == Some(true) || e.at_height.is_some(),
+                        );
                     let reason = if awaiting_block {
                         // the index holds the spend (the results view names it) and the chain has not confirmed it:
                         // the verdict is computed at the landing bar, so the row is an honest chain wait
@@ -2075,7 +2131,12 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             // against it (`owedPress.buildHopSweepForRow`), matching the key it derives
             "seatSettlePubkey": h.seat_settle_pubkey,
         });
-        owed_words(i, &mut facts_base, h.spending_txid.as_deref(), i.hop_sweeps.get(&outpoint).map(|f| f.sweep_txid.as_str()));
+        owed_words(
+            i,
+            &mut facts_base,
+            h.spending_txid.as_deref(),
+            i.hop_sweeps.get(&outpoint).map(|f| f.sweep_txid.as_str()),
+        );
         // THE SWEPT HOP (bsv-low #469 decision 3): the hop is spent by its own seat's sweep — the sweep this identity
         // FILED, or a spender whose stored bytes pay the seat's committed home (an unfiled sweep) — so the stake is
         // at the seat's own home, uncollected: a `payout` row whose credit is the sweep (`/credit-beef/<sweepTxid>`),
@@ -2102,7 +2163,12 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 continue;
             }
             let mut facts = facts_base.clone();
-            owed_words(i, &mut facts, Some(&swept.sweep_txid), Some(&swept.sweep_txid));
+            owed_words(
+                i,
+                &mut facts,
+                Some(&swept.sweep_txid),
+                Some(&swept.sweep_txid),
+            );
             facts["claim"] = json!("internalize");
             facts["claimable"] = json!(swept.confirmed);
             if !swept.confirmed {
@@ -2975,28 +3041,82 @@ pub(crate) mod tests {
     /// not hold — never the custody story, on the index pointer and on the chain rung alike.
     #[test]
     fn ns3_owed_tracker_word_controls_claim_even_when_legacy_flags_disagree() {
-        let entries = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
-        let (v,c,p) = (HashMap::new(),HashSet::new(),HashSet::new());
-        let mut inputs = inputs(&entries,&[],&[],&v,&c,&p,Some(900_200));
+        let entries = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let mut inputs = inputs(&entries, &[], &[], &v, &c, &p, Some(900_200));
         let mut state = bsv_tracker::State::new(tx(3));
-        let headers = crate::tracker_host::HeaderSnapshot {tip:Ok(900_100),headers:std::collections::BTreeMap::from([(900_100,Ok(Some(bsv_tracker::Header {hash:tx(4),merkle_root:tx(3)})))])};
-        let params = bsv_tracker::Params {age_threshold:60};
-        state.step(&params,&headers,bsv_tracker::Input::Host(bsv_tracker::HostAction::Build)).unwrap();
-        state.step(&params,&headers,bsv_tracker::Input::Hint(bsv_tracker::Hint::new("arcade",bsv_tracker::HintStatus::Seen,123))).unwrap();
-        let seen = std::collections::BTreeMap::from([(tx(3),crate::tracker_host::served::fields(&state))]);
+        let headers = crate::tracker_host::HeaderSnapshot {
+            tip: Ok(900_100),
+            headers: std::collections::BTreeMap::from([(
+                900_100,
+                Ok(Some(bsv_tracker::Header {
+                    hash: tx(4),
+                    merkle_root: tx(3),
+                })),
+            )]),
+        };
+        let params = bsv_tracker::Params { age_threshold: 60 };
+        state
+            .step(
+                &params,
+                &headers,
+                bsv_tracker::Input::Host(bsv_tracker::HostAction::Build),
+            )
+            .unwrap();
+        state
+            .step(
+                &params,
+                &headers,
+                bsv_tracker::Input::Hint(bsv_tracker::Hint::new(
+                    "arcade",
+                    bsv_tracker::HintStatus::Seen,
+                    123,
+                )),
+            )
+            .unwrap();
+        let seen = std::collections::BTreeMap::from([(
+            tx(3),
+            crate::tracker_host::served::fields(&state),
+        )]);
         inputs.spender_words = Some(&seen);
         let rows = derive_owed_rows(&inputs);
-        assert_eq!(rows[0].facts["claimable"],false);
-        assert_eq!(rows[0].facts["spentConfirmed"],true);
-        assert_eq!(rows[0].facts["spenderWord"]["word"],"seen");
-        assert_eq!(rows[0].facts["coinWord"]["word"],"pending");
-        state.step(&params,&headers,bsv_tracker::Input::Evidence(bsv_tracker::Evidence::Proof(bsv_tracker::Proof::new(tx(3),bsv_rs::transaction::MerklePath::from_coinbase_txid(&tx(3),900_100)).unwrap()))).unwrap();
-        let mined = std::collections::BTreeMap::from([(tx(3),crate::tracker_host::served::fields(&state))]);
+        assert_eq!(rows[0].facts["claimable"], false);
+        assert_eq!(rows[0].facts["spentConfirmed"], true);
+        assert_eq!(rows[0].facts["spenderWord"]["word"], "seen");
+        assert_eq!(rows[0].facts["coinWord"]["word"], "pending");
+        state
+            .step(
+                &params,
+                &headers,
+                bsv_tracker::Input::Evidence(bsv_tracker::Evidence::Proof(
+                    bsv_tracker::Proof::new(
+                        tx(3),
+                        bsv_rs::transaction::MerklePath::from_coinbase_txid(&tx(3), 900_100),
+                    )
+                    .unwrap(),
+                )),
+            )
+            .unwrap();
+        let mined = std::collections::BTreeMap::from([(
+            tx(3),
+            crate::tracker_host::served::fields(&state),
+        )]);
         inputs.spender_words = Some(&mined);
-        assert_eq!(derive_owed_rows(&inputs)[0].facts["claimable"],true);
+        assert_eq!(derive_owed_rows(&inputs)[0].facts["claimable"], true);
         let checked = &mined[&tx(3)];
-        assert_eq!(spender_coin_word(checked,&tx(3),Some(&tx(5)))["word"],"lost");
-        assert_eq!(spender_coin_word(&seen[&tx(3)],&tx(3),Some(&tx(5)))["word"],"pending");
+        assert_eq!(
+            spender_coin_word(checked, &tx(3), Some(&tx(5)))["word"],
+            "lost"
+        );
+        assert_eq!(
+            spender_coin_word(&seen[&tx(3)], &tx(3), Some(&tx(5)))["word"],
+            "pending"
+        );
     }
 
     #[test]
