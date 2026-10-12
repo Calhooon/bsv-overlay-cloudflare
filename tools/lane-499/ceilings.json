@@ -68,7 +68,7 @@
       "ceiling": {
         "reads": 528,
         "writes": 20,
-        "stmts": 29
+        "stmts": 28
       },
       "censusKey": "/owed"
     },
