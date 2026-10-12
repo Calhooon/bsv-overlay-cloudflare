@@ -258,6 +258,17 @@ async fn l23_r2_synthetic_ninth_eviction_twin_only_25h_late_filing_and_planted_m
     let mut view = vec![marker];
     assert_eq!(merge_markerless_hops(&mut view, rebuilt), 1);
     assert_eq!(view[0].game_id, valid[0].game_id);
+    let mut unknown = view[0].clone();
+    unknown.marker_verified = low_app_layer::hops_view::MarkerVerification::Unknown;
+    unknown.game_id = "unlatched-game".into();
+    let mut unlatched = vec![unknown];
+    assert_eq!(
+        merge_markerless_hops(&mut unlatched, read()),
+        1,
+        "Unknown attestation is superseded and counted too"
+    );
+    assert_eq!(unlatched[0].game_id, valid[0].game_id);
+
     assert_eq!(
         derive_for_hops(
             &me,
