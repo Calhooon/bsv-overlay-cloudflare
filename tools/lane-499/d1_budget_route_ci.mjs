@@ -329,6 +329,26 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   else fail('d1Budget keys the hooks under /internal', `+${moved('/internal')} requests (want at least ${asks})`)
   if (moved('owed-recompute') >= ran && ran > 0) pass(`d1Budget keys each detached walk under owed-recompute (+${moved('owed-recompute')}, max reads ${b1.routes['owed-recompute'].max.reads})`)
   else fail('d1Budget keys each detached walk under owed-recompute', `+${moved('owed-recompute')} (want at least ${ran})`)
+  // #648: a stale mount read names its shed. No owed read during the delay: only the alarm can refresh it.
+  const stale = await get(APP, `/owed?identity=${ID_B}`)
+  const old = JSON.parse(stale.text)
+  if (stale.status === 200 && old.refresh === 'shed' && old.retryAfterMs > 0 && old.retryAfterMs <= 60_000)
+    pass(`NS2 shed read marked: refresh=shed, retryAfterMs=${old.retryAfterMs}`)
+  else fail('NS2 shed read carries its refresh word and window remainder', stale.text)
+  const marked = (await appHealth()).owed
+  if (marked.owed_recompute_shed_total === marked.recomputeShed && marked.owed_recompute_shed_total >= h1.recomputeShed + 1)
+    pass('NS2 the shed mount read is counted')
+  else fail('NS2 every shed is counted', JSON.stringify(marked))
+  await new Promise((resolve) => setTimeout(resolve, Math.min(Math.max(old.retryAfterMs ?? 60_000, 0), 60_000)))
+  const ranDeferred = await pollFor(async () => (await appHealth()).owed.owed_recompute_deferred_total >= (h1.owed_recompute_deferred_total ?? 0) + SEATS, 20_000)
+  if (ranDeferred && (await appHealth()).owed.owed_recompute_deferred_total === (h1.owed_recompute_deferred_total ?? 0) + SEATS) pass('NS2 exactly one reserved alarm walk per seat runs without an owed poll')
+  else fail('NS2 deferred walks converge at the window end', JSON.stringify((await appHealth()).owed))
+  const refreshed = await get(APP, `/owed?identity=${ID_B}`)
+  const fresh = JSON.parse(refreshed.text)
+  if (refreshed.status === 200 && fresh.computedAtMs > old.computedAtMs && fresh.refresh !== 'shed')
+    pass(`NS2 snapshot advanced without client poll: ${old.computedAtMs} -> ${fresh.computedAtMs}`)
+  else fail('NS2 the alarm writes a fresh owed snapshot', refreshed.text)
+
 }
 
 // NS-3: the real Worker reads compact rows with zero courier calls and

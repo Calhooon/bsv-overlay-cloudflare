@@ -4529,8 +4529,9 @@ pub(crate) async fn owed_recompute_and_push(
     // lens fold's M1: a walk in flight when the hook marked stale cleared that mark with its own write, and this
     // folded rerun is the one shed; without the re-mark the next read served the older rows as fresh)
     if !owed_recompute_admit(identity_lc, source, true) {
+        let deferred = owed_deferred_deadline(identity_lc);
         owed_shed_remark(db, identity_lc).await;
-        owed_schedule_deferred(env, identity_lc).await;
+        owed_schedule_deferred(env, identity_lc, deferred).await;
         return;
     }
     owed_walk_and_push(env, db, identity_lc, source, tip_hint).await;
@@ -4539,6 +4540,8 @@ pub(crate) async fn owed_recompute_and_push(
 /// The alarm owns one reserved walk from the exhausted window. It does not consume the next window's admits.
 pub(crate) async fn owed_deferred_walk_and_push(env: &worker::Env, identity_lc: &str) -> worker::Result<()> {
     let db = env.d1("OVERLAY_DB")?;
+    crate::owed::note_recompute_deferred();
+    worker::console_log!("[owed] deferred walk for {identity_lc}");
     owed_walk_and_push(env, &db, identity_lc, "deferred", None).await;
     Ok(())
 }
@@ -4610,8 +4613,8 @@ thread_local! {
     static OWED_RATE: std::cell::RefCell<crate::owed::RecomputeRate> = std::cell::RefCell::new(crate::owed::RecomputeRate::default());
 }
 /// bsv-low #499: may this recompute run? Every walk asks here first: the hooks' and the claims' through
-/// `owed_recompute_and_push`, the read's inline arm, and the first read (`sheddable = false`: no snapshot exists to
-/// serve, so it runs and counts). A shed is counted and logged; the caller serves the snapshot it holds.
+/// `owed_recompute_and_push`, the read's inline arm, and the first read (no snapshot means a marked 503 on a
+/// shed). Every shed is counted; the caller schedules the reserved alarm and serves the snapshot it holds.
 pub(crate) fn owed_recompute_admit(identity_lc: &str, source: &str, sheddable: bool) -> bool {
     let now_ms = worker::Date::now().as_millis() as i64;
     let run = OWED_RATE.with(|r| r.borrow_mut().admit(identity_lc, now_ms, sheddable));
@@ -4627,9 +4630,26 @@ pub(crate) fn owed_recompute_admit(identity_lc: &str, source: &str, sheddable: b
     run
 }
 /// Persist a timer on the existing actor binding: HTTP wait_until expires after 30 seconds, less than our window.
-async fn owed_schedule_deferred(env: &worker::Env, identity_lc: &str) {
+/// Inspect, count and reserve a shed read with ONE clock sample and one borrow; the boundary cannot split them.
+fn owed_read_shed(identity_lc: &str, source: &str) -> Option<(i64, Option<i64>)> {
     let now = worker::Date::now().as_millis() as i64;
-    let Some(end) = OWED_RATE.with(|r| r.borrow_mut().arm_deferred(identity_lc, now)) else { return; };
+    let decision = OWED_RATE.with(|r| {
+        let mut rate = r.borrow_mut();
+        let retry = rate.retry_after_ms(identity_lc, now)?;
+        Some((retry, rate.arm_deferred(identity_lc, now)))
+    });
+    if decision.is_some() {
+        crate::owed::note_recompute_shed();
+        console_warn!("[owed] recompute ({source}) for {}… shed: {} recomputes inside {} ms already (refresh delayed)", &identity_lc[..12.min(identity_lc.len())], crate::owed::OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW, crate::owed::OWED_RECOMPUTE_RATE_WINDOW_MS);
+    }
+    decision
+}
+fn owed_deferred_deadline(identity_lc: &str) -> Option<i64> {
+    OWED_RATE.with(|r| r.borrow_mut().arm_deferred(identity_lc, worker::Date::now().as_millis() as i64))
+}
+async fn owed_schedule_deferred(env: &worker::Env, identity_lc: &str, deadline: Option<i64>) {
+    // The shed captures the deadline BEFORE any await: a slow re-mark crossing the window must not lose its alarm.
+    let Some(end) = deadline else { return; };
     let result = async {
         let ns = env.durable_object("BOARD_VIEW")?;
         let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity_lc}:{end}"));
@@ -4744,7 +4764,7 @@ pub(crate) async fn owed_recompute_and_push_coalesced(
         crate::owed::note_recompute_coalesced();
         return;
     };
-    owed_recompute_claimed(env, db, identity_lc, source, tip_hint, token).await;
+    owed_recompute_claimed(env, db, identity_lc, source, tip_hint, token, false).await;
 }
 
 /// The run behind a CLAIMED lock (`owed_refresh_begin` returned `Some(token)` to the caller, synchronously — the read path
@@ -4758,6 +4778,7 @@ pub(crate) async fn owed_recompute_claimed(
     source: &str,
     tip_hint: Option<u64>,
     token: i64,
+    mut first_admitted: bool,
 ) {
     let mut src = source.to_string();
     let mut reruns = 0usize;
@@ -4766,7 +4787,12 @@ pub(crate) async fn owed_recompute_claimed(
             // the mark is no longer ours (a takeover after a long silence): the other claim owns the rerun map now
             return;
         }
-        owed_recompute_and_push(env, db, identity_lc, &src, tip_hint).await;
+        if first_admitted {
+            first_admitted = false;
+            owed_walk_and_push(env, db, identity_lc, &src, tip_hint).await;
+        } else {
+            owed_recompute_and_push(env, db, identity_lc, &src, tip_hint).await;
+        }
         if !owed_refresh_touch(identity_lc, token) {
             // the delta-verify's LOW-4: a takeover DURING this walk owns the rerun map now — this claim must neither
             // steal a folded ask (dropping it on its own way out) nor mark stale on the takeover's behalf
@@ -4943,8 +4969,21 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                     200,
                 );
             }
-            // bsv-low #499: the first read has no snapshot to shed to, so it runs; it counts against the minute
-            owed_recompute_admit(&identity, "read-first", false);
+            // #648: first-read faults must not buy unlimited walks. No snapshot means an honest 503 on a shed.
+            if !owed_recompute_admit(&identity, "read-first", false) {
+                let retry = Some(OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)).unwrap_or(0));
+                let deferred = owed_deferred_deadline(&identity);
+                if let Some(wait) = ctx.data.wait.clone() {
+                    let env = ctx.env.clone();
+                    let id = identity.clone();
+                    wait.wait_until(async move { owed_schedule_deferred(&env, &id, deferred).await; });
+                } else {
+                    owed_schedule_deferred(&ctx.env, &identity, deferred).await;
+                }
+                let mut body = serde_json::json!({"v": 1, "error": "owed refresh delayed; no snapshot available"});
+                crate::owed::mark_shed_refresh(&mut body, retry);
+                return json_response(body.to_string(), 503);
+            }
             match owed_compute_on_read(&ctx.env, &db, &identity, "read-first", None).await {
                 Ok(v) => v,
                 Err(resp) => return resp,
@@ -4995,16 +5034,14 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                     // is bounded (8 s) and a pass that outlives it leaves the page with "could not load" and the
                     // door with a refused fallback. One refresh per identity per isolate at a time.
                     Some(wait) => {
-                        if let Some(retry) = OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)) {
+                        if let Some((retry, deferred)) = owed_read_shed(&identity, source) {
                             refresh_retry = Some(retry);
-                            // Decide synchronously so the answer names the shed, before the detached refresh runs.
-                            owed_recompute_admit(&identity, source, true);
                             let env = ctx.env.clone();
                             let id = identity.clone();
                             wait.wait_until(async move {
                                 if let Ok(db) = env.d1("OVERLAY_DB") {
                                     owed_shed_remark(&db, &id).await;
-                                    owed_schedule_deferred(&env, &id).await;
+                                    owed_schedule_deferred(&env, &id, deferred).await;
                                 }
                             });
                         } else {
@@ -5012,16 +5049,30 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                             crate::owed::note_read_refresh(claim.is_some());
                             match claim {
                                 Some(token) => {
+                                    // Reserve before the answer: another ask cannot shed this read's accepted refresh later.
+                                    let admitted = owed_recompute_admit(&identity, source, true);
                                     let env = ctx.env.clone();
                                     let id = identity.clone();
                                     let src = source.to_string();
-                                    wait.wait_until(async move {
-                                        if let Ok(db) = env.d1("OVERLAY_DB") {
-                                            owed_recompute_claimed(&env, &db, &id, &src, None, token).await;
-                                        } else {
-                                            owed_refresh_end(&id, token); // the claim must never outlive a run that cannot start
-                                        }
-                                    });
+                                    if admitted {
+                                        wait.wait_until(async move {
+                                            if let Ok(db) = env.d1("OVERLAY_DB") {
+                                                owed_recompute_claimed(&env, &db, &id, &src, None, token, true).await;
+                                            } else {
+                                                owed_refresh_end(&id, token);
+                                            }
+                                        });
+                                    } else {
+                                        owed_refresh_end(&identity, token);
+                                        refresh_retry = Some(OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)).unwrap_or(0));
+                                        let deferred = owed_deferred_deadline(&identity);
+                                        wait.wait_until(async move {
+                                            if let Ok(db) = env.d1("OVERLAY_DB") {
+                                                owed_shed_remark(&db, &id).await;
+                                                owed_schedule_deferred(&env, &id, deferred).await;
+                                            }
+                                        });
+                                    }
                                 }
                                 None => {
                                     // the delta-verify's LOW-B: a stale read that cannot kick is REMEMBERED — the holder of
@@ -5041,9 +5092,10 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                         // N4: whichever arm asked for it, a compute that faults leaves the rows in hand standing;
                         // bsv-low #499: so does one the identity's ceiling sheds
                         if !owed_recompute_admit(&identity, source, true) {
-                            refresh_retry = OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64));
+                            refresh_retry = Some(OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)).unwrap_or(0));
+                            let deferred = owed_deferred_deadline(&identity);
                             owed_shed_remark(&db, &identity).await;
-                            owed_schedule_deferred(&ctx.env, &identity).await;
+                            owed_schedule_deferred(&ctx.env, &identity, deferred).await;
                             (rows, prev_tip, st.computed_at_ms as i64, cut)
                         } else {
                             match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)
