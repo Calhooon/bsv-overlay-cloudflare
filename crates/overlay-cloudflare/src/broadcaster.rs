@@ -1348,7 +1348,8 @@ fn reached_submit_echo(fast_answer: bool) -> GateStep {
 fn submit_echo_is_fresh(stamp: Option<&str>, now_ms: i64, admission_at_ms: Option<i64>) -> bool {
     let Some(stamp) = stamp else { return true };
     crate::proof_fetcher::rfc3339_utc_ms(stamp).is_some_and(|at| {
-        at <= now_ms + 60_000 && now_ms - at < 30 * 60_000
+        at <= now_ms + 60_000
+            && now_ms - at < 30 * 60_000
             && admission_at_ms.is_none_or(|admitted| at >= admitted)
     })
 }
@@ -2110,7 +2111,9 @@ pub struct ArcadeBroadcaster {
 }
 
 impl ArcadeBroadcaster {
-    pub fn duplicate_echo(&self) -> bool { self.duplicate_echo.get() }
+    pub fn duplicate_echo(&self) -> bool {
+        self.duplicate_echo.get()
+    }
 
     pub fn with_admission_at_ms(mut self, at: Option<i64>) -> Self {
         self.admission_at_ms = at;
@@ -2632,9 +2635,14 @@ impl ArcadeBroadcaster {
                 match classify_arcade_status(&parsed.tx_status) {
                     GateVerdict::Reached => {
                         self.duplicate_echo.set(true);
-                        if !submit_echo_is_fresh(parsed.timestamp.as_deref(),
-                            worker::Date::now().as_millis() as i64, self.admission_at_ms) {
-                            return Err("Arcade stored echo predates admission or freshness bound".into());
+                        if !submit_echo_is_fresh(
+                            parsed.timestamp.as_deref(),
+                            worker::Date::now().as_millis() as i64,
+                            self.admission_at_ms,
+                        ) {
+                            return Err(
+                                "Arcade stored echo predates admission or freshness bound".into()
+                            );
                         }
                         // Witnessed mode still corroborates and can answer 502 on
                         // STORED corroborators: bsv-low #637 (NS2P-L2 / N5).
@@ -4693,9 +4701,21 @@ mod tests {
     #[test]
     fn ns2_l1_stored_echo_stamp_is_bounded_by_admission() {
         let now = crate::proof_fetcher::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
-        assert!(submit_echo_is_fresh(Some("2026-10-12T18:14:00Z"), now, Some(now - 120_000)));
-        assert!(!submit_echo_is_fresh(Some("2026-10-12T18:14:00Z"), now, Some(now - 30_000)));
-        assert!(!submit_echo_is_fresh(Some("2026-10-12T17:00:00Z"), now, None));
+        assert!(submit_echo_is_fresh(
+            Some("2026-10-12T18:14:00Z"),
+            now,
+            Some(now - 120_000)
+        ));
+        assert!(!submit_echo_is_fresh(
+            Some("2026-10-12T18:14:00Z"),
+            now,
+            Some(now - 30_000)
+        ));
+        assert!(!submit_echo_is_fresh(
+            Some("2026-10-12T17:00:00Z"),
+            now,
+            None
+        ));
         assert!(!submit_echo_is_fresh(Some("bad"), now, None));
         assert!(submit_echo_is_fresh(None, now, None));
     }
@@ -4704,8 +4724,10 @@ mod tests {
     fn ns2_m2_reached_echo_decision() {
         assert_eq!(reached_submit_echo(false), GateStep::Accepted);
         assert_eq!(reached_submit_echo(true), GateStep::SyncAccepted);
-        assert!(matches!(ladder_step(reached_submit_echo(true), "subject"),
-            Ladder::Return(ArcOutcome::AcceptedPending(_))));
+        assert!(matches!(
+            ladder_step(reached_submit_echo(true), "subject"),
+            Ladder::Return(ArcOutcome::AcceptedPending(_))
+        ));
     }
 
     #[tokio::test]
