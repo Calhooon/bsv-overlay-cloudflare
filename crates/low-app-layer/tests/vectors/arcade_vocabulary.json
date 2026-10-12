@@ -1,0 +1,31 @@
+{
+  "sources": [
+    "bsv-rs/tests/vectors/arc_tx_status_verdicts.json (recorded verdict corpus)",
+    "bsv-tracker/src/hints.rs Verdict::from_arc_body (complete vocabulary, including SEEN_MULTIPLE_NODES)"
+  ],
+  "words": [
+    "SUCCESS",
+    "UNKNOWN",
+    "RECEIVED",
+    "QUEUED",
+    "STORED",
+    "ANNOUNCED_TO_NETWORK",
+    "REQUESTED_BY_NETWORK",
+    "SENT_TO_NETWORK",
+    "ACCEPTED_BY_NETWORK",
+    "SEEN_ON_NETWORK",
+    "SEEN_MULTIPLE_NODES",
+    "MINED",
+    "CONFIRMED",
+    "IMMUTABLE",
+    "MINED_IN_STALE_BLOCK",
+    "REJECTED",
+    "INVALID",
+    "MALFORMED",
+    "DOUBLE_SPEND_ATTEMPTED",
+    "UTXO_SPENT",
+    "SEEN_IN_ORPHAN_MEMPOOL",
+    "PENDING_RETRY",
+    "STUMP_PROCESSING"
+  ]
+}
