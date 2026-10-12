@@ -179,3 +179,159 @@ fn write_event_courier_captures_subject_kind_and_proof_without_a_chain_claim() {
         .all(|v| v["txid"] == "01".repeat(32) && v["body"]["merklePath"] == "01"));
     assert!(bsv_overlay_cloudflare::tracker_events::drain().is_empty());
 }
+
+#[test]
+fn compact_concurrent_hint_cannot_demote_a_checked_word_or_a_seen_word() {
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch(stored::CREATE).unwrap();
+    let row = mined();
+    let write = |word: &str, tier: &str, at: i64| {
+        db.execute(
+            stored::UPSERT,
+            rusqlite::params![
+                row.txid,
+                word,
+                tier,
+                10,
+                row.proof_root,
+                10,
+                row.proof_hex,
+                row.header_hash,
+                "woc",
+                at,
+                at,
+                row.legacy_body
+            ],
+        )
+        .unwrap()
+    };
+    write("mined", "chain", 100);
+    write("seen", "hint", 100);
+    write("announced", "hint", 101);
+    assert_eq!(
+        db.query_row("SELECT word FROM tx_words", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "mined"
+    );
+    let other = "05".repeat(32);
+    db.execute(
+        "INSERT INTO tx_words (txid,word,tier,updated_at) VALUES (?,'seen','hint',200)",
+        [&other],
+    )
+    .unwrap();
+    db.execute(
+        stored::UPSERT,
+        rusqlite::params![
+            other,
+            "announced",
+            "hint",
+            Option::<i64>::None,
+            Option::<String>::None,
+            Option::<i64>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            "arcade",
+            201,
+            201,
+            Option::<String>::None
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        db.query_row("SELECT word FROM tx_words WHERE txid=?", [&other], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+        "seen"
+    );
+    // A checked proof whose transport started before that hint still wins;
+    // the storage stamp stays monotonic.
+    db.execute(
+        stored::UPSERT,
+        rusqlite::params![
+            other,
+            "mined",
+            "chain",
+            10,
+            other,
+            10,
+            row.proof_hex,
+            row.header_hash,
+            Option::<String>::None,
+            Option::<i64>::None,
+            199,
+            Option::<String>::None
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT word,updated_at FROM tx_words WHERE txid=?",
+            [&other],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        )
+        .unwrap(),
+        ("mined".into(), 200)
+    );
+}
+#[test]
+fn compact_fleet_lookup_is_one_bind_and_an_index_search() {
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch(stored::CREATE).unwrap();
+    let ids: Vec<_> = (0..600).map(|i| format!("{i:064x}")).collect();
+    for id in &ids {
+        db.execute(
+            "INSERT INTO tx_words (txid,word,tier,updated_at) VALUES (?,'unknown','host',0)",
+            [id],
+        )
+        .unwrap();
+    }
+    let keys = serde_json::to_string(&ids).unwrap();
+    let mut stmt = db.prepare(stored::READ).unwrap();
+    assert_eq!(stmt.parameter_count(), 1);
+    assert_eq!(
+        stmt.query_map([&keys], |r| r.get::<_, String>(0))
+            .unwrap()
+            .count(),
+        600
+    );
+    let mut plan = db
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", stored::READ))
+        .unwrap();
+    let details: Vec<_> = plan
+        .query_map([&keys], |r| r.get::<_, String>(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        details
+            .iter()
+            .any(|s| s.contains("SEARCH tx_words USING INDEX")),
+        "{details:?}"
+    );
+    assert!(
+        !details.iter().any(|s| s.contains("SCAN tx_words")),
+        "{details:?}"
+    );
+}
+
+#[test]
+fn owed_clock_reasks_aged_hint_rows_at_writes_and_never_age_polls_chain_words() {
+    let mut row = mined();
+    assert!(!runtime::owed_reask_due(&row, 1000));
+    row.word = "seen".into();
+    row.tier = "hint".into();
+    row.updated_at = 100.0;
+    assert!(!runtime::owed_reask_due(&row, 159));
+    assert!(runtime::owed_reask_due(&row, 160));
+    assert!(!runtime::owed_reask_due(&row, 99));
+    let mut state = stored::seed_hint(Some(&row), &row.txid);
+    state
+        .step(
+            &Params { age_threshold: 60 },
+            &snapshot(&row.txid),
+            Input::Host(bsv_tracker::HostAction::Tick(160)),
+        )
+        .unwrap();
+    assert!(matches!(state.reask(), Some(bsv_tracker::Reask::Age)));
+}

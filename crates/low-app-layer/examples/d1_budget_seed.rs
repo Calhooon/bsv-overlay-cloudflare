@@ -90,12 +90,40 @@ fn main() {
     rows.extend(d1_fleet::rows(now_s));
     let l23_start = rows.len();
     rows.extend(l23_r2_route_rows(now_s));
+    // NS-3 route pins: separate subjects, untouched by the budget scenarios.
+    let parent = "f1".repeat(32);
+    let seen = "f2".repeat(32);
+    let mined = "f3".repeat(32);
+    rows.push(format!("INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed) VALUES ('{parent}',0,1,'{seen}',1)"));
+    rows.push(format!("INSERT INTO hop_chain_probes (outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES ('{parent}.0',1,1,'{seen}',1)"));
+    for (id, word, tier, proof) in [
+        (&seen, "seen", "hint", None),
+        (
+            &mined,
+            "mined",
+            "chain",
+            Some(bsv_rs::transaction::MerklePath::from_coinbase_txid(&mined, 10).to_hex()),
+        ),
+    ] {
+        let legacy = serde_json::json!({"txid":id,"present":true,"confirmed":true,"height":null,"rawHex":null,"source":"external","unconfirmable":false,"claimedHeight":10}).to_string();
+        let (height, root, hex, hash) = match proof {
+            Some(hex) => (
+                "10".to_string(),
+                format!("'{id}'"),
+                format!("'{hex}'"),
+                format!("'{}'", "f4".repeat(32)),
+            ),
+            None => ("NULL".into(), "NULL".into(), "NULL".into(), "NULL".into()),
+        };
+        rows.push(format!("INSERT INTO tx_words (txid,word,tier,height,proof_root,proof_height,proof_hex,header_hash,hint_source,hint_at,updated_at,legacy_body) VALUES ('{id}','{word}','{tier}',{height},{root},{height},{hex},{hash},'woc',123,123,'{legacy}')"));
+    }
     for (i, r) in rows.iter().enumerate() {
         if r.starts_with("UPDATE ") || i >= l23_start {
             conn.execute_batch(r).unwrap();
         } else {
             d1_fleet::execute_row(&conn, r);
         }
+
         out.push_str(r);
         out.push_str(";\n");
     }

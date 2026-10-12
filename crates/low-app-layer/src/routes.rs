@@ -320,7 +320,10 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     }
 
     let entries = assemble_statuses(&outpoints, &rows);
-    json_response(crate::tracker_host::runtime::body(&ctx.env, &utxo_status_body(&entries), None).await?, 200)
+    json_response(
+        crate::tracker_host::runtime::body(&ctx.env, &utxo_status_body(&entries), None).await?,
+        200,
+    )
 }
 
 /// `GET /beef/:txid` — the BEEF bytes for a txid, read from `pot_beefs`
@@ -3595,6 +3598,16 @@ async fn owed_recompute_inner(
         }
     }
 
+    let mut word_ids = std::collections::BTreeSet::new();
+    word_ids.extend(results.iter().filter_map(|e| e.settle_txid.clone()));
+    word_ids.extend(hops.iter().filter_map(|h| h.spending_txid.clone()));
+    word_ids.extend(hop_chain.values().filter_map(|h| h.spending_txid.clone()));
+    word_ids.extend(hop_sweeps.values().map(|h| h.sweep_txid.clone()));
+    let word_ids: Vec<_> = word_ids.into_iter().collect();
+    let mut word_rows = crate::tracker_host::stored::read(env, &word_ids)
+        .await
+        .map_err(|e| e.to_string())?;
+
     // 6b. the NON-POT spenders' bytes (a sweep, a wallet's own spend, the seat's own competitor), bounded per recompute:
     //     every P2PKH output's pkh + sats and every INPUT outpoint, from the BEEF the index holds (with the index's own
     //     spend word per output) or, for a spender the index never held, from the tx-any resolver's hash-verified raw
@@ -3710,6 +3723,23 @@ async fn owed_recompute_inner(
         // answers (only a verdict MEMO costs no courier call); the cap is its own word, apart from the time budget
         wanted.sort_by_key(|sp| owed_courier_asked_at(sp).map_or(0i64, |t| t as i64));
         for sp in wanted {
+            // The compact row keeps the hash-verified raw from the first
+            // courier observation. A subject in hand never opens a read
+            // ladder again, even after the isolate memo expired.
+            if let Some(row) = word_rows.get(&sp) {
+                let parsed = row
+                    .legacy_body
+                    .as_ref()
+                    .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+                    .and_then(|body| body["rawHex"].as_str().and_then(|h| hex::decode(h).ok()))
+                    .and_then(|raw| courier_spender_bytes_of_raw(&raw, &sp));
+                if let Some(parsed) = parsed {
+                    courier_spenders.insert(sp.clone());
+                    spender_inputs.insert(sp.clone(), parsed.inputs);
+                    spender_outputs.insert(sp, parsed.outputs);
+                }
+                continue;
+            }
             if courier_reads >= crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE {
                 courier_cap_hit = true;
                 break;
@@ -3764,18 +3794,58 @@ async fn owed_recompute_inner(
     if held_key_mismatches > 0 {
         console_warn!("[owed] {held_key_mismatches} collected row(s) carry a payTxid their key was not filed for (they retire nothing)");
     }
-    let mut word_ids = std::collections::BTreeSet::new();
-    word_ids.extend(results.iter().filter_map(|e| e.settle_txid.clone()));
-    word_ids.extend(hops.iter().filter_map(|h| h.spending_txid.clone()));
-    word_ids.extend(hop_chain.values().filter_map(|h| h.spending_txid.clone()));
-    word_ids.extend(hop_sweeps.values().map(|h| h.sweep_txid.clone()));
-    let word_ids: Vec<_> = word_ids.into_iter().collect();
-    let mut word_rows = crate::tracker_host::stored::read(env, &word_ids).await.map_err(|e| e.to_string())?;
-    for id in word_ids {
-        if !word_rows.contains_key(&id) {
-            let row = crate::tracker_host::runtime::event(env, &id, "fallback", None, None).await.map_err(|e| e.to_string())?;
-            word_rows.insert(id, row);
+    let mut due: Vec<_> = word_ids
+        .iter()
+        .filter(|id| {
+            word_rows.get(*id).is_none_or(|row| {
+                source != "read-first"
+                    && crate::tracker_host::runtime::owed_reask_due(
+                        row,
+                        (now_ms.max(0) as u64) / 1000,
+                    )
+            })
+        })
+        .cloned()
+        .collect();
+    due.sort_by(|a, b| {
+        word_rows
+            .get(a)
+            .map_or(0.0, |r| r.updated_at)
+            .total_cmp(&word_rows.get(b).map_or(0.0, |r| r.updated_at))
+            .then_with(|| a.cmp(b))
+    });
+    for id in due
+        .into_iter()
+        .take(crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE)
+    {
+        if over_budget() {
+            walk_cut = true;
+            break;
         }
+        let kind = if word_rows.contains_key(&id) {
+            "tick"
+        } else {
+            "fallback"
+        };
+        let legacy = tx_any_cached(&id, worker::Date::now().as_millis() as f64)
+            .map(|answer| crate::txany::tx_any_body(&id, &answer));
+        let row = crate::tracker_host::runtime::event(env, &id, kind, None, legacy)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !spender_outputs.contains_key(&id) {
+            let parsed = row
+                .legacy_body
+                .as_ref()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+                .and_then(|body| body["rawHex"].as_str().and_then(|h| hex::decode(h).ok()))
+                .and_then(|raw| courier_spender_bytes_of_raw(&raw, &id));
+            if let Some(parsed) = parsed {
+                courier_spenders.insert(id.clone());
+                spender_inputs.insert(id.clone(), parsed.inputs);
+                spender_outputs.insert(id.clone(), parsed.outputs);
+            }
+        }
+        word_rows.insert(id, row);
     }
     let spender_words = crate::tracker_host::runtime::views(env, &word_rows).await;
     // The D3 SEEN + spenderFinal verdict-publication arm is deliberately
@@ -6726,12 +6796,43 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         Ok(db) => read_probe_memos(&db, &probe_targets).await,
         Err(_) => Vec::new(),
     };
-    let (memo_answers, _) = crate::hops_view::split_probe_targets(
+    let ids: Vec<_> = memos
+        .iter()
+        .filter_map(|m| m.spending_txid.clone())
+        .collect();
+    let mut stored_words = crate::tracker_host::stored::read(&ctx.env, &ids).await?;
+    let (mut memo_answers, _) = crate::hops_view::split_probe_targets(
         &probe_targets,
         &memos,
         now_ms,
         crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
     );
+    // A pointer whose subject is already tracked needs no courier reread.
+    // The current chain word is rechecked below, independently of this
+    // retained legacy outpoint memo's confirmation flag.
+    for (txid, vout) in &probe_targets {
+        if memo_answers.iter().any(|(t, v, _)| t == txid && v == vout) {
+            continue;
+        }
+        if let Some(m) = memos.iter().find(|m| {
+            m.outpoint == format!("{txid}.{vout}")
+                && m.spent
+                && m.spending_txid
+                    .as_ref()
+                    .is_some_and(|id| stored_words.contains_key(id))
+        }) {
+            memo_answers.push((
+                txid.clone(),
+                *vout,
+                crate::hops_view::ChainSpendProbe {
+                    known: true,
+                    spent: Some(true),
+                    spending_txid: m.spending_txid.clone(),
+                    spent_confirmed: m.spent_confirmed,
+                },
+            ));
+        }
+    }
     let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
     let mut terminals = Vec::with_capacity(outpoints.len());
     for op in &outpoints {
@@ -6797,7 +6898,20 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             write_probe_memos(&db, &fresh).await;
         }
     }
-    json_response(crate::tracker_host::runtime::body(&ctx.env, &crate::txany::spent_any_body(&entries, &terminals), None).await?, 200)
+    let value = serde_json::from_str(&crate::txany::spent_any_body(&entries, &terminals))?;
+    // New spender subjects run the absent-row fallback once. Existing
+    // subjects reuse the one lookup above.
+    json_response(
+        crate::tracker_host::runtime::body_loaded(
+            &ctx.env,
+            value,
+            None,
+            std::mem::take(&mut stored_words),
+        )
+        .await?,
+        200,
+    )
+
 }
 
 // ── /tx-any — tx-level presence/confirmation/raw, index-first (bsv-low #229) ──
@@ -7111,7 +7225,7 @@ async fn tx_any_scope(env: &worker::Env, txid: &str) -> (bool, Option<String>) {
 }
 
 /// Foreign subjects go directly to couriers; their silence is never Arcade's vote.
-async fn tx_any_external_leg(
+pub(crate) async fn tx_any_external_leg(
     txid_lc: &str,
     caller: &'static str,
     env: &worker::Env,
@@ -7529,17 +7643,21 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         return json_error("invalid txid (expect 64 hex chars)", 400);
     }
     let key = txid.to_ascii_lowercase();
-    let mut stored = crate::tracker_host::stored::read(&ctx.env, &[key.clone()]).await?;
+    let mut stored =
+        crate::tracker_host::stored::read(&ctx.env, std::slice::from_ref(&key)).await?;
     if let Some(row) = stored.remove(&key) {
         let legacy = match row.legacy_body.clone() {
             Some(body) => body,
             None => {
                 let (raw, _) = tx_any_index_leg(&ctx, &key).await;
-                let mut answer = TxAnyCached::default();
-                answer.raw_hex = raw;
-                answer.present = matches!(row.word.as_str(), "announced" | "seen" | "mined").then_some(true);
-                answer.confirmed = Some(row.word == "mined");
-                answer.height = row.height.map(|h| h as u64);
+                let answer = TxAnyCached {
+                    raw_hex: raw,
+                    present: matches!(row.word.as_str(), "announced" | "seen" | "mined")
+                        .then_some(true),
+                    confirmed: Some(row.word == "mined"),
+                    height: row.height.map(|h| h as u64),
+                    ..Default::default()
+                };
                 crate::txany::tx_any_body(&key, &answer)
             }
         };
@@ -7558,7 +7676,9 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         }
     };
     let legacy = crate::txany::tx_any_body(&key, &answer);
-    let row = crate::tracker_host::runtime::event(&ctx.env, &key, "fallback", None, Some(legacy.clone())).await?;
+    let row =
+        crate::tracker_host::runtime::event(&ctx.env, &key, "fallback", None, Some(legacy.clone()))
+            .await?;
     let mut value = serde_json::from_str(&legacy)?;
     let rows = std::collections::BTreeMap::from([(key.clone(), row)]);
     let views = crate::tracker_host::runtime::views(&ctx.env, &rows).await;
@@ -7756,7 +7876,15 @@ pub async fn tx_any_batch(req: Request, ctx: RouteContext<AuthState>) -> Result<
             }
         }
     }
-    json_response(crate::tracker_host::runtime::body(&ctx.env, &crate::txany::tx_any_batch_body(&answers, &unknown), None).await?, 200)
+    json_response(
+        crate::tracker_host::runtime::batch_body(
+            &ctx.env,
+            &crate::txany::tx_any_batch_body(&answers, &unknown),
+            &keys,
+        )
+        .await?,
+        200,
+    )
 }
 
 /// `GET /health` — liveness only (no DB touch).

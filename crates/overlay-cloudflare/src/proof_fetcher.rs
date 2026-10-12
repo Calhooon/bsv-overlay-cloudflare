@@ -937,9 +937,13 @@ pub(crate) async fn verify_bump_detailed(
 ) -> Result<bool, String> {
     match verify_bump_outcome(tracker, bump_hex, txid).await {
         BumpVerdict::Valid => {
-            crate::tracker_events::note(txid, "proof", Some(serde_json::json!({"merklePath":bump_hex})));
+            crate::tracker_events::note(
+                txid,
+                "proof",
+                Some(serde_json::json!({"merklePath":bump_hex})),
+            );
             Ok(true)
-        },
+        }
         BumpVerdict::Invalid => Ok(false),
         // unchanged: to every existing caller an absent header is a READ
         // FAULT (retried, never a refutation); only the ladder's rung fold
