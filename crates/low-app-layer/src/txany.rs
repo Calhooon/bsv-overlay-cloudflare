@@ -70,8 +70,8 @@ pub fn tx_any_cache_ttl_ms(answer: &TxAnyAnswer) -> f64 {
 }
 
 /// Arcade is the first external source for subjects without a verified bump,
-/// whether or not the overlay holds their bytes. Fresh SEEN_ON_NETWORK,
-/// SEEN_MULTIPLE_NODES and ACCEPTED are presence hints. Orphan and pre-network
+/// only where the overlay holds bytes or a submit record names the subject. Fresh SEEN_ON_NETWORK,
+/// SEEN_MULTIPLE_NODES are presence hints. Orphan and pre-network
 /// words do not count. A hint expires after ARCADE_WORD_FRESH_MS so a wedged
 /// broadcaster cannot hold the question forever. MINED and IMMUTABLE carry
 /// a merkle path and height that the caller must verify against our headers
@@ -91,7 +91,9 @@ pub enum ArcadeWord {
 pub const ARCADE_WORD_FRESH_MS: i64 = 30 * 60 * 1_000;
 
 /// First-party unmined presence hints. No status here writes a chain word.
-pub const ARCADE_SEEN_STATUSES: &[&str] = &["SEEN_ON_NETWORK", "SEEN_MULTIPLE_NODES", "ACCEPTED"];
+/// RECEIVED/STORED/ANNOUNCED/REQUESTED/SENT and ACCEPTED_BY_NETWORK are
+/// pre-SEEN ranks, never network presence (the 2026-09-17 HIGH-1 allow-list).
+pub const ARCADE_SEEN_STATUSES: &[&str] = &["SEEN_ON_NETWORK", "SEEN_MULTIPLE_NODES"];
 
 /// PURE: the three-way read of one Arcade body at `now_ms`.
 pub fn parse_arcade_word(status: u16, body: &str, now_ms: i64) -> ArcadeWord {
@@ -783,9 +785,19 @@ mod tests {
     /// bsv-low #451 slice C (iii): a verdict memo answers for its own txid inside the hour, never older, never
     /// from the future, never for another txid.
     #[test]
-    fn ns2_614_subject_binding_and_accepted_hint() {
+    fn ns2_l3_every_presence_word_is_in_tracker_vocabulary() {
+        let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/vectors/arcade_vocabulary.json")).unwrap();
+        for word in ARCADE_SEEN_STATUSES {
+            assert!(vocabulary["words"].as_array().unwrap().contains(&json!(word)));
+        }
+        assert!(!ARCADE_SEEN_STATUSES.contains(&"ACCEPTED_BY_NETWORK"));
+    }
+
+    #[test]
+    fn ns2_614_subject_binding_and_seen_hint() {
         let now = rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
-        for status in ["ACCEPTED", "SEEN_ON_NETWORK", "SEEN_MULTIPLE_NODES"] {
+        for status in ["SEEN_ON_NETWORK", "SEEN_MULTIPLE_NODES"] {
             let body = json!({"txid":"ab".repeat(32), "txStatus":status,
                 "timestamp":"2026-10-12T18:15:00Z"})
             .to_string();
