@@ -1309,10 +1309,13 @@ async fn submit_parts(
             let now = worker::Date::now().as_millis();
             match env.d1("OVERLAY_DB") {
                 Ok(db) => crate::admit_fast::admission_age_ms(&db, &subject_txid, now)
-                    .await.map(|age| now.saturating_sub(age) as i64),
+                    .await
+                    .map(|age| now.saturating_sub(age) as i64),
                 Err(_) => None,
             }
-        } else { None };
+        } else {
+            None
+        };
         let mut arcade =
             crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default())
                 // #214: Arcade's async REJECTED is never authoritative
@@ -1467,7 +1470,12 @@ async fn submit_parts(
         if duplicate_echo {
             if let Ok(db) = env.d1("OVERLAY_DB") {
                 ctx.wait_until(async move {
-                    crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_DUPLICATE_IN_FLIGHT, 1).await;
+                    crate::ops::bump_counter(
+                        &db,
+                        crate::ops::COUNTER_SUBMIT_DUPLICATE_IN_FLIGHT,
+                        1,
+                    )
+                    .await;
                 });
             }
         }
@@ -1647,13 +1655,7 @@ async fn submit_parts(
                     }
                 }
                 if let Ok(count_db) = env.d1("OVERLAY_DB") {
-                    let name = if admit_fast && duplicate_echo {
-                        crate::ops::COUNTER_SUBMIT_FAST_ADMITTED_ECHO
-                    } else if admit_fast {
-                        crate::ops::COUNTER_SUBMIT_FAST_ADMITTED
-                    } else {
-                        crate::ops::COUNTER_SUBMIT_PENDING_ADMITTED
-                    };
+                    let name = crate::ops::pending_admission_counter(admit_fast, duplicate_echo);
                     ctx.wait_until(async move {
                         crate::ops::bump_counter(&count_db, name, 1).await;
                     });
