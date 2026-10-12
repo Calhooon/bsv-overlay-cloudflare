@@ -57,6 +57,7 @@ base64 = "0.22"
 # BEEF parsing for /pots-view's spenderRawHex extraction (the same crate the
 # sibling overlay worker uses; `overlay` feature only — no net/tokio on wasm32).
 bsv-rs.workspace = true
+bsv-tracker = "=0.2.2"
 # Shared parser policies for client-derived BEEF read from the overlay's store.
 overlay-engine = { package = "bsv-overlay-engine", version = "0.1.3", path = "../overlay-engine" }
 # The `Poc5TemplatePot` covenant recognizer + param-region accessor (the SAME
