@@ -1730,13 +1730,19 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         .map(|v| v.to_string())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
-    let retire = crate::proof_fetcher::run_retire_pass(&ops_db, &arcade_base, None).await;
+    // #602 fold (MEDIUM-2): the conflict pass's GETs ride the WoC key when one is installed.
+    let woc_key = env.secret("WOC_API_KEY").ok().map(|k| k.to_string());
+    let retire =
+        crate::proof_fetcher::run_retire_pass(&ops_db, &arcade_base, woc_key.as_deref()).await;
     worker::console_log!(
-        "Scheduled: retire-pass — scanned={} retired={} kept_present={} kept_uncertain={}",
+        "Scheduled: retire-pass — scanned={} retired={} kept_present={} kept_uncertain={} conflict: scanned={} evicted={} faults={}",
         retire.scanned,
         retire.retired,
         retire.kept_present,
         retire.kept_uncertain,
+        retire.conflict.scanned,
+        retire.conflict.evicted,
+        retire.conflict.faults,
     );
 
     // 5. Admitted-but-network-absent rebroadcast backstop (bsv-low #273,
@@ -2114,13 +2120,19 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         .map(|v| v.to_string())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
-    let retire = crate::proof_fetcher::run_retire_pass(&ops_db, &arcade_base, None).await;
+    // #602 fold (MEDIUM-2): the conflict pass's GETs ride the WoC key when one is installed.
+    let woc_key = env.secret("WOC_API_KEY").ok().map(|k| k.to_string());
+    let retire =
+        crate::proof_fetcher::run_retire_pass(&ops_db, &arcade_base, woc_key.as_deref()).await;
     worker::console_log!(
-        "complete-proofs: retire-pass — scanned={} retired={} kept_present={} kept_uncertain={}",
+        "complete-proofs: retire-pass — scanned={} retired={} kept_present={} kept_uncertain={} conflict: scanned={} evicted={} faults={}",
         retire.scanned,
         retire.retired,
         retire.kept_present,
         retire.kept_uncertain,
+        retire.conflict.scanned,
+        retire.conflict.evicted,
+        retire.conflict.faults,
     );
     // 4c. admitted-but-network-absent rebroadcast backstop (bsv-low #273) —
     //     runs last, own bounds + 30min–14d candidacy bracket (gate LOW-1) +

@@ -2193,7 +2193,7 @@ fn parse_bitails_script_history(
 /// case-insensitive, coinbase `source_txid: None` never matches) is
 /// unit-pinned against real bytes — the caller's content-addressing already
 /// guarantees WHOSE bytes these are; this decides only what they spend.
-fn tx_consumes_outpoint(raw_hex: &str, txid: &str, vout: u32) -> Result<bool, String> {
+pub(crate) fn tx_consumes_outpoint(raw_hex: &str, txid: &str, vout: u32) -> Result<bool, String> {
     let tx = Transaction::from_hex(raw_hex).map_err(|e| format!("spender parse: {e}"))?;
     let want = txid.to_lowercase();
     Ok(tx.inputs.iter().any(|i| {
@@ -3338,9 +3338,9 @@ pub const REBROADCAST_POST_BUDGET: usize = 48;
 /// uncertain is `Inconclusive` → skip, retried next tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkPresence {
-    /// At least one indexer holds the tx (mempool or mined) — healthy;
-    /// proof completion will pick it up when it mines.
-    Present,
+    /// At least one indexer holds the tx. A positive height is mined;
+    /// None is mempool presence, never a terminal admission verdict.
+    Present { height: Option<u32> },
     /// BOTH indexers answered a definitive 404 — the admitted tx is absent
     /// from the network (the #267 incident class): rebroadcast.
     Absent,
@@ -3348,13 +3348,66 @@ pub enum NetworkPresence {
     Inconclusive,
 }
 
-/// PURE: fold the two indexer observations (`Some(true)` present,
-/// `Some(false)` definitive 404, `None` fault) into a [`NetworkPresence`].
-pub fn classify_presence(bitails: Option<bool>, woc: Option<bool>) -> NetworkPresence {
+/// Fold courier observations, retaining a mined height from either indexer.
+/// Absence requires two definitive 404s; faults cannot establish absence.
+pub fn classify_presence(
+    bitails: Option<NetworkPresence>,
+    woc: Option<NetworkPresence>,
+) -> NetworkPresence {
+    use NetworkPresence::{Absent, Inconclusive, Present};
     match (bitails, woc) {
-        (Some(true), _) | (_, Some(true)) => NetworkPresence::Present,
-        (Some(false), Some(false)) => NetworkPresence::Absent,
-        _ => NetworkPresence::Inconclusive,
+        (
+            Some(Present {
+                height: Some(height),
+            }),
+            _,
+        )
+        | (
+            _,
+            Some(Present {
+                height: Some(height),
+            }),
+        ) => Present {
+            height: Some(height),
+        },
+        (Some(Present { .. }), _) | (_, Some(Present { .. })) => Present { height: None },
+        (Some(Absent), Some(Absent)) => Absent,
+        _ => Inconclusive,
+    }
+}
+
+/// Courier HTTP evidence. A height of zero is mempool, never confirmation.
+/// Malformed successful bodies are faults, not admission evidence.
+pub fn presence_response(status: u16, body: &str) -> Option<NetworkPresence> {
+    if status == 404 {
+        return Some(NetworkPresence::Absent);
+    }
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let height = value
+        .get("blockheight")
+        .or_else(|| value.get("blockHeight"))
+        .and_then(|h| h.as_u64())
+        .and_then(|h| u32::try_from(h).ok())
+        .filter(|h| *h > 0);
+    Some(NetworkPresence::Present { height })
+}
+
+/// Presence-only consumers retain their existing absence bar.
+pub fn presence_bool(presence: NetworkPresence) -> bool {
+    matches!(presence, NetworkPresence::Present { .. })
+}
+
+pub fn bool_presence(present: bool) -> NetworkPresence {
+    if present {
+        NetworkPresence::Present { height: None }
+    } else {
+        NetworkPresence::Absent
     }
 }
 
@@ -3429,24 +3482,25 @@ fn rebroadcast_legs(beef: &[u8]) -> Option<(String, Vec<RebroadcastLeg>)> {
     }
 }
 
-/// Bitails `GET /tx/{txid}` presence: `Some(true)` on 2xx, `Some(false)` on
-/// a definitive 404, `None` on anything else (fault — never a verdict).
-pub(crate) async fn bitails_presence(base: &str, txid: &str) -> Option<bool> {
+/// Bitails presence with the body's mined height, definitive 404 or fault.
+pub(crate) async fn bitails_presence(base: &str, txid: &str) -> Option<NetworkPresence> {
     let url = format!("{}/tx/{}", base.trim_end_matches('/'), txid);
     match http_get(&url, None).await {
-        Ok((status, _)) if (200..300).contains(&status) => Some(true),
-        Ok((404, _)) => Some(false),
+        Ok((status, body)) => presence_response(status, &body),
         _ => None,
     }
 }
 
 /// WoC `GET /tx/hash/{txid}` presence — same three-way contract.
-pub(crate) async fn woc_presence(base: &str, api_key: Option<&str>, txid: &str) -> Option<bool> {
+pub(crate) async fn woc_presence(
+    base: &str,
+    api_key: Option<&str>,
+    txid: &str,
+) -> Option<NetworkPresence> {
     let url = format!("{}/tx/hash/{}", base.trim_end_matches('/'), txid);
     let hdr = api_key.map(|k| ("woc-api-key", k));
     match http_get(&url, hdr).await {
-        Ok((status, _)) if (200..300).contains(&status) => Some(true),
-        Ok((404, _)) => Some(false),
+        Ok((status, body)) => presence_response(status, &body),
         _ => None,
     }
 }
@@ -3491,13 +3545,13 @@ pub async fn rebroadcast_absent_admitted(
         // Presence probe: Bitails first (WoC is the free-tier-429 host — it
         // is only consulted when Bitails did not already prove presence).
         let bitails = bitails_presence(DEFAULT_BITAILS_BASE, txid).await;
-        if bitails == Some(true) {
+        if bitails.is_some_and(presence_bool) {
             summary.present += 1;
             continue;
         }
         let woc = woc_presence(DEFAULT_WOC_BASE, woc_api_key, txid).await;
         match classify_presence(bitails, woc) {
-            NetworkPresence::Present => {
+            NetworkPresence::Present { .. } => {
                 summary.present += 1;
                 continue;
             }
@@ -3777,7 +3831,9 @@ pub fn retire_verdict(
     if matches!(arcade, ArcadeLook::Present) {
         return None;
     }
-    if classify_presence(bitails, woc) != NetworkPresence::Absent {
+    if classify_presence(bitails.map(bool_presence), woc.map(bool_presence))
+        != NetworkPresence::Absent
+    {
         return None;
     }
     match arcade {
@@ -3860,6 +3916,8 @@ pub struct RetireSummary {
     pub retired: usize,
     pub kept_present: usize,
     pub kept_uncertain: usize,
+    /// #602 fold (MEDIUM-1): the conflict pass that runs first.
+    pub conflict: crate::admit_fast::ConflictPassSummary,
 }
 
 /// Shipped candidate SQL for the retire pass — the proofless_watch ledger IS
@@ -3911,7 +3969,11 @@ pub async fn run_retire_pass(
     woc_api_key: Option<&str>,
 ) -> RetireSummary {
     use crate::d1::Query;
-    let mut summary = RetireSummary::default();
+    let conflict = crate::admit_fast::confirmed_conflict_pass(db, woc_api_key).await;
+    let mut summary = RetireSummary {
+        conflict,
+        ..RetireSummary::default()
+    };
     let now = js_sys::Date::now() as i64;
     // the second gate's LOW-1: request-time absences past their window are dropped here (one statement per tick),
     // so a stranger's random-txid asks never grow the table without bound
@@ -3947,12 +4009,17 @@ pub async fn run_retire_pass(
             }
             // Corroboration probes (the same courier hosts as the backstop).
             let bitails = bitails_presence(DEFAULT_BITAILS_BASE, &row.txid).await;
-            let woc = if bitails == Some(true) {
-                Some(true)
+            let woc = if bitails.is_some_and(presence_bool) {
+                bitails
             } else {
                 woc_presence(DEFAULT_WOC_BASE, woc_api_key, &row.txid).await
             };
-            match retire_verdict(&look, bitails, woc, row.age_secs as i64) {
+            match retire_verdict(
+                &look,
+                bitails.map(presence_bool),
+                woc.map(presence_bool),
+                row.age_secs as i64,
+            ) {
                 Some(reason) => {
                     let write = match store {
                         "transactions" => {
@@ -4474,20 +4541,20 @@ pub(crate) mod tests {
         // presence is cheap to trust — the harmful error is a missed rescue,
         // and proof completion covers a present tx).
         assert_eq!(
-            classify_presence(Some(true), None),
-            NetworkPresence::Present
+            classify_presence(Some(bool_presence(true)), None),
+            NetworkPresence::Present { height: None }
         );
         assert_eq!(
-            classify_presence(None, Some(true)),
-            NetworkPresence::Present
+            classify_presence(None, Some(bool_presence(true))),
+            NetworkPresence::Present { height: None }
         );
         assert_eq!(
-            classify_presence(Some(true), Some(false)),
-            NetworkPresence::Present
+            classify_presence(Some(bool_presence(true)), Some(bool_presence(false))),
+            NetworkPresence::Present { height: None }
         );
         assert_eq!(
-            classify_presence(Some(false), Some(true)),
-            NetworkPresence::Present
+            classify_presence(Some(bool_presence(false)), Some(bool_presence(true))),
+            NetworkPresence::Present { height: None }
         );
     }
 
@@ -4496,16 +4563,16 @@ pub(crate) mod tests {
         // The ACTION verdict needs BOTH indexers' definitive 404 — a negative
         // never rests on one provider's word (#212/#213/#214 doctrine).
         assert_eq!(
-            classify_presence(Some(false), Some(false)),
+            classify_presence(Some(bool_presence(false)), Some(bool_presence(false))),
             NetworkPresence::Absent
         );
         // One-sided 404s and faults are inconclusive → no action, retried.
         assert_eq!(
-            classify_presence(Some(false), None),
+            classify_presence(Some(bool_presence(false)), None),
             NetworkPresence::Inconclusive
         );
         assert_eq!(
-            classify_presence(None, Some(false)),
+            classify_presence(None, Some(bool_presence(false))),
             NetworkPresence::Inconclusive
         );
         assert_eq!(classify_presence(None, None), NetworkPresence::Inconclusive);

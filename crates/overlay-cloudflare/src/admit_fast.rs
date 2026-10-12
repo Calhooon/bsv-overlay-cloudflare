@@ -1454,6 +1454,228 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
     true
 }
 
+/// #602: indexer confirmation is distinct from a broadcaster's stored echo.
+#[async_trait(?Send)]
+pub trait ConflictPresence {
+    async fn presence(&self, txid: &str) -> Option<crate::proof_fetcher::NetworkPresence>;
+}
+
+pub struct CourierConflictPresence {
+    pub woc_api_key: Option<String>,
+}
+
+#[async_trait(?Send)]
+impl ConflictPresence for CourierConflictPresence {
+    async fn presence(&self, txid: &str) -> Option<crate::proof_fetcher::NetworkPresence> {
+        use crate::proof_fetcher::*;
+        let b = bitails_presence(DEFAULT_BITAILS_BASE, txid).await;
+        let w = woc_presence(DEFAULT_WOC_BASE, self.woc_api_key.as_deref(), txid).await;
+        Some(classify_presence(b, w))
+    }
+}
+
+/// The only mutation port is the existing reversible eviction.
+#[async_trait(?Send)]
+pub trait ConflictEviction {
+    async fn evict_conflict(&self, txid: &str, reason: &str, now_ms: u64) -> Result<(), String>;
+}
+
+#[async_trait(?Send)]
+impl ConflictEviction for D1Database {
+    async fn evict_conflict(&self, txid: &str, reason: &str, now_ms: u64) -> Result<(), String> {
+        let result = evict_txid_everywhere(self, txid, reason, now_ms).await;
+        if !result.yielded {
+            write_refused_verdict(self, txid, now_ms as i64, reason).await;
+        }
+        Ok(())
+    }
+}
+
+/// Walk the subject's actual inputs. A spender hint alone is never a refusal:
+/// its content-addressed raw must consume the same outpoint and an indexer must
+/// name a positive mined height. Faults leave the pot available for a later pass.
+pub async fn converge_confirmed_conflict(
+    store: &dyn ConflictEviction,
+    fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
+    presence: &dyn ConflictPresence,
+    txid: &str,
+    raw: &[u8],
+    now_ms: u64,
+) -> Result<bool, String> {
+    use crate::proof_fetcher::NetworkPresence;
+    let subject = bsv_rs::transaction::Transaction::from_binary(raw).map_err(|e| e.to_string())?;
+    if !subject.id().eq_ignore_ascii_case(txid) {
+        return Err("subject raw txid mismatch".into());
+    }
+    let mut fault = None;
+    // Rotate the first input so a bounded pass cannot permanently starve a
+    // later input of a large subject. An unavailable input cannot hide another.
+    let start = (now_ms as usize) % subject.inputs.len().max(1);
+    for input in subject
+        .inputs
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(subject.inputs.len())
+    {
+        let Some(parent) = input.source_txid.as_deref() else {
+            continue;
+        };
+        let vout = input.source_output_index;
+        let competitor = match fetcher.resolve_spender(parent, vout).await {
+            Ok(Some(txid)) => txid,
+            Ok(None) => continue,
+            Err(e) => {
+                fault = Some(e);
+                continue;
+            }
+        };
+        if competitor.eq_ignore_ascii_case(txid) {
+            continue;
+        }
+        let bound_raw = match fetcher.spender_binding_raw(&competitor, parent, vout).await {
+            Ok(Some(raw)) => raw,
+            Ok(None) => continue,
+            Err(e) => {
+                fault = Some(e);
+                continue;
+            }
+        };
+        let bound =
+            bsv_rs::transaction::Transaction::from_hex(&bound_raw).map_err(|e| e.to_string())?;
+        if !bound.id().eq_ignore_ascii_case(&competitor)
+            || !crate::proof_fetcher::tx_consumes_outpoint(&bound_raw, parent, vout)?
+        {
+            continue;
+        }
+        // #602 fold (LOW-3, stated): the courier's `blockheight` is trusted as the
+        // chain's word, unverified against chaintracks; an orphaned block's height
+        // would evict a live pot once, and the pot's pushed MINED proof readmits it.
+        if let Some(NetworkPresence::Present {
+            height: Some(height),
+        }) = presence.presence(&competitor).await
+        {
+            if height == 0 {
+                continue;
+            }
+            store.evict_conflict(txid, &format!("input {parent}:{vout} spent by confirmed competitor {competitor} at {height}"), now_ms).await?;
+            return Ok(true);
+        }
+    }
+    match fault {
+        Some(e) => Err(e),
+        None => Ok(false),
+    }
+}
+
+/// Includes already-retired and readmitted pots: proof retirement must not
+/// remove an unconfirmed live pot from the conflict re-check population.
+pub const CONFLICT_CANDIDATES_SQL: &str = "SELECT b.txid, hex(b.beef) AS beef FROM pot_beefs b \
+     WHERE b.proof_verified = 0 AND EXISTS (SELECT 1 FROM pot_records p WHERE p.txid = b.txid) \
+     ORDER BY RANDOM() LIMIT 8";
+
+/// #602 fold (MEDIUM-1): what one conflict pass did, counted and on the tick's line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictPassSummary {
+    pub scanned: u64,
+    pub evicted: u64,
+    pub faults: u64,
+}
+
+impl ConflictPassSummary {
+    /// One candidate's re-check: `Ok(true)` evicted, `Err` a courier or parse fault.
+    pub fn note(&mut self, result: &Result<bool, String>) {
+        self.scanned += 1;
+        match result {
+            Ok(true) => self.evicted += 1,
+            Ok(false) => {}
+            Err(_) => self.faults += 1,
+        }
+    }
+
+    /// The counters this pass bumps (served from 0 in `read_counters`).
+    pub fn counter_deltas(&self) -> [(&'static str, u64); 3] {
+        [
+            (
+                crate::ops::COUNTER_ADMIT_FAST_CONFLICT_SCANNED,
+                self.scanned,
+            ),
+            (
+                crate::ops::COUNTER_ADMIT_FAST_CONFLICT_EVICTED,
+                self.evicted,
+            ),
+            (crate::ops::COUNTER_ADMIT_FAST_CONFLICT_FAULTS, self.faults),
+        ]
+    }
+}
+
+pub async fn confirmed_conflict_pass(
+    db: &D1Database,
+    woc_api_key: Option<&str>,
+) -> ConflictPassSummary {
+    let mut summary = ConflictPassSummary::default();
+    #[derive(serde::Deserialize)]
+    struct Candidate {
+        txid: String,
+        beef: Option<String>,
+    }
+    let rows = match Query::new(CONFLICT_CANDIDATES_SQL)
+        .fetch_all::<Candidate>(db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            worker::console_log!("[conflict] candidate read failed: {e}");
+            summary.faults += 1;
+            bump_conflict_counters(db, &summary).await;
+            return summary;
+        }
+    };
+    let fetcher = crate::proof_fetcher::ChainProofFetcher::new(None)
+        .with_woc_api_key(woc_api_key.map(str::to_owned))
+        .with_budget(24);
+    let presence = CourierConflictPresence {
+        woc_api_key: woc_api_key.map(str::to_owned),
+    };
+    for row in rows {
+        let Some(raw) =
+            crate::d1::beef_of_hex_column(row.beef).and_then(|b| crate::ef::proven_subject_raw(&b))
+        else {
+            // #602 delta LOW-B: a pot the pass cannot read is a fault, never skipped unseen.
+            worker::console_log!(
+                "[conflict] {} stored BEEF does not read, retried next pass",
+                row.txid.get(..16).unwrap_or(&row.txid)
+            );
+            summary.note(&Err("stored BEEF does not read".into()));
+            continue;
+        };
+        let result = converge_confirmed_conflict(
+            db,
+            &fetcher,
+            &presence,
+            &row.txid,
+            &raw,
+            worker::Date::now().as_millis(),
+        )
+        .await;
+        summary.note(&result);
+        if let Err(e) = result {
+            worker::console_log!(
+                "[conflict] {} re-check failed, retried next pass: {e}",
+                row.txid
+            );
+        }
+    }
+    bump_conflict_counters(db, &summary).await;
+    summary
+}
+
+async fn bump_conflict_counters(db: &D1Database, summary: &ConflictPassSummary) {
+    for (name, delta) in summary.counter_deltas() {
+        crate::ops::bump_counter(db, name, delta).await;
+    }
+}
+
 /// What the evidence check concluded about a refusal callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvidenceVerdict {
@@ -1490,8 +1712,8 @@ pub fn evidence_verdict(
         // MINED in 958776 at a sticky REJECTED), and an indexer that holds
         // the tx is a witness against the refusal.
         ArcadeLook::Fatal(..) | ArcadeLook::Missing | ArcadeLook::Fault => {
-            match crate::proof_fetcher::classify_presence(bitails, woc) {
-                NetworkPresence::Present => EvidenceVerdict::Present,
+            match crate::proof_fetcher::classify_presence(bitails.map(crate::proof_fetcher::bool_presence), woc.map(crate::proof_fetcher::bool_presence)) {
+                NetworkPresence::Present { .. } => EvidenceVerdict::Present,
                 // Absence-based (Arcade missing or faulted, not its own fatal word): a young or never-admitted
                 // txid is UNCERTAIN (counted), never refused (the gate's HIGH-2).
                 NetworkPresence::Absent
@@ -1581,7 +1803,12 @@ pub async fn evidence_check(
         }
         _ => false,
     };
-    evidence_verdict(&look, bitails, woc, young)
+    evidence_verdict(
+        &look,
+        bitails.map(crate::proof_fetcher::presence_bool),
+        woc.map(crate::proof_fetcher::presence_bool),
+        young,
+    )
 }
 
 #[derive(serde::Deserialize)]

@@ -825,6 +825,46 @@ gasp_topic_manager i551` (and `fold_medium`).
 
 The anchor verify ran peer-chosen scripts with no work bound under the Worker CPU cap (bsv-low #557); since #592 it walks under the engine's `DoorBudget`. Since the E592 lens fold a breach is HELD, never replayed: `GASPError::AnchorWalkHeld`, the graph not finalized, the UTXO failed (or, under a per-graph budget, its record kept with nothing pending, reason `anchor_walk_held`), the cursor below it, counted (`GASPSync::anchor_walk_held`, `anchor_walk_held_graphs`, the worker's `gasp_anchor_walk_held_total`). The roots the walk reached are checked first, so a bad proof is still a refusal. The hold ends when the peer serves the root PROVEN: #555's resume re-asks an unproven root and a proven one restarts the walk (`root_proven`), which trusts the proof and runs no script; so an honest 0-conf graph too big to walk lands after its block, a forgery never. What a forging peer costs: its own slot (the UTXO held below the cursor, its record re-asked each pass up to `DEFERRED_GRAPH_MAX_PASSES`) inside its per-peer budget, and D16's yieldless bound quarantines it if it never yields and serves nothing else, which holds ONLY with a per-graph budget (`set_graph_budget`, as the worker sets): the yieldless bound exists only there (the E592 delta lens, D1-L2). With NO per-graph budget (a library consumer that sets none) the held UTXO fails on every sync, the sync runs to its end and counts as a success under #302, the cursor stays below that UTXO for good, and the graph is fetched and its walk estimated again on every tick; nothing is admitted, the cost is ours, the residual D15 states for `AnchorUnavailable`. Not pinned by a test peer in the lane (stated).
 
+## Terminal admission and confirmed conflicts (bsv-low #602)
+
+For an Arcade-terminal subject, the courier presence fold retains the mined
+height. Mined presence still admits (#214); mempool presence is a live race,
+never a readmission or a SEEN witness. It answers retryable while the admission
+is young or unknown, and the standing 422 while aged. Mempool presence is not
+memoised and is counted as `submit_terminal_judged_race_total`.
+A courier-mined acceptance answers `admit;desc="mined"` and leaves
+`network_seen` unlatched. Readmitted and courier-mined Accepted subjects start a pending watch, which
+must read a broadcaster's SEEN before latching.
+
+Before proof retirement, a bounded conflict pass samples eight live,
+unverified pot BEEFs, including retired and readmitted ones. It reads each
+subject's actual inputs and the network's spender hints. Only a different,
+content-addressed transaction consuming the same input with an indexer's
+positive mined height triggers `evict_txid_everywhere`, the existing reversible
+shadow move. Mempool competitors, unrelated bytes and courier faults evict
+nothing. Failed reads remain candidates for a later pass; this sampling gives
+no fixed convergence deadline. The fetcher has a separate 24-call budget.
+
+Stated (the E602 lens fold, 2026-10-12). The pending watch's and the refusal
+callback's evidence checks still read mempool presence as "a courier holds
+it" and KEEP a refused pot (the #214 belt): such a pot is evicted by the
+conflict pass after its competitor mines, not by the callback. The pass is
+counted from 0 (`admit_fast_conflict_scanned_total`,
+`admit_fast_conflict_evicted_total`, `admit_fast_conflict_faults_total`) and
+summarised on the retire-pass line (`conflict: scanned= evicted= faults=`);
+both callers pass the `WOC_API_KEY` secret (none is installed today). A
+courier-mined subject's watch cannot latch while Arcade stays terminal: its
+`network_seen` comes from the merkle bar or a later live SEEN; a witnessed
+accept latches at once and starts no watch. The courier's `blockheight` is
+trusted as the chain's word, unverified against chaintracks, for the #214
+admission and for a competitor's confirmation: an orphaned block's height
+evicts once, reversed by the pot's MINED push; or admits once, taken back by
+the conflict pass when a competitor mines or by the retire pass when both
+couriers go clean. A candidate whose stored BEEF does not read is counted a
+fault and logged (`[conflict] <txid prefix>`). The race word applies
+to EVERY Arcade-terminal status, not only a conflict-shaped one: an aged,
+non-conflict REJECTED subject one node still holds is the 422.
+
 ## A faulted submit leaves one head (bsv-low #559, lens fold and three delta folds of 2026-10-07)
 
 `Engine::submit` inserts the admitted outputs BEFORE it deletes the stale

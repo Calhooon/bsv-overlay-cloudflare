@@ -255,6 +255,7 @@ pub const COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT: &str = "submit_readmitted_b
 /// bsv-low #519 (loop 20, 2026-09-21): an Arcade-terminal subject judged at the ladder by the chain's indexers
 /// (never a broadcaster's echo): held by an indexer (admitted), absent past the age floor (the two-source refusal),
 /// absent but young (the retryable word), the indexers inconclusive, or this isolate's courier budget spent.
+pub const COUNTER_SUBMIT_TERMINAL_RACE: &str = "submit_terminal_judged_race_total";
 pub const COUNTER_SUBMIT_TERMINAL_PRESENT: &str = "submit_terminal_judged_present_total";
 pub const COUNTER_SUBMIT_TERMINAL_ABSENT: &str = "submit_terminal_judged_absent_total";
 pub const COUNTER_SUBMIT_TERMINAL_YOUNG: &str = "submit_terminal_judged_young_total";
@@ -340,6 +341,11 @@ pub const COUNTER_ADMIT_FAST_EVICT_YIELDED: &str = "admit_fast_evict_yielded_tot
 /// pass whose yield-restore faulted with twin rows left (re-opened), by the readmission's belt on the same, and
 /// by a readmission whose stamp UPDATE failed (round 4).
 pub const COUNTER_ADMIT_FAST_READMIT_INCOMPLETE: &str = "admit_fast_readmit_incomplete_total";
+/// bsv-low #602 fold (MEDIUM-1): the conflict pass's live unverified pots re-checked, the pots it evicted on a
+/// bound confirmed competitor, and the pots whose re-check faulted (a candidate read fault counts one).
+pub const COUNTER_ADMIT_FAST_CONFLICT_SCANNED: &str = "admit_fast_conflict_scanned_total";
+pub const COUNTER_ADMIT_FAST_CONFLICT_EVICTED: &str = "admit_fast_conflict_evicted_total";
+pub const COUNTER_ADMIT_FAST_CONFLICT_FAULTS: &str = "admit_fast_conflict_faults_total";
 /// fleet loop 15 (2026-09-20): the pending watch confirmed a spend by its OWN proof read at its end — a tx that mined
 /// before the index saw it (Arcade's stored echo never says MINED, no callback is registered for an already-known tx).
 pub const COUNTER_SUBMIT_PENDING_CONFIRMED_NOW: &str = "submit_pending_confirmed_now_total";
@@ -739,16 +745,15 @@ struct PotVoutRow {
     output_index: u32,
 }
 
+/// The one bump statement (factored so the real-SQLite tier runs it as shipped).
+pub const BUMP_COUNTER_SQL: &str = "INSERT INTO ops_counters (name, value) VALUES (?, ?) \
+     ON CONFLICT(name) DO UPDATE SET value = ops_counters.value + excluded.value";
+
 pub async fn bump_counter(db: &D1Database, name: &str, delta: u64) {
     if delta == 0 {
         return;
     }
-    let q = Query::new(
-        "INSERT INTO ops_counters (name, value) VALUES (?, ?) \
-         ON CONFLICT(name) DO UPDATE SET value = ops_counters.value + excluded.value",
-    )
-    .bind(name)
-    .bind(delta);
+    let q = Query::new(BUMP_COUNTER_SQL).bind(name).bind(delta);
     if let Err(e) = q.execute(db).await {
         worker::console_log!("[ops] counter {name} bump failed: {e}");
     }
@@ -1056,6 +1061,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
         // bsv-low #519 (2026-09-21): the terminal judgement's counters read 0 until they fire.
         COUNTER_SUBMIT_TERMINAL_PRESENT,
+        COUNTER_SUBMIT_TERMINAL_RACE,
         COUNTER_SUBMIT_TERMINAL_ABSENT,
         COUNTER_SUBMIT_TERMINAL_YOUNG,
         COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE,
@@ -1067,6 +1073,9 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
         COUNTER_ADMIT_FAST_EVICT_YIELDED,
         COUNTER_ADMIT_FAST_READMIT_INCOMPLETE,
+        COUNTER_ADMIT_FAST_CONFLICT_SCANNED,
+        COUNTER_ADMIT_FAST_CONFLICT_EVICTED,
+        COUNTER_ADMIT_FAST_CONFLICT_FAULTS,
         // bsv-low #484: the probe-memo invalidation reads 0 until a reorg (or the TTL) clears one.
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED,
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED,

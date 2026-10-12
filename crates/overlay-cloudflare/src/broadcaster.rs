@@ -1813,7 +1813,7 @@ where
 /// #214's own case (Arcade's stale REJECTED for a tx MINED in 958776) is `Present` here and admits as it always did.
 ///
 /// The arms, with the gate's findings folded (2026-09-21):
-/// - `Present` admits under our subject txid (one indexer holding it is the network holding it).
+/// - Mined `Present` admits under our subject txid (#214). Mempool presence never readmits.
 /// - `Absent` with the admission at least `REFUSAL_ABSENT_MIN_AGE_MS` old is the two-source refusal (#513's evidence
 ///   rule: Arcade's own fatal word plus both indexers absent) and answers Rejected — the route's 422, an open
 ///   eviction re-run. `Absent` on a YOUNG (or never-admitted) subject answers a retryable Err instead (the gate's
@@ -1826,9 +1826,8 @@ where
 /// The refusal's text carries Arcade's `extraInfo` (the gate's MEDIUM-2: the client's refund classifier keys on
 /// `utxo_spent | spent by | double spend | txn-mempool-conflict`) with the tokens the client's already-known belt
 /// matches scrubbed out (`already | known | seen | mined`: a 422 must never read as success on an older client).
-/// Stated residual (parity, not worse): during a live unconfirmed double-spend race WoC's first-seen view can be
-/// the losing tx → `Present` → readmitted as witnessed with no Arcade lifecycle behind it; the ≥ 1 h retire pass
-/// and the spend-pointer machinery undo it when the competitor mines (the old echo had the same shape, unbounded).
+/// #602: only mined presence overrules a terminal broadcaster. Mempool presence is a live race,
+/// retryable while young and the standing refusal while aged; it never readmits or witnesses.
 pub fn terminal_at_arcade_by_presence(
     presence: crate::proof_fetcher::NetworkPresence,
     young: bool,
@@ -1838,7 +1837,15 @@ pub fn terminal_at_arcade_by_presence(
 ) -> Result<ArcOutcome, String> {
     use crate::proof_fetcher::NetworkPresence;
     match presence {
-        NetworkPresence::Present => Ok(ArcOutcome::Accepted(subject_txid.to_string())),
+        // #602 fold (LOW-3, LOW-5, stated): the courier's `blockheight` is trusted as
+        // the chain's word (a mislabelled orphan admits once; a MINED push corrects it),
+        // and the race word below applies to EVERY Arcade-terminal status, not only a
+        // conflict-shaped one: stricter than #602's proposal.
+        NetworkPresence::Present { height: Some(_) } => Ok(ArcOutcome::Accepted(subject_txid.to_string())),
+        NetworkPresence::Present { height: None } if young => Err(format!(
+            "Arcade holds {subject_txid} terminal ({arcade_status}); mempool presence is a live race: retryable (#602)"
+        )),
+        NetworkPresence::Present { height: None } => Ok(ArcOutcome::Rejected(terminal_refusal_reason(subject_txid, arcade_status, extra_info))),
         NetworkPresence::Absent if young => Err(format!(
             "Arcade holds {subject_txid} terminal ({arcade_status}) and the indexers do not hold it yet, but the admission is under ten minutes old or not recorded: the network has not had its window — retryable, never a definitive refusal on a young subject (#519, Rule 6)"
         )),
@@ -1856,8 +1863,17 @@ pub fn terminal_at_arcade_by_presence(
 /// PURE (the delta-verify's LOW, 2026-09-21): a definitive refusal must rest on a FRESH courier read. A memoised
 /// `Absent` taken while the subject was young (and answered retryable then) must not carry it across the age floor
 /// into a 422: when the memo would decide a refusal, the couriers are asked again (the cap still bounds it).
-pub fn must_reask_before_refusing(presence: crate::proof_fetcher::NetworkPresence, young: bool, source: &str) -> bool {
-    presence == crate::proof_fetcher::NetworkPresence::Absent && !young && source == "memo"
+pub fn must_reask_before_refusing(
+    presence: crate::proof_fetcher::NetworkPresence,
+    young: bool,
+    source: &str,
+) -> bool {
+    matches!(
+        presence,
+        crate::proof_fetcher::NetworkPresence::Absent
+            | crate::proof_fetcher::NetworkPresence::Present { height: None }
+    ) && !young
+        && source == "memo"
 }
 
 /// PURE (#519, the gate's MEDIUM-2 + NIT-3): the two-source refusal's text, Arcade's `extraInfo` threaded as TEXT
@@ -1929,7 +1945,8 @@ pub fn terminal_memo_store(
 ) {
     use crate::proof_fetcher::NetworkPresence;
     let remember = match presence {
-        NetworkPresence::Present => true,
+        NetworkPresence::Present { height: Some(_) } => true,
+        NetworkPresence::Present { height: None } => false,
         NetworkPresence::Absent => !young,
         NetworkPresence::Inconclusive => false,
     };
@@ -1966,6 +1983,7 @@ thread_local! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalJudgement {
     Present,
+    Race,
     Absent,
     Young,
     Inconclusive,
@@ -1979,7 +1997,8 @@ impl TerminalJudgement {
             return TerminalJudgement::Capped;
         }
         match presence {
-            NetworkPresence::Present => TerminalJudgement::Present,
+            NetworkPresence::Present { height: Some(_) } => TerminalJudgement::Present,
+            NetworkPresence::Present { height: None } => TerminalJudgement::Race,
             NetworkPresence::Absent if young => TerminalJudgement::Young,
             NetworkPresence::Absent => TerminalJudgement::Absent,
             NetworkPresence::Inconclusive => TerminalJudgement::Inconclusive,
@@ -1989,12 +2008,18 @@ impl TerminalJudgement {
     pub fn counter(self) -> &'static str {
         match self {
             TerminalJudgement::Present => crate::ops::COUNTER_SUBMIT_TERMINAL_PRESENT,
+            TerminalJudgement::Race => crate::ops::COUNTER_SUBMIT_TERMINAL_RACE,
             TerminalJudgement::Absent => crate::ops::COUNTER_SUBMIT_TERMINAL_ABSENT,
             TerminalJudgement::Young => crate::ops::COUNTER_SUBMIT_TERMINAL_YOUNG,
             TerminalJudgement::Inconclusive => crate::ops::COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE,
             TerminalJudgement::Capped => crate::ops::COUNTER_SUBMIT_TERMINAL_CAPPED,
         }
     }
+}
+
+/// A terminal judgement uses courier evidence, never a broadcaster SEEN word.
+pub fn admission_has_broadcaster_witness(terminal: Option<TerminalJudgement>) -> bool {
+    terminal.is_none()
 }
 
 /// Concatenate an EF batch (dependency order) into a single `POST /txs` body.
@@ -2119,6 +2144,11 @@ impl ArcadeBroadcaster {
     /// Server-Timing segment, carved out of `arcade-broadcast` like the corroborate leg).
     pub fn terminal_ms(&self) -> f64 {
         self.terminal_ms.get()
+    }
+
+    /// A terminal courier admission has no broadcaster SEEN witness (#602).
+    pub fn admission_is_witnessed(&self) -> bool {
+        admission_has_broadcaster_witness(self.terminal_judgement())
     }
 
     /// #519: how this request's Arcade-terminal subject was judged, if one was.
@@ -2430,8 +2460,12 @@ impl ArcadeBroadcaster {
             let started = worker::js_sys::Date::now();
             let extra_info = probe.as_ref().map(|r| r.extra_info.as_str()).unwrap_or("");
             let (mut presence, mut source) = self.terminal_presence(subject_txid, started).await;
-            // the age floor (the gate's MEDIUM-1, Rule 6): asked only when the indexers do not hold it
-            let young = if presence == crate::proof_fetcher::NetworkPresence::Absent {
+            // #602: the age floor applies to absence and mempool-only presence.
+            let young = if matches!(
+                presence,
+                crate::proof_fetcher::NetworkPresence::Absent
+                    | crate::proof_fetcher::NetworkPresence::Present { height: None }
+            ) {
                 subject_young.await
             } else {
                 false
@@ -3944,11 +3978,29 @@ mod tests {
     fn terminal_at_arcade_is_judged_by_the_indexers_never_a_broadcasters_echo() {
         use crate::proof_fetcher::NetworkPresence;
         assert_eq!(
-            terminal_at_arcade_by_presence(NetworkPresence::Present, false, "subject", "REJECTED", "").unwrap(),
+            terminal_at_arcade_by_presence(
+                NetworkPresence::Present {
+                    height: Some(970710)
+                },
+                false,
+                "subject",
+                "REJECTED",
+                ""
+            )
+            .unwrap(),
             ArcOutcome::Accepted("subject".into())
         );
         assert_eq!(
-            terminal_at_arcade_by_presence(NetworkPresence::Present, true, "subject", "REJECTED", "").unwrap(),
+            terminal_at_arcade_by_presence(
+                NetworkPresence::Present {
+                    height: Some(970710)
+                },
+                true,
+                "subject",
+                "REJECTED",
+                ""
+            )
+            .unwrap(),
             ArcOutcome::Accepted("subject".into()),
             "an indexer holding it is the network holding it, young or not"
         );
@@ -3966,13 +4018,43 @@ mod tests {
         // THE 09:39Z SHAPE, pinned by construction: a corroborator's stored accept is not an input here at all —
         // the decision takes the indexers' presence and nothing else. The classifier's rules are pinned in
         // `proof_fetcher` (a negative needs BOTH indexers clean; one holder is Present; a fault is Inconclusive).
-        assert!(matches!(crate::proof_fetcher::classify_presence(Some(false), Some(false)), NetworkPresence::Absent));
-        assert!(matches!(crate::proof_fetcher::classify_presence(Some(true), Some(false)), NetworkPresence::Present));
-        assert!(matches!(crate::proof_fetcher::classify_presence(None, Some(false)), NetworkPresence::Inconclusive));
+        assert!(matches!(
+            crate::proof_fetcher::classify_presence(
+                Some(NetworkPresence::Absent),
+                Some(NetworkPresence::Absent)
+            ),
+            NetworkPresence::Absent
+        ));
+        assert!(matches!(
+            crate::proof_fetcher::classify_presence(
+                Some(NetworkPresence::Present { height: None }),
+                Some(NetworkPresence::Absent)
+            ),
+            NetworkPresence::Present { height: None }
+        ));
+        assert!(matches!(
+            crate::proof_fetcher::classify_presence(None, Some(NetworkPresence::Absent)),
+            NetworkPresence::Inconclusive
+        ));
         // the judgement the operator counts
-        assert_eq!(TerminalJudgement::of(NetworkPresence::Absent, true, false), TerminalJudgement::Young);
-        assert_eq!(TerminalJudgement::of(NetworkPresence::Inconclusive, false, true), TerminalJudgement::Capped);
-        assert_eq!(TerminalJudgement::of(NetworkPresence::Present, true, false), TerminalJudgement::Present);
+        assert_eq!(
+            TerminalJudgement::of(NetworkPresence::Absent, true, false),
+            TerminalJudgement::Young
+        );
+        assert_eq!(
+            TerminalJudgement::of(NetworkPresence::Inconclusive, false, true),
+            TerminalJudgement::Capped
+        );
+        assert_eq!(
+            TerminalJudgement::of(
+                NetworkPresence::Present {
+                    height: Some(970710)
+                },
+                true,
+                false
+            ),
+            TerminalJudgement::Present
+        );
     }
 
     /// The gate's MEDIUM-2 + NIT-3: the refusal carries Arcade's `extraInfo` so the client's refund classifier
@@ -4039,12 +4121,45 @@ mod tests {
         terminal_memo_store(&mut m2, "y", NetworkPresence::Absent, true, 5.0);
         assert!(m2.is_empty(), "a young Absent is never remembered");
         terminal_memo_store(&mut m2, "o", NetworkPresence::Absent, false, 5.0);
-        terminal_memo_store(&mut m2, "p", NetworkPresence::Present, true, 5.0);
-        assert_eq!(terminal_memo_lookup(&m2, "o", 6.0, TERMINAL_MEMO_TTL_MS), Some(NetworkPresence::Absent), "an old Absent is remembered");
-        assert_eq!(terminal_memo_lookup(&m2, "p", 6.0, TERMINAL_MEMO_TTL_MS), Some(NetworkPresence::Present), "a Present is remembered, young or not");
-        assert!(!must_reask_before_refusing(NetworkPresence::Absent, true, "memo"), "young: the retryable word, no refusal to rest");
-        assert!(!must_reask_before_refusing(NetworkPresence::Absent, false, "couriers"), "already fresh");
-        assert!(!must_reask_before_refusing(NetworkPresence::Present, false, "memo"), "an admission may rest on the memo");
+        terminal_memo_store(
+            &mut m2,
+            "p",
+            NetworkPresence::Present {
+                height: Some(970710),
+            },
+            true,
+            5.0,
+        );
+        assert_eq!(
+            terminal_memo_lookup(&m2, "o", 6.0, TERMINAL_MEMO_TTL_MS),
+            Some(NetworkPresence::Absent),
+            "an old Absent is remembered"
+        );
+        assert_eq!(
+            terminal_memo_lookup(&m2, "p", 6.0, TERMINAL_MEMO_TTL_MS),
+            Some(NetworkPresence::Present {
+                height: Some(970710)
+            }),
+            "a Present is remembered, young or not"
+        );
+        assert!(
+            !must_reask_before_refusing(NetworkPresence::Absent, true, "memo"),
+            "young: the retryable word, no refusal to rest"
+        );
+        assert!(
+            !must_reask_before_refusing(NetworkPresence::Absent, false, "couriers"),
+            "already fresh"
+        );
+        assert!(
+            !must_reask_before_refusing(
+                NetworkPresence::Present {
+                    height: Some(970710)
+                },
+                false,
+                "memo"
+            ),
+            "an admission may rest on the memo"
+        );
     }
 
     /// SOURCE PIN (#519, the gate's LOW-1): the production ladder's terminal branch judges by the indexers BEFORE any
