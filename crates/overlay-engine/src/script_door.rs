@@ -768,6 +768,7 @@ pub(crate) fn walk_trusting(
                 input_sequence: input.sequence,
                 lock_time: tx.lock_time,
                 memory_limit: Some(budget.memory_limit),
+                work_limit: None,
             });
             stats.inputs_executed += 1;
             match spend.validate() {
