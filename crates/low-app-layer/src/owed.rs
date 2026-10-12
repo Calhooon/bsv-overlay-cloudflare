@@ -3060,15 +3060,9 @@ pub fn sort_rows_for_service(rows: &mut [OwedRow]) {
 pub const OWED_MAX_ROWS: usize = 500;
 
 // ── counters (isolate-scoped, on /health like the filings') ─────────────────
-pub const RECOMPUTE_SOURCES: [&str; 6] = [
-    "pot-changed",
-    "hop-changed",
-    "filing",
-    "read-first",
-    "read-stale",
-    "read-aged",
-];
-static RECOMPUTE_BY_SOURCE: [AtomicU64; 6] = [
+pub const RECOMPUTE_SOURCES: [&str; 7] = ["pot-changed", "hop-changed", "filing", "read-first", "read-stale", "read-aged", "deferred"];
+static RECOMPUTE_BY_SOURCE: [AtomicU64; 7] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -3231,10 +3225,9 @@ pub struct RecomputeRate {
 }
 
 impl RecomputeRate {
-    /// May `identity_lc` recompute now? `true` counts the run. `sheddable = false` is the FIRST read of an identity
-    /// (no snapshot exists to serve): it always runs, and it counts. `false` is a shed (the caller serves the
-    /// snapshot and counts it with [`note_recompute_shed`]).
-    pub fn admit(&mut self, identity_lc: &str, now_ms: i64, sheddable: bool) -> bool {
+    /// Count one admitted ordinary walk. The legacy sheddable flag no longer exempts repeated first-read faults:
+    /// with no snapshot the caller answers 503 and schedules the alarm, rather than bypassing the ceiling.
+    pub fn admit(&mut self, identity_lc: &str, now_ms: i64, _sheddable: bool) -> bool {
         if self.windows.len() >= OWED_RECOMPUTE_RATE_PRUNE_AT {
             self.windows.retain(|_, (start, _)| now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS);
             self.deferred.retain(|_, end| *end > now_ms);
@@ -3246,16 +3239,18 @@ impl RecomputeRate {
         if now_ms.saturating_sub(w.0) >= OWED_RECOMPUTE_RATE_WINDOW_MS {
             *w = (now_ms, 0);
         }
-        if sheddable && w.1 >= OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW {
+        if w.1 >= OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW {
             return false;
         }
         w.1 = w.1.saturating_add(1);
         true
     }
     /// Arm at most one deferred walk for the exhausted window. The caller persists the alarm before returning.
-    pub fn arm_deferred(&mut self, identity_lc: &str, now_ms: i64) -> Option<i64> {
-        let delay = self.retry_after_ms(identity_lc, now_ms)?;
-        let end = now_ms.saturating_add(delay);
+    pub fn arm_deferred(&mut self, identity_lc: &str, _now_ms: i64) -> Option<i64> {
+        // Called only after a shed decision. The clock crossing the end cannot revoke that window's reservation.
+        let (start, n) = self.windows.get(identity_lc)?;
+        if *n < OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW { return None; }
+        let end = start.saturating_add(OWED_RECOMPUTE_RATE_WINDOW_MS);
         if self.deferred.get(identity_lc) == Some(&end) { return None; }
         self.deferred.insert(identity_lc.to_string(), end);
         Some(end)
@@ -3298,6 +3293,11 @@ pub fn owed_shed_plan(identity_lc: &str) -> (&'static str, String) {
 
 /// bsv-low #499: recomputes shed by the per-identity ceiling (the snapshot served instead).
 static RECOMPUTE_SHED: AtomicU64 = AtomicU64::new(0);
+static RECOMPUTE_DEFERRED: AtomicU64 = AtomicU64::new(0);
+/// A reserved alarm walk that actually begins (not an arm, nor an idempotent alarm delivery).
+pub fn note_recompute_deferred() {
+    RECOMPUTE_DEFERRED.fetch_add(1, Ordering::Relaxed);
+}
 pub fn note_recompute_shed() {
     RECOMPUTE_SHED.fetch_add(1, Ordering::Relaxed);
 }
@@ -3306,6 +3306,7 @@ pub fn recompute_shed_total() -> u64 {
 }
 
 pub fn owed_health_json() -> Value {
+    let shed = RECOMPUTE_SHED.load(Ordering::Relaxed);
     let mut by_source = serde_json::Map::new();
     for (i, s) in RECOMPUTE_SOURCES.iter().enumerate() {
         by_source.insert(
@@ -3328,7 +3329,9 @@ pub fn owed_health_json() -> Value {
         "recomputeCoalesced": RECOMPUTE_COALESCED.load(Ordering::Relaxed),
         "recomputeLockTakeovers": RECOMPUTE_LOCK_TAKEOVERS.load(Ordering::Relaxed),
         "recomputeWritesSuperseded": RECOMPUTE_WRITES_SUPERSEDED.load(Ordering::Relaxed),
-        "recomputeShed": RECOMPUTE_SHED.load(Ordering::Relaxed),
+        "recomputeShed": shed,
+        "owed_recompute_shed_total": shed,
+        "owed_recompute_deferred_total": RECOMPUTE_DEFERRED.load(Ordering::Relaxed),
         "recomputesPerIdentityPerMinute": OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW,
         "recomputeCeilingScope": "per identity per isolate: the fleet bound is this times the live isolates",
         "collectedReadFaults": COLLECTED_READ_FAULTS.load(Ordering::Relaxed),
@@ -8567,7 +8570,7 @@ pub(crate) mod tests {
 
     /// bsv-low #499: THE CEILING SHEDS. Twelve recomputes of one identity inside a minute run; the thirteenth is
     /// shed (the caller serves the snapshot and counts it); another identity is untouched; the first read of an
-    /// identity (no snapshot to serve) runs over the ceiling and still counts; the window past, the identity runs
+    /// identity (no snapshot to serve) is also capped (#648); the window past, the identity runs
     /// again. RED on `b1ad9a1`: there was no ceiling (every ask walked).
     #[test]
     fn the_thirteenth_recompute_of_one_identity_inside_a_minute_is_shed_to_the_snapshot() {
@@ -8597,9 +8600,9 @@ pub(crate) mod tests {
         assert_eq!(rate.in_window(&me, t0 + 59_999), 12, "a shed is not a run");
         // a stranger's storm is not mine, and mine is not theirs
         assert!(rate.admit(&other, t0 + 30_000, true));
-        // a first read always runs (there is no snapshot to shed to) and counts
-        assert!(rate.admit(&me, t0 + 59_999, false));
-        assert_eq!(rate.in_window(&me, t0 + 59_999), 13);
+        // a repeated first read cannot bypass the bound when the previous walks faulted without a snapshot
+        assert!(!rate.admit(&me, t0 + 59_999, false));
+        assert_eq!(rate.in_window(&me, t0 + 59_999), 12);
         // the window past: runs again, counted from one
         assert!(rate.admit(&me, t0 + 60_000, true));
         assert_eq!(rate.in_window(&me, t0 + 60_000), 1);
@@ -8714,7 +8717,7 @@ pub(crate) mod tests {
             .expect("the hooks' entry");
         assert!(
             routes[push..].starts_with(&squash(
-                "pub(crate) async fn owed_recompute_and_push( env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>, ) { if !owed_recompute_admit(identity_lc, source, true) { owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc).await; return; }"
+                "pub(crate) async fn owed_recompute_and_push( env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>, ) { if !owed_recompute_admit(identity_lc, source, true) { let deferred = owed_deferred_deadline(identity_lc); owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc, deferred).await; return; }"
             )),
             "a shed in owed_recompute_and_push re-marks the identity stale before it returns"
         );
@@ -8750,11 +8753,11 @@ pub(crate) mod tests {
             .find(&squash("pub(crate) async fn owed_recompute_and_push("))
             .expect("the hooks' entry");
         let push_body = &routes[push..];
-        let ask = push_body.find(&squash("if !owed_recompute_admit(identity_lc, source, true) { owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc).await; return; }")).expect("the ask");
+        let ask = push_body.find(&squash("if !owed_recompute_admit(identity_lc, source, true) { let deferred = owed_deferred_deadline(identity_lc); owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc, deferred).await; return; }")).expect("the ask");
         let walk = push_body.find(&squash("owed_recompute(env, db, identity_lc, source, tip_hint)")).expect("the walk");
         assert!(ask < walk, "owed_recompute_and_push must ask the ceiling before it walks");
-        assert!(routes.contains(&squash("owed_recompute_admit(&identity, \"read-first\", false); match owed_compute_on_read(")));
-        assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, source, true) { refresh_retry = OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)); owed_shed_remark(&db, &identity).await; owed_schedule_deferred(&ctx.env, &identity).await; (rows, prev_tip, st.computed_at_ms as i64, cut) } else { match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)")));
+        assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, \"read-first\", false) {")));
+        assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, source, true) { refresh_retry = Some(OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)).unwrap_or(0)); let deferred = owed_deferred_deadline(&identity); owed_shed_remark(&db, &identity).await; owed_schedule_deferred(&ctx.env, &identity, deferred).await; (rows, prev_tip, st.computed_at_ms as i64, cut) } else { match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)")));
         assert_eq!(routes.matches(&squash("owed_recompute(env, db, identity_lc,")).count(), 2, "the walk's two callers (the push and the read's compute)");
     }
     #[test]
@@ -8762,7 +8765,7 @@ pub(crate) mod tests {
         let mut rate = RecomputeRate::default();
         for n in 0..12 { assert!(rate.admit(ME, 1_000 + n, true)); }
         assert!(!rate.admit(ME, 20_000, true));
-        assert!(include_str!("routes.rs").contains("owed_schedule_deferred(env, identity_lc).await"), "spent-pot pot-changed must schedule a later walk and push");
+        assert!(include_str!("routes.rs").contains("owed_schedule_deferred(env, identity_lc, deferred).await"), "spent-pot pot-changed must schedule a later walk and push");
         assert!(include_str!("board_view.rs").contains("async fn alarm(&self)"));
         assert!(include_str!("board_view.rs").contains("owed_deferred_walk_and_push"));
     }
@@ -8838,5 +8841,50 @@ pub(crate) mod tests {
         assert!(!comment.contains("which no honest"));
     }
 
+    #[test]
+    fn ns2_shed_and_deferred_counters_name_every_event() {
+        let health = owed_health_json();
+        assert!(health["owed_recompute_shed_total"].is_u64(), "every shed has a named counter");
+        assert!(health["owed_recompute_deferred_total"].is_u64(), "every deferred run has a named counter");
+        let shed = health["owed_recompute_shed_total"].as_u64().unwrap();
+        let deferred = health["owed_recompute_deferred_total"].as_u64().unwrap();
+        note_recompute_shed();
+        note_recompute_shed();
+        note_recompute_deferred();
+        let after = owed_health_json();
+        assert!(after["owed_recompute_shed_total"].as_u64().unwrap() >= shed + 2);
+        assert!(after["owed_recompute_deferred_total"].as_u64().unwrap() > deferred);
+        assert_eq!(after["recomputeShed"], after["owed_recompute_shed_total"]);
+        assert!(include_str!("routes.rs").contains("crate::owed::note_recompute_deferred();"));
+    }
+
+    #[test]
+    fn ns2_first_read_cannot_bypass_the_ceiling_without_a_snapshot() {
+        let mut rate = RecomputeRate::default();
+        for n in 0..12 { assert!(rate.admit(ME, 1_000 + n, false)); }
+        assert!(!rate.admit(ME, 20_000, false), "repeated first-read faults must not bypass the storm bound");
+        assert_eq!(rate.in_window(ME, 20_000), 12);
+    }
+
+    #[test]
+    fn ns2_a_shed_still_arms_when_the_clock_crosses_the_window_end() {
+        let mut rate = RecomputeRate::default();
+        for n in 0..12 { assert!(rate.admit(ME, 1_000 + n, true)); }
+        assert!(!rate.admit(ME, 60_999, true));
+        assert_eq!(rate.arm_deferred(ME, 61_001), Some(61_000), "the shed owns the old deadline even when the clock just crossed it");
+        assert_eq!(rate.arm_deferred(ME, 61_002), None);
+        assert!(rate.admit(ME, 61_003, true));
+        assert_eq!(rate.arm_deferred(ME, 61_003), None, "a new unexhausted window has no deferred reservation");
+    }
+
+    #[test]
+    fn ns2_read_reserves_its_admission_before_sending_the_answer() {
+        let code = include_str!("routes.rs");
+        let read = &code[code.find("pub async fn owed(req:").unwrap()..];
+        let claimed = &read[read.find("Some(token) => {").unwrap()..];
+        let ask = claimed.find("owed_recompute_admit(&identity, source, true)").unwrap();
+        let detached = claimed.find("wait.wait_until").unwrap();
+        assert!(ask < detached, "a later ask cannot turn the read's accepted refresh into an unmarked shed after its answer");
+    }
 
 }
