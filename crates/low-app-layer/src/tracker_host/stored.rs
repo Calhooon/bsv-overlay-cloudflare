@@ -208,3 +208,9 @@ pub fn project(old: Option<&Row>, state: &State, now: u64, legacy: Option<String
         Row::from_state(state, now, legacy)
     }
 }
+
+/// Durable cursor per host version: completed deploy passes do not restart on recycle.
+pub const BACKFILL_VERSION: &str = "ns3-fold-v1";
+pub const BACKFILL_CREATE: &str = "CREATE TABLE IF NOT EXISTS tracker_backfill (version TEXT PRIMARY KEY, cursor TEXT NOT NULL, complete INTEGER NOT NULL)";
+pub const BACKFILL_PAGE: &str = "SELECT txid, beef FROM (SELECT txid, beef FROM transactions WHERE has_proof = 1 UNION ALL SELECT txid, beef FROM pot_beefs WHERE has_proof = 1) WHERE txid > ?1 ORDER BY txid LIMIT 4";
+pub const BACKFILL_SAVE: &str = "INSERT INTO tracker_backfill(version,cursor,complete) VALUES (?1,?2,?3) ON CONFLICT(version) DO UPDATE SET cursor=MAX(tracker_backfill.cursor,excluded.cursor),complete=MAX(tracker_backfill.complete,excluded.complete)";

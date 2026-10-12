@@ -506,11 +506,13 @@ pub fn migration_list_fingerprint() -> u32 {
 /// the pass over the deferred EF jobs' R2 objects (its cursor, the round, the last complete count); one table.
 /// 189 → 196 for L23R2-H1/M3: two empty permanent twins and five indexes for identity-owned reads.
 /// 196 → 218 for bsv-low #638: the hop seat lookup index, write-derived links and seats, guarded backfills.
-/// 218 → 219 for NS-3: compact tracker word projection.
-pub const OVERLAY_MIGRATION_COUNT: usize = 219;
+/// 218 → 220 for NS-3: compact tracker word projection.
+pub const OVERLAY_MIGRATION_COUNT: usize = 220;
+
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS tracker_backfill (version TEXT PRIMARY KEY, cursor TEXT NOT NULL, complete INTEGER NOT NULL)",
     // NS-3 compact tracker projection; K11 may replace this boundary.
     "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)",
     // outputs table
