@@ -270,3 +270,63 @@ legs, exit 101), then GREEN with the first-run arm restored (exit 0). It
 also checks request ancestry and empty / later-run selections and pins the
 route's use of that selector. Evidence: `/tmp/ns2-arcreg-fold-5/m1-{red,green}.log`.
 The D1 addition above incorporates all six second-delta register corrections.
+
+
+## FOLD-5 rebase and final verification
+
+Rebased textually clean onto `origin/main` = `4d95436` (0.1.3, bsv-rs
+0.5.0 by caret). The sole compatibility code edit is `timestamp: None` in
+`arcreg_l3_terminal_ancestors_are_not_registered_or_refed`. No lock or dependency
+edit: both root and worker `cargo tree --locked -i bsv-rs` show one 0.5.0;
+wasm-bindgen in the worker lock remains 0.2.126, matching the supplied CLI.
+
+Final-base neutered archive copy: both fixes removed while all pins retained,
+`--lib -- arcregd2` RED, 0 passed / 3 failed, exit 101 (`neutered-red.log`).
+Restoring the real fold's files: `--lib -- arcreg` GREEN, 17 passed, exit 0
+(`restored-green.log`). No queue / D1 refusal trace is asserted by these pins.
+
+Changed Rust hunks formatted. Full package test on the rebased tree: lib
+715 passed / 0 failed / 1 ignored (the D1 export reader), integration tests
+4 + 9 + 1 passed, doc tests 0, exit 0 (`package-test.log`). Worker workspace
+clippy, all targets, `-D warnings`: Rust 1.95.0 exit 0 (`clippy-195.log`).
+The initial stable 1.98 run failed three inherited lints outside these changes
+(two formatting borrows in broadcaster.rs, one unit-error result in change_flush.rs);
+these were not changed or suppressed (`clippy.log`).
+
+Actual `make ci-route` recipes, Node 22.23.3 via nvm, `LANE_BASE=15120`,
+exit 0, within the foreground command's 570-second deadline. The external
+`foreground-shell.py` supervises the Makefile's exact worker commands in
+Python instead of Bash background jobs; every original cell is retained.
+All tier exits (`tier-exits.log`; full output `ci-route.log`):
+
+| Tier | Exit |
+|---|---:|
+| D1 budget (#499) | 0 |
+| D1 census self-test | 0 |
+| D1 census routes | 0 |
+| Landing guard (E1D) | 0 |
+| Dead letters (E576) | 0 |
+| Deferred graphs (E555) | 0 |
+| BEEF blobs (E585) | 0 |
+| Submit gate (#347) | 0 |
+| Census (#366) | 0 |
+| ARC ingest auth | 0 |
+| Network seen (#371) | 0 |
+| Script door on | 0 |
+| Script door off | 0 |
+| Any size (NL-6) | 0 |
+| EF work (NL-6c) | 0 |
+| Corroboration legs (NL-6d) | 0 |
+
+The 1,000-leg route job finished over five presentations, all 999 ancestors
+read once; the byte-deferred 40-leg job finished too. The fixture worker's
+`DUAL_BROADCAST=off` is retained: the new dual-push pin is native, not a live
+broadcast witness. The supervisor's redundant group teardown emitted EPERM
+after the recipes' teardown; all 13 reserved ports verified without listeners
+and bindable with SO_REUSEADDR (TCP TIME_WAIT excluded).
+
+Evidence stays under `/tmp/ns2-arcreg-fold-5/`. No deploy, no spend. Unverified:
+live Arcade delivery, the assumed platform default / actual subrequest trace,
+the new native seams through a real queue / refusal-record trace, and the
+ignored export reader. The captain owns the light delta and the PR after it,
+and picks up the corrected D1 register text above verbatim.

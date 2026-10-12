@@ -5035,6 +5035,7 @@ mod tests {
                         txid,
                         tx_status: status.into(),
                         extra_info: String::new(),
+                        timestamp: None,
                     })
                 }
             },
