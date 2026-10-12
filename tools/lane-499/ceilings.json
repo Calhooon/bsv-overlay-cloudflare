@@ -62,14 +62,14 @@
     "owed-first-read": {
       "route": "/owed?identity=A: the first read (the compute on read and its write)",
       "measured": {
-        "reads": 363,
+        "reads": 331,
         "writes": 18,
-        "stmts": 28
+        "stmts": 30
       },
       "ceiling": {
         "reads": 528,
         "writes": 20,
-        "stmts": 28,
+        "stmts": 30,
         "maxReads": 528
       },
       "censusKey": "/owed"
