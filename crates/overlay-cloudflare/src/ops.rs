@@ -186,8 +186,9 @@ pub const COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: &str = "arc_ingest_unauthorized_b
 /// Their proofs still arrive through the backstop poll and couriers.
 pub const COUNTER_ARC_REGISTRATION_SKIPPED: &str = "arc_registration_legs_skipped_total";
 /// bsv-low loop 6 (2026-09-07): MINED callbacks for a txid NO topic admitted
-/// (a `/submit` that admitted 0 outputs still registered the webhook) — nobody
-/// holds it, nothing is owed; acknowledged 200 and COUNTED (a 5xx made Arcade
+/// (a `/submit` that admitted 0 outputs still registered the webhook). Since
+/// #640 this also counts ancestors' own registered MINED proof pushes when
+/// no topic holds their txid (hops and strangers' ancestors) — nobody holds it, nothing is owed; acknowledged 200 and COUNTED (a 5xx made Arcade
 /// retry the same callback a second later, twice per txid in the beta log).
 pub const COUNTER_ARC_INGEST_UNKNOWN_TXID: &str = "arc_ingest_unknown_txid_total";
 /// bsv-low loop 6: block-event spend-confirmation passes run (`/internal/tip-changed`).
