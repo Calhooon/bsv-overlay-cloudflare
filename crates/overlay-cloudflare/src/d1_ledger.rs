@@ -33,12 +33,15 @@ pub struct Tally {
     pub reads: u64,
     pub writes: u64,
     pub stmts: u64,
+    /// Largest single statement, so a fleet scan cannot hide in a request total.
+    pub max_reads: u64,
 }
 
 impl Tally {
     /// One statement's meta folded in (a statement with no meta still counts as a statement).
     pub fn add(&mut self, reads: u64, writes: u64) {
         self.reads = self.reads.saturating_add(reads);
+        self.max_reads = self.max_reads.max(reads);
         self.writes = self.writes.saturating_add(writes);
         self.stmts = self.stmts.saturating_add(1);
     }
@@ -58,10 +61,12 @@ impl RouteBudget {
     pub fn record(&mut self, t: Tally) {
         self.requests = self.requests.saturating_add(1);
         self.max.reads = self.max.reads.max(t.reads);
+        self.max.max_reads = self.max.max_reads.max(t.max_reads);
         self.max.writes = self.max.writes.max(t.writes);
         self.max.stmts = self.max.stmts.max(t.stmts);
         self.last = t;
         self.total.reads = self.total.reads.saturating_add(t.reads);
+        self.total.max_reads = self.total.max_reads.max(t.max_reads);
         self.total.writes = self.total.writes.saturating_add(t.writes);
         self.total.stmts = self.total.stmts.saturating_add(t.stmts);
     }
@@ -69,7 +74,7 @@ impl RouteBudget {
 
 thread_local! {
     static CURRENT: RefCell<Option<Rc<Cell<Tally>>>> = const { RefCell::new(None) };
-    static UNSCOPED: Cell<Tally> = const { Cell::new(Tally { reads: 0, writes: 0, stmts: 0 }) };
+    static UNSCOPED: Cell<Tally> = const { Cell::new(Tally { reads: 0, writes: 0, stmts: 0, max_reads: 0 }) };
     static ROUTES: RefCell<BTreeMap<&'static str, RouteBudget>> = const { RefCell::new(BTreeMap::new()) };
 }
 
@@ -176,7 +181,10 @@ pub fn server_timing_segment(t: Tally) -> String {
 /// A segment of the same shape under another name (the app layer's view actor serves its compute's figures as
 /// `d1view`: that compute is detached from the request that reads its copy).
 pub fn named_segment(name: &str, t: Tally) -> String {
-    format!("{name};desc=\"reads={} writes={} stmts={}\"", t.reads, t.writes, t.stmts)
+    format!(
+        "{name};desc=\"reads={} writes={} stmts={} maxReads={}\"",
+        t.reads, t.writes, t.stmts, t.max_reads
+    )
 }
 
 /// PURE: the figures of the segment `name` in a `Server-Timing` value, if it carries one of our shape.
@@ -195,11 +203,12 @@ pub fn parse_segment(header: &str, name: &str) -> Option<Tally> {
                 "reads" => t.reads = v,
                 "writes" => t.writes = v,
                 "stmts" => t.stmts = v,
+                "maxReads" => t.max_reads = v,
                 _ => return None,
             }
             seen += 1;
         }
-        return (seen == 3).then_some(t);
+        return (seen == 3 || seen == 4).then_some(t);
     }
     None
 }
@@ -234,7 +243,7 @@ pub fn stamp(resp: &mut worker::Response, t: Tally) {
 }
 
 fn tally_json(t: Tally) -> serde_json::Value {
-    serde_json::json!({ "reads": t.reads, "writes": t.writes, "stmts": t.stmts })
+    serde_json::json!({ "reads": t.reads, "writes": t.writes, "stmts": t.stmts, "maxReads": t.max_reads })
 }
 
 /// PURE: the `d1Budget` body from a snapshot (pinned).
@@ -369,9 +378,29 @@ mod tests {
                 }
             }
         }
-        assert_eq!(ta, Some(Tally { reads: 30, writes: 3, stmts: 3 }));
-        assert_eq!(tb, Some(Tally { reads: 5, writes: 5, stmts: 5 }));
-        assert_eq!(UNSCOPED.with(|u| u.get()), before, "nothing noted inside a scope may land on unscoped");
+        assert_eq!(
+            ta,
+            Some(Tally {
+                reads: 30,
+                writes: 3,
+                stmts: 3,
+                max_reads: 10
+            })
+        );
+        assert_eq!(
+            tb,
+            Some(Tally {
+                reads: 5,
+                writes: 5,
+                stmts: 5,
+                max_reads: 1
+            })
+        );
+        assert_eq!(
+            UNSCOPED.with(|u| u.get()),
+            before,
+            "nothing noted inside a scope may land on unscoped"
+        );
         // and outside every scope it does
         note(7, 0);
         let after = UNSCOPED.with(|u| u.get());
@@ -420,12 +449,46 @@ mod tests {
     #[test]
     fn the_route_maxima_are_per_field_and_the_set_is_closed() {
         let mut b = RouteBudget::default();
-        b.record(Tally { reads: 100, writes: 0, stmts: 2 });
-        b.record(Tally { reads: 5, writes: 9, stmts: 3 });
+        b.record(Tally {
+            reads: 100,
+            writes: 0,
+            stmts: 2,
+            max_reads: 0,
+        });
+        b.record(Tally {
+            reads: 5,
+            writes: 9,
+            stmts: 3,
+            max_reads: 0,
+        });
         assert_eq!(b.requests, 2);
-        assert_eq!(b.max, Tally { reads: 100, writes: 9, stmts: 3 });
-        assert_eq!(b.last, Tally { reads: 5, writes: 9, stmts: 3 });
-        assert_eq!(b.total, Tally { reads: 105, writes: 9, stmts: 5 });
+        assert_eq!(
+            b.max,
+            Tally {
+                reads: 100,
+                writes: 9,
+                stmts: 3,
+                max_reads: 0
+            }
+        );
+        assert_eq!(
+            b.last,
+            Tally {
+                reads: 5,
+                writes: 9,
+                stmts: 3,
+                max_reads: 0
+            }
+        );
+        assert_eq!(
+            b.total,
+            Tally {
+                reads: 105,
+                writes: 9,
+                stmts: 5,
+                max_reads: 0
+            }
+        );
         const R: &[&str] = &["/owed", "/tx-any", "/beef"];
         assert_eq!(route_of("/owed", R), "/owed");
         assert_eq!(route_of("/tx-any/ab", R), "/tx-any");
@@ -435,8 +498,16 @@ mod tests {
 
     #[test]
     fn the_segment_appends_to_the_routes_own_timing_and_the_expose_names_it_once() {
-        let t = Tally { reads: 12, writes: 3, stmts: 4 };
-        assert_eq!(server_timing_segment(t), "d1;desc=\"reads=12 writes=3 stmts=4\"");
+        let t = Tally {
+            reads: 12,
+            writes: 3,
+            stmts: 4,
+            max_reads: 0,
+        };
+        assert_eq!(
+            server_timing_segment(t),
+            "d1;desc=\"reads=12 writes=3 stmts=4 maxReads=0\""
+        );
         assert_eq!(with_d1_segment(None, t), server_timing_segment(t));
         assert_eq!(with_d1_segment(Some("admit;dur=1.0"), t), format!("admit;dur=1.0, {}", server_timing_segment(t)));
         assert_eq!(parse_segment(&with_d1_segment(Some("admit;dur=1.0"), t), "d1"), Some(t));

@@ -1239,7 +1239,7 @@ mod tests {
         }
         for needle in [
             "SEARCH potparty_records USING INDEX idx_potparty_identity",
-            "SEARCH hp USING INDEX idx_hopparty_identity",
+            "SEARCH link USING INDEX idx_hop_pot_links_identity_created",
             "SEARCH r USING INDEX sqlite_autoindex_pot_records_1 (txid=? AND outputIndex=?)",
             "SEARCH pr USING COVERING INDEX idx_potrefund_pot (potTxid=? AND potVout=?)",
         ] {

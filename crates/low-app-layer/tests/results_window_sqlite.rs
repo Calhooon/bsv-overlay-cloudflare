@@ -3863,12 +3863,13 @@ fn the_money_facts_serve_through_the_real_producers_under_their_guards() {
     );
     apply_page_overlay_like_the_route(&conn, &mut rows);
     let params_by_pot = covenant_params_by_pot(&rows);
-    let pp = params_by_pot
-        .get(&(pot.clone(), 0))
-        .expect("decoded params");
+    assert!(
+        params_by_pot.contains_key(&(pot.clone(), 0)),
+        "decoded params"
+    );
     let mut stmt = conn.prepare(&hop_seat_markers_sql(1)).unwrap();
     let hops: Vec<HopSeatRow> = stmt
-        .query_map(params![hex::encode(pp.pub_a), hex::encode(pp.pub_b)], |r| {
+        .query_map(params![pot.as_str(), 0], |r| {
             Ok(HopSeatRow {
                 identity: r.get("identity")?,
                 seat_settle_pubkey: r.get("seatSettlePubkey")?,

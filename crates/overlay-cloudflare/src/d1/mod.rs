@@ -505,8 +505,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 188 → 189 for N5 (align-engine-050, 2026-10-10, LOW's E585 land2 lens): `ef_deferred_sweep`, the one-row state of
 /// the pass over the deferred EF jobs' R2 objects (its cursor, the round, the last complete count); one table.
 /// 189 → 196 for L23R2-H1/M3: two empty permanent twins and five indexes for identity-owned reads.
-// 196 to 197, bsv-low #638: the hop seat lookup index.
-pub const OVERLAY_MIGRATION_COUNT: usize = 197;
+/// 196 → 218 for bsv-low #638: the hop seat lookup index, write-derived links and seats, guarded backfills.
+pub const OVERLAY_MIGRATION_COUNT: usize = 218;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1835,6 +1835,28 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_party_verified_identity ON potparty_records(identity, sigValid, lower(potTxid)) WHERE seatSettlePubkey IS NOT NULL",
     // bsv-low #638: hop seat markers are lookups by the stored settle key.
     "CREATE INDEX IF NOT EXISTS idx_hopparty_seat ON hopparty_records(seatSettlePubkey)",
+    // bsv-low #638: write-derived links and seat lookups, then a guarded legacy backfill.
+    crate::derived_hops::LINKS_CREATE,
+    crate::derived_hops::LINKS_INDEX,
+    crate::derived_hops::LINKS_POT_INDEX,
+    crate::derived_hops::SEATS_CREATE,
+    crate::derived_hops::SEATS_MARKER_INDEX,
+    crate::derived_hops::POT_A_INDEX,
+    crate::derived_hops::POT_B_INDEX,
+    crate::derived_hops::STATE_CREATE,
+    crate::derived_hops::SPENDING_INDEX,
+    crate::derived_hops::HOP_INSERT,
+    crate::derived_hops::POT_INSERT,
+    crate::derived_hops::PARTY_INSERT,
+    crate::derived_hops::HOP_UPDATE,
+    crate::derived_hops::POT_UPDATE,
+    crate::derived_hops::PARTY_UPDATE,
+    crate::derived_hops::HOP_DELETE,
+    crate::derived_hops::POT_DELETE,
+    crate::derived_hops::PARTY_DELETE,
+    crate::derived_hops::LINKS_BACKFILL,
+    crate::derived_hops::SEATS_BACKFILL,
+    crate::derived_hops::STATE_DONE,
 
 ];
 

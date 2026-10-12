@@ -6,11 +6,11 @@
 //! here (a row the schema refuses fails this program, never the tier). The tier loads it with
 //! `wrangler d1 execute low-overlay-db --local --persist-to <dir> --file <script>` and serves the app layer over it.
 //!
-//! The fixture: identity A holds `A_POTS` unspent pots (the `/owed`, `/results`, `/pots-view`, `/utxo-status`
-//! scenarios), identity B holds `B_POTS` (the shed leg drives B's recompute, so A's window is untouched), and
-//! `NOISE` strangers hold one pot each with both seats' party rows. The noise is what makes the ceilings mean
-//! something: a query that loses its index reads the strangers' rows and reds by its scenario's name. No pot is
-//! spent and no hop is filed, so no recompute reaches for a courier (the tier is network-free).
+//! A and B retain the original eight-pot and two-pot budget scenarios. Fleet noise includes 22k pot/hop
+//! outpoints, 7,549 hop markers, 14k parties, 7,209 backups and sweeps, 19,005 proven transactions and
+//! 150 evictions. A separate whale has 1,033 party rows and 554 hops, including hop-only pot candidates.
+//! The shared fleet fixture also drives the native plan and compatibility pins. Noise never shares A or B's
+//! keys, so their route ceilings still measure the cost of a fixed request as the fleet grows.
 
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use rusqlite::Connection;
@@ -83,7 +83,7 @@ fn main() {
     rows.extend(d1_fleet::rows(now_s));
     rows.extend(l23_r2_route_rows(now_s));
     for r in &rows {
-        conn.execute(r, []).unwrap_or_else(|e| panic!("the fixture row is refused by the production schema: {e}\n{r}"));
+        d1_fleet::execute_row(&conn, r);
         out.push_str(r);
         out.push_str(";\n");
     }

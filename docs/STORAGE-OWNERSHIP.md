@@ -196,3 +196,9 @@ No cross-worker access exists today: each store below is read and written only b
 ## Changing this
 
 A new table: its CREATE in `OVERLAY_MIGRATIONS`, its row in `storage-ownership.json` and in the table above, in one commit; the check is red until all three agree. A new cross-crate write or read: the grant in the JSON with the reason in the row's `why`, reviewed like code. A table that leaves the never-wipe set needs the owner's word.
+
+#638 adds `hop_pot_links`, `pot_hop_seats` and `view_derivation_state`: overlay-owned derived lookup rows, read by the app layer. Admission, relatching, spend reversal and eviction maintain them in the source transaction; the guarded backfill runs once.
+
+| `hop_pot_links` | overlay-cloudflare | derived | no | App-layer identity lookup, source-write triggers. |
+| `pot_hop_seats` | overlay-cloudflare | derived | no | App-layer outpoint lookup, source-write triggers. |
+| `view_derivation_state` | overlay-cloudflare | derived | no | Guarded one-time legacy backfill. |
