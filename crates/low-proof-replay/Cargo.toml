@@ -12,6 +12,9 @@ categories = ["cryptography::cryptocurrencies"]
 include = ["src/**/*.rs", "README.md", "LICENSE-*"]
 workspace = "../../workers"
 
+[lib]
+name = "low_proof_replay"
+
 [dependencies]
 # `ProvedHands` and the `BundleProver` hook this crate's `prove_bundle` fills.
 overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
