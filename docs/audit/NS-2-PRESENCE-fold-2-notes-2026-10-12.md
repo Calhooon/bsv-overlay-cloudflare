@@ -10,18 +10,11 @@ N1: The first fold's M2, vocabulary, scope, absence retirement and proof binding
 remain pinned. The pre-flight probe readmission remains filed as #636 and the
 witnessed corroborator echo as #637. This fold fixes the POST echo path.
 
-N2: The D1 budget is a real gate, not a formality. The recorded first-read
-baseline is 26 statements, the former ceiling 28. The first fold adds one
-scope statement per externally resolved spender (two courier resolutions per
-recompute), plus at most one held-anchor statement per isolate's 30-second
-probe window. Both positive and negative probes now share that window; a
-recompute has a shorter time budget. Worst added scope/probe cost is 2 + 1,
-so this fold explicitly raises the statement ceiling to 29 (26 + 3).
-H1's content reads and evidence annotation add zero D1 statements. M1 removes
-up to four admission-age statements per evicted gated submit. L1 and L2 add
-zero D1 statements; L3 bounds the existing anchor statement rather than adding
-one. Reads/writes ceilings stay in force. The seeded route measurement does
-not by itself cover every externally resolved spender shape.
+N2 (corrected by NS2PD2-L1, fold 3): The D1 budget keeps the measured
+26-statement baseline and its +2 margin, ceiling 28. Owed external spenders
+skip the redundant scope query and therefore the held-anchor query. The
+previous unmeasured 29 ceiling is withdrawn. Other callers retain scope
+and bounded held-anchor probes. Reads/writes ceilings stay in force.
 
 N3: Confirmed foreign subjects still ask WoC hash, hex and TSC, then cached
 canonical headers. Own subjects ask Arcade first, with a held anchor when due.

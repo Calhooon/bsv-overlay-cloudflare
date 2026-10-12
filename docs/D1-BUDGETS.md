@@ -144,3 +144,9 @@ does not land on and reads `unscoped` as one running total. The platform's query
 (`d1QueriesAdaptiveGroups`) are the promotion-time read, and the beta census TABLE is written by CAP after the
 deploy, at the fleet's load after a loop. The promotion checklist carries the table, taken on beta at the fleet's load after a loop, and
 any route over its fixture ceiling is read against the split above before the promotion goes.
+
+NS2PD2-L1 (2026-10-12): `/owed` keeps the 28-statement ceiling. External
+spender resolution skips `tx_any_scope`: the recompute already missed the
+index and read its admitted pots and refused JOINs. That spender goes to the
+couriers without another scope or held-anchor query; other callers retain
+the first-party scope query. The recorded fixture baseline remains 26.
