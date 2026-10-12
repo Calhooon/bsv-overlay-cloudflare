@@ -387,3 +387,8 @@ pub fn owed_reask_due(row: &Row, now: u64) -> bool {
         "unknown" | "built" | "announced" | "seen"
     ) && now.saturating_sub(row.updated_at as u64) >= 60
 }
+
+/// The spent-any memo plan; a tracked txid does not prove an outpoint pointer.
+pub fn spent_any_memo_plan(probe_targets: &[(String,u32)], memos: &[crate::hops_view::ProbeMemo], now_ms: i64, _stored_words: &BTreeMap<String,Row>) -> crate::hops_view::ProbePlan {
+    crate::hops_view::split_probe_targets(probe_targets, memos, now_ms, crate::hops_view::PROBE_MEMO_MAX_AGE_MS)
+}

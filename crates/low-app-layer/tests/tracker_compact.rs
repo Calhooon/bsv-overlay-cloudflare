@@ -352,3 +352,20 @@ fn ns3_h2_main_fields_survive_tracker_decoration() {
         }
     }
 }
+
+#[test]
+fn ns3_h1_expired_memo_is_reasked_even_when_spender_is_tracked() {
+    use low_app_layer::hops_view::{ProbeMemo,ChainSpendProbe};
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch(stored::CREATE).unwrap();
+    db.execute_batch("CREATE TABLE hop_chain_probes (outpoint TEXT,probedAtMs INTEGER,spent INTEGER,spendingTxid TEXT,spentConfirmed INTEGER); INSERT INTO hop_chain_probes VALUES ('P.0',640000,1,'R',0)").unwrap();
+    let row = Row::from_state(&State::new("R"),1000,None);
+    db.execute("INSERT INTO tx_words (txid,word,tier,updated_at) VALUES ('R','unknown','host',1000)",[]).unwrap();
+    let memo = db.query_row("SELECT * FROM hop_chain_probes",[],|r| Ok(ProbeMemo {outpoint:r.get(0)?,probed_at_ms:r.get(1)?,spent:r.get(2)?,spending_txid:r.get(3)?,spent_confirmed:r.get(4)?})).unwrap();
+    let (mut answers, ask) = runtime::spent_any_memo_plan(&[("P".into(),0)], &[memo], 1_000_000, &BTreeMap::from([("R".into(),row)]));
+    let mut probes = 0;
+    for (id,vout) in ask { probes += 1; answers.push((id,vout,ChainSpendProbe {known:true,spent:Some(true),spending_txid:Some("S".into()),spent_confirmed:Some(true)})); }
+    assert_eq!(answers[0].2.spending_txid.as_deref(),Some("S"), "expired memo must serve PROBE spender S");
+    assert_eq!(answers[0].2.spent_confirmed,Some(true));
+    assert_eq!(probes,1);
+}
