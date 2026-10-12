@@ -3359,6 +3359,14 @@ pub fn owed_health_json() -> Value {
     })
 }
 
+/// Additive v1 read word: a snapshot whose refresh hit the ceiling is served with its retry delay.
+pub fn mark_shed_refresh(body: &mut Value, retry_after_ms: Option<i64>) {
+    if let Some(ms) = retry_after_ms {
+        body["refresh"] = json!("shed");
+        body["retryAfterMs"] = json!(ms);
+    }
+}
+
 /// The `owed-changed` event body, pushed to the identity's durable box after a
 /// recompute a change triggered (the page re-reads `/owed` on it).
 pub fn owed_changed_event_body(
@@ -8752,14 +8760,8 @@ pub(crate) mod tests {
         let walk = push_body.find(&squash("owed_recompute(env, db, identity_lc, source, tip_hint)")).expect("the walk");
         assert!(ask < walk, "owed_recompute_and_push must ask the ceiling before it walks");
         assert!(routes.contains(&squash("owed_recompute_admit(&identity, \"read-first\", false); match owed_compute_on_read(")));
-        assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, source, true) { owed_shed_remark(&db, &identity).await; (rows, prev_tip, st.computed_at_ms as i64, cut) } else { match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)")));
-        assert_eq!(
-            routes
-                .matches(&squash("owed_recompute(env, db, identity_lc,"))
-                .count(),
-            2,
-            "the walk's two callers (the push and the read's compute)"
-        );
+        assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, source, true) { refresh_retry = OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)); owed_shed_remark(&db, &identity).await; owed_schedule_deferred(&ctx.env, &identity).await; (rows, prev_tip, st.computed_at_ms as i64, cut) } else { match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)")));
+        assert_eq!(routes.matches(&squash("owed_recompute(env, db, identity_lc,")).count(), 2, "the walk's two callers (the push and the read's compute)");
     }
     #[test]
     fn ns2_shed_spent_pot_arms_a_deferred_walk_and_push() {
@@ -8802,6 +8804,26 @@ pub(crate) mod tests {
         assert_eq!(push["computedAtMs"], end);
         assert!(rate.admit(ME, end, true)); // the next window retains its ordinary twelve admits
         assert_eq!(rate.in_window(ME, end), 1);
+    }
+
+    #[test]
+    fn ns2_shed_read_names_the_refresh_and_window_remainder() {
+        let mut rate = RecomputeRate::default();
+        for n in 0..12 { assert!(rate.admit(ME, 1_000 + n, true)); }
+        assert_eq!(rate.retry_after_ms(ME, 20_000), Some(41_000));
+        assert_eq!(rate.retry_after_ms(ME, 60_999), Some(1));
+        assert_eq!(rate.retry_after_ms(ME, 61_000), None);
+        let mut body: Value = serde_json::from_str(&owed_body(ME, None, &[], 1_000, false)).unwrap();
+        let original = body.clone();
+        mark_shed_refresh(&mut body, None);
+        assert_eq!(body, original);
+        mark_shed_refresh(&mut body, rate.retry_after_ms(ME, 20_000));
+        assert_eq!(body["refresh"], "shed");
+        assert_eq!(body["retryAfterMs"], 41_000);
+        assert_eq!(body["v"], 1);
+        assert_eq!(body["computedAtMs"], 1_000);
+        let code = include_str!("routes.rs");
+        assert!(code.contains("crate::owed::mark_shed_refresh(&mut body, refresh_retry)"), "a shed read must mark its served snapshot");
     }
 
 }

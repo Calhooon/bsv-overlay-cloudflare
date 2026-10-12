@@ -4878,6 +4878,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
         ViewIdentity::Refuse(resp) => return resp,
     };
     let now_ms = worker::Date::now().as_millis() as i64;
+    let mut refresh_retry = None;
     if !crate::logic::valid_identity(&identity) {
         return json_response(
             crate::owed::owed_body(&identity, None, &[], now_ms, false),
@@ -4994,34 +4995,40 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                     // is bounded (8 s) and a pass that outlives it leaves the page with "could not load" and the
                     // door with a refused fallback. One refresh per identity per isolate at a time.
                     Some(wait) => {
-                        let claim =
-                            owed_refresh_begin(&identity, worker::Date::now().as_millis() as i64);
-                        crate::owed::note_read_refresh(claim.is_some());
-                        match claim {
-                            Some(token) => {
-                                let env = ctx.env.clone();
-                                let id = identity.clone();
-                                let src = source.to_string();
-                                wait.wait_until(async move {
-                                    if let Ok(db) = env.d1("OVERLAY_DB") {
-                                        owed_recompute_claimed(&env, &db, &id, &src, None, token)
-                                            .await;
-                                    } else {
-                                        owed_refresh_end(&id, token); // the claim must never outlive a run that cannot start
-                                    }
-                                });
-                            }
-                            None => {
-                                // the delta-verify's LOW-B: a stale read that cannot kick is REMEMBERED — the holder of
-                                // the lock runs it once more (a filing that marked stale during an in-flight walk)
-                                OWED_RERUN.with(|m| {
-                                    crate::owed::owed_rerun_note(
-                                        &mut m.borrow_mut(),
-                                        &identity,
-                                        source,
-                                    )
-                                });
-                                crate::owed::note_recompute_coalesced();
+                        if let Some(retry) = OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)) {
+                            refresh_retry = Some(retry);
+                            // Decide synchronously so the answer names the shed, before the detached refresh runs.
+                            owed_recompute_admit(&identity, source, true);
+                            let env = ctx.env.clone();
+                            let id = identity.clone();
+                            wait.wait_until(async move {
+                                if let Ok(db) = env.d1("OVERLAY_DB") {
+                                    owed_shed_remark(&db, &id).await;
+                                    owed_schedule_deferred(&env, &id).await;
+                                }
+                            });
+                        } else {
+                            let claim = owed_refresh_begin(&identity, worker::Date::now().as_millis() as i64);
+                            crate::owed::note_read_refresh(claim.is_some());
+                            match claim {
+                                Some(token) => {
+                                    let env = ctx.env.clone();
+                                    let id = identity.clone();
+                                    let src = source.to_string();
+                                    wait.wait_until(async move {
+                                        if let Ok(db) = env.d1("OVERLAY_DB") {
+                                            owed_recompute_claimed(&env, &db, &id, &src, None, token).await;
+                                        } else {
+                                            owed_refresh_end(&id, token); // the claim must never outlive a run that cannot start
+                                        }
+                                    });
+                                }
+                                None => {
+                                    // the delta-verify's LOW-B: a stale read that cannot kick is REMEMBERED — the holder of
+                                    // the lock runs it once more (a filing that marked stale during an in-flight walk)
+                                    OWED_RERUN.with(|m| crate::owed::owed_rerun_note(&mut m.borrow_mut(), &identity, source));
+                                    crate::owed::note_recompute_coalesced();
+                                }
                             }
                         }
                         (rows, prev_tip.or(tip_now), st.computed_at_ms as i64, cut)
@@ -5034,7 +5041,9 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                         // N4: whichever arm asked for it, a compute that faults leaves the rows in hand standing;
                         // bsv-low #499: so does one the identity's ceiling sheds
                         if !owed_recompute_admit(&identity, source, true) {
+                            refresh_retry = OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64));
                             owed_shed_remark(&db, &identity).await;
+                            owed_schedule_deferred(&ctx.env, &identity).await;
                             (rows, prev_tip, st.computed_at_ms as i64, cut)
                         } else {
                             match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)
@@ -5067,6 +5076,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
         truncated,
     ))
     .map_err(|e| worker::Error::RustError(e.to_string()))?;
+    crate::owed::mark_shed_refresh(&mut body, refresh_retry);
     let progress = served.iter().find(|r| r.facts.get("markerlessCandidates").is_some()).map(|r| serde_json::json!({"candidates": r.facts["markerlessCandidates"], "examined": r.facts["markerlessExamined"], "cursor": r.facts["markerlessCursor"]})).or(progress);
     if let Some(progress) = progress {
         body["markerlessProgress"] = progress;
