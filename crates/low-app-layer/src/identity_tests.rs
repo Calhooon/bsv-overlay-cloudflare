@@ -889,3 +889,46 @@ fn localhost_is_a_beta_origin_only() {
     assert!(origins(beta).contains("http://localhost:5173"), "the pin reads the beta list too");
     assert_eq!(toml.matches("[env.").count(), toml.matches("[env.beta").count(), "beta is the only other env");
 }
+
+/// bsv-low #597 (the owner's `cors dev both`, 2026-10-12): a dev-server origin
+/// (`http://localhost:<port>`, `http://127.0.0.1:<port>`) reads the identity
+/// views in BOTH envs, reflected exactly; nothing else widens.
+#[test]
+fn e597_a_dev_server_origin_reads_the_identity_views_in_both_envs() {
+    let prod = parse_origins("https://bsvarcade.com,https://www.bsvarcade.com,https://low-pot.pages.dev");
+    let beta = parse_origins("https://low-beta.pages.dev,https://low-harness.pages.dev,http://localhost:5173");
+    for allow in [&prod, &beta, &Vec::new()] {
+        for o in ["http://localhost:5273", "http://127.0.0.1:5273", "http://localhost:1", "http://127.0.0.1:65535"] {
+            assert_eq!(allowed_origin(Some(o), allow).as_deref(), Some(o), "{o} reflected exactly");
+            let h: HashMap<&str, String> = cors_headers(allowed_origin(Some(o), allow).as_deref()).into_iter().collect();
+            assert_eq!(h["Access-Control-Allow-Origin"], o, "the preflight and the GET share this set");
+            assert!(h["Access-Control-Expose-Headers"].contains("ETag"), "the expose list unchanged");
+        }
+        for o in [
+            "http://localhost",
+            "http://localhost:",
+            "http://localhost:0",
+            "http://localhost:65536",
+            "http://localhost:5273/",
+            "http://localhost:5273.evil.example",
+            "http://localhost:52a3",
+            "https://localhost:5273",
+            "http://localhost.evil.example:5273",
+            "http://127.0.0.2:5273",
+            "http://evil.example:5273",
+            "http://localhost:+5273",
+            "null",
+            "*",
+        ] {
+            assert_eq!(allowed_origin(Some(o), allow), None, "{o} is no dev-server origin");
+        }
+    }
+    // A production origin is unchanged.
+    assert_eq!(allowed_origin(Some("https://bsvarcade.com"), &prod).as_deref(), Some("https://bsvarcade.com"));
+    assert_eq!(allowed_origin(Some("https://bsvarcade.com"), &beta), None);
+    // No other route widens: only an identity path takes this decision (the rest keep the base's wildcard set).
+    assert!(is_identity_path("/identities") && is_identity_path("/identity/verify"));
+    for p in ["/owed", "/pots-view", "/.well-known/auth", "/internal/identity-kill", "/results"] {
+        assert!(!is_identity_path(p), "{p} keeps the base's CORS");
+    }
+}

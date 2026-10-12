@@ -144,7 +144,9 @@
 //! read: the BRC-104 reply headers, the session lane's seal and offer,
 //! `Retry-After` and `ETag`. The match is exact, so a Pages preview host
 //! (`<sha>.low-pot.pages.dev`) reads no names (fail-safe). `localhost` is on
-//! the beta list only, never prod's (pinned against `wrangler.toml`). The kill
+//! the beta list only, never prod's (pinned against `wrangler.toml`); since bsv-low #597 a dev-server origin
+//! (`http://localhost:<port>`, `http://127.0.0.1:<port>`) is admitted in code in
+//! both envs, the identity views only. The kill
 //! route answers with no CORS at all, like every `/internal/*` route.
 //!
 //! ## Counters
@@ -1149,11 +1151,28 @@ pub fn parse_origins(v: &str) -> Vec<String> {
         .collect()
 }
 
-/// The origin to answer with, iff the request's `Origin` is on the allowlist.
+/// The origin to answer with, iff the request's `Origin` is on the allowlist
+/// or is a dev-server origin (bsv-low #597).
 pub fn allowed_origin(origin: Option<&str>, allow: &[String]) -> Option<String> {
     let o = origin?.trim();
     let lc = o.to_ascii_lowercase();
-    allow.contains(&lc).then(|| o.to_string())
+    (allow.contains(&lc) || is_dev_server_origin(o)).then(|| o.to_string())
+}
+
+/// bsv-low #597 (the owner's `cors dev both`, 2026-10-12): exactly
+/// `http://localhost:<port>` or `http://127.0.0.1:<port>`, port 1..=65535 in
+/// decimal digits, in both envs. Names are public read-only data and a dev
+/// origin cannot forge a session lane (its MAC needs the handshake).
+pub fn is_dev_server_origin(origin: &str) -> bool {
+    let Some(port) = origin
+        .strip_prefix("http://localhost:")
+        .or_else(|| origin.strip_prefix("http://127.0.0.1:"))
+    else {
+        return false;
+    };
+    (1..=5).contains(&port.len())
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u32>().is_ok_and(|p| (1..=65535).contains(&p))
 }
 
 /// The CORS header set of an identity answer. Pure.
