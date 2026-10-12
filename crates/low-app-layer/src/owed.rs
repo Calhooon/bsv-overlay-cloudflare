@@ -874,7 +874,7 @@ pub fn markerless_plan(candidates: &[MarkerlessCandidate]) -> (Vec<MarkerlessCan
 
 /// Read only the previous snapshot's JOINs, checking the same signed identity evidence and ledger end.
 /// This does not enumerate an unbounded candidate tail; owed_rows is capped at OWED_MAX_ROWS.
-pub const MARKERLESS_PREVIOUS_CANDIDATES_SQL: &str = "SELECT DISTINCT e.txid FROM owed_rows r JOIN pot_evictions e ON e.txid = json_extract(r.facts, '$.markerlessJoin') WHERE r.identity = ?1 AND e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND (EXISTS (SELECT 1 FROM potparty_records_evicted pp WHERE pp.identity = ?1 AND pp.potTxid = e.txid AND pp.sigValid = 1 AND pp.seatSettlePubkey IS NOT NULL) OR EXISTS (SELECT 1 FROM potparty_records pp WHERE pp.identity = ?1 AND pp.potTxid = e.txid AND pp.sigValid = 1 AND pp.seatSettlePubkey IS NOT NULL))";
+pub const MARKERLESS_PREVIOUS_CANDIDATES_SQL: &str = "SELECT DISTINCT e.txid FROM owed_rows r JOIN pot_evictions e ON e.txid = json_extract(r.facts, '$.markerlessJoin') WHERE r.identity = ?1 AND e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND (EXISTS (SELECT 1 FROM potparty_records_evicted pp WHERE pp.identity = ?1 AND lower(pp.potTxid) = e.txid AND pp.sigValid = 1 AND pp.seatSettlePubkey IS NOT NULL) OR EXISTS (SELECT 1 FROM potparty_records pp WHERE pp.identity = ?1 AND lower(pp.potTxid) = e.txid AND pp.sigValid = 1 AND pp.seatSettlePubkey IS NOT NULL))";
 
 /// A deferred row retires as soon as its JOIN leaves this identity's candidate set (#608).
 pub fn markerless_should_carry(
