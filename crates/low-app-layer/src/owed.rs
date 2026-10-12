@@ -3233,6 +3233,7 @@ const OWED_RECOMPUTE_RATE_PRUNE_AT: usize = 1024;
 pub struct RecomputeRate {
     /// identity (lowercase) -> (window start ms, recomputes run in it)
     windows: HashMap<String, (i64, u32)>,
+    deferred: HashMap<String, i64>,
 }
 
 impl RecomputeRate {
@@ -3241,9 +3242,8 @@ impl RecomputeRate {
     /// snapshot and counts it with [`note_recompute_shed`]).
     pub fn admit(&mut self, identity_lc: &str, now_ms: i64, sheddable: bool) -> bool {
         if self.windows.len() >= OWED_RECOMPUTE_RATE_PRUNE_AT {
-            self.windows.retain(|_, (start, _)| {
-                now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS
-            });
+            self.windows.retain(|_, (start, _)| now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS);
+            self.deferred.retain(|_, end| *end > now_ms);
         }
         let w = self
             .windows
@@ -3257,6 +3257,24 @@ impl RecomputeRate {
         }
         w.1 = w.1.saturating_add(1);
         true
+    }
+    /// Arm at most one deferred walk for the exhausted window. The caller persists the alarm before returning.
+    pub fn arm_deferred(&mut self, identity_lc: &str, now_ms: i64) -> Option<i64> {
+        let delay = self.retry_after_ms(identity_lc, now_ms)?;
+        let end = now_ms.saturating_add(delay);
+        if self.deferred.get(identity_lc) == Some(&end) { return None; }
+        self.deferred.insert(identity_lc.to_string(), end);
+        Some(end)
+    }
+    /// Scheduling failed: allow the next shed to repair this window's missing alarm.
+    pub fn unarm_deferred(&mut self, identity_lc: &str, end: i64) {
+        if self.deferred.get(identity_lc) == Some(&end) { self.deferred.remove(identity_lc); }
+    }
+    /// Remainder of an exhausted window; reads can inspect this without spending another admission.
+    pub fn retry_after_ms(&self, identity_lc: &str, now_ms: i64) -> Option<i64> {
+        let (start, n) = self.windows.get(identity_lc)?;
+        let remaining = start.saturating_add(OWED_RECOMPUTE_RATE_WINDOW_MS).saturating_sub(now_ms);
+        (*n >= OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW && remaining > 0).then_some(remaining)
     }
     /// The recomputes `identity_lc` has run in its current window (0 past it).
     pub fn in_window(&self, identity_lc: &str, now_ms: i64) -> u32 {
@@ -8694,7 +8712,7 @@ pub(crate) mod tests {
             .expect("the hooks' entry");
         assert!(
             routes[push..].starts_with(&squash(
-                "pub(crate) async fn owed_recompute_and_push( env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>, ) { if !owed_recompute_admit(identity_lc, source, true) { owed_shed_remark(db, identity_lc).await; return; }"
+                "pub(crate) async fn owed_recompute_and_push( env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>, ) { if !owed_recompute_admit(identity_lc, source, true) { owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc).await; return; }"
             )),
             "a shed in owed_recompute_and_push re-marks the identity stale before it returns"
         );
@@ -8730,19 +8748,10 @@ pub(crate) mod tests {
             .find(&squash("pub(crate) async fn owed_recompute_and_push("))
             .expect("the hooks' entry");
         let push_body = &routes[push..];
-        let ask = push_body.find(&squash("if !owed_recompute_admit(identity_lc, source, true) { owed_shed_remark(db, identity_lc).await; return; }")).expect("the ask");
-        let walk = push_body
-            .find(&squash(
-                "owed_recompute(env, db, identity_lc, source, tip_hint)",
-            ))
-            .expect("the walk");
-        assert!(
-            ask < walk,
-            "owed_recompute_and_push must ask the ceiling before it walks"
-        );
-        assert!(routes.contains(&squash(
-            "owed_recompute_admit(&identity, \"read-first\", false); match owed_compute_on_read("
-        )));
+        let ask = push_body.find(&squash("if !owed_recompute_admit(identity_lc, source, true) { owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc).await; return; }")).expect("the ask");
+        let walk = push_body.find(&squash("owed_recompute(env, db, identity_lc, source, tip_hint)")).expect("the walk");
+        assert!(ask < walk, "owed_recompute_and_push must ask the ceiling before it walks");
+        assert!(routes.contains(&squash("owed_recompute_admit(&identity, \"read-first\", false); match owed_compute_on_read(")));
         assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, source, true) { owed_shed_remark(&db, &identity).await; (rows, prev_tip, st.computed_at_ms as i64, cut) } else { match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)")));
         assert_eq!(
             routes
@@ -8752,4 +8761,47 @@ pub(crate) mod tests {
             "the walk's two callers (the push and the read's compute)"
         );
     }
+    #[test]
+    fn ns2_shed_spent_pot_arms_a_deferred_walk_and_push() {
+        let mut rate = RecomputeRate::default();
+        for n in 0..12 { assert!(rate.admit(ME, 1_000 + n, true)); }
+        assert!(!rate.admit(ME, 20_000, true));
+        assert!(include_str!("routes.rs").contains("owed_schedule_deferred(env, identity_lc).await"), "spent-pot pot-changed must schedule a later walk and push");
+        assert!(include_str!("board_view.rs").contains("async fn alarm(&self)"));
+        assert!(include_str!("board_view.rs").contains("owed_deferred_walk_and_push"));
+    }
+
+    #[test]
+    fn ns2_one_deferred_walk_converges_the_spent_pot_at_the_window_end() {
+        let mut rate = RecomputeRate::default();
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(OWED_ROWS_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        conn.execute_batch(bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS.iter().find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS hop_chain_probes ")).unwrap()).unwrap();
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let live = [entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A))];
+        let before = derive_owed_rows(&inputs(&live, &[], &[], &v, &c, &p, Some(899_990)));
+        assert_eq!(before[0].family, OwedFamily::InProgress);
+        run_owed_write(&mut conn, &owed_write_plan(ME, &before, 1_000, Some(900_001), false));
+        for n in 0..12 { assert!(rate.admit(ME, 1_000 + n, true)); }
+        assert!(!rate.admit(ME, 20_000, true));
+        let end = rate.arm_deferred(ME, 20_000).unwrap();
+        assert_eq!(end, 61_000);
+        for at in [21_000, 30_000, 60_999] {
+            assert!(!rate.admit(ME, at, true));
+            assert_eq!(rate.arm_deferred(ME, at), None);
+        }
+        assert_eq!(served(&conn, ME).0[0].1.as_str(), "in-progress");
+        let spent = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let after = derive_owed_rows(&inputs(&spent, &[], &[], &v, &c, &p, Some(900_200)));
+        run_owed_write(&mut conn, &owed_write_plan(ME, &after, end, Some(900_200), false));
+        assert_eq!(served(&conn, ME).0[0].1.as_str(), "payout");
+        assert_eq!(after[0].sats, Some(39_200));
+        let push = owed_changed_event_body(ME, "deferred", after.len(), end);
+        assert_eq!(push["kind"], "owed-changed");
+        assert_eq!(push["computedAtMs"], end);
+        assert!(rate.admit(ME, end, true)); // the next window retains its ordinary twelve admits
+        assert_eq!(rate.in_window(ME, end), 1);
+    }
+
 }

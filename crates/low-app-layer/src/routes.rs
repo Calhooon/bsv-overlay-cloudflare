@@ -4530,8 +4530,20 @@ pub(crate) async fn owed_recompute_and_push(
     // folded rerun is the one shed; without the re-mark the next read served the older rows as fresh)
     if !owed_recompute_admit(identity_lc, source, true) {
         owed_shed_remark(db, identity_lc).await;
+        owed_schedule_deferred(env, identity_lc).await;
         return;
     }
+    owed_walk_and_push(env, db, identity_lc, source, tip_hint).await;
+}
+
+/// The alarm owns one reserved walk from the exhausted window. It does not consume the next window's admits.
+pub(crate) async fn owed_deferred_walk_and_push(env: &worker::Env, identity_lc: &str) -> worker::Result<()> {
+    let db = env.d1("OVERLAY_DB")?;
+    owed_walk_and_push(env, &db, identity_lc, "deferred", None).await;
+    Ok(())
+}
+
+async fn owed_walk_and_push(env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>) {
     // bsv-low #499 (lens fold M3): the walk runs under its own ledger, keyed `owed-recompute` in `d1Budget` (it runs
     // after the answer, in `wait_until`, where no request's scope holds it; before, it landed only in `unscoped`)
     let (walked, d1) =
@@ -4575,6 +4587,11 @@ async fn owed_shed_remark(db: &worker::D1Database, identity_lc: &str) {
 }
 
 thread_local! {
+    static OWED_ISOLATE: String = {
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes).expect("isolate nonce");
+        hex::encode(bytes)
+    };
     /// The identities whose recompute is in flight on THIS isolate, with the unix-ms it began (wasm is
     /// single-threaded; a second ask inside the window is REMEMBERED and run once more after it — never in parallel).
     /// The gate's MEDIUM-2 (2026-09-19): a mark older than `OWED_IN_FLIGHT_STALE_MS` is treated as abandoned (a
@@ -4608,6 +4625,23 @@ pub(crate) fn owed_recompute_admit(identity_lc: &str, source: &str, sheddable: b
         );
     }
     run
+}
+/// Persist a timer on the existing actor binding: HTTP wait_until expires after 30 seconds, less than our window.
+async fn owed_schedule_deferred(env: &worker::Env, identity_lc: &str) {
+    let now = worker::Date::now().as_millis() as i64;
+    let Some(end) = OWED_RATE.with(|r| r.borrow_mut().arm_deferred(identity_lc, now)) else { return; };
+    let result = async {
+        let ns = env.durable_object("BOARD_VIEW")?;
+        let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity_lc}:{end}"));
+        let stub = ns.id_from_name(&name)?.get_stub()?;
+        let response = stub.fetch_with_str(&format!("https://board-view/owed-deferred?identity={identity_lc}&due={end}")).await?;
+        if response.status_code() != 200 { return Err(worker::Error::RustError("owed alarm refused".into())); }
+        Ok::<(), worker::Error>(())
+    }.await;
+    if let Err(e) = result {
+        OWED_RATE.with(|r| r.borrow_mut().unarm_deferred(identity_lc, end));
+        console_warn!("[owed] deferred alarm could not be armed: {e}");
+    }
 }
 /// The identities at the ceiling on this isolate now, for `/health`.
 pub(crate) fn owed_rate_at_ceiling(now_ms: i64) -> usize {
