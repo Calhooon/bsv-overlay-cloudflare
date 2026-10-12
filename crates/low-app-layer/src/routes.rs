@@ -6681,8 +6681,7 @@ where
             crate::courier::note_presence("tx_any_arcade_anchor_unavailable_total");
         }
     }
-    let (mut observation, absence, claimed_height) =
-        tx_any_courier_leg_via(txid, &get).await;
+    let (mut observation, absence, claimed_height) = tx_any_courier_leg_via(txid, &get).await;
     if let TxObservation::Present { confirmed, raw_hex } = observation {
         if confirmed {
             let proven = if let Some(height) = claimed_height {
@@ -6702,7 +6701,12 @@ where
                     raw_hex,
                 }
             } else {
-                TxObservation::Fault
+                crate::courier::note_presence("tx_any_courier_proof_fault_total");
+                TxObservation::CourierHint {
+                    raw_hex,
+                    source: "woc",
+                    observed_at_ms: now_ms,
+                }
             };
         } else {
             observation = TxObservation::CourierHint {
@@ -6865,6 +6869,32 @@ fn cache_tx_any_answer(key: &str, answer: &TxAnyCached, now: f64) {
     });
 }
 
+fn apply_external_height(
+    a: &mut TxAnyCached,
+    external: &crate::txany::TxObservation,
+    claimed_height: Option<u64>,
+) {
+    if matches!(
+        external,
+        crate::txany::TxObservation::FirstPartyPresent {
+            confirmed: true,
+            ..
+        } | crate::txany::TxObservation::Present {
+            confirmed: true,
+            ..
+        }
+    ) {
+        a.height = claimed_height;
+    }
+    if matches!(
+        external,
+        crate::txany::TxObservation::Present { .. }
+            | crate::txany::TxObservation::CourierHint { .. }
+    ) {
+        a.claimed_height = claimed_height;
+    }
+}
+
 /// Everything AFTER the index leg for ONE txid (the single route's whole
 /// decision past the index read; the batched route reuses it only for the
 /// txids its index leg DECIDED, never for the external leg — gate MED-1): the
@@ -6926,24 +6956,7 @@ async fn resolve_tx_any(
         // the one break-glass left at request time: a tx the index never admitted
         let (external, absence, claimed_height) = tx_any_external_leg(key, caller, env).await;
         let mut a = crate::txany::decide_tx_any(index_raw, index_height, Some(&external), absence);
-        if matches!(
-            external,
-            crate::txany::TxObservation::FirstPartyPresent {
-                confirmed: true,
-                ..
-            }
-        ) {
-            a.height = claimed_height; // verified against our canonical headers above
-        }
-        if matches!(
-            external,
-            crate::txany::TxObservation::Present {
-                confirmed: true,
-                ..
-            }
-        ) {
-            a.height = claimed_height; // only the proof-checked foreign path reaches this
-        }
+        apply_external_height(&mut a, &external, claimed_height);
         a
     };
     // The second gate's MEDIUM-1 (2026-09-18): the request-time UNCONFIRMABLE probe (up to three inputs through the
@@ -8043,6 +8056,45 @@ mod e606_tests {
             decide_tx_any(None, None, Some(&obs), absence).confirmed,
             None
         );
+    }
+
+    #[test]
+    fn ns2pd_l2_unprovable_mined_claim_keeps_verified_content() {
+        let (txid, raw) = competitor();
+        for proof_status in [200, 404, 429] {
+            let get = |url: String| {
+                let response = if url.contains("/tx/hash/") {
+                    (200, mined_body(&txid))
+                } else if url.ends_with("/hex") {
+                    (200, hex::encode(&raw).into_bytes())
+                } else if url.ends_with("/proof/tsc") {
+                    (proof_status, b"{}".to_vec())
+                } else {
+                    (404, vec![])
+                };
+                std::future::ready(Some(response))
+            };
+            let (obs, absence, height) = run(tx_any_presence_leg_via(
+                &txid,
+                1234,
+                false,
+                None,
+                get,
+                |_, _| async { false },
+            ));
+            let mut a = decide_tx_any(None, None, Some(&obs), absence);
+            apply_external_height(&mut a, &obs, height);
+            assert_eq!(
+                crate::txany::fact_reader_raw_hex(&a),
+                Some(hex::encode(&raw).as_str())
+            );
+            assert_eq!(a.present, None);
+            assert_eq!(a.confirmed, None);
+            assert_eq!(a.height, None);
+            assert_eq!(a.claimed_height, Some(970733));
+            assert_eq!(a.hint_source, Some("woc"));
+            assert_eq!(a.observed_at_ms, Some(1234));
+        }
     }
 
     /// WoC's `/tx/hash` body for a MEMPOOL transaction, the keys as probed live 2026-10-12 (no `confirmations`).
