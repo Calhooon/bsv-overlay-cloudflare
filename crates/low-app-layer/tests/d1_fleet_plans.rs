@@ -118,6 +118,7 @@ fn hot_routes_never_scan_fleet_tables() {
             }
         }
     }
+    println!("hot route fleet SCAN list: {failures:?}");
     assert!(failures.is_empty(), "fleet scans:\n{}", failures.join("\n"));
 }
 
@@ -313,6 +314,31 @@ fn created_at_cursor_union_equals_unpaged_ranked_views_byte_for_byte() {
                 serde_json::to_vec(&got).unwrap(),
                 "party era {era:?}"
             );
+            let mut paired = Vec::new();
+            for page in selected.chunks(owed_cursor::PAGE) {
+                paired.extend(values(
+                    &db,
+                    &owed_cursor::hydrate_party_pair_sql(),
+                    &[Value::Text(serde_json::to_string(page).unwrap())],
+                ));
+            }
+            assert_eq!(expected.len(), paired.len());
+            for (expected, mut paired) in expected.iter().zip(paired) {
+                if original.contains("backupMarkerPresent") {
+                    paired["spenderProofVerified"] = paired["refundSpenderProofVerified"].clone();
+                }
+                let projection: serde_json::Map<String, serde_json::Value> = expected
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(|k| (k.clone(), paired[k].clone()))
+                    .collect();
+                assert_eq!(
+                    *expected,
+                    serde_json::Value::Object(projection),
+                    "shared hydration retains each production projection"
+                );
+            }
         }
         let original = low_app_layer::hops_view::hops_view_sql(false, era, 0);
         let cap = (low_app_layer::hops_view::HOPS_VIEW_MAX_OUTPOINTS + 1)

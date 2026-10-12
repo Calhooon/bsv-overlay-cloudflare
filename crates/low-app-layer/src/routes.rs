@@ -2590,8 +2590,39 @@ async fn owed_party_cursor(
 ) -> std::result::Result<Vec<serde_json::Value>, String> {
     use crate::owed_cursor::{candidates_sql, Cursor};
     let mut candidates = Vec::new();
-    for source in sources {
+    let mut initial: Option<Vec<serde_json::Value>> = if sources.len() == 2 {
+        Some(
+            db.prepare(crate::owed_cursor::initial_party_sql())
+                .bind(&[JsValue::from_str(identity)])
+                .map_err(|e| format!("owed initial cursor bind: {e}"))?
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<serde_json::Value>())
+                .map_err(|e| format!("owed initial cursor: {e}"))?,
+        )
+    } else {
+        None
+    };
+    for (tag, source) in sources.iter().enumerate() {
         let mut cursor = Cursor::default();
+        if let Some(initial) = initial.as_mut() {
+            let rows: Vec<_> = initial
+                .iter()
+                .filter(|v| crate::owed_cursor::number(v, "sourceTag") == Some(tag as i64))
+                .cloned()
+                .collect();
+            let n = rows.len();
+            if let Some(last) = rows.last() {
+                cursor.last = Some((
+                    crate::owed_cursor::number(last, "createdAt"),
+                    crate::owed_cursor::number(last, "cursorRowid").unwrap(),
+                ));
+            }
+            candidates.extend(rows);
+            if n < crate::owed_cursor::INITIAL_PAGE {
+                continue;
+            }
+        }
         loop {
             if worker::Date::now().as_millis() as i64 - started_ms
                 > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS
@@ -2718,33 +2749,28 @@ async fn owed_recompute_inner(
         let mut refund_rows = Vec::new();
         for chunk in page.chunks(crate::owed_cursor::PAGE) {
             let encoded = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
-            let sql = crate::owed_cursor::hydrate_sql(&crate::results::results_sql(None, 0));
+            let sql = crate::owed_cursor::hydrate_party_pair_sql();
             let rows = db
                 .prepare(sql)
                 .bind(&[JsValue::from_str(&encoded)])
-                .map_err(|e| format!("owed results cursor bind: {e}"))?
+                .map_err(|e| format!("owed party hydration bind: {e}"))?
                 .counted_all()
                 .await
-                .and_then(|r| r.results::<ResultsRowD1>())
-                .map_err(|e| format!("owed results cursor: {e}"))?
-                .into_iter()
-                .map(ResultsRowD1::into_row)
-                .collect::<Vec<_>>();
-            result_rows.extend(rows);
-            let sql =
-                crate::owed_cursor::hydrate_sql(&crate::refund_view::refund_view_sql(None, 0));
-            let rows = db
-                .prepare(sql)
-                .bind(&[JsValue::from_str(&encoded)])
-                .map_err(|e| format!("owed refund cursor bind: {e}"))?
-                .counted_all()
-                .await
-                .and_then(|r| r.results::<RefundViewRowD1>())
-                .map_err(|e| format!("owed refund cursor: {e}"))?
-                .into_iter()
-                .map(RefundViewRowD1::into_row)
-                .collect::<Vec<_>>();
-            refund_rows.extend(rows);
+                .and_then(|r| r.results::<serde_json::Value>())
+                .map_err(|e| format!("owed party hydration: {e}"))?;
+            for mut row in rows {
+                result_rows.push(
+                    serde_json::from_value::<ResultsRowD1>(row.clone())
+                        .map_err(|e| format!("owed result row: {e}"))?
+                        .into_row(),
+                );
+                row["spenderProofVerified"] = row["refundSpenderProofVerified"].clone();
+                refund_rows.push(
+                    serde_json::from_value::<RefundViewRowD1>(row)
+                        .map_err(|e| format!("owed refund row: {e}"))?
+                        .into_row(),
+                );
+            }
         }
         results.extend(
             gather_result_rows(db, identity_lc, result_rows, false)
