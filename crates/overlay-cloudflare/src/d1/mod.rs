@@ -504,7 +504,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// skipped and named); two additive ALTERs.
 /// 188 → 189 for N5 (align-engine-050, 2026-10-10, LOW's E585 land2 lens): `ef_deferred_sweep`, the one-row state of
 /// the pass over the deferred EF jobs' R2 objects (its cursor, the round, the last complete count); one table.
-pub const OVERLAY_MIGRATION_COUNT: usize = 189;
+/// 189 → 194 for L23R2-H1/M3: two empty permanent twins and three indexes for identity-owned reads.
+pub const OVERLAY_MIGRATION_COUNT: usize = 194;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1821,6 +1822,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // N5 (align-engine-050, LOW's E585 land2 lens): the one-row state of the pass over the deferred EF jobs' R2
     // objects (`ef-deferred/`), the same shape as `beef_blob_sweep`. Transient.
     crate::beef_blob_sweep::EF_SWEEP_STATE_CREATE,
+    // L23R2-H1/M3: the app-layer probes permanent twins even before the first eviction.
+    // Mirror the current sources without constraints, exactly the shadow storage contract.
+    "CREATE TABLE IF NOT EXISTS potparty_records_evicted AS SELECT CAST(0 AS INTEGER) AS af_evictedAt, CAST('' AS TEXT) AS af_reason, * FROM potparty_records WHERE 0",
+    "CREATE TABLE IF NOT EXISTS pot_records_evicted AS SELECT CAST(0 AS INTEGER) AS af_evictedAt, CAST('' AS TEXT) AS af_reason, * FROM pot_records WHERE 0",
+    "CREATE INDEX IF NOT EXISTS idx_evicted_party_identity_pot ON potparty_records_evicted(identity, lower(potTxid))",
+    "CREATE INDEX IF NOT EXISTS idx_evicted_party_pot ON potparty_records_evicted(potTxid, potVout)",
+    "CREATE INDEX IF NOT EXISTS idx_evicted_pot_txid ON pot_records_evicted(txid)",
 ];
 
 // =============================================================================
