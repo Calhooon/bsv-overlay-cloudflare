@@ -6472,7 +6472,7 @@ thread_local! {
     /// The same memo for WoC's tx route (the second gate's MEDIUM-3a): a WoC 404 reads as ABSENT only behind a
     /// route that served the known-mined anchor this isolate — a rotten or rate-limited route is a fault, never
     /// an absence (and never a memo).
-    static ARCADE_ROUTE_HEALTHY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ARCADE_ROUTE_HEALTHY: std::cell::Cell<Option<(i64, bool)>> = const { std::cell::Cell::new(None) };
     static WOC_ROUTE_HEALTHY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
@@ -6548,6 +6548,14 @@ async fn tx_any_index_leg(
     (None, None)
 }
 
+const ARCADE_ANCHOR_PROBE_TTL_MS: i64 = 30_000;
+fn arcade_anchor_probe_due(now_ms: i64) -> bool {
+    ARCADE_ROUTE_HEALTHY.with(|c| {
+        c.get()
+            .is_none_or(|(at, _)| now_ms < at || now_ms - at >= ARCADE_ANCHOR_PROBE_TTL_MS)
+    })
+}
+
 const TX_ANY_OURS_SQL: &str = "SELECT txid FROM transactions WHERE txid = ? UNION ALL SELECT txid FROM pot_beefs WHERE txid = ? UNION ALL SELECT refusedTxid AS txid FROM submit_refusals WHERE refusedTxid = ? LIMIT 1";
 const TX_ANY_HELD_ANCHOR_SQL: &str = "SELECT t.txid FROM transactions t INNER JOIN network_seen n ON n.txid = t.txid WHERE t.has_proof = 1 LIMIT 1";
 
@@ -6573,7 +6581,8 @@ async fn tx_any_scope(env: &worker::Env, txid: &str) -> (bool, Option<String>) {
         Some(stmt) => stmt.counted_first::<Id>().await.ok().flatten().is_some(),
         None => false,
     };
-    let anchor = if ours && !ARCADE_ROUTE_HEALTHY.with(std::cell::Cell::get) {
+    let now_ms = worker::Date::now().as_millis() as i64;
+    let anchor = if ours && arcade_anchor_probe_due(now_ms) {
         db.prepare(TX_ANY_HELD_ANCHOR_SQL)
             .counted_first::<Id>()
             .await
@@ -6658,28 +6667,37 @@ where
             height,
         );
     }
-    // A HELD, verified anchor proves the store route works, never that the
-    // store can see a foreign mempool subject. Memoise success per isolate (N4).
-    if ours
-        && matches!(response, Some((404, _)))
-        && !ARCADE_ROUTE_HEALTHY.with(std::cell::Cell::get)
-    {
-        if let Some(anchor) = held_anchor {
-            let healthy = get(format!("{}/tx/{anchor}", arcade_url()))
-                .await
-                .is_some_and(|(status, body)| {
-                    crate::txany::parse_arcade_subject_word(status, &body, anchor, now_ms)
-                        != ArcadeWord::Unknown
-                });
+    // A HELD, proven anchor tests route reachability, never subject absence.
+    // Both outcomes expire, so a stale Arcade rank cannot cause an endless probe.
+    if ours && matches!(response, Some((404, _))) && arcade_anchor_probe_due(now_ms) {
+        let healthy = if let Some(anchor) = held_anchor {
+            let response = get(format!("{}/tx/{anchor}", arcade_url())).await;
+            let healthy = response.as_ref().is_some_and(|(status, body)| {
+                *status == 200
+                    && serde_json::from_slice::<serde_json::Value>(body)
+                        .ok()
+                        .and_then(|v| v["txid"].as_str().map(str::to_owned))
+                        .is_some_and(|id| id.eq_ignore_ascii_case(anchor))
+            });
+            if healthy
+                && response.as_ref().is_some_and(|(status, body)| {
+                    crate::txany::parse_arcade_subject_word(*status, body, anchor, now_ms)
+                        == ArcadeWord::Unknown
+                })
+            {
+                crate::courier::note_presence("tx_any_arcade_anchor_stale_rank_total");
+            }
             crate::courier::note_presence(if healthy {
                 "tx_any_arcade_anchor_ok_total"
             } else {
                 "tx_any_arcade_anchor_unknown_total"
             });
-            ARCADE_ROUTE_HEALTHY.with(|c| c.set(healthy));
+            healthy
         } else {
             crate::courier::note_presence("tx_any_arcade_anchor_unavailable_total");
-        }
+            false
+        };
+        ARCADE_ROUTE_HEALTHY.with(|c| c.set(Some((now_ms, healthy))));
     }
     let (mut observation, absence, claimed_height) = tx_any_courier_leg_via(txid, &get).await;
     if let TxObservation::Present { confirmed, raw_hex } = observation {
@@ -7967,7 +7985,7 @@ mod e606_tests {
 
     #[test]
     fn ns2_m1_held_anchor_probe_is_memoised_but_never_a_second_absence_vote() {
-        ARCADE_ROUTE_HEALTHY.with(|c| c.set(false));
+        ARCADE_ROUTE_HEALTHY.with(|c| c.set(None));
         WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
         let subject = tx(0x11);
         let held = tx(0x22); // fixture: overlay HELD, network_seen, verified BUMP.
@@ -8001,7 +8019,66 @@ mod e606_tests {
             assert_eq!(absence, AbsenceCorroboration::Unknown);
         }
         assert_eq!(anchor_reads.get(), 1);
-        ARCADE_ROUTE_HEALTHY.with(|c| c.set(false));
+        ARCADE_ROUTE_HEALTHY.with(|c| c.set(None));
+    }
+
+    #[test]
+    fn ns2pd_l3_negative_and_stale_rank_anchor_probes_are_bounded() {
+        let subject = tx(0x11);
+        let held = tx(0x22);
+        let now = crate::txany::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
+        WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
+        for anchor_status in [404, 200] {
+            ARCADE_ROUTE_HEALTHY.with(|c| c.set(None));
+            let reads = std::cell::Cell::new(0);
+            let get = |url: String| {
+                let response = if url == format!("{}/tx/{held}", arcade_url()) {
+                    reads.set(reads.get() + 1);
+                    (
+                        anchor_status,
+                        serde_json::json!({"txid":held,"txStatus":"ACCEPTED_BY_NETWORK",
+                        "timestamp":"2026-07-22T18:32:54.263687Z"})
+                        .to_string()
+                        .into_bytes(),
+                    )
+                } else {
+                    (404, vec![])
+                };
+                std::future::ready(Some(response))
+            };
+            for at in [now, now + 1] {
+                let (obs, absence, _) = run(tx_any_presence_leg_via(
+                    &subject,
+                    at,
+                    true,
+                    Some(&held),
+                    get,
+                    |_, _| async { false },
+                ));
+                assert_eq!(decide_tx_any(None, None, Some(&obs), absence).present, None);
+                assert_eq!(absence, AbsenceCorroboration::Unknown);
+            }
+            assert_eq!(
+                reads.get(),
+                1,
+                "both negative and stale-rank success are memoised"
+            );
+            assert_eq!(
+                ARCADE_ROUTE_HEALTHY.with(|c| c.get().unwrap().1),
+                anchor_status == 200,
+                "pre-SEEN on a proven anchor is stale rank, not absence"
+            );
+            run(tx_any_presence_leg_via(
+                &subject,
+                now + 30_001,
+                true,
+                Some(&held),
+                get,
+                |_, _| async { false },
+            ));
+            assert_eq!(reads.get(), 2, "memo expires for either outcome");
+        }
+        ARCADE_ROUTE_HEALTHY.with(|c| c.set(None));
     }
 
     #[test]
