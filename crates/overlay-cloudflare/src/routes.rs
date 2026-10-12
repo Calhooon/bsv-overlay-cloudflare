@@ -1376,8 +1376,9 @@ async fn submit_parts(
                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
             // ARCREGD2-M1: the first byte-deferred run still dual-pushes its
             // subject, including proven ancestry (which has no walk). The
-            // selector caps consumer work at one leg / two fetches; later
-            // runs push nothing. Request ancestry pushes are unchanged.
+            // selector caps cursor-0 runs (including unadvanced requeues)
+            // at one leg / two fetches; runs past the first leg push nothing.
+            // Request ancestry pushes are unchanged.
             if let (true, false, Ok(dual_db)) =
                 (dual_on, dual_legs.is_empty(), env.d1("OVERLAY_DB"))
             {
