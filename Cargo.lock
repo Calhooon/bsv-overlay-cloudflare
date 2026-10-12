@@ -205,7 +205,6 @@ name = "bsv-overlay-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bsv-overlay-discovery",
  "bsv-overlay-engine",
  "bsv-rs",
  "hex",
@@ -1272,6 +1271,20 @@ dependencies = [
  "libc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "overlay-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bsv-overlay-discovery",
+ "bsv-overlay-engine",
+ "bsv-rs",
+ "hex",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
