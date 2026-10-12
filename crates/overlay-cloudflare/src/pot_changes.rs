@@ -151,6 +151,7 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>, deadline_ms: u64) {
 /// rows (the post-submit signers self-heal, `routes.rs`) must end with
 /// `flush_inline(env.clone()).await` so its own notes ride its own task.
 pub async fn flush_inline(env: Env) {
+    let tracker_events = crate::tracker_events::drain();
     let changed = drain();
     // bsv-low #469 (2026-09-19): the hop-marker notes ride every flush the pot notes ride (one set of flush points)
     let hops = crate::hop_changes::drain();
@@ -159,10 +160,10 @@ pub async fn flush_inline(env: Env) {
     if !hops.is_empty() {
         crate::hop_changes::ship(env.clone(), hops, deadline_ms).await;
     }
-    if changed.is_empty() {
-        return;
+    if !changed.is_empty() {
+        ship(env.clone(), changed, deadline_ms).await;
     }
-    ship(env, changed, deadline_ms).await;
+    crate::tracker_events::ship(&env, tracker_events).await;
 }
 
 /// Drain and ship under the given `wait_until` (a request, queue or cron
@@ -172,10 +173,11 @@ pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
     env: &Env,
     wait_until: F,
 ) {
+    let tracker_events = crate::tracker_events::drain();
     let changed = drain();
     // bsv-low #469 (2026-09-19): the hop-marker notes ride the same flush (one detached task carries both sets)
     let hops = crate::hop_changes::drain();
-    if changed.is_empty() && hops.is_empty() {
+    if changed.is_empty() && hops.is_empty() && tracker_events.is_empty() {
         return;
     }
     let env2 = env.clone();
@@ -186,8 +188,9 @@ pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
             crate::hop_changes::ship(env2.clone(), hops, deadline_ms).await;
         }
         if !changed.is_empty() {
-            ship(env2, changed, deadline_ms).await;
+            ship(env2.clone(), changed, deadline_ms).await;
         }
+        crate::tracker_events::ship(&env2, tracker_events).await;
     }));
 }
 

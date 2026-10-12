@@ -2709,3 +2709,5 @@ mod stored_rows;
 #[cfg(test)]
 #[path = "../../worker-build-info/src/worker_tests.rs"]
 mod build_info_tests;
+
+pub mod tracker_events;

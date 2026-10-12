@@ -741,6 +741,7 @@ pub async fn latch_network_seen(db: &D1Database, txid: &str) {
         worker::console_log!("[#371] network_seen latch failed for {txid}: {e}");
         return;
     }
+    crate::tracker_events::note(txid, "seen", None);
     // admit-fast step 4: the witness is a pot fact the felt renders
     // ("awaiting the network" → "seen"), so every pot row of the txid is
     // NOTED for the pots-room push (`ls_pot spentStatus.networkSeen`). The

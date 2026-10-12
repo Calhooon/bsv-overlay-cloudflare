@@ -320,7 +320,7 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     }
 
     let entries = assemble_statuses(&outpoints, &rows);
-    json_response(crate::tracker_host::served::body(&utxo_status_body(&entries), None, &Default::default()), 200)
+    json_response(crate::tracker_host::runtime::body(&ctx.env, &utxo_status_body(&entries), None).await?, 200)
 }
 
 /// `GET /beef/:txid` — the BEEF bytes for a txid, read from `pot_beefs`
@@ -4550,7 +4550,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             "could not judge the complete list this pass: bounded or faulted evidence read"
         );
     }
-    json_response(crate::tracker_host::served::body(&body.to_string(), None, &Default::default()), 200)
+    json_response(crate::tracker_host::runtime::body(&ctx.env, &body.to_string(), None).await?, 200)
 }
 
 async fn gather_result_entries(
@@ -6335,7 +6335,7 @@ pub fn set_arcade_url(url: Option<String>) {
             .filter(|s| !s.is_empty())
     });
 }
-fn arcade_url() -> String {
+pub(crate) fn arcade_url() -> String {
     ARCADE_URL.with(|u| u.borrow().clone().unwrap_or_else(|| DEFAULT_ARCADE_URL.to_string()))
 }
 
@@ -6387,7 +6387,7 @@ async fn arcade_confirmation_look(
 /// every call is COUNTED and LOGGED with its caller (`crate::courier::note`)
 /// and identifies this worker (Arcade's edge 403s bare agents — the
 /// 2026-09-01 incident's lesson on the overlay).
-async fn provider_get(caller: &'static str, url: &str) -> Option<(u16, Vec<u8>)> {
+pub(crate) async fn provider_get(caller: &'static str, url: &str) -> Option<(u16, Vec<u8>)> {
     provider_get_with(caller, url, None).await
 }
 
@@ -6780,7 +6780,7 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             write_probe_memos(&db, &fresh).await;
         }
     }
-    json_response(crate::tracker_host::served::body(&crate::txany::spent_any_body(&entries, &terminals), None, &Default::default()), 200)
+    json_response(crate::tracker_host::runtime::body(&ctx.env, &crate::txany::spent_any_body(&entries, &terminals), None).await?, 200)
 }
 
 // ── /tx-any — tx-level presence/confirmation/raw, index-first (bsv-low #229) ──
@@ -7512,6 +7512,26 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         return json_error("invalid txid (expect 64 hex chars)", 400);
     }
     let key = txid.to_ascii_lowercase();
+    let mut stored = crate::tracker_host::stored::read(&ctx.env, &[key.clone()]).await?;
+    if let Some(row) = stored.remove(&key) {
+        let legacy = match row.legacy_body.clone() {
+            Some(body) => body,
+            None => {
+                let (raw, _) = tx_any_index_leg(&ctx, &key).await;
+                let mut answer = TxAnyCached::default();
+                answer.raw_hex = raw;
+                answer.present = matches!(row.word.as_str(), "announced" | "seen" | "mined").then_some(true);
+                answer.confirmed = Some(row.word == "mined");
+                answer.height = row.height.map(|h| h as u64);
+                crate::txany::tx_any_body(&key, &answer)
+            }
+        };
+        let mut value = serde_json::from_str(&legacy)?;
+        let rows = std::collections::BTreeMap::from([(key.clone(), row)]);
+        let views = crate::tracker_host::runtime::views(&ctx.env, &rows).await;
+        crate::tracker_host::runtime::decorate(&mut value, Some(&key), &views);
+        return json_response(value.to_string(), 200);
+    }
     let now = worker::Date::now().as_millis() as f64;
     let answer = match tx_any_cached(&key, now) {
         Some(a) => a,
@@ -7520,7 +7540,13 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
             resolve_tx_any(index_raw, index_height, &key, now, "tx_any", &ctx.env).await
         }
     };
-    json_response(crate::tracker_host::served::body(&crate::txany::tx_any_body(&key, &answer), Some(&key), &Default::default()), 200)
+    let legacy = crate::txany::tx_any_body(&key, &answer);
+    let row = crate::tracker_host::runtime::event(&ctx.env, &key, "fallback", None, Some(legacy.clone())).await?;
+    let mut value = serde_json::from_str(&legacy)?;
+    let rows = std::collections::BTreeMap::from([(key.clone(), row)]);
+    let views = crate::tracker_host::runtime::views(&ctx.env, &rows).await;
+    crate::tracker_host::runtime::decorate(&mut value, Some(&key), &views);
+    json_response(value.to_string(), 200)
 }
 
 /// One batched index-leg row: the txid alongside what the single leg reads.
@@ -7713,7 +7739,7 @@ pub async fn tx_any_batch(req: Request, ctx: RouteContext<AuthState>) -> Result<
             }
         }
     }
-    json_response(crate::tracker_host::served::body(&crate::txany::tx_any_batch_body(&answers, &unknown), None, &Default::default()), 200)
+    json_response(crate::tracker_host::runtime::body(&ctx.env, &crate::txany::tx_any_batch_body(&answers, &unknown), None).await?, 200)
 }
 
 /// `GET /health` — liveness only (no DB touch).

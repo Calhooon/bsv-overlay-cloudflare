@@ -936,7 +936,10 @@ pub(crate) async fn verify_bump_detailed(
     txid: &str,
 ) -> Result<bool, String> {
     match verify_bump_outcome(tracker, bump_hex, txid).await {
-        BumpVerdict::Valid => Ok(true),
+        BumpVerdict::Valid => {
+            crate::tracker_events::note(txid, "proof", Some(serde_json::json!({"merklePath":bump_hex})));
+            Ok(true)
+        },
         BumpVerdict::Invalid => Ok(false),
         // unchanged: to every existing caller an absent header is a READ
         // FAULT (retried, never a refutation); only the ladder's rung fold
@@ -4003,6 +4006,7 @@ pub async fn run_retire_pass(
                 .clone()
                 .map(|s| (s, row.term_extra.clone().unwrap_or_default()));
             let look = arcade_look(arcade_base, &row.txid, webhook_evidence).await;
+            crate::tracker_events::note(&row.txid, "retire", None);
             if matches!(look, ArcadeLook::Present) {
                 summary.kept_present += 1;
                 continue;

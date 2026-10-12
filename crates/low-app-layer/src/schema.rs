@@ -250,6 +250,7 @@ pub const PROOF_POSTS_CREATE: &str = "CREATE TABLE IF NOT EXISTS proof_posts (
 /// Every CREATE-class catch-up this module issues. `IF NOT EXISTS` makes
 /// success the only benign outcome — any error is real and defers the latch.
 pub const CREATE_TABLE_CATCHUPS: &[&str] = &[
+    crate::tracker_host::stored::CREATE,
     NETWORK_SEEN_CREATE,
     COLLECTED_MARKERS_V2_CREATE,
     HAND_MARKERS_CREATE,
@@ -495,7 +496,7 @@ mod tests {
     fn every_create_table_catchup_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             CREATE_TABLE_CATCHUPS.len(),
-            7,
+            8,
             "network_seen (#371), collected_markers_v2 (#252 stage A), \
              hand_markers (#382, mirrored for the brain-cutover M2 join), \
              proof_posts (bsv-low P1.1 proof-in-DB, owner GO 2026-09-02), \
