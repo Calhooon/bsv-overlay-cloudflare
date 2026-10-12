@@ -62,9 +62,11 @@ that starts writing reds); statements measured + 2 (a loop that reads per row ov
 | pots-view-8 | `/pots-view?outpoints=` A's 8 pots | 8 / 0 / 1 | 12 / 0 / 3 |
 | results-view-compute | `/results?identity=A`, the actor's compute (`d1view`) | 191 / 0 / 6 | 287 / 0 / 8 |
 | results-forward | `/results?identity=A`, the forwarding request (`d1`) | 0 / 0 / 0 | 4 / 0 / 2 |
-| owed-first-read | `/owed?identity=A`, the first read (compute on read, its write) | 352 / 18 / 26 | 528 / 20 / 28 |
+| owed-first-read | `/owed?identity=A`, the first read (compute on read, its write) | 363 / 18 / 28 | 528 / 20 / 28 |
 | owed-served-read | `/owed?identity=A`, a served read | 17 / 0 / 2 | 26 / 0 / 4 |
 | submit-admit-1 | `/submit`, an operator `historical-tx-no-spv` submit admitting one tm_collected output | 0 / 13 / 7 | 4 / 15 / 9 |
+
+Owed first read re-measured 2026-10-12 after the #610 fold rebased onto main `13f0e66`: 363 reads / 18 writes / 28 statements (`make ci-d1-budget`, local fixture D1). The markerless cursor and candidates reads, #610, account for the two additional statements. The existing 28-statement ceiling is retained: zero statement margin; it is a bar, not a knob. Other scenario baselines above remain the 2026-10-07 measurements.
 
 A ceiling is raised only with a new measurement (`D1_BUDGET_MEASURE=1 make ci-d1-budget` prints the table and
 enforces nothing) and its reason written here. Not in this tier: the tower's case reads (`low-watchtower` lives in
