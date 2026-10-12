@@ -255,6 +255,7 @@ pub const COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT: &str = "submit_readmitted_b
 /// bsv-low #519 (loop 20, 2026-09-21): an Arcade-terminal subject judged at the ladder by the chain's indexers
 /// (never a broadcaster's echo): held by an indexer (admitted), absent past the age floor (the two-source refusal),
 /// absent but young (the retryable word), the indexers inconclusive, or this isolate's courier budget spent.
+pub const COUNTER_SUBMIT_TERMINAL_RACE: &str = "submit_terminal_judged_race_total";
 pub const COUNTER_SUBMIT_TERMINAL_PRESENT: &str = "submit_terminal_judged_present_total";
 pub const COUNTER_SUBMIT_TERMINAL_ABSENT: &str = "submit_terminal_judged_absent_total";
 pub const COUNTER_SUBMIT_TERMINAL_YOUNG: &str = "submit_terminal_judged_young_total";
@@ -1056,6 +1057,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
         // bsv-low #519 (2026-09-21): the terminal judgement's counters read 0 until they fire.
         COUNTER_SUBMIT_TERMINAL_PRESENT,
+        COUNTER_SUBMIT_TERMINAL_RACE,
         COUNTER_SUBMIT_TERMINAL_ABSENT,
         COUNTER_SUBMIT_TERMINAL_YOUNG,
         COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE,
