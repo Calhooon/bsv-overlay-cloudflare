@@ -388,7 +388,7 @@ ci-route: ci-d1-budget
 	  node tools/lane-347/submit_gate_ci.mjs http://127.0.0.1:$$P1; \
 	CENSUS_LENIENT_BASE=http://127.0.0.1:$$P3 \
 	  node tools/lane-366/census_route_ci.mjs http://127.0.0.1:$$P1; \
-	node tools/lane-arc-ingest/arc_ingest_auth_ci.mjs http://127.0.0.1:$$P4; \
+	node tools/lane-arc-ingest/arc_ingest_auth_ci.mjs http://127.0.0.1:$$P4 "$$arc_log"; \
 	FIXTURE_PORT=$$P5 \
 	  node tools/lane-371/network_seen_route_ci.mjs http://127.0.0.1:$$P6; \
 	FIXTURE_PORT=$$P8 \
