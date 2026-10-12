@@ -43,6 +43,7 @@
  * Exit 0 = every expectation held.
  */
 import { createHash, randomFillSync } from 'node:crypto'
+import { blockCoinbaseInput, provedBeefV1 } from '../fixtures/proven_beef.mjs'
 import { createServer } from 'node:http'
 
 const BASE = process.argv[2] ?? 'http://127.0.0.1:8796'
@@ -79,17 +80,15 @@ const u64 = (n) => {
 const sha256d = (buf) =>
   createHash('sha256').update(createHash('sha256').update(buf).digest()).digest()
 
-/** Funded "parent" spending a coinbase's null outpoint (a transaction with no
- *  input is refused at the door since bsv-rs 0.4.1, NL-8 W6), submitted alone
- *  on the operator's ungated path. A random nonce output keeps each run's txid
- *  distinct. */
+/** Proven synthetic coinbase, submitted alone on the operator's ungated
+ * path. A random nonce output keeps each run's txid distinct. */
 function fundedParent() {
   const nonce = Buffer.alloc(8)
   randomFillSync(nonce)
   const nonceScript = Buffer.concat([Buffer.from([0x00, 0x6a]), Buffer.from([8]), nonce])
   return Buffer.concat([
     u32(1),
-    varint(1), Buffer.alloc(32), u32(0xffffffff), varint(0), u32(0xffffffff),
+    varint(1), blockCoinbaseInput(),
     varint(2),
     u64(5000), Buffer.from([1, 0x51]),
     u64(0), varint(nonceScript.length), nonceScript,
@@ -99,15 +98,8 @@ function fundedParent() {
 /** Display-order txid hex of a raw tx (reversed sha256d). */
 const txidOf = (raw) => Buffer.from(sha256d(raw)).reverse().toString('hex')
 
-/** Proofless V1 BEEF over N raw txs. */
-function beefV1(...rawTxs) {
-  return Buffer.concat([
-    Buffer.from([0x01, 0x00, 0xbe, 0xef]),
-    varint(0),
-    varint(rawTxs.length),
-    ...rawTxs.flatMap((raw) => [raw, Buffer.from([0x00])]),
-  ])
-}
+/** The sole transaction is a coinbase at leaf 0 of its synthetic block. */
+const beefV1 = (...rawTxs) => provedBeefV1(rawTxs)
 
 // ── the fixture Arcade ─────────────────────────────────────────────────────
 const allowlist = new Set()

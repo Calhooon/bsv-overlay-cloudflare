@@ -2,6 +2,8 @@
 
 ## [0.1.2] - 2026-10-12
 
+- Give hand-made coinbase fixtures lone-leaf proofs and ordinary funding fixtures two-leaf proofs with real synthetic parents under bsv-rs 0.5.0's mining checks; no door rule changed.
+
 - Charge the stream's 32-byte SDK `OutputRef` at 96 bytes per output including growing-buffer slack (was 72); the size-derived guard stays intact. Repair synthetic unproven-coinbase fixtures and refresh the exact lock-version snapshot without changing the Worker health shape or test assertions.
 
 - Extend the structure-only verdict match for SDK 0.5.0's contextual decline; this mode disables spend/context checks, so that variant is unreachable here. Byte-level mining checks remain enforced.

@@ -25,6 +25,7 @@
  * Exit 0 = every expectation held.
  */
 import { createHash, randomFillSync } from 'node:crypto'
+import { provedBeefV1, blockCoinbaseInput } from '../fixtures/proven_beef.mjs'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
@@ -68,9 +69,9 @@ const input = (txid, vout) =>
   Buffer.concat([Buffer.from(txid, 'hex').reverse(), u32(vout), varint(0), u32(0xffffffff)])
 const tx = (inputs, outputs) =>
   Buffer.concat([u32(1), varint(inputs.length), ...inputs, varint(outputs.length), ...outputs, u32(0)])
-/** BEEF V1, no bumps, parents first. */
-const beefV1 = (...raws) =>
-  Buffer.concat([Buffer.from([0x01, 0x00, 0xbe, 0xef]), varint(0), varint(raws.length), ...raws.flatMap((r) => [r, Buffer.from([0x00])])])
+/** BEEF V1, the proven coinbase anchor followed by its spends. */
+// Prove G as a coinbase at offset 0; P and S remain ordinary unproven spends.
+const beefV1 = (...raws) => provedBeefV1(raws)
 
 async function submit(beef) {
   const res = await fetch(OVERLAY + '/submit', {
@@ -117,7 +118,7 @@ async function counter(name) {
   }
 }
 
-const G = tx([input('00'.repeat(32), 0xffffffff)], [output(COLLECTED_MARKER), output(nonceScript())])
+const G = tx([blockCoinbaseInput()], [output(COLLECTED_MARKER), output(nonceScript())])
 const g = txidOf(G)
 const P = tx([input(g, 0)], [output(COLLECTED_MARKER), output(nonceScript())])
 const p = txidOf(P)

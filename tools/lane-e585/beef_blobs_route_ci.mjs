@@ -40,6 +40,7 @@
  * Exit 0 = every expectation held.
  */
 import { createHash, randomFillSync } from 'node:crypto'
+import { provedBeefV1, blockCoinbaseInput } from '../fixtures/proven_beef.mjs'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { readdirSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -90,12 +91,12 @@ const padScript = (n) => {
 }
 const output = (script) => Buffer.concat([u64(0), varint(script.length), script])
 const input = (txid, vout) => Buffer.concat([Buffer.from(txid, 'hex').reverse(), u32(vout), varint(0), u32(0xffffffff)])
-/** A coinbase's null outpoint: a transaction with no input is refused at the door since bsv-rs 0.4.2 (NL-8 W6). */
-const coinbaseInput = () => input('00'.repeat(32), 0xffffffff)
+/** A synthetic coinbase's null outpoint; beefV1 supplies its lone-leaf proof. */
+const coinbaseInput = () => blockCoinbaseInput()
 const tx = (inputs, outputs) =>
   Buffer.concat([u32(1), varint(inputs.length), ...inputs, varint(outputs.length), ...outputs, u32(0)])
-const beefV1 = (...raws) =>
-  Buffer.concat([Buffer.from([0x01, 0x00, 0xbe, 0xef]), varint(0), varint(raws.length), ...raws.flatMap((r) => [r, Buffer.from([0x00])])])
+// G is a proven coinbase; P and S retain their unproven replay/eviction roles.
+const beefV1 = (...raws) => provedBeefV1(raws)
 
 async function submit(beef) {
   const res = await fetch(OVERLAY + '/submit', {
