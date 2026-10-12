@@ -330,3 +330,19 @@ live Arcade delivery, the assumed platform default / actual subrequest trace,
 the new native seams through a real queue / refusal-record trace, and the
 ignored export reader. The captain owns the light delta and the PR after it,
 and picks up the corrected D1 register text above verbatim.
+
+## ARCREGD3-L1 fold (NS-2-ARCREG-FOLD-6-PR)
+
+The cursor-0 delivery belt selects the subject by its txid, using the
+`subject_txid_of` rule (atomic name, unique tip, sorted-last) returned by
+`beef_to_ef_batch`, regardless of the subject's position in the EF batch.
+Requests still select all legs; a cursor past the first leg selects none.
+The real route and both source pins use the same predicate.
+
+The new pin converts the captured D5 incomplete-ancestry BEEF with bsv-rs
+0.5.0, verifies subject FIRST / sourced hop LAST, and projects those real
+EF legs to `[subject, hop]`. RED on the pre-fold selector at `94ca5b2`: hop
+`6ec7a0e8…` emitted instead of subject `5ad2764c…`, 0 passed / 1 failed,
+exit 101. GREEN with txid selection: all 18 ARCREG pins pass, exit 0.
+Evidence: `/tmp/ns2-arcreg-fold-6/l1-{red,green}.log`. Native selection
+plus real BEEF conversion; no live broadcaster witness is claimed.

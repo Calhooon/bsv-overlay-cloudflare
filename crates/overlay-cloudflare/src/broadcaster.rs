@@ -4876,7 +4876,7 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            source.contains("budget.dual_push_legs(&efs).iter()"),
+            source.contains("budget.dual_push_legs(&efs,|e|e.txid==subject_txid)"),
             "consumer wait_until cannot launch an unbounded duplicate walk"
         );
     }
