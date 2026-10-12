@@ -3473,7 +3473,9 @@ async fn owed_recompute_inner(
         let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
         // COVENANT rows only (the audit's silent class, 2026-09-19): `pot_records` also holds every `tm_lowfund` P2PKH
         // output — a seat's own sweep admitted under it read as "a pot took the hop" and the row vanished
-        let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_records WHERE lockKind = 'covenant' AND lower(txid) IN ({placeholders})");
+        // L23R2-H1/L4/#499: txids are stored and bound lowercase; exact IN rides the primary key. Wrapping
+        // the key in lower() scanned every pot row for a rebuilt hop's competitor (312 rows in the route pin).
+        let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_records WHERE lockKind = 'covenant' AND txid IN ({placeholders})");
         let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
         match db.prepare(&sql).bind(&b) {
             Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<TxidRowD1>()) {
