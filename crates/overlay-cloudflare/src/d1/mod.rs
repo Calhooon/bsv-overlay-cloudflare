@@ -2508,7 +2508,16 @@ mod tests {
         // through an over-broad filter (Rule 9).
         let carries: Vec<&&str> = OVERLAY_MIGRATIONS
             .iter()
-            .filter(|sql| sql.trim_start().to_uppercase().starts_with("INSERT"))
+            // #638's named backfills/stamp are pinned separately; every other INSERT remains a carry.
+            .filter(|sql| {
+                sql.trim_start().to_uppercase().starts_with("INSERT")
+                    && ![
+                        crate::derived_hops::LINKS_BACKFILL,
+                        crate::derived_hops::SEATS_BACKFILL,
+                        crate::derived_hops::STATE_DONE,
+                    ]
+                    .contains(sql)
+            })
             .collect();
         assert_eq!(carries.len(), 2, "exactly two data-carry migrations");
         for (target, source) in [
