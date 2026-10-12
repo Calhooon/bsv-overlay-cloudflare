@@ -4876,7 +4876,7 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            source.contains("dual_on&&matches!(budget,crate::ef_deferred::WorkBudget::InRequest)"),
+            source.contains("budget.dual_push_legs(&efs).iter()"),
             "consumer wait_until cannot launch an unbounded duplicate walk"
         );
     }

@@ -1357,10 +1357,12 @@ async fn submit_parts(
             // dual-pushes came back "orphan view" — TAAL holds a fresh
             // two-leg money tx in its ORPHAN POOL because the hop parent
             // never reached it. `efs` is already dependency-ordered
-            // (parents before subject), so push EVERY leg in order — the
-            // parent fills TAAL's mempool and the subject validates. Latch
-            // only on the SUBJECT's accept.
-            let dual_legs: Vec<(String, String)> = efs
+            // (parents before subject), so requests push every leg in order.
+            // Runs use the bounded subject-only delivery belt below; the
+            // foreground walk supplies any missing ancestry. Latch only on
+            // the SUBJECT's accept.
+            let dual_legs: Vec<(String, String)> = budget
+                .dual_push_legs(&efs)
                 .iter()
                 .map(|e| (e.txid.clone(), hex::encode(&e.ef)))
                 .collect();
@@ -1373,10 +1375,10 @@ async fn submit_parts(
                 .ok()
                 .map(|v| v.to_string())
                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
-            // ARCREGD-H2: every consumer run uses the bounded foreground walk.
-            // An unbounded duplicate push in wait_until spends the same
-            // invocation's subrequests, including a byte-deferred first run.
-            let dual_on = dual_on && matches!(budget, crate::ef_deferred::WorkBudget::InRequest);
+            // ARCREGD2-M1: the first byte-deferred run still dual-pushes its
+            // subject, including proven ancestry (which has no walk). The
+            // selector caps consumer work at one leg / two fetches; later
+            // runs push nothing. Request ancestry pushes are unchanged.
             if let (true, false, Ok(dual_db)) =
                 (dual_on, dual_legs.is_empty(), env.d1("OVERLAY_DB"))
             {
