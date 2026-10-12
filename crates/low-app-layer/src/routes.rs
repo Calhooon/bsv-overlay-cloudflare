@@ -3822,11 +3822,7 @@ async fn owed_recompute_inner(
             walk_cut = true;
             break;
         }
-        let kind = if word_rows.contains_key(&id) {
-            "tick"
-        } else {
-            "fallback"
-        };
+        let kind = "tick"; // only the bounded owed clock may execute a Reask
         let legacy = tx_any_cached(&id, worker::Date::now().as_millis() as f64)
             .map(|answer| crate::txany::tx_any_body(&id, &answer));
         let row = crate::tracker_host::runtime::event(env, &id, kind, None, legacy)
@@ -7862,6 +7858,7 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     body["d1Budget"] = crate::d1_ledger::budget_json();
     // bsv-low #451 slice B: the isolate's courier tally (the durable one is the overlay's /health/invariants).
     body["couriers"] = crate::courier::health_json();
+    body["trackerReask"] = crate::tracker_host::pacing::health_json();
     // bsv-low #497: the exchange rate's sample, its age and every rung's counts (this isolate's).
     body["rate"] = crate::rate::health_json(worker::Date::now().as_millis() as f64);
     // bsv-low #532: the identity views' outcomes per route and the budget (this isolate's).

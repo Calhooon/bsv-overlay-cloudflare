@@ -1410,6 +1410,7 @@ pub async fn health_invariants(
         // must reach ~0 before SUBMIT_ENFORCE is flipped to true. Per-isolate and
         // therefore lossy — a soak signal, never an audit log.
         "submitAdmission": crate::submit_gate::counters_json(),
+        "trackerEvents": crate::tracker_events::health_json(),
         // #366: would every honest CLIENT submit survive `broadcast-gated`?
         // The flip-criterion instrument for #347 criterion 1 — durable D1
         // totals, three states (Rule 13), reader contract in `census_json`.

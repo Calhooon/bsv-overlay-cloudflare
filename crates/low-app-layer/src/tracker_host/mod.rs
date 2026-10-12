@@ -81,12 +81,17 @@ pub async fn headers(env: &worker::Env, heights: &[u32]) -> HeaderSnapshot {
                 Ok((status, frame)) => header_response(*height, status, &frame),
                 Err(e) => Err(e),
             };
-            rows.insert(*height,row);
+            rows.insert(*height, row);
         }
         let after = tip(env).await;
-        let tip = if before == after {after} else {Err(HeaderError("header snapshot changed".into()))};
-        HeaderSnapshot {tip,headers:rows}
-    }).await
+        let tip = if before == after {
+            after
+        } else {
+            Err(HeaderError("header snapshot changed".into()))
+        };
+        HeaderSnapshot { tip, headers: rows }
+    })
+    .await
 }
 
 /// Completed courier transports, in ladder order. `fetch` returns raw
@@ -215,16 +220,35 @@ where
         }
     }
     // Existing overlay TSC contracts; claimed heights only select the check.
-    for (base, detail, proof_route) in [
+    let rungs = [
         (
+            "woc",
             "https://api.whatsonchain.com/v1/bsv/main",
             "tx/hash",
             "proof/tsc",
         ),
-        ("https://api.bitails.io", "tx", "proof/tsc"),
-        ("https://bananablocks.com/api/v1", "tx", "proof"),
-    ] {
-        if let Some((200, body)) = get(format!("{base}/{detail}/{txid}")).await {
+        ("bitails", "https://api.bitails.io", "tx", "proof/tsc"),
+        (
+            "bananablocks",
+            "https://bananablocks.com/api/v1",
+            "tx",
+            "proof",
+        ),
+    ];
+    for rung in pacing::order() {
+        let (source, base, detail, proof_route) = rungs[rung];
+        if !pacing::allowed(rung, source) {
+            continue;
+        }
+        pacing::note(source, "asked");
+        let response = get(format!("{base}/{detail}/{txid}")).await;
+        if response
+            .as_ref()
+            .is_none_or(|(status, _)| *status != 200 && *status != 404)
+        {
+            pacing::fault(rung, source);
+        }
+        if let Some((200, body)) = response {
             if let Ok(v) = serde_json::from_slice::<Value>(&body) {
                 if let Some(height) = v["blockheight"]
                     .as_u64()
@@ -233,8 +257,14 @@ where
                     .and_then(|h| u32::try_from(h).ok())
                     .filter(|h| *h > 0)
                 {
-                    if let Some((200, bytes)) = get(format!("{base}/tx/{txid}/{proof_route}")).await
+                    let response = get(format!("{base}/tx/{txid}/{proof_route}")).await;
+                    if response
+                        .as_ref()
+                        .is_none_or(|(status, _)| *status != 200 && *status != 404)
                     {
+                        pacing::fault(rung, source);
+                    }
+                    if let Some((200, bytes)) = response {
                         if let Ok(proof) = tsc_proof(txid, height, &bytes) {
                             if let Some(p) = checked(txid, proof, reask, &header_snapshot).await? {
                                 return Ok(Some(p));
@@ -251,11 +281,19 @@ pub mod served;
 
 pub mod stored;
 
+pub mod pacing;
 pub mod runtime;
 
 /// One retry of a bracketed header read, then cannotCheck; no promotion.
 pub async fn retry_snapshot<F, Fut>(mut read: F) -> HeaderSnapshot
-where F: FnMut() -> Fut, Fut: std::future::Future<Output = HeaderSnapshot> {
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = HeaderSnapshot>,
+{
     let first = read().await;
-    if first.tip.is_ok() {first} else {read().await}
+    if first.tip.is_ok() {
+        first
+    } else {
+        read().await
+    }
 }

@@ -4010,7 +4010,7 @@ pub async fn run_retire_pass(
                 .clone()
                 .map(|s| (s, row.term_extra.clone().unwrap_or_default()));
             let look = arcade_look(arcade_base, &row.txid, webhook_evidence).await;
-            crate::tracker_events::note(&row.txid, "retire", None);
+            // No retire hook: the bounded owed clock ages relevant subjects.
             if matches!(look, ArcadeLook::Present) {
                 summary.kept_present += 1;
                 continue;
