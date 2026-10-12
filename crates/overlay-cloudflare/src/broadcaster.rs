@@ -2108,15 +2108,27 @@ fn nearest_registration_legs<'a>(
     selected
 }
 
-/// #640: bounded transport seam. Read the nearest ancestors first; the subject is outside the window and always posted.
+/// #640: bounded registration, separate from the complete parents-first feed.
+/// Read the nearest ancestors; the subject is outside the window and always posted.
 /// Arcade's API has only GET /tx/:txid, no batched status read (api_server/routes.go).
 /// POST /txs shares ONE callback pair, so own-txid registration requires /tx.
-async fn register_full_batch_with<'a, Look, LookFut, Post, PostFut, Subject, SubjectFut>(
+async fn register_full_batch_with<
+    'a,
+    Look,
+    LookFut,
+    Post,
+    PostFut,
+    Feed,
+    FeedFut,
+    Subject,
+    SubjectFut,
+>(
     efs: &'a [EfTx],
     subject_txid: &'a str,
     window: LegWindow,
     mut look: Look,
     mut post: Post,
+    feed: Feed,
     subject: Subject,
 ) -> (Result<GateStep, String>, usize)
 where
@@ -2124,6 +2136,8 @@ where
     LookFut: std::future::Future<Output = Option<ArcadeStatusResponse>>,
     Post: FnMut(&'a EfTx, bool) -> PostFut,
     PostFut: std::future::Future<Output = ()>,
+    Feed: FnOnce(Vec<&'a EfTx>) -> FeedFut,
+    FeedFut: std::future::Future<Output = ()>,
     Subject: FnOnce(&'a EfTx) -> SubjectFut,
     SubjectFut: std::future::Future<Output = Result<GateStep, String>>,
 {
@@ -2136,21 +2150,34 @@ where
         .filter(|e| e.txid != subject_txid)
         .count()
         .saturating_sub(ancestors.len());
+    let mut registrations = Vec::new();
+    let mut terminal = std::collections::HashSet::new();
     for leg in ancestors.into_iter().take(budget) {
         let status = look(leg)
             .await
             .filter(|r| r.txid.eq_ignore_ascii_case(&leg.txid));
-        // TERMINAL AT ARCADE → NEVER RE-FEED IT, as for the subject (#519).
-        // A mismatched status response cannot suppress this leg's registration.
+        // A matching terminal read suppresses this leg in both acts (L3).
         if status
             .as_ref()
             .is_some_and(|r| classify_arcade_status(&r.tx_status) == GateVerdict::Fatal)
         {
             skipped += 1;
+            terminal.insert(leg.txid.as_str());
             continue;
         }
-        let known = status.is_some();
-        post(leg, !known).await;
+        registrations.push((leg, status.is_none()));
+    }
+    // ARCREGD-H1: the registration window never caps the orphan feed.
+    // Preserve the base's complete dependency-ordered /txs body, without
+    // callback headers. The EF batch is already sorted parents-first.
+    feed(
+        full_batch_legs(efs, subject_txid)
+            .filter(|leg| !terminal.contains(leg.txid.as_str()))
+            .collect(),
+    )
+    .await;
+    for (leg, register) in registrations {
+        post(leg, register).await;
     }
     // An ancestor's refusal or timeout never prevents the subject's own POST.
     let answer = match efs.iter().find(|e| e.txid == subject_txid) {
@@ -2672,7 +2699,7 @@ impl ArcadeBroadcaster {
                     }
                     SubmitRung::FullBatch => {
                         // #640: 32 ancestors per request, 256 per consumer run,
-                        // nearest first; the rest keep the poll/courier backstop.
+                        // nearest registrations first; feed the whole batch parents-first.
                         // Each /tx body carries only the leg named by its token.
                         // The single-subject body enables the echoed-status short-circuit
                         // here too: admit-fast Pending answers AcceptedPending; its
@@ -2689,6 +2716,12 @@ impl ArcadeBroadcaster {
                                 let _ = overlay_engine::gasp::race_or_deadline(
                                     self.submit_ef(&self.tx_endpoint(), &leg.txid, &leg.ef, register),
                                     sleep_ms(2_000),
+                                ).await;
+                            },
+                            |legs| async move {
+                                let body: Vec<u8> = legs.iter().flat_map(|leg| leg.ef.iter().copied()).collect();
+                                let _ = self.post_ef_raw(
+                                    &format!("{}/txs", self.base_url), subject_txid, &body, false,
                                 ).await;
                             },
                             |leg| async move {
@@ -4388,6 +4421,110 @@ mod tests {
         );
     }
 
+    fn arcregd_chain(n: usize) -> Vec<EfTx> {
+        (0..=n)
+            .map(|i| EfTx {
+                txid: format!("{i:064x}"),
+                ef: arcreg_ef(&if i == 0 {
+                    vec![]
+                } else {
+                    vec![format!("{:064x}", i - 1)]
+                }),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn arcregd_h1_feed_is_whole_and_parents_first() {
+        let efs = arcregd_chain(40);
+        let feed_calls = std::cell::Cell::new(0);
+        let registrations = std::cell::Cell::new(0);
+        let (answer, skipped) = register_full_batch_with(
+            &efs,
+            &efs[40].txid,
+            LegWindow::in_request(),
+            |_| async { None },
+            |_, register| {
+                assert!(register);
+                registrations.set(registrations.get() + 1);
+                async {}
+            },
+            |legs| {
+                feed_calls.set(feed_calls.get() + 1);
+                assert_eq!(
+                    legs.iter().map(|leg| &leg.txid).collect::<Vec<_>>(),
+                    efs.iter().map(|leg| &leg.txid).collect::<Vec<_>>(),
+                    "one complete body in dependency order, even past the registration window"
+                );
+                async {}
+            },
+            |_| {
+                registrations.set(registrations.get() + 1);
+                async { Ok(GateStep::SyncAccepted) }
+            },
+        )
+        .await;
+        assert!(answer.is_ok());
+        assert_eq!(feed_calls.get(), 1);
+        assert_eq!(registrations.get(), 32 + 1);
+        assert_eq!(skipped, 8);
+    }
+
+    #[tokio::test]
+    async fn arcregd_h1_orphan_missing_fortieth_parent_resolves_at_rung_three() {
+        let efs = arcregd_chain(40);
+        let held = std::cell::Cell::new(false);
+        let rungs = std::cell::RefCell::new(Vec::new());
+        let answer = broadcast_efs_gated_with(
+            efs.len(),
+            &efs[40].txid,
+            |rung| {
+                rungs.borrow_mut().push(rung);
+                let efs = &efs;
+                let held = &held;
+                async move {
+                    if matches!(rung, SubmitRung::SubjectOnly { .. }) {
+                        return Ok(GateStep::Orphan("missing root".into()));
+                    }
+                    register_full_batch_with(
+                        efs,
+                        &efs[40].txid,
+                        LegWindow::in_request(),
+                        |_| async { None },
+                        |_, _| async {},
+                        |legs| {
+                            // Arcade has the newer parents, but needs the root (40 hops away).
+                            held.set(legs.iter().any(|leg| leg.txid == efs[0].txid));
+                            async {}
+                        },
+                        |_| async {
+                            Ok(if held.get() {
+                                GateStep::SyncAccepted
+                            } else {
+                                GateStep::Orphan("missing root".into())
+                            })
+                        },
+                    )
+                    .await
+                    .0
+                }
+            },
+            |_| async { Err("no corroborator witness in this pin".into()) },
+        )
+        .await;
+        assert!(
+            matches!(answer, Ok(ArcOutcome::AcceptedPending(_))),
+            "{answer:?}"
+        );
+        assert_eq!(
+            *rungs.borrow(),
+            vec![
+                SubmitRung::SubjectOnly { graced: true },
+                SubmitRung::FullBatch
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn arcreg_h1_window_nearest_subject_and_calls() {
         for (n, budget) in [(100usize, 32usize), (80, 32), (300, 256)] {
@@ -4423,6 +4560,7 @@ mod tests {
                     calls.borrow_mut().push(format!("POST {}", leg.txid));
                     async {}
                 },
+                |_| async {},
                 |leg| {
                     calls.borrow_mut().push(format!("POST {}", leg.txid));
                     async { Ok(GateStep::SyncAccepted) }
@@ -4441,7 +4579,7 @@ mod tests {
                 format!("GET {:064x}", if n == 80 { 39 } else { n - 1 })
             );
             assert_eq!(
-                calls.borrow()[2 * (budget - 1)],
+                calls.borrow()[budget - 1],
                 format!("GET {:064x}", if n == 80 { 64 } else { n - budget })
             );
             assert_eq!(calls.borrow().last().unwrap(), "POST subject");
@@ -4494,6 +4632,7 @@ mod tests {
                         } // transport failures / refusals are discarded by the production adapter
                     }
                 },
+                |_| async {},
                 |_| {
                     subject_posts.set(subject_posts.get() + 1);
                     async { Ok(GateStep::SyncAccepted) }
@@ -4547,6 +4686,7 @@ mod tests {
                 posts.borrow_mut().push((leg.txid.clone(), register));
                 async {}
             },
+            |_| async {},
             |leg| {
                 posts.borrow_mut().push((leg.txid.clone(), true));
                 async { Ok(GateStep::SyncAccepted) }
@@ -4583,7 +4723,9 @@ mod tests {
         assert!(batch.contains("self.submit_once_and_gate(&self.tx_endpoint(),&leg.ef,&leg.txid,1,ARCADE_WAIT_TIMEOUT_MS,register_callback,"));
         assert!(batch.contains("self.tx_status(&leg.txid)"));
         assert_eq!(batch.matches("sleep_ms(2_000)").count(), 2);
-        assert!(!batch.contains("txs_endpoint"));
+        assert!(batch.contains(
+            "self.post_ef_raw(&format!(\"{}/txs\",self.base_url),subject_txid,&body,false,"
+        ));
         let post = &prod[prod.find("async fn post_ef_raw(").unwrap()..];
         assert!(post.contains("headers.set(\"X-CallbackToken\", token)"));
         assert!(post.contains("headers.set(\"X-CallbackUrl\", cb)"));

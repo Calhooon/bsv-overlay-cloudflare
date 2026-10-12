@@ -11,9 +11,14 @@ is always posted, then only its answer decides admission. Ancestors are
 selected breadth-first from the subject's EF input references, nearest first,
 with duplicates excluded; scripts are skipped as borrowed bytes, not parsed
 or hydrated. The cursor remains the corroborator's; registration uses the
-nearest ancestors on each invocation. Unselected ancestors are not posted or
-registered by this rung. Their proofs remain the poll backstop's and the
-couriers', as before #640. `arc_registration_legs_skipped_total` counts them.
+nearest ancestors on each invocation. ARCREGD-H1 separates the acts: the
+FEED is every unproven leg in one non-registering `/txs` body, parents first,
+as in the base. Matching terminal reads suppress those legs in both acts.
+REGISTRATION alone is windowed; the subject is always posted and registered
+under its register-once rule, then the nearest 32 ancestors (256 in a run)
+are the selection. Unselected ancestors are fed but remain unregistered and
+counted by `arc_registration_legs_skipped_total`; their proofs retain the
+poll/courier backstop.
 
 Arcade's `services/api_server/routes.go` exposes only `GET /tx/:txid` for
 transaction status: there is no batched status-read endpoint to use.
@@ -23,10 +28,10 @@ have a two-second deadline, including response-body reads. Faults, refusals
 and timeouts are best effort and cannot prevent the subject's own POST.
 
 Rung-3 calls before this fold: `2N + 1`, unbounded. After: at most
-`2 min(N, 32) + 1 = 65` in requests, `513` in consumer runs, plus unchanged
+`2 min(N, 32) + 2 = 66` in requests, `514` in consumer runs, plus unchanged
 subject polling. For 100 ancestors: 32 registered, subject registered, 68
-skipped, 65 calls (formerly 201). For 80: 32 plus subject, 48 skipped,
-65 calls (formerly 161). Known ancestors omit callback headers; terminal
+skipped, 66 calls (formerly 201). For 80: 32 plus subject, 48 skipped,
+66 calls (formerly 161). Known ancestors omit callback headers; terminal
 skips are described below when folded. The pre-#640 batch was one POST.
 
 Pins use an injectable transport seam plus source checks connecting the seam,
@@ -38,14 +43,17 @@ Arcade's live behaviour on this windowed registration remains unverified.
 **Since #640 (2026-10-12, overlay `lane/ns-2-arcreg`): a callback's token
 is the txid of the ONE transaction its POST carries.** The ladder's
 full-batch rung (attempt 3, reached on an orphan view or an inconclusive
-pre-batch corroboration) posts at most 32 unproven ancestors per request,
-256 per consumer run, NEAREST the subject first, each alone to Arcade `/tx`
+pre-batch corroboration) feeds every unproven leg whole and parents-first
+in ONE non-registering Arcade `/txs` body; the registration window applies
+only to registrations: the subject always, then the nearest 32 ancestors
+per request (at most 256 per consumer run), each alone to Arcade `/tx`
 under its own txid and registered only when Arcade's own status read does
 not hold it; their answers are discarded. Known terminal ancestors (REJECTED /
 DOUBLE_SPEND_ATTEMPTED) are neither registered nor re-fed, and are counted
 in the same skipped counter. Then it posts the subject alone
 under its own txid with the register-once rule unchanged. The `/txs` body
-that registered every ancestor under the SUBJECT's token is gone. The rest
+that registered every ancestor under the SUBJECT's token is gone; the whole
+parents-first feed has no callback headers. The rest
 remain unregistered and counted; their proofs remain the backstop poll's
 and the couriers'. An ancestor's MINED push now arrives as its own: D6's
 `unknown_txid` ack for a hop, the stitch and `readmit_if_evicted` for a held
@@ -54,7 +62,8 @@ the echoed-status short-circuit applies there as on rungs 1 and 2 (under
 admit-fast an echoed Pending answers `AcceptedPending`, with the pending
 watch armed by the route). A witnessed acceptance keeps the two-witness bar
 for unproven ancestry. This confirms review §5 with the owner's 32/256 cap
-and nearest-first choice in place of its proposed pause or 128-leg tail.
+and nearest-first registration choice, with the base's complete parents-first
+feed restored by ARCREGD-H1.
 
 The L1 wiring pin drives rung 1 orphan → rung 3 echoed Pending →
 `AcceptedPending`, with zero corroborations. Source pins tie the real rung's
@@ -149,3 +158,12 @@ run; no native test substitutes for the owed route tier.
 
 Unverified: the captain's light delta and LOW register/design pickup;
 Arcade's live windowed registration; route behaviour (owed). No deploy or spend.
+
+## ARCREGD-H1 fold (NS-2-ARCREG-FOLD-4)
+
+The 40th-ancestor orphan resolves at rung 3 even though only 32 ancestors
+plus the subject register. The independent body pin checks all 41 legs in
+parents-first order and exactly one feed call. Both pins are RED on a
+neutered copy restoring the reviewed head's capped, nearest-first feed;
+GREEN on the fold. The nine earlier ARCREG pins remain GREEN, with the
+source pin now requiring the non-registering whole `/txs` body.
