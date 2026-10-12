@@ -504,8 +504,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// skipped and named); two additive ALTERs.
 /// 188 → 189 for N5 (align-engine-050, 2026-10-10, LOW's E585 land2 lens): `ef_deferred_sweep`, the one-row state of
 /// the pass over the deferred EF jobs' R2 objects (its cursor, the round, the last complete count); one table.
-/// 189 → 194 for L23R2-H1/M3: two empty permanent twins and three indexes for identity-owned reads.
-pub const OVERLAY_MIGRATION_COUNT: usize = 194;
+/// 189 → 196 for L23R2-H1/M3: two empty permanent twins and five indexes for identity-owned reads.
+pub const OVERLAY_MIGRATION_COUNT: usize = 196;
 
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
@@ -1829,6 +1829,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_evicted_party_identity_pot ON potparty_records_evicted(identity, lower(potTxid))",
     "CREATE INDEX IF NOT EXISTS idx_evicted_party_pot ON potparty_records_evicted(potTxid, potVout)",
     "CREATE INDEX IF NOT EXISTS idx_evicted_pot_txid ON pot_records_evicted(txid)",
+    // H1/#499: a planted invalid signature must not cost a victim a scan of its claimed identity's rows.
+    "CREATE INDEX IF NOT EXISTS idx_evicted_party_verified_identity ON potparty_records_evicted(identity, sigValid, lower(potTxid)) WHERE seatSettlePubkey IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_party_verified_identity ON potparty_records(identity, sigValid, lower(potTxid)) WHERE seatSettlePubkey IS NOT NULL",
 ];
 
 // =============================================================================
