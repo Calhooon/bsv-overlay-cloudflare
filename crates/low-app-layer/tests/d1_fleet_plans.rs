@@ -285,10 +285,41 @@ fn created_at_cursor_union_equals_unpaged_ranked_views_byte_for_byte() {
     let db = fixture();
     // Include NULL/equal stamps, replay representatives and all validity tiers.
     db.execute_batch("UPDATE potparty_records SET createdAt=NULL WHERE rowid%19=0; UPDATE potparty_records SET sigValid=CASE WHEN rowid%3=0 THEN 1 WHEN rowid%3=1 THEN 0 ELSE NULL END; UPDATE hopparty_records SET createdAt=NULL WHERE rowid%23=0").unwrap();
+    // Opposite sides of a mixed era: the pot stamp wins COALESCE; NULL falls back to marker.
+    let pots: Vec<_> = (0..4).map(|i| format!("d0{i:062x}")).collect();
+    for (i, pot) in pots.iter().enumerate() {
+        let pot_stamp = match i {
+            0 => "1789999999",
+            1 => "1790000001",
+            _ => "NULL",
+        };
+        let marker_stamp = if i % 2 == 0 {
+            1_790_000_001
+        } else {
+            1_789_999_999
+        };
+        db.execute_batch(&format!("UPDATE pot_records SET createdAt={pot_stamp} WHERE txid='{pot}'; UPDATE potparty_records SET createdAt={marker_stamp},sigValid=1 WHERE potTxid='{pot}';")).unwrap();
+    }
     let candidates = cursor_candidates(&db, &[Source::Party, Source::Link]);
     let hop_candidates = cursor_candidates(&db, &[Source::Hop]);
-    for era in [None, Some(1_790_000_000_001), Some(1_789_999_999_000)] {
+    for era in [
+        Some(1_790_000_000_000),
+        None,
+        Some(1_790_000_000_001),
+        Some(1_789_999_999_000),
+    ] {
         let selected = owed_cursor::select(candidates.clone(), era, 10);
+        if era == Some(1_790_000_000_000) {
+            let included: Vec<_> = pots
+                .iter()
+                .map(|pot| selected.iter().any(|row| row["potTxid"] == *pot))
+                .collect();
+            assert_eq!(
+                included,
+                [false, true, true, false],
+                "mixed era uses pot stamp, with NULL fallback to marker"
+            );
+        }
         for original in [
             low_app_layer::results::results_sql(era, 0),
             low_app_layer::refund_view::refund_view_sql(era, 0),
