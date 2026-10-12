@@ -17,7 +17,7 @@ name = "low_proof_replay"
 
 [dependencies]
 # `ProvedHands` and the `BundleProver` hook this crate's `prove_bundle` fills.
-overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1.2", path = "../overlay-discovery" }
+overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1.3", path = "../overlay-discovery" }
 # bsv-low P1.1 part b (2026-09-02): the SAME pure crates the client's wasm
 # wraps (`low-core` mental/discard math, `low-wire` signed envelopes; native +
 # wasm32, no I/O, no RNG). Since 2026-10-09 (the owner's ruling 4 on
@@ -38,5 +38,5 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 
 [dev-dependencies]
 # tests/admission.rs drives the real replay through `ProofLookupService`.
-overlay-engine = { package = "bsv-overlay-engine", version = "0.1.2", path = "../overlay-engine" }
+overlay-engine = { package = "bsv-overlay-engine", version = "0.1.3", path = "../overlay-engine" }
 tokio = { workspace = true, features = ["rt", "macros"] }

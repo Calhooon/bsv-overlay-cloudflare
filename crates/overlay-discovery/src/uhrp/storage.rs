@@ -47,7 +47,7 @@ pub struct UHRPDiscoveryRecord {
 pub struct UHRPQuery {
     /// If true, return all records with pagination.
     pub find_all: Option<bool>,
-    /// Filter by canonical `uhrp://<base58check>` URL (matches TS `uhrpUrl`).
+    /// Filter by canonical Base58Check URL (matches TS `uhrpUrl`).
     pub uhrp_url: Option<String>,
     /// Filter by hex-encoded host identity key. TS reference wire name is
     /// `hostIdentityKey`; we keep the Rust field name `identity_key` but
@@ -275,32 +275,11 @@ impl UHRPStorage for MemoryUHRPStorage {
             .now_unix_seconds
             .unwrap_or_else(current_unix_seconds_i64);
 
-        // Legacy-storage fallback: pre-2026-04-22 admissions indexed
-        // `uhrp_url` as hex-of-hash. Post-fix admissions store canonical
-        // `uhrp://<base58check>`. A client query in canonical form must
-        // still match legacy records — so derive the hex-of-hash form
-        // once and accept a hit on either stored representation.
-        let hex_form_of_query = query.uhrp_url.as_deref().and_then(|u| {
-            u.strip_prefix("uhrp://").and_then(|b58| {
-                bsv_rs::primitives::encoding::from_base58_check(b58)
-                    .ok()
-                    .and_then(|(version, payload)| {
-                        if version.len() == 1 && version[0] == 0x01 && payload.len() == 32 {
-                            Some(hex::encode(&payload))
-                        } else {
-                            None
-                        }
-                    })
-            })
-        });
-
         let mut results: Vec<&UHRPRecord> = records
             .iter()
             .filter(|r| {
                 if let Some(ref u) = query.uhrp_url {
-                    let matches = r.uhrp_url == *u
-                        || hex_form_of_query.as_ref().is_some_and(|h| &r.uhrp_url == h);
-                    if !matches {
+                    if r.uhrp_url != *u {
                         return false;
                     }
                 }
