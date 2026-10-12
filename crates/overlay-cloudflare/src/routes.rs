@@ -1305,6 +1305,14 @@ async fn submit_parts(
                 ..
             }
         );
+        let admission_at_ms = if door_open.is_some() {
+            let now = worker::Date::now().as_millis();
+            match env.d1("OVERLAY_DB") {
+                Ok(db) => crate::admit_fast::admission_age_ms(&db, &subject_txid, now)
+                    .await.map(|age| now.saturating_sub(age) as i64),
+                Err(_) => None,
+            }
+        } else { None };
         let mut arcade =
             crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default())
                 // #214: Arcade's async REJECTED is never authoritative
@@ -1314,6 +1322,7 @@ async fn submit_parts(
                 // admit-fast: the sync accept answers; the witness moves to
                 // the pending watch below (nothing polled on the wire).
                 .with_fast_answer(admit_fast)
+                .with_admission_at_ms(admission_at_ms)
                 // #519: the terminal judgement's WoC read carries the same key the evidence check reads
                 .with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|s| s.to_string()))
                 // NL-6d: `CORROBORATOR_URL` routes both corroborating hosts to one base (the route tier's local
@@ -1454,6 +1463,14 @@ async fn submit_parts(
                 }
             });
         }
+        let duplicate_echo = arcade.duplicate_echo();
+        if duplicate_echo {
+            if let Ok(db) = env.d1("OVERLAY_DB") {
+                ctx.wait_until(async move {
+                    crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_DUPLICATE_IN_FLIGHT, 1).await;
+                });
+            }
+        }
         // #195: keep segments DISJOINT and attributable — the corroborate leg
         // runs inside the gated broadcast's wall-clock, so it is carved out of
         // `arcade-broadcast` and reported as its own `corroborate` segment
@@ -1474,7 +1491,9 @@ async fn submit_parts(
                 }
             }
             Ok(crate::broadcaster::ArcOutcome::AcceptedPending(_)) => {
-                if admit_fast {
+                if admit_fast && duplicate_echo {
+                    "fast-echo"
+                } else if admit_fast {
                     "fast"
                 } else {
                     "pending"
@@ -1628,7 +1647,9 @@ async fn submit_parts(
                     }
                 }
                 if let Ok(count_db) = env.d1("OVERLAY_DB") {
-                    let name = if admit_fast {
+                    let name = if admit_fast && duplicate_echo {
+                        crate::ops::COUNTER_SUBMIT_FAST_ADMITTED_ECHO
+                    } else if admit_fast {
                         crate::ops::COUNTER_SUBMIT_FAST_ADMITTED
                     } else {
                         crate::ops::COUNTER_SUBMIT_PENDING_ADMITTED

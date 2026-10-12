@@ -228,6 +228,10 @@ pub const COUNTER_ARC_INGEST_PUSH_UNVERIFIED: &str = "arc_ingest_push_unverified
 /// admit-fast step 3 (2026-09-15): gated submits ANSWERED on Arcade's
 /// synchronous accept (`ADMIT_FAST`), admitted PENDING (the witness in the
 /// background).
+/// Stored Reached POST echoes, including refused witnessed duplicates (#637).
+pub const COUNTER_SUBMIT_DUPLICATE_IN_FLIGHT: &str = "submit_duplicate_in_flight_total";
+/// Pending fast admissions from stored Reached POST echoes, separate from new accepts.
+pub const COUNTER_SUBMIT_FAST_ADMITTED_ECHO: &str = "submit_fast_admitted_echo_total";
 pub const COUNTER_SUBMIT_FAST_ADMITTED: &str = "submit_fast_admitted_total";
 /// #397 pending admissions in the WITNESSED mode (a lagging tracker + an
 /// inconclusive corroborator on a proven-ancestry single leg).
@@ -1047,6 +1051,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_ARC_INGEST_REFUSAL_UNCORROBORATED,
         COUNTER_ARC_INGEST_PUSH_UNVERIFIED,
         COUNTER_SUBMIT_FAST_ADMITTED,
+        COUNTER_SUBMIT_DUPLICATE_IN_FLIGHT,
+        COUNTER_SUBMIT_FAST_ADMITTED_ECHO,
         COUNTER_SUBMIT_PENDING_ADMITTED,
         COUNTER_SUBMIT_PENDING_SEEN_LATCHED,
         COUNTER_SUBMIT_PENDING_SEEN_MS,
