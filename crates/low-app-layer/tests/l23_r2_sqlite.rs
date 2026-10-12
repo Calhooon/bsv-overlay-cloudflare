@@ -466,6 +466,38 @@ async fn l23_r2_identity_cursor_walks_own_ninth_and_beyond_and_counts_tail() {
         19,
         "the durable ring reaches the ninth and every later identity-owned JOIN"
     );
+    // L23R2D-L1: nine evictions, every hop held by judged evidence: count alone never cuts.
+    let nine: Vec<_> = (1..=9)
+        .map(|i| {
+            (
+                format!("{i:064x}"),
+                Some(format!(r#"[{{"txid":"{:064x}","vout":0}}]"#, 100 + i)),
+            )
+        })
+        .collect();
+    let judged = markerless_released_hops(&nine, &[], &seats, &keys, &outputs);
+    assert_eq!(judged.len(), 9);
+    assert!(unheld_released_by_eviction(&nine, &judged).is_empty());
+    assert!(
+        !markerless_tail_unheld(9, 8, 0, 0, false),
+        "nine fully judged evictions are not truncated"
+    );
+    assert!(
+        markerless_tail_unheld(9, 8, 1, 0, false),
+        "unheld evidence before a complete ring is a cut"
+    );
+    assert!(!markerless_tail_unheld(9, 8, 1, 0, true));
+    assert!(
+        markerless_tail_unheld(9, 8, 0, 1, true),
+        "a carried unjudged row remains a cut"
+    );
+    let selected = markerless_plan(&read_candidates(&db, "me", &cursor)).0;
+    assert!(markerless_ring_complete(
+        r#"{"complete":true,"candidates":19}"#,
+        &cursor,
+        &selected,
+        19
+    ));
 }
 
 #[tokio::test]

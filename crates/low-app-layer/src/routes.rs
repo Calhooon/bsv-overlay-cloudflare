@@ -2824,7 +2824,7 @@ async fn owed_recompute_inner(
         #[serde(rename = "spendingTxid")]
         cursor: Option<String>,
     }
-    let cursor = db
+    let cursor_progress = db
         .prepare("SELECT spendingTxid FROM hop_chain_probes WHERE outpoint = ?1")
         .bind(&[JsValue::from_str(&cursor_key)])
         .map_err(|e| markerless_fault(e.to_string()))?
@@ -2832,8 +2832,8 @@ async fn owed_recompute_inner(
         .await
         .map_err(|e| markerless_fault(e.to_string()))?
         .and_then(|r| r.cursor)
-        .map(|raw| crate::owed::markerless_cursor_of(&raw))
         .unwrap_or_default();
+    let cursor = crate::owed::markerless_cursor_of(&cursor_progress);
     let candidates = db
         .prepare(crate::owed::MARKERLESS_CANDIDATES_SQL)
         .bind(&[JsValue::from_str(identity_lc), JsValue::from_str(&cursor)])
@@ -2844,7 +2844,12 @@ async fn owed_recompute_inner(
         .map_err(|e| markerless_fault(e.to_string()))?;
     let (selected, markerless_total) = crate::owed::markerless_plan(&candidates);
     let markerless_cut = markerless_total > selected.len();
-    walk_cut |= markerless_cut;
+    let markerless_complete = crate::owed::markerless_ring_complete(
+        &cursor_progress,
+        &cursor,
+        &selected,
+        markerless_total,
+    );
     let markerless_next = selected.last().map(|r| r.txid.clone());
     let mut markerless_previous = Vec::new();
     if markerless_cut {
@@ -3732,6 +3737,7 @@ async fn owed_recompute_inner(
         fault.facts["markerlessCursor"] = serde_json::json!(markerless_next);
     }
     crate::owed::merge_markerless_faults(&mut rows, markerless_fault_rows);
+    let mut markerless_carried = 0;
     let current: HashSet<_> = rows.iter().map(|r| r.outpoint.clone()).collect();
     for mut r in markerless_previous {
         if !current.contains(&r.outpoint)
@@ -3749,8 +3755,16 @@ async fn owed_recompute_inner(
                 "could not judge this pass: permanent evidence lies past the cursor bound".into(),
             );
             rows.push(r);
+            markerless_carried += 1;
         }
     }
+    walk_cut |= crate::owed::markerless_tail_unheld(
+        markerless_total,
+        selected.len(),
+        markerless_rebuilt_keys.len(),
+        markerless_carried,
+        markerless_complete,
+    );
     for row in &mut rows {
         let spender = row.facts["chainSpender"]
             .as_str()
@@ -3800,7 +3814,7 @@ async fn owed_recompute_inner(
     }
     // H1: advance the durable cursor in the SAME atomic snapshot batch, never after a failed write.
     if let Some(next) = &markerless_next {
-        let progress = serde_json::json!({"cursor": next, "candidates": markerless_total, "examined": selected.len()}).to_string();
+        let progress = serde_json::json!({"cursor": next, "candidates": markerless_total, "examined": selected.len(), "complete": markerless_complete}).to_string();
         {
             let cursor_binds = [
                 JsValue::from_str(&cursor_key),
