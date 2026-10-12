@@ -1165,6 +1165,8 @@ struct ArcadeStatusResponse {
     txid: String,
     #[serde(default)]
     tx_status: String,
+    #[serde(default)]
+    timestamp: Option<String>,
     /// The node's human-readable status detail. #209: previously DISCARDED —
     /// now captured so a definitive rejection threads a structured reason a
     /// fallback can key on (rather than a bare `Arcade REJECTED <txid>`).
@@ -1339,6 +1341,16 @@ fn reached_submit_echo(fast_answer: bool) -> GateStep {
     } else {
         GateStep::Accepted
     }
+}
+
+/// A stamped stored echo must be younger than the freshness bound and the
+/// admission it would restore. Missing stamps preserve the legacy contract.
+fn submit_echo_is_fresh(stamp: Option<&str>, now_ms: i64, admission_at_ms: Option<i64>) -> bool {
+    let Some(stamp) = stamp else { return true };
+    crate::proof_fetcher::rfc3339_utc_ms(stamp).is_some_and(|at| {
+        at <= now_ms + 60_000 && now_ms - at < 30 * 60_000
+            && admission_at_ms.is_none_or(|admitted| at >= admitted)
+    })
 }
 
 /// Classify one Arcade submit HTTP response (#213). PURE — unit-tested.
@@ -2081,6 +2093,8 @@ pub struct ArcadeBroadcaster {
     /// poll on the wire). OFF by default — the route turns it on from the
     /// derived `AdmitPolicy` (`ADMIT_FAST`).
     fast_answer: bool,
+    duplicate_echo: std::cell::Cell<bool>,
+    admission_at_ms: Option<i64>,
     /// #519: the wall-clock of the indexers' judgement of an Arcade-terminal subject (its own Server-Timing segment).
     terminal_ms: std::cell::Cell<f64>,
     /// #519: how the last Arcade-terminal subject of this request was judged (the route counts it).
@@ -2096,6 +2110,13 @@ pub struct ArcadeBroadcaster {
 }
 
 impl ArcadeBroadcaster {
+    pub fn duplicate_echo(&self) -> bool { self.duplicate_echo.get() }
+
+    pub fn with_admission_at_ms(mut self, at: Option<i64>) -> Self {
+        self.admission_at_ms = at;
+        self
+    }
+
     /// Create a broadcaster against `base_url` (default endpoint if empty).
     pub fn new(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
@@ -2111,6 +2132,8 @@ impl ArcadeBroadcaster {
             corroborate_ms: std::cell::Cell::new(0.0),
             poll_ms: std::cell::Cell::new(0.0),
             fast_answer: false,
+            duplicate_echo: std::cell::Cell::new(false),
+            admission_at_ms: None,
             terminal_ms: std::cell::Cell::new(0.0),
             terminal_judged: std::cell::Cell::new(None),
             woc_api_key: None,
@@ -2608,6 +2631,13 @@ impl ArcadeBroadcaster {
                 }
                 match classify_arcade_status(&parsed.tx_status) {
                     GateVerdict::Reached => {
+                        self.duplicate_echo.set(true);
+                        if !submit_echo_is_fresh(parsed.timestamp.as_deref(),
+                            worker::Date::now().as_millis() as i64, self.admission_at_ms) {
+                            return Err("Arcade stored echo predates admission or freshness bound".into());
+                        }
+                        // Witnessed mode still corroborates and can answer 502 on
+                        // STORED corroborators: bsv-low #637 (NS2P-L2 / N5).
                         worker::console_log!(
                             "[arcade] {subject_txid} accepted at {} (no poll needed)",
                             parsed.tx_status
@@ -4658,6 +4688,16 @@ mod tests {
                 "no corroboration on the wire ({efs_len} leg(s))"
             );
         }
+    }
+
+    #[test]
+    fn ns2_l1_stored_echo_stamp_is_bounded_by_admission() {
+        let now = crate::proof_fetcher::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
+        assert!(submit_echo_is_fresh(Some("2026-10-12T18:14:00Z"), now, Some(now - 120_000)));
+        assert!(!submit_echo_is_fresh(Some("2026-10-12T18:14:00Z"), now, Some(now - 30_000)));
+        assert!(!submit_echo_is_fresh(Some("2026-10-12T17:00:00Z"), now, None));
+        assert!(!submit_echo_is_fresh(Some("bad"), now, None));
+        assert!(submit_echo_is_fresh(None, now, None));
     }
 
     #[test]
