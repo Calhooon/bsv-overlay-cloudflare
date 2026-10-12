@@ -3299,38 +3299,9 @@ pub(crate) async fn owed_recompute(
             #[serde(default)]
             spent: Option<f64>,
         }
-        fn outputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<crate::owed::SpenderOutput> {
-            tx.outputs
-                .iter()
-                .enumerate()
-                .map(|(vout, o)| {
-                    let lock = o.locking_script.to_binary();
-                    crate::owed::SpenderOutput {
-                        vout: vout as u32,
-                        pkh_hex: crate::owed::p2pkh_pkh_hex(&lock),
-                        sats: o.satoshis.unwrap_or(0),
-                        spent: None,
-                        // the gate's M1: a pot covenant output = a JOIN (refused at the door and broadcast around it,
-                        // or wrongly evicted with its bytes never moved), never a sweep
-                        pot_lock: overlay_discovery::pot::is_pot_covenant_script(&lock),
-                    }
-                })
-                .collect()
-        }
-        fn inputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<(String, u32)> {
-            tx.inputs
-                .iter()
-                .filter_map(|inp| inp.source_txid.as_deref().map(|t| (t.to_ascii_lowercase(), inp.source_output_index)))
-                .collect()
-        }
         /// A tx-any answer's raw, parsed and re-checked against the txid it was asked for (content-addressed).
         fn parse_answer(a: &TxAnyCached, sp: &str) -> Option<CourierSpenderBytes> {
-            let raw = hex::decode(a.raw_hex.as_deref()?).ok()?;
-            let tx = bsv_rs::transaction::Transaction::from_binary(&raw).ok()?;
-            if !tx.id().eq_ignore_ascii_case(sp) {
-                return None;
-            }
-            Some(CourierSpenderBytes { inputs: inputs_of(&tx), outputs: outputs_of(&tx) })
+            courier_spender_bytes_of_raw(&hex::decode(a.raw_hex.as_deref()?).ok()?, sp)
         }
         // phase 1: the index's bytes (D1), a parsed courier memo, or the isolate's tx-any cache — no courier asked
         let mut wanted: Vec<String> = Vec::new();
@@ -3375,7 +3346,7 @@ pub(crate) async fn owed_recompute(
             let Some(tx) = beef.find_txid(&sp).and_then(|t| t.tx().cloned()) else {
                 continue;
             };
-            let mut outs = outputs_of(&tx);
+            let mut outs = spender_outputs_of(&tx);
             // the index's own spend word per output (the swept sats collected and moved on, or still at the home)
             if let Ok(stmt) = db.prepare("SELECT outputIndex, spent FROM pot_records WHERE txid = ?1").bind(&[JsValue::from_str(&sp)]) {
                 if let Ok(rows) = stmt.counted_all().await.and_then(|r| r.results::<SpentRowD1>()) {
@@ -3386,7 +3357,7 @@ pub(crate) async fn owed_recompute(
                     }
                 }
             }
-            spender_inputs.insert(sp.clone(), inputs_of(&tx));
+            spender_inputs.insert(sp.clone(), spender_inputs_of(&tx));
             spender_outputs.insert(sp, outs);
         }
         // phase 2: the courier asks — never-asked-first, then the oldest ask; a fresh ask is a slot whatever it
@@ -6041,6 +6012,34 @@ async fn spent_any_resolve_cached(
 }
 
 async fn spent_any_resolve(txid_lc: &str, vout: u32, caller: &'static str) -> SpentAnyCached {
+    let (row, spender_raw) = spent_any_resolve_via(txid_lc, vout, |url: String| async move {
+        provider_get(caller, &url).await
+    })
+    .await;
+    // bsv-low #606 (the L22-E602-CELL review's reuse): the spender's raw this ladder fetched and VERIFIED (it hashes to
+    // the named spender and spends this outpoint) is memoised as that spender's parsed bytes, so the owed recompute's
+    // phase 1 judges the spender from them one second later instead of spending a courier slot on a second ask (or
+    // reading "could not judge" when the slot is spent or the second ask faults). Content-addressed: the memo holds
+    // only bytes that hash to the txid it is keyed by.
+    if let (Some(spender), Some(raw)) = (row.spending_txid.as_deref(), spender_raw.as_deref()) {
+        if let Some(parsed) = courier_spender_bytes_of_raw(raw, spender) {
+            owed_spender_outputs_memo_put(&spender.to_ascii_lowercase(), &parsed);
+        }
+    }
+    row
+}
+
+/// The spent-any ladder over a courier GET port (bsv-low #606): the row, and the spender's raw when the ladder read
+/// it AND it verified (`spender_raw_verifies`); `None` otherwise.
+async fn spent_any_resolve_via<G, F>(
+    txid_lc: &str,
+    vout: u32,
+    get: G,
+) -> (SpentAnyCached, Option<Vec<u8>>)
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<Output = Option<(u16, Vec<u8>)>>,
+{
     use crate::results::{
         parse_bananablocks_unspent, parse_woc_spent_body, spender_raw_verifies, SpentObservation,
         UnspentCorroboration,
@@ -6051,7 +6050,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32, caller: &'static str) -> Sp
     // then BananaBlocks, then Bitails' tx body — a fault falls through, a
     // real answer (spent OR not) stops the ladder. Every positive still
     // passes the same raw-verification bar below, whoever named it.
-    let mut woc = match provider_get(caller, &format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await {
+    let mut woc = match get(format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await {
         Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(v) => parse_woc_spent_body(&v),
             Err(_) => SpentObservation::Fault,
@@ -6065,7 +6064,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32, caller: &'static str) -> Sp
     };
     let mut primary = "woc";
     if matches!(woc, SpentObservation::Fault) {
-        woc = match provider_get(caller, &format!("{BANANABLOCKS_BASE}/txo/{txid_lc}/{vout}/spend")).await {
+        woc = match get(format!("{BANANABLOCKS_BASE}/txo/{txid_lc}/{vout}/spend")).await {
             Some((status, body)) => {
                 let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
                 crate::results::parse_bananablocks_spent(status, v.as_ref())
@@ -6075,7 +6074,7 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32, caller: &'static str) -> Sp
         primary = "bananablocks";
     }
     if matches!(woc, SpentObservation::Fault) {
-        woc = match provider_get(caller, &format!("{BITAILS_BASE}/tx/{txid_lc}")).await {
+        woc = match get(format!("{BITAILS_BASE}/tx/{txid_lc}")).await {
             Some((status, body)) => {
                 let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
                 crate::results::parse_bitails_tx_spent(status, v.as_ref(), vout)
@@ -6086,13 +6085,14 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32, caller: &'static str) -> Sp
     }
 
     let mut spender_raw_ok = false;
+    let mut verified_raw: Option<Vec<u8>> = None;
     let mut bitails = UnspentCorroboration::Unknown;
     match &woc {
         SpentObservation::Spent { txid: spender, .. } => {
             // Raw verification: WoC hex first, Bitails binary fallback. A
             // positive is served ONLY when the raw hashes to the reported
             // spender AND spends the requested outpoint.
-            let raw = match provider_get(caller, &format!("{WOC_BASE}/tx/{spender}/hex")).await {
+            let raw = match get(format!("{WOC_BASE}/tx/{spender}/hex")).await {
                 Some((200, body)) => std::str::from_utf8(&body)
                     .ok()
                     .and_then(|h| hex::decode(h.trim()).ok()),
@@ -6100,29 +6100,28 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32, caller: &'static str) -> Sp
             };
             let raw = match raw {
                 Some(r) => Some(r),
-                None => {
-                    match provider_get(caller, &format!("{BITAILS_BASE}/download/tx/{spender}")).await {
-                        Some((200, body)) if !body.is_empty() => Some(body),
-                        _ => None,
-                    }
-                }
+                None => match get(format!("{BITAILS_BASE}/download/tx/{spender}")).await {
+                    Some((200, body)) if !body.is_empty() => Some(body),
+                    _ => None,
+                },
             };
             // 2026-09-04: the third raw source — BananaBlocks' WoC-compatible
             // `/tx/{txid}/hex` (probed live: the bytes hash to the spender).
             // `spender_raw_verifies` content-addresses whatever came back.
             let raw = match raw {
                 Some(r) => Some(r),
-                None => {
-                    match provider_get(caller, &format!("{BANANABLOCKS_BASE}/tx/{spender}/hex")).await {
-                        Some((200, body)) => std::str::from_utf8(&body)
-                            .ok()
-                            .and_then(|h| hex::decode(h.trim()).ok()),
-                        _ => None,
-                    }
-                }
+                None => match get(format!("{BANANABLOCKS_BASE}/tx/{spender}/hex")).await {
+                    Some((200, body)) => std::str::from_utf8(&body)
+                        .ok()
+                        .and_then(|h| hex::decode(h.trim()).ok()),
+                    _ => None,
+                },
             };
             if let Some(raw) = raw {
                 spender_raw_ok = spender_raw_verifies(&raw, spender, txid_lc, vout);
+                if spender_raw_ok {
+                    verified_raw = Some(raw);
+                }
             }
         }
         SpentObservation::NotSpent => {
@@ -6138,28 +6137,23 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32, caller: &'static str) -> Sp
             // bsv-low #451 slice B: the healthy pair before pruned Bitails (`unspent_corroborator_order`, pinned).
             for corroborator in crate::results::unspent_corroborator_order(primary) {
                 let got = match corroborator {
-                    "bananablocks" => match provider_get(caller, &format!(
-                        "{BANANABLOCKS_BASE}/txo/{txid_lc}/{vout}/spend"
-                    ))
-                    .await
-                    {
-                        Some((status, body)) => {
-                            let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
-                            parse_bananablocks_unspent(status, v.as_ref())
-                        }
-                        None => UnspentCorroboration::Unknown,
-                    },
-                    "bitails_tx" => {
-                        match provider_get(caller, &format!("{BITAILS_BASE}/tx/{txid_lc}")).await {
+                    "bananablocks" => {
+                        match get(format!("{BANANABLOCKS_BASE}/txo/{txid_lc}/{vout}/spend")).await {
                             Some((status, body)) => {
                                 let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
-                                crate::results::bitails_tx_unspent(status, v.as_ref(), vout)
+                                parse_bananablocks_unspent(status, v.as_ref())
                             }
                             None => UnspentCorroboration::Unknown,
                         }
                     }
-                    _ => match provider_get(caller, &format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await
-                    {
+                    "bitails_tx" => match get(format!("{BITAILS_BASE}/tx/{txid_lc}")).await {
+                        Some((status, body)) => {
+                            let v = serde_json::from_slice::<serde_json::Value>(&body).ok();
+                            crate::results::bitails_tx_unspent(status, v.as_ref(), vout)
+                        }
+                        None => UnspentCorroboration::Unknown,
+                    },
+                    _ => match get(format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await {
                         Some((s, _))
                             if matches!(
                                 crate::results::woc_spent_status_observation(s),
@@ -6181,13 +6175,16 @@ async fn spent_any_resolve(txid_lc: &str, vout: u32, caller: &'static str) -> Sp
     }
 
     let st = crate::results::decide_spent_any(&woc, spender_raw_ok, bitails);
-    SpentAnyCached {
+    let row = SpentAnyCached {
         known: st.known,
         spent: st.spent,
         spending_txid: st.spending_txid,
         spent_confirmed: st.spent_confirmed,
         reason: st.reason,
-    }
+    };
+    // the raw rides only a row that names its spender (the decision served the positive the raw verified)
+    let verified_raw = verified_raw.filter(|_| row.spending_txid.is_some());
+    (row, verified_raw)
 }
 
 /// `GET /spent-any?outpoints=<txid>.<vout>,…` — spend status for ARBITRARY
@@ -6316,6 +6313,49 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
 
 /// One cached `/tx-any` answer.
 type TxAnyCached = crate::txany::TxAnyAnswer;
+
+fn spender_outputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<crate::owed::SpenderOutput> {
+    tx.outputs
+        .iter()
+        .enumerate()
+        .map(|(vout, o)| {
+            let lock = o.locking_script.to_binary();
+            crate::owed::SpenderOutput {
+                vout: vout as u32,
+                pkh_hex: crate::owed::p2pkh_pkh_hex(&lock),
+                sats: o.satoshis.unwrap_or(0),
+                spent: None,
+                // the gate's M1: a pot covenant output = a JOIN (refused at the door and broadcast around it,
+                // or wrongly evicted with its bytes never moved), never a sweep
+                pot_lock: overlay_discovery::pot::is_pot_covenant_script(&lock),
+            }
+        })
+        .collect()
+}
+fn spender_inputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<(String, u32)> {
+    tx.inputs
+        .iter()
+        .filter_map(|inp| {
+            inp.source_txid
+                .as_deref()
+                .map(|t| (t.to_ascii_lowercase(), inp.source_output_index))
+        })
+        .collect()
+}
+
+/// A spender's raw, parsed and re-checked against the txid it is named by (content-addressed): its P2PKH outputs and
+/// its input outpoints, the owed brain's spender bytes. One reader for the tx-any answer and the chain rung's verified
+/// raw (bsv-low #606).
+fn courier_spender_bytes_of_raw(raw: &[u8], sp: &str) -> Option<CourierSpenderBytes> {
+    let tx = bsv_rs::transaction::Transaction::from_binary(raw).ok()?;
+    if !tx.id().eq_ignore_ascii_case(sp) {
+        return None;
+    }
+    Some(CourierSpenderBytes {
+        inputs: spender_inputs_of(&tx),
+        outputs: spender_outputs_of(&tx),
+    })
+}
 
 thread_local! {
     /// The wave after fleet loop 11 (2026-09-19): a hop spender the index never held (the seat's OWN competitor
@@ -6482,26 +6522,50 @@ async fn tx_any_external_leg(
 ) -> (
     crate::txany::TxObservation,
     crate::txany::AbsenceCorroboration,
-    // bsv-low 2026-09-21: the courier's CLAIMED mined height (WoC's `blockheight`), for `TxAnyAnswer::claimed_height`
     Option<u64>,
 ) {
+    tx_any_external_leg_via(txid_lc, |url: String| async move {
+        provider_get(caller, &url).await
+    })
+    .await
+}
+
+/// The external leg over a courier GET port (`get(url)` answers `provider_get`'s `(status, body)`): production passes
+/// `provider_get`, the pins a captured body (bsv-low #606).
+async fn tx_any_external_leg_via<G, F>(
+    txid_lc: &str,
+    get: G,
+) -> (
+    crate::txany::TxObservation,
+    crate::txany::AbsenceCorroboration,
+    // bsv-low 2026-09-21: the courier's CLAIMED mined height (WoC's `blockheight`), for `TxAnyAnswer::claimed_height`
+    Option<u64>,
+)
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<Output = Option<(u16, Vec<u8>)>>,
+{
     use crate::txany::{AbsenceCorroboration, TxObservation};
 
     let mut claimed_height: Option<u64> = None;
-    let woc = match provider_get(caller, &format!("{WOC_BASE}/tx/hash/{txid_lc}")).await {
+    let woc = match get(format!("{WOC_BASE}/tx/hash/{txid_lc}")).await {
         Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body) {
-            // bsv-low #527 LOW-3: a 200 body without a numeric `confirmations` field is a FAULT (unknown), never
-            // "present, unconfirmed": the era belt reads an unconfirmed presence as current-era, and every other reader
-            // treats unknown as retry
-            Ok(v) if crate::txany::parse_woc_confirmations(&v).is_none() => TxObservation::Fault,
+            // bsv-low #527 LOW-3: a 200 body that is NO claim is a FAULT (unknown), never "present, unconfirmed": the
+            // era belt reads an unconfirmed presence as current-era, and every other reader treats unknown as retry.
+            // bsv-low #606: WoC's MEMPOOL body carries no `confirmations` field (probed live 2026-10-12: `hash,
+            // locktime, size, txid, version, vin, vout`); a body of that shape for the asked txid IS a claim, present
+            // and unconfirmed (`parse_woc_tx_claim`), and its raw is fetched and hash-verified below as a mined one's
+            Ok(v) if crate::txany::parse_woc_tx_claim(&v, txid_lc).is_none() => {
+                TxObservation::Fault
+            }
             Ok(v) => {
-                let confirmed = crate::txany::parse_woc_confirmations(&v).unwrap_or(false);
+                let confirmed = crate::txany::parse_woc_tx_claim(&v, txid_lc).unwrap_or(false);
                 if confirmed {
                     claimed_height = crate::txany::parse_woc_blockheight(&v);
                 }
                 // Positive presence requires the raw in hand, hash-verified
                 // (WoC hex first, Bitails binary fallback).
-                let raw = match provider_get(caller, &format!("{WOC_BASE}/tx/{txid_lc}/hex")).await {
+                let raw = match get(format!("{WOC_BASE}/tx/{txid_lc}/hex")).await {
                     Some((200, body)) => std::str::from_utf8(&body)
                         .ok()
                         .and_then(|h| hex::decode(h.trim()).ok()),
@@ -6509,12 +6573,10 @@ async fn tx_any_external_leg(
                 };
                 let raw = match raw {
                     Some(r) => Some(r),
-                    None => {
-                        match provider_get(caller, &format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await {
-                            Some((200, body)) if !body.is_empty() => Some(body),
-                            _ => None,
-                        }
-                    }
+                    None => match get(format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await {
+                        Some((200, body)) if !body.is_empty() => Some(body),
+                        _ => None,
+                    },
                 };
                 let raw_hex = raw.and_then(|r| crate::txany::verify_raw_bytes(&r, txid_lc));
                 TxObservation::Present { confirmed, raw_hex }
@@ -6525,10 +6587,10 @@ async fn tx_any_external_leg(
             // the second gate's MEDIUM-3a: WoC's 404 is an absence only behind a healthy route (the anchor served
             // once this isolate) — the Bitails rule applied symmetrically; otherwise a fault, never an absence
             if WOC_ROUTE_HEALTHY.with(std::cell::Cell::get) != Some(true) {
-                if let Some((200, body)) = provider_get(
-                    caller,
-                    &format!("{WOC_BASE}/tx/hash/{}", crate::txany::KNOWN_MINED_TXID),
-                )
+                if let Some((200, body)) = get(format!(
+                    "{WOC_BASE}/tx/hash/{}",
+                    crate::txany::KNOWN_MINED_TXID
+                ))
                 .await
                 {
                     if !body.is_empty() {
@@ -6549,14 +6611,14 @@ async fn tx_any_external_leg(
     if woc == TxObservation::Absent {
         // Corroborate: Bitails must ALSO definitively 404 the txid…
         let bitails_404 = matches!(
-            provider_get(caller, &format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await,
+            get(format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await,
             Some((404, _))
         );
         if bitails_404 {
             // …and its tx route must prove healthy against the known-mined
             // anchor (route-rot would otherwise fake absence for every txid).
             if BITAILS_ROUTE_HEALTHY.with(std::cell::Cell::get) != Some(true) {
-                if let Some((200, body)) = provider_get(caller, &format!(
+                if let Some((200, body)) = get(format!(
                     "{BITAILS_BASE}/download/tx/{}",
                     crate::txany::KNOWN_MINED_TXID
                 ))
@@ -7341,6 +7403,259 @@ mod tests {
         assert_eq!(
             plan.keyless,
             vec![vec![(r.pot_txid.to_ascii_lowercase(), 0)]]
+        );
+    }
+}
+
+/// bsv-low #606: the tx-any courier leg and the chain rung over a captured courier, and the owed row judged from the
+/// bytes they read. Each RED on `22742afd` with only the port grafted (the leg's rule and the rung's raw kept as they
+/// were): the mempool body is a Fault, no bytes, "could not judge the spender".
+#[cfg(test)]
+mod e606_tests {
+    use super::*;
+    use crate::hops_view::HopStatus;
+    use crate::owed::tests::{chain_confirmed, hop, inputs, tx};
+    use crate::owed::{
+        derive_owed_rows, OwedFamily, HOP_STRANDED_AFTER_MS, SPENT_ELSEWHERE_REASON,
+    };
+    use crate::txany::{decide_tx_any, AbsenceCorroboration, TxObservation};
+    use bsv_rs::script::{LockingScript, Script, UnlockingScript};
+    use bsv_rs::transaction::{Transaction, TransactionInput, TransactionOutput};
+    use std::collections::{HashMap, HashSet};
+
+    /// The seat's competitor: spends the hop `tx(0x07):0` and pays 20,190 sat to a wallet address that is none of the
+    /// game's homes.
+    fn competitor() -> (String, Vec<u8>) {
+        let mut t = Transaction::new();
+        t.inputs.push(TransactionInput {
+            source_txid: Some(tx(0x07)),
+            source_output_index: 0,
+            unlocking_script: Some(UnlockingScript::from_script(Script::new())),
+            ..Default::default()
+        });
+        t.outputs.push(TransactionOutput {
+            satoshis: Some(20_190),
+            locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(
+                &[0x99u8; 20],
+            ))
+            .unwrap(),
+            change: false,
+        });
+        let raw = t.to_binary();
+        (t.id().to_ascii_lowercase(), raw)
+    }
+    /// WoC's `/tx/hash` body for a MEMPOOL transaction, the keys as probed live 2026-10-12 (no `confirmations`).
+    fn mempool_body(txid: &str) -> Vec<u8> {
+        serde_json::json!({"hash": txid, "locktime": 0, "size": 85, "txid": txid, "version": 1,
+            "vin": [{"txid": tx(0x07), "vout": 0, "scriptSig": {"asm": "", "hex": ""}, "sequence": 4294967295u64}],
+            "vout": [{"value": 0.0002019, "n": 0}]})
+        .to_string()
+        .into_bytes()
+    }
+    fn mined_body(txid: &str) -> Vec<u8> {
+        let mut v: serde_json::Value = serde_json::from_slice(&mempool_body(txid)).unwrap();
+        for (k, x) in [
+            ("blockhash", serde_json::json!("00".repeat(32))),
+            ("blockheight", serde_json::json!(970_733)),
+            ("blocktime", serde_json::json!(1_791_800_000u64)),
+            ("time", serde_json::json!(1_791_800_000u64)),
+            ("confirmations", serde_json::json!(3)),
+        ] {
+            v[k] = x;
+        }
+        v.to_string().into_bytes()
+    }
+    fn courier(
+        map: HashMap<String, (u16, Vec<u8>)>,
+    ) -> impl Fn(String) -> std::future::Ready<Option<(u16, Vec<u8>)>> {
+        move |url: String| std::future::ready(map.get(&url).cloned())
+    }
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+    fn leg(body: Vec<u8>) -> (TxObservation, String, Vec<u8>) {
+        let (sp, raw) = competitor();
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/hash/{sp}"), (200, body));
+        m.insert(
+            format!("{WOC_BASE}/tx/{sp}/hex"),
+            (200, hex::encode(&raw).into_bytes()),
+        );
+        let (obs, _, _) = run(tx_any_external_leg_via(&sp, courier(m)));
+        (obs, sp, raw)
+    }
+    /// The owed row of an evicted hop (index: unspent, the pointer released; chain: spent by `sp`) whose game's home
+    /// is known, judged with the spender bytes `bytes` (or none).
+    fn owed_reason(
+        sp: &str,
+        bytes: Option<CourierSpenderBytes>,
+    ) -> (OwedFamily, Option<String>, serde_json::Value) {
+        let key = format!("{}:0", tx(0x07));
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let by_chain = chain_confirmed(&key, true, Some(true), Some(sp), Some(false));
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), "11".repeat(20));
+        let mut outs: HashMap<String, Vec<crate::owed::SpenderOutput>> = HashMap::new();
+        let mut ins: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        let mut couriered: HashSet<String> = HashSet::new();
+        if let Some(b) = bytes {
+            outs.insert(sp.to_string(), b.outputs);
+            ins.insert(sp.to_string(), b.inputs);
+            couriered.insert(sp.to_string());
+        }
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(970_720));
+        i.hop_chain = &by_chain;
+        i.spender_outputs = &outs;
+        i.spender_inputs = &ins;
+        i.courier_spenders = &couriered;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        (
+            rows[0].family,
+            rows[0].reason.clone(),
+            rows[0].facts.clone(),
+        )
+    }
+
+    /// Pin (a): the leg on WoC's captured mempool body answers an unconfirmed presence WITH the hash-verified bytes
+    /// (RED on `22742afd`: `Fault`, no raw fetched). Pin (c): a mined body keeps its answer (GREEN before and after).
+    #[test]
+    fn e606_a_the_leg_reads_a_mempool_body_as_an_unconfirmed_presence_with_its_bytes() {
+        let (obs, sp, raw) = leg(mempool_body(&competitor().0));
+        assert_eq!(
+            obs,
+            TxObservation::Present {
+                confirmed: false,
+                raw_hex: Some(hex::encode(&raw))
+            },
+            "the mempool body"
+        );
+        let a = decide_tx_any(None, None, Some(&obs), AbsenceCorroboration::Unknown);
+        assert_eq!(
+            (a.present, a.raw_hex.as_deref()),
+            (Some(true), Some(hex::encode(&raw).as_str()))
+        );
+        assert!(courier_spender_bytes_of_raw(&raw, &sp).is_some());
+        // (c) a mined body: confirmed, its claimed height, its bytes
+        let (sp2, _) = competitor();
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/hash/{sp2}"), (200, mined_body(&sp2)));
+        m.insert(
+            format!("{WOC_BASE}/tx/{sp2}/hex"),
+            (200, hex::encode(&raw).into_bytes()),
+        );
+        let (obs, _, claimed) = run(tx_any_external_leg_via(&sp2, courier(m)));
+        assert_eq!(
+            obs,
+            TxObservation::Present {
+                confirmed: true,
+                raw_hex: Some(hex::encode(&raw))
+            }
+        );
+        assert_eq!(claimed, Some(970_733));
+        // what stays a fault: no claim at all, a foreign txid's body, a non-200, an unparseable body
+        assert_eq!(leg(b"{}".to_vec()).0, TxObservation::Fault);
+        assert_eq!(leg(mempool_body(&"ee".repeat(32))).0, TxObservation::Fault);
+        assert_eq!(leg(b"not json".to_vec()).0, TxObservation::Fault);
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/hash/{sp}"), (429, Vec::new()));
+        assert_eq!(
+            run(tx_any_external_leg_via(&sp, courier(m))).0,
+            TxObservation::Fault
+        );
+    }
+
+    /// Pin (b): the owed row of a hop spent by an UNCONFIRMED foreign transaction reads "spent outside this game" from
+    /// the bytes, by either road: the tx-any resolver's leg (the fix) and the chain rung's verified raw (the reuse).
+    /// RED on `22742afd`: the leg answers `Fault` (no bytes) and the rung discards its raw, so the row is "could not
+    /// judge the spender".
+    #[test]
+    fn e606_b_an_unconfirmed_foreign_spender_is_judged_spent_elsewhere_from_its_bytes() {
+        let (sp, raw) = competitor();
+        // without bytes: the pre-fix sentence, the baseline
+        let (fam, reason, _) = owed_reason(&sp, None);
+        assert_eq!(fam, OwedFamily::Unbound);
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("could not judge the spender"),
+            "{reason:?}"
+        );
+        // road 1: the resolver's leg over the mempool body
+        let (obs, _, _) = leg(mempool_body(&sp));
+        let a = decide_tx_any(None, None, Some(&obs), AbsenceCorroboration::Unknown);
+        let bytes = a
+            .raw_hex
+            .as_deref()
+            .and_then(|h| hex::decode(h).ok())
+            .and_then(|r| courier_spender_bytes_of_raw(&r, &sp));
+        let (fam, reason, facts) = owed_reason(&sp, bytes);
+        assert_eq!(fam, OwedFamily::Unbound);
+        assert_eq!(
+            reason.as_deref(),
+            Some(SPENT_ELSEWHERE_REASON),
+            "road 1: {facts}"
+        );
+        assert_eq!(facts["spendKind"], "spent-elsewhere");
+        assert!(SPENT_ELSEWHERE_REASON.contains("spent outside this game"));
+        // road 2: the chain rung's probe of the hop (WoC names the unconfirmed spender, its raw verified)
+        let mut m = HashMap::new();
+        m.insert(
+            format!("{WOC_BASE}/tx/{}/0/spent", tx(0x07)),
+            (
+                200,
+                serde_json::json!({"txid": sp, "vin": 0, "status": "unconfirmed"})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+        m.insert(
+            format!("{WOC_BASE}/tx/{sp}/hex"),
+            (200, hex::encode(&raw).into_bytes()),
+        );
+        let (row, spender_raw) = run(spent_any_resolve_via(&tx(0x07), 0, courier(m)));
+        assert_eq!(
+            (row.spent, row.spending_txid.as_deref(), row.spent_confirmed),
+            (Some(true), Some(sp.as_str()), Some(false))
+        );
+        assert_eq!(
+            spender_raw.as_deref(),
+            Some(raw.as_slice()),
+            "the rung keeps the raw it verified"
+        );
+        let (_, reason, _) = owed_reason(&sp, courier_spender_bytes_of_raw(&raw, &sp));
+        assert_eq!(reason.as_deref(), Some(SPENT_ELSEWHERE_REASON), "road 2");
+        // a raw that does not verify is never kept (a lying courier's bytes for another tx)
+        let mut m = HashMap::new();
+        m.insert(
+            format!("{WOC_BASE}/tx/{}/0/spent", tx(0x07)),
+            (
+                200,
+                serde_json::json!({"txid": sp, "vin": 0, "status": "unconfirmed"})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+        m.insert(format!("{WOC_BASE}/tx/{sp}/hex"), (200, b"0100".to_vec()));
+        assert_eq!(run(spent_any_resolve_via(&tx(0x07), 0, courier(m))).1, None);
+        // the wiring: the production rung memoises what it verified, the memo phase 1 reads before any courier ask
+        let src = include_str!("routes.rs");
+        let rung = &src[src.find("async fn spent_any_resolve(txid_lc").unwrap()
+            ..src.find("async fn spent_any_resolve_via").unwrap()];
+        assert!(
+            rung.contains("courier_spender_bytes_of_raw(raw, spender)")
+                && rung.contains("owed_spender_outputs_memo_put("),
+            "the rung memoises its verified raw"
         );
     }
 }

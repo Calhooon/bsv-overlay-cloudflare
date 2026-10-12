@@ -2376,15 +2376,15 @@ pub fn owed_changed_event_body(identity: &str, source: &str, rows: usize, comput
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::hops_view::MarkerVerification;
     use crate::refund_view::RefundStatus;
     use crate::results::{MoneyFacts, PotBinding, TxMoneyFacts};
 
-    const ME: &str = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    pub(crate) const ME: &str = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OPP: &str = "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    fn tx(b: u8) -> String {
+    pub(crate) fn tx(b: u8) -> String {
         hex::encode([b; 32])
     }
 
@@ -2695,7 +2695,7 @@ mod tests {
     }
 
     static NONE: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
-    fn inputs<'a>(
+    pub(crate) fn inputs<'a>(
         results: &'a [ResultEntry],
         refunds: &'a [RefundEntry],
         hops: &'a [HopEntry],
@@ -2744,7 +2744,7 @@ mod tests {
     fn chain(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>) -> HashMap<String, HopChainWord> {
         chain_confirmed(outpoint, looked, spent, spender, None)
     }
-    fn chain_confirmed(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>, spent_confirmed: Option<bool>) -> HashMap<String, HopChainWord> {
+    pub(crate) fn chain_confirmed(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>, spent_confirmed: Option<bool>) -> HashMap<String, HopChainWord> {
         chain_confirmed_aged(outpoint, looked, spent, spender, spent_confirmed, None)
     }
     fn chain_confirmed_aged(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>, spent_confirmed: Option<bool>, age_ms: Option<i64>) -> HashMap<String, HopChainWord> {
@@ -2945,7 +2945,7 @@ mod tests {
         assert_eq!(rows[0].family, OwedFamily::InProgress);
     }
 
-    fn hop(status: HopStatus, spender: Option<&str>, created_ms_ago: Option<i64>) -> HopEntry {
+    pub(crate) fn hop(status: HopStatus, spender: Option<&str>, created_ms_ago: Option<i64>) -> HopEntry {
         HopEntry {
             game_id: tx(0x01),
             hop_txid: tx(0x07),
