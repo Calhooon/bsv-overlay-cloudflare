@@ -44,11 +44,10 @@ cargo build --manifest-path workers/Cargo.toml --workspace --target wasm32-unkno
 
 Use Rust with the wasm target installed. [Makefile](Makefile) defines the full
 `make ci` gate: both workspaces' tests and clippy, wasm builds, deployment
-checks, route witnesses and D1 budgets. The captain runs it by hand before every
-landing. [.github/workflows/ci.yml](.github/workflows/ci.yml) also runs `test`,
-`fmt`, `clippy` and `wasm32` on every PR and main push; root formatting is its
-current formatting scope. The announced protection start is 2026-10-12 12:00 UTC;
-the workflow file alone does not attest that repository settings are enabled.
+checks, route witnesses and D1 budgets; run it by hand before every landing.
+[.github/workflows/ci.yml](.github/workflows/ci.yml) also runs `test`, `fmt`,
+`clippy` and `wasm32` on every PR and main push; root formatting is its
+current formatting scope.
 
 ## Deploy and observe
 
