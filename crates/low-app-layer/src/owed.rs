@@ -847,7 +847,7 @@ pub const MARKERLESS_BEEF_SQL: &str = "SELECT hex(beef) AS beef FROM pot_beefs W
 // H1/M4/L3: permanent, identity-owned candidates FIRST. Late filings remain live. The ledger's
 // readmitted word ends a release; its age never does. COUNT is over this identity's distinct JOINs.
 // N2: sigValid is the overlay/filing door's latched verdict under the single canonical-DER gate.
-pub const MARKERLESS_CANDIDATES_SQL: &str = "WITH mine AS (SELECT lower(potTxid) AS txid FROM potparty_records_evicted WHERE identity = ?1 AND sigValid = 1 AND seatSettlePubkey IS NOT NULL UNION SELECT lower(potTxid) FROM potparty_records WHERE identity = ?1 AND sigValid = 1 AND seatSettlePubkey IS NOT NULL) SELECT e.txid, e.releasedSpends, e.evictedAt, COUNT(*) OVER () AS total FROM mine JOIN pot_evictions e ON e.txid = mine.txid WHERE e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL ORDER BY CASE WHEN e.txid > ?2 THEN 0 ELSE 1 END, e.txid LIMIT 9";
+pub const MARKERLESS_CANDIDATES_SQL: &str = "WITH mine AS (SELECT lower(potTxid) AS txid FROM potparty_records_evicted WHERE identity = ?1 AND sigValid = 1 AND seatSettlePubkey IS NOT NULL UNION SELECT lower(potTxid) FROM potparty_records WHERE identity = ?1 AND sigValid = 1 AND seatSettlePubkey IS NOT NULL) SELECT e.txid, e.releasedSpends, e.evictedAt, COUNT(*) OVER () AS total FROM mine JOIN pot_evictions e ON e.txid = mine.txid WHERE e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL ORDER BY CASE WHEN e.txid > ?2 THEN 0 ELSE 1 END, e.txid LIMIT ?3";
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct MarkerlessCandidate {

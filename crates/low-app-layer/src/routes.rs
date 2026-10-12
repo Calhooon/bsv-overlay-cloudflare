@@ -2836,7 +2836,11 @@ async fn owed_recompute_inner(
     let cursor = crate::owed::markerless_cursor_of(&cursor_progress);
     let candidates = db
         .prepare(crate::owed::MARKERLESS_CANDIDATES_SQL)
-        .bind(&[JsValue::from_str(identity_lc), JsValue::from_str(&cursor)])
+        .bind(&[
+            JsValue::from_str(identity_lc),
+            JsValue::from_str(&cursor),
+            JsValue::from_f64(crate::owed::OWED_MARKERLESS_JOINS_PER_RECOMPUTE as f64),
+        ])
         .map_err(|e| markerless_fault(e.to_string()))?
         .counted_all()
         .await
