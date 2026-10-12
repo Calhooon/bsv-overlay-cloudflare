@@ -227,6 +227,12 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // bsv-low #499 (lens fold L2): keyed `(boot)` in the ledger, not under the route that woke the isolate.
     let schema_ready = d1_ledger::boot(schema::ensure_latch_columns(&env)).await;
 
+    // A failed page leaves its durable cursor untouched and resumes next request.
+    if let Err(e) = tracker_host::runtime::backfill(&env).await {
+        courier::note_presence("tracker_backfill_faulted_total");
+        worker::console_warn!("[tracker-backfill] deferred: {e}");
+    }
+
     if req.method() == worker::Method::Post && req.path() == "/internal/tx-word" {
         return tracker_host::runtime::ingest(req, &env).await;
     }

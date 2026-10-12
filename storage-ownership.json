@@ -1181,7 +1181,9 @@
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
    "writers": {},
-   "readers": ["low-app-layer"],
+   "readers": [
+    "low-app-layer"
+   ],
    "rebuild_class": "lost",
    "never_wipe": true,
    "holds": "rows of `potparty_records` evicted by admit_fast, with af_evictedAt / af_reason",
@@ -1341,6 +1343,21 @@
    "never_wipe": true,
    "holds": "compact tracker words and checked proof records per subject",
    "why": "NS-3 write-time projection, K11 replacement boundary; no journal"
+  },
+  {
+   "name": "tracker_backfill",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {
+    "low-app-layer": [
+     "CREATE"
+    ]
+   },
+   "readers": [],
+   "rebuild_class": "re-askable",
+   "never_wipe": false,
+   "holds": "bounded deploy proof backfill cursor",
+   "why": "Deleting restarts a bounded proof-only pass; no authority"
   }
  ],
  "other_stores_owners_only": {

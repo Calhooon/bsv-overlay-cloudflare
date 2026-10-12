@@ -251,6 +251,7 @@ pub const PROOF_POSTS_CREATE: &str = "CREATE TABLE IF NOT EXISTS proof_posts (
 /// success the only benign outcome — any error is real and defers the latch.
 pub const CREATE_TABLE_CATCHUPS: &[&str] = &[
     crate::tracker_host::stored::CREATE,
+    crate::tracker_host::stored::BACKFILL_CREATE,
     NETWORK_SEEN_CREATE,
     COLLECTED_MARKERS_V2_CREATE,
     HAND_MARKERS_CREATE,

@@ -155,3 +155,18 @@ fn ns3_banana_captured_tsc_root_reduces_through_sdk() {
         "d204a3ac7ac071862b1b96a18e6465da929fa2fc349a11605346e8e9647fcd57"
     );
 }
+
+#[tokio::test]
+async fn ns3_m2_bracketed_snapshot_retries_once() {
+    let calls = std::cell::Cell::new(0);
+    let answer = retry_snapshot(|| {
+        let n = calls.get(); calls.set(n+1);
+        async move { if n == 0 { HeaderSnapshot {tip:Err(HeaderError("header snapshot changed".into())),headers:Default::default()} } else {snapshot()} }
+    }).await;
+    assert_eq!(calls.get(),2);
+    assert_eq!(answer.tip,Ok(10));
+    calls.set(0);
+    let answer = retry_snapshot(|| { calls.set(calls.get()+1); async {HeaderSnapshot {tip:Err(HeaderError("transport".into())),headers:Default::default()}} }).await;
+    assert_eq!(calls.get(),2);
+    assert!(answer.tip.is_err());
+}

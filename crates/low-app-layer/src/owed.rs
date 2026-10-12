@@ -1498,10 +1498,11 @@ pub async fn pay_vout_pass(world: &mut impl PayVoutWorld, wanted: &[(String, Str
 /// took it: the pot's own row tells the story).
 fn spender_mined(i: &OwedInputs, txid: Option<&str>, legacy: bool) -> bool {
     match i.spender_words {
-        None => legacy, // pre-tracker fixture oracle only
-        Some(words) => txid
-            .and_then(|id| words.get(&id.to_ascii_lowercase()))
-            .is_some_and(|v| v["word"] == "mined" && !v["verifyPath"].is_null()),
+        None => legacy, // base index arm
+        Some(words) => match txid.and_then(|id| words.get(&id.to_ascii_lowercase())) {
+            None => legacy,
+            Some(v) => v["word"] == "mined" && !v["verifyPath"].is_null(),
+        },
     }
 }
 /// The coin judgement's tracker input; a competitor only wins on a checked
@@ -1704,7 +1705,7 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
         let contradicted =
             tracker_confirmed_by_other(i, h, i.hop_chain.get(&outpoint), &filed.sweep_txid);
         let index_word =
-            spender_mined(i, Some(&filed.sweep_txid), filed.index_proven) && !contradicted;
+            (filed.index_proven || spender_mined(i, Some(&filed.sweep_txid), false)) && !contradicted;
         if index_word || named_by_index || by_chain.is_some() {
             // the index's proof, OR its hop-row word, OR the chain rung's (a spend the index recorded before its block
             // and never re-checked read "not mined yet" for days on the pair: the recompute now probes such hops and
@@ -1712,7 +1713,7 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
             // the gate's LOW-3 (2026-09-19): the confirming chain word must NAME the filed sweep (`by_chain` does) — a
             // hop the JOIN took after all (evicted, then readmitted on its mine) reads spent+confirmed by a DIFFERENT
             // tx, and that must never turn the sweep's payout claimable for a tx that can never mine
-            let confirmed = spender_mined(
+            let confirmed = index_word || spender_mined(
                 i,
                 Some(&filed.sweep_txid),
                 index_word
@@ -1938,7 +1939,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     // NOTE-22: the press is offered only once the spend is CONFIRMED (the credit path's landing bar).
                     // the review's LOW-1 (2026-09-20): a spend with a VERIFIED proof height is mined whatever the flag says
                     // (the landing bar's third arm, the unbound arm's L1 rule) — never a chain wait said by machine on a mined tx
-                    let confirmed = spender_mined(
+                    let confirmed = e.at_height.is_some() || spender_mined(
                         i,
                         e.settle_txid.as_deref(),
                         e.spent_confirmed == Some(true) || e.at_height.is_some(),
@@ -1980,6 +1981,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     // whatever `spentConfirmed` says — a classification gap on a mined tx is not a block wait
                     let awaiting_block = e.verdict.is_none()
                         && e.settle_txid.is_some()
+                        && e.at_height.is_none()
                         && !spender_mined(
                             i,
                             e.settle_txid.as_deref(),
@@ -3037,16 +3039,24 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn ns3_m2_index_proof_survives_missing_row_and_cannot_check() {
+        let entries = [entry(Some(true),Some(PotVerdict::WinnerA),Outcome::Won,Some(SeatLetter::A))];
+        let (v,c,p) = (HashMap::new(),HashSet::new(),HashSet::new());
+        for words in [std::collections::BTreeMap::new(),std::collections::BTreeMap::from([(tx(3),json!({"word":"mined","verifyPath":null,"cannotCheck":"header snapshot changed"}))])] {
+            let mut i = inputs(&entries,&[],&[],&v,&c,&p,Some(900_200));
+            i.spender_words = Some(&words);
+            assert_eq!(derive_owed_rows(&i)[0].facts["claimable"],true,"index verified proof first");
+        }
+    }
+
     /// The gate of 2026-09-20 (M1): a hop spender whose bytes carry a POT covenant output is a JOIN the index does
     /// not hold — never the custody story, on the index pointer and on the chain rung alike.
     #[test]
     fn ns3_owed_tracker_word_controls_claim_even_when_legacy_flags_disagree() {
-        let entries = [entry(
-            Some(true),
-            Some(PotVerdict::WinnerA),
-            Outcome::Won,
-            Some(SeatLetter::A),
-        )];
+        let mut unproved = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
+        unproved.at_height = None;
+        let entries = [unproved];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let mut inputs = inputs(&entries, &[], &[], &v, &c, &p, Some(900_200));
         let mut state = bsv_tracker::State::new(tx(3));

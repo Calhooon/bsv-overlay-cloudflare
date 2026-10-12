@@ -392,3 +392,34 @@ pub fn courier_presence_hint(value: &Value, now: u64) -> Option<Hint> {
     // 0.2.2 has no Announced hint. Unknown retains the courier source without promotion.
     Some(Hint::new(source, HintStatus::Unknown, now))
 }
+
+thread_local! { static BACKFILL_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// Proof-only deploy convergence; four subjects per request, cursor durable across isolates.
+pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
+    if BACKFILL_DONE.with(std::cell::Cell::get) { return Ok(()); }
+    #[derive(serde::Deserialize)]
+    struct Cursor {cursor:String,complete:f64}
+    #[derive(serde::Deserialize)]
+    struct Subject {txid:String,beef:Option<Vec<u8>>}
+    let db = env.d1("OVERLAY_DB")?;
+    let cursor = db.prepare("SELECT cursor, complete FROM tracker_backfill WHERE version = ?1").bind(&[JsValue::from_str(stored::BACKFILL_VERSION)])?.counted_first::<Cursor>().await?;
+    if cursor.as_ref().is_some_and(|c| c.complete != 0.0) { BACKFILL_DONE.with(|c| c.set(true)); return Ok(()); }
+    let mut after = cursor.map_or_else(String::new, |c| c.cursor);
+    let rows = db.prepare(stored::BACKFILL_PAGE).bind(&[JsValue::from_str(&after)])?.counted_all().await?.results::<Subject>()?;
+    let complete = rows.len() < 4;
+    for subject in rows {
+        crate::courier::note_presence("tracker_backfill_examined_total");
+        let proof = subject.beef.and_then(|bytes| overlay_engine::beef_limits::transaction_from_beef(&bytes,Some(&subject.txid),&overlay_engine::beef_limits::STORED_BEEF_LIMITS).ok()).and_then(|tx| tx.merkle_path.clone()).and_then(|path| Proof::new(&subject.txid,path).ok());
+        if let Some(proof) = proof {
+            let headers = super::headers(env,&[proof.height()]).await;
+            let mut state = State::new(&subject.txid);
+            state.step(&Params {age_threshold:60},&headers,Input::Evidence(Evidence::Proof(proof))).map_err(|e| worker::Error::RustError(e.to_string()))?;
+            stored::write(env,&Row::from_state(&state,super::WorkerClock.now(),None)).await?;
+            crate::courier::note_presence("tracker_backfill_written_total");
+        } else { crate::courier::note_presence("tracker_backfill_unreadable_total"); }
+        after = subject.txid;
+    }
+    db.prepare(stored::BACKFILL_SAVE).bind(&[JsValue::from_str(stored::BACKFILL_VERSION),JsValue::from_str(&after),JsValue::from_f64(if complete {1.0} else {0.0})])?.counted_run().await?;
+    if complete { BACKFILL_DONE.with(|c| c.set(true)); }
+    Ok(())
+}

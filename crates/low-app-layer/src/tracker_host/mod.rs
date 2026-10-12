@@ -73,22 +73,20 @@ pub async fn headers(env: &worker::Env, heights: &[u32]) -> HeaderSnapshot {
             .and_then(|h| u32::try_from(h).ok())
             .ok_or_else(|| HeaderError("unavailable tip".into()))
     }
-    let before = tip(env).await;
-    let mut rows = BTreeMap::new();
-    for height in heights {
-        let row = match get(env, &format!("findHeaderHexForHeight?height={height}")).await {
-            Ok((status, frame)) => header_response(*height, status, &frame),
-            Err(e) => Err(e),
-        };
-        rows.insert(*height, row);
-    }
-    let after = tip(env).await;
-    let tip = if before == after {
-        after
-    } else {
-        Err(HeaderError("header snapshot changed".into()))
-    };
-    HeaderSnapshot { tip, headers: rows }
+    retry_snapshot(|| async {
+        let before = tip(env).await;
+        let mut rows = BTreeMap::new();
+        for height in heights {
+            let row = match get(env, &format!("findHeaderHexForHeight?height={height}")).await {
+                Ok((status, frame)) => header_response(*height, status, &frame),
+                Err(e) => Err(e),
+            };
+            rows.insert(*height,row);
+        }
+        let after = tip(env).await;
+        let tip = if before == after {after} else {Err(HeaderError("header snapshot changed".into()))};
+        HeaderSnapshot {tip,headers:rows}
+    }).await
 }
 
 /// Completed courier transports, in ladder order. `fetch` returns raw
@@ -254,3 +252,10 @@ pub mod served;
 pub mod stored;
 
 pub mod runtime;
+
+/// One retry of a bracketed header read, then cannotCheck; no promotion.
+pub async fn retry_snapshot<F, Fut>(mut read: F) -> HeaderSnapshot
+where F: FnMut() -> Fut, Fut: std::future::Future<Output = HeaderSnapshot> {
+    let first = read().await;
+    if first.tip.is_ok() {first} else {read().await}
+}
