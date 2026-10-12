@@ -7,10 +7,10 @@
 ## 0.1.0 (prepared, unpublished)
 
 - Registry packages for `bsv-overlay-engine`, `bsv-overlay-discovery`,
-  `low-proof-replay` and `bsv-overlay-cloudflare`, in that dependency order.
+  `bsv-low-proof-replay`, `bsv-worker-build-info` and `bsv-overlay-cloudflare`, in that dependency order.
 - Engine behavior is the e592 release at `engine-e592-2026-10-10`.
-- Release prerequisite: merge #74 and include its Worker build object before
-  tagging 0.1.0. That object is not present on this preparation branch.
+- Includes #74's Worker build object; its shared capture crate is packaged once
+  for both Workers. LOW's deployable app layer remains unpublished.
 - Crate metadata, scoped package contents and a tag-driven trusted publishing
   workflow. Cross-crate engine tests now live in an unpublished test workspace
   member to remove a publication cycle without changing their assertions.

@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+description = "Shared build provenance capture and health metadata for BSV Workers."
+readme = "README.md"
+keywords = ["bitcoin", "bsv", "workers", "build", "provenance"]
+categories = ["development-tools::build-utils"]
+include = ["src/**/*.rs", "README.md", "LICENSE-*"]
 workspace = "../../workers"
 
 [features]

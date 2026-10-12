@@ -15,10 +15,10 @@ workspace = "../../workers"
 crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
-bsv-worker-build-info = { path = "../worker-build-info", features = ["build"] }
+bsv-worker-build-info = { version = "0.1", path = "../worker-build-info", features = ["build"] }
 
 [dependencies]
-bsv-worker-build-info = { path = "../worker-build-info" }
+bsv-worker-build-info = { version = "0.1", path = "../worker-build-info" }
 getrandom = { version = "0.2", features = ["js"] }
 # worker 0.8 (bsv-low #318): `bsv-middleware-cloudflare` 0.3 — the canonical
 # BRC-103/104 middleware, the SAME major the low-watchtower pins — requires
@@ -66,7 +66,7 @@ overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path =
 # bsv-low #553: the `LOW/proof/v1` replay (was `overlay_discovery::proof::replay`),
 # run on a posted bundle and on a row the overlay admitted before the replay
 # shipped. It carries the PATH deps on the private `bsv-low` checkout.
-low-proof-replay = { version = "0.1", path = "../low-proof-replay" }
+low-proof-replay = { package = "bsv-low-proof-replay", version = "0.1", path = "../low-proof-replay" }
 # Readable wasm panics in `wrangler tail` (same pattern as the overlay worker).
 console_error_panic_hook = "0.1"
 # /live-view's bounded tower fan-out: `select` races each service-binding

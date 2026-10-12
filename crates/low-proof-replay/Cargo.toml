@@ -1,5 +1,5 @@
 [package]
-name = "low-proof-replay"
+name = "bsv-low-proof-replay"
 description = "Deterministic server-side verification of LOW proof transcript bundles."
 version.workspace = true
 edition.workspace = true

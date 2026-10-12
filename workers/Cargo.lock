@@ -196,7 +196,7 @@ dependencies = [
  "bsv-worker-build-info",
  "hex",
  "js-sys",
- "low-proof-replay",
+ "bsv-low-proof-replay",
  "rusqlite",
  "serde",
  "serde_json",
@@ -941,7 +941,7 @@ dependencies = [
  "futures-util",
  "getrandom",
  "hex",
- "low-proof-replay",
+ "bsv-low-proof-replay",
  "rusqlite",
  "serde",
  "serde_json",
@@ -950,7 +950,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "low-proof-replay"
+name = "bsv-low-proof-replay"
 version = "0.1.0"
 dependencies = [
  "bsv-low-core",
