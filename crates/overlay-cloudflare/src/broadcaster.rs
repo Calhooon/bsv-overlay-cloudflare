@@ -3011,7 +3011,7 @@ impl ArcadeBroadcaster {
                     endpoint,
                     worker::js_sys::Date::now() - t0,
                     body.len(),
-                    &text.chars().take(80).collect::<String>()
+                    text.chars().take(80).collect::<String>()
                 ));
                 classify_submit_response(status, &text)
             }
@@ -3021,7 +3021,7 @@ impl ArcadeBroadcaster {
                     endpoint,
                     worker::js_sys::Date::now() - t0,
                     body.len(),
-                    &transport.chars().take(120).collect::<String>()
+                    transport.chars().take(120).collect::<String>()
                 ));
                 SubmitOutcome::Transport(transport)
             }
