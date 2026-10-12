@@ -369,3 +369,20 @@ fn ns3_h1_expired_memo_is_reasked_even_when_spender_is_tracked() {
     assert_eq!(answers[0].2.spent_confirmed,Some(true));
     assert_eq!(probes,1);
 }
+
+#[test]
+fn ns3_m1_woc_mempool_presence_is_never_broadcaster_seen() {
+    let id = "01".repeat(32);
+    let woc_200 = json!({"txid":id,"hash":id,"vin":[],"vout":[]});
+    assert_eq!(low_app_layer::txany::parse_woc_tx_claim(&woc_200,&id),Some(false));
+    let mut s = State::new(&id);
+    let params = Params {age_threshold:60};
+    s.step(&params,&snapshot(&id),Input::Host(bsv_tracker::HostAction::Build)).unwrap();
+    let legacy = json!({"present":true,"source":"external"});
+    let hint = runtime::courier_presence_hint(&legacy,123).unwrap();
+    s.step(&params,&snapshot(&id),Input::Hint(hint)).unwrap();
+    let view = low_app_layer::tracker_host::served::fields(&s);
+    assert_ne!(view["word"], "seen", "courier presence is a live-race hint");
+    assert_eq!(view["source"],"woc");
+    assert!(view["verifyPath"].is_null());
+}

@@ -23,3 +23,9 @@ Race pin: late concurrent hints cannot demote chain/Seen rows; checked proof bea
 Gate: 668 native tests, all-target clippy -D warnings, five fleet production-body compatibility pins at three offsets, ownership and changed-hunk formatting GREEN; whole-crate fmt still reports pre-existing debt. Neutered adapter/renderer/recheck/owed/race copies RED; five Worker word/path pins RED then GREEN.
 Budget reads/writes/statements: utxo 8/0/1 (with spender pin maximum 8/0/2); pots 8/0/1; results:view 191/0/6; owed first 352/18/26, served 17/0/2; submit 0/13/8, all original ceilings unchanged. Full ci-d1-budget + ci-route GREEN; final wasm32 and worker-build --release GREEN, bindgen 0.2.126 / Node 22; logs /tmp/ns3-*.log.
 Unverified: from-scratch and delta lenses, live write-hook delivery/recovery and live deployment. The lookup route tier is verified locally. Next: lens the money judgement, fold findings, then promotion by the owner; temporary target and neutered worktree removed.
+
+### Fold M1: captain's D1/#602 ruling
+Courier mempool presence is the live-race hint `announced`, never broadcaster `seen`.
+bsv-tracker 0.2.2 has no `HintStatus::Announced`, so this host writes `Unknown` with the courier source and time, without promotion.
+K-ask: add `HintStatus::Announced` as a non-promoting courier presence hint in bsv-tracker; keep broadcaster Accepted/Seen distinct.
+Captain follow-up in bsv-low: words design §2d and S11 must say courier `announced` (0.2.2 fallback Unknown), broadcaster SEEN only.
