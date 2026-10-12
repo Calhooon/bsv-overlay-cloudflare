@@ -320,7 +320,7 @@ async fn l23_r2_synthetic_ninth_eviction_twin_only_25h_late_filing_and_planted_m
 fn read_candidates(db: &Connection, me: &str, cursor: &str) -> Vec<MarkerlessCandidate> {
     db.prepare(MARKERLESS_CANDIDATES_SQL)
         .unwrap()
-        .query_map([me, cursor], |r| {
+        .query_map(rusqlite::params![me, cursor, OWED_MARKERLESS_JOINS_PER_RECOMPUTE], |r| {
             Ok(MarkerlessCandidate {
                 txid: r.get(0)?,
                 released_spends: r.get(1)?,
@@ -414,7 +414,13 @@ async fn l23_r2_identity_cursor_walks_own_ninth_and_beyond_and_counts_tail() {
     let (cursor_txid, cursor_vout) = markerless_cursor_target("me");
     let cursor_key = low_app_layer::hops_view::probe_memo_key(&cursor_txid, cursor_vout);
     for step in 0..3 {
-        let (selected, total) = markerless_plan(&read_candidates(&db, "me", &cursor));
+        let page = read_candidates(&db, "me", &cursor);
+        assert_eq!(
+            page.len(),
+            OWED_MARKERLESS_JOINS_PER_RECOMPUTE,
+            "N3 SQL reads exactly the plan's bound"
+        );
+        let (selected, total) = markerless_plan(&page);
         assert_eq!(total, 19);
         assert_eq!(selected.len(), 8);
         let ledger: Vec<_> = selected
