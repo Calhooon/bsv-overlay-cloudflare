@@ -2608,6 +2608,7 @@ pub(crate) enum ArcIngestBody {
     /// there); the proof's own verification decides, the marker is counted.
     Proof {
         txid: String,
+        tx_status: String,
         merkle_path: String,
         block_height: Option<u32>,
         block_hash: Option<String>,
@@ -2654,6 +2655,7 @@ pub(crate) fn classify_arc_ingest_body(raw: &str) -> Result<ArcIngestBody, Strin
     match body.merkle_path {
         Some(mp) if !mp.trim().is_empty() => Ok(ArcIngestBody::Proof {
             txid: body.txid,
+            tx_status: body.tx_status.unwrap_or_default(),
             merkle_path: mp,
             block_height: body.block_height,
             block_hash: body.block_hash.map(|h| h.to_ascii_lowercase()),
@@ -2696,6 +2698,20 @@ pub(crate) fn is_unknown_txid_for_proof_ingest(e: &EngineError) -> bool {
     matches!(e, EngineError::Other(m) if m.contains("Could not find matching transaction outputs"))
 }
 
+/// bsv-low #640: identify a refused push without receiving any credential.
+fn arc_ingest_refusal_log(
+    txid: &str,
+    tx_status: &str,
+    user_agent: Option<&str>,
+    why: &str,
+) -> String {
+    // Debug quoting keeps untrusted status and User-Agent on one log line.
+    format!(
+        "POST /arc-ingest txid={txid:?} txStatus={tx_status:?} ua={:?} -> 401 ({why})",
+        user_agent.unwrap_or("")
+    )
+}
+
 pub async fn arc_ingest(
     engine: &Engine,
     mut req: Request,
@@ -2714,6 +2730,7 @@ pub async fn arc_ingest(
     // version. See `classify_arc_callback_auth`.
     let authorization = req.headers().get("authorization").ok().flatten();
     let callback_token = req.headers().get("x-callbacktoken").ok().flatten();
+    let user_agent = req.headers().get("user-agent").ok().flatten();
 
     let raw = match req.text().await {
         Ok(t) => t,
@@ -2755,7 +2772,14 @@ pub async fn arc_ingest(
                     "token presented but != subject txid",
                 ),
             };
-            worker::console_log!("POST /arc-ingest -> 401 ({why})");
+            let tx_status = match &body {
+                ArcIngestBody::Proof { tx_status, .. }
+                | ArcIngestBody::StatusOnly { tx_status, .. } => tx_status,
+            };
+            worker::console_log!(
+                "{}",
+                arc_ingest_refusal_log(&txid, tx_status, user_agent.as_deref(), why)
+            );
             if let Some(db) = ops_db {
                 crate::ops::bump_counter(db, counter, 1).await;
             }
@@ -5208,12 +5232,14 @@ mod tests {
         match classify_arc_ingest_body(&body).unwrap() {
             ArcIngestBody::Proof {
                 txid,
+                tx_status,
                 merkle_path,
                 block_height,
                 block_hash,
                 extra_info,
             } => {
                 assert_eq!(txid, CB_TXID);
+                assert_eq!(tx_status, "MINED");
                 assert_eq!(merkle_path, "beef00");
                 assert_eq!(block_height, Some(850_000));
                 assert_eq!(block_hash, None);
@@ -5355,6 +5381,51 @@ mod tests {
                 "{auth:?} / {hdr:?}"
             );
         }
+    }
+
+    #[test]
+    fn arcreg_refusal_log_names_the_push_and_never_the_bearer() {
+        let wrong = "b".repeat(64);
+        assert_eq!(
+            classify_arc_callback_auth(Some(&format!("Bearer {wrong}")), None, CB_TXID),
+            ArcCallbackAuth::BadToken
+        );
+        let line = arc_ingest_refusal_log(
+            CB_TXID,
+            "MINED",
+            Some("arcade-test/640"),
+            "token presented but != subject txid",
+        );
+        assert_eq!(line, format!("POST /arc-ingest txid={CB_TXID:?} txStatus=\"MINED\" ua=\"arcade-test/640\" -> 401 (token presented but != subject txid)"));
+        assert!(!line.contains(&wrong));
+        let escaped = arc_ingest_refusal_log(
+            CB_TXID,
+            "REJECTED\nspoof",
+            Some("courier\nspoof"),
+            "no token",
+        );
+        assert_eq!(
+            escaped.lines().count(),
+            1,
+            "untrusted log fields cannot forge another line"
+        );
+        let src = include_str!("routes.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let route = &prod[prod.find("pub async fn arc_ingest(").unwrap()..];
+        let refusal = &route[..route.find("let (merkle_path, block_height)").unwrap()];
+        assert!(
+            refusal.contains("req.headers().get(\"user-agent\")"),
+            "UA read before body consumption"
+        );
+        assert!(
+            refusal
+                .contains("arc_ingest_refusal_log(&txid, tx_status, user_agent.as_deref(), why)"),
+            "the route emits the pinned line"
+        );
+        assert!(
+            refusal.contains("ArcIngestBody::Proof { tx_status, .. }"),
+            "MINED pushed status is retained"
+        );
     }
 
     #[test]
