@@ -1,10 +1,15 @@
 [package]
 name = "bsv-overlay-discovery"
-description = "SHIP/SLAP topic managers and lookup services for BSV overlay network"
+description = "Topic managers and lookup services for the BSV overlay network."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["bitcoin", "bsv", "overlay", "discovery"]
+categories = ["cryptography::cryptocurrencies"]
+include = ["src/**/*.rs", "src/pot/poc5_template.hex", "docs/*.md", "README.md", "LICENSE-*"]
 
 [dependencies]
 overlay-engine = { package = "bsv-overlay-engine", version = "0.1", path = "../overlay-engine" }
@@ -32,7 +37,7 @@ base64 = "0.22"
 # source cargo never loads an unactivated optional path dependency).
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# `std::time::SystemTime::now()` panics on wasm32-unknown-unknown — route
+# `std::time::SystemTime::now()` panics on wasm32-unknown-unknown , route
 # timestamps through `js_sys::Date` on that target. Mirrors overlay-engine's
 # `current_timestamp_ms`. See uhrp/topic_manager.rs::current_unix_seconds.
 js-sys = "0.3"

@@ -1,10 +1,15 @@
 [package]
 name = "bsv-overlay-engine"
-description = "BSV Overlay Services Engine — transaction admission, lookup, GASP sync"
+description = "Transaction admission, lookup and GASP synchronization for BSV overlay services."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["bitcoin", "bsv", "overlay", "spv"]
+categories = ["cryptography::cryptocurrencies"]
+include = ["src/**/*.rs", "README.md", "LICENSE-*"]
 
 [features]
 default = []
@@ -26,12 +31,8 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 proptest = "1"
 reqwest = { version = "0.12", features = ["json"] }
 hex = "0.4"
-# Integration tests instantiate SHIP / SLAP / Agent services to drive
-# parity + wire-compat scenarios against the engine. Direct dep (no alias)
-# so the test imports use the published crate name.
-bsv-overlay-discovery = { version = "0.1", path = "../overlay-discovery" }
 # Integration tests use the in-process `MemoryStorage` backend. The
 # `memory-storage` feature is opt-in for the lib (production deployments
-# wire D1 / SQLite) — but every integration test instantiates it, so we
+# wire D1 / SQLite) , but every integration test instantiates it, so we
 # enable it for `cargo test` via a self-feature dev-dep.
-bsv-overlay-engine = { path = ".", features = ["memory-storage"] }
+bsv-overlay-engine = { version = "0.1", path = ".", features = ["memory-storage"] }

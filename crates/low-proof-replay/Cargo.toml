@@ -1,12 +1,16 @@
 [package]
 name = "low-proof-replay"
-description = "Server-side replay of a LOW/proof/v1 transcript bundle (both hands re-derived)"
+description = "Deterministic server-side verification of LOW proof transcript bundles."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["bitcoin", "bsv", "proof", "verification"]
+categories = ["cryptography::cryptocurrencies"]
+include = ["src/**/*.rs", "README.md", "LICENSE-*"]
 workspace = "../../workers"
-publish = false
 
 [dependencies]
 # `ProvedHands` and the `BundleProver` hook this crate's `prove_bundle` fills.
