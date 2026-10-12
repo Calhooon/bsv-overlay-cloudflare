@@ -93,15 +93,15 @@ AND hp.seatSettlePubkey IN (pot.pubA,pot.pubB)
 AND NOT EXISTS (SELECT 1 FROM potparty_records x WHERE +x.identity=hp.identity AND x.potTxid=pot.txid AND x.potVout=pot.outputIndex) AND hp.identity=OLD.identity AND pot.txid=OLD.potTxid AND pot.outputIndex=OLD.potVout; END";
 
 pub const LINKS_BACKFILL: &str = r"INSERT OR IGNORE INTO hop_pot_links (identity,createdAt,potTxid,potVout,markerRowid) SELECT hp.identity, hp.createdAt, pot.txid, pot.outputIndex, hp.rowid
-FROM hopparty_records hp CROSS JOIN pot_records hop ON hop.txid=hp.txid AND hop.outputIndex=hp.hopVout
+FROM (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM view_derivation_state WHERE name='hop-views-v1')) g CROSS JOIN hopparty_records hp CROSS JOIN pot_records hop ON hop.txid=hp.txid AND hop.outputIndex=hp.hopVout
 CROSS JOIN pot_records pot ON pot.txid=lower(hop.spendingTxid) AND pot.outputIndex=0
 WHERE hp.markerValid=1 AND hop.spent=1 AND hop.spendingTxid IS NOT NULL
 AND pot.paramsDecoded=1 AND pot.recoveryHeight IS NOT NULL
 AND pot.pubA IS NOT NULL AND pot.pubB IS NOT NULL
 AND hp.seatSettlePubkey IN (pot.pubA,pot.pubB)
-AND NOT EXISTS (SELECT 1 FROM potparty_records x WHERE +x.identity=hp.identity AND x.potTxid=pot.txid AND x.potVout=pot.outputIndex) AND NOT EXISTS (SELECT 1 FROM view_derivation_state WHERE name='hop-views-v1')";
+AND NOT EXISTS (SELECT 1 FROM potparty_records x WHERE +x.identity=hp.identity AND x.potTxid=pot.txid AND x.potVout=pot.outputIndex)";
 
-pub const SEATS_BACKFILL: &str = r"INSERT OR IGNORE INTO pot_hop_seats (potTxid,potVout,markerRowid) SELECT p.txid,p.outputIndex,hp.rowid FROM pot_records p CROSS JOIN hopparty_records hp ON hp.seatSettlePubkey IN (p.pubA,p.pubB) WHERE p.pubA IS NOT NULL AND p.pubB IS NOT NULL AND NOT EXISTS (SELECT 1 FROM view_derivation_state WHERE name='hop-views-v1')";
+pub const SEATS_BACKFILL: &str = r"INSERT OR IGNORE INTO pot_hop_seats (potTxid,potVout,markerRowid) SELECT p.txid,p.outputIndex,hp.rowid FROM (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM view_derivation_state WHERE name='hop-views-v1')) g CROSS JOIN pot_records p CROSS JOIN hopparty_records hp ON hp.seatSettlePubkey IN (p.pubA,p.pubB) WHERE p.pubA IS NOT NULL AND p.pubB IS NOT NULL";
 
 pub const STATE_DONE: &str =
     r"INSERT OR IGNORE INTO view_derivation_state (name) VALUES ('hop-views-v1')";
