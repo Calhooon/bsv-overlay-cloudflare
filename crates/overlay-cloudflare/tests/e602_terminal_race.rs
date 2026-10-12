@@ -91,8 +91,10 @@ fn e602_retire_pass_rechecks_live_pots_for_confirmed_competitors() {
     let pass = &proof[proof.find("pubasyncfnrun_retire_pass(").unwrap()..];
     let pass = &pass[..pass.find("letmutsummary=RetireSummary").unwrap()];
     assert_eq!(
-        pass.matches("crate::admit_fast::confirmed_conflict_pass(db,woc_api_key).await;")
-            .count(),
+        pass.matches(
+            "letconflict=crate::admit_fast::confirmed_conflict_pass(db,woc_api_key).await;"
+        )
+        .count(),
         1
     );
 }
@@ -127,4 +129,36 @@ fn e602_courier_functions_keep_the_response_body() {
         let body = &body[..body.find("_=>None,").unwrap()];
         assert_eq!(body.matches("presence_response(status,&body)").count(), 1);
     }
+}
+
+#[test]
+fn e602_fold_retire_callers_pass_the_woc_key_and_print_the_conflict_summary() {
+    let lib = source("lib.rs");
+    let call = "run_retire_pass(&ops_db,&arcade_base,woc_key.as_deref()).await;";
+    assert_eq!(
+        lib.matches(call).count(),
+        2,
+        "both retire-pass callers pass the key"
+    );
+    assert_eq!(
+        lib.matches("run_retire_pass(&ops_db,&arcade_base,None)")
+            .count(),
+        0
+    );
+    assert_eq!(
+        lib.matches("letwoc_key=env.secret(\"WOC_API_KEY\").ok().map(|k|k.to_string());letretire=")
+            .count(),
+        2
+    );
+    assert_eq!(
+        lib.matches("conflict:scanned={}evicted={}faults={}")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn e602_fold_a_witnessed_accept_starts_no_watch() {
+    let routes = source("routes.rs");
+    assert!(routes.contains("letneeds_watch=!arcade.admission_is_witnessed();"));
 }

@@ -214,3 +214,63 @@ async fn e602_readmitted_pot_converges_only_on_a_bound_confirmed_competitor() {
         .unwrap();
     assert_eq!(stamp, None);
 }
+
+#[tokio::test]
+async fn e602_fold_the_conflict_counters_exist_and_move_on_one_eviction() {
+    let db = Sqlite(Connection::open_in_memory().unwrap());
+    for sql in OVERLAY_MIGRATIONS {
+        if let Err(e) = db.0.execute_batch(sql) {
+            assert!(e.to_string().contains("duplicate column"), "{e}");
+        }
+    }
+    let hop = "cc".repeat(32);
+    let subject = spending(&hop, 40_000);
+    let txid = subject.id();
+    let raw = subject.to_binary();
+    db.0.execute(
+        "INSERT INTO pot_records(txid,outputIndex,spent,createdAt) VALUES (?,0,0,1)",
+        [&txid],
+    )
+    .unwrap();
+    let evidence = Evidence {
+        raw: spending(&hop, 39_000).to_hex(),
+        height: Some(970710),
+    };
+    let mut summary = ConflictPassSummary::default();
+    summary.note(&converge_confirmed_conflict(&db, &evidence, &evidence, &txid, &raw, 3000).await);
+    summary.note(&Err("courier 429".into()));
+    assert_eq!(
+        db.count("pot_records_evicted", "txid", &txid)
+            .await
+            .unwrap(),
+        1
+    );
+    for (name, delta) in summary.counter_deltas() {
+        if delta > 0 {
+            db.0.execute(
+                bsv_overlay_cloudflare::ops::BUMP_COUNTER_SQL,
+                rusqlite::params![name, delta as i64],
+            )
+            .unwrap();
+        }
+    }
+    let read = |name: &str| -> Option<i64> {
+        db.0.query_row("SELECT value FROM ops_counters WHERE name=?", [name], |r| {
+            r.get(0)
+        })
+        .optional()
+        .unwrap()
+    };
+    assert_eq!(read("admit_fast_conflict_scanned_total"), Some(2));
+    assert_eq!(read("admit_fast_conflict_evicted_total"), Some(1));
+    assert_eq!(read("admit_fast_conflict_faults_total"), Some(1));
+    let ops = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ops.rs")).unwrap();
+    let served = &ops[ops.find("async fn read_counters(").unwrap()..];
+    for name in [
+        "COUNTER_ADMIT_FAST_CONFLICT_SCANNED,",
+        "COUNTER_ADMIT_FAST_CONFLICT_EVICTED,",
+        "COUNTER_ADMIT_FAST_CONFLICT_FAULTS,",
+    ] {
+        assert!(served.contains(name), "{name} served from 0");
+    }
+}

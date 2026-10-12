@@ -1466,7 +1466,13 @@ async fn submit_parts(
         arcade_broadcast_ms =
             (js_sys::Date::now() - arcade_started - corroborate_ms - arcade_poll_ms - terminal_ms).max(0.0);
         admit_desc = match &arcade_outcome {
-            Ok(crate::broadcaster::ArcOutcome::Accepted(_)) => if arcade.admission_is_witnessed() { "witnessed" } else { "mined" },
+            Ok(crate::broadcaster::ArcOutcome::Accepted(_)) => {
+                if arcade.admission_is_witnessed() {
+                    "witnessed"
+                } else {
+                    "mined"
+                }
+            }
             Ok(crate::broadcaster::ArcOutcome::AcceptedPending(_)) => {
                 if admit_fast {
                     "fast"
@@ -1486,7 +1492,10 @@ async fn submit_parts(
                     "broadcast-gated(arcade): network accepted {subject_txid} ({accepted}, {} EF leg(s)) — admitting",
                     efs.len()
                 );
-                let needs_watch = door_open.is_some() || !arcade.admission_is_witnessed();
+                // #602 fold (LOW-1): a witnessed accept latches below, synchronously, so it
+                // starts no watch (whose first SEEN look would re-bump the pending-SEEN
+                // latency counters); only an unlatched (courier-mined) accept is watched.
+                let needs_watch = !arcade.admission_is_witnessed();
                 // loop 18 (the gate's HIGH-2): the network holds these bytes NOW — an open eviction is stale.
                 if let Some(ev) = door_open.take() {
                     if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
@@ -1518,7 +1527,9 @@ async fn submit_parts(
                 if arcade.admission_is_witnessed() {
                     match env.d1("OVERLAY_DB") {
                         Ok(db) => crate::ops::latch_network_seen(&db, &subject_txid).await,
-                        Err(e) => worker::console_log!("network_seen unavailable for {subject_txid}: {e}"),
+                        Err(e) => {
+                            worker::console_log!("network_seen unavailable for {subject_txid}: {e}")
+                        }
                     }
                 }
                 // Re-presents need a new watch even when Arcade registered this txid earlier.

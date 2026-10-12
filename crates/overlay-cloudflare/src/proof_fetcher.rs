@@ -3492,7 +3492,11 @@ pub(crate) async fn bitails_presence(base: &str, txid: &str) -> Option<NetworkPr
 }
 
 /// WoC `GET /tx/hash/{txid}` presence — same three-way contract.
-pub(crate) async fn woc_presence(base: &str, api_key: Option<&str>, txid: &str) -> Option<NetworkPresence> {
+pub(crate) async fn woc_presence(
+    base: &str,
+    api_key: Option<&str>,
+    txid: &str,
+) -> Option<NetworkPresence> {
     let url = format!("{}/tx/hash/{}", base.trim_end_matches('/'), txid);
     let hdr = api_key.map(|k| ("woc-api-key", k));
     match http_get(&url, hdr).await {
@@ -3827,7 +3831,9 @@ pub fn retire_verdict(
     if matches!(arcade, ArcadeLook::Present) {
         return None;
     }
-    if classify_presence(bitails.map(bool_presence), woc.map(bool_presence)) != NetworkPresence::Absent {
+    if classify_presence(bitails.map(bool_presence), woc.map(bool_presence))
+        != NetworkPresence::Absent
+    {
         return None;
     }
     match arcade {
@@ -3910,6 +3916,8 @@ pub struct RetireSummary {
     pub retired: usize,
     pub kept_present: usize,
     pub kept_uncertain: usize,
+    /// #602 fold (MEDIUM-1): the conflict pass that runs first.
+    pub conflict: crate::admit_fast::ConflictPassSummary,
 }
 
 /// Shipped candidate SQL for the retire pass — the proofless_watch ledger IS
@@ -3961,8 +3969,11 @@ pub async fn run_retire_pass(
     woc_api_key: Option<&str>,
 ) -> RetireSummary {
     use crate::d1::Query;
-    crate::admit_fast::confirmed_conflict_pass(db, woc_api_key).await;
-    let mut summary = RetireSummary::default();
+    let conflict = crate::admit_fast::confirmed_conflict_pass(db, woc_api_key).await;
+    let mut summary = RetireSummary {
+        conflict,
+        ..RetireSummary::default()
+    };
     let now = js_sys::Date::now() as i64;
     // the second gate's LOW-1: request-time absences past their window are dropped here (one statement per tick),
     // so a stranger's random-txid asks never grow the table without bound
@@ -4003,7 +4014,12 @@ pub async fn run_retire_pass(
             } else {
                 woc_presence(DEFAULT_WOC_BASE, woc_api_key, &row.txid).await
             };
-            match retire_verdict(&look, bitails.map(presence_bool), woc.map(presence_bool), row.age_secs as i64) {
+            match retire_verdict(
+                &look,
+                bitails.map(presence_bool),
+                woc.map(presence_bool),
+                row.age_secs as i64,
+            ) {
                 Some(reason) => {
                     let write = match store {
                         "transactions" => {

@@ -14,3 +14,11 @@ Storage ownership: 688 references passed the repository's `scripts/check-storage
 Route gate split at the successful prerequisite: `LANE_BASE=16020 make ci-route` passed all ci-d1-budget cells, then was terminated during main-tier startup and cleaned up (`/tmp/e602-route.log`). `LANE_BASE=16020 make -o ci-d1-budget ci-route` passed the remaining tier, exit 0 (`/tmp/e602-route-main.log`). Each foreground command is bounded to 570 seconds plus 15 seconds teardown.
 The source pins normalize whitespace and assert nonzero, exact occurrences. The fixture and pure-function pins are in `crates/overlay-cloudflare/tests/e602_*.rs`.
 The captain's from-scratch lens, LOW's `make ci`, beta deployment, and `spec-admit-fast-join-refused` remain outside this lane's validation. Nothing was pushed, deployed or spent.
+
+## Lens fold (2026-10-12)
+
+MEDIUM-1 counters and the retire-pass summary; MEDIUM-2 the WoC key at both
+retire-pass callers; LOW-1 a witnessed accept starts no watch; LOW-2 the
+branch's own rustfmt hunks; LOW-3/LOW-5 stated at the arms; LOW-4 the register
+text. Pins: `e602_fold_*` in `tests/e602_convergence.rs` and
+`tests/e602_terminal_race.rs`.

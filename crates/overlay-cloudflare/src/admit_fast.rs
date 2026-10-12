@@ -1548,6 +1548,9 @@ pub async fn converge_confirmed_conflict(
         {
             continue;
         }
+        // #602 fold (LOW-3, stated): the courier's `blockheight` is trusted as the
+        // chain's word, unverified against chaintracks; an orphaned block's height
+        // would evict a live pot once, and the pot's pushed MINED proof readmits it.
         if let Some(NetworkPresence::Present {
             height: Some(height),
         }) = presence.presence(&competitor).await
@@ -1571,7 +1574,46 @@ pub const CONFLICT_CANDIDATES_SQL: &str = "SELECT b.txid, hex(b.beef) AS beef FR
      WHERE b.proof_verified = 0 AND EXISTS (SELECT 1 FROM pot_records p WHERE p.txid = b.txid) \
      ORDER BY RANDOM() LIMIT 8";
 
-pub async fn confirmed_conflict_pass(db: &D1Database, woc_api_key: Option<&str>) {
+/// #602 fold (MEDIUM-1): what one conflict pass did, counted and on the tick's line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictPassSummary {
+    pub scanned: u64,
+    pub evicted: u64,
+    pub faults: u64,
+}
+
+impl ConflictPassSummary {
+    /// One candidate's re-check: `Ok(true)` evicted, `Err` a courier or parse fault.
+    pub fn note(&mut self, result: &Result<bool, String>) {
+        self.scanned += 1;
+        match result {
+            Ok(true) => self.evicted += 1,
+            Ok(false) => {}
+            Err(_) => self.faults += 1,
+        }
+    }
+
+    /// The counters this pass bumps (served from 0 in `read_counters`).
+    pub fn counter_deltas(&self) -> [(&'static str, u64); 3] {
+        [
+            (
+                crate::ops::COUNTER_ADMIT_FAST_CONFLICT_SCANNED,
+                self.scanned,
+            ),
+            (
+                crate::ops::COUNTER_ADMIT_FAST_CONFLICT_EVICTED,
+                self.evicted,
+            ),
+            (crate::ops::COUNTER_ADMIT_FAST_CONFLICT_FAULTS, self.faults),
+        ]
+    }
+}
+
+pub async fn confirmed_conflict_pass(
+    db: &D1Database,
+    woc_api_key: Option<&str>,
+) -> ConflictPassSummary {
+    let mut summary = ConflictPassSummary::default();
     #[derive(serde::Deserialize)]
     struct Candidate {
         txid: String,
@@ -1584,7 +1626,9 @@ pub async fn confirmed_conflict_pass(db: &D1Database, woc_api_key: Option<&str>)
         Ok(rows) => rows,
         Err(e) => {
             worker::console_log!("[conflict] candidate read failed: {e}");
-            return;
+            summary.faults += 1;
+            bump_conflict_counters(db, &summary).await;
+            return summary;
         }
     };
     let fetcher = crate::proof_fetcher::ChainProofFetcher::new(None)
@@ -1599,7 +1643,7 @@ pub async fn confirmed_conflict_pass(db: &D1Database, woc_api_key: Option<&str>)
         else {
             continue;
         };
-        if let Err(e) = converge_confirmed_conflict(
+        let result = converge_confirmed_conflict(
             db,
             &fetcher,
             &presence,
@@ -1607,13 +1651,22 @@ pub async fn confirmed_conflict_pass(db: &D1Database, woc_api_key: Option<&str>)
             &raw,
             worker::Date::now().as_millis(),
         )
-        .await
-        {
+        .await;
+        summary.note(&result);
+        if let Err(e) = result {
             worker::console_log!(
                 "[conflict] {} re-check failed, retried next pass: {e}",
                 row.txid
             );
         }
+    }
+    bump_conflict_counters(db, &summary).await;
+    summary
+}
+
+async fn bump_conflict_counters(db: &D1Database, summary: &ConflictPassSummary) {
+    for (name, delta) in summary.counter_deltas() {
+        crate::ops::bump_counter(db, name, delta).await;
     }
 }
 
@@ -1744,7 +1797,12 @@ pub async fn evidence_check(
         }
         _ => false,
     };
-    evidence_verdict(&look, bitails.map(crate::proof_fetcher::presence_bool), woc.map(crate::proof_fetcher::presence_bool), young)
+    evidence_verdict(
+        &look,
+        bitails.map(crate::proof_fetcher::presence_bool),
+        woc.map(crate::proof_fetcher::presence_bool),
+        young,
+    )
 }
 
 #[derive(serde::Deserialize)]

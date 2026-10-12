@@ -845,6 +845,23 @@ shadow move. Mempool competitors, unrelated bytes and courier faults evict
 nothing. Failed reads remain candidates for a later pass; this sampling gives
 no fixed convergence deadline. The fetcher has a separate 24-call budget.
 
+Stated (the E602 lens fold, 2026-10-12). The pending watch's and the refusal
+callback's evidence checks still read mempool presence as "a courier holds
+it" and KEEP a refused pot (the #214 belt): such a pot is evicted by the
+conflict pass after its competitor mines, not by the callback. The pass is
+counted from 0 (`admit_fast_conflict_scanned_total`,
+`admit_fast_conflict_evicted_total`, `admit_fast_conflict_faults_total`) and
+summarised on the retire-pass line (`conflict: scanned= evicted= faults=`);
+both callers pass the `WOC_API_KEY` secret (none is installed today). A
+courier-mined subject's watch cannot latch while Arcade stays terminal: its
+`network_seen` comes from the merkle bar or a later live SEEN; a witnessed
+accept latches at once and starts no watch. The courier's `blockheight` is
+trusted as the chain's word, unverified against chaintracks, for the #214
+admission and for a competitor's confirmation: an orphaned block's height
+admits or evicts once, and a MINED push reverses it. The race word applies
+to EVERY Arcade-terminal status, not only a conflict-shaped one: an aged,
+non-conflict REJECTED subject one node still holds is the 422.
+
 ## A faulted submit leaves one head (bsv-low #559, lens fold and three delta folds of 2026-10-07)
 
 `Engine::submit` inserts the admitted outputs BEFORE it deletes the stale
