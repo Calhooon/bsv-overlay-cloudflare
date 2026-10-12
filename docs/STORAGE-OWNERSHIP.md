@@ -203,3 +203,4 @@ A new table: its CREATE in `OVERLAY_MIGRATIONS`, its row in `storage-ownership.j
 | `hop_pot_links` | overlay-cloudflare | derived | no | App-layer identity lookup, source-write triggers. |
 | `pot_hop_seats` | overlay-cloudflare | derived | no | App-layer outpoint lookup, source-write triggers. |
 | `view_derivation_state` | overlay-cloudflare | derived | no | Guarded one-time legacy backfill. |
+| `tracker_backfill` | low-app-layer | re-askable | Bounded, resumed proof-only deploy cursor; a lost cursor restarts the pass. |

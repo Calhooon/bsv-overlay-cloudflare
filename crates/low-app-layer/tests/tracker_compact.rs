@@ -346,7 +346,9 @@ fn ns3_h2_main_fields_survive_tracker_decoration() {
         let mut batch = json!({"answers":{id.clone():before.clone()}});
         runtime::decorate(&mut batch, None, &Default::default());
         for value in [&subject, &batch["answers"][&id]] {
-            for (key, expected) in before.as_object().unwrap() { assert_eq!(&value[key], expected, "main key {key}"); }
+            for (key, expected) in before.as_object().unwrap() {
+                assert_eq!(&value[key], expected, "main key {key}");
+            }
             assert_eq!(value["tracker"]["word"], "unknown");
             assert!(value.get("word").is_none());
         }
@@ -355,55 +357,143 @@ fn ns3_h2_main_fields_survive_tracker_decoration() {
 
 #[test]
 fn ns3_h1_expired_memo_is_reasked_even_when_spender_is_tracked() {
-    use low_app_layer::hops_view::{ProbeMemo,ChainSpendProbe};
+    use low_app_layer::hops_view::{ChainSpendProbe, ProbeMemo};
     let db = rusqlite::Connection::open_in_memory().unwrap();
     db.execute_batch(stored::CREATE).unwrap();
     db.execute_batch("CREATE TABLE hop_chain_probes (outpoint TEXT,probedAtMs INTEGER,spent INTEGER,spendingTxid TEXT,spentConfirmed INTEGER); INSERT INTO hop_chain_probes VALUES ('P.0',640000,1,'R',0)").unwrap();
-    let row = Row::from_state(&State::new("R"),1000,None);
-    db.execute("INSERT INTO tx_words (txid,word,tier,updated_at) VALUES ('R','unknown','host',1000)",[]).unwrap();
-    let memo = db.query_row("SELECT * FROM hop_chain_probes",[],|r| Ok(ProbeMemo {outpoint:r.get(0)?,probed_at_ms:r.get(1)?,spent:r.get(2)?,spending_txid:r.get(3)?,spent_confirmed:r.get(4)?})).unwrap();
-    let (mut answers, ask) = runtime::spent_any_memo_plan(&[("P".into(),0)], &[memo], 1_000_000, &BTreeMap::from([("R".into(),row)]));
+    let row = Row::from_state(&State::new("R"), 1000, None);
+    db.execute(
+        "INSERT INTO tx_words (txid,word,tier,updated_at) VALUES ('R','unknown','host',1000)",
+        [],
+    )
+    .unwrap();
+    let memo = db
+        .query_row("SELECT * FROM hop_chain_probes", [], |r| {
+            Ok(ProbeMemo {
+                outpoint: r.get(0)?,
+                probed_at_ms: r.get(1)?,
+                spent: r.get(2)?,
+                spending_txid: r.get(3)?,
+                spent_confirmed: r.get(4)?,
+            })
+        })
+        .unwrap();
+    let (mut answers, ask) = runtime::spent_any_memo_plan(
+        &[("P".into(), 0)],
+        &[memo],
+        1_000_000,
+        &BTreeMap::from([("R".into(), row)]),
+    );
     let mut probes = 0;
-    for (id,vout) in ask { probes += 1; answers.push((id,vout,ChainSpendProbe {known:true,spent:Some(true),spending_txid:Some("S".into()),spent_confirmed:Some(true)})); }
-    assert_eq!(answers[0].2.spending_txid.as_deref(),Some("S"), "expired memo must serve PROBE spender S");
-    assert_eq!(answers[0].2.spent_confirmed,Some(true));
-    assert_eq!(probes,1);
+    for (id, vout) in ask {
+        probes += 1;
+        answers.push((
+            id,
+            vout,
+            ChainSpendProbe {
+                known: true,
+                spent: Some(true),
+                spending_txid: Some("S".into()),
+                spent_confirmed: Some(true),
+            },
+        ));
+    }
+    assert_eq!(
+        answers[0].2.spending_txid.as_deref(),
+        Some("S"),
+        "expired memo must serve PROBE spender S"
+    );
+    assert_eq!(answers[0].2.spent_confirmed, Some(true));
+    assert_eq!(probes, 1);
 }
 
 #[test]
 fn ns3_m1_woc_mempool_presence_is_never_broadcaster_seen() {
     let id = "01".repeat(32);
     let woc_200 = json!({"txid":id,"hash":id,"vin":[],"vout":[]});
-    assert_eq!(low_app_layer::txany::parse_woc_tx_claim(&woc_200,&id),Some(false));
+    assert_eq!(
+        low_app_layer::txany::parse_woc_tx_claim(&woc_200, &id),
+        Some(false)
+    );
     let mut s = State::new(&id);
-    let params = Params {age_threshold:60};
-    s.step(&params,&snapshot(&id),Input::Host(bsv_tracker::HostAction::Build)).unwrap();
+    let params = Params { age_threshold: 60 };
+    s.step(
+        &params,
+        &snapshot(&id),
+        Input::Host(bsv_tracker::HostAction::Build),
+    )
+    .unwrap();
     let legacy = json!({"present":true,"source":"external"});
-    let hint = runtime::courier_presence_hint(&legacy,123).unwrap();
-    s.step(&params,&snapshot(&id),Input::Hint(hint)).unwrap();
+    let hint = runtime::courier_presence_hint(&legacy, 123).unwrap();
+    s.step(&params, &snapshot(&id), Input::Hint(hint)).unwrap();
     let view = low_app_layer::tracker_host::served::fields(&s);
     assert_ne!(view["word"], "seen", "courier presence is a live-race hint");
-    assert_eq!(view["source"],"woc");
+    assert_eq!(view["source"], "woc");
     assert!(view["verifyPath"].is_null());
 }
 
 #[test]
 fn ns3_m2_backfill_page_is_bounded_resumed_and_certified() {
-    let db=rusqlite::Connection::open_in_memory().unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
     db.execute_batch(stored::BACKFILL_CREATE).unwrap();
     db.execute_batch("CREATE TABLE transactions(txid TEXT,beef BLOB,has_proof INTEGER); CREATE TABLE pot_beefs(txid TEXT,beef BLOB,has_proof INTEGER)").unwrap();
-    for n in 0..9 { db.execute("INSERT INTO transactions VALUES (?1,x'00',1)",[format!("{n:064x}")]).unwrap(); }
-    let mut after=String::new(); let mut count=0;
-    loop {
-        let rows:Vec<String>=db.prepare(stored::BACKFILL_PAGE).unwrap().query_map([&after],|r| r.get(0)).unwrap().map(Result::unwrap).collect();
-        assert!(rows.len()<=4);
-        let complete=rows.len()<4;
-        count+=rows.len();
-        if let Some(t)=rows.last(){after=t.clone();}
-        db.execute(stored::BACKFILL_SAVE,rusqlite::params![stored::BACKFILL_VERSION,after,complete]).unwrap();
-        after=db.query_row("SELECT cursor FROM tracker_backfill WHERE version=?1",[stored::BACKFILL_VERSION],|r|r.get(0)).unwrap();
-        if complete {break;}
+    for n in 0..9 {
+        db.execute(
+            "INSERT INTO transactions VALUES (?1,x'00',1)",
+            [format!("{n:064x}")],
+        )
+        .unwrap();
     }
-    assert_eq!(count,9);
-    assert_eq!(db.query_row("SELECT complete FROM tracker_backfill",[],|r|r.get::<_,bool>(0)).unwrap(),true);
+    let mut after = String::new();
+    let mut count = 0;
+    loop {
+        let rows: Vec<String> = db
+            .prepare(stored::BACKFILL_PAGE)
+            .unwrap()
+            .query_map([&after], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(rows.len() <= 4);
+        let complete = rows.len() < 4;
+        count += rows.len();
+        if let Some(t) = rows.last() {
+            after = t.clone();
+        }
+        db.execute(
+            stored::BACKFILL_SAVE,
+            rusqlite::params![stored::BACKFILL_VERSION, after, complete],
+        )
+        .unwrap();
+        after = db
+            .query_row(
+                "SELECT cursor FROM tracker_backfill WHERE version=?1",
+                [stored::BACKFILL_VERSION],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if complete {
+            break;
+        }
+    }
+    assert_eq!(count, 9);
+    assert_eq!(
+        db.query_row("SELECT complete FROM tracker_backfill", [], |r| r
+            .get::<_, bool>(0))
+            .unwrap(),
+        true
+    );
+}
+
+#[test]
+fn ns3_m3_hooks_never_buy_courier_ladders() {
+    for kind in [
+        "proof", "retire", "seen", "accepted", "submit", "callback", "fallback",
+    ] {
+        assert!(
+            !runtime::hook_may_reask(kind, true),
+            "{kind} must use its own evidence"
+        );
+    }
+    assert!(runtime::hook_may_reask("tick", true));
 }

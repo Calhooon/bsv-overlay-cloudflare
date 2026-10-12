@@ -160,13 +160,50 @@ fn ns3_banana_captured_tsc_root_reduces_through_sdk() {
 async fn ns3_m2_bracketed_snapshot_retries_once() {
     let calls = std::cell::Cell::new(0);
     let answer = retry_snapshot(|| {
-        let n = calls.get(); calls.set(n+1);
-        async move { if n == 0 { HeaderSnapshot {tip:Err(HeaderError("header snapshot changed".into())),headers:Default::default()} } else {snapshot()} }
-    }).await;
-    assert_eq!(calls.get(),2);
-    assert_eq!(answer.tip,Ok(10));
+        let n = calls.get();
+        calls.set(n + 1);
+        async move {
+            if n == 0 {
+                HeaderSnapshot {
+                    tip: Err(HeaderError("header snapshot changed".into())),
+                    headers: Default::default(),
+                }
+            } else {
+                snapshot()
+            }
+        }
+    })
+    .await;
+    assert_eq!(calls.get(), 2);
+    assert_eq!(answer.tip, Ok(10));
     calls.set(0);
-    let answer = retry_snapshot(|| { calls.set(calls.get()+1); async {HeaderSnapshot {tip:Err(HeaderError("transport".into())),headers:Default::default()}} }).await;
-    assert_eq!(calls.get(),2);
+    let answer = retry_snapshot(|| {
+        calls.set(calls.get() + 1);
+        async {
+            HeaderSnapshot {
+                tip: Err(HeaderError("transport".into())),
+                headers: Default::default(),
+            }
+        }
+    })
+    .await;
+    assert_eq!(calls.get(), 2);
     assert!(answer.tip.is_err());
+}
+
+#[test]
+fn ns3_m3_courier_rotation_and_three_fault_circuit() {
+    let mut p = low_app_layer::tracker_host::pacing::Pacing::default();
+    p.begin_tick(1);
+    assert_eq!(p.order(), [0, 1, 2]);
+    assert_eq!(p.order(), [1, 2, 0]);
+    for _ in 0..3 {
+        p.fault(1);
+    }
+    assert!(!p.allowed(1));
+    assert!(p.allowed(0));
+    p.begin_tick(1);
+    assert!(!p.allowed(1));
+    p.begin_tick(2);
+    assert!(p.allowed(1));
 }
