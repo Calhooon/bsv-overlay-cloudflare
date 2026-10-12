@@ -32,6 +32,9 @@ fn opponent(i: u32) -> String {
     format!("03{i:064x}")
 }
 
+#[path = "../tests/support/d1_fleet.rs"]
+mod d1_fleet;
+
 fn main() {
     let conn = Connection::open_in_memory().expect("open in-memory sqlite");
     for sql in OVERLAY_MIGRATIONS {
@@ -77,6 +80,7 @@ fn main() {
         let stranger = format!("02{i:064x}");
         pot('c', &stranger, i);
     }
+    rows.extend(d1_fleet::rows(now_s));
     rows.extend(l23_r2_route_rows(now_s));
     for r in &rows {
         conn.execute(r, []).unwrap_or_else(|e| panic!("the fixture row is refused by the production schema: {e}\n{r}"));
