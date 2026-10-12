@@ -6801,38 +6801,7 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         .filter_map(|m| m.spending_txid.clone())
         .collect();
     let mut stored_words = crate::tracker_host::stored::read(&ctx.env, &ids).await?;
-    let (mut memo_answers, _) = crate::hops_view::split_probe_targets(
-        &probe_targets,
-        &memos,
-        now_ms,
-        crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
-    );
-    // A pointer whose subject is already tracked needs no courier reread.
-    // The current chain word is rechecked below, independently of this
-    // retained legacy outpoint memo's confirmation flag.
-    for (txid, vout) in &probe_targets {
-        if memo_answers.iter().any(|(t, v, _)| t == txid && v == vout) {
-            continue;
-        }
-        if let Some(m) = memos.iter().find(|m| {
-            m.outpoint == format!("{txid}.{vout}")
-                && m.spent
-                && m.spending_txid
-                    .as_ref()
-                    .is_some_and(|id| stored_words.contains_key(id))
-        }) {
-            memo_answers.push((
-                txid.clone(),
-                *vout,
-                crate::hops_view::ChainSpendProbe {
-                    known: true,
-                    spent: Some(true),
-                    spending_txid: m.spending_txid.clone(),
-                    spent_confirmed: m.spent_confirmed,
-                },
-            ));
-        }
-    }
+    let (memo_answers, _) = crate::tracker_host::runtime::spent_any_memo_plan(&probe_targets, &memos, now_ms, &stored_words);
     let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
     let mut terminals = Vec::with_capacity(outpoints.len());
     for op in &outpoints {
