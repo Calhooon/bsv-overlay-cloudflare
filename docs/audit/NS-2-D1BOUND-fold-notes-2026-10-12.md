@@ -103,3 +103,11 @@ any merge; merge is a later lane's. Logs are retained in
 The delta lens is LAND. On main `17418b1`, keep its seven migration statements first, followed by the branch's twenty-two; total 218. Register names are `derived_hops::HOP_INSERT` through `PARTY_DELETE`, `LINKS_BACKFILL`, `SEATS_BACKFILL`, and `STATE_DONE` (positions at this merge: 207–215, 216–217, 218). A stamped backfill puts its guard in the OUTER derived table before CROSS JOIN; the populated pin proves zero fleet-scan steps and D1 measures 1 + 1 = 2 rows. The conditional tx-any `terminal` follows main's `tier`, `hintSource`, and `observedAtMs`.
 
 D1BD-L2 remains owed: the route's initial combined page followed by `Cursor::start` is not replayed against the unpaged view by the fixture identity pin. No fold is requested here.
+
+## Merge gate record
+
+Rebase onto `17418b1` retained only the lens's named keep-both hunks. Main's appended fixture rows need SQLite replay rather than the branch's literal parser: seed RED (101, make 2), complete fixture/cursor GREEN (177 identical pages, max 160/287). The legacy marker-carry pin also counted the three derived INSERTs; excluding only `LINKS_BACKFILL`, `SEATS_BACKFILL`, `STATE_DONE` preserves its unexpected-carry guard (101→0; overlay suite 730 passed, one ignored).
+
+Merged `/owed` measures 331 reads, 18 writes, 30 statements; the 28-statement budget reds, then the measured 30 pin greens. Original #638 trade: 15,323→311 branch rows read, 331 merged. Results 256/287, served owed 18/26, recompute max 216, refund/recovery/backups 143/401/10. The complete settled-source budget exits 0 (306.6 s), route tier exits 0 (76 PASS, 152.9 s); one intermediate budget attempt exited 2 on a dead-letter timing assertion during a watched-worker rebuild, and the settled-source run passed that assertion.
+
+The first pushed four-check run at `98b3d3d` passed fmt/clippy/wasm32 but failed main's separate `ns2pd2_l1_owed_external_spender_skips_scope_statement` ceiling assertion (30 != 28). That assertion is aligned to the measured 30; its owed-scope behavior assertions remain unchanged. This companion ceiling pin reproduces RED locally (101) and is verified by the complete app suite after the correction. No merge on the red run.
