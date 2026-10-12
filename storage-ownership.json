@@ -1141,7 +1141,7 @@
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
    "writers": {},
-   "readers": [],
+   "readers": ["low-app-layer"],
    "rebuild_class": "lost",
    "never_wipe": true,
    "holds": "rows of `potparty_records` evicted by admit_fast, with af_evictedAt / af_reason",

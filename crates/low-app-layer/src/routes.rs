@@ -2780,7 +2780,7 @@ pub(crate) async fn owed_recompute(
         }
     };
     // 4a-0. loop 23's pair 13 (bsv-low #610): a hop the eviction RELEASED that the hops view does not hold (the seat's
-    //       best-effort `tm_hopparty` marker never landed) is rebuilt from the evicted JOIN itself: my own twin party
+    //       best-effort `tm_hopparty` marker never landed) is rebuilt out of the evicted transaction itself: my own twin party
     //       row of that JOIN (`sigValid = 1`, the settle key K), the twin lock committing K, and the JOIN's own stored
     //       BEEF showing the released output paying hash160(K) (`owed::markerless_released_hops`). Keyed on the UTXO
     //       the ledger names; bounded per recompute; a faulted read names nothing (the hop stays unseen this pass).
@@ -2875,9 +2875,9 @@ pub(crate) async fn owed_recompute(
                                 outputs.extend(crate::owed::hop_outputs_from_join_beef(&bytes, outpoints));
                             }
                         }
-                        Err(e) => console_warn!("[owed] evicted JOIN bytes read failed (a markerless released hop stays unseen this pass): {e}"),
+                        Err(e) => console_warn!("[owed] evicted transaction bytes read failed (a markerless released hop stays unseen this pass): {e}"),
                     },
-                    Err(e) => console_warn!("[owed] evicted JOIN bytes bind failed: {e}"),
+                    Err(e) => console_warn!("[owed] evicted transaction bytes bind failed: {e}"),
                 }
             }
             let rebuilt = crate::owed::markerless_released_hops(
@@ -2889,7 +2889,7 @@ pub(crate) async fn owed_recompute(
             );
             if !rebuilt.is_empty() {
                 worker::console_log!(
-                    "[owed] recompute for {}…: {} released hop(s) with no marker row rebuilt from the evicted JOIN",
+                    "[owed] recompute for {}…: {} released hop(s) with no marker row rebuilt out of the evicted transaction",
                     &identity_lc[..identity_lc.len().min(12)],
                     rebuilt.len()
                 );
