@@ -81,7 +81,7 @@ use crate::stream_sizing::{self, Admission, StreamCharges};
 /// a BUMP proves: its bucket in the proven set (33 bytes, as the index: 114).
 ///
 /// IN HAND, a raw transaction: the heavier of the stream's element (3 bytes a
-/// byte, 192 an input, 72 an output) and the walk's own view of it, which is
+/// byte, 192 an input, 96 an output) and the walk's own view of it, which is
 /// the layout (an input's place 56 bytes and an output's 24, growing buffers:
 /// 168 and 72) beside the digest view of an input that checks a signature
 /// (the scripts copied once for the view and twice for the interpreter, and a

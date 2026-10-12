@@ -813,12 +813,13 @@ mod tests {
         // a parent with its own absent ancestry would join the subject in
         // the front group and the trap would not spring). Since bsv-rs 0.4.1
         // a transaction has an input (NL-8 W6), so the parent spends a
-        // proven grandparent, itself a coinbase's null outpoint spender.
+        // proven regular grandparent. An unproven coinbase is now refused
+        // by the SDK byte checks before this subject-selection witness.
         let mut grandparent = Transaction::new();
         grandparent
             .add_input(bsv_rs::transaction::TransactionInput::new(
-                "00".repeat(32),
-                u32::MAX,
+                "22".repeat(32),
+                0,
             ))
             .unwrap();
         grandparent

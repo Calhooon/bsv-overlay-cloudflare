@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.2] - 2026-10-12
+
+- Charge the stream's 32-byte SDK `OutputRef` at 96 bytes per output including growing-buffer slack (was 72); the size-derived guard stays intact. Repair synthetic unproven-coinbase fixtures and refresh the exact lock-version snapshot without changing the Worker health shape or test assertions.
+
+- Extend the structure-only verdict match for SDK 0.5.0's contextual decline; this mode disables spend/context checks, so that variant is unreachable here. Byte-level mining checks remain enforced.
+
+- Align the two Workers on exact `bsv-middleware-cloudflare =0.6.0` (core 0.3.0), whose SDK requirement is 0.5.0; 0.5.1 requires SDK 0.4 and would leave two SDK types in the Workers lock.
+
+- Declare `bsv-rs = "0.5.0"` by caret in the published libraries. The update loop can deliver compatible SDK patches to consumers without another library release; deployables keep their exact pins and committed locks.
+- Resolve bsv-rs 0.5.0, including its streaming mining checks. Stored BEEF and old BSC1 cursors require the SDK's revalidation or restart rules; no stored-data migration is performed here.
+- Both shared workspace tables carry the caret and both locks pin the exact resolution: caret in the manifests, the lock the pin. The five published crates and their internal dependency floors move to 0.1.2.
+
 ## 0.1.1
 
 - [#17](https://github.com/Calhooon/bsv-overlay-cloudflare/pull/17): Replace four-crate parity claims with the published engine line and refresh the README.
