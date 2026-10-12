@@ -28,6 +28,7 @@
  * Exit 0 = every expectation held.
  */
 import { createHash, randomFillSync } from 'node:crypto'
+import { fundingCoinbase, provedBeefV1 } from '../fixtures/proven_beef.mjs'
 import { readFileSync } from 'node:fs'
 
 const BASE = process.argv[2] ?? 'http://127.0.0.1:8791'
@@ -63,16 +64,23 @@ const u64 = (n) => {
 }
 const sha256d = (buf) => createHash('sha256').update(createHash('sha256').update(buf).digest()).digest()
 
-/** Funded "parent" spending a coinbase's null outpoint (a transaction with no
- *  input is refused at the door since bsv-rs 0.4.1, NL-8 W6) (complete: nothing for the sort to miss). A
- *  random nonce output keeps each run's txid distinct (no dedupe). */
+// The funding source is mature at the anchor's synthetic block height.
+const FUNDING_PARENT = fundingCoinbase(5000)
+const FUNDING_ANCHOR = Buffer.concat([
+  u32(1), varint(1), sha256d(FUNDING_PARENT), u32(0), varint(0), u32(0xffffffff),
+  varint(1), u64(5000), Buffer.from([1, 0x51]), u32(0),
+])
+/** Unproven ordinary parent spending the two-leaf proven anchor.
+ * The census's gated comparison must retain an unproven ancestor: a single
+ * EF leg can admit pending on inconclusive couriers. A random nonce keeps
+ * each run's txid distinct (no dedupe). */
 function fundedParent() {
   const nonce = Buffer.alloc(8)
   randomFillSync(nonce)
   const nonceScript = Buffer.concat([Buffer.from([0x00, 0x6a]), Buffer.from([8]), nonce])
   return Buffer.concat([
     u32(1),
-    varint(1), Buffer.alloc(32), u32(0xffffffff), varint(0), u32(0xffffffff),
+    varint(1), sha256d(FUNDING_ANCHOR), u32(0), varint(0), u32(0xffffffff),
     varint(2),
     u64(5000), Buffer.from([1, 0x51]), // 5000 sats, OP_TRUE
     u64(0), varint(nonceScript.length), nonceScript,
@@ -87,7 +95,7 @@ function childOf(parentRaw) {
   return Buffer.concat([
     u32(1),
     varint(1),
-    prev, u32(0), varint(1), Buffer.from([0x00]), Buffer.from([0xff, 0xff, 0xff, 0xff]),
+    prev, u32(0), varint(0), Buffer.from([0xff, 0xff, 0xff, 0xff]),
     varint(1),
     u64(4900), Buffer.from([1, 0x52]),
     u32(0),
@@ -108,8 +116,11 @@ function junkInputTx() {
   ])
 }
 
-/** Proofless V1 BEEF over N raw txs (BEEF_V1 = 0xEFBE0001 → LE 01 00 BE EF). */
+/** Carry the proven anchor before the unproven parent and child. */
 function beefV1(...rawTxs) {
+  if (rawTxs[0].subarray(5, 37).equals(sha256d(FUNDING_ANCHOR))) {
+    return provedBeefV1([FUNDING_ANCHOR, ...rawTxs], FUNDING_PARENT)
+  }
   return Buffer.concat([
     Buffer.from([0x01, 0x00, 0xbe, 0xef]),
     varint(0), // nBUMPs

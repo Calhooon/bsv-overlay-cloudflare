@@ -1254,8 +1254,45 @@ async fn lane_p2pkh_spend(corrupt_signature: bool) -> SpendFixture {
         .public_key()
         .hash160();
     let lock = P2PKH::new().lock(&key.public_key().hash160()).unwrap();
-    let funding = proven_funding(lock, 10_000);
+    // Funding spends a synthetic coinbase from HEIGHT - 100. Its own block
+    // holds a different coinbase at leaf 0 and funding at leaf 1.
+    let mut parent = Transaction::new();
+    parent.inputs.push(TransactionInput {
+        source_txid: Some("00".repeat(32)),
+        source_output_index: u32::MAX,
+        unlocking_script: Some(UnlockingScript::from_script(
+            Script::from_binary(&[3, 0x9c, 0x34, 0x0c]).expect("height 799900 push"),
+        )),
+        ..Default::default()
+    });
+    parent.outputs.push(TransactionOutput::new(
+        10_000,
+        LockingScript::from_script(Script::from_binary(&[OP_TRUE]).unwrap()),
+    ));
+    let mut sibling = parent.clone();
+    sibling.inputs[0].unlocking_script = Some(UnlockingScript::from_script(
+        Script::from_binary(&[3, 0x00, 0x35, 0x0c]).expect("height 800000 push"),
+    ));
+    sibling.outputs[0].satoshis = Some(0);
+    let mut funding = Transaction::new();
+    funding.inputs.push(TransactionInput {
+        source_txid: Some(parent.id()),
+        source_output_index: 0,
+        unlocking_script: Some(UnlockingScript::from_script(Script::new())),
+        ..Default::default()
+    });
+    funding.outputs.push(TransactionOutput::new(10_000, lock));
     let funding_txid = funding.id();
+    funding.merkle_path = Some(
+        MerklePath::new(
+            HEIGHT,
+            vec![vec![
+                MerklePathLeaf::new(0, sibling.id()),
+                MerklePathLeaf::new_txid(1, funding_txid.clone()),
+            ]],
+        )
+        .expect("funding is leaf 1 beside its block coinbase"),
+    );
     let mut tx = Transaction::new();
     tx.add_input_from_tx(funding, 0, P2PKH::unlock(&key, SignOutputs::All, false))
         .unwrap();
@@ -1272,6 +1309,40 @@ async fn lane_p2pkh_spend(corrupt_signature: bool) -> SpendFixture {
         funding_txid,
         subject_txid: tx.id(),
     }
+}
+
+#[tokio::test]
+async fn lane_script_funding_has_a_two_leaf_header_root() {
+    let valid = lane_p2pkh_spend(false).await;
+    let beef = Beef::from_binary(&valid.beef).expect("the fixture parses");
+    let bump = &beef.bumps[0];
+    assert_eq!(bump.path[0].len(), 2);
+    assert_eq!(bump.path[0][1].offset, 1);
+    assert_eq!(
+        bump.path[0][1].hash.as_deref(),
+        Some(valid.funding_txid.as_str())
+    );
+    assert!(bump.path[0][1].txid);
+    let root = bump.compute_root(Some(&valid.funding_txid)).unwrap();
+    assert_ne!(
+        root, valid.funding_txid,
+        "funding is not its own block root"
+    );
+    let mut tracker = MockChainTracker::new(HEIGHT + 100);
+    tracker.add_root(HEIGHT, root);
+    let storage = Rc::new(MemoryStorage::new());
+    let engine = engine_with(Rc::clone(&storage), Some(Box::new(tracker)));
+    engine
+        .submit(&tagged(&valid), SubmitMode::CurrentTx)
+        .await
+        .expect("signed spend verifies against the two-leaf header root");
+    assert!(is_admitted(&storage, &valid.subject_txid).await);
+    let corrupted = lane_p2pkh_spend(true).await;
+    let err = engine
+        .submit(&tagged(&corrupted), SubmitMode::CurrentTx)
+        .await
+        .expect_err("signature corruption still fails with the same proven parent");
+    expect_script_error(&err);
 }
 
 #[tokio::test]

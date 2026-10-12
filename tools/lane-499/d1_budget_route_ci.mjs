@@ -32,6 +32,7 @@
  */
 import { assertBuildInfo } from '../assert-build-info.mjs'
 import { createHash, randomFillSync } from 'node:crypto'
+import { provedBeefV1, blockCoinbaseInput } from '../fixtures/proven_beef.mjs'
 import { readFileSync } from 'node:fs'
 
 const APP = process.argv[2] ?? 'http://127.0.0.1:8800'
@@ -99,22 +100,22 @@ const COLLECTED_MARKER = Buffer.from(
   '006a104c4f572f636f6c6c65637465642f76312011111111111111111111111111111111111111111111111111111111111111112102a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1473045ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab',
   'hex',
 )
-/** A transaction spending a coinbase's null outpoint (a transaction with no input is refused at the door since
- *  bsv-rs 0.4.1, NL-8 W6), with one collected marker (admitted) and a nonce output (a fresh txid per run). */
+/** A synthetic coinbase with one collected marker and a nonce output, proved by beefV1. */
 function collectedTx() {
   const nonce = Buffer.alloc(8)
   randomFillSync(nonce)
   const nonceScript = Buffer.concat([Buffer.from([0x00, 0x6a, 8]), nonce])
   return Buffer.concat([
     u32(1),
-    varint(1), Buffer.alloc(32), u32(0xffffffff), varint(0), u32(0xffffffff),
+    varint(1), blockCoinbaseInput(),
     varint(2),
     u64(0), varint(COLLECTED_MARKER.length), COLLECTED_MARKER,
     u64(0), varint(nonceScript.length), nonceScript,
     u32(0),
   ])
 }
-const beefV1 = (raw) => Buffer.concat([Buffer.from([0x01, 0x00, 0xbe, 0xef]), varint(0), varint(1), raw, Buffer.from([0x00])])
+// The marker is a coinbase in a one-transaction synthetic block.
+const beefV1 = (raw) => provedBeefV1([raw])
 const txidOf = (raw) => Buffer.from(sha256d(raw)).reverse().toString('hex')
 
 async function appHealth() {
