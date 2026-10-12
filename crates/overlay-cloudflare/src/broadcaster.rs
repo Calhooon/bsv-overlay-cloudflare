@@ -4221,6 +4221,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn arcreg_full_batch_source_registers_one_body_per_leg() {
+        let src = include_str!("broadcaster.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let f = &prod[prod.find("pub async fn broadcast_efs_gated").unwrap()..];
+        let f = &f[..f.find("async fn submit_once_and_gate(").unwrap()];
+        let code: String = f
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars().filter(|c| !c.is_whitespace()))
+            .collect();
+        let batch = &code[code.find("SubmitRung::FullBatch=>{").unwrap()..];
+        let batch = &batch[..batch.find("CorroborationKind::SubjectOnly").unwrap()];
+        assert!(
+            batch.contains("forleginfull_batch_legs(efs,subject_txid)"),
+            "per-leg full-batch dispatch"
+        );
+        assert!(
+            batch.contains("self.submit_ef(&self.tx_endpoint(),&leg.txid,&leg.ef,!known,"),
+            "ancestor body and callback token name the same leg at /tx"
+        );
+        assert!(batch.contains("self.submit_once_and_gate(&self.tx_endpoint(),&leg.ef,&leg.txid,1,ARCADE_WAIT_TIMEOUT_MS,register_callback,"),
+            "subject alone, with its existing registration guard");
+        assert!(
+            !batch.contains("concat_efs") && !batch.contains("txs_endpoint"),
+            "no registering /txs body"
+        );
+        assert!(batch.contains("self.tx_status(&leg.txid).await.is_some_and(|r|r.txid.eq_ignore_ascii_case(&leg.txid))"),
+            "each ancestor has its own register-once guard");
+        let post = &prod[prod.find("async fn post_ef_raw(").unwrap()..];
+        assert!(post.contains("headers.set(\"X-CallbackToken\", token)"));
+        assert!(post.contains("headers.set(\"X-CallbackUrl\", cb)"));
+    }
+
     /// SOURCE PIN (#519, the gate's LOW-1): the production ladder's terminal branch judges by the indexers BEFORE any
     /// rung and never through a corroborator — the ordering inside `broadcast_efs_gated`, the branch's own text
     /// free of every corroborator and rung name, and the mined-claim dispatch (an all-proven BEEF) after the return

@@ -19,7 +19,8 @@
  *     ACCEPTED — 200, with the status-callback acknowledgement body, and the
  *     post-auth counter moves. A 404 (route not mounted) or a 400 (body died
  *     earlier) fails this leg, so the refusal legs below cannot pass vacuously.
- *  2. a WRONG bearer still 401s, and bumps `unauthorized_bad_token`;
+ *  2. a WRONG bearer still 401s, bumps `unauthorized_bad_token`, and logs
+ *     txid, pushed status and User-Agent without exposing the bearer;
  *  3. NO token at all still 401s, and bumps `unauthorized_no_token`;
  *  4. the legacy `X-CallbackToken` header form is still accepted (not traded
  *     away for the new one);
@@ -37,12 +38,16 @@
  *
  * Expects a wrangler-dev worker WITH TAAL_API_KEY set (the route is only
  * mounted when it is — `lib.rs`) on argv[2], default :8794.
+ * argv[3] is the current run's wrangler-dev log, required for refusal assertions.
  *
  * Exit 0 = every expectation held.
  */
 import { randomBytes } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 
 const BASE = process.argv[2] ?? 'http://127.0.0.1:8794'
+const WORKER_LOG = process.argv[3]
+if (!WORKER_LOG) throw new Error('argv[3] must name the current worker run wrangler-dev log')
 
 const C_PUSHED = 'arc_ingest_pushed_total'
 const C_STATUS = 'arc_ingest_status_ignored_total'
@@ -113,10 +118,13 @@ async function awaitCounters(before, name) {
  * status, assert `wantCounter` moved, and assert NO OTHER arc-ingest counter
  * moved (the Rule 13 distinctness that did not exist before this fix).
  */
-async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, wantCounter }) {
+async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, wantCounter,
+  txStatus = 'SEEN_ON_NETWORK', refusedToken }) {
   const before = await counters()
   assertCountersServed(before)
-  const res = await postIngest({ txid, txStatus: 'SEEN_ON_NETWORK' }, headers)
+  const logStart = readFileSync(WORKER_LOG, 'utf8').length
+  const ua = `arcreg-ci/640-${newTxid()}`
+  const res = await postIngest({ txid, txStatus }, { ...headers, 'User-Agent': ua })
   if (res.status !== wantStatus) {
     fail(label, `expected HTTP ${wantStatus}, got ${res.status}: ${res.text.slice(0, 200)}`)
     return
@@ -134,6 +142,26 @@ async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, want
     const delta = (got.after[other] ?? 0) - (before[other] ?? 0)
     if (delta > 0) {
       fail(label, `counter ${other} ALSO moved by ${delta} — the outcomes are not distinct`)
+      return
+    }
+  }
+  if (wantStatus === 401) {
+    let delta = ''
+    let line
+    for (let i = 0; i < 10; i++) {
+      delta = readFileSync(WORKER_LOG, 'utf8').slice(logStart)
+      line = delta.split('\n').find((l) => l.includes('POST /arc-ingest txid=') && l.includes(ua))
+      if (line) break
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    if (!line || !line.includes(`txid=${JSON.stringify(txid)}`)
+      || !line.includes(`txStatus=${JSON.stringify(txStatus)}`)
+      || !line.includes(`ua=${JSON.stringify(ua)}`) || !line.includes('-> 401 (')) {
+      fail(label, 'refusal log must name the pushed txid, status and User-Agent on one 401 line')
+      return
+    }
+    if (refusedToken && delta.includes(refusedToken)) {
+      fail(label, 'refusal log exposed the bearer value')
       return
     }
   }
@@ -159,6 +187,21 @@ async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, want
   })
 }
 
+// #640: an ancestor's MINED delivery authenticates with that ancestor's txid.
+// No proof is supplied here: this cell pins the HTTP auth gate only.
+{
+  const ancestor = newTxid()
+  await expectIngest({
+    label: 'ancestor MINED push under its own txid bearer is ACCEPTED (200)',
+    headers: { Authorization: `Bearer ${ancestor}` },
+    txid: ancestor,
+    txStatus: 'MINED',
+    wantStatus: 200,
+    wantBodyRe: /Status update acknowledged/,
+    wantCounter: C_STATUS,
+  })
+}
+
 // RFC 7235: the scheme is case-insensitive on the wire.
 {
   const txid = newTxid()
@@ -175,9 +218,12 @@ async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, want
 // ── 2. Nothing else was weakened: a WRONG bearer is still refused ───────────
 {
   const txid = newTxid()
+  const wrong = newTxid()
   await expectIngest({
     label: 'Authorization: Bearer <WRONG token> → 401 + unauthorized_bad_token',
-    headers: { Authorization: `Bearer ${newTxid()}` },
+    headers: { Authorization: `Bearer ${wrong}` },
+    refusedToken: wrong,
+    txStatus: 'MINED',
     txid,
     wantStatus: 401,
     wantBodyRe: /Unauthorized/,
