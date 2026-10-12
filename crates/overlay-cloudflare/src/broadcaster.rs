@@ -1346,14 +1346,12 @@ fn reached_submit_echo(fast_answer: bool) -> GateStep {
 /// A stamped stored echo must be younger than the freshness bound and the
 /// eviction it would restore. An unstamped echo cannot restore an eviction.
 fn submit_echo_is_fresh(stamp: Option<&str>, now_ms: i64, evicted_at_ms: Option<i64>) -> bool {
-    let Some(stamp) = stamp else {
-        return evicted_at_ms.is_none();
+    let Some(evicted) = evicted_at_ms else {
+        return true;
     };
-    crate::proof_fetcher::rfc3339_utc_ms(stamp).is_some_and(|at| {
-        at <= now_ms + 60_000
-            && now_ms - at < 30 * 60_000
-            && evicted_at_ms.is_none_or(|evicted| at > evicted)
-    })
+    let Some(stamp) = stamp else { return false };
+    crate::proof_fetcher::rfc3339_utc_ms(stamp)
+        .is_some_and(|at| at <= now_ms + 60_000 && now_ms - at < 30 * 60_000 && at > evicted)
 }
 
 /// Classify one Arcade submit HTTP response (#213). PURE — unit-tested.
@@ -4716,10 +4714,24 @@ mod tests {
         assert!(!submit_echo_is_fresh(
             Some("2026-10-12T17:00:00Z"),
             now,
+            Some(now - 5_000_000)
+        ));
+        assert!(!submit_echo_is_fresh(Some("bad"), now, Some(now - 1)));
+        assert!(submit_echo_is_fresh(None, now, None));
+    }
+
+    #[test]
+    fn ns2pd_l1_old_echo_without_eviction_is_an_idempotent_ack() {
+        let now = crate::proof_fetcher::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
+        assert!(submit_echo_is_fresh(
+            Some("2026-10-12T17:00:00Z"),
+            now,
             None
         ));
-        assert!(!submit_echo_is_fresh(Some("bad"), now, None));
-        assert!(submit_echo_is_fresh(None, now, None));
+        assert_eq!(
+            ladder_step(reached_submit_echo(true), "subject"),
+            Ladder::Return(ArcOutcome::AcceptedPending("subject".into()))
+        );
     }
 
     #[test]
