@@ -30,7 +30,7 @@ const FRESH_MS: u64 = 10_000;
 
 #[durable_object]
 pub struct BoardView {
-    _state: State,
+    state: State,
     env: Env,
     /// limit-key (0 = default) → (body json, computed-at ms).
     /// `Rc` so DETACHED compute tasks (spawn_local) can write it after the
@@ -47,7 +47,7 @@ pub struct BoardView {
 impl DurableObject for BoardView {
     fn new(state: State, env: Env) -> Self {
         Self {
-            _state: state,
+            state,
             env,
             cache: Rc::new(RefCell::new(HashMap::new())),
             computed: Rc::new(RefCell::new(HashMap::new())),
@@ -57,6 +57,22 @@ impl DurableObject for BoardView {
 
     async fn fetch(&self, req: Request) -> Result<Response> {
         let url = req.url()?;
+        // Separate object names from the board/results actors; no cache or polling path reaches this arm.
+        if req.path() == "/owed-deferred" {
+            let identity = url.query_pairs().find(|(k, _)| k == "identity").map(|(_, v)| v.to_string()).unwrap_or_default();
+            let due = url.query_pairs().find(|(k, _)| k == "due").and_then(|(_, v)| v.parse::<i64>().ok()).unwrap_or(0);
+            if !crate::logic::valid_identity(&identity) || due <= 0 { return Response::error("invalid owed alarm", 400); }
+            let storage = self.state.storage();
+            if storage.get::<bool>("owed-started").await?.unwrap_or(false) { return Response::ok("already run"); }
+            if storage.get::<String>("owed-identity").await?.is_none() {
+                storage.put("owed-identity", identity).await?;
+                storage.put("owed-due", due).await?;
+            }
+            if storage.get_alarm().await?.is_none() {
+                storage.set_alarm((due - Date::now().as_millis() as i64).max(0)).await?;
+            }
+            return Response::ok("armed");
+        }
         // S3 second iteration: ONE actor class, two view kinds. `/results`
         // instances are NAMED `results:<identity>` (the route resolves the
         // identity at the #318 seam and the name pins the scope); the board
@@ -94,6 +110,15 @@ impl DurableObject for BoardView {
             }
         })
         .await
+    }
+    async fn alarm(&self) -> Result<Response> {
+        let storage = self.state.storage();
+        if storage.get::<bool>("owed-started").await?.unwrap_or(false) { return Response::ok("already run"); }
+        let Some(identity) = storage.get::<String>("owed-identity").await? else { return Response::ok("no owed alarm"); };
+        // Claim durably BEFORE walking: an alarm retry must not buy another recompute past ceiling + one.
+        storage.put("owed-started", true).await?;
+        crate::routes::owed_deferred_walk_and_push(&self.env, &identity).await?;
+        Response::ok("owed refreshed")
     }
 }
 
