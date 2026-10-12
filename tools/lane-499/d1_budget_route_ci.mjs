@@ -173,9 +173,21 @@ const measured = {}
   if (r.status === 200 && row?.facts?.spendKind === 'spent-elsewhere' && row.facts.claim == null && row.facts.markerlessCandidates === 1)
     pass('L23R2 route-selection: captured ninth eviction, twin-only seat, planted marker, 25h story')
   else fail('L23R2 route-selection: captured ninth eviction, twin-only seat, planted marker, 25h story', r.text.slice(0, 2000))
+  const tally = segment(r.timing, 'd1')
+  if (tally && tally.reads <= 256) pass('L23R2-H1 captured read stays in the 256-read #499 class under twin noise')
+  else fail('L23R2-H1 captured read stays in the 256-read #499 class under twin noise', JSON.stringify(tally))
   const h = await appHealth()
   if (h.owed.markerlessIgnoredMarkers >= 1) pass('L23R2-M2 planted marker counted')
   else fail('L23R2-M2 planted marker counted', JSON.stringify(h.owed))
+}
+
+// M3 independently: the other captured identity has only permanent twin party rows, no hopparty row.
+{
+  const other = '030d9e9fbe045a8130f190b103609c8a6bf13b1887d5c4f15e2f918d68aca8ad67'
+  const r = await get(APP, `/owed?identity=${other}`)
+  const row = JSON.parse(r.text).rows?.find(r => r.outpoint === '9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62:0')
+  if (r.status === 200 && row?.facts?.markerlessCandidates === 1) pass('L23R2-M3 twin-only captured seat computes through owed route')
+  else fail('L23R2-M3 twin-only captured seat computes through owed route', `${r.status} ${r.text}`)
 }
 
 // L23R2-L2: a failed ancestor read is counted and served as "could not judge", never an empty 200.
