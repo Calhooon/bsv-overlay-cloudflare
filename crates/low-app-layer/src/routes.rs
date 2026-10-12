@@ -2812,7 +2812,7 @@ async fn owed_recompute_inner(
         }
     };
     // H1/M4: the ring is this identity's permanent twin/live evidence, not the global 24h window.
-    // L2: an evidence read fault aborts the compute, counted; it never writes a fresh empty answer.
+    // Transport faults on selection abort; per-candidate faults are counted rows and leave other families fresh.
     let markerless_fault = |e: String| {
         crate::owed::note_markerless_read_fault();
         format!("markerless evidence: could not judge: {e}")
@@ -2878,6 +2878,7 @@ async fn owed_recompute_inner(
         }
     }
     let mut markerless_rebuilt_keys = HashSet::new();
+    let mut markerless_fault_rows = Vec::new();
     {
         #[derive(Deserialize)]
         struct EvictedSeatD1 {
@@ -2926,67 +2927,82 @@ async fn owed_recompute_inner(
                 .collect();
             let mut twin_keys: Vec<(String, u32, crate::results::CommittedKeys)> = Vec::new();
             let mut outputs: HashMap<String, (Vec<u8>, u64)> = HashMap::new();
-            // L4: read the hop's own index first; the stored JOIN is parsed once below.
-            #[derive(Deserialize)]
-            struct HopIndexD1 {
-                spent: Option<f64>,
-                #[serde(rename = "spendingTxid")]
-                spending_txid: Option<String>,
-                #[serde(rename = "spentConfirmed")]
-                spent_confirmed: Option<f64>,
-            }
-            let mut hop_index = HashMap::new();
-            let index_targets: Vec<_> = unheld.iter().flat_map(|(_, points)| points).collect();
-            let index_count = index_targets
-                .len()
-                .min(crate::owed::OWED_MARKERLESS_INDEX_READS_PER_RECOMPUTE);
-            if index_targets.len() > index_count {
-                walk_cut = true;
-                console_warn!("[owed] {} hop index word(s) deferred by the 256-read class; their rows remain could-not-judge until the chain rung answers", index_targets.len() - index_count);
-            }
-            for (txid, vout) in index_targets.into_iter().take(index_count) {
-                let row = db.prepare("SELECT spent, spendingTxid, spentConfirmed FROM pot_records WHERE txid = ?1 AND outputIndex = ?2")
-                    .bind(&[JsValue::from_str(txid), JsValue::from_f64(f64::from(*vout))])
-                    .map_err(|e| markerless_fault(e.to_string()))?.counted_first::<HopIndexD1>()
-                    .await.map_err(|e| markerless_fault(e.to_string()))?;
-                if let Some(row) = row {
-                    hop_index.insert(outpoint_key(txid, *vout), row);
+            struct Reads<'a>(&'a worker::D1Database);
+            impl crate::owed::MarkerlessEvidenceReads for Reads<'_> {
+                async fn index(
+                    &mut self,
+                    txid: &str,
+                    vout: u32,
+                ) -> Result<Option<crate::owed::MarkerlessIndex>, String> {
+                    self.0.prepare("SELECT spent, spendingTxid, spentConfirmed FROM pot_records WHERE txid = ?1 AND outputIndex = ?2")
+                        .bind(&[JsValue::from_str(txid), JsValue::from_f64(f64::from(vout))])
+                        .map_err(|e| e.to_string())?.counted_first().await.map_err(|e| e.to_string())
+                }
+                async fn keys(
+                    &mut self,
+                    join: &str,
+                ) -> Result<Vec<(String, u32, crate::results::CommittedKeys)>, String>
+                {
+                    let rows = self
+                        .0
+                        .prepare(crate::owed::MARKERLESS_KEYS_SQL)
+                        .bind(&[JsValue::from_str(join)])
+                        .map_err(|e| e.to_string())?
+                        .counted_all()
+                        .await
+                        .and_then(|r| r.results::<EvictedKeysD1>())
+                        .map_err(|e| e.to_string())?;
+                    Ok(rows
+                        .into_iter()
+                        .filter_map(|r| {
+                            let keys = crate::results::CommittedKeys::from_columns(
+                                r.pub_a.as_deref(),
+                                r.pub_b.as_deref(),
+                                r.pay_pkh_a.as_deref(),
+                                r.pay_pkh_b.as_deref(),
+                            )?;
+                            Some((
+                                r.txid.to_ascii_lowercase(),
+                                u32::try_from(r.output_index as i64).ok()?,
+                                keys,
+                            ))
+                        })
+                        .collect())
+                }
+                async fn beef(&mut self, join: &str) -> Result<Option<Vec<u8>>, String> {
+                    let row = self
+                        .0
+                        .prepare(crate::owed::MARKERLESS_BEEF_SQL)
+                        .bind(&[JsValue::from_str(join)])
+                        .map_err(|e| e.to_string())?
+                        .counted_first::<BeefRow>()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)))
                 }
             }
+            let mut reads = Reads(db);
+            let mut hop_index = HashMap::new();
+            let mut index_budget = crate::owed::OWED_MARKERLESS_INDEX_READS_PER_RECOMPUTE;
             for (evicted, outpoints) in &unheld {
-                let rows = db
-                    .prepare(crate::owed::MARKERLESS_KEYS_SQL)
-                    .bind(&[JsValue::from_str(evicted)])
-                    .map_err(|e| markerless_fault(e.to_string()))?
-                    .counted_all()
-                    .await
-                    .and_then(|r| r.results::<EvictedKeysD1>())
-                    .map_err(|e| markerless_fault(e.to_string()))?;
-                twin_keys.extend(rows.into_iter().filter_map(|r| {
-                    let keys = crate::results::CommittedKeys::from_columns(
-                        r.pub_a.as_deref(),
-                        r.pub_b.as_deref(),
-                        r.pay_pkh_a.as_deref(),
-                        r.pay_pkh_b.as_deref(),
-                    )?;
-                    Some((
-                        r.txid.to_ascii_lowercase(),
-                        u32::try_from(r.output_index as i64).ok()?,
-                        keys,
-                    ))
-                }));
-                let row = db
-                    .prepare(crate::owed::MARKERLESS_BEEF_SQL)
-                    .bind(&[JsValue::from_str(evicted)])
-                    .map_err(|e| markerless_fault(e.to_string()))?
-                    .counted_first::<BeefRow>()
-                    .await
-                    .map_err(|e| markerless_fault(e.to_string()))?;
-                let bytes = row
-                    .and_then(|r| r.beef)
-                    .and_then(|h| decode_beef_hex(&h))
-                    .ok_or_else(|| markerless_fault("stored ancestor bytes unavailable".into()))?;
-                outputs.extend(crate::owed::hop_outputs_from_join_beef(&bytes, outpoints));
+                let candidate = selected
+                    .iter()
+                    .find(|r| r.txid == *evicted)
+                    .expect("selected ledger's JOIN");
+                let evidence = crate::owed::read_markerless_candidate(
+                    &mut reads,
+                    identity_lc,
+                    candidate,
+                    outpoints,
+                    &seats,
+                    &mut index_budget,
+                )
+                .await;
+                walk_cut |= !evidence.faults.is_empty();
+                markerless_fault_rows.extend(evidence.faults);
+                twin_keys.extend(evidence.keys);
+                outputs.extend(evidence.outputs);
+                hop_index.extend(evidence.index);
             }
             let mut rebuilt = crate::owed::markerless_released_hops(
                 &eviction_rows,
@@ -3710,6 +3726,12 @@ async fn owed_recompute_inner(
             r.facts["markerlessCursor"] = serde_json::json!(markerless_next);
         }
     }
+    for fault in &mut markerless_fault_rows {
+        fault.facts["markerlessCandidates"] = serde_json::json!(markerless_total);
+        fault.facts["markerlessExamined"] = serde_json::json!(selected.len());
+        fault.facts["markerlessCursor"] = serde_json::json!(markerless_next);
+    }
+    crate::owed::merge_markerless_faults(&mut rows, markerless_fault_rows);
     let current: HashSet<_> = rows.iter().map(|r| r.outpoint.clone()).collect();
     for mut r in markerless_previous {
         if !current.contains(&r.outpoint)

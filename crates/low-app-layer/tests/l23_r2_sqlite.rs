@@ -479,49 +479,7 @@ async fn l23_r2_captured_pair13_rows_rebuild_and_tell_spent_elsewhere() {
             assert!(e.to_string().contains("duplicate column"), "{e}");
         }
     }
-    // Captured D1 rows, including the original signatures and filed: txids, without synthesising their keys.
-    for (name, table) in [
-        ("evictions", "pot_evictions"),
-        ("parties", "potparty_records_evicted"),
-        ("locks", "pot_records_evicted"),
-        ("join_beef", "pot_beefs"),
-    ] {
-        let cols: Vec<String> = db
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .unwrap()
-            .query_map([], |r| r.get(1))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        for row in captured["rows"][name].as_array().unwrap() {
-            let fields: Vec<_> = row
-                .as_object()
-                .unwrap()
-                .iter()
-                .filter(|(k, _)| cols.contains(k))
-                .collect();
-            let binds: Vec<rusqlite::types::Value> = fields
-                .iter()
-                .map(|(k, v)| match v {
-                    Value::Null => rusqlite::types::Value::Null,
-                    Value::Number(n) => n.as_i64().unwrap().into(),
-                    Value::String(s) if k.as_str() == "beef" => hex::decode(s).unwrap().into(),
-                    Value::String(s) => s.clone().into(),
-                    _ => panic!("unexpected captured field"),
-                })
-                .collect();
-            let sql = format!(
-                "INSERT INTO {table} ({}) VALUES ({})",
-                fields
-                    .iter()
-                    .map(|(k, _)| format!("\"{k}\""))
-                    .collect::<Vec<_>>()
-                    .join(","),
-                vec!["?"; fields.len()].join(",")
-            );
-            db.execute(&sql, rusqlite::params_from_iter(binds)).unwrap();
-        }
-    }
+    load_captured(&db, &captured);
     let me = "02f9f80a92a92677d97fce5bb0a03d0321425b918868b3ef5773120d9cf5364e49";
     let hop = "97288e47d846066d59f0caa8a2bec22fd9040dd5af05f323c67cf010373ab064";
     let competitor = "57d8e2907420da08795e3146fb5bd05446a51ef2f870213775a074eccae73851";
@@ -655,4 +613,214 @@ fn l23_r2_faulted_rows_do_not_offer_a_press() {
         .as_deref()
         .unwrap()
         .contains("could not judge"));
+}
+
+fn load_captured(db: &Connection, captured: &serde_json::Value) {
+    use serde_json::Value;
+    // Captured D1 rows, including the original signatures and filed: txids, without synthesising their keys.
+    for (name, table) in [
+        ("evictions", "pot_evictions"),
+        ("parties", "potparty_records_evicted"),
+        ("locks", "pot_records_evicted"),
+        ("join_beef", "pot_beefs"),
+    ] {
+        let cols: Vec<String> = db
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for row in captured["rows"][name].as_array().unwrap() {
+            let fields: Vec<_> = row
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| cols.contains(k))
+                .collect();
+            let binds: Vec<rusqlite::types::Value> = fields
+                .iter()
+                .map(|(k, v)| match v {
+                    Value::Null => rusqlite::types::Value::Null,
+                    Value::Number(n) => n.as_i64().unwrap().into(),
+                    Value::String(s) if k.as_str() == "beef" => hex::decode(s).unwrap().into(),
+                    Value::String(s) => s.clone().into(),
+                    _ => panic!("unexpected captured field"),
+                })
+                .collect();
+            let sql = format!(
+                "INSERT INTO {table} ({}) VALUES ({})",
+                fields
+                    .iter()
+                    .map(|(k, _)| format!("\"{k}\""))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                vec!["?"; fields.len()].join(",")
+            );
+            db.execute(&sql, rusqlite::params_from_iter(binds)).unwrap();
+        }
+    }
+}
+
+struct EvidenceSqlite<'a> {
+    db: &'a Connection,
+    fail: Option<&'static str>,
+}
+impl MarkerlessEvidenceReads for EvidenceSqlite<'_> {
+    async fn index(&mut self, txid: &str, vout: u32) -> Result<Option<MarkerlessIndex>, String> {
+        if self.fail == Some("index") {
+            return Err("index transport fault".into());
+        }
+        self.db.query_row("SELECT spent, spendingTxid, spentConfirmed FROM pot_records WHERE txid=?1 AND outputIndex=?2",
+            rusqlite::params![txid,vout], |r| Ok(MarkerlessIndex {spent:r.get(0)?,spending_txid:r.get(1)?,spent_confirmed:r.get(2)?}))
+            .optional().map_err(|e| e.to_string())
+    }
+    async fn keys(
+        &mut self,
+        join: &str,
+    ) -> Result<Vec<(String, u32, low_app_layer::results::CommittedKeys)>, String> {
+        if self.fail == Some("keys") {
+            return Err("keys transport fault".into());
+        }
+        let mut stmt = self
+            .db
+            .prepare(MARKERLESS_KEYS_SQL)
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([join], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, u32>(1)?,
+                    low_app_layer::results::CommittedKeys::from_columns(
+                        r.get::<_, Option<String>>(2)?.as_deref(),
+                        r.get::<_, Option<String>>(3)?.as_deref(),
+                        r.get::<_, Option<String>>(4)?.as_deref(),
+                        r.get::<_, Option<String>>(5)?.as_deref(),
+                    )
+                    .unwrap(),
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string());
+        rows
+    }
+    async fn beef(&mut self, join: &str) -> Result<Option<Vec<u8>>, String> {
+        if self.fail == Some("beef") {
+            return Err("beef transport fault".into());
+        }
+        self.db
+            .query_row(MARKERLESS_BEEF_SQL, [join], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .map(|v| v.flatten().and_then(|v| hex::decode(v).ok()))
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[tokio::test]
+async fn l23_r2_delta_missing_beef_faults_one_candidate_and_keeps_other_rows() {
+    let db = Connection::open_in_memory().unwrap();
+    for sql in OVERLAY_MIGRATIONS {
+        if let Err(e) = db.execute_batch(sql) {
+            assert!(e.to_string().contains("duplicate column"), "{e}");
+        }
+    }
+    let captured: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/l23_r2_pair13_captured.json")).unwrap();
+    load_captured(&db, &captured);
+    let me = "02f9f80a92a92677d97fce5bb0a03d0321425b918868b3ef5773120d9cf5364e49";
+    let selected = markerless_plan(&read_candidates(&db, me, "")).0;
+    let candidate = &selected[0];
+    let ledger = vec![(candidate.txid.clone(), candidate.released_spends.clone())];
+    let points = unheld_released_by_eviction(&ledger, &[])[0].1.clone();
+    let seats = vec![EvictedSeat {
+        pot_txid: candidate.txid.clone(),
+        game_id: "game".into(),
+        opponent_identity: "opponent".into(),
+        seat_settle_pubkey: "038884be9dd2274f39f6a60a0d0a54ed3ca1aaf9bebdde62d0d48ebd5aafd1a5a9"
+            .into(),
+    }];
+    let mut reads = EvidenceSqlite {
+        db: &db,
+        fail: None,
+    };
+    let mut budget = OWED_MARKERLESS_INDEX_READS_PER_RECOMPUTE;
+    let healthy =
+        read_markerless_candidate(&mut reads, me, candidate, &points, &seats, &mut budget).await;
+    assert!(healthy.faults.is_empty());
+    assert_eq!(healthy.outputs.len(), points.len());
+    db.execute("DELETE FROM pot_beefs WHERE txid=?1", [&candidate.txid])
+        .unwrap();
+    for fail in [None, Some("keys"), Some("index"), Some("beef")] {
+        reads.fail = fail;
+        let faulty =
+            read_markerless_candidate(&mut reads, me, candidate, &points, &seats, &mut budget)
+                .await;
+        assert_eq!(
+            faulty.faults.len(),
+            points.len(),
+            "candidate absence must be served, never list death"
+        );
+        assert!(faulty.outputs.is_empty());
+        assert!(faulty.keys.is_empty());
+        assert!(faulty
+            .faults
+            .iter()
+            .all(|r| r.family == OwedFamily::Unbound && r.facts["claim"].is_null()));
+        if fail.is_none() {
+            assert!(faulty.faults[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("evidence-missing"));
+        }
+        // Other already-derived families remain fresh; a candidate fault contributes only its marked rows.
+        let mut rows = vec![OwedRow {
+            identity: me.into(),
+            outpoint: "other:0".into(),
+            family: OwedFamily::Payout,
+            game_id: "other".into(),
+            sats: Some(17),
+            opponent_identity: None,
+            at_height: None,
+            facts: serde_json::json!({"claim":"internalize"}),
+            reason: None,
+        }];
+        let mut same_outpoint = rows[0].clone();
+        same_outpoint.outpoint = faulty.faults[0].outpoint.clone();
+        let mut overlap = vec![same_outpoint.clone()];
+        merge_markerless_faults(&mut overlap, faulty.faults.clone());
+        assert_eq!(
+            overlap[0], same_outpoint,
+            "a candidate fault cannot mask an independently judged payout on the same UTXO"
+        );
+        let mut planted = same_outpoint;
+        planted.facts = serde_json::json!({"markerVerified":"unknown","claim":"sweep-hop"});
+        let mut unlatched = vec![planted];
+        merge_markerless_faults(&mut unlatched, faulty.faults.clone());
+        assert_eq!(unlatched[0].family, OwedFamily::Unbound);
+        assert!(
+            unlatched[0].facts["claim"].is_null(),
+            "an Unknown attestation cannot mask the current fault"
+        );
+        merge_markerless_faults(&mut rows, faulty.faults);
+        assert_eq!(rows.len(), 1 + points.len());
+        assert_eq!(rows[0].family, OwedFamily::Payout);
+        assert_eq!(rows[0].facts["claim"], "internalize");
+    }
+    reads.fail = None;
+    db.execute(
+        "INSERT INTO pot_beefs(txid,beef) VALUES (?1,x'00')",
+        [&candidate.txid],
+    )
+    .unwrap();
+    let faulty =
+        read_markerless_candidate(&mut reads, me, candidate, &points, &seats, &mut budget).await;
+    assert_eq!(
+        faulty.faults.len(),
+        points.len(),
+        "malformed bytes are the same candidate fault"
+    );
 }
