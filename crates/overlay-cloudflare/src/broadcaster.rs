@@ -2667,6 +2667,9 @@ impl ArcadeBroadcaster {
                         // #640: 32 ancestors per request, 256 per consumer run,
                         // nearest first; the rest keep the poll/courier backstop.
                         // Each /tx body carries only the leg named by its token.
+                        // The single-subject body enables the echoed-status short-circuit
+                        // here too: admit-fast Pending answers AcceptedPending; its
+                        // pending watch is armed by the route, with no SEEN poll.
                         let (answer, skipped) = register_full_batch_with(
                             efs, subject_txid, self.legs,
                             |leg| async move {
@@ -4981,6 +4984,70 @@ mod tests {
                 "no corroboration on the wire ({efs_len} leg(s))"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn arcreg_l1_rung_three_pending_echo_arms_the_watch() {
+        let rungs = std::cell::RefCell::new(Vec::new());
+        let corroborations = std::cell::Cell::new(0);
+        let out = broadcast_efs_gated_with(
+            81,
+            "subject",
+            |rung| {
+                rungs.borrow_mut().push(rung);
+                async move {
+                    match rung {
+                        SubmitRung::SubjectOnly { .. } => {
+                            Ok(GateStep::Orphan("missing parent".into()))
+                        }
+                        SubmitRung::FullBatch => {
+                            let echo: ArcadeStatusResponse =
+                                serde_json::from_str(r#"{"txid":"subject","txStatus":"RECEIVED"}"#)
+                                    .unwrap();
+                            assert_eq!(
+                                classify_arcade_status(&echo.tx_status),
+                                GateVerdict::Pending
+                            );
+                            Ok(GateStep::SyncAccepted)
+                        }
+                    }
+                }
+            },
+            |_| {
+                corroborations.set(corroborations.get() + 1);
+                async { Err("must not corroborate".into()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, ArcOutcome::AcceptedPending("subject".into()));
+        assert_eq!(
+            *rungs.borrow(),
+            vec![
+                SubmitRung::SubjectOnly { graced: true },
+                SubmitRung::FullBatch
+            ]
+        );
+        assert_eq!(corroborations.get(), 0);
+        // Production linkage: real subject transport carries one transaction;
+        // echo Pending fast-returns, then AcceptedPending arms the pending watch.
+        let src = include_str!("broadcaster.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let rung = &prod[prod.find("SubmitRung::FullBatch => {").unwrap()..];
+        let rung = &rung[..rung.find("CorroborationKind::SubjectOnly").unwrap()];
+        let compact: String = rung.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("&leg.txid,1,ARCADE_WAIT_TIMEOUT_MS,register_callback,"));
+        let gate = &prod[prod.find("async fn submit_once_and_gate(").unwrap()..];
+        let pending = &gate[gate.find("GateVerdict::Pending =>").unwrap()..];
+        let pending = &pending[..pending.find("self.poll_for_status(").unwrap()];
+        assert!(
+            pending.contains("if self.fast_answer")
+                && pending.contains("return Ok(GateStep::SyncAccepted)")
+        );
+        let routes = include_str!("routes.rs");
+        let arm = &routes[routes.find("ArcOutcome::AcceptedPending(pending)").unwrap()..];
+        let arm = &arm[..arm.find("ArcOutcome::Rejected").unwrap()];
+        assert!(arm.contains("wait_until(crate::admit_fast::pending_watch_job("));
     }
 
     #[test]
