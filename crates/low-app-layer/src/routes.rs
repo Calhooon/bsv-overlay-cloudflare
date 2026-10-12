@@ -3764,7 +3764,24 @@ async fn owed_recompute_inner(
     if held_key_mismatches > 0 {
         console_warn!("[owed] {held_key_mismatches} collected row(s) carry a payTxid their key was not filed for (they retire nothing)");
     }
+    let mut word_ids = std::collections::BTreeSet::new();
+    word_ids.extend(results.iter().filter_map(|e| e.settle_txid.clone()));
+    word_ids.extend(hops.iter().filter_map(|h| h.spending_txid.clone()));
+    word_ids.extend(hop_chain.values().filter_map(|h| h.spending_txid.clone()));
+    word_ids.extend(hop_sweeps.values().map(|h| h.sweep_txid.clone()));
+    let word_ids: Vec<_> = word_ids.into_iter().collect();
+    let mut word_rows = crate::tracker_host::stored::read(env, &word_ids).await.map_err(|e| e.to_string())?;
+    for id in word_ids {
+        if !word_rows.contains_key(&id) {
+            let row = crate::tracker_host::runtime::event(env, &id, "fallback", None, None).await.map_err(|e| e.to_string())?;
+            word_rows.insert(id, row);
+        }
+    }
+    let spender_words = crate::tracker_host::runtime::views(env, &word_rows).await;
+    // The D3 SEEN + spenderFinal verdict-publication arm is deliberately
+    // retained in the results producer until the from-scratch lens rules it.
     let mut inputs = OwedInputs {
+        spender_words: Some(&spender_words),
         identity_lc,
         tip,
         now_ms,

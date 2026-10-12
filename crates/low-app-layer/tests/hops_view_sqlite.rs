@@ -1944,6 +1944,7 @@ fn issue_526_a_stranded_hop_with_a_hopparty_row_and_an_unspent_output_is_served_
     let no_door = HashMap::new();
     let derive = |chain: &HashMap<String, HopChainWord>, outs: &HashMap<String, Vec<SpenderOutput>>, courier: &HashSet<String>| {
         derive_owed_rows(&OwedInputs {
+            spender_words: None,
             identity_lc: &m.identity_hex,
             tip: Some(967_700),
             now_ms: READ_AT_MS,
@@ -2151,6 +2152,7 @@ mod door_refusals {
         let (no_refunds, no_set, no_sweeps, no_pkhs) = (HashMap::new(), HashSet::new(), HashMap::new(), HashMap::new());
         let (no_outs, no_ins, no_home) = (HashMap::new(), HashMap::new(), HashMap::new());
         let rows = derive_owed_rows(&OwedInputs {
+            spender_words: None,
             identity_lc: identity,
             tip: Some(967_700),
             now_ms,

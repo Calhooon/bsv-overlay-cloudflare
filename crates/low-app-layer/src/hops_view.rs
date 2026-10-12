@@ -2539,6 +2539,7 @@ mod tests {
         // lane/owed's two fields (bsv-low #486 the door's refusal ledger, #485 the home walk's words): none here
         let (no_door_refusals, no_home_words) = (HashMap::new(), HashMap::new());
         crate::owed::derive_owed_rows(&crate::owed::OwedInputs {
+            spender_words: None,
             identity_lc: me,
             tip: Some(900_000),
             now_ms,

@@ -121,7 +121,19 @@ fn fleet_served_bodies_are_byte_identical_before_and_after_derivation() {
                     .map(HopsViewRowD1::into_row)
                     .collect();
             let (hops, _) = crate::hops_view::assemble_hops_view(rows);
+            // The new judgement gets real tracker-produced hint words for
+            // the fixture's unconfirmed pointers, rather than legacy flags.
+            let mut words = std::collections::BTreeMap::new();
+            for id in hops.iter().filter_map(|h| h.spending_txid.as_ref()) {
+                let mut state = bsv_tracker::State::new(id);
+                let empty = crate::tracker_host::HeaderSnapshot {tip:Ok(0),headers:Default::default()};
+                let params = bsv_tracker::Params {age_threshold:60};
+                state.step(&params,&empty,bsv_tracker::Input::Host(bsv_tracker::HostAction::Build)).unwrap();
+                state.step(&params,&empty,bsv_tracker::Input::Hint(bsv_tracker::Hint::new("arcade",bsv_tracker::HintStatus::Seen,123))).unwrap();
+                words.insert(id.clone(),crate::tracker_host::served::fields(&state));
+            }
             let owed = crate::owed::derive_owed_rows(&crate::owed::OwedInputs {
+            spender_words: (!old).then_some(&words),
                 identity_lc: fleet::WHALE,
                 tip: Some(900_000),
                 now_ms: 1_790_000_000_000,
@@ -145,6 +157,11 @@ fn fleet_served_bodies_are_byte_identical_before_and_after_derivation() {
                 my_pkh_by_game: &Default::default(),
                 home_spends: &Default::default(),
             });
+            let mut owed = owed;
+            for row in &mut owed {
+                row.facts.as_object_mut().unwrap().remove("spenderWord");
+                row.facts.as_object_mut().unwrap().remove("coinWord");
+            }
             let owed_body = crate::owed::owed_body(
                 fleet::WHALE,
                 Some(900_000),
