@@ -872,6 +872,30 @@ pub fn markerless_plan(candidates: &[MarkerlessCandidate]) -> (Vec<MarkerlessCan
     )
 }
 
+/// A count is progress, never a cut. Only known unheld tail evidence makes the list incomplete.
+pub fn markerless_tail_unheld(
+    total: usize,
+    examined: usize,
+    rebuilt: usize,
+    carried: usize,
+    ring_complete: bool,
+) -> bool {
+    total > examined && (carried > 0 || (rebuilt > 0 && !ring_complete))
+}
+
+/// Completion belongs to this ring's candidate count; a changed count restarts its coverage word.
+pub fn markerless_ring_complete(
+    previous: &str,
+    cursor: &str,
+    selected: &[MarkerlessCandidate],
+    total: usize,
+) -> bool {
+    let held = serde_json::from_str::<Value>(previous).unwrap_or(Value::Null);
+    total <= selected.len()
+        || (held["complete"] == true && held["candidates"].as_u64() == Some(total as u64))
+        || (!cursor.is_empty() && selected.iter().any(|r| r.txid.as_str() <= cursor))
+}
+
 /// Per-JOIN evidence reads shared by the Worker and the real-SQLite pins.
 #[allow(async_fn_in_trait)]
 pub trait MarkerlessEvidenceReads {
