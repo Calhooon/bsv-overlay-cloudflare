@@ -14,26 +14,17 @@
 //!      (historical-tx / GASP sync / peer crawl) are ungated by design, so
 //!      the PRESENCE question falls through to the external leg alongside
 //!      the confirmation question — the raw is still served either way.
-//!   2. **Break-glass external leg (Arcade, then couriers, server-side).** For
-//!      txids the index has never seen: legacy pre-overlay-era txs (the
-//!      2026-07-21 incident class) and foreign txs. The trust bars of the
-//!      client code this replaces are preserved server-side:
-//!        - A courier's POSITIVE needs raw bytes hash-verified against the
-//!          txid. First-party presence is a hint even if couriers have no
-//!          bytes; any raw served beside it is still hash checked;
-//!        - `confirmed` carries WoC's `confirmations >= 1` claim — the exact
-//!          trust the client's `wocTxConfirmed` placed in a direct WoC read;
-//!        - `claimedHeight` (bsv-low #527, 2026-09-21) carries WoC's `blockheight` beside a CONFIRMED external
-//!          answer as a claim, never a proof: DISPLAY-TIER dating of a tx the index no longer holds (a closed
-//!          table advert against the written-off era); `height` stays the chaintracks-verified word;
-//!        - Arcade is FIRST for an unmined subject, including an index miss.
-//!          Its fresh SEEN or ACCEPTED word is a presence hint; MINED needs
-//!          its proof checked against our headers before confirmation.
-//!        - NEGATIVE needs Arcade and WoC definitive 404s behind healthy
-//!          routes. Bitails is pruned: its unmined 404 is "could not look".
-//!          A known-mined anchor cannot prove that Bitails sees the mempool;
-//!        - anything else is the honest unknown (`present: null`) — the
-//!          callers' fail-safe "unknown ⇒ retry, never a conclusion".
+//!   2. **First-party presence for OUR subjects only.** Held bytes or a
+//!      local submit record permit Arcade GET /tx. Its fresh SEEN is a hint;
+//!      MINED/IMMUTABLE need a subject- and height-bound canonical proof.
+//!   3. **Foreign subjects go to couriers.** A mined foreign transaction
+//!      needs a merkle proof checked against our headers. An unmined one
+//!      is hearsay: tier=hint, hintSource and observedAtMs, present:null.
+//!      Hash-verified raw may accompany either; raw never establishes mining.
+//!      WoC's node is one capable mempool source; BananaBlocks is the
+//!      convention's unprobed second candidate. Bitails is pruned; Arcade
+//!      only knows submitted bytes. One capable source means UNKNOWN,
+//!      counted, with no request-time Absent memo. Faults are always unknown.
 //!
 //! Wire body: `{"txid","present","confirmed","height","rawHex","source"}`
 //! where `source` is `"index"` / `"index+external"` / `"external"` / `"memo"` (bsv-low #451: the durable
@@ -158,6 +149,68 @@ pub fn parse_arcade_subject_word(status: u16, body: &[u8], txid: &str, now_ms: i
         .unwrap_or(ArcadeWord::Unknown)
 }
 
+/// A mined claim becomes evidence only for this subject, this height and
+/// the canonical header root. The BUMP's own height must agree as well.
+pub fn mined_proof_matches(txid: &str, bump_hex: &str, height: u64, canonical: &str) -> bool {
+    overlay_engine::beef_limits::merkle_path_from_hex(
+        bump_hex,
+        overlay_engine::beef_limits::COURIER_PROOF_MAX_BYTES,
+    )
+    .ok()
+    .filter(|mp| {
+        u64::from(mp.block_height) == height
+            && mp.path.first().is_some_and(|leaves| {
+                leaves.iter().any(|leaf| {
+                    leaf.txid
+                        && leaf
+                            .hash
+                            .as_deref()
+                            .is_some_and(|id| id.eq_ignore_ascii_case(txid))
+                })
+            })
+    })
+    .and_then(|mp| mp.compute_root(Some(txid)).ok())
+    .is_some_and(|root| root.eq_ignore_ascii_case(canonical))
+}
+
+/// WoC's documented TSC courier shape, converted to a BUMP before binding.
+pub fn courier_tsc_bump(body: &[u8], height: u64) -> Option<String> {
+    use bsv_rs::transaction::{MerklePath, MerklePathLeaf};
+    if body.len() > overlay_engine::beef_limits::COURIER_PROOF_MAX_BYTES {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let v = if v.is_array() { v.get(0)? } else { &v };
+    let txid = v.get("txOrId")?.as_str()?;
+    if txid.len() != 64 || hex::decode(txid).is_err() {
+        return None;
+    }
+    let mut offset = v.get("index")?.as_u64()?;
+    let mut path = Vec::new();
+    for (level, node) in v.get("nodes")?.as_array()?.iter().enumerate() {
+        let mut leaves = Vec::new();
+        if level == 0 {
+            leaves.push(MerklePathLeaf::new_txid(offset, txid.to_string()));
+        }
+        let sibling = offset ^ 1;
+        let node = node.as_str()?;
+        if node != "*" && (node.len() != 64 || hex::decode(node).is_err()) {
+            return None;
+        }
+        leaves.push(if node == "*" {
+            MerklePathLeaf::new_duplicate(sibling)
+        } else {
+            MerklePathLeaf::new(sibling, node.to_string())
+        });
+        leaves.sort_by_key(|leaf| leaf.offset);
+        path.push(leaves);
+        offset /= 2;
+    }
+    MerklePath::new(u32::try_from(height).ok()?, path)
+        .ok()
+        .map(|mp| mp.to_hex())
+}
+
 /// PURE: an RFC 3339 UTC instant (`YYYY-MM-DDTHH:MM:SS[.frac](Z|+00:00)`, the shape Arcade stamps) as ms since the
 /// epoch; anything else `None`. No calendar crate in this crate — the civil-days arithmetic is Howard Hinnant's.
 pub fn rfc3339_utc_ms(s: &str) -> Option<i64> {
@@ -246,13 +299,13 @@ pub struct VerdictMemo {
 }
 
 /// The kinds of negative a memo can hold. `Unconfirmable` = an input a DIFFERENT confirmed tx spent (the subject can
-/// never confirm); `Absent` = request-time Arcade and WoC absence, with both routes healthy; `Refused` = Arcade's terminal refusal corroborated by both indexers' absence. Every kind answers
+/// never confirm); `Absent` = legacy request-time absence (unsafe generations retired on read); `Refused` = Arcade's terminal refusal corroborated by both indexers' absence. Every kind answers
 /// `present: false`; only `Unconfirmable` sets the client's `unconfirmable` flag (the refund rebroadcast retirement
 /// reads it, and only an input conflict earns it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerdictKind {
     Unconfirmable,
-    /// Request-time Arcade and WoC absence for a tx the index never admitted. A young tx can
+    /// Legacy request-time absence; no new request-time writer. A young tx can
     /// double-404 for seconds, so this kind lives only `VERDICT_MEMO_MAX_AGE_MS` (the second gate's MEDIUM-3a).
     Absent,
     /// Arcade's terminal refusal corroborated by both indexers' absence — the eviction's or the retire pass's word.
@@ -317,7 +370,10 @@ pub const VERDICT_MEMO_MAX_AGE_MS: i64 = 5 * 60_000;
 pub fn verdict_memo_answers(memo: &VerdictMemo, txid: &str, now_ms: i64, max_age_ms: i64) -> bool {
     let age = now_ms - memo.verdict_at_ms;
     // Retire the old request-time false absence immediately after an upgrade.
-    if memo.kind == VerdictKind::Absent && memo.evidence.contains("woc 404 + bitails 404") {
+    if memo.kind == VerdictKind::Absent
+        && (memo.evidence.contains("woc 404 + bitails 404")
+            || memo.evidence.contains("arcade 404 + woc 404"))
+    {
         return false;
     }
     if memo.txid != txid.to_ascii_lowercase() || age < 0 {
@@ -364,6 +420,12 @@ pub enum TxObservation {
         confirmed: bool,
         raw_hex: Option<String>,
     },
+    /// Foreign unmined presence is hearsay with provenance, never a served fact.
+    CourierHint {
+        raw_hex: Option<String>,
+        source: &'static str,
+        observed_at_ms: i64,
+    },
     /// WoC definitive 404 — "this txid is not in my index".
     Absent,
     /// Transport / 5xx / rate-limit / malformed body.
@@ -374,8 +436,8 @@ pub enum TxObservation {
 /// provider's word — the #212/#213/#214 lesson).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbsenceCorroboration {
-    /// Arcade and WoC 404 for the txid, each behind a healthy route.
-    /// Bitails cannot corroborate absence of an unmined subject.
+    /// Two sources established capable of seeing this unmined subject.
+    /// No request-time writer currently has such evidence.
     CorroboratedAbsent,
     /// Anything else — fault, 200 (contradiction), rotten route.
     Unknown,
@@ -398,9 +460,9 @@ pub struct TxAnyAnswer {
     /// client treats `present` as network truth (a zombie orphan JOIN served
     /// present:true kept its bounded rebroadcasts alive forever).
     pub present: Option<bool>,
-    /// `Some(true)` = proven/claimed mined (index BUMP, or WoC
-    /// confirmations≥1); `Some(false)` = present but not yet confirmed per
-    /// the external leg; `None` = unknown.
+    /// `Some(true)` = mined by a canonical-header-checked proof;
+    /// `Some(false)` = our first-party presence without a mined proof;
+    /// `None` = unknown (including foreign unmined courier hints).
     pub confirmed: Option<bool>,
     /// The mined block height per a chaintracks-VERIFIED bump: the stored
     /// BEEF's (index leg), or — bsv-low #451 slice B — Arcade's MINED claim
@@ -429,6 +491,18 @@ pub struct TxAnyAnswer {
     /// keys on this field is a defect. `None` when no courier answered, the tx is unconfirmed, or the leg was not the
     /// couriers'.
     pub claimed_height: Option<u64>,
+    pub hint_source: Option<&'static str>,
+    pub observed_at_ms: Option<i64>,
+}
+
+/// Money/fact readers may use owned or proven bytes, never foreign hearsay.
+/// The public response retains the hash-checked hint bytes for display/retry.
+pub fn fact_reader_raw_hex(answer: &TxAnyAnswer) -> Option<&str> {
+    if answer.hint_source.is_some() {
+        None
+    } else {
+        answer.raw_hex.as_deref()
+    }
 }
 
 /// The pure `/tx-any` decision table (unit-tested; the route feeds it real
@@ -453,6 +527,8 @@ pub fn decide_tx_any(
                 source: Some("index"),
                 unconfirmable: false,
                 claimed_height: None,
+                hint_source: None,
+                observed_at_ms: None,
             };
         }
         // Stored bytes WITHOUT a BUMP (#247): the store proves we HOLD the
@@ -478,6 +554,8 @@ pub fn decide_tx_any(
                 source: Some("index+external"),
                 unconfirmable: false,
                 claimed_height: None,
+                hint_source: None,
+                observed_at_ms: None,
             },
             Some(TxObservation::Absent) if absence == AbsenceCorroboration::CorroboratedAbsent => {
                 TxAnyAnswer {
@@ -488,6 +566,8 @@ pub fn decide_tx_any(
                     source: Some("index+external"),
                     unconfirmable: false,
                     claimed_height: None,
+                    hint_source: None,
+                    observed_at_ms: None,
                 }
             }
             _ => TxAnyAnswer {
@@ -498,11 +578,24 @@ pub fn decide_tx_any(
                 source: Some("index"),
                 unconfirmable: false,
                 claimed_height: None,
+                hint_source: None,
+                observed_at_ms: None,
             },
         };
     }
     // Break-glass external leg (legacy / foreign txids only).
     match external {
+        Some(TxObservation::CourierHint {
+            raw_hex,
+            source,
+            observed_at_ms,
+        }) => TxAnyAnswer {
+            raw_hex: raw_hex.clone(),
+            hint_source: Some(source),
+            observed_at_ms: Some(*observed_at_ms),
+            source: Some("external"),
+            ..TxAnyAnswer::default()
+        },
         Some(TxObservation::FirstPartyPresent { confirmed, raw_hex }) => TxAnyAnswer {
             present: Some(true),
             confirmed: Some(*confirmed),
@@ -511,6 +604,8 @@ pub fn decide_tx_any(
             source: Some("external"),
             unconfirmable: false,
             claimed_height: None,
+            hint_source: None,
+            observed_at_ms: None,
         },
         Some(TxObservation::Present { confirmed, raw_hex }) => match raw_hex {
             // Positive presence ONLY with hash-verified bytes in hand — a
@@ -524,6 +619,8 @@ pub fn decide_tx_any(
                 source: Some("external"),
                 unconfirmable: false,
                 claimed_height: None,
+                hint_source: None,
+                observed_at_ms: None,
             },
             None => TxAnyAnswer::default(),
         },
@@ -536,6 +633,8 @@ pub fn decide_tx_any(
                 source: Some("external"),
                 unconfirmable: false,
                 claimed_height: None,
+                hint_source: None,
+                observed_at_ms: None,
             },
             AbsenceCorroboration::Unknown => TxAnyAnswer::default(),
         },
@@ -748,6 +847,10 @@ pub fn tx_any_value(txid: &str, a: &TxAnyAnswer) -> serde_json::Value {
         "source": a.source,
         "unconfirmable": a.unconfirmable,
         "claimedHeight": a.claimed_height,
+        "tier": if a.hint_source.is_some() { "hint" } else if a.height.is_some() { "proven" }
+            else if a.present == Some(true) { "first-party" } else { "unknown" },
+        "hintSource": a.hint_source,
+        "observedAtMs": a.observed_at_ms,
     })
 }
 
@@ -785,11 +888,39 @@ mod tests {
     /// bsv-low #451 slice C (iii): a verdict memo answers for its own txid inside the hour, never older, never
     /// from the future, never for another txid.
     #[test]
+    fn ns2_l4_proof_binding_checks_subject_root_and_height() {
+        use bsv_rs::transaction::{MerklePath, MerklePathLeaf};
+        let txid = "11".repeat(32);
+        let sibling = "22".repeat(32);
+        let mp = MerklePath::new(
+            970733,
+            vec![vec![
+                MerklePathLeaf::new_txid(0, txid.clone()),
+                MerklePathLeaf::new(1, sibling.clone()),
+            ]],
+        )
+        .unwrap();
+        let root = mp.compute_root(Some(&txid)).unwrap();
+        assert!(mined_proof_matches(&txid, &mp.to_hex(), 970733, &root));
+        assert!(!mined_proof_matches(&sibling, &mp.to_hex(), 970733, &root));
+        assert!(!mined_proof_matches(&txid, &mp.to_hex(), 970734, &root));
+        assert!(!mined_proof_matches(
+            &txid,
+            &mp.to_hex(),
+            970733,
+            &"33".repeat(32)
+        ));
+    }
+
+    #[test]
     fn ns2_l3_every_presence_word_is_in_tracker_vocabulary() {
-        let vocabulary: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/vectors/arcade_vocabulary.json")).unwrap();
+        let vocabulary: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/arcade_vocabulary.json")).unwrap();
         for word in ARCADE_SEEN_STATUSES {
-            assert!(vocabulary["words"].as_array().unwrap().contains(&json!(word)));
+            assert!(vocabulary["words"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(word)));
         }
         assert!(!ARCADE_SEEN_STATUSES.contains(&"ACCEPTED_BY_NETWORK"));
     }
@@ -813,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn ns2_614_only_the_old_false_absence_memo_is_ignored() {
+    fn ns2_614_both_false_absence_memo_generations_are_ignored() {
         let now = 1000;
         let mut memo = VerdictMemo {
             txid: "ab".repeat(32),
@@ -832,7 +963,7 @@ mod tests {
         ));
         memo.evidence =
             "request-time break-glass: arcade 404 + woc 404 behind healthy routes".into();
-        assert!(verdict_memo_answers(
+        assert!(!verdict_memo_answers(
             &memo,
             &memo.txid,
             now,
@@ -1236,6 +1367,8 @@ mod tests {
             source: Some("index"),
             unconfirmable: false,
             claimed_height: None,
+            hint_source: None,
+            observed_at_ms: None,
         };
         let v: serde_json::Value = serde_json::from_str(&tx_any_body("ab", &a)).unwrap();
         assert_eq!(v["txid"], "ab");
@@ -1270,6 +1403,8 @@ mod tests {
             source: Some("index"),
             unconfirmable: false,
             claimed_height: None,
+            hint_source: None,
+            observed_at_ms: None,
         }
     }
 
