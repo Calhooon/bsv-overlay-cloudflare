@@ -37,7 +37,7 @@ base64 = "0.22"
 # source cargo never loads an unactivated optional path dependency).
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# `std::time::SystemTime::now()` panics on wasm32-unknown-unknown , route
+# `std::time::SystemTime::now()` panics on wasm32-unknown-unknown, route
 # timestamps through `js_sys::Date` on that target. Mirrors overlay-engine's
 # `current_timestamp_ms`. See uhrp/topic_manager.rs::current_unix_seconds.
 js-sys = "0.3"
