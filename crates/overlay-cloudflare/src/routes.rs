@@ -1362,8 +1362,7 @@ async fn submit_parts(
             // foreground walk supplies any missing ancestry. Latch only on
             // the SUBJECT's accept.
             let dual_legs: Vec<(String, String)> = budget
-                .dual_push_legs(&efs)
-                .iter()
+                .dual_push_legs(&efs, |e| e.txid == subject_txid)
                 .map(|e| (e.txid.clone(), hex::encode(&e.ef)))
                 .collect();
             // NL-6c: `DUAL_BROADCAST=off` turns this leg off for a worker

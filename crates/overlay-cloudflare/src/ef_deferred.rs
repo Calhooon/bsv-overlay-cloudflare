@@ -150,12 +150,16 @@ impl WorkBudget {
 
     /// #413 delivery belt: requests push the ancestry; a byte-deferred first
     /// run pushes only its subject. Later runs already presented that subject.
-    pub fn dual_push_legs<T>(self, legs: &[T]) -> &[T] {
-        match self {
-            Self::InRequest => legs,
-            Self::Resumed { from_leg: 0 } => &legs[legs.len().saturating_sub(1)..],
-            Self::Resumed { .. } => &[],
-        }
+    pub fn dual_push_legs<'a, T>(
+        self,
+        legs: &'a [T],
+        is_subject: impl Fn(&T) -> bool + 'a,
+    ) -> impl Iterator<Item = &'a T> {
+        legs.iter().filter(move |leg| match self {
+            Self::InRequest => true,
+            Self::Resumed { from_leg: 0 } => is_subject(leg),
+            Self::Resumed { .. } => false,
+        })
     }
 
     /// PURE. NL-6d: a run that resumes a walk past its first leg (an earlier
@@ -1051,35 +1055,66 @@ mod tests {
     }
 
     #[test]
+    fn arcregd3_l1_incomplete_ancestry_pushes_subject_by_txid() {
+        let (efs, subject_txid) = crate::ef::beef_to_ef_batch(include_bytes!(
+            "../tests/fixtures/ef/loop2_join_5ad2764c_incomplete.beef"
+        ))
+        .expect("the captured incomplete ancestry converts");
+        assert_eq!(efs[0].txid, subject_txid, "the subject sorts FIRST");
+        assert_ne!(efs.last().unwrap().txid, subject_txid, "the hop sorts LAST");
+        // Project the captured D5 shape onto its two relevant EF legs:
+        // [subject, fully sourced hop], retaining the real converter's order.
+        let mut efs = efs;
+        let hop = efs.pop().unwrap();
+        let subject = efs.remove(0);
+        let efs = [subject, hop];
+        let emitted: Vec<_> = WorkBudget::Resumed { from_leg: 0 }
+            .dual_push_legs(&efs, |e| e.txid == subject_txid)
+            .map(|e| e.txid.as_str())
+            .collect();
+        assert_eq!(emitted, [subject_txid.as_str()], "push only the subject");
+    }
+
+    #[test]
     fn arcregd2_m1_byte_deferred_first_run_emits_subject_dual_push() {
         // One subject EF with proven parents, too large for a request: there
         // is no unproven-ancestry foreground walk to supply its witness.
         let efs = [leg("subject", IN_REQUEST_SUBJECT_EF_BYTES + 1)];
         assert!(!EfWork::of(&efs, "subject").fits_request());
         let emitted: Vec<_> = WorkBudget::Resumed { from_leg: 0 }
-            .dual_push_legs(&efs)
-            .iter()
+            .dual_push_legs(&efs, |e| e.txid == "subject")
             .map(|e| e.txid.as_str())
             .collect();
         assert_eq!(emitted, ["subject"]);
         let chain = [leg("parent", 1), leg("subject", 1)];
-        assert_eq!(WorkBudget::InRequest.dual_push_legs(&chain).len(), 2);
         assert_eq!(
-            WorkBudget::Resumed { from_leg: 0 }.dual_push_legs(&chain)[0].txid,
+            WorkBudget::InRequest
+                .dual_push_legs(&chain, |e| e.txid == "subject")
+                .count(),
+            2
+        );
+        assert_eq!(
+            WorkBudget::Resumed { from_leg: 0 }
+                .dual_push_legs(&chain, |e| e.txid == "subject")
+                .next()
+                .unwrap()
+                .txid,
             "subject"
         );
         assert!(WorkBudget::Resumed { from_leg: 32 }
-            .dual_push_legs(&chain)
-            .is_empty());
+            .dual_push_legs(&chain, |e| e.txid == "subject")
+            .next()
+            .is_none());
         assert!(WorkBudget::Resumed { from_leg: 0 }
-            .dual_push_legs::<EfTx>(&[])
-            .is_empty());
+            .dual_push_legs::<EfTx>(&[], |e| e.txid == "subject")
+            .next()
+            .is_none());
         let source: String = include_str!("routes.rs")
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            source.contains("budget.dual_push_legs(&efs).iter()"),
+            source.contains("budget.dual_push_legs(&efs,|e|e.txid==subject_txid)"),
             "the real dual push must use the bounded legs"
         );
     }
