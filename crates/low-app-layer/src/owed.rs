@@ -2534,6 +2534,62 @@ pub(crate) mod tests {
         assert_eq!(evicted_pot_homes(&released, &[my_hop(&pub_b)], &twin), vec![(tx(0x01), "dd".repeat(20))]);
     }
 
+    /// The E606 lens's M1 (bsv-low #605): a CONFLICT eviction re-points my hop at the confirmed competitor BEFORE the
+    /// release, and the overlay's ledger now still names that hop beside the released ones (`releasedSpends`, the
+    /// overlay's `e605_a`). Once the chaser latches the pointer (`Spent`, the competitor) the home follows from the
+    /// twin and the story is "spent outside this game". The ledger as `7b285f8` wrote it (the other hop alone) names
+    /// no home for the game: "cannot match to a home", the word the cell's bar would miss.
+    #[test]
+    fn e606_m1_a_conflict_evicted_hand_reads_spent_outside_this_game() {
+        use crate::results::CommittedKeys;
+        let pub_a = format!("02{}", "aa".repeat(32));
+        let keys = CommittedKeys {
+            pub_a: pub_a.clone(),
+            pub_b: format!("03{}", "bb".repeat(32)),
+            pay_pkh_a: "cc".repeat(20),
+            pay_pkh_b: "dd".repeat(20),
+        };
+        let (join, competitor, other_hop) = (tx(0x0c), tx(0x0d), tx(0x08));
+        let mut mine = hop(HopStatus::Spent, Some(&competitor), Some(10_000_000));
+        mine.seat_settle_pubkey = pub_a;
+        let hops = [mine];
+        let entry = |t: &str| format!(r#"{{"table":"pot_records","txid":"{t}","vout":0}}"#);
+        let twin = [(join.clone(), 0u32, keys)];
+        let elsewhere = pays(&competitor, &[(0, &"99".repeat(20), 20_190, Some(false))]);
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let story = |ledger: &str| {
+            let released =
+                released_hops_by_eviction(&[(join.clone(), Some(ledger.to_string()))], &hops);
+            let homes: HashMap<String, String> = evicted_pot_homes(&released, &hops, &twin)
+                .into_iter()
+                .collect();
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.spender_outputs = &elsewhere;
+            i.my_pkh_by_game = &homes;
+            let rows = derive_owed_rows(&i);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            (
+                rows[0].reason.clone(),
+                rows[0].facts.get("spendKind").cloned(),
+            )
+        };
+        // the folded ledger: the re-pointed hop (mine) and the released one
+        let folded = format!("[{},{}]", entry(&other_hop), entry(&tx(0x07)));
+        assert_eq!(
+            story(&folded),
+            (
+                Some(SPENT_ELSEWHERE_REASON.to_string()),
+                Some(json!("spent-elsewhere"))
+            )
+        );
+        assert!(SPENT_ELSEWHERE_REASON.contains("spent outside this game"));
+        // `7b285f8`'s ledger: the re-pointed hop absent
+        assert_eq!(
+            story(&format!("[{}]", entry(&other_hop))),
+            (Some(HOME_UNKNOWN_REASON.to_string()), None)
+        );
+    }
+
     /// The gate's M2: "pays none of your homes" needs a KNOWN home. A hop-only game (no pot committed a home) gets the
     /// spender's pay-to addresses and a sentence, never `spent-elsewhere`.
     #[test]
