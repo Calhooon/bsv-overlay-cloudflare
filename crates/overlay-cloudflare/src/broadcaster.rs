@@ -2049,10 +2049,108 @@ pub fn admission_has_broadcaster_witness(terminal: Option<TerminalJudgement>) ->
 }
 
 /// Full-batch rung: preserve ancestor order, then submit the subject alone.
-fn full_batch_legs<'a>(efs: &'a [EfTx], subject_txid: &'a str) -> impl Iterator<Item = &'a EfTx> {
+fn full_batch_legs<'a>(
+    efs: &'a [EfTx],
+    subject_txid: &'a str,
+) -> impl DoubleEndedIterator<Item = &'a EfTx> {
     efs.iter()
         .filter(move |e| e.txid != subject_txid)
         .chain(efs.iter().filter(move |e| e.txid == subject_txid))
+}
+
+/// Read only EF input references, borrowing past scripts without hydrating
+/// source transactions. Breadth-first traversal makes both seats' nearest
+/// parents precede either seat's older hops, independent of BEEF sort order.
+fn nearest_registration_legs<'a>(
+    efs: &'a [EfTx],
+    subject_txid: &'a str,
+    budget: usize,
+) -> Vec<&'a EfTx> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let by_txid: HashMap<_, _> = full_batch_legs(efs, subject_txid)
+        .map(|leg| (leg.txid.as_str(), leg))
+        .collect();
+    let mut queue = VecDeque::from([subject_txid.to_string()]);
+    let mut seen = HashSet::from([subject_txid.to_string()]);
+    let mut selected = Vec::new();
+    while let Some(txid) = queue.pop_front() {
+        let Some(leg) = by_txid.get(txid.as_str()) else {
+            continue;
+        };
+        if txid != subject_txid {
+            selected.push(*leg);
+            if selected.len() == budget {
+                break;
+            }
+        }
+        // These bytes were produced by to_ef, not supplied as an EF by a caller.
+        let mut read = bsv_rs::primitives::Reader::new(&leg.ef);
+        let parents = (|| -> bsv_rs::Result<()> {
+            read.read_bytes(10)?; // version and EF marker
+            for _ in 0..read.read_var_int_num()? {
+                let mut id = read.read_bytes(32)?.to_vec();
+                id.reverse();
+                let parent = hex::encode(id);
+                if by_txid.contains_key(parent.as_str()) && seen.insert(parent.clone()) {
+                    queue.push_back(parent);
+                }
+                read.read_bytes(4)?; // vout
+                let unlock_len = read.read_var_int_num()?;
+                read.read_bytes(unlock_len)?;
+                read.read_bytes(12)?; // sequence and source satoshis
+                let lock_len = read.read_var_int_num()?;
+                read.read_bytes(lock_len)?;
+            }
+            Ok(())
+        })();
+        if parents.is_err() {
+            break;
+        } // malformed internal EF: still reach the subject
+    }
+    selected
+}
+
+/// #640: bounded transport seam. Read the nearest ancestors first; the subject is outside the window and always posted.
+/// Arcade's API has only GET /tx/:txid, no batched status read (api_server/routes.go).
+/// POST /txs shares ONE callback pair, so own-txid registration requires /tx.
+async fn register_full_batch_with<'a, Look, LookFut, Post, PostFut, Subject, SubjectFut>(
+    efs: &'a [EfTx],
+    subject_txid: &'a str,
+    window: LegWindow,
+    mut look: Look,
+    mut post: Post,
+    subject: Subject,
+) -> (Result<GateStep, String>, usize)
+where
+    Look: FnMut(&'a EfTx) -> LookFut,
+    LookFut: std::future::Future<Output = Option<ArcadeStatusResponse>>,
+    Post: FnMut(&'a EfTx, bool) -> PostFut,
+    PostFut: std::future::Future<Output = ()>,
+    Subject: FnOnce(&'a EfTx) -> SubjectFut,
+    SubjectFut: std::future::Future<Output = Result<GateStep, String>>,
+{
+    let budget = window
+        .budget
+        .min(crate::ef_deferred::RUN_CORROBORATION_LEGS)
+        .max(1);
+    let ancestors = nearest_registration_legs(efs, subject_txid, budget);
+    let skipped = efs
+        .iter()
+        .filter(|e| e.txid != subject_txid)
+        .count()
+        .saturating_sub(ancestors.len());
+    for leg in ancestors.into_iter().take(budget) {
+        let known = look(leg)
+            .await
+            .is_some_and(|r| r.txid.eq_ignore_ascii_case(&leg.txid));
+        post(leg, !known).await;
+    }
+    // An ancestor's refusal or timeout never prevents the subject's own POST.
+    let answer = match efs.iter().find(|e| e.txid == subject_txid) {
+        Some(leg) => subject(leg).await,
+        None => Err(format!("subject {subject_txid} has no EF leg")),
+    };
+    (answer, skipped)
 }
 
 /// Human-readable fatal reason for a status response, folding in the captured
@@ -2107,6 +2205,7 @@ pub struct ArcadeBroadcaster {
     corroborator_url: Option<String>,
     /// NL-6d: the window of ancestors this invocation's corroboration reads ([`LegWindow`]).
     legs: LegWindow,
+    registration_skipped: std::cell::Cell<usize>,
     /// NL-6d: set when a corroboration's walk paused at this many primed ancestors (the caller defers the rest).
     legs_paused: std::cell::Cell<Option<usize>>,
 }
@@ -2143,6 +2242,7 @@ impl ArcadeBroadcaster {
             woc_api_key: None,
             corroborator_url: None,
             legs: LegWindow::in_request(),
+            registration_skipped: std::cell::Cell::new(0),
             legs_paused: std::cell::Cell::new(None),
         }
     }
@@ -2153,6 +2253,11 @@ impl ArcadeBroadcaster {
     pub fn with_leg_window(mut self, window: LegWindow) -> Self {
         self.legs = window;
         self
+    }
+
+    /// #640: ancestors left unregistered by the registration window.
+    pub fn registration_legs_skipped(&self) -> usize {
+        self.registration_skipped.get()
     }
 
     /// NL-6d: `Some(reached)` when a corroboration of this invocation paused with `reached` ancestors primed: the
@@ -2559,29 +2664,32 @@ impl ArcadeBroadcaster {
                         .await
                     }
                     SubmitRung::FullBatch => {
-                        // bsv-low #640: Arcade stores one callback pair per POST.
-                        // Each /tx body must carry only the leg named by its token.
-                        for leg in full_batch_legs(efs, subject_txid) {
-                            if leg.txid == subject_txid {
-                                return self.submit_once_and_gate(
-                                    &self.tx_endpoint(),
-                                    &leg.ef,
-                                    &leg.txid,
-                                    1,
-                                    ARCADE_WAIT_TIMEOUT_MS,
-                                    register_callback,
+                        // #640: 32 ancestors per request, 256 per consumer run,
+                        // nearest first; the rest keep the poll/courier backstop.
+                        // Each /tx body carries only the leg named by its token.
+                        let (answer, skipped) = register_full_batch_with(
+                            efs, subject_txid, self.legs,
+                            |leg| async move {
+                                overlay_engine::gasp::race_or_deadline(
+                                    self.tx_status(&leg.txid), sleep_ms(2_000),
+                                ).await.flatten()
+                            },
+                            |leg, register| async move {
+                                // Best effort, including a hung Arcade: never hold the subject.
+                                let _ = overlay_engine::gasp::race_or_deadline(
+                                    self.submit_ef(&self.tx_endpoint(), &leg.txid, &leg.ef, register),
+                                    sleep_ms(2_000),
                                 ).await;
-                            }
-                            // Independently avoid adding registrations for known ancestors.
-                            let known = self.tx_status(&leg.txid).await
-                                .is_some_and(|r| r.txid.eq_ignore_ascii_case(&leg.txid));
-                            // Priming is best effort, as in the ancestry corroborator.
-                            // Only the subject's answer decides the ladder's verdict.
-                            let _ = self.submit_ef(
-                                &self.tx_endpoint(), &leg.txid, &leg.ef, !known,
-                            ).await;
-                        }
-                        Err(format!("subject {subject_txid} has no EF leg"))
+                            },
+                            |leg| async move {
+                                self.submit_once_and_gate(
+                                    &self.tx_endpoint(), &leg.ef, &leg.txid, 1,
+                                    ARCADE_WAIT_TIMEOUT_MS, register_callback,
+                                ).await
+                            },
+                        ).await;
+                        self.registration_skipped.set(self.registration_skipped.get() + skipped);
+                        answer
                     }
                 }
             },
@@ -4221,6 +4329,148 @@ mod tests {
         );
     }
 
+    fn arcreg_ef(parents: &[String]) -> Vec<u8> {
+        let mut ef = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0xef, parents.len() as u8];
+        for id in parents {
+            let mut bytes = hex::decode(id).unwrap();
+            bytes.reverse();
+            ef.extend(bytes);
+            ef.extend([0; 4]);
+            ef.push(0);
+            ef.extend([0xff; 4]);
+            ef.extend([0; 8]);
+            ef.push(0);
+        }
+        ef.push(0);
+        ef.extend([0; 4]);
+        ef
+    }
+
+    #[test]
+    fn arcreg_h1_nearest_across_both_join_seats() {
+        let ids: Vec<_> = (0..5).map(|i| format!("{i:064x}")).collect();
+        let efs = vec![
+            EfTx {
+                txid: ids[0].clone(),
+                ef: arcreg_ef(&[]),
+            },
+            EfTx {
+                txid: ids[1].clone(),
+                ef: arcreg_ef(&ids[0..1]),
+            },
+            EfTx {
+                txid: ids[2].clone(),
+                ef: arcreg_ef(&ids[1..2]),
+            },
+            EfTx {
+                txid: ids[3].clone(),
+                ef: arcreg_ef(&[]),
+            },
+            EfTx {
+                txid: ids[4].clone(),
+                ef: arcreg_ef(&[ids[2].clone(), ids[3].clone()]),
+            },
+        ];
+        let legs = nearest_registration_legs(&efs, &ids[4], 2);
+        assert_eq!(
+            legs.iter().map(|e| &e.txid).collect::<Vec<_>>(),
+            vec![&ids[2], &ids[3]]
+        );
+    }
+
+    #[tokio::test]
+    async fn arcreg_h1_window_nearest_subject_and_calls() {
+        for (n, budget) in [(100usize, 32usize), (80, 32), (300, 256)] {
+            let mut efs: Vec<_> = (0..n)
+                .map(|i| EfTx {
+                    txid: format!("{i:064x}"),
+                    ef: arcreg_ef(&if i == 0 {
+                        vec![]
+                    } else {
+                        vec![format!("{:064x}", i - 1)]
+                    }),
+                })
+                .collect();
+            efs.push(EfTx {
+                txid: "subject".into(),
+                ef: arcreg_ef(&[format!("{:064x}", n - 1)]),
+            });
+            let calls = std::cell::RefCell::new(Vec::new());
+            let (out, skipped) = register_full_batch_with(
+                &efs,
+                "subject",
+                LegWindow { from: 0, budget },
+                |leg| {
+                    calls.borrow_mut().push(format!("GET {}", leg.txid));
+                    async { None }
+                },
+                |leg, register| {
+                    assert!(register);
+                    calls.borrow_mut().push(format!("POST {}", leg.txid));
+                    async {}
+                },
+                |leg| {
+                    calls.borrow_mut().push(format!("POST {}", leg.txid));
+                    async { Ok(GateStep::SyncAccepted) }
+                },
+            )
+            .await;
+            assert!(matches!(out, Ok(GateStep::SyncAccepted)));
+            assert_eq!(skipped, n - budget);
+            assert_eq!(
+                calls.borrow().len(),
+                2 * budget + 1,
+                "bounded GET + POST + subject"
+            );
+            assert_eq!(calls.borrow()[0], format!("GET {:064x}", n - 1));
+            assert_eq!(
+                calls.borrow()[2 * (budget - 1)],
+                format!("GET {:064x}", n - budget)
+            );
+            assert_eq!(calls.borrow().last().unwrap(), "POST subject");
+        }
+    }
+
+    #[tokio::test]
+    async fn arcreg_h1_subject_survives_every_ancestor_fault_or_timeout() {
+        let efs = vec![
+            EfTx {
+                txid: "a".repeat(64),
+                ef: arcreg_ef(&[]),
+            },
+            EfTx {
+                txid: "subject".into(),
+                ef: arcreg_ef(&["a".repeat(64)]),
+            },
+        ];
+        let subject_posts = std::cell::Cell::new(0);
+        for timeout in [false, true] {
+            let (out, _) = register_full_batch_with(
+                &efs,
+                "subject",
+                LegWindow::in_request(),
+                |_| async { None },
+                |_, _| async move {
+                    if timeout {
+                        assert!(overlay_engine::gasp::race_or_deadline(
+                            std::future::pending::<()>(),
+                            async {},
+                        )
+                        .await
+                        .is_none());
+                    } // transport failures / refusals are discarded by the production adapter
+                },
+                |_| {
+                    subject_posts.set(subject_posts.get() + 1);
+                    async { Ok(GateStep::SyncAccepted) }
+                },
+            )
+            .await;
+            assert!(out.is_ok());
+        }
+        assert_eq!(subject_posts.get(), 2);
+    }
+
     #[test]
     fn arcreg_full_batch_source_registers_one_body_per_leg() {
         let src = include_str!("broadcaster.rs");
@@ -4234,22 +4484,12 @@ mod tests {
             .collect();
         let batch = &code[code.find("SubmitRung::FullBatch=>{").unwrap()..];
         let batch = &batch[..batch.find("CorroborationKind::SubjectOnly").unwrap()];
-        assert!(
-            batch.contains("forleginfull_batch_legs(efs,subject_txid)"),
-            "per-leg full-batch dispatch"
-        );
-        assert!(
-            batch.contains("self.submit_ef(&self.tx_endpoint(),&leg.txid,&leg.ef,!known,"),
-            "ancestor body and callback token name the same leg at /tx"
-        );
-        assert!(batch.contains("self.submit_once_and_gate(&self.tx_endpoint(),&leg.ef,&leg.txid,1,ARCADE_WAIT_TIMEOUT_MS,register_callback,"),
-            "subject alone, with its existing registration guard");
-        assert!(
-            !batch.contains("concat_efs") && !batch.contains("txs_endpoint"),
-            "no registering /txs body"
-        );
-        assert!(batch.contains("self.tx_status(&leg.txid).await.is_some_and(|r|r.txid.eq_ignore_ascii_case(&leg.txid))"),
-            "each ancestor has its own register-once guard");
+        assert!(batch.contains("register_full_batch_with(efs,subject_txid,self.legs,"));
+        assert!(batch.contains("self.submit_ef(&self.tx_endpoint(),&leg.txid,&leg.ef,register)"));
+        assert!(batch.contains("self.submit_once_and_gate(&self.tx_endpoint(),&leg.ef,&leg.txid,1,ARCADE_WAIT_TIMEOUT_MS,register_callback,"));
+        assert!(batch.contains("self.tx_status(&leg.txid)"));
+        assert_eq!(batch.matches("sleep_ms(2_000)").count(), 2);
+        assert!(!batch.contains("txs_endpoint"));
         let post = &prod[prod.find("async fn post_ef_raw(").unwrap()..];
         assert!(post.contains("headers.set(\"X-CallbackToken\", token)"));
         assert!(post.contains("headers.set(\"X-CallbackUrl\", cb)"));

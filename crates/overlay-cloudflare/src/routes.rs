@@ -1430,6 +1430,17 @@ async fn submit_parts(
                 }
             })
             .await;
+        if let Ok(count_db) = env.d1("OVERLAY_DB") {
+            let skipped = arcade.registration_legs_skipped();
+            if skipped > 0 {
+                crate::ops::bump_counter(
+                    &count_db,
+                    crate::ops::COUNTER_ARC_REGISTRATION_SKIPPED,
+                    skipped as u64,
+                )
+                .await;
+            }
+        }
         // NL-6d: the corroboration's walk paused with ancestors left (the ladder read it as inconclusive): never a
         // 502 for a count. In the request the job is deferred from the leg reached (202 and a reference); in a run
         // the answer names the next run's cursor.
