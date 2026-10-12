@@ -70,3 +70,5 @@ These are 22 independently replayable, additive SQL statements: one read index, 
 210: guarded seat backfill for pre-existing rows.
 211: completion stamp, only after both backfills.
 The adjacent CREATE statements (190 to 199) and source-trigger statements (200 to 208) could be grouped into migration batches if the runner were changed to execute batches. With the current one-statement runner they stay separate. Backfills 209/210 must precede 211; folding them would require transactional batch execution. No migration folding is necessary for correctness and none is done here.
+
+Merge addendum (D1BD-L1, main `17418b1`): register the triggers as `derived_hops::HOP_INSERT` through `PARTY_DELETE`, followed by `LINKS_BACKFILL`, `SEATS_BACKFILL`, and `STATE_DONE`; at the merge onto main's 196 these occupy 207–215, 216–217, and 218. The numbered list above records the original branch, not stable migration identities.
