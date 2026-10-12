@@ -350,6 +350,7 @@ pub fn answer_from_verdict_memo(memo: &VerdictMemo, index_raw: Option<String>) -
         AbsenceCorroboration::CorroboratedAbsent,
     );
     a.unconfirmable = memo.kind == VerdictKind::Unconfirmable;
+    a.terminal = memo.kind.terminal();
     a.source = Some("memo");
     a
 }
@@ -484,6 +485,8 @@ pub struct TxAnyAnswer {
     /// route probes inputs only for a corroborated-absent index-held tx);
     /// `false` means "not proven unconfirmable", never "confirmable".
     pub unconfirmable: bool,
+    /// #639: a definitive verdict, never a short lived request-time absence.
+    pub terminal: bool,
     /// bsv-low 2026-09-21 (the era belt on "tables that didn't start"): the courier's CLAIMED mined height (WoC's
     /// `blockheight` on the external leg, `parse_woc_blockheight`), NEVER verified against chaintracks and never a
     /// substitute for `height` (the proven one, index/Arcade). Served for DISPLAY-TIER readers that must date a tx
@@ -522,6 +525,7 @@ pub fn decide_tx_any(
                 raw_hex: Some(raw),
                 source: Some("index"),
                 unconfirmable: false,
+                terminal: false,
                 claimed_height: None,
                 hint_source: None,
                 observed_at_ms: None,
@@ -549,6 +553,7 @@ pub fn decide_tx_any(
                 raw_hex: Some(raw),
                 source: Some("index+external"),
                 unconfirmable: false,
+                terminal: false,
                 claimed_height: None,
                 hint_source: None,
                 observed_at_ms: None,
@@ -561,6 +566,7 @@ pub fn decide_tx_any(
                     raw_hex: Some(raw),
                     source: Some("index+external"),
                     unconfirmable: false,
+                    terminal: false,
                     claimed_height: None,
                     hint_source: None,
                     observed_at_ms: None,
@@ -573,6 +579,7 @@ pub fn decide_tx_any(
                 raw_hex: Some(raw),
                 source: Some("index"),
                 unconfirmable: false,
+                terminal: false,
                 claimed_height: None,
                 hint_source: None,
                 observed_at_ms: None,
@@ -614,6 +621,7 @@ pub fn decide_tx_any(
                 raw_hex: Some(raw.clone()),
                 source: Some("external"),
                 unconfirmable: false,
+                terminal: false,
                 claimed_height: None,
                 hint_source: None,
                 observed_at_ms: None,
@@ -628,6 +636,7 @@ pub fn decide_tx_any(
                 raw_hex: None,
                 source: Some("external"),
                 unconfirmable: false,
+                terminal: false,
                 claimed_height: None,
                 hint_source: None,
                 observed_at_ms: None,
@@ -834,7 +843,7 @@ pub fn fold_index_rows(
 /// The one `/tx-any` answer as a JSON value (the single route's body, the
 /// batched route's per-txid entry — one writer, so the two cannot drift).
 pub fn tx_any_value(txid: &str, a: &TxAnyAnswer) -> serde_json::Value {
-    json!({
+    let mut value = json!({
         "txid": txid,
         "present": a.present,
         "confirmed": a.confirmed,
@@ -847,7 +856,11 @@ pub fn tx_any_value(txid: &str, a: &TxAnyAnswer) -> serde_json::Value {
             else if a.present == Some(true) { "first-party" } else { "unknown" },
         "hintSource": a.hint_source,
         "observedAtMs": a.observed_at_ms,
-    })
+    });
+    if a.present == Some(false) {
+        value["terminal"] = json!(a.terminal || a.unconfirmable);
+    }
+    value
 }
 
 /// bsv-low W-C.3 — the batched body: `answers[txid]` = the single route's
@@ -874,6 +887,21 @@ pub fn tx_any_batch_body(answers: &[(String, TxAnyAnswer)], unknown: &[(String, 
 
 pub fn tx_any_body(txid: &str, a: &TxAnyAnswer) -> String {
     tx_any_value(txid, a).to_string()
+}
+
+/// #639: preserve the outpoint body, adding only the absence verdict's finality.
+pub fn spent_any_body(entries: &[crate::logic::OutpointStatus], terminals: &[bool]) -> String {
+    let mut body: serde_json::Value =
+        serde_json::from_str(&crate::logic::utxo_status_body(entries))
+            .expect("the status builder emits JSON");
+    if let Some(rows) = body.as_array_mut() {
+        for (row, terminal) in rows.iter_mut().zip(terminals) {
+            if row["reason"] == SPENT_ANY_REASON_TX_ABSENT {
+                row["terminal"] = json!(terminal);
+            }
+        }
+    }
+    body.to_string()
 }
 
 #[cfg(test)]
@@ -1376,6 +1404,7 @@ mod tests {
             raw_hex: Some("aa".into()),
             source: Some("index"),
             unconfirmable: false,
+            terminal: false,
             claimed_height: None,
             hint_source: None,
             observed_at_ms: None,
@@ -1412,6 +1441,7 @@ mod tests {
             raw_hex: Some(raw()),
             source: Some("index"),
             unconfirmable: false,
+            terminal: false,
             claimed_height: None,
             hint_source: None,
             observed_at_ms: None,

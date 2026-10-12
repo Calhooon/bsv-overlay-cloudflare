@@ -6638,8 +6638,15 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
     );
     let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
+    let mut terminals = Vec::with_capacity(outpoints.len());
     for op in &outpoints {
         let txid_lc = op.db_txid();
+        terminals.push(
+            verdicts
+                .iter()
+                .find(|m| m.txid == txid_lc)
+                .is_some_and(|m| m.kind.terminal()),
+        );
         let row = if verdicts.iter().any(|m| m.txid == txid_lc) {
             SpentAnyCached {
                 known: false,
@@ -6695,7 +6702,7 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             write_probe_memos(&db, &fresh).await;
         }
     }
-    json_response(utxo_status_body(&entries), 200)
+    json_response(crate::txany::spent_any_body(&entries, &terminals), 200)
 }
 
 // ── /tx-any — tx-level presence/confirmation/raw, index-first (bsv-low #229) ──
