@@ -606,6 +606,7 @@ pub fn decide_tx_any(
             raw_hex: raw_hex.clone(),
             source: Some("external"),
             unconfirmable: false,
+            terminal: false,
             claimed_height: None,
             hint_source: None,
             observed_at_ms: None,
