@@ -2612,12 +2612,7 @@ async fn owed_party_cursor(
                 .cloned()
                 .collect();
             let n = rows.len();
-            if let Some(last) = rows.last() {
-                cursor.last = Some((
-                    crate::owed_cursor::number(last, "createdAt"),
-                    crate::owed_cursor::number(last, "cursorRowid").unwrap(),
-                ));
-            }
+            cursor.start(&rows);
             candidates.extend(rows);
             if n < crate::owed_cursor::INITIAL_PAGE {
                 continue;
