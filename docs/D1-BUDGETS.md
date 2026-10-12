@@ -152,3 +152,12 @@ spender resolution skips `tx_any_scope`: the recompute already missed the
 index and read its admitted pots and refused JOINs. That spender goes to the
 couriers without another scope or held-anchor query; other callers retain
 the first-party scope query. The recorded fixture baseline remains 26.
+
+## Derived write cost (#638, D1B-L4)
+
+Every `pot_records` UPDATE fires `derive_pot_update`: six derived statements per
+updated pot (three keyed deletes and three indexed insert-selects), about ten
+rows read and two to four written at the beta fixture's shape. A bulk update
+multiplies that cost per affected row. The `/submit` fixture still measures 13
+writes against its unchanged 15-write ceiling. These lookup rows move the join
+cost to the source write; the write census must count that maintenance too.
