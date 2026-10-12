@@ -874,32 +874,8 @@ impl UHRPStorage for D1UHRPStorage {
 
     async fn find_record(&self, query: &UHRPQuery) -> Result<Vec<UTXOReference>, UHRPStorageError> {
         let mut wb = WhereBuilder::new();
-        // Legacy-storage fallback: pre-2026-04-22 admissions indexed
-        // `uhrpUrl` as hex-of-hash; post-fix admissions store canonical
-        // `uhrp://<base58check>`. Accept either stored form when the
-        // caller queries in canonical form — decode the hash, then
-        // match the stored column against both representations.
-        let hex_fallback = query.uhrp_url.as_deref().and_then(|u| {
-            u.strip_prefix("uhrp://").and_then(|b58| {
-                bsv_rs::primitives::encoding::from_base58_check(b58)
-                    .ok()
-                    .and_then(|(version, payload)| {
-                        if version.len() == 1 && version[0] == 0x01 && payload.len() == 32 {
-                            Some(hex::encode(&payload))
-                        } else {
-                            None
-                        }
-                    })
-            })
-        });
-        if let (Some(u), Some(hex_u)) = (query.uhrp_url.as_ref(), hex_fallback.as_ref()) {
-            // OR clause: stored matches either canonical or hex form.
-            wb = wb.raw(
-                "(uhrpUrl = ? OR uhrpUrl = ?)",
-                vec![u.as_str().into(), hex_u.as_str().into()],
-            );
-        } else if let Some(u) = query.uhrp_url.as_ref() {
-            wb = wb.eq("uhrpUrl", u.as_str());
+        if let Some(u) = query.uhrp_url.as_deref() {
+            wb = wb.eq("uhrpUrl", u);
         }
         if let Some(ref ik) = query.identity_key {
             wb = wb.eq("identityKey", &**ik);

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.3] - 2026-10-12
+
+- Index admitted UHRP adverts with the reference's ce00 prefix and bare Base58Check URL. Normalize optional UHRP query schemes in memory and D1. Five storage golden vectors prove admission and lookup parity.
+- Remove the obsolete 0x01-to-hex lookup fallback. Storage accepts legacy input but emits canonical adverts; no current producer requires that fallback. Historical 0x01/hex rows need bounded migration or re-advertisement before canonical lookup; this patch does not rewrite persisted rows.
+- Align both workspaces and internal package dependencies to 0.1.3 per RELEASING.md rule 4. The keeper lands this after the 0.1.2 release.
+
 ## [0.1.2] - 2026-10-12
 
 - Give hand-made coinbase fixtures lone-leaf proofs and ordinary funding fixtures two-leaf proofs with real synthetic parents under bsv-rs 0.5.0's mining checks; no door rule changed.

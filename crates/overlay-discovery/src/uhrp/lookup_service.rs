@@ -119,14 +119,11 @@ impl LookupService for UHRPLookupService {
             }
         };
 
-        // Canonical `uhrp_url`: `uhrp://<base58check(0x01 || sha256)>`, matching
-        // `StorageUtils.getURLForHash` in `@bsv/sdk` and the form stored by
-        // TS `UHRPLookupServiceFactory`. Clients query with this exact string,
-        // so indexing by hex (the earlier shortcut) makes lookups return 0.
-        let uhrp_url_hex = format!(
-            "uhrp://{}",
-            bsv_rs::primitives::encoding::to_base58_check(&pushdrop.fields[1], &[0x01])
-        );
+        // ts-stack@edf6e03 packages/sdk/src/storage/StorageUtils.ts:20-24
+        // encodes SHA-256 with ce00; :50-57 refuses other prefixes.
+        // The reference returns bare Base58Check, as do storage's goldens.
+        let uhrp_url =
+            bsv_rs::primitives::encoding::to_base58_check(&pushdrop.fields[1], &[0xce, 0x00]);
 
         // Dedup: skip if (txid, output_index) is already indexed.
         let is_dup = self
@@ -143,7 +140,7 @@ impl LookupService for UHRPLookupService {
             .store_record(
                 txid,
                 output_index,
-                &uhrp_url_hex,
+                &uhrp_url,
                 &identity_key,
                 &download_url,
                 expiry_time,
@@ -214,8 +211,22 @@ impl LookupService for UHRPLookupService {
                 .map_err(|e| LookupServiceError::StorageError(e.to_string()));
         }
 
-        let query: UHRPQuery = serde_json::from_value(question.query.clone())
+        let mut query: UHRPQuery = serde_json::from_value(question.query.clone())
             .map_err(|e| LookupServiceError::InvalidQuery(e.to_string()))?;
+
+        // ts-stack@edf6e03 packages/sdk/src/storage/StorageUtils.ts:9-12.
+        // Normalize before dispatch so memory and D1 receive the same key.
+        if let Some(url) = query.uhrp_url.as_mut() {
+            let bare = if url
+                .get(..5)
+                .is_some_and(|s| s.eq_ignore_ascii_case("uhrp:"))
+            {
+                &url[5..]
+            } else {
+                url.as_str()
+            };
+            *url = bare.strip_prefix("//").unwrap_or(bare).to_string();
+        }
 
         if let Some(limit) = query.limit {
             if limit == 0 {
@@ -361,17 +372,71 @@ mod tests {
 
         let records = storage.find_all_records().await.unwrap();
         assert_eq!(records[0].identity_key, hex::encode(&ident));
-        // uhrp_url stored in canonical form: "uhrp://<base58check(0x01 || hash)>".
-        // Derivation matches `StorageUtils.getURLForHash` in @bsv/sdk and the TS
-        // reference `UHRPLookupServiceFactory.ts` — see `lookup_service.rs:117-123`.
-        let expected_uhrp_url = format!(
-            "uhrp://{}",
-            bsv_rs::primitives::encoding::to_base58_check(&hash, &[0x01])
-        );
+        // ts-stack@edf6e03 packages/sdk/src/storage/StorageUtils.ts:20-24.
+        let expected_uhrp_url = bsv_rs::primitives::encoding::to_base58_check(&hash, &[0xce, 0x00]);
         assert_eq!(records[0].uhrp_url, expected_uhrp_url);
         assert_eq!(records[0].download_url, "https://a.example");
         assert_eq!(records[0].expiry_time, 1_900_000_000);
         assert_eq!(records[0].content_length, 1024);
+    }
+
+    #[tokio::test]
+    async fn storage_golden_urls_find_admitted_adverts() {
+        let vectors = [
+            include_str!("fixtures/hash/all_bytes_0_to_255.json"),
+            include_str!("fixtures/hash/empty.json"),
+            include_str!("fixtures/hash/hello_world_ascii.json"),
+            include_str!("fixtures/hash/one_mib_plus_one_byte_repeating.json"),
+            include_str!("fixtures/hash/ts_sdk_cross_vector.json"),
+        ];
+        let (svc, storage) = make_service_with_storage();
+        let ident = sample_identity();
+        for (i, vector) in vectors.iter().enumerate() {
+            let golden: serde_json::Value = serde_json::from_str(vector).unwrap();
+            let hash = hex::decode(golden["hash_hex"].as_str().unwrap()).unwrap();
+            let url = golden["uhrp_url"].as_str().unwrap();
+            let txid = format!("golden-{i}");
+            svc.output_admitted_by_topic(&OutputAdmittedByTopic::LockingScript {
+                txid: txid.clone(),
+                output_index: 0,
+                topic: "tm_uhrp".into(),
+                satoshis: 1,
+                locking_script: make_uhrp_locking_script(
+                    &ident,
+                    &hash,
+                    "https://a.example",
+                    1_900_000_000,
+                    1024,
+                ),
+                off_chain_values: None,
+            })
+            .await
+            .unwrap();
+            for query_url in [
+                url.to_string(),
+                format!("uhrp://{url}"),
+                format!("UHRP:{url}"),
+            ] {
+                let result = svc
+                    .lookup(&LookupQuestion::new(
+                        "ls_uhrp",
+                        serde_json::json!({"uhrpUrl": query_url, "nowUnixSeconds": 1_700_000_000}),
+                    ))
+                    .await
+                    .unwrap();
+                let LookupResult::OutputList(outputs) = result else {
+                    panic!("expected output list")
+                };
+                assert_eq!(outputs.len(), 1, "{}", golden["name"]);
+                assert_eq!(outputs[0].txid, txid);
+                assert_eq!(outputs[0].output_index, 0);
+            }
+            let records = storage.find_all_records().await.unwrap();
+            assert_eq!(
+                records.iter().find(|r| r.txid == txid).unwrap().uhrp_url,
+                url
+            );
+        }
     }
 
     #[tokio::test]
