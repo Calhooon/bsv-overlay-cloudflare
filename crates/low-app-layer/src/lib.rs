@@ -157,8 +157,8 @@ pub mod refund_view;
 pub mod results;
 mod routes;
 pub mod schema;
-pub mod txany;
 pub mod tracker_host;
+pub mod txany;
 
 use serde_json::Value;
 use worker::{event, Context, Env, Request, Response, Result, Router};
