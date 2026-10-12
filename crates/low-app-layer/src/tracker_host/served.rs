@@ -71,3 +71,25 @@ pub fn spenders(value: &mut Value, states: &BTreeMap<String, State>) {
         _ => {}
     }
 }
+
+/// All production body wiring goes through this boundary. Missing subjects
+/// have the tracker's birth word; legacy flags never synthesize evidence.
+pub fn body(
+    raw: &str,
+    transaction_subject: Option<&str>,
+    states: &BTreeMap<String, State>,
+) -> String {
+    let mut value: Value = serde_json::from_str(raw).expect("production JSON builder");
+    if let Some(id) = transaction_subject {
+        let state = states.get(id).cloned().unwrap_or_else(|| State::new(id));
+        transaction(&mut value, &state);
+    }
+    if let Some(answers) = value.get_mut("answers").and_then(Value::as_object_mut) {
+        for (id, answer) in answers {
+            let state = states.get(id).cloned().unwrap_or_else(|| State::new(id));
+            transaction(answer, &state);
+        }
+    }
+    spenders(&mut value, states);
+    value.to_string()
+}

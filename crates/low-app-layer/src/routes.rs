@@ -320,7 +320,7 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     }
 
     let entries = assemble_statuses(&outpoints, &rows);
-    json_response(utxo_status_body(&entries), 200)
+    json_response(crate::tracker_host::served::body(&utxo_status_body(&entries), None, &Default::default()), 200)
 }
 
 /// `GET /beef/:txid` — the BEEF bytes for a txid, read from `pot_beefs`
@@ -4550,7 +4550,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             "could not judge the complete list this pass: bounded or faulted evidence read"
         );
     }
-    json_response(body.to_string(), 200)
+    json_response(crate::tracker_host::served::body(&body.to_string(), None, &Default::default()), 200)
 }
 
 async fn gather_result_entries(
@@ -6780,7 +6780,7 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             write_probe_memos(&db, &fresh).await;
         }
     }
-    json_response(crate::txany::spent_any_body(&entries, &terminals), 200)
+    json_response(crate::tracker_host::served::body(&crate::txany::spent_any_body(&entries, &terminals), None, &Default::default()), 200)
 }
 
 // ── /tx-any — tx-level presence/confirmation/raw, index-first (bsv-low #229) ──
@@ -7520,7 +7520,7 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
             resolve_tx_any(index_raw, index_height, &key, now, "tx_any", &ctx.env).await
         }
     };
-    json_response(crate::txany::tx_any_body(&key, &answer), 200)
+    json_response(crate::tracker_host::served::body(&crate::txany::tx_any_body(&key, &answer), Some(&key), &Default::default()), 200)
 }
 
 /// One batched index-leg row: the txid alongside what the single leg reads.
@@ -7713,7 +7713,7 @@ pub async fn tx_any_batch(req: Request, ctx: RouteContext<AuthState>) -> Result<
             }
         }
     }
-    json_response(crate::txany::tx_any_batch_body(&answers, &unknown), 200)
+    json_response(crate::tracker_host::served::body(&crate::txany::tx_any_batch_body(&answers, &unknown), None, &Default::default()), 200)
 }
 
 /// `GET /health` — liveness only (no DB touch).

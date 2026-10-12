@@ -68,3 +68,22 @@ fn ns3_spender_fields_use_spender_subject_and_keep_legacy_body() {
         .remove("spenderWord");
     assert_eq!(before, value);
 }
+
+#[test]
+fn ns3_route_body_boundary_adds_words_to_single_batch_and_spenders() {
+    let id = "01".repeat(32);
+    let single: serde_json::Value = serde_json::from_str(&served::body(
+        &json!({"confirmed":true}).to_string(),
+        Some(&id),
+        &Default::default(),
+    ))
+    .unwrap();
+    assert_eq!(single["word"], "unknown");
+    assert_eq!(single["confirmed"], true);
+    let batch =
+        json!({"answers":{id.clone():{"height":null}},"rows":[{"facts":{"spendingTxid":id}}]});
+    let after: serde_json::Value =
+        serde_json::from_str(&served::body(&batch.to_string(), None, &Default::default())).unwrap();
+    assert_eq!(after["answers"][&id]["tracker"]["word"], "unknown");
+    assert_eq!(after["rows"][0]["facts"]["spenderWord"]["word"], "unknown");
+}
