@@ -1840,7 +1840,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         facts["chainProbe"] = json!("spent");
                         if let Some(age) = w.age_ms { facts["chainProbeAgeMs"] = json!(age); }
                         facts["chainSpender"] = json!(w.spending_txid);
-                        let story = spender.as_deref().filter(|s| !pointer_refuted(i, s, h)).and_then(|s| spender_story(i, s, &game));
+                        facts["spentConfirmed"] = json!(w.spent_confirmed);
+                        let story = spender
+                            .as_deref()
+                            .filter(|s| !pointer_refuted(i, s, h))
+                            .and_then(|s| spender_story(i, s, &game));
                         let reason = story_reason(
                             &mut facts,
                             story,

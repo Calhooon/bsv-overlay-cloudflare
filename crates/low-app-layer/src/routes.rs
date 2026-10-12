@@ -3299,13 +3299,6 @@ pub(crate) async fn owed_recompute(
             #[serde(default)]
             spent: Option<f64>,
         }
-        /// A tx-any answer's raw, parsed and re-checked against the txid it was asked for (content-addressed).
-        fn parse_answer(a: &TxAnyCached, sp: &str) -> Option<CourierSpenderBytes> {
-            courier_spender_bytes_of_raw(
-                &hex::decode(crate::txany::fact_reader_raw_hex(a)?).ok()?,
-                sp,
-            )
-        }
         // phase 1: the index's bytes (D1), a parsed courier memo, or the isolate's tx-any cache — no courier asked
         let mut wanted: Vec<String> = Vec::new();
         for (_at, sp) in ordered.into_iter().take(crate::owed::OWED_SPENDER_READS_PER_RECOMPUTE) {
@@ -3327,7 +3320,7 @@ pub(crate) async fn owed_recompute(
                     // the delta-verify's NEW-1: an answer this isolate already holds (a fault inside its TTL included)
                     // is never re-bought
                     if let Some(a) = tx_any_cached(&sp, now_f) {
-                        if let Some(parsed) = parse_answer(&a, &sp) {
+                        if let Some(parsed) = parse_spender_answer(&a, &sp) {
                             owed_spender_outputs_memo_put(&sp, &parsed);
                             courier_spenders.insert(sp.clone());
                             spender_inputs.insert(sp.clone(), parsed.inputs);
@@ -3386,7 +3379,7 @@ pub(crate) async fn owed_recompute(
                 continue;
             }
             if let Some(a) = tx_any_cached(&sp, now_f) {
-                if let Some(parsed) = parse_answer(&a, &sp) {
+                if let Some(parsed) = parse_spender_answer(&a, &sp) {
                     owed_spender_outputs_memo_put(&sp, &parsed);
                     courier_spenders.insert(sp.clone());
                     spender_inputs.insert(sp.clone(), parsed.inputs);
@@ -3401,7 +3394,7 @@ pub(crate) async fn owed_recompute(
                 courier_reads += 1;
                 owed_courier_note_asked(&sp, now_f);
             }
-            if let Some(parsed) = parse_answer(&a, &sp) {
+            if let Some(parsed) = parse_spender_answer(&a, &sp) {
                 owed_spender_outputs_memo_put(&sp, &parsed);
                 courier_spenders.insert(sp.clone());
                 spender_inputs.insert(sp.clone(), parsed.inputs);
@@ -3451,6 +3444,13 @@ pub(crate) async fn owed_recompute(
     let home_spends = owed_home_spend_walk(env, db, identity_lc, &crate::owed::courier_home_outputs(&inputs), now_ms, started_ms).await;
     inputs.home_spends = &home_spends;
     let mut rows = derive_owed_rows(&inputs);
+    for row in &mut rows {
+        let spender = row.facts["chainSpender"]
+            .as_str()
+            .or_else(|| row.facts["spendingTxid"].as_str());
+        let answer = spender.and_then(|sp| tx_any_cached(sp, now_ms as f64));
+        mark_pending_spender(row, answer.as_ref(), now_ms);
+    }
     // #517 (the gate's LOW-1, the delta-verify's N-A): the contradiction fact rides the rows; counted here, once per hop
     crate::hops_view::mark_refused_word_rows(&mut rows, &refused_words, &proofs_set_aside);
     crate::owed::note_sweep_proof_contradictions(crate::owed::count_sweep_proof_contradictions(&rows));
@@ -6322,6 +6322,38 @@ fn spender_inputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<(String, u32)
 /// A spender's raw, parsed and re-checked against the txid it is named by (content-addressed): its P2PKH outputs and
 /// its input outpoints, the owed brain's spender bytes. One reader for the tx-any answer and the chain rung's verified
 /// raw (bsv-low #606).
+/// A tx-any answer's raw, parsed and re-checked against the txid it was asked for (content-addressed).
+fn parse_spender_answer(a: &TxAnyCached, sp: &str) -> Option<CourierSpenderBytes> {
+    courier_spender_bytes_of_raw(
+        &hex::decode(crate::txany::fact_reader_raw_hex(a)?).ok()?,
+        sp,
+    )
+}
+
+/// Display evidence only: finality still comes from the chain spend word.
+fn mark_pending_spender(row: &mut crate::owed::OwedRow, answer: Option<&TxAnyCached>, now_ms: i64) {
+    if row.facts["spentConfirmed"] == true || row.at_height.is_some() {
+        return;
+    }
+    if row.facts["chainSpender"]
+        .as_str()
+        .or_else(|| row.facts["spendingTxid"].as_str())
+        .is_none()
+    {
+        return;
+    }
+    let source = answer
+        .and_then(|a| a.hint_source.or(a.source))
+        .unwrap_or("spent-any");
+    let at = answer.and_then(|a| a.observed_at_ms).unwrap_or_else(|| {
+        now_ms.saturating_sub(row.facts["chainProbeAgeMs"].as_i64().unwrap_or(0))
+    });
+    row.facts["spenderPresence"] = serde_json::json!({
+        "word": if row.facts["spendKind"] == "spent-elsewhere" { "spent-outside" } else { "spent" },
+        "tier": "pending", "source": source, "at": at,
+    });
+}
+
 fn courier_spender_bytes_of_raw(raw: &[u8], sp: &str) -> Option<CourierSpenderBytes> {
     let tx = bsv_rs::transaction::Transaction::from_binary(raw).ok()?;
     if !tx.id().eq_ignore_ascii_case(sp) {
@@ -7880,7 +7912,7 @@ mod e606_tests {
         let a = decide_tx_any(None, None, Some(&obs), absence);
         assert_eq!(a.present, None);
         assert_eq!(a.hint_source, Some("woc"));
-        assert_eq!(crate::txany::fact_reader_raw_hex(&a), None);
+        assert_eq!(crate::txany::fact_reader_raw_hex(&a), a.raw_hex.as_deref());
         assert_eq!(a.observed_at_ms, Some(1234));
         assert_eq!(a.raw_hex, Some(hex::encode(raw)));
         assert!(!urls
@@ -7888,6 +7920,36 @@ mod e606_tests {
             .iter()
             .any(|url| url.starts_with(&arcade_url())));
         assert_eq!(crate::txany::tx_any_value(&txid, &a)["tier"], "hint");
+    }
+
+    #[test]
+    fn ns2pd_h1_cached_hint_judges_spender_without_finality() {
+        let (sp, raw) = competitor();
+        let a = decide_tx_any(
+            None,
+            None,
+            Some(&TxObservation::CourierHint {
+                raw_hex: Some(hex::encode(raw)),
+                source: "woc",
+                observed_at_ms: 1234,
+            }),
+            AbsenceCorroboration::Unknown,
+        );
+        cache_tx_any_answer(&sp, &a, 0.0);
+        let cached = tx_any_cached(&sp, 1.0).unwrap();
+        let parsed = parse_spender_answer(&cached, &sp);
+        let (family, reason, facts) = owed_reason(&sp, parsed);
+        assert_eq!(family, OwedFamily::Unbound);
+        assert_eq!(reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
+        assert_eq!(facts["spendKind"], "spent-elsewhere");
+        assert!(facts["claim"].is_null(), "no credit or release from a hint");
+        assert_eq!(
+            facts["spenderPresence"],
+            serde_json::json!({"word":"spent-outside", "tier":"pending", "source":"woc", "at":1234})
+        );
+        assert_eq!(facts["spentConfirmed"], false);
+        assert_eq!(a.present, None);
+        assert_eq!(a.confirmed, None);
     }
 
     #[test]
@@ -8056,7 +8118,9 @@ mod e606_tests {
         i.spender_inputs = &ins;
         i.courier_spenders = &couriered;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let mut rows = derive_owed_rows(&i);
+        let answer = tx_any_cached(sp, 1.0);
+        mark_pending_spender(&mut rows[0], answer.as_ref(), 1234);
         assert_eq!(rows.len(), 1, "{rows:?}");
         (
             rows[0].family,

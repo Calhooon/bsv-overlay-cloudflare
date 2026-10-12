@@ -495,14 +495,10 @@ pub struct TxAnyAnswer {
     pub observed_at_ms: Option<i64>,
 }
 
-/// Money/fact readers may use owned or proven bytes, never foreign hearsay.
-/// The public response retains the hash-checked hint bytes for display/retry.
+/// Content-addressed bytes describe the spender even when its presence is hearsay.
+/// Reading these bytes does not confer confirmation or authorize a money action.
 pub fn fact_reader_raw_hex(answer: &TxAnyAnswer) -> Option<&str> {
-    if answer.hint_source.is_some() {
-        None
-    } else {
-        answer.raw_hex.as_deref()
-    }
+    answer.raw_hex.as_deref()
 }
 
 /// The pure `/tx-any` decision table (unit-tested; the route feeds it real
