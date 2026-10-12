@@ -2675,7 +2675,7 @@ pub(crate) async fn owed_recompute(
     };
 
     // 3. the hops view, unscoped (my funded outpoints)
-    let hops: Vec<crate::hops_view::HopEntry> = {
+    let mut hops: Vec<crate::hops_view::HopEntry> = {
         let mut all: Vec<crate::hops_view::HopEntry> = Vec::new();
         let mut after = 0usize;
         let mut more = true;
@@ -2779,6 +2779,116 @@ pub(crate) async fn owed_recompute(
             }
         }
     };
+    // 4a-0. loop 23's pair 13 (bsv-low #610): a hop the eviction RELEASED that the hops view does not hold (the seat's
+    //       best-effort `tm_hopparty` marker never landed) is rebuilt from the evicted JOIN itself: my own twin party
+    //       row of that JOIN (`sigValid = 1`, the settle key K), the twin lock committing K, and the JOIN's own stored
+    //       BEEF showing the released output paying hash160(K) (`owed::markerless_released_hops`). Keyed on the UTXO
+    //       the ledger names; bounded per recompute; a faulted read names nothing (the hop stays unseen this pass).
+    {
+        #[derive(Deserialize)]
+        struct EvictedSeatD1 {
+            #[serde(rename = "potTxid")]
+            pot_txid: String,
+            #[serde(rename = "gameId")]
+            game_id: String,
+            #[serde(rename = "opponentIdentity")]
+            opponent_identity: String,
+            #[serde(rename = "seatSettlePubkey")]
+            seat_settle_pubkey: String,
+        }
+        #[derive(Deserialize)]
+        struct EvictedKeysD1 {
+            txid: String,
+            #[serde(rename = "outputIndex")]
+            output_index: f64,
+            #[serde(rename = "pubA", default)]
+            pub_a: Option<String>,
+            #[serde(rename = "pubB", default)]
+            pub_b: Option<String>,
+            #[serde(rename = "payPkhA", default)]
+            pay_pkh_a: Option<String>,
+            #[serde(rename = "payPkhB", default)]
+            pay_pkh_b: Option<String>,
+        }
+        let mut unheld = crate::owed::unheld_released_by_eviction(&eviction_rows, &hops);
+        unheld.truncate(crate::owed::OWED_MARKERLESS_JOINS_PER_RECOMPUTE);
+        if !unheld.is_empty() {
+            let placeholders = (2..=unheld.len() + 1).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+            let mut b: Vec<JsValue> = vec![JsValue::from_str(identity_lc)];
+            b.extend(unheld.iter().map(|(t, _)| JsValue::from_str(t)));
+            // the eviction moves a party row keyed by `txid` OR `potTxid` (`admit_fast` SHADOW_TABLES); the twin
+            // keeps the source's columns and casing
+            let sql = format!(
+                "SELECT lower(potTxid) AS potTxid, gameId, opponentIdentity, seatSettlePubkey FROM potparty_records_evicted \
+                 WHERE identity = ?1 AND sigValid = 1 AND seatSettlePubkey IS NOT NULL AND lower(potTxid) IN ({placeholders})"
+            );
+            let seats: Vec<crate::owed::EvictedSeat> = match db.prepare(&sql).bind(&b) {
+                Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<EvictedSeatD1>()) {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .map(|r| crate::owed::EvictedSeat {
+                            pot_txid: r.pot_txid,
+                            game_id: r.game_id,
+                            opponent_identity: r.opponent_identity,
+                            seat_settle_pubkey: r.seat_settle_pubkey,
+                        })
+                        .collect(),
+                    Err(e) => {
+                        console_warn!("[owed] evicted seats read failed (a markerless released hop stays unseen this pass): {e}");
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    console_warn!("[owed] evicted seats bind failed: {e}");
+                    Vec::new()
+                }
+            };
+            let mine: HashSet<String> = seats.iter().map(|s| s.pot_txid.to_ascii_lowercase()).collect();
+            let mut twin_keys: Vec<(String, u32, crate::results::CommittedKeys)> = Vec::new();
+            let mut outputs: HashMap<String, (Vec<u8>, u64)> = HashMap::new();
+            for (evicted, outpoints) in unheld.iter().filter(|(t, _)| mine.contains(t)) {
+                let keys_sql = "SELECT lower(txid) AS txid, outputIndex, pubA, pubB, payPkhA, payPkhB FROM pot_records_evicted \
+                                WHERE lockKind = 'covenant' AND paramsDecoded = 1 AND txid = ?1";
+                match db.prepare(keys_sql).bind(&[JsValue::from_str(evicted)]) {
+                    Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<EvictedKeysD1>()) {
+                        Ok(rows) => twin_keys.extend(rows.into_iter().filter_map(|r| {
+                            let keys = crate::results::CommittedKeys::from_columns(
+                                r.pub_a.as_deref(),
+                                r.pub_b.as_deref(),
+                                r.pay_pkh_a.as_deref(),
+                                r.pay_pkh_b.as_deref(),
+                            )?;
+                            let vout = u32::try_from(r.output_index as i64).ok()?;
+                            Some((r.txid.to_ascii_lowercase(), vout, keys))
+                        })),
+                        Err(e) => console_warn!("[owed] evicted keys read failed (a markerless released hop stays unseen this pass): {e}"),
+                    },
+                    Err(e) => console_warn!("[owed] evicted keys bind failed: {e}"),
+                }
+                // `pot_beefs` is never moved by an eviction: the JOIN's own bytes carry its hops as ancestors
+                match db.prepare("SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?1").bind(&[JsValue::from_str(evicted)]) {
+                    Ok(stmt) => match stmt.counted_first::<BeefRow>().await {
+                        Ok(row) => {
+                            if let Some(bytes) = row.and_then(|r| r.beef).and_then(|h| decode_beef_hex(&h)) {
+                                outputs.extend(crate::owed::hop_outputs_from_join_beef(&bytes, outpoints));
+                            }
+                        }
+                        Err(e) => console_warn!("[owed] evicted JOIN bytes read failed (a markerless released hop stays unseen this pass): {e}"),
+                    },
+                    Err(e) => console_warn!("[owed] evicted JOIN bytes bind failed: {e}"),
+                }
+            }
+            let rebuilt = crate::owed::markerless_released_hops(&eviction_rows, &hops, &seats, &twin_keys, &outputs);
+            if !rebuilt.is_empty() {
+                worker::console_log!(
+                    "[owed] recompute for {}…: {} released hop(s) with no marker row rebuilt from the evicted JOIN",
+                    &identity_lc[..identity_lc.len().min(12)],
+                    rebuilt.len()
+                );
+                hops.extend(rebuilt);
+            }
+        }
+    }
     let evicted_hop_outpoints: HashSet<String> =
         crate::owed::refused_hop_outpoints_of(&crate::owed::released_hop_outpoints(&eviction_rows), &hops);
     // 4a-i. bsv-low #486: the DOOR's refusal ledger (`submit_refusals`, the overlay's): a JOIN refused synchronously
