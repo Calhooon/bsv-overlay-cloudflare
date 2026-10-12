@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Behavior REDs in a disposable copy; never checkout or mutate the lane.
 Run one foreground group (under ten minutes): m2, l1l2, l3, scope, presence.
+Second fold: delta-h1, delta-finality, delta-m1, delta-l1, delta-l2,
+delta-height, delta-l3.
 The presence mutant grafts the actual base courier function onto the native
 port, rather than claiming a compile failure proves a behavioral regression.
 """
@@ -15,7 +17,7 @@ DEADLINE = time.monotonic() + 570
 
 ROOT = Path(__file__).resolve().parents[1]
 GROUP = argparse.ArgumentParser()
-GROUP.add_argument('group', choices=['m2', 'l1l2', 'l3', 'presence', 'scope'])
+GROUP.add_argument('group', choices=['m2', 'l1l2', 'l3', 'presence', 'scope', 'delta-h1', 'delta-finality', 'delta-m1', 'delta-l1', 'delta-l2', 'delta-height', 'delta-l3'])
 GROUP = GROUP.parse_args().group
 
 def replace_function(text, name, transform):
@@ -36,7 +38,37 @@ with tempfile.TemporaryDirectory(prefix='ns2-neutered-') as tmp:
     ops = dest / 'crates/overlay-cloudflare/src/ops.rs'
     routes = dest / 'crates/low-app-layer/src/routes.rs'
     txany = dest / 'crates/low-app-layer/src/txany.rs'
-    if GROUP == 'm2':
+    if GROUP.startswith('delta-'):
+        if GROUP == 'delta-h1':
+            txany.write_text(replace_function(txany.read_text(), 'pub fn fact_reader_raw_hex(', lambda _: '\n    if answer.hint_source.is_some() { None } else { answer.raw_hex.as_deref() }\n'))
+            cases = [('low-app-layer', 'ns2pd_h1')]
+        elif GROUP == 'delta-finality':
+            owed = dest / 'crates/low-app-layer/src/owed.rs'
+            s = owed.read_text()
+            start = s.index('Some(w) if w.looked && w.spent == Some(true) =>')
+            s = s[:start] + s[start:].replace('facts["claim"] = Value::Null;', 'facts["claim"] = json!("release");', 1)
+            owed.write_text(s)
+            cases = [('low-app-layer', 'ns2pd_h1')]
+        elif GROUP == 'delta-m1':
+            broad.write_text(replace_function(broad.read_text(), 'fn submit_echo_is_fresh(', lambda _: '\n    let _ = (stamp, now_ms, evicted_at_ms); true\n'))
+            cases = [('bsv-overlay-cloudflare', 'ns2pd_m1')]
+        elif GROUP == 'delta-l1':
+            broad.write_text(replace_function(broad.read_text(), 'fn submit_echo_is_fresh(', lambda _: '\n    let Some(stamp) = stamp else { return true };\n    crate::proof_fetcher::rfc3339_utc_ms(stamp).is_some_and(|at| at <= now_ms + 60_000 && now_ms - at < 30 * 60_000 && evicted_at_ms.is_none_or(|evicted| at > evicted))\n'))
+            cases = [('bsv-overlay-cloudflare', 'ns2pd_l1')]
+        elif GROUP == 'delta-l2':
+            s = routes.read_text()
+            start = s.index('crate::courier::note_presence("tx_any_courier_proof_fault_total")')
+            stop = s.index('\n            };', start)
+            s = s[:start] + 'TxObservation::Fault' + s[stop:]
+            routes.write_text(s)
+            cases = [('low-app-layer', 'ns2pd_l2')]
+        elif GROUP == 'delta-height':
+            routes.write_text(routes.read_text().replace('a.claimed_height = claimed_height;', 'a.claimed_height = None;'))
+            cases = [('low-app-layer', 'ns2pd_l2')]
+        else:
+            routes.write_text(replace_function(routes.read_text(), 'fn arcade_anchor_probe_due(', lambda _: '\n    let _ = now_ms; true\n'))
+            cases = [('low-app-layer', 'ns2pd_l3')]
+    elif GROUP == 'm2':
         base = subprocess.check_output(['git', 'show', '4634090:crates/overlay-cloudflare/src/broadcaster.rs'], cwd=ROOT, text=True)
         arm = base[base.index('async fn submit_once_and_gate('):]
         arm = arm[arm.index('GateVerdict::Reached =>'):arm.index('GateVerdict::Fatal =>')]
@@ -46,7 +78,7 @@ with tempfile.TemporaryDirectory(prefix='ns2-neutered-') as tmp:
         broad.write_text(s)
         cases = [('bsv-overlay-cloudflare', 'ns2_m2'), ('bsv-overlay-cloudflare', 'ns2_612_' ), ('bsv-overlay-cloudflare', 'the_fast_answer_is_off_by_default_and_sits_after')]
     elif GROUP == 'l1l2':
-        broad.write_text(replace_function(broad.read_text(), 'fn submit_echo_is_fresh(', lambda _: '\n    let _ = (stamp, now_ms, admission_at_ms);\n    true\n'))
+        broad.write_text(replace_function(broad.read_text(), 'fn submit_echo_is_fresh(', lambda _: '\n    let _ = (stamp, now_ms, evicted_at_ms);\n    true\n'))
         ops.write_text(replace_function(ops.read_text(), 'pub fn pending_admission_counter(', lambda _: '\n    let _ = duplicate;\n    if fast { COUNTER_SUBMIT_FAST_ADMITTED } else { COUNTER_SUBMIT_PENDING_ADMITTED }\n'))
         cases = [('bsv-overlay-cloudflare', 'ns2_l1'), ('bsv-overlay-cloudflare', 'ns2_l2')]
     elif GROUP == 'l3':
@@ -63,7 +95,7 @@ with tempfile.TemporaryDirectory(prefix='ns2-neutered-') as tmp:
         s += '\nfn ns2_unbound_mined_claim(_: &str, _: &str, _: u64, _: &str) -> bool { true }\n'
         routes.write_text(s)
         txany.write_text(replace_function(txany.read_text().replace('|| memo.evidence.contains("arcade 404 + woc 404")', '|| false'), 'pub fn fact_reader_raw_hex(', lambda _: '\n    answer.raw_hex.as_deref()\n'))
-        cases = [('low-app-layer', 'ns2_m1_scope_and_held'), ('low-app-layer', 'ns2_m1_l4_production'), ('low-app-layer', 'ns2_614_both_false_absence'), ('low-app-layer', 'ns2_m1_foreign_unmined')]
+        cases = [('low-app-layer', 'ns2_m1_scope_and_held'), ('low-app-layer', 'ns2_m1_l4_production'), ('low-app-layer', 'ns2_614_both_false_absence')]
     else:
         base = subprocess.check_output(['git', 'show', '4634090:crates/low-app-layer/src/routes.rs'], cwd=ROOT, text=True)
         assert 'if a.present == Some(false) && absence == crate::txany::AbsenceCorroboration::CorroboratedAbsent' in base
@@ -77,7 +109,7 @@ with tempfile.TemporaryDirectory(prefix='ns2-neutered-') as tmp:
         routes.write_text(s)
         cases = [('low-app-layer', 'ns2_614_arcade_seen_outranks_courier_404s'), ('low-app-layer', 'ns2_614_arcade_unknown_and_two_404s'), ('low-app-layer', 'ns2_614_seen_without'), ('low-app-layer', 'ns2_614_mined_needs'), ('low-app-layer', 'ns2_m1_foreign_unmined'), ('low-app-layer', 'ns2_m1_mined_foreign'), ('low-app-layer', 'ns2_m1_held_anchor')]
     env = dict(os.environ)
-    env.setdefault('CARGO_TARGET_DIR', str(Path.home() / 'bsv/targets/ns-2-presence-fold'))
+    env.setdefault('CARGO_TARGET_DIR', str(Path.home() / 'bsv/targets/ns-2-presence-fold-2'))
     for package, case in cases:
         run = subprocess.run(['cargo', 'test', '--manifest-path', 'workers/Cargo.toml', '-p', package, '--lib', case, '--quiet'], cwd=dest, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=max(1, min(180, DEADLINE - time.monotonic())))
         print(run.stdout, flush=True)
