@@ -97,3 +97,9 @@ Next: force-with-lease push, draft PR, one read of its four checks, and remove
 this worktree and its private target. The captain's delta lens judges before
 any merge; merge is a later lane's. Logs are retained in
 /tmp/ns2-d1bound-fold, and the per-tier Makefile logs use bases 31000/31200.
+
+## Merge addendum: D1BD-L1
+
+The delta lens is LAND. On main `17418b1`, keep its seven migration statements first, followed by the branch's twenty-two; total 218. Register names are `derived_hops::HOP_INSERT` through `PARTY_DELETE`, `LINKS_BACKFILL`, `SEATS_BACKFILL`, and `STATE_DONE` (positions at this merge: 207–215, 216–217, 218). A stamped backfill puts its guard in the OUTER derived table before CROSS JOIN; the populated pin proves zero fleet-scan steps and D1 measures 1 + 1 = 2 rows. The conditional tx-any `terminal` follows main's `tier`, `hintSource`, and `observedAtMs`.
+
+D1BD-L2 remains owed: the route's initial combined page followed by `Cursor::start` is not replayed against the unpaged view by the fixture identity pin. No fold is requested here.
