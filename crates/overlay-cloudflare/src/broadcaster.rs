@@ -1331,6 +1331,16 @@ enum GateStep {
     SyncAccepted,
 }
 
+/// A reached POST echo is a stored acceptance; fast admission leaves its
+/// witness to the pending watch, just like the original submit (#612).
+fn reached_submit_echo(fast_answer: bool) -> GateStep {
+    if fast_answer {
+        GateStep::SyncAccepted
+    } else {
+        GateStep::Accepted
+    }
+}
+
 /// Classify one Arcade submit HTTP response (#213). PURE — unit-tested.
 pub(crate) fn classify_submit_response(status: u16, body: &str) -> SubmitOutcome {
     if (200..300).contains(&status) {
@@ -2602,7 +2612,7 @@ impl ArcadeBroadcaster {
                             "[arcade] {subject_txid} accepted at {} (no poll needed)",
                             parsed.tx_status
                         );
-                        return Ok(GateStep::Accepted);
+                        return Ok(reached_submit_echo(self.fast_answer));
                     }
                     GateVerdict::Fatal => {
                         return Ok(GateStep::AsyncRejected(arcade_fatal_reason(
@@ -4648,6 +4658,41 @@ mod tests {
                 "no corroboration on the wire ({efs_len} leg(s))"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ns2_612_known_seen_with_stored_corroborators_admits_pending() {
+        for legs in [1, 2] {
+            let out = broadcast_efs_gated_with(
+                legs,
+                "subject",
+                |_| async { Ok(reached_submit_echo(true)) },
+                |_| async {
+                    corroborator_verdict(200, r#"{"txid":"subject","txStatus":"STORED"}"#)
+                },
+            )
+            .await;
+            assert_eq!(out.unwrap(), ArcOutcome::AcceptedPending("subject".into()));
+        }
+    }
+
+    #[tokio::test]
+    async fn ns2_612_concurrent_first_and_known_seen_submit_both_admit_pending() {
+        let first = broadcast_efs_gated_with(
+            2,
+            "subject",
+            |_| async { Ok(GateStep::SyncAccepted) },
+            |_| async { panic!("first submit must not corroborate") },
+        );
+        let second = broadcast_efs_gated_with(
+            2,
+            "subject",
+            |_| async { Ok(reached_submit_echo(true)) },
+            |_| async { corroborator_verdict(200, r#"{"txid":"subject","txStatus":"STORED"}"#) },
+        );
+        let (a, b) = tokio::join!(first, second);
+        assert_eq!(a.unwrap(), ArcOutcome::AcceptedPending("subject".into()));
+        assert_eq!(b.unwrap(), ArcOutcome::AcceptedPending("subject".into()));
     }
 
     #[test]
