@@ -1344,13 +1344,15 @@ fn reached_submit_echo(fast_answer: bool) -> GateStep {
 }
 
 /// A stamped stored echo must be younger than the freshness bound and the
-/// admission it would restore. Missing stamps preserve the legacy contract.
-fn submit_echo_is_fresh(stamp: Option<&str>, now_ms: i64, admission_at_ms: Option<i64>) -> bool {
-    let Some(stamp) = stamp else { return true };
+/// eviction it would restore. An unstamped echo cannot restore an eviction.
+fn submit_echo_is_fresh(stamp: Option<&str>, now_ms: i64, evicted_at_ms: Option<i64>) -> bool {
+    let Some(stamp) = stamp else {
+        return evicted_at_ms.is_none();
+    };
     crate::proof_fetcher::rfc3339_utc_ms(stamp).is_some_and(|at| {
         at <= now_ms + 60_000
             && now_ms - at < 30 * 60_000
-            && admission_at_ms.is_none_or(|admitted| at >= admitted)
+            && evicted_at_ms.is_none_or(|evicted| at > evicted)
     })
 }
 
@@ -2095,7 +2097,7 @@ pub struct ArcadeBroadcaster {
     /// derived `AdmitPolicy` (`ADMIT_FAST`).
     fast_answer: bool,
     duplicate_echo: std::cell::Cell<bool>,
-    admission_at_ms: Option<i64>,
+    evicted_at_ms: Option<i64>,
     /// #519: the wall-clock of the indexers' judgement of an Arcade-terminal subject (its own Server-Timing segment).
     terminal_ms: std::cell::Cell<f64>,
     /// #519: how the last Arcade-terminal subject of this request was judged (the route counts it).
@@ -2115,8 +2117,8 @@ impl ArcadeBroadcaster {
         self.duplicate_echo.get()
     }
 
-    pub fn with_admission_at_ms(mut self, at: Option<i64>) -> Self {
-        self.admission_at_ms = at;
+    pub fn with_evicted_at_ms(mut self, at: Option<i64>) -> Self {
+        self.evicted_at_ms = at;
         self
     }
 
@@ -2136,7 +2138,7 @@ impl ArcadeBroadcaster {
             poll_ms: std::cell::Cell::new(0.0),
             fast_answer: false,
             duplicate_echo: std::cell::Cell::new(false),
-            admission_at_ms: None,
+            evicted_at_ms: None,
             terminal_ms: std::cell::Cell::new(0.0),
             terminal_judged: std::cell::Cell::new(None),
             woc_api_key: None,
@@ -2638,10 +2640,10 @@ impl ArcadeBroadcaster {
                         if !submit_echo_is_fresh(
                             parsed.timestamp.as_deref(),
                             worker::Date::now().as_millis() as i64,
-                            self.admission_at_ms,
+                            self.evicted_at_ms,
                         ) {
                             return Err(
-                                "Arcade stored echo predates admission or freshness bound".into()
+                                "Arcade stored echo predates eviction or freshness bound".into()
                             );
                         }
                         // Witnessed mode still corroborates and can answer 502 on
@@ -4699,7 +4701,7 @@ mod tests {
     }
 
     #[test]
-    fn ns2_l1_stored_echo_stamp_is_bounded_by_admission() {
+    fn ns2_l1_stored_echo_stamp_is_bounded_by_eviction() {
         let now = crate::proof_fetcher::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
         assert!(submit_echo_is_fresh(
             Some("2026-10-12T18:14:00Z"),
@@ -4718,6 +4720,32 @@ mod tests {
         ));
         assert!(!submit_echo_is_fresh(Some("bad"), now, None));
         assert!(submit_echo_is_fresh(None, now, None));
+    }
+
+    #[test]
+    fn ns2pd_m1_stored_echo_under_open_eviction_is_not_fresh() {
+        let now = crate::proof_fetcher::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
+        let admission = now - 120_000;
+        let eviction = now - 30_000;
+        let echo = "2026-10-12T18:14:00Z";
+        assert!(submit_echo_is_fresh(Some(echo), now, Some(admission)));
+        assert!(!submit_echo_is_fresh(Some(echo), now, Some(eviction)));
+        let route = include_str!("routes.rs");
+        let arm = &route[route.find("let admit_fast = matches!(").unwrap()
+            ..route.find("let mut arcade =").unwrap()];
+        assert!(
+            arm.contains("ev.evicted_at_ms"),
+            "the real route passes the eviction, not admission"
+        );
+        assert!(!arm.contains("admission_age_ms"));
+        assert!(
+            !submit_echo_is_fresh(None, now, Some(eviction)),
+            "unstamped echo cannot restore an eviction"
+        );
+        assert!(
+            !submit_echo_is_fresh(Some("2026-10-12T18:14:30Z"), now, Some(eviction)),
+            "only strictly newer word counts"
+        );
     }
 
     #[test]

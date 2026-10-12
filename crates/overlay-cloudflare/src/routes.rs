@@ -1305,17 +1305,7 @@ async fn submit_parts(
                 ..
             }
         );
-        let admission_at_ms = if door_open.is_some() {
-            let now = worker::Date::now().as_millis();
-            match env.d1("OVERLAY_DB") {
-                Ok(db) => crate::admit_fast::admission_age_ms(&db, &subject_txid, now)
-                    .await
-                    .map(|age| now.saturating_sub(age) as i64),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
+        let evicted_at_ms = door_open.as_ref().map(|ev| ev.evicted_at_ms as i64);
         let mut arcade =
             crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default())
                 // #214: Arcade's async REJECTED is never authoritative
@@ -1325,7 +1315,7 @@ async fn submit_parts(
                 // admit-fast: the sync accept answers; the witness moves to
                 // the pending watch below (nothing polled on the wire).
                 .with_fast_answer(admit_fast)
-                .with_admission_at_ms(admission_at_ms)
+                .with_evicted_at_ms(evicted_at_ms)
                 // #519: the terminal judgement's WoC read carries the same key the evidence check reads
                 .with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|s| s.to_string()))
                 // NL-6d: `CORROBORATOR_URL` routes both corroborating hosts to one base (the route tier's local
