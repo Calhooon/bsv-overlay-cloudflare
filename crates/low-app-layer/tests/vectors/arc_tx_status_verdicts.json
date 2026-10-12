@@ -1,0 +1,462 @@
+{
+  "description": "Recorded ARC POST /v1/tx answers with an HTTP 2xx code and the verdict a broadcaster must give on each. The body's txStatus decides; the HTTP code never does. Shared with the other ports (rs-sdk, py-sdk): the same bodies, the same verdicts.",
+  "sources": [
+    "ts-stack@edf6e03 packages/sdk/src/transaction/broadcasters/ARC.ts:16-22 (the failure set), 28-38 (the accepted set), 110-180 (the verdict on a 2xx)",
+    "go-sdk@511b58c transaction/broadcaster/arc.go:185-301 (the Go port's reading of the same rule)",
+    "arc@e7efc5b internal/api/handler/default.go:489-500 (the shape of the 2xx body), pkg/api/arc.go:429 (competingTxs is a nullable array), internal/metamorph/metamorph_api/metamorph_api.proto:13-28 (the status words ARC emits)",
+    "bsv-stack-lean issue #35, P0-2; corpus/scenarios/2026-10-08-p0-2-arc-2xx-rejected-is-success.md"
+  ],
+  "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a",
+  "competing_txid": "f67cfb4c12b221ab1b5fef6fdb5a72f82ebc6aad8f28c6d0e5427043a2c5b0a9",
+  "notes": [
+    "txid is the id of the Go SDK test-vector transaction every ARC HTTP test of this crate submits (tests/broadcaster_http_tests.rs, TEST_TX_HEX).",
+    "competing_txid is the display-order id of that transaction's input's source transaction, a plausible competitor; blockHash, blockHeight, merklePath and timestamp values are synthetic and never read by the verdict.",
+    "expect.result is success or failure. On failure: code, description, more (null when none) and txid equal to the submitted transaction's. On success: message (the status word) and competing_txs (null when none).",
+    "An explicit competingTxs: null is what ARC sends on an ordinary 2xx (pkg/api/arc.go:429 has no omitempty; doc/api.md:1512 documents [string] or null); this vector reads null as absent. The reference at the pin answers ERR_INVALID_RESPONSE for a null (ARC.ts:129-132 read a non-array that is not undefined as invalid); not run, a reading.",
+    "2026-10-08, the owner's ruling (bsv-stack-lean #35): QUEUED, REQUESTED_BY_NETWORK and CONFIRMED are accepted as the reference's own spec (specs/broadcast/arc.yaml:407-415) and go-sdk accept them; the reference's TypeScript code returns an invalid response for them. An unknown word (FOOBAR) stays an invalid response."
+  ],
+  "cases": [
+    {
+      "name": "200_rejected_extra_info",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "insufficient fee",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "REJECTED",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "REJECTED",
+        "description": "REJECTED insufficient fee",
+        "more": {
+          "extraInfo": "insufficient fee"
+        }
+      }
+    },
+    {
+      "name": "200_double_spend_attempted_competing_txs",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": [
+          "f67cfb4c12b221ab1b5fef6fdb5a72f82ebc6aad8f28c6d0e5427043a2c5b0a9"
+        ],
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "DOUBLE_SPEND_ATTEMPTED",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "DOUBLE_SPEND_ATTEMPTED",
+        "description": "DOUBLE_SPEND_ATTEMPTED",
+        "more": {
+          "competingTxs": [
+            "f67cfb4c12b221ab1b5fef6fdb5a72f82ebc6aad8f28c6d0e5427043a2c5b0a9"
+          ]
+        }
+      }
+    },
+    {
+      "name": "200_mined_in_stale_block",
+      "http_status": 200,
+      "body": {
+        "blockHash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "blockHeight": 1762040,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "MINED_IN_STALE_BLOCK",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "MINED_IN_STALE_BLOCK",
+        "description": "MINED_IN_STALE_BLOCK",
+        "more": null
+      }
+    },
+    {
+      "name": "200_seen_on_network",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "SEEN_ON_NETWORK",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "success",
+        "message": "SEEN_ON_NETWORK",
+        "competing_txs": null
+      }
+    },
+    {
+      "name": "200_mined",
+      "http_status": 200,
+      "body": {
+        "blockHash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "blockHeight": 1762040,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "MINED",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "success",
+        "message": "MINED",
+        "competing_txs": null
+      }
+    },
+    {
+      "name": "200_no_tx_status",
+      "http_status": 200,
+      "body": {
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "ERR_INVALID_RESPONSE",
+        "description": "ARC returned invalid transaction status metadata.",
+        "more": null
+      }
+    },
+    {
+      "name": "200_seen_in_orphan_mempool",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "SEEN_IN_ORPHAN_MEMPOOL",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "SEEN_IN_ORPHAN_MEMPOOL",
+        "description": "SEEN_IN_ORPHAN_MEMPOOL",
+        "more": null
+      }
+    },
+    {
+      "name": "200_seen_on_network_extra_info_orphan",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "seen in orphan mempool",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "SEEN_ON_NETWORK",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "SEEN_ON_NETWORK",
+        "description": "SEEN_ON_NETWORK seen in orphan mempool",
+        "more": {
+          "extraInfo": "seen in orphan mempool"
+        }
+      }
+    },
+    {
+      "name": "200_rejected_for_another_txid",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "REJECTED",
+        "txid": "f67cfb4c12b221ab1b5fef6fdb5a72f82ebc6aad8f28c6d0e5427043a2c5b0a9"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "ERR_TXID_MISMATCH",
+        "description": "ARC returned a failure for another transaction.",
+        "more": null
+      }
+    },
+    {
+      "name": "200_queued",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "QUEUED",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "success",
+        "message": "QUEUED",
+        "competing_txs": null
+      }
+    },
+    {
+      "name": "200_double_spend_attempted_bad_competing_txs",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": [
+          "not-a-txid"
+        ],
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "DOUBLE_SPEND_ATTEMPTED",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "ERR_INVALID_RESPONSE",
+        "description": "ARC returned invalid competing transaction identifiers.",
+        "more": null
+      }
+    },
+    {
+      "name": "201_rejected",
+      "http_status": 201,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 201,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "REJECTED",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "REJECTED",
+        "description": "REJECTED",
+        "more": null
+      }
+    },
+    {
+      "name": "200_rejected_lowercase",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "rejected",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "rejected",
+        "description": "rejected",
+        "more": null
+      }
+    },
+    {
+      "name": "200_invalid",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "INVALID",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "INVALID",
+        "description": "INVALID",
+        "more": null
+      }
+    },
+    {
+      "name": "200_malformed",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "MALFORMED",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "MALFORMED",
+        "description": "MALFORMED",
+        "more": null
+      }
+    },
+    {
+      "name": "200_seen_on_network_competing_txs",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": [
+          "F67CFB4C12B221AB1B5FEF6FDB5A72F82EBC6AAD8F28C6D0E5427043A2C5B0A9"
+        ],
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "SEEN_ON_NETWORK",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "success",
+        "message": "SEEN_ON_NETWORK",
+        "competing_txs": [
+          "f67cfb4c12b221ab1b5fef6fdb5a72f82ebc6aad8f28c6d0e5427043a2c5b0a9"
+        ]
+      }
+    },
+    {
+      "name": "200_seen_on_network_competing_txs_omitted",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "SEEN_ON_NETWORK",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "success",
+        "message": "SEEN_ON_NETWORK",
+        "competing_txs": null
+      }
+    },
+    {
+      "name": "200_requested_by_network",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "REQUESTED_BY_NETWORK",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "success",
+        "message": "REQUESTED_BY_NETWORK",
+        "competing_txs": null
+      }
+    },
+    {
+      "name": "200_confirmed",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "CONFIRMED",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "success",
+        "message": "CONFIRMED",
+        "competing_txs": null
+      }
+    },
+    {
+      "name": "200_unknown_status_word",
+      "http_status": 200,
+      "body": {
+        "blockHash": "",
+        "blockHeight": 0,
+        "competingTxs": null,
+        "extraInfo": "",
+        "merklePath": "",
+        "status": 200,
+        "timestamp": "2026-10-08T12:00:00Z",
+        "title": "OK",
+        "txStatus": "FOOBAR",
+        "txid": "4d76b00f29e480e0a933cef9d9ffe303d6ab919e2cdb265dd2cea41089baa85a"
+      },
+      "expect": {
+        "result": "failure",
+        "code": "ERR_INVALID_RESPONSE",
+        "description": "ARC returned an unknown transaction status.",
+        "more": null
+      }
+    }
+  ]
+}

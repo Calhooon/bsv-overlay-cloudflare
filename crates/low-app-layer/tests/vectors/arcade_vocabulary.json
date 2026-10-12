@@ -1,7 +1,7 @@
 {
   "sources": [
-    "bsv-rs/tests/vectors/arc_tx_status_verdicts.json (recorded verdict corpus)",
-    "bsv-tracker/src/hints.rs Verdict::from_arc_body (complete vocabulary, including SEEN_MULTIPLE_NODES)"
+    "bsv-rs@6c8d7eb/tests/vectors/arc_tx_status_verdicts.json (recorded verdict corpus)",
+    "bsv-tracker@68073ae/src/hints.rs Verdict::from_arc_body (complete vocabulary, including SEEN_MULTIPLE_NODES)"
   ],
   "words": [
     "SUCCESS",
