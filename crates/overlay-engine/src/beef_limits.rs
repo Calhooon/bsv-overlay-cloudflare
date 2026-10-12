@@ -240,6 +240,11 @@ pub fn structure_roots(bytes: &[u8]) -> Result<Vec<(u64, String)>, Refusal> {
             .map(|(height, root)| (*height, display_hex(root)))
             .collect()),
         Ok(Verdict::Invalid { offset, reason, .. }) => Err(Refusal { offset, reason }),
+        // SDK 0.5.0 contextual checks run only with spend checks enabled;
+        // verify_stream_structure disables them (BeefIndex::structure_only).
+        Ok(Verdict::Unverifiable { .. }) => {
+            unreachable!("the structure-only reader requested mining context")
+        }
         // The structure-only reader runs no script, and a slice never fails.
         Ok(Verdict::SpendRefused { .. }) | Err(_) => {
             unreachable!("the structure check of held bytes ran a script or failed to read")

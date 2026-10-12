@@ -3016,11 +3016,11 @@ mod tests {
     /// REAL producer path (BEEF round-trip), not hand-fed bytes.
     fn beef_fixture() -> (Vec<u8>, String, String) {
         use bsv_rs::transaction::Beef;
-        // A syntactically-valid raw tx: version 1, 1 input (null outpoint,
+        // A syntactically-valid raw tx: version 1, 1 input (regular outpoint,
         // empty script, seq ffffffff), 1 output (1 sat, empty script), lock 0.
         let raw_hex = "0100000001".to_string()
-            + &"00".repeat(32)
-            + "ffffffff"
+            + &"22".repeat(32)
+            + "00000000"
             + "00"
             + "ffffffff"
             + "01"

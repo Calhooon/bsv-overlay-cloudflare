@@ -35,9 +35,9 @@ fn build_object_shape() {
     assert_eq!(
         b["crates"],
         serde_json::json!({
-            "bsv-rs": "0.4.5",
-            "bsv-middleware-cloudflare": "0.5.1",
-            "bsv-middleware-core": "0.2.1",
+            "bsv-rs": "0.5.0",
+            "bsv-middleware-cloudflare": "0.6.0",
+            "bsv-middleware-core": "0.3.0",
         })
     );
 }

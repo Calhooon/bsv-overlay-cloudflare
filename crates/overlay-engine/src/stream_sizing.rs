@@ -56,8 +56,8 @@ impl StreamCharges {
     /// while it builds and hands out one element.
     ///
     /// A raw transaction: its bytes in a growing buffer (3x), an `InputRef`
-    /// of 64 bytes an input and an `OutputRef` of 24 an output, each in a
-    /// growing buffer (192, 72). A BUMP leaf: the `Leaf` of 56 bytes in a
+    /// of 64 bytes an input and an `OutputRef` of 32 an output, each in a
+    /// growing buffer (192, 96). A BUMP leaf: the `Leaf` of 56 bytes in a
     /// growing buffer (168) and, while `bump_root` runs, a path node of 48
     /// twice and an entry in three tables of 49, 41 and 41 bytes a bucket at
     /// up to 16/7 buckets an entry (96 + 112 + 94 + 94): 564, taken as 576.
@@ -68,7 +68,7 @@ impl StreamCharges {
         kept_proven: 0,
         tx_byte: 3,
         tx_input: 192,
-        tx_output: 72,
+        tx_output: 96,
         bump_leaf: 576,
     };
 }
