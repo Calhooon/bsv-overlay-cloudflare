@@ -88,9 +88,10 @@ fn main() {
     rows.push(format!("UPDATE pot_records SET lockKind='covenant', paramsDecoded=1, pubA='{ID_A}', pubB='{ID_B}', pubTower='{ID_A}', payPkhA='{}', payPkhB='{}', rakePkh='{}', stakeA=1, stakeB=1, feeSats=1, recoveryHeight=958846, potSats=2 WHERE txid LIKE 'aa%'", "11".repeat(20),"22".repeat(20),"33".repeat(20)));
     rows.push(format!("UPDATE potparty_records SET seatSettlePubkey='{ID_A}', seatSigHex='00', sigValid=1 WHERE identity='{ID_A}'"));
     rows.extend(d1_fleet::rows(now_s));
+    let l23_start = rows.len();
     rows.extend(l23_r2_route_rows(now_s));
-    for r in &rows {
-        if r.starts_with("UPDATE ") {
+    for (i, r) in rows.iter().enumerate() {
+        if r.starts_with("UPDATE ") || i >= l23_start {
             conn.execute_batch(r).unwrap();
         } else {
             d1_fleet::execute_row(&conn, r);
