@@ -246,6 +246,8 @@ pub fn configured(env: &Env) -> Option<(String, String)> {
 
 /// THE TRANSPORT: POST one body to the app layer's `path`. `Ok(dropped)` on a 2xx, `Err(())` when the POST was
 /// not accepted (logged here under `tag`).
+// The transport logs its concrete error; callers need only delivery success.
+#[allow(clippy::result_unit_err)]
 pub async fn post_body(env: &Env, url: &str, token: &str, path: &str, tag: &str, body: String) -> std::result::Result<usize, ()> {
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
