@@ -23,7 +23,7 @@ fn only_definitive_verdicts_are_terminal_on_single_and_batch_bodies() {
         body.as_object_mut().unwrap().remove("terminal");
         assert_eq!(
             body,
-            serde_json::json!({ "txid": memo.txid, "present": false, "confirmed": null, "height": null, "rawHex": "0100", "source": "memo", "unconfirmable": kind == VerdictKind::Unconfirmable, "claimedHeight": null })
+            serde_json::json!({ "txid": memo.txid, "present": false, "confirmed": null, "height": null, "rawHex": "0100", "source": "memo", "unconfirmable": kind == VerdictKind::Unconfirmable, "claimedHeight": null, "tier": "unknown", "hintSource": null, "observedAtMs": null })
         );
         let batch: serde_json::Value =
             serde_json::from_str(&tx_any_batch_body(&[(memo.txid.clone(), answer)], &[])).unwrap();
