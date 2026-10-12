@@ -123,7 +123,7 @@ async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, want
   const before = await counters()
   assertCountersServed(before)
   const logStart = readFileSync(WORKER_LOG, 'utf8').length
-  const ua = `arcreg-ci/640-${newTxid()}`
+  const ua = `arcreg-ci/640-${newTxid().slice(0, 51)}`
   const res = await postIngest({ txid, txStatus }, { ...headers, 'User-Agent': ua })
   if (res.status !== wantStatus) {
     fail(label, `expected HTTP ${wantStatus}, got ${res.status}: ${res.text.slice(0, 200)}`)
