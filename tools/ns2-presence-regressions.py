@@ -17,7 +17,7 @@ DEADLINE = time.monotonic() + 570
 
 ROOT = Path(__file__).resolve().parents[1]
 GROUP = argparse.ArgumentParser()
-GROUP.add_argument('group', choices=['m2', 'l1l2', 'l3', 'presence', 'scope', 'delta-h1', 'delta-finality', 'delta-m1', 'delta-l1', 'delta-l2', 'delta-height', 'delta-l3'])
+GROUP.add_argument('group', choices=['fold3-m1', 'm2', 'l1l2', 'l3', 'presence', 'scope', 'delta-h1', 'delta-finality', 'delta-m1', 'delta-l1', 'delta-l2', 'delta-height', 'delta-l3'])
 GROUP = GROUP.parse_args().group
 
 def replace_function(text, name, transform):
@@ -38,7 +38,13 @@ with tempfile.TemporaryDirectory(prefix='ns2-neutered-') as tmp:
     ops = dest / 'crates/overlay-cloudflare/src/ops.rs'
     routes = dest / 'crates/low-app-layer/src/routes.rs'
     txany = dest / 'crates/low-app-layer/src/txany.rs'
-    if GROUP.startswith('delta-'):
+    if GROUP == 'fold3-m1':
+        s = broad.read_text()
+        start = s.index('async fn submit_once_and_gate(')
+        s = s[:start] + s[start:].replace('self.evicted_at_ms,', 'None,', 1)
+        broad.write_text(s)
+        cases = [('bsv-overlay-cloudflare', 'ns2pd2_m1')]
+    elif GROUP.startswith('delta-'):
         if GROUP == 'delta-h1':
             txany.write_text(replace_function(txany.read_text(), 'pub fn fact_reader_raw_hex(', lambda _: '\n    if answer.hint_source.is_some() { None } else { answer.raw_hex.as_deref() }\n'))
             cases = [('low-app-layer', 'ns2pd_h1')]

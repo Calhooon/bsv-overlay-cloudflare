@@ -1343,8 +1343,11 @@ fn reached_submit_echo(fast_answer: bool) -> GateStep {
     }
 }
 
-/// A stamped stored echo must be younger than the freshness bound and the
-/// eviction it would restore. An unstamped echo cannot restore an eviction.
+/// Arcade POST submitResponse carries txid, status and txStatus, no timestamp.
+/// Under an OPEN eviction a stored echo never readmits; only the network
+/// fresh accept on OUR re-present readmits through this POST path (#513).
+/// With no eviction the echo is an idempotent ack. The stamped branch below
+/// is defensive for a future body shape, not a delivered readmission rule.
 fn submit_echo_is_fresh(stamp: Option<&str>, now_ms: i64, evicted_at_ms: Option<i64>) -> bool {
     let Some(evicted) = evicted_at_ms else {
         return true;
@@ -4737,11 +4740,16 @@ mod tests {
     #[test]
     fn ns2pd_m1_stored_echo_under_open_eviction_is_not_fresh() {
         let now = crate::proof_fetcher::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
-        let admission = now - 120_000;
         let eviction = now - 30_000;
-        let echo = "2026-10-12T18:14:00Z";
-        assert!(submit_echo_is_fresh(Some(echo), now, Some(admission)));
-        assert!(!submit_echo_is_fresh(Some(echo), now, Some(eviction)));
+        let parsed: ArcadeStatusResponse =
+            serde_json::from_str(r#"{"txid":"subject","status":202,"txStatus":"SEEN_ON_NETWORK"}"#)
+                .unwrap();
+        assert!(parsed.timestamp.is_none(), "POST echo has no timestamp");
+        assert!(!submit_echo_is_fresh(
+            parsed.timestamp.as_deref(),
+            now,
+            Some(eviction)
+        ));
         let route = include_str!("routes.rs");
         let arm = &route[route.find("let admit_fast = matches!(").unwrap()
             ..route.find("let mut arcade =").unwrap()];
@@ -4754,9 +4762,36 @@ mod tests {
             !submit_echo_is_fresh(None, now, Some(eviction)),
             "unstamped echo cannot restore an eviction"
         );
+    }
+
+    #[test]
+    fn ns2pd2_m1_route_open_eviction_stored_refused_fresh_readmitted() {
+        let src = include_str!("broadcaster.rs");
+        let submit = &src[src.find("async fn submit_once_and_gate(").unwrap()..];
+        let reached = &submit[submit.find("GateVerdict::Reached => {").unwrap()
+            ..submit
+                .find("return Ok(reached_submit_echo(self.fast_answer))")
+                .unwrap()];
         assert!(
-            !submit_echo_is_fresh(Some("2026-10-12T18:14:30Z"), now, Some(eviction)),
-            "only strictly newer word counts"
+            reached.contains("self.evicted_at_ms"),
+            "Reached arm must carry the OPEN eviction"
+        );
+        assert!(reached.contains("parsed.timestamp.as_deref()"));
+        assert!(reached.contains("return Err("));
+        let pending = &submit[submit.find("GateVerdict::Pending => {").unwrap()
+            ..submit.find("// A batch").unwrap_or(submit.len())];
+        assert!(pending.contains("return Ok(GateStep::SyncAccepted)"));
+        let route = include_str!("routes.rs");
+        let fresh = &route[route
+            .find("Ok(crate::broadcaster::ArcOutcome::AcceptedPending(pending)) =>")
+            .unwrap()
+            ..route.find("// push (`readmit_if_evicted`)").unwrap()];
+        assert!(fresh.contains("door_open.take()"));
+        assert!(fresh.contains("crate::admit_fast::readmit_if_evicted("));
+        assert!(fresh.contains("crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT"));
+        assert_eq!(
+            ladder_step(GateStep::SyncAccepted, "subject"),
+            Ladder::Return(ArcOutcome::AcceptedPending("subject".into()))
         );
     }
 
