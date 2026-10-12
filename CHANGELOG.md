@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- [#17](https://github.com/Calhooon/bsv-overlay-cloudflare/pull/17): Replace four-crate parity claims with the published engine line and refresh the README.
+- [#18](https://github.com/Calhooon/bsv-overlay-cloudflare/pull/18): Distinguish terminal mempool races, reserve network_seen for broadcaster witnesses, and converge readmitted pots on confirmed competitors (LOW #602).
+- [#19](https://github.com/Calhooon/bsv-overlay-cloudflare/pull/19): Record the confirmed competitor before conflict eviction, recognize unconfirmed mempool bodies, reuse verified spender bytes, preserve the released hop, and bound the spender memo (LOW #605 and #606).
+
 ## Unreleased: health build metadata (L2-74)
 
 - Both deployable Workers serve Zanaadu-shaped `build` metadata on every health route: engine and deployer revisions, dirty status, UTC build time, and exact workers-lock crate versions. Duplicate package entries fail the build; `BUILD_LIB_REV` overrides the deployer revision. Existing health checks and the dashboard version are unchanged.
