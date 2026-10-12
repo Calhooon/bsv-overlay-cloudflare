@@ -148,8 +148,11 @@ impl WorkBudget {
         }
     }
 
-    /// #413 delivery belt: requests push the ancestry; a byte-deferred first
-    /// run pushes only its subject. Later runs already presented that subject.
+    /// #413 delivery belt: requests push the ancestry. A run at cursor 0
+    /// (the first byte-deferred run, and any run re-queued before its walk
+    /// advanced) dual-pushes only the subject (at most two fetches); a run
+    /// resumed past the first leg never dual-pushes, and the request's push
+    /// is unchanged.
     pub fn dual_push_legs<'a, T>(
         self,
         legs: &'a [T],

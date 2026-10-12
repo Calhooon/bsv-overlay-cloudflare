@@ -201,7 +201,7 @@ This native budget model is not a platform-limit or real queue execution.
 
 **D1 delta register addition (verbatim):**
 
-Rung 3 feeds every unproven leg whole and parents-first in one non-registering `/txs` body, except legs the registration window found terminal; only registration is windowed: the subject always, then the nearest 32 ancestors per request. A paused walk stops the pass; on a consumer run the walk precedes the subject-only resubmit and pre-batch corroboration. Each run shares 256 ancestor legs between one walk and registrations and reuses the exhaustion word: at most 552 broadcaster subrequests under the assumed 1,000 default, before binding calls, the engine’s 256 predecessor reads and the pending watch. A run’s cascade-retryable refusal is retried as in a request; Arcade-terminal refusal still requires #519’s two-source corroboration. A first byte-deferred run dual-pushes only the subject (at most two fetches); later runs never dual-push, and the request’s push is unchanged. The skipped-ancestor counter is per rung-3 pass.
+Rung 3 feeds every unproven leg whole and parents-first in one non-registering `/txs` body, except legs the registration window found terminal; only registration is windowed: the subject always, then the nearest 32 ancestors per request. A paused walk stops the pass; on a consumer run the walk precedes the subject-only resubmit and pre-batch corroboration. Each run shares 256 ancestor legs between one walk and registrations and reuses the exhaustion word: at most 552 broadcaster subrequests under the assumed 1,000 default, before binding calls, the engine's 256 predecessor reads and the pending watch. A run's cascade-retryable refusal is retried as in a request; an Arcade-terminal refusal still requires #519's two-source corroboration. A run at cursor 0 (the first byte-deferred run, and any run re-queued before its walk advanced) dual-pushes only the subject (at most two fetches); a run resumed past the first leg never dual-pushes, and the request's push is unchanged. The skipped-ancestor counter is per rung-3 pass.
 
 The broadcaster figure bounds fetches, not arbitrary storage: D1 chunks,
 admission topics and background binding work still depend on the body.
@@ -262,8 +262,8 @@ not an end-to-end queue / D1 refusal-record trace.
 ## ARCREGD2-M1 fold (NS-2-ARCREG-FOLD-5)
 
 `WorkBudget::dual_push_legs` is the real route's selector: requests retain
-all ancestry legs, a first byte-deferred run selects its subject alone, and
-later runs select none. At most two extra broadcaster fetches fit the
+all ancestry legs, a run at cursor 0 selects its subject alone, and
+a run resumed past the first leg selects none. At most two extra broadcaster fetches fit the
 existing 40-call allowance; no duplicate unbounded consumer push returns.
 The proven-ancestry subject pin RED on the neutered selector (no first-run
 legs, exit 101), then GREEN with the first-run arm restored (exit 0). It
@@ -346,3 +346,36 @@ EF legs to `[subject, hop]`. RED on the pre-fold selector at `94ca5b2`: hop
 exit 101. GREEN with txid selection: all 18 ARCREG pins pass, exit 0.
 Evidence: `/tmp/ns2-arcreg-fold-6/l1-{red,green}.log`. Native selection
 plus real BEEF conversion; no live broadcaster witness is claimed.
+
+## ARCREGD3-L2 fold (NS-2-ARCREG-FOLD-6-PR)
+
+The D1 addition now carries delta-3 section 5 verbatim: cursor 0 includes
+requeues before the walk advanced; only a cursor past the first leg suppresses
+the dual push. The selector and route comments use the same cursor rule.
+This is register wording, with no behavior change. The captain owns LOW's D1 row.
+The exact-register assertion is RED before this fold (exit 1) and GREEN
+after it (exit 0), `/tmp/ns2-arcreg-fold-6/l2-{red,green}.log`.
+
+## FOLD-6 final verification
+
+Rust 1.95.0 foreground gates, each bounded to 570 seconds:
+`cargo fmt --all -- --check` exit 0; Makefile's worker-workspace clippy
+`--all-targets -- -D warnings` exit 0; package test exit 0 (lib 716 passed,
+0 failed, 1 ignored export reader; integrations 4 + 9 + 1, doc tests 0).
+The 17 prior ARCREG pins plus the new D5 selection pin all pass.
+
+The route call changed, so only the exact `make ci-route` deferred-EF worker
+launch and NL-6c / NL-6d cells were extracted and run under the foreground
+supervisor, both exit 0 (`ef-route.log`, `tier-exits.log`). Node 22.23.3,
+`LANE_BASE=15420`, initial load 9.82 below 24, wasm-bindgen 0.2.126; the
+worker and fixture ports 15431 / 15432 were free afterward. The 1,000-leg
+job finished in five presentations with all 999 ancestors read once; the
+byte-deferred 40-leg job finished with all 39 ancestors read once.
+`DUAL_BROADCAST=off` keeps these local fixtures from broadcasting. Fold-5's
+sixteen route-tier exits 0 remain the record for the other tiers.
+
+Still based on main `4d95436`, one bsv-rs 0.5.0 in each lock, no lock or
+manifest edit. Evidence remains in `/tmp/ns2-arcreg-fold-6/`. No deploy or
+spend. Live Arcade / TAAL delivery, the platform default / actual subrequest
+trace, variable binding/storage tail, real queue/refusal-record tracing of
+the native seams, and the ignored export reader remain unverified.
