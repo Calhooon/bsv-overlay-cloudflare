@@ -300,14 +300,8 @@ pub async fn event(
             .as_ref()
             .and_then(|s| serde_json::from_str::<Value>(s).ok())
         {
-            if value["present"] == true && value["source"] == "external" {
-                state
-                    .step(
-                        &params,
-                        &empty,
-                        Input::Hint(Hint::new("woc", HintStatus::Seen, now)),
-                    )
-                    .expect("hint input");
+            if let Some(hint) = courier_presence_hint(&value, now) {
+                state.step(&params, &empty, Input::Hint(hint)).expect("hint input");
             }
         }
     }
@@ -391,4 +385,10 @@ pub fn owed_reask_due(row: &Row, now: u64) -> bool {
 /// The spent-any memo plan; a tracked txid does not prove an outpoint pointer.
 pub fn spent_any_memo_plan(probe_targets: &[(String,u32)], memos: &[crate::hops_view::ProbeMemo], now_ms: i64, _stored_words: &BTreeMap<String,Row>) -> crate::hops_view::ProbePlan {
     crate::hops_view::split_probe_targets(probe_targets, memos, now_ms, crate::hops_view::PROBE_MEMO_MAX_AGE_MS)
+}
+
+pub fn courier_presence_hint(value: &Value, now: u64) -> Option<Hint> {
+    let source = value["hintSource"].as_str().or_else(|| (value["present"] == true && value["source"] == "external").then_some("woc"))?;
+    // 0.2.2 has no Announced hint. Unknown retains the courier source without promotion.
+    Some(Hint::new(source, HintStatus::Unknown, now))
 }
