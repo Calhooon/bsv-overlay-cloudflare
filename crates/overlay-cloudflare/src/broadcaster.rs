@@ -113,7 +113,7 @@ pub(crate) enum WitnessLook {
 ///   transport problem);
 /// - transport/parse trouble is the `Err(String)` of [`arc_verdict`]'s caller
 ///   (retryable against a fallback broadcaster).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArcOutcome {
     /// Network accepted (or already knew) the tx; carries ARC's txid.
     Accepted(String),
@@ -942,7 +942,7 @@ impl LegWindow {
 }
 
 /// NL-6d: what one invocation's walk of a corroboration came to.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegWalk {
     /// Every ancestor was primed (or the subject-first attempt accepted): the
     /// subject's verdict, the corroboration's answer.
@@ -1529,7 +1529,8 @@ enum SubmitRung {
     /// [`ARCADE_WAIT_TIMEOUT_MS`] (its wait is about Arcade re-validating,
     /// not about the tracker).
     SubjectOnly { graced: bool },
-    /// Ancestors first, then subject, each alone at `/tx` (attempt 3). Full budget.
+    /// Whole parents-first `/txs` feed, then windowed own-txid `/tx`
+    /// registrations and the subject's gate (attempt 3).
     FullBatch,
 }
 
@@ -1823,6 +1824,123 @@ where
     corroborated_exhaustion(corroborated, subject_txid)
 }
 
+/// ARCREGD-H2: one ancestry walk per pass, with pause ending the ladder.
+/// A consumer presents the subject, then reserves its walk before any registration (including the
+/// orphan shortcut); registrations spend only the remaining 256-leg budget.
+/// The request keeps the direct orphan feed, so H1's 40-hop chain can resolve
+/// in-request. Cache the walk's word, including an inconclusive result: the
+/// exhaustion arm cannot spend the same window a second time in this pass.
+async fn broadcast_efs_gated_in_window_with<S, SFut, C, CFut>(
+    efs_len: usize,
+    subject_txid: &str,
+    window: LegWindow,
+    mut submit_gate: S,
+    mut corroborate: C,
+) -> (Result<ArcOutcome, String>, Option<usize>)
+where
+    S: FnMut(SubmitRung, usize) -> SFut,
+    SFut: std::future::Future<Output = Result<GateStep, String>>,
+    C: FnMut(CorroborationKind) -> CFut,
+    CFut: std::future::Future<Output = LegWalk>,
+{
+    let paused = std::cell::Cell::new(None);
+    let cached_walk = std::cell::RefCell::new(None);
+    let first_step = std::cell::RefCell::new(None);
+    let mut registration_budget = window.budget;
+    if window.budget == crate::ef_deferred::RUN_CORROBORATION_LEGS && has_unproven_ancestry(efs_len)
+    {
+        // Keep the first subject presentation on every run (NL-6d's route
+        // witness); only later rungs can feed/register ancestors. Replay its
+        // word into the pure ladder below without posting it twice.
+        let step = match submit_gate(SubmitRung::SubjectOnly { graced: true }, window.budget).await
+        {
+            Ok(step) => step,
+            Err(error) => return (Err(error), None),
+        };
+        if let GateStep::SyncRejected(reason) = step {
+            return (Ok(ArcOutcome::Rejected(reason)), None);
+        }
+        *first_step.borrow_mut() = Some(step);
+        let walk = corroborate(CorroborationKind::WithAncestry).await;
+        if let LegWalk::Paused { reached } = walk {
+            return (
+                Err(format!(
+                    "corroboration paused at ancestor {reached} (NL-6d)"
+                )),
+                Some(reached),
+            );
+        }
+        // Reserve even a subject-first fast accept conservatively; never
+        // let the look+registration calls add another 256-leg run's work.
+        let walked = efs_len
+            .saturating_sub(1)
+            .saturating_sub(window.from)
+            .min(window.budget);
+        registration_budget = registration_budget.saturating_sub(walked);
+        *cached_walk.borrow_mut() = Some(walk);
+    }
+    let answer = broadcast_efs_gated_with(
+        efs_len,
+        subject_txid,
+        |rung| {
+            // A paused pre-batch corroboration cannot invoke the real rung 3.
+            let cached = if rung == (SubmitRung::SubjectOnly { graced: true }) {
+                first_step.borrow_mut().take()
+            } else {
+                None
+            };
+            let step = if paused.get().is_none() && cached.is_none() {
+                Some(submit_gate(rung, registration_budget))
+            } else {
+                None
+            };
+            async move {
+                if let Some(cached) = cached {
+                    return Ok(cached);
+                }
+                match step {
+                    Some(step) => step.await,
+                    None => Err("corroboration paused; ladder stopped (NL-6d)".into()),
+                }
+            }
+        },
+        |kind| {
+            let cached = if kind == CorroborationKind::WithAncestry {
+                cached_walk.borrow().clone()
+            } else {
+                None
+            };
+            let ask = if cached.is_none() {
+                Some(corroborate(kind))
+            } else {
+                None
+            };
+            let paused = &paused;
+            let cached_walk = &cached_walk;
+            async move {
+                let walk = match cached {
+                    Some(walk) => walk,
+                    None => ask.unwrap().await,
+                };
+                if kind == CorroborationKind::WithAncestry {
+                    *cached_walk.borrow_mut() = Some(walk.clone());
+                }
+                match walk {
+                    LegWalk::Decided(answer) => answer,
+                    LegWalk::Paused { reached } => {
+                        paused.set(Some(reached));
+                        Err(format!(
+                            "corroboration paused at ancestor {reached} (NL-6d)"
+                        ))
+                    }
+                }
+            }
+        },
+    )
+    .await;
+    (answer, paused.get())
+}
+
 /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — the ladder for a subject Arcade
 /// ALREADY holds terminal (pre-flight probe: REJECTED / DOUBLE_SPEND_ATTEMPTED).
 /// PURE control flow, natively wiring-tested like [`broadcast_efs_gated_with`].
@@ -2065,6 +2183,9 @@ fn nearest_registration_legs<'a>(
     budget: usize,
 ) -> Vec<&'a EfTx> {
     use std::collections::{HashMap, HashSet, VecDeque};
+    if budget == 0 {
+        return Vec::new();
+    }
     let by_txid: HashMap<_, _> = full_batch_legs(efs, subject_txid)
         .map(|leg| (leg.txid.as_str(), leg))
         .collect();
@@ -2143,7 +2264,7 @@ where
 {
     let budget = window
         .budget
-        .clamp(1, crate::ef_deferred::RUN_CORROBORATION_LEGS);
+        .min(crate::ef_deferred::RUN_CORROBORATION_LEGS);
     let ancestors = nearest_registration_legs(efs, subject_txid, budget);
     let mut skipped = efs
         .iter()
@@ -2472,8 +2593,8 @@ impl ArcadeBroadcaster {
         .await;
         let res = match walk {
             LegWalk::Decided(res) => res,
-            // NL-6d: the window's budget is spent with ancestors left. The ladder reads this as inconclusive (no
-            // admit, no refusal); the route reads `corroboration_paused_at` first and defers the rest.
+            // NL-6d / ARCREGD-H2: preserve pause through the typed ladder
+            // adapter. No later rung runs; the route defers from this cursor.
             LegWalk::Paused { reached } => {
                 self.legs_paused.set(Some(reached));
                 gate_log(&format!(
@@ -2679,10 +2800,11 @@ impl ArcadeBroadcaster {
             ));
         }
 
-        broadcast_efs_gated_with(
+        let (answer, paused) = broadcast_efs_gated_in_window_with(
             efs.len(),
             subject_txid,
-            |rung| async move {
+            self.legs,
+            |rung, registration_budget| async move {
                 let subject_ef = subject_ef
                     .ok_or_else(|| format!("subject {subject_txid} has no EF leg"))?;
                 match rung {
@@ -2705,7 +2827,7 @@ impl ArcadeBroadcaster {
                         // here too: admit-fast Pending answers AcceptedPending; its
                         // pending watch is armed by the route, with no SEEN poll.
                         let (answer, skipped) = register_full_batch_with(
-                            efs, subject_txid, self.legs,
+                            efs, subject_txid, LegWindow { from: 0, budget: registration_budget },
                             |leg| async move {
                                 overlay_engine::gasp::race_or_deadline(
                                     self.tx_status(&leg.txid), sleep_ms(2_000),
@@ -2737,11 +2859,12 @@ impl ArcadeBroadcaster {
                 }
             },
             |kind| async move {
-                match kind {
+                let answer = match kind {
                     CorroborationKind::SubjectOnly => {
-                        let subject_ef = subject_ef
-                            .ok_or_else(|| format!("subject {subject_txid} has no EF leg"))?;
-                        self.corroborate_subject(subject_ef).await
+                        match subject_ef {
+                            Some(subject_ef) => self.corroborate_subject(subject_ef).await,
+                            None => Err(format!("subject {subject_txid} has no EF leg")),
+                        }
                     }
                     CorroborationKind::WithAncestry => {
                         self.corroborate_batch(efs, subject_txid).await
@@ -2754,10 +2877,15 @@ impl ArcadeBroadcaster {
                             "all-proven BEEF for {subject_txid} carries no subject raw — cannot corroborate the mined-claim; refusing to admit (#268)"
                         )),
                     },
+                };
+                match self.legs_paused.get() {
+                    Some(reached) => LegWalk::Paused { reached },
+                    None => LegWalk::Decided(answer),
                 }
             },
-        )
-        .await
+        ).await;
+        self.legs_paused.set(paused);
+        answer
     }
 
     /// Submit one EF body and SEEN-gate the subject: submit → (echoed-status
@@ -4526,6 +4654,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arcregd_h2_paused_prebatch_stops_every_later_rung() {
+        let rungs = std::cell::RefCell::new(Vec::new());
+        let asks = std::cell::Cell::new(0);
+        let (answer, paused) = broadcast_efs_gated_in_window_with(
+            301,
+            "subject",
+            LegWindow::in_request(),
+            |rung, _| {
+                rungs.borrow_mut().push(rung);
+                async { Ok(GateStep::AsyncRejected("retry".into())) }
+            },
+            |_| {
+                asks.set(asks.get() + 1);
+                async { LegWalk::Paused { reached: 32 } }
+            },
+        )
+        .await;
+        assert!(answer.is_err());
+        assert_eq!(paused, Some(32));
+        assert_eq!(asks.get(), 1, "no repeated exhaustion walk");
+        assert_eq!(
+            *rungs.borrow(),
+            vec![
+                SubmitRung::SubjectOnly { graced: true },
+                SubmitRung::SubjectOnly { graced: false }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn arcregd_h2_300_leg_job_advances_each_run_under_1000_calls() {
+        let efs = arcregd_chain(300);
+        let mut cursor = 32; // the request's NL-6d walk paused here
+        let mut done = false;
+        let mut run_calls = Vec::new();
+        for run in 1..=crate::ef_deferred::JOB_ATTEMPTS {
+            // Conservative allowance for subject probes, rungs, polls and
+            // their corroborator fallback calls (the counted ancestors below
+            // also spend two calls, even when the first host could accept).
+            // Reserve 36 here, plus the explicit final subject's two calls
+            // and the feed/subject pair's two calls below: 40 in total.
+            let calls = std::cell::Cell::new(36usize);
+            let window = LegWindow {
+                from: cursor,
+                budget: crate::ef_deferred::RUN_CORROBORATION_LEGS,
+            };
+            let (answer, paused) = broadcast_efs_gated_in_window_with(
+                efs.len(),
+                &efs[300].txid,
+                window,
+                |rung, registrations| {
+                    if rung == SubmitRung::FullBatch {
+                        calls.set(calls.get() + 2 * registrations.min(300) + 2);
+                    }
+                    async { Ok(GateStep::Orphan("missing parent".into())) }
+                },
+                |kind| {
+                    let efs = &efs;
+                    let calls = &calls;
+                    async move {
+                        if kind != CorroborationKind::WithAncestry {
+                            return LegWalk::Decided(Err("inconclusive".into()));
+                        }
+                        corroborate_batch_with(efs, &efs[300].txid, window, |body| {
+                            calls.set(calls.get() + 2);
+                            let subject = body == hex::encode(&efs[300].ef);
+                            async move {
+                                if subject {
+                                    Ok(ArcOutcome::Accepted("subject".into()))
+                                } else {
+                                    Err("ancestor word discarded".into())
+                                }
+                            }
+                        })
+                        .await
+                    }
+                },
+            )
+            .await;
+            eprintln!(
+                "300-leg run {run}: cursor={cursor}, paused={paused:?}, calls={}",
+                calls.get()
+            );
+            // Model #571's platform error: a spent budget prevents the cursor write.
+            let next = if calls.get() < 1000 { paused } else { None };
+            if let Some(next) = next {
+                assert!(next > cursor, "a run must advance its persisted cursor");
+                cursor = next;
+            } else if calls.get() < 1000 && matches!(answer, Ok(ArcOutcome::Accepted(_))) {
+                cursor = 300;
+                done = true;
+            }
+            run_calls.push(calls.get());
+            if done {
+                break;
+            }
+        }
+        assert!(done, "300-leg job ends failed after five nonadvancing runs");
+        assert_eq!(cursor, 300);
+        assert!(
+            run_calls.iter().all(|calls| *calls <= 552),
+            "bounded broadcaster subrequests: {run_calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn arcregd_h2_walk_and_registration_share_256_and_exhaustion_is_cached() {
+        let efs = arcregd_chain(200);
+        let walk_asks = std::cell::Cell::new(0);
+        let registered = std::cell::Cell::new(0);
+        let (answer, paused) = broadcast_efs_gated_in_window_with(
+            efs.len(),
+            &efs[200].txid,
+            LegWindow {
+                from: 0,
+                budget: crate::ef_deferred::RUN_CORROBORATION_LEGS,
+            },
+            |rung, budget| {
+                if rung == SubmitRung::FullBatch {
+                    registered.set(budget);
+                }
+                async { Ok(GateStep::AsyncRejected("retry".into())) }
+            },
+            |kind| {
+                if kind == CorroborationKind::WithAncestry {
+                    walk_asks.set(walk_asks.get() + 1);
+                }
+                async { LegWalk::Decided(Err("inconclusive even after priming".into())) }
+            },
+        )
+        .await;
+        assert!(answer.is_err());
+        assert_eq!(paused, None);
+        assert_eq!(walk_asks.get(), 1);
+        assert_eq!(registered.get(), 56);
+        assert_eq!(200 + registered.get(), 256);
+        let source: String = include_str!("routes.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            source.contains("dual_on&&matches!(budget,crate::ef_deferred::WorkBudget::InRequest)"),
+            "consumer wait_until cannot launch an unbounded duplicate walk"
+        );
+    }
+
+    #[tokio::test]
     async fn arcreg_h1_window_nearest_subject_and_calls() {
         for (n, budget) in [(100usize, 32usize), (80, 32), (300, 256)] {
             let mut efs: Vec<_> = (0..n)
@@ -4718,7 +4993,7 @@ mod tests {
             .collect();
         let batch = &code[code.find("SubmitRung::FullBatch=>{").unwrap()..];
         let batch = &batch[..batch.find("CorroborationKind::SubjectOnly").unwrap()];
-        assert!(batch.contains("register_full_batch_with(efs,subject_txid,self.legs,"));
+        assert!(batch.contains("register_full_batch_with(efs,subject_txid,LegWindow{from:0,budget:registration_budget},"));
         assert!(batch.contains("self.submit_ef(&self.tx_endpoint(),&leg.txid,&leg.ef,register)"));
         assert!(batch.contains("self.submit_once_and_gate(&self.tx_endpoint(),&leg.ef,&leg.txid,1,ARCADE_WAIT_TIMEOUT_MS,register_callback,"));
         assert!(batch.contains("self.tx_status(&leg.txid)"));
@@ -4745,13 +5020,28 @@ mod tests {
         let fatal = code.find("GateVerdict::Fatal").expect("the fatal probe arm");
         let presence = code.find("self.terminal_presence(subject_txid").expect("the presence judgement");
         let young = code.find("subject_young.await").expect("the age floor");
-        let reask = code.find("self.terminal_presence_fresh(subject_txid").expect("the fresh re-ask before a refusal");
-        let remember = code.find("self.terminal_remember(subject_txid").expect("the memo written after the age decision");
-        let ret = code.find("return terminal_at_arcade_by_presence(").expect("the return");
-        assert!(young < reask && reask < remember && remember < ret, "young@{young} reask@{reask} remember@{remember} return@{ret}");
-        let register = code.find("let register_callback").expect("the register-once rule");
-        let rung = code.find("broadcast_efs_gated_with(").expect("the ladder's rungs");
-        let mined_claim = code.find("CorroborationKind::MinedClaim").expect("the mined-claim dispatch");
+        let reask = code
+            .find("self.terminal_presence_fresh(subject_txid")
+            .expect("the fresh re-ask before a refusal");
+        let remember = code
+            .find("self.terminal_remember(subject_txid")
+            .expect("the memo written after the age decision");
+        let ret = code
+            .find("return terminal_at_arcade_by_presence(")
+            .expect("the return");
+        assert!(
+            young < reask && reask < remember && remember < ret,
+            "young@{young} reask@{reask} remember@{remember} return@{ret}"
+        );
+        let register = code
+            .find("let register_callback")
+            .expect("the register-once rule");
+        let rung = code
+            .find("broadcast_efs_gated_in_window_with(")
+            .expect("the ladder's rungs");
+        let mined_claim = code
+            .find("CorroborationKind::MinedClaim")
+            .expect("the mined-claim dispatch");
         assert!(
             fatal < presence && presence < young && young < ret && ret < register && register < rung && ret < mined_claim,
             "fatal@{fatal} presence@{presence} young@{young} return@{ret} register@{register} rung@{rung} mined@{mined_claim}"
