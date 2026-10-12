@@ -1,5 +1,5 @@
 // #638: execute exact native-pinned pages through D1, retaining rows_read (wrangler's local CLI drops it).
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
@@ -10,7 +10,12 @@ let miniflarePath
 try { miniflarePath = require.resolve('miniflare') }
 catch {
   const root = execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim()
-  miniflarePath = createRequire(join(root, 'wrangler/package.json')).resolve('miniflare')
+  try { miniflarePath = createRequire(join(root, 'wrangler/package.json')).resolve('miniflare') }
+  catch {
+    // The same npx-only setup supported by the Makefile, when there is no global install.
+    const cli = execFileSync('npm', ['exec', '--package', 'wrangler', '--', 'which', 'wrangler'], { encoding: 'utf8' }).trim()
+    miniflarePath = createRequire(realpathSync(cli)).resolve('miniflare')
+  }
 }
 const { Miniflare } = await import(miniflarePath)
 const config = readFileSync(new URL('../../crates/low-app-layer/wrangler.toml', import.meta.url), 'utf8')

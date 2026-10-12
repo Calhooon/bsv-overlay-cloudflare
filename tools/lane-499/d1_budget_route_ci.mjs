@@ -241,6 +241,15 @@ const measured = {}
   check('submit-admit-1', (measured['/submit'] = segment(res.timing, 'd1')))
 }
 
+// #638: measure each additional hot read on the same fleet fixture, with no invented request bars.
+for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
+  const r = await get(APP, `${path}?identity=${ID_A}`)
+  if (r.status !== 200) fail(`${path} answers`, `${r.status}: ${r.text.slice(0, 200)}`)
+  const got = segment(r.timing, 'd1')
+  if (!got) fail(`${path} carries D1 figures`, 'no d1 segment')
+  else table.push({ name: path, got, ceiling: null })
+}
+
 // ── 3. the health surfaces carry the running maxima ────────────────────────
 {
   const app = (await appHealth()).d1Budget
