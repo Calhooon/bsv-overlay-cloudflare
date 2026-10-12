@@ -1,4 +1,4 @@
-# low-proof-replay
+# bsv-low-proof-replay
 
 Replays a LOW/proof/v1 transcript bundle and re-derives both hands using
 `bsv-low-core` and `bsv-low-wire` from crates.io. The `prove_bundle` function
