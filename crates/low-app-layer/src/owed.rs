@@ -872,6 +872,114 @@ pub fn markerless_plan(candidates: &[MarkerlessCandidate]) -> (Vec<MarkerlessCan
     )
 }
 
+/// Per-JOIN evidence reads shared by the Worker and the real-SQLite pins.
+#[allow(async_fn_in_trait)]
+pub trait MarkerlessEvidenceReads {
+    async fn index(&mut self, txid: &str, vout: u32) -> Result<Option<MarkerlessIndex>, String>;
+    async fn keys(
+        &mut self,
+        join: &str,
+    ) -> Result<Vec<(String, u32, crate::results::CommittedKeys)>, String>;
+    async fn beef(&mut self, join: &str) -> Result<Option<Vec<u8>>, String>;
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MarkerlessIndex {
+    pub spent: Option<f64>,
+    #[serde(rename = "spendingTxid")]
+    pub spending_txid: Option<String>,
+    #[serde(rename = "spentConfirmed")]
+    pub spent_confirmed: Option<f64>,
+}
+
+#[derive(Default)]
+pub struct MarkerlessEvidence {
+    pub keys: Vec<(String, u32, crate::results::CommittedKeys)>,
+    pub outputs: HashMap<String, (Vec<u8>, u64)>,
+    pub index: HashMap<String, MarkerlessIndex>,
+    pub faults: Vec<OwedRow>,
+}
+
+/// Missing permanent bytes and failed per-JOIN reads fault that candidate, never the owed list.
+/// A fault names the ledger's possible outpoints without asserting ownership, value or a press.
+pub async fn read_markerless_candidate(
+    reads: &mut impl MarkerlessEvidenceReads,
+    identity: &str,
+    candidate: &MarkerlessCandidate,
+    outpoints: &[(String, u32)],
+    seats: &[EvictedSeat],
+    index_budget: &mut usize,
+) -> MarkerlessEvidence {
+    let mut evidence = MarkerlessEvidence::default();
+    let attempt = async {
+        for (txid, vout) in outpoints {
+            if *index_budget == 0 {
+                return Err("evidence-unheld: hop index read lies past the bound".to_owned());
+            }
+            *index_budget -= 1;
+            if let Some(row) = reads.index(txid, *vout).await? {
+                evidence.index.insert(outpoint_key(txid, *vout), row);
+            }
+        }
+        evidence.keys = reads.keys(&candidate.txid).await?;
+        let bytes = reads.beef(&candidate.txid).await?.ok_or_else(|| {
+            "evidence-missing: the evicted JOIN's stored bytes are absent or undecodable".to_owned()
+        })?;
+        evidence.outputs = hop_outputs_from_join_beef(&bytes, outpoints);
+        if evidence.outputs.len() != outpoints.len() {
+            return Err(
+                "evidence-missing: the evicted JOIN's stored outputs are absent or undecodable"
+                    .to_owned(),
+            );
+        }
+        Ok::<_, String>(())
+    }
+    .await;
+    if let Err(reason) = attempt {
+        note_markerless_read_fault();
+        let seat = seats
+            .iter()
+            .find(|s| s.pot_txid.eq_ignore_ascii_case(&candidate.txid));
+        evidence = MarkerlessEvidence::default();
+        evidence.faults = outpoints
+            .iter()
+            .map(|(txid, vout)| OwedRow {
+                identity: identity.to_owned(),
+                outpoint: outpoint_key(txid, *vout),
+                family: OwedFamily::Unbound,
+                game_id: seat.map_or_else(String::new, |s| s.game_id.clone()),
+                sats: None,
+                opponent_identity: seat.map(|s| s.opponent_identity.clone()),
+                at_height: None,
+                facts: json!({"markerlessEvidence":true,"markerlessJoin":candidate.txid,
+                "markerlessReadFault":true,"evidenceMissing":reason.starts_with("evidence-missing"),
+                "hopTxid":txid,"hopVout":vout,"claim":null,"claimable":false,
+                "markerCreatedAtMs":candidate.evicted_at as i64}),
+                reason: Some(format!("could not judge: {reason}")),
+            })
+            .collect();
+    }
+    evidence
+}
+
+/// Missing evidence cannot replace a row independently judged from other evidence for the same UTXO.
+/// Unverified/Unknown marker rows and older candidate faults may be replaced by the current fault sentence.
+pub fn merge_markerless_faults(rows: &mut Vec<OwedRow>, faults: Vec<OwedRow>) {
+    for fault in faults {
+        if let Some(index) = rows.iter().position(|r| r.outpoint == fault.outpoint) {
+            let replace = matches!(
+                rows[index].facts["markerVerified"].as_str(),
+                Some("unknown" | "unverified")
+            ) || rows[index].facts["markerlessReadFault"] == true;
+            if !replace {
+                continue;
+            }
+            rows.remove(index);
+        }
+        rows.push(fault);
+    }
+}
+
 /// A failed inline refresh serves the older evidence as a could-not-judge sentence, never a fresh press.
 pub fn markerless_faulted_rows(mut rows: Vec<OwedRow>) -> Vec<OwedRow> {
     for r in rows

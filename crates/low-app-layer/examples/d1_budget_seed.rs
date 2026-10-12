@@ -152,8 +152,12 @@ fn l23_r2_route_rows(now_s: u64) -> Vec<String> {
     // Synthetic fault leg: a latched party row whose stored ancestor read returns no bytes.
     let fault_id = format!("02{}", "f1".repeat(32));
     let fault_join = "dd".repeat(32);
+    let fresh_pot = "ee".repeat(32);
     rows.push(format!("INSERT INTO potparty_records_evicted(identity,potTxid,gameId,opponentIdentity,seatSettlePubkey,sigValid,af_evictedAt) VALUES ('{fault_id}','{fault_join}','{game}','opponent','{}',1,{})", "02".repeat(33), now_s * 1000));
-    rows.push(format!("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES ('{fault_join}','REJECTED',{},'[{{\"txid\":\"{hop}\",\"vout\":0}}]')", now_s * 1000));
+    rows.push(format!("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES ('{fault_join}','REJECTED',{},'[{{\"txid\":\"{hop}\",\"vout\":0}},{{\"txid\":\"{fresh_pot}\",\"vout\":0}}]')", now_s * 1000));
+    // A healthy unrelated family for the same seat must remain freshly served after the missing JOIN.
+    rows.push(format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt) VALUES ('{fresh_pot}',0,0,{now_s})"));
+    rows.push(format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt) VALUES ('{fault_id}','opponent','healthy-game','{fresh_pot}',0,958846,'3045ab','healthy-filing',0,{now_s})"));
     let cached_id = format!("02{}", "f2".repeat(32));
     rows.push(format!("INSERT INTO potparty_records_evicted(identity,potTxid,gameId,opponentIdentity,seatSettlePubkey,sigValid,af_evictedAt) VALUES ('{cached_id}','{fault_join}','{game}','opponent','{}',1,{})", "02".repeat(33), now_s * 1000));
     rows.push(format!("INSERT INTO owed_state(identity,computedAtMs,rows,stale,truncated) VALUES ('{cached_id}',{},1,1,0)", now_s*1000-900000));

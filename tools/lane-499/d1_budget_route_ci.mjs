@@ -190,12 +190,14 @@ const measured = {}
   else fail('L23R2-M3 twin-only captured seat computes through owed route', `${r.status} ${r.text}`)
 }
 
-// L23R2-L2: a failed ancestor read is counted and served as "could not judge", never an empty 200.
+// L23R2D-M1: absent permanent bytes fault this candidate; the first read serves its row with 200.
 {
   const before = (await appHealth()).owed.markerlessReadFaults
   const r = await get(APP, `/owed?identity=02${'f1'.repeat(32)}`)
   const after = (await appHealth()).owed.markerlessReadFaults
-  if (r.status === 503 && r.text.includes('could not judge') && after > before)
+  const body = JSON.parse(r.text)
+  const fault = body.rows?.find(row => row.facts?.evidenceMissing)
+  if (r.status === 200 && fault?.reason?.includes('evidence-missing') && fault.facts.claim == null && body.rows.length === 2 && body.rows.some(row => row.gameId === 'healthy-game') && body.truncated && after > before)
     pass('L23R2-L2 markerless read fault counted, could not judge served')
   else fail('L23R2-L2 markerless read fault counted, could not judge served', `${r.status} ${r.text} faults ${before}->${after}`)
 }
