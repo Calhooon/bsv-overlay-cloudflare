@@ -1,25 +1,25 @@
 # NS-3-APPLAYER-TRACKER readiness, 2026-10-12
-Status: WALLED at the step-1 wasm prerequisite; steps 2 through 6 are outstanding.
-Branch `lane/ns-3-applayer-tracker`, fetched base `ec83281`; no deploy or spend.
-Step 1 commit: `a4304da`, app-layer dependency exactly `bsv-tracker = "=0.2.2"`.
-Files: `crates/low-app-layer/Cargo.toml`, `workers/Cargo.lock`, `tests/tracker_dependency.rs` in that crate.
-`cargo tree --manifest-path workers/Cargo.toml -p low-app-layer -i bsv-rs`: one SDK, 0.5.0, including tracker 0.2.2.
-Lock delta: tracker and its dependency edge only; no existing version changed. CLI checked: wasm-bindgen 0.2.126.
-Native `cargo test --manifest-path workers/Cargo.toml -p low-app-layer`: GREEN.
-Named pin `ns3_dependency_uses_sdk_050_and_checked_evidence`: GREEN; real SDK path passed directly to the tracker.
-Pin evidence: Arcade MINED at height 10 leaves Built; a proof checked by Headers writes Mined(10), root and retained header.
-Changed-file rustfmt, `git diff --check`, and app-layer all-target clippy with `-D warnings`: GREEN.
-wasm32: NOT RUN; every sampled one-minute load before this checkpoint exceeded 24 (24.58 to 28.46; last 24.77).
-The load rule also defers `make ci-route` and `make ci-d1-budget`; no budget figures were measured.
-Headers adapter: NOT IMPLEMENTED; must preserve binding transport faults, missing/behind headers and fresh snapshot semantics.
-ProofFetcher adapter: NOT IMPLEMENTED; Arcade only for held/submitted subjects, then all three courier fallbacks.
-HintSource adapter: NOT IMPLEMENTED; Verdict::from_arc_body emits hints, never checked evidence.
-Clock adapter: NOT IMPLEMENTED; Worker Date::now() must supply seconds as required by Clock::now.
-Served fields: before = deployed producers; after = identical producers, with no new word/tier/verifyPath fields yet.
-Captured route-body before/after comparison and new adapter/route RED/GREEN pins: NOT RUN.
-Five production-body compatibility pins: absent on fetched main; found on origin/lane/ns-2-d1bound, not imported.
-tx_words migration and admission/callback/proof/retire write events: NOT IMPLEMENTED.
-Persistence constraint: State and CheckedProof have no trusted deserializer; stored raw proof inputs need a Headers check.
-Owed arm retained unchanged: D3 SEEN+final; existing `a_seen_and_final_settle_classifies_with_no_proof_through_the_real_sql` passes.
-No integrated tracker-versus-legacy served fixture disagreements measured; MINED-hint evidence boundary is pinned above.
-Next: prove wasm under load 24, then adapters, additive served words, write-time persistence, owed inputs and full gates/lenses.
+Status: BLOCKED at the compact persistence contract; the lane is not complete.
+Host `box`; existing branch worktree `~/bsv/wt-ns-3-tracker` used because `wt-overlay-box` has unrelated edits; no deploy or spend.
+Step 1 remains `a4304da` (dependency) + `9165e16` (first-launch notes); tracker exactly 0.2.2, one bsv-rs 0.5.0; no lock changes.
+Step 2 `c59c0a2`: `src/tracker_host/mod.rs`, Headers via CHAINTRACKS snapshots, staged CourierProofs, BroadcasterHints and WorkerClock.
+Headers: header_response/headers stage `/findHeaderHexForHeight` + `/getPresentHeight`; missing, behind, malformed and transport fault cannot check; changing tip fails closed.
+ProofFetcher: execute_reask asks Arcade only for held/submitted subjects, then WoC, Bitails, BananaBlocks; tsc_proof reduces SDK paths, Headers.check alone accepts them.
+BananaBlocks route/body probed read-only: https://bananablocks.com/api/docs; `/tx/{txid}/proof`, fixture `tests/fixtures/ns3/banana-tsc.json`, height 956597, root d204a3ac…47fcd57.
+HintSource: Verdict::from_arc_body/into_hint keeps metadata, source and seconds; broadcaster words cannot write chain words. Clock: Date::now milliseconds / 1000.
+Step 3 `4cc64ce`: `tracker_host/served.rs` fields/transaction/spenders render State; helpers only, production `/tx-any`, `/spent-any`, `/utxo-status` and owed are NOT wired.
+Synthetic legacy-body pin before: confirmed=true,height=null,claimedHeight=10; after: those fields identical, word=seen,tier=hint,verifyPath=null; this disagreement is a lens finding.
+Checked Mined renders the path, root, height and header hash; stale/suspect renders no verifyPath; the complete height tuple is nested under tracker to preserve the old height field.
+Persistence spike `a2f3d43`: `tests/support/tracker_stored.rs` Record::replay/rechecked and `tests/tracker_stored.rs`; strictly test-only.
+At v0.2.2, src/state.rs exposes new/step/getters, no State serde or restore; CheckedProof has no trusted deserializer (README and compile-fail docs).
+A journal preserves the machine but restores it by replaying historical inputs/snapshots on reads; that violates the requested lookup-only rule. No such production read was shipped.
+Decision requested: permit a persisted tracker-produced wire view with proof-only restore/recheck, or obtain a compact snapshot/restore boundary in the pinned crate; do not manufacture words.
+`tx_words` CREATE/UPSERT is pinned under SQLite in the spike only; no production migration or submit/callback/courier/retire write hooks shipped.
+Step 5 NOT IMPLEMENTED: derive_owed_rows remains legacy; the named D3 SEEN+spenderFinal arm stays; spent/pending/lost tracker inputs await persistence.
+`a2f3d43` also imports NS-2's five-body production-builder fixture (results, refund-view, recovery-view, refund-backups, owed; fleet-shaped rows and three page offsets), byte-identical GREEN.
+Clean `cargo test -p low-app-layer`: 658 passing; all-target clippy -D warnings and storage-ownership GREEN; two redundant format borrows removed, intentional unit transport error documented.
+Separate neutered worktree/target: five adapter pins and one renderer pin RED; clean counterparts GREEN; six adapter pins, two renderer pins and three persistence pins pass.
+Baseline `make ci-d1-budget` + `make -o ci-d1-budget ci-route`: GREEN; utxo 8/0/1, pots 8/0/1, results:view 191/0/6, owed 352/18/26 (reads/writes/statements); NOT tracker-integrated figures.
+Final wasm32 build and worker-build --release GREEN, wasm-bindgen 0.2.126, Node 22; logs `/tmp/ns3-{native-tests,clippy,d1-budget,route,wasm,worker-build}.log`.
+New Rust files and changed additions formatted; whole-crate cargo fmt --check reports existing debt outside these hunks; no mass formatting. Temporary targets/worktree removed at end.
+Unverified: compact persistence decision, production route tier/new budget delta, write-event delivery, owed integration, from-scratch and delta lenses, live deployment; next finish steps 3–6 after the boundary is settled.
