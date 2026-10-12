@@ -181,6 +181,9 @@ pub const COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: &str = "arc_ingest_unauthorized_no
 /// `/arc-ingest` callbacks REFUSED 401 because a token WAS presented and did
 /// not equal the subject txid. Diagnosis: a stale registration, or a prober.
 pub const COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: &str = "arc_ingest_unauthorized_bad_token_total";
+/// #640: ancestor legs left unregistered by the 32/request, 256/run window.
+/// Their proofs still arrive through the backstop poll and couriers.
+pub const COUNTER_ARC_REGISTRATION_SKIPPED: &str = "arc_registration_legs_skipped_total";
 /// bsv-low loop 6 (2026-09-07): MINED callbacks for a txid NO topic admitted
 /// (a `/submit` that admitted 0 outputs still registered the webhook) — nobody
 /// holds it, nothing is owed; acknowledged 200 and COUNTED (a 5xx made Arcade
