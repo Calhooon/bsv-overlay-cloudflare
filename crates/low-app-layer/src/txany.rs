@@ -548,6 +548,34 @@ pub fn parse_woc_confirmations(v: &serde_json::Value) -> Option<bool> {
     v.get("confirmations").and_then(serde_json::Value::as_u64).map(|c| c >= 1)
 }
 
+/// bsv-low #606: the WHOLE claim of a WoC `GET /tx/hash/{txid}` 200 body, for the asked `txid_lc`: `Some(true)`
+/// mined, `Some(false)` present and UNCONFIRMED, `None` no claim (the leg's FAULT).
+///
+/// WoC's shapes, probed live 2026-10-12 (the L22-E602-CELL review): a MEMPOOL transaction's body has the keys
+/// `hash, locktime, size, txid, version, vin, vout` and NO `confirmations` field; a MINED one adds `blockhash,
+/// blockheight, blocktime, confirmations, time`. #527 LOW-3 (2026-09-28) read every body without the field as a
+/// fault, so every unconfirmed foreign transaction was a fault from then on.
+///
+/// - A body WITH `confirmations` keeps LOW-3's path (`parse_woc_confirmations`): numeric, else no claim.
+/// - A body WITHOUT it is an unconfirmed presence only when it is structurally WoC's mempool transaction: `txid`
+///   the asked txid (any case), `vin` and `vout` arrays, and no `blockhash` / `blockheight` (a mined body that lost
+///   its count is no claim). LOW-3's concern (a partial or re-shaped body read as "present, unconfirmed") is met by
+///   these keys and by the hash-verified raw the leg then fetches; `{}`, a foreign `txid` or a missing array stay
+///   faults.
+pub fn parse_woc_tx_claim(v: &serde_json::Value, txid_lc: &str) -> Option<bool> {
+    if v.get("confirmations").is_some() {
+        return parse_woc_confirmations(v);
+    }
+    let txid_ok = v
+        .get("txid")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|t| t.eq_ignore_ascii_case(txid_lc));
+    let shaped = v.get("vin").is_some_and(serde_json::Value::is_array)
+        && v.get("vout").is_some_and(serde_json::Value::is_array);
+    let mined_keys = v.get("blockhash").is_some() || v.get("blockheight").is_some();
+    (txid_ok && shaped && !mined_keys).then_some(false)
+}
+
 /// Verify externally-fetched raw bytes: they must parse AND hash to `txid`.
 /// Returns the lowercase hex, or `None` (a lying/garbled provider byte never
 /// leaves the server).
@@ -1040,6 +1068,50 @@ mod tests {
         assert_eq!(parse_woc_confirmations(&json!({})), None);
         assert_eq!(parse_woc_confirmations(&json!({"confirmations": "3"})), None);
         assert_eq!(parse_woc_confirmations(&json!({"confirmations": null})), None);
+    }
+
+    /// bsv-low #606: WoC's MEMPOOL body (the keys measured live 2026-10-12: no `confirmations`) is an unconfirmed
+    /// presence; a mined body keeps its answer; `{}`, a string count, a foreign txid, a missing array and a mined
+    /// key without the count stay no claim. RED on `22742afd` (the leg read every such body through
+    /// `parse_woc_confirmations`: `None`).
+    #[test]
+    fn e606_a_the_woc_mempool_body_is_an_unconfirmed_presence() {
+        let t = "16c657c6".repeat(8);
+        let mempool = json!({"hash": t, "locktime": 0, "size": 191, "txid": t, "version": 1, "vin": [{"txid": "aa".repeat(32), "vout": 0}], "vout": [{"value": 0.0002019, "n": 0}]});
+        assert_eq!(parse_woc_tx_claim(&mempool, &t), Some(false));
+        assert_eq!(
+            parse_woc_tx_claim(&mempool, &t.to_ascii_uppercase()),
+            Some(false)
+        );
+        let mut mined = mempool.clone();
+        mined["blockhash"] = json!("00".repeat(32));
+        mined["blockheight"] = json!(970_733);
+        mined["blocktime"] = json!(1_791_800_000u64);
+        mined["time"] = json!(1_791_800_000u64);
+        mined["confirmations"] = json!(3);
+        assert_eq!(parse_woc_tx_claim(&mined, &t), Some(true));
+        let mut zero = mempool.clone();
+        zero["confirmations"] = json!(0);
+        assert_eq!(parse_woc_tx_claim(&zero, &t), Some(false));
+        assert_eq!(parse_woc_tx_claim(&json!({}), &t), None);
+        let mut s = mined.clone();
+        s["confirmations"] = json!("3");
+        assert_eq!(parse_woc_tx_claim(&s, &t), None);
+        assert_eq!(
+            parse_woc_tx_claim(&mempool, &"ee".repeat(32)),
+            None,
+            "a foreign txid"
+        );
+        let mut no_vin = mempool.clone();
+        no_vin.as_object_mut().unwrap().remove("vin");
+        assert_eq!(parse_woc_tx_claim(&no_vin, &t), None);
+        let mut lost_count = mined.clone();
+        lost_count.as_object_mut().unwrap().remove("confirmations");
+        assert_eq!(
+            parse_woc_tx_claim(&lost_count, &t),
+            None,
+            "a mined body without its count"
+        );
     }
 
     #[test]
