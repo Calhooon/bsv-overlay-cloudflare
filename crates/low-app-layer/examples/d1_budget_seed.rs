@@ -77,10 +77,89 @@ fn main() {
         let stranger = format!("02{i:064x}");
         pot('c', &stranger, i);
     }
+    rows.extend(l23_r2_route_rows(now_s));
     for r in &rows {
         conn.execute(r, []).unwrap_or_else(|e| panic!("the fixture row is refused by the production schema: {e}\n{r}"));
         out.push_str(r);
         out.push_str(";\n");
     }
     print!("{out}");
+}
+
+// L23R2 route-selection pin: captured pair-13 rows alongside #499's synthetic budget seats.
+// A twin-only identity, ninth behind stranger evictions, at 25h, with a planted unverified hop marker.
+fn l23_r2_route_rows(now_s: u64) -> Vec<String> {
+    let f: serde_json::Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/l23_r2_pair13_captured.json"
+    ))
+    .unwrap();
+    let mut rows = Vec::new();
+    for (name, table) in [
+        ("evictions", "pot_evictions"),
+        ("parties", "potparty_records_evicted"),
+        ("locks", "pot_records_evicted"),
+        ("join_beef", "pot_beefs"),
+    ] {
+        for row in f["rows"][name].as_array().unwrap() {
+            let fields: Vec<_> = row
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| !k.contains('('))
+                .collect();
+            let values: Vec<_> = fields
+                .iter()
+                .map(|(k, v)| {
+                    if k.as_str() == "evictedAt" {
+                        return ((now_s - 25 * 3600) * 1000).to_string();
+                    }
+                    match v {
+                        serde_json::Value::Null => "NULL".into(),
+                        serde_json::Value::String(v) if k.as_str() == "beef" => format!("X'{v}'"),
+                        serde_json::Value::String(v) => format!("'{}'", v.replace('\'', "''")),
+                        serde_json::Value::Number(v) => v.to_string(),
+                        _ => panic!("unexpected captured column"),
+                    }
+                })
+                .collect();
+            rows.push(format!(
+                "INSERT INTO {table} ({}) VALUES ({})",
+                fields
+                    .iter()
+                    .map(|(k, _)| format!("\"{k}\""))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                values.join(",")
+            ));
+        }
+    }
+    let hop = "97288e47d846066d59f0caa8a2bec22fd9040dd5af05f323c67cf010373ab064";
+    let me = "02f9f80a92a92677d97fce5bb0a03d0321425b918868b3ef5773120d9cf5364e49";
+    let game = "9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f";
+    let competitor = "57d8e2907420da08795e3146fb5bd05446a51ef2f870213775a074eccae73851";
+    let mut beef = bsv_rs::transaction::Beef::new();
+    beef.merge_raw_tx(
+        hex::decode(f["competitor_raw_hex"].as_str().unwrap()).unwrap(),
+        None,
+    );
+    rows.push(format!(
+        "INSERT INTO pot_beefs(txid,beef,createdAt) VALUES ('{competitor}',X'{}',{now_s})",
+        hex::encode(beef.to_binary())
+    ));
+    rows.push(format!("INSERT INTO pot_records(txid,outputIndex,spent,spentConfirmed,createdAt) VALUES ('{hop}',0,0,0,{now_s})"));
+    rows.push(format!("INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES ('{hop}.0',{},1,'{competitor}',1)",now_s*1000));
+    rows.push(format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,markerValid,txid,outputIndex,createdAt) VALUES ('{me}','stranger','{game}',0,20190,'{}','00','00',3,0,'{hop}',2,{now_s})","02".repeat(33)));
+    // Synthetic fault leg: a latched party row whose stored ancestor read returns no bytes.
+    let fault_id = format!("02{}", "f1".repeat(32));
+    let fault_join = "dd".repeat(32);
+    rows.push(format!("INSERT INTO potparty_records_evicted(identity,potTxid,gameId,opponentIdentity,seatSettlePubkey,sigValid,af_evictedAt) VALUES ('{fault_id}','{fault_join}','{game}','opponent','{}',1,{})", "02".repeat(33), now_s * 1000));
+    rows.push(format!("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES ('{fault_join}','REJECTED',{},'[{{\"txid\":\"{hop}\",\"vout\":0}}]')", now_s * 1000));
+    let cached_id = format!("02{}", "f2".repeat(32));
+    rows.push(format!("INSERT INTO potparty_records_evicted(identity,potTxid,gameId,opponentIdentity,seatSettlePubkey,sigValid,af_evictedAt) VALUES ('{cached_id}','{fault_join}','{game}','opponent','{}',1,{})", "02".repeat(33), now_s * 1000));
+    rows.push(format!("INSERT INTO owed_state(identity,computedAtMs,rows,stale,truncated) VALUES ('{cached_id}',{},1,1,0)", now_s*1000-900000));
+    rows.push(format!("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs) VALUES ('{cached_id}','{hop}:0','hop-stranded','{game}','{{\"markerlessEvidence\":true,\"claim\":\"sweep-hop\",\"claimable\":true}}',{})",now_s*1000-900000));
+    for i in 1..=8 {
+        rows.push(format!("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES ('{i:064x}','REJECTED',{},'[{{\"txid\":\"{}\",\"vout\":0}}]')",now_s*1000,"aa".repeat(32)));
+    }
+    rows
 }
