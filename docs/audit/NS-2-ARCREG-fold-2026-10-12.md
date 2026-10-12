@@ -201,12 +201,7 @@ This native budget model is not a platform-limit or real queue execution.
 
 **D1 delta register addition (verbatim):**
 
-Rung 3 feeds every unproven leg whole and parents-first in one non-registering
-`/txs` body; only registration is windowed: the subject always, then the
-nearest 32 ancestors per request. A paused walk stops the pass. Each consumer
-run shares 256 ancestor legs between one walk and registrations and reuses
-the exhaustion word: at most 552 broadcaster subrequests under the assumed
-1,000 default, leaving 448 for binding calls (the house's #571 bound).
+Rung 3 feeds every unproven leg whole and parents-first in one non-registering `/txs` body, except legs the registration window found terminal; only registration is windowed: the subject always, then the nearest 32 ancestors per request. A paused walk stops the pass; on a consumer run the walk precedes the subject-only resubmit and pre-batch corroboration. Each run shares 256 ancestor legs between one walk and registrations and reuses the exhaustion word: at most 552 broadcaster subrequests under the assumed 1,000 default, before binding calls, the engine’s 256 predecessor reads and the pending watch. A run’s cascade-retryable refusal is retried as in a request; Arcade-terminal refusal still requires #519’s two-source corroboration. A first byte-deferred run dual-pushes only the subject (at most two fetches); later runs never dual-push, and the request’s push is unchanged. The skipped-ancestor counter is per rung-3 pass.
 
 The broadcaster figure bounds fetches, not arbitrary storage: D1 chunks,
 admission topics and background binding work still depend on the body.
@@ -250,7 +245,7 @@ Cleanup removes only this lane's target and neutered copy; logs remain in /tmp.
 
 The consumer wrapper routes synchronous refusals through `ladder_step`'s
 request arms. A cascade-retryable ancestor word retries and is never a
- definitive refusal; body-only script/fee failures retain the ladder's
+definitive refusal; body-only script/fee failures retain the ladder's
 validation arm. Arcade-terminal network status still uses #519's fresh
 indexer judgement; one broadcaster's stored word evicts nothing.
 
@@ -262,3 +257,16 @@ walk corroborates acceptance, and a non-cascade validation failure uses the
 same terminal arm as a request. All 14 existing pins plus these two pass.
 Evidence: `/tmp/ns2-arcreg-fold-5/h1-{red,green}.log`. These are native seams,
 not an end-to-end queue / D1 refusal-record trace.
+
+
+## ARCREGD2-M1 fold (NS-2-ARCREG-FOLD-5)
+
+`WorkBudget::dual_push_legs` is the real route's selector: requests retain
+all ancestry legs, a first byte-deferred run selects its subject alone, and
+later runs select none. At most two extra broadcaster fetches fit the
+existing 40-call allowance; no duplicate unbounded consumer push returns.
+The proven-ancestry subject pin RED on the neutered selector (no first-run
+legs, exit 101), then GREEN with the first-run arm restored (exit 0). It
+also checks request ancestry and empty / later-run selections and pins the
+route's use of that selector. Evidence: `/tmp/ns2-arcreg-fold-5/m1-{red,green}.log`.
+The D1 addition above incorporates all six second-delta register corrections.

@@ -148,6 +148,16 @@ impl WorkBudget {
         }
     }
 
+    /// #413 delivery belt: requests push the ancestry; a byte-deferred first
+    /// run pushes only its subject. Later runs already presented that subject.
+    pub fn dual_push_legs<T>(self, legs: &[T]) -> &[T] {
+        match self {
+            Self::InRequest => legs,
+            Self::Resumed { from_leg: 0 } => &legs[legs.len().saturating_sub(1)..],
+            Self::Resumed { .. } => &[],
+        }
+    }
+
     /// PURE. NL-6d: a run that resumes a walk past its first leg (an earlier
     /// invocation already presented the work).
     pub fn resumed_mid_walk(self) -> bool {
@@ -1038,6 +1048,40 @@ mod tests {
             txid: txid.to_string(),
             ef: vec![0u8; n],
         }
+    }
+
+    #[test]
+    fn arcregd2_m1_byte_deferred_first_run_emits_subject_dual_push() {
+        // One subject EF with proven parents, too large for a request: there
+        // is no unproven-ancestry foreground walk to supply its witness.
+        let efs = [leg("subject", IN_REQUEST_SUBJECT_EF_BYTES + 1)];
+        assert!(!EfWork::of(&efs, "subject").fits_request());
+        let emitted: Vec<_> = WorkBudget::Resumed { from_leg: 0 }
+            .dual_push_legs(&efs)
+            .iter()
+            .map(|e| e.txid.as_str())
+            .collect();
+        assert_eq!(emitted, ["subject"]);
+        let chain = [leg("parent", 1), leg("subject", 1)];
+        assert_eq!(WorkBudget::InRequest.dual_push_legs(&chain).len(), 2);
+        assert_eq!(
+            WorkBudget::Resumed { from_leg: 0 }.dual_push_legs(&chain)[0].txid,
+            "subject"
+        );
+        assert!(WorkBudget::Resumed { from_leg: 32 }
+            .dual_push_legs(&chain)
+            .is_empty());
+        assert!(WorkBudget::Resumed { from_leg: 0 }
+            .dual_push_legs::<EfTx>(&[])
+            .is_empty());
+        let source: String = include_str!("routes.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            source.contains("budget.dual_push_legs(&efs).iter()"),
+            "the real dual push must use the bounded legs"
+        );
     }
 
     #[test]
