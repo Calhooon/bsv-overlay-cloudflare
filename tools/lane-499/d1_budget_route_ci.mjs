@@ -164,6 +164,45 @@ const measured = {}
   measured['/owed'] = first && served ? { reads: Math.max(first.reads, served.reads), writes: Math.max(first.writes, served.writes), stmts: Math.max(first.stmts, served.stmts) } : null
 }
 
+// L23R2-H1/M2/M3/M4: the real /owed route over captured, markerless, twin-only 25h evidence.
+{
+  const p28 = '02f9f80a92a92677d97fce5bb0a03d0321425b918868b3ef5773120d9cf5364e49'
+  const r = await get(APP, `/owed?identity=${p28}`)
+  const body = JSON.parse(r.text)
+  const row = body.rows?.find(r => r.gameId === '9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f')
+  if (r.status === 200 && row?.facts?.spendKind === 'spent-elsewhere' && row.facts.claim == null && row.facts.markerlessCandidates === 1)
+    pass('L23R2 route-selection: captured ninth eviction, twin-only seat, planted marker, 25h story')
+  else fail('L23R2 route-selection: captured ninth eviction, twin-only seat, planted marker, 25h story', r.text.slice(0, 2000))
+  const h = await appHealth()
+  if (h.owed.markerlessIgnoredMarkers >= 1) pass('L23R2-M2 planted marker counted')
+  else fail('L23R2-M2 planted marker counted', JSON.stringify(h.owed))
+}
+
+// L23R2-L2: a failed ancestor read is counted and served as "could not judge", never an empty 200.
+{
+  const before = (await appHealth()).owed.markerlessReadFaults
+  const r = await get(APP, `/owed?identity=02${'f1'.repeat(32)}`)
+  const after = (await appHealth()).owed.markerlessReadFaults
+  if (r.status === 503 && r.text.includes('could not judge') && after > before)
+    pass('L23R2-L2 markerless read fault counted, could not judge served')
+  else fail('L23R2-L2 markerless read fault counted, could not judge served', `${r.status} ${r.text} faults ${before}->${after}`)
+}
+
+// The detached fault must also mark a previously served snapshot; its old press is withheld.
+{
+  const url = `/owed?identity=02${'f2'.repeat(32)}`
+  let r = await get(APP, url)
+  for (let i = 0; i < 30 && !JSON.parse(r.text).rows?.[0]?.facts?.markerlessReadFault; i++) {
+    await new Promise(resolve => setTimeout(resolve, 100))
+    r = await get(APP, url)
+  }
+  const body = JSON.parse(r.text)
+  const row = body.rows?.[0]
+  if (r.status === 200 && body.truncated && body.judgement?.includes('could not judge') && row?.facts?.markerlessReadFault && row.facts.claim == null)
+    pass('L23R2-L2 cached snapshot tells could-not-judge and withholds its press')
+  else fail('L23R2-L2 cached snapshot tells could-not-judge and withholds its press', `${r.status} ${r.text}`)
+}
+
 // ── 2. the overlay's admission writes ──────────────────────────────────────
 {
   const raw = collectedTx()
