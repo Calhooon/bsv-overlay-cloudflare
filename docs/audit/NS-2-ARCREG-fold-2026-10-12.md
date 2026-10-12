@@ -41,7 +41,9 @@ full-batch rung (attempt 3, reached on an orphan view or an inconclusive
 pre-batch corroboration) posts at most 32 unproven ancestors per request,
 256 per consumer run, NEAREST the subject first, each alone to Arcade `/tx`
 under its own txid and registered only when Arcade's own status read does
-not hold it; their answers are discarded. Then it posts the subject alone
+not hold it; their answers are discarded. Known terminal ancestors (REJECTED /
+DOUBLE_SPEND_ATTEMPTED) are neither registered nor re-fed, and are counted
+in the same skipped counter. Then it posts the subject alone
 under its own txid with the register-once rule unchanged. The `/txs` body
 that registered every ancestor under the SUBJECT's token is gone. The rest
 remain unregistered and counted; their proofs remain the backstop poll's
@@ -72,3 +74,14 @@ Bearer candidate first, then X-CallbackToken; absent/malformed schemes have
 shape `other`, length 0. The auth classifier still compares both candidates.
 The pin covers a near-1-MiB body, huge status/UA, malformed headers, both
 shape words and absence of the credential's value.
+
+## L3: terminal ancestor skip
+
+A status with matching identity and REJECTED / DOUBLE_SPEND_ATTEMPTED skips
+both registration and re-feed, counted in `arc_registration_legs_skipped_total`.
+The window bounds status reads even if all selected ancestors are terminal;
+terminal legs do not cause the walk to search farther. Known nonterminal
+ancestors are primed without registration. A mismatched terminal response
+is an unknown look, not permission to suppress a leg. The seam pin covers
+both terminal statuses, a known pending leg, a mismatched response and the
+subject still posted last.

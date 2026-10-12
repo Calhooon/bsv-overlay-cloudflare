@@ -181,7 +181,8 @@ pub const COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: &str = "arc_ingest_unauthorized_no
 /// `/arc-ingest` callbacks REFUSED 401 because a token WAS presented and did
 /// not equal the subject txid. Diagnosis: a stale registration, or a prober.
 pub const COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: &str = "arc_ingest_unauthorized_bad_token_total";
-/// #640: ancestor legs left unregistered by the 32/request, 256/run window.
+/// #640: ancestor legs left unregistered by the 32/request, 256/run window,
+/// plus known TERMINAL ancestors skipped without a re-feed.
 /// Their proofs still arrive through the backstop poll and couriers.
 pub const COUNTER_ARC_REGISTRATION_SKIPPED: &str = "arc_registration_legs_skipped_total";
 /// bsv-low loop 6 (2026-09-07): MINED callbacks for a txid NO topic admitted
@@ -997,6 +998,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: 0,
         COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: 0,
         COUNTER_ARC_INGEST_UNKNOWN_TXID: 0,
+        COUNTER_ARC_REGISTRATION_SKIPPED: 0,
         COUNTER_TIP_PASS_TOTAL: 0,
         // S2 (2026-08-29): seeded so a never-bumped counter reads an explicit
         // 0 on the surface — an ABSENT key is an unknown, and an unknown must
