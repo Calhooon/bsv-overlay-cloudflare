@@ -525,6 +525,7 @@ async fn build_health_response(
             "lookupServiceCount": services.len(),
         },
         "checks": all_checks,
+        "build": bsv_worker_build_info::build_json!(),
     });
     json_ok(&body)
 }

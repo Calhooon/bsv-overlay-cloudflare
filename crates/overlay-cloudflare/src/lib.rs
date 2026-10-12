@@ -2692,3 +2692,7 @@ mod beef_door_replay;
 // that reads a D1 export through the Worker's own readers.
 #[cfg(test)]
 mod stored_rows;
+
+#[cfg(test)]
+#[path = "../../worker-build-info/src/worker_tests.rs"]
+mod build_info_tests;

@@ -193,6 +193,7 @@ dependencies = [
  "bsv-overlay-discovery",
  "bsv-overlay-engine",
  "bsv-rs",
+ "bsv-worker-build-info",
  "hex",
  "js-sys",
  "low-proof-replay",
@@ -270,6 +271,13 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "urlencoding",
+]
+
+[[package]]
+name = "bsv-worker-build-info"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -928,6 +936,7 @@ dependencies = [
  "bsv-overlay-discovery",
  "bsv-overlay-engine",
  "bsv-rs",
+ "bsv-worker-build-info",
  "console_error_panic_hook",
  "futures-util",
  "getrandom",

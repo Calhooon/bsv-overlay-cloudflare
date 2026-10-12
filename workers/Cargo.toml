@@ -15,6 +15,7 @@
 #   cargo test --manifest-path workers/Cargo.toml --workspace
 [workspace]
 members = [
+    "../crates/worker-build-info",
     "../crates/overlay-cloudflare",
     "../crates/low-app-layer",
     "../crates/low-proof-replay",

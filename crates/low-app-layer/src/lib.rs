@@ -467,3 +467,7 @@ mod d1_ledger_door_pins {
 
 #[cfg(test)]
 mod beef_door_replay;
+
+#[cfg(test)]
+#[path = "../../worker-build-info/src/worker_tests.rs"]
+mod build_info_tests;

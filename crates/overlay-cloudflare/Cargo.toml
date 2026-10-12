@@ -17,7 +17,11 @@ workspace = "../../workers"
 # skipped (the "running 0 tests" symptom).
 crate-type = ["cdylib", "rlib"]
 
+[build-dependencies]
+bsv-worker-build-info = { path = "../worker-build-info", features = ["build"] }
+
 [dependencies]
+bsv-worker-build-info = { path = "../worker-build-info" }
 overlay-engine = { package = "bsv-overlay-engine", version = "0.1", path = "../overlay-engine" }
 overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1", path = "../overlay-discovery" }
 # bsv-low #553: the `LOW/proof/v1` replay `ls_proof` runs ONCE at admission,

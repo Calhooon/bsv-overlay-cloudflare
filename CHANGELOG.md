@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased: health build metadata (L2-74)
+
+- Both deployable Workers serve Zanaadu-shaped `build` metadata on every health route: engine and deployer revisions, dirty status, UTC build time, and exact workers-lock crate versions. Duplicate package entries fail the build; `BUILD_LIB_REV` overrides the deployer revision. Existing health checks and the dashboard version are unchanged.
+
 ## Unreleased: the workers on bsv-middleware-cloudflare 0.5.1, the bsv-rs 0.3 bridge gone, the Arcade vector at the toolbox 0.7.4's bytes, LOW's N3, N4, N5 and L1 (align-engine-050, 2026-10-10)
 
 The four findings are LOW's, in their own words at bsv-low's `docs/audit/E585-land2-lens-2026-10-10.md`
