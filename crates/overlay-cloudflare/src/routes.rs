@@ -2229,6 +2229,9 @@ async fn submit_parts(
         }
     }
 
+    if let Some(txid) = crate::beef_limits::parse_beef(&tagged_beef.beef, &crate::beef_limits::EF_BEEF_LIMITS).ok().and_then(|mut beef| crate::ef::subject_txid_of(&mut beef)) {
+        crate::tracker_events::note(&txid, "submit", None);
+    }
     // Mainnet SHIP fan-out — discover tm_X peers via SLAP trackers and POST
     // the BEEF to each. Only runs when at least one topic admitted at least
     // one output locally, matching the TS SHIPBroadcaster pattern (don't
@@ -2837,6 +2840,7 @@ pub async fn arc_ingest(
         }
     }
 
+    crate::tracker_events::note(&txid, "callback", serde_json::from_str(&raw).ok());
     let (merkle_path, block_height) = match body {
         // #228 fix: a non-MINED lifecycle callback is NORMAL webhook traffic,
         // not an error. Acknowledge (2xx), count, and — INCIDENT

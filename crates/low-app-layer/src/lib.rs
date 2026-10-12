@@ -227,6 +227,10 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // bsv-low #499 (lens fold L2): keyed `(boot)` in the ledger, not under the route that woke the isolate.
     let schema_ready = d1_ledger::boot(schema::ensure_latch_columns(&env)).await;
 
+    if req.method() == worker::Method::Post && req.path() == "/internal/tx-word" {
+        return tracker_host::runtime::ingest(req, &env).await;
+    }
+
     // W2-P4: first-party internal webhooks (bearer INTERNAL_TOKEN) — served
     // BEFORE the BRC-103 front door, exactly like the relay's /broadcast:
     // the callers are our workers, not identities with a wallet.

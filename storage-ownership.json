@@ -1326,6 +1326,21 @@
    "never_wipe": false,
    "holds": "transactional hop view derivation",
    "why": "rebuild from admitted hop markers, pot columns and party rows"
+   },
+   {
+   "name": "tx_words",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {
+    "low-app-layer": [
+     "CREATE"
+    ]
+   },
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "compact tracker words and checked proof records per subject",
+   "why": "NS-3 write-time projection, K11 replacement boundary; no journal"
   }
  ],
  "other_stores_owners_only": {
