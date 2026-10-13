@@ -4538,14 +4538,23 @@ pub(crate) async fn owed_recompute_and_push(
 }
 
 /// The alarm owns one reserved walk from the exhausted window. It does not consume the next window's admits.
-pub(crate) async fn owed_deferred_walk_and_push(env: &worker::Env, identity_lc: &str) -> worker::Result<()> {
+pub(crate) async fn owed_deferred_walk_and_push(
+    env: &worker::Env,
+    identity_lc: &str,
+) -> worker::Result<()> {
     let db = env.d1("OVERLAY_DB")?;
     crate::owed::note_recompute_deferred();
     worker::console_log!("[owed] deferred walk for {identity_lc}");
     owed_walk_and_push(env, &db, identity_lc, "deferred", None).await
 }
 
-async fn owed_walk_and_push(env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>) -> worker::Result<()> {
+async fn owed_walk_and_push(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    identity_lc: &str,
+    source: &str,
+    tip_hint: Option<u64>,
+) -> worker::Result<()> {
     // bsv-low #499 (lens fold M3): the walk runs under its own ledger, keyed `owed-recompute` in `d1Budget` (it runs
     // after the answer, in `wait_until`, where no request's scope holds it; before, it landed only in `unscoped`)
     let (walked, d1) =
@@ -4646,19 +4655,32 @@ fn owed_read_shed(identity_lc: &str, source: &str) -> Option<(i64, Option<i64>)>
     decision
 }
 fn owed_deferred_deadline(identity_lc: &str) -> Option<i64> {
-    OWED_RATE.with(|r| r.borrow_mut().arm_deferred(identity_lc, worker::Date::now().as_millis() as i64))
+    OWED_RATE.with(|r| {
+        r.borrow_mut()
+            .arm_deferred(identity_lc, worker::Date::now().as_millis() as i64)
+    })
 }
 async fn owed_schedule_deferred(env: &worker::Env, identity_lc: &str, deadline: Option<i64>) {
     // The shed captures the deadline BEFORE any await: a slow re-mark crossing the window must not lose its alarm.
-    let Some(end) = deadline else { return; };
+    let Some(end) = deadline else {
+        return;
+    };
     let result = async {
         let ns = env.durable_object("BOARD_VIEW")?;
-        let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity_lc}:{end}"));
+        let name =
+            OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity_lc}:{end}"));
         let stub = ns.id_from_name(&name)?.get_stub()?;
-        let response = stub.fetch_with_str(&format!("https://board-view/owed-deferred?identity={identity_lc}&due={end}")).await?;
-        if response.status_code() != 200 { return Err(worker::Error::RustError("owed alarm refused".into())); }
+        let response = stub
+            .fetch_with_str(&format!(
+                "https://board-view/owed-deferred?identity={identity_lc}&due={end}"
+            ))
+            .await?;
+        if response.status_code() != 200 {
+            return Err(worker::Error::RustError("owed alarm refused".into()));
+        }
         Ok::<(), worker::Error>(())
-    }.await;
+    }
+    .await;
     if let Err(e) = result {
         crate::owed::note_recompute_arm_failed();
         OWED_RATE.with(|r| r.borrow_mut().unarm_deferred(identity_lc, end));
@@ -4903,7 +4925,9 @@ async fn owed_first_read_reserved(
     db: &worker::D1Database,
     identity: &str,
 ) -> std::result::Result<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool), Result<Response>> {
-    let end = OWED_RATE.with(|r| r.borrow().window_end(identity)).unwrap_or(0);
+    let end = OWED_RATE
+        .with(|r| r.borrow().window_end(identity))
+        .unwrap_or(0);
     if end <= worker::Date::now().as_millis() as i64 {
         // The clock crossed the window during admission. This is now an ordinary next-window walk.
         if owed_recompute_admit(identity, "read-first", false) {
@@ -4914,10 +4938,19 @@ async fn owed_first_read_reserved(
         let ns = env.durable_object("BOARD_VIEW")?;
         let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity}:{end}"));
         let stub = ns.id_from_name(&name)?.get_stub()?;
-        let mut response = stub.fetch_with_str(&format!("https://board-view/owed-deferred?identity={identity}&due={end}&read=1")).await?;
-        if response.status_code() != 200 { return Err(worker::Error::RustError(response.text().await?)); }
-        response.json::<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool)>().await
-    }.await;
+        let mut response = stub
+            .fetch_with_str(&format!(
+                "https://board-view/owed-deferred?identity={identity}&due={end}&read=1"
+            ))
+            .await?;
+        if response.status_code() != 200 {
+            return Err(worker::Error::RustError(response.text().await?));
+        }
+        response
+            .json::<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool)>()
+            .await
+    }
+    .await;
     result.map_err(|e| {
         console_warn!("[owed] reserved first read failed: {e}");
         json_error("the owed list could not be computed", 503)
@@ -5067,7 +5100,10 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                 }
                             });
                         } else {
-                            let claim = owed_refresh_begin(&identity, worker::Date::now().as_millis() as i64);
+                            let claim = owed_refresh_begin(
+                                &identity,
+                                worker::Date::now().as_millis() as i64,
+                            );
                             crate::owed::note_read_refresh(claim.is_some());
                             match claim {
                                 Some(token) => {
@@ -5079,14 +5115,26 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                     if admitted {
                                         wait.wait_until(async move {
                                             if let Ok(db) = env.d1("OVERLAY_DB") {
-                                                owed_recompute_claimed(&env, &db, &id, &src, None, token, true).await;
+                                                owed_recompute_claimed(
+                                                    &env, &db, &id, &src, None, token, true,
+                                                )
+                                                .await;
                                             } else {
                                                 owed_refresh_end(&id, token);
                                             }
                                         });
                                     } else {
                                         owed_refresh_end(&identity, token);
-                                        refresh_retry = Some(OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)).unwrap_or(0));
+                                        refresh_retry = Some(
+                                            OWED_RATE
+                                                .with(|r| {
+                                                    r.borrow().retry_after_ms(
+                                                        &identity,
+                                                        worker::Date::now().as_millis() as i64,
+                                                    )
+                                                })
+                                                .unwrap_or(0),
+                                        );
                                         let deferred = owed_deferred_deadline(&identity);
                                         wait.wait_until(async move {
                                             if let Ok(db) = env.d1("OVERLAY_DB") {
@@ -5099,7 +5147,13 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                 None => {
                                     // the delta-verify's LOW-B: a stale read that cannot kick is REMEMBERED — the holder of
                                     // the lock runs it once more (a filing that marked stale during an in-flight walk)
-                                    OWED_RERUN.with(|m| crate::owed::owed_rerun_note(&mut m.borrow_mut(), &identity, source));
+                                    OWED_RERUN.with(|m| {
+                                        crate::owed::owed_rerun_note(
+                                            &mut m.borrow_mut(),
+                                            &identity,
+                                            source,
+                                        )
+                                    });
                                     crate::owed::note_recompute_coalesced();
                                 }
                             }
@@ -5114,7 +5168,16 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                         // N4: whichever arm asked for it, a compute that faults leaves the rows in hand standing;
                         // bsv-low #499: so does one the identity's ceiling sheds
                         if !owed_recompute_admit(&identity, source, true) {
-                            refresh_retry = Some(OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)).unwrap_or(0));
+                            refresh_retry = Some(
+                                OWED_RATE
+                                    .with(|r| {
+                                        r.borrow().retry_after_ms(
+                                            &identity,
+                                            worker::Date::now().as_millis() as i64,
+                                        )
+                                    })
+                                    .unwrap_or(0),
+                            );
                             let deferred = owed_deferred_deadline(&identity);
                             owed_shed_remark(&db, &identity).await;
                             owed_schedule_deferred(&ctx.env, &identity, deferred).await;
