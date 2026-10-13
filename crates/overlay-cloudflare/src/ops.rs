@@ -1002,6 +1002,7 @@ pub fn change_flush_unresent(counters: &serde_json::Value) -> Vec<(&'static str,
 /// depend on the flat spelling this module never promised. (Safe filter: no
 /// `submit_census_` row existed before #366, so nothing a reader saw is
 /// removed.)
+#[rustfmt::skip] // Preserve main's strict producer wiring pin.
 async fn read_counters(db: &D1Database) -> serde_json::Value {
     let rows: Vec<CounterRow> =
         Query::new("SELECT name, value FROM ops_counters WHERE name NOT LIKE 'submit_census_%'")
@@ -1142,13 +1143,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         }
     }
     for set in CHANGE_FLUSH_SETS {
-        for name in [
-            set.undelivered,
-            set.retry_failed,
-            set.deferred,
-            set.retried,
-            set.resent,
-        ] {
+        for name in [set.undelivered, set.retry_failed, set.deferred, set.retried, set.resent] {
             obj[name] = json!(0);
         }
     }
@@ -1565,12 +1560,7 @@ mod tests {
             ]
         );
         // the read seeds every one at 0 and derives the figure after the rows (source)
-        let squash = |s: &str| {
-            s.split_whitespace()
-                .collect::<String>()
-                .replace(",)", ")")
-                .replace(",]", "]")
-        };
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
         let src = include_str!("ops.rs");
         let start = src.find("async fn read_counters(").expect("read_counters");
         let body = squash(&src[start..start + src[start..].find("\n}\n").expect("its end")]);

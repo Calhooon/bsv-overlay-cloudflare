@@ -125,6 +125,7 @@ pub fn settle(shipped: &crate::change_flush::Shipped<(String, u32)>) -> crate::c
 /// POST's outpoints are noted back once (`pot_changed_retried_total`); the part of a flood past the flush's
 /// bound is noted back for the next flush (`pot_changed_deferred_total`). The note-back is not durable: the
 /// hole and its bound are named in [`crate::change_flush`].
+#[rustfmt::skip] // Preserve main's strict producer wiring pin.
 pub async fn ship(env: Env, outpoints: Vec<(String, u32)>, deadline_ms: u64) {
     if outpoints.is_empty() {
         return;
@@ -136,26 +137,13 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>, deadline_ms: u64) {
     let total = outpoints.len();
     let shipped = ship_with(
         outpoints,
-        |body| {
-            crate::change_flush::post_body(
-                &env,
-                &url,
-                &token,
-                "/internal/pot-changed",
-                "pot-changes",
-                body,
-            )
-        },
+        |body| crate::change_flush::post_body(&env, &url, &token, "/internal/pot-changed", "pot-changes", body),
         || Date::now().as_millis(),
         deadline_ms,
     )
     .await;
     if !shipped.delivered.is_empty() {
-        console_log!(
-            "[pot-changes] notified {} outpoint(s) in {} POST(s)",
-            shipped.delivered.len(),
-            shipped.posts
-        );
+        console_log!("[pot-changes] notified {} outpoint(s) in {} POST(s)", shipped.delivered.len(), shipped.posts);
     }
     let tally = settle(&shipped);
     crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally).await;
@@ -429,12 +417,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let squash = |s: &str| {
-            s.split_whitespace()
-                .collect::<String>()
-                .replace(",)", ")")
-                .replace(",]", "]")
-        };
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
         let src = include_str!("pot_changes.rs");
         let src = &src[..src.find("#[cfg(test)]").unwrap()];
         let start = src.find("pub async fn ship(").expect("ship");
@@ -445,7 +428,7 @@ mod tests {
                         .find("\npub async fn flush_inline(")
                         .expect("the next fn")],
         ));
-        assert!(ship.contains(&squash(r#"let shipped = ship_with( outpoints, |body| { crate::change_flush::post_body(&env, &url, &token, "/internal/pot-changed", "pot-changes", body) },"#)));
+        assert!(ship.contains(&squash(r#"let shipped = ship_with( outpoints, |body| crate::change_flush::post_body(&env, &url, &token, "/internal/pot-changed", "pot-changes", body),"#)));
         assert!(ship.contains(&squash("let tally = settle(&shipped);")));
         assert!(ship.contains(&squash(
             r#"crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally).await;"#

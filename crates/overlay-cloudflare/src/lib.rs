@@ -15,11 +15,11 @@ pub mod broadcaster;
 pub mod chain_tracker;
 pub mod change_flush;
 pub mod d1;
-pub mod d1_discovery;
 pub mod d1_ledger;
+pub mod d1_discovery;
 pub mod d1_storage;
-pub mod dead_letters;
 pub mod derived_hops;
+pub mod dead_letters;
 pub mod ef;
 pub mod ef_deferred;
 pub mod error;
@@ -373,9 +373,7 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
             .await
         }
         // bsv-low #576: the operator's bounded re-drive of the parked dead letters (bearer INTERNAL_TOKEN).
-        (Method::Post, "/internal/redrive-dead-letters") => {
-            crate::dead_letters::internal_redrive(req, &env).await
-        }
+        (Method::Post, "/internal/redrive-dead-letters") => crate::dead_letters::internal_redrive(req, &env).await,
         (Method::Post, "/internal/discard-dead-letters") => {
             crate::dead_letters::internal_discard(req, &env).await
         }
@@ -2280,7 +2278,7 @@ async fn queue_entry(
     queue_handler(worker::MessageBatch::from(event), env, ctx).await
 }
 
-#[rustfmt::skip] // Keep main's queue wiring whole; its production source pins depend on this layout.
+#[rustfmt::skip] // Preserve main's exact queue wiring pins.
 async fn queue_handler(
     batch: worker::MessageBatch<crate::queue::MutationMessage>,
     env: Env,
@@ -2658,25 +2656,13 @@ mod tests {
     /// auth refusal.
     #[test]
     fn every_dispatched_fetch_route_flushes_the_pot_changes_on_its_way_out() {
-        let code_only = |s: &str| {
-            s.lines()
-                .map(|l| l.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let src = include_str!("lib.rs");
-        let start = src
-            .find("async fn main(req: Request, env: Env, ctx: Context)")
-            .expect("the fetch handler");
-        let end = start
-            + src[start..]
-                .find("\npub async fn build_engine_from_env(")
-                .expect("the next item");
+        let start = src.find("async fn main(req: Request, env: Env, ctx: Context)").expect("the fetch handler");
+        let end = start + src[start..].find("\npub async fn build_engine_from_env(").expect("the next item");
         let handler = code_only(&src[start..end]);
-        let dispatch = handler
-            .find("let result = match (req.method(), req.path().as_str()) {")
-            .expect("the dispatch");
+        let dispatch = handler.find("let result = match (req.method(), req.path().as_str()) {").expect("the dispatch");
         let tail = squash(&handler[dispatch..]);
         assert!(
             tail.contains(&squash(
@@ -2726,15 +2712,3 @@ mod stored_rows;
 mod build_info_tests;
 
 pub mod tracker_events;
-
-/// Ignore rustfmt-only whitespace and optional argument/list trailing commas in wiring pins.
-#[cfg(test)]
-pub(crate) fn source_pin_contains(source: &str, needle: &str) -> bool {
-    let tokens = |s: &str| {
-        s.split_whitespace()
-            .collect::<String>()
-            .replace(",)", ")")
-            .replace(",]", "]")
-    };
-    tokens(source).contains(&tokens(needle))
-}
