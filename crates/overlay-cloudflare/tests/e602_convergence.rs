@@ -87,7 +87,7 @@ impl ConflictEviction for Sqlite {
         reason: &str,
         now_ms: u64,
         repointed: &[ReleasedSpend],
-    ) -> Result<(), String> {
+    ) -> Result<ConflictEvictOutcome, String> {
         let txid = txid.to_ascii_lowercase();
         let result = evict_core(self, &txid, reason, now_ms).await;
         assert!(result.faults.is_empty(), "{:?}", result.faults);
@@ -141,7 +141,8 @@ impl ConflictEviction for Sqlite {
                 QVal::Text(serde_json::to_string(&merged).unwrap()),
             ],
         )
-        .await
+        .await?;
+        Ok(ConflictEvictOutcome::Evicted)
     }
     async fn record_conflict_spender(
         &self,
@@ -509,4 +510,61 @@ async fn e605_b_the_record_is_guarded_on_the_evicted_pointer_and_unconfirmed() {
     assert_eq!(pointer(&confirmed), (1, Some(join.clone()), 1));
     assert_eq!(pointer(&foreign), (1, Some(other.clone()), 0));
     assert_eq!(pointer(&released), (1, Some(comp.clone()), 0));
+}
+
+/// bsv-low #649 M2 (the lens's yielded outcome): a conflict eviction that YIELDED to a readmission landing under
+/// it does not stand, so the pass answers "not evicted" and the summary counts no eviction. On `c8e4d8f` the port
+/// answered `()` and the pass `Ok(true)` whatever the wrapper did: an eviction logged and counted over a served pot.
+struct Yielding {
+    asked: std::cell::Cell<u32>,
+}
+#[async_trait(?Send)]
+impl ConflictEviction for Yielding {
+    async fn evict_conflict(
+        &self,
+        _: &str,
+        _: &str,
+        _: u64,
+        _: &[ReleasedSpend],
+    ) -> Result<ConflictEvictOutcome, String> {
+        self.asked.set(self.asked.get() + 1);
+        Ok(ConflictEvictOutcome::Yielded)
+    }
+    async fn record_conflict_spender(
+        &self,
+        _: &str,
+        _: u32,
+        _: &str,
+        _: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+#[tokio::test]
+async fn e649_m2_a_yielded_conflict_eviction_is_neither_logged_nor_counted() {
+    let hop = "dd".repeat(32);
+    let subject = spending(&hop, 40_000);
+    let txid = subject.id();
+    let raw = subject.to_binary();
+    let evidence = Evidence {
+        raw: spending(&hop, 39_000).to_hex(),
+        height: Some(970710),
+    };
+    let store = Yielding {
+        asked: std::cell::Cell::new(0),
+    };
+    let result = converge_confirmed_conflict(&store, &evidence, &evidence, &txid, &raw, 3000).await;
+    assert_eq!(store.asked.get(), 1, "the confirmed competitor reached the eviction");
+    assert_eq!(
+        result,
+        Ok(false),
+        "a yielded eviction does not stand: the pass must not answer evicted"
+    );
+    let mut summary = ConflictPassSummary::default();
+    summary.note(&result);
+    assert_eq!(
+        (summary.scanned, summary.evicted, summary.faults),
+        (1, 0, 0),
+        "a yielded eviction is scanned, never counted evicted"
+    );
 }
