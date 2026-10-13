@@ -1929,7 +1929,8 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
             // the gate's LOW-3 (2026-09-19): the confirming chain word must NAME the filed sweep (`by_chain` does) — a
             // hop the JOIN took after all (evicted, then readmitted on its mine) reads spent+confirmed by a DIFFERENT
             // tx, and that must never turn the sweep's payout claimable for a tx that can never mine
-            let confirmed = index_word || tracker_word
+            let confirmed = index_word
+                || tracker_word
                 || spender_mined(
                     i,
                     Some(&filed.sweep_txid),
@@ -4905,25 +4906,50 @@ pub(crate) mod tests {
     #[test]
     fn ns3d_l2_tracker_mined_sweep_names_tracker_proof() {
         let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let hops = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let hops = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
         let sweep = tx(0x0c);
         let filing = filed(&format!("{}:0", tx(0x07)), &sweep);
         let headers = crate::tracker_host::HeaderSnapshot {
-            tip: Ok(10), headers: std::collections::BTreeMap::from([(10, Ok(Some(bsv_tracker::Header {
-                hash: tx(2), merkle_root: sweep.clone(),
-            })))])
+            tip: Ok(10),
+            headers: std::collections::BTreeMap::from([(
+                10,
+                Ok(Some(bsv_tracker::Header {
+                    hash: tx(2),
+                    merkle_root: sweep.clone(),
+                })),
+            )]),
         };
         let mut state = bsv_tracker::State::new(&sweep);
-        state.step(&bsv_tracker::Params {age_threshold:60}, &headers,
-            bsv_tracker::Input::Evidence(bsv_tracker::Evidence::Proof(bsv_tracker::Proof::new(
-                &sweep, bsv_rs::transaction::MerklePath::from_coinbase_txid(&sweep, 10)).unwrap()))).unwrap();
-        let words = std::collections::BTreeMap::from([(sweep, crate::tracker_host::served::fields(&state))]);
+        state
+            .step(
+                &bsv_tracker::Params { age_threshold: 60 },
+                &headers,
+                bsv_tracker::Input::Evidence(bsv_tracker::Evidence::Proof(
+                    bsv_tracker::Proof::new(
+                        &sweep,
+                        bsv_rs::transaction::MerklePath::from_coinbase_txid(&sweep, 10),
+                    )
+                    .unwrap(),
+                )),
+            )
+            .unwrap();
+        let words = std::collections::BTreeMap::from([(
+            sweep,
+            crate::tracker_host::served::fields(&state),
+        )]);
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &filing;
         i.spender_words = Some(&words);
         let rows = derive_owed_rows(&i);
         assert_eq!(rows[0].facts["claimable"], true);
-        assert_eq!(rows[0].facts["confirmedSource"], "tracker-proof", "tracker proof mislabeled as index proof");
+        assert_eq!(
+            rows[0].facts["confirmedSource"], "tracker-proof",
+            "tracker proof mislabeled as index proof"
+        );
         assert!(rows[0].facts.get("sweepProofHeight").is_none());
     }
 

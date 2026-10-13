@@ -211,5 +211,8 @@ fn ns3_m3_courier_rotation_and_three_fault_circuit() {
 #[test]
 fn ns3d_note4_courier_circuit_uses_one_scheduled_pass_window() {
     let runtime = include_str!("../src/tracker_host/runtime.rs");
-    assert!(!runtime.contains("begin_tick(now / 60)"), "event resets courier circuit per minute");
+    assert!(
+        !runtime.contains("begin_tick(now / 60)"),
+        "event resets courier circuit per minute"
+    );
 }

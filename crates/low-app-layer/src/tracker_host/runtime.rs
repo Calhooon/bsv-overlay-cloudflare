@@ -523,9 +523,12 @@ pub async fn tick(env: &worker::Env) -> worker::Result<()> {
         .counted_run()
         .await?;
     crate::courier::note_presence("tracker_stranger_sweep_pass_total");
-    let rows = db.prepare(stored::DUE)
+    let rows = db
+        .prepare(stored::DUE)
         .bind(&[JsValue::from_f64(now.saturating_sub(900) as f64)])?
-        .counted_all().await?.results::<Subject>()?;
+        .counted_all()
+        .await?
+        .results::<Subject>()?;
     super::pacing::begin_tick(now / 900);
     for row in rows {
         event(env, &row.txid, "tick", None, None).await?;
@@ -608,13 +611,11 @@ where
         if let Some(proof) = proof {
             let headers = headers(proof.height()).await;
             let mut state = State::new(&subject.txid);
-            if let Err(error) = state
-                .step(
-                    &Params { age_threshold: 60 },
-                    &headers,
-                    Input::Evidence(Evidence::Proof(proof)),
-                )
-            {
+            if let Err(error) = state.step(
+                &Params { age_threshold: 60 },
+                &headers,
+                Input::Evidence(Evidence::Proof(proof)),
+            ) {
                 let reason = match error {
                     bsv_tracker::CheckError::RootMismatch(_) => "root_mismatch",
                     bsv_tracker::CheckError::Unavailable(_) => "unavailable",
@@ -672,10 +673,14 @@ pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
     let page_done = rows.len() < 64;
     let complete = pots && page_done;
     after = walk_backfill_page(
-        rows, after, super::WorkerClock.now(),
+        rows,
+        after,
+        super::WorkerClock.now(),
         |height| async move { super::headers(env, &[height]).await },
         |row| async move { stored::write(env, &row).await.map_err(|e| e.to_string()) },
-    ).await.map_err(worker::Error::RustError)?;
+    )
+    .await
+    .map_err(worker::Error::RustError)?;
     let saved = if page_done && !pots {
         "1:".to_string()
     } else {

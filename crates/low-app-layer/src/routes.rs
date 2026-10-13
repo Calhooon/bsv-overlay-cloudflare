@@ -7281,7 +7281,10 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         Err(_) => Vec::new(),
     };
     let (memo_answers, _) = crate::tracker_host::runtime::spent_any_memo_plan(
-        &probe_targets, &memos, now_ms, &Default::default(),
+        &probe_targets,
+        &memos,
+        now_ms,
+        &Default::default(),
     );
     let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
     let mut terminals = Vec::with_capacity(outpoints.len());
@@ -7352,18 +7355,15 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         }
     }
     // Look up the served pointer, including a freshly probed replacement.
-    let ids: Vec<_> = entries.iter().filter_map(|entry| entry.spending_txid.clone()).collect();
+    let ids: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| entry.spending_txid.clone())
+        .collect();
     let stored_words = crate::tracker_host::runtime::read_soft(&ctx.env, &ids).await?;
     let value = serde_json::from_str(&crate::txany::spent_any_body(&entries, &terminals))?;
     // Read-only decoration; missing words remain unknown until the scheduled pass.
     json_response(
-        crate::tracker_host::runtime::body_loaded(
-            &ctx.env,
-            value,
-            None,
-            stored_words,
-        )
-        .await?,
+        crate::tracker_host::runtime::body_loaded(&ctx.env, value, None, stored_words).await?,
         200,
     )
 }
@@ -8101,7 +8101,8 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     }
     crate::courier::note_presence("tracker_public_lookup_only_total");
     let key = txid.to_ascii_lowercase();
-    let stored = crate::tracker_host::runtime::read_soft(&ctx.env, std::slice::from_ref(&key)).await?;
+    let stored =
+        crate::tracker_host::runtime::read_soft(&ctx.env, std::slice::from_ref(&key)).await?;
     let now = worker::Date::now().as_millis() as f64;
     let answer = match tx_any_cached(&key, now) {
         Some(a) => a,
