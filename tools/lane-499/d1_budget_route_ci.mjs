@@ -451,13 +451,22 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
     else fail(`${name}: files its seats and parks every wake-up`, r.text.slice(0, 300))
     check(name, segment(r.timing, 'd1'))
   }
-  const d = await get(APP, '/internal/pot-announce-drain', { method: 'POST', headers: { Authorization: `Bearer ${INTERNAL_TOKEN}` } })
-  if (d.status !== 200) fail('pot-announce-drain answers', `${d.status}: ${d.text.slice(0, 200)}`)
-  else {
+  // E649 L4 N3: the seed's backlog of 120 due rows. The first pass runs its four rounds of 24 (96 settled, not
+  // configured here) and sweeps the 6 exhausted; the second takes the 24 left and reads one more round of none.
+  const drain = async () => get(APP, '/internal/pot-announce-drain', { method: 'POST', headers: { Authorization: `Bearer ${INTERNAL_TOKEN}` } })
+  for (const [name, want] of [
+    ['pot-announce-drain-backlog', { rounds: 4, due: 96, skipped: 96, swept: 6 }],
+    ['pot-announce-drain', { rounds: 2, due: 24, skipped: 24, swept: 0 }],
+  ]) {
+    const d = await drain()
+    if (d.status !== 200) {
+      fail(`${name} answers`, `${d.status}: ${d.text.slice(0, 200)}`)
+      continue
+    }
     const t = JSON.parse(d.text)
-    if (t.due === 24 && t.skipped === 24 && t.swept === 6 && t.faults === 0) pass(`pot-announce-drain: 24 due settled (not configured here), 6 exhausted swept`)
-    else fail('pot-announce-drain reads its bound and sweeps', d.text)
-    check('pot-announce-drain', segment(d.timing, 'd1'))
+    if (t.rounds === want.rounds && t.due === want.due && t.skipped === want.skipped && t.swept === want.swept && t.aged === 0 && t.faults === 0) pass(`${name}: ${t.rounds} round(s), ${t.due} due settled (not configured here), ${t.swept} exhausted swept`)
+    else fail(`${name} reads its rounds and sweeps`, d.text)
+    check(name, segment(d.timing, 'd1'))
   }
   const unauth = await get(APP, '/internal/pot-announce-drain', { method: 'POST' })
   if (unauth.status === 401) pass('pot-announce-drain refuses without the bearer')

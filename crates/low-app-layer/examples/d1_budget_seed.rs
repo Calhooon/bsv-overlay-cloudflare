@@ -198,15 +198,19 @@ fn e649_hook_rows(now_s: u64) -> Vec<String> {
             now_s * 1000
         ));
     }
-    for j in 0..30u32 {
-        let exhausted = if j < 24 {
+    // E649 L4 N3: 120 due (a backlog of five bodies: the first pass drains four rounds of 24, the second the rest)
+    // and 6 exhausted a day past their sweep.
+    for j in 0..126u32 {
+        let exhausted = if j < 120 {
             "NULL".to_string()
         } else {
             ((now_s - 2 * 86_400) * 1000).to_string()
         };
         rows.push(format!(
             "INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) \
-             VALUES ('e64d{j:060x}:0', 'room', '', 1, 1, 0, 1000, {exhausted})"
+             VALUES ('e64d{j:060x}:0', 'room', '', 1, 1, {}, 1000, {exhausted})",
+            // due an hour ago, in order: past due, under the age-out's day
+            now_s * 1000 - 3_600_000 + u64::from(j)
         ));
     }
     rows
