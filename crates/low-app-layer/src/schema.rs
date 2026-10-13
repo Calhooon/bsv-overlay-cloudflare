@@ -262,10 +262,10 @@ pub const CREATE_TABLE_CATCHUPS: &[&str] = &[
     // bsv-low #469 (decision 3): the filed hop sweeps (overlay migration 158; its two indexes 159 + 160 are the
     // overlay's alone — this list is CREATE TABLE statements by contract), read by `/owed`, written by `/record`.
     crate::hopsweep::HOPSWEEP_CREATE,
-    // E649 L4 H1: the pot hook's park (overlay migration 222; its index 223 is the overlay's alone), written by the
+    // E649 L4 H1: the pot hook's park (overlay migration 229; its index 230 is the overlay's alone), written by the
     // hook before its answer and drained by the scheduled pass.
     crate::pot_hook::PARKED_CREATE,
-    // E649 L4 N1: the park tokens' counter (overlay migration 224), bumped in the park's own batch.
+    // E649 L4 N1: the park tokens' counter (overlay migration 231), bumped in the park's own batch.
     crate::pot_hook::PARK_SEQ_CREATE,
 ];
 
