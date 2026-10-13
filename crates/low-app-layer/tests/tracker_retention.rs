@@ -50,3 +50,16 @@ fn ns3_l1_sweep_is_eight_days_bounded_and_spares_first_party() {
         .unwrap();
     assert_eq!(remaining, 3);
 }
+
+#[test]
+fn ns3d_m3_untouched_built_stranger_is_swept_after_eight_days() {
+    use low_app_layer::tracker_host::stored;
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch(stored::CREATE).unwrap();
+    db.execute_batch("CREATE TABLE transactions(txid TEXT PRIMARY KEY); CREATE TABLE pot_beefs(txid TEXT PRIMARY KEY); INSERT INTO tx_words(txid,word,tier,updated_at) VALUES ('stranger','built','host',1),('held','built','host',1); INSERT INTO transactions VALUES ('held')").unwrap();
+    let due: Vec<String> = db.prepare(stored::DUE).unwrap().query_map([700001 - 900], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(due, vec!["held"], "stranger built row renewed by scheduled reask");
+    assert_eq!(db.execute(stored::SWEEP, [700001 - 8 * 86400]).unwrap(), 1,
+        "untouched built stranger was spared by the sweep");
+    assert_eq!(db.query_row("SELECT txid FROM tx_words", [], |r| r.get::<_,String>(0)).unwrap(), "held");
+}
