@@ -3321,6 +3321,10 @@ static RECOMPUTE_ARM_FAILED: AtomicU64 = AtomicU64::new(0);
 pub fn note_recompute_arm_failed() {
     RECOMPUTE_ARM_FAILED.fetch_add(1, Ordering::Relaxed);
 }
+static RECOMPUTE_DEFERRED_ABANDONED: AtomicU64 = AtomicU64::new(0);
+pub fn note_recompute_deferred_abandoned() {
+    RECOMPUTE_DEFERRED_ABANDONED.fetch_add(1, Ordering::Relaxed);
+}
 static RECOMPUTE_DEFERRED_FAULTED: AtomicU64 = AtomicU64::new(0);
 pub fn note_recompute_deferred_faulted() {
     RECOMPUTE_DEFERRED_FAULTED.fetch_add(1, Ordering::Relaxed);
@@ -3369,6 +3373,7 @@ pub fn owed_health_json() -> Value {
         "owed_recompute_shed_total": shed,
         "owed_recompute_deferred_total": RECOMPUTE_DEFERRED.load(Ordering::Relaxed),
         "owed_recompute_arm_failed_total": RECOMPUTE_ARM_FAILED.load(Ordering::Relaxed),
+        "owed_recompute_deferred_abandoned_total": RECOMPUTE_DEFERRED_ABANDONED.load(Ordering::Relaxed),
         "owed_recompute_deferred_faulted_total": RECOMPUTE_DEFERRED_FAULTED.load(Ordering::Relaxed),
         "recomputesPerIdentityPerMinute": OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW,
         "recomputeCeilingScope": "per identity per isolate: the fleet bound is this times the live isolates",
