@@ -35,6 +35,7 @@ import { fileURLToPath } from 'node:url'
 const OVERLAY = process.argv[2] ?? 'http://127.0.0.1:8801'
 const STATE = process.argv[3]
 const TOKEN = process.env.D1_BUDGET_INTERNAL_TOKEN ?? 'ci-internal-tok'
+const ADMIN = process.env.D1_BUDGET_ADMIN_TOKEN ?? 'ci-admin-tok'
 const MEASURE = process.env.D1_BUDGET_MEASURE === '1'
 const CRATE = fileURLToPath(new URL('../../crates/overlay-cloudflare/', import.meta.url))
 const CEILINGS = JSON.parse(readFileSync(new URL('./ceilings.json', import.meta.url), 'utf8'))
@@ -215,6 +216,29 @@ if (DELIVERING && STATE2 && MOCK_PORT) {
     mode = 'plain'
     const dc = await lever({ op: 'drain' }, TOKEN, DELIVERING)
     expect(dc.json?.unparked === 2 && rows2().length === 0, '(b) the next delivery takes the new intents', `${dc.text} rows=${JSON.stringify(rows2())}`)
+    // 7. D3-H1 (the third delta lens): the RELIABLY FIRED trigger drains. The scheduled event is not delivered on
+    //    this deployment; the external cron's authenticated `POST /admin/complete-proofs` is. A pot and a hop row
+    //    parked, then that route alone (no lever drain, no tick): both delivered through the mock and deleted, the
+    //    pass answered in its body. On `1bf8e66` the route never reads `change_parked`: both rows stay.
+    const potC = 'c3'.repeat(32) + ':2'
+    const hopC = '02' + 'c3'.repeat(32)
+    await lever({ op: 'park', items: [potC], hops: [hopC] }, TOKEN, DELIVERING)
+    posts.length = 0
+    const parkedC = rows2().length
+    const wrong = await fetch(DELIVERING + '/admin/complete-proofs', { method: 'POST', headers: { authorization: 'Bearer wrong', Connection: 'close' } })
+    await wrong.text()
+    expect(wrong.status === 401 && rows2().length === 2, '7. /admin/complete-proofs refuses a wrong bearer and drains nothing', `${wrong.status} rows=${JSON.stringify(rows2())}`)
+    const cp = await fetch(DELIVERING + '/admin/complete-proofs', { method: 'POST', headers: { authorization: `Bearer ${ADMIN}`, Connection: 'close' } })
+    const cpText = await cp.text()
+    let cpJson = null
+    try {
+      cpJson = JSON.parse(cpText)
+    } catch {}
+    expect(
+      parkedC === 2 && cp.status === 200 && cpJson?.change_parked?.unparked === 2 && rows2().length === 0 && posts.length === 2,
+      '7. D3-H1: the fallback trigger (/admin/complete-proofs) drains the parked pot and hop rows',
+      `parked=${parkedC} ${cp.status} change_parked=${JSON.stringify(cpJson?.change_parked)} rows=${JSON.stringify(rows2())} posts=${posts.length} ${cpJson ? '' : cpText.slice(0, 300)}`,
+    )
   } finally {
     mock.close()
   }

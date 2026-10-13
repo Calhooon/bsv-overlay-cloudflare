@@ -518,6 +518,7 @@ ci-d1-budget:
 	    --var ARCADE_URL:http://127.0.0.1:9 \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
 	    --var APP_LAYER_URL:http://127.0.0.1:$$PM \
+	    --var ADMIN_TOKEN:ci-admin-tok \
 	) > "$$dv_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PD/listTopicManagers "$$dv_log" "delivering overlay"; \

@@ -10,7 +10,8 @@
 //! its set and the entry, so a re-park is one row with its generation bumped) as its FIRST durable write; only
 //! the entries the park landed are then taken out of the isolate's sets (the delta lens's M1: a cancellation at
 //! any await leaves every note in D1, in memory or both). A park that faults, or an entry refused at the table's
-//! ceiling, stays in the sets. The scheduled tick (every isolate's cron, `*/15`) delivers the ELIGIBLE rows
+//! ceiling, stays in the sets. The shared drain ([`drain_parked`]: the scheduled tick AND the external cron's
+//! `POST /admin/complete-proofs`, D3-H1) delivers the ELIGIBLE rows
 //! through the same flush loop (`ship_chunks`, chunked at the app layer's bound) and deletes ONLY the rows of POSTs
 //! the app layer accepted, at the generation it read (N1); a refused row backs off and leaves the drain after
 //! [`CHANGE_PARK_MAX_ATTEMPTS`], then is swept (N2); a deferred row stays parked for the next tick. So a withheld
@@ -701,19 +702,64 @@ impl UnparkPort for WorkerUnpark<'_> {
     }
 }
 
-/// The scheduled tick's delivery (bsv-low #649 M1). Unconfigured (`APP_LAYER_URL` / `INTERNAL_TOKEN`): nothing
-/// is read, the rows stay parked.
-pub async fn deliver_on_tick(env: &Env, db: &D1Database) {
-    let Some((url, token)) = crate::change_flush::configured(env) else {
-        return;
-    };
-    deliver_parked(&WorkerUnpark {
+/// bsv-low #649 D3-H1 (the third delta lens): WHO drains the parked set. The scheduled event is not delivered on
+/// this deployment (`lib.rs`: the `/admin/complete-proofs` route's own comment), and the regular trigger is an
+/// external fetch of that route; until the fold only the scheduled handler drained, so under the documented setup no
+/// parked note was ever delivered. Now BOTH call [`drain_parked`]: whichever fires drains, each pass bounded the same
+/// way ([`DRAIN_MAX_ROWS`] a set, [`DRAIN_WALL_MS`] to start its POSTs) and counted by its trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainTrigger {
+    /// The scheduled handler (`*/15` when the platform delivers it).
+    Tick,
+    /// The authenticated `POST /admin/complete-proofs` (the external cron's fetch), after its retire pass.
+    CompleteProofs,
+}
+
+impl DrainTrigger {
+    pub fn name(self) -> &'static str {
+        match self {
+            DrainTrigger::Tick => "tick",
+            DrainTrigger::CompleteProofs => "complete-proofs",
+        }
+    }
+    /// The counter of the drain passes this trigger ran.
+    pub fn counter(self) -> &'static str {
+        match self {
+            DrainTrigger::Tick => COUNTER_CHANGE_PARK_DRAIN_TICK,
+            DrainTrigger::CompleteProofs => COUNTER_CHANGE_PARK_DRAIN_COMPLETE_PROOFS,
+        }
+    }
+}
+
+/// D3-H1: drain passes run by the scheduled handler.
+pub const COUNTER_CHANGE_PARK_DRAIN_TICK: &str = "change_park_drain_tick_total";
+/// D3-H1: drain passes run by `POST /admin/complete-proofs`.
+pub const COUNTER_CHANGE_PARK_DRAIN_COMPLETE_PROOFS: &str =
+    "change_park_drain_complete_proofs_total";
+
+/// THE SHARED DRAIN (bsv-low #649 M1; D3-H1): one bounded pass of [`deliver_parked`] over D1, called by the
+/// scheduled handler and by `/admin/complete-proofs`, counted per trigger. Unconfigured (`APP_LAYER_URL` /
+/// `INTERNAL_TOKEN`): nothing is read, the rows stay parked, nothing counted (`None`).
+pub async fn drain_parked(env: &Env, db: &D1Database, trigger: DrainTrigger) -> Option<Delivered> {
+    let (url, token) = crate::change_flush::configured(env)?;
+    let out = deliver_parked(&WorkerUnpark {
         env,
         db,
         url,
         token,
     })
     .await;
+    crate::ops::bump_counter(db, trigger.counter(), 1).await;
+    if out.read > 0 || out.swept > 0 {
+        console_log!(
+            "[change-park] drain by {}: read={} unparked={} kept={}",
+            trigger.name(),
+            out.read,
+            out.unparked,
+            out.kept
+        );
+    }
+    Some(out)
 }
 
 /// `/health/invariants.changeParked`: the parked rows by set, read from D1 (`null` when the read faults). N3: each
@@ -2105,7 +2151,7 @@ mod tests {
         let lib = sq(include_str!("lib.rs"));
         let tick = &lib[lib.find("asyncfnscheduled(").unwrap()..];
         let deliver = tick
-            .find("crate::change_park::deliver_on_tick(&env,&ops_db).await;")
+            .find("crate::change_park::drain_parked(&env,&ops_db,crate::change_park::DrainTrigger::Tick)")
             .expect("the tick delivers");
         let gasp = tick
             .find("engine.start_gasp_sync(),")
@@ -2121,6 +2167,8 @@ mod tests {
             "COUNTER_CHANGE_PARK_REFUSED",
             "COUNTER_CHANGE_PARK_EXHAUSTED",
             "COUNTER_CHANGE_PARK_SWEPT",
+            "COUNTER_CHANGE_PARK_DRAIN_TICK",
+            "COUNTER_CHANGE_PARK_DRAIN_COMPLETE_PROOFS",
         ] {
             assert!(
                 ops.contains(&format!("crate::change_park::{c},")),
@@ -2130,6 +2178,46 @@ mod tests {
         assert!(
             ops.contains("\"changeParked\": change_parked,"),
             "the gauge is served"
+        );
+    }
+
+    /// bsv-low #649 D3-H1 (the third delta lens): the drain is called from the RELIABLY FIRED trigger. The worker
+    /// states the scheduled event is not delivered on this deployment and the external cron's authenticated
+    /// `POST /admin/complete-proofs` is the regular trigger; the shared drain must run there (after the retire pass,
+    /// before the answer, which carries it) as well as in the scheduled handler, each counted by its trigger. On
+    /// `1bf8e66` only the scheduled handler read `change_parked`. The route tier's leg 7 runs it end to end.
+    #[test]
+    fn e649_d3_h1_the_fallback_trigger_drains_the_parked_set() {
+        let sq = |s: &str| s.split_whitespace().collect::<String>();
+        let lib = sq(include_str!("lib.rs"));
+        let dispatch = lib
+            .find("\"/admin/complete-proofs\"=>admin_complete_proofs(&env).await,")
+            .expect("the dispatch routes the external cron's fetch");
+        let gate = lib[..dispatch]
+            .rfind("check_admin_auth(&req,&env)")
+            .expect("behind the admin bearer");
+        assert!(gate < dispatch);
+        let at = lib
+            .find("asyncfnadmin_complete_proofs(env:&Env)")
+            .expect("the fallback");
+        let body = &lib[at..];
+        let retire = body
+            .find("crate::proof_fetcher::run_retire_pass(")
+            .expect("its retire pass");
+        let drain = body
+            .find("crate::change_park::drain_parked(env,&ops_db,crate::change_park::DrainTrigger::CompleteProofs,)")
+            .expect("the fallback's maintenance drains the parked set (D3-H1)");
+        let answer = body
+            .find("answer[\"change_parked\"]=change_parked.unwrap_or(serde_json::Value::Null);")
+            .expect("its answer carries the drain's pass");
+        assert!(
+            retire < drain && drain < answer,
+            "after the retire pass, before the answer"
+        );
+        let tick = &lib[lib.find("asyncfnscheduled(").unwrap()..];
+        assert!(
+            tick.contains("crate::change_park::drain_parked(&env,&ops_db,crate::change_park::DrainTrigger::Tick)"),
+            "the scheduled handler drains too"
         );
     }
 }

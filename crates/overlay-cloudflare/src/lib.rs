@@ -1380,7 +1380,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     crate::beef_blob_sweep::run_ef_deferred_pass(&env, &ops_db).await;
     // bsv-low #649 M1: the pot and hop notes a background flush withheld (too little of its `waitUntil` window
     // left) are parked in D1; every tick delivers the oldest of them and deletes only what the app layer accepted.
-    crate::change_park::deliver_on_tick(&env, &ops_db).await;
+    // D3-H1: `/admin/complete-proofs` runs the same drain (the scheduled event is not delivered here).
+    crate::change_park::drain_parked(&env, &ops_db, crate::change_park::DrainTrigger::Tick).await;
     // The order (bsv-low #585 land2): the sweep's pass (its own 30 s race),
     // the stale graphs, the EF jobs' hand-back and keep sweep (no race of its
     // own: two D1 reads, up to 20 quiet jobs re-sent and touched, up to 50
@@ -2149,6 +2150,25 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         retire.conflict.evicted,
         retire.conflict.faults,
     );
+    // 4b'. bsv-low #649 D3-H1: the parked pot and hop notes (a background flush withheld them), delivered by the
+    //    SHARED drain the scheduled handler runs: this route is the trigger that fires on this deployment. One
+    //    bounded pass (128 rows a set, 10 s to start its POSTs), counted `change_park_drain_complete_proofs_total`.
+    let parked = crate::change_park::drain_parked(
+        env,
+        &ops_db,
+        crate::change_park::DrainTrigger::CompleteProofs,
+    )
+    .await;
+    let change_parked = parked.map(|d| {
+        serde_json::json!({
+            "read": d.read,
+            "unparked": d.unparked,
+            "kept": d.kept,
+            "refused": d.refused,
+            "exhausted": d.exhausted,
+            "swept": d.swept,
+        })
+    });
     // 4c. admitted-but-network-absent rebroadcast backstop (bsv-low #273) —
     //     runs last, own bounds + 30min–14d candidacy bracket (gate LOW-1) +
     //     the incident's attempt cap; see the scheduled block's note.
@@ -2170,7 +2190,7 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     )
     .await;
     let flagged = crate::ops::refresh_proofless_watch(&ops_db).await;
-    Response::from_json(&serde_json::json!({
+    let mut answer = serde_json::json!({
         "status": "ok",
         "tx_completed": tx_completed,
         "pot_completed": ps.completed,
@@ -2235,7 +2255,11 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         // chaser from a genuinely unconfirmable backlog.
         "spends_sample": ss.sample,
         "proofless_over_24h": flagged,
-    }))
+    });
+    // bsv-low #649 D3-H1: the shared parked drain's pass (`null`: no app layer configured, nothing read); set apart
+    // from the literal above, which sits at `json!`'s recursion limit.
+    answer["change_parked"] = change_parked.unwrap_or(serde_json::Value::Null);
+    Response::from_json(&answer)
 }
 
 /// Queue consumer for the onSteakReady pattern — and the S2 replay
