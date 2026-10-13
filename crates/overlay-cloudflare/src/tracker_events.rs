@@ -47,6 +47,30 @@ pub fn note_submit(txid: &str, gated: bool, admitted_any: bool) {
     }
 }
 
+/// The public txid bearer is a trigger, not authority for a word row.
+pub async fn note_held(
+    db: Option<&worker::D1Database>,
+    txid: &str,
+    kind: &str,
+    body: Option<Value>,
+) {
+    #[derive(serde::Deserialize)]
+    struct Held {
+        held: f64,
+    }
+    let Some(db) = db else {
+        return;
+    };
+    let held =
+        crate::d1::Query::new("SELECT 1 AS held FROM transactions WHERE txid = lower(?) LIMIT 1")
+            .bind(txid)
+            .fetch_optional::<Held>(db)
+            .await;
+    if held.is_ok_and(|row| row.is_some_and(|r| r.held == 1.0)) {
+        note(txid, kind, body);
+    }
+}
+
 pub fn drain() -> Vec<Value> {
     EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()).into_values().collect())
 }

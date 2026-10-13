@@ -317,6 +317,22 @@ pub async fn held_proof(env: &worker::Env, txid: &str) -> worker::Result<(bool, 
     }
     Ok((false, None))
 }
+/// The event boundary runs effects only for an authoritative subject.
+pub async fn event_for_subject<F, Fut>(
+    held: bool,
+    admitted: bool,
+    apply: F,
+) -> worker::Result<Option<Row>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = worker::Result<Row>>,
+{
+    if !held && !admitted {
+        return Ok(None);
+    }
+    apply().await.map(Some)
+}
+
 /// Each observed WRITE event feeds raw hints/proofs to the tracker. No
 /// retire/refusal/absence can construct a chain rejection.
 pub async fn event(
@@ -325,6 +341,36 @@ pub async fn event(
     kind: &str,
     callback: Option<&Value>,
     legacy: Option<String>,
+) -> worker::Result<Option<Row>> {
+    let held = live_hold(env, txid).await?;
+    event_for_subject(held, kind == "submit", || {
+        event_held(env, txid, kind, callback, legacy, held)
+    })
+    .await
+}
+
+/// A retained pot BEEF or an Arcade source is bytes, never live authority.
+pub async fn live_hold(env: &worker::Env, txid: &str) -> worker::Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct Held {
+        held: f64,
+    }
+    Ok(env
+        .d1("OVERLAY_DB")?
+        .prepare("SELECT 1 AS held FROM transactions WHERE txid = ? LIMIT 1")
+        .bind(&[JsValue::from_str(txid)])?
+        .counted_first::<Held>()
+        .await?
+        .is_some_and(|r| r.held == 1.0))
+}
+
+async fn event_held(
+    env: &worker::Env,
+    txid: &str,
+    kind: &str,
+    callback: Option<&Value>,
+    legacy: Option<String>,
+    live: bool,
 ) -> worker::Result<Row> {
     let old = stored::read(env, &[txid.into()]).await?.remove(txid);
     if kind == "fallback" {
@@ -360,18 +406,8 @@ pub async fn event(
     } else {
         held_proof(env, txid).await?
     };
-    let first_party = held
-        || matches!(kind, "submit" | "accepted" | "seen")
-        || old.as_ref().is_some_and(|row| {
-            row.hint_source.as_deref() == Some("arcade")
-                || row
-                    .legacy_body
-                    .as_ref()
-                    .and_then(|body| serde_json::from_str::<Value>(body).ok())
-                    .is_some_and(|body| {
-                        matches!(body["source"].as_str(), Some("index" | "index+external"))
-                    })
-        });
+    let first_party = live || kind == "submit";
+    let terminal = std::cell::Cell::new(false);
     if matches!(kind, "fallback" | "tick") && !first_party && legacy.is_none() {
         let (observation, absence, claimed_height) =
             crate::routes::tx_any_external_leg(txid, "tracker-write", env).await;
@@ -419,8 +455,10 @@ pub async fn event(
             crate::routes::provider_get("tracker-write", &format!("{arc}/tx/{txid}")).await
         {
             if let Ok(v) = Verdict::from_arc_body(txid, &bytes) {
+                let hint = v.into_hint("arcade", now);
+                terminal.set(terminal_hint(&hint));
                 state
-                    .step(&params, &empty, Input::Hint(v.into_hint("arcade", now)))
+                    .step(&params, &empty, Input::Hint(hint))
                     .expect("hint input");
             }
         }
@@ -465,7 +503,21 @@ pub async fn event(
             first_party,
             &arc,
             &Reask::Age,
-            |url| async move { crate::routes::provider_get("tracker-write", &url).await },
+            |url| {
+                let terminal = &terminal;
+                let arc = &arc;
+                async move {
+                    let response = crate::routes::provider_get("tracker-write", &url).await;
+                    if url.starts_with(arc) {
+                        if let Some((200, bytes)) = &response {
+                            if let Ok(v) = Verdict::from_arc_body(txid, bytes) {
+                                terminal.set(terminal_hint(&v.into_hint("arcade", now)));
+                            }
+                        }
+                    }
+                    response
+                }
+            },
             |height| async move { super::headers(env, &[height]).await },
         )
         .await;
@@ -476,7 +528,16 @@ pub async fn event(
             }
         }
     }
-    let row = stored::project(old.as_ref(), &state, now, legacy);
+    let mut row = stored::project(old.as_ref(), &state, now, legacy);
+    if terminal.get() {
+        let mut body = row
+            .legacy_body
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .unwrap_or_else(|| json!({}));
+        body["trackerTerminal"] = json!(true);
+        row.legacy_body = Some(body.to_string());
+    }
     stored::write(env, &row).await?;
     Ok(row)
 }
@@ -729,4 +790,11 @@ mod budget_pins {
             "owed read still writes a word"
         );
     }
+}
+
+pub fn terminal_hint(hint: &Hint) -> bool {
+    matches!(
+        hint.status,
+        HintStatus::Rejected { .. } | HintStatus::DoubleSpend { .. }
+    )
 }

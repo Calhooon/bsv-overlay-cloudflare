@@ -203,6 +203,11 @@ where
     }
     if first_party {
         if let Some((200, body)) = get(format!("{arcade}/tx/{txid}")).await {
+            if Verdict::from_arc_body(txid, &body)
+                .is_ok_and(|v| runtime::terminal_hint(&v.into_hint("arcade", 0)))
+            {
+                return Ok(None);
+            }
             if let Ok(frame) = serde_json::from_slice::<Value>(&body) {
                 if let Some(hex) = frame["merklePath"].as_str() {
                     if let Ok(path) = overlay_engine::beef_limits::merkle_path_from_hex(
