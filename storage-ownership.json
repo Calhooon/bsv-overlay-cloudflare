@@ -767,6 +767,17 @@
    "why": "a wake-up signal only: the seat's own read serves every fact, and the next pot change announces again"
   },
   {
+   "name": "pot_announce_seq",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "one row: the last token the pot hook's park handed out (E649 L4 N1) and the batch's room under its ceiling (N3), written by the park's own batch",
+   "why": "a counter only: a wipe re-seeds it from the clock (times 1,000) at the next park"
+  },
+  {
    "name": "chain_headers_seen",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

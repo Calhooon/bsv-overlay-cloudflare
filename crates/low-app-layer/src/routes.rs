@@ -2376,7 +2376,7 @@ pub(crate) async fn internal_pot_changed(
         outcome.plan.outpoints.len()
     );
     // H1: a body whose wake-ups could not be parked is not acknowledged: 503 keeps it on the producer's retry path
-    // (the detached announce still runs, and its settle parks what it does not deliver).
+    // (the detached announce still runs; with no row parked it settles nothing).
     let (status, ok) = match &outcome.stale_fault {
         None => (200, true),
         Some(_) => (503, false),
@@ -2483,9 +2483,6 @@ impl crate::pot_hook::SqlPort for D1Sql {
     }
     fn now_ms(&self) -> u64 {
         worker::Date::now().as_millis()
-    }
-    fn nonce(&self) -> u64 {
-        (worker::js_sys::Math::random() * 1000.0) as u64
     }
     fn log(&self, line: &str) {
         worker::console_log!("{line}");

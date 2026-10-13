@@ -9,10 +9,10 @@
 //! consumer is the next caller, L3's seam). The publish is VOLATILE scheduling, the filing DURABLE: every wake-up of
 //! a body is PARKED in D1 in the hook's one write batch before the answer (the review's H1); [`announce_and_report`]
 //! runs DETACHED (`ctx.wait_until`) under one wall ([`ANNOUNCE_WALL_MS`]), counted, and settles the park (a
-//! delivered wake-up out, an undelivered one re-parked); [`drain_parked`] (the scheduled tick, and
-//! `POST /internal/pot-announce-drain`) delivers what is left. A wake-up reaches its seat within the wall, or within
-//! one scheduled pass after its retry is due. The owed recompute stays where #469 and #648 put it: after the
-//! answer, coalesced and shed per identity, not parked.
+//! delivered wake-up out, an undelivered one retried at its token); [`drain_parked`] (the scheduled tick, and
+//! `POST /internal/pot-announce-drain`) delivers what is left. A wake-up reaches its seat within the wall, or within one scheduled pass after its retry is due.
+//! The owed recompute stays where #469 and #648 put it: after the answer, coalesced and shed per identity, not
+//! parked.
 //!
 //! The seat's `pot` event no longer carries a gathered `/results` entry. No reader reads it: the client's parser
 //! (`app/src/lib/lowEvents.ts` `parseLowEvent`) requires `entry` to be an OBJECT, and every consumer
@@ -54,16 +54,30 @@ pub const COUNTER_ANNOUNCE_PARK_FAULTS: &str = "pot_changed_announce_park_faults
 /// H1: the park of the pots-room wake-ups and the seats' events (overlay migration 222; its index 223 is the
 /// overlay's alone, as the catch-up list is CREATE TABLE statements by contract). One row per (outpoint, kind,
 /// recipient): `kind` is `room` (the pots-room broadcast, `recipient` empty) or `seat` (a `pot` event into that
-/// identity's box). `generation` orders the parks of one key: a later hook's park replaces an earlier one's, and a
-/// settle touches only the generation it read.
+/// identity's box). `generation` is the park's TOKEN (N1 of the delta review): taken from [`PARK_SEQ_CREATE`]'s one
+/// counter in the park's own batch, so it is ordered by commit and never reused, whatever the clock; a later park of
+/// a key replaces an earlier one's, and a settle or a drain touches only the token it holds.
 pub const PARKED_CREATE: &str = "CREATE TABLE IF NOT EXISTS pot_announce_parked (outpoint TEXT NOT NULL, kind TEXT NOT NULL, recipient TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at_ms INTEGER NOT NULL, generation INTEGER NOT NULL, exhausted_at_ms INTEGER, PRIMARY KEY (outpoint, kind, recipient))";
 /// The drain's order (live rows by `next_attempt_at_ms`) and the sweep's range (exhausted rows by their stamp).
 pub const PARKED_DUE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_pot_announce_parked_due ON pot_announce_parked(exhausted_at_ms, next_attempt_at_ms)";
-/// Park (or re-park) one wake-up. A park of an OLDER generation never replaces a newer one.
-pub const PARK_SQL: &str = "INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL) ON CONFLICT (outpoint, kind, recipient) DO UPDATE SET at = excluded.at, attempts = excluded.attempts, next_attempt_at_ms = excluded.next_attempt_at_ms, generation = excluded.generation, exhausted_at_ms = NULL WHERE excluded.generation >= pot_announce_parked.generation";
-/// A delivered wake-up leaves the park (only the generation that was delivered).
+/// N1: the park tokens' counter (overlay migration 224; in the app's catch-up list too). One row, `id` 1: `n` is the
+/// last token handed out, `room` reserved for the park's ceiling (written 0 until it is read). Never deleted.
+pub const PARK_SEQ_CREATE: &str = "CREATE TABLE IF NOT EXISTS pot_announce_seq (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL, room INTEGER NOT NULL)";
+/// N1: the FIRST statement of a write batch with `?1` parks. It takes `?1` tokens (`n` moves from `n0` to
+/// `n0 + ?1`; the batch's k-th park takes `n0 + 1 + k`, read in its own statement as `n - (?1 - 1 - k)`; D1 runs a
+/// batch as one transaction, so no other batch takes a token between them). A first row (or one after a wipe)
+/// starts at the clock `?2` times 1,000, above every token handed out before at under 1,000 a millisecond, and above
+/// the clock-stamped generations parked before the counter existed.
+pub const PARK_SEQ_BUMP_SQL: &str = "INSERT INTO pot_announce_seq (id, n, room) VALUES (1, ?2 * 1000 + ?1, 0) ON CONFLICT (id) DO UPDATE SET n = n + ?1";
+/// Park one wake-up (a NEW intent): its token from the counter (`?6` is its distance from the batch's last token), its
+/// attempts from 0, due at `?5`. A key already parked is replaced by the later token (a row exhausted comes back).
+/// The row written answers its token (`RETURNING`). PR #32's `change_park::PARK_SQL` is the same shape (a
+/// non-reused token per park, `RETURNING`).
+pub const PARK_SQL: &str = "INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) SELECT ?1, ?2, ?3, ?4, 0, ?5, (SELECT n FROM pot_announce_seq WHERE id = 1) - ?6, NULL WHERE true ON CONFLICT (outpoint, kind, recipient) DO UPDATE SET at = excluded.at, attempts = 0, next_attempt_at_ms = excluded.next_attempt_at_ms, generation = excluded.generation, exhausted_at_ms = NULL WHERE excluded.generation > pot_announce_parked.generation RETURNING generation";
+/// A delivered wake-up leaves the park (only the token that was delivered).
 pub const PARKED_DELIVERED_SQL: &str = "DELETE FROM pot_announce_parked WHERE outpoint = ?1 AND kind = ?2 AND recipient = ?3 AND generation = ?4";
-/// A drained wake-up that failed again: its next attempt, or its exhausted stamp.
+/// A wake-up that failed (the detached announce's, or the drain's): its next attempt, or its exhausted stamp, only at
+/// the token it holds (a park since is a new intent with its own attempts).
 pub const PARKED_RETRY_SQL: &str = "UPDATE pot_announce_parked SET attempts = ?5, next_attempt_at_ms = ?6, exhausted_at_ms = ?7 WHERE outpoint = ?1 AND kind = ?2 AND recipient = ?3 AND generation = ?4";
 /// The drain's read: the live wake-ups due now, oldest due first, bounded.
 pub const PARKED_DUE_SQL: &str = "SELECT outpoint, kind, recipient, at, attempts, generation FROM pot_announce_parked WHERE exhausted_at_ms IS NULL AND next_attempt_at_ms <= ?1 ORDER BY next_attempt_at_ms LIMIT ?2";
@@ -132,13 +146,11 @@ pub struct Parked {
 /// One statement of the park's write set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParkOp {
-    /// Park `wake` of `generation` with `attempts` made, due at `next_ms`.
+    /// Park `wake` as a NEW intent (attempts 0, due at `next_ms`): its token is taken in the batch (N1).
     Park {
         wake: Wake,
         at_ms: u64,
-        attempts: u32,
         next_ms: u64,
-        generation: u64,
     },
     Delivered {
         wake: Wake,
@@ -158,23 +170,17 @@ pub enum ParkOp {
 }
 
 impl ParkOp {
-    fn stmt(&self) -> Stmt {
+    /// The statement; `back` is a park's distance from the batch's last token (N1).
+    fn stmt(&self, back: u64) -> Stmt {
         let int = |n: u64| Bind::Int(n as i64);
         match self {
             ParkOp::Park {
                 wake,
                 at_ms,
-                attempts,
                 next_ms,
-                generation,
             } => {
                 let mut b = wake.key_binds();
-                b.extend([
-                    int(*at_ms),
-                    int(u64::from(*attempts)),
-                    int(*next_ms),
-                    int(*generation),
-                ]);
+                b.extend([int(*at_ms), int(*next_ms), int(back)]);
                 Stmt::new(PARK_SQL, b)
             }
             ParkOp::Delivered { wake, generation } => {
@@ -204,6 +210,13 @@ impl ParkOp {
             ),
         }
     }
+}
+
+/// What one park statement of a write came to: the rows it changed, and the token a park wrote (`None`: refused).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpOut {
+    pub changes: u64,
+    pub generation: Option<u64>,
 }
 
 /// What one relay call came to.
@@ -268,7 +281,6 @@ pub trait SqlPort {
     /// Add counter deltas (`ops_counters`), best effort.
     async fn counters(&self, deltas: Vec<(String, u64)>);
     fn now_ms(&self) -> u64;
-    fn nonce(&self) -> u64;
     fn log(&self, line: &str);
 }
 
@@ -281,18 +293,16 @@ pub trait HookStore {
     /// or no attributed seat. So 1 to 5 reads (5 + n on a required-read fault), then the caller's ONE write.
     async fn read_outpoints(&self, outpoints: &[(String, u32)]) -> Vec<OutpointRead>;
     /// Every stale mark and every park statement given, in ONE batch (the hook's write; the settle's; the
-    /// drain's). Answers the rows each park statement changed, in order (the sweep's count).
+    /// drain's), the parks' tokens taken in it (N1). Answers each op's [`OpOut`], in order.
     async fn write(
         &self,
         marks: &[(String, &'static str)],
         ops: &[ParkOp],
-    ) -> Result<Vec<u64>, String>;
+    ) -> Result<Vec<OpOut>, String>;
     /// The parked wake-ups due at `now`, oldest due first, at most `limit`.
     async fn due_parked(&self, now: u64, limit: u32) -> Result<Vec<Parked>, String>;
     async fn counters(&self, deltas: Vec<(String, u64)>);
     fn now_ms(&self) -> u64;
-    /// 0 to 999: the low digits of a park's generation (two hooks of one millisecond do not share one).
-    fn nonce(&self) -> u64;
     fn log(&self, line: &str);
 }
 
@@ -476,7 +486,7 @@ impl<P: SqlPort> HookStore for HookD1<P> {
         &self,
         marks: &[(String, &'static str)],
         ops: &[ParkOp],
-    ) -> Result<Vec<u64>, String> {
+    ) -> Result<Vec<OpOut>, String> {
         let mut stmts: Vec<Stmt> = marks
             .iter()
             .map(|(id, _)| {
@@ -486,9 +496,45 @@ impl<P: SqlPort> HookStore for HookD1<P> {
                 )
             })
             .collect();
-        stmts.extend(ops.iter().map(ParkOp::stmt));
+        // N1: the parks' tokens, taken in this batch before its first park
+        let parks = ops
+            .iter()
+            .filter(|o| matches!(o, ParkOp::Park { .. }))
+            .count() as u64;
+        let seq = usize::from(parks > 0);
+        if parks > 0 {
+            stmts.push(Stmt::new(
+                PARK_SEQ_BUMP_SQL,
+                vec![Bind::Int(parks as i64), Bind::Int(self.sql.now_ms() as i64)],
+            ));
+        }
+        let mut k = 0u64;
+        for op in ops {
+            let back = if matches!(op, ParkOp::Park { .. }) {
+                k += 1;
+                parks - k
+            } else {
+                0
+            };
+            stmts.push(op.stmt(back));
+        }
         let out = self.sql.run_batch(stmts).await?;
-        Ok(out[marks.len()..].iter().map(|o| o.changes).collect())
+        Ok(out[marks.len() + seq..]
+            .iter()
+            .zip(ops)
+            .map(|(o, op)| OpOut {
+                changes: o.changes,
+                generation: match op {
+                    ParkOp::Park { .. } => o
+                        .rows
+                        .first()
+                        .and_then(|r| r.get("generation"))
+                        .and_then(Value::as_f64)
+                        .map(|g| g as u64),
+                    _ => None,
+                },
+            })
+            .collect())
     }
 
     async fn due_parked(&self, now: u64, limit: u32) -> Result<Vec<Parked>, String> {
@@ -534,9 +580,6 @@ impl<P: SqlPort> HookStore for HookD1<P> {
     fn now_ms(&self) -> u64 {
         self.sql.now_ms()
     }
-    fn nonce(&self) -> u64 {
-        self.sql.nonce()
-    }
     fn log(&self, line: &str) {
         self.sql.log(line)
     }
@@ -576,8 +619,9 @@ pub struct AnnouncePlan {
     /// (identity, txid, vout): one `pot` event into the seat's `low_events` box.
     pub seat_events: Vec<(String, String, u32)>,
     pub at_ms: u64,
-    /// The generation its parks carry.
-    pub generation: u64,
+    /// Per wake-up of [`AnnouncePlan::wakes`], the token its park WROTE (N1: read back by `RETURNING`); `None` for one
+    /// whose park wrote no row, announced once without a park.
+    pub generations: Vec<Option<u64>>,
 }
 
 impl AnnouncePlan {
@@ -598,6 +642,26 @@ impl AnnouncePlan {
         });
         rooms.chain(seats).collect()
     }
+    /// Every wake-up with its token.
+    pub fn sends(&self) -> Vec<Call> {
+        self.wakes()
+            .into_iter()
+            .enumerate()
+            .map(|(i, wake)| Call {
+                wake,
+                at_ms: self.at_ms,
+                generation: self.generations.get(i).copied().flatten(),
+            })
+            .collect()
+    }
+}
+
+/// One relay call to make: a wake-up, the `at` its body carries, and its park's token (`None`: not parked).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Call {
+    pub wake: Wake,
+    pub at_ms: u64,
+    pub generation: Option<u64>,
 }
 
 /// What [`apply_pot_changed`] decided: the answer's lists, the identities whose owed rows the detached recompute
@@ -610,7 +674,7 @@ pub struct PotChangedOutcome {
     pub stale_marks: Vec<(String, &'static str)>,
     /// The hook's write batch (the stale marks and the parks) faulted: nothing of it landed, and the answer says so.
     pub stale_fault: Option<String>,
-    /// Wake-ups parked durably before the answer (H1).
+    /// Wake-ups parked durably before the answer: the rows the park WROTE (N1, `RETURNING`).
     pub parked: usize,
     pub plan: AnnouncePlan,
 }
@@ -638,7 +702,7 @@ pub async fn apply_pot_changed<S: HookStore>(
             outpoints: outpoints.to_vec(),
             seat_events: Vec::new(),
             at_ms,
-            generation: at_ms * 1000 + store.nonce() % 1000,
+            generations: Vec::new(),
         },
         ..PotChangedOutcome::default()
     };
@@ -681,7 +745,8 @@ pub async fn apply_pot_changed<S: HookStore>(
         }
     }
     // H1: every wake-up of the plan is PARKED in the same write batch as the stale marks, BEFORE the answer, not
-    // due until the detached announce has had its window; the announce's settle takes out what it delivered.
+    // due until the detached announce has had its window; the announce's settle takes out what it delivered. N1:
+    // each park's token is the one the batch WROTE.
     let parks: Vec<ParkOp> = out
         .plan
         .wakes()
@@ -689,13 +754,14 @@ pub async fn apply_pot_changed<S: HookStore>(
         .map(|wake| ParkOp::Park {
             wake,
             at_ms,
-            attempts: 0,
             next_ms: at_ms + PARK_GRACE_MS,
-            generation: out.plan.generation,
         })
         .collect();
     match store.write(&out.stale_marks, &parks).await {
-        Ok(_) => out.parked = parks.len(),
+        Ok(outs) => {
+            out.plan.generations = outs.iter().map(|o| o.generation).collect();
+            out.parked = outs.iter().filter(|o| o.generation.is_some()).count();
+        }
         Err(e) => out.stale_fault = Some(e),
     }
     out
@@ -730,7 +796,7 @@ pub struct AnnounceTally {
     pub failed: u64,
     /// The wall fell before every call answered (the unanswered ones are in `failed`).
     pub walled: bool,
-    /// Wake-ups left parked for the drain (every failed one).
+    /// Wake-ups left parked for the drain (every failed one that was parked).
     pub parked: u64,
     /// The settle's write faulted.
     pub park_faults: u64,
@@ -761,37 +827,37 @@ impl AnnounceTally {
     }
 }
 
-/// Deliver `wakes` together (the calls of one body run together, not one after another), all raced against ONE
-/// `wall`: each wake-up's answer, `None` for a call that had not answered at the wall (dropped).
+/// One relay call: a room's broadcast, or a seat's `pot` event.
+async fn send_one<R: RelayPort>(relay: &R, s: &Call) -> Delivery {
+    let w = &s.wake;
+    match &w.recipient {
+        None => {
+            let body = crate::internal_events::pot_changed_event_body(&w.txid, w.vout, s.at_ms);
+            relay
+                .broadcast(crate::internal_events::POTS_ROOM, body)
+                .await
+        }
+        Some(id) => {
+            let body =
+                crate::internal_events::pot_event_body(&w.txid, w.vout, carrier_entry(), s.at_ms);
+            relay.push(id, body).await
+        }
+    }
+}
+
+/// Deliver `sends` together (the calls of one body run together, not one after another), all raced against ONE
+/// `wall`: each call's answer, `None` for a call that had not answered at the wall (dropped).
 pub async fn deliver<R: RelayPort, W: Future<Output = ()>>(
     relay: &R,
-    wakes: &[Wake],
-    at_ms: u64,
+    sends: &[Call],
     wall: W,
 ) -> Vec<Option<Delivery>> {
     use futures_util::future::{join_all, select};
-    let got: RefCell<Vec<Option<Delivery>>> = RefCell::new(vec![None; wakes.len()]);
-    let calls = wakes.iter().enumerate().map(|(i, w)| {
+    let got: RefCell<Vec<Option<Delivery>>> = RefCell::new(vec![None; sends.len()]);
+    let calls = sends.iter().enumerate().map(|(i, s)| {
         let got = &got;
         async move {
-            let d = match &w.recipient {
-                None => {
-                    let body =
-                        crate::internal_events::pot_changed_event_body(&w.txid, w.vout, at_ms);
-                    relay
-                        .broadcast(crate::internal_events::POTS_ROOM, body)
-                        .await
-                }
-                Some(id) => {
-                    let body = crate::internal_events::pot_event_body(
-                        &w.txid,
-                        w.vout,
-                        carrier_entry(),
-                        at_ms,
-                    );
-                    relay.push(id, body).await
-                }
-            };
+            let d = send_one(relay, s).await;
             got.borrow_mut()[i] = Some(d);
         }
     });
@@ -811,7 +877,7 @@ pub async fn announce<R: RelayPort, W: Future<Output = ()>>(
     plan: &AnnouncePlan,
     wall: W,
 ) -> AnnounceTally {
-    let got = deliver(relay, &plan.wakes(), plan.at_ms, wall).await;
+    let got = deliver(relay, &plan.sends(), wall).await;
     let mut t = AnnounceTally::default();
     for d in got {
         match d {
@@ -843,8 +909,9 @@ impl RelayPort for WorkerRelay {
 pub type Detached = std::pin::Pin<Box<dyn Future<Output = ()>>>;
 
 /// The detached announce of one body, then its SETTLE (H1): a delivered wake-up (or one the deploy cannot send)
-/// leaves the park; one that failed or had not answered at the wall is re-parked for the drain (attempt 1, due after
-/// [`PARK_RETRY_BASE_MS`]), so a park the answer's write could not make is made here. One write batch; its log line
+/// leaves the park at the token its park wrote; one that failed or had not answered at the wall is retried by the
+/// drain (attempt 1, due after [`PARK_RETRY_BASE_MS`]) at that token only (N1: a later hook's park of the key is a new
+/// intent, untouched). A wake-up whose park wrote no row is sent once and settles nothing. One write batch; its log line
 /// and its counters.
 pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
     store: &S,
@@ -853,31 +920,35 @@ pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = 
     wall: W,
 ) -> AnnounceTally {
     let t0 = store.now_ms();
-    let wakes = plan.wakes();
-    let got = deliver(relay, &wakes, plan.at_ms, wall).await;
+    let sends = plan.sends();
+    let got = deliver(relay, &sends, wall).await;
     let now = store.now_ms();
     let mut t = AnnounceTally::default();
-    let mut ops = Vec::with_capacity(wakes.len());
-    for (wake, d) in wakes.into_iter().zip(got) {
+    let mut ops = Vec::with_capacity(sends.len());
+    for (s, d) in sends.into_iter().zip(got) {
         match d {
             Some(d @ (Delivery::Sent | Delivery::NotConfigured)) => {
                 t.note(d);
-                ops.push(ParkOp::Delivered {
-                    wake,
-                    generation: plan.generation,
-                });
+                if let Some(generation) = s.generation {
+                    ops.push(ParkOp::Delivered {
+                        wake: s.wake,
+                        generation,
+                    });
+                }
             }
             failed => {
                 t.failed += 1;
                 t.walled |= failed.is_none();
-                t.parked += 1;
-                ops.push(ParkOp::Park {
-                    wake,
-                    at_ms: plan.at_ms,
-                    attempts: 1,
-                    next_ms: retry_at(now, 1),
-                    generation: plan.generation,
-                });
+                if let Some(generation) = s.generation {
+                    t.parked += 1;
+                    ops.push(ParkOp::Retry {
+                        wake: s.wake,
+                        generation,
+                        attempts: 1,
+                        next_ms: retry_at(now, 1),
+                        exhausted_at_ms: None,
+                    });
+                }
             }
         }
     }
@@ -938,10 +1009,11 @@ impl DrainTally {
 }
 
 /// ONE DRAIN PASS (the scheduled tick's, and `POST /internal/pot-announce-drain`'s): at most
-/// [`DRAIN_MAX_PER_PASS`] parked wake-ups due now, delivered together under `wall`; a delivered one leaves the park,
-/// a failed one is retried later (doubling from [`PARK_RETRY_BASE_MS`] to [`PARK_RETRY_MAX_MS`]) and marked
-/// exhausted at its [`PARK_MAX_ATTEMPTS`]th attempt; exhausted rows older than [`PARK_SWEEP_AFTER_MS`] are swept, at
-/// most [`SWEEP_MAX_PER_PASS`]. Two D1 round trips: the due read, then one write batch (the settle and the sweep).
+/// [`DRAIN_MAX_PER_PASS`] parked wake-ups due now, delivered together under `wall`, each at the token it holds; a
+/// delivered one leaves the park, a failed one is retried later (doubling from [`PARK_RETRY_BASE_MS`] to
+/// [`PARK_RETRY_MAX_MS`]) and marked exhausted at its [`PARK_MAX_ATTEMPTS`]th attempt; exhausted rows older than
+/// [`PARK_SWEEP_AFTER_MS`] are swept, at most [`SWEEP_MAX_PER_PASS`]. Two D1 round trips: the due read, then one
+/// write batch (the settle and the sweep).
 pub async fn drain_parked<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
     store: &S,
     relay: &R,
@@ -963,7 +1035,15 @@ pub async fn drain_parked<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
     let got = if due.is_empty() {
         Vec::new()
     } else {
-        deliver_each_at(relay, &due, wall).await
+        let calls: Vec<Call> = due
+            .iter()
+            .map(|p| Call {
+                wake: p.wake.clone(),
+                at_ms: p.at_ms,
+                generation: Some(p.generation),
+            })
+            .collect();
+        deliver(relay, &calls, wall).await
     };
     let now = store.now_ms();
     for (p, d) in due.into_iter().zip(got) {
@@ -1002,7 +1082,7 @@ pub async fn drain_parked<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
         limit: SWEEP_MAX_PER_PASS,
     });
     match store.write(&[], &ops).await {
-        Ok(changes) => t.swept = changes.last().copied().unwrap_or(0),
+        Ok(outs) => t.swept = outs.last().map(|o| o.changes).unwrap_or(0),
         Err(e) => {
             t.faults += 1;
             store.log(&format!("[pot-changed] drain settle failed: {e}"));
@@ -1017,35 +1097,6 @@ pub async fn drain_parked<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
         store.counters(counters).await;
     }
     t
-}
-
-/// The drain's delivery: each parked wake-up with the `at` it was announced at, all together under the one wall.
-async fn deliver_each_at<R: RelayPort, W: Future<Output = ()>>(
-    relay: &R,
-    due: &[Parked],
-    wall: W,
-) -> Vec<Option<Delivery>> {
-    use futures_util::future::{join_all, select};
-    let got: RefCell<Vec<Option<Delivery>>> = RefCell::new(vec![None; due.len()]);
-    let calls = due.iter().enumerate().map(|(i, p)| {
-        let got = &got;
-        async move {
-            let mut one = deliver(
-                relay,
-                std::slice::from_ref(&p.wake),
-                p.at_ms,
-                std::future::pending::<()>(),
-            )
-            .await;
-            got.borrow_mut()[i] = one.pop().flatten();
-        }
-    });
-    {
-        let all = join_all(calls);
-        futures_util::pin_mut!(all, wall);
-        let _ = select(all, wall).await;
-    }
-    got.into_inner()
 }
 
 /// THE POT HOOK, after its bearer and its parse: the decision over the store ([`apply_pot_changed`]), then the
@@ -1221,9 +1272,6 @@ pub(crate) mod tests {
         fn now_ms(&self) -> u64 {
             self.now.get()
         }
-        fn nonce(&self) -> u64 {
-            self.stmts.get() as u64 % 1000
-        }
         fn log(&self, line: &str) {
             self.lines.borrow_mut().push(line.to_string());
         }
@@ -1236,7 +1284,8 @@ pub(crate) mod tests {
     fn pot(i: u32) -> (String, u32) {
         (format!("e{i:063x}"), 0)
     }
-    const MARKER_POT: &str = "f0000000000000000000000000000000000000000000000000000000000000ff";
+    pub(crate) const MARKER_POT: &str =
+        "f0000000000000000000000000000000000000000000000000000000000000ff";
     fn marker_seat(k: u32) -> String {
         format!("02{}", format!("{:02x}", 0xc0 + k).repeat(32))
     }
@@ -1543,15 +1592,13 @@ pub(crate) mod tests {
                 &[ParkOp::Park {
                     wake,
                     at_ms: now,
-                    attempts: 1,
                     next_ms: now,
-                    generation: 5,
                 }],
             )
             .await
             .unwrap();
         let failing = SlowRelay::new(Duration::ZERO, Delivery::Failed);
-        for _ in 0..PARK_MAX_ATTEMPTS - 1 {
+        for _ in 0..PARK_MAX_ATTEMPTS {
             let t = drain_parked(
                 &*store,
                 &failing,
@@ -1567,7 +1614,7 @@ pub(crate) mod tests {
         assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_EXHAUSTED), 1);
         assert_eq!(
             store.sql.counter(COUNTER_ANNOUNCE_RETRY_FAILED),
-            u64::from(PARK_MAX_ATTEMPTS) - 2
+            u64::from(PARK_MAX_ATTEMPTS) - 1
         );
         let t = drain_parked(
             &*store,
@@ -1590,47 +1637,6 @@ pub(crate) mod tests {
         assert_eq!(t.swept, 1, "swept a day after");
         assert!(parked_rows(&store.sql).is_empty());
         assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_SWEPT), 1);
-    }
-
-    /// (H1) A LATER HOOK'S PARK IS NEVER UNDONE BY AN EARLIER ONE'S SETTLE: the settle and the drain touch only the
-    /// generation they hold.
-    #[tokio::test(flavor = "current_thread")]
-    async fn e649f_h1_a_settle_touches_only_its_own_generation() {
-        let store = HookD1 {
-            sql: SqliteSql::migrated(),
-        };
-        let wake = Wake {
-            txid: MARKER_POT.to_string(),
-            vout: 0,
-            recipient: None,
-        };
-        let park = |generation: u64| ParkOp::Park {
-            wake: wake.clone(),
-            at_ms: 1,
-            attempts: 0,
-            next_ms: 1,
-            generation,
-        };
-        store.write(&[], &[park(2000)]).await.unwrap();
-        store.write(&[], &[park(1000)]).await.unwrap();
-        store
-            .write(
-                &[],
-                &[ParkOp::Delivered {
-                    wake: wake.clone(),
-                    generation: 1000,
-                }],
-            )
-            .await
-            .unwrap();
-        let rows = store.due_parked(10, 24).await.unwrap();
-        assert_eq!(
-            rows.len(),
-            1,
-            "the older park neither replaced nor deleted the newer"
-        );
-        assert_eq!(rows[0].generation, 2000);
-        assert_eq!(rows[0].wake, wake);
     }
 
     /// (H2, M2 c) AN OPTIONAL MARKER ARM'S FAULT LEAVES THE OTHER SEATS FILED. The review's case through the
@@ -1737,7 +1743,7 @@ pub(crate) mod tests {
             outpoints: vec![op(1), op(2)],
             seat_events: vec![(A.into(), op(1).0, 1)],
             at_ms: 7,
-            generation: 7000,
+            generations: Vec::new(),
         };
         let wall = || tokio::time::sleep(Duration::from_millis(200));
         let ok = announce(
@@ -1898,5 +1904,115 @@ pub(crate) mod tests {
                 "{name} answers Server-Timing"
             );
         }
+    }
+
+    fn parked_count(db: &SqliteSql) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM pot_announce_parked", [], |r| r.get(0))
+            .unwrap()
+    }
+    fn generations(db: &SqliteSql) -> Vec<i64> {
+        let mut q = db
+            .conn
+            .prepare("SELECT generation FROM pot_announce_parked ORDER BY generation")
+            .unwrap();
+        q.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// (N1, the delta review) THE PARK'S TOKEN IS ORDERED AND NEVER REUSED. The review's shapes through the production
+    /// handler over the shipped SQL: two hooks of the SAME body at the SAME millisecond (their old generation was the
+    /// stamp times 1,000 plus a nonce; with one nonce the older settle deleted all 22 later parks, `left: 0 right:
+    /// 22`; with an older nonce above the later one the later park was refused while `parked` said 22). Now each park
+    /// takes its token from D1's counter in its own batch: the later hook's 22 tokens are all above the earlier's,
+    /// its `parked` is the rows it WROTE (`RETURNING`), the earlier hook's settle (run after) deletes none of them,
+    /// and the later hook's detached work cancelled leaves its 22 wake-ups for the drain, which delivers them at the
+    /// later tokens. A settle's retry at an old token touches nothing either.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f2_n1_a_later_park_of_the_same_millisecond_survives_the_older_settle() {
+        let (db, ops) = mixed_fixture();
+        let store = Rc::new(HookD1 { sql: db });
+        let relay = Rc::new(Relay::default());
+        let (a, b) = (Recorded::default(), Recorded::default());
+        let at = store.sql.now.get();
+        let wall = || tokio::time::sleep(Duration::from_secs(5));
+        let oa = serve_pot_changed(
+            store.clone(),
+            relay.clone(),
+            wall(),
+            &|f| a.0.borrow_mut().push(f),
+            &ops,
+            at,
+        )
+        .await;
+        let ga = generations(&store.sql);
+        let ob = serve_pot_changed(
+            store.clone(),
+            relay.clone(),
+            wall(),
+            &|f| b.0.borrow_mut().push(f),
+            &ops,
+            at,
+        )
+        .await;
+        let gb = generations(&store.sql);
+        assert_eq!(
+            (oa.parked, ob.parked),
+            (22, 22),
+            "each reports the rows it wrote"
+        );
+        assert_eq!(gb.len(), 22);
+        assert!(
+            gb.iter().min() > ga.iter().max(),
+            "every later token is above every earlier one: {ga:?} then {gb:?}"
+        );
+        let mut seen = gb.clone();
+        seen.dedup();
+        assert_eq!(seen.len(), 22, "no token is shared");
+        assert_eq!(
+            ob.plan
+                .generations
+                .iter()
+                .flatten()
+                .map(|g| *g as i64)
+                .collect::<Vec<_>>()
+                .len(),
+            22,
+            "the plan holds the tokens the batch returned"
+        );
+        a.run_all().await;
+        b.0.borrow_mut().clear();
+        assert_eq!(
+            parked_count(&store.sql),
+            ob.parked as i64,
+            "the later hook's parks survive the older settle"
+        );
+        assert_eq!(generations(&store.sql), gb, "untouched at the later tokens");
+        // a retry at an old token touches nothing
+        store
+            .write(
+                &[],
+                &[ParkOp::Retry {
+                    wake: ob.plan.wakes()[0].clone(),
+                    generation: ga[0] as u64,
+                    attempts: 3,
+                    next_ms: 0,
+                    exhausted_at_ms: Some(1),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(generations(&store.sql), gb);
+        store.sql.now.set(at + PARK_GRACE_MS);
+        let quick = Relay::default();
+        let t = drain_parked(&*store, &quick, tokio::time::sleep(Duration::from_secs(5))).await;
+        assert_eq!(
+            (t.due, t.drained),
+            (22, 22),
+            "the drain delivers the later intents"
+        );
+        assert_eq!(parked_count(&store.sql), 0);
     }
 }
