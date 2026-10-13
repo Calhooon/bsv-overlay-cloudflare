@@ -459,7 +459,7 @@ pub async fn event(
         }
     }
     if !checked && hook_may_reask(kind, state.reask().is_some()) {
-        super::pacing::begin_tick(now / 60);
+        super::pacing::begin_tick(now / 900);
         let proof = super::execute_reask(
             txid,
             first_party,
