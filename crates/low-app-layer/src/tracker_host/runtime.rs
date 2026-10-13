@@ -653,6 +653,7 @@ where
 {
     for subject in rows {
         crate::courier::note_presence("tracker_backfill_scanned_total");
+        let previous = after.clone();
         after = subject.txid.clone();
         if subject.tracked.is_some() || subject.has_proof == 0.0 {
             continue;
@@ -677,6 +678,13 @@ where
                 &headers,
                 Input::Evidence(Evidence::Proof(proof)),
             ) {
+                if matches!(
+                    error,
+                    bsv_tracker::CheckError::Unavailable(_) | bsv_tracker::CheckError::Headers(_)
+                ) {
+                    crate::courier::note_presence("tracker_backfill_header_faults_total");
+                    return Ok(previous);
+                }
                 let reason = match error {
                     bsv_tracker::CheckError::RootMismatch(_) => "root_mismatch",
                     bsv_tracker::CheckError::Unavailable(_) => "unavailable",
@@ -731,8 +739,10 @@ pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
         .counted_all()
         .await?
         .results::<BackfillSubject>()?;
-    let page_done = rows.len() < 64;
-    let complete = pots && page_done;
+    let short_page = rows.len() < 64;
+    let page_end = rows
+        .last()
+        .map_or_else(|| after.clone(), |row| row.txid.clone());
     after = walk_backfill_page(
         rows,
         after,
@@ -742,6 +752,8 @@ pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
     )
     .await
     .map_err(worker::Error::RustError)?;
+    let page_done = short_page && after == page_end;
+    let complete = pots && page_done;
     let saved = if page_done && !pots {
         "1:".to_string()
     } else {
