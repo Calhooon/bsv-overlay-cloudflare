@@ -28,11 +28,12 @@ use worker::{console_warn, Headers, Method, Request, RequestInit, Response, Resu
 use crate::auth::{AuthState, IdentityDecision};
 
 use crate::logic::{
-    assemble_pots_view, assemble_recovery_view, assemble_statuses, batch_where_sql, beef_body,
-    chunk_outpoints, decode_beef_hex, health_body, leaderboard_body, parse_outpoints,
-    parse_present_height, pots_view_body, pots_view_join_sql, recovery_view_body,
-    recovery_view_sql, tip_body, utxo_status_body, valid_identity, valid_txid, Outpoint,
-    PotRecordRow, PotsViewRow, RecoveryRow, ResultMarkerRow,
+    assemble_pots_view, assemble_recovery_view, assemble_statuses, attach_evictions,
+    batch_where_sql, beef_body, chunk_outpoints, decode_beef_hex, distinct_db_txids,
+    evictions_by_txid_sql, health_body, leaderboard_body, parse_outpoints, parse_present_height,
+    pots_view_body, pots_view_join_sql, recovery_view_body, recovery_view_sql, tip_body,
+    utxo_status_body, valid_identity, valid_txid, EvictionLedgerRow, Outpoint, PotRecordRow,
+    PotsViewRow, RecoveryRow, ResultMarkerRow,
 };
 
 /// The chaintracks present-height endpoint, fetched through the service
@@ -323,11 +324,58 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         }
     }
 
-    let entries = assemble_statuses(&outpoints, &rows);
+    let mut entries = assemble_statuses(&outpoints, &rows);
+    // bsv-low E649 L6: the eviction ledger by txid, so an evicted pot is SERVED as evicted (the client keeps
+    // no memory of having seen it held). One PK read per chunk of distinct txids; a fault leaves the key
+    // absent on every entry (never a fabricated `null`, which would read as "no eviction").
+    if let Some(ledger) = read_eviction_ledger(&db, &distinct_db_txids(&outpoints)).await {
+        attach_evictions(&mut entries, &ledger);
+    }
     json_response(
         crate::tracker_host::runtime::body(&ctx.env, &utxo_status_body(&entries), None).await?,
         200,
     )
+}
+
+/// bsv-low E649 L6: read `pot_evictions` for these lowercase txids. `None` on any fault (the caller omits the
+/// field); read only.
+async fn read_eviction_ledger(
+    db: &worker::D1Database,
+    txids: &[String],
+) -> Option<Vec<EvictionLedgerRow>> {
+    #[derive(Deserialize)]
+    struct EvictionD1 {
+        txid: String,
+        #[serde(rename = "evictedAt")]
+        evicted_at: f64,
+        #[serde(rename = "readmittedAt", default)]
+        readmitted_at: Option<f64>,
+    }
+    let mut out = Vec::new();
+    for chunk in txids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let binds: Vec<JsValue> = chunk.iter().map(|t| JsValue::from_str(t)).collect();
+        let rows = match db.prepare(evictions_by_txid_sql(chunk.len())).bind(&binds) {
+            Ok(stmt) => stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<EvictionD1>()),
+            Err(e) => Err(e),
+        };
+        match rows {
+            Ok(rows) => out.extend(rows.into_iter().map(|r| EvictionLedgerRow {
+                txid: r.txid.to_ascii_lowercase(),
+                evicted_at: r.evicted_at as i64,
+                readmitted_at: r.readmitted_at.map(|v| v as i64),
+            })),
+            Err(e) => {
+                console_warn!(
+                    "[utxo-status] eviction ledger read failed (the evicted field is omitted): {e}"
+                );
+                return None;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// `GET /beef/:txid` — the BEEF bytes for a txid, read from `pot_beefs`
@@ -7526,6 +7574,7 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             spender_final: None,
             reason: row.reason,
             funding_seen: None,
+            evicted: crate::logic::ServedEviction::NotRead,
         });
     }
 

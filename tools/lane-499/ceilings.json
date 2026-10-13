@@ -5,14 +5,14 @@
     "utxo-status-8": {
       "route": "/utxo-status?outpoints=<A's 8 pots>",
       "measured": {
-        "reads": 8,
+        "reads": 16,
         "writes": 0,
-        "stmts": 1
+        "stmts": 2
       },
       "ceiling": {
-        "reads": 12,
+        "reads": 24,
         "writes": 0,
-        "stmts": 3
+        "stmts": 4
       },
       "censusKey": "/utxo-status"
     },

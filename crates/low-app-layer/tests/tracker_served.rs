@@ -160,6 +160,7 @@ fn ns3d_l3_real_main_body_builders_preserve_every_legacy_key() {
         spender_final: Some(true),
         reason: None,
         funding_seen: Some(true),
+        evicted: logic::ServedEviction::NotRead,
     }];
     check(txany::spent_any_body(&entries, &[false]), None, &views);
     check(txany::spent_any_body(&entries, &[true]), None, &views);

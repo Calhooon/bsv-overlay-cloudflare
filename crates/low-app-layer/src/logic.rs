@@ -190,6 +190,88 @@ pub struct OutpointStatus {
     /// for a confident wrong answer, and would break this route's contract
     /// that every positive is raw-hash + input-match verified.
     pub reason: Option<&'static str>,
+    /// bsv-low E649 L6: the overlay's eviction ledger (`pot_evictions`) for this txid, read on the D1
+    /// `/utxo-status` path only. [`ServedEviction::NotRead`] (every other producer, or a ledger read that
+    /// faulted) omits the key, so a client cannot tell it from an older server and judges nothing from it.
+    pub evicted: ServedEviction,
+}
+
+/// bsv-low E649 L6: the eviction ledger's word for one txid, served so the client stores nothing about an
+/// eviction (a fresh device judges an evicted pot from this field alone).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ServedEviction {
+    /// Not read on this surface (or the read faulted): the wire key is ABSENT.
+    #[default]
+    NotRead,
+    /// Read, and the ledger holds no row for the txid: the wire value is `null`.
+    NoRow,
+    /// The ledger's row: `evictedAt` (ms) and `readmittedAt` (ms, `None` while the eviction is open).
+    Row { at: i64, readmitted_at: Option<i64> },
+}
+
+/// The served word of an OPEN eviction: bsv-tracker 0.2.2's `Word::Rejected`, wire `rejected`. A readmitted
+/// row serves no word (`null`): the readmission is the chain's or the operator's word and the index holds
+/// the pot again.
+pub const EVICTED_WORD: &str = "rejected";
+
+impl ServedEviction {
+    /// The wire value, `None` when the key is omitted.
+    pub fn to_json(&self) -> Option<serde_json::Value> {
+        match self {
+            ServedEviction::NotRead => None,
+            ServedEviction::NoRow => Some(serde_json::Value::Null),
+            ServedEviction::Row { at, readmitted_at } => Some(json!({
+                "at": at,
+                "word": if readmitted_at.is_none() { Some(EVICTED_WORD) } else { None },
+                "readmittedAt": readmitted_at,
+            })),
+        }
+    }
+}
+
+/// One ledger row, host-typed (lowercase txid, D1's numbers as i64).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictionLedgerRow {
+    pub txid: String,
+    pub evicted_at: i64,
+    pub readmitted_at: Option<i64>,
+}
+
+/// bsv-low E649 L6: the `/utxo-status` ledger read, one statement per chunk of DISTINCT txids. `txid IN`
+/// rides the primary key (the ledger writes its key lowercased; the route binds lowercase). Read only:
+/// nothing on this path writes (NS-3).
+pub fn evictions_by_txid_sql(n: usize) -> String {
+    debug_assert!((1..=MAX_OUTPOINTS).contains(&n));
+    let marks = (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT lower(txid) AS txid, evictedAt, readmittedAt FROM pot_evictions WHERE txid IN ({marks})")
+}
+
+/// Distinct lowercase txids of the requested outpoints, in first-seen order (the ledger read's binds).
+pub fn distinct_db_txids(outpoints: &[Outpoint]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for op in outpoints {
+        let t = op.db_txid();
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Attach the ledger's word to every entry: a row by txid, else `NoRow` (the read answered and holds none).
+pub fn attach_evictions(entries: &mut [OutpointStatus], rows: &[EvictionLedgerRow]) {
+    for e in entries.iter_mut() {
+        e.evicted = match rows.iter().find(|r| r.txid.eq_ignore_ascii_case(&e.txid)) {
+            Some(r) => ServedEviction::Row {
+                at: r.evicted_at,
+                readmitted_at: r.readmitted_at,
+            },
+            None => ServedEviction::NoRow,
+        };
+    }
 }
 
 /// `/spent-any`: an upstream provider faulted — we could not look. NOT a
@@ -219,6 +301,7 @@ impl OutpointStatus {
             spender_final: None,
             funding_seen: None,
             reason: None,
+            evicted: ServedEviction::NotRead,
         }
     }
 
@@ -266,6 +349,7 @@ impl OutpointStatus {
             spender_final,
             funding_seen,
             reason: None,
+            evicted: ServedEviction::NotRead,
         }
     }
 }
@@ -277,7 +361,7 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
     let arr: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
-            json!({
+            let mut row = json!({
                 "txid": e.txid,
                 "vout": e.vout,
                 "known": e.known,
@@ -303,7 +387,12 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
                 // verify an answer; null everywhere else (including every
                 // known:true row and the whole D1 /utxo-status path).
                 "reason": e.reason,
-            })
+            });
+            // bsv-low E649 L6 (ADDITIVE): the eviction ledger's word, omitted where it was not read.
+            if let Some(v) = e.evicted.to_json() {
+                row["evicted"] = v;
+            }
+            row
         })
         .collect();
     serde_json::Value::Array(arr).to_string()

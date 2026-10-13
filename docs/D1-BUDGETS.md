@@ -58,7 +58,7 @@ that starts writing reds); statements measured + 2 (a loop that reads per row ov
 
 | scenario | route | measured reads / writes / stmts | ceiling reads / writes / stmts |
 |---|---|---|---|
-| utxo-status-8 | `/utxo-status?outpoints=` A's 8 pots | 8 / 0 / 1 | 12 / 0 / 3 |
+| utxo-status-8 | `/utxo-status?outpoints=` A's 8 pots | 16 / 0 / 2 | 24 / 0 / 4 |
 | pots-view-8 | `/pots-view?outpoints=` A's 8 pots | 8 / 0 / 1 | 12 / 0 / 3 |
 | results-view-compute | `/results?identity=A`, the actor's compute (`d1view`) | 191 / 0 / 6 | 287 / 0 / 8 |
 | results-forward | `/results?identity=A`, the forwarding request (`d1`) | 0 / 0 / 0 | 4 / 0 / 2 |
@@ -73,6 +73,8 @@ filer mark. SHED-M1 removes the three indexed party enumeration reads entirely; 
 their own read or armed walk. The tier pins exactly one filing walk (the filer) and one victim walk on its own
 next read. The filing baseline is 11 reads / 7 writes / 6 statements on the 300-stranger fixture; the existing
 margin rule gives 17 / 9 / 8. Its detached filer walk retains the `owed-recompute` ledger.
+
+`/utxo-status` re-measured 2026-10-13 (bsv-low E649 L6, `make ci-d1-budget`, local fixture D1): 16 reads / 0 writes / 2 statements, from 8 / 0 / 1. The added statement is the eviction ledger read (`logic::evictions_by_txid_sql`, `pot_evictions WHERE txid IN (..)` on its primary key, one chunk of distinct txids per 45): one row read per distinct requested txid, so at most 64 more per request at the route's 64-outpoint cap. It writes nothing. The margin rule gives 24 / 0 / 4.
 
 Owed first read re-measured 2026-10-12 after the #610 fold rebased onto main `13f0e66`: 363 reads / 18 writes / 28 statements (`make ci-d1-budget`, local fixture D1). The markerless cursor and candidates reads, #610, account for the two additional statements. The existing 28-statement ceiling is retained: zero statement margin; it is a bar, not a knob. Other scenario baselines above remain the 2026-10-07 measurements.
 
