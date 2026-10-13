@@ -28,6 +28,16 @@ use worker::*;
 /// so the actor strictly improves staleness while removing the herd.
 const FRESH_MS: u64 = 10_000;
 
+/// Storage::put_multiple serializes a STRUCT as an object; a serde_json map becomes a JS Map
+/// whose properties the storage API does not store.
+#[derive(serde::Serialize)]
+struct OwedDeferredArm<'a> {
+    #[serde(rename = "owed-identity")]
+    identity: &'a str,
+    #[serde(rename = "owed-due")]
+    due: i64,
+}
+
 #[durable_object]
 pub struct BoardView {
     state: State,
@@ -61,12 +71,57 @@ impl DurableObject for BoardView {
         if req.path() == "/owed-deferred" {
             let identity = url.query_pairs().find(|(k, _)| k == "identity").map(|(_, v)| v.to_string()).unwrap_or_default();
             let due = url.query_pairs().find(|(k, _)| k == "due").and_then(|(_, v)| v.parse::<i64>().ok()).unwrap_or(0);
-            if !crate::logic::valid_identity(&identity) || due <= Date::now().as_millis() as i64 { return Response::error("invalid owed alarm", 400); }
+            if !crate::logic::valid_identity(&identity) || due <= (Date::now().as_millis() as i64).saturating_sub(crate::owed::OWED_RECOMPUTE_RATE_WINDOW_MS) { return Response::error("invalid owed alarm", 400); }
             let storage = self.state.storage();
-            if storage.get::<bool>("owed-started").await?.unwrap_or(false) { return Response::ok("already run"); }
+            if storage.get::<bool>("owed-started").await?.unwrap_or(false) {
+                if url.query_pairs().any(|(k, v)| k == "read" && v == "1") {
+                    return Response::error("first read reservation already consumed", 503);
+                }
+                return Response::ok("already run");
+            }
             if storage.get::<String>("owed-identity").await?.is_none() {
-                storage.put("owed-identity", identity).await?;
-                storage.put("owed-due", due).await?;
+                // A cleanup alarm is a bounded tombstone after the consumed arm's keys were cleared.
+                if storage.get_alarm().await?.is_some() {
+                    if url.query_pairs().any(|(k, v)| k == "read" && v == "1") {
+                        return Response::error("first read reservation already consumed", 503);
+                    }
+                    return Response::ok("already run");
+                }
+                storage.put_multiple(OwedDeferredArm { identity: &identity, due }).await?;
+            }
+            if url.query_pairs().any(|(k, v)| k == "read" && v == "1") {
+                // The first read consumes the alarm's reservation. Keep the claim until the deadline alarm
+                // clears it; repeated faults and a concurrently delivered alarm cannot run it twice.
+                if storage.get::<i64>("owed-due").await? != Some(due) {
+                    return Response::error("first read reservation already consumed", 503);
+                }
+                storage.set_alarm((due - Date::now().as_millis() as i64).max(0)).await?;
+                storage.put("owed-started", true).await?;
+                crate::owed::note_recompute_deferred();
+                let db = self.env.d1("OVERLAY_DB")?;
+                let (walked, d1) = crate::d1_ledger::scoped(crate::routes::owed_compute_on_read(&self.env, &db, &identity, "read-first", None)).await;
+                crate::d1_ledger::record(crate::routes::OWED_RECOMPUTE_LEDGER_KEY, d1);
+                match walked {
+                    Ok(snapshot) => {
+                        // Consuming the alarm's slot must retain its push to the identity's other devices.
+                        let env = self.env.clone();
+                        let id = identity.clone();
+                        let event = crate::owed::owed_changed_event_body(&identity, "read-first", snapshot.0.len(), snapshot.2);
+                        self.state.wait_until(async move {
+                            crate::internal_events::first_party_push(&env, &id, event).await;
+                        });
+                        return Response::from_json(&snapshot);
+                    },
+                    Err(response) => {
+                        crate::owed::note_recompute_deferred_faulted();
+                        self.owed_clear_consumed_arm().await?;
+                        if let Err(e) = self.owed_rearm_faulted_deferred(&identity, due).await {
+                            crate::owed::note_recompute_arm_failed();
+                            return Err(e);
+                        }
+                        return response;
+                    }
+                }
             }
             if storage.get_alarm().await?.is_none() {
                 storage.set_alarm((due - Date::now().as_millis() as i64).max(0)).await?;
@@ -114,15 +169,18 @@ impl DurableObject for BoardView {
     async fn alarm(&self) -> Result<Response> {
         if self.owed_alarm_not_due().await? { return Response::ok("owed retry not due"); }
         let storage = self.state.storage();
-        if storage.get::<bool>("owed-started").await?.unwrap_or(false) { return Response::ok("already run"); }
+        if storage.get::<bool>("owed-started").await?.unwrap_or(false) {
+            self.owed_clear_consumed_arm().await?;
+            return Response::ok("already run");
+        }
         let Some(identity) = storage.get::<String>("owed-identity").await? else { return Response::ok("no owed alarm"); };
         // Claim durably BEFORE walking: an alarm retry must not buy another recompute past ceiling + one.
-        storage.put("owed-started", true).await?;
         let due = storage.get::<i64>("owed-due").await?.unwrap_or(0);
+        storage.put("owed-started", true).await?;
         let walked = crate::routes::owed_deferred_walk_and_push(&self.env, &identity).await;
-        storage.delete_all().await?;
+        if walked.is_err() { crate::owed::note_recompute_deferred_faulted(); }
+        self.owed_clear_consumed_arm().await?;
         if let Err(e) = walked {
-            crate::owed::note_recompute_deferred_faulted();
             console_warn!("[owed] deferred walk faulted: {e}");
             if let Err(e) = self.owed_rearm_faulted_deferred(&identity, due).await {
                 crate::owed::note_recompute_arm_failed();
@@ -135,6 +193,20 @@ impl DurableObject for BoardView {
 }
 
 impl BoardView {
+    async fn owed_clear_consumed_arm(&self) -> Result<()> {
+        let storage = self.state.storage();
+        // Persist the tombstone BEFORE clearing keys, until the old deadline can no longer be accepted.
+        let now = Date::now().as_millis() as i64;
+        let due = storage.get::<i64>("owed-due").await?.unwrap_or(now);
+        let expiry = due.max(now).saturating_add(crate::owed::OWED_RECOMPUTE_RATE_WINDOW_MS);
+        if let Err(e) = storage.set_alarm(expiry.saturating_sub(now)).await {
+            crate::owed::note_recompute_arm_failed();
+            return Err(e);
+        }
+        storage.delete_all().await?;
+        Ok(())
+    }
+
     async fn owed_alarm_not_due(&self) -> Result<bool> {
         let storage = self.state.storage();
         let due = storage.get::<i64>("owed-due").await?.unwrap_or(0);
@@ -150,10 +222,13 @@ impl BoardView {
     async fn owed_rearm_faulted_deferred(&self, identity: &str, due: i64) -> Result<()> {
         let next = crate::owed::owed_fault_retry_due(due, Date::now().as_millis() as i64);
         let storage = self.state.storage();
-        storage.put("owed-identity", identity).await?;
-        storage.put("owed-due", next).await?;
-        storage.set_alarm((next - Date::now().as_millis() as i64).max(0)).await?;
-        Ok(())
+        let armed = async {
+            storage.put_multiple(OwedDeferredArm { identity, due: next }).await?;
+            storage.set_alarm((next - Date::now().as_millis() as i64).max(0)).await?;
+            Ok(())
+        }.await;
+        if armed.is_err() { storage.delete_all().await?; }
+        armed
     }
 
     /// S3 — per-identity `/results` with the same SWR contract as the board
