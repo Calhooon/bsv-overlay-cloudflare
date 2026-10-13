@@ -124,7 +124,10 @@ impl DurableObject for BoardView {
         if let Err(e) = walked {
             crate::owed::note_recompute_deferred_faulted();
             console_warn!("[owed] deferred walk faulted: {e}");
-            self.owed_rearm_faulted_deferred(&identity, due).await?;
+            if let Err(e) = self.owed_rearm_faulted_deferred(&identity, due).await {
+                crate::owed::note_recompute_arm_failed();
+                return Err(e);
+            }
             return Response::ok("owed retry armed for next window");
         }
         Response::ok("owed refreshed")
