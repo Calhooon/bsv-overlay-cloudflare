@@ -2548,4 +2548,251 @@ pub(crate) mod tests {
         );
         assert_eq!(parked_count(&store.sql), 0);
     }
+
+    /// (N5, the delta review) THE EMITTED BODIES, BYTE FOR BYTE, THROUGH THE PRODUCTION SEAM. The pins `24bbda1`
+    /// amended no longer asserted the emitted event: a `carrier_entry` answering `json!(null)` passed all seven, and
+    /// the client (`app/src/lib/lowEvents.ts` `parseLowEvent`) refuses an event whose `entry` is not an object. Here
+    /// the production handler's detached announce over the mixed body: every seat's `pot` event is exactly
+    /// `{"v":1,"kind":"pot","potOutpoint":{..},"at":..,"entry":{}}` and every room's the outpoint alone, each as the
+    /// bytes the relay is handed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f2_n5_a_the_emitted_event_bodies_byte_for_byte() {
+        let (db, ops) = mixed_fixture();
+        let store = Rc::new(HookD1 { sql: db });
+        let relay = Rc::new(Relay::default());
+        let rec = Recorded::default();
+        let out = serve_pot_changed(
+            store.clone(),
+            relay.clone(),
+            tokio::time::sleep(Duration::from_secs(5)),
+            &|f| rec.0.borrow_mut().push(f),
+            &ops,
+            7,
+        )
+        .await;
+        rec.run_all().await;
+        let bodies = relay.bodies.borrow();
+        assert_eq!(bodies.len(), 22);
+        let mut seats = 0;
+        for (to, _, body) in bodies.iter() {
+            let txid = body["potOutpoint"]["txid"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if to == crate::internal_events::POTS_ROOM {
+                assert_eq!(
+                    body,
+                    &crate::internal_events::pot_changed_event_body(&txid, 0, 7),
+                    "the room's body"
+                );
+                continue;
+            }
+            seats += 1;
+            assert!(
+                body["entry"].is_object(),
+                "the client requires an object entry: {body}"
+            );
+            assert_eq!(
+                body.to_string(),
+                format!(
+                    r#"{{"at":7,"entry":{{}},"kind":"pot","potOutpoint":{{"txid":"{txid}","vout":0}},"v":1}}"#
+                ),
+                "the seat's pot event, byte for byte"
+            );
+            assert!(out
+                .filed
+                .iter()
+                .any(|f| f["identity"] == to.as_str() && f["txid"] == txid.as_str()));
+        }
+        assert_eq!(seats, 14);
+    }
+
+    /// (N5) EVERY BRANCH OF THE DECISION, THROUGH `apply_pot_changed` (the seam the worker's handler runs): a read that
+    /// failed, no params with and without marker-named seats, decoded with no attributed seat with and without
+    /// markers, and an attributed pot; each branch's `skipped` words, its stale marks, its queued identities and its
+    /// parks (a room per outpoint, a seat per attributed identity). And the real store's failed branch: with
+    /// `pot_records` unavailable every outpoint is skipped as a read failure and only its room is parked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f2_n5_b_every_branch_of_the_decision() {
+        struct Scripted {
+            inner: HookD1<SqliteSql>,
+            reads: Vec<OutpointRead>,
+        }
+        impl HookStore for Scripted {
+            async fn read_outpoints(&self, _o: &[(String, u32)]) -> Vec<OutpointRead> {
+                self.reads.clone()
+            }
+            async fn write(
+                &self,
+                marks: &[(String, &'static str)],
+                ops: &[ParkOp],
+            ) -> Result<Vec<OpOut>, String> {
+                self.inner.write(marks, ops).await
+            }
+            async fn due_parked(&self, now: u64, limit: u32) -> Result<Vec<Parked>, String> {
+                self.inner.due_parked(now, limit).await
+            }
+            async fn counters(&self, d: Vec<(String, u64)>) {
+                self.inner.counters(d).await
+            }
+            fn now_ms(&self) -> u64 {
+                self.inner.now_ms()
+            }
+            fn log(&self, line: &str) {
+                self.inner.log(line)
+            }
+        }
+        let (m, n) = (marker_seat(0), marker_seat(1));
+        let store = Scripted {
+            inner: HookD1 {
+                sql: SqliteSql::migrated(),
+            },
+            reads: vec![
+                OutpointRead::Failed("boom".into()),
+                OutpointRead::NoParams {
+                    marker_named: vec![m.clone(), n.clone()],
+                },
+                OutpointRead::NoParams {
+                    marker_named: vec![],
+                },
+                OutpointRead::Decoded {
+                    seats: vec![],
+                    marker_named: vec![m.clone()],
+                },
+                OutpointRead::Decoded {
+                    seats: vec![],
+                    marker_named: vec![],
+                },
+                OutpointRead::Decoded {
+                    seats: vec![seat(2, 0), seat(3, 0)],
+                    marker_named: vec![],
+                },
+            ],
+        };
+        let ops: Vec<(String, u32)> = (0..6).map(op).collect();
+        let out = apply_pot_changed(&store, &ops, 7).await;
+        let why: Vec<String> = out
+            .skipped
+            .iter()
+            .map(|s| s["why"].as_str().unwrap().to_string())
+            .collect();
+        let o = |i: usize| format!("{}:{}", ops[i].0, ops[i].1);
+        assert_eq!(
+            why,
+            vec![
+                format!("[pot-changed] decoded-pots read failed for {}: boom", o(0)),
+                format!("[pot-changed] {} has no decoded params yet, nothing to file (2 seat(s) attributed by marker)", o(1)),
+                format!("[pot-changed] {} has no decoded params yet, nothing to file (0 seat(s) attributed by marker)", o(2)),
+                format!("[pot-changed] {} has no attributed seats yet, nothing to file (1 seat(s) marked stale by marker)", o(3)),
+                format!("[pot-changed] {} has no attributed seats yet, nothing to file (0 seat(s) marked stale by marker)", o(4)),
+            ]
+        );
+        assert_eq!(
+            out.stale_marks,
+            vec![
+                (m.clone(), "pot-changed (by marker)"),
+                (n.clone(), "pot-changed (by marker)"),
+                (m.clone(), "pot-changed (unattributed, by marker)"),
+            ]
+        );
+        assert_eq!(
+            out.owed_identities,
+            vec![m.clone(), n.clone(), seat(2, 0), seat(3, 0)]
+        );
+        assert_eq!(
+            out.filed,
+            vec![
+                json!({ "txid": ops[5].0, "vout": ops[5].1, "identity": seat(2, 0) }),
+                json!({ "txid": ops[5].0, "vout": ops[5].1, "identity": seat(3, 0) }),
+            ]
+        );
+        assert_eq!(
+            (out.parked, out.park_full, out.stale_fault),
+            (8, 0, None),
+            "six rooms and two seats"
+        );
+
+        // the real store, the required read unavailable: every outpoint skipped as a read failure, rooms parked
+        let (db, ops) = mixed_fixture();
+        db.conn
+            .execute_batch("ALTER TABLE pot_records RENAME TO pot_records_away")
+            .unwrap();
+        let store = HookD1 { sql: db };
+        let out = apply_pot_changed(&store, &ops, 7).await;
+        assert_eq!((out.filed.len(), out.skipped.len(), out.parked), (0, 8, 8));
+        assert!(out.skipped.iter().all(|s| s["why"]
+            .as_str()
+            .unwrap()
+            .contains("decoded-pots read failed")));
+        assert!(store
+            .sql
+            .lines
+            .borrow()
+            .iter()
+            .any(|l| l.contains("each outpoint asked alone")));
+    }
+
+    /// (N5) THE HOP BATCH: eight identities marked stale in ONE batch of eight statements, each landed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f2_n5_c_the_hop_hook_marks_eight_identities_in_one_batch() {
+        let (db, _) = decoded_fixture(4);
+        let store = HookD1 { sql: db };
+        let ids: Vec<String> = (0..4).flat_map(|i| [seat(2, i), seat(3, i)]).collect();
+        apply_hop_changed(&store, &ids).await.unwrap();
+        assert_eq!(
+            (store.sql.batches.get(), store.sql.stmts.get()),
+            (1, 8),
+            "one batch, a statement per identity"
+        );
+        let stale: i64 = store
+            .sql
+            .conn
+            .query_row("SELECT COUNT(*) FROM owed_state WHERE stale = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stale, 8);
+        apply_hop_changed(&store, &[]).await.unwrap();
+        assert_eq!(store.sql.batches.get(), 1, "no identity, no batch");
+    }
+
+    /// (N5) ALL 24 CALLS SLOW: a full body (8 decoded pots, 16 attributed seats) with EVERY relay call past the
+    /// wall. The answer is in hand with no call started and all 24 wake-ups parked; the detached announce runs all 24
+    /// together into the one wall, counts 24 failed, and leaves all 24 for the drain at attempt 1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f2_n5_d_all_24_calls_slow_are_parked_for_the_drain() {
+        let (db, ops) = decoded_fixture(8);
+        let store = Rc::new(HookD1 { sql: db });
+        let relay = Rc::new(SlowRelay::new(Duration::from_secs(40), Delivery::Sent));
+        let rec = Recorded::default();
+        let t0 = Instant::now();
+        let out = serve_pot_changed(
+            store.clone(),
+            relay,
+            tokio::time::sleep(Duration::from_millis(300)),
+            &|f| rec.0.borrow_mut().push(f),
+            &ops,
+            store.sql.now.get(),
+        )
+        .await;
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            (out.filed.len(), out.parked, out.plan.calls()),
+            (16, 24, 24)
+        );
+        let t1 = Instant::now();
+        rec.run_all().await;
+        assert!(
+            t1.elapsed() < Duration::from_secs(2),
+            "the 24 run together into one wall"
+        );
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_FAILED), 24);
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_PARKED), 24);
+        let rows = parked_rows(&store.sql);
+        assert_eq!(rows.len(), 24);
+        assert!(
+            rows.iter().all(|r| r.3 == 1 && r.4.is_none()),
+            "each at attempt 1, live"
+        );
+    }
 }
