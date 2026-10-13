@@ -3294,6 +3294,8 @@ pub fn owed_shed_plan(identity_lc: &str) -> (&'static str, String) {
 /// bsv-low #499: recomputes shed by the per-identity ceiling (the snapshot served instead).
 static RECOMPUTE_SHED: AtomicU64 = AtomicU64::new(0);
 static RECOMPUTE_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static RECOMPUTE_ARM_FAILED: AtomicU64 = AtomicU64::new(0);
+pub fn note_recompute_arm_failed() { RECOMPUTE_ARM_FAILED.fetch_add(1, Ordering::Relaxed); }
 static RECOMPUTE_DEFERRED_FAULTED: AtomicU64 = AtomicU64::new(0);
 pub fn note_recompute_deferred_faulted() {
     RECOMPUTE_DEFERRED_FAULTED.fetch_add(1, Ordering::Relaxed);
@@ -3341,6 +3343,7 @@ pub fn owed_health_json() -> Value {
         "recomputeShed": shed,
         "owed_recompute_shed_total": shed,
         "owed_recompute_deferred_total": RECOMPUTE_DEFERRED.load(Ordering::Relaxed),
+        "owed_recompute_arm_failed_total": RECOMPUTE_ARM_FAILED.load(Ordering::Relaxed),
         "owed_recompute_deferred_faulted_total": RECOMPUTE_DEFERRED_FAULTED.load(Ordering::Relaxed),
         "recomputesPerIdentityPerMinute": OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW,
         "recomputeCeilingScope": "per identity per isolate: the fleet bound is this times the live isolates",
@@ -8912,6 +8915,19 @@ pub(crate) mod tests {
         assert_eq!(owed_fault_retry_due(61_000, 120_999), 121_000);
         assert_eq!(owed_fault_retry_due(61_000, 121_000), 181_000);
         assert!(owed_health_json()["owed_recompute_deferred_faulted_total"].is_u64());
+    }
+
+    #[test]
+    fn ns2_failed_arm_is_counted_and_next_read_repairs_a_snapshotless_shed() {
+        assert!(owed_health_json()["owed_recompute_arm_failed_total"].is_u64(), "SHED-L2: refused storage arm must be counted");
+        let mut rate = RecomputeRate::default();
+        for at in 1_000..1_012 { assert!(rate.admit(ME, at, true)); }
+        assert!(!rate.admit(ME, 20_000, true));
+        let due = rate.arm_deferred(ME, 20_000).unwrap();
+        rate.unarm_deferred(ME, due);
+        assert!(rate.admit(ME, due + 1, false), "next-window first read repairs the last failed arm");
+        assert_eq!(rate.in_window(ME, due + 1), 1);
+        assert!(include_str!("routes.rs").contains("note_recompute_arm_failed();"));
     }
 
 }

@@ -4660,6 +4660,7 @@ async fn owed_schedule_deferred(env: &worker::Env, identity_lc: &str, deadline: 
         Ok::<(), worker::Error>(())
     }.await;
     if let Err(e) = result {
+        crate::owed::note_recompute_arm_failed();
         OWED_RATE.with(|r| r.borrow_mut().unarm_deferred(identity_lc, end));
         console_warn!("[owed] deferred alarm could not be armed: {e}");
     }
