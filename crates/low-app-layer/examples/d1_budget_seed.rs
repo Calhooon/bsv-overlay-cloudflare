@@ -199,7 +199,11 @@ fn e649_hook_rows(now_s: u64) -> Vec<String> {
         ));
     }
     for j in 0..30u32 {
-        let exhausted = if j < 24 { "NULL".to_string() } else { ((now_s - 2 * 86_400) * 1000).to_string() };
+        let exhausted = if j < 24 {
+            "NULL".to_string()
+        } else {
+            ((now_s - 2 * 86_400) * 1000).to_string()
+        };
         rows.push(format!(
             "INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) \
              VALUES ('e64d{j:060x}:0', 'room', '', 1, 1, 0, 1000, {exhausted})"
