@@ -220,8 +220,9 @@ if (DELIVERING && STATE2 && MOCK_PORT) {
     mode = 'plain'
     const dc = await lever({ op: 'drain' }, TOKEN, DELIVERING)
     expect(dc.json?.unparked === 2 && rows2().length === 0, '(b) the next delivery takes the new intents', `${dc.text} rows=${JSON.stringify(rows2())}`)
-    // 7. D3-H1 (the third delta lens): the RELIABLY FIRED trigger drains. The scheduled event is not delivered on
-    //    this deployment; the external cron's authenticated `POST /admin/complete-proofs` is. A pot and a hop row
+    // 7. D3-H1 (the third delta lens), D4-L1 (the fourth): the ADDITIONAL trigger drains. The `*/15` scheduled
+    //    event is the observed one; the authenticated admin path `POST /admin/complete-proofs` drains too when
+    //    invoked. A pot and a hop row
     //    parked, then that route alone (no lever drain, no tick): both delivered through the mock and deleted, the
     //    pass answered in its body. On `1bf8e66` the route never reads `change_parked`: both rows stay.
     const potC = 'c3'.repeat(32) + ':2'

@@ -500,13 +500,12 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
                 return resp;
             }
             match path {
-                // #192/#193 — run the BEEF proof-completion passes on demand. The
-                // `*/15` cron that normally drives them is not firing on this worker
-                // (CF is not delivering the scheduled event — a queue+cron platform
-                // quirk; the handler/config/export are all correct), so this
-                // reliably-firing FETCH route is the durable trigger: an external
-                // cron (e.g. low-monitor) POSTs it every ~15 min. Same logic as the
-                // scheduled block; fail-closed.
+                // #192/#193: run the BEEF proof-completion passes on demand. The
+                // `*/15` scheduled event drives them (observed firing on beta, bsv-low
+                // #649 D4-L1: the R2 sweep at 19:16:06Z and 19:31:06Z on 2026-10-13);
+                // this authenticated admin FETCH route is an ADDITIONAL trigger that an
+                // external cron (e.g. low-monitor) or an operator may POST. Same logic
+                // as the scheduled block; fail-closed.
                 "/admin/complete-proofs" => admin_complete_proofs(&env).await,
                 // bsv-low#304 M-2: one-shot operator drain of the verified-
                 // latch backlog (chaintracks-only stored-bump re-verify —
@@ -1380,7 +1379,10 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     crate::beef_blob_sweep::run_ef_deferred_pass(&env, &ops_db).await;
     // bsv-low #649 M1: the pot and hop notes a background flush withheld (too little of its `waitUntil` window
     // left) are parked in D1; every tick delivers the oldest of them and deletes only what the app layer accepted.
-    // D3-H1: `/admin/complete-proofs` runs the same drain (the scheduled event is not delivered here).
+    // D3-H1, D4-L1: this `*/15` tick is the observed trigger, and `/admin/complete-proofs` (the authenticated admin
+    // path) runs the same drain when invoked. An eligible fresh parked note within the next 128 rows of its set
+    // reaches the app layer within one scheduled tick, about 16 minutes in the normal worst case, plus the app
+    // layer's own delivery. The authenticated admin maintenance call can also drain it when invoked.
     crate::change_park::drain_parked(&env, &ops_db, crate::change_park::DrainTrigger::Tick).await;
     // The order (bsv-low #585 land2): the sweep's pass (its own 30 s race),
     // the stale graphs, the EF jobs' hand-back and keep sweep (no race of its
@@ -1902,9 +1904,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
 }
 
 /// POST /admin/complete-proofs (#192/#193) — run the BEEF proof-completion passes
-/// ON DEMAND, the SAME logic the `*/15` cron would run, from a reliably-firing
-/// FETCH route (the scheduled event is not delivered to this worker — a queue+cron
-/// platform quirk). Self-contained (builds its own db/engine/storages from env) +
+/// ON DEMAND, the SAME logic the `*/15` cron runs (observed firing on beta, bsv-low
+/// #649 D4-L1), from an authenticated admin FETCH route, an ADDITIONAL trigger
+/// beside the scheduled one. Self-contained (builds its own db/engine/storages from env) +
 /// fail-closed: a BUMP is stitched only once chaintracks-verified; the `has_proof`
 /// latch + serve-time trim trust only verified proofs. An external cron POSTs this
 /// (bearer-authed via ADMIN_TOKEN, gated at the dispatch). Returns the counters.
@@ -2151,8 +2153,9 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         retire.conflict.faults,
     );
     // 4b'. bsv-low #649 D3-H1: the parked pot and hop notes (a background flush withheld them), delivered by the
-    //    SHARED drain the scheduled handler runs: this route is the trigger that fires on this deployment. One
-    //    bounded pass (128 rows a set, 10 s to start its POSTs), counted `change_park_drain_complete_proofs_total`.
+    //    SHARED drain the scheduled handler runs (D4-L1): the `*/15` tick is the observed trigger and this route
+    //    the additional authenticated admin path, which drains when invoked. One bounded pass (128 rows a set,
+    //    10 s to start its POSTs), counted `change_park_drain_complete_proofs_total`.
     let parked = crate::change_park::drain_parked(
         env,
         &ops_db,
