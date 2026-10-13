@@ -3373,7 +3373,7 @@ pub fn owed_health_json() -> Value {
 pub fn mark_shed_refresh(body: &mut Value, retry_after_ms: Option<i64>) {
     if let Some(ms) = retry_after_ms {
         body["refresh"] = json!("shed");
-        body["retryAfterMs"] = json!(ms);
+        body["retryAfterMs"] = json!(ms.max(1_000));
     }
 }
 
@@ -8928,6 +8928,15 @@ pub(crate) mod tests {
         assert!(rate.admit(ME, due + 1, false), "next-window first read repairs the last failed arm");
         assert_eq!(rate.in_window(ME, due + 1), 1);
         assert!(include_str!("routes.rs").contains("note_recompute_arm_failed();"));
+    }
+
+    #[test]
+    fn ns2_server_floors_retry_after_at_one_second() {
+        for delay in [0, 1, 999, 1_000, 41_000] {
+            let mut body = json!({"v": 1});
+            mark_shed_refresh(&mut body, Some(delay));
+            assert_eq!(body["retryAfterMs"], delay.max(1_000), "NOTE-2: retryAfterMs must be at least 1000");
+        }
     }
 
 }
