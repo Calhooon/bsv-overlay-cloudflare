@@ -174,6 +174,65 @@ pub async fn flush_inline(env: Env) {
     crate::tracker_events::ship(&env, tracker_events).await;
 }
 
+/// bsv-low #649: the wall `wait_until` holds a task for after the invocation ends (the runtime's own
+/// "did not complete within the allowed time after invocation end and have been cancelled", 30 s).
+pub const WAIT_UNTIL_WINDOW_MS: u64 = 30_000;
+
+/// bsv-low #649: under this much left of the window a background flush is SKIPPED (and counted): no POST is
+/// started that the runtime is about to cancel, and no drained note is lost with it.
+pub const FLUSH_WINDOW_FLOOR_MS: u64 = 3_000;
+
+/// What a background flush may spend (bsv-low #649).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundFlush {
+    /// Ship, starting no POST at or past `deadline_ms` (hops, pots and tracker events under this ONE deadline).
+    Ship { deadline_ms: u64 },
+    /// Less than [`FLUSH_WINDOW_FLOOR_MS`] left: nothing drained, nothing POSTed, counted.
+    Skip { remaining_ms: u64 },
+}
+
+/// PURE (bsv-low #649): the budget of a flush made by a `wait_until` job that started at `started_ms`, read at
+/// `now_ms`: `min(FLUSH_WALL_BUDGET_MS, what is left of the window)`, or a skip under the floor. The job's own
+/// start stands in for the invocation's end: the job is spawned before the answer, so the window it reads is
+/// never longer than the runtime's.
+pub fn background_flush_plan(started_ms: u64, now_ms: u64) -> BackgroundFlush {
+    let remaining_ms = WAIT_UNTIL_WINDOW_MS.saturating_sub(now_ms.saturating_sub(started_ms));
+    let budget = remaining_ms.min(crate::change_flush::FLUSH_WALL_BUDGET_MS);
+    if budget < FLUSH_WINDOW_FLOOR_MS {
+        BackgroundFlush::Skip { remaining_ms }
+    } else {
+        BackgroundFlush::Ship { deadline_ms: now_ms + budget }
+    }
+}
+
+/// [`flush_inline`] for a `wait_until` job that started at `started_ms` (bsv-low #649): ONE wall, bounded by what
+/// remains of the job's window ([`background_flush_plan`]), shared by the hop set, the pot set and the tracker
+/// events (whose own 20 s no longer stacks on top). Under the floor nothing is drained: the notes stay for the
+/// isolate's next flush, the skip is logged and counted (`admit_fast_flush_skipped_no_window_total`). A POST
+/// already in flight is not raced: the deadline only stops the flush from STARTING one it cannot afford.
+pub async fn flush_inline_within(env: Env, started_ms: u64) {
+    match background_flush_plan(started_ms, Date::now().as_millis()) {
+        BackgroundFlush::Skip { remaining_ms } => {
+            console_log!("[pot-changes] background flush SKIPPED: {remaining_ms} ms left of the wait_until window (floor {FLUSH_WINDOW_FLOOR_MS} ms); the notes stay for the next flush");
+            if let Ok(db) = env.d1("OVERLAY_DB") {
+                crate::ops::bump_counter(&db, crate::ops::COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW, 1).await;
+            }
+        }
+        BackgroundFlush::Ship { deadline_ms } => {
+            let tracker_events = crate::tracker_events::drain();
+            let changed = drain();
+            let hops = crate::hop_changes::drain();
+            if !hops.is_empty() {
+                crate::hop_changes::ship(env.clone(), hops, deadline_ms).await;
+            }
+            if !changed.is_empty() {
+                ship(env.clone(), changed, deadline_ms).await;
+            }
+            crate::tracker_events::ship_until(&env, tracker_events, deadline_ms).await;
+        }
+    }
+}
+
 /// Drain and ship under the given `wait_until` (a request, queue or cron
 /// context). One call per unit of work. NOT sufficient for notes queued by a
 /// task that runs after this call — see [`flush_inline`].
