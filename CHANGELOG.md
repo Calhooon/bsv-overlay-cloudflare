@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4] - 2026-10-13
+
+- Discover SHIP peers from the local index, the four configured SLAP trackers, and bounded SLAP-advertised `ls_ship` providers. An injected platform lookup client keeps HTTP out of the engine; the Worker bounds each lookup and response read to five seconds. Provider discovery is shared across topics in each tick, with four additional lookup hosts allowed; advertised sync peers are not capped.
+- Run `tm_uhrp` in SHIP mode while retaining its bootstrap peer in the discovered union, ahead of tracker imports that could consume the tick. Normalize and deduplicate origins across local, remote and bootstrap answers, exclude our own origin, and preserve independent answers when a tracker fails. Topic suffixes retain every configured target.
+- Reference: overlay-services@480d77a `src/Engine.ts:105-108,839-876`; ts-stack@edf6e03 `packages/sdk/src/overlay-tools/LookupResolver.ts:216-223,248,1976`. The reference defaults topics to SHIP and resolves `ls_ship` through SLAP advertisements before synchronizing with the returned domains.
+- Align both workspace versions and compatible internal dependency floors to 0.1.4 under RELEASING.md rule 4. Both bsv-rs lock resolutions remain 0.5.0; no SDK pin or stored-data migration changes.
+
 ## [0.1.3] - 2026-10-12
 
 - Index admitted UHRP adverts with the reference's ce00 prefix and bare Base58Check URL. Normalize optional UHRP query schemes in memory and D1. Five storage golden vectors prove admission and lookup parity.

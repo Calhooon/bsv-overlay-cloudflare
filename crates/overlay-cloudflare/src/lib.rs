@@ -15,11 +15,11 @@ pub mod broadcaster;
 pub mod chain_tracker;
 pub mod change_flush;
 pub mod d1;
-pub mod d1_ledger;
 pub mod d1_discovery;
+pub mod d1_ledger;
 pub mod d1_storage;
-pub mod derived_hops;
 pub mod dead_letters;
+pub mod derived_hops;
 pub mod ef;
 pub mod ef_deferred;
 pub mod error;
@@ -39,6 +39,7 @@ pub mod queue;
 pub mod relatch;
 pub mod reorg_sweep;
 pub mod routes;
+pub mod ship_lookup;
 pub mod submit_census;
 pub mod submit_gate;
 pub mod submit_refusals;
@@ -130,6 +131,57 @@ fn non_gasp_peers() -> Vec<peer_crawler::PeerConfig> {
         peer_url: "https://overlay-us-1.bsvb.tech".to_string(),
         service_to_topic: vec![("ls_uhrp".to_string(), "tm_uhrp".to_string())],
     }]
+}
+
+// Reference trackers: ts-stack@edf6e03
+// packages/sdk/src/overlay-tools/LookupResolver.ts:216-223.
+fn ship_slap_bootstrap() -> Vec<String> {
+    [
+        "https://overlay-us-1.bsvb.tech",
+        "https://overlay-eu-1.bsvb.tech",
+        "https://overlay-ap-1.bsvb.tech",
+        "https://users.bapp.dev",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn gasp_sync_configuration(trackers: &[String]) -> overlay_engine::types::SyncConfiguration {
+    use overlay_engine::types::SyncTarget;
+    let mut config = HashMap::new();
+    for topic in ["tm_ship", "tm_slap"] {
+        config.insert(topic.to_string(), SyncTarget::Peers(trackers.to_vec()));
+    }
+    for topic in ["tm_uhrp", "tm_agent", "tm_dm_delegation"] {
+        config.insert(topic.to_string(), SyncTarget::Ship);
+    }
+    // The LOW topics remain single-node indexes.
+    for topic in [
+        "tm_low",
+        "tm_reveal",
+        "tm_pot",
+        "tm_lowfund",
+        "tm_collected",
+        "tm_hand",
+        "tm_result",
+        "tm_proof",
+        "tm_potparty",
+        "tm_potrefund",
+    ] {
+        config.insert(topic.to_string(), SyncTarget::Disabled);
+    }
+    config
+}
+
+fn rekey_sync_configuration(
+    config: overlay_engine::types::SyncConfiguration,
+    suffix: &str,
+) -> overlay_engine::types::SyncConfiguration {
+    config
+        .into_iter()
+        .map(|(topic, target)| (crate::routes::suffixed_name(&topic, suffix), target))
+        .collect()
 }
 
 /// bsv-low #499: the routes the D1 rows ledger keys by name (`d1_ledger::route_of`; anything else is `other`). A
@@ -373,7 +425,9 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
             .await
         }
         // bsv-low #576: the operator's bounded re-drive of the parked dead letters (bearer INTERNAL_TOKEN).
-        (Method::Post, "/internal/redrive-dead-letters") => crate::dead_letters::internal_redrive(req, &env).await,
+        (Method::Post, "/internal/redrive-dead-letters") => {
+            crate::dead_letters::internal_redrive(req, &env).await
+        }
         (Method::Post, "/internal/discard-dead-letters") => {
             crate::dead_letters::internal_discard(req, &env).await
         }
@@ -822,105 +876,11 @@ fn build_engine_with_storage(
     // Config — hosting URL from env var, or default
     let hosting_url = env.var("HOSTING_URL").ok().map(|v| v.to_string());
 
-    // GASP sync_configuration. Two modes per topic:
-    //
-    // - `SyncTarget::Ship` — discover peers dynamically via SHIP lookup
-    //   at sync time. Works once we've ingested SHIP ads (our own or
-    //   peers') into our own `ls_ship`. Fresh deploys start with empty
-    //   `ls_ship` except for our own ads — so Ship-mode finds only us,
-    //   which isn't useful.
-    //
-    // - `SyncTarget::Peers(urls)` — bootstrap with a hardcoded peer list.
-    //   Required to break the discovery cold-start: without at least one
-    //   known peer, we never learn about anyone. For `tm_uhrp` we pin
-    //   `overlay-us-1.bsvb.tech`; once sync runs once it imports their
-    //   SHIP records, and from then on SHIP-mode could discover further
-    //   peers organically (left for a follow-up — the hardcode is
-    //   sufficient for bi-directional UHRP sync today).
-    let mut sync_configuration: overlay_engine::types::SyncConfiguration =
-        std::collections::HashMap::new();
-
-    // tm_ship + tm_slap bootstrap peers — must match what the mainline
-    // reference's default @bsv/sdk LookupResolver seeds with, so the parity
-    // harness's two sides pull from the same sources. Verified against the
-    // reference container's GASP sync log:
-    //   "Will attempt to sync with 4 peers" →
-    //     overlay-{us,eu,ap}-1.bsvb.tech, users.bapp.dev
-    // Once rust has pulled SHIP/SLAP records from these four, subsequent
-    // syncs could fall back to SyncTarget::Ship and discover more organically
-    // (left for a follow-up — the hardcode matches what mainline uses at cold
-    // start).
-    let ship_slap_bootstrap = vec![
-        "https://overlay-us-1.bsvb.tech".to_string(),
-        "https://overlay-eu-1.bsvb.tech".to_string(),
-        "https://overlay-ap-1.bsvb.tech".to_string(),
-        "https://users.bapp.dev".to_string(),
-    ];
-    sync_configuration.insert(
-        "tm_ship".to_string(),
-        overlay_engine::types::SyncTarget::Peers(ship_slap_bootstrap.clone()),
-    );
-    sync_configuration.insert(
-        "tm_slap".to_string(),
-        overlay_engine::types::SyncTarget::Peers(ship_slap_bootstrap.clone()),
-    );
-
-    sync_configuration.insert(
-        "tm_uhrp".to_string(),
-        overlay_engine::types::SyncTarget::Peers(
-            vec!["https://overlay-us-1.bsvb.tech".to_string()],
-        ),
-    );
-    // tm_agent + tm_dm_delegation are Calhooon-internal for now;
-    // SHIP-mode is the right default (we're the only known host).
-    for topic in ["tm_agent", "tm_dm_delegation"] {
-        sync_configuration.insert(topic.to_string(), overlay_engine::types::SyncTarget::Ship);
-    }
-
-    // tm_low (LOW poker lobby) starts as a single-node lobby: the
-    // low-overlay worker is the only host carrying the topic, tables are
-    // short-lived, and clients hit this instance directly — so GASP sync
-    // would only burn cron cycles discovering nobody. Explicitly Disabled
-    // (rather than Ship) until a second lobby node exists.
-    sync_configuration.insert(
-        "tm_low".to_string(),
-        overlay_engine::types::SyncTarget::Disabled,
-    );
-
-    // tm_reveal (LOW break-glass reveal index) is likewise single-node: the
-    // low-overlay worker is the only host carrying it and the watchtower
-    // queries this instance directly. Disabled until a second reveal node
-    // exists (mirrors tm_low).
-    sync_configuration.insert(
-        "tm_reveal".to_string(),
-        overlay_engine::types::SyncTarget::Disabled,
-    );
-
-    // tm_pot (LOW pot-spend landing-proof index) is single-node like tm_low /
-    // tm_reveal: this worker is the only host and the LOW client queries it
-    // directly. Disabled until a second pot-index node exists. tm_lowfund
-    // (the hop-side index into the same store) mirrors it, as does
-    // tm_collected (the cross-device "already collected" marker index,
-    // bsv-low #161), as do tm_result (the hand-result leaderboard
-    // marker index, bsv-low #38) and tm_proof (the rung-3
-    // transcript-proof bundle index), as does tm_potparty (the by-identity
-    // pot-participation recovery index, bsv-low #188) and tm_potrefund (the
-    // pre-signed refund-backup recovery index, bsv-low #191).
-    for topic in [
-        "tm_pot",
-        "tm_lowfund",
-        "tm_collected",
-        "tm_hand",
-        "tm_result",
-        "tm_proof",
-        "tm_potparty",
-        "tm_potrefund",
-    ] {
-        sync_configuration.insert(
-            topic.to_string(),
-            overlay_engine::types::SyncTarget::Disabled,
-        );
-    }
+    // SHIP discovery queries the trackers and their advertised ls_ship hosts,
+    // even when local ls_ship has no records. UHRP keeps a bootstrap peer in
+    // its union so tracker outages still leave a sync target.
+    let ship_slap_bootstrap = ship_slap_bootstrap();
+    let mut sync_configuration = gasp_sync_configuration(&ship_slap_bootstrap);
 
     // ── Deploy-time topic namespace (`TOPIC_SUFFIX`, bsv-low beta stack) ─────
     //
@@ -960,14 +920,12 @@ fn build_engine_with_storage(
         // inert: `engine.rs` defaults an unknown manager to `SyncTarget::Ship`.
         // Leaving these bare would silently turn every deliberately-Disabled
         // LOW topic into live peer discovery on the beta deploy.
-        sync_configuration = sync_configuration
-            .into_iter()
-            .map(|(k, v)| (rekey(k), v))
-            .collect();
+        sync_configuration = rekey_sync_configuration(sync_configuration, &topic_suffix);
     }
 
     let config = EngineConfig {
         hosting_url: hosting_url.clone(),
+        slap_trackers: ship_slap_bootstrap,
         sync_configuration,
         ..Default::default()
     };
@@ -1088,6 +1046,12 @@ fn build_engine_with_storage(
         config,
     );
 
+    engine.set_ship_lookup_client(Box::new(crate::ship_lookup::WorkerShipLookupClient));
+    engine.set_ship_bootstrap_peers(
+        crate::routes::suffixed_name("tm_uhrp", &topic_suffix),
+        vec!["https://overlay-us-1.bsvb.tech".to_string()],
+    );
+
     // Enable GASP sync with HTTP-based peer communication
     engine.set_gasp_remote_factory(Box::new(crate::gasp_remote::WorkerGASPRemoteFactory));
 
@@ -1204,6 +1168,12 @@ use overlay_engine::gasp::race_or_deadline;
 /// submits are dupe-checked, janitor evictions retry) and the tick moves
 /// on. Budgets sum to ≤ 9 min of network steps, leaving headroom for the
 /// bounded passes inside the 15-min cap.
+// Discovery uses SHIP_DISCOVERY_MAX_HOSTS_PER_TICK = 4 additional providers
+// plus the four ship_slap_bootstrap trackers, resolved once per invocation.
+// SHIP_DISCOVERY_LOOKUP_TIMEOUT_MS = 5_000 bounds each complete lookup.
+// With three SHIP topics, at most 4 SLAP + 3 * 8 SHIP calls cost 140 s.
+// GASP_SYNC_BUDGET_MS remains the outer 240 s deadline; discovery calls are
+// shorter than GASP_PEER_SYNC_BUDGET_MS = 30_000 so a failed host is isolated.
 pub(crate) const GASP_SYNC_BUDGET_MS: u64 = 240_000;
 const PEER_CRAWL_BUDGET_MS: u64 = 120_000;
 const JANITOR_BUDGET_MS: u64 = 180_000;
@@ -2603,6 +2573,51 @@ async fn queue_handler(
 mod tests {
     use super::*;
 
+    #[test]
+    fn gasp_sync_map_preserves_every_topic_and_target_after_rekey() {
+        use overlay_engine::types::SyncTarget;
+        let trackers = ship_slap_bootstrap();
+        let config = gasp_sync_configuration(&trackers);
+        let topics = [
+            "tm_ship",
+            "tm_slap",
+            "tm_uhrp",
+            "tm_agent",
+            "tm_dm_delegation",
+            "tm_low",
+            "tm_reveal",
+            "tm_pot",
+            "tm_lowfund",
+            "tm_collected",
+            "tm_hand",
+            "tm_result",
+            "tm_proof",
+            "tm_potparty",
+            "tm_potrefund",
+        ];
+        assert_eq!(config.len(), topics.len());
+        for suffix in ["", "_beta"] {
+            let rekeyed = rekey_sync_configuration(config.clone(), suffix);
+            assert_eq!(rekeyed.len(), topics.len());
+            for topic in topics {
+                let target = &rekeyed[&crate::routes::suffixed_name(topic, suffix)];
+                match topic {
+                    "tm_ship" | "tm_slap" => {
+                        assert!(matches!(target, SyncTarget::Peers(peers) if peers == &trackers))
+                    }
+                    "tm_uhrp" | "tm_agent" | "tm_dm_delegation" => {
+                        assert!(matches!(target, SyncTarget::Ship))
+                    }
+                    _ => assert!(matches!(target, SyncTarget::Disabled)),
+                }
+            }
+        }
+        assert_eq!(
+            trackers,
+            overlay_engine::types::NetworkPreset::Mainnet.slap_trackers()
+        );
+    }
+
     /// Pin the set of non-GASP peers we crawl on a cron. Adding a new
     /// peer is a *policy* change — it means we trust that peer's
     /// records enough to admit them through our own tm_X validators —
@@ -2656,13 +2671,25 @@ mod tests {
     /// auth refusal.
     #[test]
     fn every_dispatched_fetch_route_flushes_the_pot_changes_on_its_way_out() {
-        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let code_only = |s: &str| {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let src = include_str!("lib.rs");
-        let start = src.find("async fn main(req: Request, env: Env, ctx: Context)").expect("the fetch handler");
-        let end = start + src[start..].find("\npub async fn build_engine_from_env(").expect("the next item");
+        let start = src
+            .find("async fn main(req: Request, env: Env, ctx: Context)")
+            .expect("the fetch handler");
+        let end = start
+            + src[start..]
+                .find("\npub async fn build_engine_from_env(")
+                .expect("the next item");
         let handler = code_only(&src[start..end]);
-        let dispatch = handler.find("let result = match (req.method(), req.path().as_str()) {").expect("the dispatch");
+        let dispatch = handler
+            .find("let result = match (req.method(), req.path().as_str()) {")
+            .expect("the dispatch");
         let tail = squash(&handler[dispatch..]);
         assert!(
             tail.contains(&squash(

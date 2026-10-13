@@ -34,6 +34,7 @@ pub mod gasp_overlay;
 pub mod health_checker;
 pub mod lookup_service;
 mod script_door;
+pub mod ship_lookup;
 pub mod storage;
 pub mod stream_sizing;
 pub mod subject;
