@@ -34,6 +34,8 @@ import { assertBuildInfo } from '../assert-build-info.mjs'
 import { createHash, randomFillSync } from 'node:crypto'
 import { provedBeefV1, blockCoinbaseInput } from '../fixtures/proven_beef.mjs'
 import { readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 
 const APP = process.argv[2] ?? 'http://127.0.0.1:8800'
 const OVERLAY = process.argv[3] ?? 'http://127.0.0.1:8801'
@@ -217,6 +219,34 @@ const measured = {}
   if (r.status === 200 && body.truncated && body.judgement?.includes('could not judge') && row?.facts?.markerlessReadFault && row.facts.claim == null)
     pass('L23R2-L2 cached snapshot tells could-not-judge and withholds its press')
   else fail('L23R2-L2 cached snapshot tells could-not-judge and withholds its press', `${r.status} ${r.text}`)
+}
+
+// NOTE-3: twelve real failed writes leave no snapshot. The next read spends the reserved walk once.
+{
+  const identity = '02' + (299).toString(16).padStart(64, '0')
+  const crate = fileURLToPath(new URL('../../crates/low-app-layer/', import.meta.url))
+  const sql = (command) => execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', process.env.D1_BUDGET_STATE, '--command', command], { cwd: crate, timeout: 30_000, stdio: 'pipe' })
+  sql(`CREATE TRIGGER ns2_first_read_fault BEFORE INSERT ON owed_rows WHEN NEW.identity='${identity}' BEGIN SELECT RAISE(FAIL,'NS2 pinned write fault'); END;`)
+  try {
+    let faulted = 0
+    for (let n = 0; n < 12; n++) {
+      const r = await get(APP, `/owed?identity=${identity}`)
+      if (r.status === 503 && !JSON.parse(r.text).refresh) faulted++
+    }
+    if (faulted === 12) pass('NOTE-3 twelve ordinary first-read writes faulted with no snapshot')
+    else fail('NOTE-3 twelve first reads fault', `${faulted}/12 real write faults`)
+  } finally { sql('DROP TRIGGER ns2_first_read_fault;') }
+  const before = (await appHealth()).owed
+  const read = await get(APP, `/owed?identity=${identity}`)
+  const after = (await appHealth()).owed
+  if (read.status === 200 && JSON.parse(read.text).rows?.length === 1 && after.owed_recompute_deferred_total === before.owed_recompute_deferred_total + 1)
+    pass('NOTE-3 snapshotless read past the ceiling runs one reserved walk and answers 200')
+  else fail('NOTE-3 snapshotless first read walks instead of shedding 503', `${read.status} ${read.text} deferred ${before.owed_recompute_deferred_total}->${after.owed_recompute_deferred_total}`)
+  const second = await get(APP, `/owed?identity=${identity}`)
+  const served = (await appHealth()).owed
+  if (second.status === 200 && JSON.parse(second.text).rows?.length === 1 && served.owed_recompute_deferred_total === after.owed_recompute_deferred_total && served.recomputeBySource['read-first'] === after.recomputeBySource['read-first'])
+    pass('NOTE-3 a second read serves the snapshot without a second reserved walk')
+  else fail('NOTE-3 one reserved walk per window', JSON.stringify(served))
 }
 
 // ── 2. the overlay's admission writes ──────────────────────────────────────

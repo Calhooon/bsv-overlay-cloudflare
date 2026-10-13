@@ -4614,8 +4614,8 @@ thread_local! {
     static OWED_RATE: std::cell::RefCell<crate::owed::RecomputeRate> = std::cell::RefCell::new(crate::owed::RecomputeRate::default());
 }
 /// bsv-low #499: may this recompute run? Every walk asks here first: the hooks' and the claims' through
-/// `owed_recompute_and_push`, the read's inline arm, and the first read (no snapshot means a marked 503 on a
-/// shed). Every shed is counted; the caller schedules the reserved alarm and serves the snapshot it holds.
+/// `owed_recompute_and_push`, the read's inline arm, and the first read. An exhausted first read consumes the
+/// shared durable reservation; other sheds schedule its alarm and serve the snapshot they hold.
 pub(crate) fn owed_recompute_admit(identity_lc: &str, source: &str, sheddable: bool) -> bool {
     let now_ms = worker::Date::now().as_millis() as i64;
     let run = OWED_RATE.with(|r| r.borrow_mut().admit(identity_lc, now_ms, sheddable));
@@ -4856,7 +4856,7 @@ async fn owed_read_stored(
 }
 
 /// The read's compute: a fault is counted, logged and answered as a 503 (never "nothing owed").
-async fn owed_compute_on_read(
+pub(crate) async fn owed_compute_on_read(
     env: &worker::Env,
     db: &worker::D1Database,
     identity_lc: &str,
@@ -4895,6 +4895,33 @@ async fn owed_compute_on_read(
             ))
         }
     }
+}
+
+/// First reads and the alarm share the SAME durable claim, so neither can buy a fourteenth walk.
+async fn owed_first_read_reserved(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    identity: &str,
+) -> std::result::Result<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool), Result<Response>> {
+    let end = OWED_RATE.with(|r| r.borrow().window_end(identity)).unwrap_or(0);
+    if end <= worker::Date::now().as_millis() as i64 {
+        // The clock crossed the window during admission. This is now an ordinary next-window walk.
+        if owed_recompute_admit(identity, "read-first", false) {
+            return owed_compute_on_read(env, db, identity, "read-first", None).await;
+        }
+    }
+    let result = async {
+        let ns = env.durable_object("BOARD_VIEW")?;
+        let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity}:{end}"));
+        let stub = ns.id_from_name(&name)?.get_stub()?;
+        let mut response = stub.fetch_with_str(&format!("https://board-view/owed-deferred?identity={identity}&due={end}&read=1")).await?;
+        if response.status_code() != 200 { return Err(worker::Error::RustError(response.text().await?)); }
+        response.json::<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool)>().await
+    }.await;
+    result.map_err(|e| {
+        console_warn!("[owed] reserved first read failed: {e}");
+        json_error("the owed list could not be computed", 503)
+    })
 }
 
 /// `GET /owed?identity=` — the owed list, served from `owed_rows`; computed on the first read of an identity and
@@ -4971,24 +4998,17 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                     200,
                 );
             }
-            // #648: first-read faults must not buy unlimited walks. No snapshot means an honest 503 on a shed.
-            if !owed_recompute_admit(&identity, "read-first", false) {
-                let retry = Some(OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)).unwrap_or(0));
-                let deferred = owed_deferred_deadline(&identity);
-                if let Some(wait) = ctx.data.wait.clone() {
-                    let env = ctx.env.clone();
-                    let id = identity.clone();
-                    wait.wait_until(async move { owed_schedule_deferred(&env, &id, deferred).await; });
-                } else {
-                    owed_schedule_deferred(&ctx.env, &identity, deferred).await;
+            // No snapshot: spend the shared durable reservation once if ordinary admissions are exhausted.
+            if owed_recompute_admit(&identity, "read-first", false) {
+                match owed_compute_on_read(&ctx.env, &db, &identity, "read-first", None).await {
+                    Ok(v) => v,
+                    Err(resp) => return resp,
                 }
-                let mut body = serde_json::json!({"v": 1, "error": "owed refresh delayed; no snapshot available"});
-                crate::owed::mark_shed_refresh(&mut body, retry);
-                return json_response(body.to_string(), 503);
-            }
-            match owed_compute_on_read(&ctx.env, &db, &identity, "read-first", None).await {
-                Ok(v) => v,
-                Err(resp) => return resp,
+            } else {
+                match owed_first_read_reserved(&ctx.env, &db, &identity).await {
+                    Ok(v) => v,
+                    Err(resp) => return resp,
+                }
             }
         }
         Some(st) => {

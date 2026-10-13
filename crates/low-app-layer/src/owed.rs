@@ -622,7 +622,7 @@ pub const SPENT_ELSEWHERE_REASON: &str =
     "the hop was spent outside this game by a transaction that pays none of your homes (your wallet's own spend, or a sweep elsewhere): if it was yours, the money is already there; nothing here can move it";
 
 /// The families, in the order the page lists them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OwedFamily {
     Payout,
     RefundDue,
@@ -657,7 +657,7 @@ impl OwedFamily {
 }
 
 /// One owed row, pre-JSON and pre-D1.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OwedRow {
     pub identity: String,
     /// `txid:vout`, lowercase — the PK with the identity.
@@ -3226,7 +3226,7 @@ pub struct RecomputeRate {
 
 impl RecomputeRate {
     /// Count one admitted ordinary walk. The legacy sheddable flag no longer exempts repeated first-read faults:
-    /// with no snapshot the caller answers 503 and schedules the alarm, rather than bypassing the ceiling.
+    /// with no snapshot the caller consumes the shared durable reservation, rather than bypassing the ceiling.
     pub fn admit(&mut self, identity_lc: &str, now_ms: i64, _sheddable: bool) -> bool {
         if self.windows.len() >= OWED_RECOMPUTE_RATE_PRUNE_AT {
             self.windows.retain(|_, (start, _)| now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS);
@@ -3258,6 +3258,9 @@ impl RecomputeRate {
     /// Scheduling failed: allow the next shed to repair this window's missing alarm.
     pub fn unarm_deferred(&mut self, identity_lc: &str, end: i64) {
         if self.deferred.get(identity_lc) == Some(&end) { self.deferred.remove(identity_lc); }
+    }
+    pub fn window_end(&self, identity_lc: &str) -> Option<i64> {
+        self.windows.get(identity_lc).map(|(start, _)| start.saturating_add(OWED_RECOMPUTE_RATE_WINDOW_MS))
     }
     /// Remainder of an exhausted window; reads can inspect this without spending another admission.
     pub fn retry_after_ms(&self, identity_lc: &str, now_ms: i64) -> Option<i64> {
@@ -3305,7 +3308,7 @@ pub fn owed_fault_retry_due(due: i64, now: i64) -> i64 {
     let windows = now.saturating_sub(due).max(0) / OWED_RECOMPUTE_RATE_WINDOW_MS + 1;
     due.saturating_add(windows.saturating_mul(OWED_RECOMPUTE_RATE_WINDOW_MS))
 }
-/// A reserved alarm walk that actually begins (not an arm, nor an idempotent alarm delivery).
+/// A reserved walk that actually begins (alarm or first read; not an arm or an idempotent delivery).
 pub fn note_recompute_deferred() {
     RECOMPUTE_DEFERRED.fetch_add(1, Ordering::Relaxed);
 }
@@ -8769,7 +8772,7 @@ pub(crate) mod tests {
         let ask = push_body.find(&squash("if !owed_recompute_admit(identity_lc, source, true) { let deferred = owed_deferred_deadline(identity_lc); owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc, deferred).await; return; }")).expect("the ask");
         let walk = push_body.find(&squash("owed_recompute(env, db, identity_lc, source, tip_hint)")).expect("the walk");
         assert!(ask < walk, "owed_recompute_and_push must ask the ceiling before it walks");
-        assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, \"read-first\", false) {")));
+        assert!(routes.contains(&squash("if owed_recompute_admit(&identity, \"read-first\", false) {")));
         assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, source, true) { refresh_retry = Some(OWED_RATE.with(|r| r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64)).unwrap_or(0)); let deferred = owed_deferred_deadline(&identity); owed_shed_remark(&db, &identity).await; owed_schedule_deferred(&ctx.env, &identity, deferred).await; (rows, prev_tip, st.computed_at_ms as i64, cut) } else { match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)")));
         assert_eq!(routes.matches(&squash("owed_recompute(env, db, identity_lc,")).count(), 2, "the walk's two callers (the push and the read's compute)");
     }
@@ -8906,7 +8909,8 @@ pub(crate) mod tests {
     fn ns2_faulted_alarm_clears_storage_and_rearms_next_window() {
         let code = include_str!("board_view.rs");
         let alarm = &code[code.find("async fn alarm(&self)").unwrap()..code.find("impl BoardView {").unwrap()];
-        assert!(alarm.contains("storage.delete_all().await?"), "SHED-L1: fault must clear arm storage");
+        assert!(alarm.contains("owed_clear_consumed_arm().await?"), "SHED-L1: fault must clear arm storage");
+        assert!(code.contains("storage.delete_all().await?"));
         assert!(alarm.contains("note_recompute_deferred_faulted"), "SHED-L1: count the fault");
         assert!(alarm.contains("owed_rearm_faulted_deferred"), "SHED-L1: rearm once for next window");
         assert!(alarm.contains("owed_alarm_not_due().await?"), "SHED-L1: a duplicate old alarm cannot run the next reservation early");
@@ -8937,6 +8941,17 @@ pub(crate) mod tests {
             mark_shed_refresh(&mut body, Some(delay));
             assert_eq!(body["retryAfterMs"], delay.max(1_000), "NOTE-2: retryAfterMs must be at least 1000");
         }
+    }
+
+    #[test]
+    fn ns2_snapshotless_first_read_uses_the_single_reserved_walk() {
+        let read = include_str!("routes.rs");
+        assert!(read.contains("owed_first_read_reserved"), "NOTE-3: first read past ceiling must walk instead of shedding 503");
+        let actor = include_str!("board_view.rs");
+        assert!(actor.contains("owed_compute_on_read"), "the reserved read uses the same compute");
+        assert!(actor.contains("first_party_push"), "consuming the alarm reservation retains its own-identity push");
+        assert!(actor.contains("storage.put(\"owed-started\", true).await?"));
+        assert!(actor.contains("first read reservation already consumed"), "first-read faults cannot spend a second reserved walk");
     }
 
 }
