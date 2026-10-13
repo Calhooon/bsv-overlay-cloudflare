@@ -48,10 +48,25 @@ fn subjects(value: &Value, ids: &mut BTreeSet<String>) {
 }
 pub fn decorate(value: &mut Value, subject: Option<&str>, views: &BTreeMap<String, Value>) {
     fn tx(value: &mut Value, id: &str, views: &BTreeMap<String, Value>) {
-        let f = views
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| super::served::fields(&State::new(id)));
+        let f = views.get(id).cloned().unwrap_or_else(|| {
+            let mut state = State::new(id);
+            if let Some(source) = value["hintSource"].as_str() {
+                let observed =
+                    (value["observedAtMs"].as_f64().unwrap_or(0.0).max(0.0) / 1000.0) as u64;
+                let empty = HeaderSnapshot {
+                    tip: Ok(0),
+                    headers: Default::default(),
+                };
+                state
+                    .step(
+                        &Params { age_threshold: 60 },
+                        &empty,
+                        Input::Hint(Hint::new(source, HintStatus::Unknown, observed)),
+                    )
+                    .expect("non-promoting courier hint");
+            }
+            super::served::fields(&state)
+        });
         if let Some(obj) = value.as_object_mut() {
             obj.insert("tracker".into(), f);
         }

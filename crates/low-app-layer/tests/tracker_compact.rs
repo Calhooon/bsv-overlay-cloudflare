@@ -510,3 +510,14 @@ fn ns3_m3_hooks_never_buy_courier_ladders() {
     }
     assert!(runtime::hook_may_reask("tick", true));
 }
+#[test]
+fn ns3_m1_missing_row_keeps_courier_source_without_seen_or_write() {
+    let mut body = json!({"tier":"hint","hintSource":"woc","observedAtMs":123000.0,"present":null,"confirmed":false});
+    runtime::decorate(&mut body, Some(&"01".repeat(32)), &BTreeMap::new());
+    assert_ne!(body["tracker"]["word"], "seen");
+    assert_eq!(
+        body["tracker"]["source"], "woc",
+        "missing-row read lost courier source"
+    );
+    assert_eq!(body["tracker"]["at"], 123);
+}
