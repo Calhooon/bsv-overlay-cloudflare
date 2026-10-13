@@ -1850,8 +1850,8 @@ impl ConflictPassPort for WorkerConflictPass<'_> {
     async fn persist(&self, deltas: &ConflictPassSummary) {
         bump_conflict_counters(self.db, deltas).await;
     }
-    /// The pass's notes are delivered by the scheduled tick's own flush at its end (`lib.rs`, after the passes:
-    /// `pot_changes::flush` under the tick's `wait_until`); this pass holds no `Env` to POST with.
+    /// The pass's notes are delivered by its caller's own flush at its end (`lib.rs`: the scheduled tick's last
+    /// `pot_changes::flush`, and the dispatch's one exit for `/admin/complete-proofs`); this pass holds no `Env`.
     async fn flush(&self) {}
 }
 
