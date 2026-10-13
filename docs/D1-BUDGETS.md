@@ -67,7 +67,11 @@ that starts writing reds); statements measured + 2 (a loop that reads per row ov
 | submit-admit-1 | `/submit`, an operator `historical-tx-no-spv` submit admitting one tm_collected output | 0 / 13 / 7 | 4 / 15 / 9 |
 
 | record-potparty-filing | `/record?kind=potparty`, signed stranger naming A's live pot | 11 / 7 / 6 | 17 / 9 / 8 |
-| pot-changed-hook-1 | `/internal/pot-changed`, B's pot (no decoded params, two marker-named seats) | 7 / 0 / 6 | 11 / 2 / 8 |
+| pot-changed-hook-1 | `/internal/pot-changed`, B's pot (no decoded params, two marker-named seats) | 7 / 3 / 7 | 11 / 5 / 9 |
+| pot-changed-hook-decoded-8 | `/internal/pot-changed`, A's 8 decoded pots, one latched seat each | 74 / 48 / 25 | 111 / 50 / 27 |
+| pot-changed-hook-marker | `/internal/pot-changed`, the undecoded pot whose markers name 5 identities | 23 / 8 / 10 | 35 / 10 / 12 |
+| pot-changed-hook-8x19 | `/internal/pot-changed`, 7 decoded pots (2 seats each) + the marker pot, 19 identities with owed-state rows | 122 / 71 / 39 | 183 / 73 / 41 |
+| pot-announce-drain | `/internal/pot-announce-drain`, one pass over 24 due and 6 exhausted parked wake-ups | 73 / 33 / 28 | 110 / 35 / 30 |
 
 E649 L4 (2026-10-13, lane E649-HOOK): the pot hook's own answer is held to a ceiling (it had none: leg 4 checked
 only that it carried a `d1` segment). Measured with `D1_BUDGET_MEASURE=1 make ci-d1-budget` on the fixture D1:
@@ -78,6 +82,16 @@ as two batches (the decoded row and three marker arms; the two stale marks), pin
 `pot_hook::tests::e649_hook_b_*`. Writes take measured + 2 (the hook is a write: a seat with an `owed_state` row
 is written by its stale mark). Not in the fixture: a decoded, attributed pot (the path that gathered `/results`
 per seat on the base and now reads one seat-marker batch).
+
+E649 L4 fold (2026-10-13, the review's M1): the hook's maximum bodies and the park's drain are held too, each with a
+per-statement ceiling (`maxReads`, measured: hook-1 6, decoded-8 66, marker 12, 8x19 92, drain 24; ceilings 11,
+99, 18, 138, 36), on the fleet-shaped fixture (`e649_hook_rows` in the seed). Since H1 every hook scenario WRITES
+its parked wake-ups in its one write batch (a park row is 3 rows written: the table, its key and the due index), so
+hook-1 measures 3 writes where it measured 0. Since H2 the marker arms are read only for an outpoint that needs them,
+one batch per arm: decoded-8 reads no arm; 8x19 reads the three arms over its one marker outpoint. The largest
+statement of decoded-8 and 8x19 is the seat-marker read over the decoded pots (66 and 92 rows). Not measured here:
+a body of eight marker-only outpoints (the review's 32 + 19 statement shape; with H2 it is 8 + 3 x 8 reads and one
+write batch) and a marker skewed by 1,000 planted identities (the review's probe; data-sensitive on the base too).
 
 NS2 fold (2026-10-12): the real signed filing is measured under `/record`, including the pot stale mark and the
 filer mark. SHED-M1 removes the three indexed party enumeration reads entirely; named parties do no work until

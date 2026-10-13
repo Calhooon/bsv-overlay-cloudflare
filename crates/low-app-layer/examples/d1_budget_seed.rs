@@ -134,6 +134,7 @@ fn main() {
         };
         rows.push(format!("INSERT INTO tx_words (txid,word,tier,height,proof_root,proof_height,proof_hex,header_hash,hint_source,hint_at,updated_at,legacy_body) VALUES ('{id}','{word}','{tier}',{height},{root},{height},{hex},{hash},'woc',123,123,'{legacy}')"));
     }
+    rows.extend(e649_hook_rows(now_s));
     for (i, r) in rows.iter().enumerate() {
         if r.starts_with("UPDATE ") || i >= l23_start {
             conn.execute_batch(r).unwrap();
@@ -148,6 +149,63 @@ fn main() {
         cursor_measure::write(&conn, &path, now_s, d1_fleet::WHALE);
     }
     print!("{out}");
+}
+
+// E649 L4 M1: the pot hook's maximum body on the fleet (the review's H2 shape): seven decoded pots with two latched
+// seats each and one undecoded pot whose party and refund-backup markers name five identities, every one of the 19
+// holding an owed-state row; and the drain's park: 24 wake-ups due (the tier's deploy has no BROADCAST_TOKEN, so
+// each is settled as not configured) and 6 exhausted two days ago (swept).
+fn e649_hook_rows(now_s: u64) -> Vec<String> {
+    let mut rows = Vec::new();
+    let seat = |side: u32, i: u32| format!("0{side}e649{i:060x}");
+    for i in 0..7u32 {
+        let txid = format!("e649{i:060x}");
+        let (a, b) = (seat(2, i), seat(3, i));
+        rows.push(format!(
+            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind, paramsDecoded, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, stakeA, stakeB, feeSats, recoveryHeight, potSats) \
+             VALUES ('{txid}', 0, 0, {now_s}, 'covenant', 1, '{a}', '{b}', '{ID_A}', '{}', '{}', '{}', 1, 1, 1, 958846, 2)",
+            "11".repeat(20),
+            "22".repeat(20),
+            "33".repeat(20)
+        ));
+        for (k, (me, them)) in [(&a, &b), (&b, &a)].into_iter().enumerate() {
+            rows.push(format!(
+                "INSERT INTO potparty_records (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, sigHex, txid, outputIndex, createdAt, seatSettlePubkey, seatSigHex, sigValid) \
+                 VALUES ('{me}', '{them}', 'e649g{i}', '{txid}', 0, 958846, '3045ab', 'e64a{k}{i:059x}', 0, {now_s}, '{me}', '00', 1)"
+            ));
+        }
+    }
+    let marker_pot = format!("e649{:060x}", 0xff);
+    rows.push(format!(
+        "INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES ('{marker_pot}', 0, 0, {now_s})"
+    ));
+    let mut ids: Vec<String> = (0..7).flat_map(|i| [seat(2, i), seat(3, i)]).collect();
+    for k in 0..5u32 {
+        let me = format!("02e64f{k:060x}");
+        rows.push(format!(
+            "INSERT INTO potparty_records (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, sigHex, txid, outputIndex, createdAt) \
+             VALUES ('{me}', 'x', 'e649gm', '{marker_pot}', 0, 958846, '3045ab', 'e64b{k:060x}', 0, {now_s})"
+        ));
+        rows.push(format!(
+            "INSERT INTO potrefund_records (potTxid, potVout, gameId, identity, refundRawHex, sigHex, txid, outputIndex, createdAt) \
+             VALUES ('{marker_pot}', 0, 'e649gm', '{me}', '00', '3045ab', 'e64c{k:060x}', 0, {now_s})"
+        ));
+        ids.push(me);
+    }
+    for id in &ids {
+        rows.push(format!(
+            "INSERT INTO owed_state (identity, computedAtMs, tip, rows, stale, truncated) VALUES ('{id}', {}, 958800, 0, 0, 0)",
+            now_s * 1000
+        ));
+    }
+    for j in 0..30u32 {
+        let exhausted = if j < 24 { "NULL".to_string() } else { ((now_s - 2 * 86_400) * 1000).to_string() };
+        rows.push(format!(
+            "INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) \
+             VALUES ('e64d{j:060x}:0', 'room', '', 1, 1, 0, 1000, {exhausted})"
+        ));
+    }
+    rows
 }
 
 // L23R2 route-selection pin: captured pair-13 rows alongside #499's synthetic budget seats.

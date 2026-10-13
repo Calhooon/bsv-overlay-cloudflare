@@ -28,6 +28,8 @@
  *     hook answer carries its `d1` segment, the hooks are keyed `/internal` and every walk after the answer
  *     `owed-recompute` on `d1Budget` (the lens fold's M2 and M3). E649 L4: the first ask's own figures are held to
  *     `pot-changed-hook-1` (one attribution batch, one seat-marker batch, no walk) and it answers `hook;dur=`.
+ *  5. E649 L4 M1: the hook's maximum bodies (eight decoded outpoints; the marker fallback; the 8-outpoint /
+ *     19-identity body with existing owed-state rows) and one pass of the park's drain, each held to its ceiling.
  *
  * Exit 0 = every expectation held.
  */
@@ -418,6 +420,50 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
 
 }
 
+// ── 5. E649 L4 M1: the pot hook's maximum bodies and its park's drain, each against a named ceiling ──────────
+// (the fixture's `e649_hook_rows`). The hook PARKS every wake-up in its write batch before the answer (H1), so each
+// hook scenario's writes include its parks; the tier's deploy has no BROADCAST_TOKEN, so the detached announce
+// settles each as not configured and the drain deletes the seeded due rows.
+{
+  const hook = async (outpoints) => get(APP, '/internal/pot-changed', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${INTERNAL_TOKEN}` },
+    body: JSON.stringify({ outpoints }),
+  })
+  const e649 = (i) => 'e649' + i.toString(16).padStart(60, '0')
+  const bodies = [
+    // A's eight decoded pots, one latched seat each: the decoded maximum body (eight outpoints)
+    ['pot-changed-hook-decoded-8', Array.from({ length: 8 }, (_, i) => ({ txid: potTxid('a', i), vout: 0 })), 8],
+    // the marker fallback alone: the undecoded pot whose party and refund-backup markers name five identities
+    ['pot-changed-hook-marker', [{ txid: e649(0xff), vout: 0 }], 0],
+    // the review's H2 body: seven decoded pots with two latched seats each, the marker pot naming five; 19 identities,
+    // each with an existing owed-state row
+    ['pot-changed-hook-8x19', [...Array.from({ length: 7 }, (_, i) => ({ txid: e649(i), vout: 0 })), { txid: e649(0xff), vout: 0 }], 14],
+  ]
+  for (const [name, outpoints, seats] of bodies) {
+    const r = await hook(outpoints)
+    if (r.status !== 200) {
+      fail(`${name} answers`, `${r.status}: ${r.text.slice(0, 200)}`)
+      continue
+    }
+    const body = JSON.parse(r.text)
+    if (body.filed.length === seats && body.parked === outpoints.length + seats) pass(`${name}: ${seats} seat(s) filed, ${body.parked} wake-up(s) parked before the answer`)
+    else fail(`${name}: files its seats and parks every wake-up`, r.text.slice(0, 300))
+    check(name, segment(r.timing, 'd1'))
+  }
+  const d = await get(APP, '/internal/pot-announce-drain', { method: 'POST', headers: { Authorization: `Bearer ${INTERNAL_TOKEN}` } })
+  if (d.status !== 200) fail('pot-announce-drain answers', `${d.status}: ${d.text.slice(0, 200)}`)
+  else {
+    const t = JSON.parse(d.text)
+    if (t.due === 24 && t.skipped === 24 && t.swept === 6 && t.faults === 0) pass(`pot-announce-drain: 24 due settled (not configured here), 6 exhausted swept`)
+    else fail('pot-announce-drain reads its bound and sweeps', d.text)
+    check('pot-announce-drain', segment(d.timing, 'd1'))
+  }
+  const unauth = await get(APP, '/internal/pot-announce-drain', { method: 'POST' })
+  if (unauth.status === 401) pass('pot-announce-drain refuses without the bearer')
+  else fail('pot-announce-drain refuses without the bearer', `${unauth.status}`)
+}
+
 // NS-3: the real Worker reads compact rows with zero courier calls and
 // keeps the legacy confirmation beside the tracker hint-tier disagreement.
 {
@@ -447,10 +493,10 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
 }
 
 console.log('\n── bsv-low #499 D1 budget tier ──')
-console.log('scenario                 reads (ceiling)   writes (ceiling)  stmts (ceiling)')
+console.log('scenario                 reads (ceiling)   writes (ceiling)  stmts (ceiling)  maxReads (ceiling)')
 for (const { name, got, ceiling } of table) {
-  const col = (k) => `${String(got[k]).padStart(5)} (${ceiling ? String(ceiling[k]).padStart(5) : '    -'})`
-  console.log(`${name.padEnd(24)} ${col('reads')}     ${col('writes')}      ${col('stmts')}`)
+  const col = (k) => `${String(got[k]).padStart(5)} (${ceiling ? String(ceiling[k] ?? (k === 'maxReads' ? ceiling.reads : '-')).padStart(5) : '    -'})`
+  console.log(`${name.padEnd(24)} ${col('reads')}     ${col('writes')}      ${col('stmts')}     ${col('maxReads')}`)
 }
 console.log('')
 for (const l of lines) console.log(l)
