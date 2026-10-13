@@ -38,20 +38,76 @@ pub const CHANGE_PARKED_CREATE: &str = "CREATE TABLE IF NOT EXISTS change_parked
 /// "duplicate column").
 pub const CHANGE_PARKED_ADD_GENERATION: &str =
     "ALTER TABLE change_parked ADD COLUMN generation INTEGER NOT NULL DEFAULT 0";
-/// A park: one row per (set, entry); a re-park keeps the first stamp (its place in the oldest-first drain) and
-/// BUMPS the generation (N1): a change parked while an earlier delivery of the same entry is in flight is a new
-/// intent, which that delivery's delete does not take.
+/// bsv-low #649 N2 (the delta lens): a row's RETRY state. `attempts` counts the refused POSTs of its current
+/// generation, `next_attempt_at_ms` is when the drain may select it again (a park sets it to the park's stamp, so
+/// the drain stays oldest first; a row parked before N2 reads 0, due at once and first), `exhausted` takes it out of the drain after [`CHANGE_PARK_MAX_ATTEMPTS`]
+/// refusals (its `next_attempt_at_ms` then the exhaustion's stamp, which the sweep ages it from). Appended
+/// migrations (#638).
+pub const CHANGE_PARKED_ADD_ATTEMPTS: &str =
+    "ALTER TABLE change_parked ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0";
+pub const CHANGE_PARKED_ADD_NEXT_ATTEMPT: &str =
+    "ALTER TABLE change_parked ADD COLUMN next_attempt_at_ms INTEGER NOT NULL DEFAULT 0";
+pub const CHANGE_PARKED_ADD_EXHAUSTED: &str =
+    "ALTER TABLE change_parked ADD COLUMN exhausted INTEGER NOT NULL DEFAULT 0";
+/// A park: one row per (set, entry); a re-park keeps the first stamp and BUMPS the generation (N1): a change
+/// parked while an earlier delivery of the same entry is in flight is a new intent, which that delivery's delete
+/// does not take. A re-park is a new intent for the retry state too (N2): its attempts start again and it is
+/// eligible at once (an exhausted row comes back). A NEW key is parked only while the table holds fewer than
+/// `?4` rows ([`CHANGE_PARKED_MAX_ROWS`], read by a LIMITed scan: at most `?4` rows), so the newest are refused
+/// when it is full (no row returned: the caller keeps that entry in memory and counts it).
 pub const PARK_SQL: &str =
-    "INSERT INTO change_parked (kind, item, parked_at_ms) VALUES (?1, ?2, ?3) \
-     ON CONFLICT(kind, item) DO UPDATE SET generation = change_parked.generation + 1";
-/// The oldest parked entries of one set, each with the generation the delivery read.
-pub const PARKED_READ_SQL: &str = "SELECT item, generation FROM change_parked WHERE kind = ?1 \
-     ORDER BY parked_at_ms, item LIMIT ?2";
+    "INSERT INTO change_parked (kind, item, parked_at_ms, next_attempt_at_ms) \
+     SELECT ?1, ?2, ?3, ?3 \
+     WHERE EXISTS (SELECT 1 FROM change_parked WHERE kind = ?1 AND item = ?2) \
+        OR (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked LIMIT ?4)) < ?4 \
+     ON CONFLICT(kind, item) DO UPDATE SET generation = change_parked.generation + 1, \
+        attempts = 0, exhausted = 0, \
+        next_attempt_at_ms = MIN(change_parked.next_attempt_at_ms, excluded.next_attempt_at_ms) \
+     RETURNING item";
+/// The ELIGIBLE rows of one set (not exhausted, due by `?2`), the most overdue first, each with the generation
+/// and the attempts the delivery read (N2: a refused row backs off, so it never holds the head of the drain).
+pub const PARKED_READ_SQL: &str = "SELECT item, generation, attempts FROM change_parked \
+     WHERE kind = ?1 AND exhausted = 0 AND next_attempt_at_ms <= ?2 \
+     ORDER BY next_attempt_at_ms, item LIMIT ?3";
 /// One delivered entry, deleted ONLY at the generation its delivery read (N1).
 pub const UNPARK_SQL: &str =
     "DELETE FROM change_parked WHERE kind = ?1 AND item = ?2 AND generation = ?3";
+/// One refused entry (N2): its attempt counted, its next eligibility (`?4`) and its exhaustion (`?5`) set, ONLY
+/// at the generation the delivery read (a re-park since is a new intent with its own attempts).
+pub const REFUSE_SQL: &str = "UPDATE change_parked \
+     SET attempts = attempts + 1, next_attempt_at_ms = ?4, exhausted = ?5 \
+     WHERE kind = ?1 AND item = ?2 AND generation = ?3";
+/// The sweep of one set (N2): exhausted rows older than `?2`, at most `?3` a tick.
+pub const SWEEP_EXHAUSTED_SQL: &str = "DELETE FROM change_parked WHERE rowid IN (\
+     SELECT rowid FROM change_parked WHERE kind = ?1 AND exhausted = 1 AND next_attempt_at_ms <= ?2 \
+     ORDER BY next_attempt_at_ms LIMIT ?3) RETURNING item";
 /// The gauge, by set.
 pub const PARKED_COUNT_SQL: &str = "SELECT kind, COUNT(*) AS n FROM change_parked GROUP BY kind";
+
+/// N2: the refusals a row's generation gets before it leaves the drain.
+pub const CHANGE_PARK_MAX_ATTEMPTS: i64 = 8;
+/// N2: the first back-off after a refusal (a tick at `*/15`), doubled per attempt.
+pub const CHANGE_PARK_BACKOFF_BASE_MS: u64 = 15 * 60 * 1000;
+/// N2: the longest back-off.
+pub const CHANGE_PARK_BACKOFF_MAX_MS: u64 = 24 * 60 * 60 * 1000;
+/// N2: how long an exhausted row is kept (for the gauge and an operator's read) before the sweep deletes it.
+pub const CHANGE_PARK_EXHAUSTED_KEEP_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// N2: the most rows the table holds, both sets and exhausted rows together. Full, a NEW entry is not parked
+/// (kept in the isolate's set, counted `change_park_full_total`); a re-park of a held key always lands.
+pub const CHANGE_PARKED_MAX_ROWS: i64 = 2048;
+
+/// PURE (N2): a refusal of a row read with `attempts` at `now_ms`: `(next_attempt_at_ms, exhausted)`.
+pub fn refusal_backoff(attempts: i64, now_ms: u64) -> (u64, bool) {
+    let after = attempts.saturating_add(1);
+    if after >= CHANGE_PARK_MAX_ATTEMPTS {
+        return (now_ms, true);
+    }
+    let shift = attempts.clamp(0, 20) as u32;
+    let wait = CHANGE_PARK_BACKOFF_BASE_MS
+        .saturating_mul(1u64 << shift)
+        .min(CHANGE_PARK_BACKOFF_MAX_MS);
+    (now_ms + wait, false)
+}
 
 /// The pot set's rows (`txid:vout`).
 pub const KIND_POT: &str = "pot";
@@ -68,6 +124,14 @@ pub const COUNTER_ADMIT_FAST_FLUSH_WITHHELD: &str = "admit_fast_flush_withheld_t
 pub const COUNTER_CHANGE_PARKED: &str = "change_parked_total";
 pub const COUNTER_CHANGE_PARK_FAULTS: &str = "change_park_faults_total";
 pub const COUNTER_CHANGE_UNPARKED: &str = "change_unparked_total";
+/// N2: entries not parked because the table was full (kept in the isolate's sets).
+pub const COUNTER_CHANGE_PARK_FULL: &str = "change_park_full_total";
+/// N2: parked entries whose POST was refused (each refusal of each entry), backed off.
+pub const COUNTER_CHANGE_PARK_REFUSED: &str = "change_park_refused_total";
+/// N2: parked entries taken out of the drain after their last refusal.
+pub const COUNTER_CHANGE_PARK_EXHAUSTED: &str = "change_park_exhausted_total";
+/// N2: exhausted rows the sweep deleted.
+pub const COUNTER_CHANGE_PARK_SWEPT: &str = "change_park_swept_total";
 
 /// A pot entry's row key.
 pub fn pot_item(txid: &str, vout: u32) -> String {
@@ -85,12 +149,13 @@ pub fn parse_pot_item(item: &str) -> Option<(String, u32)> {
 
 /// The skip's world (bsv-low #649 M1): a port so the pins run the shipped [`park_withheld`] over a recorded fake.
 pub(crate) trait ParkPort {
-    /// Park `rows` (`(set, entry)`, both sets) in ONE batch: one statement each, one D1 round trip.
+    /// Park `rows` (`(set, entry)`, both sets) in ONE batch: one statement each, one D1 round trip. Answers, per
+    /// row, whether it is parked (`false`: refused, the table full).
     async fn park(
         &self,
         rows: &[(&'static str, String)],
         now_ms: u64,
-    ) -> std::result::Result<(), String>;
+    ) -> std::result::Result<Vec<bool>, String>;
     async fn bump(&self, counter: &'static str, delta: u64);
     fn log(&self, line: String);
 }
@@ -109,13 +174,30 @@ pub(crate) async fn park_withheld<P: ParkPort>(port: &P, remaining_ms: u64, now_
         .collect();
     rows.extend(hops.iter().map(|h| (KIND_HOP, h.clone())));
     let withheld = rows.len() as u64;
-    let (mut parked, mut faulted) = (0u64, 0u64);
+    let (mut parked, mut faulted, mut full) = (0u64, 0u64, 0u64);
     if withheld > 0 {
         match port.park(&rows, now_ms).await {
-            Ok(()) => {
-                crate::pot_changes::forget(&pots);
-                crate::hop_changes::forget(&hops);
-                parked = withheld;
+            Ok(landed) => {
+                let landed_at = |i: usize| landed.get(i).copied().unwrap_or(false);
+                let parked_pots: Vec<(String, u32)> = pots
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| landed_at(*i))
+                    .map(|(_, p)| p.clone())
+                    .collect();
+                let parked_hops: Vec<String> = hops
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| landed_at(pots.len() + *i))
+                    .map(|(_, h)| h.clone())
+                    .collect();
+                crate::pot_changes::forget(&parked_pots);
+                crate::hop_changes::forget(&parked_hops);
+                parked = (parked_pots.len() + parked_hops.len()) as u64;
+                full = withheld - parked;
+                if full > 0 {
+                    port.log(format!("[pot-changes] {full} entr(ies) NOT parked: the parked table is full ({CHANGE_PARKED_MAX_ROWS} rows); kept in the isolate's sets"));
+                }
             }
             Err(e) => {
                 faulted = withheld;
@@ -136,9 +218,13 @@ pub(crate) async fn park_withheld<P: ParkPort>(port: &P, remaining_ms: u64, now_
     if faulted > 0 {
         port.bump(COUNTER_CHANGE_PARK_FAULTS, faulted).await;
     }
+    if full > 0 {
+        port.bump(COUNTER_CHANGE_PARK_FULL, full).await;
+    }
     port.log(format!(
-        "[pot-changes] background flush SKIPPED: {remaining_ms} ms left of the wait_until window (floor {} ms); {withheld} entr(ies) withheld, {parked} parked in D1 for the cron, {faulted} kept in memory",
-        crate::pot_changes::FLUSH_WINDOW_FLOOR_MS
+        "[pot-changes] background flush SKIPPED: {remaining_ms} ms left of the wait_until window (floor {} ms); {withheld} entr(ies) withheld, {parked} parked in D1 for the cron, {} kept in memory",
+        crate::pot_changes::FLUSH_WINDOW_FLOOR_MS,
+        faulted + full
     ));
 }
 
@@ -152,20 +238,32 @@ impl ParkPort for WorkerPark<'_> {
         &self,
         rows: &[(&'static str, String)],
         now_ms: u64,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<Vec<bool>, String> {
         let mut stmts = Vec::with_capacity(rows.len());
         for (kind, item) in rows {
             let stmt = self
                 .db
                 .prepare(PARK_SQL)
-                .bind(&[(*kind).into(), item.as_str().into(), (now_ms as f64).into()])
+                .bind(&[
+                    (*kind).into(),
+                    item.as_str().into(),
+                    (now_ms as f64).into(),
+                    (CHANGE_PARKED_MAX_ROWS as f64).into(),
+                ])
                 .map_err(|e| e.to_string())?;
             stmts.push(stmt);
         }
-        crate::d1_ledger::counted_batch(self.db, stmts)
+        let results = crate::d1_ledger::counted_batch(self.db, stmts)
             .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(results
+            .iter()
+            .map(|r| {
+                r.results::<serde_json::Value>()
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+            })
+            .collect())
     }
     async fn bump(&self, counter: &'static str, delta: u64) {
         crate::ops::bump_counter(self.db, counter, delta).await;
@@ -175,15 +273,24 @@ impl ParkPort for WorkerPark<'_> {
     }
 }
 
+/// One parked row as the drain read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedRow {
+    pub item: String,
+    pub generation: i64,
+    pub attempts: i64,
+}
+
 /// The cron's delivery of the parked set (bsv-low #649 M1): a port so the pins run the shipped
-/// [`deliver_parked`] over a fake transport.
+/// [`deliver_parked`] over a fake transport, or over the SHIPPED statements under SQLite.
 pub(crate) trait UnparkPort {
-    /// The oldest rows of one set: `(entry, generation)`.
+    /// The eligible rows of one set at `now_ms` ([`PARKED_READ_SQL`]).
     async fn read(
         &self,
         kind: &'static str,
+        now_ms: u64,
         limit: usize,
-    ) -> std::result::Result<Vec<(String, i64)>, String>;
+    ) -> std::result::Result<Vec<ParkedRow>, String>;
     async fn post(&self, kind: &'static str, body: String) -> std::result::Result<usize, ()>;
     /// Delete the delivered rows, each only at the generation it was read at.
     async fn unpark(
@@ -191,6 +298,19 @@ pub(crate) trait UnparkPort {
         kind: &'static str,
         rows: &[(String, i64)],
     ) -> std::result::Result<(), String>;
+    /// Back the refused rows off ([`REFUSE_SQL`]): `(entry, generation, next_attempt_at_ms, exhausted)`.
+    async fn refuse(
+        &self,
+        kind: &'static str,
+        rows: &[(String, i64, u64, bool)],
+    ) -> std::result::Result<(), String>;
+    /// Delete at most `limit` exhausted rows of one set older than `before_ms` ([`SWEEP_EXHAUSTED_SQL`]).
+    async fn sweep(
+        &self,
+        kind: &'static str,
+        before_ms: u64,
+        limit: usize,
+    ) -> std::result::Result<u64, String>;
     fn now_ms(&self) -> u64;
     async fn bump(&self, counter: &'static str, delta: u64);
     fn log(&self, line: String);
@@ -201,16 +321,39 @@ pub(crate) trait UnparkPort {
 pub struct Delivered {
     pub read: u64,
     pub unparked: u64,
+    /// Read and still parked (refused, deferred past the wall, or a delete that faulted).
     pub kept: u64,
+    /// N2: refused this pass (backed off), of which `exhausted` left the drain.
+    pub refused: u64,
+    pub exhausted: u64,
+    /// N2: exhausted rows deleted by the sweep.
+    pub swept: u64,
 }
 
-/// THE DELIVERY of the parked set (bsv-low #649 M1): each set's oldest rows through the one flush loop
-/// (`change_flush::ship_chunks`, the set's own body), the rows of ACCEPTED POSTs deleted, the rest kept parked.
+/// THE DELIVERY of the parked set (bsv-low #649 M1; N2): per set, the exhausted rows past
+/// [`CHANGE_PARK_EXHAUSTED_KEEP_MS`] are swept, then the ELIGIBLE rows (due, not exhausted, most overdue first)
+/// go through the one flush loop (`change_flush::ship_chunks`, the set's own body); the rows of ACCEPTED POSTs
+/// are deleted at the generation read, the rows of REFUSED POSTs (and a pot row that does not read) are backed
+/// off ([`refusal_backoff`]) and leave the drain at their last attempt, the rows past the wall are untouched.
 pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
     let mut out = Delivered::default();
-    let deadline_ms = port.now_ms() + DRAIN_WALL_MS;
+    let now_ms = port.now_ms();
+    let deadline_ms = now_ms + DRAIN_WALL_MS;
     for kind in [KIND_HOP, KIND_POT] {
-        let read = match port.read(kind, DRAIN_MAX_ROWS).await {
+        match port
+            .sweep(
+                kind,
+                now_ms.saturating_sub(CHANGE_PARK_EXHAUSTED_KEEP_MS),
+                DRAIN_MAX_ROWS,
+            )
+            .await
+        {
+            Ok(n) => out.swept += n,
+            Err(e) => port.log(format!(
+                "[change-park] sweep of the exhausted {kind} rows faulted ({e}); next tick"
+            )),
+        }
+        let read = match port.read(kind, now_ms, DRAIN_MAX_ROWS).await {
             Ok(read) => read,
             Err(e) => {
                 port.log(format!(
@@ -222,74 +365,146 @@ pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
         if read.is_empty() {
             continue;
         }
-        let items: Vec<String> = read.iter().map(|(i, _)| i.clone()).collect();
-        let generation: std::collections::BTreeMap<&str, i64> =
-            read.iter().map(|(i, g)| (i.as_str(), *g)).collect();
-        out.read += items.len() as u64;
-        let delivered: Vec<String> = if kind == KIND_POT {
+        let by_item: std::collections::BTreeMap<&str, &ParkedRow> =
+            read.iter().map(|r| (r.item.as_str(), r)).collect();
+        out.read += read.len() as u64;
+        let items: Vec<String> = read.iter().map(|r| r.item.clone()).collect();
+        let (delivered, mut refused): (Vec<String>, Vec<String>) = if kind == KIND_POT {
             let pots: Vec<(String, u32)> = items.iter().filter_map(|i| parse_pot_item(i)).collect();
-            if pots.len() != items.len() {
+            let unreadable: Vec<String> = items
+                .iter()
+                .filter(|i| parse_pot_item(i).is_none())
+                .cloned()
+                .collect();
+            if !unreadable.is_empty() {
                 port.log(format!(
-                    "[change-park] {} parked pot row(s) do not read; left parked",
-                    items.len() - pots.len()
+                    "[change-park] {} parked pot row(s) do not read; refused",
+                    unreadable.len()
                 ));
             }
-            let shipped = crate::change_flush::ship_chunks(
-                pots,
+            let (fresh, retry): (Vec<(String, u32)>, Vec<(String, u32)>) =
+                pots.into_iter().partition(|(t, v)| {
+                    by_item
+                        .get(pot_item(t, *v).as_str())
+                        .is_some_and(|r| r.attempts == 0)
+                });
+            let (delivered, failed) = ship_isolating(
+                fresh,
+                retry,
                 crate::pot_changes::body_json,
                 |body| port.post(kind, body),
                 || port.now_ms(),
                 deadline_ms,
             )
             .await;
-            shipped
-                .delivered
-                .iter()
-                .map(|(t, v)| pot_item(t, *v))
-                .collect()
+            let mut refused: Vec<String> = failed.iter().map(|(t, v)| pot_item(t, *v)).collect();
+            refused.extend(unreadable);
+            (
+                delivered.iter().map(|(t, v)| pot_item(t, *v)).collect(),
+                refused,
+            )
         } else {
-            let shipped = crate::change_flush::ship_chunks(
-                items.clone(),
+            let (fresh, retry): (Vec<String>, Vec<String>) = items
+                .iter()
+                .cloned()
+                .partition(|i| by_item.get(i.as_str()).is_some_and(|r| r.attempts == 0));
+            ship_isolating(
+                fresh,
+                retry,
                 crate::hop_changes::body_json,
                 |body| port.post(kind, body),
                 || port.now_ms(),
                 deadline_ms,
             )
-            .await;
-            shipped.delivered
+            .await
         };
-        if delivered.is_empty() {
-            out.kept += items.len() as u64;
-            continue;
-        }
-        let delivered: Vec<(String, i64)> = delivered
-            .into_iter()
-            .map(|i| {
-                let g = generation.get(i.as_str()).copied().unwrap_or_default();
-                (i, g)
-            })
-            .collect();
-        match port.unpark(kind, &delivered).await {
-            Ok(()) => {
-                out.unparked += delivered.len() as u64;
-                out.kept += (items.len() - delivered.len()) as u64;
-            }
-            Err(e) => {
-                port.log(format!("[change-park] delete of {} delivered {kind} row(s) faulted ({e}); they are sent again", delivered.len()));
-                out.kept += items.len() as u64;
+        refused.retain(|i| by_item.contains_key(i.as_str()));
+        let mut kept = read.len() as u64;
+        if !delivered.is_empty() {
+            let rows: Vec<(String, i64)> = delivered
+                .iter()
+                .filter_map(|i| by_item.get(i.as_str()).map(|r| (i.clone(), r.generation)))
+                .collect();
+            match port.unpark(kind, &rows).await {
+                Ok(()) => {
+                    out.unparked += rows.len() as u64;
+                    kept -= rows.len() as u64;
+                }
+                Err(e) => port.log(format!("[change-park] delete of {} delivered {kind} row(s) faulted ({e}); they are sent again", rows.len())),
             }
         }
+        if !refused.is_empty() {
+            let now = port.now_ms();
+            let rows: Vec<(String, i64, u64, bool)> = refused
+                .iter()
+                .map(|i| {
+                    let r = by_item[i.as_str()];
+                    let (next, exhausted) = refusal_backoff(r.attempts, now);
+                    (i.clone(), r.generation, next, exhausted)
+                })
+                .collect();
+            match port.refuse(kind, &rows).await {
+                Ok(()) => {
+                    out.refused += rows.len() as u64;
+                    out.exhausted += rows.iter().filter(|r| r.3).count() as u64;
+                }
+                Err(e) => port.log(format!("[change-park] back-off of {} refused {kind} row(s) faulted ({e}); they are tried again next tick", rows.len())),
+            }
+        }
+        out.kept += kept;
     }
-    if out.unparked > 0 {
-        port.bump(COUNTER_CHANGE_UNPARKED, out.unparked).await;
+    for (counter, n) in [
+        (COUNTER_CHANGE_UNPARKED, out.unparked),
+        (COUNTER_CHANGE_PARK_REFUSED, out.refused),
+        (COUNTER_CHANGE_PARK_EXHAUSTED, out.exhausted),
+        (COUNTER_CHANGE_PARK_SWEPT, out.swept),
+    ] {
+        if n > 0 {
+            port.bump(counter, n).await;
+        }
     }
-    if out.read > 0 {
+    if out.read > 0 || out.swept > 0 {
         port.log(format!(
-            "[change-park] delivered {} parked entr(ies), {} kept parked for the next tick",
-            out.unparked, out.kept
+            "[change-park] delivered {} parked entr(ies), {} kept parked ({} refused and backed off, {} exhausted), {} exhausted swept",
+            out.unparked, out.kept, out.refused, out.exhausted, out.swept
         ));
     }
     out
+}
+
+/// N2: the fresh rows (never refused) through the one flush loop in chunks; then each row a POST already
+/// REFUSED, ALONE (one POST each, inside the same chunk count and wall), so a refused row cannot take the rows
+/// chunked with it down with it: a chunk is refused whole. Rows past the bound are neither (untouched).
+/// Answers `(delivered, refused)`.
+async fn ship_isolating<T, B, P, Fut, C>(
+    fresh: Vec<T>,
+    retry: Vec<T>,
+    body: B,
+    mut post: P,
+    now_ms: C,
+    deadline_ms: u64,
+) -> (Vec<T>, Vec<T>)
+where
+    T: Clone,
+    B: Fn(&[T]) -> String,
+    P: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<usize, ()>>,
+    C: Fn() -> u64,
+{
+    let shipped =
+        crate::change_flush::ship_chunks(fresh, &body, &mut post, &now_ms, deadline_ms).await;
+    let (mut delivered, mut failed, mut posts) = (shipped.delivered, shipped.failed, shipped.posts);
+    for row in retry {
+        if posts >= crate::change_flush::CHANGE_MAX_CHUNKS || now_ms() >= deadline_ms {
+            break;
+        }
+        posts += 1;
+        match post(body(std::slice::from_ref(&row))).await {
+            Ok(_) => delivered.push(row),
+            Err(()) => failed.push(row),
+        }
+    }
+    (delivered, failed)
 }
 
 /// The worker's [`UnparkPort`]: D1 and the app layer's `/internal/{pot,hop}-changed`.
@@ -304,30 +519,38 @@ impl UnparkPort for WorkerUnpark<'_> {
     async fn read(
         &self,
         kind: &'static str,
+        now_ms: u64,
         limit: usize,
-    ) -> std::result::Result<Vec<(String, i64)>, String> {
+    ) -> std::result::Result<Vec<ParkedRow>, String> {
         #[derive(serde::Deserialize)]
         struct Row {
             item: String,
             generation: f64,
+            attempts: f64,
         }
         let rows = crate::d1::Query::new(PARKED_READ_SQL)
             .bind(kind)
+            .bind(now_ms as f64)
             .bind(limit as i64)
             .fetch_all::<Row>(self.db)
             .await?;
         Ok(rows
             .into_iter()
-            .map(|r| (r.item, r.generation as i64))
+            .map(|r| ParkedRow {
+                item: r.item,
+                generation: r.generation as i64,
+                attempts: r.attempts as i64,
+            })
             .collect())
     }
     async fn post(&self, kind: &'static str, body: String) -> std::result::Result<usize, ()> {
-        let (path, tag) = if kind == KIND_POT {
-            ("/internal/pot-changed", "change-park")
+        let path = if kind == KIND_POT {
+            "/internal/pot-changed"
         } else {
-            ("/internal/hop-changed", "change-park")
+            "/internal/hop-changed"
         };
-        crate::change_flush::post_body(self.env, &self.url, &self.token, path, tag, body).await
+        crate::change_flush::post_body(self.env, &self.url, &self.token, path, "change-park", body)
+            .await
     }
     async fn unpark(
         &self,
@@ -351,6 +574,45 @@ impl UnparkPort for WorkerUnpark<'_> {
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+    async fn refuse(
+        &self,
+        kind: &'static str,
+        rows: &[(String, i64, u64, bool)],
+    ) -> std::result::Result<(), String> {
+        let mut stmts = Vec::with_capacity(rows.len());
+        for (item, generation, next, exhausted) in rows {
+            stmts.push(
+                self.db
+                    .prepare(REFUSE_SQL)
+                    .bind(&[
+                        kind.into(),
+                        item.as_str().into(),
+                        (*generation as f64).into(),
+                        (*next as f64).into(),
+                        (if *exhausted { 1.0 } else { 0.0 }).into(),
+                    ])
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        crate::d1_ledger::counted_batch(self.db, stmts)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    async fn sweep(
+        &self,
+        kind: &'static str,
+        before_ms: u64,
+        limit: usize,
+    ) -> std::result::Result<u64, String> {
+        crate::d1::Query::new(SWEEP_EXHAUSTED_SQL)
+            .bind(kind)
+            .bind(before_ms as f64)
+            .bind(limit as i64)
+            .fetch_all::<serde_json::Value>(self.db)
+            .await
+            .map(|rows| rows.len() as u64)
     }
     fn now_ms(&self) -> u64 {
         Date::now().as_millis()
@@ -432,14 +694,14 @@ mod tests {
             &self,
             rows: &[(&'static str, String)],
             _now_ms: u64,
-        ) -> std::result::Result<(), String> {
+        ) -> std::result::Result<Vec<bool>, String> {
             if self.fail {
                 return Err("D1 down".into());
             }
             for (k, i) in rows {
                 self.rows.borrow_mut().push((k.to_string(), i.clone()));
             }
-            Ok(())
+            Ok(vec![true; rows.len()])
         }
         async fn bump(&self, counter: &'static str, delta: u64) {
             self.counters.borrow_mut().push((counter, delta));
@@ -511,14 +773,14 @@ mod tests {
             &self,
             rows: &[(&'static str, String)],
             _now_ms: u64,
-        ) -> std::result::Result<(), String> {
+        ) -> std::result::Result<Vec<bool>, String> {
             if self.hang == "park" {
                 std::future::pending::<()>().await;
             }
             for (k, i) in rows {
                 self.rows.borrow_mut().push((k.to_string(), i.clone()));
             }
-            Ok(())
+            Ok(vec![true; rows.len()])
         }
         async fn bump(&self, _counter: &'static str, _delta: u64) {
             let n = *self.bumps.borrow();
@@ -588,12 +850,17 @@ mod tests {
         let park = body
             .find("port.park(&rows,now_ms).await")
             .expect("the park");
-        let ok = body
-            .find("Ok(())=>{crate::pot_changes::forget(&pots);crate::hop_changes::forget(&hops);")
+        let ok = body.find("Ok(landed)=>{").expect("the park's Ok arm");
+        let forget = body
+            .find("crate::pot_changes::forget(&parked_pots);crate::hop_changes::forget(&parked_hops);")
             .expect("forgotten only once parked");
+        assert!(
+            ok < forget && body.matches("forget(").count() == 2,
+            "the sets are cleared only in the park's Ok arm, of what it landed"
+        );
         let first_bump = body.find("port.bump(").unwrap();
         assert!(
-            park < ok && park < first_bump,
+            park < ok && forget < first_bump,
             "the park is the first await; the counters after it"
         );
     }
@@ -611,15 +878,20 @@ mod tests {
         async fn read(
             &self,
             kind: &'static str,
+            _now_ms: u64,
             limit: usize,
-        ) -> std::result::Result<Vec<(String, i64)>, String> {
+        ) -> std::result::Result<Vec<ParkedRow>, String> {
             Ok(self
                 .rows
                 .borrow()
                 .iter()
                 .filter(|(k, _)| k == kind)
                 .take(limit)
-                .map(|(_, i)| (i.clone(), 0))
+                .map(|(_, i)| ParkedRow {
+                    item: i.clone(),
+                    generation: 0,
+                    attempts: 0,
+                })
                 .collect())
         }
         async fn post(&self, kind: &'static str, body: String) -> std::result::Result<usize, ()> {
@@ -643,12 +915,28 @@ mod tests {
                 .retain(|(k, i)| !(k == kind && rows.iter().any(|(r, _)| r == i)));
             Ok(())
         }
+        async fn refuse(
+            &self,
+            _kind: &'static str,
+            _rows: &[(String, i64, u64, bool)],
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        async fn sweep(
+            &self,
+            _kind: &'static str,
+            _before_ms: u64,
+            _limit: usize,
+        ) -> std::result::Result<u64, String> {
+            Ok(0)
+        }
         fn now_ms(&self) -> u64 {
             0
         }
         async fn bump(&self, counter: &'static str, delta: u64) {
-            assert_eq!(counter, COUNTER_CHANGE_UNPARKED);
-            *self.unparked.borrow_mut() += delta;
+            if counter == COUNTER_CHANGE_UNPARKED {
+                *self.unparked.borrow_mut() += delta;
+            }
         }
         fn log(&self, _line: String) {}
     }
@@ -674,7 +962,9 @@ mod tests {
             Delivered {
                 read: 11,
                 unparked: 9,
-                kept: 2
+                kept: 2,
+                refused: 2,
+                ..Default::default()
             },
             "the hop and the first pot chunk of 8 delivered"
         );
@@ -703,7 +993,7 @@ mod tests {
             Delivered {
                 read: 2,
                 unparked: 2,
-                kept: 0
+                ..Default::default()
             }
         );
         assert!(
@@ -713,24 +1003,286 @@ mod tests {
         assert_eq!(*port.unparked.borrow() + *again.unparked.borrow(), 11);
     }
 
+    const MAX: i64 = CHANGE_PARKED_MAX_ROWS;
+
+    /// The shipped park (it RETURNS the row it parked): `true` when parked.
+    fn park_sql<P: rusqlite::Params>(
+        conn: &rusqlite::Connection,
+        params: P,
+    ) -> rusqlite::Result<bool> {
+        let mut q = conn.prepare(PARK_SQL)?;
+        let n = q.query_map(params, |r| r.get::<_, String>(0))?.count();
+        Ok(n == 1)
+    }
+
+    /// The table as the migrations build it: every `change_parked` statement of the SHIPPED list, in its order.
+    fn parked_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mine: Vec<&str> = crate::d1::OVERLAY_MIGRATIONS
+            .iter()
+            .copied()
+            .filter(|m| m.contains("change_parked"))
+            .collect();
+        assert!(mine.contains(&CHANGE_PARKED_CREATE) && mine.len() >= 5);
+        for m in mine {
+            conn.execute_batch(m).unwrap();
+        }
+        conn
+    }
+
+    /// The cron's world over the SHIPPED statements under SQLite; the app layer refuses every POST naming an entry
+    /// in `refuse`; `clock` is the tick's time.
+    struct SqlitePort {
+        conn: rusqlite::Connection,
+        refuse: std::collections::BTreeSet<String>,
+        clock: std::cell::Cell<u64>,
+        posted: RefCell<Vec<String>>,
+        refused_posts: RefCell<usize>,
+    }
+
+    impl UnparkPort for SqlitePort {
+        async fn read(
+            &self,
+            kind: &'static str,
+            now_ms: u64,
+            limit: usize,
+        ) -> std::result::Result<Vec<ParkedRow>, String> {
+            let mut q = self.conn.prepare(PARKED_READ_SQL).unwrap();
+            Ok(
+                q.query_map(rusqlite::params![kind, now_ms as i64, limit as i64], |r| {
+                    Ok(ParkedRow {
+                        item: r.get(0)?,
+                        generation: r.get(1)?,
+                        attempts: r.get(2)?,
+                    })
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect(),
+            )
+        }
+        async fn post(&self, _kind: &'static str, body: String) -> std::result::Result<usize, ()> {
+            self.posted.borrow_mut().push(body.clone());
+            if self.refuse.iter().any(|t| body.contains(t.as_str())) {
+                *self.refused_posts.borrow_mut() += 1;
+                return Err(());
+            }
+            Ok(0)
+        }
+        async fn unpark(
+            &self,
+            kind: &'static str,
+            rows: &[(String, i64)],
+        ) -> std::result::Result<(), String> {
+            for (i, g) in rows {
+                self.conn
+                    .execute(UNPARK_SQL, rusqlite::params![kind, i, g])
+                    .unwrap();
+            }
+            Ok(())
+        }
+        async fn refuse(
+            &self,
+            kind: &'static str,
+            rows: &[(String, i64, u64, bool)],
+        ) -> std::result::Result<(), String> {
+            for (i, g, next, ex) in rows {
+                self.conn
+                    .execute(
+                        REFUSE_SQL,
+                        rusqlite::params![kind, i, g, *next as i64, *ex as i64],
+                    )
+                    .unwrap();
+            }
+            Ok(())
+        }
+        async fn sweep(
+            &self,
+            kind: &'static str,
+            before_ms: u64,
+            limit: usize,
+        ) -> std::result::Result<u64, String> {
+            let mut q = self.conn.prepare(SWEEP_EXHAUSTED_SQL).unwrap();
+            let n = q
+                .query_map(
+                    rusqlite::params![kind, before_ms as i64, limit as i64],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap()
+                .count();
+            Ok(n as u64)
+        }
+        fn now_ms(&self) -> u64 {
+            self.clock.get()
+        }
+        async fn bump(&self, _counter: &'static str, _delta: u64) {}
+        fn log(&self, _line: String) {}
+    }
+
+    fn rows_of(conn: &rusqlite::Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    const TICK_MS: u64 = 15 * 60 * 1000;
+
+    /// bsv-low #649 N2 (the delta lens's refused prefix, the SHIPPED statements and the shipped delivery): 129 pot
+    /// rows, the first 128 refused for good, the 129th acceptable. The 129th must be delivered within a bounded
+    /// number of ticks, and the refused rows must leave the drain and the table. On `1516ed5` three passes made 48
+    /// refused POSTs, kept all 129 rows and never POSTed the 129th.
+    #[test]
+    fn e649_n2_a_refused_prefix_never_starves_a_later_row_and_is_swept() {
+        let conn = parked_db();
+        let txid = |i: u32| format!("{:064x}", i + 1);
+        for i in 0..129u32 {
+            park_sql(
+                &conn,
+                rusqlite::params![KIND_POT, pot_item(&txid(i), 0), 1_000 + i as i64, MAX],
+            )
+            .unwrap();
+        }
+        let port = SqlitePort {
+            conn,
+            refuse: (0..128u32).map(txid).collect(),
+            clock: std::cell::Cell::new(10_000),
+            posted: Default::default(),
+            refused_posts: RefCell::new(0),
+        };
+        let last = txid(128);
+        let mut delivered_at = None;
+        for tick in 0..3u64 {
+            port.clock.set(10_000 + tick * TICK_MS);
+            run(deliver_parked(&port));
+            if delivered_at.is_none() && port.posted.borrow().iter().any(|b| b.contains(&last)) {
+                delivered_at = Some(tick);
+            }
+        }
+        assert!(
+            delivered_at.is_some(),
+            "the 129th row was never POSTed in 3 ticks: {} refused POSTs, {} rows kept",
+            port.refused_posts.borrow(),
+            rows_of(&port.conn, "SELECT COUNT(*) FROM change_parked")
+        );
+        assert_eq!(
+            rows_of(
+                &port.conn,
+                "SELECT COUNT(*) FROM change_parked WHERE exhausted = 0"
+            ),
+            128,
+            "the 129th delivered and deleted; the refused rows backed off"
+        );
+        // the refused rows exhaust at their 8th refusal and the sweep takes them a week later
+        for tick in 3..400u64 {
+            port.clock.set(10_000 + tick * TICK_MS);
+            run(deliver_parked(&port));
+        }
+        assert_eq!(
+            rows_of(
+                &port.conn,
+                "SELECT COUNT(*) FROM change_parked WHERE exhausted = 0"
+            ),
+            0,
+            "every refused row left the drain"
+        );
+        let posts = *port.refused_posts.borrow();
+        assert_eq!(
+            posts,
+            16 + 128 * (CHANGE_PARK_MAX_ATTEMPTS as usize - 1),
+            "each refused row was POSTed exactly its bounded attempts (once in its chunk, then alone)"
+        );
+        port.clock
+            .set(10_000 + 400 * TICK_MS + CHANGE_PARK_EXHAUSTED_KEEP_MS);
+        run(deliver_parked(&port));
+        assert_eq!(
+            rows_of(&port.conn, "SELECT COUNT(*) FROM change_parked"),
+            0,
+            "a week after its exhaustion each refused row is swept"
+        );
+    }
+
+    /// bsv-low #649 N2: the TOTAL bound. A full table refuses the NEWEST key (no row returned, kept in memory by
+    /// the skip, counted `change_park_full_total`), while a re-park of a held key still lands, bumps its generation
+    /// and resets its retry state.
+    #[test]
+    fn e649_n2_a_full_table_refuses_the_newest_and_a_held_key_still_re_parks() {
+        let conn = parked_db();
+        let park = |item: &str, at: i64, max: i64| -> bool {
+            let mut q = conn.prepare(PARK_SQL).unwrap();
+            q.query_map(rusqlite::params![KIND_POT, item, at, max], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap()
+            .count()
+                == 1
+        };
+        assert!(park("a:0", 10, 2) && park("b:0", 20, 2));
+        assert!(!park("c:0", 30, 2), "full: the newest is refused");
+        conn.execute(REFUSE_SQL, rusqlite::params![KIND_POT, "a:0", 0, 99_999, 1])
+            .unwrap();
+        assert!(park("a:0", 40, 2), "a held key re-parks when full");
+        let (g, a, ex, next): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT generation, attempts, exhausted, next_attempt_at_ms FROM change_parked WHERE item = 'a:0'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (g, a, ex, next),
+            (1, 0, 0, 40),
+            "a new intent: eligible now"
+        );
+        // the skip keeps what was refused in memory and counts it
+        let _ = crate::pot_changes::drain();
+        let _ = crate::hop_changes::drain();
+        let t = "cd".repeat(32);
+        crate::pot_changes::note(&t, 0);
+        crate::pot_changes::note(&t, 1);
+        struct Half(RefCell<Vec<(&'static str, u64)>>);
+        impl ParkPort for Half {
+            async fn park(
+                &self,
+                rows: &[(&'static str, String)],
+                _now_ms: u64,
+            ) -> std::result::Result<Vec<bool>, String> {
+                Ok((0..rows.len()).map(|i| i == 0).collect())
+            }
+            async fn bump(&self, c: &'static str, d: u64) {
+                self.0.borrow_mut().push((c, d));
+            }
+            fn log(&self, _line: String) {}
+        }
+        let port = Half(Default::default());
+        run(park_withheld(&port, 2_000, 1_000));
+        assert_eq!(
+            crate::pot_changes::drain(),
+            vec![(t.clone(), 1)],
+            "the refused one stays in memory"
+        );
+        assert!(port.0.borrow().contains(&(COUNTER_CHANGE_PARK_FULL, 1)));
+        assert!(port.0.borrow().contains(&(COUNTER_CHANGE_PARKED, 1)));
+        // backoff is bounded and doubles
+        assert_eq!(refusal_backoff(0, 0), (CHANGE_PARK_BACKOFF_BASE_MS, false));
+        assert_eq!(
+            refusal_backoff(1, 0),
+            (2 * CHANGE_PARK_BACKOFF_BASE_MS, false)
+        );
+        assert_eq!(refusal_backoff(CHANGE_PARK_MAX_ATTEMPTS - 1, 7), (7, true));
+        assert!(refusal_backoff(6, 0).0 <= CHANGE_PARK_BACKOFF_MAX_MS);
+    }
+
     /// bsv-low #649 M1: the SHIPPED statements under real SQLite: a re-park is one row with its first stamp, the read
     /// is oldest first and bounded, the delete takes the one row; the table is in the migrations; the entry keys
     /// read back.
     #[test]
     fn e649_m1_the_shipped_statements_under_sqlite() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        assert!(crate::d1::OVERLAY_MIGRATIONS.contains(&CHANGE_PARKED_CREATE));
-        conn.execute_batch(CHANGE_PARKED_CREATE).unwrap();
-        conn.execute_batch(CHANGE_PARKED_ADD_GENERATION).unwrap();
+        let conn = parked_db();
         for (item, at) in [("b:1", 20), ("a:0", 10), ("b:1", 30), ("c:2", 15)] {
-            conn.execute(PARK_SQL, rusqlite::params![KIND_POT, item, at])
-                .unwrap();
+            park_sql(&conn, rusqlite::params![KIND_POT, item, at, MAX]).unwrap();
         }
-        conn.execute(PARK_SQL, rusqlite::params![KIND_HOP, ID, 5])
-            .unwrap();
+        park_sql(&conn, rusqlite::params![KIND_HOP, ID, 5, MAX]).unwrap();
         let read = |limit: i64| -> Vec<String> {
             let mut q = conn.prepare(PARKED_READ_SQL).unwrap();
-            q.query_map(rusqlite::params![KIND_POT, limit], |r| r.get(0))
+            q.query_map(rusqlite::params![KIND_POT, 1_000, limit], |r| r.get(0))
                 .unwrap()
                 .map(|r| r.unwrap())
                 .collect()
@@ -762,17 +1314,12 @@ mod tests {
     /// key-only DELETE erased the sole row: state 2 had no pending notification.
     #[test]
     fn e649_n1_a_re_park_during_a_delivery_survives_that_deliverys_delete() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        for m in [CHANGE_PARKED_CREATE, CHANGE_PARKED_ADD_GENERATION] {
-            assert!(crate::d1::OVERLAY_MIGRATIONS.contains(&m));
-            conn.execute_batch(m).unwrap();
-        }
+        let conn = parked_db();
         let k = pot_item(&"ab".repeat(32), 0);
-        conn.execute(PARK_SQL, rusqlite::params![KIND_POT, k, 100])
-            .unwrap();
+        park_sql(&conn, rusqlite::params![KIND_POT, k, 100, MAX]).unwrap();
         let selected: Vec<(String, i64)> = {
             let mut q = conn.prepare(PARKED_READ_SQL).unwrap();
-            q.query_map(rusqlite::params![KIND_POT, 128], |r| {
+            q.query_map(rusqlite::params![KIND_POT, 150, 128], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .unwrap()
@@ -780,8 +1327,7 @@ mod tests {
             .collect()
         };
         assert_eq!(selected.len(), 1);
-        conn.execute(PARK_SQL, rusqlite::params![KIND_POT, k, 200])
-            .unwrap();
+        park_sql(&conn, rusqlite::params![KIND_POT, k, 200, MAX]).unwrap();
         for (item, generation) in &selected {
             conn.execute(UNPARK_SQL, rusqlite::params![KIND_POT, item, generation])
                 .unwrap();
@@ -795,9 +1341,11 @@ mod tests {
         );
         // and its own delivery takes it
         let again: (String, i64) = conn
-            .query_row(PARKED_READ_SQL, rusqlite::params![KIND_POT, 128], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                PARKED_READ_SQL,
+                rusqlite::params![KIND_POT, 250, 128],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         conn.execute(UNPARK_SQL, rusqlite::params![KIND_POT, again.0, again.1])
             .unwrap();
@@ -836,6 +1384,10 @@ mod tests {
             "COUNTER_CHANGE_PARKED",
             "COUNTER_CHANGE_PARK_FAULTS",
             "COUNTER_CHANGE_UNPARKED",
+            "COUNTER_CHANGE_PARK_FULL",
+            "COUNTER_CHANGE_PARK_REFUSED",
+            "COUNTER_CHANGE_PARK_EXHAUSTED",
+            "COUNTER_CHANGE_PARK_SWEPT",
         ] {
             assert!(
                 ops.contains(&format!("crate::change_park::{c},")),

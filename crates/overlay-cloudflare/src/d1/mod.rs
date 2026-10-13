@@ -510,7 +510,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 220 → 221 for NS3D-NOTE-5: scheduled refresh/sweep age index.
 /// 221 → 222 for bsv-low #649 M1: `change_parked`, the notes a background flush withheld, parked for the cron.
 /// 222 → 223 for bsv-low #649 N1: `change_parked.generation`, so a delivery deletes only the intent it read.
-pub const OVERLAY_MIGRATION_COUNT: usize = 223;
+/// 223 → 226 for bsv-low #649 N2: `change_parked`'s retry state (attempts, next eligibility, exhausted).
+pub const OVERLAY_MIGRATION_COUNT: usize = 226;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1876,6 +1877,10 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::change_park::CHANGE_PARKED_CREATE,
     // bsv-low #649 N1: the row's generation (a re-park bumps it; a delivery deletes only the one it read).
     crate::change_park::CHANGE_PARKED_ADD_GENERATION,
+    // bsv-low #649 N2: the retry state (a refused row backs off and leaves the drain after its last attempt).
+    crate::change_park::CHANGE_PARKED_ADD_ATTEMPTS,
+    crate::change_park::CHANGE_PARKED_ADD_NEXT_ATTEMPT,
+    crate::change_park::CHANGE_PARKED_ADD_EXHAUSTED,
 
 ];
 
