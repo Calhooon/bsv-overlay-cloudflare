@@ -1785,6 +1785,10 @@ pub(crate) trait ConflictPassPort {
     async fn check(&self, txid: &str, beef: Option<String>) -> Result<bool, String>;
     /// Persist one candidate's counter deltas (the durable `ops_counters` rows).
     async fn persist(&self, deltas: &ConflictPassSummary);
+    /// bsv-low #649 L1 (the delta lens): the pass's DELIVERY of the notes its evictions made, its one delivery
+    /// await and its LAST effect: nothing is persisted after it (each candidate's deltas were persisted before
+    /// the next candidate's courier).
+    async fn flush(&self);
 }
 
 /// THE LOOP of a conflict pass (bsv-low #649 H1): each candidate's deltas are PERSISTED once it completes, before
@@ -1806,6 +1810,7 @@ pub(crate) async fn run_conflict_candidates<P: ConflictPassPort>(
         summary.evicted += one.evicted;
         summary.faults += one.faults;
     }
+    port.flush().await;
     summary
 }
 
@@ -1845,6 +1850,9 @@ impl ConflictPassPort for WorkerConflictPass<'_> {
     async fn persist(&self, deltas: &ConflictPassSummary) {
         bump_conflict_counters(self.db, deltas).await;
     }
+    /// The pass's notes are delivered by the scheduled tick's own flush at its end (`lib.rs`, after the passes:
+    /// `pot_changes::flush` under the tick's `wait_until`); this pass holds no `Env` to POST with.
+    async fn flush(&self) {}
 }
 
 pub async fn confirmed_conflict_pass(
@@ -4311,6 +4319,98 @@ mod tests {
                 d.scanned, d.evicted, d.faults
             ));
         }
+        async fn flush(&self) {
+            self.events.borrow_mut().push("flush".into());
+        }
+    }
+
+    /// bsv-low #649 L1: the conflict pass's world where EVERY candidate completes (the first and third evicted,
+    /// the second's re-check faulted) and the delivery completes too.
+    struct CompletingConflict {
+        events: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ConflictPassPort for CompletingConflict {
+        async fn check(&self, txid: &str, _beef: Option<String>) -> Result<bool, String> {
+            self.events.borrow_mut().push(format!("check {txid}"));
+            match txid {
+                "second" => Err("courier fault".into()),
+                _ => Ok(true),
+            }
+        }
+        async fn persist(&self, d: &ConflictPassSummary) {
+            self.events
+                .borrow_mut()
+                .push(format!("persist {}/{}/{}", d.scanned, d.evicted, d.faults));
+        }
+        async fn flush(&self) {
+            self.events.borrow_mut().push("flush".into());
+        }
+    }
+
+    /// bsv-low #649 L1 (the delta lens's appended persist in the conflict loop): the shipped pass, run to its END
+    /// over three candidates and a delivery that complete, persists each candidate ONCE, in order, before the
+    /// next candidate's check, and its delivery await is its last effect: nothing persisted after it. And over the
+    /// loop's WHOLE body: the delivery await is the last statement before the answer, and each iteration ends with
+    /// pure additions after its persist. The lens's mutant (`port.flush().await; port.persist(&summary).await;`
+    /// appended) passed every pin on `1516ed5`; here it is RED on the extra `persist 3/2/1` and on the body.
+    #[test]
+    fn e649_l1_the_conflict_pass_persists_nothing_after_its_delivery_await() {
+        let port = CompletingConflict {
+            events: Default::default(),
+        };
+        let rows = vec![
+            ("first".to_string(), None),
+            ("second".to_string(), None),
+            ("third".to_string(), None),
+        ];
+        let mut fut = std::pin::pin!(run_conflict_candidates(&port, rows));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(summary) = std::future::Future::poll(fut.as_mut(), &mut cx)
+        else {
+            panic!("every step of the fake answers at once: the pass completes")
+        };
+        assert_eq!(
+            (summary.scanned, summary.evicted, summary.faults),
+            (3, 2, 1)
+        );
+        assert_eq!(
+            *port.events.borrow(),
+            vec![
+                "check first",
+                "persist 1/1/0",
+                "check second",
+                "persist 1/0/1",
+                "check third",
+                "persist 1/1/0",
+                "flush",
+            ],
+            "each candidate persisted once before the next check; the delivery is the pass's LAST effect"
+        );
+        let src = include_str!("admit_fast.rs");
+        let l = &src[src
+            .find("pub(crate) async fn run_conflict_candidates<")
+            .unwrap()..];
+        let l = squashed(&l[..l.find("\n}\n").unwrap() + 3]);
+        let flush = "port.flush().await;";
+        assert_eq!(l.matches("port.flush()").count(), 1, "one delivery await");
+        assert_eq!(
+            &l[l.find(flush).unwrap() + flush.len()..],
+            "summary}",
+            "nothing after the conflict pass's delivery await but its answer"
+        );
+        assert_eq!(
+            l.matches(".persist(").count(),
+            1,
+            "one persist: each candidate's own"
+        );
+        let persist = "port.persist(&one).await;";
+        let after = &l[l.find(persist).unwrap() + persist.len()..l.find(flush).unwrap()];
+        assert_eq!(
+            after,
+            "summary.scanned+=one.scanned;summary.evicted+=one.evicted;summary.faults+=one.faults;}",
+            "an iteration ends with pure additions after its persist"
+        );
     }
 
     /// bsv-low #649 H1 (the lens's hanging second courier): candidate 1 is evicted, candidate 2's courier hangs, and
