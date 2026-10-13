@@ -109,8 +109,10 @@ pub(crate) async fn relay_post(
 }
 
 /// Fan one event out through the relay's `/broadcast` (bearer `BROADCAST_TOKEN`).
-/// Best-effort and logged; an unconfigured deploy no-ops.
-pub async fn push_broadcast(env: &Env, room: &str, body: Value) {
+/// Best-effort and logged; an unconfigured deploy no-ops. E649 L4: answers what the call came to, so the pot
+/// hook's detached announce can count it.
+pub async fn push_broadcast(env: &Env, room: &str, body: Value) -> crate::pot_hook::Delivery {
+    use crate::pot_hook::Delivery;
     let (Ok(relay), Ok(token)) = (
         env.var("RELAY_URL").map(|v| v.to_string()),
         env.secret("BROADCAST_TOKEN").map(|v| v.to_string()),
@@ -118,11 +120,11 @@ pub async fn push_broadcast(env: &Env, room: &str, body: Value) {
         console_log!(
             "[broadcast] not configured (RELAY_URL / BROADCAST_TOKEN) — {room} event dropped"
         );
-        return;
+        return Delivery::NotConfigured;
     };
     let payload = json!({ "room": room, "body": body }).to_string();
     match relay_post(env, &relay, "/broadcast", &token, payload).await {
-        Ok(r) if r.status_code() == 200 => {}
+        Ok(r) if r.status_code() == 200 => Delivery::Sent,
         Ok(mut r) => {
             let status = r.status_code();
             let server = r.headers().get("server").ok().flatten().unwrap_or_default();
@@ -131,8 +133,12 @@ pub async fn push_broadcast(env: &Env, room: &str, body: Value) {
                 "[broadcast] {room} push HTTP {status} (server={server}) {}",
                 excerpt(&body)
             );
+            Delivery::Failed
         }
-        Err(e) => console_log!("[broadcast] {room} push failed: {e}"),
+        Err(e) => {
+            console_log!("[broadcast] {room} push failed: {e}");
+            Delivery::Failed
+        }
     }
 }
 
@@ -147,18 +153,19 @@ pub fn sender_pubkey_hex(server_private_key_hex: &str) -> Option<String> {
 /// File one DURABLE event into ONE seat's `low_events` box through the
 /// relay's first-party `POST /push` (bearer `BROADCAST_TOKEN`; stored,
 /// live-bridged, acknowledged by the client, replayed on reload). Best-effort.
-pub async fn first_party_push(env: &Env, recipient: &str, body: Value) {
+pub async fn first_party_push(env: &Env, recipient: &str, body: Value) -> crate::pot_hook::Delivery {
+    use crate::pot_hook::Delivery;
     let (Ok(relay), Ok(token), Ok(sk)) = (
         env.var("RELAY_URL").map(|v| v.to_string()),
         env.secret("BROADCAST_TOKEN").map(|v| v.to_string()),
         env.secret("SERVER_PRIVATE_KEY").map(|v| v.to_string()),
     ) else {
         console_log!("[push] not configured (RELAY_URL / BROADCAST_TOKEN / SERVER_PRIVATE_KEY) — event dropped");
-        return;
+        return Delivery::NotConfigured;
     };
     let Some(sender) = sender_pubkey_hex(&sk) else {
         console_log!("[push] SERVER_PRIVATE_KEY does not derive a pubkey — event dropped");
-        return;
+        return Delivery::NotConfigured;
     };
     let payload = json!({
         "sender": sender,
@@ -168,7 +175,7 @@ pub async fn first_party_push(env: &Env, recipient: &str, body: Value) {
     })
     .to_string();
     match relay_post(env, &relay, "/push", &token, payload).await {
-        Ok(r) if (200..300).contains(&r.status_code()) => {}
+        Ok(r) if (200..300).contains(&r.status_code()) => Delivery::Sent,
         Ok(mut r) => {
             let status = r.status_code();
             let server = r.headers().get("server").ok().flatten().unwrap_or_default();
@@ -178,11 +185,15 @@ pub async fn first_party_push(env: &Env, recipient: &str, body: Value) {
                 &recipient[..12.min(recipient.len())],
                 excerpt(&body)
             );
+            Delivery::Failed
         }
-        Err(e) => console_log!(
-            "[push] → {}… failed: {e}",
-            &recipient[..12.min(recipient.len())]
-        ),
+        Err(e) => {
+            console_log!(
+                "[push] → {}… failed: {e}",
+                &recipient[..12.min(recipient.len())]
+            );
+            Delivery::Failed
+        }
     }
 }
 
@@ -844,8 +855,8 @@ mod tests {
         let start = routes.find(&squash("pub(crate) async fn internal_pot_changed(")).expect("the handler");
         let handler = &routes[start..start + routes[start + 1..].find(&squash("pub(crate) async fn")).expect("the next handler")];
         assert!(handler.contains(&squash("let (outpoints, dropped) = crate::internal_events::parse_pot_changed_counted(&raw);")));
-        assert!(handler.contains(&squash("for (txid, vout) in &outpoints {")), "the push loop runs over every parsed outpoint");
-        assert!(handler.contains(&squash("for (txid, vout) in outpoints {")), "and so does the filing loop");
+        // E649 L4: the seam takes the whole parsed list (its plan announces every outpoint, `pot_hook`'s pins)
+        assert!(handler.contains(&squash("crate::pot_hook::apply_pot_changed(&D1HookStore { db: &db }, &outpoints, t0)")), "the seam runs over every parsed outpoint");
         assert!(handler.contains(&squash("crate::internal_events::COUNTER_POT_CHANGED_DROPPED")), "a refused remainder is counted");
         assert!(handler.contains(&squash(r#""dropped": dropped"#)), "and answered to the overlay");
     }
@@ -902,7 +913,7 @@ mod tests {
         let start = routes.find(&squash("pub(crate) async fn internal_hop_changed(")).expect("the handler");
         let handler = &routes[start..start + routes[start + 1..].find(&squash("pub(crate) async fn")).expect("the next handler")];
         assert!(handler.contains(&squash("let (identities, dropped) = crate::internal_events::parse_hop_changed_counted(&raw);")));
-        assert!(handler.contains(&squash("for id in &identities {")), "the stale mark runs over every parsed identity");
+        assert!(handler.contains(&squash("crate::pot_hook::apply_hop_changed(&D1HookStore { db: &db }, &identities)")), "the stale mark runs over every parsed identity (one batch, E649 L4)");
         assert!(handler.contains(&squash("for id in ids {")), "and so does the recompute");
         assert!(handler.contains(&squash("crate::internal_events::COUNTER_HOP_CHANGED_DROPPED")), "a refused remainder is counted");
         assert!(handler.contains(&squash(r#""dropped": dropped"#)), "and answered to the overlay");
@@ -990,43 +1001,29 @@ mod tests {
         assert_eq!(POTS_ROOM, "broadcast-low-pots");
     }
 
-    /// The handler announces EVERY parsed outpoint in the pots room BEFORE the
-    /// attribution loop (bsv-low loop 10 D2, the pair-10 finding: a seat
-    /// blocked at funding has no marker, so the per-seat event never files for
-    /// it; the beta log read "has no attributed seats yet, nothing to file"
-    /// for both JOINs). To red: move the push below `attribute_seats(` or
-    /// delete it.
+    /// The pots room hears EVERY parsed outpoint (bsv-low loop 10 D2, the pair-10 finding: a seat blocked at
+    /// funding has no marker, so the per-seat event never files for it), whatever the attribution finds. Since
+    /// E649 L4 the announce is the seam's PLAN, run after the answer: the plan carries every parsed outpoint
+    /// (`pot_hook::tests::e649_hook_e_*`), and the handler hands it to `announce_detached` inside `wait_until`.
+    /// To red: drop the detached announce, or build the plan from the attributed outpoints only.
     #[test]
-    fn internal_pot_changed_announces_every_outpoint_before_attribution() {
-        // Scanned WITHOUT whitespace: rustfmt reflows a call across lines
-        // (2026-09-09: the push call was formatted onto five lines and this
-        // pin's one-line needle stopped matching — a formatter must never be
-        // able to red a source pin, nor to green it). Relative ORDER survives
-        // the squash, which is all the pin asserts.
+    fn internal_pot_changed_announces_every_outpoint_detached() {
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
-        let routes = squash(include_str!("routes.rs"));
+        let routes = squash(&code_only(include_str!("routes.rs")));
         let start = routes
             .find(&squash("pub(crate) async fn internal_pot_changed("))
             .expect("the handler");
         let body = &routes[start..];
-        let push = body
-            .find(&squash(
-                "push_broadcast(env, crate::internal_events::POTS_ROOM, crate::internal_events::pot_changed_event_body(",
-            ))
-            .expect("the pots push");
-        let attribution = body
-            .find(&squash("attribute_seats("))
-            .expect("the attribution");
+        let detached = body
+            .find(&squash("ctx.wait_until(async move { crate::pot_hook::announce_detached(env_announce, plan).await });"))
+            .expect("the announce runs detached");
+        let answer = body.find(&squash("json_response(")).expect("the answer");
+        assert!(detached < answer, "handed to wait_until before the answer is built, awaited by nobody on it");
+        let hook = include_str!("pot_hook.rs");
         assert!(
-            push < attribution,
-            "the pots push comes BEFORE any attribution"
-        );
-        let filing_loop = body
-            .find(&squash("for (txid, vout) in outpoints {"))
-            .expect("the per-outpoint filing loop");
-        assert!(
-            push < filing_loop,
-            "the push runs over every parsed outpoint, before the filing loop"
+            hook.contains("outpoints: outpoints.to_vec(),"),
+            "the plan announces every parsed outpoint, not the attributed ones"
         );
     }
 
@@ -1038,34 +1035,35 @@ mod tests {
     /// To red: drop `owed_identities_by_marker` / `owed_mark_stale` from that branch.
     #[test]
     fn internal_pot_changed_marks_the_marker_named_identities_stale_when_no_seat_is_attributed() {
-        // comments stripped before the squash: a comment naming `owed_mark_stale(` must not green this pin
+        // E649 L4: the branch is the seam's (`pot_hook::apply_pot_changed`), executed by
+        // `pot_hook::tests::e649_hook_b_*` over a model store; here, that the D1 store reads the three marker arms,
+        // the refund-backup one included (the one marker a seat killed at the funding filed).
         let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = squash(&code_only(include_str!("routes.rs")));
-        let start = routes
-            .find(&squash("pub(crate) async fn internal_pot_changed("))
-            .expect("the handler");
-        let handler = &routes[start..];
-        let branch = handler
-            .find(&squash("if identities.is_empty() {"))
-            .expect("the no-attributed-seats branch");
-        let body = &handler[branch..];
-        let end = body.find(&squash("continue;")).expect("the branch ends with continue");
-        let body = &body[..end];
-        let named = body.find(&squash("owed_identities_by_marker(&db, &txid, vout)")).expect("the marker-named identities are read");
-        let stale = body.find(&squash("owed_mark_stale(")).expect("and marked stale");
-        let queued = body.find(&squash("owed_identities.push(id)")).expect("and queued for the after-answer re-derivation");
-        assert!(named < stale && stale < queued, "read, mark stale, queue — in that order");
-        // and the marker-named read has the refund-backup arm (the one marker a seat killed at the funding filed)
-        let helper = routes.find(&squash("pub(crate) async fn owed_identities_by_marker(")).expect("the helper");
-        // bounded to the helper's own body: the next `pub(crate) async fn` (the delta-verify's N4; `find` lands on
-        // an ASCII marker, a char boundary, never a byte offset into an em dash)
-        let rest = &routes[helper + 1..];
+        let store = routes
+            .find(&squash("impl crate::pot_hook::HookStore for D1HookStore<'_> {"))
+            .expect("the D1 store");
+        let rest = &routes[store..];
         let end = rest.find(&squash("pub(crate) async fn")).unwrap_or(rest.len());
-        let helper_body = &rest[..end];
-        assert!(helper_body.contains(&squash("crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL")), "the potrefund arm");
+        let store = &rest[..end];
+        for arm in [
+            "crate::owed::OWED_ATTRIBUTE_BY_POT_SQL",
+            "crate::owed::OWED_ATTRIBUTE_BY_HOP_SQL",
+            "crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL",
+        ] {
+            assert!(store.contains(&squash(arm)), "the store reads {arm}");
+        }
+        let hook = squash(&code_only(include_str!("pot_hook.rs")));
+        let branch = hook
+            .find(&squash("} if seats.is_empty() => {"))
+            .expect("the no-attributed-seats branch");
+        let body = &hook[branch..];
+        let body = &body[..body.find(&squash("out.skipped.push(")).expect("the branch skips")];
+        let stale = body.find(&squash("out.stale_marks")).expect("marked stale");
+        let queued = body.find(&squash("push_unique(&mut out.owed_identities, id)")).expect("and queued for the recompute");
+        assert!(stale < queued, "mark stale, then queue");
     }
-
 
     #[test]
     fn tip_event_body_is_a_snapshot_with_the_room_name_pinned() {

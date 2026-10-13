@@ -2302,61 +2302,12 @@ pub async fn compute_results_body_string(
 /// box as a `pot` event. Best-effort per outpoint; the answer names what
 /// was filed. Nothing here is money truth — the client still verifies
 /// landings before any credit.
-/// The identities whose OWN markers name an outpoint: the party rows naming it as a pot, the hop rows naming it as a
-/// hop (`OWED_ATTRIBUTE_BY_POT_SQL` / `_BY_HOP_SQL`). Fail-soft: a faulted read names nobody (the cadence re-derives).
-/// The identities the seats' OWN markers name for an outpoint. Two events share this helper with different key
-/// spaces: a POT event (the no-decoded-params and no-attributed-seats branches) is answered by the party arm and
-/// the refund-backup arm (both keyed by the pot); a released-HOP event by the hop arm (keyed by the hop container's
-/// outpoint, which never matches a pot). An arm that cannot match its event is one indexed empty read.
-pub(crate) async fn owed_identities_by_marker(
-    db: &worker::D1Database,
-    txid: &str,
-    vout: u32,
-) -> Vec<String> {
-    #[derive(Deserialize)]
-    struct IdentityOnlyD1 {
-        identity: String,
-    }
-    let mut out: Vec<String> = Vec::new();
-    for sql in [
-        crate::owed::OWED_ATTRIBUTE_BY_POT_SQL,
-        crate::owed::OWED_ATTRIBUTE_BY_HOP_SQL,
-        crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL,
-    ] {
-        match db
-            .prepare(sql)
-            .bind(&[JsValue::from_str(txid), JsValue::from_f64(f64::from(vout))])
-        {
-            Ok(stmt) => match stmt
-                .counted_all()
-                .await
-                .and_then(|r| r.results::<IdentityOnlyD1>())
-            {
-                Ok(rows) => {
-                    for r in rows {
-                        let id = r.identity.to_ascii_lowercase();
-                        if !out.contains(&id) {
-                            out.push(id);
-                        }
-                    }
-                }
-                Err(e) => console_warn!(
-                    "[pot-changed] marker attribution read failed for {txid}:{vout}: {e}"
-                ),
-            },
-            Err(e) => {
-                console_warn!("[pot-changed] marker attribution bind failed for {txid}:{vout}: {e}")
-            }
-        }
-    }
-    out
-}
-
 pub(crate) async fn internal_pot_changed(
     mut req: Request,
     env: &worker::Env,
     ctx: &worker::Context,
 ) -> Result<Response> {
+    let t0 = worker::Date::now().as_millis();
     if !crate::internal_events::internal_bearer_ok(&req, env) {
         return Response::error("unauthorized", 401);
     }
@@ -2385,179 +2336,21 @@ pub(crate) async fn internal_pot_changed(
             .await;
         });
     }
-    // bsv-low loop 10 D2 (2026-09-08, the pair-10 finding): announce EVERY
-    // changed outpoint in the pots room FIRST, before any attribution (see
-    // `internal_events::POTS_ROOM`). A seat that holds this JOIN but never
-    // published its marker (a seat blocked at funding) hears it here and reads
-    // the network; the per-seat durable event below still files for every
-    // attributed seat.
-    let announced_at = worker::Date::now().as_millis();
-    for (txid, vout) in &outpoints {
-        crate::internal_events::push_broadcast(
-            env,
-            crate::internal_events::POTS_ROOM,
-            crate::internal_events::pot_changed_event_body(txid, *vout, announced_at),
-        )
-        .await;
-    }
+    // E649 L4: the hook is a WRITE. Its answer path is the seam's D1 batches alone (`pot_hook::apply_pot_changed`):
+    // the attribution read, the stale marks. The pots-room announce of every parsed outpoint (loop 10 D2) and the
+    // attributed seats' `pot` events run AFTER the answer, under one wall, counted; no `/results` gather.
     let db = env.d1("OVERLAY_DB")?;
-    let era = written_off_before_ms_env(env);
-    let mut filed: Vec<serde_json::Value> = Vec::new();
-    let mut skipped: Vec<serde_json::Value> = Vec::new();
-    // bsv-low #469 (the gate's MEDIUM-11): the owed recompute runs AFTER this answer (`wait_until`), once per identity
-    // this call attributed, never inline and never per outpoint × identity.
-    let mut owed_identities: Vec<String> = Vec::new();
-    for (txid, vout) in outpoints {
-        // (1) committed params for the outpoint (the decoded columns).
-        let stmt = db
-            .prepare(crate::results::decoded_pots_sql(1))
-            .bind(&[JsValue::from_str(&txid), JsValue::from_f64(f64::from(vout))])?;
-        let rows = match stmt
-            .counted_all()
-            .await
-            .and_then(|r| r.results::<DecodedPotRowD1>())
-        {
-            Ok(r) => r,
-            Err(e) => {
-                console_warn!("[pot-changed] decoded-pots read failed for {txid}:{vout}: {e}");
-
-                skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] decoded-pots read failed for {txid}:{vout}: {e}") }));
-
-                continue;
-            }
-        };
-        let Some(params) = rows.first().and_then(|r| r.covenant_params()) else {
-            // fleet loop 11 (the gate's MEDIUM-1): an EVICTED pot's row is gone and a released HOP is a P2PKH row —
-            // neither decodes. The seats are reached through the seats' OWN markers: for the released HOP its
-            // `hopparty_records` row (never moved by an eviction) names its seat; the by-pot arm answers for a pot
-            // whose party rows still stand (an evicted pot's were moved to their twin, so an eviction reaches both
-            // seats through their hops). Those identities are marked stale and re-derived after the answer, so a
-            // refusal reaches the owed list at once (nothing is FILED here: the filing below needs the params)
-            let named = owed_identities_by_marker(&db, &txid, vout).await;
-            let named_n = named.len();
-            for id in named {
-                owed_mark_stale(
-                    &db,
-                    crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
-                    &[JsValue::from_str(&id)],
-                    "pot-changed (by marker)",
-                )
-                .await;
-                if !owed_identities.contains(&id) {
-                    owed_identities.push(id);
-                }
-            }
-            worker::console_log!(
-                "[pot-changed] {txid}:{vout} has no decoded params yet — nothing to file ({named_n} seat(s) attributed by marker)"
-            );
-
-            skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} has no decoded params yet — nothing to file") }));
-
-            continue;
-        };
-        let key = (txid.clone(), vout);
-        let mut params_by_pot = std::collections::HashMap::new();
-        params_by_pot.insert(key.clone(), params.clone());
-        // (2) the two identities from their verified seat markers.
-        let markers = results_seat_markers(&db, &params_by_pot).await;
-        let attr = crate::results::attribute_seats(
-            &params,
-            &txid,
-            vout,
-            markers.get(&key).map(Vec::as_slice).unwrap_or(&[]),
-        );
-        let identities: Vec<String> = [attr.identity_a.clone(), attr.identity_b.clone()]
-            .into_iter()
-            .flatten()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
-        if identities.is_empty() {
-            // fleet loop 15 (2026-09-20, pair 1's refundLandedVerify): a pot whose seats never filed their party
-            // markers (both tabs killed at the funding, the arm-and-verify unit) still has OWED ROWS for the
-            // identities the refund-backup and hop markers name — and its confirm event reached this branch,
-            // filed nothing, and marked nobody stale, so the rows kept saying "wait for a block" for a spend
-            // that had confirmed. The marker-named identities are marked stale and re-derived after the answer,
-            // exactly as the no-decoded-params branch above does.
-            let named = owed_identities_by_marker(&db, &txid, vout).await;
-            let named_n = named.len();
-            for id in named {
-                owed_mark_stale(
-                    &db,
-                    crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
-                    &[JsValue::from_str(&id)],
-                    "pot-changed (unattributed, by marker)",
-                )
-                .await;
-                if !owed_identities.contains(&id) {
-                    owed_identities.push(id);
-                }
-            }
-            worker::console_log!(
-                "[pot-changed] {txid}:{vout} has no attributed seats yet — nothing to file ({named_n} seat(s) marked stale by marker)"
-            );
-
-            skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} has no attributed seats yet — nothing to file") }));
-
-            continue;
-        }
-        // (3) each seat's own served entry → its box.
-        for id in identities {
-            let entries = match gather_result_entries(&db, &id, era, 0).await {
-                Ok((entries, _)) => entries,
-                Err(e) => {
-                    console_warn!(
-                        "[pot-changed] gather for {}… failed: {e}",
-                        &id[..12.min(id.len())]
-                    );
-
-                    skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] gather for {}… failed: {e}", &id[..12.min(id.len())]) }));
-
-                    continue;
-                }
-            };
-            let Some(entry) = entries
-                .iter()
-                .find(|e| e.pot_txid.eq_ignore_ascii_case(&txid) && e.pot_vout == vout)
-            else {
-                worker::console_log!(
-                    "[pot-changed] {txid}:{vout} not in {}…'s served page — nothing to file",
-                    &id[..12.min(id.len())]
-                );
-
-                skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} not in {}…'s served page — nothing to file", &id[..12.min(id.len())]) }));
-
-                continue;
-            };
-            let body = crate::results::results_body(&id, std::slice::from_ref(entry), false, 0);
-            let served: serde_json::Value = match serde_json::from_str(&body) {
-                Ok(v) => v,
-                Err(e) => {
-                    console_warn!("[pot-changed] serializer output is not JSON: {e}");
-
-                    skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] serializer output is not JSON: {e}") }));
-
-                    continue;
-                }
-            };
-            let Some(one) = crate::internal_events::first_served_result(&served) else {
-                skipped.push(serde_json::json!({ "txid": txid, "vout": vout, "why": "serializer produced no entry" }));
-                continue;
-            };
-            let event = crate::internal_events::pot_event_body(
-                &txid,
-                vout,
-                one,
-                worker::Date::now().as_millis(),
-            );
-            crate::internal_events::first_party_push(env, &id, event).await;
-            if !owed_identities.contains(&id) {
-                owed_identities.push(id.clone());
-            }
-            filed.push(serde_json::json!({ "txid": txid, "vout": vout, "identity": id }));
-        }
+    let outcome =
+        crate::pot_hook::apply_pot_changed(&D1HookStore { db: &db }, &outpoints, t0).await;
+    if let Some(e) = &outcome.stale_fault {
+        console_warn!("[owed] stale mark (pot-changed) failed: {e}");
     }
-    // bsv-low #469: the owed list is COMPUTED ON WRITE — every identity this call attributed has its rows re-derived
-    // and its page told (`owed-changed`), after the overlay has its answer; the read stays O(1).
+    let env_announce = env.clone();
+    let plan = outcome.plan.clone();
+    ctx.wait_until(async move { crate::pot_hook::announce_detached(env_announce, plan).await });
+    // bsv-low #469 (the gate's MEDIUM-11): the owed recompute runs AFTER this answer (`wait_until`), once per identity
+    // this call attributed, never inline and never per outpoint × identity; #648 sheds it per identity.
+    let owed_identities = outcome.owed_identities.clone();
     if !owed_identities.is_empty() {
         let env2 = env.clone();
         ctx.wait_until(async move {
@@ -2571,23 +2364,163 @@ pub(crate) async fn internal_pot_changed(
             }
         });
     }
-    json_response(
-        serde_json::json!({ "ok": true, "filed": filed, "skipped": skipped, "dropped": dropped })
+    let ms = worker::Date::now().as_millis().saturating_sub(t0);
+    worker::console_log!(
+        "[pot-changed] answered in {ms} ms, announce detached ({} outpoints)",
+        outcome.plan.outpoints.len()
+    );
+    let mut resp = json_response(
+        serde_json::json!({ "ok": true, "filed": outcome.filed, "skipped": outcome.skipped, "dropped": dropped, "announce": "detached" })
             .to_string(),
         200,
-    )
+    )?;
+    resp.headers_mut()
+        .set("Server-Timing", &crate::pot_hook::hook_timing(ms))?;
+    Ok(resp)
+}
+
+/// E649 L4: the hooks' D1 port. Each method is ONE `counted_batch` round trip (the seat markers a second one,
+/// over the pots the first decoded), never a statement per outpoint or per identity.
+///
+/// The marker arms (they were `owed_identities_by_marker`, a statement each, per outpoint): the identities the
+/// seats' OWN markers name for an outpoint. A POT event is answered by the party arm and the refund-backup arm
+/// (both keyed by the pot); a released-HOP event by the hop arm (keyed by the hop container's outpoint, which never
+/// matches a pot). An arm that cannot match its event is one indexed empty read. A faulted arm names nobody (the
+/// cadence re-derives).
+pub(crate) struct D1HookStore<'a> {
+    pub(crate) db: &'a worker::D1Database,
+}
+
+#[derive(Deserialize)]
+struct IdentityOnlyD1 {
+    identity: String,
+}
+
+impl crate::pot_hook::HookStore for D1HookStore<'_> {
+    async fn read_outpoints(&self, outpoints: &[(String, u32)]) -> Vec<crate::pot_hook::OutpointRead> {
+        use crate::pot_hook::OutpointRead;
+        const ARMS: [&str; 3] = [
+            crate::owed::OWED_ATTRIBUTE_BY_POT_SQL,
+            crate::owed::OWED_ATTRIBUTE_BY_HOP_SQL,
+            crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL,
+        ];
+        let failed_all = |e: String| -> Vec<OutpointRead> {
+            outpoints.iter().map(|_| OutpointRead::Failed(e.clone())).collect()
+        };
+        // (1) ONE batch: per outpoint, its decoded row and the three marker arms.
+        let decoded_sql = crate::results::decoded_pots_sql(1);
+        let mut stmts = Vec::with_capacity(outpoints.len() * (1 + ARMS.len()));
+        for (txid, vout) in outpoints {
+            let binds = [JsValue::from_str(txid), JsValue::from_f64(f64::from(*vout))];
+            for sql in std::iter::once(decoded_sql.as_str()).chain(ARMS) {
+                match self.db.prepare(sql).bind(&binds) {
+                    Ok(s) => stmts.push(s),
+                    Err(e) => return failed_all(format!("bind: {e}")),
+                }
+            }
+        }
+        let results = match crate::d1_ledger::counted_batch(self.db, stmts).await {
+            Ok(r) => r,
+            Err(e) => {
+                console_warn!("[pot-changed] attribution batch failed: {e}");
+                return failed_all(e.to_string());
+            }
+        };
+        let per = 1 + ARMS.len();
+        let mut decoded: Vec<std::result::Result<Option<crate::results::CovenantParams>, String>> =
+            Vec::with_capacity(outpoints.len());
+        let mut named: Vec<Vec<String>> = Vec::with_capacity(outpoints.len());
+        for (i, (txid, vout)) in outpoints.iter().enumerate() {
+            let group = &results[i * per..(i + 1) * per];
+            decoded.push(
+                group[0]
+                    .results::<DecodedPotRowD1>()
+                    .map(|rows| rows.first().and_then(|r| r.covenant_params()))
+                    .map_err(|e| e.to_string()),
+            );
+            let mut ids: Vec<String> = Vec::new();
+            for r in &group[1..] {
+                match r.results::<IdentityOnlyD1>() {
+                    Ok(rows) => {
+                        for row in rows {
+                            let id = row.identity.to_ascii_lowercase();
+                            if !ids.contains(&id) {
+                                ids.push(id);
+                            }
+                        }
+                    }
+                    Err(e) => console_warn!(
+                        "[pot-changed] marker attribution read failed for {txid}:{vout}: {e}"
+                    ),
+                }
+            }
+            named.push(ids);
+        }
+        // (2) ONE batch: the decoded pots' seat markers, then `attribute_seats` per pot.
+        let mut params_by_pot = std::collections::HashMap::new();
+        for ((txid, vout), d) in outpoints.iter().zip(&decoded) {
+            if let Ok(Some(p)) = d {
+                params_by_pot.insert((txid.clone(), *vout), p.clone());
+            }
+        }
+        let markers = results_seat_markers_batched(self.db, &params_by_pot).await;
+        outpoints
+            .iter()
+            .zip(decoded)
+            .zip(named)
+            .map(|(((txid, vout), d), marker_named)| match d {
+                Err(e) => OutpointRead::Failed(e),
+                Ok(None) => OutpointRead::NoParams { marker_named },
+                Ok(Some(params)) => {
+                    let key = (txid.clone(), *vout);
+                    let attr = crate::results::attribute_seats(
+                        &params,
+                        txid,
+                        *vout,
+                        markers.get(&key).map(Vec::as_slice).unwrap_or(&[]),
+                    );
+                    let seats = [attr.identity_a, attr.identity_b]
+                        .into_iter()
+                        .flatten()
+                        .map(|s| s.to_ascii_lowercase())
+                        .collect();
+                    OutpointRead::Decoded { seats, marker_named }
+                }
+            })
+            .collect()
+    }
+
+    async fn mark_stale(&self, marks: &[(String, &'static str)]) -> std::result::Result<(), String> {
+        let mut stmts = Vec::with_capacity(marks.len());
+        for (id, what) in marks {
+            match self
+                .db
+                .prepare(crate::owed::OWED_STALE_FOR_IDENTITY_SQL)
+                .bind(&[JsValue::from_str(id)])
+            {
+                Ok(s) => stmts.push(s),
+                Err(e) => return Err(format!("stale mark ({what}) bind failed: {e}")),
+            }
+        }
+        crate::d1_ledger::counted_batch(self.db, stmts)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// bsv-low #469 (2026-09-19) — `POST /internal/hop-changed` (bearer `INTERNAL_TOKEN`; the overlay's hop-marker
 /// admission through the `APP_LAYER` binding): `{"identities":[…]}` — every identity a just-admitted hop marker names
 /// has its owed rows marked STALE and re-derived after the answer (`wait_until`), the page told by `owed-changed`.
 /// The device-switch unit's hop branch read "nothing owed" for 90 s over a verified marker because only the cadence
-/// re-derived a hop-only identity; a hop funded IS a write the list is computed on.
+/// re-derived a hop-only identity; a hop funded IS a write the list is computed on. E649 L4: the stale marks are
+/// ONE batch (`pot_hook::apply_hop_changed`), the recompute stays after the answer.
 pub(crate) async fn internal_hop_changed(
     mut req: Request,
     env: &worker::Env,
     ctx: &worker::Context,
 ) -> Result<Response> {
+    let t0 = worker::Date::now().as_millis();
     if !crate::internal_events::internal_bearer_ok(&req, env) {
         return Response::error("unauthorized", 401);
     }
@@ -2617,14 +2550,8 @@ pub(crate) async fn internal_hop_changed(
         });
     }
     let db = env.d1("OVERLAY_DB")?;
-    for id in &identities {
-        owed_mark_stale(
-            &db,
-            crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
-            &[JsValue::from_str(id)],
-            "hop-changed",
-        )
-        .await;
+    if let Err(e) = crate::pot_hook::apply_hop_changed(&D1HookStore { db: &db }, &identities).await {
+        console_warn!("[owed] stale mark (hop-changed) failed: {e}");
     }
     let env2 = env.clone();
     let ids = identities.clone();
@@ -2637,10 +2564,18 @@ pub(crate) async fn internal_hop_changed(
             owed_recompute_and_push_coalesced(&env2, &db, &id, "hop-changed", tip).await;
         }
     });
-    json_response(
+    let ms = worker::Date::now().as_millis().saturating_sub(t0);
+    worker::console_log!(
+        "[hop-changed] answered in {ms} ms, recompute detached ({} identities)",
+        identities.len()
+    );
+    let mut resp = json_response(
         serde_json::json!({ "ok": true, "identities": identities, "dropped": dropped }).to_string(),
         200,
-    )
+    )?;
+    resp.headers_mut()
+        .set("Server-Timing", &crate::pot_hook::hook_timing(ms))?;
+    Ok(resp)
 }
 
 /// HIGH-4: mark the identities a change concerns STALE (their next read recomputes) and tell their pages. The
@@ -5814,35 +5749,82 @@ async fn results_seat_markers(
             .await
             .and_then(|r| r.results::<SeatMarkerRowD1>())
         {
-            Ok(fetched) => {
-                for r in fetched {
-                    let (Some(pk), Some(seat_sig), Some(id_sig)) =
-                        (r.seat_settle_pubkey, r.seat_sig_hex, r.sig_hex)
-                    else {
-                        continue;
-                    };
-                    out.entry((r.pot_txid.to_ascii_lowercase(), r.pot_vout as u32))
-                        .or_default()
-                        .push(crate::results::SeatMarkerRow {
-                            identity: r.identity.to_ascii_lowercase(),
-                            opponent_identity: r.opponent_identity.to_ascii_lowercase(),
-                            game_id: r.game_id.to_ascii_lowercase(),
-                            pot_txid: r.pot_txid.to_ascii_lowercase(),
-                            pot_vout: r.pot_vout as u32,
-                            recovery_height: r.recovery_height as u32,
-                            seat_settle_pubkey: pk.to_ascii_lowercase(),
-                            seat_sig_hex: seat_sig.to_ascii_lowercase(),
-                            identity_sig_hex: id_sig.to_ascii_lowercase(),
-                            sig_valid: r.sig_valid.map(|v| v != 0.0),
-                        });
-                }
-            }
+            Ok(fetched) => note_seat_marker_rows(&mut out, fetched),
             Err(e) => {
                 // A racing pre-migration schema (no seatSettlePubkey column
                 // yet) or any D1 fault: attribution is simply omitted.
                 console_warn!("[results] seat-marker query failed (attribution partial): {e}");
             }
         }
+    }
+    out
+}
+
+/// The verified seat-marker rows of a fetched page into the per-pot map (shared by the per-chunk read and the hooks'
+/// batched one).
+fn note_seat_marker_rows(
+    out: &mut std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>>,
+    fetched: Vec<SeatMarkerRowD1>,
+) {
+    for r in fetched {
+        let (Some(pk), Some(seat_sig), Some(id_sig)) =
+            (r.seat_settle_pubkey, r.seat_sig_hex, r.sig_hex)
+        else {
+            continue;
+        };
+        out.entry((r.pot_txid.to_ascii_lowercase(), r.pot_vout as u32))
+            .or_default()
+            .push(crate::results::SeatMarkerRow {
+                identity: r.identity.to_ascii_lowercase(),
+                opponent_identity: r.opponent_identity.to_ascii_lowercase(),
+                game_id: r.game_id.to_ascii_lowercase(),
+                pot_txid: r.pot_txid.to_ascii_lowercase(),
+                pot_vout: r.pot_vout as u32,
+                recovery_height: r.recovery_height as u32,
+                seat_settle_pubkey: pk.to_ascii_lowercase(),
+                seat_sig_hex: seat_sig.to_ascii_lowercase(),
+                identity_sig_hex: id_sig.to_ascii_lowercase(),
+                sig_valid: r.sig_valid.map(|v| v != 0.0),
+            });
+    }
+}
+
+/// E649 L4: [`results_seat_markers`] as ONE `counted_batch` of its chunks (the hooks' second round trip).
+async fn results_seat_markers_batched(
+    db: &worker::D1Database,
+    params_by_pot: &std::collections::HashMap<(String, u32), crate::results::CovenantParams>,
+) -> std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>> {
+    let mut out = std::collections::HashMap::new();
+    let mut stmts = Vec::new();
+    for chunk in crate::results::seat_marker_chunks(params_by_pot) {
+        let sql =
+            crate::results::seat_markers_sql(chunk.len(), crate::results::SEAT_MARKERS_PER_KEY);
+        let mut binds: Vec<JsValue> =
+            Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
+        for b in &chunk {
+            binds.push(JsValue::from_str(&b.pot_txid));
+            binds.push(JsValue::from_f64(f64::from(b.pot_vout)));
+            binds.push(JsValue::from_str(&b.pub_a_hex));
+            binds.push(JsValue::from_str(&b.pub_b_hex));
+        }
+        match db.prepare(sql).bind(&binds) {
+            Ok(s) => stmts.push(s),
+            Err(e) => console_warn!("[pot-changed] seat-marker bind failed (chunk omitted): {e}"),
+        }
+    }
+    if stmts.is_empty() {
+        return out;
+    }
+    match crate::d1_ledger::counted_batch(db, stmts).await {
+        Ok(results) => {
+            for r in results {
+                match r.results::<SeatMarkerRowD1>() {
+                    Ok(fetched) => note_seat_marker_rows(&mut out, fetched),
+                    Err(e) => console_warn!("[pot-changed] seat-marker rows unreadable (attribution partial): {e}"),
+                }
+            }
+        }
+        Err(e) => console_warn!("[pot-changed] seat-marker batch failed (attribution partial): {e}"),
     }
     out
 }

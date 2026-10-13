@@ -2995,8 +2995,9 @@ pub const OWED_STALE_FOR_POT_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE 
 // N8: the filing mark is keyed on a CALLER-CHOSEN pot: a stranger's verified filing can mark both parties of any pot
 // stale — bounded by the per-(poster, family, day) filing caps, and the cost is one recompute on the victim's next
 // read, never a wrong row.
-// N9: the pot-changed hook reaches the identities with a VERIFIED seat marker whose entry sits on their first results
-// page; a heavier identity and a hop-only seat are covered by the read's staleness rule below.
+// N9: the pot-changed hook reaches the identities with a VERIFIED seat marker (since E649 L4 every attributed seat,
+// no `/results` gather on the hook; it was those whose entry sat on their first results page); a hop-only seat is
+// covered by the read's staleness rule below.
 /// HIGH-4: a filing by an identity marks it stale (a `collected` retires a payout on its next read).
 pub const OWED_STALE_FOR_IDENTITY_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE identity = ?1";
 /// MEDIUM-5: the probe before a first-read compute — an identity with no party row and no hop row has nothing to

@@ -444,7 +444,7 @@ async fn push_board_changed(env: &Env) {
         "broadcast-low-board",
         serde_json::json!({ "kind": "board-changed", "at": Date::now().as_millis() }),
     )
-    .await
+    .await;
 }
 
 impl BoardView {
