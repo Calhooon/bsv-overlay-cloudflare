@@ -151,9 +151,20 @@ mod tests {
         let routes = include_str!("routes.rs");
         let at = routes.find("crate::tracker_events::note_submit(").unwrap();
         let call = &routes[at..at + routes[at..].find("\n    }").unwrap()];
-        assert!(call.contains("gated_subject.is_some()"), "submit route replaced the gated mode with a constant");
-        assert!(call.contains("steak.values().any(|a|"), "submit route replaced admission with a constant");
-        for field in ["!a.outputs_to_admit.is_empty()", "!a.coins_to_retain.is_empty()", "a.coins_removed", ".is_some_and(|coins| !coins.is_empty())"] {
+        assert!(
+            call.contains("gated_subject.is_some()"),
+            "submit route replaced the gated mode with a constant"
+        );
+        assert!(
+            call.contains("steak.values().any(|a|"),
+            "submit route replaced admission with a constant"
+        );
+        for field in [
+            "!a.outputs_to_admit.is_empty()",
+            "!a.coins_to_retain.is_empty()",
+            "a.coins_removed",
+            ".is_some_and(|coins| !coins.is_empty())",
+        ] {
             assert!(call.contains(field), "submit admission omits {field}");
         }
     }

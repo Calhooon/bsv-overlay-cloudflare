@@ -777,6 +777,13 @@ pub fn hook_may_reask(kind: &str, has_reask: bool) -> bool {
     kind == "tick" && has_reask
 }
 
+pub fn terminal_hint(hint: &Hint) -> bool {
+    matches!(
+        hint.status,
+        HintStatus::Rejected { .. } | HintStatus::DoubleSpend { .. }
+    )
+}
+
 #[cfg(test)]
 mod budget_pins {
     #[test]
@@ -802,11 +809,4 @@ mod budget_pins {
             "owed read still writes a word"
         );
     }
-}
-
-pub fn terminal_hint(hint: &Hint) -> bool {
-    matches!(
-        hint.status,
-        HintStatus::Rejected { .. } | HintStatus::DoubleSpend { .. }
-    )
 }
