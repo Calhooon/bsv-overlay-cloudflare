@@ -1681,7 +1681,7 @@ struct PotBeefRowD1 {
 /// `pot_records` decoded-column row for the #284 classification partition
 /// (`decoded_pots_sql`). All optional/`default` — a legacy row is NULLs.
 #[derive(Deserialize)]
-struct DecodedPotRowD1 {
+pub(crate) struct DecodedPotRowD1 {
     txid: String,
     #[serde(rename = "spendingTxid", default)]
     spending_txid: Option<String>,
@@ -1721,7 +1721,7 @@ struct DecodedPotRowD1 {
 impl DecodedPotRowD1 {
     /// Strict column reconstruction of the committed params (length/hex
     /// validated) — `None` falls back to the BLOB path, never a shortcut.
-    fn covenant_params(&self) -> Option<crate::results::CovenantParams> {
+    pub(crate) fn covenant_params(&self) -> Option<crate::results::CovenantParams> {
         if self.lock_kind.as_deref() != Some("covenant") {
             return None;
         }
@@ -1991,7 +1991,7 @@ async fn classify_spent_pots(
 
 /// `potparty_records` v2 row for the #230 attribution join.
 #[derive(Deserialize)]
-struct SeatMarkerRowD1 {
+pub(crate) struct SeatMarkerRowD1 {
     identity: String,
     #[serde(rename = "opponentIdentity")]
     opponent_identity: String,
@@ -2336,18 +2336,22 @@ pub(crate) async fn internal_pot_changed(
             .await;
         });
     }
-    // E649 L4: the hook is a WRITE. Its answer path is the seam's D1 batches alone (`pot_hook::apply_pot_changed`):
-    // the attribution read, the stale marks. The pots-room announce of every parsed outpoint (loop 10 D2) and the
-    // attributed seats' `pot` events run AFTER the answer, under one wall, counted; no `/results` gather.
-    let db = env.d1("OVERLAY_DB")?;
+    // E649 L4: the hook is a WRITE. Its answer path is `pot_hook::serve_pot_changed` over the D1 port alone; the
+    // pots-room announce of every parsed outpoint (loop 10 D2) and the attributed seats' `pot` events are handed to
+    // `ctx.wait_until` under one wall, counted; no `/results` gather.
+    let store = std::rc::Rc::new(crate::pot_hook::HookD1 {
+        sql: D1Sql::of(env)?,
+    });
+    let relay = std::rc::Rc::new(crate::pot_hook::WorkerRelay { env: env.clone() });
+    let wall = worker::Delay::from(core::time::Duration::from_millis(
+        crate::pot_hook::ANNOUNCE_WALL_MS,
+    ));
+    let detach = |f: crate::pot_hook::Detached| ctx.wait_until(f);
     let outcome =
-        crate::pot_hook::apply_pot_changed(&D1HookStore { db: &db }, &outpoints, t0).await;
+        crate::pot_hook::serve_pot_changed(store, relay, wall, &detach, &outpoints, t0).await;
     if let Some(e) = &outcome.stale_fault {
         console_warn!("[owed] stale mark (pot-changed) failed: {e}");
     }
-    let env_announce = env.clone();
-    let plan = outcome.plan.clone();
-    ctx.wait_until(async move { crate::pot_hook::announce_detached(env_announce, plan).await });
     // bsv-low #469 (the gate's MEDIUM-11): the owed recompute runs AFTER this answer (`wait_until`), once per identity
     // this call attributed, never inline and never per outpoint × identity; #648 sheds it per identity.
     let owed_identities = outcome.owed_identities.clone();
@@ -2379,133 +2383,71 @@ pub(crate) async fn internal_pot_changed(
     Ok(resp)
 }
 
-/// E649 L4: the hooks' D1 port. Each method is ONE `counted_batch` round trip (the seat markers a second one,
-/// over the pots the first decoded), never a statement per outpoint or per identity.
-///
-/// The marker arms (they were `owed_identities_by_marker`, a statement each, per outpoint): the identities the
-/// seats' OWN markers name for an outpoint. A POT event is answered by the party arm and the refund-backup arm
-/// (both keyed by the pot); a released-HOP event by the hop arm (keyed by the hop container's outpoint, which never
-/// matches a pot). An arm that cannot match its event is one indexed empty read. A faulted arm names nobody (the
-/// cadence re-derives).
-pub(crate) struct D1HookStore<'a> {
-    pub(crate) db: &'a worker::D1Database,
+/// E649 L4: the hooks' SQL port over D1 (`pot_hook::HookD1` holds the statements): one `batch` is one
+/// `counted_batch` round trip; the counters ride `courier::flush`.
+pub(crate) struct D1Sql {
+    pub(crate) db: worker::D1Database,
+    pub(crate) env: worker::Env,
 }
 
-#[derive(Deserialize)]
-struct IdentityOnlyD1 {
-    identity: String,
+impl D1Sql {
+    pub(crate) fn of(env: &worker::Env) -> Result<Self> {
+        Ok(D1Sql {
+            db: env.d1("OVERLAY_DB")?,
+            env: env.clone(),
+        })
+    }
 }
 
-impl crate::pot_hook::HookStore for D1HookStore<'_> {
-    async fn read_outpoints(&self, outpoints: &[(String, u32)]) -> Vec<crate::pot_hook::OutpointRead> {
-        use crate::pot_hook::OutpointRead;
-        const ARMS: [&str; 3] = [
-            crate::owed::OWED_ATTRIBUTE_BY_POT_SQL,
-            crate::owed::OWED_ATTRIBUTE_BY_HOP_SQL,
-            crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL,
-        ];
-        let failed_all = |e: String| -> Vec<OutpointRead> {
-            outpoints.iter().map(|_| OutpointRead::Failed(e.clone())).collect()
-        };
-        // (1) ONE batch: per outpoint, its decoded row and the three marker arms.
-        let decoded_sql = crate::results::decoded_pots_sql(1);
-        let mut stmts = Vec::with_capacity(outpoints.len() * (1 + ARMS.len()));
-        for (txid, vout) in outpoints {
-            let binds = [JsValue::from_str(txid), JsValue::from_f64(f64::from(*vout))];
-            for sql in std::iter::once(decoded_sql.as_str()).chain(ARMS) {
-                match self.db.prepare(sql).bind(&binds) {
-                    Ok(s) => stmts.push(s),
-                    Err(e) => return failed_all(format!("bind: {e}")),
-                }
-            }
+impl crate::pot_hook::SqlPort for D1Sql {
+    async fn run_batch(
+        &self,
+        stmts: Vec<crate::pot_hook::Stmt>,
+    ) -> std::result::Result<Vec<crate::pot_hook::StmtOut>, String> {
+        use crate::pot_hook::Bind;
+        if stmts.is_empty() {
+            return Ok(Vec::new());
         }
-        let results = match crate::d1_ledger::counted_batch(self.db, stmts).await {
-            Ok(r) => r,
-            Err(e) => {
-                console_warn!("[pot-changed] attribution batch failed: {e}");
-                return failed_all(e.to_string());
-            }
-        };
-        let per = 1 + ARMS.len();
-        let mut decoded: Vec<std::result::Result<Option<crate::results::CovenantParams>, String>> =
-            Vec::with_capacity(outpoints.len());
-        let mut named: Vec<Vec<String>> = Vec::with_capacity(outpoints.len());
-        for (i, (txid, vout)) in outpoints.iter().enumerate() {
-            let group = &results[i * per..(i + 1) * per];
-            decoded.push(
-                group[0]
-                    .results::<DecodedPotRowD1>()
-                    .map(|rows| rows.first().and_then(|r| r.covenant_params()))
-                    .map_err(|e| e.to_string()),
+        let mut prepared = Vec::with_capacity(stmts.len());
+        for st in stmts {
+            let binds: Vec<JsValue> = st
+                .binds
+                .iter()
+                .map(|b| match b {
+                    Bind::Text(t) => JsValue::from_str(t),
+                    Bind::Int(n) => JsValue::from_f64(*n as f64),
+                    Bind::Null => JsValue::NULL,
+                })
+                .collect();
+            prepared.push(
+                self.db
+                    .prepare(st.sql)
+                    .bind(&binds)
+                    .map_err(|e| format!("bind: {e}"))?,
             );
-            let mut ids: Vec<String> = Vec::new();
-            for r in &group[1..] {
-                match r.results::<IdentityOnlyD1>() {
-                    Ok(rows) => {
-                        for row in rows {
-                            let id = row.identity.to_ascii_lowercase();
-                            if !ids.contains(&id) {
-                                ids.push(id);
-                            }
-                        }
-                    }
-                    Err(e) => console_warn!(
-                        "[pot-changed] marker attribution read failed for {txid}:{vout}: {e}"
-                    ),
-                }
-            }
-            named.push(ids);
         }
-        // (2) ONE batch: the decoded pots' seat markers, then `attribute_seats` per pot.
-        let mut params_by_pot = std::collections::HashMap::new();
-        for ((txid, vout), d) in outpoints.iter().zip(&decoded) {
-            if let Ok(Some(p)) = d {
-                params_by_pot.insert((txid.clone(), *vout), p.clone());
-            }
-        }
-        let markers = results_seat_markers_batched(self.db, &params_by_pot).await;
-        outpoints
-            .iter()
-            .zip(decoded)
-            .zip(named)
-            .map(|(((txid, vout), d), marker_named)| match d {
-                Err(e) => OutpointRead::Failed(e),
-                Ok(None) => OutpointRead::NoParams { marker_named },
-                Ok(Some(params)) => {
-                    let key = (txid.clone(), *vout);
-                    let attr = crate::results::attribute_seats(
-                        &params,
-                        txid,
-                        *vout,
-                        markers.get(&key).map(Vec::as_slice).unwrap_or(&[]),
-                    );
-                    let seats = [attr.identity_a, attr.identity_b]
-                        .into_iter()
-                        .flatten()
-                        .map(|s| s.to_ascii_lowercase())
-                        .collect();
-                    OutpointRead::Decoded { seats, marker_named }
-                }
+        let results = crate::d1_ledger::counted_batch(&self.db, prepared)
+            .await
+            .map_err(|e| e.to_string())?;
+        results
+            .into_iter()
+            .map(|r| {
+                let rows = r
+                    .results::<serde_json::Value>()
+                    .map_err(|e| e.to_string())?;
+                let changes = r.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) as u64;
+                Ok(crate::pot_hook::StmtOut { rows, changes })
             })
             .collect()
     }
-
-    async fn mark_stale(&self, marks: &[(String, &'static str)]) -> std::result::Result<(), String> {
-        let mut stmts = Vec::with_capacity(marks.len());
-        for (id, what) in marks {
-            match self
-                .db
-                .prepare(crate::owed::OWED_STALE_FOR_IDENTITY_SQL)
-                .bind(&[JsValue::from_str(id)])
-            {
-                Ok(s) => stmts.push(s),
-                Err(e) => return Err(format!("stale mark ({what}) bind failed: {e}")),
-            }
-        }
-        crate::d1_ledger::counted_batch(self.db, stmts)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+    async fn counters(&self, deltas: Vec<(String, u64)>) {
+        crate::courier::flush(self.env.d1("OVERLAY_DB").ok(), deltas).await;
+    }
+    fn now_ms(&self) -> u64 {
+        worker::Date::now().as_millis()
+    }
+    fn log(&self, line: &str) {
+        worker::console_log!("{line}");
     }
 }
 
@@ -2549,8 +2491,10 @@ pub(crate) async fn internal_hop_changed(
             .await;
         });
     }
-    let db = env.d1("OVERLAY_DB")?;
-    if let Err(e) = crate::pot_hook::apply_hop_changed(&D1HookStore { db: &db }, &identities).await {
+    let store = crate::pot_hook::HookD1 {
+        sql: D1Sql::of(env)?,
+    };
+    if let Err(e) = crate::pot_hook::apply_hop_changed(&store, &identities).await {
         console_warn!("[owed] stale mark (hop-changed) failed: {e}");
     }
     let env2 = env.clone();
@@ -5762,7 +5706,7 @@ async fn results_seat_markers(
 
 /// The verified seat-marker rows of a fetched page into the per-pot map (shared by the per-chunk read and the hooks'
 /// batched one).
-fn note_seat_marker_rows(
+pub(crate) fn note_seat_marker_rows(
     out: &mut std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>>,
     fetched: Vec<SeatMarkerRowD1>,
 ) {
@@ -5787,46 +5731,6 @@ fn note_seat_marker_rows(
                 sig_valid: r.sig_valid.map(|v| v != 0.0),
             });
     }
-}
-
-/// E649 L4: [`results_seat_markers`] as ONE `counted_batch` of its chunks (the hooks' second round trip).
-async fn results_seat_markers_batched(
-    db: &worker::D1Database,
-    params_by_pot: &std::collections::HashMap<(String, u32), crate::results::CovenantParams>,
-) -> std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>> {
-    let mut out = std::collections::HashMap::new();
-    let mut stmts = Vec::new();
-    for chunk in crate::results::seat_marker_chunks(params_by_pot) {
-        let sql =
-            crate::results::seat_markers_sql(chunk.len(), crate::results::SEAT_MARKERS_PER_KEY);
-        let mut binds: Vec<JsValue> =
-            Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
-        for b in &chunk {
-            binds.push(JsValue::from_str(&b.pot_txid));
-            binds.push(JsValue::from_f64(f64::from(b.pot_vout)));
-            binds.push(JsValue::from_str(&b.pub_a_hex));
-            binds.push(JsValue::from_str(&b.pub_b_hex));
-        }
-        match db.prepare(sql).bind(&binds) {
-            Ok(s) => stmts.push(s),
-            Err(e) => console_warn!("[pot-changed] seat-marker bind failed (chunk omitted): {e}"),
-        }
-    }
-    if stmts.is_empty() {
-        return out;
-    }
-    match crate::d1_ledger::counted_batch(db, stmts).await {
-        Ok(results) => {
-            for r in results {
-                match r.results::<SeatMarkerRowD1>() {
-                    Ok(fetched) => note_seat_marker_rows(&mut out, fetched),
-                    Err(e) => console_warn!("[pot-changed] seat-marker rows unreadable (attribution partial): {e}"),
-                }
-            }
-        }
-        Err(e) => console_warn!("[pot-changed] seat-marker batch failed (attribution partial): {e}"),
-    }
-    out
 }
 
 // ── /refund-view — per-identity refund status (bsv-low #252 stage 2a) ───────

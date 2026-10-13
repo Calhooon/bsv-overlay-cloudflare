@@ -52,15 +52,241 @@ pub enum OutpointRead {
     },
 }
 
-/// The D1 side of the hooks. Each method is ONE round trip of batched statements (the worker's runs
-/// `counted_batch`), never a statement per outpoint or per identity.
+/// One bound value of a [`Stmt`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Bind {
+    Text(String),
+    Int(i64),
+    Null,
+}
+
+/// One statement of a batch: the SQL and its binds, in `?N` order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stmt {
+    pub sql: String,
+    pub binds: Vec<Bind>,
+}
+
+impl Stmt {
+    fn new(sql: impl Into<String>, binds: Vec<Bind>) -> Self {
+        Stmt {
+            sql: sql.into(),
+            binds,
+        }
+    }
+}
+
+/// What one statement of a batch answered: its rows (JSON objects by column name) and the rows it changed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StmtOut {
+    pub rows: Vec<Value>,
+    pub changes: u64,
+}
+
+/// The SQL under [`HookD1`]: ONE `batch` is one D1 round trip (the worker's `D1Sql` runs `counted_batch`), atomic
+/// as D1's is (one statement that faults fails the batch). The native pins run the same statements over real
+/// SQLite with the overlay's migrations.
+#[allow(async_fn_in_trait)]
+pub trait SqlPort {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String>;
+    /// Add counter deltas (`ops_counters`), best effort.
+    async fn counters(&self, deltas: Vec<(String, u64)>);
+    fn now_ms(&self) -> u64;
+    fn log(&self, line: &str);
+}
+
+/// The D1 side of the hooks. The worker's is [`HookD1`] over `routes::D1Sql`.
 #[allow(async_fn_in_trait)]
 pub trait HookStore {
-    /// Every outpoint's decoded row and marker arms (one batch), then the decoded pots' seat markers (one batch).
-    /// The answer is in the order of `outpoints`.
+    /// Every outpoint's attribution, in the order of `outpoints`.
     async fn read_outpoints(&self, outpoints: &[(String, u32)]) -> Vec<OutpointRead>;
     /// Every stale mark of the body, in ONE batch. `Err` is logged by the caller; the recompute still runs.
     async fn mark_stale(&self, marks: &[(String, &'static str)]) -> Result<(), String>;
+    async fn counters(&self, deltas: Vec<(String, u64)>);
+    fn now_ms(&self) -> u64;
+    fn log(&self, line: &str);
+}
+
+/// The marker arms (they were `owed_identities_by_marker`, a statement each, per outpoint): the identities the
+/// seats' OWN markers name for an outpoint. A POT event is answered by the party arm and the refund-backup arm
+/// (both keyed by the pot); a released-HOP event by the hop arm (keyed by the hop container's outpoint, which never
+/// matches a pot).
+pub const MARKER_ARMS: [(&str, &str); 3] = [
+    ("pot", crate::owed::OWED_ATTRIBUTE_BY_POT_SQL),
+    ("hop", crate::owed::OWED_ATTRIBUTE_BY_HOP_SQL),
+    ("potrefund", crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL),
+];
+
+/// The hooks' D1 store: the shipped statements over a [`SqlPort`].
+pub struct HookD1<P: SqlPort> {
+    pub sql: P,
+}
+
+fn identity_rows(rows: &[Value], ids: &mut Vec<String>) {
+    for r in rows {
+        if let Some(id) = r.get("identity").and_then(Value::as_str) {
+            push_unique(ids, &id.to_ascii_lowercase());
+        }
+    }
+}
+
+fn decoded_of(out: &StmtOut) -> Result<Option<crate::results::CovenantParams>, String> {
+    match out.rows.first() {
+        None => Ok(None),
+        Some(row) => serde_json::from_value::<crate::routes::DecodedPotRowD1>(row.clone())
+            .map(|r| r.covenant_params())
+            .map_err(|e| e.to_string()),
+    }
+}
+
+impl<P: SqlPort> HookD1<P> {
+    /// The decoded pots' verified seat markers, ONE batch of its chunks. A fault leaves the attribution partial.
+    async fn seat_markers(
+        &self,
+        params_by_pot: &std::collections::HashMap<(String, u32), crate::results::CovenantParams>,
+    ) -> std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>> {
+        let mut out = std::collections::HashMap::new();
+        let mut stmts = Vec::new();
+        for chunk in crate::results::seat_marker_chunks(params_by_pot) {
+            let sql =
+                crate::results::seat_markers_sql(chunk.len(), crate::results::SEAT_MARKERS_PER_KEY);
+            let mut binds =
+                Vec::with_capacity(chunk.len() * crate::results::SEAT_MARKERS_BINDS_PER_POT);
+            for b in &chunk {
+                binds.push(Bind::Text(b.pot_txid.clone()));
+                binds.push(Bind::Int(i64::from(b.pot_vout)));
+                binds.push(Bind::Text(b.pub_a_hex.clone()));
+                binds.push(Bind::Text(b.pub_b_hex.clone()));
+            }
+            stmts.push(Stmt::new(sql, binds));
+        }
+        if stmts.is_empty() {
+            return out;
+        }
+        match self.sql.run_batch(stmts).await {
+            Ok(results) => {
+                for r in results {
+                    let rows: Result<Vec<crate::routes::SeatMarkerRowD1>, _> =
+                        r.rows.into_iter().map(serde_json::from_value).collect();
+                    match rows {
+                        Ok(fetched) => crate::routes::note_seat_marker_rows(&mut out, fetched),
+                        Err(e) => self.sql.log(&format!(
+                            "[pot-changed] seat-marker rows unreadable (attribution partial): {e}"
+                        )),
+                    }
+                }
+            }
+            Err(e) => self.sql.log(&format!(
+                "[pot-changed] seat-marker batch failed (attribution partial): {e}"
+            )),
+        }
+        out
+    }
+}
+
+impl<P: SqlPort> HookStore for HookD1<P> {
+    async fn read_outpoints(&self, outpoints: &[(String, u32)]) -> Vec<OutpointRead> {
+        let failed_all = |e: String| -> Vec<OutpointRead> {
+            outpoints
+                .iter()
+                .map(|_| OutpointRead::Failed(e.clone()))
+                .collect()
+        };
+        // (1) ONE batch: per outpoint, its decoded row and the three marker arms.
+        let decoded_sql = crate::results::decoded_pots_sql(1);
+        let per = 1 + MARKER_ARMS.len();
+        let mut stmts = Vec::with_capacity(outpoints.len() * per);
+        for (txid, vout) in outpoints {
+            let binds = vec![Bind::Text(txid.clone()), Bind::Int(i64::from(*vout))];
+            stmts.push(Stmt::new(decoded_sql.clone(), binds.clone()));
+            for (_, sql) in MARKER_ARMS {
+                stmts.push(Stmt::new(sql, binds.clone()));
+            }
+        }
+        let results = match self.sql.run_batch(stmts).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.sql
+                    .log(&format!("[pot-changed] attribution batch failed: {e}"));
+                return failed_all(e);
+            }
+        };
+        let mut decoded = Vec::with_capacity(outpoints.len());
+        let mut named: Vec<Vec<String>> = Vec::with_capacity(outpoints.len());
+        for i in 0..outpoints.len() {
+            let group = &results[i * per..(i + 1) * per];
+            decoded.push(decoded_of(&group[0]));
+            let mut ids = Vec::new();
+            for r in &group[1..] {
+                identity_rows(&r.rows, &mut ids);
+            }
+            named.push(ids);
+        }
+        // (2) ONE batch: the decoded pots' seat markers, then `attribute_seats` per pot.
+        let mut params_by_pot = std::collections::HashMap::new();
+        for ((txid, vout), d) in outpoints.iter().zip(&decoded) {
+            if let Ok(Some(p)) = d {
+                params_by_pot.insert((txid.clone(), *vout), p.clone());
+            }
+        }
+        let markers = self.seat_markers(&params_by_pot).await;
+        outpoints
+            .iter()
+            .zip(decoded)
+            .zip(named)
+            .map(|(((txid, vout), d), marker_named)| match d {
+                Err(e) => OutpointRead::Failed(e),
+                Ok(None) => OutpointRead::NoParams { marker_named },
+                Ok(Some(params)) => OutpointRead::Decoded {
+                    seats: seats_of(&params, txid, *vout, &markers),
+                    marker_named,
+                },
+            })
+            .collect()
+    }
+
+    async fn mark_stale(&self, marks: &[(String, &'static str)]) -> Result<(), String> {
+        let stmts = marks
+            .iter()
+            .map(|(id, _)| {
+                Stmt::new(
+                    crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
+                    vec![Bind::Text(id.clone())],
+                )
+            })
+            .collect();
+        self.sql.run_batch(stmts).await.map(|_| ())
+    }
+
+    async fn counters(&self, deltas: Vec<(String, u64)>) {
+        self.sql.counters(deltas).await
+    }
+    fn now_ms(&self) -> u64 {
+        self.sql.now_ms()
+    }
+    fn log(&self, line: &str) {
+        self.sql.log(line)
+    }
+}
+
+fn seats_of(
+    params: &crate::results::CovenantParams,
+    txid: &str,
+    vout: u32,
+    markers: &std::collections::HashMap<(String, u32), Vec<crate::results::SeatMarkerRow>>,
+) -> Vec<String> {
+    let key = (txid.to_ascii_lowercase(), vout);
+    let attr = crate::results::attribute_seats(
+        params,
+        txid,
+        vout,
+        markers.get(&key).map(Vec::as_slice).unwrap_or(&[]),
+    );
+    [attr.identity_a, attr.identity_b]
+        .into_iter()
+        .flatten()
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
 }
 
 /// The relay side of the detached announce.
@@ -266,25 +492,32 @@ pub async fn announce<R: RelayPort, W: Future<Output = ()>>(
 }
 
 /// The worker's relay: the `RELAY` binding through `internal_events`.
-pub struct WorkerRelay<'a> {
-    pub env: &'a worker::Env,
+pub struct WorkerRelay {
+    pub env: worker::Env,
 }
 
-impl RelayPort for WorkerRelay<'_> {
+impl RelayPort for WorkerRelay {
     async fn broadcast(&self, room: &'static str, body: Value) -> Delivery {
-        crate::internal_events::push_broadcast(self.env, room, body).await
+        crate::internal_events::push_broadcast(&self.env, room, body).await
     }
     async fn push(&self, recipient: &str, body: Value) -> Delivery {
-        crate::internal_events::first_party_push(self.env, recipient, body).await
+        crate::internal_events::first_party_push(&self.env, recipient, body).await
     }
 }
 
-/// The handler's `wait_until` body: the announce under the wall, its log line and its counters.
-pub async fn announce_detached(env: worker::Env, plan: AnnouncePlan) {
-    let t0 = worker::Date::now().as_millis();
-    let wall = worker::Delay::from(core::time::Duration::from_millis(ANNOUNCE_WALL_MS));
-    let t = announce(&WorkerRelay { env: &env }, &plan, wall).await;
-    worker::console_log!(
+/// One unit of work handed past the answer (the worker's is `ctx.wait_until`).
+pub type Detached = std::pin::Pin<Box<dyn Future<Output = ()>>>;
+
+/// The detached announce of one body: the announce under the wall, its log line and its counters.
+pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
+    store: &S,
+    relay: &R,
+    plan: &AnnouncePlan,
+    wall: W,
+) -> AnnounceTally {
+    let t0 = store.now_ms();
+    let t = announce(relay, plan, wall).await;
+    store.log(&format!(
         "[pot-changed] announce: {} outpoint(s), {} seat event(s): sent={} skipped={} failed={}{} in {} ms",
         plan.outpoints.len(),
         plan.seat_events.len(),
@@ -292,12 +525,38 @@ pub async fn announce_detached(env: worker::Env, plan: AnnouncePlan) {
         t.skipped,
         t.failed,
         if t.walled { " (WALL)" } else { "" },
-        worker::Date::now().as_millis().saturating_sub(t0)
-    );
+        store.now_ms().saturating_sub(t0)
+    ));
     let counters = t.counters();
     if !counters.is_empty() {
-        crate::courier::flush(env.d1("OVERLAY_DB").ok(), counters).await;
+        store.counters(counters).await;
     }
+    t
+}
+
+/// THE POT HOOK, after its bearer and its parse: the decision over the store ([`apply_pot_changed`]), then the
+/// announce handed to `detach` (never awaited here), then the outcome the answer is built from. The worker's
+/// `routes::internal_pot_changed` calls it with `HookD1` over D1, the `RELAY` binding and `ctx.wait_until`; the
+/// pins call it with the same store over SQLite and a recording `detach`.
+pub async fn serve_pot_changed<S, R, W>(
+    store: std::rc::Rc<S>,
+    relay: std::rc::Rc<R>,
+    wall: W,
+    detach: &dyn Fn(Detached),
+    outpoints: &[(String, u32)],
+    at_ms: u64,
+) -> PotChangedOutcome
+where
+    S: HookStore + 'static,
+    R: RelayPort + 'static,
+    W: Future<Output = ()> + 'static,
+{
+    let outcome = apply_pot_changed(&*store, outpoints, at_ms).await;
+    let plan = outcome.plan.clone();
+    detach(Box::pin(async move {
+        announce_and_report(&*store, &*relay, &plan, wall).await;
+    }));
+    outcome
 }
 
 /// The `Server-Timing` segment of a hook's answer.
@@ -306,7 +565,7 @@ pub fn hook_timing(ms: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
@@ -335,66 +594,216 @@ mod tests {
     }
 
     const A: &str = "02a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
-    const B: &str = "02b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
-    const C: &str = "03c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
 
     fn op(i: u32) -> (String, u32) {
         (format!("{i:064x}"), i % 3)
     }
 
-    /// The D1 port as a model: its answers set per outpoint, its round trips counted.
-    #[derive(Default)]
-    struct ModelStore {
-        reads: Vec<OutpointRead>,
-        read_calls: Cell<u32>,
-        mark_calls: Cell<u32>,
-        marked: RefCell<Vec<(String, &'static str)>>,
-        mark_fault: bool,
+    /// THE REAL STORE'S SQL over real SQLite: the overlay's production migrations, a batch atomic as D1's (one
+    /// statement that faults rolls the batch back and fails it), every batch and statement counted, the clock
+    /// settable, the counters and the log lines kept.
+    pub(crate) struct SqliteSql {
+        pub conn: rusqlite::Connection,
+        pub batches: Cell<u32>,
+        pub stmts: Cell<u32>,
+        pub now: Cell<u64>,
+        pub counted: RefCell<Vec<(String, u64)>>,
+        pub lines: RefCell<Vec<String>>,
     }
-    impl HookStore for ModelStore {
-        async fn read_outpoints(&self, outpoints: &[(String, u32)]) -> Vec<OutpointRead> {
-            self.read_calls.set(self.read_calls.get() + 1);
-            assert_eq!(outpoints.len(), self.reads.len());
-            self.reads.clone()
-        }
-        async fn mark_stale(&self, marks: &[(String, &'static str)]) -> Result<(), String> {
-            self.mark_calls.set(self.mark_calls.get() + 1);
-            self.marked.borrow_mut().extend(marks.iter().cloned());
-            if self.mark_fault {
-                Err("D1 down".into())
-            } else {
-                Ok(())
+
+    impl SqliteSql {
+        pub(crate) fn migrated() -> Self {
+            let conn = rusqlite::Connection::open_in_memory().expect("sqlite");
+            for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+                if let Err(e) = conn.execute_batch(sql) {
+                    assert!(
+                        e.to_string()
+                            .to_ascii_lowercase()
+                            .contains("duplicate column"),
+                        "production migration failed under real SQLite: {e}\n{sql}"
+                    );
+                }
             }
+            SqliteSql {
+                conn,
+                batches: Cell::new(0),
+                stmts: Cell::new(0),
+                now: Cell::new(1_000_000),
+                counted: RefCell::default(),
+                lines: RefCell::default(),
+            }
+        }
+        pub(crate) fn counter(&self, name: &str) -> u64 {
+            self.counted
+                .borrow()
+                .iter()
+                .filter(|(k, _)| k == name)
+                .map(|(_, n)| n)
+                .sum()
+        }
+        fn run(&self, st: &Stmt) -> Result<StmtOut, String> {
+            let binds: Vec<rusqlite::types::Value> = st
+                .binds
+                .iter()
+                .map(|b| match b {
+                    Bind::Text(t) => rusqlite::types::Value::Text(t.clone()),
+                    Bind::Int(n) => rusqlite::types::Value::Integer(*n),
+                    Bind::Null => rusqlite::types::Value::Null,
+                })
+                .collect();
+            let mut q = self.conn.prepare(&st.sql).map_err(|e| e.to_string())?;
+            let cols: Vec<String> = q.column_names().iter().map(|c| c.to_string()).collect();
+            let mut rows = Vec::new();
+            {
+                let mut it = q
+                    .query(rusqlite::params_from_iter(binds.iter()))
+                    .map_err(|e| e.to_string())?;
+                while let Some(r) = it.next().map_err(|e| e.to_string())? {
+                    let mut m = serde_json::Map::new();
+                    for (k, c) in cols.iter().enumerate() {
+                        let v = match r.get_ref(k).map_err(|e| e.to_string())? {
+                            rusqlite::types::ValueRef::Null => Value::Null,
+                            rusqlite::types::ValueRef::Integer(n) => json!(n),
+                            rusqlite::types::ValueRef::Real(f) => json!(f),
+                            rusqlite::types::ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+                            rusqlite::types::ValueRef::Blob(b) => json!(hex::encode(b)),
+                        };
+                        m.insert(c.clone(), v);
+                    }
+                    rows.push(Value::Object(m));
+                }
+            }
+            Ok(StmtOut {
+                rows,
+                changes: self.conn.changes(),
+            })
         }
     }
 
-    /// The relay as a fake: every call sleeps `delay`, then answers `answer`; calls started and answered counted.
-    struct SlowRelay {
-        delay: Duration,
-        answer: Delivery,
-        started: Rc<Cell<u32>>,
-        answered_at: Rc<RefCell<Vec<Instant>>>,
-        rooms: Rc<RefCell<Vec<(String, Value)>>>,
+    impl SqlPort for SqliteSql {
+        async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+            if stmts.is_empty() {
+                return Ok(Vec::new());
+            }
+            self.batches.set(self.batches.get() + 1);
+            self.stmts.set(self.stmts.get() + stmts.len() as u32);
+            self.conn.execute_batch("BEGIN").unwrap();
+            let mut out = Vec::with_capacity(stmts.len());
+            for st in &stmts {
+                match self.run(st) {
+                    Ok(o) => out.push(o),
+                    Err(e) => {
+                        self.conn.execute_batch("ROLLBACK").unwrap();
+                        return Err(e);
+                    }
+                }
+            }
+            self.conn.execute_batch("COMMIT").unwrap();
+            Ok(out)
+        }
+        async fn counters(&self, deltas: Vec<(String, u64)>) {
+            self.counted.borrow_mut().extend(deltas);
+        }
+        fn now_ms(&self) -> u64 {
+            self.now.get()
+        }
+        fn log(&self, line: &str) {
+            self.lines.borrow_mut().push(line.to_string());
+        }
     }
-    impl SlowRelay {
-        fn new(delay: Duration, answer: Delivery) -> Self {
-            SlowRelay {
-                delay,
-                answer,
-                started: Rc::default(),
-                answered_at: Rc::default(),
-                rooms: Rc::default(),
+
+    /// A seat identity (and its settle key: the fixture's keys are the identities, as the budget seed's are).
+    fn seat(side: u8, i: u32) -> String {
+        format!("0{side}{}", format!("{:02x}", 0x10 + i).repeat(32))
+    }
+    fn pot(i: u32) -> (String, u32) {
+        (format!("e{i:063x}"), 0)
+    }
+    const MARKER_POT: &str = "f0000000000000000000000000000000000000000000000000000000000000ff";
+    fn marker_seat(k: u32) -> String {
+        format!("02{}", format!("{:02x}", 0xc0 + k).repeat(32))
+    }
+
+    /// THE FLEET-SHAPED BODY of the review's H2 (8 outpoints, 19 identities): seven decoded pots with two verified
+    /// (latched) seats each, one undecoded pot whose party AND refund-backup markers name five identities; every
+    /// identity holds an owed-state row.
+    pub(crate) fn mixed_fixture() -> (SqliteSql, Vec<(String, u32)>) {
+        let db = SqliteSql::migrated();
+        let mut sql = Vec::new();
+        for i in 0..7 {
+            let (txid, _) = pot(i);
+            let (a, b) = (seat(2, i), seat(3, i));
+            sql.push(format!(
+                "INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind, paramsDecoded, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, stakeA, stakeB, feeSats, recoveryHeight, potSats) \
+                 VALUES ('{txid}', 0, 0, 1, 'covenant', 1, '{a}', '{b}', '{A}', '{}', '{}', '{}', 1, 1, 1, 958846, 2)",
+                "11".repeat(20), "22".repeat(20), "33".repeat(20)
+            ));
+            for (k, (me, them)) in [(&a, &b), (&b, &a)].into_iter().enumerate() {
+                sql.push(format!(
+                    "INSERT INTO potparty_records (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, sigHex, txid, outputIndex, createdAt, seatSettlePubkey, seatSigHex, sigValid) \
+                     VALUES ('{me}', '{them}', 'g{i}', '{txid}', 0, 958846, '3045ab', 'd{k}{i:062x}', 0, 1, '{me}', '00', 1)"
+                ));
             }
         }
+        sql.push(format!("INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES ('{MARKER_POT}', 0, 0, 1)"));
+        for k in 0..5 {
+            let me = marker_seat(k);
+            sql.push(format!(
+                "INSERT INTO potparty_records (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, sigHex, txid, outputIndex, createdAt) \
+                 VALUES ('{me}', 'x', 'gm', '{MARKER_POT}', 0, 958846, '3045ab', 'c{k}{:062x}', 0, 1)", 0
+            ));
+            sql.push(format!(
+                "INSERT INTO potrefund_records (potTxid, potVout, gameId, identity, refundRawHex, sigHex, txid, outputIndex, createdAt) \
+                 VALUES ('{MARKER_POT}', 0, 'gm', '{me}', '00', '3045ab', 'b{k}{:062x}', 0, 1)", 0
+            ));
+        }
+        let mut ids: Vec<String> = (0..7).flat_map(|i| [seat(2, i), seat(3, i)]).collect();
+        ids.extend((0..5).map(marker_seat));
+        for id in &ids {
+            sql.push(format!(
+                "INSERT INTO owed_state (identity, computedAtMs, tip, rows, stale, truncated) VALUES ('{id}', 1, 1, 0, 0, 0)"
+            ));
+        }
+        for q in sql {
+            db.conn
+                .execute_batch(&q)
+                .unwrap_or_else(|e| panic!("{e}: {q}"));
+        }
+        let mut ops: Vec<(String, u32)> = (0..7).map(pot).collect();
+        ops.push((MARKER_POT.to_string(), 0));
+        (db, ops)
+    }
+
+    /// The relay as a fake: every call answers `Sent` after 10 ms, except a call naming a `hung` txid, which sleeps
+    /// 40 s; each call's start and delivery recorded with its target.
+    #[derive(Default)]
+    pub(crate) struct Relay {
+        pub hung: Vec<String>,
+        pub started: Cell<u32>,
+        pub delivered: RefCell<Vec<(String, String, Instant)>>,
+    }
+    impl Relay {
         async fn call(&self, to: String, body: Value) -> Delivery {
             self.started.set(self.started.get() + 1);
-            tokio::time::sleep(self.delay).await;
-            self.answered_at.borrow_mut().push(Instant::now());
-            self.rooms.borrow_mut().push((to, body));
-            self.answer
+            let txid = body["potOutpoint"]["txid"]
+                .as_str()
+                .or(body["outpoint"]["txid"].as_str())
+                .or(body["txid"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            let slow =
+                self.hung.contains(&txid) && to == crate::internal_events::POTS_ROOM;
+            tokio::time::sleep(if slow {
+                Duration::from_secs(40)
+            } else {
+                Duration::from_millis(10)
+            })
+            .await;
+            self.delivered.borrow_mut().push((to, txid, Instant::now()));
+            Delivery::Sent
         }
     }
-    impl RelayPort for SlowRelay {
+    impl RelayPort for Relay {
         async fn broadcast(&self, room: &'static str, body: Value) -> Delivery {
             self.call(room.to_string(), body).await
         }
@@ -403,254 +812,136 @@ mod tests {
         }
     }
 
-    fn attributed(n: u32) -> ModelStore {
-        ModelStore {
-            reads: (0..n)
-                .map(|_| OutpointRead::Decoded {
-                    seats: vec![A.into(), B.into()],
-                    marker_named: vec![],
-                })
-                .collect(),
-            ..ModelStore::default()
+    /// A recording Worker context: what the handler hands to `wait_until`, kept unpolled until the test runs it.
+    #[derive(Default)]
+    pub(crate) struct Recorded(pub RefCell<Vec<Detached>>);
+    impl Recorded {
+        pub(crate) async fn run_all(&self) {
+            let all: Vec<Detached> = self.0.borrow_mut().drain(..).collect();
+            futures_util::future::join_all(all).await;
         }
     }
 
-    /// What the handler does, in its order, with the worker's `ctx.wait_until` as a `spawn_local`: the seam, then
-    /// the detached announce handed off, then the answer. Returns the time to the answer and the detached task.
-    async fn serve(
-        store: &ModelStore,
-        relay: Rc<SlowRelay>,
-        outpoints: &[(String, u32)],
-        wall: Duration,
-    ) -> (
-        Duration,
-        PotChangedOutcome,
-        tokio::task::JoinHandle<AnnounceTally>,
-    ) {
-        let t0 = Instant::now();
-        let outcome = apply_pot_changed(store, outpoints, 1).await;
-        let plan = outcome.plan.clone();
-        let detached = tokio::task::spawn_local(async move {
-            announce(&*relay, &plan, tokio::time::sleep(wall)).await
-        });
-        (t0.elapsed(), outcome, detached)
-    }
-
-    /// (a) THE HANDLER AWAITS NO RELAY CALL BEFORE ITS ANSWER. Source: the pot handler names no relay call and no
-    /// gather; it calls the seam. RED on `57751b4`: "the pot-changed handler calls push_broadcast( on its answer
-    /// path". Executed: a relay fake that sleeps 40 s; the answer is in hand within 1 s with NO relay call started;
-    /// a fake that answers in 50 ms is observed AFTER the answer, every call sent.
+    /// (M2 a) THE PRODUCTION HANDLER AWAITS NO RELAY COMPLETION. `serve_pot_changed`, the function the worker's
+    /// `internal_pot_changed` calls, run with the real store's SQL over SQLite and a recording `wait_until`, on the
+    /// mixed body with the eighth outpoint's room broadcast HUNG (seven fast, one 40 s): the answer is in hand with
+    /// NO relay call started and its D1 work in at most three round trips; the announce was handed to `wait_until`;
+    /// run after the answer, the seven rooms and fourteen seat events are delivered and the hung one runs into the
+    /// wall. Source: the worker's handler calls this function and hands `ctx.wait_until` as `detach`.
     #[tokio::test(flavor = "current_thread")]
-    async fn e649_hook_a_the_pot_hook_awaits_no_relay_call_and_no_gather_before_its_answer() {
+    async fn e649f_m2_a_the_production_handler_answers_before_any_relay_call_completes() {
         let h = routes_item("pub(crate) async fn internal_pot_changed(");
+        assert!(
+            h.contains(&squash(
+                "crate::pot_hook::serve_pot_changed(store, relay, wall, &detach, &outpoints, t0)"
+            )),
+            "the worker's handler is serve_pot_changed"
+        );
+        assert!(
+            h.contains(&squash(
+                "let detach = |f: crate::pot_hook::Detached| ctx.wait_until(f);"
+            )),
+            "detach is ctx.wait_until"
+        );
         for banned in [
             "push_broadcast(",
             "first_party_push(",
             "gather_result_entries(",
+            "counted_all()",
+            "counted_batch(",
         ] {
             assert!(
                 !h.contains(&squash(banned)),
                 "the pot-changed handler calls {banned} on its answer path"
             );
         }
+        let (db, ops) = mixed_fixture();
+        let store = Rc::new(HookD1 { sql: db });
+        let relay = Rc::new(Relay {
+            hung: vec![MARKER_POT.to_string()],
+            ..Relay::default()
+        });
+        let rec = Recorded::default();
+        let detach = |f: Detached| rec.0.borrow_mut().push(f);
+        let t0 = Instant::now();
+        let out = serve_pot_changed(
+            store.clone(),
+            relay.clone(),
+            tokio::time::sleep(Duration::from_millis(300)),
+            &detach,
+            &ops,
+            7,
+        )
+        .await;
+        let answered = Instant::now();
         assert!(
-            h.contains(&squash("crate::pot_hook::apply_pot_changed(")),
-            "the handler calls the seam"
-        );
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let slow = Rc::new(SlowRelay::new(Duration::from_secs(40), Delivery::Sent));
-                let started = slow.started.clone();
-                let (took, _, detached) =
-                    serve(&attributed(1), slow, &[op(1)], Duration::from_millis(200)).await;
-                assert!(took < Duration::from_secs(1), "answered in {took:?}");
-                assert_eq!(started.get(), 0, "no relay call started before the answer");
-                let t = detached.await.unwrap();
-                assert!(
-                    t.walled,
-                    "the 40 s relay ran into the wall, after the answer"
-                );
-
-                let quick = Rc::new(SlowRelay::new(Duration::from_millis(50), Delivery::Sent));
-                let (answered_at, rooms) = (quick.answered_at.clone(), quick.rooms.clone());
-                let t0 = Instant::now();
-                let (took, _, detached) =
-                    serve(&attributed(1), quick, &[op(1)], Duration::from_secs(5)).await;
-                let answer_at = t0 + took;
-                assert!(
-                    answered_at.borrow().is_empty(),
-                    "nothing pushed before the answer"
-                );
-                let t = detached.await.unwrap();
-                assert_eq!((t.sent, t.failed, t.walled), (3, 0, false));
-                assert!(
-                    answered_at.borrow().iter().all(|at| *at > answer_at),
-                    "every push after the answer"
-                );
-                let rooms = rooms.borrow();
-                assert!(rooms
-                    .iter()
-                    .any(|(to, b)| to == POTS_ROOM_NAME && b["kind"] == "pot-changed"));
-                for seat in [A, B] {
-                    let (_, b) = rooms
-                        .iter()
-                        .find(|(to, _)| to == seat)
-                        .expect("each seat told");
-                    assert_eq!(b["kind"], "pot");
-                    assert!(
-                        b["entry"].is_object(),
-                        "the client's parser needs an object entry"
-                    );
-                    assert_eq!(b["entry"], json!({}), "no gathered entry rides the push");
-                }
-            })
-            .await;
-    }
-    const POTS_ROOM_NAME: &str = crate::internal_events::POTS_ROOM;
-
-    /// (b) ONE READ AND ONE WRITE BATCH PER BODY. Source: neither hook handler runs a statement of its own beside
-    /// the seam; the D1 store's reads are `counted_batch` round trips (the attribution, then the seat markers) and
-    /// its stale marks one. RED on `57751b4`: "internal_pot_changed runs a statement of its own (counted_all())
-    /// beside the seam's batch". Executed: a body of 8 mixed outpoints is one read call and one mark call; a hop
-    /// body of 8 identities is one mark call.
-    #[tokio::test(flavor = "current_thread")]
-    async fn e649_hook_b_the_hooks_reach_d1_only_through_the_seams_batches() {
-        for name in ["internal_pot_changed", "internal_hop_changed"] {
-            let h = routes_item(&format!("pub(crate) async fn {name}("));
-            for banned in [
-                "counted_all()",
-                "counted_run()",
-                "counted_first",
-                "owed_mark_stale(",
-                "owed_identities_by_marker(",
-                "counted_batch(",
-            ] {
-                assert!(
-                    !h.contains(&squash(banned)),
-                    "{name} runs a statement of its own ({banned}) beside the seam's batch"
-                );
-            }
-        }
-        let store = routes_item("impl crate::pot_hook::HookStore for D1HookStore<'_> {");
-        assert_eq!(
-            store.matches("counted_batch(").count(),
-            2,
-            "attribution and stale marks: one batch each"
+            answered - t0 < Duration::from_secs(1),
+            "answered in {:?}",
+            answered - t0
         );
         assert_eq!(
-            store.matches("results_seat_markers_batched(").count(),
-            1,
-            "the seat markers: one batch"
-        );
-        for banned in [
-            "counted_all()",
-            "counted_run()",
-            "results_seat_markers(self",
-        ] {
-            assert!(!store.contains(banned), "the store runs {banned}");
-        }
-        let routes = include_str!("routes.rs");
-        let seat = &routes[routes
-            .find("async fn results_seat_markers_batched(")
-            .expect("the batched seat read")..];
-        let seat = &seat[..seat.find("\n}\n").expect("its end")];
-        assert_eq!(
-            seat.matches("counted_batch(").count(),
-            1,
-            "the seat markers of a body: one batch"
+            relay.started.get(),
+            0,
+            "relay calls started before the answer"
         );
         assert!(
-            !seat.contains("counted_all()"),
-            "the batched seat read runs no statement of its own"
-        );
-
-        let ids: Vec<String> = (0..8).map(|i| format!("02{i:064x}")).collect();
-        let store = ModelStore {
-            reads: vec![
-                OutpointRead::Failed("x".into()),
-                OutpointRead::NoParams {
-                    marker_named: vec![A.into(), C.into()],
-                },
-                OutpointRead::Decoded {
-                    seats: vec![],
-                    marker_named: vec![C.into()],
-                },
-                OutpointRead::Decoded {
-                    seats: vec![A.into(), B.into()],
-                    marker_named: vec![],
-                },
-                OutpointRead::Decoded {
-                    seats: vec![B.into(), C.into()],
-                    marker_named: vec![],
-                },
-                OutpointRead::NoParams {
-                    marker_named: vec![],
-                },
-                OutpointRead::NoParams {
-                    marker_named: vec![B.into()],
-                },
-                OutpointRead::Decoded {
-                    seats: vec![A.into()],
-                    marker_named: vec![A.into()],
-                },
-            ],
-            ..ModelStore::default()
-        };
-        let ops: Vec<(String, u32)> = (0..8).map(op).collect();
-        let _ = apply_pot_changed(&store, &ops, 1).await;
-        assert_eq!(
-            (store.read_calls.get(), store.mark_calls.get()),
-            (1, 1),
-            "one read, one write, per body"
+            store.sql.batches.get() <= 3,
+            "the answer's D1 work: {} round trips",
+            store.sql.batches.get()
         );
         assert_eq!(
-            store.marked.borrow().len(),
-            4,
-            "every stale mark rode the one batch"
+            out.filed.len(),
+            14,
+            "every verified seat filed: {:?}",
+            out.skipped
         );
-        let hop = ModelStore::default();
-        apply_hop_changed(&hop, &ids).await.unwrap();
-        assert_eq!((hop.read_calls.get(), hop.mark_calls.get()), (0, 1));
-        assert_eq!(hop.marked.borrow().len(), 8);
-        let quiet = attributed(2);
-        let _ = apply_pot_changed(&quiet, &ops[..2], 1).await;
-        assert_eq!(quiet.mark_calls.get(), 0, "nothing to mark: no write");
+        assert_eq!(out.owed_identities.len(), 19);
+        assert_eq!(
+            rec.0.borrow().len(),
+            1,
+            "the announce was handed to wait_until"
+        );
+        rec.run_all().await;
+        let delivered = relay.delivered.borrow();
+        assert!(
+            delivered.iter().all(|(_, _, at)| *at > answered),
+            "every delivery after the answer"
+        );
+        assert_eq!(
+            delivered.len(),
+            7 + 14,
+            "seven rooms and fourteen seats delivered"
+        );
+        assert!(!delivered
+            .iter()
+            .any(|(to, t, _)| t == MARKER_POT && to == crate::internal_events::POTS_ROOM));
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_SENT), 21);
+        assert_eq!(
+            store.sql.counter(COUNTER_ANNOUNCE_FAILED),
+            1,
+            "the hung call counted at the wall"
+        );
     }
 
-    /// (c) A BODY OF 8 OUTPOINTS, BOTH SEATS ATTRIBUTED, ANSWERS IN UNDER 1 S WITH THE RELAY 40 S SLOW: 8 pots-room
-    /// calls and 16 seat events go to the detached announce, all started together (not one after another), and the
-    /// wall ends them.
-    #[tokio::test(flavor = "current_thread")]
-    async fn e649_hook_c_a_body_of_8_outpoints_answers_under_a_second_with_the_relay_slow() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let slow = Rc::new(SlowRelay::new(Duration::from_secs(40), Delivery::Sent));
-                let started = slow.started.clone();
-                let ops: Vec<(String, u32)> = (0..8).map(op).collect();
-                let (took, outcome, detached) =
-                    serve(&attributed(8), slow, &ops, Duration::from_millis(300)).await;
-                assert!(took < Duration::from_secs(1), "answered in {took:?}");
-                assert_eq!(started.get(), 0);
-                assert_eq!(outcome.plan.outpoints, ops, "every outpoint announced");
-                assert_eq!(outcome.plan.seat_events.len(), 16);
-                assert_eq!(outcome.filed.len(), 16);
-                assert_eq!(outcome.owed_identities, vec![A.to_string(), B.to_string()]);
-                let t0 = Instant::now();
-                let t = detached.await.unwrap();
-                assert!(
-                    t0.elapsed() < Duration::from_secs(5),
-                    "bounded by the wall, not 24 x 40 s"
-                );
-                assert_eq!(
-                    started.get(),
-                    24,
-                    "every call started inside the wall: together, not in sequence"
-                );
-                assert_eq!((t.sent, t.failed, t.walled), (0, 24, true));
-            })
-            .await;
+    /// The relay as a fake: every call sleeps `delay`, then answers `answer`.
+    struct SlowRelay {
+        delay: Duration,
+        answer: Delivery,
+    }
+    impl SlowRelay {
+        fn new(delay: Duration, answer: Delivery) -> Self {
+            SlowRelay { delay, answer }
+        }
+    }
+    impl RelayPort for SlowRelay {
+        async fn broadcast(&self, _room: &'static str, _body: Value) -> Delivery {
+            tokio::time::sleep(self.delay).await;
+            self.answer
+        }
+        async fn push(&self, _recipient: &str, _body: Value) -> Delivery {
+            tokio::time::sleep(self.delay).await;
+            self.answer
+        }
     }
 
     /// (d) THE DETACHED ANNOUNCE IS COUNTED on success, at the wall, on a failure, and when the relay is not
@@ -745,86 +1036,16 @@ mod tests {
                 "the wall sits under the platform's waitUntil window"
             )
         };
-        let src = squash(&code_only(include_str!("pot_hook.rs")));
-        let det = &src[src.find("pubasyncfnannounce_detached(").unwrap()..];
-        assert!(det.contains(&squash(
-            "worker::Delay::from(core::time::Duration::from_millis(ANNOUNCE_WALL_MS))"
+        let h = routes_item("pub(crate) async fn internal_pot_changed(");
+        assert!(h.contains(&squash(
+            "worker::Delay::from(core::time::Duration::from_millis(crate::pot_hook::ANNOUNCE_WALL_MS,))"
         )));
+        let src = squash(&code_only(include_str!("pot_hook.rs")));
+        let det = &src[src.find("pubasyncfnannounce_and_report<").unwrap()..];
         assert!(
-            det.contains(&squash(
-                "crate::courier::flush(env.d1(\"OVERLAY_DB\").ok(), counters)"
-            )),
+            det.contains(&squash("store.counters(counters).await;")),
             "the counters are flushed"
         );
-    }
-
-    /// (e) THE SEAM RUNS WITHOUT A `Request`: `apply_pot_changed` over a model store, each branch the handler had
-    /// before L4. A read fault is skipped; no decoded params, or no attributed seat, marks the marker-named
-    /// identities stale (fleet loops 11 and 15) and queues their recompute; an attributed pot files a `pot` event
-    /// per seat. The plan announces EVERY parsed outpoint (loop 10 D2), attributed or not. A stale-mark fault is
-    /// reported and the recompute still queued.
-    #[tokio::test(flavor = "current_thread")]
-    async fn e649_hook_e_apply_pot_changed_runs_from_a_harness_without_a_request() {
-        let store = ModelStore {
-            reads: vec![
-                OutpointRead::Failed("D1 down".into()),
-                OutpointRead::NoParams {
-                    marker_named: vec![C.into()],
-                },
-                OutpointRead::Decoded {
-                    seats: vec![],
-                    marker_named: vec![A.into(), C.into()],
-                },
-                OutpointRead::Decoded {
-                    seats: vec![A.into(), B.into()],
-                    marker_named: vec![C.into()],
-                },
-            ],
-            mark_fault: true,
-            ..ModelStore::default()
-        };
-        let ops: Vec<(String, u32)> = (0..4).map(op).collect();
-        let out = apply_pot_changed(&store, &ops, 99).await;
-        assert_eq!(
-            out.plan.outpoints, ops,
-            "every parsed outpoint is announced"
-        );
-        assert_eq!(out.plan.at_ms, 99);
-        assert_eq!(
-            out.stale_marks,
-            vec![
-                (C.to_string(), "pot-changed (by marker)"),
-                (A.to_string(), "pot-changed (unattributed, by marker)"),
-                (C.to_string(), "pot-changed (unattributed, by marker)"),
-            ]
-        );
-        assert_eq!(out.stale_fault.as_deref(), Some("D1 down"));
-        assert_eq!(
-            out.owed_identities,
-            vec![C.to_string(), A.to_string(), B.to_string()]
-        );
-        assert_eq!(
-            out.plan.seat_events,
-            vec![
-                (A.to_string(), ops[3].0.clone(), ops[3].1),
-                (B.to_string(), ops[3].0.clone(), ops[3].1)
-            ]
-        );
-        assert_eq!(out.filed.len(), 2);
-        assert_eq!(out.filed[0]["identity"], A);
-        assert_eq!(out.skipped.len(), 3);
-        assert!(out.skipped[0]["why"]
-            .as_str()
-            .unwrap()
-            .contains("decoded-pots read failed"));
-        assert!(out.skipped[1]["why"]
-            .as_str()
-            .unwrap()
-            .contains("no decoded params yet"));
-        assert!(out.skipped[2]["why"]
-            .as_str()
-            .unwrap()
-            .contains("no attributed seats yet"));
     }
 
     /// The deploy lane reads the hooks' timing: `Server-Timing: hook;dur=<ms>` and one log line per answer.
