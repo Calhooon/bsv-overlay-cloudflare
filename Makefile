@@ -512,6 +512,7 @@ ci-d1-budget:
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PO/listTopicManagers "$$ov_log" "overlay"; \
 	node tools/lane-499/d1_budget_route_ci.mjs http://127.0.0.1:$$PA http://127.0.0.1:$$PO; \
+	node tools/lane-499/tracker_fault_route_ci.mjs http://127.0.0.1:$$PA "$$state"; \
 	python3 scripts/d1-census.py --self-test; \
 	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO; \
 	node tools/lane-e1d/landing_guard_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
