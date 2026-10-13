@@ -529,7 +529,10 @@ fn ns3d_m1_faulting_word_lookup_keeps_legacy_body_available() {
     let outcome: Result<BTreeMap<String, serde_json::Value>, &str> = Err("tx_words unavailable");
     let views = runtime::lookup_result(outcome).expect("word lookup must not fail the route");
     let body = runtime::decorate_lookup(legacy.clone(), Some(&"01".repeat(32)), views.as_ref());
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), legacy);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        legacy
+    );
     assert!(!body.contains("tracker"));
 }
 
@@ -547,12 +550,18 @@ fn ns3d_m1_owed_recompute_word_lookup_cannot_abort_legacy_judgement() {
 #[test]
 fn ns3d_l1_spent_any_looks_up_the_served_spender_after_probe() {
     let routes = include_str!("../src/routes.rs");
-    let route = &routes[routes.find("pub async fn spent_any(").unwrap()..routes.find("// ── /tx-any").unwrap()];
-    assert!(route.find("runtime::read_soft").unwrap() > route.find("entries.push").unwrap(),
-        "word lookup still precedes the fresh spender probe");
+    let route = &routes
+        [routes.find("pub async fn spent_any(").unwrap()..routes.find("// ── /tx-any").unwrap()];
+    assert!(
+        route.find("runtime::read_soft").unwrap() > route.find("entries.push").unwrap(),
+        "word lookup still precedes the fresh spender probe"
+    );
     let fresh = mined();
     let mut served = json!([{"spendingTxid":fresh.txid,"spentConfirmed":true}]);
-    runtime::decorate(&mut served, None, &BTreeMap::from([(fresh.txid.clone(), fresh.view())]));
+    runtime::decorate(
+        &mut served,
+        None,
+        &BTreeMap::from([(fresh.txid.clone(), fresh.view())]),
+    );
     assert_eq!(served[0]["spenderWord"]["word"], "mined");
-
 }

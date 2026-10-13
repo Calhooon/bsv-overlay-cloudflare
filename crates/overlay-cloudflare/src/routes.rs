@@ -2289,10 +2289,17 @@ async fn submit_parts(
             .ok()
             .and_then(|mut beef| crate::ef::subject_txid_of(&mut beef))
     {
-        crate::tracker_events::note_submit(&txid, gated_subject.is_some(), steak.values().any(|a| {
-            !a.outputs_to_admit.is_empty() || !a.coins_to_retain.is_empty()
-                || a.coins_removed.as_ref().is_some_and(|coins| !coins.is_empty())
-        }));
+        crate::tracker_events::note_submit(
+            &txid,
+            gated_subject.is_some(),
+            steak.values().any(|a| {
+                !a.outputs_to_admit.is_empty()
+                    || !a.coins_to_retain.is_empty()
+                    || a.coins_removed
+                        .as_ref()
+                        .is_some_and(|coins| !coins.is_empty())
+            }),
+        );
     }
     // Mainnet SHIP fan-out — discover tm_X peers via SLAP trackers and POST
     // the BEEF to each. Only runs when at least one topic admitted at least

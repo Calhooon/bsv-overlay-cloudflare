@@ -96,10 +96,18 @@ fn ns3d_l3_real_main_body_builders_preserve_every_legacy_key() {
         fn legacy(value: &mut serde_json::Value) {
             match value {
                 serde_json::Value::Object(obj) => {
-                    for key in ["tracker", "spenderWord", "coinWord"] { obj.remove(key); }
-                    for child in obj.values_mut() { legacy(child); }
+                    for key in ["tracker", "spenderWord", "coinWord"] {
+                        obj.remove(key);
+                    }
+                    for child in obj.values_mut() {
+                        legacy(child);
+                    }
                 }
-                serde_json::Value::Array(arr) => for child in arr { legacy(child); },
+                serde_json::Value::Array(arr) => {
+                    for child in arr {
+                        legacy(child);
+                    }
+                }
                 _ => {}
             }
         }
@@ -111,28 +119,65 @@ fn ns3d_l3_real_main_body_builders_preserve_every_legacy_key() {
     }
     let id = "01".repeat(32);
     let spender = "02".repeat(32);
-    let views = BTreeMap::from([(spender.clone(), json!({"word":"seen", "tier":"hint", "source":"arcade"}))]);
+    let views = BTreeMap::from([(
+        spender.clone(),
+        json!({"word":"seen", "tier":"hint", "source":"arcade"}),
+    )]);
     let observations = [
-        txany::TxObservation::FirstPartyPresent {confirmed:false, raw_hex:Some("0100".into())},
-        txany::TxObservation::Present {confirmed:true, raw_hex:Some("0100".into())},
-        txany::TxObservation::CourierHint {raw_hex:Some("0100".into()), source:"woc", observed_at_ms:123000},
+        txany::TxObservation::FirstPartyPresent {
+            confirmed: false,
+            raw_hex: Some("0100".into()),
+        },
+        txany::TxObservation::Present {
+            confirmed: true,
+            raw_hex: Some("0100".into()),
+        },
+        txany::TxObservation::CourierHint {
+            raw_hex: Some("0100".into()),
+            source: "woc",
+            observed_at_ms: 123000,
+        },
         txany::TxObservation::Fault,
     ];
     for obs in observations {
-        let answer = txany::decide_tx_any(None, None, Some(&obs), txany::AbsenceCorroboration::Unknown);
+        let answer =
+            txany::decide_tx_any(None, None, Some(&obs), txany::AbsenceCorroboration::Unknown);
         check(txany::tx_any_body(&id, &answer), Some(&id), &views);
-        check(txany::tx_any_batch_body(&[(id.clone(),answer)], &[(spender.clone(), "fault")]), None, &views);
+        check(
+            txany::tx_any_batch_body(&[(id.clone(), answer)], &[(spender.clone(), "fault")]),
+            None,
+            &views,
+        );
     }
     let entries = [logic::OutpointStatus {
-        txid:id.clone(), vout:0, known:true, spent:Some(true), spending_txid:Some(spender.clone()),
-        spent_confirmed:Some(false), spender_seen:Some(true), spender_final:Some(true),
-        reason:None, funding_seen:Some(true),
+        txid: id.clone(),
+        vout: 0,
+        known: true,
+        spent: Some(true),
+        spending_txid: Some(spender.clone()),
+        spent_confirmed: Some(false),
+        spender_seen: Some(true),
+        spender_final: Some(true),
+        reason: None,
+        funding_seen: Some(true),
     }];
     check(txany::spent_any_body(&entries, &[false]), None, &views);
     check(txany::spent_any_body(&entries, &[true]), None, &views);
     check(logic::utxo_status_body(&entries), None, &views);
-    let rows = [owed::OwedRow {identity:id.clone(), outpoint:format!("{id}:0"), family:owed::OwedFamily::Payout,
-        game_id:"game".into(), sats:Some(100), opponent_identity:Some(spender.clone()), at_height:Some(10),
-        facts:json!({"claimable":true,"spendingTxid":spender,"spentConfirmed":true,"tier":"proven"}), reason:None}];
-    check(owed::owed_body(&id, Some(10), &rows, 123000, false), None, &views);
+    let rows = [owed::OwedRow {
+        identity: id.clone(),
+        outpoint: format!("{id}:0"),
+        family: owed::OwedFamily::Payout,
+        game_id: "game".into(),
+        sats: Some(100),
+        opponent_identity: Some(spender.clone()),
+        at_height: Some(10),
+        facts: json!({"claimable":true,"spendingTxid":spender,"spentConfirmed":true,"tier":"proven"}),
+        reason: None,
+    }];
+    check(
+        owed::owed_body(&id, Some(10), &rows, 123000, false),
+        None,
+        &views,
+    );
 }

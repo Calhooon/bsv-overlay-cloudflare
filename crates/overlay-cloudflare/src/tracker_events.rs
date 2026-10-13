@@ -127,11 +127,16 @@ mod tests {
         drain();
         // historical-tx-no-spv under the lenient window, even if its marker was admitted.
         note_submit(&"01".repeat(32), false, true);
-        assert!(drain().is_empty(), "stranger historical-tx-no-spv wrote a word event");
+        assert!(
+            drain().is_empty(),
+            "stranger historical-tx-no-spv wrote a word event"
+        );
         note_submit(&"02".repeat(32), true, false);
-        assert!(drain().is_empty(), "admitted-nothing submit wrote a word event");
+        assert!(
+            drain().is_empty(),
+            "admitted-nothing submit wrote a word event"
+        );
         note_submit(&"03".repeat(32), true, true);
         assert_eq!(drain().len(), 1);
     }
-
 }
