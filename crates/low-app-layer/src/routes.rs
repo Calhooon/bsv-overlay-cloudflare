@@ -3888,7 +3888,7 @@ async fn owed_recompute_inner(
     word_ids.extend(hop_chain.values().filter_map(|h| h.spending_txid.clone()));
     word_ids.extend(hop_sweeps.values().map(|h| h.sweep_txid.clone()));
     let word_ids: Vec<_> = word_ids.into_iter().collect();
-    let mut word_rows = crate::tracker_host::stored::read(env, &word_ids)
+    let word_rows = crate::tracker_host::stored::read(env, &word_ids)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -4097,55 +4097,6 @@ async fn owed_recompute_inner(
     crate::owed::note_held_filings(held_verified.len(), held_key_mismatches);
     if held_key_mismatches > 0 {
         console_warn!("[owed] {held_key_mismatches} collected row(s) carry a payTxid their key was not filed for (they retire nothing)");
-    }
-    let mut due: Vec<_> = word_ids
-        .iter()
-        .filter(|id| {
-            word_rows.get(*id).is_none_or(|row| {
-                source != "read-first"
-                    && crate::tracker_host::runtime::owed_reask_due(
-                        row,
-                        (now_ms.max(0) as u64) / 1000,
-                    )
-            })
-        })
-        .cloned()
-        .collect();
-    due.sort_by(|a, b| {
-        word_rows
-            .get(a)
-            .map_or(0.0, |r| r.updated_at)
-            .total_cmp(&word_rows.get(b).map_or(0.0, |r| r.updated_at))
-            .then_with(|| a.cmp(b))
-    });
-    for id in due
-        .into_iter()
-        .take(crate::tracker_host::runtime::OWED_FALLBACK_WRITE_EVENTS)
-    {
-        if over_budget() {
-            walk_cut = true;
-            break;
-        }
-        let kind = "tick"; // only the bounded owed clock may execute a Reask
-        let legacy = tx_any_cached(&id, worker::Date::now().as_millis() as f64)
-            .map(|answer| crate::txany::tx_any_body(&id, &answer));
-        let row = crate::tracker_host::runtime::event(env, &id, kind, None, legacy)
-            .await
-            .map_err(|e| e.to_string())?;
-        if !spender_outputs.contains_key(&id) {
-            let parsed = row
-                .legacy_body
-                .as_ref()
-                .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
-                .and_then(|body| body["rawHex"].as_str().and_then(|h| hex::decode(h).ok()))
-                .and_then(|raw| courier_spender_bytes_of_raw(&raw, &id));
-            if let Some(parsed) = parsed {
-                courier_spenders.insert(id.clone());
-                spender_inputs.insert(id.clone(), parsed.inputs);
-                spender_outputs.insert(id.clone(), parsed.outputs);
-            }
-        }
-        word_rows.insert(id, row);
     }
     let spender_words = crate::tracker_host::runtime::views(env, &word_rows).await;
     // The D3 SEEN + spenderFinal verdict-publication arm is deliberately
@@ -7407,8 +7358,7 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         }
     }
     let value = serde_json::from_str(&crate::txany::spent_any_body(&entries, &terminals))?;
-    // New spender subjects run the absent-row fallback once. Existing
-    // subjects reuse the one lookup above.
+    // Read-only decoration; missing words remain unknown until the scheduled pass.
     json_response(
         crate::tracker_host::runtime::body_loaded(
             &ctx.env,
@@ -8163,18 +8113,7 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         }
     };
     let legacy = crate::txany::tx_any_body(&key, &answer);
-    let mut rows = stored;
-    if !rows.contains_key(&key) {
-        let row = crate::tracker_host::runtime::event(
-            &ctx.env,
-            &key,
-            "fallback",
-            None,
-            Some(legacy.clone()),
-        )
-        .await?;
-        rows.insert(key.clone(), row);
-    }
+    let rows = stored;
     let mut value = serde_json::from_str(&legacy)?;
     let views = crate::tracker_host::runtime::views(&ctx.env, &rows).await;
     crate::tracker_host::runtime::decorate(&mut value, Some(&key), &views);

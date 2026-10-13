@@ -142,20 +142,8 @@ pub async fn body_loaded(
     env: &worker::Env,
     mut value: Value,
     subject: Option<&str>,
-    mut rows: BTreeMap<String, Row>,
+    rows: BTreeMap<String, Row>,
 ) -> worker::Result<String> {
-    let mut ids = BTreeSet::new();
-    subjects(&value, &mut ids);
-    if let Some(id) = subject {
-        ids.insert(id.into());
-    }
-
-    for id in ids {
-        if let std::collections::btree_map::Entry::Vacant(entry) = rows.entry(id) {
-            let row = event(env, entry.key(), "fallback", None, None).await?;
-            entry.insert(row);
-        }
-    }
     let views = views(env, &rows).await;
     decorate(&mut value, subject, &views);
     Ok(value.to_string())
@@ -464,7 +452,23 @@ pub async fn batch_body(env: &worker::Env, raw: &str, ids: &[String]) -> worker:
     body_loaded(env, value, None, rows).await
 }
 
-pub const OWED_FALLBACK_WRITE_EVENTS: usize = 1;
+/// Only the scheduled pass may refresh aged words, two subjects per tick.
+pub async fn tick(env: &worker::Env) -> worker::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Subject {
+        txid: String,
+    }
+    let now = super::WorkerClock.now();
+    let db = env.d1("OVERLAY_DB")?;
+    let rows = db.prepare("SELECT txid FROM tx_words WHERE word IN ('unknown','built','announced','seen') AND updated_at <= ? ORDER BY updated_at, txid LIMIT 2")
+        .bind(&[JsValue::from_f64(now.saturating_sub(900) as f64)])?
+        .counted_all().await?.results::<Subject>()?;
+    super::pacing::begin_tick(now / 900);
+    for row in rows {
+        event(env, &row.txid, "tick", None, None).await?;
+    }
+    Ok(())
+}
 
 /// Host pacing for the owed WRITE event. Chain words are never age-polled.
 /// The tracker decides the resulting Reask from Tick/SpendAttempt inputs.
@@ -606,12 +610,26 @@ pub fn hook_may_reask(kind: &str, has_reask: bool) -> bool {
 #[cfg(test)]
 mod budget_pins {
     #[test]
-    fn ns3_m4_owed_fallback_writes_at_most_one_event() {
-        let src = include_str!("../routes.rs");
-        let clock = &src[src.find("let mut due: Vec<_> = word_ids").unwrap()..];
+    fn ns3_m4_a_read_with_no_row_writes_nothing() {
+        let runtime = include_str!("runtime.rs");
+        let body = &runtime[runtime.find("pub async fn body_loaded(").unwrap()
+            ..runtime.find("pub async fn owed_body(").unwrap()];
         assert!(
-            clock.contains(".take(crate::tracker_host::runtime::OWED_FALLBACK_WRITE_EVENTS)"),
-            "owed tracker fallback still takes two write events"
+            !body.contains("event("),
+            "a read with no row still writes a fallback word"
+        );
+        let routes = include_str!("../routes.rs");
+        let tx = &routes[routes.find("pub async fn tx_any(").unwrap()
+            ..routes.find("struct BeefTrustRowKeyed").unwrap()];
+        assert!(
+            !tx.contains("runtime::event("),
+            "tx-any read still writes a word"
+        );
+        let owed = &routes[routes.find("async fn owed_recompute_inner(").unwrap()
+            ..routes.find("let spender_words =").unwrap()];
+        assert!(
+            !owed.contains("runtime::event("),
+            "owed read still writes a word"
         );
     }
 }
