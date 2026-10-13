@@ -17,8 +17,11 @@
 //! ceil((B + 1) / 96)-th scheduled pass after it falls due ([`DRAIN_MAX_ROUNDS`] x [`DRAIN_MAX_PER_PASS`] a pass, one
 //! pass every 15 minutes); B is at most [`PARK_MAX_ROWS`] - 1, so at most 22 passes (5.5 hours) on a full table. A
 //! failed retry backs off (1 minute doubling to an hour) and is exhausted at its 8th attempt; a wake-up due for a day
-//! is aged out; a new key past the ceiling is sent once and not parked (counted). The owed recompute stays where #469
-//! and #648 put it: after the answer, coalesced and shed per identity, not parked.
+//! is aged out. A wake-up is NEVER acknowledged unparked (the second delta review's N6): a batch that would pass the
+//! ceiling first makes room (the oldest exhausted rows, then the oldest live rows that failed at least
+//! [`PARK_DISPLACE_MIN_ATTEMPTS`] deliveries, each displaced one named LOST in the log and counted); past that the
+//! WHOLE batch rolls back and the hook answers 503, nothing announced, the refusal counted. The owed recompute stays
+//! where #469 and #648 put it: after the answer, coalesced and shed per identity, not parked.
 //!
 //! The seat's `pot` event no longer carries a gathered `/results` entry. No reader reads it: the client's parser
 //! (`app/src/lib/lowEvents.ts` `parseLowEvent`) requires `entry` to be an OBJECT, and every consumer
@@ -56,10 +59,16 @@ pub const COUNTER_ANNOUNCE_EXHAUSTED: &str = "pot_changed_announce_exhausted_tot
 pub const COUNTER_ANNOUNCE_SWEPT: &str = "pot_changed_announce_swept_total";
 /// A park, settle or drain statement batch that faulted.
 pub const COUNTER_ANNOUNCE_PARK_FAULTS: &str = "pot_changed_announce_park_faults_total";
-/// N3: wake-ups the park REFUSED at the table's ceiling ([`PARK_MAX_ROWS`]): announced once, not parked.
+/// N3, N6: wake-ups of a body the park REFUSED at the table's ceiling ([`PARK_MAX_ROWS`]) with no room to make: the
+/// whole batch rolled back, the hook answered 503, nothing announced.
 pub const COUNTER_ANNOUNCE_PARK_FULL: &str = "pot_changed_announce_park_full_total";
 /// N3: live wake-ups aged out, due for longer than [`PARK_OVERDUE_MAX_MS`].
 pub const COUNTER_ANNOUNCE_AGED: &str = "pot_changed_announce_aged_total";
+/// N6: exhausted rows deleted early to make room for a new body's wake-ups (already given up: no wake-up is lost).
+pub const COUNTER_ANNOUNCE_EVICTED_EXHAUSTED: &str = "pot_changed_announce_evicted_exhausted_total";
+/// N6: LIVE wake-ups displaced to make room (each failed at least [`PARK_DISPLACE_MIN_ATTEMPTS`] deliveries), each
+/// named LOST in the log; served on the overlay's `/health/invariants.counters` with every counter row.
+pub const COUNTER_ANNOUNCE_DISPLACED: &str = "pot_changed_announce_displaced_total";
 
 /// H1: the park of the pots-room wake-ups and the seats' events (overlay migration 222; its index 223 is the
 /// overlay's alone, as the catch-up list is CREATE TABLE statements by contract). One row per (outpoint, kind,
@@ -71,22 +80,51 @@ pub const PARKED_CREATE: &str = "CREATE TABLE IF NOT EXISTS pot_announce_parked 
 /// The drain's order (live rows by `next_attempt_at_ms`) and the sweep's range (exhausted rows by their stamp).
 pub const PARKED_DUE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_pot_announce_parked_due ON pot_announce_parked(exhausted_at_ms, next_attempt_at_ms)";
 /// N1: the park tokens' counter (overlay migration 224; in the app's catch-up list too). One row, `id` 1: `n` is the
-/// last token handed out, `room` the parks of new keys the current batch may still make (N3). Never deleted.
+/// last token handed out, `room` the table's room under the ceiling after the last batch's parks (N6: negative, the
+/// excess that batch made room for). Never deleted.
 pub const PARK_SEQ_CREATE: &str = "CREATE TABLE IF NOT EXISTS pot_announce_seq (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL, room INTEGER NOT NULL)";
-/// N1, N3: the FIRST statement of a write batch with `?1` parks. It takes `?1` tokens (`n` moves from `n0` to
-/// `n0 + ?1`; the batch's k-th park takes `n0 + 1 + k`, read in its own statement as `n - (?1 - 1 - k)`; D1 runs a
-/// batch as one transaction, so no other batch takes a token between them), and reads the table's ROOM under the
-/// ceiling `?2` ONCE for the batch (one LIMITed scan, at most `?2` rows). A first row (or one after a wipe) starts at
-/// the clock `?3` times 1,000, above every token handed out before at under 1,000 a millisecond, and above the
-/// clock-stamped generations parked before the counter existed.
-pub const PARK_SEQ_BUMP_SQL: &str = "INSERT INTO pot_announce_seq (id, n, room) VALUES (1, ?3 * 1000 + ?1, ?2 - (SELECT COUNT(*) FROM (SELECT 1 FROM pot_announce_parked LIMIT ?2))) ON CONFLICT (id) DO UPDATE SET n = n + ?1, room = excluded.room";
-/// Park one wake-up (a NEW intent): its token from the counter (`?6` is its distance from the batch's last token), its
-/// attempts from 0, due at `?5`. A key already parked is replaced by the later token (a row exhausted comes back). A
-/// NEW key is parked only while the batch's room (read by [`PARK_SEQ_BUMP_SQL`]) is above the park's place `?7` in
-/// the batch, so the table never passes [`PARK_MAX_ROWS`] and the newest are refused when it is full (N3). The row
-/// written answers its token (`RETURNING`); a refused park answers none. PR #32's `change_park::PARK_SQL` is the
-/// same shape (a non-reused token per park, the ceiling in SQL, `RETURNING`), its ceiling scan made per park.
-pub const PARK_SQL: &str = "INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) SELECT ?1, ?2, ?3, ?4, 0, ?5, (SELECT n FROM pot_announce_seq WHERE id = 1) - ?6, NULL WHERE EXISTS (SELECT 1 FROM pot_announce_parked WHERE outpoint = ?1 AND kind = ?2 AND recipient = ?3) OR (SELECT room FROM pot_announce_seq WHERE id = 1) > ?7 ON CONFLICT (outpoint, kind, recipient) DO UPDATE SET at = excluded.at, attempts = 0, next_attempt_at_ms = excluded.next_attempt_at_ms, generation = excluded.generation, exhausted_at_ms = NULL WHERE excluded.generation > pot_announce_parked.generation RETURNING generation";
+/// Park one wake-up (a NEW intent), a park statement of a write batch: its token is the counter's last plus its
+/// position `?6` in the batch (1-based; `?7`, the clock, times 1,000 on a first counter row, above every token handed
+/// out before at under 1,000 a millisecond and above the clock-stamped generations parked before the counter existed),
+/// its attempts from 0, due at `?5`. [`PARK_SEQ_BUMP_SQL`] then moves the counter past the batch; D1 runs a batch as
+/// one transaction, so no other batch takes a token between them (N1). A key already parked is replaced by the later
+/// token (a row exhausted comes back). Every park of a batch is written (N6 of the second delta review): the ceiling
+/// is held after them, for the batch as a whole ([`PARK_GUARD_SQL`], [`PARK_MAKE_ROOM_SQL`]), so a batch parks EVERY
+/// wake-up or none. The row written answers its token (`RETURNING`).
+pub const PARK_SQL: &str = "INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) SELECT ?1, ?2, ?3, ?4, 0, ?5, COALESCE((SELECT n FROM pot_announce_seq WHERE id = 1), ?7 * 1000) + ?6, NULL WHERE true ON CONFLICT (outpoint, kind, recipient) DO UPDATE SET at = excluded.at, attempts = 0, next_attempt_at_ms = excluded.next_attempt_at_ms, generation = excluded.generation, exhausted_at_ms = NULL WHERE excluded.generation > pot_announce_parked.generation RETURNING generation";
+/// N1, N6: the statement after a batch's `?1` parks: the counter moves past them (`n` from `n0` to `n0 + ?1`, a first
+/// row at the clock `?2` times 1,000 plus `?1`, as [`PARK_SQL`] read it), and `room` is the table's room under the
+/// ceiling `?3` NOW, the parks counted (one LIMITed scan, at most `?3 + ?1` rows: the table held at most `?3` before
+/// the batch); negative, it is the excess the batch must make room for.
+pub const PARK_SEQ_BUMP_SQL: &str = "INSERT INTO pot_announce_seq (id, n, room) VALUES (1, ?2 * 1000 + ?1, ?3 - (SELECT COUNT(*) FROM (SELECT 1 FROM pot_announce_parked LIMIT ?3 + ?1))) ON CONFLICT (id) DO UPDATE SET n = n + ?1, room = excluded.room";
+/// N6: the rows that may make room (`?1` [`PARK_DISPLACE_MIN_ATTEMPTS`], `?2` the batch's parks): an EXHAUSTED row
+/// (already given up), or a LIVE row that failed at least `?1` deliveries, never a row of this batch (its tokens are
+/// the counter's last `?2`).
+macro_rules! park_room_rows {
+    () => {
+        "FROM pot_announce_parked WHERE exhausted_at_ms IS NOT NULL OR (attempts >= ?1 AND generation <= (SELECT n FROM pot_announce_seq WHERE id = 1) - ?2)"
+    };
+}
+/// N6: past the ceiling (`room` below 0) with fewer rows that may make room than the excess, this writes a counter row
+/// that breaks the counter's `CHECK (id = 1)`: the statement faults and D1 rolls the WHOLE batch back (the stale
+/// marks, every park, the counter): nothing of the body is written and the hook answers 503 with nothing announced.
+/// The fault's words carry [`PARK_FULL_FAULT`]. Under the ceiling it reads the counter row alone; over it, at most
+/// the excess (one body's 24) of the rows that may make room.
+pub const PARK_GUARD_SQL: &str = concat!(
+    "INSERT INTO pot_announce_seq (id, n, room) SELECT 2, 0, 0 WHERE (SELECT room FROM pot_announce_seq WHERE id = 1) < 0 AND (SELECT COUNT(*) FROM (SELECT 1 ",
+    park_room_rows!(),
+    " LIMIT max(0, -(SELECT room FROM pot_announce_seq WHERE id = 1)))) < -(SELECT room FROM pot_announce_seq WHERE id = 1)"
+);
+/// N6: what a fault of [`PARK_GUARD_SQL`] says (SQLite's and D1's words for the broken check).
+pub const PARK_FULL_FAULT: &str = "CHECK constraint failed";
+/// N6: the batch's last statement: the excess taken out, the oldest EXHAUSTED rows first, then the oldest LIVE rows
+/// that may make room. So a batch displaces at most its own size. Each row taken is RETURNED, so the store names it.
+/// Under the ceiling its limit is 0.
+pub const PARK_MAKE_ROOM_SQL: &str = concat!(
+    "DELETE FROM pot_announce_parked WHERE rowid IN (SELECT rowid ",
+    park_room_rows!(),
+    " ORDER BY exhausted_at_ms IS NULL, exhausted_at_ms, at LIMIT max(0, -(SELECT room FROM pot_announce_seq WHERE id = 1))) RETURNING outpoint, kind, recipient, attempts, exhausted_at_ms"
+);
 /// A delivered wake-up leaves the park (only the token that was delivered).
 pub const PARKED_DELIVERED_SQL: &str = "DELETE FROM pot_announce_parked WHERE outpoint = ?1 AND kind = ?2 AND recipient = ?3 AND generation = ?4";
 /// A wake-up that failed (the detached announce's, or the drain's): its next attempt, or its exhausted stamp, only at
@@ -110,10 +148,14 @@ pub const PARK_RETRY_MAX_MS: u64 = 3_600_000;
 pub const PARK_MAX_ATTEMPTS: u32 = 8;
 /// An exhausted wake-up is swept a day after it was marked.
 pub const PARK_SWEEP_AFTER_MS: u64 = 86_400_000;
-/// N3: the table's ceiling, as PR #32's `CHANGE_PARKED_MAX_ROWS`: a park of a new key past it is refused, counted
-/// ([`COUNTER_ANNOUNCE_PARK_FULL`]) and announced once without a park. Read once a batch: near the ceiling a batch
-/// whose earlier parks were of keys already held may refuse a new key it had room for (conservative, never over).
+/// N3: the table's ceiling, as PR #32's `CHANGE_PARKED_MAX_ROWS`. N6: a batch past it makes room
+/// ([`PARK_MAKE_ROOM_SQL`]) or is refused WHOLE ([`PARK_GUARD_SQL`], counted [`COUNTER_ANNOUNCE_PARK_FULL`], 503).
+/// Read after the batch's parks, so a key already held never needs room.
 pub const PARK_MAX_ROWS: u32 = 2048;
+/// N6: a LIVE row may be displaced to make room only once it has failed this many deliveries (the detached announce
+/// and two drain retries: at least 3 minutes of failing sends). The bound of the room a batch may make of live rows:
+/// at most its own size (24), only of rows at or past this count. Past it the body is refused (503).
+pub const PARK_DISPLACE_MIN_ATTEMPTS: u32 = 3;
 /// N3: a live wake-up due for longer than this is aged out (exhausted, then swept).
 pub const PARK_OVERDUE_MAX_MS: u64 = 86_400_000;
 /// The drain's bound per ROUND: the wake-ups of one full body (8 rooms, 16 seats), delivered together.
@@ -203,8 +245,8 @@ pub enum ParkOp {
 }
 
 impl ParkOp {
-    /// The statement; a park's distance `back` from the batch's last token (N1) and its `place` in the batch (N3).
-    fn stmt(&self, back: u64, place: u64) -> Stmt {
+    /// The statement; a park's position `pos` in the batch (1-based) and the batch's clock `now` (N1).
+    fn stmt(&self, pos: u64, now: u64) -> Stmt {
         let int = |n: u64| Bind::Int(n as i64);
         match self {
             ParkOp::Park {
@@ -213,7 +255,7 @@ impl ParkOp {
                 next_ms,
             } => {
                 let mut b = wake.key_binds();
-                b.extend([int(*at_ms), int(*next_ms), int(back), int(place)]);
+                b.extend([int(*at_ms), int(*next_ms), int(pos), int(now)]);
                 Stmt::new(PARK_SQL, b)
             }
             ParkOp::Delivered { wake, generation } => {
@@ -380,6 +422,38 @@ fn decoded_of(out: &StmtOut) -> Result<Option<crate::results::CovenantParams>, S
 }
 
 impl<P: SqlPort> HookD1<P> {
+    /// N6: the rows [`PARK_MAKE_ROOM_SQL`] took out of a batch that committed: exhausted ones counted, each LIVE one
+    /// named LOST in the log and counted (its wake-up is not delivered).
+    async fn room_made(&self, out: &StmtOut) {
+        let (mut exhausted, mut displaced) = (0u64, 0u64);
+        for r in &out.rows {
+            if r.get("exhausted_at_ms").is_some_and(|v| !v.is_null()) {
+                exhausted += 1;
+                continue;
+            }
+            displaced += 1;
+            let text = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default();
+            self.sql.log(&format!(
+                "[pot-changed] LOST {} {} {} attempts={}: displaced at the park's ceiling ({PARK_MAX_ROWS} rows)",
+                text("outpoint"),
+                text("kind"),
+                text("recipient"),
+                r.get("attempts").and_then(Value::as_f64).unwrap_or(0.0) as u64
+            ));
+        }
+        let deltas: Vec<(String, u64)> = [
+            (COUNTER_ANNOUNCE_EVICTED_EXHAUSTED, exhausted),
+            (COUNTER_ANNOUNCE_DISPLACED, displaced),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(k, n)| (k.to_string(), n))
+        .collect();
+        if !deltas.is_empty() {
+            self.sql.counters(deltas).await;
+        }
+    }
+
     /// The decoded pots' verified seat markers, ONE batch of its chunks. A fault leaves the attribution partial.
     async fn seat_markers(
         &self,
@@ -537,34 +611,42 @@ impl<P: SqlPort> HookStore for HookD1<P> {
                 )
             })
             .collect();
-        // N1: the parks' tokens, taken in this batch before its first park
+        // N1: the parks' tokens, the counter's last plus each park's position; the bump after them
         let parks = ops
             .iter()
             .filter(|o| matches!(o, ParkOp::Park { .. }))
             .count() as u64;
-        let seq = usize::from(parks > 0);
+        let now = self.sql.now_ms();
+        let mut pos = 0u64;
+        for op in ops {
+            if matches!(op, ParkOp::Park { .. }) {
+                pos += 1;
+            }
+            stmts.push(op.stmt(pos, now));
+        }
+        // N6: the counter and the room, the guard that rolls the batch back, then the room made
         if parks > 0 {
+            let room = vec![
+                Bind::Int(i64::from(PARK_DISPLACE_MIN_ATTEMPTS)),
+                Bind::Int(parks as i64),
+            ];
             stmts.push(Stmt::new(
                 PARK_SEQ_BUMP_SQL,
                 vec![
                     Bind::Int(parks as i64),
+                    Bind::Int(now as i64),
                     Bind::Int(i64::from(PARK_MAX_ROWS)),
-                    Bind::Int(self.sql.now_ms() as i64),
                 ],
             ));
-        }
-        let mut k = 0u64;
-        for op in ops {
-            let (back, place) = if matches!(op, ParkOp::Park { .. }) {
-                k += 1;
-                (parks - k, k - 1)
-            } else {
-                (0, 0)
-            };
-            stmts.push(op.stmt(back, place));
+            stmts.push(Stmt::new(PARK_GUARD_SQL, room.clone()));
+            stmts.push(Stmt::new(PARK_MAKE_ROOM_SQL, room));
         }
         let out = self.sql.run_batch(stmts).await?;
-        Ok(out[marks.len() + seq..]
+        let at = marks.len();
+        if parks > 0 {
+            self.room_made(&out[at + ops.len() + 2]).await;
+        }
+        Ok(out[at..at + ops.len()]
             .iter()
             .zip(ops)
             .map(|(o, op)| OpOut {
@@ -659,8 +741,8 @@ pub trait RelayPort {
 }
 
 /// N2: the relay message id of one seat's `pot` event: the sha256 hex (64, the relay's stored-id shape) of the
-/// outpoint, the recipient (lowercase) and the park's TOKEN (`g<generation>`; a wake-up the park refused at its
-/// ceiling has none and takes `a<at_ms>`, the event's own stamp). One intent's every send (the detached announce, each
+/// outpoint, the recipient (lowercase) and the park's TOKEN (`g<generation>`; since N6 every send has one: a
+/// call with none, kept for the type, takes `a<at_ms>`, the event's own stamp). One intent's every send (the detached announce, each
 /// drain retry) carries one id, and the relay (`rust-message-box` 0.4.6, `split_push_body`: a flat `/push` body's
 /// `messageId` is kept; `messages.message_id` is UNIQUE and stored `INSERT OR IGNORE`) files it once and answers a
 /// repeat `400 ERR_DUPLICATE_MESSAGE`, which [`crate::internal_events::push_answer`] reads as delivered.
@@ -680,8 +762,8 @@ pub struct AnnouncePlan {
     /// (identity, txid, vout): one `pot` event into the seat's `low_events` box.
     pub seat_events: Vec<(String, String, u32)>,
     pub at_ms: u64,
-    /// Per wake-up of [`AnnouncePlan::wakes`], the token its park WROTE (N1: read back by `RETURNING`); `None` for one
-    /// the park refused at its ceiling (N3), announced once without a park.
+    /// Per wake-up of [`AnnouncePlan::wakes`], the token its park WROTE (N1: read back by `RETURNING`); `None` is
+    /// never planned since N6 (a refused body announces nothing; kept for the type).
     pub generations: Vec<Option<u64>>,
 }
 
@@ -738,7 +820,8 @@ pub struct PotChangedOutcome {
     pub stale_fault: Option<String>,
     /// Wake-ups parked durably before the answer: the rows the park WROTE (N1, `RETURNING`).
     pub parked: usize,
-    /// Wake-ups the park refused at its ceiling (N3), counted; announced once without a park.
+    /// N6: wake-ups of a body the park refused WHOLE at its ceiling (no room to make): counted, and the body is
+    /// answered 503 (`stale_fault` is set) with nothing announced.
     pub park_full: usize,
     pub plan: AnnouncePlan,
 }
@@ -810,7 +893,7 @@ pub async fn apply_pot_changed<S: HookStore>(
     }
     // H1: every wake-up of the plan is PARKED in the same write batch as the stale marks, BEFORE the answer, not
     // due until the detached announce has had its window; the announce's settle takes out what it delivered. N1:
-    // each park's token is the one the batch WROTE; N3: a park refused at the ceiling is counted.
+    // each park's token is the one the batch WROTE; N6: a batch the ceiling refuses is rolled back whole.
     let parks: Vec<ParkOp> = out
         .plan
         .wakes()
@@ -825,19 +908,20 @@ pub async fn apply_pot_changed<S: HookStore>(
         Ok(outs) => {
             out.plan.generations = outs.iter().map(|o| o.generation).collect();
             out.parked = outs.iter().filter(|o| o.generation.is_some()).count();
-            out.park_full = parks.len() - out.parked;
-            if out.park_full > 0 {
-                store.log(&format!(
-                    "[pot-changed] the park is FULL ({PARK_MAX_ROWS} rows): {} wake-up(s) not parked, announced once",
-                    out.park_full
-                ));
-                store
-                    .counters(vec![(
-                        COUNTER_ANNOUNCE_PARK_FULL.to_string(),
-                        out.park_full as u64,
-                    )])
-                    .await;
-            }
+        }
+        Err(e) if !parks.is_empty() && e.contains(PARK_FULL_FAULT) => {
+            out.park_full = parks.len();
+            store.log(&format!(
+                "[pot-changed] the park is FULL ({PARK_MAX_ROWS} rows, no room to make): the body's {} wake-up(s) refused, answered 503, nothing announced",
+                out.park_full
+            ));
+            store
+                .counters(vec![(
+                    COUNTER_ANNOUNCE_PARK_FULL.to_string(),
+                    out.park_full as u64,
+                )])
+                .await;
+            out.stale_fault = Some(format!("the park is full: {e}"));
         }
         Err(e) => out.stale_fault = Some(e),
     }
@@ -1000,7 +1084,7 @@ pub type Detached = std::pin::Pin<Box<dyn Future<Output = ()>>>;
 /// The detached announce of one body, then its SETTLE (H1): a delivered wake-up (or one the deploy cannot send)
 /// leaves the park at the token its park wrote; one that failed or had not answered at the wall is retried by the
 /// drain (attempt 1, due after [`PARK_RETRY_BASE_MS`]) at that token only (N1: a later hook's park of the key is a new
-/// intent, untouched). A wake-up the park refused (N3) is sent once and settles nothing. One write batch; its log line
+/// intent, untouched). A call with no token (none since N6) settles nothing. One write batch; its log line
 /// and its counters.
 pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
     store: &S,
@@ -2365,9 +2449,8 @@ pub(crate) mod tests {
 
     /// (N3, the delta review) THE PARK IS BOUNDED AND ITS DRAIN FOLLOWS THE BACKLOG. The review's reproduction: 400
     /// distinct capped bodies whose detached work is cancelled left 3,200 parks on `24bbda1` (`left: 3200 right: <=
-    /// 2048`), and a pass drained 24. Now a NEW key is parked only under [`PARK_MAX_ROWS`]: the table holds 2,048,
-    /// the 1,152 refused are counted and logged and each body answers what it parked; a refused wake-up is still
-    /// announced once (volatile). A pass runs rounds while the backlog fills them: 96 delivered, not 24. A live row
+    /// 2048`), and a pass drained 24. Now the table holds 2,048: the 144 bodies past it are refused WHOLE (N6 of the
+    /// second delta review: 503, nothing announced), their 1,152 wake-ups counted and logged. A pass runs rounds while the backlog fills them: 96 delivered, not 24. A live row
     /// due for longer than a day is aged out (exhausted, then swept), at most 50 a pass.
     #[tokio::test(flavor = "current_thread")]
     async fn e649f2_n3_the_park_is_bounded_and_the_drain_follows_the_backlog() {
@@ -2394,8 +2477,8 @@ pub(crate) mod tests {
             if b == 399 {
                 assert_eq!(
                     rec.0.borrow().len(),
-                    1,
-                    "a refused wake-up is still announced once"
+                    0,
+                    "N6: a refused body announces nothing"
                 );
             }
         }
@@ -2414,7 +2497,10 @@ pub(crate) mod tests {
             (0, 8),
             "the last body answers what it parked"
         );
-        assert_eq!(last.plan.generations, vec![None; 8]);
+        assert!(
+            last.stale_fault.is_some(),
+            "N6: a refused body is answered 503"
+        );
         assert!(store
             .sql
             .lines
@@ -2794,5 +2880,228 @@ pub(crate) mod tests {
             rows.iter().all(|r| r.3 == 1 && r.4.is_none()),
             "each at attempt 1, live"
         );
+    }
+
+    /// The table filled to `rows` directly (older live rows, attempts 0, due at once; keys `9..`, apart from every
+    /// fixture's), for the ceiling's pins.
+    fn fill_parked(db: &SqliteSql, rows: u32) {
+        db.conn
+            .execute_batch(&format!(
+                "WITH RECURSIVE k(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM k WHERE i + 1 < {rows}) \
+                 INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) \
+                 SELECT printf('9%063x:0', i), 'room', '', i, 0, i, i + 1, NULL FROM k"
+            ))
+            .unwrap();
+    }
+
+    /// (N6, the second delta review) A WAKE-UP IS NEVER ACKNOWLEDGED UNPARKED. The review's reproduction on
+    /// `c830527`: 400 capped bodies with cancelled announces leave 2,048 rows; the mixed body then answered 200 with
+    /// `parkFull: 22` and volatile sends; its announce cancelled, 22 drain passes over the 2,048 older rows never
+    /// delivered one of its wake-ups (RED: `left: 0 right: 22`). Now that body is refused WHOLE: 503, nothing written
+    /// (its stale marks rolled back too), nothing announced, counted; the producer's re-send after the drain has made
+    /// room parks all 22, and the drain delivers them though the re-sent announce is cancelled too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f3_n6_a_the_review_sequence_never_loses_the_mixed_body_silently() {
+        let (db, mixed) = mixed_fixture();
+        let store = Rc::new(HookD1 { sql: db });
+        let relay = Rc::new(Relay::default());
+        let at = store.sql.now.get();
+        for b in 0..400u32 {
+            let ops: Vec<(String, u32)> = (0..8u32)
+                .map(|i| (format!("a{b:031x}{i:032x}"), 0))
+                .collect();
+            let rec = Recorded::default();
+            serve_pot_changed(
+                store.clone(),
+                relay.clone(),
+                std::future::pending::<()>(),
+                &|f| rec.0.borrow_mut().push(f),
+                &ops,
+                at,
+            )
+            .await;
+        }
+        assert_eq!(parked_count(&store.sql), i64::from(PARK_MAX_ROWS));
+        let stale = |db: &SqliteSql| -> i64 {
+            db.conn
+                .query_row("SELECT COUNT(*) FROM owed_state WHERE stale = 1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        let rec = Recorded::default();
+        let o = serve_pot_changed(
+            store.clone(),
+            relay.clone(),
+            std::future::pending::<()>(),
+            &|f| rec.0.borrow_mut().push(f),
+            &mixed,
+            at,
+        )
+        .await;
+        assert_eq!(
+            (o.parked, o.park_full, rec.0.borrow().len()),
+            (0, 22, 0),
+            "refused whole, nothing announced"
+        );
+        assert!(
+            o.stale_fault
+                .as_deref()
+                .is_some_and(|e| e.contains("park is full")),
+            "answered 503: {:?}",
+            o.stale_fault
+        );
+        assert_eq!(stale(&store.sql), 0, "the batch rolled back whole");
+        assert_eq!(parked_count(&store.sql), i64::from(PARK_MAX_ROWS));
+        assert_eq!(
+            store.sql.counter(COUNTER_ANNOUNCE_PARK_FULL),
+            1152 + 22,
+            "every refused wake-up counted"
+        );
+        // the producer re-sends a retryable answer; its announce is cancelled again; the drain delivers
+        let quick = Relay::default();
+        let mut resent = None;
+        for pass in 0..30u64 {
+            store.sql.now.set(at + PARK_GRACE_MS + pass * 900_000);
+            drain_parked(&*store, &quick, tokio::time::sleep(Duration::from_secs(5))).await;
+            if resent.is_none() && parked_count(&store.sql) <= i64::from(PARK_MAX_ROWS) - 22 {
+                let rec = Recorded::default();
+                let again = serve_pot_changed(
+                    store.clone(),
+                    relay.clone(),
+                    std::future::pending::<()>(),
+                    &|f| rec.0.borrow_mut().push(f),
+                    &mixed,
+                    store.sql.now.get() - PARK_GRACE_MS,
+                )
+                .await;
+                assert_eq!((again.parked, again.park_full), (22, 0));
+                resent = Some(again);
+            }
+        }
+        let txids: Vec<String> = mixed.iter().map(|(t, _)| t.clone()).collect();
+        let got = quick
+            .delivered
+            .borrow()
+            .iter()
+            .filter(|(_, t, _)| txids.contains(t))
+            .count();
+        let lost = store
+            .sql
+            .lines
+            .borrow()
+            .iter()
+            .filter(|l| l.contains("LOST"))
+            .count();
+        assert_eq!(
+            got + lost,
+            22,
+            "every wake-up of the mixed body delivered or named lost"
+        );
+        assert_eq!(got, 22);
+    }
+
+    /// (N6) THE ROOM A BATCH MAY MAKE, and its bound. At 2,040 rows the mixed body's 22 wake-ups passed the ceiling by
+    /// 14; on `c830527` its eight rooms took the slots and the fourteen seats were refused, so with every send failing
+    /// no seat retry row existed (the review's `left: 0 right: 14`). Now: (1) with no row to displace, the body is
+    /// refused whole; (2) the oldest EXHAUSTED rows make the room first (counted, nothing named lost); (3) then the
+    /// oldest LIVE rows that failed at least [`PARK_DISPLACE_MIN_ATTEMPTS`] deliveries, each named LOST in the log and
+    /// counted; a live row under that count is never displaced; and every failed seat send of a parked body leaves its
+    /// retry row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f3_n6_b_room_is_made_of_exhausted_then_failing_live_rows_and_past_that_refused() {
+        let (db, mixed) = mixed_fixture();
+        fill_parked(&db, PARK_MAX_ROWS - 8);
+        let store = Rc::new(HookD1 { sql: db });
+        let down = Rc::new(SlowRelay::new(Duration::ZERO, Delivery::Failed));
+        let at = store.sql.now.get();
+        let serve = |ops: Vec<(String, u32)>| {
+            let (store, down) = (store.clone(), down.clone());
+            async move {
+                let rec = Recorded::default();
+                let o = serve_pot_changed(
+                    store,
+                    down,
+                    std::future::pending::<()>(),
+                    &|f| rec.0.borrow_mut().push(f),
+                    &ops,
+                    at,
+                )
+                .await;
+                rec.run_all().await;
+                o
+            }
+        };
+        // (1) attempts under the bound: nothing to displace, refused whole
+        store
+            .sql
+            .conn
+            .execute_batch(&format!(
+                "UPDATE pot_announce_parked SET attempts = {}",
+                PARK_DISPLACE_MIN_ATTEMPTS - 1
+            ))
+            .unwrap();
+        let o = serve(mixed.clone()).await;
+        assert_eq!((o.parked, o.park_full), (0, 22));
+        assert_eq!(parked_count(&store.sql), i64::from(PARK_MAX_ROWS) - 8);
+        // (2) twenty exhausted rows: the fourteen oldest make the room, nothing named lost
+        store
+            .sql
+            .conn
+            .execute_batch(
+                "UPDATE pot_announce_parked SET exhausted_at_ms = at WHERE rowid IN (SELECT rowid FROM pot_announce_parked ORDER BY at DESC LIMIT 20)",
+            )
+            .unwrap();
+        let o = serve(mixed.clone()).await;
+        assert_eq!((o.parked, o.park_full), (22, 0));
+        assert!(o.stale_fault.is_none());
+        assert_eq!(parked_count(&store.sql), i64::from(PARK_MAX_ROWS));
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_EVICTED_EXHAUSTED), 14);
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_DISPLACED), 0);
+        let seat_retries: i64 = store
+            .sql
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pot_announce_parked WHERE kind = 'seat' AND attempts = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            seat_retries, 14,
+            "every failed seat send keeps its retry row"
+        );
+        // (3) a new 8-room body: six exhausted rows left, then two live rows at the bound, oldest first, named LOST
+        store
+            .sql
+            .conn
+            .execute_batch(&format!(
+                "UPDATE pot_announce_parked SET attempts = {} WHERE outpoint IN ('{}:0', '{}:0')",
+                PARK_DISPLACE_MIN_ATTEMPTS,
+                format_args!("9{:063x}", 0),
+                format_args!("9{:063x}", 1)
+            ))
+            .unwrap();
+        let fresh: Vec<(String, u32)> = (0..8u32).map(|i| (format!("b{i:063x}"), 0)).collect();
+        let o = serve(fresh).await;
+        assert_eq!((o.parked, o.park_full), (8, 0));
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_EVICTED_EXHAUSTED), 20);
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_DISPLACED), 2);
+        let lost: Vec<String> = store
+            .sql
+            .lines
+            .borrow()
+            .iter()
+            .filter(|l| l.contains("LOST"))
+            .cloned()
+            .collect();
+        assert_eq!(lost.len(), 2, "{lost:?}");
+        assert!(lost[0].contains(&format!("9{:063x}:0 room", 0)), "{lost:?}");
+        assert!(lost[1].contains(&format!("9{:063x}:0 room", 1)), "{lost:?}");
+        // (4) full again of rows under the bound (the batch's own rows included): the next body is refused whole
+        let more: Vec<(String, u32)> = (0..8u32).map(|i| (format!("c{i:063x}"), 0)).collect();
+        let o = serve(more).await;
+        assert_eq!((o.parked, o.park_full), (0, 8));
+        assert_eq!(parked_count(&store.sql), i64::from(PARK_MAX_ROWS));
     }
 }
