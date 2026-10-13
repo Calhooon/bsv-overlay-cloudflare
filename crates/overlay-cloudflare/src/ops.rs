@@ -359,6 +359,10 @@ pub const COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED: &str = "queue_replay_skipped_evi
 /// loop 18, round 2 of the gate (NEW-1): an eviction pass overtaken by a READMISSION (the chain's word landed
 /// under the pass) — the pass's own moves restored again, the ledger left readmitted.
 pub const COUNTER_ADMIT_FAST_EVICT_YIELDED: &str = "admit_fast_evict_yielded_total";
+/// bsv-low #649: a background flush of an admit-fast job (the pending watch, the `/arc-ingest` refusal and
+/// witness jobs) SKIPPED because less than `pot_changes::FLUSH_WINDOW_FLOOR_MS` of the invocation's `waitUntil`
+/// window was left. The notes stay in the isolate's sets for its next flush (never drained and dropped).
+pub const COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW: &str = "admit_fast_flush_skipped_no_window_total";
 /// loop 18, round 2 (NEW-2): a readmission whose restore faulted on a table — the row left OPEN (never a
 /// closed ledger over rows still in a twin); the next accept or proof runs it again. Also bumped by an eviction
 /// pass whose yield-restore faulted with twin rows left (re-opened), by the readmission's belt on the same, and
@@ -1133,6 +1137,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
         COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
         COUNTER_ADMIT_FAST_EVICT_YIELDED,
+        COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW,
         COUNTER_ADMIT_FAST_READMIT_INCOMPLETE,
         COUNTER_ADMIT_FAST_CONFLICT_SCANNED,
         COUNTER_ADMIT_FAST_CONFLICT_EVICTED,

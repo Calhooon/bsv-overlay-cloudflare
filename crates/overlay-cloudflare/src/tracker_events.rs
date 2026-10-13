@@ -97,11 +97,15 @@ pub fn health_json() -> Value {
     COUNTS.with(|c| json!(*c.borrow()))
 }
 pub async fn ship(env: &worker::Env, events: Vec<Value>) {
+    ship_until(env, events, worker::Date::now().as_millis() + 20_000).await;
+}
+/// bsv-low #649: [`ship`] under a deadline the caller holds (a background flush's one window, shared with
+/// the pot and hop sets, never a 20 s of its own on top).
+pub async fn ship_until(env: &worker::Env, events: Vec<Value>, deadline: u64) {
     if events.is_empty() {
         return;
     }
     let configured = crate::change_flush::configured(env);
-    let deadline = worker::Date::now().as_millis() + 20_000;
     for frame in events {
         if worker::Date::now().as_millis() >= deadline {
             count(&frame, "walled");
