@@ -115,6 +115,21 @@
         "stmts": 8
       },
       "censusKey": "/record"
+    },
+    "pot-changed-hook-1": {
+      "route": "/internal/pot-changed: B's pot, one outpoint, no decoded params, its two marker-named seats marked stale (E649 L4: the attribution batch, the stale-mark batch; no walk, no relay call on the answer path)",
+      "measured": {
+        "reads": 7,
+        "writes": 0,
+        "stmts": 6
+      },
+      "ceiling": {
+        "reads": 11,
+        "writes": 2,
+        "stmts": 8,
+        "maxReads": 11
+      },
+      "censusKey": null
     }
   },
   "censusKey": "the d1Budget route a production census holds against this ceiling (advisory there: production rows are not the fixture's); null = the route's maximum is another scenario's"

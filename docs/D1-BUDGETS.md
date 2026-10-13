@@ -67,6 +67,17 @@ that starts writing reds); statements measured + 2 (a loop that reads per row ov
 | submit-admit-1 | `/submit`, an operator `historical-tx-no-spv` submit admitting one tm_collected output | 0 / 13 / 7 | 4 / 15 / 9 |
 
 | record-potparty-filing | `/record?kind=potparty`, signed stranger naming A's live pot | 11 / 7 / 6 | 17 / 9 / 8 |
+| pot-changed-hook-1 | `/internal/pot-changed`, B's pot (no decoded params, two marker-named seats) | 7 / 0 / 6 | 11 / 2 / 8 |
+
+E649 L4 (2026-10-13, lane E649-HOOK): the pot hook's own answer is held to a ceiling (it had none: leg 4 checked
+only that it carried a `d1` segment). Measured with `D1_BUDGET_MEASURE=1 make ci-d1-budget` on the fixture D1:
+7 reads / 0 writes / 6 statements, the SAME figure on `57751b4` (the base) with the harness change alone: the
+fixture's pot `bb..:0` has no decoded params, so it takes the marker branch, which never gathered. What changed is
+the round trips, which the ledger does not count: the base ran its 6 statements one after another, L4 runs them
+as two batches (the decoded row and three marker arms; the two stale marks), pinned natively by
+`pot_hook::tests::e649_hook_b_*`. Writes take measured + 2 (the hook is a write: a seat with an `owed_state` row
+is written by its stale mark). Not in the fixture: a decoded, attributed pot (the path that gathered `/results`
+per seat on the base and now reads one seat-marker batch).
 
 NS2 fold (2026-10-12): the real signed filing is measured under `/record`, including the pot stale mark and the
 filer mark. SHED-M1 removes the three indexed party enumeration reads entirely; named parties do no work until
