@@ -35,6 +35,7 @@ pub mod ops;
 pub mod peer_crawler;
 pub mod pot_changes;
 pub mod proof_fetcher;
+pub mod proof_window;
 pub mod queue;
 pub mod relatch;
 pub mod reorg_sweep;
@@ -626,7 +627,8 @@ pub(crate) fn courier_fetcher(
     env: &Env,
     tracker: Option<Rc<dyn bsv_rs::transaction::ChainTracker>>,
 ) -> crate::proof_fetcher::ChainProofFetcher {
-    let mut f = crate::proof_fetcher::ChainProofFetcher::new(tracker);
+    let mut f = crate::proof_fetcher::ChainProofFetcher::new(tracker)
+        .with_sources(crate::proof_fetcher::ProofSources::from_env(env));
     if let Some(u) = env
         .var("ARCADE_URL")
         .ok()
@@ -1297,6 +1299,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         hopparty_storage.clone(),
     );
 
+    crate::proof_window::run_pass(&engine, &ops_db).await;
+
     // Give stored proof completion its own early slot. Held GASP graphs are
     // not admitted transactions: their roots use hydrate_root during sync.
     // A timeout stamps no success heartbeat; the next tick retries the rows.
@@ -1743,8 +1747,13 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
     // #602 fold (MEDIUM-2): the conflict pass's GETs ride the WoC key when one is installed.
     let woc_key = env.secret("WOC_API_KEY").ok().map(|k| k.to_string());
-    let retire =
-        crate::proof_fetcher::run_retire_pass(&ops_db, &arcade_base, woc_key.as_deref()).await;
+    let retire = crate::proof_fetcher::run_retire_pass(
+        &ops_db,
+        &arcade_base,
+        woc_key.as_deref(),
+        crate::proof_fetcher::ProofSources::from_env(&env),
+    )
+    .await;
     worker::console_log!(
         "Scheduled: retire-pass — scanned={} retired={} kept_present={} kept_uncertain={} conflict: scanned={} evicted={} faults={}",
         retire.scanned,
@@ -1768,8 +1777,13 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     //    — 3 lifetime attempts, spacing 1h/6h, dead-letter log at the cap).
     let tx_storage = D1Storage::new(ops_db.clone());
     let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
-    let rb = crate::proof_fetcher::run_rebroadcast_backstop(&tx_storage, taal_key.as_deref(), None)
-        .await;
+    let rb = crate::proof_fetcher::run_rebroadcast_backstop(
+        &tx_storage,
+        taal_key.as_deref(),
+        None,
+        crate::proof_fetcher::ProofSources::from_env(&env),
+    )
+    .await;
     worker::console_log!(
         "Scheduled: rebroadcast-backstop (transactions) — scanned={} present={} \
          inconclusive={} rebroadcast={} failed={} budget_skipped={} attempted={}",
@@ -2130,8 +2144,13 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
     // #602 fold (MEDIUM-2): the conflict pass's GETs ride the WoC key when one is installed.
     let woc_key = env.secret("WOC_API_KEY").ok().map(|k| k.to_string());
-    let retire =
-        crate::proof_fetcher::run_retire_pass(&ops_db, &arcade_base, woc_key.as_deref()).await;
+    let retire = crate::proof_fetcher::run_retire_pass(
+        &ops_db,
+        &arcade_base,
+        woc_key.as_deref(),
+        crate::proof_fetcher::ProofSources::from_env(&env),
+    )
+    .await;
     worker::console_log!(
         "complete-proofs: retire-pass — scanned={} retired={} kept_present={} kept_uncertain={} conflict: scanned={} evicted={} faults={}",
         retire.scanned,
@@ -2147,8 +2166,13 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     //     the incident's attempt cap; see the scheduled block's note.
     let tx_storage = D1Storage::new(db.clone());
     let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
-    let rb = crate::proof_fetcher::run_rebroadcast_backstop(&tx_storage, taal_key.as_deref(), None)
-        .await;
+    let rb = crate::proof_fetcher::run_rebroadcast_backstop(
+        &tx_storage,
+        taal_key.as_deref(),
+        None,
+        crate::proof_fetcher::ProofSources::from_env(&env),
+    )
+    .await;
     // 5. observability heartbeat + counters (same as the cron would stamp).
     let proofs_completed = tx_completed + ps.completed as u64;
     let fetch_failed = tx_fetch_failed + ps.fetch_failed as u64;

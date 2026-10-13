@@ -1315,6 +1315,7 @@ async fn submit_parts(
         let evicted_at_ms = door_open.as_ref().map(|ev| ev.evicted_at_ms as i64);
         let mut arcade =
             crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default())
+                .with_proof_sources(crate::proof_fetcher::ProofSources::from_env(env))
                 // #214: Arcade's async REJECTED is never authoritative
                 // uncorroborated — an exhausted ladder gets a second
                 // broadcaster's word (TAAL → GorillaPool) before any 422.
@@ -2333,7 +2334,8 @@ async fn submit_parts(
         if let Ok(seen_db) = env.d1("OVERLAY_DB") {
             let beef_for_seen = tagged_beef.beef.clone();
             let seen_arcade =
-                crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default());
+                crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default())
+                    .with_proof_sources(crate::proof_fetcher::ProofSources::from_env(env));
             let seen_env = env.clone();
             ctx.wait_until(async move {
                 // The same subject rule as the gate (loop-2 hardening): a

@@ -3726,7 +3726,7 @@ impl Engine {
             .collect();
         let found = self
             .storage
-            .find_outputs_by_outpoints(&outpoints, true)
+            .find_served_outputs(&outpoints)
             .await
             .map_err(|e| EngineError::StorageError(e.to_string()))?;
 
@@ -5517,6 +5517,142 @@ impl Engine {
     /// Union local records, tracker answers, SLAP-named providers and bootstrap.
     /// Reference: overlay-services@480d77a src/Engine.ts:839-876 and
     /// ts-stack@edf6e03 packages/sdk/src/overlay-tools/LookupResolver.ts:1976.
+    /// Ask the configured topic peers for held outputs, using the same SHIP
+    /// discovery as sync. Only a header-verified proof can change stored bytes.
+    pub async fn rerequest_held_proofs(
+        &self,
+        candidates: &[crate::proof_window::HeldOutput],
+        progress: &std::cell::Cell<crate::proof_window::PeerProofSummary>,
+    ) {
+        use crate::proof_window::{PEER_PROOF_REQUEST_MS, PEER_PROOF_ROW_LIMIT};
+        let Some(factory) = &self.gasp_remote_factory else {
+            return;
+        };
+        let Some(tracker) = self.chain_tracker.as_deref() else {
+            return;
+        };
+        let mut lookup_hosts = None;
+        let mut topic_peers = HashMap::new();
+        let mut landed = HashSet::new();
+        for candidate in candidates.iter().take(PEER_PROOF_ROW_LIMIT) {
+            if !self.managers.contains_key(&candidate.topic) {
+                continue;
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                topic_peers.entry(candidate.topic.clone())
+            {
+                let peers = match self.config.sync_configuration.get(&candidate.topic) {
+                    Some(SyncTarget::Ship) => {
+                        self.discover_ship_peers(&candidate.topic, &mut lookup_hosts)
+                            .await
+                    }
+                    Some(SyncTarget::Peers(peers)) => self.ship_peers_excluding_self(peers.clone()),
+                    _ => Vec::new(),
+                };
+                entry.insert(peers);
+            }
+            for peer in &topic_peers[&candidate.topic] {
+                let remote = factory.create_remote(peer, &candidate.topic);
+                let graph_id = format!("{}.{}", candidate.txid, candidate.output_index);
+                let mut summary = progress.get();
+                summary.requests += 1;
+                progress.set(summary);
+                let ask =
+                    remote.request_node(&graph_id, &candidate.txid, candidate.output_index, false);
+                let response = if let Some((sleep, _)) = &self.peer_sync_budget {
+                    crate::gasp::race_or_deadline(ask, sleep(PEER_PROOF_REQUEST_MS)).await
+                } else {
+                    Some(ask.await)
+                };
+                let Some(Ok(node)) = response else {
+                    let mut summary = progress.get();
+                    summary.faults += 1;
+                    progress.set(summary);
+                    continue;
+                };
+                if landed.contains(&candidate.txid) {
+                    continue;
+                }
+                let Some(proof_hex) = node.proof else {
+                    continue;
+                };
+                let proof = match beef_limits::merkle_path_from_hex(
+                    &proof_hex,
+                    beef_limits::COURIER_PROOF_MAX_BYTES,
+                ) {
+                    Ok(proof) => proof,
+                    Err(_) => {
+                        let mut summary = progress.get();
+                        summary.refused += 1;
+                        progress.set(summary);
+                        continue;
+                    }
+                };
+                let valid = match proof.compute_root(Some(&candidate.txid)) {
+                    Ok(root) => tracker
+                        .is_valid_root_for_height(&root, proof.block_height)
+                        .await
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+                if !valid {
+                    let mut summary = progress.get();
+                    summary.refused += 1;
+                    progress.set(summary);
+                    continue;
+                }
+                match self.land_peer_proof(candidate, &proof).await {
+                    Ok(()) => {
+                        landed.insert(candidate.txid.clone());
+                        let mut summary = progress.get();
+                        summary.landed += 1;
+                        progress.set(summary);
+                    }
+                    Err(error) => {
+                        warn!(%error, "[proof window] verified proof could not be stored");
+                        let mut summary = progress.get();
+                        summary.faults += 1;
+                        progress.set(summary);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn land_peer_proof(
+        &self,
+        candidate: &crate::proof_window::HeldOutput,
+        proof: &bsv_rs::transaction::MerklePath,
+    ) -> Result<(), EngineError> {
+        let output = self
+            .storage
+            .find_output(
+                &candidate.txid,
+                candidate.output_index,
+                Some(&candidate.topic),
+                None,
+                true,
+            )
+            .await
+            .map_err(|e| EngineError::StorageError(e.to_string()))?
+            .ok_or(EngineError::NodeNotFound)?;
+        let beef = output
+            .beef
+            .ok_or_else(|| EngineError::BeefParseError("missing stored BEEF".into()))?;
+        let stitched = Self::stitch_proof_into_stored_beef(&beef, &candidate.txid, proof)
+            .ok_or_else(|| {
+                EngineError::BeefParseError("proof does not stitch into stored subject".into())
+            })?;
+        self.storage
+            .update_transaction_beef(&candidate.txid, &stitched)
+            .await
+            .map_err(|e| EngineError::StorageError(e.to_string()))?;
+        self.storage
+            .mark_transaction_proven_at(&candidate.txid, Some(u64::from(proof.block_height)))
+            .await
+            .map_err(|e| EngineError::StorageError(e.to_string()))
+    }
+
     async fn discover_ship_peers(
         &self,
         topic: &str,
@@ -6563,6 +6699,159 @@ mod tests {
             }
             _ => panic!("Expected OutputList"),
         }
+    }
+
+    #[tokio::test]
+    async fn proof_window_holds_an_aged_child_with_a_proven_parent() {
+        let mut engine = make_engine(vec![0]);
+        let storage = std::rc::Rc::new(MemoryStorage::new());
+        engine.storage = Box::new(storage.clone());
+        engine
+            .submit(&test_tagged_beef(vec!["tm_test"]), SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        assert!(beef_limits::own_proof(&test_beef(), TEST_TXID)
+            .unwrap()
+            .is_none());
+        let question = LookupQuestion::new("ls_test", serde_json::json!({}));
+        storage.advance_clock((crate::proof_window::PROOFLESS_FLAG_MS / 1000) as u64);
+        assert_eq!(
+            engine
+                .lookup_with_txids(&question, None)
+                .await
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+        storage.advance_clock(1);
+        assert!(
+            engine
+                .lookup_with_txids(&question, None)
+                .await
+                .unwrap()
+                .1
+                .is_empty(),
+            "an aged unproven child must be held even when its parent is proven"
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_window_peer_proof_verifies_then_restores_lookup() {
+        use crate::proof_window::{HeldOutput, PeerProofSummary, PROOFLESS_FLAG_MS};
+        let mut engine = make_engine(vec![0]);
+        let storage = std::rc::Rc::new(MemoryStorage::new());
+        engine.storage = Box::new(storage.clone());
+        engine
+            .submit(&test_tagged_beef(vec!["tm_test"]), SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        storage.advance_clock((PROOFLESS_FLAG_MS / 1000) as u64 + 1);
+        let question = LookupQuestion::new("ls_test", serde_json::json!({}));
+        let candidate = HeldOutput {
+            txid: TEST_TXID.into(),
+            output_index: 0,
+            topic: "tm_test".into(),
+        };
+        let (_, mut remote) = budget_page_engine(1);
+        remote.node_cost_ms = 0;
+        remote.nodes = std::rc::Rc::new(HashMap::from([(
+            TEST_TXID.into(),
+            crate::types::GASPNode {
+                graph_id: String::new(),
+                raw_tx: String::new(),
+                output_index: 0,
+                proof: Some(single_leaf_bump_hex(TEST_TXID, 800_000)),
+                tx_metadata: None,
+                output_metadata: None,
+                inputs: None,
+            },
+        )]));
+        engine
+            .config
+            .sync_configuration
+            .insert("tm_test".into(), SyncTarget::Ship);
+        engine.ship_bootstrap_peers.insert(
+            "tm_test".into(),
+            vec!["https://a.example".into(), "https://b.example".into()],
+        );
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let progress = std::cell::Cell::new(PeerProofSummary::default());
+        engine.chain_tracker = Some(Box::new(bsv_rs::transaction::MockChainTracker::new(
+            800_001,
+        )));
+        engine
+            .rerequest_held_proofs(std::slice::from_ref(&candidate), &progress)
+            .await;
+        assert_eq!(progress.get().requests, 2, "ask every topic peer");
+        assert_eq!(progress.get().landed, 0);
+        assert_eq!(progress.get().refused, 2);
+        assert!(engine
+            .lookup_with_txids(&question, None)
+            .await
+            .unwrap()
+            .1
+            .is_empty());
+        let mut tracker = bsv_rs::transaction::MockChainTracker::new(800_001);
+        tracker.add_root(800_000, TEST_TXID.into());
+        engine.chain_tracker = Some(Box::new(tracker));
+        engine.rerequest_held_proofs(&[candidate], &progress).await;
+        assert_eq!(progress.get().requests, 4);
+        assert_eq!(
+            progress.get().landed,
+            1,
+            "count durable proofs, not peer answers"
+        );
+        let (_, txids) = engine.lookup_with_txids(&question, None).await.unwrap();
+        assert_eq!(txids, vec![TEST_TXID]);
+        let stored = storage
+            .find_output(TEST_TXID, 0, None, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            beef_limits::own_proof(stored.beef.as_ref().unwrap(), TEST_TXID)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(storage.proven_at_height(TEST_TXID), Some(Some(800_000)));
+    }
+
+    #[tokio::test]
+    async fn proof_window_silent_peers_yield_at_the_request_budget() {
+        use crate::proof_window::{HeldOutput, PeerProofSummary, PEER_PROOF_REQUEST_MS};
+        let (mut engine, remote) = budget_page_engine(1);
+        engine.config.sync_configuration.insert(
+            "tm_test".into(),
+            SyncTarget::Peers(vec!["https://a.example".into(), "https://b.example".into()]),
+        );
+        let elapsed = remote.elapsed.clone();
+        engine.set_peer_sync_budget(
+            std::rc::Rc::new(move |ms| {
+                assert_eq!(ms, PEER_PROOF_REQUEST_MS);
+                let deadline = elapsed.get() + ms;
+                let elapsed = elapsed.clone();
+                Box::pin(std::future::poll_fn(move |_| {
+                    if elapsed.get() >= deadline {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }))
+            }),
+            30_000,
+        );
+        let candidate = HeldOutput {
+            txid: remote.outputs[0].txid.clone(),
+            output_index: 0,
+            topic: "tm_test".into(),
+        };
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let progress = std::cell::Cell::new(PeerProofSummary::default());
+        engine.rerequest_held_proofs(&[candidate], &progress).await;
+        assert_eq!(progress.get().requests, 2);
+        assert_eq!(progress.get().faults, 2);
+        assert_eq!(progress.get().landed, 0);
     }
 
     /// #291: the public sync-response page size is always bounded.

@@ -1547,6 +1547,7 @@ pub trait ConflictPresence {
 }
 
 pub struct CourierConflictPresence {
+    pub sources: crate::proof_fetcher::ProofSources,
     pub woc_api_key: Option<String>,
 }
 
@@ -1554,8 +1555,11 @@ pub struct CourierConflictPresence {
 impl ConflictPresence for CourierConflictPresence {
     async fn presence(&self, txid: &str) -> Option<crate::proof_fetcher::NetworkPresence> {
         use crate::proof_fetcher::*;
-        let b = bitails_presence(DEFAULT_BITAILS_BASE, txid).await;
-        let w = woc_presence(DEFAULT_WOC_BASE, self.woc_api_key.as_deref(), txid).await;
+        let b = self.sources.bitails_presence(txid).await;
+        let w = self
+            .sources
+            .woc_presence(self.woc_api_key.as_deref(), txid)
+            .await;
         Some(classify_presence(b, w))
     }
 }
@@ -1761,6 +1765,7 @@ impl ConflictPassSummary {
 pub async fn confirmed_conflict_pass(
     db: &D1Database,
     woc_api_key: Option<&str>,
+    sources: crate::proof_fetcher::ProofSources,
 ) -> ConflictPassSummary {
     let mut summary = ConflictPassSummary::default();
     #[derive(serde::Deserialize)]
@@ -1781,9 +1786,11 @@ pub async fn confirmed_conflict_pass(
         }
     };
     let fetcher = crate::proof_fetcher::ChainProofFetcher::new(None)
+        .with_sources(sources)
         .with_woc_api_key(woc_api_key.map(str::to_owned))
         .with_budget(24);
     let presence = CourierConflictPresence {
+        sources,
         woc_api_key: woc_api_key.map(str::to_owned),
     };
     for row in rows {
@@ -1918,23 +1925,17 @@ pub async fn evidence_check(
     txid: &str,
     webhook: (String, String),
 ) -> EvidenceVerdict {
-    let look = crate::proof_fetcher::arcade_look(&env.arcade_base, txid, Some(webhook)).await;
+    let sources = crate::proof_fetcher::ProofSources::from_env(&env.env);
+    let look = sources
+        .arcade_look(&env.arcade_base, txid, Some(webhook))
+        .await;
     let (bitails, woc) = match look {
         // Arcade holds it: nothing to corroborate. Every other word (fatal,
         // missing, a fault) is one source; the indexers are the second.
         crate::proof_fetcher::ArcadeLook::Present => (None, None),
         _ => {
-            let b = crate::proof_fetcher::bitails_presence(
-                crate::proof_fetcher::DEFAULT_BITAILS_BASE,
-                txid,
-            )
-            .await;
-            let w = crate::proof_fetcher::woc_presence(
-                crate::proof_fetcher::DEFAULT_WOC_BASE,
-                env.woc_api_key.as_deref(),
-                txid,
-            )
-            .await;
+            let b = sources.bitails_presence(txid).await;
+            let w = sources.woc_presence(env.woc_api_key.as_deref(), txid).await;
             (b, w)
         }
     };
@@ -2015,7 +2016,8 @@ pub async fn witness_job(env: EvidenceEnv, txid: String, pushed_status: String) 
         );
         return;
     };
-    let arcade = crate::broadcaster::ArcadeBroadcaster::new(env.arcade_base.clone());
+    let arcade = crate::broadcaster::ArcadeBroadcaster::new(env.arcade_base.clone())
+        .with_proof_sources(crate::proof_fetcher::ProofSources::from_env(&env.env));
     if arcade.network_witnessed(&txid).await {
         crate::ops::latch_network_seen(&db, &txid).await;
         // step 4: a background latch ships its own pots-room push.
@@ -2116,7 +2118,8 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
     // (an Rc: the watch-end proof read below builds the D1 pot store over the same handle; every `&db` below
     // deref-coerces to `&D1Database`)
     let db = std::rc::Rc::new(db);
-    let arcade = crate::broadcaster::ArcadeBroadcaster::new(env.arcade_base.clone());
+    let arcade = crate::broadcaster::ArcadeBroadcaster::new(env.arcade_base.clone())
+        .with_proof_sources(crate::proof_fetcher::ProofSources::from_env(&env.env));
     let mut last = crate::broadcaster::WitnessLook::Unknown;
     for sleep in PENDING_WATCH_SLEEPS_MS {
         crate::broadcaster::sleep_ms(sleep).await;

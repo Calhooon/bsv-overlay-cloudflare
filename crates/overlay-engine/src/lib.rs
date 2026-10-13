@@ -33,6 +33,7 @@ pub mod gasp;
 pub mod gasp_overlay;
 pub mod health_checker;
 pub mod lookup_service;
+pub mod proof_window;
 mod script_door;
 pub mod ship_lookup;
 pub mod storage;

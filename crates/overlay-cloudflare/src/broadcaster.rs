@@ -2362,6 +2362,7 @@ pub struct ArcadeBroadcaster {
     terminal_judged: std::cell::Cell<Option<TerminalJudgement>>,
     /// #519: the WoC key the presence read carries (the same one `evidence_check` reads; none installed today).
     woc_api_key: Option<String>,
+    proof_sources: crate::proof_fetcher::ProofSources,
     /// NL-6d: one base for both corroborating hosts (`CORROBORATOR_URL`, a local fixture); `None` in production.
     corroborator_url: Option<String>,
     /// NL-6d: the window of ancestors this invocation's corroboration reads ([`LegWindow`]).
@@ -2401,6 +2402,7 @@ impl ArcadeBroadcaster {
             terminal_ms: std::cell::Cell::new(0.0),
             terminal_judged: std::cell::Cell::new(None),
             woc_api_key: None,
+            proof_sources: crate::proof_fetcher::ProofSources::default(),
             corroborator_url: None,
             legs: LegWindow::in_request(),
             registration_skipped: std::cell::Cell::new(0),
@@ -2434,6 +2436,11 @@ impl ArcadeBroadcaster {
         self.corroborator_url = url
             .map(|u| u.trim().trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty());
+        self
+    }
+
+    pub fn with_proof_sources(mut self, sources: crate::proof_fetcher::ProofSources) -> Self {
+        self.proof_sources = sources;
         self
     }
 
@@ -2475,9 +2482,15 @@ impl ArcadeBroadcaster {
         if !allowed {
             return (NetworkPresence::Inconclusive, "capped");
         }
-        let bitails = crate::proof_fetcher::bitails_presence(crate::proof_fetcher::DEFAULT_BITAILS_BASE, txid).await;
-        let woc = crate::proof_fetcher::woc_presence(crate::proof_fetcher::DEFAULT_WOC_BASE, self.woc_api_key.as_deref(), txid).await;
-        (crate::proof_fetcher::classify_presence(bitails, woc), "couriers")
+        let bitails = self.proof_sources.bitails_presence(txid).await;
+        let woc = self
+            .proof_sources
+            .woc_presence(self.woc_api_key.as_deref(), txid)
+            .await;
+        (
+            crate::proof_fetcher::classify_presence(bitails, woc),
+            "couriers",
+        )
     }
 
     /// #519: remember a fresh verdict (the branch calls it AFTER the age decision: `terminal_memo_store`'s rule).

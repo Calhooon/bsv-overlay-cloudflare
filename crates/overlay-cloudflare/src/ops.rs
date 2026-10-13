@@ -467,7 +467,7 @@ pub fn courier_counter_name(rung: &str, kind: &str) -> String {
 pub const DEFAULT_MAX_STALE_MS: i64 = 6 * 60 * 60 * 1000;
 
 /// Proofless-ledger flag threshold: a tx proofless longer than this is flagged.
-pub const PROOFLESS_FLAG_MS: i64 = 24 * 60 * 60 * 1000;
+pub use overlay_engine::proof_window::PROOFLESS_FLAG_MS;
 
 /// Per-tick cap on how many proofless txids we newly enrol into the watch
 /// ledger from each store (keeps the write bounded; the ledger self-heals over
@@ -943,6 +943,9 @@ pub async fn refresh_proofless_watch(db: &D1Database) -> u64 {
 /// reason (INCIDENT D1-CALLBACK-FLOOD 2026-09-01: that store's retirement
 /// twin — corroborated network-dead, e.g. a UTXO_SPENT double-spend).
 pub(crate) fn proofless_watch_enrol_sql(table: &str) -> String {
+    if table == "transactions" {
+        return format!("INSERT OR IGNORE INTO proofless_watch (txid, first_seen_ms) SELECT txid, COALESCE(created_at * 1000, ?) FROM transactions WHERE has_proof = 0 AND retired_ms IS NULL ORDER BY RANDOM() LIMIT {WATCH_ENROLL_LIMIT}");
+    }
     let unprovable_clause = if table == "pot_beefs" {
         " AND structurally_unprovable IS NOT 1"
     } else {
@@ -1345,6 +1348,20 @@ pub async fn health_invariants(
 
     let counters = read_counters(db).await;
     let flagged = count_flagged(db, now - PROOFLESS_FLAG_MS).await;
+    let held_by_window = Query::new(crate::proof_window::held_count_sql())
+        .bind(now)
+        .fetch_optional::<CountRow>(db)
+        .await
+        .ok()
+        .flatten()
+        .map_or(-1, |r| r.c as i64);
+    let expired_unproven = Query::new(crate::proof_window::EXPIRED_COUNT_SQL)
+        .fetch_optional::<CountRow>(db)
+        .await
+        .ok()
+        .flatten()
+        .map_or(-1, |r| r.c as i64);
+
     let census = census_json(db).await;
     // #371: total network_seen latches — the observable the ci-route tier
     // asserts a submit MOVES (gate MEDIUM-1: both latch call sites are
@@ -1434,6 +1451,10 @@ pub async fn health_invariants(
         // #2b: GENUINE backlog only — retired (structurally-unprovable)
         // rows are excluded at enrol AND dropped by the watch GC.
         "prooflessOver24h": flagged,
+        "heldByWindow": held_by_window,
+        "peerProofRequests": counters.get("peer_proof_requests_total").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        "peerProofsLanded": counters.get("peer_proofs_landed_total").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        "retiredExpiredUnprovenTotal": expired_unproven,
         // #2b: where the residue went (live count; -1 = table unreadable).
         "retiredUnprovableTotal": retired_unprovable_total,
         // INCIDENT D1-CALLBACK-FLOOD 2026-09-01 (both -1 = unreadable):
