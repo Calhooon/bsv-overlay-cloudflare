@@ -20,7 +20,7 @@ help:
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
 	@echo "  ownership        The storage ownership check (bsv-low #474): every SQL statement against storage-ownership.json (part of ci)"
 	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c and NL-6d)"
-	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; :LANE_BASE+9, +10)"
+	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; four ports: :LANE_BASE+9 app layer, +10 overlay, +11 the e649 delivering overlay, +12 its mock app layer)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
 
@@ -428,7 +428,8 @@ ci-route: ci-d1-budget
 # `POST /internal/beef-blob-sweep` (the d3 fold-4: one pass of the tick's own function; no scheduled tick is fired, so
 # the overlay runs without `--test-scheduled`), and a put twice moving the object's `touched` stamp.
 #
-# Ports: LANE_BASE+9 (app layer) and LANE_BASE+10 (overlay), :8800 and :8801 by default; the same pre-flight,
+# Ports (four): LANE_BASE+9 (app layer), LANE_BASE+10 (overlay), LANE_BASE+11 (the e649 cell's delivering overlay)
+# and LANE_BASE+12 (its mock app layer, served by the cell), :8800 to :8803 by default; the same pre-flight,
 # bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network: no
 # fixture pot is spent and no hop filed (no courier), the app layer's service bindings are absent (its tip reads
 # answer 503 and the views serve without a tip), and the overlay's ARCADE_URL is a closed local port. The logs carry

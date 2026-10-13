@@ -23,7 +23,9 @@
  *     generation here, so a mutant binding any other generation (the lens's: generation 1) is RED at (a) or (b).
  *
  *   node tools/lane-e649/change_park_budget_ci.mjs <overlay base> <overlay --persist-to dir> \
- *        [<delivering overlay base> <its --persist-to dir> <mock app-layer port>]
+ *        <delivering overlay base> <its --persist-to dir> <mock app-layer port>
+ *   All five arguments are required (the D3-L2 fold): legs 6 and 7 run on the delivering overlay
+ *   (`make ci-d1-budget`: LANE_BASE+11, given APP_LAYER_URL and ADMIN_TOKEN) and its mock app layer (LANE_BASE+12).
  *   D1_BUDGET_MEASURE=1 ...   prints the measured figures and enforces nothing
  *
  * Exit 0 = every expectation held.
@@ -39,8 +41,10 @@ const ADMIN = process.env.D1_BUDGET_ADMIN_TOKEN ?? 'ci-admin-tok'
 const MEASURE = process.env.D1_BUDGET_MEASURE === '1'
 const CRATE = fileURLToPath(new URL('../../crates/overlay-cloudflare/', import.meta.url))
 const CEILINGS = JSON.parse(readFileSync(new URL('./ceilings.json', import.meta.url), 'utf8'))
-if (!STATE) {
-  console.error('usage: change_park_budget_ci.mjs <overlay base> <overlay --persist-to dir>')
+if (process.argv.length < 7) {
+  console.error(
+    'usage: change_park_budget_ci.mjs <overlay base> <overlay --persist-to dir> <delivering overlay base> <its --persist-to dir> <mock app-layer port>',
+  )
   process.exit(2)
 }
 
