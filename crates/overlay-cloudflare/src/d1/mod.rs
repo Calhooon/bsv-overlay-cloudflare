@@ -507,7 +507,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 189 → 196 for L23R2-H1/M3: two empty permanent twins and five indexes for identity-owned reads.
 /// 196 → 218 for bsv-low #638: the hop seat lookup index, write-derived links and seats, guarded backfills.
 /// 218 → 220 for NS-3: compact tracker word projection.
-pub const OVERLAY_MIGRATION_COUNT: usize = 220;
+/// 220 → 221 for NS3D-NOTE-5: scheduled refresh/sweep age index.
+pub const OVERLAY_MIGRATION_COUNT: usize = 221;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";

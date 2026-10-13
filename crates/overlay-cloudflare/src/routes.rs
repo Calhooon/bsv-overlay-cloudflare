@@ -1800,9 +1800,8 @@ async fn submit_parts(
     let (steak, mutation_report) = match engine.submit_with_report(&tagged_beef, mode).await {
         Ok(v) => v,
         // E592 fold: a walk past the budget is NOT NOW (nothing written or queued), counted
-        Err(EngineError::WalkCouldNotRun(stop)) => {
-            return walk_not_now(env, &stop, "POST /submit").await
-        }
+        #[rustfmt::skip] // Keep main's source-pinned guard layout.
+        Err(EngineError::WalkCouldNotRun(stop)) => return walk_not_now(env, &stop, "POST /submit").await,
         Err(e) => {
             let status = engine_error_status(&e);
             worker::console_log!("POST /submit -> {} (submit failed)", status);
