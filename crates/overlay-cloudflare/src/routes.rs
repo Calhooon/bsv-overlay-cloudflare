@@ -1893,10 +1893,8 @@ async fn submit_parts(
                 }
                 Ok(Some(ev)) => {
                     let now_ms = worker::Date::now().as_millis();
-                    let outcome = crate::admit_fast::evict_txid_everywhere(
-                        &ledger_db, subject, &ev.reason, now_ms,
-                    )
-                    .await;
+                    #[rustfmt::skip] // Main's exact eviction wiring pin.
+                    let outcome = crate::admit_fast::evict_txid_everywhere(&ledger_db, subject, &ev.reason, now_ms).await;
                     let moved = outcome.moved;
                     crate::ops::bump_counter(
                         &ledger_db,
@@ -5755,7 +5753,7 @@ mod tests {
         ]
         .concat();
         assert!(
-            crate::source_pin_contains(post, &reevict),
+            post.contains(&reevict),
             "the write that outran its eviction re-evicts"
         );
         // round 4: a subject the network ACCEPTED at the door whose readmission faulted is readmitted again after the
@@ -5814,7 +5812,7 @@ mod tests {
         ]
         .concat();
         assert!(
-            crate::source_pin_contains(&consumer[q_after..], &q_reevict),
+            consumer[q_after..].contains(&q_reevict),
             "the replay that outran an eviction re-evicts"
         );
         let guard_block = &consumer[q_guard..q_write];
