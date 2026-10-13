@@ -3531,11 +3531,27 @@ mod tests {
         );
         // the two jobs write no refused memo and count no eviction over a yielded pass (round 3, finding 3; round 4)
         // bsv-low #649: both jobs hand `outcome.yielded` to ONE settle, whose guards these are
-        for job_name in ["pub async fn refusal_job(", "pub async fn pending_watch_job("] {
+        // bsv-low #649 L2: the CALL's own arguments, comment-stripped and split at the top level, never a token
+        // found somewhere after it (a decoy `let _unused_yield = (outcome.yielded,);` passed that)
+        for (job_name, counter) in [
+            ("pub async fn refusal_job(", "crate::ops::COUNTER_ARC_INGEST_EVICTED"),
+            ("pub async fn pending_watch_job(", "crate::ops::COUNTER_SUBMIT_PENDING_EVICTED"),
+        ] {
             let job = &src[src.find(job_name).unwrap()..];
             let job = &job[..job.find("\n}\n").unwrap()];
-            let settle = job.find("settle_corroborated_refusal(").expect("the settle");
-            assert!(job[settle..].contains("outcome.yielded,"), "{job_name}: the settle is told the pass yielded");
+            let args = call_args(job, "settle_corroborated_refusal(");
+            assert_eq!(args.len(), 5, "{job_name}: the settle's five arguments: {args:?}");
+            assert_eq!(args[0], "&port", "{job_name}: the settle runs over the job's port");
+            assert_eq!(args[1], "outcome.yielded", "{job_name}: the settle is told THIS pass's yield");
+            assert_eq!(args[2], counter, "{job_name}: settled under its own eviction counter");
+            assert!(args[4].starts_with("SettleLines{"), "{job_name}: the job's words");
+            let evict = job.find("let outcome =").expect("the eviction's outcome is bound");
+            assert!(
+                self::squashed(&job[evict..]).starts_with("letoutcome=evict_txid_everywhere("),
+                "{job_name}: `outcome` is the eviction's"
+            );
+            assert!(evict < job.find("settle_corroborated_refusal(").unwrap(), "{job_name}: bound before the settle");
+            assert_eq!(job.matches("let outcome").count(), 1, "{job_name}: one `outcome` binding, no shadowing");
         }
         {
             let job_name = "pub(crate) async fn settle_corroborated_refusal<";
@@ -4249,6 +4265,32 @@ mod tests {
             .collect::<String>()
             .split_whitespace()
             .collect()
+    }
+
+    /// bsv-low #649 L2: the top-level arguments of the first call `open` (ending in `(`) in `text`, each
+    /// comment-stripped and squashed.
+    fn call_args(text: &str, open: &str) -> Vec<String> {
+        let code = squashed(text);
+        let open = squashed(open);
+        let start = code.find(&open).expect("the call") + open.len();
+        let (mut depth, mut args, mut cur) = (0i32, Vec::new(), String::new());
+        for ch in code[start..].chars() {
+            match ch {
+                '(' | '{' | '[' => depth += 1,
+                ')' | '}' | ']' if depth == 0 => break,
+                ')' | '}' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    args.push(std::mem::take(&mut cur));
+                    continue;
+                }
+                _ => {}
+            }
+            cur.push(ch);
+        }
+        if !cur.is_empty() {
+            args.push(cur);
+        }
+        args
     }
 
     /// bsv-low #649 L1 (the lens's appended bump): the shipped settle, run to its END over a flush that completes,
