@@ -3325,7 +3325,7 @@ mod tests {
         // the wiring: the main consumer notes the class of the replay's faults; the park asks the verdict; a not-now
         // deferral is counted apart; the health block serves `classes`
         let lib = include_str!("lib.rs");
-        assert!(lib.contains("&format!(\"not durable: {}\", report.summary()), crate::dead_letters::LetterClass::of_sites(report.faults.iter().map(|f| f.site)))"));
+        assert!(crate::source_pin_contains(lib, "&format!(\"not durable: {}\", report.summary()), crate::dead_letters::LetterClass::of_sites(report.faults.iter().map(|f| f.site)))"));
         let src = include_str!("dead_letters.rs");
         let park = &src[src.find("async fn park_one(").unwrap()..];
         let park = &park[..park.find("\n}\n").unwrap()];
@@ -3765,7 +3765,7 @@ mod tests {
             "crate::dead_letters::LetterClass::of_sites(report.faults.iter().map(|f| f.site))";
         let mut by_report = 0;
         for c in &calls {
-            if c.contains(of_report) {
+            if crate::source_pin_contains(c, of_report) {
                 assert!(c.contains("\"not durable: {}\""), "{c}");
                 by_report += 1;
             } else if c.contains("crate::queue::replay_error_class(&e)") {

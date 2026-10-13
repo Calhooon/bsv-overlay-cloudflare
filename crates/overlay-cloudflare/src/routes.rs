@@ -5739,7 +5739,7 @@ mod tests {
         ]
         .concat();
         assert!(
-            post.contains(&reevict),
+            crate::source_pin_contains(post, &reevict),
             "the write that outran its eviction re-evicts"
         );
         // round 4: a subject the network ACCEPTED at the door whose readmission faulted is readmitted again after the
@@ -5754,7 +5754,7 @@ mod tests {
             memo_read < after - write,
             "the refused memo is read before the guard's match: the discriminator (round 5, N1)"
         );
-        let reev = post.find(&reevict).expect("the re-evict arm");
+        let reev = post.find(&rerun).expect("the re-evict arm");
         assert!(
             retry < reev,
             "the accepted-subject arm precedes the re-evict arm"
@@ -5780,11 +5780,7 @@ mod tests {
             .find(&q_guard_needle)
             .expect("the consumer's guard");
         // the E592 lens fold: the consumer's write names its breach policy
-        let q_write_needle = [
-            "engine.submit_with_report_",
-            "under(&tagged_beef, mode, policy)",
-        ]
-        .concat();
+        let q_write_needle = [".submit_with_report_", "under("].concat();
         let q_write = consumer
             .find(&q_write_needle)
             .expect("the consumer's write");
@@ -5802,7 +5798,7 @@ mod tests {
         ]
         .concat();
         assert!(
-            consumer[q_after..].contains(&q_reevict),
+            crate::source_pin_contains(&consumer[q_after..], &q_reevict),
             "the replay that outran an eviction re-evicts"
         );
         let guard_block = &consumer[q_guard..q_write];

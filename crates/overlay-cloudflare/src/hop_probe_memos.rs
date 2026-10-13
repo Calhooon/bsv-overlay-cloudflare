@@ -554,7 +554,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
         let src = include_str!("tip_pass.rs");
         let src = code_only(&src[..src.find("#[cfg(test)]").unwrap_or(src.len())]);
         let body = |name: &str| -> String {
@@ -613,7 +618,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
         let src = include_str!("tip_pass.rs");
         let src = code_only(&src[..src.find("#[cfg(test)]").unwrap_or(src.len())]);
         let start = src
