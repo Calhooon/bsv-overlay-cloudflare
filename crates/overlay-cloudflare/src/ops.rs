@@ -1150,6 +1150,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         crate::change_park::COUNTER_CHANGE_PARK_REFUSED,
         crate::change_park::COUNTER_CHANGE_PARK_EXHAUSTED,
         crate::change_park::COUNTER_CHANGE_PARK_SWEPT,
+        crate::change_park::COUNTER_CHANGE_PARK_DRAIN_TICK,
+        crate::change_park::COUNTER_CHANGE_PARK_DRAIN_COMPLETE_PROOFS,
         COUNTER_ADMIT_FAST_READMIT_INCOMPLETE,
         COUNTER_ADMIT_FAST_CONFLICT_SCANNED,
         COUNTER_ADMIT_FAST_CONFLICT_EVICTED,
