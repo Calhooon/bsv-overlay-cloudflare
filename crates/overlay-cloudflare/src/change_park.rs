@@ -54,25 +54,39 @@ pub const CHANGE_PARKED_ADD_NEXT_ATTEMPT: &str =
     "ALTER TABLE change_parked ADD COLUMN next_attempt_at_ms INTEGER NOT NULL DEFAULT 0";
 pub const CHANGE_PARKED_ADD_EXHAUSTED: &str =
     "ALTER TABLE change_parked ADD COLUMN exhausted INTEGER NOT NULL DEFAULT 0";
+/// bsv-low #649 D3-M1 (the third delta lens): the park tokens' COUNTER, one row (`id` 1), `n` the last token handed
+/// out. The convention of PR #33's `pot_announce_seq` (the app layer's park): a token is taken from a counter in the
+/// park's own batch, never derived from a clock, so it is never reused for a key whatever the clocks or the deletes.
+/// Transient like the table it serves: a wipe re-seeds it from the clock at the next park ([`PARK_SEQ_BUMP_SQL`]).
+/// Appended (#638).
+pub const CHANGE_PARKED_SEQ_CREATE: &str = "CREATE TABLE IF NOT EXISTS change_parked_seq (\
+     id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL)";
+/// D3-M1: the FIRST statement of every park batch. It takes ONE token for the batch (`n + 1`, `RETURNING n`); D1
+/// runs a batch as one transaction, so no other batch takes a token between it and the batch's parks, and the token
+/// is equal only within one batch, where each (set, entry) appears once (the generation is compared per key). A
+/// first row (none yet, or after a wipe) starts at `(?1 + 1000) * 2048`, `?1` the park's stamp in ms: above every
+/// clock-derived token parked before the counter (`stamp * 2048 + nonce`, a re-park's carry included) from a clock
+/// less than a second ahead of this one; under 2^53 until the year 2109, so it reads back exact through D1's numbers.
+pub const PARK_SEQ_BUMP_SQL: &str = "INSERT INTO change_parked_seq (id, n) \
+     VALUES (1, (CAST(?1 AS INTEGER) + 1000) * 2048) \
+     ON CONFLICT (id) DO UPDATE SET n = n + 1 RETURNING n";
 /// A park: one row per (set, entry); a re-park keeps the first stamp and gives the row a NEW generation (N1): a
 /// change parked while an earlier delivery of the same entry is in flight is a new intent, which that delivery's
-/// delete does not take. The generation is an INTENT TOKEN never reused for a key (the second delta lens, D2-M1):
-/// every insert and every re-park writes `stamp * 2048 + nonce` (`?3` the park's stamp in ms, the nonce SQLite's
-/// `random()` masked to 11 bits; under 2^53 until the year 2109, so it reads back exact through D1's numbers), and a
-/// re-park takes the larger of that and the held token plus one. Until the fold an insert took the column's default
-/// 0, so a key deleted by one delivery and parked again was K/0 again, and a second delivery that had read K/0
-/// deleted the new intent. A token is reused only by a park of the same key in the same millisecond with the same
-/// nonce after the earlier row was deleted (stated: clocks of two isolates that disagree can make two stamps equal). A re-park is a new intent for the retry state too (N2): its attempts start again and it is
-/// eligible at once (an exhausted row comes back). A NEW key is parked only while the table holds fewer than
-/// `?4` rows ([`CHANGE_PARKED_MAX_ROWS`], read by a LIMITed scan: at most `?4` rows), so the newest are refused
-/// when it is full (no row returned: the caller keeps that entry in memory and counts it).
+/// delete does not take. The generation is an INTENT TOKEN never reused for a key: the batch's token from
+/// [`PARK_SEQ_BUMP_SQL`]'s counter (D3-M1). Until the second delta fold an insert took the column's default 0; until
+/// the third it was `stamp * 2048 + nonce`, which a park of the same key after a delete could mint again (the lens:
+/// 16 pot and 18 hop collisions in 256 equal-stamp iterations, and `MAX(held + 1, candidate)` carrying into the next
+/// millisecond), so a stale delivery deleted the later intent. A re-park is a new intent for the retry state too (N2):
+/// its attempts start again and it is eligible at once (an exhausted row comes back). A NEW key is parked only while
+/// the table holds fewer than `?4` rows ([`CHANGE_PARKED_MAX_ROWS`], read by a LIMITed scan: at most `?4` rows), so
+/// the newest are refused when it is full (no row returned: the caller keeps that entry in memory and counts it).
 pub const PARK_SQL: &str =
     "INSERT INTO change_parked (kind, item, parked_at_ms, next_attempt_at_ms, generation) \
-     SELECT ?1, ?2, ?3, ?3, CAST(?3 AS INTEGER) * 2048 + (random() & 2047) \
+     SELECT ?1, ?2, ?3, ?3, (SELECT n FROM change_parked_seq WHERE id = 1) \
      WHERE EXISTS (SELECT 1 FROM change_parked WHERE kind = ?1 AND item = ?2) \
         OR (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked LIMIT ?4)) < ?4 \
      ON CONFLICT(kind, item) DO UPDATE SET \
-        generation = MAX(excluded.generation, change_parked.generation + 1), \
+        generation = excluded.generation, \
         attempts = 0, exhausted = 0, \
         next_attempt_at_ms = MIN(change_parked.next_attempt_at_ms, excluded.next_attempt_at_ms) \
      RETURNING item";
@@ -185,7 +199,7 @@ pub fn parse_pot_item(item: &str) -> Option<(String, u32)> {
 
 /// The skip's world (bsv-low #649 M1): a port so the pins run the shipped [`park_withheld`] over a recorded fake.
 pub(crate) trait ParkPort {
-    /// Park `rows` (`(set, entry)`, both sets) in ONE batch: one statement each, one D1 round trip. Answers, per
+    /// Park `rows` (`(set, entry)`, both sets) in ONE batch: the batch's token ([`PARK_SEQ_BUMP_SQL`]), then one statement each, one D1 round trip. Answers, per
     /// row, whether it is parked (`false`: refused, the table full).
     async fn park(
         &self,
@@ -276,7 +290,13 @@ impl ParkPort for WorkerPark<'_> {
         rows: &[(&'static str, String)],
         now_ms: u64,
     ) -> std::result::Result<Vec<bool>, String> {
-        let mut stmts = Vec::with_capacity(rows.len());
+        let mut stmts = Vec::with_capacity(rows.len() + 1);
+        stmts.push(
+            self.db
+                .prepare(PARK_SEQ_BUMP_SQL)
+                .bind(&[(now_ms as f64).into()])
+                .map_err(|e| e.to_string())?,
+        );
         for (kind, item) in rows {
             let stmt = self
                 .db
@@ -295,6 +315,7 @@ impl ParkPort for WorkerPark<'_> {
             .map_err(|e| e.to_string())?;
         Ok(results
             .iter()
+            .skip(1)
             .map(|r| {
                 r.results::<serde_json::Value>()
                     .map(|v| !v.is_empty())
@@ -1222,9 +1243,16 @@ mod tests {
         conn: &rusqlite::Connection,
         params: P,
     ) -> rusqlite::Result<bool> {
+        bump_seq(conn, 0);
         let mut q = conn.prepare(PARK_SQL)?;
         let n = q.query_map(params, |r| r.get::<_, String>(0))?.count();
         Ok(n == 1)
+    }
+
+    /// The batch's token, as the worker's park takes it before its parks (D3-M1): the token.
+    fn bump_seq(conn: &rusqlite::Connection, now_ms: i64) -> i64 {
+        conn.query_row(PARK_SEQ_BUMP_SQL, rusqlite::params![now_ms], |r| r.get(0))
+            .unwrap()
     }
 
     /// [`REFUSE_SQL`]'s binds, as the worker binds them.
@@ -1492,6 +1520,7 @@ mod tests {
     fn e649_n2_a_full_table_refuses_the_newest_and_a_held_key_still_re_parks() {
         let conn = parked_db();
         let park = |item: &str, at: i64, max: i64| -> bool {
+            bump_seq(&conn, at);
             let mut q = conn.prepare(PARK_SQL).unwrap();
             q.query_map(rusqlite::params![KIND_POT, item, at, max], |r| {
                 r.get::<_, String>(0)
@@ -1741,6 +1770,45 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM change_parked", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// bsv-low #649 D3-M1 (the third delta lens's stress, the SHIPPED statements under SQLite, both sets): 256
+    /// iterations per set of one key parked at the SAME stamp, its token read, every token an earlier iteration read
+    /// replayed as a stale accepted delivery's guarded DELETE, then the row deleted at its own token. A stale DELETE
+    /// that takes the new row is a reused token. On `1bf8e66` (`stamp * 2048 + nonce`) the 256 draws of 2,048 nonces
+    /// collide about 16 times (the lens: 16 pot, 18 hop on local D1); from the counter, never.
+    #[test]
+    fn e649_d3_m1_a_token_is_never_reused_after_a_delete_at_an_equal_stamp() {
+        for (kind, k) in [
+            (KIND_POT, pot_item(&"cd".repeat(32), 1)),
+            (KIND_HOP, ID.to_string()),
+        ] {
+            let conn = parked_db();
+            let mut seen: Vec<i64> = Vec::new();
+            let mut collisions = 0usize;
+            for _ in 0..256 {
+                assert!(park_sql(&conn, rusqlite::params![kind, k, 100, MAX]).unwrap());
+                let token: i64 = conn
+                    .query_row(
+                        "SELECT generation FROM change_parked WHERE kind = ?1 AND item = ?2",
+                        rusqlite::params![kind, k],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                for stale in &seen {
+                    collisions +=
+                        exec_returning(&conn, UNPARK_SQL, rusqlite::params![kind, k, stale]);
+                }
+                if rows_of(&conn, "SELECT COUNT(*) FROM change_parked") == 1 {
+                    exec_returning(&conn, UNPARK_SQL, rusqlite::params![kind, k, token]);
+                }
+                seen.push(token);
+            }
+            assert_eq!(
+                collisions, 0,
+                "{kind}: a stale delivery's DELETE took a later intent {collisions} time(s) in 256"
+            );
+        }
     }
 
     /// bsv-low #649 D2-M1 (the second delta lens, the SHIPPED statements under SQLite, both sets): two deliveries
