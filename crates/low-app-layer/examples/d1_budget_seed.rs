@@ -245,22 +245,48 @@ fn record_fixture() -> serde_json::Value {
     use bsv_rs::primitives::PrivateKey;
     use bsv_rs::wallet::{Counterparty, CreateSignatureArgs, GetPublicKeyArgs, ProtoWallet};
     let wallet = ProtoWallet::new(Some(PrivateKey::from_hex(&hex::encode([7u8; 32])).unwrap()));
-    let identity = wallet.get_public_key(GetPublicKeyArgs {
-        identity_key: true, protocol_id: None, key_id: None, counterparty: None, for_self: None,
-    }).unwrap().public_key;
+    let identity = wallet
+        .get_public_key(GetPublicKeyArgs {
+            identity_key: true,
+            protocol_id: None,
+            key_id: None,
+            counterparty: None,
+            for_self: None,
+        })
+        .unwrap()
+        .public_key;
     let id = hex::decode(&identity).unwrap();
     let opp = hex::decode(ID_A).unwrap();
     let game = [0x77u8; 32];
     let pot: [u8; 32] = hex::decode(pot_txid('a', 0)).unwrap().try_into().unwrap();
-    let challenge = overlay_discovery::potparty::validity::potparty_v1_challenge(&id, &opp, &game, &pot, 0, 900_000).unwrap();
-    let sig = wallet.create_signature(CreateSignatureArgs {
-        data: Some(challenge), hash_to_directly_sign: None,
-        protocol_id: overlay_discovery::potparty::validity::potparty_protocol(),
-        key_id: hex::encode(game), counterparty: Some(Counterparty::Anyone),
-    }).unwrap().signature;
+    let challenge = overlay_discovery::potparty::validity::potparty_v1_challenge(
+        &id, &opp, &game, &pot, 0, 900_000,
+    )
+    .unwrap();
+    let sig = wallet
+        .create_signature(CreateSignatureArgs {
+            data: Some(challenge),
+            hash_to_directly_sign: None,
+            protocol_id: overlay_discovery::potparty::validity::potparty_protocol(),
+            key_id: hex::encode(game),
+            counterparty: Some(Counterparty::Anyone),
+        })
+        .unwrap()
+        .signature;
     let mut script = vec![0, 0x6a];
-    for field in [b"LOW/potparty/v1".as_slice(), &id, &opp, &game, &pot, &0u32.to_le_bytes(), &900_000u32.to_le_bytes(), &sig] {
-        if field.len() >= 0x4c { script.push(0x4c); }
+    for field in [
+        b"LOW/potparty/v1".as_slice(),
+        &id,
+        &opp,
+        &game,
+        &pot,
+        &0u32.to_le_bytes(),
+        &900_000u32.to_le_bytes(),
+        &sig,
+    ] {
+        if field.len() >= 0x4c {
+            script.push(0x4c);
+        }
         script.push(field.len() as u8);
         script.extend_from_slice(field);
     }
