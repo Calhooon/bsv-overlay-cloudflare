@@ -213,7 +213,7 @@
       "censusKey": null
     },
     "pot-changed-hook-full-refused": {
-      "route": "/internal/pot-changed: eight new rooms at a FULL table of 2,048 live rows none of which may be displaced (E649 L4 N6, fold-3: the batch's eight parks, the counter's one LIMITed scan of at most 2,056 rows, the guard over the rows that may make room (none), which faults and rolls the batch back; answered 503. D1 answers a FAILED batch with no meta, so the ledger counts the reads before it only: the batch's own scan, up to 2,056 rows, is real and unmeasured here)",
+      "route": "/internal/pot-changed: eight new rooms at a FULL table of 2,048 live rows none of which may be displaced (E649 L4 N6, fold-3: the batch's eight parks, the counter's one LIMITed scan of at most 2,056 rows, the guard over the rows that may make room (none), which faults and rolls the batch back; answered 503. D1 answers a FAILED batch with no meta, so the ledger counts the reads before it only. NOT the refusal's total (N10, the third delta review): the batch's counter scan (up to 2,056 rows) and its guard, which with no eligible row visits EVERY row (2,059 by the review's D1 binding), are real and unreported; the total is about 16 + 2,057 + 2,059 = 4,132 rows, stated in docs/D1-BUDGETS.md, each scan bounded by the tail scenario's measured maxReads)",
       "measured": {
         "reads": 16,
         "writes": 2,
@@ -225,6 +225,22 @@
         "writes": 4,
         "stmts": 35,
         "maxReads": 3
+      },
+      "censusKey": null
+    },
+    "pot-changed-hook-full-room-tail": {
+      "route": "/internal/pot-changed: eight fresh rooms at a FULL table whose eight exhausted rows sit at the TAIL of the scan order (E649 L4 N10, the third delta review: the guard's LIMIT counts ELIGIBLE rows, not rows visited, so it visits the whole table to find them; the counter's scan and the delete's ORDER BY as in full-room). The worst placement of the room-making arm",
+      "measured": {
+        "reads": 6247,
+        "writes": 34,
+        "stmts": 44,
+        "maxReads": 2097
+      },
+      "ceiling": {
+        "reads": 9371,
+        "writes": 36,
+        "stmts": 46,
+        "maxReads": 3146
       },
       "censusKey": null
     },

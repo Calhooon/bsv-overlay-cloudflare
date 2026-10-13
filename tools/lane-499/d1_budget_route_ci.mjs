@@ -483,6 +483,11 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   if (rb && rb.retryable === true && rb.parked === 0 && rb.parkFull === 8 && rb.announce === 'none') pass('pot-changed-hook-full-refused: refused whole at 2,048 rows, 503 retryable, nothing announced')
   else fail('pot-changed-hook-full-refused: refused whole', `${refused.status}: ${refused.text.slice(0, 300)}`)
   check('pot-changed-hook-full-refused', segment(refused.timing, 'd1'))
+  // E649 L4 N10 (the third delta review): D1 answers the failed batch with no figures, so the reads above (16) are
+  // NOT the refusal's total: the batch's counter scan (at most 2,048 + 8 rows) and its guard, which with no row that
+  // may make room VISITS EVERY ROW (about 2,059, by the review's D1 binding), are real and unreported here. The
+  // local wrangler CLI reports no rows read, so that total is stated (docs/D1-BUDGETS.md), bounded by the scans the
+  // tail scenario below measures, not measured here.
   sql("UPDATE pot_announce_parked SET exhausted_at_ms = 1 WHERE rowid IN (SELECT rowid FROM pot_announce_parked WHERE outpoint LIKE 'e64f%' ORDER BY outpoint LIMIT 8)")
   const room = await hook(fresh)
   const ob = room.status === 200 ? JSON.parse(room.text) : null
@@ -494,6 +499,26 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   if (ob && ob.parked === 8 && ob.parkFull === 0 && exhaustedLeft === 0 && count <= 2048) pass(`pot-changed-hook-full-room: eight exhausted rows make the room, all eight parked, the table at ${count} <= 2,048`)
   else fail('pot-changed-hook-full-room: room made of exhausted rows', `${room.status} exhaustedLeft=${exhaustedLeft} count=${count}: ${room.text.slice(0, 300)}`)
   check('pot-changed-hook-full-room', segment(room.timing, 'd1'))
+  // E649 L4 N10: the guard's LIMIT is of ELIGIBLE rows, not of rows visited: with the rows that may make room at the
+  // TAIL of the table's scan order, the guard visits the whole table to find them (and the delete's ORDER BY reads it
+  // as ever). Wait for the detached announce to settle the eight (the table at 2,040), refill to 2,048 at the tail,
+  // make the LAST eight rows by rowid exhausted, then a fresh body of eight rooms.
+  let settled = 0
+  for (let i = 0; i < 40 && (settled = one('SELECT COUNT(*) AS n FROM pot_announce_parked')) > 2040; i++) await new Promise((r) => setTimeout(r, 250))
+  // the room hook's detached work (its settle and counters) is let finish before this cell writes the local D1 again
+  await new Promise((r) => setTimeout(r, 3000))
+  const alive = await get(APP, '/health')
+  if (alive.status !== 200) fail('pot-changed-hook-full-room-tail: the app layer answers before the refill', `${alive.status}`)
+  sql("WITH RECURSIVE k(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM k WHERE i + 1 < 2048) INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) SELECT printf('e64d%060x:0', i), 'room', '', 1, 0, 9000000000000, 1, NULL FROM k WHERE i < 2048 - (SELECT COUNT(*) FROM pot_announce_parked)")
+  sql('UPDATE pot_announce_parked SET exhausted_at_ms = 1 WHERE rowid IN (SELECT rowid FROM pot_announce_parked ORDER BY rowid DESC LIMIT 8)')
+  const before = one('SELECT COUNT(*) AS n FROM pot_announce_parked')
+  const tailFresh = Array.from({ length: 8 }, (_, i) => ({ txid: 'e64c' + i.toString(16).padStart(60, '0'), vout: 0 }))
+  const tail = await hook(tailFresh)
+  const tb = tail.status === 200 ? JSON.parse(tail.text) : null
+  const tailCount = one('SELECT COUNT(*) AS n FROM pot_announce_parked')
+  if (settled === 2040 && before === 2048 && tb && tb.parked === 8 && tb.parkFull === 0 && tailCount <= 2048) pass(`pot-changed-hook-full-room-tail: eight exhausted rows at the tail make the room, all eight parked, the table at ${tailCount} <= 2,048`)
+  else fail('pot-changed-hook-full-room-tail: room made of exhausted rows at the tail', `${tail.status} settled=${settled} before=${before} count=${tailCount}: ${tail.text.slice(0, 300)}`)
+  check('pot-changed-hook-full-room-tail', segment(tail.timing, 'd1'))
 }
 
 // NS-3: the real Worker reads compact rows with zero courier calls and

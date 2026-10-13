@@ -115,9 +115,22 @@ the ceiling; over it, it deletes the excess, the oldest exhausted rows first, th
 at least 3 deliveries, each named LOST. So every hook batch with a park is two statements more than fold-2, the
 same one scan: hook-1 10, decoded-8 28, marker 13, 8x19 42 statements, each at its ceiling. At a FULL table
 (`pot-changed-hook-full-*`): a body with no room to make is refused whole (503; D1 reports no figures for the failed
-batch, so its own scan of up to 2,056 rows is not in the ledger), and a body whose room is made of exhausted rows
-reads 4,206 rows (the counter's count and the delete's ORDER BY over the rows that may make room, each about the
-table). Both are the ceiling's cost only: under it the guard reads the counter row and the delete's limit is 0.
+batch, so its own scans are not in the ledger), and a body whose room is made of exhausted rows reads 4,206 rows
+(the counter's count and the delete's ORDER BY over the rows that may make room, each about the table). Both are
+the ceiling's cost only: under it the guard reads the counter row and the delete's limit is 0.
+
+E649 L4 fold-4 (2026-10-13, the third delta review's N10): the guard's LIMIT is of ELIGIBLE rows found, not of rows
+VISITED. Its scan is unindexed (the live rows' `attempts` has no index; one would cost a write per park and per
+retry) and stops at the excess-th eligible row, so it visits up to the whole table. With the eligible rows first in
+the scan order it reads 12 rows (`pot-changed-hook-full-room`); with them at the TAIL it reads about the table
+(2,052 by the review), and the room-making body reads 6,247 rows (`pot-changed-hook-full-room-tail`, measured: the
+counter's scan, the guard's and the delete's, three scans of about the table; maxReads 2,097). The REFUSAL's 16
+reported reads are not its total: the failed batch's counter scan (up to 2,056 rows) and its guard, which with no
+eligible row visits every row (2,059 by the review through a D1 binding), are real and unreported (the local
+wrangler CLI reports no rows read, so the tier states them and does not measure them): about 4,132 rows a refusal.
+So a hook at a full table reads at most three scans of the table (about 6,300 rows, under a cent per thousand
+hooks); the table is bounded at 2,048 + one body's 24, and no whole-hook latency failure was measured (a refusal
+answered in 5 ms, the tail body in 5 ms on the local tier).
 
 NS2 fold (2026-10-12): the real signed filing is measured under `/record`, including the pot stale mark and the
 filer mark. SHED-M1 removes the three indexed party enumeration reads entirely; named parties do no work until

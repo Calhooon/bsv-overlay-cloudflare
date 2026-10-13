@@ -108,8 +108,11 @@ macro_rules! park_room_rows {
 /// N6: past the ceiling (`room` below 0) with fewer rows that may make room than the excess, this writes a counter row
 /// that breaks the counter's `CHECK (id = 1)`: the statement faults and D1 rolls the WHOLE batch back (the stale
 /// marks, every park, the counter): nothing of the body is written and the hook answers 503 with nothing announced.
-/// The fault's words carry [`PARK_FULL_FAULT`]. Under the ceiling it reads the counter row alone; over it, at most
-/// the excess (one body's 24) of the rows that may make room.
+/// The fault's words carry [`PARK_FULL_FAULT`]. Under the ceiling it reads the counter row alone. Over it, its LIMIT
+/// is the excess (one body's 24) of ELIGIBLE rows found, not of rows visited (N10, the third delta review): the scan
+/// is unindexed and stops at the excess-th eligible row, so it visits up to the whole table (at most 2,048 + the
+/// batch's parks) when the eligible rows sit at the tail of the scan order or are too few (a refusal visits every
+/// row). Measured: 12 rows with the eligible rows first, the whole table at the tail (`pot-changed-hook-full-room-tail`).
 pub const PARK_GUARD_SQL: &str = concat!(
     "INSERT INTO pot_announce_seq (id, n, room) SELECT 2, 0, 0 WHERE (SELECT room FROM pot_announce_seq WHERE id = 1) < 0 AND (SELECT COUNT(*) FROM (SELECT 1 ",
     park_room_rows!(),
