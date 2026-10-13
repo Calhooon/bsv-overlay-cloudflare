@@ -183,17 +183,35 @@ use worker::{event, Context, Env, Request, Response, Result, Router};
 #[event(scheduled)]
 async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
     // E649 L4 N4: the pot hook's drain is its OWN task, handed first, under its own wall: the tracker's backfill
-    // awaits CHAINTRACKS with no timeout, so it no longer holds the drain behind it.
+    // awaits CHAINTRACKS with no timeout, so it no longer holds the drain behind it. N7: ONE deadline for the whole
+    // task: the boot, the pass (its every read, relay call, settle and counter) and the courier flush run under it.
     let env_drain = env.clone();
     let drain: pot_hook::Detached = Box::pin(async move {
-        d1_ledger::boot(schema::ensure_latch_columns(&env_drain)).await;
+        let deadline =
+            routes::worker_deadline(pot_hook::DRAIN_WALL_MS, pot_hook::DRAIN_SETTLE_RESERVE_MS);
+        if deadline
+            .run(d1_ledger::boot(schema::ensure_latch_columns(&env_drain)))
+            .await
+            .is_none()
+        {
+            worker::console_warn!("[pot-changed] drain: boot not done at the deadline");
+            return;
+        }
         // E649 L4 H1: one bounded pass over the pot hook's parked wake-ups
-        if let Err(e) = routes::drain_pot_announce(&env_drain).await {
+        if let Err(e) = routes::drain_pot_announce(&env_drain, &deadline).await {
             worker::console_warn!("[pot-changed] drain deferred: {e}");
         }
         if let Ok(db) = env_drain.d1("OVERLAY_DB") {
             let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
-            courier::flush(Some(db), pending).await;
+            if deadline
+                .run(courier::flush(Some(db), pending))
+                .await
+                .is_none()
+            {
+                worker::console_warn!(
+                    "[pot-changed] drain: courier flush not done at the deadline"
+                );
+            }
         }
     });
     let tracker: pot_hook::Detached = Box::pin(async move {
