@@ -1565,7 +1565,12 @@ mod tests {
             ]
         );
         // the read seeds every one at 0 and derives the figure after the rows (source)
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
         let src = include_str!("ops.rs");
         let start = src.find("async fn read_counters(").expect("read_counters");
         let body = squash(&src[start..start + src[start..].find("\n}\n").expect("its end")]);

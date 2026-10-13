@@ -9614,7 +9614,3 @@ mod e606_tests {
 #[cfg(test)]
 #[path = "../tests/support/served_bodies.rs"]
 mod ns2_d1bound_compat;
-
-#[cfg(test)]
-#[path = "../tests/support/served_bodies.rs"]
-mod ns3_compatibility_bodies;

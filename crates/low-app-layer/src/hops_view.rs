@@ -2701,7 +2701,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
         let routes = include_str!("routes.rs");
         let routes = squash(&code_only(
             &routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())],
@@ -2964,7 +2969,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
         let routes = include_str!("routes.rs");
         let routes = squash(&code_only(
             &routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())],
@@ -3106,7 +3116,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
         let routes = include_str!("routes.rs");
         let routes = squash(&code_only(
             &routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())],
@@ -3361,7 +3376,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
         let routes = include_str!("routes.rs");
         let routes = squash(&code_only(
             &routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())],

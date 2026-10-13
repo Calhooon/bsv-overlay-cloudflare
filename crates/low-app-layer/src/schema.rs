@@ -501,8 +501,8 @@ mod tests {
     fn every_create_table_catchup_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             CREATE_TABLE_CATCHUPS.len(),
-            8,
-            "network_seen (#371), collected_markers_v2 (#252 stage A), \
+            9,
+            "tx_words and tracker_backfill (NS-3), network_seen (#371), collected_markers_v2 (#252 stage A), \
              hand_markers (#382, mirrored for the brain-cutover M2 join), \
              proof_posts (bsv-low P1.1 proof-in-DB, owner GO 2026-09-02), \
              owed_rows + owed_state (bsv-low #469, the owed list), \

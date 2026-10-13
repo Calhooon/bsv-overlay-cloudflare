@@ -429,7 +429,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
         let src = include_str!("pot_changes.rs");
         let src = &src[..src.find("#[cfg(test)]").unwrap()];
         let start = src.find("pub async fn ship(").expect("ship");
@@ -440,7 +445,7 @@ mod tests {
                         .find("\npub async fn flush_inline(")
                         .expect("the next fn")],
         ));
-        assert!(ship.contains(&squash(r#"let shipped = ship_with( outpoints, |body| crate::change_flush::post_body(&env, &url, &token, "/internal/pot-changed", "pot-changes", body),"#)));
+        assert!(ship.contains(&squash(r#"let shipped = ship_with( outpoints, |body| { crate::change_flush::post_body(&env, &url, &token, "/internal/pot-changed", "pot-changes", body) },"#)));
         assert!(ship.contains(&squash("let tally = settle(&shipped);")));
         assert!(ship.contains(&squash(
             r#"crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally).await;"#

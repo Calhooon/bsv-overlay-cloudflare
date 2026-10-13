@@ -2769,3 +2769,15 @@ mod stored_rows;
 mod build_info_tests;
 
 pub mod tracker_events;
+
+/// Ignore rustfmt-only whitespace and optional argument/list trailing commas in wiring pins.
+#[cfg(test)]
+pub(crate) fn source_pin_contains(source: &str, needle: &str) -> bool {
+    let tokens = |s: &str| {
+        s.split_whitespace()
+            .collect::<String>()
+            .replace(",)", ")")
+            .replace(",]", "]")
+    };
+    tokens(source).contains(&tokens(needle))
+}

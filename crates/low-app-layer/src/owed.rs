@@ -7910,7 +7910,12 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(held, 2, "one per faulted read");
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
         let routes = squash(include_str!("routes.rs"));
         assert!(routes.contains(&squash("crate::owed::note_probe_memo_read_fault(); let binds = [JsValue::from_str(crate::owed::COUNTER_PROBE_MEMO_READ_FAULTS), JsValue::from_f64(1.0)];")));
     }
@@ -8619,7 +8624,12 @@ pub(crate) mod tests {
         // past the window the read's recompute runs (it is not shed again)
         assert!(rate.admit(ME, t0 + OWED_RECOMPUTE_RATE_WINDOW_MS, true));
         // the source half: the hooks' and claims' entry runs the plan on a shed, before it returns
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
         let code: String = include_str!("routes.rs")
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
@@ -8651,7 +8661,12 @@ pub(crate) mod tests {
     /// `owed_recompute_and_push` (the walk then runs past the ceiling).
     #[test]
     fn every_owed_recompute_caller_asks_the_ceiling_before_it_walks() {
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
         let code: String = include_str!("routes.rs")
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
