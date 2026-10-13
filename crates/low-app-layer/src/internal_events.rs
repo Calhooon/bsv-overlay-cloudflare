@@ -856,7 +856,7 @@ mod tests {
         let handler = &routes[start..start + routes[start + 1..].find(&squash("pub(crate) async fn")).expect("the next handler")];
         assert!(handler.contains(&squash("let (outpoints, dropped) = crate::internal_events::parse_pot_changed_counted(&raw);")));
         // E649 L4: the seam takes the whole parsed list (its plan announces every outpoint, `pot_hook`'s pins)
-        assert!(handler.contains(&squash("crate::pot_hook::apply_pot_changed(&D1HookStore { db: &db }, &outpoints, t0)")), "the seam runs over every parsed outpoint");
+        assert!(handler.contains(&squash("crate::pot_hook::serve_pot_changed(store, relay, wall, &detach, &outpoints, t0)")), "the seam runs over every parsed outpoint");
         assert!(handler.contains(&squash("crate::internal_events::COUNTER_POT_CHANGED_DROPPED")), "a refused remainder is counted");
         assert!(handler.contains(&squash(r#""dropped": dropped"#)), "and answered to the overlay");
     }
@@ -913,7 +913,7 @@ mod tests {
         let start = routes.find(&squash("pub(crate) async fn internal_hop_changed(")).expect("the handler");
         let handler = &routes[start..start + routes[start + 1..].find(&squash("pub(crate) async fn")).expect("the next handler")];
         assert!(handler.contains(&squash("let (identities, dropped) = crate::internal_events::parse_hop_changed_counted(&raw);")));
-        assert!(handler.contains(&squash("crate::pot_hook::apply_hop_changed(&D1HookStore { db: &db }, &identities)")), "the stale mark runs over every parsed identity (one batch, E649 L4)");
+        assert!(handler.contains(&squash("crate::pot_hook::apply_hop_changed(&store, &identities)")), "the stale mark runs over every parsed identity (one batch, E649 L4)");
         assert!(handler.contains(&squash("for id in ids {")), "and so does the recompute");
         assert!(handler.contains(&squash("crate::internal_events::COUNTER_HOP_CHANGED_DROPPED")), "a refused remainder is counted");
         assert!(handler.contains(&squash(r#""dropped": dropped"#)), "and answered to the overlay");
@@ -1016,8 +1016,11 @@ mod tests {
             .expect("the handler");
         let body = &routes[start..];
         let detached = body
-            .find(&squash("ctx.wait_until(async move { crate::pot_hook::announce_detached(env_announce, plan).await });"))
+            .find(&squash("crate::pot_hook::serve_pot_changed(store, relay, wall, &detach, &outpoints, t0)"))
             .expect("the announce runs detached");
+        assert!(body.contains(&squash("let detach = |f: crate::pot_hook::Detached| ctx.wait_until(f);")), "detach is wait_until");
+        let hook_code = squash(&code_only(include_str!("pot_hook.rs")));
+        assert!(hook_code.contains(&squash("detach(Box::pin(async move { announce_and_report(")), "the seam hands the announce to detach");
         let answer = body.find(&squash("json_response(")).expect("the answer");
         assert!(detached < answer, "handed to wait_until before the answer is built, awaited by nobody on it");
         let hook = include_str!("pot_hook.rs");
@@ -1041,12 +1044,10 @@ mod tests {
         let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = squash(&code_only(include_str!("routes.rs")));
-        let store = routes
-            .find(&squash("impl crate::pot_hook::HookStore for D1HookStore<'_> {"))
-            .expect("the D1 store");
-        let rest = &routes[store..];
-        let end = rest.find(&squash("pub(crate) async fn")).unwrap_or(rest.len());
-        let store = &rest[..end];
+        let _ = routes;
+        let hook_src = squash(&code_only(include_str!("pot_hook.rs")));
+        let store = &hook_src[hook_src.find(&squash("pub const MARKER_ARMS")).expect("the D1 store's arms")..];
+        let store = &store[..store.find(&squash("];")).expect("their end")];
         for arm in [
             "crate::owed::OWED_ATTRIBUTE_BY_POT_SQL",
             "crate::owed::OWED_ATTRIBUTE_BY_HOP_SQL",
