@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.5] - Unreleased
+## [0.1.5] - 2026-10-13
 
 - **DEPLOYMENT CHANGE: public explorer rungs are OFF unless named in `PROOF_SOURCES=arcade,bananablocks,woc,bitails`. LOW and Zanaadu must set this var to retain the previous explorer behavior. The stack leaves it unset.** `ARCADE_URL` and `WOC_API_KEY` only configure enabled rungs. Proof, raw-ancestor, spend-hint, retirement, conflict and rebroadcast probes follow this setting.
 - Hold admitted outputs without their own verified proof after the shared 24-hour observation window. Lookup and UHRP SQL omit held rows, keep the BEEF as stored, and bound each result read to 1,000 outpoints. Admission verification is unchanged.
