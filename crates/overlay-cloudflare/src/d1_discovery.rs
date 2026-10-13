@@ -817,6 +817,61 @@ fn uhrp_err(e: String) -> UHRPStorageError {
     UHRPStorageError::Database(e)
 }
 
+pub(crate) fn uhrp_lookup_query(query: &UHRPQuery, now_ms: i64) -> Query {
+    let mut wb = WhereBuilder::new();
+    if let Some(u) = query.uhrp_url.as_deref() {
+        wb = wb.eq("uhrpUrl", u);
+    }
+    if let Some(ref ik) = query.identity_key {
+        wb = wb.eq("identityKey", &**ik);
+    }
+
+    wb = wb.raw(&format!("EXISTS (SELECT 1 FROM transactions t LEFT JOIN proofless_watch w ON w.txid = t.txid WHERE t.txid = uhrp_records.txid AND {})", crate::proof_window::served_predicate("?")), vec![now_ms.into()]);
+    let (mut where_clause, mut params) = wb.build();
+
+    // Opt-in expiry filter. `include_expired = Some(true)` short-circuits
+    // (historians / audit consumers). Otherwise we hide records whose
+    // `expiry_time` is in the past vs `query.now_unix_seconds` (or our
+    // own clock if unset). `expiry_time = 0` is "never expires" and is
+    // always visible ; matches the UHRP convention where a missing/zero
+    // expiry means permanent. `WhereBuilder` has no `OR`, so we
+    // hand-append the clause.
+    if !query.include_expired.unwrap_or(false) {
+        let now = query
+            .now_unix_seconds
+            .unwrap_or_else(current_unix_seconds_i64);
+        let clause = "(expiryTime = 0 OR expiryTime >= ?)";
+        where_clause = if where_clause.is_empty() {
+            format!(" WHERE {clause}")
+        } else {
+            format!("{where_clause} AND {clause}")
+        };
+        params.push(now.into());
+    }
+
+    let order = match query.sort_order {
+        Some(UHRPSortOrder::Asc) => "ASC",
+        _ => "DESC",
+    };
+    let mut sql = format!(
+        "SELECT txid, outputIndex FROM uhrp_records{where_clause} ORDER BY createdAt {order}"
+    );
+    let limit = query
+        .limit
+        .unwrap_or(crate::proof_window::LOOKUP_WINDOW_LIMIT as u32)
+        .min(crate::proof_window::LOOKUP_WINDOW_LIMIT as u32);
+    sql.push_str(&format!(" LIMIT {limit}"));
+    if let Some(skip) = query.skip {
+        sql.push_str(&format!(" OFFSET {skip}"));
+    }
+
+    let mut q = Query::new(sql);
+    for p in params {
+        q = q.bind(p);
+    }
+    q
+}
+
 #[async_trait(?Send)]
 impl UHRPStorage for D1UHRPStorage {
     async fn has_duplicate_record(
@@ -873,54 +928,7 @@ impl UHRPStorage for D1UHRPStorage {
     }
 
     async fn find_record(&self, query: &UHRPQuery) -> Result<Vec<UTXOReference>, UHRPStorageError> {
-        let mut wb = WhereBuilder::new();
-        if let Some(u) = query.uhrp_url.as_deref() {
-            wb = wb.eq("uhrpUrl", u);
-        }
-        if let Some(ref ik) = query.identity_key {
-            wb = wb.eq("identityKey", &**ik);
-        }
-
-        let (mut where_clause, mut params) = wb.build();
-
-        // Opt-in expiry filter. `include_expired = Some(true)` short-circuits
-        // (historians / audit consumers). Otherwise we hide records whose
-        // `expiry_time` is in the past vs `query.now_unix_seconds` (or our
-        // own clock if unset). `expiry_time = 0` is "never expires" and is
-        // always visible — matches the UHRP convention where a missing/zero
-        // expiry means permanent. `WhereBuilder` has no `OR`, so we
-        // hand-append the clause.
-        if !query.include_expired.unwrap_or(false) {
-            let now = query
-                .now_unix_seconds
-                .unwrap_or_else(current_unix_seconds_i64);
-            let clause = "(expiryTime = 0 OR expiryTime >= ?)";
-            where_clause = if where_clause.is_empty() {
-                format!(" WHERE {clause}")
-            } else {
-                format!("{where_clause} AND {clause}")
-            };
-            params.push(now.into());
-        }
-
-        let order = match query.sort_order {
-            Some(UHRPSortOrder::Asc) => "ASC",
-            _ => "DESC",
-        };
-        let mut sql = format!(
-            "SELECT txid, outputIndex FROM uhrp_records{where_clause} ORDER BY createdAt {order}"
-        );
-        if let Some(limit) = query.limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
-        }
-        if let Some(skip) = query.skip {
-            sql.push_str(&format!(" OFFSET {skip}"));
-        }
-
-        let mut q = Query::new(sql);
-        for p in params {
-            q = q.bind(p);
-        }
+        let q = uhrp_lookup_query(query, (current_unix_seconds_i64()).saturating_mul(1000));
         let rows: Vec<UTXORow> = q.fetch_all(&self.db).await.map_err(uhrp_err)?;
         Ok(rows.into_iter().map(UTXORow::into_ref).collect())
     }

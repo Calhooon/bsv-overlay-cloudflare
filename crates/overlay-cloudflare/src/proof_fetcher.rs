@@ -129,6 +129,82 @@ pub const ADMIN_REVERIFY_MAX_LIMIT: u64 = 450;
 /// (pre-migration NULL stamps) are always eligible, same direction.
 pub const PUSH_BACKSTOP_MIN_AGE_SECS: u64 = 30 * 60;
 
+/// Explorer access is explicitly named by the deployment. Unknown names
+/// enable nothing; credentials and an endpoint override do not enable a rung.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProofSources(u8);
+
+impl ProofSources {
+    pub fn parse(value: &str) -> Self {
+        let mut sources = Self::default();
+        for name in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            sources.0 |= match name {
+                "arcade" => 1,
+                "bananablocks" => 2,
+                "woc" => 4,
+                "bitails" => 8,
+                _ => {
+                    tracing::warn!(source = name, "[proof] unknown PROOF_SOURCES entry skipped");
+                    0
+                }
+            };
+        }
+        sources
+    }
+    pub fn from_env(env: &worker::Env) -> Self {
+        Self::parse(
+            &env.var("PROOF_SOURCES")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        )
+    }
+    pub fn enabled(self, source: &str) -> bool {
+        self.0
+            & match source {
+                "arcade" => 1,
+                "bananablocks" => 2,
+                "woc" => 4,
+                "bitails" => 8,
+                _ => 0,
+            }
+            != 0
+    }
+    fn permits(self, source: &str) -> bool {
+        let enabled = self.enabled(source);
+        if !enabled {
+            push_log(&format!("[proof] {source}: disabled source skipped"));
+        }
+        enabled
+    }
+    pub(crate) async fn bitails_presence(self, txid: &str) -> Option<NetworkPresence> {
+        if !self.permits("bitails") {
+            return None;
+        }
+        bitails_presence(DEFAULT_BITAILS_BASE, txid).await
+    }
+    pub(crate) async fn woc_presence(
+        self,
+        key: Option<&str>,
+        txid: &str,
+    ) -> Option<NetworkPresence> {
+        if !self.permits("woc") {
+            return None;
+        }
+        woc_presence(DEFAULT_WOC_BASE, key, txid).await
+    }
+    pub(crate) async fn arcade_look(
+        self,
+        base: &str,
+        txid: &str,
+        evidence: Option<(String, String)>,
+    ) -> ArcadeLook {
+        if !self.permits("arcade") {
+            return ArcadeLook::Fault;
+        }
+        arcade_look(base, txid, evidence).await
+    }
+}
+
 /// `AncestorFetcher` backed by the Arcade→Bitails→WoC courier ladder (WoC is
 /// break-glass/last-resort) with a mandatory chaintracks re-verify before ANY
 /// bump is returned.
@@ -211,21 +287,63 @@ pub fn rotate_order(n: usize, start: usize) -> Vec<usize> {
 }
 
 impl ChainProofFetcher {
-    /// Build a fetcher over the default courier endpoints. `tracker` is the
+    /// Build a fetcher with every explorer disabled. `tracker` is the
     /// chaintracks header source used to verify every bump; `None` makes the
     /// fetcher a pure retry (no proof can ever be verified).
     pub fn new(tracker: Option<Rc<dyn ChainTracker>>) -> Self {
         Self {
-            arcade_url: DEFAULT_ARCADE_URL.to_string(),
-            bananablocks_base: DEFAULT_BANANABLOCKS_BASE.to_string(),
-            woc_base: DEFAULT_WOC_BASE.to_string(),
-            bitails_base: DEFAULT_BITAILS_BASE.to_string(),
+            arcade_url: String::new(),
+            bananablocks_base: String::new(),
+            woc_base: String::new(),
+            bitails_base: String::new(),
             woc_api_key: None,
             tracker,
             budget: Cell::new(DEFAULT_FETCH_BUDGET),
             rung_stats: RefCell::new(BTreeMap::new()),
             rung_consecutive_faults: RefCell::new(BTreeMap::new()),
             rung_rotation: Cell::new(0),
+        }
+    }
+
+    #[must_use]
+    pub fn with_sources(mut self, sources: ProofSources) -> Self {
+        self.arcade_url = if sources.enabled("arcade") {
+            DEFAULT_ARCADE_URL.into()
+        } else {
+            String::new()
+        };
+        self.bananablocks_base = if sources.enabled("bananablocks") {
+            DEFAULT_BANANABLOCKS_BASE.into()
+        } else {
+            String::new()
+        };
+        self.woc_base = if sources.enabled("woc") {
+            DEFAULT_WOC_BASE.into()
+        } else {
+            String::new()
+        };
+        self.bitails_base = if sources.enabled("bitails") {
+            DEFAULT_BITAILS_BASE.into()
+        } else {
+            String::new()
+        };
+        self
+    }
+
+    fn source_enabled(&self, name: &'static str) -> bool {
+        let base: &str = match name {
+            "arcade" => &self.arcade_url,
+            "woc" | "woc_history" => &self.woc_base,
+            "bitails" | "bitails_tx" | "bitails_history" => &self.bitails_base,
+            "bananablocks" | "bananablocks_txo" => &self.bananablocks_base,
+            _ => "",
+        };
+        if base.is_empty() {
+            self.rung_skipped(name);
+            push_log(&format!("[proof] {name}: disabled source skipped"));
+            false
+        } else {
+            true
         }
     }
 
@@ -270,7 +388,7 @@ impl ChainProofFetcher {
     #[must_use]
     pub fn with_arcade_url(mut self, url: impl Into<String>) -> Self {
         let url = url.into();
-        if !url.trim().is_empty() {
+        if !self.arcade_url.is_empty() && !url.trim().is_empty() {
             self.arcade_url = url.trim_end_matches('/').to_string();
         }
         self
@@ -318,6 +436,12 @@ impl ChainProofFetcher {
         txid: &str,
         arcade_stop: bool,
     ) -> Result<Option<String>, String> {
+        if self.arcade_url.is_empty() && self.bitails_base.is_empty() && self.woc_base.is_empty() {
+            for name in ["arcade", "bitails", "woc"] {
+                self.source_enabled(name);
+            }
+            return Ok(None);
+        }
         let tracker = self.tracker.as_deref();
         // bsv-low M19B-G1 round 2 (review MED-3): one rung's candidate at a
         // height OUR header source does not serve (`BlockNotFound`) is that
@@ -379,7 +503,7 @@ impl ChainProofFetcher {
                     return Ok(Some(bump_hex));
                 }
             }
-            None => worker::console_log!(
+            None => tracing::info!(
                 "[proof] bitails returned NO bump for {txid} (tracker_present={})",
                 tracker.is_some()
             ),
@@ -398,6 +522,9 @@ impl ChainProofFetcher {
     /// Arcade `GET /tx/{txid}` → what it says about the tx's PROOF (bsv-low #451 slice B): the BUMP when MINED,
     /// "held unmined" when Arcade carries a live non-mined status, else unknown (the ladder goes on).
     async fn arcade_proof_look(&self, txid: &str) -> ArcadeProofLook {
+        if !self.source_enabled("arcade") {
+            return ArcadeProofLook::Unknown;
+        }
         let url = format!("{}/tx/{}", self.arcade_url, txid);
         match http_get(&url, None).await {
             Ok((status, body)) => {
@@ -423,6 +550,9 @@ impl ChainProofFetcher {
     /// WoC block height for `txid` (`GET /tx/hash/{txid}` → `blockheight`), or
     /// `None` if unmined / unknown.
     async fn woc_block_height(&self, txid: &str) -> Option<u32> {
+        if !self.source_enabled("woc") {
+            return None;
+        }
         let url = format!("{}/tx/hash/{}", self.woc_base, txid);
         let hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
         let (status, body) = http_get(&url, hdr).await.ok()?;
@@ -450,6 +580,9 @@ impl ChainProofFetcher {
 
     /// Bitails block height for `txid` (`GET /tx/{txid}` → `blockHeight`).
     async fn bitails_block_height(&self, txid: &str) -> Option<u32> {
+        if !self.source_enabled("bitails") {
+            return None;
+        }
         let url = format!("{}/tx/{}", self.bitails_base, txid);
         let (status, body) = http_get(&url, None).await.ok()?;
         if !(200..300).contains(&status) {
@@ -480,13 +613,16 @@ impl ChainProofFetcher {
     pub(crate) async fn fetch_raw_hex(&self, txid: &str) -> Result<String, GASPError> {
         // 1. Bitails raw download (non-WoC primary).
         let bitails = format!("{}/download/tx/{}/hex", self.bitails_base, txid);
-        if let Some(raw) = self.raw_hex_content_addressed(txid, &bitails, None).await {
+        if let Some(raw) = self
+            .raw_hex_content_addressed("bitails", txid, &bitails, None)
+            .await
+        {
             return Ok(raw);
         }
         // 2. WoC (api key when installed).
         let woc = format!("{}/tx/{}/hex", self.woc_base, txid);
         let hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
-        if let Some(raw) = self.raw_hex_content_addressed(txid, &woc, hdr).await {
+        if let Some(raw) = self.raw_hex_content_addressed("woc", txid, &woc, hdr).await {
             return Ok(raw);
         }
         // 3. BananaBlocks (2026-09-04, owner ruling "all three, fallbacks for
@@ -494,7 +630,10 @@ impl ChainProofFetcher {
         //    the bytes hash to the txid. Content-addressed like the others, so
         //    a wrong body can never inject an ancestor.
         let banana = bananablocks_tx_hex_url(&self.bananablocks_base, txid);
-        if let Some(raw) = self.raw_hex_content_addressed(txid, &banana, None).await {
+        if let Some(raw) = self
+            .raw_hex_content_addressed("bananablocks", txid, &banana, None)
+            .await
+        {
             return Ok(raw);
         }
         Err(GASPError::NodeNotFound(format!(
@@ -509,10 +648,14 @@ impl ChainProofFetcher {
     /// transport/status/parse/mismatch.
     async fn raw_hex_content_addressed(
         &self,
+        source: &'static str,
         txid: &str,
         url: &str,
         header: Option<(&str, &str)>,
     ) -> Option<String> {
+        if !self.source_enabled(source) {
+            return None;
+        }
         let (status, body) = http_get(url, header).await.ok()?;
         if !(200..300).contains(&status) {
             return None;
@@ -718,6 +861,9 @@ impl ChainProofFetcher {
         let remaining = self.budget.get();
         if remaining == 0 {
             return RungCall::BudgetExhausted(format!("{name}: per-tick fetch budget exhausted"));
+        }
+        if !self.source_enabled(name) {
+            return RungCall::Fault(format!("{name}: disabled source skipped"));
         }
         self.budget.set(remaining - 1);
         match http_get(url, hdr).await {
@@ -1270,9 +1416,18 @@ fn tsc_proof_to_merkle_path(
     MerklePath::new(block_height, path).map_err(|e| format!("{e}"))
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! { static TEST_HTTP_CALLS: Cell<u32> = const { Cell::new(0) }; }
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) async fn http_get(_: &str, _: Option<(&str, &str)>) -> Result<(u16, String), String> {
+    TEST_HTTP_CALLS.with(|calls| calls.set(calls.get() + 1));
+    Ok((404, String::new()))
+}
+
 /// Fetch a URL via `worker::Fetch`, returning `(status, body)`. `header` is an
 /// optional single `(name, value)` pair (e.g. the WoC api key). `pub(crate)`
 /// since bsv-low#309: the advert-lifecycle pass probes the same courier hosts.
+#[cfg(not(all(test, not(target_arch = "wasm32"))))]
 pub(crate) async fn http_get(
     url: &str,
     header: Option<(&str, &str)>,
@@ -3541,6 +3696,7 @@ pub async fn rebroadcast_absent_admitted(
     candidates: Vec<overlay_engine::storage::TransactionBeef>,
     taal_api_key: Option<&str>,
     woc_api_key: Option<&str>,
+    sources: ProofSources,
 ) -> RebroadcastSummary {
     let mut summary = RebroadcastSummary {
         scanned: candidates.len(),
@@ -3554,12 +3710,12 @@ pub async fn rebroadcast_absent_admitted(
 
         // Presence probe: Bitails first (WoC is the free-tier-429 host — it
         // is only consulted when Bitails did not already prove presence).
-        let bitails = bitails_presence(DEFAULT_BITAILS_BASE, txid).await;
+        let bitails = sources.bitails_presence(txid).await;
         if bitails.is_some_and(presence_bool) {
             summary.present += 1;
             continue;
         }
-        let woc = woc_presence(DEFAULT_WOC_BASE, woc_api_key, txid).await;
+        let woc = sources.woc_presence(woc_api_key, txid).await;
         match classify_presence(bitails, woc) {
             NetworkPresence::Present { .. } => {
                 summary.present += 1;
@@ -3711,6 +3867,7 @@ pub async fn run_rebroadcast_backstop(
     storage: &crate::d1_storage::D1Storage,
     taal_api_key: Option<&str>,
     woc_api_key: Option<&str>,
+    sources: ProofSources,
 ) -> RebroadcastSummary {
     let now = js_sys::Date::now() as i64;
     let page = match storage
@@ -3757,6 +3914,7 @@ pub async fn run_rebroadcast_backstop(
         eligible.into_iter().map(|c| c.tx).collect(),
         taal_api_key,
         woc_api_key,
+        sources,
     )
     .await;
     for (txid, outcome) in &summary.attempted {
@@ -3978,9 +4136,10 @@ pub async fn run_retire_pass(
     db: &worker::D1Database,
     arcade_base: &str,
     woc_api_key: Option<&str>,
+    sources: ProofSources,
 ) -> RetireSummary {
     use crate::d1::Query;
-    let conflict = crate::admit_fast::confirmed_conflict_pass(db, woc_api_key).await;
+    let conflict = crate::admit_fast::confirmed_conflict_pass(db, woc_api_key, sources).await;
     let mut summary = RetireSummary {
         conflict,
         ..RetireSummary::default()
@@ -4013,18 +4172,20 @@ pub async fn run_retire_pass(
                 .term_status
                 .clone()
                 .map(|s| (s, row.term_extra.clone().unwrap_or_default()));
-            let look = arcade_look(arcade_base, &row.txid, webhook_evidence).await;
+            let look = sources
+                .arcade_look(arcade_base, &row.txid, webhook_evidence)
+                .await;
             // No retire hook: the bounded owed clock ages relevant subjects.
             if matches!(look, ArcadeLook::Present) {
                 summary.kept_present += 1;
                 continue;
             }
             // Corroboration probes (the same courier hosts as the backstop).
-            let bitails = bitails_presence(DEFAULT_BITAILS_BASE, &row.txid).await;
+            let bitails = sources.bitails_presence(&row.txid).await;
             let woc = if bitails.is_some_and(presence_bool) {
                 bitails
             } else {
-                woc_presence(DEFAULT_WOC_BASE, woc_api_key, &row.txid).await
+                sources.woc_presence(woc_api_key, &row.txid).await
             };
             match retire_verdict(
                 &look,
@@ -7691,6 +7852,61 @@ pub(crate) mod tests {
 
     /// bsv-low #451 slice B (the gate's HIGH-1 / HIGH-2): only a FRESH SEEN stops the proof ladder; the orphan view,
     /// the pre-network ranks, a stale SEEN, a refusal and MINED-without-a-path ask on.
+    #[tokio::test]
+    async fn proof_window_disabled_sources_make_zero_requests() {
+        TEST_HTTP_CALLS.with(|calls| calls.set(0));
+        let fetcher = ChainProofFetcher::new(None)
+            .with_arcade_url("https://override.example")
+            .with_woc_api_key(Some("fixture".into()));
+        assert!(fetcher.verified_proof_for("aa").await.is_none());
+        assert!(fetcher.fetch_raw_hex("aa").await.is_err());
+        assert!(fetcher.spender_hint_ladder("aa", 0).await.is_err());
+        assert!(fetcher.output_script_from_courier("aa", 0).await.is_err());
+        assert!(fetcher.scripthash_history_ladder("aa", "bb").await.is_err());
+        let sources = ProofSources::default();
+        assert!(sources.bitails_presence("aa").await.is_none());
+        assert!(sources.woc_presence(None, "aa").await.is_none());
+        assert_eq!(
+            sources
+                .arcade_look("https://override.example", "aa", None)
+                .await,
+            ArcadeLook::Fault
+        );
+        assert_eq!(TEST_HTTP_CALLS.with(Cell::get), 0);
+        assert!(
+            !fetcher.rung_stats().is_empty(),
+            "disabled attempts are visible skips"
+        );
+        let enabled = ChainProofFetcher::new(None).with_sources(ProofSources::parse("bitails"));
+        assert!(enabled.fetch_raw_hex("aa").await.is_err());
+        assert_eq!(
+            TEST_HTTP_CALLS.with(Cell::get),
+            1,
+            "only the named rung reaches the mock transport"
+        );
+    }
+
+    #[test]
+    fn proof_window_sources_parse_only_named_rungs() {
+        let sources = ProofSources::parse(" woc,arcade,woc,unknown ");
+        assert!(sources.enabled("woc") && sources.enabled("arcade"));
+        assert!(!sources.enabled("bitails") && !sources.enabled("bananablocks"));
+        let fetcher = ChainProofFetcher::new(None)
+            .with_sources(sources)
+            .with_arcade_url("https://override.example/");
+        assert_eq!(fetcher.arcade_url, "https://override.example");
+        assert!(fetcher.bitails_base.is_empty());
+    }
+
+    #[test]
+    fn proof_window_fetcher_starts_without_explorer_bases() {
+        let fetcher = ChainProofFetcher::new(None);
+        assert!(fetcher.arcade_url.is_empty());
+        assert!(fetcher.bananablocks_base.is_empty());
+        assert!(fetcher.woc_base.is_empty());
+        assert!(fetcher.bitails_base.is_empty());
+    }
+
     #[test]
     fn parse_arcade_proof_look_allow_list_and_freshness() {
         let now = 1_789_683_775_142_i64; // 2026-09-17T22:22:55.142Z

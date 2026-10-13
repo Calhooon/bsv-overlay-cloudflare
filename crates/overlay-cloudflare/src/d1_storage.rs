@@ -294,6 +294,13 @@ impl D1Storage {
         }
     }
 
+    pub(crate) fn served_outputs_sql() -> String {
+        let base = Self::select_outputs(true);
+        let served = crate::proof_window::served_predicate("?2");
+        let cap = crate::proof_window::LOOKUP_WINDOW_LIMIT;
+        format!("{base} LEFT JOIN proofless_watch w ON w.txid = t.txid JOIN json_each(?1) wanted ON o.txid = json_extract(wanted.value, '$[0]') AND o.outputIndex = json_extract(wanted.value, '$[1]') WHERE {served} GROUP BY o.txid, o.outputIndex LIMIT {cap}")
+    }
+
     /// SQL for one batched-outpoint chunk (bsv-low #289): a single row-value
     /// `IN (VALUES …)` query replacing `n` individual `find_output` round
     /// trips. `n` must be ≥ 1. Factored out so the real-SQLite test below can
@@ -742,6 +749,42 @@ impl Storage for D1Storage {
         let row: Option<OutputRow> = query.fetch_optional(&self.db).await.map_err(d1_err)?;
 
         Ok(row.map(OutputRow::into_output))
+    }
+
+    /// Lookup hydration with one bounded JSON key batch and the serving predicate.
+    async fn find_served_outputs(
+        &self,
+        outpoints: &[Outpoint],
+    ) -> Result<Vec<Output>, StorageError> {
+        let outpoints = &outpoints[..outpoints
+            .len()
+            .min(crate::proof_window::LOOKUP_WINDOW_LIMIT)];
+        if outpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<_> = outpoints
+            .iter()
+            .map(|o| (&o.txid, o.output_index))
+            .collect();
+        let wanted =
+            serde_json::to_string(&keys).map_err(|e| StorageError::Database(e.to_string()))?;
+        let rows: Vec<OutputRow> = Query::new(Self::served_outputs_sql())
+            .bind(wanted)
+            .bind(js_sys::Date::now() as i64)
+            .fetch_all(&self.db)
+            .await
+            .map_err(d1_err)?;
+        let by_key: std::collections::HashMap<_, _> = rows
+            .into_iter()
+            .map(|r| {
+                let output = r.into_output();
+                ((output.txid.clone(), output.output_index), output)
+            })
+            .collect();
+        Ok(outpoints
+            .iter()
+            .filter_map(|o| by_key.get(&(o.txid.clone(), o.output_index)).cloned())
+            .collect())
     }
 
     /// Batched outpoint hydration (bsv-low #289): the engine's `/lookup`

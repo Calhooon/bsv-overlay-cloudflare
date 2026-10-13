@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.5] - Unreleased
+
+- **DEPLOYMENT CHANGE: public explorer rungs are OFF unless named in `PROOF_SOURCES=arcade,bananablocks,woc,bitails`. LOW and Zanaadu must set this var to retain the previous explorer behavior. The stack leaves it unset.** `ARCADE_URL` and `WOC_API_KEY` only configure enabled rungs. Proof, raw-ancestor, spend-hint, retirement, conflict and rebroadcast probes follow this setting.
+- Hold admitted outputs without their own verified proof after the shared 24-hour observation window. Lookup and UHRP SQL omit held rows, keep the BEEF as stored, and bound each result read to 1,000 outpoints. Admission verification is unchanged.
+- Retry up to 20 held outputs against their configured or SHIP-discovered topic peers in a 30-second tick slot, with five seconds per node request. Verify each BUMP against headers, stitch it into stored BEEF, and restore lookup visibility. Report `heldByWindow`, `peerProofRequests` and `peerProofsLanded` on invariants.
+- Retire a held transaction as `expired-unproven` when every indexed output is an expired UHRP advert. Keep live, permanent and non-UHRP siblings. Report the live `retiredExpiredUnprovenTotal` separately from structurally unprovable LOW rows.
+- Use the existing watch observation stamp, falling back to transaction creation time; watch enrollment retains that creation time. No schema, SDK pin or package version change in this lane.
+
 ## [0.1.4] - 2026-10-13
 
 - Request GASP pages of 100 outputs under the 30-second peer budget and persist only completed scores below every failed, deferred or unfinished output. Unordered pages, score ties, responder clamping and deadline resumes retain the existing gap guards. Reference overlay-services@480d77a uses 10,000 at `src/Engine.ts:29,895` through `src/GASP/OverlayGASPRemote.ts`; the smaller engine page bounds reply work on Workers.

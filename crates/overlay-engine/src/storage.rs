@@ -179,6 +179,15 @@ pub trait Storage {
         Ok(results)
     }
 
+    /// Lookup-only read. Backends with observation stamps apply the shared
+    /// proof window here, before returning BEEF. Internal graph reads remain available.
+    async fn find_served_outputs(
+        &self,
+        outpoints: &[Outpoint],
+    ) -> Result<Vec<Output>, StorageError> {
+        self.find_outputs_by_outpoints(outpoints, true).await
+    }
+
     /// Find all outputs for a given transaction.
     async fn find_outputs_for_transaction(
         &self,
@@ -499,6 +508,13 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
             .find_output(txid, output_index, topic, spent, include_beef)
             .await
     }
+    async fn find_served_outputs(
+        &self,
+        outpoints: &[Outpoint],
+    ) -> Result<Vec<Output>, StorageError> {
+        (**self).find_served_outputs(outpoints).await
+    }
+
     async fn find_outputs_for_transaction(
         &self,
         txid: &str,
@@ -1048,6 +1064,29 @@ pub mod memory {
                 }
             }
             Ok(None)
+        }
+
+        async fn find_served_outputs(
+            &self,
+            outpoints: &[Outpoint],
+        ) -> Result<Vec<Output>, StorageError> {
+            let outputs = self.find_outputs_by_outpoints(outpoints, true).await?;
+            let now = i64::try_from(*self.clock_secs.lock().unwrap())
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1000);
+            let proven = self.proven.lock().unwrap();
+            let stamps = self.created_at.lock().unwrap();
+            Ok(outputs
+                .into_iter()
+                .filter(|output| {
+                    let seen = stamps
+                        .get(&output.txid)
+                        .and_then(|s| i64::try_from(*s).ok())
+                        .map(|s| s.saturating_mul(1000));
+                    crate::proof_window::verdict(proven.contains(&output.txid), seen, now)
+                        == crate::proof_window::Verdict::Served
+                })
+                .collect())
         }
 
         async fn find_outputs_for_transaction(
