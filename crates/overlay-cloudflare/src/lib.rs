@@ -1823,6 +1823,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                 None,
                 crate::advert_lifecycle::ADVERT_SPEND_CHECK_LIMIT,
                 crate::advert_lifecycle::ADVERT_REAP_LIMIT,
+                crate::proof_fetcher::ProofSources::from_env(&env),
             )
             .await
         },
@@ -2031,6 +2032,7 @@ async fn admin_advert_lifecycle(env: &Env, req: &Request) -> worker::Result<Resp
         None,
         spend_limit,
         reap_limit,
+        crate::proof_fetcher::ProofSources::from_env(env),
     )
     .await;
 
@@ -2158,7 +2160,7 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         &ops_db,
         &arcade_base,
         woc_key.as_deref(),
-        crate::proof_fetcher::ProofSources::from_env(&env),
+        crate::proof_fetcher::ProofSources::from_env(env),
     )
     .await;
     worker::console_log!(
@@ -2200,7 +2202,7 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         &tx_storage,
         taal_key.as_deref(),
         None,
-        crate::proof_fetcher::ProofSources::from_env(&env),
+        crate::proof_fetcher::ProofSources::from_env(env),
     )
     .await;
     // 5. observability heartbeat + counters (same as the cron would stamp).

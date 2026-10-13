@@ -391,6 +391,12 @@ pub async fn run_arcade_reorg_pass(
     memo: &mut crate::reorg_sweep::RootMemo,
     release_pending: bool,
 ) -> crate::arcade_reorg::ArcadePassSummary {
+    if !crate::proof_fetcher::ProofSources::from_env(env).permits("arcade") {
+        return crate::arcade_reorg::ArcadePassSummary {
+            stopped: Some("disabled source".into()),
+            ..Default::default()
+        };
+    }
     let tracker = crate::lookup_service_chain_tracker(env);
     let Some(db) = ops_db else {
         console_log!("[arcade-reorg] ({origin}) no D1 handle: no state row, no pass");
