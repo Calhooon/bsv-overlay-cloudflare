@@ -14,6 +14,7 @@ pub mod beef_blob_sweep;
 pub mod broadcaster;
 pub mod chain_tracker;
 pub mod change_flush;
+pub mod change_park;
 pub mod d1;
 pub mod d1_discovery;
 pub mod d1_ledger;
@@ -1374,6 +1375,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     // R2 objects (`ef-deferred/`), counted for the health figure; an object no
     // job row names, past the keep, is deleted (L1 (b)).
     crate::beef_blob_sweep::run_ef_deferred_pass(&env, &ops_db).await;
+    // bsv-low #649 M1: the pot and hop notes a background flush withheld (too little of its `waitUntil` window
+    // left) are parked in D1; every tick delivers the oldest of them and deletes only what the app layer accepted.
+    crate::change_park::deliver_on_tick(&env, &ops_db).await;
     // The order (bsv-low #585 land2): the sweep's pass (its own 30 s race),
     // the stale graphs, the EF jobs' hand-back and keep sweep (no race of its
     // own: two D1 reads, up to 20 quiet jobs re-sent and touched, up to 50
