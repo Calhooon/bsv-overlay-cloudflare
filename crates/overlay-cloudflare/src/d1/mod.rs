@@ -509,7 +509,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 218 → 220 for NS-3: compact tracker word projection.
 /// 220 → 221 for NS3D-NOTE-5: scheduled refresh/sweep age index.
 /// 221 → 222 for bsv-low #649 M1: `change_parked`, the notes a background flush withheld, parked for the cron.
-pub const OVERLAY_MIGRATION_COUNT: usize = 222;
+/// 222 → 223 for bsv-low #649 N1: `change_parked.generation`, so a delivery deletes only the intent it read.
+pub const OVERLAY_MIGRATION_COUNT: usize = 223;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1873,6 +1874,8 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // bsv-low #649 M1: the pot and hop notes a background flush withheld, parked for the cron (`change_park.rs`).
     // Transient: a lost row costs one push the felt's own reads recover.
     crate::change_park::CHANGE_PARKED_CREATE,
+    // bsv-low #649 N1: the row's generation (a re-park bumps it; a delivery deletes only the one it read).
+    crate::change_park::CHANGE_PARKED_ADD_GENERATION,
 
 ];
 
