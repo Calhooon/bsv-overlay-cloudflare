@@ -66,6 +66,14 @@ that starts writing reds); statements measured + 2 (a loop that reads per row ov
 | owed-served-read | `/owed?identity=A`, a served read | 17 / 0 / 2 | 26 / 0 / 4 |
 | submit-admit-1 | `/submit`, an operator `historical-tx-no-spv` submit admitting one tm_collected output | 0 / 13 / 7 | 4 / 15 / 9 |
 
+| record-potparty-filing | `/record?kind=potparty`, signed stranger naming A's live pot | 11 / 7 / 6 | 17 / 9 / 8 |
+
+NS2 fold (2026-10-12): the real signed filing is measured under `/record`, including the pot stale mark and the
+filer mark. SHED-M1 removes the three indexed party enumeration reads entirely; named parties do no work until
+their own read or armed walk. The tier pins exactly one filing walk (the filer) and one victim walk on its own
+next read. The filing baseline is 11 reads / 7 writes / 6 statements on the 300-stranger fixture; the existing
+margin rule gives 17 / 9 / 8. Its detached filer walk retains the `owed-recompute` ledger.
+
 Owed first read re-measured 2026-10-12 after the #610 fold rebased onto main `13f0e66`: 363 reads / 18 writes / 28 statements (`make ci-d1-budget`, local fixture D1). The markerless cursor and candidates reads, #610, account for the two additional statements. The existing 28-statement ceiling is retained: zero statement margin; it is a bar, not a knob. Other scenario baselines above remain the 2026-10-07 measurements.
 
 A ceiling is raised only with a new measurement (`D1_BUDGET_MEASURE=1 make ci-d1-budget` prints the table and

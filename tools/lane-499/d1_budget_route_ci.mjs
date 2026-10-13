@@ -221,6 +221,30 @@ const measured = {}
   else fail('L23R2-L2 cached snapshot tells could-not-judge and withholds its press', `${r.status} ${r.text}`)
 }
 
+// A real signed stranger filing: all request statements join /record's measured ceiling.
+// M1 removed the three party enumeration reads; the remaining filing work is still counted.
+{
+  const seed = readFileSync(process.env.D1_BUDGET_SEED, 'utf8')
+  const fixture = JSON.parse(seed.split('\n').find((line) => line.startsWith('-- NS2_RECORD_FIXTURE ')).slice('-- NS2_RECORD_FIXTURE '.length))
+  const before = (await appHealth()).owed.recomputeBySource.filing
+  const filed = await get(APP, `/record?kind=potparty&identity=${fixture.identity}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ scriptHex: fixture.scriptHex }),
+  })
+  if (filed.status === 200 && JSON.parse(filed.text).filed) pass('NS2 stranger potparty filing admitted')
+  else fail('NS2 stranger potparty filing admitted', `${filed.status}: ${filed.text}`)
+  check('record-potparty-filing', (measured['/record'] = segment(filed.timing, 'd1')))
+  const ran = await pollFor(async () => (await appHealth()).owed.recomputeBySource.filing > before)
+  const after = (await appHealth()).owed.recomputeBySource.filing
+  if (ran && after === before + 1) pass('SHED-M1 filing walks and pushes only its filer; no victim walk or push')
+  else fail('SHED-M1 filing walks only its filer', `filing walks +${after - before} (want 1)`)
+  const staleBefore = (await appHealth()).owed.recomputeBySource['read-stale']
+  await get(APP, `/owed?identity=${ID_A}`)
+  const repaired = await pollFor(async () => (await appHealth()).owed.recomputeBySource['read-stale'] > staleBefore)
+  const staleAfter = (await appHealth()).owed.recomputeBySource['read-stale']
+  if (repaired && staleAfter === staleBefore + 1) pass('SHED-M1 victim own next read consumes its stale mark with one walk')
+  else fail('SHED-M1 victim own next read recomputes once', `read-stale walks +${staleAfter - staleBefore}`)
+}
+
 // NOTE-3: twelve real failed writes leave no snapshot. The next read spends the reserved walk once.
 {
   const identity = '02' + (299).toString(16).padStart(64, '0')
