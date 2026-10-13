@@ -207,15 +207,21 @@ pub fn background_flush_plan(started_ms: u64, now_ms: u64) -> BackgroundFlush {
 
 /// [`flush_inline`] for a `wait_until` job that started at `started_ms` (bsv-low #649): ONE wall, bounded by what
 /// remains of the job's window ([`background_flush_plan`]), shared by the hop set, the pot set and the tracker
-/// events (whose own 20 s no longer stacks on top). Under the floor nothing is drained: the notes stay for the
-/// isolate's next flush, the skip is logged and counted (`admit_fast_flush_skipped_no_window_total`). A POST
+/// events (whose own 20 s no longer stacks on top). Under the floor no POST is started: the pot and hop notes are
+/// PARKED in D1 (bsv-low #649 M1, [`crate::change_park::park_withheld`]) for the cron to deliver, the skip and the
+/// withheld entries counted (`admit_fast_flush_skipped_no_window_total`, `admit_fast_flush_withheld_total`). A POST
 /// already in flight is not raced: the deadline only stops the flush from STARTING one it cannot afford.
 pub async fn flush_inline_within(env: Env, started_ms: u64) {
     match background_flush_plan(started_ms, Date::now().as_millis()) {
         BackgroundFlush::Skip { remaining_ms } => {
-            console_log!("[pot-changes] background flush SKIPPED: {remaining_ms} ms left of the wait_until window (floor {FLUSH_WINDOW_FLOOR_MS} ms); the notes stay for the next flush");
-            if let Ok(db) = env.d1("OVERLAY_DB") {
-                crate::ops::bump_counter(&db, crate::ops::COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW, 1).await;
+            // bsv-low #649 M1: the withheld pot and hop notes are PARKED in D1 for the cron's delivery
+            // (`change_park.rs`), never left to this isolate's next flush alone
+            match env.d1("OVERLAY_DB") {
+                Ok(db) => {
+                    let port = crate::change_park::WorkerPark { db: &db };
+                    crate::change_park::park_withheld(&port, remaining_ms, Date::now().as_millis()).await;
+                }
+                Err(_) => console_log!("[pot-changes] background flush SKIPPED: {remaining_ms} ms left of the wait_until window (floor {FLUSH_WINDOW_FLOOR_MS} ms); no OVERLAY_DB to park in, the notes stay for the next flush"),
             }
         }
         BackgroundFlush::Ship { deadline_ms } => {

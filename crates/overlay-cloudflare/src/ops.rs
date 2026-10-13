@@ -1138,6 +1138,10 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
         COUNTER_ADMIT_FAST_EVICT_YIELDED,
         COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW,
+        crate::change_park::COUNTER_ADMIT_FAST_FLUSH_WITHHELD,
+        crate::change_park::COUNTER_CHANGE_PARKED,
+        crate::change_park::COUNTER_CHANGE_PARK_FAULTS,
+        crate::change_park::COUNTER_CHANGE_UNPARKED,
         COUNTER_ADMIT_FAST_READMIT_INCOMPLETE,
         COUNTER_ADMIT_FAST_CONFLICT_SCANNED,
         COUNTER_ADMIT_FAST_CONFLICT_EVICTED,
@@ -1400,6 +1404,7 @@ pub async fn health_invariants(
     let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);
     let mut index_janitor = index_janitor_backlog(db).await;
     let dead_letters = crate::dead_letters::health_json(db, env).await;
+    let change_parked = crate::change_park::health_json(db).await;
     let queue = crate::beef_blob_sweep::health_json(db, env).await;
     let deferred_graphs = crate::gasp_deferred::health_json(
         db,
@@ -1461,6 +1466,9 @@ pub async fn health_invariants(
         // bsv-low #576: the parked dead letters (count by status, the oldest parked, the last re-drive, the letters
         // past the re-drive ceiling); `readable: false` = the table is unreadable, distinct from none.
         "deadLetters": dead_letters,
+        // bsv-low #649 M1: the pot and hop notes a background flush withheld, parked in D1 until the cron delivers
+        // them (by set; `null` = unreadable).
+        "changeParked": change_parked,
         // bsv-low #585 (door 3's fold): the queue's R2 objects at rest as the orphan sweep's listing counted them
         // (the last complete round and the one in progress) and the sweep's window, bounds and last pass.
         "queue": queue,

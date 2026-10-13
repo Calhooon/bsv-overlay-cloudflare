@@ -4134,10 +4134,12 @@ mod tests {
         let pots = squash(include_str!("pot_changes.rs"));
         let within = &pots[pots.find("pubasyncfnflush_inline_within(").expect("the windowed flush")..];
         let within = &within[..within.find("pubfnflush<").expect("ends")];
+        // bsv-low #649 M1: a skip POSTs nothing and PARKS its notes durably (`change_park::park_withheld`, which
+        // counts the skip and the withheld entries; its own pins run it); the Ship arm alone drains to POST
+        let skip_arm = &within[within.find("BackgroundFlush::Skip{").unwrap()..within.find("BackgroundFlush::Ship{").unwrap()];
         assert!(
-            within.contains("COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW")
-                && within.find("Skip{").unwrap() < within.find("drain()").unwrap(),
-            "a skip is counted and drains nothing (the notes stay for the next flush)"
+            skip_arm.contains("crate::change_park::park_withheld(") && !skip_arm.contains("ship(") && !skip_arm.contains("drain()"),
+            "a skip starts no POST and parks its notes (bsv-low #649 M1), never left in the isolate's sets alone"
         );
         assert!(
             within.contains("tracker_events::ship_until(&env,tracker_events,deadline_ms)") && !within.contains("tracker_events::ship(&"),

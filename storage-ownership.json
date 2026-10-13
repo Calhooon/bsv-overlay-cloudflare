@@ -899,6 +899,17 @@
    "why": "the cron's sweep (and the operator's lever POST /internal/beef-blob-sweep, the same pass) lists BEEF_BLOBS 200 objects a pass and resumes from the key at rest; a lost row restarts the round at the first key and loses only the served count until a round completes; transient"
   },
   {
+   "name": "change_parked",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the pot and hop change notes a background flush of an admit-fast job withheld for want of its waitUntil window (bsv-low #649 M1), one row per (set, entry) with its first park stamp; the cron delivers the oldest 128 a set a tick through the change flush and deletes only the rows of POSTs the app layer accepted",
+   "why": "a skipped flush's notes were in one isolate's memory only and a lone eviction could lose its push for good; a lost row costs one push the felt's own reads recover; transient"
+  },
+  {
    "name": "ef_deferred_sweep",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
