@@ -2403,7 +2403,11 @@ pub(crate) async fn internal_pot_announce_drain(
     if !crate::internal_events::internal_bearer_ok(&req, env) {
         return Response::error("unauthorized", 401);
     }
-    let t = drain_pot_announce(env).await?;
+    let deadline = worker_deadline(
+        crate::pot_hook::DRAIN_WALL_MS,
+        crate::pot_hook::DRAIN_SETTLE_RESERVE_MS,
+    );
+    let t = drain_pot_announce(env, &deadline).await?;
     json_response(
         serde_json::json!({ "ok": true, "rounds": t.rounds, "due": t.due, "drained": t.drained, "skipped": t.skipped, "retryFailed": t.retry_failed, "exhausted": t.exhausted, "aged": t.aged, "swept": t.swept, "faults": t.faults })
             .to_string(),
@@ -2411,16 +2415,31 @@ pub(crate) async fn internal_pot_announce_drain(
     )
 }
 
-/// One drain pass over the worker's D1 and relay, under the drain's own wall (N4).
-pub(crate) async fn drain_pot_announce(env: &worker::Env) -> Result<crate::pot_hook::DrainTally> {
+/// E649 L4 N7: the worker's [`crate::pot_hook::Deadline`]: `budget_ms` from now on `Date::now`, timed by
+/// `worker::Delay` (one timer per await, for the time left).
+pub(crate) fn worker_deadline(budget_ms: u64, reserve_ms: u64) -> crate::pot_hook::Deadline {
+    crate::pot_hook::Deadline::new(
+        budget_ms,
+        reserve_ms,
+        Box::new(|| worker::Date::now().as_millis()),
+        Box::new(|ms| {
+            Box::pin(async move {
+                worker::Delay::from(core::time::Duration::from_millis(ms)).await;
+            })
+        }),
+    )
+}
+
+/// One drain pass over the worker's D1 and relay, under the caller's one deadline (N4, N7).
+pub(crate) async fn drain_pot_announce(
+    env: &worker::Env,
+    deadline: &crate::pot_hook::Deadline,
+) -> Result<crate::pot_hook::DrainTally> {
     let store = crate::pot_hook::HookD1 {
         sql: D1Sql::of(env)?,
     };
     let relay = crate::pot_hook::WorkerRelay { env: env.clone() };
-    let wall = worker::Delay::from(core::time::Duration::from_millis(
-        crate::pot_hook::DRAIN_WALL_MS,
-    ));
-    Ok(crate::pot_hook::drain_parked(&store, &relay, wall).await)
+    Ok(crate::pot_hook::drain_parked(&store, &relay, deadline).await)
 }
 
 /// E649 L4: the hooks' SQL port over D1 (`pot_hook::HookD1` holds the statements): one `batch` is one

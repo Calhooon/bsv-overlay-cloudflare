@@ -163,8 +163,12 @@ pub const DRAIN_MAX_PER_PASS: u32 = 24;
 /// N3: a pass runs further rounds while the last one was full (a backlog) and the wall has not fallen: at most
 /// [`DRAIN_MAX_ROUNDS`] x [`DRAIN_MAX_PER_PASS`] = 96 wake-ups a scheduled pass, 384 an hour at `*/15`.
 pub const DRAIN_MAX_ROUNDS: u32 = 4;
-/// N4: the drain's own wall, the whole pass (its rounds share it); it runs in its own scheduled task.
+/// N4, N7: the drain TASK's one deadline (its boot, every round's due read, relay calls and settle, its counters and
+/// the final courier flush; [`Deadline`]); it runs in its own scheduled task.
 pub const DRAIN_WALL_MS: u64 = 60_000;
+/// N7: the time a round's due read and relay calls leave before the deadline, so the settle of what they did (and
+/// the age-out and sweep of the first round) is still issued while a relay hangs.
+pub const DRAIN_SETTLE_RESERVE_MS: u64 = 5_000;
 /// The sweep's bound per pass (and the age-out's).
 pub const SWEEP_MAX_PER_PASS: u32 = 50;
 
@@ -172,6 +176,58 @@ pub const SWEEP_MAX_PER_PASS: u32 = 50;
 pub fn retry_at(now: u64, attempts: u32) -> u64 {
     let shift = attempts.saturating_sub(1).min(16);
     now + (PARK_RETRY_BASE_MS << shift).min(PARK_RETRY_MAX_MS)
+}
+
+/// N7 (the second delta review): ONE deadline for a whole task, an absolute end on a clock and a timer for the time
+/// left. Every await of the task runs under [`Deadline::run`] (or [`Deadline::run_reserving`]): raced against the
+/// time left, and NOT ISSUED once that time is spent. The worker's is [`Deadline::new`] over `Date::now` and
+/// `worker::Delay`; the pins' over `Instant` and tokio's sleep.
+pub struct Deadline {
+    end_ms: u64,
+    reserve_ms: u64,
+    clock: Box<dyn Fn() -> u64>,
+    timer: Box<dyn Fn(u64) -> Detached>,
+}
+
+impl Deadline {
+    /// A deadline `budget_ms` from now; `reserve_ms` is what [`Deadline::run_reserving`] leaves before it.
+    pub fn new(
+        budget_ms: u64,
+        reserve_ms: u64,
+        clock: Box<dyn Fn() -> u64>,
+        timer: Box<dyn Fn(u64) -> Detached>,
+    ) -> Self {
+        Deadline {
+            end_ms: clock() + budget_ms,
+            reserve_ms,
+            clock,
+            timer,
+        }
+    }
+    /// The time left, in ms.
+    pub fn left_ms(&self) -> u64 {
+        self.end_ms.saturating_sub((self.clock)())
+    }
+    /// `f` raced against the deadline: `None` when the deadline fell first (`f` dropped) or had fallen before it.
+    pub async fn run<F: Future>(&self, f: F) -> Option<F::Output> {
+        self.run_leaving(0, f).await
+    }
+    /// `f` raced against the deadline less its reserve: what may not take the settle's time.
+    pub async fn run_reserving<F: Future>(&self, f: F) -> Option<F::Output> {
+        self.run_leaving(self.reserve_ms, f).await
+    }
+    async fn run_leaving<F: Future>(&self, reserve_ms: u64, f: F) -> Option<F::Output> {
+        use futures_util::future::{select, Either};
+        let left = self.left_ms().saturating_sub(reserve_ms);
+        if left == 0 {
+            return None;
+        }
+        let f = std::pin::pin!(f);
+        match select(f, (self.timer)(left)).await {
+            Either::Left((v, _)) => Some(v),
+            Either::Right(_) => None,
+        }
+    }
 }
 
 /// One wake-up of a body: the pots-room broadcast of an outpoint, or one seat's `pot` event.
@@ -1187,27 +1243,36 @@ impl DrainTally {
 
 /// ONE DRAIN PASS (the scheduled tick's own task, and `POST /internal/pot-announce-drain`'s): ROUNDS of at most
 /// [`DRAIN_MAX_PER_PASS`] parked wake-ups due now, each round's delivered together, a further round only while the
-/// last was full (a backlog), delivered at least one and the one `wall` has not fallen, at most [`DRAIN_MAX_ROUNDS`]
-/// (N3). A delivered one
-/// leaves the park, a failed one is retried later (doubling from [`PARK_RETRY_BASE_MS`] to [`PARK_RETRY_MAX_MS`]) and
-/// marked exhausted at its [`PARK_MAX_ATTEMPTS`]th attempt; the first round's write also ages out live rows due for
-/// longer than [`PARK_OVERDUE_MAX_MS`] and sweeps exhausted rows older than [`PARK_SWEEP_AFTER_MS`], each at most
-/// [`SWEEP_MAX_PER_PASS`]. Two D1 round trips a round: the due read, then one write batch.
-pub async fn drain_parked<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
+/// last was full (a backlog), delivered at least one and the deadline has not fallen, at most [`DRAIN_MAX_ROUNDS`]
+/// (N3). A delivered one leaves the park, a failed one is retried later (doubling from [`PARK_RETRY_BASE_MS`] to
+/// [`PARK_RETRY_MAX_MS`]) and marked exhausted at its [`PARK_MAX_ATTEMPTS`]th attempt; the first round's write also
+/// ages out live rows due for longer than [`PARK_OVERDUE_MAX_MS`] and sweeps exhausted rows older than
+/// [`PARK_SWEEP_AFTER_MS`], each at most [`SWEEP_MAX_PER_PASS`]. Two D1 round trips a round: the due read, then one
+/// write batch. N7: EVERY await (the due read, the relay calls, the settle, the counters) runs under the task's one
+/// `deadline`; the due read and the relay calls leave its reserve ([`DRAIN_SETTLE_RESERVE_MS`]) for the settle. A
+/// relay call that has not answered when they stop is settled as a failed attempt; a round whose settle is not
+/// issued, or is dropped, leaves its rows as they were (still parked at their tokens, retried by a later pass).
+pub async fn drain_parked<S: HookStore, R: RelayPort>(
     store: &S,
     relay: &R,
-    wall: W,
+    deadline: &Deadline,
 ) -> DrainTally {
     let mut t = DrainTally::default();
-    futures_util::pin_mut!(wall);
     let mut walled = false;
     for round in 0..DRAIN_MAX_ROUNDS {
         let now = store.now_ms();
-        let due = match store.due_parked(now, DRAIN_MAX_PER_PASS).await {
-            Ok(d) => d,
-            Err(e) => {
+        let due = match deadline
+            .run_reserving(store.due_parked(now, DRAIN_MAX_PER_PASS))
+            .await
+        {
+            Some(Ok(d)) => d,
+            Some(Err(e)) => {
                 t.faults += 1;
                 store.log(&format!("[pot-changed] drain read failed: {e}"));
+                break;
+            }
+            None => {
+                walled = true;
                 break;
             }
         };
@@ -1226,26 +1291,22 @@ pub async fn drain_parked<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
                     generation: Some(p.generation),
                 })
                 .collect();
-            let got = {
-                use futures_util::future::{join_all, select, Either};
-                let cell: RefCell<Vec<Option<Delivery>>> = RefCell::new(vec![None; sends.len()]);
-                let calls = sends.iter().enumerate().map(|(i, s)| {
-                    let cell = &cell;
-                    async move {
-                        let d = send_one(relay, s).await;
-                        cell.borrow_mut()[i] = Some(d);
-                    }
-                });
-                {
-                    let all = join_all(calls);
-                    futures_util::pin_mut!(all);
-                    if let Either::Right(_) = select(all, wall.as_mut()).await {
-                        walled = true;
-                    }
+            let cell: RefCell<Vec<Option<Delivery>>> = RefCell::new(vec![None; sends.len()]);
+            let calls = sends.iter().enumerate().map(|(i, s)| {
+                let cell = &cell;
+                async move {
+                    let d = send_one(relay, s).await;
+                    cell.borrow_mut()[i] = Some(d);
                 }
-                cell.into_inner()
-            };
-            got
+            });
+            if deadline
+                .run_reserving(futures_util::future::join_all(calls))
+                .await
+                .is_none()
+            {
+                walled = true;
+            }
+            cell.into_inner()
         };
         let now = store.now_ms();
         let settled_before = t.drained + t.skipped;
@@ -1292,17 +1353,25 @@ pub async fn drain_parked<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
             });
         }
         if !ops.is_empty() {
-            match store.write(&[], &ops).await {
-                Ok(outs) => {
+            match deadline.run(store.write(&[], &ops)).await {
+                Some(Ok(outs)) => {
                     if round == 0 {
                         let n = outs.len();
                         t.aged = outs[n - 2].changes;
                         t.swept = outs[n - 1].changes;
                     }
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     t.faults += 1;
                     store.log(&format!("[pot-changed] drain settle failed: {e}"));
+                    break;
+                }
+                None => {
+                    walled = true;
+                    store.log(&format!(
+                        "[pot-changed] drain settle not landed at the deadline: {} op(s) left as they were",
+                        ops.len()
+                    ));
                     break;
                 }
             }
@@ -1318,8 +1387,8 @@ pub async fn drain_parked<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
         if walled { " (WALL)" } else { "" }
     ));
     let counters = t.counters();
-    if !counters.is_empty() {
-        store.counters(counters).await;
+    if !counters.is_empty() && deadline.run(store.counters(counters)).await.is_none() {
+        store.log("[pot-changed] drain counters not flushed at the deadline");
     }
     t
 }
@@ -1813,10 +1882,10 @@ pub(crate) mod tests {
         assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_SENT), 21);
 
         let quick = Relay::default();
-        let t = drain_parked(&*store, &quick, tokio::time::sleep(Duration::from_secs(5))).await;
+        let t = drain_parked(&*store, &quick, &test_deadline(5_000)).await;
         assert_eq!((t.due, t.drained), (0, 0), "not due before its retry");
         store.sql.now.set(store.sql.now.get() + PARK_RETRY_BASE_MS);
-        let t = drain_parked(&*store, &quick, tokio::time::sleep(Duration::from_secs(5))).await;
+        let t = drain_parked(&*store, &quick, &test_deadline(5_000)).await;
         assert_eq!(
             (t.due, t.drained, t.faults),
             (1, 1, 0),
@@ -1853,12 +1922,7 @@ pub(crate) mod tests {
             .unwrap();
         let failing = SlowRelay::new(Duration::ZERO, Delivery::Failed);
         for _ in 0..PARK_MAX_ATTEMPTS {
-            let t = drain_parked(
-                &*store,
-                &failing,
-                tokio::time::sleep(Duration::from_secs(5)),
-            )
-            .await;
+            let t = drain_parked(&*store, &failing, &test_deadline(5_000)).await;
             assert_eq!(t.due, 1);
             store.sql.now.set(store.sql.now.get() + PARK_RETRY_MAX_MS);
         }
@@ -1870,24 +1934,14 @@ pub(crate) mod tests {
             store.sql.counter(COUNTER_ANNOUNCE_RETRY_FAILED),
             u64::from(PARK_MAX_ATTEMPTS) - 1
         );
-        let t = drain_parked(
-            &*store,
-            &failing,
-            tokio::time::sleep(Duration::from_secs(5)),
-        )
-        .await;
+        let t = drain_parked(&*store, &failing, &test_deadline(5_000)).await;
         assert_eq!(
             (t.due, t.swept),
             (0, 0),
             "an exhausted wake-up is not retried, nor swept early"
         );
         store.sql.now.set(store.sql.now.get() + PARK_SWEEP_AFTER_MS);
-        let t = drain_parked(
-            &*store,
-            &failing,
-            tokio::time::sleep(Duration::from_secs(5)),
-        )
-        .await;
+        let t = drain_parked(&*store, &failing, &test_deadline(5_000)).await;
         assert_eq!(t.swept, 1, "swept a day after");
         assert!(parked_rows(&store.sql).is_empty());
         assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_SWEPT), 1);
@@ -2284,7 +2338,7 @@ pub(crate) mod tests {
         assert_eq!(generations(&store.sql), gb);
         store.sql.now.set(at + PARK_GRACE_MS);
         let quick = Relay::default();
-        let t = drain_parked(&*store, &quick, tokio::time::sleep(Duration::from_secs(5))).await;
+        let t = drain_parked(&*store, &quick, &test_deadline(5_000)).await;
         assert_eq!(
             (t.due, t.drained),
             (22, 22),
@@ -2408,7 +2462,7 @@ pub(crate) mod tests {
         .await;
         rec.run_all().await;
         store.sql.now.set(at + PARK_GRACE_MS + PARK_RETRY_BASE_MS);
-        let t = drain_parked(&*store, &*relay, wall()).await;
+        let t = drain_parked(&*store, &*relay, &test_deadline(5_000)).await;
         assert_eq!((t.due, t.drained), (1, 1));
         let ids: Vec<Option<String>> = seat_sends(&relay)
             .into_iter()
@@ -2525,7 +2579,7 @@ pub(crate) mod tests {
         // the drain follows the backlog: four rounds of 24
         store.sql.now.set(at + PARK_GRACE_MS);
         let quick = Relay::default();
-        let t = drain_parked(&*store, &quick, tokio::time::sleep(Duration::from_secs(5))).await;
+        let t = drain_parked(&*store, &quick, &test_deadline(5_000)).await;
         assert_eq!(
             (t.rounds, t.due, t.drained),
             (u64::from(DRAIN_MAX_ROUNDS), 96, 96)
@@ -2537,7 +2591,7 @@ pub(crate) mod tests {
             .now
             .set(at + PARK_GRACE_MS + PARK_OVERDUE_MAX_MS + 1);
         let down = SlowRelay::new(Duration::ZERO, Delivery::Failed);
-        let t = drain_parked(&*store, &down, tokio::time::sleep(Duration::from_secs(5))).await;
+        let t = drain_parked(&*store, &down, &test_deadline(5_000)).await;
         assert_eq!(t.aged, u64::from(SWEEP_MAX_PER_PASS));
         assert_eq!(
             store.sql.counter(COUNTER_ANNOUNCE_AGED),
@@ -2620,7 +2674,7 @@ pub(crate) mod tests {
         let relay = Rc::new(Relay::default());
         let (s2, r2) = (store.clone(), relay.clone());
         let drain: Detached = Box::pin(async move {
-            drain_parked(&*s2, &*r2, tokio::time::sleep(Duration::from_secs(5))).await;
+            drain_parked(&*s2, &*r2, &test_deadline(5_000)).await;
         });
         let tracker: Detached = Box::pin(std::future::pending::<()>());
         let rec = Recorded::default();
@@ -2963,7 +3017,7 @@ pub(crate) mod tests {
         let mut resent = None;
         for pass in 0..30u64 {
             store.sql.now.set(at + PARK_GRACE_MS + pass * 900_000);
-            drain_parked(&*store, &quick, tokio::time::sleep(Duration::from_secs(5))).await;
+            drain_parked(&*store, &quick, &test_deadline(5_000)).await;
             if resent.is_none() && parked_count(&store.sql) <= i64::from(PARK_MAX_ROWS) - 22 {
                 let rec = Recorded::default();
                 let again = serve_pot_changed(
@@ -3103,5 +3157,194 @@ pub(crate) mod tests {
         let o = serve(more).await;
         assert_eq!((o.parked, o.park_full), (0, 8));
         assert_eq!(parked_count(&store.sql), i64::from(PARK_MAX_ROWS));
+    }
+
+    /// A deadline `ms` from now over `Instant` and tokio's sleep, no reserve (the pins' fake relay is quick).
+    fn test_deadline(ms: u64) -> Deadline {
+        test_deadline_reserving(ms, 0)
+    }
+    fn test_deadline_reserving(ms: u64, reserve_ms: u64) -> Deadline {
+        let t0 = Instant::now();
+        Deadline::new(
+            ms,
+            reserve_ms,
+            Box::new(move || t0.elapsed().as_millis() as u64),
+            Box::new(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms)))),
+        )
+    }
+
+    /// The shipped store with SLOW (or never answering) D1 round trips: the due read and the write batch each sleep
+    /// their delay before the real SQL runs (a dropped call runs none).
+    struct SlowStore<'a> {
+        inner: &'a HookD1<SqliteSql>,
+        read: Option<Duration>,
+        write: Option<Duration>,
+    }
+    async fn slow(d: Option<Duration>) {
+        match d {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+    impl HookStore for SlowStore<'_> {
+        async fn read_outpoints(&self, o: &[(String, u32)]) -> Vec<OutpointRead> {
+            self.inner.read_outpoints(o).await
+        }
+        async fn write(
+            &self,
+            marks: &[(String, &'static str)],
+            ops: &[ParkOp],
+        ) -> Result<Vec<OpOut>, String> {
+            slow(self.write).await;
+            self.inner.write(marks, ops).await
+        }
+        async fn due_parked(&self, now: u64, limit: u32) -> Result<Vec<Parked>, String> {
+            slow(self.read).await;
+            self.inner.due_parked(now, limit).await
+        }
+        async fn counters(&self, deltas: Vec<(String, u64)>) {
+            self.inner.counters(deltas).await
+        }
+        fn now_ms(&self) -> u64 {
+            self.inner.now_ms()
+        }
+        fn log(&self, line: &str) {
+            self.inner.log(line)
+        }
+    }
+
+    /// (N7, the second delta review) THE DRAIN TASK HAS ONE DEADLINE. On `c830527` the shared timer raced the relay
+    /// futures only: an EMPTY pass with an 80 ms due read and an 80 ms maintenance write returned after 174 ms under
+    /// a 40 ms wall (RED: "took 174 ms under 40 ms"), and a pending store read never reached the race. Now every await
+    /// of the pass runs under [`Deadline`]: (a) that empty pass returns at the deadline; (b) a never-answering due
+    /// read too; (c) 24 due rows delivered by a quick relay whose SETTLE is slow return at the deadline with the rows
+    /// RETAINED as they were (attempts 0, still parked at their tokens, retried by a later pass); (d) a relay that
+    /// never answers is stopped at the reserve and its rows are settled as failed attempts before the deadline. The
+    /// worker's drain task runs its boot and its courier flush under the same deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f3_n7_the_drain_task_is_bounded_by_one_deadline() {
+        let lib = squash(&code_only(include_str!("lib.rs")));
+        let sched = &lib[lib.find(&squash("async fn scheduled(")).expect("scheduled")..];
+        let task = &sched[sched
+            .find(&squash("let drain: pot_hook::Detached"))
+            .expect("the drain task")
+            ..sched
+                .find(&squash("let tracker: pot_hook::Detached"))
+                .expect("the tracker task")];
+        for step in [
+            "let deadline = routes::worker_deadline(pot_hook::DRAIN_WALL_MS, pot_hook::DRAIN_SETTLE_RESERVE_MS);",
+            ".run(d1_ledger::boot(schema::ensure_latch_columns(&env_drain)))",
+            "routes::drain_pot_announce(&env_drain, &deadline)",
+            "deadline.run(courier::flush(Some(db), pending))",
+        ] {
+            assert!(task.contains(&squash(step)), "the drain task: {step}");
+        }
+        let src = squash(&code_only(include_str!("pot_hook.rs")));
+        let pass = &src[src
+            .find(&squash("pub async fn drain_parked<"))
+            .expect("the pass")
+            ..src
+                .find(&squash("pub async fn serve_pot_changed<"))
+                .expect("the hook")];
+        for step in [
+            ".run_reserving(store.due_parked(now, DRAIN_MAX_PER_PASS))",
+            ".run_reserving(futures_util::future::join_all(calls))",
+            "deadline.run(store.write(&[], &ops))",
+            "deadline.run(store.counters(counters))",
+        ] {
+            assert!(pass.contains(&squash(step)), "the pass: {step}");
+        }
+        assert_eq!(
+            pass.matches(".await").count(),
+            5,
+            "the pass awaits nothing but its four deadline runs and the relay call inside the raced join"
+        );
+
+        let store = HookD1 {
+            sql: SqliteSql::migrated(),
+        };
+        let ms = Duration::from_millis;
+        // (a) the review's empty pass
+        let s = SlowStore {
+            inner: &store,
+            read: Some(ms(80)),
+            write: Some(ms(80)),
+        };
+        let t0 = Instant::now();
+        drain_parked(&s, &Relay::default(), &test_deadline_reserving(40, 10)).await;
+        let took = t0.elapsed().as_millis();
+        assert!(took < 60, "the empty pass took {took} ms under 40 ms");
+        // (b) a never-answering due read
+        let s = SlowStore {
+            inner: &store,
+            read: None,
+            write: None,
+        };
+        let t0 = Instant::now();
+        let t = drain_parked(&s, &Relay::default(), &test_deadline_reserving(40, 10)).await;
+        let took = t0.elapsed().as_millis();
+        assert!(took < 60, "a pending read took {took} ms under 40 ms");
+        assert_eq!(t.rounds, 0);
+        // (c) 24 due rows, a quick relay, a slow settle: the rows retained as they were
+        let now = store.sql.now.get();
+        let parks: Vec<ParkOp> = (0..24u32)
+            .map(|i| ParkOp::Park {
+                wake: Wake {
+                    txid: format!("d{i:063x}"),
+                    vout: 0,
+                    recipient: None,
+                },
+                at_ms: now,
+                next_ms: now,
+            })
+            .collect();
+        store.write(&[], &parks).await.unwrap();
+        let before = generations(&store.sql);
+        let s = SlowStore {
+            inner: &store,
+            read: Some(Duration::ZERO),
+            write: Some(ms(80)),
+        };
+        let t0 = Instant::now();
+        let quick = Relay::default();
+        drain_parked(&s, &quick, &test_deadline_reserving(40, 10)).await;
+        let took = t0.elapsed().as_millis();
+        assert!(took < 60, "the slow settle took {took} ms under 40 ms");
+        assert_eq!(quick.delivered.borrow().len(), 24, "the relay took them");
+        assert_eq!(generations(&store.sql), before, "retained at their tokens");
+        let attempts: i64 = store
+            .sql
+            .conn
+            .query_row("SELECT SUM(attempts) FROM pot_announce_parked", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(attempts, 0, "retained as they were");
+        assert!(store
+            .sql
+            .lines
+            .borrow()
+            .iter()
+            .any(|l| l.contains("drain settle not landed at the deadline")));
+        // (d) a relay that never answers: stopped at the reserve, the settle issued before the deadline
+        let s = SlowStore {
+            inner: &store,
+            read: Some(Duration::ZERO),
+            write: Some(Duration::ZERO),
+        };
+        let hung = SlowRelay::new(Duration::from_secs(3600), Delivery::Sent);
+        let t0 = Instant::now();
+        let t = drain_parked(&s, &hung, &test_deadline_reserving(60, 30)).await;
+        let took = t0.elapsed().as_millis();
+        assert!(took < 60, "the hung relay took {took} ms under 60 ms");
+        assert_eq!((t.due, t.retry_failed), (24, 24));
+        let attempts: i64 = store
+            .sql
+            .conn
+            .query_row("SELECT SUM(attempts) FROM pot_announce_parked", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(attempts, 24, "each settled as a failed attempt");
     }
 }
