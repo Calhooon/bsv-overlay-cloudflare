@@ -1778,11 +1778,79 @@ impl ConflictPassSummary {
     }
 }
 
+/// One conflict pass's world, candidate by candidate (bsv-low #649 H1): a port so the pins run the shipped
+/// [`run_conflict_candidates`] over a fake whose second candidate's courier never answers.
+pub(crate) trait ConflictPassPort {
+    /// Re-check one candidate (its stored BEEF read, then [`converge_confirmed_conflict`]): `Ok(true)` evicted.
+    async fn check(&self, txid: &str, beef: Option<String>) -> Result<bool, String>;
+    /// Persist one candidate's counter deltas (the durable `ops_counters` rows).
+    async fn persist(&self, deltas: &ConflictPassSummary);
+}
+
+/// THE LOOP of a conflict pass (bsv-low #649 H1): each candidate's deltas are PERSISTED once it completes, before
+/// the next candidate's courier calls start. Until the fold the pass bumped its counters once after the loop, so an
+/// eviction already made (the shadow move, the memo, the log) waited for every later candidate's network calls,
+/// which have no timeout of their own: a task cancelled there lost `admit_fast_conflict_evicted_total` for a pot
+/// already out of the candidate set (it is never selected again), and an eviction not counted reads as none.
+pub(crate) async fn run_conflict_candidates<P: ConflictPassPort>(
+    port: &P,
+    rows: Vec<(String, Option<String>)>,
+) -> ConflictPassSummary {
+    let mut summary = ConflictPassSummary::default();
+    for (txid, beef) in rows {
+        let result = port.check(&txid, beef).await;
+        let mut one = ConflictPassSummary::default();
+        one.note(&result);
+        port.persist(&one).await;
+        summary.scanned += one.scanned;
+        summary.evicted += one.evicted;
+        summary.faults += one.faults;
+    }
+    summary
+}
+
+/// The worker's [`ConflictPassPort`]: D1, the courier fetcher (its 24-call budget shared by the pass) and presence.
+struct WorkerConflictPass<'a> {
+    db: &'a D1Database,
+    fetcher: crate::proof_fetcher::ChainProofFetcher,
+    presence: CourierConflictPresence,
+}
+
+impl ConflictPassPort for WorkerConflictPass<'_> {
+    async fn check(&self, txid: &str, beef: Option<String>) -> Result<bool, String> {
+        let Some(raw) =
+            crate::d1::beef_of_hex_column(beef).and_then(|b| crate::ef::proven_subject_raw(&b))
+        else {
+            // #602 delta LOW-B: a pot the pass cannot read is a fault, never skipped unseen.
+            worker::console_log!(
+                "[conflict] {} stored BEEF does not read, retried next pass",
+                txid.get(..16).unwrap_or(txid)
+            );
+            return Err("stored BEEF does not read".into());
+        };
+        let result = converge_confirmed_conflict(
+            self.db,
+            &self.fetcher,
+            &self.presence,
+            txid,
+            &raw,
+            worker::Date::now().as_millis(),
+        )
+        .await;
+        if let Err(e) = &result {
+            worker::console_log!("[conflict] {txid} re-check failed, retried next pass: {e}");
+        }
+        result
+    }
+    async fn persist(&self, deltas: &ConflictPassSummary) {
+        bump_conflict_counters(self.db, deltas).await;
+    }
+}
+
 pub async fn confirmed_conflict_pass(
     db: &D1Database,
     woc_api_key: Option<&str>,
 ) -> ConflictPassSummary {
-    let mut summary = ConflictPassSummary::default();
     #[derive(serde::Deserialize)]
     struct Candidate {
         txid: String,
@@ -1795,53 +1863,28 @@ pub async fn confirmed_conflict_pass(
         Ok(rows) => rows,
         Err(e) => {
             worker::console_log!("[conflict] candidate read failed: {e}");
-            summary.faults += 1;
+            let summary = ConflictPassSummary { faults: 1, ..Default::default() };
             bump_conflict_counters(db, &summary).await;
             return summary;
         }
     };
-    let fetcher = crate::proof_fetcher::ChainProofFetcher::new(None)
-        .with_woc_api_key(woc_api_key.map(str::to_owned))
-        .with_budget(24);
-    let presence = CourierConflictPresence {
-        woc_api_key: woc_api_key.map(str::to_owned),
+    let port = WorkerConflictPass {
+        db,
+        fetcher: crate::proof_fetcher::ChainProofFetcher::new(None)
+            .with_woc_api_key(woc_api_key.map(str::to_owned))
+            .with_budget(24),
+        presence: CourierConflictPresence { woc_api_key: woc_api_key.map(str::to_owned) },
     };
-    for row in rows {
-        let Some(raw) =
-            crate::d1::beef_of_hex_column(row.beef).and_then(|b| crate::ef::proven_subject_raw(&b))
-        else {
-            // #602 delta LOW-B: a pot the pass cannot read is a fault, never skipped unseen.
-            worker::console_log!(
-                "[conflict] {} stored BEEF does not read, retried next pass",
-                row.txid.get(..16).unwrap_or(&row.txid)
-            );
-            summary.note(&Err("stored BEEF does not read".into()));
-            continue;
-        };
-        let result = converge_confirmed_conflict(
-            db,
-            &fetcher,
-            &presence,
-            &row.txid,
-            &raw,
-            worker::Date::now().as_millis(),
-        )
-        .await;
-        summary.note(&result);
-        if let Err(e) = result {
-            worker::console_log!(
-                "[conflict] {} re-check failed, retried next pass: {e}",
-                row.txid
-            );
-        }
-    }
-    bump_conflict_counters(db, &summary).await;
-    summary
+    run_conflict_candidates(&port, rows.into_iter().map(|r| (r.txid, r.beef)).collect()).await
 }
 
+/// The pass's counters, a zero delta skipped (bsv-low #649 H1: written once per candidate, so a write per counter
+/// that moved, at most two a candidate).
 async fn bump_conflict_counters(db: &D1Database, summary: &ConflictPassSummary) {
     for (name, delta) in summary.counter_deltas() {
-        crate::ops::bump_counter(db, name, delta).await;
+        if delta > 0 {
+            crate::ops::bump_counter(db, name, delta).await;
+        }
     }
 }
 
@@ -4112,5 +4155,69 @@ mod tests {
         let memo = imp.find("write_refused_verdict(").expect("the memo");
         let ev = imp.find("Ok(ConflictEvictOutcome::Evicted)").expect("the eviction answered");
         assert!(y < memo && memo < ev, "yield answered first, then the memo, then Evicted");
+    }
+
+    /// bsv-low #649 H1: the conflict pass's world, recorded; the SECOND candidate's courier never answers.
+    struct HangingSecondCourier {
+        events: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ConflictPassPort for HangingSecondCourier {
+        async fn check(&self, txid: &str, _beef: Option<String>) -> Result<bool, String> {
+            self.events.borrow_mut().push(format!("check {txid}"));
+            if txid == "first" {
+                self.events.borrow_mut().push("first evicted".into());
+                return Ok(true);
+            }
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn persist(&self, d: &ConflictPassSummary) {
+            self.events
+                .borrow_mut()
+                .push(format!("persist scanned={} evicted={} faults={}", d.scanned, d.evicted, d.faults));
+        }
+    }
+
+    /// bsv-low #649 H1 (the lens's hanging second courier): candidate 1 is evicted, candidate 2's courier hangs, and
+    /// the runtime cancels the task there. The shipped loop must have PERSISTED candidate 1's eviction count before
+    /// candidate 2's network work started. On `c8e4d8f` the pass bumped once after the loop: nothing persisted.
+    #[test]
+    fn e649_h1_a_conflict_eviction_is_counted_before_the_next_candidates_courier() {
+        let port = HangingSecondCourier { events: Default::default() };
+        let rows = vec![("first".to_string(), None), ("second".to_string(), None)];
+        let mut fut = std::pin::pin!(run_conflict_candidates(&port, rows));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut cx).is_pending(),
+            "the second courier hangs, so the pass has not returned"
+        );
+        let done = port.events.borrow().clone();
+        assert_eq!(
+            done,
+            vec![
+                "check first".to_string(),
+                "first evicted".to_string(),
+                "persist scanned=1 evicted=1 faults=0".to_string(),
+                "check second".to_string(),
+            ],
+            "the first eviction is counted durably before the second candidate's courier is asked"
+        );
+    }
+
+    /// bsv-low #649 H1 (structural): the production pass runs the shipped loop, and the loop persists inside it.
+    #[test]
+    fn e649_h1_the_pass_runs_the_shipped_loop() {
+        let src = include_str!("admit_fast.rs");
+        let pass = &src[src.find("pub async fn confirmed_conflict_pass(").unwrap()..];
+        let pass = &pass[..pass.find("\n}\n").unwrap()];
+        assert!(pass.contains("run_conflict_candidates(&port,"), "the pass runs the shipped loop");
+        assert_eq!(pass.matches("bump_conflict_counters(").count(), 1, "only the candidate read's fault is bumped by the pass itself");
+        let l = &src[src.find("pub(crate) async fn run_conflict_candidates<").unwrap()..];
+        let l = &l[..l.find("\n}\n").unwrap()];
+        let check = l.find("port.check(").unwrap();
+        let persist = l.find("port.persist(&one).await").expect("each candidate persisted");
+        let close = l.find("summary.scanned += one.scanned").unwrap();
+        assert!(check < persist && persist < close, "persisted inside the loop, after its own check");
     }
 }
