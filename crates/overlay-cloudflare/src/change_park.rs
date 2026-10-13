@@ -38,8 +38,8 @@ use worker::*;
 pub const CHANGE_PARKED_CREATE: &str = "CREATE TABLE IF NOT EXISTS change_parked (\
      kind TEXT NOT NULL, item TEXT NOT NULL, parked_at_ms INTEGER NOT NULL, \
      PRIMARY KEY (kind, item))";
-/// bsv-low #649 N1 (the delta lens): the row's GENERATION, bumped by every re-park, so a delivery deletes only the
-/// intent it read. Appended as its own migration (#638: never a DROP or a RENAME; the runner ignores the re-run's
+/// bsv-low #649 N1 (the delta lens): the row's GENERATION, a new intent token at every park (D2-M1: [`PARK_SQL`]),
+/// so a delivery deletes only the intent it read. Appended as its own migration (#638: never a DROP or a RENAME; the runner ignores the re-run's
 /// "duplicate column").
 pub const CHANGE_PARKED_ADD_GENERATION: &str =
     "ALTER TABLE change_parked ADD COLUMN generation INTEGER NOT NULL DEFAULT 0";
@@ -54,18 +54,25 @@ pub const CHANGE_PARKED_ADD_NEXT_ATTEMPT: &str =
     "ALTER TABLE change_parked ADD COLUMN next_attempt_at_ms INTEGER NOT NULL DEFAULT 0";
 pub const CHANGE_PARKED_ADD_EXHAUSTED: &str =
     "ALTER TABLE change_parked ADD COLUMN exhausted INTEGER NOT NULL DEFAULT 0";
-/// A park: one row per (set, entry); a re-park keeps the first stamp and BUMPS the generation (N1): a change
-/// parked while an earlier delivery of the same entry is in flight is a new intent, which that delivery's delete
-/// does not take. A re-park is a new intent for the retry state too (N2): its attempts start again and it is
+/// A park: one row per (set, entry); a re-park keeps the first stamp and gives the row a NEW generation (N1): a
+/// change parked while an earlier delivery of the same entry is in flight is a new intent, which that delivery's
+/// delete does not take. The generation is an INTENT TOKEN never reused for a key (the second delta lens, D2-M1):
+/// every insert and every re-park writes `stamp * 2048 + nonce` (`?3` the park's stamp in ms, the nonce SQLite's
+/// `random()` masked to 11 bits; under 2^53 until the year 2109, so it reads back exact through D1's numbers), and a
+/// re-park takes the larger of that and the held token plus one. Until the fold an insert took the column's default
+/// 0, so a key deleted by one delivery and parked again was K/0 again, and a second delivery that had read K/0
+/// deleted the new intent. A token is reused only by a park of the same key in the same millisecond with the same
+/// nonce after the earlier row was deleted (stated: clocks of two isolates that disagree can make two stamps equal). A re-park is a new intent for the retry state too (N2): its attempts start again and it is
 /// eligible at once (an exhausted row comes back). A NEW key is parked only while the table holds fewer than
 /// `?4` rows ([`CHANGE_PARKED_MAX_ROWS`], read by a LIMITed scan: at most `?4` rows), so the newest are refused
 /// when it is full (no row returned: the caller keeps that entry in memory and counts it).
 pub const PARK_SQL: &str =
-    "INSERT INTO change_parked (kind, item, parked_at_ms, next_attempt_at_ms) \
-     SELECT ?1, ?2, ?3, ?3 \
+    "INSERT INTO change_parked (kind, item, parked_at_ms, next_attempt_at_ms, generation) \
+     SELECT ?1, ?2, ?3, ?3, CAST(?3 AS INTEGER) * 2048 + (random() & 2047) \
      WHERE EXISTS (SELECT 1 FROM change_parked WHERE kind = ?1 AND item = ?2) \
         OR (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked LIMIT ?4)) < ?4 \
-     ON CONFLICT(kind, item) DO UPDATE SET generation = change_parked.generation + 1, \
+     ON CONFLICT(kind, item) DO UPDATE SET \
+        generation = MAX(excluded.generation, change_parked.generation + 1), \
         attempts = 0, exhausted = 0, \
         next_attempt_at_ms = MIN(change_parked.next_attempt_at_ms, excluded.next_attempt_at_ms) \
      RETURNING item";
@@ -1368,8 +1375,14 @@ mod tests {
         };
         assert!(park("a:0", 10, 2) && park("b:0", 20, 2));
         assert!(!park("c:0", 30, 2), "full: the newest is refused");
-        conn.execute(REFUSE_SQL, rusqlite::params![KIND_POT, "a:0", 0, 99_999, 1])
+        let g0: i64 = conn
+            .query_row("SELECT generation FROM change_parked WHERE item = 'a:0'", [], |r| r.get(0))
             .unwrap();
+        conn.execute(
+            "UPDATE change_parked SET attempts = 8, exhausted = 1, next_attempt_at_ms = 99999 WHERE item = 'a:0'",
+            [],
+        )
+        .unwrap();
         assert!(park("a:0", 40, 2), "a held key re-parks when full");
         let (g, a, ex, next): (i64, i64, i64, i64) = conn
             .query_row(
@@ -1378,11 +1391,8 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(
-            (g, a, ex, next),
-            (1, 0, 0, 40),
-            "a new intent: eligible now"
-        );
+        assert!(g > g0, "a new intent token: {g} after {g0}");
+        assert_eq!((a, ex, next), (0, 0, 40), "a new intent: eligible now");
         // the skip keeps what was refused in memory and counts it
         let _ = crate::pot_changes::drain();
         let _ = crate::hop_changes::drain();
@@ -1524,7 +1534,16 @@ mod tests {
             "oldest first, a re-park keeps its first stamp"
         );
         assert_eq!(read(2), vec!["a:0", "c:2"]);
-        conn.execute(UNPARK_SQL, rusqlite::params![KIND_POT, "c:2", 0])
+        let g: i64 = conn
+            .query_row("SELECT generation FROM change_parked WHERE item = 'c:2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            conn.execute(UNPARK_SQL, rusqlite::params![KIND_POT, "c:2", 0])
+                .unwrap(),
+            0,
+            "D2-M1: a parked row's generation is its intent token, never the default 0"
+        );
+        conn.execute(UNPARK_SQL, rusqlite::params![KIND_POT, "c:2", g])
             .unwrap();
         assert_eq!(read(10), vec!["a:0", "b:1"]);
         let counts: (i64, i64, i64, i64) = conn
@@ -1583,6 +1602,39 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM change_parked", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// bsv-low #649 D2-M1 (the second delta lens, the SHIPPED statements under SQLite, both sets): two deliveries
+    /// select K at the same generation, delivery A's accepted POST deletes it, a LATER park inserts K again, then
+    /// delivery B's accepted POST deletes what IT read. The later park is a new intent and must still be parked. On
+    /// `a80e197` an insert took the default generation 0 again, so B's guarded DELETE removed the new row.
+    #[test]
+    fn e649_d2_m1_a_key_parked_again_after_its_delete_is_a_new_intent() {
+        for (kind, k) in [
+            (KIND_POT, pot_item(&"ab".repeat(32), 0)),
+            (KIND_HOP, ID.to_string()),
+        ] {
+            let conn = parked_db();
+            park_sql(&conn, rusqlite::params![kind, k, 100, MAX]).unwrap();
+            let select = || -> (String, i64) {
+                conn.query_row(PARKED_READ_SQL, rusqlite::params![kind, 1_000, 128], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap()
+            };
+            let a = select();
+            let b = select();
+            conn.execute(UNPARK_SQL, rusqlite::params![kind, a.0, a.1])
+                .unwrap();
+            park_sql(&conn, rusqlite::params![kind, k, 300, MAX]).unwrap();
+            conn.execute(UNPARK_SQL, rusqlite::params![kind, b.0, b.1])
+                .unwrap();
+            let left = rows_of(&conn, "SELECT COUNT(*) FROM change_parked");
+            assert_eq!(
+                left, 1,
+                "{kind}: the key parked at 300 after delivery A deleted its row was erased by delivery B's delete"
+            );
+        }
     }
 
     /// bsv-low #649 N4 (the delta lens's documentation drift): the Skip variant and the skip counter say what a skip
