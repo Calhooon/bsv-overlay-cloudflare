@@ -704,14 +704,17 @@ impl UnparkPort for WorkerUnpark<'_> {
     }
 }
 
-/// bsv-low #649 D3-H1 (the third delta lens): WHO drains the parked set. The scheduled event is not delivered on
-/// this deployment (`lib.rs`: the `/admin/complete-proofs` route's own comment), and the regular trigger is an
-/// external fetch of that route; until the fold only the scheduled handler drained, so under the documented setup no
-/// parked note was ever delivered. Now BOTH call [`drain_parked`]: whichever fires drains, each pass bounded the same
-/// way ([`DRAIN_MAX_ROWS`] a set, [`DRAIN_WALL_MS`] to start its POSTs) and counted by its trigger.
+/// bsv-low #649 D3-H1 (the third delta lens) and D4-L1 (the fourth): WHO drains the parked set. The `*/15` scheduled
+/// event is the observed trigger (measured on beta on 2026-10-13: the R2 sweep at 19:16:06Z and 19:31:06Z,
+/// `tickCount` 6057 to 6058), and the authenticated admin path `POST /admin/complete-proofs` is an ADDITIONAL one;
+/// until D3-H1 only the scheduled handler drained. Now BOTH call [`drain_parked`]: whichever fires drains, each pass
+/// bounded the same way ([`DRAIN_MAX_ROWS`] a set, [`DRAIN_WALL_MS`] to start its POSTs) and counted by its trigger.
+/// The delivery bound: an eligible fresh parked note within the next 128 rows of its set reaches the app layer within
+/// one scheduled tick, about 16 minutes in the normal worst case, plus the app layer's own delivery. The
+/// authenticated admin maintenance call can also drain it when invoked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainTrigger {
-    /// The scheduled handler (`*/15` when the platform delivers it).
+    /// The scheduled handler (`*/15`, the observed trigger).
     Tick,
     /// The authenticated `POST /admin/complete-proofs` (the external cron's fetch), after its retire pass.
     CompleteProofs,
@@ -2183,9 +2186,9 @@ mod tests {
         );
     }
 
-    /// bsv-low #649 D3-H1 (the third delta lens): the drain is called from the RELIABLY FIRED trigger. The worker
-    /// states the scheduled event is not delivered on this deployment and the external cron's authenticated
-    /// `POST /admin/complete-proofs` is the regular trigger; the shared drain must run there (after the retire pass,
+    /// bsv-low #649 D3-H1 (the third delta lens), D4-L1 (the fourth): the drain is called from BOTH triggers. The
+    /// `*/15` scheduled event is the observed one and the authenticated admin path `POST /admin/complete-proofs` an
+    /// additional one, which drains when invoked; the shared drain must run there (after the retire pass,
     /// before the answer, which carries it) as well as in the scheduled handler, each counted by its trigger. On
     /// `1bf8e66` only the scheduled handler read `change_parked`. The route tier's leg 7 runs it end to end.
     #[test]
