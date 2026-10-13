@@ -69,6 +69,8 @@ pub struct Engine {
     arc_broadcaster: Option<Box<dyn ArcBroadcaster>>,
     chain_tracker: Option<Box<dyn bsv_rs::transaction::ChainTracker>>,
     gasp_remote_factory: Option<Box<dyn crate::gasp::GASPRemoteFactory>>,
+    ship_lookup_client: Option<Box<dyn crate::ship_lookup::ShipLookupClient>>,
+    ship_bootstrap_peers: HashMap<String, Vec<String>>,
     /// OPT-IN / OFF BY DEFAULT chain-backed ancestor fetcher for GASP ingest.
     /// When `None` (default / production), GASP ingest is byte-identical to
     /// today. A platform crate may set `Some` (one-time-migration only) to let
@@ -976,6 +978,8 @@ impl Engine {
             arc_broadcaster,
             chain_tracker,
             gasp_remote_factory: None,
+            ship_lookup_client: None,
+            ship_bootstrap_peers: HashMap::new(),
             ancestor_fetcher: None,
             peer_sync_budget: None,
             graph_budget: None,
@@ -1007,6 +1011,23 @@ impl Engine {
     /// that creates HTTP-based remotes using their native fetch API.
     pub fn set_gasp_remote_factory(&mut self, factory: Box<dyn crate::gasp::GASPRemoteFactory>) {
         self.gasp_remote_factory = Some(factory);
+    }
+
+    /// Set the platform lookup transport for network SHIP discovery.
+    /// Trackers come from [`EngineConfig::slap_trackers`].
+    pub fn set_ship_lookup_client(
+        &mut self,
+        client: Box<dyn crate::ship_lookup::ShipLookupClient>,
+    ) {
+        self.ship_lookup_client = Some(client);
+    }
+
+    /// Keep these peers in a topic's SHIP union even when trackers fail.
+    /// This leaves the existing [`SyncTarget`] serialization unchanged.
+    /// Such topics run ahead of tracker imports so discovery and sync can
+    /// proceed without spending the tick on importing discovery records.
+    pub fn set_ship_bootstrap_peers(&mut self, topic: impl Into<String>, peers: Vec<String>) {
+        self.ship_bootstrap_peers.insert(topic.into(), peers);
     }
 
     /// Set the OPT-IN chain-backed ancestor fetcher for GASP ingest.
@@ -4872,8 +4893,8 @@ impl Engine {
     /// Start GASP synchronization with peers for all configured topics.
     ///
     /// For each topic in `sync_configuration`:
-    /// - `SyncTarget::Ship` — discovers peers via local `ls_ship` lookup, parses
-    ///   SHIP advertisement scripts to extract domain URLs.
+    /// - `SyncTarget::Ship`: unions local SHIP records, network discovery via
+    ///   configured SLAP trackers, and the topic's bootstrap peers.
     /// - `SyncTarget::Peers(urls)` — uses the provided peer URLs directly.
     /// - `SyncTarget::Disabled` — skips the topic.
     ///
@@ -4901,8 +4922,21 @@ impl Engine {
         }
 
         let mut topics_synced: HashMap<String, TopicSyncResult> = HashMap::new();
+        // Resolve SLAP providers once per invocation, sharing their host cap
+        // across all SHIP topics. Every topic still queries each lookup host.
+        let mut ship_lookup_hosts = None;
+        let mut topic_order = sync_order(&self.config.sync_configuration);
+        // Explicit bootstrap-backed SHIP topics run ahead of large tracker
+        // imports. Stable sorting preserves the existing order elsewhere.
+        topic_order.sort_by_key(|(topic, target)| {
+            !(matches!(target, SyncTarget::Ship)
+                && self
+                    .ship_bootstrap_peers
+                    .get(topic.as_str())
+                    .is_some_and(|peers| !peers.is_empty()))
+        });
 
-        for (topic, target) in sync_order(&self.config.sync_configuration) {
+        for (topic, target) in topic_order {
             // A CONFIGURED topic's peers are reserved part of a storage's
             // deferred-graph ceiling (bsv-low #555, the delta-2 fold's D2-M2).
             let configured_peers = matches!(target, SyncTarget::Peers(_));
@@ -4913,7 +4947,9 @@ impl Engine {
                 }
                 SyncTarget::Ship => {
                     info!("[GASP SYNC] Topic {topic} configured for SHIP discovery");
-                    let peers = self.discover_ship_peers(topic).await;
+                    let peers = self
+                        .discover_ship_peers(topic, &mut ship_lookup_hosts)
+                        .await;
                     info!(
                         "[GASP SYNC] Discovered {} peer(s) for topic {topic}",
                         peers.len()
@@ -5478,14 +5514,79 @@ impl Engine {
         all_landed
     }
 
-    /// Discover peer overlay nodes for a topic via SHIP lookup.
-    ///
-    /// Queries the local `ls_ship` lookup service for SHIP advertisement records
-    /// matching the given topic, then parses each record's PushDrop locking script
-    /// to extract the advertised domain URL. Filters out our own hosting URL.
-    async fn discover_ship_peers(&self, topic: &str) -> Vec<String> {
+    /// Union local records, tracker answers, SLAP-named providers and bootstrap.
+    /// Reference: overlay-services@480d77a src/Engine.ts:839-876 and
+    /// ts-stack@edf6e03 packages/sdk/src/overlay-tools/LookupResolver.ts:1976.
+    async fn discover_ship_peers(
+        &self,
+        topic: &str,
+        lookup_hosts: &mut Option<Vec<String>>,
+    ) -> Vec<String> {
+        let mut domains = self.local_ship_peers(topic).await;
+        if let Some(bootstrap) = self.ship_bootstrap_peers.get(topic) {
+            domains.extend(bootstrap.iter().cloned());
+        }
+        if let Some(client) = &self.ship_lookup_client {
+            if lookup_hosts.is_none() {
+                *lookup_hosts = Some(self.discover_ship_lookup_hosts(client.as_ref()).await);
+            }
+            let question = LookupQuestion::new("ls_ship", serde_json::json!({"topics": [topic]}));
+            for host in lookup_hosts.as_ref().into_iter().flatten() {
+                match client.lookup(host, &question).await {
+                    Ok(outputs) => {
+                        domains.extend(outputs.iter().filter_map(|output| {
+                            parse_lookup_advertisement(output, b"SHIP", topic)
+                        }));
+                    }
+                    Err(e) => warn!("[GASP SYNC] SHIP lookup at {host} for {topic} failed: {e}"),
+                }
+            }
+        }
+        self.ship_peers_excluding_self(domains)
+    }
+
+    async fn discover_ship_lookup_hosts(
+        &self,
+        client: &dyn crate::ship_lookup::ShipLookupClient,
+    ) -> Vec<String> {
+        use crate::ship_lookup::SHIP_DISCOVERY_MAX_HOSTS_PER_TICK;
+        let trackers = self.ship_peers_excluding_self(self.config.slap_trackers.clone());
+        let tracker_origins: HashSet<_> = trackers
+            .iter()
+            .map(|host| crate::gasp::peer_origin(host))
+            .collect();
+        let question = LookupQuestion::new("ls_slap", serde_json::json!({"service": "ls_ship"}));
+        let mut advertised = Vec::new();
+        for tracker in &trackers {
+            match client.lookup(tracker, &question).await {
+                Ok(outputs) => {
+                    advertised.extend(outputs.iter().filter_map(|output| {
+                        parse_lookup_advertisement(output, b"SLAP", "ls_ship")
+                    }));
+                }
+                Err(e) => warn!("[GASP SYNC] SLAP lookup at {tracker} failed: {e}"),
+            }
+        }
+        let providers = self
+            .ship_peers_excluding_self(advertised)
+            .into_iter()
+            .filter(|host| !tracker_origins.contains(&crate::gasp::peer_origin(host)))
+            .take(SHIP_DISCOVERY_MAX_HOSTS_PER_TICK);
+        trackers.into_iter().chain(providers).collect()
+    }
+
+    fn ship_peers_excluding_self(&self, domains: impl IntoIterator<Item = String>) -> Vec<String> {
+        crate::gasp::ship_peers_by_origin(domains.into_iter().filter(|domain| {
+            self.config.hosting_url.as_ref().is_none_or(|our_url| {
+                crate::gasp::peer_origin(domain) != crate::gasp::peer_origin(our_url)
+            })
+        }))
+    }
+
+    /// Read local SHIP records independently of network discovery failures.
+    async fn local_ship_peers(&self, topic: &str) -> Vec<String> {
         let Some(ship_ls) = self.lookup_services.get("ls_ship") else {
-            warn!("[GASP SYNC] No ls_ship lookup service registered — cannot discover peers");
+            warn!("[GASP SYNC] No local ls_ship; retaining network and bootstrap discovery");
             return Vec::new();
         };
 
@@ -5820,6 +5921,29 @@ fn current_timestamp_ms() -> f64 {
 /// field[2] = domain (UTF-8), field[3] = topic.
 /// Returns `None` if the script cannot be parsed or is not a SHIP advertisement.
 fn parse_ship_domain_from_script(output_script: &[u8]) -> Option<String> {
+    parse_advertisement_domain_from_script(output_script, b"SHIP", None)
+}
+
+fn parse_lookup_advertisement(
+    output: &OutputListItem,
+    protocol: &[u8],
+    scope: &str,
+) -> Option<String> {
+    let tx = beef_limits::transaction_from_beef(&output.beef, None, &beef_limits::PEER_BEEF_LIMITS)
+        .ok()?;
+    let script = tx
+        .outputs
+        .get(output.output_index as usize)?
+        .locking_script
+        .to_binary();
+    parse_advertisement_domain_from_script(&script, protocol, Some(scope))
+}
+
+fn parse_advertisement_domain_from_script(
+    output_script: &[u8],
+    protocol: &[u8],
+    scope: Option<&str>,
+) -> Option<String> {
     use bsv_rs::script::templates::PushDrop;
 
     let script = bsv_rs::script::Script::from_binary(output_script).ok()?;
@@ -5829,8 +5953,16 @@ fn parse_ship_domain_from_script(output_script: &[u8]) -> Option<String> {
         return None;
     }
 
-    let protocol = String::from_utf8_lossy(&pushdrop.fields[0]);
-    if protocol != "SHIP" {
+    if pushdrop.fields[0] != protocol {
+        return None;
+    }
+
+    if scope.is_some_and(|expected| {
+        pushdrop
+            .fields
+            .get(3)
+            .is_none_or(|actual| actual != expected.as_bytes())
+    }) {
         return None;
     }
 
@@ -5976,13 +6108,11 @@ impl From<AdvertiserError> for EngineError {
 // Tests
 // ============================================================================
 
-/// The order `start_gasp_sync` takes its topics in (bsv-low #555, the delta
-/// fold's D-M1): topics with CONFIGURED peers (`SyncTarget::Peers`) first,
-/// then those whose peers `ls_ship` discovers (anyone may advertise a host
-/// there), each by name. The deferred-graph records share one storage
-/// ceiling; a place it frees goes to a configured peer before a discovered
-/// one, and a pass the outer deadline cuts has reached the configured peers.
-/// The map's own order was arbitrary.
+/// Baseline sync order: configured peer topics before SHIP discovery topics,
+/// each by name (bsv-low #555, D-M1). `start_gasp_sync` advances SHIP topics
+/// with explicit bootstrap peers ahead of this order so their sync can run
+/// without importing tracker records. Deferred-graph reservations still use
+/// each topic's configured target.
 pub(crate) fn sync_order(config: &SyncConfiguration) -> Vec<(&String, &SyncTarget)> {
     let mut order: Vec<(&String, &SyncTarget)> = config.iter().collect();
     order.sort_by_key(|(topic, target)| (!matches!(target, SyncTarget::Peers(_)), topic.as_str()));
@@ -7429,6 +7559,323 @@ mod tests {
             "Self URL should be filtered out"
         );
         assert_eq!(topic_result.peers[0], "https://peer2.example.com");
+    }
+
+    #[derive(Clone, Default)]
+    struct MockShipLookupClient {
+        records: HashMap<(String, String), Vec<OutputListItem>>,
+        failures: HashSet<String>,
+        calls: std::rc::Rc<std::cell::RefCell<Vec<(String, LookupQuestion)>>>,
+    }
+
+    struct RecordingDiscoverySyncFactory {
+        calls: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
+    }
+
+    impl crate::gasp::GASPRemoteFactory for RecordingDiscoverySyncFactory {
+        fn create_remote(&self, peer: &str, topic: &str) -> Box<dyn crate::gasp::GASPRemote> {
+            self.calls
+                .borrow_mut()
+                .push((peer.to_string(), topic.to_string()));
+            Box::new(MockSyncRemote { utxos: Vec::new() })
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl crate::ship_lookup::ShipLookupClient for MockShipLookupClient {
+        async fn lookup(
+            &self,
+            host: &str,
+            question: &LookupQuestion,
+        ) -> Result<Vec<OutputListItem>, String> {
+            self.calls
+                .borrow_mut()
+                .push((host.to_string(), question.clone()));
+            if self.failures.contains(host) {
+                return Err("mock tracker unavailable".to_string());
+            }
+            Ok(self
+                .records
+                .get(&(host.to_string(), question.service.clone()))
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    fn discovery_output(protocol: &str, domain: &str, scope: &str) -> OutputListItem {
+        use bsv_rs::script::templates::PushDrop;
+        let pubkey = bsv_rs::PublicKey::from_hex(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let script = PushDrop::new(
+            pubkey,
+            vec![
+                protocol.as_bytes().to_vec(),
+                vec![0x02; 33],
+                domain.as_bytes().to_vec(),
+                scope.as_bytes().to_vec(),
+            ],
+        )
+        .lock();
+        let mut tx = Transaction::from_beef(&test_beef(), None).unwrap();
+        tx.outputs[0].locking_script = script;
+        tx.merkle_path = None;
+        tx.invalidate_caches();
+        let beef = tx.to_atomic_beef(true).unwrap();
+        let parsed =
+            beef_limits::transaction_from_beef(&beef, None, &beef_limits::PEER_BEEF_LIMITS)
+                .unwrap();
+        assert_eq!(
+            parsed.outputs[0].locking_script,
+            tx.outputs[0].locking_script
+        );
+        OutputListItem {
+            beef,
+            output_index: 0,
+            context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ship_network_discovery_unions_local_trackers_and_slap_hosts_by_origin() {
+        let (mut engine, _) = make_engine_with_broadcaster(
+            vec![0],
+            MockBroadcaster::new(),
+            vec![
+                ("https://local.example", "tm_test"),
+                ("https://shared.example/?local", "tm_test"),
+            ],
+            Some("https://self.example"),
+        )
+        .await;
+        engine.config.slap_trackers = vec!["https://tracker.example".to_string()];
+        engine.set_ship_bootstrap_peers("tm_test", vec!["https://bootstrap.example".to_string()]);
+        let mut client = MockShipLookupClient::default();
+        client.records.insert(
+            ("https://tracker.example".to_string(), "ls_ship".to_string()),
+            vec![
+                discovery_output("SHIP", "https://direct.example", "tm_test"),
+                discovery_output("SHIP", "https://SHARED.example:443/path", "tm_test"),
+                discovery_output("SHIP", "http://SELF.example.:8443/?x#y", "tm_test"),
+                discovery_output("SLAP", "https://wrong-protocol.example", "tm_test"),
+                discovery_output("SHIP", "https://wrong-topic.example", "tm_other"),
+                OutputListItem {
+                    beef: vec![1, 2, 3],
+                    output_index: 0,
+                    context: None,
+                },
+            ],
+        );
+        client.records.insert(
+            ("https://tracker.example".to_string(), "ls_slap".to_string()),
+            vec![
+                discovery_output("SLAP", "https://lookup.example", "ls_ship"),
+                discovery_output("SLAP", "https://LOOKUP.example:443/path", "ls_ship"),
+                discovery_output("SLAP", "https://self.example/?slap", "ls_ship"),
+                discovery_output("SLAP", "https://tracker.example/path", "ls_ship"),
+                discovery_output("SLAP", "https://other-service.example", "ls_other"),
+            ],
+        );
+        client.records.insert(
+            ("https://lookup.example".to_string(), "ls_ship".to_string()),
+            vec![
+                discovery_output("SHIP", "https://indirect.example", "tm_test"),
+                discovery_output("SHIP", "https://self.example:443/#ship", "tm_test"),
+            ],
+        );
+        let calls = client.calls.clone();
+        engine.set_ship_lookup_client(Box::new(client));
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(
+            result.topics_synced["tm_test"].peers,
+            vec![
+                "https://bootstrap.example",
+                "https://direct.example",
+                "https://indirect.example",
+                "https://local.example",
+                "https://shared.example",
+            ]
+        );
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 3);
+        for (_, question) in calls.iter() {
+            let expected = if question.service == "ls_slap" {
+                serde_json::json!({"service": "ls_ship"})
+            } else {
+                serde_json::json!({"topics": ["tm_test"]})
+            };
+            assert_eq!(question.query, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn ship_network_discovery_empty_local_finds_all_advertised_peers() {
+        let (mut engine, _) =
+            make_engine_with_broadcaster(vec![0], MockBroadcaster::new(), vec![], None).await;
+        engine.config.slap_trackers = vec!["https://tracker.example".to_string()];
+        let mut client = MockShipLookupClient::default();
+        let outputs = (0..9)
+            .map(|n| discovery_output("SHIP", &format!("https://peer{n}.example"), "tm_test"))
+            .collect();
+        client.records.insert(
+            ("https://tracker.example".to_string(), "ls_ship".to_string()),
+            outputs,
+        );
+        engine.set_ship_lookup_client(Box::new(client));
+        engine.set_gasp_remote_factory(Box::new(MockGASPRemoteFactory));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.sync_type, "ship");
+        assert_eq!(
+            topic.peers.len(),
+            9,
+            "the lookup-host cap must not truncate sync peers"
+        );
+        assert!(topic.errors.is_empty());
+        for peer in &topic.peers {
+            assert!(
+                engine
+                    .storage
+                    .get_last_interaction(peer, "tm_test")
+                    .await
+                    .unwrap()
+                    > 0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ship_network_discovery_tracker_failure_preserves_other_answers() {
+        let mut engine = make_engine(vec![]);
+        engine.config.slap_trackers = vec![
+            "https://dead.example".to_string(),
+            "https://live.example".to_string(),
+        ];
+        let mut client = MockShipLookupClient::default();
+        client.failures.insert("https://dead.example".to_string());
+        client.records.insert(
+            ("https://live.example".to_string(), "ls_ship".to_string()),
+            vec![discovery_output("SHIP", "https://peer.example", "tm_test")],
+        );
+        engine.set_ship_lookup_client(Box::new(client));
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(
+            result.topics_synced["tm_test"].peers,
+            vec!["https://peer.example"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ship_network_discovery_provider_cap_is_shared_across_topics() {
+        use crate::ship_lookup::SHIP_DISCOVERY_MAX_HOSTS_PER_TICK;
+        let mut engine = make_engine(vec![]);
+        engine
+            .config
+            .sync_configuration
+            .insert("tm_other".to_string(), SyncTarget::Ship);
+        engine.config.slap_trackers = vec!["https://tracker.example".to_string()];
+        let mut client = MockShipLookupClient::default();
+        let mut providers = Vec::new();
+        for n in 0..SHIP_DISCOVERY_MAX_HOSTS_PER_TICK + 3 {
+            let host = format!("https://lookup{n}.example");
+            providers.push(discovery_output("SLAP", &host, "ls_ship"));
+            client.records.insert(
+                (host, "ls_ship".to_string()),
+                vec![
+                    discovery_output("SHIP", &format!("https://peer{n}.example"), "tm_test"),
+                    discovery_output("SHIP", &format!("https://other{n}.example"), "tm_other"),
+                ],
+            );
+        }
+        client.records.insert(
+            ("https://tracker.example".to_string(), "ls_slap".to_string()),
+            providers,
+        );
+        let calls = client.calls.clone();
+        engine.set_ship_lookup_client(Box::new(client));
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(
+            result.topics_synced["tm_test"].peers.len(),
+            SHIP_DISCOVERY_MAX_HOSTS_PER_TICK
+        );
+        assert_eq!(
+            result.topics_synced["tm_other"].peers.len(),
+            SHIP_DISCOVERY_MAX_HOSTS_PER_TICK
+        );
+        let calls = calls.borrow();
+        assert_eq!(
+            calls.iter().filter(|(_, q)| q.service == "ls_slap").count(),
+            1
+        );
+        let providers: HashSet<_> = calls
+            .iter()
+            .filter(|(h, q)| h != "https://tracker.example" && q.service == "ls_ship")
+            .map(|(h, _)| h)
+            .collect();
+        assert_eq!(providers.len(), SHIP_DISCOVERY_MAX_HOSTS_PER_TICK);
+        assert_eq!(calls.len(), 1 + 2 * (1 + SHIP_DISCOVERY_MAX_HOSTS_PER_TICK));
+    }
+
+    #[tokio::test]
+    async fn ship_network_discovery_outage_keeps_bootstrap_and_excludes_self() {
+        let mut engine = make_engine(vec![]);
+        engine.config.hosting_url = Some("https://self.example".to_string());
+        engine.config.slap_trackers = vec!["https://dead.example".to_string()];
+        let mut client = MockShipLookupClient::default();
+        client.failures.insert("https://dead.example".to_string());
+        engine.set_ship_lookup_client(Box::new(client));
+        engine.set_ship_bootstrap_peers(
+            "tm_test",
+            vec![
+                "https://bootstrap.example".to_string(),
+                "https://BOOTSTRAP.example.:443/?x".to_string(),
+                "http://SELF.example.:8443/path".to_string(),
+            ],
+        );
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(
+            result.topics_synced["tm_test"].peers,
+            vec!["https://bootstrap.example"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ship_network_discovery_bootstrap_topic_runs_before_tracker_import() {
+        let mut engine = make_engine(vec![]);
+        for topic in ["tm_ship", "tm_slap"] {
+            engine.config.sync_configuration.insert(
+                topic.to_string(),
+                SyncTarget::Peers(vec!["https://tracker.example".to_string()]),
+            );
+        }
+        engine.config.slap_trackers = vec!["https://tracker.example".to_string()];
+        let mut client = MockShipLookupClient::default();
+        client.records.insert(
+            ("https://tracker.example".to_string(), "ls_ship".to_string()),
+            vec![discovery_output(
+                "SHIP",
+                "https://discovered.example",
+                "tm_test",
+            )],
+        );
+        let lookups = client.calls.clone();
+        engine.set_ship_lookup_client(Box::new(client));
+        engine.set_ship_bootstrap_peers("tm_test", vec!["https://bootstrap.example".to_string()]);
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        engine.set_gasp_remote_factory(Box::new(RecordingDiscoverySyncFactory {
+            calls: calls.clone(),
+        }));
+        engine.start_gasp_sync().await.unwrap();
+        assert_eq!(
+            calls
+                .borrow()
+                .iter()
+                .map(|(_, topic)| topic.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tm_test", "tm_test", "tm_ship", "tm_slap"]
+        );
+        assert_eq!(lookups.borrow().len(), 2);
     }
 
     #[tokio::test]
