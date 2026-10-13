@@ -517,7 +517,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// undelivered wake-ups, which its scheduled pass drains) and its due index; one table, one index.
 /// 230 → 231 for E649 L4 N1 (2026-10-13): `pot_announce_seq`, the one-row counter the park's tokens are taken from
 /// (ordered and never reused) and the batch's room under the park's ceiling (N3); one table.
-pub const OVERLAY_MIGRATION_COUNT: usize = 231;
+/// 231 → 236 for engine 0.1.5 (2026-10-13): the tick lease, the source heartbeat and the one-day activity window
+/// (the tick shared by the cron and the `TickAlarm` Durable Object).
+pub const OVERLAY_MIGRATION_COUNT: usize = 236;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1898,6 +1900,11 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // E649 L4 N1: the park tokens' counter (`pot_hook::PARK_SEQ_CREATE`, byte-identical, also in the catch-up list).
     "CREATE TABLE IF NOT EXISTS pot_announce_seq (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL, room INTEGER NOT NULL)",
 
+    crate::tick_ops::LEASE_CREATE,
+    crate::tick_ops::EVENTS_CREATE,
+    crate::tick_ops::EVENTS_INDEX,
+    crate::tick_ops::SOURCE_COLUMN,
+    crate::tick_ops::AT_COLUMN,
 ];
 
 // =============================================================================

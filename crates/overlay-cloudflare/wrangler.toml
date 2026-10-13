@@ -126,3 +126,11 @@ max_concurrency = 1
 
 [triggers]
 crons = ["*/15 * * * *"]
+
+# A singleton tick alarm supplements the existing cron schedule.
+[durable_objects]
+bindings = [{ name = "TICK_ALARM", class_name = "TickAlarm" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TickAlarm"]

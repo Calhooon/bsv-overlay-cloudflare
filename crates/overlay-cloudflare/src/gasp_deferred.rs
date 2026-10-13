@@ -1207,12 +1207,17 @@ mod tests {
         assert_eq!(swept, ["old.0"]);
         assert_eq!(rows(&conn), ["new.0"]);
         assert_eq!(DEFERRED_GRAPH_STALE_SECS, 108_000);
-        let lib = include_str!("lib.rs");
-        let sweep = lib
+        // Both triggers now share the sequence in tick.rs.
+        let tick = include_str!("tick.rs")
+            .split_whitespace()
+            .collect::<String>();
+        let sweep = tick
             .find("crate::gasp_deferred::sweep_stale(&ops_db).await;")
             .unwrap();
-        let sync = lib.find("engine.start_gasp_sync(),\n        crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS)").unwrap();
-        assert!(sweep < sync, "the cron sweeps before its GASP sync");
+        let sync = tick
+            .find("engine.start_gasp_sync(),crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS)")
+            .unwrap();
+        assert!(sweep < sync, "the tick sweeps before its GASP sync");
         assert!(counter_names().contains(&COUNTER_GASP_GRAPH_DROPPED_STALE.to_string()));
     }
 
