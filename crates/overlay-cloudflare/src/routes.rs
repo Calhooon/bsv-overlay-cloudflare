@@ -1613,7 +1613,13 @@ async fn submit_parts(
                 }
             }
             Ok(crate::broadcaster::ArcOutcome::AcceptedPending(pending)) => {
-                crate::tracker_events::note(&subject_txid, "accepted", None);
+                crate::tracker_events::note_held(
+                    env.d1("OVERLAY_DB").ok().as_ref(),
+                    &subject_txid,
+                    "accepted",
+                    None,
+                )
+                .await;
                 // #397 / admit-fast step 3 (2026-09-15): the subject is
                 // admitted on Arcade's SYNCHRONOUS validation — under
                 // `ADMIT_FAST` for EVERY gated subject (the fast answer: the
@@ -2910,7 +2916,8 @@ pub async fn arc_ingest(
         }
     }
 
-    crate::tracker_events::note(&txid, "callback", serde_json::from_str(&raw).ok());
+    crate::tracker_events::note_held(ops_db, &txid, "callback", serde_json::from_str(&raw).ok())
+        .await;
     let (merkle_path, block_height) = match body {
         // #228 fix: a non-MINED lifecycle callback is NORMAL webhook traffic,
         // not an error. Acknowledge (2xx), count, and — INCIDENT
