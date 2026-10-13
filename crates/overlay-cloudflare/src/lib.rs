@@ -2280,6 +2280,7 @@ async fn queue_entry(
     queue_handler(worker::MessageBatch::from(event), env, ctx).await
 }
 
+#[rustfmt::skip] // Keep main's queue wiring whole; its production source pins depend on this layout.
 async fn queue_handler(
     batch: worker::MessageBatch<crate::queue::MutationMessage>,
     env: Env,
@@ -2429,12 +2430,7 @@ async fn queue_handler(
         if let Some(db) = &counters {
             match crate::admit_fast::open_eviction(db, &subject).await {
                 Ok(Some(ev)) => {
-                    crate::ops::bump_counter(
-                        db,
-                        crate::ops::COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
-                        1,
-                    )
-                    .await;
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED, 1).await;
                     worker::console_log!(
                         "Queue: replay of {subject} SKIPPED — under an open eviction (at {} ms — {}); the twin holds it, a MINED proof readmits",
                         ev.evicted_at_ms,
@@ -2454,23 +2450,11 @@ async fn queue_handler(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    crate::ops::bump_counter(
-                        db,
-                        crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
-                        1,
-                    )
-                    .await;
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1).await;
                     worker::console_log!(
                         "Queue: the eviction ledger could not be read for {subject} ({e}) — retrying the replay later"
                     );
-                    crate::dead_letters::note_failing(
-                        db,
-                        body,
-                        Some(&subject),
-                        &format!("the eviction ledger could not be read ({e})"),
-                        crate::dead_letters::LetterClass::Fault,
-                    )
-                    .await;
+                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("the eviction ledger could not be read ({e})"), crate::dead_letters::LetterClass::Fault).await;
                     msg.retry();
                     continue;
                 }
@@ -2482,9 +2466,7 @@ async fn queue_handler(
         // these bytes), acked and never dead-lettered for its size; on any other it is "not now", retried, then
         // parked as a `not_now` letter (#576's class: one per txid, 200 a day), never admitted unrun.
         let policy = crate::queue::replay_breach_policy(body);
-        let replayed = engine
-            .submit_with_report_under(&tagged_beef, mode, policy)
-            .await;
+        let replayed = engine.submit_with_report_under(&tagged_beef, mode, policy).await;
         if let (Ok((_, report)), Some(db)) = (&replayed, &counters) {
             crate::ops::note_engine_walk(db, report, "Queue").await;
         }
@@ -2509,17 +2491,12 @@ async fn queue_handler(
                     match crate::admit_fast::open_eviction(db, &subject).await {
                         Ok(Some(ev)) => {
                             let now_ms = worker::Date::now().as_millis();
-                            let moved = crate::admit_fast::evict_txid_everywhere(
-                                db, &subject, &ev.reason, now_ms,
-                            )
-                            .await
-                            .moved;
-                            crate::ops::bump_counter(
-                                db,
-                                crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
-                                1,
-                            )
-                            .await;
+                            let moved =
+                                crate::admit_fast::evict_txid_everywhere(db, &subject, &ev.reason, now_ms)
+                                    .await
+                                    .moved;
+                            crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1)
+                                .await;
                             crate::pot_changes::flush_inline(env.clone()).await;
                             worker::console_log!(
                                 "Queue: the replay of {subject} outran an eviction (at {} ms — {}): re-evicted {moved} row(s); acked",
@@ -2540,12 +2517,7 @@ async fn queue_handler(
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            crate::ops::bump_counter(
-                                db,
-                                crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
-                                1,
-                            )
-                            .await;
+                            crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1).await;
                             worker::console_log!(
                                 "Queue: the eviction ledger could not be read for {subject} after the replay's write ({e}) — retrying (a durable write dedups)"
                             );
@@ -2603,16 +2575,8 @@ async fn queue_handler(
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
                         .await;
-                    crate::dead_letters::note_failing(
-                        db,
-                        body,
-                        Some(&subject),
-                        &format!("not durable: {}", report.summary()),
-                        crate::dead_letters::LetterClass::of_sites(
-                            report.faults.iter().map(|f| f.site),
-                        ),
-                    )
-                    .await;
+                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("not durable: {}", report.summary()), crate::dead_letters::LetterClass::of_sites(report.faults.iter().map(|f| f.site)))
+                        .await;
                 }
                 msg.retry();
             }
@@ -2621,14 +2585,7 @@ async fn queue_handler(
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
                         .await;
-                    crate::dead_letters::note_failing(
-                        db,
-                        body,
-                        Some(&subject),
-                        &format!("failed: {e}"),
-                        crate::queue::replay_error_class(&e),
-                    )
-                    .await;
+                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("failed: {e}"), crate::queue::replay_error_class(&e)).await;
                 }
                 msg.retry();
             }
