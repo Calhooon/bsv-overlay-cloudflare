@@ -101,6 +101,20 @@
         "stmts": 9
       },
       "censusKey": "/submit"
+    },
+    "record-potparty-filing": {
+      "route": "/record?kind=potparty: a signed stranger filing naming A's pot; all inline filing reads and marks",
+      "measured": {
+        "reads": 11,
+        "writes": 7,
+        "stmts": 6
+      },
+      "ceiling": {
+        "reads": 17,
+        "writes": 9,
+        "stmts": 8
+      },
+      "censusKey": "/record"
     }
   },
   "censusKey": "the d1Budget route a production census holds against this ceiling (advisory there: production rows are not the fixture's); null = the route's maximum is another scenario's"
