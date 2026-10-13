@@ -141,6 +141,35 @@ pub async fn views(env: &worker::Env, rows: &BTreeMap<String, Row>) -> BTreeMap<
         })
         .collect()
 }
+/// Shared read boundary: lookup faults never erase an available legacy body.
+pub fn lookup_result<T, E>(result: Result<T, E>) -> Result<Option<T>, E> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => {
+            crate::courier::note_presence("tracker_lookup_faults_total");
+            Ok(None)
+        }
+    }
+}
+
+pub async fn read_soft(
+    env: &worker::Env,
+    ids: &[String],
+) -> worker::Result<Option<BTreeMap<String, Row>>> {
+    lookup_result(stored::read(env, ids).await)
+}
+
+pub fn decorate_lookup(
+    mut value: Value,
+    subject: Option<&str>,
+    views: Option<&BTreeMap<String, Value>>,
+) -> String {
+    if let Some(views) = views {
+        decorate(&mut value, subject, views);
+    }
+    value.to_string()
+}
+
 pub async fn body(env: &worker::Env, raw: &str, subject: Option<&str>) -> worker::Result<String> {
     let value: Value =
         serde_json::from_str(raw).map_err(|e| worker::Error::RustError(e.to_string()))?;
@@ -150,18 +179,20 @@ pub async fn body(env: &worker::Env, raw: &str, subject: Option<&str>) -> worker
         ids.insert(id.into());
     }
     let ids: Vec<_> = ids.into_iter().collect();
-    let rows = stored::read(env, &ids).await?;
+    let rows = read_soft(env, &ids).await?;
     body_loaded(env, value, subject, rows).await
 }
 pub async fn body_loaded(
     env: &worker::Env,
-    mut value: Value,
+    value: Value,
     subject: Option<&str>,
-    rows: BTreeMap<String, Row>,
+    rows: Option<BTreeMap<String, Row>>,
 ) -> worker::Result<String> {
-    let views = views(env, &rows).await;
-    decorate(&mut value, subject, &views);
-    Ok(value.to_string())
+    let views = match rows {
+        Some(rows) => Some(views(env, &rows).await),
+        None => None,
+    };
+    Ok(decorate_lookup(value, subject, views.as_ref()))
 }
 /// Owed snapshots already persist their word tuples in facts. Recheck those
 /// proofs without another D1 lookup or a read-triggered fallback write.
@@ -242,6 +273,11 @@ pub async fn owed_body(env: &worker::Env, value: &mut Value) {
     }
     let mut rows = BTreeMap::new();
     collect(value, &mut rows);
+    // A recompute with a word-store fault persists only legacy facts. Do not
+    // synthesize tracker decorations when that snapshot has no word tuples.
+    if rows.is_empty() {
+        return;
+    }
     let views = views(env, &rows).await;
     replace(value, &views);
     decorate(value, None, &views);
@@ -467,7 +503,7 @@ pub async fn ingest(
 /// dropped them. Unknown ids keep the existing batch fallback contract.
 pub async fn batch_body(env: &worker::Env, raw: &str, ids: &[String]) -> worker::Result<String> {
     let value: Value = serde_json::from_str(raw)?;
-    let rows = stored::read(env, ids).await?;
+    let rows = read_soft(env, ids).await?;
     body_loaded(env, value, None, rows).await
 }
 

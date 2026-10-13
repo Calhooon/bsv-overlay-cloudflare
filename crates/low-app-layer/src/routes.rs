@@ -3888,9 +3888,11 @@ async fn owed_recompute_inner(
     word_ids.extend(hop_chain.values().filter_map(|h| h.spending_txid.clone()));
     word_ids.extend(hop_sweeps.values().map(|h| h.sweep_txid.clone()));
     let word_ids: Vec<_> = word_ids.into_iter().collect();
-    let word_rows = crate::tracker_host::stored::read(env, &word_ids)
+    let word_lookup = crate::tracker_host::runtime::read_soft(env, &word_ids)
         .await
         .map_err(|e| e.to_string())?;
+    let word_lookup_available = word_lookup.is_some();
+    let word_rows = word_lookup.unwrap_or_default();
 
     // 6b. the NON-POT spenders' bytes (a sweep, a wallet's own spend, the seat's own competitor), bounded per recompute:
     //     every P2PKH output's pkh + sats and every INPUT outpoint, from the BEEF the index holds (with the index's own
@@ -4102,7 +4104,7 @@ async fn owed_recompute_inner(
     // The D3 SEEN + spenderFinal verdict-publication arm is deliberately
     // retained in the results producer until the from-scratch lens rules it.
     let mut inputs = OwedInputs {
-        spender_words: Some(&spender_words),
+        spender_words: word_lookup_available.then_some(&spender_words),
         identity_lc,
         tip,
         now_ms,
@@ -7282,12 +7284,12 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         .iter()
         .filter_map(|m| m.spending_txid.clone())
         .collect();
-    let mut stored_words = crate::tracker_host::stored::read(&ctx.env, &ids).await?;
+    let stored_words = crate::tracker_host::runtime::read_soft(&ctx.env, &ids).await?;
     let (memo_answers, _) = crate::tracker_host::runtime::spent_any_memo_plan(
         &probe_targets,
         &memos,
         now_ms,
-        &stored_words,
+        stored_words.as_ref().unwrap_or(&Default::default()),
     );
     let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
     let mut terminals = Vec::with_capacity(outpoints.len());
@@ -7364,7 +7366,7 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             &ctx.env,
             value,
             None,
-            std::mem::take(&mut stored_words),
+            stored_words,
         )
         .await?,
         200,
@@ -8104,7 +8106,7 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     }
     crate::courier::note_presence("tracker_public_lookup_only_total");
     let key = txid.to_ascii_lowercase();
-    let stored = crate::tracker_host::stored::read(&ctx.env, std::slice::from_ref(&key)).await?;
+    let stored = crate::tracker_host::runtime::read_soft(&ctx.env, std::slice::from_ref(&key)).await?;
     let now = worker::Date::now().as_millis() as f64;
     let answer = match tx_any_cached(&key, now) {
         Some(a) => a,
@@ -8114,11 +8116,11 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         }
     };
     let legacy = crate::txany::tx_any_body(&key, &answer);
-    let rows = stored;
-    let mut value = serde_json::from_str(&legacy)?;
-    let views = crate::tracker_host::runtime::views(&ctx.env, &rows).await;
-    crate::tracker_host::runtime::decorate(&mut value, Some(&key), &views);
-    json_response(value.to_string(), 200)
+    let value = serde_json::from_str(&legacy)?;
+    json_response(
+        crate::tracker_host::runtime::body_loaded(&ctx.env, value, Some(&key), stored).await?,
+        200,
+    )
 }
 
 /// One batched index-leg row: the txid alongside what the single leg reads.
