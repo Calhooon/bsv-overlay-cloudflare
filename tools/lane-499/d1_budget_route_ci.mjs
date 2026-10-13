@@ -26,7 +26,8 @@
  *     BOTH seats (B and B's opponent), so each ask is two recomputes, one per identity, and each identity's 13th
  *     is shed: `recomputeBySource.pot-changed` moves by 24 and `/health.owed.recomputeShed` by exactly 2. Each
  *     hook answer carries its `d1` segment, the hooks are keyed `/internal` and every walk after the answer
- *     `owed-recompute` on `d1Budget` (the lens fold's M2 and M3).
+ *     `owed-recompute` on `d1Budget` (the lens fold's M2 and M3). E649 L4: the first ask's own figures are held to
+ *     `pot-changed-hook-1` (one attribution batch, one seat-marker batch, no walk) and it answers `hook;dur=`.
  *
  * Exit 0 = every expectation held.
  */
@@ -349,6 +350,18 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
       break
     }
     if (!segment(r.timing, 'd1')) hookUnstamped++
+    // E649 L4: the hook is a write. Its first answer is held to a named ceiling (the attribution batch and the seat
+    // markers' batch, no statement per outpoint, no walk) and carries its own timing (`hook;dur=`).
+    if (i === 0) {
+      check('pot-changed-hook-1', segment(r.timing, 'd1'))
+      const dur = (r.timing ?? '').match(/(?:^|,\s*)hook;dur=(\d+)/)
+      if (!dur) fail('E649 L4: the hook answers Server-Timing hook;dur=', `Server-Timing: ${r.timing}`)
+      else if (Number(dur[1]) >= 1000) fail('E649 L4: the hook answers in under a second', `hook;dur=${dur[1]}`)
+      else pass(`E649 L4: the hook answers hook;dur=${dur[1]} (under 1000 ms), announce detached`)
+      const body = JSON.parse(r.text)
+      if (body.announce === 'detached') pass('E649 L4: the answer says the announce is detached')
+      else fail('E649 L4: the answer says the announce is detached', r.text.slice(0, 200))
+    }
     // the recompute runs after the answer: wait it out, so the next ask is a recompute and not a folded one
     const settled = await pollFor(async () => {
       const o = (await appHealth()).owed
