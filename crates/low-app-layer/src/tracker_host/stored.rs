@@ -216,3 +216,7 @@ pub const BACKFILL_CREATE: &str = "CREATE TABLE IF NOT EXISTS tracker_backfill (
 pub const BACKFILL_PAGE: &str = "SELECT transactions.txid, transactions.beef, transactions.has_proof, tx_words.txid AS tracked FROM transactions LEFT JOIN tx_words ON tx_words.txid = transactions.txid WHERE transactions.txid > ?1 ORDER BY transactions.txid LIMIT 64";
 pub const BACKFILL_POT_PAGE: &str = "SELECT pot_beefs.txid, pot_beefs.beef, pot_beefs.has_proof, tx_words.txid AS tracked FROM pot_beefs LEFT JOIN tx_words ON tx_words.txid = pot_beefs.txid WHERE pot_beefs.txid > ?1 ORDER BY pot_beefs.txid LIMIT 64";
 pub const BACKFILL_SAVE: &str = "INSERT INTO tracker_backfill(version,cursor,complete) VALUES (?1,?2,?3) ON CONFLICT(version) DO UPDATE SET cursor=MAX(tracker_backfill.cursor,excluded.cursor),complete=MAX(tracker_backfill.complete,excluded.complete)";
+
+/// Expire stranger projections after eight days. Held subjects and broadcaster
+/// write events identify first-party touches, and are outside this sweep.
+pub const SWEEP: &str = "DELETE FROM tx_words WHERE txid IN (SELECT w.txid FROM tx_words w WHERE w.updated_at < ?1 AND COALESCE(w.hint_source,'') <> 'arcade' AND w.word <> 'built' AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) AND NOT EXISTS (SELECT 1 FROM pot_beefs p WHERE p.txid=w.txid) ORDER BY w.updated_at,w.txid LIMIT 64)";

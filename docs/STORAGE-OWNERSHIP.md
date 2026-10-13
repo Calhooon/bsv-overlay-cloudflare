@@ -66,7 +66,7 @@ The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` r
 | `tx_any_verdicts` | overlay-cloudflare | low-app-layer: INSERT | low-app-layer | chain | no | re-askable negative memos (courier calls to rebuild) |
 | `hop_chain_probes` | low-app-layer | overlay-cloudflare: INSERT, DELETE | none | chain | no | courier memos, re-askable; the overlay expires them and marks them on a reorg. It also holds `homeproof:` rows (the durable latch of a verified Proven word, `owed.rs`) and `homecursor:` rows (the home walk's cursor), which the expiry spares: a wipe loses no money, every latch becomes a courier re-probe again, 2 per recompute (`OWED_HOME_PROBES_PER_RECOMPUTE`) |
 | `pot_evictions` | overlay-cloudflare | none | low-app-layer | lost | **yes** | admit-fast's eviction ledger: a readmission re-marks released spends FROM this row; nothing else holds it (#470 section 3 item 8) |
-| `tx_words` | low-app-layer | low-app-layer: CREATE | none | lost | yes | compact tracker words and retained checked proof, NS-3 / K11 |
+| `tx_words` | low-app-layer | low-app-layer: CREATE | none | re-askable | no | compact tracker projection; eight-day stranger sweep; public reads create zero rows |
 | `owed_rows` | low-app-layer | none | none | transient | no | a pure derivation over the money tables; the next read recomputes |
 | `owed_state` | low-app-layer | none | none | transient | no | recomputed on the next read |
 | `chain_headers_seen` | overlay-cloudflare | none | none | transient | no | a cursor |

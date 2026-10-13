@@ -1339,8 +1339,8 @@
     ]
    },
    "readers": [],
-   "rebuild_class": "lost",
-   "never_wipe": true,
+   "rebuild_class": "re-askable",
+   "never_wipe": false,
    "holds": "compact tracker words and checked proof records per subject",
    "why": "NS-3 write-time projection, K11 replacement boundary; no journal"
   },
