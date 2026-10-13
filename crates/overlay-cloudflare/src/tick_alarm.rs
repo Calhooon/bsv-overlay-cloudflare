@@ -65,10 +65,21 @@ impl DurableObject for TickAlarm {
     async fn fetch(&self, req: Request) -> worker::Result<Response> {
         match (req.method(), req.path().as_str()) {
             (Method::Post, "/arm") => {
-                if self.state.storage().get_alarm().await?.is_none() {
-                    self.arm_at(next_alarm_at(now_ms(), None)).await?;
-                }
-                Response::from_json(&self.status().await?)
+                let next_alarm_ms = match self.state.storage().get_alarm().await? {
+                    Some(at) => at,
+                    None => {
+                        let at = next_alarm_at(now_ms(), None);
+                        self.arm_at(at).await?;
+                        at
+                    }
+                };
+                // Arming needs only alarm storage. Reading the D1 heartbeat
+                // here would add a read to every cron's lease check and make
+                // the arm response depend on the heartbeat migration.
+                Response::from_json(&serde_json::json!({
+                    "alarmArmed": true,
+                    "nextAlarmMs": next_alarm_ms,
+                }))
             }
             (Method::Get, "/status") => Response::from_json(&self.status().await?),
             _ => Response::error("Not found", 404),
