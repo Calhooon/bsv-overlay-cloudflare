@@ -969,6 +969,28 @@
    "why": "operator counters"
   },
   {
+   "name": "ops_lease",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the tick holder and its expiry in milliseconds",
+   "why": "one maintenance tick across the cron and alarm; expiry recovers interrupted holders"
+  },
+  {
+   "name": "ops_tick_events",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "tick source, start time and lease skip for the past day",
+   "why": "indexed rolling activity counts; old events are pruned by the next acquired tick"
+  },
+  {
    "name": "ops_heartbeat",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

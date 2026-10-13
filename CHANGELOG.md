@@ -8,6 +8,9 @@
 - Retire a held transaction as `expired-unproven` when every indexed output is an expired UHRP advert. Keep live, permanent and non-UHRP siblings. Report the live `retiredExpiredUnprovenTotal` separately from structurally unprovable LOW rows.
 - Use the existing watch observation stamp, falling back to transaction creation time; watch enrollment retains that creation time. No schema, SDK pin or package version change in this lane.
 - The Arcade reorg feed also requires the `arcade` source. LOW advert spend probes require both `woc` and `bitails` for independent corroboration; their D1 expiry reaper still runs. A peer BUMP with an unmarked subject hash is attached to that verified subject before the proven flag moves.
+- Share the maintenance tick between cron and the `TickAlarm` Durable Object, with a D1 lease, bounded execution and source activity on `/health/invariants.tick`. The alarm re-arms after failed ticks; the cron revives a dormant alarm. Authenticated operators can use `POST /admin/tick/arm` and `GET /admin/tick/status`.
+- Deployment configs must add the `TICK_ALARM` binding for class `TickAlarm` and a migration with `new_sqlite_classes = ["TickAlarm"]` (choose an unused migration tag). The engine's example uses tag `v1`; the stack keeper, LOW and Zanaadu own their deploy configs. Without the binding, cron still runs and logs the skipped arm. Arm after deploying, then verify both source counters and the next alarm.
+- D1 adds a transient lease, a one-day activity history and two nullable heartbeat fields. Existing proof-completion counters keep their meaning. Rollback may leave these additive tables and columns in place. Workspace versions remain for the keeper's release commit.
 
 ## [0.1.4] - 2026-10-13
 

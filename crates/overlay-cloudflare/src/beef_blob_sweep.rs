@@ -1736,11 +1736,12 @@ mod tests {
                 .split_whitespace()
                 .collect::<String>()
         };
-        let lib = include_str!("lib.rs");
-        let start = lib.find("async fn scheduled(").unwrap();
-        let tick = squash(&lib[start..start + lib[start..].find("\n}\n").unwrap()]);
+        // The shared tick module owns the sequence for both triggers.
+        let source = include_str!("tick.rs");
+        let start = source.find("async fn run_steps(").unwrap();
+        let tick = squash(&source[start..start + source[start..].find("\n}\n").unwrap()]);
         let sweep = tick
-            .find("crate::beef_blob_sweep::run_pass(&env,&ops_db,\"tick\").await;")
+            .find("crate::beef_blob_sweep::run_pass(env,&ops_db,\"tick\").await;")
             .expect("the scheduled tick runs one bounded pass of the sweep");
         assert!(
             sweep < tick.find("engine.start_gasp_sync()").unwrap(),
@@ -2003,9 +2004,9 @@ mod tests {
             ),
             "the router sends POST /internal/beef-blob-sweep to the lever"
         );
-        let tick = item(lib, "async fn scheduled(");
+        let tick = item(include_str!("tick.rs"), "async fn run_steps(");
         assert_eq!(
-            tick.matches("crate::beef_blob_sweep::run_pass(&env,&ops_db,\"tick\").await;")
+            tick.matches("crate::beef_blob_sweep::run_pass(env,&ops_db,\"tick\").await;")
                 .count(),
             1,
             "the tick runs the same function"

@@ -1433,6 +1433,7 @@ pub async fn health_invariants(
     let dead_letters = crate::dead_letters::health_json(db, env).await;
     let change_parked = crate::change_park::health_json(db).await;
     let queue = crate::beef_blob_sweep::health_json(db, env).await;
+    let tick = crate::tick_alarm::health_json(db, env).await;
     let deferred_graphs = crate::gasp_deferred::health_json(
         db,
         crate::gasp_deferred::graph_budget_limbs_from_env(env),
@@ -1449,6 +1450,7 @@ pub async fn health_invariants(
         // bsv-low (2026-09-04): the index janitor — the live backlog by row
         // kind; its pass totals are the `missing_spend_*` counters below.
         "indexJanitor": index_janitor,
+        "tick": tick,
         "completionPass": {
             "dead": dead,
             "neverRan": never_ran,
