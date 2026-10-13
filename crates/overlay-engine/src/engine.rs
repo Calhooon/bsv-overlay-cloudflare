@@ -5576,17 +5576,14 @@ impl Engine {
                 let Some(proof_hex) = node.proof else {
                     continue;
                 };
-                let proof = match beef_limits::merkle_path_from_hex(
+                let Ok(mut proof) = beef_limits::merkle_path_from_hex(
                     &proof_hex,
                     beef_limits::COURIER_PROOF_MAX_BYTES,
-                ) {
-                    Ok(proof) => proof,
-                    Err(_) => {
-                        let mut summary = progress.get();
-                        summary.refused += 1;
-                        progress.set(summary);
-                        continue;
-                    }
+                ) else {
+                    let mut summary = progress.get();
+                    summary.refused += 1;
+                    progress.set(summary);
+                    continue;
                 };
                 let valid = match proof.compute_root(Some(&candidate.txid)) {
                     Ok(root) => tracker
@@ -5600,6 +5597,13 @@ impl Engine {
                     summary.refused += 1;
                     progress.set(summary);
                     continue;
+                }
+                // Root verification accepts a hash leaf too. Mark the verified
+                // subject so BEEF attaches the path before its proof flag moves.
+                for leaf in &mut proof.path[0] {
+                    if leaf.hash.as_deref() == Some(&candidate.txid) {
+                        leaf.txid = true;
+                    }
                 }
                 match self.land_peer_proof(candidate, &proof).await {
                     Ok(()) => {
@@ -6815,6 +6819,69 @@ mod tests {
                 .is_some()
         );
         assert_eq!(storage.proven_at_height(TEST_TXID), Some(Some(800_000)));
+    }
+
+    #[tokio::test]
+    async fn proof_window_peer_hash_leaf_is_stored_as_own_proof() {
+        use crate::proof_window::{HeldOutput, PeerProofSummary, PROOFLESS_FLAG_MS};
+        let mut engine = make_engine(vec![0]);
+        let storage = std::rc::Rc::new(MemoryStorage::new());
+        engine.storage = Box::new(storage.clone());
+        engine
+            .submit(&test_tagged_beef(vec!["tm_test"]), SubmitMode::CurrentTx)
+            .await
+            .unwrap();
+        storage.advance_clock((PROOFLESS_FLAG_MS / 1000) as u64 + 1);
+        let mut proof =
+            bsv_rs::transaction::MerklePath::from_hex(&single_leaf_bump_hex(TEST_TXID, 800_000))
+                .unwrap();
+        proof.path[0][0].txid = false;
+        let mut tracker = bsv_rs::transaction::MockChainTracker::new(800_001);
+        tracker.add_root(800_000, proof.compute_root(Some(TEST_TXID)).unwrap());
+        engine.chain_tracker = Some(Box::new(tracker));
+        let (_, mut remote) = budget_page_engine(1);
+        remote.node_cost_ms = 0;
+        remote.nodes = std::rc::Rc::new(HashMap::from([(
+            TEST_TXID.into(),
+            crate::types::GASPNode {
+                graph_id: String::new(),
+                raw_tx: String::new(),
+                output_index: 0,
+                proof: Some(proof.to_hex()),
+                tx_metadata: None,
+                output_metadata: None,
+                inputs: None,
+            },
+        )]));
+        engine.config.sync_configuration.insert(
+            "tm_test".into(),
+            SyncTarget::Peers(vec!["https://peer.example".into()]),
+        );
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let progress = std::cell::Cell::new(PeerProofSummary::default());
+        engine
+            .rerequest_held_proofs(
+                &[HeldOutput {
+                    txid: TEST_TXID.into(),
+                    output_index: 0,
+                    topic: "tm_test".into(),
+                }],
+                &progress,
+            )
+            .await;
+        assert_eq!(progress.get().landed, 1);
+        let question = LookupQuestion::new("ls_test", serde_json::json!({}));
+        let (answer, txids) = engine.lookup_with_txids(&question, None).await.unwrap();
+        assert_eq!(txids, vec![TEST_TXID]);
+        let LookupAnswer::OutputList { outputs } = answer else {
+            panic!("expected outputs")
+        };
+        assert!(
+            beef_limits::own_proof(&outputs[0].beef, TEST_TXID)
+                .unwrap()
+                .is_some(),
+            "a proven flag must have the child's own path in the served BEEF"
+        );
     }
 
     #[tokio::test]
