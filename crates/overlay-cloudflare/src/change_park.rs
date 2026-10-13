@@ -1228,7 +1228,12 @@ mod tests {
     }
 
     /// [`REFUSE_SQL`]'s binds, as the worker binds them.
-    fn refuse_params(kind: &str, item: &str, generation: i64, now_ms: u64) -> impl rusqlite::Params {
+    fn refuse_params(
+        kind: &str,
+        item: &str,
+        generation: i64,
+        now_ms: u64,
+    ) -> impl rusqlite::Params {
         (
             kind.to_string(),
             item.to_string(),
@@ -1241,7 +1246,11 @@ mod tests {
     }
 
     /// A shipped statement that RETURNS its changed rows (D2-L1), run: the rows it changed.
-    fn exec_returning<P: rusqlite::Params>(conn: &rusqlite::Connection, sql: &str, params: P) -> usize {
+    fn exec_returning<P: rusqlite::Params>(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: P,
+    ) -> usize {
         let mut q = conn.prepare(sql).unwrap();
         q.query_map(params, |_| Ok(())).unwrap().count()
     }
@@ -1494,7 +1503,11 @@ mod tests {
         assert!(park("a:0", 10, 2) && park("b:0", 20, 2));
         assert!(!park("c:0", 30, 2), "full: the newest is refused");
         let g0: i64 = conn
-            .query_row("SELECT generation FROM change_parked WHERE item = 'a:0'", [], |r| r.get(0))
+            .query_row(
+                "SELECT generation FROM change_parked WHERE item = 'a:0'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "UPDATE change_parked SET attempts = 8, exhausted = 1, next_attempt_at_ms = 99999 WHERE item = 'a:0'",
@@ -1653,7 +1666,11 @@ mod tests {
         );
         assert_eq!(read(2), vec!["a:0", "c:2"]);
         let g: i64 = conn
-            .query_row("SELECT generation FROM change_parked WHERE item = 'c:2'", [], |r| r.get(0))
+            .query_row(
+                "SELECT generation FROM change_parked WHERE item = 'c:2'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(
             exec_returning(&conn, UNPARK_SQL, rusqlite::params![KIND_POT, "c:2", 0]),
@@ -1694,7 +1711,11 @@ mod tests {
         assert_eq!(selected.len(), 1);
         park_sql(&conn, rusqlite::params![KIND_POT, k, 200, MAX]).unwrap();
         for (item, generation) in &selected {
-            exec_returning(&conn, UNPARK_SQL, rusqlite::params![KIND_POT, item, generation]);
+            exec_returning(
+                &conn,
+                UNPARK_SQL,
+                rusqlite::params![KIND_POT, item, generation],
+            );
         }
         let left: i64 = conn
             .query_row("SELECT COUNT(*) FROM change_parked", [], |r| r.get(0))
@@ -1711,7 +1732,11 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        exec_returning(&conn, UNPARK_SQL, rusqlite::params![KIND_POT, again.0, again.1]);
+        exec_returning(
+            &conn,
+            UNPARK_SQL,
+            rusqlite::params![KIND_POT, again.0, again.1],
+        );
         let left: i64 = conn
             .query_row("SELECT COUNT(*) FROM change_parked", [], |r| r.get(0))
             .unwrap();
@@ -1795,7 +1820,11 @@ mod tests {
     #[test]
     fn e649_d2_l1_a_guarded_no_op_is_not_counted_as_a_change() {
         let conn = parked_db();
-        park_sql(&conn, rusqlite::params![KIND_POT, pot_item(&"ab".repeat(32), 0), 100, MAX]).unwrap();
+        park_sql(
+            &conn,
+            rusqlite::params![KIND_POT, pot_item(&"ab".repeat(32), 0), 100, MAX],
+        )
+        .unwrap();
         park_sql(&conn, rusqlite::params![KIND_HOP, ID, 100, MAX]).unwrap();
         let mut port = SqlitePort {
             conn,
@@ -1832,7 +1861,10 @@ mod tests {
             d.kept
         );
         assert_eq!(
-            rows_of(&port.conn, "SELECT COUNT(*) FROM change_parked WHERE attempts = 0"),
+            rows_of(
+                &port.conn,
+                "SELECT COUNT(*) FROM change_parked WHERE attempts = 0"
+            ),
             2,
             "the re-parked rows' new intents carry no refusal"
         );
@@ -1847,9 +1879,16 @@ mod tests {
     fn e649_d2_l3_overlapping_refusals_exhaust_at_the_eighth_attempt() {
         let conn = parked_db();
         let t = "ab".repeat(32);
-        park_sql(&conn, rusqlite::params![KIND_POT, pot_item(&t, 0), 100, MAX]).unwrap();
-        conn.execute("UPDATE change_parked SET attempts = 6, next_attempt_at_ms = 0", [])
-            .unwrap();
+        park_sql(
+            &conn,
+            rusqlite::params![KIND_POT, pot_item(&t, 0), 100, MAX],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE change_parked SET attempts = 6, next_attempt_at_ms = 0",
+            [],
+        )
+        .unwrap();
         let port = SqlitePort {
             conn,
             refuse: [t].into_iter().collect(),
@@ -1876,7 +1915,10 @@ mod tests {
             (CHANGE_PARK_MAX_ATTEMPTS, 1),
             "attempts={attempts} exhausted={exhausted}: the eighth refusal did not exhaust the row"
         );
-        assert_eq!((a.refused, a.exhausted, b.refused, b.exhausted), (1, 0, 1, 1));
+        assert_eq!(
+            (a.refused, a.exhausted, b.refused, b.exhausted),
+            (1, 0, 1, 1)
+        );
         let c = run(deliver_parked(&port));
         assert_eq!(
             (c.refused, c.exhausted),
@@ -1901,12 +1943,21 @@ mod tests {
                 .query_row("SELECT generation FROM change_parked", [], |r| r.get(0))
                 .unwrap();
             let item = pot_item(&"ab".repeat(32), 0);
-            assert_eq!(exec_returning(&port.conn, REFUSE_SQL, refuse_params(KIND_POT, &item, g, 5_000)), 1);
+            assert_eq!(
+                exec_returning(
+                    &port.conn,
+                    REFUSE_SQL,
+                    refuse_params(KIND_POT, &item, g, 5_000)
+                ),
+                1
+            );
             let (next, ex): (i64, i64) = port
                 .conn
-                .query_row("SELECT next_attempt_at_ms, exhausted FROM change_parked", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
+                .query_row(
+                    "SELECT next_attempt_at_ms, exhausted FROM change_parked",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
                 .unwrap();
             assert_eq!(
                 (next as u64, ex == 1),
