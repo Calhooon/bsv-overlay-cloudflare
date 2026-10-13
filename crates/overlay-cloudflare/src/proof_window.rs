@@ -331,14 +331,18 @@ mod tests {
         ] {
             assert!(ops.contains(field));
         }
+        // The shared tick lives in tick.rs (cron and the alarm both run it); lib.rs only declares the module.
         let lib = include_str!("lib.rs");
+        assert_eq!(lib.matches("crate::proof_window::run_pass(").count(), 0);
+        let tick_src = include_str!("tick.rs");
         assert_eq!(
-            lib.matches("crate::proof_window::run_pass(&engine, &ops_db).await;")
+            tick_src
+                .matches("crate::proof_window::run_pass(&engine, &ops_db).await;")
                 .count(),
             1
         );
-        let begin = lib.find("async fn scheduled(").unwrap();
-        let tick = &lib[begin..];
+        let begin = tick_src.find("fn run_tick(").unwrap();
+        let tick = &tick_src[begin..];
         assert!(
             tick.find("crate::proof_window::run_pass").unwrap()
                 < tick.find("engine.start_gasp_sync()").unwrap()
