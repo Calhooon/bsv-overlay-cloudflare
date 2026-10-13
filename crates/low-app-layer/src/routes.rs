@@ -4667,8 +4667,7 @@ async fn owed_schedule_deferred(env: &worker::Env, identity_lc: &str, deadline: 
     };
     let result = async {
         let ns = env.durable_object("BOARD_VIEW")?;
-        let name =
-            OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity_lc}:{end}"));
+        let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity_lc}"));
         let stub = ns.id_from_name(&name)?.get_stub()?;
         let response = stub
             .fetch_with_str(&format!(
@@ -4936,7 +4935,7 @@ async fn owed_first_read_reserved(
     }
     let result = async {
         let ns = env.durable_object("BOARD_VIEW")?;
-        let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity}:{end}"));
+        let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity}"));
         let stub = ns.id_from_name(&name)?.get_stub()?;
         let mut response = stub
             .fetch_with_str(&format!(
