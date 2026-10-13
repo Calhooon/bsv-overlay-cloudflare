@@ -202,9 +202,12 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             worker::console_warn!("[pot-changed] drain deferred: {e}");
         }
         if let Ok(db) = env_drain.d1("OVERLAY_DB") {
-            let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
+            // N9: the take is inside the raced future: an expired deadline leaves the deltas queued.
+            let now = worker::Date::now().as_millis() as f64;
             if deadline
-                .run(courier::flush(Some(db), pending))
+                .run(courier::take_and_flush(now, |pending| {
+                    courier::flush(Some(db), pending)
+                }))
                 .await
                 .is_none()
             {

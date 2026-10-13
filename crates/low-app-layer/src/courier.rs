@@ -164,6 +164,20 @@ pub fn take_pending_if_due(now_ms: f64) -> Vec<(String, u64)> {
         .collect()
 }
 
+/// E649 L4 N9: take the pending deltas when a flush is due and hand them to `flush`, both INSIDE the returned
+/// future, so a caller that races it against a deadline and never polls it (the deadline fell first) leaves the
+/// deltas queued for the next take. Taken outside the race, an expired drain emptied the map and dropped the vector.
+pub async fn take_and_flush<F, Fut>(now_ms: f64, flush: F)
+where
+    F: FnOnce(Vec<(String, u64)>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let pending = take_pending_if_due(now_ms);
+    if !pending.is_empty() {
+        flush(pending).await;
+    }
+}
+
 /// Flush the deltas into the overlay's `ops_counters`: one prepared upsert per name, ONE D1 batch. Off the critical
 /// path (the caller runs it under `wait_until`); a failure is logged, never surfaced — a lost delta is a census
 /// under-count, not a wrong answer.

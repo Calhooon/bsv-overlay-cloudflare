@@ -3229,6 +3229,66 @@ pub(crate) mod tests {
         }
     }
 
+    /// (N9, the third delta review) AN EXPIRED DRAIN LEAVES THE COURIER DELTAS QUEUED. On `b792b85` the drain task
+    /// took the pending deltas (`take_pending_if_due`, which empties the map) BEFORE the deadline's race, and an
+    /// expired deadline returned without polling the flush: the deltas were dropped (RED: the next take was `[]`).
+    /// Now the take runs inside the raced future (`courier::take_and_flush`): a deadline that has fallen polls
+    /// nothing, the delta is still there for the next take, and a live one takes and flushes it once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f4_n9_an_expired_drain_leaves_the_courier_deltas_queued() {
+        let lib = squash(&code_only(include_str!("lib.rs")));
+        let sched = &lib[lib.find(&squash("async fn scheduled(")).expect("scheduled")..];
+        let task = &sched[sched
+            .find(&squash("let drain: pot_hook::Detached"))
+            .expect("the drain task")
+            ..sched
+                .find(&squash("let tracker: pot_hook::Detached"))
+                .expect("the tracker task")];
+        assert!(
+            !task.contains(&squash("take_pending_if_due")),
+            "the drain task takes the courier deltas inside the deadline's race, never before it"
+        );
+        assert!(
+            task.contains(&squash(
+                "deadline.run(courier::take_and_flush(now, |pending| { courier::flush(Some(db), pending) }))"
+            )),
+            "the drain task races the take and the flush as one future"
+        );
+
+        let name = "e649f4_n9_probe_total";
+        crate::courier::note_presence(name);
+        let flushed = std::cell::RefCell::new(Vec::<(String, u64)>::new());
+        let expired = test_deadline(0);
+        let out = expired
+            .run(crate::courier::take_and_flush(0.0, |p| {
+                flushed.borrow_mut().extend(p);
+                async {}
+            }))
+            .await;
+        assert!(out.is_none(), "the deadline had fallen");
+        assert!(
+            flushed.borrow().is_empty(),
+            "an expired deadline polls no flush"
+        );
+        let live = test_deadline(1_000);
+        let out = live
+            .run(crate::courier::take_and_flush(0.0, |p| {
+                flushed.borrow_mut().extend(p);
+                async {}
+            }))
+            .await;
+        assert!(out.is_some());
+        let got = flushed.borrow().clone();
+        assert!(
+            got.iter().any(|(n, d)| n == name && *d == 1),
+            "the delta an expired drain left is taken and flushed by the next: {got:?}"
+        );
+        assert!(
+            crate::courier::take_pending_if_due(1.0e12).is_empty(),
+            "flushed once, not twice"
+        );
+    }
+
     /// (N7, the second delta review) THE DRAIN TASK HAS ONE DEADLINE. On `c830527` the shared timer raced the relay
     /// futures only: an EMPTY pass with an 80 ms due read and an 80 ms maintenance write returned after 174 ms under
     /// a 40 ms wall (RED: "took 174 ms under 40 ms"), and a pending store read never reached the race. Now every await
@@ -3251,7 +3311,7 @@ pub(crate) mod tests {
             "let deadline = routes::worker_deadline(pot_hook::DRAIN_WALL_MS, pot_hook::DRAIN_SETTLE_RESERVE_MS);",
             ".run(d1_ledger::boot(schema::ensure_latch_columns(&env_drain)))",
             "routes::drain_pot_announce(&env_drain, &deadline)",
-            "deadline.run(courier::flush(Some(db), pending))",
+            "deadline.run(courier::take_and_flush(now, |pending| { courier::flush(Some(db), pending) }))",
         ] {
             assert!(task.contains(&squash(step)), "the drain task: {step}");
         }
