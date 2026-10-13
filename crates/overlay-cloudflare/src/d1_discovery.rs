@@ -2097,6 +2097,17 @@ struct NetworkSeenRow {
     txid: String,
 }
 
+/// One `pot_evictions` row (bsv-low E649 L6 fold: the `ls_pot spentStatus` ledger read).
+#[derive(serde::Deserialize)]
+struct EvictionRow {
+    txid: String,
+    // D1 numbers arrive as JS numbers (the app layer's `read_eviction_ledger` reads them the same way)
+    #[serde(rename = "evictedAt")]
+    evicted_at: f64,
+    #[serde(rename = "readmittedAt", default)]
+    readmitted_at: Option<f64>,
+}
+
 /// The #284 backfill's verdict write (gate finding MEDIUM-2, 2026-07-28): a
 /// GUARDED COMPARE-AND-SET that attaches a verdict to the pointer it was
 /// computed for — and touches NOTHING else. `WHERE … AND spendingTxid = ?`
@@ -2760,6 +2771,33 @@ impl PotStorage for D1PotStorage {
             .iter()
             .map(|(txid, output_index)| by_outpoint.get(&(txid.clone(), *output_index)).cloned())
             .collect())
+    }
+
+    async fn evictions_for(
+        &self,
+        txids: &[String],
+    ) -> Result<Option<Vec<Option<overlay_discovery::pot::storage::EvictionLedgerEntry>>>, PotStorageError> {
+        use overlay_discovery::pot::storage::{evictions_by_txid_sql, EvictionLedgerEntry, EVICTIONS_CHUNK};
+        // bsv-low E649 L6 fold (L1): the `ls_pot spentStatus` ledger read, primary key, one statement per chunk.
+        let mut by_txid: std::collections::HashMap<String, EvictionLedgerEntry> = std::collections::HashMap::new();
+        let lower: Vec<String> = txids.iter().map(|t| t.to_ascii_lowercase()).collect();
+        for chunk in lower.chunks(EVICTIONS_CHUNK) {
+            let mut q = Query::new(evictions_by_txid_sql(chunk.len()));
+            for txid in chunk {
+                q = q.bind(txid.clone());
+            }
+            let rows: Vec<EvictionRow> = q.fetch_all(&self.db).await.map_err(pot_err)?;
+            for row in rows {
+                by_txid.insert(
+                    row.txid.to_ascii_lowercase(),
+                    EvictionLedgerEntry {
+                        evicted_at: row.evicted_at as i64,
+                        readmitted_at: row.readmitted_at.map(|v| v as i64),
+                    },
+                );
+            }
+        }
+        Ok(Some(lower.iter().map(|t| by_txid.get(t).copied()).collect()))
     }
 
     async fn network_seen_for(&self, txids: &[String]) -> Result<Vec<bool>, PotStorageError> {
@@ -8756,6 +8794,35 @@ mod tests {
 
     /// admit-fast step 4: the witness batch query answers exactly the latched
     /// txids among those asked, on the real schema.
+    #[test]
+    fn eviction_ledger_batch_sql_reads_by_primary_key_real_sqlite() {
+        // bsv-low E649 L6 fold (L1): the `ls_pot spentStatus` ledger read, on the production schema.
+        let conn = production_schema_db();
+        conn.execute(
+            "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt) VALUES (?1, 'r', 5, NULL)",
+            [h64(0xaa)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt) VALUES (?1, 'r', 6, 9)",
+            [h64(0xbb)],
+        )
+        .unwrap();
+        let sql = overlay_discovery::pot::storage::evictions_by_txid_sql(3);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let mut rows: Vec<(String, i64, Option<i64>)> = stmt
+            .query_map([h64(0xaa), h64(0xbb), h64(0xcc)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![(h64(0xaa), 5, None), (h64(0xbb), 6, Some(9))]);
+        let plan: String = conn
+            .query_row(&format!("EXPLAIN QUERY PLAN {sql}"), [h64(0xaa), h64(0xbb), h64(0xcc)], |r| r.get(3))
+            .unwrap();
+        assert!(!plan.contains("SCAN"), "the ledger read rides its primary key: {plan}");
+    }
+
     #[test]
     fn network_seen_batch_sql_selects_exact_txids_real_sqlite() {
         let conn = production_schema_db();

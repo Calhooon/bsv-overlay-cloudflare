@@ -258,6 +258,39 @@ pub enum PotQuery {
 }
 
 /// Backend-agnostic storage for pot-spend records.
+/// bsv-low E649 L6: one eviction ledger row (`pot_evictions`), host-typed: `evictedAt` and `readmittedAt` in ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvictionLedgerEntry {
+    pub evicted_at: i64,
+    pub readmitted_at: Option<i64>,
+}
+
+/// The served word of an OPEN eviction: bsv-tracker 0.2.2's `Word::Rejected`, wire `rejected`. A readmitted
+/// row serves no word (`null`): the readmission is the chain's or the operator's word and the index holds the
+/// pot again.
+pub const EVICTED_WORD: &str = "rejected";
+
+/// The ONE projection of a ledger row on the wire (`/utxo-status.evicted`, `ls_pot spentStatus.evicted`):
+/// `{at, word, readmittedAt}`, `word` `rejected` while open and `null` once readmitted.
+pub fn served_eviction_value(at: i64, readmitted_at: Option<i64>) -> serde_json::Value {
+    serde_json::json!({
+        "at": at,
+        "word": if readmitted_at.is_none() { Some(EVICTED_WORD) } else { None },
+        "readmittedAt": readmitted_at,
+    })
+}
+
+/// The ledger read, one statement per chunk of DISTINCT lowercase txids: `txid IN` rides the primary key (the
+/// ledger writes its key lowercased; every caller binds lowercase). Read only.
+pub fn evictions_by_txid_sql(n: usize) -> String {
+    debug_assert!((1..=EVICTIONS_CHUNK).contains(&n));
+    let marks = (1..=n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+    format!("SELECT lower(txid) AS txid, evictedAt, readmittedAt FROM pot_evictions WHERE txid IN ({marks})")
+}
+
+/// Txids per ledger statement (D1 binds at most 100).
+pub const EVICTIONS_CHUNK: usize = 90;
+
 #[async_trait(?Send)]
 pub trait PotStorage {
     /// Record an admitted pot outpoint (called with `spent = false`).
@@ -412,6 +445,20 @@ pub trait PotStorage {
     /// never from a poll.
     async fn network_seen_for(&self, txids: &[String]) -> Result<Vec<bool>, PotStorageError> {
         Ok(vec![false; txids.len()])
+    }
+
+    /// bsv-low E649 L6 fold (L1): the overlay's eviction ledger (`pot_evictions`) for a batch of txids, ALIGNED
+    /// index-for-index with the input (`None` per txid = the ledger holds no row). `Ok(None)` = this store
+    /// serves no ledger (the default): the caller omits the field, never "no eviction". The D1 backend reads
+    /// [`evictions_by_txid_sql`] on the primary key, one statement per [`EVICTIONS_CHUNK`] txids; under
+    /// `spentStatus`'s cap of [`crate::pot::lookup_service::MAX_SPENT_STATUS_OUTPOINTS`] that is at most two
+    /// statements and one row read per distinct txid. Read only.
+    async fn evictions_for(
+        &self,
+        txids: &[String],
+    ) -> Result<Option<Vec<Option<EvictionLedgerEntry>>>, PotStorageError> {
+        let _ = txids;
+        Ok(None)
     }
 
     /// Spent-but-UNCONFIRMED pot records — the spend-confirmation chaser's
@@ -1044,6 +1091,10 @@ pub struct MemoryPotStorage {
     /// admit-fast step 4: the txids this store reports as network-witnessed
     /// (`network_seen_for`); `mark_network_seen` is the test hook.
     network_seen: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// bsv-low E649 L6 fold: the eviction ledger twin (`evictions_for`): `None` = this store serves no ledger
+    /// (the trait default), `Some(Err)` = the read faults; test hooks `serve_evictions`, `record_eviction`,
+    /// `fault_evictions`.
+    evictions: std::sync::Mutex<Option<Result<std::collections::HashMap<String, EvictionLedgerEntry>, ()>>>,
     /// The persisted walk states (`reorg_sweep_state`).
     sweep_states:
         std::sync::Mutex<std::collections::HashMap<String, crate::pot::reorg::SweepState>>,
@@ -1090,6 +1141,27 @@ impl MemoryPotStorage {
             .lock()
             .unwrap()
             .insert(txid.to_ascii_lowercase());
+    }
+
+    /// bsv-low E649 L6 fold: this store now serves an (empty) eviction ledger.
+    pub fn serve_evictions(&self) {
+        *self.evictions.lock().unwrap() = Some(Ok(Default::default()));
+    }
+
+    /// bsv-low E649 L6 fold: a ledger row for `txid` (serves the ledger if it did not).
+    pub fn record_eviction(&self, txid: &str, evicted_at: i64, readmitted_at: Option<i64>) {
+        let mut g = self.evictions.lock().unwrap();
+        if !matches!(*g, Some(Ok(_))) {
+            *g = Some(Ok(Default::default()));
+        }
+        if let Some(Ok(m)) = g.as_mut() {
+            m.insert(txid.to_ascii_lowercase(), EvictionLedgerEntry { evicted_at, readmitted_at });
+        }
+    }
+
+    /// bsv-low E649 L6 fold: every later ledger read faults.
+    pub fn fault_evictions(&self) {
+        *self.evictions.lock().unwrap() = Some(Err(()));
     }
 
     pub fn beef_count(&self) -> usize {
@@ -1199,6 +1271,17 @@ impl MemoryPotStorage {
 
 #[async_trait(?Send)]
 impl PotStorage for MemoryPotStorage {
+    async fn evictions_for(
+        &self,
+        txids: &[String],
+    ) -> Result<Option<Vec<Option<EvictionLedgerEntry>>>, PotStorageError> {
+        match &*self.evictions.lock().unwrap() {
+            None => Ok(None),
+            Some(Err(())) => Err(PotStorageError::Other("eviction ledger read faulted (test hook)".into())),
+            Some(Ok(m)) => Ok(Some(txids.iter().map(|t| m.get(&t.to_ascii_lowercase()).copied()).collect())),
+        }
+    }
+
     async fn network_seen_for(&self, txids: &[String]) -> Result<Vec<bool>, PotStorageError> {
         let seen = self.network_seen.lock().unwrap();
         Ok(txids
