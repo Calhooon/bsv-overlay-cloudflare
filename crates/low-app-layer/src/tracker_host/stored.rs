@@ -219,4 +219,8 @@ pub const BACKFILL_SAVE: &str = "INSERT INTO tracker_backfill(version,cursor,com
 
 /// Expire stranger projections after eight days. Held subjects and broadcaster
 /// write events identify first-party touches, and are outside this sweep.
-pub const SWEEP: &str = "DELETE FROM tx_words WHERE txid IN (SELECT w.txid FROM tx_words w WHERE w.updated_at < ?1 AND COALESCE(w.hint_source,'') <> 'arcade' AND w.word <> 'built' AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) AND NOT EXISTS (SELECT 1 FROM pot_beefs p WHERE p.txid=w.txid) ORDER BY w.updated_at,w.txid LIMIT 64)";
+pub const SWEEP: &str = "DELETE FROM tx_words WHERE txid IN (SELECT w.txid FROM tx_words w WHERE w.updated_at < ?1 AND COALESCE(w.hint_source,'') <> 'arcade' AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) AND NOT EXISTS (SELECT 1 FROM pot_beefs p WHERE p.txid=w.txid) ORDER BY w.updated_at,w.txid LIMIT 64)";
+
+/// Only held or broadcaster-touched subjects buy scheduled refreshes. A
+/// stranger's historic built projection cannot renew its own sweep age.
+pub const DUE: &str = "SELECT w.txid FROM tx_words w WHERE w.word IN ('unknown','built','announced','seen') AND w.updated_at <= ?1 AND (w.hint_source = 'arcade' OR EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) OR EXISTS (SELECT 1 FROM pot_beefs p WHERE p.txid=w.txid)) ORDER BY w.updated_at,w.txid LIMIT 2";

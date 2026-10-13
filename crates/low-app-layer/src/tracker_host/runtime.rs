@@ -364,7 +364,6 @@ pub async fn event(
         || matches!(kind, "submit" | "accepted" | "seen")
         || old.as_ref().is_some_and(|row| {
             row.hint_source.as_deref() == Some("arcade")
-                || row.word == "built"
                 || row
                     .legacy_body
                     .as_ref()
@@ -522,7 +521,7 @@ pub async fn tick(env: &worker::Env) -> worker::Result<()> {
         .counted_run()
         .await?;
     crate::courier::note_presence("tracker_stranger_sweep_pass_total");
-    let rows = db.prepare("SELECT txid FROM tx_words WHERE word IN ('unknown','built','announced','seen') AND updated_at <= ? ORDER BY updated_at, txid LIMIT 2")
+    let rows = db.prepare(stored::DUE)
         .bind(&[JsValue::from_f64(now.saturating_sub(900) as f64)])?
         .counted_all().await?.results::<Subject>()?;
     super::pacing::begin_tick(now / 900);
