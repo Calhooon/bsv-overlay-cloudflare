@@ -85,11 +85,20 @@ pub const PARKED_READ_SQL: &str = "SELECT item, generation, attempts FROM change
 /// (D2-L1: a row re-parked since is not deleted and not counted).
 pub const UNPARK_SQL: &str =
     "DELETE FROM change_parked WHERE kind = ?1 AND item = ?2 AND generation = ?3 RETURNING item";
-/// One refused entry (N2): its attempt counted, its next eligibility (`?4`) and its exhaustion (`?5`) set, ONLY
-/// at the generation the delivery read (a re-park since is a new intent with its own attempts).
+/// One refused entry (N2), its attempt RESERVED in one statement (the second delta lens, D2-L3): the count goes up
+/// by one and its exhaustion (`?5` [`CHANGE_PARK_MAX_ATTEMPTS`]) and next eligibility (`?4` now, then `?6`
+/// [`CHANGE_PARK_BACKOFF_BASE_MS`] doubled per earlier attempt, at most `?7` [`CHANGE_PARK_BACKOFF_MAX_MS`]) are
+/// derived in SQL from the count it moves, never from the delivery's read; only at the generation the delivery
+/// read (a re-park since is a new intent with its own attempts) and only while the row is not exhausted (an
+/// exhaustion is one transition). It RETURNS the row it changed (D2-L1). [`refusal_backoff`] is its pure mirror,
+/// pinned equal. Until the fold the next time and the exhaustion were the delivery's, computed from its read, so two
+/// overlapping deliveries that read `attempts = 6` left `attempts = 8, exhausted = 0`.
 pub const REFUSE_SQL: &str = "UPDATE change_parked \
-     SET attempts = attempts + 1, next_attempt_at_ms = ?4, exhausted = ?5 \
-     WHERE kind = ?1 AND item = ?2 AND generation = ?3 RETURNING exhausted";
+     SET attempts = attempts + 1, \
+        exhausted = (attempts + 1 >= ?5), \
+        next_attempt_at_ms = CASE WHEN attempts + 1 >= ?5 THEN ?4 \
+           ELSE ?4 + MIN(?6 << MIN(MAX(attempts, 0), 20), ?7) END \
+     WHERE kind = ?1 AND item = ?2 AND generation = ?3 AND exhausted = 0 RETURNING exhausted";
 /// The sweep of one set (N2): exhausted rows older than `?2`, at most `?3` a tick.
 pub const SWEEP_EXHAUSTED_SQL: &str = "DELETE FROM change_parked WHERE rowid IN (\
      SELECT rowid FROM change_parked WHERE kind = ?1 AND exhausted = 1 AND next_attempt_at_ms <= ?2 \
@@ -122,7 +131,8 @@ pub const CHANGE_PARK_EXHAUSTED_KEEP_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// (kept in the isolate's set, counted `change_park_full_total`); a re-park of a held key always lands.
 pub const CHANGE_PARKED_MAX_ROWS: i64 = 2048;
 
-/// PURE (N2): a refusal of a row read with `attempts` at `now_ms`: `(next_attempt_at_ms, exhausted)`.
+/// PURE (N2): a refusal of a row holding `attempts` at `now_ms`: `(next_attempt_at_ms, exhausted)`. The mirror of
+/// [`REFUSE_SQL`], which is what the drain runs (D2-L3).
 pub fn refusal_backoff(attempts: i64, now_ms: u64) -> (u64, bool) {
     let after = attempts.saturating_add(1);
     if after >= CHANGE_PARK_MAX_ATTEMPTS {
@@ -325,12 +335,14 @@ pub(crate) trait UnparkPort {
         kind: &'static str,
         rows: &[(String, i64)],
     ) -> std::result::Result<u64, String>;
-    /// Back the refused rows off ([`REFUSE_SQL`]): `(entry, generation, next_attempt_at_ms, exhausted)`. Answers
-    /// `(backed off, of which exhausted)`, the rows the statements CHANGED (D2-L1).
+    /// Back the refused rows off at `now_ms` ([`REFUSE_SQL`], each `(entry, generation)`: the attempt reserved and
+    /// its back-off derived in the statement, D2-L3). Answers `(backed off, of which exhausted)`, the rows the
+    /// statements CHANGED (D2-L1).
     async fn refuse(
         &self,
         kind: &'static str,
-        rows: &[(String, i64, u64, bool)],
+        rows: &[(String, i64)],
+        now_ms: u64,
     ) -> std::result::Result<(u64, u64), String>;
     /// Delete at most `limit` exhausted rows of one set older than `before_ms` ([`SWEEP_EXHAUSTED_SQL`]).
     async fn sweep(
@@ -464,15 +476,11 @@ pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
         }
         if !refused.is_empty() {
             let now = port.now_ms();
-            let rows: Vec<(String, i64, u64, bool)> = refused
+            let rows: Vec<(String, i64)> = refused
                 .iter()
-                .map(|i| {
-                    let r = by_item[i.as_str()];
-                    let (next, exhausted) = refusal_backoff(r.attempts, now);
-                    (i.clone(), r.generation, next, exhausted)
-                })
+                .map(|i| (i.clone(), by_item[i.as_str()].generation))
                 .collect();
-            match port.refuse(kind, &rows).await {
+            match port.refuse(kind, &rows, now).await {
                 Ok((backed_off, exhausted)) => {
                     out.refused += backed_off;
                     out.exhausted += exhausted;
@@ -614,10 +622,11 @@ impl UnparkPort for WorkerUnpark<'_> {
     async fn refuse(
         &self,
         kind: &'static str,
-        rows: &[(String, i64, u64, bool)],
+        rows: &[(String, i64)],
+        now_ms: u64,
     ) -> std::result::Result<(u64, u64), String> {
         let mut stmts = Vec::with_capacity(rows.len());
-        for (item, generation, next, exhausted) in rows {
+        for (item, generation) in rows {
             stmts.push(
                 self.db
                     .prepare(REFUSE_SQL)
@@ -625,8 +634,10 @@ impl UnparkPort for WorkerUnpark<'_> {
                         kind.into(),
                         item.as_str().into(),
                         (*generation as f64).into(),
-                        (*next as f64).into(),
-                        (if *exhausted { 1.0 } else { 0.0 }).into(),
+                        (now_ms as f64).into(),
+                        (CHANGE_PARK_MAX_ATTEMPTS as f64).into(),
+                        (CHANGE_PARK_BACKOFF_BASE_MS as f64).into(),
+                        (CHANGE_PARK_BACKOFF_MAX_MS as f64).into(),
                     ])
                     .map_err(|e| e.to_string())?,
             );
@@ -740,9 +751,10 @@ impl UnparkPort for NoTransport<'_> {
     async fn refuse(
         &self,
         kind: &'static str,
-        rows: &[(String, i64, u64, bool)],
+        rows: &[(String, i64)],
+        now_ms: u64,
     ) -> std::result::Result<(u64, u64), String> {
-        self.0.refuse(kind, rows).await
+        self.0.refuse(kind, rows, now_ms).await
     }
     async fn sweep(
         &self,
@@ -1101,9 +1113,10 @@ mod tests {
         async fn refuse(
             &self,
             _kind: &'static str,
-            rows: &[(String, i64, u64, bool)],
+            rows: &[(String, i64)],
+            _now_ms: u64,
         ) -> std::result::Result<(u64, u64), String> {
-            Ok((rows.len() as u64, rows.iter().filter(|r| r.3).count() as u64))
+            Ok((rows.len() as u64, 0))
         }
         async fn sweep(
             &self,
@@ -1198,6 +1211,19 @@ mod tests {
         Ok(n == 1)
     }
 
+    /// [`REFUSE_SQL`]'s binds, as the worker binds them.
+    fn refuse_params(kind: &str, item: &str, generation: i64, now_ms: u64) -> impl rusqlite::Params {
+        (
+            kind.to_string(),
+            item.to_string(),
+            generation,
+            now_ms as i64,
+            CHANGE_PARK_MAX_ATTEMPTS,
+            CHANGE_PARK_BACKOFF_BASE_MS as i64,
+            CHANGE_PARK_BACKOFF_MAX_MS as i64,
+        )
+    }
+
     /// A shipped statement that RETURNS its changed rows (D2-L1), run: the rows it changed.
     fn exec_returning<P: rusqlite::Params>(conn: &rusqlite::Connection, sql: &str, params: P) -> usize {
         let mut q = conn.prepare(sql).unwrap();
@@ -1229,6 +1255,10 @@ mod tests {
         refused_posts: RefCell<usize>,
         /// D2-L1: every POST re-parks the rows it carries before it answers (a later change during the POST).
         repark: bool,
+        /// D2-L3: the rows the last read answered, and a read to answer INSTEAD of the table (an overlapping
+        /// delivery that read before another's back-off landed).
+        last_read: RefCell<Vec<ParkedRow>>,
+        stale_read: RefCell<Option<Vec<ParkedRow>>>,
     }
 
     impl UnparkPort for SqlitePort {
@@ -1238,9 +1268,12 @@ mod tests {
             now_ms: u64,
             limit: usize,
         ) -> std::result::Result<Vec<ParkedRow>, String> {
+            if let Some(stale) = self.stale_read.borrow().clone() {
+                return Ok(stale.into_iter().filter(|_| kind == KIND_POT).collect());
+            }
             let mut q = self.conn.prepare(PARKED_READ_SQL).unwrap();
-            Ok(
-                q.query_map(rusqlite::params![kind, now_ms as i64, limit as i64], |r| {
+            let rows: Vec<ParkedRow> = q
+                .query_map(rusqlite::params![kind, now_ms as i64, limit as i64], |r| {
                     Ok(ParkedRow {
                         item: r.get(0)?,
                         generation: r.get(1)?,
@@ -1249,8 +1282,11 @@ mod tests {
                 })
                 .unwrap()
                 .map(|r| r.unwrap())
-                .collect(),
-            )
+                .collect();
+            if !rows.is_empty() {
+                *self.last_read.borrow_mut() = rows.clone();
+            }
+            Ok(rows)
         }
         async fn post(&self, kind: &'static str, body: String) -> std::result::Result<usize, ()> {
             self.posted.borrow_mut().push(body.clone());
@@ -1302,16 +1338,14 @@ mod tests {
         async fn refuse(
             &self,
             kind: &'static str,
-            rows: &[(String, i64, u64, bool)],
+            rows: &[(String, i64)],
+            now_ms: u64,
         ) -> std::result::Result<(u64, u64), String> {
             let (mut n, mut ex_n) = (0u64, 0u64);
-            for (i, g, next, ex) in rows {
+            for (i, g) in rows {
                 let mut q = self.conn.prepare(REFUSE_SQL).unwrap();
                 for e in q
-                    .query_map(
-                        rusqlite::params![kind, i, g, *next as i64, *ex as i64],
-                        |r| r.get::<_, i64>(0),
-                    )
+                    .query_map(refuse_params(kind, i, *g, now_ms), |r| r.get::<_, i64>(0))
                     .unwrap()
                 {
                     n += 1;
@@ -1371,6 +1405,8 @@ mod tests {
             posted: Default::default(),
             refused_posts: RefCell::new(0),
             repark: false,
+            last_read: Default::default(),
+            stale_read: Default::default(),
         };
         let last = txid(128);
         let mut delivered_at = None;
@@ -1752,6 +1788,8 @@ mod tests {
             posted: Default::default(),
             refused_posts: RefCell::new(0),
             repark: true,
+            last_read: Default::default(),
+            stale_read: Default::default(),
         };
         let d = run(deliver_parked(&port));
         assert_eq!(
@@ -1782,6 +1820,84 @@ mod tests {
             2,
             "the re-parked rows' new intents carry no refusal"
         );
+    }
+
+    /// bsv-low #649 D2-L3 (the second delta lens, the SHIPPED delivery over the SHIPPED statements): two deliveries
+    /// overlap (the cron and the authenticated drain lever) and both read one refused pot row at `attempts = 6`;
+    /// both POSTs are refused. The row's eighth refusal must exhaust it, counted once; a third overlapping delivery
+    /// on the same stale read changes nothing. On `a80e197` each back-off assigned the exhaustion its delivery
+    /// computed from the stale read: `attempts=8 exhausted=0`, still eligible.
+    #[test]
+    fn e649_d2_l3_overlapping_refusals_exhaust_at_the_eighth_attempt() {
+        let conn = parked_db();
+        let t = "ab".repeat(32);
+        park_sql(&conn, rusqlite::params![KIND_POT, pot_item(&t, 0), 100, MAX]).unwrap();
+        conn.execute("UPDATE change_parked SET attempts = 6, next_attempt_at_ms = 0", [])
+            .unwrap();
+        let port = SqlitePort {
+            conn,
+            refuse: [t].into_iter().collect(),
+            clock: std::cell::Cell::new(10_000),
+            posted: Default::default(),
+            refused_posts: RefCell::new(0),
+            repark: false,
+            last_read: Default::default(),
+            stale_read: Default::default(),
+        };
+        let a = run(deliver_parked(&port));
+        // delivery B read the row before A's back-off landed
+        *port.stale_read.borrow_mut() = Some(port.last_read.borrow().clone());
+        assert_eq!(port.last_read.borrow()[0].attempts, 6);
+        let b = run(deliver_parked(&port));
+        let (attempts, exhausted): (i64, i64) = port
+            .conn
+            .query_row("SELECT attempts, exhausted FROM change_parked", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            (attempts, exhausted),
+            (CHANGE_PARK_MAX_ATTEMPTS, 1),
+            "attempts={attempts} exhausted={exhausted}: the eighth refusal did not exhaust the row"
+        );
+        assert_eq!((a.refused, a.exhausted, b.refused, b.exhausted), (1, 0, 1, 1));
+        let c = run(deliver_parked(&port));
+        assert_eq!(
+            (c.refused, c.exhausted),
+            (0, 0),
+            "an exhausted row is not backed off or exhausted again"
+        );
+        let attempts: i64 = port
+            .conn
+            .query_row("SELECT attempts FROM change_parked", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, CHANGE_PARK_MAX_ATTEMPTS);
+        // the statement and its pure mirror agree at every count
+        for held in 0..CHANGE_PARK_MAX_ATTEMPTS {
+            port.conn
+                .execute(
+                    "UPDATE change_parked SET attempts = ?1, exhausted = 0",
+                    [held],
+                )
+                .unwrap();
+            let g: i64 = port
+                .conn
+                .query_row("SELECT generation FROM change_parked", [], |r| r.get(0))
+                .unwrap();
+            let item = pot_item(&"ab".repeat(32), 0);
+            assert_eq!(exec_returning(&port.conn, REFUSE_SQL, refuse_params(KIND_POT, &item, g, 5_000)), 1);
+            let (next, ex): (i64, i64) = port
+                .conn
+                .query_row("SELECT next_attempt_at_ms, exhausted FROM change_parked", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(
+                (next as u64, ex == 1),
+                refusal_backoff(held, 5_000),
+                "at attempts {held}"
+            );
+        }
     }
 
     /// bsv-low #649 N4 (the delta lens's documentation drift): the Skip variant and the skip counter say what a skip
