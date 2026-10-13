@@ -560,15 +560,20 @@ impl LookupService for PotLookupService {
                 distinct.push(t.clone());
             }
         }
-        let ledger: Option<std::collections::HashMap<String, Option<super::storage::EvictionLedgerEntry>>> =
-            match self.storage.evictions_for(&distinct).await {
-                Ok(Some(rows)) if rows.len() == distinct.len() => Some(distinct.iter().cloned().zip(rows).collect()),
-                Ok(Some(_)) | Ok(None) => None,
-                Err(e) => {
-                    tracing::warn!("ls_pot spentStatus: eviction ledger read faulted, the field is omitted: {e}");
-                    None
-                }
-            };
+        let ledger: Option<
+            std::collections::HashMap<String, Option<super::storage::EvictionLedgerEntry>>,
+        > = match self.storage.evictions_for(&distinct).await {
+            Ok(Some(rows)) if rows.len() == distinct.len() => {
+                Some(distinct.iter().cloned().zip(rows).collect())
+            }
+            Ok(Some(_)) | Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    "ls_pot spentStatus: eviction ledger read faulted, the field is omitted: {e}"
+                );
+                None
+            }
+        };
 
         // Build an input-ordered array: one entry per requested outpoint.
         let mut entries = Vec::with_capacity(outpoints.len());
@@ -934,7 +939,10 @@ mod tests {
         ]);
         // a store that serves no ledger: the key is absent on every entry
         let arr = spent_status(&svc, ask.clone()).await;
-        assert!(arr[0].get("evicted").is_none(), "not served: absent, never null");
+        assert!(
+            arr[0].get("evicted").is_none(),
+            "not served: absent, never null"
+        );
         storage.serve_evictions();
         storage.record_eviction(&open, 1_760_000_000_000, None);
         storage.record_eviction(&readmitted, 1_760_000_000_000, Some(1_760_000_060_000));
@@ -949,7 +957,11 @@ mod tests {
             arr[1]["evicted"],
             serde_json::json!({"at": 1_760_000_000_000_i64, "word": null, "readmittedAt": 1_760_000_060_000_i64})
         );
-        assert_eq!(arr[2]["evicted"], serde_json::Value::Null, "read, no row: null");
+        assert_eq!(
+            arr[2]["evicted"],
+            serde_json::Value::Null,
+            "read, no row: null"
+        );
         // a faulted ledger read omits the key and still answers the money fields
         storage.fault_evictions();
         let arr = spent_status(&svc, ask).await;
