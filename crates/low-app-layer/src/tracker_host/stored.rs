@@ -224,3 +224,5 @@ pub const SWEEP: &str = "DELETE FROM tx_words WHERE txid IN (SELECT w.txid FROM 
 /// Only held or broadcaster-touched subjects buy scheduled refreshes. A
 /// stranger's historic built projection cannot renew its own sweep age.
 pub const DUE: &str = "SELECT w.txid FROM tx_words w WHERE w.word IN ('unknown','built','announced','seen') AND w.updated_at <= ?1 AND (w.hint_source = 'arcade' OR EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) OR EXISTS (SELECT 1 FROM pot_beefs p WHERE p.txid=w.txid)) ORDER BY w.updated_at,w.txid LIMIT 2";
+
+pub const AGE_INDEX: &str = "CREATE INDEX IF NOT EXISTS tx_words_age ON tx_words(updated_at,txid)";
