@@ -149,6 +149,7 @@ pub mod live_view;
 pub mod logic;
 pub mod owed;
 pub mod owed_cursor;
+pub mod pot_hook;
 pub mod proof_post;
 pub mod rate;
 pub mod record_post;
