@@ -509,11 +509,14 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 218 → 220 for NS-3: compact tracker word projection.
 pub const OVERLAY_MIGRATION_COUNT: usize = 220;
 
+/// Named NS-3 production migration (historically migration 190).
+pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
+
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS tracker_backfill (version TEXT PRIMARY KEY, cursor TEXT NOT NULL, complete INTEGER NOT NULL)",
     // NS-3 compact tracker projection; K11 may replace this boundary.
-    "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)",
+    TX_WORDS_CREATE,
     // outputs table
     "CREATE TABLE IF NOT EXISTS outputs (
         txid TEXT NOT NULL,
