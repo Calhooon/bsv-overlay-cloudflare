@@ -209,10 +209,8 @@ pub enum ServedEviction {
     Row { at: i64, readmitted_at: Option<i64> },
 }
 
-/// The served word of an OPEN eviction: bsv-tracker 0.2.2's `Word::Rejected`, wire `rejected`. A readmitted
-/// row serves no word (`null`): the readmission is the chain's or the operator's word and the index holds
-/// the pot again.
-pub const EVICTED_WORD: &str = "rejected";
+/// The served word of an OPEN eviction (shared with `ls_pot spentStatus`, bsv-low E649 L6 fold L1).
+pub use overlay_discovery::pot::storage::EVICTED_WORD;
 
 impl ServedEviction {
     /// The wire value, `None` when the key is omitted.
@@ -220,11 +218,9 @@ impl ServedEviction {
         match self {
             ServedEviction::NotRead => None,
             ServedEviction::NoRow => Some(serde_json::Value::Null),
-            ServedEviction::Row { at, readmitted_at } => Some(json!({
-                "at": at,
-                "word": if readmitted_at.is_none() { Some(EVICTED_WORD) } else { None },
-                "readmittedAt": readmitted_at,
-            })),
+            ServedEviction::Row { at, readmitted_at } => Some(
+                overlay_discovery::pot::storage::served_eviction_value(*at, *readmitted_at),
+            ),
         }
     }
 }
@@ -240,13 +236,10 @@ pub struct EvictionLedgerRow {
 /// bsv-low E649 L6: the `/utxo-status` ledger read, one statement per chunk of DISTINCT txids. `txid IN`
 /// rides the primary key (the ledger writes its key lowercased; the route binds lowercase). Read only:
 /// nothing on this path writes (NS-3).
+/// The statement is the overlay's own (`ls_pot spentStatus` reads the same, E649 L6 fold L1).
 pub fn evictions_by_txid_sql(n: usize) -> String {
     debug_assert!((1..=MAX_OUTPOINTS).contains(&n));
-    let marks = (1..=n)
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("SELECT lower(txid) AS txid, evictedAt, readmittedAt FROM pot_evictions WHERE txid IN ({marks})")
+    overlay_discovery::pot::storage::evictions_by_txid_sql(n)
 }
 
 /// Distinct lowercase txids of the requested outpoints, in first-seen order (the ledger read's binds).

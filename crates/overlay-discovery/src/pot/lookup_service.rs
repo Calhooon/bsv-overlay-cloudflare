@@ -550,6 +550,26 @@ impl LookupService for PotLookupService {
             .await
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
 
+        // bsv-low E649 L6 fold (L1): the eviction ledger, the same projection `/utxo-status` serves. One read of
+        // the DISTINCT txids (bounded by the cap above: at most two primary-key statements); a store without the
+        // ledger or a faulted read omits the key (never "no eviction" from a fault, and never a failed answer:
+        // the money fields stand on their own reads).
+        let mut distinct: Vec<String> = Vec::new();
+        for (t, _) in &keys {
+            if !distinct.contains(t) {
+                distinct.push(t.clone());
+            }
+        }
+        let ledger: Option<std::collections::HashMap<String, Option<super::storage::EvictionLedgerEntry>>> =
+            match self.storage.evictions_for(&distinct).await {
+                Ok(Some(rows)) if rows.len() == distinct.len() => Some(distinct.iter().cloned().zip(rows).collect()),
+                Ok(Some(_)) | Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("ls_pot spentStatus: eviction ledger read faulted, the field is omitted: {e}");
+                    None
+                }
+            };
+
         // Build an input-ordered array: one entry per requested outpoint.
         let mut entries = Vec::with_capacity(outpoints.len());
         for ((op, record), seen) in outpoints.iter().zip(records).zip(witnessed) {
@@ -588,7 +608,7 @@ impl LookupService for PotLookupService {
                 ),
             };
 
-            entries.push(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "txid": op.txid,
                 "vout": op.vout,
                 "known": known,
@@ -605,7 +625,15 @@ impl LookupService for PotLookupService {
                 // unwitnessed for seconds: the felt says "awaiting the
                 // network" until this flips, from the pots-room push.
                 "networkSeen": if known { serde_json::Value::Bool(seen) } else { serde_json::Value::Null },
-            }));
+            });
+            if let Some(ledger) = &ledger {
+                let row = ledger.get(&op.txid.to_ascii_lowercase()).copied().flatten();
+                entry["evicted"] = match row {
+                    Some(r) => super::storage::served_eviction_value(r.evicted_at, r.readmitted_at),
+                    None => serde_json::Value::Null,
+                };
+            }
+            entries.push(entry);
         }
 
         Ok(LookupResult::Answer(LookupAnswer::Freeform {
@@ -887,6 +915,46 @@ mod tests {
         .await;
         assert_eq!(arr[0]["known"], true);
         assert_eq!(arr[0]["spent"], false);
+    }
+
+    /// bsv-low E649 L6 fold (L1): `spentStatus` serves the eviction ledger beside `known`, the same projection
+    /// `/utxo-status` serves: `{at, word, readmittedAt}` for a row (`rejected` while open, null once
+    /// readmitted), `null` when the ledger holds none, the key ABSENT where the store serves no ledger or the
+    /// read faulted (never "no eviction" from a fault).
+    #[tokio::test]
+    async fn spent_status_serves_the_eviction_ledger() {
+        let (svc, storage) = make_service_with_storage();
+        let open = "ab".repeat(32);
+        let readmitted = "cd".repeat(32);
+        let never = "ef".repeat(32);
+        let ask = serde_json::json!([
+            {"txid": open.to_ascii_uppercase(), "vout": 0},
+            {"txid": readmitted, "vout": 0},
+            {"txid": never, "vout": 0},
+        ]);
+        // a store that serves no ledger: the key is absent on every entry
+        let arr = spent_status(&svc, ask.clone()).await;
+        assert!(arr[0].get("evicted").is_none(), "not served: absent, never null");
+        storage.serve_evictions();
+        storage.record_eviction(&open, 1_760_000_000_000, None);
+        storage.record_eviction(&readmitted, 1_760_000_000_000, Some(1_760_000_060_000));
+        let arr = spent_status(&svc, ask.clone()).await;
+        assert_eq!(arr[0]["known"], false);
+        assert_eq!(
+            arr[0]["evicted"],
+            serde_json::json!({"at": 1_760_000_000_000_i64, "word": "rejected", "readmittedAt": null}),
+            "an open row (case-insensitive txid)"
+        );
+        assert_eq!(
+            arr[1]["evicted"],
+            serde_json::json!({"at": 1_760_000_000_000_i64, "word": null, "readmittedAt": 1_760_000_060_000_i64})
+        );
+        assert_eq!(arr[2]["evicted"], serde_json::Value::Null, "read, no row: null");
+        // a faulted ledger read omits the key and still answers the money fields
+        storage.fault_evictions();
+        let arr = spent_status(&svc, ask).await;
+        assert_eq!(arr[0]["known"], false);
+        assert!(arr[0].get("evicted").is_none(), "a fault is not served");
     }
 
     /// admit-fast step 4: `spentStatus` serves the pot's OWN network witness —
