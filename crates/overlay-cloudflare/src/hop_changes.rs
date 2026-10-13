@@ -41,6 +41,21 @@ pub fn drain() -> Vec<String> {
     CHANGES.with(|c| std::mem::take(&mut *c.borrow_mut()).into_iter().collect())
 }
 
+/// bsv-low #649 M1: a COPY of every noted identity, the set left as it is (see `pot_changes::snapshot`).
+pub fn snapshot() -> Vec<String> {
+    CHANGES.with(|c| c.borrow().iter().cloned().collect())
+}
+
+/// bsv-low #649 M1: take `parked` out of the set (identities noted since the snapshot stay).
+pub fn forget(parked: &[String]) {
+    CHANGES.with(|c| {
+        let mut set = c.borrow_mut();
+        for p in parked {
+            set.remove(p);
+        }
+    });
+}
+
 /// The webhook body: `{"identities":["02…","03…"]}`.
 pub fn body_json(identities: &[String]) -> String {
     serde_json::json!({ "identities": identities }).to_string()
