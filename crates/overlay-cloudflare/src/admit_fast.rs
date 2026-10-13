@@ -1560,19 +1560,29 @@ impl ConflictPresence for CourierConflictPresence {
     }
 }
 
+/// What a conflict eviction did (bsv-low #649 M2): the pass either evicted, or YIELDED to a readmission that
+/// landed under it (the chain's word stands, the pot is served). A yielded pass is neither logged nor counted as an
+/// eviction: it does not stand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictEvictOutcome {
+    Evicted,
+    Yielded,
+}
+
 /// The mutation port: the existing reversible eviction, and (bsv-low #605) the competitor written as the spender of
 /// the outpoint it took, before the eviction releases that outpoint's pointer.
 #[async_trait(?Send)]
 pub trait ConflictEviction {
     /// `repointed`: the outpoints [`Self::record_conflict_spender`] moved to the competitor, which the ledger's
-    /// `releasedSpends` must still name (the E606 lens's M1).
+    /// `releasedSpends` must still name (the E606 lens's M1). Answers whether the eviction stands or yielded
+    /// (bsv-low #649 M2).
     async fn evict_conflict(
         &self,
         txid: &str,
         reason: &str,
         now_ms: u64,
         repointed: &[ReleasedSpend],
-    ) -> Result<(), String>;
+    ) -> Result<ConflictEvictOutcome, String>;
     async fn record_conflict_spender(
         &self,
         outpoint_txid: &str,
@@ -1599,12 +1609,14 @@ impl ConflictEviction for D1Database {
         reason: &str,
         now_ms: u64,
         repointed: &[ReleasedSpend],
-    ) -> Result<(), String> {
+    ) -> Result<ConflictEvictOutcome, String> {
         let result = evict_txid_everywhere_repointed(self, txid, reason, now_ms, repointed).await;
-        if !result.yielded {
-            write_refused_verdict(self, txid, now_ms as i64, reason).await;
+        if result.yielded {
+            // bsv-low #649 M2: the yield is the caller's to know (no eviction log, no eviction counted)
+            return Ok(ConflictEvictOutcome::Yielded);
         }
-        Ok(())
+        write_refused_verdict(self, txid, now_ms as i64, reason).await;
+        Ok(ConflictEvictOutcome::Evicted)
     }
 }
 
@@ -1695,7 +1707,7 @@ pub async fn converge_confirmed_conflict(
             } else {
                 Vec::new()
             };
-            store
+            let outcome = store
                 .evict_conflict(
                     txid,
                     &format!("input {parent}:{vout} spent by confirmed competitor {competitor} at {height}"),
@@ -1703,6 +1715,14 @@ pub async fn converge_confirmed_conflict(
                     &repointed,
                 )
                 .await?;
+            if outcome == ConflictEvictOutcome::Yielded {
+                // bsv-low #649 M2: overtaken by a readmission; the eviction does not stand, so it is neither logged
+                // as one nor counted (the wrapper counted the yield itself, `admit_fast_evict_yielded_total`)
+                crate::proof_fetcher::push_log(&format!(
+                    "[conflict] {txid}: eviction YIELDED to a readmission, {parent}:{vout} taken by {competitor} at {height}; not counted"
+                ));
+                return Ok(false);
+            }
             // one line per eviction (the lens's L2: the miss was logged on its own for every plain funding input)
             crate::proof_fetcher::push_log(&format!(
                 "[conflict] {txid}: evicted, {parent}:{vout} taken by {competitor} at {height}; re-pointed: {}",
@@ -4072,5 +4092,25 @@ mod tests {
             4,
             "the settle's port, the witness job, the watch's SEEN latch and its proof read"
         );
+    }
+
+    /// bsv-low #649 M2 (structural; `e649_m2_*` in `tests/e602_convergence.rs` runs the pass over a yielding port):
+    /// the D1 adapter answers the wrapper's yield as `Yielded` BEFORE any refused memo, never `Ok(())` over it.
+    #[test]
+    fn e649_m2_the_d1_adapter_carries_the_yield() {
+        let src = include_str!("admit_fast.rs");
+        let imp = &src[src.find("impl ConflictEviction for D1Database").unwrap()..];
+        let imp: String = imp[..imp.find("pub async fn converge_confirmed_conflict").unwrap()]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<String>()
+            .split_whitespace()
+            .collect();
+        let y = imp
+            .find("ifresult.yielded{returnOk(ConflictEvictOutcome::Yielded);}")
+            .expect("the D1 adapter answers the yield");
+        let memo = imp.find("write_refused_verdict(").expect("the memo");
+        let ev = imp.find("Ok(ConflictEvictOutcome::Evicted)").expect("the eviction answered");
+        assert!(y < memo && memo < ev, "yield answered first, then the memo, then Evicted");
     }
 }
