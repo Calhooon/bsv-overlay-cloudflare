@@ -2382,7 +2382,7 @@ pub(crate) async fn internal_pot_changed(
         Some(_) => (503, false),
     };
     let mut resp = json_response(
-        serde_json::json!({ "ok": ok, "filed": outcome.filed, "skipped": outcome.skipped, "dropped": dropped, "announce": if ok { "detached" } else { "none" }, "parked": outcome.parked, "retryable": !ok })
+        serde_json::json!({ "ok": ok, "filed": outcome.filed, "skipped": outcome.skipped, "dropped": dropped, "announce": if ok { "detached" } else { "none" }, "parked": outcome.parked, "parkFull": outcome.park_full, "retryable": !ok })
             .to_string(),
         status,
     )?;
@@ -2403,7 +2403,7 @@ pub(crate) async fn internal_pot_announce_drain(
     }
     let t = drain_pot_announce(env).await?;
     json_response(
-        serde_json::json!({ "ok": true, "due": t.due, "drained": t.drained, "skipped": t.skipped, "retryFailed": t.retry_failed, "exhausted": t.exhausted, "swept": t.swept, "faults": t.faults })
+        serde_json::json!({ "ok": true, "rounds": t.rounds, "due": t.due, "drained": t.drained, "skipped": t.skipped, "retryFailed": t.retry_failed, "exhausted": t.exhausted, "aged": t.aged, "swept": t.swept, "faults": t.faults })
             .to_string(),
         200,
     )

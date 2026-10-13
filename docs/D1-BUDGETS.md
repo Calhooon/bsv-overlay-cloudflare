@@ -67,11 +67,12 @@ that starts writing reds); statements measured + 2 (a loop that reads per row ov
 | submit-admit-1 | `/submit`, an operator `historical-tx-no-spv` submit admitting one tm_collected output | 0 / 13 / 7 | 4 / 15 / 9 |
 
 | record-potparty-filing | `/record?kind=potparty`, signed stranger naming A's live pot | 11 / 7 / 6 | 17 / 9 / 8 |
-| pot-changed-hook-1 | `/internal/pot-changed`, B's pot (no decoded params, two marker-named seats) | 7 / 3 / 7 | 11 / 5 / 9 |
-| pot-changed-hook-decoded-8 | `/internal/pot-changed`, A's 8 decoded pots, one latched seat each | 74 / 48 / 25 | 111 / 50 / 27 |
-| pot-changed-hook-marker | `/internal/pot-changed`, the undecoded pot whose markers name 5 identities | 23 / 8 / 10 | 35 / 10 / 12 |
-| pot-changed-hook-8x19 | `/internal/pot-changed`, 7 decoded pots (2 seats each) + the marker pot, 19 identities with owed-state rows | 122 / 71 / 39 | 183 / 73 / 41 |
-| pot-announce-drain | `/internal/pot-announce-drain`, one pass over 24 due and 6 exhausted parked wake-ups | 73 / 33 / 28 | 110 / 35 / 30 |
+| pot-changed-hook-1 | `/internal/pot-changed`, B's pot (no decoded params, two marker-named seats) | 138 / 4 / 8 | 207 / 6 / 10 |
+| pot-changed-hook-decoded-8 | `/internal/pot-changed`, A's 8 decoded pots, one latched seat each | 265 / 49 / 26 | 398 / 51 / 28 |
+| pot-changed-hook-marker | `/internal/pot-changed`, the undecoded pot whose markers name 5 identities | 154 / 9 / 11 | 231 / 11 / 13 |
+| pot-changed-hook-8x19 | `/internal/pot-changed`, 7 decoded pots (2 seats each) + the marker pot, 19 identities with owed-state rows | 337 / 72 / 40 | 506 / 74 / 42 |
+| pot-announce-drain-backlog | `/internal/pot-announce-drain`, the first pass over a backlog of 120 due and 6 exhausted parked wake-ups (four rounds of 24) | 220 / 105 / 104 | 330 / 107 / 106 |
+| pot-announce-drain | `/internal/pot-announce-drain`, the second pass over the 24 due left (two rounds, the second reads none) | 55 / 25 / 29 | 110 / 35 / 31 |
 
 E649 L4 (2026-10-13, lane E649-HOOK): the pot hook's own answer is held to a ceiling (it had none: leg 4 checked
 only that it carried a `d1` segment). Measured with `D1_BUDGET_MEASURE=1 make ci-d1-budget` on the fixture D1:
@@ -92,6 +93,16 @@ one batch per arm: decoded-8 reads no arm; 8x19 reads the three arms over its on
 statement of decoded-8 and 8x19 is the seat-marker read over the decoded pots (66 and 92 rows). Not measured here:
 a body of eight marker-only outpoints (the review's 32 + 19 statement shape; with H2 it is 8 + 3 x 8 reads and one
 write batch) and a marker skewed by 1,000 planted identities (the review's probe; data-sensitive on the base too).
+
+E649 L4 fold-2 (2026-10-13, the delta review's N1 and N3): every hook write batch with a park now opens with ONE
+statement on the one-row `pot_announce_seq` (the park tokens, N1; one write) that reads the parked table's room
+under its ceiling once, a LIMITed scan of at most 2,048 rows (N3); each park reads the counter's row. At this
+fixture's 126 parked rows that scan is the largest statement of every hook scenario (127 rows read), so the hook
+reads grow by about the parked rows: at a FULL table a hook reads up to 2,048 more rows (about $0.000002 a hook at
+D1's read price), where a row count kept by triggers would have cost two row WRITES per park and delivery (a
+thousand times the price per row). The drain takes rounds while the backlog fills them (N3):
+`pot-announce-drain-backlog` measures four rounds of 24 (104 statements, 24 rows at most per statement), the
+second pass two (the full round, then a read of none).
 
 NS2 fold (2026-10-12): the real signed filing is measured under `/record`, including the pot stale mark and the
 filer mark. SHED-M1 removes the three indexed party enumeration reads entirely; named parties do no work until

@@ -117,81 +117,97 @@
       "censusKey": "/record"
     },
     "pot-changed-hook-1": {
-      "route": "/internal/pot-changed: B's pot, one outpoint, no decoded params, its two marker-named seats marked stale (E649 L4: the required read, the marker arms one batch each, ONE write batch of the stale marks and the outpoint's parked wake-up (H1); no walk, no relay call on the answer path)",
+      "route": "/internal/pot-changed: B's pot, one outpoint, no decoded params, its two marker-named seats marked stale (E649 L4: the required read, the marker arms one batch each, ONE write batch of the stale marks and the outpoint's parked wake-up (H1); no walk, no relay call on the answer path; the park batch reads the table's room ONCE, one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
       "measured": {
-        "reads": 7,
-        "writes": 3,
-        "stmts": 7,
-        "maxReads": 6
+        "reads": 138,
+        "writes": 4,
+        "stmts": 8,
+        "maxReads": 127
       },
       "ceiling": {
-        "reads": 11,
-        "writes": 5,
-        "stmts": 9,
-        "maxReads": 11
+        "reads": 207,
+        "writes": 6,
+        "stmts": 10,
+        "maxReads": 191
       },
       "censusKey": null
     },
     "pot-changed-hook-decoded-8": {
-      "route": "/internal/pot-changed: A's eight decoded pots, one latched seat each (E649 L4 M1, the decoded maximum body: one required batch of 8, the seat markers' batch, ONE write batch of 16 parked wake-ups; no marker arm is read)",
+      "route": "/internal/pot-changed: A's eight decoded pots, one latched seat each (E649 L4 M1, the decoded maximum body: one required batch of 8, the seat markers' batch, ONE write batch of 16 parked wake-ups; no marker arm is read; the park batch reads the table's room ONCE, one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
       "measured": {
-        "reads": 74,
-        "writes": 48,
-        "stmts": 25,
-        "maxReads": 66
+        "reads": 265,
+        "writes": 49,
+        "stmts": 26,
+        "maxReads": 127
       },
       "ceiling": {
-        "reads": 111,
-        "writes": 50,
-        "stmts": 27,
-        "maxReads": 99
+        "reads": 398,
+        "writes": 51,
+        "stmts": 28,
+        "maxReads": 191
       },
       "censusKey": null
     },
     "pot-changed-hook-marker": {
-      "route": "/internal/pot-changed: the fixture's undecoded pot whose party and refund-backup markers name five identities with owed-state rows (E649 L4 M1, the marker fallback: the required read, three arm batches, ONE write batch of five stale marks and one park)",
+      "route": "/internal/pot-changed: the fixture's undecoded pot whose party and refund-backup markers name five identities with owed-state rows (E649 L4 M1, the marker fallback: the required read, three arm batches, ONE write batch of five stale marks and one park; the park batch reads the table's room ONCE, one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
       "measured": {
-        "reads": 23,
-        "writes": 8,
-        "stmts": 10,
-        "maxReads": 12
+        "reads": 154,
+        "writes": 9,
+        "stmts": 11,
+        "maxReads": 127
       },
       "ceiling": {
-        "reads": 35,
-        "writes": 10,
-        "stmts": 12,
-        "maxReads": 18
+        "reads": 231,
+        "writes": 11,
+        "stmts": 13,
+        "maxReads": 191
       },
       "censusKey": null
     },
     "pot-changed-hook-8x19": {
-      "route": "/internal/pot-changed: seven decoded pots with two latched seats each and the marker pot naming five, 19 identities each with an owed-state row (E649 L4 M1, the review's H2 body: required batch of 8, seat markers, three arm batches over the one marker outpoint, ONE write batch of 5 stale marks and 22 parks)",
+      "route": "/internal/pot-changed: seven decoded pots with two latched seats each and the marker pot naming five, 19 identities each with an owed-state row (E649 L4 M1, the review's H2 body: required batch of 8, seat markers, three arm batches over the one marker outpoint, ONE write batch of 5 stale marks and 22 parks; the park batch reads the table's room ONCE, one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
       "measured": {
-        "reads": 122,
-        "writes": 71,
-        "stmts": 39,
-        "maxReads": 92
+        "reads": 337,
+        "writes": 72,
+        "stmts": 40,
+        "maxReads": 127
       },
       "ceiling": {
-        "reads": 183,
-        "writes": 73,
-        "stmts": 41,
-        "maxReads": 138
+        "reads": 506,
+        "writes": 74,
+        "stmts": 42,
+        "maxReads": 191
+      },
+      "censusKey": null
+    },
+    "pot-announce-drain-backlog": {
+      "route": "/internal/pot-announce-drain: the first pass over the fixture's backlog of 120 due and 6 exhausted parked wake-ups (E649 L4 N3: four rounds, each the due read, LIMIT 24, then ONE write batch of its 24 settles; the first round's batch also ages out (LIMIT 50) and sweeps (LIMIT 50))",
+      "measured": {
+        "reads": 220,
+        "writes": 105,
+        "stmts": 104,
+        "maxReads": 24
+      },
+      "ceiling": {
+        "reads": 330,
+        "writes": 107,
+        "stmts": 106,
+        "maxReads": 36
       },
       "censusKey": null
     },
     "pot-announce-drain": {
-      "route": "/internal/pot-announce-drain: one drain pass over the fixture's 24 due and 6 exhausted parked wake-ups (E649 L4 H1: the due read, LIMIT 24, then ONE write batch of 24 settles and the sweep, LIMIT 50)",
+      "route": "/internal/pot-announce-drain: the second pass, over the 24 due wake-ups the backlog pass left (E649 L4 H1, N3: the due read, LIMIT 24, ONE write batch of 24 settles, the age-out and the sweep; the round was full, so one more due read finds none)",
       "measured": {
-        "reads": 73,
-        "writes": 33,
-        "stmts": 28,
+        "reads": 55,
+        "writes": 25,
+        "stmts": 29,
         "maxReads": 24
       },
       "ceiling": {
         "reads": 110,
         "writes": 35,
-        "stmts": 30,
+        "stmts": 31,
         "maxReads": 36
       },
       "censusKey": null
