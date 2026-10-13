@@ -471,6 +471,29 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   const unauth = await get(APP, '/internal/pot-announce-drain', { method: 'POST' })
   if (unauth.status === 401) pass('pot-announce-drain refuses without the bearer')
   else fail('pot-announce-drain refuses without the bearer', `${unauth.status}`)
+  // E649 L4 N6 (fold-3): the ceiling held for the batch WHOLE. The table filled to 2,048 rows of live wake-ups that
+  // failed no delivery yet (none may be displaced): a body of eight new rooms is refused whole (503, retryable,
+  // nothing written). Eight rows then made exhausted: the same body parks all eight, the room made of them.
+  const crate = fileURLToPath(new URL('../../crates/low-app-layer/', import.meta.url))
+  const sql = (command) => execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', process.env.D1_BUDGET_STATE, '--command', command], { cwd: crate, timeout: 30_000, stdio: 'pipe' })
+  sql("WITH RECURSIVE k(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM k WHERE i + 1 < 2048) INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) SELECT printf('e64f%060x:0', i), 'room', '', 1, 0, 9000000000000, 1, NULL FROM k WHERE i < 2048 - (SELECT COUNT(*) FROM pot_announce_parked)")
+  const fresh = Array.from({ length: 8 }, (_, i) => ({ txid: 'e64e' + i.toString(16).padStart(60, '0'), vout: 0 }))
+  const refused = await hook(fresh)
+  const rb = refused.status === 503 ? JSON.parse(refused.text) : null
+  if (rb && rb.retryable === true && rb.parked === 0 && rb.parkFull === 8 && rb.announce === 'none') pass('pot-changed-hook-full-refused: refused whole at 2,048 rows, 503 retryable, nothing announced')
+  else fail('pot-changed-hook-full-refused: refused whole', `${refused.status}: ${refused.text.slice(0, 300)}`)
+  check('pot-changed-hook-full-refused', segment(refused.timing, 'd1'))
+  sql("UPDATE pot_announce_parked SET exhausted_at_ms = 1 WHERE rowid IN (SELECT rowid FROM pot_announce_parked WHERE outpoint LIKE 'e64f%' ORDER BY outpoint LIMIT 8)")
+  const room = await hook(fresh)
+  const ob = room.status === 200 ? JSON.parse(room.text) : null
+  // the detached announce (not configured here) settles the eight as delivered at once: what is left to read is that
+  // the eight exhausted rows made the room and the table never passed its ceiling
+  const one = (q) => Number(Object.values(JSON.parse(execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', process.env.D1_BUDGET_STATE, '--json', '--command', q], { cwd: crate, timeout: 30_000, stdio: 'pipe' }).toString())[0].results[0])[0])
+  const exhaustedLeft = one("SELECT COUNT(*) AS n FROM pot_announce_parked WHERE exhausted_at_ms IS NOT NULL AND outpoint LIKE 'e64f%'")
+  const count = one('SELECT COUNT(*) AS n FROM pot_announce_parked')
+  if (ob && ob.parked === 8 && ob.parkFull === 0 && exhaustedLeft === 0 && count <= 2048) pass(`pot-changed-hook-full-room: eight exhausted rows make the room, all eight parked, the table at ${count} <= 2,048`)
+  else fail('pot-changed-hook-full-room: room made of exhausted rows', `${room.status} exhaustedLeft=${exhaustedLeft} count=${count}: ${room.text.slice(0, 300)}`)
+  check('pot-changed-hook-full-room', segment(room.timing, 'd1'))
 }
 
 // NS-3: the real Worker reads compact rows with zero courier calls and

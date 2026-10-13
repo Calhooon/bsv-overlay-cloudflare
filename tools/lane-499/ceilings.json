@@ -117,12 +117,12 @@
       "censusKey": "/record"
     },
     "pot-changed-hook-1": {
-      "route": "/internal/pot-changed: B's pot, one outpoint, no decoded params, its two marker-named seats marked stale (E649 L4: the required read, the marker arms one batch each, ONE write batch of the stale marks and the outpoint's parked wake-up (H1); no walk, no relay call on the answer path; the park batch reads the table's room ONCE, one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
+      "route": "/internal/pot-changed: B's pot, one outpoint, no decoded params, its two marker-named seats marked stale (E649 L4: the required read, the marker arms one batch each, ONE write batch of the stale marks and the outpoint's parked wake-up (H1); no walk, no relay call on the answer path; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
       "measured": {
-        "reads": 138,
+        "reads": 143,
         "writes": 4,
-        "stmts": 8,
-        "maxReads": 127
+        "stmts": 10,
+        "maxReads": 128
       },
       "ceiling": {
         "reads": 207,
@@ -133,12 +133,12 @@
       "censusKey": null
     },
     "pot-changed-hook-decoded-8": {
-      "route": "/internal/pot-changed: A's eight decoded pots, one latched seat each (E649 L4 M1, the decoded maximum body: one required batch of 8, the seat markers' batch, ONE write batch of 16 parked wake-ups; no marker arm is read; the park batch reads the table's room ONCE, one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
+      "route": "/internal/pot-changed: A's eight decoded pots, one latched seat each (E649 L4 M1, the decoded maximum body: one required batch of 8, the seat markers' batch, ONE write batch of 16 parked wake-ups; no marker arm is read; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
       "measured": {
-        "reads": 265,
+        "reads": 270,
         "writes": 49,
-        "stmts": 26,
-        "maxReads": 127
+        "stmts": 28,
+        "maxReads": 143
       },
       "ceiling": {
         "reads": 398,
@@ -149,12 +149,12 @@
       "censusKey": null
     },
     "pot-changed-hook-marker": {
-      "route": "/internal/pot-changed: the fixture's undecoded pot whose party and refund-backup markers name five identities with owed-state rows (E649 L4 M1, the marker fallback: the required read, three arm batches, ONE write batch of five stale marks and one park; the park batch reads the table's room ONCE, one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
+      "route": "/internal/pot-changed: the fixture's undecoded pot whose party and refund-backup markers name five identities with owed-state rows (E649 L4 M1, the marker fallback: the required read, three arm batches, ONE write batch of five stale marks and one park; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
       "measured": {
-        "reads": 154,
+        "reads": 159,
         "writes": 9,
-        "stmts": 11,
-        "maxReads": 127
+        "stmts": 13,
+        "maxReads": 128
       },
       "ceiling": {
         "reads": 231,
@@ -165,12 +165,12 @@
       "censusKey": null
     },
     "pot-changed-hook-8x19": {
-      "route": "/internal/pot-changed: seven decoded pots with two latched seats each and the marker pot naming five, 19 identities each with an owed-state row (E649 L4 M1, the review's H2 body: required batch of 8, seat markers, three arm batches over the one marker outpoint, ONE write batch of 5 stale marks and 22 parks; the park batch reads the table's room ONCE, one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
+      "route": "/internal/pot-changed: seven decoded pots with two latched seats each and the marker pot naming five, 19 identities each with an owed-state row (E649 L4 M1, the review's H2 body: required batch of 8, seat markers, three arm batches over the one marker outpoint, ONE write batch of 5 stale marks and 22 parks; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
       "measured": {
-        "reads": 337,
+        "reads": 342,
         "writes": 72,
-        "stmts": 40,
-        "maxReads": 127
+        "stmts": 42,
+        "maxReads": 149
       },
       "ceiling": {
         "reads": 506,
@@ -209,6 +209,38 @@
         "writes": 35,
         "stmts": 31,
         "maxReads": 36
+      },
+      "censusKey": null
+    },
+    "pot-changed-hook-full-refused": {
+      "route": "/internal/pot-changed: eight new rooms at a FULL table of 2,048 live rows none of which may be displaced (E649 L4 N6, fold-3: the batch's eight parks, the counter's one LIMITed scan of at most 2,056 rows, the guard over the rows that may make room (none), which faults and rolls the batch back; answered 503. D1 answers a FAILED batch with no meta, so the ledger counts the reads before it only: the batch's own scan, up to 2,056 rows, is real and unmeasured here)",
+      "measured": {
+        "reads": 16,
+        "writes": 2,
+        "stmts": 33,
+        "maxReads": 2
+      },
+      "ceiling": {
+        "reads": 24,
+        "writes": 4,
+        "stmts": 35,
+        "maxReads": 3
+      },
+      "censusKey": null
+    },
+    "pot-changed-hook-full-room": {
+      "route": "/internal/pot-changed: the same eight rooms once eight rows are exhausted (E649 L4 N6, fold-3: eight parks, the counter's scan, the guard reading the eight exhausted rows, the room-making delete of them, ordered, RETURNING)",
+      "measured": {
+        "reads": 4206,
+        "writes": 35,
+        "stmts": 44,
+        "maxReads": 2097
+      },
+      "ceiling": {
+        "reads": 6309,
+        "writes": 37,
+        "stmts": 46,
+        "maxReads": 3146
       },
       "censusKey": null
     }
