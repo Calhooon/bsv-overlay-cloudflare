@@ -2836,3 +2836,10 @@ A `result` filing refreshes nobody (its identity is `None`, as on main); the hon
 `potparty` / `potrefund` / `collected` / `held` / `hopsweep` filings and the settle hooks (NOTE-B).
 A faulted retry stops and counts `owed_recompute_deferred_abandoned_total`; the identity's next read past the
 window repairs the stale or absent snapshot. One actor per identity/isolate merges carried and new reservations.
+NOTE-C: deleteAll() preserves the alarm at compatibility date `2024-12-01` (the app-layer's pinned date).
+workers-rs 0.8.5 `Storage::delete_all` delegates directly to the JS `deleteAll()` call; Cloudflare changed
+both KV and SQLite backends to delete the alarm only at dates `2026-02-24` or later
+([compatibility change](https://developers.cloudflare.com/changelog/post/2026-02-24-deleteall-deletes-alarms/)).
+The workerd DO pin sets an alarm, deletes all keys, and observes the alarm still set at the configured date.
+The folded cleanup sets its tombstone alarm AFTER delete_all and retains only the consumed deadline until
+that alarm removes it; its correctness no longer depends on the old alarm surviving deleteAll().
