@@ -20,7 +20,7 @@
    "low-app-layer-beta"
   ],
   "overlay-discovery": [
-   "a library linked into both workers; it issues no SQL"
+   "a library linked into both workers; it issues no SQL, and its one statement text (pot::storage::evictions_by_txid_sql, a read of pot_evictions) is issued by the workers"
   ]
  },
  "databases": [
@@ -725,7 +725,8 @@
    "owner": "overlay-cloudflare",
    "writers": {},
    "readers": [
-    "low-app-layer"
+    "low-app-layer",
+    "overlay-discovery"
    ],
    "rebuild_class": "lost",
    "never_wipe": true,
