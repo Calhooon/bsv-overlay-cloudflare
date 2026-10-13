@@ -147,6 +147,17 @@ mod tests {
         assert_eq!(health_json()["tracker_events_index_shipped_total"], 1);
     }
     #[test]
+    fn ns3d2_note3_submit_route_passes_mode_and_real_steak_admission() {
+        let routes = include_str!("routes.rs");
+        let at = routes.find("crate::tracker_events::note_submit(").unwrap();
+        let call = &routes[at..at + routes[at..].find("\n    }").unwrap()];
+        assert!(call.contains("gated_subject.is_some()"), "submit route replaced the gated mode with a constant");
+        assert!(call.contains("steak.values().any(|a|"), "submit route replaced admission with a constant");
+        for field in ["!a.outputs_to_admit.is_empty()", "!a.coins_to_retain.is_empty()", "a.coins_removed", ".is_some_and(|coins| !coins.is_empty())"] {
+            assert!(call.contains(field), "submit admission omits {field}");
+        }
+    }
+    #[test]
     fn ns3d_m3_ungated_stranger_submit_leaves_no_word_event() {
         drain();
         // historical-tx-no-spv under the lenient window, even if its marker was admitted.
