@@ -910,6 +910,17 @@
    "why": "a skipped flush's notes were in one isolate's memory only and a lone eviction could lose its push for good; a lost row costs one push the felt's own reads recover; transient"
   },
   {
+   "name": "change_parked_seq",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "one row: the last token the change park handed out (bsv-low #649 D3-M1), taken by the park's own batch, so a row's generation is never reused for its key",
+   "why": "a counter only, the convention of the app layer's pot_announce_seq: a wipe re-seeds it from the clock (times 2,048, one second ahead) at the next park; transient"
+  },
+  {
    "name": "ef_deferred_sweep",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

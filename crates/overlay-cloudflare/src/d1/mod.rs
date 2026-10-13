@@ -512,7 +512,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 222 → 223 for bsv-low #649 N1: `change_parked.generation`, so a delivery deletes only the intent it read.
 /// 223 → 226 for bsv-low #649 N2: `change_parked`'s retry state (attempts, next eligibility, exhausted).
 /// 226 → 227 for bsv-low #649 N3: `change_parked_drain`, the index of the drain's order.
-pub const OVERLAY_MIGRATION_COUNT: usize = 227;
+/// 227 → 228 for bsv-low #649 D3-M1: `change_parked_seq`, the one-row counter the park's tokens are taken from.
+pub const OVERLAY_MIGRATION_COUNT: usize = 228;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1884,6 +1885,8 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::change_park::CHANGE_PARKED_ADD_EXHAUSTED,
     // bsv-low #649 N3: the drain's order, served by an index (no temp B-tree, no whole-set scan).
     crate::change_park::CHANGE_PARKED_DRAIN_INDEX,
+    // bsv-low #649 D3-M1: the park tokens' one-row counter (a token never reused, never derived from a clock).
+    crate::change_park::CHANGE_PARKED_SEQ_CREATE,
 
 ];
 
