@@ -410,12 +410,12 @@ async fn mixed_success_and_failure() {
 
     // Should succeed — bad UTXO is skipped, good ones sync.
     gasp.sync(None).await.unwrap();
-    // The cursor is CAPPED at 199 — strictly below the failed `bad`@200 — so the
-    // next sync (`since=199`) re-pulls `bad`. Were it left at 300 (the highest
+    // The cursor stays at the completed score 100, below failed `bad`@200, so
+    // the next sync (`since=100`) re-pulls `bad`. Were it left at 300 (the highest
     // SEEN score), `bad` would be permanently stranded: the peer serves
     // `score >= since`, so `bad`@200 < 300 would never be re-served. Proven by
     // the zanaadu `parity-harness` GASP chaos suite (#43).
-    assert_eq!(gasp.last_interaction, 199);
+    assert_eq!(gasp.last_interaction, 100);
 }
 
 // ============================================================================

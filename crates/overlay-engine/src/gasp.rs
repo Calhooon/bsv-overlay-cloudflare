@@ -22,6 +22,13 @@ pub const GASP_VERSION: u32 = 1;
 /// Default sync limit per page.
 pub const DEFAULT_GASP_SYNC_LIMIT: u64 = 10000;
 
+/// Pull 100 outputs per request under the Worker's 30-second peer budget.
+/// Reference: overlay-services@480d77a src/Engine.ts:29,895 requests 10,000
+/// through src/GASP/OverlayGASPRemote.ts. Smaller requests bound each reply
+/// and allow a slow peer's completed prefix to persist across ticks.
+/// The responder's default stays unchanged for wire compatibility.
+pub const ENGINE_GASP_SYNC_PAGE_LIMIT: u64 = 100;
+
 // ============================================================================
 // Per-peer sync budgets + dead-peer quarantine (bsv-low#302)
 // ============================================================================
@@ -1283,7 +1290,8 @@ impl<'a> GASPSync<'a> {
 
     /// The cursor that is safe to persist if `sync` stopped RIGHT NOW (its
     /// future dropped at a deadline; bsv-low #552). It is the gap guard's
-    /// rule applied to unfinished work: strictly below the lowest score of
+    /// rule applied to completed scores: never above a completed output, and
+    /// strictly below the lowest score of
     /// any UTXO of the current page not yet completed (the one in flight
     /// included) and of any UTXO whose ingest failed, never below the cursor
     /// the sync entered with. The remote serves `score >= since`, so the next
@@ -1304,13 +1312,19 @@ impl<'a> GASPSync<'a> {
         self.graph_in_flight
     }
 
-    /// `cursor` capped strictly below `lowest_unfinished`, floored at `floor`:
-    /// the gap guard's arithmetic, shared with [`Self::completed_cursor`].
-    fn capped_below(cursor: u64, lowest_unfinished: Option<u64>, floor: u64) -> u64 {
-        match lowest_unfinished {
-            Some(score) => cursor.min(score.saturating_sub(1).max(floor)),
-            None => cursor,
-        }
+    /// Highest completed score below every gap, floored at the entry cursor.
+    /// Retaining scores handles unordered pages without inventing a cursor
+    /// between outputs or skipping an unfinished member of a score tie.
+    fn cursor_for_completed(
+        completed: &std::collections::BTreeSet<u64>,
+        lowest_unfinished: Option<u64>,
+        floor: u64,
+    ) -> u64 {
+        let highest = match lowest_unfinished {
+            Some(score) => completed.range(..score).next_back(),
+            None => completed.iter().next_back(),
+        };
+        highest.copied().unwrap_or(floor).max(floor)
     }
 
     /// How many graphs this orchestrator's last `sync` discarded because
@@ -1425,6 +1439,7 @@ impl<'a> GASPSync<'a> {
         // below it (a failed RE-ingest of an already-synced range is not a new
         // gap), and the gap-guard below is floored at it.
         let initial_interaction = self.last_interaction;
+        let mut completed_scores = std::collections::BTreeSet::new();
         // Lowest score of any UTXO whose graph ingest FAILED this run. The
         // in-loop `last_interaction` advance below is by max-seen-score so
         // pagination terminates, but a transient ingest failure must NOT let the
@@ -1455,8 +1470,11 @@ impl<'a> GASPSync<'a> {
             let cursor_before_page = self.last_interaction;
             // Every UTXO seen so far is completed or failed: were the sync
             // dropped inside the page request below, this is what it did.
-            self.completed_cursor =
-                Self::capped_below(self.last_interaction, min_failed_score, initial_interaction);
+            self.completed_cursor = Self::cursor_for_completed(
+                &completed_scores,
+                min_failed_score,
+                initial_interaction,
+            );
             let request = GASPInitialRequest {
                 version: GASP_VERSION,
                 since: self.last_interaction,
@@ -1477,6 +1495,15 @@ impl<'a> GASPSync<'a> {
             for i in (0..lowest_ahead.len().saturating_sub(1)).rev() {
                 lowest_ahead[i] = lowest_ahead[i].min(lowest_ahead[i + 1]);
             }
+
+            // The request may have returned an unordered page. Hold below all
+            // its unfinished outputs before any graph or storage await.
+            let unfinished = match lowest_ahead.as_slice() {
+                [lowest, ..] => Some(min_failed_score.map_or(*lowest, |score| score.min(*lowest))),
+                [] => min_failed_score,
+            };
+            self.completed_cursor =
+                Self::cursor_for_completed(&completed_scores, unfinished, initial_interaction);
 
             for (position, utxo) in response.utxo_list.iter().enumerate() {
                 // Track highest score for pagination
@@ -1499,8 +1526,8 @@ impl<'a> GASPSync<'a> {
                     // New UTXO — request and ingest the graph
                     let lowest_unfinished = min_failed_score
                         .map_or(lowest_ahead[position], |f| f.min(lowest_ahead[position]));
-                    self.completed_cursor = Self::capped_below(
-                        self.last_interaction,
+                    self.completed_cursor = Self::cursor_for_completed(
+                        &completed_scores,
                         Some(lowest_unfinished),
                         initial_interaction,
                     );
@@ -1524,7 +1551,7 @@ impl<'a> GASPSync<'a> {
                     };
                     match ingested {
                         Ok(true) => {
-                            shared_outpoints.insert(outpoint);
+                            shared_outpoints.insert(outpoint.clone());
                         }
                         // bsv-low #555: DEFERRED, its walk saved (or a
                         // record held back for the next sync, M1). Held
@@ -1534,7 +1561,7 @@ impl<'a> GASPSync<'a> {
                         Ok(false) => {
                             let s = utxo.score as u64;
                             min_failed_score = Some(min_failed_score.map_or(s, |cur| cur.min(s)));
-                            failed_outpoints.insert(outpoint);
+                            failed_outpoints.insert(outpoint.clone());
                         }
                         Err(e) => {
                             warn!(
@@ -1546,11 +1573,30 @@ impl<'a> GASPSync<'a> {
                             let s = utxo.score as u64;
                             min_failed_score = Some(min_failed_score.map_or(s, |cur| cur.min(s)));
                             // Not again in this sync (bsv-low #554).
-                            failed_outpoints.insert(outpoint);
+                            failed_outpoints.insert(outpoint.clone());
                         }
                     }
                 }
+                // Known outputs and graphs whose finalize hook landed are
+                // settled. Explicit anchor refusals retain the existing
+                // terminal-discard rule; deferred, held and faulted graphs
+                // remain gaps until a later pass completes them.
+                if shared_outpoints.contains(&outpoint) {
+                    completed_scores.insert(utxo.score as u64);
+                }
+                let unfinished = lowest_ahead
+                    .get(position + 1)
+                    .copied()
+                    .into_iter()
+                    .chain(min_failed_score)
+                    .min();
+                self.completed_cursor =
+                    Self::cursor_for_completed(&completed_scores, unfinished, initial_interaction);
             }
+
+            // Keep the settled frontier and any completed scores above a gap.
+            // An advancing page needs no older score again.
+            completed_scores.retain(|score| *score >= self.completed_cursor);
 
             // Pagination termination (bsv-low #291 gate findings M1/LOW-A):
             // keep paging on ANY page that advanced the score cursor —
@@ -1584,17 +1630,17 @@ impl<'a> GASPSync<'a> {
         // (the remote serves `score >= since`). Floored at `initial_interaction`
         // so the cursor never regresses — a failure within the already-synced
         // range is not a new gap and must not rewind the cursor.
+        self.completed_cursor =
+            Self::cursor_for_completed(&completed_scores, min_failed_score, initial_interaction);
         if let Some(failed) = min_failed_score {
-            let cap = failed.saturating_sub(1).max(initial_interaction);
-            if self.last_interaction > cap {
+            if self.last_interaction > self.completed_cursor {
                 warn!(
                     "{} Capping cursor {} -> {} (transient ingest failure at score {}); next sync will re-pull",
-                    self.log_prefix, self.last_interaction, cap, failed
+                    self.log_prefix, self.last_interaction, self.completed_cursor, failed
                 );
-                self.last_interaction = cap;
             }
         }
-        self.completed_cursor = self.last_interaction;
+        self.last_interaction = self.completed_cursor;
 
         // bsv-low #555: a record whose UTXO a sync that ran to its end was
         // not served (spent at the peer, or no longer listed): nothing will
@@ -2459,33 +2505,18 @@ impl<'a> GASPSync<'a> {
     /// The root's own proof, hydrated by the ancestor fetcher when the peer
     /// served it with none.
     async fn hydrate_root(&self, mut node: GASPNode) -> GASPNode {
-        // GOD-TIER proof-anchoring (#126): if the peer served this node WITHOUT
-        // a merkle proof but the tx is mined, hydrate its OWN proof via the
-        // ancestor fetcher (WoC `/beef`). A proven node ends the walk UNLESS
-        // its topic manager names inputs needed for overlay history. Managers
-        // naming nothing still avoid the spent prior contract-state (a
-        // 2-tx-pattern template, or a covenant's previous UTXO). Without this,
-        // the walk reaches a spent input whose output
-        // record exists in storage (so `find_needed_inputs` strips it) but whose tx
-        // is absent from the in-memory graph, so the node's BEEF fails "Missing
-        // source transaction" and the whole graph is discarded. Legacy beta's
-        // GASP-serve omits proofs, so this is required cross-stack. No-op when no
-        // fetcher is configured (production default unchanged) or the node already
-        // carries a proof (children fetched via the walk already do).
-        // Only the GRAPH ROOT arrives from the peer (spent_by == None); children
-        // come from the ancestry walk already carrying their proofs, so gate on
-        // the root to avoid redundant re-fetches.
+        // The peer already supplied the raw. Ask our proof source for only
+        // its verified BUMP, inside the graph and peer deadlines. Production
+        // re-verifies courier proofs against CHAINTRACKS; the graph's anchor
+        // check still runs before any admission. A resumed proofless root
+        // takes this path too, so a kept graph can land once its proof exists.
         if node.proof.is_none() {
             if let Some(fetcher) = &self.ancestor_fetcher {
                 if let Some(node_txid) =
                     Self::node_id(&node).and_then(|id| parse_outpoint(&id).map(|(txid, _)| txid))
                 {
                     self.count_call();
-                    if let Ok(root_fetch) = fetcher.fetch_ancestor(&node_txid).await {
-                        if root_fetch.proof.is_some() {
-                            node.proof = root_fetch.proof;
-                        }
-                    }
+                    node.proof = fetcher.verified_proof_for(&node_txid).await;
                 }
             }
         }

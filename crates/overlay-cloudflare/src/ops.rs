@@ -520,6 +520,24 @@ pub async fn record_completion_tick(
         worker::console_log!("[ops] heartbeat upsert failed: {e}");
     }
 
+    record_completion_results(
+        db,
+        proofs_completed,
+        fetch_failed,
+        pot_beefs_compacted,
+        spends_confirmed,
+    )
+    .await;
+}
+
+/// Add results from later maintenance without stamping a second tick heartbeat.
+pub async fn record_completion_results(
+    db: &D1Database,
+    proofs_completed: u64,
+    fetch_failed: u64,
+    pot_beefs_compacted: u64,
+    spends_confirmed: u64,
+) {
     // Persistent monotonic counters (additive upsert).
     for (name, delta) in [
         (COUNTER_PROOFS_COMPLETED, proofs_completed),
