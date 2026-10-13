@@ -9033,56 +9033,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ns2_faulted_alarm_clears_storage_and_rearms_next_window() {
-        let code = include_str!("board_view.rs");
-        let alarm = &code
-            [code.find("async fn alarm(&self)").unwrap()..code.find("impl BoardView {").unwrap()];
-        assert!(
-            alarm.contains("owed_clear_consumed_arm().await?"),
-            "SHED-L1: fault must clear arm storage"
-        );
-        assert!(code.contains("storage.delete_all().await?"));
-        assert!(
-            alarm.contains("note_recompute_deferred_faulted"),
-            "SHED-L1: count the fault"
-        );
-        assert!(
-            alarm.contains("owed_rearm_faulted_deferred"),
-            "SHED-L1: rearm once for next window"
-        );
-        assert!(
-            alarm.contains("owed_alarm_not_due().await?"),
-            "SHED-L1: a duplicate old alarm cannot run the next reservation early"
-        );
-        assert!(
-            alarm.find("owed-started").unwrap()
-                < alarm.find("owed_deferred_walk_and_push").unwrap()
-        );
+    fn ns2_fault_retry_deadline_always_enters_a_later_window() {
         assert_eq!(owed_fault_retry_due(61_000, 61_001), 121_000);
         assert_eq!(owed_fault_retry_due(61_000, 120_999), 121_000);
         assert_eq!(owed_fault_retry_due(61_000, 121_000), 181_000);
-        assert!(owed_health_json()["owed_recompute_deferred_faulted_total"].is_u64());
-    }
-
-    #[test]
-    fn ns2_failed_arm_is_counted_and_next_read_repairs_a_snapshotless_shed() {
-        assert!(
-            owed_health_json()["owed_recompute_arm_failed_total"].is_u64(),
-            "SHED-L2: refused storage arm must be counted"
-        );
-        let mut rate = RecomputeRate::default();
-        for at in 1_000..1_012 {
-            assert!(rate.admit(ME, at, true));
-        }
-        assert!(!rate.admit(ME, 20_000, true));
-        let due = rate.arm_deferred(ME, 20_000).unwrap();
-        rate.unarm_deferred(ME, due);
-        assert!(
-            rate.admit(ME, due + 1, false),
-            "next-window first read repairs the last failed arm"
-        );
-        assert_eq!(rate.in_window(ME, due + 1), 1);
-        assert!(include_str!("routes.rs").contains("note_recompute_arm_failed();"));
     }
 
     #[test]
@@ -9098,26 +9052,5 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn ns2_snapshotless_first_read_uses_the_single_reserved_walk() {
-        let read = include_str!("routes.rs");
-        assert!(
-            read.contains("owed_first_read_reserved"),
-            "NOTE-3: first read past ceiling must walk instead of shedding 503"
-        );
-        let actor = include_str!("board_view.rs");
-        assert!(
-            actor.contains("owed_compute_on_read"),
-            "the reserved read uses the same compute"
-        );
-        assert!(
-            actor.contains("first_party_push"),
-            "consuming the alarm reservation retains its own-identity push"
-        );
-        assert!(actor.contains("storage.put(\"owed-started\", true).await?"));
-        assert!(
-            actor.contains("first read reservation already consumed"),
-            "first-read faults cannot spend a second reserved walk"
-        );
-    }
+
 }

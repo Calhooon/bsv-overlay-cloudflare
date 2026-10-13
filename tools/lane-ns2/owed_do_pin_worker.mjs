@@ -2,7 +2,26 @@
 // Only the clock and one refused storage.put are controlled; no production route exposes these levers.
 import worker, { BoardView, AuthSessionStore } from '../../crates/low-app-layer/build/worker/shim.mjs'
 export { AuthSessionStore }
-export default worker
+const refusals = new Set()
+const objects = new Map()
+const NativeDate = Date
+let clockOffset = 0
+globalThis.Date = class extends NativeDate {
+  constructor(...args) { super(...(args.length ? args : [NativeDate.now() + clockOffset])) }
+  static now() { return NativeDate.now() + clockOffset }
+}
+export default class PinWorker extends worker {
+  fetch(req) {
+    const url = new URL(req.url)
+    if (url.pathname === '/pin/refuse') { refusals.add(url.searchParams.get('identity')); return new Response('next arm write refused') }
+    if (url.pathname === '/pin/route-alarm') {
+      const id = objects.get(url.searchParams.get('identity'))
+      return this.env.BOARD_VIEW.get(this.env.BOARD_VIEW.idFromString(id)).fetch('http://pin/pin/alarm')
+    }
+    if (url.pathname === '/pin/advance-clock') { clockOffset += 61000; return new Response('next window') }
+    return super.fetch(req)
+  }
+}
 export class OwedPin {
   constructor(state, env) {
     this.state = state
@@ -38,6 +57,8 @@ export class OwedPin {
       await this.state.storage.deleteAll()
       return this.fetch(new Request('http://pin/pin/state'))
     }
+    if (url.pathname === '/owed-deferred') objects.set(url.searchParams.get('identity'), this.state.id.toString())
+    if (url.pathname === '/owed-deferred' && refusals.delete(url.searchParams.get('identity'))) this.refuse = true
     return this.inner.fetch(req)
   }
   alarm() { return this.inner.alarm() }
