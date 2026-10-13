@@ -201,7 +201,9 @@ pub fn background_flush_plan(started_ms: u64, now_ms: u64) -> BackgroundFlush {
     if budget < FLUSH_WINDOW_FLOOR_MS {
         BackgroundFlush::Skip { remaining_ms }
     } else {
-        BackgroundFlush::Ship { deadline_ms: now_ms + budget }
+        BackgroundFlush::Ship {
+            deadline_ms: now_ms + budget,
+        }
     }
 }
 

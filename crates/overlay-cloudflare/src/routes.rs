@@ -4975,8 +4975,14 @@ mod tests {
             let fl = tail
                 .find(flush)
                 .expect("a job latch is followed by a flush");
-            assert!(fl < 900, "the flush sits right after the latch and its counts (at {fl})");
-            assert!(tail[..fl].contains("bump_counter("), "the latch is counted BEFORE its flush (bsv-low #649)");
+            assert!(
+                fl < 900,
+                "the flush sits right after the latch and its counts (at {fl})"
+            );
+            assert!(
+                tail[..fl].contains("bump_counter("),
+                "the latch is counted BEFORE its flush (bsv-low #649)"
+            );
             n += 1;
             from = at + needle.len();
         }
