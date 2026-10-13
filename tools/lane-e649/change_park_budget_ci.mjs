@@ -8,7 +8,7 @@
  *  1. `health`: the gauge, each count stopped at its cap (256).
  *  2. `park` of a NEW key on a full table (10,000 rows past the 2,048 ceiling): refused, kept in memory; the
  *     ceiling's read stops at the ceiling.
- *  3. `park` of a HELD key: it re-parks (the generation bumped).
+ *  3. `park` of a HELD key: it re-parks (a new intent token for its generation).
  *  4. `drain`: 128 eligible rows read through the drain's index (no APP_LAYER_URL here: no POST leaves, each
  *     read row is refused and backed off), the exhausted sweep.
  *  5. The drain's statement, read verbatim out of the Rust source, under EXPLAIN QUERY PLAN on the same local
@@ -132,7 +132,7 @@ check('change-park-park-new-full', p1.d1)
 const held = '0'.repeat(63) + '1:0'
 const p2 = await lever({ op: 'park', items: [held] })
 const gen = d1(`SELECT generation AS g FROM change_parked WHERE item = '${held}'`)[0]?.g
-expect(p2.status === 200 && gen === 1, 'a held key re-parks on a full table (generation 1)', `${p2.text} generation=${gen}`)
+expect(p2.status === 200 && gen > 0, 'a held key re-parks on a full table (a new intent token, D2-M1)', `${p2.text} generation=${gen}`)
 check('change-park-park-held', p2.d1)
 
 // 4. The drain.
