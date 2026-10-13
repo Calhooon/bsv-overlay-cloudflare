@@ -433,11 +433,19 @@ fn ns3_m1_woc_mempool_presence_is_never_broadcaster_seen() {
 }
 
 #[test]
-fn ns3_m2_backfill_page_is_bounded_resumed_and_certified() {
+fn ns3_m4_backfill_never_runs_on_a_read_and_pages_by_primary_key() {
+    let fetch = include_str!("../src/lib.rs");
+    let fetch = &fetch[fetch.find("pub async fn fetch").unwrap()
+        ..fetch.find("pub async fn fetch").unwrap() + 8000];
+    assert!(
+        !fetch.contains("runtime::backfill"),
+        "deploy backfill still runs inside fetch"
+    );
     let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch(stored::CREATE).unwrap();
     db.execute_batch(stored::BACKFILL_CREATE).unwrap();
-    db.execute_batch("CREATE TABLE transactions(txid TEXT,beef BLOB,has_proof INTEGER); CREATE TABLE pot_beefs(txid TEXT,beef BLOB,has_proof INTEGER)").unwrap();
-    for n in 0..9 {
+    db.execute_batch("CREATE TABLE transactions(txid TEXT PRIMARY KEY,beef BLOB,has_proof INTEGER); CREATE TABLE pot_beefs(txid TEXT PRIMARY KEY,beef BLOB,has_proof INTEGER)").unwrap();
+    for n in 0..150 {
         db.execute(
             "INSERT INTO transactions VALUES (?1,x'00',1)",
             [format!("{n:064x}")],
@@ -445,7 +453,7 @@ fn ns3_m2_backfill_page_is_bounded_resumed_and_certified() {
         .unwrap();
     }
     let mut after = String::new();
-    let mut count = 0;
+    let mut scanned = 0;
     loop {
         let rows: Vec<String> = db
             .prepare(stored::BACKFILL_PAGE)
@@ -454,34 +462,39 @@ fn ns3_m2_backfill_page_is_bounded_resumed_and_certified() {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert!(rows.len() <= 4);
-        let complete = rows.len() < 4;
-        count += rows.len();
-        if let Some(t) = rows.last() {
-            after = t.clone();
+        assert!(rows.len() <= 64);
+        let complete = rows.len() < 64;
+        scanned += rows.len();
+        if let Some(last) = rows.last() {
+            after = last.clone();
         }
-        db.execute(
-            stored::BACKFILL_SAVE,
-            rusqlite::params![stored::BACKFILL_VERSION, after, complete],
-        )
-        .unwrap();
-        after = db
-            .query_row(
-                "SELECT cursor FROM tracker_backfill WHERE version=?1",
-                [stored::BACKFILL_VERSION],
-                |r| r.get(0),
-            )
-            .unwrap();
         if complete {
             break;
         }
     }
-    assert_eq!(count, 9);
-    assert_eq!(
-        db.query_row("SELECT complete FROM tracker_backfill", [], |r| r
-            .get::<_, bool>(0))
-            .unwrap(),
-        true
+    assert_eq!(scanned, 150);
+    let details: Vec<String> = db
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", stored::BACKFILL_PAGE))
+        .unwrap()
+        .query_map([""], |r| r.get(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("SEARCH transactions USING INDEX") && d.contains("txid>")),
+        "{details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("SEARCH tx_words USING") && d.contains("txid=")),
+        "{details:?}"
+    );
+    assert!(
+        !details.iter().any(|d| d.contains("SCAN transactions")),
+        "{details:?}"
     );
 }
 

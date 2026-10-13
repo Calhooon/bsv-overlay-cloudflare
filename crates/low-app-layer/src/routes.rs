@@ -5089,10 +5089,8 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             "could not judge the complete list this pass: bounded or faulted evidence read"
         );
     }
-    json_response(
-        crate::tracker_host::runtime::body(&ctx.env, &body.to_string(), None).await?,
-        200,
-    )
+    crate::tracker_host::runtime::owed_body(&ctx.env, &mut body).await;
+    json_response(body.to_string(), 200)
 }
 
 async fn gather_result_entries(

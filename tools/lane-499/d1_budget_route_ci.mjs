@@ -269,6 +269,8 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
     if (!b) fail(`d1Budget carries ${route}`, `routes: ${Object.keys(budget?.routes ?? {}).join(' ')}`)
     else if (b.max.reads < m.reads || b.max.writes < m.writes || b.max.stmts < m.stmts) fail(`d1Budget's ${route} maximum covers its answer`, `${JSON.stringify(b.max)} < ${JSON.stringify(m)}`)
     else pass(`d1Budget carries ${route} (max reads ${b.max.reads}, writes ${b.max.writes}, stmts ${b.max.stmts}; ${b.requests} request(s))`)
+    if (route === '/owed' && b?.max.stmts > CEILINGS.scenarios['owed-first-read'].ceiling.stmts)
+      fail('owed surface maximum within named ceiling', `${b.max.stmts} > ${CEILINGS.scenarios['owed-first-read'].ceiling.stmts}`)
   }
 }
 

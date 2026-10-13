@@ -160,6 +160,90 @@ pub async fn body_loaded(
     decorate(&mut value, subject, &views);
     Ok(value.to_string())
 }
+/// Owed snapshots already persist their word tuples in facts. Recheck those
+/// proofs without another D1 lookup or a read-triggered fallback write.
+pub async fn owed_body(env: &worker::Env, value: &mut Value) {
+    fn collect(value: &Value, rows: &mut BTreeMap<String, Row>) {
+        if let Some(obj) = value.as_object() {
+            if let (Some(word), Some(id)) = (
+                obj.get("spenderWord"),
+                obj.get("coinWord").and_then(|c| c["txid"].as_str()),
+            ) {
+                let p = &word["verifyPath"];
+                rows.insert(
+                    id.to_string(),
+                    Row {
+                        txid: id.into(),
+                        word: word["word"].as_str().unwrap_or("unknown").into(),
+                        tier: word["tier"].as_str().unwrap_or("host").into(),
+                        height: word["height"].as_f64(),
+                        proof_root: p["root"].as_str().map(str::to_string),
+                        proof_height: p["height"].as_f64(),
+                        proof_hex: p["merklePath"].as_str().map(str::to_string),
+                        header_hash: p["headerHash"].as_str().map(str::to_string),
+                        hint_source: word["source"].as_str().map(str::to_string),
+                        hint_at: word["at"].as_f64(),
+                        updated_at: 0.0,
+                        legacy_body: None,
+                    },
+                );
+            }
+            for (key, child) in obj {
+                if key != "spenderWord" {
+                    collect(child, rows);
+                }
+            }
+        } else if let Some(a) = value.as_array() {
+            for child in a {
+                collect(child, rows);
+            }
+        }
+    }
+    fn replace(value: &mut Value, views: &BTreeMap<String, Value>) {
+        if let Some(obj) = value.as_object_mut() {
+            let id = obj
+                .get("coinWord")
+                .and_then(|c| c["txid"].as_str())
+                .map(str::to_string);
+            if let Some(id) = id {
+                if let Some(word) = views.get(&id) {
+                    let old_coin = obj["coinWord"]["word"].as_str().unwrap_or("pending");
+                    let coin = if word["word"] == "stale" {
+                        "suspended"
+                    } else if word["word"] == "mined" && !word["verifyPath"].is_null() {
+                        if old_coin == "lost" {
+                            "lost"
+                        } else {
+                            "spent"
+                        }
+                    } else {
+                        "pending"
+                    };
+                    obj.insert(
+                        "coinWord".into(),
+                        json!({"word":coin,"txid":id,"height":word["height"]}),
+                    );
+                    obj.insert("spenderWord".into(), word.clone());
+                }
+            }
+            for (key, child) in obj.iter_mut() {
+                if key != "spenderWord" {
+                    replace(child, views);
+                }
+            }
+        } else if let Some(a) = value.as_array_mut() {
+            for child in a {
+                replace(child, views);
+            }
+        }
+    }
+    let mut rows = BTreeMap::new();
+    collect(value, &mut rows);
+    let views = views(env, &rows).await;
+    replace(value, &views);
+    decorate(value, None, &views);
+}
+
 #[derive(serde::Deserialize)]
 struct BeefRow {
     beef: Option<String>,
@@ -415,7 +499,8 @@ pub fn courier_presence_hint(value: &Value, now: u64) -> Option<Hint> {
 }
 
 thread_local! { static BACKFILL_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-/// Proof-only deploy convergence; four subjects per request, cursor durable across isolates.
+/// Proof-only deploy convergence: one 64-subject indexed page per scheduled pass.
+/// The page plus its tx_words PK join reads at most 64 + 64 rows.
 pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
     if BACKFILL_DONE.with(std::cell::Cell::get) {
         return Ok(());
@@ -429,6 +514,8 @@ pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
     struct Subject {
         txid: String,
         beef: Option<Vec<u8>>,
+        has_proof: f64,
+        tracked: Option<String>,
     }
     let db = env.d1("OVERLAY_DB")?;
     let cursor = db
@@ -440,16 +527,27 @@ pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
         BACKFILL_DONE.with(|c| c.set(true));
         return Ok(());
     }
-    let mut after = cursor.map_or_else(String::new, |c| c.cursor);
+    let saved = cursor.map_or_else(|| "0:".into(), |c| c.cursor);
+    let pots = saved.starts_with("1:");
+    let mut after = saved[2..].to_string();
     let rows = db
-        .prepare(stored::BACKFILL_PAGE)
+        .prepare(if pots {
+            stored::BACKFILL_POT_PAGE
+        } else {
+            stored::BACKFILL_PAGE
+        })
         .bind(&[JsValue::from_str(&after)])?
         .counted_all()
         .await?
         .results::<Subject>()?;
-    let complete = rows.len() < 4;
+    let page_done = rows.len() < 64;
+    let complete = pots && page_done;
     for subject in rows {
-        crate::courier::note_presence("tracker_backfill_examined_total");
+        crate::courier::note_presence("tracker_backfill_scanned_total");
+        after = subject.txid.clone();
+        if subject.tracked.is_some() || subject.has_proof == 0.0 {
+            continue;
+        }
         let proof = subject
             .beef
             .and_then(|bytes| {
@@ -481,12 +579,16 @@ pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
         } else {
             crate::courier::note_presence("tracker_backfill_unreadable_total");
         }
-        after = subject.txid;
     }
+    let saved = if page_done && !pots {
+        "1:".to_string()
+    } else {
+        format!("{}:{after}", if pots { 1 } else { 0 })
+    };
     db.prepare(stored::BACKFILL_SAVE)
         .bind(&[
             JsValue::from_str(stored::BACKFILL_VERSION),
-            JsValue::from_str(&after),
+            JsValue::from_str(&saved),
             JsValue::from_f64(if complete { 1.0 } else { 0.0 }),
         ])?
         .counted_run()
