@@ -27,6 +27,8 @@ pub const ANNOUNCE_WALL_MS: u64 = 20_000;
 pub const COUNTER_ANNOUNCE_SENT: &str = "pot_changed_announce_sent_total";
 /// Relay calls not made: the deploy has no `RELAY_URL` / `BROADCAST_TOKEN` (/ `SERVER_PRIVATE_KEY` for a seat).
 pub const COUNTER_ANNOUNCE_SKIPPED: &str = "pot_changed_announce_skipped_total";
+/// A marker arm's batch that faulted (H2): the outpoints are attributed from the arms that answered.
+pub const COUNTER_MARKER_ARM_FAILED: &str = "pot_changed_marker_arm_failed_total";
 /// Relay calls that failed (a transport fault, a non-2xx) or had not answered at the wall.
 pub const COUNTER_ANNOUNCE_FAILED: &str = "pot_changed_announce_failed_total";
 
@@ -186,43 +188,34 @@ impl<P: SqlPort> HookD1<P> {
 
 impl<P: SqlPort> HookStore for HookD1<P> {
     async fn read_outpoints(&self, outpoints: &[(String, u32)]) -> Vec<OutpointRead> {
-        let failed_all = |e: String| -> Vec<OutpointRead> {
-            outpoints
-                .iter()
-                .map(|_| OutpointRead::Failed(e.clone()))
-                .collect()
-        };
-        // (1) ONE batch: per outpoint, its decoded row and the three marker arms.
+        let binds =
+            |txid: &str, vout: u32| vec![Bind::Text(txid.to_string()), Bind::Int(i64::from(vout))];
+        // (1) THE REQUIRED READ, one batch: every outpoint's decoded row. D1 fails a batch whole, so on a fault each
+        // outpoint is asked again alone and only the one whose own statement faults is `Failed` (H2).
         let decoded_sql = crate::results::decoded_pots_sql(1);
-        let per = 1 + MARKER_ARMS.len();
-        let mut stmts = Vec::with_capacity(outpoints.len() * per);
-        for (txid, vout) in outpoints {
-            let binds = vec![Bind::Text(txid.clone()), Bind::Int(i64::from(*vout))];
-            stmts.push(Stmt::new(decoded_sql.clone(), binds.clone()));
-            for (_, sql) in MARKER_ARMS {
-                stmts.push(Stmt::new(sql, binds.clone()));
-            }
-        }
-        let results = match self.sql.run_batch(stmts).await {
-            Ok(r) => r,
-            Err(e) => {
-                self.sql
-                    .log(&format!("[pot-changed] attribution batch failed: {e}"));
-                return failed_all(e);
-            }
-        };
-        let mut decoded = Vec::with_capacity(outpoints.len());
-        let mut named: Vec<Vec<String>> = Vec::with_capacity(outpoints.len());
-        for i in 0..outpoints.len() {
-            let group = &results[i * per..(i + 1) * per];
-            decoded.push(decoded_of(&group[0]));
-            let mut ids = Vec::new();
-            for r in &group[1..] {
-                identity_rows(&r.rows, &mut ids);
-            }
-            named.push(ids);
-        }
-        // (2) ONE batch: the decoded pots' seat markers, then `attribute_seats` per pot.
+        let stmts = outpoints
+            .iter()
+            .map(|(txid, vout)| Stmt::new(decoded_sql.clone(), binds(txid, *vout)))
+            .collect();
+        let decoded: Vec<Result<Option<crate::results::CovenantParams>, String>> =
+            match self.sql.run_batch(stmts).await {
+                Ok(results) => results.iter().map(decoded_of).collect(),
+                Err(e) => {
+                    self.sql.log(&format!(
+                        "[pot-changed] decoded-pots batch failed ({e}): each outpoint asked alone"
+                    ));
+                    let mut each = Vec::with_capacity(outpoints.len());
+                    for (txid, vout) in outpoints {
+                        let one = vec![Stmt::new(decoded_sql.clone(), binds(txid, *vout))];
+                        each.push(match self.sql.run_batch(one).await {
+                            Ok(r) => r.first().map(decoded_of).unwrap_or(Ok(None)),
+                            Err(e) => Err(e),
+                        });
+                    }
+                    each
+                }
+            };
+        // (2) one batch: the decoded pots' seat markers, then `attribute_seats` per pot.
         let mut params_by_pot = std::collections::HashMap::new();
         for ((txid, vout), d) in outpoints.iter().zip(&decoded) {
             if let Ok(Some(p)) = d {
@@ -230,15 +223,62 @@ impl<P: SqlPort> HookStore for HookD1<P> {
             }
         }
         let markers = self.seat_markers(&params_by_pot).await;
-        outpoints
+        let seats: Vec<Option<Vec<String>>> = outpoints
             .iter()
-            .zip(decoded)
+            .zip(&decoded)
+            .map(|((txid, vout), d)| match d {
+                Ok(Some(params)) => Some(seats_of(params, txid, *vout, &markers)),
+                _ => None,
+            })
+            .collect();
+        // (3) THE OPTIONAL MARKER ARMS, only for an outpoint that needs them (no decoded params, or decoded with no
+        // attributed seat), as before L4: one batch PER ARM over those outpoints. An arm that faults names nobody
+        // for this body, is counted and logged by name, and the other arms and the outpoint stand (H2).
+        let needs: Vec<usize> = (0..outpoints.len())
+            .filter(|&i| match (&decoded[i], &seats[i]) {
+                (Ok(None), _) => true,
+                (Ok(Some(_)), Some(v)) => v.is_empty(),
+                _ => false,
+            })
+            .collect();
+        let mut named: Vec<Vec<String>> = vec![Vec::new(); outpoints.len()];
+        let mut arm_faults = 0u64;
+        if !needs.is_empty() {
+            for (arm, sql) in MARKER_ARMS {
+                let stmts = needs
+                    .iter()
+                    .map(|&i| Stmt::new(sql, binds(&outpoints[i].0, outpoints[i].1)))
+                    .collect();
+                match self.sql.run_batch(stmts).await {
+                    Ok(results) => {
+                        for (&i, r) in needs.iter().zip(&results) {
+                            identity_rows(&r.rows, &mut named[i]);
+                        }
+                    }
+                    Err(e) => {
+                        arm_faults += 1;
+                        self.sql.log(&format!(
+                            "[pot-changed] marker arm {arm} failed for {} outpoint(s): {e}",
+                            needs.len()
+                        ));
+                    }
+                }
+            }
+        }
+        if arm_faults > 0 {
+            self.sql
+                .counters(vec![(COUNTER_MARKER_ARM_FAILED.to_string(), arm_faults)])
+                .await;
+        }
+        decoded
+            .into_iter()
+            .zip(seats)
             .zip(named)
-            .map(|(((txid, vout), d), marker_named)| match d {
+            .map(|((d, seats), marker_named)| match d {
                 Err(e) => OutpointRead::Failed(e),
                 Ok(None) => OutpointRead::NoParams { marker_named },
-                Ok(Some(params)) => OutpointRead::Decoded {
-                    seats: seats_of(&params, txid, *vout, &markers),
+                Ok(Some(_)) => OutpointRead::Decoded {
+                    seats: seats.unwrap_or_default(),
                     marker_named,
                 },
             })
@@ -791,8 +831,7 @@ pub(crate) mod tests {
                 .or(body["txid"].as_str())
                 .unwrap_or_default()
                 .to_string();
-            let slow =
-                self.hung.contains(&txid) && to == crate::internal_events::POTS_ROOM;
+            let slow = self.hung.contains(&txid) && to == crate::internal_events::POTS_ROOM;
             tokio::time::sleep(if slow {
                 Duration::from_secs(40)
             } else {
@@ -825,7 +864,8 @@ pub(crate) mod tests {
     /// (M2 a) THE PRODUCTION HANDLER AWAITS NO RELAY COMPLETION. `serve_pot_changed`, the function the worker's
     /// `internal_pot_changed` calls, run with the real store's SQL over SQLite and a recording `wait_until`, on the
     /// mixed body with the eighth outpoint's room broadcast HUNG (seven fast, one 40 s): the answer is in hand with
-    /// NO relay call started and its D1 work in at most three round trips; the announce was handed to `wait_until`;
+    /// NO relay call started and its D1 work in six round trips (H2: the required batch, the
+    /// seat markers, one batch per marker arm, one write); the announce was handed to `wait_until`;
     /// run after the answer, the seven rooms and fourteen seat events are delivered and the hung one runs into the
     /// wall. Source: the worker's handler calls this function and hands `ctx.wait_until` as `detach`.
     #[tokio::test(flavor = "current_thread")]
@@ -884,10 +924,11 @@ pub(crate) mod tests {
             0,
             "relay calls started before the answer"
         );
-        assert!(
-            store.sql.batches.get() <= 3,
-            "the answer's D1 work: {} round trips",
-            store.sql.batches.get()
+        assert_eq!(
+            store.sql.batches.get(),
+            6,
+            "the answer's D1 work: the decoded rows, the seat markers, one batch per marker arm (the marker-only \
+             outpoint needs them), one write"
         );
         assert_eq!(
             out.filed.len(),
@@ -921,6 +962,81 @@ pub(crate) mod tests {
             1,
             "the hung call counted at the wall"
         );
+    }
+
+    /// (H2, M2 c) AN OPTIONAL MARKER ARM'S FAULT LEAVES THE OTHER SEATS FILED. The review's case through the
+    /// production handler and the real store's SQL: the mixed body with `potrefund_records` unavailable (renamed
+    /// away under SQLite, so the shipped statement fails to prepare as on a D1 that faults it). The fourteen
+    /// verified seats are filed, the five marker identities (named by the party arm, which answered) are marked
+    /// stale in D1 and queued, and the faulted arm is counted and logged by name; nothing is `Failed`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f_h2_an_optional_arm_fault_leaves_the_other_seats_filed() {
+        let (db, ops) = mixed_fixture();
+        db.conn
+            .execute_batch("ALTER TABLE potrefund_records RENAME TO potrefund_records_away")
+            .unwrap();
+        let store = Rc::new(HookD1 { sql: db });
+        let relay = Rc::new(Relay::default());
+        let rec = Recorded::default();
+        let detach = |f: Detached| rec.0.borrow_mut().push(f);
+        let out = serve_pot_changed(
+            store.clone(),
+            relay,
+            tokio::time::sleep(Duration::from_secs(5)),
+            &detach,
+            &ops,
+            7,
+        )
+        .await;
+        let filed: Vec<&str> = out
+            .filed
+            .iter()
+            .filter_map(|f| f["identity"].as_str())
+            .collect();
+        assert_eq!(filed.len(), 14, "filed={filed:?} skipped={:?}", out.skipped);
+        assert_eq!(
+            out.owed_identities.len(),
+            19,
+            "every identity queued for its recompute"
+        );
+        assert_eq!(
+            out.stale_marks.len(),
+            5,
+            "the marker identities marked stale"
+        );
+        assert_eq!(out.stale_fault, None);
+        let stale: i64 = store
+            .sql
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM owed_state WHERE stale = 1 AND identity IN ({})",
+                    (0..5)
+                        .map(|k| format!("'{}'", marker_seat(k)))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 5, "the stale marks landed in D1");
+        assert_eq!(
+            store.sql.counter(COUNTER_MARKER_ARM_FAILED),
+            1,
+            "the faulted arm counted once"
+        );
+        assert!(
+            store
+                .sql
+                .lines
+                .borrow()
+                .iter()
+                .any(|l| l.contains("marker arm potrefund failed")),
+            "the faulted arm logged by name: {:?}",
+            store.sql.lines.borrow()
+        );
+        rec.run_all().await;
     }
 
     /// The relay as a fake: every call sleeps `delay`, then answers `answer`.
