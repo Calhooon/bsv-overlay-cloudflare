@@ -383,7 +383,9 @@ pub(crate) trait UnparkPort {
 pub struct Delivered {
     pub read: u64,
     pub unparked: u64,
-    /// Read and still parked (refused, deferred past the wall, or a delete that faulted).
+    /// Read by this pass and NOT deleted by it (refused, deferred past the wall, a delete that faulted, or a row
+    /// re-parked since its read). A per-pass figure, never the rows parked now: another delivery may already have
+    /// deleted them (the third delta lens, D3-L1). The table's own count is `/health/invariants.changeParked`.
     pub kept: u64,
     /// N2: refused this pass (backed off), of which `exhausted` left the drain.
     pub refused: u64,
@@ -524,7 +526,7 @@ pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
     }
     if out.read > 0 || out.swept > 0 {
         port.log(format!(
-            "[change-park] delivered {} parked entr(ies), {} kept parked ({} refused and backed off, {} exhausted), {} exhausted swept",
+            "[change-park] delivered {} parked entr(ies), {} read and not deleted by this pass ({} refused and backed off, {} exhausted), {} exhausted swept",
             out.unparked, out.kept, out.refused, out.exhausted, out.swept
         ));
     }
@@ -752,7 +754,7 @@ pub async fn drain_parked(env: &Env, db: &D1Database, trigger: DrainTrigger) -> 
     crate::ops::bump_counter(db, trigger.counter(), 1).await;
     if out.read > 0 || out.swept > 0 {
         console_log!(
-            "[change-park] drain by {}: read={} unparked={} kept={}",
+            "[change-park] drain by {}: read={} unparked={} not_deleted_by_this_pass={}",
             trigger.name(),
             out.read,
             out.unparked,
@@ -2218,6 +2220,95 @@ mod tests {
         assert!(
             tick.contains("crate::change_park::drain_parked(&env,&ops_db,crate::change_park::DrainTrigger::Tick)"),
             "the scheduled handler drains too"
+        );
+    }
+
+    /// bsv-low #649 D3-L1 (the third delta lens): `kept` is the rows this pass READ and did not delete, never the
+    /// rows still parked. Two rows, every POST re-parks what it carries (so the guarded DELETE takes nothing), then
+    /// another delivery deletes both before the log is read: the pass's figure is 2, the table holds 0. The log line
+    /// must say what the figure is. On `1bf8e66` it read "2 kept parked" over an empty table.
+    #[test]
+    fn e649_d3_l1_kept_is_logged_as_read_and_not_deleted_by_this_pass() {
+        struct Logged<'a>(&'a SqlitePort, RefCell<Vec<String>>);
+        impl UnparkPort for Logged<'_> {
+            async fn read(
+                &self,
+                kind: &'static str,
+                now_ms: u64,
+                limit: usize,
+            ) -> std::result::Result<Vec<ParkedRow>, String> {
+                self.0.read(kind, now_ms, limit).await
+            }
+            async fn post(
+                &self,
+                kind: &'static str,
+                body: String,
+            ) -> std::result::Result<usize, ()> {
+                self.0.post(kind, body).await
+            }
+            async fn unpark(
+                &self,
+                kind: &'static str,
+                rows: &[(String, i64)],
+            ) -> std::result::Result<u64, String> {
+                self.0.unpark(kind, rows).await
+            }
+            async fn refuse(
+                &self,
+                kind: &'static str,
+                rows: &[(String, i64)],
+                now_ms: u64,
+            ) -> std::result::Result<(u64, u64), String> {
+                self.0.refuse(kind, rows, now_ms).await
+            }
+            async fn sweep(
+                &self,
+                kind: &'static str,
+                before_ms: u64,
+                limit: usize,
+            ) -> std::result::Result<u64, String> {
+                self.0.sweep(kind, before_ms, limit).await
+            }
+            fn now_ms(&self) -> u64 {
+                self.0.now_ms()
+            }
+            async fn bump(&self, counter: &'static str, delta: u64) {
+                self.0.bump(counter, delta).await
+            }
+            fn log(&self, line: String) {
+                self.1.borrow_mut().push(line)
+            }
+        }
+        let conn = parked_db();
+        park_sql(
+            &conn,
+            rusqlite::params![KIND_POT, pot_item(&"ab".repeat(32), 0), 100, MAX],
+        )
+        .unwrap();
+        park_sql(&conn, rusqlite::params![KIND_HOP, ID, 100, MAX]).unwrap();
+        let port = SqlitePort {
+            conn,
+            refuse: Default::default(),
+            clock: std::cell::Cell::new(10_000),
+            posted: Default::default(),
+            refused_posts: RefCell::new(0),
+            repark: true,
+            last_read: Default::default(),
+            stale_read: Default::default(),
+        };
+        let logged = Logged(&port, RefCell::new(Vec::new()));
+        let d = run(deliver_parked(&logged));
+        port.conn.execute("DELETE FROM change_parked", []).unwrap();
+        assert_eq!((d.read, d.unparked, d.kept), (2, 0, 2));
+        assert_eq!(rows_of(&port.conn, "SELECT COUNT(*) FROM change_parked"), 0);
+        let lines = logged.1.borrow();
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("[change-park] delivered "))
+            .expect("the pass logs its figures");
+        assert!(
+            line.contains("2 read and not deleted by this pass") && !line.contains("kept parked"),
+            "the per-pass figure is labelled as one: {line}"
         );
     }
 }
