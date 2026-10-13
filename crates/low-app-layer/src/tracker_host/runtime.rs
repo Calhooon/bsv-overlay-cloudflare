@@ -453,6 +453,8 @@ pub async fn batch_body(env: &worker::Env, raw: &str, ids: &[String]) -> worker:
 }
 
 /// Only the scheduled pass may refresh aged words, two subjects per tick.
+pub const PUBLIC_ROWS_PER_MINUTE: usize = 0;
+
 pub async fn tick(env: &worker::Env) -> worker::Result<()> {
     #[derive(serde::Deserialize)]
     struct Subject {
@@ -460,6 +462,11 @@ pub async fn tick(env: &worker::Env) -> worker::Result<()> {
     }
     let now = super::WorkerClock.now();
     let db = env.d1("OVERLAY_DB")?;
+    db.prepare(stored::SWEEP)
+        .bind(&[JsValue::from_f64(now.saturating_sub(8 * 86400) as f64)])?
+        .counted_run()
+        .await?;
+    crate::courier::note_presence("tracker_stranger_sweep_pass_total");
     let rows = db.prepare("SELECT txid FROM tx_words WHERE word IN ('unknown','built','announced','seen') AND updated_at <= ? ORDER BY updated_at, txid LIMIT 2")
         .bind(&[JsValue::from_f64(now.saturating_sub(900) as f64)])?
         .counted_all().await?.results::<Subject>()?;

@@ -8102,6 +8102,7 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     if !valid_txid(&txid) {
         return json_error("invalid txid (expect 64 hex chars)", 400);
     }
+    crate::courier::note_presence("tracker_public_lookup_only_total");
     let key = txid.to_ascii_lowercase();
     let stored = crate::tracker_host::stored::read(&ctx.env, std::slice::from_ref(&key)).await?;
     let now = worker::Date::now().as_millis() as f64;
