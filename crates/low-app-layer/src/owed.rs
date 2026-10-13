@@ -1920,16 +1920,16 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
         // (counted once per hop in the row pass: this fn also runs in the candidates pre-pass)
         let contradicted =
             tracker_confirmed_by_other(i, h, i.hop_chain.get(&outpoint), &filed.sweep_txid);
-        let index_word = (filed.index_proven || spender_mined(i, Some(&filed.sweep_txid), false))
-            && !contradicted;
-        if index_word || named_by_index || by_chain.is_some() {
+        let index_word = filed.index_proven && !contradicted;
+        let tracker_word = spender_mined(i, Some(&filed.sweep_txid), false) && !contradicted;
+        if index_word || tracker_word || named_by_index || by_chain.is_some() {
             // the index's proof, OR its hop-row word, OR the chain rung's (a spend the index recorded before its block
             // and never re-checked read "not mined yet" for days on the pair: the recompute now probes such hops and
             // the courier's confirmation heals the row without a client action)
             // the gate's LOW-3 (2026-09-19): the confirming chain word must NAME the filed sweep (`by_chain` does) — a
             // hop the JOIN took after all (evicted, then readmitted on its mine) reads spent+confirmed by a DIFFERENT
             // tx, and that must never turn the sweep's payout claimable for a tx that can never mine
-            let confirmed = index_word
+            let confirmed = index_word || tracker_word
                 || spender_mined(
                     i,
                     Some(&filed.sweep_txid),
@@ -2508,6 +2508,8 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 let word = i.hop_chain.get(&outpoint);
                 facts["confirmedSource"] = json!(if swept.index_proven {
                     "index-proof"
+                } else if spender_mined(i, Some(&swept.sweep_txid), false) {
+                    "tracker-proof"
                 } else if by_index {
                     "index"
                 } else if word.and_then(|w| w.age_ms).is_some() {
@@ -4898,6 +4900,31 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &other, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
         assert_eq!(derive_owed_rows(&i)[0].family, OwedFamily::Unbound);
+    }
+
+    #[test]
+    fn ns3d_l2_tracker_mined_sweep_names_tracker_proof() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let hops = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let sweep = tx(0x0c);
+        let filing = filed(&format!("{}:0", tx(0x07)), &sweep);
+        let headers = crate::tracker_host::HeaderSnapshot {
+            tip: Ok(10), headers: std::collections::BTreeMap::from([(10, Ok(Some(bsv_tracker::Header {
+                hash: tx(2), merkle_root: sweep.clone(),
+            })))])
+        };
+        let mut state = bsv_tracker::State::new(&sweep);
+        state.step(&bsv_tracker::Params {age_threshold:60}, &headers,
+            bsv_tracker::Input::Evidence(bsv_tracker::Evidence::Proof(bsv_tracker::Proof::new(
+                &sweep, bsv_rs::transaction::MerklePath::from_coinbase_txid(&sweep, 10)).unwrap()))).unwrap();
+        let words = std::collections::BTreeMap::from([(sweep, crate::tracker_host::served::fields(&state))]);
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_sweeps = &filing;
+        i.spender_words = Some(&words);
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["confirmedSource"], "tracker-proof", "tracker proof mislabeled as index proof");
+        assert!(rows[0].facts.get("sweepProofHeight").is_none());
     }
 
     /// bsv-low #517 (loop 19, pair 11, 2026-09-21): the INDEX's own verified proof of the filed sweep confirms the
