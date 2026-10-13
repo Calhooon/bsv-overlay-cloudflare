@@ -310,3 +310,10 @@ bindings = [
   { name = "BOARD_VIEW", class_name = "BoardView" },
   { name = "AUTH_SESSION_STORE", class_name = "AuthSessionStore" },
 ]
+
+# One bounded deploy convergence page per scheduled owed-clock pass.
+[triggers]
+crons = ["*/15 * * * *"]
+
+[env.beta.triggers]
+crons = ["*/15 * * * *"]

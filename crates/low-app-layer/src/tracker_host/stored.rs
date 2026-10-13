@@ -210,7 +210,9 @@ pub fn project(old: Option<&Row>, state: &State, now: u64, legacy: Option<String
 }
 
 /// Durable cursor per host version: completed deploy passes do not restart on recycle.
-pub const BACKFILL_VERSION: &str = "ns3-fold-v1";
+pub const BACKFILL_VERSION: &str = "ns3-fold-v2-scheduled";
 pub const BACKFILL_CREATE: &str = "CREATE TABLE IF NOT EXISTS tracker_backfill (version TEXT PRIMARY KEY, cursor TEXT NOT NULL, complete INTEGER NOT NULL)";
-pub const BACKFILL_PAGE: &str = "SELECT txid, beef FROM (SELECT txid, beef FROM transactions WHERE has_proof = 1 UNION ALL SELECT txid, beef FROM pot_beefs WHERE has_proof = 1) WHERE txid > ?1 ORDER BY txid LIMIT 4";
+// One-to-one PK join; no proof/absence filter may scan beyond the 64-subject page.
+pub const BACKFILL_PAGE: &str = "SELECT transactions.txid, transactions.beef, transactions.has_proof, tx_words.txid AS tracked FROM transactions LEFT JOIN tx_words ON tx_words.txid = transactions.txid WHERE transactions.txid > ?1 ORDER BY transactions.txid LIMIT 64";
+pub const BACKFILL_POT_PAGE: &str = "SELECT pot_beefs.txid, pot_beefs.beef, pot_beefs.has_proof, tx_words.txid AS tracked FROM pot_beefs LEFT JOIN tx_words ON tx_words.txid = pot_beefs.txid WHERE pot_beefs.txid > ?1 ORDER BY pot_beefs.txid LIMIT 64";
 pub const BACKFILL_SAVE: &str = "INSERT INTO tracker_backfill(version,cursor,complete) VALUES (?1,?2,?3) ON CONFLICT(version) DO UPDATE SET cursor=MAX(tracker_backfill.cursor,excluded.cursor),complete=MAX(tracker_backfill.complete,excluded.complete)";

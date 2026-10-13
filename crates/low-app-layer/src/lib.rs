@@ -178,6 +178,22 @@ use worker::{event, Context, Env, Request, Response, Result, Router};
 /// bsv-low #499 (lens fold M2): the WHOLE body runs under the request's D1 rows ledger, the internal hooks and the
 /// front door's own replies included (the t=0 burst's hooks answered with no figures before), and every answer,
 /// an escaped handler error's too (L5), carries `Server-Timing: d1;desc=..`, stamped last (after any signing).
+/// Deploy convergence runs only on the scheduled owed-clock pass, never a fetch.
+#[event(scheduled)]
+async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
+    ctx.wait_until(async move {
+        d1_ledger::boot(schema::ensure_latch_columns(&env)).await;
+        if let Err(e) = tracker_host::runtime::backfill(&env).await {
+            courier::note_presence("tracker_backfill_faulted_total");
+            worker::console_warn!("[tracker-backfill] deferred: {e}");
+        }
+        if let Ok(db) = env.d1("OVERLAY_DB") {
+            let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
+            courier::flush(Some(db), pending).await;
+        }
+    });
+}
+
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let d1_route = d1_ledger::route_of(req.path().as_str(), D1_LEDGER_ROUTES);
@@ -226,12 +242,6 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // there is no other way to obtain a `LatchColumnsEnsured`.
     // bsv-low #499 (lens fold L2): keyed `(boot)` in the ledger, not under the route that woke the isolate.
     let schema_ready = d1_ledger::boot(schema::ensure_latch_columns(&env)).await;
-
-    // A failed page leaves its durable cursor untouched and resumes next request.
-    if let Err(e) = tracker_host::runtime::backfill(&env).await {
-        courier::note_presence("tracker_backfill_faulted_total");
-        worker::console_warn!("[tracker-backfill] deferred: {e}");
-    }
 
     if req.method() == worker::Method::Post && req.path() == "/internal/tx-word" {
         return tracker_host::runtime::ingest(req, &env).await;
