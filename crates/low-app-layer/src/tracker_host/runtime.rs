@@ -234,14 +234,14 @@ pub async fn owed_body(env: &worker::Env, value: &mut Value) {
 
 #[derive(serde::Deserialize)]
 struct BeefRow {
-    beef: Option<String>,
+    beef: Option<Vec<u8>>,
 }
 /// Read held bytes only: absence is no evidence and never a terminal word.
 pub async fn held_proof(env: &worker::Env, txid: &str) -> worker::Result<(bool, Option<Proof>)> {
     let db = env.d1("OVERLAY_DB")?;
     for sql in [
-        "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?",
-        "SELECT hex(beef) AS beef FROM transactions WHERE txid = ?",
+        "SELECT beef FROM pot_beefs WHERE txid = ?",
+        "SELECT beef FROM transactions WHERE txid = ?",
     ] {
         if let Some(row) = db
             .prepare(sql)
@@ -251,9 +251,13 @@ pub async fn held_proof(env: &worker::Env, txid: &str) -> worker::Result<(bool, 
         {
             let proof = row
                 .beef
-                .and_then(|h| hex::decode(h).ok())
                 .and_then(|bytes| {
-                    bsv_rs::transaction::Transaction::from_beef(&bytes, Some(txid)).ok()
+                    overlay_engine::beef_limits::transaction_from_beef(
+                        &bytes,
+                        Some(txid),
+                        &overlay_engine::beef_limits::STORED_BEEF_LIMITS,
+                    )
+                    .ok()
                 })
                 .and_then(|tx| tx.merkle_path.clone())
                 .and_then(|path| Proof::new(txid, path).ok());
