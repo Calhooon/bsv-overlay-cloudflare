@@ -1004,7 +1004,8 @@ mod tests {
     /// The pots room hears EVERY parsed outpoint (bsv-low loop 10 D2, the pair-10 finding: a seat blocked at
     /// funding has no marker, so the per-seat event never files for it), whatever the attribution finds. Since
     /// E649 L4 the announce is the seam's PLAN, run after the answer: the plan carries every parsed outpoint
-    /// (`pot_hook::tests::e649_hook_e_*`), and the handler hands it to `announce_detached` inside `wait_until`.
+    /// and parks every one of them (`pot_hook::tests::e649f_h1_*`), and the handler's `serve_pot_changed` hands the
+    /// announce to `wait_until`.
     /// To red: drop the detached announce, or build the plan from the attributed outpoints only.
     #[test]
     fn internal_pot_changed_announces_every_outpoint_detached() {
@@ -1039,7 +1040,7 @@ mod tests {
     #[test]
     fn internal_pot_changed_marks_the_marker_named_identities_stale_when_no_seat_is_attributed() {
         // E649 L4: the branch is the seam's (`pot_hook::apply_pot_changed`), executed by
-        // `pot_hook::tests::e649_hook_b_*` over a model store; here, that the D1 store reads the three marker arms,
+        // `pot_hook::tests::e649f_h2_*` over the real store's SQL; here, that the D1 store reads the three marker arms,
         // the refund-backup one included (the one marker a seat killed at the funding filed).
         let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
