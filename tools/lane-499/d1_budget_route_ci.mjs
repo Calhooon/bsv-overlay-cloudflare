@@ -303,6 +303,12 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
       break
     }
   }
+  const maximum = (await appHealth()).d1Budget?.routes?.['owed-recompute']?.max
+  const owedCeiling = CEILINGS.scenarios['owed-first-read'].ceiling.stmts
+  if (maximum) {
+    console.log(`OWED MAXIMUM reads ${maximum.reads} writes ${maximum.writes} stmts ${maximum.stmts}; ceiling ${owedCeiling}`)
+    if (maximum.stmts > owedCeiling) fail('owed maximum within named ceiling', `${maximum.stmts} > ${owedCeiling}`)
+  }
   const h1 = (await appHealth()).owed
   const elapsed = Date.now() - t0
   const ran = h1.recomputeBySource['pot-changed'] - h0.recomputeBySource['pot-changed']
@@ -336,8 +342,10 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   checkWord('NS-3 tx-any lookup serves seen beside legacy confirmed', tx, txBody.tracker)
   if (txBody.tier !== 'unknown' || txBody.present !== null) fail('NS-3 preserves main foreign unknown fields', tx.text)
   const batch = await get(APP, `/tx-any?txids=${seen}`)
-  if (batch.status === 200 && JSON.parse(batch.text).unknown?.includes(seen)) pass('NS-3 batch keeps main index-miss body for a stored foreign word')
-  else fail('NS-3 batch changed main foreign body', batch.text)
+  const batchBody = JSON.parse(batch.text)
+  const legacy = ({ tracker, ...body }) => body
+  if (batch.status === 200 && JSON.stringify(legacy(batchBody.answers?.[seen] ?? {})) === JSON.stringify(legacy(txBody))) pass('NS-3 batch keeps main cached single body for a stored foreign word')
+  else fail('NS-3 batch changed main cached foreign body', batch.text)
   const utxo = await get(APP, `/utxo-status?outpoints=${parent}.0`)
   checkWord('NS-3 utxo-status uses the spender subject', utxo, JSON.parse(utxo.text)?.[0]?.spenderWord)
   const spent = await get(APP, `/spent-any?outpoints=${parent}.0`)

@@ -310,7 +310,11 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
             binds.push(JsValue::from_f64(f64::from(op.vout)));
         }
         let stmt = db.prepare(batch_where_sql(chunk.len())).bind(&binds)?;
-        match stmt.counted_all().await.and_then(|r| r.results::<PotRowD1>()) {
+        match stmt
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<PotRowD1>())
+        {
             Ok(chunk_rows) => rows.extend(chunk_rows.into_iter().map(PotRowD1::into_row)),
             Err(e) => {
                 console_warn!("[utxo-status] pot_records batch query failed: {e}");
@@ -705,7 +709,11 @@ pub async fn pots_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         let stmt = db
             .prepare(pots_view_join_sql(chunk.len(), era))
             .bind(&binds)?;
-        match stmt.counted_all().await.and_then(|r| r.results::<PotsViewRowD1>()) {
+        match stmt
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<PotsViewRowD1>())
+        {
             Ok(chunk_rows) => rows.extend(chunk_rows.into_iter().map(PotsViewRowD1::into_row)),
             Err(e) => {
                 console_warn!("[pots-view] pot_records join query failed: {e}");
@@ -861,7 +869,11 @@ pub async fn recovery_view(req: Request, ctx: RouteContext<AuthState>) -> Result
         .map(|a| a.min(crate::logic::RECOVERY_VIEW_AFTER_MAX))
         .unwrap_or(0);
     let stmt = db.prepare(recovery_view_sql(era, after)).bind(&binds)?;
-    let rows: Vec<RecoveryRow> = match stmt.counted_all().await.and_then(|r| r.results::<RecoveryRowD1>()) {
+    let rows: Vec<RecoveryRow> = match stmt
+        .counted_all()
+        .await
+        .and_then(|r| r.results::<RecoveryRowD1>())
+    {
         Ok(rows) => rows.into_iter().map(RecoveryRowD1::into_row).collect(),
         Err(e) => {
             console_warn!("[recovery-view] potparty join query failed: {e}");
@@ -954,7 +966,11 @@ async fn collected_games_for(
                 return None;
             }
         };
-        match stmt.counted_all().await.and_then(|r| r.results::<GameIdRowD1>()) {
+        match stmt
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<GameIdRowD1>())
+        {
             Ok(rows) => out.extend(rows.into_iter().map(|r| r.game_id.to_ascii_lowercase())),
             Err(e) => {
                 // A whole-set None rather than a partial set: a partial answer
@@ -1171,14 +1187,17 @@ pub async fn compute_leaderboard_body_string(
     let stmt = db
         .prepare(crate::logic::chain_wins_spine_sql(era))
         .bind(&binds)?;
-    let mut owner_rows: Vec<OwnerRowD1> =
-        match stmt.counted_all().await.and_then(|r| r.results::<OwnerRowD1>()) {
-            Ok(rows) => rows,
-            Err(e) => {
-                console_warn!("[leaderboard] chain-wins spine query failed: {e}");
-                return Ok((503, "{\"error\":\"database query failed\"}".to_string()));
-            }
-        };
+    let mut owner_rows: Vec<OwnerRowD1> = match stmt
+        .counted_all()
+        .await
+        .and_then(|r| r.results::<OwnerRowD1>())
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            console_warn!("[leaderboard] chain-wins spine query failed: {e}");
+            return Ok((503, "{\"error\":\"database query failed\"}".to_string()));
+        }
+    };
     let truncated = owner_rows.len() > page;
     owner_rows.truncate(page);
     let owners: Vec<String> = owner_rows
@@ -1235,7 +1254,11 @@ pub async fn compute_leaderboard_body_string(
             b.push(JsValue::from_f64(f64::from(op.vout)));
         }
         let stmt = db.prepare(batch_where_sql(chunk.len())).bind(&b)?;
-        match stmt.counted_all().await.and_then(|r| r.results::<PotRowD1>()) {
+        match stmt
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<PotRowD1>())
+        {
             Ok(rows) => status_rows.extend(rows.into_iter().map(PotRowD1::into_row)),
             Err(e) => {
                 console_warn!("[leaderboard] pot_records batch query failed: {e}");
@@ -1276,7 +1299,11 @@ pub async fn compute_leaderboard_body_string(
                 continue;
             }
         };
-        match stmt.counted_all().await.and_then(|r| r.results::<ResultRowD1>()) {
+        match stmt
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<ResultRowD1>())
+        {
             Ok(rows) => {
                 for m in rows.into_iter().filter_map(ResultRowD1::into_marker) {
                     push_marker(m);
@@ -1293,7 +1320,11 @@ pub async fn compute_leaderboard_body_string(
             b.push(era_bind(ms));
         }
         match db.prepare(crate::logic::era_hands_sql(era)).bind(&b) {
-            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<ResultRowD1>()) {
+            Ok(stmt) => match stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<ResultRowD1>())
+            {
                 Ok(rows) => {
                     for m in rows.into_iter().filter_map(ResultRowD1::into_marker) {
                         push_marker(m);
@@ -1337,7 +1368,11 @@ pub async fn compute_leaderboard_body_string(
                     b.push(JsValue::from_f64(f64::from(op.vout)));
                 }
                 match db.prepare(batch_where_sql(chunk.len())).bind(&b) {
-                    Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<PotRowD1>()) {
+                    Ok(stmt) => match stmt
+                        .counted_all()
+                        .await
+                        .and_then(|r| r.results::<PotRowD1>())
+                    {
                         Ok(rows) => extra_rows.extend(rows.into_iter().map(PotRowD1::into_row)),
                         Err(e) => console_warn!(
                             "[leaderboard] hands pots status query failed (hands omitted): {e}"
@@ -1850,7 +1885,11 @@ async fn classify_spent_pots(
                 return (verdicts, params_by_pot, signers_by_pot);
             }
         };
-        match stmt.counted_all().await.and_then(|r| r.results::<PotBeefRowD1>()) {
+        match stmt
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<PotBeefRowD1>())
+        {
             Ok(rows) => {
                 for r in rows {
                     if let Some(bytes) = r.beef.and_then(|h| decode_beef_hex(&h)) {
@@ -2221,7 +2260,11 @@ pub async fn compute_results_body_string(
 /// spaces: a POT event (the no-decoded-params and no-attributed-seats branches) is answered by the party arm and
 /// the refund-backup arm (both keyed by the pot); a released-HOP event by the hop arm (keyed by the hop container's
 /// outpoint, which never matches a pot). An arm that cannot match its event is one indexed empty read.
-pub(crate) async fn owed_identities_by_marker(db: &worker::D1Database, txid: &str, vout: u32) -> Vec<String> {
+pub(crate) async fn owed_identities_by_marker(
+    db: &worker::D1Database,
+    txid: &str,
+    vout: u32,
+) -> Vec<String> {
     #[derive(Deserialize)]
     struct IdentityOnlyD1 {
         identity: String,
@@ -2232,8 +2275,15 @@ pub(crate) async fn owed_identities_by_marker(db: &worker::D1Database, txid: &st
         crate::owed::OWED_ATTRIBUTE_BY_HOP_SQL,
         crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL,
     ] {
-        match db.prepare(sql).bind(&[JsValue::from_str(txid), JsValue::from_f64(f64::from(vout))]) {
-            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<IdentityOnlyD1>()) {
+        match db
+            .prepare(sql)
+            .bind(&[JsValue::from_str(txid), JsValue::from_f64(f64::from(vout))])
+        {
+            Ok(stmt) => match stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<IdentityOnlyD1>())
+            {
                 Ok(rows) => {
                     for r in rows {
                         let id = r.identity.to_ascii_lowercase();
@@ -2242,15 +2292,23 @@ pub(crate) async fn owed_identities_by_marker(db: &worker::D1Database, txid: &st
                         }
                     }
                 }
-                Err(e) => console_warn!("[pot-changed] marker attribution read failed for {txid}:{vout}: {e}"),
+                Err(e) => console_warn!(
+                    "[pot-changed] marker attribution read failed for {txid}:{vout}: {e}"
+                ),
             },
-            Err(e) => console_warn!("[pot-changed] marker attribution bind failed for {txid}:{vout}: {e}"),
+            Err(e) => {
+                console_warn!("[pot-changed] marker attribution bind failed for {txid}:{vout}: {e}")
+            }
         }
     }
     out
 }
 
-pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ctx: &worker::Context) -> Result<Response> {
+pub(crate) async fn internal_pot_changed(
+    mut req: Request,
+    env: &worker::Env,
+    ctx: &worker::Context,
+) -> Result<Response> {
     if !crate::internal_events::internal_bearer_ok(&req, env) {
         return Response::error("unauthorized", 401);
     }
@@ -2271,7 +2329,10 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
         ctx.wait_until(async move {
             crate::courier::flush(
                 counter_db,
-                vec![(crate::internal_events::COUNTER_POT_CHANGED_DROPPED.to_string(), dropped as u64)],
+                vec![(
+                    crate::internal_events::COUNTER_POT_CHANGED_DROPPED.to_string(),
+                    dropped as u64,
+                )],
             )
             .await;
         });
@@ -2327,7 +2388,13 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
             let named = owed_identities_by_marker(&db, &txid, vout).await;
             let named_n = named.len();
             for id in named {
-                owed_mark_stale(&db, crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(&id)], "pot-changed (by marker)").await;
+                owed_mark_stale(
+                    &db,
+                    crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
+                    &[JsValue::from_str(&id)],
+                    "pot-changed (by marker)",
+                )
+                .await;
                 if !owed_identities.contains(&id) {
                     owed_identities.push(id);
                 }
@@ -2366,7 +2433,13 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
             let named = owed_identities_by_marker(&db, &txid, vout).await;
             let named_n = named.len();
             for id in named {
-                owed_mark_stale(&db, crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(&id)], "pot-changed (unattributed, by marker)").await;
+                owed_mark_stale(
+                    &db,
+                    crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
+                    &[JsValue::from_str(&id)],
+                    "pot-changed (unattributed, by marker)",
+                )
+                .await;
                 if !owed_identities.contains(&id) {
                     owed_identities.push(id);
                 }
@@ -2440,7 +2513,9 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
     if !owed_identities.is_empty() {
         let env2 = env.clone();
         ctx.wait_until(async move {
-            let Ok(db) = env2.d1("OVERLAY_DB") else { return };
+            let Ok(db) = env2.d1("OVERLAY_DB") else {
+                return;
+            };
             // N7: ONE tip read for every identity this call recomputes
             let tip = chaintracks_present_height_env(&env2, "owed").await.ok();
             for id in owed_identities {
@@ -2449,7 +2524,8 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
         });
     }
     json_response(
-        serde_json::json!({ "ok": true, "filed": filed, "skipped": skipped, "dropped": dropped }).to_string(),
+        serde_json::json!({ "ok": true, "filed": filed, "skipped": skipped, "dropped": dropped })
+            .to_string(),
         200,
     )
 }
@@ -2459,7 +2535,11 @@ pub(crate) async fn internal_pot_changed(mut req: Request, env: &worker::Env, ct
 /// has its owed rows marked STALE and re-derived after the answer (`wait_until`), the page told by `owed-changed`.
 /// The device-switch unit's hop branch read "nothing owed" for 90 s over a verified marker because only the cadence
 /// re-derived a hop-only identity; a hop funded IS a write the list is computed on.
-pub(crate) async fn internal_hop_changed(mut req: Request, env: &worker::Env, ctx: &worker::Context) -> Result<Response> {
+pub(crate) async fn internal_hop_changed(
+    mut req: Request,
+    env: &worker::Env,
+    ctx: &worker::Context,
+) -> Result<Response> {
     if !crate::internal_events::internal_bearer_ok(&req, env) {
         return Response::error("unauthorized", 401);
     }
@@ -2480,30 +2560,49 @@ pub(crate) async fn internal_hop_changed(mut req: Request, env: &worker::Env, ct
         ctx.wait_until(async move {
             crate::courier::flush(
                 counter_db,
-                vec![(crate::internal_events::COUNTER_HOP_CHANGED_DROPPED.to_string(), dropped as u64)],
+                vec![(
+                    crate::internal_events::COUNTER_HOP_CHANGED_DROPPED.to_string(),
+                    dropped as u64,
+                )],
             )
             .await;
         });
     }
     let db = env.d1("OVERLAY_DB")?;
     for id in &identities {
-        owed_mark_stale(&db, crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(id)], "hop-changed").await;
+        owed_mark_stale(
+            &db,
+            crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
+            &[JsValue::from_str(id)],
+            "hop-changed",
+        )
+        .await;
     }
     let env2 = env.clone();
     let ids = identities.clone();
     ctx.wait_until(async move {
-        let Ok(db) = env2.d1("OVERLAY_DB") else { return };
+        let Ok(db) = env2.d1("OVERLAY_DB") else {
+            return;
+        };
         let tip = chaintracks_present_height_env(&env2, "owed").await.ok();
         for id in ids {
             owed_recompute_and_push_coalesced(&env2, &db, &id, "hop-changed", tip).await;
         }
     });
-    json_response(serde_json::json!({ "ok": true, "identities": identities, "dropped": dropped }).to_string(), 200)
+    json_response(
+        serde_json::json!({ "ok": true, "identities": identities, "dropped": dropped }).to_string(),
+        200,
+    )
 }
 
 /// HIGH-4: mark the identities a change concerns STALE (their next read recomputes) and tell their pages. The
 /// filing route has no background context, so it never recomputes inline (MEDIUM-11): one cheap UPDATE + a push.
-pub(crate) async fn owed_mark_stale(db: &worker::D1Database, sql: &str, binds: &[JsValue], what: &str) {
+pub(crate) async fn owed_mark_stale(
+    db: &worker::D1Database,
+    sql: &str,
+    binds: &[JsValue],
+    what: &str,
+) {
     match db.prepare(sql).bind(binds) {
         Ok(stmt) => {
             if let Err(e) = stmt.counted_run().await {
@@ -2696,7 +2795,10 @@ async fn owed_recompute_inner(
     // recomputes; the read passes the one it fetched); `None` = read it here.
     tip_hint: Option<u64>,
 ) -> std::result::Result<OwedComputed, String> {
-    use crate::owed::{derive_owed_rows, outpoint_key, refund_output_sats, sort_rows_for_service, OwedInputs, ValidRefund};
+    use crate::owed::{
+        derive_owed_rows, outpoint_key, refund_output_sats, sort_rows_for_service, OwedInputs,
+        ValidRefund,
+    };
     use crate::results::SeatLetter;
     use std::collections::{HashMap, HashSet};
 
@@ -2709,8 +2811,16 @@ async fn owed_recompute_inner(
         // MEDIUM-8: a chaintracks blip must never rewrite the gate rows (refund-due → in-progress); when a previous
         // compute had a tip, the previous rows STAND and the fault is counted. A first compute proceeds without a
         // gate (the staleness rule re-derives it minutes later).
-        let prev = match db.prepare(crate::owed::OWED_STATE_READ_SQL).bind(&[JsValue::from_str(identity_lc)]) {
-            Ok(stmt) => stmt.counted_first::<OwedStateD1>().await.ok().flatten().and_then(|s| s.tip),
+        let prev = match db
+            .prepare(crate::owed::OWED_STATE_READ_SQL)
+            .bind(&[JsValue::from_str(identity_lc)])
+        {
+            Ok(stmt) => stmt
+                .counted_first::<OwedStateD1>()
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.tip),
             Err(_) => None,
         };
         if prev.is_some() {
@@ -2719,7 +2829,10 @@ async fn owed_recompute_inner(
     }
     let now_ms = worker::Date::now().as_millis() as i64;
     let started_ms = now_ms;
-    let over_budget = || worker::Date::now().as_millis() as i64 - started_ms > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS;
+    let over_budget = || {
+        worker::Date::now().as_millis() as i64 - started_ms
+            > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS
+    };
     let mut probes_made = 0usize;
     let mut spender_reads = 0usize;
     let mut courier_reads = 0usize;
@@ -2807,7 +2920,6 @@ async fn owed_recompute_inner(
         hops.extend(crate::hops_view::assemble_hops_view(rows).0);
     }
 
-
     // 4. the VALID filed refunds per pot, sized by MY home (the committed pay pkh of my seat)
     let my_pkh_by_pot: HashMap<String, String> = results
         .iter()
@@ -2841,9 +2953,16 @@ async fn owed_recompute_inner(
         struct TxidOnlyD1 {
             txid: String,
         }
-        let unknown: Vec<String> = results.iter().filter(|e| e.spent.is_none()).map(|e| e.pot_txid.to_ascii_lowercase()).collect();
+        let unknown: Vec<String> = results
+            .iter()
+            .filter(|e| e.spent.is_none())
+            .map(|e| e.pot_txid.to_ascii_lowercase())
+            .collect();
         for chunk in unknown.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-            let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             // the ledger writes its key lowercased; `txid IN` rides the primary key (the crate's N3 rule)
             let sql = format!("SELECT DISTINCT lower(txid) AS txid FROM pot_evictions WHERE readmittedAt IS NULL AND txid IN ({placeholders})");
             let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
@@ -2868,9 +2987,19 @@ async fn owed_recompute_inner(
             released_spends: Option<String>,
         }
         let since = JsValue::from_f64((now_ms - crate::owed::OWED_EVICTION_WINDOW_MS) as f64);
-        match db.prepare(crate::owed::OWED_EVICTIONS_WINDOW_SQL).bind(&[since]) {
-            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<EvictionRowD1>()) {
-                Ok(rows) => rows.into_iter().map(|r| (r.txid.to_ascii_lowercase(), r.released_spends)).collect(),
+        match db
+            .prepare(crate::owed::OWED_EVICTIONS_WINDOW_SQL)
+            .bind(&[since])
+        {
+            Ok(stmt) => match stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<EvictionRowD1>())
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|r| (r.txid.to_ascii_lowercase(), r.released_spends))
+                    .collect(),
                 Err(e) => {
                     console_warn!("[owed] evictions window failed (a refused hop keeps its sentence this pass): {e}");
                     Vec::new()
@@ -3140,8 +3269,10 @@ async fn owed_recompute_inner(
             crate::owed::note_markerless_ignored_markers(ignored);
         }
     }
-    let evicted_hop_outpoints: HashSet<String> =
-        crate::owed::refused_hop_outpoints_of(&crate::owed::released_hop_outpoints(&eviction_rows), &hops);
+    let evicted_hop_outpoints: HashSet<String> = crate::owed::refused_hop_outpoints_of(
+        &crate::owed::released_hop_outpoints(&eviction_rows),
+        &hops,
+    );
     // 4a-i. bsv-low #486: the DOOR's refusal ledger (`submit_refusals`, the overlay's): a JOIN refused synchronously
     //       was never admitted, so no eviction names its hops. The ledger holds one row per hop OUTPOINT, written
     //       only when the hop's own key signed the refused transaction (the overlay verifies it), and it is read
@@ -3158,9 +3289,19 @@ async fn owed_recompute_inner(
             reason: String,
         }
         let since = JsValue::from_f64((now_ms - crate::owed::OWED_EVICTION_WINDOW_MS) as f64);
-        let rows: Vec<(String, u32, String)> = match db.prepare(crate::owed::OWED_DOOR_REFUSALS_SQL).bind(&[JsValue::from_str(identity_lc), since]) {
-            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<RefusalRowD1>()) {
-                Ok(rows) => rows.into_iter().map(|r| (r.hop_txid, r.hop_vout as u32, r.reason)).collect(),
+        let rows: Vec<(String, u32, String)> = match db
+            .prepare(crate::owed::OWED_DOOR_REFUSALS_SQL)
+            .bind(&[JsValue::from_str(identity_lc), since])
+        {
+            Ok(stmt) => match stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<RefusalRowD1>())
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|r| (r.hop_txid, r.hop_vout as u32, r.reason))
+                    .collect(),
                 Err(e) => {
                     console_warn!("[owed] door refusals read failed (a door-refused hop keeps its sentence this pass): {e}");
                     Vec::new()
@@ -3195,12 +3336,18 @@ async fn owed_recompute_inner(
             pay_pkh_b: Option<String>,
         }
         let released = crate::owed::released_hops_by_eviction(&eviction_rows, &hops);
-        let mut wanted: Vec<String> = released.iter().map(|(_, evicted)| evicted.clone()).collect();
+        let mut wanted: Vec<String> = released
+            .iter()
+            .map(|(_, evicted)| evicted.clone())
+            .collect();
         wanted.sort_unstable();
         wanted.dedup();
         let mut twin_keys: Vec<(String, u32, crate::results::CommittedKeys)> = Vec::new();
         for chunk in wanted.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-            let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             // the twin carries its source's columns (`admit_fast::ensure_shadow`), keyed and cased like them
             let sql = format!(
                 "SELECT lower(txid) AS txid, outputIndex, pubA, pubB, payPkhA, payPkhB FROM pot_records_evicted \
@@ -3254,7 +3401,10 @@ async fn owed_recompute_inner(
                 b.push(JsValue::from_str(t));
                 b.push(JsValue::from_f64(f64::from(*v)));
             }
-            let stmt = db.prepare(&sql).bind(&b).map_err(|e| format!("owed backups bind: {e}"))?;
+            let stmt = db
+                .prepare(&sql)
+                .bind(&b)
+                .map_err(|e| format!("owed backups bind: {e}"))?;
             let rows: Vec<ValidRefundRowD1> = stmt
                 .counted_all()
                 .await
@@ -3268,8 +3418,16 @@ async fn owed_recompute_inner(
                 if valid_refunds.contains_key(&key) {
                     continue; // the newest valid row per pot
                 }
-                let my_sats = my_pkh_by_pot.get(&key).and_then(|pkh| refund_output_sats(raw, pkh));
-                valid_refunds.insert(key, ValidRefund { raw_hex: raw.to_string(), my_sats });
+                let my_sats = my_pkh_by_pot
+                    .get(&key)
+                    .and_then(|pkh| refund_output_sats(raw, pkh));
+                valid_refunds.insert(
+                    key,
+                    ValidRefund {
+                        raw_hex: raw.to_string(),
+                        my_sats,
+                    },
+                );
             }
         }
     }
@@ -3297,13 +3455,20 @@ async fn owed_recompute_inner(
                 // strands it at once; without a chain word its sweep press would wait for nothing)
                 // (bsv-low #486: refused by an eviction OR synchronously at the door)
                 let hop_key = outpoint_key(&h.hop_txid, h.hop_vout);
-                let join_refused = evicted_hop_outpoints.contains(&hop_key) || door_refused_hop_outpoints.contains_key(&hop_key);
-                let stranded_candidate = (h.status == crate::hops_view::HopStatus::Unspent || (h.status == crate::hops_view::HopStatus::Unknown && h.spent != Some(true)))
-                    && (join_refused || h.marker_created_at.is_some_and(|c| now_ms.saturating_sub(c) >= crate::owed::HOP_STRANDED_AFTER_MS));
+                let join_refused = evicted_hop_outpoints.contains(&hop_key)
+                    || door_refused_hop_outpoints.contains_key(&hop_key);
+                let stranded_candidate = (h.status == crate::hops_view::HopStatus::Unspent
+                    || (h.status == crate::hops_view::HopStatus::Unknown && h.spent != Some(true)))
+                    && (join_refused
+                        || h.marker_created_at.is_some_and(|c| {
+                            now_ms.saturating_sub(c) >= crate::owed::HOP_STRANDED_AFTER_MS
+                        }));
                 // AND a hop the index shows SPENT by a non-pot spender but never CONFIRMED (a sweep recorded before its
                 // block and never re-checked read "not mined yet" for days on the pair): the courier's confirmation
                 // heals the swept payout's claimability (`swept_home`), within the same probe budget
-                let stale_spent = h.status == crate::hops_view::HopStatus::Spent && h.spent_confirmed != Some(true) && h.spending_txid.is_some();
+                let stale_spent = h.status == crate::hops_view::HopStatus::Spent
+                    && h.spent_confirmed != Some(true)
+                    && h.spending_txid.is_some();
                 verified && (stranded_candidate || stale_spent)
             })
             .map(|h| (h.hop_txid.to_ascii_lowercase(), h.hop_vout))
@@ -3312,7 +3477,15 @@ async fn owed_recompute_inner(
             // bsv-low #484 (lens fold, M2): the overlay's reorg tombstone rides the same read (all-or-nothing, in
             // statements under D1's bind cap since delta fold 2's D-L5: the memos and the stamp arrive together or
             // not at all, and with no memos every candidate is asked)
-            let memos = read_probe_memos(db, &[candidates.as_slice(), &[crate::hops_view::reorg_mark_target()]].concat()).await;
+            let memos = read_probe_memos(
+                db,
+                &[
+                    candidates.as_slice(),
+                    &[crate::hops_view::reorg_mark_target()],
+                ]
+                .concat(),
+            )
+            .await;
             // bsv-low #469, the stranded cell's run 5 (2026-09-19): a CONFIRMED spend's memo answers for two hours
             // (`PROBE_MEMO_CONFIRMED_MAX_AGE_MS`; the gate's NIT-8: it read "a day" here after the window shrank), and the
             // outpoints still to ask go never-probed first (newest marker first) then oldest memo first, so the
@@ -3331,20 +3504,51 @@ async fn owed_recompute_inner(
             );
             let marker_at: HashMap<String, i64> = hops
                 .iter()
-                .filter_map(|h| h.marker_created_at.map(|c| (format!("{}.{}", h.hop_txid.to_ascii_lowercase(), h.hop_vout), c)))
+                .filter_map(|h| {
+                    h.marker_created_at.map(|c| {
+                        (
+                            format!("{}.{}", h.hop_txid.to_ascii_lowercase(), h.hop_vout),
+                            c,
+                        )
+                    })
+                })
                 .collect();
             // the never-probed share of the front is capped at half the budget (the gate's M2): the expired memos always get slots
-            let to_probe = crate::hops_view::order_probe_targets(to_probe, &memos, &marker_at, crate::owed::OWED_PROBES_PER_RECOMPUTE / 2, (now_ms / 60_000).max(0) as usize);
+            let to_probe = crate::hops_view::order_probe_targets(
+                to_probe,
+                &memos,
+                &marker_at,
+                crate::owed::OWED_PROBES_PER_RECOMPUTE / 2,
+                (now_ms / 60_000).max(0) as usize,
+            );
             for (t, v, p) in answered {
                 if let Some(s) = p.spending_txid.as_deref() {
                     chain_spenders.push(s.to_ascii_lowercase());
                 }
                 // the memo's age rides the word (the gate's L5): the newest memo for the key, as the split judged it
-                let age_ms = memos.iter().filter(|m| m.outpoint == format!("{t}.{v}")).map(|m| now_ms - m.probed_at_ms).min();
-                if crate::hops_view::confirmed_in_reorg_grace(p.spent_confirmed, now_ms - age_ms.unwrap_or(0), reorg_clear) {
+                let age_ms = memos
+                    .iter()
+                    .filter(|m| m.outpoint == format!("{t}.{v}"))
+                    .map(|m| now_ms - m.probed_at_ms)
+                    .min();
+                if crate::hops_view::confirmed_in_reorg_grace(
+                    p.spent_confirmed,
+                    now_ms - age_ms.unwrap_or(0),
+                    reorg_clear,
+                ) {
                     grace_words.insert(outpoint_key(&t, v));
                 }
-                hop_chain.insert(outpoint_key(&t, v), crate::owed::HopChainWord { looked: p.known, spent: p.spent, spending_txid: p.spending_txid, spent_confirmed: p.spent_confirmed, stale: false, age_ms });
+                hop_chain.insert(
+                    outpoint_key(&t, v),
+                    crate::owed::HopChainWord {
+                        looked: p.known,
+                        spent: p.spent,
+                        spending_txid: p.spending_txid,
+                        spent_confirmed: p.spent_confirmed,
+                        stale: false,
+                        age_ms,
+                    },
+                );
             }
             let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
             let mut probed = 0usize;
@@ -3354,33 +3558,64 @@ async fn owed_recompute_inner(
                     budget_cut = true;
                 }
                 if probed >= crate::owed::OWED_PROBES_PER_RECOMPUTE || budget_cut {
-                    if let Some(m) = memos.iter().filter(|m| m.outpoint == format!("{t}.{v}")).max_by_key(|m| m.probed_at_ms) {
+                    if let Some(m) = memos
+                        .iter()
+                        .filter(|m| m.outpoint == format!("{t}.{v}"))
+                        .max_by_key(|m| m.probed_at_ms)
+                    {
                         if let Some(s) = m.spending_txid.as_deref() {
                             chain_spenders.push(s.to_ascii_lowercase());
                         }
                         // D-M1: a confirmed memo the grace refused its window is not served as confirmed
                         // (D2-M1: remembered with the spender it names, so it can still contradict a proof)
                         if crate::hops_view::confirmation_refused(m, reorg_clear) {
-                            refused_words.insert(key.clone(), m.spending_txid.as_deref().map(str::to_ascii_lowercase));
+                            refused_words.insert(
+                                key.clone(),
+                                m.spending_txid.as_deref().map(str::to_ascii_lowercase),
+                            );
                         }
-                        hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear));
+                        hop_chain.insert(
+                            key,
+                            crate::hops_view::stale_memo_word(m, now_ms, reorg_clear),
+                        );
                     }
                     continue;
                 }
                 probed += 1;
                 probes_made += 1;
-                let row = spent_any_resolve_cached(t, *v, "owed", crate::results::SPENT_ANY_CACHE_TTL_MS).await;
-                let probe = crate::hops_view::ChainSpendProbe { known: row.known, spent: row.spent, spending_txid: row.spending_txid.clone(), spent_confirmed: row.spent_confirmed };
+                let row =
+                    spent_any_resolve_cached(t, *v, "owed", crate::results::SPENT_ANY_CACHE_TTL_MS)
+                        .await;
+                let probe = crate::hops_view::ChainSpendProbe {
+                    known: row.known,
+                    spent: row.spent,
+                    spending_txid: row.spending_txid.clone(),
+                    spent_confirmed: row.spent_confirmed,
+                };
                 if let Some(m) = crate::hops_view::probe_memo_of(t, *v, &probe, now_ms) {
                     fresh.push(m);
                 }
                 if let Some(s) = row.spending_txid.as_deref() {
                     chain_spenders.push(s.to_ascii_lowercase());
                 }
-                if crate::hops_view::confirmed_in_reorg_grace(row.spent_confirmed, now_ms, reorg_clear) {
+                if crate::hops_view::confirmed_in_reorg_grace(
+                    row.spent_confirmed,
+                    now_ms,
+                    reorg_clear,
+                ) {
                     grace_words.insert(key.clone());
                 }
-                hop_chain.insert(key, crate::owed::HopChainWord { looked: row.known, spent: row.spent, spending_txid: row.spending_txid, spent_confirmed: row.spent_confirmed, stale: false, age_ms: None });
+                hop_chain.insert(
+                    key,
+                    crate::owed::HopChainWord {
+                        looked: row.known,
+                        spent: row.spent,
+                        spending_txid: row.spending_txid,
+                        spent_confirmed: row.spent_confirmed,
+                        stale: false,
+                        age_ms: None,
+                    },
+                );
             }
             if !fresh.is_empty() {
                 write_probe_memos(db, &fresh).await;
@@ -3408,8 +3643,14 @@ async fn owed_recompute_inner(
             #[serde(rename = "sweepRawHex")]
             sweep_raw_hex: String,
         }
-        let rows = match db.prepare(crate::hopsweep::HOPSWEEPS_FOR_IDENTITY_SQL).bind(&[JsValue::from_str(identity_lc)]) {
-            Ok(stmt) => stmt.counted_all().await.and_then(|r| r.results::<SweepRowD1>()),
+        let rows = match db
+            .prepare(crate::hopsweep::HOPSWEEPS_FOR_IDENTITY_SQL)
+            .bind(&[JsValue::from_str(identity_lc)])
+        {
+            Ok(stmt) => stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<SweepRowD1>()),
             Err(e) => Err(e),
         };
         match rows {
@@ -3427,13 +3668,18 @@ async fn owed_recompute_inner(
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert(filing);
                         }
-                        std::collections::hash_map::Entry::Occupied(o) => older_sweeps.entry(o.key().clone()).or_default().push(filing),
+                        std::collections::hash_map::Entry::Occupied(o) => older_sweeps
+                            .entry(o.key().clone())
+                            .or_default()
+                            .push(filing),
                     }
                 }
             }
             Err(e) => {
                 crate::owed::note_hop_sweeps_read_fault();
-                console_warn!("[owed] hop-sweeps read failed (no filed sweep served this pass): {e}");
+                console_warn!(
+                    "[owed] hop-sweeps read failed (no filed sweep served this pass): {e}"
+                );
             }
         }
     }
@@ -3454,7 +3700,16 @@ async fn owed_recompute_inner(
             #[serde(rename = "proofHeight", default)]
             proof_height: Option<f64>,
         }
-        let mut sweep_txids: Vec<String> = hop_sweeps.values().map(|s| s.sweep_txid.clone()).chain(older_sweeps.values().flatten().map(|s| s.sweep_txid.clone())).collect();
+        let mut sweep_txids: Vec<String> = hop_sweeps
+            .values()
+            .map(|s| s.sweep_txid.clone())
+            .chain(
+                older_sweeps
+                    .values()
+                    .flatten()
+                    .map(|s| s.sweep_txid.clone()),
+            )
+            .collect();
         sweep_txids.sort_unstable();
         sweep_txids.dedup();
         let mut proven: HashMap<String, Option<u64>> = HashMap::new();
@@ -3463,13 +3718,19 @@ async fn owed_recompute_inner(
             let sql = crate::hopsweep::sweep_proofs_sql(chunk.len());
             let binds: Vec<JsValue> = chunk.iter().map(|t| JsValue::from_str(t)).collect();
             let rows = match db.prepare(&sql).bind(&binds) {
-                Ok(stmt) => stmt.counted_all().await.and_then(|r| r.results::<ProofRowD1>()),
+                Ok(stmt) => stmt
+                    .counted_all()
+                    .await
+                    .and_then(|r| r.results::<ProofRowD1>()),
                 Err(e) => Err(e),
             };
             match rows {
                 Ok(rows) => {
                     for r in rows {
-                        proven.insert(r.txid.to_ascii_lowercase(), r.proof_height.filter(|h| *h > 0.0).map(|h| h as u64));
+                        proven.insert(
+                            r.txid.to_ascii_lowercase(),
+                            r.proof_height.filter(|h| *h > 0.0).map(|h| h as u64),
+                        );
                     }
                 }
                 Err(e) => {
@@ -3506,7 +3767,10 @@ async fn owed_recompute_inner(
 
     // delta fold 2 (D2-M1): a refused past-budget word naming ANOTHER spender than the filed sweep still contradicts
     // the index's proof of that sweep (the grace narrows the claimable word, never the contradiction)
-    let proofs_set_aside = crate::hops_view::set_aside_proofs_a_refused_word_contradicts(&mut hop_sweeps, &refused_words);
+    let proofs_set_aside = crate::hops_view::set_aside_proofs_a_refused_word_contradicts(
+        &mut hop_sweeps,
+        &refused_words,
+    );
 
     // 5. the `collected` markers naming this identity — VERIFIED under the identity (the gate's HIGH-1: the table
     //    is byte-format admitted, a stranger can plant a row naming any (identity, game); only a signature the
@@ -3531,7 +3795,10 @@ async fn owed_recompute_inner(
         // every spent pot's game AND every hop's game (a swept hop-only game has no pot row; its payout retires by
         // its game's filing too — the collect pass of 2026-09-19 filed five that stood)
         let game_ids = crate::owed::collected_lookup_games(
-            results.iter().filter(|e| e.spent == Some(true)).map(|e| e.game_id.as_str()),
+            results
+                .iter()
+                .filter(|e| e.spent == Some(true))
+                .map(|e| e.game_id.as_str()),
             hops.iter().map(|h| h.game_id.as_str()),
         );
         for chunk in game_ids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
@@ -3543,18 +3810,29 @@ async fn owed_recompute_inner(
                 b.push(JsValue::from_str(g));
             }
             let rows = match db.prepare(&sql).bind(&b) {
-                Ok(stmt) => stmt.counted_all().await.and_then(|r| r.results::<CollectedRowD1>()),
+                Ok(stmt) => stmt
+                    .counted_all()
+                    .await
+                    .and_then(|r| r.results::<CollectedRowD1>()),
                 Err(e) => Err(e),
             };
             match rows {
                 Ok(rows) => {
                     for r in rows {
-                        collected.row(identity_lc, &r.game_id, r.sig_hex.as_deref(), r.txid.as_deref(), r.pay_txid.as_deref());
+                        collected.row(
+                            identity_lc,
+                            &r.game_id,
+                            r.sig_hex.as_deref(),
+                            r.txid.as_deref(),
+                            r.pay_txid.as_deref(),
+                        );
                     }
                 }
                 Err(e) => {
                     crate::owed::note_collected_read_fault();
-                    console_warn!("[owed] collected read failed (no payout retired this pass): {e}");
+                    console_warn!(
+                        "[owed] collected read failed (no payout retired this pass): {e}"
+                    );
                 }
             }
         }
@@ -3582,8 +3860,14 @@ async fn owed_recompute_inner(
         let sql = crate::owed::covenant_spenders_sql(chunk.len());
         let b: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
         match db.prepare(&sql).bind(&b) {
-            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<TxidRowD1>()) {
-                Ok(rows) => pot_spenders.extend(rows.into_iter().map(|r| r.txid.to_ascii_lowercase())),
+            Ok(stmt) => match stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<TxidRowD1>())
+            {
+                Ok(rows) => {
+                    pot_spenders.extend(rows.into_iter().map(|r| r.txid.to_ascii_lowercase()))
+                }
                 Err(e) => {
                     pot_spenders_faulted = true;
                     crate::owed::note_pot_spenders_read_fault();
@@ -3634,7 +3918,10 @@ async fn owed_recompute_inner(
             let named: Option<String> = if h.spent == Some(true) {
                 h.spending_txid.as_deref().map(str::to_ascii_lowercase)
             } else {
-                hop_chain.get(&key).filter(|w| w.looked && w.spent == Some(true)).and_then(|w| w.spending_txid.as_deref().map(str::to_ascii_lowercase))
+                hop_chain
+                    .get(&key)
+                    .filter(|w| w.looked && w.spent == Some(true))
+                    .and_then(|w| w.spending_txid.as_deref().map(str::to_ascii_lowercase))
             };
             if let Some(sp) = named {
                 if !pot_spenders.contains(&sp) && seen_spenders.insert(sp.clone()) {
@@ -3650,7 +3937,9 @@ async fn owed_recompute_inner(
         for h in hops.iter() {
             let key = outpoint_key(&h.hop_txid, h.hop_vout);
             if let Some(s) = hop_sweeps.get(&key).filter(|s| s.index_proven) {
-                if !pot_spenders.contains(&s.sweep_txid) && seen_spenders.insert(s.sweep_txid.clone()) {
+                if !pot_spenders.contains(&s.sweep_txid)
+                    && seen_spenders.insert(s.sweep_txid.clone())
+                {
                     ordered.push((h.marker_created_at.unwrap_or(0), s.sweep_txid.clone()));
                 }
             }
@@ -3664,7 +3953,10 @@ async fn owed_recompute_inner(
         }
         // phase 1: the index's bytes (D1), a parsed courier memo, or the isolate's tx-any cache — no courier asked
         let mut wanted: Vec<String> = Vec::new();
-        for (_at, sp) in ordered.into_iter().take(crate::owed::OWED_SPENDER_READS_PER_RECOMPUTE) {
+        for (_at, sp) in ordered
+            .into_iter()
+            .take(crate::owed::OWED_SPENDER_READS_PER_RECOMPUTE)
+        {
             if over_budget() {
                 budget_cut = true;
                 break;
@@ -3707,8 +3999,15 @@ async fn owed_recompute_inner(
             };
             let mut outs = spender_outputs_of(&tx);
             // the index's own spend word per output (the swept sats collected and moved on, or still at the home)
-            if let Ok(stmt) = db.prepare("SELECT outputIndex, spent FROM pot_records WHERE txid = ?1").bind(&[JsValue::from_str(&sp)]) {
-                if let Ok(rows) = stmt.counted_all().await.and_then(|r| r.results::<SpentRowD1>()) {
+            if let Ok(stmt) = db
+                .prepare("SELECT outputIndex, spent FROM pot_records WHERE txid = ?1")
+                .bind(&[JsValue::from_str(&sp)])
+            {
+                if let Ok(rows) = stmt
+                    .counted_all()
+                    .await
+                    .and_then(|r| r.results::<SpentRowD1>())
+                {
                     for r in rows {
                         if let Some(o) = outs.iter_mut().find(|o| o.vout == r.output_index as u32) {
                             o.spent = r.spent.map(|v| v >= 1.0);
@@ -3789,7 +4088,12 @@ async fn owed_recompute_inner(
     // 6d. bsv-low #492 / #512: the payouts this identity's wallet ALREADY HOLDS by its own signed word: the
     //     (game, paying txid) names of its held filings, as step 5 folded them. A row such a filing names is not
     //     served.
-    let crate::owed::CollectedFold { verified: collected_verified, present: collected_present, held: held_verified, held_key_mismatches } = collected;
+    let crate::owed::CollectedFold {
+        verified: collected_verified,
+        present: collected_present,
+        held: held_verified,
+        held_key_mismatches,
+    } = collected;
     crate::owed::note_held_filings(held_verified.len(), held_key_mismatches);
     if held_key_mismatches > 0 {
         console_warn!("[owed] {held_key_mismatches} collected row(s) carry a payTxid their key was not filed for (they retire nothing)");
@@ -3816,7 +4120,7 @@ async fn owed_recompute_inner(
     });
     for id in due
         .into_iter()
-        .take(crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE)
+        .take(crate::tracker_host::runtime::OWED_FALLBACK_WRITE_EVENTS)
     {
         if over_budget() {
             walk_cut = true;
@@ -3874,7 +4178,15 @@ async fn owed_recompute_inner(
     // 6c. bsv-low #485: the home outputs of the CONFIRMED courier-proven payouts (the candidates are the derivation's
     //     own: `owed::courier_home_outputs`), looked at within a small budget, so such a row can RETIRE on evidence
     //     this crate decides: the home key's signature over a spender's bytes (`owed_home_spend_walk`).
-    let home_spends = owed_home_spend_walk(env, db, identity_lc, &crate::owed::courier_home_outputs(&inputs), now_ms, started_ms).await;
+    let home_spends = owed_home_spend_walk(
+        env,
+        db,
+        identity_lc,
+        &crate::owed::courier_home_outputs(&inputs),
+        now_ms,
+        started_ms,
+    )
+    .await;
     inputs.home_spends = &home_spends;
     let mut rows = derive_owed_rows(&inputs);
     // H1/L2: a deferred older row keeps a counted "could not judge" sentence, with its press cleared.
@@ -3933,7 +4245,9 @@ async fn owed_recompute_inner(
     }
     // #517 (the gate's LOW-1, the delta-verify's N-A): the contradiction fact rides the rows; counted here, once per hop
     crate::hops_view::mark_refused_word_rows(&mut rows, &refused_words, &proofs_set_aside);
-    crate::owed::note_sweep_proof_contradictions(crate::owed::count_sweep_proof_contradictions(&rows));
+    crate::owed::note_sweep_proof_contradictions(crate::owed::count_sweep_proof_contradictions(
+        &rows,
+    ));
     crate::hops_view::mark_reorg_grace_rows(&mut rows, &grace_words);
     sort_rows_for_service(&mut rows);
     if rows.len() > crate::owed::OWED_MAX_ROWS {
@@ -3950,8 +4264,17 @@ async fn owed_recompute_inner(
     //     start chunk turning with the clock), and a row it leaves `null` this pass is asked again on the next.
     {
         let wanted = crate::owed::pay_vout_wanted(&rows);
-        let mut world = PayVoutReads { db, started_ms: worker::Date::now().as_millis() as i64 };
-        let pass = crate::owed::pay_vout_pass(&mut world, &wanted, crate::logic::D1_CHUNK_OUTPOINTS, now_ms as u64).await;
+        let mut world = PayVoutReads {
+            db,
+            started_ms: worker::Date::now().as_millis() as i64,
+        };
+        let pass = crate::owed::pay_vout_pass(
+            &mut world,
+            &wanted,
+            crate::logic::D1_CHUNK_OUTPOINTS,
+            now_ms as u64,
+        )
+        .await;
         budget_cut |= pass.cut;
         crate::owed::mark_pay_vouts(&mut rows, &pass.vouts);
     }
@@ -3969,7 +4292,11 @@ async fn owed_recompute_inner(
                 crate::owed::OwedBind::Null => JsValue::NULL,
             })
             .collect();
-        stmts.push(db.prepare(*sql).bind(&b).map_err(|e| format!("owed write bind: {e}"))?);
+        stmts.push(
+            db.prepare(*sql)
+                .bind(&b)
+                .map_err(|e| format!("owed write bind: {e}"))?,
+        );
     }
     // H1: advance the durable cursor in the SAME atomic snapshot batch, never after a failed write.
     if let Some(next) = &markerless_next {
@@ -4000,7 +4327,10 @@ async fn owed_recompute_inner(
         #[serde(rename = "computedAtMs")]
         computed_at_ms: f64,
     }
-    let stamp_after = written.last().and_then(|r| r.results::<StampD1>().ok()).and_then(|v| v.first().map(|s| s.computed_at_ms as i64));
+    let stamp_after = written
+        .last()
+        .and_then(|r| r.results::<StampD1>().ok())
+        .and_then(|v| v.first().map(|s| s.computed_at_ms as i64));
     // bsv-low #487: the write is monotonic in the walk's stamp; a snapshot older than the marker's changed nothing
     // (a walk that outlived its takeover, or the slower of two isolates). An unreadable read-back is taken as landed
     // (the batch itself succeeded; the pre-#487 word).
@@ -4013,7 +4343,13 @@ async fn owed_recompute_inner(
             stamp_after.unwrap_or_default(),
             worker::Date::now().as_millis() as i64 - started_ms
         );
-        return Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut, superseded });
+        return Ok(OwedComputed {
+            rows,
+            tip,
+            computed_at_ms: now_ms,
+            truncated: walk_cut,
+            superseded,
+        });
     }
     crate::owed::note_recompute(source, &rows);
     if courier_reads > 0 || courier_cap_hit {
@@ -4035,7 +4371,13 @@ async fn owed_recompute_inner(
         budget_cut,
         walk_cut
     );
-    Ok(OwedComputed { rows, tip, computed_at_ms: now_ms, truncated: walk_cut, superseded })
+    Ok(OwedComputed {
+        rows,
+        tip,
+        computed_at_ms: now_ms,
+        truncated: walk_cut,
+        superseded,
+    })
 }
 
 /// bsv-low #485: what the brain can establish about the home outputs of a courier-proven payout, per outpoint
@@ -4064,30 +4406,53 @@ async fn owed_home_spend_walk(
     now_ms: i64,
     started_ms: i64,
 ) -> std::collections::HashMap<String, crate::owed::HomeSpendWord> {
-    use crate::owed::{home_cursor_of, home_cursor_target, home_latch_target, home_walk_window, OWED_HOME_WINDOW};
+    use crate::owed::{
+        home_cursor_of, home_cursor_target, home_latch_target, home_walk_window, OWED_HOME_WINDOW,
+    };
     if candidates.is_empty() {
         return std::collections::HashMap::new();
     }
     let memo_targets = |window: &[crate::owed::CourierHomeOutput]| -> Vec<(String, u32)> {
-        window.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).chain(window.iter().map(|c| (c.sweep_txid.clone(), c.vout))).collect()
+        window
+            .iter()
+            .map(|c| home_latch_target(&c.sweep_txid, c.vout))
+            .chain(window.iter().map(|c| (c.sweep_txid.clone(), c.vout)))
+            .collect()
     };
     // a lived-in identity holds a handful: the cursor rides the one memo read. Past the window, it is read first.
     let (window, memos) = if candidates.len() <= OWED_HOME_WINDOW {
         let mut targets = vec![home_cursor_target(identity_lc)];
         targets.extend(memo_targets(candidates));
         let memos = read_probe_memos(db, &targets).await;
-        (home_walk_window(candidates, home_cursor_of(&memos, identity_lc).as_deref(), OWED_HOME_WINDOW), memos)
+        (
+            home_walk_window(
+                candidates,
+                home_cursor_of(&memos, identity_lc).as_deref(),
+                OWED_HOME_WINDOW,
+            ),
+            memos,
+        )
     } else {
-        let cursor = home_cursor_of(&read_probe_memos(db, &[home_cursor_target(identity_lc)]).await, identity_lc);
+        let cursor = home_cursor_of(
+            &read_probe_memos(db, &[home_cursor_target(identity_lc)]).await,
+            identity_lc,
+        );
         let window = home_walk_window(candidates, cursor.as_deref(), OWED_HOME_WINDOW);
         let memos = read_probe_memos(db, &memo_targets(&window)).await;
         (window, memos)
     };
     // the latch keys and the chain keys never collide (`HOME_SPEND_LATCH_PREFIX`), so one list serves both readers
-    let mut world = HomeWalkCouriers { env, db, started_ms };
+    let mut world = HomeWalkCouriers {
+        env,
+        db,
+        started_ms,
+    };
     let pass = crate::owed::home_walk_pass(&mut world, &window, &memos, &memos, now_ms).await;
     let mut writes = pass.memos;
-    for latch in writes.iter().filter(|m| m.outpoint.starts_with(crate::owed::HOME_SPEND_LATCH_PREFIX)) {
+    for latch in writes
+        .iter()
+        .filter(|m| m.outpoint.starts_with(crate::owed::HOME_SPEND_LATCH_PREFIX))
+    {
         worker::console_log!(
             "[owed] home output {} is proven spent by {} (the home key's signature verified): the courier-proven payout retires",
             latch.outpoint,
@@ -4111,7 +4476,8 @@ struct PayVoutReads<'a> {
 }
 impl crate::owed::PayVoutWorld for PayVoutReads<'_> {
     fn over_own_budget(&self) -> bool {
-        worker::Date::now().as_millis() as i64 - self.started_ms > crate::owed::OWED_PAY_VOUT_READ_BUDGET_MS
+        worker::Date::now().as_millis() as i64 - self.started_ms
+            > crate::owed::OWED_PAY_VOUT_READ_BUDGET_MS
     }
     fn memo_get(&self, key: &str) -> Option<u32> {
         owed_pay_vout_memo_get(key)
@@ -4121,21 +4487,31 @@ impl crate::owed::PayVoutWorld for PayVoutReads<'_> {
     }
     async fn stored_raws(&mut self, txids: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
         let placeholders = vec!["?"; txids.len()].join(",");
-        let sql = format!("SELECT txid, hex(beef) AS beef FROM pot_beefs WHERE txid IN ({placeholders})");
+        let sql =
+            format!("SELECT txid, hex(beef) AS beef FROM pot_beefs WHERE txid IN ({placeholders})");
         let binds: Vec<JsValue> = txids.iter().map(|t| JsValue::from_str(t)).collect();
         let read = match self.db.prepare(&sql).bind(&binds) {
-            Ok(stmt) => stmt.counted_all().await.and_then(|r| r.results::<PotBeefRowD1>()),
+            Ok(stmt) => stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<PotBeefRowD1>()),
             Err(e) => Err(e),
         };
         let beefs = read.map_err(|e| {
-            console_warn!("[owed] payVout read failed (those rows serve payVout: null this pass): {e}");
+            console_warn!(
+                "[owed] payVout read failed (those rows serve payVout: null this pass): {e}"
+            );
             e.to_string()
         })?;
         Ok(beefs
             .into_iter()
             .filter_map(|b| {
                 let txid = b.txid.to_ascii_lowercase();
-                let raw = b.beef.and_then(|h| decode_beef_hex(&h)).and_then(|bytes| crate::logic::extract_raw_tx_hex(&bytes, &txid)).and_then(|h| hex::decode(h).ok())?;
+                let raw = b
+                    .beef
+                    .and_then(|h| decode_beef_hex(&h))
+                    .and_then(|bytes| crate::logic::extract_raw_tx_hex(&bytes, &txid))
+                    .and_then(|h| hex::decode(h).ok())?;
                 Some((txid, raw))
             })
             .collect())
@@ -4150,11 +4526,19 @@ struct HomeWalkCouriers<'a> {
 }
 impl crate::owed::HomeWalkWorld for HomeWalkCouriers<'_> {
     fn over_budget(&self) -> bool {
-        worker::Date::now().as_millis() as i64 - self.started_ms > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS
+        worker::Date::now().as_millis() as i64 - self.started_ms
+            > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS
     }
     async fn probe(&mut self, txid: &str, vout: u32) -> crate::hops_view::ChainSpendProbe {
-        let row = spent_any_resolve_cached(txid, vout, "owed", crate::results::SPENT_ANY_CACHE_TTL_MS).await;
-        crate::hops_view::ChainSpendProbe { known: row.known, spent: row.spent, spending_txid: row.spending_txid, spent_confirmed: row.spent_confirmed }
+        let row =
+            spent_any_resolve_cached(txid, vout, "owed", crate::results::SPENT_ANY_CACHE_TTL_MS)
+                .await;
+        crate::hops_view::ChainSpendProbe {
+            known: row.known,
+            spent: row.spent,
+            spending_txid: row.spending_txid,
+            spent_confirmed: row.spent_confirmed,
+        }
     }
     async fn stored_spender(&mut self, spender_txid: &str) -> Option<Vec<u8>> {
         match load_stored_beef(self.env, self.db, spender_txid).await {
@@ -4197,7 +4581,8 @@ pub(crate) async fn owed_recompute_and_push(
     }
     // bsv-low #499 (lens fold M3): the walk runs under its own ledger, keyed `owed-recompute` in `d1Budget` (it runs
     // after the answer, in `wait_until`, where no request's scope holds it; before, it landed only in `unscoped`)
-    let (walked, d1) = crate::d1_ledger::scoped(owed_recompute(env, db, identity_lc, source, tip_hint)).await;
+    let (walked, d1) =
+        crate::d1_ledger::scoped(owed_recompute(env, db, identity_lc, source, tip_hint)).await;
     crate::d1_ledger::record(OWED_RECOMPUTE_LEDGER_KEY, d1);
     match walked {
         // bsv-low #487: a snapshot the write refused is not announced (the newer walk's own push stands)
@@ -4206,7 +4591,12 @@ pub(crate) async fn owed_recompute_and_push(
             crate::internal_events::first_party_push(
                 env,
                 identity_lc,
-                crate::owed::owed_changed_event_body(identity_lc, source, c.rows.len(), c.computed_at_ms),
+                crate::owed::owed_changed_event_body(
+                    identity_lc,
+                    source,
+                    c.rows.len(),
+                    c.computed_at_ms,
+                ),
             )
             .await;
         }
@@ -4304,7 +4694,11 @@ fn owed_refresh_begin(identity_lc: &str, now_ms: i64) -> Option<i64> {
     })
 }
 /// PURE (pinned): release the mark only when it is still OURS.
-pub(crate) fn owed_lock_release(map: &mut std::collections::HashMap<String, (i64, i64)>, identity_lc: &str, token: i64) -> bool {
+pub(crate) fn owed_lock_release(
+    map: &mut std::collections::HashMap<String, (i64, i64)>,
+    identity_lc: &str,
+    token: i64,
+) -> bool {
     if map.get(identity_lc).map(|(t, _)| *t) == Some(token) {
         map.remove(identity_lc);
         true
@@ -4313,7 +4707,12 @@ pub(crate) fn owed_lock_release(map: &mut std::collections::HashMap<String, (i64
     }
 }
 /// PURE (pinned): a live claim re-stamps its progress (only while the mark is still its own).
-pub(crate) fn owed_lock_touch(map: &mut std::collections::HashMap<String, (i64, i64)>, identity_lc: &str, token: i64, now_ms: i64) -> bool {
+pub(crate) fn owed_lock_touch(
+    map: &mut std::collections::HashMap<String, (i64, i64)>,
+    identity_lc: &str,
+    token: i64,
+    now_ms: i64,
+) -> bool {
     match map.get_mut(identity_lc) {
         Some((t, progress)) if *t == token => {
             *progress = now_ms;
@@ -4390,7 +4789,13 @@ pub(crate) async fn owed_recompute_claimed(
             // the delta-verify's LOW-1: an ask left folded past the bound is served by the NEXT read — but the walk just
             // wrote `stale = 0`, so the mark is set again here (the ask itself stays in the map for the next claim)
             if OWED_RERUN.with(|m| m.borrow().contains_key(identity_lc)) {
-                owed_mark_stale(db, crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(identity_lc)], "coalesced overflow").await;
+                owed_mark_stale(
+                    db,
+                    crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
+                    &[JsValue::from_str(identity_lc)],
+                    "coalesced overflow",
+                )
+                .await;
             }
             break;
         }
@@ -4407,10 +4812,26 @@ pub(crate) async fn owed_recompute_claimed(
 
 /// The snapshot the table holds for `identity_lc` (the marker, then its rows): what a superseded read serves.
 /// `None` on any fault or a missing marker.
-async fn owed_read_stored(db: &worker::D1Database, identity_lc: &str) -> Option<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool)> {
+async fn owed_read_stored(
+    db: &worker::D1Database,
+    identity_lc: &str,
+) -> Option<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool)> {
     let id = [JsValue::from_str(identity_lc)];
-    let st = db.prepare(crate::owed::OWED_STATE_READ_SQL).bind(&id).ok()?.counted_first::<OwedStateD1>().await.ok()??;
-    let rows = db.prepare(crate::owed::OWED_ROWS_READ_SQL).bind(&id).ok()?.counted_all().await.and_then(|r| r.results::<OwedRowD1>()).ok()?;
+    let st = db
+        .prepare(crate::owed::OWED_STATE_READ_SQL)
+        .bind(&id)
+        .ok()?
+        .counted_first::<OwedStateD1>()
+        .await
+        .ok()??;
+    let rows = db
+        .prepare(crate::owed::OWED_ROWS_READ_SQL)
+        .bind(&id)
+        .ok()?
+        .counted_all()
+        .await
+        .and_then(|r| r.results::<OwedRowD1>())
+        .ok()?;
     Some((
         rows.into_iter().filter_map(OwedRowD1::into_row).collect(),
         st.tip.map(|t| t as u64),
@@ -4432,12 +4853,18 @@ async fn owed_compute_on_read(
         // reader is served the stored rows, never its own older ones. The delta fold's LOW-4: when the stored read
         // faults too, the walk's own rows are served for that one response with NO claimable word in them
         // (`owed::superseded_read_snapshot`): the older snapshot may hold a press the newer walk retired.
-        Ok(c) if crate::owed::read_answer_after_compute(c.superseded) == crate::owed::ReadAnswer::Stored => {
+        Ok(c)
+            if crate::owed::read_answer_after_compute(c.superseded)
+                == crate::owed::ReadAnswer::Stored =>
+        {
             let stored = owed_read_stored(db, identity_lc).await;
             if stored.is_none() {
                 console_warn!("[owed] compute on read ({source}): superseded and the stored read faulted: the older rows are served with no claimable word");
             }
-            Ok(crate::owed::superseded_read_snapshot(stored, (c.rows, c.tip, c.computed_at_ms, c.truncated)))
+            Ok(crate::owed::superseded_read_snapshot(
+                stored,
+                (c.rows, c.tip, c.computed_at_ms, c.truncated),
+            ))
         }
         Ok(c) => Ok((c.rows, c.tip, c.computed_at_ms, c.truncated)),
         Err(e) => {
@@ -4465,7 +4892,10 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
     };
     let now_ms = worker::Date::now().as_millis() as i64;
     if !crate::logic::valid_identity(&identity) {
-        return json_response(crate::owed::owed_body(&identity, None, &[], now_ms, false), 200);
+        return json_response(
+            crate::owed::owed_body(&identity, None, &[], now_ms, false),
+            200,
+        );
     }
     let db = match ctx.env.d1("OVERLAY_DB") {
         Ok(db) => db,
@@ -4503,7 +4933,10 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                 #[allow(dead_code)]
                 present: Option<f64>,
             }
-            let known = match db.prepare(crate::owed::OWED_IDENTITY_PROBE_SQL).bind(&[JsValue::from_str(&identity)]) {
+            let known = match db
+                .prepare(crate::owed::OWED_IDENTITY_PROBE_SQL)
+                .bind(&[JsValue::from_str(&identity)])
+            {
                 Ok(stmt) => match stmt.counted_first::<PresentD1>().await {
                     Ok(v) => v.is_some(),
                     Err(e) => {
@@ -4517,7 +4950,10 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                 }
             };
             if !known {
-                return json_response(crate::owed::owed_body(&identity, None, &[], now_ms, false), 200);
+                return json_response(
+                    crate::owed::owed_body(&identity, None, &[], now_ms, false),
+                    200,
+                );
             }
             // bsv-low #499: the first read has no snapshot to shed to, so it runs; it counts against the minute
             owed_recompute_admit(&identity, "read-first", false);
@@ -4531,7 +4967,11 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                 .prepare(crate::owed::OWED_ROWS_READ_SQL)
                 .bind(&[JsValue::from_str(&identity)])
             {
-                Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<OwedRowD1>()) {
+                Ok(stmt) => match stmt
+                    .counted_all()
+                    .await
+                    .and_then(|r| r.results::<OwedRowD1>())
+                {
                     Ok(rows) => rows.into_iter().filter_map(OwedRowD1::into_row).collect(),
                     Err(e) => {
                         console_warn!("[owed] rows read failed: {e}");
@@ -4549,8 +4989,14 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             let stale = st.stale.unwrap_or(0.0) != 0.0;
             let prev_tip = st.tip.map(|t| t as u64);
             let age_ms = now_ms.saturating_sub(st.computed_at_ms as i64);
-            let needs_tip = rows.iter().any(|r| r.family == crate::owed::OwedFamily::InProgress);
-            let mut tip_now: Option<u64> = if needs_tip { chaintracks_present_height(&ctx, "owed").await.ok() } else { None };
+            let needs_tip = rows
+                .iter()
+                .any(|r| r.family == crate::owed::OwedFamily::InProgress);
+            let mut tip_now: Option<u64> = if needs_tip {
+                chaintracks_present_height(&ctx, "owed").await.ok()
+            } else {
+                None
+            };
             let cut = st.truncated.unwrap_or(0.0) != 0.0;
             if crate::owed::should_recompute(stale, age_ms, prev_tip, tip_now, &rows) {
                 let source: &'static str = if stale { "read-stale" } else { "read-aged" };
@@ -4561,7 +5007,8 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                     // is bounded (8 s) and a pass that outlives it leaves the page with "could not load" and the
                     // door with a refused fallback. One refresh per identity per isolate at a time.
                     Some(wait) => {
-                        let claim = owed_refresh_begin(&identity, worker::Date::now().as_millis() as i64);
+                        let claim =
+                            owed_refresh_begin(&identity, worker::Date::now().as_millis() as i64);
                         crate::owed::note_read_refresh(claim.is_some());
                         match claim {
                             Some(token) => {
@@ -4570,7 +5017,8 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                 let src = source.to_string();
                                 wait.wait_until(async move {
                                     if let Ok(db) = env.d1("OVERLAY_DB") {
-                                        owed_recompute_claimed(&env, &db, &id, &src, None, token).await;
+                                        owed_recompute_claimed(&env, &db, &id, &src, None, token)
+                                            .await;
                                     } else {
                                         owed_refresh_end(&id, token); // the claim must never outlive a run that cannot start
                                     }
@@ -4579,7 +5027,13 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                             None => {
                                 // the delta-verify's LOW-B: a stale read that cannot kick is REMEMBERED — the holder of
                                 // the lock runs it once more (a filing that marked stale during an in-flight walk)
-                                OWED_RERUN.with(|m| crate::owed::owed_rerun_note(&mut m.borrow_mut(), &identity, source));
+                                OWED_RERUN.with(|m| {
+                                    crate::owed::owed_rerun_note(
+                                        &mut m.borrow_mut(),
+                                        &identity,
+                                        source,
+                                    )
+                                });
                                 crate::owed::note_recompute_coalesced();
                             }
                         }
@@ -4596,7 +5050,9 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                             owed_shed_remark(&db, &identity).await;
                             (rows, prev_tip, st.computed_at_ms as i64, cut)
                         } else {
-                            match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now).await {
+                            match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)
+                                .await
+                            {
                                 Ok(v) => v,
                                 Err(_) => (
                                     crate::owed::markerless_faulted_rows(rows),
@@ -4633,7 +5089,10 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             "could not judge the complete list this pass: bounded or faulted evidence read"
         );
     }
-    json_response(crate::tracker_host::runtime::body(&ctx.env, &body.to_string(), None).await?, 200)
+    json_response(
+        crate::tracker_host::runtime::body(&ctx.env, &body.to_string(), None).await?,
+        200,
+    )
 }
 
 async fn gather_result_entries(
@@ -4652,11 +5111,14 @@ async fn gather_result_entries(
         .prepare(crate::results::results_sql(written_off_before_ms, after))
         .bind(&binds)
         .map_err(|e| format!("results bind failed: {e}"))?;
-    let mut rows: Vec<crate::results::ResultsRow> =
-        match stmt.counted_all().await.and_then(|r| r.results::<ResultsRowD1>()) {
-            Ok(rows) => rows.into_iter().map(ResultsRowD1::into_row).collect(),
-            Err(e) => return Err(format!("potparty join query failed: {e}")),
-        };
+    let mut rows: Vec<crate::results::ResultsRow> = match stmt
+        .counted_all()
+        .await
+        .and_then(|r| r.results::<ResultsRowD1>())
+    {
+        Ok(rows) => rows.into_iter().map(ResultsRowD1::into_row).collect(),
+        Err(e) => return Err(format!("potparty join query failed: {e}")),
+    };
     // Truncation is decided by what the QUERY returned (the #399 gate-S2
     // lesson: never by downstream consumption): the window probes
     // RESULTS_MAX_ROWS + 1, so an extra row means MORE pots exist past this
@@ -4736,7 +5198,11 @@ async fn gather_result_rows(
                 continue;
             }
         };
-        match stmt.counted_all().await.and_then(|r| r.results::<ResultRowD1>()) {
+        match stmt
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<ResultRowD1>())
+        {
             Ok(rows) => claim_markers.extend(rows.into_iter().filter_map(ResultRowD1::into_marker)),
             Err(e) => {
                 console_warn!("[results] result_markers_v2 query failed (claims omitted): {e}");
@@ -5526,7 +5992,9 @@ impl HopsViewRowD1 {
             marker_valid: self.marker_valid.map(|v| v != 0.0),
             // bsv-low #469 (the gate's HIGH-3): `hopparty_records.createdAt` is unix SECONDS (every marker table
             // here is); the entry carries MILLISECONDS, the unit the owed list's age rule compares.
-            marker_created_at: self.marker_created_at.map(|v| (v as i64).saturating_mul(1000)),
+            marker_created_at: self
+                .marker_created_at
+                .map(|v| (v as i64).saturating_mul(1000)),
         }
     }
 }
@@ -5625,14 +6093,17 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             after,
         ))
         .bind(&binds)?;
-    let rows: Vec<crate::hops_view::HopsViewRow> =
-        match stmt.counted_all().await.and_then(|r| r.results::<HopsViewRowD1>()) {
-            Ok(rows) => rows.into_iter().map(HopsViewRowD1::into_row).collect(),
-            Err(e) => {
-                console_warn!("[hops-view] hopparty join query failed: {e}");
-                return json_error("database query failed", 503);
-            }
-        };
+    let rows: Vec<crate::hops_view::HopsViewRow> = match stmt
+        .counted_all()
+        .await
+        .and_then(|r| r.results::<HopsViewRowD1>())
+    {
+        Ok(rows) => rows.into_iter().map(HopsViewRowD1::into_row).collect(),
+        Err(e) => {
+            console_warn!("[hops-view] hopparty join query failed: {e}");
+            return json_error("database query failed", 503);
+        }
+    };
 
     let (entries, truncated) = crate::hops_view::assemble_hops_view(rows);
     // B2.1 (bsv-low, 2026-09-02): the index's `unspent` is a non-observation;
@@ -5680,17 +6151,30 @@ async fn read_probe_memos(
     let mut rows: Vec<ProbeMemoRow> = Vec::new();
     for keys in crate::hops_view::probe_memo_read_chunks(targets) {
         let binds: Vec<JsValue> = keys.iter().map(|k| JsValue::from_str(k)).collect();
-        match db.prepare(crate::hops_view::probe_memo_read_sql(keys.len())).bind(&binds) {
-            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<ProbeMemoRow>()) {
+        match db
+            .prepare(crate::hops_view::probe_memo_read_sql(keys.len()))
+            .bind(&binds)
+        {
+            Ok(stmt) => match stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<ProbeMemoRow>())
+            {
                 Ok(chunk) => rows.extend(chunk),
                 Err(e) => {
-                    console_warn!("[spent-any] probe memo read failed ({} targets): {e}", targets.len());
+                    console_warn!(
+                        "[spent-any] probe memo read failed ({} targets): {e}",
+                        targets.len()
+                    );
                     probe_memo_read_faulted(db).await;
                     return Vec::new();
                 }
             },
             Err(e) => {
-                console_warn!("[spent-any] probe memo bind failed ({} targets): {e}", targets.len());
+                console_warn!(
+                    "[spent-any] probe memo bind failed ({} targets): {e}",
+                    targets.len()
+                );
                 probe_memo_read_faulted(db).await;
                 return Vec::new();
             }
@@ -5713,7 +6197,10 @@ async fn read_probe_memos(
 /// on the fault arm only; a counter write that fails too is logged and the isolate's count stands.
 async fn probe_memo_read_faulted(db: &worker::D1Database) {
     crate::owed::note_probe_memo_read_fault();
-    let binds = [JsValue::from_str(crate::owed::COUNTER_PROBE_MEMO_READ_FAULTS), JsValue::from_f64(1.0)];
+    let binds = [
+        JsValue::from_str(crate::owed::COUNTER_PROBE_MEMO_READ_FAULTS),
+        JsValue::from_f64(1.0),
+    ];
     match db.prepare(crate::beef_guard::BUMP_COUNTER_SQL).bind(&binds) {
         Ok(stmt) => {
             if let Err(e) = stmt.counted_run().await {
@@ -5732,10 +6219,18 @@ async fn write_probe_memos(db: &worker::D1Database, memos: &[crate::hops_view::P
             JsValue::from_str(&m.outpoint),
             JsValue::from_f64(m.probed_at_ms as f64),
             JsValue::from_f64(if m.spent { 1.0 } else { 0.0 }),
-            m.spending_txid.as_deref().map(JsValue::from_str).unwrap_or(JsValue::NULL),
-            m.spent_confirmed.map(|v| JsValue::from_f64(if v { 1.0 } else { 0.0 })).unwrap_or(JsValue::NULL),
+            m.spending_txid
+                .as_deref()
+                .map(JsValue::from_str)
+                .unwrap_or(JsValue::NULL),
+            m.spent_confirmed
+                .map(|v| JsValue::from_f64(if v { 1.0 } else { 0.0 }))
+                .unwrap_or(JsValue::NULL),
         ];
-        match db.prepare(crate::hops_view::PROBE_MEMO_UPSERT_SQL).bind(&binds) {
+        match db
+            .prepare(crate::hops_view::PROBE_MEMO_UPSERT_SQL)
+            .bind(&binds)
+        {
             Ok(s) => stmts.push(s),
             Err(e) => console_warn!("[spent-any] probe memo bind failed for {}: {e}", m.outpoint),
         }
@@ -5744,7 +6239,10 @@ async fn write_probe_memos(db: &worker::D1Database, memos: &[crate::hops_view::P
         return;
     }
     if let Err(e) = crate::d1_ledger::counted_batch(db, stmts).await {
-        console_warn!("[spent-any] probe memo write failed ({} rows): {e}", memos.len());
+        console_warn!(
+            "[spent-any] probe memo write failed ({} rows): {e}",
+            memos.len()
+        );
     }
 }
 
@@ -5766,7 +6264,11 @@ struct VerdictMemoRow {
 
 /// The memo that answers for `txid` at `now_ms`, if one does. Fail-soft: no binding / a query fault = none
 /// (the couriers are asked, exactly as before).
-async fn read_verdict_memo(env: &worker::Env, txid: &str, now_ms: i64) -> Option<crate::txany::VerdictMemo> {
+async fn read_verdict_memo(
+    env: &worker::Env,
+    txid: &str,
+    now_ms: i64,
+) -> Option<crate::txany::VerdictMemo> {
     read_verdict_memos(env, std::slice::from_ref(&txid.to_string()), now_ms)
         .await
         .into_iter()
@@ -5783,28 +6285,45 @@ async fn read_verdict_memos(
     if txids.is_empty() {
         return Vec::new();
     }
-    let Ok(db) = env.d1("OVERLAY_DB") else { return Vec::new() };
+    let Ok(db) = env.d1("OVERLAY_DB") else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for chunk in txids.chunks(crate::txany::TX_ANY_BATCH_D1_CHUNK) {
-        let binds: Vec<JsValue> = chunk.iter().map(|t| JsValue::from_str(&t.to_ascii_lowercase())).collect();
+        let binds: Vec<JsValue> = chunk
+            .iter()
+            .map(|t| JsValue::from_str(&t.to_ascii_lowercase()))
+            .collect();
         let rows: Vec<VerdictMemoRow> = match db
             .prepare(crate::txany::verdict_memo_read_many_sql(chunk.len()))
             .bind(&binds)
         {
-            Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<VerdictMemoRow>()) {
+            Ok(stmt) => match stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<VerdictMemoRow>())
+            {
                 Ok(rows) => rows,
                 Err(e) => {
-                    console_warn!("[tx-any] verdict memo read failed ({} txids): {e}", chunk.len());
+                    console_warn!(
+                        "[tx-any] verdict memo read failed ({} txids): {e}",
+                        chunk.len()
+                    );
                     continue;
                 }
             },
             Err(e) => {
-                console_warn!("[tx-any] verdict memo bind failed ({} txids): {e}", chunk.len());
+                console_warn!(
+                    "[tx-any] verdict memo bind failed ({} txids): {e}",
+                    chunk.len()
+                );
                 continue;
             }
         };
         for r in rows {
-            let Some(kind) = crate::txany::VerdictKind::parse(r.kind.as_deref()) else { continue };
+            let Some(kind) = crate::txany::VerdictKind::parse(r.kind.as_deref()) else {
+                continue;
+            };
             let m = crate::txany::VerdictMemo {
                 txid: r.txid.to_ascii_lowercase(),
                 verdict_at_ms: r.verdict_at_ms,
@@ -5813,7 +6332,12 @@ async fn read_verdict_memos(
                 kind,
                 evidence: r.evidence.unwrap_or_default(),
             };
-            if crate::txany::verdict_memo_answers(&m, &m.txid.clone(), now_ms, crate::txany::VERDICT_MEMO_MAX_AGE_MS) {
+            if crate::txany::verdict_memo_answers(
+                &m,
+                &m.txid.clone(),
+                now_ms,
+                crate::txany::VERDICT_MEMO_MAX_AGE_MS,
+            ) {
                 out.push(m);
             }
         }
@@ -6262,14 +6786,17 @@ pub async fn live_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             return json_error("database query failed", 503);
         }
     };
-    let mut rows: Vec<crate::live_view::LiveViewRow> =
-        match stmt.counted_all().await.and_then(|r| r.results::<LiveViewRowD1>()) {
-            Ok(rows) => rows.into_iter().map(LiveViewRowD1::into_row).collect(),
-            Err(e) => {
-                console_warn!("[live-view] potparty join query failed: {e}");
-                return json_error("database query failed", 503);
-            }
-        };
+    let mut rows: Vec<crate::live_view::LiveViewRow> = match stmt
+        .counted_all()
+        .await
+        .and_then(|r| r.results::<LiveViewRowD1>())
+    {
+        Ok(rows) => rows.into_iter().map(LiveViewRowD1::into_row).collect(),
+        Err(e) => {
+            console_warn!("[live-view] potparty join query failed: {e}");
+            return json_error("database query failed", 503);
+        }
+    };
     // Truncation decided by what the QUERY returned (the #399 gate-S2
     // lesson): the window probes MAX + 1; drop the probe row before any
     // downstream leg (the case fan-out must not chase a pot this page does
@@ -6419,7 +6946,11 @@ pub fn set_arcade_url(url: Option<String>) {
     });
 }
 pub(crate) fn arcade_url() -> String {
-    ARCADE_URL.with(|u| u.borrow().clone().unwrap_or_else(|| DEFAULT_ARCADE_URL.to_string()))
+    ARCADE_URL.with(|u| {
+        u.borrow()
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ARCADE_URL.to_string())
+    })
 }
 
 /// bsv-low #451 slice B: the ARCADE leg of `/tx-any` for a tx the index holds without a verified bump (the JOIN's
@@ -6543,7 +7074,9 @@ async fn spent_any_resolve_cached(
     let cached = SPENT_ANY_CACHE.with(|c| {
         c.borrow()
             .get(&key)
-            .filter(|(written_at, _)| crate::results::spent_any_cache_fresh(*written_at, now, max_age_ms))
+            .filter(|(written_at, _)| {
+                crate::results::spent_any_cache_fresh(*written_at, now, max_age_ms)
+            })
             .map(|(_, row)| row.clone())
     });
     if let Some(row) = cached {
@@ -6554,7 +7087,11 @@ async fn spent_any_resolve_cached(
         let mut map = c.borrow_mut();
         // Prune entries no reader would accept any more, so the map stays bounded.
         map.retain(|_, (written_at, _)| {
-            crate::results::spent_any_cache_fresh(*written_at, now, crate::results::SPENT_ANY_PROBE_MAX_AGE_MS)
+            crate::results::spent_any_cache_fresh(
+                *written_at,
+                now,
+                crate::results::SPENT_ANY_PROBE_MAX_AGE_MS,
+            )
         });
         map.insert(key, (now, row.clone()));
     });
@@ -6797,7 +7334,12 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         .filter_map(|m| m.spending_txid.clone())
         .collect();
     let mut stored_words = crate::tracker_host::stored::read(&ctx.env, &ids).await?;
-    let (memo_answers, _) = crate::tracker_host::runtime::spent_any_memo_plan(&probe_targets, &memos, now_ms, &stored_words);
+    let (memo_answers, _) = crate::tracker_host::runtime::spent_any_memo_plan(
+        &probe_targets,
+        &memos,
+        now_ms,
+        &stored_words,
+    );
     let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
     let mut terminals = Vec::with_capacity(outpoints.len());
     for op in &outpoints {
@@ -6816,7 +7358,10 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
                 spent_confirmed: None,
                 reason: Some(crate::txany::SPENT_ANY_REASON_TX_ABSENT),
             }
-        } else if let Some((_, _, p)) = memo_answers.iter().find(|(t, v, _)| *t == txid_lc && *v == op.vout) {
+        } else if let Some((_, _, p)) = memo_answers
+            .iter()
+            .find(|(t, v, _)| *t == txid_lc && *v == op.vout)
+        {
             SpentAnyCached {
                 known: true,
                 spent: p.spent,
@@ -6876,7 +7421,6 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         .await?,
         200,
     )
-
 }
 
 // ── /tx-any — tx-level presence/confirmation/raw, index-first (bsv-low #229) ──
@@ -7483,7 +8027,10 @@ fn cache_tx_any_answer(key: &str, answer: &TxAnyCached, now: f64) {
         map.retain(|_, (expiry, _)| *expiry > now);
         map.insert(
             key.to_string(),
-            (now + crate::txany::tx_any_cache_ttl_ms(answer), answer.clone()),
+            (
+                now + crate::txany::tx_any_cache_ttl_ms(answer),
+                answer.clone(),
+            ),
         );
     });
 }
@@ -7608,8 +8155,7 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         return json_error("invalid txid (expect 64 hex chars)", 400);
     }
     let key = txid.to_ascii_lowercase();
-    let stored =
-        crate::tracker_host::stored::read(&ctx.env, std::slice::from_ref(&key)).await?;
+    let stored = crate::tracker_host::stored::read(&ctx.env, std::slice::from_ref(&key)).await?;
     let now = worker::Date::now().as_millis() as f64;
     let answer = match tx_any_cached(&key, now) {
         Some(a) => a,
@@ -7621,7 +8167,14 @@ pub async fn tx_any(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     let legacy = crate::txany::tx_any_body(&key, &answer);
     let mut rows = stored;
     if !rows.contains_key(&key) {
-        let row = crate::tracker_host::runtime::event(&ctx.env, &key, "fallback", None, Some(legacy.clone())).await?;
+        let row = crate::tracker_host::runtime::event(
+            &ctx.env,
+            &key,
+            "fallback",
+            None,
+            Some(legacy.clone()),
+        )
+        .await?;
         rows.insert(key.clone(), row);
     }
     let mut value = serde_json::from_str(&legacy)?;
@@ -7852,7 +8405,8 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     // bsv-low #469: the owed list's recomputes by source, the rows written by family, the faults.
     body["owed"] = crate::owed::owed_health_json();
     body["owed"]["inFlight"] = owed_in_flight_snapshot(worker::Date::now().as_millis() as i64);
-    body["owed"]["recomputeAtCeiling"] = serde_json::json!(owed_rate_at_ceiling(worker::Date::now().as_millis() as i64));
+    body["owed"]["recomputeAtCeiling"] =
+        serde_json::json!(owed_rate_at_ceiling(worker::Date::now().as_millis() as i64));
     // bsv-low #499: this isolate's D1 rows ledger, the per-route running maxima since boot (the overlay serves the
     // same body on `/health/invariants.d1Budget`; `scripts/d1-census.py` reads both).
     body["d1Budget"] = crate::d1_ledger::budget_json();
@@ -7949,7 +8503,10 @@ mod owed_mapper_tests {
             marker_created_at: Some(1_758_000_000.0),
         };
         // an older row without the column maps to None (never a guess)
-        let older = HopsViewRowD1 { marker_created_at: None, ..row };
+        let older = HopsViewRowD1 {
+            marker_created_at: None,
+            ..row
+        };
         assert_eq!(older.into_row().marker_created_at, None);
         let row = HopsViewRowD1 {
             identity: "02".repeat(33),
@@ -7979,8 +8536,14 @@ mod owed_mapper_tests {
         assert_eq!(mapped.marker_created_at, Some(1_758_000_000_000));
         let now_ms: i64 = 1_758_000_060_000; // 60 s later
         let age = now_ms - mapped.marker_created_at.unwrap();
-        assert!(age < crate::owed::HOP_STRANDED_AFTER_MS, "a minute-old hop is not stranded");
-        assert!(now_ms + 31 * 60 * 1000 - mapped.marker_created_at.unwrap() >= crate::owed::HOP_STRANDED_AFTER_MS);
+        assert!(
+            age < crate::owed::HOP_STRANDED_AFTER_MS,
+            "a minute-old hop is not stranded"
+        );
+        assert!(
+            now_ms + 31 * 60 * 1000 - mapped.marker_created_at.unwrap()
+                >= crate::owed::HOP_STRANDED_AFTER_MS
+        );
     }
 }
 
@@ -7994,7 +8557,10 @@ mod tests {
         m.insert("ab".to_string(), (1_000i64, 1_000i64));
         // the original holder's token no longer matches after a takeover re-stamped the mark
         m.insert("ab".to_string(), (62_000i64, 62_000i64));
-        assert!(!super::owed_lock_release(&mut m, "ab", 1_000), "the original's end must not free the takeover's mark");
+        assert!(
+            !super::owed_lock_release(&mut m, "ab", 1_000),
+            "the original's end must not free the takeover's mark"
+        );
         assert_eq!(m.get("ab").copied(), Some((62_000, 62_000)));
         // the original cannot re-stamp progress on a mark that is not its own; the holder can
         assert!(!super::owed_lock_touch(&mut m, "ab", 1_000, 70_000));
@@ -8003,9 +8569,21 @@ mod tests {
         assert!(super::owed_lock_release(&mut m, "ab", 62_000));
         assert!(!m.contains_key("ab"));
         // the stale bound judges PROGRESS (the delta-verify's LOW-2: a live claim re-stamps before every walk)
-        assert!(!super::owed_lock_free(Some((1_000, 1_000)), 1_000 + super::OWED_IN_FLIGHT_STALE_MS - 1));
-        assert!(super::owed_lock_free(Some((1_000, 1_000)), 1_000 + super::OWED_IN_FLIGHT_STALE_MS));
-        assert!(!super::owed_lock_free(Some((1_000, 100_000)), 100_000 + super::OWED_IN_FLIGHT_STALE_MS - 1), "a refreshed claim holds");
+        assert!(!super::owed_lock_free(
+            Some((1_000, 1_000)),
+            1_000 + super::OWED_IN_FLIGHT_STALE_MS - 1
+        ));
+        assert!(super::owed_lock_free(
+            Some((1_000, 1_000)),
+            1_000 + super::OWED_IN_FLIGHT_STALE_MS
+        ));
+        assert!(
+            !super::owed_lock_free(
+                Some((1_000, 100_000)),
+                100_000 + super::OWED_IN_FLIGHT_STALE_MS - 1
+            ),
+            "a refreshed claim holds"
+        );
         assert!(super::owed_lock_free(None, 0));
     }
 

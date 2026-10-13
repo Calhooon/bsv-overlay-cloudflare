@@ -155,7 +155,10 @@ pub async fn armed_pots(req: Request, env: &Env) -> Result<Response> {
         wasm_bindgen::JsValue::from_f64(since_seconds(since_ms) as f64),
         wasm_bindgen::JsValue::from_f64((limit + 1) as f64),
     ])?;
-    let rows: Vec<ArmedPotRowD1> = match stmt.counted_all().await.and_then(|r| r.results::<ArmedPotRowD1>())
+    let rows: Vec<ArmedPotRowD1> = match stmt
+        .counted_all()
+        .await
+        .and_then(|r| r.results::<ArmedPotRowD1>())
     {
         Ok(rows) => rows,
         Err(e) => {

@@ -338,7 +338,11 @@ pub struct LatchColumnsEnsured(());
 /// that needs the database says so itself.
 pub async fn ensure_latch_columns(env: &worker::Env) -> LatchColumnsEnsured {
     let now_ms = worker::Date::now().as_millis() as i64;
-    if catchup_due(APPLIED.load(Ordering::Acquire), RETRY_NOT_BEFORE_MS.load(Ordering::Acquire), now_ms) {
+    if catchup_due(
+        APPLIED.load(Ordering::Acquire),
+        RETRY_NOT_BEFORE_MS.load(Ordering::Acquire),
+        now_ms,
+    ) {
         // the lease is taken BEFORE the attempt: every other request on this isolate proceeds without one meanwhile
         RETRY_NOT_BEFORE_MS.store(now_ms + CATCHUP_RETRY_BACKOFF_MS, Ordering::Release);
         if let Ok(db) = env.d1("OVERLAY_DB") {

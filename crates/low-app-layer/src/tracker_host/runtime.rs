@@ -380,6 +380,8 @@ pub async fn batch_body(env: &worker::Env, raw: &str, ids: &[String]) -> worker:
     body_loaded(env, value, None, rows).await
 }
 
+pub const OWED_FALLBACK_WRITE_EVENTS: usize = 1;
+
 /// Host pacing for the owed WRITE event. Chain words are never age-polled.
 /// The tracker decides the resulting Reask from Tick/SpendAttempt inputs.
 pub fn owed_reask_due(row: &Row, now: u64) -> bool {
@@ -497,4 +499,17 @@ pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
 
 pub fn hook_may_reask(kind: &str, has_reask: bool) -> bool {
     kind == "tick" && has_reask
+}
+
+#[cfg(test)]
+mod budget_pins {
+    #[test]
+    fn ns3_m4_owed_fallback_writes_at_most_one_event() {
+        let src = include_str!("../routes.rs");
+        let clock = &src[src.find("let mut due: Vec<_> = word_ids").unwrap()..];
+        assert!(
+            clock.contains(".take(crate::tracker_host::runtime::OWED_FALLBACK_WRITE_EVENTS)"),
+            "owed tracker fallback still takes two write events"
+        );
+    }
 }

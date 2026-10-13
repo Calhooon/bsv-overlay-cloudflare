@@ -124,7 +124,10 @@ impl<F: Future> Future for Scoped<F> {
 
 /// Run `fut` under a fresh tally; resolves to its output and what it cost D1.
 pub fn scoped<F: Future>(fut: F) -> Scoped<F> {
-    Scoped { tally: Rc::new(Cell::new(Tally::default())), fut: Box::pin(fut) }
+    Scoped {
+        tally: Rc::new(Cell::new(Tally::default())),
+        fut: Box::pin(fut),
+    }
 }
 
 /// The ledger's key for a path: the known route it names (exact, or the route followed by `/` for a route with a
@@ -191,8 +194,12 @@ pub fn named_segment(name: &str, t: Tally) -> String {
 pub fn parse_segment(header: &str, name: &str) -> Option<Tally> {
     for seg in header.split(',') {
         let seg = seg.trim();
-        let Some(rest) = seg.strip_prefix(name) else { continue };
-        let Some(desc) = rest.trim_start().strip_prefix(";desc=\"") else { continue };
+        let Some(rest) = seg.strip_prefix(name) else {
+            continue;
+        };
+        let Some(desc) = rest.trim_start().strip_prefix(";desc=\"") else {
+            continue;
+        };
         let desc = desc.strip_suffix('"')?;
         let mut t = Tally::default();
         let mut seen = 0;
@@ -225,7 +232,12 @@ pub fn with_d1_segment(existing: Option<&str>, t: Tally) -> String {
 /// `Access-Control-Expose-Headers` with `Server-Timing` in it (left as is when it already names it).
 pub fn expose_server_timing(existing: Option<&str>) -> String {
     match existing.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(e) if e.split(',').any(|h| h.trim().eq_ignore_ascii_case("server-timing")) => e.to_string(),
+        Some(e)
+            if e.split(',')
+                .any(|h| h.trim().eq_ignore_ascii_case("server-timing")) =>
+        {
+            e.to_string()
+        }
         Some(e) => format!("{e}, Server-Timing"),
         None => "Server-Timing".to_string(),
     }
@@ -238,7 +250,12 @@ pub fn stamp(resp: &mut worker::Response, t: Tally) {
     let h = resp.headers_mut();
     let timing = with_d1_segment(h.get("Server-Timing").ok().flatten().as_deref(), t);
     let _ = h.set("Server-Timing", &timing);
-    let expose = expose_server_timing(h.get("Access-Control-Expose-Headers").ok().flatten().as_deref());
+    let expose = expose_server_timing(
+        h.get("Access-Control-Expose-Headers")
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
     let _ = h.set("Access-Control-Expose-Headers", &expose);
 }
 
@@ -247,7 +264,10 @@ fn tally_json(t: Tally) -> serde_json::Value {
 }
 
 /// PURE: the `d1Budget` body from a snapshot (pinned).
-pub fn budget_json_of(routes: &BTreeMap<&'static str, RouteBudget>, unscoped: Tally) -> serde_json::Value {
+pub fn budget_json_of(
+    routes: &BTreeMap<&'static str, RouteBudget>,
+    unscoped: Tally,
+) -> serde_json::Value {
     let mut by_route = serde_json::Map::new();
     for (r, b) in routes {
         by_route.insert(
@@ -304,11 +324,15 @@ impl Counted for worker::D1PreparedStatement {
             .and_then(|m| worker::serde_wasm_bindgen::from_value::<worker::D1ResultMeta>(m).ok());
         note_meta(meta.as_ref());
         let results = Reflect::get(&js, &JsValue::from_str("results"))?;
-        let Ok(rows) = results.dyn_into::<Array>() else { return Ok(None) };
+        let Ok(rows) = results.dyn_into::<Array>() else {
+            return Ok(None);
+        };
         if rows.length() == 0 {
             return Ok(None);
         }
-        Ok(worker::serde_wasm_bindgen::from_value::<Option<T>>(rows.get(0))?)
+        Ok(worker::serde_wasm_bindgen::from_value::<Option<T>>(
+            rows.get(0),
+        )?)
     }
 }
 
@@ -363,8 +387,14 @@ mod tests {
         let before = UNSCOPED.with(|u| u.get());
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut a = Box::pin(scoped(Statements { left: 3, reads_each: 10 }));
-        let mut b = Box::pin(scoped(Statements { left: 5, reads_each: 1 }));
+        let mut a = Box::pin(scoped(Statements {
+            left: 3,
+            reads_each: 10,
+        }));
+        let mut b = Box::pin(scoped(Statements {
+            left: 5,
+            reads_each: 1,
+        }));
         let (mut ta, mut tb) = (None, None);
         while ta.is_none() || tb.is_none() {
             if ta.is_none() {
@@ -404,7 +434,10 @@ mod tests {
         // and outside every scope it does
         note(7, 0);
         let after = UNSCOPED.with(|u| u.get());
-        assert_eq!((after.reads - before.reads, after.stmts - before.stmts), (7, 1));
+        assert_eq!(
+            (after.reads - before.reads, after.stmts - before.stmts),
+            (7, 1)
+        );
     }
 
     /// bsv-low #499 (lens fold L1): NO D1 STATEMENT IS AWAITED OUTSIDE THE COUNTED SEAM. Every await form of the
@@ -416,7 +449,16 @@ mod tests {
     /// through `d1::Query`); no production code calls it.
     #[test]
     fn no_d1_statement_is_awaited_outside_the_ledger() {
-        const BARE: &[&str] = &[".all()", ".run()", ".raw()", ".raw::<", ".first(None", ".first(Some", ".first::<", ".batch("];
+        const BARE: &[&str] = &[
+            ".all()",
+            ".run()",
+            ".raw()",
+            ".raw::<",
+            ".first(None",
+            ".first(Some",
+            ".first::<",
+            ".batch(",
+        ];
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for e in std::fs::read_dir(dir).expect("read src") {
                 let p = e.expect("entry").path();
@@ -432,7 +474,10 @@ mod tests {
         walk(&src, &mut files);
         assert!(files.len() > 5, "the crate's sources are walked");
         let mut holes = Vec::new();
-        for f in files.iter().filter(|f| f.file_name().is_some_and(|n| n != "d1_ledger.rs")) {
+        for f in files
+            .iter()
+            .filter(|f| f.file_name().is_some_and(|n| n != "d1_ledger.rs"))
+        {
             let text = std::fs::read_to_string(f).expect("read source");
             for (i, line) in text.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
@@ -441,9 +486,15 @@ mod tests {
                 }
             }
         }
-        assert!(holes.is_empty(), "D1 awaited outside the counted seam (use d1_ledger::Counted / counted_batch):\n{}", holes.join("\n"));
+        assert!(
+            holes.is_empty(),
+            "D1 awaited outside the counted seam (use d1_ledger::Counted / counted_batch):\n{}",
+            holes.join("\n")
+        );
         // the pin bites on the form it was written for
-        assert!(BARE.iter().any(|b| "let row: Option<BeefTrustRow> = match stmt.first(None).await {".contains(b)));
+        assert!(BARE
+            .iter()
+            .any(|b| "let row: Option<BeefTrustRow> = match stmt.first(None).await {".contains(b)));
     }
 
     #[test]
@@ -492,7 +543,11 @@ mod tests {
         const R: &[&str] = &["/owed", "/tx-any", "/beef"];
         assert_eq!(route_of("/owed", R), "/owed");
         assert_eq!(route_of("/tx-any/ab", R), "/tx-any");
-        assert_eq!(route_of("/beefy", R), "other", "a prefix that is not a path segment is not the route");
+        assert_eq!(
+            route_of("/beefy", R),
+            "other",
+            "a prefix that is not a path segment is not the route"
+        );
         assert_eq!(route_of("/anything/else", R), "other");
     }
 
@@ -509,16 +564,40 @@ mod tests {
             "d1;desc=\"reads=12 writes=3 stmts=4 maxReads=0\""
         );
         assert_eq!(with_d1_segment(None, t), server_timing_segment(t));
-        assert_eq!(with_d1_segment(Some("admit;dur=1.0"), t), format!("admit;dur=1.0, {}", server_timing_segment(t)));
-        assert_eq!(parse_segment(&with_d1_segment(Some("admit;dur=1.0"), t), "d1"), Some(t));
-        assert_eq!(parse_segment(&named_segment("d1view", t), "d1view"), Some(t));
-        assert_eq!(parse_segment(&named_segment("d1view", t), "d1"), None, "d1 is not d1view");
-        assert_eq!(parse_segment("d1;desc=\"reads=1 writes=x stmts=1\"", "d1"), None);
+        assert_eq!(
+            with_d1_segment(Some("admit;dur=1.0"), t),
+            format!("admit;dur=1.0, {}", server_timing_segment(t))
+        );
+        assert_eq!(
+            parse_segment(&with_d1_segment(Some("admit;dur=1.0"), t), "d1"),
+            Some(t)
+        );
+        assert_eq!(
+            parse_segment(&named_segment("d1view", t), "d1view"),
+            Some(t)
+        );
+        assert_eq!(
+            parse_segment(&named_segment("d1view", t), "d1"),
+            None,
+            "d1 is not d1view"
+        );
+        assert_eq!(
+            parse_segment("d1;desc=\"reads=1 writes=x stmts=1\"", "d1"),
+            None
+        );
         assert_eq!(expose_server_timing(None), "Server-Timing");
-        assert_eq!(expose_server_timing(Some("x-bsv-auth-nonce")), "x-bsv-auth-nonce, Server-Timing");
-        assert_eq!(expose_server_timing(Some("Server-Timing, X-Overlay-Mutation")), "Server-Timing, X-Overlay-Mutation");
+        assert_eq!(
+            expose_server_timing(Some("x-bsv-auth-nonce")),
+            "x-bsv-auth-nonce, Server-Timing"
+        );
+        assert_eq!(
+            expose_server_timing(Some("Server-Timing, X-Overlay-Mutation")),
+            "Server-Timing, X-Overlay-Mutation"
+        );
         let mut m = BTreeMap::new();
-        m.entry("/owed").or_insert_with(RouteBudget::default).record(t);
+        m.entry("/owed")
+            .or_insert_with(RouteBudget::default)
+            .record(t);
         let j = budget_json_of(&m, Tally::default());
         assert_eq!(j["routes"]["/owed"]["max"]["reads"], 12);
         assert_eq!(j["routes"]["/owed"]["requests"], 1);

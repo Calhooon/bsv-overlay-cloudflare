@@ -133,20 +133,20 @@ pub mod armed_pots;
 pub mod auth;
 pub mod beef_guard;
 pub mod compaction;
-pub mod courier;
 pub mod cors;
+pub mod courier;
+pub mod credit_beef;
 /// bsv-low #499: the D1 rows ledger, the overlay's own source compiled here (this crate does not link the overlay).
 #[path = "../../overlay-cloudflare/src/d1_ledger.rs"]
 pub mod d1_ledger;
-pub mod credit_beef;
 pub mod hops_view;
+pub mod hopsweep;
 /// bsv-low #532: the identity views (names and pictures), a proxy to LOW's identity resolver.
 pub mod identity;
 pub mod internal_events;
 pub mod lane_attest;
 pub mod live_view;
 pub mod logic;
-pub mod hopsweep;
 pub mod owed;
 pub mod owed_cursor;
 pub mod proof_post;
@@ -447,7 +447,12 @@ fn router(
 #[cfg(test)]
 mod d1_ledger_door_pins {
     fn squash(s: &str) -> String {
-        s.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n").split_whitespace().collect()
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect()
     }
 
     /// bsv-low #499 (lens fold M2, L5): the WHOLE fetch body runs under the request's ledger, so the internal hooks
@@ -458,22 +463,67 @@ mod d1_ledger_door_pins {
     #[test]
     fn the_hooks_and_the_front_door_run_inside_the_ledger_and_an_escaped_error_is_stamped() {
         let lib = squash(include_str!("lib.rs"));
-        let fetch = lib.find(&squash("pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {")).expect("the entry");
-        let serve = lib.find(&squash("async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {")).expect("the body");
+        let fetch = lib
+            .find(&squash(
+                "pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {",
+            ))
+            .expect("the entry");
+        let serve = lib
+            .find(&squash(
+                "async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {",
+            ))
+            .expect("the body");
         let entry = &lib[fetch..serve];
-        assert!(entry.contains(&squash("d1_ledger::scoped(serve(req, env, ctx)).await;")), "fetch runs the whole body under the ledger");
-        assert!(entry.contains(&squash("Err(e) => { let mut resp = d1_ledger::escaped(&e, d1)?;")), "an escaped error is answered stamped");
+        assert!(
+            entry.contains(&squash("d1_ledger::scoped(serve(req, env, ctx)).await;")),
+            "fetch runs the whole body under the ledger"
+        );
+        assert!(
+            entry.contains(&squash(
+                "Err(e) => { let mut resp = d1_ledger::escaped(&e, d1)?;"
+            )),
+            "an escaped error is answered stamped"
+        );
         let body = &lib[serve..];
-        let end = body.find(&squash("pub const D1_LEDGER_ROUTES")).expect("the body's end");
+        let end = body
+            .find(&squash("pub const D1_LEDGER_ROUTES"))
+            .expect("the body's end");
         let body = &body[..end];
-        for door in ["\"/internal/tip-changed\"", "\"/internal/pot-changed\"", "\"/internal/hop-changed\"", "\"/internal/lobby-changed\"", "\"/internal/armed-pots\"", "auth::front_door(req,&env)", "schema::ensure_latch_columns(&env)"] {
-            assert!(body.contains(door), "{door} is served inside the scoped body");
+        for door in [
+            "\"/internal/tip-changed\"",
+            "\"/internal/pot-changed\"",
+            "\"/internal/hop-changed\"",
+            "\"/internal/lobby-changed\"",
+            "\"/internal/armed-pots\"",
+            "auth::front_door(req,&env)",
+            "schema::ensure_latch_columns(&env)",
+        ] {
+            assert!(
+                body.contains(door),
+                "{door} is served inside the scoped body"
+            );
         }
-        assert!(!body.contains("d1_ledger::scoped("), "one scope per request, at the entry");
-        assert!(lib.contains(&squash("\"/internal\",")), "the hooks have their ledger key");
+        assert!(
+            !body.contains("d1_ledger::scoped("),
+            "one scope per request, at the entry"
+        );
+        assert!(
+            lib.contains(&squash("\"/internal\",")),
+            "the hooks have their ledger key"
+        );
         let overlay = squash(include_str!("../../overlay-cloudflare/src/lib.rs"));
-        assert!(overlay.contains(&squash("Err(e) => return crate::d1_ledger::escaped(&e, tally),")), "the overlay stamps an escaped error too");
-        assert!(overlay.contains(&squash("crate::d1_ledger::boot(ensure_overlay_migrations(&db))")), "the overlay's migrations are keyed (boot)");
+        assert!(
+            overlay.contains(&squash(
+                "Err(e) => return crate::d1_ledger::escaped(&e, tally),"
+            )),
+            "the overlay stamps an escaped error too"
+        );
+        assert!(
+            overlay.contains(&squash(
+                "crate::d1_ledger::boot(ensure_overlay_migrations(&db))"
+            )),
+            "the overlay's migrations are keyed (boot)"
+        );
     }
 }
 

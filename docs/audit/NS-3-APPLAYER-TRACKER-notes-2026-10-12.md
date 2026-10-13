@@ -29,3 +29,15 @@ Courier mempool presence is the live-race hint `announced`, never broadcaster `s
 bsv-tracker 0.2.2 has no `HintStatus::Announced`, so this host writes `Unknown` with the courier source and time, without promotion.
 K-ask: add `HintStatus::Announced` as a non-promoting courier presence hint in bsv-tracker; keep broadcaster Accepted/Seen distinct.
 Captain follow-up in bsv-low: words design §2d and S11 must say courier `announced` (0.2.2 fallback Unknown), broadcaster SEEN only.
+
+### Launch 3: M4 STOP, 2026-10-12
+Rebased e33966e onto origin/main 7f0204f; conflicts only in tracker-touched routes.rs, d1/mod.rs, d1_budget_seed.rs, storage-ownership.json and STORAGE-OWNERSHIP.md. Main code and fields retained beside tracker additions. App-layer check 1.95.0 exit 0.
+The route-removal comparison differs only in main's spent_any_body replacing the older utxo_status_body; the tracker now decorates main's terminal-aware body.
+OWED_FALLBACK_WRITE_EVENTS = 1; RED: "owed tracker fallback still takes two write events"; GREEN: ns3_m4_owed_fallback_writes_at_most_one_event, 1 passed.
+Main's named owed ceiling remains 30. Batch pin follows main's cached single body after the single lookup, preserving every legacy field.
+make ci-d1-budget, LANE_BASE=19341, exit 2: owed first read 29756/19/33, versus main recorded 331/18/30 (reads/writes/statements). Largest statement 29423 rows.
+Three added per-request backfill statements: cursor SELECT, BACKFILL_PAGE (LIMIT 4 over transactions/pot_beefs union, scanning the fixture), BACKFILL_SAVE UPSERT. Detached owed-recompute maximum 216/8/22; /owed surface maximum 29756/19/35 across the captured route cases. The launch-2 pre-bound maximum was reported as 32, not remeasured here.
+Both workspaces cargo +1.95.0 fmt --all -- --check exit 0; one-event pin GREEN; full clippy/tests/route/final wasm and worker-build gates not run after the explicit >30 STOP. Local budget startup did build both workers.
+L1/L2/L3 and register fold remain pending. M1 remains Unknown with courier source/time (crate lacks Announced; captain's K-ask). Remote lane remains 9885e6a; no push/deploy/spend.
+Evidence: /tmp/ns3-fold3-budget.log, /tmp/ns3-fold3-m4-{red,green}.log, /tmp/ns3-fold3-rebase-check.log, /tmp/ns3-fold3-{original,route}-removals.
+Next: captain rules on the measured backfill cost before resuming remaining folds and full gates. Isolated worktree and target removed after preservation.

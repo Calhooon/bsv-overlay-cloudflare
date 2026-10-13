@@ -137,7 +137,9 @@ impl BoardView {
         // across an await (the actor interleaves at awaits).
         let held = self.cache.borrow().get(&key).cloned();
         match held {
-            Some((body, at)) if now.saturating_sub(at) <= FRESH_MS => body_response(body, false, self.last_compute(key)),
+            Some((body, at)) if now.saturating_sub(at) <= FRESH_MS => {
+                body_response(body, false, self.last_compute(key))
+            }
             Some((body, _)) => {
                 self.spawn_compute(key, compute);
                 body_response(body, true, self.last_compute(key))
@@ -224,13 +226,20 @@ impl BoardView {
 
 /// The held copy, with the D1 figures of the compute that produced it (`d1view`; bsv-low #499): a served copy
 /// reads no row, and the route records the compute's figures under its `:view` key.
-fn body_response(body: String, stale: bool, d1: Option<crate::d1_ledger::Tally>) -> Result<Response> {
+fn body_response(
+    body: String,
+    stale: bool,
+    d1: Option<crate::d1_ledger::Tally>,
+) -> Result<Response> {
     let mut resp = crate::routes::json_response_cached(body, 200, 5)?;
     if stale {
         resp.headers_mut().set("X-Board-Stale", "1")?;
     }
     if let Some(t) = d1 {
-        resp.headers_mut().set("Server-Timing", &crate::d1_ledger::named_segment("d1view", t))?;
+        resp.headers_mut().set(
+            "Server-Timing",
+            &crate::d1_ledger::named_segment("d1view", t),
+        )?;
     }
     Ok(resp)
 }
