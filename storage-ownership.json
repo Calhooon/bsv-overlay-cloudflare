@@ -763,7 +763,7 @@
    "readers": [],
    "rebuild_class": "transient",
    "never_wipe": false,
-   "holds": "the pot hook's wake-ups (pots-room broadcasts, seat pot events) its detached announce did not deliver, drained by the scheduled pass (E649 L4 H1)",
+   "holds": "the pot hook's wake-ups (pots-room broadcasts, seat pot events) its detached announce did not deliver, drained by the scheduled pass (E649 L4 H1); at its ceiling the oldest exhausted, then failing live, rows make room, each live one named LOST (N6)",
    "why": "a wake-up signal only: the seat's own read serves every fact, and the next pot change announces again"
   },
   {
@@ -774,7 +774,7 @@
    "readers": [],
    "rebuild_class": "transient",
    "never_wipe": false,
-   "holds": "one row: the last token the pot hook's park handed out (E649 L4 N1) and the batch's room under its ceiling (N3), written by the park's own batch",
+   "holds": "one row: the last token the pot hook's park handed out (E649 L4 N1) and the batch's room under its ceiling after its parks (N3, N6), written by the park's own batch",
    "why": "a counter only: a wipe re-seeds it from the clock (times 1,000) at the next park"
   },
   {

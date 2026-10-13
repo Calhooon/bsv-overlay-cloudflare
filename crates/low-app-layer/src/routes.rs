@@ -2300,7 +2300,8 @@ pub async fn compute_results_body_string(
 /// seats' own markers name, marked stale; and every wake-up of the body (each outpoint's pots-room broadcast, one
 /// `pot` event per attributed seat) PARKED durably in the same write batch as the stale marks (H1). The relay calls
 /// are SCHEDULED, not made: the detached announce (`ctx.wait_until`, under one wall) sends them after the answer,
-/// and what it does not deliver stays parked for the scheduled drain. So the answer's `filed` names the seat events
+/// and what it does not deliver stays parked for the scheduled drain. A body the park's ceiling refuses WHOLE (no room
+/// to make, `pot_hook::PARK_GUARD_SQL`) is answered 503 like a faulted batch. So the answer's `filed` names the seat events
 /// scheduled and parked, not delivered. The `pot` event carries an EMPTY `entry` (`pot_hook::carrier_entry`): no
 /// `/results` entry is assembled, the seat re-reads its served rows. A write batch that faulted is answered 503
 /// retryable. Nothing here is money truth: the client still verifies landings before any credit.
@@ -2376,7 +2377,8 @@ pub(crate) async fn internal_pot_changed(
         outcome.plan.outpoints.len()
     );
     // H1: a body whose wake-ups could not be parked is not acknowledged: 503 keeps it on the producer's retry path.
-    // N2: nothing of that body was announced (the retry announces once).
+    // N2: nothing of that body was announced (the retry announces once). N6: so is a body the park's ceiling refused
+    // whole (`parkFull` names its wake-ups): a wake-up is never acknowledged unparked.
     let (status, ok) = match &outcome.stale_fault {
         None => (200, true),
         Some(_) => (503, false),

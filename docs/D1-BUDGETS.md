@@ -104,6 +104,16 @@ thousand times the price per row). The drain takes rounds while the backlog fill
 `pot-announce-drain-backlog` measures four rounds of 24 (104 statements, 24 rows at most per statement), the
 second pass two (the full round, then a read of none).
 
+E649 L4 fold-3 (2026-10-13, the second delta review's N6): a wake-up is never acknowledged unparked, so the ceiling
+is held for the batch WHOLE, after its parks: the counter statement moves to after the parks and does the same one
+LIMITed scan (now of at most 2,048 + the batch's parks), and two statements follow it. The GUARD reads the counter
+row alone under the ceiling; over it, at most the excess (one body's 24) of the rows that may make room, and with
+too few it faults the batch (D1 rolls it back; the hook answers 503). The ROOM-MAKING delete has a limit of 0 under
+the ceiling; over it, it deletes the excess, the oldest exhausted rows first, then the oldest live rows that failed
+at least 3 deliveries, each named LOST. So every hook batch with a park is two statements more than fold-2, the
+same one scan: hook-1 10, decoded-8 28, marker 13, 8x19 42 statements, each at its ceiling. Not measured here: a
+batch at a FULL table (its guard and delete over the rows that may make room, an ORDER BY over them).
+
 NS2 fold (2026-10-12): the real signed filing is measured under `/record`, including the pot stale mark and the
 filer mark. SHED-M1 removes the three indexed party enumeration reads entirely; named parties do no work until
 their own read or armed walk. The tier pins exactly one filing walk (the filer) and one victim walk on its own
