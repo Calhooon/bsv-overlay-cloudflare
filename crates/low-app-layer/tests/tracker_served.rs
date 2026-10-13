@@ -87,3 +87,52 @@ fn ns3_route_body_boundary_adds_words_to_single_batch_and_spenders() {
     assert_eq!(after["answers"][&id]["tracker"]["word"], "unknown");
     assert_eq!(after["rows"][0]["facts"]["spenderWord"]["word"], "unknown");
 }
+
+#[test]
+fn ns3d_l3_real_main_body_builders_preserve_every_legacy_key() {
+    use low_app_layer::{logic, owed, tracker_host::runtime, txany};
+    use std::collections::BTreeMap;
+    fn check(raw: String, subject: Option<&str>, views: &BTreeMap<String, serde_json::Value>) {
+        fn legacy(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(obj) => {
+                    for key in ["tracker", "spenderWord", "coinWord"] { obj.remove(key); }
+                    for child in obj.values_mut() { legacy(child); }
+                }
+                serde_json::Value::Array(arr) => for child in arr { legacy(child); },
+                _ => {}
+            }
+        }
+        let before: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let mut after = before.clone();
+        runtime::decorate(&mut after, subject, views);
+        legacy(&mut after);
+        assert_eq!(after, before, "production body key or value changed");
+    }
+    let id = "01".repeat(32);
+    let spender = "02".repeat(32);
+    let views = BTreeMap::from([(spender.clone(), json!({"word":"seen", "tier":"hint", "source":"arcade"}))]);
+    let observations = [
+        txany::TxObservation::FirstPartyPresent {confirmed:false, raw_hex:Some("0100".into())},
+        txany::TxObservation::Present {confirmed:true, raw_hex:Some("0100".into())},
+        txany::TxObservation::CourierHint {raw_hex:Some("0100".into()), source:"woc", observed_at_ms:123000},
+        txany::TxObservation::Fault,
+    ];
+    for obs in observations {
+        let answer = txany::decide_tx_any(None, None, Some(&obs), txany::AbsenceCorroboration::Unknown);
+        check(txany::tx_any_body(&id, &answer), Some(&id), &views);
+        check(txany::tx_any_batch_body(&[(id.clone(),answer)], &[(spender.clone(), "fault")]), None, &views);
+    }
+    let entries = [logic::OutpointStatus {
+        txid:id.clone(), vout:0, known:true, spent:Some(true), spending_txid:Some(spender.clone()),
+        spent_confirmed:Some(false), spender_seen:Some(true), spender_final:Some(true),
+        reason:None, funding_seen:Some(true),
+    }];
+    check(txany::spent_any_body(&entries, &[false]), None, &views);
+    check(txany::spent_any_body(&entries, &[true]), None, &views);
+    check(logic::utxo_status_body(&entries), None, &views);
+    let rows = [owed::OwedRow {identity:id.clone(), outpoint:format!("{id}:0"), family:owed::OwedFamily::Payout,
+        game_id:"game".into(), sats:Some(100), opponent_identity:Some(spender.clone()), at_height:Some(10),
+        facts:json!({"claimable":true,"spendingTxid":spender,"spentConfirmed":true,"tier":"proven"}), reason:None}];
+    check(owed::owed_body(&id, Some(10), &rows, 123000, false), None, &views);
+}
