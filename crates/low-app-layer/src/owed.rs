@@ -8829,7 +8829,9 @@ pub(crate) mod tests {
         let hook = &code[code.find("if !row_written {").unwrap()..];
         assert!(hook.contains("owed_recompute_and_push_coalesced"), "a filing must walk once before announcing its snapshot");
         assert!(!hook.contains("owed_changed_event_body(id, \"filing\", 0"), "no bare trigger to every device");
-        assert!(hook.contains("owed_identities_by_marker"), "walk both pot parties, not just the filer");
+        assert!(!hook.contains("owed_identities_by_marker"), "SHED-M1: stranger filing must run no victim walk or push");
+        assert!(hook.contains("OWED_STALE_FOR_POT_SQL"), "the victim stays stale for its own read");
+        assert!(hook.contains("if let Some(id) = identity"), "only the filer owns the filing refresh");
     }
 
     #[test]

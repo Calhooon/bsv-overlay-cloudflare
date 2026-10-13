@@ -1890,7 +1890,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     }
     // bsv-low #469: a filing changes what is owed (a refund backup makes a gate-open pot claimable for BOTH seats; a
     // `collected` retires a payout row; a party marker binds a seat). The gate's HIGH-4 + MEDIUM-11: mark every
-    // party of the pot STALE and schedule one coalesced walk per affected identity. Announce only the computed
+    // party of the pot STALE for its own next read; schedule only the FILER's coalesced walk. Announce the computed
     // snapshot: a bare filing trigger makes every mounted device spend another read-stale walk (#648).
     if !row_written {
         bump(&ALREADY_FILED_BY_KIND, kind);
@@ -1905,7 +1905,6 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
             VerifiedRecord::Hopsweep(_, r) => (Some(r.identity.to_ascii_lowercase()), None),
             VerifiedRecord::Result(..) => (None, None),
         };
-        let mut identities = Vec::new();
         if let Some((pot_txid, pot_vout)) = &pot {
             crate::routes::owed_mark_stale(
                 &db,
@@ -1914,23 +1913,19 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
                 "filing: the pot's parties",
             )
             .await;
-            identities = crate::routes::owed_identities_by_marker(&db, pot_txid, *pot_vout).await;
         }
         if let Some(id) = &identity {
             crate::routes::owed_mark_stale(&db, crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(id)], "filing: the filer").await;
-            if !identities.contains(id) { identities.push(id.clone()); }
         }
-        if let Some(wait) = ctx.data.wait.clone() {
-            let env = ctx.env.clone();
-            wait.wait_until(async move {
-                if let Ok(db) = env.d1("OVERLAY_DB") {
-                    for id in identities {
+        if let Some(id) = identity {
+            if let Some(wait) = ctx.data.wait.clone() {
+                let env = ctx.env.clone();
+                wait.wait_until(async move {
+                    if let Ok(db) = env.d1("OVERLAY_DB") {
                         crate::routes::owed_recompute_and_push_coalesced(&env, &db, &id, "filing", None).await;
                     }
-                }
-            });
-        } else {
-            for id in identities {
+                });
+            } else {
                 crate::routes::owed_recompute_and_push_coalesced(&ctx.env, &db, &id, "filing", None).await;
             }
         }
