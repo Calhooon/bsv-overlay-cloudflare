@@ -2409,14 +2409,14 @@ pub(crate) async fn internal_pot_announce_drain(
     )
 }
 
-/// One drain pass over the worker's D1 and relay, under the announce's wall.
+/// One drain pass over the worker's D1 and relay, under the drain's own wall (N4).
 pub(crate) async fn drain_pot_announce(env: &worker::Env) -> Result<crate::pot_hook::DrainTally> {
     let store = crate::pot_hook::HookD1 {
         sql: D1Sql::of(env)?,
     };
     let relay = crate::pot_hook::WorkerRelay { env: env.clone() };
     let wall = worker::Delay::from(core::time::Duration::from_millis(
-        crate::pot_hook::ANNOUNCE_WALL_MS,
+        crate::pot_hook::DRAIN_WALL_MS,
     ));
     Ok(crate::pot_hook::drain_parked(&store, &relay, wall).await)
 }

@@ -182,7 +182,21 @@ use worker::{event, Context, Env, Request, Response, Result, Router};
 /// Deploy convergence runs only on the scheduled owed-clock pass, never a fetch.
 #[event(scheduled)]
 async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
-    ctx.wait_until(async move {
+    // E649 L4 N4: the pot hook's drain is its OWN task, handed first, under its own wall: the tracker's backfill
+    // awaits CHAINTRACKS with no timeout, so it no longer holds the drain behind it.
+    let env_drain = env.clone();
+    let drain: pot_hook::Detached = Box::pin(async move {
+        d1_ledger::boot(schema::ensure_latch_columns(&env_drain)).await;
+        // E649 L4 H1: one bounded pass over the pot hook's parked wake-ups
+        if let Err(e) = routes::drain_pot_announce(&env_drain).await {
+            worker::console_warn!("[pot-changed] drain deferred: {e}");
+        }
+        if let Ok(db) = env_drain.d1("OVERLAY_DB") {
+            let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
+            courier::flush(Some(db), pending).await;
+        }
+    });
+    let tracker: pot_hook::Detached = Box::pin(async move {
         d1_ledger::boot(schema::ensure_latch_columns(&env)).await;
         if let Err(e) = tracker_host::runtime::backfill(&env).await {
             courier::note_presence("tracker_backfill_faulted_total");
@@ -191,16 +205,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         if let Err(e) = tracker_host::runtime::tick(&env).await {
             worker::console_warn!("[tracker-tick] deferred: {e}");
         }
-        // E649 L4 H1: one bounded pass over the pot hook's parked wake-ups (a wake-up the hook's detached announce
-        // did not deliver reaches its seat here, within one scheduled pass).
-        if let Err(e) = routes::drain_pot_announce(&env).await {
-            worker::console_warn!("[pot-changed] drain deferred: {e}");
-        }
-        if let Ok(db) = env.d1("OVERLAY_DB") {
-            let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
-            courier::flush(Some(db), pending).await;
-        }
     });
+    pot_hook::schedule_tick(&|f| ctx.wait_until(f), drain, tracker);
 }
 
 #[event(fetch)]
