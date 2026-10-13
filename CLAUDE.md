@@ -2829,3 +2829,11 @@ CLOUDFLARE_API_TOKEN="<token>" CLOUDFLARE_ACCOUNT_ID="<id>" wrangler deploy
   SHIP/SLAP baseline.
 
 - **Stated limit (bsv-low #581, the delta-4 lens D4-L1):** with one dead-letter consumer and up to 101 deliveries per held-back "not now" letter, a flood can delay honest fault letters and let them expire at the queue's retention; the fix when it matters is a queue per class.
+
+NS2 #648 / #499 fold (2026-10-12): a shed reserves one deferred walk per identity per window per isolate
+(a DO alarm keyed by the isolate and the window's end); the bound is ceiling + 1 per isolate. A shed snapshot's
+read answer carries `refresh: "shed"` and `retryAfterMs` floored at 1,000 ms. A filing marks the pot's parties
+stale and walks only its filer; another party walks on its own next read or its own armed alarm. An exhausted
+first read with no snapshot consumes that same durable reservation once. A faulted alarm clears its arm,
+counts `owed_recompute_deferred_faulted_total`, and re-arms for the next window; a refused arm counts
+`owed_recompute_arm_failed_total`, and the next read past the window repairs even a snapshotless identity.
