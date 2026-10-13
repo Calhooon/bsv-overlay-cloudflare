@@ -70,7 +70,7 @@ pub const COUNTER_ANNOUNCE_EVICTED_EXHAUSTED: &str = "pot_changed_announce_evict
 /// named LOST in the log; served on the overlay's `/health/invariants.counters` with every counter row.
 pub const COUNTER_ANNOUNCE_DISPLACED: &str = "pot_changed_announce_displaced_total";
 
-/// H1: the park of the pots-room wake-ups and the seats' events (overlay migration 222; its index 223 is the
+/// H1: the park of the pots-room wake-ups and the seats' events (overlay migration 229; its index 230 is the
 /// overlay's alone, as the catch-up list is CREATE TABLE statements by contract). One row per (outpoint, kind,
 /// recipient): `kind` is `room` (the pots-room broadcast, `recipient` empty) or `seat` (a `pot` event into that
 /// identity's box). `generation` is the park's TOKEN (N1 of the delta review): taken from [`PARK_SEQ_CREATE`]'s one
@@ -79,7 +79,7 @@ pub const COUNTER_ANNOUNCE_DISPLACED: &str = "pot_changed_announce_displaced_tot
 pub const PARKED_CREATE: &str = "CREATE TABLE IF NOT EXISTS pot_announce_parked (outpoint TEXT NOT NULL, kind TEXT NOT NULL, recipient TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at_ms INTEGER NOT NULL, generation INTEGER NOT NULL, exhausted_at_ms INTEGER, PRIMARY KEY (outpoint, kind, recipient))";
 /// The drain's order (live rows by `next_attempt_at_ms`) and the sweep's range (exhausted rows by their stamp).
 pub const PARKED_DUE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_pot_announce_parked_due ON pot_announce_parked(exhausted_at_ms, next_attempt_at_ms)";
-/// N1: the park tokens' counter (overlay migration 224; in the app's catch-up list too). One row, `id` 1: `n` is the
+/// N1: the park tokens' counter (overlay migration 231; in the app's catch-up list too). One row, `id` 1: `n` is the
 /// last token handed out, `room` the table's room under the ceiling after the last batch's parks (N6: negative, the
 /// excess that batch made room for). Never deleted.
 pub const PARK_SEQ_CREATE: &str = "CREATE TABLE IF NOT EXISTS pot_announce_seq (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL, room INTEGER NOT NULL)";
