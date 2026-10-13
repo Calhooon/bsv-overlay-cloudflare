@@ -756,6 +756,17 @@
    "why": "recomputed on the next read"
   },
   {
+   "name": "pot_announce_parked",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the pot hook's wake-ups (pots-room broadcasts, seat pot events) its detached announce did not deliver, drained by the scheduled pass (E649 L4 H1)",
+   "why": "a wake-up signal only: the seat's own read serves every fact, and the next pot change announces again"
+  },
+  {
    "name": "chain_headers_seen",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

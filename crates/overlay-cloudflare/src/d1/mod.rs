@@ -513,7 +513,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 223 → 226 for bsv-low #649 N2: `change_parked`'s retry state (attempts, next eligibility, exhausted).
 /// 226 → 227 for bsv-low #649 N3: `change_parked_drain`, the index of the drain's order.
 /// 227 → 228 for bsv-low #649 D3-M1: `change_parked_seq`, the one-row counter the park's tokens are taken from.
-pub const OVERLAY_MIGRATION_COUNT: usize = 228;
+/// 228 → 230 for E649 L4 H1 (2026-10-13): `pot_announce_parked` (the app layer's park of the pot hook's
+/// undelivered wake-ups, which its scheduled pass drains) and its due index; one table, one index.
+pub const OVERLAY_MIGRATION_COUNT: usize = 230;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1887,6 +1889,10 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::change_park::CHANGE_PARKED_DRAIN_INDEX,
     // bsv-low #649 D3-M1: the park tokens' one-row counter (a token never reused, never derived from a clock).
     crate::change_park::CHANGE_PARKED_SEQ_CREATE,
+    // E649 L4 H1 (bsv-low, 2026-10-13): the app layer's park of the pot hook's undelivered wake-ups (its
+    // `pot_hook::PARKED_CREATE`, byte-identical, also in its catch-up list) and the drain's index.
+    "CREATE TABLE IF NOT EXISTS pot_announce_parked (outpoint TEXT NOT NULL, kind TEXT NOT NULL, recipient TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at_ms INTEGER NOT NULL, generation INTEGER NOT NULL, exhausted_at_ms INTEGER, PRIMARY KEY (outpoint, kind, recipient))",
+    "CREATE INDEX IF NOT EXISTS idx_pot_announce_parked_due ON pot_announce_parked(exhausted_at_ms, next_attempt_at_ms)",
 
 ];
 

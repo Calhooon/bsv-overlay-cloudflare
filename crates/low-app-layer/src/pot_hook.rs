@@ -32,6 +32,175 @@ pub const COUNTER_MARKER_ARM_FAILED: &str = "pot_changed_marker_arm_failed_total
 /// Relay calls that failed (a transport fault, a non-2xx) or had not answered at the wall.
 pub const COUNTER_ANNOUNCE_FAILED: &str = "pot_changed_announce_failed_total";
 
+/// Wake-ups left PARKED after the detached announce (a relay fault, or no answer at the wall): the scheduled drain
+/// delivers them (H1).
+pub const COUNTER_ANNOUNCE_PARKED: &str = "pot_changed_announce_parked_total";
+/// Parked wake-ups the drain delivered.
+pub const COUNTER_ANNOUNCE_DRAINED: &str = "pot_changed_announce_drained_total";
+/// Parked wake-ups the drain tried and could not deliver (a relay fault, or no answer at the drain's wall).
+pub const COUNTER_ANNOUNCE_RETRY_FAILED: &str = "pot_changed_announce_retry_failed_total";
+/// Parked wake-ups marked exhausted after [`PARK_MAX_ATTEMPTS`] attempts.
+pub const COUNTER_ANNOUNCE_EXHAUSTED: &str = "pot_changed_announce_exhausted_total";
+/// Exhausted parked wake-ups swept after [`PARK_SWEEP_AFTER_MS`].
+pub const COUNTER_ANNOUNCE_SWEPT: &str = "pot_changed_announce_swept_total";
+/// A park, settle or drain statement batch that faulted.
+pub const COUNTER_ANNOUNCE_PARK_FAULTS: &str = "pot_changed_announce_park_faults_total";
+
+/// H1: the park of the pots-room wake-ups and the seats' events (overlay migration 222; its index 223 is the
+/// overlay's alone, as the catch-up list is CREATE TABLE statements by contract). One row per (outpoint, kind,
+/// recipient): `kind` is `room` (the pots-room broadcast, `recipient` empty) or `seat` (a `pot` event into that
+/// identity's box). `generation` orders the parks of one key: a later hook's park replaces an earlier one's, and a
+/// settle touches only the generation it read.
+pub const PARKED_CREATE: &str = "CREATE TABLE IF NOT EXISTS pot_announce_parked (outpoint TEXT NOT NULL, kind TEXT NOT NULL, recipient TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at_ms INTEGER NOT NULL, generation INTEGER NOT NULL, exhausted_at_ms INTEGER, PRIMARY KEY (outpoint, kind, recipient))";
+/// The drain's order (live rows by `next_attempt_at_ms`) and the sweep's range (exhausted rows by their stamp).
+pub const PARKED_DUE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_pot_announce_parked_due ON pot_announce_parked(exhausted_at_ms, next_attempt_at_ms)";
+/// Park (or re-park) one wake-up. A park of an OLDER generation never replaces a newer one.
+pub const PARK_SQL: &str = "INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL) ON CONFLICT (outpoint, kind, recipient) DO UPDATE SET at = excluded.at, attempts = excluded.attempts, next_attempt_at_ms = excluded.next_attempt_at_ms, generation = excluded.generation, exhausted_at_ms = NULL WHERE excluded.generation >= pot_announce_parked.generation";
+/// A delivered wake-up leaves the park (only the generation that was delivered).
+pub const PARKED_DELIVERED_SQL: &str = "DELETE FROM pot_announce_parked WHERE outpoint = ?1 AND kind = ?2 AND recipient = ?3 AND generation = ?4";
+/// A drained wake-up that failed again: its next attempt, or its exhausted stamp.
+pub const PARKED_RETRY_SQL: &str = "UPDATE pot_announce_parked SET attempts = ?5, next_attempt_at_ms = ?6, exhausted_at_ms = ?7 WHERE outpoint = ?1 AND kind = ?2 AND recipient = ?3 AND generation = ?4";
+/// The drain's read: the live wake-ups due now, oldest due first, bounded.
+pub const PARKED_DUE_SQL: &str = "SELECT outpoint, kind, recipient, at, attempts, generation FROM pot_announce_parked WHERE exhausted_at_ms IS NULL AND next_attempt_at_ms <= ?1 ORDER BY next_attempt_at_ms LIMIT ?2";
+/// The sweep: exhausted wake-ups older than the bound, bounded per pass.
+pub const PARKED_SWEEP_SQL: &str = "DELETE FROM pot_announce_parked WHERE rowid IN (SELECT rowid FROM pot_announce_parked WHERE exhausted_at_ms IS NOT NULL AND exhausted_at_ms < ?1 LIMIT ?2)";
+
+/// A wake-up parked before the answer is not due until the detached announce has had its window (the platform's
+/// 30 s `waitUntil`), so the drain does not race it; the announce's settle takes it out or re-parks it.
+pub const PARK_GRACE_MS: u64 = 30_000;
+/// The first retry of a wake-up that failed; it doubles per attempt up to [`PARK_RETRY_MAX_MS`].
+pub const PARK_RETRY_BASE_MS: u64 = 60_000;
+pub const PARK_RETRY_MAX_MS: u64 = 3_600_000;
+/// Attempts (the detached announce's included) before a wake-up is marked exhausted.
+pub const PARK_MAX_ATTEMPTS: u32 = 8;
+/// An exhausted wake-up is swept a day after it was marked.
+pub const PARK_SWEEP_AFTER_MS: u64 = 86_400_000;
+/// The drain's bound per scheduled pass: the wake-ups of one full body (8 rooms, 16 seats).
+pub const DRAIN_MAX_PER_PASS: u32 = 24;
+/// The sweep's bound per pass.
+pub const SWEEP_MAX_PER_PASS: u32 = 50;
+
+/// When attempt `attempts` (1-based) may be retried, from `now`.
+pub fn retry_at(now: u64, attempts: u32) -> u64 {
+    let shift = attempts.saturating_sub(1).min(16);
+    now + (PARK_RETRY_BASE_MS << shift).min(PARK_RETRY_MAX_MS)
+}
+
+/// One wake-up of a body: the pots-room broadcast of an outpoint, or one seat's `pot` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wake {
+    pub txid: String,
+    pub vout: u32,
+    /// `None`: the pots room.
+    pub recipient: Option<String>,
+}
+
+impl Wake {
+    fn outpoint(&self) -> String {
+        format!("{}:{}", self.txid, self.vout)
+    }
+    fn kind(&self) -> &'static str {
+        if self.recipient.is_some() {
+            "seat"
+        } else {
+            "room"
+        }
+    }
+    fn key_binds(&self) -> Vec<Bind> {
+        vec![
+            Bind::Text(self.outpoint()),
+            Bind::Text(self.kind().to_string()),
+            Bind::Text(self.recipient.clone().unwrap_or_default()),
+        ]
+    }
+}
+
+/// One parked row as the drain reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parked {
+    pub wake: Wake,
+    pub at_ms: u64,
+    pub attempts: u32,
+    pub generation: u64,
+}
+
+/// One statement of the park's write set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParkOp {
+    /// Park `wake` of `generation` with `attempts` made, due at `next_ms`.
+    Park {
+        wake: Wake,
+        at_ms: u64,
+        attempts: u32,
+        next_ms: u64,
+        generation: u64,
+    },
+    Delivered {
+        wake: Wake,
+        generation: u64,
+    },
+    Retry {
+        wake: Wake,
+        generation: u64,
+        attempts: u32,
+        next_ms: u64,
+        exhausted_at_ms: Option<u64>,
+    },
+    Sweep {
+        before_ms: u64,
+        limit: u32,
+    },
+}
+
+impl ParkOp {
+    fn stmt(&self) -> Stmt {
+        let int = |n: u64| Bind::Int(n as i64);
+        match self {
+            ParkOp::Park {
+                wake,
+                at_ms,
+                attempts,
+                next_ms,
+                generation,
+            } => {
+                let mut b = wake.key_binds();
+                b.extend([
+                    int(*at_ms),
+                    int(u64::from(*attempts)),
+                    int(*next_ms),
+                    int(*generation),
+                ]);
+                Stmt::new(PARK_SQL, b)
+            }
+            ParkOp::Delivered { wake, generation } => {
+                let mut b = wake.key_binds();
+                b.push(int(*generation));
+                Stmt::new(PARKED_DELIVERED_SQL, b)
+            }
+            ParkOp::Retry {
+                wake,
+                generation,
+                attempts,
+                next_ms,
+                exhausted_at_ms,
+            } => {
+                let mut b = wake.key_binds();
+                b.extend([
+                    int(*generation),
+                    int(u64::from(*attempts)),
+                    int(*next_ms),
+                    exhausted_at_ms.map(int).unwrap_or(Bind::Null),
+                ]);
+                Stmt::new(PARKED_RETRY_SQL, b)
+            }
+            ParkOp::Sweep { before_ms, limit } => Stmt::new(
+                PARKED_SWEEP_SQL,
+                vec![int(*before_ms), int(u64::from(*limit))],
+            ),
+        }
+    }
+}
+
 /// What one relay call came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
@@ -94,6 +263,7 @@ pub trait SqlPort {
     /// Add counter deltas (`ops_counters`), best effort.
     async fn counters(&self, deltas: Vec<(String, u64)>);
     fn now_ms(&self) -> u64;
+    fn nonce(&self) -> u64;
     fn log(&self, line: &str);
 }
 
@@ -102,10 +272,19 @@ pub trait SqlPort {
 pub trait HookStore {
     /// Every outpoint's attribution, in the order of `outpoints`.
     async fn read_outpoints(&self, outpoints: &[(String, u32)]) -> Vec<OutpointRead>;
-    /// Every stale mark of the body, in ONE batch. `Err` is logged by the caller; the recompute still runs.
-    async fn mark_stale(&self, marks: &[(String, &'static str)]) -> Result<(), String>;
+    /// Every stale mark and every park statement given, in ONE batch (the hook's write; the settle's; the
+    /// drain's). Answers the rows each park statement changed, in order (the sweep's count).
+    async fn write(
+        &self,
+        marks: &[(String, &'static str)],
+        ops: &[ParkOp],
+    ) -> Result<Vec<u64>, String>;
+    /// The parked wake-ups due at `now`, oldest due first, at most `limit`.
+    async fn due_parked(&self, now: u64, limit: u32) -> Result<Vec<Parked>, String>;
     async fn counters(&self, deltas: Vec<(String, u64)>);
     fn now_ms(&self) -> u64;
+    /// 0 to 999: the low digits of a park's generation (two hooks of one millisecond do not share one).
+    fn nonce(&self) -> u64;
     fn log(&self, line: &str);
 }
 
@@ -285,8 +464,12 @@ impl<P: SqlPort> HookStore for HookD1<P> {
             .collect()
     }
 
-    async fn mark_stale(&self, marks: &[(String, &'static str)]) -> Result<(), String> {
-        let stmts = marks
+    async fn write(
+        &self,
+        marks: &[(String, &'static str)],
+        ops: &[ParkOp],
+    ) -> Result<Vec<u64>, String> {
+        let mut stmts: Vec<Stmt> = marks
             .iter()
             .map(|(id, _)| {
                 Stmt::new(
@@ -295,7 +478,46 @@ impl<P: SqlPort> HookStore for HookD1<P> {
                 )
             })
             .collect();
-        self.sql.run_batch(stmts).await.map(|_| ())
+        stmts.extend(ops.iter().map(ParkOp::stmt));
+        let out = self.sql.run_batch(stmts).await?;
+        Ok(out[marks.len()..].iter().map(|o| o.changes).collect())
+    }
+
+    async fn due_parked(&self, now: u64, limit: u32) -> Result<Vec<Parked>, String> {
+        let out = self
+            .sql
+            .run_batch(vec![Stmt::new(
+                PARKED_DUE_SQL,
+                vec![Bind::Int(now as i64), Bind::Int(i64::from(limit))],
+            )])
+            .await?;
+        let mut parked = Vec::new();
+        for r in out.first().map(|o| o.rows.as_slice()).unwrap_or(&[]) {
+            let text = |k: &str| {
+                r.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let num = |k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(0.0) as u64;
+            let outpoint = text("outpoint");
+            let Some((txid, vout)) = outpoint.rsplit_once(':') else {
+                continue;
+            };
+            let Ok(vout) = vout.parse() else { continue };
+            let recipient = text("recipient");
+            parked.push(Parked {
+                wake: Wake {
+                    txid: txid.to_string(),
+                    vout,
+                    recipient: (text("kind") == "seat").then_some(recipient),
+                },
+                at_ms: num("at"),
+                attempts: num("attempts") as u32,
+                generation: num("generation"),
+            });
+        }
+        Ok(parked)
     }
 
     async fn counters(&self, deltas: Vec<(String, u64)>) {
@@ -303,6 +525,9 @@ impl<P: SqlPort> HookStore for HookD1<P> {
     }
     fn now_ms(&self) -> u64 {
         self.sql.now_ms()
+    }
+    fn nonce(&self) -> u64 {
+        self.sql.nonce()
     }
     fn log(&self, line: &str) {
         self.sql.log(line)
@@ -343,11 +568,27 @@ pub struct AnnouncePlan {
     /// (identity, txid, vout): one `pot` event into the seat's `low_events` box.
     pub seat_events: Vec<(String, String, u32)>,
     pub at_ms: u64,
+    /// The generation its parks carry.
+    pub generation: u64,
 }
 
 impl AnnouncePlan {
     pub fn calls(&self) -> u64 {
         (self.outpoints.len() + self.seat_events.len()) as u64
+    }
+    /// Every wake-up of the plan: the rooms, then the seats.
+    pub fn wakes(&self) -> Vec<Wake> {
+        let rooms = self.outpoints.iter().map(|(txid, vout)| Wake {
+            txid: txid.clone(),
+            vout: *vout,
+            recipient: None,
+        });
+        let seats = self.seat_events.iter().map(|(id, txid, vout)| Wake {
+            txid: txid.clone(),
+            vout: *vout,
+            recipient: Some(id.clone()),
+        });
+        rooms.chain(seats).collect()
     }
 }
 
@@ -359,7 +600,10 @@ pub struct PotChangedOutcome {
     pub skipped: Vec<Value>,
     pub owed_identities: Vec<String>,
     pub stale_marks: Vec<(String, &'static str)>,
+    /// The hook's write batch (the stale marks and the parks) faulted: nothing of it landed, and the answer says so.
     pub stale_fault: Option<String>,
+    /// Wake-ups parked durably before the answer (H1).
+    pub parked: usize,
     pub plan: AnnouncePlan,
 }
 
@@ -385,6 +629,7 @@ pub async fn apply_pot_changed<S: HookStore>(
             outpoints: outpoints.to_vec(),
             seat_events: Vec::new(),
             at_ms,
+            generation: at_ms * 1000 + store.nonce() % 1000,
         },
         ..PotChangedOutcome::default()
     };
@@ -426,10 +671,23 @@ pub async fn apply_pot_changed<S: HookStore>(
             }
         }
     }
-    if !out.stale_marks.is_empty() {
-        if let Err(e) = store.mark_stale(&out.stale_marks).await {
-            out.stale_fault = Some(e);
-        }
+    // H1: every wake-up of the plan is PARKED in the same write batch as the stale marks, BEFORE the answer, not
+    // due until the detached announce has had its window; the announce's settle takes out what it delivered.
+    let parks: Vec<ParkOp> = out
+        .plan
+        .wakes()
+        .into_iter()
+        .map(|wake| ParkOp::Park {
+            wake,
+            at_ms,
+            attempts: 0,
+            next_ms: at_ms + PARK_GRACE_MS,
+            generation: out.plan.generation,
+        })
+        .collect();
+    match store.write(&out.stale_marks, &parks).await {
+        Ok(_) => out.parked = parks.len(),
+        Err(e) => out.stale_fault = Some(e),
     }
     out
 }
@@ -446,7 +704,7 @@ pub async fn apply_hop_changed<S: HookStore>(
     if marks.is_empty() {
         return Ok(());
     }
-    store.mark_stale(&marks).await
+    store.write(&marks, &[]).await.map(|_| ())
 }
 
 /// The `entry` of a seat's `pot` event since L4: an empty object (the client's parser requires an object; no
@@ -463,6 +721,10 @@ pub struct AnnounceTally {
     pub failed: u64,
     /// The wall fell before every call answered (the unanswered ones are in `failed`).
     pub walled: bool,
+    /// Wake-ups left parked for the drain (every failed one).
+    pub parked: u64,
+    /// The settle's write faulted.
+    pub park_faults: u64,
 }
 
 impl AnnounceTally {
@@ -480,6 +742,8 @@ impl AnnounceTally {
             (COUNTER_ANNOUNCE_SENT, self.sent),
             (COUNTER_ANNOUNCE_SKIPPED, self.skipped),
             (COUNTER_ANNOUNCE_FAILED, self.failed),
+            (COUNTER_ANNOUNCE_PARKED, self.parked),
+            (COUNTER_ANNOUNCE_PARK_FAULTS, self.park_faults),
         ]
         .into_iter()
         .filter(|(_, n)| *n > 0)
@@ -488,45 +752,66 @@ impl AnnounceTally {
     }
 }
 
+/// Deliver `wakes` together (the calls of one body run together, not one after another), all raced against ONE
+/// `wall`: each wake-up's answer, `None` for a call that had not answered at the wall (dropped).
+pub async fn deliver<R: RelayPort, W: Future<Output = ()>>(
+    relay: &R,
+    wakes: &[Wake],
+    at_ms: u64,
+    wall: W,
+) -> Vec<Option<Delivery>> {
+    use futures_util::future::{join_all, select};
+    let got: RefCell<Vec<Option<Delivery>>> = RefCell::new(vec![None; wakes.len()]);
+    let calls = wakes.iter().enumerate().map(|(i, w)| {
+        let got = &got;
+        async move {
+            let d = match &w.recipient {
+                None => {
+                    let body =
+                        crate::internal_events::pot_changed_event_body(&w.txid, w.vout, at_ms);
+                    relay
+                        .broadcast(crate::internal_events::POTS_ROOM, body)
+                        .await
+                }
+                Some(id) => {
+                    let body = crate::internal_events::pot_event_body(
+                        &w.txid,
+                        w.vout,
+                        carrier_entry(),
+                        at_ms,
+                    );
+                    relay.push(id, body).await
+                }
+            };
+            got.borrow_mut()[i] = Some(d);
+        }
+    });
+    {
+        let all = join_all(calls);
+        futures_util::pin_mut!(all, wall);
+        let _ = select(all, wall).await;
+    }
+    got.into_inner()
+}
+
 /// The detached announce of one body: every changed outpoint into the pots room (the deployed client matches
-/// `potOutpoint` alone, so one body per outpoint; the calls of one hook run together, not one after another),
-/// and one `pot` event into each attributed seat's box, all raced against ONE `wall`. A call that has not answered
-/// at the wall is dropped and counted failed.
+/// `potOutpoint` alone, so one body per outpoint) and one `pot` event into each attributed seat's box, under ONE
+/// `wall`. A call that has not answered at the wall is dropped and counted failed.
 pub async fn announce<R: RelayPort, W: Future<Output = ()>>(
     relay: &R,
     plan: &AnnouncePlan,
     wall: W,
 ) -> AnnounceTally {
-    use futures_util::future::{join_all, select, Either};
-    let tally = RefCell::new(AnnounceTally::default());
-    let pots = plan.outpoints.iter().map(|(txid, vout)| {
-        let body = crate::internal_events::pot_changed_event_body(txid, *vout, plan.at_ms);
-        let tally = &tally;
-        async move {
-            let d = relay
-                .broadcast(crate::internal_events::POTS_ROOM, body)
-                .await;
-            tally.borrow_mut().note(d);
+    let got = deliver(relay, &plan.wakes(), plan.at_ms, wall).await;
+    let mut t = AnnounceTally::default();
+    for d in got {
+        match d {
+            Some(d) => t.note(d),
+            None => {
+                t.failed += 1;
+                t.walled = true;
+            }
         }
-    });
-    let seats = plan.seat_events.iter().map(|(id, txid, vout)| {
-        let body = crate::internal_events::pot_event_body(txid, *vout, carrier_entry(), plan.at_ms);
-        let tally = &tally;
-        async move {
-            let d = relay.push(id, body).await;
-            tally.borrow_mut().note(d);
-        }
-    });
-    let all = async {
-        futures_util::future::join(join_all(pots), join_all(seats)).await;
-    };
-    futures_util::pin_mut!(all, wall);
-    let walled = matches!(select(all, wall).await, Either::Right(_));
-    let mut t = *tally.borrow();
-    if walled {
-        let answered = t.sent + t.skipped + t.failed;
-        t.failed += plan.calls().saturating_sub(answered);
-        t.walled = true;
     }
     t
 }
@@ -548,7 +833,10 @@ impl RelayPort for WorkerRelay {
 /// One unit of work handed past the answer (the worker's is `ctx.wait_until`).
 pub type Detached = std::pin::Pin<Box<dyn Future<Output = ()>>>;
 
-/// The detached announce of one body: the announce under the wall, its log line and its counters.
+/// The detached announce of one body, then its SETTLE (H1): a delivered wake-up (or one the deploy cannot send)
+/// leaves the park; one that failed or had not answered at the wall is re-parked for the drain (attempt 1, due after
+/// [`PARK_RETRY_BASE_MS`]), so a park the answer's write could not make is made here. One write batch; its log line
+/// and its counters.
 pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
     store: &S,
     relay: &R,
@@ -556,14 +844,51 @@ pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = 
     wall: W,
 ) -> AnnounceTally {
     let t0 = store.now_ms();
-    let t = announce(relay, plan, wall).await;
+    let wakes = plan.wakes();
+    let got = deliver(relay, &wakes, plan.at_ms, wall).await;
+    let now = store.now_ms();
+    let mut t = AnnounceTally::default();
+    let mut ops = Vec::with_capacity(wakes.len());
+    for (wake, d) in wakes.into_iter().zip(got) {
+        match d {
+            Some(d @ (Delivery::Sent | Delivery::NotConfigured)) => {
+                t.note(d);
+                ops.push(ParkOp::Delivered {
+                    wake,
+                    generation: plan.generation,
+                });
+            }
+            failed => {
+                t.failed += 1;
+                t.walled |= failed.is_none();
+                t.parked += 1;
+                ops.push(ParkOp::Park {
+                    wake,
+                    at_ms: plan.at_ms,
+                    attempts: 1,
+                    next_ms: retry_at(now, 1),
+                    generation: plan.generation,
+                });
+            }
+        }
+    }
+    if !ops.is_empty() {
+        if let Err(e) = store.write(&[], &ops).await {
+            t.park_faults += 1;
+            store.log(&format!(
+                "[pot-changed] announce settle failed ({} wake-up(s)): {e}",
+                ops.len()
+            ));
+        }
+    }
     store.log(&format!(
-        "[pot-changed] announce: {} outpoint(s), {} seat event(s): sent={} skipped={} failed={}{} in {} ms",
+        "[pot-changed] announce: {} outpoint(s), {} seat event(s): sent={} skipped={} failed={} parked={}{} in {} ms",
         plan.outpoints.len(),
         plan.seat_events.len(),
         t.sent,
         t.skipped,
         t.failed,
+        t.parked,
         if t.walled { " (WALL)" } else { "" },
         store.now_ms().saturating_sub(t0)
     ));
@@ -572,6 +897,146 @@ pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = 
         store.counters(counters).await;
     }
     t
+}
+
+/// What one drain pass came to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainTally {
+    pub due: u64,
+    pub drained: u64,
+    pub skipped: u64,
+    pub retry_failed: u64,
+    pub exhausted: u64,
+    pub swept: u64,
+    pub faults: u64,
+}
+
+impl DrainTally {
+    pub fn counters(&self) -> Vec<(String, u64)> {
+        [
+            (COUNTER_ANNOUNCE_DRAINED, self.drained),
+            (COUNTER_ANNOUNCE_SKIPPED, self.skipped),
+            (COUNTER_ANNOUNCE_RETRY_FAILED, self.retry_failed),
+            (COUNTER_ANNOUNCE_EXHAUSTED, self.exhausted),
+            (COUNTER_ANNOUNCE_SWEPT, self.swept),
+            (COUNTER_ANNOUNCE_PARK_FAULTS, self.faults),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(k, n)| (k.to_string(), n))
+        .collect()
+    }
+}
+
+/// ONE DRAIN PASS (the scheduled tick's, and `POST /internal/pot-announce-drain`'s): at most
+/// [`DRAIN_MAX_PER_PASS`] parked wake-ups due now, delivered together under `wall`; a delivered one leaves the park,
+/// a failed one is retried later (doubling from [`PARK_RETRY_BASE_MS`] to [`PARK_RETRY_MAX_MS`]) and marked
+/// exhausted at its [`PARK_MAX_ATTEMPTS`]th attempt; exhausted rows older than [`PARK_SWEEP_AFTER_MS`] are swept, at
+/// most [`SWEEP_MAX_PER_PASS`]. Two D1 round trips: the due read, then one write batch (the settle and the sweep).
+pub async fn drain_parked<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
+    store: &S,
+    relay: &R,
+    wall: W,
+) -> DrainTally {
+    let now = store.now_ms();
+    let mut t = DrainTally::default();
+    let due = match store.due_parked(now, DRAIN_MAX_PER_PASS).await {
+        Ok(d) => d,
+        Err(e) => {
+            t.faults += 1;
+            store.log(&format!("[pot-changed] drain read failed: {e}"));
+            store.counters(t.counters()).await;
+            return t;
+        }
+    };
+    t.due = due.len() as u64;
+    let mut ops = Vec::with_capacity(due.len() + 1);
+    let got = if due.is_empty() {
+        Vec::new()
+    } else {
+        deliver_each_at(relay, &due, wall).await
+    };
+    let now = store.now_ms();
+    for (p, d) in due.into_iter().zip(got) {
+        match d {
+            Some(d @ (Delivery::Sent | Delivery::NotConfigured)) => {
+                if d == Delivery::Sent {
+                    t.drained += 1;
+                } else {
+                    t.skipped += 1;
+                }
+                ops.push(ParkOp::Delivered {
+                    wake: p.wake,
+                    generation: p.generation,
+                });
+            }
+            _ => {
+                let attempts = p.attempts + 1;
+                let exhausted = attempts >= PARK_MAX_ATTEMPTS;
+                if exhausted {
+                    t.exhausted += 1;
+                } else {
+                    t.retry_failed += 1;
+                }
+                ops.push(ParkOp::Retry {
+                    wake: p.wake,
+                    generation: p.generation,
+                    attempts,
+                    next_ms: retry_at(now, attempts),
+                    exhausted_at_ms: exhausted.then_some(now),
+                });
+            }
+        }
+    }
+    ops.push(ParkOp::Sweep {
+        before_ms: now.saturating_sub(PARK_SWEEP_AFTER_MS),
+        limit: SWEEP_MAX_PER_PASS,
+    });
+    match store.write(&[], &ops).await {
+        Ok(changes) => t.swept = changes.last().copied().unwrap_or(0),
+        Err(e) => {
+            t.faults += 1;
+            store.log(&format!("[pot-changed] drain settle failed: {e}"));
+        }
+    }
+    store.log(&format!(
+        "[pot-changed] drain: due={} drained={} skipped={} retry_failed={} exhausted={} swept={} faults={}",
+        t.due, t.drained, t.skipped, t.retry_failed, t.exhausted, t.swept, t.faults
+    ));
+    let counters = t.counters();
+    if !counters.is_empty() {
+        store.counters(counters).await;
+    }
+    t
+}
+
+/// The drain's delivery: each parked wake-up with the `at` it was announced at, all together under the one wall.
+async fn deliver_each_at<R: RelayPort, W: Future<Output = ()>>(
+    relay: &R,
+    due: &[Parked],
+    wall: W,
+) -> Vec<Option<Delivery>> {
+    use futures_util::future::{join_all, select};
+    let got: RefCell<Vec<Option<Delivery>>> = RefCell::new(vec![None; due.len()]);
+    let calls = due.iter().enumerate().map(|(i, p)| {
+        let got = &got;
+        async move {
+            let mut one = deliver(
+                relay,
+                std::slice::from_ref(&p.wake),
+                p.at_ms,
+                std::future::pending::<()>(),
+            )
+            .await;
+            got.borrow_mut()[i] = one.pop().flatten();
+        }
+    });
+    {
+        let all = join_all(calls);
+        futures_util::pin_mut!(all, wall);
+        let _ = select(all, wall).await;
+    }
+    got.into_inner()
 }
 
 /// THE POT HOOK, after its bearer and its parse: the decision over the store ([`apply_pot_changed`]), then the
@@ -746,6 +1211,9 @@ pub(crate) mod tests {
         }
         fn now_ms(&self) -> u64 {
             self.now.get()
+        }
+        fn nonce(&self) -> u64 {
+            self.stmts.get() as u64 % 1000
         }
         fn log(&self, line: &str) {
             self.lines.borrow_mut().push(line.to_string());
@@ -964,6 +1432,198 @@ pub(crate) mod tests {
         );
     }
 
+    fn parked_rows(db: &SqliteSql) -> Vec<(String, String, String, i64, Option<i64>)> {
+        let mut q = db
+            .conn
+            .prepare("SELECT outpoint, kind, recipient, attempts, exhausted_at_ms FROM pot_announce_parked ORDER BY outpoint, kind, recipient")
+            .unwrap();
+        q.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    /// (H1, M2 b) NO WAKE-UP IS LOST. The production handler over the real store's SQL, the mixed body, the eighth
+    /// room broadcast hung past the wall: every wake-up (8 rooms, 14 seats) is PARKED in D1 before the answer, in
+    /// the hook's one write batch; the detached announce runs after the answer, and its settle leaves exactly the
+    /// hung wake-up parked (attempt 1), counted. The drain is not early (the retry is not due), then delivers it
+    /// one pass later and empties the park. A wake-up that keeps failing is marked exhausted at its 8th attempt
+    /// and swept a day after; every step counted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f_h1_the_wall_parks_the_unfinished_wake_up_and_the_drain_delivers_it() {
+        let (db, ops) = mixed_fixture();
+        let store = Rc::new(HookD1 { sql: db });
+        let relay = Rc::new(Relay {
+            hung: vec![MARKER_POT.to_string()],
+            ..Relay::default()
+        });
+        let rec = Recorded::default();
+        let detach = |f: Detached| rec.0.borrow_mut().push(f);
+        let at = store.sql.now.get();
+        let out = serve_pot_changed(
+            store.clone(),
+            relay.clone(),
+            tokio::time::sleep(Duration::from_millis(300)),
+            &detach,
+            &ops,
+            at,
+        )
+        .await;
+        assert_eq!(out.stale_fault, None);
+        assert_eq!(relay.started.get(), 0, "nothing sent before the answer");
+        let before = parked_rows(&store.sql);
+        assert_eq!(
+            (out.parked, before.len()),
+            (22, 22),
+            "the wake-ups are parked before the answer"
+        );
+        assert_eq!(
+            before.iter().filter(|r| r.1 == "room").count(),
+            8,
+            "every parsed outpoint's room wake-up"
+        );
+        rec.run_all().await;
+        let after = parked_rows(&store.sql);
+        assert_eq!(
+            after,
+            vec![(
+                format!("{MARKER_POT}:0"),
+                "room".to_string(),
+                String::new(),
+                1,
+                None
+            )],
+            "the wall leaves the hung wake-up parked, the delivered ones settled"
+        );
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_PARKED), 1);
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_SENT), 21);
+
+        let quick = Relay::default();
+        let t = drain_parked(&*store, &quick, tokio::time::sleep(Duration::from_secs(5))).await;
+        assert_eq!((t.due, t.drained), (0, 0), "not due before its retry");
+        store.sql.now.set(store.sql.now.get() + PARK_RETRY_BASE_MS);
+        let t = drain_parked(&*store, &quick, tokio::time::sleep(Duration::from_secs(5))).await;
+        assert_eq!(
+            (t.due, t.drained, t.faults),
+            (1, 1, 0),
+            "the drain delivers it one pass later"
+        );
+        assert!(quick
+            .delivered
+            .borrow()
+            .iter()
+            .any(|(to, txid, _)| to == crate::internal_events::POTS_ROOM && txid == MARKER_POT));
+        assert!(
+            parked_rows(&store.sql).is_empty(),
+            "delivered: the park is empty"
+        );
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_DRAINED), 1);
+
+        // a wake-up that keeps failing: exhausted at its 8th attempt, swept a day later
+        let wake = Wake {
+            txid: MARKER_POT.to_string(),
+            vout: 0,
+            recipient: Some(marker_seat(0)),
+        };
+        let now = store.sql.now.get();
+        store
+            .write(
+                &[],
+                &[ParkOp::Park {
+                    wake,
+                    at_ms: now,
+                    attempts: 1,
+                    next_ms: now,
+                    generation: 5,
+                }],
+            )
+            .await
+            .unwrap();
+        let failing = SlowRelay::new(Duration::ZERO, Delivery::Failed);
+        for _ in 0..PARK_MAX_ATTEMPTS - 1 {
+            let t = drain_parked(
+                &*store,
+                &failing,
+                tokio::time::sleep(Duration::from_secs(5)),
+            )
+            .await;
+            assert_eq!(t.due, 1);
+            store.sql.now.set(store.sql.now.get() + PARK_RETRY_MAX_MS);
+        }
+        let rows = parked_rows(&store.sql);
+        assert_eq!((rows.len(), rows[0].3), (1, i64::from(PARK_MAX_ATTEMPTS)));
+        assert!(rows[0].4.is_some(), "exhausted at its 8th attempt");
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_EXHAUSTED), 1);
+        assert_eq!(
+            store.sql.counter(COUNTER_ANNOUNCE_RETRY_FAILED),
+            u64::from(PARK_MAX_ATTEMPTS) - 2
+        );
+        let t = drain_parked(
+            &*store,
+            &failing,
+            tokio::time::sleep(Duration::from_secs(5)),
+        )
+        .await;
+        assert_eq!(
+            (t.due, t.swept),
+            (0, 0),
+            "an exhausted wake-up is not retried, nor swept early"
+        );
+        store.sql.now.set(store.sql.now.get() + PARK_SWEEP_AFTER_MS);
+        let t = drain_parked(
+            &*store,
+            &failing,
+            tokio::time::sleep(Duration::from_secs(5)),
+        )
+        .await;
+        assert_eq!(t.swept, 1, "swept a day after");
+        assert!(parked_rows(&store.sql).is_empty());
+        assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_SWEPT), 1);
+    }
+
+    /// (H1) A LATER HOOK'S PARK IS NEVER UNDONE BY AN EARLIER ONE'S SETTLE: the settle and the drain touch only the
+    /// generation they hold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f_h1_a_settle_touches_only_its_own_generation() {
+        let store = HookD1 {
+            sql: SqliteSql::migrated(),
+        };
+        let wake = Wake {
+            txid: MARKER_POT.to_string(),
+            vout: 0,
+            recipient: None,
+        };
+        let park = |generation: u64| ParkOp::Park {
+            wake: wake.clone(),
+            at_ms: 1,
+            attempts: 0,
+            next_ms: 1,
+            generation,
+        };
+        store.write(&[], &[park(2000)]).await.unwrap();
+        store.write(&[], &[park(1000)]).await.unwrap();
+        store
+            .write(
+                &[],
+                &[ParkOp::Delivered {
+                    wake: wake.clone(),
+                    generation: 1000,
+                }],
+            )
+            .await
+            .unwrap();
+        let rows = store.due_parked(10, 24).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the older park neither replaced nor deleted the newer"
+        );
+        assert_eq!(rows[0].generation, 2000);
+        assert_eq!(rows[0].wake, wake);
+    }
+
     /// (H2, M2 c) AN OPTIONAL MARKER ARM'S FAULT LEAVES THE OTHER SEATS FILED. The review's case through the
     /// production handler and the real store's SQL: the mixed body with `potrefund_records` unavailable (renamed
     /// away under SQLite, so the shipped statement fails to prepare as on a D1 that faults it). The fourteen
@@ -1068,6 +1728,7 @@ pub(crate) mod tests {
             outpoints: vec![op(1), op(2)],
             seat_events: vec![(A.into(), op(1).0, 1)],
             at_ms: 7,
+            generation: 7000,
         };
         let wall = || tokio::time::sleep(Duration::from_millis(200));
         let ok = announce(
@@ -1082,7 +1743,9 @@ pub(crate) mod tests {
                 sent: 3,
                 skipped: 0,
                 failed: 0,
-                walled: false
+                walled: false,
+                parked: 0,
+                park_faults: 0,
             }
         );
         assert_eq!(ok.counters(), vec![(COUNTER_ANNOUNCE_SENT.to_string(), 3)]);
@@ -1098,7 +1761,9 @@ pub(crate) mod tests {
                 sent: 0,
                 skipped: 0,
                 failed: 3,
-                walled: true
+                walled: true,
+                parked: 0,
+                park_faults: 0,
             }
         );
         assert_eq!(
@@ -1117,7 +1782,9 @@ pub(crate) mod tests {
                 sent: 0,
                 skipped: 0,
                 failed: 3,
-                walled: false
+                walled: false,
+                parked: 0,
+                park_faults: 0,
             }
         );
         assert_eq!(

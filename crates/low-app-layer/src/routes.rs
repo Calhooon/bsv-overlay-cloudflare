@@ -2350,7 +2350,7 @@ pub(crate) async fn internal_pot_changed(
     let outcome =
         crate::pot_hook::serve_pot_changed(store, relay, wall, &detach, &outpoints, t0).await;
     if let Some(e) = &outcome.stale_fault {
-        console_warn!("[owed] stale mark (pot-changed) failed: {e}");
+        console_warn!("[pot-changed] write batch (stale marks and parks) failed: {e}");
     }
     // bsv-low #469 (the gate's MEDIUM-11): the owed recompute runs AFTER this answer (`wait_until`), once per identity
     // this call attributed, never inline and never per outpoint × identity; #648 sheds it per identity.
@@ -2373,14 +2373,50 @@ pub(crate) async fn internal_pot_changed(
         "[pot-changed] answered in {ms} ms, announce detached ({} outpoints)",
         outcome.plan.outpoints.len()
     );
+    // H1: a body whose wake-ups could not be parked is not acknowledged: 503 keeps it on the producer's retry path
+    // (the detached announce still runs, and its settle parks what it does not deliver).
+    let (status, ok) = match &outcome.stale_fault {
+        None => (200, true),
+        Some(_) => (503, false),
+    };
     let mut resp = json_response(
-        serde_json::json!({ "ok": true, "filed": outcome.filed, "skipped": outcome.skipped, "dropped": dropped, "announce": "detached" })
+        serde_json::json!({ "ok": ok, "filed": outcome.filed, "skipped": outcome.skipped, "dropped": dropped, "announce": "detached", "parked": outcome.parked, "retryable": !ok })
             .to_string(),
-        200,
+        status,
     )?;
     resp.headers_mut()
         .set("Server-Timing", &crate::pot_hook::hook_timing(ms))?;
     Ok(resp)
+}
+
+/// E649 L4 H1: `POST /internal/pot-announce-drain` (bearer `INTERNAL_TOKEN`): ONE drain pass of the pot hook's
+/// parked wake-ups, the function the scheduled tick runs (`pot_hook::drain_parked`), answered with its tally. For an
+/// operator, and for the D1 budget tier, which measures the pass's statements.
+pub(crate) async fn internal_pot_announce_drain(
+    req: Request,
+    env: &worker::Env,
+) -> Result<Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return Response::error("unauthorized", 401);
+    }
+    let t = drain_pot_announce(env).await?;
+    json_response(
+        serde_json::json!({ "ok": true, "due": t.due, "drained": t.drained, "skipped": t.skipped, "retryFailed": t.retry_failed, "exhausted": t.exhausted, "swept": t.swept, "faults": t.faults })
+            .to_string(),
+        200,
+    )
+}
+
+/// One drain pass over the worker's D1 and relay, under the announce's wall.
+pub(crate) async fn drain_pot_announce(env: &worker::Env) -> Result<crate::pot_hook::DrainTally> {
+    let store = crate::pot_hook::HookD1 {
+        sql: D1Sql::of(env)?,
+    };
+    let relay = crate::pot_hook::WorkerRelay { env: env.clone() };
+    let wall = worker::Delay::from(core::time::Duration::from_millis(
+        crate::pot_hook::ANNOUNCE_WALL_MS,
+    ));
+    Ok(crate::pot_hook::drain_parked(&store, &relay, wall).await)
 }
 
 /// E649 L4: the hooks' SQL port over D1 (`pot_hook::HookD1` holds the statements): one `batch` is one
@@ -2445,6 +2481,9 @@ impl crate::pot_hook::SqlPort for D1Sql {
     }
     fn now_ms(&self) -> u64 {
         worker::Date::now().as_millis()
+    }
+    fn nonce(&self) -> u64 {
+        (worker::js_sys::Math::random() * 1000.0) as u64
     }
     fn log(&self, line: &str) {
         worker::console_log!("{line}");
