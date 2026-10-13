@@ -61,7 +61,7 @@ impl DurableObject for BoardView {
         if req.path() == "/owed-deferred" {
             let identity = url.query_pairs().find(|(k, _)| k == "identity").map(|(_, v)| v.to_string()).unwrap_or_default();
             let due = url.query_pairs().find(|(k, _)| k == "due").and_then(|(_, v)| v.parse::<i64>().ok()).unwrap_or(0);
-            if !crate::logic::valid_identity(&identity) || due <= 0 { return Response::error("invalid owed alarm", 400); }
+            if !crate::logic::valid_identity(&identity) || due <= Date::now().as_millis() as i64 { return Response::error("invalid owed alarm", 400); }
             let storage = self.state.storage();
             if storage.get::<bool>("owed-started").await?.unwrap_or(false) { return Response::ok("already run"); }
             if storage.get::<String>("owed-identity").await?.is_none() {
@@ -112,17 +112,47 @@ impl DurableObject for BoardView {
         .await
     }
     async fn alarm(&self) -> Result<Response> {
+        if self.owed_alarm_not_due().await? { return Response::ok("owed retry not due"); }
         let storage = self.state.storage();
         if storage.get::<bool>("owed-started").await?.unwrap_or(false) { return Response::ok("already run"); }
         let Some(identity) = storage.get::<String>("owed-identity").await? else { return Response::ok("no owed alarm"); };
         // Claim durably BEFORE walking: an alarm retry must not buy another recompute past ceiling + one.
         storage.put("owed-started", true).await?;
-        crate::routes::owed_deferred_walk_and_push(&self.env, &identity).await?;
+        let due = storage.get::<i64>("owed-due").await?.unwrap_or(0);
+        let walked = crate::routes::owed_deferred_walk_and_push(&self.env, &identity).await;
+        storage.delete_all().await?;
+        if let Err(e) = walked {
+            crate::owed::note_recompute_deferred_faulted();
+            console_warn!("[owed] deferred walk faulted: {e}");
+            self.owed_rearm_faulted_deferred(&identity, due).await?;
+            return Response::ok("owed retry armed for next window");
+        }
         Response::ok("owed refreshed")
     }
 }
 
 impl BoardView {
+    async fn owed_alarm_not_due(&self) -> Result<bool> {
+        let storage = self.state.storage();
+        let due = storage.get::<i64>("owed-due").await?.unwrap_or(0);
+        let now = Date::now().as_millis() as i64;
+        if due > now {
+            // A duplicate delivery of the old alarm must not consume its later-window retry.
+            storage.set_alarm(due - now).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn owed_rearm_faulted_deferred(&self, identity: &str, due: i64) -> Result<()> {
+        let next = crate::owed::owed_fault_retry_due(due, Date::now().as_millis() as i64);
+        let storage = self.state.storage();
+        storage.put("owed-identity", identity).await?;
+        storage.put("owed-due", next).await?;
+        storage.set_alarm((next - Date::now().as_millis() as i64).max(0)).await?;
+        Ok(())
+    }
+
     /// S3 — per-identity `/results` with the same SWR contract as the board
     /// (fresh ≤10 s from memory; stale serves instantly while one arrival
     /// refreshes; failed refresh serves held). Keyed by `after` page.

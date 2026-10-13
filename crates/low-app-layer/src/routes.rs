@@ -4534,7 +4534,7 @@ pub(crate) async fn owed_recompute_and_push(
         owed_schedule_deferred(env, identity_lc, deferred).await;
         return;
     }
-    owed_walk_and_push(env, db, identity_lc, source, tip_hint).await;
+    let _ = owed_walk_and_push(env, db, identity_lc, source, tip_hint).await;
 }
 
 /// The alarm owns one reserved walk from the exhausted window. It does not consume the next window's admits.
@@ -4542,11 +4542,10 @@ pub(crate) async fn owed_deferred_walk_and_push(env: &worker::Env, identity_lc: 
     let db = env.d1("OVERLAY_DB")?;
     crate::owed::note_recompute_deferred();
     worker::console_log!("[owed] deferred walk for {identity_lc}");
-    owed_walk_and_push(env, &db, identity_lc, "deferred", None).await;
-    Ok(())
+    owed_walk_and_push(env, &db, identity_lc, "deferred", None).await
 }
 
-async fn owed_walk_and_push(env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>) {
+async fn owed_walk_and_push(env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>) -> worker::Result<()> {
     // bsv-low #499 (lens fold M3): the walk runs under its own ledger, keyed `owed-recompute` in `d1Budget` (it runs
     // after the answer, in `wait_until`, where no request's scope holds it; before, it landed only in `unscoped`)
     let (walked, d1) =
@@ -4574,8 +4573,10 @@ async fn owed_walk_and_push(env: &worker::Env, db: &worker::D1Database, identity
                 "[owed] recompute ({source}) for {}… failed: {e}",
                 &identity_lc[..12.min(identity_lc.len())]
             );
+            return Err(worker::Error::RustError(e));
         }
     }
+    Ok(())
 }
 
 /// bsv-low #499 (lens fold M3): the `d1Budget` key of one detached recompute (the hooks', the claims' and the stale
@@ -4789,7 +4790,7 @@ pub(crate) async fn owed_recompute_claimed(
         }
         if first_admitted {
             first_admitted = false;
-            owed_walk_and_push(env, db, identity_lc, &src, tip_hint).await;
+            let _ = owed_walk_and_push(env, db, identity_lc, &src, tip_hint).await;
         } else {
             owed_recompute_and_push(env, db, identity_lc, &src, tip_hint).await;
         }

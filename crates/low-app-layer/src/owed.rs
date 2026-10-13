@@ -3294,6 +3294,15 @@ pub fn owed_shed_plan(identity_lc: &str) -> (&'static str, String) {
 /// bsv-low #499: recomputes shed by the per-identity ceiling (the snapshot served instead).
 static RECOMPUTE_SHED: AtomicU64 = AtomicU64::new(0);
 static RECOMPUTE_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static RECOMPUTE_DEFERRED_FAULTED: AtomicU64 = AtomicU64::new(0);
+pub fn note_recompute_deferred_faulted() {
+    RECOMPUTE_DEFERRED_FAULTED.fetch_add(1, Ordering::Relaxed);
+}
+/// Retry only in a later window, even when a slow fault crossed several windows.
+pub fn owed_fault_retry_due(due: i64, now: i64) -> i64 {
+    let windows = now.saturating_sub(due).max(0) / OWED_RECOMPUTE_RATE_WINDOW_MS + 1;
+    due.saturating_add(windows.saturating_mul(OWED_RECOMPUTE_RATE_WINDOW_MS))
+}
 /// A reserved alarm walk that actually begins (not an arm, nor an idempotent alarm delivery).
 pub fn note_recompute_deferred() {
     RECOMPUTE_DEFERRED.fetch_add(1, Ordering::Relaxed);
@@ -3332,6 +3341,7 @@ pub fn owed_health_json() -> Value {
         "recomputeShed": shed,
         "owed_recompute_shed_total": shed,
         "owed_recompute_deferred_total": RECOMPUTE_DEFERRED.load(Ordering::Relaxed),
+        "owed_recompute_deferred_faulted_total": RECOMPUTE_DEFERRED_FAULTED.load(Ordering::Relaxed),
         "recomputesPerIdentityPerMinute": OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW,
         "recomputeCeilingScope": "per identity per isolate: the fleet bound is this times the live isolates",
         "collectedReadFaults": COLLECTED_READ_FAULTS.load(Ordering::Relaxed),
@@ -8887,6 +8897,21 @@ pub(crate) mod tests {
         let ask = claimed.find("owed_recompute_admit(&identity, source, true)").unwrap();
         let detached = claimed.find("wait.wait_until").unwrap();
         assert!(ask < detached, "a later ask cannot turn the read's accepted refresh into an unmarked shed after its answer");
+    }
+
+    #[test]
+    fn ns2_faulted_alarm_clears_storage_and_rearms_next_window() {
+        let code = include_str!("board_view.rs");
+        let alarm = &code[code.find("async fn alarm(&self)").unwrap()..code.find("impl BoardView {").unwrap()];
+        assert!(alarm.contains("storage.delete_all().await?"), "SHED-L1: fault must clear arm storage");
+        assert!(alarm.contains("note_recompute_deferred_faulted"), "SHED-L1: count the fault");
+        assert!(alarm.contains("owed_rearm_faulted_deferred"), "SHED-L1: rearm once for next window");
+        assert!(alarm.contains("owed_alarm_not_due().await?"), "SHED-L1: a duplicate old alarm cannot run the next reservation early");
+        assert!(alarm.find("owed-started").unwrap() < alarm.find("owed_deferred_walk_and_push").unwrap());
+        assert_eq!(owed_fault_retry_due(61_000, 61_001), 121_000);
+        assert_eq!(owed_fault_retry_due(61_000, 120_999), 121_000);
+        assert_eq!(owed_fault_retry_due(61_000, 121_000), 181_000);
+        assert!(owed_health_json()["owed_recompute_deferred_faulted_total"].is_u64());
     }
 
 }
