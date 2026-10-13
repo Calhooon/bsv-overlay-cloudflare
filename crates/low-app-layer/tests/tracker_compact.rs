@@ -521,3 +521,25 @@ fn ns3_m1_missing_row_keeps_courier_source_without_seen_or_write() {
     );
     assert_eq!(body["tracker"]["at"], 123);
 }
+
+#[test]
+fn ns3d_m1_faulting_word_lookup_keeps_legacy_body_available() {
+    let legacy = json!({"txid":"01".repeat(32), "present":true,
+        "confirmed":false, "tier":"hint", "hintSource":"woc"});
+    let outcome: Result<BTreeMap<String, serde_json::Value>, &str> = Err("tx_words unavailable");
+    let views = runtime::lookup_result(outcome).expect("word lookup must not fail the route");
+    let body = runtime::decorate_lookup(legacy.clone(), Some(&"01".repeat(32)), views.as_ref());
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), legacy);
+    assert!(!body.contains("tracker"));
+}
+
+#[test]
+fn ns3d_m1_owed_recompute_word_lookup_cannot_abort_legacy_judgement() {
+    let routes = include_str!("../src/routes.rs");
+    let owed = &routes[routes.find("async fn owed_recompute_inner(").unwrap()
+        ..routes.find("let spender_words =").unwrap()];
+    assert!(
+        !owed.contains("tracker_host::stored::read"),
+        "owed word lookup still aborts a legacy judgement"
+    );
+}
