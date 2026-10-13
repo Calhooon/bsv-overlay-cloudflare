@@ -106,10 +106,7 @@ pub fn parse_arcade_word(status: u16, body: &str, now_ms: i64) -> ArcadeWord {
             .and_then(|m| m.as_str())
             .map(str::trim)
             .filter(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_hexdigit()));
-        let height = v
-            .get("blockHeight")
-            .and_then(|h| h.as_u64())
-            .filter(|h| *h > 0);
+        let height = v.get("blockHeight").and_then(|h| h.as_u64()).filter(|h| *h > 0);
         return match (path, height) {
             (Some(p), Some(h)) => ArcadeWord::Mined {
                 bump_hex: p.to_ascii_lowercase(),
@@ -675,9 +672,7 @@ pub fn input_proves_unconfirmable(
 /// a positive integer, else `None` (absent, 0 = unconfirmed, a non-number). A claim, never a proof: the display
 /// tier's dating of a tx the index no longer holds; `height` stays the chaintracks-verified word.
 pub fn parse_woc_blockheight(v: &serde_json::Value) -> Option<u64> {
-    v.get("blockheight")
-        .and_then(|h| h.as_u64())
-        .filter(|h| *h > 0)
+    v.get("blockheight").and_then(|h| h.as_u64()).filter(|h| *h > 0)
 }
 
 /// Parse a WoC `GET /tx/hash/{txid}` 200 body into the confirmation claim:
@@ -691,9 +686,7 @@ pub fn parse_woc_blockheight(v: &serde_json::Value) -> Option<u64> {
 /// retired client's `wocTxConfirmed` parity, which had no reader that trusted
 /// `false` as a positive fact).
 pub fn parse_woc_confirmations(v: &serde_json::Value) -> Option<bool> {
-    v.get("confirmations")
-        .and_then(serde_json::Value::as_u64)
-        .map(|c| c >= 1)
+    v.get("confirmations").and_then(serde_json::Value::as_u64).map(|c| c >= 1)
 }
 
 /// bsv-low #606: the WHOLE claim of a WoC `GET /tx/hash/{txid}` 200 body, for the asked `txid_lc`: `Some(true)`
@@ -1034,192 +1027,47 @@ mod tests {
             kind: VerdictKind::Unconfirmable,
             evidence: String::new(),
         };
-        assert!(
-            verdict_memo_answers(&m(1_000), &"AB".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS),
-            "a minute old, case-insensitive"
-        );
-        assert!(verdict_memo_answers(
-            &m(VERDICT_MEMO_MAX_AGE_MS - 1),
-            &"ab".repeat(32),
-            now,
-            VERDICT_MEMO_MAX_AGE_MS
-        ));
+        assert!(verdict_memo_answers(&m(1_000), &"AB".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a minute old, case-insensitive");
+        assert!(verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS - 1), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS));
         // slice C (iv), measured: a proven input conflict is TERMINAL — it answers at any age (a lapsed memo turned
         // every dead story into a recurring null on the felt)
-        assert!(
-            verdict_memo_answers(
-                &m(VERDICT_MEMO_MAX_AGE_MS),
-                &"ab".repeat(32),
-                now,
-                VERDICT_MEMO_MAX_AGE_MS
-            ),
-            "past the window: an input conflict still answers"
-        );
-        assert!(
-            verdict_memo_answers(
-                &m(30 * 24 * 60 * 60_000),
-                &"ab".repeat(32),
-                now,
-                VERDICT_MEMO_MAX_AGE_MS
-            ),
-            "a month old: still terminal"
-        );
-        let refused = |age: i64| VerdictMemo {
-            kind: VerdictKind::Refused,
-            ..m(age)
-        };
-        assert!(
-            verdict_memo_answers(
-                &refused(2 * VERDICT_MEMO_MAX_AGE_MS),
-                &"ab".repeat(32),
-                now,
-                VERDICT_MEMO_MAX_AGE_MS
-            ),
-            "a corroborated refusal is terminal too"
-        );
-        let absent = |age: i64| VerdictMemo {
-            kind: VerdictKind::Absent,
-            ..m(age)
-        };
-        assert!(
-            verdict_memo_answers(
-                &absent(VERDICT_MEMO_MAX_AGE_MS - 1),
-                &"ab".repeat(32),
-                now,
-                VERDICT_MEMO_MAX_AGE_MS
-            ),
-            "a fresh absence answers"
-        );
-        assert!(
-            !verdict_memo_answers(
-                &absent(VERDICT_MEMO_MAX_AGE_MS),
-                &"ab".repeat(32),
-                now,
-                VERDICT_MEMO_MAX_AGE_MS
-            ),
-            "a five-minute-old absence is re-asked (an absence can end)"
-        );
-        let retired = |age: i64| VerdictMemo {
-            kind: VerdictKind::Retired,
-            ..m(age)
-        };
-        assert!(
-            verdict_memo_answers(
-                &retired(30 * 24 * 60 * 60_000),
-                &"ab".repeat(32),
-                now,
-                VERDICT_MEMO_MAX_AGE_MS
-            ),
-            "a retired row's absence is terminal while it stays retired"
-        );
-        assert!(
-            !verdict_memo_answers(&m(-5_000), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS),
-            "from the future: no"
-        );
-        assert!(
-            !verdict_memo_answers(&m(1_000), &"ff".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS),
-            "another txid: no"
-        );
+        assert!(verdict_memo_answers(&m(VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "past the window: an input conflict still answers");
+        assert!(verdict_memo_answers(&m(30 * 24 * 60 * 60_000), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a month old: still terminal");
+        let refused = |age: i64| VerdictMemo { kind: VerdictKind::Refused, ..m(age) };
+        assert!(verdict_memo_answers(&refused(2 * VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a corroborated refusal is terminal too");
+        let absent = |age: i64| VerdictMemo { kind: VerdictKind::Absent, ..m(age) };
+        assert!(verdict_memo_answers(&absent(VERDICT_MEMO_MAX_AGE_MS - 1), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a fresh absence answers");
+        assert!(!verdict_memo_answers(&absent(VERDICT_MEMO_MAX_AGE_MS), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a five-minute-old absence is re-asked (an absence can end)");
+        let retired = |age: i64| VerdictMemo { kind: VerdictKind::Retired, ..m(age) };
+        assert!(verdict_memo_answers(&retired(30 * 24 * 60 * 60_000), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "a retired row's absence is terminal while it stays retired");
+        assert!(!verdict_memo_answers(&m(-5_000), &"ab".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "from the future: no");
+        assert!(!verdict_memo_answers(&m(1_000), &"ff".repeat(32), now, VERDICT_MEMO_MAX_AGE_MS), "another txid: no");
     }
 
     /// bsv-low #451 slice C (iv): every memo kind is a corroborated `present: false`; only an input conflict sets
     /// `unconfirmable`; the index bytes ride beside the negative when held; a pre-152 row (no kind) is unconfirmable.
     #[test]
     fn a_memo_answers_present_false_and_only_a_conflict_is_unconfirmable() {
-        let base = VerdictMemo {
-            txid: "ab".repeat(32),
-            verdict_at_ms: 1,
-            input_outpoint: String::new(),
-            spender_txid: String::new(),
-            kind: VerdictKind::Absent,
-            evidence: "network-absent".into(),
-        };
+        let base = VerdictMemo { txid: "ab".repeat(32), verdict_at_ms: 1, input_outpoint: String::new(), spender_txid: String::new(), kind: VerdictKind::Absent, evidence: "network-absent".into() };
         let a = answer_from_verdict_memo(&base, Some("0100".into()));
-        assert_eq!(
-            (
-                a.present,
-                a.confirmed,
-                a.unconfirmable,
-                a.raw_hex.as_deref(),
-                a.source
-            ),
-            (Some(false), None, false, Some("0100"), Some("memo"))
-        );
-        let a = answer_from_verdict_memo(
-            &VerdictMemo {
-                kind: VerdictKind::Refused,
-                ..base.clone()
-            },
-            None,
-        );
-        assert_eq!(
-            (a.present, a.unconfirmable, a.raw_hex),
-            (Some(false), false, None)
-        );
-        let a = answer_from_verdict_memo(
-            &VerdictMemo {
-                kind: VerdictKind::Unconfirmable,
-                ..base.clone()
-            },
-            Some("0100".into()),
-        );
-        assert_eq!(
-            (a.present, a.unconfirmable),
-            (Some(false), true),
-            "an input conflict is the one unconfirmable kind"
-        );
-        assert_eq!(
-            VerdictKind::parse(None),
-            Some(VerdictKind::Unconfirmable),
-            "a pre-152 row"
-        );
-        assert_eq!(
-            VerdictKind::parse(Some("")),
-            Some(VerdictKind::Unconfirmable)
-        );
-        assert_eq!(
-            VerdictKind::parse(Some("Absent")),
-            Some(VerdictKind::Absent)
-        );
-        assert_eq!(
-            VerdictKind::parse(Some("refused")),
-            Some(VerdictKind::Refused)
-        );
-        assert_eq!(
-            VerdictKind::parse(Some("retired")),
-            Some(VerdictKind::Retired)
-        );
-        assert_eq!(
-            VerdictKind::parse(Some("nope")),
-            None,
-            "an unknown kind is no memo"
-        );
+        assert_eq!((a.present, a.confirmed, a.unconfirmable, a.raw_hex.as_deref(), a.source), (Some(false), None, false, Some("0100"), Some("memo")));
+        let a = answer_from_verdict_memo(&VerdictMemo { kind: VerdictKind::Refused, ..base.clone() }, None);
+        assert_eq!((a.present, a.unconfirmable, a.raw_hex), (Some(false), false, None));
+        let a = answer_from_verdict_memo(&VerdictMemo { kind: VerdictKind::Unconfirmable, ..base.clone() }, Some("0100".into()));
+        assert_eq!((a.present, a.unconfirmable), (Some(false), true), "an input conflict is the one unconfirmable kind");
+        assert_eq!(VerdictKind::parse(None), Some(VerdictKind::Unconfirmable), "a pre-152 row");
+        assert_eq!(VerdictKind::parse(Some("")), Some(VerdictKind::Unconfirmable));
+        assert_eq!(VerdictKind::parse(Some("Absent")), Some(VerdictKind::Absent));
+        assert_eq!(VerdictKind::parse(Some("refused")), Some(VerdictKind::Refused));
+        assert_eq!(VerdictKind::parse(Some("retired")), Some(VerdictKind::Retired));
+        assert_eq!(VerdictKind::parse(Some("nope")), None, "an unknown kind is no memo");
         // the second gate's HIGH-2: the janitor's retired row answers `present: false` at any age
-        let retired = VerdictMemo {
-            kind: VerdictKind::Retired,
-            verdict_at_ms: 1,
-            ..base.clone()
-        };
+        let retired = VerdictMemo { kind: VerdictKind::Retired, verdict_at_ms: 1, ..base.clone() };
         let a = answer_from_verdict_memo(&retired, Some("0100".into()));
-        assert_eq!(
-            (a.present, a.unconfirmable, a.source),
-            (Some(false), false, Some("memo"))
-        );
-        assert!(
-            verdict_memo_answers(
-                &retired,
-                &"ab".repeat(32),
-                1_789_683_775_142,
-                VERDICT_MEMO_MAX_AGE_MS
-            ),
-            "a month-old retired memo still answers"
-        );
+        assert_eq!((a.present, a.unconfirmable, a.source), (Some(false), false, Some("memo")));
+        assert!(verdict_memo_answers(&retired, &"ab".repeat(32), 1_789_683_775_142, VERDICT_MEMO_MAX_AGE_MS), "a month-old retired memo still answers");
         assert_eq!(verdict_memo_read_many_sql(2), "SELECT txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence FROM tx_any_verdicts WHERE txid IN (?, ?)");
-        assert_eq!(
-            verdict_memo_read_many_sql(1).replace("IN (?)", "= ?"),
-            VERDICT_MEMO_READ_SQL,
-            "the same columns as the single read"
-        );
+        assert_eq!(verdict_memo_read_many_sql(1).replace("IN (?)", "= ?"), VERDICT_MEMO_READ_SQL, "the same columns as the single read");
     }
 
     /// bsv-low #451 slice B: an unconfirmable verdict lives 10 minutes in the isolate; everything else 15 s.
@@ -1230,10 +1078,7 @@ mod tests {
         a.present = Some(false);
         a.unconfirmable = true;
         assert_eq!(tx_any_cache_ttl_ms(&a), TX_ANY_UNCONFIRMABLE_TTL_MS);
-        assert!(
-            tx_any_cache_ttl_ms(&a) > tx_any_cache_ttl_ms(&TxAnyAnswer::default()),
-            "the negative outlives the ordinary answer"
-        );
+        assert!(tx_any_cache_ttl_ms(&a) > tx_any_cache_ttl_ms(&TxAnyAnswer::default()), "the negative outlives the ordinary answer");
     }
 
     /// bsv-low #451 slice B (the gate's HIGH-1 / HIGH-2 / MEDIUM-1): an allow-list with a freshness bound; MINED is
@@ -1247,99 +1092,25 @@ mod tests {
         let fresh2 = r#"{"txStatus":"seen_multiple_nodes","timestamp":"2026-09-17T22:22:50.5Z"}"#;
         assert_eq!(parse_arcade_word(200, fresh2, now), ArcadeWord::SeenFresh);
         let stale = r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"2026-09-17T21:52:00Z"}"#;
-        assert_eq!(
-            parse_arcade_word(200, stale, now),
-            ArcadeWord::Unknown,
-            "31 minutes old: the couriers decide"
-        );
+        assert_eq!(parse_arcade_word(200, stale, now), ArcadeWord::Unknown, "31 minutes old: the couriers decide");
         let future = r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"2026-09-17T23:30:00Z"}"#;
-        assert_eq!(
-            parse_arcade_word(200, future, now),
-            ArcadeWord::Unknown,
-            "a stamp from the future is no word"
-        );
+        assert_eq!(parse_arcade_word(200, future, now), ArcadeWord::Unknown, "a stamp from the future is no word");
         let unstamped = r#"{"txStatus":"SEEN_ON_NETWORK"}"#;
-        assert_eq!(
-            parse_arcade_word(200, unstamped, now),
-            ArcadeWord::Unknown,
-            "no stamp: not fresh"
-        );
+        assert_eq!(parse_arcade_word(200, unstamped, now), ArcadeWord::Unknown, "no stamp: not fresh");
         let zero = r#"{"txStatus":"SEEN_ON_NETWORK","timestamp":"0001-01-01T00:00:00Z"}"#;
         assert_eq!(parse_arcade_word(200, zero, now), ArcadeWord::Unknown);
-        for st in [
-            "SEEN_IN_ORPHAN_MEMPOOL",
-            "MINED_IN_STALE_BLOCK",
-            "RECEIVED",
-            "STORED",
-            "ANNOUNCED_TO_NETWORK",
-            "REQUESTED_BY_NETWORK",
-            "SENT_TO_NETWORK",
-            "ACCEPTED_BY_NETWORK",
-            "QUEUED",
-            "UNKNOWN",
-            "REJECTED",
-            "DOUBLE_SPEND_ATTEMPTED",
-            "",
-        ] {
+        for st in ["SEEN_IN_ORPHAN_MEMPOOL", "MINED_IN_STALE_BLOCK", "RECEIVED", "STORED", "ANNOUNCED_TO_NETWORK", "REQUESTED_BY_NETWORK", "SENT_TO_NETWORK", "ACCEPTED_BY_NETWORK", "QUEUED", "UNKNOWN", "REJECTED", "DOUBLE_SPEND_ATTEMPTED", ""] {
             let body = format!(r#"{{"txStatus":"{st}","timestamp":"2026-09-17T22:22:00Z"}}"#);
-            assert_eq!(
-                parse_arcade_word(200, &body, now),
-                ArcadeWord::Unknown,
-                "not on the allow-list: the couriers decide — judged {body}"
-            );
+            assert_eq!(parse_arcade_word(200, &body, now), ArcadeWord::Unknown, "not on the allow-list: the couriers decide — judged {body}");
         }
         let mined = r#"{"txStatus":"MINED","blockHeight":965000,"merklePath":"FE0A0B0C","timestamp":"2026-01-01T00:00:00Z"}"#;
-        assert_eq!(
-            parse_arcade_word(200, mined, now),
-            ArcadeWord::Mined {
-                bump_hex: "fe0a0b0c".into(),
-                height: 965000
-            },
-            "a MINED word is a claim, age-free, carried for verification"
-        );
-        assert_eq!(
-            parse_arcade_word(
-                200,
-                r#"{"txStatus":"IMMUTABLE","blockHeight":1,"merklePath":"aa"}"#,
-                now
-            ),
-            ArcadeWord::Mined {
-                bump_hex: "aa".into(),
-                height: 1
-            }
-        );
-        assert_eq!(
-            parse_arcade_word(200, r#"{"txStatus":"MINED","blockHeight":965000}"#, now),
-            ArcadeWord::Unknown,
-            "MINED without a path: nothing to verify"
-        );
-        assert_eq!(
-            parse_arcade_word(200, r#"{"txStatus":"MINED","merklePath":"aa"}"#, now),
-            ArcadeWord::Unknown,
-            "MINED without a height: nothing to verify against"
-        );
-        assert_eq!(
-            parse_arcade_word(
-                200,
-                r#"{"txStatus":"MINED","blockHeight":0,"merklePath":"aa"}"#,
-                now
-            ),
-            ArcadeWord::Unknown
-        );
-        assert_eq!(
-            parse_arcade_word(
-                200,
-                r#"{"txStatus":"MINED","blockHeight":5,"merklePath":"zz"}"#,
-                now
-            ),
-            ArcadeWord::Unknown,
-            "a non-hex path is no bump"
-        );
-        assert_eq!(
-            parse_arcade_word(404, fresh, now),
-            ArcadeWord::Unknown,
-            "a 404 body is not a look"
-        );
+        assert_eq!(parse_arcade_word(200, mined, now), ArcadeWord::Mined { bump_hex: "fe0a0b0c".into(), height: 965000 }, "a MINED word is a claim, age-free, carried for verification");
+        assert_eq!(parse_arcade_word(200, r#"{"txStatus":"IMMUTABLE","blockHeight":1,"merklePath":"aa"}"#, now), ArcadeWord::Mined { bump_hex: "aa".into(), height: 1 });
+        assert_eq!(parse_arcade_word(200, r#"{"txStatus":"MINED","blockHeight":965000}"#, now), ArcadeWord::Unknown, "MINED without a path: nothing to verify");
+        assert_eq!(parse_arcade_word(200, r#"{"txStatus":"MINED","merklePath":"aa"}"#, now), ArcadeWord::Unknown, "MINED without a height: nothing to verify against");
+        assert_eq!(parse_arcade_word(200, r#"{"txStatus":"MINED","blockHeight":0,"merklePath":"aa"}"#, now), ArcadeWord::Unknown);
+        assert_eq!(parse_arcade_word(200, r#"{"txStatus":"MINED","blockHeight":5,"merklePath":"zz"}"#, now), ArcadeWord::Unknown, "a non-hex path is no bump");
+        assert_eq!(parse_arcade_word(404, fresh, now), ArcadeWord::Unknown, "a 404 body is not a look");
         assert_eq!(parse_arcade_word(200, "not json", now), ArcadeWord::Unknown);
         assert_eq!(parse_arcade_word(503, "", now), ArcadeWord::Unknown);
     }
@@ -1347,60 +1118,20 @@ mod tests {
     /// bsv-low #451 slice B: Arcade's status stamp read as an instant (the freshness bound rests on it).
     #[test]
     fn rfc3339_utc_ms_reads_arcade_stamps() {
-        assert_eq!(
-            rfc3339_utc_ms("2026-09-17T22:22:55.142485Z"),
-            Some(1_789_683_775_142)
-        );
-        assert_eq!(
-            rfc3339_utc_ms("2026-09-17T22:22:55Z"),
-            Some(1_789_683_775_000)
-        );
-        assert_eq!(
-            rfc3339_utc_ms("2026-01-01T00:00:00Z"),
-            Some(1_767_225_600_000)
-        );
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55.142485Z"), Some(1_789_683_775_142));
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55Z"), Some(1_789_683_775_000));
+        assert_eq!(rfc3339_utc_ms("2026-01-01T00:00:00Z"), Some(1_767_225_600_000));
         assert_eq!(rfc3339_utc_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(
-            rfc3339_utc_ms("2026-09-17T22:22:55+00:00"),
-            Some(1_789_683_775_000)
-        );
-        assert_eq!(
-            rfc3339_utc_ms("0001-01-01T00:00:00Z").map(|v| v < 0),
-            Some(true),
-            "Arcade's zero stamp is far in the past, never fresh"
-        );
-        for bad in [
-            "",
-            "2026-09-17",
-            "2026-09-17T22:22:55",
-            "2026-13-01T00:00:00Z",
-            "2026-09-17T25:00:00Z",
-            "not a time",
-            "2026-09-17T22:22:55.abcZ",
-            "2026-09-31T00:00:00Z",
-            "2026-02-29T00:00:00Z",
-            "2026-04-31T00:00:00Z",
-            "2026-09-00T00:00:00Z",
-            "2026-09-17T-1:00:00Z",
-            "2026-09-17T22:+5:00Z",
-            "2026-09-17T22:22:-0Z",
-        ] {
+        assert_eq!(rfc3339_utc_ms("2026-09-17T22:22:55+00:00"), Some(1_789_683_775_000));
+        assert_eq!(rfc3339_utc_ms("0001-01-01T00:00:00Z").map(|v| v < 0), Some(true), "Arcade's zero stamp is far in the past, never fresh");
+        for bad in ["", "2026-09-17", "2026-09-17T22:22:55", "2026-13-01T00:00:00Z", "2026-09-17T25:00:00Z", "not a time", "2026-09-17T22:22:55.abcZ",
+                    "2026-09-31T00:00:00Z", "2026-02-29T00:00:00Z", "2026-04-31T00:00:00Z", "2026-09-00T00:00:00Z", "2026-09-17T-1:00:00Z", "2026-09-17T22:+5:00Z", "2026-09-17T22:22:-0Z"] {
             assert_eq!(rfc3339_utc_ms(bad), None, "judged {bad:?}");
         }
         // the delta-verify's LOW-C: the day is bound by its month, leap years included
-        assert_eq!(
-            rfc3339_utc_ms("2024-02-29T00:00:00Z"),
-            Some(1_709_164_800_000)
-        );
-        assert!(
-            rfc3339_utc_ms("2000-02-29T00:00:00Z").is_some(),
-            "400-year leap"
-        );
-        assert_eq!(
-            rfc3339_utc_ms("1900-02-29T00:00:00Z"),
-            None,
-            "100-year non-leap"
-        );
+        assert_eq!(rfc3339_utc_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
+        assert!(rfc3339_utc_ms("2000-02-29T00:00:00Z").is_some(), "400-year leap");
+        assert_eq!(rfc3339_utc_ms("1900-02-29T00:00:00Z"), None, "100-year non-leap");
         assert_eq!(days_in_month(2026, 2), 28);
         assert_eq!(days_in_month(2028, 2), 29);
         assert_eq!(days_in_month(2026, 13), 0);
@@ -1412,34 +1143,12 @@ mod tests {
     fn arcade_witness_beside_index_bytes_decides_like_woc() {
         let raw = "0100".to_string();
         // the route builds the observation from the word: SeenFresh → unconfirmed presence; a VERIFIED Mined → confirmed
-        let seen = TxObservation::Present {
-            confirmed: false,
-            raw_hex: None,
-        };
-        let a = decide_tx_any(
-            Some(raw.clone()),
-            None,
-            Some(&seen),
-            AbsenceCorroboration::Unknown,
-        );
-        assert_eq!(
-            (a.present, a.confirmed, a.raw_hex.as_deref(), a.source),
-            (
-                Some(true),
-                Some(false),
-                Some("0100"),
-                Some("index+external")
-            )
-        );
-        let mined = TxObservation::Present {
-            confirmed: true,
-            raw_hex: None,
-        };
+        let seen = TxObservation::Present { confirmed: false, raw_hex: None };
+        let a = decide_tx_any(Some(raw.clone()), None, Some(&seen), AbsenceCorroboration::Unknown);
+        assert_eq!((a.present, a.confirmed, a.raw_hex.as_deref(), a.source), (Some(true), Some(false), Some("0100"), Some("index+external")));
+        let mined = TxObservation::Present { confirmed: true, raw_hex: None };
         let a = decide_tx_any(Some(raw), None, Some(&mined), AbsenceCorroboration::Unknown);
-        assert_eq!(
-            (a.present, a.confirmed, a.source),
-            (Some(true), Some(true), Some("index+external"))
-        );
+        assert_eq!((a.present, a.confirmed, a.source), (Some(true), Some(true), Some("index+external")));
     }
 
     fn raw() -> String {
@@ -1621,24 +1330,12 @@ mod tests {
 
     #[test]
     fn woc_confirmations_parse() {
-        assert_eq!(
-            parse_woc_confirmations(&json!({"confirmations": 3})),
-            Some(true)
-        );
-        assert_eq!(
-            parse_woc_confirmations(&json!({"confirmations": 0})),
-            Some(false)
-        );
+        assert_eq!(parse_woc_confirmations(&json!({"confirmations": 3})), Some(true));
+        assert_eq!(parse_woc_confirmations(&json!({"confirmations": 0})), Some(false));
         // bsv-low #527 LOW-3: a body without the field is NOT "unconfirmed" — it is no claim at all (the leg faults)
         assert_eq!(parse_woc_confirmations(&json!({})), None);
-        assert_eq!(
-            parse_woc_confirmations(&json!({"confirmations": "3"})),
-            None
-        );
-        assert_eq!(
-            parse_woc_confirmations(&json!({"confirmations": null})),
-            None
-        );
+        assert_eq!(parse_woc_confirmations(&json!({"confirmations": "3"})), None);
+        assert_eq!(parse_woc_confirmations(&json!({"confirmations": null})), None);
     }
 
     /// bsv-low #606: WoC's MEMPOOL body (the keys measured live 2026-10-12: no `confirmations`) is an unconfirmed
@@ -1718,32 +1415,14 @@ mod tests {
         assert_eq!(v["present"], true);
         assert_eq!(v["confirmed"], true);
         assert_eq!(v["height"], 1);
-        assert!(
-            v["claimedHeight"].is_null(),
-            "no courier claim on an index answer"
-        );
+        assert!(v["claimedHeight"].is_null(), "no courier claim on an index answer");
         let mut c = a.clone();
         c.claimed_height = Some(967_123);
         assert_eq!(tx_any_value("ab", &c)["claimedHeight"], 967_123);
-        assert_eq!(
-            parse_woc_blockheight(&serde_json::json!({"blockheight": 967123})),
-            Some(967_123)
-        );
-        assert_eq!(
-            parse_woc_blockheight(&serde_json::json!({"blockheight": 0})),
-            None,
-            "0 = unconfirmed"
-        );
-        assert_eq!(
-            parse_woc_blockheight(&serde_json::json!({"blockheight": "967123"})),
-            None,
-            "a non-number is no claim"
-        );
-        assert_eq!(
-            parse_woc_blockheight(&serde_json::json!({"confirmations": 3})),
-            None,
-            "absent"
-        );
+        assert_eq!(parse_woc_blockheight(&serde_json::json!({"blockheight": 967123})), Some(967_123));
+        assert_eq!(parse_woc_blockheight(&serde_json::json!({"blockheight": 0})), None, "0 = unconfirmed");
+        assert_eq!(parse_woc_blockheight(&serde_json::json!({"blockheight": "967123"})), None, "a non-number is no claim");
+        assert_eq!(parse_woc_blockheight(&serde_json::json!({"confirmations": 3})), None, "absent");
         assert_eq!(v["rawHex"], "aa");
         assert_eq!(v["source"], "index");
         assert_eq!(v["unconfirmable"], false);

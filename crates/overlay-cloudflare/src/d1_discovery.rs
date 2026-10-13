@@ -7852,55 +7852,29 @@ mod tests {
                 .unwrap()
                 .count()
         };
-        exec_store(
-            &conn,
-            "potP",
-            0,
-            1_000,
-            Some("covenant"),
-            None,
-            Some(500),
-            Some(1_000),
-            1,
-        );
+        exec_store(&conn, "potP", 0, 1_000, Some("covenant"), None, Some(500), Some(1_000), 1);
         assert_eq!(candidates(10), 0, "an UNSPENT row is not a candidate");
         exec_mark_spent(&conn, "potP", 0, "settleP", false, Some("winner-a"), None);
-        assert_eq!(
-            candidates(10),
-            0,
-            "spent with NO decoded home is not a candidate (a hop row, a bare pot)"
-        );
+        assert_eq!(candidates(10), 0, "spent with NO decoded home is not a candidate (a hop row, a bare pot)");
         conn.execute(
             "UPDATE pot_records SET payPkhA = ?1 WHERE txid = 'potP'",
             rusqlite::params!["11".repeat(20)],
         )
         .unwrap();
-        assert_eq!(
-            candidates(10),
-            1,
-            "spent + a decoded home + no payouts = a candidate"
-        );
+        assert_eq!(candidates(10), 1, "spent + a decoded home + no payouts = a candidate");
         // The CAS: a stale pointer writes nothing; the live one measures; stored-wins.
         conn.execute(
             spender_payouts_cas_sql(),
             rusqlite::params![Some(900_i64), Some(0_i64), "potP", 0_i64, "settleOLD"],
         )
         .unwrap();
-        assert_eq!(
-            candidates(10),
-            1,
-            "a write naming a spender that is not the live pointer is a no-op"
-        );
+        assert_eq!(candidates(10), 1, "a write naming a spender that is not the live pointer is a no-op");
         conn.execute(
             spender_payouts_cas_sql(),
             rusqlite::params![Some(900_i64), Some(0_i64), "potP", 0_i64, "settleP"],
         )
         .unwrap();
-        assert_eq!(
-            candidates(10),
-            0,
-            "a measured row (a Some(0) side included) leaves the set"
-        );
+        assert_eq!(candidates(10), 0, "a measured row (a Some(0) side included) leaves the set");
         conn.execute(
             spender_payouts_cas_sql(),
             rusqlite::params![Some(1_i64), Some(1_i64), "potP", 0_i64, "settleP"],
@@ -7913,11 +7887,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(
-            (a, b),
-            (900, 0),
-            "stored-wins: a second measure never rewrites"
-        );
+        assert_eq!((a, b), (900, 0), "stored-wins: a second measure never rewrites");
     }
 
     #[test]

@@ -523,12 +523,7 @@ pub async fn run_arcade_reorg_pass(
     .await;
     // bsv-low #484: an orphan event applied (or any row this pass re-judged) is a reorg: the app layer's
     // CONFIRMED probe memos are cleared so the next owed walk re-probes (`hop_probe_memos`)
-    crate::hop_probe_memos::clear_on_reorg(
-        db,
-        origin,
-        crate::hop_probe_memos::arcade_pass_rejudged(&s),
-    )
-    .await;
+    crate::hop_probe_memos::clear_on_reorg(db, origin, crate::hop_probe_memos::arcade_pass_rejudged(&s)).await;
     console_log!(
         "[arcade-reorg] ({origin}) feed_read={} rows={} malformed={} events_after_cursor={} applied={} skipped_uncorroborated={} unresolved={} released={} held={} lagging={} \
          spenders scanned={} standing={} reanchored={} demoted={} faults={} budget_stops={}; pot_beefs scanned={} stale={}; transactions scanned={} stale={}; \

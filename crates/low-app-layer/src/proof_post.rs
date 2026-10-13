@@ -358,7 +358,8 @@ mod tests {
     use bsv_rs::primitives::ec::PrivateKey;
     use bsv_rs::wallet::{Counterparty, CreateSignatureArgs, ProtoWallet};
 
-    const REAL: &[u8] = include_bytes!("../../low-proof-replay/src/fixtures/bundle-a1081773.bin");
+    const REAL: &[u8] =
+        include_bytes!("../../low-proof-replay/src/fixtures/bundle-a1081773.bin");
     const REAL_GAME: &str = "a1081773673e8c7cb6093db8f4a59166495f15e9ded1fe354ee27bbda7922523";
 
     fn wallet_of(seed: u8) -> ProtoWallet {

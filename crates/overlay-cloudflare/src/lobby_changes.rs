@@ -77,15 +77,14 @@ pub const LOBBY_CHANGED_NOTED_BACK_UNRESENT: &str = "lobby_changed_noted_back_un
 /// its `COUNTER_LOBBY_CHANGED_DROPPED` from its tests).
 pub const COUNTER_LOBBY_CHANGED_DROPPED: &str = "lobby_changed_dropped_total";
 
-pub(crate) const COUNTERS: crate::change_flush::FlushCounters =
-    crate::change_flush::FlushCounters {
-        undelivered: COUNTER_LOBBY_CHANGED_UNDELIVERED,
-        deferred: COUNTER_LOBBY_CHANGED_DEFERRED,
-        retried: COUNTER_LOBBY_CHANGED_RETRIED,
-        retry_failed: COUNTER_LOBBY_CHANGED_RETRY_FAILED,
-        resent: COUNTER_LOBBY_CHANGED_RESENT,
-        noted_back_unresent: LOBBY_CHANGED_NOTED_BACK_UNRESENT,
-    };
+pub(crate) const COUNTERS: crate::change_flush::FlushCounters = crate::change_flush::FlushCounters {
+    undelivered: COUNTER_LOBBY_CHANGED_UNDELIVERED,
+    deferred: COUNTER_LOBBY_CHANGED_DEFERRED,
+    retried: COUNTER_LOBBY_CHANGED_RETRIED,
+    retry_failed: COUNTER_LOBBY_CHANGED_RETRY_FAILED,
+    resent: COUNTER_LOBBY_CHANGED_RESENT,
+    noted_back_unresent: LOBBY_CHANGED_NOTED_BACK_UNRESENT,
+};
 
 thread_local! {
     /// The changes noted back once after a failed POST (the retry is bounded at one), and those deferred past a
@@ -96,12 +95,7 @@ thread_local! {
 /// THE FLUSH of the lobby set, transport injected (`ship` runs exactly this, and so do the pins, through a fake
 /// `post`): the changes in POSTs of at most [`LOBBY_CHANGED_CHUNK`], each body built by [`body_json`], under
 /// the bounds of [`crate::change_flush::ship_chunks`].
-pub async fn ship_with<P, Fut, C>(
-    changes: Vec<Change>,
-    post: P,
-    now_ms: C,
-    deadline_ms: u64,
-) -> crate::change_flush::Shipped<Change>
+pub async fn ship_with<P, Fut, C>(changes: Vec<Change>, post: P, now_ms: C, deadline_ms: u64) -> crate::change_flush::Shipped<Change>
 where
     P: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<usize, ()>>,
@@ -113,8 +107,7 @@ where
 /// What a flush owes after its POSTs ([`crate::change_flush::settle`] over this set's memory): the deferred part
 /// and a failed POST's entries (once) are noted back for the next flush. Returns the flush's account.
 pub fn settle(shipped: &crate::change_flush::Shipped<Change>) -> crate::change_flush::Tally {
-    let (back, tally) =
-        NOTED_BACK.with(|m| crate::change_flush::settle(&mut m.borrow_mut(), shipped));
+    let (back, tally) = NOTED_BACK.with(|m| crate::change_flush::settle(&mut m.borrow_mut(), shipped));
     for (txid, vout, kind) in &back {
         note(txid, *vout, kind);
     }
@@ -137,26 +130,13 @@ pub async fn ship(env: Env, changes: Vec<Change>) {
     let deadline_ms = Date::now().as_millis() + crate::change_flush::FLUSH_WALL_BUDGET_MS;
     let shipped = ship_with(
         changes,
-        |body| {
-            crate::change_flush::post_body(
-                &env,
-                &url,
-                &token,
-                "/internal/lobby-changed",
-                "lobby-changes",
-                body,
-            )
-        },
+        |body| crate::change_flush::post_body(&env, &url, &token, "/internal/lobby-changed", "lobby-changes", body),
         || Date::now().as_millis(),
         deadline_ms,
     )
     .await;
     if !shipped.delivered.is_empty() {
-        console_log!(
-            "[lobby-changes] notified {} change(s) in {} POST(s)",
-            shipped.delivered.len(),
-            shipped.posts
-        );
+        console_log!("[lobby-changes] notified {} change(s) in {} POST(s)", shipped.delivered.len(), shipped.posts);
     }
     let tally = settle(&shipped);
     crate::change_flush::account(&env, "lobby-changes", &COUNTERS, total, tally).await;
@@ -209,28 +189,14 @@ mod tests {
     #[test]
     fn a_lobby_flush_is_chunked_at_the_bound_and_a_failed_chunk_is_noted_back_once() {
         drain();
-        let changes: Vec<Change> = (0..19u32)
-            .map(|i| {
-                (
-                    format!("{i:064x}"),
-                    i % 3,
-                    if i % 2 == 0 { "admitted" } else { "evicted" },
-                )
-            })
-            .collect();
+        let changes: Vec<Change> = (0..19u32).map(|i| (format!("{i:064x}"), i % 3, if i % 2 == 0 { "admitted" } else { "evicted" })).collect();
         let bodies: RefCell<Vec<String>> = RefCell::new(Vec::new());
         let shipped = crate::change_flush::run(ship_with(
             changes.clone(),
             |b: String| {
                 bodies.borrow_mut().push(b);
                 let n = bodies.borrow().len();
-                async move {
-                    if n == 3 {
-                        Err(())
-                    } else {
-                        Ok(0)
-                    }
-                }
+                async move { if n == 3 { Err(()) } else { Ok(0) } }
             },
             || 0,
             1,
@@ -241,47 +207,14 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(b).unwrap();
             let arr = v["changes"].as_array().unwrap();
             assert!(!arr.is_empty() && arr.len() <= LOBBY_CHANGED_CHUNK);
-            seen.extend(arr.iter().map(|o| {
-                (
-                    o["txid"].as_str().unwrap().to_string(),
-                    o["vout"].as_u64().unwrap() as u32,
-                    o["kind"].as_str().unwrap().to_string(),
-                )
-            }));
+            seen.extend(arr.iter().map(|o| (o["txid"].as_str().unwrap().to_string(), o["vout"].as_u64().unwrap() as u32, o["kind"].as_str().unwrap().to_string())));
         }
-        let want: Vec<(String, u32, String)> = changes
-            .iter()
-            .map(|(t, v, k)| (t.clone(), *v, k.to_string()))
-            .collect();
+        let want: Vec<(String, u32, String)> = changes.iter().map(|(t, v, k)| (t.clone(), *v, k.to_string())).collect();
         assert_eq!(seen, want, "every change in exactly one body");
-        assert_eq!(
-            settle(&shipped),
-            crate::change_flush::Tally {
-                retried: 3,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            drain(),
-            changes[16..].to_vec(),
-            "the failed chunk rides the next flush"
-        );
-        let again = crate::change_flush::run(ship_with(
-            changes[16..].to_vec(),
-            |_b: String| async { Err(()) },
-            || 0,
-            1,
-        ));
-        assert_eq!(
-            settle(&again),
-            crate::change_flush::Tally {
-                undelivered: 3,
-                retry_failed: 3,
-                resent: 3,
-                ..Default::default()
-            },
-            "a second failure is counted and let go"
-        );
+        assert_eq!(settle(&shipped), crate::change_flush::Tally { retried: 3, ..Default::default() });
+        assert_eq!(drain(), changes[16..].to_vec(), "the failed chunk rides the next flush");
+        let again = crate::change_flush::run(ship_with(changes[16..].to_vec(), |_b: String| async { Err(()) }, || 0, 1));
+        assert_eq!(settle(&again), crate::change_flush::Tally { undelivered: 3, retry_failed: 3, resent: 3, ..Default::default() }, "a second failure is counted and let go");
         assert!(drain().is_empty());
     }
 }
