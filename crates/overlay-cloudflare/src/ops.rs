@@ -361,7 +361,10 @@ pub const COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED: &str = "queue_replay_skipped_evi
 pub const COUNTER_ADMIT_FAST_EVICT_YIELDED: &str = "admit_fast_evict_yielded_total";
 /// bsv-low #649: a background flush of an admit-fast job (the pending watch, the `/arc-ingest` refusal and
 /// witness jobs) SKIPPED because less than `pot_changes::FLUSH_WINDOW_FLOOR_MS` of the invocation's `waitUntil`
-/// window was left. The notes stay in the isolate's sets for its next flush (never drained and dropped).
+/// window was left, counted per job. Its pot and hop notes are PARKED in D1 for the cron (`change_park.rs`): a
+/// successful park takes them out of the isolate's sets (`change_parked_total`); a failed park
+/// (`change_park_faults_total`) or a full table (`change_park_full_total`) leaves them in the sets for the
+/// isolate's next flush. The tracker frames it withheld stay in the isolate's memory.
 pub const COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW: &str =
     "admit_fast_flush_skipped_no_window_total";
 /// loop 18, round 2 (NEW-2): a readmission whose restore faulted on a table — the row left OPEN (never a

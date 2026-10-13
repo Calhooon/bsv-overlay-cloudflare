@@ -6,24 +6,29 @@
 //! the felt waited on an unrelated wake-up. The skip counter counted jobs, not the withheld entries, and none of
 //! them entered the note-back accounting.
 //!
-//! Now the skip DRAINS the pot and hop sets and PARKS what it withheld in D1 (`change_parked`, one row per entry,
-//! keyed by its set and the entry, so a re-park is one row). The scheduled tick (every isolate's cron, `*/15`)
-//! delivers the parked rows through the same flush loop (`ship_chunks`, chunked at the app layer's bound) and
-//! deletes ONLY the rows of POSTs the app layer accepted; a failed or deferred row stays parked for the next tick.
-//! So a withheld entry is at rest until a POST of it is accepted: at least once, no isolate needed.
+//! Now the skip COPIES the pot and hop sets and PARKS the copy in D1 (`change_parked`, one row per entry, keyed by
+//! its set and the entry, so a re-park is one row with its generation bumped) as its FIRST durable write; only
+//! the entries the park landed are then taken out of the isolate's sets (the delta lens's M1: a cancellation at
+//! any await leaves every note in D1, in memory or both). A park that faults, or an entry refused at the table's
+//! ceiling, stays in the sets. The scheduled tick (every isolate's cron, `*/15`) delivers the ELIGIBLE rows
+//! through the same flush loop (`ship_chunks`, chunked at the app layer's bound) and deletes ONLY the rows of POSTs
+//! the app layer accepted, at the generation it read (N1); a refused row backs off and leaves the drain after
+//! [`CHANGE_PARK_MAX_ATTEMPTS`], then is swept (N2); a deferred row stays parked for the next tick. So a withheld
+//! entry is at rest until a POST of it is accepted or its attempts are spent: no isolate needed.
 //!
 //! Why not the existing note-back accounting (`*_deferred_total`, `*_resent_total`, `*_noted_back_unresent`,
 //! `change_flush::NotedBack`): it is per-isolate memory by design (`change_flush.rs`, "THE NOTE-BACK IS NOT
 //! DURABLE"), and its `resent` is counted only by the isolate that noted the entry back, so a parked entry
 //! delivered by another isolate's cron would read as lost there for good. The parked set has its own counters, in
 //! entries: `admit_fast_flush_withheld_total` (every entry a skip withheld), `change_parked_total` (parked in D1),
-//! `change_park_faults_total` (a park write that faulted: those entries are noted back into the isolate's sets,
-//! the old behaviour, logged), `change_unparked_total` (delivered from the table and deleted). The gauge is the
-//! table itself (`parked` on `/health/invariants.changeParked`, by set), a durable count read from D1, never an
+//! `change_park_faults_total` (a park write that faulted: those entries were never taken out of the isolate's
+//! sets, logged), `change_park_full_total` (refused at the table's ceiling, kept in the sets), `change_unparked_total` (delivered from the table and deleted), `change_park_refused_total`,
+//! `change_park_exhausted_total` and `change_park_swept_total`. The gauge is the table itself (on
+//! `/health/invariants.changeParked`, by set, active and exhausted, each count capped), read from D1, never an
 //! isolate's.
 //!
-//! Stated: the tracker events (`tracker_events`, telemetry frames, no money view) withheld by a skip stay in the
-//! isolate's memory as before. The lobby set has its own flush and is not drained by this one. The cron's
+//! Stated: the tracker frames (`tracker_events`, telemetry, no money view) withheld by a skip are NOT parked: they
+//! stay in the isolate's memory as before. The lobby set has its own flush and is not drained by this one. The cron's
 //! delivery runs before the GASP step under its own wall ([`DRAIN_WALL_MS`]) and at most [`DRAIN_MAX_ROWS`] rows
 //! a set a tick; a POST in flight is not raced (as every flush: `change_flush.rs`). A delete that faults after an
 //! accepted POST leaves the row, which is delivered again (over-notification is harmless: the app layer re-reads).
@@ -1579,6 +1584,59 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM change_parked", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// bsv-low #649 N4 (the delta lens's documentation drift): the Skip variant and the skip counter say what a skip
+    /// does now: a successful park takes the notes out of memory, a failed park keeps them, the tracker frames stay.
+    /// On `1516ed5` the variant said "nothing drained" and the counter "The notes stay in the isolate's sets".
+    #[test]
+    fn e649_n4_the_skip_docs_name_the_park_the_failed_park_and_the_tracker_frames() {
+        let doc_before = |src: &str, item: &str| -> String {
+            let at = src.find(item).expect(item);
+            let lines: Vec<&str> = src[..at]
+                .lines()
+                .rev()
+                .skip_while(|l| l.trim().is_empty())
+                .take_while(|l| l.trim_start().starts_with("///"))
+                .collect();
+            lines
+                .into_iter()
+                .rev()
+                .map(|l| l.trim_start().trim_start_matches("///").trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let skip = doc_before(
+            include_str!("pot_changes.rs"),
+            "    Skip { remaining_ms: u64 },",
+        );
+        let counter = doc_before(
+            include_str!("ops.rs"),
+            "pub const COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW",
+        );
+        for (name, doc) in [("the Skip variant", &skip), ("the skip counter", &counter)] {
+            assert!(
+                !doc.contains("nothing drained"),
+                "{name} still says nothing is drained: {doc}"
+            );
+            assert!(
+                !doc.contains("The notes stay in the isolate's sets"),
+                "{name} still says the notes stay: {doc}"
+            );
+            assert!(doc.contains("PARKED in D1"), "{name} names the park: {doc}");
+            assert!(
+                doc.contains("successful park takes them out of the isolate's sets"),
+                "{name}: a successful park: {doc}"
+            );
+            assert!(
+                doc.contains("leaves them in the sets"),
+                "{name}: a failed park: {doc}"
+            );
+            assert!(
+                doc.contains("tracker frames"),
+                "{name}: the tracker frames: {doc}"
+            );
+        }
     }
 
     /// bsv-low #649 M1 (structural): the skip parks through the shipped function, the tick delivers, the counters
