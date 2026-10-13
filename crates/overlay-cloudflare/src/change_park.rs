@@ -400,12 +400,11 @@ pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
                     unreadable.len()
                 ));
             }
-            let (fresh, retry): (Vec<(String, u32)>, Vec<(String, u32)>) =
-                pots.into_iter().partition(|(t, v)| {
-                    by_item
-                        .get(pot_item(t, *v).as_str())
-                        .is_some_and(|r| r.attempts == 0)
-                });
+            let (fresh, retry): (Vec<_>, Vec<_>) = pots.into_iter().partition(|(t, v)| {
+                by_item
+                    .get(pot_item(t, *v).as_str())
+                    .is_some_and(|r| r.attempts == 0)
+            });
             let (delivered, failed) = ship_isolating(
                 fresh,
                 retry,
