@@ -117,17 +117,82 @@
       "censusKey": "/record"
     },
     "pot-changed-hook-1": {
-      "route": "/internal/pot-changed: B's pot, one outpoint, no decoded params, its two marker-named seats marked stale (E649 L4: the attribution batch, the stale-mark batch; no walk, no relay call on the answer path)",
+      "route": "/internal/pot-changed: B's pot, one outpoint, no decoded params, its two marker-named seats marked stale (E649 L4: the required read, the marker arms one batch each, ONE write batch of the stale marks and the outpoint's parked wake-up (H1); no walk, no relay call on the answer path)",
       "measured": {
         "reads": 7,
-        "writes": 0,
-        "stmts": 6
+        "writes": 3,
+        "stmts": 7,
+        "maxReads": 6
       },
       "ceiling": {
         "reads": 11,
-        "writes": 2,
-        "stmts": 8,
+        "writes": 5,
+        "stmts": 9,
         "maxReads": 11
+      },
+      "censusKey": null
+    },
+    "pot-changed-hook-decoded-8": {
+      "route": "/internal/pot-changed: A's eight decoded pots, one latched seat each (E649 L4 M1, the decoded maximum body: one required batch of 8, the seat markers' batch, ONE write batch of 16 parked wake-ups; no marker arm is read)",
+      "measured": {
+        "reads": 74,
+        "writes": 48,
+        "stmts": 25,
+        "maxReads": 66
+      },
+      "ceiling": {
+        "reads": 111,
+        "writes": 50,
+        "stmts": 27,
+        "maxReads": 99
+      },
+      "censusKey": null
+    },
+    "pot-changed-hook-marker": {
+      "route": "/internal/pot-changed: the fixture's undecoded pot whose party and refund-backup markers name five identities with owed-state rows (E649 L4 M1, the marker fallback: the required read, three arm batches, ONE write batch of five stale marks and one park)",
+      "measured": {
+        "reads": 23,
+        "writes": 8,
+        "stmts": 10,
+        "maxReads": 12
+      },
+      "ceiling": {
+        "reads": 35,
+        "writes": 10,
+        "stmts": 12,
+        "maxReads": 18
+      },
+      "censusKey": null
+    },
+    "pot-changed-hook-8x19": {
+      "route": "/internal/pot-changed: seven decoded pots with two latched seats each and the marker pot naming five, 19 identities each with an owed-state row (E649 L4 M1, the review's H2 body: required batch of 8, seat markers, three arm batches over the one marker outpoint, ONE write batch of 5 stale marks and 22 parks)",
+      "measured": {
+        "reads": 122,
+        "writes": 71,
+        "stmts": 39,
+        "maxReads": 92
+      },
+      "ceiling": {
+        "reads": 183,
+        "writes": 73,
+        "stmts": 41,
+        "maxReads": 138
+      },
+      "censusKey": null
+    },
+    "pot-announce-drain": {
+      "route": "/internal/pot-announce-drain: one drain pass over the fixture's 24 due and 6 exhausted parked wake-ups (E649 L4 H1: the due read, LIMIT 24, then ONE write batch of 24 settles and the sweep, LIMIT 50)",
+      "measured": {
+        "reads": 73,
+        "writes": 33,
+        "stmts": 28,
+        "maxReads": 24
+      },
+      "ceiling": {
+        "reads": 110,
+        "writes": 35,
+        "stmts": 30,
+        "maxReads": 36
       },
       "censusKey": null
     }
