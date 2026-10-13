@@ -2040,10 +2040,10 @@ mod tests {
         }
         assert!(h.contains("Response::from_json(&pass_json(&out))?.with_status(status)"));
         // exactly two callers of the pass: the tick and the lever
-        let workers: usize = [lib, me]
-            .iter()
-            .map(|f| squash_src(f).matches("run_pass(").count())
-            .sum();
+        let workers = squash_src(lib)
+            .matches("crate::beef_blob_sweep::run_pass(")
+            .count()
+            + squash_src(me).matches("run_pass(").count();
         assert_eq!(workers, 3, "the definition, the tick and the lever");
 
         // the body: empty or {}, nothing else

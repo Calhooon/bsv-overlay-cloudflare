@@ -39,7 +39,7 @@ struct Candidate {
     topic: String,
 }
 
-pub async fn run_pass(engine: &overlay_engine::Engine, db: &D1Database) {
+pub async fn run_pass(engine: &overlay_engine::engine::Engine, db: &D1Database) {
     let progress = Cell::new(PeerProofSummary::default());
     let pass = async {
         let now = js_sys::Date::now() as i64;
@@ -285,6 +285,35 @@ mod tests {
             db.execute(crate::ops::PROOFLESS_WATCH_GC_SQL, []).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn proof_window_reorg_feed_requires_an_enabled_source() {
+        let source = include_str!("tip_pass.rs");
+        let pass = &source[source.find("pub async fn run_arcade_reorg_pass(").unwrap()..];
+        let gate = pass
+            .find(".permits(\"arcade\")")
+            .expect("reorg source policy absent");
+        assert!(gate < pass.find("ArcadeBlockStatusFeed::new").unwrap());
+        assert!(
+            pass[gate..].find("return ").unwrap()
+                < pass[gate..].find("ArcadeBlockStatusFeed::new").unwrap()
+        );
+    }
+
+    #[test]
+    fn proof_window_advert_spend_requires_enabled_sources() {
+        let source = include_str!("advert_lifecycle.rs");
+        let pass = &source[source.find("pub async fn run_advert_lifecycle(").unwrap()..];
+        let probe = pass.find("confirm_advert_spends(").unwrap();
+        for name in ["woc", "bitails"] {
+            assert!(
+                pass.find(&format!("sources.permits(\"{name}\")"))
+                    .expect("advert source policy absent")
+                    < probe
+            );
+        }
+        assert!(pass.contains("AdvertSpendSummary::default()"));
     }
 
     #[test]

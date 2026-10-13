@@ -7,6 +7,7 @@
 - Retry up to 20 held outputs against their configured or SHIP-discovered topic peers in a 30-second tick slot, with five seconds per node request. Verify each BUMP against headers, stitch it into stored BEEF, and restore lookup visibility. Report `heldByWindow`, `peerProofRequests` and `peerProofsLanded` on invariants.
 - Retire a held transaction as `expired-unproven` when every indexed output is an expired UHRP advert. Keep live, permanent and non-UHRP siblings. Report the live `retiredExpiredUnprovenTotal` separately from structurally unprovable LOW rows.
 - Use the existing watch observation stamp, falling back to transaction creation time; watch enrollment retains that creation time. No schema, SDK pin or package version change in this lane.
+- The Arcade reorg feed also requires the `arcade` source. LOW advert spend probes require both `woc` and `bitails` for independent corroboration; their D1 expiry reaper still runs. A peer BUMP with an unmarked subject hash is attached to that verified subject before the proven flag moves.
 
 ## [0.1.4] - 2026-10-13
 

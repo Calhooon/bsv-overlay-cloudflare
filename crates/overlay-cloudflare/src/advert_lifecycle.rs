@@ -509,10 +509,16 @@ pub async fn run_advert_lifecycle(
     woc_api_key: Option<&str>,
     spend_limit: u64,
     reap_limit: u64,
+    sources: crate::proof_fetcher::ProofSources,
 ) -> (AdvertReapSummary, AdvertSpendSummary) {
     let reap = reap_expired_adverts(storage, tip, reap_limit).await;
-    let spend =
-        confirm_advert_spends(storage, &WorkerFetchTransport, woc_api_key, spend_limit).await;
+    // Both independent sources are needed to corroborate a spend. Check both
+    // flags so every disabled dependency records its skip.
+    let spend = if sources.permits("woc") & sources.permits("bitails") {
+        confirm_advert_spends(storage, &WorkerFetchTransport, woc_api_key, spend_limit).await
+    } else {
+        AdvertSpendSummary::default()
+    };
     (reap, spend)
 }
 

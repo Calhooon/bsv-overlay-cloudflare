@@ -92,7 +92,7 @@ fn e602_retire_pass_rechecks_live_pots_for_confirmed_competitors() {
     let pass = &pass[..pass.find("letmutsummary=RetireSummary").unwrap()];
     assert_eq!(
         pass.matches(
-            "letconflict=crate::admit_fast::confirmed_conflict_pass(db,woc_api_key).await;"
+            "letconflict=crate::admit_fast::confirmed_conflict_pass(db,woc_api_key,sources).await;"
         )
         .count(),
         1
@@ -124,7 +124,7 @@ fn e602_only_broadcaster_admissions_carry_a_witness() {
 fn e602_courier_functions_keep_the_response_body() {
     let proof = source("proof_fetcher.rs");
     for name in ["bitails_presence", "woc_presence"] {
-        let start = proof.find(&format!("asyncfn{name}(")).unwrap();
+        let start = proof.find(&format!("asyncfn{name}(base:")).unwrap();
         let body = &proof[start..];
         let body = &body[..body.find("_=>None,").unwrap()];
         assert_eq!(body.matches("presence_response(status,&body)").count(), 1);
@@ -133,12 +133,12 @@ fn e602_courier_functions_keep_the_response_body() {
 
 #[test]
 fn e602_fold_retire_callers_pass_the_woc_key_and_print_the_conflict_summary() {
-    let lib = source("lib.rs");
-    let call = "run_retire_pass(&ops_db,&arcade_base,woc_key.as_deref()).await;";
+    let lib = source("lib.rs").replace("from_env(&env)", "from_env(env)");
+    let call = "run_retire_pass(&ops_db,&arcade_base,woc_key.as_deref(),crate::proof_fetcher::ProofSources::from_env(env),).await;";
     assert_eq!(
         lib.matches(call).count(),
         2,
-        "both retire-pass callers pass the key"
+        "both retire-pass callers pass the key and source policy"
     );
     assert_eq!(
         lib.matches("run_retire_pass(&ops_db,&arcade_base,None)")

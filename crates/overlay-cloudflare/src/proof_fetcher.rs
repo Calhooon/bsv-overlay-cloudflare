@@ -169,7 +169,7 @@ impl ProofSources {
             }
             != 0
     }
-    fn permits(self, source: &str) -> bool {
+    pub(crate) fn permits(self, source: &str) -> bool {
         let enabled = self.enabled(source);
         if !enabled {
             push_log(&format!("[proof] {source}: disabled source skipped"));
