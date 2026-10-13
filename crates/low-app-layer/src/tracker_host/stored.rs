@@ -210,7 +210,7 @@ pub fn project(old: Option<&Row>, state: &State, now: u64, legacy: Option<String
 }
 
 /// Durable cursor per host version: completed deploy passes do not restart on recycle.
-pub const BACKFILL_VERSION: &str = "ns3-fold-v2-scheduled";
+pub const BACKFILL_VERSION: &str = "ns3-fold-v3-header-retry";
 pub const BACKFILL_CREATE: &str = "CREATE TABLE IF NOT EXISTS tracker_backfill (version TEXT PRIMARY KEY, cursor TEXT NOT NULL, complete INTEGER NOT NULL)";
 // One-to-one PK join; no proof/absence filter may scan beyond the 64-subject page.
 pub const BACKFILL_PAGE: &str = "SELECT transactions.txid, CASE WHEN transactions.has_proof = 1 AND tx_words.txid IS NULL THEN transactions.beef END AS beef, transactions.has_proof, tx_words.txid AS tracked FROM transactions LEFT JOIN tx_words ON tx_words.txid = transactions.txid WHERE transactions.txid > ?1 ORDER BY transactions.txid LIMIT 64";
