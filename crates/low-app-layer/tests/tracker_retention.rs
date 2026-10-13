@@ -63,3 +63,18 @@ fn ns3d_m3_untouched_built_stranger_is_swept_after_eight_days() {
         "untouched built stranger was spared by the sweep");
     assert_eq!(db.query_row("SELECT txid FROM tx_words", [], |r| r.get::<_,String>(0)).unwrap(), "held");
 }
+
+#[test]
+fn ns3d_note5_age_scans_use_a_production_index() {
+    use low_app_layer::tracker_host::stored;
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+        if let Err(e) = db.execute_batch(sql) { assert!(e.to_string().contains("duplicate column")); }
+    }
+    assert_eq!(stored::AGE_INDEX, bsv_overlay_cloudflare::d1::TX_WORDS_AGE_INDEX);
+    for sql in [stored::DUE, stored::SWEEP] {
+        let plans: Vec<String> = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap()
+            .query_map([100], |r| r.get(3)).unwrap().map(Result::unwrap).collect();
+        assert!(plans.iter().any(|p| p.contains("tx_words_age")), "age scan lacks index: {plans:?}");
+    }
+}

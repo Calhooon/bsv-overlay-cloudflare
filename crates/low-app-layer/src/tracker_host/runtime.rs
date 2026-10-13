@@ -516,6 +516,8 @@ pub async fn tick(env: &worker::Env) -> worker::Result<()> {
     }
     let now = super::WorkerClock.now();
     let db = env.d1("OVERLAY_DB")?;
+    // Catch up on the scheduled path only; no read gains a schema statement.
+    db.prepare(stored::AGE_INDEX).counted_run().await?;
     db.prepare(stored::SWEEP)
         .bind(&[JsValue::from_f64(now.saturating_sub(8 * 86400) as f64)])?
         .counted_run()
