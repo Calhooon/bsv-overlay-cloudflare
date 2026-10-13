@@ -9,9 +9,9 @@
 //! consumer is the next caller, L3's seam). The publish is VOLATILE scheduling, the filing DURABLE: every wake-up of
 //! a body is PARKED in D1 in the hook's one write batch before the answer (the review's H1); [`announce_and_report`]
 //! runs DETACHED (`ctx.wait_until`) under one wall ([`ANNOUNCE_WALL_MS`]), counted, and settles the park (a
-//! delivered wake-up out, an undelivered one retried at its token); [`drain_parked`] (the scheduled tick, and
-//! `POST /internal/pot-announce-drain`) delivers what is left. A batch that faulted announces nothing (the
-//! 503 alone, N2). THE DELIVERY BOUND (the delta review's N3), conditional on the relay answering within the
+//! delivered wake-up out, an undelivered one retried at its token); [`drain_parked`] (the scheduled tick's own
+//! task, and `POST /internal/pot-announce-drain`) delivers what is left. A batch that faulted announces nothing (the
+//! 503 alone, N2). THE DELIVERY BOUND (the delta review's N3, N4), conditional on the relay answering within the
 //! walls and the scheduled task running: a wake-up is sent within [`ANNOUNCE_WALL_MS`] of the answer, or else it is
 //! due [`PARK_RETRY_BASE_MS`] later and waits behind the B wake-ups due before it, delivered by the
 //! ceil((B + 1) / 96)-th scheduled pass after it falls due ([`DRAIN_MAX_ROUNDS`] x [`DRAIN_MAX_PER_PASS`] a pass, one
@@ -121,6 +121,8 @@ pub const DRAIN_MAX_PER_PASS: u32 = 24;
 /// N3: a pass runs further rounds while the last one was full (a backlog) and the wall has not fallen: at most
 /// [`DRAIN_MAX_ROUNDS`] x [`DRAIN_MAX_PER_PASS`] = 96 wake-ups a scheduled pass, 384 an hour at `*/15`.
 pub const DRAIN_MAX_ROUNDS: u32 = 4;
+/// N4: the drain's own wall, the whole pass (its rounds share it); it runs in its own scheduled task.
+pub const DRAIN_WALL_MS: u64 = 60_000;
 /// The sweep's bound per pass (and the age-out's).
 pub const SWEEP_MAX_PER_PASS: u32 = 50;
 
@@ -1099,7 +1101,7 @@ impl DrainTally {
     }
 }
 
-/// ONE DRAIN PASS (the scheduled tick's, and `POST /internal/pot-announce-drain`'s): ROUNDS of at most
+/// ONE DRAIN PASS (the scheduled tick's own task, and `POST /internal/pot-announce-drain`'s): ROUNDS of at most
 /// [`DRAIN_MAX_PER_PASS`] parked wake-ups due now, each round's delivered together, a further round only while the
 /// last was full (a backlog), delivered at least one and the one `wall` has not fallen, at most [`DRAIN_MAX_ROUNDS`]
 /// (N3). A delivered one
@@ -1264,6 +1266,14 @@ where
         }));
     }
     outcome
+}
+
+/// N4: the scheduled tick's two units of work, each its OWN `wait_until` task, the drain handed FIRST: the tracker's
+/// backfill and tick await CHAINTRACKS with no timeout of their own, so a pending header answer no longer holds the
+/// drain behind it. The worker's `scheduled` calls this with `ctx.wait_until`.
+pub fn schedule_tick(spawn: &dyn Fn(Detached), drain: Detached, tracker: Detached) {
+    spawn(drain);
+    spawn(tracker);
 }
 
 /// The `Server-Timing` segment of a hook's answer.
@@ -2464,5 +2474,78 @@ pub(crate) mod tests {
         const {
             assert!(DRAIN_MAX_ROUNDS * DRAIN_MAX_PER_PASS == 96);
         }
+    }
+
+    /// (N4, the delta review) A HUNG TRACKER CALL LEAVES THE DRAIN RUNNING. On `24bbda1` the drain ran after the
+    /// tracker's backfill and tick in ONE scheduled task, and the backfill awaits CHAINTRACKS with no timeout. Now the
+    /// scheduled tick hands two tasks to `wait_until`, the drain FIRST ([`schedule_tick`]): with the tracker's future
+    /// never answering, the drain's pass over the shipped SQL delivers the due wake-up. Source: the worker's
+    /// `scheduled` calls `schedule_tick` with `ctx.wait_until`, its drain task holds the drain and not the tracker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f2_n4_a_hung_tracker_call_leaves_the_drain_running() {
+        let lib = squash(&code_only(include_str!("lib.rs")));
+        let sched = &lib[lib.find(&squash("async fn scheduled(")).expect("scheduled")..];
+        let sched = &sched[..sched
+            .find(&squash("#[event(fetch)]"))
+            .unwrap_or(sched.len())];
+        assert!(
+            sched.contains(&squash(
+                "pot_hook::schedule_tick(&|f| ctx.wait_until(f), drain, tracker);"
+            )),
+            "the drain is its own task, scheduled before the tracker work"
+        );
+        let drain_at = sched
+            .find(&squash("let drain: pot_hook::Detached"))
+            .expect("the drain task");
+        let tracker_at = sched
+            .find(&squash("let tracker: pot_hook::Detached"))
+            .expect("the tracker task");
+        let drain_task = &sched[drain_at..tracker_at];
+        assert!(drain_task.contains("drain_pot_announce(") && !drain_task.contains("backfill("));
+        assert!(
+            sched[tracker_at..].contains("backfill(")
+                && !sched[tracker_at..].contains("drain_pot_announce(")
+        );
+        assert!(
+            include_str!("routes.rs").contains("crate::pot_hook::DRAIN_WALL_MS,"),
+            "the drain's own wall"
+        );
+
+        let store = Rc::new(HookD1 {
+            sql: SqliteSql::migrated(),
+        });
+        let now = store.sql.now.get();
+        let wake = Wake {
+            txid: MARKER_POT.to_string(),
+            vout: 0,
+            recipient: None,
+        };
+        store
+            .write(
+                &[],
+                &[ParkOp::Park {
+                    wake,
+                    at_ms: now,
+                    next_ms: now,
+                }],
+            )
+            .await
+            .unwrap();
+        let relay = Rc::new(Relay::default());
+        let (s2, r2) = (store.clone(), relay.clone());
+        let drain: Detached = Box::pin(async move {
+            drain_parked(&*s2, &*r2, tokio::time::sleep(Duration::from_secs(5))).await;
+        });
+        let tracker: Detached = Box::pin(std::future::pending::<()>());
+        let rec = Recorded::default();
+        schedule_tick(&|f| rec.0.borrow_mut().push(f), drain, tracker);
+        assert_eq!(rec.0.borrow().len(), 2, "two tasks");
+        let _ = tokio::time::timeout(Duration::from_secs(2), rec.run_all()).await;
+        assert_eq!(
+            relay.delivered.borrow().len(),
+            1,
+            "the drain delivered under a hung tracker"
+        );
+        assert_eq!(parked_count(&store.sql), 0);
     }
 }
