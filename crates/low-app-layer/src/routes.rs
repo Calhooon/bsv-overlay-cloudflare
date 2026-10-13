@@ -7280,16 +7280,8 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         Ok(db) => read_probe_memos(&db, &probe_targets).await,
         Err(_) => Vec::new(),
     };
-    let ids: Vec<_> = memos
-        .iter()
-        .filter_map(|m| m.spending_txid.clone())
-        .collect();
-    let stored_words = crate::tracker_host::runtime::read_soft(&ctx.env, &ids).await?;
     let (memo_answers, _) = crate::tracker_host::runtime::spent_any_memo_plan(
-        &probe_targets,
-        &memos,
-        now_ms,
-        stored_words.as_ref().unwrap_or(&Default::default()),
+        &probe_targets, &memos, now_ms, &Default::default(),
     );
     let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
     let mut terminals = Vec::with_capacity(outpoints.len());
@@ -7359,6 +7351,9 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             write_probe_memos(&db, &fresh).await;
         }
     }
+    // Look up the served pointer, including a freshly probed replacement.
+    let ids: Vec<_> = entries.iter().filter_map(|entry| entry.spending_txid.clone()).collect();
+    let stored_words = crate::tracker_host::runtime::read_soft(&ctx.env, &ids).await?;
     let value = serde_json::from_str(&crate::txany::spent_any_body(&entries, &terminals))?;
     // Read-only decoration; missing words remain unknown until the scheduled pass.
     json_response(
