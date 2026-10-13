@@ -4220,4 +4220,97 @@ mod tests {
         let close = l.find("summary.scanned += one.scanned").unwrap();
         assert!(check < persist && persist < close, "persisted inside the loop, after its own check");
     }
+
+    /// bsv-low #649 L1: the settle's world, recorded; its flush COMPLETES, so whatever the settle does after the
+    /// delivery await is executed and seen (the hanging fake stops at the flush and cannot see a suffix).
+    struct CompletingFlush {
+        events: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl RefusalSettle for CompletingFlush {
+        async fn write_memo(&self, reason: &str) {
+            self.events.borrow_mut().push(format!("memo {reason}"));
+        }
+        async fn bump(&self, counter: &'static str) {
+            self.events.borrow_mut().push(format!("bump {counter}"));
+        }
+        async fn flush(&self) {
+            self.events.borrow_mut().push("flush".into());
+        }
+        fn log(&self, line: String) {
+            self.events.borrow_mut().push(format!("log {line}"));
+        }
+    }
+
+    /// The code of `text` with `//` comments and every whitespace removed.
+    fn squashed(text: &str) -> String {
+        text.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<String>()
+            .split_whitespace()
+            .collect()
+    }
+
+    /// bsv-low #649 L1 (the lens's appended bump): the shipped settle, run to its END over a flush that completes,
+    /// does NOTHING after the delivery await, yielded or not, under both jobs' counters; and over the WHOLE of both
+    /// settle jobs, nothing is persisted or logged on the settled path after the settle's call: its arm ends at the
+    /// call, and so does the job (the refusal job's match is its last statement; the watch returns after it).
+    #[test]
+    fn e649_l1_nothing_is_persisted_or_logged_after_the_delivery_await() {
+        for counter in [crate::ops::COUNTER_SUBMIT_PENDING_EVICTED, crate::ops::COUNTER_ARC_INGEST_EVICTED] {
+            for yielded in [false, true] {
+                let port = CompletingFlush { events: Default::default() };
+                let lines = SettleLines { no_memo: "no-memo".into(), yielded: "yielded".into(), evicted: "evicted".into() };
+                let mut fut =
+                    std::pin::pin!(settle_corroborated_refusal(&port, yielded, counter, "REJECTED (spent)", lines));
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(
+                    std::future::Future::poll(fut.as_mut(), &mut cx).is_ready(),
+                    "every step of the fake answers at once: the settle completes"
+                );
+                let done = port.events.borrow().clone();
+                let expected: Vec<String> = if yielded {
+                    vec!["log no-memo".into(), "log yielded".into(), "flush".into()]
+                } else {
+                    vec!["memo REJECTED (spent)".into(), format!("bump {counter}"), "log evicted".into(), "flush".into()]
+                };
+                assert_eq!(done, expected, "{counter} yielded={yielded}: the flush is the settle's LAST effect");
+            }
+        }
+        let src = include_str!("admit_fast.rs");
+        // the settle: its body ends at the delivery await
+        let settle = &src[src.find("pub(crate) async fn settle_corroborated_refusal<").unwrap()..];
+        let settle = squashed(&settle[..settle.find("\n}\n").unwrap() + 3]);
+        let after = &settle[settle.find("port.flush().await;").expect("the delivery await") + "port.flush().await;".len()..];
+        assert_eq!(after, "}", "nothing after the settle's delivery await");
+        assert_eq!(settle.matches("port.flush()").count(), 1, "one delivery await in the settle");
+        // both jobs: the settled arm ends at the settle's call
+        for (job_name, tail_after_match) in [
+            ("pub async fn refusal_job(", "}}"),
+            ("pub async fn pending_watch_job(", ""),
+        ] {
+            let job = &src[src.find(job_name).expect("the job")..];
+            let job = squashed(&job[..job.find("\n}\n").expect("the job ends")]);
+            let call = job.find("settle_corroborated_refusal(").expect("the settle call");
+            let call_end = job[call..].find(".await;").expect("the call is awaited") + call + ".await;".len();
+            let next_arm = job[call_end..].find("EvidenceVerdict::Present=>").expect("the next arm") + call_end;
+            assert_eq!(
+                &job[call_end..next_arm],
+                "}",
+                "{job_name}: the settled arm ends at the settle's call (nothing persisted or logged after its delivery)"
+            );
+            if job_name.starts_with("pub async fn refusal_job") {
+                let last = job.rfind("COUNTER_ARC_INGEST_REFUSAL_UNCORROBORATED,1).await;").expect("the last arm's count")
+                    + "COUNTER_ARC_INGEST_REFUSAL_UNCORROBORATED,1).await;".len();
+                assert_eq!(&job[last..], tail_after_match, "the refusal job's match is its last statement");
+            } else {
+                let uncertain = job[call_end..].find("EvidenceVerdict::Uncertain(why)=>").unwrap() + call_end;
+                let orphan = job[uncertain..].find("crate::broadcaster::WitnessLook::Orphan(_)").unwrap() + uncertain;
+                assert!(
+                    job[uncertain..orphan].ends_with("}}return;}"),
+                    "the watch returns right after the evidence match: its settled path reaches no later count or log"
+                );
+            }
+        }
+    }
 }
