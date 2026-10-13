@@ -564,6 +564,75 @@ pub fn courier_presence_hint(value: &Value, now: u64) -> Option<Hint> {
     Some(Hint::new(source, HintStatus::Unknown, now))
 }
 
+#[derive(serde::Deserialize)]
+pub struct BackfillSubject {
+    pub txid: String,
+    pub beef: Option<Vec<u8>>,
+    pub has_proof: f64,
+    pub tracked: Option<String>,
+}
+
+/// Production page walker; only the header and write transports are supplied.
+pub async fn walk_backfill_page<H, HF, W, WF>(
+    rows: Vec<BackfillSubject>,
+    mut after: String,
+    now: u64,
+    mut headers: H,
+    mut write: W,
+) -> Result<String, String>
+where
+    H: FnMut(u32) -> HF,
+    HF: std::future::Future<Output = HeaderSnapshot>,
+    W: FnMut(Row) -> WF,
+    WF: std::future::Future<Output = Result<(), String>>,
+{
+    for subject in rows {
+        crate::courier::note_presence("tracker_backfill_scanned_total");
+        after = subject.txid.clone();
+        if subject.tracked.is_some() || subject.has_proof == 0.0 {
+            continue;
+        }
+        let proof = subject
+            .beef
+            .and_then(|bytes| {
+                overlay_engine::beef_limits::transaction_from_beef(
+                    &bytes,
+                    Some(&subject.txid),
+                    &overlay_engine::beef_limits::STORED_BEEF_LIMITS,
+                )
+                .ok()
+            })
+            .and_then(|tx| tx.merkle_path.clone())
+            .and_then(|path| Proof::new(&subject.txid, path).ok());
+        if let Some(proof) = proof {
+            let headers = headers(proof.height()).await;
+            let mut state = State::new(&subject.txid);
+            if let Err(error) = state
+                .step(
+                    &Params { age_threshold: 60 },
+                    &headers,
+                    Input::Evidence(Evidence::Proof(proof)),
+                )
+            {
+                let reason = match error {
+                    bsv_tracker::CheckError::RootMismatch(_) => "root_mismatch",
+                    bsv_tracker::CheckError::Unavailable(_) => "unavailable",
+                    bsv_tracker::CheckError::Headers(_) => "headers",
+                    _ => "invalid_proof",
+                };
+                crate::courier::note_presence("tracker_backfill_skipped_total");
+                crate::courier::note_presence(&format!("tracker_backfill_skipped_{reason}_total"));
+                continue;
+            }
+            write(Row::from_state(&state, now, None)).await?;
+            crate::courier::note_presence("tracker_backfill_written_total");
+        } else {
+            crate::courier::note_presence("tracker_backfill_unreadable_total");
+        }
+    }
+    Ok(after)
+}
+
 thread_local! { static BACKFILL_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 /// Proof-only deploy convergence: one 64-subject indexed page per scheduled pass.
 /// The page plus its tx_words PK join reads at most 64 + 64 rows.
@@ -575,13 +644,6 @@ pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
     struct Cursor {
         cursor: String,
         complete: f64,
-    }
-    #[derive(serde::Deserialize)]
-    struct Subject {
-        txid: String,
-        beef: Option<Vec<u8>>,
-        has_proof: f64,
-        tracked: Option<String>,
     }
     let db = env.d1("OVERLAY_DB")?;
     let cursor = db
@@ -605,47 +667,14 @@ pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
         .bind(&[JsValue::from_str(&after)])?
         .counted_all()
         .await?
-        .results::<Subject>()?;
+        .results::<BackfillSubject>()?;
     let page_done = rows.len() < 64;
     let complete = pots && page_done;
-    for subject in rows {
-        crate::courier::note_presence("tracker_backfill_scanned_total");
-        after = subject.txid.clone();
-        if subject.tracked.is_some() || subject.has_proof == 0.0 {
-            continue;
-        }
-        let proof = subject
-            .beef
-            .and_then(|bytes| {
-                overlay_engine::beef_limits::transaction_from_beef(
-                    &bytes,
-                    Some(&subject.txid),
-                    &overlay_engine::beef_limits::STORED_BEEF_LIMITS,
-                )
-                .ok()
-            })
-            .and_then(|tx| tx.merkle_path.clone())
-            .and_then(|path| Proof::new(&subject.txid, path).ok());
-        if let Some(proof) = proof {
-            let headers = super::headers(env, &[proof.height()]).await;
-            let mut state = State::new(&subject.txid);
-            state
-                .step(
-                    &Params { age_threshold: 60 },
-                    &headers,
-                    Input::Evidence(Evidence::Proof(proof)),
-                )
-                .map_err(|e| worker::Error::RustError(e.to_string()))?;
-            stored::write(
-                env,
-                &Row::from_state(&state, super::WorkerClock.now(), None),
-            )
-            .await?;
-            crate::courier::note_presence("tracker_backfill_written_total");
-        } else {
-            crate::courier::note_presence("tracker_backfill_unreadable_total");
-        }
-    }
+    after = walk_backfill_page(
+        rows, after, super::WorkerClock.now(),
+        |height| async move { super::headers(env, &[height]).await },
+        |row| async move { stored::write(env, &row).await.map_err(|e| e.to_string()) },
+    ).await.map_err(worker::Error::RustError)?;
     let saved = if page_done && !pots {
         "1:".to_string()
     } else {
