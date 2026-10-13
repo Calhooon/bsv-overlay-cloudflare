@@ -187,6 +187,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             courier::note_presence("tracker_backfill_faulted_total");
             worker::console_warn!("[tracker-backfill] deferred: {e}");
         }
+        if let Err(e) = tracker_host::runtime::tick(&env).await {
+            worker::console_warn!("[tracker-tick] deferred: {e}");
+        }
         if let Ok(db) = env.d1("OVERLAY_DB") {
             let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
             courier::flush(Some(db), pending).await;
