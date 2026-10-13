@@ -554,7 +554,11 @@ async fn e649_m2_a_yielded_conflict_eviction_is_neither_logged_nor_counted() {
         asked: std::cell::Cell::new(0),
     };
     let result = converge_confirmed_conflict(&store, &evidence, &evidence, &txid, &raw, 3000).await;
-    assert_eq!(store.asked.get(), 1, "the confirmed competitor reached the eviction");
+    assert_eq!(
+        store.asked.get(),
+        1,
+        "the confirmed competitor reached the eviction"
+    );
     assert_eq!(
         result,
         Ok(false),

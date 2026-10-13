@@ -181,8 +181,13 @@ fn e602_delta_the_conflict_pass_bumps_its_counters_on_both_exits() {
         1,
         "the read fault bumps the conflict counters"
     );
-    assert!(pass.contains("run_conflict_candidates(&port,"), "the loop is the shipped one");
-    let port = &admit_fast[admit_fast.find("implConflictPassPortforWorkerConflictPass").unwrap()..start];
+    assert!(
+        pass.contains("run_conflict_candidates(&port,"),
+        "the loop is the shipped one"
+    );
+    let port = &admit_fast[admit_fast
+        .find("implConflictPassPortforWorkerConflictPass")
+        .unwrap()..start];
     assert!(
         port.contains("asyncfnpersist(&self,deltas:&ConflictPassSummary){bump_conflict_counters(self.db,deltas).await;}"),
         "the worker's port persists a candidate's deltas"
