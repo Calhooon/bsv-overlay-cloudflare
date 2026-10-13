@@ -811,6 +811,22 @@ pub fn seat_message_id(txid: &str, vout: u32, recipient: &str, token: &str) -> S
     hex::encode(bsv_rs::primitives::hash::sha256(key.as_bytes()))
 }
 
+/// N8 (the second delta review): the INTENT id of one pots-room broadcast, the sha256 hex of the outpoint and the
+/// park's TOKEN (as [`seat_message_id`]): every send of one intent (the detached announce, each drain retry, a
+/// retry after a lost answer or a failed delete) carries one id, and a later park of the outpoint is a new intent with
+/// a new id. The relay cannot honour it: `rust-message-box` 0.4.6's `/broadcast` reads `{box_name, body}` only and
+/// mints `bcast-<ms>` per fan-out (`fan_out_broadcast`), so a repeat is filed again. It rides the BODY
+/// (`intentId`), for the client's own dedupe; the relay's `/broadcast` taking a caller's id is the ask filed in the
+/// PR.
+pub fn room_intent_id(txid: &str, vout: u32, token: &str) -> String {
+    let key = format!(
+        "{}|{}:{vout}|{token}",
+        crate::internal_events::POTS_ROOM,
+        txid.to_ascii_lowercase()
+    );
+    hex::encode(bsv_rs::primitives::hash::sha256(key.as_bytes()))
+}
+
 /// What the detached work of one body is: the outpoints to announce in the pots room, and the seats to tell.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AnnouncePlan {
@@ -1044,21 +1060,23 @@ impl AnnounceTally {
     }
 }
 
-/// One relay call: a room's broadcast, or a seat's `pot` event under its [`seat_message_id`].
+/// One relay call: a room's broadcast carrying its [`room_intent_id`] (N8), or a seat's `pot` event under its
+/// [`seat_message_id`].
 async fn send_one<R: RelayPort>(relay: &R, s: &Call) -> Delivery {
     let w = &s.wake;
+    let token = match s.generation {
+        Some(g) => format!("g{g}"),
+        None => format!("a{}", s.at_ms),
+    };
     match &w.recipient {
         None => {
-            let body = crate::internal_events::pot_changed_event_body(&w.txid, w.vout, s.at_ms);
+            let mut body = crate::internal_events::pot_changed_event_body(&w.txid, w.vout, s.at_ms);
+            body["intentId"] = json!(room_intent_id(&w.txid, w.vout, &token));
             relay
                 .broadcast(crate::internal_events::POTS_ROOM, body)
                 .await
         }
         Some(id) => {
-            let token = match s.generation {
-                Some(g) => format!("g{g}"),
-                None => format!("a{}", s.at_ms),
-            };
             let body =
                 crate::internal_events::pot_event_body(&w.txid, w.vout, carrier_entry(), s.at_ms);
             relay
@@ -2720,11 +2738,9 @@ pub(crate) mod tests {
                 .unwrap_or_default()
                 .to_string();
             if to == crate::internal_events::POTS_ROOM {
-                assert_eq!(
-                    body,
-                    &crate::internal_events::pot_changed_event_body(&txid, 0, 7),
-                    "the room's body"
-                );
+                let mut want = crate::internal_events::pot_changed_event_body(&txid, 0, 7);
+                want["intentId"] = body["intentId"].clone();
+                assert_eq!(body, &want, "the room's body, its intent id beside (N8)");
                 continue;
             }
             seats += 1;
@@ -3346,5 +3362,75 @@ pub(crate) mod tests {
             })
             .unwrap();
         assert_eq!(attempts, 24, "each settled as a failed attempt");
+    }
+
+    /// (N8, the second delta review) A ROOM INTENT CARRIES ONE ID ACROSS ITS RETRIES. On `c830527` a room broadcast
+    /// carried no intent id: a relay that took the first body and answered a failure saw the same body again on the
+    /// drain's retry with nothing to tell them apart (RED: `[None, None]`). Now every send of one room intent carries
+    /// `intentId`, the [`room_intent_id`] of its park token: the failed send and the drain's retry carry the same 64-hex
+    /// id; a later park of the outpoint (a new intent) carries another; the seat ids are unchanged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f3_n8_a_room_intent_carries_one_id_across_its_retries() {
+        let (db, ops) = decoded_fixture(1);
+        let store = Rc::new(HookD1 { sql: db });
+        let relay = Rc::new(Relay::default());
+        relay
+            .fail_once
+            .borrow_mut()
+            .push(crate::internal_events::POTS_ROOM.to_string());
+        let at = store.sql.now.get();
+        let serve = |at: u64| {
+            let (store, relay, ops) = (store.clone(), relay.clone(), ops.clone());
+            async move {
+                let rec = Recorded::default();
+                let o = serve_pot_changed(
+                    store,
+                    relay,
+                    std::future::pending::<()>(),
+                    &|f| rec.0.borrow_mut().push(f),
+                    &ops,
+                    at,
+                )
+                .await;
+                rec.run_all().await;
+                o
+            }
+        };
+        let first = serve(at).await;
+        store.sql.now.set(at + PARK_GRACE_MS + PARK_RETRY_BASE_MS);
+        let t = drain_parked(&*store, &*relay, &test_deadline(5_000)).await;
+        assert_eq!((t.due, t.drained), (1, 1));
+        let rooms = || -> Vec<Value> {
+            relay
+                .bodies
+                .borrow()
+                .iter()
+                .filter(|(to, _, _)| to == crate::internal_events::POTS_ROOM)
+                .map(|(_, _, b)| b.clone())
+                .collect()
+        };
+        let ids: Vec<Option<String>> = rooms()
+            .iter()
+            .map(|b| b["intentId"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(ids.len(), 2, "the failed room send and its retry");
+        assert!(
+            ids[0].is_some() && ids[0] == ids[1],
+            "one room intent, one id across its retries: {ids:?}"
+        );
+        let g = first.plan.generations[0].expect("the room parked");
+        let (txid, vout) = &ops[0];
+        let want = room_intent_id(txid, *vout, &format!("g{g}"));
+        assert_eq!(ids[0].as_deref(), Some(want.as_str()));
+        assert!(want.len() == 64 && want.bytes().all(|b| b.is_ascii_hexdigit()));
+        // a later park of the outpoint is a new intent with a new id
+        serve(store.sql.now.get()).await;
+        let all = rooms();
+        assert_eq!(all.len(), 3);
+        assert_ne!(
+            all[2]["intentId"], all[0]["intentId"],
+            "a new intent, a new id"
+        );
+        assert_eq!(all[2]["kind"], "pot-changed");
     }
 }
