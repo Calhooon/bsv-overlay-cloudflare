@@ -187,7 +187,8 @@ pub(crate) trait ParkPort {
 
 /// THE SKIP of a background flush (bsv-low #649 M1; the delta lens's M1). The pot and hop sets are COPIED, the
 /// copy is PARKED in D1 as the skip's FIRST durable write (one batch, both sets), and only once the park landed
-/// are the parked entries taken out of the isolate's sets; the counters come after. So a cancellation at any
+/// are the parked entries taken out of the isolate's sets, each only at the version the copy read (D2-M2: a note of
+/// the same key made while the park was pending stays); the counters come after. So a cancellation at any
 /// await leaves every note in memory, in D1, or in both (a note in both is delivered twice: harmless, the app
 /// layer re-reads). A park that faults takes nothing out of memory, counted and logged.
 pub(crate) async fn park_withheld<P: ParkPort>(port: &P, remaining_ms: u64, now_ms: u64) {
@@ -195,22 +196,22 @@ pub(crate) async fn park_withheld<P: ParkPort>(port: &P, remaining_ms: u64, now_
     let hops = crate::hop_changes::snapshot();
     let mut rows: Vec<(&'static str, String)> = pots
         .iter()
-        .map(|(t, v)| (KIND_POT, pot_item(t, *v)))
+        .map(|((t, v), _)| (KIND_POT, pot_item(t, *v)))
         .collect();
-    rows.extend(hops.iter().map(|h| (KIND_HOP, h.clone())));
+    rows.extend(hops.iter().map(|(h, _)| (KIND_HOP, h.clone())));
     let withheld = rows.len() as u64;
     let (mut parked, mut faulted, mut full) = (0u64, 0u64, 0u64);
     if withheld > 0 {
         match port.park(&rows, now_ms).await {
             Ok(landed) => {
                 let landed_at = |i: usize| landed.get(i).copied().unwrap_or(false);
-                let parked_pots: Vec<(String, u32)> = pots
+                let parked_pots: Vec<((String, u32), u64)> = pots
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| landed_at(*i))
                     .map(|(_, p)| p.clone())
                     .collect();
-                let parked_hops: Vec<String> = hops
+                let parked_hops: Vec<(String, u64)> = hops
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| landed_at(pots.len() + *i))
@@ -789,7 +790,10 @@ pub async fn internal_lever(
             }
             park_withheld(&WorkerPark { db: &db }, 0, Date::now().as_millis()).await;
             let left = crate::pot_changes::snapshot();
-            let kept = pots.iter().filter(|p| left.contains(p)).count();
+            let kept = pots
+                .iter()
+                .filter(|p| left.iter().any(|(k, _)| k == *p))
+                .count();
             worker::Response::from_json(
                 &serde_json::json!({ "op": "park", "items": pots.len(), "keptInMemory": kept }),
             )
@@ -1635,6 +1639,44 @@ mod tests {
                 "{kind}: the key parked at 300 after delivery A deleted its row was erased by delivery B's delete"
             );
         }
+    }
+
+    /// bsv-low #649 D2-M2 (the second delta lens): while the skip's park is pending, its row is delivered and deleted
+    /// (another isolate's cron) and a LATER mutation notes the SAME pot and hop keys again. When the park answers,
+    /// the skip must forget only the notes it parked, never the later ones. On `a80e197` the sets held keys with no
+    /// version and `forget` removed the later notes: `durable=0 memory_pot=0 memory_hop=0`.
+    #[test]
+    fn e649_d2_m2_a_later_note_of_the_same_key_survives_the_parks_forget() {
+        struct LaterNote(RefCell<Vec<(String, String)>>);
+        impl ParkPort for LaterNote {
+            async fn park(
+                &self,
+                rows: &[(&'static str, String)],
+                _now_ms: u64,
+            ) -> std::result::Result<Vec<bool>, String> {
+                // the park commits, the cron delivers and deletes the row, then a later mutation notes it again
+                crate::pot_changes::note(&"ab".repeat(32), 5);
+                crate::hop_changes::note(ID, ID);
+                self.0.borrow_mut().clear();
+                Ok(vec![true; rows.len()])
+            }
+            async fn bump(&self, _counter: &'static str, _delta: u64) {}
+            fn log(&self, _line: String) {}
+        }
+        let _ = crate::pot_changes::drain();
+        let _ = crate::hop_changes::drain();
+        crate::pot_changes::note(&"AB".repeat(32), 5);
+        crate::hop_changes::note(ID, ID);
+        let port = LaterNote(Default::default());
+        run(park_withheld(&port, 2_000, 1_000));
+        let durable = port.0.borrow().len();
+        let memory_pot = crate::pot_changes::drain().len();
+        let memory_hop = crate::hop_changes::drain().len();
+        assert_eq!(
+            (durable, memory_pot, memory_hop),
+            (0, 1, 1),
+            "durable={durable} memory_pot={memory_pot} memory_hop={memory_hop}: the later notes were forgotten"
+        );
     }
 
     /// bsv-low #649 N4 (the delta lens's documentation drift): the Skip variant and the skip counter say what a skip

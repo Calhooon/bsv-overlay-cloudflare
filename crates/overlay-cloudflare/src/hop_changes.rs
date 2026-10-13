@@ -14,44 +14,58 @@
 //! (`POST /internal/hop-changed`, bearer `INTERNAL_TOKEN`, through the
 //! `APP_LAYER` service binding). Over-notification is harmless (a recompute
 //! is idempotent); a lost notification costs the cadence, never money.
-use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 use worker::*;
 
 thread_local! {
-    static CHANGES: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+    /// Each noted identity with the VERSION of its latest note (bsv-low #649 D2-M2; see `pot_changes::CHANGES`).
+    static CHANGES: RefCell<BTreeMap<String, u64>> = const { RefCell::new(BTreeMap::new()) };
+    static VERSION: Cell<u64> = const { Cell::new(0) };
+}
+
+/// One identity into the set at a new version.
+fn insert(id: String) {
+    let version = VERSION.with(|v| {
+        v.set(v.get() + 1);
+        v.get()
+    });
+    CHANGES.with(|c| {
+        c.borrow_mut().insert(id, version);
+    });
 }
 
 /// Record that a hop marker naming `identity` (and `opponent`) was admitted. Cheap, never fails.
 pub fn note(identity: &str, opponent: &str) {
-    CHANGES.with(|c| {
-        let mut set = c.borrow_mut();
-        for id in [identity, opponent] {
-            let id = id.trim().to_ascii_lowercase();
-            if id.len() == 66 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                set.insert(id);
-            }
+    for id in [identity, opponent] {
+        let id = id.trim().to_ascii_lowercase();
+        if id.len() == 66 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            insert(id);
         }
-    });
+    }
 }
 
 /// Take every noted identity (deduped, sorted), leaving the set empty.
 pub fn drain() -> Vec<String> {
-    CHANGES.with(|c| std::mem::take(&mut *c.borrow_mut()).into_iter().collect())
+    CHANGES.with(|c| std::mem::take(&mut *c.borrow_mut()).into_keys().collect())
 }
 
-/// bsv-low #649 M1: a COPY of every noted identity, the set left as it is (see `pot_changes::snapshot`).
-pub fn snapshot() -> Vec<String> {
-    CHANGES.with(|c| c.borrow().iter().cloned().collect())
+/// bsv-low #649 M1: a COPY of every noted identity with the version of its note, the set left as it is (see
+/// `pot_changes::snapshot`).
+pub fn snapshot() -> Vec<(String, u64)> {
+    CHANGES.with(|c| c.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect())
 }
 
-/// bsv-low #649 M1: take `parked` out of the set (identities noted since the snapshot stay).
-pub fn forget(parked: &[String]) {
+/// bsv-low #649 M1: take `parked` out of the set, each ONLY at the version the snapshot read (D2-M2: a later note
+/// of the same identity stays).
+pub fn forget(parked: &[(String, u64)]) {
     CHANGES.with(|c| {
         let mut set = c.borrow_mut();
-        for p in parked {
-            set.remove(p);
+        for (id, version) in parked {
+            if set.get(id) == Some(version) {
+                set.remove(id);
+            }
         }
     });
 }
@@ -116,7 +130,9 @@ where
 /// and a failed POST's entries (once) are noted back for the next flush. Returns the flush's account.
 pub fn settle(shipped: &crate::change_flush::Shipped<String>) -> crate::change_flush::Tally {
     let (back, tally) = NOTED_BACK.with(|m| crate::change_flush::settle(&mut m.borrow_mut(), shipped));
-    CHANGES.with(|c| c.borrow_mut().extend(back));
+    for id in back {
+        insert(id);
+    }
     tally
 }
 

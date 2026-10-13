@@ -11,40 +11,50 @@
 //! boxes as an EVENT. Over-notification is harmless (the app-layer re-reads
 //! the truth); a lost notification costs nothing money-wise (every money
 //! view is still served from the same rows on the next read).
-use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 use worker::*;
 
 thread_local! {
-    static CHANGES: RefCell<BTreeSet<(String, u32)>> = const { RefCell::new(BTreeSet::new()) };
+    /// Each noted outpoint with the VERSION of its latest note (bsv-low #649 D2-M2): a note of a key already held
+    /// gives it a new version, so [`forget`] of a snapshot never takes a note made after it.
+    static CHANGES: RefCell<BTreeMap<(String, u32), u64>> = const { RefCell::new(BTreeMap::new()) };
+    static VERSION: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Record that `(txid, vout)`'s row changed. Cheap, never fails.
 pub fn note(txid: &str, vout: u32) {
     let key = (txid.to_ascii_lowercase(), vout);
+    let version = VERSION.with(|v| {
+        v.set(v.get() + 1);
+        v.get()
+    });
     CHANGES.with(|c| {
-        c.borrow_mut().insert(key);
+        c.borrow_mut().insert(key, version);
     });
 }
 
 /// Take every noted outpoint (deduped), leaving the set empty.
 pub fn drain() -> Vec<(String, u32)> {
-    CHANGES.with(|c| std::mem::take(&mut *c.borrow_mut()).into_iter().collect())
+    CHANGES.with(|c| std::mem::take(&mut *c.borrow_mut()).into_keys().collect())
 }
 
-/// bsv-low #649 M1: a COPY of every noted outpoint, the set left as it is (the skip parks the copy first and
-/// [`forget`]s only what its park landed, so a cancelled park leaves the notes here).
-pub fn snapshot() -> Vec<(String, u32)> {
-    CHANGES.with(|c| c.borrow().iter().cloned().collect())
+/// bsv-low #649 M1: a COPY of every noted outpoint with the version of its note, the set left as it is (the skip
+/// parks the copy first and [`forget`]s only what its park landed, so a cancelled park leaves the notes here).
+pub fn snapshot() -> Vec<((String, u32), u64)> {
+    CHANGES.with(|c| c.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect())
 }
 
-/// bsv-low #649 M1: take `parked` out of the set (entries noted since the snapshot stay).
-pub fn forget(parked: &[(String, u32)]) {
+/// bsv-low #649 M1: take `parked` out of the set, each ONLY at the version the snapshot read (D2-M2: a note of the
+/// same key made since, while the park was pending, is a later version and stays; so do other keys).
+pub fn forget(parked: &[((String, u32), u64)]) {
     CHANGES.with(|c| {
         let mut set = c.borrow_mut();
-        for p in parked {
-            set.remove(p);
+        for (key, version) in parked {
+            if set.get(key) == Some(version) {
+                set.remove(key);
+            }
         }
     });
 }
