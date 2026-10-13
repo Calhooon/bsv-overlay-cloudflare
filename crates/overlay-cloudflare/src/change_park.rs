@@ -777,8 +777,9 @@ impl UnparkPort for NoTransport<'_> {
 
 /// `POST /internal/change-park` (bsv-low #649 N3; bearer `INTERNAL_TOKEN`): ONE step of the parked set's shipped
 /// code on demand, so the D1 budget tier measures it on a populated table (each answer carries its `d1`
-/// Server-Timing). Body `{"op":"park","items":["<txid>:<vout>",..]}` (the items noted, then the shipped skip
-/// [`park_withheld`]: what this isolate holds is parked with them), `{"op":"drain"}` (the shipped
+/// Server-Timing). Body `{"op":"park","items":["<txid>:<vout>",..],"hops"?:["<identity>",..]}` (the pot items and
+/// the hop identities noted, then the shipped skip [`park_withheld`]: what this isolate holds is parked with them;
+/// the hops since D2-L2, so the route tier re-parks both sets during a delivery's POST), `{"op":"drain"}` (the shipped
 /// [`deliver_parked`]; with no `APP_LAYER_URL` no POST leaves and each read row is refused and backed off) or
 /// `{"op":"health"}` (the gauge).
 pub async fn internal_lever(
@@ -795,6 +796,8 @@ pub async fn internal_lever(
         op: String,
         #[serde(default)]
         items: Vec<String>,
+        #[serde(default)]
+        hops: Vec<String>,
     }
     let Ok(body) = serde_json::from_slice::<Body>(&req.bytes().await?) else {
         return worker::Response::error(
@@ -813,11 +816,24 @@ pub async fn internal_lever(
                 .iter()
                 .filter_map(|i| parse_pot_item(i))
                 .collect();
-            if pots.len() != body.items.len() || pots.len() > DRAIN_MAX_ROWS {
-                return worker::Response::error("items: 1 to 128 \"<txid>:<vout>\"", 400);
+            let hops_ok = body
+                .hops
+                .iter()
+                .all(|h| h.len() == 66 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+            if pots.len() != body.items.len()
+                || pots.len() + body.hops.len() > DRAIN_MAX_ROWS
+                || !hops_ok
+            {
+                return worker::Response::error(
+                    "items: \"<txid>:<vout>\", hops: 66-hex identities, at most 128 together",
+                    400,
+                );
             }
             for (t, v) in &pots {
                 crate::pot_changes::note(t, *v);
+            }
+            for h in &body.hops {
+                crate::hop_changes::note(h, h);
             }
             park_withheld(&WorkerPark { db: &db }, 0, Date::now().as_millis()).await;
             let left = crate::pot_changes::snapshot();

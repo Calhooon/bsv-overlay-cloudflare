@@ -442,9 +442,11 @@ ci-route: ci-d1-budget
 # runs one pass of the sweep through its lever, synchronously, and the order of the cells is free again.
 ci-d1-budget:
 	@set -e; \
-	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); \
+	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); PD=$$((B+11)); PM=$$((B+12)); \
 	app_log=/tmp/lane499-d1-$$B-app.log; ov_log=/tmp/lane499-d1-$$B-overlay.log; seed_log=/tmp/lane499-d1-$$B-seed.log; \
+	dv_log=/tmp/lane499-d1-$$B-delivering.log; \
 	state=$$(mktemp -d /tmp/lane499-d1-state.XXXXXX); ov_state=$$(mktemp -d /tmp/lane499-d1-ovstate.XXXXXX); \
+	dv_state=$$(mktemp -d /tmp/lane499-d1-dvstate.XXXXXX); \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -464,11 +466,11 @@ ci-d1-budget:
 	    _n=$$((_n+1)); sleep 1; \
 	  done; \
 	  if [ -n "$$_left" ]; then echo "⚠ ci-d1-budget: could not free$$owned_ports (still held by:$$_left)"; fi; \
-	  rm -rf "$$state" "$$ov_state"; \
+	  rm -rf "$$state" "$$ov_state" "$$dv_state"; \
 	}; \
 	trap 'cleanup; exit 130' INT TERM; \
 	trap cleanup EXIT; \
-	for _pt in $$PA $$PO; do \
+	for _pt in $$PA $$PO $$PD $$PM; do \
 	  _held=$$(lsof -nP -tiTCP:$$_pt -sTCP:LISTEN 2>/dev/null || true); \
 	  if [ -n "$$_held" ]; then \
 	    echo "✗ ci-d1-budget: :$$_pt is ALREADY BOUND before we start, refusing to run (a stale worker would answer)."; \
@@ -476,7 +478,7 @@ ci-d1-budget:
 	    exit 1; \
 	  fi; \
 	done; \
-	owned_ports="$$PA $$PO"; \
+	owned_ports="$$PA $$PO $$PD"; \
 	wait_up() { \
 	  _url=$$1; _log=$$2; _label=$$3; _i=0; _t0=$$(date +%s); \
 	  while [ $$_i -lt $(ROUTE_UP_TRIES) ]; do \
@@ -511,6 +513,14 @@ ci-d1-budget:
 	) > "$$ov_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PO/listTopicManagers "$$ov_log" "overlay"; \
+	echo "→ starting wrangler dev :$$PD (the delivering overlay of the e649 cell, APP_LAYER_URL its mock on :$$PM)…"; \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$PD --ip 127.0.0.1 --persist-to "$$dv_state" \
+	    --var ARCADE_URL:http://127.0.0.1:9 \
+	    --var INTERNAL_TOKEN:ci-internal-tok \
+	    --var APP_LAYER_URL:http://127.0.0.1:$$PM \
+	) > "$$dv_log" 2>&1 & \
+	job_pids="$$job_pids $$!"; \
+	wait_up http://127.0.0.1:$$PD/listTopicManagers "$$dv_log" "delivering overlay"; \
 	D1_BUDGET_SEED="$$state/seed.sql" D1_BUDGET_STATE="$$state" node tools/lane-499/d1_budget_route_ci.mjs http://127.0.0.1:$$PA http://127.0.0.1:$$PO; \
 	python3 tools/lane-ns2/register_pin.py; \
 	D1_BUDGET_SEED="$$state/seed.sql" npx --package wrangler -c 'node tools/lane-ns2/owed_do_pins.mjs'; \
@@ -521,7 +531,7 @@ ci-d1-budget:
 	node tools/lane-e576/dead_letter_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e555/deferred_graphs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e585/beef_blobs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
-	node tools/lane-e649/change_park_budget_ci.mjs http://127.0.0.1:$$PO "$$ov_state"
+	node tools/lane-e649/change_park_budget_ci.mjs http://127.0.0.1:$$PO "$$ov_state" http://127.0.0.1:$$PD "$$dv_state" $$PM
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`
