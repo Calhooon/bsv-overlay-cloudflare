@@ -1,9 +1,9 @@
 {
-  "doc": "bsv-low #649 N3: the D1 ceilings of the parked set's steps on a 10,000-row fixture (tools/lane-e649/change_park_budget_ci.mjs, make ci-d1-budget), measured on local D1 under wrangler dev on 2026-10-13. The margin is lane 499's: reads x 1.5 rounded up, at least + 4; writes + 2, 0 stays 0; stmts + 2. The drain's 128 reads and 128 writes are the 128 rows it selects and backs off (no transport in the tier); the park of a NEW key on a full table reads its ceiling (2,048). Re-measured 2026-10-13 after the second delta lens (D2-L1, D2-L3): the drain's 128 back-offs RETURN their rows and guard on the attempt they reserve, 391 reads (was 263); the other three unchanged.",
+  "doc": "bsv-low #649 N3: the D1 ceilings of the parked set's steps on a 10,000-row fixture (tools/lane-e649/change_park_budget_ci.mjs, make ci-d1-budget), measured on local D1 under wrangler dev on 2026-10-13. The margin is lane 499's: reads x 1.5 rounded up, at least + 4; writes + 2, 0 stays 0; stmts + 2. The drain's 128 reads and 128 writes are the 128 rows it selects and backs off (no transport in the tier); the park of a NEW key on a full table reads its ceiling (2,048). Re-measured 2026-10-13 after the second delta lens (D2-L1, D2-L3): the drain's 128 back-offs RETURN their rows and guard on the attempt they reserve, 391 reads (was 263); the other three unchanged. Re-measured 2026-10-13 after the third delta lens (D3-M1): a park batch takes its token from the one-row counter change_parked_seq first, one statement and one write more (new-full 2,052 / 7 / 5, held 9 / 7 / 5); the drain and the gauge unchanged.",
   "scenarios": {
     "change-park-health-10000": { "measured": { "reads": 256, "writes": 0, "stmts": 1 }, "ceiling": { "reads": 384, "writes": 0, "stmts": 3 } },
-    "change-park-park-new-full": { "measured": { "reads": 2050, "writes": 6, "stmts": 4 }, "ceiling": { "reads": 3075, "writes": 8, "stmts": 6 } },
-    "change-park-park-held": { "measured": { "reads": 6, "writes": 6, "stmts": 4 }, "ceiling": { "reads": 10, "writes": 8, "stmts": 6 } },
+    "change-park-park-new-full": { "measured": { "reads": 2052, "writes": 7, "stmts": 5 }, "ceiling": { "reads": 3078, "writes": 9, "stmts": 7 } },
+    "change-park-park-held": { "measured": { "reads": 9, "writes": 7, "stmts": 5 }, "ceiling": { "reads": 14, "writes": 9, "stmts": 7 } },
     "change-park-drain-10000": { "measured": { "reads": 391, "writes": 258, "stmts": 133 }, "ceiling": { "reads": 587, "writes": 260, "stmts": 135 } }
   }
 }
