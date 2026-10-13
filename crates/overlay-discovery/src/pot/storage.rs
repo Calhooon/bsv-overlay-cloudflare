@@ -284,7 +284,10 @@ pub fn served_eviction_value(at: i64, readmitted_at: Option<i64>) -> serde_json:
 /// ledger writes its key lowercased; every caller binds lowercase). Read only.
 pub fn evictions_by_txid_sql(n: usize) -> String {
     debug_assert!((1..=EVICTIONS_CHUNK).contains(&n));
-    let marks = (1..=n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+    let marks = (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("SELECT lower(txid) AS txid, evictedAt, readmittedAt FROM pot_evictions WHERE txid IN ({marks})")
 }
 
@@ -1094,7 +1097,9 @@ pub struct MemoryPotStorage {
     /// bsv-low E649 L6 fold: the eviction ledger twin (`evictions_for`): `None` = this store serves no ledger
     /// (the trait default), `Some(Err)` = the read faults; test hooks `serve_evictions`, `record_eviction`,
     /// `fault_evictions`.
-    evictions: std::sync::Mutex<Option<Result<std::collections::HashMap<String, EvictionLedgerEntry>, ()>>>,
+    evictions: std::sync::Mutex<
+        Option<Result<std::collections::HashMap<String, EvictionLedgerEntry>, ()>>,
+    >,
     /// The persisted walk states (`reorg_sweep_state`).
     sweep_states:
         std::sync::Mutex<std::collections::HashMap<String, crate::pot::reorg::SweepState>>,
@@ -1155,7 +1160,13 @@ impl MemoryPotStorage {
             *g = Some(Ok(Default::default()));
         }
         if let Some(Ok(m)) = g.as_mut() {
-            m.insert(txid.to_ascii_lowercase(), EvictionLedgerEntry { evicted_at, readmitted_at });
+            m.insert(
+                txid.to_ascii_lowercase(),
+                EvictionLedgerEntry {
+                    evicted_at,
+                    readmitted_at,
+                },
+            );
         }
     }
 
@@ -1277,8 +1288,15 @@ impl PotStorage for MemoryPotStorage {
     ) -> Result<Option<Vec<Option<EvictionLedgerEntry>>>, PotStorageError> {
         match &*self.evictions.lock().unwrap() {
             None => Ok(None),
-            Some(Err(())) => Err(PotStorageError::Other("eviction ledger read faulted (test hook)".into())),
-            Some(Ok(m)) => Ok(Some(txids.iter().map(|t| m.get(&t.to_ascii_lowercase()).copied()).collect())),
+            Some(Err(())) => Err(PotStorageError::Other(
+                "eviction ledger read faulted (test hook)".into(),
+            )),
+            Some(Ok(m)) => Ok(Some(
+                txids
+                    .iter()
+                    .map(|t| m.get(&t.to_ascii_lowercase()).copied())
+                    .collect(),
+            )),
         }
     }
 
