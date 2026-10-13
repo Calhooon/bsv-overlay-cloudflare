@@ -154,6 +154,19 @@ pub fn sender_pubkey_hex(server_private_key_hex: &str) -> Option<String> {
 /// relay's first-party `POST /push` (bearer `BROADCAST_TOKEN`; stored,
 /// live-bridged, acknowledged by the client, replayed on reload). Best-effort.
 pub async fn first_party_push(env: &Env, recipient: &str, body: Value) -> crate::pot_hook::Delivery {
+    first_party_push_with_id(env, recipient, None, body).await
+}
+
+/// [`first_party_push`] under a caller-supplied relay `messageId` (E649 L4 N2: the pot hook's
+/// `pot_hook::seat_message_id`, one per intent). The relay keeps a flat body's `messageId` (`rust-message-box`
+/// 0.4.6 `split_push_body`), stores it once (`messages.message_id` UNIQUE, `INSERT OR IGNORE`) and answers a repeat
+/// `400 ERR_DUPLICATE_MESSAGE`: [`push_answer`] reads that as delivered. With `None` the relay mints its own id.
+pub async fn first_party_push_with_id(
+    env: &Env,
+    recipient: &str,
+    message_id: Option<&str>,
+    body: Value,
+) -> crate::pot_hook::Delivery {
     use crate::pot_hook::Delivery;
     let (Ok(relay), Ok(token), Ok(sk)) = (
         env.var("RELAY_URL").map(|v| v.to_string()),
@@ -167,19 +180,24 @@ pub async fn first_party_push(env: &Env, recipient: &str, body: Value) -> crate:
         console_log!("[push] SERVER_PRIVATE_KEY does not derive a pubkey — event dropped");
         return Delivery::NotConfigured;
     };
-    let payload = json!({
+    let mut payload = json!({
         "sender": sender,
         "recipient": recipient.to_ascii_lowercase(),
         "messageBox": "low_events",
         "body": body,
-    })
-    .to_string();
-    match relay_post(env, &relay, "/push", &token, payload).await {
+    });
+    if let Some(id) = message_id {
+        payload["messageId"] = json!(id);
+    }
+    match relay_post(env, &relay, "/push", &token, payload.to_string()).await {
         Ok(r) if (200..300).contains(&r.status_code()) => Delivery::Sent,
         Ok(mut r) => {
             let status = r.status_code();
             let server = r.headers().get("server").ok().flatten().unwrap_or_default();
             let body = r.text().await.unwrap_or_default();
+            if push_answer(status, &body) == Delivery::Sent {
+                return Delivery::Sent;
+            }
             console_log!(
                 "[push] → {}… HTTP {status} (server={server}) {}",
                 &recipient[..12.min(recipient.len())],
@@ -194,6 +212,25 @@ pub async fn first_party_push(env: &Env, recipient: &str, body: Value) -> crate:
             );
             Delivery::Failed
         }
+    }
+}
+
+/// What a relay `/push` answer means: 2xx is delivered, and so is `400 ERR_DUPLICATE_MESSAGE` (E649 L4 N2: the
+/// relay already holds that `messageId`, an earlier send of the same intent landed); anything else failed.
+pub fn push_answer(status: u16, body: &str) -> crate::pot_hook::Delivery {
+    use crate::pot_hook::Delivery;
+    if (200..300).contains(&status) {
+        return Delivery::Sent;
+    }
+    let duplicate = status == 400
+        && serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|v| v.get("code").and_then(Value::as_str).map(str::to_string))
+            .is_some_and(|c| c == "ERR_DUPLICATE_MESSAGE");
+    if duplicate {
+        Delivery::Sent
+    } else {
+        Delivery::Failed
     }
 }
 

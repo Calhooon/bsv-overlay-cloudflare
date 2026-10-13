@@ -2375,14 +2375,14 @@ pub(crate) async fn internal_pot_changed(
         "[pot-changed] answered in {ms} ms, announce detached ({} outpoints)",
         outcome.plan.outpoints.len()
     );
-    // H1: a body whose wake-ups could not be parked is not acknowledged: 503 keeps it on the producer's retry path
-    // (the detached announce still runs; with no row parked it settles nothing).
+    // H1: a body whose wake-ups could not be parked is not acknowledged: 503 keeps it on the producer's retry path.
+    // N2: nothing of that body was announced (the retry announces once).
     let (status, ok) = match &outcome.stale_fault {
         None => (200, true),
         Some(_) => (503, false),
     };
     let mut resp = json_response(
-        serde_json::json!({ "ok": ok, "filed": outcome.filed, "skipped": outcome.skipped, "dropped": dropped, "announce": "detached", "parked": outcome.parked, "retryable": !ok })
+        serde_json::json!({ "ok": ok, "filed": outcome.filed, "skipped": outcome.skipped, "dropped": dropped, "announce": if ok { "detached" } else { "none" }, "parked": outcome.parked, "retryable": !ok })
             .to_string(),
         status,
     )?;

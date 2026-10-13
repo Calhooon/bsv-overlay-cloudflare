@@ -10,7 +10,8 @@
 //! a body is PARKED in D1 in the hook's one write batch before the answer (the review's H1); [`announce_and_report`]
 //! runs DETACHED (`ctx.wait_until`) under one wall ([`ANNOUNCE_WALL_MS`]), counted, and settles the park (a
 //! delivered wake-up out, an undelivered one retried at its token); [`drain_parked`] (the scheduled tick, and
-//! `POST /internal/pot-announce-drain`) delivers what is left. A wake-up reaches its seat within the wall, or within one scheduled pass after its retry is due.
+//! `POST /internal/pot-announce-drain`) delivers what is left. A batch that faulted announces nothing (the
+//! 503 alone, N2). A wake-up reaches its seat within the wall, or within one scheduled pass after its retry is due.
 //! The owed recompute stays where #469 and #648 put it: after the answer, coalesced and shed per identity, not
 //! parked.
 //!
@@ -609,7 +610,23 @@ fn seats_of(
 #[allow(async_fn_in_trait)]
 pub trait RelayPort {
     async fn broadcast(&self, room: &'static str, body: Value) -> Delivery;
-    async fn push(&self, recipient: &str, body: Value) -> Delivery;
+    /// One `pot` event into `recipient`'s box, under the relay message id `message_id` ([`seat_message_id`]).
+    async fn push(&self, recipient: &str, message_id: &str, body: Value) -> Delivery;
+}
+
+/// N2: the relay message id of one seat's `pot` event: the sha256 hex (64, the relay's stored-id shape) of the
+/// outpoint, the recipient (lowercase) and the park's TOKEN (`g<generation>`; a wake-up whose park wrote no row
+/// has none and takes `a<at_ms>`, the event's own stamp). One intent's every send (the detached announce, each
+/// drain retry) carries one id, and the relay (`rust-message-box` 0.4.6, `split_push_body`: a flat `/push` body's
+/// `messageId` is kept; `messages.message_id` is UNIQUE and stored `INSERT OR IGNORE`) files it once and answers a
+/// repeat `400 ERR_DUPLICATE_MESSAGE`, which [`crate::internal_events::push_answer`] reads as delivered.
+pub fn seat_message_id(txid: &str, vout: u32, recipient: &str, token: &str) -> String {
+    let key = format!(
+        "low_events/pot|{}:{vout}|{}|{token}",
+        txid.to_ascii_lowercase(),
+        recipient.to_ascii_lowercase()
+    );
+    hex::encode(bsv_rs::primitives::hash::sha256(key.as_bytes()))
 }
 
 /// What the detached work of one body is: the outpoints to announce in the pots room, and the seats to tell.
@@ -672,7 +689,8 @@ pub struct PotChangedOutcome {
     pub skipped: Vec<Value>,
     pub owed_identities: Vec<String>,
     pub stale_marks: Vec<(String, &'static str)>,
-    /// The hook's write batch (the stale marks and the parks) faulted: nothing of it landed, and the answer says so.
+    /// The hook's write batch (the stale marks and the parks) faulted: nothing of it landed, NOTHING is announced
+    /// (N2), and the answer says so (503, retryable).
     pub stale_fault: Option<String>,
     /// Wake-ups parked durably before the answer: the rows the park WROTE (N1, `RETURNING`).
     pub parked: usize,
@@ -827,7 +845,7 @@ impl AnnounceTally {
     }
 }
 
-/// One relay call: a room's broadcast, or a seat's `pot` event.
+/// One relay call: a room's broadcast, or a seat's `pot` event under its [`seat_message_id`].
 async fn send_one<R: RelayPort>(relay: &R, s: &Call) -> Delivery {
     let w = &s.wake;
     match &w.recipient {
@@ -838,9 +856,15 @@ async fn send_one<R: RelayPort>(relay: &R, s: &Call) -> Delivery {
                 .await
         }
         Some(id) => {
+            let token = match s.generation {
+                Some(g) => format!("g{g}"),
+                None => format!("a{}", s.at_ms),
+            };
             let body =
                 crate::internal_events::pot_event_body(&w.txid, w.vout, carrier_entry(), s.at_ms);
-            relay.push(id, body).await
+            relay
+                .push(id, &seat_message_id(&w.txid, w.vout, id, &token), body)
+                .await
         }
     }
 }
@@ -900,8 +924,14 @@ impl RelayPort for WorkerRelay {
     async fn broadcast(&self, room: &'static str, body: Value) -> Delivery {
         crate::internal_events::push_broadcast(&self.env, room, body).await
     }
-    async fn push(&self, recipient: &str, body: Value) -> Delivery {
-        crate::internal_events::first_party_push(&self.env, recipient, body).await
+    async fn push(&self, recipient: &str, message_id: &str, body: Value) -> Delivery {
+        crate::internal_events::first_party_push_with_id(
+            &self.env,
+            recipient,
+            Some(message_id),
+            body,
+        )
+        .await
     }
 }
 
@@ -1099,10 +1129,11 @@ pub async fn drain_parked<S: HookStore, R: RelayPort, W: Future<Output = ()>>(
     t
 }
 
-/// THE POT HOOK, after its bearer and its parse: the decision over the store ([`apply_pot_changed`]), then the
-/// announce handed to `detach` (never awaited here), then the outcome the answer is built from. The worker's
-/// `routes::internal_pot_changed` calls it with `HookD1` over D1, the `RELAY` binding and `ctx.wait_until`; the
-/// pins call it with the same store over SQLite and a recording `detach`.
+/// THE POT HOOK, after its bearer and its parse: the decision over the store ([`apply_pot_changed`]), then, ONLY when
+/// its write batch committed, the announce handed to `detach` (never awaited here), then the outcome the answer is
+/// built from. N2: a batch that faulted announces NOTHING (the answer is 503 and the producer's retry announces once).
+/// The worker's `routes::internal_pot_changed` calls it with `HookD1` over D1, the `RELAY` binding and
+/// `ctx.wait_until`; the pins call it with the same store over SQLite and a recording `detach`.
 pub async fn serve_pot_changed<S, R, W>(
     store: std::rc::Rc<S>,
     relay: std::rc::Rc<R>,
@@ -1117,10 +1148,12 @@ where
     W: Future<Output = ()> + 'static,
 {
     let outcome = apply_pot_changed(&*store, outpoints, at_ms).await;
-    let plan = outcome.plan.clone();
-    detach(Box::pin(async move {
-        announce_and_report(&*store, &*relay, &plan, wall).await;
-    }));
+    if outcome.stale_fault.is_none() {
+        let plan = outcome.plan.clone();
+        detach(Box::pin(async move {
+            announce_and_report(&*store, &*relay, &plan, wall).await;
+        }));
+    }
     outcome
 }
 
@@ -1347,10 +1380,27 @@ pub(crate) mod tests {
         pub hung: Vec<String>,
         pub started: Cell<u32>,
         pub delivered: RefCell<Vec<(String, String, Instant)>>,
+        /// Every call: (to, the seat's message id, the body).
+        pub bodies: RefCell<Vec<(String, Option<String>, Value)>>,
+        /// Recipients whose next push fails (once each).
+        pub fail_once: RefCell<Vec<String>>,
     }
     impl Relay {
-        async fn call(&self, to: String, body: Value) -> Delivery {
+        async fn call(&self, to: String, message_id: Option<&str>, body: Value) -> Delivery {
             self.started.set(self.started.get() + 1);
+            self.bodies.borrow_mut().push((
+                to.clone(),
+                message_id.map(str::to_string),
+                body.clone(),
+            ));
+            let failing = {
+                let mut f = self.fail_once.borrow_mut();
+                let hit = f.iter().position(|r| *r == to);
+                hit.map(|i| f.remove(i)).is_some()
+            };
+            if failing {
+                return Delivery::Failed;
+            }
             let txid = body["potOutpoint"]["txid"]
                 .as_str()
                 .or(body["outpoint"]["txid"].as_str())
@@ -1370,10 +1420,11 @@ pub(crate) mod tests {
     }
     impl RelayPort for Relay {
         async fn broadcast(&self, room: &'static str, body: Value) -> Delivery {
-            self.call(room.to_string(), body).await
+            self.call(room.to_string(), None, body).await
         }
-        async fn push(&self, recipient: &str, body: Value) -> Delivery {
-            self.call(recipient.to_string(), body).await
+        async fn push(&self, recipient: &str, message_id: &str, body: Value) -> Delivery {
+            self.call(recipient.to_string(), Some(message_id), body)
+                .await
         }
     }
 
@@ -1729,7 +1780,7 @@ pub(crate) mod tests {
             tokio::time::sleep(self.delay).await;
             self.answer
         }
-        async fn push(&self, _recipient: &str, _body: Value) -> Delivery {
+        async fn push(&self, _recipient: &str, _message_id: &str, _body: Value) -> Delivery {
             tokio::time::sleep(self.delay).await;
             self.answer
         }
@@ -1922,6 +1973,29 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// N decoded pots, two verified (latched) seats each, every seat holding an owed-state row: 8 of them are the
+    /// body of 8 rooms and 16 seats, the review's 24 calls.
+    fn decoded_fixture(n: u32) -> (SqliteSql, Vec<(String, u32)>) {
+        let db = SqliteSql::migrated();
+        for i in 0..n {
+            let (txid, _) = pot(i);
+            let (a, b) = (seat(2, i), seat(3, i));
+            db.conn.execute_batch(&format!(
+                "INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind, paramsDecoded, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, stakeA, stakeB, feeSats, recoveryHeight, potSats) \
+                 VALUES ('{txid}', 0, 0, 1, 'covenant', 1, '{a}', '{b}', '{A}', '{}', '{}', '{}', 1, 1, 1, 958846, 2)",
+                "11".repeat(20), "22".repeat(20), "33".repeat(20)
+            )).unwrap();
+            for (k, (me, them)) in [(&a, &b), (&b, &a)].into_iter().enumerate() {
+                db.conn.execute_batch(&format!(
+                    "INSERT INTO potparty_records (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, sigHex, txid, outputIndex, createdAt, seatSettlePubkey, seatSigHex, sigValid) \
+                     VALUES ('{me}', '{them}', 'g{i}', '{txid}', 0, 958846, '3045ab', 'd{k}{i:062x}', 0, 1, '{me}', '00', 1); \
+                     INSERT INTO owed_state (identity, computedAtMs, tip, rows, stale, truncated) VALUES ('{me}', 1, 1, 0, 0, 0)"
+                )).unwrap();
+            }
+        }
+        (db, (0..n).map(pot).collect())
+    }
+
     /// (N1, the delta review) THE PARK'S TOKEN IS ORDERED AND NEVER REUSED. The review's shapes through the production
     /// handler over the shipped SQL: two hooks of the SAME body at the SAME millisecond (their old generation was the
     /// stamp times 1,000 plus a nonce; with one nonce the older settle deleted all 22 later parks, `left: 0 right:
@@ -2014,5 +2088,159 @@ pub(crate) mod tests {
             "the drain delivers the later intents"
         );
         assert_eq!(parked_count(&store.sql), 0);
+    }
+
+    fn seat_sends(relay: &Relay) -> Vec<(String, Option<String>, Value)> {
+        relay
+            .bodies
+            .borrow()
+            .iter()
+            .filter(|(to, _, _)| to != crate::internal_events::POTS_ROOM)
+            .cloned()
+            .collect()
+    }
+
+    /// (N2, the delta review) A FAILED WRITE BATCH ANNOUNCES NOTHING, AND ONE INTENT HAS ONE RELAY ID. The review's
+    /// reproduction through the production handler: the first park batch rejected (a trigger refuses the last room
+    /// park after the earlier statements ran), its relay calls let succeed, the fault removed, the same eight
+    /// outpoints sent again. On `24bbda1` the first hook still scheduled its announce: 28 seat sends and 16 room
+    /// sends (`left: 28 right: 14`). Now the 503 hook hands nothing to `wait_until`, and the resend's announce is the
+    /// only one: 14 seat sends, 8 room sends. Each seat send carries `messageId` = `seat_message_id(.., "g<token>")`,
+    /// 64 hex; a seat send that fails is retried by the drain under the SAME id, so a relay that did file the first
+    /// one answers the repeat `ERR_DUPLICATE_MESSAGE`, which reads as delivered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e649f2_n2_a_failed_batch_announces_nothing_and_the_resend_once() {
+        let (db, ops) = mixed_fixture();
+        db.conn
+            .execute_batch(&format!(
+                "CREATE TRIGGER refuse_park BEFORE INSERT ON pot_announce_parked WHEN NEW.outpoint = '{MARKER_POT}:0' AND NEW.kind = 'room' BEGIN SELECT RAISE(ABORT, 'refused'); END"
+            ))
+            .unwrap();
+        let store = Rc::new(HookD1 { sql: db });
+        let relay = Rc::new(Relay::default());
+        let rec = Recorded::default();
+        let wall = || tokio::time::sleep(Duration::from_secs(5));
+        let o1 = serve_pot_changed(
+            store.clone(),
+            relay.clone(),
+            wall(),
+            &|f| rec.0.borrow_mut().push(f),
+            &ops,
+            7,
+        )
+        .await;
+        assert!(o1.stale_fault.is_some(), "the batch faulted");
+        assert_eq!(
+            (o1.parked, parked_count(&store.sql)),
+            (0, 0),
+            "nothing of it landed"
+        );
+        assert_eq!(
+            rec.0.borrow().len(),
+            0,
+            "a failed batch hands no announce to wait_until"
+        );
+        rec.run_all().await;
+        store
+            .sql
+            .conn
+            .execute_batch("DROP TRIGGER refuse_park")
+            .unwrap();
+        let o2 = serve_pot_changed(
+            store.clone(),
+            relay.clone(),
+            wall(),
+            &|f| rec.0.borrow_mut().push(f),
+            &ops,
+            8,
+        )
+        .await;
+        assert_eq!((o2.stale_fault.clone(), o2.parked), (None, 22));
+        rec.run_all().await;
+        let (all, room) = {
+            let d = relay.delivered.borrow();
+            let room = d
+                .iter()
+                .filter(|(to, _, _)| to == crate::internal_events::POTS_ROOM)
+                .count();
+            (d.len(), room)
+        };
+        assert_eq!(all - room, 14, "seat sends");
+        assert_eq!(room, 8, "room sends");
+        let wakes = o2.plan.wakes();
+        for (to, id, body) in seat_sends(&relay) {
+            let i = wakes
+                .iter()
+                .position(|w| {
+                    w.recipient.as_deref() == Some(to.as_str())
+                        && body["potOutpoint"]["txid"] == w.txid
+                })
+                .expect("a planned seat");
+            let g = o2.plan.generations[i].expect("parked");
+            let id = id.expect("a seat send carries its messageId");
+            assert_eq!(
+                id,
+                seat_message_id(&wakes[i].txid, wakes[i].vout, &to, &format!("g{g}"))
+            );
+            assert!(
+                id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{id}"
+            );
+        }
+        // the drain's retry of one intent carries the id of its first send
+        let (db, ops) = decoded_fixture(1);
+        let store = Rc::new(HookD1 { sql: db });
+        let relay = Rc::new(Relay::default());
+        relay.fail_once.borrow_mut().push(seat(2, 0));
+        let rec = Recorded::default();
+        let at = store.sql.now.get();
+        serve_pot_changed(
+            store.clone(),
+            relay.clone(),
+            wall(),
+            &|f| rec.0.borrow_mut().push(f),
+            &ops,
+            at,
+        )
+        .await;
+        rec.run_all().await;
+        store.sql.now.set(at + PARK_GRACE_MS + PARK_RETRY_BASE_MS);
+        let t = drain_parked(&*store, &*relay, wall()).await;
+        assert_eq!((t.due, t.drained), (1, 1));
+        let ids: Vec<Option<String>> = seat_sends(&relay)
+            .into_iter()
+            .filter(|(to, _, _)| *to == seat(2, 0))
+            .map(|(_, id, _)| id)
+            .collect();
+        assert_eq!(ids.len(), 2, "the failed send and the drain's retry");
+        assert_eq!(ids[0], ids[1], "one intent, one relay id");
+        // the relay's answer to a repeated id is delivered; any other refusal is not
+        use crate::internal_events::push_answer;
+        assert_eq!(push_answer(201, ""), Delivery::Sent);
+        assert_eq!(
+            push_answer(
+                400,
+                r#"{"status":"error","code":"ERR_DUPLICATE_MESSAGE","description":"Duplicate message."}"#
+            ),
+            Delivery::Sent
+        );
+        assert_eq!(
+            push_answer(400, r#"{"status":"error","code":"ERR_INVALID_MESSAGEID"}"#),
+            Delivery::Failed
+        );
+        assert_eq!(push_answer(503, "ERR_DUPLICATE_MESSAGE"), Delivery::Failed);
+        // the worker's push sends the id flat, where the relay's `split_push_body` keeps it
+        let ie = squash(&code_only(include_str!("internal_events.rs")));
+        assert!(
+            ie.contains(&squash("payload[\"messageId\"] = json!(id);")),
+            "the payload carries messageId"
+        );
+        assert!(ie.contains(&squash("if push_answer(status, &body) == Delivery::Sent {")));
+        let src = squash(&code_only(include_str!("pot_hook.rs")));
+        let serve = &src[src.find("pubasyncfnserve_pot_changed<").unwrap()..];
+        assert!(
+            serve.contains(&squash("if outcome.stale_fault.is_none() {")),
+            "the announce is scheduled only on a committed batch"
+        );
     }
 }
