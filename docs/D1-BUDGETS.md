@@ -67,12 +67,14 @@ that starts writing reds); statements measured + 2 (a loop that reads per row ov
 | submit-admit-1 | `/submit`, an operator `historical-tx-no-spv` submit admitting one tm_collected output | 0 / 13 / 7 | 4 / 15 / 9 |
 
 | record-potparty-filing | `/record?kind=potparty`, signed stranger naming A's live pot | 11 / 7 / 6 | 17 / 9 / 8 |
-| pot-changed-hook-1 | `/internal/pot-changed`, B's pot (no decoded params, two marker-named seats) | 138 / 4 / 8 | 207 / 6 / 10 |
-| pot-changed-hook-decoded-8 | `/internal/pot-changed`, A's 8 decoded pots, one latched seat each | 265 / 49 / 26 | 398 / 51 / 28 |
-| pot-changed-hook-marker | `/internal/pot-changed`, the undecoded pot whose markers name 5 identities | 154 / 9 / 11 | 231 / 11 / 13 |
-| pot-changed-hook-8x19 | `/internal/pot-changed`, 7 decoded pots (2 seats each) + the marker pot, 19 identities with owed-state rows | 337 / 72 / 40 | 506 / 74 / 42 |
+| pot-changed-hook-1 | `/internal/pot-changed`, B's pot (no decoded params, two marker-named seats) | 143 / 4 / 10 | 207 / 6 / 10 |
+| pot-changed-hook-decoded-8 | `/internal/pot-changed`, A's 8 decoded pots, one latched seat each | 270 / 49 / 28 | 398 / 51 / 28 |
+| pot-changed-hook-marker | `/internal/pot-changed`, the undecoded pot whose markers name 5 identities | 159 / 9 / 13 | 231 / 11 / 13 |
+| pot-changed-hook-8x19 | `/internal/pot-changed`, 7 decoded pots (2 seats each) + the marker pot, 19 identities with owed-state rows | 342 / 72 / 42 | 506 / 74 / 42 |
 | pot-announce-drain-backlog | `/internal/pot-announce-drain`, the first pass over a backlog of 120 due and 6 exhausted parked wake-ups (four rounds of 24) | 220 / 105 / 104 | 330 / 107 / 106 |
 | pot-announce-drain | `/internal/pot-announce-drain`, the second pass over the 24 due left (two rounds, the second reads none) | 55 / 25 / 29 | 110 / 35 / 31 |
+| pot-changed-hook-full-refused | `/internal/pot-changed`, 8 new rooms at a full table of 2,048 live rows none may displace: refused whole, 503 (the failed batch's own reads are not reported) | 16 / 2 / 33 | 24 / 4 / 35 |
+| pot-changed-hook-full-room | `/internal/pot-changed`, the same 8 rooms once 8 rows are exhausted: the room made of them (two full-table scans, largest 2,097 rows) | 4206 / 35 / 44 | 6309 / 37 / 46 |
 
 E649 L4 (2026-10-13, lane E649-HOOK): the pot hook's own answer is held to a ceiling (it had none: leg 4 checked
 only that it carried a `d1` segment). Measured with `D1_BUDGET_MEASURE=1 make ci-d1-budget` on the fixture D1:
@@ -111,8 +113,11 @@ row alone under the ceiling; over it, at most the excess (one body's 24) of the 
 too few it faults the batch (D1 rolls it back; the hook answers 503). The ROOM-MAKING delete has a limit of 0 under
 the ceiling; over it, it deletes the excess, the oldest exhausted rows first, then the oldest live rows that failed
 at least 3 deliveries, each named LOST. So every hook batch with a park is two statements more than fold-2, the
-same one scan: hook-1 10, decoded-8 28, marker 13, 8x19 42 statements, each at its ceiling. Not measured here: a
-batch at a FULL table (its guard and delete over the rows that may make room, an ORDER BY over them).
+same one scan: hook-1 10, decoded-8 28, marker 13, 8x19 42 statements, each at its ceiling. At a FULL table
+(`pot-changed-hook-full-*`): a body with no room to make is refused whole (503; D1 reports no figures for the failed
+batch, so its own scan of up to 2,056 rows is not in the ledger), and a body whose room is made of exhausted rows
+reads 4,206 rows (the counter's count and the delete's ORDER BY over the rows that may make room, each about the
+table). Both are the ceiling's cost only: under it the guard reads the counter row and the delete's limit is 0.
 
 NS2 fold (2026-10-12): the real signed filing is measured under `/record`, including the pot stale mark and the
 filer mark. SHED-M1 removes the three indexed party enumeration reads entirely; named parties do no work until
