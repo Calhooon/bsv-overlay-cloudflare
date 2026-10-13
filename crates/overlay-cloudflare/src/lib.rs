@@ -463,6 +463,9 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
         (Method::Post, "/internal/beef-blob-sweep") => {
             crate::beef_blob_sweep::internal_sweep(req, &env).await
         }
+        // bsv-low #649 N3: one step of the parked set's shipped code on demand (bearer INTERNAL_TOKEN), so the
+        // D1 budget tier measures it on a populated table.
+        (Method::Post, "/internal/change-park") => crate::change_park::internal_lever(req, &env).await,
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
 
