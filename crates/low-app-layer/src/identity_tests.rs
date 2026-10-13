@@ -45,17 +45,27 @@ struct FakeResolver {
 impl FakeResolver {
     fn with_batch(body: &str, keys: &str) -> Self {
         let r = FakeResolver::default();
-        r.serve(&format!("{RESOLVER_BATCH_PATH}?ik={keys}"), 200, body.as_bytes());
+        r.serve(
+            &format!("{RESOLVER_BATCH_PATH}?ik={keys}"),
+            200,
+            body.as_bytes(),
+        );
         r
     }
 
     fn serve(&self, path: &str, status: u16, body: &[u8]) {
-        self.routes.borrow_mut().insert(path.to_string(), (status, body.to_vec()));
+        self.routes
+            .borrow_mut()
+            .insert(path.to_string(), (status, body.to_vec()));
     }
 }
 
 impl Resolver for FakeResolver {
-    async fn get(&self, path: &str, max_bytes: usize) -> std::result::Result<Upstream, UpstreamError> {
+    async fn get(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> std::result::Result<Upstream, UpstreamError> {
         self.calls.borrow_mut().push(path.to_string());
         if let Some(e) = self.fault.take() {
             return Err(e);
@@ -84,7 +94,10 @@ struct FakeKill {
 }
 
 impl KillList for FakeKill {
-    async fn killed_among(&self, hashes: &[String]) -> std::result::Result<HashSet<String>, String> {
+    async fn killed_among(
+        &self,
+        hashes: &[String],
+    ) -> std::result::Result<HashSet<String>, String> {
         // The KV adapter's chunking, counted as the store sees it.
         for chunk in hashes.chunks(KILL_BULK_CHUNK) {
             self.reads.borrow_mut().push(chunk.len());
@@ -92,7 +105,11 @@ impl KillList for FakeKill {
         if self.broken.get() {
             return Err("kv down".to_string());
         }
-        Ok(hashes.iter().filter(|h| self.set.borrow().contains(*h)).cloned().collect())
+        Ok(hashes
+            .iter()
+            .filter(|h| self.set.borrow().contains(*h))
+            .cloned()
+            .collect())
     }
     async fn kill(&self, hash: &str, _reason: &str, _now: i64) -> std::result::Result<(), String> {
         if self.broken.get() {
@@ -149,11 +166,41 @@ fn expected_display(key: &str) -> serde_json::Value {
     };
     let none = serde_json::json!({"name": null, "nameDisplay": null, "imageHash": null, "pictureUrl": null, "since": null});
     match key {
-        ALICE => pick("alpha", "alpha", ALICE_PIC, 900007.into(), "bce006a0ca96065a851e12b2eac7d7ce6cc26ec2ad00fcae850d65ce5e1b7bdd"),
-        BOB => pick("bob", "bob", BOB_PIC, 900017.into(), "774c1435e50476a7b07cbab062f0d33635bae30f65942ba02b5e194653cd74be"),
-        CAROL => pick("carol", "carol", "6cc97d417a349ae9375a4d13948d347ee6627354ec866f41d1676363170f5ceb", serde_json::Value::Null, "0554ae9833bf69637dc8d1c0693e5edd2946e75e546b87caf90ae168643885ef"),
-        DAVE => pick("d4ve", "D4ve", "d8f11aff599bd918329a74c7605ed997735bc435d7e6d8d538c9c2daa5a33246", 900011.into(), "5375126d4f4a0d7ca5ee8d0f70216075d6f7c6a6a2adc67c1ab15dd15d62b1db"),
-        ERIN => pick("erin", "erin", "a144b55fc113b93b9f59f674bb0b557cba6a0f4cb4fb6f68f51e3227419fc6bd", 900013.into(), "a823c341718b6c3cc738620c28897f1639f2fe779c09e4663c208d3dbce64554"),
+        ALICE => pick(
+            "alpha",
+            "alpha",
+            ALICE_PIC,
+            900007.into(),
+            "bce006a0ca96065a851e12b2eac7d7ce6cc26ec2ad00fcae850d65ce5e1b7bdd",
+        ),
+        BOB => pick(
+            "bob",
+            "bob",
+            BOB_PIC,
+            900017.into(),
+            "774c1435e50476a7b07cbab062f0d33635bae30f65942ba02b5e194653cd74be",
+        ),
+        CAROL => pick(
+            "carol",
+            "carol",
+            "6cc97d417a349ae9375a4d13948d347ee6627354ec866f41d1676363170f5ceb",
+            serde_json::Value::Null,
+            "0554ae9833bf69637dc8d1c0693e5edd2946e75e546b87caf90ae168643885ef",
+        ),
+        DAVE => pick(
+            "d4ve",
+            "D4ve",
+            "d8f11aff599bd918329a74c7605ed997735bc435d7e6d8d538c9c2daa5a33246",
+            900011.into(),
+            "5375126d4f4a0d7ca5ee8d0f70216075d6f7c6a6a2adc67c1ab15dd15d62b1db",
+        ),
+        ERIN => pick(
+            "erin",
+            "erin",
+            "a144b55fc113b93b9f59f674bb0b557cba6a0f4cb4fb6f68f51e3227419fc6bd",
+            900013.into(),
+            "a823c341718b6c3cc738620c28897f1639f2fe779c09e4663c208d3dbce64554",
+        ),
         _ => none,
     }
 }
@@ -184,7 +231,11 @@ async fn the_resolver_answer_maps_to_the_contract_shape() {
         let entry = ids[&key].as_object().unwrap();
         let mut fields: Vec<&str> = entry.keys().map(String::as_str).collect();
         fields.sort_unstable();
-        assert_eq!(fields, vec!["display", "names", "pictures", "preference", "userNumber"], "{key}");
+        assert_eq!(
+            fields,
+            vec!["display", "names", "pictures", "preference", "userNumber"],
+            "{key}"
+        );
         for f in ["userNumber", "names", "pictures", "preference"] {
             let raw = fixture_raw(&key, f);
             assert!(
@@ -193,9 +244,18 @@ async fn the_resolver_answer_maps_to_the_contract_shape() {
             );
         }
         assert_eq!(entry["display"], expected_display(&key), "{key}");
-        let mut shape: Vec<&str> = entry["display"].as_object().unwrap().keys().map(String::as_str).collect();
+        let mut shape: Vec<&str> = entry["display"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         shape.sort_unstable();
-        assert_eq!(shape, vec!["imageHash", "name", "nameDisplay", "pictureUrl", "since"], "no ownerCanonical, no userNumber");
+        assert_eq!(
+            shape,
+            vec!["imageHash", "name", "nameDisplay", "pictureUrl", "since"],
+            "no ownerCanonical, no userNumber"
+        );
     }
     // The wire order of an entry is the contract's.
     assert!(text.contains(&format!("\"{NOBODY}\":{{\"userNumber\":null,\"names\":[],\"pictures\":[],\"preference\":{{\"name\":null,\"picture\":null}},\"display\":{{\"name\":null,\"nameDisplay\":null,\"imageHash\":null,\"pictureUrl\":null,\"since\":null}}}}")));
@@ -208,10 +268,18 @@ async fn the_contract_entries_map_to_the_contract_shape() {
     const BOB_ENTRY: &str = r#""027670d1cbc190bc530ebde2669e76e7ab3c23b3ac0add9aa0902170d1280bddb4":{"userNumber":2,"names":[{"name":"bob","ownerSigner":"02fc785fd6af28caf61274612a25e37c33270266fc371f80f5c946e4ee3861e713","ownerIdentity":"027670d1cbc190bc530ebde2669e76e7ab3c23b3ac0add9aa0902170d1280bddb4","minterIdentity":"027670d1cbc190bc530ebde2669e76e7ab3c23b3ac0add9aa0902170d1280bddb4","ownerCanonical":true,"minterCanonical":true,"salePrice":0,"listed":false,"headTxid":"774c1435e50476a7b07cbab062f0d33635bae30f65942ba02b5e194653cd74be","height":900017,"consented":true,"lastOp":"mint","display":"bob"},{"name":"gift_name","ownerSigner":"02fc785fd6af28caf61274612a25e37c33270266fc371f80f5c946e4ee3861e713","ownerIdentity":"027670d1cbc190bc530ebde2669e76e7ab3c23b3ac0add9aa0902170d1280bddb4","minterIdentity":"0222ca50390e660f601036dd7502bb973bdcd104b5dcb8f2e74de8edc6c292b03a","ownerCanonical":true,"minterCanonical":true,"salePrice":0,"listed":false,"headTxid":"032c0f5b9a7437275086185ce366303aa0a34eb86450a3e8f14c7129c0e21525","height":900016,"consented":false,"lastOp":"transfer","display":"gift_name"}],"pictures":[{"imageHash":"749be7996a7c91dc4f501be1e1fc23800440b5127614266253c65d25bdead80f","ownerSigner":"02fc785fd6af28caf61274612a25e37c33270266fc371f80f5c946e4ee3861e713","ownerIdentity":"027670d1cbc190bc530ebde2669e76e7ab3c23b3ac0add9aa0902170d1280bddb4","minterIdentity":"0222ca50390e660f601036dd7502bb973bdcd104b5dcb8f2e74de8edc6c292b03a","ownerCanonical":true,"minterCanonical":true,"salePrice":0,"listed":false,"headTxid":"9fa1366e2aaa0d5a91f12d7c6189508d1aed97d62ff96ba26a5778273a31c7e0","height":900036,"consented":false,"lastOp":"transfer"},{"imageHash":"74c560ae2e6a8950103698605f7b9b451628285ab36f7b51aaa9d6582715e80c","ownerSigner":"02fc785fd6af28caf61274612a25e37c33270266fc371f80f5c946e4ee3861e713","ownerIdentity":"027670d1cbc190bc530ebde2669e76e7ab3c23b3ac0add9aa0902170d1280bddb4","minterIdentity":"0222ca50390e660f601036dd7502bb973bdcd104b5dcb8f2e74de8edc6c292b03a","ownerCanonical":true,"minterCanonical":true,"salePrice":0,"listed":false,"headTxid":"93f62b9fd769ffb4f98bd75b406f06cd12a1888b2e1dd70400859b03aeaa2a83","height":900035,"consented":true,"lastOp":"touch"},{"imageHash":"e1c0738479ca0d7b7509cf0bb016871680e49a02566e2c74316ddd04fe2992f2","ownerSigner":"02fc785fd6af28caf61274612a25e37c33270266fc371f80f5c946e4ee3861e713","ownerIdentity":"027670d1cbc190bc530ebde2669e76e7ab3c23b3ac0add9aa0902170d1280bddb4","minterIdentity":"027670d1cbc190bc530ebde2669e76e7ab3c23b3ac0add9aa0902170d1280bddb4","ownerCanonical":true,"minterCanonical":true,"salePrice":0,"listed":false,"headTxid":"db974bea2f83179207f8db8cf6b822c13b922cabd342cabdaeddd197d99c1088","height":900033,"consented":true,"lastOp":"mint"}],"preference":{"name":null,"picture":null},"display":{"userNumber":2,"name":"bob","nameDisplay":"bob","picture":"74c560ae2e6a8950103698605f7b9b451628285ab36f7b51aaa9d6582715e80c","ownerCanonical":true}}"#;
     const NOBODY_ENTRY: &str = r#""025710158d4bc87e484ac205f67ad5c8e4438e12afa09eed71bc28381ea8e358cd":{"userNumber":null,"names":[],"pictures":[],"preference":{"name":null,"picture":null},"display":{"userNumber":null,"name":null,"nameDisplay":null,"picture":null,"ownerCanonical":null}}"#;
     for entry in [BOB_ENTRY, NOBODY_ENTRY] {
-        assert!(DISPLAY_FIXTURE.contains(entry), "the CONTRACT.md entry is the captured body's bytes");
+        assert!(
+            DISPLAY_FIXTURE.contains(entry),
+            "the CONTRACT.md entry is the captured body's bytes"
+        );
     }
-    for (key, entry, user_number) in [(BOB, BOB_ENTRY, serde_json::json!(2)), (NOBODY, NOBODY_ENTRY, serde_json::Value::Null)] {
-        let body = format!("{{\"namespaceIds\":{{\"name\":null,\"picture\":null}},\"identities\":{{{entry}}}}}");
+    for (key, entry, user_number) in [
+        (BOB, BOB_ENTRY, serde_json::json!(2)),
+        (NOBODY, NOBODY_ENTRY, serde_json::Value::Null),
+    ] {
+        let body = format!(
+            "{{\"namespaceIds\":{{\"name\":null,\"picture\":null}},\"identities\":{{{entry}}}}}"
+        );
         let r = FakeResolver::with_batch(&body, key);
         let v = body_json(&single_answer(&r, &FakeKill::default(), key, ORIGIN).await);
         assert_eq!(v["userNumber"], user_number, "userNumber passed through");
@@ -225,16 +293,30 @@ async fn the_contract_entries_map_to_the_contract_shape() {
 #[tokio::test]
 async fn an_entry_without_display_is_all_null_never_derived() {
     let batch = parse_resolver_batch(FIXTURE.as_bytes(), &keys()).unwrap();
-    assert_eq!(batch.display_notes(), (8, 0), "eight entries without display");
+    assert_eq!(
+        batch.display_notes(),
+        (8, 0),
+        "eight entries without display"
+    );
     let before = health_json()["display"]["absent"].as_u64().unwrap();
     let r = FakeResolver::with_batch(FIXTURE, QUERY);
     let kill = FakeKill::default();
     let v = body_json(&batch_answer(&r, &kill, &keys(), ORIGIN).await);
     for key in keys() {
-        assert_eq!(v["identities"][&key]["display"], expected_display(NOBODY), "{key}");
-        assert_eq!(v["identities"][&key]["userNumber"].to_string(), raw_of(FIXTURE, &key, "userNumber"));
+        assert_eq!(
+            v["identities"][&key]["display"],
+            expected_display(NOBODY),
+            "{key}"
+        );
+        assert_eq!(
+            v["identities"][&key]["userNumber"].to_string(),
+            raw_of(FIXTURE, &key, "userNumber")
+        );
     }
-    assert!(kill.reads.borrow().is_empty(), "no pick, nothing to ask the kill list");
+    assert!(
+        kill.reads.borrow().is_empty(),
+        "no pick, nothing to ask the kill list"
+    );
     assert!(health_json()["display"]["absent"].as_u64().unwrap() >= before + 8);
 }
 
@@ -280,8 +362,20 @@ fn no_display_rule_lives_in_the_app_layer() {
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n");
-    for planted in ["consented", "ownerCanonical", "owner_canonical", ".sort", ".min_by(", ".max_by(", "listed", "preference ="] {
-        assert!(!code.contains(planted), "identity.rs must map the resolver's pick, never derive it ({planted})");
+    for planted in [
+        "consented",
+        "ownerCanonical",
+        "owner_canonical",
+        ".sort",
+        ".min_by(",
+        ".max_by(",
+        "listed",
+        "preference =",
+    ] {
+        assert!(
+            !code.contains(planted),
+            "identity.rs must map the resolver's pick, never derive it ({planted})"
+        );
     }
 }
 
@@ -310,18 +404,29 @@ async fn the_single_key_form() {
     assert_eq!(v["display"], expected_display(ALICE));
     let text = String::from_utf8(a.body).unwrap();
     assert!(text.contains(&format!("\"names\":{}", fixture_raw(ALICE, "names"))));
-    assert_eq!(*r.calls.borrow(), vec![format!("{RESOLVER_BATCH_PATH}?ik={ALICE}")]);
+    assert_eq!(
+        *r.calls.borrow(),
+        vec![format!("{RESOLVER_BATCH_PATH}?ik={ALICE}")]
+    );
 }
 
 #[test]
 fn the_key_list_parses_dedupes_and_caps() {
     let upper = ALICE.to_ascii_uppercase().replace("0X", "0x");
-    assert_eq!(parse_identity_keys(&format!("{ALICE},{upper},,")).unwrap(), vec![ALICE.to_string()]);
+    assert_eq!(
+        parse_identity_keys(&format!("{ALICE},{upper},,")).unwrap(),
+        vec![ALICE.to_string()]
+    );
     assert!(parse_identity_keys("").is_err());
     assert!(parse_identity_keys("04abc").is_err());
     let many: Vec<String> = (0..101).map(|i| format!("02{:064x}", i)).collect();
-    assert!(parse_identity_keys(&many.join(",")).unwrap_err().contains("max 100"));
-    assert_eq!(parse_identity_keys(&many[..100].join(",")).unwrap().len(), 100);
+    assert!(parse_identity_keys(&many.join(","))
+        .unwrap_err()
+        .contains("max 100"));
+    assert_eq!(
+        parse_identity_keys(&many[..100].join(",")).unwrap().len(),
+        100
+    );
 }
 
 #[tokio::test]
@@ -356,12 +461,16 @@ async fn a_png_passes_with_the_hardening_headers() {
     assert_eq!(a.header("Content-Type"), Some("image/png"));
     assert_eq!(a.header("X-Content-Type-Options"), Some("nosniff"));
     assert_eq!(a.header("Content-Security-Policy"), Some("sandbox"));
-    assert_eq!(a.header("Cache-Control"), Some("public, immutable, max-age=31536000"));
+    assert_eq!(
+        a.header("Cache-Control"),
+        Some("public, immutable, max-age=31536000")
+    );
 }
 
 #[tokio::test]
 async fn an_svg_with_a_png_extension_refuses() {
-    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>"#.to_vec();
+    let svg =
+        br#"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>"#.to_vec();
     let h = hash_of(&svg);
     let r = FakeResolver::default();
     r.serve(&format!("{RESOLVER_PICTURE_PATH}{h}"), 200, &svg);
@@ -387,25 +496,46 @@ async fn a_65_kb_png_refuses() {
     assert_eq!((a.status, a.outcome), (404, Outcome::Oversize));
     // Exactly 64 KB is inside the cap.
     let edge = png(PICTURE_MAX_BYTES);
-    assert_eq!(picture_gate(&hash_of(&edge), &edge), PictureGate::Serve("image/png"));
+    assert_eq!(
+        picture_gate(&hash_of(&edge), &edge),
+        PictureGate::Serve("image/png")
+    );
 }
 
 #[test]
 fn the_magic_bytes_decide_the_type() {
-    assert_eq!(sniff_image(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]), Some("image/jpeg"));
+    assert_eq!(
+        sniff_image(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]),
+        Some("image/jpeg")
+    );
     assert_eq!(sniff_image(b"GIF89a\x01\x00"), Some("image/gif"));
     assert_eq!(sniff_image(b"GIF87a\x01\x00"), Some("image/gif"));
-    assert_eq!(sniff_image(b"RIFF\x10\x00\x00\x00WEBPVP8 "), Some("image/webp"));
+    assert_eq!(
+        sniff_image(b"RIFF\x10\x00\x00\x00WEBPVP8 "),
+        Some("image/webp")
+    );
     assert_eq!(sniff_image(b"RIFF\x10\x00\x00\x00WAVEfmt "), None);
     assert_eq!(sniff_image(b"<?xml version=\"1.0\"?><svg/>"), None);
     assert_eq!(sniff_image(b"<!doctype html><html>"), None);
     // The 4-byte prefix IS the png rule, as Zanaadu's `sniff_image_kind` and the client's sniff (M29-3b fold lens LOW-1).
     assert_eq!(sniff_image(&[0x89, b'P', b'N', b'G']), Some("image/png"));
-    assert_eq!(sniff_image(b"GIF8"), Some("image/gif"), "GIF8 alone is the gif rule");
-    assert_eq!(sniff_image(&[0x89, b'P', b'N']), None, "three bytes are not a png");
+    assert_eq!(
+        sniff_image(b"GIF8"),
+        Some("image/gif"),
+        "GIF8 alone is the gif rule"
+    );
+    assert_eq!(
+        sniff_image(&[0x89, b'P', b'N']),
+        None,
+        "three bytes are not a png"
+    );
     // AVIF: Zanaadu's own header fixture, the one the client lane pins.
     assert_eq!(sniff_image(AVIF), Some("image/avif"));
-    assert_eq!(sniff_image(b"\x00\x00\x00\x1cftypheicmif1"), None, "an ftyp box, not avif");
+    assert_eq!(
+        sniff_image(b"\x00\x00\x00\x1cftypheicmif1"),
+        None,
+        "an ftyp box, not avif"
+    );
     assert_eq!(sniff_image(&AVIF[..11]), None);
     assert_eq!(sniff_image(b""), None);
 }
@@ -451,7 +581,10 @@ async fn every_picture_refusal_is_the_same_404() {
         assert_eq!(a.headers, missing.headers);
         assert_eq!(a.header("Cache-Control"), Some(NO_STORE));
     }
-    assert_eq!((missing.outcome, killed.outcome), (Outcome::NotFound, Outcome::Killed));
+    assert_eq!(
+        (missing.outcome, killed.outcome),
+        (Outcome::NotFound, Outcome::Killed)
+    );
 }
 
 // -- the kill list ----------------------------------------------------------
@@ -465,14 +598,35 @@ async fn the_kill_list_stops_the_bytes_and_the_display() {
     let kill = FakeKill::default();
     assert_eq!(picture_answer(&r, &kill, &h).await.status, 200);
 
-    let a = kill_answer(&kill, format!("{{\"imageHash\":\"{}\",\"reason\":\"abuse\"}}", h.to_uppercase()).as_bytes(), 1).await;
+    let a = kill_answer(
+        &kill,
+        format!(
+            "{{\"imageHash\":\"{}\",\"reason\":\"abuse\"}}",
+            h.to_uppercase()
+        )
+        .as_bytes(),
+        1,
+    )
+    .await;
     assert_eq!(a.status, 200);
-    assert_eq!(body_json(&a), serde_json::json!({"imageHash": h, "killed": true}));
+    assert_eq!(
+        body_json(&a),
+        serde_json::json!({"imageHash": h, "killed": true})
+    );
     let a = picture_answer(&r, &kill, &h).await;
     assert_eq!((a.status, a.outcome), (404, Outcome::Killed));
-    assert_eq!(r.calls.borrow().len(), 1, "a killed hash never reaches the resolver");
+    assert_eq!(
+        r.calls.borrow().len(),
+        1,
+        "a killed hash never reaches the resolver"
+    );
 
-    let a = kill_answer(&kill, format!("{{\"imageHash\":\"{h}\",\"unkill\":true}}").as_bytes(), 2).await;
+    let a = kill_answer(
+        &kill,
+        format!("{{\"imageHash\":\"{h}\",\"unkill\":true}}").as_bytes(),
+        2,
+    )
+    .await;
     assert_eq!(body_json(&a)["killed"], false);
     assert_eq!(picture_answer(&r, &kill, &h).await.status, 200);
 
@@ -488,7 +642,11 @@ async fn the_kill_list_stops_the_bytes_and_the_display() {
     want["imageHash"] = serde_json::Value::Null;
     want["pictureUrl"] = serde_json::Value::Null;
     assert_eq!(body_json(&a)["display"], want);
-    assert_eq!(*kill.reads.borrow(), vec![1], "one read: the pick's picture only");
+    assert_eq!(
+        *kill.reads.borrow(),
+        vec![1],
+        "one read: the pick's picture only"
+    );
     // The kill list never touches a name: a "hash" equal to nothing in names.
     let kill = FakeKill::default();
     kill.set.borrow_mut().insert(BOB_PIC.to_string());
@@ -520,25 +678,51 @@ async fn a_kill_list_fault_fails_closed() {
     let r = FakeResolver::with_batch(DISPLAY_FIXTURE, ALICE);
     let a = single_answer(&r, &kill, ALICE, ORIGIN).await;
     assert_eq!((a.status, a.outcome), (200, Outcome::KillListFault));
-    assert_eq!(a.header("Cache-Control"), Some(NO_STORE), "a degraded answer is never cached");
+    assert_eq!(
+        a.header("Cache-Control"),
+        Some(NO_STORE),
+        "a degraded answer is never cached"
+    );
     let v = body_json(&a);
     assert_eq!(v["display"]["imageHash"], serde_json::Value::Null);
     assert_eq!(v["display"]["pictureUrl"], serde_json::Value::Null);
     assert_eq!(v["display"]["name"], "alpha", "names still render");
 
-    assert_eq!(kill_answer(&kill, format!("{{\"imageHash\":\"{h}\"}}").as_bytes(), 1).await.status, 503);
+    assert_eq!(
+        kill_answer(&kill, format!("{{\"imageHash\":\"{h}\"}}").as_bytes(), 1)
+            .await
+            .status,
+        503
+    );
 }
 
 #[tokio::test]
 async fn a_bad_kill_body_is_refused() {
     let kill = FakeKill::default();
-    for body in ["", "{}", "{\"imageHash\":\"zz\"}", "{\"imageHash\":\"00\",\"extra\":1}"] {
-        assert_eq!(kill_answer(&kill, body.as_bytes(), 1).await.status, 400, "{body}");
+    for body in [
+        "",
+        "{}",
+        "{\"imageHash\":\"zz\"}",
+        "{\"imageHash\":\"00\",\"extra\":1}",
+    ] {
+        assert_eq!(
+            kill_answer(&kill, body.as_bytes(), 1).await.status,
+            400,
+            "{body}"
+        );
     }
-    let long = format!("{{\"imageHash\":\"{}\",\"reason\":\"{}\"}}", "00".repeat(32), "x".repeat(501));
+    let long = format!(
+        "{{\"imageHash\":\"{}\",\"reason\":\"{}\"}}",
+        "00".repeat(32),
+        "x".repeat(501)
+    );
     assert_eq!(kill_answer(&kill, long.as_bytes(), 1).await.status, 400);
     // The body itself is capped at 4 KB before it is parsed.
-    let huge = format!("{{\"imageHash\":\"{}\",\"reason\":\"x\"{}}}", "00".repeat(32), " ".repeat(KILL_BODY_MAX_BYTES));
+    let huge = format!(
+        "{{\"imageHash\":\"{}\",\"reason\":\"x\"{}}}",
+        "00".repeat(32),
+        " ".repeat(KILL_BODY_MAX_BYTES)
+    );
     let a = kill_answer(&kill, huge.as_bytes(), 1).await;
     assert_eq!((a.status, a.outcome), (413, Outcome::BadRequest));
     assert!(kill.set.borrow().is_empty());
@@ -550,15 +734,26 @@ async fn a_bad_kill_body_is_refused() {
 async fn verify_passes_the_proofs_through() {
     let r = FakeResolver::with_batch(DISPLAY_FIXTURE, ALICE);
     let name_proof = r#"{"name":"alpha","leafKey":"ab","namespaceId":"cd","shardId":2,"root":"ee","chainRoot":"ee","match":true,"leaf":"ff","siblings":["00"],"directions":[true],"head":{"txid":"11","vout":0,"height":900007}}"#;
-    r.serve(&format!("{RESOLVER_VERIFY_NAME_PATH}alpha"), 200, name_proof.as_bytes());
+    r.serve(
+        &format!("{RESOLVER_VERIFY_NAME_PATH}alpha"),
+        200,
+        name_proof.as_bytes(),
+    );
     // The picture's proof is a 404 at the resolver: `null`, not an error.
     let a = verify_answer(&r, &FakeKill::default(), ALICE, ORIGIN).await;
     assert_eq!(a.status, 200);
     let text = String::from_utf8(a.body.clone()).unwrap();
-    assert!(text.contains(&format!("\"name\":{name_proof}")), "byte for byte");
+    assert!(
+        text.contains(&format!("\"name\":{name_proof}")),
+        "byte for byte"
+    );
     let v = body_json(&a);
     assert_eq!(v["identityKey"], ALICE);
-    assert_eq!(v["display"], expected_display(ALICE), "the mapped picks are the ones proven");
+    assert_eq!(
+        v["display"],
+        expected_display(ALICE),
+        "the mapped picks are the ones proven"
+    );
     assert_eq!(v["picture"], serde_json::Value::Null);
     assert_eq!(
         *r.calls.borrow(),
@@ -573,7 +768,12 @@ async fn verify_passes_the_proofs_through() {
     let a = verify_answer(&r, &FakeKill::default(), ALICE, ORIGIN).await;
     assert_eq!((a.status, a.outcome), (503, Outcome::UpstreamFault));
     r.serve(&format!("{RESOLVER_VERIFY_NAME_PATH}alpha"), 200, b"[1,2]");
-    assert_eq!(verify_answer(&r, &FakeKill::default(), ALICE, ORIGIN).await.status, 502);
+    assert_eq!(
+        verify_answer(&r, &FakeKill::default(), ALICE, ORIGIN)
+            .await
+            .status,
+        502
+    );
 }
 
 // -- the anonymous read, the CORS, the budgets ------------------------------
@@ -583,10 +783,18 @@ async fn verify_passes_the_proofs_through() {
 /// kill route are served before it.
 #[test]
 fn the_identity_reads_are_anonymous_under_strict() {
-    for path in ["/identities", &format!("/identity/{ALICE}"), &format!("/identity/verify/{ALICE}")] {
+    for path in [
+        "/identities",
+        &format!("/identity/{ALICE}"),
+        &format!("/identity/verify/{ALICE}"),
+    ] {
         let mode = effective_mode(AuthMode::Strict, path);
         assert_eq!(mode, AuthMode::Lenient, "{path}");
-        assert_eq!(front_door_disposition(mode, true, false), Disposition::ProceedAnonymous, "{path}");
+        assert_eq!(
+            front_door_disposition(mode, true, false),
+            Disposition::ProceedAnonymous,
+            "{path}"
+        );
         assert!(!IDENTITY_ROUTES.contains(&path));
         assert!(is_identity_path(path));
     }
@@ -601,14 +809,29 @@ fn the_identity_reads_are_anonymous_under_strict() {
 #[test]
 fn cors_answers_the_app_origins_only_and_exposes_what_the_browser_reads() {
     let allow = parse_origins(" https://bsvarcade.com/, https://LOW-POT.pages.dev ,,");
-    assert_eq!(allow, vec!["https://bsvarcade.com", "https://low-pot.pages.dev"]);
-    assert_eq!(allowed_origin(Some("https://low-pot.pages.dev"), &allow).as_deref(), Some("https://low-pot.pages.dev"));
+    assert_eq!(
+        allow,
+        vec!["https://bsvarcade.com", "https://low-pot.pages.dev"]
+    );
+    assert_eq!(
+        allowed_origin(Some("https://low-pot.pages.dev"), &allow).as_deref(),
+        Some("https://low-pot.pages.dev")
+    );
     assert_eq!(allowed_origin(Some("https://evil.example"), &allow), None);
-    assert_eq!(allowed_origin(Some("https://bsvarcade.com.evil.example"), &allow), None);
+    assert_eq!(
+        allowed_origin(Some("https://bsvarcade.com.evil.example"), &allow),
+        None
+    );
     assert_eq!(allowed_origin(None, &allow), None);
-    assert_eq!(allowed_origin(Some("https://bsvarcade.com"), &[]), None, "unset allowlist: no origin");
+    assert_eq!(
+        allowed_origin(Some("https://bsvarcade.com"), &[]),
+        None,
+        "unset allowlist: no origin"
+    );
 
-    let h: HashMap<&str, String> = cors_headers(Some("https://bsvarcade.com")).into_iter().collect();
+    let h: HashMap<&str, String> = cors_headers(Some("https://bsvarcade.com"))
+        .into_iter()
+        .collect();
     assert_eq!(h["Access-Control-Allow-Origin"], "https://bsvarcade.com");
     assert_eq!(h["Vary"], "Origin");
     let expose = &h["Access-Control-Expose-Headers"];
@@ -632,7 +855,11 @@ fn cors_answers_the_app_origins_only_and_exposes_what_the_browser_reads() {
     assert!(h["Access-Control-Allow-Headers"].contains(lane::LANE_ASK_HEADER));
 
     let none: HashMap<&str, String> = cors_headers(None).into_iter().collect();
-    assert_eq!(none.len(), 1, "a stranger's origin gets Vary and nothing else");
+    assert_eq!(
+        none.len(),
+        1,
+        "a stranger's origin gets Vary and nothing else"
+    );
     assert_eq!(none["Vary"], "Origin");
 }
 
@@ -644,16 +871,30 @@ fn the_budgets_refuse_per_ip_and_per_identity() {
     for _ in 0..30 {
         assert!(b.charge("1.2.3.4", None, 100, t).is_ok());
     }
-    assert_eq!(b.charge("1.2.3.4", None, 100, t + 10_000), Err((BudgetScope::Ip, 50_000)));
-    assert!(b.charge("5.6.7.8", None, 100, t).is_ok(), "another IP has its own window");
-    assert!(b.charge("1.2.3.4", None, 100, t + BUDGET_WINDOW_MS).is_ok(), "a new window");
+    assert_eq!(
+        b.charge("1.2.3.4", None, 100, t + 10_000),
+        Err((BudgetScope::Ip, 50_000))
+    );
+    assert!(
+        b.charge("5.6.7.8", None, 100, t).is_ok(),
+        "another IP has its own window"
+    );
+    assert!(
+        b.charge("1.2.3.4", None, 100, t + BUDGET_WINDOW_MS).is_ok(),
+        "a new window"
+    );
 
     // Per identity, across IPs.
     let mut b = Budget::default();
     for i in 0..60 {
-        assert!(b.charge(&format!("10.0.0.{i}"), Some(ALICE), 100, t).is_ok());
+        assert!(b
+            .charge(&format!("10.0.0.{i}"), Some(ALICE), 100, t)
+            .is_ok());
     }
-    assert_eq!(b.charge("10.0.1.1", Some(ALICE), 1, t).unwrap_err().0, BudgetScope::Identity);
+    assert_eq!(
+        b.charge("10.0.1.1", Some(ALICE), 1, t).unwrap_err().0,
+        BudgetScope::Identity
+    );
     assert!(b.charge("10.0.1.1", Some(BOB), 1, t).is_ok());
 
     let a = budget_refusal(BudgetScope::Ip, 1_500);
@@ -702,8 +943,18 @@ fn every_route_is_counted_on_health() {
 #[test]
 fn rows_read_ceiling_499_no_identity_route_reads_d1() {
     let src = include_str!("identity.rs");
-    for planted in ["OVERLAY_DB", ".d1(", "D1Database", ".prepare(", "SELECT ", "INSERT "] {
-        assert!(!src.contains(planted), "identity.rs must not touch D1 ({planted})");
+    for planted in [
+        "OVERLAY_DB",
+        ".d1(",
+        "D1Database",
+        ".prepare(",
+        "SELECT ",
+        "INSERT ",
+    ] {
+        assert!(
+            !src.contains(planted),
+            "identity.rs must not touch D1 ({planted})"
+        );
     }
 }
 
@@ -722,7 +973,9 @@ async fn rows_read_ceiling_499_store_calls_per_route() {
         let pick = serde_json::json!({"userNumber": null, "name": null, "nameDisplay": null, "picture": format!("{:060x}{:04x}", i, 4), "ownerCanonical": true});
         ids.insert(k.clone(), serde_json::json!({"userNumber": null, "names": [], "pictures": pics, "preference": {"name": null, "picture": null}, "display": pick}));
     }
-    let body = serde_json::json!({"namespaceIds": {"name": null, "picture": null}, "identities": ids}).to_string();
+    let body =
+        serde_json::json!({"namespaceIds": {"name": null, "picture": null}, "identities": ids})
+            .to_string();
     let r = FakeResolver::with_batch(&body, &keys.join(","));
     let kill = FakeKill::default();
     let a = batch_answer(&r, &kill, &keys, ORIGIN).await;
@@ -735,12 +988,19 @@ async fn rows_read_ceiling_499_store_calls_per_route() {
     single_answer(&r, &kill, ALICE, ORIGIN).await;
     assert_eq!((r.calls.borrow().len(), kill.reads.borrow().len()), (1, 1));
     verify_answer(&r, &kill, ALICE, ORIGIN).await;
-    assert_eq!((r.calls.borrow().len(), kill.reads.borrow().len()), (4, 2), "verify: three resolver calls");
+    assert_eq!(
+        (r.calls.borrow().len(), kill.reads.borrow().len()),
+        (4, 2),
+        "verify: three resolver calls"
+    );
 
     let r = FakeResolver::default();
     let kill = FakeKill::default();
     picture_answer(&r, &kill, ALICE_PIC).await;
-    assert_eq!((r.calls.borrow().len(), kill.reads.borrow().clone()), (1, vec![1]));
+    assert_eq!(
+        (r.calls.borrow().len(), kill.reads.borrow().clone()),
+        (1, vec![1])
+    );
 }
 
 // -- inside the D1 rows ledger (the merge over #499) -------------------------
@@ -753,34 +1013,58 @@ fn rows_read_ceiling_499_every_identity_route_has_its_ledger_key() {
     let key = |p: &str| crate::d1_ledger::route_of(p, crate::D1_LEDGER_ROUTES);
     assert_eq!(key(BATCH_ROUTE), "/identities");
     assert_eq!(key(&format!("{IDENTITY_ROUTE_PREFIX}{ALICE}")), "/identity");
-    assert_eq!(key(&format!("{IDENTITY_ROUTE_PREFIX}{VERIFY_ROUTE_PREFIX}{ALICE}")), "/identity");
-    assert_eq!(key(&format!("{PICTURE_ROUTE_PREFIX}{ALICE_PIC}")), "/identity/pic");
+    assert_eq!(
+        key(&format!(
+            "{IDENTITY_ROUTE_PREFIX}{VERIFY_ROUTE_PREFIX}{ALICE}"
+        )),
+        "/identity"
+    );
+    assert_eq!(
+        key(&format!("{PICTURE_ROUTE_PREFIX}{ALICE_PIC}")),
+        "/identity/pic"
+    );
     assert_eq!(key(KILL_ROUTE), "/internal/identity/kill");
-    assert_eq!(key("/internal/pot-changed"), "/internal", "the other hooks keep their key");
+    assert_eq!(
+        key("/internal/pot-changed"),
+        "/internal",
+        "the other hooks keep their key"
+    );
 }
 
 /// What `fetch` does to a finished answer, on its header list: the identity
 /// CORS (applied inside the body), then `d1_ledger::stamp`'s two values
 /// (stamped last, outside any signature). The body is never touched.
 fn stamped(a: &Answer, origin: Option<&str>, t: crate::d1_ledger::Tally) -> Vec<(String, String)> {
-    let mut h: Vec<(String, String)> = a.headers.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    let mut h: Vec<(String, String)> = a
+        .headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
     for (k, v) in cors_headers(origin) {
         h.retain(|(n, _)| !n.eq_ignore_ascii_case(k));
         h.push((k.to_string(), v));
     }
     let get = |h: &Vec<(String, String)>, n: &str| {
-        h.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone())
+        h.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.clone())
     };
     let timing = crate::d1_ledger::with_d1_segment(get(&h, "Server-Timing").as_deref(), t);
-    let expose = crate::d1_ledger::expose_server_timing(get(&h, "Access-Control-Expose-Headers").as_deref());
-    h.retain(|(n, _)| !n.eq_ignore_ascii_case("Server-Timing") && !n.eq_ignore_ascii_case("Access-Control-Expose-Headers"));
+    let expose =
+        crate::d1_ledger::expose_server_timing(get(&h, "Access-Control-Expose-Headers").as_deref());
+    h.retain(|(n, _)| {
+        !n.eq_ignore_ascii_case("Server-Timing")
+            && !n.eq_ignore_ascii_case("Access-Control-Expose-Headers")
+    });
     h.push(("Server-Timing".to_string(), timing));
     h.push(("Access-Control-Expose-Headers".to_string(), expose));
     h
 }
 
 fn header_of<'a>(h: &'a [(String, String)], n: &str) -> Option<&'a str> {
-    h.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.as_str())
+    h.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(n))
+        .map(|(_, v)| v.as_str())
 }
 
 /// A JSON identity view, through the fake binding, under the request's
@@ -789,14 +1073,27 @@ fn header_of<'a>(h: &'a [(String, String)], n: &str) -> Option<&'a str> {
 #[tokio::test]
 async fn an_identity_json_answer_carries_server_timing() {
     let r = FakeResolver::with_batch(DISPLAY_FIXTURE, ALICE);
-    let (a, t) = crate::d1_ledger::scoped(batch_answer(&r, &FakeKill::default(), &[ALICE.to_string()], ORIGIN)).await;
-    assert_eq!((a.status, t), (200, crate::d1_ledger::Tally::default()), "served, no D1 statement");
+    let (a, t) = crate::d1_ledger::scoped(batch_answer(
+        &r,
+        &FakeKill::default(),
+        &[ALICE.to_string()],
+        ORIGIN,
+    ))
+    .await;
+    assert_eq!(
+        (a.status, t),
+        (200, crate::d1_ledger::Tally::default()),
+        "served, no D1 statement"
+    );
     let body = a.body.clone();
     let h = stamped(&a, Some(ORIGIN), t);
     let timing = header_of(&h, "Server-Timing").expect("stamped");
     assert_eq!(crate::d1_ledger::parse_segment(timing, "d1"), Some(t));
     let expose = header_of(&h, "Access-Control-Expose-Headers").unwrap();
-    assert!(expose.contains("Server-Timing") && expose.contains("ETag"), "{expose}");
+    assert!(
+        expose.contains("Server-Timing") && expose.contains("ETag"),
+        "{expose}"
+    );
     assert_eq!(header_of(&h, "Access-Control-Allow-Origin"), Some(ORIGIN));
     assert_eq!(a.body, body);
 }
@@ -814,11 +1111,18 @@ async fn an_identity_picture_answer_carries_server_timing_and_its_bytes_untouche
     let (a, t) = crate::d1_ledger::scoped(picture_answer(&r, &FakeKill::default(), &h)).await;
     assert_eq!((a.status, t), (200, crate::d1_ledger::Tally::default()));
     let hs = stamped(&a, Some(ORIGIN), t);
-    assert_eq!(crate::d1_ledger::parse_segment(header_of(&hs, "Server-Timing").unwrap(), "d1"), Some(t));
+    assert_eq!(
+        crate::d1_ledger::parse_segment(header_of(&hs, "Server-Timing").unwrap(), "d1"),
+        Some(t)
+    );
     assert_eq!(a.body, bytes, "the bytes as fetched");
     assert_eq!(header_of(&hs, "Content-Type"), Some("image/png"));
     assert_eq!(header_of(&hs, "Content-Security-Policy"), Some("sandbox"));
-    assert!(hs.iter().all(|(k, _)| !k.to_ascii_lowercase().starts_with("x-bsv-auth")), "unsigned");
+    assert!(
+        hs.iter()
+            .all(|(k, _)| !k.to_ascii_lowercase().starts_with("x-bsv-auth")),
+        "unsigned"
+    );
 }
 
 /// The order of the body (`lib.rs`), pinned on its source: `fetch` scopes
@@ -837,7 +1141,10 @@ fn the_identity_routes_run_inside_the_ledger_and_the_picture_before_the_door() {
             .collect()
     }
     let lib = squash(include_str!("lib.rs"));
-    let at = |n: &str| lib.find(&squash(n)).unwrap_or_else(|| panic!("lib.rs: {n}"));
+    let at = |n: &str| {
+        lib.find(&squash(n))
+            .unwrap_or_else(|| panic!("lib.rs: {n}"))
+    };
     let scoped = at("d1_ledger::scoped(serve(req, env, ctx)).await;");
     let serve = at("async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {");
     let exempt = at("identity::serve_exempt(req, &env).await?;");
@@ -847,20 +1154,48 @@ fn the_identity_routes_run_inside_the_ledger_and_the_picture_before_the_door() {
     let sign = at("sign_json_response(");
     let end = at("pub const D1_LEDGER_ROUTES");
     assert!(scoped < serve, "fetch scopes serve");
-    assert!(serve < exempt && exempt < door, "the picture and the kill route are answered before the door");
-    assert!(lib[exempt..door].contains("returnOk(resp);"), "the exempt arm returns");
-    assert!(door < run && run < seal && run < sign && seal < end && sign < end, "the JSON views behind the door");
-    assert!(lib.contains(&squash(".get_async(identity::BATCH_ROUTE, identity::get_batch)")));
-    assert!(lib.contains(&squash(".get_async(\"/identity/*rest\", identity::get_identity)")));
+    assert!(
+        serve < exempt && exempt < door,
+        "the picture and the kill route are answered before the door"
+    );
+    assert!(
+        lib[exempt..door].contains("returnOk(resp);"),
+        "the exempt arm returns"
+    );
+    assert!(
+        door < run && run < seal && run < sign && seal < end && sign < end,
+        "the JSON views behind the door"
+    );
+    assert!(lib.contains(&squash(
+        ".get_async(identity::BATCH_ROUTE, identity::get_batch)"
+    )));
+    assert!(lib.contains(&squash(
+        ".get_async(\"/identity/*rest\", identity::get_identity)"
+    )));
 
     let id = squash(include_str!("identity.rs"));
-    let f = id.find(&squash("pub async fn serve_exempt(mut req: Request, env: &Env) -> Result<Response> {")).unwrap();
+    let f = id
+        .find(&squash(
+            "pub async fn serve_exempt(mut req: Request, env: &Env) -> Result<Response> {",
+        ))
+        .unwrap();
     let arm = &id[f..];
-    let post = arm.find(&squash("if req.method() == Method::Post {")).unwrap();
-    let bearer = arm.find(&squash("if !crate::internal_events::internal_bearer_ok(&req, env) {")).unwrap();
+    let post = arm
+        .find(&squash("if req.method() == Method::Post {"))
+        .unwrap();
+    let bearer = arm
+        .find(&squash(
+            "if !crate::internal_events::internal_bearer_ok(&req, env) {",
+        ))
+        .unwrap();
     let read = arm.find(&squash("req.bytes().await")).unwrap();
-    assert!(post < bearer && bearer < read, "the bearer is checked before the body is read");
-    assert!(arm[bearer..read].contains(&squash("Answer::error(401, \"unauthorized\", Outcome::Unauthorized)")));
+    assert!(
+        post < bearer && bearer < read,
+        "the bearer is checked before the body is read"
+    );
+    assert!(arm[bearer..read].contains(&squash(
+        "Answer::error(401, \"unauthorized\", Outcome::Unauthorized)"
+    )));
 }
 
 // -- the origins per env (the M29-3b lens, L6) ------------------------------
@@ -883,11 +1218,21 @@ fn localhost_is_a_beta_origin_only() {
             .find(|l| l.trim_start().starts_with(APP_ORIGINS_VAR))
             .expect("an IDENTITY_APP_ORIGINS line")
     };
-    assert!(!code(prod).iter().any(|l| l.contains("localhost")), "prod must not carry localhost");
+    assert!(
+        !code(prod).iter().any(|l| l.contains("localhost")),
+        "prod must not carry localhost"
+    );
     assert!(!origins(prod).contains("localhost"));
     assert!(origins(prod).contains("https://bsvarcade.com"));
-    assert!(origins(beta).contains("http://localhost:5173"), "the pin reads the beta list too");
-    assert_eq!(toml.matches("[env.").count(), toml.matches("[env.beta").count(), "beta is the only other env");
+    assert!(
+        origins(beta).contains("http://localhost:5173"),
+        "the pin reads the beta list too"
+    );
+    assert_eq!(
+        toml.matches("[env.").count(),
+        toml.matches("[env.beta").count(),
+        "beta is the only other env"
+    );
 }
 
 /// bsv-low #597 (the owner's `cors dev both`, 2026-10-12): a dev-server origin
@@ -895,14 +1240,34 @@ fn localhost_is_a_beta_origin_only() {
 /// views in BOTH envs, reflected exactly; nothing else widens.
 #[test]
 fn e597_a_dev_server_origin_reads_the_identity_views_in_both_envs() {
-    let prod = parse_origins("https://bsvarcade.com,https://www.bsvarcade.com,https://low-pot.pages.dev");
-    let beta = parse_origins("https://low-beta.pages.dev,https://low-harness.pages.dev,http://localhost:5173");
+    let prod =
+        parse_origins("https://bsvarcade.com,https://www.bsvarcade.com,https://low-pot.pages.dev");
+    let beta = parse_origins(
+        "https://low-beta.pages.dev,https://low-harness.pages.dev,http://localhost:5173",
+    );
     for allow in [&prod, &beta, &Vec::new()] {
-        for o in ["http://localhost:5273", "http://127.0.0.1:5273", "http://localhost:1", "http://127.0.0.1:65535"] {
-            assert_eq!(allowed_origin(Some(o), allow).as_deref(), Some(o), "{o} reflected exactly");
-            let h: HashMap<&str, String> = cors_headers(allowed_origin(Some(o), allow).as_deref()).into_iter().collect();
-            assert_eq!(h["Access-Control-Allow-Origin"], o, "the preflight and the GET share this set");
-            assert!(h["Access-Control-Expose-Headers"].contains("ETag"), "the expose list unchanged");
+        for o in [
+            "http://localhost:5273",
+            "http://127.0.0.1:5273",
+            "http://localhost:1",
+            "http://127.0.0.1:65535",
+        ] {
+            assert_eq!(
+                allowed_origin(Some(o), allow).as_deref(),
+                Some(o),
+                "{o} reflected exactly"
+            );
+            let h: HashMap<&str, String> = cors_headers(allowed_origin(Some(o), allow).as_deref())
+                .into_iter()
+                .collect();
+            assert_eq!(
+                h["Access-Control-Allow-Origin"], o,
+                "the preflight and the GET share this set"
+            );
+            assert!(
+                h["Access-Control-Expose-Headers"].contains("ETag"),
+                "the expose list unchanged"
+            );
         }
         for o in [
             "http://localhost",
@@ -920,15 +1285,28 @@ fn e597_a_dev_server_origin_reads_the_identity_views_in_both_envs() {
             "null",
             "*",
         ] {
-            assert_eq!(allowed_origin(Some(o), allow), None, "{o} is no dev-server origin");
+            assert_eq!(
+                allowed_origin(Some(o), allow),
+                None,
+                "{o} is no dev-server origin"
+            );
         }
     }
     // A production origin is unchanged.
-    assert_eq!(allowed_origin(Some("https://bsvarcade.com"), &prod).as_deref(), Some("https://bsvarcade.com"));
+    assert_eq!(
+        allowed_origin(Some("https://bsvarcade.com"), &prod).as_deref(),
+        Some("https://bsvarcade.com")
+    );
     assert_eq!(allowed_origin(Some("https://bsvarcade.com"), &beta), None);
     // No other route widens: only an identity path takes this decision (the rest keep the base's wildcard set).
     assert!(is_identity_path("/identities") && is_identity_path("/identity/verify"));
-    for p in ["/owed", "/pots-view", "/.well-known/auth", "/internal/identity-kill", "/results"] {
+    for p in [
+        "/owed",
+        "/pots-view",
+        "/.well-known/auth",
+        "/internal/identity-kill",
+        "/results",
+    ] {
         assert!(!is_identity_path(p), "{p} keeps the base's CORS");
     }
 }

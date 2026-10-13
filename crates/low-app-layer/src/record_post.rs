@@ -618,7 +618,8 @@ pub struct HeldMarker {
 /// Parse a held filing: the canonical encoding only (this family has no chain reader), exact tag, exact lengths.
 pub fn parse_held_marker(script: &[u8]) -> Option<HeldMarker> {
     use overlay_discovery::collected::{
-        COLLECTED_GAME_ID_LEN, COLLECTED_IDENTITY_KEY_LEN, COLLECTED_SIG_MAX_LEN, COLLECTED_SIG_MIN_LEN,
+        COLLECTED_GAME_ID_LEN, COLLECTED_IDENTITY_KEY_LEN, COLLECTED_SIG_MAX_LEN,
+        COLLECTED_SIG_MIN_LEN,
     };
     let pushes = canonical_marker_pushes(script)?;
     let [tag, game_id, identity_key, pay_txid, sig] = pushes.as_slice() else {
@@ -651,30 +652,51 @@ pub fn held_content_key(m: &HeldMarker) -> String {
 /// filed for, and a row keyed by a chain outpoint (which this door never writes) names nothing at all. One
 /// sha256, no signature. All hex, any case; anything undecodable or of the wrong length is `false`.
 pub fn is_held_row_key(row_key: &str, game_id: &str, identity: &str, pay_txid: &str) -> bool {
-    let (Ok(game), Ok(id), Ok(txid)) = (hex::decode(game_id), hex::decode(identity), hex::decode(pay_txid)) else {
+    let (Ok(game), Ok(id), Ok(txid)) = (
+        hex::decode(game_id),
+        hex::decode(identity),
+        hex::decode(pay_txid),
+    ) else {
         return false;
     };
-    let (Ok(game), Ok(txid)) = (<[u8; 32]>::try_from(game.as_slice()), <[u8; 32]>::try_from(txid.as_slice())) else {
+    let (Ok(game), Ok(txid)) = (
+        <[u8; 32]>::try_from(game.as_slice()),
+        <[u8; 32]>::try_from(txid.as_slice()),
+    ) else {
         return false;
     };
     if id.len() != overlay_discovery::collected::COLLECTED_IDENTITY_KEY_LEN {
         return false;
     }
-    row_key == held_content_key(&HeldMarker { game_id: game, identity_key: id, pay_txid: txid, sig: Vec::new() })
+    row_key
+        == held_content_key(&HeldMarker {
+            game_id: game,
+            identity_key: id,
+            pay_txid: txid,
+            sig: Vec::new(),
+        })
 }
 
 /// The client's held challenge: `LOW-collected\nv2\ngid=<gid>\nid=<identity>\ntxid=<payTxid>` (all lowercase
 /// hex), signed under `[1,'low collected']`, keyID = gameId, counterparty anyone (the v1 marker's protocol and
 /// key; the `v2` line and the `txid=` line keep the two challenges apart, so neither signature is the other's).
 pub fn held_challenge(game_id_lc: &str, identity_lc: &str, pay_txid_lc: &str) -> Vec<u8> {
-    format!("LOW-collected\nv2\ngid={game_id_lc}\nid={identity_lc}\ntxid={pay_txid_lc}").into_bytes()
+    format!("LOW-collected\nv2\ngid={game_id_lc}\nid={identity_lc}\ntxid={pay_txid_lc}")
+        .into_bytes()
 }
 
 /// bsv-low #492: does this signature verify UNDER the named identity as a held filing of `pay_txid_lc` for the
 /// game (the replay the filing door runs before it writes the row and its `payTxid`)? The owed walk does not call
 /// it (the B3 lens fold M1: the door's check is the only one); a reader of `ls_collected` rows can.
-pub fn held_sig_verifies(identity_lc: &str, game_id_lc: &str, pay_txid_lc: &str, sig_hex: &str) -> bool {
-    let Ok(sig) = hex::decode(sig_hex) else { return false };
+pub fn held_sig_verifies(
+    identity_lc: &str,
+    game_id_lc: &str,
+    pay_txid_lc: &str,
+    sig_hex: &str,
+) -> bool {
+    let Ok(sig) = hex::decode(sig_hex) else {
+        return false;
+    };
     canonical_anyone_sig_verifies(
         identity_lc,
         game_id_lc,
@@ -691,7 +713,9 @@ pub fn held_sig_verifies(identity_lc: &str, game_id_lc: &str, pay_txid_lc: &str,
 /// (the same replay the filing door runs)? Only such a row retires a payout from the owed list; a row that merely
 /// exists is byte-format admitted and proves nothing.
 pub(crate) fn collected_sig_verifies(identity_lc: &str, game_id_lc: &str, sig_hex: &str) -> bool {
-    let Ok(sig) = hex::decode(sig_hex) else { return false };
+    let Ok(sig) = hex::decode(sig_hex) else {
+        return false;
+    };
     canonical_anyone_sig_verifies(
         identity_lc,
         game_id_lc,
@@ -942,7 +966,10 @@ pub enum VerifiedRecord {
     /// bsv-low #469: the parsed sweep filing, UNBOUND (the route reads the hop
     /// row and binds with `hopsweep::bind_hop_sweep` after the parse); only a
     /// bound one is written.
-    Hopsweep(crate::hopsweep::HopsweepMarker, crate::hopsweep::HopsweepRecord),
+    Hopsweep(
+        crate::hopsweep::HopsweepMarker,
+        crate::hopsweep::HopsweepRecord,
+    ),
 }
 
 impl VerifiedRecord {
@@ -1146,7 +1173,8 @@ pub fn verify_record_post(
             }))
         }
         RecordKind::Hopsweep => {
-            let m = crate::hopsweep::parse_hopsweep_marker(script).ok_or(RecordRefusal::NotAMarker)?;
+            let m =
+                crate::hopsweep::parse_hopsweep_marker(script).ok_or(RecordRefusal::NotAMarker)?;
             if hex::encode(&m.identity) != poster_lc {
                 return Err(RecordRefusal::PosterMismatch);
             }
@@ -1154,7 +1182,8 @@ pub fn verify_record_post(
             if !crate::hopsweep::sweep_spends_hop(&m.sweep_raw, &m.hop_txid, m.hop_vout) {
                 return Err(RecordRefusal::SweepDoesNotSpendTheHop);
             }
-            let record = crate::hopsweep::record_of(&m).ok_or(RecordRefusal::SweepDoesNotSpendTheHop)?;
+            let record =
+                crate::hopsweep::record_of(&m).ok_or(RecordRefusal::SweepDoesNotSpendTheHop)?;
             Ok(VerifiedRecord::Hopsweep(m, record))
         }
     }
@@ -1357,7 +1386,12 @@ pub fn cap_queries(v: &VerifiedRecord) -> (&'static str, Vec<String>, &'static s
         ),
         VerifiedRecord::Hopsweep(_, r) => (
             crate::hopsweep::HOPSWEEP_FILED_ROWS_SQL,
-            vec![r.identity.clone(), r.game_id.clone(), r.hop_txid.clone(), r.txid.clone()],
+            vec![
+                r.identity.clone(),
+                r.game_id.clone(),
+                r.hop_txid.clone(),
+                r.txid.clone(),
+            ],
             crate::hopsweep::HOPSWEEP_FILED_TODAY_SQL,
             r.identity.clone(),
         ),
@@ -1371,7 +1405,11 @@ pub fn cap_refusal(kind: RecordKind, rows_for_pot: i64, rows_today: i64) -> Opti
 
 /// The pure cap decision for ONE verified record (the route's call): its own per-game cap
 /// ([`filed_rows_cap_of`]) over the count [`cap_queries`] names for it.
-pub fn cap_refusal_for(v: &VerifiedRecord, rows_for_pot: i64, rows_today: i64) -> Option<RecordRefusal> {
+pub fn cap_refusal_for(
+    v: &VerifiedRecord,
+    rows_for_pot: i64,
+    rows_today: i64,
+) -> Option<RecordRefusal> {
     cap_refusal_at(filed_rows_cap_of(v), rows_for_pot, rows_today)
 }
 
@@ -1407,16 +1445,20 @@ pub fn already_filed_body(v: &VerifiedRecord) -> serde_json::Value {
 
 static FILED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
 static REFUSED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
-static TOO_MANY_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
+static TOO_MANY_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] =
+    [const { AtomicU64::new(0) }; RECORD_KINDS];
 static DAILY_CAP_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
-static ALREADY_INDEXED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
+static ALREADY_INDEXED_BY_KIND: [AtomicU64; RECORD_KINDS] =
+    [const { AtomicU64::new(0) }; RECORD_KINDS];
 /// Re-files of a `collected` content already on file (the B3 lens fold L2): nothing written, staled or pushed.
-static ALREADY_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
+static ALREADY_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] =
+    [const { AtomicU64::new(0) }; RECORD_KINDS];
 /// Refund backups written at rank 0 (the pot not indexed at filing time).
 static REFUNDS_FILED_UNBOUND: AtomicU64 = AtomicU64::new(0);
 /// Rank-0 refund rows latched to rank 1 by a later re-file.
 static REFUNDS_LATCHED_LATER: AtomicU64 = AtomicU64::new(0);
-static ANONYMOUS_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] = [const { AtomicU64::new(0) }; RECORD_KINDS];
+static ANONYMOUS_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] =
+    [const { AtomicU64::new(0) }; RECORD_KINDS];
 
 fn bump(c: &[AtomicU64; RECORD_KINDS], kind: RecordKind) {
     c[kind.index()].fetch_add(1, Ordering::Relaxed);
@@ -1899,9 +1941,17 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     {
         use worker::wasm_bindgen::JsValue;
         let (identity, pot): (Option<String>, Option<(String, u32)>) = match &verified {
-            VerifiedRecord::Potparty(r, _) => (Some(r.identity.to_ascii_lowercase()), Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout))),
-            VerifiedRecord::Potrefund(r, _) => (Some(r.identity.to_ascii_lowercase()), Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout))),
-            VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) => (Some(r.identity.to_ascii_lowercase()), None),
+            VerifiedRecord::Potparty(r, _) => (
+                Some(r.identity.to_ascii_lowercase()),
+                Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout)),
+            ),
+            VerifiedRecord::Potrefund(r, _) => (
+                Some(r.identity.to_ascii_lowercase()),
+                Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout)),
+            ),
+            VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) => {
+                (Some(r.identity.to_ascii_lowercase()), None)
+            }
             VerifiedRecord::Hopsweep(_, r) => (Some(r.identity.to_ascii_lowercase()), None),
             VerifiedRecord::Result(..) => (None, None),
         };
@@ -1909,17 +1959,31 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
             crate::routes::owed_mark_stale(
                 &db,
                 crate::owed::OWED_STALE_FOR_POT_SQL,
-                &[JsValue::from_str(pot_txid), JsValue::from_f64(f64::from(*pot_vout))],
+                &[
+                    JsValue::from_str(pot_txid),
+                    JsValue::from_f64(f64::from(*pot_vout)),
+                ],
                 "filing: the pot's parties",
             )
             .await;
         }
         if let Some(id) = &identity {
-            crate::routes::owed_mark_stale(&db, crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(id)], "filing: the filer").await;
+            crate::routes::owed_mark_stale(
+                &db,
+                crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
+                &[JsValue::from_str(id)],
+                "filing: the filer",
+            )
+            .await;
             crate::internal_events::first_party_push(
                 &ctx.env,
                 id,
-                crate::owed::owed_changed_event_body(id, "filing", 0, worker::Date::now().as_millis() as i64),
+                crate::owed::owed_changed_event_body(
+                    id,
+                    "filing",
+                    0,
+                    worker::Date::now().as_millis() as i64,
+                ),
             )
             .await;
         }
@@ -2217,7 +2281,14 @@ pub(crate) mod tests {
         let id = identity(&w);
         let hop = [0x51u8; 32];
         let raw = junk_refund_raw(&hop, 0); // input 0 spends hop:0 — the cheap check passes; the bind judges the bytes
-        let s = script(&[b"LOW/hopsweep/v1", &id, &[0x11; 32], &hop, &0u32.to_le_bytes(), &raw]);
+        let s = script(&[
+            b"LOW/hopsweep/v1",
+            &id,
+            &[0x11; 32],
+            &hop,
+            &0u32.to_le_bytes(),
+            &raw,
+        ]);
         match verify_record_post(RecordKind::Hopsweep, &s, &hex::encode(&id)) {
             Ok(VerifiedRecord::Hopsweep(m, r)) => {
                 assert_eq!(m.hop_vout, 0);
@@ -2229,24 +2300,45 @@ pub(crate) mod tests {
             other => panic!("expected a parsed sweep filing, got {other:?}"),
         }
         assert_eq!(
-            verify_record_post(RecordKind::Hopsweep, &s, &hex::encode(identity(&wallet(0x32)))).unwrap_err(),
+            verify_record_post(
+                RecordKind::Hopsweep,
+                &s,
+                &hex::encode(identity(&wallet(0x32)))
+            )
+            .unwrap_err(),
             RecordRefusal::PosterMismatch
         );
-        let other_vout = script(&[b"LOW/hopsweep/v1", &id, &[0x11; 32], &hop, &1u32.to_le_bytes(), &raw]);
+        let other_vout = script(&[
+            b"LOW/hopsweep/v1",
+            &id,
+            &[0x11; 32],
+            &hop,
+            &1u32.to_le_bytes(),
+            &raw,
+        ]);
         assert_eq!(
             verify_record_post(RecordKind::Hopsweep, &other_vout, &hex::encode(&id)).unwrap_err(),
             RecordRefusal::SweepDoesNotSpendTheHop
         );
         let five = script(&[b"LOW/hopsweep/v1", &id, &[0x11; 32], &hop, &raw]);
-        assert_eq!(verify_record_post(RecordKind::Hopsweep, &five, &hex::encode(&id)).unwrap_err(), RecordRefusal::NotAMarker);
+        assert_eq!(
+            verify_record_post(RecordKind::Hopsweep, &five, &hex::encode(&id)).unwrap_err(),
+            RecordRefusal::NotAMarker
+        );
         // the ladder's shapes name the hop
         let v = verify_record_post(RecordKind::Hopsweep, &s, &hex::encode(&id)).unwrap();
         let (rows_sql, binds, day_sql, day_id) = cap_queries(&v);
         assert!(rows_sql.contains("hopsweep_records") && day_sql.contains("hopsweep_records"));
-        assert_eq!((binds.len(), binds[2].as_str(), day_id.as_str()), (4, hex::encode(hop).as_str(), hex::encode(&id).as_str()));
+        assert_eq!(
+            (binds.len(), binds[2].as_str(), day_id.as_str()),
+            (4, hex::encode(hop).as_str(), hex::encode(&id).as_str())
+        );
         let (chain_sql, chain_binds) = chain_rows_query(&v).unwrap();
         assert!(chain_sql.contains("hopsweep_records") && chain_binds.len() == 3);
-        assert_eq!(cap_refusal(RecordKind::Hopsweep, 2, 0), Some(RecordRefusal::TooManyFiled));
+        assert_eq!(
+            cap_refusal(RecordKind::Hopsweep, 2, 0),
+            Some(RecordRefusal::TooManyFiled)
+        );
         assert_eq!(cap_refusal(RecordKind::Hopsweep, 1, 0), None);
         // the statuses: 425 for the two not-yet classes (the client's outbox re-files), 422 for the two judged ones
         assert_eq!(RecordRefusal::HopNotIndexed.status(), 425);
@@ -2444,12 +2536,22 @@ pub(crate) mod tests {
             held_challenge(&gid_lc, &id_lc, &pay_lc),
             format!("LOW-collected\nv2\ngid={gid_lc}\nid={id_lc}\ntxid={pay_lc}").into_bytes()
         );
-        let sig = sign(&w, collected_protocol(), &gid_lc, &held_challenge(&gid_lc, &id_lc, &pay_lc));
+        let sig = sign(
+            &w,
+            collected_protocol(),
+            &gid_lc,
+            &held_challenge(&gid_lc, &id_lc, &pay_lc),
+        );
         let s = script(&[HELD_TAG, &gid, &id, &pay, &sig]);
         let v = verify_record_post(RecordKind::Collected, &s, &id_lc).unwrap();
-        let VerifiedRecord::Held(r, named) = &v else { panic!("a held filing") };
+        let VerifiedRecord::Held(r, named) = &v else {
+            panic!("a held filing")
+        };
         assert_eq!(named, &pay_lc);
-        assert_eq!((r.identity.as_str(), r.game_id.as_str()), (id_lc.as_str(), gid_lc.as_str()));
+        assert_eq!(
+            (r.identity.as_str(), r.game_id.as_str()),
+            (id_lc.as_str(), gid_lc.as_str())
+        );
         assert_eq!(r.txid, held_content_key(&parse_held_marker(&s).unwrap()));
         assert!(r.txid.starts_with("filed:"));
         assert_eq!(v.kind(), RecordKind::Collected);
@@ -2458,53 +2560,147 @@ pub(crate) mod tests {
         // the caps (the B3 lens fold L1): the HELD rows of the (identity, game) window, counted apart from the v1
         // marker's, up to HELD_FILINGS_PER_GAME; the day is the family's, both shapes together
         let (rows_sql, binds, day_sql, _) = cap_queries(&v);
-        assert_eq!((rows_sql, day_sql), (HELD_FILED_ROWS_SQL, COLLECTED_FILED_TODAY_SQL));
-        assert!(HELD_FILED_ROWS_SQL.contains("payTxid IS NOT NULL") && COLLECTED_FILED_ROWS_SQL.contains("payTxid IS NULL"));
+        assert_eq!(
+            (rows_sql, day_sql),
+            (HELD_FILED_ROWS_SQL, COLLECTED_FILED_TODAY_SQL)
+        );
+        assert!(
+            HELD_FILED_ROWS_SQL.contains("payTxid IS NOT NULL")
+                && COLLECTED_FILED_ROWS_SQL.contains("payTxid IS NULL")
+        );
         assert_eq!(binds, vec![id_lc.clone(), gid_lc.clone(), r.txid.clone()]);
         assert_eq!(filed_rows_cap_of(&v), HELD_FILINGS_PER_GAME);
         assert_eq!(cap_refusal_for(&v, HELD_FILINGS_PER_GAME - 1, 0), None);
-        assert_eq!(cap_refusal_for(&v, HELD_FILINGS_PER_GAME, 0), Some(RecordRefusal::TooManyFiled));
-        assert_eq!(cap_refusal_for(&v, 0, RECORD_FILINGS_PER_IDENTITY_PER_DAY), Some(RecordRefusal::DailyCapReached));
+        assert_eq!(
+            cap_refusal_for(&v, HELD_FILINGS_PER_GAME, 0),
+            Some(RecordRefusal::TooManyFiled)
+        );
+        assert_eq!(
+            cap_refusal_for(&v, 0, RECORD_FILINGS_PER_IDENTITY_PER_DAY),
+            Some(RecordRefusal::DailyCapReached)
+        );
         // the row's key is the content key of (game, identity, txid), and of nothing else (the owed walk's gate, M1)
         assert!(is_held_row_key(&r.txid, &gid_lc, &id_lc, &pay_lc));
-        assert!(is_held_row_key(&r.txid, &gid_lc.to_ascii_uppercase(), &id_lc.to_ascii_uppercase(), &pay_lc.to_ascii_uppercase()));
+        assert!(is_held_row_key(
+            &r.txid,
+            &gid_lc.to_ascii_uppercase(),
+            &id_lc.to_ascii_uppercase(),
+            &pay_lc.to_ascii_uppercase()
+        ));
         assert!(!is_held_row_key(&r.txid, &gid_lc, &id_lc, &"67".repeat(32)));
         assert!(!is_held_row_key(&r.txid, &"56".repeat(32), &id_lc, &pay_lc));
-        assert!(!is_held_row_key(&r.txid, &gid_lc, &hex::encode(identity(&wallet(12))), &pay_lc));
-        assert!(!is_held_row_key(&"ee".repeat(32), &gid_lc, &id_lc, &pay_lc), "a chain outpoint is no held key");
+        assert!(!is_held_row_key(
+            &r.txid,
+            &gid_lc,
+            &hex::encode(identity(&wallet(12))),
+            &pay_lc
+        ));
+        assert!(
+            !is_held_row_key(&"ee".repeat(32), &gid_lc, &id_lc, &pay_lc),
+            "a chain outpoint is no held key"
+        );
         assert!(!is_held_row_key("filed:", &gid_lc, &id_lc, &pay_lc));
-        assert!(!is_held_row_key(&r.txid, &gid_lc, &id_lc, "zz") && !is_held_row_key(&r.txid, &gid_lc[2..], &id_lc, &pay_lc));
+        assert!(
+            !is_held_row_key(&r.txid, &gid_lc, &id_lc, "zz")
+                && !is_held_row_key(&r.txid, &gid_lc[2..], &id_lc, &pay_lc)
+        );
         // the stored signature verifies as a held filing of THAT txid only, and never as the v1 marker
         let sig_hex = r.sig_hex.clone().unwrap();
         assert!(held_sig_verifies(&id_lc, &gid_lc, &pay_lc, &sig_hex));
-        assert!(!held_sig_verifies(&id_lc, &gid_lc, &"67".repeat(32), &sig_hex));
-        assert!(!held_sig_verifies(&id_lc, &"56".repeat(32), &pay_lc, &sig_hex));
+        assert!(!held_sig_verifies(
+            &id_lc,
+            &gid_lc,
+            &"67".repeat(32),
+            &sig_hex
+        ));
+        assert!(!held_sig_verifies(
+            &id_lc,
+            &"56".repeat(32),
+            &pay_lc,
+            &sig_hex
+        ));
         assert!(!collected_sig_verifies(&id_lc, &gid_lc, &sig_hex));
         // and the v1 marker's signature is no held filing of anything
-        let v1_sig = sign(&w, collected_protocol(), &gid_lc, &collected_challenge(&gid_lc, &id_lc));
-        assert!(!held_sig_verifies(&id_lc, &gid_lc, &pay_lc, &hex::encode(&v1_sig)));
+        let v1_sig = sign(
+            &w,
+            collected_protocol(),
+            &gid_lc,
+            &collected_challenge(&gid_lc, &id_lc),
+        );
+        assert!(!held_sig_verifies(
+            &id_lc,
+            &gid_lc,
+            &pay_lc,
+            &hex::encode(&v1_sig)
+        ));
         assert_eq!(
-            verify_record_post(RecordKind::Collected, &script(&[HELD_TAG, &gid, &id, &pay, &v1_sig]), &id_lc).unwrap_err(),
+            verify_record_post(
+                RecordKind::Collected,
+                &script(&[HELD_TAG, &gid, &id, &pay, &v1_sig]),
+                &id_lc
+            )
+            .unwrap_err(),
             RecordRefusal::SignatureInvalid
         );
         // a re-signed copy is the same row; another txid is another row; another game another
-        let again = sign(&w, collected_protocol(), &gid_lc, &held_challenge(&gid_lc, &id_lc, &pay_lc));
+        let again = sign(
+            &w,
+            collected_protocol(),
+            &gid_lc,
+            &held_challenge(&gid_lc, &id_lc, &pay_lc),
+        );
         let m = parse_held_marker(&s).unwrap();
-        assert_eq!(held_content_key(&HeldMarker { sig: again, ..m.clone() }), r.txid);
-        assert_ne!(held_content_key(&HeldMarker { pay_txid: [0x67; 32], ..m.clone() }), r.txid);
-        assert_ne!(held_content_key(&HeldMarker { game_id: [0x56; 32], ..m.clone() }), r.txid);
+        assert_eq!(
+            held_content_key(&HeldMarker {
+                sig: again,
+                ..m.clone()
+            }),
+            r.txid
+        );
+        assert_ne!(
+            held_content_key(&HeldMarker {
+                pay_txid: [0x67; 32],
+                ..m.clone()
+            }),
+            r.txid
+        );
+        assert_ne!(
+            held_content_key(&HeldMarker {
+                game_id: [0x56; 32],
+                ..m.clone()
+            }),
+            r.txid
+        );
         // a stranger posting it, a signature over another txid, a stranger's signature: refused
         let stranger = wallet(12);
         let stranger_lc = hex::encode(identity(&stranger));
-        assert_eq!(verify_record_post(RecordKind::Collected, &s, &stranger_lc).unwrap_err(), RecordRefusal::PosterMismatch);
+        assert_eq!(
+            verify_record_post(RecordKind::Collected, &s, &stranger_lc).unwrap_err(),
+            RecordRefusal::PosterMismatch
+        );
         let other = [0x67u8; 32];
         assert_eq!(
-            verify_record_post(RecordKind::Collected, &script(&[HELD_TAG, &gid, &id, &other, &sig]), &id_lc).unwrap_err(),
+            verify_record_post(
+                RecordKind::Collected,
+                &script(&[HELD_TAG, &gid, &id, &other, &sig]),
+                &id_lc
+            )
+            .unwrap_err(),
             RecordRefusal::SignatureInvalid
         );
-        let forged = sign(&stranger, collected_protocol(), &gid_lc, &held_challenge(&gid_lc, &id_lc, &pay_lc));
+        let forged = sign(
+            &stranger,
+            collected_protocol(),
+            &gid_lc,
+            &held_challenge(&gid_lc, &id_lc, &pay_lc),
+        );
         assert_eq!(
-            verify_record_post(RecordKind::Collected, &script(&[HELD_TAG, &gid, &id, &pay, &forged]), &id_lc).unwrap_err(),
+            verify_record_post(
+                RecordKind::Collected,
+                &script(&[HELD_TAG, &gid, &id, &pay, &forged]),
+                &id_lc
+            )
+            .unwrap_err(),
             RecordRefusal::SignatureInvalid
         );
         // the shape is exact: a short txid, a sixth push, the v1 tag over five pushes are not markers of this kind
@@ -2514,10 +2710,16 @@ pub(crate) mod tests {
             script(&[b"LOW/collected/v1", &gid, &id, &pay, &sig]),
         ] {
             assert!(parse_held_marker(&bad).is_none());
-            assert_eq!(verify_record_post(RecordKind::Collected, &bad, &id_lc).unwrap_err(), RecordRefusal::NotAMarker);
+            assert_eq!(
+                verify_record_post(RecordKind::Collected, &bad, &id_lc).unwrap_err(),
+                RecordRefusal::NotAMarker
+            );
         }
         // no other door takes it
-        assert_eq!(verify_record_post(RecordKind::Potrefund, &s, &id_lc).unwrap_err(), RecordRefusal::NotAMarker);
+        assert_eq!(
+            verify_record_post(RecordKind::Potrefund, &s, &id_lc).unwrap_err(),
+            RecordRefusal::NotAMarker
+        );
     }
 
     #[test]
@@ -2922,7 +3124,11 @@ pub(crate) mod tests {
         assert_eq!(filed_rows_cap(RecordKind::Potparty), 2);
         assert_eq!(filed_rows_cap(RecordKind::Result), 2);
         assert_eq!(filed_rows_cap(RecordKind::Potrefund), 1);
-        assert_eq!(filed_rows_cap(RecordKind::Collected), 1, "the v1 marker's; the held filings are counted apart");
+        assert_eq!(
+            filed_rows_cap(RecordKind::Collected),
+            1,
+            "the v1 marker's; the held filings are counted apart"
+        );
         assert_eq!(HELD_FILINGS_PER_GAME, 4);
         assert_eq!(cap_refusal(RecordKind::Potrefund, 0, 0), None);
         assert_eq!(
@@ -3024,7 +3230,16 @@ pub(crate) mod tests {
         assert_eq!(RecordRefusal::NotCanonical.status(), 400);
         let h = record_health_json();
         assert_eq!(h["filedRowsCap"]["potrefund"], 1);
-        assert_eq!((&h["filedRowsCap"]["collected"], &h["filedRowsCap"]["collectedHeld"]), (&serde_json::json!(1), &serde_json::json!(HELD_FILINGS_PER_GAME)));
+        assert_eq!(
+            (
+                &h["filedRowsCap"]["collected"],
+                &h["filedRowsCap"]["collectedHeld"]
+            ),
+            (
+                &serde_json::json!(1),
+                &serde_json::json!(HELD_FILINGS_PER_GAME)
+            )
+        );
         assert!(h["alreadyFiledByKind"]["collected"].is_u64());
         assert_eq!(
             h["filingsPerIdentityPerDay"],
@@ -3047,11 +3262,28 @@ pub(crate) mod tests {
                     sources(&path, out);
                 } else if path.extension().is_some_and(|x| x == "rs") {
                     let text = std::fs::read_to_string(&path).unwrap();
-                    let production = text.split("\nmod tests {").next().unwrap().split("\npub(crate) mod tests {").next().unwrap();
-                    let code: Vec<&str> = production.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+                    let production = text
+                        .split("\nmod tests {")
+                        .next()
+                        .unwrap()
+                        .split("\npub(crate) mod tests {")
+                        .next()
+                        .unwrap();
+                    let code: Vec<&str> = production
+                        .lines()
+                        .filter(|l| !l.trim_start().starts_with("//"))
+                        .collect();
                     // one line of text: a statement split over source lines (a `\` continuation) reads whole
-                    let flat = code.join(" ").replace('\\', " ").split_whitespace().collect::<Vec<_>>().join(" ");
-                    out.push((path.file_name().unwrap().to_string_lossy().into_owned(), flat));
+                    let flat = code
+                        .join(" ")
+                        .replace('\\', " ")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    out.push((
+                        path.file_name().unwrap().to_string_lossy().into_owned(),
+                        flat,
+                    ));
                 }
             }
         }
@@ -3059,13 +3291,25 @@ pub(crate) mod tests {
         let mut files = Vec::new();
         sources(&here.join("src"), &mut files);
         sources(&here.join("../overlay-cloudflare/src"), &mut files);
-        assert!(files.len() > 40, "both workers' sources were read: {}", files.len());
+        assert!(
+            files.len() > 40,
+            "both workers' sources were read: {}",
+            files.len()
+        );
         let table = "collected_markers_v2";
         let (mut inserts, mut naming_pay_txid) = (0usize, Vec::new());
         for (file, flat) in &files {
             let upper = flat.to_ascii_uppercase();
-            for verb in ["UPDATE ", "DELETE FROM ", "REPLACE INTO ", "INSERT OR REPLACE INTO "] {
-                assert!(!upper.contains(&format!("{verb}{}", table.to_ascii_uppercase())), "{file}: `{verb}{table}`: rows are never rewritten");
+            for verb in [
+                "UPDATE ",
+                "DELETE FROM ",
+                "REPLACE INTO ",
+                "INSERT OR REPLACE INTO ",
+            ] {
+                assert!(
+                    !upper.contains(&format!("{verb}{}", table.to_ascii_uppercase())),
+                    "{file}: `{verb}{table}`: rows are never rewritten"
+                );
             }
             let into = format!("INTO {table}");
             for (at, _) in flat.match_indices(&into) {
@@ -3078,15 +3322,37 @@ pub(crate) mod tests {
             }
         }
         assert!(inserts >= 3, "the door's insert, the overlay's `store_record` and the carry were all seen: {inserts}");
-        assert_eq!(naming_pay_txid, vec!["record_post.rs".to_string()], "one insert names the column, the door's");
-        assert!(COLLECTED_FILE_SQL.contains("INTO collected_markers_v2") && COLLECTED_FILE_SQL.contains("payTxid"));
+        assert_eq!(
+            naming_pay_txid,
+            vec!["record_post.rs".to_string()],
+            "one insert names the column, the door's"
+        );
+        assert!(
+            COLLECTED_FILE_SQL.contains("INTO collected_markers_v2")
+                && COLLECTED_FILE_SQL.contains("payTxid")
+        );
         let door = &files.iter().find(|(f, _)| f == "record_post.rs").unwrap().1;
-        let uses: Vec<usize> = door.match_indices("COLLECTED_FILE_SQL").map(|(i, _)| i).collect();
+        let uses: Vec<usize> = door
+            .match_indices("COLLECTED_FILE_SQL")
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(uses.len(), 2, "the const and ONE prepare");
-        let prepare = door.find(".prepare(COLLECTED_FILE_SQL)").expect("the door prepares it");
+        let prepare = door
+            .find(".prepare(COLLECTED_FILE_SQL)")
+            .expect("the door prepares it");
         let route = door.find("pub async fn record_post(").expect("the door");
-        let verify = door[route..].find("verify_record_post(kind, &script, &identity)").expect("the door verifies") + route;
-        assert!(route < verify && verify < prepare, "the signature check runs before the one insert");
-        assert_eq!(door.matches("pub async fn ").count(), 1, "the route is the file's only async door, so the insert is inside it");
+        let verify = door[route..]
+            .find("verify_record_post(kind, &script, &identity)")
+            .expect("the door verifies")
+            + route;
+        assert!(
+            route < verify && verify < prepare,
+            "the signature check runs before the one insert"
+        );
+        assert_eq!(
+            door.matches("pub async fn ").count(),
+            1,
+            "the route is the file's only async door, so the insert is inside it"
+        );
     }
 }

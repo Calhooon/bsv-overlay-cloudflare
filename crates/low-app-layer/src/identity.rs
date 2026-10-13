@@ -268,7 +268,8 @@ pub fn parse_image_hash(s: &str) -> Option<String> {
 /// (Zanaadu's `is_normalized_name`).
 pub fn is_normalized_name(s: &str) -> bool {
     (1..=20).contains(&s.len())
-        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +404,9 @@ pub fn map_display(
     Display {
         name: pick.name.clone(),
         name_display: pick.name_display.clone(),
-        picture_url: image_hash.as_ref().map(|h| format!("{origin}{PICTURE_ROUTE_PREFIX}{h}")),
+        picture_url: image_hash
+            .as_ref()
+            .map(|h| format!("{origin}{PICTURE_ROUTE_PREFIX}{h}")),
         image_hash,
         since: since_of(pick, names),
     }
@@ -456,35 +459,40 @@ pub struct ParsedBatch {
 /// `picture` is not a 64-hex hash) is an error: the route answers 502, never
 /// a guess. A key the resolver did not answer is the empty shape with the
 /// all-null pick (what the resolver answers for a key that holds nothing).
-pub fn parse_resolver_batch(body: &[u8], keys: &[String]) -> std::result::Result<ParsedBatch, String> {
+pub fn parse_resolver_batch(
+    body: &[u8],
+    keys: &[String],
+) -> std::result::Result<ParsedBatch, String> {
     let mut batch: ResolverBatch =
         serde_json::from_slice(body).map_err(|e| format!("resolver batch body: {e}"))?;
     let mut entries = Vec::with_capacity(keys.len());
     for key in keys {
-        let (user_number_raw, names_raw, pictures_raw, preference_raw, pick) = match batch.identities.remove(key) {
-            Some(e) => (
-                e.user_number.unwrap_or_else(|| raw("null")),
-                e.names,
-                e.pictures,
-                e.preference.unwrap_or_else(|| raw(r#"{"name":null,"picture":null}"#)),
-                e.display,
-            ),
-            None => (
-                raw("null"),
-                raw("[]"),
-                raw("[]"),
-                raw(r#"{"name":null,"picture":null}"#),
-                Some(ResolverPick::default()),
-            ),
-        };
+        let (user_number_raw, names_raw, pictures_raw, preference_raw, pick) =
+            match batch.identities.remove(key) {
+                Some(e) => (
+                    e.user_number.unwrap_or_else(|| raw("null")),
+                    e.names,
+                    e.pictures,
+                    e.preference
+                        .unwrap_or_else(|| raw(r#"{"name":null,"picture":null}"#)),
+                    e.display,
+                ),
+                None => (
+                    raw("null"),
+                    raw("[]"),
+                    raw("[]"),
+                    raw(r#"{"name":null,"picture":null}"#),
+                    Some(ResolverPick::default()),
+                ),
+            };
         let names: Vec<NameRow> = serde_json::from_str(names_raw.get())
             .map_err(|e| format!("resolver names for {key}: {e}"))?;
         let pick = match pick {
             Some(mut p) => {
                 if let Some(h) = p.picture.take() {
-                    p.picture = Some(
-                        parse_image_hash(&h).ok_or_else(|| format!("resolver pick for {key}: picture '{h}' is not a hash"))?,
-                    );
+                    p.picture = Some(parse_image_hash(&h).ok_or_else(|| {
+                        format!("resolver pick for {key}: picture '{h}' is not a hash")
+                    })?);
                 }
                 Some(p)
             }
@@ -572,7 +580,11 @@ impl ParsedBatch {
         map_display(e.pick.as_ref(), &e.names, killed, origin)
     }
 
-    fn entry_out<'a>(e: &'a ParsedEntry, killed: Option<&HashSet<String>>, origin: &str) -> EntryOut<'a> {
+    fn entry_out<'a>(
+        e: &'a ParsedEntry,
+        killed: Option<&HashSet<String>>,
+        origin: &str,
+    ) -> EntryOut<'a> {
         EntryOut {
             user_number: &e.user_number_raw,
             names: &e.names_raw,
@@ -636,14 +648,19 @@ pub enum UpstreamError {
 /// and through a fake in the tests.
 #[allow(async_fn_in_trait)]
 pub trait Resolver {
-    async fn get(&self, path_and_query: &str, max_bytes: usize) -> std::result::Result<Upstream, UpstreamError>;
+    async fn get(
+        &self,
+        path_and_query: &str,
+        max_bytes: usize,
+    ) -> std::result::Result<Upstream, UpstreamError>;
 }
 
 /// The kill list (`IDENTITY_KILL` KV in the worker, a set in the tests).
 #[allow(async_fn_in_trait)]
 pub trait KillList {
     /// The members of `hashes` that are killed.
-    async fn killed_among(&self, hashes: &[String]) -> std::result::Result<HashSet<String>, String>;
+    async fn killed_among(&self, hashes: &[String])
+        -> std::result::Result<HashSet<String>, String>;
     async fn kill(&self, hash: &str, reason: &str, now_ms: i64) -> std::result::Result<(), String>;
     async fn unkill(&self, hash: &str) -> std::result::Result<(), String>;
 }
@@ -724,14 +741,20 @@ impl Answer {
     }
 
     fn error(status: u16, msg: &str, outcome: Outcome) -> Self {
-        Self::json(status, serde_json::json!({ "error": msg }).to_string(), NO_STORE, outcome)
+        Self::json(
+            status,
+            serde_json::json!({ "error": msg }).to_string(),
+            NO_STORE,
+            outcome,
+        )
     }
 
     /// The ONE picture refusal (same status, body and headers whatever the
     /// reason, so the route is not an oracle); `outcome` is for the counters.
     fn picture_not_found(outcome: Outcome) -> Self {
         let mut a = Self::error(404, "no such picture", outcome);
-        a.headers.push(("Content-Security-Policy", PICTURE_CSP.to_string()));
+        a.headers
+            .push(("Content-Security-Policy", PICTURE_CSP.to_string()));
         a
     }
 }
@@ -741,21 +764,39 @@ fn upstream_fault(e: &UpstreamError) -> Answer {
         UpstreamError::Timeout | UpstreamError::Transport(_) => {
             Answer::error(503, "identity resolver unavailable", Outcome::UpstreamFault)
         }
-        UpstreamError::TooLarge => Answer::error(502, "identity resolver answer too large", Outcome::UpstreamFault),
+        UpstreamError::TooLarge => Answer::error(
+            502,
+            "identity resolver answer too large",
+            Outcome::UpstreamFault,
+        ),
     }
 }
 
 /// Ask the resolver for `keys` and parse the answer, or the error answer.
-async fn fetch_batch<R: Resolver>(r: &R, keys: &[String]) -> std::result::Result<ParsedBatch, Answer> {
+async fn fetch_batch<R: Resolver>(
+    r: &R,
+    keys: &[String],
+) -> std::result::Result<ParsedBatch, Answer> {
     let path = format!("{RESOLVER_BATCH_PATH}?ik={}", keys.join(","));
-    let up = r.get(&path, RESOLVER_JSON_MAX_BYTES).await.map_err(|e| upstream_fault(&e))?;
+    let up = r
+        .get(&path, RESOLVER_JSON_MAX_BYTES)
+        .await
+        .map_err(|e| upstream_fault(&e))?;
     if up.status != 200 {
         identity_warn!("[identity] resolver batch answered {}", up.status);
-        return Err(Answer::error(502, "identity resolver refused the read", Outcome::UpstreamFault));
+        return Err(Answer::error(
+            502,
+            "identity resolver refused the read",
+            Outcome::UpstreamFault,
+        ));
     }
     let batch = parse_resolver_batch(&up.body, keys).map_err(|e| {
         identity_warn!("[identity] {e}");
-        Answer::error(502, "identity resolver answered an unexpected shape", Outcome::UpstreamFault)
+        Answer::error(
+            502,
+            "identity resolver answered an unexpected shape",
+            Outcome::UpstreamFault,
+        )
     })?;
     let (absent, since_miss) = batch.display_notes();
     DISPLAY_ABSENT.fetch_add(absent, Ordering::Relaxed);
@@ -787,33 +828,59 @@ fn json_answer(body: String, kill_known: bool) -> Answer {
 }
 
 /// `GET /identities?ik=...` for parsed `keys`.
-pub async fn batch_answer<R: Resolver, K: KillList>(r: &R, k: &K, keys: &[String], origin: &str) -> Answer {
+pub async fn batch_answer<R: Resolver, K: KillList>(
+    r: &R,
+    k: &K,
+    keys: &[String],
+    origin: &str,
+) -> Answer {
     let batch = match fetch_batch(r, keys).await {
         Ok(b) => b,
         Err(a) => return a,
     };
     let killed = killed_or_none(k, &batch).await;
-    json_answer(batch.render_batch(killed.as_ref(), origin), killed.is_some())
+    json_answer(
+        batch.render_batch(killed.as_ref(), origin),
+        killed.is_some(),
+    )
 }
 
 /// `GET /identity/:ik` for a parsed key.
-pub async fn single_answer<R: Resolver, K: KillList>(r: &R, k: &K, key: &str, origin: &str) -> Answer {
+pub async fn single_answer<R: Resolver, K: KillList>(
+    r: &R,
+    k: &K,
+    key: &str,
+    origin: &str,
+) -> Answer {
     let batch = match fetch_batch(r, &[key.to_string()]).await {
         Ok(b) => b,
         Err(a) => return a,
     };
     let killed = killed_or_none(k, &batch).await;
-    json_answer(batch.render_single(killed.as_ref(), origin), killed.is_some())
+    json_answer(
+        batch.render_single(killed.as_ref(), origin),
+        killed.is_some(),
+    )
 }
 
 /// One verify body from the resolver: `Ok(None)` on its 404, the raw body on a
 /// 200 that is a JSON object, an error answer otherwise.
-async fn fetch_verify<R: Resolver>(r: &R, path: &str) -> std::result::Result<Option<Box<RawValue>>, Answer> {
-    let up = r.get(path, RESOLVER_JSON_MAX_BYTES).await.map_err(|e| upstream_fault(&e))?;
+async fn fetch_verify<R: Resolver>(
+    r: &R,
+    path: &str,
+) -> std::result::Result<Option<Box<RawValue>>, Answer> {
+    let up = r
+        .get(path, RESOLVER_JSON_MAX_BYTES)
+        .await
+        .map_err(|e| upstream_fault(&e))?;
     match up.status {
         200 => {
             let body: Box<RawValue> = serde_json::from_slice(&up.body).map_err(|_| {
-                Answer::error(502, "identity resolver answered an unexpected shape", Outcome::UpstreamFault)
+                Answer::error(
+                    502,
+                    "identity resolver answered an unexpected shape",
+                    Outcome::UpstreamFault,
+                )
             })?;
             if !body.get().trim_start().starts_with('{') {
                 return Err(Answer::error(
@@ -827,7 +894,11 @@ async fn fetch_verify<R: Resolver>(r: &R, path: &str) -> std::result::Result<Opt
         404 => Ok(None),
         s => {
             identity_warn!("[identity] resolver verify {path} answered {s}");
-            Err(Answer::error(503, "identity proof temporarily unavailable", Outcome::UpstreamFault))
+            Err(Answer::error(
+                503,
+                "identity proof temporarily unavailable",
+                Outcome::UpstreamFault,
+            ))
         }
     }
 }
@@ -843,7 +914,12 @@ struct VerifyOut<'a> {
 
 /// `GET /identity/verify/:ik`: the mapped picks, then the resolver's SMT
 /// proof of each (at most three resolver calls).
-pub async fn verify_answer<R: Resolver, K: KillList>(r: &R, k: &K, key: &str, origin: &str) -> Answer {
+pub async fn verify_answer<R: Resolver, K: KillList>(
+    r: &R,
+    k: &K,
+    key: &str,
+    origin: &str,
+) -> Answer {
     let batch = match fetch_batch(r, &[key.to_string()]).await {
         Ok(b) => b,
         Err(a) => return a,
@@ -885,17 +961,26 @@ pub async fn picture_answer<R: Resolver, K: KillList>(r: &R, k: &K, hash_param: 
         Ok(_) => {}
         Err(e) => {
             identity_warn!("[identity] kill list read failed, picture refused: {e}");
-            let mut a = Answer::error(503, "picture temporarily unavailable", Outcome::KillListFault);
-            a.headers.push(("Content-Security-Policy", PICTURE_CSP.to_string()));
+            let mut a = Answer::error(
+                503,
+                "picture temporarily unavailable",
+                Outcome::KillListFault,
+            );
+            a.headers
+                .push(("Content-Security-Policy", PICTURE_CSP.to_string()));
             return a;
         }
     }
-    let up = match r.get(&format!("{RESOLVER_PICTURE_PATH}{hash}"), PICTURE_MAX_BYTES).await {
+    let up = match r
+        .get(&format!("{RESOLVER_PICTURE_PATH}{hash}"), PICTURE_MAX_BYTES)
+        .await
+    {
         Ok(up) => up,
         Err(UpstreamError::TooLarge) => return Answer::picture_not_found(Outcome::Oversize),
         Err(e) => {
             let mut a = upstream_fault(&e);
-            a.headers.push(("Content-Security-Policy", PICTURE_CSP.to_string()));
+            a.headers
+                .push(("Content-Security-Policy", PICTURE_CSP.to_string()));
             return a;
         }
     };
@@ -942,16 +1027,15 @@ pub async fn kill_answer<K: KillList>(k: &K, body: &[u8], now_ms: i64) -> Answer
     if body.len() > KILL_BODY_MAX_BYTES {
         return kill_body_too_large();
     }
-    let parsed: KillBody = match serde_json::from_slice(body) {
-        Ok(b) => b,
-        Err(_) => {
-            return Answer::error(
+    let parsed: KillBody =
+        match serde_json::from_slice(body) {
+            Ok(b) => b,
+            Err(_) => return Answer::error(
                 400,
                 "body must be {\"imageHash\": <64 hex>, \"reason\"?: <text>, \"unkill\"?: true}",
                 Outcome::BadRequest,
-            )
-        }
-    };
+            ),
+        };
     let Some(hash) = parse_image_hash(&parsed.image_hash) else {
         return Answer::error(400, "imageHash must be 64 hex chars", Outcome::BadRequest);
     };
@@ -1025,7 +1109,8 @@ impl Budget {
 
     fn add(&mut self, key: String, units: u32, now_ms: i64) {
         if !self.windows.contains_key(&key) && self.windows.len() >= BUDGET_MAX_TRACKED {
-            self.windows.retain(|_, (start, _)| now_ms - *start < BUDGET_WINDOW_MS);
+            self.windows
+                .retain(|_, (start, _)| now_ms - *start < BUDGET_WINDOW_MS);
             if self.windows.len() >= BUDGET_MAX_TRACKED {
                 self.windows.clear();
                 self.evictions += 1;
@@ -1079,7 +1164,8 @@ pub fn budget_refusal(scope: BudgetScope, retry_after_ms: i64) -> Answer {
         NO_STORE,
         Outcome::BudgetRefused,
     );
-    a.headers.push(("Retry-After", ((retry_after_ms + 999) / 1000).to_string()));
+    a.headers
+        .push(("Retry-After", ((retry_after_ms + 999) / 1000).to_string()));
     a
 }
 
@@ -1089,7 +1175,8 @@ thread_local! {
 
 fn charge_isolate(ip: &str, identity: Option<&str>, units: u32) -> Option<Answer> {
     let now = worker::Date::now().as_millis() as i64;
-    BUDGET.with(|b| b.borrow_mut().charge(ip, identity, units, now).err())
+    BUDGET
+        .with(|b| b.borrow_mut().charge(ip, identity, units, now).err())
         .map(|(scope, retry)| budget_refusal(scope, retry))
 }
 
@@ -1113,7 +1200,10 @@ pub fn health_json() -> serde_json::Value {
     for (r, rname) in ROUTE_NAMES.iter().enumerate() {
         let mut o = serde_json::Map::new();
         for (i, oname) in OUTCOME_NAMES.iter().enumerate() {
-            o.insert((*oname).to_string(), COUNTS[r][i].load(Ordering::Relaxed).into());
+            o.insert(
+                (*oname).to_string(),
+                COUNTS[r][i].load(Ordering::Relaxed).into(),
+            );
         }
         routes.insert((*rname).to_string(), serde_json::Value::Object(o));
     }
@@ -1182,7 +1272,10 @@ pub fn cors_headers(origin: Option<&str>) -> Vec<(&'static str, String)> {
     let mut h = vec![("Vary", "Origin".to_string())];
     if let Some(o) = origin {
         h.push(("Access-Control-Allow-Origin", o.to_string()));
-        h.push(("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS".to_string()));
+        h.push((
+            "Access-Control-Allow-Methods",
+            "GET, HEAD, OPTIONS".to_string(),
+        ));
         h.push((
             "Access-Control-Allow-Headers",
             format!("Content-Type, {auth_list}, {lane_allow}"),
@@ -1276,7 +1369,11 @@ async fn with_timeout<F: core::future::Future>(fut: F, ms: u64) -> Option<F::Out
 }
 
 impl Resolver for BindingResolver {
-    async fn get(&self, path_and_query: &str, max_bytes: usize) -> std::result::Result<Upstream, UpstreamError> {
+    async fn get(
+        &self,
+        path_and_query: &str,
+        max_bytes: usize,
+    ) -> std::result::Result<Upstream, UpstreamError> {
         let url = format!("{}{path_and_query}", self.base);
         let fut = async {
             let mut init = RequestInit::new();
@@ -1291,11 +1388,18 @@ impl Resolver for BindingResolver {
                 .map_err(|e| UpstreamError::Transport(e.to_string()))?;
             let status = resp.status_code();
             if let Ok(Some(cl)) = resp.headers().get("Content-Length") {
-                if cl.trim().parse::<u64>().map(|n| n > max_bytes as u64).unwrap_or(false) {
+                if cl
+                    .trim()
+                    .parse::<u64>()
+                    .map(|n| n > max_bytes as u64)
+                    .unwrap_or(false)
+                {
                     return Err(UpstreamError::TooLarge);
                 }
             }
-            let mut stream = resp.stream().map_err(|e| UpstreamError::Transport(e.to_string()))?;
+            let mut stream = resp
+                .stream()
+                .map_err(|e| UpstreamError::Transport(e.to_string()))?;
             let mut body: Vec<u8> = Vec::new();
             use futures_util::StreamExt;
             while let Some(chunk) = stream.next().await {
@@ -1307,7 +1411,9 @@ impl Resolver for BindingResolver {
             }
             Ok(Upstream { status, body })
         };
-        with_timeout(fut, RESOLVER_TIMEOUT_MS).await.unwrap_or(Err(UpstreamError::Timeout))
+        with_timeout(fut, RESOLVER_TIMEOUT_MS)
+            .await
+            .unwrap_or(Err(UpstreamError::Timeout))
     }
 }
 
@@ -1316,7 +1422,9 @@ pub struct Unbound;
 
 impl Resolver for Unbound {
     async fn get(&self, _: &str, _: usize) -> std::result::Result<Upstream, UpstreamError> {
-        Err(UpstreamError::Transport("the IDENTITY binding is not configured".to_string()))
+        Err(UpstreamError::Transport(
+            "the IDENTITY binding is not configured".to_string(),
+        ))
     }
 }
 
@@ -1329,7 +1437,9 @@ impl KvKillList {
     }
 
     fn store(&self) -> std::result::Result<&worker::KvStore, String> {
-        self.0.as_ref().ok_or_else(|| format!("the {KILL_BINDING} KV binding is not configured"))
+        self.0
+            .as_ref()
+            .ok_or_else(|| format!("the {KILL_BINDING} KV binding is not configured"))
     }
 }
 
@@ -1338,7 +1448,10 @@ pub fn kill_key(hash: &str) -> String {
 }
 
 impl KillList for KvKillList {
-    async fn killed_among(&self, hashes: &[String]) -> std::result::Result<HashSet<String>, String> {
+    async fn killed_among(
+        &self,
+        hashes: &[String],
+    ) -> std::result::Result<HashSet<String>, String> {
         let kv = self.store()?;
         let mut out = HashSet::new();
         for chunk in hashes.chunks(KILL_BULK_CHUNK) {
@@ -1364,7 +1477,10 @@ impl KillList for KvKillList {
     }
 
     async fn unkill(&self, hash: &str) -> std::result::Result<(), String> {
-        self.store()?.delete(&kill_key(hash)).await.map_err(|e| e.to_string())
+        self.store()?
+            .delete(&kill_key(hash))
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1388,7 +1504,9 @@ fn client_ip(req: &Request) -> String {
 }
 
 fn origin_of(req: &Request) -> String {
-    req.url().map(|u| u.origin().ascii_serialization()).unwrap_or_default()
+    req.url()
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_default()
 }
 
 fn verified_identity(state: &AuthState) -> Option<&str> {
@@ -1413,7 +1531,11 @@ async fn run<R: Resolver>(
             let raw = req
                 .url()
                 .ok()
-                .and_then(|u| u.query_pairs().find(|(k, _)| k == "ik").map(|(_, v)| v.into_owned()))
+                .and_then(|u| {
+                    u.query_pairs()
+                        .find(|(k, _)| k == "ik")
+                        .map(|(_, v)| v.into_owned())
+                })
                 .unwrap_or_default();
             let keys = match parse_identity_keys(&raw) {
                 Ok(k) => k,
@@ -1426,7 +1548,11 @@ async fn run<R: Resolver>(
         }
         RouteId::Single | RouteId::Verify => {
             let Some(key) = parse_identity_key(key_param) else {
-                return Answer::error(400, "not a compressed identity key (66 hex chars, 02/03 prefix)", Outcome::BadRequest);
+                return Answer::error(
+                    400,
+                    "not a compressed identity key (66 hex chars, 02/03 prefix)",
+                    Outcome::BadRequest,
+                );
             };
             // Verify costs three resolver calls, so it is charged three keys.
             let units = if route == RouteId::Verify { 3 } else { 1 };
@@ -1449,7 +1575,13 @@ async fn run<R: Resolver>(
     }
 }
 
-async fn serve(env: &Env, route: RouteId, req: &Request, identity: Option<&str>, key_param: &str) -> Result<Response> {
+async fn serve(
+    env: &Env,
+    route: RouteId,
+    req: &Request,
+    identity: Option<&str>,
+    key_param: &str,
+) -> Result<Response> {
     let answer = match BindingResolver::from_env(env) {
         Some(r) => run(&r, env, route, req, identity, key_param).await,
         None => run(&Unbound, env, route, req, identity, key_param).await,
@@ -1460,7 +1592,14 @@ async fn serve(env: &Env, route: RouteId, req: &Request, identity: Option<&str>,
 
 /// `GET /identities` (router).
 pub async fn get_batch(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
-    serve(&ctx.env, RouteId::Batch, &req, verified_identity(&ctx.data), "").await
+    serve(
+        &ctx.env,
+        RouteId::Batch,
+        &req,
+        verified_identity(&ctx.data),
+        "",
+    )
+    .await
 }
 
 /// `GET /identity/*rest` (router): `:ik` or `verify/:ik`.
@@ -1469,7 +1608,9 @@ pub async fn get_identity(req: Request, ctx: RouteContext<AuthState>) -> Result<
     let identity = verified_identity(&ctx.data);
     match rest.strip_prefix(VERIFY_ROUTE_PREFIX) {
         Some(ik) if !ik.contains('/') => serve(&ctx.env, RouteId::Verify, &req, identity, ik).await,
-        None if !rest.contains('/') => serve(&ctx.env, RouteId::Single, &req, identity, &rest).await,
+        None if !rest.contains('/') => {
+            serve(&ctx.env, RouteId::Single, &req, identity, &rest).await
+        }
         _ => crate::routes::json_error(&format!("no such route: {}", req.path()), 404),
     }
 }
@@ -1505,7 +1646,10 @@ pub async fn serve_exempt(mut req: Request, env: &Env) -> Result<Response> {
         count(RouteId::Kill, answer.outcome);
         return to_response(answer);
     }
-    let hash = path.strip_prefix(PICTURE_ROUTE_PREFIX).unwrap_or_default().to_string();
+    let hash = path
+        .strip_prefix(PICTURE_ROUTE_PREFIX)
+        .unwrap_or_default()
+        .to_string();
     serve(env, RouteId::Picture, &req, None, &hash).await
 }
 

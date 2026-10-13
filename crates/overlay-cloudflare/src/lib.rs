@@ -15,11 +15,11 @@ pub mod broadcaster;
 pub mod chain_tracker;
 pub mod change_flush;
 pub mod d1;
-pub mod d1_ledger;
 pub mod d1_discovery;
+pub mod d1_ledger;
 pub mod d1_storage;
-pub mod derived_hops;
 pub mod dead_letters;
+pub mod derived_hops;
 pub mod ef;
 pub mod ef_deferred;
 pub mod error;
@@ -373,7 +373,9 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
             .await
         }
         // bsv-low #576: the operator's bounded re-drive of the parked dead letters (bearer INTERNAL_TOKEN).
-        (Method::Post, "/internal/redrive-dead-letters") => crate::dead_letters::internal_redrive(req, &env).await,
+        (Method::Post, "/internal/redrive-dead-letters") => {
+            crate::dead_letters::internal_redrive(req, &env).await
+        }
         (Method::Post, "/internal/discard-dead-letters") => {
             crate::dead_letters::internal_discard(req, &env).await
         }
@@ -2427,7 +2429,12 @@ async fn queue_handler(
         if let Some(db) = &counters {
             match crate::admit_fast::open_eviction(db, &subject).await {
                 Ok(Some(ev)) => {
-                    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED, 1).await;
+                    crate::ops::bump_counter(
+                        db,
+                        crate::ops::COUNTER_QUEUE_REPLAY_SKIPPED_EVICTED,
+                        1,
+                    )
+                    .await;
                     worker::console_log!(
                         "Queue: replay of {subject} SKIPPED — under an open eviction (at {} ms — {}); the twin holds it, a MINED proof readmits",
                         ev.evicted_at_ms,
@@ -2447,11 +2454,23 @@ async fn queue_handler(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1).await;
+                    crate::ops::bump_counter(
+                        db,
+                        crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
+                        1,
+                    )
+                    .await;
                     worker::console_log!(
                         "Queue: the eviction ledger could not be read for {subject} ({e}) — retrying the replay later"
                     );
-                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("the eviction ledger could not be read ({e})"), crate::dead_letters::LetterClass::Fault).await;
+                    crate::dead_letters::note_failing(
+                        db,
+                        body,
+                        Some(&subject),
+                        &format!("the eviction ledger could not be read ({e})"),
+                        crate::dead_letters::LetterClass::Fault,
+                    )
+                    .await;
                     msg.retry();
                     continue;
                 }
@@ -2463,7 +2482,9 @@ async fn queue_handler(
         // these bytes), acked and never dead-lettered for its size; on any other it is "not now", retried, then
         // parked as a `not_now` letter (#576's class: one per txid, 200 a day), never admitted unrun.
         let policy = crate::queue::replay_breach_policy(body);
-        let replayed = engine.submit_with_report_under(&tagged_beef, mode, policy).await;
+        let replayed = engine
+            .submit_with_report_under(&tagged_beef, mode, policy)
+            .await;
         if let (Ok((_, report)), Some(db)) = (&replayed, &counters) {
             crate::ops::note_engine_walk(db, report, "Queue").await;
         }
@@ -2488,12 +2509,17 @@ async fn queue_handler(
                     match crate::admit_fast::open_eviction(db, &subject).await {
                         Ok(Some(ev)) => {
                             let now_ms = worker::Date::now().as_millis();
-                            let moved =
-                                crate::admit_fast::evict_txid_everywhere(db, &subject, &ev.reason, now_ms)
-                                    .await
-                                    .moved;
-                            crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1)
-                                .await;
+                            let moved = crate::admit_fast::evict_txid_everywhere(
+                                db, &subject, &ev.reason, now_ms,
+                            )
+                            .await
+                            .moved;
+                            crate::ops::bump_counter(
+                                db,
+                                crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
+                                1,
+                            )
+                            .await;
                             crate::pot_changes::flush_inline(env.clone()).await;
                             worker::console_log!(
                                 "Queue: the replay of {subject} outran an eviction (at {} ms — {}): re-evicted {moved} row(s); acked",
@@ -2514,7 +2540,12 @@ async fn queue_handler(
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1).await;
+                            crate::ops::bump_counter(
+                                db,
+                                crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
+                                1,
+                            )
+                            .await;
                             worker::console_log!(
                                 "Queue: the eviction ledger could not be read for {subject} after the replay's write ({e}) — retrying (a durable write dedups)"
                             );
@@ -2572,8 +2603,16 @@ async fn queue_handler(
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
                         .await;
-                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("not durable: {}", report.summary()), crate::dead_letters::LetterClass::of_sites(report.faults.iter().map(|f| f.site)))
-                        .await;
+                    crate::dead_letters::note_failing(
+                        db,
+                        body,
+                        Some(&subject),
+                        &format!("not durable: {}", report.summary()),
+                        crate::dead_letters::LetterClass::of_sites(
+                            report.faults.iter().map(|f| f.site),
+                        ),
+                    )
+                    .await;
                 }
                 msg.retry();
             }
@@ -2582,7 +2621,14 @@ async fn queue_handler(
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1)
                         .await;
-                    crate::dead_letters::note_failing(db, body, Some(&subject), &format!("failed: {e}"), crate::queue::replay_error_class(&e)).await;
+                    crate::dead_letters::note_failing(
+                        db,
+                        body,
+                        Some(&subject),
+                        &format!("failed: {e}"),
+                        crate::queue::replay_error_class(&e),
+                    )
+                    .await;
                 }
                 msg.retry();
             }
@@ -2655,13 +2701,25 @@ mod tests {
     /// auth refusal.
     #[test]
     fn every_dispatched_fetch_route_flushes_the_pot_changes_on_its_way_out() {
-        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let code_only = |s: &str| {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let src = include_str!("lib.rs");
-        let start = src.find("async fn main(req: Request, env: Env, ctx: Context)").expect("the fetch handler");
-        let end = start + src[start..].find("\npub async fn build_engine_from_env(").expect("the next item");
+        let start = src
+            .find("async fn main(req: Request, env: Env, ctx: Context)")
+            .expect("the fetch handler");
+        let end = start
+            + src[start..]
+                .find("\npub async fn build_engine_from_env(")
+                .expect("the next item");
         let handler = code_only(&src[start..end]);
-        let dispatch = handler.find("let result = match (req.method(), req.path().as_str()) {").expect("the dispatch");
+        let dispatch = handler
+            .find("let result = match (req.method(), req.path().as_str()) {")
+            .expect("the dispatch");
         let tail = squash(&handler[dispatch..]);
         assert!(
             tail.contains(&squash(

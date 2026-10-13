@@ -273,7 +273,8 @@ pub const COUNTER_SUBMIT_REFUSED_EVICTED: &str = "submit_refused_evicted_total";
 /// loop 18 (the gate's HIGH-2): a gated subject under an open eviction that the network ACCEPTED again —
 /// readmitted at the door (the fresh word overrules the ledger's stale one; a wrong eviction heals on the next
 /// accepted re-present, never permanently).
-pub const COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT: &str = "submit_readmitted_by_fresh_accept_total";
+pub const COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT: &str =
+    "submit_readmitted_by_fresh_accept_total";
 /// bsv-low #519 (loop 20, 2026-09-21): an Arcade-terminal subject judged at the ladder by the chain's indexers
 /// (never a broadcaster's echo): held by an indexer (admitted), absent past the age floor (the two-source refusal),
 /// absent but young (the retryable word), the indexers inconclusive, or this isolate's courier budget spent.
@@ -657,7 +658,10 @@ pub async fn arcade_reorg_view(db: &D1Database) -> serde_json::Value {
 
 /// PURE (bsv-low #484): the reorg view carries how many CONFIRMED hop probe memos the reorg passes have cleared
 /// (`hop_probe_memos`; the lifetime counter, 0 until the first), beside the cursor that says where the judge is.
-pub fn with_probe_memos_cleared(mut view: serde_json::Value, counters: &serde_json::Value) -> serde_json::Value {
+pub fn with_probe_memos_cleared(
+    mut view: serde_json::Value,
+    counters: &serde_json::Value,
+) -> serde_json::Value {
     if view.is_object() {
         view["probeMemosCleared"] = json!(counters
             .get(crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED)
@@ -963,8 +967,11 @@ async fn count_flagged(db: &D1Database, cutoff_ms: i64) -> u64 {
 }
 
 /// The three change webhooks' flush accounts (bsv-low #436): each set's five counters are seeded 0.
-pub const CHANGE_FLUSH_SETS: [&crate::change_flush::FlushCounters; 3] =
-    [&crate::pot_changes::COUNTERS, &crate::hop_changes::COUNTERS, &crate::lobby_changes::COUNTERS];
+pub const CHANGE_FLUSH_SETS: [&crate::change_flush::FlushCounters; 3] = [
+    &crate::pot_changes::COUNTERS,
+    &crate::hop_changes::COUNTERS,
+    &crate::lobby_changes::COUNTERS,
+];
 
 /// PURE (the delta lens's D-L2): each set's note-backs NEVER RE-SENT, derived from the served counters
 /// (`retried + deferred - resent`, [`crate::change_flush::noted_back_unresent`]): `(name, value)` per set.
@@ -974,7 +981,16 @@ pub fn change_flush_unresent(counters: &serde_json::Value) -> Vec<(&'static str,
     let read = |name: &str| counters[name].as_u64().unwrap_or(0);
     CHANGE_FLUSH_SETS
         .iter()
-        .map(|set| (set.noted_back_unresent, crate::change_flush::noted_back_unresent(read(set.retried), read(set.deferred), read(set.resent))))
+        .map(|set| {
+            (
+                set.noted_back_unresent,
+                crate::change_flush::noted_back_unresent(
+                    read(set.retried),
+                    read(set.deferred),
+                    read(set.resent),
+                ),
+            )
+        })
         .collect()
 }
 
@@ -1126,7 +1142,13 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         }
     }
     for set in CHANGE_FLUSH_SETS {
-        for name in [set.undelivered, set.retry_failed, set.deferred, set.retried, set.resent] {
+        for name in [
+            set.undelivered,
+            set.retry_failed,
+            set.deferred,
+            set.retried,
+            set.resent,
+        ] {
             obj[name] = json!(0);
         }
     }
@@ -1504,15 +1526,42 @@ mod tests {
         });
         assert_eq!(
             change_flush_unresent(&c),
-            vec![("pot_changed_noted_back_unresent", 8), ("hop_changed_noted_back_unresent", 0), ("lobby_changed_noted_back_unresent", 0)]
+            vec![
+                ("pot_changed_noted_back_unresent", 8),
+                ("hop_changed_noted_back_unresent", 0),
+                ("lobby_changed_noted_back_unresent", 0)
+            ]
         );
-        let names: Vec<&str> = CHANGE_FLUSH_SETS.iter().flat_map(|s| [s.undelivered, s.retry_failed, s.deferred, s.retried, s.resent]).collect();
+        let names: Vec<&str> = CHANGE_FLUSH_SETS
+            .iter()
+            .flat_map(|s| {
+                [
+                    s.undelivered,
+                    s.retry_failed,
+                    s.deferred,
+                    s.retried,
+                    s.resent,
+                ]
+            })
+            .collect();
         assert_eq!(
             names,
             [
-                "pot_changed_undelivered_total", "pot_changed_retry_failed_total", "pot_changed_deferred_total", "pot_changed_retried_total", "pot_changed_resent_total",
-                "hop_changed_undelivered_total", "hop_changed_retry_failed_total", "hop_changed_deferred_total", "hop_changed_retried_total", "hop_changed_resent_total",
-                "lobby_changed_undelivered_total", "lobby_changed_retry_failed_total", "lobby_changed_deferred_total", "lobby_changed_retried_total", "lobby_changed_resent_total",
+                "pot_changed_undelivered_total",
+                "pot_changed_retry_failed_total",
+                "pot_changed_deferred_total",
+                "pot_changed_retried_total",
+                "pot_changed_resent_total",
+                "hop_changed_undelivered_total",
+                "hop_changed_retry_failed_total",
+                "hop_changed_deferred_total",
+                "hop_changed_retried_total",
+                "hop_changed_resent_total",
+                "lobby_changed_undelivered_total",
+                "lobby_changed_retry_failed_total",
+                "lobby_changed_deferred_total",
+                "lobby_changed_retried_total",
+                "lobby_changed_resent_total",
             ]
         );
         // the read seeds every one at 0 and derives the figure after the rows (source)
@@ -1522,7 +1571,11 @@ mod tests {
         let body = squash(&src[start..start + src[start..].find("\n}\n").expect("its end")]);
         assert!(body.contains(&squash("for set in CHANGE_FLUSH_SETS { for name in [set.undelivered, set.retry_failed, set.deferred, set.retried, set.resent] { obj[name] = json!(0); } }")));
         let rows_at = body.find(&squash("for r in rows {")).expect("the rows");
-        let derive_at = body.find(&squash("for (name, value) in change_flush_unresent(&obj) { obj[name] = json!(value); }")).expect("the derived figure");
+        let derive_at = body
+            .find(&squash(
+                "for (name, value) in change_flush_unresent(&obj) { obj[name] = json!(value); }",
+            ))
+            .expect("the derived figure");
         assert!(derive_at > rows_at, "derived from the rows just read");
     }
 

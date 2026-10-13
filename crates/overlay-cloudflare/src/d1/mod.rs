@@ -509,7 +509,6 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 218 → 220 for NS-3: compact tracker word projection.
 pub const OVERLAY_MIGRATION_COUNT: usize = 220;
 
-
 /// Overlay Engine schema migrations.
 pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS tracker_backfill (version TEXT PRIMARY KEY, cursor TEXT NOT NULL, complete INTEGER NOT NULL)",

@@ -135,8 +135,14 @@ const _: () = assert!(OWED_DOOR_REFUSALS_MAX == 64);
 /// named each. `rows` are `OWED_DOOR_REFUSALS_SQL`'s (hopTxid, hopVout, reason); the intersection with the walk's
 /// OWN hops is kept as the belt (the SQL already joins the identity's markers): a row for an outpoint the walk does
 /// not hold names nothing.
-pub fn door_refused_hops(rows: &[(String, u32, String)], hops: &[HopEntry]) -> HashMap<String, DoorRefusal> {
-    let mine: HashSet<String> = hops.iter().map(|h| outpoint_key(&h.hop_txid, h.hop_vout)).collect();
+pub fn door_refused_hops(
+    rows: &[(String, u32, String)],
+    hops: &[HopEntry],
+) -> HashMap<String, DoorRefusal> {
+    let mine: HashSet<String> = hops
+        .iter()
+        .map(|h| outpoint_key(&h.hop_txid, h.hop_vout))
+        .collect();
     let mut out: HashMap<String, DoorRefusal> = HashMap::new();
     for (txid, vout, reason) in rows {
         let key = outpoint_key(txid, *vout);
@@ -160,10 +166,19 @@ pub fn door_refused_hops(rows: &[(String, u32, String)], hops: &[HopEntry]) -> H
 pub fn released_hop_outpoints(evictions: &[(String, Option<String>)]) -> HashSet<String> {
     let mut out = HashSet::new();
     for (_txid, released) in evictions {
-        let Some(raw) = released.as_deref() else { continue };
-        let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(raw) else { continue };
+        let Some(raw) = released.as_deref() else {
+            continue;
+        };
+        let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
         for e in entries {
-            let (Some(txid), Some(vout)) = (e.get("txid").and_then(Value::as_str), e.get("vout").and_then(Value::as_u64)) else { continue };
+            let (Some(txid), Some(vout)) = (
+                e.get("txid").and_then(Value::as_str),
+                e.get("vout").and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
             if txid.len() == 64 && txid.bytes().all(|b| b.is_ascii_hexdigit()) {
                 out.insert(outpoint_key(txid, vout as u32));
             }
@@ -204,7 +219,8 @@ pub fn refused_hop_outpoints_of(released: &HashSet<String>, hops: &[HopEntry]) -
 pub const OWED_PROBES_PER_RECOMPUTE: usize = 8;
 /// A `payout` row is CLAIMABLE only once the spend is confirmed (the credit
 /// path's landing bar); an unconfirmed spend is a row that says so.
-pub const UNCONFIRMED_PAYOUT_REASON: &str = "the spend is seen but not mined yet: the credit lands with the block";
+pub const UNCONFIRMED_PAYOUT_REASON: &str =
+    "the spend is seen but not mined yet: the credit lands with the block";
 /// The story on a pot whose spend the index HOLDS (the seat's own refund or settle, submitted here) but the chain has
 /// not confirmed: the verdict (and any press) waits for the block — never "not classified" (fleet loop 11's wave,
 /// 2026-09-19: `refundLandedVerify` read that word for 27 minutes while the refund sat seen-but-unmined between two
@@ -252,23 +268,49 @@ pub const OWED_HOME_PROBES_PER_RECOMPUTE: usize = 2;
 /// (`overlay_discovery::pot::p2pkh_input_signed`: `bsv_rs::script::Spend`, the engine's own walk), over the sighash
 /// of the bytes given: only the home key's holder can produce a `true`, whoever carried the bytes and whether or
 /// not the spender is mined. Anything malformed, oversized or unverifiable is `false`.
-pub fn home_output_spend_proven(spender_raw: &[u8], home_txid: &str, home_vout: u32, home_pkh_hex: &str, sats: u64) -> bool {
-    let Ok(tx) = bsv_rs::transaction::Transaction::from_binary(spender_raw) else { return false };
-    let Some(pkh) = hex::decode(home_pkh_hex).ok().and_then(|b| <[u8; 20]>::try_from(b).ok()) else { return false };
-    let Some(vin) = tx
-        .inputs
-        .iter()
-        .position(|inp| inp.source_output_index == home_vout && inp.source_txid.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(home_txid)))
+pub fn home_output_spend_proven(
+    spender_raw: &[u8],
+    home_txid: &str,
+    home_vout: u32,
+    home_pkh_hex: &str,
+    sats: u64,
+) -> bool {
+    let Ok(tx) = bsv_rs::transaction::Transaction::from_binary(spender_raw) else {
+        return false;
+    };
+    let Some(pkh) = hex::decode(home_pkh_hex)
+        .ok()
+        .and_then(|b| <[u8; 20]>::try_from(b).ok())
     else {
         return false;
     };
-    overlay_discovery::pot::p2pkh_input_signed(&tx, vin, &overlay_discovery::pot::p2pkh_lock(&pkh), sats)
+    let Some(vin) = tx.inputs.iter().position(|inp| {
+        inp.source_output_index == home_vout
+            && inp
+                .source_txid
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(home_txid))
+    }) else {
+        return false;
+    };
+    overlay_discovery::pot::p2pkh_input_signed(
+        &tx,
+        vin,
+        &overlay_discovery::pot::p2pkh_lock(&pkh),
+        sats,
+    )
 }
 
 /// PURE: the probe-memo target of a home output's LATCH (`read_probe_memos` and the latch write both key it through
 /// `hops_view::probe_memo_key`, so the key written is the key read back: pinned on real SQLite).
 pub fn home_latch_target(sweep_txid: &str, vout: u32) -> (String, u32) {
-    (format!("{HOME_SPEND_LATCH_PREFIX}{}", sweep_txid.to_ascii_lowercase()), vout)
+    (
+        format!(
+            "{HOME_SPEND_LATCH_PREFIX}{}",
+            sweep_txid.to_ascii_lowercase()
+        ),
+        vout,
+    )
 }
 
 /// PURE (bsv-low #485, the lens fold's MEDIUM-2): the first rung of the home walk. A candidate whose latch memo
@@ -278,7 +320,11 @@ pub fn latched_home_words(
     candidates: &[CourierHomeOutput],
     latch_memos: &[crate::hops_view::ProbeMemo],
 ) -> (HashMap<String, HomeSpendWord>, Vec<(String, u32)>) {
-    let latched: HashSet<&str> = latch_memos.iter().filter(|m| m.spent && m.spending_txid.is_some()).map(|m| m.outpoint.as_str()).collect();
+    let latched: HashSet<&str> = latch_memos
+        .iter()
+        .filter(|m| m.spent && m.spending_txid.is_some())
+        .map(|m| m.outpoint.as_str())
+        .collect();
     let mut words: HashMap<String, HomeSpendWord> = HashMap::new();
     let mut targets: Vec<(String, u32)> = Vec::new();
     for c in candidates {
@@ -310,10 +356,15 @@ pub fn home_word(
     match probe.spent? {
         false => Some((HomeSpendWord::Unspent, None)),
         true => {
-            let Some(raw) = spender_raw.filter(|raw| home_output_spend_proven(raw, &home.sweep_txid, home.vout, &home.pkh_hex, home.sats)) else {
+            let Some(raw) = spender_raw.filter(|raw| {
+                home_output_spend_proven(raw, &home.sweep_txid, home.vout, &home.pkh_hex, home.sats)
+            }) else {
                 return Some((HomeSpendWord::Unproven, None));
             };
-            let proven_txid = bsv_rs::transaction::Transaction::from_binary(raw).ok()?.id().to_ascii_lowercase();
+            let proven_txid = bsv_rs::transaction::Transaction::from_binary(raw)
+                .ok()?
+                .id()
+                .to_ascii_lowercase();
             let (latch_txid, vout) = home_latch_target(&home.sweep_txid, home.vout);
             Some((
                 HomeSpendWord::Proven,
@@ -346,24 +397,41 @@ pub const HOME_WALK_CURSOR_PREFIX: &str = "homecursor:";
 
 /// PURE: the probe-memo target of an identity's home-walk cursor.
 pub fn home_cursor_target(identity_lc: &str) -> (String, u32) {
-    (format!("{HOME_WALK_CURSOR_PREFIX}{}", identity_lc.to_ascii_lowercase()), 0)
+    (
+        format!(
+            "{HOME_WALK_CURSOR_PREFIX}{}",
+            identity_lc.to_ascii_lowercase()
+        ),
+        0,
+    )
 }
 
 /// PURE: the cursor the memo read returned for `identity_lc` (the memo key of the output to start at), if any.
 pub fn home_cursor_of(memos: &[crate::hops_view::ProbeMemo], identity_lc: &str) -> Option<String> {
     let (txid, vout) = home_cursor_target(identity_lc);
     let key = crate::hops_view::probe_memo_key(&txid, vout);
-    memos.iter().filter(|m| m.outpoint == key).max_by_key(|m| m.probed_at_ms).and_then(|m| m.spending_txid.clone())
+    memos
+        .iter()
+        .filter(|m| m.outpoint == key)
+        .max_by_key(|m| m.probed_at_ms)
+        .and_then(|m| m.spending_txid.clone())
 }
 
 /// PURE: the cursor row that makes `next` the start of the identity's next pass.
-pub fn home_cursor_memo(identity_lc: &str, next: &CourierHomeOutput, now_ms: i64) -> crate::hops_view::ProbeMemo {
+pub fn home_cursor_memo(
+    identity_lc: &str,
+    next: &CourierHomeOutput,
+    now_ms: i64,
+) -> crate::hops_view::ProbeMemo {
     let (txid, vout) = home_cursor_target(identity_lc);
     crate::hops_view::ProbeMemo {
         outpoint: crate::hops_view::probe_memo_key(&txid, vout),
         probed_at_ms: now_ms,
         spent: false,
-        spending_txid: Some(crate::hops_view::probe_memo_key(&next.sweep_txid, next.vout)),
+        spending_txid: Some(crate::hops_view::probe_memo_key(
+            &next.sweep_txid,
+            next.vout,
+        )),
         spent_confirmed: None,
     }
 }
@@ -376,19 +444,35 @@ pub fn home_cursor_memo(identity_lc: &str, next: &CourierHomeOutput, now_ms: i64
 /// moves past an output the pass withheld nothing from (`home_cursor_after`), so no fixed head can hold a cap
 /// against the tail: before, the three cuts shared one sorted order and an unprovable head starved the rest for
 /// ever (bsv-low `CLAUDE.md`, the bounded-walk starvation lesson of 2026-09-19).
-pub fn home_walk_window(candidates: &[CourierHomeOutput], cursor: Option<&str>, window: usize) -> Vec<CourierHomeOutput> {
+pub fn home_walk_window(
+    candidates: &[CourierHomeOutput],
+    cursor: Option<&str>,
+    window: usize,
+) -> Vec<CourierHomeOutput> {
     let n = candidates.len();
-    let at = cursor.and_then(|c| c.rsplit_once('.')).and_then(|(txid, vout)| Some((txid.to_ascii_lowercase(), vout.parse::<u32>().ok()?)));
+    let at = cursor
+        .and_then(|c| c.rsplit_once('.'))
+        .and_then(|(txid, vout)| Some((txid.to_ascii_lowercase(), vout.parse::<u32>().ok()?)));
     let start = at
-        .and_then(|(txid, vout)| candidates.iter().position(|c| (c.sweep_txid.to_ascii_lowercase(), c.vout) >= (txid.clone(), vout)))
+        .and_then(|(txid, vout)| {
+            candidates
+                .iter()
+                .position(|c| (c.sweep_txid.to_ascii_lowercase(), c.vout) >= (txid.clone(), vout))
+        })
         .unwrap_or(0);
-    (0..n.min(window)).map(|k| candidates[(start + k) % n].clone()).collect()
+    (0..n.min(window))
+        .map(|k| candidates[(start + k) % n].clone())
+        .collect()
 }
 
 /// PURE: where the NEXT pass starts. The first output of the window the pass WITHHELD something from (a cap or
 /// the clock stood between it and a look it was owed); with nothing withheld, the candidate after the window. A
 /// window that held every candidate and withheld nothing leaves the cursor where it is (`None`: no write).
-pub fn home_cursor_after<'a>(candidates: &'a [CourierHomeOutput], window: &'a [CourierHomeOutput], first_withheld: Option<usize>) -> Option<&'a CourierHomeOutput> {
+pub fn home_cursor_after<'a>(
+    candidates: &'a [CourierHomeOutput],
+    window: &'a [CourierHomeOutput],
+    first_withheld: Option<usize>,
+) -> Option<&'a CourierHomeOutput> {
     if let Some(home) = first_withheld.and_then(|i| window.get(i)) {
         return Some(home);
     }
@@ -453,8 +537,14 @@ pub async fn home_walk_pass<W: HomeWalkWorld>(
         crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
         crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
     );
-    let mut answered: HashMap<String, crate::hops_view::ChainSpendProbe> = answered.into_iter().map(|(t, v, p)| (outpoint_key(&t, v), p)).collect();
-    let mut pass = HomePass { words, ..HomePass::default() };
+    let mut answered: HashMap<String, crate::hops_view::ChainSpendProbe> = answered
+        .into_iter()
+        .map(|(t, v, p)| (outpoint_key(&t, v), p))
+        .collect();
+    let mut pass = HomePass {
+        words,
+        ..HomePass::default()
+    };
     let mut latches: Vec<crate::hops_view::ProbeMemo> = Vec::new();
     for (idx, home) in window.iter().enumerate() {
         let key = outpoint_key(&home.sweep_txid, home.vout);
@@ -467,7 +557,12 @@ pub async fn home_walk_pass<W: HomeWalkWorld>(
             None if pass.probes < OWED_HOME_PROBES_PER_RECOMPUTE && !world.over_budget() => {
                 pass.probes += 1;
                 let p = world.probe(&home.sweep_txid, home.vout).await;
-                pass.memos.extend(crate::hops_view::probe_memo_of(&home.sweep_txid, home.vout, &p, now_ms));
+                pass.memos.extend(crate::hops_view::probe_memo_of(
+                    &home.sweep_txid,
+                    home.vout,
+                    &p,
+                    now_ms,
+                ));
                 Some(p)
             }
             None => {
@@ -477,8 +572,13 @@ pub async fn home_walk_pass<W: HomeWalkWorld>(
         };
         if let Some(probe) = probe {
             let mut raw: Option<Vec<u8>> = None;
-            if let (true, Some(true), Some(sp)) = (probe.known, probe.spent, probe.spending_txid.as_deref().map(str::to_ascii_lowercase)) {
-                if pass.stored_reads < OWED_HOME_STORED_READS_PER_RECOMPUTE && !world.over_budget() {
+            if let (true, Some(true), Some(sp)) = (
+                probe.known,
+                probe.spent,
+                probe.spending_txid.as_deref().map(str::to_ascii_lowercase),
+            ) {
+                if pass.stored_reads < OWED_HOME_STORED_READS_PER_RECOMPUTE && !world.over_budget()
+                {
                     pass.stored_reads += 1;
                     raw = world.stored_spender(&sp).await;
                 } else {
@@ -487,7 +587,9 @@ pub async fn home_walk_pass<W: HomeWalkWorld>(
                 if raw.is_none() {
                     raw = match world.cached_spender(&sp) {
                         Some(held) => held,
-                        None if pass.resolver_asks < OWED_HOME_PROBES_PER_RECOMPUTE && !world.over_budget() => {
+                        None if pass.resolver_asks < OWED_HOME_PROBES_PER_RECOMPUTE
+                            && !world.over_budget() =>
+                        {
                             pass.resolver_asks += 1;
                             world.resolve_spender(&sp).await
                         }
@@ -621,9 +723,10 @@ pub struct SpenderOutput {
 /// a planted row's) is refuted and the hop is judged as if the bytes were never read ("could not judge"), never a
 /// payout or a custody story off a wrong pointer. A spender whose inputs were not recorded is not refuted.
 fn pointer_refuted(i: &OwedInputs, spender: &str, h: &HopEntry) -> bool {
-    i.spender_inputs
-        .get(spender)
-        .is_some_and(|ins| !ins.iter().any(|(t, v)| *v == h.hop_vout && t.eq_ignore_ascii_case(&h.hop_txid)))
+    i.spender_inputs.get(spender).is_some_and(|ins| {
+        !ins.iter()
+            .any(|(t, v)| *v == h.hop_vout && t.eq_ignore_ascii_case(&h.hop_txid))
+    })
 }
 
 /// A hop spent by its OWN seat's sweep — the FILED sweep, or a spender whose stored bytes pay the seat's committed
@@ -723,7 +826,13 @@ pub struct OwedInputs<'a> {
 
 /// The 20-byte pkh of a standard P2PKH locking script (`76 a9 14 <20> 88 ac`), lowercase hex; `None` for any other lock.
 pub fn p2pkh_pkh_hex(lock: &[u8]) -> Option<String> {
-    if lock.len() == 25 && lock[0] == 0x76 && lock[1] == 0xa9 && lock[2] == 0x14 && lock[23] == 0x88 && lock[24] == 0xac {
+    if lock.len() == 25
+        && lock[0] == 0x76
+        && lock[1] == 0xa9
+        && lock[2] == 0x14
+        && lock[23] == 0x88
+        && lock[24] == 0xac
+    {
         Some(hex::encode(&lock[3..23]))
     } else {
         None
@@ -736,17 +845,32 @@ pub fn outpoint_key(txid: &str, vout: u32) -> String {
 
 /// PURE: (my hop outpoint, the evicted txid that released it) — the same ledger rows and the same UTXO key as
 /// [`released_hop_outpoints`], keeping WHICH eviction named the hop (the twin row to read). Sorted, deduplicated.
-pub fn released_hops_by_eviction(evictions: &[(String, Option<String>)], hops: &[HopEntry]) -> Vec<(String, String)> {
-    let mine: HashSet<String> = hops.iter().map(|h| outpoint_key(&h.hop_txid, h.hop_vout)).collect();
+pub fn released_hops_by_eviction(
+    evictions: &[(String, Option<String>)],
+    hops: &[HopEntry],
+) -> Vec<(String, String)> {
+    let mine: HashSet<String> = hops
+        .iter()
+        .map(|h| outpoint_key(&h.hop_txid, h.hop_vout))
+        .collect();
     let mut out: Vec<(String, String)> = Vec::new();
     for (evicted, released) in evictions {
         if evicted.len() != 64 || !evicted.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
-        let Some(raw) = released.as_deref() else { continue };
-        let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(raw) else { continue };
+        let Some(raw) = released.as_deref() else {
+            continue;
+        };
+        let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
         for e in entries {
-            let (Some(txid), Some(vout)) = (e.get("txid").and_then(Value::as_str), e.get("vout").and_then(Value::as_u64)) else { continue };
+            let (Some(txid), Some(vout)) = (
+                e.get("txid").and_then(Value::as_str),
+                e.get("vout").and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
             if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
                 continue;
             }
@@ -800,19 +924,28 @@ pub fn evicted_pot_homes(
         by_outpoint
             .entry(outpoint_key(&h.hop_txid, h.hop_vout))
             .and_modify(|held| {
-                if held.is_some_and(|x| !x.seat_settle_pubkey.eq_ignore_ascii_case(&h.seat_settle_pubkey) || !x.game_id.eq_ignore_ascii_case(&h.game_id)) {
+                if held.is_some_and(|x| {
+                    !x.seat_settle_pubkey
+                        .eq_ignore_ascii_case(&h.seat_settle_pubkey)
+                        || !x.game_id.eq_ignore_ascii_case(&h.game_id)
+                }) {
                     *held = None;
                 }
             })
             .or_insert(Some(h));
     }
-    let mut homes: std::collections::BTreeMap<String, Option<String>> = std::collections::BTreeMap::new();
+    let mut homes: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
     for (hop_outpoint, evicted) in released {
-        let Some(Some(h)) = by_outpoint.get(hop_outpoint) else { continue };
+        let Some(Some(h)) = by_outpoint.get(hop_outpoint) else {
+            continue;
+        };
         if h.marker_verified != MarkerVerification::Verified {
             continue;
         }
-        let Some(Some(keys)) = keys_by_txid.get(&evicted.to_ascii_lowercase()) else { continue };
+        let Some(Some(keys)) = keys_by_txid.get(&evicted.to_ascii_lowercase()) else {
+            continue;
+        };
         let my_key = h.seat_settle_pubkey.to_ascii_lowercase();
         if my_key.is_empty() {
             continue;
@@ -1364,8 +1497,13 @@ fn my_committed_pay_pkh(e: &ResultEntry) -> Option<String> {
 /// PURE (bsv-low #512, the B3 lens fold M2): THE output of a transaction that pays `pkh_hex` by a standard P2PKH,
 /// when there is EXACTLY ONE (`outputs` = each output's index and its P2PKH pkh, if it is one). None or several:
 /// `None`, never a pick (a device then reads the transaction itself and must own every home output).
-pub fn sole_home_vout<'a>(outputs: impl Iterator<Item = (u32, Option<&'a str>)>, pkh_hex: &str) -> Option<u32> {
-    let mut mine = outputs.filter(|(_, p)| p.is_some_and(|p| p.eq_ignore_ascii_case(pkh_hex))).map(|(v, _)| v);
+pub fn sole_home_vout<'a>(
+    outputs: impl Iterator<Item = (u32, Option<&'a str>)>,
+    pkh_hex: &str,
+) -> Option<u32> {
+    let mut mine = outputs
+        .filter(|(_, p)| p.is_some_and(|p| p.eq_ignore_ascii_case(pkh_hex)))
+        .map(|(v, _)| v);
     let first = mine.next()?;
     mine.next().is_none().then_some(first)
 }
@@ -1377,13 +1515,26 @@ pub fn sole_home_vout_of_raw(raw: &[u8], txid: &str, pkh_hex: &str) -> Option<u3
     if !tx.id().eq_ignore_ascii_case(txid) {
         return None;
     }
-    let pkhs: Vec<Option<String>> = tx.outputs.iter().map(|o| p2pkh_pkh_hex(&o.locking_script.to_binary())).collect();
-    sole_home_vout(pkhs.iter().enumerate().map(|(v, p)| (v as u32, p.as_deref())), pkh_hex)
+    let pkhs: Vec<Option<String>> = tx
+        .outputs
+        .iter()
+        .map(|o| p2pkh_pkh_hex(&o.locking_script.to_binary()))
+        .collect();
+    sole_home_vout(
+        pkhs.iter()
+            .enumerate()
+            .map(|(v, p)| (v as u32, p.as_deref())),
+        pkh_hex,
+    )
 }
 
 /// The served key of one (paying txid, home pkh) pair in the route's `payVout` map, lowercase.
 pub fn pay_vout_key(pay_txid: &str, pkh_hex: &str) -> String {
-    format!("{}:{}", pay_txid.to_ascii_lowercase(), pkh_hex.to_ascii_lowercase())
+    format!(
+        "{}:{}",
+        pay_txid.to_ascii_lowercase(),
+        pkh_hex.to_ascii_lowercase()
+    )
 }
 
 /// PURE (the B3 lens fold M2): the (paying txid, home pkh) of every derived payout row whose `payVout` the
@@ -1393,8 +1544,15 @@ pub fn pay_vout_key(pay_txid: &str, pkh_hex: &str) -> String {
 pub fn pay_vout_wanted(rows: &[OwedRow]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = rows
         .iter()
-        .filter(|r| r.family == OwedFamily::Payout && r.facts.get("payVout").is_some_and(Value::is_null))
-        .filter_map(|r| Some((r.facts.get("payTxid")?.as_str()?.to_ascii_lowercase(), r.facts.get("payPkh")?.as_str()?.to_ascii_lowercase())))
+        .filter(|r| {
+            r.family == OwedFamily::Payout && r.facts.get("payVout").is_some_and(Value::is_null)
+        })
+        .filter_map(|r| {
+            Some((
+                r.facts.get("payTxid")?.as_str()?.to_ascii_lowercase(),
+                r.facts.get("payPkh")?.as_str()?.to_ascii_lowercase(),
+            ))
+        })
         .collect();
     out.sort_unstable();
     out.dedup();
@@ -1406,8 +1564,13 @@ pub fn pay_vout_wanted(rows: &[OwedRow]) -> Vec<(String, String)> {
 /// rows written.
 pub fn mark_pay_vouts(rows: &mut [OwedRow], vouts: &HashMap<String, u32>) -> usize {
     let mut marked = 0usize;
-    for r in rows.iter_mut().filter(|r| r.family == OwedFamily::Payout && r.facts.get("payVout").is_some_and(Value::is_null)) {
-        let key = match (r.facts.get("payTxid").and_then(Value::as_str), r.facts.get("payPkh").and_then(Value::as_str)) {
+    for r in rows.iter_mut().filter(|r| {
+        r.family == OwedFamily::Payout && r.facts.get("payVout").is_some_and(Value::is_null)
+    }) {
+        let key = match (
+            r.facts.get("payTxid").and_then(Value::as_str),
+            r.facts.get("payPkh").and_then(Value::as_str),
+        ) {
             (Some(t), Some(p)) => pay_vout_key(t, p),
             _ => continue,
         };
@@ -1454,7 +1617,12 @@ pub struct PayVoutPass {
 /// step's own clock cuts a later chunk, the next pass does not start at the same head: an answer is memoised (a
 /// warm isolate asks only for what is left), and the start chunk turns with `turn` (the route passes the
 /// recompute's clock), so a cold isolate, or a head of rows the bytes never answer, cannot starve the tail.
-pub async fn pay_vout_pass(world: &mut impl PayVoutWorld, wanted: &[(String, String)], chunk: usize, turn: u64) -> PayVoutPass {
+pub async fn pay_vout_pass(
+    world: &mut impl PayVoutWorld,
+    wanted: &[(String, String)],
+    chunk: usize,
+    turn: u64,
+) -> PayVoutPass {
     let mut pass = PayVoutPass::default();
     let mut to_read: Vec<&(String, String)> = Vec::new();
     for w in wanted {
@@ -1581,8 +1749,14 @@ fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(Stri
 /// stake swept before any JOIN — has no pot row at all; the collect pass of 2026-09-19 pressed five such payouts to
 /// "already in your wallet", filed each, and the rows stood because this lookup read the pots' games only). Sorted,
 /// deduped, lower-case: one chunked `IN (...)` read.
-pub fn collected_lookup_games<'a>(spent_result_games: impl Iterator<Item = &'a str>, hop_games: impl Iterator<Item = &'a str>) -> Vec<String> {
-    let mut games: Vec<String> = spent_result_games.chain(hop_games).map(str::to_ascii_lowercase).collect();
+pub fn collected_lookup_games<'a>(
+    spent_result_games: impl Iterator<Item = &'a str>,
+    hop_games: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut games: Vec<String> = spent_result_games
+        .chain(hop_games)
+        .map(str::to_ascii_lowercase)
+        .collect();
     games.sort_unstable();
     games.dedup();
     games
@@ -1622,18 +1796,29 @@ impl CollectedFold {
     /// keeps out every row the door did not write that way: a chain row (keyed by an outpoint; a stranger plants
     /// those free under lenient submit) and a row whose column and key disagree retire nothing, whatever they
     /// carry. No signature is spent on a held filing (it is not tried as the v1 marker either).
-    pub fn row(&mut self, identity_lc: &str, game_id: &str, sig_hex: Option<&str>, txid: Option<&str>, pay_txid: Option<&str>) {
+    pub fn row(
+        &mut self,
+        identity_lc: &str,
+        game_id: &str,
+        sig_hex: Option<&str>,
+        txid: Option<&str>,
+        pay_txid: Option<&str>,
+    ) {
         let g = game_id.to_ascii_lowercase();
         self.present.insert(g.clone());
         if let Some(pay) = pay_txid {
-            if txid.is_some_and(|key| crate::record_post::is_held_row_key(key, &g, identity_lc, pay)) {
+            if txid
+                .is_some_and(|key| crate::record_post::is_held_row_key(key, &g, identity_lc, pay))
+            {
                 self.held.insert(held_key(&g, pay));
             } else {
                 self.held_key_mismatches += 1;
             }
             return;
         }
-        if sig_hex.is_some_and(|sig| crate::record_post::collected_sig_verifies(identity_lc, &g, sig)) {
+        if sig_hex
+            .is_some_and(|sig| crate::record_post::collected_sig_verifies(identity_lc, &g, sig))
+        {
             self.verified.insert(g);
         }
     }
@@ -1641,7 +1826,11 @@ impl CollectedFold {
 
 /// The key of [`OwedInputs::held_verified`]: `<gameId>:<payTxid>`, lowercase.
 pub fn held_key(game_id: &str, pay_txid: &str) -> String {
-    format!("{}:{}", game_id.to_ascii_lowercase(), pay_txid.to_ascii_lowercase())
+    format!(
+        "{}:{}",
+        game_id.to_ascii_lowercase(),
+        pay_txid.to_ascii_lowercase()
+    )
 }
 
 /// The fact a payout row carries beside `payTxid` (bsv-low #492): the filing a device whose wallet already OWNS
@@ -1665,8 +1854,15 @@ pub const HELD_FILING_TAG: &str = "LOW/collected/v2";
 /// judge", never worse, and a confirmed refuted pointer would be an overlay attribution bug with no producer today.
 pub fn confirmed_by_other(h: &HopEntry, word: Option<&HopChainWord>, sweep_txid: &str) -> bool {
     let other = |s: &str| !s.eq_ignore_ascii_case(sweep_txid);
-    (h.spent == Some(true) && h.spent_confirmed == Some(true) && h.spending_txid.as_deref().is_some_and(other))
-        || word.is_some_and(|w| w.looked && w.spent == Some(true) && w.spent_confirmed == Some(true) && w.spending_txid.as_deref().is_some_and(other))
+    (h.spent == Some(true)
+        && h.spent_confirmed == Some(true)
+        && h.spending_txid.as_deref().is_some_and(other))
+        || word.is_some_and(|w| {
+            w.looked
+                && w.spent == Some(true)
+                && w.spent_confirmed == Some(true)
+                && w.spending_txid.as_deref().is_some_and(other)
+        })
 }
 
 /// The hop is spent by ITS OWN SEAT'S SWEEP: the sweep this identity FILED (the index's spender or the chain rung's
@@ -1682,18 +1878,38 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
         let (Some(outs), Some(pkh)) = (i.spender_outputs.get(spender), my_pkh.as_deref()) else {
             return Vec::new();
         };
-        outs.iter().filter(|o| o.pkh_hex.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(pkh))).collect()
+        outs.iter()
+            .filter(|o| {
+                o.pkh_hex
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case(pkh))
+            })
+            .collect()
     };
     // bsv-low #485: a home output is SPENT by the index's own word, or by the home key's signature this crate
     // verified over its spender's bytes (`HomeSpendWord::Proven`); never by a courier's word of spent
-    let home_proven = |spender: &str, o: &SpenderOutput| i.home_spends.get(&outpoint_key(spender, o.vout)) == Some(&HomeSpendWord::Proven);
+    let home_proven = |spender: &str, o: &SpenderOutput| {
+        i.home_spends.get(&outpoint_key(spender, o.vout)) == Some(&HomeSpendWord::Proven)
+    };
     let home_spent = |spender: &str| -> bool {
         let mine = home_outputs_of(spender);
-        !mine.is_empty() && mine.iter().all(|o| o.spent == Some(true) || home_proven(spender, o))
+        !mine.is_empty()
+            && mine
+                .iter()
+                .all(|o| o.spent == Some(true) || home_proven(spender, o))
     };
     if let Some(filed) = i.hop_sweeps.get(&outpoint) {
-        let named_by_index = h.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid));
-        let by_chain = i.hop_chain.get(&outpoint).filter(|w| w.looked && w.spent == Some(true) && w.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid)));
+        let named_by_index = h
+            .spending_txid
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid));
+        let by_chain = i.hop_chain.get(&outpoint).filter(|w| {
+            w.looked
+                && w.spent == Some(true)
+                && w.spending_txid
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&filed.sweep_txid))
+        });
         // bsv-low #517 (loop 19, pair 11, 2026-09-21): the INDEX's own VERIFIED proof of the filed sweep names the
         // spender and confirms the payout FIRST (`transactions.has_proof`, the latch only the chaintracks-verified stitch
         // sets: a mined sweep that spends the hop is the hop's spender, definitively; the same word `/tx-any` serves and
@@ -1704,8 +1920,8 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
         // (counted once per hop in the row pass: this fn also runs in the candidates pre-pass)
         let contradicted =
             tracker_confirmed_by_other(i, h, i.hop_chain.get(&outpoint), &filed.sweep_txid);
-        let index_word =
-            (filed.index_proven || spender_mined(i, Some(&filed.sweep_txid), false)) && !contradicted;
+        let index_word = (filed.index_proven || spender_mined(i, Some(&filed.sweep_txid), false))
+            && !contradicted;
         if index_word || named_by_index || by_chain.is_some() {
             // the index's proof, OR its hop-row word, OR the chain rung's (a spend the index recorded before its block
             // and never re-checked read "not mined yet" for days on the pair: the recompute now probes such hops and
@@ -1713,23 +1929,31 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
             // the gate's LOW-3 (2026-09-19): the confirming chain word must NAME the filed sweep (`by_chain` does) — a
             // hop the JOIN took after all (evicted, then readmitted on its mine) reads spent+confirmed by a DIFFERENT
             // tx, and that must never turn the sweep's payout claimable for a tx that can never mine
-            let confirmed = index_word || spender_mined(
-                i,
-                Some(&filed.sweep_txid),
-                index_word
-                    || (named_by_index && h.spent_confirmed == Some(true))
-                    || by_chain.and_then(|w| w.spent_confirmed) == Some(true),
-            );
+            let confirmed = index_word
+                || spender_mined(
+                    i,
+                    Some(&filed.sweep_txid),
+                    index_word
+                        || (named_by_index && h.spent_confirmed == Some(true))
+                        || by_chain.and_then(|w| w.spent_confirmed) == Some(true),
+                );
             return Some(SweptHome {
                 sweep_txid: filed.sweep_txid.clone(),
                 raw_hex: Some(filed.raw_hex.clone()),
                 pays_sats: filed.pays_sats,
                 confirmed,
                 index_proven: index_word,
-                index_proof_height: if index_word { filed.index_proof_height } else { None },
+                index_proof_height: if index_word {
+                    filed.index_proof_height
+                } else {
+                    None
+                },
                 source: "hopsweep-filing",
                 output_spent: home_spent(&filed.sweep_txid),
-                home_outputs: home_outputs_of(&filed.sweep_txid).iter().map(|o| (o.vout, o.sats)).collect(),
+                home_outputs: home_outputs_of(&filed.sweep_txid)
+                    .iter()
+                    .map(|o| (o.vout, o.sats))
+                    .collect(),
             });
         }
     }
@@ -1740,7 +1964,14 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
         return None; // a transaction that CREATES a pot is a JOIN, never a sweep (the delta-verify's NEW-3)
     }
     let pkh = my_pkh?;
-    let mine: Vec<&SpenderOutput> = outs.iter().filter(|o| o.pkh_hex.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&pkh))).collect();
+    let mine: Vec<&SpenderOutput> = outs
+        .iter()
+        .filter(|o| {
+            o.pkh_hex
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(&pkh))
+        })
+        .collect();
     if mine.is_empty() {
         return None;
     }
@@ -1748,7 +1979,11 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
     for o in &mine {
         sum = sum.checked_add(o.sats)?;
     }
-    let source = if i.courier_spenders.contains(&spender) { "courier-bytes" } else { "index-bytes" };
+    let source = if i.courier_spenders.contains(&spender) {
+        "courier-bytes"
+    } else {
+        "index-bytes"
+    };
     Some(SweptHome {
         raw_hex: None,
         pays_sats: Some(sum),
@@ -1756,7 +1991,9 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
         index_proven: false,
         index_proof_height: None,
         source,
-        output_spent: mine.iter().all(|o| o.spent == Some(true) || home_proven(&spender, o)),
+        output_spent: mine
+            .iter()
+            .all(|o| o.spent == Some(true) || home_proven(&spender, o)),
         home_outputs: mine.iter().map(|o| (o.vout, o.sats)).collect(),
         sweep_txid: spender,
     })
@@ -1782,16 +2019,27 @@ pub fn courier_home_outputs(i: &OwedInputs) -> Vec<CourierHomeOutput> {
         if i.collected_verified.contains(&game) {
             continue;
         }
-        let Some(swept) = swept_home(i, h) else { continue };
+        let Some(swept) = swept_home(i, h) else {
+            continue;
+        };
         if swept.source != "courier-bytes" || !swept.confirmed || swept.output_spent {
             continue;
         }
-        if i.held_verified.contains(&held_key(&game, &swept.sweep_txid)) {
+        if i.held_verified
+            .contains(&held_key(&game, &swept.sweep_txid))
+        {
             continue; // bsv-low #492: retired by the identity's held filing, nothing to walk
         }
-        let Some(pkh) = i.my_pkh_by_game.get(&game) else { continue };
+        let Some(pkh) = i.my_pkh_by_game.get(&game) else {
+            continue;
+        };
         for (vout, sats) in &swept.home_outputs {
-            out.push(CourierHomeOutput { sweep_txid: swept.sweep_txid.to_ascii_lowercase(), vout: *vout, pkh_hex: pkh.to_ascii_lowercase(), sats: *sats });
+            out.push(CourierHomeOutput {
+                sweep_txid: swept.sweep_txid.to_ascii_lowercase(),
+                vout: *vout,
+                pkh_hex: pkh.to_ascii_lowercase(),
+                sats: *sats,
+            });
         }
     }
     out.sort_by(|a, b| (&a.sweep_txid, a.vout).cmp(&(&b.sweep_txid, b.vout)));
@@ -1814,7 +2062,10 @@ fn spender_story(i: &OwedInputs, spender: &str, game: &str) -> Option<SpenderSto
         return Some(SpenderStory::Pot);
     }
     if !i.my_pkh_by_game.contains_key(game) {
-        let mut pkhs: Vec<String> = outs.iter().filter_map(|o| o.pkh_hex.as_deref().map(str::to_ascii_lowercase)).collect();
+        let mut pkhs: Vec<String> = outs
+            .iter()
+            .filter_map(|o| o.pkh_hex.as_deref().map(str::to_ascii_lowercase))
+            .collect();
         pkhs.sort_unstable();
         pkhs.dedup();
         return Some(SpenderStory::HomeUnknown { pkhs });
@@ -1823,7 +2074,11 @@ fn spender_story(i: &OwedInputs, spender: &str, game: &str) -> Option<SpenderSto
 }
 
 /// The story's reason, its machine facts written; `unknown` when the bytes were never read.
-fn story_reason(facts: &mut Value, story: Option<SpenderStory>, unknown: &'static str) -> &'static str {
+fn story_reason(
+    facts: &mut Value,
+    story: Option<SpenderStory>,
+    unknown: &'static str,
+) -> &'static str {
     match story {
         Some(SpenderStory::Pot) => {
             facts["spendKind"] = json!("pot-unindexed");
@@ -1855,15 +2110,22 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
     // and shows the marker as provenance): one marker can never hide a second pot's payout.
     let mut payout_candidates_by_game: HashMap<String, usize> = HashMap::new();
     for e in i.results {
-        if e.spent == Some(true) && e.verdict.is_some() && matches!(e.outcome, Outcome::Won | Outcome::Tie | Outcome::Refund) {
-            *payout_candidates_by_game.entry(e.game_id.to_ascii_lowercase()).or_insert(0) += 1;
+        if e.spent == Some(true)
+            && e.verdict.is_some()
+            && matches!(e.outcome, Outcome::Won | Outcome::Tie | Outcome::Refund)
+        {
+            *payout_candidates_by_game
+                .entry(e.game_id.to_ascii_lowercase())
+                .or_insert(0) += 1;
         }
     }
     // a hop spent by ITS OWN filed sweep is a payout candidate of the game too (the sweep's credit): the one
     // `collected` marker of a game whose stake came back by a sweep AND whose pot paid keeps both rows
     for h in i.hops {
         if swept_home(i, h).is_some_and(|s| !s.output_spent) {
-            *payout_candidates_by_game.entry(h.game_id.to_ascii_lowercase()).or_insert(0) += 1;
+            *payout_candidates_by_game
+                .entry(h.game_id.to_ascii_lowercase())
+                .or_insert(0) += 1;
         }
     }
 
@@ -1876,8 +2138,12 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
         let game = e.game_id.to_ascii_lowercase();
         // MEDIUM-9: the ONE shared predicate for the gate height (the committed height when it is a valid block
         // height, else the marker's; a timestamp-range value is no height) — never a fourth copy.
-        let gate = crate::refund_view::served_recovery_height(e.cov_recovery_height, e.recovery_height);
-        let refund = i.refunds.iter().find(|r| r.pot_txid.eq_ignore_ascii_case(&e.pot_txid) && r.pot_vout == e.pot_vout);
+        let gate =
+            crate::refund_view::served_recovery_height(e.cov_recovery_height, e.recovery_height);
+        let refund = i
+            .refunds
+            .iter()
+            .find(|r| r.pot_txid.eq_ignore_ascii_case(&e.pot_txid) && r.pot_vout == e.pot_vout);
         let mut base_facts = json!({
             "potTxid": e.pot_txid,
             "potVout": e.pot_vout,
@@ -1920,7 +2186,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     continue;
                 }
                 let verified_collected = i.collected_verified.contains(&game);
-                if verified_collected && payout_candidates_by_game.get(&game).copied().unwrap_or(0) <= 1 {
+                if verified_collected
+                    && payout_candidates_by_game.get(&game).copied().unwrap_or(0) <= 1
+                {
                     continue;
                 }
                 let pays_me = matches!(e.outcome, Outcome::Won | Outcome::Tie | Outcome::Refund);
@@ -1931,7 +2199,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     // row: there is nothing to collect and so nothing to press. It names the TRANSACTION, so the
                     // candidate count (N10) does not matter, and a pot whose spend becomes another transaction is
                     // served again.
-                    if e.settle_txid.as_deref().is_some_and(|t| i.held_verified.contains(&held_key(&game, t))) {
+                    if e.settle_txid
+                        .as_deref()
+                        .is_some_and(|t| i.held_verified.contains(&held_key(&game, t)))
+                    {
                         continue;
                     }
                     let mut facts = base_facts.clone();
@@ -1939,22 +2210,26 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     // NOTE-22: the press is offered only once the spend is CONFIRMED (the credit path's landing bar).
                     // the review's LOW-1 (2026-09-20): a spend with a VERIFIED proof height is mined whatever the flag says
                     // (the landing bar's third arm, the unbound arm's L1 rule) — never a chain wait said by machine on a mined tx
-                    let confirmed = e.at_height.is_some() || spender_mined(
-                        i,
-                        e.settle_txid.as_deref(),
-                        e.spent_confirmed == Some(true) || e.at_height.is_some(),
-                    );
+                    let confirmed = e.at_height.is_some()
+                        || spender_mined(
+                            i,
+                            e.settle_txid.as_deref(),
+                            e.spent_confirmed == Some(true) || e.at_height.is_some(),
+                        );
                     facts["claimable"] = json!(confirmed);
                     if !confirmed {
                         facts["claimReason"] = json!(UNCONFIRMED_PAYOUT_REASON);
                         facts["chainWait"] = json!("block"); // a CHAIN wait by machine (the wave's homeKeyRecovery: 25 min counted as a wedge)
                     }
-                    facts["collectedMarkerPresent"] = json!(i.collected_present.contains(&game) || verified_collected);
+                    facts["collectedMarkerPresent"] =
+                        json!(i.collected_present.contains(&game) || verified_collected);
                     facts["collectedSigVerified"] = json!(verified_collected);
-                    facts["creditBeef"] = json!(e.settle_txid.as_ref().map(|t| format!("/credit-beef/{t}")));
+                    facts["creditBeef"] =
+                        json!(e.settle_txid.as_ref().map(|t| format!("/credit-beef/{t}")));
                     // bsv-low #492 / #512: WHAT a device asks its own wallet about before it offers the press (does
                     // the ledger already hold this transaction?) and what its held filing names when it does
-                    facts["payTxid"] = json!(e.settle_txid.as_ref().map(|t| t.to_ascii_lowercase()));
+                    facts["payTxid"] =
+                        json!(e.settle_txid.as_ref().map(|t| t.to_ascii_lowercase()));
                     facts["heldFiling"] = json!(HELD_FILING_TAG);
                     // the B3 lens fold M2: the OUTPUT the device must own before it files (`payTxid`:`payVout`, the
                     // spend's output to my committed home `payPkh`). The spend's output order is not in the index
@@ -2015,7 +2290,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 let gate_open = matches!((gate, i.tip), (Some(h), Some(t)) if t >= h);
                 let valid = i.valid_refunds.get(&outpoint);
                 let refund_due = gate_open
-                    && refund.is_none_or(|r| r.status == RefundStatus::GateOpen || r.status == RefundStatus::Armed)
+                    && refund.is_none_or(|r| {
+                        r.status == RefundStatus::GateOpen || r.status == RefundStatus::Armed
+                    })
                     && valid.is_some();
                 if refund_due {
                     let mut facts = base_facts.clone();
@@ -2148,7 +2425,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
         // rung's): the proof did not decide (see `confirmed_by_other`). The fact rides the hop's row (whatever family
         // the ladder gives it) so the operator sees WHICH hop; the route counts the rows (the delta-verify's N-A/N-B:
         // this derivation stays pure, no global moves here)
-        if i.hop_sweeps.get(&outpoint).is_some_and(|f| f.index_proven && confirmed_by_other(h, i.hop_chain.get(&outpoint), &f.sweep_txid)) {
+        if i.hop_sweeps.get(&outpoint).is_some_and(|f| {
+            f.index_proven && confirmed_by_other(h, i.hop_chain.get(&outpoint), &f.sweep_txid)
+        }) {
             contradicted_hops.insert(outpoint.clone());
         }
         if let Some(swept) = swept_home(i, h) {
@@ -2156,12 +2435,15 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 continue;
             }
             let verified_collected = i.collected_verified.contains(&game);
-            if verified_collected && payout_candidates_by_game.get(&game).copied().unwrap_or(0) <= 1 {
+            if verified_collected && payout_candidates_by_game.get(&game).copied().unwrap_or(0) <= 1
+            {
                 continue;
             }
             // bsv-low #492 / #512: the wallet already holds this sweep's payout (the identity's held filing names
             // the sweep): not a row, whichever proof named the sweep (a courier-proven one included)
-            if i.held_verified.contains(&held_key(&game, &swept.sweep_txid)) {
+            if i.held_verified
+                .contains(&held_key(&game, &swept.sweep_txid))
+            {
                 continue;
             }
             let mut facts = facts_base.clone();
@@ -2183,16 +2465,31 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 // forever. An UNCONFIRMED one keeps its waiting word (the round-2 LOW-1): the pointer's spend may
                 // still be displaced, so "the sats sit at your home" is said only once the chain confirmed it.
                 facts["claimable"] = json!(false);
-                facts["claimReason"] = json!(if swept.confirmed { COURIER_BYTES_NO_CREDIT_REASON } else { UNCONFIRMED_PAYOUT_REASON });
+                facts["claimReason"] = json!(if swept.confirmed {
+                    COURIER_BYTES_NO_CREDIT_REASON
+                } else {
+                    UNCONFIRMED_PAYOUT_REASON
+                });
                 // bsv-low #485: the row retires by a `collected` filing, or once every home output's spend is PROVEN
                 // (`swept_home`'s `output_spent`: the home key's signature, verified here). Until then it says what the
                 // chain rung's look at the home outputs found, when it looked: `unspent` (a corroborated absence: the
                 // sats were seen at the home) or `unproven` (a spender is named, its bytes do not carry the proof yet).
                 facts["creditKind"] = json!("courier-bytes");
-                let words: Vec<Option<&HomeSpendWord>> = swept.home_outputs.iter().map(|(vout, _)| i.home_spends.get(&outpoint_key(&swept.sweep_txid, *vout))).collect();
-                if words.iter().any(|w| matches!(w, Some(HomeSpendWord::Unproven))) {
+                let words: Vec<Option<&HomeSpendWord>> = swept
+                    .home_outputs
+                    .iter()
+                    .map(|(vout, _)| i.home_spends.get(&outpoint_key(&swept.sweep_txid, *vout)))
+                    .collect();
+                if words
+                    .iter()
+                    .any(|w| matches!(w, Some(HomeSpendWord::Unproven)))
+                {
                     facts["homeSpend"] = json!("unproven");
-                } else if !words.is_empty() && words.iter().all(|w| matches!(w, Some(HomeSpendWord::Unspent | HomeSpendWord::Proven))) {
+                } else if !words.is_empty()
+                    && words
+                        .iter()
+                        .all(|w| matches!(w, Some(HomeSpendWord::Unspent | HomeSpendWord::Proven)))
+                {
                     facts["homeSpend"] = json!("unspent");
                 }
             }
@@ -2203,9 +2500,21 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             // the delta-verify's NEW-1 (2026-09-19): WHICH word made the payout claimable, and how old the chain's word
             // was — a confirmation from a memo (≤ 2 h) after a reorg is a wrong word an operator must be able to see
             if swept.confirmed {
-                let by_index = h.spending_txid.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&swept.sweep_txid)) && h.spent_confirmed == Some(true);
+                let by_index = h
+                    .spending_txid
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&swept.sweep_txid))
+                    && h.spent_confirmed == Some(true);
                 let word = i.hop_chain.get(&outpoint);
-                facts["confirmedSource"] = json!(if swept.index_proven { "index-proof" } else if by_index { "index" } else if word.and_then(|w| w.age_ms).is_some() { "chain-memo" } else { "chain-probe" });
+                facts["confirmedSource"] = json!(if swept.index_proven {
+                    "index-proof"
+                } else if by_index {
+                    "index"
+                } else if word.and_then(|w| w.age_ms).is_some() {
+                    "chain-memo"
+                } else {
+                    "chain-probe"
+                });
                 if let Some(height) = swept.index_proof_height {
                     facts["sweepProofHeight"] = json!(height);
                 }
@@ -2223,7 +2532,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             let pay_pkh = i.my_pkh_by_game.get(&game).map(|p| p.to_ascii_lowercase());
             let pay_vout = match swept.home_outputs.as_slice() {
                 [(vout, _)] => Some(*vout),
-                [] => match (swept.raw_hex.as_deref().and_then(|h| hex::decode(h).ok()), pay_pkh.as_deref()) {
+                [] => match (
+                    swept.raw_hex.as_deref().and_then(|h| hex::decode(h).ok()),
+                    pay_pkh.as_deref(),
+                ) {
                     (Some(raw), Some(pkh)) => sole_home_vout_of_raw(&raw, &swept.sweep_txid, pkh),
                     _ => None,
                 },
@@ -2231,7 +2543,8 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             };
             facts["payPkh"] = json!(pay_pkh);
             facts["payVout"] = json!(pay_vout);
-            facts["collectedMarkerPresent"] = json!(i.collected_present.contains(&game) || verified_collected);
+            facts["collectedMarkerPresent"] =
+                json!(i.collected_present.contains(&game) || verified_collected);
             facts["collectedSigVerified"] = json!(verified_collected);
             rows.push(OwedRow {
                 identity: me.clone(),
@@ -2250,7 +2563,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
         match h.status {
             HopStatus::Spent => {
                 let spender = h.spending_txid.as_deref().map(str::to_ascii_lowercase);
-                let by_pot = spender.as_deref().is_some_and(|s| i.pot_spenders.contains(s));
+                let by_pot = spender
+                    .as_deref()
+                    .is_some_and(|s| i.pot_spenders.contains(s));
                 if by_pot {
                     continue; // the JOIN took it: the pot's own row tells the story
                 }
@@ -2260,7 +2575,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 // pays no home of mine) the story is positive: spent outside this game (`spent-elsewhere`).
                 let mut facts = facts_base.clone();
                 facts["claim"] = Value::Null;
-                let story = spender.as_deref().filter(|s| !pointer_refuted(i, s, h)).and_then(|s| spender_story(i, s, &game));
+                let story = spender
+                    .as_deref()
+                    .filter(|s| !pointer_refuted(i, s, h))
+                    .and_then(|s| spender_story(i, s, &game));
                 let reason = if i.pot_spenders_faulted {
                     "could not check the hop's spender against the index this pass (a read faulted)"
                 } else {
@@ -2383,8 +2701,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     Some(w) if w.looked && w.spent == Some(false) => {
                         facts["claim"] = json!("sweep-hop");
                         facts["claimable"] = json!(true);
-                        facts["chainProbe"] = json!(if w.stale { "unspent-stale" } else { "unspent" });
-                        if let Some(age) = w.age_ms { facts["chainProbeAgeMs"] = json!(age); }
+                        facts["chainProbe"] =
+                            json!(if w.stale { "unspent-stale" } else { "unspent" });
+                        if let Some(age) = w.age_ms {
+                            facts["chainProbeAgeMs"] = json!(age);
+                        }
                         // the FILED sweep rides the row when this identity filed one (any device presses it as it
                         // is); without one the press signs a sweep on the device that owns the key
                         match i.hop_sweeps.get(&outpoint) {
@@ -2415,12 +2736,17 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     }
                     Some(w) if w.looked && w.spent == Some(true) => {
                         let spender = w.spending_txid.as_deref().map(str::to_ascii_lowercase);
-                        if spender.as_deref().is_some_and(|s| i.pot_spenders.contains(s)) {
+                        if spender
+                            .as_deref()
+                            .is_some_and(|s| i.pot_spenders.contains(s))
+                        {
                             continue; // the JOIN took it after all (the index lagged): the pot's row tells the story
                         }
                         facts["claim"] = Value::Null;
                         facts["chainProbe"] = json!("spent");
-                        if let Some(age) = w.age_ms { facts["chainProbeAgeMs"] = json!(age); }
+                        if let Some(age) = w.age_ms {
+                            facts["chainProbeAgeMs"] = json!(age);
+                        }
                         facts["chainSpender"] = json!(w.spending_txid);
                         facts["spentConfirmed"] = json!(w.spent_confirmed);
                         let story = spender
@@ -2549,12 +2875,21 @@ pub const OWED_STATE_STAMP_SQL: &str = "SELECT computedAtMs FROM owed_state WHER
 
 /// PURE: the ONE batch that writes a snapshot (the identity's rows replaced, the marker stamped, the marker's stamp
 /// read back), in order, all or nothing. The route binds it to D1; the pin runs it on real SQLite.
-pub fn owed_write_plan(identity_lc: &str, rows: &[OwedRow], computed_at_ms: i64, tip: Option<u64>, truncated: bool) -> Vec<(&'static str, Vec<OwedBind>)> {
+pub fn owed_write_plan(
+    identity_lc: &str,
+    rows: &[OwedRow],
+    computed_at_ms: i64,
+    tip: Option<u64>,
+    truncated: bool,
+) -> Vec<(&'static str, Vec<OwedBind>)> {
     let text = |s: &str| OwedBind::Text(s.to_string());
     let opt_text = |s: Option<&str>| s.map_or(OwedBind::Null, |s| OwedBind::Text(s.to_string()));
     let opt_int = |v: Option<u64>| v.map_or(OwedBind::Null, |v| OwedBind::Int(v as i64));
     let mut plan: Vec<(&'static str, Vec<OwedBind>)> = Vec::with_capacity(rows.len() + 3);
-    plan.push((OWED_ROWS_DELETE_SQL, vec![text(identity_lc), OwedBind::Int(computed_at_ms)]));
+    plan.push((
+        OWED_ROWS_DELETE_SQL,
+        vec![text(identity_lc), OwedBind::Int(computed_at_ms)],
+    ));
     for r in rows {
         plan.push((
             OWED_ROW_INSERT_SQL,
@@ -2574,7 +2909,13 @@ pub fn owed_write_plan(identity_lc: &str, rows: &[OwedRow], computed_at_ms: i64,
     }
     plan.push((
         OWED_STATE_UPSERT_SQL,
-        vec![text(identity_lc), OwedBind::Int(computed_at_ms), opt_int(tip), OwedBind::Int(rows.len() as i64), OwedBind::Int(i64::from(truncated))],
+        vec![
+            text(identity_lc),
+            OwedBind::Int(computed_at_ms),
+            opt_int(tip),
+            OwedBind::Int(rows.len() as i64),
+            OwedBind::Int(i64::from(truncated)),
+        ],
     ));
     plan.push((OWED_STATE_STAMP_SQL, vec![text(identity_lc)]));
     plan
@@ -2638,11 +2979,13 @@ pub const OWED_STALE_ON_TIP_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE i
 /// party rows naming the pot and the hop rows naming the hop — so an eviction re-derives both seats' owed rows at
 /// once instead of at the next cadence (up to 5 minutes, with a live Rejoin press on a hand the network refused).
 pub const OWED_ATTRIBUTE_BY_POT_SQL: &str = "SELECT DISTINCT identity FROM potparty_records WHERE potTxid = ?1 AND potVout = ?2 UNION SELECT identity FROM potparty_records_evicted WHERE potTxid = ?1 AND potVout = ?2";
-pub const OWED_ATTRIBUTE_BY_HOP_SQL: &str = "SELECT DISTINCT identity FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2";
+pub const OWED_ATTRIBUTE_BY_HOP_SQL: &str =
+    "SELECT DISTINCT identity FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2";
 /// Fleet loop 15 (2026-09-20, the review's MED-2): the REFUND-BACKUP filing names the pot too (`idx_potrefund_pot`) —
 /// the one marker a seat killed at the funding still filed (its party marker never was), so a pot with no party
 /// rows and no hop match still reaches its seats' owed rows on its confirm event.
-pub const OWED_ATTRIBUTE_BY_POTREFUND_SQL: &str = "SELECT DISTINCT identity FROM potrefund_records WHERE potTxid = ?1 AND potVout = ?2";
+pub const OWED_ATTRIBUTE_BY_POTREFUND_SQL: &str =
+    "SELECT DISTINCT identity FROM potrefund_records WHERE potTxid = ?1 AND potVout = ?2";
 pub const OWED_STALE_FOR_POT_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE identity IN (SELECT DISTINCT identity FROM potparty_records WHERE potTxid = ?1 AND potVout = ?2)";
 // N3: both stale marks join EXACTLY (`idx_potparty_pot`, the `pot_records` PK), as every sibling query in this crate
 // does (`results_sql`: `r.txid = pp.potTxid`); a `lower()` on a join key would scan the table per block / per filing.
@@ -2665,20 +3008,29 @@ pub const OWED_RECOMPUTE_ANY_AFTER_MS: i64 = 15 * 60 * 1000;
 /// a hop crosses its window, a counterparty files). bsv-low #484 (delta fold, D-M1): so is a payout whose chain
 /// word was a "confirmed" taken inside the reorg grace (`hops_view::mark_reorg_grace_rows`): asked again in five minutes.
 pub fn row_is_open(r: &OwedRow) -> bool {
-    r.family != OwedFamily::Payout || r.facts["claimable"] == Value::Bool(false) || r.facts[crate::hops_view::OWED_FACT_REORG_GRACE_WORD] == Value::Bool(true)
+    r.family != OwedFamily::Payout
+        || r.facts["claimable"] == Value::Bool(false)
+        || r.facts[crate::hops_view::OWED_FACT_REORG_GRACE_WORD] == Value::Bool(true)
 }
 
 /// The read's rule (N5, the ONE predicate): recompute when the marker says stale; when the tip advanced past an
 /// in-progress row's recovery height since the compute; when an open list is older than 5 minutes; when any list is
 /// older than 15 minutes (an empty list must not stay "nothing owed" forever; a stranded hop crosses its window with
 /// no other trigger).
-pub fn should_recompute(stale: bool, age_ms: i64, prev_tip: Option<u64>, tip_now: Option<u64>, rows: &[OwedRow]) -> bool {
+pub fn should_recompute(
+    stale: bool,
+    age_ms: i64,
+    prev_tip: Option<u64>,
+    tip_now: Option<u64>,
+    rows: &[OwedRow],
+) -> bool {
     if stale {
         return true;
     }
     let gate_flipped = match tip_now {
         Some(t) if prev_tip.is_none_or(|p| p < t) => rows.iter().any(|r| {
-            r.family == OwedFamily::InProgress && r.facts["recoveryHeight"].as_u64().is_some_and(|h| t >= h)
+            r.family == OwedFamily::InProgress
+                && r.facts["recoveryHeight"].as_u64().is_some_and(|h| t >= h)
         }),
         _ => false,
     };
@@ -2705,7 +3057,14 @@ pub fn sort_rows_for_service(rows: &mut [OwedRow]) {
 pub const OWED_MAX_ROWS: usize = 500;
 
 // ── counters (isolate-scoped, on /health like the filings') ─────────────────
-pub const RECOMPUTE_SOURCES: [&str; 6] = ["pot-changed", "hop-changed", "filing", "read-first", "read-stale", "read-aged"];
+pub const RECOMPUTE_SOURCES: [&str; 6] = [
+    "pot-changed",
+    "hop-changed",
+    "filing",
+    "read-first",
+    "read-stale",
+    "read-aged",
+];
 static RECOMPUTE_BY_SOURCE: [AtomicU64; 6] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -2801,7 +3160,14 @@ pub fn note_sweep_proof_contradictions(n: u64) {
 }
 /// PURE: how many rows of one derivation carry the contradiction fact (the route's count, pinned).
 pub fn count_sweep_proof_contradictions(rows: &[OwedRow]) -> u64 {
-    rows.iter().filter(|r| r.facts.get("sweepProofContradicted").and_then(|v| v.as_bool()) == Some(true)).count() as u64
+    rows.iter()
+        .filter(|r| {
+            r.facts
+                .get("sweepProofContradicted")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+        })
+        .count() as u64
 }
 
 pub fn note_recompute(source: &str, rows: &[OwedRow]) {
@@ -2872,9 +3238,14 @@ impl RecomputeRate {
     /// snapshot and counts it with [`note_recompute_shed`]).
     pub fn admit(&mut self, identity_lc: &str, now_ms: i64, sheddable: bool) -> bool {
         if self.windows.len() >= OWED_RECOMPUTE_RATE_PRUNE_AT {
-            self.windows.retain(|_, (start, _)| now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS);
+            self.windows.retain(|_, (start, _)| {
+                now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS
+            });
         }
-        let w = self.windows.entry(identity_lc.to_string()).or_insert((now_ms, 0));
+        let w = self
+            .windows
+            .entry(identity_lc.to_string())
+            .or_insert((now_ms, 0));
         if now_ms.saturating_sub(w.0) >= OWED_RECOMPUTE_RATE_WINDOW_MS {
             *w = (now_ms, 0);
         }
@@ -2895,7 +3266,10 @@ impl RecomputeRate {
     pub fn at_ceiling(&self, now_ms: i64) -> usize {
         self.windows
             .values()
-            .filter(|(start, n)| now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS && *n >= OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW)
+            .filter(|(start, n)| {
+                now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS
+                    && *n >= OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW
+            })
             .count()
     }
 }
@@ -2919,11 +3293,17 @@ pub fn recompute_shed_total() -> u64 {
 pub fn owed_health_json() -> Value {
     let mut by_source = serde_json::Map::new();
     for (i, s) in RECOMPUTE_SOURCES.iter().enumerate() {
-        by_source.insert((*s).to_string(), json!(RECOMPUTE_BY_SOURCE[i].load(Ordering::Relaxed)));
+        by_source.insert(
+            (*s).to_string(),
+            json!(RECOMPUTE_BY_SOURCE[i].load(Ordering::Relaxed)),
+        );
     }
     let mut by_family = serde_json::Map::new();
     for f in OwedFamily::ALL {
-        by_family.insert(f.as_str().to_string(), json!(ROWS_BY_FAMILY[f.index()].load(Ordering::Relaxed)));
+        by_family.insert(
+            f.as_str().to_string(),
+            json!(ROWS_BY_FAMILY[f.index()].load(Ordering::Relaxed)),
+        );
     }
     json!({
         "countersScope": "isolate",
@@ -2960,7 +3340,12 @@ pub fn owed_health_json() -> Value {
 
 /// The `owed-changed` event body, pushed to the identity's durable box after a
 /// recompute a change triggered (the page re-reads `/owed` on it).
-pub fn owed_changed_event_body(identity: &str, source: &str, rows: usize, computed_at_ms: i64) -> Value {
+pub fn owed_changed_event_body(
+    identity: &str,
+    source: &str,
+    rows: usize,
+    computed_at_ms: i64,
+) -> Value {
     json!({
         "v": 1,
         "kind": "owed-changed",
@@ -2997,13 +3382,19 @@ pub(crate) mod tests {
     use crate::refund_view::RefundStatus;
     use crate::results::{MoneyFacts, PotBinding, TxMoneyFacts};
 
-    pub(crate) const ME: &str = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    pub(crate) const ME: &str =
+        "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OPP: &str = "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     pub(crate) fn tx(b: u8) -> String {
         hex::encode([b; 32])
     }
 
-    fn entry(spent: Option<bool>, verdict: Option<PotVerdict>, outcome: Outcome, my_seat: Option<SeatLetter>) -> ResultEntry {
+    fn entry(
+        spent: Option<bool>,
+        verdict: Option<PotVerdict>,
+        outcome: Outcome,
+        my_seat: Option<SeatLetter>,
+    ) -> ResultEntry {
         ResultEntry {
             game_id: tx(0x01),
             pot_txid: tx(0x02),
@@ -3011,7 +3402,11 @@ pub(crate) mod tests {
             recovery_height: 900_000,
             cov_recovery_height: Some(900_000),
             opponent_identity: OPP.to_string(),
-            settle_txid: if spent == Some(true) { Some(tx(0x03)) } else { None },
+            settle_txid: if spent == Some(true) {
+                Some(tx(0x03))
+            } else {
+                None
+            },
             spent,
             spent_confirmed: spent,
             pot_binding: PotBinding::Chain,
@@ -3020,7 +3415,11 @@ pub(crate) mod tests {
             settle_signers: Some("coop".into()),
             outcome,
             outcome_source: Some("chain+seatkey"),
-            at_height: if spent == Some(true) { Some(900_100) } else { None },
+            at_height: if spent == Some(true) {
+                Some(900_100)
+            } else {
+                None
+            },
             winner_hand: None,
             marker_hands: Default::default(),
             hands_source: None,
@@ -3028,7 +3427,13 @@ pub(crate) mod tests {
             money: MoneyFacts {
                 funding: None,
                 settle: if spent == Some(true) {
-                    Some(TxMoneyFacts { txid: tx(0x03), size_bytes: Some(3577), fee_sats: Some(400), pay_a_sats: Some(39_200), pay_b_sats: Some(0) })
+                    Some(TxMoneyFacts {
+                        txid: tx(0x03),
+                        size_bytes: Some(3577),
+                        fee_sats: Some(400),
+                        pay_a_sats: Some(39_200),
+                        pay_b_sats: Some(0),
+                    })
                 } else {
                     None
                 },
@@ -3041,12 +3446,27 @@ pub(crate) mod tests {
 
     #[test]
     fn ns3_m2_index_proof_survives_missing_row_and_cannot_check() {
-        let entries = [entry(Some(true),Some(PotVerdict::WinnerA),Outcome::Won,Some(SeatLetter::A))];
-        let (v,c,p) = (HashMap::new(),HashSet::new(),HashSet::new());
-        for words in [std::collections::BTreeMap::new(),std::collections::BTreeMap::from([(tx(3),json!({"word":"mined","verifyPath":null,"cannotCheck":"header snapshot changed"}))])] {
-            let mut i = inputs(&entries,&[],&[],&v,&c,&p,Some(900_200));
+        let entries = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        for words in [
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([(
+                tx(3),
+                json!({"word":"mined","verifyPath":null,"cannotCheck":"header snapshot changed"}),
+            )]),
+        ] {
+            let mut i = inputs(&entries, &[], &[], &v, &c, &p, Some(900_200));
             i.spender_words = Some(&words);
-            assert_eq!(derive_owed_rows(&i)[0].facts["claimable"],true,"index verified proof first");
+            assert_eq!(
+                derive_owed_rows(&i)[0].facts["claimable"],
+                true,
+                "index verified proof first"
+            );
         }
     }
 
@@ -3054,7 +3474,12 @@ pub(crate) mod tests {
     /// not hold — never the custody story, on the index pointer and on the chain rung alike.
     #[test]
     fn ns3_owed_tracker_word_controls_claim_even_when_legacy_flags_disagree() {
-        let mut unproved = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
+        let mut unproved = entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        );
         unproved.at_height = None;
         let entries = [unproved];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
@@ -3137,9 +3562,21 @@ pub(crate) mod tests {
         m.insert(
             join.clone(),
             vec![
-                SpenderOutput { vout: 0, pkh_hex: None, sats: 40_000, spent: None, pot_lock: true },
+                SpenderOutput {
+                    vout: 0,
+                    pkh_hex: None,
+                    sats: 40_000,
+                    spent: None,
+                    pot_lock: true,
+                },
                 // the change pays MY home: a pot-creating tx is still a JOIN, never a 190-sat "sweep" (NEW-3)
-                SpenderOutput { vout: 1, pkh_hex: Some("cc".repeat(20)), sats: 190, spent: None, pot_lock: false },
+                SpenderOutput {
+                    vout: 1,
+                    pkh_hex: Some("cc".repeat(20)),
+                    sats: 190,
+                    spent: None,
+                    pot_lock: false,
+                },
             ],
         );
         let mut pkhs: HashMap<String, String> = HashMap::new();
@@ -3156,7 +3593,13 @@ pub(crate) mod tests {
         assert!(rows[0].facts.get("claim").is_none_or(|c| c.is_null()));
         // 2. the chain rung names it (the index says unspent)
         let old = [hop(HopStatus::Unspent, None, Some(10_000_000))];
-        let by_chain = chain_confirmed(&format!("{}:0", tx(0x07)), true, Some(true), Some(&join), Some(true));
+        let by_chain = chain_confirmed(
+            &format!("{}:0", tx(0x07)),
+            true,
+            Some(true),
+            Some(&join),
+            Some(true),
+        );
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &by_chain;
         i.spender_outputs = &m;
@@ -3171,14 +3614,24 @@ pub(crate) mod tests {
     /// committed home is yours". The ledger names the hop the JOIN spent (the UTXO), the twin holds the lock's
     /// decode, my VERIFIED hop marker names my settle key: the home follows and the hop's real spender is judged.
     #[test]
-    fn a_refused_joins_committed_home_is_read_from_the_twin_keyed_on_the_released_hop_so_its_spender_is_judged() {
+    fn a_refused_joins_committed_home_is_read_from_the_twin_keyed_on_the_released_hop_so_its_spender_is_judged(
+    ) {
         use crate::results::CommittedKeys;
         let pub_a = format!("02{}", "aa".repeat(32));
         let pub_b = format!("03{}", "bb".repeat(32));
-        let keys = CommittedKeys { pub_a: pub_a.clone(), pub_b: pub_b.clone(), pay_pkh_a: "cc".repeat(20), pay_pkh_b: "dd".repeat(20) };
+        let keys = CommittedKeys {
+            pub_a: pub_a.clone(),
+            pub_b: pub_b.clone(),
+            pay_pkh_a: "cc".repeat(20),
+            pay_pkh_b: "dd".repeat(20),
+        };
         let join = tx(0x0c); // the refused JOIN (evicted: its pot row and the party rows live in the twins)
         let sweep = tx(0x0d); // what took the hop instead (courier-read bytes, pays elsewhere)
-        let released_json = |hop_txid: &str| Some(format!(r#"[{{"table":"pot_records","txid":"{hop_txid}","vout":0}}]"#));
+        let released_json = |hop_txid: &str| {
+            Some(format!(
+                r#"[{{"table":"pot_records","txid":"{hop_txid}","vout":0}}]"#
+            ))
+        };
         let ledger = [(join.clone(), released_json(&tx(0x07)))];
         let my_hop = |key: &str| {
             let mut h = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
@@ -3206,20 +3659,56 @@ pub(crate) mod tests {
         assert!(evicted_pot_homes(&released, &hops, &[]).is_empty());
         let none: HashMap<String, String> = HashMap::new();
         i.my_pkh_by_game = &none;
-        assert_eq!(derive_owed_rows(&i)[0].reason.as_deref(), Some(HOME_UNKNOWN_REASON));
+        assert_eq!(
+            derive_owed_rows(&i)[0].reason.as_deref(),
+            Some(HOME_UNKNOWN_REASON)
+        );
         // THE KEY IS THE RELEASED HOP UTXO, never a name: an eviction that released a stranger's hop names nothing,
         // and a malformed ledger row contributes nothing
-        assert!(released_hops_by_eviction(&[(join.clone(), released_json(&tx(0x08)))], &hops).is_empty());
-        assert!(released_hops_by_eviction(&[(join.clone(), None), ("zz".repeat(32), released_json(&tx(0x07))), (join.clone(), Some("nope".into()))], &hops).is_empty());
+        assert!(
+            released_hops_by_eviction(&[(join.clone(), released_json(&tx(0x08)))], &hops)
+                .is_empty()
+        );
+        assert!(released_hops_by_eviction(
+            &[
+                (join.clone(), None),
+                ("zz".repeat(32), released_json(&tx(0x07))),
+                (join.clone(), Some("nope".into()))
+            ],
+            &hops
+        )
+        .is_empty());
         // the seat must be PROVEN by the hop's own attested key
         let mut unverified = my_hop(&pub_a);
         unverified.marker_verified = MarkerVerification::Unverified;
         assert!(evicted_pot_homes(&released, &[unverified], &twin).is_empty());
-        assert!(evicted_pot_homes(&released, &[my_hop(&format!("02{}", "ee".repeat(32)))], &twin).is_empty());
+        assert!(evicted_pot_homes(
+            &released,
+            &[my_hop(&format!("02{}", "ee".repeat(32)))],
+            &twin
+        )
+        .is_empty());
         assert!(evicted_pot_homes(&released, &[my_hop("")], &twin).is_empty());
-        let both = [(join.clone(), 0u32, CommittedKeys { pub_b: pub_a.clone(), ..keys.clone() })];
+        let both = [(
+            join.clone(),
+            0u32,
+            CommittedKeys {
+                pub_b: pub_a.clone(),
+                ..keys.clone()
+            },
+        )];
         assert!(evicted_pot_homes(&released, &hops, &both).is_empty());
-        let split = [twin[0].clone(), (join.clone(), 1u32, CommittedKeys { pay_pkh_a: "ee".repeat(20), ..keys.clone() })];
+        let split = [
+            twin[0].clone(),
+            (
+                join.clone(),
+                1u32,
+                CommittedKeys {
+                    pay_pkh_a: "ee".repeat(20),
+                    ..keys.clone()
+                },
+            ),
+        ];
         assert!(evicted_pot_homes(&released, &hops, &split).is_empty());
         // two refused JOINs of ONE game: agreeing twins name the home once; disagreeing twins name nothing
         let join2 = tx(0x0e);
@@ -3230,11 +3719,27 @@ pub(crate) mod tests {
         let released2 = released_hops_by_eviction(&ledger2, &two);
         assert_eq!(released2.len(), 2);
         let agree = [twin[0].clone(), (join2.clone(), 0u32, keys.clone())];
-        assert_eq!(evicted_pot_homes(&released2, &two, &agree), vec![(tx(0x01), "cc".repeat(20))]);
-        let disagree = [twin[0].clone(), (join2, 0u32, CommittedKeys { pay_pkh_a: "ee".repeat(20), ..keys.clone() })];
+        assert_eq!(
+            evicted_pot_homes(&released2, &two, &agree),
+            vec![(tx(0x01), "cc".repeat(20))]
+        );
+        let disagree = [
+            twin[0].clone(),
+            (
+                join2,
+                0u32,
+                CommittedKeys {
+                    pay_pkh_a: "ee".repeat(20),
+                    ..keys.clone()
+                },
+            ),
+        ];
         assert!(evicted_pot_homes(&released2, &two, &disagree).is_empty());
         // seat B by the same rule
-        assert_eq!(evicted_pot_homes(&released, &[my_hop(&pub_b)], &twin), vec![(tx(0x01), "dd".repeat(20))]);
+        assert_eq!(
+            evicted_pot_homes(&released, &[my_hop(&pub_b)], &twin),
+            vec![(tx(0x01), "dd".repeat(20))]
+        );
     }
 
     /// Loop 23's pair 13 (bsv-low #610, `spec-admit-fast-join-refused`:752): p28's `tm_hopparty` submit was refused
@@ -3468,7 +3973,13 @@ pub(crate) mod tests {
     fn spent_elsewhere_needs_a_known_home_else_the_addresses_are_served_for_the_device_to_match() {
         let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
         let sweep = tx(0x0d);
-        let elsewhere = pays(&sweep, &[(0, &"99".repeat(20), 20_000, Some(false)), (1, &"88".repeat(20), 100, None)]);
+        let elsewhere = pays(
+            &sweep,
+            &[
+                (0, &"99".repeat(20), 20_000, Some(false)),
+                (1, &"88".repeat(20), 100, None),
+            ],
+        );
         let hops = [hop(HopStatus::Spent, Some(&sweep), Some(10_000_000))];
         // home UNKNOWN (no results entry for the game): the addresses, no custody story
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
@@ -3477,7 +3988,10 @@ pub(crate) mod tests {
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert_eq!(rows[0].reason.as_deref(), Some(HOME_UNKNOWN_REASON));
         assert!(rows[0].facts.get("spendKind").is_none());
-        assert_eq!(rows[0].facts["spenderPkhs"], json!(["88".repeat(20), "99".repeat(20)]));
+        assert_eq!(
+            rows[0].facts["spenderPkhs"],
+            json!(["88".repeat(20), "99".repeat(20)])
+        );
         // home KNOWN and not paid: spent outside this game, as before
         let mut pkhs: HashMap<String, String> = HashMap::new();
         pkhs.insert(tx(0x01), "cc".repeat(20));
@@ -3512,7 +4026,10 @@ pub(crate) mod tests {
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &courier;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::Payout, Some(20_000)));
+        assert_eq!(
+            (rows[0].family, rows[0].sats),
+            (OwedFamily::Payout, Some(20_000))
+        );
         assert_eq!(rows[0].facts["sweepSource"], "courier-bytes");
         assert_eq!(rows[0].facts["claimable"], false);
         assert_eq!(rows[0].facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON);
@@ -3543,8 +4060,20 @@ pub(crate) mod tests {
                 i.courier_spenders = &courier;
             }
             let rows = derive_owed_rows(&i);
-            assert_eq!(rows[0].family, OwedFamily::Unbound, "courier_sourced={courier_sourced}");
-            assert!(rows[0].reason.as_deref().unwrap().contains("could not judge"), "{:?}", rows[0].reason);
+            assert_eq!(
+                rows[0].family,
+                OwedFamily::Unbound,
+                "courier_sourced={courier_sourced}"
+            );
+            assert!(
+                rows[0]
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("could not judge"),
+                "{:?}",
+                rows[0].reason
+            );
             assert!(rows[0].facts.get("spendKind").is_none());
         }
         // the same bytes from the INDEX: claimable, as before
@@ -3568,9 +4097,20 @@ pub(crate) mod tests {
         let refunds: Vec<RefundEntry> = Vec::new();
         let hops: Vec<HopEntry> = Vec::new();
         let (valid, none, pots) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let i = inputs(&results, &refunds, &hops, &valid, &none, &pots, Some(900_200));
+        let i = inputs(
+            &results,
+            &refunds,
+            &hops,
+            &valid,
+            &none,
+            &pots,
+            Some(900_200),
+        );
         let rows = derive_owed_rows(&i);
-        assert_eq!(rows[0].reason.as_deref(), Some("the spend is not classified yet (no verdict)"));
+        assert_eq!(
+            rows[0].reason.as_deref(),
+            Some("the spend is not classified yet (no verdict)")
+        );
         assert!(rows[0].facts.get("chainWait").is_none());
     }
 
@@ -3578,7 +4118,8 @@ pub(crate) mod tests {
     /// refund submitted here, seen, between two blocks) is an honest CHAIN wait, said by machine
     /// (`facts.chainWait = "block"`), never "not classified" — the verdict is computed at the landing bar.
     #[test]
-    fn an_index_held_unconfirmed_spend_without_a_verdict_is_a_chain_wait_not_an_unclassified_story() {
+    fn an_index_held_unconfirmed_spend_without_a_verdict_is_a_chain_wait_not_an_unclassified_story()
+    {
         let mut e = entry(Some(true), None, Outcome::Refund, Some(SeatLetter::A));
         e.spent_confirmed = Some(false);
         e.at_height = None; // unconfirmed: no verified mined height (the review's LOW-1 bar)
@@ -3589,7 +4130,15 @@ pub(crate) mod tests {
         let valid = HashMap::new();
         let none = HashSet::new();
         let pots = HashSet::new();
-        let i = inputs(&results, &refunds, &hops, &valid, &none, &pots, Some(900_200));
+        let i = inputs(
+            &results,
+            &refunds,
+            &hops,
+            &valid,
+            &none,
+            &pots,
+            Some(900_200),
+        );
         let rows = derive_owed_rows(&i);
         assert_eq!(rows.len(), 1, "one story row");
         let r = &rows[0];
@@ -3597,14 +4146,30 @@ pub(crate) mod tests {
         assert_eq!(r.reason.as_deref(), Some(SPEND_AWAITING_BLOCK_REASON));
         assert_eq!(r.facts["chainWait"], json!("block"));
         assert_eq!(r.facts["spendTxid"], json!(tx(0x03)));
-        assert!(r.facts.get("claim").is_none_or(|c| c.is_null()), "no press before the block");
+        assert!(
+            r.facts.get("claim").is_none_or(|c| c.is_null()),
+            "no press before the block"
+        );
 
         // an unconfirmed PAYOUT (the verdict known, the block not yet): the press waits, the row says the chain wait
-        let mut w = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
+        let mut w = entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        );
         w.spent_confirmed = Some(false);
         w.at_height = None;
         let results_w = vec![w];
-        let i_w = inputs(&results_w, &refunds, &hops, &valid, &none, &pots, Some(900_200));
+        let i_w = inputs(
+            &results_w,
+            &refunds,
+            &hops,
+            &valid,
+            &none,
+            &pots,
+            Some(900_200),
+        );
         let rows_w = derive_owed_rows(&i_w);
         assert_eq!(rows_w.len(), 1);
         assert_eq!(rows_w[0].family, OwedFamily::Payout);
@@ -3615,10 +4180,21 @@ pub(crate) mod tests {
         let mut c = entry(Some(true), None, Outcome::Refund, Some(SeatLetter::A));
         c.spent_confirmed = Some(true);
         let results2 = vec![c];
-        let i2 = inputs(&results2, &refunds, &hops, &valid, &none, &pots, Some(900_200));
+        let i2 = inputs(
+            &results2,
+            &refunds,
+            &hops,
+            &valid,
+            &none,
+            &pots,
+            Some(900_200),
+        );
         let rows2 = derive_owed_rows(&i2);
         assert_eq!(rows2.len(), 1);
-        assert_eq!(rows2[0].reason.as_deref(), Some("the spend is not classified yet (no verdict)"));
+        assert_eq!(
+            rows2[0].reason.as_deref(),
+            Some("the spend is not classified yet (no verdict)")
+        );
         assert!(rows2[0].facts.get("chainWait").is_none());
     }
 
@@ -3658,36 +4234,98 @@ pub(crate) mod tests {
             home_spends: &NO_HOME_SPENDS,
         }
     }
-    static NO_SPENDERS: std::sync::LazyLock<HashMap<String, Vec<SpenderOutput>>> = std::sync::LazyLock::new(HashMap::new);
-    static NO_DOOR: std::sync::LazyLock<HashMap<String, DoorRefusal>> = std::sync::LazyLock::new(HashMap::new);
-    static NO_INPUTS: std::sync::LazyLock<HashMap<String, Vec<(String, u32)>>> = std::sync::LazyLock::new(HashMap::new);
-    static NO_PKHS: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(HashMap::new);
-    fn pays(spender: &str, outs: &[(u32, &str, u64, Option<bool>)]) -> HashMap<String, Vec<SpenderOutput>> {
+    static NO_SPENDERS: std::sync::LazyLock<HashMap<String, Vec<SpenderOutput>>> =
+        std::sync::LazyLock::new(HashMap::new);
+    static NO_DOOR: std::sync::LazyLock<HashMap<String, DoorRefusal>> =
+        std::sync::LazyLock::new(HashMap::new);
+    static NO_INPUTS: std::sync::LazyLock<HashMap<String, Vec<(String, u32)>>> =
+        std::sync::LazyLock::new(HashMap::new);
+    static NO_PKHS: std::sync::LazyLock<HashMap<String, String>> =
+        std::sync::LazyLock::new(HashMap::new);
+    fn pays(
+        spender: &str,
+        outs: &[(u32, &str, u64, Option<bool>)],
+    ) -> HashMap<String, Vec<SpenderOutput>> {
         let mut m = HashMap::new();
-        m.insert(spender.to_string(), outs.iter().map(|(v, pkh, sats, spent)| SpenderOutput { vout: *v, pkh_hex: Some((*pkh).to_string()), sats: *sats, spent: *spent, pot_lock: false }).collect());
+        m.insert(
+            spender.to_string(),
+            outs.iter()
+                .map(|(v, pkh, sats, spent)| SpenderOutput {
+                    vout: *v,
+                    pkh_hex: Some((*pkh).to_string()),
+                    sats: *sats,
+                    spent: *spent,
+                    pot_lock: false,
+                })
+                .collect(),
+        );
         m
     }
-    static NO_CHAIN: std::sync::LazyLock<HashMap<String, HopChainWord>> = std::sync::LazyLock::new(HashMap::new);
-    static NO_HOME_SPENDS: std::sync::LazyLock<HashMap<String, HomeSpendWord>> = std::sync::LazyLock::new(HashMap::new);
-    static NO_SWEEPS: std::sync::LazyLock<HashMap<String, crate::hopsweep::FiledHopSweep>> = std::sync::LazyLock::new(HashMap::new);
-    fn chain(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>) -> HashMap<String, HopChainWord> {
+    static NO_CHAIN: std::sync::LazyLock<HashMap<String, HopChainWord>> =
+        std::sync::LazyLock::new(HashMap::new);
+    static NO_HOME_SPENDS: std::sync::LazyLock<HashMap<String, HomeSpendWord>> =
+        std::sync::LazyLock::new(HashMap::new);
+    static NO_SWEEPS: std::sync::LazyLock<HashMap<String, crate::hopsweep::FiledHopSweep>> =
+        std::sync::LazyLock::new(HashMap::new);
+    fn chain(
+        outpoint: &str,
+        looked: bool,
+        spent: Option<bool>,
+        spender: Option<&str>,
+    ) -> HashMap<String, HopChainWord> {
         chain_confirmed(outpoint, looked, spent, spender, None)
     }
-    pub(crate) fn chain_confirmed(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>, spent_confirmed: Option<bool>) -> HashMap<String, HopChainWord> {
+    pub(crate) fn chain_confirmed(
+        outpoint: &str,
+        looked: bool,
+        spent: Option<bool>,
+        spender: Option<&str>,
+        spent_confirmed: Option<bool>,
+    ) -> HashMap<String, HopChainWord> {
         chain_confirmed_aged(outpoint, looked, spent, spender, spent_confirmed, None)
     }
-    fn chain_confirmed_aged(outpoint: &str, looked: bool, spent: Option<bool>, spender: Option<&str>, spent_confirmed: Option<bool>, age_ms: Option<i64>) -> HashMap<String, HopChainWord> {
+    fn chain_confirmed_aged(
+        outpoint: &str,
+        looked: bool,
+        spent: Option<bool>,
+        spender: Option<&str>,
+        spent_confirmed: Option<bool>,
+        age_ms: Option<i64>,
+    ) -> HashMap<String, HopChainWord> {
         let mut m = HashMap::new();
-        m.insert(outpoint.to_string(), HopChainWord { looked, spent, spending_txid: spender.map(str::to_string), spent_confirmed, stale: false, age_ms });
+        m.insert(
+            outpoint.to_string(),
+            HopChainWord {
+                looked,
+                spent,
+                spending_txid: spender.map(str::to_string),
+                spent_confirmed,
+                stale: false,
+                age_ms,
+            },
+        );
         m
     }
     fn filed(outpoint: &str, sweep_txid: &str) -> HashMap<String, crate::hopsweep::FiledHopSweep> {
         let mut m = HashMap::new();
-        m.insert(outpoint.to_string(), crate::hopsweep::FiledHopSweep { sweep_txid: sweep_txid.to_string(), raw_hex: "0100".repeat(20), pays_sats: Some(20_000), index_proven: false, index_proof_height: None });
+        m.insert(
+            outpoint.to_string(),
+            crate::hopsweep::FiledHopSweep {
+                sweep_txid: sweep_txid.to_string(),
+                raw_hex: "0100".repeat(20),
+                pays_sats: Some(20_000),
+                index_proven: false,
+                index_proof_height: None,
+            },
+        );
         m
     }
     /// #517: the same filing, held PROVEN by the index (`transactions.has_proof = 1`, the bump's block when recorded).
-    fn filed_proven(outpoint: &str, sweep_txid: &str, height: Option<u64>) -> HashMap<String, crate::hopsweep::FiledHopSweep> {
+    fn filed_proven(
+        outpoint: &str,
+        sweep_txid: &str,
+        height: Option<u64>,
+    ) -> HashMap<String, crate::hopsweep::FiledHopSweep> {
         let mut m = filed(outpoint, sweep_txid);
         if let Some(s) = m.get_mut(outpoint) {
             s.index_proven = true;
@@ -3698,7 +4336,12 @@ pub(crate) mod tests {
 
     #[test]
     fn a_won_confirmed_spend_paying_my_home_is_a_payout_row_with_my_sats() {
-        let e = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let e = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let rows = derive_owed_rows(&inputs(&e, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows.len(), 1);
@@ -3706,19 +4349,35 @@ pub(crate) mod tests {
         assert_eq!(rows[0].sats, Some(39_200));
         assert_eq!(rows[0].outpoint, format!("{}:0", tx(0x02)));
         assert_eq!(rows[0].facts["claim"], "internalize");
-        assert_eq!(rows[0].facts["creditBeef"], format!("/credit-beef/{}", tx(0x03)));
+        assert_eq!(
+            rows[0].facts["creditBeef"],
+            format!("/credit-beef/{}", tx(0x03))
+        );
         assert_eq!(rows[0].at_height, Some(900_100));
     }
 
     #[test]
-    fn a_decided_loss_is_not_a_row_and_a_verified_collected_payout_is_not_a_row_but_a_planted_one_stays() {
-        let lost = [entry(Some(true), Some(PotVerdict::WinnerB), Outcome::Lost, Some(SeatLetter::A))];
+    fn a_decided_loss_is_not_a_row_and_a_verified_collected_payout_is_not_a_row_but_a_planted_one_stays(
+    ) {
+        let lost = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerB),
+            Outcome::Lost,
+            Some(SeatLetter::A),
+        )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         assert!(derive_owed_rows(&inputs(&lost, &[], &[], &v, &c, &p, Some(900_200))).is_empty());
-        let won = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let won = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
         // the identity's OWN collected filing (signature verified under it): retired
         let verified: HashSet<String> = [tx(0x01)].into_iter().collect();
-        assert!(derive_owed_rows(&inputs(&won, &[], &[], &v, &verified, &p, Some(900_200))).is_empty());
+        assert!(
+            derive_owed_rows(&inputs(&won, &[], &[], &v, &verified, &p, Some(900_200))).is_empty()
+        );
         // the gate's HIGH-1: a PRESENT collected row nobody verified (a stranger's dust marker naming the winner)
         // retires NOTHING — the row stays, with the presence named as provenance
         let present: HashSet<String> = [tx(0x01)].into_iter().collect();
@@ -3734,11 +4393,24 @@ pub(crate) mod tests {
 
     #[test]
     fn an_unconfirmed_payout_is_a_row_that_is_not_claimable_yet() {
-        let mut e = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
+        let mut e = entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        );
         e.spent_confirmed = Some(false);
         e.at_height = None; // unconfirmed: no verified mined height (the review's LOW-1 bar)
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(std::slice::from_ref(&e), &[], &[], &v, &c, &p, Some(900_200)));
+        let rows = derive_owed_rows(&inputs(
+            std::slice::from_ref(&e),
+            &[],
+            &[],
+            &v,
+            &c,
+            &p,
+            Some(900_200),
+        ));
         assert_eq!(rows[0].family, OwedFamily::Payout);
         assert_eq!(rows[0].facts["claimable"], false);
         assert_eq!(rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
@@ -3747,34 +4419,81 @@ pub(crate) mod tests {
     #[test]
     fn a_winner_verdict_that_contradicts_my_seat_sizes_nothing() {
         // NOTE-16: winner-a with my seat B (a self-signed claim contradicting the binding) never takes home A's amount
-        let e = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::B));
+        let e = entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::B),
+        );
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(std::slice::from_ref(&e), &[], &[], &v, &c, &p, Some(900_200)));
+        let rows = derive_owed_rows(&inputs(
+            std::slice::from_ref(&e),
+            &[],
+            &[],
+            &v,
+            &c,
+            &p,
+            Some(900_200),
+        ));
         assert_eq!(rows[0].sats, None);
     }
 
     #[test]
     fn a_tie_and_a_refund_verdict_pay_my_seat_side() {
-        let mut e = entry(Some(true), Some(PotVerdict::Tie), Outcome::Tie, Some(SeatLetter::B));
+        let mut e = entry(
+            Some(true),
+            Some(PotVerdict::Tie),
+            Outcome::Tie,
+            Some(SeatLetter::B),
+        );
         e.money.settle.as_mut().unwrap().pay_a_sats = Some(19_600);
         e.money.settle.as_mut().unwrap().pay_b_sats = Some(19_600);
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(std::slice::from_ref(&e), &[], &[], &v, &c, &p, Some(900_200)));
-        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::Payout, Some(19_600)));
+        let rows = derive_owed_rows(&inputs(
+            std::slice::from_ref(&e),
+            &[],
+            &[],
+            &v,
+            &c,
+            &p,
+            Some(900_200),
+        ));
+        assert_eq!(
+            (rows[0].family, rows[0].sats),
+            (OwedFamily::Payout, Some(19_600))
+        );
         // the same tie with the seat unknown: a payout the brain cannot size, never a guess
         let unknown = entry(Some(true), Some(PotVerdict::Tie), Outcome::Tie, None);
-        let rows = derive_owed_rows(&inputs(std::slice::from_ref(&unknown), &[], &[], &v, &c, &p, Some(900_200)));
+        let rows = derive_owed_rows(&inputs(
+            std::slice::from_ref(&unknown),
+            &[],
+            &[],
+            &v,
+            &c,
+            &p,
+            Some(900_200),
+        ));
         assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::Payout, None));
     }
 
     #[test]
     fn a_spent_pot_the_brain_cannot_judge_is_unbound_with_its_sentence() {
-        let no_verdict = [entry(Some(true), None, Outcome::Unresolved, Some(SeatLetter::A))];
+        let no_verdict = [entry(
+            Some(true),
+            None,
+            Outcome::Unresolved,
+            Some(SeatLetter::A),
+        )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let rows = derive_owed_rows(&inputs(&no_verdict, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0].reason.as_deref().unwrap().contains("no verdict"));
-        let no_seat = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Unresolved, None)];
+        let no_seat = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Unresolved,
+            None,
+        )];
         let rows = derive_owed_rows(&inputs(&no_seat, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0].reason.as_deref().unwrap().contains("seat binding"));
@@ -3808,25 +4527,55 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_unspent_pot_past_the_gate_with_a_valid_filed_refund_is_refund_due_sized_by_the_refunds_output() {
-        let e = [entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A))];
+    fn an_unspent_pot_past_the_gate_with_a_valid_filed_refund_is_refund_due_sized_by_the_refunds_output(
+    ) {
+        let e = [entry(
+            Some(false),
+            None,
+            Outcome::Unresolved,
+            Some(SeatLetter::A),
+        )];
         let r = [refund_entry(RefundStatus::GateOpen)];
         let mut valid = HashMap::new();
-        valid.insert(format!("{}:0", tx(0x02)), ValidRefund { raw_hex: "00".into(), my_sats: Some(19_800) });
+        valid.insert(
+            format!("{}:0", tx(0x02)),
+            ValidRefund {
+                raw_hex: "00".into(),
+                my_sats: Some(19_800),
+            },
+        );
         let (c, p) = (HashSet::new(), HashSet::new());
         let rows = derive_owed_rows(&inputs(&e, &r, &[], &valid, &c, &p, Some(900_005)));
-        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::RefundDue, Some(19_800)));
+        assert_eq!(
+            (rows[0].family, rows[0].sats),
+            (OwedFamily::RefundDue, Some(19_800))
+        );
         assert_eq!(rows[0].facts["claim"], "present-refund");
         assert_eq!(rows[0].facts["claimable"], true);
         // LOW-15: a refund paying my home NOTHING is a sizing fault, said as such, never "0 sats"
         let mut zero = HashMap::new();
-        zero.insert(format!("{}:0", tx(0x02)), ValidRefund { raw_hex: "00".into(), my_sats: Some(0) });
+        zero.insert(
+            format!("{}:0", tx(0x02)),
+            ValidRefund {
+                raw_hex: "00".into(),
+                my_sats: Some(0),
+            },
+        );
         let rows = derive_owed_rows(&inputs(&e, &r, &[], &zero, &c, &p, Some(900_005)));
-        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::RefundDue, None));
-        assert!(rows[0].facts["refundSizing"].as_str().unwrap().starts_with("zero"));
+        assert_eq!(
+            (rows[0].family, rows[0].sats),
+            (OwedFamily::RefundDue, None)
+        );
+        assert!(rows[0].facts["refundSizing"]
+            .as_str()
+            .unwrap()
+            .starts_with("zero"));
         // the gate NOT open yet: the hand's window, a rejoin row sized by my stake
         let rows = derive_owed_rows(&inputs(&e, &r, &[], &valid, &c, &p, Some(899_990)));
-        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::InProgress, Some(20_000)));
+        assert_eq!(
+            (rows[0].family, rows[0].sats),
+            (OwedFamily::InProgress, Some(20_000))
+        );
         assert_eq!(rows[0].facts["claim"], "rejoin");
         // bsv-low #518 (loop 20's pre-flight, 2026-09-21): an EVICTED, never readmitted pot is never a refund-due row
         // (nor any row of its own), whatever its pot row says — a row that outran its eviction before #513 read
@@ -3837,7 +4586,13 @@ pub(crate) mod tests {
         let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
         i.evicted_pots = &evicted;
         let rows_ev = derive_owed_rows(&i);
-        assert!(rows_ev.iter().all(|row| row.family != OwedFamily::RefundDue && row.family != OwedFamily::InProgress), "{rows_ev:?}");
+        assert!(
+            rows_ev
+                .iter()
+                .all(|row| row.family != OwedFamily::RefundDue
+                    && row.family != OwedFamily::InProgress),
+            "{rows_ev:?}"
+        );
         let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(899_990));
         i.evicted_pots = &evicted;
         let rows_ev = derive_owed_rows(&i);
@@ -3849,7 +4604,10 @@ pub(crate) mod tests {
         // refund record surfaces. It rides `facts.recoveryHeight`, never `at_height` (a future gate is not a mined
         // "at height": the owed list renders/sorts `atHeight` as one), which stays None on an unspent pot.
         assert_eq!(rows[0].facts["recoveryHeight"], 900_000);
-        assert!(rows[0].at_height.is_none(), "an unspent in-progress pot has no mined height");
+        assert!(
+            rows[0].at_height.is_none(),
+            "an unspent in-progress pot has no mined height"
+        );
         // the gate open and NO valid filed refund: unbound, with the tower named as the path
         let none = HashMap::new();
         let rows = derive_owed_rows(&inputs(&e, &r, &[], &none, &c, &p, Some(900_005)));
@@ -3863,18 +4621,45 @@ pub(crate) mod tests {
         // (`/refund-view` serves gate-open for the same pot), a timestamp-range value is no height at all
         let mut cov_zero = entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A));
         cov_zero.cov_recovery_height = Some(0);
-        let rows = derive_owed_rows(&inputs(std::slice::from_ref(&cov_zero), &r, &[], &valid, &c, &p, Some(900_005)));
-        assert_eq!(rows[0].family, OwedFamily::RefundDue, "the marker height 900_000 gates, the committed 0 does not veto it");
+        let rows = derive_owed_rows(&inputs(
+            std::slice::from_ref(&cov_zero),
+            &r,
+            &[],
+            &valid,
+            &c,
+            &p,
+            Some(900_005),
+        ));
+        assert_eq!(
+            rows[0].family,
+            OwedFamily::RefundDue,
+            "the marker height 900_000 gates, the committed 0 does not veto it"
+        );
         assert_eq!(rows[0].facts["recoveryHeight"], 900_000);
         let mut stamp = entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A));
         stamp.cov_recovery_height = Some(1_800_000_000);
         stamp.recovery_height = 0;
-        let rows = derive_owed_rows(&inputs(std::slice::from_ref(&stamp), &[], &[], &valid, &c, &p, Some(900_005)));
-        assert!(rows[0].facts["recoveryHeight"].is_null(), "a timestamp-range value is no gate height");
+        let rows = derive_owed_rows(&inputs(
+            std::slice::from_ref(&stamp),
+            &[],
+            &[],
+            &valid,
+            &c,
+            &p,
+            Some(900_005),
+        ));
+        assert!(
+            rows[0].facts["recoveryHeight"].is_null(),
+            "a timestamp-range value is no gate height"
+        );
         assert_eq!(rows[0].family, OwedFamily::InProgress);
     }
 
-    pub(crate) fn hop(status: HopStatus, spender: Option<&str>, created_ms_ago: Option<i64>) -> HopEntry {
+    pub(crate) fn hop(
+        status: HopStatus,
+        spender: Option<&str>,
+        created_ms_ago: Option<i64>,
+    ) -> HopEntry {
         HopEntry {
             game_id: tx(0x01),
             hop_txid: tx(0x07),
@@ -3897,22 +4682,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_hop_unspent_past_the_window_is_stranded_with_a_sweep_claim_a_young_one_is_in_progress_with_rejoin() {
+    fn a_hop_unspent_past_the_window_is_stranded_with_a_sweep_claim_a_young_one_is_in_progress_with_rejoin(
+    ) {
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
         let key = format!("{}:0", tx(0x07));
         let unspent = chain(&key, true, Some(false), None);
         let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(900_000));
         i.hop_chain = &unspent;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::HopStranded, Some(20_190)));
+        assert_eq!(
+            (rows[0].family, rows[0].sats),
+            (OwedFamily::HopStranded, Some(20_190))
+        );
         assert_eq!(rows[0].facts["claim"], "sweep-hop");
         assert_eq!(rows[0].facts["chainProbe"], "unspent");
         // a YOUNG unspent hop is an `in-progress` row with the felt's rejoin (the stake is funded, the hand has not
         // started), sized by the hop, never a sweep claim before the window
         let young = [hop(HopStatus::Unspent, None, Some(60_000))];
         let rows = derive_owed_rows(&inputs(&[], &[], &young, &v, &c, &p, Some(900_000)));
-        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::InProgress, Some(20_190)));
+        assert_eq!(
+            (rows[0].family, rows[0].sats),
+            (OwedFamily::InProgress, Some(20_190))
+        );
         assert_eq!(rows[0].facts["claim"], "rejoin");
         assert_eq!(rows[0].facts["claimable"], true);
         assert_eq!(rows[0].facts["stage"], "hop-funded");
@@ -3921,31 +4717,47 @@ pub(crate) mod tests {
         assert!(rows[0].facts.get("sweepRawHex").is_none());
         // an age the brain cannot say, or a marker not yet verified: no row
         let ageless = [hop(HopStatus::Unspent, None, None)];
-        assert!(derive_owed_rows(&inputs(&[], &[], &ageless, &v, &c, &p, Some(900_000))).is_empty());
+        assert!(
+            derive_owed_rows(&inputs(&[], &[], &ageless, &v, &c, &p, Some(900_000))).is_empty()
+        );
         let mut unverified = hop(HopStatus::Unspent, None, Some(60_000));
         unverified.marker_verified = MarkerVerification::Unknown;
-        assert!(derive_owed_rows(&inputs(&[], &[], &[unverified], &v, &c, &p, Some(900_000))).is_empty());
+        assert!(
+            derive_owed_rows(&inputs(&[], &[], &[unverified], &v, &c, &p, Some(900_000)))
+                .is_empty()
+        );
     }
 
     #[test]
-    fn a_hop_spent_by_a_low_pot_is_no_row_a_hop_spent_by_an_unindexed_spender_is_unbound_never_a_custody_story() {
+    fn a_hop_spent_by_a_low_pot_is_no_row_a_hop_spent_by_an_unindexed_spender_is_unbound_never_a_custody_story(
+    ) {
         let (v, c) = (HashMap::new(), HashSet::new());
         let join = tx(0x02);
         let by_pot = [hop(HopStatus::Spent, Some(&join), Some(10_000_000))];
         let pots: HashSet<String> = [join.clone()].into_iter().collect();
-        assert!(derive_owed_rows(&inputs(&[], &[], &by_pot, &v, &c, &pots, Some(900_000))).is_empty());
+        assert!(
+            derive_owed_rows(&inputs(&[], &[], &by_pot, &v, &c, &pots, Some(900_000))).is_empty()
+        );
         // MEDIUM-7: a spender absent from the index is NOT evidence of a wallet spend (an unindexed JOIN is the common
         // honest case): a sentence, no claim, never "spent elsewhere"
         let elsewhere = [hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000))];
         let rows = derive_owed_rows(&inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0].facts["claim"].is_null());
-        assert!(rows[0].reason.as_deref().unwrap().contains("could not judge"));
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("could not judge"));
         // a FAULTED spender check says so
         let mut i = inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000));
         i.pot_spenders_faulted = true;
         let rows = derive_owed_rows(&i);
-        assert!(rows[0].reason.as_deref().unwrap().contains("could not check"));
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("could not check"));
     }
 
     #[test]
@@ -3953,13 +4765,21 @@ pub(crate) mod tests {
         // the index's "unspent" alone is a sentence; the chain's unspent is the claim; the chain's spent-by-a-pot is no
         // row; the chain's spent-by-another is could-not-judge
         let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
         let key = format!("{}:0", tx(0x07));
         // no chain word yet
         let rows = derive_owed_rows(&inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert_eq!(rows[0].facts["chainProbe"], "pending");
-        assert!(rows[0].reason.as_deref().unwrap().contains("not corroborated"));
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("not corroborated"));
         // the providers could not look
         let not_looked = chain(&key, false, None, None);
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
@@ -3988,15 +4808,39 @@ pub(crate) mod tests {
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let mut planted = hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1));
         planted.marker_verified = MarkerVerification::Unverified;
-        let rows = derive_owed_rows(&inputs(&[], &[], std::slice::from_ref(&planted), &v, &c, &p, Some(900_000)));
+        let rows = derive_owed_rows(&inputs(
+            &[],
+            &[],
+            std::slice::from_ref(&planted),
+            &v,
+            &c,
+            &p,
+            Some(900_000),
+        ));
         assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::Unbound, None));
         assert!(rows[0].facts["claim"].is_null());
-        assert!(rows[0].reason.as_deref().unwrap().contains("does not verify"));
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("does not verify"));
         let mut pending = hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1));
         pending.marker_verified = MarkerVerification::Unknown;
-        let rows = derive_owed_rows(&inputs(&[], &[], std::slice::from_ref(&pending), &v, &c, &p, Some(900_000)));
+        let rows = derive_owed_rows(&inputs(
+            &[],
+            &[],
+            std::slice::from_ref(&pending),
+            &v,
+            &c,
+            &p,
+            Some(900_000),
+        ));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
-        assert!(rows[0].reason.as_deref().unwrap().contains("not verified yet"));
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("not verified yet"));
     }
 
     #[test]
@@ -4012,9 +4856,15 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::Payout, Some(20_000)));
+        assert_eq!(
+            (rows[0].family, rows[0].sats),
+            (OwedFamily::Payout, Some(20_000))
+        );
         assert_eq!(rows[0].facts["claim"], "internalize");
-        assert_eq!(rows[0].facts["claimable"], false, "the sweep is seen, not mined: the credit lands with the block");
+        assert_eq!(
+            rows[0].facts["claimable"], false,
+            "the sweep is seen, not mined: the credit lands with the block"
+        );
         assert_eq!(rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
         assert_eq!(rows[0].facts["outcome"], "hop-sweep");
         assert_eq!(rows[0].facts["sweepTxid"], sweep);
@@ -4029,13 +4879,20 @@ pub(crate) mod tests {
         let rows = derive_owed_rows(&i);
         assert_eq!(rows[0].facts["claimable"], true);
         // the CHAIN rung naming my sweep on an index-unspent hop is the same payout (a sweep broadcast direct to ARC)
-        let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
         let by_chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
         i.hop_chain = &by_chain;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].family, rows[0].facts["claimable"].as_bool()), (OwedFamily::Payout, Some(true)));
+        assert_eq!(
+            (rows[0].family, rows[0].facts["claimable"].as_bool()),
+            (OwedFamily::Payout, Some(true))
+        );
         // a spender that is NOT my filing (another tx) stays could-not-judge, as before
         let other = [hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000))];
         let mut i = inputs(&[], &[], &other, &v, &c, &no_pots, Some(900_000));
@@ -4053,7 +4910,11 @@ pub(crate) mod tests {
         let key = format!("{}:0", tx(0x07));
         let sweep = tx(0x0c);
         // the hop row as the fleet read it: index-unspent (the pointer released), old enough to be stranded
-        let hops = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let hops = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
         // the courier memo: spent by my sweep, NOT confirmed (an indexer lagging the block)
         let lagging = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(false));
         let proven = filed_proven(&key, &sweep, Some(967_696));
@@ -4061,8 +4922,14 @@ pub(crate) mod tests {
         i.hop_sweeps = &proven;
         i.hop_chain = &lagging;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::Payout, Some(20_000)));
-        assert_eq!(rows[0].facts["claimable"], true, "the index's verified proof outranks the courier's lag");
+        assert_eq!(
+            (rows[0].family, rows[0].sats),
+            (OwedFamily::Payout, Some(20_000))
+        );
+        assert_eq!(
+            rows[0].facts["claimable"], true,
+            "the index's verified proof outranks the courier's lag"
+        );
         assert_eq!(rows[0].facts["confirmedSource"], "index-proof");
         assert_eq!(rows[0].facts["sweepProofHeight"], 967_696);
         assert!(rows[0].facts.get("claimReason").is_none());
@@ -4070,7 +4937,10 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].family, rows[0].facts["claimable"].as_bool()), (OwedFamily::Payout, Some(true)));
+        assert_eq!(
+            (rows[0].family, rows[0].facts["claimable"].as_bool()),
+            (OwedFamily::Payout, Some(true))
+        );
         assert_eq!(rows[0].facts["confirmedSource"], "index-proof");
         // the same filing UNPROVEN by the index keeps the old word: the courier's lag is the row's wait
         let unproven = filed(&key, &sweep);
@@ -4099,7 +4969,10 @@ pub(crate) mod tests {
         i.hop_sweeps = &proven_no_height;
         i.hop_chain = &lagging;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].facts["claimable"].as_bool(), rows[0].at_height), (Some(true), None));
+        assert_eq!(
+            (rows[0].facts["claimable"].as_bool(), rows[0].at_height),
+            (Some(true), None)
+        );
         assert!(rows[0].facts.get("sweepProofHeight").is_none());
         // the precedence: the hop row names the sweep spent+confirmed AND the index holds it proven: "index-proof"
         let mut named = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
@@ -4107,7 +4980,10 @@ pub(crate) mod tests {
         let hops_n = [named];
         let mut i = inputs(&[], &[], &hops_n, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
-        assert_eq!(derive_owed_rows(&i)[0].facts["confirmedSource"], "index-proof");
+        assert_eq!(
+            derive_owed_rows(&i)[0].facts["confirmedSource"],
+            "index-proof"
+        );
     }
 
     /// #517, the gate's LOW-1 (Rule 6): the proof never outranks a CONTRADICTING confirmed word. A hop the index's own
@@ -4127,12 +5003,31 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops_o, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
         let rows = derive_owed_rows(&i);
-        assert_ne!(rows[0].family, OwedFamily::Payout, "the proof did not decide against the row's confirmed spender");
-        assert!(rows[0].reason.as_deref().unwrap_or("").contains("could not judge"), "{:?}", rows[0].reason);
-        assert_eq!(rows[0].facts["sweepProofContradicted"], true, "the operator sees WHICH hop");
+        assert_ne!(
+            rows[0].family,
+            OwedFamily::Payout,
+            "the proof did not decide against the row's confirmed spender"
+        );
+        assert!(
+            rows[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("could not judge"),
+            "{:?}",
+            rows[0].reason
+        );
+        assert_eq!(
+            rows[0].facts["sweepProofContradicted"], true,
+            "the operator sees WHICH hop"
+        );
         assert_eq!(count_sweep_proof_contradictions(&rows), 1);
         // the chain rung naming ANOTHER confirmed spender on an index-unspent hop: the same
-        let unspent = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let unspent = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
         let chain_other = chain_confirmed(&key, true, Some(true), Some(&tx(0x09)), Some(true));
         let mut i = inputs(&[], &[], &unspent, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
@@ -4148,17 +5043,25 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops_s, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].family, rows[0].facts["confirmedSource"].as_str()), (OwedFamily::Payout, Some("index-proof")));
+        assert_eq!(
+            (rows[0].family, rows[0].facts["confirmedSource"].as_str()),
+            (OwedFamily::Payout, Some("index-proof"))
+        );
         assert!(rows[0].facts.get("sweepProofContradicted").is_none());
         assert_eq!(count_sweep_proof_contradictions(&rows), 0);
     }
 
     #[test]
-    fn a_stranded_hop_carries_its_filed_sweep_or_says_sign_here_and_an_unindexed_hop_is_judged_by_the_chain_too() {
+    fn a_stranded_hop_carries_its_filed_sweep_or_says_sign_here_and_an_unindexed_hop_is_judged_by_the_chain_too(
+    ) {
         let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
         let key = format!("{}:0", tx(0x07));
         let unspent = chain(&key, true, Some(false), None);
-        let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
         // without a filing: the press signs on the owning device
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &unspent;
@@ -4166,7 +5069,10 @@ pub(crate) mod tests {
         assert_eq!(rows[0].facts["claim"], "sweep-hop");
         assert_eq!(rows[0].facts["sweepSource"], "sign-here");
         assert!(rows[0].facts["sweepRawHex"].is_null());
-        assert!(rows[0].facts["seatSettlePubkey"].is_string(), "the key the owning device matches its derivation against");
+        assert!(
+            rows[0].facts["seatSettlePubkey"].is_string(),
+            "the key the owning device matches its derivation against"
+        );
         // with a filing: the bytes ride the row
         let sweeps = filed(&key, &tx(0x0c));
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
@@ -4183,20 +5089,35 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &unspent;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].family, rows[0].facts["claim"].as_str()), (OwedFamily::HopStranded, Some("sweep-hop")));
+        assert_eq!(
+            (rows[0].family, rows[0].facts["claim"].as_str()),
+            (OwedFamily::HopStranded, Some("sweep-hop"))
+        );
         // …and without a chain word it is the sentence naming the missing index row
         let mut unknown = hop(HopStatus::Unknown, None, Some(HOP_STRANDED_AFTER_MS + 1));
         unknown.spent = None;
         let hops = [unknown];
         let rows = derive_owed_rows(&inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
-        assert!(rows[0].reason.as_deref().unwrap().contains("not in the index"));
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("not in the index"));
         // a recorded-but-unconfirmed spend on an Unknown hop keeps its own sentence
-        let mut recorded = hop(HopStatus::Unknown, Some(&tx(0x09)), Some(HOP_STRANDED_AFTER_MS + 1));
+        let mut recorded = hop(
+            HopStatus::Unknown,
+            Some(&tx(0x09)),
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        );
         recorded.spent = Some(true);
         let hops = [recorded];
         let rows = derive_owed_rows(&inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000)));
-        assert!(rows[0].reason.as_deref().unwrap().contains("recorded but not confirmed"));
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("recorded but not confirmed"));
     }
 
     #[test]
@@ -4211,7 +5132,11 @@ pub(crate) mod tests {
         let mut pkhs = HashMap::new();
         pkhs.insert(tx(0x01), my_pkh.clone());
         // index: unspent (the pointer released by the eviction); chain: spent by the sweep, mined
-        let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
         let by_chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
         let no_pots: HashSet<String> = HashSet::new();
         // 1. the bytes pay my home, the home output unspent → a claimable payout (source index-bytes, no raw)
@@ -4221,7 +5146,10 @@ pub(crate) mod tests {
         i.spender_outputs = &mine;
         i.my_pkh_by_game = &pkhs;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::Payout, Some(20_000)));
+        assert_eq!(
+            (rows[0].family, rows[0].sats),
+            (OwedFamily::Payout, Some(20_000))
+        );
         assert_eq!(rows[0].facts["sweepSource"], "index-bytes");
         assert_eq!(rows[0].facts["sweepTxid"], sweep);
         assert!(rows[0].facts["sweepRawHex"].is_null());
@@ -4248,7 +5176,11 @@ pub(crate) mod tests {
         i.hop_chain = &by_chain;
         i.my_pkh_by_game = &pkhs;
         let rows = derive_owed_rows(&i);
-        assert!(rows[0].reason.as_deref().unwrap().contains("could not judge the spender"));
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("could not judge the spender"));
         // 5. the same through the INDEX pointer (status Spent, the spender not a covenant pot)
         let mut spent = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
         spent.spent_confirmed = Some(true);
@@ -4257,11 +5189,17 @@ pub(crate) mod tests {
         i.spender_outputs = &mine;
         i.my_pkh_by_game = &pkhs;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].family, rows[0].facts["claimable"].as_bool()), (OwedFamily::Payout, Some(true)));
+        assert_eq!(
+            (rows[0].family, rows[0].facts["claimable"].as_bool()),
+            (OwedFamily::Payout, Some(true))
+        );
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.spender_outputs = &elsewhere;
         i.my_pkh_by_game = &pkhs;
-        assert_eq!(derive_owed_rows(&i)[0].facts["spendKind"], "spent-elsewhere");
+        assert_eq!(
+            derive_owed_rows(&i)[0].facts["spendKind"],
+            "spent-elsewhere"
+        );
     }
 
     #[test]
@@ -4269,7 +5207,10 @@ pub(crate) mod tests {
         let mut lock = vec![0x76, 0xa9, 0x14];
         lock.extend_from_slice(&[0x42; 20]);
         lock.extend_from_slice(&[0x88, 0xac]);
-        assert_eq!(p2pkh_pkh_hex(&lock).as_deref(), Some("42".repeat(20).as_str()));
+        assert_eq!(
+            p2pkh_pkh_hex(&lock).as_deref(),
+            Some("42".repeat(20).as_str())
+        );
         assert!(p2pkh_pkh_hex(&lock[..24]).is_none());
         assert!(p2pkh_pkh_hex(&[0x51]).is_none());
         let mut covenant = lock.clone();
@@ -4288,14 +5229,31 @@ pub(crate) mod tests {
         let young = [hop(HopStatus::Unspent, None, Some(60_000))];
         let key = format!("{}:0", tx(0x07));
         let mut chain: HashMap<String, HopChainWord> = HashMap::new();
-        chain.insert(key.clone(), HopChainWord { looked: true, spent: Some(false), spending_txid: None, spent_confirmed: None, stale: false, age_ms: None });
+        chain.insert(
+            key.clone(),
+            HopChainWord {
+                looked: true,
+                spent: Some(false),
+                spending_txid: None,
+                spent_confirmed: None,
+                stale: false,
+                age_ms: None,
+            },
+        );
         let mut i = inputs(&e, &[], &young, &v, &c, &p, Some(900_000));
         i.hop_chain = &chain;
         let rows = derive_owed_rows(&i);
-        assert!(rows.iter().any(|r| r.family == OwedFamily::InProgress && r.facts["claim"] == "rejoin"), "a young hop of a live game is in-progress");
+        assert!(
+            rows.iter()
+                .any(|r| r.family == OwedFamily::InProgress && r.facts["claim"] == "rejoin"),
+            "a young hop of a live game is in-progress"
+        );
         assert!(!rows.iter().any(|r| r.family == OwedFamily::HopStranded));
         // the eviction row as the overlay writes it: the pot txid + the released spends (this hop's outpoint)
-        let released = format!("[{{\"table\":\"pot_records\",\"txid\":\"{}\",\"vout\":0}}]", tx(0x07));
+        let released = format!(
+            "[{{\"table\":\"pot_records\",\"txid\":\"{}\",\"vout\":0}}]",
+            tx(0x07)
+        );
         let refused = released_hop_outpoints(&[(tx(0x02), Some(released))]);
         assert_eq!(refused.len(), 1);
         assert!(refused.contains(&key));
@@ -4311,16 +5269,27 @@ pub(crate) mod tests {
         assert_eq!(rows[0].reason.as_deref(), Some(JOIN_REFUSED_REASON));
         // HIGH-1: a PLANTED party row naming this identity, a live game and a stranger's own evicted txid releases the
         // STRANGER's hops, never this seat's: the young hop stays in-progress (a name is never the key)
-        let planted = format!("[{{\"table\":\"pot_records\",\"txid\":\"{}\",\"vout\":0}}]", tx(0x09));
+        let planted = format!(
+            "[{{\"table\":\"pot_records\",\"txid\":\"{}\",\"vout\":0}}]",
+            tx(0x09)
+        );
         let strangers = released_hop_outpoints(&[(tx(0x02), Some(planted))]);
         i.evicted_hop_outpoints = &strangers;
         let rows = derive_owed_rows(&i);
-        assert!(rows.iter().any(|r| r.family == OwedFamily::InProgress && r.facts["claim"] == "rejoin"), "a plant strands nothing");
+        assert!(
+            rows.iter()
+                .any(|r| r.family == OwedFamily::InProgress && r.facts["claim"] == "rejoin"),
+            "a plant strands nothing"
+        );
         assert!(!rows.iter().any(|r| r.family == OwedFamily::HopStranded));
         // the parser: NULL, malformed and non-hex entries contribute nothing (fail-safe)
         assert!(released_hop_outpoints(&[(tx(0x02), None)]).is_empty());
         assert!(released_hop_outpoints(&[(tx(0x02), Some("not json".into()))]).is_empty());
-        assert!(released_hop_outpoints(&[(tx(0x02), Some("[{\"txid\":\"zz\",\"vout\":0}]".into()))]).is_empty());
+        assert!(released_hop_outpoints(&[(
+            tx(0x02),
+            Some("[{\"txid\":\"zz\",\"vout\":0}]".into())
+        )])
+        .is_empty());
     }
 
     /// The delta-verify's HIGH-A (2026-09-19): the refusal's candidate set must come from the eviction LEDGER —
@@ -4329,12 +5298,20 @@ pub(crate) mod tests {
     /// derivation then strands the identity's young hop. Real SQLite, the shipped migrations, the overlay's own
     /// move statements (a dev-dependency), the app layer's own query.
     #[test]
-    fn a_refused_join_is_found_through_the_eviction_ledger_after_the_overlay_moved_the_party_row_real_sqlite() {
-        use bsv_overlay_cloudflare::admit_fast::{create_shadow_sql, move_sql, ColumnInfo, MOVED_TABLES};
+    fn a_refused_join_is_found_through_the_eviction_ledger_after_the_overlay_moved_the_party_row_real_sqlite(
+    ) {
+        use bsv_overlay_cloudflare::admit_fast::{
+            create_shadow_sql, move_sql, ColumnInfo, MOVED_TABLES,
+        };
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
             if let Err(e) = conn.execute_batch(sql) {
-                assert!(e.to_string().to_ascii_lowercase().contains("duplicate column"), "migration failed under real SQLite: {e}");
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "migration failed under real SQLite: {e}"
+                );
             }
         }
         let me = ME.to_string();
@@ -4346,9 +5323,17 @@ pub(crate) mod tests {
             rusqlite::params![me, tx(0x01), pot, tx(0x0a)],
         )
         .unwrap();
-        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 900)", rusqlite::params![pot]).unwrap();
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 900)",
+            rusqlite::params![pot],
+        )
+        .unwrap();
         // the hop's own row, its spend pointer RELEASED by the eviction (the overlay's release SQL is its own pin)
-        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 800)", rusqlite::params![hop_txid]).unwrap();
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 800)",
+            rusqlite::params![hop_txid],
+        )
+        .unwrap();
         let evicted_at = 1_700_000_000_000i64;
         conn.execute(
             "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?1, 'REJECTED (corroborated)', ?2, NULL, 2, ?3)",
@@ -4356,8 +5341,20 @@ pub(crate) mod tests {
         )
         .unwrap();
         let cols = |conn: &rusqlite::Connection, t: &str| -> Vec<ColumnInfo> {
-            let mut st = conn.prepare(&format!("PRAGMA table_info(\"{t}\")")).unwrap();
-            st.query_map([], |r| Ok(ColumnInfo { name: r.get(1)?, ty: r.get::<_, String>(2).unwrap_or_default(), notnull: r.get::<_, i64>(3).unwrap_or(0), dflt_value: r.get::<_, Option<String>>(4).unwrap_or(None) })).unwrap().map(|r| r.unwrap()).collect()
+            let mut st = conn
+                .prepare(&format!("PRAGMA table_info(\"{t}\")"))
+                .unwrap();
+            st.query_map([], |r| {
+                Ok(ColumnInfo {
+                    name: r.get(1)?,
+                    ty: r.get::<_, String>(2).unwrap_or_default(),
+                    notnull: r.get::<_, i64>(3).unwrap_or(0),
+                    dflt_value: r.get::<_, Option<String>>(4).unwrap_or(None),
+                })
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
         };
         // the overlay's eviction: every keyed row of the pot moves to its twin (the same SQL the D1 path runs)
         for (table, keys) in MOVED_TABLES {
@@ -4371,16 +5368,31 @@ pub(crate) mod tests {
                 }
                 conn.execute_batch(&create_shadow_sql(table, &c)).unwrap();
                 let (ins, del) = move_sql(table, key, &c);
-                conn.execute(&ins, rusqlite::params![evicted_at, "REJECTED (corroborated)", &pot]).unwrap();
+                conn.execute(
+                    &ins,
+                    rusqlite::params![evicted_at, "REJECTED (corroborated)", &pot],
+                )
+                .unwrap();
                 conn.execute(&del, [&pot]).unwrap();
             }
         }
-        let party_rows: i64 = conn.query_row("SELECT COUNT(*) FROM potparty_records WHERE identity = ?1", [&me], |r| r.get(0)).unwrap();
-        assert_eq!(party_rows, 0, "the results view has NO entry to derive a candidate from after the eviction");
+        let party_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM potparty_records WHERE identity = ?1",
+                [&me],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            party_rows, 0,
+            "the results view has NO entry to derive a candidate from after the eviction"
+        );
         // the app layer's own query on the ledger still names the released hop
         let mut st = conn.prepare(OWED_EVICTIONS_WINDOW_SQL).unwrap();
         let rows: Vec<(String, Option<String>)> = st
-            .query_map([evicted_at - OWED_EVICTION_WINDOW_MS + 1], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_map([evicted_at - OWED_EVICTION_WINDOW_MS + 1], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
@@ -4393,7 +5405,17 @@ pub(crate) mod tests {
         // and the derivation strands the young hop (the pot itself is gone from the results, so no pot row at all)
         let key = format!("{hop_txid}:0");
         let mut chain: HashMap<String, HopChainWord> = HashMap::new();
-        chain.insert(key, HopChainWord { looked: true, spent: Some(false), spending_txid: None, spent_confirmed: None, stale: false, age_ms: None });
+        chain.insert(
+            key,
+            HopChainWord {
+                looked: true,
+                spent: Some(false),
+                spending_txid: None,
+                spent_confirmed: None,
+                stale: false,
+                age_ms: None,
+            },
+        );
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let mut i = inputs(&[], &[], &young, &v, &c, &p, Some(900_000));
         i.hop_chain = &chain;
@@ -4435,26 +5457,38 @@ pub(crate) mod tests {
         i.hop_sweeps = &sweeps;
         i.hop_chain = &by_other;
         let rows = derive_owed_rows(&i);
-        let payout = rows.iter().find(|r| r.family == OwedFamily::Payout).expect("the sweep's payout row");
-        assert_eq!(payout.facts["claimable"], false, "a different spender's confirmation is not the sweep's");
+        let payout = rows
+            .iter()
+            .find(|r| r.family == OwedFamily::Payout)
+            .expect("the sweep's payout row");
+        assert_eq!(
+            payout.facts["claimable"], false,
+            "a different spender's confirmation is not the sweep's"
+        );
         // the chain naming the sweep, confirmed → claimable
         let by_sweep = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
         i.hop_chain = &by_sweep;
         let rows = derive_owed_rows(&i);
-        let payout = rows.iter().find(|r| r.family == OwedFamily::Payout).expect("the sweep's payout row");
+        let payout = rows
+            .iter()
+            .find(|r| r.family == OwedFamily::Payout)
+            .expect("the sweep's payout row");
         assert_eq!(payout.facts["claimable"], true);
     }
 
     #[test]
-    fn a_coalesced_ask_remembers_the_latest_source_and_the_attribution_sql_names_the_marker_tables() {
+    fn a_coalesced_ask_remembers_the_latest_source_and_the_attribution_sql_names_the_marker_tables()
+    {
         let mut m = HashMap::new();
         owed_rerun_note(&mut m, "ab", "pot-changed");
         owed_rerun_note(&mut m, "ab", "hop-changed");
         assert_eq!(m.get("ab").map(String::as_str), Some("hop-changed"));
         assert_eq!(m.len(), 1);
         // MEDIUM-1: the eviction trigger attributes through the seats' own markers, by the marker tables' real columns
-        assert!(OWED_ATTRIBUTE_BY_POT_SQL.contains("FROM potparty_records WHERE potTxid = ?1 AND potVout = ?2"));
-        assert!(OWED_ATTRIBUTE_BY_HOP_SQL.contains("FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2"));
+        assert!(OWED_ATTRIBUTE_BY_POT_SQL
+            .contains("FROM potparty_records WHERE potTxid = ?1 AND potVout = ?2"));
+        assert!(OWED_ATTRIBUTE_BY_HOP_SQL
+            .contains("FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2"));
     }
 
     #[test]
@@ -4484,9 +5518,17 @@ pub(crate) mod tests {
         let verified: HashSet<String> = [tx(0x01)].into_iter().collect();
         let mut i = inputs(&[], &[], &hops, &v, &verified, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
-        assert!(derive_owed_rows(&i).is_empty(), "collected: the sweep's credit is in the wallet");
+        assert!(
+            derive_owed_rows(&i).is_empty(),
+            "collected: the sweep's credit is in the wallet"
+        );
         // the same game ALSO has a paid pot: two candidates, the marker cannot say which; both rows stay
-        let paid = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let paid = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
         let mut i = inputs(&paid, &[], &hops, &v, &verified, &no_pots, Some(900_200));
         i.hop_sweeps = &sweeps;
         assert_eq!(derive_owed_rows(&i).len(), 2);
@@ -4496,8 +5538,14 @@ pub(crate) mod tests {
     /// paying transaction the identity's wallet ALREADY HOLDS, said by its own verified held filing, is not a row,
     /// so there is nothing to press. The filing names the transaction: another transaction's payout stays.
     #[test]
-    fn i492_a_payout_the_wallet_already_holds_is_not_served_and_the_filing_names_one_transaction_only() {
-        let won = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+    fn i492_a_payout_the_wallet_already_holds_is_not_served_and_the_filing_names_one_transaction_only(
+    ) {
+        let won = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         // before any filing: the row is served claimable, and it names what a device asks its wallet about
         let rows = derive_owed_rows(&inputs(&won, &[], &[], &v, &c, &p, Some(900_200)));
@@ -4509,9 +5557,15 @@ pub(crate) mod tests {
         let held: HashSet<String> = [held_key(&tx(0x01), &tx(0x03))].into_iter().collect();
         let mut i = inputs(&won, &[], &[], &v, &c, &p, Some(900_200));
         i.held_verified = &held;
-        assert!(derive_owed_rows(&i).is_empty(), "held: nothing to collect, nothing to press");
+        assert!(
+            derive_owed_rows(&i).is_empty(),
+            "held: nothing to collect, nothing to press"
+        );
         // a filing naming ANOTHER transaction (a spend of the pot that was replaced, another game's) retires nothing
-        for other in [held_key(&tx(0x01), &tx(0x04)), held_key(&tx(0x09), &tx(0x03))] {
+        for other in [
+            held_key(&tx(0x01), &tx(0x04)),
+            held_key(&tx(0x09), &tx(0x03)),
+        ] {
             let held: HashSet<String> = [other].into_iter().collect();
             let mut i = inputs(&won, &[], &[], &v, &c, &p, Some(900_200));
             i.held_verified = &held;
@@ -4520,7 +5574,12 @@ pub(crate) mod tests {
             assert_eq!(rows[0].facts["claimable"], true);
         }
         // a decided loss stays no row, an unspent pot is untouched by a filing naming a txid it does not have
-        let open = [entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A))];
+        let open = [entry(
+            Some(false),
+            None,
+            Outcome::Unresolved,
+            Some(SeatLetter::A),
+        )];
         let mut i = inputs(&open, &[], &[], &v, &c, &p, Some(899_000));
         i.held_verified = &held;
         assert_eq!(derive_owed_rows(&i).len(), 1);
@@ -4538,7 +5597,12 @@ pub(crate) mod tests {
         let mut mined = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
         mined.spent_confirmed = Some(true);
         let hops = [mined];
-        let paid = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let paid = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
         let v1: HashSet<String> = [tx(0x01)].into_iter().collect();
         let rows_with = |held: &HashSet<String>| {
             let mut i = inputs(&paid, &[], &hops, &v, &v1, &no_pots, Some(900_200));
@@ -4546,7 +5610,11 @@ pub(crate) mod tests {
             i.held_verified = held;
             derive_owed_rows(&i)
         };
-        assert_eq!(rows_with(&HashSet::new()).len(), 2, "the v1 marker alone cannot say which");
+        assert_eq!(
+            rows_with(&HashSet::new()).len(),
+            2,
+            "the v1 marker alone cannot say which"
+        );
         // the swept hop's row names its sweep as the paying transaction
         let both = rows_with(&HashSet::new());
         let sweep_row = both.iter().find(|r| r.outpoint == key).unwrap();
@@ -4578,7 +5646,12 @@ pub(crate) mod tests {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
             if let Err(e) = conn.execute_batch(sql) {
-                assert!(e.to_string().to_ascii_lowercase().contains("duplicate column"), "production migration failed under real SQLite: {e}");
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}"
+                );
             }
         }
         conn
@@ -4592,7 +5665,12 @@ pub(crate) mod tests {
         for game in games {
             let rows = stmt
                 .query_map(rusqlite::params![me, game], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
                 })
                 .unwrap();
             for r in rows {
@@ -4615,17 +5693,44 @@ pub(crate) mod tests {
         created_at: i64,
     ) -> std::result::Result<(String, bool), crate::record_post::RecordRefusal> {
         use crate::record_post::tests::{script, sign};
-        use crate::record_post::{cap_queries, cap_refusal_for, collected_protocol, held_challenge, insert_wrote_a_row, verify_record_post, RecordKind, VerifiedRecord, COLLECTED_FILE_SQL, HELD_TAG};
+        use crate::record_post::{
+            cap_queries, cap_refusal_for, collected_protocol, held_challenge, insert_wrote_a_row,
+            verify_record_post, RecordKind, VerifiedRecord, COLLECTED_FILE_SQL, HELD_TAG,
+        };
         let (me, game) = (hex::encode(id), hex::encode(gid));
-        let sig = sign(signer, collected_protocol(), &game, &held_challenge(&game, &me, &hex::encode(pay)));
-        let verified = verify_record_post(RecordKind::Collected, &script(&[HELD_TAG, gid, id, pay, &sig]), &me)?;
-        let VerifiedRecord::Held(r, pay_txid) = &verified else { panic!("a held filing") };
+        let sig = sign(
+            signer,
+            collected_protocol(),
+            &game,
+            &held_challenge(&game, &me, &hex::encode(pay)),
+        );
+        let verified = verify_record_post(
+            RecordKind::Collected,
+            &script(&[HELD_TAG, gid, id, pay, &sig]),
+            &me,
+        )?;
+        let VerifiedRecord::Held(r, pay_txid) = &verified else {
+            panic!("a held filing")
+        };
         let (rows_sql, binds, _, _) = cap_queries(&verified);
-        let others: i64 = conn.query_row(rows_sql, rusqlite::params![binds[0], binds[1], binds[2]], |row| row.get(0)).unwrap();
+        let others: i64 = conn
+            .query_row(
+                rows_sql,
+                rusqlite::params![binds[0], binds[1], binds[2]],
+                |row| row.get(0),
+            )
+            .unwrap();
         if let Some(refusal) = cap_refusal_for(&verified, others, 0) {
             return Err(refusal);
         }
-        let changes = conn.execute(COLLECTED_FILE_SQL, rusqlite::params![r.identity, r.game_id, r.txid, 0i64, r.sig_hex, created_at, pay_txid]).unwrap();
+        let changes = conn
+            .execute(
+                COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    r.identity, r.game_id, r.txid, 0i64, r.sig_hex, created_at, pay_txid
+                ],
+            )
+            .unwrap();
         Ok((r.txid.clone(), insert_wrote_a_row(Some(changes))))
     }
 
@@ -4652,7 +5757,12 @@ pub(crate) mod tests {
         };
         let paid: Vec<ResultEntry> = (0..N)
             .map(|k| {
-                let mut e = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
+                let mut e = entry(
+                    Some(true),
+                    Some(PotVerdict::WinnerA),
+                    Outcome::Won,
+                    Some(SeatLetter::A),
+                );
                 e.game_id = hex::encode(b32(0xa0, k));
                 e.pot_txid = hex::encode(b32(0xb0, k));
                 e.settle_txid = Some(hex::encode(b32(0xc0, k)));
@@ -4672,20 +5782,44 @@ pub(crate) mod tests {
         };
         assert_eq!(served().len(), N, "nothing filed: every payout is served");
         for k in 0..N {
-            let (_, written) = file_held(&conn, &w, &id, &b32(0xa0, k), &b32(0xc0, k), 1_000 + k as i64).unwrap();
+            let (_, written) = file_held(
+                &conn,
+                &w,
+                &id,
+                &b32(0xa0, k),
+                &b32(0xc0, k),
+                1_000 + k as i64,
+            )
+            .unwrap();
             assert!(written);
         }
-        assert_eq!(fold_collected(&conn, &me, &games).held.len(), N, "every filing is read as held: no cut at 256");
+        assert_eq!(
+            fold_collected(&conn, &me, &games).held.len(),
+            N,
+            "every filing is read as held: no cut at 256"
+        );
         // every recompute, not only the first: three passes, each from the table
         for pass in 0..3 {
             let rows = served();
-            assert!(rows.is_empty(), "pass {pass}: {} of {N} held payouts are still served", rows.len());
+            assert!(
+                rows.is_empty(),
+                "pass {pass}: {} of {N} held payouts are still served",
+                rows.len()
+            );
         }
         // and the retire is exact at this scale too: a game whose spend is replaced is served again, alone
         let mut replaced = paid.clone();
         replaced[N - 1].settle_txid = Some(tx(0xee));
         let fold = fold_collected(&conn, &me, &games);
-        let mut i = inputs(&replaced, &[], &[], &v, &fold.verified, &no_pots, Some(900_200));
+        let mut i = inputs(
+            &replaced,
+            &[],
+            &[],
+            &v,
+            &fold.verified,
+            &no_pots,
+            Some(900_200),
+        );
         i.identity_lc = &me;
         i.held_verified = &fold.held;
         let rows = derive_owed_rows(&i);
@@ -4709,7 +5843,12 @@ pub(crate) mod tests {
         let me = hex::encode(&id);
         let (gid, settle) = ([0x01u8; 32], [0x03u8; 32]);
         let game = tx(0x01);
-        let won = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let won = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
         let (v, no_pots) = (HashMap::new(), HashSet::new());
         let served = || -> (Vec<OwedRow>, CollectedFold) {
             let fold = fold_collected(&conn, &me, std::slice::from_ref(&game));
@@ -4728,9 +5867,16 @@ pub(crate) mod tests {
             .unwrap();
         }
         let (rows, fold) = served();
-        assert_eq!(rows.len(), 1, "planted rows retire nothing, whatever their column says");
+        assert_eq!(
+            rows.len(),
+            1,
+            "planted rows retire nothing, whatever their column says"
+        );
         assert_eq!(rows[0].facts["claimable"], true);
-        assert_eq!(rows[0].facts["collectedMarkerPresent"], true, "they are provenance, as before");
+        assert_eq!(
+            rows[0].facts["collectedMarkerPresent"], true,
+            "they are provenance, as before"
+        );
         assert!(fold.held.is_empty());
         assert_eq!(fold.held_key_mismatches, 5, "and they are counted");
         // three more with a `filed:` key that is not this content's key (no writer makes one; three, so the door's
@@ -4746,8 +5892,16 @@ pub(crate) mod tests {
         // the real filing, the ninth row of the pair: it retires its payout
         assert!(file_held(&conn, &w, &id, &gid, &settle, 100).unwrap().1);
         let (rows, fold) = served();
-        assert!(rows.is_empty(), "the identity's own filing is not crowded out");
-        assert_eq!(fold.held, [held_key(&game, &tx(0x03))].into_iter().collect::<HashSet<String>>());
+        assert!(
+            rows.is_empty(),
+            "the identity's own filing is not crowded out"
+        );
+        assert_eq!(
+            fold.held,
+            [held_key(&game, &tx(0x03))]
+                .into_iter()
+                .collect::<HashSet<String>>()
+        );
     }
 
     /// bsv-low #492 / #512 END TO END on real SQLite and real signatures: the door's verdict on a device's held
@@ -4756,11 +5910,14 @@ pub(crate) mod tests {
     /// was ever filed, the row was served claimable and a press said "Collected". With it: the two caps counted
     /// APART (the B3 lens fold L1) and the re-file that writes nothing (L2).
     #[test]
-    fn i492_a_devices_held_filing_retires_its_payout_through_the_door_the_table_and_the_read_on_real_sqlite() {
+    fn i492_a_devices_held_filing_retires_its_payout_through_the_door_the_table_and_the_read_on_real_sqlite(
+    ) {
         use crate::record_post::tests::{identity, script, sign, wallet};
         use crate::record_post::{
-            already_filed_body, cap_queries, cap_refusal_for, collected_challenge, collected_protocol, held_challenge, insert_wrote_a_row, verify_record_post, RecordKind,
-            RecordRefusal, VerifiedRecord, COLLECTED_FILED_ROWS_SQL, COLLECTED_FILE_SQL, HELD_FILED_ROWS_SQL, HELD_FILINGS_PER_GAME,
+            already_filed_body, cap_queries, cap_refusal_for, collected_challenge,
+            collected_protocol, held_challenge, insert_wrote_a_row, verify_record_post, RecordKind,
+            RecordRefusal, VerifiedRecord, COLLECTED_FILED_ROWS_SQL, COLLECTED_FILE_SQL,
+            HELD_FILED_ROWS_SQL, HELD_FILINGS_PER_GAME,
         };
         let conn = production_sqlite();
         let w = wallet(21);
@@ -4769,18 +5926,33 @@ pub(crate) mod tests {
         let (gid, settle, sweep_b) = ([0x01u8; 32], [0x03u8; 32], [0x0cu8; 32]);
         let (game, sweep) = (tx(0x01), tx(0x0c));
         // the game pays this seat twice: the pot's payout (settle 03..) and a swept hop's (sweep 0c..)
-        let paid = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let paid = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
         let hop_key = format!("{}:0", tx(0x07));
         let sweeps = filed(&hop_key, &sweep);
         let mut mined = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
         mined.spent_confirmed = Some(true);
         let hops = [mined];
         let (v, no_pots) = (HashMap::new(), HashSet::new());
-        let file = |pay: &[u8; 32], signer: &bsv_rs::wallet::ProtoWallet, created_at: i64| file_held(&conn, signer, &id, &gid, pay, created_at);
+        let file = |pay: &[u8; 32], signer: &bsv_rs::wallet::ProtoWallet, created_at: i64| {
+            file_held(&conn, signer, &id, &gid, pay, created_at)
+        };
         // the recompute's read and fold, then the derivation
         let served = || -> Vec<OwedRow> {
             let fold = fold_collected(&conn, &me, std::slice::from_ref(&game));
-            let mut i = inputs(&paid, &[], &hops, &v, &fold.verified, &no_pots, Some(900_200));
+            let mut i = inputs(
+                &paid,
+                &[],
+                &hops,
+                &v,
+                &fold.verified,
+                &no_pots,
+                Some(900_200),
+            );
             i.identity_lc = &me;
             i.collected_present = &fold.present;
             i.held_verified = &fold.held;
@@ -4790,33 +5962,83 @@ pub(crate) mod tests {
         // RED's shape: nothing filed, both payouts served claimable (the press that said "Collected")
         let rows = served();
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| r.family == OwedFamily::Payout && r.facts["claimable"] == true));
+        assert!(rows
+            .iter()
+            .all(|r| r.family == OwedFamily::Payout && r.facts["claimable"] == true));
         // a stranger cannot retire it: its signature is refused at the door, and a row it plants through the
         // chain's byte-format admission (any signature bytes, a chain txid) is presence only
-        assert_eq!(file(&settle, &wallet(22), 100).unwrap_err(), RecordRefusal::SignatureInvalid);
-        let planted = hex::encode(sign(&wallet(22), collected_protocol(), &game, &held_challenge(&game, &me, &tx(0x03))));
-        conn.execute(COLLECTED_FILE_SQL, rusqlite::params![me, game, tx(0xee), 0i64, planted, 100i64, Option::<String>::None]).unwrap();
+        assert_eq!(
+            file(&settle, &wallet(22), 100).unwrap_err(),
+            RecordRefusal::SignatureInvalid
+        );
+        let planted = hex::encode(sign(
+            &wallet(22),
+            collected_protocol(),
+            &game,
+            &held_challenge(&game, &me, &tx(0x03)),
+        ));
+        conn.execute(
+            COLLECTED_FILE_SQL,
+            rusqlite::params![
+                me,
+                game,
+                tx(0xee),
+                0i64,
+                planted,
+                100i64,
+                Option::<String>::None
+            ],
+        )
+        .unwrap();
         assert_eq!(served().len(), 2);
         // the device's wallet holds the settle: it files, and the pot's payout is gone; the sweep's stays
         let (key, written) = file(&settle, &w, 200).unwrap();
         assert!(written);
-        let stored: Option<String> = conn.query_row("SELECT payTxid FROM collected_markers_v2 WHERE txid = ?1", rusqlite::params![key], |r| r.get(0)).unwrap();
-        assert_eq!(stored, Some(tx(0x03)), "the door writes the txid it verified, in the row's own insert");
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT payTxid FROM collected_markers_v2 WHERE txid = ?1",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            Some(tx(0x03)),
+            "the door writes the txid it verified, in the row's own insert"
+        );
         let rows = served();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].outpoint, hop_key);
         assert_eq!(rows[0].facts["payTxid"], sweep);
-        assert_eq!(rows[0].facts["collectedMarkerPresent"], true, "the planted row is provenance, as before");
+        assert_eq!(
+            rows[0].facts["collectedMarkerPresent"], true,
+            "the planted row is provenance, as before"
+        );
         // L2: filed again (a fresh signature, another device of the identity, a stranger's replay): the same key,
         // NO row written, so the door stales nothing, pushes nothing and counts no filing (`insert_wrote_a_row`
         // is the route's own test of the insert), and it answers 200 with the existing key and `filed: false`
         let (again, written) = file(&settle, &w, 300).unwrap();
         assert_eq!(again, key);
         assert!(!written, "a re-file is a no-op insert");
-        assert!(insert_wrote_a_row(Some(1)) && insert_wrote_a_row(None) && !insert_wrote_a_row(Some(0)));
-        let sig = sign(&w, collected_protocol(), &game, &held_challenge(&game, &me, &tx(0x03)));
-        let refiled = verify_record_post(RecordKind::Collected, &script(&[crate::record_post::HELD_TAG, &gid, &id, &settle, &sig]), &me).unwrap();
-        assert_eq!(already_filed_body(&refiled), json!({ "filed": false, "kind": "collected", "key": key, "alreadyFiled": true, "heldTxid": tx(0x03) }));
+        assert!(
+            insert_wrote_a_row(Some(1)) && insert_wrote_a_row(None) && !insert_wrote_a_row(Some(0))
+        );
+        let sig = sign(
+            &w,
+            collected_protocol(),
+            &game,
+            &held_challenge(&game, &me, &tx(0x03)),
+        );
+        let refiled = verify_record_post(
+            RecordKind::Collected,
+            &script(&[crate::record_post::HELD_TAG, &gid, &id, &settle, &sig]),
+            &me,
+        )
+        .unwrap();
+        assert_eq!(
+            already_filed_body(&refiled),
+            json!({ "filed": false, "kind": "collected", "key": key, "alreadyFiled": true, "heldTxid": tx(0x03) })
+        );
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM collected_markers_v2 WHERE identity = ?1 AND txid LIKE 'filed:%'", rusqlite::params![me], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
         assert_eq!(served().len(), 1);
@@ -4827,23 +6049,73 @@ pub(crate) mod tests {
         for b in 0..(HELD_FILINGS_PER_GAME - 2) as u8 {
             file(&[0x90 + b; 32], &w, 500).unwrap();
         }
-        assert_eq!(file(&[0xa0; 32], &w, 500).unwrap_err(), RecordRefusal::TooManyFiled, "a fifth held filing of the game");
-        assert!(file(&settle, &w, 600).is_ok(), "a re-file of a held filing on file is never the cap's (its own key is excluded)");
+        assert_eq!(
+            file(&[0xa0; 32], &w, 500).unwrap_err(),
+            RecordRefusal::TooManyFiled,
+            "a fifth held filing of the game"
+        );
+        assert!(
+            file(&settle, &w, 600).is_ok(),
+            "a re-file of a held filing on file is never the cap's (its own key is excluded)"
+        );
         // L1, the other way (the lens's scenario): the game's four held rows do NOT refuse the identity's v1 marker
-        let v1_sig = sign(&w, collected_protocol(), &game, &collected_challenge(&game, &me));
-        let v1 = verify_record_post(RecordKind::Collected, &script(&[b"LOW/collected/v1", &gid, &id, &v1_sig]), &me).unwrap();
-        let VerifiedRecord::Collected(r) = &v1 else { panic!("the v1 marker") };
+        let v1_sig = sign(
+            &w,
+            collected_protocol(),
+            &game,
+            &collected_challenge(&game, &me),
+        );
+        let v1 = verify_record_post(
+            RecordKind::Collected,
+            &script(&[b"LOW/collected/v1", &gid, &id, &v1_sig]),
+            &me,
+        )
+        .unwrap();
+        let VerifiedRecord::Collected(r) = &v1 else {
+            panic!("the v1 marker")
+        };
         let (rows_sql, binds, _, _) = cap_queries(&v1);
         assert_eq!(rows_sql, COLLECTED_FILED_ROWS_SQL);
-        let count = |sql: &str, key: &str| -> i64 { conn.query_row(sql, rusqlite::params![me, game, key], |row| row.get(0)).unwrap() };
-        assert_eq!(count(rows_sql, &binds[2]), 0, "the v1 marker counts v1 rows only");
+        let count = |sql: &str, key: &str| -> i64 {
+            conn.query_row(sql, rusqlite::params![me, game, key], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            count(rows_sql, &binds[2]),
+            0,
+            "the v1 marker counts v1 rows only"
+        );
         assert_eq!(cap_refusal_for(&v1, 0, 0), None);
-        assert_eq!(conn.execute(COLLECTED_FILE_SQL, rusqlite::params![r.identity, r.game_id, r.txid, 0i64, r.sig_hex, 700i64, Option::<String>::None]).unwrap(), 1);
+        assert_eq!(
+            conn.execute(
+                COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    r.identity,
+                    r.game_id,
+                    r.txid,
+                    0i64,
+                    r.sig_hex,
+                    700i64,
+                    Option::<String>::None
+                ]
+            )
+            .unwrap(),
+            1
+        );
         // and the v1 marker takes no held slot: the held count is still four, a second v1 content is the v1 cap's
-        assert_eq!(count(HELD_FILED_ROWS_SQL, "filed:none"), HELD_FILINGS_PER_GAME);
+        assert_eq!(
+            count(HELD_FILED_ROWS_SQL, "filed:none"),
+            HELD_FILINGS_PER_GAME
+        );
         assert_eq!(count(COLLECTED_FILED_ROWS_SQL, "filed:none"), 1);
-        assert_eq!(cap_refusal_for(&v1, 1, 0), Some(RecordRefusal::TooManyFiled));
-        assert!(served().is_empty(), "filings that name no payout transaction of the game change nothing");
+        assert_eq!(
+            cap_refusal_for(&v1, 1, 0),
+            Some(RecordRefusal::TooManyFiled)
+        );
+        assert!(
+            served().is_empty(),
+            "filings that name no payout transaction of the game change nothing"
+        );
     }
 
     /// THE B3 LENS FOLD M2: every payout row names the OUTPUT a device must own before it files a held filing:
@@ -4872,11 +6144,15 @@ pub(crate) mod tests {
             self.memo.insert(key.to_string(), vout);
         }
         async fn stored_raws(&mut self, txids: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
-            self.asked.push(txids.iter().map(|t| t.to_string()).collect());
+            self.asked
+                .push(txids.iter().map(|t| t.to_string()).collect());
             if self.fault {
                 return Err("d1 down".into());
             }
-            Ok(txids.iter().filter_map(|t| Some((t.to_string(), self.raws.get(*t)?.clone()))).collect())
+            Ok(txids
+                .iter()
+                .filter_map(|t| Some((t.to_string(), self.raws.get(*t)?.clone())))
+                .collect())
         }
     }
 
@@ -4888,9 +6164,13 @@ pub(crate) mod tests {
     fn i512_dl1_a_payvout_left_null_by_the_clock_is_served_on_the_next_pass() {
         use bsv_rs::script::LockingScript;
         use bsv_rs::transaction::{Transaction, TransactionOutput};
-        let run = |world: &mut PayVoutTable, wanted: &[(String, String)], chunk: usize, turn: u64| {
-            tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(pay_vout_pass(world, wanted, chunk, turn))
-        };
+        let run =
+            |world: &mut PayVoutTable, wanted: &[(String, String)], chunk: usize, turn: u64| {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(pay_vout_pass(world, wanted, chunk, turn))
+            };
         let home = [0x11u8; 20];
         let home_hex = hex::encode(home);
         // seven paying transactions, each paying the home at vout 1 behind a distinct first output
@@ -4899,27 +6179,54 @@ pub(crate) mod tests {
         for n in 0..7u64 {
             let mut t = Transaction::new();
             for (sats, pkh) in [(100 + n, [0x33u8; 20]), (39_000, home)] {
-                t.outputs.push(TransactionOutput { satoshis: Some(sats), locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh)).unwrap(), change: false });
+                t.outputs.push(TransactionOutput {
+                    satoshis: Some(sats),
+                    locking_script: LockingScript::from_binary(
+                        &overlay_discovery::pot::p2pkh_lock(&pkh),
+                    )
+                    .unwrap(),
+                    change: false,
+                });
             }
             raws.insert(t.id(), t.to_binary());
             wanted.push((t.id(), home_hex.clone()));
         }
         wanted.sort_unstable();
-        let table = |slow: bool| PayVoutTable { raws: raws.clone(), memo: HashMap::new(), slow, fault: false, asked: Vec::new() };
+        let table = |slow: bool| PayVoutTable {
+            raws: raws.clone(),
+            memo: HashMap::new(),
+            slow,
+            fault: false,
+            asked: Vec::new(),
+        };
 
         // the step's clock spent at once (the heaviest case): the first chunk is read all the same
         let mut world = table(true);
         let one = run(&mut world, &wanted, 3, 0);
-        assert_eq!((one.vouts.len(), one.cut, one.reads), (3, true, 1), "pass one: one chunk whatever the clock says, the rest cut");
+        assert_eq!(
+            (one.vouts.len(), one.cut, one.reads),
+            (3, true, 1),
+            "pass one: one chunk whatever the clock says, the rest cut"
+        );
         assert!(one.vouts.values().all(|v| *v == 1));
         // WARM isolate, the clock spent on every pass, the SAME turn: the memo carries, the next chunk is the first
         let two = run(&mut world, &wanted, 3, 0);
-        assert_eq!((two.vouts.len(), two.cut, two.reads), (6, true, 1), "pass two serves what pass one left");
-        assert!(wanted[3..6].iter().all(|(t, p)| two.vouts.contains_key(&pay_vout_key(t, p))));
+        assert_eq!(
+            (two.vouts.len(), two.cut, two.reads),
+            (6, true, 1),
+            "pass two serves what pass one left"
+        );
+        assert!(wanted[3..6]
+            .iter()
+            .all(|(t, p)| two.vouts.contains_key(&pay_vout_key(t, p))));
         let three = run(&mut world, &wanted, 3, 0);
         assert_eq!((three.vouts.len(), three.cut, three.reads), (7, false, 1));
         let four = run(&mut world, &wanted, 3, 0);
-        assert_eq!((four.vouts.len(), four.cut, four.reads), (7, false, 0), "a warm isolate that holds every answer reads nothing");
+        assert_eq!(
+            (four.vouts.len(), four.cut, four.reads),
+            (7, false, 0),
+            "a warm isolate that holds every answer reads nothing"
+        );
         assert_eq!(world.asked.len(), 3);
 
         // COLD isolates (no memo carried), the clock spent on every pass: the start chunk turns, so three passes
@@ -4934,7 +6241,11 @@ pub(crate) mod tests {
             served.extend(pass.vouts.into_keys());
         }
         assert_eq!(heads.len(), 3, "each pass started at another chunk");
-        assert_eq!(served.len(), 7, "every row was served on one of the three passes");
+        assert_eq!(
+            served.len(),
+            7,
+            "every row was served on one of the three passes"
+        );
 
         // inside its own clock the step reads every chunk in one pass; a fault is counted and names nothing
         let mut quick = table(false);
@@ -4944,7 +6255,10 @@ pub(crate) mod tests {
         down.fault = true;
         let before = PAY_VOUT_READ_FAULTS.load(Ordering::Relaxed);
         let none = run(&mut down, &wanted, 3, 0);
-        assert!(none.vouts.is_empty() && !none.cut && down.memo.is_empty(), "a fault answers nothing and memoises nothing");
+        assert!(
+            none.vouts.is_empty() && !none.cut && down.memo.is_empty(),
+            "a fault answers nothing and memoises nothing"
+        );
         assert!(PAY_VOUT_READ_FAULTS.load(Ordering::Relaxed) >= before + 3);
         // never wrong: bytes that do not hash to the asked txid name nothing
         let mut lying = table(false);
@@ -4952,7 +6266,10 @@ pub(crate) mod tests {
         lying.raws.insert(wanted[0].0.clone(), swapped);
         let pass = run(&mut lying, &wanted[..1], 3, 0);
         assert!(pass.vouts.is_empty() && lying.memo.is_empty());
-        assert!(run(&mut table(true), &[], 3, 9).vouts.is_empty(), "nothing wanted: no read, no divide by zero");
+        assert!(
+            run(&mut table(true), &[], 3, 9).vouts.is_empty(),
+            "nothing wanted: no read, no divide by zero"
+        );
     }
 
     #[test]
@@ -4961,7 +6278,12 @@ pub(crate) mod tests {
         use bsv_rs::script::LockingScript;
         use bsv_rs::transaction::{Transaction, TransactionOutput};
         let (home, other, rake) = ([0x11u8; 20], [0x22u8; 20], [0x33u8; 20]);
-        let out = |sats: u64, pkh: &[u8; 20]| TransactionOutput { satoshis: Some(sats), locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(pkh)).unwrap(), change: false };
+        let out = |sats: u64, pkh: &[u8; 20]| TransactionOutput {
+            satoshis: Some(sats),
+            locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(pkh))
+                .unwrap(),
+            change: false,
+        };
         let raw_of = |outs: &[(u64, &[u8; 20])]| -> (String, Vec<u8>) {
             let mut t = Transaction::new();
             for (sats, pkh) in outs {
@@ -4974,40 +6296,81 @@ pub(crate) mod tests {
         let (claim, claim_raw) = raw_of(&[(800, &rake), (39_200, &home)]);
         let (bare, bare_raw) = raw_of(&[(900, &home)]);
         let (tie, tie_raw) = raw_of(&[(800, &rake), (19_600, &other), (19_600, &home)]);
-        assert_eq!(sole_home_vout_of_raw(&claim_raw, &claim, &home_hex), Some(1));
-        assert_eq!(sole_home_vout_of_raw(&bare_raw, &bare, &home_hex), Some(0), "no rake output: the order moves, so it is read, never assumed");
+        assert_eq!(
+            sole_home_vout_of_raw(&claim_raw, &claim, &home_hex),
+            Some(1)
+        );
+        assert_eq!(
+            sole_home_vout_of_raw(&bare_raw, &bare, &home_hex),
+            Some(0),
+            "no rake output: the order moves, so it is read, never assumed"
+        );
         assert_eq!(sole_home_vout_of_raw(&tie_raw, &tie, &home_hex), Some(2));
-        assert_eq!(sole_home_vout_of_raw(&tie_raw, &tie, &hex::encode(other)), Some(1), "the tie's other seat: its own output");
+        assert_eq!(
+            sole_home_vout_of_raw(&tie_raw, &tie, &hex::encode(other)),
+            Some(1),
+            "the tie's other seat: its own output"
+        );
         // never a pick: no output to the home, two outputs to the home, bytes of another transaction, junk
         let (twice, twice_raw) = raw_of(&[(1, &home), (2, &home)]);
-        assert_eq!(sole_home_vout_of_raw(&claim_raw, &claim, &hex::encode([0x44u8; 20])), None);
+        assert_eq!(
+            sole_home_vout_of_raw(&claim_raw, &claim, &hex::encode([0x44u8; 20])),
+            None
+        );
         assert_eq!(sole_home_vout_of_raw(&twice_raw, &twice, &home_hex), None);
-        assert_eq!(sole_home_vout_of_raw(&bare_raw, &claim, &home_hex), None, "the bytes must hash to the paying txid");
+        assert_eq!(
+            sole_home_vout_of_raw(&bare_raw, &claim, &home_hex),
+            None,
+            "the bytes must hash to the paying txid"
+        );
         assert_eq!(sole_home_vout_of_raw(&[0u8; 4], &claim, &home_hex), None);
 
         // THE POT'S ROW: `payPkh` is my committed home by my seat; `payVout` is null until the route read the bytes
-        let mut won = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
+        let mut won = entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        );
         won.settle_txid = Some(claim.clone());
-        won.committed_keys = Some(CommittedKeys { pub_a: "02".repeat(33), pub_b: "03".repeat(33), pay_pkh_a: home_hex.clone(), pay_pkh_b: hex::encode(other) });
+        won.committed_keys = Some(CommittedKeys {
+            pub_a: "02".repeat(33),
+            pub_b: "03".repeat(33),
+            pay_pkh_a: home_hex.clone(),
+            pay_pkh_b: hex::encode(other),
+        });
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let paid = [won.clone()];
         let mut rows = derive_owed_rows(&inputs(&paid, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows.len(), 1);
-        assert_eq!((&rows[0].facts["payTxid"], &rows[0].facts["payPkh"]), (&json!(claim), &json!(home_hex)));
+        assert_eq!(
+            (&rows[0].facts["payTxid"], &rows[0].facts["payPkh"]),
+            (&json!(claim), &json!(home_hex))
+        );
         assert!(rows[0].facts["payVout"].is_null());
-        assert_eq!(pay_vout_wanted(&rows), vec![(claim.clone(), home_hex.clone())]);
+        assert_eq!(
+            pay_vout_wanted(&rows),
+            vec![(claim.clone(), home_hex.clone())]
+        );
         // the route's answer for that (txid, home), and only that: another home's answer marks nothing
         let mut vouts: HashMap<String, u32> = HashMap::new();
         vouts.insert(pay_vout_key(&claim, &hex::encode(other)), 7);
         assert_eq!(mark_pay_vouts(&mut rows, &vouts), 0);
         assert!(rows[0].facts["payVout"].is_null());
-        vouts.insert(pay_vout_key(&claim, &home_hex), sole_home_vout_of_raw(&claim_raw, &claim, &home_hex).unwrap());
+        vouts.insert(
+            pay_vout_key(&claim, &home_hex),
+            sole_home_vout_of_raw(&claim_raw, &claim, &home_hex).unwrap(),
+        );
         assert_eq!(mark_pay_vouts(&mut rows, &vouts), 1);
         assert_eq!(rows[0].facts["payVout"], 1);
-        assert!(pay_vout_wanted(&rows).is_empty(), "a named row is asked for no more");
+        assert!(
+            pay_vout_wanted(&rows).is_empty(),
+            "a named row is asked for no more"
+        );
         // seat B of the same pot is paid at ITS home; a seat the binding does not prove names no home and is not asked
         let mut tied = won.clone();
-        (tied.verdict, tied.outcome, tied.my_seat) = (Some(PotVerdict::Tie), Outcome::Tie, Some(SeatLetter::B));
+        (tied.verdict, tied.outcome, tied.my_seat) =
+            (Some(PotVerdict::Tie), Outcome::Tie, Some(SeatLetter::B));
         let tied = [tied];
         let rows_b = derive_owed_rows(&inputs(&tied, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows_b[0].facts["payPkh"], hex::encode(other));
@@ -5032,7 +6395,14 @@ pub(crate) mod tests {
         i.my_pkh_by_game = &pkhs;
         let rows_s = derive_owed_rows(&i);
         assert_eq!(rows_s.len(), 1);
-        assert_eq!((&rows_s[0].facts["payTxid"], &rows_s[0].facts["payPkh"], &rows_s[0].facts["payVout"]), (&json!(sweep), &json!(home_hex), &json!(0)));
+        assert_eq!(
+            (
+                &rows_s[0].facts["payTxid"],
+                &rows_s[0].facts["payPkh"],
+                &rows_s[0].facts["payVout"]
+            ),
+            (&json!(sweep), &json!(home_hex), &json!(0))
+        );
         // a home this list does not know, or a raw that is not the sweep: `null`, and the route is not asked (a sweep is not in `pot_beefs`' contract)
         let mut i = inputs(&[], &[], &hops, &v, &NONE, &p, Some(900_000));
         i.hop_sweeps = &sweeps;
@@ -5044,39 +6414,107 @@ pub(crate) mod tests {
     #[test]
     fn one_collected_marker_never_hides_a_second_pots_payout_of_the_same_game() {
         // N10: two pots funded under one game id (a re-funding); one verified collected marker names the game
-        let a = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
-        let mut b = entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A));
+        let a = entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        );
+        let mut b = entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        );
         b.pot_txid = tx(0x05);
         b.settle_txid = Some(tx(0x06));
         let both = [a, b];
         let verified: HashSet<String> = [tx(0x01)].into_iter().collect();
         let (v, p) = (HashMap::new(), HashSet::new());
         let rows = derive_owed_rows(&inputs(&both, &[], &[], &v, &verified, &p, Some(900_200)));
-        assert_eq!(rows.len(), 2, "both payout rows stay; the marker cannot say which pot it meant");
-        assert!(rows.iter().all(|r| r.facts["collectedSigVerified"] == true && r.facts["collectedMarkerPresent"] == true));
+        assert_eq!(
+            rows.len(),
+            2,
+            "both payout rows stay; the marker cannot say which pot it meant"
+        );
+        assert!(rows.iter().all(|r| r.facts["collectedSigVerified"] == true
+            && r.facts["collectedMarkerPresent"] == true));
     }
 
     #[test]
-    fn the_read_rule_recomputes_on_stale_on_the_gate_flip_on_an_aged_open_list_and_on_any_old_list() {
+    fn the_read_rule_recomputes_on_stale_on_the_gate_flip_on_an_aged_open_list_and_on_any_old_list()
+    {
         // N5: the four arms of `should_recompute`, one predicate
-        let e = [entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A))];
+        let e = [entry(
+            Some(false),
+            None,
+            Outcome::Unresolved,
+            Some(SeatLetter::A),
+        )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let in_progress = derive_owed_rows(&inputs(&e, &[], &[], &v, &c, &p, Some(899_990)));
         assert_eq!(in_progress[0].family, OwedFamily::InProgress);
-        let paid = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let paid = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
         let payout = derive_owed_rows(&inputs(&paid, &[], &[], &v, &c, &p, Some(900_200)));
         // stale wins whatever else
         assert!(should_recompute(true, 0, Some(1), Some(1), &[]));
         // the gate flip: the tip reached the in-progress row's recovery height since the compute
-        assert!(should_recompute(false, 0, Some(899_990), Some(900_000), &in_progress));
-        assert!(!should_recompute(false, 0, Some(899_990), Some(899_995), &in_progress));
-        assert!(!should_recompute(false, 0, Some(900_000), Some(900_000), &in_progress), "no tip advance, no flip");
-        assert!(should_recompute(false, 0, None, Some(900_000), &in_progress), "a compute without a tip heals on the next tipped read");
+        assert!(should_recompute(
+            false,
+            0,
+            Some(899_990),
+            Some(900_000),
+            &in_progress
+        ));
+        assert!(!should_recompute(
+            false,
+            0,
+            Some(899_990),
+            Some(899_995),
+            &in_progress
+        ));
+        assert!(
+            !should_recompute(false, 0, Some(900_000), Some(900_000), &in_progress),
+            "no tip advance, no flip"
+        );
+        assert!(
+            should_recompute(false, 0, None, Some(900_000), &in_progress),
+            "a compute without a tip heals on the next tipped read"
+        );
         // an OPEN list ages out at 5 minutes; a claimable-payout-only list at 15; an empty list at 15
-        assert!(!should_recompute(false, 4 * 60_000, Some(1), Some(1), &in_progress));
-        assert!(should_recompute(false, 6 * 60_000, Some(1), Some(1), &in_progress));
-        assert!(!should_recompute(false, 6 * 60_000, Some(1), Some(1), &payout));
-        assert!(should_recompute(false, 16 * 60_000, Some(1), Some(1), &payout));
+        assert!(!should_recompute(
+            false,
+            4 * 60_000,
+            Some(1),
+            Some(1),
+            &in_progress
+        ));
+        assert!(should_recompute(
+            false,
+            6 * 60_000,
+            Some(1),
+            Some(1),
+            &in_progress
+        ));
+        assert!(!should_recompute(
+            false,
+            6 * 60_000,
+            Some(1),
+            Some(1),
+            &payout
+        ));
+        assert!(should_recompute(
+            false,
+            16 * 60_000,
+            Some(1),
+            Some(1),
+            &payout
+        ));
         assert!(should_recompute(false, 16 * 60_000, Some(1), Some(1), &[]));
         assert!(!should_recompute(false, 14 * 60_000, Some(1), Some(1), &[]));
     }
@@ -5085,13 +6523,56 @@ pub(crate) mod tests {
     fn the_service_order_puts_the_actionable_families_first_then_the_newest_spend() {
         // N2b
         let mut rows = vec![
-            OwedRow { identity: ME.into(), outpoint: "b".into(), family: OwedFamily::Unbound, game_id: String::new(), sats: None, opponent_identity: None, at_height: Some(5), facts: Value::Null, reason: None },
-            OwedRow { identity: ME.into(), outpoint: "a".into(), family: OwedFamily::Payout, game_id: String::new(), sats: None, opponent_identity: None, at_height: Some(1), facts: Value::Null, reason: None },
-            OwedRow { identity: ME.into(), outpoint: "c".into(), family: OwedFamily::Payout, game_id: String::new(), sats: None, opponent_identity: None, at_height: Some(9), facts: Value::Null, reason: None },
-            OwedRow { identity: ME.into(), outpoint: "d".into(), family: OwedFamily::RefundDue, game_id: String::new(), sats: None, opponent_identity: None, at_height: None, facts: Value::Null, reason: None },
+            OwedRow {
+                identity: ME.into(),
+                outpoint: "b".into(),
+                family: OwedFamily::Unbound,
+                game_id: String::new(),
+                sats: None,
+                opponent_identity: None,
+                at_height: Some(5),
+                facts: Value::Null,
+                reason: None,
+            },
+            OwedRow {
+                identity: ME.into(),
+                outpoint: "a".into(),
+                family: OwedFamily::Payout,
+                game_id: String::new(),
+                sats: None,
+                opponent_identity: None,
+                at_height: Some(1),
+                facts: Value::Null,
+                reason: None,
+            },
+            OwedRow {
+                identity: ME.into(),
+                outpoint: "c".into(),
+                family: OwedFamily::Payout,
+                game_id: String::new(),
+                sats: None,
+                opponent_identity: None,
+                at_height: Some(9),
+                facts: Value::Null,
+                reason: None,
+            },
+            OwedRow {
+                identity: ME.into(),
+                outpoint: "d".into(),
+                family: OwedFamily::RefundDue,
+                game_id: String::new(),
+                sats: None,
+                opponent_identity: None,
+                at_height: None,
+                facts: Value::Null,
+                reason: None,
+            },
         ];
         sort_rows_for_service(&mut rows);
-        assert_eq!(rows.iter().map(|r| r.outpoint.as_str()).collect::<Vec<_>>(), ["c", "a", "d", "b"]);
+        assert_eq!(
+            rows.iter().map(|r| r.outpoint.as_str()).collect::<Vec<_>>(),
+            ["c", "a", "d", "b"]
+        );
     }
 
     #[test]
@@ -5100,22 +6581,54 @@ pub(crate) mod tests {
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let mut unknown = hop(HopStatus::Unknown, None, Some(10_000_000));
         unknown.spent = None;
-        let rows = derive_owed_rows(&inputs(&[], &[], std::slice::from_ref(&unknown), &v, &c, &p, Some(900_000)));
+        let rows = derive_owed_rows(&inputs(
+            &[],
+            &[],
+            std::slice::from_ref(&unknown),
+            &v,
+            &c,
+            &p,
+            Some(900_000),
+        ));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
-        assert!(rows[0].reason.as_deref().unwrap().contains("not in the index"));
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("not in the index"));
         assert_eq!(rows[0].sats, Some(20_190));
         let mut pending = hop(HopStatus::Unknown, Some(&tx(0x09)), Some(10_000_000));
         pending.spent = Some(true);
-        let rows = derive_owed_rows(&inputs(&[], &[], std::slice::from_ref(&pending), &v, &c, &p, Some(900_000)));
+        let rows = derive_owed_rows(&inputs(
+            &[],
+            &[],
+            std::slice::from_ref(&pending),
+            &v,
+            &c,
+            &p,
+            Some(900_000),
+        ));
         assert!(rows[0].reason.as_deref().unwrap().contains("not confirmed"));
     }
 
     #[test]
     fn the_wire_body_is_versioned_and_carries_every_row_field() {
-        let e = [entry(Some(true), Some(PotVerdict::WinnerA), Outcome::Won, Some(SeatLetter::A))];
+        let e = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let rows = derive_owed_rows(&inputs(&e, &[], &[], &v, &c, &p, Some(900_200)));
-        let body: Value = serde_json::from_str(&owed_body(ME, Some(900_200), &rows, 1_800_000_000_000, false)).unwrap();
+        let body: Value = serde_json::from_str(&owed_body(
+            ME,
+            Some(900_200),
+            &rows,
+            1_800_000_000_000,
+            false,
+        ))
+        .unwrap();
         assert_eq!(body["v"], 1);
         assert_eq!(body["identity"], ME);
         assert_eq!(body["tip"], 900_200);
@@ -5140,37 +6653,70 @@ pub(crate) mod tests {
         let pkh = [0x11u8; 20];
         let other = [0x22u8; 20];
         let mut t = Transaction::new();
-        t.outputs.push(TransactionOutput { satoshis: Some(19_800), locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh)).unwrap(), change: false });
-        t.outputs.push(TransactionOutput { satoshis: Some(19_800), locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&other)).unwrap(), change: false });
-        t.outputs.push(TransactionOutput { satoshis: Some(5), locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh)).unwrap(), change: false });
+        t.outputs.push(TransactionOutput {
+            satoshis: Some(19_800),
+            locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh))
+                .unwrap(),
+            change: false,
+        });
+        t.outputs.push(TransactionOutput {
+            satoshis: Some(19_800),
+            locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&other))
+                .unwrap(),
+            change: false,
+        });
+        t.outputs.push(TransactionOutput {
+            satoshis: Some(5),
+            locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh))
+                .unwrap(),
+            change: false,
+        });
         let raw = hex::encode(t.to_binary());
         assert_eq!(refund_output_sats(&raw, &hex::encode(pkh)), Some(19_805));
-        assert_eq!(refund_output_sats(&raw, &hex::encode([0x33u8; 20])), Some(0));
+        assert_eq!(
+            refund_output_sats(&raw, &hex::encode([0x33u8; 20])),
+            Some(0)
+        );
         assert_eq!(refund_output_sats("zz", &hex::encode(pkh)), None);
         assert_eq!(refund_output_sats(&raw, "abcd"), None);
     }
 
     #[test]
     fn the_collected_lookup_covers_every_hop_game_beside_the_spent_pots() {
-        let games = collected_lookup_games(["AA".repeat(32).as_str(), &"bb".repeat(32)].into_iter(), [&"cc".repeat(32)[..], &"bb".repeat(32)].into_iter());
-        assert_eq!(games, vec!["aa".repeat(32), "bb".repeat(32), "cc".repeat(32)]);
+        let games = collected_lookup_games(
+            ["AA".repeat(32).as_str(), &"bb".repeat(32)].into_iter(),
+            [&"cc".repeat(32)[..], &"bb".repeat(32)].into_iter(),
+        );
+        assert_eq!(
+            games,
+            vec!["aa".repeat(32), "bb".repeat(32), "cc".repeat(32)]
+        );
         assert!(collected_lookup_games(std::iter::empty(), std::iter::empty()).is_empty());
     }
 
     #[test]
-    fn a_filed_sweep_the_index_names_but_never_confirmed_is_claimable_once_the_chain_rung_confirms_it() {
+    fn a_filed_sweep_the_index_names_but_never_confirmed_is_claimable_once_the_chain_rung_confirms_it(
+    ) {
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let sweep = tx(0x0c);
         let key = format!("{}:0", tx(0x07));
         let mut h = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
         h.spent_confirmed = Some(false); // the index recorded the spend before its block and never re-checked
         let filed_sweeps = filed(&key, &sweep);
-        let mut i = inputs(&[], &[], std::slice::from_ref(&h), &v, &c, &p, Some(900_000));
+        let mut i = inputs(
+            &[],
+            &[],
+            std::slice::from_ref(&h),
+            &v,
+            &c,
+            &p,
+            Some(900_000),
+        );
         i.hop_sweeps = &filed_sweeps;
         let rows = derive_owed_rows(&i);
         assert_eq!(rows[0].family, OwedFamily::Payout);
         assert_eq!(rows[0].facts["claimable"], false); // the index's word alone: not yet
-        // the courier's word heals it: the same spender, confirmed
+                                                       // the courier's word heals it: the same spender, confirmed
         let word = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
         i.hop_chain = &word;
         let rows = derive_owed_rows(&i);
@@ -5181,7 +6727,10 @@ pub(crate) mod tests {
 
     /// The owed write batch on real SQLite, as D1 runs it: every statement in order inside one transaction; the
     /// closing read-back's stamp is the answer (`owed_write_landed`).
-    fn run_owed_write(conn: &mut rusqlite::Connection, plan: &[(&'static str, Vec<OwedBind>)]) -> Option<i64> {
+    fn run_owed_write(
+        conn: &mut rusqlite::Connection,
+        plan: &[(&'static str, Vec<OwedBind>)],
+    ) -> Option<i64> {
         let txn = conn.transaction().expect("begin");
         let mut stamp: Option<i64> = None;
         for (n, (sql, binds)) in plan.iter().enumerate() {
@@ -5194,18 +6743,33 @@ pub(crate) mod tests {
                 })
                 .collect();
             if n + 1 == plan.len() {
-                stamp = txn.query_row(sql, rusqlite::params_from_iter(vals), |r| r.get(0)).ok();
+                stamp = txn
+                    .query_row(sql, rusqlite::params_from_iter(vals), |r| r.get(0))
+                    .ok();
             } else {
-                txn.execute(sql, rusqlite::params_from_iter(vals)).unwrap_or_else(|e| panic!("statement {n} ({sql}): {e}"));
+                txn.execute(sql, rusqlite::params_from_iter(vals))
+                    .unwrap_or_else(|e| panic!("statement {n} ({sql}): {e}"));
             }
         }
         txn.commit().expect("commit");
         stamp
     }
     fn served(conn: &rusqlite::Connection, identity: &str) -> (Vec<(String, String)>, i64, i64) {
-        let mut st = conn.prepare("SELECT outpoint, family FROM owed_rows WHERE identity = ?1 ORDER BY outpoint").unwrap();
-        let rows: Vec<(String, String)> = st.query_map([identity], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
-        let (stamp, stale): (i64, i64) = conn.query_row("SELECT computedAtMs, stale FROM owed_state WHERE identity = ?1", [identity], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let mut st = conn
+            .prepare("SELECT outpoint, family FROM owed_rows WHERE identity = ?1 ORDER BY outpoint")
+            .unwrap();
+        let rows: Vec<(String, String)> = st
+            .query_map([identity], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let (stamp, stale): (i64, i64) = conn
+            .query_row(
+                "SELECT computedAtMs, stale FROM owed_state WHERE identity = ?1",
+                [identity],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         (rows, stamp, stale)
     }
 
@@ -5244,40 +6808,82 @@ pub(crate) mod tests {
         let one = [row(&format!("{}:0", tx(0x07)), OwedFamily::HopStranded)];
         // walk TWO (the takeover) began at t = 71 000: the hop was swept meanwhile, so it sees the sweep's payout
         let two_at = 71_000i64;
-        let two = [row(&format!("{}:0", tx(0x07)), OwedFamily::Payout), row(&format!("{}:1", tx(0x08)), OwedFamily::InProgress)];
+        let two = [
+            row(&format!("{}:0", tx(0x07)), OwedFamily::Payout),
+            row(&format!("{}:1", tx(0x08)), OwedFamily::InProgress),
+        ];
         // TWO lands first
-        let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, &two, two_at, Some(900_001), false));
+        let stamp = run_owed_write(
+            &mut conn,
+            &owed_write_plan(ME, &two, two_at, Some(900_001), false),
+        );
         assert!(owed_write_landed(stamp, two_at));
         let newer = served(&conn, ME);
         assert_eq!(newer.0.len(), 2);
         // a filing marks the newer snapshot stale before ONE lands: a refused write must not clear the mark
         conn.execute(OWED_STALE_FOR_IDENTITY_SQL, [ME]).unwrap();
         // ONE lands second, with its older snapshot: REFUSED, nothing moves
-        let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, &one, one_at, Some(900_000), false));
-        assert!(!owed_write_landed(stamp, one_at), "the older walk is told its snapshot did not land");
+        let stamp = run_owed_write(
+            &mut conn,
+            &owed_write_plan(ME, &one, one_at, Some(900_000), false),
+        );
+        assert!(
+            !owed_write_landed(stamp, one_at),
+            "the older walk is told its snapshot did not land"
+        );
         let after = served(&conn, ME);
-        assert_eq!(after.0, newer.0, "the newer snapshot's rows stand, none replaced and none added");
+        assert_eq!(
+            after.0, newer.0,
+            "the newer snapshot's rows stand, none replaced and none added"
+        );
         assert_eq!(after.1, two_at, "the marker keeps the newer stamp");
         assert_eq!(after.2, 1, "and its stale mark");
-        let tip: i64 = conn.query_row("SELECT tip FROM owed_state WHERE identity = ?1", [ME], |r| r.get(0)).unwrap();
+        let tip: i64 = conn
+            .query_row(
+                "SELECT tip FROM owed_state WHERE identity = ?1",
+                [ME],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(tip, 900_001);
         // the ordinary order still writes: a NEWER walk replaces the rows and clears the mark
         let three_at = 72_000i64;
-        let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, &one, three_at, Some(900_002), true));
+        let stamp = run_owed_write(
+            &mut conn,
+            &owed_write_plan(ME, &one, three_at, Some(900_002), true),
+        );
         assert!(owed_write_landed(stamp, three_at));
         let after = served(&conn, ME);
-        assert_eq!(after.0, vec![(format!("{}:0", tx(0x07)), "hop-stranded".to_string())]);
+        assert_eq!(
+            after.0,
+            vec![(format!("{}:0", tx(0x07)), "hop-stranded".to_string())]
+        );
         assert_eq!((after.1, after.2), (three_at, 0));
         // the SAME stamp rewrites (one walk's batch retried is idempotent, never a refusal of itself)
-        let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, &two, three_at, Some(900_002), false));
+        let stamp = run_owed_write(
+            &mut conn,
+            &owed_write_plan(ME, &two, three_at, Some(900_002), false),
+        );
         assert!(owed_write_landed(stamp, three_at));
         assert_eq!(served(&conn, ME).0.len(), 2);
         // the guard is per identity: another identity's newer marker refuses nothing of mine
         let other = OPP;
-        let theirs = [OwedRow { identity: other.to_string(), ..row(&format!("{}:0", tx(0x09)), OwedFamily::Payout) }];
-        assert!(owed_write_landed(run_owed_write(&mut conn, &owed_write_plan(other, &theirs, 999_000, None, false)), 999_000));
+        let theirs = [OwedRow {
+            identity: other.to_string(),
+            ..row(&format!("{}:0", tx(0x09)), OwedFamily::Payout)
+        }];
+        assert!(owed_write_landed(
+            run_owed_write(
+                &mut conn,
+                &owed_write_plan(other, &theirs, 999_000, None, false)
+            ),
+            999_000
+        ));
         let four_at = 73_000i64;
-        assert!(owed_write_landed(run_owed_write(&mut conn, &owed_write_plan(ME, &one, four_at, None, false)), four_at));
+        assert!(owed_write_landed(
+            run_owed_write(&mut conn, &owed_write_plan(ME, &one, four_at, None, false)),
+            four_at
+        ));
         assert_eq!(served(&conn, ME).0.len(), 1);
         assert_eq!(served(&conn, other).0.len(), 1);
         // an EMPTY older snapshot (the false "nothing owed") is refused like any other
@@ -5287,7 +6893,11 @@ pub(crate) mod tests {
     }
 
     /// A real sweep paying `home_key`'s P2PKH `sats`, and a real spend of that home output signed by `signer`.
-    fn sweep_and_home_spend(home_key: &bsv_rs::primitives::PrivateKey, signer: &bsv_rs::primitives::PrivateKey, sats: u64) -> (String, Vec<u8>) {
+    fn sweep_and_home_spend(
+        home_key: &bsv_rs::primitives::PrivateKey,
+        signer: &bsv_rs::primitives::PrivateKey,
+        sats: u64,
+    ) -> (String, Vec<u8>) {
         use bsv_rs::script::templates::P2PKH;
         use bsv_rs::script::{Script, ScriptTemplate, SignOutputs, UnlockingScript};
         use bsv_rs::transaction::{Transaction, TransactionInput, TransactionOutput};
@@ -5298,12 +6908,24 @@ pub(crate) mod tests {
             unlocking_script: Some(UnlockingScript::from_script(Script::new())),
             ..Default::default()
         });
-        sweep.outputs.push(TransactionOutput::new(sats, P2PKH::new().lock(&home_key.public_key().hash160()).unwrap()));
+        sweep.outputs.push(TransactionOutput::new(
+            sats,
+            P2PKH::new().lock(&home_key.public_key().hash160()).unwrap(),
+        ));
         let sweep_txid = sweep.id();
         let mut spend = Transaction::new();
-        spend.add_input_from_tx(sweep, 0, P2PKH::unlock(signer, SignOutputs::All, false)).unwrap();
-        spend.outputs.push(TransactionOutput::new(sats - 100, P2PKH::new().lock(&[0x11u8; 20]).unwrap()));
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(spend.sign()).expect("template signing");
+        spend
+            .add_input_from_tx(sweep, 0, P2PKH::unlock(signer, SignOutputs::All, false))
+            .unwrap();
+        spend.outputs.push(TransactionOutput::new(
+            sats - 100,
+            P2PKH::new().lock(&[0x11u8; 20]).unwrap(),
+        ));
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(spend.sign())
+            .expect("template signing");
         (sweep_txid, spend.to_binary())
     }
 
@@ -5311,28 +6933,89 @@ pub(crate) mod tests {
     /// executed here over the bytes; bytes a courier could fabricate (another key's signature, a signature over a
     /// different amount or outpoint, a damaged one) prove nothing.
     #[test]
-    fn a_home_outputs_spend_is_proven_by_the_home_keys_signature_and_by_nothing_a_courier_can_fabricate() {
+    fn a_home_outputs_spend_is_proven_by_the_home_keys_signature_and_by_nothing_a_courier_can_fabricate(
+    ) {
         let home = bsv_rs::primitives::PrivateKey::random();
         let stranger = bsv_rs::primitives::PrivateKey::random();
         let home_pkh = hex::encode(home.public_key().hash160());
         let (sweep_txid, spend_raw) = sweep_and_home_spend(&home, &home, 20_000);
-        assert!(home_output_spend_proven(&spend_raw, &sweep_txid, 0, &home_pkh, 20_000));
-        assert!(home_output_spend_proven(&spend_raw, &sweep_txid.to_ascii_uppercase(), 0, &home_pkh.to_ascii_uppercase(), 20_000));
+        assert!(home_output_spend_proven(
+            &spend_raw,
+            &sweep_txid,
+            0,
+            &home_pkh,
+            20_000
+        ));
+        assert!(home_output_spend_proven(
+            &spend_raw,
+            &sweep_txid.to_ascii_uppercase(),
+            0,
+            &home_pkh.to_ascii_uppercase(),
+            20_000
+        ));
         // a courier's fabrication: bytes that consume the home output under a key that is not the home's
         let (forged_sweep, forged_raw) = sweep_and_home_spend(&home, &stranger, 20_000);
-        assert!(!home_output_spend_proven(&forged_raw, &forged_sweep, 0, &home_pkh, 20_000));
+        assert!(!home_output_spend_proven(
+            &forged_raw,
+            &forged_sweep,
+            0,
+            &home_pkh,
+            20_000
+        ));
         // the signature commits to the amount and to the outpoint
-        assert!(!home_output_spend_proven(&spend_raw, &sweep_txid, 0, &home_pkh, 20_001));
-        assert!(!home_output_spend_proven(&spend_raw, &sweep_txid, 1, &home_pkh, 20_000));
-        assert!(!home_output_spend_proven(&spend_raw, &tx(0x0e), 0, &home_pkh, 20_000));
+        assert!(!home_output_spend_proven(
+            &spend_raw,
+            &sweep_txid,
+            0,
+            &home_pkh,
+            20_001
+        ));
+        assert!(!home_output_spend_proven(
+            &spend_raw,
+            &sweep_txid,
+            1,
+            &home_pkh,
+            20_000
+        ));
+        assert!(!home_output_spend_proven(
+            &spend_raw,
+            &tx(0x0e),
+            0,
+            &home_pkh,
+            20_000
+        ));
         // another home, a damaged signature, junk
-        assert!(!home_output_spend_proven(&spend_raw, &sweep_txid, 0, &"cc".repeat(20), 20_000));
+        assert!(!home_output_spend_proven(
+            &spend_raw,
+            &sweep_txid,
+            0,
+            &"cc".repeat(20),
+            20_000
+        ));
         let mut damaged = spend_raw.clone();
         let at = damaged.len() / 3; // inside input 0's unlocking script (the DER signature)
         damaged[at] ^= 0x01;
-        assert!(!home_output_spend_proven(&damaged, &sweep_txid, 0, &home_pkh, 20_000));
-        assert!(!home_output_spend_proven(&[], &sweep_txid, 0, &home_pkh, 20_000));
-        assert!(!home_output_spend_proven(&spend_raw, &sweep_txid, 0, "nothex", 20_000));
+        assert!(!home_output_spend_proven(
+            &damaged,
+            &sweep_txid,
+            0,
+            &home_pkh,
+            20_000
+        ));
+        assert!(!home_output_spend_proven(
+            &[],
+            &sweep_txid,
+            0,
+            &home_pkh,
+            20_000
+        ));
+        assert!(!home_output_spend_proven(
+            &spend_raw,
+            &sweep_txid,
+            0,
+            "nothex",
+            20_000
+        ));
     }
 
     /// bsv-low #485: a courier-proven payout row (a sweep the index never held, courier outputs carry `spent: null`)
@@ -5341,7 +7024,8 @@ pub(crate) mod tests {
     /// proof, a corroborated unspent, or no look at all leave the row standing, claimable false, saying what was seen.
     /// To red: drop the `home_proven` arm of `swept_home`'s `output_spent`.
     #[test]
-    fn a_courier_proven_payout_retires_when_the_home_key_signed_the_sats_away_and_on_no_couriers_word() {
+    fn a_courier_proven_payout_retires_when_the_home_key_signed_the_sats_away_and_on_no_couriers_word(
+    ) {
         let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
         let sweep = tx(0x0e);
         let my_pkh = "cc".repeat(20);
@@ -5355,8 +7039,12 @@ pub(crate) mod tests {
         let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
         spends_it.insert(sweep.clone(), vec![(tx(0x07), 0)]);
         let home_key = format!("{sweep}:0");
-        let word = |w: Option<HomeSpendWord>| -> HashMap<String, HomeSpendWord> { w.map(|w| (home_key.clone(), w)).into_iter().collect() };
-        let derive = |outs: &HashMap<String, Vec<SpenderOutput>>, words: &HashMap<String, HomeSpendWord>, courier: &HashSet<String>| {
+        let word = |w: Option<HomeSpendWord>| -> HashMap<String, HomeSpendWord> {
+            w.map(|w| (home_key.clone(), w)).into_iter().collect()
+        };
+        let derive = |outs: &HashMap<String, Vec<SpenderOutput>>,
+                      words: &HashMap<String, HomeSpendWord>,
+                      courier: &HashSet<String>| {
             let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
             i.spender_outputs = outs;
             i.spender_inputs = &spends_it;
@@ -5371,20 +7059,48 @@ pub(crate) mod tests {
         assert_eq!(rows[0].facts["creditKind"], "courier-bytes");
         assert_eq!(rows[0].facts["claimable"], false);
         assert!(rows[0].facts.get("homeSpend").is_none());
-        assert_eq!(candidates, vec![CourierHomeOutput { sweep_txid: sweep.clone(), vout: 0, pkh_hex: my_pkh.clone(), sats: 20_000 }]);
+        assert_eq!(
+            candidates,
+            vec![CourierHomeOutput {
+                sweep_txid: sweep.clone(),
+                vout: 0,
+                pkh_hex: my_pkh.clone(),
+                sats: 20_000
+            }]
+        );
         // the chain rung's corroborated unspent: the row stands and says the sats were SEEN at the home
         let (rows, _) = derive(&mine, &word(Some(HomeSpendWord::Unspent)), &courier);
-        assert_eq!((rows.len(), rows[0].facts["claimable"].clone(), rows[0].facts["homeSpend"].clone()), (1, json!(false), json!("unspent")));
+        assert_eq!(
+            (
+                rows.len(),
+                rows[0].facts["claimable"].clone(),
+                rows[0].facts["homeSpend"].clone()
+            ),
+            (1, json!(false), json!("unspent"))
+        );
         assert_eq!(rows[0].facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON);
         // a courier's word of spent WITHOUT the proof retires nothing
         let (rows, _) = derive(&mine, &word(Some(HomeSpendWord::Unproven)), &courier);
-        assert_eq!((rows.len(), rows[0].facts["claimable"].clone(), rows[0].facts["homeSpend"].clone()), (1, json!(false), json!("unproven")));
+        assert_eq!(
+            (
+                rows.len(),
+                rows[0].facts["claimable"].clone(),
+                rows[0].facts["homeSpend"].clone()
+            ),
+            (1, json!(false), json!("unproven"))
+        );
         // THE RETIREMENT: the home key signed the output away
         let (rows, candidates) = derive(&mine, &word(Some(HomeSpendWord::Proven)), &courier);
         assert!(rows.is_empty(), "{rows:?}");
-        assert!(candidates.is_empty(), "a retired output is not walked again inside the pass");
+        assert!(
+            candidates.is_empty(),
+            "a retired output is not walked again inside the pass"
+        );
         // two home outputs: one proven is not enough
-        let two = pays(&sweep, &[(0, &my_pkh, 20_000, None), (1, &my_pkh, 190, None)]);
+        let two = pays(
+            &sweep,
+            &[(0, &my_pkh, 20_000, None), (1, &my_pkh, 190, None)],
+        );
         let (rows, candidates) = derive(&two, &word(Some(HomeSpendWord::Proven)), &courier);
         assert_eq!((rows.len(), rows[0].sats), (1, Some(20_190)));
         assert_eq!(candidates.len(), 2);
@@ -5392,7 +7108,10 @@ pub(crate) mod tests {
         both.insert(format!("{sweep}:1"), HomeSpendWord::Proven);
         assert!(derive(&two, &both, &courier).0.is_empty());
         // a word for ANOTHER outpoint (a stranger's sweep, a planted key) retires nothing of mine
-        let other: HashMap<String, HomeSpendWord> = [(format!("{}:0", tx(0x0f)), HomeSpendWord::Proven)].into_iter().collect();
+        let other: HashMap<String, HomeSpendWord> =
+            [(format!("{}:0", tx(0x0f)), HomeSpendWord::Proven)]
+                .into_iter()
+                .collect();
         assert_eq!(derive(&mine, &other, &courier).0.len(), 1);
         // an UNCONFIRMED courier payout is not a candidate (the pointer may yet be displaced) and keeps its waiting word
         let mut unconfirmed = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
@@ -5404,7 +7123,10 @@ pub(crate) mod tests {
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &courier;
         assert!(courier_home_outputs(&i).is_empty());
-        assert_eq!(derive_owed_rows(&i)[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
+        assert_eq!(
+            derive_owed_rows(&i)[0].facts["claimReason"],
+            UNCONFIRMED_PAYOUT_REASON
+        );
         // the index's own bytes are not this walk's business (the index's spend word retires those, as before)
         let none: HashSet<String> = HashSet::new();
         let (rows, candidates) = derive(&mine, &word(None), &none);
@@ -5428,11 +7150,17 @@ pub(crate) mod tests {
         let ledger = |reason: &str| vec![(hop_txid.to_ascii_uppercase(), 0u32, reason.to_string())];
         let script = door_refused_hops(&ledger("script-refused"), &young);
         let network = door_refused_hops(&ledger("network-rejected: REJECTED"), &young);
-        assert_eq!(script, [(key.clone(), DoorRefusal::Script)].into_iter().collect::<HashMap<_, _>>());
+        assert_eq!(
+            script,
+            [(key.clone(), DoorRefusal::Script)]
+                .into_iter()
+                .collect::<HashMap<_, _>>()
+        );
         assert_eq!(network.get(&key), Some(&DoorRefusal::Network));
         let unspent = chain(&key, true, Some(false), None);
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let derive = |refused: &HashMap<String, DoorRefusal>, chain_word: &HashMap<String, HopChainWord>| {
+        let derive = |refused: &HashMap<String, DoorRefusal>,
+                      chain_word: &HashMap<String, HopChainWord>| {
             let mut i = inputs(&[], &[], &young, &v, &c, &p, Some(900_000));
             i.hop_chain = chain_word;
             i.door_refused_hop_outpoints = refused;
@@ -5441,7 +7169,10 @@ pub(crate) mod tests {
         // THE FIX: stranded now, the sweep press (the Collect on a stranded hop), never the felt's rejoin
         let rows = derive(&script, &unspent);
         assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!((rows[0].family, rows[0].sats), (OwedFamily::HopStranded, Some(20_190)));
+        assert_eq!(
+            (rows[0].family, rows[0].sats),
+            (OwedFamily::HopStranded, Some(20_190))
+        );
         assert_eq!(rows[0].facts["claim"], "sweep-hop");
         assert_eq!(rows[0].facts["claimable"], true);
         assert_eq!(rows[0].facts["joinRefused"], true);
@@ -5450,22 +7181,52 @@ pub(crate) mod tests {
         // LOW-1: the 400 arm says what one refused copy proves, and that the sweep returns the seat's own stake
         let said = rows[0].reason.as_deref().unwrap();
         assert_eq!(said, DOOR_SCRIPT_REFUSED_REASON);
-        assert!(!said.contains("cannot start"), "one refused copy does not prove the hand cannot start");
-        assert!(said.contains("refused at the door") && said.contains("swept back now") && said.contains("your own stake"));
+        assert!(
+            !said.contains("cannot start"),
+            "one refused copy does not prove the hand cannot start"
+        );
+        assert!(
+            said.contains("refused at the door")
+                && said.contains("swept back now")
+                && said.contains("your own stake")
+        );
         // the 422 arm (the network's definitive word on bytes whose scripts verified) keeps its sentence
         let rows = derive(&network, &unspent);
-        assert_eq!((rows[0].family, rows[0].facts["doorRefusal"].clone(), rows[0].reason.as_deref()), (OwedFamily::HopStranded, json!("network"), Some(DOOR_REFUSED_REASON)));
+        assert_eq!(
+            (
+                rows[0].family,
+                rows[0].facts["doorRefusal"].clone(),
+                rows[0].reason.as_deref()
+            ),
+            (
+                OwedFamily::HopStranded,
+                json!("network"),
+                Some(DOOR_REFUSED_REASON)
+            )
+        );
         // the press still rests on the chain rung: no word yet is a waiting sentence that says why it will be sweepable
         let rows = derive(&script, &NO_CHAIN);
-        assert_eq!((rows[0].family, rows[0].facts["joinRefused"].clone()), (OwedFamily::Unbound, json!(true)));
+        assert_eq!(
+            (rows[0].family, rows[0].facts["joinRefused"].clone()),
+            (OwedFamily::Unbound, json!(true))
+        );
         assert!(rows[0].facts.get("claimable").is_none());
         // without the ledger's word: in progress, rejoin, and no door fact
         let rows = derive(&HashMap::new(), &unspent);
-        assert_eq!((rows[0].family, rows[0].facts["claim"].clone()), (OwedFamily::InProgress, json!("rejoin")));
+        assert_eq!(
+            (rows[0].family, rows[0].facts["claim"].clone()),
+            (OwedFamily::InProgress, json!("rejoin"))
+        );
         assert!(rows[0].facts.get("doorRefusal").is_none());
         // a ledger row for an outpoint the walk does not hold names nothing (the belt behind the SQL's own join)
-        assert!(door_refused_hops(&[(tx(0x09), 0, "script-refused".to_string())], &young).is_empty());
-        assert!(door_refused_hops(&[(hop_txid.clone(), 1, "script-refused".to_string())], &young).is_empty());
+        assert!(
+            door_refused_hops(&[(tx(0x09), 0, "script-refused".to_string())], &young).is_empty()
+        );
+        assert!(door_refused_hops(
+            &[(hop_txid.clone(), 1, "script-refused".to_string())],
+            &young
+        )
+        .is_empty());
         // an eviction's word keeps its own sentence when both ledgers name the hop
         let evicted: HashSet<String> = [key.clone()].into_iter().collect();
         let mut i = inputs(&[], &[], &young, &v, &c, &p, Some(900_000));
@@ -5473,7 +7234,13 @@ pub(crate) mod tests {
         i.door_refused_hop_outpoints = &script;
         i.evicted_hop_outpoints = &evicted;
         let rows = derive_owed_rows(&i);
-        assert_eq!((rows[0].facts["joinRefusedBy"].clone(), rows[0].reason.as_deref()), (json!("eviction"), Some(JOIN_REFUSED_REASON)));
+        assert_eq!(
+            (
+                rows[0].facts["joinRefusedBy"].clone(),
+                rows[0].reason.as_deref()
+            ),
+            (json!("eviction"), Some(JOIN_REFUSED_REASON))
+        );
         assert!(rows[0].facts.get("doorRefusal").is_none());
     }
 
@@ -5485,15 +7252,32 @@ pub(crate) mod tests {
     /// To red: have `home_word` latch on a bare word of spent, or key the latch read differently from its write.
     #[test]
     fn the_home_walk_latches_only_a_verified_proof_and_reads_its_own_latch_back_real_sqlite() {
-        use crate::hops_view::{probe_memo_key, probe_memo_read_sql, ChainSpendProbe, ProbeMemo, PROBE_MEMO_UPSERT_SQL};
+        use crate::hops_view::{
+            probe_memo_key, probe_memo_read_sql, ChainSpendProbe, ProbeMemo, PROBE_MEMO_UPSERT_SQL,
+        };
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
             if let Err(e) = conn.execute_batch(sql) {
-                assert!(e.to_string().to_ascii_lowercase().contains("duplicate column"), "migration failed under real SQLite: {e}");
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "migration failed under real SQLite: {e}"
+                );
             }
         }
         let write = |m: &ProbeMemo| {
-            conn.execute(PROBE_MEMO_UPSERT_SQL, rusqlite::params![m.outpoint, m.probed_at_ms, i64::from(m.spent), m.spending_txid, m.spent_confirmed.map(i64::from)]).unwrap();
+            conn.execute(
+                PROBE_MEMO_UPSERT_SQL,
+                rusqlite::params![
+                    m.outpoint,
+                    m.probed_at_ms,
+                    i64::from(m.spent),
+                    m.spending_txid,
+                    m.spent_confirmed.map(i64::from)
+                ],
+            )
+            .unwrap();
         };
         // the route's `read_probe_memos`: one IN read keyed by `probe_memo_key` of each target
         let read = |targets: &[(String, u32)]| -> Vec<ProbeMemo> {
@@ -5513,54 +7297,149 @@ pub(crate) mod tests {
                 .map(|r| r.unwrap())
                 .collect()
         };
-        let (home, stranger) = (bsv_rs::primitives::PrivateKey::random(), bsv_rs::primitives::PrivateKey::random());
+        let (home, stranger) = (
+            bsv_rs::primitives::PrivateKey::random(),
+            bsv_rs::primitives::PrivateKey::random(),
+        );
         let pkh = hex::encode(home.public_key().hash160());
         let (sweep_a, spend_a) = sweep_and_home_spend(&home, &home, 20_000);
         let (sweep_b, forged_b) = sweep_and_home_spend(&home, &stranger, 30_000); // spent "by" bytes the home key never signed
-        let cand = |sweep: &str, sats: u64| CourierHomeOutput { sweep_txid: sweep.to_string(), vout: 0, pkh_hex: pkh.clone(), sats };
+        let cand = |sweep: &str, sats: u64| CourierHomeOutput {
+            sweep_txid: sweep.to_string(),
+            vout: 0,
+            pkh_hex: pkh.clone(),
+            sats,
+        };
         let candidates = [cand(&sweep_a, 20_000), cand(&sweep_b, 30_000)];
-        let latch_targets: Vec<(String, u32)> = candidates.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).collect();
+        let latch_targets: Vec<(String, u32)> = candidates
+            .iter()
+            .map(|c| home_latch_target(&c.sweep_txid, c.vout))
+            .collect();
         // pass 1: nothing latched, both outputs go to the chain rung
         let (words, targets) = latched_home_words(&candidates, &read(&latch_targets));
         assert!(words.is_empty());
         assert_eq!(targets, vec![(sweep_a.clone(), 0), (sweep_b.clone(), 0)]);
-        let spent_by = |sp: &str| ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(sp.to_string()), spent_confirmed: Some(true) };
+        let spent_by = |sp: &str| ChainSpendProbe {
+            known: true,
+            spent: Some(true),
+            spending_txid: Some(sp.to_string()),
+            spent_confirmed: Some(true),
+        };
         let named = tx(0x5a); // the spender a courier NAMED; the proof is over the bytes
-        // an unknown or faulted probe, and a known probe with no verdict: nothing established, the row stands
-        assert_eq!(home_word(&ChainSpendProbe { known: false, spent: Some(true), spending_txid: Some(named.clone()), spent_confirmed: None }, Some(&spend_a), &candidates[0], 5_000), None);
-        assert_eq!(home_word(&ChainSpendProbe { known: true, spent: None, spending_txid: None, spent_confirmed: None }, Some(&spend_a), &candidates[0], 5_000), None);
+                              // an unknown or faulted probe, and a known probe with no verdict: nothing established, the row stands
+        assert_eq!(
+            home_word(
+                &ChainSpendProbe {
+                    known: false,
+                    spent: Some(true),
+                    spending_txid: Some(named.clone()),
+                    spent_confirmed: None
+                },
+                Some(&spend_a),
+                &candidates[0],
+                5_000
+            ),
+            None
+        );
+        assert_eq!(
+            home_word(
+                &ChainSpendProbe {
+                    known: true,
+                    spent: None,
+                    spending_txid: None,
+                    spent_confirmed: None
+                },
+                Some(&spend_a),
+                &candidates[0],
+                5_000
+            ),
+            None
+        );
         // a corroborated absence
-        assert_eq!(home_word(&ChainSpendProbe { known: true, spent: Some(false), spending_txid: None, spent_confirmed: None }, None, &candidates[0], 5_000), Some((HomeSpendWord::Unspent, None)));
+        assert_eq!(
+            home_word(
+                &ChainSpendProbe {
+                    known: true,
+                    spent: Some(false),
+                    spending_txid: None,
+                    spent_confirmed: None
+                },
+                None,
+                &candidates[0],
+                5_000
+            ),
+            Some((HomeSpendWord::Unspent, None))
+        );
         // a word of spent with no bytes, with bytes another key signed, with another output's proof: unproven, no latch
-        assert_eq!(home_word(&spent_by(&named), None, &candidates[0], 5_000), Some((HomeSpendWord::Unproven, None)));
-        assert_eq!(home_word(&spent_by(&named), Some(&forged_b), &candidates[1], 5_000), Some((HomeSpendWord::Unproven, None)));
-        assert_eq!(home_word(&spent_by(&named), Some(&spend_a), &candidates[1], 5_000), Some((HomeSpendWord::Unproven, None)));
+        assert_eq!(
+            home_word(&spent_by(&named), None, &candidates[0], 5_000),
+            Some((HomeSpendWord::Unproven, None))
+        );
+        assert_eq!(
+            home_word(&spent_by(&named), Some(&forged_b), &candidates[1], 5_000),
+            Some((HomeSpendWord::Unproven, None))
+        );
+        assert_eq!(
+            home_word(&spent_by(&named), Some(&spend_a), &candidates[1], 5_000),
+            Some((HomeSpendWord::Unproven, None))
+        );
         // THE PROOF: the home key's signature over output A's spend
-        let (word, latch) = home_word(&spent_by(&named), Some(&spend_a), &candidates[0], 5_000).expect("a word");
+        let (word, latch) =
+            home_word(&spent_by(&named), Some(&spend_a), &candidates[0], 5_000).expect("a word");
         let latch = latch.expect("a proof writes its latch");
         assert_eq!(word, HomeSpendWord::Proven);
-        assert_eq!(latch.outpoint, format!("{HOME_SPEND_LATCH_PREFIX}{sweep_a}.0"));
-        let proven_txid = bsv_rs::transaction::Transaction::from_binary(&spend_a).unwrap().id();
-        assert_eq!(latch.spending_txid.as_deref(), Some(proven_txid.as_str()), "the latch names the transaction the proven bytes hash to");
+        assert_eq!(
+            latch.outpoint,
+            format!("{HOME_SPEND_LATCH_PREFIX}{sweep_a}.0")
+        );
+        let proven_txid = bsv_rs::transaction::Transaction::from_binary(&spend_a)
+            .unwrap()
+            .id();
+        assert_eq!(
+            latch.spending_txid.as_deref(),
+            Some(proven_txid.as_str()),
+            "the latch names the transaction the proven bytes hash to"
+        );
         assert_ne!(proven_txid, named);
         write(&latch);
         // the chain rung's ordinary memo of output B (keyed `<txid>.<vout>`) is no latch
-        write(&ProbeMemo { outpoint: probe_memo_key(&sweep_b, 0), probed_at_ms: 5_000, spent: true, spending_txid: Some(named.clone()), spent_confirmed: Some(true) });
+        write(&ProbeMemo {
+            outpoint: probe_memo_key(&sweep_b, 0),
+            probed_at_ms: 5_000,
+            spent: true,
+            spending_txid: Some(named.clone()),
+            spent_confirmed: Some(true),
+        });
         // pass 2: the key written is the key read; A is Proven with no ask, B is still a target
         let memos = read(&latch_targets);
         assert_eq!(memos.len(), 1);
         let (words, targets) = latched_home_words(&candidates, &memos);
-        assert_eq!(words, [(outpoint_key(&sweep_a, 0), HomeSpendWord::Proven)].into_iter().collect::<HashMap<_, _>>());
+        assert_eq!(
+            words,
+            [(outpoint_key(&sweep_a, 0), HomeSpendWord::Proven)]
+                .into_iter()
+                .collect::<HashMap<_, _>>()
+        );
         assert_eq!(targets, vec![(sweep_b.clone(), 0)]);
         // a candidate named in another case reads the same latch
         let upper = [cand(&sweep_a.to_ascii_uppercase(), 20_000)];
-        let upper_targets: Vec<(String, u32)> = upper.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).collect();
+        let upper_targets: Vec<(String, u32)> = upper
+            .iter()
+            .map(|c| home_latch_target(&c.sweep_txid, c.vout))
+            .collect();
         assert_eq!(latched_home_words(&upper, &read(&upper_targets)).0.len(), 1);
         // a memo under a latch key that does not say spent-with-a-spender latches nothing
-        let weak = ProbeMemo { outpoint: probe_memo_key(&latch_targets[1].0, 0), probed_at_ms: 5_000, spent: true, spending_txid: None, spent_confirmed: None };
+        let weak = ProbeMemo {
+            outpoint: probe_memo_key(&latch_targets[1].0, 0),
+            probed_at_ms: 5_000,
+            spent: true,
+            spending_txid: None,
+            spent_confirmed: None,
+        };
         assert!(latched_home_words(&candidates[1..], &[weak]).0.is_empty());
         // the stored-read count sits inside the candidate cap
-        const _: () = assert!(OWED_HOME_STORED_READS_PER_RECOMPUTE <= crate::logic::D1_CHUNK_OUTPOINTS);
+        const _: () =
+            assert!(OWED_HOME_STORED_READS_PER_RECOMPUTE <= crate::logic::D1_CHUNK_OUTPOINTS);
     }
 
     /// The lens fold's LOW-2: a read whose own walk was SUPERSEDED (the #487 guard refused its older snapshot) is
@@ -5592,24 +7471,60 @@ pub(crate) mod tests {
             reason: None,
         };
         let older = [row(format!("{}:0", tx(0x07)), OwedFamily::HopStranded)];
-        let newer = [row(format!("{}:0", tx(0x07)), OwedFamily::Payout), row(format!("{}:1", tx(0x08)), OwedFamily::InProgress)];
+        let newer = [
+            row(format!("{}:0", tx(0x07)), OwedFamily::Payout),
+            row(format!("{}:1", tx(0x08)), OwedFamily::InProgress),
+        ];
         // the route's stored read: the marker, then the rows, through the shipped statements
-        let stored = |conn: &rusqlite::Connection| -> (Vec<(String, String)>, i64, Option<i64>, bool) {
-            let (at, tip, cut): (i64, Option<i64>, i64) = conn.query_row(OWED_STATE_READ_SQL, [ME], |r| Ok((r.get(1)?, r.get(2)?, r.get(5)?))).unwrap();
-            let rows = conn.prepare(OWED_ROWS_READ_SQL).unwrap().query_map([ME], |r| Ok((r.get(1)?, r.get(2)?))).unwrap().map(|r| r.unwrap()).collect();
-            (rows, at, tip, cut != 0)
-        };
+        let stored =
+            |conn: &rusqlite::Connection| -> (Vec<(String, String)>, i64, Option<i64>, bool) {
+                let (at, tip, cut): (i64, Option<i64>, i64) = conn
+                    .query_row(OWED_STATE_READ_SQL, [ME], |r| {
+                        Ok((r.get(1)?, r.get(2)?, r.get(5)?))
+                    })
+                    .unwrap();
+                let rows = conn
+                    .prepare(OWED_ROWS_READ_SQL)
+                    .unwrap()
+                    .query_map([ME], |r| Ok((r.get(1)?, r.get(2)?)))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+                (rows, at, tip, cut != 0)
+            };
         // the newer walk (began at 71 000) lands first; its own read serves its own rows
-        let landed = owed_write_landed(run_owed_write(&mut conn, &owed_write_plan(ME, &newer, 71_000, Some(900_001), true)), 71_000);
+        let landed = owed_write_landed(
+            run_owed_write(
+                &mut conn,
+                &owed_write_plan(ME, &newer, 71_000, Some(900_001), true),
+            ),
+            71_000,
+        );
         assert_eq!(read_answer_after_compute(!landed), ReadAnswer::Own);
         // the older walk (began at 1 000) lands second: refused, and its READER is owed the newer rows
-        let landed = owed_write_landed(run_owed_write(&mut conn, &owed_write_plan(ME, &older, 1_000, Some(900_000), false)), 1_000);
+        let landed = owed_write_landed(
+            run_owed_write(
+                &mut conn,
+                &owed_write_plan(ME, &older, 1_000, Some(900_000), false),
+            ),
+            1_000,
+        );
         assert!(!landed);
         assert_eq!(read_answer_after_compute(!landed), ReadAnswer::Stored);
         let (rows, at, tip, cut) = stored(&conn);
-        assert_eq!(rows, vec![(format!("{}:0", tx(0x07)), "payout".to_string()), (format!("{}:1", tx(0x08)), "in-progress".to_string())]);
+        assert_eq!(
+            rows,
+            vec![
+                (format!("{}:0", tx(0x07)), "payout".to_string()),
+                (format!("{}:1", tx(0x08)), "in-progress".to_string())
+            ]
+        );
         assert_ne!(rows.len(), older.len(), "never the older walk's own rows");
-        assert_eq!((at, tip, cut), (71_000, Some(900_001), true), "with the newer snapshot's stamp, tip and cut");
+        assert_eq!(
+            (at, tip, cut),
+            (71_000, Some(900_001), true),
+            "with the newer snapshot's stamp, tip and cut"
+        );
     }
 
     // ---- the delta fold (2026-10-06): the home walk's ring, its caps, the superseded fallback ----
@@ -5633,7 +7548,15 @@ pub(crate) mod tests {
         async fn probe(&mut self, txid: &str, vout: u32) -> crate::hops_view::ChainSpendProbe {
             let key = outpoint_key(txid, vout);
             self.probed.push(key.clone());
-            self.probes.get(&key).cloned().unwrap_or(crate::hops_view::ChainSpendProbe { known: false, spent: None, spending_txid: None, spent_confirmed: None })
+            self.probes
+                .get(&key)
+                .cloned()
+                .unwrap_or(crate::hops_view::ChainSpendProbe {
+                    known: false,
+                    spent: None,
+                    spending_txid: None,
+                    spent_confirmed: None,
+                })
         }
         async fn stored_spender(&mut self, spender_txid: &str) -> Option<Vec<u8>> {
             self.stored_asked.push(spender_txid.to_string());
@@ -5652,19 +7575,44 @@ pub(crate) mod tests {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
             if let Err(e) = conn.execute_batch(sql) {
-                assert!(e.to_string().to_ascii_lowercase().contains("duplicate column"), "migration failed under real SQLite: {e}");
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "migration failed under real SQLite: {e}"
+                );
             }
         }
         conn
     }
     fn write_memos(conn: &rusqlite::Connection, memos: &[crate::hops_view::ProbeMemo]) {
         for m in memos {
-            conn.execute(crate::hops_view::PROBE_MEMO_UPSERT_SQL, rusqlite::params![m.outpoint, m.probed_at_ms, i64::from(m.spent), m.spending_txid, m.spent_confirmed.map(i64::from)]).unwrap();
+            conn.execute(
+                crate::hops_view::PROBE_MEMO_UPSERT_SQL,
+                rusqlite::params![
+                    m.outpoint,
+                    m.probed_at_ms,
+                    i64::from(m.spent),
+                    m.spending_txid,
+                    m.spent_confirmed.map(i64::from)
+                ],
+            )
+            .unwrap();
         }
     }
-    fn read_memos(conn: &rusqlite::Connection, targets: &[(String, u32)]) -> Vec<crate::hops_view::ProbeMemo> {
-        let keys: Vec<String> = targets.iter().map(|(t, v)| crate::hops_view::probe_memo_key(t, *v)).collect();
-        assert!(keys.len() < crate::logic::D1_MAX_BOUND_PARAMS, "one read stays inside D1's bind limit ({})", keys.len());
+    fn read_memos(
+        conn: &rusqlite::Connection,
+        targets: &[(String, u32)],
+    ) -> Vec<crate::hops_view::ProbeMemo> {
+        let keys: Vec<String> = targets
+            .iter()
+            .map(|(t, v)| crate::hops_view::probe_memo_key(t, *v))
+            .collect();
+        assert!(
+            keys.len() < crate::logic::D1_MAX_BOUND_PARAMS,
+            "one read stays inside D1's bind limit ({})",
+            keys.len()
+        );
         conn.prepare(&crate::hops_view::probe_memo_read_sql(keys.len()))
             .unwrap()
             .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
@@ -5683,22 +7631,41 @@ pub(crate) mod tests {
     /// ONE PASS as `routes::owed_home_spend_walk` runs it, the Worker's D1 replaced by real SQLite over the shipped
     /// memo statements: the cursor and the window's memos read, `home_walk_pass`, the memos and the cursor written.
     /// Returns the pass and the window it walked.
-    fn home_pass_on_sqlite(conn: &rusqlite::Connection, world: &mut FakeCouriers, candidates: &[CourierHomeOutput], now_ms: i64) -> (HomePass, Vec<CourierHomeOutput>) {
+    fn home_pass_on_sqlite(
+        conn: &rusqlite::Connection,
+        world: &mut FakeCouriers,
+        candidates: &[CourierHomeOutput],
+        now_ms: i64,
+    ) -> (HomePass, Vec<CourierHomeOutput>) {
         let memo_targets = |window: &[CourierHomeOutput]| -> Vec<(String, u32)> {
-            window.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).chain(window.iter().map(|c| (c.sweep_txid.clone(), c.vout))).collect()
+            window
+                .iter()
+                .map(|c| home_latch_target(&c.sweep_txid, c.vout))
+                .chain(window.iter().map(|c| (c.sweep_txid.clone(), c.vout)))
+                .collect()
         };
         let (window, memos) = if candidates.len() <= OWED_HOME_WINDOW {
             let mut targets = vec![home_cursor_target(ME)];
             targets.extend(memo_targets(candidates));
             let memos = read_memos(conn, &targets);
-            (home_walk_window(candidates, home_cursor_of(&memos, ME).as_deref(), OWED_HOME_WINDOW), memos)
+            (
+                home_walk_window(
+                    candidates,
+                    home_cursor_of(&memos, ME).as_deref(),
+                    OWED_HOME_WINDOW,
+                ),
+                memos,
+            )
         } else {
             let cursor = home_cursor_of(&read_memos(conn, &[home_cursor_target(ME)]), ME);
             let window = home_walk_window(candidates, cursor.as_deref(), OWED_HOME_WINDOW);
             let memos = read_memos(conn, &memo_targets(&window));
             (window, memos)
         };
-        let pass = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(home_walk_pass(world, &window, &memos, &memos, now_ms));
+        let pass = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(home_walk_pass(world, &window, &memos, &memos, now_ms));
         write_memos(conn, &pass.memos);
         if let Some(next) = home_cursor_after(candidates, &window, pass.first_withheld) {
             write_memos(conn, &[home_cursor_memo(ME, next, now_ms)]);
@@ -5706,10 +7673,22 @@ pub(crate) mod tests {
         (pass, window)
     }
     fn plain_candidates(n: usize) -> Vec<CourierHomeOutput> {
-        (0..n).map(|i| CourierHomeOutput { sweep_txid: format!("{:064x}", 0x1000 + i), vout: 0, pkh_hex: "cc".repeat(20), sats: 20_000 }).collect()
+        (0..n)
+            .map(|i| CourierHomeOutput {
+                sweep_txid: format!("{:064x}", 0x1000 + i),
+                vout: 0,
+                pkh_hex: "cc".repeat(20),
+                sats: 20_000,
+            })
+            .collect()
     }
     fn unspent_probe() -> crate::hops_view::ChainSpendProbe {
-        crate::hops_view::ChainSpendProbe { known: true, spent: Some(false), spending_txid: None, spent_confirmed: None }
+        crate::hops_view::ChainSpendProbe {
+            known: true,
+            spent: Some(false),
+            spending_txid: None,
+            spent_confirmed: None,
+        }
     }
 
     /// bsv-low #484 (merge fold, the merged lens's LOW-1 and N3): THE BUDGET-WAIT SENTENCE PROMISES A CREDIT ONLY
@@ -5724,60 +7703,119 @@ pub(crate) mod tests {
     #[test]
     fn the_budget_wait_promises_a_credit_only_on_a_row_that_can_be_offered_one() {
         use crate::hops_view::{
-            confirmation_refused, mark_refused_word_rows, probe_memo_of, set_aside_proofs_a_refused_word_contradicts, stale_memo_word, ChainSpendProbe, ProbeMemo,
-            CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON, CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON, CHAIN_WORD_AWAITS_PROBE_REASON, OWED_CHAIN_WAIT_PROBE,
-            OWED_FACT_CHAIN_WORD_AWAITS_PROBE,
+            confirmation_refused, mark_refused_word_rows, probe_memo_of,
+            set_aside_proofs_a_refused_word_contradicts, stale_memo_word, ChainSpendProbe,
+            ProbeMemo, CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON,
+            CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON, CHAIN_WORD_AWAITS_PROBE_REASON,
+            OWED_CHAIN_WAIT_PROBE, OWED_FACT_CHAIN_WORD_AWAITS_PROBE,
         };
         let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
         let now: i64 = 1_800_000_000_000;
         let (clear, read_at) = (now - 7 * 60_000, now - 6 * 60_000); // the memo was read one minute into the grace
         let (sweep, rival, my_pkh) = (tx(0x0e), tx(0x9b), "cc".repeat(20));
         let key = outpoint_key(&tx(0x07), 0);
-        let hops = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let hops = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
         let pkhs: HashMap<String, String> = [(tx(0x01), my_pkh.clone())].into_iter().collect();
         let memo_naming = |spender: &str| -> ProbeMemo {
-            probe_memo_of(&tx(0x07), 0, &ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(spender.to_string()), spent_confirmed: Some(true) }, read_at).expect("a known answer is memoised")
+            probe_memo_of(
+                &tx(0x07),
+                0,
+                &ChainSpendProbe {
+                    known: true,
+                    spent: Some(true),
+                    spending_txid: Some(spender.to_string()),
+                    spent_confirmed: Some(true),
+                },
+                read_at,
+            )
+            .expect("a known answer is memoised")
         };
         // THE WALK past the budget, in the route's order: the stale word, the refusal remembered, the set-aside,
         // the derivation, the mark
-        let walk = |memo: &ProbeMemo, spender: &str, courier: bool, filed: Option<&str>| -> OwedRow {
-            let mut refused_words: HashMap<String, Option<String>> = HashMap::new();
-            assert!(confirmation_refused(memo, Some(clear)));
-            refused_words.insert(key.clone(), memo.spending_txid.as_deref().map(str::to_ascii_lowercase));
-            let chain: HashMap<String, HopChainWord> = [(key.clone(), stale_memo_word(memo, now, Some(clear)))].into_iter().collect();
-            let mut sweeps: HashMap<String, crate::hopsweep::FiledHopSweep> = filed
-                .map(|f| (key.clone(), crate::hopsweep::FiledHopSweep { sweep_txid: f.to_string(), raw_hex: "0100".repeat(20), pays_sats: Some(20_000), index_proven: true, index_proof_height: Some(899_990) }))
-                .into_iter()
-                .collect();
-            let set_aside = set_aside_proofs_a_refused_word_contradicts(&mut sweeps, &refused_words);
-            let outs = pays(spender, &[(0, &my_pkh, 20_000, None)]);
-            let ins: HashMap<String, Vec<(String, u32)>> = [(spender.to_string(), vec![(tx(0x07), 0)])].into_iter().collect();
-            let couriers: HashSet<String> = if courier { [spender.to_string()].into_iter().collect() } else { HashSet::new() };
-            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
-            i.hop_chain = &chain;
-            i.hop_sweeps = &sweeps;
-            i.spender_outputs = &outs;
-            i.spender_inputs = &ins;
-            i.my_pkh_by_game = &pkhs;
-            i.courier_spenders = &couriers;
-            let mut rows = derive_owed_rows(&i);
-            assert_eq!(rows.len(), 1);
-            assert_eq!((rows[0].family, rows[0].facts["claimable"].as_bool(), rows[0].facts["claimReason"].as_str()), (OwedFamily::Payout, Some(false), Some(UNCONFIRMED_PAYOUT_REASON)), "the row the mark renames");
-            assert_eq!(rows[0].facts["chainWait"], "block");
-            mark_refused_word_rows(&mut rows, &refused_words, &set_aside);
-            rows.remove(0)
-        };
+        let walk =
+            |memo: &ProbeMemo, spender: &str, courier: bool, filed: Option<&str>| -> OwedRow {
+                let mut refused_words: HashMap<String, Option<String>> = HashMap::new();
+                assert!(confirmation_refused(memo, Some(clear)));
+                refused_words.insert(
+                    key.clone(),
+                    memo.spending_txid.as_deref().map(str::to_ascii_lowercase),
+                );
+                let chain: HashMap<String, HopChainWord> =
+                    [(key.clone(), stale_memo_word(memo, now, Some(clear)))]
+                        .into_iter()
+                        .collect();
+                let mut sweeps: HashMap<String, crate::hopsweep::FiledHopSweep> = filed
+                    .map(|f| {
+                        (
+                            key.clone(),
+                            crate::hopsweep::FiledHopSweep {
+                                sweep_txid: f.to_string(),
+                                raw_hex: "0100".repeat(20),
+                                pays_sats: Some(20_000),
+                                index_proven: true,
+                                index_proof_height: Some(899_990),
+                            },
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                let set_aside =
+                    set_aside_proofs_a_refused_word_contradicts(&mut sweeps, &refused_words);
+                let outs = pays(spender, &[(0, &my_pkh, 20_000, None)]);
+                let ins: HashMap<String, Vec<(String, u32)>> =
+                    [(spender.to_string(), vec![(tx(0x07), 0)])]
+                        .into_iter()
+                        .collect();
+                let couriers: HashSet<String> = if courier {
+                    [spender.to_string()].into_iter().collect()
+                } else {
+                    HashSet::new()
+                };
+                let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+                i.hop_chain = &chain;
+                i.hop_sweeps = &sweeps;
+                i.spender_outputs = &outs;
+                i.spender_inputs = &ins;
+                i.my_pkh_by_game = &pkhs;
+                i.courier_spenders = &couriers;
+                let mut rows = derive_owed_rows(&i);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    (
+                        rows[0].family,
+                        rows[0].facts["claimable"].as_bool(),
+                        rows[0].facts["claimReason"].as_str()
+                    ),
+                    (
+                        OwedFamily::Payout,
+                        Some(false),
+                        Some(UNCONFIRMED_PAYOUT_REASON)
+                    ),
+                    "the row the mark renames"
+                );
+                assert_eq!(rows[0].facts["chainWait"], "block");
+                mark_refused_word_rows(&mut rows, &refused_words, &set_aside);
+                rows.remove(0)
+            };
         // 1. COURIER BYTES: no credit can be assembled here, and the row never says one is coming
         let row = walk(&memo_naming(&sweep), &sweep, true, None);
         assert_eq!(row.facts["creditKind"], "courier-bytes");
-        assert_eq!(row.facts["claimReason"], CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON);
+        assert_eq!(
+            row.facts["claimReason"],
+            CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON
+        );
         assert_eq!(row.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE], true);
         assert_eq!(row.facts["chainWait"], OWED_CHAIN_WAIT_PROBE);
         assert!(row.facts.get("sweepProofContradicted").is_none());
         //    the same row on a FRESH confirmed word: the sentence the wait now agrees with
         let fresh = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
         let outs = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
-        let ins: HashMap<String, Vec<(String, u32)>> = [(sweep.clone(), vec![(tx(0x07), 0)])].into_iter().collect();
+        let ins: HashMap<String, Vec<(String, u32)>> =
+            [(sweep.clone(), vec![(tx(0x07), 0)])].into_iter().collect();
         let couriers: HashSet<String> = [sweep.clone()].into_iter().collect();
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &fresh;
@@ -5785,28 +7823,54 @@ pub(crate) mod tests {
         i.spender_inputs = &ins;
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &couriers;
-        assert_eq!(derive_owed_rows(&i)[0].facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON);
+        assert_eq!(
+            derive_owed_rows(&i)[0].facts["claimReason"],
+            COURIER_BYTES_NO_CREDIT_REASON
+        );
         // 2. THE PROOF SET ASIDE: a proven filing, a refused word naming a rival whose bytes pay this home
         let row = walk(&memo_naming(&rival), &rival, false, Some(&sweep));
         assert_eq!(row.facts["sweepProofContradicted"], true);
-        assert_eq!(row.facts["claimReason"], CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON);
+        assert_eq!(
+            row.facts["claimReason"],
+            CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON
+        );
         assert_eq!(row.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE], true);
         assert_eq!(row.facts["chainWait"], OWED_CHAIN_WAIT_PROBE);
         //    and it outranks the courier-bytes word (the filed sweep's credit may yet stand)
         let row = walk(&memo_naming(&rival), &rival, true, Some(&sweep));
-        assert_eq!((row.facts["creditKind"].as_str(), row.facts["claimReason"].as_str()), (Some("courier-bytes"), Some(CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON)));
+        assert_eq!(
+            (
+                row.facts["creditKind"].as_str(),
+                row.facts["claimReason"].as_str()
+            ),
+            (
+                Some("courier-bytes"),
+                Some(CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON)
+            )
+        );
         // 3. AN INDEX-HELD SWEEP, nothing set aside: the one row a credit can be offered on keeps the promise
         let row = walk(&memo_naming(&sweep), &sweep, false, None);
-        assert!(row.facts.get("creditKind").is_none() && row.facts.get("sweepProofContradicted").is_none());
+        assert!(
+            row.facts.get("creditKind").is_none()
+                && row.facts.get("sweepProofContradicted").is_none()
+        );
         assert_eq!(row.facts["claimReason"], CHAIN_WORD_AWAITS_PROBE_REASON);
         assert_eq!(row.facts["chainWait"], OWED_CHAIN_WAIT_PROBE);
         // the words: only the third speaks of a credit being offered; all three name the reorg and the re-ask
         assert!(CHAIN_WORD_AWAITS_PROBE_REASON.contains("the credit is offered"));
-        for other in [CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON, CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON] {
+        for other in [
+            CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON,
+            CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON,
+        ] {
             assert!(!other.contains("offered"), "{other}");
-            assert!(other.contains("read just after a reorg") && other.contains("asked again in turn"), "{other}");
+            assert!(
+                other.contains("read just after a reorg") && other.contains("asked again in turn"),
+                "{other}"
+            );
         }
-        assert!(CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON.contains("no credit can be assembled here"));
+        assert!(
+            CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON.contains("no credit can be assembled here")
+        );
         assert_ne!(OWED_CHAIN_WAIT_PROBE, "block");
     }
 
@@ -5817,15 +7881,34 @@ pub(crate) mod tests {
     /// To red: drop `probe_memo_read_faulted` from either fault arm, or rename either constant alone.
     #[test]
     fn a_faulted_probe_memo_read_is_counted_on_health_and_in_the_overlays_counters_real_sqlite() {
-        assert_eq!(COUNTER_PROBE_MEMO_READ_FAULTS, bsv_overlay_cloudflare::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS, "the overlay seeds the row this worker writes");
-        let before = owed_health_json()["probeMemoReadFaults"].as_u64().expect("the count is on /health.owed");
+        assert_eq!(
+            COUNTER_PROBE_MEMO_READ_FAULTS,
+            bsv_overlay_cloudflare::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,
+            "the overlay seeds the row this worker writes"
+        );
+        let before = owed_health_json()["probeMemoReadFaults"]
+            .as_u64()
+            .expect("the count is on /health.owed");
         note_probe_memo_read_fault();
-        assert_eq!(owed_health_json()["probeMemoReadFaults"].as_u64().unwrap(), before + 1);
+        assert_eq!(
+            owed_health_json()["probeMemoReadFaults"].as_u64().unwrap(),
+            before + 1
+        );
         let conn = memo_db();
         for _ in 0..2 {
-            conn.execute(crate::beef_guard::BUMP_COUNTER_SQL, rusqlite::params![COUNTER_PROBE_MEMO_READ_FAULTS, 1i64]).unwrap();
+            conn.execute(
+                crate::beef_guard::BUMP_COUNTER_SQL,
+                rusqlite::params![COUNTER_PROBE_MEMO_READ_FAULTS, 1i64],
+            )
+            .unwrap();
         }
-        let held: i64 = conn.query_row("SELECT value FROM ops_counters WHERE name = ?1", [COUNTER_PROBE_MEMO_READ_FAULTS], |r| r.get(0)).unwrap();
+        let held: i64 = conn
+            .query_row(
+                "SELECT value FROM ops_counters WHERE name = ?1",
+                [COUNTER_PROBE_MEMO_READ_FAULTS],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(held, 2, "one per faulted read");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = squash(include_str!("routes.rs"));
@@ -5847,12 +7930,19 @@ pub(crate) mod tests {
     /// To red: drop either prefix from either DELETE (on `7868785` the clear took the confirmed latch and the
     /// sweep took the other latch and the cursor).
     #[test]
-    fn the_overlays_reorg_clear_and_ttl_sweep_leave_the_home_latch_and_the_home_cursor_real_sqlite() {
+    fn the_overlays_reorg_clear_and_ttl_sweep_leave_the_home_latch_and_the_home_cursor_real_sqlite()
+    {
         use crate::hops_view::{probe_memo_key, ChainSpendProbe, ProbeMemo};
         use bsv_overlay_cloudflare::hop_probe_memos::{
-            HOP_PROBE_MEMO_APP_LAYER_PREFIXES, HOP_PROBE_MEMO_EXPIRE_SQL, HOP_PROBE_MEMO_REORG_CLEAR_SQL, HOP_PROBE_MEMO_REORG_MARK, HOP_PROBE_MEMO_REORG_MARK_SQL,
+            HOP_PROBE_MEMO_APP_LAYER_PREFIXES, HOP_PROBE_MEMO_EXPIRE_SQL,
+            HOP_PROBE_MEMO_REORG_CLEAR_SQL, HOP_PROBE_MEMO_REORG_MARK,
+            HOP_PROBE_MEMO_REORG_MARK_SQL,
         };
-        assert_eq!(HOP_PROBE_MEMO_APP_LAYER_PREFIXES, [HOME_SPEND_LATCH_PREFIX, HOME_WALK_CURSOR_PREFIX], "the overlay spares exactly the prefixes this crate writes");
+        assert_eq!(
+            HOP_PROBE_MEMO_APP_LAYER_PREFIXES,
+            [HOME_SPEND_LATCH_PREFIX, HOME_WALK_CURSOR_PREFIX],
+            "the overlay spares exactly the prefixes this crate writes"
+        );
         let conn = memo_db();
         let t0: i64 = 1_800_000_000_000;
         let home = bsv_rs::primitives::PrivateKey::random();
@@ -5860,39 +7950,103 @@ pub(crate) mod tests {
         let (sweep_a, spend_a) = sweep_and_home_spend(&home, &home, 20_000);
         let (sweep_b, spend_b) = sweep_and_home_spend(&home, &home, 30_000);
         let candidates = [
-            CourierHomeOutput { sweep_txid: sweep_a.clone(), vout: 0, pkh_hex: pkh.clone(), sats: 20_000 },
-            CourierHomeOutput { sweep_txid: sweep_b.clone(), vout: 0, pkh_hex: pkh.clone(), sats: 30_000 },
+            CourierHomeOutput {
+                sweep_txid: sweep_a.clone(),
+                vout: 0,
+                pkh_hex: pkh.clone(),
+                sats: 20_000,
+            },
+            CourierHomeOutput {
+                sweep_txid: sweep_b.clone(),
+                vout: 0,
+                pkh_hex: pkh.clone(),
+                sats: 30_000,
+            },
         ];
-        let spent = |confirmed: Option<bool>| ChainSpendProbe { known: true, spent: Some(true), spending_txid: Some(tx(0x5a)), spent_confirmed: confirmed };
+        let spent = |confirmed: Option<bool>| ChainSpendProbe {
+            known: true,
+            spent: Some(true),
+            spending_txid: Some(tx(0x5a)),
+            spent_confirmed: confirmed,
+        };
         // the latch of a CONFIRMED probe (`spentConfirmed = 1`: the reorg clear's own predicate) and of an unconfirmed one
-        let (_, latch_a) = home_word(&spent(Some(true)), Some(&spend_a), &candidates[0], t0).expect("a word");
-        let (_, latch_b) = home_word(&spent(None), Some(&spend_b), &candidates[1], t0).expect("a word");
-        let (latch_a, latch_b) = (latch_a.expect("a proof latches"), latch_b.expect("a proof latches"));
+        let (_, latch_a) =
+            home_word(&spent(Some(true)), Some(&spend_a), &candidates[0], t0).expect("a word");
+        let (_, latch_b) =
+            home_word(&spent(None), Some(&spend_b), &candidates[1], t0).expect("a word");
+        let (latch_a, latch_b) = (
+            latch_a.expect("a proof latches"),
+            latch_b.expect("a proof latches"),
+        );
         assert_eq!(latch_a.spent_confirmed, Some(true));
         let cursor = home_cursor_memo(ME, &candidates[1], t0);
         // the chain rung's own memos of the same two outputs, and the tombstone
-        let chain = |sweep: &str, confirmed: Option<bool>| ProbeMemo { outpoint: probe_memo_key(sweep, 0), probed_at_ms: t0, spent: true, spending_txid: Some(tx(0x5a)), spent_confirmed: confirmed };
-        write_memos(&conn, &[latch_a, latch_b, cursor, chain(&sweep_a, Some(true)), chain(&sweep_b, None)]);
-        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0]).unwrap();
-        let held = |conn: &rusqlite::Connection| -> usize { conn.query_row("SELECT COUNT(*) FROM hop_chain_probes", [], |r| r.get::<_, i64>(0)).unwrap() as usize };
-        assert_eq!(held(&conn), 6);
-        let latch_targets: Vec<(String, u32)> = candidates.iter().map(|c| home_latch_target(&c.sweep_txid, c.vout)).collect();
-        let both_latched = |conn: &rusqlite::Connection| -> bool {
-            let (words, targets) = latched_home_words(&candidates, &read_memos(conn, &latch_targets));
-            targets.is_empty() && words.len() == 2 && words.values().all(|w| *w == HomeSpendWord::Proven)
+        let chain = |sweep: &str, confirmed: Option<bool>| ProbeMemo {
+            outpoint: probe_memo_key(sweep, 0),
+            probed_at_ms: t0,
+            spent: true,
+            spending_txid: Some(tx(0x5a)),
+            spent_confirmed: confirmed,
         };
-        let cursor_at_b = |conn: &rusqlite::Connection| -> bool { home_cursor_of(&read_memos(conn, &[home_cursor_target(ME)]), ME) == Some(probe_memo_key(&sweep_b, 0)) };
+        write_memos(
+            &conn,
+            &[
+                latch_a,
+                latch_b,
+                cursor,
+                chain(&sweep_a, Some(true)),
+                chain(&sweep_b, None),
+            ],
+        );
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0])
+            .unwrap();
+        let held = |conn: &rusqlite::Connection| -> usize {
+            conn.query_row("SELECT COUNT(*) FROM hop_chain_probes", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap() as usize
+        };
+        assert_eq!(held(&conn), 6);
+        let latch_targets: Vec<(String, u32)> = candidates
+            .iter()
+            .map(|c| home_latch_target(&c.sweep_txid, c.vout))
+            .collect();
+        let both_latched = |conn: &rusqlite::Connection| -> bool {
+            let (words, targets) =
+                latched_home_words(&candidates, &read_memos(conn, &latch_targets));
+            targets.is_empty()
+                && words.len() == 2
+                && words.values().all(|w| *w == HomeSpendWord::Proven)
+        };
+        let cursor_at_b = |conn: &rusqlite::Connection| -> bool {
+            home_cursor_of(&read_memos(conn, &[home_cursor_target(ME)]), ME)
+                == Some(probe_memo_key(&sweep_b, 0))
+        };
         // THE REORG CLEAR: the confirmed chain memo goes, nothing else (it took the confirmed latch too)
         assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 1, "the one confirmed chain memo: a signature proof is not a chain word, a reorg does not unmake it");
         assert!(both_latched(&conn), "the reorg clear took a latch");
         assert!(cursor_at_b(&conn));
         // THE TTL SWEEP, with a bound past every row: the other chain memo goes, nothing else (it took both latches and the cursor)
-        assert_eq!(conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![i64::MAX]).unwrap(), 1, "the one chain memo left");
+        assert_eq!(
+            conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![i64::MAX])
+                .unwrap(),
+            1,
+            "the one chain memo left"
+        );
         assert!(both_latched(&conn), "the TTL sweep took a latch: the retired row is back and is bought again from the couriers");
-        assert!(cursor_at_b(&conn), "the TTL sweep took the cursor: the ring starts at its head again");
-        assert_eq!(read_memos(&conn, &[crate::hops_view::reorg_mark_target()]).len(), 1, "the tombstone keeps its own exemption");
+        assert!(
+            cursor_at_b(&conn),
+            "the TTL sweep took the cursor: the ring starts at its head again"
+        );
+        assert_eq!(
+            read_memos(&conn, &[crate::hops_view::reorg_mark_target()]).len(),
+            1,
+            "the tombstone keeps its own exemption"
+        );
         assert_eq!(held(&conn), 4, "two latches, the cursor, the tombstone");
-        assert!(!HOP_PROBE_MEMO_APP_LAYER_PREFIXES.iter().any(|p| HOP_PROBE_MEMO_REORG_MARK.starts_with(p)));
+        assert!(!HOP_PROBE_MEMO_APP_LAYER_PREFIXES
+            .iter()
+            .any(|p| HOP_PROBE_MEMO_REORG_MARK.starts_with(p)));
     }
 
     /// The delta fold's LOW-1 (cut 1) and LOW-2 (the stored-read cap), EXECUTED on real SQLite: twelve home outputs
@@ -5910,16 +8064,37 @@ pub(crate) mod tests {
         let mut made: Vec<(CourierHomeOutput, Vec<u8>)> = (0..12u64)
             .map(|i| {
                 let (sweep, spend) = sweep_and_home_spend(&home, &home, 20_000 + i);
-                (CourierHomeOutput { sweep_txid: sweep, vout: 0, pkh_hex: pkh.clone(), sats: 20_000 + i }, spend)
+                (
+                    CourierHomeOutput {
+                        sweep_txid: sweep,
+                        vout: 0,
+                        pkh_hex: pkh.clone(),
+                        sats: 20_000 + i,
+                    },
+                    spend,
+                )
             })
             .collect();
         made.sort_by(|a, b| a.0.sweep_txid.cmp(&b.0.sweep_txid)); // `courier_home_outputs`' order
         let candidates: Vec<CourierHomeOutput> = made.iter().map(|(c, _)| c.clone()).collect();
-        let spender_of = |i: usize| bsv_rs::transaction::Transaction::from_binary(&made[i].1).unwrap().id();
+        let spender_of = |i: usize| {
+            bsv_rs::transaction::Transaction::from_binary(&made[i].1)
+                .unwrap()
+                .id()
+        };
         let mut world = FakeCouriers::default();
         for (i, (c, spend)) in made.iter().enumerate() {
             // every output: a confirmed spend the chain rung already memoised (no probe is owed)
-            write_memos(&conn, &[ProbeMemo { outpoint: probe_memo_key(&c.sweep_txid, 0), probed_at_ms: 1_000, spent: true, spending_txid: Some(spender_of(i)), spent_confirmed: Some(true) }]);
+            write_memos(
+                &conn,
+                &[ProbeMemo {
+                    outpoint: probe_memo_key(&c.sweep_txid, 0),
+                    probed_at_ms: 1_000,
+                    spent: true,
+                    spending_txid: Some(spender_of(i)),
+                    spent_confirmed: Some(true),
+                }],
+            );
             if i < 8 {
                 world.held.insert(spender_of(i), None); // the isolate holds the resolver's answer: no bytes
             } else {
@@ -5931,33 +8106,77 @@ pub(crate) mod tests {
         // pass 1: the cap, honoured, on the head; nothing proves; the ninth is the first output withheld
         let (pass, window) = home_pass_on_sqlite(&conn, &mut world, &candidates, 2_000);
         assert_eq!(window, candidates);
-        assert_eq!(pass.stored_reads, OWED_HOME_STORED_READS_PER_RECOMPUTE, "exactly the cap");
-        assert_eq!(world.stored_asked, (0..8).map(spender_of).collect::<Vec<_>>());
-        assert!(pass.words.values().all(|w| *w == HomeSpendWord::Unproven), "{:?}", pass.words);
+        assert_eq!(
+            pass.stored_reads, OWED_HOME_STORED_READS_PER_RECOMPUTE,
+            "exactly the cap"
+        );
+        assert_eq!(
+            world.stored_asked,
+            (0..8).map(spender_of).collect::<Vec<_>>()
+        );
+        assert!(
+            pass.words.values().all(|w| *w == HomeSpendWord::Unproven),
+            "{:?}",
+            pass.words
+        );
         assert_eq!(pass.first_withheld, Some(8));
-        assert_eq!(pass.resolver_asks, OWED_HOME_PROBES_PER_RECOMPUTE, "the resolver's cap, honoured: the ninth and tenth asked, no more");
+        assert_eq!(
+            pass.resolver_asks, OWED_HOME_PROBES_PER_RECOMPUTE,
+            "the resolver's cap, honoured: the ninth and tenth asked, no more"
+        );
         assert_eq!(world.resolver_asked, vec![spender_of(8), spender_of(9)]);
         // the cursor row, read back through the shipped statement under the key the next pass reads
-        assert_eq!(home_cursor_of(&read_memos(&conn, &[home_cursor_target(ME)]), ME), Some(probe_memo_key(&candidates[8].sweep_txid, 0)));
+        assert_eq!(
+            home_cursor_of(&read_memos(&conn, &[home_cursor_target(ME)]), ME),
+            Some(probe_memo_key(&candidates[8].sweep_txid, 0))
+        );
 
         // pass 2: starts at the ninth; the tail's four spends are read, verified, latched
         world.stored_asked.clear();
         let (pass, window) = home_pass_on_sqlite(&conn, &mut world, &candidates, 3_000);
-        assert_eq!(window[0], candidates[8], "the ring starts where the last pass was cut");
+        assert_eq!(
+            window[0], candidates[8],
+            "the ring starts where the last pass was cut"
+        );
         assert_eq!(pass.stored_reads, OWED_HOME_STORED_READS_PER_RECOMPUTE);
-        assert_eq!(world.stored_asked[..4], (8..12).map(spender_of).collect::<Vec<_>>()[..]);
+        assert_eq!(
+            world.stored_asked[..4],
+            (8..12).map(spender_of).collect::<Vec<_>>()[..]
+        );
         for c in &candidates[8..] {
-            assert_eq!(pass.words.get(&outpoint_key(&c.sweep_txid, 0)), Some(&HomeSpendWord::Proven), "within two passes");
+            assert_eq!(
+                pass.words.get(&outpoint_key(&c.sweep_txid, 0)),
+                Some(&HomeSpendWord::Proven),
+                "within two passes"
+            );
         }
-        assert_eq!(pass.memos.iter().filter(|m| m.outpoint.starts_with(HOME_SPEND_LATCH_PREFIX)).count(), 4);
+        assert_eq!(
+            pass.memos
+                .iter()
+                .filter(|m| m.outpoint.starts_with(HOME_SPEND_LATCH_PREFIX))
+                .count(),
+            4
+        );
 
         // pass 3: the four are latched (no read, no ask); the eight that never prove are still looked at, none starved
         world.stored_asked.clear();
         let (pass, _) = home_pass_on_sqlite(&conn, &mut world, &candidates, 4_000);
         assert_eq!(pass.stored_reads, 8);
         assert_eq!(pass.first_withheld, None);
-        assert_eq!(pass.words.values().filter(|w| **w == HomeSpendWord::Proven).count(), 4);
-        assert_eq!(pass.words.values().filter(|w| **w == HomeSpendWord::Unproven).count(), 8);
+        assert_eq!(
+            pass.words
+                .values()
+                .filter(|w| **w == HomeSpendWord::Proven)
+                .count(),
+            4
+        );
+        assert_eq!(
+            pass.words
+                .values()
+                .filter(|w| **w == HomeSpendWord::Unproven)
+                .count(),
+            8
+        );
     }
 
     /// The delta fold's LOW-1 (cut 2, the chain rung): two outputs the couriers can never answer leave no memo and,
@@ -5971,32 +8190,62 @@ pub(crate) mod tests {
         let candidates = plain_candidates(5);
         let mut world = FakeCouriers::default();
         for c in &candidates[2..] {
-            world.probes.insert(outpoint_key(&c.sweep_txid, 0), unspent_probe());
+            world
+                .probes
+                .insert(outpoint_key(&c.sweep_txid, 0), unspent_probe());
         }
         let key = |i: usize| outpoint_key(&candidates[i].sweep_txid, 0);
         let (pass, _) = home_pass_on_sqlite(&conn, &mut world, &candidates, 1_000);
-        assert_eq!((pass.probes, pass.first_withheld), (OWED_HOME_PROBES_PER_RECOMPUTE, Some(2)));
+        assert_eq!(
+            (pass.probes, pass.first_withheld),
+            (OWED_HOME_PROBES_PER_RECOMPUTE, Some(2))
+        );
         assert_eq!(world.probed, vec![key(0), key(1)]);
         assert!(pass.words.is_empty(), "an unanswered probe names nothing");
         let (pass, window) = home_pass_on_sqlite(&conn, &mut world, &candidates, 2_000);
         assert_eq!(window[0], candidates[2]);
         assert_eq!(pass.probes, OWED_HOME_PROBES_PER_RECOMPUTE);
         assert_eq!(world.probed[2..], [key(2), key(3)]);
-        assert_eq!((pass.words.get(&key(2)), pass.words.get(&key(3))), (Some(&HomeSpendWord::Unspent), Some(&HomeSpendWord::Unspent)));
+        assert_eq!(
+            (pass.words.get(&key(2)), pass.words.get(&key(3))),
+            (Some(&HomeSpendWord::Unspent), Some(&HomeSpendWord::Unspent))
+        );
         let (pass, _) = home_pass_on_sqlite(&conn, &mut world, &candidates, 3_000);
         assert_eq!(pass.probes, OWED_HOME_PROBES_PER_RECOMPUTE);
-        assert_eq!(world.probed[4..], [key(4), key(0)], "the fifth, then the ring wraps to the head");
+        assert_eq!(
+            world.probed[4..],
+            [key(4), key(0)],
+            "the fifth, then the ring wraps to the head"
+        );
         let seen: HashSet<&String> = world.probed.iter().collect();
-        assert_eq!(seen.len(), 5, "every output probed within three passes of two");
+        assert_eq!(
+            seen.len(),
+            5,
+            "every output probed within three passes of two"
+        );
         // a pass past its clock asks nothing and moves nothing
         let before = home_cursor_of(&read_memos(&conn, &[home_cursor_target(ME)]), ME);
         let asked = world.probed.len();
         world.over_budget = true;
         let (pass, window) = home_pass_on_sqlite(&conn, &mut world, &candidates, 400_000);
-        assert_eq!((pass.probes, pass.stored_reads, pass.resolver_asks, world.probed.len()), (0, 0, 0, asked));
+        assert_eq!(
+            (
+                pass.probes,
+                pass.stored_reads,
+                pass.resolver_asks,
+                world.probed.len()
+            ),
+            (0, 0, 0, asked)
+        );
         assert_eq!(pass.first_withheld, Some(0));
-        assert_eq!(home_cursor_of(&read_memos(&conn, &[home_cursor_target(ME)]), ME), before);
-        assert_eq!(Some(crate::hops_view::probe_memo_key(&window[0].sweep_txid, 0)), before);
+        assert_eq!(
+            home_cursor_of(&read_memos(&conn, &[home_cursor_target(ME)]), ME),
+            before
+        );
+        assert_eq!(
+            Some(crate::hops_view::probe_memo_key(&window[0].sweep_txid, 0)),
+            before
+        );
     }
 
     /// The delta fold's LOW-1 (cut 3, the window) and the bound itself: an identity with MORE home outputs than one
@@ -6005,7 +8254,8 @@ pub(crate) mod tests {
     /// pass over its caps or its window.
     /// To red: cut the candidates to the first `OWED_HOME_WINDOW` (ignore the cursor).
     #[test]
-    fn more_home_outputs_than_the_window_are_all_tried_within_a_bounded_number_of_passes_real_sqlite() {
+    fn more_home_outputs_than_the_window_are_all_tried_within_a_bounded_number_of_passes_real_sqlite(
+    ) {
         use crate::hops_view::{probe_memo_key, ProbeMemo};
         let candidates = plain_candidates(50);
         assert!(candidates.len() > OWED_HOME_WINDOW);
@@ -6015,35 +8265,73 @@ pub(crate) mod tests {
         let conn = memo_db();
         for c in &candidates[..45] {
             let (latch_txid, vout) = home_latch_target(&c.sweep_txid, c.vout);
-            write_memos(&conn, &[ProbeMemo { outpoint: probe_memo_key(&latch_txid, vout), probed_at_ms: 500, spent: true, spending_txid: Some(tx(0x5a)), spent_confirmed: Some(true) }]);
+            write_memos(
+                &conn,
+                &[ProbeMemo {
+                    outpoint: probe_memo_key(&latch_txid, vout),
+                    probed_at_ms: 500,
+                    spent: true,
+                    spending_txid: Some(tx(0x5a)),
+                    spent_confirmed: Some(true),
+                }],
+            );
         }
         let mut world = FakeCouriers::default();
         for c in &candidates[45..] {
-            world.probes.insert(outpoint_key(&c.sweep_txid, 0), unspent_probe());
+            world
+                .probes
+                .insert(outpoint_key(&c.sweep_txid, 0), unspent_probe());
         }
         let mut words: HashMap<String, HomeSpendWord> = HashMap::new();
         for pass_no in 0..4i64 {
-            let (pass, window) = home_pass_on_sqlite(&conn, &mut world, &candidates, 1_000 + pass_no);
+            let (pass, window) =
+                home_pass_on_sqlite(&conn, &mut world, &candidates, 1_000 + pass_no);
             assert_eq!(window.len(), OWED_HOME_WINDOW);
             assert!(pass.probes <= OWED_HOME_PROBES_PER_RECOMPUTE);
             if pass_no == 0 {
-                assert!(world.probed.is_empty() && pass.first_withheld.is_none(), "the head's window is all latches: the cursor moves past it");
+                assert!(
+                    world.probed.is_empty() && pass.first_withheld.is_none(),
+                    "the head's window is all latches: the cursor moves past it"
+                );
             }
             words.extend(pass.words);
         }
-        assert_eq!(world.probed, (45..50).map(key).collect::<Vec<_>>(), "the five behind the window, each probed once");
-        assert_eq!(words.len(), 50, "every output has a word within four passes");
-        assert_eq!(words.values().filter(|w| **w == HomeSpendWord::Unspent).count(), 5);
+        assert_eq!(
+            world.probed,
+            (45..50).map(key).collect::<Vec<_>>(),
+            "the five behind the window, each probed once"
+        );
+        assert_eq!(
+            words.len(),
+            50,
+            "every output has a word within four passes"
+        );
+        assert_eq!(
+            words
+                .values()
+                .filter(|w| **w == HomeSpendWord::Unspent)
+                .count(),
+            5
+        );
 
         // (b) fifty outputs, none answerable: two per pass, all fifty within twenty-five passes
         let conn = memo_db();
         let mut world = FakeCouriers::default();
         for pass_no in 0..25i64 {
-            let (pass, window) = home_pass_on_sqlite(&conn, &mut world, &candidates, 1_000 + pass_no);
-            assert_eq!((window.len(), pass.probes), (OWED_HOME_WINDOW, OWED_HOME_PROBES_PER_RECOMPUTE), "pass {pass_no}");
+            let (pass, window) =
+                home_pass_on_sqlite(&conn, &mut world, &candidates, 1_000 + pass_no);
+            assert_eq!(
+                (window.len(), pass.probes),
+                (OWED_HOME_WINDOW, OWED_HOME_PROBES_PER_RECOMPUTE),
+                "pass {pass_no}"
+            );
         }
         assert_eq!(world.probed.len(), 50);
-        assert_eq!(world.probed.iter().collect::<HashSet<_>>().len(), 50, "every candidate tried within ceil(50 / 2) passes");
+        assert_eq!(
+            world.probed.iter().collect::<HashSet<_>>().len(),
+            50,
+            "every candidate tried within ceil(50 / 2) passes"
+        );
     }
 
     /// The ring's two pure ends: where a pass starts and where the next one will.
@@ -6052,22 +8340,53 @@ pub(crate) mod tests {
         let c = plain_candidates(4);
         let k = |i: usize| crate::hops_view::probe_memo_key(&c[i].sweep_txid, 0);
         assert_eq!(home_walk_window(&c, None, 45), c);
-        assert_eq!(home_walk_window(&c, Some(&k(2)), 45), vec![c[2].clone(), c[3].clone(), c[0].clone(), c[1].clone()]);
-        assert_eq!(home_walk_window(&c, Some(&k(3).to_ascii_uppercase()), 2), vec![c[3].clone(), c[0].clone()]);
+        assert_eq!(
+            home_walk_window(&c, Some(&k(2)), 45),
+            vec![c[2].clone(), c[3].clone(), c[0].clone(), c[1].clone()]
+        );
+        assert_eq!(
+            home_walk_window(&c, Some(&k(3).to_ascii_uppercase()), 2),
+            vec![c[3].clone(), c[0].clone()]
+        );
         // a cursor naming an output that left the list lands on its successor; past the end, or malformed: the head
-        assert_eq!(home_walk_window(&c, Some(&format!("{:064x}.7", 0x1001)), 1), vec![c[2].clone()]);
-        assert_eq!(home_walk_window(&c, Some(&format!("{}.0", "ff".repeat(32))), 1), vec![c[0].clone()]);
-        assert_eq!(home_walk_window(&c, Some("not a cursor"), 1), vec![c[0].clone()]);
+        assert_eq!(
+            home_walk_window(&c, Some(&format!("{:064x}.7", 0x1001)), 1),
+            vec![c[2].clone()]
+        );
+        assert_eq!(
+            home_walk_window(&c, Some(&format!("{}.0", "ff".repeat(32))), 1),
+            vec![c[0].clone()]
+        );
+        assert_eq!(
+            home_walk_window(&c, Some("not a cursor"), 1),
+            vec![c[0].clone()]
+        );
         assert!(home_walk_window(&[], Some(&k(0)), 45).is_empty());
         // the next start: the first withheld output; else the one after the window; a whole ring with nothing withheld stays
         let w = home_walk_window(&c, Some(&k(2)), 2);
         assert_eq!(home_cursor_after(&c, &w, Some(1)), Some(&c[3]));
         assert_eq!(home_cursor_after(&c, &w, None), Some(&c[0]));
-        assert_eq!(home_cursor_after(&c, &home_walk_window(&c, Some(&k(2)), 45), None), None);
+        assert_eq!(
+            home_cursor_after(&c, &home_walk_window(&c, Some(&k(2)), 45), None),
+            None
+        );
         // the cursor row is no latch and no chain word
         let memo = home_cursor_memo(ME, &c[3], 9_000);
-        assert_eq!((memo.outpoint.as_str(), memo.spent, memo.spending_txid.as_deref()), (format!("{HOME_WALK_CURSOR_PREFIX}{ME}.0").as_str(), false, Some(k(3).as_str())));
-        assert!(latched_home_words(&c, std::slice::from_ref(&memo)).0.is_empty());
+        assert_eq!(
+            (
+                memo.outpoint.as_str(),
+                memo.spent,
+                memo.spending_txid.as_deref()
+            ),
+            (
+                format!("{HOME_WALK_CURSOR_PREFIX}{ME}.0").as_str(),
+                false,
+                Some(k(3).as_str())
+            )
+        );
+        assert!(latched_home_words(&c, std::slice::from_ref(&memo))
+            .0
+            .is_empty());
     }
 
     /// The delta fold's LOW-4: a SUPERSEDED read whose stored read faults as well (here: no marker row, the shipped
@@ -6099,27 +8418,73 @@ pub(crate) mod tests {
             reason: None,
         };
         let older = vec![
-            row(0x07, OwedFamily::HopStranded, json!({ "claim": "sweep-hop", "claimable": true, "joinRefusedBy": "door" })),
-            row(0x08, OwedFamily::Payout, json!({ "claim": "internalize", "claimable": true, "creditBeef": "/credit-beef/x" })),
-            row(0x09, OwedFamily::Payout, json!({ "claim": "internalize", "claimable": false, "claimReason": UNCONFIRMED_PAYOUT_REASON })),
+            row(
+                0x07,
+                OwedFamily::HopStranded,
+                json!({ "claim": "sweep-hop", "claimable": true, "joinRefusedBy": "door" }),
+            ),
+            row(
+                0x08,
+                OwedFamily::Payout,
+                json!({ "claim": "internalize", "claimable": true, "creditBeef": "/credit-beef/x" }),
+            ),
+            row(
+                0x09,
+                OwedFamily::Payout,
+                json!({ "claim": "internalize", "claimable": false, "claimReason": UNCONFIRMED_PAYOUT_REASON }),
+            ),
             row(0x0a, OwedFamily::Unbound, json!({ "claim": null })),
         ];
         // the route's stored read (`owed_read_stored`): the marker first; no marker = no snapshot
         let marker = conn.query_row(OWED_STATE_READ_SQL, [ME], |r| r.get::<_, i64>(1));
         assert!(matches!(marker, Err(rusqlite::Error::QueryReturnedNoRows)));
         assert_eq!(read_answer_after_compute(true), ReadAnswer::Stored);
-        let (rows, tip, at, cut) = superseded_read_snapshot(None, (older.clone(), Some(900_000), 1_000, false));
+        let (rows, tip, at, cut) =
+            superseded_read_snapshot(None, (older.clone(), Some(900_000), 1_000, false));
         assert_eq!((rows.len(), tip, at, cut), (4, Some(900_000), 1_000, false));
-        assert!(rows.iter().all(|r| r.facts.get("claimable") != Some(&json!(true))), "no claimable word on the double fault: {rows:?}");
+        assert!(
+            rows.iter()
+                .all(|r| r.facts.get("claimable") != Some(&json!(true))),
+            "no claimable word on the double fault: {rows:?}"
+        );
         for r in &rows[..2] {
-            assert_eq!((r.facts["claimable"].clone(), r.facts["claimReason"].clone(), r.facts["supersededFallback"].clone()), (json!(false), json!(SUPERSEDED_FALLBACK_REASON), json!(true)));
+            assert_eq!(
+                (
+                    r.facts["claimable"].clone(),
+                    r.facts["claimReason"].clone(),
+                    r.facts["supersededFallback"].clone()
+                ),
+                (json!(false), json!(SUPERSEDED_FALLBACK_REASON), json!(true))
+            );
         }
-        assert_eq!((rows[0].facts["claim"].clone(), rows[0].facts["joinRefusedBy"].clone(), rows[1].facts["creditBeef"].clone()), (json!("sweep-hop"), json!("door"), json!("/credit-beef/x")), "every other fact stands");
-        assert_eq!((&rows[2], &rows[3]), (&older[2], &older[3]), "a row with no claimable word is served as it was");
+        assert_eq!(
+            (
+                rows[0].facts["claim"].clone(),
+                rows[0].facts["joinRefusedBy"].clone(),
+                rows[1].facts["creditBeef"].clone()
+            ),
+            (json!("sweep-hop"), json!("door"), json!("/credit-beef/x")),
+            "every other fact stands"
+        );
+        assert_eq!(
+            (&rows[2], &rows[3]),
+            (&older[2], &older[3]),
+            "a row with no claimable word is served as it was"
+        );
         assert!(!owed_body(ME, tip, &rows, at, cut).contains("\"claimable\":true"));
         // with a stored snapshot the reader gets it, untouched
-        let newer = vec![row(0x0b, OwedFamily::HopStranded, json!({ "claim": "sweep-hop", "claimable": true }))];
-        assert_eq!(superseded_read_snapshot(Some((newer.clone(), Some(900_001), 71_000, true)), (older, Some(900_000), 1_000, false)), (newer, Some(900_001), 71_000, true));
+        let newer = vec![row(
+            0x0b,
+            OwedFamily::HopStranded,
+            json!({ "claim": "sweep-hop", "claimable": true }),
+        )];
+        assert_eq!(
+            superseded_read_snapshot(
+                Some((newer.clone(), Some(900_001), 71_000, true)),
+                (older, Some(900_000), 1_000, false)
+            ),
+            (newer, Some(900_001), 71_000, true)
+        );
     }
 
     /// bsv-low #499: THE CEILING SHEDS. Twelve recomputes of one identity inside a minute run; the thirteenth is
@@ -6132,15 +8497,25 @@ pub(crate) mod tests {
         let (me, other) = ("02".repeat(33), "03".repeat(33));
         let t0 = 1_790_000_000_000_i64;
         for i in 0..OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW {
-            assert!(rate.admit(&me, t0 + i64::from(i) * 1_000, true), "recompute {} of the minute runs", i + 1);
+            assert!(
+                rate.admit(&me, t0 + i64::from(i) * 1_000, true),
+                "recompute {} of the minute runs",
+                i + 1
+            );
         }
         assert_eq!(OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW, 12);
         assert_eq!(rate.at_ceiling(t0 + 12_000), 1);
         let shed_before = recompute_shed_total();
         // the 13th inside the minute: shed (the route counts it and serves the snapshot)
-        assert!(!rate.admit(&me, t0 + 59_999, true), "the 13th recompute inside the minute must be shed");
+        assert!(
+            !rate.admit(&me, t0 + 59_999, true),
+            "the 13th recompute inside the minute must be shed"
+        );
         note_recompute_shed();
-        assert!(recompute_shed_total() > shed_before, "a shed is counted on /health (recomputeShed)");
+        assert!(
+            recompute_shed_total() > shed_before,
+            "a shed is counted on /health (recomputeShed)"
+        );
         assert_eq!(rate.in_window(&me, t0 + 59_999), 12, "a shed is not a run");
         // a stranger's storm is not mine, and mine is not theirs
         assert!(rate.admit(&other, t0 + 30_000, true));
@@ -6162,7 +8537,8 @@ pub(crate) mod tests {
     /// minutes). RED on `a0db9fb`: a shed wrote nothing (no `owed_shed_plan`), the read saw `stale = 0` and served
     /// walk 12's rows. To red: drop the plan's statement in `owed_recompute_and_push` (the source half below).
     #[test]
-    fn a_shed_rerun_after_a_walk_cleared_the_hooks_mark_leaves_the_identity_stale_for_the_next_read() {
+    fn a_shed_rerun_after_a_walk_cleared_the_hooks_mark_leaves_the_identity_stale_for_the_next_read(
+    ) {
         let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         conn.execute_batch(OWED_ROWS_CREATE).unwrap();
         conn.execute_batch(OWED_STATE_CREATE).unwrap();
@@ -6185,7 +8561,13 @@ pub(crate) mod tests {
             reason: None,
         };
         // an earlier snapshot, then twelve recomputes inside the minute (the counter at its ceiling)
-        assert!(owed_write_landed(run_owed_write(&mut conn, &owed_write_plan(ME, &[], 1_000, Some(900_000), false)), 1_000));
+        assert!(owed_write_landed(
+            run_owed_write(
+                &mut conn,
+                &owed_write_plan(ME, &[], 1_000, Some(900_000), false)
+            ),
+            1_000
+        ));
         let mut rate = RecomputeRate::default();
         let t0 = 10_000i64;
         for i in 0..OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW {
@@ -6195,19 +8577,39 @@ pub(crate) mod tests {
         conn.execute(OWED_STALE_FOR_IDENTITY_SQL, [ME]).unwrap();
         assert_eq!(served(&conn, ME).2, 1, "the hook marked the identity stale");
         // walk 12 writes what it read (the payout, not the hook's change): stamped t0, newest, so it lands, stale = 0
-        let stamp = run_owed_write(&mut conn, &owed_write_plan(ME, std::slice::from_ref(&payout), t0, Some(900_001), false));
+        let stamp = run_owed_write(
+            &mut conn,
+            &owed_write_plan(ME, std::slice::from_ref(&payout), t0, Some(900_001), false),
+        );
         assert!(owed_write_landed(stamp, t0));
-        assert_eq!(served(&conn, ME).2, 0, "the walk's write cleared the hook's mark (the race)");
+        assert_eq!(
+            served(&conn, ME).2,
+            0,
+            "the walk's write cleared the hook's mark (the race)"
+        );
         // the claim pops the folded ask: the ceiling sheds it, and the shed runs its plan
-        assert!(!rate.admit(ME, t0 + 30_000, true), "the folded rerun is the 13th: shed");
+        assert!(
+            !rate.admit(ME, t0 + 30_000, true),
+            "the folded rerun is the 13th: shed"
+        );
         let (sql, bind) = owed_shed_plan(ME);
         conn.execute(sql, [bind.as_str()]).unwrap();
         // the next read: stale, so it recomputes at once (not 15 minutes later by age)
         let (rows, computed_at, stale) = served(&conn, ME);
-        assert_eq!((rows.len(), computed_at, stale), (1, t0, 1), "walk 12's rows stand, marked stale");
+        assert_eq!(
+            (rows.len(), computed_at, stale),
+            (1, t0, 1),
+            "walk 12's rows stand, marked stale"
+        );
         let read_at = t0 + 40_000;
         assert!(
-            should_recompute(stale != 0, read_at - computed_at, Some(900_001), Some(900_001), std::slice::from_ref(&payout)),
+            should_recompute(
+                stale != 0,
+                read_at - computed_at,
+                Some(900_001),
+                Some(900_001),
+                std::slice::from_ref(&payout)
+            ),
             "the next read recomputes"
         );
         assert!(
@@ -6218,17 +8620,28 @@ pub(crate) mod tests {
         assert!(rate.admit(ME, t0 + OWED_RECOMPUTE_RATE_WINDOW_MS, true));
         // the source half: the hooks' and claims' entry runs the plan on a shed, before it returns
         let squash = |s: &str| s.split_whitespace().collect::<String>();
-        let code: String = include_str!("routes.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let code: String = include_str!("routes.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let routes = squash(&code);
-        let push = routes.find(&squash("pub(crate) async fn owed_recompute_and_push(")).expect("the hooks' entry");
+        let push = routes
+            .find(&squash("pub(crate) async fn owed_recompute_and_push("))
+            .expect("the hooks' entry");
         assert!(
             routes[push..].starts_with(&squash(
                 "pub(crate) async fn owed_recompute_and_push( env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>, ) { if !owed_recompute_admit(identity_lc, source, true) { owed_shed_remark(db, identity_lc).await; return; }"
             )),
             "a shed in owed_recompute_and_push re-marks the identity stale before it returns"
         );
-        let remark = routes.find(&squash("async fn owed_shed_remark(")).expect("the re-mark");
-        assert!(routes[remark..].contains(&squash("crate::owed::owed_shed_plan(identity_lc)")), "the re-mark runs the pinned plan");
+        let remark = routes
+            .find(&squash("async fn owed_shed_remark("))
+            .expect("the re-mark");
+        assert!(
+            routes[remark..].contains(&squash("crate::owed::owed_shed_plan(identity_lc)")),
+            "the re-mark runs the pinned plan"
+        );
     }
 
     /// bsv-low #499: EVERY WALK ASKS THE CEILING FIRST. The pure counter above sheds nothing unless the route asks
@@ -6245,13 +8658,30 @@ pub(crate) mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let routes = squash(&code);
-        let push = routes.find(&squash("pub(crate) async fn owed_recompute_and_push(")).expect("the hooks' entry");
+        let push = routes
+            .find(&squash("pub(crate) async fn owed_recompute_and_push("))
+            .expect("the hooks' entry");
         let push_body = &routes[push..];
         let ask = push_body.find(&squash("if !owed_recompute_admit(identity_lc, source, true) { owed_shed_remark(db, identity_lc).await; return; }")).expect("the ask");
-        let walk = push_body.find(&squash("owed_recompute(env, db, identity_lc, source, tip_hint)")).expect("the walk");
-        assert!(ask < walk, "owed_recompute_and_push must ask the ceiling before it walks");
-        assert!(routes.contains(&squash("owed_recompute_admit(&identity, \"read-first\", false); match owed_compute_on_read(")));
+        let walk = push_body
+            .find(&squash(
+                "owed_recompute(env, db, identity_lc, source, tip_hint)",
+            ))
+            .expect("the walk");
+        assert!(
+            ask < walk,
+            "owed_recompute_and_push must ask the ceiling before it walks"
+        );
+        assert!(routes.contains(&squash(
+            "owed_recompute_admit(&identity, \"read-first\", false); match owed_compute_on_read("
+        )));
         assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, source, true) { owed_shed_remark(&db, &identity).await; (rows, prev_tip, st.computed_at_ms as i64, cut) } else { match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)")));
-        assert_eq!(routes.matches(&squash("owed_recompute(env, db, identity_lc,")).count(), 2, "the walk's two callers (the push and the read's compute)");
+        assert_eq!(
+            routes
+                .matches(&squash("owed_recompute(env, db, identity_lc,"))
+                .count(),
+            2,
+            "the walk's two callers (the push and the read's compute)"
+        );
     }
 }

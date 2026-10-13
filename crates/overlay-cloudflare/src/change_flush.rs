@@ -100,7 +100,13 @@ pub struct Shipped<T> {
 /// THE FLUSH LOOP, transport injected. `post` gets one chunk's body and answers `Ok(dropped)` on a 2xx (what
 /// the receiver answered it refused) or `Err(())`; `now_ms` is the clock the wall is read on; no POST is
 /// STARTED at or past `deadline_ms`. Sequential: one POST in flight at a time.
-pub async fn ship_chunks<T, B, P, Fut, C>(items: Vec<T>, body: B, mut post: P, now_ms: C, deadline_ms: u64) -> Shipped<T>
+pub async fn ship_chunks<T, B, P, Fut, C>(
+    items: Vec<T>,
+    body: B,
+    mut post: P,
+    now_ms: C,
+    deadline_ms: u64,
+) -> Shipped<T>
 where
     T: Clone,
     B: Fn(&[T]) -> String,
@@ -108,7 +114,13 @@ where
     Fut: Future<Output = std::result::Result<usize, ()>>,
     C: Fn() -> u64,
 {
-    let mut out = Shipped { posts: 0, delivered: Vec::new(), refused: 0, failed: Vec::new(), deferred: Vec::new() };
+    let mut out = Shipped {
+        posts: 0,
+        delivered: Vec::new(),
+        refused: 0,
+        failed: Vec::new(),
+        deferred: Vec::new(),
+    };
     for (i, chunk) in items.chunks(CHANGE_CHUNK).enumerate() {
         if i >= CHANGE_MAX_CHUNKS || now_ms() >= deadline_ms {
             out.deferred.extend_from_slice(chunk);
@@ -130,7 +142,11 @@ where
 /// already noted back once: a delivered entry leaves it; a failed entry not in it enters it and is returned to
 /// be noted back; a failed entry already in it leaves it and is counted lost (so is one the full memory cannot
 /// hold). Returns `(note back, lost)`.
-pub fn settle_failed<T: Ord + Clone>(retried: &mut BTreeSet<T>, delivered: &[T], failed: Vec<T>) -> (Vec<T>, usize) {
+pub fn settle_failed<T: Ord + Clone>(
+    retried: &mut BTreeSet<T>,
+    delivered: &[T],
+    failed: Vec<T>,
+) -> (Vec<T>, usize) {
     for d in delivered {
         retried.remove(d);
     }
@@ -158,7 +174,10 @@ pub struct NotedBack<T> {
 
 impl<T> NotedBack<T> {
     pub const fn new() -> Self {
-        Self { retried: BTreeSet::new(), deferred: BTreeSet::new() }
+        Self {
+            retried: BTreeSet::new(),
+            deferred: BTreeSet::new(),
+        }
     }
 
     /// Forget everything (the pins start from an empty memory).
@@ -202,8 +221,16 @@ pub fn settle<T: Ord + Clone>(memory: &mut NotedBack<T>, shipped: &Shipped<T>) -
             resent += 1;
         }
     }
-    let retry_failed = shipped.failed.iter().filter(|f| memory.retried.contains(*f)).count();
-    let (mut back, lost) = settle_failed(&mut memory.retried, &shipped.delivered, shipped.failed.clone());
+    let retry_failed = shipped
+        .failed
+        .iter()
+        .filter(|f| memory.retried.contains(*f))
+        .count();
+    let (mut back, lost) = settle_failed(
+        &mut memory.retried,
+        &shipped.delivered,
+        shipped.failed.clone(),
+    );
     let retried = back.len();
     let (mut deferred, mut let_go) = (0usize, 0usize);
     for d in &shipped.deferred {
@@ -217,7 +244,16 @@ pub fn settle<T: Ord + Clone>(memory: &mut NotedBack<T>, shipped: &Shipped<T>) -
             let_go += 1;
         }
     }
-    (back, Tally { undelivered: shipped.refused + lost + let_go, retry_failed, retried, deferred, resent })
+    (
+        back,
+        Tally {
+            undelivered: shipped.refused + lost + let_go,
+            retry_failed,
+            retried,
+            deferred,
+            resent,
+        },
+    )
 }
 
 /// PURE: the note-backs never re-sent, from the three counters' totals (`/health/invariants` serves it per set
@@ -238,7 +274,10 @@ pub fn answered_dropped(answer: &str) -> usize {
 
 /// The deploy's webhook target: `(APP_LAYER_URL, INTERNAL_TOKEN)`, or `None` when either is missing.
 pub fn configured(env: &Env) -> Option<(String, String)> {
-    match (env.var("APP_LAYER_URL").map(|v| v.to_string()), env.secret("INTERNAL_TOKEN").map(|v| v.to_string())) {
+    match (
+        env.var("APP_LAYER_URL").map(|v| v.to_string()),
+        env.secret("INTERNAL_TOKEN").map(|v| v.to_string()),
+    ) {
         (Ok(url), Ok(token)) => Some((url, token)),
         _ => None,
     }
@@ -248,7 +287,14 @@ pub fn configured(env: &Env) -> Option<(String, String)> {
 /// not accepted (logged here under `tag`).
 // The transport logs its concrete error; callers need only delivery success.
 #[allow(clippy::result_unit_err)]
-pub async fn post_body(env: &Env, url: &str, token: &str, path: &str, tag: &str, body: String) -> std::result::Result<usize, ()> {
+pub async fn post_body(
+    env: &Env,
+    url: &str,
+    token: &str,
+    path: &str,
+    tag: &str,
+    body: String,
+) -> std::result::Result<usize, ()> {
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
     let headers = Headers::new();
@@ -256,7 +302,8 @@ pub async fn post_body(env: &Env, url: &str, token: &str, path: &str, tag: &str,
     let _ = headers.set("content-type", "application/json");
     init.with_headers(headers);
     init.with_body(Some(body.into()));
-    let Ok(req) = Request::new_with_init(&format!("{}{path}", url.trim_end_matches('/')), &init) else {
+    let Ok(req) = Request::new_with_init(&format!("{}{path}", url.trim_end_matches('/')), &init)
+    else {
         console_log!("[{tag}] request build failed: one body not notified");
         return Err(());
     };
@@ -270,11 +317,17 @@ pub async fn post_body(env: &Env, url: &str, token: &str, path: &str, tag: &str,
         Err(_) => Fetch::Request(req).send().await,
     };
     match sent {
-        Ok(mut r) if (200..300).contains(&r.status_code()) => Ok(answered_dropped(&r.text().await.unwrap_or_default())),
+        Ok(mut r) if (200..300).contains(&r.status_code()) => {
+            Ok(answered_dropped(&r.text().await.unwrap_or_default()))
+        }
         Ok(mut r) => {
             let status = r.status_code();
             let body = r.text().await.unwrap_or_default();
-            let excerpt: String = body.chars().take(200).collect::<String>().replace(['\n', '\r'], " ");
+            let excerpt: String = body
+                .chars()
+                .take(200)
+                .collect::<String>()
+                .replace(['\n', '\r'], " ");
             console_log!("[{tag}] app-layer HTTP {status} {excerpt}: one body not notified");
             Err(())
         }
@@ -304,7 +357,13 @@ pub struct FlushCounters {
 
 /// The flush's account, after the POSTs: one log line and the counters, only when something did not go through.
 pub async fn account(env: &Env, tag: &str, counters: &FlushCounters, shipped: usize, tally: Tally) {
-    let Tally { undelivered, retry_failed, retried, deferred, resent } = tally;
+    let Tally {
+        undelivered,
+        retry_failed,
+        retried,
+        deferred,
+        resent,
+    } = tally;
     if undelivered + retried + deferred + resent == 0 {
         return;
     }
@@ -325,7 +384,10 @@ pub async fn account(env: &Env, tag: &str, counters: &FlushCounters, shipped: us
 /// Run a future that never waits on anything outside itself (the pins' fake transports) to its answer.
 #[cfg(test)]
 pub(crate) fn run<F: Future>(fut: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread().build().expect("a current-thread runtime").block_on(fut)
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a current-thread runtime")
+        .block_on(fut)
 }
 
 #[cfg(test)]
@@ -353,7 +415,14 @@ mod tests {
                 body,
                 |b: String| {
                     let v: serde_json::Value = serde_json::from_str(&b).unwrap();
-                    seen.borrow_mut().push(v["n"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect());
+                    seen.borrow_mut().push(
+                        v["n"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|x| x.as_u64().unwrap() as u32)
+                            .collect(),
+                    );
                     async { Ok(0) }
                 },
                 || 0,
@@ -362,10 +431,23 @@ mod tests {
             let bound = CHANGE_CHUNK * CHANGE_MAX_CHUNKS;
             let shipped = n.min(bound);
             assert_eq!(out.posts, shipped.div_ceil(CHANGE_CHUNK), "{n}");
-            assert!(seen.borrow().iter().all(|c| !c.is_empty() && c.len() <= CHANGE_CHUNK), "{n}");
-            assert_eq!(seen.borrow().concat(), items(shipped), "every shipped entry in exactly one body, in order ({n})");
+            assert!(
+                seen.borrow()
+                    .iter()
+                    .all(|c| !c.is_empty() && c.len() <= CHANGE_CHUNK),
+                "{n}"
+            );
+            assert_eq!(
+                seen.borrow().concat(),
+                items(shipped),
+                "every shipped entry in exactly one body, in order ({n})"
+            );
             assert_eq!(out.delivered, items(shipped));
-            assert_eq!(out.deferred, items(n)[shipped..].to_vec(), "past the bound: deferred, never dropped ({n})");
+            assert_eq!(
+                out.deferred,
+                items(n)[shipped..].to_vec(),
+                "past the bound: deferred, never dropped ({n})"
+            );
             assert!(out.failed.is_empty() && out.refused == 0);
         }
     }
@@ -393,7 +475,11 @@ mod tests {
             1,
         ));
         assert_eq!(out.posts, 3);
-        assert_eq!(out.failed, items(19)[8..16].to_vec(), "the second chunk, whole");
+        assert_eq!(
+            out.failed,
+            items(19)[8..16].to_vec(),
+            "the second chunk, whole"
+        );
         assert_eq!(out.delivered, [&items(19)[..8], &items(19)[16..]].concat());
         assert_eq!(out.refused, 2);
         assert!(out.deferred.is_empty());
@@ -405,11 +491,23 @@ mod tests {
     fn a_failed_entry_is_retried_once_and_only_once() {
         let mut retried: BTreeSet<u32> = BTreeSet::new();
         let (again, lost) = settle_failed(&mut retried, &[], vec![1, 2, 3]);
-        assert_eq!((again, lost), (vec![1, 2, 3], 0), "the first failure: noted back");
+        assert_eq!(
+            (again, lost),
+            (vec![1, 2, 3], 0),
+            "the first failure: noted back"
+        );
         // the next flush: 1 is delivered, 2 fails again, 3 fails again, 4 fails for the first time
         let (again, lost) = settle_failed(&mut retried, &[1], vec![2, 3, 4]);
-        assert_eq!((again, lost), (vec![4], 2), "a second failure is counted and let go");
-        assert_eq!(retried.iter().copied().collect::<Vec<_>>(), vec![4], "only the entry awaiting its one retry is remembered");
+        assert_eq!(
+            (again, lost),
+            (vec![4], 2),
+            "a second failure is counted and let go"
+        );
+        assert_eq!(
+            retried.iter().copied().collect::<Vec<_>>(),
+            vec![4],
+            "only the entry awaiting its one retry is remembered"
+        );
         // 2 is noted afresh by a later write and fails: a first failure again
         let (again, lost) = settle_failed(&mut retried, &[4], vec![2]);
         assert_eq!((again, lost), (vec![2], 0));
@@ -427,13 +525,20 @@ mod tests {
     /// there and `noted_back_unresent` does not.
     /// To red: count no `resent` (the base: the figure is the note-backs ever made), or count a re-deferral anew.
     #[test]
-    fn a_note_back_is_counted_when_made_and_when_resent_and_the_difference_is_what_was_never_resent() {
+    fn a_note_back_is_counted_when_made_and_when_resent_and_the_difference_is_what_was_never_resent(
+    ) {
         let post_failing = |fail: &'static [usize]| {
             let calls = Cell::new(0usize);
             move |_b: String| {
                 calls.set(calls.get() + 1);
                 let n = calls.get();
-                async move { if fail.contains(&n) { Err(()) } else { Ok(0) } }
+                async move {
+                    if fail.contains(&n) {
+                        Err(())
+                    } else {
+                        Ok(0)
+                    }
+                }
             }
         };
         let add = |sum: &mut Tally, t: Tally| {
@@ -443,58 +548,136 @@ mod tests {
             sum.deferred += t.deferred;
             sum.resent += t.resent;
         };
-        let unresent = |sum: &Tally| noted_back_unresent(sum.retried as u64, sum.deferred as u64, sum.resent as u64);
+        let unresent = |sum: &Tally| {
+            noted_back_unresent(sum.retried as u64, sum.deferred as u64, sum.resent as u64)
+        };
         let mut memory: NotedBack<u32> = NotedBack::new();
         let mut sum = Tally::default();
 
         // flush 1: 131 entries, the second POST answered 503: eight retried, three deferred, all noted back
-        let (back, t) = settle(&mut memory, &run(ship_chunks(items(131), body, post_failing(&[2]), || 0, 1)));
-        assert_eq!(t, Tally { retried: 8, deferred: 3, ..Tally::default() });
+        let (back, t) = settle(
+            &mut memory,
+            &run(ship_chunks(items(131), body, post_failing(&[2]), || 0, 1)),
+        );
+        assert_eq!(
+            t,
+            Tally {
+                retried: 8,
+                deferred: 3,
+                ..Tally::default()
+            }
+        );
         assert_eq!(back, [&items(131)[8..16], &items(131)[128..]].concat());
         add(&mut sum, t);
-        assert_eq!((sum.undelivered, unresent(&sum)), (0, 11), "eleven note-backs made, none re-sent yet");
+        assert_eq!(
+            (sum.undelivered, unresent(&sum)),
+            (0, 11),
+            "eleven note-backs made, none re-sent yet"
+        );
 
         // flush 2 (the same isolate): the eleven ride it; the retried chunk fails AGAIN, the deferred three arrive
-        let (back2, t) = settle(&mut memory, &run(ship_chunks(back.clone(), body, post_failing(&[1]), || 0, 1)));
-        assert_eq!(t, Tally { undelivered: 8, retry_failed: 8, resent: 11, ..Tally::default() }, "retried and still failed: its own name");
+        let (back2, t) = settle(
+            &mut memory,
+            &run(ship_chunks(back.clone(), body, post_failing(&[1]), || 0, 1)),
+        );
+        assert_eq!(
+            t,
+            Tally {
+                undelivered: 8,
+                retry_failed: 8,
+                resent: 11,
+                ..Tally::default()
+            },
+            "retried and still failed: its own name"
+        );
         assert!(back2.is_empty(), "the retry is bounded at one");
         add(&mut sum, t);
-        assert_eq!(unresent(&sum), 0, "every note-back was POSTed again: the account closes");
+        assert_eq!(
+            unresent(&sum),
+            0,
+            "every note-back was POSTed again: the account closes"
+        );
         assert!(memory.retried.is_empty() && memory.deferred.is_empty());
 
         // a flood deferred twice over is ONE note-back per entry: 300 entries, 128 a flush
-        let (back, t) = settle(&mut memory, &run(ship_chunks(items(300), body, post_failing(&[]), || 0, 1)));
+        let (back, t) = settle(
+            &mut memory,
+            &run(ship_chunks(items(300), body, post_failing(&[]), || 0, 1)),
+        );
         assert_eq!((t.deferred, back.len()), (172, 172));
         add(&mut sum, t);
-        let (back, t) = settle(&mut memory, &run(ship_chunks(back, body, post_failing(&[]), || 0, 1)));
-        assert_eq!((t.resent, t.deferred, back.len()), (128, 0, 44), "the 44 still waiting are not counted again");
+        let (back, t) = settle(
+            &mut memory,
+            &run(ship_chunks(back, body, post_failing(&[]), || 0, 1)),
+        );
+        assert_eq!(
+            (t.resent, t.deferred, back.len()),
+            (128, 0, 44),
+            "the 44 still waiting are not counted again"
+        );
         add(&mut sum, t);
         assert_eq!(unresent(&sum), 44);
         // a deferred entry whose POST then fails: its deferral is re-sent, its failure is a new note-back
-        let (back, t) = settle(&mut memory, &run(ship_chunks(back, body, post_failing(&[1]), || 0, 1)));
-        assert_eq!(t, Tally { retried: 8, resent: 44, ..Tally::default() });
+        let (back, t) = settle(
+            &mut memory,
+            &run(ship_chunks(back, body, post_failing(&[1]), || 0, 1)),
+        );
+        assert_eq!(
+            t,
+            Tally {
+                retried: 8,
+                resent: 44,
+                ..Tally::default()
+            }
+        );
         add(&mut sum, t);
         assert_eq!((back.len(), unresent(&sum)), (8, 8));
 
         // THE HOLE: the isolate is evicted holding those eight. Nothing more is ever counted for them:
         // `undelivered` says nothing was lost since the eight of flush 2, and the unresent figure names them.
         drop(memory);
-        assert_eq!((sum.undelivered, sum.retry_failed, unresent(&sum)), (8, 8, 8), "a loss `undelivered` cannot see, under its own name");
+        assert_eq!(
+            (sum.undelivered, sum.retry_failed, unresent(&sum)),
+            (8, 8, 8),
+            "a loss `undelivered` cannot see, under its own name"
+        );
 
         // a second isolate's flushes do not disturb the figure (its own note-backs meet its own resends)
         let mut other: NotedBack<u32> = NotedBack::new();
-        let (back, t) = settle(&mut other, &run(ship_chunks(items(9), body, post_failing(&[2]), || 0, 1)));
+        let (back, t) = settle(
+            &mut other,
+            &run(ship_chunks(items(9), body, post_failing(&[2]), || 0, 1)),
+        );
         add(&mut sum, t);
-        let (_, t) = settle(&mut other, &run(ship_chunks(back, body, post_failing(&[]), || 0, 1)));
+        let (_, t) = settle(
+            &mut other,
+            &run(ship_chunks(back, body, post_failing(&[]), || 0, 1)),
+        );
         add(&mut sum, t);
         assert_eq!(unresent(&sum), 8);
 
         // the memory is bounded: past it a deferred entry is let go and counted undelivered, never an untracked note
         let mut full: NotedBack<u32> = NotedBack::new();
         full.deferred = (1_000_000..1_000_000 + DEFER_MEMORY_MAX as u32).collect();
-        let (back, t) = settle(&mut full, &run(ship_chunks(items(131), body, post_failing(&[]), || 0, 1)));
-        assert_eq!((back.len(), t), (0, Tally { undelivered: 3, ..Tally::default() }));
-        assert_eq!(noted_back_unresent(1, 1, 5), 0, "floored: the counters are bumped one statement at a time");
+        let (back, t) = settle(
+            &mut full,
+            &run(ship_chunks(items(131), body, post_failing(&[]), || 0, 1)),
+        );
+        assert_eq!(
+            (back.len(), t),
+            (
+                0,
+                Tally {
+                    undelivered: 3,
+                    ..Tally::default()
+                }
+            )
+        );
+        assert_eq!(
+            noted_back_unresent(1, 1, 5),
+            0,
+            "floored: the counters are bumped one statement at a time"
+        );
     }
 
     /// Lens L4, THE WORST CASE FLUSH MEASURED: 128 pot outpoints (and three more) in one flush. Sixteen
@@ -503,7 +686,9 @@ mod tests {
     /// defers the tail (counted) instead of losing it with the task.
     #[test]
     fn the_worst_case_flush_is_bounded_in_posts_bytes_and_wall() {
-        let pots: Vec<(String, u32)> = (0..131u32).map(|i| (format!("{i:064x}"), u32::MAX)).collect();
+        let pots: Vec<(String, u32)> = (0..131u32)
+            .map(|i| (format!("{i:064x}"), u32::MAX))
+            .collect();
         let bytes: RefCell<Vec<usize>> = RefCell::new(Vec::new());
         let in_flight = Cell::new(0usize);
         let most_in_flight = Cell::new(0usize);
@@ -523,13 +708,26 @@ mod tests {
             || 0,
             FLUSH_WALL_BUDGET_MS,
         ));
-        assert_eq!(fast.posts, CHANGE_MAX_CHUNKS, "sixteen POSTs, never a seventeenth");
+        assert_eq!(
+            fast.posts, CHANGE_MAX_CHUNKS,
+            "sixteen POSTs, never a seventeenth"
+        );
         assert_eq!((fast.delivered.len(), fast.deferred.len()), (128, 3));
-        assert_eq!(most_in_flight.get(), 1, "sequential: one subrequest in flight at a time");
+        assert_eq!(
+            most_in_flight.get(),
+            1,
+            "sequential: one subrequest in flight at a time"
+        );
         let largest = *bytes.borrow().iter().max().unwrap();
         let total: usize = bytes.borrow().iter().sum();
-        println!("worst case pot flush: {} POSTs, largest body {largest} bytes, {total} bytes in all", fast.posts);
-        assert_eq!(largest, 767, "a body of eight outpoints with the widest vout");
+        println!(
+            "worst case pot flush: {} POSTs, largest body {largest} bytes, {total} bytes in all",
+            fast.posts
+        );
+        assert_eq!(
+            largest, 767,
+            "a body of eight outpoints with the widest vout"
+        );
         assert_eq!(total, 16 * 767);
 
         // the wall: 2 s per POST on a modelled clock
@@ -544,18 +742,39 @@ mod tests {
             || clock.get(),
             FLUSH_WALL_BUDGET_MS,
         ));
-        println!("at 2 s per POST: {} POSTs in {} ms, {} delivered, {} deferred", slow.posts, clock.get(), slow.delivered.len(), slow.deferred.len());
+        println!(
+            "at 2 s per POST: {} POSTs in {} ms, {} delivered, {} deferred",
+            slow.posts,
+            clock.get(),
+            slow.delivered.len(),
+            slow.deferred.len()
+        );
         assert_eq!(slow.posts, 10, "no POST is started at or past the budget");
         assert_eq!(clock.get(), FLUSH_WALL_BUDGET_MS);
-        assert_eq!((slow.delivered.len(), slow.deferred.len()), (80, 51), "the tail is deferred and counted, not lost with the task");
-        const { assert!(FLUSH_WALL_BUDGET_MS < 30_000, "inside the wall `wait_until` holds a task for") };
+        assert_eq!(
+            (slow.delivered.len(), slow.deferred.len()),
+            (80, 51),
+            "the tail is deferred and counted, not lost with the task"
+        );
+        const {
+            assert!(
+                FLUSH_WALL_BUDGET_MS < 30_000,
+                "inside the wall `wait_until` holds a task for"
+            )
+        };
     }
 
     /// The app layer's `dropped` answer is read (additive: an answer without it, or not JSON, is 0).
     #[test]
     fn the_app_layers_dropped_answer_is_read() {
-        assert_eq!(answered_dropped(r#"{"ok":true,"filed":[],"skipped":[],"dropped":3}"#), 3);
-        assert_eq!(answered_dropped(r#"{"ok":true,"filed":[],"skipped":[]}"#), 0);
+        assert_eq!(
+            answered_dropped(r#"{"ok":true,"filed":[],"skipped":[],"dropped":3}"#),
+            3
+        );
+        assert_eq!(
+            answered_dropped(r#"{"ok":true,"filed":[],"skipped":[]}"#),
+            0
+        );
         assert_eq!(answered_dropped("not json"), 0);
     }
 }

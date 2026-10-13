@@ -2031,7 +2031,11 @@ pub fn must_reask_before_refusing(
 /// with the already-known belt's tokens scrubbed — and the belt itself (`already_known`, the client's Rust mirror)
 /// run over the result: a detail the scrub could not clear (a `257` dress, a token the rules miss) is dropped whole,
 /// so the mirror holds by construction, never by token rules (the delta-verify's NIT).
-pub fn terminal_refusal_reason(subject_txid: &str, arcade_status: &str, extra_info: &str) -> String {
+pub fn terminal_refusal_reason(
+    subject_txid: &str,
+    arcade_status: &str,
+    extra_info: &str,
+) -> String {
     let tail = format!(
         "{subject_txid}; both indexers absent (#519: an Arcade-terminal subject is judged by the chain's indexers, never a broadcaster's echo)"
     );
@@ -2080,7 +2084,9 @@ pub fn terminal_memo_lookup(
     now: f64,
     ttl_ms: f64,
 ) -> Option<crate::proof_fetcher::NetworkPresence> {
-    memo.get(txid).filter(|(_, at)| now - *at >= 0.0 && now - *at < ttl_ms).map(|(p, _)| *p)
+    memo.get(txid)
+        .filter(|(_, at)| now - *at >= 0.0 && now - *at < ttl_ms)
+        .map(|(p, _)| *p)
 }
 
 /// PURE: remember a verdict — never a fault (`Inconclusive`), which must be re-asked, and never an `Absent` read
@@ -2461,28 +2467,64 @@ impl ArcadeBroadcaster {
 
     /// #519: the indexers' presence for an Arcade-terminal subject — the isolate's memo first, then the per-minute
     /// cap, then both couriers (a verdict remembered, a fault not). The second element names the source.
-    async fn terminal_presence(&self, txid: &str, now: f64) -> (crate::proof_fetcher::NetworkPresence, &'static str) {
-        if let Some(p) = TERMINAL_MEMO.with(|m| terminal_memo_lookup(&m.borrow(), txid, now, TERMINAL_MEMO_TTL_MS)) {
+    async fn terminal_presence(
+        &self,
+        txid: &str,
+        now: f64,
+    ) -> (crate::proof_fetcher::NetworkPresence, &'static str) {
+        if let Some(p) = TERMINAL_MEMO
+            .with(|m| terminal_memo_lookup(&m.borrow(), txid, now, TERMINAL_MEMO_TTL_MS))
+        {
             return (p, "memo");
         }
         self.terminal_presence_fresh(txid, now).await
     }
 
     /// #519: the couriers asked NOW (the memo bypassed, the cap kept): the read a refusal must rest on.
-    async fn terminal_presence_fresh(&self, txid: &str, now: f64) -> (crate::proof_fetcher::NetworkPresence, &'static str) {
+    async fn terminal_presence_fresh(
+        &self,
+        txid: &str,
+        now: f64,
+    ) -> (crate::proof_fetcher::NetworkPresence, &'static str) {
         use crate::proof_fetcher::NetworkPresence;
-        let allowed = TERMINAL_ASKS.with(|a| terminal_ask_allowed_in(&mut a.borrow_mut(), now, TERMINAL_ASKS_PER_WINDOW, TERMINAL_ASK_WINDOW_MS));
+        let allowed = TERMINAL_ASKS.with(|a| {
+            terminal_ask_allowed_in(
+                &mut a.borrow_mut(),
+                now,
+                TERMINAL_ASKS_PER_WINDOW,
+                TERMINAL_ASK_WINDOW_MS,
+            )
+        });
         if !allowed {
             return (NetworkPresence::Inconclusive, "capped");
         }
-        let bitails = crate::proof_fetcher::bitails_presence(crate::proof_fetcher::DEFAULT_BITAILS_BASE, txid).await;
-        let woc = crate::proof_fetcher::woc_presence(crate::proof_fetcher::DEFAULT_WOC_BASE, self.woc_api_key.as_deref(), txid).await;
-        (crate::proof_fetcher::classify_presence(bitails, woc), "couriers")
+        let bitails = crate::proof_fetcher::bitails_presence(
+            crate::proof_fetcher::DEFAULT_BITAILS_BASE,
+            txid,
+        )
+        .await;
+        let woc = crate::proof_fetcher::woc_presence(
+            crate::proof_fetcher::DEFAULT_WOC_BASE,
+            self.woc_api_key.as_deref(),
+            txid,
+        )
+        .await;
+        (
+            crate::proof_fetcher::classify_presence(bitails, woc),
+            "couriers",
+        )
     }
 
     /// #519: remember a fresh verdict (the branch calls it AFTER the age decision: `terminal_memo_store`'s rule).
-    fn terminal_remember(&self, txid: &str, presence: crate::proof_fetcher::NetworkPresence, young: bool, now: f64) {
-        TERMINAL_MEMO.with(|m| terminal_memo_store(&mut m.borrow_mut(), txid, presence, young, now));
+    fn terminal_remember(
+        &self,
+        txid: &str,
+        presence: crate::proof_fetcher::NetworkPresence,
+        young: bool,
+        now: f64,
+    ) {
+        TERMINAL_MEMO
+            .with(|m| terminal_memo_store(&mut m.borrow_mut(), txid, presence, young, now));
     }
 
     /// admit-fast (bsv-low 2026-09-15): answer the gate on Arcade's
@@ -2644,8 +2686,13 @@ impl ArcadeBroadcaster {
         };
         // #519: a caller without a ledger view treats an absent Arcade-terminal subject as YOUNG (the retryable word,
         // never a definitive 422 it cannot justify by age); the route passes the ledger's own age.
-        self.broadcast_efs_gated(&efs, &subject_txid, mined_subject_raw.as_deref(), std::future::ready(true))
-            .await
+        self.broadcast_efs_gated(
+            &efs,
+            &subject_txid,
+            mined_subject_raw.as_deref(),
+            std::future::ready(true),
+        )
+        .await
     }
 
     /// Submit `efs` (unproven Extended-Format legs, dependency order) to Arcade
@@ -2791,7 +2838,13 @@ impl ArcadeBroadcaster {
                 "[arcade] {subject_txid} held TERMINAL by Arcade ({probe_status}) — skipping every Arcade rung; judged by the indexers ({source}: {presence:?}{}) → {judgement:?}, never a broadcaster's echo (#519)",
                 if young { ", the admission young" } else { "" }
             ));
-            return terminal_at_arcade_by_presence(presence, young, subject_txid, probe_status, extra_info);
+            return terminal_at_arcade_by_presence(
+                presence,
+                young,
+                subject_txid,
+                probe_status,
+                extra_info,
+            );
         }
         // REGISTER ONCE PER TXID: a subject Arcade already holds (pending,
         // orphan, or terminal) has its callback registered from its first
@@ -4348,17 +4401,51 @@ mod tests {
             ArcOutcome::Accepted("subject".into()),
             "an indexer holding it is the network holding it, young or not"
         );
-        let refused = terminal_at_arcade_by_presence(NetworkPresence::Absent, false, "subject", "REJECTED", "").unwrap();
+        let refused = terminal_at_arcade_by_presence(
+            NetworkPresence::Absent,
+            false,
+            "subject",
+            "REJECTED",
+            "",
+        )
+        .unwrap();
         match refused {
             ArcOutcome::Rejected(r) => {
-                assert!(r.contains("Arcade REJECTED subject") && r.contains("both indexers absent") && r.contains("#519"), "{r}");
+                assert!(
+                    r.contains("Arcade REJECTED subject")
+                        && r.contains("both indexers absent")
+                        && r.contains("#519"),
+                    "{r}"
+                );
             }
             other => panic!("Absent must refuse, got {other:?}"),
         }
-        let young = terminal_at_arcade_by_presence(NetworkPresence::Absent, true, "subject", "REJECTED", "").unwrap_err();
-        assert!(young.contains("young") && young.contains("retryable") && young.contains("Rule 6"), "{young}");
-        let err = terminal_at_arcade_by_presence(NetworkPresence::Inconclusive, false, "subject", "DOUBLE_SPEND_ATTEMPTED", "").unwrap_err();
-        assert!(err.contains("inconclusive") && err.contains("retryable") && err.contains("never admitted"), "{err}");
+        let young = terminal_at_arcade_by_presence(
+            NetworkPresence::Absent,
+            true,
+            "subject",
+            "REJECTED",
+            "",
+        )
+        .unwrap_err();
+        assert!(
+            young.contains("young") && young.contains("retryable") && young.contains("Rule 6"),
+            "{young}"
+        );
+        let err = terminal_at_arcade_by_presence(
+            NetworkPresence::Inconclusive,
+            false,
+            "subject",
+            "DOUBLE_SPEND_ATTEMPTED",
+            "",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("inconclusive")
+                && err.contains("retryable")
+                && err.contains("never admitted"),
+            "{err}"
+        );
         // THE 09:39Z SHAPE, pinned by construction: a corroborator's stored accept is not an input here at all —
         // the decision takes the indexers' presence and nothing else. The classifier's rules are pinned in
         // `proof_fetcher` (a negative needs BOTH indexers clean; one holder is Present; a fault is Inconclusive).
@@ -4413,29 +4500,67 @@ mod tests {
             "",
         ];
         for (i, extra) in shapes.iter().enumerate() {
-            let reason = terminal_refusal_reason("3b14f0e654db348ba70ac6f70c87df8eeede689ab6c5969c0ae33b97511babfc", "REJECTED", extra);
+            let reason = terminal_refusal_reason(
+                "3b14f0e654db348ba70ac6f70c87df8eeede689ab6c5969c0ae33b97511babfc",
+                "REJECTED",
+                extra,
+            );
             assert!(!already_known(&reason), "shape {i}: {reason}");
-            assert!(reason.contains("both indexers absent") && reason.contains("#519"), "{reason}");
+            assert!(
+                reason.contains("both indexers absent") && reason.contains("#519"),
+                "{reason}"
+            );
         }
         let spent = terminal_refusal_reason("x", "REJECTED", shapes[0]).to_lowercase();
-        assert!(spent.contains("utxo_spent") && spent.contains("spent by tx"), "the refund classifier's needles survive: {spent}");
+        assert!(
+            spent.contains("utxo_spent") && spent.contains("spent by tx"),
+            "the refund classifier's needles survive: {spent}"
+        );
         let conflict = terminal_refusal_reason("x", "REJECTED", shapes[1]).to_lowercase();
-        assert!(conflict.contains("txn-mempool-conflict") && conflict.contains("double spend"), "{conflict}");
+        assert!(
+            conflict.contains("txn-mempool-conflict") && conflict.contains("double spend"),
+            "{conflict}"
+        );
         // the young and inconclusive words never read as already-known either
         for e in [
-            terminal_at_arcade_by_presence(crate::proof_fetcher::NetworkPresence::Absent, true, "x", "REJECTED", shapes[0]).unwrap_err(),
-            terminal_at_arcade_by_presence(crate::proof_fetcher::NetworkPresence::Inconclusive, false, "x", "REJECTED", "").unwrap_err(),
+            terminal_at_arcade_by_presence(
+                crate::proof_fetcher::NetworkPresence::Absent,
+                true,
+                "x",
+                "REJECTED",
+                shapes[0],
+            )
+            .unwrap_err(),
+            terminal_at_arcade_by_presence(
+                crate::proof_fetcher::NetworkPresence::Inconclusive,
+                false,
+                "x",
+                "REJECTED",
+                "",
+            )
+            .unwrap_err(),
         ] {
             assert!(!already_known(&e), "{e}");
         }
         assert_eq!(scrub_already_known_tokens("utxo already spent by tx; txn-already-known; unknown inputs; unseen; mined; examined"), "utxo spent by tx; unknown inputs; unseen;");
-        assert_eq!(scrub_already_known_tokens("(already known )"), "", "no punctuation crumbs");
+        assert_eq!(
+            scrub_already_known_tokens("(already known )"),
+            "",
+            "no punctuation crumbs"
+        );
         // the delta-verify's NIT: the belt itself runs over the result, so a dress the scrub cannot clear (a `257`
         // code, a token the rules miss) drops the detail whole — the mirror holds by construction
-        for extra in ["error code 257 (already known)", "unknownknown inputs", "\"257\""] {
+        for extra in [
+            "error code 257 (already known)",
+            "unknownknown inputs",
+            "\"257\"",
+        ] {
             let reason = terminal_refusal_reason("x", "REJECTED", extra);
             assert!(!already_known(&reason), "{reason}");
-            assert!(reason.starts_with("Arcade REJECTED x;"), "the detail dropped whole: {reason}");
+            assert!(
+                reason.starts_with("Arcade REJECTED x;"),
+                "the detail dropped whole: {reason}"
+            );
         }
     }
 
@@ -4446,21 +4571,62 @@ mod tests {
         use crate::proof_fetcher::NetworkPresence;
         let mut memo = std::collections::HashMap::new();
         terminal_memo_store(&mut memo, "a", NetworkPresence::Absent, false, 1_000.0);
-        terminal_memo_store(&mut memo, "b", NetworkPresence::Inconclusive, false, 1_000.0);
-        assert_eq!(terminal_memo_lookup(&memo, "a", 1_000.0 + TERMINAL_MEMO_TTL_MS - 1.0, TERMINAL_MEMO_TTL_MS), Some(NetworkPresence::Absent));
-        assert_eq!(terminal_memo_lookup(&memo, "a", 1_000.0 + TERMINAL_MEMO_TTL_MS, TERMINAL_MEMO_TTL_MS), None, "expired");
-        assert_eq!(terminal_memo_lookup(&memo, "b", 1_001.0, TERMINAL_MEMO_TTL_MS), None, "a fault is never remembered");
-        assert_eq!(terminal_memo_lookup(&memo, "a", 999.0, TERMINAL_MEMO_TTL_MS), None, "a clock from the future answers nothing");
+        terminal_memo_store(
+            &mut memo,
+            "b",
+            NetworkPresence::Inconclusive,
+            false,
+            1_000.0,
+        );
+        assert_eq!(
+            terminal_memo_lookup(
+                &memo,
+                "a",
+                1_000.0 + TERMINAL_MEMO_TTL_MS - 1.0,
+                TERMINAL_MEMO_TTL_MS
+            ),
+            Some(NetworkPresence::Absent)
+        );
+        assert_eq!(
+            terminal_memo_lookup(
+                &memo,
+                "a",
+                1_000.0 + TERMINAL_MEMO_TTL_MS,
+                TERMINAL_MEMO_TTL_MS
+            ),
+            None,
+            "expired"
+        );
+        assert_eq!(
+            terminal_memo_lookup(&memo, "b", 1_001.0, TERMINAL_MEMO_TTL_MS),
+            None,
+            "a fault is never remembered"
+        );
+        assert_eq!(
+            terminal_memo_lookup(&memo, "a", 999.0, TERMINAL_MEMO_TTL_MS),
+            None,
+            "a clock from the future answers nothing"
+        );
         let mut asks = std::collections::VecDeque::new();
         assert!(terminal_ask_allowed_in(&mut asks, 0.0, 2, 60_000.0));
         assert!(terminal_ask_allowed_in(&mut asks, 1.0, 2, 60_000.0));
-        assert!(!terminal_ask_allowed_in(&mut asks, 2.0, 2, 60_000.0), "the cap");
-        assert!(terminal_ask_allowed_in(&mut asks, 60_000.0, 2, 60_000.0), "the window slid");
+        assert!(
+            !terminal_ask_allowed_in(&mut asks, 2.0, 2, 60_000.0),
+            "the cap"
+        );
+        assert!(
+            terminal_ask_allowed_in(&mut asks, 60_000.0, 2, 60_000.0),
+            "the window slid"
+        );
         assert_eq!(asks.len(), 2);
         // the delta-verify's LOW: a refusal never rests on a memo written while the subject was young; since the
         // second delta-verify a young Absent is never remembered, so the belt below fires only for a memo the store
         // rule cannot write (kept as the belt; the store rule is pinned beside it)
-        assert!(must_reask_before_refusing(NetworkPresence::Absent, false, "memo"));
+        assert!(must_reask_before_refusing(
+            NetworkPresence::Absent,
+            false,
+            "memo"
+        ));
         let mut m2 = std::collections::HashMap::new();
         terminal_memo_store(&mut m2, "y", NetworkPresence::Absent, true, 5.0);
         assert!(m2.is_empty(), "a young Absent is never remembered");
@@ -5098,9 +5264,17 @@ mod tests {
         let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
         let f = &prod[prod.find("pub async fn broadcast_efs_gated").unwrap()..];
         let f = &f[..f.find("async fn submit_once_and_gate(").unwrap()];
-        let code: String = f.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
-        let fatal = code.find("GateVerdict::Fatal").expect("the fatal probe arm");
-        let presence = code.find("self.terminal_presence(subject_txid").expect("the presence judgement");
+        let code: String = f
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fatal = code
+            .find("GateVerdict::Fatal")
+            .expect("the fatal probe arm");
+        let presence = code
+            .find("self.terminal_presence(subject_txid")
+            .expect("the presence judgement");
         let young = code.find("subject_young.await").expect("the age floor");
         let reask = code
             .find("self.terminal_presence_fresh(subject_txid")
@@ -5129,10 +5303,23 @@ mod tests {
             "fatal@{fatal} presence@{presence} young@{young} return@{ret} register@{register} rung@{rung} mined@{mined_claim}"
         );
         let branch = &code[fatal..ret];
-        assert!(!branch.contains("corroborate"), "no corroborator in the terminal branch");
-        assert!(!branch.contains("submit_ef") && !branch.contains("submit_once_and_gate"), "no Arcade rung in the terminal branch");
-        assert_eq!(code.matches("broadcast_terminal_at_arcade_with(").count(), 0);
-        assert_eq!(code.matches("return terminal_at_arcade_by_presence(").count(), 1);
+        assert!(
+            !branch.contains("corroborate"),
+            "no corroborator in the terminal branch"
+        );
+        assert!(
+            !branch.contains("submit_ef") && !branch.contains("submit_once_and_gate"),
+            "no Arcade rung in the terminal branch"
+        );
+        assert_eq!(
+            code.matches("broadcast_terminal_at_arcade_with(").count(),
+            0
+        );
+        assert_eq!(
+            code.matches("return terminal_at_arcade_by_presence(")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

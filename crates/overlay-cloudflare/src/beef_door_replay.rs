@@ -673,7 +673,9 @@ mod twin {
         let start = q.find("pub async fn enqueue_replay(").unwrap();
         let f = &q[start..start + q[start..].find("\n}\n").unwrap()];
         // the E592 fold: the producer plans the marked or unmarked message (`plan_replay` is the unmarked one)
-        assert!(f.contains("plan_replay_gated(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room, gated)"));
+        assert!(f.contains(
+            "plan_replay_gated(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room, gated)"
+        ));
         assert!(!f.contains("max_bytes") && !q.contains("too large for the mutation queue"));
         assert!(include_str!("routes.rs").contains(r#"h.set("X-Overlay-Mutation", "queued")"#));
 
