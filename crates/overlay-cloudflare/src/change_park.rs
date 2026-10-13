@@ -2311,4 +2311,44 @@ mod tests {
             "the per-pass figure is labelled as one: {line}"
         );
     }
+
+    /// bsv-low #649 D3-L2 (the third delta lens): the tier's usage names every resource the recipe needs. The
+    /// `ci-d1-budget` help line and the recipe's port comment name all four ports (LANE_BASE+9 to +12: the recipe
+    /// starts the delivering overlay on +11 and the cell serves its mock on +12), and the cell's usage makes its five
+    /// arguments mandatory (it fails without the last three). On `1bf8e66` the help named +9, +10 alone and the
+    /// usage bracketed the last three as optional.
+    #[test]
+    fn e649_d3_l2_the_tier_usage_names_four_ports_and_five_required_arguments() {
+        let make = include_str!("../../../Makefile");
+        let help = make
+            .lines()
+            .find(|l| l.contains("\"  ci-d1-budget"))
+            .expect("the help line");
+        for port in ["+9", "+10", "+11", "+12"] {
+            assert!(help.contains(port), "the help names {port}: {help}");
+        }
+        let recipe = &make[make.find("\nci-d1-budget:").expect("the recipe")..];
+        assert!(
+            recipe.contains("PD=$$((B+11)); PM=$$((B+12));"),
+            "the recipe uses +11 and +12"
+        );
+        let comment = &make[..make.find("\nci-d1-budget:").unwrap()];
+        let ports = &comment[comment.rfind("# Ports").expect("the recipe's port comment")..];
+        assert!(
+            ports.contains("LANE_BASE+11") && ports.contains("LANE_BASE+12"),
+            "the recipe's comment names all four ports: {}",
+            &ports[..ports.len().min(200)]
+        );
+        let cell = include_str!("../../../tools/lane-e649/change_park_budget_ci.mjs");
+        let usage = &cell[cell.find(" *   node tools/lane-e649/").expect("the usage")..];
+        let usage = &usage[..usage.find("\n *\n").unwrap_or(usage.len())];
+        assert!(
+            !usage.contains('[') && usage.contains("<mock app-layer port>"),
+            "the five arguments are mandatory in the usage: {usage}"
+        );
+        assert!(
+            cell.contains("if (process.argv.length < 7) {"),
+            "the cell refuses fewer than five arguments with its usage"
+        );
+    }
 }
