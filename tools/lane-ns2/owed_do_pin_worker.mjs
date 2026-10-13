@@ -14,8 +14,9 @@ export default class PinWorker extends worker {
   fetch(req) {
     const url = new URL(req.url)
     if (url.pathname === '/pin/refuse') { refusals.add(url.searchParams.get('identity')); return new Response('next arm write refused') }
+    if (url.pathname === '/pin/object-ids') return Response.json([...objects.get(url.searchParams.get('identity'))])
     if (url.pathname === '/pin/route-alarm') {
-      const id = objects.get(url.searchParams.get('identity'))
+      const id = [...objects.get(url.searchParams.get('identity'))].at(-1)
       return this.env.BOARD_VIEW.get(this.env.BOARD_VIEW.idFromString(id)).fetch('http://pin/pin/alarm')
     }
     if (url.pathname === '/pin/advance-clock') { clockOffset += 61000; return new Response('next window') }
@@ -44,6 +45,10 @@ export class OwedPin {
   async fetch(req) {
     const url = new URL(req.url)
     if (url.pathname === '/pin/state') return Response.json({keys: Object.fromEntries(await this.state.storage.list()), alarm: await this.state.storage.getAlarm()})
+    if (url.pathname === '/pin/duplicate-alarm') {
+      await this.inner.alarm()
+      return this.fetch(new Request('http://pin/pin/state'))
+    }
     if (url.pathname === '/pin/alarm') {
       // Drive the real alarm handler at its stored due, without waiting a minute per fault.
       await this.state.storage.put('owed-due', Date.now() - 1)
@@ -57,7 +62,11 @@ export class OwedPin {
       await this.state.storage.deleteAll()
       return this.fetch(new Request('http://pin/pin/state'))
     }
-    if (url.pathname === '/owed-deferred') objects.set(url.searchParams.get('identity'), this.state.id.toString())
+    if (url.pathname === '/owed-deferred') {
+      const identity = url.searchParams.get('identity')
+      if (!objects.has(identity)) objects.set(identity, new Set())
+      objects.get(identity).add(this.state.id.toString())
+    }
     if (url.pathname === '/owed-deferred' && refusals.delete(url.searchParams.get('identity'))) this.refuse = true
     return this.inner.fetch(req)
   }

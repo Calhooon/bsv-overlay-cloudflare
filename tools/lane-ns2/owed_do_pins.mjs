@@ -10,10 +10,12 @@ assert(wrangler, 'run through npx --package wrangler -c so the tier uses wrangle
 const require = createRequire(wrangler)
 const { Miniflare, convertV4MiniflareOptions = v => v } = require('miniflare')
 const root = fileURLToPath(new URL('../../', import.meta.url))
+const compatibilityDate = readFileSync(root + 'crates/low-app-layer/wrangler.toml', 'utf8').match(/^compatibility_date = "([^"]+)"/m)[1]
+assert.equal(compatibilityDate, '2024-12-01', 'NOTE-C compatibility date must match the register evidence')
 const mf = new Miniflare(convertV4MiniflareOptions({name: "pin",
   modules: ['tools/lane-ns2/owed_do_pin_worker.mjs', 'crates/low-app-layer/build/worker/shim.mjs', 'crates/low-app-layer/build/index.js', 'crates/low-app-layer/build/index_bg.wasm'].map(path => ({path: root + path, type: path.endsWith('.wasm') ? 'CompiledWasm' : 'ESModule', contents: readFileSync(root + path)})),
   modulesRoot: root,
-  compatibilityDate: '2024-12-01', compatibilityFlags: ['nodejs_compat'],
+  compatibilityDate, compatibilityFlags: ['nodejs_compat'],
   durableObjects: {BOARD_VIEW: {className: 'OwedPin', useSQLite: true}, AUTH_SESSIONS: 'AuthSessionStore'},
   d1Databases: {OVERLAY_DB: 'ns2-pin'},
   bindings: {AUTH_ENFORCE: 'false', SESSION_LANE: 'false', INTERNAL_TOKEN: 'ci-internal-tok'},
@@ -32,6 +34,12 @@ print(json.dumps(out))
 `, process.env.D1_BUDGET_SEED], {maxBuffer: 64 * 1024 * 1024, timeout: 30000}))
   for (let n = 0; n < statements.length; n += 100) await db.batch(statements.slice(n, n + 100).map(s => db.prepare(s)))
   const ns = await mf.getDurableObjectNamespace('BOARD_VIEW')
+  const cleanup = ns.get(ns.idFromName('ns2-delete-all-compatibility'))
+  const cleared = await (await cleanup.fetch('http://pin/pin/delete-all')).json()
+  assert.deepEqual(cleared.keys, {}, 'NOTE-C deleteAll removes all keys')
+  assert(cleared.alarm > Date.now(), 'NOTE-C deleteAll preserves the alarm at configured 2024-12-01 date')
+  console.log('PASS NOTE-C real SQLite DO deleteAll: keys=0, alarm preserved (2024-12-01)')
+
   const identity = '02' + (299).toString(16).padStart(64, '0')
   const stub = ns.get(ns.idFromName(`owed-deferred:pin:${identity}`))
   const call = async path => stub.fetch('http://board-view' + path)
@@ -48,6 +56,9 @@ print(json.dumps(out))
   assert.equal((await arm(once.keys['owed-due'])).status, 200)
   const twice = await (await call('/pin/alarm')).json()
   assert.equal(twice.keys['owed-identity'], undefined, 'SHEDD-M1 faulted retry arms NOTHING; two faulted windows cannot stack chains')
+  const duplicate = await (await call('/pin/duplicate-alarm')).json()
+  assert.equal(duplicate.keys['owed-consumed-due'], twice.keys['owed-consumed-due'], 'NOTE-C duplicate old alarm preserves the consumed tombstone until its expiry')
+  assert.equal(duplicate.keys['owed-identity'], undefined)
   const health = await (await mf.dispatchFetch('http://app/health')).json()
   assert.equal(health.owed.owed_recompute_deferred_abandoned_total, 1, 'SHEDD-M1 abandoned retry counted once')
   console.log('PASS SHEDD-M1 two faulted windows: one live retry then zero; abandoned=1')
@@ -110,5 +121,20 @@ print(json.dumps(out))
   await request(`/pin/route-alarm?identity=${first}`)
   assert.equal((await owedHealth()).owed_recompute_deferred_total, readAfter.owed_recompute_deferred_total, 'NOTE-3 alarm cannot spend the first read’s claim twice')
   console.log('PASS SHEDD-L1 snapshotless first read: reserved walk=1; second read=0; alarm=0')
+  // Two genuinely exhausted ROUTE windows under a deterministic write fault must resolve one live actor.
+  const stacked = '02' + (295).toString(16).padStart(64, '0')
+  await db.prepare(`CREATE TRIGGER ns2_two_window_fault BEFORE INSERT ON owed_rows WHEN NEW.identity='${stacked}' BEGIN SELECT RAISE(FAIL,'NS2 two-window fault'); END;`).run()
+  for (let window = 0; window < 2; window++) {
+    for (let n = 0; n < 13; n++) assert.equal((await request(`/owed?identity=${stacked}`)).status, 503)
+    const ids = await (await request(`/pin/object-ids?identity=${stacked}`)).json()
+    assert.equal(ids.length, 1, 'SHEDD-M1 two exhausted route windows share ONE live actor, never window-named chains')
+    if (window === 0) await request('/pin/advance-clock')
+  }
+  const abandonedBefore = (await owedHealth()).owed_recompute_deferred_abandoned_total
+  await request(`/pin/route-alarm?identity=${stacked}`)
+  assert.equal((await owedHealth()).owed_recompute_deferred_abandoned_total, abandonedBefore + 1, 'SHEDD-M1 the sole faulted carried retry is abandoned')
+  await db.exec('DROP TRIGGER ns2_two_window_fault;')
+  console.log('PASS SHEDD-M1 2 exhausted route windows (26 faults): live actors=1, faulted retry abandoned=1')
+
 
 } finally { await mf.dispose() }

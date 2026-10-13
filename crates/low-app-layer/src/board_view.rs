@@ -259,7 +259,7 @@ impl DurableObject for BoardView {
 impl BoardView {
     async fn owed_clear_consumed_arm(&self) -> Result<()> {
         let storage = self.state.storage();
-        // Persist the tombstone BEFORE clearing keys, until the old deadline can no longer be accepted.
+        // Retain the consumed deadline until it can no longer be accepted; set the cleanup alarm after delete_all.
         let now = Date::now().as_millis() as i64;
         let due = storage.get::<i64>("owed-due").await?.unwrap_or(now);
         let expiry = due
@@ -277,7 +277,15 @@ impl BoardView {
 
     async fn owed_alarm_not_due(&self) -> Result<bool> {
         let storage = self.state.storage();
-        let due = storage.get::<i64>("owed-due").await?.unwrap_or(0);
+        let due = match storage.get::<i64>("owed-due").await? {
+            Some(due) => due,
+            // A duplicate old alarm cannot erase the tombstone while its consumed deadline is still valid.
+            None => storage
+                .get::<i64>("owed-consumed-due")
+                .await?
+                .unwrap_or(0)
+                .saturating_add(crate::owed::OWED_RECOMPUTE_RATE_WINDOW_MS),
+        };
         let now = Date::now().as_millis() as i64;
         if due > now {
             // A duplicate delivery of the old alarm must not consume its later-window retry.
@@ -358,9 +366,7 @@ impl BoardView {
         // across an await (the actor interleaves at awaits).
         let held = self.cache.borrow().get(&key).cloned();
         match held {
-            Some((body, at)) if now.saturating_sub(at) <= FRESH_MS => {
-                body_response(body, false, self.last_compute(key))
-            }
+            Some((body, at)) if now.saturating_sub(at) <= FRESH_MS => body_response(body, false, self.last_compute(key)),
             Some((body, _)) => {
                 self.spawn_compute(key, compute);
                 body_response(body, true, self.last_compute(key))
@@ -447,20 +453,13 @@ impl BoardView {
 
 /// The held copy, with the D1 figures of the compute that produced it (`d1view`; bsv-low #499): a served copy
 /// reads no row, and the route records the compute's figures under its `:view` key.
-fn body_response(
-    body: String,
-    stale: bool,
-    d1: Option<crate::d1_ledger::Tally>,
-) -> Result<Response> {
+fn body_response(body: String, stale: bool, d1: Option<crate::d1_ledger::Tally>) -> Result<Response> {
     let mut resp = crate::routes::json_response_cached(body, 200, 5)?;
     if stale {
         resp.headers_mut().set("X-Board-Stale", "1")?;
     }
     if let Some(t) = d1 {
-        resp.headers_mut().set(
-            "Server-Timing",
-            &crate::d1_ledger::named_segment("d1view", t),
-        )?;
+        resp.headers_mut().set("Server-Timing", &crate::d1_ledger::named_segment("d1view", t))?;
     }
     Ok(resp)
 }
