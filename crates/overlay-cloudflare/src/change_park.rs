@@ -81,8 +81,21 @@ pub const REFUSE_SQL: &str = "UPDATE change_parked \
 pub const SWEEP_EXHAUSTED_SQL: &str = "DELETE FROM change_parked WHERE rowid IN (\
      SELECT rowid FROM change_parked WHERE kind = ?1 AND exhausted = 1 AND next_attempt_at_ms <= ?2 \
      ORDER BY next_attempt_at_ms LIMIT ?3) RETURNING item";
-/// The gauge, by set.
-pub const PARKED_COUNT_SQL: &str = "SELECT kind, COUNT(*) AS n FROM change_parked GROUP BY kind";
+/// bsv-low #649 N3 (the delta lens): the drain's ORDER. `(kind, item)` (the primary key) cannot serve the drain's
+/// order, so it scanned and sorted the whole set (a temp B-tree, 90,412 VM steps for 128 rows of 10,001). This
+/// index serves [`PARKED_READ_SQL`] (equality on the set and `exhausted`, a range and the order on
+/// `next_attempt_at_ms, item`), [`SWEEP_EXHAUSTED_SQL`] and the gauge's bounded counts. Appended (#638).
+pub const CHANGE_PARKED_DRAIN_INDEX: &str = "CREATE INDEX IF NOT EXISTS change_parked_drain \
+     ON change_parked(kind, exhausted, next_attempt_at_ms, item)";
+/// The gauge (N3: BOUNDED): each set's eligible-or-backing-off and exhausted rows, each count read through the
+/// drain's index and stopped at `?1` ([`HEALTH_COUNT_CAP`]); a count equal to the cap reads "at least".
+pub const PARKED_COUNT_SQL: &str = "SELECT \
+     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'pot' AND exhausted = 0 LIMIT ?1)) AS pot, \
+     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'hop' AND exhausted = 0 LIMIT ?1)) AS hop, \
+     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'pot' AND exhausted = 1 LIMIT ?1)) AS pot_exhausted, \
+     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'hop' AND exhausted = 1 LIMIT ?1)) AS hop_exhausted";
+/// N3: where the gauge stops counting (at most four times this many index entries a read).
+pub const HEALTH_COUNT_CAP: i64 = 256;
 
 /// N2: the refusals a row's generation gets before it leaves the drain.
 pub const CHANGE_PARK_MAX_ATTEMPTS: i64 = 8;
@@ -640,30 +653,165 @@ pub async fn deliver_on_tick(env: &Env, db: &D1Database) {
     .await;
 }
 
-/// `/health/invariants.changeParked`: the parked rows by set, read from D1 (`null` when the read faults).
+/// `/health/invariants.changeParked`: the parked rows by set, read from D1 (`null` when the read faults). N3: each
+/// count stops at [`HEALTH_COUNT_CAP`] (`capped`: a figure equal to it reads "at least").
 pub async fn health_json(db: &D1Database) -> serde_json::Value {
     #[derive(serde::Deserialize)]
     struct Row {
-        kind: String,
-        n: f64,
+        pot: f64,
+        hop: f64,
+        pot_exhausted: f64,
+        hop_exhausted: f64,
     }
     match crate::d1::Query::new(PARKED_COUNT_SQL)
-        .fetch_all::<Row>(db)
+        .bind(HEALTH_COUNT_CAP)
+        .fetch_optional::<Row>(db)
         .await
     {
-        Ok(rows) => {
-            let mut pot = 0u64;
-            let mut hop = 0u64;
-            for r in rows {
-                match r.kind.as_str() {
-                    KIND_POT => pot = r.n as u64,
-                    KIND_HOP => hop = r.n as u64,
-                    _ => {}
-                }
+        Ok(Some(r)) => serde_json::json!({
+            "pot": r.pot as u64,
+            "hop": r.hop as u64,
+            "potExhausted": r.pot_exhausted as u64,
+            "hopExhausted": r.hop_exhausted as u64,
+            "capped": HEALTH_COUNT_CAP,
+            "maxRows": CHANGE_PARKED_MAX_ROWS,
+            "maxAttempts": CHANGE_PARK_MAX_ATTEMPTS,
+            "exhaustedKeepMs": CHANGE_PARK_EXHAUSTED_KEEP_MS,
+            "drainMaxRows": DRAIN_MAX_ROWS,
+            "drainWallMs": DRAIN_WALL_MS,
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// The unconfigured drain's transport (no `APP_LAYER_URL`): no POST leaves; every one is refused.
+struct NoTransport<'a>(WorkerUnpark<'a>);
+
+impl UnparkPort for NoTransport<'_> {
+    async fn read(
+        &self,
+        kind: &'static str,
+        now_ms: u64,
+        limit: usize,
+    ) -> std::result::Result<Vec<ParkedRow>, String> {
+        self.0.read(kind, now_ms, limit).await
+    }
+    async fn post(&self, _kind: &'static str, _body: String) -> std::result::Result<usize, ()> {
+        Err(())
+    }
+    async fn unpark(
+        &self,
+        kind: &'static str,
+        rows: &[(String, i64)],
+    ) -> std::result::Result<(), String> {
+        self.0.unpark(kind, rows).await
+    }
+    async fn refuse(
+        &self,
+        kind: &'static str,
+        rows: &[(String, i64, u64, bool)],
+    ) -> std::result::Result<(), String> {
+        self.0.refuse(kind, rows).await
+    }
+    async fn sweep(
+        &self,
+        kind: &'static str,
+        before_ms: u64,
+        limit: usize,
+    ) -> std::result::Result<u64, String> {
+        self.0.sweep(kind, before_ms, limit).await
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    async fn bump(&self, counter: &'static str, delta: u64) {
+        self.0.bump(counter, delta).await
+    }
+    fn log(&self, line: String) {
+        self.0.log(line)
+    }
+}
+
+/// `POST /internal/change-park` (bsv-low #649 N3; bearer `INTERNAL_TOKEN`): ONE step of the parked set's shipped
+/// code on demand, so the D1 budget tier measures it on a populated table (each answer carries its `d1`
+/// Server-Timing). Body `{"op":"park","items":["<txid>:<vout>",..]}` (the items noted, then the shipped skip
+/// [`park_withheld`]: what this isolate holds is parked with them), `{"op":"drain"}` (the shipped
+/// [`deliver_parked`]; with no `APP_LAYER_URL` no POST leaves and each read row is refused and backed off) or
+/// `{"op":"health"}` (the gauge).
+pub async fn internal_lever(
+    mut req: worker::Request,
+    env: &Env,
+) -> worker::Result<worker::Response> {
+    let authorization = req.headers().get("authorization").ok().flatten();
+    let secret = env.secret("INTERNAL_TOKEN").ok().map(|s| s.to_string());
+    if !crate::tip_pass::bearer_ok(authorization.as_deref(), secret.as_deref()) {
+        return worker::Response::error("unauthorized", 401);
+    }
+    #[derive(serde::Deserialize)]
+    struct Body {
+        op: String,
+        #[serde(default)]
+        items: Vec<String>,
+    }
+    let Ok(body) = serde_json::from_slice::<Body>(&req.bytes().await?) else {
+        return worker::Response::error(
+            "body must be {\"op\": \"park\" | \"drain\" | \"health\"}",
+            400,
+        );
+    };
+    let db = env.d1("OVERLAY_DB")?;
+    crate::d1::ensure_overlay_migrations(&db)
+        .await
+        .map_err(worker::Error::from)?;
+    match body.op.as_str() {
+        "park" => {
+            let pots: Vec<(String, u32)> = body
+                .items
+                .iter()
+                .filter_map(|i| parse_pot_item(i))
+                .collect();
+            if pots.len() != body.items.len() || pots.len() > DRAIN_MAX_ROWS {
+                return worker::Response::error("items: 1 to 128 \"<txid>:<vout>\"", 400);
             }
-            serde_json::json!({ "pot": pot, "hop": hop, "drainMaxRows": DRAIN_MAX_ROWS, "drainWallMs": DRAIN_WALL_MS })
+            for (t, v) in &pots {
+                crate::pot_changes::note(t, *v);
+            }
+            park_withheld(&WorkerPark { db: &db }, 0, Date::now().as_millis()).await;
+            let left = crate::pot_changes::snapshot();
+            let kept = pots.iter().filter(|p| left.contains(p)).count();
+            worker::Response::from_json(
+                &serde_json::json!({ "op": "park", "items": pots.len(), "keptInMemory": kept }),
+            )
         }
-        Err(_) => serde_json::Value::Null,
+        "drain" => {
+            let configured = crate::change_flush::configured(env);
+            let d = match configured {
+                Some((url, token)) => {
+                    deliver_parked(&WorkerUnpark {
+                        env,
+                        db: &db,
+                        url,
+                        token,
+                    })
+                    .await
+                }
+                None => {
+                    deliver_parked(&NoTransport(WorkerUnpark {
+                        env,
+                        db: &db,
+                        url: String::new(),
+                        token: String::new(),
+                    }))
+                    .await
+                }
+            };
+            worker::Response::from_json(&serde_json::json!({
+                "op": "drain", "read": d.read, "unparked": d.unparked, "kept": d.kept,
+                "refused": d.refused, "exhausted": d.exhausted, "swept": d.swept,
+            }))
+        }
+        "health" => worker::Response::from_json(&health_json(&db).await),
+        _ => worker::Response::error("op: park | drain | health", 400),
     }
 }
 
@@ -1270,6 +1418,85 @@ mod tests {
         assert!(refusal_backoff(6, 0).0 <= CHANGE_PARK_BACKOFF_MAX_MS);
     }
 
+    /// The plan and the VM steps of one shipped statement.
+    fn plan_and_steps<P: rusqlite::Params + Clone>(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: P,
+    ) -> (String, i64) {
+        let mut q = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = q
+            .query_map(params.clone(), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let mut q = conn.prepare(sql).unwrap();
+        let n = q.query_map(params, |_| Ok(())).unwrap().count();
+        assert!(n <= 10_001);
+        let steps = q.get_status(rusqlite::StatementStatus::VmStep) as i64;
+        (plan.join(" | "), steps)
+    }
+
+    /// bsv-low #649 N3 (the delta lens's 10,001 rows): the drain, the sweep and the gauge read through the drain's
+    /// index, with NO temp B-tree and no scan of the whole set, and their work is bounded by what they return, not
+    /// by the backlog. On `1516ed5` the drain's plan was `SEARCH change_parked USING INDEX
+    /// sqlite_autoindex_change_parked_1 (kind=?) | USE TEMP B-TREE FOR ORDER BY` (90,412 VM steps for 128 rows).
+    #[test]
+    fn e649_n3_the_drain_is_served_by_its_index_on_a_populated_table() {
+        let conn = parked_db();
+        assert!(crate::d1::OVERLAY_MIGRATIONS.contains(&CHANGE_PARKED_DRAIN_INDEX));
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..10_001i64 {
+            park_sql(
+                &conn,
+                rusqlite::params![KIND_POT, format!("{i:064x}:0"), 1_000 + i, 1_000_000],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        let (drain, drain_steps) = plan_and_steps(
+            &conn,
+            PARKED_READ_SQL,
+            rusqlite::params![KIND_POT, 1_000_000_000i64, DRAIN_MAX_ROWS as i64],
+        );
+        assert!(
+            drain.contains("change_parked_drain") && !drain.contains("TEMP B-TREE"),
+            "the drain's plan: {drain}"
+        );
+        assert!(
+            drain_steps < 4_000,
+            "128 rows of 10,001 in {drain_steps} VM steps"
+        );
+        let (sweep, sweep_steps) = plan_and_steps(
+            &conn,
+            "SELECT rowid FROM change_parked WHERE kind = ?1 AND exhausted = 1 AND next_attempt_at_ms <= ?2 \
+             ORDER BY next_attempt_at_ms LIMIT ?3",
+            rusqlite::params![KIND_POT, 1_000_000_000i64, DRAIN_MAX_ROWS as i64],
+        );
+        assert!(
+            sweep.contains("change_parked_drain")
+                && !sweep.contains("TEMP B-TREE")
+                && sweep_steps < 200,
+            "the sweep's selection: {sweep} in {sweep_steps} VM steps"
+        );
+        let (gauge, gauge_steps) =
+            plan_and_steps(&conn, PARKED_COUNT_SQL, rusqlite::params![HEALTH_COUNT_CAP]);
+        assert!(
+            gauge_steps < 16 * HEALTH_COUNT_CAP,
+            "the gauge stops at its cap: {gauge} in {gauge_steps} VM steps"
+        );
+        // the park's ceiling read stops at the ceiling
+        let (_, park_steps) = plan_and_steps(
+            &conn,
+            PARK_SQL,
+            rusqlite::params![KIND_POT, "new:0", 2_000_000i64, MAX],
+        );
+        assert!(
+            park_steps < 8 * MAX + 400,
+            "a park on a full table reads at most its ceiling: {park_steps} VM steps"
+        );
+    }
+
     /// bsv-low #649 M1: the SHIPPED statements under real SQLite: a re-park is one row with its first stamp, the read
     /// is oldest first and bounded, the delete takes the one row; the table is in the migrations; the entry keys
     /// read back.
@@ -1296,13 +1523,12 @@ mod tests {
         conn.execute(UNPARK_SQL, rusqlite::params![KIND_POT, "c:2", 0])
             .unwrap();
         assert_eq!(read(10), vec!["a:0", "b:1"]);
-        let mut q = conn.prepare(PARKED_COUNT_SQL).unwrap();
-        let counts: Vec<(String, i64)> = q
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert!(counts.contains(&("pot".into(), 2)) && counts.contains(&("hop".into(), 1)));
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(PARKED_COUNT_SQL, rusqlite::params![HEALTH_COUNT_CAP], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!(counts, (2, 1, 0, 0));
         let t = "EF".repeat(32);
         assert_eq!(parse_pot_item(&pot_item(&t, 7)), Some(("ef".repeat(32), 7)));
         assert_eq!(parse_pot_item("zz:1"), None);
