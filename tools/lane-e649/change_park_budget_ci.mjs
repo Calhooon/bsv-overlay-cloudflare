@@ -231,7 +231,7 @@ if (DELIVERING && STATE2 && MOCK_PORT) {
     const parkedC = rows2().length
     const wrong = await fetch(DELIVERING + '/admin/complete-proofs', { method: 'POST', headers: { authorization: 'Bearer wrong', Connection: 'close' } })
     await wrong.text()
-    expect(wrong.status === 401 && rows2().length === 2, '7. /admin/complete-proofs refuses a wrong bearer and drains nothing', `${wrong.status} rows=${JSON.stringify(rows2())}`)
+    expect(wrong.status === 403 && rows2().length === 2, '7. /admin/complete-proofs refuses a wrong bearer (the admin gate: 403) and drains nothing', `${wrong.status} rows=${JSON.stringify(rows2())}`)
     const cp = await fetch(DELIVERING + '/admin/complete-proofs', { method: 'POST', headers: { authorization: `Bearer ${ADMIN}`, Connection: 'close' } })
     const cpText = await cp.text()
     let cpJson = null
