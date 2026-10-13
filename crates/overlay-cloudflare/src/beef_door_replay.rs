@@ -1322,13 +1322,15 @@ mod e592 {
         );
         assert!(lib.contains("engine.set_walk_budget(WORKER_WALK_BUDGET);"));
         // the crawl's walks (E592 L3) and the GASP anchor's hold
-        assert!(lib.contains("anchor_walk_held_graphs={}"));
+        // The maintenance sequence shared by both triggers now lives in tick.rs.
+        let tick = include_str!("tick.rs");
+        assert!(tick.contains("anchor_walk_held_graphs={}"));
         // E592 NOTE-3: the crawl counts INSIDE the raced future, as each submit returns, never after the race
         // (a crawl dropped at its budget lost them); the cron and the operator's crawl both hand it the D1. RED on
         // `d899aa1`'s sources: the cron's crawl is handed no D1.
-        assert!(lib
+        assert!(tick
             .contains("peer_crawler::crawl_peers(&engine, &peers, \"cron\", crawl_db.as_ref()),"));
-        let after_race = &lib[lib
+        let after_race = &tick[tick
             .find("peer_crawler::crawl_peers(&engine, &peers, \"cron\"")
             .expect("the cron's crawl")..];
         let after_race = &after_race[..after_race

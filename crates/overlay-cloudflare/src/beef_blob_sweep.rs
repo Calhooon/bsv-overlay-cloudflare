@@ -2004,7 +2004,11 @@ mod tests {
             ),
             "the router sends POST /internal/beef-blob-sweep to the lever"
         );
-        let tick = item(include_str!("tick.rs"), "async fn run_steps(");
+        let tick_source = include_str!("tick.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let tick = item(tick_source, "async fn run_steps(");
         assert_eq!(
             tick.matches("crate::beef_blob_sweep::run_pass(env,&ops_db,\"tick\").await;")
                 .count(),
@@ -2041,9 +2045,14 @@ mod tests {
         }
         assert!(h.contains("Response::from_json(&pass_json(&out))?.with_status(status)"));
         // exactly two callers of the pass: the tick and the lever
-        let workers = squash_src(lib)
-            .matches("crate::beef_blob_sweep::run_pass(")
-            .count()
+        let workers: usize = [lib, tick_source]
+            .iter()
+            .map(|f| {
+                squash_src(f)
+                    .matches("crate::beef_blob_sweep::run_pass(")
+                    .count()
+            })
+            .sum::<usize>()
             + squash_src(me).matches("run_pass(").count();
         assert_eq!(workers, 3, "the definition, the tick and the lever");
 
