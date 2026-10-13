@@ -133,25 +133,29 @@ fn e602_courier_functions_keep_the_response_body() {
 
 #[test]
 fn e602_fold_retire_callers_pass_the_woc_key_and_print_the_conflict_summary() {
-    let lib = source("lib.rs");
+    // The admin caller remains in lib.rs; cron and alarm share tick.rs.
+    let callers = source("lib.rs") + &source("tick.rs");
     let call = "run_retire_pass(&ops_db,&arcade_base,woc_key.as_deref()).await;";
     assert_eq!(
-        lib.matches(call).count(),
+        callers.matches(call).count(),
         2,
         "both retire-pass callers pass the key"
     );
     assert_eq!(
-        lib.matches("run_retire_pass(&ops_db,&arcade_base,None)")
+        callers
+            .matches("run_retire_pass(&ops_db,&arcade_base,None)")
             .count(),
         0
     );
     assert_eq!(
-        lib.matches("letwoc_key=env.secret(\"WOC_API_KEY\").ok().map(|k|k.to_string());letretire=")
+        callers
+            .matches("letwoc_key=env.secret(\"WOC_API_KEY\").ok().map(|k|k.to_string());letretire=")
             .count(),
         2
     );
     assert_eq!(
-        lib.matches("conflict:scanned={}evicted={}faults={}")
+        callers
+            .matches("conflict:scanned={}evicted={}faults={}")
             .count(),
         2
     );
