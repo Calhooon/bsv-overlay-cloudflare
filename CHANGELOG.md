@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.5] - Unreleased
+
+- Share the maintenance tick between cron and the `TickAlarm` Durable Object, with a D1 lease, bounded execution and source activity on `/health/invariants.tick`. The alarm re-arms after failed ticks; the cron revives a dormant alarm. Authenticated operators can use `POST /admin/tick/arm` and `GET /admin/tick/status`.
+- Deployment configs must add the `TICK_ALARM` binding for class `TickAlarm` and a migration with `new_sqlite_classes = ["TickAlarm"]` (choose an unused migration tag). The engine's example uses tag `v1`; the stack keeper, LOW and Zanaadu own their deploy configs. Without the binding, cron still runs and logs the skipped arm. Arm after deploying, then verify both source counters and the next alarm.
+- D1 adds a transient lease, a one-day activity history and two nullable heartbeat fields. Existing proof-completion counters keep their meaning. Rollback may leave these additive tables and columns in place. Workspace versions remain for the keeper's release commit.
+
 ## [0.1.4] - 2026-10-13
 
 - Request GASP pages of 100 outputs under the 30-second peer budget and persist only completed scores below every failed, deferred or unfinished output. Unordered pages, score ties, responder clamping and deadline resumes retain the existing gap guards. Reference overlay-services@480d77a uses 10,000 at `src/Engine.ts:29,895` through `src/GASP/OverlayGASPRemote.ts`; the smaller engine page bounds reply work on Workers.

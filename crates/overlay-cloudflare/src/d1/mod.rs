@@ -508,7 +508,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 196 → 218 for bsv-low #638: the hop seat lookup index, write-derived links and seats, guarded backfills.
 /// 218 → 220 for NS-3: compact tracker word projection.
 /// 220 → 221 for NS3D-NOTE-5: scheduled refresh/sweep age index.
-pub const OVERLAY_MIGRATION_COUNT: usize = 221;
+// 221 -> 226: the tick lease, source heartbeat and one-day activity window.
+pub const OVERLAY_MIGRATION_COUNT: usize = 226;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1870,6 +1871,11 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_hops::SEATS_BACKFILL,
     crate::derived_hops::STATE_DONE,
 
+    crate::tick_ops::LEASE_CREATE,
+    crate::tick_ops::EVENTS_CREATE,
+    crate::tick_ops::EVENTS_INDEX,
+    crate::tick_ops::SOURCE_COLUMN,
+    crate::tick_ops::AT_COLUMN,
 ];
 
 // =============================================================================
