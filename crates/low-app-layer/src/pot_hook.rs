@@ -4,10 +4,15 @@
 //! sequential fan-out (11 to 15 s p50 under the fleet), then a full `/results` gather per attributed seat.
 //!
 //! The rule here: the answer path is D1 alone, in batches; no relay call and no read-model walk is awaited before
-//! the answer. What the hook decides is [`apply_pot_changed`] / [`apply_hop_changed`], over a [`HookStore`] port
-//! (the worker's is `routes::D1HookStore`; a queue consumer is the next caller, L3's seam). The publish is
-//! [`announce`], run DETACHED (`ctx.wait_until`) under one wall ([`ANNOUNCE_WALL_MS`]) and counted. The owed
-//! recompute stays where #469 and #648 put it: after the answer, coalesced and shed per identity.
+//! the answer. The worker's handler is [`serve_pot_changed`]: what the hook decides is [`apply_pot_changed`] /
+//! [`apply_hop_changed`], over a [`HookStore`] port (the worker's is [`HookD1`] over `routes::D1Sql`; a queue
+//! consumer is the next caller, L3's seam). The publish is VOLATILE scheduling, the filing DURABLE: every wake-up of
+//! a body is PARKED in D1 in the hook's one write batch before the answer (the review's H1); [`announce_and_report`]
+//! runs DETACHED (`ctx.wait_until`) under one wall ([`ANNOUNCE_WALL_MS`]), counted, and settles the park (a
+//! delivered wake-up out, an undelivered one re-parked); [`drain_parked`] (the scheduled tick, and
+//! `POST /internal/pot-announce-drain`) delivers what is left. A wake-up reaches its seat within the wall, or within
+//! one scheduled pass after its retry is due. The owed recompute stays where #469 and #648 put it: after the
+//! answer, coalesced and shed per identity, not parked.
 //!
 //! The seat's `pot` event no longer carries a gathered `/results` entry. No reader reads it: the client's parser
 //! (`app/src/lib/lowEvents.ts` `parseLowEvent`) requires `entry` to be an OBJECT, and every consumer
@@ -254,7 +259,7 @@ pub struct StmtOut {
     pub changes: u64,
 }
 
-/// The SQL under [`HookD1`]: ONE `batch` is one D1 round trip (the worker's `D1Sql` runs `counted_batch`), atomic
+/// The SQL under [`HookD1`]: ONE `run_batch` is one D1 round trip (the worker's `D1Sql` runs `counted_batch`), atomic
 /// as D1's is (one statement that faults fails the batch). The native pins run the same statements over real
 /// SQLite with the overlay's migrations.
 #[allow(async_fn_in_trait)]
@@ -270,7 +275,10 @@ pub trait SqlPort {
 /// The D1 side of the hooks. The worker's is [`HookD1`] over `routes::D1Sql`.
 #[allow(async_fn_in_trait)]
 pub trait HookStore {
-    /// Every outpoint's attribution, in the order of `outpoints`.
+    /// Every outpoint's attribution, in the order of `outpoints`. [`HookD1`]'s round trips, conditional: the
+    /// required decoded-rows batch (and, only when that batch faults, one more per outpoint); the seat markers'
+    /// batch, only when a pot decoded; one batch per marker arm (three), only when an outpoint has no decoded params
+    /// or no attributed seat. So 1 to 5 reads (5 + n on a required-read fault), then the caller's ONE write.
     async fn read_outpoints(&self, outpoints: &[(String, u32)]) -> Vec<OutpointRead>;
     /// Every stale mark and every park statement given, in ONE batch (the hook's write; the settle's; the
     /// drain's). Answers the rows each park statement changed, in order (the sweep's count).
@@ -613,8 +621,9 @@ fn push_unique(v: &mut Vec<String>, id: &str) {
     }
 }
 
-/// The pot hook's whole decision for one parsed body: one read through the store, one stale-mark batch, and the
-/// plan of what runs after the answer. No relay call, no read-model walk, no owed recompute.
+/// The pot hook's whole decision for one parsed body: the store's reads, then ONE write batch (the stale marks and
+/// every wake-up parked), and the plan of what runs after the answer. No relay call, no read-model walk, no owed
+/// recompute.
 ///
 /// Per outpoint, the branches of the handler before L4: a read fault is skipped; with no decoded params, or with
 /// decoded params and no attributed seat, the marker-named identities are marked stale and queued for the
@@ -1829,6 +1838,41 @@ pub(crate) mod tests {
             det.contains(&squash("store.counters(counters).await;")),
             "the counters are flushed"
         );
+    }
+
+    /// (L1) THE COMMENTS SAY WHAT THE HOOK DOES: the handler's doc no longer promises an assembled `/results` entry
+    /// filed before the answer, it names the empty carrier, the volatile scheduling and the durable park; the store's
+    /// doc states its conditional round trips, not "one round trip per method".
+    #[test]
+    fn e649f_l1_the_hooks_comments_say_the_carrier_the_park_and_the_round_trips() {
+        let routes = include_str!("routes.rs");
+        let at = routes
+            .find("pub(crate) async fn internal_pot_changed(")
+            .expect("the handler");
+        let doc = &routes[routes[..at].rfind("/// W2-P4").expect("the handler's doc")..at];
+        for gone in ["assemble each", "served `/results` entry (the same gather"] {
+            assert!(
+                !doc.contains(gone),
+                "the handler's doc still promises an assembled entry: {gone}"
+            );
+        }
+        for said in [
+            "EMPTY `entry`",
+            "SCHEDULED, not made",
+            "PARKED durably",
+            "not delivered",
+        ] {
+            assert!(doc.contains(said), "the handler's doc says {said}");
+        }
+        let hook = include_str!("pot_hook.rs");
+        assert!(
+            !hook.contains(&["Each method is ONE round", " trip"].concat()),
+            "a stale round-trip claim"
+        );
+        assert!(hook.contains(
+            "So 1 to 5 reads (5 + n on a required-read fault), then the caller's ONE write."
+        ));
+        assert!(hook.contains("The publish is VOLATILE scheduling, the filing DURABLE"));
     }
 
     /// The deploy lane reads the hooks' timing: `Server-Timing: hook;dur=<ms>` and one log line per answer.

@@ -2293,15 +2293,17 @@ pub async fn compute_results_body_string(
 /// results query failed (each caller keeps its own posture: `/results`
 /// answers 503, `/recovery-view` serves null outcomes — best-effort). The
 /// claims/seat legs stay BEST-EFFORT inside, exactly as before.
-/// W2-P4 — `POST /internal/pot-changed` (bearer `INTERNAL_TOKEN`; the
-/// overlay's pot storage notes every changed outpoint and ships this once per
-/// unit of work). For each outpoint: decode the committed params, attribute
-/// the two seat IDENTITIES from their verified seat markers, assemble each
-/// seat's OWN served `/results` entry (the same gather + serializer the route
-/// uses — never a second shape) and file it into that seat's `low_events`
-/// box as a `pot` event. Best-effort per outpoint; the answer names what
-/// was filed. Nothing here is money truth — the client still verifies
-/// landings before any credit.
+/// W2-P4, E649 L4: `POST /internal/pot-changed` (bearer `INTERNAL_TOKEN`; the overlay's pot storage notes every
+/// changed outpoint and ships this once per unit of work). The answer path is D1 alone
+/// (`pot_hook::serve_pot_changed` over `pot_hook::HookD1`): per outpoint the committed params and the seat
+/// IDENTITIES their verified seat markers attribute; for an outpoint with no attributed seat, the identities the
+/// seats' own markers name, marked stale; and every wake-up of the body (each outpoint's pots-room broadcast, one
+/// `pot` event per attributed seat) PARKED durably in the same write batch as the stale marks (H1). The relay calls
+/// are SCHEDULED, not made: the detached announce (`ctx.wait_until`, under one wall) sends them after the answer,
+/// and what it does not deliver stays parked for the scheduled drain. So the answer's `filed` names the seat events
+/// scheduled and parked, not delivered. The `pot` event carries an EMPTY `entry` (`pot_hook::carrier_entry`): no
+/// `/results` entry is assembled, the seat re-reads its served rows. A write batch that faulted is answered 503
+/// retryable. Nothing here is money truth: the client still verifies landings before any credit.
 pub(crate) async fn internal_pot_changed(
     mut req: Request,
     env: &worker::Env,
