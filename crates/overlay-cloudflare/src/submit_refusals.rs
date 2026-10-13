@@ -55,8 +55,7 @@ use worker::*;
 /// the hop (a log pointer, never a key).
 pub const SUBMIT_REFUSALS_CREATE: &str = "CREATE TABLE IF NOT EXISTS submit_refusals (hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, refusedTxid TEXT NOT NULL, reason TEXT NOT NULL, refusedAt INTEGER NOT NULL, PRIMARY KEY (hopTxid, hopVout))";
 /// Migration 162: the door's own pass prunes by age.
-pub const SUBMIT_REFUSALS_INDEX: &str =
-    "CREATE INDEX IF NOT EXISTS idx_submit_refusals_at ON submit_refusals(refusedAt)";
+pub const SUBMIT_REFUSALS_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_submit_refusals_at ON submit_refusals(refusedAt)";
 /// Binds: hopTxid (as `pot_records` holds it), hopVout, refusedTxid (lowercase), reason, refusedAt (unix ms). A
 /// later refusal REPLACES the hop's row (never a second row).
 pub const SUBMIT_REFUSAL_UPSERT_SQL: &str = "INSERT INTO submit_refusals (hopTxid, hopVout, refusedTxid, reason, refusedAt) VALUES (?, ?, ?, ?, ?) \
@@ -127,9 +126,7 @@ pub fn signed_p2pkh_spends(beef_bytes: &[u8], subject_txid: &str) -> Vec<SignedS
         let Some(src_out) = src.outputs.get(input.source_output_index as usize) else {
             continue;
         };
-        let Some(sats) = src_out.satoshis else {
-            continue;
-        };
+        let Some(sats) = src_out.satoshis else { continue };
         let lock = src_out.locking_script.to_binary();
         if overlay_discovery::pot::p2pkh_input_signed(&tx, vin, &lock, sats) {
             out.push(SignedSpend {
@@ -175,35 +172,21 @@ pub struct IndexedHop {
 /// names nothing), and (3) the ledger holds no row for it, or holds a WEAKER word (a script refusal under the
 /// network's definitive one), or holds a row older than `SUBMIT_REFUSAL_REFRESH_MS`. (3) is the flood's bound: a
 /// stranger's N-th refused variant of one outpoint writes nothing and notes nothing.
-pub fn refusals_to_write(
-    signed: &[SignedSpend],
-    index: &[IndexedHop],
-    reason: &str,
-    now_ms: i64,
-) -> Vec<SignedSpend> {
+pub fn refusals_to_write(signed: &[SignedSpend], index: &[IndexedHop], reason: &str, now_ms: i64) -> Vec<SignedSpend> {
     let mut out: Vec<SignedSpend> = Vec::new();
     for s in signed {
-        let Some(row) = index
-            .iter()
-            .find(|r| r.output_index == i64::from(s.vout) && r.txid.eq_ignore_ascii_case(&s.txid))
-        else {
+        let Some(row) = index.iter().find(|r| r.output_index == i64::from(s.vout) && r.txid.eq_ignore_ascii_case(&s.txid)) else {
             continue;
         };
         if row.spent.unwrap_or(0) != 0 {
             continue;
         }
         let standing = match (row.held_reason.as_deref(), row.held_at) {
-            (Some(held), Some(at)) => {
-                reason_rank(held) >= reason_rank(reason)
-                    && now_ms.saturating_sub(at) < SUBMIT_REFUSAL_REFRESH_MS
-            }
+            (Some(held), Some(at)) => reason_rank(held) >= reason_rank(reason) && now_ms.saturating_sub(at) < SUBMIT_REFUSAL_REFRESH_MS,
             _ => false,
         };
         // the hop's txid as the INDEX holds it: the reader joins on it
-        let spend = SignedSpend {
-            txid: row.txid.clone(),
-            vout: s.vout,
-        };
+        let spend = SignedSpend { txid: row.txid.clone(), vout: s.vout };
         if !standing && !out.contains(&spend) {
             out.push(spend);
         }
@@ -212,12 +195,7 @@ pub fn refusals_to_write(
 }
 
 /// PURE: the writes of one refusal, in order: one upsert per hop, then the prune. Empty when nothing is to write.
-pub fn write_queries(
-    to_write: &[SignedSpend],
-    subject_txid: &str,
-    reason: &str,
-    now_ms: i64,
-) -> Vec<Query> {
+pub fn write_queries(to_write: &[SignedSpend], subject_txid: &str, reason: &str, now_ms: i64) -> Vec<Query> {
     if to_write.is_empty() {
         return Vec::new();
     }
@@ -232,9 +210,7 @@ pub fn write_queries(
                 .bind(QVal::Int(now_ms))
         })
         .collect();
-    out.push(
-        Query::new(SUBMIT_REFUSALS_GC_SQL).bind(QVal::Int(now_ms - SUBMIT_REFUSALS_RETENTION_MS)),
-    );
+    out.push(Query::new(SUBMIT_REFUSALS_GC_SQL).bind(QVal::Int(now_ms - SUBMIT_REFUSALS_RETENTION_MS)));
     out
 }
 
@@ -308,9 +284,7 @@ mod tests {
     use bsv_rs::primitives::PrivateKey;
     use bsv_rs::script::templates::P2PKH;
     use bsv_rs::script::{Script, ScriptTemplate, SignOutputs, UnlockingScript};
-    use bsv_rs::transaction::{
-        MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput,
-    };
+    use bsv_rs::transaction::{MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput};
 
     /// A "mined" hop: one throwaway input, `sats` to `key`'s P2PKH, carrying a one-leaf BUMP so a BEEF can hold it.
     fn hop(key: &PrivateKey, sats: u64, salt: u8) -> Transaction {
@@ -321,37 +295,20 @@ mod tests {
             unlocking_script: Some(UnlockingScript::from_script(Script::new())),
             ..Default::default()
         });
-        tx.outputs.push(TransactionOutput::new(
-            sats,
-            P2PKH::new().lock(&key.public_key().hash160()).unwrap(),
-        ));
+        tx.outputs.push(TransactionOutput::new(sats, P2PKH::new().lock(&key.public_key().hash160()).unwrap()));
         let txid = tx.id();
-        tx.merkle_path =
-            Some(MerklePath::new(900_000, vec![vec![MerklePathLeaf::new_txid(0, txid)]]).unwrap());
+        tx.merkle_path = Some(MerklePath::new(900_000, vec![vec![MerklePathLeaf::new_txid(0, txid)]]).unwrap());
         tx
     }
 
     /// A two-input "JOIN": hop A signed by `sign_a`, hop B signed by `sign_b`.
-    async fn join(
-        hop_a: Transaction,
-        sign_a: &PrivateKey,
-        hop_b: Transaction,
-        sign_b: &PrivateKey,
-    ) -> (Vec<u8>, String) {
+    async fn join(hop_a: Transaction, sign_a: &PrivateKey, hop_b: Transaction, sign_b: &PrivateKey) -> (Vec<u8>, String) {
         let mut tx = Transaction::new();
-        tx.add_input_from_tx(hop_a, 0, P2PKH::unlock(sign_a, SignOutputs::All, false))
-            .unwrap();
-        tx.add_input_from_tx(hop_b, 0, P2PKH::unlock(sign_b, SignOutputs::All, false))
-            .unwrap();
-        tx.outputs.push(TransactionOutput::new(
-            40_000,
-            P2PKH::new().lock(&[0x11u8; 20]).unwrap(),
-        ));
+        tx.add_input_from_tx(hop_a, 0, P2PKH::unlock(sign_a, SignOutputs::All, false)).unwrap();
+        tx.add_input_from_tx(hop_b, 0, P2PKH::unlock(sign_b, SignOutputs::All, false)).unwrap();
+        tx.outputs.push(TransactionOutput::new(40_000, P2PKH::new().lock(&[0x11u8; 20]).unwrap()));
         tx.sign().await.expect("template signing");
-        (
-            tx.to_beef(false).expect("BEEF with both proven parents"),
-            tx.id(),
-        )
+        (tx.to_beef(false).expect("BEEF with both proven parents"), tx.id())
     }
 
     /// bsv-low #486: the ledger records a hop only when the hop's OWN key signed the refused transaction. A JOIN one
@@ -360,37 +317,18 @@ mod tests {
     /// the door) name nothing, so no one can strand another seat's live hop by getting bytes refused.
     #[tokio::test]
     async fn only_a_hop_whose_own_key_signed_the_refused_transaction_is_recorded() {
-        let (a, b, stranger) = (
-            PrivateKey::random(),
-            PrivateKey::random(),
-            PrivateKey::random(),
-        );
+        let (a, b, stranger) = (PrivateKey::random(), PrivateKey::random(), PrivateKey::random());
         let (hop_a, hop_b) = (hop(&a, 20_190, 0xa1), hop(&b, 20_190, 0xb2));
         let (a_txid, b_txid) = (hop_a.id(), hop_b.id());
         // both seats signed: both hops are named (a valid JOIN the NETWORK refused, the 422 arm)
         let (beef, txid) = join(hop_a.clone(), &a, hop_b.clone(), &b).await;
         assert_eq!(
             signed_p2pkh_spends(&beef, &txid),
-            vec![
-                SignedSpend {
-                    txid: a_txid.clone(),
-                    vout: 0
-                },
-                SignedSpend {
-                    txid: b_txid.clone(),
-                    vout: 0
-                }
-            ]
+            vec![SignedSpend { txid: a_txid.clone(), vout: 0 }, SignedSpend { txid: b_txid.clone(), vout: 0 }]
         );
         // seat B's input does not verify (the interpreter's refusal): seat A's hop alone is named
         let (beef, txid) = join(hop_a.clone(), &a, hop_b.clone(), &stranger).await;
-        assert_eq!(
-            signed_p2pkh_spends(&beef, &txid),
-            vec![SignedSpend {
-                txid: a_txid.clone(),
-                vout: 0
-            }]
-        );
+        assert_eq!(signed_p2pkh_spends(&beef, &txid), vec![SignedSpend { txid: a_txid.clone(), vout: 0 }]);
         // a stranger's bytes naming BOTH victims' hops: nothing
         let (beef, txid) = join(hop_a.clone(), &stranger, hop_b.clone(), &stranger).await;
         assert!(signed_p2pkh_spends(&beef, &txid).is_empty());
@@ -418,25 +356,14 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         for sql in crate::d1::OVERLAY_MIGRATIONS {
             if let Err(e) = conn.execute_batch(sql) {
-                assert!(
-                    e.to_string()
-                        .to_ascii_lowercase()
-                        .contains("duplicate column"),
-                    "migration failed under real SQLite: {e}"
-                );
+                assert!(e.to_string().to_ascii_lowercase().contains("duplicate column"), "migration failed under real SQLite: {e}");
             }
         }
         conn
     }
 
     /// `record`, natively: the same four steps over real SQLite. Returns the hops written (the ones `record` notes).
-    fn record_on(
-        conn: &rusqlite::Connection,
-        beef: &[u8],
-        subject: &str,
-        reason: &str,
-        now_ms: i64,
-    ) -> Vec<SignedSpend> {
+    fn record_on(conn: &rusqlite::Connection, beef: &[u8], subject: &str, reason: &str, now_ms: i64) -> Vec<SignedSpend> {
         let signed = signed_p2pkh_spends(beef, subject);
         if signed.is_empty() {
             return Vec::new();
@@ -446,31 +373,20 @@ mod tests {
             .prepare(read.sql())
             .unwrap()
             .query_map(rusqlite::params_from_iter(binds(&read).iter()), |r| {
-                Ok(IndexedHop {
-                    txid: r.get(0)?,
-                    output_index: r.get(1)?,
-                    spent: r.get(2)?,
-                    held_reason: r.get(3)?,
-                    held_at: r.get(4)?,
-                })
+                Ok(IndexedHop { txid: r.get(0)?, output_index: r.get(1)?, spent: r.get(2)?, held_reason: r.get(3)?, held_at: r.get(4)? })
             })
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
         let to_write = refusals_to_write(&signed, &index, reason, now_ms);
         for q in write_queries(&to_write, subject, reason, now_ms) {
-            conn.execute(q.sql(), rusqlite::params_from_iter(binds(&q).iter()))
-                .unwrap();
+            conn.execute(q.sql(), rusqlite::params_from_iter(binds(&q).iter())).unwrap();
         }
         to_write
     }
 
     fn index_hop(conn: &rusqlite::Connection, txid: &str) {
-        conn.execute(
-            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 800)",
-            [txid],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, 0, 800)", [txid]).unwrap();
     }
 
     fn ledger(conn: &rusqlite::Connection) -> Vec<(String, i64, String, String, i64)> {
@@ -489,43 +405,20 @@ mod tests {
     #[tokio::test]
     async fn a_refused_submit_writes_exactly_the_row_of_each_signed_and_indexed_hop_real_sqlite() {
         let conn = ledger_db();
-        let (a, b, stranger) = (
-            PrivateKey::random(),
-            PrivateKey::random(),
-            PrivateKey::random(),
-        );
+        let (a, b, stranger) = (PrivateKey::random(), PrivateKey::random(), PrivateKey::random());
         let (hop_a, hop_b) = (hop(&a, 20_190, 0xa1), hop(&b, 20_190, 0xb2));
         let (a_txid, b_txid) = (hop_a.id(), hop_b.id());
         // seat B's input is corrupted (the 400 arm); only hop A is indexed so far
         index_hop(&conn, &a_txid);
         let (beef, bad_join) = join(hop_a.clone(), &a, hop_b.clone(), &stranger).await;
         let wrote = record_on(&conn, &beef, &bad_join, REASON_SCRIPT_REFUSED, 1_000);
-        assert_eq!(
-            wrote,
-            vec![SignedSpend {
-                txid: a_txid.clone(),
-                vout: 0
-            }]
-        );
-        assert_eq!(
-            ledger(&conn),
-            vec![(
-                a_txid.clone(),
-                0,
-                bad_join.clone(),
-                REASON_SCRIPT_REFUSED.to_string(),
-                1_000
-            )]
-        );
+        assert_eq!(wrote, vec![SignedSpend { txid: a_txid.clone(), vout: 0 }]);
+        assert_eq!(ledger(&conn), vec![(a_txid.clone(), 0, bad_join.clone(), REASON_SCRIPT_REFUSED.to_string(), 1_000)]);
         // an UNSIGNED input (a stranger's bytes naming both indexed hops): no row, whatever the index holds
         index_hop(&conn, &b_txid);
         let (beef, forged) = join(hop_a.clone(), &stranger, hop_b.clone(), &stranger).await;
         assert!(record_on(&conn, &beef, &forged, REASON_SCRIPT_REFUSED, 1_100).is_empty());
-        assert_eq!(
-            ledger(&conn).len(),
-            1,
-            "a stranger's bytes record nothing about a victim's hop"
-        );
+        assert_eq!(ledger(&conn).len(), 1, "a stranger's bytes record nothing about a victim's hop");
         // an UNINDEXED input (signed, but no `pot_records` row): no row
         let c = PrivateKey::random();
         let hop_c = hop(&c, 5_000, 0xc3);
@@ -537,19 +430,12 @@ mod tests {
         let reason = network_rejected_reason("REJECTED");
         let wrote = record_on(&conn, &beef, &valid_join, &reason, 2_000);
         assert_eq!(wrote.len(), 2);
-        let mut want = vec![
-            (a_txid.clone(), 0, valid_join.clone(), reason.clone(), 2_000),
-            (b_txid.clone(), 0, valid_join.clone(), reason.clone(), 2_000),
-        ];
+        let mut want = vec![(a_txid.clone(), 0, valid_join.clone(), reason.clone(), 2_000), (b_txid.clone(), 0, valid_join.clone(), reason.clone(), 2_000)];
         want.sort();
         assert_eq!(ledger(&conn), want);
         // a hop the index shows SPENT (the JOIN landed; a corrupted copy arrives after): no row (the lens's LOW-3)
         conn.execute("DELETE FROM submit_refusals", []).unwrap();
-        conn.execute(
-            "UPDATE pot_records SET spent = 1, spendingTxid = ?1 WHERE txid = ?2",
-            rusqlite::params![valid_join, a_txid],
-        )
-        .unwrap();
+        conn.execute("UPDATE pot_records SET spent = 1, spendingTxid = ?1 WHERE txid = ?2", rusqlite::params![valid_join, a_txid]).unwrap();
         let (beef, late_copy) = join(hop_a.clone(), &a, hop_b.clone(), &stranger).await;
         assert!(record_on(&conn, &beef, &late_copy, REASON_SCRIPT_REFUSED, 3_000).is_empty());
         assert!(ledger(&conn).is_empty());
@@ -569,82 +455,22 @@ mod tests {
         let mut writes = 0usize;
         for n in 0..24u8 {
             let other = PrivateKey::random();
-            let (beef, variant) =
-                join(own.clone(), &stranger, hop(&other, 1_000, n), &stranger).await;
+            let (beef, variant) = join(own.clone(), &stranger, hop(&other, 1_000, n), &stranger).await;
             assert!(txids.insert(variant.clone()), "every variant is a new txid");
-            writes += record_on(
-                &conn,
-                &beef,
-                &variant,
-                REASON_SCRIPT_REFUSED,
-                10_000 + i64::from(n),
-            )
-            .len();
+            writes += record_on(&conn, &beef, &variant, REASON_SCRIPT_REFUSED, 10_000 + i64::from(n)).len();
         }
         assert_eq!(txids.len(), 24);
-        assert_eq!(
-            ledger(&conn).len(),
-            1,
-            "one row per outpoint, whatever the count of refused variants"
-        );
-        assert_eq!(
-            writes, 1,
-            "the first variant wrote; the other 23 cost the read alone"
-        );
-        assert_eq!(
-            ledger(&conn)[0].4,
-            10_000,
-            "the standing row was not rewritten"
-        );
+        assert_eq!(ledger(&conn).len(), 1, "one row per outpoint, whatever the count of refused variants");
+        assert_eq!(writes, 1, "the first variant wrote; the other 23 cost the read alone");
+        assert_eq!(ledger(&conn)[0].4, 10_000, "the standing row was not rewritten");
         // the standing word is refreshed only once it is an hour old (it must not age out under a live refusal)
-        let (beef, late) = join(
-            own.clone(),
-            &stranger,
-            hop(&PrivateKey::random(), 1_000, 0x77),
-            &stranger,
-        )
-        .await;
-        assert!(record_on(
-            &conn,
-            &beef,
-            &late,
-            REASON_SCRIPT_REFUSED,
-            10_000 + SUBMIT_REFUSAL_REFRESH_MS - 1
-        )
-        .is_empty());
-        assert_eq!(
-            record_on(
-                &conn,
-                &beef,
-                &late,
-                REASON_SCRIPT_REFUSED,
-                10_000 + SUBMIT_REFUSAL_REFRESH_MS
-            )
-            .len(),
-            1
-        );
-        assert_eq!(
-            ledger(&conn),
-            vec![(
-                own.id(),
-                0,
-                late,
-                REASON_SCRIPT_REFUSED.to_string(),
-                10_000 + SUBMIT_REFUSAL_REFRESH_MS
-            )]
-        );
+        let (beef, late) = join(own.clone(), &stranger, hop(&PrivateKey::random(), 1_000, 0x77), &stranger).await;
+        assert!(record_on(&conn, &beef, &late, REASON_SCRIPT_REFUSED, 10_000 + SUBMIT_REFUSAL_REFRESH_MS - 1).is_empty());
+        assert_eq!(record_on(&conn, &beef, &late, REASON_SCRIPT_REFUSED, 10_000 + SUBMIT_REFUSAL_REFRESH_MS).len(), 1);
+        assert_eq!(ledger(&conn), vec![(own.id(), 0, late, REASON_SCRIPT_REFUSED.to_string(), 10_000 + SUBMIT_REFUSAL_REFRESH_MS)]);
         // a weaker word never replaces the network's
-        let held = [IndexedHop {
-            txid: own.id(),
-            output_index: 0,
-            spent: Some(0),
-            held_reason: Some(network_rejected_reason("REJECTED")),
-            held_at: Some(5),
-        }];
-        let one = [SignedSpend {
-            txid: own.id(),
-            vout: 0,
-        }];
+        let held = [IndexedHop { txid: own.id(), output_index: 0, spent: Some(0), held_reason: Some(network_rejected_reason("REJECTED")), held_at: Some(5) }];
+        let one = [SignedSpend { txid: own.id(), vout: 0 }];
         assert!(refusals_to_write(&one, &held, REASON_SCRIPT_REFUSED, 6).is_empty());
         assert!(refusals_to_write(&one, &held, &network_rejected_reason("REJECTED"), 6).is_empty());
     }
@@ -656,61 +482,25 @@ mod tests {
     #[tokio::test]
     async fn an_admission_retires_the_refusal_of_the_hop_it_spends_real_sqlite() {
         let conn = ledger_db();
-        let (a, b, stranger) = (
-            PrivateKey::random(),
-            PrivateKey::random(),
-            PrivateKey::random(),
-        );
+        let (a, b, stranger) = (PrivateKey::random(), PrivateKey::random(), PrivateKey::random());
         let (hop_a, hop_b) = (hop(&a, 20_190, 0xa1), hop(&b, 20_190, 0xb2));
         index_hop(&conn, &hop_a.id());
         index_hop(&conn, &hop_b.id());
         let (beef, corrupted) = join(hop_a.clone(), &a, hop_b.clone(), &stranger).await;
-        assert_eq!(
-            record_on(&conn, &beef, &corrupted, REASON_SCRIPT_REFUSED, 1_000).len(),
-            1
-        );
+        assert_eq!(record_on(&conn, &beef, &corrupted, REASON_SCRIPT_REFUSED, 1_000).len(), 1);
         let other = hop(&stranger, 700, 0x0f);
         index_hop(&conn, &other.id());
         let (beef, theirs) = join(other.clone(), &stranger, hop_b.clone(), &a).await;
-        assert_eq!(
-            record_on(&conn, &beef, &theirs, REASON_SCRIPT_REFUSED, 1_000).len(),
-            1
-        );
+        assert_eq!(record_on(&conn, &beef, &theirs, REASON_SCRIPT_REFUSED, 1_000).len(), 1);
         assert_eq!(ledger(&conn).len(), 2);
         // the GOOD JOIN (another txid than the refused copy) is admitted: the index marks hop A spent by it
         let (_, good) = join(hop_a.clone(), &a, hop_b.clone(), &b).await;
         assert_ne!(good, corrupted);
         let retire = retire_query(&good);
-        assert_eq!(
-            conn.execute(
-                retire.sql(),
-                rusqlite::params_from_iter(binds(&retire).iter())
-            )
-            .unwrap(),
-            0,
-            "nothing is spent by it yet"
-        );
-        conn.execute(
-            "UPDATE pot_records SET spent = 1, spendingTxid = ?1 WHERE txid = ?2",
-            rusqlite::params![good, hop_a.id()],
-        )
-        .unwrap();
-        assert_eq!(
-            conn.execute(
-                retire.sql(),
-                rusqlite::params_from_iter(binds(&retire).iter())
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            ledger(&conn)
-                .iter()
-                .map(|r| r.0.clone())
-                .collect::<Vec<_>>(),
-            vec![other.id()],
-            "the stranger's own row stands"
-        );
+        assert_eq!(conn.execute(retire.sql(), rusqlite::params_from_iter(binds(&retire).iter())).unwrap(), 0, "nothing is spent by it yet");
+        conn.execute("UPDATE pot_records SET spent = 1, spendingTxid = ?1 WHERE txid = ?2", rusqlite::params![good, hop_a.id()]).unwrap();
+        assert_eq!(conn.execute(retire.sql(), rusqlite::params_from_iter(binds(&retire).iter())).unwrap(), 1);
+        assert_eq!(ledger(&conn).iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec![other.id()], "the stranger's own row stands");
         // the retirement runs off the spend pointer's index and the ledger's key
         let plan: Vec<String> = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {SUBMIT_REFUSALS_RETIRE_SQL}"))
@@ -719,16 +509,9 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        assert!(
-            plan.iter().any(|l| l.contains("idx_pot_spending")),
-            "{plan:?}"
-        );
+        assert!(plan.iter().any(|l| l.contains("idx_pot_spending")), "{plan:?}");
         // the prune
-        assert_eq!(
-            conn.execute(SUBMIT_REFUSALS_GC_SQL, [1_000i64]).unwrap(),
-            0,
-            "a row at the cutoff is kept"
-        );
+        assert_eq!(conn.execute(SUBMIT_REFUSALS_GC_SQL, [1_000i64]).unwrap(), 0, "a row at the cutoff is kept");
         assert_eq!(conn.execute(SUBMIT_REFUSALS_GC_SQL, [1_001i64]).unwrap(), 1);
     }
 
@@ -737,12 +520,7 @@ mod tests {
     /// the admission's 200 path and the readmission retire. A source pin, comments stripped.
     #[test]
     fn the_door_records_on_its_400_and_its_definitive_422_alone_and_retires_on_admission() {
-        let code_only = |s: &str| {
-            s.lines()
-                .map(|l| l.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = code_only(include_str!("routes.rs"));
         let routes = squash(&routes[..routes.find("#[cfg(test)]").unwrap()]);
@@ -750,40 +528,18 @@ mod tests {
         assert_eq!(routes.matches(call).count(), 2, "exactly two hooks");
         let first = routes.find(call).unwrap();
         let second = first + 1 + routes[first + 1..].find(call).unwrap();
-        let arm_400 = routes
-            .find("count(crate::ops::COUNTER_SUBMIT_SCRIPT_REFUSED);")
-            .expect("the 400 arm");
-        assert!(
-            arm_400 < first && first - arm_400 < 200,
-            "the first hook sits in the script-refused arm"
-        );
-        assert!(routes[first..first + 260]
-            .contains("crate::submit_refusals::REASON_SCRIPT_REFUSED.to_string()"));
-        assert!(routes[second..second + 320]
-            .contains("crate::submit_refusals::network_rejected_reason("));
-        let answer_422 = routes[second..]
-            .find("json_error(&format!(\"networkrejected:{reason}\"),422)")
-            .expect("the 422 answer");
-        assert!(
-            answer_422 < 500,
-            "the second hook sits right before the definitive 422 answer (at +{answer_422})"
-        );
-        assert_eq!(
-            routes
-                .matches("crate::submit_refusals::retire_admitted(")
-                .count(),
-            1,
-            "the door's admission retires"
-        );
+        let arm_400 = routes.find("count(crate::ops::COUNTER_SUBMIT_SCRIPT_REFUSED);").expect("the 400 arm");
+        assert!(arm_400 < first && first - arm_400 < 200, "the first hook sits in the script-refused arm");
+        assert!(routes[first..first + 260].contains("crate::submit_refusals::REASON_SCRIPT_REFUSED.to_string()"));
+        assert!(routes[second..second + 320].contains("crate::submit_refusals::network_rejected_reason("));
+        let answer_422 = routes[second..].find("json_error(&format!(\"networkrejected:{reason}\"),422)").expect("the 422 answer");
+        assert!(answer_422 < 500, "the second hook sits right before the definitive 422 answer (at +{answer_422})");
+        assert_eq!(routes.matches("crate::submit_refusals::retire_admitted(").count(), 1, "the door's admission retires");
         let admit = code_only(include_str!("admit_fast.rs"));
         let admit = squash(&admit[..admit.find("#[cfg(test)]").unwrap()]);
         let readmit = &admit[admit.find("pubasyncfnreadmit_if_evicted(").unwrap()..];
-        let remark = readmit
-            .find("remark_spends(db,&txid,&released,now_ms)")
-            .expect("the re-mark");
-        let retire = readmit
-            .find("crate::submit_refusals::retire_admitted(db,&txid)")
-            .expect("the readmission retires");
+        let remark = readmit.find("remark_spends(db,&txid,&released,now_ms)").expect("the re-mark");
+        let retire = readmit.find("crate::submit_refusals::retire_admitted(db,&txid)").expect("the readmission retires");
         assert!(remark < retire, "retired AFTER the spend pointers are back");
     }
 }

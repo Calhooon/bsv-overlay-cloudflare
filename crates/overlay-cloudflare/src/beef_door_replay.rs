@@ -673,9 +673,7 @@ mod twin {
         let start = q.find("pub async fn enqueue_replay(").unwrap();
         let f = &q[start..start + q[start..].find("\n}\n").unwrap()];
         // the E592 fold: the producer plans the marked or unmarked message (`plan_replay` is the unmarked one)
-        assert!(f.contains(
-            "plan_replay_gated(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room, gated)"
-        ));
+        assert!(f.contains("plan_replay_gated(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room, gated)"));
         assert!(!f.contains("max_bytes") && !q.contains("too large for the mutation queue"));
         assert!(include_str!("routes.rs").contains(r#"h.set("X-Overlay-Mutation", "queued")"#));
 
@@ -1306,7 +1304,7 @@ mod e592 {
     fn e592_d_every_door_that_walks_counts_the_engine_walk() {
         let lib = include_str!("lib.rs");
         let replay = lib
-            .find("let policy = crate::queue::replay_breach_policy(body);")
+            .find("let policy = crate::queue::replay_breach_policy(body);\n        let replayed = engine.submit_with_report_under(&tagged_beef, mode, policy).await;")
             .expect("the queue's replay, its policy read off the message");
         let tail = &lib[replay..];
         assert!(
@@ -1319,10 +1317,9 @@ mod e592 {
                 .expect("not now counted")
                 < 600
         );
-        assert!(crate::source_pin_contains(
-            lib,
-            "&format!(\"failed: {e}\"), crate::queue::replay_error_class(&e)).await;"
-        ));
+        assert!(
+            lib.contains("&format!(\"failed: {e}\"), crate::queue::replay_error_class(&e)).await;")
+        );
         assert!(lib.contains("engine.set_walk_budget(WORKER_WALK_BUDGET);"));
         // the crawl's walks (E592 L3) and the GASP anchor's hold
         assert!(lib.contains("anchor_walk_held_graphs={}"));
@@ -1368,8 +1365,8 @@ mod e592 {
             .find("let (steak, mutation_report) = match engine.submit_with_report(&tagged_beef, mode).await {")
             .expect("the synchronous submit");
         let tail = &routes[submit..];
-        assert!(crate::source_pin_contains(tail,
-            "Err(EngineError::WalkCouldNotRun(stop)) => { return walk_not_now(env, &stop, \"POST /submit\").await }"
+        assert!(tail.contains(
+            "Err(EngineError::WalkCouldNotRun(stop)) => return walk_not_now(env, &stop, \"POST /submit\").await,"
         ));
         assert!(
             tail.contains("crate::ops::note_engine_walk(&db, &mutation_report, \"POST /submit\")")

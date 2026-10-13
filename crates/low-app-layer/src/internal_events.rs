@@ -261,10 +261,7 @@ pub fn parse_hop_changed_counted(raw: &[u8]) -> (Vec<String>, usize) {
     let mut over: Vec<String> = Vec::new();
     for o in arr {
         let id = o.as_str().unwrap_or("").trim().to_ascii_lowercase();
-        if id.len() != 66
-            || !(id.starts_with("02") || id.starts_with("03"))
-            || !id.bytes().all(|b| b.is_ascii_hexdigit())
-        {
+        if id.len() != 66 || !(id.starts_with("02") || id.starts_with("03")) || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
         if out.contains(&id) {
@@ -406,11 +403,7 @@ pub async fn lobby_changed(mut req: Request, env: &Env) -> Result<Response> {
             "[lobby-changed] body carried {} change(s) past the cap of {LOBBY_CHANGED_MAX}: {dropped} NOT carried by the event (the producer must chunk)",
             changes.len() + dropped
         );
-        crate::courier::flush(
-            env.d1("OVERLAY_DB").ok(),
-            vec![(COUNTER_LOBBY_CHANGED_DROPPED.to_string(), dropped as u64)],
-        )
-        .await;
+        crate::courier::flush(env.d1("OVERLAY_DB").ok(), vec![(COUNTER_LOBBY_CHANGED_DROPPED.to_string(), dropped as u64)]).await;
     }
     push_broadcast(
         env,
@@ -418,9 +411,7 @@ pub async fn lobby_changed(mut req: Request, env: &Env) -> Result<Response> {
         lobby_event_body(&changes, Date::now().as_millis()),
     )
     .await;
-    Response::from_json(
-        &json!({ "ok": true, "room": LOBBY_ROOM, "changes": changes.len(), "dropped": dropped }),
-    )
+    Response::from_json(&json!({ "ok": true, "room": LOBBY_ROOM, "changes": changes.len(), "dropped": dropped }))
 }
 
 /// `POST /internal/tip-changed` (bearer `INTERNAL_TOKEN`, body `{height}`):
@@ -614,9 +605,7 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
     // re-reads on the tip event it receives on the same room).
     let env3 = env.clone();
     ctx.wait_until(async move {
-        let Ok(db) = env3.d1("OVERLAY_DB") else {
-            return;
-        };
+        let Ok(db) = env3.d1("OVERLAY_DB") else { return };
         crate::routes::owed_mark_stale(
             &db,
             crate::owed::OWED_STALE_ON_TIP_SQL,
@@ -795,28 +784,16 @@ mod tests {
             .collect();
         let raw = format!(r#"{{"outpoints":[{}]}}"#, many.join(","));
         let (kept, dropped) = parse_pot_changed_counted(raw.as_bytes());
-        assert_eq!(
-            (kept.len(), dropped),
-            (POT_CHANGED_MAX, 20 - POT_CHANGED_MAX)
-        );
+        assert_eq!((kept.len(), dropped), (POT_CHANGED_MAX, 20 - POT_CHANGED_MAX));
         assert_eq!(parse_pot_changed_counted(b"nope"), (Vec::new(), 0));
-        let eight: Vec<String> = (0..POT_CHANGED_MAX)
-            .map(|i| format!(r#"{{"txid":"{}","vout":{i}}}"#, "cd".repeat(32)))
-            .collect();
+        let eight: Vec<String> = (0..POT_CHANGED_MAX).map(|i| format!(r#"{{"txid":"{}","vout":{i}}}"#, "cd".repeat(32))).collect();
         let raw = format!(r#"{{"outpoints":[{}]}}"#, eight.join(","));
-        assert_eq!(
-            parse_pot_changed_counted(raw.as_bytes()).1,
-            0,
-            "a body at the bound drops nothing"
-        );
+        assert_eq!(parse_pot_changed_counted(raw.as_bytes()).1, 0, "a body at the bound drops nothing");
     }
 
     /// A future that waits on nothing outside itself (the fake transports below), run to its answer.
     fn run<F: std::future::Future>(fut: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("a current-thread runtime")
-            .block_on(fut)
+        tokio::runtime::Builder::new_current_thread().build().expect("a current-thread runtime").block_on(fut)
     }
 
     /// bsv-low #436 (the loop-10 D4 delta review; the lens's L1): BOTH ENDS OF THE CONTRACT IN ONE PIN, OVER THE
@@ -831,16 +808,8 @@ mod tests {
     #[test]
     fn nineteen_outpoints_in_one_flush_all_reach_the_filing_and_the_push() {
         use bsv_overlay_cloudflare::pot_changes;
-        assert_eq!(
-            pot_changes::POT_CHANGED_CHUNK,
-            POT_CHANGED_MAX,
-            "the overlay chunks at this worker's bound"
-        );
-        assert_eq!(
-            pot_changes::COUNTER_POT_CHANGED_DROPPED,
-            COUNTER_POT_CHANGED_DROPPED,
-            "the overlay seeds the row this worker writes (the lens's N1)"
-        );
+        assert_eq!(pot_changes::POT_CHANGED_CHUNK, POT_CHANGED_MAX, "the overlay chunks at this worker's bound");
+        assert_eq!(pot_changes::COUNTER_POT_CHANGED_DROPPED, COUNTER_POT_CHANGED_DROPPED, "the overlay seeds the row this worker writes (the lens's N1)");
         let _ = pot_changes::drain();
         let noted: Vec<(String, u32)> = (0..19u32).map(|i| (format!("{i:064x}"), i % 2)).collect();
         for (t, v) in &noted {
@@ -853,10 +822,7 @@ mod tests {
             drained,
             |body: String| {
                 let (kept, dropped) = parse_pot_changed_counted(body.as_bytes());
-                assert!(
-                    !kept.is_empty(),
-                    "no empty POST (the handler answers 400 to one)"
-                );
+                assert!(!kept.is_empty(), "no empty POST (the handler answers 400 to one)");
                 reached.borrow_mut().extend(kept);
                 async move { Ok(dropped) }
             },
@@ -868,54 +834,20 @@ mod tests {
         let mut want = noted.clone();
         want.sort();
         assert_eq!(shipped.refused, 0, "nothing dropped at the receiving end");
-        assert_eq!(
-            reached, want,
-            "every noted outpoint reaches the handler's list"
-        );
+        assert_eq!(reached, want, "every noted outpoint reaches the handler's list");
         assert_eq!(shipped.posts, 3, "19 outpoints ride ceil(19 / 8) POSTs");
-        assert_eq!(
-            pot_changes::settle(&shipped),
-            bsv_overlay_cloudflare::change_flush::Tally::default(),
-            "nothing undelivered, retried or deferred"
-        );
+        assert_eq!(pot_changes::settle(&shipped), bsv_overlay_cloudflare::change_flush::Tally::default(), "nothing undelivered, retried or deferred");
         // the handler announces and files over the parsed list, and a refused remainder is counted and answered
-        let code_only = |s: &str| {
-            s.lines()
-                .map(|l| l.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = squash(&code_only(include_str!("routes.rs")));
-        let start = routes
-            .find(&squash("pub(crate) async fn internal_pot_changed("))
-            .expect("the handler");
-        let handler = &routes[start
-            ..start
-                + routes[start + 1..]
-                    .find(&squash("pub(crate) async fn"))
-                    .expect("the next handler")];
-        assert!(handler.contains(&squash(
-            "let (outpoints, dropped) = crate::internal_events::parse_pot_changed_counted(&raw);"
-        )));
-        assert!(
-            handler.contains(&squash("for (txid, vout) in &outpoints {")),
-            "the push loop runs over every parsed outpoint"
-        );
-        assert!(
-            handler.contains(&squash("for (txid, vout) in outpoints {")),
-            "and so does the filing loop"
-        );
-        assert!(
-            handler.contains(&squash(
-                "crate::internal_events::COUNTER_POT_CHANGED_DROPPED"
-            )),
-            "a refused remainder is counted"
-        );
-        assert!(
-            handler.contains(&squash(r#""dropped": dropped"#)),
-            "and answered to the overlay"
-        );
+        let start = routes.find(&squash("pub(crate) async fn internal_pot_changed(")).expect("the handler");
+        let handler = &routes[start..start + routes[start + 1..].find(&squash("pub(crate) async fn")).expect("the next handler")];
+        assert!(handler.contains(&squash("let (outpoints, dropped) = crate::internal_events::parse_pot_changed_counted(&raw);")));
+        assert!(handler.contains(&squash("for (txid, vout) in &outpoints {")), "the push loop runs over every parsed outpoint");
+        assert!(handler.contains(&squash("for (txid, vout) in outpoints {")), "and so does the filing loop");
+        assert!(handler.contains(&squash("crate::internal_events::COUNTER_POT_CHANGED_DROPPED")), "a refused remainder is counted");
+        assert!(handler.contains(&squash(r#""dropped": dropped"#)), "and answered to the overlay");
     }
 
     /// bsv-low #436 (lens fold, L6): BOTH ENDS OF THE HOP-CHANGED CONTRACT IN ONE PIN, OVER THE REAL FLUSH.
@@ -928,20 +860,10 @@ mod tests {
     #[test]
     fn nineteen_identities_in_one_hop_flush_all_reach_the_owed_recompute() {
         use bsv_overlay_cloudflare::hop_changes;
-        assert_eq!(
-            hop_changes::HOP_CHANGED_CHUNK,
-            HOP_CHANGED_MAX,
-            "the overlay chunks at this worker's bound"
-        );
-        assert_eq!(
-            hop_changes::COUNTER_HOP_CHANGED_DROPPED,
-            COUNTER_HOP_CHANGED_DROPPED,
-            "the overlay seeds the row this worker writes"
-        );
+        assert_eq!(hop_changes::HOP_CHANGED_CHUNK, HOP_CHANGED_MAX, "the overlay chunks at this worker's bound");
+        assert_eq!(hop_changes::COUNTER_HOP_CHANGED_DROPPED, COUNTER_HOP_CHANGED_DROPPED, "the overlay seeds the row this worker writes");
         let _ = hop_changes::drain();
-        let ids: Vec<String> = (0..19u32)
-            .map(|i| format!("{}{i:064x}", if i % 2 == 0 { "02" } else { "03" }))
-            .collect();
+        let ids: Vec<String> = (0..19u32).map(|i| format!("{}{i:064x}", if i % 2 == 0 { "02" } else { "03" })).collect();
         for pair in ids.chunks(2) {
             hop_changes::note(&pair[0], pair.get(1).map(String::as_str).unwrap_or(""));
         }
@@ -952,10 +874,7 @@ mod tests {
             drained,
             |body: String| {
                 let (kept, dropped) = parse_hop_changed_counted(body.as_bytes());
-                assert!(
-                    !kept.is_empty(),
-                    "no empty POST (the handler answers 400 to one)"
-                );
+                assert!(!kept.is_empty(), "no empty POST (the handler answers 400 to one)");
                 reached.borrow_mut().extend(kept);
                 async move { Ok(dropped) }
             },
@@ -967,66 +886,26 @@ mod tests {
         let mut want = ids.clone();
         want.sort();
         assert_eq!(shipped.refused, 0, "nothing dropped at the receiving end");
-        assert_eq!(
-            reached, want,
-            "every noted identity reaches the handler's list"
-        );
+        assert_eq!(reached, want, "every noted identity reaches the handler's list");
         assert_eq!(shipped.posts, 3, "19 identities ride ceil(19 / 8) POSTs");
-        assert_eq!(
-            hop_changes::settle(&shipped),
-            bsv_overlay_cloudflare::change_flush::Tally::default()
-        );
+        assert_eq!(hop_changes::settle(&shipped), bsv_overlay_cloudflare::change_flush::Tally::default());
         // a body over the cap (a producer that does not chunk) is counted, never trimmed silently
         let whole = hop_changes::body_json(&ids);
         let (kept, dropped) = parse_hop_changed_counted(whole.as_bytes());
-        assert_eq!(
-            (kept.len(), dropped),
-            (HOP_CHANGED_MAX, 19 - HOP_CHANGED_MAX)
-        );
+        assert_eq!((kept.len(), dropped), (HOP_CHANGED_MAX, 19 - HOP_CHANGED_MAX));
         let twice = hop_changes::body_json(&[ids.clone(), ids.clone()].concat());
-        assert_eq!(
-            parse_hop_changed_counted(twice.as_bytes()).1,
-            19 - HOP_CHANGED_MAX,
-            "a repeat is not a second drop"
-        );
+        assert_eq!(parse_hop_changed_counted(twice.as_bytes()).1, 19 - HOP_CHANGED_MAX, "a repeat is not a second drop");
         // the handler marks and re-derives over the parsed list, and a refused remainder is counted and answered
-        let code_only = |s: &str| {
-            s.lines()
-                .map(|l| l.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = squash(&code_only(include_str!("routes.rs")));
-        let start = routes
-            .find(&squash("pub(crate) async fn internal_hop_changed("))
-            .expect("the handler");
-        let handler = &routes[start
-            ..start
-                + routes[start + 1..]
-                    .find(&squash("pub(crate) async fn"))
-                    .expect("the next handler")];
-        assert!(handler.contains(&squash(
-            "let (identities, dropped) = crate::internal_events::parse_hop_changed_counted(&raw);"
-        )));
-        assert!(
-            handler.contains(&squash("for id in &identities {")),
-            "the stale mark runs over every parsed identity"
-        );
-        assert!(
-            handler.contains(&squash("for id in ids {")),
-            "and so does the recompute"
-        );
-        assert!(
-            handler.contains(&squash(
-                "crate::internal_events::COUNTER_HOP_CHANGED_DROPPED"
-            )),
-            "a refused remainder is counted"
-        );
-        assert!(
-            handler.contains(&squash(r#""dropped": dropped"#)),
-            "and answered to the overlay"
-        );
+        let start = routes.find(&squash("pub(crate) async fn internal_hop_changed(")).expect("the handler");
+        let handler = &routes[start..start + routes[start + 1..].find(&squash("pub(crate) async fn")).expect("the next handler")];
+        assert!(handler.contains(&squash("let (identities, dropped) = crate::internal_events::parse_hop_changed_counted(&raw);")));
+        assert!(handler.contains(&squash("for id in &identities {")), "the stale mark runs over every parsed identity");
+        assert!(handler.contains(&squash("for id in ids {")), "and so does the recompute");
+        assert!(handler.contains(&squash("crate::internal_events::COUNTER_HOP_CHANGED_DROPPED")), "a refused remainder is counted");
+        assert!(handler.contains(&squash(r#""dropped": dropped"#)), "and answered to the overlay");
     }
 
     /// bsv-low #436 (lens fold, L6): BOTH ENDS OF THE LOBBY-CHANGED CONTRACT IN ONE PIN, OVER THE REAL FLUSH.
@@ -1037,16 +916,8 @@ mod tests {
     #[test]
     fn nineteen_lobby_changes_in_one_flush_all_reach_the_event() {
         use bsv_overlay_cloudflare::lobby_changes;
-        assert_eq!(
-            lobby_changes::LOBBY_CHANGED_CHUNK,
-            LOBBY_CHANGED_MAX,
-            "the overlay chunks at this worker's bound"
-        );
-        assert_eq!(
-            lobby_changes::COUNTER_LOBBY_CHANGED_DROPPED,
-            COUNTER_LOBBY_CHANGED_DROPPED,
-            "the overlay seeds the row this worker writes"
-        );
+        assert_eq!(lobby_changes::LOBBY_CHANGED_CHUNK, LOBBY_CHANGED_MAX, "the overlay chunks at this worker's bound");
+        assert_eq!(lobby_changes::COUNTER_LOBBY_CHANGED_DROPPED, COUNTER_LOBBY_CHANGED_DROPPED, "the overlay seeds the row this worker writes");
         let _ = lobby_changes::drain();
         for i in 0..19u32 {
             if i % 2 == 0 {
@@ -1057,21 +928,14 @@ mod tests {
         }
         let drained = lobby_changes::drain();
         assert_eq!(drained.len(), 19);
-        let mut want: Vec<(String, u32, String)> = drained
-            .iter()
-            .map(|(t, v, k)| (t.clone(), *v, k.to_string()))
-            .collect();
+        let mut want: Vec<(String, u32, String)> = drained.iter().map(|(t, v, k)| (t.clone(), *v, k.to_string())).collect();
         let whole = lobby_changes::body_json(&drained);
-        let reached: std::cell::RefCell<Vec<(String, u32, String)>> =
-            std::cell::RefCell::new(Vec::new());
+        let reached: std::cell::RefCell<Vec<(String, u32, String)>> = std::cell::RefCell::new(Vec::new());
         let shipped = run(lobby_changes::ship_with(
             drained,
             |body: String| {
                 let (kept, dropped) = parse_lobby_changed_counted(body.as_bytes());
-                assert!(
-                    !kept.is_empty(),
-                    "no empty POST (the handler answers 400 to one)"
-                );
+                assert!(!kept.is_empty(), "no empty POST (the handler answers 400 to one)");
                 reached.borrow_mut().extend(kept);
                 async move { Ok(dropped) }
             },
@@ -1084,53 +948,21 @@ mod tests {
         assert_eq!(shipped.refused, 0, "nothing dropped at the receiving end");
         assert_eq!(reached, want, "every noted change reaches the event's list");
         assert_eq!(shipped.posts, 3, "19 changes ride ceil(19 / 8) POSTs");
-        assert_eq!(
-            lobby_changes::settle(&shipped),
-            bsv_overlay_cloudflare::change_flush::Tally::default()
-        );
+        assert_eq!(lobby_changes::settle(&shipped), bsv_overlay_cloudflare::change_flush::Tally::default());
         // a body over the cap is counted, never trimmed silently
         let (kept, dropped) = parse_lobby_changed_counted(whole.as_bytes());
-        assert_eq!(
-            (kept.len(), dropped),
-            (LOBBY_CHANGED_MAX, 19 - LOBBY_CHANGED_MAX)
-        );
+        assert_eq!((kept.len(), dropped), (LOBBY_CHANGED_MAX, 19 - LOBBY_CHANGED_MAX));
         // the handler fans the parsed list out, and a refused remainder is counted and answered
-        let code_only = |s: &str| {
-            s.lines()
-                .map(|l| l.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let src = include_str!("internal_events.rs");
         let src = squash(&code_only(&src[..src.find("#[cfg(test)]").unwrap()]));
-        let start = src
-            .find(&squash("pub async fn lobby_changed("))
-            .expect("the handler");
-        let handler = &src[start
-            ..start
-                + src[start + 1..]
-                    .find(&squash("pub fn overlay_tip_body("))
-                    .expect("the next item")];
-        assert!(handler.contains(&squash(
-            "let (changes, dropped) = parse_lobby_changed_counted(&raw);"
-        )));
-        assert!(
-            handler.contains(&squash(
-                "lobby_event_body(&changes, Date::now().as_millis())"
-            )),
-            "the event carries every parsed change"
-        );
-        assert!(
-            handler.contains(&squash(
-                "COUNTER_LOBBY_CHANGED_DROPPED.to_string(), dropped as u64"
-            )),
-            "a refused remainder is counted"
-        );
-        assert!(
-            handler.contains(&squash(r#""dropped": dropped"#)),
-            "and answered to the overlay"
-        );
+        let start = src.find(&squash("pub async fn lobby_changed(")).expect("the handler");
+        let handler = &src[start..start + src[start + 1..].find(&squash("pub fn overlay_tip_body(")).expect("the next item")];
+        assert!(handler.contains(&squash("let (changes, dropped) = parse_lobby_changed_counted(&raw);")));
+        assert!(handler.contains(&squash("lobby_event_body(&changes, Date::now().as_millis())")), "the event carries every parsed change");
+        assert!(handler.contains(&squash("COUNTER_LOBBY_CHANGED_DROPPED.to_string(), dropped as u64")), "a refused remainder is counted");
+        assert!(handler.contains(&squash(r#""dropped": dropped"#)), "and answered to the overlay");
     }
 
     #[test]
@@ -1207,12 +1039,7 @@ mod tests {
     #[test]
     fn internal_pot_changed_marks_the_marker_named_identities_stale_when_no_seat_is_attributed() {
         // comments stripped before the squash: a comment naming `owed_mark_stale(` must not green this pin
-        let code_only = |s: &str| {
-            s.lines()
-                .map(|l| l.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = squash(&code_only(include_str!("routes.rs")));
         let start = routes
@@ -1223,39 +1050,22 @@ mod tests {
             .find(&squash("if identities.is_empty() {"))
             .expect("the no-attributed-seats branch");
         let body = &handler[branch..];
-        let end = body
-            .find(&squash("continue;"))
-            .expect("the branch ends with continue");
+        let end = body.find(&squash("continue;")).expect("the branch ends with continue");
         let body = &body[..end];
-        let named = body
-            .find(&squash("owed_identities_by_marker(&db, &txid, vout)"))
-            .expect("the marker-named identities are read");
-        let stale = body
-            .find(&squash("owed_mark_stale("))
-            .expect("and marked stale");
-        let queued = body
-            .find(&squash("owed_identities.push(id)"))
-            .expect("and queued for the after-answer re-derivation");
-        assert!(
-            named < stale && stale < queued,
-            "read, mark stale, queue — in that order"
-        );
+        let named = body.find(&squash("owed_identities_by_marker(&db, &txid, vout)")).expect("the marker-named identities are read");
+        let stale = body.find(&squash("owed_mark_stale(")).expect("and marked stale");
+        let queued = body.find(&squash("owed_identities.push(id)")).expect("and queued for the after-answer re-derivation");
+        assert!(named < stale && stale < queued, "read, mark stale, queue — in that order");
         // and the marker-named read has the refund-backup arm (the one marker a seat killed at the funding filed)
-        let helper = routes
-            .find(&squash("pub(crate) async fn owed_identities_by_marker("))
-            .expect("the helper");
+        let helper = routes.find(&squash("pub(crate) async fn owed_identities_by_marker(")).expect("the helper");
         // bounded to the helper's own body: the next `pub(crate) async fn` (the delta-verify's N4; `find` lands on
         // an ASCII marker, a char boundary, never a byte offset into an em dash)
         let rest = &routes[helper + 1..];
-        let end = rest
-            .find(&squash("pub(crate) async fn"))
-            .unwrap_or(rest.len());
+        let end = rest.find(&squash("pub(crate) async fn")).unwrap_or(rest.len());
         let helper_body = &rest[..end];
-        assert!(
-            helper_body.contains(&squash("crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL")),
-            "the potrefund arm"
-        );
+        assert!(helper_body.contains(&squash("crate::owed::OWED_ATTRIBUTE_BY_POTREFUND_SQL")), "the potrefund arm");
     }
+
 
     #[test]
     fn tip_event_body_is_a_snapshot_with_the_room_name_pinned() {
@@ -1270,13 +1080,10 @@ mod tests {
     fn hop_changed_parses_well_formed_identities_once_and_refuses_the_rest() {
         let a = format!("02{}", "aa".repeat(32));
         let b = format!("03{}", "bb".repeat(32));
-        let body = format!(
-            "{{\"identities\":[\"{}\",\"{b}\",\"{a}\",\"04{}\",\"junk\"]}}",
-            a.to_ascii_uppercase(),
-            "cc".repeat(32)
-        );
+        let body = format!("{{\"identities\":[\"{}\",\"{b}\",\"{a}\",\"04{}\",\"junk\"]}}", a.to_ascii_uppercase(), "cc".repeat(32));
         assert_eq!(parse_hop_changed(body.as_bytes()), vec![a, b]);
         assert!(parse_hop_changed(b"{}").is_empty());
         assert!(parse_hop_changed(b"not json").is_empty());
     }
+
 }

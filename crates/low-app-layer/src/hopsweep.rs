@@ -36,9 +36,7 @@
 //! What this does NOT decide: the sweep's destination. The seat signed it; the
 //! seat chose where its own sats go (the client pays its BRC-29 pot home).
 
-use bsv_rs::primitives::bsv::sighash::{
-    compute_sighash_for_signing, parse_transaction, SighashParams, SIGHASH_ALL, SIGHASH_FORKID,
-};
+use bsv_rs::primitives::bsv::sighash::{compute_sighash_for_signing, parse_transaction, SighashParams, SIGHASH_ALL, SIGHASH_FORKID};
 use overlay_discovery::hopparty::hopparty_identity_challenge;
 use overlay_discovery::hopparty::validity::expected_hop_lock_hex;
 use overlay_discovery::potparty::validity::{canonical_der, verify_identity_sig};
@@ -104,10 +102,7 @@ pub struct HopsweepRecord {
 /// A filing's key: identity ‖ game ‖ hop txid ‖ vout ‖ the sweep bytes (there is no signature to exclude).
 pub fn hopsweep_content_key(m: &HopsweepMarker) -> String {
     let vout = m.hop_vout.to_le_bytes();
-    crate::record_post::content_key(
-        HOPSWEEP_TAG,
-        &[&m.identity, &m.game_id, &m.hop_txid, &vout, &m.sweep_raw],
-    )
+    crate::record_post::content_key(HOPSWEEP_TAG, &[&m.identity, &m.game_id, &m.hop_txid, &vout, &m.sweep_raw])
 }
 
 /// The txid of the sweep raw (display order, lowercase), or `None` when the raw does not parse.
@@ -140,11 +135,7 @@ pub fn sweep_spends_hop(raw: &[u8], hop_txid: &[u8; 32], hop_vout: u32) -> bool 
         return false;
     };
     let want = hex::encode(hop_txid);
-    input
-        .source_txid
-        .as_deref()
-        .is_some_and(|t| t.eq_ignore_ascii_case(&want))
-        && input.source_output_index == hop_vout
+    input.source_txid.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(&want)) && input.source_output_index == hop_vout
 }
 
 /// The hop as the index holds it — ONE `hopparty_records` row for (the hop outpoint, the poster), read by the route
@@ -185,10 +176,7 @@ const SIGHASH_ALL_FORKID_BYTE: u8 = (SIGHASH_ALL | SIGHASH_FORKID) as u8;
 
 /// THE BAR (module docs): the poster's verified hop marker, the raw spending it, the seat's signature over the
 /// hop's own lock and value. Pure over its inputs; the route reads the hop row.
-pub fn bind_hop_sweep(
-    m: &HopsweepMarker,
-    hop: Option<&HopContext>,
-) -> std::result::Result<(), SweepRefusal> {
+pub fn bind_hop_sweep(m: &HopsweepMarker, hop: Option<&HopContext>) -> std::result::Result<(), SweepRefusal> {
     let Some(hop) = hop else {
         return Err(SweepRefusal::HopNotIndexed);
     };
@@ -205,14 +193,7 @@ pub fn bind_hop_sweep(
         return Err(SweepRefusal::HopMarkerUnverified);
     };
     if hop.marker_valid != Some(true) {
-        let Some(challenge) = hopparty_identity_challenge(
-            &m.identity,
-            &opponent,
-            &m.game_id,
-            hop.hop_vout,
-            hop.hop_sats,
-            &seat_pub,
-        ) else {
+        let Some(challenge) = hopparty_identity_challenge(&m.identity, &opponent, &m.game_id, hop.hop_vout, hop.hop_sats, &seat_pub) else {
             return Err(SweepRefusal::HopMarkerUnverified);
         };
         if !verify_identity_sig(&m.identity, &m.game_id, &challenge, &identity_sig) {
@@ -227,11 +208,7 @@ pub fn bind_hop_sweep(
     let Some(expected_lock) = expected_hop_lock_hex(&seat_pub) else {
         return Err(SweepRefusal::SweepNotTheSeatsSpend);
     };
-    if hop
-        .hop_lock_hex
-        .as_deref()
-        .is_some_and(|l| !l.eq_ignore_ascii_case(&expected_lock))
-    {
+    if hop.hop_lock_hex.as_deref().is_some_and(|l| !l.eq_ignore_ascii_case(&expected_lock)) {
         return Err(SweepRefusal::SweepNotTheSeatsSpend); // the container's lock is not a P2PKH of the marker's key
     }
     let Ok(lock) = hex::decode(&expected_lock) else {
@@ -312,10 +289,8 @@ pub fn sweep_output_sats(raw_hex: &str) -> Option<u64> {
 
 /// The table (overlay migration 158; the app layer issues the same statement as a catch-up).
 pub const HOPSWEEP_CREATE: &str = "CREATE TABLE IF NOT EXISTS hopsweep_records (identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, sweepTxid TEXT NOT NULL, sweepRawHex TEXT NOT NULL, txid TEXT NOT NULL, outputIndex INTEGER NOT NULL, createdAt INTEGER, PRIMARY KEY (txid, outputIndex))";
-pub const HOPSWEEP_IDX_IDENTITY: &str =
-    "CREATE INDEX IF NOT EXISTS idx_hopsweep_identity ON hopsweep_records(identity)";
-pub const HOPSWEEP_IDX_HOP: &str =
-    "CREATE INDEX IF NOT EXISTS idx_hopsweep_hop ON hopsweep_records(hopTxid, hopVout)";
+pub const HOPSWEEP_IDX_IDENTITY: &str = "CREATE INDEX IF NOT EXISTS idx_hopsweep_identity ON hopsweep_records(identity)";
+pub const HOPSWEEP_IDX_HOP: &str = "CREATE INDEX IF NOT EXISTS idx_hopsweep_hop ON hopsweep_records(hopTxid, hopVout)";
 
 pub const HOPSWEEP_FILE_SQL: &str = "INSERT OR IGNORE INTO hopsweep_records \
      (identity, gameId, hopTxid, hopVout, sweepTxid, sweepRawHex, txid, outputIndex, createdAt) \
@@ -335,8 +310,7 @@ pub const HOP_CONTEXT_SQL: &str = "SELECT identity, opponentIdentity, gameId, ho
      FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2 AND identity = ?3 \
      ORDER BY COALESCE(markerValid, 0) DESC, createdAt ASC, rowid ASC LIMIT 1";
 /// Every filed sweep of an identity, newest first (the owed recompute keeps the newest per hop outpoint).
-pub const HOPSWEEPS_FOR_IDENTITY_SQL: &str =
-    "SELECT hopTxid, hopVout, sweepTxid, sweepRawHex FROM hopsweep_records \
+pub const HOPSWEEPS_FOR_IDENTITY_SQL: &str = "SELECT hopTxid, hopVout, sweepTxid, sweepRawHex FROM hopsweep_records \
      WHERE identity = ?1 ORDER BY createdAt DESC, rowid DESC LIMIT 500";
 
 /// bsv-low #517: the filed sweeps the index holds PROVEN, one chunk of txids per ask (the caller closes the `IN (`
@@ -348,10 +322,7 @@ pub const SWEEP_PROOFS_SQL_HEAD: &str =
 /// PURE: the proof read for `n` sweep txids (`?1..?n`), prepared against the shipped schema at representative arities
 /// in `tests/sql_prepares_sqlite.rs` (the crate's #323 rule: a `contains` pin is never the only thing behind a query).
 pub fn sweep_proofs_sql(n: usize) -> String {
-    let placeholders = (1..=n)
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let placeholders = (1..=n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
     format!("{SWEEP_PROOFS_SQL_HEAD}{placeholders})")
 }
 
@@ -378,21 +349,13 @@ mod tests {
         PrivateKey::from_bytes(&b).expect("nonzero scalar")
     }
     fn wallet(seed: u8) -> ProtoWallet {
-        ProtoWallet::new(Some(
-            PrivateKey::from_hex(&hex::encode([seed; 32])).unwrap(),
-        ))
+        ProtoWallet::new(Some(PrivateKey::from_hex(&hex::encode([seed; 32])).unwrap()))
     }
     fn identity(w: &ProtoWallet) -> Vec<u8> {
         hex::decode(
-            w.get_public_key(GetPublicKeyArgs {
-                identity_key: true,
-                protocol_id: None,
-                key_id: None,
-                counterparty: None,
-                for_self: None,
-            })
-            .unwrap()
-            .public_key,
+            w.get_public_key(GetPublicKeyArgs { identity_key: true, protocol_id: None, key_id: None, counterparty: None, for_self: None })
+                .unwrap()
+                .public_key,
         )
         .unwrap()
     }
@@ -420,13 +383,7 @@ mod tests {
     const HOP: [u8; 32] = [0x51; 32];
     const HOP_SATS: u64 = 20_190;
     /// A 1-in/1-out raw: input `prev:vout` with `unlock`, one output of `out_sats` to `out_lock`.
-    fn raw_1in_1out(
-        prev: &[u8; 32],
-        vout: u32,
-        unlock: &[u8],
-        out_sats: u64,
-        out_lock: &[u8],
-    ) -> Vec<u8> {
+    fn raw_1in_1out(prev: &[u8; 32], vout: u32, unlock: &[u8], out_sats: u64, out_lock: &[u8]) -> Vec<u8> {
         let mut raw = Vec::new();
         raw.extend_from_slice(&1i32.to_le_bytes());
         raw.push(1);
@@ -448,13 +405,7 @@ mod tests {
     }
     /// The seat's sweep of `HOP:vout` (value `sats`, lock = P2PKH(seat)) to `dest`, signed by `signer` (the honest
     /// case: `signer` == the seat key).
-    fn sweep_raw(
-        seat: &PrivateKey,
-        signer: &PrivateKey,
-        vout: u32,
-        sats: u64,
-        dest: &[u8],
-    ) -> Vec<u8> {
+    fn sweep_raw(seat: &PrivateKey, signer: &PrivateKey, vout: u32, sats: u64, dest: &[u8]) -> Vec<u8> {
         let seat_pub = seat.public_key().to_compressed();
         let lock = hex::decode(expected_hop_lock_hex(&seat_pub).unwrap()).unwrap();
         let skeleton = raw_1in_1out(&HOP, vout, &[], sats - 190, dest);
@@ -477,29 +428,19 @@ mod tests {
         raw_1in_1out(&HOP, vout, &unlock, sats - 190, dest)
     }
     fn marker(id: &[u8], raw: &[u8]) -> HopsweepMarker {
-        HopsweepMarker {
-            identity: id.to_vec(),
-            game_id: GID,
-            hop_txid: HOP,
-            hop_vout: 0,
-            sweep_raw: raw.to_vec(),
-        }
+        HopsweepMarker { identity: id.to_vec(), game_id: GID, hop_txid: HOP, hop_vout: 0, sweep_raw: raw.to_vec() }
     }
     /// The hop's admitted marker for the wallet: a REAL identity signature over the hopparty challenge.
     fn hop_ctx(w: &ProtoWallet, seat: &PrivateKey, on_chain: bool) -> HopContext {
         let id = identity(w);
         let opp = vec![0x03; 33];
         let seat_pub = seat.public_key().to_compressed();
-        let challenge =
-            hopparty_identity_challenge(&id, &opp, &GID, 0, HOP_SATS, &seat_pub).unwrap();
+        let challenge = hopparty_identity_challenge(&id, &opp, &GID, 0, HOP_SATS, &seat_pub).unwrap();
         let sig = w
             .create_signature(CreateSignatureArgs {
                 data: Some(challenge),
                 hash_to_directly_sign: None,
-                protocol_id: bsv_rs::wallet::Protocol::new(
-                    bsv_rs::wallet::SecurityLevel::App,
-                    "low potparty",
-                ),
+                protocol_id: bsv_rs::wallet::Protocol::new(bsv_rs::wallet::SecurityLevel::App, "low potparty"),
                 key_id: hex::encode(GID),
                 counterparty: Some(Counterparty::Anyone),
             })
@@ -513,19 +454,12 @@ mod tests {
             hop_sats: HOP_SATS,
             seat_settle_pubkey: hex::encode(seat_pub.as_slice()),
             identity_sig_hex: hex::encode(sig),
-            hop_lock_hex: if on_chain {
-                expected_hop_lock_hex(&seat_pub)
-            } else {
-                None
-            },
+            hop_lock_hex: if on_chain { expected_hop_lock_hex(&seat_pub) } else { None },
             hop_sats_on_chain: if on_chain { Some(HOP_SATS) } else { None },
             marker_valid: None,
         }
     }
-    const DEST: [u8; 25] = [
-        0x76, 0xa9, 0x14, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
-        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x88, 0xac,
-    ];
+    const DEST: [u8; 25] = [0x76, 0xa9, 0x14, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x88, 0xac];
 
     #[test]
     fn the_marker_parses_from_its_six_canonical_pushes_and_nothing_else() {
@@ -534,75 +468,17 @@ mod tests {
         let raw = vec![0x01u8; 200];
         let s = script(&[HOPSWEEP_TAG, &id, &GID, &HOP, &7u32.to_le_bytes(), &raw]);
         let m = parse_hopsweep_marker(&s).expect("parses");
-        assert_eq!(
-            (
-                m.identity.as_slice(),
-                m.game_id,
-                m.hop_txid,
-                m.hop_vout,
-                m.sweep_raw.as_slice()
-            ),
-            (id.as_slice(), GID, HOP, 7, raw.as_slice())
-        );
+        assert_eq!((m.identity.as_slice(), m.game_id, m.hop_txid, m.hop_vout, m.sweep_raw.as_slice()), (id.as_slice(), GID, HOP, 7, raw.as_slice()));
         // a PUSHDATA2 raw (past 255 bytes) rides the same grammar
         let big = vec![0x02u8; 300];
-        assert!(parse_hopsweep_marker(&script(&[
-            HOPSWEEP_TAG,
-            &id,
-            &GID,
-            &HOP,
-            &0u32.to_le_bytes(),
-            &big
-        ]))
-        .is_some());
+        assert!(parse_hopsweep_marker(&script(&[HOPSWEEP_TAG, &id, &GID, &HOP, &0u32.to_le_bytes(), &big])).is_some());
         // wrong tag, a fifth or seventh push, a short identity, a 31-byte game id, an empty raw: not a marker
-        assert!(parse_hopsweep_marker(&script(&[
-            b"LOW/potrefund/v1",
-            &id,
-            &GID,
-            &HOP,
-            &0u32.to_le_bytes(),
-            &raw
-        ]))
-        .is_none());
+        assert!(parse_hopsweep_marker(&script(&[b"LOW/potrefund/v1", &id, &GID, &HOP, &0u32.to_le_bytes(), &raw])).is_none());
         assert!(parse_hopsweep_marker(&script(&[HOPSWEEP_TAG, &id, &GID, &HOP, &raw])).is_none());
-        assert!(parse_hopsweep_marker(&script(&[
-            HOPSWEEP_TAG,
-            &id,
-            &GID,
-            &HOP,
-            &0u32.to_le_bytes(),
-            &raw,
-            &[1u8]
-        ]))
-        .is_none());
-        assert!(parse_hopsweep_marker(&script(&[
-            HOPSWEEP_TAG,
-            &id[..32],
-            &GID,
-            &HOP,
-            &0u32.to_le_bytes(),
-            &raw
-        ]))
-        .is_none());
-        assert!(parse_hopsweep_marker(&script(&[
-            HOPSWEEP_TAG,
-            &id,
-            &GID[..31],
-            &HOP,
-            &0u32.to_le_bytes(),
-            &raw
-        ]))
-        .is_none());
-        assert!(parse_hopsweep_marker(&script(&[
-            HOPSWEEP_TAG,
-            &id,
-            &GID,
-            &HOP,
-            &0u32.to_le_bytes(),
-            &[]
-        ]))
-        .is_none());
+        assert!(parse_hopsweep_marker(&script(&[HOPSWEEP_TAG, &id, &GID, &HOP, &0u32.to_le_bytes(), &raw, &[1u8]])).is_none());
+        assert!(parse_hopsweep_marker(&script(&[HOPSWEEP_TAG, &id[..32], &GID, &HOP, &0u32.to_le_bytes(), &raw])).is_none());
+        assert!(parse_hopsweep_marker(&script(&[HOPSWEEP_TAG, &id, &GID[..31], &HOP, &0u32.to_le_bytes(), &raw])).is_none());
+        assert!(parse_hopsweep_marker(&script(&[HOPSWEEP_TAG, &id, &GID, &HOP, &0u32.to_le_bytes(), &[]])).is_none());
         // a non-canonical spelling (a PUSHDATA1 of a short push) is refused at the door
         let mut nc = vec![0x00, 0x6a, 0x4c, 15];
         nc.extend_from_slice(HOPSWEEP_TAG);
@@ -618,15 +494,8 @@ mod tests {
         assert!(k.starts_with("filed:"));
         assert_eq!(k.len(), 62);
         assert_eq!(hopsweep_content_key(&m.clone()), k);
-        assert_ne!(
-            hopsweep_content_key(&marker(&id, &[0x02; 100])),
-            k,
-            "another sweep, another row"
-        );
-        let other = HopsweepMarker {
-            hop_vout: 1,
-            ..m.clone()
-        };
+        assert_ne!(hopsweep_content_key(&marker(&id, &[0x02; 100])), k, "another sweep, another row");
+        let other = HopsweepMarker { hop_vout: 1, ..m.clone() };
         assert_ne!(hopsweep_content_key(&other), k);
     }
 
@@ -640,43 +509,22 @@ mod tests {
         assert_eq!(bind_hop_sweep(&marker(&id, &honest), Some(&ctx)), Ok(()));
         // the record: the txid is the raw's own
         let r = record_of(&marker(&id, &honest)).unwrap();
-        assert_eq!(
-            r.sweep_txid,
-            bsv_rs::transaction::Transaction::from_binary(&honest)
-                .unwrap()
-                .id()
-                .to_ascii_lowercase()
-        );
+        assert_eq!(r.sweep_txid, bsv_rs::transaction::Transaction::from_binary(&honest).unwrap().id().to_ascii_lowercase());
         assert_eq!(r.hop_txid, hex::encode(HOP));
         assert_eq!(sweep_output_sats(&r.sweep_raw_hex), Some(HOP_SATS - 190));
         // a stranger's signature under the seat's pubkey push
         let forged = sweep_raw(&seat, &skey(8), 0, HOP_SATS, &DEST);
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &forged), Some(&ctx)),
-            Err(SweepRefusal::SweepNotTheSeatsSpend)
-        );
+        assert_eq!(bind_hop_sweep(&marker(&id, &forged), Some(&ctx)), Err(SweepRefusal::SweepNotTheSeatsSpend));
         // signed over another value than the hop's (the digest differs)
         let wrong_value = sweep_raw(&seat, &seat, 0, HOP_SATS + 1, &DEST);
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &wrong_value), Some(&ctx)),
-            Err(SweepRefusal::SweepNotTheSeatsSpend)
-        );
+        assert_eq!(bind_hop_sweep(&marker(&id, &wrong_value), Some(&ctx)), Err(SweepRefusal::SweepNotTheSeatsSpend));
         // a raw that spends another output of the hop
         let other_vout = sweep_raw(&seat, &seat, 1, HOP_SATS, &DEST);
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &other_vout), Some(&ctx)),
-            Err(SweepRefusal::SweepDoesNotSpendTheHop)
-        );
+        assert_eq!(bind_hop_sweep(&marker(&id, &other_vout), Some(&ctx)), Err(SweepRefusal::SweepDoesNotSpendTheHop));
         // garbage bytes
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &[0xaa; 40]), Some(&ctx)),
-            Err(SweepRefusal::SweepDoesNotSpendTheHop)
-        );
+        assert_eq!(bind_hop_sweep(&marker(&id, &[0xaa; 40]), Some(&ctx)), Err(SweepRefusal::SweepDoesNotSpendTheHop));
         // no hop row: 425, the client re-files
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &honest), None),
-            Err(SweepRefusal::HopNotIndexed)
-        );
+        assert_eq!(bind_hop_sweep(&marker(&id, &honest), None), Err(SweepRefusal::HopNotIndexed));
     }
 
     #[test]
@@ -686,71 +534,37 @@ mod tests {
         let seat = skey(9);
         let honest = sweep_raw(&seat, &seat, 0, HOP_SATS, &DEST);
         // the replay (no latch yet), with and without the container's decoded facts
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &honest), Some(&hop_ctx(&w, &seat, true))),
-            Ok(())
-        );
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &honest), Some(&hop_ctx(&w, &seat, false))),
-            Ok(())
-        );
+        assert_eq!(bind_hop_sweep(&marker(&id, &honest), Some(&hop_ctx(&w, &seat, true))), Ok(()));
+        assert_eq!(bind_hop_sweep(&marker(&id, &honest), Some(&hop_ctx(&w, &seat, false))), Ok(()));
         // a garbled identity signature and no latch: unverified (425)
         let mut garbled = hop_ctx(&w, &seat, true);
         garbled.identity_sig_hex = "30".repeat(35);
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &honest), Some(&garbled)),
-            Err(SweepRefusal::HopMarkerUnverified)
-        );
+        assert_eq!(bind_hop_sweep(&marker(&id, &honest), Some(&garbled)), Err(SweepRefusal::HopMarkerUnverified));
         // the overlay's latched verdict stands in for the replay
         garbled.marker_valid = Some(true);
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &honest), Some(&garbled)),
-            Ok(())
-        );
+        assert_eq!(bind_hop_sweep(&marker(&id, &honest), Some(&garbled)), Ok(()));
         // a row naming another identity (the query would not return it; the bind still refuses)
         let mut other = hop_ctx(&w, &seat, true);
         other.identity = hex::encode(identity(&wallet(0x25)));
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &honest), Some(&other)),
-            Err(SweepRefusal::HopNotIndexed)
-        );
+        assert_eq!(bind_hop_sweep(&marker(&id, &honest), Some(&other)), Err(SweepRefusal::HopNotIndexed));
         // the container's lock is not a P2PKH of the marker's key: nothing this key can sweep
         let mut foreign_lock = hop_ctx(&w, &seat, true);
         foreign_lock.hop_lock_hex = expected_hop_lock_hex(&skey(10).public_key().to_compressed());
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &honest), Some(&foreign_lock)),
-            Err(SweepRefusal::SweepNotTheSeatsSpend)
-        );
+        assert_eq!(bind_hop_sweep(&marker(&id, &honest), Some(&foreign_lock)), Err(SweepRefusal::SweepNotTheSeatsSpend));
         // a sweep whose pubkey push is another key (even with a valid signature under it) is not the seat's spend
         let other_seat = skey(11);
         let theirs = sweep_raw(&other_seat, &other_seat, 0, HOP_SATS, &DEST);
-        assert_eq!(
-            bind_hop_sweep(&marker(&id, &theirs), Some(&hop_ctx(&w, &seat, true))),
-            Err(SweepRefusal::SweepNotTheSeatsSpend)
-        );
+        assert_eq!(bind_hop_sweep(&marker(&id, &theirs), Some(&hop_ctx(&w, &seat, true))), Err(SweepRefusal::SweepNotTheSeatsSpend));
     }
 
     #[test]
     fn the_sql_names_the_tables_columns() {
-        for sql in [
-            HOPSWEEP_FILE_SQL,
-            HOPSWEEP_FILED_ROWS_SQL,
-            HOPSWEEP_FILED_TODAY_SQL,
-            HOPSWEEP_CHAIN_ROWS_SQL,
-            HOPSWEEPS_FOR_IDENTITY_SQL,
-        ] {
+        for sql in [HOPSWEEP_FILE_SQL, HOPSWEEP_FILED_ROWS_SQL, HOPSWEEP_FILED_TODAY_SQL, HOPSWEEP_CHAIN_ROWS_SQL, HOPSWEEPS_FOR_IDENTITY_SQL] {
             assert!(sql.contains("hopsweep_records"));
         }
-        assert!(
-            HOP_CONTEXT_SQL.contains("FROM hopparty_records")
-                && HOP_CONTEXT_SQL.contains("markerValid")
-        );
+        assert!(HOP_CONTEXT_SQL.contains("FROM hopparty_records") && HOP_CONTEXT_SQL.contains("markerValid"));
         // #517: the proof read names the engine's own latch, never the admit path's bytes
-        assert!(
-            SWEEP_PROOFS_SQL_HEAD.contains("FROM transactions")
-                && SWEEP_PROOFS_SQL_HEAD.contains("has_proof = 1")
-                && SWEEP_PROOFS_SQL_HEAD.ends_with("IN (")
-        );
+        assert!(SWEEP_PROOFS_SQL_HEAD.contains("FROM transactions") && SWEEP_PROOFS_SQL_HEAD.contains("has_proof = 1") && SWEEP_PROOFS_SQL_HEAD.ends_with("IN ("));
         assert_eq!(sweep_proofs_sql(3).matches('?').count(), 3);
         assert!(sweep_proofs_sql(1).ends_with("IN (?1)"));
     }
@@ -758,29 +572,11 @@ mod tests {
     /// #517, the gate's LOW-2: the newest filing rides the row unless an older filing of the hop is the proven one.
     #[test]
     fn the_proven_filing_rides_the_row_even_when_an_older_one_mined() {
-        let f = |txid: &str, proven: bool| FiledHopSweep {
-            sweep_txid: txid.to_string(),
-            raw_hex: "0100".repeat(20),
-            pays_sats: Some(20_000),
-            index_proven: proven,
-            index_proof_height: proven.then_some(967_696),
-        };
+        let f = |txid: &str, proven: bool| FiledHopSweep { sweep_txid: txid.to_string(), raw_hex: "0100".repeat(20), pays_sats: Some(20_000), index_proven: proven, index_proof_height: proven.then_some(967_696) };
         assert_eq!(pick_filed_sweep(f("aa", false), vec![]).sweep_txid, "aa");
-        assert_eq!(
-            pick_filed_sweep(f("aa", true), vec![f("bb", true)]).sweep_txid,
-            "aa",
-            "the newest proven filing wins"
-        );
-        assert_eq!(
-            pick_filed_sweep(f("aa", false), vec![f("bb", false), f("cc", true)]).sweep_txid,
-            "cc",
-            "the older PROVEN filing is the hop's spender"
-        );
-        assert_eq!(
-            pick_filed_sweep(f("aa", false), vec![f("bb", false)]).sweep_txid,
-            "aa",
-            "nothing proven: the newest, as before"
-        );
+        assert_eq!(pick_filed_sweep(f("aa", true), vec![f("bb", true)]).sweep_txid, "aa", "the newest proven filing wins");
+        assert_eq!(pick_filed_sweep(f("aa", false), vec![f("bb", false), f("cc", true)]).sweep_txid, "cc", "the older PROVEN filing is the hop's spender");
+        assert_eq!(pick_filed_sweep(f("aa", false), vec![f("bb", false)]).sweep_txid, "aa", "nothing proven: the newest, as before");
         assert_eq!(HOPSWEEP_FILE_SQL.matches('?').count(), 9);
         assert!(HOPSWEEP_CREATE.contains("PRIMARY KEY (txid, outputIndex)"));
     }

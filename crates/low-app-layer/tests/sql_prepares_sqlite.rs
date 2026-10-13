@@ -31,10 +31,10 @@ use low_app_layer::logic::{
 };
 use low_app_layer::record_post::{
     lb_row_file_sql, COLLECTED_CHAIN_ROWS_SQL, COLLECTED_FILED_ROWS_SQL, COLLECTED_FILED_TODAY_SQL,
-    COLLECTED_FILE_SQL, HELD_FILED_ROWS_SQL, POTPARTY_CHAIN_ROWS_SQL, POTPARTY_FILED_ROWS_SQL,
-    POTPARTY_FILED_TODAY_SQL, POTPARTY_FILE_SQL, POTREFUND_CHAIN_ROWS_SQL,
-    POTREFUND_FILED_ROWS_SQL, POTREFUND_FILED_TODAY_SQL, POTREFUND_FILE_SQL, POTREFUND_LATCH_SQL,
-    RESULT_CHAIN_ROWS_SQL, RESULT_FILED_ROWS_SQL, RESULT_FILED_TODAY_SQL, RESULT_FILE_SQL,
+    COLLECTED_FILE_SQL, HELD_FILED_ROWS_SQL, POTPARTY_CHAIN_ROWS_SQL, POTPARTY_FILED_ROWS_SQL, POTPARTY_FILED_TODAY_SQL,
+    POTPARTY_FILE_SQL, POTREFUND_CHAIN_ROWS_SQL, POTREFUND_FILED_ROWS_SQL,
+    POTREFUND_FILED_TODAY_SQL, POTREFUND_FILE_SQL, POTREFUND_LATCH_SQL, RESULT_CHAIN_ROWS_SQL,
+    RESULT_FILED_ROWS_SQL, RESULT_FILED_TODAY_SQL, RESULT_FILE_SQL,
 };
 use low_app_layer::refund_backups::refund_backups_sql;
 use low_app_layer::refund_view::refund_view_sql;
@@ -106,92 +106,24 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "RESULT_FILE_SQL", RESULT_FILE_SQL);
     assert_prepares(&conn, "COLLECTED_FILE_SQL", COLLECTED_FILE_SQL);
     // bsv-low #469: the owed list's statements (the gate's MEDIUM-12)
-    assert_prepares(
-        &conn,
-        "OWED_ROWS_DELETE_SQL",
-        low_app_layer::owed::OWED_ROWS_DELETE_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "OWED_ROW_INSERT_SQL",
-        low_app_layer::owed::OWED_ROW_INSERT_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "OWED_STATE_UPSERT_SQL",
-        low_app_layer::owed::OWED_STATE_UPSERT_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "OWED_STATE_READ_SQL",
-        low_app_layer::owed::OWED_STATE_READ_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "OWED_STATE_STAMP_SQL",
-        low_app_layer::owed::OWED_STATE_STAMP_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "OWED_DOOR_REFUSALS_SQL",
-        low_app_layer::owed::OWED_DOOR_REFUSALS_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "OWED_ROWS_READ_SQL",
-        low_app_layer::owed::OWED_ROWS_READ_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "OWED_STALE_ON_TIP_SQL",
-        low_app_layer::owed::OWED_STALE_ON_TIP_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "OWED_STALE_FOR_POT_SQL",
-        low_app_layer::owed::OWED_STALE_FOR_POT_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "OWED_STALE_FOR_IDENTITY_SQL",
-        low_app_layer::owed::OWED_STALE_FOR_IDENTITY_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "OWED_IDENTITY_PROBE_SQL",
-        low_app_layer::owed::OWED_IDENTITY_PROBE_SQL,
-    );
+    assert_prepares(&conn, "OWED_ROWS_DELETE_SQL", low_app_layer::owed::OWED_ROWS_DELETE_SQL);
+    assert_prepares(&conn, "OWED_ROW_INSERT_SQL", low_app_layer::owed::OWED_ROW_INSERT_SQL);
+    assert_prepares(&conn, "OWED_STATE_UPSERT_SQL", low_app_layer::owed::OWED_STATE_UPSERT_SQL);
+    assert_prepares(&conn, "OWED_STATE_READ_SQL", low_app_layer::owed::OWED_STATE_READ_SQL);
+    assert_prepares(&conn, "OWED_STATE_STAMP_SQL", low_app_layer::owed::OWED_STATE_STAMP_SQL);
+    assert_prepares(&conn, "OWED_DOOR_REFUSALS_SQL", low_app_layer::owed::OWED_DOOR_REFUSALS_SQL);
+    assert_prepares(&conn, "OWED_ROWS_READ_SQL", low_app_layer::owed::OWED_ROWS_READ_SQL);
+    assert_prepares(&conn, "OWED_STALE_ON_TIP_SQL", low_app_layer::owed::OWED_STALE_ON_TIP_SQL);
+    assert_prepares(&conn, "OWED_STALE_FOR_POT_SQL", low_app_layer::owed::OWED_STALE_FOR_POT_SQL);
+    assert_prepares(&conn, "OWED_STALE_FOR_IDENTITY_SQL", low_app_layer::owed::OWED_STALE_FOR_IDENTITY_SQL);
+    assert_prepares(&conn, "OWED_IDENTITY_PROBE_SQL", low_app_layer::owed::OWED_IDENTITY_PROBE_SQL);
     // bsv-low #469 decision 3: the filed hop sweeps (migrations 158 to 160)
-    assert_prepares(
-        &conn,
-        "HOPSWEEP_FILE_SQL",
-        low_app_layer::hopsweep::HOPSWEEP_FILE_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "HOPSWEEP_FILED_ROWS_SQL",
-        low_app_layer::hopsweep::HOPSWEEP_FILED_ROWS_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "HOPSWEEP_FILED_TODAY_SQL",
-        low_app_layer::hopsweep::HOPSWEEP_FILED_TODAY_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "HOPSWEEP_CHAIN_ROWS_SQL",
-        low_app_layer::hopsweep::HOPSWEEP_CHAIN_ROWS_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "HOP_CONTEXT_SQL",
-        low_app_layer::hopsweep::HOP_CONTEXT_SQL,
-    );
-    assert_prepares(
-        &conn,
-        "HOPSWEEPS_FOR_IDENTITY_SQL",
-        low_app_layer::hopsweep::HOPSWEEPS_FOR_IDENTITY_SQL,
-    );
+    assert_prepares(&conn, "HOPSWEEP_FILE_SQL", low_app_layer::hopsweep::HOPSWEEP_FILE_SQL);
+    assert_prepares(&conn, "HOPSWEEP_FILED_ROWS_SQL", low_app_layer::hopsweep::HOPSWEEP_FILED_ROWS_SQL);
+    assert_prepares(&conn, "HOPSWEEP_FILED_TODAY_SQL", low_app_layer::hopsweep::HOPSWEEP_FILED_TODAY_SQL);
+    assert_prepares(&conn, "HOPSWEEP_CHAIN_ROWS_SQL", low_app_layer::hopsweep::HOPSWEEP_CHAIN_ROWS_SQL);
+    assert_prepares(&conn, "HOP_CONTEXT_SQL", low_app_layer::hopsweep::HOP_CONTEXT_SQL);
+    assert_prepares(&conn, "HOPSWEEPS_FOR_IDENTITY_SQL", low_app_layer::hopsweep::HOPSWEEPS_FOR_IDENTITY_SQL);
     assert_prepares(&conn, "lb_row_file_sql", lb_row_file_sql());
     // The filing caps (bsv-low M18-2 B, the gate's HIGH-2/MED-4): FILED rows
     // per (poster, family, game, pot) and per (poster, family, day).
@@ -200,11 +132,7 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "RESULT_FILED_ROWS_SQL", RESULT_FILED_ROWS_SQL);
     assert_prepares(&conn, "COLLECTED_FILED_ROWS_SQL", COLLECTED_FILED_ROWS_SQL);
     assert_prepares(&conn, "HELD_FILED_ROWS_SQL", HELD_FILED_ROWS_SQL);
-    assert_prepares(
-        &conn,
-        "collected_rows_sql",
-        &low_app_layer::owed::collected_rows_sql("?, ?"),
-    );
+    assert_prepares(&conn, "collected_rows_sql", &low_app_layer::owed::collected_rows_sql("?, ?"));
     assert_prepares(&conn, "POTPARTY_FILED_TODAY_SQL", POTPARTY_FILED_TODAY_SQL);
     assert_prepares(
         &conn,
@@ -319,11 +247,7 @@ fn every_batched_query_prepares_at_representative_arities() {
         );
         assert_prepares(&conn, &format!("claims_sql({n})"), &claims_sql(n));
         // bsv-low #517: the filed sweeps' index-proof read (transactions.has_proof + proofHeight)
-        assert_prepares(
-            &conn,
-            &format!("sweep_proofs_sql({n})"),
-            &low_app_layer::hopsweep::sweep_proofs_sql(n),
-        );
+        assert_prepares(&conn, &format!("sweep_proofs_sql({n})"), &low_app_layer::hopsweep::sweep_proofs_sql(n));
         // bsv-low P4 slice 2: the /results page overlay (settleSigners + the
         // money facts) and the hop seat/money fetch, against the schema that
         // now carries sizeBytes/feeSats/fundingSizeBytes/… columns.

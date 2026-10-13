@@ -3120,7 +3120,9 @@ pub fn replay_proof_row(
     Some(ProofHandsFact {
         game_id: game_id_hex.to_ascii_lowercase(),
         winner: winner_hex.to_ascii_lowercase(),
-        winner_cards_hex: low_proof_replay::ProvedHands::cards_hex(&proved.winner_cards),
+        winner_cards_hex: low_proof_replay::ProvedHands::cards_hex(
+            &proved.winner_cards,
+        ),
         loser_cards_hex: proved
             .loser_cards
             .map(|c| low_proof_replay::ProvedHands::cards_hex(&c)),
@@ -5813,10 +5815,10 @@ mod tests {
             // of this key keeps its own path untouched.
             "markerHands",
             "money",
-            // bsv-low #469: my seat and my stake, as the binding proved them.
-            "mySeat",
-            "stakeSats",
-        ];
+        // bsv-low #469: my seat and my stake, as the binding proved them.
+        "mySeat",
+        "stakeSats",
+    ];
         let me = ident(0xaa);
         let e = ResultEntry {
             settle_signers: None,
@@ -6854,33 +6856,13 @@ mod courier_ladder_2026_09_04 {
     /// bsv-low #451 slice B: pruned Bitails is never asked before WoC as a corroborator; the primary is never re-asked.
     #[test]
     fn unspent_corroborators_ask_the_healthy_pair_before_pruned_bitails() {
-        assert_eq!(
-            unspent_corroborator_order("woc"),
-            vec!["bananablocks", "bitails_tx"]
-        );
-        assert_eq!(
-            unspent_corroborator_order("bananablocks"),
-            vec!["woc", "bitails_tx"]
-        );
-        assert_eq!(
-            unspent_corroborator_order("bitails_tx"),
-            vec!["bananablocks", "woc"]
-        );
+        assert_eq!(unspent_corroborator_order("woc"), vec!["bananablocks", "bitails_tx"]);
+        assert_eq!(unspent_corroborator_order("bananablocks"), vec!["woc", "bitails_tx"]);
+        assert_eq!(unspent_corroborator_order("bitails_tx"), vec!["bananablocks", "woc"]);
         for primary in ["woc", "bananablocks", "bitails_tx"] {
             let order = unspent_corroborator_order(primary);
-            assert!(
-                !order.contains(&primary),
-                "the primary is never its own corroborator — judged {order:?}"
-            );
-            assert_eq!(
-                order.last().copied().unwrap_or(""),
-                if primary == "bitails_tx" {
-                    "woc"
-                } else {
-                    "bitails_tx"
-                },
-                "judged {order:?}"
-            );
+            assert!(!order.contains(&primary), "the primary is never its own corroborator — judged {order:?}");
+            assert_eq!(order.last().copied().unwrap_or(""), if primary == "bitails_tx" { "woc" } else { "bitails_tx" }, "judged {order:?}");
         }
     }
 
@@ -6891,29 +6873,12 @@ mod courier_ladder_2026_09_04 {
         let written = 1_000_000.0;
         let press = SPENT_ANY_CACHE_TTL_MS;
         let probe = SPENT_ANY_PROBE_MAX_AGE_MS;
-        assert!(
-            spent_any_cache_fresh(written, written + 14_000.0, press),
-            "14 s: fresh for the press"
-        );
-        assert!(
-            !spent_any_cache_fresh(written, written + 16_000.0, press),
-            "16 s: stale for the press"
-        );
-        assert!(
-            spent_any_cache_fresh(written, written + 16_000.0, probe),
-            "16 s: fresh for the probe"
-        );
-        assert!(
-            spent_any_cache_fresh(written, written + 4.0 * 60_000.0, probe),
-            "4 min: fresh for the probe"
-        );
-        assert!(
-            !spent_any_cache_fresh(written, written + 6.0 * 60_000.0, probe),
-            "6 min: stale for everyone"
-        );
-        assert!(
-            !spent_any_cache_fresh(written, written - 1.0, press),
-            "a row from the future is not fresh"
-        );
+        assert!(spent_any_cache_fresh(written, written + 14_000.0, press), "14 s: fresh for the press");
+        assert!(!spent_any_cache_fresh(written, written + 16_000.0, press), "16 s: stale for the press");
+        assert!(spent_any_cache_fresh(written, written + 16_000.0, probe), "16 s: fresh for the probe");
+        assert!(spent_any_cache_fresh(written, written + 4.0 * 60_000.0, probe), "4 min: fresh for the probe");
+        assert!(!spent_any_cache_fresh(written, written + 6.0 * 60_000.0, probe), "6 min: stale for everyone");
+        assert!(!spent_any_cache_fresh(written, written - 1.0, press), "a row from the future is not fresh");
     }
+
 }
