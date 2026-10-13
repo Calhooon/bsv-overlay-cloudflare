@@ -4962,7 +4962,9 @@ mod tests {
             src[gated..].contains("crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));"),
             "the /submit route's flush follows the gated latch"
         );
-        // And in admit_fast.rs: both jobs flush right after their latch.
+        // And in admit_fast.rs: both jobs flush right after their latch, through the WINDOWED flush, after the
+        // latch's counts and log (bsv-low #649: a flush the waitUntil window cancels takes nothing after it).
+        let flush = "crate::pot_changes::flush_inline_within(";
         let jobs = code_only(include_str!("admit_fast.rs"));
         let jobs = &jobs[..jobs.find("#[cfg(test)]").unwrap_or(jobs.len())];
         let mut from = 0;
@@ -4973,7 +4975,8 @@ mod tests {
             let fl = tail
                 .find(flush)
                 .expect("a job latch is followed by a flush");
-            assert!(fl < 400, "the flush sits right after the latch (at {fl})");
+            assert!(fl < 900, "the flush sits right after the latch and its counts (at {fl})");
+            assert!(tail[..fl].contains("bump_counter("), "the latch is counted BEFORE its flush (bsv-low #649)");
             n += 1;
             from = at + needle.len();
         }
