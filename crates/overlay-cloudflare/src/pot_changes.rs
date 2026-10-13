@@ -33,6 +33,22 @@ pub fn drain() -> Vec<(String, u32)> {
     CHANGES.with(|c| std::mem::take(&mut *c.borrow_mut()).into_iter().collect())
 }
 
+/// bsv-low #649 M1: a COPY of every noted outpoint, the set left as it is (the skip parks the copy first and
+/// [`forget`]s only what its park landed, so a cancelled park leaves the notes here).
+pub fn snapshot() -> Vec<(String, u32)> {
+    CHANGES.with(|c| c.borrow().iter().cloned().collect())
+}
+
+/// bsv-low #649 M1: take `parked` out of the set (entries noted since the snapshot stay).
+pub fn forget(parked: &[(String, u32)]) {
+    CHANGES.with(|c| {
+        let mut set = c.borrow_mut();
+        for p in parked {
+            set.remove(p);
+        }
+    });
+}
+
 /// The webhook body: `{"outpoints":[{"txid","vout"},…]}`.
 pub fn body_json(outpoints: &[(String, u32)]) -> String {
     let arr: Vec<serde_json::Value> = outpoints

@@ -77,56 +77,51 @@ pub fn parse_pot_item(item: &str) -> Option<(String, u32)> {
 
 /// The skip's world (bsv-low #649 M1): a port so the pins run the shipped [`park_withheld`] over a recorded fake.
 pub(crate) trait ParkPort {
-    /// Park `items` of the set `kind` (one statement each, one batch).
+    /// Park `rows` (`(set, entry)`, both sets) in ONE batch: one statement each, one D1 round trip.
     async fn park(
         &self,
-        kind: &'static str,
-        items: &[String],
+        rows: &[(&'static str, String)],
         now_ms: u64,
     ) -> std::result::Result<(), String>;
     async fn bump(&self, counter: &'static str, delta: u64);
     fn log(&self, line: String);
 }
 
-/// THE SKIP of a background flush (bsv-low #649 M1): the pot and hop sets are DRAINED and parked durably; the
-/// withheld entries are counted; a park that faults notes its entries back into the isolate's sets (the old
-/// behaviour), counted and logged.
+/// THE SKIP of a background flush (bsv-low #649 M1; the delta lens's M1). The pot and hop sets are COPIED, the
+/// copy is PARKED in D1 as the skip's FIRST durable write (one batch, both sets), and only once the park landed
+/// are the parked entries taken out of the isolate's sets; the counters come after. So a cancellation at any
+/// await leaves every note in memory, in D1, or in both (a note in both is delivered twice: harmless, the app
+/// layer re-reads). A park that faults takes nothing out of memory, counted and logged.
 pub(crate) async fn park_withheld<P: ParkPort>(port: &P, remaining_ms: u64, now_ms: u64) {
-    let pots: Vec<String> = crate::pot_changes::drain()
+    let pots = crate::pot_changes::snapshot();
+    let hops = crate::hop_changes::snapshot();
+    let mut rows: Vec<(&'static str, String)> = pots
         .iter()
-        .map(|(t, v)| pot_item(t, *v))
+        .map(|(t, v)| (KIND_POT, pot_item(t, *v)))
         .collect();
-    let hops = crate::hop_changes::drain();
+    rows.extend(hops.iter().map(|h| (KIND_HOP, h.clone())));
+    let withheld = rows.len() as u64;
+    let (mut parked, mut faulted) = (0u64, 0u64);
+    if withheld > 0 {
+        match port.park(&rows, now_ms).await {
+            Ok(()) => {
+                crate::pot_changes::forget(&pots);
+                crate::hop_changes::forget(&hops);
+                parked = withheld;
+            }
+            Err(e) => {
+                faulted = withheld;
+                port.log(format!("[pot-changes] park of {withheld} entr(ies) FAULTED ({e}); kept in the isolate's sets"));
+            }
+        }
+    }
     port.bump(crate::ops::COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW, 1)
         .await;
-    let withheld = (pots.len() + hops.len()) as u64;
     if withheld == 0 {
         port.log(format!("[pot-changes] background flush SKIPPED: {remaining_ms} ms left of the wait_until window; nothing withheld"));
         return;
     }
     port.bump(COUNTER_ADMIT_FAST_FLUSH_WITHHELD, withheld).await;
-    let (mut parked, mut faulted) = (0u64, 0u64);
-    for (kind, items) in [(KIND_POT, &pots), (KIND_HOP, &hops)] {
-        if items.is_empty() {
-            continue;
-        }
-        match port.park(kind, items, now_ms).await {
-            Ok(()) => parked += items.len() as u64,
-            Err(e) => {
-                faulted += items.len() as u64;
-                port.log(format!("[pot-changes] park of {} {kind} entr(ies) FAULTED ({e}); kept in the isolate's set", items.len()));
-                for item in items.iter() {
-                    if kind == KIND_POT {
-                        if let Some((t, v)) = parse_pot_item(item) {
-                            crate::pot_changes::note(&t, v);
-                        }
-                    } else {
-                        crate::hop_changes::note(item, item);
-                    }
-                }
-            }
-        }
-    }
     if parked > 0 {
         port.bump(COUNTER_CHANGE_PARKED, parked).await;
     }
@@ -147,16 +142,15 @@ pub(crate) struct WorkerPark<'a> {
 impl ParkPort for WorkerPark<'_> {
     async fn park(
         &self,
-        kind: &'static str,
-        items: &[String],
+        rows: &[(&'static str, String)],
         now_ms: u64,
     ) -> std::result::Result<(), String> {
-        let mut stmts = Vec::with_capacity(items.len());
-        for item in items {
+        let mut stmts = Vec::with_capacity(rows.len());
+        for (kind, item) in rows {
             let stmt = self
                 .db
                 .prepare(PARK_SQL)
-                .bind(&[kind.into(), item.as_str().into(), (now_ms as f64).into()])
+                .bind(&[(*kind).into(), item.as_str().into(), (now_ms as f64).into()])
                 .map_err(|e| e.to_string())?;
             stmts.push(stmt);
         }
@@ -405,15 +399,14 @@ mod tests {
     impl ParkPort for ModelPark {
         async fn park(
             &self,
-            kind: &'static str,
-            items: &[String],
+            rows: &[(&'static str, String)],
             _now_ms: u64,
         ) -> std::result::Result<(), String> {
             if self.fail {
                 return Err("D1 down".into());
             }
-            for i in items {
-                self.rows.borrow_mut().push((kind.to_string(), i.clone()));
+            for (k, i) in rows {
+                self.rows.borrow_mut().push((k.to_string(), i.clone()));
             }
             Ok(())
         }
@@ -473,6 +466,105 @@ mod tests {
             .counters
             .borrow()
             .contains(&(COUNTER_CHANGE_PARK_FAULTS, 1)));
+    }
+
+    /// The skip's world with ONE await that never answers: `hang` names it (`park`, or the n-th counter bump).
+    struct HangingPark {
+        rows: RefCell<Vec<(String, String)>>,
+        bumps: RefCell<usize>,
+        hang: &'static str,
+    }
+
+    impl ParkPort for HangingPark {
+        async fn park(
+            &self,
+            rows: &[(&'static str, String)],
+            _now_ms: u64,
+        ) -> std::result::Result<(), String> {
+            if self.hang == "park" {
+                std::future::pending::<()>().await;
+            }
+            for (k, i) in rows {
+                self.rows.borrow_mut().push((k.to_string(), i.clone()));
+            }
+            Ok(())
+        }
+        async fn bump(&self, _counter: &'static str, _delta: u64) {
+            let n = *self.bumps.borrow();
+            *self.bumps.borrow_mut() += 1;
+            if (self.hang == "first counter" && n == 0) || (self.hang == "second counter" && n == 1)
+            {
+                std::future::pending::<()>().await;
+            }
+        }
+        fn log(&self, _line: String) {}
+    }
+
+    /// bsv-low #649 M1 (the delta lens's three cancellation boundaries): the skip is cancelled while its first
+    /// counter, its second counter or its park is pending (polled once, then dropped, as the runtime drops a
+    /// `waitUntil` task). Every withheld note must still exist, in D1 or in the isolate's sets. On `1516ed5` the skip
+    /// drained both sets BEFORE the counters and the park: at the first two boundaries nothing was left anywhere.
+    #[test]
+    fn e649_m1_a_skip_cancelled_at_any_await_keeps_every_note() {
+        let txid = "AB".repeat(32);
+        let pot = format!("{}:5", "ab".repeat(32));
+        for hang in ["first counter", "second counter", "park"] {
+            let _ = crate::pot_changes::drain();
+            let _ = crate::hop_changes::drain();
+            crate::pot_changes::note(&txid, 5);
+            crate::hop_changes::note(ID, ID);
+            let port = HangingPark {
+                rows: Default::default(),
+                bumps: RefCell::new(0),
+                hang,
+            };
+            {
+                let mut fut = std::pin::pin!(park_withheld(&port, 2_000, 1_000));
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(
+                    std::future::Future::poll(fut.as_mut(), &mut cx).is_pending(),
+                    "{hang}: the skip is suspended there"
+                );
+            } // dropped: the runtime cancelled the task
+            let durable = port.rows.borrow().clone();
+            let memory_pots = crate::pot_changes::drain();
+            let memory_hops = crate::hop_changes::drain();
+            let pot_kept = durable.contains(&("pot".to_string(), pot.clone()))
+                || memory_pots.contains(&("ab".repeat(32), 5));
+            let hop_kept = durable.contains(&("hop".to_string(), ID.to_string()))
+                || memory_hops.contains(&ID.to_string());
+            assert!(
+                pot_kept && hop_kept,
+                "cancelled at the {hang}: durable={} memory={}: a withheld note was destroyed",
+                durable.len(),
+                memory_pots.len() + memory_hops.len()
+            );
+        }
+    }
+
+    /// bsv-low #649 M1 (structural): the park is the skip's FIRST durable write and the sets are cleared only after
+    /// it answered: no `drain()` in the skip, `forget` only in the park's `Ok` arm, every counter after the park.
+    #[test]
+    fn e649_m1_the_park_is_the_skips_first_durable_write() {
+        let sq = |s: &str| s.split_whitespace().collect::<String>();
+        let src = sq(include_str!("change_park.rs"));
+        let body = &src[src.find("pub(crate)asyncfnpark_withheld<").unwrap()..];
+        let body = &body[..body.find("///Theworker's[`ParkPort`]").unwrap()];
+        assert!(
+            !body.contains("drain()"),
+            "the skip never drains: it copies, parks, then forgets"
+        );
+        let park = body
+            .find("port.park(&rows,now_ms).await")
+            .expect("the park");
+        let ok = body
+            .find("Ok(())=>{crate::pot_changes::forget(&pots);crate::hop_changes::forget(&hops);")
+            .expect("forgotten only once parked");
+        let first_bump = body.find("port.bump(").unwrap();
+        assert!(
+            park < ok && park < first_bump,
+            "the park is the first await; the counters after it"
+        );
     }
 
     /// The cron's world: the parked rows and a transport whose `fail_hop`/`fail_pot_chunk` POSTs are refused.
