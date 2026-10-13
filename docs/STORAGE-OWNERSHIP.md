@@ -36,11 +36,11 @@ The resolver (`workers/low-identity-resolver`, lane M29-3a) reads the D1. What i
 
 ## The tables of `low-overlay-db`
 
-56 rows: 51 owned by `overlay-cloudflare`, 5 by `low-app-layer` (`hopsweep_records`, `proof_posts`, `owed_rows`, `owed_state`, `hop_chain_probes`). 23 are never-wipe: the money tables and filings (`pot_records`, `potparty_records`, `potrefund_records`, `hopsweep_records`, `hopparty_records`, `result_markers_v2`, `collected_markers_v2`, `proof_posts`), the eviction ledger (`pot_evictions` and its 11 `_evicted` twins), the dead v1 `collected_markers` (the copy source of v2) `banned_hosts` (the operator's word, held nowhere else) and `mutation_dead_letters` (the parked dead letters, #576: the only copy once the DLQ acks).
+57 rows: 51 owned by `overlay-cloudflare`, 6 by `low-app-layer` (`hopsweep_records`, `proof_posts`, `owed_rows`, `owed_state`, `hop_chain_probes`, `pot_announce_parked`). 23 are never-wipe: the money tables and filings (`pot_records`, `potparty_records`, `potrefund_records`, `hopsweep_records`, `hopparty_records`, `result_markers_v2`, `collected_markers_v2`, `proof_posts`), the eviction ledger (`pot_evictions` and its 11 `_evicted` twins), the dead v1 `collected_markers` (the copy source of v2) `banned_hosts` (the operator's word, held nowhere else) and `mutation_dead_letters` (the parked dead letters, #576: the only copy once the DLQ acks).
 
 The filed rows of `potparty_records`, `potrefund_records`, `result_markers_v2`, `collected_markers_v2` and `lb_marker_rows` are written today only by the app layer's `/record` (`crates/low-app-layer/src/record_post.rs`); the overlay is still named their owner, as it holds the schema and its topic managers wrote the old era's rows.
 
-The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` repeats it): INSERT `potparty_records`, INSERT and UPDATE `potrefund_records`, INSERT `hopsweep_records`, `result_markers_v2`, `collected_markers_v2`, `proof_posts`, `lb_marker_rows`, `tx_any_verdicts`, `hop_chain_probes`, `ops_counters`, INSERT and DELETE `owed_rows`, INSERT and UPDATE `owed_state`; and the catch-up DDL (ALTER on `pot_records`, `potparty_records`, `hopparty_records`, `result_markers_v2`, `hand_markers`, `collected_markers_v2`; CREATE IF NOT EXISTS on `network_seen`, `collected_markers_v2`, `hand_markers`, `proof_posts`, `hopsweep_records`, `owed_rows`, `owed_state`).
+The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` repeats it): INSERT `potparty_records`, INSERT and UPDATE `potrefund_records`, INSERT `hopsweep_records`, `result_markers_v2`, `collected_markers_v2`, `proof_posts`, `lb_marker_rows`, `tx_any_verdicts`, `hop_chain_probes`, `ops_counters`, INSERT and DELETE `owed_rows`, INSERT and UPDATE `owed_state`, INSERT, UPDATE and DELETE `pot_announce_parked`; and the catch-up DDL (ALTER on `pot_records`, `potparty_records`, `hopparty_records`, `result_markers_v2`, `hand_markers`, `collected_markers_v2`; CREATE IF NOT EXISTS on `network_seen`, `collected_markers_v2`, `hand_markers`, `proof_posts`, `hopsweep_records`, `owed_rows`, `owed_state`, `pot_announce_parked`).
 
 | table | owner | further writers | readers | rebuild class | never-wipe | why |
 |---|---|---|---|---|---|---|
@@ -69,6 +69,7 @@ The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` r
 | `tx_words` | low-app-layer | low-app-layer: CREATE | none | re-askable | no | compact tracker projection; eight-day stranger sweep; public reads create zero rows |
 | `owed_rows` | low-app-layer | none | none | transient | no | a pure derivation over the money tables; the next read recomputes |
 | `owed_state` | low-app-layer | none | none | transient | no | recomputed on the next read |
+| `pot_announce_parked` | low-app-layer | none | none | transient | no | a wake-up signal only (E649 L4 H1): the seat's own read serves every fact, and the next pot change announces again |
 | `chain_headers_seen` | overlay-cloudflare | none | none | transient | no | a cursor |
 | `reorg_sweep_state` | overlay-cloudflare | none | none | transient | no | a cursor |
 | `arcade_reorg_state` | overlay-cloudflare | none | none | transient | no | a cursor |

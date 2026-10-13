@@ -191,6 +191,11 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         if let Err(e) = tracker_host::runtime::tick(&env).await {
             worker::console_warn!("[tracker-tick] deferred: {e}");
         }
+        // E649 L4 H1: one bounded pass over the pot hook's parked wake-ups (a wake-up the hook's detached announce
+        // did not deliver reaches its seat here, within one scheduled pass).
+        if let Err(e) = routes::drain_pot_announce(&env).await {
+            worker::console_warn!("[pot-changed] drain deferred: {e}");
+        }
         if let Ok(db) = env.d1("OVERLAY_DB") {
             let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
             courier::flush(Some(db), pending).await;
@@ -262,6 +267,9 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
     if req.method() == worker::Method::Post && req.path() == "/internal/hop-changed" {
         return routes::internal_hop_changed(req, &env, &ctx).await;
+    }
+    if req.method() == worker::Method::Post && req.path() == "/internal/pot-announce-drain" {
+        return routes::internal_pot_announce_drain(req, &env).await;
     }
     if req.method() == worker::Method::Post && req.path() == "/internal/lobby-changed" {
         return internal_events::lobby_changed(req, &env).await;
