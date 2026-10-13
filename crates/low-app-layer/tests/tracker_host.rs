@@ -216,3 +216,84 @@ fn ns3d_note4_courier_circuit_uses_one_scheduled_pass_window() {
         "event resets courier circuit per minute"
     );
 }
+
+#[tokio::test]
+async fn ns3d3_l1_terminal_arcade_still_checks_courier_proof() {
+    let fixture: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/ns3/banana-tsc.json")).unwrap();
+    let txid = fixture["txOrId"].as_str().unwrap().to_owned();
+    let headers = || HeaderSnapshot {
+        tip: Ok(10),
+        headers: BTreeMap::from([(
+            10,
+            header_response(
+                10,
+                200,
+                &json!({"status":"success","value":{"height":10,"hash":"02".repeat(32),"merkleRoot":fixture["target"]}}),
+            ),
+        )]),
+    };
+    for status in ["REJECTED", "DOUBLE_SPEND_ATTEMPTED"] {
+        let proof = execute_reask(
+            &txid,
+            true,
+            "https://arcade",
+            &Reask::Age,
+            |url: String| {
+                let body = if url.starts_with("https://arcade/") {
+                    json!({"txid":txid,"txStatus":status})
+                } else if url.ends_with("proof/tsc") || url.ends_with("/proof") {
+                    fixture.clone()
+                } else {
+                    json!({"blockheight":10})
+                };
+                async move { Some((200, body.to_string().into_bytes())) }
+            },
+            |_| async { headers() },
+        )
+        .await
+        .unwrap()
+        .expect("terminal Arcade answer skipped checked courier proof");
+        let mut state = State::new(&txid);
+        state
+            .step(
+                &Params { age_threshold: 60 },
+                &headers(),
+                Input::Evidence(Evidence::Proof(proof)),
+            )
+            .unwrap();
+        let row = stored::project(None, &state, 123, None);
+        assert_eq!(row.word, "mined");
+        assert!(row.proof_hex.is_some());
+        let calls = std::cell::Cell::new(0);
+        let absent = execute_reask(
+            &txid,
+            true,
+            "https://arcade",
+            &Reask::Age,
+            |url: String| {
+                calls.set(calls.get() + 1);
+                let answer = if url.starts_with("https://arcade/") {
+                    (
+                        200,
+                        json!({"txid":txid,"txStatus":status})
+                            .to_string()
+                            .into_bytes(),
+                    )
+                } else {
+                    (404, Vec::new())
+                };
+                async move { Some(answer) }
+            },
+            |_| async { headers() },
+        )
+        .await
+        .unwrap();
+        assert!(absent.is_none());
+        assert_eq!(
+            calls.get(),
+            4,
+            "terminal answer must still ask each courier once"
+        );
+    }
+}

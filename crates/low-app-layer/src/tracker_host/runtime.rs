@@ -529,13 +529,14 @@ async fn event_held(
         }
     }
     let mut row = stored::project(old.as_ref(), &state, now, legacy);
-    if terminal.get() {
+    if terminal.get() || row.word == "mined" {
         let mut body = row
             .legacy_body
             .as_deref()
+            .or_else(|| old.as_ref().and_then(|r| r.legacy_body.as_deref()))
             .and_then(|s| serde_json::from_str::<Value>(s).ok())
             .unwrap_or_else(|| json!({}));
-        body["trackerTerminal"] = json!(true);
+        body["trackerTerminal"] = json!(terminal.get() && row.word != "mined");
         row.legacy_body = Some(body.to_string());
     }
     stored::write(env, &row).await?;
