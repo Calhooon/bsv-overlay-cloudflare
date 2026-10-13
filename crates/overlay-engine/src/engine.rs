@@ -4911,7 +4911,7 @@ impl Engine {
     /// Without a factory, peer discovery still runs but no actual sync occurs
     /// (backwards-compatible with the previous discovery-only behavior).
     pub async fn start_gasp_sync(&self) -> Result<GASPSyncResult, EngineError> {
-        use crate::gasp::{GASPSync, DEFAULT_GASP_SYNC_LIMIT};
+        use crate::gasp::{GASPSync, ENGINE_GASP_SYNC_PAGE_LIMIT};
         use crate::gasp_overlay::OverlayGASPStorage;
 
         if self.config.sync_configuration.is_empty() {
@@ -5118,13 +5118,13 @@ impl Engine {
                     let sync_outcome = match &self.peer_sync_budget {
                         Some((sleep, budget_ms)) => {
                             crate::gasp::race_or_deadline_guarded(
-                                sync.sync(Some(DEFAULT_GASP_SYNC_LIMIT)),
+                                sync.sync(Some(ENGINE_GASP_SYNC_PAGE_LIMIT)),
                                 sleep(*budget_ms),
                                 &self.finalize_gate,
                             )
                             .await
                         }
-                        None => Some(sync.sync(Some(DEFAULT_GASP_SYNC_LIMIT)).await),
+                        None => Some(sync.sync(Some(ENGINE_GASP_SYNC_PAGE_LIMIT)).await),
                     };
 
                     let mut outcome_success = matches!(sync_outcome, Some(Ok(())));
@@ -7723,7 +7723,10 @@ mod tests {
             outputs,
         );
         engine.set_ship_lookup_client(Box::new(client));
-        engine.set_gasp_remote_factory(Box::new(MockGASPRemoteFactory));
+        let sync_calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        engine.set_gasp_remote_factory(Box::new(RecordingDiscoverySyncFactory {
+            calls: sync_calls.clone(),
+        }));
         let result = engine.start_gasp_sync().await.unwrap();
         let topic = &result.topics_synced["tm_test"];
         assert_eq!(topic.sync_type, "ship");
@@ -7733,15 +7736,11 @@ mod tests {
             "the lookup-host cap must not truncate sync peers"
         );
         assert!(topic.errors.is_empty());
+        assert_eq!(sync_calls.borrow().len(), 9);
         for peer in &topic.peers {
-            assert!(
-                engine
-                    .storage
-                    .get_last_interaction(peer, "tm_test")
-                    .await
-                    .unwrap()
-                    > 0
-            );
+            assert!(sync_calls
+                .borrow()
+                .contains(&(peer.clone(), "tm_test".to_string())));
         }
     }
 
@@ -8106,6 +8105,375 @@ mod tests {
     /// Mock factory that creates MockSyncRemote instances
     struct MockGASPRemoteFactory;
 
+    #[derive(Clone)]
+    struct BudgetPageRemote {
+        outputs: std::rc::Rc<Vec<crate::types::GASPOutput>>,
+        nodes: std::rc::Rc<HashMap<String, crate::types::GASPNode>>,
+        elapsed: std::rc::Rc<Cell<u64>>,
+        requests: std::rc::Rc<std::cell::RefCell<Vec<crate::types::GASPInitialRequest>>>,
+        clamp: Option<usize>,
+        node_cost_ms: u64,
+    }
+
+    #[async_trait(?Send)]
+    impl crate::gasp::GASPRemote for BudgetPageRemote {
+        async fn get_initial_response(
+            &self,
+            request: &crate::types::GASPInitialRequest,
+        ) -> Result<crate::types::GASPInitialResponse, crate::gasp::GASPError> {
+            self.requests.borrow_mut().push(request.clone());
+            let page = self
+                .outputs
+                .iter()
+                .filter(|u| u.score as u64 >= request.since);
+            let limit = self.clamp.map_or(usize::MAX, |cap| {
+                cap.min(request.limit.unwrap_or(u64::MAX) as usize)
+            });
+            Ok(crate::types::GASPInitialResponse {
+                utxo_list: page.take(limit).cloned().collect(),
+                since: request.since,
+            })
+        }
+
+        async fn get_initial_reply(
+            &self,
+            _: &crate::types::GASPInitialResponse,
+        ) -> Result<crate::types::GASPInitialReply, crate::gasp::GASPError> {
+            unreachable!()
+        }
+
+        async fn request_node(
+            &self,
+            graph_id: &str,
+            txid: &str,
+            _: u32,
+            _: bool,
+        ) -> Result<crate::types::GASPNode, crate::gasp::GASPError> {
+            self.elapsed.set(self.elapsed.get() + self.node_cost_ms);
+            if self.node_cost_ms > 0 {
+                let mut yielded = false;
+                std::future::poll_fn(|cx| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
+            let mut node = self
+                .nodes
+                .get(txid)
+                .cloned()
+                .ok_or_else(|| crate::gasp::GASPError::NodeNotFound(format!("{txid}.0")))?;
+            node.graph_id = graph_id.to_string();
+            Ok(node)
+        }
+
+        async fn submit_node(
+            &self,
+            _: &crate::types::GASPNode,
+        ) -> Result<Option<crate::types::GASPNodeResponse>, crate::gasp::GASPError> {
+            unreachable!()
+        }
+    }
+
+    impl crate::gasp::GASPRemoteFactory for BudgetPageRemote {
+        fn create_remote(&self, _: &str, _: &str) -> Box<dyn crate::gasp::GASPRemote> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn budget_page_engine(count: u32) -> (Engine, BudgetPageRemote) {
+        let mut engine = make_engine(vec![0]);
+        let mut tracker = bsv_rs::transaction::MockChainTracker::new(1000);
+        let mut outputs = Vec::new();
+        let mut nodes = HashMap::new();
+        for n in 1..=count {
+            let tx = child_of(&format!("{n:064x}"), 0);
+            let txid = tx.id();
+            tracker.add_root(n, txid.clone());
+            outputs.push(crate::types::GASPOutput {
+                txid: txid.clone(),
+                output_index: 0,
+                score: f64::from(n * 10),
+            });
+            nodes.insert(
+                txid.clone(),
+                crate::types::GASPNode {
+                    graph_id: String::new(),
+                    raw_tx: tx.to_hex(),
+                    output_index: 0,
+                    proof: Some(single_leaf_bump_hex(&txid, n)),
+                    tx_metadata: None,
+                    output_metadata: None,
+                    inputs: None,
+                },
+            );
+        }
+        engine.chain_tracker = Some(Box::new(tracker));
+        engine.config.sync_configuration.insert(
+            "tm_test".to_string(),
+            SyncTarget::Peers(vec!["https://budget.example".to_string()]),
+        );
+        let remote = BudgetPageRemote {
+            outputs: std::rc::Rc::new(outputs),
+            nodes: std::rc::Rc::new(nodes),
+            elapsed: std::rc::Rc::new(Cell::new(0)),
+            requests: std::rc::Rc::default(),
+            clamp: None,
+            node_cost_ms: 5000,
+        };
+        (engine, remote)
+    }
+
+    fn virtual_peer_budget(engine: &mut Engine, remote: &BudgetPageRemote) {
+        let elapsed = remote.elapsed.clone();
+        engine.set_peer_sync_budget(
+            std::rc::Rc::new(move |ms| {
+                assert_eq!(ms, 30_000);
+                let elapsed = elapsed.clone();
+                let until = elapsed.get() + ms;
+                Box::pin(std::future::poll_fn(move |_| {
+                    if elapsed.get() >= until {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }))
+            }),
+            30_000,
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_budget_large_page_persists_a_finalized_score_and_resumes() {
+        // This responder ignores the limit: the initiator must safely handle
+        // a 3,000-output page under a virtual 30-second peer budget.
+        let (mut engine, remote) = budget_page_engine(3000);
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        for round in 1..=2 {
+            let result = engine.start_gasp_sync().await.unwrap();
+            let topic = &result.topics_synced["tm_test"];
+            assert_eq!(topic.finalized_graphs, 5);
+            assert_eq!(topic.deadline_dropped_graphs, 1);
+            assert_eq!(topic.cursor_moves.len(), 1);
+            let expected = round * 50;
+            assert_eq!(topic.cursor_moves[0].to, expected);
+            assert_eq!(
+                engine
+                    .storage
+                    .get_last_interaction("https://budget.example", "tm_test")
+                    .await
+                    .unwrap(),
+                expected
+            );
+            {
+                let requests = remote.requests.borrow();
+                assert_eq!(requests[(round - 1) as usize].since, (round - 1) * 50);
+            }
+            for output in remote.outputs.iter().take((round * 5) as usize) {
+                assert!(engine
+                    .storage
+                    .find_output(&output.txid, 0, Some("tm_test"), None, true)
+                    .await
+                    .unwrap()
+                    .is_some());
+            }
+            let unfinished = &remote.outputs[(round * 5) as usize];
+            assert!(engine
+                .storage
+                .find_output(&unfinished.txid, 0, Some("tm_test"), None, true)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_budget_requests_bounded_pages_and_accepts_responder_clamping() {
+        let (mut engine, mut remote) = budget_page_engine(7);
+        remote.clamp = Some(3);
+        remote.node_cost_ms = 0;
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(result.topics_synced["tm_test"].finalized_graphs, 7);
+        let requests = remote.requests.borrow();
+        assert_eq!(requests.len(), 4);
+        assert!(requests.iter().all(|request| request.limit == Some(100)));
+        assert_eq!(
+            requests.iter().map(|r| r.since).collect::<Vec<_>>(),
+            vec![0, 30, 50, 70]
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_budget_unordered_page_keeps_the_completed_score_below_a_gap() {
+        let (mut engine, mut remote) = budget_page_engine(3000);
+        std::rc::Rc::make_mut(&mut remote.outputs).swap(0, 9);
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.finalized_graphs, 5);
+        // Score 100 landed, but score 10 is still ahead in this unordered
+        // page. The unfinished lower score must hold the cursor at entry.
+        assert!(topic.cursor_moves.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_budget_tied_scores_do_not_skip_an_unfinished_output() {
+        let (mut engine, mut remote) = budget_page_engine(3);
+        std::rc::Rc::make_mut(&mut remote.outputs)[2].score = 20.0;
+        remote.node_cost_ms = 10_000;
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.finalized_graphs, 2);
+        assert_eq!(topic.cursor_moves[0].to, 10);
+    }
+
+    #[tokio::test]
+    async fn sync_budget_failed_graph_holds_the_cursor_below_later_finalizations() {
+        let (mut engine, mut remote) = budget_page_engine(3000);
+        let failed = remote.outputs[2].txid.clone();
+        std::rc::Rc::make_mut(&mut remote.nodes).remove(&failed);
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.finalized_graphs, 4);
+        assert_eq!(topic.cursor_moves[0].to, 20);
+    }
+
+    struct ProofOnlyRootFetcher {
+        proofs: HashMap<String, String>,
+        requested: std::rc::Rc<Cell<u64>>,
+    }
+
+    #[async_trait(?Send)]
+    impl AncestorFetcher for ProofOnlyRootFetcher {
+        async fn fetch_ancestor(&self, _: &str) -> Result<FetchedAncestor, GASPError> {
+            Err(GASPError::RemoteError("raw source unavailable".to_string()))
+        }
+        async fn verified_proof_for(&self, txid: &str) -> Option<String> {
+            self.requested.set(self.requested.get() + 1);
+            self.proofs.get(txid).cloned()
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_budget_proofless_root_uses_own_proof_source_without_raw_refetch() {
+        for proven in [true, false] {
+            let (mut engine, mut remote) = budget_page_engine(1);
+            let txid = remote.outputs[0].txid.clone();
+            let proof = remote.nodes[&txid].proof.clone().unwrap();
+            std::rc::Rc::make_mut(&mut remote.nodes)
+                .get_mut(&txid)
+                .unwrap()
+                .proof = None;
+            let requested = std::rc::Rc::new(Cell::new(0));
+            engine.set_ancestor_fetcher(std::rc::Rc::new(ProofOnlyRootFetcher {
+                proofs: if proven {
+                    HashMap::from([(txid.clone(), proof)])
+                } else {
+                    HashMap::new()
+                },
+                requested: requested.clone(),
+            }));
+            virtual_peer_budget(&mut engine, &remote);
+            engine.set_gasp_remote_factory(Box::new(remote));
+            let result = engine.start_gasp_sync().await.unwrap();
+            assert!(requested.get() > 0);
+            assert_eq!(
+                result.topics_synced["tm_test"].finalized_graphs,
+                u64::from(proven)
+            );
+            assert_eq!(
+                engine
+                    .storage
+                    .find_output(&txid, 0, Some("tm_test"), None, true)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                proven
+            );
+            if !proven {
+                assert!(result.topics_synced["tm_test"].cursor_moves.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_budget_deferred_root_resumes_when_own_proof_becomes_available() {
+        let (mut engine, mut remote) = budget_page_engine(1);
+        let txid = remote.outputs[0].txid.clone();
+        let proof = remote.nodes[&txid].proof.clone().unwrap();
+        std::rc::Rc::make_mut(&mut remote.nodes)
+            .get_mut(&txid)
+            .unwrap()
+            .proof = None;
+        let requested = std::rc::Rc::new(Cell::new(0));
+        engine.set_ancestor_fetcher(std::rc::Rc::new(ProofOnlyRootFetcher {
+            proofs: HashMap::new(),
+            requested: requested.clone(),
+        }));
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_graph_budget(
+            std::rc::Rc::new(|_| Box::pin(std::future::pending())),
+            5,
+            5000,
+        );
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let held = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(held.topics_synced["tm_test"].finalized_graphs, 0);
+        assert_eq!(held.topics_synced["tm_test"].deferred_graphs, 1);
+        assert!(held.topics_synced["tm_test"].cursor_moves.is_empty());
+        engine.set_ancestor_fetcher(std::rc::Rc::new(ProofOnlyRootFetcher {
+            proofs: HashMap::from([(txid.clone(), proof)]),
+            requested,
+        }));
+        let landed = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(landed.topics_synced["tm_test"].resumed_graphs, 1);
+        assert_eq!(landed.topics_synced["tm_test"].finalized_graphs, 1);
+        assert_eq!(landed.topics_synced["tm_test"].cursor_moves[0].to, 10);
+        assert!(engine
+            .storage
+            .find_output(&txid, 0, Some("tm_test"), None, true)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn sync_budget_own_proof_without_a_valid_header_is_never_admitted() {
+        let (mut engine, mut remote) = budget_page_engine(1);
+        let txid = remote.outputs[0].txid.clone();
+        std::rc::Rc::make_mut(&mut remote.nodes)
+            .get_mut(&txid)
+            .unwrap()
+            .proof = None;
+        engine.set_ancestor_fetcher(std::rc::Rc::new(ProofOnlyRootFetcher {
+            proofs: HashMap::from([(txid.clone(), single_leaf_bump_hex(&txid, 999))]),
+            requested: std::rc::Rc::default(),
+        }));
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(result.topics_synced["tm_test"].finalized_graphs, 0);
+        assert!(engine
+            .storage
+            .find_output(&txid, 0, Some("tm_test"), None, true)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     impl crate::gasp::GASPRemoteFactory for MockGASPRemoteFactory {
         fn create_remote(&self, _peer_url: &str, _topic: &str) -> Box<dyn crate::gasp::GASPRemote> {
             Box::new(MockSyncRemote {
@@ -8162,15 +8530,11 @@ mod tests {
             .get_last_interaction("https://peer1.example.com", "tm_test")
             .await
             .unwrap();
-        // The mock remote serves synthetic `rawtx_*` nodes that cannot assemble
-        // into a real BEEF, so both graphs fail to INGEST (a transient-class
-        // error). The cursor is therefore capped at 99 — strictly below the
-        // lowest un-ingested score (remote_tx1@100) — so the next sync re-pulls
-        // them rather than skipping past. (Pre-#43 this advanced to 200, the
-        // highest *seen* score, silently stranding both graphs.)
+        // Synthetic nodes cannot assemble into BEEF. No score completed,
+        // so the entry cursor stays and the next sync re-requests both.
         assert_eq!(
-            last, 99,
-            "cursor must cap below the lowest un-ingested score, not skip to the seen tip"
+            last, 0,
+            "cursor must remain at entry when no output completed"
         );
     }
 
@@ -8313,7 +8677,7 @@ mod tests {
         assert_eq!(topic_result.peers.len(), 2);
         assert!(topic_result.errors.is_empty());
 
-        // Both peers should have their last_interaction updated
+        // Neither peer completed its synthetic graphs.
         let last1 = engine
             .storage()
             .get_last_interaction("https://peer1.example.com", "tm_test")
@@ -8324,11 +8688,8 @@ mod tests {
             .get_last_interaction("https://peer2.example.com", "tm_test")
             .await
             .unwrap();
-        // Capped at 99 (below the lowest un-ingested score@100), not 200 — the
-        // synthetic mock graphs fail to ingest, so the cursor must not skip past
-        // them. See `test_start_gasp_sync_with_factory_runs_sync` (#43 gap-guard).
-        assert_eq!(last1, 99);
-        assert_eq!(last2, 99);
+        assert_eq!(last1, 0);
+        assert_eq!(last2, 0);
     }
 
     // ── Per-peer budget + dead-peer quarantine (bsv-low#302) ──────────
@@ -8450,8 +8811,8 @@ mod tests {
             "both peers attempted this tick"
         );
 
-        // Cursor semantics (the #257 gate property): a timed-out peer's
-        // cursor NEVER advances; the completed peer's does.
+        // A timed-out peer stays at entry. The other peer was reached but
+        // served synthetic graphs that cannot complete, so its cursor stays too.
         let hang_cursor = store
             .get_last_interaction("https://hang.example.com", "tm_test")
             .await
@@ -8461,7 +8822,7 @@ mod tests {
             .get_last_interaction("https://good.example.com", "tm_test")
             .await
             .unwrap();
-        assert!(good_cursor > 0, "completed peer's cursor advances");
+        assert_eq!(good_cursor, 0, "no synthetic graph completed");
 
         // Health bookkeeping: timeout = failure, completion = success.
         let hang_health = store

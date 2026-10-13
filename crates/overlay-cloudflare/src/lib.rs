@@ -184,6 +184,32 @@ fn rekey_sync_configuration(
         .collect()
 }
 
+fn registered_sync_configuration(
+    mut config: overlay_engine::types::SyncConfiguration,
+    managers: &HashMap<String, Box<dyn TopicManager>>,
+) -> (overlay_engine::types::SyncConfiguration, Vec<String>) {
+    let mut skipped = Vec::new();
+    config.retain(|topic, _| {
+        let registered = managers.contains_key(topic);
+        if !registered {
+            skipped.push(topic.clone());
+        }
+        registered
+    });
+    skipped.sort();
+    (config, skipped)
+}
+
+fn sync_topic_warning_due(topic: &str) -> bool {
+    // One warning per topic per isolate, including repeated engine builds.
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .is_ok_and(|mut warned| warned.insert(topic.to_string()))
+}
+
 /// bsv-low #499: the routes the D1 rows ledger keys by name (`d1_ledger::route_of`; anything else is `other`). A
 /// route with a path parameter is listed by its fixed head. `/admin` and `/internal` are one key each.
 pub const D1_LEDGER_ROUTES: &[&str] = &[
@@ -923,6 +949,16 @@ fn build_engine_with_storage(
         sync_configuration = rekey_sync_configuration(sync_configuration, &topic_suffix);
     }
 
+    // Filter after both maps have their deployment namespace, before the
+    // engine fills defaults. Unregistered topics never spend peer slots.
+    let (sync_configuration, skipped) =
+        registered_sync_configuration(sync_configuration, &managers);
+    for topic in skipped {
+        if sync_topic_warning_due(&topic) {
+            worker::console_warn!("GASP sync topic {topic} has no registered manager; skipped");
+        }
+    }
+
     let config = EngineConfig {
         hosting_url: hosting_url.clone(),
         slap_trackers: ship_slap_bootstrap,
@@ -942,19 +978,19 @@ fn build_engine_with_storage(
     // since initial release. Victims: the ad self-admission (every
     // sync_advertisements local submit) and any stock no-mode-header
     // /submit whose BEEF carries a BUMP. ChainTracks itself was healthy the
-    // whole time. Same preference order as the sibling: service binding
-    // first, URL fetch only as the off-account fallback. The enablement
-    // condition (CHAIN_TRACKER_URL set) is unchanged — only the transport.
+    // whole time. A configured service binding enables verification even
+    // without a URL variable, matching lookup_service_chain_tracker.
+    let tracker_url = env.var("CHAIN_TRACKER_URL").ok().map(|v| v.to_string());
     let chain_tracker: Option<Box<dyn bsv_rs::transaction::ChainTracker>> =
-        env.var("CHAIN_TRACKER_URL").ok().map(|v| {
-            let ct_url = v.to_string();
-            match env.service("CHAINTRACKS") {
-                Ok(svc) => Box::new(WorkerChainTracker::with_service(ct_url, svc))
-                    as Box<dyn bsv_rs::transaction::ChainTracker>,
-                Err(_) => Box::new(WorkerChainTracker::new(ct_url))
-                    as Box<dyn bsv_rs::transaction::ChainTracker>,
-            }
-        });
+        match env.service("CHAINTRACKS") {
+            Ok(svc) => Some(Box::new(WorkerChainTracker::with_service(
+                tracker_url.unwrap_or_else(|| "https://chaintracks.invalid".to_string()),
+                svc,
+            ))),
+            Err(_) => tracker_url.map(|url| {
+                Box::new(WorkerChainTracker::new(url)) as Box<dyn bsv_rs::transaction::ChainTracker>
+            }),
+        };
 
     // Network broadcaster — Arcade V2 is the overlay's SOLE network broadcaster
     // (#192/#193): EF submit + a FREE merkle proof pushed in Arcade's MINED
@@ -1197,6 +1233,12 @@ const GASP_PEER_SYNC_BUDGET_MS: u64 = 30_000;
 /// so this is what keeps a hung D1 call from holding them.
 const GASP_FINALIZE_SUBMIT_BUDGET_MS: u64 = 30_000;
 
+/// Complete admitted transactions before the network sync and maintenance.
+/// Half the courier candidate budget remains available to proofless GASP roots.
+const TRANSACTION_PROOF_COMPLETION_LIMIT: u64 =
+    crate::proof_fetcher::DEFAULT_FETCH_BUDGET as u64 / 2;
+const TRANSACTION_PROOF_COMPLETION_BUDGET_MS: u64 = 30_000;
+
 #[event(scheduled)]
 async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
     worker::console_log!("Scheduled event triggered");
@@ -1254,6 +1296,39 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         potrefund_storage.clone(),
         hopparty_storage.clone(),
     );
+
+    // Give stored proof completion its own early slot. Held GASP graphs are
+    // not admitted transactions: their roots use hydrate_root during sync.
+    // A timeout stamps no success heartbeat; the next tick retries the rows.
+    let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
+    let (tx_completed, tx_fetch_failed) = match race_or_deadline(
+        engine.complete_missing_proofs(TRANSACTION_PROOF_COMPLETION_LIMIT, backstop_age),
+        crate::broadcaster::sleep_ms(TRANSACTION_PROOF_COMPLETION_BUDGET_MS),
+    )
+    .await
+    {
+        Some(Ok(summary)) => {
+            worker::console_log!("Scheduled: transaction proof completion scanned={} completed={} unconfirmed={} stitch_failed={}",
+                summary.scanned, summary.completed, summary.still_unconfirmed, summary.stitch_failed);
+            crate::ops::record_completion_tick(
+                &ops_db,
+                summary.completed as u64,
+                summary.fetch_failed as u64,
+                0,
+                0,
+            )
+            .await;
+            (summary.completed as u64, summary.fetch_failed as u64)
+        }
+        Some(Err(e)) => {
+            worker::console_log!("Scheduled: transaction proof completion failed: {e}");
+            (0, 0)
+        }
+        None => {
+            worker::console_log!("Scheduled: transaction proof completion exceeded {TRANSACTION_PROOF_COMPLETION_BUDGET_MS} ms; retry next tick");
+            (0, 0)
+        }
+    };
 
     // Sync advertisements (if advertiser + hosting URL are configured).
     // Publishes any new SHIP/SLAP ads on-chain so peers can discover us.
@@ -1478,43 +1553,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         }
     }
 
-    // BEEF proof completion (#192/#193). Two parallel passes, both bounded per
-    // tick and fail-closed (a BUMP is stitched only once its root is verified
-    // against chaintracks; an unmined/unverifiable candidate is retried, never
-    // written proofless).
-    //
-    // 1. Engine `transactions` store — uses the ancestor fetcher set in
-    //    build_engine_with_storage. A no-op if no fetcher/tracker is configured.
-    //
-    //    #228: the poll passes are the BACKSTOP — /arc-ingest push is the
-    //    primary proof source — so each pass only touches rows older than
-    //    PUSH_BACKSTOP_MIN_AGE_SECS (see its doc for the 30-min rationale).
-    let engine_budget = u64::from(crate::proof_fetcher::DEFAULT_FETCH_BUDGET);
-    let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
-    let (tx_completed, tx_fetch_failed) = match engine
-        .complete_missing_proofs(engine_budget, backstop_age)
-        .await
-    {
-        Ok(s) => {
-            worker::console_log!(
-                "Scheduled: proof-completion (transactions) — scanned={} proofless={} completed={} \
-                 still_unconfirmed={} fetch_failed={} stitch_failed={} already_proven={}",
-                s.scanned,
-                s.proofless,
-                s.completed,
-                s.still_unconfirmed,
-                s.fetch_failed,
-                s.stitch_failed,
-                s.already_proven,
-            );
-            (s.completed as u64, s.fetch_failed as u64)
-        }
-        Err(e) => {
-            worker::console_log!("Scheduled: proof-completion (transactions) error: {e}");
-            (0, 0)
-        }
-    };
-
+    // BEEF proof completion continues with the LOW maintenance passes;
+    // transaction completion already ran in its bounded early slot.
     // 2+3. LOW pot-store maintenance, ORDER LOAD-BEARING (bsv-low#304 gate
     //    M-5): the #186 spend-confirmation chaser (the small, money-relevant
     //    CREDIT ANCHOR) runs BEFORE the pot-beef proof/bulk-drain pass so a
@@ -1787,20 +1827,17 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         }
     }
 
-    // Observability (#192/#193, P4): stamp the completion-pass heartbeat, bump
-    // the persistent counters, and refresh the proofless first-seen ledger so a
-    // dead pass / a proof-not-landing surfaces via GET /health/invariants
-    // within a day (not weeks). Best-effort — never breaks the cron.
+    // Add later LOW maintenance results without counting the early pass twice.
     let proofs_completed = tx_completed + pot_summary.completed as u64;
     let fetch_failed = tx_fetch_failed + pot_summary.fetch_failed as u64;
     let pot_beefs_compacted = pot_summary.completed as u64;
     // A displacement latches spentConfirmed the same as a confirm — the ops
     // heartbeat counts both or displaced rows go invisible (2026-08-18).
     let spends_confirmed = (spend_summary.confirmed + spend_summary.displaced) as u64;
-    crate::ops::record_completion_tick(
+    crate::ops::record_completion_results(
         &ops_db,
-        proofs_completed,
-        fetch_failed,
+        pot_summary.completed as u64,
+        pot_summary.fetch_failed as u64,
         pot_beefs_compacted,
         spends_confirmed,
     )
@@ -2572,6 +2609,105 @@ async fn queue_handler(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    struct RegisteredTopicRemote;
+
+    #[async_trait::async_trait(?Send)]
+    impl overlay_engine::gasp::GASPRemote for RegisteredTopicRemote {
+        async fn get_initial_response(
+            &self,
+            request: &overlay_engine::types::GASPInitialRequest,
+        ) -> Result<overlay_engine::types::GASPInitialResponse, overlay_engine::gasp::GASPError>
+        {
+            Ok(overlay_engine::types::GASPInitialResponse {
+                utxo_list: Vec::new(),
+                since: request.since,
+            })
+        }
+        async fn get_initial_reply(
+            &self,
+            _: &overlay_engine::types::GASPInitialResponse,
+        ) -> Result<overlay_engine::types::GASPInitialReply, overlay_engine::gasp::GASPError>
+        {
+            unreachable!()
+        }
+        async fn request_node(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+            _: bool,
+        ) -> Result<overlay_engine::types::GASPNode, overlay_engine::gasp::GASPError> {
+            unreachable!()
+        }
+        async fn submit_node(
+            &self,
+            _: &overlay_engine::types::GASPNode,
+        ) -> Result<Option<overlay_engine::types::GASPNodeResponse>, overlay_engine::gasp::GASPError>
+        {
+            unreachable!()
+        }
+    }
+
+    struct RegisteredTopicFactory(Rc<std::cell::RefCell<Vec<String>>>);
+    impl overlay_engine::gasp::GASPRemoteFactory for RegisteredTopicFactory {
+        fn create_remote(&self, _: &str, topic: &str) -> Box<dyn overlay_engine::gasp::GASPRemote> {
+            self.0.borrow_mut().push(topic.to_string());
+            Box::new(RegisteredTopicRemote)
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_budget_unregistered_topics_are_skipped_after_suffix_rekey() {
+        use overlay_engine::types::SyncTarget;
+        for suffix in ["", "_beta"] {
+            let trackers = vec!["https://tracker.example".to_string()];
+            let mut config = gasp_sync_configuration(&trackers);
+            config.insert("tm_agent".to_string(), SyncTarget::Peers(trackers.clone()));
+            let config = rekey_sync_configuration(config, suffix);
+            let topic = crate::routes::suffixed_name("tm_uhrp", suffix);
+            let mut managers: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
+            managers.insert("tm_ship".to_string(), Box::new(SHIPTopicManager::new()));
+            managers.insert(topic.clone(), Box::new(UHRPTopicManager::new()));
+            managers.insert(
+                crate::routes::suffixed_name("tm_low", suffix),
+                Box::new(LowTopicManager::new()),
+            );
+            let (filtered, skipped) = registered_sync_configuration(config, &managers);
+            assert_eq!(filtered.len(), 3);
+            assert_eq!(skipped.len(), 12);
+            assert!(matches!(filtered[&topic], SyncTarget::Ship));
+            assert!(matches!(
+                filtered[&crate::routes::suffixed_name("tm_low", suffix)],
+                SyncTarget::Disabled
+            ));
+            let mut engine = Engine::new(
+                managers,
+                HashMap::new(),
+                Box::new(overlay_engine::storage::memory::MemoryStorage::new()),
+                None,
+                EngineConfig {
+                    sync_configuration: filtered,
+                    ship_trackers: trackers.clone(),
+                    slap_trackers: trackers,
+                    ..Default::default()
+                },
+            );
+            engine.set_ship_bootstrap_peers(
+                topic.clone(),
+                vec!["https://registered.example".to_string()],
+            );
+            let calls = Rc::new(std::cell::RefCell::new(Vec::new()));
+            engine.set_gasp_remote_factory(Box::new(RegisteredTopicFactory(calls.clone())));
+            let result = engine.start_gasp_sync().await.unwrap();
+            assert_eq!(result.topics_synced.len(), 2);
+            assert!(calls
+                .borrow()
+                .iter()
+                .all(|called| called == "tm_ship" || called == &topic));
+            assert_eq!(calls.borrow().len(), 2);
+        }
+    }
 
     #[test]
     fn gasp_sync_map_preserves_every_topic_and_target_after_rekey() {
