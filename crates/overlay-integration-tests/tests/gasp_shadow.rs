@@ -344,6 +344,94 @@ async fn w2_the_finalize_materialization_is_compared_to_the_served_materializati
     assert!(bodies.iter().all(|r| r.delta == DeltaClass::Same));
 }
 
+/// The w2 chain `g <- c <- d`, the manager erring on `c` at the finalize.
+fn erring_chain() -> Scenario {
+    let g = genesis(7, 1);
+    let c = child(&g, 0, 1);
+    let d = child(&c, 0, 1);
+    let mut scenario = Scenario::honest(vec![g, c, d], vec![(2, 0, 1.0)]);
+    scenario.fails_at_finalize = Some(scenario.txs[1].id());
+    scenario
+}
+
+fn json(bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(bytes)
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(bytes)))
+}
+
+/// The shadow lens's MEDIUM 2: a manager error at the finalize is seen in the
+/// census. The erring body's row carries `applied_topics`, `deduped_topics`
+/// and the served not-landed reason in its words' bytes and names the manager
+/// and its error on both sides; the graph row carries the stopping body's
+/// whole word, and its status is 200 only when nothing stopped.
+#[tokio::test]
+async fn w2b_a_manager_error_at_the_finalize_shows_in_the_census() {
+    let scenario = erring_chain();
+    let shadow = beside(&scenario).await;
+    print_census("W2b", &shadow);
+    let c = scenario.txs[1].id();
+    let manager = format!("topic_manager.{TOPIC}");
+    let error = "the finalize refuses this body";
+
+    let row = shadow
+        .of(ShadowKind::Body)
+        .into_iter()
+        .find(|r| r.txid == c)
+        .expect("the erring body has its row");
+    let served = json(&row.served.bytes);
+    let ours = json(&row.shadow.bytes);
+    for (side, word) in [("served", &served), ("shadow", &ours)] {
+        assert_eq!(
+            word["applied_topics"],
+            serde_json::json!([]),
+            "{side}: {word}"
+        );
+        assert_eq!(
+            word["deduped_topics"],
+            serde_json::json!([]),
+            "{side}: {word}"
+        );
+        let errors = word["manager_errors"].to_string();
+        assert!(
+            errors.contains(&manager) && errors.contains(error),
+            "{side} names the manager and its error: {word}"
+        );
+    }
+    assert_eq!(
+        served["not_landed"],
+        serde_json::json!("the topic manager failed on it"),
+        "the served word says why the finalize stopped: {served}"
+    );
+    assert_eq!(
+        ours["not_landed"],
+        serde_json::Value::Null,
+        "A committed the unit: {ours}"
+    );
+    assert_ne!(
+        row.delta,
+        DeltaClass::Same,
+        "the served finalize stopped at this body and A went on: {row:?}"
+    );
+
+    let graph = &shadow.of(ShadowKind::Materialization)[0];
+    let served = json(&graph.served.bytes);
+    assert_ne!(
+        graph.served.status, 200,
+        "the served graph stopped: {graph:?}"
+    );
+    assert_eq!(served["stopped"]["txid"], serde_json::json!(c), "{served}");
+    assert_eq!(
+        json(served["stopped"]["bytes"].as_str().unwrap().as_bytes())["not_landed"],
+        serde_json::json!("the topic manager failed on it"),
+        "the graph word carries the stopping body's whole word: {served}"
+    );
+    assert_eq!(served["stopped"]["status"], serde_json::json!(200));
+    assert!(
+        served["manager_errors"].to_string().contains(error),
+        "{served}"
+    );
+}
+
 // ============================================================================
 // Witness 3: the four GASP chaos records of the HTTP corpus
 // (`parity-harness/corpus/xanaverse/chaos/0{1..4}_*.json`, Zanaadu), each a
