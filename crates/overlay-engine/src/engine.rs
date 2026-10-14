@@ -568,6 +568,7 @@ pub struct MutationReport {
     /// Pure checks that refused, ordered by topic, service and site. No apply
     /// writes or notifications are made for these topics. Accepted siblings
     /// can still apply. Empty under the default lookup-service checks.
+    /// For a refused topic, the STEAK is the judgement, not an admission.
     pub refused: Vec<AdmissionRefusal>,
     pub faults: Vec<MutationFault>,
     pub applied_topics: Vec<String>,
@@ -621,6 +622,7 @@ impl MutationReport {
 
     /// True when every mutation this submit needed landed (nothing to
     /// replay). A dupe-only submit is durable (there was nothing to write).
+    /// A caller classifies `refused` before `faults`.
     #[must_use]
     pub fn is_durable(&self) -> bool {
         self.faults.is_empty() && self.refused.is_empty()
@@ -1473,6 +1475,7 @@ impl Engine {
     /// 3. **MUTATE** — mark spent, delete stale, insert new outputs, notify lookup services
     ///
     /// Returns a STEAK mapping each topic to its admittance instructions.
+    /// For a refused topic, the STEAK is the judgement, not an admission.
     ///
     /// Phase-3 faults are reported through [`Engine::submit_with_report`];
     /// this convenience keeps the historical signature and only LOGS the
