@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.1.8] - 2026-10-14
+
+- Hold the GASP graph in flight when the per-peer deadline falls due, whatever
+  it fetched (`gasp_deferred_graphs`, reason `peer_deadline`), and move the
+  cursor past it to the page's last finished score; the next sync resumes it
+  ahead of its pages under the per-graph budget. Three consecutive cuts are
+  now needed only for the graph's own deadline. `cursor_held_by` names only
+  outpoints neither finished nor held.
+- Remember a root refused as expired across runs (`gasp_expired_outpoints`,
+  keyed by topic and outpoint), so a later sync skips it with no node fetch.
+  A row is kept until `max(expiry, refusal) + 7 days` and at most 20,000 a
+  topic, both swept by the cron. `gaspExpiredRefused` counts new refusals only.
+- A sync that finalized, moved the cursor, refused an expired root, retained a
+  graph holding a served node or resumed one with progress is never a failed
+  attempt for the quarantine. Only a finalize, a cursor move or a refusal ends
+  the yieldless streak; held and resumed walks stay inside its allowance.
+- New `Storage` methods `remember_expired_outpoint` and
+  `find_expired_outpoints` have defaults (fail-safe: the dead are fetched
+  again); a wrapper forwards both.
+- **DEPLOYMENT NOTE:** One additive migration (236 to 238): the table
+  `gasp_expired_outpoints` and its index `idx_gasp_expired_outpoints_keep`,
+  applied by the overlay's migration runner on its next cold start. No new
+  variable or dependency pin. The keeper sets both workspace versions and
+  internal floors for release.
+
 ## [0.1.7] - 2026-10-14
 
 - Give scheduled and admin transaction proof completion a dedicated 60-attempt
