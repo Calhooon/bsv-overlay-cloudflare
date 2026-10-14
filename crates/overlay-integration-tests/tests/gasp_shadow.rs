@@ -17,7 +17,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::{Rc, Weak};
 
 use async_trait::async_trait;
-use bsv_overlay_engine::admission::{UnitRunner, WalkOutcome, GATE_PARENT_ERROR_SITE};
+use bsv_overlay_engine::admission::{
+    AdmitRefusal, UnitRunner, WalkOutcome, GATE_PARENT_ERROR_SITE, INLINE_BEEF_MAX_BYTES,
+};
 use bsv_overlay_engine::engine::{Engine, EngineConfig};
 use bsv_overlay_engine::gasp_shadow::{
     AdmissionMode, DeltaClass, GaspCensusRow, GaspShadow, MemoryGaspShadow, ShadowBudget,
@@ -40,6 +42,9 @@ struct Scenario {
     budgeted: bool,
     /// Before each tick: what the peer does in it.
     ticks: Vec<fn(&ChaosRemote, &[Transaction])>,
+    /// The shadow's host cannot resolve an R2 BEEF (its read faults), so a
+    /// body past the inline bound is refused at its walk.
+    r2_faults: bool,
 }
 
 impl Scenario {
@@ -57,6 +62,7 @@ impl Scenario {
             fails_at_finalize: None,
             budgeted: false,
             ticks: vec![|_, _| {}],
+            r2_faults: false,
         }
     }
 }
@@ -90,6 +96,7 @@ struct Measured {
     inner: MemoryGaspShadow,
     live: RefCell<Vec<Weak<dyn UnitRunner>>>,
     peak: Cell<usize>,
+    r2_faults: bool,
 }
 
 impl Measured {
@@ -98,6 +105,7 @@ impl Measured {
             inner,
             live: RefCell::default(),
             peak: Cell::default(),
+            r2_faults: false,
         }
     }
 }
@@ -109,7 +117,15 @@ impl GaspShadow for Measured {
         scope: &ShadowScope<'_>,
         budget: &ShadowBudget,
     ) -> Result<ShadowSnapshot, String> {
-        let snapshot = self.inner.snapshot(scope, budget).await?;
+        let mut snapshot = self.inner.snapshot(scope, budget).await?;
+        if self.r2_faults {
+            snapshot.resolve = Box::new(|_, _| {
+                Err(AdmitRefusal::transient(
+                    "r2_resolve",
+                    "the host's read of the R2 BEEF faulted",
+                ))
+            });
+        }
         let mut live = self.live.borrow_mut();
         live.retain(|w| w.strong_count() > 0);
         live.push(Rc::downgrade(&snapshot.runner));
@@ -166,7 +182,9 @@ async fn run(
         if let Some(clock) = clock {
             host = host.with_clock(clock);
         }
-        let host = Rc::new(Measured::new(host));
+        let mut host = Measured::new(host);
+        host.r2_faults = scenario.r2_faults;
+        let host = Rc::new(host);
         engine.set_gasp_shadow(mode, host.clone());
         host
     });
@@ -625,6 +643,79 @@ async fn w8_d44_the_census_row_carries_the_gates_reason_per_body() {
         return;
     }
     panic!("no run took the erring parent first in 64 tries");
+}
+
+/// The gate lens's LOW 2: a body whose WALK is refused is handed to the gate
+/// as a held parent, so the graph is not stopped by position there. A fan-in
+/// whose parent `a` carries an output past the inline bound (its BEEF rides
+/// R2) under a host whose R2 read faults: `a`'s walk is refused, the sibling
+/// `b` is still judged and lands, and the root waits on `a`, in either
+/// sibling order (run until `a` came first, `b` after it). The served path lands all three (it reads no R2): the rows
+/// differ.
+#[tokio::test]
+async fn w10_d44_a_refused_walk_holds_its_descendants_and_its_siblings_land() {
+    let mut a = genesis(70, 1);
+    let mut data = vec![0x00, 0x6a, 0x4e];
+    data.extend(u32::try_from(INLINE_BEEF_MAX_BYTES).unwrap().to_le_bytes());
+    data.resize(data.len() + INLINE_BEEF_MAX_BYTES, 0xab);
+    a.outputs.push(bsv_rs::transaction::TransactionOutput::new(
+        1,
+        bsv_rs::script::LockingScript::from_binary(&data).unwrap(),
+    ));
+    let b = genesis(71, 1);
+    let r = spends(&[(&a, 0), (&b, 0)], 1);
+    let mut scenario = Scenario::honest(vec![a, b, r], vec![(2, 0, 1.0)]);
+    scenario.r2_faults = true;
+    let [a, b, r] = [0, 1, 2].map(|i| scenario.txs[i].id());
+    let off = run(&scenario, None, None, None).await;
+    // A frozen clock: the shadow's time budget is not this witness's (a
+    // 1.9 MB body is walked in seconds by a debug build).
+    for _ in 0..16 {
+        let shadow = run(&scenario, Some(AdmissionMode::Shadow), None, Some(|| 0)).await;
+        assert_eq!(
+            (&off.rows, &off.results),
+            (&shadow.rows, &shadow.results),
+            "the shadow changed nothing served (every body lands in either order)"
+        );
+        let graph = &shadow.of(ShadowKind::Materialization)[0];
+        let first = shadow.of(ShadowKind::Body)[0].txid.clone();
+        let ours = json(&graph.shadow.bytes);
+        let gate = serde_json::to_value(&graph.gate).unwrap();
+        println!(
+            "W10 {} first: landed {} stopped {} gate {gate}",
+            &first[..8],
+            ours["landed"],
+            ours["stopped"]["txid"],
+        );
+        assert_eq!(
+            (
+                ours["landed"].clone(),
+                ours["stopped"]["txid"].clone(),
+                gate
+            ),
+            (
+                serde_json::json!([b]),
+                serde_json::json!(a),
+                serde_json::json!([{"txid": r, "reason": {"waiting_on": [a]}}]),
+            ),
+            "the sibling lands, the refused walk stops the graph, the root waits on it"
+        );
+        for (tx, held) in [(&a, "false"), (&b, "true"), (&r, "false")] {
+            assert_eq!(
+                ours["rows"][format!("applied {tx}")],
+                serde_json::json!(held),
+                "{ours}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(graph.delta).unwrap(),
+            serde_json::json!("rows_differ")
+        );
+        if first == a {
+            return; // the refused walk first: the sibling after it was judged
+        }
+    }
+    panic!("16 runs never handed the refused walk first");
 }
 
 /// The census of every world above whose finalize order is our node's
