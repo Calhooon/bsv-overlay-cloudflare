@@ -9,8 +9,8 @@ mod world;
 
 #[test]
 fn off_recording_is_a1s_byte_for_byte_timing_included() {
-    let (transcript, polls) = world::recording(&|_, _| {});
-    let (again, polls_again) = world::recording(&|_, _| {});
+    let (transcript, polls) = world::recording(&|_, _, _| {});
+    let (again, polls_again) = world::recording(&|_, _, _| {});
     assert_eq!(
         (&transcript, &polls),
         (&again, &polls_again),

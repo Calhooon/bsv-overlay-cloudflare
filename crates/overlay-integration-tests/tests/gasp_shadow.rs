@@ -12,16 +12,16 @@
 #[path = "support/gasp_shadow_world.rs"]
 mod world;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use async_trait::async_trait;
-use bsv_overlay_engine::admission::WalkOutcome;
+use bsv_overlay_engine::admission::{UnitRunner, WalkOutcome};
 use bsv_overlay_engine::engine::{Engine, EngineConfig};
 use bsv_overlay_engine::gasp_shadow::{
     AdmissionMode, DeltaClass, GaspCensusRow, GaspShadow, MemoryGaspShadow, ShadowBudget,
-    ShadowKind, ShadowScope, ShadowSnapshot,
+    ShadowKind, ShadowScope, ShadowSnapshot, SHADOW_SNAPSHOTS_HELD,
 };
 use bsv_overlay_engine::storage::memory::MemoryStorage;
 use bsv_overlay_engine::storage::Storage;
@@ -71,6 +71,8 @@ struct Run {
     rows: BTreeMap<String, String>,
     census: Vec<GaspCensusRow>,
     snapshots: usize,
+    /// The most snapshots alive at once (taken and not yet compared).
+    peak_held: usize,
 }
 
 impl Run {
@@ -79,6 +81,46 @@ impl Run {
     }
     fn of(&self, kind: ShadowKind) -> Vec<&GaspCensusRow> {
         self.census.iter().filter(|r| r.kind == kind).collect()
+    }
+}
+
+/// The reference host, counting the snapshots alive (each one's store is
+/// dropped once its comparison ran) and their peak.
+struct Measured {
+    inner: MemoryGaspShadow,
+    live: RefCell<Vec<Weak<dyn UnitRunner>>>,
+    peak: Cell<usize>,
+}
+
+impl Measured {
+    fn new(inner: MemoryGaspShadow) -> Self {
+        Self {
+            inner,
+            live: RefCell::default(),
+            peak: Cell::default(),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl GaspShadow for Measured {
+    async fn snapshot(
+        &self,
+        scope: &ShadowScope<'_>,
+        budget: &ShadowBudget,
+    ) -> Result<ShadowSnapshot, String> {
+        let snapshot = self.inner.snapshot(scope, budget).await?;
+        let mut live = self.live.borrow_mut();
+        live.retain(|w| w.strong_count() > 0);
+        live.push(Rc::downgrade(&snapshot.runner));
+        self.peak.set(self.peak.get().max(live.len()));
+        Ok(snapshot)
+    }
+    fn now_ms(&self) -> u64 {
+        self.inner.now_ms()
+    }
+    async fn record(&self, row: &GaspCensusRow) -> Result<(), String> {
+        self.inner.record(row).await
     }
 }
 
@@ -124,7 +166,7 @@ async fn run(
         if let Some(clock) = clock {
             host = host.with_clock(clock);
         }
-        let host = Rc::new(host);
+        let host = Rc::new(Measured::new(host));
         engine.set_gasp_shadow(mode, host.clone());
         host
     });
@@ -154,8 +196,9 @@ async fn run(
         peer,
         results,
         rows,
-        census: host.as_ref().map_or_else(Vec::new, |h| h.census()),
-        snapshots: host.as_ref().map_or(0, |h| h.snapshots()),
+        census: host.as_ref().map_or_else(Vec::new, |h| h.inner.census()),
+        snapshots: host.as_ref().map_or(0, |h| h.inner.snapshots()),
+        peak_held: host.as_ref().map_or(0, |h| h.peak.get()),
     }
 }
 
@@ -545,6 +588,12 @@ async fn w2c_the_census_names_a_stop_delta_and_a_rows_delta_apart() {
 // ============================================================================
 
 fn assert_shadowed(run: &Run, bodies: usize, graphs: usize) {
+    // The shadow lens's LOW 4: the snapshots a sync holds at once, measured.
+    println!(
+        "snapshots: {} taken, {} held at the peak",
+        run.snapshots, run.peak_held
+    );
+    assert!(run.peak_held <= SHADOW_SNAPSHOTS_HELD);
     assert_eq!(
         (
             run.of(ShadowKind::Body).len(),
@@ -680,7 +729,7 @@ impl GaspShadow for Untouchable {
 
 #[test]
 fn w4_off_with_a_host_set_is_a1s_recording_timing_included() {
-    let (transcript, polls) = recording(&|engine, _| {
+    let (transcript, polls) = recording(&|engine, _, _| {
         engine.set_gasp_shadow(AdmissionMode::Off, Rc::new(Untouchable));
     });
     assert_eq!(digest(&transcript), OFF_A1_DIGEST);
@@ -737,6 +786,112 @@ async fn w5_past_the_budget_the_row_says_not_shadowed_budget_and_nothing_served_
         let word = String::from_utf8_lossy(&row.shadow.bytes).to_string();
         assert!(word.starts_with("not shadowed: budget (time"), "{word}");
     }
+}
+
+/// A reference host that writes a line into the recording's transcript for
+/// each census row it records.
+struct Logged {
+    inner: MemoryGaspShadow,
+    events: Events,
+}
+
+#[async_trait(?Send)]
+impl GaspShadow for Logged {
+    async fn snapshot(
+        &self,
+        scope: &ShadowScope<'_>,
+        budget: &ShadowBudget,
+    ) -> Result<ShadowSnapshot, String> {
+        self.inner.snapshot(scope, budget).await
+    }
+    fn now_ms(&self) -> u64 {
+        self.inner.now_ms()
+    }
+    async fn record(&self, row: &GaspCensusRow) -> Result<(), String> {
+        self.events
+            .borrow_mut()
+            .push(format!("census {:?} {}", row.kind, row.txid));
+        self.inner.record(row).await
+    }
+}
+
+/// The shadow's recording: the recorded world under `shadow`, its transcript
+/// carrying a line per census row.
+fn shadow_recording() -> (Vec<String>, Vec<u64>) {
+    recording(&|engine, store, events| {
+        engine.set_gasp_shadow(
+            AdmissionMode::Shadow,
+            Rc::new(Logged {
+                inner: shadow_host(store, None),
+                events: events.clone(),
+            }),
+        );
+    })
+}
+
+/// The shadow lens's LOW 4: the drain runs once a sync, after every served
+/// write of it (the peers' syncs, their cursors and their health rows), so
+/// the shadow's work delays no peer, topic or served write behind it.
+#[test]
+fn w5c_the_drain_runs_after_every_served_write_of_the_sync() {
+    let (transcript, _) = shadow_recording();
+    let mut tick = String::new();
+    let mut census_at = None;
+    let mut rows = 0;
+    for (i, line) in transcript.iter().enumerate() {
+        if line.starts_with("tick ") {
+            tick = line.clone();
+            census_at = None;
+        } else if line.starts_with("census ") {
+            rows += 1;
+            census_at.get_or_insert(i);
+        } else if line.starts_with("store.") || line.starts_with("remote.") {
+            if let Some(at) = census_at {
+                panic!(
+                    "{tick}: a served call after the census began (line {at}): {line}\n{}",
+                    transcript[at.saturating_sub(2)..=i].join("\n")
+                );
+            }
+        }
+    }
+    assert!(rows > 0, "the census was written");
+}
+
+/// The shadow lens's LOW 4: the snapshots one sync holds at once are bounded
+/// (`ShadowBudget::snapshots`); past it no snapshot is taken and the row says
+/// `not shadowed: budget (snapshots ...)`; nothing served moves.
+#[tokio::test]
+async fn w5d_the_snapshots_a_sync_holds_are_bounded() {
+    let scenario = recorded_world();
+    let off = run(&scenario, None, None, None).await;
+    let unbounded = run(&scenario, Some(AdmissionMode::Shadow), None, None).await;
+    println!(
+        "recorded world: {} snapshots taken, {} held at the peak (allowance {SHADOW_SNAPSHOTS_HELD})",
+        unbounded.snapshots, unbounded.peak_held
+    );
+    assert!(unbounded.peak_held > 2 && unbounded.peak_held <= SHADOW_SNAPSHOTS_HELD);
+    let bounded = run(
+        &scenario,
+        Some(AdmissionMode::Shadow),
+        Some(ShadowBudget {
+            snapshots: 2,
+            ..ShadowBudget::default()
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(off.served(), bounded.served());
+    assert!(bounded.peak_held <= 2, "held {}", bounded.peak_held);
+    assert_eq!(bounded.census.len(), unbounded.census.len(), "a row each");
+    let over: Vec<_> = bounded
+        .census
+        .iter()
+        .filter(|r| {
+            String::from_utf8_lossy(&r.shadow.bytes).starts_with("not shadowed: budget (snapshots")
+        })
+        .collect();
+    assert!(!over.is_empty(), "the limb was reached");
+    assert!(over.iter().all(|r| r.delta == DeltaClass::NotShadowed));
 }
 
 #[test]

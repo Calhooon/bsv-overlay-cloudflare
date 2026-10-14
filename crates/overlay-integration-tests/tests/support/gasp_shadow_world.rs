@@ -691,7 +691,11 @@ pub fn run_counting<F: Future>(future: F) -> (F::Output, u64) {
 /// under a per-peer budget whose deadline never falls due (the finalize
 /// hook's path). Returns the whole transcript (every storage call in order,
 /// each awaited, and every peer call) and the polls of each tick.
-pub fn recording(configure: &dyn Fn(&mut Engine, &Rc<MemoryStorage>)) -> (Vec<String>, Vec<u64>) {
+/// `configure` is handed the engine, the served store and the transcript's
+/// event stream (a test host can write its own lines into it).
+pub fn recording(
+    configure: &dyn Fn(&mut Engine, &Rc<MemoryStorage>, &Events),
+) -> (Vec<String>, Vec<u64>) {
     let parent = genesis(1, 2);
     let left = child(&parent, 0, 1);
     let right = child(&parent, 1, 1);
@@ -731,7 +735,7 @@ pub fn recording(configure: &dyn Fn(&mut Engine, &Rc<MemoryStorage>)) -> (Vec<St
         if budgeted {
             engine.set_peer_sync_budget(never_due(), 30_000);
         }
-        configure(&mut engine, &store);
+        configure(&mut engine, &store, &events);
         for tick in 0..2 {
             if tick == 1 {
                 remote.faults.borrow_mut().clear();
