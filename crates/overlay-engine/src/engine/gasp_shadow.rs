@@ -35,35 +35,46 @@ impl Drop for Held {
     }
 }
 
-pub(crate) struct BodyJob {
-    peer: String,
-    topic: String,
-    graph: String,
+/// What the served finalize answered for one body.
+pub(crate) struct BodyServed {
     txid: String,
     position: u32,
     beef: Vec<u8>,
-    prepared: Prepared,
     served: Word,
     served_judgement: Option<Judgement>,
 }
 
+/// A body's comparison on its own snapshot (every body but a graph's first).
+pub(crate) struct BodyJob {
+    peer: String,
+    topic: String,
+    graph: String,
+    prepared: Prepared,
+    body: BodyServed,
+}
+
+/// A graph's comparison. Its snapshot, taken just before the graph's first
+/// served submit, is also that body's: one state, one copy (the shadow lens's
+/// NOTE 6). `served` is set after the graph's last served body; a graph a
+/// deadline dropped mid-way has none and gives its first body's row alone.
 pub(crate) struct GraphJob {
     peer: String,
     topic: String,
     graph: String,
     beefs: Vec<Vec<u8>>,
     prepared: Prepared,
-    served: Word,
+    first: Option<BodyServed>,
+    served: Option<Word>,
 }
 
-/// One graph's shadow while the served finalize submits it: its snapshot,
-/// and what the served path landed and where it stopped.
+/// One graph's shadow while the served finalize submits it: its job's place
+/// in the queue, and what the served path landed and where it stopped.
 pub(crate) struct FinalizeShadow {
     host: Rc<dyn GaspShadow>,
     peer: String,
     topic: String,
     root: String,
-    prepared: Prepared,
+    slot: usize,
     landed: Vec<String>,
     stopped: Option<(String, Word)>,
     /// The topic managers' errors the served submits met.
@@ -396,7 +407,7 @@ impl Engine {
     }
 
     /// A graph's shadow, begun before its first served submit: the graph's
-    /// snapshot.
+    /// snapshot (its first body's too), its job queued in the graph's place.
     pub(crate) async fn shadow_graph_begin(
         &self,
         host: Rc<dyn GaspShadow>,
@@ -406,15 +417,26 @@ impl Engine {
         let prepared = self
             .shadow_prepare(host.as_ref(), peer, &graph.topic, &graph.beefs)
             .await;
+        let root = graph
+            .beefs
+            .last()
+            .map_or_else(String::new, |b| body_txid(b));
+        let mut jobs = self.shadow_jobs.borrow_mut();
+        jobs.push(ShadowJob::Graph(Box::new(GraphJob {
+            peer: peer.into(),
+            topic: graph.topic.clone(),
+            graph: root.clone(),
+            beefs: graph.beefs.clone(),
+            prepared,
+            first: None,
+            served: None,
+        })));
         FinalizeShadow {
-            root: graph
-                .beefs
-                .last()
-                .map_or_else(String::new, |b| body_txid(b)),
             host,
             peer: peer.into(),
             topic: graph.topic.clone(),
-            prepared,
+            root,
+            slot: jobs.len() - 1,
             landed: Vec::new(),
             stopped: None,
             manager_errors: Vec::new(),
@@ -422,16 +444,35 @@ impl Engine {
         }
     }
 
+    /// The graph's job, in its place.
+    fn graph_job<R>(
+        &self,
+        shadow: &FinalizeShadow,
+        f: impl FnOnce(&mut GraphJob) -> R,
+    ) -> Option<R> {
+        match self.shadow_jobs.borrow_mut().get_mut(shadow.slot) {
+            Some(ShadowJob::Graph(job)) => Some(f(job)),
+            _ => None,
+        }
+    }
+
     /// One body's snapshot, taken before its served submit (`body` is that
-    /// one BEEF); the managers' errors of that submit are captured from here.
+    /// one BEEF; none at position 0, whose state is the graph's snapshot);
+    /// the managers' errors of that submit are captured from here.
     pub(crate) async fn shadow_body_begin(
         &self,
         shadow: &FinalizeShadow,
+        position: usize,
         body: &[Vec<u8>],
-    ) -> Prepared {
-        let prepared = self
-            .shadow_prepare(shadow.host.as_ref(), &shadow.peer, &shadow.topic, body)
-            .await;
+    ) -> Option<Prepared> {
+        let prepared = if position == 0 {
+            None
+        } else {
+            Some(
+                self.shadow_prepare(shadow.host.as_ref(), &shadow.peer, &shadow.topic, body)
+                    .await,
+            )
+        };
         self.capture_manager_errors();
         prepared
     }
@@ -480,43 +521,42 @@ impl Engine {
         let word = Word::served(served, not_landed, &errors);
         shadow.manager_errors.extend(errors);
         shadow.last = Some(word.clone());
-        let Some(prepared) = prepared else {
-            return;
+        let body = BodyServed {
+            txid: body_txid(beef),
+            position: u32::try_from(position).unwrap_or(u32::MAX),
+            beef: beef.to_vec(),
+            served: word,
+            served_judgement: served.as_ref().ok().map(|(steak, _)| judgement_of(steak)),
         };
-        self.shadow_jobs
-            .borrow_mut()
-            .push(ShadowJob::Body(Box::new(BodyJob {
-                peer: shadow.peer.clone(),
-                topic: shadow.topic.clone(),
-                graph: shadow.root.clone(),
-                txid: body_txid(beef),
-                position: u32::try_from(position).unwrap_or(u32::MAX),
-                beef: beef.to_vec(),
-                prepared,
-                served: word,
-                served_judgement: served.as_ref().ok().map(|(steak, _)| judgement_of(steak)),
-            })));
+        match prepared {
+            Some(prepared) => {
+                self.shadow_jobs
+                    .borrow_mut()
+                    .push(ShadowJob::Body(Box::new(BodyJob {
+                        peer: shadow.peer.clone(),
+                        topic: shadow.topic.clone(),
+                        graph: shadow.root.clone(),
+                        prepared,
+                        body,
+                    })));
+            }
+            None => {
+                self.graph_job(shadow, |job| job.first = Some(body));
+            }
+        }
     }
 
-    /// Queue one graph's comparison: its snapshot, and the rows the served
-    /// submits left, read now (before a later graph moves them).
+    /// Complete one graph's comparison: the rows the served submits left,
+    /// read now (before a later graph moves them).
     pub(crate) async fn shadow_graph_served(&self, shadow: FinalizeShadow, beefs: &[Vec<u8>]) {
         let rows = materialized_rows(self.storage.as_ref(), &shadow.topic, beefs).await;
-        self.shadow_jobs
-            .borrow_mut()
-            .push(ShadowJob::Graph(Box::new(GraphJob {
-                served: materialization_word(
-                    &shadow.landed,
-                    shadow.stopped.as_ref(),
-                    &shadow.manager_errors,
-                    &rows,
-                ),
-                peer: shadow.peer,
-                topic: shadow.topic,
-                graph: shadow.root,
-                beefs: beefs.to_vec(),
-                prepared: shadow.prepared,
-            })));
+        let word = materialization_word(
+            &shadow.landed,
+            shadow.stopped.as_ref(),
+            &shadow.manager_errors,
+            &rows,
+        );
+        self.graph_job(&shadow, |job| job.served = Some(word));
     }
 
     /// Run every queued comparison and hand its row to the host. After the
@@ -528,17 +568,38 @@ impl Engine {
         };
         self.end_manager_errors();
         let jobs = std::mem::take(&mut *self.shadow_jobs.borrow_mut());
+        // A graph's job comes before its later bodies' (it holds the first
+        // body's snapshot); its row is recorded after them.
+        let mut graph_row = None;
         for job in jobs {
-            let row = match job {
-                ShadowJob::Body(job) => self.shadow_body(host.as_ref(), *job).await,
-                ShadowJob::Graph(job) => self.shadow_graph(host.as_ref(), *job).await,
-            };
-            if let Err(e) = host.record(&row).await {
-                warn!(
-                    "[GASP SHADOW] census row for {} ({:?}) not recorded: {e}",
-                    row.txid, row.kind
-                );
+            match job {
+                ShadowJob::Body(job) => {
+                    let row = self.shadow_body(host.as_ref(), *job).await;
+                    Self::record_row(host.as_ref(), &row).await;
+                }
+                ShadowJob::Graph(job) => {
+                    if let Some(row) = graph_row.take() {
+                        Self::record_row(host.as_ref(), &row).await;
+                    }
+                    let (first, graph) = self.shadow_graph(host.as_ref(), *job).await;
+                    if let Some(row) = first {
+                        Self::record_row(host.as_ref(), &row).await;
+                    }
+                    graph_row = graph;
+                }
             }
+        }
+        if let Some(row) = graph_row {
+            Self::record_row(host.as_ref(), &row).await;
+        }
+    }
+
+    async fn record_row(host: &dyn GaspShadow, row: &GaspCensusRow) {
+        if let Err(e) = host.record(row).await {
+            warn!(
+                "[GASP SHADOW] census row for {} ({:?}) not recorded: {e}",
+                row.txid, row.kind
+            );
         }
     }
 
@@ -579,25 +640,8 @@ impl Engine {
             start: host.now_ms(),
             budget: self.shadow_budget,
         };
-        let mut row = GaspCensusRow {
-            kind: ShadowKind::Body,
-            peer: job.peer,
-            topic: job.topic,
-            graph: job.graph,
-            txid: job.txid,
-            position: job.position,
-            served: job.served,
-            shadow: Word::not_shadowed("not judged"),
-            delta: DeltaClass::NotShadowed,
-            served_judgement: job.served_judgement,
-            shadow_judgement: None,
-            served_evidence: AdmitEvidence::default(),
-            shadow_evidence: AdmitEvidence::default(),
-            shadow_seqs: vec![],
-            snapshot_rows: 0,
-            snapshot_bytes: 0,
-            shadow_ms: 0,
-        };
+        let mut row = body_row(job.peer, job.topic, job.graph, job.body.served_parts());
+        let beef = job.body.beef;
         row.shadow = 'judged: {
             let snapshot = match job.prepared.snapshot {
                 Ok(snapshot) => snapshot,
@@ -609,9 +653,7 @@ impl Engine {
                 break 'judged Word::not_shadowed(why);
             }
             let walked =
-                match Self::shadow_walk(&snapshot, &job.beef, &row.topic, &row.served_evidence)
-                    .await
-                {
+                match Self::shadow_walk(&snapshot, &beef, &row.topic, &row.served_evidence).await {
                     Ok(walked) => walked,
                     Err(word) => break 'judged word,
                 };
@@ -644,21 +686,41 @@ impl Engine {
         row
     }
 
-    async fn shadow_graph(&self, host: &dyn GaspShadow, job: GraphJob) -> GaspCensusRow {
+    /// A graph's comparison on its snapshot, and its first body's: every body
+    /// walked first (the Worker's side; only the first when the graph has no
+    /// served word), the first body's `judge_dry` on the untouched snapshot,
+    /// then the graph in one hop (each body its own unit, stopping at the
+    /// first that does not land), the first unit's answer the first body's.
+    async fn shadow_graph(
+        &self,
+        host: &dyn GaspShadow,
+        job: GraphJob,
+    ) -> (Option<GaspCensusRow>, Option<GaspCensusRow>) {
+        if job.first.is_none() && job.served.is_none() {
+            return (None, None);
+        }
         let spent = Spent {
             host,
             before: job.prepared.ms,
             start: host.now_ms(),
             budget: self.shadow_budget,
         };
-        let mut row = GaspCensusRow {
+        let mut first = job.first.map(|body| {
+            body_row(
+                job.peer.clone(),
+                job.topic.clone(),
+                job.graph.clone(),
+                body.served_parts(),
+            )
+        });
+        let mut graph = job.served.map(|served| GaspCensusRow {
             kind: ShadowKind::Materialization,
-            peer: job.peer,
-            topic: job.topic,
+            peer: job.peer.clone(),
+            topic: job.topic.clone(),
             txid: job.graph.clone(),
-            graph: job.graph,
+            graph: job.graph.clone(),
             position: u32::try_from(job.beefs.len()).unwrap_or(u32::MAX),
-            served: job.served,
+            served,
             shadow: Word::not_shadowed("not judged"),
             delta: DeltaClass::NotShadowed,
             served_judgement: None,
@@ -669,26 +731,33 @@ impl Engine {
             snapshot_rows: 0,
             snapshot_bytes: 0,
             shadow_ms: 0,
-        };
-        row.shadow = 'judged: {
+        });
+        let judged: Result<Word, Word> = 'judged: {
             let snapshot = match job.prepared.snapshot {
                 Ok(snapshot) => snapshot,
-                Err(e) => break 'judged not_snapshotted(&e),
+                Err(e) => break 'judged Err(not_snapshotted(&e)),
             };
-            row.snapshot_rows = snapshot.rows;
-            row.snapshot_bytes = snapshot.bytes;
-            if let Some(why) = self.over_reads(&snapshot).or_else(|| spent.over()) {
-                break 'judged Word::not_shadowed(why);
+            for row in first.iter_mut().chain(graph.iter_mut()) {
+                row.snapshot_rows = snapshot.rows;
+                row.snapshot_bytes = snapshot.bytes;
             }
-            // Every body walked first (the Worker's side), then the graph in
-            // one hop: each body its own unit, stopping at the first that
-            // does not land.
+            if let Some(why) = self.over_reads(&snapshot).or_else(|| spent.over()) {
+                break 'judged Err(Word::not_shadowed(why));
+            }
+            let bodies = if graph.is_some() {
+                &job.beefs[..]
+            } else {
+                &job.beefs[..job.beefs.len().min(1)]
+            };
             let mut walked = Vec::new();
             let mut stopped = None;
-            for beef in &job.beefs {
-                match Self::shadow_walk(&snapshot, beef, &row.topic, &row.served_evidence).await {
+            let mut evidence = AdmitEvidence::default();
+            for beef in bodies {
+                match Self::shadow_walk(&snapshot, beef, &job.topic, &AdmitEvidence::default())
+                    .await
+                {
                     Ok(body) => {
-                        row.shadow_evidence.tx.extend(body.evidence.tx.clone());
+                        evidence.tx.extend(body.evidence.tx.clone());
                         walked.push(body);
                     }
                     Err(word) => {
@@ -697,33 +766,131 @@ impl Engine {
                     }
                 }
             }
+            if let Some(row) = first.as_mut() {
+                match (walked.first(), &stopped) {
+                    (Some(body), _) => {
+                        row.shadow_evidence = body.evidence.clone();
+                        let judged = snapshot.engine.judge_dry(body).await;
+                        row.shadow_judgement =
+                            judged.ok().map(|admitted| judgement_of(&admitted.steak));
+                    }
+                    (None, Some((_, word))) => row.shadow = word.clone(),
+                    (None, None) => {}
+                }
+            }
+            if let Some(row) = graph.as_mut() {
+                row.shadow_evidence = evidence;
+            }
             let mut landed = Vec::new();
             let mut refused = None;
-            let seqs = &mut row.shadow_seqs;
+            let mut errors = Vec::new();
+            let mut first_answer = None;
+            let mut seqs = Vec::new();
             let engine = &snapshot.engine;
             engine.capture_manager_errors();
             admit_graph_observed(
                 engine,
                 snapshot.runner.as_ref(),
                 &walked,
-                &mut |body, answer| match answer {
-                    Ok(committed) => {
-                        seqs.push(committed.seq);
-                        landed.push(body.txid.clone());
+                &mut |body, answer| {
+                    let met = engine.take_manager_errors();
+                    if first_answer.is_none() {
+                        first_answer = Some((
+                            Word::admission(answer, &met),
+                            answer.as_ref().ok().map(|committed| committed.seq),
+                        ));
                     }
-                    Err(refusal) => refused = Some((body.txid.clone(), Word::refusal(refusal))),
+                    errors.extend(met);
+                    match answer {
+                        Ok(committed) => {
+                            seqs.push(committed.seq);
+                            landed.push(body.txid.clone());
+                        }
+                        Err(refusal) => {
+                            refused = Some((body.txid.clone(), Word::refusal(refusal)));
+                        }
+                    }
                 },
             );
-            let errors = engine.end_manager_errors();
-            let stopped = refused.or(stopped);
-            let rows = materialized_rows(snapshot.engine.storage(), &row.topic, &job.beefs).await;
-            match spent.over() {
-                Some(why) => Word::not_shadowed(why),
-                None => materialization_word(&landed, stopped.as_ref(), &errors, &rows),
+            engine.end_manager_errors();
+            if let (Some(row), Some((word, seq))) = (first.as_mut(), first_answer) {
+                row.shadow = word;
+                row.shadow_seqs.extend(seq);
             }
+            let Some(row) = graph.as_mut() else {
+                break 'judged Ok(Word::not_shadowed("no graph"));
+            };
+            row.shadow_seqs = seqs;
+            let stopped = refused.or(stopped);
+            let rows = materialized_rows(snapshot.engine.storage(), &job.topic, &job.beefs).await;
+            Ok(materialization_word(
+                &landed,
+                stopped.as_ref(),
+                &errors,
+                &rows,
+            ))
         };
-        row.shadow_ms = spent.ms();
-        row.delta = classify(&row);
-        row
+        let over = spent.over();
+        if let Some(row) = first.as_mut() {
+            match (&judged, &over) {
+                (Err(word), _) => row.shadow = word.clone(),
+                (_, Some(why)) => row.shadow = Word::not_shadowed(why),
+                _ => {}
+            }
+            row.shadow_ms = spent.ms();
+            row.delta = classify(row);
+        }
+        if let Some(row) = graph.as_mut() {
+            row.shadow = match (judged, over) {
+                (Err(word), _) => word,
+                (_, Some(why)) => Word::not_shadowed(why),
+                (Ok(word), None) => word,
+            };
+            row.shadow_ms = spent.ms();
+            row.delta = classify(row);
+        }
+        (first, graph)
+    }
+}
+
+/// The served side of a body's row: its parts.
+struct ServedParts {
+    txid: String,
+    position: u32,
+    served: Word,
+    served_judgement: Option<Judgement>,
+}
+
+impl BodyServed {
+    fn served_parts(&self) -> ServedParts {
+        ServedParts {
+            txid: self.txid.clone(),
+            position: self.position,
+            served: self.served.clone(),
+            served_judgement: self.served_judgement.clone(),
+        }
+    }
+}
+
+/// A body's row before the shadow judged it.
+fn body_row(peer: String, topic: String, graph: String, body: ServedParts) -> GaspCensusRow {
+    GaspCensusRow {
+        kind: ShadowKind::Body,
+        peer,
+        topic,
+        graph,
+        txid: body.txid,
+        position: body.position,
+        served: body.served,
+        shadow: Word::not_shadowed("not judged"),
+        delta: DeltaClass::NotShadowed,
+        served_judgement: body.served_judgement,
+        shadow_judgement: None,
+        served_evidence: AdmitEvidence::default(),
+        shadow_evidence: AdmitEvidence::default(),
+        shadow_seqs: vec![],
+        snapshot_rows: 0,
+        snapshot_bytes: 0,
+        shadow_ms: 0,
     }
 }

@@ -5760,10 +5760,10 @@ impl Engine {
                 let tagged = TaggedBEEF::new(beef_bytes.clone(), vec![graph.topic.clone()]);
                 #[cfg(feature = "gasp-shadow")]
                 let body_snapshot = match &shadow {
-                    Some(shadow) => Some(
-                        self.shadow_body_begin(shadow, std::slice::from_ref(beef_bytes))
-                            .await,
-                    ),
+                    Some(shadow) => {
+                        self.shadow_body_begin(shadow, position, std::slice::from_ref(beef_bytes))
+                            .await
+                    }
                     None => None,
                 };
                 // No deadline drops a write section, and the section does
