@@ -12962,6 +12962,12 @@ mod tests {
         ) -> Result<crate::gasp::DeferredGraphSave, StorageError> {
             self.inner.put_deferred_graph(record).await
         }
+        async fn reserve_unanchorable_retry(
+            &self,
+            record: &crate::gasp::DeferredGraph,
+        ) -> Result<bool, StorageError> {
+            self.inner.reserve_unanchorable_retry(record).await
+        }
         async fn find_deferred_graphs(
             &self,
             host: &str,

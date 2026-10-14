@@ -354,13 +354,13 @@ pub trait Storage {
     /// global ceiling), counted `too_many`; the walk then goes on under the
     /// per-peer budget alone, as before #555.
     ///
-    /// The four deferred-graph methods are REQUIRED (the lens fold's M2,
+    /// The deferred-graph methods are REQUIRED (the lens fold's M2,
     /// the house style of `TopicManager::identify_admissible_outputs`): with
     /// a default, a storage or WRAPPER that did not forward them compiled,
     /// and `Engine::set_graph_budget` over it saved nothing, walked every
     /// graph past the call budget from its root on every tick and never
     /// admitted it (`store_fault`), a hard cap on graph size worse than no
-    /// budget. A wrapper forwards all four to the storage it wraps:
+    /// budget. A wrapper forwards these methods to the storage it wraps:
     ///
     /// ```ignore
     /// async fn put_deferred_graph(&self, record: &DeferredGraph)
@@ -368,7 +368,7 @@ pub trait Storage {
     ///     self.inner.put_deferred_graph(record).await
     /// }
     /// // and the same for find_deferred_graphs, get_deferred_graph and
-    /// // delete_deferred_graph.
+    /// // delete_deferred_graph and reserve_unanchorable_retry.
     /// ```
     ///
     /// A backend that keeps no records answers none from
@@ -379,6 +379,14 @@ pub trait Storage {
         &self,
         record: &crate::gasp::DeferredGraph,
     ) -> Result<crate::gasp::DeferredGraphSave, StorageError>;
+
+    /// Atomically replace an unanchorable record only when its score and class
+    /// match, its backoff elapsed, and `record` reserves exactly the next retry.
+    /// Return false on a stale claim or exhausted room. Wrappers must forward it.
+    async fn reserve_unanchorable_retry(
+        &self,
+        record: &crate::gasp::DeferredGraph,
+    ) -> Result<bool, StorageError>;
 
     /// The KEYS of the records of (`host`, `topic`), lowest score first. A
     /// sync reads these up front and each record only when its UTXO is
@@ -653,6 +661,12 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
         record: &crate::gasp::DeferredGraph,
     ) -> Result<crate::gasp::DeferredGraphSave, StorageError> {
         (**self).put_deferred_graph(record).await
+    }
+    async fn reserve_unanchorable_retry(
+        &self,
+        record: &crate::gasp::DeferredGraph,
+    ) -> Result<bool, StorageError> {
+        (**self).reserve_unanchorable_retry(record).await
     }
     async fn find_deferred_graphs(
         &self,
@@ -1458,6 +1472,49 @@ pub mod memory {
                 record.clone(),
             );
             Ok(crate::gasp::DeferredGraphSave::Saved)
+        }
+
+        async fn reserve_unanchorable_retry(
+            &self,
+            record: &crate::gasp::DeferredGraph,
+        ) -> Result<bool, StorageError> {
+            *self.deferred_graph_put_attempts.lock().unwrap() += 1;
+            if *self.deferred_graph_put_fault.lock().unwrap() {
+                return Err(StorageError::Database("retry reservation faulted".into()));
+            }
+            let ceiling = *self.deferred_graph_byte_ceiling.lock().unwrap();
+            let key = (
+                record.peer.clone(),
+                record.topic.clone(),
+                record.outpoint.clone(),
+            );
+            let mut held = self.deferred_graphs.lock().unwrap();
+            let Some(prior) = held.get(&key) else {
+                return Ok(false);
+            };
+            let now = (crate::engine::current_timestamp_ms() / 1000.0) as u64;
+            if !prior.is_unanchorable()
+                || prior.reason != record.reason
+                || prior.score != record.score
+                || prior.retry_at > now
+                || prior.unanchorable_retries.checked_add(1) != Some(record.unanchorable_retries)
+                || record.unanchorable_retries > crate::gasp::UNANCHORABLE_RETRIES
+            {
+                return Ok(false);
+            }
+            if ceiling.is_some_and(|limit| {
+                held.iter()
+                    .filter(|(k, _)| **k != key)
+                    .map(|(_, r)| r.byte_size())
+                    .sum::<usize>()
+                    + record.byte_size()
+                    > limit
+            }) {
+                return Ok(false);
+            }
+            held.insert(key, record.clone());
+            *self.deferred_graph_writes.lock().unwrap() += 1;
+            Ok(true)
         }
 
         async fn find_deferred_graphs(

@@ -1557,6 +1557,20 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             .map_err(|e| GASPError::StorageError(e.to_string()))
     }
 
+    async fn reserve_unanchorable_retry(
+        &self,
+        record: &crate::gasp::DeferredGraph,
+    ) -> Result<bool, GASPError> {
+        let mut record = record.clone();
+        record.peer.clone_from(&self.peer);
+        record.topic.clone_from(&self.topic);
+        record.configured = self.configured_peer;
+        self.storage
+            .reserve_unanchorable_retry(&record)
+            .await
+            .map_err(|e| GASPError::StorageError(e.to_string()))
+    }
+
     async fn delete_deferred_graph(&self, outpoint: &str) -> Result<(), GASPError> {
         self.storage
             .delete_deferred_graph(&self.peer, &self.topic, outpoint)

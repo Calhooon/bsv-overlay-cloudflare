@@ -3566,6 +3566,12 @@ impl Storage for ScriptedStore {
     ) -> Result<bsv_overlay_engine::gasp::DeferredGraphSave, StorageError> {
         self.inner.put_deferred_graph(record).await
     }
+    async fn reserve_unanchorable_retry(
+        &self,
+        record: &bsv_overlay_engine::gasp::DeferredGraph,
+    ) -> Result<bool, StorageError> {
+        self.inner.reserve_unanchorable_retry(record).await
+    }
     async fn find_deferred_graphs(
         &self,
         host: &str,
