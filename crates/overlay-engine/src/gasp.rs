@@ -2096,7 +2096,7 @@ impl<'a> GASPSync<'a> {
         walk.struck = Some(Box::new(record.clone()));
         *self.walk.borrow_mut() = Some(walk);
         let ended = self.walk_graph(Some(&mut *deadline)).await;
-        let out = self.finish_pass(outpoint, ended).await;
+        let out = self.finish_pass(outpoint, ended, deadline).await;
         let keep_unanchorable = |record: &DeferredGraph| {
             let mut record = record.clone();
             record.retry_at = Self::now_secs() + UNANCHORABLE_RETRY_SECS;
@@ -3154,7 +3154,7 @@ impl<'a> GASPSync<'a> {
             self.walk_graph(Some(&mut *deadline)).await
         }
         .await;
-        self.finish_pass(outpoint, ended).await
+        self.finish_pass(outpoint, ended, deadline).await
     }
 
     /// Append the walk's fetched nodes to the graph (a resume, or a walk
@@ -3175,14 +3175,14 @@ impl<'a> GASPSync<'a> {
     }
 
     /// The end of a budgeted pass: complete the graph, defer it, or fail
-    /// its UTXO. A walk past its per-graph budget that cannot be KEPT (past
-    /// [`DEFERRED_GRAPHS_PER_PEER_TOPIC`] or the storage's ceiling) goes on under the per-peer budget alone, as
-    /// every walk did before #555 (the lens fold's L4: such a graph completed
-    /// in one pass before #555, and was then failed on every pass).
+    /// its UTXO. A call/size cut whose record cannot be kept may continue
+    /// within the same root deadline (L4). Time and courier limits stop it
+    /// even when the storage refuses the save; the cursor retains its gap.
     async fn finish_pass(
         &self,
         outpoint: &str,
         mut ended: Result<WalkEnd, GASPError>,
+        deadline: &mut crate::engine::SleepFuture,
     ) -> Result<Ingested, GASPError> {
         loop {
             let graph_id = Self::graph_id_of(self.walk.borrow().as_ref(), outpoint);
@@ -3304,11 +3304,10 @@ impl<'a> GASPSync<'a> {
                     ("fault", false)
                 }
             };
-            // Only a walk the per-graph budget cut may go on (L4).
-            let budget_cut = matches!(
-                reason,
-                "calls" | "time" | "bytes" | "nodes" | "courier_rungs"
-            );
+            // Call and size cuts may go on if no record fits (L4), with
+            // the original deadline still active. Time and courier cuts
+            // stop this root even if its save is refused.
+            let budget_cut = matches!(reason, "calls" | "bytes" | "nodes");
             let (why, mut walk) = match self.save_walk(reason, completed).await {
                 Saved::Retry => {
                     let _ = self.storage.discard_graph(&graph_id).await;
@@ -3361,7 +3360,7 @@ impl<'a> GASPSync<'a> {
                 }
             };
             info!(
-                "{} Graph {} cannot be kept ({}): its walk goes on under the per-peer budget alone (bsv-low #555)",
+                "{} Graph {} cannot be kept ({}): its walk goes on with the root deadline (bsv-low #555)",
                 self.log_prefix,
                 outpoint,
                 why.as_str()
@@ -3370,7 +3369,7 @@ impl<'a> GASPSync<'a> {
             walk.gone_on = true;
             *self.walk.borrow_mut() = Some(*walk);
             // The graph in hand was never discarded: walk on.
-            ended = self.walk_graph(None).await;
+            ended = self.walk_graph(Some(&mut *deadline)).await;
         }
     }
 
@@ -3441,8 +3440,8 @@ impl<'a> GASPSync<'a> {
 
     /// Save the walk in hand as its graph's record (bsv-low #555), counting
     /// a deferral; or hand it back UNKEPT with the reason (past a bound, or
-    /// holding no node), or answer the storage's fault with the walk (a walk
-    /// the per-graph budget cut then goes on, D-L2; any other fails its
+    /// holding no node), or answer the storage's fault with the walk (a call
+    /// or size cut may go on within its deadline, D-L2; any other fails its
     /// UTXO). A walk that already went on is neither saved nor counted again
     /// (D-L1). Counts the pass progressed or stalled (the lens fold's H1),
     /// once per pass.
@@ -3807,6 +3806,7 @@ impl<'a> GASPSync<'a> {
     }
 
     fn root_bound(&self, reason: &'static str) -> WalkEnd {
+        self.last_fault.set(None);
         if let Some(walk) = self.walk.borrow().as_ref() {
             self.stats
                 .borrow_mut()

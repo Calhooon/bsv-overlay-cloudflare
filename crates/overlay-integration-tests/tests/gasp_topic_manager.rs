@@ -9238,7 +9238,8 @@ async fn e555d2_l1_a_fresh_walk_that_paid_half_its_budget_keeps_its_record() {
     assert!(records.is_empty(), "under half: D-M1");
     // 100 calls, half the TIME due at once: the second call faults, kept.
     let half_due: bsv_overlay_engine::engine::SleepFactory = Rc::new(|ms| {
-        if ms == 30_000 {
+        // The configured minute is clamped to the root's time ceiling.
+        if ms == bsv_overlay_engine::meter::ROOT_MAX_MS / 2 {
             Box::pin(std::future::ready(()))
         } else {
             Box::pin(std::future::pending::<()>())

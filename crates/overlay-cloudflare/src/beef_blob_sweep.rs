@@ -1744,7 +1744,7 @@ mod tests {
             .find("crate::beef_blob_sweep::run_pass(env,&ops_db,\"tick\").await;")
             .expect("the scheduled tick runs one bounded pass of the sweep");
         assert!(
-            sweep < tick.find("engine.start_gasp_sync()").unwrap(),
+            sweep < tick.find("engine.start_gasp_sync_metered(").unwrap(),
             "before the GASP step"
         );
         let ops = squash(include_str!("ops.rs"));

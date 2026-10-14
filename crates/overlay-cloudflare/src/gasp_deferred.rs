@@ -1433,7 +1433,7 @@ mod tests {
             .find("crate::gasp_deferred::sweep_stale(&ops_db).await;")
             .unwrap();
         let sync = tick
-            .find("engine.start_gasp_sync(),crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS)")
+            .find("engine.start_gasp_sync_metered(&overlay_engine::sync_load::SyncFilter::default(),&gasp_meter),crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS)")
             .unwrap();
         assert!(sweep < sync, "the tick sweeps before its GASP sync");
         assert!(counter_names().contains(&COUNTER_GASP_GRAPH_DROPPED_STALE.to_string()));
