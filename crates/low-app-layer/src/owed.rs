@@ -1548,6 +1548,13 @@ fn p2pkh_outputs_of_raw(raw: &[u8], txid: &str) -> Option<Vec<Option<String>>> {
     )
 }
 
+/// The served `payPkhSource` (the L25 lens's NOTE-1): where a payout row's `payPkh` was read. The identity's
+/// COMMITTED home (the pot's decoded keys), or, on a hop whose game has no committed home, the FILED SWEEP's own
+/// sole P2PKH output. ABSENT when `payPkh` is `null`. An additive fact: nothing compares a derivation to a
+/// `filed-sweep` pkh, which is the sweep's own destination and would make such a check tautological.
+pub const PAY_PKH_COMMITTED_HOME: &str = "committed-home";
+pub const PAY_PKH_FILED_SWEEP: &str = "filed-sweep";
+
 /// The served key of one (paying txid, home pkh) pair in the route's `payVout` map, lowercase.
 pub fn pay_vout_key(pay_txid: &str, pkh_hex: &str) -> String {
     format!(
@@ -2256,7 +2263,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     // spend's output to my committed home `payPkh`). The spend's output order is not in the index
                     // (a rake output may lead it), so the vout is `null` here and the route names it from the
                     // spend's stored bytes (`pay_vout_wanted`, `mark_pay_vouts`); `null` stays when it could not.
-                    facts["payPkh"] = json!(my_committed_pay_pkh(e));
+                    let pay_pkh = my_committed_pay_pkh(e);
+                    if pay_pkh.is_some() {
+                        facts["payPkhSource"] = json!(PAY_PKH_COMMITTED_HOME);
+                    }
+                    facts["payPkh"] = json!(pay_pkh);
                     facts["payVout"] = Value::Null;
                     facts["payASats"] = json!(e.money.settle.as_ref().and_then(|s| s.pay_a_sats));
                     facts["payBSats"] = json!(e.money.settle.as_ref().and_then(|s| s.pay_b_sats));
@@ -2558,7 +2569,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             // sweep, and the client's press derives its home itself and reads neither field
             let raw = swept.raw_hex.as_deref().and_then(|h| hex::decode(h).ok());
             let committed = i.my_pkh_by_game.get(&game).map(|p| p.to_ascii_lowercase());
-            let (pay_pkh, pay_vout) = match committed {
+            let (pay_pkh, pay_vout, pay_pkh_source) = match committed {
                 Some(pkh) => {
                     let vout = match swept.home_outputs.as_slice() {
                         [(vout, _)] => Some(*vout),
@@ -2567,16 +2578,19 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             .and_then(|r| sole_home_vout_of_raw(r, &swept.sweep_txid, &pkh)),
                         _ => None,
                     };
-                    (Some(pkh), vout)
+                    (Some(pkh), vout, Some(PAY_PKH_COMMITTED_HOME))
                 }
                 None => match raw
                     .as_deref()
                     .and_then(|r| sole_p2pkh_output_of_raw(r, &swept.sweep_txid))
                 {
-                    Some((vout, pkh)) => (Some(pkh), Some(vout)),
-                    None => (None, None),
+                    Some((vout, pkh)) => (Some(pkh), Some(vout), Some(PAY_PKH_FILED_SWEEP)),
+                    None => (None, None, None),
                 },
             };
+            if let Some(source) = pay_pkh_source {
+                facts["payPkhSource"] = json!(source);
+            }
             facts["payPkh"] = json!(pay_pkh);
             facts["payVout"] = json!(pay_vout);
             facts["collectedMarkerPresent"] =
@@ -6501,6 +6515,7 @@ pub(crate) mod tests {
             (&json!(claim), &json!(home_hex))
         );
         assert!(rows[0].facts["payVout"].is_null());
+        assert_eq!(rows[0].facts["payPkhSource"], "committed-home");
         assert_eq!(
             pay_vout_wanted(&rows),
             vec![(claim.clone(), home_hex.clone())]
@@ -6532,6 +6547,10 @@ pub(crate) mod tests {
         let keyless = [keyless];
         let rows_k = derive_owed_rows(&inputs(&keyless, &[], &[], &v, &c, &p, Some(900_200)));
         assert!(rows_k[0].facts["payPkh"].is_null() && rows_k[0].facts["payVout"].is_null());
+        assert!(
+            rows_k[0].facts.get("payPkhSource").is_none(),
+            "no payPkh: no source"
+        );
         assert!(pay_vout_wanted(&rows_k).is_empty());
 
         // THE SWEPT HOP'S ROW: the filed sweep's own raw names the output (it hashes to the sweep's txid)
@@ -6556,6 +6575,7 @@ pub(crate) mod tests {
             ),
             (&json!(sweep), &json!(home_hex), &json!(0))
         );
+        assert_eq!(rows_s[0].facts["payPkhSource"], "committed-home");
         // a home this list does not know: the filed sweep's sole P2PKH output names itself (bsv-low L25, pinned by
         // `l25_a_*`), and the route is not asked (a sweep is not in `pot_beefs`' contract)
         let mut i = inputs(&[], &[], &hops, &v, &NONE, &p, Some(900_000));
@@ -6565,29 +6585,55 @@ pub(crate) mod tests {
             (&rows_n[0].facts["payPkh"], &rows_n[0].facts["payVout"]),
             (&json!(home_hex), &json!(0))
         );
+        assert_eq!(rows_n[0].facts["payPkhSource"], "filed-sweep");
         assert!(pay_vout_wanted(&rows_n).is_empty());
     }
 
     #[test]
     fn l25_a_pot_less_hopsweep_row_names_the_filed_sweeps_sole_p2pkh_output() {
         // beta pair 17, 2026-10-14: a hop whose JOIN never assembled has no pot home (`my_pkh_by_game` is empty), and
-        // its filed sweep (one output, 20,170 sats to the wallet's key) was served `payPkh: null, payVout: null`
+        // its filed sweep was served `payPkh: null, payVout: null`. The bytes are the trace's own `sweepRawHex` (the
+        // L25 lens's NOTE-2): one input spending `edd91866..c3db:0`, one output of 20,170 sats to `3d0e8bcc..669d`
         use bsv_rs::script::LockingScript;
         use bsv_rs::transaction::{Transaction, TransactionOutput};
+        const SWEEP: &str = "4e3d7436ff8529e7cf56a87682b1b50cb1291ac987202647f6bfab781a654ed7";
+        const SWEEP_RAW: &str = "0100000001dbc374dbe28fef26aeb49a01e928d4b77c2069ff394adbfb7d773c986618d9ed000000006b483045022100bee8d7e1dc239a995fa3ebfedd5a02f7a0a33504d9cfc7453e08324a604a192b0220226c667d7e719078486dacdf72bbaad6d87b5af7b94b583b644869d5c2990d17412102752292ff79e0c1827caf0b6e43df06014523ef632b27f7633bc0cd72fd50054affffffff01ca4e0000000000001976a9143d0e8bccb9f1b8f314cd9fa8a478e61d6445669d88ac00000000";
         let pkh_hex = "3d0e8bccb9f1b8f314cd9fa8a478e61d6445669d";
         let pkh: [u8; 20] = hex::decode(pkh_hex).unwrap().try_into().unwrap();
-        let raw_of = |outs: &[(u64, &[u8; 20])]| -> (String, Vec<u8>) {
+        let real_raw = hex::decode(SWEEP_RAW).unwrap();
+        let real = Transaction::from_binary(&real_raw).unwrap();
+        assert_eq!(
+            real.id(),
+            SWEEP,
+            "the trace's bytes hash to the sweep's txid"
+        );
+        assert_eq!(real.inputs.len(), 1);
+        assert_eq!(
+            real.inputs[0].source_txid.as_deref(),
+            Some("edd91866983c777dfbdb4a39ff69207cb7d428e9019ab4ae26ef8fe2db74c3db")
+        );
+        assert_eq!(real.inputs[0].source_output_index, 0);
+        assert_eq!(real.outputs.len(), 1);
+        assert_eq!(real.outputs[0].satoshis, Some(20_170));
+        assert_eq!(
+            hex::encode(real.outputs[0].locking_script.to_binary()),
+            format!("76a914{pkh_hex}88ac")
+        );
+        // the edge rows: the real sweep's version, input and lock time with its outputs replaced (each script as raw
+        // bytes); a fresh transaction, since a parsed one caches its hash
+        let p2pkh = |p: &[u8; 20]| overlay_discovery::pot::p2pkh_lock(p);
+        let raw_of = |outs: &[(u64, Vec<u8>)]| -> (String, Vec<u8>) {
             let mut t = Transaction::new();
-            for (sats, p) in outs {
-                t.outputs.push(TransactionOutput {
+            (t.version, t.inputs, t.lock_time) =
+                (real.version, real.inputs.clone(), real.lock_time);
+            t.outputs = outs
+                .iter()
+                .map(|(sats, script)| TransactionOutput {
                     satoshis: Some(*sats),
-                    locking_script: LockingScript::from_binary(
-                        &overlay_discovery::pot::p2pkh_lock(p),
-                    )
-                    .unwrap(),
+                    locking_script: LockingScript::from_binary(script).unwrap(),
                     change: false,
-                });
-            }
+                })
+                .collect();
             (t.id(), t.to_binary())
         };
         let (v, p) = (HashMap::new(), HashSet::new());
@@ -6605,26 +6651,57 @@ pub(crate) mod tests {
             assert_eq!(rows[0].facts["sweepSource"], "hopsweep-filing");
             rows.remove(0)
         };
-        // ONE P2PKH output: named, its index and its own pkh, and the route is asked nothing
-        let (sweep, raw) = raw_of(&[(20_170, &pkh)]);
-        let row = row_of(&sweep, &raw);
-        assert_eq!(
+        let named = |row: &OwedRow| {
             (
-                &row.facts["payTxid"],
-                &row.facts["payPkh"],
-                &row.facts["payVout"]
-            ),
-            (&json!(sweep), &json!(pkh_hex), &json!(0)),
+                row.facts["payPkh"].clone(),
+                row.facts["payVout"].clone(),
+                row.facts.get("payPkhSource").cloned(),
+            )
+        };
+        let unnamed = (Value::Null, Value::Null, None);
+        // THE TRACE'S SWEEP: named, its index and its own pkh, the source `filed-sweep`, the route asked nothing
+        let row = row_of(SWEEP, &real_raw);
+        assert_eq!(row.facts["payTxid"], json!(SWEEP));
+        assert_eq!(
+            named(&row),
+            (json!(pkh_hex), json!(0), Some(json!("filed-sweep"))),
             "a pot-less hop's filed sweep names its one P2PKH output"
         );
         assert!(pay_vout_wanted(std::slice::from_ref(&row)).is_empty());
         // TWO P2PKH outputs: never a pick
-        let (two, two_raw) = raw_of(&[(10_000, &pkh), (10_170, &[0x22u8; 20])]);
-        let row = row_of(&two, &two_raw);
-        assert!(row.facts["payPkh"].is_null() && row.facts["payVout"].is_null());
+        let (two, two_raw) = raw_of(&[(10_000, p2pkh(&pkh)), (10_170, p2pkh(&[0x22u8; 20]))]);
+        assert_eq!(named(&row_of(&two, &two_raw)), unnamed);
         // bytes that do not hash to the sweep's txid: nothing named
-        let row = row_of(&two, &raw);
-        assert!(row.facts["payPkh"].is_null() && row.facts["payVout"].is_null());
+        assert_eq!(named(&row_of(&two, &real_raw)), unnamed);
+        // NOTE-3 (a): an OP_RETURN BEFORE the one P2PKH: the P2PKH is named at ITS index, never the OP_RETURN's
+        let op_return = vec![0x00, 0x6a, 0x03, b'L', b'O', b'W'];
+        let (opr, opr_raw) = raw_of(&[(0, op_return), (20_170, p2pkh(&pkh))]);
+        assert_eq!(
+            named(&row_of(&opr, &opr_raw)),
+            (json!(pkh_hex), json!(1), Some(json!("filed-sweep")))
+        );
+        // NOTE-3 (b): a 25-byte P2PKH LOOKALIKE (OP_CHECKSIGVERIFY for OP_CHECKSIG) is not P2PKH: alone it names
+        // nothing; beside the real one it is not counted, so the real one is named
+        let mut lookalike = p2pkh(&[0x22u8; 20]);
+        assert_eq!((lookalike.len(), lookalike[24]), (25, 0xac));
+        lookalike[24] = 0xad;
+        let (look, look_raw) = raw_of(&[(20_170, lookalike.clone())]);
+        assert_eq!(named(&row_of(&look, &look_raw)), unnamed);
+        let (both, both_raw) = raw_of(&[(100, lookalike), (20_070, p2pkh(&pkh))]);
+        assert_eq!(
+            named(&row_of(&both, &both_raw)),
+            (json!(pkh_hex), json!(1), Some(json!("filed-sweep")))
+        );
+        // NOTE-3 (c): a 0-sat P2PKH beside a funded one is a second P2PKH output: null, never a pick by value. The
+        // rule counts SCRIPTS, never sats, so a 0-sat P2PKH that is the SOLE P2PKH output is named all the same
+        // (its pkh is the seat's own signed destination; the device's hold rule still judges the outpoint)
+        let (zero, zero_raw) = raw_of(&[(20_170, p2pkh(&pkh)), (0, p2pkh(&[0x22u8; 20]))]);
+        assert_eq!(named(&row_of(&zero, &zero_raw)), unnamed);
+        let (sole0, sole0_raw) = raw_of(&[(0, p2pkh(&pkh))]);
+        assert_eq!(
+            named(&row_of(&sole0, &sole0_raw)),
+            (json!(pkh_hex), json!(0), Some(json!("filed-sweep")))
+        );
     }
 
     #[test]
