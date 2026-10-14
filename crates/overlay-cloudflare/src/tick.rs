@@ -350,7 +350,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 r.topics_synced.values().map(f).sum()
             };
             worker::console_log!(
-                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={} anchor_walk_held_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped_graphs={} stalled_graphs={} held_back_graphs={}",
+                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={} anchor_walk_held_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped_graphs={} stalled_graphs={} held_back_graphs={} unanchorable_graphs={} unanchorable_cleared={}",
                 r.topics_synced.len(),
                 total_peers,
                 total_errors,
@@ -362,7 +362,9 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 sum(|t| t.converged_graphs),
                 sum(|t| t.dropped_graphs.len() as u64),
                 sum(|t| t.stalled_graphs),
-                sum(|t| t.held_back_graphs)
+                sum(|t| t.held_back_graphs),
+                sum(|t| t.unanchorable_graphs),
+                sum(|t| t.unanchorable_cleared)
             );
             crate::gasp_deferred::record_counters(&ops_db, &r.topics_synced).await;
             // bsv-low #552: what the tick got done under the per-peer
@@ -390,7 +392,18 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 total_cursor_moves
             );
             for (topic, res) in &r.topics_synced {
-                worker::console_log!("Scheduled GASP topic={} gaspRootsProven={} gaspRootsUnproven={} cursor_held_by={:?}", topic, res.roots_proven, res.roots_unproven, res.cursor_held_by);
+                // Engine 0.1.9: every root a peer's sync dropped, once a
+                // run, with its fault class; `cursor_held_by` names only what
+                // is neither finished nor held, so the two together say why
+                // the cursor stopped or moved.
+                worker::console_log!(
+                    "Scheduled GASP topic={} gaspRootsProven={} gaspRootsUnproven={} cursor_held_by={:?} faulted={:?}",
+                    topic,
+                    res.roots_proven,
+                    res.roots_unproven,
+                    res.cursor_held_by,
+                    faulted_summary(&res.faulted_roots)
+                );
                 if !res.errors.is_empty()
                     || res.pruned_inputs > 0
                     || res.discarded_graphs > 0
@@ -836,9 +849,53 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     result.ok_or_else(|| "tick exceeded its total budget".to_string())
 }
 
+/// PURE: one item per root a sync dropped (engine 0.1.9), for the tick's
+/// line: `<outpoint> <class> runs=<n>`, ` unanchorable` once the cursor
+/// passes it, then the peer.
+pub(crate) fn faulted_summary(roots: &[overlay_engine::gasp::FaultedRoot]) -> Vec<String> {
+    roots
+        .iter()
+        .map(|f| {
+            let passed = if f.unanchorable { " unanchorable" } else { "" };
+            format!(
+                "{} {} runs={}{} {}",
+                f.outpoint, f.class, f.faults, passed, f.peer
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Engine 0.1.9: the tick's per-topic line names each dropped root with
+    /// its class, its faulted runs and whether the cursor passes it.
+    #[test]
+    fn unanchorable_019_the_tick_line_names_each_dropped_root() {
+        let root =
+            |outpoint: &str, class: &str, faults, unanchorable| overlay_engine::gasp::FaultedRoot {
+                peer: "https://peer.example".into(),
+                outpoint: outpoint.into(),
+                class: class.into(),
+                faults,
+                unanchorable,
+                error: "no rung served".into(),
+            };
+        assert_eq!(
+            faulted_summary(&[
+                root("aa.0", "courier", 3, true),
+                root("bb.1", "peer", 0, false),
+            ]),
+            vec![
+                "aa.0 courier runs=3 unanchorable https://peer.example".to_string(),
+                "bb.1 peer runs=0 https://peer.example".to_string(),
+            ]
+        );
+        let src = include_str!("tick.rs");
+        assert!(src.contains("cursor_held_by={:?} faulted={:?}"));
+        assert!(src.contains("faulted_summary(&res.faulted_roots)"));
+    }
 
     #[test]
     fn total_budget_reserves_the_lease_margin_and_caps_each_write() {

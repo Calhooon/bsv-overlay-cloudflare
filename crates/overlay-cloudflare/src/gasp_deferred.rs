@@ -553,6 +553,10 @@ pub const COUNTER_GASP_ROOTS_PROVEN: &str = "gasp_roots_proven_total";
 pub const COUNTER_GASP_ROOTS_UNPROVEN: &str = "gasp_roots_unproven_total";
 /// Expired roots omitted before proof hydration.
 pub const COUNTER_GASP_EXPIRED_REFUSED: &str = "gasp_expired_refused_total";
+/// Roots recorded unanchorable (engine 0.1.9): their walk faulted in
+/// `UNANCHORABLE_AFTER_FAULTED_RUNS` consecutive runs and the cursor passes
+/// them; invariants' `gaspUnanchorable`.
+pub const COUNTER_GASP_UNANCHORABLE: &str = "gasp_unanchorable_total";
 
 /// The counter of one drop reason: `gasp_graph_dropped_<reason>_total`.
 pub fn dropped_counter_name(reason: &str) -> String {
@@ -569,6 +573,7 @@ pub fn counter_names() -> Vec<String> {
         COUNTER_GASP_GRAPH_DROPPED_STALE.to_string(),
         COUNTER_GASP_ANCHOR_WALK_HELD.to_string(),
         COUNTER_GASP_EXPIRED_REFUSED.to_string(),
+        COUNTER_GASP_UNANCHORABLE.to_string(),
         COUNTER_GASP_ROOTS_PROVEN.to_string(),
         COUNTER_GASP_ROOTS_UNPROVEN.to_string(),
     ];
@@ -594,6 +599,7 @@ pub fn counter_deltas(
         *deltas
             .entry(COUNTER_GASP_EXPIRED_REFUSED.into())
             .or_default() += r.expired_refused;
+        *deltas.entry(COUNTER_GASP_UNANCHORABLE.into()).or_default() += r.unanchorable_graphs;
         *deltas
             .entry(COUNTER_GASP_GRAPH_DEFERRED.into())
             .or_default() += r.deferred_graphs;
@@ -1808,6 +1814,41 @@ mod tests {
         );
     }
 
+    /// Engine 0.1.9: the roots a sync recorded unanchorable are counted
+    /// (`gasp_unanchorable_total`, summed over topics) and served on
+    /// invariants as `gaspUnanchorable`; a sync's results without the field
+    /// (an older engine's) read 0.
+    #[test]
+    fn unanchorable_019_the_counter_sums_and_is_served() {
+        let topic =
+            |json: serde_json::Value| -> TopicSyncResult { serde_json::from_value(json).unwrap() };
+        let results = std::collections::HashMap::from([
+            (
+                "tm_a".to_string(),
+                topic(
+                    serde_json::json!({"peers": [], "sync_type": "peers", "errors": [], "unanchorable_graphs": 2}),
+                ),
+            ),
+            (
+                "tm_b".to_string(),
+                topic(
+                    serde_json::json!({"peers": [], "sync_type": "peers", "errors": [], "unanchorable_graphs": 1}),
+                ),
+            ),
+            (
+                "tm_c".to_string(),
+                topic(serde_json::json!({"peers": [], "sync_type": "peers", "errors": []})),
+            ),
+        ]);
+        assert_eq!(
+            counter_deltas(&results),
+            vec![(COUNTER_GASP_UNANCHORABLE.to_string(), 3)]
+        );
+        assert!(include_str!("ops.rs").contains(
+            "\"gaspUnanchorable\": counters.get(crate::gasp_deferred::COUNTER_GASP_UNANCHORABLE)"
+        ));
+    }
+
     /// bsv-low #555: the counters of a sync, summed over topics, a drop
     /// counted in all and under its reason; every name seeded.
     #[test]
@@ -1863,8 +1904,10 @@ mod tests {
             ]
         );
         let names = counter_names();
-        // Seed both the anchor hold and the sync expiry refusal.
-        assert_eq!(names.len(), 9 + 10);
+        // Seed both the anchor hold and the sync expiry refusal, and the
+        // unanchorable roots (engine 0.1.9).
+        assert_eq!(names.len(), 10 + 10);
+        assert!(names.contains(&COUNTER_GASP_UNANCHORABLE.to_string()));
         assert!(names.contains(&COUNTER_GASP_ANCHOR_WALK_HELD.to_string()));
         assert!(names.contains(&COUNTER_GASP_EXPIRED_REFUSED.to_string()));
         // bsv-low #585: nothing is dropped for its size.
