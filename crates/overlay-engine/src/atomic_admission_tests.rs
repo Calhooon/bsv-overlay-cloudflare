@@ -1665,3 +1665,206 @@ async fn a1_n2_r2_carry_persists_verified_proofs() {
         .unwrap();
     assert!(stored == legacy, "N2 stored BEEF must equal submit's");
 }
+
+const NEEDS_ERR: &str = "tm_needs_err";
+struct NeededErrorManager {
+    store: Rc<MemoryStorage>,
+    fail_txid: String,
+    fail: bool,
+    defer: bool,
+}
+#[async_trait(?Send)]
+impl TopicManager for NeededErrorManager {
+    fn reads_off_chain_values(&self) -> bool {
+        false
+    }
+    async fn identify_admissible_outputs(
+        &self,
+        tx: &Transaction,
+        _: &[u8],
+        _: Option<&[u8]>,
+        _: SubmitMode,
+        _: &TopicAdmittanceContext,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        Ok(AdmittanceInstructions {
+            outputs_to_admit: if tx.outputs.len() == 3 {
+                vec![1]
+            } else {
+                vec![]
+            },
+            ..AdmittanceInstructions::default()
+        })
+    }
+    async fn identify_needed_inputs(
+        &self,
+        beef: &[u8],
+        _: Option<&[u8]>,
+    ) -> Result<Vec<Outpoint>, TopicManagerError> {
+        let tx = Transaction::from_beef(beef, None).unwrap();
+        if tx.id() == self.fail_txid {
+            if self.defer {
+                self.store
+                    .defer("evidence_unavailable", "needed inputs unavailable".into());
+            }
+            if self.fail {
+                return Err(TopicManagerError::Other("needed inputs error".into()));
+            }
+            return Ok(vec![]);
+        }
+        Ok(tx
+            .inputs
+            .iter()
+            .map(|input| Outpoint::new(input.get_source_txid().unwrap(), input.source_output_index))
+            .collect())
+    }
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+fn needed_error_engine(
+    store: &Rc<MemoryStorage>,
+    fail_txid: &str,
+    fail: bool,
+    defer: bool,
+) -> Engine {
+    Engine::new(
+        HashMap::from([
+            (
+                NEEDS_ERR.into(),
+                Box::new(NeededErrorManager {
+                    store: store.clone(),
+                    fail_txid: fail_txid.into(),
+                    fail,
+                    defer,
+                }) as Box<dyn TopicManager>,
+            ),
+            (
+                PROOF.into(),
+                Box::new(ProofManager) as Box<dyn TopicManager>,
+            ),
+        ]),
+        HashMap::new(),
+        Box::new(store.clone()),
+        None,
+        EngineConfig::default(),
+    )
+}
+
+#[tokio::test]
+async fn a1_n1_both_needed_input_error_paths_fail_topic_unless_deferred() {
+    let (_, fixture_store, _, mut direct, parent) = fixture_refusal(false).await;
+    direct.topics = vec![PROOF.into(), NEEDS_ERR.into()];
+    let funding = fixture_store
+        .find_output(&parent, 0, Some(REGISTRY), None, true)
+        .await
+        .unwrap()
+        .unwrap()
+        .beef
+        .unwrap();
+    let funding = Transaction::from_beef(&funding, None).unwrap();
+    let mut middle = Transaction::new();
+    let mut input = TransactionInput::new(parent, 0);
+    input.source_transaction = Some(Box::new(funding));
+    input.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
+    middle.inputs.push(input);
+    for _ in 0..2 {
+        middle.outputs.push(TransactionOutput::new(
+            1,
+            LockingScript::from_binary(&[0x51]).unwrap(),
+        ));
+    }
+    let middle_id = middle.id();
+    let mut subject = Transaction::new();
+    let mut input = TransactionInput::new(middle_id.clone(), 0);
+    input.source_transaction = Some(Box::new(middle));
+    input.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
+    subject.inputs.push(input);
+    for _ in 0..3 {
+        subject.outputs.push(TransactionOutput::new(
+            0,
+            LockingScript::from_binary(&[0x51]).unwrap(),
+        ));
+    }
+    let carried = TaggedBEEF::new(subject.to_beef(false).unwrap(), direct.topics.clone());
+    let direct_id = Transaction::from_beef(&direct.beef, None).unwrap().id();
+    // Exercise the nested named_history arm first, then the direct hook.
+    for (beef, fail_txid, variant) in [
+        (carried, middle_id, "carried"),
+        (direct, direct_id, "direct"),
+    ] {
+        let store = Rc::new(MemoryStorage::new());
+        let engine = needed_error_engine(&store, &fail_txid, true, false);
+        let legacy_store = Rc::new(MemoryStorage::new());
+        let legacy = needed_error_engine(&legacy_store, &fail_txid, true, false)
+            .submit(&beef, SubmitMode::HistoricalTxNoSpv)
+            .await
+            .unwrap();
+        let result = submit_log(&engine, &store, &beef).await;
+        assert!(
+            result.is_ok(),
+            "N1 {variant} manager error must not fail the unit: {result:?}"
+        );
+        let (word, _) = result.unwrap();
+        assert_eq!(
+            legacy[NEEDS_ERR].outputs_to_admit,
+            vec![1],
+            "legacy submit remains unchanged"
+        );
+        assert_eq!(word[PROOF].outputs_to_admit, vec![2]);
+        assert!(
+            word[NEEDS_ERR].outputs_to_admit.is_empty(),
+            "N1 {variant} needed-input error must fail only its topic"
+        );
+        let expected_store = Rc::new(MemoryStorage::new());
+        let expected_engine = Engine::new(
+            HashMap::from([
+                (
+                    NEEDS_ERR.into(),
+                    Box::new(ErrorManager {
+                        store: expected_store.clone(),
+                        defer: false,
+                    }) as Box<dyn TopicManager>,
+                ),
+                (
+                    PROOF.into(),
+                    Box::new(ProofManager) as Box<dyn TopicManager>,
+                ),
+            ]),
+            HashMap::new(),
+            Box::new(expected_store.clone()),
+            None,
+            EngineConfig::default(),
+        );
+        let (expected_word, _) = submit_log(&expected_engine, &expected_store, &beef)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&word).unwrap(),
+            serde_json::to_value(expected_word).unwrap(),
+            "both manager hooks follow F5"
+        );
+        let index = Rc::new(Mutex::new(BTreeMap::new()));
+        assert!(
+            snapshot(&store, &index) == snapshot(&expected_store, &index),
+            "N1 {variant} error must have no extra store effects"
+        );
+        let deferred_store = Rc::new(MemoryStorage::new());
+        let before = snapshot(&deferred_store, &index);
+        let result = submit_log(
+            &needed_error_engine(&deferred_store, &fail_txid, true, true),
+            &deferred_store,
+            &beef,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(LogError::Refused(AdmitRefusal::NotNow { site, .. })) if site == "evidence_unavailable")
+        );
+        assert!(
+            snapshot(&deferred_store, &index) == before,
+            "N1 {variant} deferral must roll back both topics"
+        );
+    }
+}

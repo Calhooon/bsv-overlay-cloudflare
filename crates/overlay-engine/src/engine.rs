@@ -2385,7 +2385,8 @@ impl Engine {
                 if admits && subject_names.is_none() {
                     subject_names = Some(
                         self.named_history(manager.as_ref(), subject_named_beef, bound, None)
-                            .await,
+                            .await
+                            .unwrap_or_default(),
                     );
                 }
                 let remembered = spent.iter().find(|(source, vout)| {
@@ -2419,6 +2420,7 @@ impl Engine {
                         None,
                     )
                     .await
+                    .unwrap_or_default()
                 else {
                     break;
                 };
@@ -2852,14 +2854,16 @@ impl Engine {
         question_reads: &mut usize,
         bound: Option<&CallBound>,
         admission: Option<&dyn crate::admission::LogTxn>,
-    ) -> Option<NotNow> {
+    ) -> Result<Option<NotNow>, TopicManagerError> {
         let _read_only = admission.map(crate::admission::LogTxn::read_only);
         let dry_context = TopicAdmittanceContext {
             dry_run: true,
             admission_seq: admission.map(crate::admission::LogTxn::seq),
         };
-        let manager = self.managers.get(topic)?;
-        let wait = |why: String| Some(NotNow { why, carried: None });
+        let Some(manager) = self.managers.get(topic) else {
+            return Ok(None);
+        };
+        let wait = |why: String| Ok(Some(NotNow { why, carried: None }));
         // The outpoints `tx` spends, as `txid.vout`.
         let starts: Vec<(String, u32)> = tx
             .inputs
@@ -2892,10 +2896,12 @@ impl Engine {
         // Nothing to ask (a transaction that admits and names nothing, every
         // manager of this workspace): the BEEF is not even parsed.
         if ask.is_empty() {
-            return None;
+            return Ok(None);
         }
         let direct: HashSet<String> = ask.iter().cloned().collect();
-        let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS).ok()?;
+        let Ok(beef) = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS) else {
+            return Ok(None);
+        };
         // Each body the BEEF carries, and whether the BEEF says it is
         // proven (a bump index: its word, no proof is checked here).
         let bodies: HashMap<String, (&Transaction, bool)> = beef
@@ -2926,7 +2932,7 @@ impl Engine {
                 if subject_names.is_none() {
                     *subject_names = Some(
                         self.named_history(manager.as_ref(), beef_bytes, bound, admission)
-                            .await,
+                            .await?,
                     );
                 }
                 let is_named = subject_names.as_ref().is_some_and(|named| {
@@ -2961,10 +2967,10 @@ impl Engine {
                 ))
             };
             let carried = |why: String| {
-                Some(NotNow {
+                Ok(Some(NotNow {
                     why,
                     carried: Some(candidate.clone()),
-                })
+                }))
             };
             let record = AppliedTransaction {
                 txid: candidate.clone(),
@@ -3061,7 +3067,7 @@ impl Engine {
                     if subject_names.is_none() {
                         *subject_names = Some(
                             self.named_history(manager.as_ref(), beef_bytes, bound, admission)
-                                .await,
+                                .await?,
                         );
                     }
                     subject_names.as_ref()
@@ -3078,7 +3084,7 @@ impl Engine {
                                     bound,
                                     admission,
                                 )
-                                .await
+                                .await?
                             }
                             None => HashSet::new(),
                         };
@@ -3132,36 +3138,39 @@ impl Engine {
                 reads += spent;
             }
         }
-        None
+        Ok(None)
     }
 
     /// The outpoints (`txid.vout`) the topic manager NAMES as overlay
     /// history of the transaction `beef_bytes` names (`identify_needed_inputs`,
     /// D13's word; an atomic BEEF, so a manager that parses
     /// `from_beef(_, None)` reads that transaction). An `Err` or no answer
-    /// names nothing, as the GASP walk treats it (logged).
+    /// names nothing on ordinary submit, as the GASP walk treats it (logged).
+    /// In admission mode, a manager error reaches the caller's per-topic F5
+    /// handling; it is not a failed storage statement.
     async fn named_history(
         &self,
         manager: &dyn TopicManager,
         beef_bytes: &[u8],
         bound: Option<&CallBound>,
         admission: Option<&dyn crate::admission::LogTxn>,
-    ) -> HashSet<String> {
+    ) -> Result<HashSet<String>, TopicManagerError> {
         match bounded(bound, manager.identify_needed_inputs(beef_bytes, None)).await {
-            Ok(Ok(named)) => named.iter().map(Outpoint::to_graph_id).collect(),
+            Ok(Ok(named)) => Ok(named.iter().map(Outpoint::to_graph_id).collect()),
             Ok(Err(e)) => {
-                if let Some(log) = admission {
-                    log.fail(format!("identify_needed_inputs: {e}"));
-                }
                 warn!("the predecessor question: the manager could not name its inputs: {e}");
-                HashSet::new()
+                if admission.is_some() {
+                    Err(e)
+                } else {
+                    Ok(HashSet::new())
+                }
             }
             Err(no_answer) => {
                 if let Some(log) = admission {
                     log.fail(format!("identify_needed_inputs: {no_answer}"));
                 }
                 warn!("the predecessor question: the manager did not name its inputs: {no_answer}");
-                HashSet::new()
+                Ok(HashSet::new())
             }
         }
     }

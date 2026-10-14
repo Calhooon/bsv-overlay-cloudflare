@@ -340,6 +340,15 @@ impl Engine {
                     )
                     .await;
                 walked.predecessor_reads.set(reads);
+                // Nested history naming is the same manager hook as above.
+                // Its error fails this topic, never the unit's statement latch.
+                let Ok(wait) = wait else {
+                    if let Some(refusal) = log.deferral() {
+                        return Err(refusal.with_notes(log.notes()));
+                    }
+                    steak.insert(topic.clone(), AdmittanceInstructions::default());
+                    continue;
+                };
                 if let Some(wait) = wait {
                     let predecessor = wait
                         .carried
