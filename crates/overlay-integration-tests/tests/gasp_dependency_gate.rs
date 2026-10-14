@@ -25,6 +25,7 @@ use bsv_overlay_engine::admission::{
 use bsv_overlay_engine::engine::{Engine, EngineConfig, WalkBreachPolicy};
 use bsv_overlay_engine::lookup_service::{LookupService, LookupServiceError};
 use bsv_overlay_engine::storage::memory::MemoryStorage;
+use bsv_overlay_engine::storage::Storage;
 use bsv_overlay_engine::types::*;
 use bsv_rs::transaction::{MerklePath, Transaction};
 use world::*;
@@ -199,8 +200,26 @@ fn record(judged: &mut Judged, body: &Walked, answer: &Result<Committed, AdmitRe
     judged.answers.insert(body.txid.clone(), kind);
 }
 
+/// The store's rows of `txs` (`served_rows`, which names a stored BEEF by its
+/// length), and each stored BEEF by its BYTES (their SHA-256; the gate lens's
+/// NOTE 2).
 async fn rows(store: &Rc<MemoryStorage>, txs: &[&Transaction]) -> BTreeMap<String, String> {
-    served_rows(store.as_ref(), txs).await
+    let mut rows = served_rows(store.as_ref(), txs).await;
+    for tx in txs {
+        for vout in 0..tx.outputs.len() as u32 {
+            let beef = store
+                .find_output(&tx.id(), vout, Some(TOPIC), None, true)
+                .await
+                .unwrap()
+                .and_then(|o| o.beef)
+                .map_or_else(
+                    || "none".to_string(),
+                    |b| hex::encode(bsv_rs::primitives::hash::sha256(&b)),
+                );
+            rows.insert(format!("beef {}.{vout}", tx.id()), beef);
+        }
+    }
+    rows
 }
 
 fn applied(rows: &BTreeMap<String, String>, tx: &Transaction) -> String {
@@ -443,4 +462,159 @@ async fn d44_l1_a_child_handed_before_its_parent_gets_the_in_order_answer() {
             fails.is_some()
         );
     }
+}
+
+// ============================================================================
+// The gate lens's NOTEs: the descendant of a terminally refused parent names
+// that parent in its word (NOTE 1); the lens's scratch witnesses kept as pins
+// (NOTE 2, NOTE 6).
+// ============================================================================
+
+/// The word of a body the gate held behind a terminal refusal names the body
+/// whose own refusal it is, through every generation: `g <- c <- d <- e`, the
+/// index refusing `c`'s outputs.
+#[tokio::test]
+async fn d44_n1_a_terminal_refusals_descendants_name_the_refused_parent() {
+    let g = genesis(65, 1);
+    let c = child(&g, 0, 1);
+    let d = child(&c, 0, 1);
+    let e = child(&d, 0, 1);
+    let store = Rc::new(MemoryStorage::new());
+    let engine = engine(&store, None, Some(c.id()));
+    let judged = admit(
+        &engine,
+        &store,
+        &[(&g, 100), (&c, 101), (&d, 102), (&e, 103)],
+    )
+    .await;
+    let word = |tx: &Transaction| judged.refusals[&tx.id()].to_string();
+    println!("D44 N1 c: {}", word(&c));
+    println!("D44 N1 d: {}", word(&d));
+    println!("D44 N1 e: {}", word(&e));
+    for tx in [&d, &e] {
+        assert_eq!(judged.of(tx), Some(Answer::Lookup), "{judged:?}");
+        assert!(
+            word(tx).starts_with(&format!("parent {} was refused: ", c.id())),
+            "the descendant's word names the refused parent: {}",
+            word(tx)
+        );
+        assert!(word(tx).ends_with(&word(&c)), "and carries its word whole");
+    }
+    assert!(
+        !word(&c).contains("was refused"),
+        "c's own word: {}",
+        word(&c)
+    );
+}
+
+/// The lens's scratch fan-in: `a`'s manager errs, the index refuses `b`'s
+/// outputs. `a` waits `not now` (`parent_error`), `b` is refused with its own
+/// word, and the root takes the TERMINAL word (`b`'s: it can never land)
+/// waiting on both, naming `b`.
+#[tokio::test]
+async fn d44_n6_a_fan_in_whose_parents_meet_a_manager_error_and_a_lookup_refusal() {
+    let [a, b, r] = fan_in();
+    let store = Rc::new(MemoryStorage::new());
+    let engine = engine(&store, Some(a.id()), Some(b.id()));
+    let judged = admit(&engine, &store, &[(&a, 100), (&b, 101), (&r, 102)]).await;
+    println!(
+        "D44 N6 fan-in: {:?} gates {:?}",
+        judged.answers, judged.gates
+    );
+    assert_eq!(judged.of(&a), Some(Answer::NotNow));
+    assert_eq!(judged.gate(&a), Some(GateReason::ParentError));
+    assert_eq!(judged.of(&b), Some(Answer::Lookup));
+    assert_eq!(judged.gate(&b), None, "its own refusal");
+    assert_eq!(
+        judged.of(&r),
+        Some(Answer::Lookup),
+        "terminal wins: {judged:?}"
+    );
+    assert_eq!(
+        judged.gate(&r),
+        Some(GateReason::WaitingOn(vec![a.id(), b.id()]))
+    );
+    assert!(judged.refusals[&r.id()]
+        .to_string()
+        .starts_with(&format!("parent {} was refused: ", b.id())));
+    let rows = rows(&store, &[&a, &b, &r]).await;
+    for tx in [&a, &b, &r] {
+        assert_eq!(applied(&rows, tx), "false", "nothing landed: {rows:?}");
+    }
+}
+
+/// The lens's scratch graph whose every body waits: `g <- c`, the manager
+/// erring on the genesis. Nothing lands; `g` is `parent_error`, `c` waits on
+/// it; nothing is written.
+#[tokio::test]
+async fn d44_n6_a_graph_whose_every_body_waits_lands_nothing_and_says_why() {
+    let g = genesis(66, 1);
+    let c = child(&g, 0, 1);
+    let store = Rc::new(MemoryStorage::new());
+    let engine = engine(&store, Some(g.id()), None);
+    let judged = admit(&engine, &store, &[(&g, 100), (&c, 101)]).await;
+    println!(
+        "D44 N6 all waiting: {:?} gates {:?}",
+        judged.answers, judged.gates
+    );
+    assert_eq!(judged.of(&g), Some(Answer::NotNow));
+    assert_eq!(judged.of(&c), Some(Answer::NotNow));
+    assert_eq!(judged.gate(&g), Some(GateReason::ParentError));
+    assert_eq!(judged.gate(&c), Some(GateReason::WaitingOn(vec![g.id()])));
+    let rows = rows(&store, &[&g, &c]).await;
+    assert!(
+        rows.iter()
+            .all(|(k, v)| !k.starts_with("applied") || v == "false"),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|(k, v)| !k.starts_with("output") || v == "absent"),
+        "{rows:?}"
+    );
+}
+
+/// The lens's scratch re-sync under ANOTHER proof: the waiting parent `a` is
+/// re-sent at height 105 (it was 100). `a` and `r` land with the STEAKs of a
+/// first-time graph, and the store's rows, its stored BEEFs by their bytes
+/// included, are those of a first-time graph handed those very bytes.
+#[tokio::test]
+async fn d44_n2_a_waiting_parent_re_sent_under_another_proof_lands_as_a_first_time_body() {
+    let [a, b, r] = fan_in();
+    let txs = [&a, &b, &r];
+    let first = Rc::new(MemoryStorage::new());
+    let once = admit(
+        &engine(&first, None, None),
+        &first,
+        &[(&a, 105), (&b, 101), (&r, 102)],
+    )
+    .await;
+    assert!(
+        once.answers.values().all(|a| *a == Answer::Landed),
+        "{once:?}"
+    );
+
+    let store = Rc::new(MemoryStorage::new());
+    let tick = admit(
+        &engine(&store, Some(a.id()), None),
+        &store,
+        &[(&a, 100), (&b, 101), (&r, 102)],
+    )
+    .await;
+    assert_eq!(tick.of(&a), Some(Answer::NotNow), "{tick:?}");
+    let again = admit(&engine(&store, None, None), &store, &[(&a, 105), (&r, 102)]).await;
+    println!("D44 N2 re-sync under another proof: {:?}", again.answers);
+    for tx in [&a, &r] {
+        assert_eq!(again.of(tx), Some(Answer::Landed), "{again:?}");
+        assert_eq!(
+            again.steaks.get(&tx.id()),
+            once.steaks.get(&tx.id()),
+            "the same judgement"
+        );
+    }
+    assert_eq!(
+        rows(&store, &txs).await,
+        rows(&first, &txs).await,
+        "the same rows, the stored BEEFs byte for byte"
+    );
 }

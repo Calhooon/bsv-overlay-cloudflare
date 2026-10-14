@@ -718,6 +718,60 @@ async fn w10_d44_a_refused_walk_holds_its_descendants_and_its_siblings_land() {
     panic!("16 runs never handed the refused walk first");
 }
 
+/// The gate lens's scratch graph whose every body waits, through the census
+/// beside an `off` run (NOTE 6): `g <- c`, the manager erring on the genesis
+/// at the finalize. Both sides land nothing (the rows agree:
+/// `materialization`); A's graph word stops at `g` (503) and names every body
+/// it held with its reason; `g`'s body row is `words` (served 200 and "not
+/// landed", A's 503 naming the manager's error).
+#[tokio::test]
+async fn w11_d44_a_graph_whose_every_body_waits_says_so_in_the_census() {
+    let g = genesis(80, 1);
+    let c = child(&g, 0, 1);
+    let mut scenario = Scenario::honest(vec![g, c], vec![(1, 0, 1.0)]);
+    scenario.fails_at_finalize = Some(scenario.txs[0].id());
+    let [g, c] = [0, 1].map(|i| scenario.txs[i].id());
+    let shadow = beside(&scenario).await;
+    print_census("W11 all waiting", &shadow);
+    let graph = &shadow.of(ShadowKind::Materialization)[0];
+    let served = json(&graph.served.bytes);
+    let ours = json(&graph.shadow.bytes);
+    assert_eq!(graph.delta, DeltaClass::Materialization, "{graph:?}");
+    assert_eq!(served["landed"], serde_json::json!([]), "{served}");
+    assert_eq!(ours["landed"], serde_json::json!([]), "{ours}");
+    assert_eq!(served["rows"], ours["rows"], "the rows agree");
+    for (key, value) in ours["rows"].as_object().unwrap() {
+        let empty = if key.starts_with("applied") {
+            "false"
+        } else {
+            "absent"
+        };
+        assert_eq!(value, &serde_json::json!(empty), "{key}: {ours}");
+    }
+    assert_eq!(ours["stopped"]["txid"], serde_json::json!(g), "{ours}");
+    assert_eq!(graph.shadow.status, 503);
+    assert_eq!(
+        serde_json::to_value(&graph.gate).unwrap(),
+        serde_json::json!([
+            {"txid": g, "reason": "parent_error"},
+            {"txid": c, "reason": {"waiting_on": [g]}},
+        ])
+    );
+    let body = shadow
+        .of(ShadowKind::Body)
+        .into_iter()
+        .find(|row| row.txid == g)
+        .expect("the genesis's body row");
+    assert_eq!(body.delta, DeltaClass::Words, "{body:?}");
+    assert_eq!((body.served.status, body.shadow.status), (200, 503));
+    assert!(
+        json(&body.shadow.bytes)["manager_errors"]
+            .to_string()
+            .contains("the finalize refuses this body"),
+        "{body:?}"
+    );
+}
+
 /// The census of every world above whose finalize order is our node's
 /// (`compute_ordered_beefs`, ancestors first), with the fan-in in the order
 /// w8 takes (the erring parent first), frozen on `8ed47d8` (the gate's tip,
