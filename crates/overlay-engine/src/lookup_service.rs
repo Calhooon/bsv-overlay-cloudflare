@@ -55,6 +55,30 @@ pub trait LookupService {
     // Lifecycle hooks (called by Engine during submit)
     // ========================================================================
 
+    /// Would `output_admitted_by_topic` accept this payload?
+    ///
+    /// Pure validation only: no writes, no I/O, and no externally observable
+    /// side effects. Share the topic guard and parser with the notification
+    /// hook so the two cannot drift. The engine checks each payload once per
+    /// service after judgement and successor handling, before applying any
+    /// topic. A refusal prevents that topic's apply; it cannot undo writes
+    /// already made by a manager during judgement or by predecessor landing.
+    /// Validate-only submissions do not call these checks.
+    ///
+    /// Default: accept, preserving existing services' behavior.
+    fn check_admitted(&self, _payload: &OutputAdmittedByTopic) -> Result<(), LookupServiceError> {
+        Ok(())
+    }
+
+    /// Would `output_spent` accept this payload?
+    ///
+    /// The same pure, no-write, no-I/O contract as [`Self::check_admitted`]
+    /// applies, including `SpendNotificationMode::None` payloads.
+    /// Default: accept, preserving existing services' behavior.
+    fn check_spent(&self, _payload: &OutputSpent) -> Result<(), LookupServiceError> {
+        Ok(())
+    }
+
     /// Called when a Topic Manager admits a new UTXO.
     ///
     /// The lookup service should index this output so it can be found via `lookup()`.
@@ -231,6 +255,27 @@ mod tests {
                 ..Default::default()
             }
         }
+    }
+
+    #[test]
+    fn e657_default_checks_accept_without_writes() {
+        let svc = MockLookupService::new();
+        let admitted = OutputAdmittedByTopic::LockingScript {
+            txid: "abc".into(),
+            output_index: 0,
+            topic: "tm_test".into(),
+            satoshis: 1,
+            locking_script: vec![0x51],
+            off_chain_values: None,
+        };
+        let spent = OutputSpent::None {
+            txid: "abc".into(),
+            output_index: 0,
+            topic: "tm_test".into(),
+        };
+        assert!(svc.check_admitted(&admitted).is_ok());
+        assert!(svc.check_spent(&spent).is_ok());
+        assert_eq!(svc.record_count(), 0);
     }
 
     #[tokio::test]
