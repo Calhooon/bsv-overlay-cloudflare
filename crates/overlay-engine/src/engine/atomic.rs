@@ -267,7 +267,7 @@ impl Engine {
             }
             if !log.evidence().tx.contains_key(txid) {
                 return Err(AdmitRefusal::not_now(
-                    "evidence_missing",
+                    "admit_evidence_missing",
                     format!("{txid} on {topic}"),
                 ));
             }

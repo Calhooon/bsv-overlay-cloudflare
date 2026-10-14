@@ -759,7 +759,7 @@ async fn a1_missing_evidence_and_notes_are_per_unit() {
         .unwrap();
     walked.evidence.tx.clear();
     assert!(
-        matches!(store.admit(&engine, &walked), Err(LogError::Refused(AdmitRefusal::NotNow { site, .. })) if site == "evidence_missing")
+        matches!(store.admit(&engine, &walked), Err(LogError::Refused(AdmitRefusal::NotNow { site, .. })) if site == "admit_evidence_missing")
     );
     assert!(before == snapshot(&store, &index));
     let result: Result<(), _> = store.transaction("notes", &AdmitEvidence::default(), || async {

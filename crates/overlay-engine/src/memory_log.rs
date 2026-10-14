@@ -234,7 +234,9 @@ impl MemoryStorage {
                 walked
             } else {
                 let Some(carried) = walked.carried.iter().find(|c| &c.txid == txid) else {
-                    return Err(AdmitRefusal::not_now("evidence_missing", txid.clone()).into());
+                    return Err(
+                        AdmitRefusal::not_now("admit_evidence_missing", txid.clone()).into(),
+                    );
                 };
                 let mut beef = crate::beef_limits::parse_beef(
                     &walked.tagged_beef.beef,
