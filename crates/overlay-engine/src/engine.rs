@@ -5134,6 +5134,7 @@ impl Engine {
                     if let Some((sleep, max_calls, budget_ms)) = &self.graph_budget {
                         let (sleep, budget_ms) = (sleep.clone(), *budget_ms);
                         let half_sleep = sleep.clone();
+                        let share_sleep = sleep.clone();
                         sync = sync.with_graph_budget(crate::gasp::GraphBudget {
                             max_calls: *max_calls,
                             max_bytes_fetched: self.graph_budget_limbs.0,
@@ -5141,6 +5142,12 @@ impl Engine {
                             deadline: Box::new(move || sleep(budget_ms)),
                             half_deadline: Some(Box::new(move || half_sleep(budget_ms / 2))),
                         });
+                        // Engine 0.1.11: the resumes take a named share of
+                        // the per-peer slice, the rest is the page's.
+                        if let Some((_, peer_ms)) = &self.peer_sync_budget {
+                            let share_ms = crate::gasp::resume_share_ms(*peer_ms, budget_ms);
+                            sync = sync.with_resume_share(Box::new(move || share_sleep(share_ms)));
+                        }
                     }
                     // bsv-low #552: under a budget each graph is submitted as
                     // it finalizes, so the deadline cannot take it back. With
@@ -10165,6 +10172,81 @@ mod tests {
             (record.nodes.len(), record.idle_resumes),
             (1, 1),
             "{record:?}"
+        );
+    }
+
+    /// 0.1.11 (the page's share): fourteen obligations of fact 3's shape
+    /// ahead of a page of twelve fresh roots, every request 1,500 ms of a
+    /// virtual 30,000 ms per-peer slice and a 15,000 ms graph budget. The
+    /// resumes take at most `resume_share_ms(30_000, 15_000)` = 9,900 ms
+    /// together; those reached after it are held back (not resumed, not a
+    /// failure, not stalled, not idle, their records as they were) and the
+    /// page's twelve roots are all walked and finalized in the same run.
+    /// On 0.1.10 the resumes shared one graph budget (15,000 ms): ten of
+    /// them ran, and the per-peer deadline dropped the sync at nine of the
+    /// page's twelve roots (fact 4: the page got what the resumes left).
+    #[tokio::test]
+    async fn obligations_0111_fourteen_obligations_leave_the_page_its_share() {
+        let ObligationFixture {
+            mut engine,
+            remote,
+            store,
+            obligations,
+            ..
+        } = obligation_fixture(12, 14, 1500).await;
+        let elapsed = remote.elapsed.clone();
+        engine.set_graph_budget(
+            std::rc::Rc::new(move |ms| {
+                let elapsed = elapsed.clone();
+                let until = elapsed.get() + ms;
+                Box::pin(std::future::poll_fn(move |_| {
+                    if elapsed.get() >= until {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }))
+            }),
+            100,
+            15_000,
+        );
+        assert_eq!(crate::gasp::resume_share_ms(30_000, 15_000), 9_900);
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert!(topic.errors.is_empty(), "inside the slice: {topic:?}");
+        assert_eq!(topic.finalized_graphs, 12, "the page's share: {topic:?}");
+        assert_eq!(topic.cursor_moves[0].to, 120);
+        // Six resumes struck; the seventh cut in flight by the share, having
+        // asked and appended nothing (counted idle and stalled, as 0.1.10
+        // counts a deadline's cut); the other seven held back.
+        assert_eq!(topic.resumed_graphs, 7, "{topic:?}");
+        assert_eq!(topic.held_back_graphs, 7, "{topic:?}");
+        assert_eq!(topic.faulted_roots.len(), 6, "{topic:?}");
+        assert_eq!((topic.stalled_graphs, topic.idle_counted), (1, 1));
+        assert!(topic.cursor_held_by.is_empty());
+        let host = "https://budget.example";
+        let mut reasons = std::collections::BTreeMap::new();
+        for outpoint in &obligations {
+            let record = store
+                .get_deferred_graph(host, "tm_test", outpoint)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(record.cursor_passable, "{record:?}");
+            if record.reason == "retry" {
+                // Held back: as it was, not counted idle.
+                assert_eq!((record.idle_resumes, record.retry_at), (0, 0));
+                assert_eq!((record.faults, record.passes), (0, 0));
+            }
+            *reasons.entry(record.reason).or_insert(0) += 1;
+        }
+        assert_eq!(
+            reasons,
+            std::collections::BTreeMap::from([
+                ("retry".to_string(), 7),
+                ("retry:fault:courier".to_string(), 6),
+                ("time".to_string(), 1),
+            ])
         );
     }
 
