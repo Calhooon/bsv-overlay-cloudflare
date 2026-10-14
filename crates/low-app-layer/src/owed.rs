@@ -338,6 +338,62 @@ pub fn latched_home_words(
     (words, targets)
 }
 
+/// The most spenders one byte-free latch read binds: two range bounds each, under D1's 100-bound limit.
+pub const HOME_LATCH_READ_CHUNK: usize = 45;
+const _: () = assert!(2 * HOME_LATCH_READ_CHUNK <= crate::logic::D1_MAX_BOUND_PARAMS);
+
+/// PURE (bsv-low L25, the courier-retire story-row flap): the byte-free read of the `homeproof:` latches of `n`
+/// named spenders. The home output's vout is not known without the sweep's bytes, so the read is vout-agnostic:
+/// an INDEXED RANGE of the `hop_chain_probes` PRIMARY KEY (`outpoint`) over each spender's `homeproof:<spender>.`
+/// prefix, OR'd into one statement (a range per spender, `>= lo AND < hi`, uses the PK index; never a scan). The
+/// columns are [`crate::hops_view::ProbeMemoRow`]'s, so the read deserializes as any probe-memo read does.
+pub fn home_latch_range_read_sql(n: usize) -> String {
+    let term = "(outpoint >= ? AND outpoint < ?)";
+    let terms = std::iter::repeat_n(term, n.max(1))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!("SELECT outpoint, probedAtMs, spent, spendingTxid, spentConfirmed FROM hop_chain_probes WHERE {terms}")
+}
+
+/// PURE: the lo/hi range bounds for each spender's `homeproof:` latch prefix, in the statement's bind order.
+/// lo = `homeproof:<spender>.` (inclusive); hi = `homeproof:<spender>/` (exclusive: `/` = 0x2F is the byte after
+/// `.` = 0x2E, so the range is exactly the spender's latch rows `homeproof:<spender>.<vout>`, no other prefix and
+/// no other spender, since every txid is the same 64-hex length).
+pub fn home_latch_range_binds(spenders: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(spenders.len() * 2);
+    for sp in spenders {
+        let sp = sp.to_ascii_lowercase();
+        out.push(format!("{HOME_SPEND_LATCH_PREFIX}{sp}."));
+        out.push(format!("{HOME_SPEND_LATCH_PREFIX}{sp}/"));
+    }
+    out
+}
+
+/// PURE (bsv-low L25): the named spenders carrying a durable PROVEN `homeproof:` latch, read byte-free from
+/// [`home_latch_range_read_sql`]. A latch memo is PROVEN when its home output reads spent with a named spender
+/// (`spent` and `spendingTxid` set) — the word [`home_word`] latched only after THIS crate verified the home key's
+/// own signature over the spend (`home_output_spend_proven`), the sole writer of a `homeproof:` row. Its mere
+/// presence proves "this sweep paid my committed home and my key spent it", so the hop is retired on this recompute
+/// whatever this pass's courier reads did. The latch key's body is the sweep (spender) txid
+/// (`homeproof:<sweepTxid>.<vout>`), matched against the named spenders.
+pub fn latched_retired_spenders(
+    named_spenders: &[String],
+    latch_memos: &[crate::hops_view::ProbeMemo],
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for sp in named_spenders {
+        let sp = sp.to_ascii_lowercase();
+        let prefix = format!("{HOME_SPEND_LATCH_PREFIX}{sp}.");
+        if latch_memos
+            .iter()
+            .any(|m| m.spent && m.spending_txid.is_some() && m.outpoint.starts_with(&prefix))
+        {
+            out.insert(sp);
+        }
+    }
+    out
+}
+
 /// PURE (bsv-low #485, the lens fold's MEDIUM-2), THE RETIREMENT DECISION for one home output: the chain rung's
 /// probe, plus the named spender's bytes when the walk could read them. `None` = nothing established (a faulted or
 /// unknown probe: the outpoint stays unnamed and the row stands). A corroborated absence is `Unspent`. A word of
@@ -822,6 +878,14 @@ pub struct OwedInputs<'a> {
     /// bsv-low #485: home outpoint (`<sweepTxid>:<vout>`, lowercase) → what the brain established about its spend
     /// (the route's bounded walk over `courier_home_outputs`). Absent = not looked this pass.
     pub home_spends: &'a HashMap<String, HomeSpendWord>,
+    /// bsv-low L25 (the courier-retire story-row flap): the hops' named spenders (lowercase) carrying a durable
+    /// PROVEN `homeproof:` latch, read BYTE-FREE from `hop_chain_probes` ([`latched_retired_spenders`]). A spender
+    /// here retires its hop on this recompute even when this pass's courier cap WITHHELD the sweep's bytes
+    /// (`swept_home` is then `None` and Arm A cannot run): the latch is an earlier pass's PROVEN verdict that MY
+    /// key spent the sweep's home output, the same retirement Arm A's `output_spent` makes with the bytes in hand.
+    /// Consulted in [`derive_owed_rows`] only on the byte-free path (`swept_home` `None`), so the bytes-in-hand
+    /// answer is unchanged. Empty when no latch was read or the read faulted (then the pass judges as before).
+    pub retired_spenders: &'a HashSet<String>,
 }
 
 /// The 20-byte pkh of a standard P2PKH locking script (`76 a9 14 <20> 88 ac`), lowercase hex; `None` for any other lock.
@@ -1050,6 +1114,16 @@ fn hop_named_spender(i: &OwedInputs, h: &HopEntry) -> Option<String> {
         .get(&outpoint_key(&h.hop_txid, h.hop_vout))
         .filter(|w| w.looked && w.spent == Some(true))
         .and_then(|w| w.spending_txid.as_deref().map(str::to_ascii_lowercase))
+}
+
+/// PURE (bsv-low L25): the distinct named spenders of this identity's SPENT hops (lowercase, sorted): the spenders
+/// whose durable `homeproof:` latch the recompute reads byte-free ([`latched_retired_spenders`]) to retire a hop an
+/// earlier pass already proved home-spent, whatever this pass's spender courier cap withheld.
+pub fn hop_named_spenders(i: &OwedInputs) -> Vec<String> {
+    let mut out: Vec<String> = i.hops.iter().filter_map(|h| hop_named_spender(i, h)).collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// PURE (the L25-WITHHELD lens's LOW-2): `r` is THIS pass's spender judgement of the hop at `key`: an `unbound`
@@ -2683,6 +2757,20 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             continue;
         }
         let game = h.game_id.to_ascii_lowercase();
+        // bsv-low L25 (the courier-retire story-row flap): a hop an earlier pass PROVED home-spent — THIS crate
+        // verified MY key's signature over the spender and latched it durably under `homeproof:` — is RETIRED on
+        // every recompute, byte-free. On the BYTE-FREE path only (`swept_home` is `None` because this pass's
+        // spender courier cap withheld the sweep's bytes), the durable latch retires the hop exactly as the
+        // bytes-in-hand Arm A does (`swept_home`'s `output_spent`); with the bytes present `swept_home` is `Some`
+        // and Arm A/B decide as before, so the answer is the same with and without bytes, and a still-claimable
+        // sibling home output a later pass sees is never hidden. The latch only ever serves LESS (no row), never
+        // mints a claim; a planted spender cannot forge a Proven latch. Closes the #662 gap at its source: the
+        // latch, not a byte-gated candidate window, is the durable retirement authority.
+        if swept_home(i, h).is_none()
+            && hop_named_spender(i, h).is_some_and(|sp| i.retired_spenders.contains(&sp))
+        {
+            continue;
+        }
         let mut facts_base = json!({
             "hopTxid": h.hop_txid,
             "hopVout": h.hop_vout,
@@ -4662,6 +4750,127 @@ pub(crate) mod tests {
         assert!(rows[0].facts.get("refresh").is_none());
     }
 
+    /// bsv-low L25 (the courier-retire story-row flap; RC-L25POST2, pair 19, 05:34:17Z): a hop an EARLIER pass
+    /// PROVED home-spent — THIS crate verified MY key's signature over the spender and latched it durably under
+    /// `homeproof:` — is RETIRED on every recompute, BYTE-FREE. On the 05:34Z recompute the spender courier cap
+    /// (`OWED_SPENDER_COURIER_READS_PER_RECOMPUTE` = 2, three hops) WITHHELD one hop's sweep bytes; `swept_home`
+    /// answered `None`, the hop fell to the raw chain-spent arm, and it served a claimless `unbound` "could not
+    /// judge the spender" row for money that was home and spent (series ...3, 1, 0, 1). The durable latch now
+    /// retires it byte-free, the SAME answer the bytes-in-hand Arm A gives (`output_spent`), so the list is stable
+    /// across recomputes with and without the bytes. The REVERSE (no latch, bytes withheld) is unchanged: the
+    /// could-not-judge row still stands (#662's keep then covers it when a prior courier-bytes payout row survives,
+    /// which it does not after a retirement — the gap this closes at its source). Beside the #485 retirement pin
+    /// (`a_courier_proven_payout_retires_...`) and the #662 keep pin
+    /// (`i662_a_withheld_spender_read_keeps_...`).
+    /// To red: revert the byte-free retirement `continue` in `derive_owed_rows` (the field grafted inert): h2
+    /// serves the could-not-judge row again and the forward assertion fails.
+    #[test]
+    fn l25_a_proven_homeproof_latch_retires_the_swept_hop_byte_free_when_the_courier_cap_withholds_its_bytes(
+    ) {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let my_pkh = "cc".repeat(20);
+        // three hops, each swept to MY committed home by its own courier sweep; the chain rung names each sweep
+        // spent + confirmed; none is in the index's own spend word (swept around the overlay), the live shape.
+        let mk = |hop_b: u8, game_b: u8| {
+            let mut h = hop(HopStatus::Unknown, None, Some(HOP_STRANDED_AFTER_MS + 1));
+            h.hop_txid = tx(hop_b);
+            h.game_id = tx(game_b);
+            h
+        };
+        let hops = [mk(0x11, 0x21), mk(0x12, 0x22), mk(0x13, 0x23)];
+        let (sa, sb, sc) = (tx(0x31), tx(0x32), tx(0x33));
+        let (ka, kb, kc) = (
+            format!("{}:0", tx(0x11)),
+            format!("{}:0", tx(0x12)),
+            format!("{}:0", tx(0x13)),
+        );
+        let mut chain: HashMap<String, HopChainWord> = HashMap::new();
+        for (k, s) in [(&ka, &sa), (&kb, &sb), (&kc, &sc)] {
+            chain.extend(chain_confirmed(k, true, Some(true), Some(s), Some(true)));
+        }
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        for g in [0x21u8, 0x22, 0x23] {
+            pkhs.insert(tx(g), my_pkh.clone());
+        }
+        let courier: HashSet<String> = [sa.clone(), sb.clone(), sc.clone()].into_iter().collect();
+        // h1 and h3 have their sweep bytes in hand (pay MY home) and the home walk proved them Proven; h2's bytes
+        // were WITHHELD by the courier cap this pass, so `swept_home` is `None` and `home_spends` carries nothing.
+        let mut bytes: HashMap<String, Vec<SpenderOutput>> = HashMap::new();
+        bytes.extend(pays(&sa, &[(0, &my_pkh, 20_000, None)]));
+        bytes.extend(pays(&sc, &[(0, &my_pkh, 20_000, None)]));
+        let mut home_spends: HashMap<String, HomeSpendWord> = HashMap::new();
+        home_spends.insert(format!("{sa}:0"), HomeSpendWord::Proven);
+        home_spends.insert(format!("{sc}:0"), HomeSpendWord::Proven);
+        let build = |retired: &HashSet<String>| -> Vec<OwedRow> {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.hop_chain = &chain;
+            i.spender_outputs = &bytes;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = &courier;
+            i.home_spends = &home_spends;
+            i.retired_spenders = retired;
+            derive_owed_rows(&i)
+        };
+        // the pure byte-free read: every hop's named spender, and every spender's durable Proven `homeproof:`
+        // latch, matched against them. A latch for a stranger's sweep, and a non-proven memo, retire nothing.
+        let probe = |i: &OwedInputs| hop_named_spenders(i);
+        let named = {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.hop_chain = &chain;
+            probe(&i)
+        };
+        assert_eq!(named, {
+            let mut s = [sa.clone(), sb.clone(), sc.clone()];
+            s.sort();
+            s.to_vec()
+        });
+        let latch = |sweep: &str, vout: u32, spent: bool, named_spender: bool| {
+            let (t, vv) = home_latch_target(sweep, vout);
+            crate::hops_view::ProbeMemo {
+                outpoint: crate::hops_view::probe_memo_key(&t, vv),
+                probed_at_ms: 1_800_000_000_000,
+                spent,
+                spending_txid: named_spender.then(|| tx(0x99)),
+                spent_confirmed: Some(true),
+            }
+        };
+        let memos = [
+            latch(&sa, 0, true, true),
+            latch(&sb, 0, true, true),
+            latch(&sc, 0, true, true),
+            latch(&tx(0x41), 0, true, true), // a stranger's sweep: not a named spender
+            latch(&sb, 1, false, true),      // a non-proven memo (spent=false) of a named spender
+        ];
+        let latched = latched_retired_spenders(&named, &memos);
+        assert_eq!(latched, {
+            let mut s = HashSet::new();
+            s.extend([sa.clone(), sb.clone(), sc.clone()]);
+            s
+        });
+        // FORWARD: with every latch read (h2's included), ALL THREE retire — h1 and h3 via Arm A's `output_spent`
+        // (their bytes are in hand), h2 BYTE-FREE (its bytes withheld). No could-not-judge row for h2.
+        assert!(
+            build(&latched).is_empty(),
+            "a proven homeproof latch retires every swept hop, byte-free when its bytes were withheld: {:?}",
+            build(&latched)
+        );
+        // REVERSE: with NO latch read, h1/h3 still retire via Arm A (bytes in hand), but h2 — bytes withheld,
+        // `swept_home` `None`, no latch — serves the existing claimless `unbound` "could not judge the spender"
+        // row. This is the flap the fix removes; it reds the forward assertion when the `continue` is reverted.
+        let without = build(&NONE);
+        assert_eq!(without.len(), 1, "{without:?}");
+        assert_eq!(
+            (without[0].outpoint.as_str(), without[0].family, without[0].sats),
+            (kb.as_str(), OwedFamily::Unbound, Some(20_190))
+        );
+        assert!(without[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("could not judge the spender"));
+        assert!(without[0].facts["claim"].is_null());
+    }
+
     /// The L25-WITHHELD lens's LOW-1: the withheld/looked ledger, per outcome. A cap break, the clock and the
     /// 16-read tail are WITHHELD; a stored read, a courier ask, a memo, a cached answer and a tracker row, faulted or
     /// not, are LOOKED, and a look wins over any withhold. A spender nothing was noted for is never withheld (a path
@@ -5024,6 +5233,7 @@ pub(crate) mod tests {
             courier_spenders: &NONE,
             my_pkh_by_game: &NO_PKHS,
             home_spends: &NO_HOME_SPENDS,
+            retired_spenders: &NONE,
         }
     }
     static NO_SPENDERS: std::sync::LazyLock<HashMap<String, Vec<SpenderOutput>>> =

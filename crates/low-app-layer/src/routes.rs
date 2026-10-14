@@ -4115,6 +4115,7 @@ async fn owed_recompute_inner(
     // 7. derive (pure), then the ONE service order and the write cap (N2: a planted-marker flood can derive
     //    thousands of `unbound` rows; the actionable ones are written first, the list is CUT and says so)
     let no_home_words: HashMap<String, crate::owed::HomeSpendWord> = HashMap::new();
+    let no_retired: HashSet<String> = HashSet::new();
     // 6d. bsv-low #492 / #512: the payouts this identity's wallet ALREADY HOLDS by its own signed word: the
     //     (game, paying txid) names of its held filings, as step 5 folded them. A row such a filing names is not
     //     served.
@@ -4155,6 +4156,7 @@ async fn owed_recompute_inner(
         courier_spenders: &courier_spenders,
         my_pkh_by_game: &my_pkh_by_game,
         home_spends: &no_home_words,
+        retired_spenders: &no_retired,
     };
     // 6c. bsv-low #485: the home outputs of the CONFIRMED courier-proven payouts (the candidates are the derivation's
     //     own: `owed::courier_home_outputs`), looked at within a small budget, so such a row can RETIRE on evidence
@@ -4169,6 +4171,27 @@ async fn owed_recompute_inner(
     )
     .await;
     inputs.home_spends = &home_spends;
+    // 6e. bsv-low L25 (the courier-retire story-row flap): the durable `homeproof:` latches of the hops' named
+    //     spenders, read BYTE-FREE (no sweep bytes, no courier ask) so a hop an earlier pass PROVED
+    //     home-spent-and-retired stays retired whatever THIS pass's spender courier cap withheld. One indexed PK
+    //     range read of `hop_chain_probes` (zero statements when the identity names no spent hop); the derivation
+    //     consults it only on the byte-free path (`swept_home` `None`), so the bytes-in-hand answer is unchanged.
+    let named_spenders = crate::owed::hop_named_spenders(&inputs);
+    let retired = if named_spenders.is_empty() {
+        HashSet::new()
+    } else {
+        crate::owed::latched_retired_spenders(
+            &named_spenders,
+            &read_home_latches(db, &named_spenders).await,
+        )
+    };
+    if !retired.is_empty() {
+        worker::console_log!(
+            "[owed] {} hop spender(s) carry a durable homeproof latch: a byte-free retirement signal this pass",
+            retired.len()
+        );
+    }
+    inputs.retired_spenders = &retired;
     let mut rows = derive_owed_rows(&inputs);
     // H1/L2: a deferred older row keeps a counted "could not judge" sentence, with its press cleared.
     // The next cursor page refreshes it from evidence; no bounded pass silently erases the tail.
@@ -6473,6 +6496,59 @@ async fn write_probe_memos(db: &worker::D1Database, memos: &[crate::hops_view::P
             memos.len()
         );
     }
+}
+
+/// bsv-low L25 (the courier-retire story-row flap): the durable `homeproof:` latches of the hops' named spenders,
+/// read BYTE-FREE (no sweep bytes, no courier ask) so a hop an earlier pass PROVED home-spent-and-retired stays
+/// retired whatever THIS pass's spender courier cap withheld. One INDEXED range read of the `hop_chain_probes`
+/// PRIMARY KEY per spender, OR'd into one statement (chunked under D1's bound limit); never a scan. A read fault
+/// returns no latch: the pass then judges as it did before (the honest could-not-judge row or #662's keep).
+async fn read_home_latches(
+    db: &worker::D1Database,
+    spenders: &[String],
+) -> Vec<crate::hops_view::ProbeMemo> {
+    let mut rows: Vec<ProbeMemoRow> = Vec::new();
+    for chunk in spenders.chunks(crate::owed::HOME_LATCH_READ_CHUNK) {
+        let binds: Vec<JsValue> = crate::owed::home_latch_range_binds(chunk)
+            .iter()
+            .map(|b| JsValue::from_str(b))
+            .collect();
+        match db
+            .prepare(crate::owed::home_latch_range_read_sql(chunk.len()))
+            .bind(&binds)
+        {
+            Ok(stmt) => match stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<ProbeMemoRow>())
+            {
+                Ok(got) => rows.extend(got),
+                Err(e) => {
+                    console_warn!(
+                        "[owed] home latch read failed ({} spenders): {e}",
+                        spenders.len()
+                    );
+                    return Vec::new();
+                }
+            },
+            Err(e) => {
+                console_warn!(
+                    "[owed] home latch bind failed ({} spenders): {e}",
+                    spenders.len()
+                );
+                return Vec::new();
+            }
+        }
+    }
+    rows.into_iter()
+        .map(|r| crate::hops_view::ProbeMemo {
+            outpoint: r.outpoint,
+            probed_at_ms: r.probed_at_ms,
+            spent: r.spent != 0,
+            spending_txid: r.spending_txid,
+            spent_confirmed: r.spent_confirmed.map(|v| v != 0),
+        })
+        .collect()
 }
 
 /// One `tx_any_verdicts` row as D1 returns it (bsv-low #451 slice C (iii)).
