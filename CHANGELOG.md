@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.1.9] - 2026-10-14
+
+- Record a GASP root whose walk is dropped by a fault in three consecutive
+  runs as unanchorable, and move the cursor past it. The faults that count are
+  a courier fault, an input nobody served, and a verification refusal. A
+  deadline, a bound and a peer's fault of the moment do not count.
+  - The run's lowest faulted root starts a record `retry:fault:<class>` in
+    `gasp_deferred_graphs`. Its next runs walk it again ahead of the pages.
+  - At `UNANCHORABLE_AFTER_FAULTED_RUNS` (3) the record becomes
+    `unanchorable:<class>` and passable, and is walked again only after
+    `UNANCHORABLE_RETRY_SECS` (6 h).
+  - A later success admits the root as any root and clears the record. Nothing
+    is admitted unanchored.
+  - At most one new record per (peer, topic) per run.
+- Name every dropped root with its fault class, once per run. The sync's
+  accounting carries `faulted_roots`, `unanchorable_graphs` and
+  `unanchorable_cleared`. The tick's per-topic line carries `faulted=[...]`
+  beside `cursor_held_by`, and the sync line sums both counts. The counter
+  `gasp_unanchorable_total` is served on invariants as `gaspUnanchorable`.
+- `GET /admin/proof-probe?txid=<hex>&walk=1[&vout=<n>][&topic=<tm>]` (admin
+  bearer) reports what a walk of an unadmitted outpoint is served. Each
+  configured peer is asked for the root's node: present, proof, inputs. For an
+  unproven root, the courier is asked for each ancestor, to depth 3 and at
+  most 24 asks. Nothing is written.
+- **DEPLOYMENT NOTE:** No migration, new variable or dependency pin. The
+  deferred store carries the reason in its existing `reason` column. The
+  count and backoff live in the record's JSON (`faults`, `retry_at`), and
+  are absent from every other record. Rolling back to 0.1.8 is safe: 0.1.8
+  ignores the two new fields. It resumes an `unanchorable:` record as a
+  passable hold walked every run, and deletes a `retry:fault:` record at its
+  next fault, so that root is a gap again, as on 0.1.8. The keeper sets
+  both workspace versions and internal floors for release.
+
 ## [0.1.8] - 2026-10-14
 
 - Hold the GASP graph in flight when the per-peer deadline falls due, whatever
