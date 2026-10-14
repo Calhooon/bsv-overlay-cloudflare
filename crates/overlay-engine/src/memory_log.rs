@@ -53,6 +53,7 @@ struct MemoryLogState {
     after_commit: Vec<(u64, AfterCommit)>,
     crash: CrashPoint,
     awaited_io: u64,
+    poisoned: bool,
 }
 
 impl MemoryStorage {
@@ -142,6 +143,7 @@ impl MemoryStorage {
         evidence: &AdmitEvidence,
         run: impl FnOnce() -> F,
     ) -> Result<T, LogError> {
+        if self.log.lock().unwrap().poisoned { return Err(LogError::AnswerLost); }
         let _writer = self
             .writer
             .try_lock()
@@ -174,11 +176,18 @@ impl MemoryStorage {
                 dry: false,
             });
         }
-        let polled = {
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut future = std::pin::pin!(run());
             future
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
+        }));
+        let polled = match polled {
+            Ok(polled) => polled,
+            Err(_) => {
+                self.log.lock().unwrap().poisoned = true;
+                return Err(LogError::AnswerLost);
+            }
         };
         let scope = self.log.lock().unwrap().scope.take().expect("unit scope");
         let result = match polled {

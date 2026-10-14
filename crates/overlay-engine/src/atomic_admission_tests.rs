@@ -1292,3 +1292,22 @@ async fn a1_c8_second_spender_matches_submit_and_sees_committed_rows() {
     }
     assert_eq!(words[0..2], words[2..4], "spent-coin judgement must match submit");
 }
+
+#[test]
+fn a1_c9_trap_rolls_back_and_poisons_instance() {
+    let store = MemoryStorage::new();
+    let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.transaction::<(), _>("trap", &AdmitEvidence::default(), || async {
+            store.put_admission_row("head", b"key", b"value").unwrap();
+            panic!("unit trap after a write");
+        })
+    }));
+    assert!(matches!(answer, Ok(Err(LogError::AnswerLost))), "trap must lose the answer at the transport boundary");
+    assert!(store.admission_row("head", b"key").is_none());
+    assert_eq!(store.log_head(), 0);
+    assert!(matches!(store.transaction("later", &AdmitEvidence::default(), || async { Ok(()) }), Err(LogError::AnswerLost)), "poisoned instance must refuse every later unit");
+    let runner_answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.run_unit(UnitKind::Admit, &AdmitEvidence::default(), Box::pin(async { Ok(UnitOutput::Done) }))
+    }));
+    assert!(matches!(runner_answer.unwrap_err().downcast_ref::<LogError>(), Some(LogError::AnswerLost)));
+}
