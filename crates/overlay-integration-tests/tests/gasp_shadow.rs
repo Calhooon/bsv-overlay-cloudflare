@@ -315,8 +315,9 @@ async fn w1_each_finalized_body_has_one_census_row_with_the_shadows_answer_besid
             assert_eq!(dupe.served, dupe.shadow);
             assert!(String::from_utf8_lossy(&dupe.served.bytes).contains("outputsToAdmit\":[]"));
         }
-        // One snapshot per body and one per graph, and no other.
-        assert_eq!(shadow.snapshots, expected.len() + 5);
+        // One snapshot per body, the graph's shared with its first body (the
+        // shadow lens's NOTE 6: one state, one copy), and no other.
+        assert_eq!(shadow.snapshots, expected.len(), "one snapshot per body");
     }
 }
 
@@ -897,6 +898,64 @@ async fn w5d_the_snapshots_a_sync_holds_are_bounded() {
         .collect();
     assert!(!over.is_empty(), "the limb was reached");
     assert!(over.iter().all(|r| r.delta == DeltaClass::NotShadowed));
+}
+
+/// The shadow lens's NOTE 7 as a pin: the shadow makes no outbound call. On
+/// the recorded world the peer is asked exactly what `off` asks (29 calls, the
+/// same lines in the same order); the served store is read 48 times more (33
+/// `find_output`, 15 `applied?`: `materialized_rows` of the served side, per
+/// graph after its last body) and written exactly as under `off`; `off`'s
+/// transcript is the shadow's with those reads and the census taken out.
+#[test]
+fn w7_the_shadow_makes_no_outbound_call_and_reads_the_served_store_48_times_more() {
+    let (off, _) = recording(&|_, _, _| {});
+    let (shadow, _) = shadow_recording();
+    let of = |lines: &[String], prefix: &str| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l.starts_with(prefix))
+            .cloned()
+            .collect()
+    };
+    let (off_peer, shadow_peer) = (of(&off, "remote."), of(&shadow, "remote."));
+    println!(
+        "peer calls: off {}, shadow {}; store calls: off {}, shadow {}",
+        off_peer.len(),
+        shadow_peer.len(),
+        of(&off, "store.").len(),
+        of(&shadow, "store.").len()
+    );
+    assert_eq!(off_peer.len(), 29);
+    assert_eq!(off_peer, shadow_peer, "no peer call added");
+    let extra = |op: &str| of(&shadow, op).len() - of(&off, op).len();
+    assert_eq!(
+        of(&shadow, "store.").len() - of(&off, "store.").len(),
+        48,
+        "the served-store reads the shadow adds"
+    );
+    assert_eq!(
+        (extra("store.find_output "), extra("store.applied? ")),
+        (33, 15)
+    );
+    // Take out exactly those reads and the census: what is left is `off`.
+    let mut rest = shadow
+        .iter()
+        .filter(|l| !l.starts_with("census "))
+        .peekable();
+    let mut taken = 0;
+    for line in &off {
+        while rest.peek().is_some_and(|l| *l != line) {
+            let read = rest.next().unwrap();
+            assert!(
+                read.starts_with("store.find_output ") || read.starts_with("store.applied? "),
+                "only reads are added: {read}"
+            );
+            taken += 1;
+        }
+        assert_eq!(rest.next(), Some(line), "off is a subsequence of shadow");
+    }
+    taken += rest.count();
+    assert_eq!(taken, 48);
 }
 
 #[test]
