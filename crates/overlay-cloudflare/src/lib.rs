@@ -646,6 +646,16 @@ pub(crate) fn courier_fetcher(
     env: &Env,
     tracker: Option<Rc<dyn bsv_rs::transaction::ChainTracker>>,
 ) -> crate::proof_fetcher::ChainProofFetcher {
+    courier_fetcher_unrecorded(env, tracker)
+        .with_proof_fault_store(env.d1("OVERLAY_DB").ok().map(Rc::new))
+}
+
+/// The courier of [`courier_fetcher`] with no fault store: it writes
+/// nothing (engine 0.1.9, the probe's walk). Its tallies are in memory.
+pub(crate) fn courier_fetcher_unrecorded(
+    env: &Env,
+    tracker: Option<Rc<dyn bsv_rs::transaction::ChainTracker>>,
+) -> crate::proof_fetcher::ChainProofFetcher {
     let mut f = crate::proof_fetcher::ChainProofFetcher::new(tracker)
         .with_sources(crate::proof_fetcher::ProofSources::from_env(env));
     if let Some(u) = env
@@ -657,7 +667,6 @@ pub(crate) fn courier_fetcher(
         f = f.with_arcade_url(u);
     }
     f.with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|k| k.to_string()))
-        .with_proof_fault_store(env.d1("OVERLAY_DB").ok().map(Rc::new))
 }
 
 pub(crate) fn lookup_service_chain_tracker(
