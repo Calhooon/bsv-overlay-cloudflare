@@ -37,6 +37,7 @@ struct MemoryScope {
     notes: RefusalNotes,
     site: String,
     failed: Option<String>,
+    deferred: Option<AdmitRefusal>,
     writes: usize,
     dry: bool,
 }
@@ -48,6 +49,8 @@ struct MemoryLogState {
     units: Vec<MemoryUnit>,
     rows: BTreeMap<(String, Vec<u8>), Vec<u8>>,
     outbox: Vec<OutboxRow>,
+    sql_statements: Vec<SqlStmt>,
+    after_commit: Vec<(u64, AfterCommit)>,
     crash: CrashPoint,
     awaited_io: u64,
 }
@@ -166,6 +169,7 @@ impl MemoryStorage {
                 notes: vec![],
                 site: "admit".into(),
                 failed: None,
+                deferred: None,
                 writes: 0,
                 dry: false,
             });
@@ -186,6 +190,10 @@ impl MemoryStorage {
         };
         // A failed statement takes precedence over a later verdict derived
         // from the incomplete store. It must remain retryable.
+        let result = match scope.deferred {
+            Some(refusal) => Err(refusal),
+            None => result,
+        };
         let result = match (result, scope.failed) {
             (_, Some(error)) => Err(AdmitRefusal::transient("admit_statement_failed", error)),
             (result, _) => result,
@@ -342,6 +350,20 @@ impl MemoryStorage {
 }
 
 impl LogTxn for MemoryStorage {
+    fn sql(&self) -> &dyn SqlExecutor { self }
+    fn after_commit(&self, intent: AfterCommit) {
+        if self.write_pin().is_err() { return; }
+        let mut log = self.log.lock().unwrap();
+        let seq = log.scope.as_ref().expect("open unit").seq;
+        log.after_commit.push((seq, intent));
+    }
+    fn defer(&self, site: &str, reason: String) {
+        self.log.lock().unwrap().scope.as_mut().expect("open unit")
+            .deferred.get_or_insert_with(|| AdmitRefusal::not_now(site, reason));
+    }
+    fn deferral(&self) -> Option<AdmitRefusal> {
+        self.log.lock().unwrap().scope.as_ref().expect("open unit").deferred.clone()
+    }
     fn seq(&self) -> u64 {
         self.log.lock().unwrap().scope.as_ref().map_or(0, |s| s.seq)
     }
@@ -413,11 +435,11 @@ impl LogTxn for MemoryStorage {
             was_dry,
         })
     }
-    fn emit(&self, event: OutboxEvent) -> Result<(), StorageError> {
+    fn emit(&self, event: OutboxEvent) {
         if self.log.lock().unwrap().scope.is_none() {
-            return Err(StorageError::Other("emit outside admission unit".into()));
+            return;
         }
-        self.write_pin()?;
+        if self.write_pin().is_err() { return; }
         let mut log = self.log.lock().unwrap();
         let seq = log.scope.as_ref().expect("open unit").seq;
         let index = log.outbox.iter().filter(|r| r.seq == seq).count();
@@ -428,7 +450,6 @@ impl LogTxn for MemoryStorage {
             attempts: 0,
             last_error: None,
         });
-        Ok(())
     }
 }
 
@@ -461,6 +482,8 @@ struct MemorySnapshot {
     units: Vec<MemoryUnit>,
     rows: BTreeMap<(String, Vec<u8>), Vec<u8>>,
     outbox: Vec<OutboxRow>,
+    sql_statements: Vec<SqlStmt>,
+    after_commit: Vec<(u64, AfterCommit)>,
 }
 impl MemorySnapshot {
     fn take(store: &MemoryStorage) -> Self {
@@ -481,6 +504,8 @@ impl MemorySnapshot {
             units: log.units.clone(),
             rows: log.rows.clone(),
             outbox: log.outbox.clone(),
+            sql_statements: log.sql_statements.clone(),
+            after_commit: log.after_commit.clone(),
         }
     }
     fn restore(self, store: &MemoryStorage) {
@@ -500,6 +525,8 @@ impl MemorySnapshot {
         log.units = self.units;
         log.rows = self.rows;
         log.outbox = self.outbox;
+        log.sql_statements = self.sql_statements;
+        log.after_commit = self.after_commit;
     }
 }
 
@@ -539,6 +566,7 @@ impl MemoryStorage {
             notes: vec![],
             site: "dry judgement".into(),
             failed: None,
+            deferred: None,
             writes: 0,
             dry: true,
         });
@@ -588,5 +616,52 @@ impl UnitRunner for MemoryStorage {
             Err(LogError::Refused(refusal)) => Err(refusal),
             Err(lost @ LogError::AnswerLost) => std::panic::resume_unwind(Box::new(lost)),
         }
+    }
+}
+
+impl MemoryStorage {
+    /// Statements recorded by the memory executor, not evaluated as SQLite.
+    pub fn sql_statements(&self) -> Vec<SqlStmt> {
+        self.log.lock().unwrap().sql_statements.clone()
+    }
+    /// Only committed intents may reach a host's external side effects.
+    pub fn after_commit_intents(&self) -> Vec<(u64, AfterCommit)> {
+        let log = self.log.lock().unwrap();
+        log.after_commit.iter().filter(|(seq, _)| *seq <= log.head).cloned().collect()
+    }
+    fn record_sql(&self, sql: &str, binds: &[SqlValue], write: bool) -> Result<(), StorageError> {
+        if self.log.lock().unwrap().scope.is_none() {
+            return Err(StorageError::Other("SQL outside admission unit".into()));
+        }
+        if write { self.write_pin()?; }
+        self.log.lock().unwrap().sql_statements.push(SqlStmt { sql: sql.into(), binds: binds.to_vec() });
+        Ok(())
+    }
+}
+/// A recording executor for testing the unit boundary. It returns empty reads
+/// and zero changes; hosts needing SQL evaluation supply a SQLite executor.
+#[async_trait(?Send)]
+impl SqlExecutor for MemoryStorage {
+    async fn run(&self, sql: &str, binds: &[SqlValue]) -> Result<SqlRun, StorageError> {
+        self.record_sql(sql, binds, true)?;
+        Ok(SqlRun { changes: 0, last_row_id: None })
+    }
+    async fn all(&self, sql: &str, binds: &[SqlValue]) -> Result<Vec<SqlRow>, StorageError> {
+        self.record_sql(sql, binds, false)?;
+        Ok(vec![])
+    }
+    async fn batch(&self, stmts: &[SqlStmt]) -> Result<Vec<SqlRun>, StorageError> {
+        let start = self.log.lock().unwrap().sql_statements.len();
+        let mut results = Vec::new();
+        for stmt in stmts {
+            match self.run(&stmt.sql, &stmt.binds).await {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    self.log.lock().unwrap().sql_statements.truncate(start);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(results)
     }
 }

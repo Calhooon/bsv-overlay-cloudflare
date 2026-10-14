@@ -200,12 +200,16 @@ pub struct OutboxEvent {
 /// including errors swallowed by a caller, and refuse commit if one failed.
 /// Managers are built over this scope. No thread-local state is involved.
 pub trait LogTxn: Storage {
+    fn sql(&self) -> &dyn SqlExecutor;
+    fn after_commit(&self, intent: AfterCommit);
+    fn defer(&self, site: &str, reason: String);
+    fn deferral(&self) -> Option<AdmitRefusal>;
     fn seq(&self) -> u64;
     fn now_ms(&self) -> i64;
     fn evidence(&self) -> Arc<AdmitEvidence>;
     fn note(&self, topic: &str, note: RefusalNote);
     fn notes(&self) -> RefusalNotes;
-    fn emit(&self, event: OutboxEvent) -> Result<(), StorageError>;
+    fn emit(&self, event: OutboxEvent);
     /// Name the active hook so a Pending refusal identifies its owner.
     fn at(&self, site: &str);
     /// Keep helper faults visible even when a legacy read helper returns a
@@ -294,3 +298,28 @@ pub fn admit_graph(engine: &crate::engine::Engine, runner: &dyn UnitRunner, grap
 }
 
 pub type LocalBoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
+
+pub const INLINE_BEEF_MAX_BYTES: usize = 1_900_000;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BeefCarry {
+    Inline(Vec<u8>),
+    R2 { key: String, sha256: [u8; 32], len: u64, raw_txs: Vec<Vec<u8>> },
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AfterCommit {
+    R2Put { key: String, bytes_from: BeefCarry },
+}
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlValue { Null, Integer(i64), Real(f64), Text(String), Blob(Vec<u8>) }
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlStmt { pub sql: String, pub binds: Vec<SqlValue> }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlRun { pub changes: u64, pub last_row_id: Option<i64> }
+pub type SqlRow = Vec<(String, SqlValue)>;
+#[async_trait(?Send)]
+pub trait SqlExecutor {
+    async fn run(&self, sql: &str, binds: &[SqlValue]) -> Result<SqlRun, StorageError>;
+    async fn all(&self, sql: &str, binds: &[SqlValue]) -> Result<Vec<SqlRow>, StorageError>;
+    /// Atomic as a whole, and with the containing unit.
+    async fn batch(&self, stmts: &[SqlStmt]) -> Result<Vec<SqlRun>, StorageError>;
+}

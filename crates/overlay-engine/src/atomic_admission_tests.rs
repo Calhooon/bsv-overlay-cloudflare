@@ -602,8 +602,7 @@ impl LookupService for ReadEmitLookup {
                 output_index: *output_index,
                 event_type: "admitted".into(),
                 envelope: b"frozen-envelope".to_vec(),
-            })
-            .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+            });
         Ok(())
     }
     async fn output_evicted(&self, _: &str, _: u32) -> Result<(), LookupServiceError> {
@@ -1175,4 +1174,37 @@ async fn a1_c4_graph_stops_at_first_refusal() {
     assert_eq!(store.log_units().len(), 1);
     let committed = store.run_unit(UnitKind::Gc, &AdmitEvidence::default(), Box::pin(async { Ok(UnitOutput::Done) })).unwrap();
     assert!(matches!(committed.output, UnitOutput::Done));
+}
+
+#[test]
+fn a1_c5_sql_batch_after_commit_and_deferral_share_unit() {
+    let store = MemoryStorage::new();
+    let evidence = AdmitEvidence::default();
+    let stmts = vec![SqlStmt { sql: "INSERT INTO heads VALUES (?)".into(), binds: vec![SqlValue::Integer(1)] },
+        SqlStmt { sql: "UPDATE heads SET n = ?".into(), binds: vec![SqlValue::Integer(2)] }];
+    store.fault_write(Some(2));
+    let failed = store.transaction("batch", &evidence, || async {
+        let _ = store.sql().batch(&stmts).await;
+        Ok(())
+    });
+    assert!(failed.is_err());
+    assert!(store.sql_statements().is_empty(), "batch must roll back as a whole");
+    store.fault_write(None);
+    store.transaction("commit", &evidence, || async {
+        assert_eq!(store.sql().batch(&stmts).await.unwrap().len(), 2);
+        store.after_commit(AfterCommit::R2Put { key: "beef".into(), bytes_from: BeefCarry::Inline(vec![1]) });
+        assert!(store.after_commit_intents().is_empty(), "intent cannot escape the open unit");
+        Ok(())
+    }).unwrap();
+    assert_eq!(store.sql_statements(), stmts);
+    assert_eq!(store.after_commit_intents().len(), 1);
+    let deferred = store.transaction("defer", &evidence, || async {
+        store.sql().run("DELETE FROM heads WHERE n = ?", &[SqlValue::Integer(2)]).await.unwrap();
+        store.after_commit(AfterCommit::R2Put { key: "refused".into(), bytes_from: BeefCarry::Inline(vec![2]) });
+        store.defer("evidence_unavailable", "headers down".into());
+        Ok(())
+    });
+    assert!(matches!(deferred, Err(LogError::Refused(AdmitRefusal::NotNow { site, .. })) if site == "evidence_unavailable"));
+    assert_eq!(store.sql_statements(), stmts);
+    assert_eq!(store.after_commit_intents().len(), 1);
 }
