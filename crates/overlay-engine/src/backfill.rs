@@ -231,7 +231,8 @@ impl GASPSyncResult {
                 unanchorable_cleared,
                 strikes_refused,
                 dead_graphs,
-                expired_swept
+                expired_swept,
+                memo_folded
             );
             topic.root_bounds.append(&mut incoming.root_bounds);
             topic.peers_skipped.append(&mut incoming.peers_skipped);

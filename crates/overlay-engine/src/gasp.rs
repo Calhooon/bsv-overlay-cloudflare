@@ -445,34 +445,6 @@ pub const DEFERRED_GRAPH_MAX_PASSES: u32 = 60;
 /// room, under which a RESUMED walk keeps the record it holds.
 pub const DEFERRED_GRAPHS_PER_PEER_TOPIC: usize = 16;
 
-/// The most FAULT records one (peer, topic) may hold (engine 0.1.10): a
-/// root's `retry:fault:<class>` or `unanchorable:<class>` record, which holds
-/// the root, its class and its count and NO node. Bounded on its own, not
-/// under [`DEFERRED_GRAPHS_PER_PEER_TOPIC`]: on 0.1.9 a (peer, topic) whose
-/// sixteen slots held obligations had no room for the strike of the root
-/// that held its cursor, and the rule was inert (fact 2 of the 0.1.10
-/// brief). The strike of the run's lowest faulted root is written whatever
-/// the deferred store holds; past this bound it is refused and counted
-/// (`strikes_refused`), and the root stays a gap, named `no_room`.
-///
-/// 32: the public peer showed 21 faulted roots in one run, and only the
-/// lowest strikes a run, so 32 holds that history with half again of room.
-/// A record is a few hundred bytes, so 32 are about 13 KB a (peer, topic);
-/// an unanchorable one is walked once per [`UNANCHORABLE_RETRY_SECS`], so 32
-/// cost at most 128 walks a day against 1,440 ticks. Above it the storage's
-/// own ceiling stays the only one ([`DeferredGraphSave::AtCeiling`], the
-/// lens fold's M3): the 16 of L4 bound what a peer serving many DEEP graphs
-/// costs in bytes, and a fault record carries none; what it costs in rows
-/// is this bound, one new record a (peer, topic) a run, and the storage's
-/// row ceilings (the worker's global count and a discovered origin's share).
-///
-/// A held record struck on its own slot (engine 0.1.11) becomes a fault
-/// record under this bound and frees its deferred slot under
-/// [`DEFERRED_GRAPHS_PER_PEER_TOPIC`]: no row is added. In the held loop the
-/// keys not yet read are counted as fault records, so the bound holds before
-/// every record has been read.
-pub const FAULT_RECORDS_PER_PEER_TOPIC: usize = 32;
-
 /// Reset a resumed partial walk after this many consecutive idle faults.
 /// Keep the root retry obligation if the cursor could have passed it. These
 /// attempts remain yieldless and count toward peer quarantine.
@@ -640,10 +612,8 @@ pub struct FaultedRoot {
     pub unanchorable: bool,
     /// The error, cut to 160 characters.
     pub error: String,
-    /// Why its strike was refused (engine 0.1.10): `no_room` (the fault
-    /// bound [`FAULT_RECORDS_PER_PEER_TOPIC`], the storage's ceiling, or the
-    /// keys unread) or `store_fault`; empty when it was written or no strike
-    /// was due.
+    /// Why its strike was refused: `no_room` at the storage's own ceiling,
+    /// or `store_fault`; empty when written or no strike was due.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub refused: String,
 }
@@ -651,8 +621,7 @@ pub struct FaultedRoot {
 /// Why a strike was refused (engine 0.1.10), as [`FaultedRoot::refused`]
 /// names it.
 pub mod strike_refused {
-    /// No room: past [`super::FAULT_RECORDS_PER_PEER_TOPIC`], the storage's
-    /// ceiling, or the (peer, topic)'s keys could not be read.
+    /// No room at the storage's own ceiling. Memo eviction is not a refusal.
     pub const NO_ROOM: &str = "no_room";
     /// The storage faulted writing the record.
     pub const STORE_FAULT: &str = "store_fault";
@@ -1207,6 +1176,15 @@ pub trait GASPStorage {
         record: &DeferredGraph,
     ) -> Result<DeferredGraphSave, GASPError>;
 
+    /// Batched compact facts for a page, or due facts and maintenance with None.
+    /// Standalone adapters may have no memo; engine adapters must forward it.
+    async fn read_fault_memos(
+        &self,
+        _outpoints: Option<&[String]>,
+    ) -> Result<crate::fault_memo::FaultMemoBatch, GASPError> {
+        Ok(crate::fault_memo::FaultMemoBatch::default())
+    }
+
     /// Atomically claim the next retry. A storage without retry support declines.
     async fn reserve_unanchorable_retry(&self, _record: &DeferredGraph) -> Result<bool, GASPError> {
         Ok(false)
@@ -1588,13 +1566,10 @@ pub struct GASPSync<'a> {
     /// records apart (engine 0.1.10: they are counted in `fault_records`).
     held_records: std::cell::Cell<usize>,
     /// The roots of this (peer, topic)'s FAULT records known in this sync
-    /// (engine 0.1.10), bounded by [`FAULT_RECORDS_PER_PEER_TOPIC`]: each
+    /// (engine 0.1.14), outside the partial-graph slot count: each
     /// held one is known when the sync reads it (every held record is read
     /// ahead of the pages), a new one when its strike is written.
     fault_records: std::cell::RefCell<std::collections::HashSet<String>>,
-    /// The keys of this (peer, topic) could not be read: the fault records
-    /// are unknown, so a new strike finds no room (as the deferred slots).
-    fault_keys_unread: std::cell::Cell<bool>,
     /// See [`Self::strikes_refused`].
     strikes_refused: std::cell::Cell<u64>,
     /// The idle resumes counted on the held record the resume in hand read
@@ -1606,11 +1581,6 @@ pub struct GASPSync<'a> {
     /// counted its idle resume, or reset the count on a node appended, so
     /// nothing is counted after it.
     pass_saved: std::cell::Cell<bool>,
-    /// The held keys of this (peer, topic) the sync has not reached yet
-    /// (engine 0.1.11): each may be a fault record, so a resumed record
-    /// struck in the held loop finds room only if the fault bound holds
-    /// them all.
-    keys_unread: std::cell::Cell<usize>,
     /// The walk of the graph in hand (see [`Walk`]).
     walk: std::cell::RefCell<Option<Walk>>,
     /// See [`Self::deferral_stats`].
@@ -1630,6 +1600,7 @@ pub struct GASPSync<'a> {
     unanchorable_cleared: std::cell::Cell<u64>,
     dead_recorded: std::cell::Cell<u64>,
     expired_swept: std::cell::Cell<u64>,
+    memo_folded: std::cell::Cell<u64>,
     root_expiries: std::cell::RefCell<std::collections::HashMap<String, u64>>,
     page: PageProgress,
     request_stop: Option<std::rc::Rc<dyn Fn() -> bool + 'a>>,
@@ -1683,11 +1654,9 @@ impl<'a> GASPSync<'a> {
             nodes_appended: std::cell::Cell::new(0),
             held_records: std::cell::Cell::new(0),
             fault_records: std::cell::RefCell::default(),
-            fault_keys_unread: std::cell::Cell::new(false),
             strikes_refused: std::cell::Cell::new(0),
             resume_idle: std::cell::Cell::new(None),
             pass_saved: std::cell::Cell::new(false),
-            keys_unread: std::cell::Cell::new(0),
             walk: std::cell::RefCell::new(None),
             stats: std::cell::RefCell::new(DeferralStats::default()),
             graphs_attempted: std::cell::Cell::new(0),
@@ -1697,6 +1666,7 @@ impl<'a> GASPSync<'a> {
             unanchorable_cleared: std::cell::Cell::new(0),
             dead_recorded: std::cell::Cell::new(0),
             expired_swept: std::cell::Cell::new(0),
+            memo_folded: std::cell::Cell::new(0),
             root_expiries: std::cell::RefCell::default(),
             page: PageProgress::default(),
             request_stop: None,
@@ -1797,6 +1767,10 @@ impl<'a> GASPSync<'a> {
         self.dead_recorded.get()
     }
 
+    pub fn memo_folded(&self) -> u64 {
+        self.memo_folded.get()
+    }
+
     pub fn expired_swept(&self) -> u64 {
         self.expired_swept.get()
     }
@@ -1805,9 +1779,8 @@ impl<'a> GASPSync<'a> {
         self.unanchorable_cleared.get()
     }
 
-    /// Strikes the last `sync` could not write (engine 0.1.10): past
-    /// [`FAULT_RECORDS_PER_PEER_TOPIC`], at the storage's ceiling, with the
-    /// keys unread, or on a storage fault. Each is named in
+    /// Strikes the last `sync` could not write at the storage's ceiling
+    /// or on a storage fault. Each is named in
     /// [`Self::faulted_roots`] with its [`FaultedRoot::refused`]; a refused
     /// strike of a new root leaves it a gap the cursor holds below.
     pub fn strikes_refused(&self) -> u64 {
@@ -2110,9 +2083,8 @@ impl<'a> GASPSync<'a> {
     /// holds) under [`UNANCHORABLE_AFTER_FAULTED_RUNS`], `unanchorable:<class>`
     /// (passable, walked again after [`UNANCHORABLE_RETRY_SECS`]) at it. The
     /// record holds nothing but the root to ask for: the walk starts again
-    /// from it. A new record needs room among the (peer, topic)'s FAULT
-    /// records ([`FAULT_RECORDS_PER_PEER_TOPIC`], engine 0.1.10), never among
-    /// its deferred slots. A strike that is not written (no room, the
+    /// from it. The storage keeps this compact fact in its bounded memo,
+    /// separate from partial graphs. A strike that is not written (the
     /// storage's ceiling, a storage fault) is REFUSED: counted in
     /// [`Self::strikes_refused`] and named with why; a new root then stays a
     /// gap, a held unanchorable record stays as it was.
@@ -2137,16 +2109,6 @@ impl<'a> GASPSync<'a> {
                 refused: Some(why),
             }
         };
-        // A NEW fault record: a root with no record, or a held record struck
-        // on its own slot (engine 0.1.11), which leaves the deferred slots
-        // for the fault records. The keys not read yet may be fault records.
-        if !prior.is_some_and(DeferredGraph::is_struck)
-            && (self.fault_keys_unread.get()
-                || self.fault_records.borrow().len() + self.keys_unread.get()
-                    >= FAULT_RECORDS_PER_PEER_TOPIC)
-        {
-            return refuse(strike_refused::NO_ROOM);
-        }
         let mut record = Self::fresh_walk(score, outpoint, PassCap::NONE).record;
         record.faults = prior.map_or(0, |r| r.faults).saturating_add(1);
         record.unanchorable_retries = prior.map_or(0, |r| r.unanchorable_retries);
@@ -2482,10 +2444,10 @@ impl<'a> GASPSync<'a> {
         self.unanchorable_cleared.set(0);
         self.dead_recorded.set(0);
         self.expired_swept.set(0);
+        self.memo_folded.set(0);
         self.root_expiries.borrow_mut().clear();
         self.strikes_refused.set(0);
         self.fault_records.borrow_mut().clear();
-        self.fault_keys_unread.set(false);
         self.discarded_graphs.set(0);
         self.anchor_walk_held.set(0);
         self.completed_cursor = self.last_interaction;
@@ -2504,26 +2466,38 @@ impl<'a> GASPSync<'a> {
         // one at a time under the shared resume allowance. A key-read fault
         // conservatively reserves all slots for the records already held.
         let mut held_keys = Vec::new();
-        self.keys_unread.set(0);
         if self.graph_budget.is_some() {
+            let memo = self.storage.read_fault_memos(None).await?;
+            self.memo_folded.set(memo.folded);
+            self.expired_swept.set(memo.swept);
             match self.storage.load_deferred_graphs().await {
                 Ok(keys) => {
                     held_keys.clone_from(&keys);
                     self.held_records.set(keys.len());
-                    self.keys_unread.set(keys.len());
                     self.deferred
                         .borrow_mut()
                         .extend(keys.into_iter().map(|k| k.outpoint));
                 }
                 Err(e) => {
                     self.held_records.set(DEFERRED_GRAPHS_PER_PEER_TOPIC);
-                    self.fault_keys_unread.set(true);
                     warn!(
                         "{} Could not read the deferred graphs (bsv-low #555): {}",
                         self.log_prefix, e
                     );
                 }
             }
+            for record in memo.records {
+                held_keys.retain(|key| key.outpoint != record.outpoint);
+                self.fault_records
+                    .borrow_mut()
+                    .insert(record.outpoint.clone());
+                self.deferred.borrow_mut().insert(record.outpoint.clone());
+                held_keys.push(DeferredGraphKey {
+                    outpoint: record.outpoint,
+                    score: record.score,
+                });
+            }
+            held_keys.sort_by(|a, b| (a.score, &a.outpoint).cmp(&(b.score, &b.outpoint)));
         }
 
         // Track what we already know
@@ -2588,10 +2562,6 @@ impl<'a> GASPSync<'a> {
             if self.request_stopped() {
                 break;
             }
-            // This key is reached now (engine 0.1.11: the fault bound of a
-            // strike in the held loop counts the keys after it).
-            self.keys_unread
-                .set(self.keys_unread.get().saturating_sub(1));
             if known_outpoints.contains(&key.outpoint) {
                 self.deferred.borrow_mut().remove(&key.outpoint);
                 self.drop_record(&key.outpoint, DropReason::Held).await;
@@ -2714,6 +2684,29 @@ impl<'a> GASPSync<'a> {
                     .collect(),
             )
             .await;
+
+            if self.graph_budget.is_some() {
+                let outpoints: Vec<_> = response
+                    .utxo_list
+                    .iter()
+                    .map(|u| format!("{}.{}", u.txid, u.output_index))
+                    .collect();
+                let memo = self.storage.read_fault_memos(Some(&outpoints)).await?;
+                for record in memo.records {
+                    let changed = response.utxo_list.iter().any(|u| {
+                        format!("{}.{}", u.txid, u.output_index) == record.outpoint
+                            && u.score as u64 != record.score
+                    });
+                    if changed && (record.dead || record.unanchorable) {
+                        shared_outpoints.remove(&record.outpoint);
+                        failed_outpoints.remove(&record.outpoint);
+                    }
+                    self.fault_records
+                        .borrow_mut()
+                        .insert(record.outpoint.clone());
+                    self.deferred.borrow_mut().insert(record.outpoint);
+                }
+            }
 
             // lowest_ahead[i]: the lowest score among this page's UTXOs from
             // i on, for `completed_cursor` (a page is not assumed sorted).

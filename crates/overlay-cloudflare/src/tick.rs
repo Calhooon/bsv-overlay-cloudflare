@@ -226,8 +226,8 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     .await
     {
         Some(Ok(summary)) => {
-            worker::console_log!("Scheduled: transaction proof completion scanned={} completed={} unconfirmed={} stitch_failed={}",
-                summary.scanned, summary.completed, summary.still_unconfirmed, summary.stitch_failed);
+            worker::console_log!("Scheduled: transaction proof completion scanned={} completed={} unconfirmed={} stitch_failed={} early_gasp={}",
+                summary.scanned, summary.completed, summary.still_unconfirmed, summary.stitch_failed, summary.early_gasp);
             crate::ops::record_completion_tick(
                 &ops_db,
                 summary.completed as u64,
@@ -377,6 +377,9 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 sum(|t| t.idle_counted)
             );
             worker::console_log!("Scheduled: GASP dead_graphs={} expired_swept={}", sum(|t| t.dead_graphs), sum(|t| t.expired_swept));
+            if sum(|t| t.memo_folded) > 0 || sum(|t| t.expired_swept) > 0 {
+                worker::console_log!("Scheduled: GASP fault memo folded={} sweep={}", sum(|t| t.memo_folded), sum(|t| t.expired_swept));
+            }
             crate::gasp_deferred::record_counters(&ops_db, &r.topics_synced).await;
             // bsv-low #552: what the tick got done under the per-peer
             // budget. Graphs are submitted as they finalize, so a peer

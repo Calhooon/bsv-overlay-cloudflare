@@ -30,6 +30,7 @@ pub mod beef_limits;
 pub mod broadcaster;
 pub mod builder;
 pub mod engine;
+pub mod fault_memo;
 pub mod gasp;
 pub mod gasp_overlay;
 pub mod health_checker;

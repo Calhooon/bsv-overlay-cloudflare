@@ -3394,7 +3394,11 @@ impl ScriptedStore {
 
 #[async_trait(?Send)]
 impl Storage for ScriptedStore {
-    async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
+    async fn insert_output_with_origin(
+        &self,
+        output: &Output,
+        gasp: bool,
+    ) -> Result<(), StorageError> {
         let hangs = matches!(
             self.armed.borrow().as_ref(),
             Some((txid, output_index, InsertEvent::Hangs))
@@ -3422,7 +3426,19 @@ impl Storage for ScriptedStore {
             clock.spent.set(clock.allowance.get() + 1);
             tokio::task::yield_now().await;
         }
-        self.inner.insert_output(output).await
+        self.inner.insert_output_with_origin(output, gasp).await
+    }
+    async fn read_fault_memos(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoints: Option<&[String]>,
+    ) -> Result<bsv_overlay_engine::fault_memo::FaultMemoBatch, StorageError> {
+        self.inner.read_fault_memos(host, topic, outpoints).await
+    }
+
+    async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
+        self.insert_output_with_origin(output, false).await
     }
     async fn delete_output(
         &self,

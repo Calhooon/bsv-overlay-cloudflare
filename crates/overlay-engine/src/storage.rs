@@ -23,6 +23,8 @@ pub struct TransactionBeef {
     pub txid: String,
     /// The serialized BEEF bytes for this transaction.
     pub beef: Vec<u8>,
+    /// Selected before the ordinary push-backstop age because GASP admitted it.
+    pub early_gasp: bool,
 }
 
 /// Overlay Services storage backend.
@@ -41,6 +43,15 @@ pub trait Storage {
     /// If `output.beef` is Some, also upsert the BEEF into the transactions table
     /// (deduplicated by txid).
     async fn insert_output(&self, output: &Output) -> Result<(), StorageError>;
+
+    /// Insert an output and record its admission origin with its transaction.
+    /// A GASP finalization has no broadcaster callback to wait for. Wrappers
+    /// must forward this method; ordinary submissions pass false.
+    async fn insert_output_with_origin(
+        &self,
+        output: &Output,
+        gasp: bool,
+    ) -> Result<(), StorageError>;
 
     /// Delete an output from storage.
     ///
@@ -388,6 +399,18 @@ pub trait Storage {
         record: &crate::gasp::DeferredGraph,
     ) -> Result<bool, StorageError>;
 
+    /// Read compact fault facts. With a page, use only its outpoint keys.
+    /// With None, atomically fold legacy fault records out of partial-graph
+    /// storage, sweep expired facts, and return at most FAULT_MEMO_DUE_LIMIT
+    /// due records. The legacy graph accessors also address memo facts, while
+    /// find_deferred_graphs enumerates partial graphs only.
+    async fn read_fault_memos(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoints: Option<&[String]>,
+    ) -> Result<crate::fault_memo::FaultMemoBatch, StorageError>;
+
     /// The KEYS of the records of (`host`, `topic`), lowest score first. A
     /// sync reads these up front and each record only when its UTXO is
     /// served (the lens fold's L3).
@@ -482,6 +505,22 @@ pub struct PeerSyncHealth {
 /// `Box<dyn Storage>` over the same instance. Pure delegation, no semantics.
 #[async_trait(?Send)]
 impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
+    async fn insert_output_with_origin(
+        &self,
+        output: &Output,
+        gasp: bool,
+    ) -> Result<(), StorageError> {
+        (**self).insert_output_with_origin(output, gasp).await
+    }
+    async fn read_fault_memos(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoints: Option<&[String]>,
+    ) -> Result<crate::fault_memo::FaultMemoBatch, StorageError> {
+        (**self).read_fault_memos(host, topic, outpoints).await
+    }
+
     async fn get_peer_cadence(
         &self,
         host: &str,
@@ -748,6 +787,9 @@ pub mod memory {
     /// NOT suitable for production — no persistence, no concurrency beyond Mutex.
     #[derive(Debug, Default)]
     pub struct MemoryStorage {
+        fault_memos: Mutex<HashMap<(String, String, String), crate::fault_memo::FaultMemo>>,
+        fault_memo_ceiling: Mutex<Option<usize>>,
+        gasp_transactions: Mutex<std::collections::HashSet<String>>,
         cadence: Mutex<HashMap<(String, String), (crate::sync_load::PeerCadence, u64)>>,
         /// outputs keyed by (txid, outputIndex, topic)
         outputs: Mutex<HashMap<(String, u32, String), Output>>,
@@ -823,6 +865,48 @@ pub mod memory {
     type YieldStreakRow = (u64, u64, u64);
 
     impl MemoryStorage {
+        pub fn fault_memos(&self) -> Vec<crate::fault_memo::FaultMemo> {
+            self.fault_memos.lock().unwrap().values().cloned().collect()
+        }
+
+        pub fn set_fault_memo_ceiling(&self, ceiling: Option<usize>) {
+            *self.fault_memo_ceiling.lock().unwrap() = ceiling;
+        }
+
+        pub fn seed_legacy_fault(&self, record: crate::gasp::DeferredGraph) {
+            self.deferred_graphs.lock().unwrap().insert(
+                (
+                    record.peer.clone(),
+                    record.topic.clone(),
+                    record.outpoint.clone(),
+                ),
+                record,
+            );
+        }
+
+        fn cap_fault_memos(
+            held: &mut HashMap<(String, String, String), crate::fault_memo::FaultMemo>,
+            topic: &str,
+        ) {
+            if held.len() <= crate::fault_memo::FAULT_MEMO_MAX_ROWS {
+                return;
+            }
+            let mut keys: Vec<_> = held
+                .iter()
+                .filter(|(_, r)| r.topic == topic)
+                .map(|(k, r)| (r.first_at, k.clone()))
+                .collect();
+            let excess = keys
+                .len()
+                .saturating_sub(crate::fault_memo::FAULT_MEMO_MAX_ROWS);
+            if excess > 0 {
+                keys.sort();
+                for (_, key) in keys.into_iter().take(excess) {
+                    held.remove(&key);
+                }
+            }
+        }
+
         pub fn new() -> Self {
             Self::default()
         }
@@ -959,6 +1043,94 @@ pub mod memory {
 
     #[async_trait(?Send)]
     impl Storage for MemoryStorage {
+        async fn insert_output_with_origin(
+            &self,
+            output: &Output,
+            gasp: bool,
+        ) -> Result<(), StorageError> {
+            self.insert_output(output).await?;
+            if gasp && output.beef.is_some() {
+                self.gasp_transactions
+                    .lock()
+                    .unwrap()
+                    .insert(output.txid.clone());
+            }
+            Ok(())
+        }
+
+        async fn read_fault_memos(
+            &self,
+            host: &str,
+            topic: &str,
+            outpoints: Option<&[String]>,
+        ) -> Result<crate::fault_memo::FaultMemoBatch, StorageError> {
+            use crate::fault_memo::{FaultMemo, FaultMemoBatch, FAULT_MEMO_DUE_LIMIT};
+            let now = (crate::engine::current_timestamp_ms() / 1000.0) as u64;
+            let mut batch = FaultMemoBatch::default();
+            let mut held = self.fault_memos.lock().unwrap();
+            if outpoints.is_none() {
+                let mut legacy = self.deferred_graphs.lock().unwrap();
+                legacy.retain(|key, record| {
+                    if record.peer != host || record.topic != topic {
+                        return true;
+                    }
+                    let Some(memo) = FaultMemo::from_record(record, now) else {
+                        return true;
+                    };
+                    held.entry(key.clone()).or_insert(memo);
+                    batch.folded += 1;
+                    false
+                });
+                Self::cap_fault_memos(&mut held, topic);
+                let mut expired = self.expired_outpoints.lock().unwrap();
+                let logical_now = *self.clock_secs.lock().unwrap();
+                for r in held.values().filter(|r| {
+                    r.peer == host
+                        && r.topic == topic
+                        && (r.dead || r.unanchorable)
+                        && r.expiry.is_some_and(|t| t <= now)
+                }) {
+                    expired.insert(
+                        (topic.into(), r.outpoint.clone()),
+                        (
+                            logical_now + crate::gasp::EXPIRED_OUTPOINT_MEMO_SECS,
+                            logical_now,
+                        ),
+                    );
+                }
+                held.retain(|_, r| {
+                    let remove = r.peer == host
+                        && r.topic == topic
+                        && (r.dead || r.unanchorable)
+                        && (r.expiry.is_some_and(|t| t <= now)
+                            || expired
+                                .get(&(topic.into(), r.outpoint.clone()))
+                                .is_some_and(|(until, _)| *until > logical_now));
+                    if remove {
+                        batch.swept += 1;
+                    }
+                    !remove
+                });
+            }
+            batch.records = held
+                .values()
+                .filter(|r| r.peer == host && r.topic == topic)
+                .filter(|r| {
+                    outpoints.map_or(!r.dead && r.next_at <= now, |keys| {
+                        keys.contains(&r.outpoint)
+                    })
+                })
+                .cloned()
+                .collect();
+            batch.records.sort_by(|a, b| {
+                (a.next_at, a.score, &a.outpoint).cmp(&(b.next_at, b.score, &b.outpoint))
+            });
+            if outpoints.is_none() {
+                batch.records.truncate(FAULT_MEMO_DUE_LIMIT);
+            }
+            Ok(batch)
+        }
+
         async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
             let key = (
                 output.txid.clone(),
@@ -1013,6 +1185,7 @@ pub mod memory {
             if !has_remaining {
                 self.transactions.lock().unwrap().remove(txid);
                 self.proven.lock().unwrap().remove(txid);
+                self.gasp_transactions.lock().unwrap().remove(txid);
             }
 
             Ok(())
@@ -1300,12 +1473,14 @@ pub mod memory {
                     .map(|(txid, beef)| TransactionBeef {
                         txid: txid.clone(),
                         beef: beef.clone(),
+                        early_gasp: self.gasp_transactions.lock().unwrap().contains(txid)
+                            && !self.age_gate_open(txid, min_age_secs),
                     })
                     .collect()
             };
             Ok(candidates
                 .into_iter()
-                .filter(|c| self.age_gate_open(&c.txid, min_age_secs))
+                .filter(|c| c.early_gasp || self.age_gate_open(&c.txid, min_age_secs))
                 .take(limit as usize)
                 .collect())
         }
@@ -1445,6 +1620,28 @@ pub mod memory {
             if *self.deferred_graph_put_fault.lock().unwrap() {
                 return Err(StorageError::Database("deferred graph save faulted".into()));
             }
+            if let Some(mut memo) = crate::fault_memo::FaultMemo::from_record(
+                record,
+                (crate::engine::current_timestamp_ms() / 1000.0) as u64,
+            ) {
+                let mut held = self.fault_memos.lock().unwrap();
+                if self
+                    .fault_memo_ceiling
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|n| !held.contains_key(&key) && held.len() >= n)
+                {
+                    return Ok(crate::gasp::DeferredGraphSave::AtCeiling);
+                }
+                if let Some(prior) = held.get(&key).filter(|r| r.score == memo.score) {
+                    memo.first_at = prior.first_at;
+                }
+                held.insert(key.clone(), memo);
+                Self::cap_fault_memos(&mut held, &record.topic);
+                self.deferred_graphs.lock().unwrap().remove(&key);
+                *self.deferred_graph_writes.lock().unwrap() += 1;
+                return Ok(crate::gasp::DeferredGraphSave::Saved);
+            }
             if let Some(ceiling) = *self.deferred_graph_ceiling.lock().unwrap() {
                 let held = self.deferred_graphs.lock().unwrap();
                 if !held.contains_key(&key) && held.len() >= ceiling {
@@ -1462,6 +1659,7 @@ pub mod memory {
                     return Ok(crate::gasp::DeferredGraphSave::AtCeiling);
                 }
             }
+            self.fault_memos.lock().unwrap().remove(&key);
             *self.deferred_graph_writes.lock().unwrap() += 1;
             self.deferred_graphs.lock().unwrap().insert(
                 (
@@ -1482,37 +1680,28 @@ pub mod memory {
             if *self.deferred_graph_put_fault.lock().unwrap() {
                 return Err(StorageError::Database("retry reservation faulted".into()));
             }
-            let ceiling = *self.deferred_graph_byte_ceiling.lock().unwrap();
             let key = (
                 record.peer.clone(),
                 record.topic.clone(),
                 record.outpoint.clone(),
             );
-            let mut held = self.deferred_graphs.lock().unwrap();
-            let Some(prior) = held.get(&key) else {
+            let mut held = self.fault_memos.lock().unwrap();
+            let Some(prior) = held.get_mut(&key) else {
                 return Ok(false);
             };
             let now = (crate::engine::current_timestamp_ms() / 1000.0) as u64;
-            if !prior.is_unanchorable()
-                || prior.reason != record.reason
+            if prior.dead
+                || !prior.unanchorable
+                || record.fault_class() != Some(prior.class.as_str())
                 || prior.score != record.score
-                || prior.retry_at > now
-                || prior.unanchorable_retries.checked_add(1) != Some(record.unanchorable_retries)
+                || prior.next_at > now
+                || prior.retries.checked_add(1) != Some(record.unanchorable_retries)
                 || record.unanchorable_retries > crate::gasp::UNANCHORABLE_RETRIES
             {
                 return Ok(false);
             }
-            if ceiling.is_some_and(|limit| {
-                held.iter()
-                    .filter(|(k, _)| **k != key)
-                    .map(|(_, r)| r.byte_size())
-                    .sum::<usize>()
-                    + record.byte_size()
-                    > limit
-            }) {
-                return Ok(false);
-            }
-            held.insert(key, record.clone());
+            prior.retries = record.unanchorable_retries;
+            prior.next_at = record.retry_at;
             *self.deferred_graph_writes.lock().unwrap() += 1;
             Ok(true)
         }
@@ -1543,6 +1732,15 @@ pub mod memory {
             outpoint: &str,
         ) -> Result<Option<crate::gasp::DeferredGraph>, StorageError> {
             *self.deferred_graph_reads.lock().unwrap() += 1;
+            if let Some(memo) = self
+                .fault_memos
+                .lock()
+                .unwrap()
+                .get(&(host.into(), topic.into(), outpoint.into()))
+                .cloned()
+            {
+                return Ok(Some(memo.into_record()));
+            }
             Ok(self
                 .deferred_graphs
                 .lock()
@@ -1557,6 +1755,10 @@ pub mod memory {
             topic: &str,
             outpoint: &str,
         ) -> Result<(), StorageError> {
+            self.fault_memos
+                .lock()
+                .unwrap()
+                .remove(&(host.into(), topic.into(), outpoint.into()));
             self.deferred_graphs.lock().unwrap().remove(&(
                 host.to_string(),
                 topic.to_string(),

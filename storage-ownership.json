@@ -1458,6 +1458,28 @@
    "never_wipe": false,
    "holds": "bounded deploy proof backfill cursor",
    "why": "Deleting restarts a bounded proof-only pass; no authority"
+  },
+  {
+   "name": "gasp_fault_memo",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "compact GASP fault facts; bounded to 20,000 rows per topic; expiry, retry and operator clearing; no graph bytes",
+   "why": "Memo maintenance only; never evidence for admission"
+  },
+  {
+   "name": "gasp_fault_memo_size",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "transactional row counts used only to bound the fault memo without scanning it on each insert",
+   "why": "Memo maintenance only; never evidence for admission"
   }
  ],
  "other_stores_owners_only": {

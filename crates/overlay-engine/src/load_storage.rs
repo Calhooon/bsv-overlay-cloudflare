@@ -4,6 +4,24 @@ use async_trait::async_trait;
 pub(crate) struct MeteredStorage(pub Box<dyn Storage>);
 #[async_trait(?Send)]
 impl Storage for MeteredStorage {
+    async fn insert_output_with_origin(
+        &self,
+        output: &Output,
+        gasp: bool,
+    ) -> Result<(), StorageError> {
+        crate::meter::storage_write();
+        self.0.insert_output_with_origin(output, gasp).await
+    }
+    async fn read_fault_memos(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoints: Option<&[String]>,
+    ) -> Result<crate::fault_memo::FaultMemoBatch, StorageError> {
+        crate::meter::storage_read();
+        self.0.read_fault_memos(host, topic, outpoints).await
+    }
+
     async fn get_peer_cadence(
         &self,
         host: &str,

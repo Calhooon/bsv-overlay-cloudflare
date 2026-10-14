@@ -340,23 +340,6 @@ pub const DEFERRED_GRAPH_UPSERT_SQL: &str = "INSERT INTO gasp_deferred_graphs \
 pub const DEFERRED_GRAPHS_SELECT_SQL: &str = "SELECT outpoint, score FROM gasp_deferred_graphs \
      WHERE host = ?1 AND topic = ?2 ORDER BY score, outpoint";
 
-/// One compare-and-set reserves a retry across overlapping requests. Fault
-/// records are whole rows. Preserve all byte ceilings while replacing the JSON.
-/// Binds: key, JSON, bytes, retained reason, score, prior count, three byte
-/// ceilings (global, origin, discovered), retry ceiling.
-pub const RESERVE_UNANCHORABLE_SQL: &str = "UPDATE gasp_deferred_graphs AS g \
-    SET record = ?4, bytes = ?5, updated_at = unixepoch() \
-    WHERE host = ?1 AND topic = ?2 AND outpoint = ?3 AND score = ?7 \
-      AND reason = ?6 AND reason LIKE 'held:unanchorable:%' AND chunks = 0 \
-      AND json_valid(record) \
-      AND COALESCE(json_extract(record, '$.unanchorableRetries'), 0) = ?8 \
-      AND ?8 < ?12 AND COALESCE(json_extract(record, '$.retryAt'), 0) <= unixepoch() \
-      AND (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs) - g.bytes + ?5 <= ?9 \
-      AND (g.configured OR ( \
-        (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs WHERE origin = g.origin AND configured = 0) - g.bytes + ?5 <= ?10 \
-        AND (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs WHERE configured = 0) - g.bytes + ?5 <= ?11)) \
-    RETURNING outpoint";
-
 /// One record's head row: its first part, and where the rest is
 /// ([`DEFERRED_GRAPH_CHUNK_GET_SQL`], `seq` 1 ..= `chunks` under `gen`).
 pub const DEFERRED_GRAPH_GET_SQL: &str = "SELECT record, chunks, gen FROM gasp_deferred_graphs \
@@ -485,7 +468,12 @@ pub async fn readmit_fault(db: &D1Database, topic: &str, outpoint: &str) -> work
         .fetch_all::<RetiredFault>(db)
         .await?;
     delete_fault_parts(db, &rows).await?;
-    Ok(rows.len() as u64)
+    let memo = Query::new(crate::gasp_fault_memo::READMIT)
+        .bind(topic)
+        .bind(outpoint)
+        .fetch_all::<serde_json::Value>(db)
+        .await?;
+    Ok((rows.len() + memo.len()) as u64)
 }
 
 async fn sweep_fault_expiry(db: &D1Database) {
@@ -513,6 +501,17 @@ pub const COUNTER_GASP_GRAPH_DROPPED_STALE: &str = "gasp_graph_dropped_stale_tot
 /// its GASP sync): each logged, counted `stale` and in all drops. Best effort.
 pub async fn sweep_stale(db: &D1Database) {
     sweep_fault_expiry(db).await;
+    // Known expiry is indexed every tick. Reconciling unknown legacy expiry
+    // reads the bounded memo, so share the existing hourly memo-cap cadence.
+    let reconcile_shared = expired_outpoints_cap_due(crate::tick::now_ms() as f64);
+    match crate::gasp_fault_memo::sweep(db, None, None, reconcile_shared).await {
+        Ok(n) if n > 0 => {
+            crate::ops::bump_counter(db, COUNTER_GASP_FAULT_EXPIRED, n).await;
+            worker::console_log!("Scheduled: GASP fault memo sweep removed={n}");
+        }
+        Ok(_) => {}
+        Err(e) => worker::console_log!("Scheduled: GASP fault memo sweep failed: {e}"),
+    }
     #[derive(Deserialize)]
     struct Swept {
         host: String,
@@ -642,7 +641,7 @@ pub const COUNTER_GASP_UNANCHORABLE: &str = "gasp_unanchorable_total";
 pub const COUNTER_GASP_DEAD: &str = "gasp_dead_total";
 pub const COUNTER_GASP_FAULT_EXPIRED: &str = "gasp_fault_expired_total";
 /// Strikes the engine could not write (engine 0.1.10): past
-/// `FAULT_RECORDS_PER_PEER_TOPIC`, at this store's ceiling or on its fault;
+/// this store's own ceiling or on its fault;
 /// invariants' `gaspStrikesRefused`. Each leaves its root a gap the cursor
 /// holds below, named `no_room` or `store_fault` on the tick's line.
 pub const COUNTER_GASP_STRIKES_REFUSED: &str = "gasp_strikes_refused_total";
@@ -2024,6 +2023,7 @@ mod tests {
             peer_results: std::collections::HashMap::new(),
             dead_graphs: 0,
             expired_swept: 0,
+            memo_folded: 0,
             unanchorable_graphs: 0,
             unanchorable_cleared: 0,
             strikes_refused: 0,
