@@ -450,9 +450,12 @@ pub const DEFERRED_GRAPHS_PER_PEER_TOPIC: usize = 16;
 /// attempts remain yieldless and count toward peer quarantine.
 pub const DEFERRED_GRAPH_MAX_IDLE_FAULTS: u32 = 3;
 
-/// Three consecutive deadline cuts distinguish a repeatedly stalled root
-/// from a single slow response. Keep a bounded retry record meanwhile; only
-/// the third cut permits the cursor to pass a root with no fetched node.
+/// Three consecutive cuts by the graph's OWN deadline (`time`) distinguish a
+/// repeatedly stalled root from a single slow response. Keep a bounded retry
+/// record meanwhile; only the third cut permits the cursor to pass a root
+/// with no fetched node. The per-PEER deadline (`peer_deadline`) is not the
+/// graph's: the graph in flight when the peer's slice ends is held at once
+/// (see [`GASPSync::defer_in_flight`]).
 pub const DEADLINE_STALL_DEFERRAL_RUNS: u32 = 3;
 
 /// The per-graph budget of a [`GASPSync`] (bsv-low #555,
@@ -1171,6 +1174,15 @@ pub struct GASPSync<'a> {
     roots_unproven: std::cell::Cell<u64>,
     cursor_held_by: Option<(u64, String)>,
     cursor_after_in_flight: u64,
+    /// The root (score, outpoint) of the graph in flight, kept OUTSIDE the
+    /// walk's future like [`Walk`], so a per-peer deadline that drops the
+    /// sync before the walk exists (or after a refusal took it) still names
+    /// the graph it cut.
+    in_flight: Option<(u64, String)>,
+    /// New durable holds this sync saved: see [`Self::graphs_retained`].
+    retained: std::cell::Cell<u64>,
+    /// Held graphs this sync resumed that appended a node or converged.
+    resumed_with_progress: std::cell::Cell<u64>,
     cursor_yielded: std::cell::Cell<bool>,
     expired_refused: std::cell::Cell<u64>,
     storage: Box<dyn GASPStorage + 'a>,
@@ -1258,6 +1270,9 @@ impl<'a> GASPSync<'a> {
             roots_unproven: std::cell::Cell::new(0),
             cursor_held_by: None,
             cursor_after_in_flight: last_interaction,
+            in_flight: None,
+            retained: std::cell::Cell::new(0),
+            resumed_with_progress: std::cell::Cell::new(0),
             cursor_yielded: std::cell::Cell::new(false),
             last_interaction,
             unidirectional,
@@ -1312,6 +1327,30 @@ impl<'a> GASPSync<'a> {
 
     pub fn cursor_yielded(&self) -> bool {
         self.cursor_yielded.get()
+    }
+
+    /// New durable holds the last `sync` saved (a walk past its budget, or
+    /// the graph in flight at the per-peer deadline): work the cursor may
+    /// pass because the next sync resumes it.
+    pub fn graphs_retained(&self) -> u64 {
+        self.retained.get()
+    }
+
+    /// Held graphs the last `sync` resumed that appended at least one node
+    /// or converged.
+    pub fn graphs_resumed_with_progress(&self) -> u64 {
+        self.resumed_with_progress.get()
+    }
+
+    /// Release the cursor's hold on `outpoint`: it is finished or held.
+    fn release_hold(&mut self, outpoint: &str) {
+        if self
+            .cursor_held_by
+            .as_ref()
+            .is_some_and(|(_, held)| held == outpoint)
+        {
+            self.cursor_held_by = None;
+        }
     }
 
     fn hold_cursor(&mut self, score: u64, outpoint: &str) {
@@ -1479,6 +1518,9 @@ impl<'a> GASPSync<'a> {
         self.roots_proven.set(0);
         self.roots_unproven.set(0);
         self.cursor_held_by = None;
+        self.in_flight = None;
+        self.retained.set(0);
+        self.resumed_with_progress.set(0);
         self.cursor_yielded.set(false);
         self.discarded_graphs.set(0);
         self.anchor_walk_held.set(0);
@@ -1574,10 +1616,12 @@ impl<'a> GASPSync<'a> {
                 score: key.score as f64,
             };
             self.graph_in_flight = true;
+            self.in_flight = Some((key.score, key.outpoint.clone()));
             self.cursor_after_in_flight = initial_interaction;
             self.hold_cursor(key.score, &key.outpoint);
             let result = self.ingest_utxo(&utxo, &key.outpoint).await;
             self.graph_in_flight = false;
+            self.in_flight = None;
             let settled = match result {
                 Ok(Ingested::Completed) => {
                     let landed = match &self.finalized_hook {
@@ -1714,8 +1758,10 @@ impl<'a> GASPSync<'a> {
                         Self::cursor_for_completed(&with_current, remaining, initial_interaction);
                     self.hold_cursor(utxo.score as u64, &outpoint);
                     self.graph_in_flight = true;
+                    self.in_flight = Some((utxo.score as u64, outpoint.clone()));
                     let ingested = self.ingest_utxo(utxo, &outpoint).await;
                     self.graph_in_flight = false;
+                    self.in_flight = None;
                     let ingested = match ingested {
                         Ok(Ingested::Expired) => {
                             self.cursor_yielded.set(true);
@@ -2338,6 +2384,8 @@ impl<'a> GASPSync<'a> {
                 self.held_records
                     .set(self.held_records.get().saturating_sub(1));
                 self.stats.borrow_mut().converged += 1;
+                self.resumed_with_progress
+                    .set(self.resumed_with_progress.get() + 1);
                 info!(
                     "{} Deferred graph {} CONVERGED after {} passes, {} calls, {} nodes (bsv-low #555)",
                     self.log_prefix,
@@ -2384,8 +2432,11 @@ impl<'a> GASPSync<'a> {
             walk.record.passes = 0;
         }
         walk.record.passes += 1;
+        // Only the graph's OWN deadline earns the stall allowance. The
+        // per-peer deadline ends the slice, not the graph: what it cut is
+        // held at once and the cursor passes it.
         let retry = walk.record.nodes.is_empty()
-            && deadline_cut
+            && reason == "time"
             && !was_held
             && walk.record.passes < DEADLINE_STALL_DEFERRAL_RUNS;
         walk.record.cursor_passable = !retry;
@@ -2414,6 +2465,12 @@ impl<'a> GASPSync<'a> {
             Ok(DeferredGraphSave::Saved) => {
                 if !walk.resumed {
                     self.held_records.set(self.held_records.get() + 1);
+                    if !retry {
+                        self.retained.set(self.retained.get() + 1);
+                    }
+                } else if walk.record.nodes.len() > walk.nodes_at_start {
+                    self.resumed_with_progress
+                        .set(self.resumed_with_progress.get() + 1);
                 }
                 if !retry {
                     self.stats.borrow_mut().deferred += 1;
@@ -2549,18 +2606,52 @@ impl<'a> GASPSync<'a> {
     /// Save the walk of the graph that was in hand when a deadline dropped
     /// `sync` (bsv-low #555): the per-peer deadline (D16) defers it like the
     /// per-graph one, so the next pass resumes it instead of walking it
-    /// again. No-op without a per-graph budget or with no walk in hand.
+    /// again. No-op without a per-graph budget.
+    ///
+    /// The graph in flight is HELD at once, whatever it fetched: its root
+    /// outpoint and partial walk become a durable record (reason
+    /// `peer_deadline`) the next sync resumes ahead of its pages, so the
+    /// cursor passes it to the page's last finished score. Before 0.1.8 a
+    /// graph the deadline met before its root came back was only a retry,
+    /// and the next run re-read the same page behind it (bsv-low #552:
+    /// "the graph in flight is lost whole"). A graph the deadline met after
+    /// its refusal is finished, not held. A graph that cannot be held (no
+    /// room) stays the cursor's gap and is named in `cursor_held_by`.
     pub async fn defer_in_flight(&mut self) {
+        let in_flight = self.in_flight.take();
+        if self.graph_budget.is_none() {
+            return;
+        }
+        if let Some((_, outpoint)) = &in_flight {
+            if self.expired.borrow().contains(outpoint) {
+                let outpoint = outpoint.clone();
+                self.walk.borrow_mut().take();
+                self.completed_cursor = self.cursor_after_in_flight;
+                self.release_hold(&outpoint);
+                return;
+            }
+        }
         // A deadline during pagination has no graph to save. Preserve the
         // completed cursor, including any earlier unsaved gap.
-        if self.graph_budget.is_some() && self.walk.borrow().is_some() {
-            match self.save_walk("peer_deadline", false).await {
-                Saved::Yes => {
-                    self.completed_cursor = self.cursor_after_in_flight;
-                }
-                Saved::Unkept(why, mut walk) => self.unkept(why, &mut walk).await,
-                _ => {}
+        if self.walk.borrow().is_none() {
+            let Some((score, outpoint)) = in_flight else {
+                return;
+            };
+            *self.walk.borrow_mut() = Some(Self::fresh_walk(score, &outpoint, PassCap::NONE));
+        }
+        let outpoint = self
+            .walk
+            .borrow()
+            .as_ref()
+            .map(|w| w.record.outpoint.clone())
+            .unwrap_or_default();
+        match self.save_walk("peer_deadline", false).await {
+            Saved::Yes => {
+                self.completed_cursor = self.cursor_after_in_flight;
+                self.release_hold(&outpoint);
             }
+            Saved::Unkept(why, mut walk) => self.unkept(why, &mut walk).await,
+            _ => {}
         }
     }
 

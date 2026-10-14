@@ -8546,6 +8546,10 @@ mod tests {
         requests: std::rc::Rc<std::cell::RefCell<Vec<crate::types::GASPInitialRequest>>>,
         clamp: Option<usize>,
         node_cost_ms: u64,
+        /// One request of this txid costs this much more, once.
+        slow_once: std::rc::Rc<std::cell::RefCell<Option<(String, u64)>>>,
+        /// Node requests answered, by txid.
+        asked: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     }
 
     #[async_trait(?Send)]
@@ -8582,7 +8586,18 @@ mod tests {
             _: u32,
             _: bool,
         ) -> Result<crate::types::GASPNode, crate::gasp::GASPError> {
+            self.asked.borrow_mut().push(txid.to_string());
             self.elapsed.set(self.elapsed.get() + self.node_cost_ms);
+            let slow = {
+                let mut slow = self.slow_once.borrow_mut();
+                match slow.as_ref() {
+                    Some((t, _)) if t == txid => slow.take().map(|(_, ms)| ms),
+                    _ => None,
+                }
+            };
+            if let Some(ms) = slow {
+                self.elapsed.set(self.elapsed.get() + ms);
+            }
             if self.node_cost_ms > 0 {
                 let mut yielded = false;
                 std::future::poll_fn(|cx| {
@@ -8658,6 +8673,8 @@ mod tests {
             requests: std::rc::Rc::default(),
             clamp: None,
             node_cost_ms: 5000,
+            slow_once: std::rc::Rc::default(),
+            asked: std::rc::Rc::default(),
         };
         (engine, remote)
     }
@@ -8978,6 +8995,65 @@ mod tests {
             .unwrap();
         assert!(held.cursor_passable);
         assert!(held.nodes.is_empty());
+    }
+
+    /// 0.1.8 (the cursor): a graph the per-PEER deadline cuts before its
+    /// root comes back is held at once (`peer_deadline`), the cursor passes
+    /// it to the page's last finished score, and the next run resumes it
+    /// ahead of the pages until it converges. On 0.1.7 the cut was a retry
+    /// for three runs, the cursor stayed at 20 and `cursor_held_by` named it.
+    #[tokio::test]
+    async fn cursor_018_the_graph_in_flight_at_the_peer_deadline_is_held_and_passed() {
+        let (mut engine, remote) = budget_page_engine(6);
+        let slow = remote.outputs[2].txid.clone();
+        let root = format!("{slow}.0");
+        *remote.slow_once.borrow_mut() = Some((slow.clone(), 60_000));
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_graph_budget(
+            std::rc::Rc::new(|_| Box::pin(std::future::pending())),
+            100,
+            60_000,
+        );
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.finalized_graphs, 2);
+        assert_eq!(topic.deadline_dropped_graphs, 1);
+        assert_eq!(topic.deferred_graphs, 1);
+        assert_eq!(topic.cursor_moves.len(), 1);
+        assert_eq!(topic.cursor_moves[0].to, 30, "past the held graph");
+        assert!(topic.cursor_held_by.is_empty(), "{topic:?}");
+        let held = engine
+            .storage()
+            .get_deferred_graph("https://budget.example", "tm_test", &root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(held.cursor_passable);
+        assert_eq!(held.reason, "peer_deadline");
+        assert!(held.nodes.is_empty());
+        assert_eq!(held.score, 30);
+
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.resumed_graphs, 1);
+        assert_eq!(topic.converged_graphs, 1);
+        assert_eq!(topic.finalized_graphs, 4, "the held graph and 40, 50, 60");
+        assert_eq!(topic.cursor_moves[0].to, 60);
+        assert!(engine
+            .storage()
+            .get_deferred_graph("https://budget.example", "tm_test", &root)
+            .await
+            .unwrap()
+            .is_none());
+        for output in remote.outputs.iter() {
+            assert!(engine
+                .storage
+                .find_output(&output.txid, 0, Some("tm_test"), None, true)
+                .await
+                .unwrap()
+                .is_some());
+        }
     }
 
     #[tokio::test]
