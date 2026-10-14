@@ -8357,9 +8357,9 @@ async fn e555f_h1_a_hung_peer_keeps_a_retry_obligation_and_is_quarantined() {
 }
 
 // H1, the deadline arm. The per-PEER deadline cuts a walk that has fetched
-// nothing (the root request is the one that overspends): a retry record is
-// kept, and the tick is a failed attempt. Retaining the obligation must not
-// count as productive peer progress.
+// nothing (the root request is the one that overspends). Since 0.1.8 the
+// graph in flight is held at once (`peer_deadline`, passable) and the cursor
+// passes it; the next slice resumes it ahead of the listing.
 #[tokio::test]
 async fn e555f_h1_the_peer_deadline_over_a_walk_that_fetched_nothing_is_a_failure() {
     let (_logs, _guard) = capture_logs();
@@ -8378,7 +8378,9 @@ async fn e555f_h1_the_peer_deadline_over_a_walk_that_fetched_nothing_is_a_failur
     assert_eq!(node.failures().await, 1);
     let records = node.store.deferred_graphs();
     assert_eq!(records.len(), 1);
-    assert!(!records[0].cursor_passable && records[0].nodes.is_empty());
+    assert!(records[0].cursor_passable && records[0].nodes.is_empty());
+    assert_eq!(records[0].reason, "peer_deadline");
+    assert_eq!(node.cursor().await, 1, "the held root is passed");
     // Resume precedes pagination, so the next slice can retain the root.
     let (topic, sent) = node.tick().await;
     assert_eq!(sent, txids(&nodes, &[3, 2]));
