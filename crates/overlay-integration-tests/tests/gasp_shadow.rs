@@ -583,6 +583,50 @@ async fn w2c_the_census_names_a_stop_delta_and_a_rows_delta_apart() {
     }
 }
 
+/// The owner's D44 in the census: on the fan-in with the erring parent first
+/// (the served finalize lands nothing after the error; A lands the sibling),
+/// the graph row stays `rows_differ` against today's path and carries the
+/// gate's reason per body it held, in graph order: the erring parent
+/// `parent_error`, the root `{"waiting_on": [the erring parent]}`. The erring
+/// parent's own body row carries its own.
+#[tokio::test]
+async fn w8_d44_the_census_row_carries_the_gates_reason_per_body() {
+    let scenario = erring_fan_in(0);
+    let [a, _, r] = [0, 1, 2].map(|i| scenario.txs[i].id());
+    for _ in 0..64 {
+        let shadow = beside_unordered(&scenario).await;
+        let graph = &shadow.of(ShadowKind::Materialization)[0];
+        if json(&graph.served.bytes)["landed"] != serde_json::json!([]) {
+            continue; // the sibling came first: not the witness's order
+        }
+        print_census("W8 D44", &shadow);
+        let row = serde_json::to_value(graph).unwrap();
+        println!("W8 D44 graph row gate: {}", row["gate"]);
+        assert_eq!(row["delta"], serde_json::json!("rows_differ"), "{row}");
+        assert_eq!(
+            row["gate"],
+            serde_json::json!([
+                {"txid": a, "reason": "parent_error"},
+                {"txid": r, "reason": {"waiting_on": [a]}},
+            ]),
+            "the graph row names the gate's reason per body it held"
+        );
+        let body = shadow
+            .of(ShadowKind::Body)
+            .into_iter()
+            .find(|row| row.txid == a)
+            .expect("the erring parent's body row");
+        let body = serde_json::to_value(body).unwrap();
+        assert_eq!(
+            body["gate"],
+            serde_json::json!([{"txid": a, "reason": "parent_error"}]),
+            "{body}"
+        );
+        return;
+    }
+    panic!("no run took the erring parent first in 64 tries");
+}
+
 // ============================================================================
 // Witness 3: the four GASP chaos records of the HTTP corpus
 // (`parity-harness/corpus/xanaverse/chaos/0{1..4}_*.json`, Zanaadu), each a
