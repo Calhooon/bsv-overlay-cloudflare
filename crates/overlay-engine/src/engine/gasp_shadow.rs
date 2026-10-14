@@ -268,6 +268,13 @@ fn evidence_differs(served: &AdmitEvidence, shadow: &AdmitEvidence) -> bool {
     })
 }
 
+/// The `rows` of a materialization word.
+fn materialized_rows_of(word: &Word) -> Option<serde_json::Value> {
+    serde_json::from_slice::<serde_json::Value>(&word.bytes)
+        .ok()
+        .and_then(|mut value| value.get_mut("rows").map(serde_json::Value::take))
+}
+
 fn classify(row: &GaspCensusRow) -> DeltaClass {
     if row.shadow.status == 0 {
         return DeltaClass::NotShadowed;
@@ -275,8 +282,10 @@ fn classify(row: &GaspCensusRow) -> DeltaClass {
     if row.kind == ShadowKind::Materialization {
         return if row.served == row.shadow {
             DeltaClass::Same
-        } else {
+        } else if materialized_rows_of(&row.served) == materialized_rows_of(&row.shadow) {
             DeltaClass::Materialization
+        } else {
+            DeltaClass::RowsDiffer
         };
     }
     if row.shadow.status == 422

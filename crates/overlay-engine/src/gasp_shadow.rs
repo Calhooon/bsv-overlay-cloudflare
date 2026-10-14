@@ -131,9 +131,14 @@ pub enum ShadowKind {
     Materialization,
 }
 
-/// The slice's delta classes, plus the materialization's own. `UnitRefusal`
+/// The slice's delta classes, plus the materialization's two. `UnitRefusal`
 /// is the owner's `unit-wide` first delta (D34): A refused the unit where the
-/// served path landed a topic, the intended change, counted.
+/// served path landed a topic, the intended change, counted. A graph row whose
+/// words differ is `Materialization` when the rows the graph reaches agree (a
+/// stop point or a status apart: D1, the erring chain) and `RowsDiffer` when
+/// they do not (D2: on a fan-in A lands the sibling and the root over a parent
+/// whose manager erred, where the served finalize lands neither). The census
+/// names D2; whether A should stop there is the owner's ruling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeltaClass {
@@ -143,6 +148,7 @@ pub enum DeltaClass {
     Evidence,
     Words,
     Materialization,
+    RowsDiffer,
 }
 
 /// An answer as a status and its bytes (the slice's `Word`). Status 0 is no
