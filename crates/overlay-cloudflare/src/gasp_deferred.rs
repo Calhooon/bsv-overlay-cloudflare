@@ -2004,6 +2004,7 @@ mod tests {
             backed_off_graphs: 0,
             waiting_graphs: 0,
             idle_counted: 0,
+            peer_results: std::collections::HashMap::new(),
             dead_graphs: 0,
             expired_swept: 0,
             unanchorable_graphs: 0,

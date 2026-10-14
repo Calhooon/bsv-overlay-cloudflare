@@ -1487,6 +1487,13 @@ pub trait FinalizedGraphHook {
 // GASP orchestrator
 // ============================================================================
 
+#[derive(Default)]
+struct PageProgress {
+    pages: u64,
+    advanced: bool,
+    reached_tip: bool,
+}
+
 /// GASP sync orchestrator.
 ///
 /// Coordinates between local `GASPStorage` and a `GASPRemote` peer to
@@ -1619,6 +1626,8 @@ pub struct GASPSync<'a> {
     dead_recorded: std::cell::Cell<u64>,
     expired_swept: std::cell::Cell<u64>,
     root_expiries: std::cell::RefCell<std::collections::HashMap<String, u64>>,
+    page: PageProgress,
+    request_stop: Option<std::rc::Rc<dyn Fn() -> bool + 'a>>,
 }
 
 impl<'a> GASPSync<'a> {
@@ -1684,6 +1693,8 @@ impl<'a> GASPSync<'a> {
             dead_recorded: std::cell::Cell::new(0),
             expired_swept: std::cell::Cell::new(0),
             root_expiries: std::cell::RefCell::default(),
+            page: PageProgress::default(),
+            request_stop: None,
         }
     }
 
@@ -1695,6 +1706,24 @@ impl<'a> GASPSync<'a> {
     ) -> Self {
         self.expired = expired;
         self
+    }
+
+    /// Backfill slices stop after one page or at a caller-owned request bound.
+    pub fn with_page_slice(mut self, stop: std::rc::Rc<dyn Fn() -> bool + 'a>) -> Self {
+        self.request_stop = Some(stop);
+        self
+    }
+    fn request_stopped(&self) -> bool {
+        self.request_stop.as_ref().is_some_and(|stop| stop())
+    }
+    pub fn pages(&self) -> u64 {
+        self.page.pages
+    }
+    pub fn page_advanced(&self) -> bool {
+        self.page.advanced
+    }
+    pub fn reached_tip(&self) -> bool {
+        self.page.reached_tip
     }
 
     pub fn expired_refused(&self) -> u64 {
@@ -2221,6 +2250,7 @@ impl<'a> GASPSync<'a> {
             "{} Walking root {} again after {} faulted runs ({}) (engine 0.1.9)",
             self.log_prefix, outpoint, record.faults, record.reason
         );
+        crate::meter::walk_output();
         let mut walk = Self::fresh_walk(score, outpoint, cap);
         walk.struck = Some(Box::new(record.clone()));
         *self.walk.borrow_mut() = Some(walk);
@@ -2424,6 +2454,9 @@ impl<'a> GASPSync<'a> {
             "{} Starting sync. last_interaction={}",
             self.log_prefix, self.last_interaction
         );
+        self.page.pages = 0;
+        self.page.advanced = false;
+        self.page.reached_tip = false;
         self.pruned.borrow_mut().clear();
         self.pruned_inputs.set(0);
         self.expired_refused.set(0);
@@ -2544,6 +2577,9 @@ impl<'a> GASPSync<'a> {
             .map(|key| (key.outpoint.clone(), key.score))
             .collect();
         for key in held_keys {
+            if self.request_stopped() {
+                break;
+            }
             // This key is reached now (engine 0.1.11: the fault bound of a
             // strike in the held loop counts the keys after it).
             self.keys_unread
@@ -2638,7 +2674,10 @@ impl<'a> GASPSync<'a> {
         }
 
         // Paginated pull from remote
-        loop {
+        'pages: loop {
+            if self.request_stopped() {
+                break;
+            }
             let cursor_before_page = self.last_interaction;
             // Every UTXO seen so far is completed or failed: were the sync
             // dropped inside the page request below, this is what it did.
@@ -2654,6 +2693,7 @@ impl<'a> GASPSync<'a> {
             };
             let response = self.remote.get_initial_response(&request).await?;
             let page_size = response.utxo_list.len();
+            self.page.pages += 1;
 
             info!(
                 "{} Processing page with {} UTXOs (since: {})",
@@ -2689,6 +2729,11 @@ impl<'a> GASPSync<'a> {
                 Self::cursor_for_completed(&completed_scores, unfinished, initial_interaction);
 
             for (position, utxo) in response.utxo_list.iter().enumerate() {
+                if self.request_stopped() {
+                    let score = lowest_ahead[position];
+                    min_failed_score = Some(min_failed_score.map_or(score, |s| s.min(score)));
+                    break 'pages;
+                }
                 // Track highest score for pagination
                 if utxo.score as u64 > self.last_interaction {
                     self.last_interaction = utxo.score as u64;
@@ -2865,6 +2910,36 @@ impl<'a> GASPSync<'a> {
             // the responder-side note at
             // `D1Storage::find_utxos_for_topic`.
             if self.last_interaction == cursor_before_page {
+                let settled = min_failed_score.is_none()
+                    && response.utxo_list.iter().all(|u| {
+                        shared_outpoints.contains(&format!("{}.{}", u.txid, u.output_index))
+                    });
+                if self.request_stop.is_some() && settled && !response.utxo_list.is_empty() {
+                    // Inclusive peers repeat the boundary. Confirm an empty page above
+                    // it before claiming tip, without ever storing the probe cursor.
+                    // A clamped boundary can conceal later rows: retain our cursor
+                    // and report no progress when the probe finds any.
+                    if !self.request_stopped() {
+                        if let Some(since) = self.last_interaction.checked_add(1) {
+                            let probe = self
+                                .remote
+                                .get_initial_response(&GASPInitialRequest {
+                                    version: GASP_VERSION,
+                                    since,
+                                    limit,
+                                })
+                                .await?;
+                            self.page.pages += 1;
+                            self.page.reached_tip = probe.utxo_list.is_empty();
+                        }
+                    }
+                } else {
+                    self.page.reached_tip = settled;
+                }
+                break;
+            }
+            self.page.advanced = true;
+            if self.request_stop.is_some() {
                 break;
             }
         }
@@ -2937,6 +3012,7 @@ impl<'a> GASPSync<'a> {
         let Some(budget) = &self.graph_budget else {
             *self.walk.borrow_mut() =
                 Some(Self::fresh_walk(utxo.score as u64, outpoint, PassCap::NONE));
+            crate::meter::walk_output();
             let walked = self.walk_graph(None).await;
             if matches!(walked, Ok(WalkEnd::Expired)) {
                 return self.refuse_expired(outpoint).await;
@@ -3263,6 +3339,7 @@ impl<'a> GASPSync<'a> {
             .nodes
             .first()
             .is_some_and(|w| w.node.proof.is_none());
+        crate::meter::walk_output();
         *self.walk.borrow_mut() = Some(walk);
 
         let ended = async {

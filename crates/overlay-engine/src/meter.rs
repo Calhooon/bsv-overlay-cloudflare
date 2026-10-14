@@ -18,44 +18,81 @@ pub struct SyncCost {
     pub courier_rungs: u64,
     pub storage_reads: u64,
     pub storage_writes: u64,
+    pub d1_queries: u64,
     pub courier_not_found_memo_hits: u64,
     pub ms: u64,
+    pub outputs_walked: u64,
+    pub ms_per_1000_outputs: Option<u64>,
 }
 
 impl SyncCost {
     pub fn since(self, before: Self) -> Self {
-        Self {
+        let mut cost = Self {
             calls_out: self.calls_out.saturating_sub(before.calls_out),
             peer_requests: self.peer_requests.saturating_sub(before.peer_requests),
             courier_rungs: self.courier_rungs.saturating_sub(before.courier_rungs),
             storage_reads: self.storage_reads.saturating_sub(before.storage_reads),
             storage_writes: self.storage_writes.saturating_sub(before.storage_writes),
+            d1_queries: self.d1_queries.saturating_sub(before.d1_queries),
             courier_not_found_memo_hits: self
                 .courier_not_found_memo_hits
                 .saturating_sub(before.courier_not_found_memo_hits),
             ms: self.ms.saturating_sub(before.ms),
-        }
+            outputs_walked: self.outputs_walked.saturating_sub(before.outputs_walked),
+            ms_per_1000_outputs: None,
+        };
+        cost.refresh_speed();
+        cost
+    }
+
+    pub fn refresh_speed(&mut self) {
+        self.ms_per_1000_outputs = (self.outputs_walked != 0).then(|| {
+            ((u128::from(self.ms) * 1000) / u128::from(self.outputs_walked))
+                .min(u128::from(u64::MAX)) as u64
+        });
+    }
+
+    pub fn add(&mut self, other: Self) {
+        self.calls_out = self.calls_out.saturating_add(other.calls_out);
+        self.peer_requests = self.peer_requests.saturating_add(other.peer_requests);
+        self.courier_rungs = self.courier_rungs.saturating_add(other.courier_rungs);
+        self.storage_reads = self.storage_reads.saturating_add(other.storage_reads);
+        self.storage_writes = self.storage_writes.saturating_add(other.storage_writes);
+        self.d1_queries = self.d1_queries.saturating_add(other.d1_queries);
+        self.courier_not_found_memo_hits = self
+            .courier_not_found_memo_hits
+            .saturating_add(other.courier_not_found_memo_hits);
+        self.ms = self.ms.saturating_add(other.ms);
+        self.outputs_walked = self.outputs_walked.saturating_add(other.outputs_walked);
+        self.refresh_speed();
     }
 }
 
 struct Data {
     cost: Cell<SyncCost>,
     started: f64,
+    clock: Rc<dyn Fn() -> f64>,
 }
 #[derive(Clone)]
 pub struct LoadMeter(Rc<Data>);
 impl Default for LoadMeter {
     fn default() -> Self {
-        Self(Rc::new(Data {
-            cost: Cell::default(),
-            started: crate::engine::current_timestamp_ms(),
-        }))
+        Self::with_clock(Rc::new(crate::engine::current_timestamp_ms))
     }
 }
 impl LoadMeter {
+    /// Inject a monotonic millisecond clock for deterministic host tests.
+    pub fn with_clock(clock: Rc<dyn Fn() -> f64>) -> Self {
+        Self(Rc::new(Data {
+            cost: Cell::default(),
+            started: clock(),
+            clock,
+        }))
+    }
     pub fn snapshot(&self) -> SyncCost {
         let mut cost = self.0.cost.get();
-        cost.ms = (crate::engine::current_timestamp_ms() - self.0.started).max(0.0) as u64;
+        cost.ms = ((self.0.clock)() - self.0.started).max(0.0) as u64;
+        cost.refresh_speed();
         cost
     }
     pub fn scope<F: Future>(&self, future: F) -> Measured<F> {
@@ -102,6 +139,9 @@ fn note(f: impl FnOnce(&mut SyncCost)) {
         }
     });
 }
+pub fn walk_output() {
+    note(|v| v.outputs_walked += 1);
+}
 pub fn peer_request() {
     note(|v| {
         v.calls_out += 1;
@@ -113,6 +153,10 @@ pub fn storage_read() {
 }
 pub fn storage_write() {
     note(|v| v.storage_writes += 1);
+}
+/// Count attempted SQL statements at the worker adapter, including batch members.
+pub fn d1_queries(count: u64) {
+    note(|v| v.d1_queries = v.d1_queries.saturating_add(count));
 }
 pub fn not_found_memo_hit() {
     note(|v| v.courier_not_found_memo_hits += 1);

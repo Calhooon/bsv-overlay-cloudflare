@@ -4963,12 +4963,129 @@ impl Engine {
         filter: &crate::sync_load::SyncFilter,
         meter: &crate::meter::LoadMeter,
     ) -> Result<GASPSyncResult, EngineError> {
-        meter.scope(self.run_gasp_sync(filter)).await
+        let run = self.gasp_run();
+        meter.scope(self.run_gasp_sync(filter, &run, None)).await
+    }
+
+    fn gasp_run(&self) -> crate::backfill::Run {
+        crate::backfill::Run::new(
+            self.gasp_ancestor_fetcher
+                .as_ref()
+                .or(self.ancestor_fetcher.as_ref())
+                .cloned(),
+        )
+    }
+
+    /// Walk one selected pair, checkpointing on wall, request or progress bounds.
+    /// The continuation never supplies a cursor to storage or to the remote.
+    pub async fn start_gasp_backfill_metered(
+        &self,
+        request: &crate::backfill::SyncRequest,
+        meter: &crate::meter::LoadMeter,
+    ) -> Result<crate::backfill::BackfillResult, EngineError> {
+        use crate::backfill::{
+            BackfillResult, Continuation, Control, BACKFILL_MAX_SLICES, BACKFILL_REQUEST_MS,
+        };
+        request.validate().map_err(EngineError::InvalidQuery)?;
+        let (topic, peer) = request.pair().map_err(EngineError::InvalidQuery)?;
+        if request.until.is_none() || self.peer_sync_budget.is_none() || self.graph_budget.is_none()
+        {
+            return Err(EngineError::InvalidQuery(
+                "backfill requires until: tip and peer/graph bounds".into(),
+            ));
+        }
+        if self.gasp_remote_factory.is_none()
+            || !matches!(
+                self.config.sync_configuration.get(topic),
+                Some(SyncTarget::Ship | SyncTarget::Peers(_))
+            )
+        {
+            return Err(EngineError::InvalidQuery(
+                "backfill topic is not enabled for sync".into(),
+            ));
+        }
+        meter
+            .scope(async {
+                let initial = self.storage.get_last_interaction(peer, topic).await?;
+                if let Some(token) = &request.continuation {
+                    let token = Continuation::decode(token).map_err(EngineError::InvalidQuery)?;
+                    if token.cursor > initial {
+                        return Err(EngineError::InvalidQuery(
+                            "continuation is ahead of the durable cursor".into(),
+                        ));
+                    }
+                }
+                let filter = request.filter();
+                let run = self.gasp_run();
+                let control = Control {
+                    meter: meter.clone(),
+                    budget_ms: request.budget_ms.unwrap_or(0).min(BACKFILL_REQUEST_MS),
+                };
+                let mut result = BackfillResult {
+                    sync: GASPSyncResult {
+                        filter: filter.clone(),
+                        ..GASPSyncResult::default()
+                    },
+                    slices: 0,
+                    reached_tip: false,
+                    stop_reason: "slice_allowance".into(),
+                    continuation: None,
+                };
+                let mut previous_cursor = initial;
+                for _ in 0..BACKFILL_MAX_SLICES {
+                    if let Some(reason) = control.stop_reason() {
+                        result.stop_reason = reason.into();
+                        break;
+                    }
+                    let slice = self.run_gasp_sync(&filter, &run, Some(&control)).await?;
+                    let topic_result = slice.topics_synced.get(topic).ok_or_else(|| {
+                        EngineError::InvalidQuery("backfill selection matched no topic".into())
+                    })?;
+                    if !topic_result.peers.iter().any(|p| p == peer) {
+                        return Err(EngineError::InvalidQuery(
+                            "backfill selection matched no peer".into(),
+                        ));
+                    }
+                    let summary = topic_result.peer_results.get(peer).cloned();
+                    let waiting = !topic_result.peers_skipped.is_empty();
+                    result.sync.append_slice(slice);
+                    if let Some(summary) = summary {
+                        result.slices += summary.slices;
+                        if summary.reached_tip {
+                            result.reached_tip = true;
+                            result.stop_reason = "tip".into();
+                            break;
+                        }
+                        if let Some(reason) = control.stop_reason() {
+                            result.stop_reason = reason.into();
+                            break;
+                        }
+                        if summary.cursor <= previous_cursor {
+                            result.stop_reason = "no_progress".into();
+                            break;
+                        }
+                        previous_cursor = summary.cursor;
+                    } else {
+                        result.stop_reason =
+                            if waiting { "peer_wait" } else { "no_progress" }.into();
+                        break;
+                    }
+                }
+                let cursor = self.storage.get_last_interaction(peer, topic).await?;
+                if !result.reached_tip {
+                    result.continuation = Some(Continuation::new(topic, peer, cursor).encode());
+                }
+                result.sync.cost = meter.snapshot();
+                Ok(result)
+            })
+            .await
     }
 
     async fn run_gasp_sync(
         &self,
         filter: &crate::sync_load::SyncFilter,
+        run: &crate::backfill::Run,
+        control: Option<&crate::backfill::Control>,
     ) -> Result<GASPSyncResult, EngineError> {
         use crate::gasp::{GASPSync, ENGINE_GASP_SYNC_PAGE_LIMIT};
         use crate::gasp_overlay::OverlayGASPStorage;
@@ -4983,11 +5100,7 @@ impl Engine {
             });
         }
 
-        let sync_fetcher: Option<std::rc::Rc<dyn crate::gasp::AncestorFetcher>> = self
-            .gasp_ancestor_fetcher
-            .as_ref()
-            .or(self.ancestor_fetcher.as_ref())
-            .map(|f| std::rc::Rc::new(crate::sync_fetcher::SyncFetcher::new(f.clone())) as _);
+        let sync_fetcher = &run.fetcher;
         let mut topics_synced: HashMap<String, TopicSyncResult> = HashMap::new();
         // Resolve SLAP providers once per invocation, sharing their host cap
         // across all SHIP topics. Every topic still queries each lookup host.
@@ -5076,7 +5189,8 @@ impl Engine {
             let mut roots_proven = 0;
             let mut roots_unproven = 0;
             let mut cursor_held_by = Vec::new();
-            let expired = std::rc::Rc::default();
+            let expired = run.expired(topic);
+            let mut peer_results = HashMap::new();
             let mut anchor_walk_held_graphs: u64 = 0;
             let mut finalized_graphs: u64 = 0;
             let mut deadline_dropped_graphs: u64 = 0;
@@ -5152,6 +5266,7 @@ impl Engine {
                         continue;
                     }
 
+                    let peer_cost_before = crate::meter::snapshot();
                     info!("[GASP SYNC] Syncing topic {topic} with peer {peer_url}");
 
                     // Get last interaction score for this (peer, topic) pair
@@ -5208,6 +5323,12 @@ impl Engine {
                     )
                     .with_ancestor_fetcher(sync_fetcher.clone())
                     .with_expired_outpoints(std::rc::Rc::clone(&expired));
+                    if let Some(control) = control {
+                        let control = control.clone();
+                        sync = sync.with_page_slice(std::rc::Rc::new(move || {
+                            control.stop_reason().is_some()
+                        }));
+                    }
                     // bsv-low #555: a graph past its own budget is deferred,
                     // not dropped with the sync.
                     if let Some((sleep, max_calls, budget_ms)) = &self.graph_budget {
@@ -5254,9 +5375,21 @@ impl Engine {
                     // transaction and the hook stops at the boundary.
                     let sync_outcome = match &self.peer_sync_budget {
                         Some((sleep, budget_ms)) => {
+                            let budget_ms =
+                                control.map_or(*budget_ms, |c| (*budget_ms).min(c.remaining_ms()));
+                            let mut deadline = sleep(budget_ms);
+                            let deadline = std::future::poll_fn(|cx| {
+                                if control.is_some_and(|c| c.stop_reason().is_some())
+                                    || std::future::Future::poll(deadline.as_mut(), cx).is_ready()
+                                {
+                                    std::task::Poll::Ready(())
+                                } else {
+                                    std::task::Poll::Pending
+                                }
+                            });
                             crate::gasp::race_or_deadline_guarded(
                                 sync.sync(Some(ENGINE_GASP_SYNC_PAGE_LIMIT)),
-                                sleep(*budget_ms),
+                                deadline,
                                 &self.finalize_gate,
                             )
                             .await
@@ -5605,6 +5738,18 @@ impl Engine {
                             "[GASP SYNC] failed to record peer sync outcome for {peer_url}/{topic}: {e}"
                         );
                     }
+                    let cursor = self.storage.get_last_interaction(peer_url, topic).await?;
+                    let cost = crate::meter::snapshot().since(peer_cost_before);
+                    peer_results.insert(
+                        peer_url.clone(),
+                        crate::backfill::PeerSyncResult {
+                            slices: u64::from(sync.page_advanced() || cost.outputs_walked > 0),
+                            pages: sync.pages(),
+                            reached_tip: sync.reached_tip() && cursor >= sync.completed_cursor(),
+                            cursor,
+                            cost,
+                        },
+                    );
                 }
             }
 
@@ -5637,6 +5782,7 @@ impl Engine {
                     backed_off_graphs,
                     waiting_graphs,
                     idle_counted,
+                    peer_results,
                     dead_graphs,
                     expired_swept,
                     unanchorable_graphs,
@@ -6217,7 +6363,7 @@ impl crate::gasp::FinalizedGraphHook for SubmitAsFinalized<'_> {
 /// Result of a GASP sync operation.
 ///
 /// Returned by `Engine::start_gasp_sync()` to summarize what happened.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GASPSyncResult {
     #[serde(default, flatten)]
     pub cost: crate::meter::SyncCost,
@@ -6230,8 +6376,10 @@ pub struct GASPSyncResult {
 }
 
 /// Sync result for a single topic.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TopicSyncResult {
+    #[serde(default)]
+    pub peer_results: HashMap<String, crate::backfill::PeerSyncResult>,
     #[serde(default)]
     pub dead_graphs: u64,
     #[serde(default)]
@@ -8968,6 +9116,7 @@ mod tests {
                 backed_off_graphs: 0,
                 waiting_graphs: 0,
                 idle_counted: 0,
+                peer_results: HashMap::new(),
                 dead_graphs: 0,
                 expired_swept: 0,
                 unanchorable_graphs: 0,

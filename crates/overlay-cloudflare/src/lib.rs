@@ -27,6 +27,7 @@ pub mod error;
 mod gasp_cost;
 pub mod gasp_deferred;
 pub mod gasp_remote;
+mod gasp_speed;
 pub mod health_checker;
 pub mod hop_changes;
 pub mod hop_probe_memos;
