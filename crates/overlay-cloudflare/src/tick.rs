@@ -350,7 +350,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 r.topics_synced.values().map(f).sum()
             };
             worker::console_log!(
-                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={} anchor_walk_held_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped_graphs={} stalled_graphs={} held_back_graphs={} unanchorable_graphs={} unanchorable_cleared={} strikes_refused={} backed_off_graphs={} waiting_graphs={}",
+                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={} anchor_walk_held_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped_graphs={} stalled_graphs={} held_back_graphs={} unanchorable_graphs={} unanchorable_cleared={} strikes_refused={} backed_off_graphs={} waiting_graphs={} idle_counted={}",
                 r.topics_synced.len(),
                 total_peers,
                 total_errors,
@@ -369,7 +369,10 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 // and the held records the idle backoff sent away or kept.
                 sum(|t| t.strikes_refused),
                 sum(|t| t.backed_off_graphs),
-                sum(|t| t.waiting_graphs)
+                sum(|t| t.waiting_graphs),
+                // Engine 0.1.11: the held records whose resume counted an
+                // idle pass, so a captain reads the idle rule firing.
+                sum(|t| t.idle_counted)
             );
             crate::gasp_deferred::record_counters(&ops_db, &r.topics_synced).await;
             // bsv-low #552: what the tick got done under the per-peer
@@ -940,6 +943,15 @@ mod tests {
             "unanchorable_cleared={} strikes_refused={} backed_off_graphs={} waiting_graphs={}"
         ));
         assert!(src.contains("sum(|t| t.strikes_refused)"));
+    }
+
+    /// Engine 0.1.11: the summary line counts the held records whose resume
+    /// counted an idle pass (`idle_counted`), after the idle backoff's two.
+    #[test]
+    fn obligations_0111_the_tick_counts_idle_resumes() {
+        let src = include_str!("tick.rs");
+        assert!(src.contains("backed_off_graphs={} waiting_graphs={} idle_counted={}\","));
+        assert!(src.contains("sum(|t| t.idle_counted)"));
     }
 
     #[test]
