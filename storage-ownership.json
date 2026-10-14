@@ -855,6 +855,17 @@
    "why": "a GASP cursor; the next sync walks again"
   },
   {
+   "name": "gasp_sync_cost",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "Recent sync costs and the latest tick cost",
+   "why": "rolling telemetry"
+  },
+  {
    "name": "gasp_peer_health",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

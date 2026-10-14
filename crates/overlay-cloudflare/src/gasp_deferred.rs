@@ -1898,6 +1898,8 @@ mod tests {
     #[test]
     fn e555_the_counters_sum_a_sync_and_count_drops_by_reason() {
         let topic = |deferred, resumed, converged, reasons: &[&str]| TopicSyncResult {
+            cost: overlay_engine::meter::SyncCost::default(),
+            root_bounds: Vec::new(),
             peers_skipped: Vec::new(),
             peers_filtered: Vec::new(),
             roots_proven: 0,

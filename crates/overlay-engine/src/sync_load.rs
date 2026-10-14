@@ -53,3 +53,10 @@ pub struct SkippedPeer {
     pub reason: String,
     pub retry_after_secs: u64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootBound {
+    pub peer: String,
+    pub outpoint: String,
+    pub reason: String,
+}

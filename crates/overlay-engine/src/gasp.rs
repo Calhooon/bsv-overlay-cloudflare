@@ -592,6 +592,8 @@ pub mod fault_class {
     /// The courier (the chain ancestor fetcher, its rungs) faulted or could
     /// not serve an ancestor.
     pub const COURIER: &str = "courier";
+    /// All raw couriers answered definite absence in this run.
+    pub const NOT_FOUND: &str = "not_found";
     /// The peer answered it does not hold the root or an input an unproven
     /// node needs (`NodeNotFound`).
     pub const NOT_SERVED: &str = "not_served";
@@ -611,7 +613,7 @@ pub mod fault_class {
     /// three of the 0.1.9 brief (the courier, an input nobody served, a
     /// verification refusal), never a peer's fault of the moment.
     pub fn strikes(class: &str) -> bool {
-        matches!(class, COURIER | NOT_SERVED | VERIFICATION)
+        matches!(class, COURIER | NOT_SERVED | VERIFICATION | NOT_FOUND)
     }
 }
 
@@ -955,6 +957,8 @@ pub struct DroppedGraph {
 /// What a sync did with deferred graphs (bsv-low #555).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeferralStats {
+    /// Per-pass work limits that stopped a root.
+    pub root_bounds: Vec<crate::sync_load::RootBound>,
     /// Graphs deferred (a new record, or a resumed one deferred again).
     pub deferred: u64,
     /// Graphs resumed from a record.
@@ -1271,6 +1275,9 @@ pub trait GASPRemoteFactory {
 /// in this engine crate (no `reqwest`/`std::time` — must stay wasm-clean).
 #[async_trait(?Send)]
 pub trait AncestorFetcher {
+    /// Reset invocation-local retry caches before a new sync.
+    fn begin_sync(&self) {}
+
     /// Fetch an ancestor transaction by txid from chain.
     ///
     /// Returns the raw tx hex plus, when the ancestor is mined, its BUMP merkle
@@ -1913,7 +1920,11 @@ impl<'a> GASPSync<'a> {
     ) -> bool {
         let class = self.last_fault.take();
         let struck = match class {
-            Some(class) if lowest && self.graph_budget.is_some() && fault_class::strikes(class) => {
+            Some(class)
+                if (lowest || class == fault_class::NOT_FOUND)
+                    && self.graph_budget.is_some()
+                    && fault_class::strikes(class) =>
+            {
                 self.strike(score, outpoint, class, None).await
             }
             _ => Strike::default(),
@@ -2002,7 +2013,8 @@ impl<'a> GASPSync<'a> {
         }
         let mut record = Self::fresh_walk(score, outpoint, PassCap::NONE).record;
         record.faults = prior.map_or(0, |r| r.faults) + 1;
-        let unanchorable = record.faults >= UNANCHORABLE_AFTER_FAULTED_RUNS;
+        let unanchorable =
+            class == fault_class::NOT_FOUND || record.faults >= UNANCHORABLE_AFTER_FAULTED_RUNS;
         // A record the cursor had passed stays passable (engine 0.1.11): the
         // strike counts its faulted runs and never takes the pass back.
         record.cursor_passable = unanchorable || prior.is_some_and(|r| r.cursor_passable);
@@ -2754,6 +2766,18 @@ impl<'a> GASPSync<'a> {
     /// Empty deadline retries hold the cursor until the stall threshold.
     /// All resumed graphs share one allowance; fresh graphs retain theirs.
     async fn ingest_utxo(&self, utxo: &GASPOutput, outpoint: &str) -> Result<Ingested, GASPError> {
+        if self.graph_budget.is_some() {
+            crate::meter::root_scope(self.ingest_utxo_inner(utxo, outpoint)).await
+        } else {
+            self.ingest_utxo_inner(utxo, outpoint).await
+        }
+    }
+
+    async fn ingest_utxo_inner(
+        &self,
+        utxo: &GASPOutput,
+        outpoint: &str,
+    ) -> Result<Ingested, GASPError> {
         self.last_fault.set(None);
         self.resume_idle.set(None);
         self.pass_saved.set(false);
@@ -3198,7 +3222,7 @@ impl<'a> GASPSync<'a> {
                     }
                 },
                 Ok(WalkEnd::Deferred(reason)) => (reason, false),
-                Err(e @ GASPError::NodeNotFound(_)) => {
+                Err(e @ (GASPError::NodeNotFound(_) | GASPError::DefinitiveNotFound(_))) => {
                     let _ = self.storage.discard_graph(&graph_id).await;
                     let walk = self.walk.borrow_mut().take();
                     if resumed {
@@ -3281,7 +3305,10 @@ impl<'a> GASPSync<'a> {
                 }
             };
             // Only a walk the per-graph budget cut may go on (L4).
-            let budget_cut = matches!(reason, "calls" | "time" | "bytes" | "nodes");
+            let budget_cut = matches!(
+                reason,
+                "calls" | "time" | "bytes" | "nodes" | "courier_rungs"
+            );
             let (why, mut walk) = match self.save_walk(reason, completed).await {
                 Saved::Retry => {
                     let _ = self.storage.discard_graph(&graph_id).await;
@@ -3779,6 +3806,20 @@ impl<'a> GASPSync<'a> {
         Ok(())
     }
 
+    fn root_bound(&self, reason: &'static str) -> WalkEnd {
+        if let Some(walk) = self.walk.borrow().as_ref() {
+            self.stats
+                .borrow_mut()
+                .root_bounds
+                .push(crate::sync_load::RootBound {
+                    peer: String::new(),
+                    outpoint: walk.record.outpoint.clone(),
+                    reason: reason.into(),
+                });
+        }
+        WalkEnd::Deferred(reason)
+    }
+
     /// Walk the graph in hand until nothing is pending (an explicit stack,
     /// bsv-low #555; before it a recursion, in the same order: an input's
     /// whole branch before its next sibling). Each step's result is
@@ -3827,10 +3868,14 @@ impl<'a> GASPSync<'a> {
             let out = match deadline.as_mut() {
                 Some(deadline) => match race_or_deadline(step, deadline.as_mut()).await {
                     Some(out) => out,
-                    None => return Ok(WalkEnd::Deferred("time")),
+                    None => return Ok(self.root_bound("time")),
                 },
                 None => step.await,
-            }?;
+            };
+            if crate::meter::root_exhausted() || matches!(out, Err(GASPError::CourierBudget)) {
+                return Ok(self.root_bound("courier_rungs"));
+            }
+            let out = out?;
             if matches!(out, StepOut::Expired) {
                 return Ok(WalkEnd::Expired);
             }
@@ -4071,10 +4116,14 @@ impl<'a> GASPSync<'a> {
                 // Every fetcher error fails the UTXO (the `?`):
                 // the fetcher arm never prunes, see the rule above.
                 Some(fetcher) => {
-                    let ancestor = fetcher
-                        .fetch_ancestor(&txid)
-                        .await
-                        .map_err(|e| self.faulted(fault_class::COURIER, e))?;
+                    let ancestor = fetcher.fetch_ancestor(&txid).await.map_err(|e| {
+                        let class = if matches!(e, GASPError::DefinitiveNotFound(_)) {
+                            fault_class::NOT_FOUND
+                        } else {
+                            fault_class::COURIER
+                        };
+                        self.faulted(class, e)
+                    })?;
                     let node = GASPNode {
                         graph_id: item.graph_id.clone(),
                         raw_tx: ancestor.raw_tx,
@@ -4292,6 +4341,12 @@ pub fn parse_outpoint(s: &str) -> Option<(String, u32)> {
 /// GASP protocol errors.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum GASPError {
+    /// Every enabled raw rung answered absence, with no skipped or failed rung.
+    #[error("all raw couriers report not found: {0}")]
+    DefinitiveNotFound(String),
+    /// The pass spent its courier allowance; retain its pending walk.
+    #[error("root courier rung budget exhausted")]
+    CourierBudget,
     /// Version mismatch between peers.
     #[error("version mismatch: local={local}, remote={remote}")]
     VersionMismatch { local: u32, remote: u32 },
