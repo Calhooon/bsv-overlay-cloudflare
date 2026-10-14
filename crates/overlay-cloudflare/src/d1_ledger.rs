@@ -286,11 +286,13 @@ pub trait Counted {
 
 impl Counted for worker::D1PreparedStatement {
     async fn counted_all(&self) -> worker::Result<worker::D1Result> {
+        overlay_engine::meter::d1_queries(1);
         let r = self.all().await?;
         note_meta(r.meta().ok().flatten().as_ref());
         Ok(r)
     }
     async fn counted_run(&self) -> worker::Result<worker::D1Result> {
+        overlay_engine::meter::d1_queries(1);
         let r = self.run().await?;
         note_meta(r.meta().ok().flatten().as_ref());
         Ok(r)
@@ -298,6 +300,7 @@ impl Counted for worker::D1PreparedStatement {
     async fn counted_first<T: serde::de::DeserializeOwned>(&self) -> worker::Result<Option<T>> {
         use worker::js_sys::{Array, Reflect};
         use worker::wasm_bindgen::{JsCast, JsValue};
+        overlay_engine::meter::d1_queries(1);
         let js = worker::wasm_bindgen_futures::JsFuture::from(self.inner().all()?).await?;
         let meta = Reflect::get(&js, &JsValue::from_str("meta"))
             .ok()
@@ -317,6 +320,7 @@ pub async fn counted_batch(
     db: &worker::D1Database,
     stmts: Vec<worker::D1PreparedStatement>,
 ) -> worker::Result<Vec<worker::D1Result>> {
+    overlay_engine::meter::d1_queries(stmts.len() as u64);
     let out = db.batch(stmts).await?;
     for r in &out {
         note_meta(r.meta().ok().flatten().as_ref());

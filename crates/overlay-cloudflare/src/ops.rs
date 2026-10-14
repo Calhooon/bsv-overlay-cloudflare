@@ -1485,6 +1485,7 @@ pub async fn health_invariants(
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);
     let gasp_load = crate::gasp_cost::view(db).await;
+    let gasp_speed = crate::gasp_speed::view(db).await;
     let mut body = json!({
         "ok": !dead,
         "service": "low-overlay",
@@ -1568,6 +1569,10 @@ pub async fn health_invariants(
         "gasp": { "deferredGraphs": deferred_graphs },
     });
 
+    body["gaspLastSync"] = gasp_speed["lastSync"].clone();
+    body["gaspWalk24h"] = gasp_speed["totals24h"].clone();
+    body["gaspWalkByTopicPeer24h"] = gasp_speed["byTopicPeer24h"].clone();
+    body["gaspSpeedFault"] = gasp_speed["fault"].clone();
     body["gaspDead"] = counters
         .get(crate::gasp_deferred::COUNTER_GASP_DEAD)
         .cloned()

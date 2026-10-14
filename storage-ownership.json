@@ -855,6 +855,17 @@
    "why": "a GASP cursor; the next sync walks again"
   },
   {
+   "name": "gasp_sync_speed",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "One day of sync speed readings and the latest sync",
+   "why": "measured root walks and wall time"
+  },
+  {
    "name": "gasp_sync_cost",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

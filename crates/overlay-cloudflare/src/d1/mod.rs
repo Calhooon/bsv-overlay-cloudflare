@@ -523,7 +523,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// remembered across runs, and its age index; one table, one index.
 /// 238 to 241: durable quiet-peer cadence, independent of failure health.
 /// 241 to 243: rolling sync cost readings and their age index.
-pub const OVERLAY_MIGRATION_COUNT: usize = 243;
+/// 243 to 245: per-sync speed readings and their age index.
+pub const OVERLAY_MIGRATION_COUNT: usize = 245;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1919,6 +1920,8 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "ALTER TABLE gasp_peer_health ADD COLUMN quiet_advert TEXT NOT NULL DEFAULT ''",
     crate::gasp_cost::CREATE,
     "CREATE INDEX IF NOT EXISTS gasp_sync_cost_age ON gasp_sync_cost(ended_ms)",
+    crate::gasp_speed::CREATE,
+    crate::gasp_speed::INDEX,
 
 ];
 

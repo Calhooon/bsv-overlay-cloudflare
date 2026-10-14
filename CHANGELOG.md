@@ -2,6 +2,13 @@
 
 ## [0.1.13] - 2026-10-14
 
+- Accept `until: "tip"` with a positive `budget_ms` for one selected topic and
+  peer on `POST /admin/startGASPSync`. Page slices retain the existing peer and
+  graph deadlines and share the request's expiry and courier-absence memos.
+  Report summed accounting, data slices and a continuation from the durable
+  cursor when wall, request, slice or progress limits stop the walk. No tick
+  selection or deadline changes. A repeated boundary is checked above its
+  score before reporting tip; the probe never advances the stored cursor.
 - Reserve at most four six-hour retries after an unanchorable verdict, including
   interrupted walks. Exhausted roots become passable `dead:<class>` records,
   never resumed on the same score. A changed peer score opens a new walk.
@@ -9,11 +16,20 @@
   records and expiry removals as `gaspDead` and `gaspFaultExpired`. The authenticated
   proof probe accepts `walk=1&readmit=1` to clear the selected topic/outpoint's
   fault records before its diagnostic walk; the response counts the removals.
+- Report `outputs_walked`, `ms` and `ms_per_1000_outputs` per peer, per topic and
+  in total. Invariants expose `gaspLastSync`, `gaspWalk24h` and
+  `gaspWalkByTopicPeer24h`; rates use summed time divided by summed outputs,
+  with `null` for zero outputs. `d1_queries` counts attempted SQL statements.
 
 DEPLOYMENT NOTE: existing JSON records default to zero retry reservations and
-unknown expiry. No lifecycle table migration, var or dependency pin changes.
+unknown expiry. Two additive migrations create `gasp_sync_speed` and its
+`gasp_sync_speed_age` index for rolling speed readings and the latest sync.
+No lifecycle table migration, var or dependency pin changes.
 Older records can be swept through the existing expired-outpoint memo; a future
 walk also captures the advert expiry. No version bump is included here.
+Backfills checkpoint at 180,000 ms, 500 trait/network operations, 600 measured
+SQL statements or 64 data-page passes, with room for guarded finalization and
+request bookkeeping. CPU limits still require measurement at the deployment.
 
 ## [0.1.12] - 2026-10-14
 

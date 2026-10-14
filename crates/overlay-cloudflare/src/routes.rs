@@ -3396,41 +3396,64 @@ pub async fn admin_start_gasp_sync(
     mut req: Request,
 ) -> worker::Result<Response> {
     worker::console_log!("POST /admin/startGASPSync");
-    let filter = match overlay_engine::sync_load::SyncFilter::parse(&req.text().await?) {
-        Ok(filter) => filter,
-        Err(_) => return json_error("Expected optional topics and peers arrays of strings", 400),
+    let request = match overlay_engine::backfill::SyncRequest::parse(&req.text().await?) {
+        Ok(request) => request,
+        Err(error) => return json_error(&error, 400),
     };
-
+    let filter = request.filter();
     let meter = overlay_engine::meter::LoadMeter::default();
     let outcome = overlay_engine::gasp::race_or_deadline_guarded(
-        engine.start_gasp_sync_metered(&filter, &meter),
+        async {
+            if request.until.is_some() {
+                let result = engine.start_gasp_backfill_metered(&request, &meter).await?;
+                let value =
+                    serde_json::to_value(&result).map_err(|e| EngineError::Other(e.to_string()))?;
+                Ok((result.sync, value))
+            } else {
+                let result = engine.start_gasp_sync_metered(&filter, &meter).await?;
+                let value =
+                    serde_json::to_value(&result).map_err(|e| EngineError::Other(e.to_string()))?;
+                Ok((result, value))
+            }
+        },
         crate::broadcaster::sleep_ms(crate::GASP_SYNC_BUDGET_MS),
         engine.finalize_submit_gate(),
     )
     .await;
+    let cost = meter.snapshot();
     if let Ok(db) = env.d1("OVERLAY_DB") {
-        crate::gasp_cost::record(&db, "admin", meter.snapshot()).await;
+        let result = outcome
+            .as_ref()
+            .and_then(|r: &Result<_, EngineError>| r.as_ref().ok())
+            .map(|(r, _)| r);
+        crate::gasp_cost::record(&db, "admin", cost).await;
+        crate::gasp_speed::record(&db, "admin", cost, result).await;
+        if let Some(result) = result {
+            crate::gasp_deferred::record_counters(&db, &result.topics_synced).await;
+        }
     }
     let Some(outcome) = outcome else {
         worker::console_log!("POST /admin/startGASPSync -> 504 (budget exceeded)");
         return json_error(
             &format!(
-                "GASP sync exceeded its {} ms budget and was dropped; what it finalized is admitted",
+                "GASP sync exceeded its {} ms budget; persisted cursors and holds can be resumed",
                 crate::GASP_SYNC_BUDGET_MS
             ),
             504,
         );
     };
     match outcome {
-        Ok(result) => {
+        Ok((result, value)) => {
             let topic_count = result.topics_synced.len();
             let peer_count: usize = result.topics_synced.values().map(|t| t.peers.len()).sum();
             worker::console_log!(
-                "POST /admin/startGASPSync -> 200 ({} topics, {} total peers)",
+                "POST /admin/startGASPSync -> 200 ({} topics, {} peers, {} outputs walked, {} ms)",
                 topic_count,
                 peer_count,
+                cost.outputs_walked,
+                cost.ms
             );
-            json_ok(&result)
+            json_ok(&value)
         }
         Err(e) => {
             let status = engine_error_status(&e);
