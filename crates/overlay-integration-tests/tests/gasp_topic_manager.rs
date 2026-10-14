@@ -4699,6 +4699,15 @@ fn unproven_beef(nodes: &[GASPNode], subject: usize, proven: usize) -> TaggedBEE
 // nodes carried by the successor. A refusal of node 1 must remain typed.
 #[tokio::test]
 async fn e657_carried_refusal_is_typed_for_the_successor() {
+    check_carried_refusal_attempts(1).await;
+}
+
+#[tokio::test]
+async fn e657_check_refusal_leaves_no_not_landed_for_a_reused_engine() {
+    check_carried_refusal_attempts(2).await;
+}
+
+async fn check_carried_refusal_attempts(attempts: usize) {
     use bsv_overlay_engine::engine::AdmissionRefusal;
     use bsv_overlay_engine::lookup_service::{LookupService, LookupServiceError};
 
@@ -4761,6 +4770,9 @@ async fn e657_carried_refusal_is_typed_for_the_successor() {
             .is_durable()
     );
     let before = admitted_digest(&store).await;
+    // Debug covers every private MemoryStorage table and its counters. This
+    // fixture has at most one entry per table, so map ordering is immaterial.
+    let store_before = format!("{store:?}").into_bytes();
     let checked = Rc::new(RefCell::new(Vec::new()));
     let notified = Rc::new(RefCell::new(Vec::new()));
     let engine = Engine::new(
@@ -4780,40 +4792,44 @@ async fn e657_carried_refusal_is_typed_for_the_successor() {
         None,
         EngineConfig::default(),
     );
-    let report = submitted(&engine, &unproven_beef(&nodes, 2, 0)).await;
-    println!(
-        "refused={:?} faults={:?} landed={:?} store={:?}",
-        report.refused,
-        report.faults,
-        report.landed_predecessors,
-        rows(&store, &nodes).await,
-    );
-    assert_eq!(rows(&store, &nodes).await, ["0:spent=false"]);
-    assert_eq!(applied_rows(&store, &nodes).await, [true, false, false]);
-    assert_eq!(
-        admitted_digest(&store).await,
-        before,
-        "stored bytes changed"
-    );
-    assert!(notified.borrow().is_empty());
-    assert!(!report.is_durable());
-    assert!(report.applied_topics.is_empty());
-    assert!(report.landed_predecessors.is_empty());
-    assert_eq!(
-        report.refused,
-        vec![AdmissionRefusal {
-            topic: TOPIC.to_string(),
-            service: "ls_lens".to_string(),
-            site: "lookup_service.check_admitted",
-            error: LookupServiceError::Other("lens refusal".into()),
-        }],
-        "carried refusal must reach the successor as typed refusal"
-    );
-    assert!(
-        report.faults.is_empty(),
-        "a typed refusal is never a predecessor wait"
-    );
-    assert_eq!(*checked.borrow(), [node_txid(&nodes[1])]);
+    let beef = unproven_beef(&nodes, 2, 0);
+    for attempt in 1..=attempts {
+        let report = submitted(&engine, &beef).await;
+        println!(
+            "attempt={attempt} refused={:?} faults={:?} landed={:?} store={:?}",
+            report.refused,
+            report.faults,
+            report.landed_predecessors,
+            rows(&store, &nodes).await,
+        );
+        assert_eq!(rows(&store, &nodes).await, ["0:spent=false"]);
+        assert_eq!(applied_rows(&store, &nodes).await, [true, false, false]);
+        assert_eq!(
+            admitted_digest(&store).await,
+            before,
+            "stored bytes changed"
+        );
+        assert_eq!(format!("{store:?}").into_bytes(), store_before);
+        assert!(notified.borrow().is_empty());
+        assert!(!report.is_durable());
+        assert!(report.applied_topics.is_empty());
+        assert!(report.landed_predecessors.is_empty());
+        assert_eq!(
+            report.refused,
+            vec![AdmissionRefusal {
+                topic: TOPIC.to_string(),
+                service: "ls_lens".to_string(),
+                site: "lookup_service.check_admitted",
+                error: LookupServiceError::Other("lens refusal".into()),
+            }],
+            "carried refusal must reach the successor as typed refusal"
+        );
+        assert!(
+            report.faults.is_empty(),
+            "a typed refusal is never a predecessor wait"
+        );
+        assert_eq!(*checked.borrow(), vec![node_txid(&nodes[1]); attempt]);
+    }
 }
 
 // F1: the DELETE of the stale coin answers an error, after the insert. The
