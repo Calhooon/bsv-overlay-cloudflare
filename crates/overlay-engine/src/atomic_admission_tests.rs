@@ -1221,3 +1221,36 @@ async fn a1_c6_dry_judgement_is_explicit_and_read_only() {
     assert!(store.sql_statements().is_empty());
     assert_eq!(store.log_head(), 0);
 }
+
+struct ErrorManager { store: Rc<MemoryStorage>, defer: bool }
+#[async_trait(?Send)]
+impl TopicManager for ErrorManager {
+    async fn identify_admissible_outputs(&self, _: &Transaction, _: &[u8], _: Option<&[u8]>, _: SubmitMode, _: &TopicAdmittanceContext) -> Result<AdmittanceInstructions, TopicManagerError> {
+        if self.defer { self.store.defer("evidence_unavailable", "ARC down".into()); }
+        Err(TopicManagerError::Other("manager error".into()))
+    }
+    async fn get_documentation(&self) -> String { String::new() }
+    async fn get_metadata(&self) -> ServiceMetadata { ServiceMetadata::default() }
+}
+fn error_engine(store: &Rc<MemoryStorage>, defer: bool) -> Engine {
+    Engine::new(HashMap::from([
+        (REGISTRY.into(), Box::new(ErrorManager { store: store.clone(), defer }) as Box<dyn TopicManager>),
+        (PROOF.into(), Box::new(ProofManager) as Box<dyn TopicManager>),
+    ]), HashMap::new(), Box::new(store.clone()), None, EngineConfig::default())
+}
+#[tokio::test]
+async fn a1_c7_manager_error_fails_only_its_topic_unless_deferred() {
+    let (_, legacy_store, _, beef, _) = fixture().await;
+    let legacy = error_engine(&legacy_store, false).submit(&beef, SubmitMode::HistoricalTxNoSpv).await.unwrap();
+    let (_, store, index, _, _) = fixture().await;
+    let engine = error_engine(&store, false);
+    let (word, _) = submit_log(&engine, &store, &beef).await.unwrap();
+    assert_eq!(serde_json::to_value(&word).unwrap(), serde_json::to_value(&legacy).unwrap());
+    assert_eq!(word[PROOF].outputs_to_admit, vec![2]);
+    assert!(word[REGISTRY].outputs_to_admit.is_empty());
+    let (_, deferred_store, _, _, _) = fixture().await;
+    let before = snapshot(&deferred_store, &index);
+    let result = submit_log(&error_engine(&deferred_store, true), &deferred_store, &beef).await;
+    assert!(matches!(result, Err(LogError::Refused(AdmitRefusal::NotNow { site, .. })) if site == "evidence_unavailable"));
+    assert!(before == snapshot(&deferred_store, &index));
+}

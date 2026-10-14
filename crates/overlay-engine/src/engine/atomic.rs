@@ -271,7 +271,7 @@ impl Engine {
             log.at(&format!(
                 "topic_manager.{topic}.identify_admissible_outputs"
             ));
-            let admittance = self
+            let admittance = match self
                 .judge(
                     &tx,
                     topic,
@@ -281,14 +281,26 @@ impl Engine {
                     &context,
                     None,
                 )
-                .await
-                .map_err(|e| manager_refusal(topic, e))?;
+                .await {
+                    Ok(admittance) => admittance,
+                    Err(_) => {
+                        if let Some(refusal) = log.deferral() { return Err(refusal.with_notes(log.notes())); }
+                        steak.insert(topic.clone(), AdmittanceInstructions::default());
+                        continue;
+                    }
+                };
             if previous.is_empty() && !tx.inputs.is_empty() {
                 log.at(&format!("topic_manager.{topic}.predecessor"));
-                let needed = self.managers[topic]
+                let needed = match self.managers[topic]
                     .identify_needed_inputs(&named, walked.tagged_beef.off_chain_values.as_deref())
-                    .await
-                    .map_err(|e| AdmitRefusal::transient("identify_needed_inputs", e))?;
+                    .await {
+                        Ok(needed) => needed,
+                        Err(_) => {
+                            if let Some(refusal) = log.deferral() { return Err(refusal.with_notes(log.notes())); }
+                            steak.insert(topic.clone(), AdmittanceInstructions::default());
+                            continue;
+                        }
+                    };
                 let mut named_inputs = Some(
                     needed
                         .into_iter()
@@ -588,17 +600,3 @@ fn lookup_refusal(topic: &str, site: &str, error: LookupServiceError) -> AdmitRe
     }
 }
 
-fn manager_refusal(topic: &str, error: TopicManagerError) -> AdmitRefusal {
-    match error {
-        TopicManagerError::Admission(error) => error,
-        TopicManagerError::Other(reason) => {
-            AdmitRefusal::transient("topic_manager.identify_admissible_outputs", reason)
-        }
-        other => AdmitRefusal::Deterministic {
-            topic: topic.into(),
-            site: "topic_manager.identify_admissible_outputs".into(),
-            reason: other.to_string(),
-            notes: vec![],
-        },
-    }
-}
