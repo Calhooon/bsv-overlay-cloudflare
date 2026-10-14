@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.1.10] - 2026-10-14
+
+- Give the strike room of its own. A fault record (`retry:fault:<class>` or
+  `unanchorable:<class>`: a root, a class, a count, no nodes) is bounded by
+  `FAULT_RECORDS_PER_PEER_TOPIC` (32), not under
+  `DEFERRED_GRAPHS_PER_PEER_TOPIC` (16). On 0.1.9 a (peer, topic) whose
+  sixteen slots held root retry obligations refused the strike of the root
+  that held its cursor, and the rule was inert.
+  - The strike of the run's lowest faulted root is written whatever the
+    deferred store holds. The storage's own ceiling stays the only one above
+    the new bound.
+  - A struck root's walk replaces its fault record with the hold it earned
+    only with room among the deferred slots; else it goes on as any walk
+    past the bound, and the fault record stays.
+- Bound the churn of held records that never progress. A held (passable)
+  record resumed `IDLE_RESUMES_BEFORE_BACKOFF` (3) passes in a row with no
+  node appended waits `IDLE_RESUME_RETRY_SECS` (6 h) before its next resume:
+  no request, the cursor passes it, not an attempt for the yieldless streak.
+  A resume that appends a node resets the count. The records are kept, and
+  an expired root a record holds is still refused ahead of the backoff, with
+  no request.
+  - A pass counts only when it asked the peer. A resume cut in flight by the
+    per-peer deadline with nothing appended counts.
+  - A hung peer whose only record waits is asked only its listing in those
+    ticks: a quiet sync, recorded as any. Each pass after the backoff runs
+    out is a failed attempt again, and `PEER_QUARANTINE_THRESHOLD` of them in
+    a row still quarantine it.
+- Make a refused strike readable. A strike refused at the fault bound, at the
+  storage's ceiling, with the keys unread or on a storage fault is counted
+  (`strikes_refused` in the sync's accounting) and named on the root
+  (`refused`: `no_room` or `store_fault`). The tick's per-topic `faulted`
+  items carry the reason; its summary line carries `strikes_refused=`,
+  `backed_off_graphs=` and `waiting_graphs=`. The counter
+  `gasp_strikes_refused_total` is served on invariants as
+  `gaspStrikesRefused`.
+- **DEPLOYMENT NOTE:** No migration, new variable or dependency pin. The
+  deferred store's columns and keys are unchanged: the sync knows a fault
+  record when it reads it. The idle count lives in the record's JSON
+  (`idle_resumes`, absent when 0) beside 0.1.9's `retry_at`. Rolling back to
+  0.1.9 is safe: 0.1.9 ignores `idle_resumes` and the `retry_at` of a record
+  that is not a fault record, so it resumes such records every run again,
+  and counts fault records among its sixteen slots again. The keeper sets
+  both workspace versions and internal floors for release.
+
 ## [0.1.9] - 2026-10-14
 
 - Record a GASP root whose walk is dropped by a fault in three consecutive
