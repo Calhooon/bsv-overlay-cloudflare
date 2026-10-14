@@ -163,6 +163,10 @@ fn minutes_clock(engine: &mut Engine, remote: &BudgetPageRemote) -> crate::meter
 #[tokio::test]
 async fn minutes_0113_backfill_three_pages_in_three_slices_with_speed() {
     let (mut engine, mut remote) = budget_page_engine(6);
+    engine.config.sync_configuration.insert(
+        "tm_other".into(),
+        SyncTarget::Peers(vec!["https://other.example".into()]),
+    );
     remote.clamp = Some(3);
     remote.node_cost_ms = 10;
     let meter = minutes_clock(&mut engine, &remote);
@@ -174,6 +178,7 @@ async fn minutes_0113_backfill_three_pages_in_three_slices_with_speed() {
     assert!(result.reached_tip);
     assert!(result.continuation.is_none());
     assert_eq!(result.slices, 3);
+    assert_eq!(result.sync.topics_filtered, ["tm_other"]);
     assert_eq!(result.sync.topics_synced["tm_test"].finalized_graphs, 6);
     assert_eq!(result.sync.cost.outputs_walked, 6);
     assert_eq!(result.sync.cost.ms, 60);
