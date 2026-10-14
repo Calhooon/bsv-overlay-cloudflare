@@ -11,6 +11,7 @@
 - Share the maintenance tick between cron and the `TickAlarm` Durable Object, with a D1 lease, bounded execution and source activity on `/health/invariants.tick`. The alarm re-arms after failed ticks; the cron revives a dormant alarm. Authenticated operators can use `POST /admin/tick/arm` and `GET /admin/tick/status`.
 - Deployment configs must add the `TICK_ALARM` binding for class `TickAlarm` and a migration with `new_sqlite_classes = ["TickAlarm"]` (choose an unused migration tag). The engine's example uses tag `v1`; the stack keeper, LOW and Zanaadu own their deploy configs. Without the binding, cron still runs and logs the skipped arm. Arm after deploying, then verify both source counters and the next alarm.
 - D1 adds a transient lease, a one-day activity history and two nullable heartbeat fields. Existing proof-completion counters keep their meaning. Rollback may leave these additive tables and columns in place. Workspace versions remain for the keeper's release commit.
+- Carries the E649 work landed on `main` after 0.1.4 (bsv-low #649, LOW's captain): a background flush's withheld pot and hop notes parked in D1 and drained by the shared tick and by `/admin/complete-proofs` (migrations 222 to 231; the tick lane's are 232 to 236), the conflict pass persisting each candidate's counts, the eviction ledger served on the app layer's `/utxo-status`.
 
 ## [0.1.4] - 2026-10-13
 

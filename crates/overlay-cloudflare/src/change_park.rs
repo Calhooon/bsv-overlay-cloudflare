@@ -2153,10 +2153,12 @@ mod tests {
             within[skip..ship].contains("crate::change_park::park_withheld(&port,remaining_ms,"),
             "the skip parks"
         );
-        let lib = sq(include_str!("lib.rs"));
-        let tick = &lib[lib.find("asyncfnscheduled(").unwrap()..];
+        // Engine 0.1.5: the cron's `scheduled` and the `TickAlarm` share the tick's body in `tick.rs`
+        // (`run_tick`), where `env` is already a reference.
+        let tick_src = sq(include_str!("tick.rs"));
+        let tick = &tick_src[tick_src.find("asyncfnrun_tick(").unwrap()..];
         let deliver = tick
-            .find("crate::change_park::drain_parked(&env,&ops_db,crate::change_park::DrainTrigger::Tick)")
+            .find("crate::change_park::drain_parked(env,&ops_db,crate::change_park::DrainTrigger::Tick)")
             .expect("the tick delivers");
         let gasp = tick
             .find("engine.start_gasp_sync(),")
@@ -2219,10 +2221,11 @@ mod tests {
             retire < drain && drain < answer,
             "after the retire pass, before the answer"
         );
-        let tick = &lib[lib.find("asyncfnscheduled(").unwrap()..];
+        let tick_src = sq(include_str!("tick.rs"));
+        let tick = &tick_src[tick_src.find("asyncfnrun_tick(").unwrap()..];
         assert!(
-            tick.contains("crate::change_park::drain_parked(&env,&ops_db,crate::change_park::DrainTrigger::Tick)"),
-            "the scheduled handler drains too"
+            tick.contains("crate::change_park::drain_parked(env,&ops_db,crate::change_park::DrainTrigger::Tick)"),
+            "the shared tick (cron and alarm) drains too"
         );
     }
 
