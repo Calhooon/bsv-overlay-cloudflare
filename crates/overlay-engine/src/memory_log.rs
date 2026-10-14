@@ -330,6 +330,7 @@ impl MemoryStorage {
                     charge: walked.charge,
                     could_not_run: None,
                     predecessor_reads: walked.predecessor_reads.clone(),
+                    spends: None,
                 };
                 &carried_unit
             };

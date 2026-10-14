@@ -81,6 +81,12 @@ pub struct Walked {
     /// Shared by every topic and carried landing attempt for this submit.
     #[serde(skip)]
     pub predecessor_reads: std::rc::Rc<std::cell::Cell<usize>>,
+    /// The txids the subject's inputs spend, from the walk's own parse, read
+    /// by the dependency gate (the gate lens's NOTE 3: one parse per body).
+    /// `None` (a body off the wire, or built by hand): the gate parses the
+    /// BEEF itself.
+    #[serde(skip)]
+    pub spends: Option<Vec<String>>,
 }
 
 #[async_trait(?Send)]
@@ -107,17 +113,27 @@ impl EvidenceSource for NoEvidence {
 pub enum AdmitRefusal {
     /// Pure lookup checks refused before any topic apply. The original typed
     /// service errors are retained, just as in `MutationReport::refused`.
-    #[error("lookup preflight refused: {refused:?}")]
+    #[error(
+        "{}lookup preflight refused: {refused:?}",
+        parent_prefix(refused_parent.as_deref())
+    )]
     Lookup {
         refused: Vec<AdmissionRefusal>,
         notes: RefusalNotes,
+        /// Set by the dependency gate (D44) on a GASP body it held behind a
+        /// parent of its graph refused with this word: the txid of the body
+        /// whose own refusal it is (the gate lens's NOTE 1). `None`: the
+        /// body's own. Boxed: the enum keeps its size.
+        refused_parent: Option<Box<str>>,
     },
-    #[error("{site}: {reason}")]
+    #[error("{}{site}: {reason}", parent_prefix(refused_parent.as_deref()))]
     Deterministic {
         topic: String,
         site: String,
         reason: String,
         notes: RefusalNotes,
+        /// As [`AdmitRefusal::Lookup`]'s.
+        refused_parent: Option<Box<str>>,
     },
     #[error("{site}: {reason}")]
     Transient {
@@ -133,6 +149,11 @@ pub enum AdmitRefusal {
         predecessor: Option<(String, String)>,
     },
 }
+/// A held descendant's word names the refused parent first.
+fn parent_prefix(refused_parent: Option<&str>) -> String {
+    refused_parent.map_or_else(String::new, |txid| format!("parent {txid} was refused: "))
+}
+
 impl AdmitRefusal {
     #[allow(
         clippy::needless_pass_by_value,
@@ -359,8 +380,12 @@ pub fn admit_graph(
 pub type GraphObserver<'a> =
     dyn FnMut(&Walked, &Result<Committed, AdmitRefusal>, Option<&GateReason>) + 'a;
 
-/// The txids a body's inputs spend, its own excluded.
+/// The txids a body's inputs spend, its own excluded: the walk's own parse
+/// when the body carries it ([`Walked::spends`]), else the body's BEEF parsed.
 fn spent_txids(walked: &Walked) -> Vec<String> {
+    if let Some(spends) = &walked.spends {
+        return spends.clone();
+    }
     let tx = match &walked.beef {
         BeefCarry::Inline(bytes) => crate::beef_limits::transaction_from_beef(
             bytes,
@@ -373,13 +398,16 @@ fn spent_txids(walked: &Walked) -> Vec<String> {
             .filter_map(|raw| Transaction::from_binary(raw).ok())
             .find(|tx| tx.id() == walked.txid),
     };
+    tx.map(|tx| spends_of(&tx, &walked.txid))
+        .unwrap_or_default()
+}
+
+/// The txids `tx`'s inputs spend, in input order, once each, `txid` excluded.
+pub(crate) fn spends_of(tx: &Transaction, txid: &str) -> Vec<String> {
     let mut spent: Vec<String> = Vec::new();
-    let Some(tx) = tx else {
-        return spent;
-    };
     for input in &tx.inputs {
         if let Ok(source) = input.get_source_txid() {
-            if source != walked.txid && !spent.contains(&source) {
+            if source != txid && !spent.contains(&source) {
                 spent.push(source);
             }
         }
@@ -530,11 +558,16 @@ pub fn admit_graph_observed(
             let gate = (answer.is_err() && manager_failed.get()).then_some(GateReason::ParentError);
             (answer, gate)
         } else {
-            let terminal = waiting.iter().find_map(|p| match &refused[p] {
-                refusal @ (AdmitRefusal::Lookup { .. } | AdmitRefusal::Deterministic { .. }) => {
-                    Some(refusal.clone())
+            let terminal = waiting.iter().find_map(|p| {
+                let mut refusal = refused[p].clone();
+                match &mut refusal {
+                    AdmitRefusal::Lookup { refused_parent, .. }
+                    | AdmitRefusal::Deterministic { refused_parent, .. } => {
+                        refused_parent.get_or_insert_with(|| p.as_str().into());
+                        Some(refusal)
+                    }
+                    _ => None,
                 }
-                _ => None,
             });
             let refusal = terminal.unwrap_or_else(|| {
                 AdmitRefusal::not_now(

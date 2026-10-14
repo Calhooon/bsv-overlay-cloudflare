@@ -152,6 +152,7 @@ impl Engine {
             charge: charge as u64,
             could_not_run,
             predecessor_reads: std::rc::Rc::default(),
+            spends: Some(crate::admission::spends_of(&tx, &txid)),
         })
     }
 
@@ -419,6 +420,7 @@ impl Engine {
             return Err(AdmitRefusal::Lookup {
                 refused: report.refused,
                 notes: log.notes(),
+                refused_parent: None,
             });
         }
         // All topics judge before any engine mutation, as on the ordinary path.
@@ -625,6 +627,7 @@ fn lookup_refusal(topic: &str, site: &str, error: LookupServiceError) -> AdmitRe
                 site: site.into(),
                 reason,
                 notes: vec![],
+                refused_parent: None,
             }
         }
         // Unknown legacy errors are retryable, never string-classified.

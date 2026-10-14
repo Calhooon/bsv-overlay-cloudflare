@@ -243,18 +243,15 @@ fn fan_in() -> [Transaction; 3] {
 async fn d44_fan_in_the_good_parent_lands_the_erring_parent_and_the_root_wait() {
     let [a, b, r] = fan_in();
     let mut seen = Vec::new();
-    for order in [[&a, &b], [&b, &a]] {
+    // Each body at its own height whatever the order: the same bytes (the
+    // rows name each stored BEEF by its bytes).
+    for order in [[(&a, 100), (&b, 101)], [(&b, 101), (&a, 100)]] {
         let store = Rc::new(MemoryStorage::new());
         let engine = engine(&store, Some(a.id()), None);
-        let judged = admit(
-            &engine,
-            &store,
-            &[(order[0], 100), (order[1], 101), (&r, 102)],
-        )
-        .await;
+        let judged = admit(&engine, &store, &[order[0], order[1], (&r, 102)]).await;
         println!(
             "D44 fan-in, {} first: {:?}",
-            &order[0].id()[..8],
+            &order[0].0.id()[..8],
             judged.answers
         );
         assert_eq!(
@@ -390,10 +387,14 @@ async fn d44_a_lookup_refusal_is_terminal_and_its_descendants_take_its_word() {
         Some(Answer::Lookup),
         "the descendant is refused with the same typed word, not `not now`: {judged:?}"
     );
+    let mut named = judged.refusals[&c.id()].clone();
+    if let AdmitRefusal::Lookup { refused_parent, .. } = &mut named {
+        *refused_parent = Some(c.id().into());
+    }
     assert_eq!(
         judged.refusals.get(&d.id()),
-        judged.refusals.get(&c.id()),
-        "the same word"
+        Some(&named),
+        "the same word, naming the refused parent (the gate lens's NOTE 1)"
     );
     assert_eq!(judged.gate(&c), None, "its own refusal");
     assert_eq!(judged.gate(&d), Some(GateReason::WaitingOn(vec![c.id()])));
@@ -616,5 +617,47 @@ async fn d44_n2_a_waiting_parent_re_sent_under_another_proof_lands_as_a_first_ti
         rows(&store, &txs).await,
         rows(&first, &txs).await,
         "the same rows, the stored BEEFs byte for byte"
+    );
+}
+
+/// The gate lens's NOTE 3: the gate reads each body's parents from the walk's
+/// own parse (`Walked::spends`), not a second parse of its BEEF. The walk
+/// carries the fan-in root's two parents; and a sibling whose carried spends
+/// are made to name the erring parent is held on it, which only a gate
+/// reading the walk's word can do (its BEEF spends nothing of the graph).
+#[tokio::test]
+async fn d44_n3_the_gate_reads_the_walks_spends() {
+    let [a, b, r] = fan_in();
+    let store = Rc::new(MemoryStorage::new());
+    let engine = engine(&store, Some(a.id()), None);
+    let mut walked = walk(&engine, &[(&a, 100), (&b, 101), (&r, 102)]).await;
+    assert_eq!(
+        walked[2].spends,
+        Some(vec![a.id(), b.id()]),
+        "the walk's word"
+    );
+    assert_eq!(
+        walked[1].spends,
+        Some(vec!["00".repeat(32)]),
+        "b's genesis input"
+    );
+    walked[1].spends = Some(vec![a.id()]);
+    let mut gates = BTreeMap::new();
+    admit_graph_observed(
+        &engine,
+        store.as_ref(),
+        &walked,
+        &[],
+        &mut |body, _, gate| {
+            if let Some(gate) = gate {
+                gates.insert(body.txid.clone(), gate.clone());
+            }
+        },
+    );
+    println!("D44 N3 gates: {gates:?}");
+    assert_eq!(
+        gates.get(&b.id()),
+        Some(&GateReason::WaitingOn(vec![a.id()])),
+        "the gate took the walk's spends"
     );
 }

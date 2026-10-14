@@ -696,6 +696,7 @@ async fn a1_statement_guard_catches_swallowed_manager_write() {
             site: "manager".into(),
             reason: "missing row after failed write".into(),
             notes: vec![],
+            refused_parent: None,
         })
     });
     assert!(matches!(

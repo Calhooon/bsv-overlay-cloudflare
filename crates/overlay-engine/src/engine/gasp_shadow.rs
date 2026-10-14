@@ -279,6 +279,7 @@ fn walk_refusal(topic: &str, error: &EngineError) -> AdmitRefusal {
             site: "gasp_finalize.walk".into(),
             reason: error.to_string(),
             notes: vec![],
+            refused_parent: None,
         },
         503 => AdmitRefusal::not_now("gasp_finalize.walk", error.to_string()),
         _ => AdmitRefusal::transient("gasp_finalize.walk", error),
