@@ -376,6 +376,11 @@ pub fn home_latch_range_binds(spenders: &[String]) -> Vec<String> {
 /// presence proves "this sweep paid my committed home and my key spent it", so the hop is retired on this recompute
 /// whatever this pass's courier reads did. The latch key's body is the sweep (spender) txid
 /// (`homeproof:<sweepTxid>.<vout>`), matched against the named spenders.
+///
+/// The HOMEPROOF lens's LOW-1: the match is per vout but retires on ANY proven latch of the spender, which equals
+/// Arm A's `.all()` over this identity's home outputs (`swept_home`'s `home_spent`) ONLY because a LOW sweep pays
+/// this identity exactly one home output by construction (the sole output's latch is every home output). The
+/// retirement arm in [`derive_owed_rows`] carries the invariant and its client-builder citation.
 pub fn latched_retired_spenders(
     named_spenders: &[String],
     latch_memos: &[crate::hops_view::ProbeMemo],
@@ -2757,15 +2762,30 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             continue;
         }
         let game = h.game_id.to_ascii_lowercase();
-        // bsv-low L25 (the courier-retire story-row flap): a hop an earlier pass PROVED home-spent — THIS crate
-        // verified MY key's signature over the spender and latched it durably under `homeproof:` — is RETIRED on
+        // bsv-low L25 (the courier-retire story-row flap): a hop an earlier pass PROVED home-spent (THIS crate
+        // verified MY key's signature over the spender and latched it durably under `homeproof:`) is RETIRED on
         // every recompute, byte-free. On the BYTE-FREE path only (`swept_home` is `None` because this pass's
         // spender courier cap withheld the sweep's bytes), the durable latch retires the hop exactly as the
         // bytes-in-hand Arm A does (`swept_home`'s `output_spent`); with the bytes present `swept_home` is `Some`
-        // and Arm A/B decide as before, so the answer is the same with and without bytes, and a still-claimable
-        // sibling home output a later pass sees is never hidden. The latch only ever serves LESS (no row), never
-        // mints a claim; a planted spender cannot forge a Proven latch. Closes the #662 gap at its source: the
-        // latch, not a byte-gated candidate window, is the durable retirement authority.
+        // and Arm A/B decide as before.
+        //
+        // The HOMEPROOF lens's LOW-1 (the one-home invariant): this byte-free match reads the latch per vout
+        // (`homeproof:<spender>.<vout>`) but retires on ANY proven latch for the named spender
+        // (`latched_retired_spenders`, an `.any()`), whereas Arm A retires only when EVERY one of this identity's
+        // home outputs in the sweep is spent-or-Proven (`swept_home`'s `home_spent`, an `.all()`). The two agree
+        // because a LOW sweep pays this identity EXACTLY ONE home output by construction: the client builds every
+        // hop sweep as one hop input to one `dest_script_hex` home (`money_p2pkh_sweep_assemble`'s
+        // `P2pkhSweepPlanJson`: one `hop`, one `dest_script_hex`; `owedPress::buildHopSweepForRow`,
+        // `Pot::ensureHopSweepInternal`), and two hops of one game are TWO sweeps with one home output each
+        // (stake.ts: "both hops pay the same script"). So the sole home output's latch IS every home output, and
+        // the byte-free `.any()` equals Arm A's `.all()`: the answer is the same with and without the bytes, and a
+        // still-claimable sibling home output a later pass sees is never hidden (there is no sibling to hide). WERE
+        // a sweep ever to pay this identity two home outputs, one latched and one still claimable, the byte-free
+        // path could not see the unlatched sibling and would retire where Arm A serves a payout; the one-home
+        // invariant, enforced by the client builder and NOT by this read, is what keeps the two equal (pinned:
+        // `l25_low1_one_home_sweep_retires_the_same_byte_free_and_with_bytes`). The latch only ever serves LESS (no
+        // row), never mints a claim; a planted spender cannot forge a Proven latch. Closes the #662 gap at its
+        // source: the latch, not a byte-gated candidate window, is the durable retirement authority.
         if swept_home(i, h).is_none()
             && hop_named_spender(i, h).is_some_and(|sp| i.retired_spenders.contains(&sp))
         {
@@ -4869,6 +4889,90 @@ pub(crate) mod tests {
             .unwrap()
             .contains("could not judge the spender"));
         assert!(without[0].facts["claim"].is_null());
+    }
+
+    /// bsv-low L25 (the HOMEPROOF lens's LOW-1): the byte-free retirement rests on ONE invariant - a LOW sweep pays
+    /// this identity EXACTLY ONE home output. The client builds every hop sweep as a single hop input to a single
+    /// `dest_script_hex` home (`money_p2pkh_sweep_assemble`'s `P2pkhSweepPlanJson`; `owedPress::buildHopSweepForRow`,
+    /// `Pot::ensureHopSweepInternal`); two hops of one game are TWO sweeps, one home output each (stake.ts: "both
+    /// hops pay the same script"). So the sole home output's `homeproof:` latch IS every home output, and the
+    /// byte-free `.any()` match (`latched_retired_spenders`) equals Arm A's `.all()` over the single `mine`
+    /// (`swept_home`'s `home_spent`). This pins that equivalence on the realized ONE-home shape: the hop retires the
+    /// SAME byte-free (its bytes withheld, the latch read) as bytes-in-hand (Arm A's `output_spent`); and the
+    /// UNPROVEN sole output is retired by NEITHER road (a claimable payout stands byte-in-hand, an honest
+    /// could-not-judge row byte-free). Were a sweep ever to pay two home outputs, one latched one claimable, the
+    /// byte-free path could not see the unlatched sibling; the invariant, enforced by the client builder and not by
+    /// this read, is what keeps the two answers equal.
+    #[test]
+    fn l25_low1_one_home_sweep_retires_the_same_byte_free_and_with_bytes() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let my_pkh = "cc".repeat(20);
+        let mut h = hop(HopStatus::Unknown, None, Some(HOP_STRANDED_AFTER_MS + 1));
+        h.hop_txid = tx(0x11);
+        h.game_id = tx(0x21);
+        let hops = [h];
+        let sweep = tx(0x31);
+        let k = format!("{}:0", tx(0x11));
+        let mut chain: HashMap<String, HopChainWord> = HashMap::new();
+        chain.extend(chain_confirmed(&k, true, Some(true), Some(sweep.as_str()), Some(true)));
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x21), my_pkh.clone());
+        let courier: HashSet<String> = [sweep.clone()].into_iter().collect();
+        // ONE home output (vout 0): the shape the client builder always makes.
+        let bytes_one = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let mut proven: HashMap<String, HomeSpendWord> = HashMap::new();
+        proven.insert(format!("{sweep}:0"), HomeSpendWord::Proven);
+        let no_bytes: HashMap<String, Vec<SpenderOutput>> = HashMap::new();
+        let no_home: HashMap<String, HomeSpendWord> = HashMap::new();
+        let build = |spenders: &HashMap<String, Vec<SpenderOutput>>,
+                     home: &HashMap<String, HomeSpendWord>,
+                     retired: &HashSet<String>|
+         -> Vec<OwedRow> {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.hop_chain = &chain;
+            i.spender_outputs = spenders;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = &courier;
+            i.home_spends = home;
+            i.retired_spenders = retired;
+            derive_owed_rows(&i)
+        };
+        // the byte-free latch of the SOLE home output
+        let (t, vv) = home_latch_target(&sweep, 0);
+        let memo = crate::hops_view::ProbeMemo {
+            outpoint: crate::hops_view::probe_memo_key(&t, vv),
+            probed_at_ms: 1_800_000_000_000,
+            spent: true,
+            spending_txid: Some(tx(0x99)),
+            spent_confirmed: Some(true),
+        };
+        let named = {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.hop_chain = &chain;
+            hop_named_spenders(&i)
+        };
+        assert_eq!(named, vec![sweep.clone()]);
+        let latched = latched_retired_spenders(&named, std::slice::from_ref(&memo));
+        assert_eq!(latched, HashSet::from([sweep.clone()]));
+        // EQUIVALENCE: the one-home sweep's sole output proven retires the hop, the SAME answer both roads.
+        let with_bytes = build(&bytes_one, &proven, &NONE);
+        let byte_free = build(&no_bytes, &no_home, &latched);
+        assert!(
+            with_bytes.is_empty(),
+            "bytes in hand, the sole home output proven: Arm A retires: {with_bytes:?}"
+        );
+        assert!(
+            byte_free.is_empty(),
+            "byte-free, the sole home output's latch: retires the same: {byte_free:?}"
+        );
+        // THE HONEST BOUNDARY: the UNPROVEN sole output is retired by NEITHER road.
+        let with_bytes_unspent = build(&bytes_one, &no_home, &NONE);
+        let byte_free_no_latch = build(&no_bytes, &no_home, &NONE);
+        assert_eq!(with_bytes_unspent.len(), 1, "{with_bytes_unspent:?}");
+        assert_eq!(with_bytes_unspent[0].family, OwedFamily::Payout);
+        assert_eq!(byte_free_no_latch.len(), 1, "{byte_free_no_latch:?}");
+        assert_eq!(byte_free_no_latch[0].family, OwedFamily::Unbound);
+        assert!(byte_free_no_latch[0].facts["claim"].is_null());
     }
 
     /// The L25-WITHHELD lens's LOW-1: the withheld/looked ledger, per outcome. A cap break, the clock and the
