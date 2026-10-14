@@ -501,6 +501,17 @@ pub const UNANCHORABLE_RETRY_SECS: u64 = 6 * 3600;
 pub const UNANCHORABLE_RETRIES: u32 = 4;
 pub const DEAD_REASON: &str = "dead:";
 
+/// The least time between two counted absences of one root (engine 0.1.15,
+/// bsv-overlay-cloudflare #56): an absence is the advertising peer's word
+/// ([`fault_class::NOT_FOUND`]), and three of them strike the root
+/// `unanchorable:not_found` only when they were asked on three runs with a
+/// gap. Sixty seconds: two of the stack's 30 s per-peer slices
+/// (`GASP_PEER_SYNC_BUDGET_MS`), one tick at its one-minute cadence, so a
+/// backfill call walking slice after slice cannot count one root three
+/// times in one breath. Until it passes the root's record costs no request
+/// and the cursor holds below it, as for any fault under the threshold.
+pub const ABSENCE_GAP_SECS: u64 = 60;
+
 /// A held (passable) record resumed this many CONSECUTIVE passes with no
 /// node appended goes to the long backoff (engine 0.1.10): it is not resumed
 /// again until [`IDLE_RESUME_RETRY_SECS`] have passed, so the resumes' shared
@@ -569,10 +580,19 @@ pub mod fault_class {
     /// The courier (the chain ancestor fetcher, its rungs) faulted or could
     /// not serve an ancestor.
     pub const COURIER: &str = "courier";
-    /// All raw couriers answered definite absence in this run.
+    /// Absence (engine 0.1.15, bsv-overlay-cloudflare #56): the advertising
+    /// peer answered it does not hold the root, or a transaction an
+    /// UNPROVEN node of the graph needs (`NodeNotFound`), so nothing can
+    /// anchor; or, beside it, every configured raw rung answered absent
+    /// (`DefinitiveNotFound`). One run counts once whoever said it. The
+    /// peers' word decides: a rung, when one is configured, fetches and
+    /// never strikes by itself (on 0.1.12 to 0.1.14 the rungs' absence
+    /// struck `unanchorable:not_found` at once). Three runs at least
+    /// [`super::ABSENCE_GAP_SECS`] apart strike it, as any striking class.
     pub const NOT_FOUND: &str = "not_found";
-    /// The peer answered it does not hold the root or an input an unproven
-    /// node needs (`NodeNotFound`).
+    /// The class a peer's `NodeNotFound` carried on 0.1.9 to 0.1.14. Kept
+    /// so the records written then read as they were; a peer's word of
+    /// absence is [`NOT_FOUND`] since 0.1.15.
     pub const NOT_SERVED: &str = "not_served";
     /// The peer faulted serving a node (a transport fault, a 5xx, a body
     /// that does not parse). Named, never a strike: a peer that answers
@@ -1528,6 +1548,11 @@ pub struct GASPSync<'a> {
     pruned: std::cell::RefCell<std::collections::HashSet<String>>,
     /// Distinct outpoints pruned in the last `sync` (the size of `pruned`).
     pruned_inputs: std::cell::Cell<u64>,
+    /// Inputs of UNPROVEN nodes the peer answered it does not hold in this
+    /// sync (engine 0.1.15), keyed `txid.outputIndex`: needed again by
+    /// another graph of the sync, the answer is remembered, not asked.
+    /// Cleared at the start of each `sync`.
+    absent: std::cell::RefCell<std::collections::HashSet<String>>,
     /// Graphs REFUSED by `validate_graph_anchor` and discarded in the last
     /// `sync` (bsv-low #551). Cleared at the start of each `sync`.
     discarded_graphs: std::cell::Cell<u64>,
@@ -1598,6 +1623,8 @@ pub struct GASPSync<'a> {
     unanchorable_recorded: std::cell::Cell<u64>,
     /// See [`Self::unanchorable_cleared`].
     unanchorable_cleared: std::cell::Cell<u64>,
+    /// See [`Self::absent_struck`].
+    absent_struck: std::cell::Cell<u64>,
     dead_recorded: std::cell::Cell<u64>,
     expired_swept: std::cell::Cell<u64>,
     memo_folded: std::cell::Cell<u64>,
@@ -1639,6 +1666,7 @@ impl<'a> GASPSync<'a> {
             ancestor_fetcher: None,
             pruned: std::cell::RefCell::new(std::collections::HashSet::new()),
             pruned_inputs: std::cell::Cell::new(0),
+            absent: std::cell::RefCell::default(),
             discarded_graphs: std::cell::Cell::new(0),
             anchor_walk_held: std::cell::Cell::new(0),
             finalized_hook: None,
@@ -1664,6 +1692,7 @@ impl<'a> GASPSync<'a> {
             faulted: std::cell::RefCell::default(),
             unanchorable_recorded: std::cell::Cell::new(0),
             unanchorable_cleared: std::cell::Cell::new(0),
+            absent_struck: std::cell::Cell::new(0),
             dead_recorded: std::cell::Cell::new(0),
             expired_swept: std::cell::Cell::new(0),
             memo_folded: std::cell::Cell::new(0),
@@ -1758,6 +1787,14 @@ impl<'a> GASPSync<'a> {
     /// passes them from now on.
     pub fn unanchorable_recorded(&self) -> u64 {
         self.unanchorable_recorded.get()
+    }
+
+    /// Roots the last `sync` struck `unanchorable:not_found` (engine 0.1.15):
+    /// the peers' word of absence counted on [`UNANCHORABLE_AFTER_FAULTED_RUNS`]
+    /// runs at least [`ABSENCE_GAP_SECS`] apart. Counted in
+    /// [`Self::unanchorable_recorded`] too.
+    pub fn absent_struck(&self) -> u64 {
+        self.absent_struck.get()
     }
 
     /// Roots with a fault record (unanchorable or not yet) that the last
@@ -1985,10 +2022,12 @@ impl<'a> GASPSync<'a> {
         error
     }
 
-    /// The class of a peer's failure to serve a node.
+    /// The class of a peer's failure to serve a node: its `NodeNotFound`
+    /// is its word that it does not hold the transaction (engine 0.1.15),
+    /// any other failure is the moment's.
     fn peer_fault_class(error: &GASPError) -> &'static str {
         match error {
-            GASPError::NodeNotFound(_) => fault_class::NOT_SERVED,
+            GASPError::NodeNotFound(_) => fault_class::NOT_FOUND,
             _ => fault_class::PEER,
         }
     }
@@ -2028,6 +2067,10 @@ impl<'a> GASPSync<'a> {
         lowest: bool,
     ) -> bool {
         let class = self.last_fault.take();
+        // Absence counts on every root of the run, not only the lowest
+        // (0.1.12 for the rungs' word, 0.1.15 for the peer's): it is a
+        // definite answer, one row of the bounded memo each (0.1.14), so a
+        // page of absent roots passes together on its third gapped run.
         let struck = match class {
             Some(class)
                 if (lowest || class == fault_class::NOT_FOUND)
@@ -2118,8 +2161,9 @@ impl<'a> GASPSync<'a> {
             .get(outpoint)
             .copied()
             .or_else(|| prior.and_then(|r| r.expiry));
-        let unanchorable =
-            class == fault_class::NOT_FOUND || record.faults >= UNANCHORABLE_AFTER_FAULTED_RUNS;
+        // Engine 0.1.15: absence strikes on the three-run rule like every
+        // class; on 0.1.12 to 0.1.14 the rungs' word struck at once.
+        let unanchorable = record.faults >= UNANCHORABLE_AFTER_FAULTED_RUNS;
         // A record the cursor had passed stays passable (engine 0.1.11): the
         // strike counts its faulted runs and never takes the pass back.
         record.cursor_passable = unanchorable || prior.is_some_and(|r| r.cursor_passable);
@@ -2128,6 +2172,11 @@ impl<'a> GASPSync<'a> {
             record.retry_at = Self::now_secs() + UNANCHORABLE_RETRY_SECS;
         } else {
             record.reason = format!("{FAULT_RETRY_REASON}{class}");
+            // The next absence counts after the gap; until then the record
+            // costs no request (engine 0.1.15).
+            if class == fault_class::NOT_FOUND {
+                record.retry_at = Self::now_secs() + ABSENCE_GAP_SECS;
+            }
         }
         if unanchorable && record.unanchorable_retries >= UNANCHORABLE_RETRIES {
             record.reason = format!("{DEAD_REASON}{class}");
@@ -2150,6 +2199,9 @@ impl<'a> GASPSync<'a> {
                 if unanchorable && !prior.is_some_and(DeferredGraph::is_unanchorable) {
                     self.unanchorable_recorded
                         .set(self.unanchorable_recorded.get() + 1);
+                    if class == fault_class::NOT_FOUND {
+                        self.absent_struck.set(self.absent_struck.get() + 1);
+                    }
                     warn!(
                         "{} Root {} UNANCHORABLE ({}): faulted {} runs in a row; the cursor passes it, walked again in {} s (engine 0.1.9)",
                         self.log_prefix, outpoint, class, record.faults, UNANCHORABLE_RETRY_SECS
@@ -2189,16 +2241,39 @@ impl<'a> GASPSync<'a> {
         cap: PassCap,
     ) -> Result<Ingested, GASPError> {
         let score = utxo.score as u64;
+        let absent = record.fault_class() == Some(fault_class::NOT_FOUND);
         if record.is_dead() || (record.is_unanchorable() && Self::now_secs() < record.retry_at) {
             // Not asked of the peer: not an attempt for the yieldless
             // streak (a quiet peer holding one is never quarantined for it).
             self.graphs_attempted
                 .set(self.graphs_attempted.get().saturating_sub(1));
+            if absent {
+                crate::meter::peer_absent_memo_hit();
+            }
             debug!(
                 "{} Unanchorable root {} waits until {} (engine 0.1.9)",
                 self.log_prefix, outpoint, record.retry_at
             );
             return Ok(Ingested::Unanchorable);
+        }
+        // Engine 0.1.15: an absence counted less than ABSENCE_GAP_SECS ago
+        // is not asked again; the run counts nothing and the cursor holds
+        // below a root it has not passed.
+        if !record.is_unanchorable() && Self::now_secs() < record.retry_at {
+            self.graphs_attempted
+                .set(self.graphs_attempted.get().saturating_sub(1));
+            if absent {
+                crate::meter::peer_absent_memo_hit();
+            }
+            debug!(
+                "{} Absent root {} counted {} runs; the next count waits until {} (engine 0.1.15)",
+                self.log_prefix, outpoint, record.faults, record.retry_at
+            );
+            return Ok(if record.cursor_passable {
+                Ingested::Deferred
+            } else {
+                Ingested::Retry
+            });
         }
         if record.is_unanchorable() {
             if record.unanchorable_retries >= UNANCHORABLE_RETRIES {
@@ -2429,6 +2504,7 @@ impl<'a> GASPSync<'a> {
         self.page.reached_tip = false;
         self.pruned.borrow_mut().clear();
         self.pruned_inputs.set(0);
+        self.absent.borrow_mut().clear();
         self.expired_refused.set(0);
         self.root_proofs.borrow_mut().clear();
         self.roots_proven.set(0);
@@ -2442,6 +2518,7 @@ impl<'a> GASPSync<'a> {
         self.faulted.borrow_mut().clear();
         self.unanchorable_recorded.set(0);
         self.unanchorable_cleared.set(0);
+        self.absent_struck.set(0);
         self.dead_recorded.set(0);
         self.expired_swept.set(0);
         self.memo_folded.set(0);
@@ -4325,7 +4402,6 @@ impl<'a> GASPSync<'a> {
             let Some((txid, oi)) = parse_outpoint(&item.outpoint) else {
                 return Ok(StepOut::Pruned);
             };
-            self.count_call();
             match &self.ancestor_fetcher {
                 // OPT-IN ancestry hydration (off by default). When a
                 // fetcher is configured we KNOW the peer cannot serve
@@ -4357,17 +4433,50 @@ impl<'a> GASPSync<'a> {
                 // never completes unless a per-graph budget defers and
                 // resumes it (bsv-low #555).
                 //
-                // Every fetcher error fails the UTXO (the `?`):
-                // the fetcher arm never prunes, see the rule above.
+                // Every fetcher error fails the UTXO: the fetcher arm
+                // never prunes, see the rule above.
+                //
+                // THE PEER DECIDES ABSENCE (engine 0.1.15, #56). An input
+                // of an UNPROVEN node the fetcher cannot serve is asked of
+                // the peer, one request: a rung fetches, it never decides.
+                // On a deployment with no rung configured (the stack's
+                // production since 2026-10-14) the fetcher answers every
+                // such input "exhausted" with no request, so before 0.1.15
+                // the peer was never asked and a graph the chain never
+                // held was named `courier`, never the absence it is. The
+                // peer serving it, the walk goes on; its `NodeNotFound` is
+                // its word that nothing of this graph can anchor
+                // ([`fault_class::NOT_FOUND`]); any other answer keeps the
+                // fetcher's error and class. A proven node's named inputs
+                // and a spent courier budget are as before.
                 Some(fetcher) => {
-                    let ancestor = fetcher.fetch_ancestor(&txid).await.map_err(|e| {
-                        let class = if matches!(e, GASPError::DefinitiveNotFound(_)) {
-                            fault_class::NOT_FOUND
-                        } else {
-                            fault_class::COURIER
-                        };
-                        self.faulted(class, e)
-                    })?;
+                    self.count_call();
+                    let ancestor = match fetcher.fetch_ancestor(&txid).await {
+                        Ok(ancestor) => ancestor,
+                        Err(e) => {
+                            let class = if matches!(e, GASPError::DefinitiveNotFound(_)) {
+                                fault_class::NOT_FOUND
+                            } else {
+                                fault_class::COURIER
+                            };
+                            if item.parent_proven
+                                || matches!(e, GASPError::CourierBudget)
+                                || crate::meter::root_exhausted()
+                            {
+                                return Err(self.faulted(class, e));
+                            }
+                            return match self.ask_peer_for_input(item, &txid, oi).await {
+                                Ok(node) => self
+                                    .absorb(item, node)
+                                    .await
+                                    .map_err(|e| self.faulted(fault_class::VERIFICATION, e)),
+                                Err(peer @ GASPError::NodeNotFound(_)) => {
+                                    Err(self.faulted(fault_class::NOT_FOUND, peer))
+                                }
+                                Err(_) => Err(self.faulted(class, e)),
+                            };
+                        }
+                    };
                     let node = GASPNode {
                         graph_id: item.graph_id.clone(),
                         raw_tx: ancestor.raw_tx,
@@ -4380,40 +4489,84 @@ impl<'a> GASPSync<'a> {
                     self.count_fetched(&node);
                     node
                 }
-                // Default / production: no fetcher → ask the peer.
-                None => match self
-                    .remote
-                    .request_node(&item.graph_id, &txid, oi, item.metadata)
+                // No fetcher, an unproven parent: ask the peer; its
+                // `NodeNotFound` is absence (engine 0.1.15), remembered for
+                // the rest of the sync.
+                None if !item.parent_proven => self
+                    .ask_peer_for_input(item, &txid, oi)
                     .await
-                {
-                    Ok(child_node) => {
-                        self.count_fetched(&child_node);
-                        child_node
-                    }
-                    // Proven parent and a DEFINITE "not held": the D8 prune
-                    // (see the rule above).
-                    Err(e @ GASPError::NodeNotFound(_)) if item.parent_proven => {
-                        warn!(
+                    .map_err(|e| self.faulted(Self::peer_fault_class(&e), e))?,
+                // No fetcher, a proven parent → ask the peer.
+                None => {
+                    self.count_call();
+                    match self
+                        .remote
+                        .request_node(&item.graph_id, &txid, oi, item.metadata)
+                        .await
+                    {
+                        Ok(child_node) => {
+                            self.count_fetched(&child_node);
+                            child_node
+                        }
+                        // Proven parent and a DEFINITE "not held": the D8 prune
+                        // (see the rule above).
+                        Err(e @ GASPError::NodeNotFound(_)) if item.parent_proven => {
+                            warn!(
                             "{} Pruned input {} named by proven node {}: the peer does not hold it: {}",
                             self.log_prefix,
                             item.outpoint,
                             item.spent_by.as_deref().unwrap_or_default(),
                             e
                         );
-                        if self.pruned.borrow_mut().insert(item.outpoint.clone()) {
-                            self.pruned_inputs.set(self.pruned_inputs.get() + 1);
+                            if self.pruned.borrow_mut().insert(item.outpoint.clone()) {
+                                self.pruned_inputs.set(self.pruned_inputs.get() + 1);
+                            }
+                            return Ok(StepOut::Pruned);
                         }
-                        return Ok(StepOut::Pruned);
+                        // Any other error: propagate, as the reference does.
+                        Err(e) => return Err(self.faulted(Self::peer_fault_class(&e), e)),
                     }
-                    // Any other error, and every error under an unproven
-                    // parent: propagate, as the reference does.
-                    Err(e) => return Err(self.faulted(Self::peer_fault_class(&e), e)),
-                },
+                }
             }
         };
         self.absorb(item, node)
             .await
             .map_err(|e| self.faulted(fault_class::VERIFICATION, e))
+    }
+
+    /// Ask the peer for `item`, an input an UNPROVEN node needs (engine
+    /// 0.1.15): one request, or none when the peer already answered in this
+    /// sync that it does not hold it (counted a peer-absence memo hit).
+    async fn ask_peer_for_input(
+        &self,
+        item: &PendingInput,
+        txid: &str,
+        output_index: u32,
+    ) -> Result<GASPNode, GASPError> {
+        if self.absent.borrow().contains(&item.outpoint) {
+            crate::meter::peer_absent_memo_hit();
+            return Err(GASPError::NodeNotFound(format!(
+                "{}: the peer answered it does not hold it earlier in this sync",
+                item.outpoint
+            )));
+        }
+        self.count_call();
+        match self
+            .remote
+            .request_node(&item.graph_id, txid, output_index, item.metadata)
+            .await
+        {
+            Ok(node) => {
+                self.count_fetched(&node);
+                Ok(node)
+            }
+            Err(e) => {
+                if matches!(e, GASPError::NodeNotFound(_)) {
+                    self.absent.borrow_mut().insert(item.outpoint.clone());
+                }
+                Err(e)
+            }
+        }
     }
 
     /// The node of `item`, fetched: append it to the graph and name its
@@ -4586,6 +4739,8 @@ pub fn parse_outpoint(s: &str) -> Option<(String, u32)> {
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum GASPError {
     /// Every enabled raw rung answered absence, with no skipped or failed rung.
+    /// Since engine 0.1.15 it counts one run of absence beside the peer's
+    /// word ([`fault_class::NOT_FOUND`]), never a strike by itself.
     #[error("all raw couriers report not found: {0}")]
     DefinitiveNotFound(String),
     /// The pass spent its courier allowance; retain its pending walk.

@@ -1590,6 +1590,11 @@ pub async fn health_invariants(
             body["gaspFaultMemoFault"] = json!(error);
         }
     }
+    // Engine 0.1.15 (#56): the absences the peers' word recorded in a day.
+    body["gaspPeerAbsent24h"] = match crate::gasp_fault_memo::peer_absent_24h(db).await {
+        Ok(absent) => absent,
+        Err(error) => json!({"fault": error}),
+    };
     body["gaspFaultMemoFolded"] = counters
         .get("gasp_fault_memo_folded_total")
         .cloned()

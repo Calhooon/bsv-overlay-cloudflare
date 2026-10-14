@@ -229,6 +229,7 @@ impl GASPSyncResult {
                 idle_counted,
                 unanchorable_graphs,
                 unanchorable_cleared,
+                absent_struck,
                 strikes_refused,
                 dead_graphs,
                 expired_swept,

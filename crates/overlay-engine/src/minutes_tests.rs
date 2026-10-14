@@ -292,8 +292,18 @@ fn minutes_0113_request_shape_and_speed_arithmetic() {
     assert_eq!(crate::meter::SyncCost::default().ms_per_1000_outputs, None);
 }
 
+/// Engine 0.1.15 (#56) amended this witness. Its three roots were built by
+/// setting `lock_time` on a parsed transaction, which leaves the id it reads
+/// unchanged, so on 0.1.13 and 0.1.14 one outpoint was listed at three
+/// scores; they are three distinct children of the one absent parent now.
+/// The rungs' absence counts one run per root (it struck at once before),
+/// so the lowest holds the cursor and the call ends `no_progress` after its
+/// opening slice (a backfill slice is one page, here two roots): the memo is
+/// witnessed across the roots of the call (the name it had said slices),
+/// one ladder for the parent and one memo hit; the third root waits for a
+/// call after the cursor passes.
 #[tokio::test]
-async fn minutes_0113_absence_memo_spans_backfill_slices() {
+async fn minutes_0113_absence_memo_spans_the_backfill_call() {
     let mut f = unanchorable_fixture();
     let old = f.root.split('.').next().unwrap();
     let child = Transaction::from_hex(&f.remote.nodes[old].raw_tx).unwrap();
@@ -301,8 +311,7 @@ async fn minutes_0113_absence_memo_spans_backfill_slices() {
     let mut outputs = Vec::new();
     let mut nodes = HashMap::new();
     for n in 1..=3 {
-        let mut tx = child_of(source, 0);
-        tx.lock_time = n;
+        let tx = child_of_value(source, 0, 1000 + n as u64);
         let txid = tx.id();
         outputs.push(crate::types::GASPOutput {
             txid: txid.clone(),
@@ -322,6 +331,8 @@ async fn minutes_0113_absence_memo_spans_backfill_slices() {
             },
         );
     }
+    let f_roots: Vec<String> = outputs.iter().map(|o| format!("{}.0", o.txid)).collect();
+    let f_store = f.store.clone();
     f.remote.outputs = std::rc::Rc::new(outputs);
     f.remote.nodes = std::rc::Rc::new(nodes);
     f.remote.clamp = Some(2);
@@ -338,11 +349,29 @@ async fn minutes_0113_absence_memo_spans_backfill_slices() {
         .start_gasp_backfill_metered(&minutes_backfill_request(1000), &meter)
         .await
         .unwrap();
-    assert!(result.reached_tip, "{result:?}");
     assert_eq!(calls.get(), 1);
-    assert_eq!(result.sync.cost.courier_not_found_memo_hits, 2);
-    assert_eq!(result.sync.topics_synced["tm_test"].unanchorable_graphs, 3);
-    assert_eq!(result.sync.topics_synced["tm_test"].finalized_graphs, 0);
+    assert_eq!(result.sync.cost.courier_not_found_memo_hits, 1, "{result:?}");
+    assert_eq!(result.stop_reason, "no_progress", "{result:?}");
+    let topic = &result.sync.topics_synced["tm_test"];
+    assert_eq!(topic.unanchorable_graphs, 0, "{result:?}");
+    assert_eq!(topic.finalized_graphs, 0);
+    assert!(f_store
+        .get_deferred_graph("https://budget.example", "tm_test", &f_roots[2])
+        .await
+        .unwrap()
+        .is_none());
+    for root in &f_roots[..2] {
+        let record = f_store
+            .get_deferred_graph("https://budget.example", "tm_test", root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (record.reason.as_str(), record.faults),
+            ("retry:fault:not_found", 1),
+            "{root}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -52,6 +52,13 @@ pub const RESERVE: &str = "UPDATE gasp_fault_memo SET retries=?4, next_at=?5
 pub const READMIT: &str =
     "DELETE FROM gasp_fault_memo WHERE topic=?1 AND outpoint=?2 RETURNING outpoint";
 pub const COUNT: &str = "SELECT COUNT(*) AS rows FROM gasp_fault_memo";
+/// Engine 0.1.15 (#56): the absence facts recorded in the last day (by the
+/// row's `first_at`),
+/// and how many of them are struck (`unanchorable:not_found` or dead). One
+/// pass over the memo, which its row bound limits, as `COUNT` above.
+pub const PEER_ABSENT_24H: &str = "SELECT COUNT(*) AS recorded,
+    COALESCE(SUM(unanchorable=1 OR dead=1), 0) AS struck FROM gasp_fault_memo
+    WHERE class='not_found' AND first_at>=unixepoch()-86400";
 
 // Fault rows written by 0.1.9 through 0.1.13 have no nodes or chunks. Keep
 // malformed/unknown records in the old store for its ordinary error handling.
@@ -283,6 +290,21 @@ pub async fn health(db: &D1Database) -> Result<u64, String> {
         .map_or(0, |r| r.rows))
 }
 
+/// `gaspPeerAbsent24h` (engine 0.1.15): the absence facts the peers' word
+/// (or the rungs' beside it) recorded in the last day, and those struck.
+pub async fn peer_absent_24h(db: &D1Database) -> Result<serde_json::Value, String> {
+    #[derive(Deserialize)]
+    struct Absent {
+        recorded: u64,
+        struck: u64,
+    }
+    let row = Query::new(PEER_ABSENT_24H)
+        .fetch_optional::<Absent>(db)
+        .await?;
+    let (recorded, struck) = row.map_or((0, 0), |r| (r.recorded, r.struck));
+    Ok(serde_json::json!({"recorded": recorded, "struck": struck}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +365,29 @@ mod tests {
 
     fn count(db: &Connection) -> usize {
         db.query_row(COUNT, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn absence_0115_sql_counts_the_days_absences_and_the_struck() {
+        let db = sqlite();
+        let mut counting = memo(1);
+        counting.unanchorable = false;
+        counting.cursor_passable = false;
+        put(&db, &counting);
+        put(&db, &memo(2));
+        let mut courier = memo(3);
+        courier.class = "courier".into();
+        put(&db, &courier);
+        put(&db, &memo(4));
+        db.execute(
+            "UPDATE gasp_fault_memo SET first_at=unixepoch()-90000 WHERE score=4",
+            [],
+        )
+        .unwrap();
+        let (recorded, struck): (u64, u64) = db
+            .query_row(PEER_ABSENT_24H, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((recorded, struck), (2, 1));
     }
 
     #[test]

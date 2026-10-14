@@ -20,6 +20,10 @@ pub struct SyncCost {
     pub storage_writes: u64,
     pub d1_queries: u64,
     pub courier_not_found_memo_hits: u64,
+    /// Requests the peers' remembered absence saved (engine 0.1.15): an
+    /// input the peer answered it does not hold, needed again in the same
+    /// sync, or a root whose counted absence waits out its gap or backoff.
+    pub peer_absent_memo_hits: u64,
     pub ms: u64,
     pub outputs_walked: u64,
     pub ms_per_1000_outputs: Option<u64>,
@@ -37,6 +41,9 @@ impl SyncCost {
             courier_not_found_memo_hits: self
                 .courier_not_found_memo_hits
                 .saturating_sub(before.courier_not_found_memo_hits),
+            peer_absent_memo_hits: self
+                .peer_absent_memo_hits
+                .saturating_sub(before.peer_absent_memo_hits),
             ms: self.ms.saturating_sub(before.ms),
             outputs_walked: self.outputs_walked.saturating_sub(before.outputs_walked),
             ms_per_1000_outputs: None,
@@ -62,6 +69,9 @@ impl SyncCost {
         self.courier_not_found_memo_hits = self
             .courier_not_found_memo_hits
             .saturating_add(other.courier_not_found_memo_hits);
+        self.peer_absent_memo_hits = self
+            .peer_absent_memo_hits
+            .saturating_add(other.peer_absent_memo_hits);
         self.ms = self.ms.saturating_add(other.ms);
         self.outputs_walked = self.outputs_walked.saturating_add(other.outputs_walked);
         self.refresh_speed();
@@ -160,6 +170,9 @@ pub fn d1_queries(count: u64) {
 }
 pub fn not_found_memo_hit() {
     note(|v| v.courier_not_found_memo_hits += 1);
+}
+pub fn peer_absent_memo_hit() {
+    note(|v| v.peer_absent_memo_hits += 1);
 }
 
 /// Twelve courier HTTP attempts at at most 1,000 ms each fit in a 15,000 ms
