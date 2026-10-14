@@ -1122,6 +1122,12 @@ pub fn verify_record_post(
                         txid: held_content_key(&m),
                         output_index: 0,
                         sig_hex: Some(hex::encode(&m.sig)),
+                        // bsv-low #492/#512 (loop 25 I5): the held filing's own
+                        // paying txid, so the overlay's `ls_collected` reader
+                        // serves it and a client can rebuild `heldChallenge`.
+                        // The write binds it from the `Held` variant's String
+                        // (`COLLECTED_FILE_SQL`), unchanged.
+                        pay_txid: Some(pay_txid.clone()),
                     },
                     pay_txid,
                 ));
@@ -1148,6 +1154,9 @@ pub fn verify_record_post(
                 txid: collected_content_key(&m),
                 output_index: 0,
                 sig_hex: Some(hex::encode(&m.sig)),
+                // The v1 marker signs `collectedChallenge` (no txid): no payout
+                // named, so the row's `payTxid` is NULL.
+                pay_txid: None,
             }))
         }
         RecordKind::Hopsweep => {
@@ -2962,6 +2971,7 @@ pub(crate) mod tests {
             txid: "filed:x".into(),
             output_index: 0,
             sig_hex: None,
+            pay_txid: None,
         };
         let (rows_sql, binds, day_sql, day_id) = cap_queries(&VerifiedRecord::Collected(r));
         assert_eq!(rows_sql, COLLECTED_FILED_ROWS_SQL);

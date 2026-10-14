@@ -63,6 +63,16 @@ pub struct CollectedRecord {
     /// CLIENT-side only.
     #[serde(rename = "sigHex")]
     pub sig_hex: Option<String>,
+    /// bsv-low #492/#512 (loop 25 I5): the paying transaction a v2 HELD filing
+    /// (`LOW/collected/v2`) names in its `heldChallenge`
+    /// (`LOW-collected\nv2\ngid=…\nid=…\ntxid=<payTxid>`), lowercase hex. It
+    /// mirrors the nullable `collected_markers_v2.payTxid` column. ADDITIVE and
+    /// `None` for a v1 marker (which signs `collectedChallenge`, no txid): the
+    /// filing door already verified the signature over this txid at write, and
+    /// a querying client re-derives the v2 challenge from it to verify the row
+    /// under its own identity (nothing is trusted on the index's word).
+    #[serde(rename = "payTxid", default)]
+    pub pay_txid: Option<String>,
 }
 
 /// `ls_collected` query shapes — tagged JSON, e.g.
@@ -205,6 +215,7 @@ mod tests {
             txid: txid.into(),
             output_index,
             sig_hex: Some(sig_hex.into()),
+            pay_txid: None,
         }
     }
 
