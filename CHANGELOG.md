@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.1.11] - 2026-10-14
+
+- Strike a held record whose resume faults. A RESUMED pass dropped by a fault
+  of a striking class (`courier`, `not_served`, `verification`) at the
+  `not_held` or `idle_faults` drop counts a faulted run on the record's own
+  slot, as for a fresh root: `faults`, the reason `retry:fault:<class>`, its
+  score kept. At `UNANCHORABLE_AFTER_FAULTED_RUNS` (3) it is
+  `unanchorable:<class>` and waits `UNANCHORABLE_RETRY_SECS` (6 h); a later
+  success clears it. On 0.1.10 such a resume was dropped and saved again as
+  it was on every run, named `courier` with `faults 0`, never struck.
+  - A record the cursor had passed stays passable while it counts its runs.
+  - The struck record frees its deferred slot and is held under
+    `FAULT_RECORDS_PER_PEER_TOPIC`; in the held loop the keys not yet read
+    count as fault records. A strike refused there is counted and named as
+    in 0.1.10, and the record is dropped as before.
+  - A pass that never got the root (the peer no longer serves it) is left to
+    0.1.10's idle rule. A peer's fault of the moment is never a strike.
+- Make the idle count fire on every ending. A resumed pass that asked the
+  peer and kept no node counts one idle resume whether it ended in its own
+  save, a drop or an error. On 0.1.10 the count after a drop read the
+  sync's appended nodes, which the root appended and then thrown away with
+  the drop had raised, so it never fired. A strike takes precedence. The
+  sync's accounting carries `idle_counted` (records counted this run), and
+  the tick's summary line carries `idle_counted=`.
+- Give the page its share of the slice. The resumes of one pass share one
+  deadline of `resume_share_ms` = min(the per-peer budget times
+  `RESUMES_SHARE_OF_PEER_BUDGET_PERCENT` (33) / 100, the graph budget):
+  9,900 ms on the worker's 30,000 ms and 15,000 ms. It starts with the held
+  loop, so the storage's calls between resumes are inside it. The page keeps
+  the rest. A record reached after the share is held back for the next sync:
+  not resumed, not a failed UTXO, not stalled, not an idle resume. An
+  unanchorable record inside its backoff is not counted held back.
+- **DEPLOYMENT NOTE:** No migration, new variable or dependency pin. The
+  records written by 0.1.8 to 0.1.10 are read as they are (`reason "retry"`,
+  no `idleResumes`, no `faults`). A struck obligation's JSON carries `faults`
+  and, at three, `retryAt`, as 0.1.9's fault records do. Rolling back to
+  0.1.10 is safe for the store; 0.1.10 reads a struck obligation as a fault
+  record, and its next strike of one still under three runs clears the
+  passable flag, so that root holds the cursor until its third run. The
+  keeper sets both workspace versions and internal floors for release.
+
 ## [0.1.10] - 2026-10-14
 
 - Give the strike room of its own. A fault record (`retry:fault:<class>` or
