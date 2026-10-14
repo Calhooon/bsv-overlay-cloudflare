@@ -4944,6 +4944,15 @@ impl Engine {
     /// Without a factory, peer discovery still runs but no actual sync occurs
     /// (backwards-compatible with the previous discovery-only behavior).
     pub async fn start_gasp_sync(&self) -> Result<GASPSyncResult, EngineError> {
+        self.start_gasp_sync_filtered(&crate::sync_load::SyncFilter::default())
+            .await
+    }
+
+    /// Run selected topic/peer pairs; explicit peers bypass network discovery.
+    pub async fn start_gasp_sync_filtered(
+        &self,
+        filter: &crate::sync_load::SyncFilter,
+    ) -> Result<GASPSyncResult, EngineError> {
         use crate::gasp::{GASPSync, ENGINE_GASP_SYNC_PAGE_LIMIT};
         use crate::gasp_overlay::OverlayGASPStorage;
 
@@ -4951,6 +4960,8 @@ impl Engine {
             info!("[GASP SYNC] No sync configuration — nothing to sync");
             return Ok(GASPSyncResult {
                 topics_synced: HashMap::new(),
+                filter: filter.clone(),
+                topics_filtered: Vec::new(),
             });
         }
 
@@ -4969,7 +4980,16 @@ impl Engine {
                     .is_some_and(|peers| !peers.is_empty()))
         });
 
+        let mut topics_filtered = Vec::new();
         for (topic, target) in topic_order {
+            if filter
+                .topics
+                .as_ref()
+                .is_some_and(|names| !names.contains(topic))
+            {
+                topics_filtered.push(topic.clone());
+                continue;
+            }
             // A CONFIGURED topic's peers are reserved part of a storage's
             // deferred-graph ceiling (bsv-low #555, the delta-2 fold's D2-M2).
             let configured_peers = matches!(target, SyncTarget::Peers(_));
@@ -4980,9 +5000,12 @@ impl Engine {
                 }
                 SyncTarget::Ship => {
                     info!("[GASP SYNC] Topic {topic} configured for SHIP discovery");
-                    let peers = self
-                        .discover_ship_peers(topic, &mut ship_lookup_hosts)
-                        .await;
+                    let peers = if let Some(peers) = &filter.peers {
+                        self.ship_peers_excluding_self(peers.clone())
+                    } else {
+                        self.discover_ship_peers(topic, &mut ship_lookup_hosts)
+                            .await
+                    };
                     info!(
                         "[GASP SYNC] Discovered {} peer(s) for topic {topic}",
                         peers.len()
@@ -5014,6 +5037,12 @@ impl Engine {
                 }
             };
 
+            let (peers, peers_filtered): (Vec<_>, Vec<_>) = peers.into_iter().partition(|peer| {
+                filter
+                    .peers
+                    .as_ref()
+                    .is_none_or(|names| names.contains(peer))
+            });
             let mut errors = Vec::new();
             let mut pruned_inputs: u64 = 0;
             let mut discarded_graphs: u64 = 0;
@@ -5502,6 +5531,7 @@ impl Engine {
                     cursor_held_by,
                     expired_refused,
                     peers,
+                    peers_filtered,
                     sync_type,
                     errors,
                     pruned_inputs,
@@ -5544,7 +5574,11 @@ impl Engine {
         if refused > 0 {
             info!("[GASP SYNC] gaspStrikesRefused={refused}");
         }
-        Ok(GASPSyncResult { topics_synced })
+        Ok(GASPSyncResult {
+            topics_synced,
+            filter: filter.clone(),
+            topics_filtered,
+        })
     }
 
     /// Drain `sink` and submit every finalized graph in it, ancestors first
@@ -6059,6 +6093,10 @@ impl crate::gasp::FinalizedGraphHook for SubmitAsFinalized<'_> {
 /// Returned by `Engine::start_gasp_sync()` to summarize what happened.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GASPSyncResult {
+    #[serde(default)]
+    pub filter: crate::sync_load::SyncFilter,
+    #[serde(default)]
+    pub topics_filtered: Vec<String>,
     /// Per-topic sync results.
     pub topics_synced: HashMap<String, TopicSyncResult>,
 }
@@ -6066,6 +6104,8 @@ pub struct GASPSyncResult {
 /// Sync result for a single topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicSyncResult {
+    #[serde(default)]
+    pub peers_filtered: Vec<String>,
     /// Root proof status after successful anchor validation and finalization.
     #[serde(default)]
     pub roots_proven: u64,
@@ -8104,6 +8144,63 @@ mod tests {
         assert_eq!(topic_result.peers[0], "https://peer2.example.com");
     }
 
+    #[tokio::test]
+    async fn load_0112_filter_selects_only_named_topic_and_peer() {
+        let calls = std::rc::Rc::default();
+        let mut engine = Engine::new(
+            HashMap::new(),
+            HashMap::new(),
+            Box::new(MemoryStorage::new()),
+            None,
+            EngineConfig {
+                sync_configuration: ["tm_alpha", "tm_beta"]
+                    .into_iter()
+                    .map(|t| {
+                        (
+                            t.to_string(),
+                            SyncTarget::Peers(vec![
+                                "https://a.example".into(),
+                                "https://b.example".into(),
+                            ]),
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        engine.set_gasp_remote_factory(Box::new(RecordingDiscoverySyncFactory {
+            calls: std::rc::Rc::clone(&calls),
+        }));
+        let filter = crate::sync_load::SyncFilter::parse(
+            r#"{"topics":["tm_beta"],"peers":["https://b.example"]}"#,
+        )
+        .unwrap();
+        let result = engine.start_gasp_sync_filtered(&filter).await.unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            vec![("https://b.example".into(), "tm_beta".into())]
+        );
+        assert_eq!(result.topics_synced.len(), 1);
+        calls.borrow_mut().clear();
+        engine.start_gasp_sync().await.unwrap();
+        assert_eq!(calls.borrow().len(), 4);
+        calls.borrow_mut().clear();
+        engine
+            .start_gasp_sync_filtered(&crate::sync_load::SyncFilter {
+                topics: Some(vec![]),
+                peers: None,
+            })
+            .await
+            .unwrap();
+        assert!(calls.borrow().is_empty());
+        assert!(crate::sync_load::SyncFilter::parse(r#"{"peers":"bad"}"#).is_err());
+        assert!(crate::sync_load::SyncFilter::parse("null").is_err());
+        assert_eq!(
+            crate::sync_load::SyncFilter::parse("  ").unwrap(),
+            crate::sync_load::SyncFilter::default()
+        );
+    }
+
     #[derive(Clone, Default)]
     struct MockShipLookupClient {
         records: HashMap<(String, String), Vec<OutputListItem>>,
@@ -8561,6 +8658,7 @@ mod tests {
         topics_synced.insert(
             "tm_test".to_string(),
             super::TopicSyncResult {
+                peers_filtered: Vec::new(),
                 roots_proven: 0,
                 roots_unproven: 0,
                 cursor_held_by: Vec::new(),
@@ -8590,7 +8688,11 @@ mod tests {
             },
         );
 
-        let result = super::GASPSyncResult { topics_synced };
+        let result = super::GASPSyncResult {
+            topics_synced,
+            filter: Default::default(),
+            topics_filtered: Vec::new(),
+        };
         let json = serde_json::to_string(&result).unwrap();
         let back: super::GASPSyncResult = serde_json::from_str(&json).unwrap();
 

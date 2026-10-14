@@ -3390,11 +3390,15 @@ pub async fn admin_sync_advertisements(engine: &Engine) -> worker::Result<Respon
 /// caller hangs up inside a submit (it ran 114 s and 240 s live, #257). A
 /// sync the belt drops answers 504: what it finalized before that is
 /// admitted and its cursors are persisted per peer, as on the cron.
-pub async fn admin_start_gasp_sync(engine: &Engine) -> worker::Result<Response> {
+pub async fn admin_start_gasp_sync(engine: &Engine, mut req: Request) -> worker::Result<Response> {
     worker::console_log!("POST /admin/startGASPSync");
+    let filter = match overlay_engine::sync_load::SyncFilter::parse(&req.text().await?) {
+        Ok(filter) => filter,
+        Err(_) => return json_error("Expected optional topics and peers arrays of strings", 400),
+    };
 
     let Some(outcome) = overlay_engine::gasp::race_or_deadline_guarded(
-        engine.start_gasp_sync(),
+        engine.start_gasp_sync_filtered(&filter),
         crate::broadcaster::sleep_ms(crate::GASP_SYNC_BUDGET_MS),
         engine.finalize_submit_gate(),
     )
