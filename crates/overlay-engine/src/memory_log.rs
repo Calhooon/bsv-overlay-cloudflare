@@ -235,17 +235,8 @@ impl MemoryStorage {
         // Keep only keys on the landing stack. A full BEEF per stack frame
         // would multiply a large carried body by the predecessor bound.
         let mut pending = vec![(walked.txid.clone(), walked.tagged_beef.topics.clone())];
-        let mut attempts = 0;
         let mut landed = Vec::new();
         while let Some((txid, topics)) = pending.last() {
-            attempts += 1;
-            if attempts > 257 {
-                return Err(AdmitRefusal::not_now(
-                    "predecessor_not_landed",
-                    "landing allowance exhausted",
-                )
-                .into());
-            }
             let carried_unit;
             let unit = if txid == &walked.txid {
                 walked
@@ -273,6 +264,7 @@ impl MemoryStorage {
                     evidence: walked.evidence.clone(),
                     charge: walked.charge,
                     could_not_run: None,
+                    predecessor_reads: walked.predecessor_reads.clone(),
                 };
                 &carried_unit
             };

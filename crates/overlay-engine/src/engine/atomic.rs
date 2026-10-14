@@ -156,6 +156,7 @@ impl Engine {
             evidence,
             charge: charge as u64,
             could_not_run,
+            predecessor_reads: Default::default(),
         })
     }
 
@@ -307,8 +308,8 @@ impl Engine {
                         .map(|o| format!("{}.{}", o.txid, o.output_index))
                         .collect(),
                 );
-                let mut reads = 0;
-                if let Some(wait) = self
+                let mut reads = walked.predecessor_reads.get();
+                let wait = self
                     .unlanded_predecessor(
                         &tx,
                         txid,
@@ -321,8 +322,9 @@ impl Engine {
                         None,
                         Some(log),
                     )
-                    .await
-                {
+                    .await;
+                walked.predecessor_reads.set(reads);
+                if let Some(wait) = wait {
                     let predecessor = wait
                         .carried
                         .filter(|id| {

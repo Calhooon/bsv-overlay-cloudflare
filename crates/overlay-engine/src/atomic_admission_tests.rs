@@ -1311,3 +1311,25 @@ fn a1_c9_trap_rolls_back_and_poisons_instance() {
     }));
     assert!(matches!(runner_answer.unwrap_err().downcast_ref::<LogError>(), Some(LogError::AnswerLost)));
 }
+
+#[tokio::test]
+async fn a1_c10_predecessor_allowance_spans_topics_and_attempts() {
+    let (_, store, _, mut beef, parent) = fixture().await;
+    beef.topics = (0..130).map(|n| format!("tm_bound_{n}")).collect();
+    let mut managers = HashMap::new();
+    for topic in &beef.topics {
+        managers.insert(topic.clone(), Box::new(ChainManager) as Box<dyn TopicManager>);
+        store.insert_applied_transaction(&AppliedTransaction { txid: parent.clone(), topic: topic.clone() }).await.unwrap();
+    }
+    let engine = Engine::new(managers, HashMap::new(), Box::new(store.clone()), None, EngineConfig::default());
+    let walked = engine.walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence).await.unwrap();
+    let first = store.transaction::<(), _>(&walked.txid, &walked.evidence, || async {
+        engine.admit(&walked).await.unwrap();
+        Err(AdmitRefusal::transient("test", "retry the same submit"))
+    });
+    assert!(first.is_err());
+    let second = store.transaction(&walked.txid, &walked.evidence, || engine.admit(&walked));
+    assert!(matches!(second, Err(LogError::Refused(AdmitRefusal::NotNow { site, reason, .. }))
+        if site == "predecessor_not_landed" && reason.contains("256 reads")), "read allowance must survive topic and attempt boundaries");
+    assert_eq!(store.log_head(), 0);
+}

@@ -84,6 +84,9 @@ pub struct Walked {
     pub evidence: AdmitEvidence,
     pub charge: u64,
     pub could_not_run: Option<WalkCouldNotRun>,
+    /// Shared by every topic and carried landing attempt for this submit.
+    #[serde(skip)]
+    pub predecessor_reads: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
 #[async_trait(?Send)]
