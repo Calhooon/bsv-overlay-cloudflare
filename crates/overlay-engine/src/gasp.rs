@@ -1358,11 +1358,24 @@ impl<'a> GASPSync<'a> {
         self.cursor_yielded.get()
     }
 
-    /// New durable holds the last `sync` saved (a walk past its budget, or
-    /// the graph in flight at the per-peer deadline): work the cursor may
-    /// pass because the next sync resumes it.
+    /// New durable holds the last `sync` saved holding at least one node
+    /// the peer served (a walk past its budget, or the graph in flight at
+    /// the per-peer deadline): work the cursor may pass because the next
+    /// sync resumes it. A hold of nothing is not counted: the peer served
+    /// no node of it (the hung peer of bsv-low #555's H1).
     pub fn graphs_retained(&self) -> u64 {
         self.retained.get()
+    }
+
+    /// Whether the last `sync` did work beyond finalizing a graph or moving
+    /// the cursor (engine 0.1.8): it refused an expired root not refused
+    /// before, retained a graph or resumed one with progress. Such a sync is
+    /// never a failed attempt. Only the refusal also ends the yieldless
+    /// streak (see `Engine::start_gasp_sync`).
+    pub fn did_work(&self) -> bool {
+        self.expired_refused.get() > 0
+            || self.retained.get() > 0
+            || self.resumed_with_progress.get() > 0
     }
 
     /// Held graphs the last `sync` resumed that appended at least one node
@@ -2546,7 +2559,7 @@ impl<'a> GASPSync<'a> {
             Ok(DeferredGraphSave::Saved) => {
                 if !walk.resumed {
                     self.held_records.set(self.held_records.get() + 1);
-                    if !retry {
+                    if !retry && !walk.record.nodes.is_empty() {
                         self.retained.set(self.retained.get() + 1);
                     }
                 } else if walk.record.nodes.len() > walk.nodes_at_start {

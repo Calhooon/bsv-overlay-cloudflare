@@ -5241,10 +5241,21 @@ impl Engine {
                             // (the lens fold's H1: a hung peer deferred with
                             // 0 nodes on every tick and was never
                             // quarantined).
+                            //
+                            // Engine 0.1.8: the deadline drop itself is not a
+                            // failure of the peer. The per-peer deadline is
+                            // OUR slice of the tick, set by our cadence and
+                            // the Worker's limits; a peer that served every
+                            // page and node we asked for until it fell due
+                            // did not fail. What the slice did is the test:
+                            // a sync that refused an expired root, retained
+                            // a graph or resumed one with progress did work
+                            // too (`GASPSync::did_work`).
                             advanced_cursor = completed > last_interaction;
                             outcome_success = peer_finalized.get() > 0
                                 || (completed > last_interaction && sync.cursor_yielded())
-                                || sync.deferral_stats().progressed > 0;
+                                || sync.deferral_stats().progressed > 0
+                                || sync.did_work();
                             warn!(
                                 "[GASP SYNC] {peer_url} for {topic} at the deadline: finalized_graphs={} deadline_dropped_graphs={in_flight} cursor {last_interaction} -> {} (bsv-low #552)",
                                 peer_finalized.get(),
@@ -5272,6 +5283,7 @@ impl Engine {
                             if stats.stalled > 0
                                 && stats.progressed == 0
                                 && peer_finalized.get() == 0
+                                && !sync.did_work()
                                 && !(landed
                                     && sync.last_interaction > last_interaction
                                     && sync.cursor_yielded())
@@ -5335,6 +5347,28 @@ impl Engine {
                             errors.push(msg);
                         }
                     }
+                    // Engine 0.1.8: work is not a failure. A sync that
+                    // finalized a graph, moved the cursor past what it
+                    // finished, refused an expired root not refused before,
+                    // retained a graph or resumed one with progress is never
+                    // a failed attempt (a peer is quarantined for being
+                    // dead, never for our cadence), even if it then faulted.
+                    //
+                    // The YIELD that ends the yieldless streak (and alone
+                    // lifts a quarantine, D4-L2) is the narrower set: a
+                    // finalized graph, a moved cursor, a refusal. A held or
+                    // resumed walk is the peer's word until its anchor is
+                    // checked: counted as a yield, a peer that lists one
+                    // fabricated root a tick, serves it and hangs on its
+                    // input would never be quarantined (bsv-low #555's D-M2).
+                    // Such syncs stay inside the yieldless allowance (12
+                    // syncs and 3 h), which an honest deep graph converges in.
+                    let yielded = peer_finalized.get() > 0
+                        || (advanced_cursor && sync.cursor_yielded())
+                        || sync.expired_refused() > 0;
+                    if yielded || sync.did_work() {
+                        outcome_success = true;
+                    }
                     // bsv-low #555, the delta fold's D-M2: "progress" (a node
                     // appended) is the peer's word. A sync the peer served
                     // work that finalized no graph and moved no cursor is
@@ -5345,36 +5379,35 @@ impl Engine {
                     // count; a fault of the count is fail-safe (no failure).
                     // Only with a per-graph budget: without one nothing is
                     // deferred and #302's rule is unchanged.
-                    if ran && self.graph_budget.is_some() {
-                        let yielded =
-                            peer_finalized.get() > 0 || (advanced_cursor && sync.cursor_yielded());
-                        if yielded || sync.graphs_attempted() > 0 {
-                            match self
-                                .storage
-                                .record_peer_sync_yield(&health_key, topic, yielded)
-                                .await
+                    if ran
+                        && self.graph_budget.is_some()
+                        && (yielded || sync.graphs_attempted() > 0)
+                    {
+                        match self
+                            .storage
+                            .record_peer_sync_yield(&health_key, topic, yielded)
+                            .await
+                        {
+                            Ok(streak)
+                                if !yielded
+                                    && crate::gasp::yieldless_sync_failed(&streak)
+                                    && outcome_success =>
                             {
-                                Ok(streak)
-                                    if !yielded
-                                        && crate::gasp::yieldless_sync_failed(&streak)
-                                        && outcome_success =>
-                                {
-                                    outcome_success = false;
-                                    let msg = format!(
-                                        "{peer_url}: {} consecutive syncs over {} s finalized no graph and moved no cursor (past {} and {} s; bsv-low #555)",
-                                        streak.yieldless_syncs,
-                                        streak.secs_since_first.unwrap_or(0),
-                                        crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED,
-                                        crate::gasp::PEER_YIELDLESS_SECS_ALLOWED
-                                    );
-                                    warn!("[GASP SYNC] {msg}");
-                                    errors.push(msg);
-                                }
-                                Ok(_) => {}
-                                Err(e) => warn!(
-                                    "[GASP SYNC] failed to record the yield of {peer_url}/{topic}: {e}"
-                                ),
+                                outcome_success = false;
+                                let msg = format!(
+                                    "{peer_url}: {} consecutive syncs over {} s finalized no graph and moved no cursor (past {} and {} s; bsv-low #555)",
+                                    streak.yieldless_syncs,
+                                    streak.secs_since_first.unwrap_or(0),
+                                    crate::gasp::PEER_YIELDLESS_SYNCS_ALLOWED,
+                                    crate::gasp::PEER_YIELDLESS_SECS_ALLOWED
+                                );
+                                warn!("[GASP SYNC] {msg}");
+                                errors.push(msg);
                             }
+                            Ok(_) => {}
+                            Err(e) => warn!(
+                                "[GASP SYNC] failed to record the yield of {peer_url}/{topic}: {e}"
+                            ),
                         }
                     }
                     if !advanced_cursor {
@@ -5415,7 +5448,7 @@ impl Engine {
                     // its yieldless streak: 100 of 200 ticks. A health read
                     // that faulted read 0 failures: the old rule, fail-safe.
                     if outcome_success
-                        && !(peer_finalized.get() > 0 || (advanced_cursor && sync.cursor_yielded()))
+                        && !yielded
                         && self.graph_budget.is_some()
                         && health.consecutive_failures >= crate::gasp::PEER_QUARANTINE_THRESHOLD
                     {
@@ -9054,6 +9087,116 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
+    }
+
+    /// Every root's advert expired (the walk refuses each after its node).
+    struct ExpiredRoots(MockTopicManager);
+
+    #[async_trait(?Send)]
+    impl TopicManagerTrait for ExpiredRoots {
+        async fn identify_admissible_outputs(
+            &self,
+            tx: &Transaction,
+            previous_coins: &[u8],
+            off_chain_values: Option<&[u8]>,
+            mode: SubmitMode,
+            context: &TopicAdmittanceContext,
+        ) -> Result<AdmittanceInstructions, TopicManagerError> {
+            self.0
+                .identify_admissible_outputs(tx, previous_coins, off_chain_values, mode, context)
+                .await
+        }
+        async fn get_documentation(&self) -> String {
+            self.0.get_documentation().await
+        }
+        async fn get_metadata(&self) -> ServiceMetadata {
+            self.0.get_metadata().await
+        }
+        fn sync_expiry(&self, _: &bsv_rs::script::LockingScript) -> Option<u64> {
+            Some(1)
+        }
+    }
+
+    /// A page of dead adverts above one root the peer cannot serve (a gap
+    /// the cursor holds below), on a shared store.
+    fn dead_page_engine(count: u32) -> (Engine, BudgetPageRemote, std::rc::Rc<MemoryStorage>) {
+        let (mut engine, mut remote) = budget_page_engine(count);
+        let gap = remote.outputs[0].txid.clone();
+        std::rc::Rc::make_mut(&mut remote.nodes).remove(&gap);
+        engine.managers.insert(
+            "tm_test".to_string(),
+            Box::new(ExpiredRoots(MockTopicManager::admitting(vec![0]))),
+        );
+        let store = std::rc::Rc::new(MemoryStorage::new());
+        engine.storage = Box::new(store.clone());
+        engine.set_graph_budget(
+            std::rc::Rc::new(|_| Box::pin(std::future::pending())),
+            100,
+            60_000,
+        );
+        (engine, remote, store)
+    }
+
+    /// 0.1.8: a sync that only refused expired adverts (the cursor held by
+    /// a gap below them) did work: a yield, never a step of the yieldless
+    /// streak. On 0.1.7 it was yieldless.
+    #[tokio::test]
+    async fn cursor_018_a_sync_that_only_refuses_the_dead_is_a_yield() {
+        let (mut engine, mut remote, store) = dead_page_engine(3);
+        remote.node_cost_ms = 0;
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.expired_refused, 2);
+        assert_eq!(topic.finalized_graphs, 0);
+        assert!(topic.cursor_moves.is_empty());
+        let host = crate::gasp::peer_origin("https://budget.example");
+        assert_eq!(store.peer_yieldless_syncs(&host, "tm_test"), 0);
+        let health = store.get_peer_sync_health(&host, "tm_test").await.unwrap();
+        assert_eq!(health.consecutive_failures, 0);
+    }
+
+    /// 0.1.8: a peer that served every page and every node, whose slice
+    /// the per-peer deadline ended in each of nine runs in a row while it
+    /// refused dead adverts (the cursor held by a gap below them), is never
+    /// quarantined: each run did work. On 0.1.7 each was a failed attempt
+    /// and the ninth was skipped.
+    #[tokio::test]
+    async fn cursor_018_deadline_drops_in_a_row_do_not_quarantine_a_serving_peer() {
+        let (mut engine, remote, store) = dead_page_engine(200);
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        let host = crate::gasp::peer_origin("https://budget.example");
+        let runs = crate::gasp::PEER_QUARANTINE_THRESHOLD + 1;
+        for run in 1..=runs {
+            let asked = remote.asked.borrow().len();
+            let result = engine.start_gasp_sync().await.unwrap();
+            let topic = &result.topics_synced["tm_test"];
+            assert!(remote.asked.borrow().len() > asked, "run {run}: attempted");
+            assert_eq!(topic.deadline_dropped_graphs, 1, "run {run}");
+            assert!(topic.expired_refused > 0, "run {run}: {topic:?}");
+            assert!(topic.cursor_moves.is_empty(), "run {run}: the gap holds");
+            let health = store.get_peer_sync_health(&host, "tm_test").await.unwrap();
+            assert_eq!(health.consecutive_failures, 0, "run {run}");
+        }
+        // A refused root is never fetched again. The one root fetched twice
+        // per cut is the graph in flight: its answer was lost with the slice
+        // and its hold is resumed (and refused) by the next run.
+        let asked = remote.asked.borrow();
+        let mut dead: Vec<&String> = asked
+            .iter()
+            .filter(|t| **t != remote.outputs[0].txid)
+            .collect();
+        let fetched = dead.len();
+        dead.sort();
+        dead.dedup();
+        assert_eq!(
+            fetched - dead.len(),
+            (runs - 1) as usize,
+            "one per resumed cut"
+        );
+        assert_eq!(store.expired_outpoints("tm_test").len(), dead.len() - 1);
     }
 
     #[tokio::test]
