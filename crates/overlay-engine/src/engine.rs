@@ -5035,6 +5035,8 @@ impl Engine {
             let mut unanchorable_graphs: u64 = 0;
             let mut unanchorable_cleared: u64 = 0;
             let mut strikes_refused: u64 = 0;
+            let mut backed_off_graphs: u64 = 0;
+            let mut waiting_graphs: u64 = 0;
             let mut faulted_roots: Vec<crate::gasp::FaultedRoot> = Vec::new();
 
             // If we have a remote factory, actually run GASP sync
@@ -5426,6 +5428,8 @@ impl Engine {
                     converged_graphs += deferral.converged;
                     stalled_graphs += deferral.stalled;
                     held_back_graphs += deferral.held_back;
+                    backed_off_graphs += deferral.backed_off;
+                    waiting_graphs += deferral.waiting;
                     dropped_graphs.extend(deferral.dropped.into_iter().map(|d| DroppedDeferral {
                         peer: peer_url.clone(),
                         outpoint: d.outpoint,
@@ -5503,6 +5507,8 @@ impl Engine {
                     dropped_graphs,
                     stalled_graphs,
                     held_back_graphs,
+                    backed_off_graphs,
+                    waiting_graphs,
                     unanchorable_graphs,
                     unanchorable_cleared,
                     strikes_refused,
@@ -6143,6 +6149,16 @@ pub struct TopicSyncResult {
     /// the next sync, untouched.
     #[serde(default)]
     pub held_back_graphs: u64,
+    /// Held records this sync sent to the long backoff (engine 0.1.10,
+    /// `gasp::IDLE_RESUMES_BEFORE_BACKOFF`): resumed that many passes in a
+    /// row with no node appended, not resumed again for
+    /// `gasp::IDLE_RESUME_RETRY_SECS`.
+    #[serde(default)]
+    pub backed_off_graphs: u64,
+    /// Held records this sync did not resume because they wait out that
+    /// backoff: no request, the cursor passes them (engine 0.1.10).
+    #[serde(default)]
+    pub waiting_graphs: u64,
     /// Roots recorded UNANCHORABLE in this sync (engine 0.1.9,
     /// `GASPSync::unanchorable_recorded`): their walk faulted in
     /// `gasp::UNANCHORABLE_AFTER_FAULTED_RUNS` consecutive runs; the cursor
@@ -8548,6 +8564,8 @@ mod tests {
                 dropped_graphs: Vec::new(),
                 stalled_graphs: 0,
                 held_back_graphs: 0,
+                backed_off_graphs: 0,
+                waiting_graphs: 0,
                 unanchorable_graphs: 0,
                 unanchorable_cleared: 0,
                 strikes_refused: 0,
@@ -9550,6 +9568,7 @@ mod tests {
             cursor_passable: passable,
             faults: 0,
             retry_at: 0,
+            idle_resumes: 0,
         }
     }
 
@@ -9695,6 +9714,167 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// 0.1.10 (the churn bounded): sixteen root retry obligations the peer
+    /// no longer serves (fact 3: `held:retry`, nodes 0) took every run's
+    /// slice on 0.1.9, resumed ahead of the page, appending nothing, so the
+    /// page's fresh roots were never walked. Each now goes to the long
+    /// backoff after `IDLE_RESUMES_BEFORE_BACKOFF` idle resumes, is asked
+    /// nothing while it waits, and stays held; the page is walked.
+    #[tokio::test]
+    async fn room_0110_idle_obligations_back_off_and_the_page_is_walked() {
+        let (mut engine, mut remote) = budget_page_engine(3);
+        remote.node_cost_ms = 2000;
+        let store = std::rc::Rc::new(MemoryStorage::new());
+        engine.storage = Box::new(store.clone());
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_graph_budget(
+            std::rc::Rc::new(|_| Box::pin(std::future::pending())),
+            100,
+            60_000,
+        );
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        let obligations =
+            hold_obligations(&engine, crate::gasp::DEFERRED_GRAPHS_PER_PEER_TOPIC).await;
+        let idle = crate::gasp::IDLE_RESUMES_BEFORE_BACKOFF;
+        // The witness of 0.1.9: each run's slice goes to the obligations
+        // (15 resumed, nothing appended, the last of them cut in flight by
+        // the per-peer deadline) and the page is never reached.
+        for run in 1..=idle {
+            let result = engine.start_gasp_sync().await.unwrap();
+            let topic = &result.topics_synced["tm_test"];
+            assert_eq!(topic.finalized_graphs, 0, "run {run}: {topic:?}");
+            assert!(topic.cursor_moves.is_empty(), "run {run}");
+            assert_eq!(topic.resumed_graphs, 15, "run {run}");
+            assert_eq!(topic.waiting_graphs, 0, "run {run}");
+            let expect = if run == idle { 15 } else { 0 };
+            assert_eq!(topic.backed_off_graphs, expect, "run {run}: {topic:?}");
+        }
+        // The fifteen wait; the slice reaches the page.
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.waiting_graphs, 15, "{topic:?}");
+        assert_eq!(topic.finalized_graphs, 3, "the page's fresh roots");
+        assert_eq!(topic.cursor_moves.len(), 1, "{topic:?}");
+        assert_eq!(topic.cursor_moves[0].to, 30);
+        // The last one follows; then every obligation waits, asked nothing.
+        let mut backed_off = 15;
+        for _ in 0..idle {
+            let result = engine.start_gasp_sync().await.unwrap();
+            backed_off += result.topics_synced["tm_test"].backed_off_graphs;
+        }
+        assert_eq!(backed_off, obligations.len() as u64);
+        let asked = remote.asked.borrow().len();
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.waiting_graphs, obligations.len() as u64, "{topic:?}");
+        assert_eq!(topic.resumed_graphs, 0);
+        assert!(topic.dropped_graphs.is_empty(), "{topic:?}");
+        assert_eq!(remote.asked.borrow().len(), asked, "no request");
+        // Kept, not deleted (bsv-low #555's resume), each on its backoff.
+        let now = (current_timestamp_ms() / 1000.0) as u64;
+        let held = store.deferred_graphs();
+        assert_eq!(held.len(), obligations.len());
+        for record in &held {
+            assert!(obligations.contains(&record.outpoint));
+            assert!(record.cursor_passable);
+            assert!(record.idle_resumes >= idle, "{record:?}");
+            assert!(record.retry_at > now, "{record:?}");
+        }
+    }
+
+    /// 0.1.10: a record waiting out its idle backoff whose root is
+    /// remembered expired (0.1.8's memo, keyed by topic: any peer's walk that
+    /// refused it) is swept at the next sync ahead of the backoff gate, with
+    /// no request: refused and deleted, counted in `dropped_graphs`
+    /// (`refused`). A record that holds its root node is refused the same
+    /// way from that node; one holding nothing is refused at its next
+    /// resume, when its root is fetched.
+    #[tokio::test]
+    async fn room_0110_a_waiting_record_whose_root_expired_is_swept() {
+        let (mut engine, remote) = budget_page_engine(1);
+        let store = std::rc::Rc::new(MemoryStorage::new());
+        engine.storage = Box::new(store.clone());
+        engine.set_graph_budget(
+            std::rc::Rc::new(|_| Box::pin(std::future::pending())),
+            100,
+            60_000,
+        );
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        let now = (current_timestamp_ms() / 1000.0) as u64;
+        let mut waiting = bare_record(0, 1, "retry", true);
+        waiting.idle_resumes = crate::gasp::IDLE_RESUMES_BEFORE_BACKOFF;
+        waiting.retry_at = now + 3600;
+        let dead = bare_record(1, 2, "retry", true);
+        let mut dead_waiting = dead.clone();
+        dead_waiting.idle_resumes = crate::gasp::IDLE_RESUMES_BEFORE_BACKOFF;
+        dead_waiting.retry_at = now + 3600;
+        for record in [&waiting, &dead_waiting] {
+            engine.storage().put_deferred_graph(record).await.unwrap();
+        }
+        engine
+            .storage()
+            .remember_expired_outpoint("tm_test", &dead.outpoint, 1)
+            .await
+            .unwrap();
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.waiting_graphs, 1, "{topic:?}");
+        assert_eq!(
+            topic
+                .dropped_graphs
+                .iter()
+                .map(|d| (d.outpoint.as_str(), d.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(dead.outpoint.as_str(), "refused")]
+        );
+        let held: Vec<String> = store
+            .deferred_graphs()
+            .into_iter()
+            .map(|r| r.outpoint)
+            .collect();
+        assert_eq!(held, vec![waiting.outpoint.clone()]);
+        let asked = remote.asked.borrow();
+        assert!(!asked.iter().any(|t| dead.outpoint.starts_with(t.as_str())));
+        assert!(!asked
+            .iter()
+            .any(|t| waiting.outpoint.starts_with(t.as_str())));
+    }
+
+    /// 0.1.10: a resume that appends a node resets the idle resumes (and
+    /// any backoff), so a record that progresses is never backed off.
+    #[tokio::test]
+    async fn room_0110_a_resume_that_appends_a_node_resets_the_count() {
+        let UnanchorableFixture {
+            mut engine,
+            remote,
+            store,
+            root,
+            ..
+        } = unanchorable_fixture();
+        // One node a pass: the root is appended and its walk deferred.
+        engine.set_graph_budget_limbs(u64::MAX, 1);
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let mut record = bare_record(0, 10, "retry", true);
+        record.outpoint.clone_from(&root);
+        record.pending[0].outpoint.clone_from(&root);
+        record.pending[0].graph_id.clone_from(&root);
+        record.idle_resumes = crate::gasp::IDLE_RESUMES_BEFORE_BACKOFF - 1;
+        engine.storage().put_deferred_graph(&record).await.unwrap();
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.resumed_graphs, 1, "{topic:?}");
+        assert_eq!(topic.backed_off_graphs, 0);
+        let held = store
+            .get_deferred_graph("https://budget.example", "tm_test", &root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.nodes.len(), 1, "{held:?}");
+        assert_eq!(held.reason, "nodes");
+        assert_eq!(held.idle_resumes, 0);
+        assert_eq!(held.retry_at, 0);
     }
 
     #[tokio::test]

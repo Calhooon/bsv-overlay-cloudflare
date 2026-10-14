@@ -514,6 +514,29 @@ pub const UNANCHORABLE_AFTER_FAULTED_RUNS: u32 = 3;
 /// root and clears the record; nothing is admitted unanchored (T2).
 pub const UNANCHORABLE_RETRY_SECS: u64 = 6 * 3600;
 
+/// A held (passable) record resumed this many CONSECUTIVE passes with no
+/// node appended goes to the long backoff (engine 0.1.10): it is not resumed
+/// again until [`IDLE_RESUME_RETRY_SECS`] have passed, so the resumes' shared
+/// budget goes to records that progress and the peer's slice to its page.
+/// Three, the deadline rule's number ([`DEADLINE_STALL_DEFERRAL_RUNS`]) and
+/// the idle-fault rule's ([`DEFERRED_GRAPH_MAX_IDLE_FAULTS`]): one empty
+/// pass is the moment's (a slow peer, a budget the earlier resumes spent),
+/// three in a row, each with a fresh slice, are the record's own. On 0.1.9 a
+/// root retry obligation the peer no longer serves (fact 3 of the 0.1.10
+/// brief: 14 of them, `nodes 0`, `not_held` on every run) was resumed on
+/// every tick for ever, and they took the slice the page's fresh roots
+/// needed. A resume that appends a node resets the count; one past the
+/// backoff that appends nothing goes back to it at once.
+pub const IDLE_RESUMES_BEFORE_BACKOFF: u32 = 3;
+
+/// How long a record sent to the long backoff waits before its next resume:
+/// [`UNANCHORABLE_RETRY_SECS`] (six hours), as an unanchorable root does, for
+/// the same reason: what it lacks (a peer that serves the root again, a
+/// proof, an ancestor) lands on that scale or not at all. The record is
+/// kept (bsv-low #555's resume: its cursor may have passed it) and costs
+/// four resumes a day instead of 1,440.
+pub const IDLE_RESUME_RETRY_SECS: u64 = UNANCHORABLE_RETRY_SECS;
+
 /// The reason prefix of a root's record while its fault streak is under
 /// [`UNANCHORABLE_AFTER_FAULTED_RUNS`]: not passable, the cursor holds.
 pub const FAULT_RETRY_REASON: &str = "retry:fault:";
@@ -753,6 +776,13 @@ pub struct DeferredGraph {
     /// ([`UNANCHORABLE_RETRY_SECS`]); 0 otherwise.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub retry_at: u64,
+    /// Consecutive passes that RESUMED this held record and appended no node
+    /// (engine 0.1.10): at [`IDLE_RESUMES_BEFORE_BACKOFF`] the record waits
+    /// [`IDLE_RESUME_RETRY_SECS`] (its `retry_at`) before its next resume; a
+    /// pass that appends a node resets it. 0 in every other record (and not
+    /// written, so their JSON is unchanged).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub idle_resumes: u32,
 }
 
 // serde's `skip_serializing_if` passes the field by reference.
@@ -777,6 +807,14 @@ impl DeferredGraph {
     /// Whether this record holds an unanchorable root (passable).
     pub fn is_unanchorable(&self) -> bool {
         self.is_struck() && self.reason.starts_with(UNANCHORABLE_REASON)
+    }
+
+    /// Whether this held record waits out the long backoff of its idle
+    /// resumes at `now` (engine 0.1.10): not resumed, the cursor passes it.
+    /// A fault record keeps its own backoff, a record that holds the cursor
+    /// is never backed off.
+    pub fn waits_idle(&self, now: u64) -> bool {
+        !self.is_struck() && self.cursor_passable && now < self.retry_at
     }
 
     /// The fault class the record names, if it counts faulted runs.
@@ -894,6 +932,13 @@ pub struct DeferralStats {
     /// spent their shared budget (the lens fold's M1); held, untouched, for
     /// the next sync.
     pub held_back: u64,
+    /// Records sent to the long backoff by this sync (engine 0.1.10): their
+    /// resume appended no node [`IDLE_RESUMES_BEFORE_BACKOFF`] passes in a
+    /// row.
+    pub backed_off: u64,
+    /// Records NOT resumed by this sync because they wait out that backoff
+    /// (no request at all; the cursor passes them).
+    pub waiting: u64,
 }
 
 impl Walk {
@@ -983,6 +1028,9 @@ enum Ingested {
     /// An unanchorable root, held (engine 0.1.9): recorded at this walk, or
     /// a record whose backoff has not run out. The cursor passes it.
     Unanchorable,
+    /// A held record that waits out the long backoff of its idle resumes
+    /// (engine 0.1.10): not resumed, no request. The cursor passes it.
+    Waiting,
 }
 
 /// What a strike did (engine 0.1.10): the record that holds the count
@@ -1461,6 +1509,13 @@ pub struct GASPSync<'a> {
     fault_keys_unread: std::cell::Cell<bool>,
     /// See [`Self::strikes_refused`].
     strikes_refused: std::cell::Cell<u64>,
+    /// The idle resumes counted on the held record the resume in hand read
+    /// (engine 0.1.10), before its pass: what its pass adds one to when it
+    /// appends nothing. `None` for any other walk.
+    resume_idle: std::cell::Cell<Option<u32>>,
+    /// The pass in hand counted its idle resume in its own save
+    /// ([`Self::save_walk`]), so nothing is counted after it.
+    idle_counted: std::cell::Cell<bool>,
     /// The walk of the graph in hand (see [`Walk`]).
     walk: std::cell::RefCell<Option<Walk>>,
     /// See [`Self::deferral_stats`].
@@ -1529,6 +1584,8 @@ impl<'a> GASPSync<'a> {
             fault_records: std::cell::RefCell::default(),
             fault_keys_unread: std::cell::Cell::new(false),
             strikes_refused: std::cell::Cell::new(0),
+            resume_idle: std::cell::Cell::new(None),
+            idle_counted: std::cell::Cell::new(false),
             walk: std::cell::RefCell::new(None),
             stats: std::cell::RefCell::new(DeferralStats::default()),
             graphs_attempted: std::cell::Cell::new(0),
@@ -2236,7 +2293,12 @@ impl<'a> GASPSync<'a> {
                     self.cursor_yielded.set(true);
                     true
                 }
-                Ok(Ingested::Deferred | Ingested::HeldBack | Ingested::Unanchorable) => true,
+                Ok(
+                    Ingested::Deferred
+                    | Ingested::HeldBack
+                    | Ingested::Unanchorable
+                    | Ingested::Waiting,
+                ) => true,
                 Ok(Ingested::Retry) => false,
                 Err(error) => {
                     warn!(
@@ -2389,9 +2451,12 @@ impl<'a> GASPSync<'a> {
                             }
                             landed.map(|()| true)
                         }
-                        Ok(Ingested::Deferred | Ingested::HeldBack | Ingested::Unanchorable) => {
-                            Ok(true)
-                        }
+                        Ok(
+                            Ingested::Deferred
+                            | Ingested::HeldBack
+                            | Ingested::Unanchorable
+                            | Ingested::Waiting,
+                        ) => Ok(true),
                         Ok(Ingested::Retry) => Ok(false),
                         Err(e) => {
                             self.walk.borrow_mut().take();
@@ -2541,6 +2606,8 @@ impl<'a> GASPSync<'a> {
     /// All resumed graphs share one allowance; fresh graphs retain theirs.
     async fn ingest_utxo(&self, utxo: &GASPOutput, outpoint: &str) -> Result<Ingested, GASPError> {
         self.last_fault.set(None);
+        self.resume_idle.set(None);
+        self.idle_counted.set(false);
         if self.expired.borrow().contains(outpoint) {
             return self.refuse_expired(outpoint).await;
         }
@@ -2574,13 +2641,19 @@ impl<'a> GASPSync<'a> {
         let cap = self.resume_left.get();
         if cap.spent() || Self::due(&mut deadline).await {
             *self.resume_deadline.borrow_mut() = Some(deadline);
+            let record = self.storage.get_deferred_graph(outpoint).await?;
+            self.read_record(record.as_ref());
+            if record
+                .as_ref()
+                .is_some_and(|r| r.waits_idle(Self::now_secs()))
+            {
+                return Ok(self.wait_idle(outpoint));
+            }
             self.stats.borrow_mut().held_back += 1;
             info!(
                 "{} Deferred graph {} held back: the resumes of this pass spent their budget (bsv-low #555)",
                 self.log_prefix, outpoint
             );
-            let record = self.storage.get_deferred_graph(outpoint).await?;
-            self.read_record(record.as_ref());
             let Some(mut record) = record else {
                 return Ok(Ingested::Retry);
             };
@@ -2608,6 +2681,19 @@ impl<'a> GASPSync<'a> {
         let ingested = self
             .ingest_budgeted(utxo, outpoint, &mut deadline, cap, true)
             .await;
+        // Engine 0.1.10: a held record's resume that asked the peer,
+        // appended no node and did not finish counts one more idle resume.
+        // Its own save counted it; a pass whose record was dropped and saved
+        // again as a fresh obligation (`drop_record`) counts it here.
+        if let Some(prior) = self.resume_idle.take() {
+            let idle = self.calls_made.get() > before.0 && self.nodes_appended.get() == before.2;
+            if idle
+                && !self.idle_counted.get()
+                && !matches!(ingested, Ok(Ingested::Completed | Ingested::Expired))
+            {
+                self.idle_resume(outpoint, prior).await;
+            }
+        }
         let narrowed = |spent: u64| u32::try_from(spent).unwrap_or(u32::MAX);
         self.resume_left.set(PassCap {
             calls: cap
@@ -2622,6 +2708,54 @@ impl<'a> GASPSync<'a> {
         });
         *self.resume_deadline.borrow_mut() = Some(deadline);
         ingested
+    }
+
+    /// A held record not resumed: it waits out the long backoff of its idle
+    /// resumes (engine 0.1.10). Not asked of the peer: not an attempt for
+    /// the yieldless streak, as an unanchorable root inside its backoff.
+    fn wait_idle(&self, outpoint: &str) -> Ingested {
+        self.graphs_attempted
+            .set(self.graphs_attempted.get().saturating_sub(1));
+        self.stats.borrow_mut().waiting += 1;
+        debug!(
+            "{} Deferred graph {} waits out its idle backoff (engine 0.1.10)",
+            self.log_prefix, outpoint
+        );
+        Ingested::Waiting
+    }
+
+    /// Count one more idle resume on the held record of `outpoint` after a
+    /// pass that did not save it (engine 0.1.10): `prior` is what it counted
+    /// when its pass read it, so a record the pass dropped and saved again as
+    /// a fresh obligation (`drop_record`) counts on from there. At
+    /// [`IDLE_RESUMES_BEFORE_BACKOFF`] it goes to the long backoff. A record
+    /// gone, a fault record or one that holds the cursor is left alone.
+    async fn idle_resume(&self, outpoint: &str, prior: u32) {
+        let Ok(Some(mut record)) = self.storage.get_deferred_graph(outpoint).await else {
+            return;
+        };
+        if record.is_struck() || !record.cursor_passable {
+            return;
+        }
+        record.idle_resumes = prior.saturating_add(1);
+        let backoff = record.idle_resumes >= IDLE_RESUMES_BEFORE_BACKOFF;
+        if backoff {
+            record.retry_at = Self::now_secs() + IDLE_RESUME_RETRY_SECS;
+        }
+        match self.storage.save_deferred_graph(&record).await {
+            Ok(DeferredGraphSave::Saved) if backoff => {
+                self.stats.borrow_mut().backed_off += 1;
+                info!(
+                    "{} Deferred graph {} resumed {} passes in a row with no node appended: not resumed for {} s (engine 0.1.10)",
+                    self.log_prefix, outpoint, record.idle_resumes, IDLE_RESUME_RETRY_SECS
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
+                "{} Could not count an idle resume of deferred graph {}: {}",
+                self.log_prefix, outpoint, e
+            ),
+        }
     }
 
     /// Whether `deadline` has fallen due (polled once, with the task's own
@@ -2655,6 +2789,7 @@ impl<'a> GASPSync<'a> {
                 cursor_passable: false,
                 faults: 0,
                 retry_at: 0,
+                idle_resumes: 0,
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
@@ -2706,6 +2841,15 @@ impl<'a> GASPSync<'a> {
                     self.deferred.borrow_mut().insert(outpoint.to_string());
                     return self.refuse_expired(outpoint).await;
                 }
+            }
+            // Engine 0.1.10: a held record past its idle resumes waits out
+            // the long backoff (an expired root it holds was refused above,
+            // with no request); else its pass counts on from what it holds.
+            if record.cursor_passable {
+                if record.waits_idle(Self::now_secs()) {
+                    return Ok(self.wait_idle(outpoint));
+                }
+                self.resume_idle.set(Some(record.idle_resumes));
             }
         }
         let walk = match record {
@@ -3125,7 +3269,30 @@ impl<'a> GASPSync<'a> {
         };
         if walk.record.nodes.len() > walk.nodes_at_start {
             walk.record.idle_faults = 0;
+            // A pass that appends a node resets the idle resumes (0.1.10).
+            walk.record.idle_resumes = 0;
+            walk.record.retry_at = 0;
         }
+        // Engine 0.1.10: a RESUMED pass of a held record that asked the peer
+        // and appended nothing counts one idle resume in this save; at the
+        // bound the record waits out the long backoff.
+        let backing_off = if walk.resumed
+            && was_held
+            && walk.struck.is_none()
+            && !completed
+            && walk.calls_this_pass > 0
+            && walk.record.nodes.len() <= walk.nodes_at_start
+        {
+            self.idle_counted.set(true);
+            walk.record.idle_resumes = walk.record.idle_resumes.saturating_add(1);
+            let due = walk.record.idle_resumes >= IDLE_RESUMES_BEFORE_BACKOFF;
+            if due {
+                walk.record.retry_at = Self::now_secs() + IDLE_RESUME_RETRY_SECS;
+            }
+            due
+        } else {
+            false
+        };
         // Empty walks qualify only after repeated deadline cuts. The small
         // retry record uses the same per-peer and global storage ceilings.
         // A quick fresh fault still earns no record.
@@ -3159,6 +3326,13 @@ impl<'a> GASPSync<'a> {
                 }
                 if !retry {
                     self.stats.borrow_mut().deferred += 1;
+                }
+                if backing_off {
+                    self.stats.borrow_mut().backed_off += 1;
+                    info!(
+                        "{} Deferred graph {} resumed {} passes in a row with no node appended: not resumed for {} s (engine 0.1.10)",
+                        self.log_prefix, outpoint, walk.record.idle_resumes, IDLE_RESUME_RETRY_SECS
+                    );
                 }
                 info!(
                     "{} DEFERRED graph {} ({}): {} nodes, {} pending, {} calls ({} this pass), pass {}, {} bytes (bsv-low #555)",
@@ -3525,6 +3699,7 @@ impl<'a> GASPSync<'a> {
                 cursor_passable: false,
                 faults: 0,
                 retry_at: 0,
+                idle_resumes: 0,
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
