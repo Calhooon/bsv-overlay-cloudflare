@@ -469,12 +469,12 @@ impl LookupPayloads<'_> {
         let txid = self.txid;
         match mode {
             SpendNotificationMode::None => OutputSpent::None {
-                txid: prev_output.txid.to_owned(),
+                txid: prev_output.txid.clone(),
                 output_index: prev_output.output_index,
                 topic: topic.to_owned(),
             },
             SpendNotificationMode::Txid => OutputSpent::Txid {
-                txid: prev_output.txid.to_owned(),
+                txid: prev_output.txid.clone(),
                 output_index: prev_output.output_index,
                 topic: topic.to_owned(),
                 spending_txid: txid.to_owned(),
@@ -488,7 +488,7 @@ impl LookupPayloads<'_> {
                     .map(bsv_rs::UnlockingScript::to_binary)
                     .unwrap_or_default();
                 OutputSpent::Script {
-                    txid: prev_output.txid.to_owned(),
+                    txid: prev_output.txid.clone(),
                     output_index: prev_output.output_index,
                     topic: topic.to_owned(),
                     spending_txid: txid.to_owned(),
@@ -499,7 +499,7 @@ impl LookupPayloads<'_> {
                 }
             }
             SpendNotificationMode::WholeTx => OutputSpent::WholeTx {
-                txid: prev_output.txid.to_owned(),
+                txid: prev_output.txid.clone(),
                 output_index: prev_output.output_index,
                 topic: topic.to_owned(),
                 spending_atomic_beef: self.atomic_beef.to_vec(),

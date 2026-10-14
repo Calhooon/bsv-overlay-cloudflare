@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-overlay-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bsv-rs",
