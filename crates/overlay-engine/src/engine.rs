@@ -5032,6 +5032,9 @@ impl Engine {
             let mut dropped_graphs: Vec<DroppedDeferral> = Vec::new();
             let mut stalled_graphs: u64 = 0;
             let mut held_back_graphs: u64 = 0;
+            let mut unanchorable_graphs: u64 = 0;
+            let mut unanchorable_cleared: u64 = 0;
+            let mut faulted_roots: Vec<crate::gasp::FaultedRoot> = Vec::new();
 
             // If we have a remote factory, actually run GASP sync
             if let Some(ref factory) = self.gasp_remote_factory {
@@ -5427,6 +5430,13 @@ impl Engine {
                         outpoint: d.outpoint,
                         reason: d.reason.as_str().to_string(),
                     }));
+                    // Engine 0.1.9: the roots dropped, each with why.
+                    unanchorable_graphs += sync.unanchorable_recorded();
+                    unanchorable_cleared += sync.unanchorable_cleared();
+                    faulted_roots.extend(sync.faulted_roots().into_iter().map(|mut f| {
+                        f.peer.clone_from(peer_url);
+                        f
+                    }));
 
                     // bsv-low#302: record the attempt outcome (success resets
                     // the consecutive-failure count; timeout/error increments
@@ -5490,6 +5500,9 @@ impl Engine {
                     dropped_graphs,
                     stalled_graphs,
                     held_back_graphs,
+                    unanchorable_graphs,
+                    unanchorable_cleared,
+                    faulted_roots,
                 },
             );
         }
@@ -5502,6 +5515,10 @@ impl Engine {
         let expired: u64 = topics_synced.values().map(|r| r.expired_refused).sum();
         if expired > 0 {
             info!("[GASP SYNC] gaspExpiredRefused={expired}");
+        }
+        let unanchorable: u64 = topics_synced.values().map(|r| r.unanchorable_graphs).sum();
+        if unanchorable > 0 {
+            info!("[GASP SYNC] gaspUnanchorable={unanchorable}");
         }
         Ok(GASPSyncResult { topics_synced })
     }
@@ -6118,6 +6135,24 @@ pub struct TopicSyncResult {
     /// the next sync, untouched.
     #[serde(default)]
     pub held_back_graphs: u64,
+    /// Roots recorded UNANCHORABLE in this sync (engine 0.1.9,
+    /// `GASPSync::unanchorable_recorded`): their walk faulted in
+    /// `gasp::UNANCHORABLE_AFTER_FAULTED_RUNS` consecutive runs; the cursor
+    /// passes them, and each is walked again after
+    /// `gasp::UNANCHORABLE_RETRY_SECS`. Nothing of them is admitted.
+    #[serde(default)]
+    pub unanchorable_graphs: u64,
+    /// Roots with a fault record that this sync walked again and admitted,
+    /// or refused on a verdict: their record cleared (engine 0.1.9).
+    #[serde(default)]
+    pub unanchorable_cleared: u64,
+    /// Every root a peer's sync dropped in this run, once per (peer, root),
+    /// named with its fault class, its faulted runs and whether it is now
+    /// unanchorable (engine 0.1.9, `GASPSync::faulted_roots`). With
+    /// `cursor_held_by` (what is neither finished nor held) the captain
+    /// reads why the cursor stopped or moved.
+    #[serde(default)]
+    pub faulted_roots: Vec<crate::gasp::FaultedRoot>,
 }
 
 /// A deferred graph's record deleted without converging (bsv-low #555,
@@ -8499,6 +8534,9 @@ mod tests {
                 dropped_graphs: Vec::new(),
                 stalled_graphs: 0,
                 held_back_graphs: 0,
+                unanchorable_graphs: 0,
+                unanchorable_cleared: 0,
+                faulted_roots: Vec::new(),
             },
         );
 
@@ -9176,7 +9214,15 @@ mod tests {
             assert!(remote.asked.borrow().len() > asked, "run {run}: attempted");
             assert_eq!(topic.deadline_dropped_graphs, 1, "run {run}");
             assert!(topic.expired_refused > 0, "run {run}: {topic:?}");
-            assert!(topic.cursor_moves.is_empty(), "run {run}: the gap holds");
+            // 0.1.9: the gap is a root the peer lists and does not serve
+            // (`not_served`); its third faulted run records it unanchorable
+            // and the cursor passes it.
+            if run < u64::from(crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS) {
+                assert!(topic.cursor_moves.is_empty(), "run {run}: the gap holds");
+            } else if run == u64::from(crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS) {
+                assert_eq!(topic.unanchorable_graphs, 1, "run {run}: {topic:?}");
+                assert!(!topic.cursor_moves.is_empty(), "run {run}: passed");
+            }
             let health = store.get_peer_sync_health(&host, "tm_test").await.unwrap();
             assert_eq!(health.consecutive_failures, 0, "run {run}");
         }
@@ -9197,6 +9243,271 @@ mod tests {
             "one per resumed cut"
         );
         assert_eq!(store.expired_outpoints("tm_test").len(), dead.len() - 1);
+    }
+
+    /// A courier that serves ONE ancestor, and only once told to (engine
+    /// 0.1.9): before, every rung "could not serve" it.
+    struct GatedCourier {
+        txid: String,
+        raw_tx: String,
+        proof: String,
+        serve: std::rc::Rc<Cell<bool>>,
+        asked: std::rc::Rc<Cell<u64>>,
+    }
+
+    #[async_trait(?Send)]
+    impl AncestorFetcher for GatedCourier {
+        async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
+            self.asked.set(self.asked.get() + 1);
+            if self.serve.get() && txid == self.txid {
+                Ok(FetchedAncestor {
+                    raw_tx: self.raw_tx.clone(),
+                    proof: Some(self.proof.clone()),
+                })
+            } else {
+                Err(GASPError::RemoteError(format!(
+                    "no rung served the raw of {txid}"
+                )))
+            }
+        }
+        async fn verified_proof_for(&self, _: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// The fixture of 0.1.9: a page of three (scores 10, 20, 30) whose
+    /// lowest root is served UNPROVEN, so its walk needs its parent, which
+    /// only the courier can serve (a mined parent, proven at height 900).
+    struct UnanchorableFixture {
+        engine: Engine,
+        remote: BudgetPageRemote,
+        store: std::rc::Rc<MemoryStorage>,
+        root: String,
+        serve: std::rc::Rc<Cell<bool>>,
+        asked: std::rc::Rc<Cell<u64>>,
+    }
+
+    fn unanchorable_fixture() -> UnanchorableFixture {
+        let (mut engine, mut remote) = budget_page_engine(3);
+        remote.node_cost_ms = 0;
+        let parent = child_of(&format!("{:064x}", 0xab), 0);
+        let child = child_of(&parent.id(), 0);
+        let mut tracker = bsv_rs::transaction::MockChainTracker::new(1000);
+        for n in 1..=3u32 {
+            tracker.add_root(n, child_of(&format!("{n:064x}"), 0).id());
+        }
+        tracker.add_root(900, parent.id());
+        engine.chain_tracker = Some(Box::new(tracker));
+        let replaced = std::mem::replace(
+            &mut std::rc::Rc::make_mut(&mut remote.outputs)[0].txid,
+            child.id(),
+        );
+        let nodes = std::rc::Rc::make_mut(&mut remote.nodes);
+        nodes.remove(&replaced);
+        nodes.insert(
+            child.id(),
+            crate::types::GASPNode {
+                graph_id: String::new(),
+                raw_tx: child.to_hex(),
+                output_index: 0,
+                proof: None,
+                tx_metadata: None,
+                output_metadata: None,
+                inputs: None,
+            },
+        );
+        let serve = std::rc::Rc::new(Cell::new(false));
+        let asked = std::rc::Rc::new(Cell::new(0));
+        engine.set_gasp_ancestor_fetcher(std::rc::Rc::new(GatedCourier {
+            txid: parent.id(),
+            raw_tx: parent.to_hex(),
+            proof: single_leaf_bump_hex(&parent.id(), 900),
+            serve: serve.clone(),
+            asked: asked.clone(),
+        }));
+        let store = std::rc::Rc::new(MemoryStorage::new());
+        engine.storage = Box::new(store.clone());
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_graph_budget(
+            std::rc::Rc::new(|_| Box::pin(std::future::pending())),
+            100,
+            60_000,
+        );
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        UnanchorableFixture {
+            engine,
+            remote,
+            store,
+            root: format!("{}.0", child.id()),
+            serve,
+            asked,
+        }
+    }
+
+    /// 0.1.9 (unanchorable): a root whose ancestor the courier cannot serve
+    /// faults three runs in a row; each run names it with its class
+    /// (`courier`) and holds the cursor below it until the third, which
+    /// records it `unanchorable:courier` and passes the cursor to the page's
+    /// last finished score. Inside its backoff it costs no request. A later
+    /// run in which the courier serves the ancestor admits it and clears the
+    /// record. On 0.1.8 the cursor stayed at 0 on every run (fact 2: the
+    /// keeper's hand).
+    #[tokio::test]
+    async fn unanchorable_019_a_root_faulted_three_runs_is_recorded_passed_and_admitted_later() {
+        let UnanchorableFixture {
+            engine,
+            remote,
+            store,
+            root,
+            serve,
+            asked,
+        } = unanchorable_fixture();
+        let host = "https://budget.example";
+        let runs = crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS;
+        for run in 1..=runs {
+            let result = engine.start_gasp_sync().await.unwrap();
+            let topic = &result.topics_synced["tm_test"];
+            assert_eq!(topic.faulted_roots.len(), 1, "run {run}: {topic:?}");
+            let named = &topic.faulted_roots[0];
+            assert_eq!(
+                (named.peer.as_str(), named.outpoint.as_str()),
+                (host, root.as_str())
+            );
+            assert_eq!(named.class, crate::gasp::fault_class::COURIER);
+            assert_eq!(named.faults, run, "run {run}");
+            assert!(named.error.contains("no rung served"), "{named:?}");
+            let record = engine
+                .storage()
+                .get_deferred_graph(host, "tm_test", &root)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.faults, run);
+            assert!(record.nodes.is_empty(), "the root alone, asked again");
+            if run < runs {
+                assert!(!named.unanchorable);
+                assert_eq!(topic.unanchorable_graphs, 0);
+                assert_eq!(record.reason, "retry:fault:courier");
+                assert!(!record.cursor_passable);
+                assert!(topic.cursor_moves.is_empty(), "run {run}: the gap holds");
+                assert_eq!(topic.cursor_held_by, vec![root.clone()]);
+            } else {
+                assert!(named.unanchorable);
+                assert_eq!(topic.unanchorable_graphs, 1);
+                assert_eq!(record.reason, "unanchorable:courier");
+                assert!(record.cursor_passable);
+                assert!(record.retry_at > (current_timestamp_ms() / 1000.0) as u64);
+                assert_eq!(topic.cursor_moves.len(), 1);
+                assert_eq!(
+                    topic.cursor_moves[0].to, 30,
+                    "the page's last finished score"
+                );
+                assert!(topic.cursor_held_by.is_empty(), "{topic:?}");
+            }
+            if run == 1 {
+                assert_eq!(topic.finalized_graphs, 2, "20 and 30");
+            }
+        }
+
+        // Inside the backoff: the root is not asked of the peer or the
+        // courier, nothing is named, and the quiet run is no attempt.
+        let (courier_asks, node_asks) = (asked.get(), remote.asked.borrow().len());
+        let streak = store.peer_yieldless_syncs(&crate::gasp::peer_origin(host), "tm_test");
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert!(topic.faulted_roots.is_empty(), "{topic:?}");
+        assert!(topic.cursor_held_by.is_empty());
+        assert_eq!(topic.unanchorable_graphs, 0);
+        assert_eq!(asked.get(), courier_asks);
+        assert_eq!(remote.asked.borrow().len(), node_asks);
+        assert_eq!(
+            store.peer_yieldless_syncs(&crate::gasp::peer_origin(host), "tm_test"),
+            streak
+        );
+
+        // The backoff runs out and the courier serves the ancestor: the
+        // root is admitted as any root and its record is cleared.
+        let mut record = engine
+            .storage()
+            .get_deferred_graph(host, "tm_test", &root)
+            .await
+            .unwrap()
+            .unwrap();
+        record.retry_at = 1;
+        engine.storage().put_deferred_graph(&record).await.unwrap();
+        serve.set(true);
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.finalized_graphs, 1, "{topic:?}");
+        assert_eq!(topic.unanchorable_cleared, 1);
+        assert!(topic.faulted_roots.is_empty());
+        assert!(engine
+            .storage()
+            .get_deferred_graph(host, "tm_test", &root)
+            .await
+            .unwrap()
+            .is_none());
+        let (txid, _) = crate::gasp::parse_outpoint(&root).unwrap();
+        assert!(engine
+            .storage
+            .find_output(&txid, 0, Some("tm_test"), None, true)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// 0.1.9: only the run's LOWEST faulted root starts a fault record (the
+    /// delta fold's D-M1: a peer that faults every node earns one record a
+    /// run, not one per root); the others are named, class and all, and
+    /// stay gaps above it.
+    #[tokio::test]
+    async fn unanchorable_019_only_the_lowest_faulted_root_is_recorded_and_all_are_named() {
+        let (mut engine, mut remote) = budget_page_engine(4);
+        remote.node_cost_ms = 0;
+        let nodes = std::rc::Rc::make_mut(&mut remote.nodes);
+        nodes.remove(&remote.outputs[1].txid);
+        nodes.remove(&remote.outputs[3].txid);
+        let store = std::rc::Rc::new(MemoryStorage::new());
+        engine.storage = Box::new(store.clone());
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_graph_budget(
+            std::rc::Rc::new(|_| Box::pin(std::future::pending())),
+            100,
+            60_000,
+        );
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        let named: Vec<(&str, &str, u32)> = topic
+            .faulted_roots
+            .iter()
+            .map(|f| (f.outpoint.as_str(), f.class.as_str(), f.faults))
+            .collect();
+        let low = format!("{}.0", remote.outputs[1].txid);
+        let high = format!("{}.0", remote.outputs[3].txid);
+        assert_eq!(
+            named,
+            vec![
+                (low.as_str(), crate::gasp::fault_class::NOT_SERVED, 1),
+                (high.as_str(), crate::gasp::fault_class::NOT_SERVED, 0),
+            ]
+        );
+        assert_eq!(topic.cursor_moves[0].to, 10, "below the lower gap");
+        let host = "https://budget.example";
+        assert!(store
+            .get_deferred_graph(host, "tm_test", &high)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .get_deferred_graph(host, "tm_test", &low)
+                .await
+                .unwrap()
+                .unwrap()
+                .reason,
+            "retry:fault:not_served"
+        );
     }
 
     #[tokio::test]
