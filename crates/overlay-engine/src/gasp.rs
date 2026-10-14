@@ -1931,12 +1931,15 @@ impl<'a> GASPSync<'a> {
     }
 
     /// Retire only fault facts whose own advert expired. No remote read.
-    async fn sweep_expired_record(&self, outpoint: &str) -> Result<bool, GASPError> {
-        let record = self.storage.get_deferred_graph(outpoint).await?;
+    async fn sweep_expired_record(
+        &self,
+        record: Option<&DeferredGraph>,
+    ) -> Result<bool, GASPError> {
         let Some(record) = record.filter(|r| r.is_unanchorable() || r.is_dead()) else {
             return Ok(false);
         };
-        self.read_record(Some(&record));
+        let outpoint = record.outpoint.as_str();
+        self.read_record(Some(record));
         if record.expiry.is_none_or(|expiry| expiry > Self::now_secs())
             && !self.expired.borrow().contains(outpoint)
         {
@@ -2595,10 +2598,6 @@ impl<'a> GASPSync<'a> {
                 shared_outpoints.insert(key.outpoint);
                 continue;
             }
-            if self.sweep_expired_record(&key.outpoint).await? {
-                shared_outpoints.insert(key.outpoint);
-                continue;
-            }
             let Some((txid, output_index)) = parse_outpoint(&key.outpoint) else {
                 continue;
             };
@@ -3010,6 +3009,12 @@ impl<'a> GASPSync<'a> {
         self.resume_idle.set(None);
         self.pass_saved.set(false);
         if self.expired.borrow().contains(outpoint) {
+            if self.deferred.borrow().contains(outpoint) {
+                let record = self.storage.get_deferred_graph(outpoint).await?;
+                if self.sweep_expired_record(record.as_ref()).await? {
+                    return Ok(Ingested::Expired);
+                }
+            }
             return self.refuse_expired(outpoint).await;
         }
         debug!("{} Requesting node for {}", self.log_prefix, outpoint);
@@ -3045,6 +3050,9 @@ impl<'a> GASPSync<'a> {
             *self.resume_deadline.borrow_mut() = Some(deadline);
             let record = self.storage.get_deferred_graph(outpoint).await?;
             self.read_record(record.as_ref());
+            if self.sweep_expired_record(record.as_ref()).await? {
+                return Ok(Ingested::Expired);
+            }
             if record
                 .as_ref()
                 .is_some_and(|r| r.waits_idle(Self::now_secs()))
@@ -3253,6 +3261,9 @@ impl<'a> GASPSync<'a> {
         } else {
             None
         };
+        if self.sweep_expired_record(record.as_ref()).await? {
+            return Ok(Ingested::Expired);
+        }
         if record
             .as_ref()
             .is_some_and(|r| (r.is_unanchorable() || r.is_dead()) && r.score != score)
