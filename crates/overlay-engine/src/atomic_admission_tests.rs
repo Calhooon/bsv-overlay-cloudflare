@@ -259,7 +259,7 @@ async fn submit_log(
     beef: &TaggedBEEF,
 ) -> Result<(Steak, MutationReport), LogError> {
     let walked = engine
-        .walk(
+        .walk_with_mode(
             beef,
             SubmitMode::HistoricalTxNoSpv,
             crate::engine::WalkBreachPolicy::NotNow,
@@ -716,7 +716,7 @@ async fn a1_lost_answer_is_ambiguous_and_replay_deduplicates() {
         let (engine, store, index, beef, _) = fixture_refusal(false).await;
         let before = snapshot(&store, &index);
         let walked = engine
-            .walk(
+            .walk_with_mode(
                 &beef,
                 SubmitMode::HistoricalTxNoSpv,
                 crate::engine::WalkBreachPolicy::NotNow,
@@ -749,7 +749,7 @@ async fn a1_missing_evidence_and_notes_are_per_unit() {
     let (engine, store, index, beef, _) = fixture_refusal(false).await;
     let before = snapshot(&store, &index);
     let mut walked = engine
-        .walk(
+        .walk_with_mode(
             &beef,
             SubmitMode::HistoricalTxNoSpv,
             crate::engine::WalkBreachPolicy::NotNow,
@@ -921,7 +921,7 @@ async fn a1_07_carried_body_has_its_own_transaction() {
             EngineConfig::default(),
         );
         let walked = engine
-            .walk(
+            .walk_with_mode(
                 &beef,
                 SubmitMode::HistoricalTxNoSpv,
                 crate::engine::WalkBreachPolicy::NotNow,
@@ -1002,7 +1002,7 @@ async fn a1_03_retained_coin_update_faults_roll_back() {
 async fn a1_walked_payload_is_serializable() {
     let (engine, store, _, beef, _) = fixture_refusal(false).await;
     let walked = engine
-        .walk(
+        .walk_with_mode(
             &beef,
             SubmitMode::HistoricalTxNoSpv,
             crate::engine::WalkBreachPolicy::NotNow,
@@ -1026,7 +1026,7 @@ impl crate::broadcaster::ArcBroadcaster for AcceptingArc {
 }
 
 #[tokio::test]
-async fn a1_current_walk_carries_its_broadcaster_accept_and_admit_never_broadcasts() {
+async fn a1_current_walk_and_admit_never_broadcast() {
     let (_, store, _, original, parent) = fixture().await;
     let parent_row = store
         .find_output(&parent, 0, Some(REGISTRY), None, true)
@@ -1045,7 +1045,7 @@ async fn a1_current_walk_carries_its_broadcaster_accept_and_admit_never_broadcas
     let calls = Rc::new(std::cell::Cell::new(0));
     engine.set_arc_broadcaster(Box::new(AcceptingArc(calls.clone())));
     let walked = engine
-        .walk(
+        .walk_with_mode(
             &beef,
             SubmitMode::CurrentTx,
             crate::engine::WalkBreachPolicy::NotNow,
@@ -1053,16 +1053,9 @@ async fn a1_current_walk_carries_its_broadcaster_accept_and_admit_never_broadcas
         )
         .await
         .unwrap();
-    assert_eq!(calls.get(), 1);
-    assert!(matches!(
-        walked.evidence.tx[&walked.txid].network,
-        Some(NetworkVerdict::Accepted {
-            by: NetworkSource::Broadcaster { .. },
-            ..
-        })
-    ));
+    assert_eq!(calls.get(), 0);
     store.admit(&engine, &walked).unwrap();
-    assert_eq!(calls.get(), 1, "admit must never reach the broadcaster");
+    assert_eq!(calls.get(), 0, "admit must never reach the broadcaster");
     assert_eq!(store.awaited_io(), 0);
 }
 
@@ -1124,4 +1117,29 @@ async fn a1_refusal_order_does_not_depend_on_hashmap_seed() {
         );
         assert_eq!(store.log_head(), 0);
     }
+}
+
+struct UnavailableEvidence;
+#[async_trait(?Send)]
+impl EvidenceSource for UnavailableEvidence {
+    async fn gather(&self, subject: &Transaction, _: &[&Transaction], _: &[String]) -> AdmitEvidence {
+        AdmitEvidence { tx: BTreeMap::from([(subject.id(), TxEvidence {
+            walk: WalkOutcome::Spv,
+            network: Some(NetworkVerdict::Unavailable { reason: "ARC down".into() }),
+            proof: None,
+        })]), ..AdmitEvidence::default() }
+    }
+}
+
+#[tokio::test]
+async fn a1_c1_unavailable_evidence_reaches_log_before_answer() {
+    let (engine, store, _, beef, _) = fixture().await;
+    let walked: Result<Walked, crate::engine::EngineError> = engine.walk(
+        &beef, crate::engine::WalkBreachPolicy::NotNow, &UnavailableEvidence,
+    ).await;
+    let walked = walked.unwrap();
+    assert_eq!(store.log_head(), 0);
+    assert!(matches!(walked.evidence.tx[&walked.txid].network, Some(NetworkVerdict::Unavailable { .. })));
+    // A durable deterministic judgement wins over the unavailable ARC word.
+    refused(&store.admit(&engine, &walked).unwrap_err());
 }

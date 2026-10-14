@@ -100,7 +100,7 @@ async fn log_corpus_completes_in_one_poll_with_the_same_words() {
             );
             for replay in 0..2 {
                 let word = match engine
-                    .walk(&beef, mode, WalkBreachPolicy::NotNow, &NoEvidence)
+                    .walk_with_mode(&beef, mode, WalkBreachPolicy::NotNow, &NoEvidence)
                     .await
                 {
                     Ok(walked) => {

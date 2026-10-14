@@ -10,10 +10,20 @@ impl Engine {
     pub async fn walk(
         &self,
         tagged_beef: &TaggedBEEF,
+        policy: WalkBreachPolicy,
+        source: &dyn EvidenceSource,
+    ) -> Result<Walked, EngineError> {
+        self.walk_with_mode(tagged_beef, SubmitMode::CurrentTx, policy, source).await
+    }
+
+    /// Explicit legacy mode for already verified GASP bodies.
+    pub async fn walk_with_mode(
+        &self,
+        tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
         policy: WalkBreachPolicy,
         source: &dyn EvidenceSource,
-    ) -> Result<Walked, WalkAnswer> {
+    ) -> Result<Walked, EngineError> {
         let (tx, txid, could_not_run) = self
             .walk_transaction(tagged_beef, mode, None, policy)
             .await?;
@@ -57,7 +67,7 @@ impl Engine {
             }
         }
         let mut reads = 0;
-        for id in order.iter().filter(|id| *id != &txid) {
+        'bodies: for id in order.iter().filter(|id| *id != &txid) {
             let mut topics = Vec::new();
             for topic in &tagged_beef.topics {
                 if !self.lands_without_values(topic) {
@@ -65,10 +75,7 @@ impl Engine {
                 }
                 reads += 1;
                 if reads > PREDECESSOR_READS_PER_SUBMIT {
-                    return Err(WalkAnswer::EvidenceUnobtainable {
-                        site: "predecessor_not_landed".into(),
-                        reason: "predecessor read allowance exhausted".into(),
-                    });
+                    break 'bodies;
                 }
                 let applied = self
                     .storage
@@ -77,10 +84,7 @@ impl Engine {
                         topic: topic.clone(),
                     })
                     .await
-                    .map_err(|e| WalkAnswer::EvidenceUnobtainable {
-                        site: "predecessor_read".into(),
-                        reason: e.to_string(),
-                    })?;
+                    ?;
                 if !applied {
                     topics.push(topic.clone());
                 }
@@ -113,7 +117,7 @@ impl Engine {
                     .and_then(bsv_rs::transaction::BeefTx::tx)
             })
             .collect();
-        let mut evidence = source.gather(&tx, &bodies, &tagged_beef.topics).await?;
+        let mut evidence = source.gather(&tx, &bodies, &tagged_beef.topics).await;
         // The host supplies acceptance evidence, never the engine's walk word.
         for (id, walk) in outcomes {
             evidence
@@ -125,62 +129,6 @@ impl Engine {
                     network: None,
                     proof: None,
                 });
-        }
-        if mode == SubmitMode::CurrentTx {
-            let dry = self.storage.admission_dry_run(&evidence).map_err(|e| {
-                WalkAnswer::EvidenceUnobtainable {
-                    site: "dry_judgement".into(),
-                    reason: e.to_string(),
-                }
-            })?;
-            let mut validations = Vec::new();
-            for topic in &tagged_beef.topics {
-                validations.push(
-                    self.validate_topic(
-                        &tx,
-                        &txid,
-                        topic,
-                        tagged_beef.off_chain_values.as_deref(),
-                        mode,
-                        &TopicAdmittanceContext::DRY_RUN,
-                        None,
-                    )
-                    .await,
-                );
-            }
-            if let Some(reason) = dry.failure() {
-                return Err(WalkAnswer::EvidenceUnobtainable {
-                    site: "dry_judgement".into(),
-                    reason,
-                });
-            }
-            drop(dry);
-            let may_admit = validations.iter().any(|v| {
-                !v.is_dupe
-                    && !v.failed
-                    && v.read_fault.is_none()
-                    && !v.admittance.outputs_to_admit.is_empty()
-            });
-            if may_admit {
-                if let Some(accepted_txid) = self
-                    .broadcast_validations(tagged_beef, mode, &tx, &validations)
-                    .await
-                {
-                    if accepted_txid == txid {
-                        evidence
-                            .tx
-                            .get_mut(&txid)
-                            .expect("subject evidence")
-                            .network = Some(NetworkVerdict::Accepted {
-                            by: NetworkSource::Broadcaster {
-                                name: "ARC".into(),
-                                at_ms: current_timestamp_ms() as i64,
-                            },
-                            status: "accepted".into(),
-                        });
-                    }
-                }
-            }
         }
         // Account evidence separately; the existing e592 walk ledger and all
         // its limits remain unchanged. Sidecar bytes themselves never cross.

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bsv_rs::transaction::Transaction;
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{EngineError, MutationReport, WalkBreachPolicy, WalkCouldNotRun};
+use crate::engine::{MutationReport, WalkBreachPolicy, WalkCouldNotRun};
 use crate::storage::{Storage, StorageError};
 use crate::types::{Steak, SubmitMode, TaggedBEEF};
 
@@ -85,14 +85,6 @@ pub struct Walked {
     pub could_not_run: Option<WalkCouldNotRun>,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum WalkAnswer {
-    #[error("{0}")]
-    WalkCouldNotRun(#[from] EngineError),
-    #[error("{site}: {reason}")]
-    EvidenceUnobtainable { site: String, reason: String },
-}
-
 #[async_trait(?Send)]
 pub trait EvidenceSource {
     async fn gather(
@@ -100,7 +92,7 @@ pub trait EvidenceSource {
         subject: &Transaction,
         bodies: &[&Transaction],
         topics: &[String],
-    ) -> Result<AdmitEvidence, WalkAnswer>;
+    ) -> AdmitEvidence;
 }
 
 /// For managers needing no host network evidence. The engine supplies each
@@ -113,8 +105,8 @@ impl EvidenceSource for NoEvidence {
         _: &Transaction,
         _: &[&Transaction],
         _: &[String],
-    ) -> Result<AdmitEvidence, WalkAnswer> {
-        Ok(AdmitEvidence::default())
+    ) -> AdmitEvidence {
+        AdmitEvidence::default()
     }
 }
 
