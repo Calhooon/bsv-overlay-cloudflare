@@ -268,6 +268,23 @@ fn materialization_word(
     }
 }
 
+/// A finalize body's walk refused, as the gate holds it (the gate lens's LOW
+/// 2), by the class its word's status names: a 400 is the walk's final word
+/// (terminal: its descendants take it), a 503 "not now", anything else a
+/// fault (`Transient`: its descendants wait `not now`).
+fn walk_refusal(topic: &str, error: &EngineError) -> AdmitRefusal {
+    match engine_error_status(error) {
+        400 => AdmitRefusal::Deterministic {
+            topic: topic.to_string(),
+            site: "gasp_finalize.walk".into(),
+            reason: error.to_string(),
+            notes: vec![],
+        },
+        503 => AdmitRefusal::not_now("gasp_finalize.walk", error.to_string()),
+        _ => AdmitRefusal::transient("gasp_finalize.walk", error),
+    }
+}
+
 /// A snapshot that was not taken: the budget's words as they are, any other
 /// failure as the host's setup.
 fn not_snapshotted(error: &str) -> Word {
@@ -611,7 +628,7 @@ impl Engine {
         beef: &[u8],
         topic: &str,
         served: &AdmitEvidence,
-    ) -> Result<Walked, Word> {
+    ) -> Result<Walked, (Word, AdmitRefusal)> {
         let tagged = TaggedBEEF::new(beef.to_vec(), vec![topic.to_string()]);
         let walked = snapshot
             .engine
@@ -622,9 +639,9 @@ impl Engine {
                 &ServedEvidence(served.clone()),
             )
             .await
-            .map_err(|e| Word::engine_error(&e))?;
+            .map_err(|e| (Word::engine_error(&e), walk_refusal(topic, &e)))?;
         if matches!(walked.beef, BeefCarry::R2 { .. }) {
-            (snapshot.resolve)(&walked.beef, beef.to_vec()).map_err(|r| Word::refusal(&r))?;
+            (snapshot.resolve)(&walked.beef, beef.to_vec()).map_err(|r| (Word::refusal(&r), r))?;
         }
         Ok(walked)
     }
@@ -655,7 +672,7 @@ impl Engine {
             let walked =
                 match Self::shadow_walk(&snapshot, &beef, &row.topic, &row.served_evidence).await {
                     Ok(walked) => walked,
-                    Err(word) => break 'judged word,
+                    Err((word, _)) => break 'judged word,
                 };
             row.shadow_evidence = walked.evidence.clone();
             let judged = snapshot.engine.judge_dry(&walked).await;
@@ -669,6 +686,7 @@ impl Engine {
                 engine,
                 snapshot.runner.as_ref(),
                 std::slice::from_ref(&walked),
+                &[],
                 &mut |body, answer, gate| {
                     if let Ok(committed) = answer {
                         seqs.push(committed.seq);
@@ -755,33 +773,47 @@ impl Engine {
             } else {
                 &job.beefs[..job.beefs.len().min(1)]
             };
+            // A body whose walk is refused is handed to the gate as a held
+            // parent and the walk goes on (the gate lens's LOW 2): its
+            // descendants wait on it and its siblings are still judged.
             let mut walked = Vec::new();
-            let mut stopped = None;
+            let mut unwalked = Vec::new();
+            let mut walk_words = Vec::new();
+            let mut position = BTreeMap::new();
             let mut evidence = AdmitEvidence::default();
-            for beef in bodies {
+            for (at, beef) in bodies.iter().enumerate() {
                 match Self::shadow_walk(&snapshot, beef, &job.topic, &AdmitEvidence::default())
                     .await
                 {
                     Ok(body) => {
                         evidence.tx.extend(body.evidence.tx.clone());
+                        position.entry(body.txid.clone()).or_insert(at);
                         walked.push(body);
                     }
-                    Err(word) => {
-                        stopped = Some((body_txid(beef), word));
-                        break;
+                    Err((word, refusal)) => {
+                        let txid = body_txid(beef);
+                        position.entry(txid.clone()).or_insert(at);
+                        walk_words.push((at, txid.clone(), word));
+                        unwalked.push(Unwalked { txid, refusal });
                     }
                 }
             }
+            // The first body's own answer: its walk's refusal, or its unit's.
+            let first_txid = walked
+                .first()
+                .filter(|body| position.get(&body.txid) == Some(&0))
+                .map(|body| body.txid.clone());
             if let Some(row) = first.as_mut() {
-                match (walked.first(), &stopped) {
-                    (Some(body), _) => {
+                match (&first_txid, walk_words.first()) {
+                    (Some(_), _) => {
+                        let body = &walked[0];
                         row.shadow_evidence = body.evidence.clone();
                         let judged = snapshot.engine.judge_dry(body).await;
                         row.shadow_judgement =
                             judged.ok().map(|admitted| judgement_of(&admitted.steak));
                     }
-                    (None, Some((_, word))) => row.shadow = word.clone(),
-                    (None, None) => {}
+                    (None, Some((0, _, word))) => row.shadow = word.clone(),
+                    (None, _) => {}
                 }
             }
             if let Some(row) = graph.as_mut() {
@@ -799,13 +831,14 @@ impl Engine {
                 engine,
                 snapshot.runner.as_ref(),
                 &walked,
+                &unwalked,
                 &mut |body, answer, gate| {
                     let met = engine.take_manager_errors();
                     let gate = gate.map(|reason| GateEntry {
                         txid: body.txid.clone(),
                         reason: reason.clone(),
                     });
-                    if first_answer.is_none() {
+                    if first_answer.is_none() && first_txid.as_ref() == Some(&body.txid) {
                         first_answer = Some((
                             Word::admission(answer, &met),
                             answer.as_ref().ok().map(|committed| committed.seq),
@@ -819,12 +852,15 @@ impl Engine {
                             seqs.push(committed.seq);
                             landed.push(body.txid.clone());
                         }
-                        // The first body held is where the graph stopped
-                        // landing whole; the gate judged the rest (D44).
-                        Err(refusal) if refused.is_none() => {
-                            refused = Some((body.txid.clone(), Word::refusal(refusal)));
+                        // The first body held (in graph order) is where the
+                        // graph stopped landing whole; the gate judged the
+                        // rest (D44).
+                        Err(refusal) => {
+                            let at = position.get(&body.txid).copied().unwrap_or(usize::MAX);
+                            if refused.as_ref().is_none_or(|(first, _, _)| at < *first) {
+                                refused = Some((at, body.txid.clone(), Word::refusal(refusal)));
+                            }
                         }
-                        Err(_) => {}
                     }
                 },
             );
@@ -839,7 +875,11 @@ impl Engine {
             };
             row.shadow_seqs = seqs;
             row.gate = gates;
-            let stopped = refused.or(stopped);
+            let stopped = refused
+                .into_iter()
+                .chain(walk_words.into_iter().take(1))
+                .min_by_key(|(at, _, _)| *at)
+                .map(|(_, txid, word)| (txid, word));
             let rows = materialized_rows(snapshot.engine.storage(), &job.topic, &job.beefs).await;
             Ok(materialization_word(
                 &landed,

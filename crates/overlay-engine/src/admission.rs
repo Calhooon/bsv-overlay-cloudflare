@@ -333,14 +333,26 @@ pub enum GateReason {
 pub const GATE_PARENT_ERROR_SITE: &str = "gasp_finalize.topic_manager";
 pub const GATE_WAITING_SITE: &str = "gasp_finalize.dependency_gate";
 
-/// GASP finalize: each body lands independently, in graph order, under the
+/// A body of a GASP graph its caller could not walk, and the walk's refusal
+/// (the gate lens's LOW 2). It is handed to the gate as a held parent: its
+/// descendants in the graph wait on it (its word when terminal, else `not
+/// now`) and its independent siblings are still judged. A body the caller
+/// drops instead (neither walked nor named here) is a parent the gate cannot
+/// see: its descendants are judged as if it were outside the graph.
+#[derive(Debug, Clone)]
+pub struct Unwalked {
+    pub txid: String,
+    pub refusal: AdmitRefusal,
+}
+
+/// GASP finalize: each body lands independently, ancestors first, under the
 /// dependency gate (D44).
 pub fn admit_graph(
     engine: &crate::engine::Engine,
     runner: &dyn UnitRunner,
     graph: &[Walked],
 ) -> GraphOutcome {
-    admit_graph_observed(engine, runner, graph, &mut |_, _, _| {})
+    admit_graph_observed(engine, runner, graph, &[], &mut |_, _, _| {})
 }
 
 /// Handed each body of a graph, its unit's answer and the gate's reason.
@@ -423,9 +435,11 @@ fn ancestors_first(graph: &[Walked], spends: &[Vec<String>]) -> Vec<usize> {
 /// The dependency gate (the owner's D44). The bodies are judged ancestors
 /// first ([`ancestors_first`]: the batch's order does not move a word or a
 /// row; the lens's LOW 1), so every parent of the graph a body spends was
-/// judged before it. For every body:
+/// judged before it. The bodies the caller could not walk (`unwalked`) are
+/// held before any unit, each its walk's refusal (`HeldBody::gate` `None`),
+/// and are parents like any other. For every body:
 /// 1. A parent it spends that is a body of this graph and did not land in
-///    this graph (refused or held) holds it without a unit: `WaitingOn`, the
+///    this graph (refused, held or unwalked) holds it without a unit: `WaitingOn`, the
 ///    parent's typed word when that is terminal (`Lookup`, `Deterministic`:
 ///    D34's unit-wide refusal reaches its descendants), else `not now`.
 /// 2. A parent outside the graph is not the gate's: it is the walk's (GASP
@@ -443,9 +457,14 @@ pub fn admit_graph_observed(
     engine: &crate::engine::Engine,
     runner: &dyn UnitRunner,
     graph: &[Walked],
+    unwalked: &[Unwalked],
     observe: &mut GraphObserver<'_>,
 ) -> GraphOutcome {
-    let bodies: std::collections::HashSet<&str> = graph.iter().map(|w| w.txid.as_str()).collect();
+    let bodies: std::collections::HashSet<&str> = graph
+        .iter()
+        .map(|w| w.txid.as_str())
+        .chain(unwalked.iter().map(|u| u.txid.as_str()))
+        .collect();
     let spends: Vec<Vec<String>> = graph
         .iter()
         .map(|walked| {
@@ -459,6 +478,14 @@ pub fn admit_graph_observed(
     let mut landed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut refused: BTreeMap<String, AdmitRefusal> = BTreeMap::new();
     let mut held = Vec::new();
+    for body in unwalked {
+        refused.insert(body.txid.clone(), body.refusal.clone());
+        held.push(HeldBody {
+            txid: body.txid.clone(),
+            refusal: body.refusal.clone(),
+            gate: None,
+        });
+    }
     for at in ancestors_first(graph, &spends) {
         let walked = &graph[at];
         let waiting: Vec<String> = spends[at]
