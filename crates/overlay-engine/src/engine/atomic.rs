@@ -159,7 +159,7 @@ impl Engine {
     /// executor through storage; Zanaadu's evidence path does not call this.
     /// No broadcast or durable mutation occurs in this judgement.
     pub async fn judge_dry(&self, walked: &Walked) -> Result<Admitted, AdmitRefusal> {
-        let tagged_beef = walked.tagged_beef()?;
+        let tagged_beef = walked.tagged_beef(self.storage.as_ref())?;
         let dry = self
             .storage
             .admission_dry_run(&walked.evidence)
@@ -218,7 +218,7 @@ impl Engine {
         let log = self.storage.admission_log().ok_or_else(|| {
             AdmitRefusal::transient("admit_without_log", "storage has no open admission unit")
         })?;
-        let tagged_beef = walked.tagged_beef()?;
+        let tagged_beef = walked.tagged_beef(self.storage.as_ref())?;
         // Stable hook order makes a refusal independent of HashMap seeds.
         let mut services: Vec<_> = self.lookup_services.iter().collect();
         services.sort_by_key(|(name, _)| *name);

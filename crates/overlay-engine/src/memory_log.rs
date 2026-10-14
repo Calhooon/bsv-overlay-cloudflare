@@ -57,6 +57,30 @@ struct MemoryLogState {
 }
 
 impl MemoryStorage {
+    /// Model the host fetching an R2 object by its key before entering the log.
+    /// Resolved objects are immutable input, not admission rows or commits.
+    pub fn cache_admission_beef(
+        &self,
+        carry: &BeefCarry,
+        bytes: Vec<u8>,
+    ) -> Result<(), AdmitRefusal> {
+        if self.log.lock().unwrap().scope.is_some() {
+            return Err(AdmitRefusal::transient(
+                "walked_payload",
+                "R2 resolution inside admission unit",
+            ));
+        }
+        carry.verify_resolved(&bytes)?;
+        let BeefCarry::R2 { key, .. } = carry else {
+            unreachable!()
+        };
+        self.admission_beefs
+            .lock()
+            .unwrap()
+            .insert(key.clone(), bytes.into());
+        Ok(())
+    }
+
     /// One-shot fault seam. Counts every engine, manager and outbox write.
     fn write_pin(&self) -> Result<(), StorageError> {
         let mut fault = self.admission_fault.lock().unwrap();
@@ -245,7 +269,7 @@ impl MemoryStorage {
                         AdmitRefusal::not_now("admit_evidence_missing", txid.clone()).into(),
                     );
                 }
-                let payload = walked.tagged_beef()?;
+                let payload = walked.tagged_beef(self)?;
                 let mut beef = crate::beef_limits::parse_beef(
                     &payload.beef,
                     &crate::beef_limits::ENGINE_BEEF_LIMITS,
@@ -254,10 +278,14 @@ impl MemoryStorage {
                 let bytes = beef
                     .to_binary_atomic(txid)
                     .map_err(|e| AdmitRefusal::transient("carried_payload", e))?;
+                let carry = BeefCarry::from_beef(&bytes, &beef, txid);
+                if matches!(carry, BeefCarry::R2 { .. }) {
+                    self.cache_admission_beef(&carry, bytes)?;
+                }
                 carried_unit = Walked {
                     txid: txid.clone(),
                     topics: topics.clone(),
-                    beef: BeefCarry::from_beef(&bytes, &beef, txid),
+                    beef: carry,
                     off_chain_values: None,
                     mode: walked.mode,
                     policy: walked.policy,

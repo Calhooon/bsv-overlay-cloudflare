@@ -1571,3 +1571,97 @@ async fn a1_c11_walked_uses_bounded_inline_or_r2_carry() {
         .get("tagged_beef")
         .is_none());
 }
+
+#[tokio::test]
+async fn a1_n2_r2_carry_persists_verified_proofs() {
+    let (_, _, _, small, _) = fixture_refusal(false).await;
+    let mut tx = Transaction::from_beef(&small.beef, None).unwrap();
+    tx.outputs[0].locking_script =
+        LockingScript::from_binary(&vec![0x61; INLINE_BEEF_MAX_BYTES]).unwrap();
+    tx.invalidate_caches();
+    tx.merkle_path =
+        Some(MerklePath::new(100, vec![vec![MerklePathLeaf::new_txid(0, tx.id())]]).unwrap());
+    let large = TaggedBEEF::new(tx.to_beef(false).unwrap(), vec![PROOF.into()]);
+    let store = Rc::new(MemoryStorage::new());
+    let engine = error_engine(&store, false);
+    let walked = engine
+        .walk(&large, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence)
+        .await
+        .unwrap();
+    assert!(matches!(walked.beef, BeefCarry::R2 { .. }));
+    let index = Rc::new(Mutex::new(BTreeMap::new()));
+    let before = snapshot(&store, &index);
+    let missing = store.admit(&engine, &walked);
+    assert!(
+        matches!(missing, Err(LogError::Refused(AdmitRefusal::Transient { site, .. })) if site == "walked_payload")
+    );
+    assert!(snapshot(&store, &index) == before);
+    // A real host fetches by key outside the unit. Memory models the resolved object.
+    store
+        .cache_admission_beef(&walked.beef, large.beef.clone())
+        .unwrap();
+    // Even a cached object must match every descriptor received on a later hop.
+    for mismatch in 0..4 {
+        let mut bad = walked.clone();
+        let BeefCarry::R2 {
+            key,
+            sha256,
+            len,
+            raw_txs,
+        } = &mut bad.beef
+        else {
+            unreachable!()
+        };
+        match mismatch {
+            0 => key.push('x'),
+            1 => sha256[0] ^= 1,
+            2 => *len += 1,
+            _ => raw_txs[0][0] ^= 1,
+        }
+        let rejected = store.admit(&engine, &bad);
+        assert!(
+            matches!(rejected, Err(LogError::Refused(AdmitRefusal::Transient { site, .. })) if site == "walked_payload")
+        );
+        assert!(snapshot(&store, &index) == before);
+    }
+    let walked: Walked = serde_json::from_slice(&serde_json::to_vec(&walked).unwrap()).unwrap();
+    let admitted = store.admit(&engine, &walked).unwrap();
+    assert_eq!(admitted.steak[PROOF].outputs_to_admit, vec![2]);
+    let stored = store
+        .find_output(&walked.txid, 2, Some(PROOF), None, true)
+        .await
+        .unwrap()
+        .unwrap()
+        .beef
+        .unwrap();
+    let reread = Transaction::from_beef(&stored, None).unwrap();
+    assert!(
+        reread.merkle_path.is_some(),
+        "N2 stored subject has proof: false"
+    );
+    assert!(
+        stored == large.beef,
+        "N2 stored BEEF differs from walked bytes"
+    );
+    engine
+        .walk(
+            &TaggedBEEF::new(stored.clone(), vec![PROOF.into()]),
+            crate::engine::WalkBreachPolicy::NotNow,
+            &NoEvidence,
+        )
+        .await
+        .expect("persisted BEEF must verify with its proofs");
+    let legacy_store = Rc::new(MemoryStorage::new());
+    error_engine(&legacy_store, false)
+        .submit(&large, SubmitMode::CurrentTx)
+        .await
+        .unwrap();
+    let legacy = legacy_store
+        .find_output(&walked.txid, 2, Some(PROOF), None, true)
+        .await
+        .unwrap()
+        .unwrap()
+        .beef
+        .unwrap();
+    assert!(stored == legacy, "N2 stored BEEF must equal submit's");
+}

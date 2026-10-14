@@ -375,6 +375,45 @@ pub trait SqlExecutor {
 }
 
 impl BeefCarry {
+    /// Check a host-resolved object's identity and the raw bodies sent on the hop.
+    pub(crate) fn verify_resolved(&self, bytes: &[u8]) -> Result<(), AdmitRefusal> {
+        let Self::R2 {
+            sha256,
+            len,
+            raw_txs,
+            ..
+        } = self
+        else {
+            return Err(AdmitRefusal::transient(
+                "walked_payload",
+                "expected R2 descriptor",
+            ));
+        };
+        if bytes.len() as u64 != *len || bsv_rs::primitives::hash::sha256(bytes) != *sha256 {
+            return Err(AdmitRefusal::transient(
+                "walked_payload",
+                "R2 BEEF hash or length mismatch",
+            ));
+        }
+        let beef = crate::beef_limits::parse_beef(bytes, &crate::beef_limits::ENGINE_BEEF_LIMITS)
+            .map_err(|e| AdmitRefusal::transient("walked_payload", e))?;
+        let mut original: Vec<_> = beef
+            .txs
+            .iter()
+            .filter_map(|body| body.tx().map(Transaction::to_binary))
+            .collect();
+        let mut carried: Vec<_> = raw_txs.iter().collect();
+        original.sort_unstable();
+        carried.sort_unstable();
+        if original.iter().collect::<Vec<_>>() != carried {
+            return Err(AdmitRefusal::transient(
+                "walked_payload",
+                "R2 BEEF raw transactions mismatch",
+            ));
+        }
+        Ok(())
+    }
+
     /// Hosts persist the original large BEEF under this content-addressed key
     /// before sending the hop. The log uses raw transactions for judgement;
     /// the pointer remains the home of the original proof-bearing BEEF.
@@ -404,21 +443,19 @@ impl BeefCarry {
     }
 }
 impl Walked {
-    /// Raw transactions suffice for log judgement. This reconstruction is not
-    /// the original proof-bearing BEEF; hosts retain its R2 descriptor when
-    /// persisting history and must not replace the referenced original.
-    pub(crate) fn tagged_beef(&self) -> Result<TaggedBEEF, AdmitRefusal> {
+    /// Resolve the original verified BEEF, never a proof-stripped reconstruction.
+    pub(crate) fn tagged_beef(&self, storage: &dyn Storage) -> Result<TaggedBEEF, AdmitRefusal> {
         let bytes = match &self.beef {
             BeefCarry::Inline(bytes) => bytes.clone(),
-            BeefCarry::R2 { raw_txs, .. } => {
-                let mut beef = bsv_rs::transaction::Beef::new();
-                for raw in raw_txs {
-                    Transaction::from_binary(raw)
-                        .map_err(|e| AdmitRefusal::transient("walked_payload", e))?;
-                    beef.merge_raw_tx(raw.clone(), None);
-                }
-                beef.to_binary_atomic(&self.txid)
-                    .map_err(|e| AdmitRefusal::transient("walked_payload", e))?
+            BeefCarry::R2 { key, .. } => {
+                let bytes = storage.admission_beef(key).ok_or_else(|| {
+                    AdmitRefusal::transient(
+                        "walked_payload",
+                        "R2 BEEF not resolved before admission",
+                    )
+                })?;
+                self.beef.verify_resolved(&bytes)?;
+                bytes.to_vec()
             }
         };
         let mut tagged = TaggedBEEF::new(bytes, self.topics.clone());

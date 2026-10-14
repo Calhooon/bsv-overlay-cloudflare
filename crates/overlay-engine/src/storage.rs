@@ -36,6 +36,13 @@ pub trait Storage {
         None
     }
 
+    /// Original R2 BEEF already fetched by the host before opening the unit.
+    /// This is a synchronous cache read, never network I/O. The engine checks
+    /// the descriptor and carried raw transactions before using these bytes.
+    fn admission_beef(&self, _key: &str) -> Option<std::sync::Arc<[u8]>> {
+        None
+    }
+
     /// Install the host's read-only executor for the generic log path's dry
     /// broadcast judgement. Ordinary submit never calls this method.
     fn admission_dry_run(
@@ -440,6 +447,9 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
     fn admission_log(&self) -> Option<&dyn crate::admission::LogTxn> {
         (**self).admission_log()
     }
+    fn admission_beef(&self, key: &str) -> Option<std::sync::Arc<[u8]>> {
+        (**self).admission_beef(key)
+    }
     fn admission_dry_run(
         &self,
         evidence: &crate::admission::AdmitEvidence,
@@ -684,6 +694,8 @@ pub mod memory {
     #[derive(Debug, Default)]
     pub struct MemoryStorage {
         log: Mutex<MemoryLogState>,
+        /// Host-resolved immutable objects, outside the admission transaction.
+        admission_beefs: Mutex<HashMap<String, std::sync::Arc<[u8]>>>,
         writer: Mutex<()>,
         admission_fault: Mutex<(Option<usize>, usize)>,
         /// outputs keyed by (txid, outputIndex, topic)
@@ -888,6 +900,9 @@ pub mod memory {
                 .scope
                 .as_ref()
                 .map(|_| self as &dyn crate::admission::LogTxn)
+        }
+        fn admission_beef(&self, key: &str) -> Option<std::sync::Arc<[u8]>> {
+            self.admission_beefs.lock().unwrap().get(key).cloned()
         }
         fn admission_dry_run(
             &self,
