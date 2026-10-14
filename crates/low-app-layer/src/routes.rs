@@ -3897,10 +3897,12 @@ async fn owed_recompute_inner(
     // the spenders whose bytes the COURIERS supplied (the gate's M3): a real payout with no index proof to credit from
     let mut courier_spenders: HashSet<String> = HashSet::new();
     let mut courier_cap_hit = false;
-    // bsv-low #662: the spenders this pass LOOKED at (a read made, a memo or a cached answer used, faulted or not);
-    // the named spenders outside it were WITHHELD by a cap or the clock (never a fault)
-    let mut spenders_looked: HashSet<String> = HashSet::new();
-    let mut spenders_named: Vec<String> = Vec::new();
+    // bsv-low #662, the L25-WITHHELD lens's LOW-1: the spender look ledger (`owed::SpenderLook`). A spender is
+    // WITHHELD only on a noted cap, clock or tail and no look; every read made or answer used, faulted or not, is
+    // LOOKED (its row is this pass's word)
+    let mut spender_look = crate::owed::SpenderLook::default();
+    // MEDIUM-1 (2): the spenders a courier was really asked for this pass, stamped durably in the write batch
+    let mut spenders_asked: Vec<String> = Vec::new();
     {
         // the spenders, newest hop first (the marker's filing time), dedup'd, pots excluded
         let mut ordered: Vec<(i64, String)> = Vec::new();
@@ -3946,22 +3948,29 @@ async fn owed_recompute_inner(
             spent: Option<f64>,
         }
         // phase 1: the index's bytes (D1), a parsed courier memo, or the isolate's tx-any cache — no courier asked
-        spenders_named.extend(ordered.iter().map(|(_, sp)| sp.clone()));
+        let mut ordered: Vec<String> = ordered.into_iter().map(|(_, sp)| sp).collect();
+        let tail = ordered.split_off(
+            ordered
+                .len()
+                .min(crate::owed::OWED_SPENDER_READS_PER_RECOMPUTE),
+        );
+        spender_look.withhold_all(&tail, crate::owed::SpenderWithheld::Tail);
         let mut wanted: Vec<String> = Vec::new();
-        for (_at, sp) in ordered
-            .into_iter()
-            .take(crate::owed::OWED_SPENDER_READS_PER_RECOMPUTE)
-        {
+        for (at, sp) in ordered.iter().cloned().enumerate() {
             if over_budget() {
                 budget_cut = true;
+                spender_look.withhold_all(&ordered[at..], crate::owed::SpenderWithheld::Clock);
                 break;
             }
             spender_reads += 1;
-            spenders_looked.insert(sp.clone());
             let bytes = match load_stored_beef(env, db, &sp).await {
-                Ok(Some(b)) => b,
+                Ok(Some(b)) => {
+                    spender_look.look(&sp, crate::owed::SpenderLooked::StoredRead);
+                    b
+                }
                 Ok(None) => {
                     if let Some(parsed) = owed_spender_outputs_memo_get(&sp) {
+                        spender_look.look(&sp, crate::owed::SpenderLooked::Memo);
                         courier_spenders.insert(sp.clone());
                         spender_inputs.insert(sp.clone(), parsed.inputs);
                         spender_outputs.insert(sp, parsed.outputs);
@@ -3971,6 +3980,7 @@ async fn owed_recompute_inner(
                     // the delta-verify's NEW-1: an answer this isolate already holds (a fault inside its TTL included)
                     // is never re-bought
                     if let Some(a) = tx_any_cached(&sp, now_f) {
+                        spender_look.look(&sp, crate::owed::SpenderLooked::CachedAnswer);
                         if let Some(parsed) = parse_spender_answer(&a, &sp) {
                             owed_spender_outputs_memo_put(&sp, &parsed);
                             courier_spenders.insert(sp.clone());
@@ -3979,11 +3989,12 @@ async fn owed_recompute_inner(
                         }
                         continue;
                     }
-                    spenders_looked.remove(&sp);
+                    // no look yet: the courier phase decides (a look, or a noted cap or clock)
                     wanted.push(sp);
                     continue;
                 }
                 Err(_) => {
+                    spender_look.look(&sp, crate::owed::SpenderLooked::StoredRead);
                     crate::owed::note_spender_read_fault();
                     continue;
                 }
@@ -4016,14 +4027,28 @@ async fn owed_recompute_inner(
             spender_outputs.insert(sp, outs);
         }
         // phase 2: the courier asks — never-asked-first, then the oldest ask; a fresh ask is a slot whatever it
-        // answers (only a verdict MEMO costs no courier call); the cap is its own word, apart from the time budget
-        wanted.sort_by_key(|sp| owed_courier_asked_at(sp).map_or(0i64, |t| t as i64));
-        for sp in wanted {
+        // answers (only a verdict MEMO costs no courier call); the cap is its own word, apart from the time budget.
+        // MEDIUM-1 (2): the ask stamps are DURABLE (`owed::SPENDER_ASK_PREFIX` rows, read here only when the cap
+        // can bite, one statement), merged with the isolate's, so a cold isolate's pass buys the spenders the last
+        // passes did not; a faulted read is the isolate's order alone (counted as the probe memo read's fault)
+        let durable_asks = if wanted.len() > crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE {
+            let targets: Vec<(String, u32)> = wanted
+                .iter()
+                .map(|sp| crate::owed::spender_ask_target(sp))
+                .collect();
+            crate::owed::spender_ask_stamps(&read_probe_memos(db, &targets).await)
+        } else {
+            HashMap::new()
+        };
+        let wanted = crate::owed::spender_ask_order(wanted, &durable_asks, |sp| {
+            owed_courier_asked_at(sp).map(|t| t as i64)
+        });
+        for (at, sp) in wanted.iter().cloned().enumerate() {
             // The compact row keeps the hash-verified raw from the first
             // courier observation. A subject in hand never opens a read
             // ladder again, even after the isolate memo expired.
             if let Some(row) = word_rows.get(&sp) {
-                spenders_looked.insert(sp.clone());
+                spender_look.look(&sp, crate::owed::SpenderLooked::TrackerRow);
                 let parsed = row
                     .legacy_body
                     .as_ref()
@@ -4039,24 +4064,27 @@ async fn owed_recompute_inner(
             }
             if courier_reads >= crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE {
                 courier_cap_hit = true;
+                spender_look.withhold_all(&wanted[at..], crate::owed::SpenderWithheld::Cap);
                 break;
             }
             if over_budget() {
                 budget_cut = true;
+                spender_look.withhold_all(&wanted[at..], crate::owed::SpenderWithheld::Clock);
                 break;
             }
-            spenders_looked.insert(sp.clone());
             let now_f = worker::Date::now().as_millis() as f64;
             // the round-3 LOW: another identity's recompute on this isolate (the in-flight lock is per identity;
             // a competitor JOIN spends BOTH seats' hops within ms) may have bought this spender since phase 1 —
             // re-check the memo and the cache before spending a ladder on it
             if let Some(parsed) = owed_spender_outputs_memo_get(&sp) {
+                spender_look.look(&sp, crate::owed::SpenderLooked::Memo);
                 courier_spenders.insert(sp.clone());
                 spender_inputs.insert(sp.clone(), parsed.inputs);
                 spender_outputs.insert(sp, parsed.outputs);
                 continue;
             }
             if let Some(a) = tx_any_cached(&sp, now_f) {
+                spender_look.look(&sp, crate::owed::SpenderLooked::CachedAnswer);
                 if let Some(parsed) = parse_spender_answer(&a, &sp) {
                     owed_spender_outputs_memo_put(&sp, &parsed);
                     courier_spenders.insert(sp.clone());
@@ -4065,12 +4093,15 @@ async fn owed_recompute_inner(
                 }
                 continue;
             }
+            spender_look.look(&sp, crate::owed::SpenderLooked::CourierAsked);
             let a = resolve_tx_any(None, None, &sp, now_f, "owed", env).await;
             if a.source != Some("memo") {
                 // a courier was really asked: the slot, and the stamp that sends this spender to the back of the
-                // never-asked-first order (a verdict-memo answer costs nothing and is not an ask)
+                // never-asked-first order (a verdict-memo answer costs nothing and is not an ask); the durable
+                // stamp rides the write batch (MEDIUM-1 (2))
                 courier_reads += 1;
                 owed_courier_note_asked(&sp, now_f);
+                spenders_asked.push(sp.clone());
             }
             if let Some(parsed) = parse_spender_answer(&a, &sp) {
                 owed_spender_outputs_memo_put(&sp, &parsed);
@@ -4165,10 +4196,7 @@ async fn owed_recompute_inner(
     // bsv-low #662: a judged courier-bytes payout whose sweep's bytes this pass WITHHELD (the spender courier cap or
     // the clock) keeps its previous row, marked `refresh: "withheld"`, never "could not judge"; a faulted read is
     // never withheld and keeps its fault row. One PK read, made only when such a row exists.
-    let spenders_withheld: HashSet<String> = spenders_named
-        .into_iter()
-        .filter(|sp| !spenders_looked.contains(sp))
-        .collect();
+    let spenders_withheld = spender_look.withheld();
     let withheld_outpoints =
         crate::owed::withheld_hop_outpoints(&inputs, &rows, &spenders_withheld);
     if !withheld_outpoints.is_empty() {
@@ -4206,8 +4234,11 @@ async fn owed_recompute_inner(
                     );
                 }
             }
-            // the read faulted: this pass's rows stand as derived (the pre-#662 word), nothing invented
-            Err(e) => console_warn!("[owed] withheld payouts read failed: {e}"),
+            // the read faulted: this pass's rows stand as derived (the pre-#662 word), nothing invented; counted
+            Err(e) => {
+                crate::owed::note_withheld_previous_read_fault();
+                console_warn!("[owed] withheld payouts read failed: {e}");
+            }
         }
     }
     let mut markerless_carried = 0;
@@ -4313,9 +4344,24 @@ async fn owed_recompute_inner(
             stmts.insert(stmts.len() - 1, cursor_stmt);
         }
     }
+    // MEDIUM-1 (2): the durable ask stamps of this pass's courier asks (at most the courier cap), in the SAME
+    // batch: the rotation is the same on every isolate from the next pass on
+    for sp in &spenders_asked {
+        let (txid, vout) = crate::owed::spender_ask_target(sp);
+        let ask_stmt = db
+            .prepare(crate::owed::SPENDER_ASK_UPSERT_SQL)
+            .bind(&[
+                JsValue::from_str(&crate::hops_view::probe_memo_key(&txid, vout)),
+                JsValue::from_f64(now_ms as f64),
+            ])
+            .map_err(|e| format!("owed ask stamp bind: {e}"))?;
+        stmts.insert(stmts.len() - 1, ask_stmt);
+    }
     debug_assert!(
-        stmts.len() <= 4 + crate::owed::OWED_MAX_ROWS,
-        "the batch stays under the row cap + the bookends and cursor"
+        stmts.len()
+            <= 4 + crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE
+                + crate::owed::OWED_MAX_ROWS,
+        "the batch stays under the row cap + the bookends, the cursor and the ask stamps"
     );
     let written = crate::d1_ledger::counted_batch(db, stmts)
         .await
