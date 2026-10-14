@@ -19,6 +19,8 @@ const REGISTRY: &str = "tm_registry_657";
 const PROOF: &str = "tm_proof_657";
 const REFUSAL: &str = "E657 deterministic refusal of registry output 2";
 type Index = Rc<Mutex<BTreeMap<(String, u32, String), u64>>>;
+type Services = HashMap<String, Box<dyn LookupService>>;
+type CallCapture = Rc<Mutex<Calls>>;
 
 struct RegistryManager;
 #[async_trait(?Send)]
@@ -398,12 +400,7 @@ impl LookupService for Probe {
         ServiceMetadata::default()
     }
 }
-fn probes(
-    refuse_spent: bool,
-) -> (
-    HashMap<String, Box<dyn LookupService>>,
-    Vec<Rc<Mutex<Calls>>>,
-) {
+fn probes(refuse_spent: bool) -> (Services, Vec<CallCapture>) {
     let mut services: HashMap<String, Box<dyn LookupService>> = HashMap::new();
     let mut captures = vec![];
     for admission in [AdmissionMode::LockingScript, AdmissionMode::WholeTx] {
