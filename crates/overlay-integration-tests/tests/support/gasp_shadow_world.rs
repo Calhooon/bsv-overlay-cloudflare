@@ -68,6 +68,18 @@ pub fn child(parent: &Transaction, vout: u32, count: usize) -> Transaction {
     tx
 }
 
+/// A transaction of `count` outputs spending each of `sources` (a fan-in).
+pub fn spends(sources: &[(&Transaction, u32)], count: usize) -> Transaction {
+    let mut tx = Transaction::new();
+    for (parent, vout) in sources {
+        let mut input = TransactionInput::new(parent.id(), *vout);
+        input.unlocking_script = Some(UnlockingScript::from_binary(&[]).unwrap());
+        tx.inputs.push(input);
+    }
+    outputs(&mut tx, count);
+    tx
+}
+
 pub fn honest_proof(txid: &str, height: u32) -> String {
     MerklePath::new(
         height,

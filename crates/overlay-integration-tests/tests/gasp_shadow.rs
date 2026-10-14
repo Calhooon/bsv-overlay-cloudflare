@@ -439,6 +439,105 @@ async fn w2b_a_manager_error_at_the_finalize_shows_in_the_census() {
     );
 }
 
+/// A scenario whose served finalize order is a `HashMap`'s (a fan-in's
+/// siblings): the shadow run beside an `off` run that took the same order
+/// (the same rows), tried up to 64 times; the peer's calls compared as a
+/// multiset (their order is the same `HashMap`'s).
+async fn beside_unordered(scenario: &Scenario) -> Run {
+    let shadow = run(scenario, Some(AdmissionMode::Shadow), None, None).await;
+    let sorted = |run: &Run| {
+        let mut calls = run.peer.clone();
+        calls.sort();
+        calls
+    };
+    for _ in 0..64 {
+        let off = run(scenario, None, None, None).await;
+        if off.rows == shadow.rows {
+            assert_eq!(
+                (sorted(&off), &off.results),
+                (sorted(&shadow), &shadow.results),
+                "the shadow changed nothing served"
+            );
+            return shadow;
+        }
+    }
+    panic!("no off run took the shadow run's served order in 64 tries");
+}
+
+/// `r` spends `a.0` and `b.0` (all proven); the manager errs at the finalize
+/// on the parent `erring` (0: `a`, 1: `b`).
+fn erring_fan_in(erring: usize) -> Scenario {
+    let a = genesis(50, 1);
+    let b = genesis(51, 1);
+    let r = spends(&[(&a, 0), (&b, 0)], 1);
+    let mut scenario = Scenario::honest(vec![a, b, r], vec![(2, 0, 1.0)]);
+    scenario.fails_at_finalize = Some(scenario.txs[erring].id());
+    scenario
+}
+
+/// The shadow lens's MEDIUM 3: the two materialization deltas apart. D1 (the
+/// erring chain): the stop point differs and the rows agree, `materialization`.
+/// D2 (a fan-in, the manager erring on either parent): A lands the sibling and
+/// the root over the erring parent, the served finalize lands neither the root
+/// nor (when the erring parent comes first) the sibling, so the rows differ,
+/// `rows_differ`. The census names D2; A's behaviour on it is the owner's
+/// ruling to come, not changed here.
+#[tokio::test]
+async fn w2c_the_census_names_a_stop_delta_and_a_rows_delta_apart() {
+    let class = |row: &GaspCensusRow| serde_json::to_value(row.delta).unwrap();
+    let chain = beside(&erring_chain()).await;
+    let graph = &chain.of(ShadowKind::Materialization)[0];
+    assert_eq!(
+        class(graph),
+        serde_json::json!("materialization"),
+        "D1: {graph:?}"
+    );
+    let served = json(&graph.served.bytes);
+    let ours = json(&graph.shadow.bytes);
+    assert_eq!(served["rows"], ours["rows"], "D1: the rows agree");
+
+    for erring in [0, 1] {
+        let scenario = erring_fan_in(erring);
+        let shadow = beside_unordered(&scenario).await;
+        print_census(&format!("W2c fan-in erring={erring}"), &shadow);
+        let [a, b, r] = [0, 1, 2].map(|i| scenario.txs[i].id());
+        let graph = &shadow.of(ShadowKind::Materialization)[0];
+        let served = json(&graph.served.bytes);
+        let ours = json(&graph.shadow.bytes);
+        let mut landed: Vec<_> = ours["landed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect();
+        landed.sort();
+        let mut all = vec![a.clone(), b.clone(), r.clone()];
+        all.sort();
+        assert_eq!(landed, all, "A lands both parents and the root: {ours}");
+        assert!(ours["stopped"].is_null(), "{ours}");
+        assert!(
+            !served["landed"].to_string().contains(&r),
+            "the served finalize never lands the root: {served}"
+        );
+        assert_ne!(served["rows"], ours["rows"], "D2: the rows differ");
+        assert_eq!(
+            ours["rows"][format!("applied {r}")],
+            serde_json::json!("true"),
+            "{ours}"
+        );
+        assert_eq!(
+            served["rows"][format!("applied {r}")],
+            serde_json::json!("false"),
+            "{served}"
+        );
+        assert_eq!(
+            class(graph),
+            serde_json::json!("rows_differ"),
+            "D2 erring={erring}: served {served}, shadow {ours}"
+        );
+    }
+}
+
 // ============================================================================
 // Witness 3: the four GASP chaos records of the HTTP corpus
 // (`parity-harness/corpus/xanaverse/chaos/0{1..4}_*.json`, Zanaadu), each a
