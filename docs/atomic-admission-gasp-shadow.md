@@ -397,3 +397,33 @@ parents are the inputs of each body that name another body of the graph; a
 parent outside the graph is the walk's and A's predecessor question's, as
 before. A body held by line 1 opens no unit, so it reads nothing and costs no
 seq.
+
+**Gates, on the tip of `lane/atomic-gasp-dependency-gate`.**
+
+- `cargo test --workspace --features bsv-overlay-engine/memory-storage
+  --no-fail-fast`: **1,691 passed, 0 failed, 66 ignored** (103 binaries;
+  1,686 before, plus the gate's four witnesses and w8). With the feature off
+  (`-p overlay-integration-tests --no-default-features`): `gasp_shadow_off` and
+  the four gate witnesses green.
+- `cargo test --manifest-path workers/Cargo.toml --workspace --no-fail-fast`:
+  **1,565 passed, 0 failed, 1 ignored** (unchanged).
+- clippy with warnings denied (the workspace with `memory-storage`, the engine
+  with no feature and with `gasp-shadow,memory-storage`) and `cargo fmt`: clean.
+- **The `off` recording** `431baab4e305582981b14370ed9ee36007a0a922e25341e9ca7c772192d4d112`,
+  polls `[57, 11, 54, 11]`: unchanged, with the feature on and off. **The peer
+  calls** (w7): 29 under `off`, 29 under `shadow`; the served store 129 and 177.
+- **The wasm, raw release** (`bsv-overlay-cloudflare`, both trees built AT
+  THIS WORKTREE'S PATH under the same `--remap-path-prefix`, `75e2d7b` checked
+  out in place): `75e2d7b` feature off 8,963,479 B; this tip feature off
+  8,963,133 B (**-346 B**), none of `gasp_shadow`, `admit_graph`, `judge_dry`,
+  `walk_with_mode`; feature on 9,407,485 B, 100 `gasp_shadow` names.
+  `make gasp-shadow-size` itself FAILS its 4,096 B tolerance here, on the
+  base's side: its `git archive` tree builds about 5 KB larger at its scratch
+  path than the same code at the worktree's (A1 `9d5a75a` 8,968,284 B against
+  the record's 8,963,951 B; `75e2d7b` 8,968,002 B there against 8,963,479 B
+  in place), while this tree's off build is within 4 B of the lens's tip
+  figure. The script's remap does not equalize the two paths; not chased.
+- `make ci-deploy`: green, four dry runs through the real worker-build:
+  `bsv-overlay-cloudflare` and `low-overlay` 6,680,563 B, `low-app-layer`
+  4,795,299 B, `low-overlay` with `gasp-shadow` 7,016,450 B (the record's
+  6,675,401 B and 7,015,838 B were built at another path).
