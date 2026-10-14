@@ -571,3 +571,22 @@ impl Drop for MemoryReadOnly<'_> {
         }
     }
 }
+
+impl UnitRunner for MemoryStorage {
+    fn run_unit<'a>(
+        &'a self,
+        _kind: UnitKind,
+        evidence: &'a AdmitEvidence,
+        unit: LocalBoxFuture<'a, Result<UnitOutput, AdmitRefusal>>,
+    ) -> Result<Committed, AdmitRefusal> {
+        let result = self.transaction("", evidence, || async {
+            let output = unit.await?;
+            Ok((output, self.notes()))
+        });
+        match result {
+            Ok((output, notes)) => Ok(Committed { seq: self.log_head(), output, notes }),
+            Err(LogError::Refused(refusal)) => Err(refusal),
+            Err(lost @ LogError::AnswerLost) => std::panic::resume_unwind(Box::new(lost)),
+        }
+    }
+}

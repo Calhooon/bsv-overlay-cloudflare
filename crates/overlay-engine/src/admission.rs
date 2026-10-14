@@ -249,3 +249,48 @@ mod sidecar_map {
 pub trait DryRunScope {
     fn failure(&self) -> Option<String>;
 }
+
+/// Opens one unit and polls its body once. A lost answer escapes as a transport
+/// failure, never a rollback refusal. Native memory transport uses `LogError`
+/// as an unwind payload for that arm; Worker bindings abort the instance.
+pub trait UnitRunner {
+    fn run_unit<'a>(
+        &'a self,
+        kind: UnitKind,
+        evidence: &'a AdmitEvidence,
+        unit: LocalBoxFuture<'a, Result<UnitOutput, AdmitRefusal>>,
+    ) -> Result<Committed, AdmitRefusal>;
+}
+#[derive(Debug, Clone, Copy)]
+pub enum UnitKind { Admit, Proof, Evict, Unevict, Readmit, Gc, Renotify }
+#[derive(Debug)]
+pub enum UnitOutput { Admitted(Admitted), Done }
+#[derive(Debug)]
+pub struct Committed {
+    pub seq: u64,
+    pub output: UnitOutput,
+    pub notes: RefusalNotes,
+}
+#[derive(Debug)]
+pub enum GraphOutcome {
+    AllLanded { seqs: Vec<u64> },
+    StoppedAt { txid: String, refusal: AdmitRefusal, landed: Vec<u64> },
+}
+
+/// GASP finalize: each body lands independently, in graph order.
+pub fn admit_graph(engine: &crate::engine::Engine, runner: &dyn UnitRunner, graph: &[Walked]) -> GraphOutcome {
+    let mut seqs = Vec::new();
+    for walked in graph {
+        match runner.run_unit(UnitKind::Admit, &walked.evidence, Box::pin(async {
+            engine.admit(walked).await.map(UnitOutput::Admitted)
+        })) {
+            Ok(committed) => seqs.push(committed.seq),
+            Err(refusal) => return GraphOutcome::StoppedAt {
+                txid: walked.txid.clone(), refusal, landed: seqs,
+            },
+        }
+    }
+    GraphOutcome::AllLanded { seqs }
+}
+
+pub type LocalBoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;

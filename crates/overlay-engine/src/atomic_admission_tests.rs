@@ -1160,3 +1160,19 @@ async fn a1_c3_admit_uses_storages_open_unit() {
     store.transaction(&walked.txid, &walked.evidence, || engine.admit(&walked)).unwrap();
     assert_eq!(store.log_head(), 1);
 }
+
+#[tokio::test]
+async fn a1_c4_graph_stops_at_first_refusal() {
+    let (engine, store, _, beef, _) = fixture().await;
+    let mut first = beef.clone();
+    first.topics = vec![PROOF.into()];
+    let first = engine.walk(&first, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence).await.unwrap();
+    let second = engine.walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence).await.unwrap();
+    let stopped = second.txid.clone();
+    let graph = [first.clone(), second, first];
+    assert!(matches!(admit_graph(&engine, store.as_ref(), &graph),
+        GraphOutcome::StoppedAt { txid, landed, .. } if txid == stopped && landed == vec![1]));
+    assert_eq!(store.log_units().len(), 1);
+    let committed = store.run_unit(UnitKind::Gc, &AdmitEvidence::default(), Box::pin(async { Ok(UnitOutput::Done) })).unwrap();
+    assert!(matches!(committed.output, UnitOutput::Done));
+}
