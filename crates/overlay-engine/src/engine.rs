@@ -76,6 +76,7 @@ pub struct Engine {
     /// today. A platform crate may set `Some` (one-time-migration only) to let
     /// ingest self-heal missing ancestry by fetching it from chain.
     ancestor_fetcher: Option<std::rc::Rc<dyn crate::gasp::AncestorFetcher>>,
+    gasp_ancestor_fetcher: Option<std::rc::Rc<dyn crate::gasp::AncestorFetcher>>,
     /// bsv-low#302: per-peer GASP sync wall-clock budget —
     /// `(sleep factory, budget ms)`. `None` (default) = unbounded per-peer
     /// sync, byte-identical to the pre-#302 behavior. When set, each peer's
@@ -981,6 +982,7 @@ impl Engine {
             ship_lookup_client: None,
             ship_bootstrap_peers: HashMap::new(),
             ancestor_fetcher: None,
+            gasp_ancestor_fetcher: None,
             peer_sync_budget: None,
             graph_budget: None,
             graph_budget_limbs: (
@@ -1041,6 +1043,14 @@ impl Engine {
     /// NOT call this — when unset, GASP ingest behavior is unchanged.
     pub fn set_ancestor_fetcher(&mut self, fetcher: std::rc::Rc<dyn crate::gasp::AncestorFetcher>) {
         self.ancestor_fetcher = Some(fetcher);
+    }
+
+    /// Supply a courier reserved for sync. Completion retains its own budget.
+    pub fn set_gasp_ancestor_fetcher(
+        &mut self,
+        fetcher: std::rc::Rc<dyn crate::gasp::AncestorFetcher>,
+    ) {
+        self.gasp_ancestor_fetcher = Some(fetcher);
     }
 
     /// Set the admission predicate asked BEFORE the door lands a carried
@@ -1551,6 +1561,20 @@ impl Engine {
         let (mut validations, mut steak, tx, txid, could_not_run) = self
             .run_validation(tagged_beef, mode, &context, bound, walked, policy)
             .await?;
+        if finalize {
+            let now = (current_timestamp_ms() / 1000.0) as u64;
+            for validation in &mut validations {
+                let manager = &self.managers[&validation.topic];
+                validation.admittance.outputs_to_admit.retain(|index| {
+                    tx.outputs.get(*index as usize).is_none_or(|output| {
+                        manager
+                            .sync_expiry(&output.locking_script)
+                            .is_none_or(|expiry| expiry > now)
+                    })
+                });
+                steak.insert(validation.topic.clone(), validation.admittance.clone());
+            }
+        }
         let mut report = MutationReport {
             walk_could_not_run: could_not_run,
             ..MutationReport::default()
@@ -4984,6 +5008,8 @@ impl Engine {
             let mut errors = Vec::new();
             let mut pruned_inputs: u64 = 0;
             let mut discarded_graphs: u64 = 0;
+            let mut expired_refused: u64 = 0;
+            let expired = std::rc::Rc::default();
             let mut anchor_walk_held_graphs: u64 = 0;
             let mut finalized_graphs: u64 = 0;
             let mut deadline_dropped_graphs: u64 = 0;
@@ -5046,7 +5072,11 @@ impl Engine {
                     // input the peer answers it does not hold, which exists
                     // only WITHOUT a fetcher, see
                     // `GASPSync::process_incoming_node`).
-                    let hydration_on = self.ancestor_fetcher.is_some();
+                    let sync_fetcher = self
+                        .gasp_ancestor_fetcher
+                        .as_ref()
+                        .or(self.ancestor_fetcher.as_ref());
+                    let hydration_on = sync_fetcher.is_some();
 
                     // Create storage adapter and remote
                     let mut gasp_storage =
@@ -5078,7 +5108,8 @@ impl Engine {
                         &log_prefix,
                         true, // unidirectional — overlay GASP is pull-only (submitNode throws); matches TS Engine.startGASPSync
                     )
-                    .with_ancestor_fetcher(self.ancestor_fetcher.clone());
+                    .with_ancestor_fetcher(sync_fetcher.cloned())
+                    .with_expired_outpoints(std::rc::Rc::clone(&expired));
                     // bsv-low #555: a graph past its own budget is deferred,
                     // not dropped with the sync.
                     if let Some((sleep, max_calls, budget_ms)) = &self.graph_budget {
@@ -5134,6 +5165,7 @@ impl Engine {
                     // Summed over peers: one decoy seen through two peers
                     // counts twice.
                     pruned_inputs += sync.pruned_inputs();
+                    expired_refused += sync.expired_refused();
                     // bsv-low #551: graphs the anchor check refused. Counted
                     // apart from `errors` for the same reason as a prune: a
                     // refused graph is not a failed sync (the reference
@@ -5384,6 +5416,7 @@ impl Engine {
             topics_synced.insert(
                 topic.clone(),
                 TopicSyncResult {
+                    expired_refused,
                     peers,
                     sync_type,
                     errors,
@@ -5408,6 +5441,10 @@ impl Engine {
             topics_synced.len()
         );
 
+        let expired: u64 = topics_synced.values().map(|r| r.expired_refused).sum();
+        if expired > 0 {
+            info!("[GASP SYNC] gaspExpiredRefused={expired}");
+        }
         Ok(GASPSyncResult { topics_synced })
     }
 
@@ -5930,6 +5967,9 @@ pub struct GASPSyncResult {
 /// Sync result for a single topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicSyncResult {
+    /// Distinct expired advert roots skipped before any proof request.
+    #[serde(default)]
+    pub expired_refused: u64,
     /// Peer URLs discovered or configured for this topic.
     pub peers: Vec<String>,
     /// How peers were determined: "ship" or "peers".
@@ -6042,7 +6082,7 @@ pub struct CursorMove {
 ///
 /// Uses `js_sys::Date::now()` on wasm32 (Cloudflare Workers) since
 /// `std::time::SystemTime` is not available on that platform.
-fn current_timestamp_ms() -> f64 {
+pub(crate) fn current_timestamp_ms() -> f64 {
     #[cfg(target_arch = "wasm32")]
     {
         js_sys::Date::now()
@@ -8374,6 +8414,7 @@ mod tests {
         topics_synced.insert(
             "tm_test".to_string(),
             super::TopicSyncResult {
+                expired_refused: 0,
                 peers: vec!["https://peer.com".to_string()],
                 sync_type: "ship".to_string(),
                 errors: vec![],
@@ -8721,6 +8762,39 @@ mod tests {
             self.requested.set(self.requested.get() + 1);
             self.proofs.get(txid).cloned()
         }
+    }
+
+    #[tokio::test]
+    async fn copy_sync_leaves_completion_courier_untouched() {
+        let (mut engine, mut remote) = budget_page_engine(1);
+        remote.node_cost_ms = 0;
+        let txid = remote.outputs[0].txid.clone();
+        let proof = std::rc::Rc::make_mut(&mut remote.nodes)
+            .get_mut(&txid)
+            .unwrap()
+            .proof
+            .take()
+            .unwrap();
+        let completion_asks = std::rc::Rc::new(Cell::new(0));
+        let sync_asks = std::rc::Rc::new(Cell::new(0));
+        engine.set_ancestor_fetcher(std::rc::Rc::new(ProofOnlyRootFetcher {
+            proofs: HashMap::new(),
+            requested: completion_asks.clone(),
+        }));
+        engine.set_gasp_ancestor_fetcher(std::rc::Rc::new(ProofOnlyRootFetcher {
+            proofs: HashMap::from([(txid.clone(), proof.clone())]),
+            requested: sync_asks.clone(),
+        }));
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(result.topics_synced["tm_test"].finalized_graphs, 1);
+        assert_eq!(completion_asks.get(), 0);
+        assert_eq!(sync_asks.get(), 1);
+        let served = engine
+            .provide_foreign_gasp_node(&format!("{txid}.0"), &txid, 0)
+            .await
+            .unwrap();
+        assert_eq!(served.proof, Some(proof));
     }
 
     #[tokio::test]

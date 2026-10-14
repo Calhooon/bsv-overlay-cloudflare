@@ -34,7 +34,7 @@
 
 use overlay_engine::beef_limits;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use async_trait::async_trait;
@@ -205,10 +205,17 @@ impl ProofSources {
     }
 }
 
-/// `AncestorFetcher` backed by the Arcade→Bitails→WoC courier ladder (WoC is
-/// break-glass/last-resort) with a mandatory chaintracks re-verify before ANY
-/// bump is returned.
+#[derive(Clone)]
+struct ProofMemo {
+    outcome: Result<Option<String>, String>,
+    exhaustive: bool,
+}
+
+/// `AncestorFetcher` backed by the configured courier ladder, with a
+/// mandatory header verification before any BUMP is returned.
 pub struct ChainProofFetcher {
+    proof_memo: RefCell<HashMap<String, ProofMemo>>,
+    ancestor_memo: RefCell<HashMap<String, Result<FetchedAncestor, GASPError>>>,
     arcade_url: String,
     bananablocks_base: String,
     woc_base: String,
@@ -299,6 +306,8 @@ impl ChainProofFetcher {
             woc_api_key: None,
             tracker,
             budget: Cell::new(DEFAULT_FETCH_BUDGET),
+            proof_memo: RefCell::new(HashMap::new()),
+            ancestor_memo: RefCell::new(HashMap::new()),
             rung_stats: RefCell::new(BTreeMap::new()),
             rung_consecutive_faults: RefCell::new(BTreeMap::new()),
             rung_rotation: Cell::new(0),
@@ -416,7 +425,7 @@ impl ChainProofFetcher {
     /// fail for every rung, so it propagates immediately as retryable);
     /// courier fetch failures stay `Ok(None)`-shaped (honest unknown).
     pub(crate) async fn fetch_verified_proof(&self, txid: &str) -> Result<Option<String>, String> {
-        self.fetch_verified_proof_with(txid, true).await
+        self.memoized_proof(txid, true, true).await
     }
 
     /// bsv-low #451 slice B: the ladder with NO per-pass stop on Arcade's unmined word — every rung is asked. For
@@ -426,7 +435,58 @@ impl ChainProofFetcher {
         &self,
         txid: &str,
     ) -> Result<Option<String>, String> {
-        self.fetch_verified_proof_with(txid, false).await
+        self.memoized_proof(txid, false, true).await
+    }
+
+    /// The memo belongs to this courier instance, shared by every path in
+    /// one run. Mark an attempt before awaiting so cancellation cannot cause
+    /// another request. A partial negative cannot become an exhaustive verdict.
+    async fn memoized_proof(
+        &self,
+        txid: &str,
+        arcade_stop: bool,
+        charge: bool,
+    ) -> Result<Option<String>, String> {
+        let key = txid.to_ascii_lowercase();
+        if let Some(memo) = self.proof_memo.borrow().get(&key) {
+            if !arcade_stop && !memo.exhaustive && matches!(memo.outcome, Ok(None)) {
+                return Err("prior proof search stopped on an unmined hint; exhaustive retry needs another run".into());
+            }
+            return memo.outcome.clone();
+        }
+        if charge {
+            if let Some(Err(error)) = self.ancestor_memo.borrow().get(&key) {
+                return Err(error.to_string());
+            }
+        }
+        self.proof_memo.borrow_mut().insert(
+            key.clone(),
+            ProofMemo {
+                outcome: Err("proof attempt pending or interrupted; retry next run".into()),
+                exhaustive: true,
+            },
+        );
+        let exhaustive = Cell::new(true);
+        let outcome = if charge && self.budget.get() == 0 {
+            push_log(&format!(
+                "[proof] per-tick budget exhausted (skipping proof for {key}; retried next tick)"
+            ));
+            Ok(None)
+        } else {
+            if charge {
+                self.budget.set(self.budget.get() - 1);
+            }
+            self.fetch_verified_proof_with(&key, arcade_stop, &exhaustive)
+                .await
+        };
+        self.proof_memo.borrow_mut().insert(
+            key,
+            ProofMemo {
+                outcome: outcome.clone(),
+                exhaustive: exhaustive.get(),
+            },
+        );
+        outcome
     }
 
     /// The ladder. `arcade_stop`: may a fresh "held unmined" word from Arcade end this pass without asking the
@@ -435,6 +495,7 @@ impl ChainProofFetcher {
         &self,
         txid: &str,
         arcade_stop: bool,
+        exhaustive: &Cell<bool>,
     ) -> Result<Option<String>, String> {
         if self.arcade_url.is_empty() && self.bitails_base.is_empty() && self.woc_base.is_empty() {
             for name in ["arcade", "bitails", "woc"] {
@@ -484,9 +545,10 @@ impl ChainProofFetcher {
             // WoC read per tick that could only answer "no bump".
             ArcadeProofLook::KnownUnmined(status) => {
                 if arcade_stop {
-                    worker::console_log!(
-                        "[proof] arcade holds {txid} unmined ({status}) — the couriers are not asked this pass"
-                    );
+                    exhaustive.set(false);
+                    push_log(&format!(
+                        "[proof] arcade holds {txid} unmined ({status}); couriers skipped this pass"
+                    ));
                     return Ok(None);
                 }
                 worker::console_log!(
@@ -967,34 +1029,67 @@ impl AncestorFetcher for ChainProofFetcher {
     }
 
     async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
-        // Per-tick budget guard — bound subrequests per Worker invocation.
-        let remaining = self.budget.get();
-        if remaining == 0 {
-            return Err(GASPError::RemoteError(format!(
-                "proof-fetch per-tick budget exhausted (skipping {txid}; retried next tick)"
-            )));
+        let key = txid.to_ascii_lowercase();
+        if let Some(answer) = self.ancestor_memo.borrow().get(&key) {
+            return answer.clone();
         }
-        self.budget.set(remaining - 1);
-
-        // Content-address: the returned raw MUST hash to the requested txid, so
-        // a garbled/malicious courier response can never inject a forged
-        // ancestor (trait mandate).
-        let raw_tx = self.fetch_raw_hex(txid).await?;
-        let recomputed = Transaction::from_hex(raw_tx.trim())
-            .map_err(|e| GASPError::Other(format!("parse raw {txid}: {e}")))?
-            .id();
-        if !recomputed.eq_ignore_ascii_case(txid) {
-            return Err(GASPError::Other(format!(
-                "content-address mismatch: raw hashes to {recomputed}, requested {txid}"
-            )));
+        if self
+            .proof_memo
+            .borrow()
+            .get(&key)
+            .is_some_and(|m| !matches!(m.outcome, Ok(Some(_))))
+        {
+            return Err(GASPError::RemoteError(
+                "transaction already attempted without a proof; retry next run".into(),
+            ));
         }
-
-        // Proof: courier ladder + chaintracks verify. Unmined / unverifiable at
-        // every tier → `None` (retry next tick), NEVER an error.
-        // The ancestor path never needs the fault distinction — a proof-read
-        // fault degrades to "no proof" (the raw alone is still the answer).
-        let proof = self.fetch_verified_proof(txid).await.unwrap_or(None);
-        Ok(FetchedAncestor { raw_tx, proof })
+        self.ancestor_memo.borrow_mut().insert(
+            key.clone(),
+            Err(GASPError::RemoteError(
+                "ancestor attempt pending or interrupted; retry next run".into(),
+            )),
+        );
+        let result = async {
+            if self.budget.get() == 0 {
+                if !self.proof_memo.borrow().contains_key(&key) {
+                    push_log(&format!("[proof] per-tick budget exhausted (skipping proof for {key}; retried next tick)"));
+                    self.proof_memo.borrow_mut().insert(
+                        key.clone(),
+                        ProofMemo {
+                            outcome: Ok(None),
+                            exhaustive: true,
+                        },
+                    );
+                }
+                return Err(GASPError::RemoteError(
+                    "proof-fetch per-tick budget exhausted".into(),
+                ));
+            }
+            self.budget.set(self.budget.get() - 1);
+            let raw_tx = self.fetch_raw_hex(&key).await?;
+            let recomputed = Transaction::from_hex(raw_tx.trim())
+                .map_err(|e| GASPError::Other(format!("parse raw {key}: {e}")))?
+                .id();
+            if !recomputed.eq_ignore_ascii_case(&key) {
+                return Err(GASPError::Other(format!(
+                    "content-address mismatch: raw hashes to {recomputed}, requested {key}"
+                )));
+            }
+            let proof = self.memoized_proof(&key, true, false).await.unwrap_or(None);
+            Ok(FetchedAncestor { raw_tx, proof })
+        }
+        .await;
+        if let Err(error) = &result {
+            self.proof_memo
+                .borrow_mut()
+                .entry(key.clone())
+                .or_insert_with(|| ProofMemo {
+                    outcome: Err(error.to_string()),
+                    exhaustive: true,
+                });
+        }
+        self.ancestor_memo.borrow_mut().insert(key, result.clone());
+        result
     }
 
     /// PROOF-ONLY completion path (#192/#193 FIX 2): run the courier ladder +
@@ -1012,32 +1107,10 @@ impl AncestorFetcher for ChainProofFetcher {
     }
 
     async fn verified_proof_for_detailed(&self, txid: &str) -> Result<Option<String>, String> {
-        let remaining = self.budget.get();
-        if remaining == 0 {
-            // push_log, not console_log (bsv-low#304 gate LOW-3 residual):
-            // native tests exercise the zero-budget path (the admin bulk
-            // re-verify's chaintracks-only property). A budget refusal is a
-            // DELIBERATE local bound, not a read fault → Ok(None).
-            push_log(&format!(
-                "[proof] per-tick budget exhausted (skipping proof for {txid}; retried next tick)"
-            ));
-            return Ok(None);
-        }
-        self.budget.set(remaining - 1);
         self.fetch_verified_proof(txid).await
     }
 
-    /// bsv-low #451 slice B (the delta-verify's LOW-A): the budgeted EXHAUSTIVE ask — every rung, no per-pass stop
-    /// on Arcade's unmined word — for the reorg re-anchor. Budget-bounded exactly like the detailed ask.
     async fn verified_proof_for_exhaustive(&self, txid: &str) -> Result<Option<String>, String> {
-        let remaining = self.budget.get();
-        if remaining == 0 {
-            push_log(&format!(
-                "[proof] per-tick budget exhausted (skipping proof for {txid}; retried next tick)"
-            ));
-            return Ok(None);
-        }
-        self.budget.set(remaining - 1);
         self.fetch_verified_proof_exhaustive(txid).await
     }
 
@@ -1417,7 +1490,10 @@ fn tsc_proof_to_merkle_path(
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-thread_local! { static TEST_HTTP_CALLS: Cell<u32> = const { Cell::new(0) }; }
+thread_local! {
+    static TEST_HTTP_CALLS: Cell<u32> = const { Cell::new(0) };
+    static TEST_PROOF_LOGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) async fn http_get(_: &str, _: Option<(&str, &str)>) -> Result<(u16, String), String> {
     TEST_HTTP_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -4313,6 +4389,8 @@ impl PushedPotSummary {
 /// stored-bump-failed-reverify branch. `pub(crate)` since bsv-low#309: the
 /// natively-tested advert-lifecycle passes log through it too.
 pub(crate) fn push_log(msg: &str) {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    TEST_PROOF_LOGS.with(|logs| logs.borrow_mut().push(msg.to_string()));
     #[cfg(target_arch = "wasm32")]
     worker::console_log!("{}", msg);
     #[cfg(not(target_arch = "wasm32"))]
@@ -7884,6 +7962,111 @@ pub(crate) mod tests {
             1,
             "only the named rung reaches the mock transport"
         );
+    }
+
+    #[tokio::test]
+    async fn copy_memo_budget_zero_logs_once_and_new_run_retries() {
+        TEST_HTTP_CALLS.with(|calls| calls.set(0));
+        TEST_PROOF_LOGS.with(|logs| logs.borrow_mut().clear());
+        let fetcher = ChainProofFetcher::new(None)
+            .with_sources(ProofSources::parse("bitails"))
+            .with_budget(0);
+        for _ in 0..3 {
+            assert!(fetcher.verified_proof_for("aa").await.is_none());
+            assert!(fetcher.fetch_ancestor("aa").await.is_err());
+            assert!(fetcher
+                .verified_proof_for_exhaustive("AA")
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(TEST_HTTP_CALLS.with(Cell::get), 0);
+        assert_eq!(TEST_PROOF_LOGS.with(|logs| logs.borrow().len()), 1);
+        let next = ChainProofFetcher::new(None).with_sources(ProofSources::parse("bitails"));
+        assert!(next.verified_proof_for("aa").await.is_none());
+        assert_eq!(TEST_HTTP_CALLS.with(Cell::get), 1);
+    }
+
+    #[tokio::test]
+    async fn copy_memo_ancestor_fault_is_kept_across_proof_paths() {
+        TEST_HTTP_CALLS.with(|calls| calls.set(0));
+        let fetcher = ChainProofFetcher::new(None).with_sources(ProofSources::parse("bitails"));
+        assert!(matches!(
+            fetcher.fetch_ancestor("aa").await,
+            Err(GASPError::NodeNotFound(_))
+        ));
+        let calls = TEST_HTTP_CALLS.with(Cell::get);
+        assert!(fetcher.verified_proof_for_detailed("aa").await.is_err());
+        assert!(fetcher.verified_proof_for_exhaustive("aa").await.is_err());
+        assert!(matches!(
+            fetcher.fetch_ancestor("AA").await,
+            Err(GASPError::NodeNotFound(_))
+        ));
+        assert_eq!(TEST_HTTP_CALLS.with(Cell::get), calls);
+        assert_eq!(fetcher.budget.get(), DEFAULT_FETCH_BUDGET - 1);
+    }
+
+    #[tokio::test]
+    async fn copy_memo_partial_negative_never_becomes_exhaustive_evidence() {
+        TEST_HTTP_CALLS.with(|calls| calls.set(0));
+        let fetcher = ChainProofFetcher::new(None);
+        fetcher.proof_memo.borrow_mut().insert(
+            "aa".into(),
+            ProofMemo {
+                outcome: Ok(None),
+                exhaustive: false,
+            },
+        );
+        assert!(fetcher.verified_proof_for("aa").await.is_none());
+        assert!(fetcher
+            .verified_proof_for_exhaustive("aa")
+            .await
+            .unwrap_err()
+            .contains("unmined hint"));
+        assert_eq!(TEST_HTTP_CALLS.with(Cell::get), 0);
+    }
+
+    #[tokio::test]
+    async fn copy_sync_budget_does_not_spend_completion_allowance() {
+        let completion = ChainProofFetcher::new(None);
+        let sync = ChainProofFetcher::new(None).with_budget(crate::GASP_PROOF_FETCH_BUDGET);
+        assert_eq!(crate::GASP_PROOF_FETCH_BUDGET, 60);
+        for i in 0..61 {
+            assert!(sync
+                .verified_proof_for(&format!("{i:064x}"))
+                .await
+                .is_none());
+        }
+        assert_eq!(sync.budget_remaining(), Some(0));
+        assert_eq!(completion.budget_remaining(), Some(DEFAULT_FETCH_BUDGET));
+        let source = include_str!("lib.rs");
+        assert!(source.contains(
+            "courier_fetcher(env, proof_tracker.clone()).with_budget(GASP_PROOF_FETCH_BUDGET)"
+        ));
+        assert!(source.contains("engine.set_gasp_ancestor_fetcher(std::rc::Rc::new(sync_fetcher))"));
+    }
+
+    #[tokio::test]
+    async fn copy_memo_negative_is_shared_by_output_ancestor_and_exhaustive() {
+        TEST_HTTP_CALLS.with(|calls| calls.set(0));
+        let fetcher = ChainProofFetcher::new(None).with_sources(ProofSources::parse("bitails"));
+        assert!(fetcher.verified_proof_for("aa").await.is_none());
+        let requests = TEST_HTTP_CALLS.with(Cell::get);
+        let remaining = fetcher.budget_remaining();
+        assert!(requests > 0);
+        assert!(fetcher
+            .verified_proof_for_exhaustive("aa")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(fetcher.fetch_ancestor("aa").await.is_err());
+        assert!(fetcher.verified_proof_for("AA").await.is_none());
+        assert_eq!(
+            TEST_HTTP_CALLS.with(Cell::get),
+            requests,
+            "one negative ask per transaction per run"
+        );
+        assert_eq!(fetcher.budget_remaining(), remaining);
     }
 
     #[test]

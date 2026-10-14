@@ -1,37 +1,8 @@
-//! Peer crawler — pulls `/lookup` output-lists from configured non-GASP
-//! overlay peers and re-submits each returned BEEF into our own engine so
-//! the records appear in our D1.
-//!
-//! # Why this exists
-//!
-//! The engine already speaks GASP (`engine.start_gasp_sync()`) for peers
-//! that expose `/requestSyncResponse`. The only UHRP-carrying peer today
-//! (`overlay-us-1.bsvb.tech`) does NOT speak GASP — they return
-//! `ERR_ROUTE_NOT_FOUND` on that path (probed 2026-04-21). They do
-//! expose `/lookup` and `/submit`, so we HTTP-crawl them instead.
-//!
-//! This module is **bsvb-specific compatibility glue**, scoped to drop
-//! when bsvb (or any other non-GASP peer in the config) adds GASP
-//! support. The GASP plumbing in overlay-engine is the long-term
-//! correct answer; this is the bridge.
-//!
-//! # Design
-//!
-//! For each configured (peer, service → topic) mapping:
-//!
-//! 1. `POST peer/lookup {"service": "<service>", "query": {"findAll": true}}`
-//! 2. Parse the JSON response as `OutputList { outputs: [{ beef, outputIndex }] }`
-//! 3. For each output, call our own `engine.submit(TaggedBEEF{beef, topics: [topic]}, CurrentTx)`
-//! 4. Skip-on-duplicate is already the engine's behaviour (tm_X
-//!    `is_dupe` check), so crawling the same peer repeatedly is
-//!    idempotent — no new txs, just admit-decision replay.
-//!
-//! Errors are per-peer, per-service: a failed lookup logs + continues
-//! to the next service; a failed submit logs + continues to the next
-//! output. Never returns Err from the crawl driver; partial success
-//! is the expected common case (e.g. bsvb sends 80 records, our tm_X
-//! admits 70 and rejects 10 for stale-expiry or bad-sig — still a net
-//! win).
+//! Targeted peer lookups supplement GASP discovery with hosts for content
+//! this overlay already carries. UHRP peers require a selector; they do not
+//! promise a list-all query. Each pass samples at most 16 distinct live hashes
+//! from local adverts, queries their bare UHRP URLs, and admits returned BEEF
+//! through the normal engine checks. GASP enumerates unfamiliar content.
 
 use overlay_engine::engine::Engine;
 use overlay_engine::types::{SubmitMode, TaggedBEEF};
@@ -121,12 +92,14 @@ pub async fn crawl_peers(
                     }
                 }
                 Err(e) => {
-                    worker::console_log!(
-                        "[{origin}] peer-crawl: {peer}/{service} lookup failed: {err}",
-                        peer = peer.peer_url,
-                        service = service,
-                        err = e,
-                    );
+                    if !is_lookup_400(&e) || claim_400_log(db, &key).await {
+                        worker::console_log!(
+                            "[{origin}] peer-crawl: {peer}/{service} lookup failed: {err}",
+                            peer = peer.peer_url,
+                            service = service,
+                            err = e,
+                        );
+                    }
                     result.peer_errors.insert(key, e);
                 }
             }
@@ -154,7 +127,21 @@ async fn crawl_one(
     origin: &str,
     db: Option<&worker::D1Database>,
 ) -> Result<CrawledOne, String> {
-    let outputs = fetch_lookup(peer_url, service).await?;
+    let mut outputs = Vec::new();
+    if service == "ls_uhrp" {
+        if let Some(db) = db {
+            let seeds: Vec<CrawlSeed> = crate::d1::Query::new(CRAWL_SEEDS_SQL)
+                .bind(worker::Date::now().as_millis() / 1000)
+                .bind(UHRP_CRAWL_QUERY_LIMIT)
+                .fetch_all(db)
+                .await?;
+            for seed in seeds {
+                outputs.extend(fetch_lookup(peer_url, service, Some(&seed.url)).await?);
+            }
+        }
+    } else {
+        outputs = fetch_lookup(peer_url, service, None).await?;
+    }
     let mut admitted_total: usize = 0;
     let mut errors: Vec<String> = Vec::new();
     let mut walks: Vec<overlay_engine::engine::WalkCouldNotRun> = Vec::new();
@@ -217,13 +204,14 @@ async fn crawl_one(
 /// output-list response. Returns just the output entries — any
 /// `free-text-reply` responses (not applicable for our services) are
 /// treated as empty.
-async fn fetch_lookup(peer_url: &str, service: &str) -> Result<Vec<OutputEntry>, String> {
+async fn fetch_lookup(
+    peer_url: &str,
+    service: &str,
+    uhrp_url: Option<&str>,
+) -> Result<Vec<OutputEntry>, String> {
     let url = format!("{}/lookup", peer_url.trim_end_matches('/'));
 
-    let body_json = serde_json::json!({
-        "service": service,
-        "query": { "findAll": true }
-    });
+    let body_json = lookup_body(service, uhrp_url);
     let body_str = body_json.to_string();
 
     let mut init = worker::RequestInit::new();
@@ -243,7 +231,10 @@ async fn fetch_lookup(peer_url: &str, service: &str) -> Result<Vec<OutputEntry>,
 
     let status = response.status_code();
     if !(200..300).contains(&status) {
-        return Err(format!("peer {url} returned HTTP {status}"));
+        return Err(format!(
+            "peer {url} returned HTTP {status}; request body shape: {}",
+            lookup_body_shape(service)
+        ));
     }
 
     let text = response
@@ -252,6 +243,73 @@ async fn fetch_lookup(peer_url: &str, service: &str) -> Result<Vec<OutputEntry>,
         .map_err(|e| format!("read body: {e}"))?;
 
     parse_output_list(&text)
+}
+
+const UHRP_CRAWL_QUERY_LIMIT: u64 = 16;
+const CRAWL_SEEDS_SQL: &str = "SELECT DISTINCT uhrpUrl AS url FROM uhrp_records WHERE expiryTime > ?1 ORDER BY RANDOM() LIMIT ?2";
+const CLAIM_400_SQL: &str = "INSERT INTO ops_counters (name, value) VALUES (?1, 1) ON CONFLICT(name) DO NOTHING RETURNING value";
+
+#[derive(Deserialize)]
+struct CrawlSeed {
+    url: String,
+}
+
+thread_local! {
+    static LOGGED_400: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::default();
+}
+
+pub(crate) fn is_lookup_400(error: &str) -> bool {
+    error.contains("returned HTTP 400; request body shape:")
+}
+
+async fn claim_400_log(db: Option<&worker::D1Database>, peer_service: &str) -> bool {
+    // One durable claim per configured peer, service and body shape version.
+    // The isolate cache also bounds logging when the observation store faults.
+    let key = format!(
+        "peer_crawl_400_v1_{}",
+        hex::encode(bsv_rs::primitives::hash::sha256(peer_service.as_bytes()))
+    );
+    if !LOGGED_400.with(|seen| seen.borrow_mut().insert(key.clone())) {
+        return false;
+    }
+    let Some(db) = db else {
+        return true;
+    };
+    crate::d1::Query::new(CLAIM_400_SQL)
+        .bind(key)
+        .fetch_optional::<serde_json::Value>(db)
+        .await
+        .map_or(true, |claimed| claimed.is_some())
+}
+
+fn lookup_body_shape(service: &str) -> &'static str {
+    if service == "ls_uhrp" {
+        "{service:string,query:{uhrpUrl:bare-string}}"
+    } else {
+        "{service:string,query:{findAll:boolean}}"
+    }
+}
+
+fn lookup_body(service: &str, uhrp_url: Option<&str>) -> serde_json::Value {
+    let query = match uhrp_url {
+        Some(url) => {
+            let bare = url
+                .strip_prefix("uhrp://")
+                .or_else(|| url.strip_prefix("uhrp:"))
+                .unwrap_or(url);
+            serde_json::json!({"uhrpUrl": bare})
+        }
+        None => serde_json::json!({"findAll": true}),
+    };
+    serde_json::json!({"service": service, "query": query})
+}
+
+#[test]
+fn copy_crawl_body_uses_bare_uhrp_selector() {
+    assert_eq!(
+        lookup_body("ls_uhrp", Some("uhrp://fixture")),
+        serde_json::json!({"service": "ls_uhrp", "query": {"uhrpUrl": "fixture"}})
+    );
 }
 
 /// Pure parser for the peer's `/lookup` JSON response. Extracted for
@@ -286,6 +344,38 @@ fn preview(s: &str) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn copy_crawl_sql_samples_live_content_and_claims_one_400_log() {
+        use rusqlite::OptionalExtension;
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            let _ = db.execute_batch(sql);
+        }
+        for i in 0..24 {
+            db.execute("INSERT INTO uhrp_records (txid, outputIndex, uhrpUrl, identityKey, downloadUrl, expiryTime, contentLength) VALUES (?1,0,?2,'fixture','https://content.example/item',?3,1)",
+                rusqlite::params![format!("tx{i}"), format!("hash{i}"), if i == 0 { 99 } else { 101 }]).unwrap();
+        }
+        let mut query = db.prepare(CRAWL_SEEDS_SQL).unwrap();
+        let rows: Vec<String> = query
+            .query_map(rusqlite::params![100, UHRP_CRAWL_QUERY_LIMIT], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 16);
+        assert!(!rows.iter().any(|url| url == "hash0"));
+        for (key, expected) in [
+            ("peer-a-shape-v1", Some(1)),
+            ("peer-a-shape-v1", None),
+            ("peer-b-shape-v1", Some(1)),
+        ] {
+            let claimed: Option<u32> = db
+                .query_row(CLAIM_400_SQL, [key], |r| r.get(0))
+                .optional()
+                .unwrap();
+            assert_eq!(claimed, expected);
+        }
+    }
 
     #[test]
     fn parses_output_list_with_two_entries() {

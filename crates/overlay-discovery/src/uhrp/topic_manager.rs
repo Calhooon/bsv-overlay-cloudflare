@@ -11,20 +11,10 @@
 //! 6. ECDSA signature (DER): over `concat(field[0..4])`, linked via BRC-42
 //!    to field[0].
 //!
-//! There is **no TypeScript reference** for a UHRP topic manager — the crate
-//! `@bsv/overlay-discovery-services` ships only SHIP and SLAP. This module
-//! is the reference implementation. It mirrors the structure of
-//! [`super::super::ship::topic_manager::SHIPTopicManager`] line-for-line,
-//! swapping the field validation to the UHRP 5-field layout.
-//!
-//! # Expiry policy
-//!
-//! This implementation is **strict**: an advert whose `expiry_time <= now()`
-//! at validation time is rejected. Rationale is documented in
-//! `docs/uhrp_topic.md`. SHIP has no expiry field so its topic manager does
-//! not reject on it; UHRP has expiry as an in-protocol field explicitly for
-//! "how long the host commits to serving this content" — admitting expired
-//! commitments is never useful.
+//! Submission admission follows uhrp-services@b9ed638: a positive expiry is
+//! accepted even after its time passes. The sync walk may skip an expired
+//! advert before proof hydration because its host commitment has ended.
+//! Lookup filtering and chain verification retain their own roles.
 //!
 //! # Reference points
 //!
@@ -77,6 +67,15 @@ impl TopicManager for UHRPTopicManager {
     /// Admission is judged on the transaction alone: no off-chain value is read.
     fn reads_off_chain_values(&self) -> bool {
         false
+    }
+
+    fn sync_expiry(&self, script: &bsv_rs::script::LockingScript) -> Option<u64> {
+        let advert = PushDrop::decode(script).ok()?;
+        if advert.fields.len() != 6 {
+            return None;
+        }
+        let expiry = Reader::new(&advert.fields[3]).read_var_int().ok()?;
+        (expiry > 0).then_some(expiry)
     }
 
     async fn identify_admissible_outputs(
@@ -888,5 +887,287 @@ mod tests {
         // Intentional no-op; see handler tests in bsv-storage-cloudflare
         // for the actual live round-trip against both bsvb.tech and
         // <your-overlay>.workers.dev.
+    }
+    #[derive(Clone)]
+    struct CopyRemote {
+        nodes: std::rc::Rc<Vec<overlay_engine::types::GASPNode>>,
+        asks: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    #[async_trait(?Send)]
+    impl overlay_engine::gasp::GASPRemote for CopyRemote {
+        async fn get_initial_response(
+            &self,
+            request: &overlay_engine::types::GASPInitialRequest,
+        ) -> Result<overlay_engine::types::GASPInitialResponse, overlay_engine::gasp::GASPError>
+        {
+            Ok(overlay_engine::types::GASPInitialResponse {
+                since: request.since,
+                utxo_list: self
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, node)| {
+                        let score = (i as u64 + 1) * 10;
+                        (score >= request.since).then(|| overlay_engine::types::GASPOutput {
+                            txid: Transaction::from_hex(&node.raw_tx).unwrap().id(),
+                            output_index: node.output_index,
+                            score: score as f64,
+                        })
+                    })
+                    .collect(),
+            })
+        }
+        async fn get_initial_reply(
+            &self,
+            _: &overlay_engine::types::GASPInitialResponse,
+        ) -> Result<overlay_engine::types::GASPInitialReply, overlay_engine::gasp::GASPError>
+        {
+            unreachable!()
+        }
+        async fn request_node(
+            &self,
+            graph: &str,
+            txid: &str,
+            output: u32,
+            _: bool,
+        ) -> Result<overlay_engine::types::GASPNode, overlay_engine::gasp::GASPError> {
+            self.asks.set(self.asks.get() + 1);
+            let mut node = self
+                .nodes
+                .iter()
+                .find(|n| {
+                    Transaction::from_hex(&n.raw_tx).unwrap().id() == txid
+                        && n.output_index == output
+                })
+                .unwrap()
+                .clone();
+            node.graph_id = graph.into();
+            Ok(node)
+        }
+        async fn submit_node(
+            &self,
+            _: &overlay_engine::types::GASPNode,
+        ) -> Result<Option<overlay_engine::types::GASPNodeResponse>, overlay_engine::gasp::GASPError>
+        {
+            unreachable!()
+        }
+    }
+    impl overlay_engine::gasp::GASPRemoteFactory for CopyRemote {
+        fn create_remote(&self, _: &str, _: &str) -> Box<dyn overlay_engine::gasp::GASPRemote> {
+            Box::new(self.clone())
+        }
+    }
+    struct CopyFetcher(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+    #[async_trait(?Send)]
+    impl overlay_engine::gasp::AncestorFetcher for CopyFetcher {
+        async fn fetch_ancestor(
+            &self,
+            _: &str,
+        ) -> Result<overlay_engine::gasp::FetchedAncestor, overlay_engine::gasp::GASPError>
+        {
+            panic!("a proven root needs no ancestor courier")
+        }
+        async fn verified_proof_for(&self, txid: &str) -> Option<String> {
+            self.0.borrow_mut().push(txid.into());
+            Some(
+                bsv_rs::transaction::MerklePath::new(
+                    1,
+                    vec![vec![bsv_rs::transaction::MerklePathLeaf::new_txid(
+                        0,
+                        txid.into(),
+                    )]],
+                )
+                .unwrap()
+                .to_hex(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_sync_expired_page_spends_proofs_on_live_only() {
+        for budgeted in [false, true] {
+            copy_expired_page(budgeted).await;
+        }
+    }
+
+    async fn copy_expired_page(budgeted: bool) {
+        use overlay_engine::engine::{Engine, EngineConfig};
+        use overlay_engine::storage::memory::MemoryStorage;
+        use overlay_engine::types::{GASPNode, SyncTarget};
+        use std::{collections::HashMap, rc::Rc};
+        let key = PrivateKey::from_hex(&format!("{:064x}", 7)).unwrap();
+        let mut nodes = Vec::new();
+        let mut tracker = bsv_rs::transaction::MockChainTracker::new(10);
+        for (i, expiry) in [1, u64::MAX, 2].into_iter().enumerate() {
+            let raw = format!(
+                "0100000001{}0000000000ffffffff010100000000000000015100000000",
+                "11".repeat(32)
+            );
+            let mut tx = Transaction::from_hex(&raw).unwrap();
+            tx.outputs.clear();
+            tx.add_output(make_signed_uhrp_output(
+                &key,
+                [i as u8; 32],
+                "https://content.example/item",
+                expiry,
+                1,
+            ))
+            .unwrap();
+            if i == 1 {
+                tx.add_output(make_signed_uhrp_output(
+                    &key,
+                    [9; 32],
+                    "https://content.example/old",
+                    1,
+                    1,
+                ))
+                .unwrap();
+                tracker.add_root(1, tx.id());
+            }
+            nodes.push(GASPNode {
+                graph_id: String::new(),
+                raw_tx: tx.to_hex(),
+                output_index: 0,
+                proof: None,
+                tx_metadata: None,
+                output_metadata: None,
+                inputs: None,
+            });
+        }
+        let live = Transaction::from_hex(&nodes[1].raw_tx).unwrap().id();
+        let remote = CopyRemote {
+            nodes: Rc::new(nodes),
+            asks: Rc::default(),
+        };
+        let proof_asks = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let peers = ["https://peer.example", "https://another-peer.example"];
+        let mut config = EngineConfig::default();
+        config.sync_configuration.insert(
+            "tm_uhrp".into(),
+            SyncTarget::Peers(peers.iter().map(|peer| (*peer).into()).collect()),
+        );
+        let managers: HashMap<String, Box<dyn TopicManager>> = HashMap::from([(
+            "tm_uhrp".into(),
+            Box::new(UHRPTopicManager::new()) as Box<dyn TopicManager>,
+        )]);
+        let mut engine = Engine::with_chain_tracker(
+            managers,
+            HashMap::new(),
+            Box::new(MemoryStorage::new()),
+            None,
+            None,
+            Some(Box::new(tracker)),
+            config,
+        );
+        if budgeted {
+            let root = remote.nodes[0].clone();
+            let outpoint = format!("{}.0", Transaction::from_hex(&root.raw_tx).unwrap().id());
+            let mut record = overlay_engine::gasp::DeferredGraph {
+                peer: "https://peer.example".into(),
+                topic: "tm_uhrp".into(),
+                outpoint: outpoint.clone(),
+                score: 10,
+                nodes: vec![overlay_engine::gasp::WalkedNode {
+                    node: root,
+                    spent_by: None,
+                }],
+                pending: vec![],
+                calls: 1,
+                passes: 1,
+                reason: "time".into(),
+                configured: true,
+                idle_faults: 0,
+            };
+            for peer in peers {
+                record.peer = peer.into();
+                engine.storage().put_deferred_graph(&record).await.unwrap();
+            }
+            let sleep: overlay_engine::engine::SleepFactory =
+                Rc::new(|_| Box::pin(std::future::pending()));
+            engine.set_peer_sync_budget(sleep.clone(), 30_000);
+            engine.set_graph_budget(sleep, 64, 15_000);
+        }
+        engine.set_ancestor_fetcher(Rc::new(CopyFetcher(proof_asks.clone())));
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(
+            *proof_asks.borrow(),
+            vec![live.clone()],
+            "expired adverts must not spend proofs"
+        );
+        assert_eq!(
+            remote.asks.get(),
+            if budgeted { 2 } else { 3 },
+            "expired retained roots, boundary adverts and other peers need no re-request"
+        );
+        assert_eq!(result.topics_synced["tm_uhrp"].cursor_moves.len(), 2);
+        for cursor in &result.topics_synced["tm_uhrp"].cursor_moves {
+            assert_eq!(cursor.to, 30);
+        }
+        assert_eq!(
+            result.topics_synced["tm_uhrp"].finalized_graphs, 1,
+            "{result:?}"
+        );
+        assert_eq!(result.topics_synced["tm_uhrp"].expired_refused, 2);
+        assert_eq!(result.topics_synced["tm_uhrp"].deferred_graphs, 0);
+        for peer in peers {
+            assert!(engine
+                .storage()
+                .find_deferred_graphs(peer, "tm_uhrp")
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert!(
+            engine
+                .storage()
+                .find_output(&live, 1, Some("tm_uhrp"), None, false)
+                .await
+                .unwrap()
+                .is_none(),
+            "expired siblings stay out of sync admission"
+        );
+        let old = Transaction::from_hex(&remote.nodes[0].raw_tx).unwrap();
+        assert!(engine
+            .storage()
+            .find_output(&old.id(), 0, Some("tm_uhrp"), None, false)
+            .await
+            .unwrap()
+            .is_none());
+        let mut direct = old;
+        direct.merkle_path = Some(
+            bsv_rs::transaction::MerklePath::new(
+                1,
+                vec![vec![bsv_rs::transaction::MerklePathLeaf::new_txid(
+                    0,
+                    direct.id(),
+                )]],
+            )
+            .unwrap(),
+        );
+        let admitted = engine
+            .submit(
+                &overlay_engine::types::TaggedBEEF::new(
+                    direct.to_beef(true).unwrap(),
+                    vec!["tm_uhrp".into()],
+                ),
+                SubmitMode::HistoricalTxNoSpv,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            admitted["tm_uhrp"].outputs_to_admit,
+            vec![0],
+            "direct admission retains the reference expiry rule"
+        );
+        let node = engine
+            .provide_foreign_gasp_node(&format!("{live}.0"), &live, 0)
+            .await
+            .unwrap();
+        assert!(
+            node.proof.is_some(),
+            "the stored own BUMP is served to peers"
+        );
     }
 }

@@ -470,7 +470,9 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
         }
         // bsv-low #649 N3: one step of the parked set's shipped code on demand (bearer INTERNAL_TOKEN), so the
         // D1 budget tier measures it on a populated table.
-        (Method::Post, "/internal/change-park") => crate::change_park::internal_lever(req, &env).await,
+        (Method::Post, "/internal/change-park") => {
+            crate::change_park::internal_lever(req, &env).await
+        }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
 
@@ -1157,6 +1159,9 @@ fn build_engine_with_storage(
     // Without a chain tracker it degrades to a pure retry (no proof can ever be
     // verified — fail-closed).
     let proof_tracker = lookup_service_chain_tracker(env);
+    let sync_fetcher =
+        courier_fetcher(env, proof_tracker.clone()).with_budget(GASP_PROOF_FETCH_BUDGET);
+    engine.set_gasp_ancestor_fetcher(std::rc::Rc::new(sync_fetcher));
     let proof_fetcher = courier_fetcher(env, proof_tracker);
     engine.set_ancestor_fetcher(std::rc::Rc::new(proof_fetcher));
 
@@ -1238,6 +1243,15 @@ const ADVERT_LIFECYCLE_BUDGET_MS: u64 = 60_000;
 /// step-level GASP_SYNC_BUDGET_MS stays as the outer belt.
 const GASP_PEER_SYNC_BUDGET_MS: u64 = 30_000;
 
+/// Sync alone gets 60 transaction attempts: a planning allowance of 500 ms
+/// per transaction in the 30 s peer slice. The wall deadline remains the
+/// actual time bound. At most 3 raw GETs + 5 proof GETs + 3 header reads =
+/// 11 subrequests per ancestor attempt, hence 60 * 11 = 660 of the paid
+/// plan's 1,000 ceiling, leaving 340 for pages, storage and other passes.
+/// The 500 ms is a sizing assumption, not a measured latency or a minimum.
+/// This is a courier allowance, not a guarantee for the whole tick's I/O.
+const GASP_PROOF_FETCH_BUDGET: u32 = (GASP_PEER_SYNC_BUDGET_MS / 500) as u32;
+
 /// The bound of ONE transaction's GASP finalize submit (bsv-low #559): a
 /// handful of D1 calls and the lookup hooks, milliseconds when D1 answers.
 /// The per-peer budget and the step belt both WAIT for a submit in flight,
@@ -1245,7 +1259,7 @@ const GASP_PEER_SYNC_BUDGET_MS: u64 = 30_000;
 const GASP_FINALIZE_SUBMIT_BUDGET_MS: u64 = 30_000;
 
 /// Complete admitted transactions before the network sync and maintenance.
-/// Half the courier candidate budget remains available to proofless GASP roots.
+/// Its courier is independent of the sync courier and retains the default allowance.
 const TRANSACTION_PROOF_COMPLETION_LIMIT: u64 =
     crate::proof_fetcher::DEFAULT_FETCH_BUDGET as u64 / 2;
 const TRANSACTION_PROOF_COMPLETION_BUDGET_MS: u64 = 30_000;

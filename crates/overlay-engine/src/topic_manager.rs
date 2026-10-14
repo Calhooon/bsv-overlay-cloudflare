@@ -92,6 +92,12 @@ pub trait TopicManager {
         true
     }
 
+    /// Optional advert expiry for a sync root, in Unix seconds. This does
+    /// not change submission admission or the treatment of ancestry.
+    fn sync_expiry(&self, _script: &bsv_rs::script::LockingScript) -> Option<u64> {
+        None
+    }
+
     /// Return Markdown documentation for this topic manager.
     async fn get_documentation(&self) -> String;
 

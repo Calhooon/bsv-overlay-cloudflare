@@ -765,6 +765,24 @@ impl<'a> OverlayGASPStorage<'a> {
 
 #[async_trait(?Send)]
 impl GASPStorage for OverlayGASPStorage<'_> {
+    fn sync_expiry(&self, node: &GASPNode, outpoint: &str) -> Result<Option<u64>, GASPError> {
+        let Some(manager) = self.topic_manager else {
+            return Ok(None);
+        };
+        let tx = Transaction::from_hex(&node.raw_tx)
+            .map_err(|e| GASPError::Other(format!("sync root parse: {e}")))?;
+        if format!("{}.{}", tx.id(), node.output_index) != outpoint {
+            return Err(GASPError::Other(
+                "sync root content-address mismatch".into(),
+            ));
+        }
+        let output = tx
+            .outputs
+            .get(node.output_index as usize)
+            .ok_or_else(|| GASPError::Other("sync root output missing".into()))?;
+        Ok(manager.sync_expiry(&output.locking_script))
+    }
+
     /// Returns UTXOs known for this topic since the given score/timestamp.
     ///
     /// Delegates to `Storage::find_utxos_for_topic()`, converting `Output`

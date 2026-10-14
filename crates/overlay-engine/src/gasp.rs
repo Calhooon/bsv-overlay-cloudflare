@@ -770,6 +770,7 @@ struct Walk {
 
 /// How a graph's walk ended in this pass.
 enum WalkEnd {
+    Expired,
     /// Nothing is pending: complete the graph.
     Done,
     /// Deferred, with this reason.
@@ -778,6 +779,7 @@ enum WalkEnd {
 
 /// What one step of the walk got.
 enum StepOut {
+    Expired,
     Pruned,
     Seen,
     Appended {
@@ -789,6 +791,7 @@ enum StepOut {
 
 /// How [`GASPSync::ingest_utxo`] ended for a UTXO.
 enum Ingested {
+    Expired,
     Completed,
     Deferred,
     /// A record not resumed: the pass's resumes spent their shared budget.
@@ -822,6 +825,12 @@ enum Saved {
 /// and graph validation/finalization.
 #[async_trait(?Send)]
 pub trait GASPStorage {
+    /// The root advert's own expiry. The adapter binds the bytes to the
+    /// requested outpoint before interpreting a topic's expiry field.
+    fn sync_expiry(&self, _node: &GASPNode, _outpoint: &str) -> Result<Option<u64>, GASPError> {
+        Ok(None)
+    }
+
     /// Returns UTXOs known to be unspent since the given score/timestamp.
     /// Non-confirmed UTXOs should always be returned regardless of `since`.
     async fn find_known_utxos(
@@ -1151,6 +1160,8 @@ pub trait FinalizedGraphHook {
 /// The lifetime `'a` allows the storage and remote to borrow from their
 /// environment (e.g., `OverlayGASPStorage` borrows from the Engine's storage).
 pub struct GASPSync<'a> {
+    expired: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    expired_refused: std::cell::Cell<u64>,
     storage: Box<dyn GASPStorage + 'a>,
     remote: Box<dyn GASPRemote + 'a>,
     /// Score of last successful interaction with this peer.
@@ -1229,6 +1240,8 @@ impl<'a> GASPSync<'a> {
         Self {
             storage,
             remote,
+            expired: std::rc::Rc::default(),
+            expired_refused: std::cell::Cell::new(0),
             last_interaction,
             unidirectional,
             log_prefix: log_prefix.into(),
@@ -1252,6 +1265,43 @@ impl<'a> GASPSync<'a> {
             stats: std::cell::RefCell::new(DeferralStats::default()),
             graphs_attempted: std::cell::Cell::new(0),
         }
+    }
+
+    /// Share expired outpoints across the topic peers of one engine run.
+    #[must_use]
+    pub fn with_expired_outpoints(
+        mut self,
+        expired: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.expired = expired;
+        self
+    }
+
+    pub fn expired_refused(&self) -> u64 {
+        self.expired_refused.get()
+    }
+
+    fn root_expired(&self, node: &GASPNode, outpoint: &str) -> Result<bool, GASPError> {
+        let now = (crate::engine::current_timestamp_ms() / 1000.0) as u64;
+        Ok(self
+            .storage
+            .sync_expiry(node, outpoint)?
+            .is_some_and(|expiry| expiry <= now))
+    }
+
+    async fn refuse_expired(&self, outpoint: &str) -> Result<Ingested, GASPError> {
+        let walk = self.walk.borrow_mut().take();
+        if self.expired.borrow_mut().insert(outpoint.to_string()) {
+            self.expired_refused.set(self.expired_refused.get() + 1);
+        }
+        let _ = self
+            .storage
+            .discard_graph(&Self::graph_id_of(walk.as_ref(), outpoint))
+            .await;
+        if walk.as_ref().is_some_and(|w| w.resumed) || self.deferred.borrow_mut().remove(outpoint) {
+            self.drop_record(outpoint, DropReason::Refused).await;
+        }
+        Ok(Ingested::Expired)
     }
 
     /// Bound each graph's walk by `budget` and DEFER a graph past it
@@ -1387,6 +1437,7 @@ impl<'a> GASPSync<'a> {
         );
         self.pruned.borrow_mut().clear();
         self.pruned_inputs.set(0);
+        self.expired_refused.set(0);
         self.discarded_graphs.set(0);
         self.anchor_walk_held.set(0);
         self.completed_cursor = self.last_interaction;
@@ -1535,6 +1586,7 @@ impl<'a> GASPSync<'a> {
                     let ingested = self.ingest_utxo(utxo, &outpoint).await;
                     self.graph_in_flight = false;
                     let ingested = match ingested {
+                        Ok(Ingested::Expired) => Ok(true),
                         Ok(Ingested::Completed) => {
                             let landed = match &self.finalized_hook {
                                 Some(hook) => hook.graph_completed().await,
@@ -1693,12 +1745,18 @@ impl<'a> GASPSync<'a> {
     /// served once that budget is spent is HELD BACK untouched (no read, no
     /// pass counted) for the next sync.
     async fn ingest_utxo(&self, utxo: &GASPOutput, outpoint: &str) -> Result<Ingested, GASPError> {
+        if self.expired.borrow().contains(outpoint) {
+            return self.refuse_expired(outpoint).await;
+        }
         debug!("{} Requesting node for {}", self.log_prefix, outpoint);
         self.graphs_attempted.set(self.graphs_attempted.get() + 1);
         let Some(budget) = &self.graph_budget else {
             *self.walk.borrow_mut() =
                 Some(Self::fresh_walk(utxo.score as u64, outpoint, PassCap::NONE));
             let walked = self.walk_graph(None).await;
+            if matches!(walked, Ok(WalkEnd::Expired)) {
+                return self.refuse_expired(outpoint).await;
+            }
             let walk = self.walk.borrow_mut().take();
             walked?;
             self.complete_graph(&Self::graph_id_of(walk.as_ref(), outpoint))
@@ -1817,6 +1875,14 @@ impl<'a> GASPSync<'a> {
         } else {
             None
         };
+        if let Some(record) = &record {
+            if let [root, ..] = record.nodes.as_slice() {
+                if self.root_expired(&root.node, outpoint)? {
+                    self.deferred.borrow_mut().insert(outpoint.to_string());
+                    return self.refuse_expired(outpoint).await;
+                }
+            }
+        }
         let walk = match record {
             None => {
                 let mut walk = Self::fresh_walk(score, outpoint, cap);
@@ -1892,7 +1958,8 @@ impl<'a> GASPSync<'a> {
                 };
                 match race_or_deadline(self.fetch_root(&root), deadline.as_mut()).await {
                     None => return Ok(WalkEnd::Deferred("time")),
-                    Some(Ok(node)) if node.proof.is_some() => {
+                    Some(Ok(None)) => return Ok(WalkEnd::Expired),
+                    Some(Ok(Some(node))) if node.proof.is_some() => {
                         // The walk is fresh, the PASS is not: what it spent
                         // of every counted limb goes with it (the re-ask
                         // appends nothing, so the nodes are 0 today; carried
@@ -1953,6 +2020,7 @@ impl<'a> GASPSync<'a> {
             // `root_proven` restart, whose walk is fresh.
             let resumed = self.walk.borrow().as_ref().is_some_and(|w| w.resumed);
             let (reason, completed) = match ended {
+                Ok(WalkEnd::Expired) => return self.refuse_expired(outpoint).await,
                 Ok(WalkEnd::Done) => match self.complete_graph(&graph_id).await {
                     Ok(true) => return Ok(Ingested::Completed),
                     Ok(false) => {
@@ -2413,6 +2481,9 @@ impl<'a> GASPSync<'a> {
                 },
                 None => step.await,
             }?;
+            if matches!(out, StepOut::Expired) {
+                return Ok(WalkEnd::Expired);
+            }
             self.commit(out);
         }
     }
@@ -2490,7 +2561,7 @@ impl<'a> GASPSync<'a> {
 
     /// The ROOT of a graph: the peer's node for the UTXO, its own proof
     /// hydrated by the ancestor fetcher when it has none.
-    async fn fetch_root(&self, item: &PendingInput) -> Result<GASPNode, GASPError> {
+    async fn fetch_root(&self, item: &PendingInput) -> Result<Option<GASPNode>, GASPError> {
         let (txid, oi) = parse_outpoint(&item.outpoint)
             .ok_or_else(|| GASPError::Other(format!("bad outpoint {}", item.outpoint)))?;
         self.count_call();
@@ -2499,7 +2570,10 @@ impl<'a> GASPSync<'a> {
             .request_node(&item.graph_id, &txid, oi, item.metadata)
             .await?;
         self.count_fetched(&node);
-        Ok(self.hydrate_root(node).await)
+        if self.root_expired(&node, &item.outpoint)? {
+            return Ok(None);
+        }
+        Ok(Some(self.hydrate_root(node).await))
     }
 
     /// The root's own proof, hydrated by the ancestor fetcher when the peer
@@ -2590,7 +2664,10 @@ impl<'a> GASPSync<'a> {
         // dropped whole; what a dropped sync keeps is bsv-low #552's
         // ground, and a cap on the list is the manager's choice.
         let node = if item.spent_by.is_none() {
-            self.fetch_root(item).await?
+            let Some(node) = self.fetch_root(item).await? else {
+                return Ok(StepOut::Expired);
+            };
+            node
         } else {
             let Some((txid, oi)) = parse_outpoint(&item.outpoint) else {
                 return Ok(StepOut::Pruned);
@@ -2825,7 +2902,7 @@ pub fn parse_outpoint(s: &str) -> Option<(String, u32)> {
 // ============================================================================
 
 /// GASP protocol errors.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum GASPError {
     /// Version mismatch between peers.
     #[error("version mismatch: local={local}, remote={remote}")]

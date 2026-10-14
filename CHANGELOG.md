@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.6] - 2026-10-14
+
+- GASP skips expired UHRP roots before proof hydration, advances their cursor,
+  and counts `gaspExpiredRefused`. Resumed roots and expired siblings follow
+  the same sync rule; direct submission retains the reference admission rule.
+- Courier attempts share a per-run transaction memo across output, ancestry
+  and exhaustive paths. Faults and interrupted attempts remain retryable;
+  a partial unmined hint never becomes an exhaustive negative.
+- GASP has a separate 60-attempt proof allowance. Completion keeps its default
+  courier budget. Every proof still requires header verification.
+- Peer crawls query bare UHRP hashes from at most 16 local live content keys.
+  GASP enumerates unfamiliar content. A peer's HTTP 400 includes the request
+  shape and is logged once per peer, service and shape version, using D1.
+- **DEPLOYMENT NOTE:** Nothing changes for operators. No new configuration,
+  dependency pin or schema migration. Explorer sources stay opt-in. The keeper
+  sets both workspace versions for the release.
+
 ## [0.1.5] - 2026-10-13
 
 - **DEPLOYMENT CHANGE: public explorer rungs are OFF unless named in `PROOF_SOURCES=arcade,bananablocks,woc,bitails`. LOW and Zanaadu must set this var to retain the previous explorer behavior. The stack leaves it unset.** `ARCADE_URL` and `WOC_API_KEY` only configure enabled rungs. Proof, raw-ancestor, spend-hint, retirement, conflict and rebroadcast probes follow this setting.
