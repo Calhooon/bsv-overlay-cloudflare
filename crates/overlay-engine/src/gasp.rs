@@ -465,6 +465,12 @@ pub const DEFERRED_GRAPHS_PER_PEER_TOPIC: usize = 16;
 /// costs in bytes, and a fault record carries none; what it costs in rows
 /// is this bound, one new record a (peer, topic) a run, and the storage's
 /// row ceilings (the worker's global count and a discovered origin's share).
+///
+/// A held record struck on its own slot (engine 0.1.11) becomes a fault
+/// record under this bound and frees its deferred slot under
+/// [`DEFERRED_GRAPHS_PER_PEER_TOPIC`]: no row is added. In the held loop the
+/// keys not yet read are counted as fault records, so the bound holds before
+/// every record has been read.
 pub const FAULT_RECORDS_PER_PEER_TOPIC: usize = 32;
 
 /// Reset a resumed partial walk after this many consecutive idle faults.
@@ -502,7 +508,11 @@ pub const EXPIRED_OUTPOINT_MEMO_MAX_ROWS: usize = 20_000;
 /// survives three runs, each with a fresh peer slice and a fresh courier
 /// budget and each walking this root ahead of the pages, is the graph's own.
 /// Before 0.1.9 such a root held the cursor below it for ever (the 0.1.4
-/// rule) and every later output waited on a captain's hand.
+/// rule) and every later output waited on a captain's hand. A held record
+/// whose RESUMED pass is dropped by such a fault counts the same runs on its
+/// own slot (engine 0.1.11): on 0.1.10 a root retry obligation whose parent
+/// no rung served was dropped and saved again as it was on every run, never
+/// struck (fact 3 of the 0.1.11 brief).
 pub const UNANCHORABLE_AFTER_FAULTED_RUNS: u32 = 3;
 
 /// How long an unanchorable root waits before its next walk: six hours. What
@@ -939,6 +949,11 @@ pub struct DeferralStats {
     /// Records NOT resumed by this sync because they wait out that backoff
     /// (no request at all; the cursor passes them).
     pub waiting: u64,
+    /// Records whose resumed pass this sync counted one idle resume on
+    /// (engine 0.1.11): it asked and appended nothing it kept, whatever its
+    /// ending (a save, a drop, an error). A record a strike counted instead
+    /// is not among them.
+    pub idle_counted: u64,
 }
 
 impl Walk {
@@ -1510,12 +1525,19 @@ pub struct GASPSync<'a> {
     /// See [`Self::strikes_refused`].
     strikes_refused: std::cell::Cell<u64>,
     /// The idle resumes counted on the held record the resume in hand read
-    /// (engine 0.1.10), before its pass: what its pass adds one to when it
-    /// appends nothing. `None` for any other walk.
-    resume_idle: std::cell::Cell<Option<u32>>,
-    /// The pass in hand counted its idle resume in its own save
-    /// ([`Self::save_walk`]), so nothing is counted after it.
-    idle_counted: std::cell::Cell<bool>,
+    /// (engine 0.1.10), and the nodes it held (engine 0.1.11), before its
+    /// pass: what its pass adds one to when it asks and keeps nothing more.
+    /// `None` for any other walk.
+    resume_idle: std::cell::Cell<Option<(u32, usize)>>,
+    /// The pass in hand saved its own record ([`Self::save_walk`]): that save
+    /// counted its idle resume, or reset the count on a node appended, so
+    /// nothing is counted after it.
+    pass_saved: std::cell::Cell<bool>,
+    /// The held keys of this (peer, topic) the sync has not reached yet
+    /// (engine 0.1.11): each may be a fault record, so a resumed record
+    /// struck in the held loop finds room only if the fault bound holds
+    /// them all.
+    keys_unread: std::cell::Cell<usize>,
     /// The walk of the graph in hand (see [`Walk`]).
     walk: std::cell::RefCell<Option<Walk>>,
     /// See [`Self::deferral_stats`].
@@ -1585,7 +1607,8 @@ impl<'a> GASPSync<'a> {
             fault_keys_unread: std::cell::Cell::new(false),
             strikes_refused: std::cell::Cell::new(0),
             resume_idle: std::cell::Cell::new(None),
-            idle_counted: std::cell::Cell::new(false),
+            pass_saved: std::cell::Cell::new(false),
+            keys_unread: std::cell::Cell::new(0),
             walk: std::cell::RefCell::new(None),
             stats: std::cell::RefCell::new(DeferralStats::default()),
             graphs_attempted: std::cell::Cell::new(0),
@@ -1861,6 +1884,42 @@ impl<'a> GASPSync<'a> {
         struck.passable()
     }
 
+    /// A RESUMED walk of a held record dropped by a fault (engine 0.1.11):
+    /// a root like any other, so a fault of a striking class
+    /// ([`fault_class::strikes`]) counts a faulted run on the record's own
+    /// slot ([`Self::strike`] with the record as `prior`: `faults`, the
+    /// reason `retry:fault:<class>`, its score and its pass kept), and three
+    /// make it `unanchorable:<class>`. Named in `faulted` with the count.
+    /// `None` when no strike was written: no fault of the graph (a peer's
+    /// fault of the moment, a storage fault, a bound), a pass that did not
+    /// get the root (the peer no longer serves it: the record's own idle
+    /// rule, engine 0.1.10), the record unread, or the strike refused
+    /// (named `no_room` or `store_fault`); the caller then drops the record
+    /// as before 0.1.11.
+    async fn strike_resumed(
+        &self,
+        outpoint: &str,
+        walk: Option<&Walk>,
+        error: &GASPError,
+    ) -> Option<Strike> {
+        let class = self.last_fault.get().filter(|c| fault_class::strikes(c))?;
+        // The root was never served this pass: the peer no longer offers
+        // it, which says nothing of its graph.
+        if walk.is_none_or(|w| w.record.nodes.is_empty()) {
+            return None;
+        }
+        let prior = self.storage.get_deferred_graph(outpoint).await.ok()??;
+        if prior.is_struck() {
+            return None;
+        }
+        self.last_fault.set(None);
+        let struck = self
+            .strike(prior.score, outpoint, class, Some(&prior))
+            .await;
+        self.note_faulted(outpoint, error, Some(class), struck);
+        struck.held.map(|_| struck)
+    }
+
     /// Count one more faulted run of `outpoint` (engine 0.1.9), on its
     /// record `prior` or on a new one: `retry:fault:<class>` (the cursor
     /// holds) under [`UNANCHORABLE_AFTER_FAULTED_RUNS`], `unanchorable:<class>`
@@ -1893,16 +1952,22 @@ impl<'a> GASPSync<'a> {
                 refused: Some(why),
             }
         };
-        if prior.is_none()
+        // A NEW fault record: a root with no record, or a held record struck
+        // on its own slot (engine 0.1.11), which leaves the deferred slots
+        // for the fault records. The keys not read yet may be fault records.
+        if !prior.is_some_and(DeferredGraph::is_struck)
             && (self.fault_keys_unread.get()
-                || self.fault_records.borrow().len() >= FAULT_RECORDS_PER_PEER_TOPIC)
+                || self.fault_records.borrow().len() + self.keys_unread.get()
+                    >= FAULT_RECORDS_PER_PEER_TOPIC)
         {
             return refuse(strike_refused::NO_ROOM);
         }
         let mut record = Self::fresh_walk(score, outpoint, PassCap::NONE).record;
         record.faults = prior.map_or(0, |r| r.faults) + 1;
         let unanchorable = record.faults >= UNANCHORABLE_AFTER_FAULTED_RUNS;
-        record.cursor_passable = unanchorable;
+        // A record the cursor had passed stays passable (engine 0.1.11): the
+        // strike counts its faulted runs and never takes the pass back.
+        record.cursor_passable = unanchorable || prior.is_some_and(|r| r.cursor_passable);
         if unanchorable {
             record.reason = format!("{UNANCHORABLE_REASON}{class}");
             record.retry_at = Self::now_secs() + UNANCHORABLE_RETRY_SECS;
@@ -1912,8 +1977,14 @@ impl<'a> GASPSync<'a> {
         match self.storage.save_deferred_graph(&record).await {
             Ok(DeferredGraphSave::Saved) => {
                 // A new key holds a fault record and no deferred slot; a
-                // prior one was known when it was read.
-                self.fault_records.borrow_mut().insert(outpoint.to_string());
+                // held record struck on its own slot frees its deferred
+                // slot for the fault record (engine 0.1.11); a prior fault
+                // record was known when it was read.
+                if prior.is_some() {
+                    self.know_fault_record(outpoint);
+                } else {
+                    self.fault_records.borrow_mut().insert(outpoint.to_string());
+                }
                 if unanchorable && !prior.is_some_and(DeferredGraph::is_unanchorable) {
                     self.unanchorable_recorded
                         .set(self.unanchorable_recorded.get() + 1);
@@ -1983,17 +2054,26 @@ impl<'a> GASPSync<'a> {
         };
         match out {
             // A stall of the graph's own deadline does not undo the record:
-            // the empty retry `save_walk` wrote is replaced again.
-            Ok(Ingested::Retry) if record.is_unanchorable() => {
-                if let Ok(DeferredGraphSave::Saved) = self
-                    .storage
-                    .save_deferred_graph(&keep_unanchorable(&record))
-                    .await
+            // the empty retry `save_walk` wrote is replaced again. So for a
+            // passable fault record struck on a held record's slot (engine
+            // 0.1.11): the empty retry would hold the cursor it had passed.
+            Ok(Ingested::Retry) if record.cursor_passable => {
+                let unanchorable = record.is_unanchorable();
+                let kept = if unanchorable {
+                    keep_unanchorable(&record)
+                } else {
+                    record.clone()
+                };
+                if let Ok(DeferredGraphSave::Saved) = self.storage.save_deferred_graph(&kept).await
                 {
                     // A fault record again, not a deferred slot (0.1.10).
                     self.know_fault_record(outpoint);
                 }
-                Ok(Ingested::Unanchorable)
+                Ok(if unanchorable {
+                    Ingested::Unanchorable
+                } else {
+                    Ingested::Deferred
+                })
             }
             Ok(ingested) => Ok(ingested),
             Err(error) => {
@@ -2191,11 +2271,13 @@ impl<'a> GASPSync<'a> {
         // one at a time under the shared resume allowance. A key-read fault
         // conservatively reserves all slots for the records already held.
         let mut held_keys = Vec::new();
+        self.keys_unread.set(0);
         if self.graph_budget.is_some() {
             match self.storage.load_deferred_graphs().await {
                 Ok(keys) => {
                     held_keys.clone_from(&keys);
                     self.held_records.set(keys.len());
+                    self.keys_unread.set(keys.len());
                     self.deferred
                         .borrow_mut()
                         .extend(keys.into_iter().map(|k| k.outpoint));
@@ -2256,6 +2338,10 @@ impl<'a> GASPSync<'a> {
         self.load_remembered_expired(held_keys.iter().map(|k| k.outpoint.clone()).collect())
             .await;
         for key in held_keys {
+            // This key is reached now (engine 0.1.11: the fault bound of a
+            // strike in the held loop counts the keys after it).
+            self.keys_unread
+                .set(self.keys_unread.get().saturating_sub(1));
             if known_outpoints.contains(&key.outpoint) {
                 self.deferred.borrow_mut().remove(&key.outpoint);
                 self.drop_record(&key.outpoint, DropReason::Held).await;
@@ -2607,7 +2693,7 @@ impl<'a> GASPSync<'a> {
     async fn ingest_utxo(&self, utxo: &GASPOutput, outpoint: &str) -> Result<Ingested, GASPError> {
         self.last_fault.set(None);
         self.resume_idle.set(None);
-        self.idle_counted.set(false);
+        self.pass_saved.set(false);
         if self.expired.borrow().contains(outpoint) {
             return self.refuse_expired(outpoint).await;
         }
@@ -2649,6 +2735,16 @@ impl<'a> GASPSync<'a> {
             {
                 return Ok(self.wait_idle(outpoint));
             }
+            // An unanchorable root inside its backoff would not be walked
+            // anyway: not held back, and no attempt (engine 0.1.11).
+            if record
+                .as_ref()
+                .is_some_and(|r| r.is_unanchorable() && Self::now_secs() < r.retry_at)
+            {
+                self.graphs_attempted
+                    .set(self.graphs_attempted.get().saturating_sub(1));
+                return Ok(Ingested::Unanchorable);
+            }
             self.stats.borrow_mut().held_back += 1;
             info!(
                 "{} Deferred graph {} held back: the resumes of this pass spent their budget (bsv-low #555)",
@@ -2683,15 +2779,20 @@ impl<'a> GASPSync<'a> {
             .await;
         // Engine 0.1.10: a held record's resume that asked the peer,
         // appended no node and did not finish counts one more idle resume.
-        // Its own save counted it; a pass whose record was dropped and saved
-        // again as a fresh obligation (`drop_record`) counts it here.
-        if let Some(prior) = self.resume_idle.take() {
-            let idle = self.calls_made.get() > before.0 && self.nodes_appended.get() == before.2;
-            if idle
-                && !self.idle_counted.get()
+        // Its own save counted it; any other ending counts it here (engine
+        // 0.1.11): a drop that saved the record again as a fresh obligation
+        // (`drop_record`) or an error that left it as it was. What the pass
+        // KEPT is read from the record, not from the nodes it appended: on
+        // 0.1.10 a root appended and then thrown away with the drop (fact 3
+        // of the 0.1.11 brief: the courier exhausted on its parent) read as
+        // progress, and the count never fired. A record a strike counted is
+        // left to the strike.
+        if let Some((prior, held)) = self.resume_idle.take() {
+            if self.calls_made.get() > before.0
+                && !self.pass_saved.get()
                 && !matches!(ingested, Ok(Ingested::Completed | Ingested::Expired))
             {
-                self.idle_resume(outpoint, prior).await;
+                self.idle_resume(outpoint, prior, held).await;
             }
         }
         let narrowed = |spent: u64| u32::try_from(spent).unwrap_or(u32::MAX);
@@ -2729,12 +2830,13 @@ impl<'a> GASPSync<'a> {
     /// when its pass read it, so a record the pass dropped and saved again as
     /// a fresh obligation (`drop_record`) counts on from there. At
     /// [`IDLE_RESUMES_BEFORE_BACKOFF`] it goes to the long backoff. A record
-    /// gone, a fault record or one that holds the cursor is left alone.
-    async fn idle_resume(&self, outpoint: &str, prior: u32) {
+    /// gone, a fault record, one that holds the cursor, or one holding more
+    /// nodes than the `held` its pass read (it kept progress) is left alone.
+    async fn idle_resume(&self, outpoint: &str, prior: u32, held: usize) {
         let Ok(Some(mut record)) = self.storage.get_deferred_graph(outpoint).await else {
             return;
         };
-        if record.is_struck() || !record.cursor_passable {
+        if record.is_struck() || !record.cursor_passable || record.nodes.len() > held {
             return;
         }
         record.idle_resumes = prior.saturating_add(1);
@@ -2742,7 +2844,11 @@ impl<'a> GASPSync<'a> {
         if backoff {
             record.retry_at = Self::now_secs() + IDLE_RESUME_RETRY_SECS;
         }
-        match self.storage.save_deferred_graph(&record).await {
+        let saved = self.storage.save_deferred_graph(&record).await;
+        if let Ok(DeferredGraphSave::Saved) = saved {
+            self.stats.borrow_mut().idle_counted += 1;
+        }
+        match saved {
             Ok(DeferredGraphSave::Saved) if backoff => {
                 self.stats.borrow_mut().backed_off += 1;
                 info!(
@@ -2849,7 +2955,8 @@ impl<'a> GASPSync<'a> {
                 if record.waits_idle(Self::now_secs()) {
                     return Ok(self.wait_idle(outpoint));
                 }
-                self.resume_idle.set(Some(record.idle_resumes));
+                self.resume_idle
+                    .set(Some((record.idle_resumes, record.nodes.len())));
             }
         }
         let walk = match record {
@@ -3030,8 +3137,18 @@ impl<'a> GASPSync<'a> {
                 Ok(WalkEnd::Deferred(reason)) => (reason, false),
                 Err(e @ GASPError::NodeNotFound(_)) => {
                     let _ = self.storage.discard_graph(&graph_id).await;
-                    self.walk.borrow_mut().take();
+                    let walk = self.walk.borrow_mut().take();
                     if resumed {
+                        // Engine 0.1.11: a fault of the graph is a strike on
+                        // the record's own slot, as for a fresh root.
+                        if let Some(struck) = self.strike_resumed(outpoint, walk.as_ref(), &e).await
+                        {
+                            return if struck.passable() {
+                                Ok(Ingested::Unanchorable)
+                            } else {
+                                Err(e)
+                            };
+                        }
                         self.drop_record(outpoint, DropReason::NotHeld).await;
                     }
                     return Err(e);
@@ -3078,7 +3195,17 @@ impl<'a> GASPSync<'a> {
                             self.log_prefix, outpoint, idle, e
                         );
                         let _ = self.storage.discard_graph(&graph_id).await;
-                        self.walk.borrow_mut().take();
+                        let walk = self.walk.borrow_mut().take();
+                        // Engine 0.1.11: dropped by a fault of the graph, a
+                        // strike on the record's own slot.
+                        if let Some(struck) = self.strike_resumed(outpoint, walk.as_ref(), &e).await
+                        {
+                            return if struck.passable() {
+                                Ok(Ingested::Unanchorable)
+                            } else {
+                                Err(e)
+                            };
+                        }
                         self.drop_record(outpoint, DropReason::IdleFaults).await;
                         return Err(e);
                     }
@@ -3276,14 +3403,13 @@ impl<'a> GASPSync<'a> {
         // Engine 0.1.10: a RESUMED pass of a held record that asked the peer
         // and appended nothing counts one idle resume in this save; at the
         // bound the record waits out the long backoff.
-        let backing_off = if walk.resumed
+        let idle_now = walk.resumed
             && was_held
             && walk.struck.is_none()
             && !completed
             && walk.calls_this_pass > 0
-            && walk.record.nodes.len() <= walk.nodes_at_start
-        {
-            self.idle_counted.set(true);
+            && walk.record.nodes.len() <= walk.nodes_at_start;
+        let backing_off = if idle_now {
             walk.record.idle_resumes = walk.record.idle_resumes.saturating_add(1);
             let due = walk.record.idle_resumes >= IDLE_RESUMES_BEFORE_BACKOFF;
             if due {
@@ -3313,6 +3439,12 @@ impl<'a> GASPSync<'a> {
         let outpoint = walk.record.outpoint.clone();
         match self.storage.save_deferred_graph(&walk.record).await {
             Ok(DeferredGraphSave::Saved) => {
+                if walk.resumed {
+                    self.pass_saved.set(true);
+                }
+                if idle_now {
+                    self.stats.borrow_mut().idle_counted += 1;
+                }
                 if !walk.resumed {
                     // A fault record replaced is a fault record no more.
                     self.fault_records.borrow_mut().remove(&outpoint);

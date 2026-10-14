@@ -1926,6 +1926,7 @@ mod tests {
             held_back_graphs: 0,
             backed_off_graphs: 0,
             waiting_graphs: 0,
+            idle_counted: 0,
             unanchorable_graphs: 0,
             unanchorable_cleared: 0,
             strikes_refused: 0,
