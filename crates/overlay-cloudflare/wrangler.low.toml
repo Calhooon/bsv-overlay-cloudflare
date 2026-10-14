@@ -61,6 +61,10 @@ WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal,tm_pot,tm_lowfund,tm_collected,tm_hand,tm_result,tm_proof,tm_potparty,tm_potrefund,tm_hopparty"
 LOOKUP_SERVICES = "ls_ship,ls_slap,ls_low,ls_reveal,ls_pot,ls_collected,ls_hand,ls_result,ls_proof,ls_potparty,ls_potrefund,ls_hopparty"
 ENABLE_EXTENSIONS = "true"
+# Engine 0.1.5: the public explorer rungs are opt-in by name (the stack leaves them off under rule 21).
+# LOW keeps the pre-0.1.5 ladder: Arcade first for our own, then BananaBlocks, WoC and Bitails as each
+# other's fallbacks (the owner's courier ruling 2026-09-04). Unknown names enable nothing.
+PROOF_SOURCES = "arcade,bananablocks,woc,bitails"
 # SCRIPT_VERIFY_NETWORK_GATED — unset on PROD (= the kill switch: the door
 # executes nothing; the network alone judges) until the promotion flips it on
 # the owner's word. See [env.beta.vars] for what "true" does (bsv-low W-A, 2026-09-09).
@@ -282,6 +286,10 @@ SCRIPT_VERIFY_NETWORK_GATED = "true"
 # wire (the pre-2026-09-15 gate). BETA ON first; prod on the owner's word at
 # the promotion, after a full beta loop clean on it.
 ADMIT_FAST = "true"
+# Engine 0.1.5: the public explorer rungs are opt-in by name (the stack leaves them off under rule 21).
+# LOW keeps the pre-0.1.5 ladder: Arcade first for our own, then BananaBlocks, WoC and Bitails as each
+# other's fallbacks (the owner's courier ruling 2026-09-04). Unknown names enable nothing.
+PROOF_SOURCES = "arcade,bananablocks,woc,bitails"
 
 [[env.beta.d1_databases]]
 binding = "OVERLAY_DB"
