@@ -124,6 +124,12 @@ pub struct Engine {
     /// door's [`DoorBudget`], [`DoorBudget::DEFAULT`] unless set. See
     /// [`Engine::set_walk_budget`].
     walk_budget: DoorBudget,
+    /// GASP's shadow under `admit_graph` (bsv-low #657, R7.7 item 5):
+    /// `Off` unless set, and then nothing of it runs. See
+    /// [`Engine::set_gasp_shadow`].
+    admission_mode: crate::gasp_shadow::AdmissionMode,
+    gasp_shadow: Option<std::rc::Rc<dyn crate::gasp_shadow::GaspShadow>>,
+    shadow_budget: crate::gasp_shadow::ShadowBudget,
     config: EngineConfig,
 }
 
@@ -1119,8 +1125,36 @@ impl Engine {
             landing_guard: None,
             verify_scripts: true,
             walk_budget: DoorBudget::DEFAULT,
+            admission_mode: crate::gasp_shadow::AdmissionMode::Off,
+            gasp_shadow: None,
+            shadow_budget: crate::gasp_shadow::ShadowBudget::default(),
             config,
         }
+    }
+
+    /// GASP's shadow under `admit_graph` (bsv-low #657, R7.7 item 5; see
+    /// [`crate::gasp_shadow`]). Under [`crate::gasp_shadow::AdmissionMode::Shadow`]
+    /// every GASP finalize body and graph is compared on a fresh snapshot the
+    /// `host` takes, and one census row each is handed to it; the served
+    /// finalize is unchanged. Under `Off` the host is never asked.
+    pub fn set_gasp_shadow(
+        &mut self,
+        mode: crate::gasp_shadow::AdmissionMode,
+        host: std::rc::Rc<dyn crate::gasp_shadow::GaspShadow>,
+    ) {
+        self.admission_mode = mode;
+        self.gasp_shadow = Some(host);
+    }
+
+    /// The allowance of one shadow comparison (the slice's: 4,096 rows,
+    /// 16 MiB and 2,000 ms unless set).
+    pub fn set_gasp_shadow_budget(&mut self, budget: crate::gasp_shadow::ShadowBudget) {
+        self.shadow_budget = budget;
+    }
+
+    /// The mode the engine's GASP shadow runs under.
+    pub fn admission_mode(&self) -> crate::gasp_shadow::AdmissionMode {
+        self.admission_mode
     }
 
     /// Set the ARC broadcaster for network broadcast to miners.
