@@ -445,6 +445,28 @@ pub const DEFERRED_GRAPH_MAX_PASSES: u32 = 60;
 /// room, under which a RESUMED walk keeps the record it holds.
 pub const DEFERRED_GRAPHS_PER_PEER_TOPIC: usize = 16;
 
+/// The most FAULT records one (peer, topic) may hold (engine 0.1.10): a
+/// root's `retry:fault:<class>` or `unanchorable:<class>` record, which holds
+/// the root, its class and its count and NO node. Bounded on its own, not
+/// under [`DEFERRED_GRAPHS_PER_PEER_TOPIC`]: on 0.1.9 a (peer, topic) whose
+/// sixteen slots held obligations had no room for the strike of the root
+/// that held its cursor, and the rule was inert (fact 2 of the 0.1.10
+/// brief). The strike of the run's lowest faulted root is written whatever
+/// the deferred store holds; past this bound it is refused and counted
+/// (`strikes_refused`), and the root stays a gap, named `no_room`.
+///
+/// 32: the public peer showed 21 faulted roots in one run, and only the
+/// lowest strikes a run, so 32 holds that history with half again of room.
+/// A record is a few hundred bytes, so 32 are about 13 KB a (peer, topic);
+/// an unanchorable one is walked once per [`UNANCHORABLE_RETRY_SECS`], so 32
+/// cost at most 128 walks a day against 1,440 ticks. Above it the storage's
+/// own ceiling stays the only one ([`DeferredGraphSave::AtCeiling`], the
+/// lens fold's M3): the 16 of L4 bound what a peer serving many DEEP graphs
+/// costs in bytes, and a fault record carries none; what it costs in rows
+/// is this bound, one new record a (peer, topic) a run, and the storage's
+/// row ceilings (the worker's global count and a discovered origin's share).
+pub const FAULT_RECORDS_PER_PEER_TOPIC: usize = 32;
+
 /// Reset a resumed partial walk after this many consecutive idle faults.
 /// Keep the root retry obligation if the cursor could have passed it. These
 /// attempts remain yieldless and count toward peer quarantine.
@@ -545,6 +567,22 @@ pub struct FaultedRoot {
     pub unanchorable: bool,
     /// The error, cut to 160 characters.
     pub error: String,
+    /// Why its strike was refused (engine 0.1.10): `no_room` (the fault
+    /// bound [`FAULT_RECORDS_PER_PEER_TOPIC`], the storage's ceiling, or the
+    /// keys unread) or `store_fault`; empty when it was written or no strike
+    /// was due.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub refused: String,
+}
+
+/// Why a strike was refused (engine 0.1.10), as [`FaultedRoot::refused`]
+/// names it.
+pub mod strike_refused {
+    /// No room: past [`super::FAULT_RECORDS_PER_PEER_TOPIC`], the storage's
+    /// ceiling, or the (peer, topic)'s keys could not be read.
+    pub const NO_ROOM: &str = "no_room";
+    /// The storage faulted writing the record.
+    pub const STORE_FAULT: &str = "store_fault";
 }
 
 /// The per-graph budget of a [`GASPSync`] (bsv-low #555,
@@ -945,6 +983,21 @@ enum Ingested {
     /// An unanchorable root, held (engine 0.1.9): recorded at this walk, or
     /// a record whose backoff has not run out. The cursor passes it.
     Unanchorable,
+}
+
+/// What a strike did (engine 0.1.10): the record that holds the count
+/// (its faulted runs, whether it is unanchorable), and why it was refused.
+#[derive(Debug, Clone, Copy, Default)]
+struct Strike {
+    held: Option<(u32, bool)>,
+    refused: Option<&'static str>,
+}
+
+impl Strike {
+    /// Whether the root is held unanchorable: the cursor passes it.
+    fn passable(self) -> bool {
+        self.held.is_some_and(|(_, unanchorable)| unanchorable)
+    }
 }
 
 /// What [`GASPSync::save_walk`] did with the walk in hand.
@@ -1395,8 +1448,19 @@ pub struct GASPSync<'a> {
     bytes_fetched: std::cell::Cell<u64>,
     /// Nodes appended by the sync's walks so far (bsv-low #586).
     nodes_appended: std::cell::Cell<u64>,
-    /// How many records this (peer, topic) holds in storage.
+    /// How many records this (peer, topic) holds in storage, its fault
+    /// records apart (engine 0.1.10: they are counted in `fault_records`).
     held_records: std::cell::Cell<usize>,
+    /// The roots of this (peer, topic)'s FAULT records known in this sync
+    /// (engine 0.1.10), bounded by [`FAULT_RECORDS_PER_PEER_TOPIC`]: each
+    /// held one is known when the sync reads it (every held record is read
+    /// ahead of the pages), a new one when its strike is written.
+    fault_records: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// The keys of this (peer, topic) could not be read: the fault records
+    /// are unknown, so a new strike finds no room (as the deferred slots).
+    fault_keys_unread: std::cell::Cell<bool>,
+    /// See [`Self::strikes_refused`].
+    strikes_refused: std::cell::Cell<u64>,
     /// The walk of the graph in hand (see [`Walk`]).
     walk: std::cell::RefCell<Option<Walk>>,
     /// See [`Self::deferral_stats`].
@@ -1462,6 +1526,9 @@ impl<'a> GASPSync<'a> {
             bytes_fetched: std::cell::Cell::new(0),
             nodes_appended: std::cell::Cell::new(0),
             held_records: std::cell::Cell::new(0),
+            fault_records: std::cell::RefCell::default(),
+            fault_keys_unread: std::cell::Cell::new(false),
+            strikes_refused: std::cell::Cell::new(0),
             walk: std::cell::RefCell::new(None),
             stats: std::cell::RefCell::new(DeferralStats::default()),
             graphs_attempted: std::cell::Cell::new(0),
@@ -1546,6 +1613,42 @@ impl<'a> GASPSync<'a> {
     /// record cleared.
     pub fn unanchorable_cleared(&self) -> u64 {
         self.unanchorable_cleared.get()
+    }
+
+    /// Strikes the last `sync` could not write (engine 0.1.10): past
+    /// [`FAULT_RECORDS_PER_PEER_TOPIC`], at the storage's ceiling, with the
+    /// keys unread, or on a storage fault. Each is named in
+    /// [`Self::faulted_roots`] with its [`FaultedRoot::refused`]; a refused
+    /// strike of a new root leaves it a gap the cursor holds below.
+    pub fn strikes_refused(&self) -> u64 {
+        self.strikes_refused.get()
+    }
+
+    /// Know `outpoint` as a fault record of this (peer, topic) (engine
+    /// 0.1.10): one counted among the deferred slots moves to the fault
+    /// records. A no-op for one already known.
+    fn know_fault_record(&self, outpoint: &str) {
+        if self.fault_records.borrow_mut().insert(outpoint.to_string()) {
+            self.held_records
+                .set(self.held_records.get().saturating_sub(1));
+        }
+    }
+
+    /// A record of this (peer, topic) read from the storage: a fault record
+    /// is known as one (engine 0.1.10).
+    fn read_record(&self, record: Option<&DeferredGraph>) {
+        if let Some(record) = record.filter(|r| r.is_struck()) {
+            self.know_fault_record(&record.outpoint);
+        }
+    }
+
+    /// A record of this (peer, topic) deleted: one fewer fault record, or
+    /// one fewer deferred slot held.
+    fn forget_record(&self, outpoint: &str) {
+        if !self.fault_records.borrow_mut().remove(outpoint) {
+            self.held_records
+                .set(self.held_records.get().saturating_sub(1));
+        }
     }
 
     /// Release the cursor's hold on `outpoint`: it is finished or held.
@@ -1662,13 +1765,13 @@ impl<'a> GASPSync<'a> {
         outpoint: &str,
         error: &GASPError,
         class: Option<&'static str>,
-        struck: Option<(u32, bool)>,
+        struck: Strike,
     ) {
         let mut faulted = self.faulted.borrow_mut();
         if faulted.iter().any(|f| f.outpoint == outpoint) {
             return;
         }
-        let (faults, unanchorable) = struck.unwrap_or((0, false));
+        let (faults, unanchorable) = struck.held.unwrap_or((0, false));
         faulted.push(FaultedRoot {
             peer: String::new(),
             outpoint: outpoint.to_string(),
@@ -1676,6 +1779,7 @@ impl<'a> GASPSync<'a> {
             faults,
             unanchorable,
             error: error.to_string().chars().take(160).collect(),
+            refused: struck.refused.unwrap_or_default().to_string(),
         });
     }
 
@@ -1694,10 +1798,10 @@ impl<'a> GASPSync<'a> {
             Some(class) if lowest && self.graph_budget.is_some() && fault_class::strikes(class) => {
                 self.strike(score, outpoint, class, None).await
             }
-            _ => None,
+            _ => Strike::default(),
         };
         self.note_faulted(outpoint, error, class, struck);
-        struck.is_some_and(|(_, unanchorable)| unanchorable)
+        struck.passable()
     }
 
     /// Count one more faulted run of `outpoint` (engine 0.1.9), on its
@@ -1705,21 +1809,38 @@ impl<'a> GASPSync<'a> {
     /// holds) under [`UNANCHORABLE_AFTER_FAULTED_RUNS`], `unanchorable:<class>`
     /// (passable, walked again after [`UNANCHORABLE_RETRY_SECS`]) at it. The
     /// record holds nothing but the root to ask for: the walk starts again
-    /// from it. `None` when no record holds the count (no room, a storage
-    /// fault): the root stays a gap, as before 0.1.9.
+    /// from it. A new record needs room among the (peer, topic)'s FAULT
+    /// records ([`FAULT_RECORDS_PER_PEER_TOPIC`], engine 0.1.10), never among
+    /// its deferred slots. A strike that is not written (no room, the
+    /// storage's ceiling, a storage fault) is REFUSED: counted in
+    /// [`Self::strikes_refused`] and named with why; a new root then stays a
+    /// gap, a held unanchorable record stays as it was.
     async fn strike(
         &self,
         score: u64,
         outpoint: &str,
         class: &'static str,
         prior: Option<&DeferredGraph>,
-    ) -> Option<(u32, bool)> {
-        if prior.is_none() && self.held_records.get() >= DEFERRED_GRAPHS_PER_PEER_TOPIC {
+    ) -> Strike {
+        let refuse = |why: &'static str| {
+            self.strikes_refused.set(self.strikes_refused.get() + 1);
             warn!(
-                "{} Root {} faulted ({}): no room for its record, the cursor holds (engine 0.1.9)",
-                self.log_prefix, outpoint, class
+                "{} Root {} faulted ({}): its strike was REFUSED ({}), the cursor holds (engine 0.1.10)",
+                self.log_prefix, outpoint, class, why
             );
-            return None;
+            Strike {
+                // A held unanchorable record stays as it was: passable.
+                held: prior
+                    .filter(|r| r.is_unanchorable())
+                    .map(|r| (r.faults, true)),
+                refused: Some(why),
+            }
+        };
+        if prior.is_none()
+            && (self.fault_keys_unread.get()
+                || self.fault_records.borrow().len() >= FAULT_RECORDS_PER_PEER_TOPIC)
+        {
+            return refuse(strike_refused::NO_ROOM);
         }
         let mut record = Self::fresh_walk(score, outpoint, PassCap::NONE).record;
         record.faults = prior.map_or(0, |r| r.faults) + 1;
@@ -1733,9 +1854,9 @@ impl<'a> GASPSync<'a> {
         }
         match self.storage.save_deferred_graph(&record).await {
             Ok(DeferredGraphSave::Saved) => {
-                if prior.is_none() {
-                    self.held_records.set(self.held_records.get() + 1);
-                }
+                // A new key holds a fault record and no deferred slot; a
+                // prior one was known when it was read.
+                self.fault_records.borrow_mut().insert(outpoint.to_string());
                 if unanchorable && !prior.is_some_and(DeferredGraph::is_unanchorable) {
                     self.unanchorable_recorded
                         .set(self.unanchorable_recorded.get() + 1);
@@ -1753,18 +1874,13 @@ impl<'a> GASPSync<'a> {
                         UNANCHORABLE_AFTER_FAULTED_RUNS
                     );
                 }
-                Some((record.faults, unanchorable))
+                Strike {
+                    held: Some((record.faults, unanchorable)),
+                    refused: None,
+                }
             }
-            Ok(DeferredGraphSave::AtCeiling) | Err(_) => {
-                warn!(
-                    "{} Root {} faulted ({}): its record was not saved (engine 0.1.9)",
-                    self.log_prefix, outpoint, class
-                );
-                // A held unanchorable record stays as it was: passable.
-                prior
-                    .filter(|r| r.is_unanchorable())
-                    .map(|r| (r.faults, true))
-            }
+            Ok(DeferredGraphSave::AtCeiling) => refuse(strike_refused::NO_ROOM),
+            Err(_) => refuse(strike_refused::STORE_FAULT),
         }
     }
 
@@ -1812,10 +1928,14 @@ impl<'a> GASPSync<'a> {
             // A stall of the graph's own deadline does not undo the record:
             // the empty retry `save_walk` wrote is replaced again.
             Ok(Ingested::Retry) if record.is_unanchorable() => {
-                let _ = self
+                if let Ok(DeferredGraphSave::Saved) = self
                     .storage
                     .save_deferred_graph(&keep_unanchorable(&record))
-                    .await;
+                    .await
+                {
+                    // A fault record again, not a deferred slot (0.1.10).
+                    self.know_fault_record(outpoint);
+                }
                 Ok(Ingested::Unanchorable)
             }
             Ok(ingested) => Ok(ingested),
@@ -1828,7 +1948,10 @@ impl<'a> GASPSync<'a> {
                         outpoint,
                         &error,
                         class,
-                        Some((record.faults, record.is_unanchorable())),
+                        Strike {
+                            held: Some((record.faults, record.is_unanchorable())),
+                            refused: None,
+                        },
                     );
                     if record.is_unanchorable() {
                         let _ = self
@@ -1841,7 +1964,7 @@ impl<'a> GASPSync<'a> {
                 };
                 let struck = self.strike(score, outpoint, class, Some(&record)).await;
                 self.note_faulted(outpoint, &error, Some(class), struck);
-                if struck.is_some_and(|(_, unanchorable)| unanchorable) {
+                if struck.passable() {
                     Ok(Ingested::Unanchorable)
                 } else {
                     Err(error)
@@ -1990,6 +2113,9 @@ impl<'a> GASPSync<'a> {
         self.faulted.borrow_mut().clear();
         self.unanchorable_recorded.set(0);
         self.unanchorable_cleared.set(0);
+        self.strikes_refused.set(0);
+        self.fault_records.borrow_mut().clear();
+        self.fault_keys_unread.set(false);
         self.discarded_graphs.set(0);
         self.anchor_walk_held.set(0);
         self.completed_cursor = self.last_interaction;
@@ -2019,6 +2145,7 @@ impl<'a> GASPSync<'a> {
                 }
                 Err(e) => {
                     self.held_records.set(DEFERRED_GRAPHS_PER_PEER_TOPIC);
+                    self.fault_keys_unread.set(true);
                     warn!(
                         "{} Could not read the deferred graphs (bsv-low #555): {}",
                         self.log_prefix, e
@@ -2118,7 +2245,7 @@ impl<'a> GASPSync<'a> {
                     );
                     self.walk.borrow_mut().take();
                     let class = self.last_fault.take();
-                    self.note_faulted(&key.outpoint, &error, class, None);
+                    self.note_faulted(&key.outpoint, &error, class, Strike::default());
                     false
                 }
             };
@@ -2452,7 +2579,9 @@ impl<'a> GASPSync<'a> {
                 "{} Deferred graph {} held back: the resumes of this pass spent their budget (bsv-low #555)",
                 self.log_prefix, outpoint
             );
-            let Some(mut record) = self.storage.get_deferred_graph(outpoint).await? else {
+            let record = self.storage.get_deferred_graph(outpoint).await?;
+            self.read_record(record.as_ref());
+            let Some(mut record) = record else {
                 return Ok(Ingested::Retry);
             };
             if record.reason == "retry:deadline" {
@@ -2556,6 +2685,7 @@ impl<'a> GASPSync<'a> {
         // A read fault fails the UTXO and keeps the record for the next sync.
         let record = if from_record {
             let record = self.storage.get_deferred_graph(outpoint).await?;
+            self.read_record(record.as_ref());
             if record.is_none() {
                 // Deleted since the keys were read (the worker's sweep).
                 self.held_records
@@ -2910,8 +3040,7 @@ impl<'a> GASPSync<'a> {
                         self.log_prefix, walk.record.outpoint, e
                     );
                 }
-                self.held_records
-                    .set(self.held_records.get().saturating_sub(1));
+                self.forget_record(&walk.record.outpoint);
                 self.unanchorable_cleared
                     .set(self.unanchorable_cleared.get() + 1);
                 info!(
@@ -2931,8 +3060,7 @@ impl<'a> GASPSync<'a> {
                         self.log_prefix, walk.record.outpoint, e
                     );
                 }
-                self.held_records
-                    .set(self.held_records.get().saturating_sub(1));
+                self.forget_record(&walk.record.outpoint);
                 self.stats.borrow_mut().converged += 1;
                 self.resumed_with_progress
                     .set(self.resumed_with_progress.get() + 1);
@@ -3004,10 +3132,12 @@ impl<'a> GASPSync<'a> {
         if walk.record.nodes.is_empty() && !deadline_cut && !was_held {
             return Saved::Unkept(DropReason::NoProgress, Box::new(walk));
         }
-        // A root walked again after faulted runs holds its record's slot
-        // (engine 0.1.9): a save replaces that record.
-        let holds_slot = walk.resumed || walk.struck.is_some();
-        if !holds_slot && self.held_records.get() >= DEFERRED_GRAPHS_PER_PEER_TOPIC {
+        // A resumed walk holds its record's deferred slot. A root walked
+        // again after faulted runs holds a FAULT record (engine 0.1.10): the
+        // hold its walk earned replaces it only with room among the deferred
+        // slots, else the walk goes on as any walk past the bound (L4) and
+        // its fault record stays as it was.
+        if !walk.resumed && self.held_records.get() >= DEFERRED_GRAPHS_PER_PEER_TOPIC {
             return Saved::Unkept(DropReason::TooMany, Box::new(walk));
         }
         // No bound on a record's size (bsv-low #585): the figure is logged
@@ -3017,9 +3147,9 @@ impl<'a> GASPSync<'a> {
         match self.storage.save_deferred_graph(&walk.record).await {
             Ok(DeferredGraphSave::Saved) => {
                 if !walk.resumed {
-                    if !holds_slot {
-                        self.held_records.set(self.held_records.get() + 1);
-                    }
+                    // A fault record replaced is a fault record no more.
+                    self.fault_records.borrow_mut().remove(&outpoint);
+                    self.held_records.set(self.held_records.get() + 1);
                     if !retry && !walk.record.nodes.is_empty() {
                         self.retained.set(self.retained.get() + 1);
                     }
@@ -3140,8 +3270,7 @@ impl<'a> GASPSync<'a> {
                 self.log_prefix, outpoint, e
             );
         }
-        self.held_records
-            .set(self.held_records.get().saturating_sub(1));
+        self.forget_record(outpoint);
         self.note_dropped(outpoint, reason);
     }
 

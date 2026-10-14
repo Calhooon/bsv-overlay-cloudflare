@@ -1882,6 +1882,7 @@ mod tests {
             held_back_graphs: 0,
             unanchorable_graphs: 0,
             unanchorable_cleared: 0,
+            strikes_refused: 0,
             faulted_roots: Vec::new(),
         };
         let results = std::collections::HashMap::from([

@@ -881,6 +881,7 @@ mod tests {
                 faults,
                 unanchorable,
                 error: "no rung served".into(),
+                refused: String::new(),
             };
         assert_eq!(
             faulted_summary(&[

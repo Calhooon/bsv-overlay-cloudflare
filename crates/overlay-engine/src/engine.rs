@@ -5034,6 +5034,7 @@ impl Engine {
             let mut held_back_graphs: u64 = 0;
             let mut unanchorable_graphs: u64 = 0;
             let mut unanchorable_cleared: u64 = 0;
+            let mut strikes_refused: u64 = 0;
             let mut faulted_roots: Vec<crate::gasp::FaultedRoot> = Vec::new();
 
             // If we have a remote factory, actually run GASP sync
@@ -5433,6 +5434,8 @@ impl Engine {
                     // Engine 0.1.9: the roots dropped, each with why.
                     unanchorable_graphs += sync.unanchorable_recorded();
                     unanchorable_cleared += sync.unanchorable_cleared();
+                    // Engine 0.1.10: a strike not written is a fact.
+                    strikes_refused += sync.strikes_refused();
                     faulted_roots.extend(sync.faulted_roots().into_iter().map(|mut f| {
                         f.peer.clone_from(peer_url);
                         f
@@ -5502,6 +5505,7 @@ impl Engine {
                     held_back_graphs,
                     unanchorable_graphs,
                     unanchorable_cleared,
+                    strikes_refused,
                     faulted_roots,
                 },
             );
@@ -5519,6 +5523,10 @@ impl Engine {
         let unanchorable: u64 = topics_synced.values().map(|r| r.unanchorable_graphs).sum();
         if unanchorable > 0 {
             info!("[GASP SYNC] gaspUnanchorable={unanchorable}");
+        }
+        let refused: u64 = topics_synced.values().map(|r| r.strikes_refused).sum();
+        if refused > 0 {
+            info!("[GASP SYNC] gaspStrikesRefused={refused}");
         }
         Ok(GASPSyncResult { topics_synced })
     }
@@ -6146,6 +6154,12 @@ pub struct TopicSyncResult {
     /// or refused on a verdict: their record cleared (engine 0.1.9).
     #[serde(default)]
     pub unanchorable_cleared: u64,
+    /// Strikes this sync could not write (engine 0.1.10,
+    /// `GASPSync::strikes_refused`): past `gasp::FAULT_RECORDS_PER_PEER_TOPIC`,
+    /// at the storage's ceiling or on its fault. Each root is named in
+    /// `faulted_roots` with its `refused` reason.
+    #[serde(default)]
+    pub strikes_refused: u64,
     /// Every root a peer's sync dropped in this run, once per (peer, root),
     /// named with its fault class, its faulted runs and whether it is now
     /// unanchorable (engine 0.1.9, `GASPSync::faulted_roots`). With
@@ -8536,6 +8550,7 @@ mod tests {
                 held_back_graphs: 0,
                 unanchorable_graphs: 0,
                 unanchorable_cleared: 0,
+                strikes_refused: 0,
                 faulted_roots: Vec::new(),
             },
         );
@@ -9508,6 +9523,178 @@ mod tests {
                 .reason,
             "retry:fault:not_served"
         );
+    }
+
+    /// A record of the budget page's peer and topic, holding nothing but
+    /// its root (engine 0.1.10 tests).
+    fn bare_record(n: u32, score: u64, reason: &str, passable: bool) -> crate::gasp::DeferredGraph {
+        let outpoint = format!("{:064x}.0", 0xdead_0000 + n);
+        crate::gasp::DeferredGraph {
+            peer: "https://budget.example".into(),
+            topic: "tm_test".into(),
+            outpoint: outpoint.clone(),
+            score,
+            nodes: Vec::new(),
+            pending: vec![crate::gasp::PendingInput {
+                outpoint: outpoint.clone(),
+                graph_id: outpoint,
+                metadata: true,
+                spent_by: None,
+                parent_proven: false,
+            }],
+            calls: 0,
+            passes: 0,
+            reason: reason.into(),
+            configured: true,
+            idle_faults: 0,
+            cursor_passable: passable,
+            faults: 0,
+            retry_at: 0,
+        }
+    }
+
+    /// Fill the budget page's (peer, topic) with `count` root retry
+    /// obligations the peer does not serve (fact 3 of the 0.1.10 brief:
+    /// `held:retry`, nodes 0, below the cursor), returning their roots.
+    async fn hold_obligations(engine: &Engine, count: usize) -> Vec<String> {
+        let mut roots = Vec::new();
+        for n in 0..count {
+            let record = bare_record(n as u32, 1 + n as u64, "retry", true);
+            roots.push(record.outpoint.clone());
+            engine.storage().put_deferred_graph(&record).await.unwrap();
+        }
+        roots
+    }
+
+    /// 0.1.10 (room): a (peer, topic) whose deferred slots are all held by
+    /// root retry obligations that never progress still records the root
+    /// that holds its cursor: a fault record is bounded on its own
+    /// (`FAULT_RECORDS_PER_PEER_TOPIC`), so the strike is written on each
+    /// faulted run and the third passes the cursor. On 0.1.9 every strike
+    /// found "no room" (`gasp.rs:1717`), the root was named with no run and
+    /// the cursor stayed at 0 for ever (fact 2: the keeper's eighth hand).
+    #[tokio::test]
+    async fn room_0110_a_full_store_still_records_the_cursors_holder_and_passes_it() {
+        let UnanchorableFixture {
+            engine,
+            store,
+            root,
+            ..
+        } = unanchorable_fixture();
+        let host = "https://budget.example";
+        let obligations =
+            hold_obligations(&engine, crate::gasp::DEFERRED_GRAPHS_PER_PEER_TOPIC).await;
+        let runs = crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS;
+        for run in 1..=runs {
+            let result = engine.start_gasp_sync().await.unwrap();
+            let topic = &result.topics_synced["tm_test"];
+            assert_eq!(topic.strikes_refused, 0, "run {run}: {topic:?}");
+            let named = topic
+                .faulted_roots
+                .iter()
+                .find(|f| f.outpoint == root)
+                .unwrap_or_else(|| panic!("run {run}: {topic:?}"));
+            assert_eq!(named.class, crate::gasp::fault_class::COURIER);
+            assert_eq!(named.faults, run, "run {run}: the strike was written");
+            assert!(named.refused.is_empty(), "{named:?}");
+            if run < runs {
+                assert!(topic.cursor_moves.is_empty(), "run {run}: the gap holds");
+                assert_eq!(topic.cursor_held_by, vec![root.clone()]);
+            } else {
+                assert!(named.unanchorable);
+                assert_eq!(topic.unanchorable_graphs, 1);
+                assert_eq!(topic.cursor_moves.len(), 1, "{topic:?}");
+                assert_eq!(topic.cursor_moves[0].to, 30, "passed");
+                assert!(topic.cursor_held_by.is_empty(), "{topic:?}");
+            }
+        }
+        // The obligations are all still held beside the fault record.
+        let held: Vec<String> = store
+            .deferred_graphs()
+            .into_iter()
+            .map(|r| r.outpoint)
+            .collect();
+        assert_eq!(held.len(), obligations.len() + 1, "{held:?}");
+        assert!(obligations.iter().all(|o| held.contains(o)));
+        let record = store
+            .get_deferred_graph(host, "tm_test", &root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.reason, "unanchorable:courier");
+    }
+
+    /// 0.1.10 (the reason, readable): a strike the bound or the storage
+    /// refuses is counted (`strikes_refused`) and named on the root
+    /// (`refused`): `no_room` past `FAULT_RECORDS_PER_PEER_TOPIC` fault
+    /// records and at the storage's ceiling, `store_fault` on its fault.
+    /// The root stays a gap the cursor holds below, as on 0.1.9, where the
+    /// refusal was a `warn!` alone.
+    #[tokio::test]
+    async fn room_0110_a_refused_strike_is_counted_and_named() {
+        let UnanchorableFixture {
+            engine,
+            store,
+            root,
+            ..
+        } = unanchorable_fixture();
+        // The fault bound: as many unanchorable roots, inside their backoff
+        // (passable, never asked), as a (peer, topic) may hold.
+        let later = (current_timestamp_ms() / 1000.0) as u64 + 3600;
+        for n in 0..crate::gasp::FAULT_RECORDS_PER_PEER_TOPIC {
+            let mut record = bare_record(n as u32, 1, "unanchorable:courier", true);
+            record.faults = crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS;
+            record.retry_at = later;
+            engine.storage().put_deferred_graph(&record).await.unwrap();
+        }
+        let refused_as = |result: &super::GASPSyncResult, why: &str| {
+            let topic = &result.topics_synced["tm_test"];
+            assert_eq!(topic.strikes_refused, 1, "{topic:?}");
+            let named = topic
+                .faulted_roots
+                .iter()
+                .find(|f| f.outpoint == root)
+                .unwrap_or_else(|| panic!("{topic:?}"));
+            assert_eq!(named.refused, why, "{named:?}");
+            assert_eq!(named.faults, 0, "no record holds the count");
+            assert!(topic.cursor_moves.is_empty(), "the gap holds");
+            assert_eq!(topic.cursor_held_by, vec![root.clone()]);
+        };
+        let result = engine.start_gasp_sync().await.unwrap();
+        refused_as(&result, crate::gasp::strike_refused::NO_ROOM);
+        assert!(store
+            .get_deferred_graph("https://budget.example", "tm_test", &root)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Room again among the fault records, none in the storage.
+        let gone = bare_record(0, 1, "", false).outpoint;
+        engine
+            .storage()
+            .delete_deferred_graph("https://budget.example", "tm_test", &gone)
+            .await
+            .unwrap();
+        store.set_deferred_graph_ceiling(Some(store.deferred_graphs().len()));
+        let result = engine.start_gasp_sync().await.unwrap();
+        refused_as(&result, crate::gasp::strike_refused::NO_ROOM);
+
+        // The storage faults.
+        store.set_deferred_graph_ceiling(None);
+        store.set_deferred_graph_put_fault(true);
+        let result = engine.start_gasp_sync().await.unwrap();
+        refused_as(&result, crate::gasp::strike_refused::STORE_FAULT);
+
+        // The storage serves again: the strike is written.
+        store.set_deferred_graph_put_fault(false);
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.strikes_refused, 0, "{topic:?}");
+        assert!(store
+            .get_deferred_graph("https://budget.example", "tm_test", &root)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
