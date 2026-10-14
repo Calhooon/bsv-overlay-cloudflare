@@ -1031,6 +1031,14 @@ pub fn markerless_should_carry(
 pub const OWED_WITHHELD_PREVIOUS_SQL: &str = "SELECT identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason FROM owed_rows WHERE identity = ?1 AND outpoint IN (SELECT value FROM json_each(?2)) AND family = 'payout'";
 /// The row word of a payout kept from the previous snapshot because this pass could not look at its spender.
 pub const OWED_REFRESH_WITHHELD: &str = "withheld";
+/// The L25-WITHHELD lens's MEDIUM-1 (1): how long a kept row may stand on its last judgement (`judgedAtMs`, the pass
+/// that last read the spender's bytes). Sixty minutes, twelve open-list refreshes
+/// (`OWED_RECOMPUTE_OPEN_AFTER_MS`, five): the durable rotation ([`spender_ask_order`]) buys every named spender
+/// within ceil(16 / 2) = 8 passes (40 min) at the courier cap of two, so an honest rotation re-reads the bytes before
+/// the bound; past it the rotation is not reaching the spender (every pass's batch lost, or more spenders than the
+/// walk names) and the honest "could not judge the spender" row returns.
+pub const OWED_WITHHELD_KEEP_MAX_MS: i64 = 60 * 60_000;
+const _: () = assert!(OWED_WITHHELD_KEEP_MAX_MS >= 12 * OWED_RECOMPUTE_OPEN_AFTER_MS);
 
 /// PURE (bsv-low #662): the spender a hop's row is judged on (the index's recorded spend, else the chain rung's
 /// spent word), lowercase: the same name the route asks the spender's bytes of.
@@ -1042,6 +1050,19 @@ fn hop_named_spender(i: &OwedInputs, h: &HopEntry) -> Option<String> {
         .get(&outpoint_key(&h.hop_txid, h.hop_vout))
         .filter(|w| w.looked && w.spent == Some(true))
         .and_then(|w| w.spending_txid.as_deref().map(str::to_ascii_lowercase))
+}
+
+/// PURE (the L25-WITHHELD lens's LOW-2): `r` is THIS pass's spender judgement of the hop at `key`: an `unbound`
+/// row whose spender fact (`chainSpender`, else `spendingTxid`) names `sp`, never a markerless evidence read-fault
+/// row (`markerlessReadFault`: a faulted read keeps its fault row).
+fn is_spender_judgement(r: &OwedRow, key: &str, sp: &str) -> bool {
+    r.outpoint == key
+        && r.family == OwedFamily::Unbound
+        && r.facts["markerlessReadFault"] != true
+        && r.facts["chainSpender"]
+            .as_str()
+            .or_else(|| r.facts["spendingTxid"].as_str())
+            .is_some_and(|named| named.eq_ignore_ascii_case(sp))
 }
 
 /// PURE (bsv-low #662): the hop outpoints served `unbound` this pass ONLY because the spender's bytes were WITHHELD
@@ -1066,7 +1087,7 @@ pub fn withheld_hop_outpoints(
             }
             let key = outpoint_key(&h.hop_txid, h.hop_vout);
             rows.iter()
-                .any(|r| r.outpoint == key && r.family == OwedFamily::Unbound)
+                .any(|r| is_spender_judgement(r, &key, &sp))
                 .then_some(key)
         })
         .collect();
@@ -1099,10 +1120,10 @@ pub fn keep_withheld_payouts(
         let Some(sp) = hop_named_spender(i, h) else {
             continue;
         };
+        // the read binds the identity (`WHERE identity = ?1`, exact): no identity compare here (the lens's NOTE-2)
         let Some((prev, updated_at_ms)) = previous.iter().find(|(p, _)| {
             p.outpoint == key
                 && p.family == OwedFamily::Payout
-                && p.identity.eq_ignore_ascii_case(i.identity_lc)
                 && p.facts["creditKind"] == "courier-bytes"
                 && p.facts["sweepTxid"]
                     .as_str()
@@ -1114,14 +1135,15 @@ pub fn keep_withheld_payouts(
         if i.collected_verified.contains(&game) || i.held_verified.contains(&held_key(&game, &sp)) {
             continue;
         }
-        let Some(slot) = rows
-            .iter_mut()
-            .find(|r| r.outpoint == key && r.family == OwedFamily::Unbound)
-        else {
+        let judged_at = prev.facts["judgedAtMs"].as_i64().unwrap_or(*updated_at_ms);
+        // MEDIUM-1 (1): a judgement older than the bound is not kept; the could-not-judge row stands
+        if i.now_ms.saturating_sub(judged_at) > OWED_WITHHELD_KEEP_MAX_MS {
+            continue;
+        }
+        let Some(slot) = rows.iter_mut().find(|r| is_spender_judgement(r, &key, &sp)) else {
             continue;
         };
         let mut row = prev.clone();
-        let judged_at = row.facts["judgedAtMs"].as_i64().unwrap_or(*updated_at_ms);
         row.facts["claimable"] = json!(false);
         row.facts["refresh"] = json!(OWED_REFRESH_WITHHELD);
         row.facts["judgedAtMs"] = json!(judged_at);
@@ -1129,6 +1151,134 @@ pub fn keep_withheld_payouts(
         kept += 1;
     }
     kept
+}
+
+/// How a named spender's bytes were LOOKED at this pass (the L25-WITHHELD lens's LOW-1): a read was made, or an
+/// answer already held was used, faulted or not. A looked spender is never withheld: its row (a judgement or a
+/// fault) is this pass's word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpenderLooked {
+    /// The index's stored BEEF read (`load_stored_beef`), whatever it answered: bytes, a fault, unparsable bytes.
+    StoredRead,
+    /// The isolate's parsed courier memo answered.
+    Memo,
+    /// The isolate's tx-any cache answered (a fault inside its TTL included).
+    CachedAnswer,
+    /// The tracker's compact row carried the hash-verified raw (or not: the row was the answer).
+    TrackerRow,
+    /// A courier was asked (`resolve_tx_any`), whatever it answered.
+    CourierAsked,
+}
+
+/// Why a named spender's bytes were NOT looked at this pass: the only causes of a WITHHELD spender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpenderWithheld {
+    /// The spender courier cap (`OWED_SPENDER_COURIER_READS_PER_RECOMPUTE`).
+    Cap,
+    /// The recompute's clock (`OWED_RECOMPUTE_TIME_BUDGET_MS`).
+    Clock,
+    /// Past the stored-read count (`OWED_SPENDER_READS_PER_RECOMPUTE`): never reached this pass.
+    Tail,
+}
+
+/// PURE (the L25-WITHHELD lens's LOW-1): the spender look ledger of one recompute. WITHHELD is positive evidence: a
+/// spender is withheld only when a cap, the clock or the tail was NOTED for it and no look was. A path that notes
+/// nothing leaves the spender looked-or-unknown, never withheld, so its row stands as derived (the pre-#662 word,
+/// the honest could-not-judge): a read path added later without its note can never bring a stale payout over a
+/// fault.
+#[derive(Debug, Clone, Default)]
+pub struct SpenderLook {
+    looked: HashMap<String, SpenderLooked>,
+    withheld: HashMap<String, SpenderWithheld>,
+}
+
+impl SpenderLook {
+    pub fn look(&mut self, sp: &str, how: SpenderLooked) {
+        self.looked.insert(sp.to_ascii_lowercase(), how);
+    }
+    pub fn withhold(&mut self, sp: &str, why: SpenderWithheld) {
+        self.withheld.entry(sp.to_ascii_lowercase()).or_insert(why);
+    }
+    pub fn withhold_all<'a>(
+        &mut self,
+        sps: impl IntoIterator<Item = &'a String>,
+        why: SpenderWithheld,
+    ) {
+        for sp in sps {
+            self.withhold(sp, why);
+        }
+    }
+    /// The spenders whose bytes this pass WITHHELD (lowercase): noted withheld and never looked at.
+    pub fn withheld(&self) -> HashSet<String> {
+        self.withheld
+            .keys()
+            .filter(|sp| !self.looked.contains_key(*sp))
+            .cloned()
+            .collect()
+    }
+}
+
+/// The L25-WITHHELD lens's MEDIUM-1 (2): the durable ask stamp of a spender's courier read, one `hop_chain_probes`
+/// row under this key prefix (`spenderask:<spender txid>.0`, the memo key's shape, so it rides the probe memo read).
+/// Its `probedAtMs` is the last time a courier was asked for that spender's bytes; `spent` is 0 and
+/// `spentConfirmed` NULL, so no reader takes it for a probe or a latch and the overlay's reorg clear (confirmed
+/// memos only) never touches it. The overlay's TTL sweep (two hours) DOES delete it, and that is its lifecycle: a
+/// stamp past two hours ranks as never asked, which is where the oldest ask goes anyway, and the rows never grow
+/// past the spenders asked in two hours. Keyed by the SPENDER (the thing asked), not the hop: one spender can
+/// serve two hops and the isolate's own stamp was keyed the same way.
+pub const SPENDER_ASK_PREFIX: &str = "spenderask:";
+/// MEDIUM-1 (2): stamp a spender's courier ask (binds: the memo key, now in ms). Written in the recompute's ONE
+/// write batch, never alone on the read path; the stamp only grows.
+pub const SPENDER_ASK_UPSERT_SQL: &str = "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) VALUES (?1, ?2, 0, NULL, NULL) \
+     ON CONFLICT(outpoint) DO UPDATE SET probedAtMs = MAX(hop_chain_probes.probedAtMs, excluded.probedAtMs)";
+
+/// PURE: the probe-memo target of a spender's durable ask stamp.
+pub fn spender_ask_target(spender_lc: &str) -> (String, u32) {
+    (
+        format!("{SPENDER_ASK_PREFIX}{}", spender_lc.to_ascii_lowercase()),
+        0,
+    )
+}
+
+/// PURE: the durable ask stamps the memo read returned, by spender (lowercase).
+pub fn spender_ask_stamps(memos: &[crate::hops_view::ProbeMemo]) -> HashMap<String, i64> {
+    let mut out: HashMap<String, i64> = HashMap::new();
+    for m in memos {
+        let Some(sp) = m
+            .outpoint
+            .strip_prefix(SPENDER_ASK_PREFIX)
+            .and_then(|k| k.strip_suffix(".0"))
+        else {
+            continue;
+        };
+        let at = out.entry(sp.to_ascii_lowercase()).or_insert(m.probed_at_ms);
+        *at = (*at).max(m.probed_at_ms);
+    }
+    out
+}
+
+/// PURE (MEDIUM-1 (2)): the courier asks' order, NEVER-ASKED FIRST, then the oldest ask (the bounded-walk rule of
+/// 2026-09-19), a tie in `wanted`'s order (newest hop first). An ask's stamp is the later of the DURABLE stamp (the
+/// same on every isolate) and the isolate's own (`isolate`), so a cold isolate's pass buys the spenders the last
+/// passes did not, and the oldest unasked spender is never withheld for ever.
+pub fn spender_ask_order(
+    wanted: Vec<String>,
+    durable: &HashMap<String, i64>,
+    isolate: impl Fn(&str) -> Option<i64>,
+) -> Vec<String> {
+    let mut keyed: Vec<(i64, String)> = wanted
+        .into_iter()
+        .map(|sp| {
+            let at = durable
+                .get(&sp.to_ascii_lowercase())
+                .copied()
+                .max(isolate(&sp))
+                .unwrap_or(0);
+            (at, sp)
+        })
+        .collect();
+    keyed.sort_by_key(|(at, _)| *at);
+    keyed.into_iter().map(|(_, sp)| sp).collect()
 }
 
 /// A count is progress, never a cut. Only known unheld tail evidence makes the list incomplete.
@@ -3252,6 +3402,12 @@ static SPENDER_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub fn note_spender_read_fault() {
     SPENDER_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
+/// The L25-WITHHELD lens's LOW-3: the withheld payouts' previous-row read (`OWED_WITHHELD_PREVIOUS_SQL`) faulted
+/// (that pass's rows stand as derived: could not judge).
+static WITHHELD_PREVIOUS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
+pub fn note_withheld_previous_read_fault() {
+    WITHHELD_PREVIOUS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
 /// Reads that served the rows in hand and kicked a background refresh (the stale / aged arms of the read rule).
 static READ_REFRESHES: AtomicU64 = AtomicU64::new(0);
 /// Reads that found a refresh of the same identity already in flight on this isolate (served, no second kick).
@@ -3543,6 +3699,7 @@ pub fn owed_health_json() -> Value {
         "probeMemoReadFaults": PROBE_MEMO_READ_FAULTS.load(Ordering::Relaxed),
         "sweepProofContradictions": SWEEP_PROOF_CONTRADICTIONS.load(Ordering::Relaxed),
         "spenderReadFaults": SPENDER_READ_FAULTS.load(Ordering::Relaxed),
+        "withheldPreviousReadFaults": WITHHELD_PREVIOUS_READ_FAULTS.load(Ordering::Relaxed),
         "spenderReadsPerRecompute": OWED_SPENDER_READS_PER_RECOMPUTE,
         "recomputeTimeBudgetMs": OWED_RECOMPUTE_TIME_BUDGET_MS,
         "readRefreshesKicked": READ_REFRESHES.load(Ordering::Relaxed),
@@ -4348,7 +4505,9 @@ pub(crate) mod tests {
         assert_eq!(judged[0].outpoint, key);
         assert_eq!(judged[0].family, OwedFamily::Payout);
         assert_eq!(judged[0].facts["creditKind"], "courier-bytes");
-        let previous = vec![(judged[0].clone(), 1_791_937_805_199i64)];
+        // the judging pass ten minutes before this one (the helper's `now_ms`), the first keep five minutes after it
+        let judged_at = 1_800_000_000_000i64 - 10 * 60_000;
+        let previous = vec![(judged[0].clone(), judged_at)];
         // pass C: the same hop, the same spender named, its bytes WITHHELD by the courier cap
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &chain;
@@ -4380,16 +4539,63 @@ pub(crate) mod tests {
         assert_eq!(r.facts["sweepTxid"], json!(sweep));
         assert_eq!(r.facts["claimable"], false);
         assert_eq!(r.facts["refresh"], OWED_REFRESH_WITHHELD);
-        assert_eq!(r.facts["judgedAtMs"], 1_791_937_805_199i64);
+        assert_eq!(r.facts["judgedAtMs"], judged_at);
         assert!(
             row_is_open(r),
             "the kept row is open: the read re-judges it"
         );
         // a second withheld pass keeps the FIRST judgement's stamp
-        let again = vec![(r.clone(), 1_791_938_135_277i64)];
+        let again = vec![(r.clone(), judged_at + 5 * 60_000)];
         let mut rows2 = derived.clone();
         assert_eq!(keep_withheld_payouts(&i, &mut rows2, &again, &withheld), 1);
-        assert_eq!(rows2[0].facts["judgedAtMs"], 1_791_937_805_199i64);
+        assert_eq!(rows2[0].facts["judgedAtMs"], judged_at);
+        // the L25-WITHHELD lens's MEDIUM-1 (1): a third withheld pass AT the bound still keeps; one ms past it keeps
+        // NOTHING, and the honest could-not-judge row returns
+        let kept_twice = vec![(rows2[0].clone(), judged_at + 10 * 60_000)];
+        let mut at_bound = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        at_bound.hop_chain = &chain;
+        at_bound.spender_outputs = &no_bytes;
+        at_bound.spender_inputs = &no_inputs;
+        at_bound.my_pkh_by_game = &pkhs;
+        at_bound.now_ms = judged_at + OWED_WITHHELD_KEEP_MAX_MS;
+        let mut rows3 = derived.clone();
+        assert_eq!(
+            keep_withheld_payouts(&at_bound, &mut rows3, &kept_twice, &withheld),
+            1,
+            "at the bound the judgement still stands"
+        );
+        at_bound.now_ms = judged_at + OWED_WITHHELD_KEEP_MAX_MS + 1;
+        let mut rows3 = derived.clone();
+        assert_eq!(
+            keep_withheld_payouts(&at_bound, &mut rows3, &kept_twice, &withheld),
+            0,
+            "a judgement older than OWED_WITHHELD_KEEP_MAX_MS is never kept"
+        );
+        assert_eq!(
+            rows3, derived,
+            "past the bound the could-not-judge row stands"
+        );
+        // the lens's LOW-2: the slot must be THIS pass's spender judgement. A markerless evidence READ-FAULT row at
+        // the outpoint (`merge_markerless_faults` put it there) is never replaced, nor a spender row so marked
+        let mut fault_row = derived[0].clone();
+        fault_row.facts = json!({"markerlessEvidence": true, "markerlessReadFault": true, "hopTxid": tx(0x07),
+            "hopVout": 0, "claim": null, "claimable": false});
+        fault_row.reason = Some("could not judge: evidence-missing".into());
+        let mut rows4 = vec![fault_row.clone()];
+        assert_eq!(
+            keep_withheld_payouts(&i, &mut rows4, &previous, &withheld),
+            0
+        );
+        assert_eq!(rows4, vec![fault_row]);
+        let mut marked = derived[0].clone();
+        marked.facts["markerlessReadFault"] = json!(true);
+        let mut rows4 = vec![marked.clone()];
+        assert!(withheld_hop_outpoints(&i, &rows4, &withheld).is_empty());
+        assert_eq!(
+            keep_withheld_payouts(&i, &mut rows4, &previous, &withheld),
+            0
+        );
+        assert_eq!(rows4, vec![marked]);
         // a FAULTED read (the spender looked at, the answer bad): never withheld, the fault row stands
         let mut rows = derived.clone();
         assert_eq!(keep_withheld_payouts(&i, &mut rows, &previous, &none), 0);
@@ -4454,6 +4660,221 @@ pub(crate) mod tests {
             0
         );
         assert!(rows[0].facts.get("refresh").is_none());
+    }
+
+    /// The L25-WITHHELD lens's LOW-1: the withheld/looked ledger, per outcome. A cap break, the clock and the
+    /// 16-read tail are WITHHELD; a stored read, a courier ask, a memo, a cached answer and a tracker row, faulted or
+    /// not, are LOOKED, and a look wins over any withhold. A spender nothing was noted for is never withheld (a path
+    /// that forgets its note keeps the honest could-not-judge row, never a stale payout over a fault).
+    #[test]
+    fn l25w_low1_the_spender_look_ledger_withholds_only_on_a_cap_the_clock_or_the_tail() {
+        for why in [
+            SpenderWithheld::Cap,
+            SpenderWithheld::Clock,
+            SpenderWithheld::Tail,
+        ] {
+            let mut look = SpenderLook::default();
+            look.withhold("AB", why);
+            assert_eq!(
+                look.withheld(),
+                HashSet::from(["ab".to_string()]),
+                "{why:?} withholds"
+            );
+        }
+        for how in [
+            SpenderLooked::StoredRead,
+            SpenderLooked::Memo,
+            SpenderLooked::CachedAnswer,
+            SpenderLooked::TrackerRow,
+            SpenderLooked::CourierAsked,
+        ] {
+            // looked first (phase 1), then a later cap names it (phase 2 never reaches it): looked
+            let mut look = SpenderLook::default();
+            look.look("ab", how);
+            look.withhold("ab", SpenderWithheld::Cap);
+            assert!(
+                look.withheld().is_empty(),
+                "{how:?} is a look, never withheld"
+            );
+            // the cap first, the look after (another identity's recompute bought it; order never matters)
+            let mut look = SpenderLook::default();
+            look.withhold("ab", SpenderWithheld::Clock);
+            look.look("AB", how);
+            assert!(
+                look.withheld().is_empty(),
+                "{how:?} is a look, never withheld"
+            );
+        }
+        // named and never noted (a read path with no note): not withheld
+        let look = SpenderLook::default();
+        assert!(look.withheld().is_empty());
+        // the route's shape: three wanted at a cap of two, the first two asked, the third withheld by the cap
+        let wanted: Vec<String> = ["aa", "bb", "cc"].iter().map(|s| s.to_string()).collect();
+        let mut look = SpenderLook::default();
+        look.withhold_all(&wanted[3..], SpenderWithheld::Tail);
+        for (at, sp) in wanted.iter().enumerate() {
+            if at == OWED_SPENDER_COURIER_READS_PER_RECOMPUTE {
+                look.withhold_all(&wanted[at..], SpenderWithheld::Cap);
+                break;
+            }
+            look.look(sp, SpenderLooked::CourierAsked);
+        }
+        assert_eq!(look.withheld(), HashSet::from(["cc".to_string()]));
+    }
+
+    /// The L25-WITHHELD lens's MEDIUM-1 (2): the courier asks' rotation is DURABLE. Three named spenders (newest
+    /// hop first: A, B, C) under the courier cap of two, two passes each on a COLD isolate (no isolate stamp): the
+    /// first buys A and B and its write batch stamps them (`SPENDER_ASK_UPSERT_SQL`, real SQLite); the second reads
+    /// the stamps back through the shipped probe memo read and buys C first. Before the fold the order was the
+    /// isolate's alone and every cold pass bought A and B: C, the oldest hop, was withheld for ever. The stamp is
+    /// spared by the overlay's reorg clear and expired by its TTL sweep (its lifecycle), and a reader of the memos
+    /// never takes it for a probe of any outpoint.
+    #[test]
+    fn l25w_m1_two_cold_passes_over_three_named_spenders_buy_all_three_real_sqlite() {
+        use bsv_overlay_cloudflare::hop_probe_memos::{
+            HOP_PROBE_MEMO_EXPIRE_SQL, HOP_PROBE_MEMO_REORG_CLEAR_SQL,
+        };
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(
+            bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
+                .iter()
+                .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS hop_chain_probes "))
+                .unwrap(),
+        )
+        .unwrap();
+        let (a, b, c) = (tx(0x0a), tx(0x0b), tx(0x0c));
+        let wanted = vec![a.clone(), b.clone(), c.clone()];
+        let cold = |_: &str| -> Option<i64> { None };
+        let read_stamps = |conn: &rusqlite::Connection| -> HashMap<String, i64> {
+            let targets: Vec<(String, u32)> =
+                wanted.iter().map(|sp| spender_ask_target(sp)).collect();
+            let keys = &crate::hops_view::probe_memo_read_chunks(&targets)[0];
+            let mut stmt = conn
+                .prepare(&crate::hops_view::probe_memo_read_sql(keys.len()))
+                .unwrap();
+            let memos: Vec<crate::hops_view::ProbeMemo> = stmt
+                .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                    Ok(crate::hops_view::ProbeMemo {
+                        outpoint: r.get(0)?,
+                        probed_at_ms: r.get(1)?,
+                        spent: r.get::<_, i64>(2)? != 0,
+                        spending_txid: r.get(3)?,
+                        spent_confirmed: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                    })
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(memos
+                .iter()
+                .all(|m| !m.spent && m.spent_confirmed.is_none()));
+            spender_ask_stamps(&memos)
+        };
+        let stamp = |conn: &rusqlite::Connection, sp: &str, at: i64| {
+            let (txid, vout) = spender_ask_target(sp);
+            conn.execute(
+                SPENDER_ASK_UPSERT_SQL,
+                rusqlite::params![crate::hops_view::probe_memo_key(&txid, vout), at],
+            )
+            .unwrap();
+        };
+        let mut bought: HashSet<String> = HashSet::new();
+        let t1 = 1_800_000_000_000i64;
+        // pass 1, cold: no stamp anywhere
+        let order = spender_ask_order(wanted.clone(), &read_stamps(&conn), cold);
+        assert_eq!(order, wanted, "never asked: newest hop first");
+        for sp in order.iter().take(OWED_SPENDER_COURIER_READS_PER_RECOMPUTE) {
+            bought.insert(sp.clone());
+            stamp(&conn, sp, t1);
+        }
+        // pass 2, five minutes later, ANOTHER cold isolate
+        let t2 = t1 + 5 * 60_000;
+        let order = spender_ask_order(wanted.clone(), &read_stamps(&conn), cold);
+        assert_eq!(
+            order[0], c,
+            "the never-asked spender goes first on a cold isolate: {order:?}"
+        );
+        for sp in order.iter().take(OWED_SPENDER_COURIER_READS_PER_RECOMPUTE) {
+            bought.insert(sp.clone());
+            stamp(&conn, sp, t2);
+        }
+        assert_eq!(
+            bought,
+            HashSet::from([a.clone(), b.clone(), c.clone()]),
+            "two cold passes buy all three named spenders"
+        );
+        // the stamp only grows (a late batch never moves it back)
+        stamp(&conn, &c, t1);
+        assert_eq!(read_stamps(&conn)[&c], t2);
+        // the isolate's own stamp is merged: a warm isolate that asked A later than the durable stamp says
+        let warm = |sp: &str| -> Option<i64> { (sp == a).then_some(t2 + 1) };
+        let order = spender_ask_order(wanted.clone(), &read_stamps(&conn), warm);
+        assert_eq!(order.last(), Some(&a));
+        // the overlay's reorg clear spares the stamp (it is no confirmed memo); its TTL sweep expires it
+        conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap();
+        assert_eq!(read_stamps(&conn).len(), 3);
+        conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![t1])
+            .unwrap();
+        let left = read_stamps(&conn);
+        assert_eq!(
+            left.len(),
+            2,
+            "the stamps of t1 expired, ranked never-asked again: {left:?}"
+        );
+        // the key never reads as a probe memo of an outpoint (the memo key is `<txid>.<vout>`)
+        assert!(spender_ask_target(&a).0.starts_with(SPENDER_ASK_PREFIX));
+        assert!(!crate::hops_view::probe_memo_key(&a, 0).starts_with(SPENDER_ASK_PREFIX));
+    }
+
+    /// The L25-WITHHELD lens's LOW-1, LOW-3 and MEDIUM-1 (2), the route's wiring (the house source-shape pin over
+    /// the squashed route): each withhold is noted at its break (the cap, the clock in both phases, the tail), the
+    /// withheld set is the ledger's, the courier order is the durable one (no isolate-only sort), each real ask is
+    /// stamped in the SAME write batch, and the previous-row read's fault is counted and served on `/health`.
+    #[test]
+    fn l25w_the_route_notes_each_withhold_orders_by_the_durable_stamp_and_counts_the_read_fault() {
+        let squash = |s: &str| {
+            s.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+                .replace(",]", "]")
+        };
+        let code: String = include_str!("routes.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let routes = squash(&code);
+        for shape in [
+            "spender_look.withhold_all(&tail, crate::owed::SpenderWithheld::Tail);",
+            "budget_cut = true; spender_look.withhold_all(&ordered[at..], crate::owed::SpenderWithheld::Clock); break;",
+            "courier_cap_hit = true; spender_look.withhold_all(&wanted[at..], crate::owed::SpenderWithheld::Cap); break;",
+            "budget_cut = true; spender_look.withhold_all(&wanted[at..], crate::owed::SpenderWithheld::Clock); break;",
+            "let spenders_withheld = spender_look.withheld();",
+            "let wanted = crate::owed::spender_ask_order(wanted, &durable_asks,",
+            "owed_courier_note_asked(&sp, now_f); spenders_asked.push(sp.clone());",
+            ".prepare(crate::owed::SPENDER_ASK_UPSERT_SQL)",
+            "stmts.insert(stmts.len() - 1, ask_stmt);",
+            "Err(e) => { crate::owed::note_withheld_previous_read_fault(); console_warn!(",
+        ] {
+            assert!(routes.contains(&squash(shape)), "the route carries: {shape}");
+        }
+        assert!(
+            !routes.contains(&squash("wanted.sort_by_key(")),
+            "the courier order is never the isolate's alone"
+        );
+        let stamped = routes
+            .find(&squash("stmts.insert(stmts.len() - 1, ask_stmt);"))
+            .unwrap();
+        let written = routes
+            .find(&squash(
+                "let written = crate::d1_ledger::counted_batch(db, stmts)",
+            ))
+            .unwrap();
+        assert!(
+            stamped < written,
+            "the ask stamps ride the snapshot's one batch"
+        );
+        assert!(owed_health_json()["withheldPreviousReadFaults"].is_u64());
     }
 
     /// The gate's L1: a spend with a VERIFIED proof height is mined whatever `spentConfirmed` says — a verdict gap on
