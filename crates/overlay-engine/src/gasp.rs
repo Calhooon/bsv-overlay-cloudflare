@@ -547,6 +547,39 @@ pub const IDLE_RESUMES_BEFORE_BACKOFF: u32 = 3;
 /// four resumes a day instead of 1,440.
 pub const IDLE_RESUME_RETRY_SECS: u64 = UNANCHORABLE_RETRY_SECS;
 
+/// The share of the per-PEER sync budget the resumes of one pass may take
+/// together, in percent (engine 0.1.11): the held records are walked ahead
+/// of the page, so without a share of its own the page got what they left.
+/// The rest of the slice is the page's.
+///
+/// 33: on the stack's worker the per-peer budget is 30,000 ms
+/// (`GASP_PEER_SYNC_BUDGET_MS`) and one graph's own budget 15,000 ms
+/// (`GASP_GRAPH_BUDGET_MS`), which was the resumes' shared deadline (the lens
+/// fold's M1) and started at the opening resume, so the reads and writes of
+/// the storage between resumes (a record read, its save or drop, the
+/// settled read: about five a record) came on top of it, outside any race.
+/// The share is [`resume_share_ms`]: `min(30,000 * 33 / 100, 15,000)` =
+/// 9,900 ms, started when the held loop starts, so those storage calls are
+/// inside it. The page keeps 20,100 ms: one fresh graph's whole 15,000 ms
+/// budget and 5,100 ms for its listing pages, the finalize submits and the
+/// storage. The courier's rungs (bitails, woc, bananablocks, asked in turn)
+/// have no timeout of their own (the worker's `http_get` sets none): a rung
+/// is cut only by the deadline its step races, which inside the held loop is
+/// this share. The worker sizes a courier attempt at 500 ms
+/// (`GASP_PROOF_FETCH_BUDGET`, a planning figure, not a measurement), so the
+/// share holds about 20 attempts: about 6 resumes of fact 3's shape (a root
+/// request, a root proof ask and an ancestor's three rungs), the rest held
+/// back to the next run. A record held back by the share is not resumed, not
+/// a failed UTXO, not a stalled walk and not an idle resume.
+pub const RESUMES_SHARE_OF_PEER_BUDGET_PERCENT: u64 = 33;
+
+/// The resumes' share of a pass, ms (engine 0.1.11): the
+/// [`RESUMES_SHARE_OF_PEER_BUDGET_PERCENT`] of the per-peer budget, never
+/// more than one graph's own budget (the shared deadline before 0.1.11).
+pub fn resume_share_ms(peer_budget_ms: u64, graph_budget_ms: u64) -> u64 {
+    (peer_budget_ms.saturating_mul(RESUMES_SHARE_OF_PEER_BUDGET_PERCENT) / 100).min(graph_budget_ms)
+}
+
 /// The reason prefix of a root's record while its fault streak is under
 /// [`UNANCHORABLE_AFTER_FAULTED_RUNS`]: not passable, the cursor holds.
 pub const FAULT_RETRY_REASON: &str = "retry:fault:";
@@ -1505,6 +1538,10 @@ pub struct GASPSync<'a> {
     resume_deadline: std::cell::RefCell<Option<crate::engine::SleepFuture>>,
     /// What every resume of the sync may still spend together (M1).
     resume_left: std::cell::Cell<PassCap>,
+    /// A fresh deadline for the resumes' share of a pass (engine 0.1.11,
+    /// [`Self::with_resume_share`]); `None`: the per-graph deadline, made at
+    /// the resume that opens the pass, as before.
+    resume_share: Option<Box<dyn Fn() -> crate::engine::SleepFuture + 'a>>,
     /// Calls made by the sync's walks so far.
     calls_made: std::cell::Cell<u64>,
     /// Bytes served to the sync's walks so far (bsv-low #586).
@@ -1599,6 +1636,7 @@ impl<'a> GASPSync<'a> {
             deferred: std::cell::RefCell::new(std::collections::HashSet::new()),
             resume_deadline: std::cell::RefCell::new(None),
             resume_left: std::cell::Cell::new(PassCap::NONE),
+            resume_share: None,
             calls_made: std::cell::Cell::new(0),
             bytes_fetched: std::cell::Cell::new(0),
             nodes_appended: std::cell::Cell::new(0),
@@ -2112,6 +2150,21 @@ impl<'a> GASPSync<'a> {
 
     /// Bound each graph's walk and retain its pending work. A successfully
     /// saved hold permits cursor progress; an unsaved graph remains a gap.
+    /// Bound the resumes of each pass by `share` (engine 0.1.11): ONE
+    /// deadline for every held record walked ahead of the page, started when
+    /// the held loop starts, so the page keeps the rest of the per-peer
+    /// slice (see [`RESUMES_SHARE_OF_PEER_BUDGET_PERCENT`]). A record reached
+    /// once it fell due is held back for the next sync. Without one the
+    /// resumes share one per-graph deadline (the lens fold's M1).
+    #[must_use]
+    pub fn with_resume_share(
+        mut self,
+        share: Box<dyn Fn() -> crate::engine::SleepFuture + 'a>,
+    ) -> Self {
+        self.resume_share = Some(share);
+        self
+    }
+
     pub fn with_graph_budget(mut self, budget: GraphBudget<'a>) -> Self {
         self.graph_budget = Some(budget);
         self
@@ -2337,6 +2390,16 @@ impl<'a> GASPSync<'a> {
         // A held root remembered dead is refused with no fetch.
         self.load_remembered_expired(held_keys.iter().map(|k| k.outpoint.clone()).collect())
             .await;
+        // Engine 0.1.11: the resumes' share starts with the held loop, so the
+        // storage's calls between resumes are inside it (polled once now, so
+        // a timer that starts when it is polled runs).
+        if !held_keys.is_empty() && self.graph_budget.is_some() {
+            if let Some(share) = &self.resume_share {
+                let mut deadline = latched(share());
+                let _ = Self::due(&mut deadline).await;
+                *self.resume_deadline.borrow_mut() = Some(deadline);
+            }
+        }
         for key in held_keys {
             // This key is reached now (engine 0.1.11: the fault bound of a
             // strike in the held loop counts the keys after it).
