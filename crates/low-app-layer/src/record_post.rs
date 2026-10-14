@@ -559,6 +559,7 @@ pub fn collected_challenge(game_id_lc: &str, identity_lc: &str) -> Vec<u8> {
 //    assembled) and whose filed sweep, hashing to `payTxid`, carries EXACTLY ONE P2PKH output is served that
 //    output: `payVout` its index and `payPkh` its own pkh, read from the sweep, never a committed home (bsv-low
 //    L25). The hold rule above is unchanged: the device files only when its wallet owns that outpoint.
+//    `payPkhSource` says which: `"committed-home"` or `"filed-sweep"` (absent with `payPkh: null`).
 // 2. THE DOOR. `POST /record?kind=collected&identity=<identity hex>`, body `{ "scriptHex": "<the script>" }`.
 //    The script: `OP_FALSE OP_RETURN`, then five minimal pushes: `LOW/collected/v2`, gameId (32), identityKey
 //    (33), payTxid (32, the byte order of the txid's hex as `facts.payTxid` prints it), sig. The signature: over
