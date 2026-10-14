@@ -787,6 +787,7 @@ mod tests {
             cursor_passable: false,
             faults: 0,
             retry_at: 0,
+            idle_resumes: 0,
         }
     }
 
@@ -1880,6 +1881,8 @@ mod tests {
                 .collect(),
             stalled_graphs: 0,
             held_back_graphs: 0,
+            backed_off_graphs: 0,
+            waiting_graphs: 0,
             unanchorable_graphs: 0,
             unanchorable_cleared: 0,
             strikes_refused: 0,

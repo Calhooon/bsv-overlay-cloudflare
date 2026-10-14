@@ -7668,6 +7668,22 @@ fn record_shape(r: &DeferredGraph) -> (usize, Vec<String>, u64, u32, String) {
     )
 }
 
+/// Engine 0.1.10: run out the long backoff of every held record, as its six
+/// hours would (a held record resumed `IDLE_RESUMES_BEFORE_BACKOFF` passes in
+/// a row with no node appended waits `IDLE_RESUME_RETRY_SECS`). Returns the
+/// records written.
+async fn run_out_backoffs(store: &MemoryStorage) -> u64 {
+    let mut written = 0;
+    for mut record in store.deferred_graphs() {
+        if record.retry_at > 0 && !record.is_struck() {
+            record.retry_at = 0;
+            store.put_deferred_graph(&record).await.unwrap();
+            written += 1;
+        }
+    }
+    written
+}
+
 fn deferral(topic: &bsv_overlay_engine::engine::TopicSyncResult) -> (u64, u64, u64, Vec<String>) {
     (
         topic.deferred_graphs,
@@ -7909,6 +7925,9 @@ fn hanging(
 // Amended by the lens fold (H1): each pass after the first fetches NOTHING,
 // a failed attempt for the quarantine (pinned apart, `e555f_h1`); the peer is
 // re-admitted after each pass here so the record's own bound is reached.
+// Amended by engine 0.1.10: after IDLE_RESUMES_BEFORE_BACKOFF such passes
+// the record waits out its long backoff (a tick asks nothing); the backoff
+// is run out before each later pass, so the passes still reach the bound.
 #[tokio::test]
 async fn e555_b_a_stuck_peer_is_deferred_each_pass_and_dropped_after_max_passes() {
     let (_logs, _guard) = capture_logs();
@@ -7933,7 +7952,16 @@ async fn e555_b_a_stuck_peer_is_deferred_each_pass_and_dropped_after_max_passes(
         record_shape(&node.store.deferred_graphs()[0]),
         (4, vec![outpoint_of(&nodes[3])], 5, 1, "time".into())
     );
+    let idle = bsv_overlay_engine::gasp::IDLE_RESUMES_BEFORE_BACKOFF;
     for pass in 2..=DEFERRED_GRAPH_MAX_PASSES {
+        if pass > idle + 1 {
+            if pass == idle + 2 {
+                let (topic, sent) = node.tick().await;
+                assert!(sent.is_empty(), "pass {pass}: it waits, asked nothing");
+                assert_eq!(topic.waiting_graphs, 1);
+            }
+            run_out_backoffs(&node.store).await;
+        }
         let (topic, sent) = node.tick().await;
         assert_eq!(
             sent,
@@ -7949,6 +7977,7 @@ async fn e555_b_a_stuck_peer_is_deferred_each_pass_and_dropped_after_max_passes(
             .unwrap();
     }
     // The exhausted walk is reset, retaining its durable retry obligation.
+    run_out_backoffs(&node.store).await;
     let (topic, sent) = node.tick().await;
     assert!(sent.is_empty());
     assert_eq!(deferral(&topic), (0, 0, 0, vec!["max_passes".to_string()]));
@@ -8317,6 +8346,11 @@ async fn e555_f_a_root_proven_since_restarts_and_an_unlisted_record_resumes() {
 // a retry record keeps the consecutive deadline count, each such pass is a
 // FAILED attempt, and PEER_QUARANTINE_THRESHOLD skips the peer. After the
 // named stall allowance, the durable retry record permits cursor movement.
+// Amended by engine 0.1.10: after IDLE_RESUMES_BEFORE_BACKOFF resumes of the
+// durable record that fetch nothing, it waits out its long backoff: a tick
+// then asks the peer nothing but its listing (a quiet sync, recorded as #302
+// records any). Each pass after the backoff runs out is a failed attempt
+// again, and PEER_QUARANTINE_THRESHOLD of them in a row skip the peer.
 #[tokio::test]
 async fn e555f_h1_a_hung_peer_keeps_a_retry_obligation_and_is_quarantined() {
     let (_logs, _guard) = capture_logs();
@@ -8335,7 +8369,12 @@ async fn e555f_h1_a_hung_peer_keeps_a_retry_obligation_and_is_quarantined() {
     let all: Vec<String> = nodes.iter().map(node_txid).collect();
     let _h = hanging(&mut node, remote, &all);
     let threshold = bsv_overlay_engine::gasp::PEER_QUARANTINE_THRESHOLD;
-    for pass in 1..=threshold {
+    let backoff_after = u64::from(
+        bsv_overlay_engine::gasp::DEADLINE_STALL_DEFERRAL_RUNS
+            + bsv_overlay_engine::gasp::IDLE_RESUMES_BEFORE_BACKOFF,
+    );
+    assert!(backoff_after < threshold);
+    for pass in 1..=backoff_after {
         let (topic, sent) = node.tick().await;
         assert_eq!(sent, txids(&nodes, &[3]), "pass {pass}: the root, hung");
         let durable = pass >= u64::from(bsv_overlay_engine::gasp::DEADLINE_STALL_DEFERRAL_RUNS);
@@ -8347,7 +8386,27 @@ async fn e555f_h1_a_hung_peer_keeps_a_retry_obligation_and_is_quarantined() {
         assert_eq!(node.cursor().await, u64::from(durable));
         assert_eq!(node.failures().await, pass, "pass {pass}: a failed attempt");
     }
-    assert_eq!(node.store.deferred_graph_writes(), threshold);
+    // The record waits out its backoff: the tick asks the peer nothing but
+    // its listing, a quiet sync, which #302 records as any quiet sync.
+    let (topic, sent) = node.tick().await;
+    assert!(sent.is_empty(), "it waits, asked nothing");
+    assert_eq!(topic.waiting_graphs, 1);
+    assert_eq!(node.failures().await, 0, "the listing answered");
+    // Each pass after its backoff runs out hangs again: a failed attempt,
+    // and PEER_QUARANTINE_THRESHOLD of them in a row skip the peer.
+    let mut run_out = 0;
+    for attempt in 1..=threshold {
+        run_out += run_out_backoffs(&node.store).await;
+        let (topic, sent) = node.tick().await;
+        assert_eq!(sent, txids(&nodes, &[3]), "attempt {attempt}: hung");
+        assert_eq!(topic.deferred_graphs, 1);
+        assert_eq!(node.store.deferred_graphs().len(), 1);
+        assert_eq!(node.failures().await, attempt, "attempt {attempt}");
+    }
+    assert_eq!(
+        node.store.deferred_graph_writes(),
+        backoff_after + threshold + run_out
+    );
     for _ in 0..2 {
         let (_, sent) = node.tick().await;
         assert!(sent.is_empty(), "quarantined: skipped");
@@ -9124,6 +9183,11 @@ async fn e555d2_m2_idle_faults_reset_the_walk_but_keep_its_retry_obligation() {
     assert_eq!(retained.len(), 1);
     assert!(retained[0].cursor_passable && retained[0].nodes.is_empty());
     assert_eq!(deferral(&topic).3, vec!["idle_faults".to_string()]);
+    // Engine 0.1.10: those were also IDLE_RESUMES_BEFORE_BACKOFF resumes with
+    // nothing appended, so the obligation waits out its long backoff; it is
+    // run out here, as its six hours would.
+    assert!(retained[0].retry_at > 0, "{:?}", retained[0]);
+    run_out_backoffs(&node.store).await;
     // A pass that appends resets the count: heal, fault one node deeper.
     faults.borrow_mut().clear();
     node.tick().await; // fresh: 7, 6, 5

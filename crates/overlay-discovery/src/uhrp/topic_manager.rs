@@ -1197,6 +1197,7 @@ mod tests {
                 cursor_passable: false,
                 faults: 0,
                 retry_at: 0,
+                idle_resumes: 0,
             };
             for peer in peers {
                 record.peer = peer.into();
