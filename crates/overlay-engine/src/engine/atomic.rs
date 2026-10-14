@@ -13,7 +13,8 @@ impl Engine {
         policy: WalkBreachPolicy,
         source: &dyn EvidenceSource,
     ) -> Result<Walked, EngineError> {
-        self.walk_with_mode(tagged_beef, SubmitMode::CurrentTx, policy, source).await
+        self.walk_with_mode(tagged_beef, SubmitMode::CurrentTx, policy, source)
+            .await
     }
 
     /// Explicit legacy mode for already verified GASP bodies.
@@ -83,8 +84,7 @@ impl Engine {
                         txid: id.clone(),
                         topic: topic.clone(),
                     })
-                    .await
-                    ?;
+                    .await?;
                 if !applied {
                     topics.push(topic.clone());
                 }
@@ -104,18 +104,11 @@ impl Engine {
                 WalkOutcome::Spv
             };
             outcomes.insert(id.clone(), walk);
-            carried.push(Carried {
-                txid: id.clone(),
-                topics,
-                walk,
-            });
+            carried.push(id.clone());
         }
         let bodies: Vec<_> = carried
             .iter()
-            .filter_map(|c| {
-                beef.find_txid(&c.txid)
-                    .and_then(bsv_rs::transaction::BeefTx::tx)
-            })
+            .filter_map(|c| beef.find_txid(c).and_then(bsv_rs::transaction::BeefTx::tx))
             .collect();
         let mut evidence = source.gather(&tx, &bodies, &tagged_beef.topics).await;
         // The host supplies acceptance evidence, never the engine's walk word.
@@ -147,8 +140,10 @@ impl Engine {
                 })
                 .sum::<usize>();
         Ok(Walked {
-            txid,
-            tagged_beef: tagged_beef.clone(),
+            txid: txid.clone(),
+            topics: tagged_beef.topics.clone(),
+            beef: BeefCarry::from_beef(&tagged_beef.beef, &beef, &txid),
+            off_chain_values: tagged_beef.off_chain_values.clone(),
             mode,
             policy,
             walk: outcome,
@@ -156,7 +151,7 @@ impl Engine {
             evidence,
             charge: charge as u64,
             could_not_run,
-            predecessor_reads: Default::default(),
+            predecessor_reads: std::rc::Rc::default(),
         })
     }
 
@@ -164,29 +159,56 @@ impl Engine {
     /// executor through storage; Zanaadu's evidence path does not call this.
     /// No broadcast or durable mutation occurs in this judgement.
     pub async fn judge_dry(&self, walked: &Walked) -> Result<Admitted, AdmitRefusal> {
-        let dry = self.storage.admission_dry_run(&walked.evidence)
+        let tagged_beef = walked.tagged_beef()?;
+        let dry = self
+            .storage
+            .admission_dry_run(&walked.evidence)
             .map_err(|e| AdmitRefusal::transient("dry_judgement", e))?;
         let tx = beef_limits::transaction_from_beef(
-            &walked.tagged_beef.beef, Some(&walked.txid), &beef_limits::ENGINE_BEEF_LIMITS,
-        ).map_err(|e| AdmitRefusal::transient("walked_payload", e))?;
+            &tagged_beef.beef,
+            Some(&walked.txid),
+            &beef_limits::ENGINE_BEEF_LIMITS,
+        )
+        .map_err(|e| AdmitRefusal::transient("walked_payload", e))?;
         let mut steak = Steak::new();
         let mut report = MutationReport::default();
-        for topic in &walked.tagged_beef.topics {
-            let validation = self.validate_topic(
-                &tx, &walked.txid, topic, walked.tagged_beef.off_chain_values.as_deref(),
-                walked.mode, &TopicAdmittanceContext::DRY_RUN, None,
-            ).await;
+        for topic in &tagged_beef.topics {
+            let validation = self
+                .validate_topic(
+                    &tx,
+                    &walked.txid,
+                    topic,
+                    tagged_beef.off_chain_values.as_deref(),
+                    walked.mode,
+                    &TopicAdmittanceContext::DRY_RUN,
+                    None,
+                )
+                .await;
             if let Some(fault) = validation.read_fault {
-                return Err(AdmitRefusal::transient("dry_judgement", format!("{fault:?}")));
+                return Err(AdmitRefusal::transient(
+                    "dry_judgement",
+                    format!("{fault:?}"),
+                ));
             }
-            if validation.is_dupe { report.deduped_topics.push(topic.clone()); }
+            if validation.is_dupe {
+                report.deduped_topics.push(topic.clone());
+            }
             steak.insert(topic.clone(), validation.admittance);
         }
         if let Some(reason) = dry.failure() {
             return Err(AdmitRefusal::transient("dry_judgement", reason));
         }
-        let notes = self.storage.admission_log().map_or_else(Vec::new, LogTxn::notes);
-        Ok(Admitted { steak, report, seq: 0, notes })
+        let notes = self
+            .storage
+            .admission_log()
+            .map_or_else(Vec::new, LogTxn::notes);
+        Ok(Admitted {
+            dedup: report.deduped_topics.len() == walked.topics.len(),
+            steak,
+            report,
+            seq: 0,
+            notes,
+        })
     }
 
     /// Judge and mutate inside the caller's open log transaction. No network
@@ -196,19 +218,19 @@ impl Engine {
         let log = self.storage.admission_log().ok_or_else(|| {
             AdmitRefusal::transient("admit_without_log", "storage has no open admission unit")
         })?;
+        let tagged_beef = walked.tagged_beef()?;
         // Stable hook order makes a refusal independent of HashMap seeds.
         let mut services: Vec<_> = self.lookup_services.iter().collect();
         services.sort_by_key(|(name, _)| *name);
         let tx = beef_limits::transaction_from_beef(
-            &walked.tagged_beef.beef,
+            &tagged_beef.beef,
             Some(&walked.txid),
             &beef_limits::ENGINE_BEEF_LIMITS,
         )
         .map_err(|e| AdmitRefusal::transient("walked_payload", e))?;
         let txid = &walked.txid;
-        let mut beef =
-            beef_limits::parse_beef(&walked.tagged_beef.beef, &beef_limits::ENGINE_BEEF_LIMITS)
-                .map_err(|e| AdmitRefusal::transient("walked_payload", e))?;
+        let mut beef = beef_limits::parse_beef(&tagged_beef.beef, &beef_limits::ENGINE_BEEF_LIMITS)
+            .map_err(|e| AdmitRefusal::transient("walked_payload", e))?;
         let named = beef
             .to_binary_atomic(txid)
             .map_err(|e| AdmitRefusal::transient("walked_payload", e))?;
@@ -222,7 +244,7 @@ impl Engine {
         };
         let mut steak = Steak::new();
         let mut validations = Vec::new();
-        for topic in &walked.tagged_beef.topics {
+        for topic in &tagged_beef.topics {
             let record = AppliedTransaction {
                 txid: txid.clone(),
                 topic: topic.clone(),
@@ -255,13 +277,7 @@ impl Engine {
                 let source = input.get_source_txid().unwrap_or_default();
                 if let Some(output) = self
                     .storage
-                    .find_output(
-                        &source,
-                        input.source_output_index,
-                        Some(topic),
-                        None,
-                        false,
-                    )
+                    .find_output(&source, input.source_output_index, Some(topic), None, false)
                     .await
                     .map_err(|e| AdmitRefusal::transient("find_output", e))?
                 {
@@ -272,36 +288,36 @@ impl Engine {
             log.at(&format!(
                 "topic_manager.{topic}.identify_admissible_outputs"
             ));
-            let admittance = match self
+            let Ok(admittance) = self
                 .judge(
                     &tx,
                     topic,
                     &previous,
-                    walked.tagged_beef.off_chain_values.as_deref(),
+                    tagged_beef.off_chain_values.as_deref(),
                     walked.mode,
                     &context,
                     None,
                 )
-                .await {
-                    Ok(admittance) => admittance,
-                    Err(_) => {
-                        if let Some(refusal) = log.deferral() { return Err(refusal.with_notes(log.notes())); }
-                        steak.insert(topic.clone(), AdmittanceInstructions::default());
-                        continue;
-                    }
-                };
+                .await
+            else {
+                if let Some(refusal) = log.deferral() {
+                    return Err(refusal.with_notes(log.notes()));
+                }
+                steak.insert(topic.clone(), AdmittanceInstructions::default());
+                continue;
+            };
             if previous.is_empty() && !tx.inputs.is_empty() {
                 log.at(&format!("topic_manager.{topic}.predecessor"));
-                let needed = match self.managers[topic]
-                    .identify_needed_inputs(&named, walked.tagged_beef.off_chain_values.as_deref())
-                    .await {
-                        Ok(needed) => needed,
-                        Err(_) => {
-                            if let Some(refusal) = log.deferral() { return Err(refusal.with_notes(log.notes())); }
-                            steak.insert(topic.clone(), AdmittanceInstructions::default());
-                            continue;
-                        }
-                    };
+                let Ok(needed) = self.managers[topic]
+                    .identify_needed_inputs(&named, tagged_beef.off_chain_values.as_deref())
+                    .await
+                else {
+                    if let Some(refusal) = log.deferral() {
+                        return Err(refusal.with_notes(log.notes()));
+                    }
+                    steak.insert(topic.clone(), AdmittanceInstructions::default());
+                    continue;
+                };
                 let mut named_inputs = Some(
                     needed
                         .into_iter()
@@ -329,10 +345,7 @@ impl Engine {
                         .carried
                         .filter(|id| {
                             self.lands_without_values(topic)
-                                && walked
-                                    .carried
-                                    .iter()
-                                    .any(|c| &c.txid == id && c.topics.contains(topic))
+                                && walked.carried.iter().any(|c| c == id)
                         })
                         .map(|id| (id, topic.clone()));
                     return Err(AdmitRefusal::NotNow {
@@ -399,7 +412,7 @@ impl Engine {
                                     .map(bsv_rs::UnlockingScript::to_binary)
                                     .unwrap_or_default(),
                                 sequence_number: input.sequence,
-                                off_chain_values: walked.tagged_beef.off_chain_values.clone(),
+                                off_chain_values: tagged_beef.off_chain_values.clone(),
                             }
                         }
                         SpendNotificationMode::WholeTx => OutputSpent::WholeTx {
@@ -407,7 +420,7 @@ impl Engine {
                             output_index: output.output_index,
                             topic: topic.clone(),
                             spending_atomic_beef: named.clone(),
-                            off_chain_values: walked.tagged_beef.off_chain_values.clone(),
+                            off_chain_values: tagged_beef.off_chain_values.clone(),
                         },
                     };
                     service
@@ -431,7 +444,7 @@ impl Engine {
                     spent: false,
                     outputs_consumed: consumed.clone(),
                     consumed_by: Vec::new(),
-                    beef: Some(walked.tagged_beef.beef.clone()),
+                    beef: Some(tagged_beef.beef.clone()),
                     block_height: None,
                     score: Some(log.now_ms() as f64),
                 };
@@ -449,13 +462,13 @@ impl Engine {
                             topic: topic.clone(),
                             satoshis: sats,
                             locking_script: script.clone(),
-                            off_chain_values: walked.tagged_beef.off_chain_values.clone(),
+                            off_chain_values: tagged_beef.off_chain_values.clone(),
                         },
                         AdmissionMode::WholeTx => OutputAdmittedByTopic::WholeTx {
                             atomic_beef: named.clone(),
                             output_index: vout,
                             topic: topic.clone(),
-                            off_chain_values: walked.tagged_beef.off_chain_values.clone(),
+                            off_chain_values: tagged_beef.off_chain_values.clone(),
                         },
                     };
                     service
@@ -505,6 +518,7 @@ impl Engine {
             report.applied_topics.push(topic.clone());
         }
         Ok(Admitted {
+            dedup: report.deduped_topics.len() == walked.topics.len(),
             steak,
             report,
             seq: log.seq(),
@@ -601,4 +615,3 @@ fn lookup_refusal(topic: &str, site: &str, error: LookupServiceError) -> AdmitRe
         other => AdmitRefusal::transient(site, other),
     }
 }
-

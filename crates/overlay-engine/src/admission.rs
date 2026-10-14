@@ -63,24 +63,18 @@ pub struct RefusalNote {
 }
 pub type RefusalNotes = Vec<(String, RefusalNote)>;
 
-/// An independently walked predecessor. Its bytes remain in the one BEEF.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Carried {
-    pub txid: String,
-    pub topics: Vec<String>,
-    pub walk: WalkOutcome,
-}
-
 /// Local staged payload. Hosts may transport the bytes inline or by a verified
 /// content-addressed pointer; resolving that pointer must precede the unit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Walked {
     pub txid: String,
-    pub tagged_beef: TaggedBEEF,
+    pub topics: Vec<String>,
+    pub beef: BeefCarry,
+    pub off_chain_values: Option<Vec<u8>>,
     pub mode: SubmitMode,
     pub policy: WalkBreachPolicy,
     pub walk: WalkOutcome,
-    pub carried: Vec<Carried>,
+    pub carried: Vec<String>,
     pub evidence: AdmitEvidence,
     pub charge: u64,
     pub could_not_run: Option<WalkCouldNotRun>,
@@ -104,12 +98,7 @@ pub trait EvidenceSource {
 pub struct NoEvidence;
 #[async_trait(?Send)]
 impl EvidenceSource for NoEvidence {
-    async fn gather(
-        &self,
-        _: &Transaction,
-        _: &[&Transaction],
-        _: &[String],
-    ) -> AdmitEvidence {
+    async fn gather(&self, _: &Transaction, _: &[&Transaction], _: &[String]) -> AdmitEvidence {
         AdmitEvidence::default()
     }
 }
@@ -186,6 +175,7 @@ pub enum LookupRefusal {
 pub struct Admitted {
     pub steak: Steak,
     pub report: MutationReport,
+    pub dedup: bool,
     pub seq: u64,
     pub notes: RefusalNotes,
 }
@@ -269,9 +259,24 @@ pub trait UnitRunner {
     ) -> Result<Committed, AdmitRefusal>;
 }
 #[derive(Debug, Clone, Copy)]
-pub enum UnitKind { Admit, Proof, Evict, Unevict, Readmit, Gc, Renotify }
+pub enum UnitKind {
+    Admit,
+    Proof,
+    Evict,
+    Unevict,
+    Readmit,
+    Gc,
+    Renotify,
+}
 #[derive(Debug)]
-pub enum UnitOutput { Admitted(Admitted), Done }
+#[allow(
+    clippy::large_enum_variant,
+    reason = "frozen UnitOutput carries Admitted by value"
+)]
+pub enum UnitOutput {
+    Admitted(Admitted),
+    Done,
+}
 #[derive(Debug)]
 pub struct Committed {
     pub seq: u64,
@@ -280,21 +285,37 @@ pub struct Committed {
 }
 #[derive(Debug)]
 pub enum GraphOutcome {
-    AllLanded { seqs: Vec<u64> },
-    StoppedAt { txid: String, refusal: AdmitRefusal, landed: Vec<u64> },
+    AllLanded {
+        seqs: Vec<u64>,
+    },
+    StoppedAt {
+        txid: String,
+        refusal: AdmitRefusal,
+        landed: Vec<u64>,
+    },
 }
 
 /// GASP finalize: each body lands independently, in graph order.
-pub fn admit_graph(engine: &crate::engine::Engine, runner: &dyn UnitRunner, graph: &[Walked]) -> GraphOutcome {
+pub fn admit_graph(
+    engine: &crate::engine::Engine,
+    runner: &dyn UnitRunner,
+    graph: &[Walked],
+) -> GraphOutcome {
     let mut seqs = Vec::new();
     for walked in graph {
-        match runner.run_unit(UnitKind::Admit, &walked.evidence, Box::pin(async {
-            engine.admit(walked).await.map(UnitOutput::Admitted)
-        })) {
+        match runner.run_unit(
+            UnitKind::Admit,
+            &walked.evidence,
+            Box::pin(async { engine.admit(walked).await.map(UnitOutput::Admitted) }),
+        ) {
             Ok(committed) => seqs.push(committed.seq),
-            Err(refusal) => return GraphOutcome::StoppedAt {
-                txid: walked.txid.clone(), refusal, landed: seqs,
-            },
+            Err(refusal) => {
+                return GraphOutcome::StoppedAt {
+                    txid: walked.txid.clone(),
+                    refusal,
+                    landed: seqs,
+                }
+            }
         }
     }
     GraphOutcome::AllLanded { seqs }
@@ -306,18 +327,35 @@ pub const INLINE_BEEF_MAX_BYTES: usize = 1_900_000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BeefCarry {
     Inline(Vec<u8>),
-    R2 { key: String, sha256: [u8; 32], len: u64, raw_txs: Vec<Vec<u8>> },
+    R2 {
+        key: String,
+        sha256: [u8; 32],
+        len: u64,
+        raw_txs: Vec<Vec<u8>>,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AfterCommit {
     R2Put { key: String, bytes_from: BeefCarry },
 }
 #[derive(Debug, Clone, PartialEq)]
-pub enum SqlValue { Null, Integer(i64), Real(f64), Text(String), Blob(Vec<u8>) }
+pub enum SqlValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
 #[derive(Debug, Clone, PartialEq)]
-pub struct SqlStmt { pub sql: String, pub binds: Vec<SqlValue> }
+pub struct SqlStmt {
+    pub sql: String,
+    pub binds: Vec<SqlValue>,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SqlRun { pub changes: u64, pub last_row_id: Option<i64> }
+pub struct SqlRun {
+    pub changes: u64,
+    pub last_row_id: Option<i64>,
+}
 pub type SqlRow = Vec<(String, SqlValue)>;
 #[async_trait(?Send)]
 pub trait SqlExecutor {
@@ -325,4 +363,57 @@ pub trait SqlExecutor {
     async fn all(&self, sql: &str, binds: &[SqlValue]) -> Result<Vec<SqlRow>, StorageError>;
     /// Atomic as a whole, and with the containing unit.
     async fn batch(&self, stmts: &[SqlStmt]) -> Result<Vec<SqlRun>, StorageError>;
+}
+
+impl BeefCarry {
+    /// Hosts persist the original large BEEF under this content-addressed key
+    /// before sending the hop. The log uses raw transactions for judgement;
+    /// the pointer remains the home of the original proof-bearing BEEF.
+    pub(crate) fn from_beef(bytes: &[u8], beef: &bsv_rs::transaction::Beef, _txid: &str) -> Self {
+        if bytes.len() <= INLINE_BEEF_MAX_BYTES {
+            return Self::Inline(bytes.to_vec());
+        }
+        let sha256 = bsv_rs::primitives::hash::sha256(bytes);
+        use std::fmt::Write;
+        let key = sha256
+            .iter()
+            .fold(String::with_capacity(64), |mut key, byte| {
+                write!(key, "{byte:02x}").expect("writing to String cannot fail");
+                key
+            });
+        let raw_txs = beef
+            .txs
+            .iter()
+            .filter_map(|body| body.tx().map(Transaction::to_binary))
+            .collect();
+        Self::R2 {
+            key,
+            sha256,
+            len: bytes.len() as u64,
+            raw_txs,
+        }
+    }
+}
+impl Walked {
+    /// Raw transactions suffice for log judgement. This reconstruction is not
+    /// the original proof-bearing BEEF; hosts retain its R2 descriptor when
+    /// persisting history and must not replace the referenced original.
+    pub(crate) fn tagged_beef(&self) -> Result<TaggedBEEF, AdmitRefusal> {
+        let bytes = match &self.beef {
+            BeefCarry::Inline(bytes) => bytes.clone(),
+            BeefCarry::R2 { raw_txs, .. } => {
+                let mut beef = bsv_rs::transaction::Beef::new();
+                for raw in raw_txs {
+                    Transaction::from_binary(raw)
+                        .map_err(|e| AdmitRefusal::transient("walked_payload", e))?;
+                    beef.merge_raw_tx(raw.clone(), None);
+                }
+                beef.to_binary_atomic(&self.txid)
+                    .map_err(|e| AdmitRefusal::transient("walked_payload", e))?
+            }
+        };
+        let mut tagged = TaggedBEEF::new(bytes, self.topics.clone());
+        tagged.off_chain_values.clone_from(&self.off_chain_values);
+        Ok(tagged)
+    }
 }

@@ -878,7 +878,12 @@ pub mod memory {
     #[async_trait(?Send)]
     impl Storage for MemoryStorage {
         fn admission_log(&self) -> Option<&dyn crate::admission::LogTxn> {
-            self.log.lock().unwrap().scope.as_ref().map(|_| self as &dyn crate::admission::LogTxn)
+            self.log
+                .lock()
+                .unwrap()
+                .scope
+                .as_ref()
+                .map(|_| self as &dyn crate::admission::LogTxn)
         }
         fn admission_dry_run(
             &self,

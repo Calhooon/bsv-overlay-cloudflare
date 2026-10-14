@@ -143,7 +143,9 @@ impl MemoryStorage {
         evidence: &AdmitEvidence,
         run: impl FnOnce() -> F,
     ) -> Result<T, LogError> {
-        if self.log.lock().unwrap().poisoned { return Err(LogError::AnswerLost); }
+        if self.log.lock().unwrap().poisoned {
+            return Err(LogError::AnswerLost);
+        }
         let _writer = self
             .writer
             .try_lock()
@@ -182,12 +184,9 @@ impl MemoryStorage {
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
         }));
-        let polled = match polled {
-            Ok(polled) => polled,
-            Err(_) => {
-                self.log.lock().unwrap().poisoned = true;
-                return Err(LogError::AnswerLost);
-            }
+        let Ok(polled) = polled else {
+            self.log.lock().unwrap().poisoned = true;
+            return Err(LogError::AnswerLost);
         };
         let scope = self.log.lock().unwrap().scope.take().expect("unit scope");
         let result = match polled {
@@ -234,20 +233,21 @@ impl MemoryStorage {
     pub fn admit(&self, engine: &Engine, walked: &Walked) -> Result<Admitted, LogError> {
         // Keep only keys on the landing stack. A full BEEF per stack frame
         // would multiply a large carried body by the predecessor bound.
-        let mut pending = vec![(walked.txid.clone(), walked.tagged_beef.topics.clone())];
+        let mut pending = vec![(walked.txid.clone(), walked.topics.clone())];
         let mut landed = Vec::new();
         while let Some((txid, topics)) = pending.last() {
             let carried_unit;
             let unit = if txid == &walked.txid {
                 walked
             } else {
-                let Some(carried) = walked.carried.iter().find(|c| &c.txid == txid) else {
+                if !walked.carried.contains(txid) {
                     return Err(
                         AdmitRefusal::not_now("admit_evidence_missing", txid.clone()).into(),
                     );
-                };
+                }
+                let payload = walked.tagged_beef()?;
                 let mut beef = crate::beef_limits::parse_beef(
-                    &walked.tagged_beef.beef,
+                    &payload.beef,
                     &crate::beef_limits::ENGINE_BEEF_LIMITS,
                 )
                 .map_err(|e| AdmitRefusal::transient("carried_payload", e))?;
@@ -256,10 +256,19 @@ impl MemoryStorage {
                     .map_err(|e| AdmitRefusal::transient("carried_payload", e))?;
                 carried_unit = Walked {
                     txid: txid.clone(),
-                    tagged_beef: crate::types::TaggedBEEF::new(bytes, topics.clone()),
+                    topics: topics.clone(),
+                    beef: BeefCarry::from_beef(&bytes, &beef, txid),
+                    off_chain_values: None,
                     mode: walked.mode,
                     policy: walked.policy,
-                    walk: carried.walk,
+                    walk: walked
+                        .evidence
+                        .tx
+                        .get(txid)
+                        .ok_or_else(|| {
+                            AdmitRefusal::not_now("admit_evidence_missing", txid.clone())
+                        })?
+                        .walk,
                     carried: walked.carried.clone(),
                     evidence: walked.evidence.clone(),
                     charge: walked.charge,
@@ -351,19 +360,36 @@ impl MemoryStorage {
 }
 
 impl LogTxn for MemoryStorage {
-    fn sql(&self) -> &dyn SqlExecutor { self }
+    fn sql(&self) -> &dyn SqlExecutor {
+        self
+    }
     fn after_commit(&self, intent: AfterCommit) {
-        if self.write_pin().is_err() { return; }
+        if self.write_pin().is_err() {
+            return;
+        }
         let mut log = self.log.lock().unwrap();
         let seq = log.scope.as_ref().expect("open unit").seq;
         log.after_commit.push((seq, intent));
     }
     fn defer(&self, site: &str, reason: String) {
-        self.log.lock().unwrap().scope.as_mut().expect("open unit")
-            .deferred.get_or_insert_with(|| AdmitRefusal::not_now(site, reason));
+        self.log
+            .lock()
+            .unwrap()
+            .scope
+            .as_mut()
+            .expect("open unit")
+            .deferred
+            .get_or_insert_with(|| AdmitRefusal::not_now(site, reason));
     }
     fn deferral(&self) -> Option<AdmitRefusal> {
-        self.log.lock().unwrap().scope.as_ref().expect("open unit").deferred.clone()
+        self.log
+            .lock()
+            .unwrap()
+            .scope
+            .as_ref()
+            .expect("open unit")
+            .deferred
+            .clone()
     }
     fn seq(&self) -> u64 {
         self.log.lock().unwrap().scope.as_ref().map_or(0, |s| s.seq)
@@ -440,7 +466,9 @@ impl LogTxn for MemoryStorage {
         if self.log.lock().unwrap().scope.is_none() {
             return;
         }
-        if self.write_pin().is_err() { return; }
+        if self.write_pin().is_err() {
+            return;
+        }
         let mut log = self.log.lock().unwrap();
         let seq = log.scope.as_ref().expect("open unit").seq;
         let index = log.outbox.iter().filter(|r| r.seq == seq).count();
@@ -613,7 +641,11 @@ impl UnitRunner for MemoryStorage {
             Ok((output, self.notes()))
         });
         match result {
-            Ok((output, notes)) => Ok(Committed { seq: self.log_head(), output, notes }),
+            Ok((output, notes)) => Ok(Committed {
+                seq: self.log_head(),
+                output,
+                notes,
+            }),
             Err(LogError::Refused(refusal)) => Err(refusal),
             Err(lost @ LogError::AnswerLost) => std::panic::resume_unwind(Box::new(lost)),
         }
@@ -628,14 +660,23 @@ impl MemoryStorage {
     /// Only committed intents may reach a host's external side effects.
     pub fn after_commit_intents(&self) -> Vec<(u64, AfterCommit)> {
         let log = self.log.lock().unwrap();
-        log.after_commit.iter().filter(|(seq, _)| *seq <= log.head).cloned().collect()
+        log.after_commit
+            .iter()
+            .filter(|(seq, _)| *seq <= log.head)
+            .cloned()
+            .collect()
     }
     fn record_sql(&self, sql: &str, binds: &[SqlValue], write: bool) -> Result<(), StorageError> {
         if self.log.lock().unwrap().scope.is_none() {
             return Err(StorageError::Other("SQL outside admission unit".into()));
         }
-        if write { self.write_pin()?; }
-        self.log.lock().unwrap().sql_statements.push(SqlStmt { sql: sql.into(), binds: binds.to_vec() });
+        if write {
+            self.write_pin()?;
+        }
+        self.log.lock().unwrap().sql_statements.push(SqlStmt {
+            sql: sql.into(),
+            binds: binds.to_vec(),
+        });
         Ok(())
     }
 }
@@ -645,7 +686,10 @@ impl MemoryStorage {
 impl SqlExecutor for MemoryStorage {
     async fn run(&self, sql: &str, binds: &[SqlValue]) -> Result<SqlRun, StorageError> {
         self.record_sql(sql, binds, true)?;
-        Ok(SqlRun { changes: 0, last_row_id: None })
+        Ok(SqlRun {
+            changes: 0,
+            last_row_id: None,
+        })
     }
     async fn all(&self, sql: &str, binds: &[SqlValue]) -> Result<Vec<SqlRow>, StorageError> {
         self.record_sql(sql, binds, false)?;

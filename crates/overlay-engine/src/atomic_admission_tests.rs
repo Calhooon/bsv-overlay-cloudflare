@@ -595,14 +595,13 @@ impl LookupService for ReadEmitLookup {
                 .is_some(),
             "service must read its unit's inserted row"
         );
-        self.store
-            .emit(OutboxEvent {
-                txid: txid.clone(),
-                topic: topic.clone(),
-                output_index: *output_index,
-                event_type: "admitted".into(),
-                envelope: b"frozen-envelope".to_vec(),
-            });
+        self.store.emit(OutboxEvent {
+            txid: txid.clone(),
+            topic: topic.clone(),
+            output_index: *output_index,
+            event_type: "admitted".into(),
+            envelope: b"frozen-envelope".to_vec(),
+        });
         Ok(())
     }
     async fn output_evicted(&self, _: &str, _: u32) -> Result<(), LookupServiceError> {
@@ -1121,31 +1120,53 @@ async fn a1_refusal_order_does_not_depend_on_hashmap_seed() {
 struct UnavailableEvidence;
 #[async_trait(?Send)]
 impl EvidenceSource for UnavailableEvidence {
-    async fn gather(&self, subject: &Transaction, _: &[&Transaction], _: &[String]) -> AdmitEvidence {
-        AdmitEvidence { tx: BTreeMap::from([(subject.id(), TxEvidence {
-            walk: WalkOutcome::Spv,
-            network: Some(NetworkVerdict::Unavailable { reason: "ARC down".into() }),
-            proof: None,
-        })]), ..AdmitEvidence::default() }
+    async fn gather(
+        &self,
+        subject: &Transaction,
+        _: &[&Transaction],
+        _: &[String],
+    ) -> AdmitEvidence {
+        AdmitEvidence {
+            tx: BTreeMap::from([(
+                subject.id(),
+                TxEvidence {
+                    walk: WalkOutcome::Spv,
+                    network: Some(NetworkVerdict::Unavailable {
+                        reason: "ARC down".into(),
+                    }),
+                    proof: None,
+                },
+            )]),
+            ..AdmitEvidence::default()
+        }
     }
 }
 
 #[tokio::test]
 async fn a1_c1_unavailable_evidence_reaches_log_before_answer() {
     let (engine, store, _, beef, _) = fixture().await;
-    let walked: Result<Walked, crate::engine::EngineError> = engine.walk(
-        &beef, crate::engine::WalkBreachPolicy::NotNow, &UnavailableEvidence,
-    ).await;
+    let walked: Result<Walked, crate::engine::EngineError> = engine
+        .walk(
+            &beef,
+            crate::engine::WalkBreachPolicy::NotNow,
+            &UnavailableEvidence,
+        )
+        .await;
     let walked = walked.unwrap();
     assert_eq!(store.log_head(), 0);
-    assert!(matches!(walked.evidence.tx[&walked.txid].network, Some(NetworkVerdict::Unavailable { .. })));
+    assert!(matches!(
+        walked.evidence.tx[&walked.txid].network,
+        Some(NetworkVerdict::Unavailable { .. })
+    ));
     // A durable deterministic judgement wins over the unavailable ARC word.
     refused(&store.admit(&engine, &walked).unwrap_err());
 }
 
 #[test]
 fn a1_c2_unavailable_proof_roundtrips() {
-    let verdict = ProofVerdict::Unavailable { reason: "headers down".into() };
+    let verdict = ProofVerdict::Unavailable {
+        reason: "headers down".into(),
+    };
     let wire = serde_json::to_vec(&verdict).unwrap();
     assert_eq!(verdict, serde_json::from_slice(&wire).unwrap());
 }
@@ -1153,10 +1174,15 @@ fn a1_c2_unavailable_proof_roundtrips() {
 #[tokio::test]
 async fn a1_c3_admit_uses_storages_open_unit() {
     let (engine, store, _, beef, _) = fixture_refusal(false).await;
-    let walked = engine.walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence).await.unwrap();
+    let walked = engine
+        .walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence)
+        .await
+        .unwrap();
     assert!(matches!(engine.admit(&walked).await,
         Err(AdmitRefusal::Transient { site, .. }) if site == "admit_without_log"));
-    store.transaction(&walked.txid, &walked.evidence, || engine.admit(&walked)).unwrap();
+    store
+        .transaction(&walked.txid, &walked.evidence, || engine.admit(&walked))
+        .unwrap();
     assert_eq!(store.log_head(), 1);
 }
 
@@ -1165,14 +1191,26 @@ async fn a1_c4_graph_stops_at_first_refusal() {
     let (engine, store, _, beef, _) = fixture().await;
     let mut first = beef.clone();
     first.topics = vec![PROOF.into()];
-    let first = engine.walk(&first, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence).await.unwrap();
-    let second = engine.walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence).await.unwrap();
+    let first = engine
+        .walk(&first, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence)
+        .await
+        .unwrap();
+    let second = engine
+        .walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence)
+        .await
+        .unwrap();
     let stopped = second.txid.clone();
     let graph = [first.clone(), second, first];
     assert!(matches!(admit_graph(&engine, store.as_ref(), &graph),
         GraphOutcome::StoppedAt { txid, landed, .. } if txid == stopped && landed == vec![1]));
     assert_eq!(store.log_units().len(), 1);
-    let committed = store.run_unit(UnitKind::Gc, &AdmitEvidence::default(), Box::pin(async { Ok(UnitOutput::Done) })).unwrap();
+    let committed = store
+        .run_unit(
+            UnitKind::Gc,
+            &AdmitEvidence::default(),
+            Box::pin(async { Ok(UnitOutput::Done) }),
+        )
+        .unwrap();
     assert!(matches!(committed.output, UnitOutput::Done));
 }
 
@@ -1180,31 +1218,59 @@ async fn a1_c4_graph_stops_at_first_refusal() {
 fn a1_c5_sql_batch_after_commit_and_deferral_share_unit() {
     let store = MemoryStorage::new();
     let evidence = AdmitEvidence::default();
-    let stmts = vec![SqlStmt { sql: "INSERT INTO heads VALUES (?)".into(), binds: vec![SqlValue::Integer(1)] },
-        SqlStmt { sql: "UPDATE heads SET n = ?".into(), binds: vec![SqlValue::Integer(2)] }];
+    let stmts = vec![
+        SqlStmt {
+            sql: "INSERT INTO heads VALUES (?)".into(),
+            binds: vec![SqlValue::Integer(1)],
+        },
+        SqlStmt {
+            sql: "UPDATE heads SET n = ?".into(),
+            binds: vec![SqlValue::Integer(2)],
+        },
+    ];
     store.fault_write(Some(2));
     let failed = store.transaction("batch", &evidence, || async {
         let _ = store.sql().batch(&stmts).await;
         Ok(())
     });
     assert!(failed.is_err());
-    assert!(store.sql_statements().is_empty(), "batch must roll back as a whole");
+    assert!(
+        store.sql_statements().is_empty(),
+        "batch must roll back as a whole"
+    );
     store.fault_write(None);
-    store.transaction("commit", &evidence, || async {
-        assert_eq!(store.sql().batch(&stmts).await.unwrap().len(), 2);
-        store.after_commit(AfterCommit::R2Put { key: "beef".into(), bytes_from: BeefCarry::Inline(vec![1]) });
-        assert!(store.after_commit_intents().is_empty(), "intent cannot escape the open unit");
-        Ok(())
-    }).unwrap();
+    store
+        .transaction("commit", &evidence, || async {
+            assert_eq!(store.sql().batch(&stmts).await.unwrap().len(), 2);
+            store.after_commit(AfterCommit::R2Put {
+                key: "beef".into(),
+                bytes_from: BeefCarry::Inline(vec![1]),
+            });
+            assert!(
+                store.after_commit_intents().is_empty(),
+                "intent cannot escape the open unit"
+            );
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(store.sql_statements(), stmts);
     assert_eq!(store.after_commit_intents().len(), 1);
     let deferred = store.transaction("defer", &evidence, || async {
-        store.sql().run("DELETE FROM heads WHERE n = ?", &[SqlValue::Integer(2)]).await.unwrap();
-        store.after_commit(AfterCommit::R2Put { key: "refused".into(), bytes_from: BeefCarry::Inline(vec![2]) });
+        store
+            .sql()
+            .run("DELETE FROM heads WHERE n = ?", &[SqlValue::Integer(2)])
+            .await
+            .unwrap();
+        store.after_commit(AfterCommit::R2Put {
+            key: "refused".into(),
+            bytes_from: BeefCarry::Inline(vec![2]),
+        });
         store.defer("evidence_unavailable", "headers down".into());
         Ok(())
     });
-    assert!(matches!(deferred, Err(LogError::Refused(AdmitRefusal::NotNow { site, .. })) if site == "evidence_unavailable"));
+    assert!(
+        matches!(deferred, Err(LogError::Refused(AdmitRefusal::NotNow { site, .. })) if site == "evidence_unavailable")
+    );
     assert_eq!(store.sql_statements(), stmts);
     assert_eq!(store.after_commit_intents().len(), 1);
 }
@@ -1213,7 +1279,10 @@ fn a1_c5_sql_batch_after_commit_and_deferral_share_unit() {
 async fn a1_c6_dry_judgement_is_explicit_and_read_only() {
     let (engine, store, index, beef, _) = fixture_refusal(false).await;
     let before = snapshot(&store, &index);
-    let walked = engine.walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence).await.unwrap();
+    let walked = engine
+        .walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence)
+        .await
+        .unwrap();
     let dry = engine.judge_dry(&walked).await.unwrap();
     assert_eq!(dry.steak[REGISTRY].outputs_to_admit, vec![0, 2]);
     assert_eq!(dry.seq, 0);
@@ -1222,50 +1291,112 @@ async fn a1_c6_dry_judgement_is_explicit_and_read_only() {
     assert_eq!(store.log_head(), 0);
 }
 
-struct ErrorManager { store: Rc<MemoryStorage>, defer: bool }
+struct ErrorManager {
+    store: Rc<MemoryStorage>,
+    defer: bool,
+}
 #[async_trait(?Send)]
 impl TopicManager for ErrorManager {
-    async fn identify_admissible_outputs(&self, _: &Transaction, _: &[u8], _: Option<&[u8]>, _: SubmitMode, _: &TopicAdmittanceContext) -> Result<AdmittanceInstructions, TopicManagerError> {
-        if self.defer { self.store.defer("evidence_unavailable", "ARC down".into()); }
+    async fn identify_admissible_outputs(
+        &self,
+        _: &Transaction,
+        _: &[u8],
+        _: Option<&[u8]>,
+        _: SubmitMode,
+        _: &TopicAdmittanceContext,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
+        if self.defer {
+            self.store.defer("evidence_unavailable", "ARC down".into());
+        }
         Err(TopicManagerError::Other("manager error".into()))
     }
-    async fn get_documentation(&self) -> String { String::new() }
-    async fn get_metadata(&self) -> ServiceMetadata { ServiceMetadata::default() }
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
 }
 fn error_engine(store: &Rc<MemoryStorage>, defer: bool) -> Engine {
-    Engine::new(HashMap::from([
-        (REGISTRY.into(), Box::new(ErrorManager { store: store.clone(), defer }) as Box<dyn TopicManager>),
-        (PROOF.into(), Box::new(ProofManager) as Box<dyn TopicManager>),
-    ]), HashMap::new(), Box::new(store.clone()), None, EngineConfig::default())
+    Engine::new(
+        HashMap::from([
+            (
+                REGISTRY.into(),
+                Box::new(ErrorManager {
+                    store: store.clone(),
+                    defer,
+                }) as Box<dyn TopicManager>,
+            ),
+            (
+                PROOF.into(),
+                Box::new(ProofManager) as Box<dyn TopicManager>,
+            ),
+        ]),
+        HashMap::new(),
+        Box::new(store.clone()),
+        None,
+        EngineConfig::default(),
+    )
 }
 #[tokio::test]
 async fn a1_c7_manager_error_fails_only_its_topic_unless_deferred() {
     let (_, legacy_store, _, beef, _) = fixture().await;
-    let legacy = error_engine(&legacy_store, false).submit(&beef, SubmitMode::HistoricalTxNoSpv).await.unwrap();
+    let legacy = error_engine(&legacy_store, false)
+        .submit(&beef, SubmitMode::HistoricalTxNoSpv)
+        .await
+        .unwrap();
     let (_, store, index, _, _) = fixture().await;
     let engine = error_engine(&store, false);
     let (word, _) = submit_log(&engine, &store, &beef).await.unwrap();
-    assert_eq!(serde_json::to_value(&word).unwrap(), serde_json::to_value(&legacy).unwrap());
+    assert_eq!(
+        serde_json::to_value(&word).unwrap(),
+        serde_json::to_value(&legacy).unwrap()
+    );
     assert_eq!(word[PROOF].outputs_to_admit, vec![2]);
     assert!(word[REGISTRY].outputs_to_admit.is_empty());
     let (_, deferred_store, _, _, _) = fixture().await;
     let before = snapshot(&deferred_store, &index);
     let result = submit_log(&error_engine(&deferred_store, true), &deferred_store, &beef).await;
-    assert!(matches!(result, Err(LogError::Refused(AdmitRefusal::NotNow { site, .. })) if site == "evidence_unavailable"));
+    assert!(
+        matches!(result, Err(LogError::Refused(AdmitRefusal::NotNow { site, .. })) if site == "evidence_unavailable")
+    );
     assert!(before == snapshot(&deferred_store, &index));
 }
 
-struct ObservingRetainManager { store: Rc<MemoryStorage>, first: String, saw_first: Rc<std::cell::Cell<bool>> }
+struct ObservingRetainManager {
+    store: Rc<MemoryStorage>,
+    first: String,
+    saw_first: Rc<std::cell::Cell<bool>>,
+}
 #[async_trait(?Send)]
 impl TopicManager for ObservingRetainManager {
-    async fn identify_admissible_outputs(&self, tx: &Transaction, previous: &[u8], offchain: Option<&[u8]>, mode: SubmitMode, context: &TopicAdmittanceContext) -> Result<AdmittanceInstructions, TopicManagerError> {
+    async fn identify_admissible_outputs(
+        &self,
+        tx: &Transaction,
+        previous: &[u8],
+        offchain: Option<&[u8]>,
+        mode: SubmitMode,
+        context: &TopicAdmittanceContext,
+    ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if tx.id() != self.first {
-            self.saw_first.set(self.store.find_output(&self.first, 0, Some(REGISTRY), None, false).await.unwrap().is_some());
+            self.saw_first.set(
+                self.store
+                    .find_output(&self.first, 0, Some(REGISTRY), None, false)
+                    .await
+                    .unwrap()
+                    .is_some(),
+            );
         }
-        RetainManager.identify_admissible_outputs(tx, previous, offchain, mode, context).await
+        RetainManager
+            .identify_admissible_outputs(tx, previous, offchain, mode, context)
+            .await
     }
-    async fn get_documentation(&self) -> String { String::new() }
-    async fn get_metadata(&self) -> ServiceMetadata { ServiceMetadata::default() }
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
 }
 #[tokio::test]
 async fn a1_c8_second_spender_matches_submit_and_sees_committed_rows() {
@@ -1277,20 +1408,45 @@ async fn a1_c8_second_spender_matches_submit_and_sees_committed_rows() {
         let first_id = tx.id();
         tx.lock_time += 1;
         tx.invalidate_caches();
-        tx.merkle_path = Some(MerklePath::new(100, vec![vec![MerklePathLeaf::new_txid(0, tx.id())]]).unwrap());
+        tx.merkle_path =
+            Some(MerklePath::new(100, vec![vec![MerklePathLeaf::new_txid(0, tx.id())]]).unwrap());
         let second = TaggedBEEF::new(tx.to_beef(false).unwrap(), first.topics.clone());
         let saw_first = Rc::new(std::cell::Cell::new(false));
-        let engine = Engine::new(HashMap::from([(REGISTRY.into(), Box::new(ObservingRetainManager {
-            store: store.clone(), first: first_id, saw_first: saw_first.clone(),
-        }) as Box<dyn TopicManager>)]), HashMap::new(), Box::new(store.clone()), None, EngineConfig::default());
+        let engine = Engine::new(
+            HashMap::from([(
+                REGISTRY.into(),
+                Box::new(ObservingRetainManager {
+                    store: store.clone(),
+                    first: first_id,
+                    saw_first: saw_first.clone(),
+                }) as Box<dyn TopicManager>,
+            )]),
+            HashMap::new(),
+            Box::new(store.clone()),
+            None,
+            EngineConfig::default(),
+        );
         for beef in [first, second] {
-            let word = if atomic { submit_log(&engine, &store, &beef).await.unwrap().0 }
-                else { engine.submit(&beef, SubmitMode::HistoricalTxNoSpv).await.unwrap() };
+            let word = if atomic {
+                submit_log(&engine, &store, &beef).await.unwrap().0
+            } else {
+                engine
+                    .submit(&beef, SubmitMode::HistoricalTxNoSpv)
+                    .await
+                    .unwrap()
+            };
             words.push(serde_json::to_value(word).unwrap());
         }
-        assert!(saw_first.get(), "second unit must judge against the first unit's committed row");
+        assert!(
+            saw_first.get(),
+            "second unit must judge against the first unit's committed row"
+        );
     }
-    assert_eq!(words[0..2], words[2..4], "spent-coin judgement must match submit");
+    assert_eq!(
+        words[0..2],
+        words[2..4],
+        "spent-coin judgement must match submit"
+    );
 }
 
 #[test]
@@ -1302,14 +1458,30 @@ fn a1_c9_trap_rolls_back_and_poisons_instance() {
             panic!("unit trap after a write");
         })
     }));
-    assert!(matches!(answer, Ok(Err(LogError::AnswerLost))), "trap must lose the answer at the transport boundary");
+    assert!(
+        matches!(answer, Ok(Err(LogError::AnswerLost))),
+        "trap must lose the answer at the transport boundary"
+    );
     assert!(store.admission_row("head", b"key").is_none());
     assert_eq!(store.log_head(), 0);
-    assert!(matches!(store.transaction("later", &AdmitEvidence::default(), || async { Ok(()) }), Err(LogError::AnswerLost)), "poisoned instance must refuse every later unit");
+    assert!(
+        matches!(
+            store.transaction("later", &AdmitEvidence::default(), || async { Ok(()) }),
+            Err(LogError::AnswerLost)
+        ),
+        "poisoned instance must refuse every later unit"
+    );
     let runner_answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        store.run_unit(UnitKind::Admit, &AdmitEvidence::default(), Box::pin(async { Ok(UnitOutput::Done) }))
+        store.run_unit(
+            UnitKind::Admit,
+            &AdmitEvidence::default(),
+            Box::pin(async { Ok(UnitOutput::Done) }),
+        )
     }));
-    assert!(matches!(runner_answer.unwrap_err().downcast_ref::<LogError>(), Some(LogError::AnswerLost)));
+    assert!(matches!(
+        runner_answer.unwrap_err().downcast_ref::<LogError>(),
+        Some(LogError::AnswerLost)
+    ));
 }
 
 #[tokio::test]
@@ -1318,18 +1490,84 @@ async fn a1_c10_predecessor_allowance_spans_topics_and_attempts() {
     beef.topics = (0..130).map(|n| format!("tm_bound_{n}")).collect();
     let mut managers = HashMap::new();
     for topic in &beef.topics {
-        managers.insert(topic.clone(), Box::new(ChainManager) as Box<dyn TopicManager>);
-        store.insert_applied_transaction(&AppliedTransaction { txid: parent.clone(), topic: topic.clone() }).await.unwrap();
+        managers.insert(
+            topic.clone(),
+            Box::new(ChainManager) as Box<dyn TopicManager>,
+        );
+        store
+            .insert_applied_transaction(&AppliedTransaction {
+                txid: parent.clone(),
+                topic: topic.clone(),
+            })
+            .await
+            .unwrap();
     }
-    let engine = Engine::new(managers, HashMap::new(), Box::new(store.clone()), None, EngineConfig::default());
-    let walked = engine.walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence).await.unwrap();
+    let engine = Engine::new(
+        managers,
+        HashMap::new(),
+        Box::new(store.clone()),
+        None,
+        EngineConfig::default(),
+    );
+    let walked = engine
+        .walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence)
+        .await
+        .unwrap();
     let first = store.transaction::<(), _>(&walked.txid, &walked.evidence, || async {
         engine.admit(&walked).await.unwrap();
         Err(AdmitRefusal::transient("test", "retry the same submit"))
     });
     assert!(first.is_err());
     let second = store.transaction(&walked.txid, &walked.evidence, || engine.admit(&walked));
-    assert!(matches!(second, Err(LogError::Refused(AdmitRefusal::NotNow { site, reason, .. }))
-        if site == "predecessor_not_landed" && reason.contains("256 reads")), "read allowance must survive topic and attempt boundaries");
+    assert!(
+        matches!(second, Err(LogError::Refused(AdmitRefusal::NotNow { site, reason, .. }))
+        if site == "predecessor_not_landed" && reason.contains("256 reads")),
+        "read allowance must survive topic and attempt boundaries"
+    );
     assert_eq!(store.log_head(), 0);
+}
+
+#[tokio::test]
+async fn a1_c11_walked_uses_bounded_inline_or_r2_carry() {
+    let (engine, _, _, beef, _) = fixture_refusal(false).await;
+    let small = engine
+        .walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence)
+        .await
+        .unwrap();
+    assert_eq!(small.topics, beef.topics);
+    assert!(matches!(small.beef, BeefCarry::Inline(_)));
+    let _: &Vec<String> = &small.carried;
+    let mut tx = Transaction::from_beef(&beef.beef, None).unwrap();
+    tx.outputs[0].locking_script =
+        LockingScript::from_binary(&vec![0x61; INLINE_BEEF_MAX_BYTES]).unwrap();
+    tx.invalidate_caches();
+    tx.merkle_path =
+        Some(MerklePath::new(100, vec![vec![MerklePathLeaf::new_txid(0, tx.id())]]).unwrap());
+    let large = TaggedBEEF::new(tx.to_beef(false).unwrap(), beef.topics.clone());
+    let walked = engine
+        .walk(&large, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence)
+        .await
+        .unwrap();
+    let BeefCarry::R2 {
+        key,
+        sha256,
+        len,
+        raw_txs,
+    } = &walked.beef
+    else {
+        panic!("large BEEF must use R2 carry")
+    };
+    assert!(!key.is_empty());
+    assert_eq!(*len, large.beef.len() as u64);
+    assert_eq!(*sha256, bsv_rs::primitives::hash::sha256(&large.beef));
+    assert!(raw_txs
+        .iter()
+        .any(|raw| Transaction::from_binary(raw).unwrap().id() == walked.txid));
+    let wire = serde_json::to_vec(&walked).unwrap();
+    let decoded: Walked = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(decoded.beef, walked.beef);
+    assert!(serde_json::from_slice::<serde_json::Value>(&wire)
+        .unwrap()
+        .get("tagged_beef")
+        .is_none());
 }
