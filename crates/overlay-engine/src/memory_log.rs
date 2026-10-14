@@ -184,10 +184,10 @@ impl MemoryStorage {
             }
             Poll::Ready(result) => result,
         };
-        // Even a swallowed failed statement is fatal. Preserve a deliberate
-        // refusal if one was already returned by the body.
+        // A failed statement takes precedence over a later verdict derived
+        // from the incomplete store. It must remain retryable.
         let result = match (result, scope.failed) {
-            (Ok(_), Some(error)) => Err(AdmitRefusal::transient("admit_statement_failed", error)),
+            (_, Some(error)) => Err(AdmitRefusal::transient("admit_statement_failed", error)),
             (result, _) => result,
         }
         .map_err(|error| error.with_notes(scope.notes));
@@ -219,6 +219,7 @@ impl MemoryStorage {
         // would multiply a large carried body by the predecessor bound.
         let mut pending = vec![(walked.txid.clone(), walked.tagged_beef.topics.clone())];
         let mut attempts = 0;
+        let mut landed = Vec::new();
         while let Some((txid, topics)) = pending.last() {
             attempts += 1;
             if attempts > 257 {
@@ -259,8 +260,18 @@ impl MemoryStorage {
             match self.transaction(&unit.txid, &unit.evidence, || engine.admit(unit, self)) {
                 Ok(mut admitted) => {
                     admitted.seq = self.log_head();
+                    if pending.len() > 1 {
+                        landed.extend(
+                            admitted
+                                .report
+                                .applied_topics
+                                .iter()
+                                .map(|topic| (unit.txid.clone(), topic.clone())),
+                        );
+                    }
                     pending.pop();
                     if pending.is_empty() {
+                        admitted.report.landed_predecessors = landed;
                         return Ok(admitted);
                     }
                 }

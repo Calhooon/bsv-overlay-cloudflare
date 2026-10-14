@@ -689,6 +689,22 @@ async fn a1_statement_guard_catches_swallowed_manager_write() {
         matches!(result, Err(LogError::Refused(AdmitRefusal::Transient { site, .. })) if site == "admit_statement_failed")
     );
     assert!(before == snapshot(&store, &index));
+    store.fault_write(Some(2));
+    let result: Result<(), _> = store.transaction("manager", &AdmitEvidence::default(), || async {
+        store.put_admission_row("heads", b"one", b"first").unwrap();
+        let _ = store.put_admission_row("heads", b"two", b"second");
+        Err(AdmitRefusal::Deterministic {
+            topic: REGISTRY.into(),
+            site: "manager".into(),
+            reason: "missing row after failed write".into(),
+            notes: vec![],
+        })
+    });
+    assert!(matches!(
+        result,
+        Err(LogError::Refused(AdmitRefusal::Transient { .. }))
+    ));
+    assert!(before == snapshot(&store, &index));
 }
 
 #[tokio::test]
@@ -857,84 +873,98 @@ impl TopicManager for ChainManager {
 
 #[tokio::test]
 async fn a1_07_carried_body_has_its_own_transaction() {
-    let (_, store, _, _, parent) = fixture().await;
-    let held = store
-        .find_output(&parent, 0, Some(REGISTRY), None, true)
-        .await
-        .unwrap()
-        .unwrap();
-    let funding = Transaction::from_beef(&held.beef.unwrap(), None).unwrap();
-    let mut middle = Transaction::new();
-    let mut input = TransactionInput::new(parent.clone(), 0);
-    input.source_transaction = Some(Box::new(funding));
-    input.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
-    middle.inputs.push(input);
-    middle.outputs.push(TransactionOutput::new(
-        3,
-        LockingScript::from_binary(&[0x51]).unwrap(),
-    ));
-    let middle_id = middle.id();
-    let mut subject = Transaction::new();
-    let mut input = TransactionInput::new(middle_id.clone(), 0);
-    input.source_transaction = Some(Box::new(middle));
-    input.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
-    subject.inputs.push(input);
-    for _ in 0..3 {
-        subject.outputs.push(TransactionOutput::new(
-            1,
-            LockingScript::from_binary(&[0x51]).unwrap(),
-        ));
-    }
-    let subject_id = subject.id();
-    let beef = TaggedBEEF::new(subject.to_beef(false).unwrap(), vec![REGISTRY.into()]);
-    let engine = Engine::new(
-        HashMap::from([(
-            REGISTRY.into(),
-            Box::new(ChainManager) as Box<dyn TopicManager>,
-        )]),
-        HashMap::from([(
-            "index".into(),
-            Box::new(RefusingLookup {
-                store: store.clone(),
-                refuse: true,
-            }) as Box<dyn LookupService>,
-        )]),
-        Box::new(store.clone()),
-        None,
-        EngineConfig::default(),
-    );
-    let walked = engine
-        .walk(
-            &beef,
-            SubmitMode::HistoricalTxNoSpv,
-            crate::engine::WalkBreachPolicy::NotNow,
-            &NoEvidence,
-        )
-        .await
-        .unwrap();
-    assert!(walked.evidence.tx.contains_key(&middle_id));
-    let error = store.admit(&engine, &walked).unwrap_err();
-    refused(&error);
-    assert_eq!(store.log_head(), 1);
-    assert_eq!(store.log_units()[0].txid, middle_id);
-    assert!(
-        !store
-            .find_output(&middle_id, 0, Some(REGISTRY), None, false)
+    for refuse in [true, false] {
+        let (_, store, _, _, parent) = fixture().await;
+        let held = store
+            .find_output(&parent, 0, Some(REGISTRY), None, true)
             .await
             .unwrap()
+            .unwrap();
+        let funding = Transaction::from_beef(&held.beef.unwrap(), None).unwrap();
+        let mut middle = Transaction::new();
+        let mut input = TransactionInput::new(parent.clone(), 0);
+        input.source_transaction = Some(Box::new(funding));
+        input.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
+        middle.inputs.push(input);
+        middle.outputs.push(TransactionOutput::new(
+            3,
+            LockingScript::from_binary(&[0x51]).unwrap(),
+        ));
+        let middle_id = middle.id();
+        let mut subject = Transaction::new();
+        let mut input = TransactionInput::new(middle_id.clone(), 0);
+        input.source_transaction = Some(Box::new(middle));
+        input.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
+        subject.inputs.push(input);
+        for _ in 0..3 {
+            subject.outputs.push(TransactionOutput::new(
+                1,
+                LockingScript::from_binary(&[0x51]).unwrap(),
+            ));
+        }
+        let subject_id = subject.id();
+        let beef = TaggedBEEF::new(subject.to_beef(false).unwrap(), vec![REGISTRY.into()]);
+        let engine = Engine::new(
+            HashMap::from([(
+                REGISTRY.into(),
+                Box::new(ChainManager) as Box<dyn TopicManager>,
+            )]),
+            HashMap::from([(
+                "index".into(),
+                Box::new(RefusingLookup {
+                    store: store.clone(),
+                    refuse,
+                }) as Box<dyn LookupService>,
+            )]),
+            Box::new(store.clone()),
+            None,
+            EngineConfig::default(),
+        );
+        let walked = engine
+            .walk(
+                &beef,
+                SubmitMode::HistoricalTxNoSpv,
+                crate::engine::WalkBreachPolicy::NotNow,
+                &NoEvidence,
+            )
+            .await
+            .unwrap();
+        assert!(walked.evidence.tx.contains_key(&middle_id));
+        let result = store.admit(&engine, &walked);
+        if !refuse {
+            let admitted = result.unwrap();
+            assert_eq!(
+                admitted.report.landed_predecessors,
+                vec![(middle_id.clone(), REGISTRY.into())]
+            );
+            assert_eq!(store.log_head(), 2);
+            assert_eq!(store.log_units()[0].txid, middle_id);
+            assert_eq!(store.log_units()[1].txid, subject_id);
+            continue;
+        }
+        let error = result.unwrap_err();
+        refused(&error);
+        assert_eq!(store.log_head(), 1);
+        assert_eq!(store.log_units()[0].txid, middle_id);
+        assert!(
+            !store
+                .find_output(&middle_id, 0, Some(REGISTRY), None, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent
+        );
+        assert!(store
+            .find_outputs_for_transaction(&subject_id, false)
+            .await
             .unwrap()
-            .spent
-    );
-    assert!(store
-        .find_outputs_for_transaction(&subject_id, false)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(store
-        .find_output(&parent, 0, Some(REGISTRY), None, false)
-        .await
-        .unwrap()
-        .is_none());
+            .is_empty());
+        assert!(store
+            .find_output(&parent, 0, Some(REGISTRY), None, false)
+            .await
+            .unwrap()
+            .is_none());
+    }
 }
 
 #[tokio::test]
@@ -1034,4 +1064,64 @@ async fn a1_current_walk_carries_its_broadcaster_accept_and_admit_never_broadcas
     store.admit(&engine, &walked).unwrap();
     assert_eq!(calls.get(), 1, "admit must never reach the broadcaster");
     assert_eq!(store.awaited_io(), 0);
+}
+
+struct NamedRefusal(&'static str);
+#[async_trait(?Send)]
+impl LookupService for NamedRefusal {
+    fn admission_mode(&self) -> AdmissionMode {
+        AdmissionMode::LockingScript
+    }
+    fn spend_notification_mode(&self) -> SpendNotificationMode {
+        SpendNotificationMode::None
+    }
+    async fn output_admitted_by_topic(
+        &self,
+        _: &OutputAdmittedByTopic,
+    ) -> Result<(), LookupServiceError> {
+        Err(LookupRefusal::Deterministic(self.0.into()).into())
+    }
+    async fn output_evicted(&self, _: &str, _: u32) -> Result<(), LookupServiceError> {
+        Ok(())
+    }
+    async fn lookup(&self, _: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
+        Ok(LookupResult::OutputList(vec![]))
+    }
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+#[tokio::test]
+async fn a1_refusal_order_does_not_depend_on_hashmap_seed() {
+    for _ in 0..32 {
+        let (_, store, _, mut beef, _) = fixture().await;
+        beef.topics = vec![PROOF.into()];
+        let engine = Engine::new(
+            HashMap::from([(
+                PROOF.into(),
+                Box::new(ProofManager) as Box<dyn TopicManager>,
+            )]),
+            HashMap::from([
+                (
+                    "b".into(),
+                    Box::new(NamedRefusal("second")) as Box<dyn LookupService>,
+                ),
+                (
+                    "a".into(),
+                    Box::new(NamedRefusal("first")) as Box<dyn LookupService>,
+                ),
+            ]),
+            Box::new(store.clone()),
+            None,
+            EngineConfig::default(),
+        );
+        assert!(
+            matches!(submit_log(&engine, &store, &beef).await, Err(LogError::Refused(AdmitRefusal::Deterministic { reason, .. })) if reason == "first")
+        );
+        assert_eq!(store.log_head(), 0);
+    }
 }

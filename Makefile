@@ -118,6 +118,7 @@ ci:
 	bash scripts/check-config-ids.sh; \
 	python3 scripts/check-storage-ownership.py --self-test; \
 	python3 scripts/check-storage-ownership.py; \
+	python3 scripts/check-admission-managers.py; \
 	cargo test --workspace --features bsv-overlay-engine/memory-storage --no-fail-fast; \
 	cargo test $(WORKERS) --workspace --no-fail-fast; \
 	cargo clippy --workspace --all-targets --features bsv-overlay-engine/memory-storage -- -D warnings; \

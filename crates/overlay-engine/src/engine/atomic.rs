@@ -224,6 +224,9 @@ impl Engine {
                 "engine and log must share the open transaction",
             ));
         }
+        // Stable hook order makes a refusal independent of HashMap seeds.
+        let mut services: Vec<_> = self.lookup_services.iter().collect();
+        services.sort_by_key(|(name, _)| *name);
         let tx = beef_limits::transaction_from_beef(
             &walked.tagged_beef.beef,
             Some(&walked.txid),
@@ -383,7 +386,7 @@ impl Engine {
                     .mark_utxo_as_spent(&output.txid, output.output_index, topic)
                     .await
                     .map_err(|e| AdmitRefusal::transient("mark_utxo_as_spent", e))?;
-                for (name, service) in &self.lookup_services {
+                for (name, service) in &services {
                     log.at(&format!("lookup_service.{name}.output_spent"));
                     let payload = match service.spend_notification_mode() {
                         SpendNotificationMode::None => OutputSpent::None {
@@ -452,7 +455,7 @@ impl Engine {
                     .await
                     .map_err(|e| AdmitRefusal::transient("insert_output", e))?;
                 new_utxos.push(Outpoint::new(txid, vout));
-                for (name, service) in &self.lookup_services {
+                for (name, service) in &services {
                     log.at(&format!("lookup_service.{name}.output_admitted_by_topic"));
                     let payload = match service.admission_mode() {
                         AdmissionMode::LockingScript => OutputAdmittedByTopic::LockingScript {
@@ -529,6 +532,8 @@ impl Engine {
         output: &Output,
         log: &dyn LogTxn,
     ) -> Result<(), AdmitRefusal> {
+        let mut services: Vec<_> = self.lookup_services.iter().collect();
+        services.sort_by_key(|(name, _)| *name);
         let mut stack = vec![output.clone()];
         let mut seen = HashSet::new();
         while let Some(output) = stack.pop() {
@@ -544,7 +549,7 @@ impl Engine {
                     .delete_output(&output.txid, output.output_index, &output.topic)
                     .await
                     .map_err(|e| AdmitRefusal::transient("delete_output", e))?;
-                for (name, service) in &self.lookup_services {
+                for (name, service) in &services {
                     log.at(&format!(
                         "lookup_service.{name}.output_no_longer_retained_in_history"
                     ));
