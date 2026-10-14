@@ -162,16 +162,10 @@ impl Engine {
     /// Judge and mutate inside the caller's open log transaction. No network
     /// operation occurs here. The executor MUST poll once and roll back on
     /// Pending or Err, and catch swallowed failed storage statements.
-    pub async fn admit(&self, walked: &Walked, log: &dyn LogTxn) -> Result<Admitted, AdmitRefusal> {
-        if self.storage.admission_log_id().is_none()
-            || self.storage.admission_log_id() != log.admission_log_id()
-            || log.seq() == 0
-        {
-            return Err(AdmitRefusal::transient(
-                "admission_scope",
-                "engine and log must share the open transaction",
-            ));
-        }
+    pub async fn admit(&self, walked: &Walked) -> Result<Admitted, AdmitRefusal> {
+        let log = self.storage.admission_log().ok_or_else(|| {
+            AdmitRefusal::transient("admit_without_log", "storage has no open admission unit")
+        })?;
         // Stable hook order makes a refusal independent of HashMap seeds.
         let mut services: Vec<_> = self.lookup_services.iter().collect();
         services.sort_by_key(|(name, _)| *name);

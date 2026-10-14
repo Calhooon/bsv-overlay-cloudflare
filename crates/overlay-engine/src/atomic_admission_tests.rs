@@ -1150,3 +1150,13 @@ fn a1_c2_unavailable_proof_roundtrips() {
     let wire = serde_json::to_vec(&verdict).unwrap();
     assert_eq!(verdict, serde_json::from_slice(&wire).unwrap());
 }
+
+#[tokio::test]
+async fn a1_c3_admit_uses_storages_open_unit() {
+    let (engine, store, _, beef, _) = fixture_refusal(false).await;
+    let walked = engine.walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence).await.unwrap();
+    assert!(matches!(engine.admit(&walked).await,
+        Err(AdmitRefusal::Transient { site, .. }) if site == "admit_without_log"));
+    store.transaction(&walked.txid, &walked.evidence, || engine.admit(&walked)).unwrap();
+    assert_eq!(store.log_head(), 1);
+}

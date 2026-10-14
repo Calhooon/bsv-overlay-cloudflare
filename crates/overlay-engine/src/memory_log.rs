@@ -259,7 +259,7 @@ impl MemoryStorage {
                 };
                 &carried_unit
             };
-            match self.transaction(&unit.txid, &unit.evidence, || engine.admit(unit, self)) {
+            match self.transaction(&unit.txid, &unit.evidence, || engine.admit(unit)) {
                 Ok(mut admitted) => {
                     admitted.seq = self.log_head();
                     if pending.len() > 1 {

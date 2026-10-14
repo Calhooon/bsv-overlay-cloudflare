@@ -31,8 +31,8 @@ pub struct TransactionBeef {
 /// (Cloudflare Workers D1).
 #[async_trait(?Send)]
 pub trait Storage {
-    /// Identity of a log backend. Default keeps ordinary backends unchanged.
-    fn admission_log_id(&self) -> Option<usize> {
+    /// The open admission unit, if this storage is executing inside one.
+    fn admission_log(&self) -> Option<&dyn crate::admission::LogTxn> {
         None
     }
 
@@ -437,8 +437,8 @@ pub struct PeerSyncHealth {
 /// `Box<dyn Storage>` over the same instance. Pure delegation, no semantics.
 #[async_trait(?Send)]
 impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
-    fn admission_log_id(&self) -> Option<usize> {
-        (**self).admission_log_id()
+    fn admission_log(&self) -> Option<&dyn crate::admission::LogTxn> {
+        (**self).admission_log()
     }
     fn admission_dry_run(
         &self,
@@ -877,8 +877,8 @@ pub mod memory {
 
     #[async_trait(?Send)]
     impl Storage for MemoryStorage {
-        fn admission_log_id(&self) -> Option<usize> {
-            Some(std::ptr::from_ref(self) as usize)
+        fn admission_log(&self) -> Option<&dyn crate::admission::LogTxn> {
+            self.log.lock().unwrap().scope.as_ref().map(|_| self as &dyn crate::admission::LogTxn)
         }
         fn admission_dry_run(
             &self,
