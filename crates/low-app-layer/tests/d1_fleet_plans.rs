@@ -44,6 +44,18 @@ fn hot_routes_never_scan_fleet_tables() {
             );
         }
     }
+    // bsv-low L25 (the HOMEPROOF lens's NOTE-2): the byte-free `homeproof:` latch read runs on every /owed
+    // recompute; each OR'd PK-range term must stay on the hop_chain_probes PRIMARY KEY autoindex (SEARCH /
+    // MULTI-INDEX OR), never a scan, at every arity up to the chunk bound. A future WITHOUT ROWID or a dropped
+    // PK index would regress it silently without this pin.
+    for n in [1, 24, low_app_layer::owed::HOME_LATCH_READ_CHUNK] {
+        for detail in plan(&db, &low_app_layer::owed::home_latch_range_read_sql(n)) {
+            assert!(
+                !detail.starts_with("SCAN"),
+                "the homeproof latch range read must stay index-backed (arity {n}): {detail}"
+            );
+        }
+    }
     for (route, sql) in [
         (
             "/results:view",
