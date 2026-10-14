@@ -640,6 +640,10 @@ pub enum StorageError {
 
 #[cfg(any(test, feature = "memory-storage"))]
 pub mod memory {
+    #[cfg(test)]
+    mod atomic_admission_tests {
+        include!("atomic_admission_tests.rs");
+    }
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
