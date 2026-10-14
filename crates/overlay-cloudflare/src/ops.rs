@@ -1866,7 +1866,9 @@ mod tests {
             latch(&"c3".repeat(32)).is_empty(),
             "a txid that funds and spends no pot notes nothing"
         );
-        // One indexed read, never a scan of pot_records.
+        // One indexed read by idx_pot_spending itself, never a scan of
+        // pot_records and never its sibling idx_pot_spending_lower (the
+        // index name is matched with its opening parenthesis).
         let plan: Vec<String> = conn
             .prepare(&format!(
                 "EXPLAIN QUERY PLAN {NETWORK_SEEN_SPENT_POT_ROWS_SQL}"
@@ -1879,8 +1881,8 @@ mod tests {
         assert!(
             !plan.is_empty()
                 && plan.iter().all(|d| {
-                    d.contains("USING INDEX idx_pot_spending")
-                        || d.contains("USING COVERING INDEX idx_pot_spending")
+                    d.contains("USING INDEX idx_pot_spending (")
+                        || d.contains("USING COVERING INDEX idx_pot_spending (")
                 }),
             "the spent read uses idx_pot_spending: {plan:?}"
         );
