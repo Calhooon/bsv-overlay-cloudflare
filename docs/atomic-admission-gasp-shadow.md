@@ -59,8 +59,9 @@ records "not shadowed". This PR is their shadow, the engine's.
   `judge_dry` on the untouched snapshot beside the served judgement, and the
   body's own unit through `admit_graph_observed`. For a graph: every body
   walked on the graph's snapshot, the first body's `judge_dry`, then
-  `admit_graph` over the whole graph (each body its own unit, stopping at the
-  first that does not land), the first unit's answer the first body's, and
+  `admit_graph` over the whole graph (each body its own unit under the
+  owner's D44 dependency gate, "D44 as built" below), the first unit's answer
+  the first body's, and
   the same rows read from the shadow's store. One census row per body and
   one per graph, the graph's after its bodies'.
 - **The delta classes** are the slice's (`same`, `not_shadowed`,
@@ -84,14 +85,18 @@ records "not shadowed". This PR is their shadow, the engine's.
   and the drain is guarded by the same check; without the feature none of it
   is compiled.
 - `admit_graph` is now `admit_graph_observed` with a no-op observer (the shadow
-  words each body's unit answer as it is given).
+  words each body's unit answer as it is given, with the gate's reason when
+  the gate held it).
 
 ## The census row
 
 `{kind: body|materialization, peer, topic, graph (root txid), txid, position,
 served: {status, bytes, landed_topics}, shadow: {status, bytes, landed_topics},
 delta, served_judgement, shadow_judgement, served_evidence, shadow_evidence,
-shadow_seqs, snapshot_rows, snapshot_bytes, shadow_ms}`.
+shadow_seqs, gate, snapshot_rows, snapshot_bytes, shadow_ms}`. `gate` (D44,
+below) lists each body A's gate held, in graph order, `{txid, reason}`, the
+reason `"parent_error"` or `{"waiting_on": [txid, ...]}`: a body row its own
+(empty when it landed or met its own refusal), a graph row every body held.
 
 A body word's bytes are `{"steak", "refused", "faults", "applied_topics",
 "deduped_topics", "not_landed", "manager_errors"}` (served, and A's unit as
@@ -288,7 +293,9 @@ Both arise only from a topic manager that answers `Err` at the finalize (the
 served finalize treats it as "did not land", D15's "Err is not now"; A's unit
 commits F5's empty judgement and `admit_graph` goes on, `admission.rs`: only a
 refused unit stops it). The census now names them apart; A's behaviour is
-unchanged.
+unchanged. (Ruled since: D44, `dependency gate`, the next section. On D1 A
+now holds the erring body itself, `not now`, and its spender waits on it; on
+D2 A lands the sibling only.)
 
 - **D1, `materialization`, rows equal** (w2's chain `g <- c <- d`, the manager
   erring on `c`). Served: lands `g`, stops at `c`, the graph held below the
@@ -306,3 +313,87 @@ unchanged.
   committed F5's empty judgement after a manager `Err`, as the served finalize
   does (D15), or is going on F5's intent at the finalize too, as the
   reference's per-topic catch would carry on?
+
+## D44 as built (the dependency gate, `lane/atomic-gasp-dependency-gate`)
+
+The owner's D44 (zanaadu-v2 `progress/decisions/2026-10-14-owner-rulings.md`;
+the memo's item 4, revision 3) ruled the fan-in delta D2: `dependency gate`.
+It lives in A's `admit_graph` (`admission.rs`, `admit_graph_observed`), which
+the shadow's judgement and the `on` path share. The served finalize (legacy)
+is unchanged: it still stops at the erring body, so the census keeps naming
+the class between them until `on`.
+
+**The rule, in five lines** (each body of a GASP graph, in graph order):
+
+1. A parent it spends that is a body of this graph and did not land in this
+   graph holds it without a unit: `WaitingOn([parent])`, refused with the
+   parent's typed word when that is terminal (`Lookup`, `Deterministic`:
+   D34's unit-wide refusal reaches its descendants), else `not now`.
+2. A parent of the graph not yet met (a graph out of order) must hold an
+   applied row in every topic of the body, read inside the body's unit; else
+   the unit is refused `not now`, `WaitingOn`.
+3. A topic manager that answers `Err` at the finalize (a topic of the unit
+   neither applied nor deduped: F5's empty judgement) refuses the whole unit
+   `not now` (`gasp_finalize.topic_manager`), `ParentError`: it rolls back,
+   nothing of it is written, never terminal.
+4. Any other refusal is the body's own (no gate reason); its descendants wait
+   on it by line 1.
+5. An independent sibling is judged and lands as its own unit; a body that
+   waited lands on the peer's next sync with the same judgement as any
+   first-time body (nothing of it was written).
+
+The API: `GraphOutcome::StoppedAt` is now `Held { landed, held }`, each
+`HeldBody { txid, refusal, gate: Option<GateReason> }`; `GateReason` is
+`ParentError` or `WaitingOn(Vec<txid>)`; the observer is handed the reason
+(`GraphObserver`). A1's C4 pin (`a1_c4_graph_stops_at_first_refusal`) is
+restated as `a1_c4_graph_holds_a_refused_body_and_judges_the_rest` (the refused
+body held, the body after it judged: a dedup, `landed [1, 1]`). The shadow's
+words follow: a unit refused while its managers erred keeps their errors in
+its word (`{"refusal", "manager_errors"}`, the lens's MEDIUM 2 kept), and a
+graph word's `stopped` is the FIRST body held (the gate judges the rest).
+
+**The census row** carries the gate's reason per body: `gate: [{txid, reason}]`,
+`reason` `"parent_error"` or `{"waiting_on": [txid, ...]}`, in graph order; a
+body row its own (empty when it landed or met its own refusal), a graph row
+every body held. On the fan-in with the erring parent first:
+
+```
+"delta": "rows_differ",
+"gate": [{"txid": a, "reason": "parent_error"},
+         {"txid": r, "reason": {"waiting_on": [a]}}]
+```
+
+The class against today's path: on the fan-in, `rows_differ` when the erring
+parent comes first (today lands nothing after the error; A lands the
+sibling), `materialization` when the sibling comes first (both land the
+sibling alone: the rows agree); on the chain (D1) `materialization` (both land
+`g` alone; A's first held body is the erring one, 503). The served order is a
+`HashMap`'s, so w2c takes either and asserts the class that order gives; w8
+takes the erring-first order.
+
+**Witnesses**, `crates/overlay-integration-tests/tests/gasp_dependency_gate.rs`
+(A's `admit_graph` run directly over a `MemoryStorage` runner and the shadow
+world's proven transactions; no feature needed), and `gasp_shadow.rs` w8.
+RED on `24df313` (the witnesses on `75e2d7b`'s engine) and `590c503`:
+
+| witness | RED | green |
+| --- | --- | --- |
+| the fan-in (`r` spends `a.0`, `b.0`; the manager erring on `a` at the finalize), both batch orders | `the erring parent waits, not now (never terminal)`: `left: Some(Landed) right: Some(NotNow)` (all three landed, `a` on F5's empty judgement) | `b` lands; `a` `not now`, `parent_error`; `r` `not now`, `waiting_on [a]`; nothing of `a` or `r` written; the rows equal in both orders |
+| the chain (`g <- c <- d`, the error at `c`) | `left: Some(Landed) right: Some(NotNow)` (`c` landed its empty judgement; `d` refused `predecessor_not_landed`) | `g` lands; `c` `not now`, `parent_error`; `d` `not now`, `waiting_on [c]`; `g.0` unspent |
+| the re-sync (the erring tick, then the healed manager handed the waiting part `[a, r]`) | `left: Some(Landed) right: Some(NotNow)` (the erring tick landed everything) | the erring tick lands `b`; the re-sync lands `a` and `r`; the digest of the rows and the STEAKs `3e9537070c81b8bd4972f2afa1f3dc981bb8fd886ddb20a4dfc45da2ce5fd12b`, equal to the first-time graph's |
+| a lookup refusal (`check_admitted` refusing `c`'s outputs) | `the descendant is refused with the same typed word, not not now`: `left: None right: Some(Lookup)` (the graph stopped at `c`; `d` never judged) | `g` lands; `c` `Lookup` (its own, no gate reason), nothing of it written; `d` refused with the same `Lookup` word, `waiting_on [c]` |
+| w8 the census row's reason per body | on `cd53832`: `left: Null right: Array [{"reason": "parent_error", ..}, {"reason": {"waiting_on": [..]}, ..}]` | the graph row `rows_differ` with the two entries above; `a`'s body row `[{"txid": a, "reason": "parent_error"}]` |
+
+Restated with the gate (green on `cd53832`): w2 (the erring chain: A lands
+`[g]`, its first held body `c` at 503, the rows agree), w2b (`c`'s shadow word
+503, the gate's site, the manager and its error named), w2c (the class by the
+served order, above).
+
+**Not built, stated.** `on` is still refused, so nothing serves the gate: the
+cursor's rule under `on` (a graph with a held body held below the cursor so
+the peer's next sync re-sends the waiting part) is the `on` runner's, a later
+slice; the re-sync witness hands the waiting part in by hand. The gate's
+parents are the inputs of each body that name another body of the graph; a
+parent outside the graph is the walk's and A's predecessor question's, as
+before. A body held by line 1 opens no unit, so it reads nothing and costs no
+seq.
