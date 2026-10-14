@@ -233,6 +233,7 @@ pub struct ChainProofFetcher {
     tracker: Option<Rc<dyn ChainTracker>>,
     /// Per-tick fetch budget (remaining).
     budget: Cell<u32>,
+    sync_budget: Cell<u32>,
     /// 2026-09-04: per-rung tallies this tick (`rung_stats`) — the lifetime
     /// `courier_<rung>_*_total` counters and the health surface's `couriers`
     /// view are built from these.
@@ -314,6 +315,7 @@ impl ChainProofFetcher {
             woc_api_key: None,
             tracker,
             budget: Cell::new(DEFAULT_FETCH_BUDGET),
+            sync_budget: Cell::new(DEFAULT_FETCH_BUDGET),
             proof_tallies: RefCell::default(),
             proof_fault_logged: RefCell::default(),
             proof_fault_store: None,
@@ -430,6 +432,7 @@ impl ChainProofFetcher {
     #[must_use]
     pub fn with_budget(self, budget: u32) -> Self {
         self.budget.set(budget);
+        self.sync_budget.set(budget);
         self
     }
 
@@ -530,69 +533,92 @@ impl ChainProofFetcher {
         Ok(None)
     }
 
-    /// Fetch the raw tx hex for `txid`, content-addressed, trying Bitails FIRST
-    /// and WhatsOnChain only as a LAST RESORT (WoC 429s on the free tier, so it
-    /// must never sit on the hot path). Used ONLY by the GASP-sync trait path
-    /// ([`AncestorFetcher::fetch_ancestor`]) where the raw genuinely is needed;
-    /// the proof-completion passes take the raw-free [`Self::verified_proof_for`].
+    /// Content-addressed raw bytes. Absence is definitive only when all three
+    /// enabled providers answer 404 or a recognized not-found body.
     pub(crate) async fn fetch_raw_hex(&self, txid: &str) -> Result<String, GASPError> {
-        // 1. Bitails raw download (non-WoC primary).
         let bitails = format!("{}/download/tx/{}/hex", self.bitails_base, txid);
-        if let Some(raw) = self
-            .raw_hex_content_addressed("bitails", txid, &bitails, None)
-            .await
-        {
-            return Ok(raw);
-        }
-        // 2. WoC (api key when installed).
         let woc = format!("{}/tx/{}/hex", self.woc_base, txid);
-        let hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
-        if let Some(raw) = self.raw_hex_content_addressed("woc", txid, &woc, hdr).await {
-            return Ok(raw);
-        }
-        // 3. BananaBlocks (2026-09-04, owner ruling "all three, fallbacks for
-        //    each other"): a WoC-compatible `/tx/{txid}/hex` — probed live,
-        //    the bytes hash to the txid. Content-addressed like the others, so
-        //    a wrong body can never inject an ancestor.
         let banana = bananablocks_tx_hex_url(&self.bananablocks_base, txid);
-        if let Some(raw) = self
-            .raw_hex_content_addressed("bananablocks", txid, &banana, None)
-            .await
-        {
-            return Ok(raw);
+        let hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
+        let mut all_absent = true;
+        for (source, url, header) in [
+            ("bitails", bitails, None),
+            ("woc", woc, hdr),
+            ("bananablocks", banana, None),
+        ] {
+            match self
+                .raw_hex_content_addressed(source, txid, &url, header)
+                .await
+            {
+                Ok(Some(raw)) => return Ok(raw),
+                Ok(None) => {}
+                Err(()) => all_absent = false,
+            }
+            if overlay_engine::meter::root_exhausted() {
+                return Err(GASPError::CourierBudget);
+            }
         }
-        Err(GASPError::NodeNotFound(format!(
-            "no raw tx for {txid} (bitails + woc + bananablocks exhausted)"
-        )))
+        if all_absent {
+            Err(GASPError::DefinitiveNotFound(txid.into()))
+        } else {
+            Err(GASPError::NodeNotFound(format!(
+                "no raw tx for {txid} (bitails + woc + bananablocks exhausted)"
+            )))
+        }
     }
 
-    /// GET raw tx hex from `url` and accept it ONLY if it parses to a tx whose
-    /// id is `txid` — content-addressing, so a garbled response or a
-    /// wrong-provider body can never inject a forged ancestor and the ladder
-    /// safely falls through to the next provider. `None` on any
-    /// transport/status/parse/mismatch.
     async fn raw_hex_content_addressed(
         &self,
         source: &'static str,
         txid: &str,
         url: &str,
         header: Option<(&str, &str)>,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, ()> {
         if !self.source_enabled(source) {
-            return None;
+            return Err(());
         }
-        let (status, body) = http_get(url, header).await.ok()?;
+        let (status, body) = http_get(url, header).await.map_err(|_| ())?;
+        if raw_not_found(status, &body) {
+            return Ok(None);
+        }
         if !(200..300).contains(&status) {
-            return None;
+            return Err(());
         }
         let raw = body.trim().to_string();
-        let recomputed = Transaction::from_hex(&raw).ok()?.id();
+        let recomputed = Transaction::from_hex(&raw).map_err(|_| ())?.id();
         if recomputed.eq_ignore_ascii_case(txid) {
-            Some(raw)
+            Ok(Some(raw))
         } else {
-            None
+            Err(())
         }
     }
+}
+
+/// Recognize explicit absence, never provider faults or arbitrary error text.
+fn raw_not_found(status: u16, body: &str) -> bool {
+    if status == 404 {
+        return true;
+    }
+    if !(200..300).contains(&status) && status != 400 {
+        return false;
+    }
+    let normalized = body.trim().to_ascii_lowercase();
+    let value = serde_json::from_str::<serde_json::Value>(&normalized).ok();
+    let message = value
+        .as_ref()
+        .and_then(|v| {
+            v.as_str()
+                .or_else(|| v.get("error").and_then(serde_json::Value::as_str))
+                .or_else(|| v.get("message").and_then(serde_json::Value::as_str))
+        })
+        .unwrap_or(&normalized);
+    matches!(
+        message,
+        "not found"
+            | "transaction not found"
+            | "tx not found"
+            | "no such mempool or blockchain transaction"
+    )
 }
 
 impl ChainProofFetcher {
@@ -848,6 +874,13 @@ enum RungCall<T> {
 
 #[async_trait(?Send)]
 impl AncestorFetcher for ChainProofFetcher {
+    fn begin_sync(&self) {
+        self.proof_memo.borrow_mut().clear();
+        self.ancestor_memo.borrow_mut().clear();
+        self.proof_fault_logged.borrow_mut().clear();
+        self.budget.set(self.sync_budget.get());
+    }
+
     async fn resolve_spender(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
         self.spender_hint_ladder(txid, vout).await
     }
@@ -1361,6 +1394,25 @@ fn tsc_proof_to_merkle_path(
     MerklePath::new(block_height, path).map_err(|e| format!("{e}"))
 }
 
+/// The transport seam counts actual attempts and applies the active root's
+/// rung limit. Other passes retain their own budgets and timeout policy.
+pub(crate) async fn http_get(
+    url: &str,
+    header: Option<(&str, &str)>,
+) -> Result<(u16, String), String> {
+    overlay_engine::meter::courier_request().map_err(str::to_string)?;
+    if overlay_engine::meter::root_scoped() {
+        overlay_engine::gasp::race_or_deadline(
+            http_get_inner(url, header),
+            crate::broadcaster::sleep_ms(overlay_engine::meter::COURIER_RUNG_TIMEOUT_MS),
+        )
+        .await
+        .unwrap_or_else(|| Err("courier rung timeout".into()))
+    } else {
+        http_get_inner(url, header).await
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 thread_local! {
     static TEST_HTTP_RESPONSES: RefCell<HashMap<String, (u16, String)>> = RefCell::new(HashMap::new());
@@ -1368,7 +1420,7 @@ thread_local! {
     static TEST_PROOF_LOGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 #[cfg(all(test, not(target_arch = "wasm32")))]
-pub(crate) async fn http_get(url: &str, _: Option<(&str, &str)>) -> Result<(u16, String), String> {
+async fn http_get_inner(url: &str, _: Option<(&str, &str)>) -> Result<(u16, String), String> {
     TEST_HTTP_CALLS.with(|calls| calls.set(calls.get() + 1));
     Ok(TEST_HTTP_RESPONSES
         .with(|r| r.borrow().get(url).cloned())
@@ -1379,10 +1431,7 @@ pub(crate) async fn http_get(url: &str, _: Option<(&str, &str)>) -> Result<(u16,
 /// optional single `(name, value)` pair (e.g. the WoC api key). `pub(crate)`
 /// since bsv-low#309: the advert-lifecycle pass probes the same courier hosts.
 #[cfg(not(all(test, not(target_arch = "wasm32"))))]
-pub(crate) async fn http_get(
-    url: &str,
-    header: Option<(&str, &str)>,
-) -> Result<(u16, String), String> {
+async fn http_get_inner(url: &str, header: Option<(&str, &str)>) -> Result<(u16, String), String> {
     let mut init = worker::RequestInit::new();
     init.with_method(worker::Method::Get);
     init.with_redirect(worker::RequestRedirect::Manual);
@@ -4512,6 +4561,73 @@ pub async fn apply_pushed_proof_to_pot_stores(
 pub(crate) mod tests {
     use super::*;
     use bsv_rs::transaction::MockChainTracker;
+
+    #[tokio::test]
+    async fn load_0112_root_rung_limit_counts_actual_http_attempts() {
+        let fetcher = ChainProofFetcher::new(None)
+            .with_sources(ProofSources::parse("bitails,woc,bananablocks"));
+        TEST_HTTP_RESPONSES.with(|r| r.borrow_mut().clear());
+        TEST_HTTP_CALLS.with(|c| c.set(0));
+        let meter = overlay_engine::meter::LoadMeter::default();
+        meter
+            .scope(overlay_engine::meter::root_scope(async {
+                for n in 0..4 {
+                    assert!(matches!(
+                        fetcher.fetch_raw_hex(&format!("{n:064x}")).await,
+                        Err(GASPError::DefinitiveNotFound(_))
+                    ));
+                }
+                assert!(matches!(
+                    fetcher.fetch_raw_hex(TXID).await,
+                    Err(GASPError::CourierBudget)
+                ));
+            }))
+            .await;
+        assert_eq!(TEST_HTTP_CALLS.with(Cell::get), 12);
+        assert_eq!(meter.snapshot().courier_rungs, 12);
+        assert_eq!(meter.snapshot().calls_out, 12);
+    }
+
+    #[tokio::test]
+    async fn load_0112_raw_absence_requires_all_three_definite_answers() {
+        let fetcher = ChainProofFetcher::new(None)
+            .with_sources(ProofSources::parse("bitails,woc,bananablocks"));
+        TEST_HTTP_RESPONSES.with(|r| r.borrow_mut().clear());
+        TEST_HTTP_CALLS.with(|c| c.set(0));
+        let result = fetcher.fetch_raw_hex(TXID).await;
+        assert!(
+            matches!(result, Err(GASPError::DefinitiveNotFound(_))),
+            "{result:?}"
+        );
+        assert_eq!(TEST_HTTP_CALLS.with(Cell::get), 3);
+        for status in [429, 500, 503] {
+            TEST_HTTP_RESPONSES.with(|r| {
+                r.borrow_mut().insert(
+                    format!("{}/tx/{TXID}/hex", fetcher.woc_base),
+                    (status, "not found".into()),
+                );
+            });
+            assert!(!matches!(
+                fetcher.fetch_raw_hex(TXID).await,
+                Err(GASPError::DefinitiveNotFound(_))
+            ));
+        }
+        TEST_HTTP_RESPONSES.with(|r| {
+            r.borrow_mut().insert(
+                format!("{}/tx/{TXID}/hex", fetcher.woc_base),
+                (200, "Transaction not found".into()),
+            );
+        });
+        assert!(matches!(
+            fetcher.fetch_raw_hex(TXID).await,
+            Err(GASPError::DefinitiveNotFound(_))
+        ));
+        let disabled = ChainProofFetcher::new(None);
+        assert!(!matches!(
+            disabled.fetch_raw_hex(TXID).await,
+            Err(GASPError::DefinitiveNotFound(_))
+        ));
+    }
 
     const TXID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HEIGHT: u32 = 830_000;

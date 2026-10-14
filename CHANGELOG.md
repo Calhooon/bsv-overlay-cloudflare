@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.1.12] - 2026-10-14
+
+- Accept optional `topics` and `peers` arrays on `POST /admin/startGASPSync`.
+  An empty body selects the full configured sync; an empty array selects
+  nothing. Named peers bypass network discovery. Results name the filter
+  and excluded topics and peers. Scheduled sync selection is unchanged.
+- Back off quiet successful peers after three empty syncs of a topic: 60
+  seconds, doubling to one hour. Productive work resets the streak; an
+  explicit filtered sync resets it, and a changed locally admitted SLAP
+  advertisement (or topic-specific SHIP advertisement) wakes the peer.
+  Results name `peers_skipped` with `no_yield` or `quarantine`. Quiet
+  polling and the existing failed-peer quarantine use separate counters.
+- Treat three definite raw-rung absences as `unanchorable:not_found` on
+  that run, for fresh roots and resumed obligations. The six-hour retry
+  and fault-record ceilings remain. The per-run memo is shared across
+  topics and peers and counts `courier_not_found_memo_hits`. Disabled
+  rungs, malformed responses, 429s, 5xx responses, transport errors and
+  spent budgets cannot establish absence. Other fault classes retain
+  their three-run rule. No unanchored graph is admitted.
+- Bound a budgeted root pass to twelve courier HTTP attempts and at most
+  15,000 ms of walking, with a 1,000 ms timeout per courier request.
+  `root_bounds` names the root and limiting reason; the existing durable
+  deferral path retains its work. Storage/finalize completion retains its
+  existing guarded semantics. Library users still opt into graph budgets.
+- Report `calls_out`, `peer_requests`, `courier_rungs`, `storage_reads`,
+  `storage_writes` and `ms` per topic and for the whole sync. Storage
+  figures count attempted trait operations, including errors, rather than
+  SQL rows. The tick logs totals even when its outer budget cancels the
+  sync. `/health/invariants` serves `gaspLastTick`, `gaspCallsOut24h`,
+  `gaspStorageReads24h`, `gaspStorageWrites24h`, `gaspSyncMs24h` and a read
+  fault flag. One-day totals include admin and scheduled syncs.
+- **DEPLOYMENT NOTE:** Five additive schema statements (238 to 243):
+  `gasp_peer_health.quiet_syncs`, `quiet_retry_at`, `quiet_advert`, and
+  `gasp_sync_cost` with its age index. Existing rows receive zero/empty
+  cadence defaults; no deferred-record rewrite is required. No new var,
+  dependency pin or version move. Older workers ignore the additions;
+  rollback restores their polling cadence. Consumers constructing sync
+  result literals must supply the added fields, and exhaustive GASP error
+  matches must handle the two added variants. The keeper sets workspace
+  versions and internal floors for release and calibrates the counters
+  against production analytics before claiming reduced load.
+
 ## [0.1.11] - 2026-10-14
 
 - Strike a held record whose resume faults. A RESUMED pass dropped by a fault

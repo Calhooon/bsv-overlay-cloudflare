@@ -973,7 +973,7 @@ impl Engine {
         Self {
             managers,
             lookup_services,
-            storage,
+            storage: Box::new(crate::load_storage::MeteredStorage(storage)),
             advertiser,
             broadcaster,
             arc_broadcaster,
@@ -4953,18 +4953,41 @@ impl Engine {
         &self,
         filter: &crate::sync_load::SyncFilter,
     ) -> Result<GASPSyncResult, EngineError> {
+        let meter = crate::meter::LoadMeter::default();
+        self.start_gasp_sync_metered(filter, &meter).await
+    }
+
+    /// A caller holding the meter can read partial costs after cancellation.
+    pub async fn start_gasp_sync_metered(
+        &self,
+        filter: &crate::sync_load::SyncFilter,
+        meter: &crate::meter::LoadMeter,
+    ) -> Result<GASPSyncResult, EngineError> {
+        meter.scope(self.run_gasp_sync(filter)).await
+    }
+
+    async fn run_gasp_sync(
+        &self,
+        filter: &crate::sync_load::SyncFilter,
+    ) -> Result<GASPSyncResult, EngineError> {
         use crate::gasp::{GASPSync, ENGINE_GASP_SYNC_PAGE_LIMIT};
         use crate::gasp_overlay::OverlayGASPStorage;
 
         if self.config.sync_configuration.is_empty() {
             info!("[GASP SYNC] No sync configuration — nothing to sync");
             return Ok(GASPSyncResult {
+                cost: crate::meter::SyncCost::default(),
                 topics_synced: HashMap::new(),
                 filter: filter.clone(),
                 topics_filtered: Vec::new(),
             });
         }
 
+        let sync_fetcher: Option<std::rc::Rc<dyn crate::gasp::AncestorFetcher>> = self
+            .gasp_ancestor_fetcher
+            .as_ref()
+            .or(self.ancestor_fetcher.as_ref())
+            .map(|f| std::rc::Rc::new(crate::sync_fetcher::SyncFetcher::new(f.clone())) as _);
         let mut topics_synced: HashMap<String, TopicSyncResult> = HashMap::new();
         // Resolve SLAP providers once per invocation, sharing their host cap
         // across all SHIP topics. Every topic still queries each lookup host.
@@ -4990,6 +5013,7 @@ impl Engine {
                 topics_filtered.push(topic.clone());
                 continue;
             }
+            let cost_before = crate::meter::snapshot();
             // A CONFIGURED topic's peers are reserved part of a storage's
             // deferred-graph ceiling (bsv-low #555, the delta-2 fold's D2-M2).
             let configured_peers = matches!(target, SyncTarget::Peers(_));
@@ -5069,6 +5093,7 @@ impl Engine {
             let mut backed_off_graphs: u64 = 0;
             let mut waiting_graphs: u64 = 0;
             let mut idle_counted: u64 = 0;
+            let mut root_bounds = Vec::new();
             let mut faulted_roots: Vec<crate::gasp::FaultedRoot> = Vec::new();
 
             // If we have a remote factory, actually run GASP sync
@@ -5145,10 +5170,6 @@ impl Engine {
                     // input the peer answers it does not hold, which exists
                     // only WITHOUT a fetcher, see
                     // `GASPSync::process_incoming_node`).
-                    let sync_fetcher = self
-                        .gasp_ancestor_fetcher
-                        .as_ref()
-                        .or(self.ancestor_fetcher.as_ref());
                     let hydration_on = sync_fetcher.is_some();
 
                     // Create storage adapter and remote
@@ -5169,7 +5190,9 @@ impl Engine {
                     if let Some(tracker) = self.chain_tracker.as_deref() {
                         gasp_storage = gasp_storage.with_chain_tracker(tracker);
                     }
-                    let gasp_remote = factory.create_remote(peer_url, topic);
+                    let gasp_remote = Box::new(crate::load_remote::MeteredRemote(
+                        factory.create_remote(peer_url, topic),
+                    ));
 
                     let log_prefix = format!("[GASP {topic} <-> {peer_url}]");
                     // Graphs of this peer handed to submit (bsv-low #552).
@@ -5181,12 +5204,13 @@ impl Engine {
                         &log_prefix,
                         true, // unidirectional — overlay GASP is pull-only (submitNode throws); matches TS Engine.startGASPSync
                     )
-                    .with_ancestor_fetcher(sync_fetcher.cloned())
+                    .with_ancestor_fetcher(sync_fetcher.clone())
                     .with_expired_outpoints(std::rc::Rc::clone(&expired));
                     // bsv-low #555: a graph past its own budget is deferred,
                     // not dropped with the sync.
                     if let Some((sleep, max_calls, budget_ms)) = &self.graph_budget {
-                        let (sleep, budget_ms) = (sleep.clone(), *budget_ms);
+                        let (sleep, budget_ms) =
+                            (sleep.clone(), (*budget_ms).min(crate::meter::ROOT_MAX_MS));
                         let half_sleep = sleep.clone();
                         let share_sleep = sleep.clone();
                         sync = sync.with_graph_budget(crate::gasp::GraphBudget {
@@ -5485,7 +5509,7 @@ impl Engine {
                         && !sync.did_work()
                         && sync.faulted_roots().is_empty()
                         && sync.deferral_stats().stalled == 0;
-                    let quiet_syncs = if quiet {
+                    let quiet_syncs = if quiet && !filter.explicit() {
                         if reset_cadence {
                             1
                         } else {
@@ -5513,6 +5537,10 @@ impl Engine {
                     }
                     finalized_graphs += peer_finalized.get();
                     let deferral = sync.deferral_stats();
+                    root_bounds.extend(deferral.root_bounds.iter().cloned().map(|mut bound| {
+                        bound.peer.clone_from(peer_url);
+                        bound
+                    }));
                     deferred_graphs += deferral.deferred;
                     resumed_graphs += deferral.resumed;
                     converged_graphs += deferral.converged;
@@ -5579,6 +5607,8 @@ impl Engine {
             topics_synced.insert(
                 topic.clone(),
                 TopicSyncResult {
+                    cost: crate::meter::snapshot().since(cost_before),
+                    root_bounds,
                     peers_skipped,
                     peers_filtered,
                     roots_proven,
@@ -5629,6 +5659,7 @@ impl Engine {
             info!("[GASP SYNC] gaspStrikesRefused={refused}");
         }
         Ok(GASPSyncResult {
+            cost: crate::meter::snapshot(),
             topics_synced,
             filter: filter.clone(),
             topics_filtered,
@@ -5929,6 +5960,7 @@ impl Engine {
             }
             let question = LookupQuestion::new("ls_ship", serde_json::json!({"topics": [topic]}));
             for host in lookup_hosts.as_ref().into_iter().flatten() {
+                crate::meter::peer_request();
                 match client.lookup(host, &question).await {
                     Ok(outputs) => {
                         domains.extend(outputs.iter().filter_map(|output| {
@@ -5955,6 +5987,7 @@ impl Engine {
         let question = LookupQuestion::new("ls_slap", serde_json::json!({"service": "ls_ship"}));
         let mut advertised = Vec::new();
         for tracker in &trackers {
+            crate::meter::peer_request();
             match client.lookup(tracker, &question).await {
                 Ok(outputs) => {
                     advertised.extend(outputs.iter().filter_map(|output| {
@@ -6180,6 +6213,8 @@ impl crate::gasp::FinalizedGraphHook for SubmitAsFinalized<'_> {
 /// Returned by `Engine::start_gasp_sync()` to summarize what happened.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GASPSyncResult {
+    #[serde(default, flatten)]
+    pub cost: crate::meter::SyncCost,
     #[serde(default)]
     pub filter: crate::sync_load::SyncFilter,
     #[serde(default)]
@@ -6191,6 +6226,10 @@ pub struct GASPSyncResult {
 /// Sync result for a single topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicSyncResult {
+    #[serde(default, flatten)]
+    pub cost: crate::meter::SyncCost,
+    #[serde(default)]
+    pub root_bounds: Vec<crate::sync_load::RootBound>,
     #[serde(default)]
     pub peers_skipped: Vec<crate::sync_load::SkippedPeer>,
     #[serde(default)]
@@ -8341,6 +8380,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_0112_an_admitted_slap_change_wakes_its_peer() {
+        let (mut engine, mut remote) = budget_page_engine(0);
+        remote.node_cost_ms = 0;
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        for _ in 0..3 {
+            engine.start_gasp_sync().await.unwrap();
+        }
+        let skipped = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(
+            skipped.topics_synced["tm_test"].peers_skipped[0].reason,
+            "no_yield"
+        );
+        let count = remote.requests.borrow().len();
+        let ad = discovery_output("SLAP", "https://budget.example", "ls_ship");
+        let tx = beef_limits::transaction_from_beef(&ad.beef, None, &beef_limits::PEER_BEEF_LIMITS)
+            .unwrap();
+        engine
+            .storage
+            .insert_output(&Output {
+                txid: tx.id(),
+                output_index: 0,
+                output_script: tx.outputs[0].locking_script.to_binary(),
+                satoshis: 1,
+                topic: "tm_slap".into(),
+                spent: false,
+                outputs_consumed: vec![],
+                consumed_by: vec![],
+                beef: None,
+                block_height: None,
+                score: Some(1.0),
+            })
+            .await
+            .unwrap();
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert!(result.topics_synced["tm_test"].peers_skipped.is_empty());
+        assert_eq!(remote.requests.borrow().len(), count + 1);
+    }
+
+    #[tokio::test]
     async fn load_0112_filter_selects_only_named_topic_and_peer() {
         let calls = std::rc::Rc::default();
         let mut engine = Engine::new(
@@ -8854,6 +8932,8 @@ mod tests {
         topics_synced.insert(
             "tm_test".to_string(),
             super::TopicSyncResult {
+                cost: crate::meter::SyncCost::default(),
+                root_bounds: Vec::new(),
                 peers_skipped: Vec::new(),
                 peers_filtered: Vec::new(),
                 roots_proven: 0,
@@ -8886,6 +8966,7 @@ mod tests {
         );
 
         let result = super::GASPSyncResult {
+            cost: crate::meter::SyncCost::default(),
             topics_synced,
             filter: crate::sync_load::SyncFilter::default(),
             topics_filtered: Vec::new(),
@@ -9627,6 +9708,230 @@ mod tests {
     /// The fixture of 0.1.9: a page of three (scores 10, 20, 30) whose
     /// lowest root is served UNPROVEN, so its walk needs its parent, which
     /// only the courier can serve (a mined parent, proven at height 900).
+    #[tokio::test]
+    async fn load_0112_definitive_absence_strikes_a_resumed_obligation() {
+        let mut fixture = obligation_fixture(1, 1, 0).await;
+        fixture
+            .engine
+            .set_gasp_ancestor_fetcher(std::rc::Rc::new(LoadCourier {
+                calls: std::rc::Rc::new(Cell::new(0)),
+                bounded: false,
+            }));
+        let result = fixture.engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!((topic.unanchorable_graphs, topic.finalized_graphs), (1, 1));
+        let record = fixture
+            .store
+            .get_deferred_graph("https://budget.example", "tm_test", &fixture.obligations[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (record.reason.as_str(), record.faults),
+            ("unanchorable:not_found", 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn load_0112_root_time_is_clamped_and_named() {
+        let (mut engine, mut remote) = budget_page_engine(1);
+        remote.node_cost_ms = 16_000;
+        let elapsed = remote.elapsed.clone();
+        let sleep: SleepFactory = std::rc::Rc::new(move |ms| {
+            let clock = elapsed.clone();
+            let due = clock.get() + ms;
+            Box::pin(std::future::poll_fn(move |_| {
+                if clock.get() >= due {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }))
+        });
+        engine.set_peer_sync_budget(sleep.clone(), 30_000);
+        engine.set_graph_budget(sleep, 100, 60_000);
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.finalized_graphs, 0);
+        assert_eq!(topic.root_bounds[0].reason, "time");
+        assert!(!topic.cursor_held_by.is_empty() || topic.deferred_graphs > 0);
+    }
+
+    #[tokio::test]
+    async fn load_0112_storage_counts_are_attempts_at_the_boundary() {
+        let engine = make_engine(vec![0]);
+        let meter = crate::meter::LoadMeter::default();
+        meter
+            .scope(async {
+                assert_eq!(
+                    engine
+                        .storage
+                        .get_last_interaction("peer", "topic")
+                        .await
+                        .unwrap(),
+                    0
+                );
+                engine
+                    .storage
+                    .update_last_interaction("peer", "topic", 12)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    engine
+                        .storage
+                        .get_last_interaction("peer", "topic")
+                        .await
+                        .unwrap(),
+                    12
+                );
+            })
+            .await;
+        assert_eq!(
+            (
+                meter.snapshot().storage_reads,
+                meter.snapshot().storage_writes
+            ),
+            (2, 1)
+        );
+        engine
+            .storage
+            .get_last_interaction("peer", "topic")
+            .await
+            .unwrap();
+        assert_eq!(meter.snapshot().storage_reads, 2);
+    }
+
+    struct LoadCourier {
+        calls: std::rc::Rc<Cell<u64>>,
+        bounded: bool,
+    }
+    #[async_trait(?Send)]
+    impl crate::gasp::AncestorFetcher for LoadCourier {
+        async fn fetch_ancestor(
+            &self,
+            txid: &str,
+        ) -> Result<crate::gasp::FetchedAncestor, crate::gasp::GASPError> {
+            self.calls.set(self.calls.get() + 1);
+            if self.bounded {
+                for _ in 0..13 {
+                    crate::meter::courier_request()
+                        .map_err(|e| crate::gasp::GASPError::Other(e.into()))?;
+                }
+                Err(crate::gasp::GASPError::RemoteError(
+                    "still missing a proof".into(),
+                ))
+            } else {
+                for _ in 0..3 {
+                    crate::meter::courier_request().unwrap();
+                }
+                Err(crate::gasp::GASPError::DefinitiveNotFound(txid.into()))
+            }
+        }
+        async fn verified_proof_for(&self, _: &str) -> Option<String> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn load_0112_definitive_absence_is_shared_across_peers_and_topics() {
+        let UnanchorableFixture {
+            mut engine,
+            remote,
+            root,
+            ..
+        } = unanchorable_fixture();
+        let calls = std::rc::Rc::new(Cell::new(0));
+        engine.set_gasp_ancestor_fetcher(std::rc::Rc::new(LoadCourier {
+            calls: calls.clone(),
+            bounded: false,
+        }));
+        engine.managers.insert(
+            "tm_other".into(),
+            Box::new(MockTopicManager::admitting(vec![0])),
+        );
+        for topic in ["tm_test", "tm_other"] {
+            engine.config.sync_configuration.insert(
+                topic.into(),
+                SyncTarget::Peers(vec!["https://a.example".into(), "https://b.example".into()]),
+            );
+        }
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(calls.get(), 1, "one ladder per missing ancestor per run");
+        assert_eq!(result.cost.courier_not_found_memo_hits, 3);
+        assert_eq!(result.cost.courier_rungs, 3);
+        for (topic, res) in &result.topics_synced {
+            assert_eq!(res.unanchorable_graphs, 2, "{res:?}");
+            assert_eq!(
+                res.cost.courier_rungs + res.cost.peer_requests,
+                res.cost.calls_out
+            );
+            for host in ["https://a.example", "https://b.example"] {
+                let mut record = engine
+                    .storage
+                    .get_deferred_graph(host, topic, &root)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(record.reason, "unanchorable:not_found");
+                assert_eq!(record.faults, 1);
+                assert!(record.cursor_passable);
+                record.retry_at = 0;
+                engine.storage.put_deferred_graph(&record).await.unwrap();
+            }
+        }
+        assert!(!remote.asked.borrow().is_empty());
+        engine.start_gasp_sync().await.unwrap();
+        assert_eq!(calls.get(), 2, "another run can retry absence");
+    }
+
+    #[tokio::test]
+    async fn load_0112_courier_bound_defers_the_root_and_names_it() {
+        let UnanchorableFixture {
+            mut engine, root, ..
+        } = unanchorable_fixture();
+        engine.set_gasp_ancestor_fetcher(std::rc::Rc::new(LoadCourier {
+            calls: std::rc::Rc::new(Cell::new(0)),
+            bounded: true,
+        }));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let record = engine
+            .storage
+            .get_deferred_graph("https://budget.example", "tm_test", &root)
+            .await
+            .unwrap()
+            .expect("bounded root must be retained");
+        assert_eq!(record.reason, "courier_rungs");
+        assert!(!record.nodes.is_empty());
+        assert_eq!(result.cost.courier_rungs, 12);
+        assert_eq!(
+            result.topics_synced["tm_test"].root_bounds[0].reason,
+            "courier_rungs"
+        );
+        assert_eq!(result.topics_synced["tm_test"].finalized_graphs, 2);
+    }
+
+    #[tokio::test]
+    async fn load_0112_cost_matches_the_remote_call_log() {
+        let (mut engine, remote) = budget_page_engine(2);
+        remote.elapsed.set(0);
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let actual_calls = (remote.requests.borrow().len() + remote.asked.borrow().len()) as u64;
+        assert_eq!(result.cost.peer_requests, actual_calls);
+        assert_eq!(result.cost.calls_out, actual_calls);
+        assert!(result.cost.storage_reads > 0);
+        assert!(result.cost.storage_writes > 0);
+        assert_eq!(
+            result.cost.storage_reads,
+            result.topics_synced["tm_test"].cost.storage_reads
+        );
+        assert_eq!(
+            result.cost.storage_writes,
+            result.topics_synced["tm_test"].cost.storage_writes
+        );
+    }
+
     struct UnanchorableFixture {
         engine: Engine,
         remote: BudgetPageRemote,

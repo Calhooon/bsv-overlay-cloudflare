@@ -78,6 +78,7 @@ The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` r
 | `rebroadcast_state` | overlay-cloudflare | none | none | transient | no | a watch list |
 | `proofless_watch` | overlay-cloudflare | none | none | transient | no | a watch list, re-enrolled from transactions / pot_beefs |
 | `host_sync_state` | overlay-cloudflare | none | none | transient | no | a GASP cursor; the next sync walks again |
+| `gasp_sync_cost` | overlay-cloudflare | none | none | transient | no | one day of sync cost readings and the latest tick; no admission state |
 | `gasp_peer_health` | overlay-cloudflare | none | none | transient | no | counters |
 | `ef_deferred_jobs` | overlay-cloudflare | none | none | transient | no | NL-6c: one row per broadcast-gated submission whose EF work was past one request's budget (its reference, where its bytes rest, its state, its runs, the corroboration's cursor since NL-6d, the arm's answer); swept by the cron seven days after it settles; a lost row loses the caller's poll and the queued run |
 | `ef_deferred_chunks` | overlay-cloudflare | none | none | transient | no | NL-6c: a deferred submission's bytes at rest in D1, a chunk of at most 1,000,000 bytes a row, when no `BEEF_BLOBS` binding exists; deleted when the job settles |

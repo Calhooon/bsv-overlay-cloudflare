@@ -936,19 +936,47 @@ impl Storage for D1Storage {
         Ok(row.map_or(0, |r| r.since as u64))
     }
 
-    async fn get_peer_cadence(&self, host: &str, topic: &str) -> Result<overlay_engine::sync_load::PeerCadence, StorageError> {
+    async fn get_peer_cadence(
+        &self,
+        host: &str,
+        topic: &str,
+    ) -> Result<overlay_engine::sync_load::PeerCadence, StorageError> {
         #[derive(Deserialize)]
-        struct Row { quiet_syncs: u32, retry_after_secs: u64, advertisement: String }
-        let row: Option<Row> = Query::new(PEER_CADENCE_SELECT_SQL).bind(host).bind(topic).fetch_optional(&self.db).await.map_err(d1_err)?;
-        Ok(row.map_or_else(Default::default, |r| overlay_engine::sync_load::PeerCadence {
-            quiet_syncs: r.quiet_syncs, retry_after_secs: r.retry_after_secs, advertisement: r.advertisement,
+        struct Row {
+            quiet_syncs: u32,
+            retry_after_secs: u64,
+            advertisement: String,
+        }
+        let row: Option<Row> = Query::new(PEER_CADENCE_SELECT_SQL)
+            .bind(host)
+            .bind(topic)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(d1_err)?;
+        Ok(row.map_or_else(Default::default, |r| {
+            overlay_engine::sync_load::PeerCadence {
+                quiet_syncs: r.quiet_syncs,
+                retry_after_secs: r.retry_after_secs,
+                advertisement: r.advertisement,
+            }
         }))
     }
 
-    async fn set_peer_cadence(&self, host: &str, topic: &str, state: &overlay_engine::sync_load::PeerCadence) -> Result<(), StorageError> {
-        Query::new(PEER_CADENCE_UPSERT_SQL).bind(host).bind(topic).bind(state.quiet_syncs)
-            .bind(state.retry_after_secs).bind(state.advertisement.as_str())
-            .execute(&self.db).await.map_err(d1_err)
+    async fn set_peer_cadence(
+        &self,
+        host: &str,
+        topic: &str,
+        state: &overlay_engine::sync_load::PeerCadence,
+    ) -> Result<(), StorageError> {
+        Query::new(PEER_CADENCE_UPSERT_SQL)
+            .bind(host)
+            .bind(topic)
+            .bind(state.quiet_syncs)
+            .bind(state.retry_after_secs)
+            .bind(state.advertisement.as_str())
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)
     }
 
     async fn record_peer_sync_outcome(
@@ -1324,16 +1352,46 @@ mod tests {
                 assert!(e.to_string().contains("duplicate column"), "{e}: {sql}");
             }
         }
-        conn.execute(PEER_HEALTH_UPSERT_SQL, rusqlite::params!["peer", "topic", false]).unwrap();
-        conn.execute(PEER_CADENCE_UPSERT_SQL, rusqlite::params!["peer", "topic", 3, 60, "ad"]).unwrap();
-        let row: (u32, u64, String) = conn.query_row(PEER_CADENCE_SELECT_SQL, rusqlite::params!["peer", "topic"], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        conn.execute(
+            PEER_HEALTH_UPSERT_SQL,
+            rusqlite::params!["peer", "topic", false],
+        )
+        .unwrap();
+        conn.execute(
+            PEER_CADENCE_UPSERT_SQL,
+            rusqlite::params!["peer", "topic", 3, 60, "ad"],
+        )
+        .unwrap();
+        let row: (u32, u64, String) = conn
+            .query_row(
+                PEER_CADENCE_SELECT_SQL,
+                rusqlite::params!["peer", "topic"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
         assert_eq!(row.0, 3);
         assert!((59..=60).contains(&row.1));
         assert_eq!(row.2, "ad");
-        let failures: u64 = conn.query_row(PEER_HEALTH_SELECT_SQL, rusqlite::params!["peer", "topic"], |r| r.get(0)).unwrap();
+        let failures: u64 = conn
+            .query_row(
+                PEER_HEALTH_SELECT_SQL,
+                rusqlite::params!["peer", "topic"],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(failures, 1);
-        conn.execute(PEER_CADENCE_UPSERT_SQL, rusqlite::params!["peer", "topic", 0, 0, "changed"]).unwrap();
-        let row: (u32, u64) = conn.query_row(PEER_CADENCE_SELECT_SQL, rusqlite::params!["peer", "topic"], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        conn.execute(
+            PEER_CADENCE_UPSERT_SQL,
+            rusqlite::params!["peer", "topic", 0, 0, "changed"],
+        )
+        .unwrap();
+        let row: (u32, u64) = conn
+            .query_row(
+                PEER_CADENCE_SELECT_SQL,
+                rusqlite::params!["peer", "topic"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(row, (0, 0));
     }
 

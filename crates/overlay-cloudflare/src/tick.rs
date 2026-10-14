@@ -317,8 +317,9 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // graph is being submitted, and a submit dropped between its writes
     // leaves a head chain with no head. It waits for the transaction being
     // written and drops the sync at the boundary.
+    let gasp_meter = overlay_engine::meter::LoadMeter::default();
     match overlay_engine::gasp::race_or_deadline_guarded(
-        engine.start_gasp_sync(),
+        engine.start_gasp_sync_metered(&overlay_engine::sync_load::SyncFilter::default(), &gasp_meter),
         crate::broadcaster::sleep_ms(GASP_SYNC_BUDGET_MS),
         engine.finalize_submit_gate(),
     )
@@ -400,6 +401,10 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 total_cursor_moves
             );
             for (topic, res) in &r.topics_synced {
+                worker::console_log!("Scheduled GASP topic={} calls_out={} peer_requests={} courier_rungs={} storage_reads={} storage_writes={} ms={} courier_not_found_memo_hits={} peers_skipped={:?} root_bounds={:?}",
+                    topic, res.cost.calls_out, res.cost.peer_requests, res.cost.courier_rungs,
+                    res.cost.storage_reads, res.cost.storage_writes, res.cost.ms,
+                    res.cost.courier_not_found_memo_hits, res.peers_skipped, res.root_bounds);
                 // Engine 0.1.9: every root a peer's sync dropped, once a
                 // run, with its fault class; `cursor_held_by` names only what
                 // is neither finished nor held, so the two together say why
@@ -458,6 +463,12 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         }
         Some(Err(e)) => worker::console_log!("Scheduled: GASP sync error: {}", e),
     }
+
+    let gasp_cost = gasp_meter.snapshot();
+    worker::console_log!("Scheduled GASP totals calls_out={} peer_requests={} courier_rungs={} storage_reads={} storage_writes={} ms={} courier_not_found_memo_hits={}",
+        gasp_cost.calls_out, gasp_cost.peer_requests, gasp_cost.courier_rungs,
+        gasp_cost.storage_reads, gasp_cost.storage_writes, gasp_cost.ms, gasp_cost.courier_not_found_memo_hits);
+    crate::gasp_cost::record(&ops_db, "tick", gasp_cost).await;
 
     // Peer crawl: bridge for non-GASP peers (bsvb today). `/lookup` +
     // `/submit` instead of `/requestSyncResponse`. Engine's tm_X

@@ -1484,6 +1484,7 @@ pub async fn health_invariants(
     .await;
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);
+    let gasp_load = crate::gasp_cost::view(db).await;
     let body = json!({
         "ok": !dead,
         "service": "low-overlay",
@@ -1517,6 +1518,12 @@ pub async fn health_invariants(
         // rows are excluded at enrol AND dropped by the watch GC.
         "prooflessOver24h": flagged,
         "heldByWindow": held_by_window,
+        "gaspLastTick": gasp_load["lastTick"],
+        "gaspCallsOut24h": gasp_load["totals24h"]["calls_out"],
+        "gaspStorageReads24h": gasp_load["totals24h"]["storage_reads"],
+        "gaspStorageWrites24h": gasp_load["totals24h"]["storage_writes"],
+        "gaspSyncMs24h": gasp_load["totals24h"]["ms"],
+        "gaspLoadFault": gasp_load["fault"],
         "gaspRootsProven": counters.get(crate::gasp_deferred::COUNTER_GASP_ROOTS_PROVEN).and_then(serde_json::Value::as_u64).unwrap_or(0),
         "gaspRootsUnproven": counters.get(crate::gasp_deferred::COUNTER_GASP_ROOTS_UNPROVEN).and_then(serde_json::Value::as_u64).unwrap_or(0),
         "crawlExpiredRefused": counters.get(crate::peer_crawler::COUNTER_CRAWL_EXPIRED_REFUSED).and_then(serde_json::Value::as_u64).unwrap_or(0),
