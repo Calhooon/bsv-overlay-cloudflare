@@ -3477,6 +3477,11 @@ struct CollectedRow {
     output_index: u32,
     #[serde(rename = "sigHex")]
     sig_hex: Option<String>,
+    /// bsv-low #492/#512 (loop 25 I5): the v2 HELD filing's paying txid, NULL
+    /// for a v1 marker (`default` so an older read lacking the column still
+    /// deserialises as `None`).
+    #[serde(rename = "payTxid", default)]
+    pay_txid: Option<String>,
 }
 
 impl CollectedRow {
@@ -3487,6 +3492,7 @@ impl CollectedRow {
             txid: self.txid,
             output_index: self.output_index,
             sig_hex: self.sig_hex,
+            pay_txid: self.pay_txid,
         }
     }
 }
@@ -3540,8 +3546,8 @@ const COLLECTED_ROWS_PER_PAIR: usize = 8;
 pub fn collected_records_batch_sql(n: usize) -> String {
     let placeholders = vec!["?"; n].join(", ");
     format!(
-        "SELECT identity, gameId, txid, outputIndex, sigHex FROM \
-           (SELECT identity, gameId, txid, outputIndex, sigHex, \
+        "SELECT identity, gameId, txid, outputIndex, sigHex, payTxid FROM \
+           (SELECT identity, gameId, txid, outputIndex, sigHex, payTxid, \
                    ROW_NUMBER() OVER (PARTITION BY identity, gameId \
                                       ORDER BY createdAt DESC, txid DESC, \
                                                outputIndex DESC) AS rn \
@@ -3611,7 +3617,7 @@ impl CollectedStorage for D1CollectedStorage {
         // reads of one store that disagreed on either would be a boundary with
         // no pin (Rule 16).
         let rows: Vec<CollectedRow> = Query::new(format!(
-            "SELECT identity, gameId, txid, outputIndex, sigHex FROM collected_markers_v2 \
+            "SELECT identity, gameId, txid, outputIndex, sigHex, payTxid FROM collected_markers_v2 \
              WHERE identity = ? AND gameId = ? \
              ORDER BY createdAt DESC, txid DESC, outputIndex DESC \
              LIMIT {COLLECTED_ROWS_PER_PAIR}"
@@ -9585,6 +9591,79 @@ mod tests {
                 .any(|(txid, sig)| *txid == h64(0xbb) && sig == "sigREAL"),
             "a PRE-FILED squat must not evict the victim's later genuine marker \
              — an oldest-first window would hand the squatter every slot: {rows:?}"
+        );
+    }
+
+    /// bsv-low #492/#512, loop 25 I5 (the client half's dependency): the shipped
+    /// `collectedFor` read carries each row's `payTxid`, so a client can rebuild
+    /// the v2 held filing's `heldChallenge`
+    /// (`LOW-collected\nv2\ngid=…\nid=…\ntxid=<payTxid>`) and verify the row under
+    /// its own identity. The home Lobby card stopped suppressing Collect on a
+    /// credited game once the filing door moved to the v2-only `LOW/collected/v2`
+    /// marker and the reader could not reconstruct that challenge.
+    ///
+    /// The two `collected_markers_v2` shapes answer the ONE shipped batch read:
+    /// a HELD filing names a `payTxid`, a v1 marker leaves it NULL (it signs
+    /// `collectedChallenge`, which names no txid). Pinned against the REAL
+    /// production schema (the `payTxid` column is migration 162→163): on base the
+    /// SELECT carries no `payTxid`, so reading it is an out-of-range column
+    /// error (RED on `197b1921`).
+    #[test]
+    fn collected_batch_sql_carries_pay_txid_for_held_and_null_for_v1_real_sqlite() {
+        let conn = production_schema_db();
+        let me = victim_id();
+        let held_game = h64(0x11);
+        let v1_game = h64(0x22);
+        let pay = h64(0x66);
+
+        // A v2 HELD filing (written by the app-layer filing door after it
+        // verified the signature over `pay`): its row names the paying txid.
+        conn.execute(
+            "INSERT INTO collected_markers_v2 \
+             (identity, gameId, txid, outputIndex, sigHex, createdAt, payTxid) \
+             VALUES (?1, ?2, ?3, 0, 'sigHELD', 1, ?4)",
+            rusqlite::params![me, held_game, "filed:held", pay],
+        )
+        .unwrap();
+        // A v1 marker for a different game: no paying txid (payTxid stays NULL).
+        conn.execute(
+            "INSERT INTO collected_markers_v2 \
+             (identity, gameId, txid, outputIndex, sigHex, createdAt) \
+             VALUES (?1, ?2, ?3, 0, 'sigV1', 2)",
+            rusqlite::params![me, v1_game, h64(0xcc)],
+        )
+        .unwrap();
+
+        // The HELD row serves its `payTxid` (column 5, appended after sigHex).
+        let sql = collected_records_batch_sql(1);
+        let mut stmt = conn.prepare(&sql).expect("shipped batch SQL must parse");
+        let held: Vec<(String, Option<String>)> = stmt
+            .query_map(rusqlite::params![me, held_game], |row| {
+                Ok((row.get::<_, String>(2)?, row.get::<_, Option<String>>(5)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            held,
+            vec![("filed:held".to_string(), Some(pay.clone()))],
+            "the held filing's row must carry its payTxid so the client can \
+             rebuild the v2 heldChallenge"
+        );
+
+        // The v1 row serves a NULL payTxid (additive, absent for v1).
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let v1: Vec<(String, Option<String>)> = stmt
+            .query_map(rusqlite::params![me, v1_game], |row| {
+                Ok((row.get::<_, String>(2)?, row.get::<_, Option<String>>(5)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            v1,
+            vec![(h64(0xcc), None)],
+            "a v1 marker names no paying txid, so payTxid is NULL"
         );
     }
 

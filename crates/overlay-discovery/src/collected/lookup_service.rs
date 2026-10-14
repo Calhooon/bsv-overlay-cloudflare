@@ -111,6 +111,10 @@ impl LookupService for CollectedLookupService {
             txid: txid.to_string(),
             output_index,
             sig_hex: Some(hex::encode(&marker.sig)),
+            // A `tm_collected` on-chain marker is the v1 shape (it signs
+            // `collectedChallenge`, which names no txid); the v2 HELD filing's
+            // `payTxid` is stored only by the app-layer filing door.
+            pay_txid: None,
         };
 
         // Keyed on the OUTPOINT: a replay of the same output is a harmless
@@ -199,6 +203,7 @@ impl LookupService for CollectedLookupService {
                     "txid": serde_json::Value::Null,
                     "outputIndex": serde_json::Value::Null,
                     "sigHex": serde_json::Value::Null,
+                    "payTxid": serde_json::Value::Null,
                     "present": false,
                 }));
                 continue;
@@ -211,6 +216,14 @@ impl LookupService for CollectedLookupService {
                     "outputIndex": r.output_index,
                     "sigHex": r
                         .sig_hex
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                    // bsv-low #492/#512 (loop 25 I5): the v2 HELD filing's paying
+                    // txid, so the client can rebuild `heldChallenge` and verify
+                    // the row under its own identity. ADDITIVE; `null` for a v1
+                    // marker and for an absent gameId.
+                    "payTxid": r
+                        .pay_txid
                         .map(serde_json::Value::String)
                         .unwrap_or(serde_json::Value::Null),
                     "present": true,
@@ -378,6 +391,68 @@ mod tests {
         assert_eq!(e["txid"], "markerTx1");
         assert_eq!(e["sigHex"], hex::encode(golden_sig()));
         assert_eq!(e["present"], true);
+    }
+
+    /// bsv-low #492/#512, loop 25 I5: a `collectedFor` entry carries the row's
+    /// `payTxid`, so a client can rebuild the v2 held filing's `heldChallenge`
+    /// and verify it under its own identity. A HELD filing's row names its
+    /// paying txid; a v1 marker and an absent gameId name none (null). ADDITIVE
+    /// Every other field is unchanged.
+    #[tokio::test]
+    async fn collected_for_carries_pay_txid_for_held_and_null_otherwise() {
+        let (svc, storage) = make_service_with_storage();
+        let id = golden_identity_hex();
+        let held_game = "11".repeat(32);
+        let v1_game = "22".repeat(32);
+        let pay = "66".repeat(32);
+
+        // A v2 HELD filing row (as the app-layer filing door writes it): it
+        // names its paying txid.
+        storage
+            .store_record(&CollectedRecord {
+                identity: id.clone(),
+                game_id: held_game.clone(),
+                txid: "filed:held".into(),
+                output_index: 0,
+                sig_hex: Some("3045abcd".into()),
+                pay_txid: Some(pay.clone()),
+            })
+            .await
+            .unwrap();
+        // A v1 marker row: no paying txid.
+        storage
+            .store_record(&CollectedRecord {
+                identity: id.clone(),
+                game_id: v1_game.clone(),
+                txid: "txV1".into(),
+                output_index: 0,
+                sig_hex: Some("3045ef01".into()),
+                pay_txid: None,
+            })
+            .await
+            .unwrap();
+
+        // Ask for the held game, the v1 game, and an ABSENT game.
+        let absent = "33".repeat(32);
+        let arr = collected_for(&svc, &id, serde_json::json!([held_game, v1_game, absent])).await;
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+
+        // The held row carries its payTxid, so the client can rebuild the v2
+        // heldChallenge and verify the filing.
+        assert_eq!(arr[0]["gameId"], held_game);
+        assert_eq!(arr[0]["present"], true);
+        assert_eq!(arr[0]["payTxid"], pay);
+
+        // The v1 row names no paying txid.
+        assert_eq!(arr[1]["gameId"], v1_game);
+        assert_eq!(arr[1]["present"], true);
+        assert!(arr[1]["payTxid"].is_null(), "a v1 marker serves no payTxid");
+
+        // An absent gameId also serves a null payTxid (fail-safe shape).
+        assert_eq!(arr[2]["gameId"], absent);
+        assert_eq!(arr[2]["present"], false);
+        assert!(arr[2]["payTxid"].is_null());
     }
 
     // ── Input ordering + the absent shape ─────────────────────────────────
