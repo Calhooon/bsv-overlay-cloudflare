@@ -5215,6 +5215,7 @@ impl Engine {
             let mut memo_folded = 0;
             let mut unanchorable_graphs: u64 = 0;
             let mut unanchorable_cleared: u64 = 0;
+            let mut absent_struck: u64 = 0;
             let mut strikes_refused: u64 = 0;
             let mut backed_off_graphs: u64 = 0;
             let mut waiting_graphs: u64 = 0;
@@ -5705,6 +5706,7 @@ impl Engine {
                     memo_folded += sync.memo_folded();
                     unanchorable_graphs += sync.unanchorable_recorded();
                     unanchorable_cleared += sync.unanchorable_cleared();
+                    absent_struck += sync.absent_struck();
                     // Engine 0.1.10: a strike not written is a fact.
                     strikes_refused += sync.strikes_refused();
                     faulted_roots.extend(sync.faulted_roots().into_iter().map(|mut f| {
@@ -5799,6 +5801,7 @@ impl Engine {
                     memo_folded,
                     unanchorable_graphs,
                     unanchorable_cleared,
+                    absent_struck,
                     strikes_refused,
                     faulted_roots,
                 },
@@ -5817,6 +5820,10 @@ impl Engine {
         let unanchorable: u64 = topics_synced.values().map(|r| r.unanchorable_graphs).sum();
         if unanchorable > 0 {
             info!("[GASP SYNC] gaspUnanchorable={unanchorable}");
+        }
+        let absent: u64 = topics_synced.values().map(|r| r.absent_struck).sum();
+        if absent > 0 {
+            info!("[GASP SYNC] gaspAbsentStruck={absent}");
         }
         let refused: u64 = topics_synced.values().map(|r| r.strikes_refused).sum();
         if refused > 0 {
@@ -6522,6 +6529,13 @@ pub struct TopicSyncResult {
     /// `gasp::UNANCHORABLE_RETRY_SECS`. Nothing of them is admitted.
     #[serde(default)]
     pub unanchorable_graphs: u64,
+    /// Roots struck `unanchorable:not_found` in this sync (engine 0.1.15,
+    /// `GASPSync::absent_struck`): the advertising peer said it does not
+    /// hold the root, or a transaction an unproven node of its graph needs,
+    /// on `gasp::UNANCHORABLE_AFTER_FAULTED_RUNS` runs at least
+    /// `gasp::ABSENCE_GAP_SECS` apart. Counted in `unanchorable_graphs` too.
+    #[serde(default)]
+    pub absent_struck: u64,
     /// Roots with a fault record that this sync walked again and admitted,
     /// or refused on a verdict: their record cleared (engine 0.1.9).
     #[serde(default)]
@@ -9136,6 +9150,7 @@ mod tests {
                 memo_folded: 0,
                 unanchorable_graphs: 0,
                 unanchorable_cleared: 0,
+                absent_struck: 0,
                 strikes_refused: 0,
                 faulted_roots: Vec::new(),
             },
@@ -9227,6 +9242,8 @@ mod tests {
         slow_once: std::rc::Rc<std::cell::RefCell<Option<(String, u64)>>>,
         /// Node requests answered, by txid.
         asked: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        /// Txids answered with a transport fault (a 503), not `NodeNotFound`.
+        faults_for: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     }
 
     #[async_trait(?Send)]
@@ -9274,6 +9291,9 @@ mod tests {
             };
             if let Some(ms) = slow {
                 self.elapsed.set(self.elapsed.get() + ms);
+            }
+            if self.faults_for.borrow().contains(txid) {
+                return Err(crate::gasp::GASPError::RemoteError("HTTP 503".into()));
             }
             if self.node_cost_ms > 0 {
                 let mut yielded = false;
@@ -9352,6 +9372,7 @@ mod tests {
             node_cost_ms: 5000,
             slow_once: std::rc::Rc::default(),
             asked: std::rc::Rc::default(),
+            faults_for: std::rc::Rc::default(),
         };
         (engine, remote)
     }
@@ -9590,6 +9611,16 @@ mod tests {
     async fn sync_budget_deferred_root_resumes_when_own_proof_becomes_available() {
         let (mut engine, mut remote) = budget_page_engine(1);
         let txid = remote.outputs[0].txid.clone();
+        // Engine 0.1.15: the peer is asked for the parent the fetcher cannot
+        // serve. This witness's subject is a paid walk kept as a deferral,
+        // so the peer answers that parent with a transport fault (#56).
+        let parent = bsv_rs::transaction::Transaction::from_hex(&remote.nodes[&txid].raw_tx)
+            .unwrap()
+            .inputs[0]
+            .source_txid
+            .clone()
+            .unwrap();
+        remote.faults_for.borrow_mut().insert(parent);
         let proof = remote.nodes[&txid].proof.clone().unwrap();
         std::rc::Rc::make_mut(&mut remote.nodes)
             .get_mut(&txid)
@@ -9813,7 +9844,20 @@ mod tests {
         engine.set_gasp_remote_factory(Box::new(remote.clone()));
         let host = crate::gasp::peer_origin("https://budget.example");
         let runs = crate::gasp::PEER_QUARANTINE_THRESHOLD + 1;
+        let gap = format!("{}.0", remote.outputs[0].txid);
         for run in 1..=runs {
+            // Engine 0.1.15: the gap root is absence (`not_found`), counted
+            // on runs at least ABSENCE_GAP_SECS apart; these runs follow at
+            // once, so the gap is passed by hand (#56).
+            if let Some(mut record) = store
+                .get_deferred_graph("https://budget.example", "tm_test", &gap)
+                .await
+                .unwrap()
+                .filter(|r| r.reason.starts_with("retry:fault:"))
+            {
+                record.retry_at = 0;
+                store.put_deferred_graph(&record).await.unwrap();
+            }
             let asked = remote.asked.borrow().len();
             let result = engine.start_gasp_sync().await.unwrap();
             let topic = &result.topics_synced["tm_test"];
@@ -9821,8 +9865,8 @@ mod tests {
             assert_eq!(topic.deadline_dropped_graphs, 1, "run {run}");
             assert!(topic.expired_refused > 0, "run {run}: {topic:?}");
             // 0.1.9: the gap is a root the peer lists and does not serve
-            // (`not_served`); its third faulted run records it unanchorable
-            // and the cursor passes it.
+            // (`not_found` since 0.1.15, `not_served` before); its third
+            // faulted run records it unanchorable and the cursor passes it.
             if run < u64::from(crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS) {
                 assert!(topic.cursor_moves.is_empty(), "run {run}: the gap holds");
             } else if run == u64::from(crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS) {
@@ -9893,19 +9937,36 @@ mod tests {
                 calls: std::rc::Rc::new(Cell::new(0)),
                 bounded: false,
             }));
-        let result = fixture.engine.start_gasp_sync().await.unwrap();
-        let topic = &result.topics_synced["tm_test"];
-        assert_eq!((topic.unanchorable_graphs, topic.finalized_graphs), (1, 1));
-        let record = fixture
-            .store
-            .get_deferred_graph("https://budget.example", "tm_test", &fixture.obligations[0])
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (record.reason.as_str(), record.faults),
-            ("unanchorable:not_found", 1)
-        );
+        // Engine 0.1.15 (#56): the rungs' absence counts one run, never a
+        // strike by itself (it struck at once on 0.1.12 to 0.1.14); three
+        // runs with a gap strike it. The obligation stays passable.
+        let host = "https://budget.example";
+        let runs = crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS;
+        for run in 1..=runs {
+            let result = fixture.engine.start_gasp_sync().await.unwrap();
+            let topic = &result.topics_synced["tm_test"];
+            let record = fixture
+                .store
+                .get_deferred_graph(host, "tm_test", &fixture.obligations[0])
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.faults, run);
+            assert!(record.cursor_passable);
+            if run == 1 {
+                assert_eq!(topic.finalized_graphs, 1);
+            }
+            if run < runs {
+                assert_eq!(topic.unanchorable_graphs, 0);
+                assert_eq!(record.reason, "retry:fault:not_found");
+                let mut record = record;
+                record.retry_at = 0;
+                fixture.store.put_deferred_graph(&record).await.unwrap();
+            } else {
+                assert_eq!(topic.unanchorable_graphs, 1);
+                assert_eq!(record.reason, "unanchorable:not_found");
+            }
+        }
     }
 
     #[tokio::test]
@@ -10037,7 +10098,9 @@ mod tests {
         assert_eq!(result.cost.courier_not_found_memo_hits, 3);
         assert_eq!(result.cost.courier_rungs, 3);
         for (topic, res) in &result.topics_synced {
-            assert_eq!(res.unanchorable_graphs, 2, "{res:?}");
+            // Engine 0.1.15 (#56): the rungs' absence counts one run on each
+            // (peer, topic), not a strike (2 unanchorable on 0.1.12 to 0.1.14).
+            assert_eq!(res.unanchorable_graphs, 0, "{res:?}");
             assert_eq!(
                 res.cost.courier_rungs + res.cost.peer_requests,
                 res.cost.calls_out
@@ -10049,9 +10112,9 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(record.reason, "unanchorable:not_found");
+                assert_eq!(record.reason, "retry:fault:not_found");
                 assert_eq!(record.faults, 1);
-                assert!(record.cursor_passable);
+                assert!(!record.cursor_passable);
                 record.retry_at = 0;
                 engine.storage.put_deferred_graph(&record).await.unwrap();
             }
@@ -10269,6 +10332,11 @@ mod tests {
                 inputs: None,
             },
         );
+        // Engine 0.1.15: the peer is asked for an input the courier cannot
+        // serve. This fixture's subject is the courier's fault, so its peer
+        // answers that input with a transport fault, which counts nothing
+        // (#56); the absence witnesses clear it to hear the peer's word.
+        remote.faults_for.borrow_mut().insert(parent.id());
         let serve = std::rc::Rc::new(Cell::new(false));
         let asked = std::rc::Rc::new(Cell::new(0));
         engine.set_gasp_ancestor_fetcher(std::rc::Rc::new(GatedCourier {
@@ -10417,9 +10485,40 @@ mod tests {
     async fn unanchorable_019_only_the_lowest_faulted_root_is_recorded_and_all_are_named() {
         let (mut engine, mut remote) = budget_page_engine(4);
         remote.node_cost_ms = 0;
-        let nodes = std::rc::Rc::make_mut(&mut remote.nodes);
-        nodes.remove(&remote.outputs[1].txid);
-        nodes.remove(&remote.outputs[3].txid);
+        // Engine 0.1.15 (#56): a root the peer does not hold is absence,
+        // which counts on every root of a run (the 0.1.12 rule of the
+        // rungs' absence, now the peers'). This witness's subject is D-M1
+        // for the other striking classes, so its two faulting roots are
+        // served unproven over a parent the courier cannot serve and the
+        // peer answers with a transport fault (`courier`); on 0.1.9 to
+        // 0.1.14 the peer did not hold them (`not_served`).
+        for idx in [1usize, 3] {
+            let parent = child_of(&format!("{:064x}", 0xdead_0000 + idx), 0);
+            let child = child_of(&parent.id(), 0);
+            let old = std::mem::replace(
+                &mut std::rc::Rc::make_mut(&mut remote.outputs)[idx].txid,
+                child.id(),
+            );
+            let nodes = std::rc::Rc::make_mut(&mut remote.nodes);
+            nodes.remove(&old);
+            nodes.insert(
+                child.id(),
+                crate::types::GASPNode {
+                    graph_id: String::new(),
+                    raw_tx: child.to_hex(),
+                    output_index: 0,
+                    proof: None,
+                    tx_metadata: None,
+                    output_metadata: None,
+                    inputs: None,
+                },
+            );
+            remote.faults_for.borrow_mut().insert(parent.id());
+        }
+        engine.set_gasp_ancestor_fetcher(std::rc::Rc::new(ExhaustedCourier {
+            asked: std::rc::Rc::default(),
+            transient: std::rc::Rc::default(),
+        }));
         let store = std::rc::Rc::new(MemoryStorage::new());
         engine.storage = Box::new(store.clone());
         virtual_peer_budget(&mut engine, &remote);
@@ -10441,8 +10540,8 @@ mod tests {
         assert_eq!(
             named,
             vec![
-                (low.as_str(), crate::gasp::fault_class::NOT_SERVED, 1),
-                (high.as_str(), crate::gasp::fault_class::NOT_SERVED, 0),
+                (low.as_str(), crate::gasp::fault_class::COURIER, 1),
+                (high.as_str(), crate::gasp::fault_class::COURIER, 0),
             ]
         );
         assert_eq!(topic.cursor_moves[0].to, 10, "below the lower gap");
@@ -10459,7 +10558,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .reason,
-            "retry:fault:not_served"
+            "retry:fault:courier"
         );
     }
 
@@ -10833,6 +10932,11 @@ mod tests {
         for n in 0..count {
             let parent = child_of(&format!("{:064x}", 0xbeef_0000 + n), 0);
             let child = child_of(&parent.id(), 0);
+            // Engine 0.1.15: the peer is asked for an input the courier
+            // cannot serve. This fixture's subject is the courier, so its
+            // peer answers the parent with a transport fault, which counts
+            // nothing (#56).
+            remote.faults_for.borrow_mut().insert(parent.id());
             nodes.insert(
                 child.id(),
                 crate::types::GASPNode {
@@ -11096,12 +11200,15 @@ mod tests {
         assert!(topic.errors.is_empty(), "inside the slice: {topic:?}");
         assert_eq!(topic.finalized_graphs, 12, "the page's share: {topic:?}");
         assert_eq!(topic.cursor_moves[0].to, 120);
-        // Six resumes struck; the seventh cut in flight by the share, having
+        // Three resumes struck; the fourth cut in flight by the share, having
         // asked and appended nothing (counted idle and stalled, as 0.1.10
-        // counts a deadline's cut); the other seven held back.
-        assert_eq!(topic.resumed_graphs, 7, "{topic:?}");
-        assert_eq!(topic.held_back_graphs, 7, "{topic:?}");
-        assert_eq!(topic.faulted_roots.len(), 6, "{topic:?}");
+        // counts a deadline's cut); the other ten held back. Engine 0.1.15:
+        // each resume asks the peer for the parent the courier cannot serve
+        // (#56), two requests of 1,500 ms, so the 9,900 ms share holds three
+        // (six on 0.1.11 to 0.1.14, one request each).
+        assert_eq!(topic.resumed_graphs, 4, "{topic:?}");
+        assert_eq!(topic.held_back_graphs, 10, "{topic:?}");
+        assert_eq!(topic.faulted_roots.len(), 3, "{topic:?}");
         assert_eq!((topic.stalled_graphs, topic.idle_counted), (1, 1));
         assert!(topic.cursor_held_by.is_empty());
         let host = "https://budget.example";
@@ -11123,8 +11230,8 @@ mod tests {
         assert_eq!(
             reasons,
             std::collections::BTreeMap::from([
-                ("retry".to_string(), 7),
-                ("retry:fault:courier".to_string(), 6),
+                ("retry".to_string(), 10),
+                ("retry:fault:courier".to_string(), 3),
                 ("time".to_string(), 1),
             ])
         );
@@ -13695,4 +13802,5 @@ mod tests {
     }
     include!("minutes_tests.rs");
     include!("memo_tests.rs");
+    include!("absence_tests.rs");
 }

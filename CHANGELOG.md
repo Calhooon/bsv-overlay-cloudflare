@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.1.15] - 2026-10-14
+
+- An absence is the peers' word, never an explorer's (#56). A peer's
+  `NodeNotFound` for a root it lists, or for a transaction an unproven node
+  of the root's graph needs, is the `not_found` class (it was `not_served`).
+  Three such runs at least `ABSENCE_GAP_SECS` (60 s) apart strike the root
+  `unanchorable:not_found`: passable, on the six-hour backoff, the four
+  bounded retries, dead and swept at the advert's expiry, as every strike.
+  A run inside the gap asks nothing and counts nothing; a transport fault, a
+  timeout, a 5xx or a disabled remote counts nothing.
+- The raw rungs fetch, never decide. All configured rungs answering absent
+  (`DefinitiveNotFound`) counts the same one run, never a strike by itself
+  (0.1.12 to 0.1.14 struck at once). An input of an unproven node the courier
+  cannot serve is asked of the peer, one request; with no rung configured
+  (`PROOF_SOURCES` unset) the peer was never asked before and such a root was
+  named `courier`. The D8 prune of a proven node's named inputs and a spent
+  courier budget are unchanged.
+- A peer's absence is remembered: an input it answered it does not hold is
+  not asked again in the sync, and a root inside its gap or backoff costs no
+  request. `SyncCost.peer_absent_memo_hits` counts both; topic results carry
+  `absent_struck`; invariants expose `gaspPeerAbsent24h` (`recorded`,
+  `struck`) from the fault memo; the tick lines name `absences_struck` and
+  `peer_absent_memo_hits`.
+
+DEPLOYMENT NOTE: no migration, var or pin. Fault memo rows written by 0.1.14
+read as they are: a `not_served` record keeps its class and count, a struck
+`unanchorable:not_found` keeps its verdict. A `retry:fault:not_found` row
+written by 0.1.15 carries its gap in `next_at`; a rollback to 0.1.14 leaves it
+out of the due read until then but walks it when its page lists it. Production with no rung configured reaches
+`unanchorable:not_found` on the advertising peer's word alone. Each walk of a
+graph whose unproven input the courier cannot serve now costs one more peer
+request (the 0.1.11 resume share holds fewer such resumes per pass).
+Constructors of `SyncCost` and `TopicSyncResult` gain one field each.
+
 ## [0.1.14] - 2026-10-14
 
 - Store GASP fault facts in `gasp_fault_memo`, separately from partial graphs.

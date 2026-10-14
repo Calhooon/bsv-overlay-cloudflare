@@ -20,13 +20,60 @@ fn memo_page(count: u32) -> (Engine, BudgetPageRemote, std::rc::Rc<MemoryStorage
     (engine, remote, store)
 }
 
+/// The gap between two counted absences passed by hand on every memo row
+/// still counting (an unanchorable row keeps its own backoff).
+async fn memo_gap_passes(store: &MemoryStorage) {
+    for memo in store.fault_memos() {
+        if memo.unanchorable || memo.dead {
+            continue;
+        }
+        let mut record = memo.into_record();
+        record.retry_at = 0;
+        store.put_deferred_graph(&record).await.unwrap();
+    }
+}
+
+/// Engine 0.1.15 (#56): absence strikes on three runs with a gap, so the
+/// forty pass on the third (on 0.1.14 the rungs' absence struck at once
+/// and they passed on one run, the name this witness had). Every run counts
+/// all forty, none is refused, and a run inside the gap spends no request.
 #[tokio::test]
-async fn memo_0114_forty_absent_roots_pass_in_one_run() {
+async fn memo_0114_forty_absent_roots_pass_on_three_runs_with_a_gap() {
     let (engine, remote, store) = memo_page(40);
+    // Run 1 counts all forty on the page; a run inside the gap asks nothing.
     let result = engine.start_gasp_sync().await.unwrap();
-    let topic = &result.topics_synced["tm_test"];
-    assert_eq!(topic.strikes_refused, 0, "{topic:?}");
-    assert_eq!(topic.unanchorable_graphs, 40);
+    assert_eq!(result.topics_synced["tm_test"].strikes_refused, 0);
+    assert_eq!(result.topics_synced["tm_test"].unanchorable_graphs, 0);
+    assert_eq!(store.fault_memos().len(), 40);
+    assert!(store.fault_memos().iter().all(|r| r.faults == 1));
+    let requests = remote.asked.borrow().len();
+    engine.start_gasp_sync().await.unwrap();
+    assert_eq!(
+        remote.asked.borrow().len(),
+        requests,
+        "a remembered absence inside its gap spends no node request"
+    );
+    // Later runs walk the due records ahead of the page under the resumes'
+    // shared allowance (100 calls), so a run counts what it reaches; none
+    // counts one root twice and none is refused.
+    let mut struck = 0;
+    for run in 2..=8 {
+        memo_gap_passes(&store).await;
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.strikes_refused, 0, "{topic:?}");
+        assert_eq!(topic.absent_struck, topic.unanchorable_graphs);
+        assert!(store
+            .fault_memos()
+            .iter()
+            .all(|r| r.faults <= crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS));
+        struck += topic.unanchorable_graphs;
+        if struck == 40 {
+            break;
+        }
+        assert!(run < 8, "struck {struck} of 40");
+    }
+    assert_eq!(store.fault_memos().len(), 40);
     assert_eq!(
         store
             .get_last_interaction("https://budget.example", "tm_test")
@@ -34,7 +81,6 @@ async fn memo_0114_forty_absent_roots_pass_in_one_run() {
             .unwrap(),
         400
     );
-    assert_eq!(store.fault_memos().len(), 40);
     assert!(store.deferred_graphs().is_empty());
     let requests = remote.asked.borrow().len();
     engine.start_gasp_sync().await.unwrap();
@@ -143,6 +189,8 @@ async fn memo_0114_full_partial_store_does_not_limit_fault_facts() {
     let (engine, _, store) = memo_page(40);
     store.set_deferred_graph_ceiling(Some(0));
     let result = engine.start_gasp_sync().await.unwrap();
-    assert_eq!(result.topics_synced["tm_test"].unanchorable_graphs, 40);
+    // Engine 0.1.15 (#56): one run counts forty absences, not forty strikes
+    // (`unanchorable_graphs` 40 on 0.1.14); the facts are the memo's.
+    assert_eq!(store.fault_memos().len(), 40);
     assert_eq!(result.topics_synced["tm_test"].strikes_refused, 0);
 }

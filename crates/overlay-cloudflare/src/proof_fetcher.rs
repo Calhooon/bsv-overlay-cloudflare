@@ -534,7 +534,11 @@ impl ChainProofFetcher {
     }
 
     /// Content-addressed raw bytes. Absence is definitive only when all three
-    /// enabled providers answer 404 or a recognized not-found body.
+    /// enabled providers answer 404 or a recognized not-found body. It counts
+    /// one run of absence beside the advertising peer's word and never
+    /// strikes a root by itself (engine 0.1.15, #56): a rung fetches, it
+    /// never decides. With no rung configured every source is skipped and
+    /// the answer is `NodeNotFound`, after which the walk asks the peer.
     pub(crate) async fn fetch_raw_hex(&self, txid: &str) -> Result<String, GASPError> {
         let bitails = format!("{}/download/tx/{}/hex", self.bitails_base, txid);
         let woc = format!("{}/tx/{}/hex", self.woc_base, txid);

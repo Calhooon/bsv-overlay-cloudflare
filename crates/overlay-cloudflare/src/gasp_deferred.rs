@@ -2026,6 +2026,7 @@ mod tests {
             memo_folded: 0,
             unanchorable_graphs: 0,
             unanchorable_cleared: 0,
+            absent_struck: 0,
             strikes_refused: 0,
             faulted_roots: Vec::new(),
         };
