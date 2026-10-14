@@ -653,6 +653,8 @@ pub mod memory {
     /// NOT suitable for production — no persistence, no concurrency beyond Mutex.
     #[derive(Debug, Default)]
     pub struct MemoryStorage {
+        #[cfg(test)]
+        admission_fault: Mutex<(Option<usize>, usize)>,
         /// outputs keyed by (txid, outputIndex, topic)
         outputs: Mutex<HashMap<(String, u32, String), Output>>,
         /// BEEF data keyed by txid
@@ -723,6 +725,21 @@ pub mod memory {
     type YieldStreakRow = (u64, u64, u64);
 
     impl MemoryStorage {
+        #[cfg(test)]
+        fn fault_write(&self, at: Option<usize>) {
+            *self.admission_fault.lock().unwrap() = (at, 0);
+        }
+
+        #[cfg(test)]
+        fn write_pin(&self) -> Result<(), StorageError> {
+            let mut fault = self.admission_fault.lock().unwrap();
+            fault.1 += 1;
+            if fault.0 == Some(fault.1) {
+                return Err(StorageError::Other("E657 injected write fault".into()));
+            }
+            Ok(())
+        }
+
         pub fn new() -> Self {
             Self::default()
         }
@@ -845,6 +862,8 @@ pub mod memory {
     #[async_trait(?Send)]
     impl Storage for MemoryStorage {
         async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
+            #[cfg(test)]
+            self.write_pin()?;
             let key = (
                 output.txid.clone(),
                 output.output_index,
@@ -889,6 +908,8 @@ pub mod memory {
             output_index: u32,
             topic: &str,
         ) -> Result<(), StorageError> {
+            #[cfg(test)]
+            self.write_pin()?;
             let key = (txid.to_string(), output_index, topic.to_string());
             let mut outputs = self.outputs.lock().unwrap();
             outputs.remove(&key);
@@ -909,6 +930,8 @@ pub mod memory {
             output_index: u32,
             topic: &str,
         ) -> Result<(), StorageError> {
+            #[cfg(test)]
+            self.write_pin()?;
             let key = (txid.to_string(), output_index, topic.to_string());
             if let Some(output) = self.outputs.lock().unwrap().get_mut(&key) {
                 output.spent = true;
@@ -923,6 +946,8 @@ pub mod memory {
             topic: &str,
             consumed_by: &[Outpoint],
         ) -> Result<(), StorageError> {
+            #[cfg(test)]
+            self.write_pin()?;
             let key = (txid.to_string(), output_index, topic.to_string());
             if let Some(output) = self.outputs.lock().unwrap().get_mut(&key) {
                 output.consumed_by = consumed_by.to_vec();
@@ -995,6 +1020,8 @@ pub mod memory {
             &self,
             tx: &AppliedTransaction,
         ) -> Result<(), StorageError> {
+            #[cfg(test)]
+            self.write_pin()?;
             self.applied
                 .lock()
                 .unwrap()

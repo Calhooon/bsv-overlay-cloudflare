@@ -298,3 +298,127 @@ async fn e657_same_bytes_same_word_after_refusal() {
         "both refusals must preserve every stored byte"
     );
 }
+
+// Test 3/11: exercise real engine writes, not a mock commit implementation.
+#[tokio::test]
+async fn a1_03_each_write_fault_rolls_back() {
+    for at in 1..=5 {
+        let (engine, store, index, beef, _) = fixture().await;
+        let before = snapshot(&store, &index);
+        store.fault_write(Some(at));
+        let _ = engine.submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv).await;
+        assert!(before == snapshot(&store, &index), "a1_03 write {at} left rows");
+    }
+}
+
+#[tokio::test]
+async fn a1_11_applied_row_fault_rolls_back() {
+    let (engine, store, index, mut beef, _) = fixture().await;
+    // The proof topic writes its output then its applied row.
+    beef.topics = vec![PROOF.into()];
+    let before = snapshot(&store, &index);
+    store.fault_write(Some(2));
+    let _ = engine.submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv).await;
+    assert!(before == snapshot(&store, &index), "a1_11 applied fault left output and index");
+}
+
+#[tokio::test]
+async fn a1_07_predecessor_commits_but_refused_successor_does_not() {
+    let (engine, store, index, mut beef, parent) = fixture().await;
+    // The fixture's proven previous coin is a separately landed unit.
+    let predecessor = store.find_output(&parent, 0, Some(REGISTRY), None, true).await.unwrap().unwrap();
+    let first = TaggedBEEF::new(predecessor.beef.clone().unwrap(), vec![REGISTRY.into()]);
+    engine.submit_with_report(&first, SubmitMode::HistoricalTxNoSpv).await.unwrap();
+    let before = snapshot(&store, &index);
+    beef.topics = vec![REGISTRY.into()];
+    let _ = engine.submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv).await;
+    assert!(before == snapshot(&store, &index), "a1_07 refused successor changed predecessor unit");
+}
+
+struct AwaitingLookup;
+#[async_trait(?Send)]
+impl LookupService for AwaitingLookup {
+    fn admission_mode(&self) -> AdmissionMode { AdmissionMode::LockingScript }
+    fn spend_notification_mode(&self) -> SpendNotificationMode { SpendNotificationMode::None }
+    async fn output_admitted_by_topic(&self, _: &OutputAdmittedByTopic) -> Result<(), LookupServiceError> {
+        // A real timer promise, not an already-ready async function.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        Ok(())
+    }
+    async fn output_evicted(&self, _: &str, _: u32) -> Result<(), LookupServiceError> { Ok(()) }
+    async fn lookup(&self, _: &LookupQuestion) -> Result<LookupResult, LookupServiceError> { Ok(LookupResult::OutputList(vec![])) }
+    async fn get_documentation(&self) -> String { String::new() }
+    async fn get_metadata(&self) -> ServiceMetadata { ServiceMetadata::default() }
+}
+
+#[tokio::test]
+async fn a1_27_real_promise_is_loud_and_rolls_back() {
+    let (_, store, index, mut beef, _) = fixture().await;
+    beef.topics = vec![PROOF.into()];
+    let engine = Engine::new(
+        HashMap::from([(PROOF.into(), Box::new(ProofManager) as Box<dyn TopicManager>)]),
+        HashMap::from([("awaiting".into(), Box::new(AwaitingLookup) as Box<dyn LookupService>)]),
+        Box::new(store.clone()), None, EngineConfig::default());
+    let before = snapshot(&store, &index);
+    let result = engine.submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv).await;
+    assert!(before == snapshot(&store, &index), "a1_27 awaited promise committed rows: {result:?}");
+}
+
+struct RetainManager;
+#[async_trait(?Send)]
+impl TopicManager for RetainManager {
+    async fn identify_admissible_outputs(&self, _: &Transaction, previous: &[u8], _: Option<&[u8]>, _: SubmitMode, _: &TopicAdmittanceContext) -> Result<AdmittanceInstructions, TopicManagerError> {
+        if previous.is_empty() { return Err(TopicManagerError::NoAdmissibleOutputs("coin already spent".into())); }
+        Ok(AdmittanceInstructions { outputs_to_admit: vec![0], coins_to_retain: vec![0], coins_removed: None })
+    }
+    async fn get_documentation(&self) -> String { String::new() }
+    async fn get_metadata(&self) -> ServiceMetadata { ServiceMetadata::default() }
+}
+
+#[tokio::test]
+async fn a1_05_two_spenders_judge_the_serial_store() {
+    let (_, store, _, mut first, _) = fixture().await;
+    first.topics = vec![REGISTRY.into()];
+    let mut tx = Transaction::from_beef(&first.beef, None).unwrap();
+    tx.lock_time += 1;
+    tx.invalidate_caches();
+    tx.merkle_path = Some(MerklePath::new(100, vec![vec![MerklePathLeaf::new_txid(0, tx.id())]]).unwrap());
+    let second = TaggedBEEF::new(tx.to_beef(false).unwrap(), first.topics.clone());
+    let engine = Engine::new(
+        HashMap::from([(REGISTRY.into(), Box::new(RetainManager) as Box<dyn TopicManager>)]),
+        HashMap::new(), Box::new(store.clone()), None, EngineConfig::default());
+    let (a, b) = tokio::join!(
+        engine.submit_with_report(&first, SubmitMode::HistoricalTxNoSpv),
+        engine.submit_with_report(&second, SubmitMode::HistoricalTxNoSpv));
+    let landed = [a, b].into_iter().filter(|r| r.as_ref().is_ok_and(|(_, report)| !report.applied_topics.is_empty())).count();
+    assert_eq!(landed, 1, "a1_05 both spends admitted against one retained coin");
+}
+
+struct ReadEmitLookup { store: Rc<MemoryStorage>, sent: Index }
+#[async_trait(?Send)]
+impl LookupService for ReadEmitLookup {
+    fn admission_mode(&self) -> AdmissionMode { AdmissionMode::LockingScript }
+    fn spend_notification_mode(&self) -> SpendNotificationMode { SpendNotificationMode::None }
+    async fn output_admitted_by_topic(&self, payload: &OutputAdmittedByTopic) -> Result<(), LookupServiceError> {
+        let OutputAdmittedByTopic::LockingScript { txid, output_index, topic, .. } = payload else { unreachable!() };
+        assert!(self.store.find_output(txid, *output_index, Some(topic), None, false).await.unwrap().is_some(), "service must read its unit's inserted row");
+        self.sent.lock().unwrap().insert((txid.clone(), *output_index, topic.clone()), 1);
+        Ok(())
+    }
+    async fn output_evicted(&self, _: &str, _: u32) -> Result<(), LookupServiceError> { Ok(()) }
+    async fn lookup(&self, _: &LookupQuestion) -> Result<LookupResult, LookupServiceError> { Ok(LookupResult::OutputList(vec![])) }
+    async fn get_documentation(&self) -> String { String::new() }
+    async fn get_metadata(&self) -> ServiceMetadata { ServiceMetadata::default() }
+}
+
+#[tokio::test]
+async fn a1_13_read_own_write_stages_event_until_drain() {
+    let (_, store, sent, mut beef, _) = fixture().await;
+    beef.topics = vec![PROOF.into()];
+    let engine = Engine::new(
+        HashMap::from([(PROOF.into(), Box::new(ProofManager) as Box<dyn TopicManager>)]),
+        HashMap::from([("read_emit".into(), Box::new(ReadEmitLookup { store: store.clone(), sent: sent.clone() }) as Box<dyn LookupService>)]),
+        Box::new(store), None, EngineConfig::default());
+    engine.submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv).await.unwrap();
+    assert!(sent.lock().unwrap().is_empty(), "a1_13 event escaped before outbox drain");
+}
