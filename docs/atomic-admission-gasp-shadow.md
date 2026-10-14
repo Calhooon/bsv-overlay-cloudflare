@@ -146,7 +146,7 @@ The lens corrections' witnesses, each RED on the commit before its fix:
 
 | witness | RED | green |
 | --- | --- | --- |
-| `make gasp-shadow-size` (`scripts/check-gasp-shadow-size.sh`), MEDIUM 1 | on `8b9e6ca`: `A1 9d5a75a 8963976 B; this tree, feature off, 9401531 B (delta 437555 B)`; the off Worker links `gasp_shadow` (69 names), `admit_graph` (3), `judge_dry` (1), `walk_with_mode` (1) | `A1 9d5a75a 8963951 B; this tree, feature off, 8963657 B (delta -294 B)`; none of the four names; feature on 9,436,171 B (+472,220), 76 `gasp_shadow` names |
+| `make gasp-shadow-size` (`scripts/check-gasp-shadow-size.sh`), MEDIUM 1 | on `8b9e6ca`: `A1 9d5a75a 8963976 B; this tree, feature off, 9401531 B (delta 437555 B)`; the off Worker links `gasp_shadow` (69 names), `admit_graph` (3), `judge_dry` (1), `walk_with_mode` (1) | on the tip: `A1 9d5a75a 8963951 B; this tree, feature off, 8963375 B (delta -576 B)`; none of the four names; feature on 9,405,638 B (+441,687), 100 `gasp_shadow` names (on `12ad069`, the fix alone: off -294 B, on +472,220) |
 | w2b a manager error at the finalize, MEDIUM 2 | on `12ad069`: the erring body `served=200 shadow=200 delta=Same`, its word `{"faults":[],"refused":[],"steak":{…}}`: `left: Null right: Array []` | the row `words`: served `not_landed` "the topic manager failed on it", both sides `manager_errors` ["topic_manager.tm_shadow: invalid script: the finalize refuses this body"], `applied_topics` and `deduped_topics` `[]`; the served graph 503 carrying `c`'s whole word |
 | w2c D1 and D2 apart, MEDIUM 3 | on `ec192a9`: `D2 erring=0: served {"landed":[],…} left: String("materialization") right: String("rows_differ")` | D1 `materialization` (the rows agree); D2 `rows_differ` with the manager erring on either parent (20 runs, both sibling orders): A lands `a`, `b` and `r`, the served finalize never lands `r` |
 | w5c the drain after every served write of the sync, LOW 4 | on `05cb0b3`: `tick 0 budgeted=false: a served call after the census began (line 90): store.peer_outcome shadow-peer tm_shadow true` | every census line after the sync's last served call |
@@ -211,15 +211,15 @@ Re-run on `lane/atomic-gasp-shadow-2` after the lens's corrections:
   | --- | --- | --- | --- | --- |
   | A1 `9d5a75a` | 8,963,951 B | | 6,675,687 B | |
   | the PR at `8b9e6ca` | 9,401,531 B | +437,555 | | |
-  | feature off (this branch) | 8,963,657 B | **-294** | 6,675,401 B | **-286** |
-  | feature on (this branch) | 9,436,171 B | +472,220 | 7,015,838 B | +340,151 |
+  | feature off (this branch) | 8,963,375 B | **-576** | 6,675,401 B | **-286** |
+  | feature on (this branch) | 9,405,638 B | +441,687 | 7,015,838 B | +340,151 |
 
   The lens measured A1 8,978,547 B and the PR 9,458,459 B raw without the
   remap, on other paths (+479,912); the PR's own record measured the deployed
   `low-overlay` at 6,660,132 B (A1) and 7,045,776 B (+385,644) on another
   checkout. The feature-off build carries none of `gasp_shadow`,
   `admit_graph`, `judge_dry` or `walk_with_mode` (A1's carries none either);
-  the feature-on build carries 76 `gasp_shadow` names. Without the feature
+  the feature-on build carries 100 `gasp_shadow` names. Without the feature
   the engine source differs from A1's in `admission.rs`'s observer
   (`admit_graph_observed`, unreachable from a Worker), one `match &outcome`
   in the finalize loop and `judge` binding its answer before returning it.
