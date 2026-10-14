@@ -310,13 +310,26 @@ pub fn admit_graph(
     runner: &dyn UnitRunner,
     graph: &[Walked],
 ) -> GraphOutcome {
+    admit_graph_observed(engine, runner, graph, &mut |_, _| {})
+}
+
+/// [`admit_graph`], handing each body's unit answer to `observe` as it is
+/// given (the GASP shadow words each body it ran; bsv-low #657, R7.7 item 5).
+pub fn admit_graph_observed(
+    engine: &crate::engine::Engine,
+    runner: &dyn UnitRunner,
+    graph: &[Walked],
+    observe: &mut dyn FnMut(&Walked, &Result<Committed, AdmitRefusal>),
+) -> GraphOutcome {
     let mut seqs = Vec::new();
     for walked in graph {
-        match runner.run_unit(
+        let answer = runner.run_unit(
             UnitKind::Admit,
             &walked.evidence,
             Box::pin(async { engine.admit(walked).await.map(UnitOutput::Admitted) }),
-        ) {
+        );
+        observe(walked, &answer);
+        match answer {
             Ok(committed) => seqs.push(committed.seq),
             Err(refusal) => {
                 return GraphOutcome::StoppedAt {

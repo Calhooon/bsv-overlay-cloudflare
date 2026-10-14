@@ -228,24 +228,24 @@ async fn w1_each_finalized_body_has_one_census_row_with_the_shadows_answer_besid
         print_census(&format!("W1 budgeted={budgeted}"), &shadow);
         let id = |i: usize| scenario.txs[i].id();
         // Tick 0: [parent, left], [parent, right] (the parent a duplicate
-        // body), [lone], [low, high]; the blip held. Tick 1: [blip].
+        // body: both graphs are walked before either is submitted),
+        // [lone], [low, high]; the blip held. Tick 1: [blip]. Under a
+        // per-peer budget each graph is submitted as it finalizes, so the
+        // parent is held when the second graph is walked and is stripped.
+        let mut expected = vec![(id(0), 0), (id(1), 1)];
+        if budgeted {
+            expected.push((id(2), 0));
+        } else {
+            expected.extend([(id(0), 0), (id(2), 1)]);
+        }
+        expected.extend([(id(3), 0), (id(5), 0), (id(6), 1), (id(4), 0)]);
         let bodies: Vec<_> = shadow
             .of(ShadowKind::Body)
             .iter()
             .map(|r| (r.txid.clone(), r.position))
             .collect();
         assert_eq!(
-            bodies,
-            vec![
-                (id(0), 0),
-                (id(1), 1),
-                (id(0), 0),
-                (id(2), 1),
-                (id(3), 0),
-                (id(5), 0),
-                (id(6), 1),
-                (id(4), 0),
-            ],
+            bodies, expected,
             "the census holds one row per finalized body, in the served order"
         );
         for row in shadow.of(ShadowKind::Body) {
@@ -266,12 +266,14 @@ async fn w1_each_finalized_body_has_one_census_row_with_the_shadows_answer_besid
             assert_eq!(evidence.walk, WalkOutcome::HistoricalTxNoSpv);
             assert!(evidence.network.is_none() && evidence.proof.is_none());
         }
-        // The duplicate body: the served dedup and A's dedup, the same word.
-        let dupe = &shadow.of(ShadowKind::Body)[2];
-        assert_eq!(dupe.served, dupe.shadow);
-        assert!(String::from_utf8_lossy(&dupe.served.bytes).contains("outputsToAdmit\":[]"));
+        if !budgeted {
+            // The duplicate body: the served dedup and A's dedup, one word.
+            let dupe = &shadow.of(ShadowKind::Body)[2];
+            assert_eq!(dupe.served, dupe.shadow);
+            assert!(String::from_utf8_lossy(&dupe.served.bytes).contains("outputsToAdmit\":[]"));
+        }
         // One snapshot per body and one per graph, and no other.
-        assert_eq!(shadow.snapshots, 8 + 5);
+        assert_eq!(shadow.snapshots, expected.len() + 5);
     }
 }
 

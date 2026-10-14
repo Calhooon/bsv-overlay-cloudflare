@@ -94,6 +94,9 @@ pub struct ShadowScope<'a> {
     pub beefs: &'a [Vec<u8>],
 }
 
+/// Hands a host-resolved R2 BEEF's original bytes to a snapshot's store.
+pub type ResolveBeef = Box<dyn Fn(&BeefCarry, Vec<u8>) -> Result<(), AdmitRefusal>>;
+
 /// A disposable engine over an isolated copy of the served store, as it stood
 /// when the snapshot was taken. Its storage is the runner's (each unit runs
 /// inside it); it holds no tracker, broadcaster, fetcher or peer factory, so
@@ -102,7 +105,7 @@ pub struct ShadowSnapshot {
     pub engine: Engine,
     pub runner: Rc<dyn UnitRunner>,
     /// Hands a resolved R2 BEEF to the snapshot's store before its unit.
-    pub resolve: Box<dyn Fn(&BeefCarry, Vec<u8>) -> Result<(), AdmitRefusal>>,
+    pub resolve: ResolveBeef,
     pub rows: usize,
     pub bytes: usize,
 }
@@ -326,7 +329,6 @@ pub fn judgement_of(steak: &Steak) -> Judgement {
 #[cfg(feature = "memory-storage")]
 pub struct MemoryGaspShadow {
     served: Rc<crate::storage::memory::MemoryStorage>,
-    #[allow(clippy::type_complexity)]
     build: Box<dyn Fn(Rc<crate::storage::memory::MemoryStorage>) -> Engine>,
     clock: Rc<dyn Fn() -> u64>,
     census: std::cell::RefCell<Vec<GaspCensusRow>>,
