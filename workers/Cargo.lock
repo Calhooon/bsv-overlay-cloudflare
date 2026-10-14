@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-low-proof-replay"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bsv-low-core",
  "bsv-low-wire",
@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-overlay-cloudflare"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-overlay-discovery"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-overlay-engine"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "bsv-rs",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-worker-build-info"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde_json",
 ]
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "low-app-layer"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64",
