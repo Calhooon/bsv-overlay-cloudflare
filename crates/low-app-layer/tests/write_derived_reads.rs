@@ -173,3 +173,54 @@ fn populated_backfills_are_byte_identical_to_source_triggers() {
         seats.len()
     );
 }
+
+/// bsv-low #662: the withheld-payout read is the identity's own rows by their primary key, never a SCAN of
+/// `owed_rows` (the fleet's table); the JSON array of outpoints is the only scanned source.
+#[test]
+fn the_withheld_payouts_read_searches_owed_rows_by_its_primary_key() {
+    let db = Connection::open_in_memory().unwrap();
+    for sql in OVERLAY_MIGRATIONS {
+        if let Err(e) = db.execute_batch(sql) {
+            assert!(e.to_string().contains("duplicate column"), "{e}: {sql}");
+        }
+    }
+    let query = format!(
+        "EXPLAIN QUERY PLAN {}",
+        low_app_layer::owed::OWED_WITHHELD_PREVIOUS_SQL
+    );
+    let mut stmt = db.prepare(&query).unwrap();
+    let details = stmt
+        .query_map(rusqlite::params!["me", r#"["aa:0","bb:1"]"#], |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    assert!(
+        details
+            .iter()
+            .any(|s| s.starts_with("SEARCH owed_rows USING")
+                && s.contains("identity=? AND outpoint=?")),
+        "{details:?}"
+    );
+    assert!(
+        !details.iter().any(|s| s.starts_with("SCAN owed_rows")),
+        "{details:?}"
+    );
+    db.execute_batch(
+        "INSERT INTO owed_rows (identity,outpoint,family,gameId,facts,updatedAtMs) VALUES
+         ('me','aa:0','payout','g','{}',1),('me','bb:1','unbound','g','{}',1),('you','aa:0','payout','g','{}',1);",
+    )
+    .unwrap();
+    let mut stmt = db
+        .prepare(low_app_layer::owed::OWED_WITHHELD_PREVIOUS_SQL)
+        .unwrap();
+    let got = stmt
+        .query_map(rusqlite::params!["me", r#"["aa:0","bb:1"]"#], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    assert_eq!(got, vec![("me".to_string(), "aa:0".to_string())]);
+}

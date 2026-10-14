@@ -1025,6 +1025,112 @@ pub fn markerless_should_carry(
             .is_some_and(|join| active.contains(join) && !selected.iter().any(|c| c.txid == join))
 }
 
+/// bsv-low #662: the previous snapshot's PAYOUT rows at the hop outpoints whose spender's bytes this pass WITHHELD
+/// (one statement, the identity's own rows by their primary key: `(identity, outpoint)`, at most one row an
+/// outpoint; the outpoints bound as one JSON array).
+pub const OWED_WITHHELD_PREVIOUS_SQL: &str = "SELECT identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason FROM owed_rows WHERE identity = ?1 AND outpoint IN (SELECT value FROM json_each(?2)) AND family = 'payout'";
+/// The row word of a payout kept from the previous snapshot because this pass could not look at its spender.
+pub const OWED_REFRESH_WITHHELD: &str = "withheld";
+
+/// PURE (bsv-low #662): the spender a hop's row is judged on (the index's recorded spend, else the chain rung's
+/// spent word), lowercase: the same name the route asks the spender's bytes of.
+fn hop_named_spender(i: &OwedInputs, h: &HopEntry) -> Option<String> {
+    if h.spent == Some(true) {
+        return h.spending_txid.as_deref().map(str::to_ascii_lowercase);
+    }
+    i.hop_chain
+        .get(&outpoint_key(&h.hop_txid, h.hop_vout))
+        .filter(|w| w.looked && w.spent == Some(true))
+        .and_then(|w| w.spending_txid.as_deref().map(str::to_ascii_lowercase))
+}
+
+/// PURE (bsv-low #662): the hop outpoints served `unbound` this pass ONLY because the spender's bytes were WITHHELD
+/// (a cap or the clock kept the look; `withheld` names the spenders never looked at, lowercase): the row has no
+/// bytes to judge from, and no read of this row faulted. A FAULTED read (a stored read or a courier ask that
+/// answered badly, a cached fault, the pot spenders' read) is never in `withheld` and keeps its fault row.
+pub fn withheld_hop_outpoints(
+    i: &OwedInputs,
+    rows: &[OwedRow],
+    withheld: &HashSet<String>,
+) -> Vec<String> {
+    if withheld.is_empty() || i.pot_spenders_faulted {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = i
+        .hops
+        .iter()
+        .filter_map(|h| {
+            let sp = hop_named_spender(i, h)?;
+            if !withheld.contains(&sp) || i.spender_outputs.contains_key(&sp) {
+                return None;
+            }
+            let key = outpoint_key(&h.hop_txid, h.hop_vout);
+            rows.iter()
+                .any(|r| r.outpoint == key && r.family == OwedFamily::Unbound)
+                .then_some(key)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// PURE (bsv-low #662): a judged courier-bytes payout does not flap to "could not judge" when a later pass's spender
+/// courier cap (or its clock) WITHHELD the sweep's bytes. The home walk's rule (`home_walk_pass`): a withheld look
+/// names nothing more than it did before, so the row stands. For each outpoint of [`withheld_hop_outpoints`], the
+/// identity's PREVIOUS row (`previous`: the row and its `updatedAtMs`) replaces this pass's `unbound` row when it
+/// was a courier-bytes payout of the SAME spender the hop still names, its game not retired by a verified
+/// `collected` filing nor its sweep by a held one. The kept row is the identity's own previous evidence, served as
+/// it was with `refresh: "withheld"` and `judgedAtMs` (the stamp of the pass that last read the bytes); it stays
+/// unclaimable (a courier-bytes payout always is), so the read's open-list rule re-judges it. Returns the count.
+pub fn keep_withheld_payouts(
+    i: &OwedInputs,
+    rows: &mut [OwedRow],
+    previous: &[(OwedRow, i64)],
+    withheld: &HashSet<String>,
+) -> usize {
+    let outpoints = withheld_hop_outpoints(i, rows, withheld);
+    let mut kept = 0;
+    for h in i.hops {
+        let key = outpoint_key(&h.hop_txid, h.hop_vout);
+        if !outpoints.contains(&key) {
+            continue;
+        }
+        let Some(sp) = hop_named_spender(i, h) else {
+            continue;
+        };
+        let Some((prev, updated_at_ms)) = previous.iter().find(|(p, _)| {
+            p.outpoint == key
+                && p.family == OwedFamily::Payout
+                && p.identity.eq_ignore_ascii_case(i.identity_lc)
+                && p.facts["creditKind"] == "courier-bytes"
+                && p.facts["sweepTxid"]
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&sp))
+        }) else {
+            continue;
+        };
+        let game = prev.game_id.to_ascii_lowercase();
+        if i.collected_verified.contains(&game) || i.held_verified.contains(&held_key(&game, &sp)) {
+            continue;
+        }
+        let Some(slot) = rows
+            .iter_mut()
+            .find(|r| r.outpoint == key && r.family == OwedFamily::Unbound)
+        else {
+            continue;
+        };
+        let mut row = prev.clone();
+        let judged_at = row.facts["judgedAtMs"].as_i64().unwrap_or(*updated_at_ms);
+        row.facts["claimable"] = json!(false);
+        row.facts["refresh"] = json!(OWED_REFRESH_WITHHELD);
+        row.facts["judgedAtMs"] = json!(judged_at);
+        *slot = row;
+        kept += 1;
+    }
+    kept
+}
+
 /// A count is progress, never a cut. Only known unheld tail evidence makes the list incomplete.
 pub fn markerless_tail_unheld(
     total: usize,
@@ -4200,6 +4306,154 @@ pub(crate) mod tests {
         let rows = derive_owed_rows(&i);
         assert_eq!(rows[0].facts["sweepSource"], "index-bytes");
         assert_eq!(rows[0].facts["claimable"], true);
+    }
+
+    /// bsv-low #662 (live 2026-10-14 00:35:35Z, pair 19, hop d4029675ccb65a4b:0, sweep 96448ef1fc3b): pass B judged
+    /// the swept hop a courier-bytes payout; pass C's spender courier cap WITHHELD the sweep's bytes and the row
+    /// flapped to `unbound`, "could not judge the spender". A withheld look names nothing more than it did before:
+    /// the previous row stands, marked `refresh: "withheld"`. A FAULTED read keeps the fault row.
+    #[test]
+    fn i662_a_withheld_spender_read_keeps_the_judged_courier_bytes_payout_a_faulted_one_does_not() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let my_pkh = "cc".repeat(20);
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        // the live shape: the index never held the hop's spend (swept around the overlay); the chain rung names the
+        // sweep, confirmed; the JOIN was evicted
+        let hops = [hop(
+            HopStatus::Unknown,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        let mut courier: HashSet<String> = HashSet::new();
+        courier.insert(sweep.clone());
+        let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends_it.insert(sweep.clone(), vec![(tx(0x07), 0)]);
+        let no_bytes: HashMap<String, Vec<SpenderOutput>> = HashMap::new();
+        let no_inputs: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        let none: HashSet<String> = HashSet::new();
+        // pass B: the courier's bytes in hand, the row judged
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &chain;
+        i.spender_outputs = &mine;
+        i.spender_inputs = &spends_it;
+        i.my_pkh_by_game = &pkhs;
+        i.courier_spenders = &courier;
+        let judged = derive_owed_rows(&i);
+        assert_eq!(judged.len(), 1);
+        assert_eq!(judged[0].outpoint, key);
+        assert_eq!(judged[0].family, OwedFamily::Payout);
+        assert_eq!(judged[0].facts["creditKind"], "courier-bytes");
+        let previous = vec![(judged[0].clone(), 1_791_937_805_199i64)];
+        // pass C: the same hop, the same spender named, its bytes WITHHELD by the courier cap
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &chain;
+        i.spender_outputs = &no_bytes;
+        i.spender_inputs = &no_inputs;
+        i.my_pkh_by_game = &pkhs;
+        let derived = derive_owed_rows(&i);
+        assert_eq!(derived[0].family, OwedFamily::Unbound);
+        assert!(derived[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("could not judge the spender"));
+        let mut withheld: HashSet<String> = HashSet::new();
+        withheld.insert(sweep.clone());
+        let mut rows = derived.clone();
+        assert_eq!(
+            keep_withheld_payouts(&i, &mut rows, &previous, &withheld),
+            1
+        );
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(
+            (r.family, r.sats, r.outpoint.as_str()),
+            (OwedFamily::Payout, Some(20_000), key.as_str()),
+            "a withheld read never turns a judged payout into could-not-judge: {r:?}"
+        );
+        assert_eq!(r.facts["creditKind"], "courier-bytes");
+        assert_eq!(r.facts["sweepTxid"], json!(sweep));
+        assert_eq!(r.facts["claimable"], false);
+        assert_eq!(r.facts["refresh"], OWED_REFRESH_WITHHELD);
+        assert_eq!(r.facts["judgedAtMs"], 1_791_937_805_199i64);
+        assert!(
+            row_is_open(r),
+            "the kept row is open: the read re-judges it"
+        );
+        // a second withheld pass keeps the FIRST judgement's stamp
+        let again = vec![(r.clone(), 1_791_938_135_277i64)];
+        let mut rows2 = derived.clone();
+        assert_eq!(keep_withheld_payouts(&i, &mut rows2, &again, &withheld), 1);
+        assert_eq!(rows2[0].facts["judgedAtMs"], 1_791_937_805_199i64);
+        // a FAULTED read (the spender looked at, the answer bad): never withheld, the fault row stands
+        let mut rows = derived.clone();
+        assert_eq!(keep_withheld_payouts(&i, &mut rows, &previous, &none), 0);
+        assert_eq!(rows, derived);
+        // the pot spenders' read faulted this pass: the fault row stands
+        let mut faulted = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        faulted.hop_chain = &chain;
+        faulted.spender_outputs = &no_bytes;
+        faulted.my_pkh_by_game = &pkhs;
+        faulted.pot_spenders_faulted = true;
+        let mut rows = derived.clone();
+        assert_eq!(
+            keep_withheld_payouts(&faulted, &mut rows, &previous, &withheld),
+            0
+        );
+        // the chain now names ANOTHER spender: the previous evidence is not about it
+        let other = tx(0x0f);
+        let chain_other = chain_confirmed(&key, true, Some(true), Some(&other), Some(true));
+        let mut i2 = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i2.hop_chain = &chain_other;
+        i2.spender_outputs = &no_bytes;
+        i2.my_pkh_by_game = &pkhs;
+        let derived_other = derive_owed_rows(&i2);
+        let mut rows = derived_other.clone();
+        let mut withheld_other: HashSet<String> = HashSet::new();
+        withheld_other.insert(other.clone());
+        assert_eq!(
+            keep_withheld_payouts(&i2, &mut rows, &previous, &withheld_other),
+            0
+        );
+        assert_eq!(rows, derived_other);
+        // the previous row was not a courier-bytes payout: nothing to keep
+        let mut index_bytes = judged[0].clone();
+        index_bytes.facts["creditKind"] = Value::Null;
+        let mut rows = derived.clone();
+        assert_eq!(
+            keep_withheld_payouts(&i, &mut rows, &[(index_bytes, 1)], &withheld),
+            0
+        );
+        // a verified `collected` filing retired the game since: the row is not brought back
+        let mut collected: HashSet<String> = HashSet::new();
+        collected.insert(tx(0x01));
+        let mut i3 = inputs(&[], &[], &hops, &v, &collected, &no_pots, Some(900_000));
+        i3.hop_chain = &chain;
+        i3.spender_outputs = &no_bytes;
+        i3.my_pkh_by_game = &pkhs;
+        let mut rows = derived.clone();
+        assert_eq!(
+            keep_withheld_payouts(&i3, &mut rows, &previous, &withheld),
+            0
+        );
+        // the bytes in hand this pass: the derivation judges, nothing is kept
+        let mut i4 = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i4.hop_chain = &chain;
+        i4.spender_outputs = &mine;
+        i4.spender_inputs = &spends_it;
+        i4.my_pkh_by_game = &pkhs;
+        i4.courier_spenders = &courier;
+        let mut rows = derive_owed_rows(&i4);
+        assert_eq!(
+            keep_withheld_payouts(&i4, &mut rows, &previous, &withheld),
+            0
+        );
+        assert!(rows[0].facts.get("refresh").is_none());
     }
 
     /// The gate's L1: a spend with a VERIFIED proof height is mined whatever `spentConfirmed` says — a verdict gap on

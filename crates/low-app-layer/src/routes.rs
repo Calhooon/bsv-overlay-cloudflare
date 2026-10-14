@@ -2640,6 +2640,8 @@ struct OwedRowD1 {
     at_height: Option<f64>,
     facts: String,
     reason: Option<String>,
+    #[serde(rename = "updatedAtMs", default)]
+    updated_at_ms: Option<f64>,
 }
 
 impl OwedRowD1 {
@@ -3895,6 +3897,10 @@ async fn owed_recompute_inner(
     // the spenders whose bytes the COURIERS supplied (the gate's M3): a real payout with no index proof to credit from
     let mut courier_spenders: HashSet<String> = HashSet::new();
     let mut courier_cap_hit = false;
+    // bsv-low #662: the spenders this pass LOOKED at (a read made, a memo or a cached answer used, faulted or not);
+    // the named spenders outside it were WITHHELD by a cap or the clock (never a fault)
+    let mut spenders_looked: HashSet<String> = HashSet::new();
+    let mut spenders_named: Vec<String> = Vec::new();
     {
         // the spenders, newest hop first (the marker's filing time), dedup'd, pots excluded
         let mut ordered: Vec<(i64, String)> = Vec::new();
@@ -3940,6 +3946,7 @@ async fn owed_recompute_inner(
             spent: Option<f64>,
         }
         // phase 1: the index's bytes (D1), a parsed courier memo, or the isolate's tx-any cache — no courier asked
+        spenders_named.extend(ordered.iter().map(|(_, sp)| sp.clone()));
         let mut wanted: Vec<String> = Vec::new();
         for (_at, sp) in ordered
             .into_iter()
@@ -3950,6 +3957,7 @@ async fn owed_recompute_inner(
                 break;
             }
             spender_reads += 1;
+            spenders_looked.insert(sp.clone());
             let bytes = match load_stored_beef(env, db, &sp).await {
                 Ok(Some(b)) => b,
                 Ok(None) => {
@@ -3971,6 +3979,7 @@ async fn owed_recompute_inner(
                         }
                         continue;
                     }
+                    spenders_looked.remove(&sp);
                     wanted.push(sp);
                     continue;
                 }
@@ -4014,6 +4023,7 @@ async fn owed_recompute_inner(
             // courier observation. A subject in hand never opens a read
             // ladder again, even after the isolate memo expired.
             if let Some(row) = word_rows.get(&sp) {
+                spenders_looked.insert(sp.clone());
                 let parsed = row
                     .legacy_body
                     .as_ref()
@@ -4035,6 +4045,7 @@ async fn owed_recompute_inner(
                 budget_cut = true;
                 break;
             }
+            spenders_looked.insert(sp.clone());
             let now_f = worker::Date::now().as_millis() as f64;
             // the round-3 LOW: another identity's recompute on this isolate (the in-flight lock is per identity;
             // a competitor JOIN spends BOTH seats' hops within ms) may have bought this spender since phase 1 —
@@ -4151,6 +4162,54 @@ async fn owed_recompute_inner(
         fault.facts["markerlessCursor"] = serde_json::json!(markerless_next);
     }
     crate::owed::merge_markerless_faults(&mut rows, markerless_fault_rows);
+    // bsv-low #662: a judged courier-bytes payout whose sweep's bytes this pass WITHHELD (the spender courier cap or
+    // the clock) keeps its previous row, marked `refresh: "withheld"`, never "could not judge"; a faulted read is
+    // never withheld and keeps its fault row. One PK read, made only when such a row exists.
+    let spenders_withheld: HashSet<String> = spenders_named
+        .into_iter()
+        .filter(|sp| !spenders_looked.contains(sp))
+        .collect();
+    let withheld_outpoints =
+        crate::owed::withheld_hop_outpoints(&inputs, &rows, &spenders_withheld);
+    if !withheld_outpoints.is_empty() {
+        let list = serde_json::Value::from(withheld_outpoints).to_string();
+        let previous = match db
+            .prepare(crate::owed::OWED_WITHHELD_PREVIOUS_SQL)
+            .bind(&[JsValue::from_str(identity_lc), JsValue::from_str(&list)])
+        {
+            Ok(stmt) => stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<OwedRowD1>())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match previous {
+            Ok(prev) => {
+                let prev: Vec<(crate::owed::OwedRow, i64)> = prev
+                    .into_iter()
+                    .filter_map(|p| {
+                        let at = p.updated_at_ms.unwrap_or(0.0) as i64;
+                        Some((p.into_row()?, at))
+                    })
+                    .collect();
+                let kept = crate::owed::keep_withheld_payouts(
+                    &inputs,
+                    &mut rows,
+                    &prev,
+                    &spenders_withheld,
+                );
+                if kept > 0 {
+                    worker::console_log!(
+                        "[owed] recompute {source} for {}…: {kept} judged courier-bytes payout(s) kept (the spender's bytes were withheld this pass)",
+                        &identity_lc[..12.min(identity_lc.len())]
+                    );
+                }
+            }
+            // the read faulted: this pass's rows stand as derived (the pre-#662 word), nothing invented
+            Err(e) => console_warn!("[owed] withheld payouts read failed: {e}"),
+        }
+    }
     let mut markerless_carried = 0;
     let current: HashSet<_> = rows.iter().map(|r| r.outpoint.clone()).collect();
     for mut r in markerless_previous {
