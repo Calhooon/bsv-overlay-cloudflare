@@ -1207,6 +1207,11 @@ pub trait GASPStorage {
         record: &DeferredGraph,
     ) -> Result<DeferredGraphSave, GASPError>;
 
+    /// Atomically claim the next retry. A storage without retry support declines.
+    async fn reserve_unanchorable_retry(&self, _record: &DeferredGraph) -> Result<bool, GASPError> {
+        Ok(false)
+    }
+
     /// Delete the record of the graph rooted at `outpoint`.
     async fn delete_deferred_graph(&self, outpoint: &str) -> Result<(), GASPError>;
 
@@ -2240,10 +2245,10 @@ impl<'a> GASPSync<'a> {
             // Reserve before dispatch: cancellation cannot buy another retry.
             record.unanchorable_retries += 1;
             record.retry_at = Self::now_secs() + UNANCHORABLE_RETRY_SECS;
-            if self.storage.save_deferred_graph(&record).await? != DeferredGraphSave::Saved {
-                return Err(GASPError::StorageError(
-                    "could not reserve unanchorable retry".into(),
-                ));
+            if !self.storage.reserve_unanchorable_retry(&record).await? {
+                self.graphs_attempted
+                    .set(self.graphs_attempted.get().saturating_sub(1));
+                return Ok(Ingested::Unanchorable);
             }
         }
         info!(

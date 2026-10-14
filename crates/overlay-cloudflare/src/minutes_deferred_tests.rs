@@ -64,3 +64,78 @@ fn minutes_0113_dead_and_swept_counters_are_additive() {
         ]
     );
 }
+
+#[test]
+fn minutes_0113_retry_claim_sql_is_atomic_bounded_and_time_gated() {
+    let db = sqlite();
+    let mut r = record("retry.0", 10, 0, 0);
+    r.reason = "unanchorable:courier".into();
+    r.cursor_passable = true;
+    r.retry_at = 0;
+    upsert(&db, &r);
+    db.execute(
+        "UPDATE gasp_deferred_graphs SET reason = ?1",
+        [retained_reason(&r)],
+    )
+    .unwrap();
+    let now: u64 = db
+        .query_row("SELECT unixepoch()", [], |row| row.get(0))
+        .unwrap();
+    let claim = |candidate: &overlay_engine::gasp::DeferredGraph, ceiling: u64| {
+        let json = serde_json::to_string(candidate).unwrap();
+        let mut statement = db.prepare(RESERVE_UNANCHORABLE_SQL).unwrap();
+        statement
+            .query_map(
+                rusqlite::params![
+                    candidate.peer,
+                    candidate.topic,
+                    candidate.outpoint,
+                    json,
+                    json.len(),
+                    retained_reason(candidate),
+                    candidate.score,
+                    candidate.unanchorable_retries - 1,
+                    ceiling,
+                    DEFERRED_GRAPHS_MAX_BYTES_PER_HOST,
+                    DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES,
+                    overlay_engine::gasp::UNANCHORABLE_RETRIES
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len()
+    };
+    r.unanchorable_retries = 1;
+    r.retry_at = now + overlay_engine::gasp::UNANCHORABLE_RETRY_SECS;
+    assert_eq!(claim(&r, DEFERRED_GRAPHS_MAX_TOTAL_BYTES), 1);
+    assert_eq!(claim(&r, DEFERRED_GRAPHS_MAX_TOTAL_BYTES), 0);
+    r.unanchorable_retries = 2;
+    assert_eq!(
+        claim(&r, DEFERRED_GRAPHS_MAX_TOTAL_BYTES),
+        0,
+        "backoff stands"
+    );
+    db.execute(
+        "UPDATE gasp_deferred_graphs SET record = json_set(record, '$.retryAt', 0)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(claim(&r, 0), 0, "byte ceiling stands");
+    r.score = 11;
+    assert_eq!(
+        claim(&r, DEFERRED_GRAPHS_MAX_TOTAL_BYTES),
+        0,
+        "score changed"
+    );
+    r.score = 10;
+    assert_eq!(claim(&r, DEFERRED_GRAPHS_MAX_TOTAL_BYTES), 1);
+    db.execute("UPDATE gasp_deferred_graphs SET record = json_set(record, '$.retryAt', 0, '$.unanchorableRetries', 4)", []).unwrap();
+    r.unanchorable_retries = 5;
+    assert_eq!(
+        claim(&r, DEFERRED_GRAPHS_MAX_TOTAL_BYTES),
+        0,
+        "retry ceiling stands"
+    );
+}

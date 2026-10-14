@@ -445,3 +445,21 @@ async fn minutes_0113_fault_retains_the_topic_managers_expiry() {
     assert!(record.is_unanchorable());
     assert_eq!(record.expiry, Some(expiry));
 }
+
+#[tokio::test]
+async fn minutes_0113_one_reservation_per_retry_slot() {
+    let f = minutes_unanchorable().await;
+    let mut record = minutes_record(&f).await;
+    record.retry_at = 0;
+    f.store.put_deferred_graph(&record).await.unwrap();
+    record.unanchorable_retries = 1;
+    record.retry_at =
+        (current_timestamp_ms() / 1000.0) as u64 + crate::gasp::UNANCHORABLE_RETRY_SECS;
+    let a = f.store.reserve_unanchorable_retry(&record).await.unwrap();
+    let b = f.store.reserve_unanchorable_retry(&record).await.unwrap();
+    assert_eq!(
+        u8::from(a) + u8::from(b),
+        1,
+        "two callers read the same prior count"
+    );
+}

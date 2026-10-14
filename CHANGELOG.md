@@ -10,7 +10,9 @@
   selection or deadline changes. A repeated boundary is checked above its
   score before reporting tip; the probe never advances the stored cursor.
 - Reserve at most four six-hour retries after an unanchorable verdict, including
-  interrupted walks. Exhausted roots become passable `dead:<class>` records,
+  interrupted walks. Claims compare the stored count, score and backoff in one
+  atomic operation, so overlapping syncs cannot spend the same retry slot.
+  Exhausted roots become passable `dead:<class>` records,
   never resumed on the same score. A changed peer score opens a new walk.
 - Sweep dead and unanchorable records at the advert's own expiry. Count terminal
   records and expiry removals as `gaspDead` and `gaspFaultExpired`. The authenticated
@@ -28,8 +30,11 @@ No lifecycle table migration, var or dependency pin changes.
 Older records can be swept through the existing expired-outpoint memo; a future
 walk also captures the advert expiry. No version bump is included here.
 Backfills checkpoint at 180,000 ms, 500 trait/network operations, 600 measured
-SQL statements or 64 data-page passes, with room for guarded finalization and
+SQL statements or 64 slice attempts, with room for guarded finalization and
 request bookkeeping. CPU limits still require measurement at the deployment.
+Custom `Storage` implementations and wrappers must implement or forward
+`reserve_unanchorable_retry` atomically. Standalone `GASPStorage` adapters that
+do not support it decline retries safely; the shipped adapter forwards it.
 
 ## [0.1.12] - 2026-10-14
 

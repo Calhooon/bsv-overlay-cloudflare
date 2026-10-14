@@ -340,6 +340,23 @@ pub const DEFERRED_GRAPH_UPSERT_SQL: &str = "INSERT INTO gasp_deferred_graphs \
 pub const DEFERRED_GRAPHS_SELECT_SQL: &str = "SELECT outpoint, score FROM gasp_deferred_graphs \
      WHERE host = ?1 AND topic = ?2 ORDER BY score, outpoint";
 
+/// One compare-and-set reserves a retry across overlapping requests. Fault
+/// records are whole rows. Preserve all byte ceilings while replacing the JSON.
+/// Binds: key, JSON, bytes, retained reason, score, prior count, three byte
+/// ceilings (global, origin, discovered), retry ceiling.
+pub const RESERVE_UNANCHORABLE_SQL: &str = "UPDATE gasp_deferred_graphs AS g \
+    SET record = ?4, bytes = ?5, updated_at = unixepoch() \
+    WHERE host = ?1 AND topic = ?2 AND outpoint = ?3 AND score = ?7 \
+      AND reason = ?6 AND reason LIKE 'held:unanchorable:%' AND chunks = 0 \
+      AND json_valid(record) \
+      AND COALESCE(json_extract(record, '$.unanchorableRetries'), 0) = ?8 \
+      AND ?8 < ?12 AND COALESCE(json_extract(record, '$.retryAt'), 0) <= unixepoch() \
+      AND (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs) - g.bytes + ?5 <= ?9 \
+      AND (g.configured OR ( \
+        (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs WHERE origin = g.origin AND configured = 0) - g.bytes + ?5 <= ?10 \
+        AND (SELECT COALESCE(SUM(bytes), 0) FROM gasp_deferred_graphs WHERE configured = 0) - g.bytes + ?5 <= ?11)) \
+    RETURNING outpoint";
+
 /// One record's head row: its first part, and where the rest is
 /// ([`DEFERRED_GRAPH_CHUNK_GET_SQL`], `seq` 1 ..= `chunks` under `gen`).
 pub const DEFERRED_GRAPH_GET_SQL: &str = "SELECT record, chunks, gen FROM gasp_deferred_graphs \

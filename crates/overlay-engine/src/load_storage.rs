@@ -204,6 +204,13 @@ impl Storage for MeteredStorage {
         crate::meter::storage_write();
         self.0.put_deferred_graph(record).await
     }
+    async fn reserve_unanchorable_retry(
+        &self,
+        record: &crate::gasp::DeferredGraph,
+    ) -> Result<bool, StorageError> {
+        crate::meter::storage_write();
+        self.0.reserve_unanchorable_retry(record).await
+    }
     async fn find_deferred_graphs(
         &self,
         host: &str,

@@ -1127,6 +1127,38 @@ impl Storage for D1Storage {
         })
     }
 
+    async fn reserve_unanchorable_retry(
+        &self,
+        record: &overlay_engine::gasp::DeferredGraph,
+    ) -> Result<bool, StorageError> {
+        let Some(prior) = record.unanchorable_retries.checked_sub(1) else {
+            return Ok(false);
+        };
+        let json = serde_json::to_string(record)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        if json.len() > crate::gasp_deferred::DEFERRED_GRAPH_CHUNK_BYTES {
+            return Ok(false);
+        }
+        let saved: Option<serde_json::Value> =
+            Query::new(crate::gasp_deferred::RESERVE_UNANCHORABLE_SQL)
+                .bind(record.peer.as_str())
+                .bind(record.topic.as_str())
+                .bind(record.outpoint.as_str())
+                .bind(json.as_str())
+                .bind(json.len() as u64)
+                .bind(crate::gasp_deferred::retained_reason(record))
+                .bind(record.score)
+                .bind(prior)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_TOTAL_BYTES)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_BYTES_PER_HOST)
+                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES)
+                .bind(overlay_engine::gasp::UNANCHORABLE_RETRIES)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(d1_err)?;
+        Ok(saved.is_some())
+    }
+
     async fn find_deferred_graphs(
         &self,
         host: &str,
