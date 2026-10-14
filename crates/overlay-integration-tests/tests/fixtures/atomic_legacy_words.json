@@ -1,0 +1,794 @@
+[
+  {
+    "mode": "current-tx",
+    "name": "submit_empty_body",
+    "replay": 0,
+    "word": {
+      "error": "BEEF parsing failed: BEEF error: invalid BEEF at byte 0: Truncated { needed: 4 }"
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "submit_empty_body",
+    "replay": 1,
+    "word": {
+      "error": "BEEF parsing failed: BEEF error: invalid BEEF at byte 0: Truncated { needed: 4 }"
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "submit_empty_body",
+    "replay": 0,
+    "word": {
+      "error": "BEEF parsing failed: BEEF error: invalid BEEF at byte 0: Truncated { needed: 4 }"
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "submit_empty_body",
+    "replay": 1,
+    "word": {
+      "error": "BEEF parsing failed: BEEF error: invalid BEEF at byte 0: Truncated { needed: 4 }"
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "submit_empty_body",
+    "replay": 0,
+    "word": {
+      "error": "BEEF parsing failed: BEEF error: invalid BEEF at byte 0: Truncated { needed: 4 }"
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "submit_empty_body",
+    "replay": 1,
+    "word": {
+      "error": "BEEF parsing failed: BEEF error: invalid BEEF at byte 0: Truncated { needed: 4 }"
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "submit_missing_topics_header",
+    "replay": 0,
+    "word": {
+      "ok": {}
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "submit_missing_topics_header",
+    "replay": 1,
+    "word": {
+      "ok": {}
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "submit_missing_topics_header",
+    "replay": 0,
+    "word": {
+      "ok": {}
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "submit_missing_topics_header",
+    "replay": 1,
+    "word": {
+      "ok": {}
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "submit_missing_topics_header",
+    "replay": 0,
+    "word": {
+      "ok": {}
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "submit_missing_topics_header",
+    "replay": 1,
+    "word": {
+      "ok": {}
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "submit_ship_beef",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "submit_ship_beef",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "submit_ship_beef",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "submit_ship_beef",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "submit_ship_beef",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "submit_ship_beef",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "submit_slap_beef",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "submit_slap_beef",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "submit_slap_beef",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "submit_slap_beef",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "submit_slap_beef",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "submit_slap_beef",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "submit_unknown_topic",
+    "replay": 0,
+    "word": {
+      "error": "This server does not support this topic: tm_not_registered"
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "submit_unknown_topic",
+    "replay": 1,
+    "word": {
+      "error": "This server does not support this topic: tm_not_registered"
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "submit_unknown_topic",
+    "replay": 0,
+    "word": {
+      "error": "This server does not support this topic: tm_not_registered"
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "submit_unknown_topic",
+    "replay": 1,
+    "word": {
+      "error": "This server does not support this topic: tm_not_registered"
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "submit_unknown_topic",
+    "replay": 0,
+    "word": {
+      "error": "This server does not support this topic: tm_not_registered"
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "submit_unknown_topic",
+    "replay": 1,
+    "word": {
+      "error": "This server does not support this topic: tm_not_registered"
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "ship_wire_0",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "ship_wire_0",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "ship_wire_0",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "ship_wire_0",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "ship_wire_0",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "ship_wire_0",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "ship_wire_1",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "ship_wire_1",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "ship_wire_1",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "ship_wire_1",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "ship_wire_1",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "ship_wire_1",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "ship_wire_2",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "ship_wire_2",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "ship_wire_2",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "ship_wire_2",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "ship_wire_2",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "ship_wire_2",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_ship": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "slap_wire_0",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "slap_wire_0",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "slap_wire_0",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "slap_wire_0",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "slap_wire_0",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "slap_wire_0",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "slap_wire_1",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "slap_wire_1",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "slap_wire_1",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "slap_wire_1",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "slap_wire_1",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "slap_wire_1",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "slap_wire_2",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "current-tx",
+    "name": "slap_wire_2",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "slap_wire_2",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx",
+    "name": "slap_wire_2",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "slap_wire_2",
+    "replay": 0,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsRemoved": [],
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  },
+  {
+    "mode": "historical-tx-no-spv",
+    "name": "slap_wire_2",
+    "replay": 1,
+    "word": {
+      "ok": {
+        "tm_slap": {
+          "coinsToRetain": [],
+          "outputsToAdmit": []
+        }
+      }
+    }
+  }
+]

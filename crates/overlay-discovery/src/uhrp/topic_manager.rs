@@ -19,12 +19,9 @@
 //!
 //! # Expiry policy
 //!
-//! This implementation is **strict**: an advert whose `expiry_time <= now()`
-//! at validation time is rejected. Rationale is documented in
-//! `docs/uhrp_topic.md`. SHIP has no expiry field so its topic manager does
-//! not reject on it; UHRP has expiry as an in-protocol field explicitly for
-//! "how long the host commits to serving this content" — admitting expired
-//! commitments is never useful.
+//! Admission accepts every expiry >= 1, matching the reference. Lookup hides
+//! expired advertisements. The manager reads no clock, so nodes converge on
+//! the same admitted outputs regardless of when they receive the transaction.
 //!
 //! # Reference points
 //!
@@ -90,10 +87,8 @@ impl TopicManager for UHRPTopicManager {
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let mut outputs_to_admit = Vec::new();
 
-        let now = current_unix_seconds();
-
         for (i, output) in tx.outputs.iter().enumerate() {
-            match Self::validate_uhrp_output(output, now) {
+            match Self::validate_uhrp_output(output, 0) {
                 Ok(true) => {
                     debug!("UHRP: admitted output {i}");
                     outputs_to_admit.push(i as u32);
@@ -139,9 +134,8 @@ impl UHRPTopicManager {
     /// short human-readable reason if the output looks like a malformed
     /// UHRP attempt (bad URI scheme, bad varint, etc.).
     ///
-    /// `now` is the current unix-seconds timestamp used for expiry checks;
-    /// taking it as a parameter keeps the validator a pure function and
-    /// makes unit tests deterministic.
+    /// `now` is retained for source compatibility and is ignored. Expiry
+    /// filtering belongs to the lookup service.
     pub fn validate_uhrp_output(
         output: &bsv_rs::transaction::TransactionOutput,
         now: u64,
@@ -289,29 +283,6 @@ impl UHRPTopicManager {
 
         let _ = content_length; // already validated non-zero above
         Ok(true)
-    }
-}
-
-/// Current time in unix seconds.
-///
-/// `std::time::SystemTime` PANICS on `wasm32-unknown-unknown` (it has no OS
-/// clock source), so on Cloudflare Workers we route through `js_sys::Date`.
-/// Matches the pattern in `overlay-engine/src/engine.rs::current_timestamp_ms`.
-///
-/// Native (tests / non-wasm consumers) falls back to `SystemTime`. A
-/// pre-epoch clock (impossible in practice) yields 0, which makes every
-/// non-zero-expiry advert look unexpired — strictly safer than panicking.
-fn current_unix_seconds() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        (js_sys::Date::now() / 1000.0) as u64
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
     }
 }
 

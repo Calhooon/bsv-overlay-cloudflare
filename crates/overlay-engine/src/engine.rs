@@ -8,6 +8,8 @@
 
 use crate::beef_limits;
 
+mod atomic;
+
 use bsv_rs::transaction::{Beef, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -695,7 +697,7 @@ type Validated = (
 /// Which limb of the [`DoorBudget`] a submit's own walk went past (bsv-low
 /// #592): the [`DoorLimb`] of the door's error, with the interpreter's own
 /// memory limit told apart from the static work estimate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WalkLimb {
     /// The static work estimate.
     OverWork,
@@ -738,7 +740,7 @@ impl WalkLimb {
 /// lock is charged 3,971 keys). So a breach says nothing about whether the
 /// spend is valid, and on a path where nothing else judges it an admission
 /// would admit a spend nobody checked: the lens's forged spend of a held coin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum WalkBreachPolicy {
     /// "Not now" ([`EngineError::WalkCouldNotRun`]): nothing judged, nothing
     /// written, never a final refusal. Every door but one: the ungated
@@ -763,7 +765,7 @@ pub enum WalkBreachPolicy {
 /// `HistoricalTxNoSpv` and this says so on its [`MutationReport`]. The
 /// reference (`Engine.submit`, `tx.verify`) has no budget; this is the
 /// platform's addition, on the door's lineage (D8).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalkCouldNotRun {
     /// The submitted transaction.
     pub subject_txid: String,
@@ -2233,7 +2235,7 @@ impl Engine {
                 let admits = !v.admittance.outputs_to_admit.is_empty();
                 if admits && subject_names.is_none() {
                     subject_names = Some(
-                        self.named_history(manager.as_ref(), subject_named_beef, bound)
+                        self.named_history(manager.as_ref(), subject_named_beef, bound, None)
                             .await,
                     );
                 }
@@ -2265,6 +2267,7 @@ impl Engine {
                         &mut subject_names,
                         question_reads,
                         bound,
+                        None,
                     )
                     .await
                 else {
@@ -2690,7 +2693,13 @@ impl Engine {
         subject_names: &mut Option<HashSet<String>>,
         question_reads: &mut usize,
         bound: Option<&CallBound>,
+        admission: Option<&dyn crate::admission::LogTxn>,
     ) -> Option<NotNow> {
+        let _read_only = admission.map(crate::admission::LogTxn::read_only);
+        let dry_context = TopicAdmittanceContext {
+            dry_run: true,
+            admission_seq: admission.map(crate::admission::LogTxn::seq),
+        };
         let manager = self.managers.get(topic)?;
         let wait = |why: String| Some(NotNow { why, carried: None });
         // The outpoints `tx` spends, as `txid.vout`.
@@ -2758,7 +2767,7 @@ impl Engine {
                 }
                 if subject_names.is_none() {
                     *subject_names = Some(
-                        self.named_history(manager.as_ref(), beef_bytes, bound)
+                        self.named_history(manager.as_ref(), beef_bytes, bound, admission)
                             .await,
                     );
                 }
@@ -2893,7 +2902,7 @@ impl Engine {
                 let names = if spender == txid {
                     if subject_names.is_none() {
                         *subject_names = Some(
-                            self.named_history(manager.as_ref(), beef_bytes, bound)
+                            self.named_history(manager.as_ref(), beef_bytes, bound, admission)
                                 .await,
                         );
                     }
@@ -2905,8 +2914,13 @@ impl Engine {
                             .and_then(|spender| spender.to_atomic_beef(true).ok())
                         {
                             Some(spender_beef) => {
-                                self.named_history(manager.as_ref(), &spender_beef, bound)
-                                    .await
+                                self.named_history(
+                                    manager.as_ref(),
+                                    &spender_beef,
+                                    bound,
+                                    admission,
+                                )
+                                .await
                             }
                             None => HashSet::new(),
                         };
@@ -2928,13 +2942,7 @@ impl Engine {
                     .unwrap_or_else(|| body.clone());
                 let verdict = bounded(
                     bound,
-                    manager.identify_admissible_outputs(
-                        &judged,
-                        &[],
-                        None,
-                        mode,
-                        &TopicAdmittanceContext::DRY_RUN,
-                    ),
+                    manager.identify_admissible_outputs(&judged, &[], None, mode, &dry_context),
                 )
                 .await;
                 match verdict {
@@ -2979,14 +2987,21 @@ impl Engine {
         manager: &dyn TopicManager,
         beef_bytes: &[u8],
         bound: Option<&CallBound>,
+        admission: Option<&dyn crate::admission::LogTxn>,
     ) -> HashSet<String> {
         match bounded(bound, manager.identify_needed_inputs(beef_bytes, None)).await {
             Ok(Ok(named)) => named.iter().map(Outpoint::to_graph_id).collect(),
             Ok(Err(e)) => {
+                if let Some(log) = admission {
+                    log.fail(format!("identify_needed_inputs: {e}"));
+                }
                 warn!("the predecessor question: the manager could not name its inputs: {e}");
                 HashSet::new()
             }
             Err(no_answer) => {
+                if let Some(log) = admission {
+                    log.fail(format!("identify_needed_inputs: {no_answer}"));
+                }
                 warn!("the predecessor question: the manager did not name its inputs: {no_answer}");
                 HashSet::new()
             }
@@ -3406,19 +3421,13 @@ impl Engine {
                 .all(|ls| !ls.reads_off_chain_values(topic))
     }
 
-    /// Run Phase 1 (topic validation) and Phase 2 (broadcast) without mutating storage.
-    ///
-    /// Returns (validations, steak, parsed_tx, txid) so the caller can either
-    /// stop (validate-only) or proceed with Phase 3 (mutations).
-    async fn run_validation(
+    async fn walk_transaction(
         &self,
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
-        context: &TopicAdmittanceContext,
-        bound: Option<&CallBound>,
         walked: Option<&HashSet<String>>,
         policy: WalkBreachPolicy,
-    ) -> Result<Validated, EngineError> {
+    ) -> Result<(Transaction, String, Option<WalkCouldNotRun>), EngineError> {
         // Validate all topics are supported
         for topic in &tagged_beef.topics {
             if !self.managers.contains_key(topic) {
@@ -3511,33 +3520,17 @@ impl Engine {
             }
         }
 
-        let mut steak = Steak::new();
+        Ok((tx, txid, could_not_run))
+    }
 
-        // =============================================================
-        // PHASE 1: VALIDATE (read-only)
-        // =============================================================
-        let mut validations = Vec::new();
-
-        for topic in &tagged_beef.topics {
-            validations.push(
-                self.validate_topic(
-                    &tx,
-                    &txid,
-                    topic,
-                    tagged_beef.off_chain_values.as_deref(),
-                    mode,
-                    context,
-                    bound,
-                )
-                .await,
-            );
-        }
-
-        // Build preliminary STEAK
-        for v in &validations {
-            steak.insert(v.topic.clone(), v.admittance.clone());
-        }
-
+    async fn broadcast_validations(
+        &self,
+        tagged_beef: &TaggedBEEF,
+        mode: SubmitMode,
+        tx: &Transaction,
+        validations: &[TopicValidation],
+    ) -> Option<String> {
+        let mut accepted_txid = None;
         // =============================================================
         // PHASE 2: BROADCAST / SHIP propagation (before mutations)
         // =============================================================
@@ -3567,6 +3560,7 @@ impl Engine {
                     match arc.broadcast(&raw_tx_hex).await {
                         Ok(arc_txid) => {
                             info!("ARC broadcast succeeded: txid={arc_txid}");
+                            accepted_txid = Some(arc_txid);
                         }
                         Err(e) => {
                             error!("ARC broadcast failed (non-fatal): {e}");
@@ -3648,6 +3642,55 @@ impl Engine {
                 }
             }
         }
+        accepted_txid
+    }
+
+    /// Run Phase 1 (topic validation) and Phase 2 (broadcast) without mutating storage.
+    ///
+    /// Returns (validations, steak, parsed_tx, txid) so the caller can either
+    /// stop (validate-only) or proceed with Phase 3 (mutations).
+    async fn run_validation(
+        &self,
+        tagged_beef: &TaggedBEEF,
+        mode: SubmitMode,
+        context: &TopicAdmittanceContext,
+        bound: Option<&CallBound>,
+        walked: Option<&HashSet<String>>,
+        policy: WalkBreachPolicy,
+    ) -> Result<Validated, EngineError> {
+        let (tx, txid, could_not_run) = self
+            .walk_transaction(tagged_beef, mode, walked, policy)
+            .await?;
+
+        let mut steak = Steak::new();
+
+        // =============================================================
+        // PHASE 1: VALIDATE (read-only)
+        // =============================================================
+        let mut validations = Vec::new();
+
+        for topic in &tagged_beef.topics {
+            validations.push(
+                self.validate_topic(
+                    &tx,
+                    &txid,
+                    topic,
+                    tagged_beef.off_chain_values.as_deref(),
+                    mode,
+                    context,
+                    bound,
+                )
+                .await,
+            );
+        }
+
+        // Build preliminary STEAK
+        for v in &validations {
+            steak.insert(v.topic.clone(), v.admittance.clone());
+        }
+
+        self.broadcast_validations(tagged_beef, mode, &tx, &validations)
+            .await;
 
         Ok((validations, steak, tx, txid, could_not_run))
     }

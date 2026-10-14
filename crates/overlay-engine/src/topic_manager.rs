@@ -102,6 +102,9 @@ pub trait TopicManager {
 /// Errors from TopicManager operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TopicManagerError {
+    /// Typed log refusal, including unavailable evidence and retryable faults.
+    #[error("{0}")]
+    Admission(#[from] crate::admission::AdmitRefusal),
     /// The transaction BEEF could not be parsed.
     #[error("invalid BEEF: {0}")]
     InvalidBeef(String),

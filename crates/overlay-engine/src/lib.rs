@@ -24,6 +24,7 @@
 #![allow(clippy::cast_sign_loss)] // f64→u64 for scores, negatives not meaningful
 #![allow(clippy::let_and_return)] // sometimes clearer
 
+pub mod admission;
 pub mod advertiser;
 pub mod beef_limits;
 pub mod broadcaster;
