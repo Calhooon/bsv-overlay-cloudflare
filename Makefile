@@ -5,7 +5,7 @@
 # in parity mode + runs the differential harness + writes PARITY_REPORT.md.
 # Exit is non-zero on any un-noted divergence.
 
-.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ownership \
+.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ownership gasp-shadow-size \
         wrangler-dev harness test e2e-bsv-storage clean help
 
 help:
@@ -22,6 +22,7 @@ help:
 	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c and NL-6d)"
 	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; four ports: :LANE_BASE+9 app layer, +10 overlay, +11 the e649 delivering overlay, +12 its mock app layer)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
+	@echo "  gasp-shadow-size The raw Worker wasm with the gasp-shadow feature off against A1 9d5a75a, and on (bsv-low #657)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
 
 ## -- Reference stack (TS overlay-express 2.2.0 + Mongo + MySQL in Docker) -----
@@ -129,6 +130,13 @@ ci:
 	$(MAKE) ci-deploy; \
 	$(MAKE) ci-route; \
 	echo "✅ local CI green"
+
+# bsv-low #657, the GASP shadow lens's MEDIUM 1: the shadow is the engine's
+# cargo feature `gasp-shadow`, default off. The raw Worker wasm with it off
+# against A1's (`9d5a75a`), within 4096 B and none of the shadow's names, and
+# with it on (the names linked). Three cold-ish release wasm builds.
+gasp-shadow-size:
+	@bash scripts/check-gasp-shadow-size.sh
 
 # bsv-low #474: the shared D1's ownership manifest. Every SQL statement of the
 # overlay, discovery and app-layer crates against storage-ownership.json (prose:
