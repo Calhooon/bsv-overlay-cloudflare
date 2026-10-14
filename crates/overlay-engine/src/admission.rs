@@ -297,50 +297,227 @@ pub enum GraphOutcome {
     AllLanded {
         seqs: Vec<u64>,
     },
-    StoppedAt {
-        txid: String,
-        refusal: AdmitRefusal,
+    /// The owner's D44 (`dependency gate`): every body whose parents landed
+    /// was judged as its own unit and these did not land; the rest did.
+    Held {
         landed: Vec<u64>,
+        held: Vec<HeldBody>,
     },
 }
 
-/// GASP finalize: each body lands independently, in graph order.
+/// A body of a GASP graph that did not land, its refusal, and why the
+/// dependency gate held it (`None`: its own refusal, met by its own unit).
+#[derive(Debug, Clone)]
+pub struct HeldBody {
+    pub txid: String,
+    pub refusal: AdmitRefusal,
+    pub gate: Option<GateReason>,
+}
+
+/// Why the dependency gate (D44) held a body of a GASP graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateReason {
+    /// Its own topic manager answered `Err` at the finalize: the unit is
+    /// refused `not now` (never terminal; nothing of it is written), and every
+    /// descendant of it in the graph waits on it.
+    ParentError,
+    /// A parent it spends (named, graph order) has not landed, in this graph
+    /// or before: refused without a unit, with that parent's word (a terminal
+    /// lookup or deterministic refusal is the same typed word; anything else
+    /// is `not now`).
+    WaitingOn(Vec<String>),
+}
+
+/// The site of the gate's refusals.
+pub const GATE_PARENT_ERROR_SITE: &str = "gasp_finalize.topic_manager";
+pub const GATE_WAITING_SITE: &str = "gasp_finalize.dependency_gate";
+
+/// GASP finalize: each body lands independently, in graph order, under the
+/// dependency gate (D44).
 pub fn admit_graph(
     engine: &crate::engine::Engine,
     runner: &dyn UnitRunner,
     graph: &[Walked],
 ) -> GraphOutcome {
-    admit_graph_observed(engine, runner, graph, &mut |_, _| {})
+    admit_graph_observed(engine, runner, graph, &mut |_, _, _| {})
 }
 
-/// [`admit_graph`], handing each body's unit answer to `observe` as it is
-/// given (the GASP shadow words each body it ran; bsv-low #657, R7.7 item 5).
+/// Handed each body of a graph, its unit's answer and the gate's reason.
+pub type GraphObserver<'a> =
+    dyn FnMut(&Walked, &Result<Committed, AdmitRefusal>, Option<&GateReason>) + 'a;
+
+/// The txids a body's inputs spend, its own excluded.
+fn spent_txids(walked: &Walked) -> Vec<String> {
+    let tx = match &walked.beef {
+        BeefCarry::Inline(bytes) => crate::beef_limits::transaction_from_beef(
+            bytes,
+            Some(&walked.txid),
+            &crate::beef_limits::ENGINE_BEEF_LIMITS,
+        )
+        .ok(),
+        BeefCarry::R2 { raw_txs, .. } => raw_txs
+            .iter()
+            .filter_map(|raw| Transaction::from_binary(raw).ok())
+            .find(|tx| tx.id() == walked.txid),
+    };
+    let mut spent: Vec<String> = Vec::new();
+    let Some(tx) = tx else {
+        return spent;
+    };
+    for input in &tx.inputs {
+        if let Ok(source) = input.get_source_txid() {
+            if source != walked.txid && !spent.contains(&source) {
+                spent.push(source);
+            }
+        }
+    }
+    spent
+}
+
+/// [`admit_graph`], handing each body's answer to `observe` as it is given,
+/// with the gate's reason when the gate held it (the GASP shadow words each
+/// body; bsv-low #657, R7.7 item 5).
+///
+/// The dependency gate (the owner's D44), for every body in graph order:
+/// 1. A parent it spends that is a body of this graph and has not landed in
+///    this graph (refused or held) holds it without a unit: `WaitingOn`, the
+///    parent's typed word when that is terminal (`Lookup`, `Deterministic`:
+///    D34's unit-wide refusal reaches its descendants), else `not now`.
+/// 2. A parent of this graph not yet met (a graph out of order) must hold an
+///    applied row in every topic of the body, read inside the body's unit;
+///    else the unit is refused `not now`, `WaitingOn`.
+/// 3. A topic manager that answers `Err` at the finalize (a topic of the unit
+///    neither applied nor deduped: F5's empty judgement) refuses the unit
+///    `not now`, `ParentError`: it rolls back whole and its descendants wait.
+/// 4. Any other refusal is the body's own; its descendants wait on it.
+/// 5. An independent sibling is judged and lands as its own unit. A body that
+///    waited lands on the peer's next sync with the same judgement as any
+///    first-time body (nothing of it was written).
 pub fn admit_graph_observed(
     engine: &crate::engine::Engine,
     runner: &dyn UnitRunner,
     graph: &[Walked],
-    observe: &mut dyn FnMut(&Walked, &Result<Committed, AdmitRefusal>),
+    observe: &mut GraphObserver<'_>,
 ) -> GraphOutcome {
+    let bodies: std::collections::HashSet<&str> = graph.iter().map(|w| w.txid.as_str()).collect();
     let mut seqs = Vec::new();
+    let mut landed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut refused: BTreeMap<String, AdmitRefusal> = BTreeMap::new();
+    let mut held = Vec::new();
     for walked in graph {
-        let answer = runner.run_unit(
-            UnitKind::Admit,
-            &walked.evidence,
-            Box::pin(async { engine.admit(walked).await.map(UnitOutput::Admitted) }),
-        );
-        observe(walked, &answer);
+        let parents: Vec<String> = spent_txids(walked)
+            .into_iter()
+            .filter(|p| bodies.contains(p.as_str()) && !landed.contains(p))
+            .collect();
+        let (waiting, unmet): (Vec<_>, Vec<_>) =
+            parents.into_iter().partition(|p| refused.contains_key(p));
+        let (answer, gate) = if waiting.is_empty() {
+            let manager_failed = std::cell::Cell::new(false);
+            let store_waiting = std::cell::RefCell::new(Vec::new());
+            let answer = runner.run_unit(
+                UnitKind::Admit,
+                &walked.evidence,
+                Box::pin(async {
+                    for parent in &unmet {
+                        for topic in &walked.topics {
+                            let held = engine
+                                .storage()
+                                .does_applied_transaction_exist(&crate::types::AppliedTransaction {
+                                    txid: parent.clone(),
+                                    topic: topic.clone(),
+                                })
+                                .await
+                                .map_err(|e| {
+                                    AdmitRefusal::transient("does_applied_transaction_exist", e)
+                                })?;
+                            if !held {
+                                store_waiting.borrow_mut().push(parent.clone());
+                                break;
+                            }
+                        }
+                    }
+                    if !store_waiting.borrow().is_empty() {
+                        return Err(AdmitRefusal::not_now(
+                            GATE_WAITING_SITE,
+                            format!("waiting on {}", store_waiting.borrow().join(", ")),
+                        ));
+                    }
+                    let admitted = engine.admit(walked).await?;
+                    let failed: Vec<&String> = walked
+                        .topics
+                        .iter()
+                        .filter(|t| {
+                            !admitted.report.applied_topics.contains(t)
+                                && !admitted.report.deduped_topics.contains(t)
+                        })
+                        .collect();
+                    if !failed.is_empty() {
+                        manager_failed.set(true);
+                        return Err(AdmitRefusal::NotNow {
+                            site: GATE_PARENT_ERROR_SITE.into(),
+                            reason: format!(
+                                "the topic manager failed on it ({}): its descendants wait",
+                                failed
+                                    .iter()
+                                    .map(|t| t.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                            notes: admitted.notes,
+                            predecessor: None,
+                        });
+                    }
+                    Ok(UnitOutput::Admitted(admitted))
+                }),
+            );
+            let gate = if answer.is_err() && manager_failed.get() {
+                Some(GateReason::ParentError)
+            } else if answer.is_err() && !store_waiting.borrow().is_empty() {
+                Some(GateReason::WaitingOn(store_waiting.take()))
+            } else {
+                None
+            };
+            (answer, gate)
+        } else {
+            let terminal = waiting.iter().find_map(|p| match &refused[p] {
+                refusal @ (AdmitRefusal::Lookup { .. } | AdmitRefusal::Deterministic { .. }) => {
+                    Some(refusal.clone())
+                }
+                _ => None,
+            });
+            let refusal = terminal.unwrap_or_else(|| {
+                AdmitRefusal::not_now(
+                    GATE_WAITING_SITE,
+                    format!("waiting on {}", waiting.join(", ")),
+                )
+            });
+            (Err(refusal), Some(GateReason::WaitingOn(waiting)))
+        };
+        observe(walked, &answer, gate.as_ref());
         match answer {
-            Ok(committed) => seqs.push(committed.seq),
+            Ok(committed) => {
+                seqs.push(committed.seq);
+                refused.remove(&walked.txid);
+                landed.insert(walked.txid.clone());
+            }
             Err(refusal) => {
-                return GraphOutcome::StoppedAt {
+                if !landed.contains(&walked.txid) {
+                    refused.insert(walked.txid.clone(), refusal.clone());
+                }
+                held.push(HeldBody {
                     txid: walked.txid.clone(),
                     refusal,
-                    landed: seqs,
-                }
+                    gate,
+                });
             }
         }
     }
-    GraphOutcome::AllLanded { seqs }
+    if held.is_empty() {
+        GraphOutcome::AllLanded { seqs }
+    } else {
+        GraphOutcome::Held { landed: seqs, held }
+    }
 }
 
 pub type LocalBoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;

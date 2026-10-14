@@ -668,7 +668,7 @@ impl Engine {
                 engine,
                 snapshot.runner.as_ref(),
                 std::slice::from_ref(&walked),
-                &mut |_, answer| {
+                &mut |_, answer, _| {
                     if let Ok(committed) = answer {
                         seqs.push(committed.seq);
                     }
@@ -689,8 +689,8 @@ impl Engine {
     /// A graph's comparison on its snapshot, and its first body's: every body
     /// walked first (the Worker's side; only the first when the graph has no
     /// served word), the first body's `judge_dry` on the untouched snapshot,
-    /// then the graph in one hop (each body its own unit, stopping at the
-    /// first that does not land), the first unit's answer the first body's.
+    /// then the graph in one hop (each body its own unit under the dependency
+    /// gate, D44), the first unit's answer the first body's.
     async fn shadow_graph(
         &self,
         host: &dyn GaspShadow,
@@ -792,7 +792,7 @@ impl Engine {
                 engine,
                 snapshot.runner.as_ref(),
                 &walked,
-                &mut |body, answer| {
+                &mut |body, answer, _| {
                     let met = engine.take_manager_errors();
                     if first_answer.is_none() {
                         first_answer = Some((
@@ -806,9 +806,12 @@ impl Engine {
                             seqs.push(committed.seq);
                             landed.push(body.txid.clone());
                         }
-                        Err(refusal) => {
+                        // The first body held is where the graph stopped
+                        // landing whole; the gate judged the rest (D44).
+                        Err(refusal) if refused.is_none() => {
                             refused = Some((body.txid.clone(), Word::refusal(refusal)));
                         }
+                        Err(_) => {}
                     }
                 },
             );

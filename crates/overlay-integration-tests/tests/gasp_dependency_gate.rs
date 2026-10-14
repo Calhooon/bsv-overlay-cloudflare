@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use async_trait::async_trait;
 use bsv_overlay_engine::admission::{
-    admit_graph_observed, AdmitRefusal, Committed, NoEvidence, UnitOutput, Walked,
+    admit_graph_observed, AdmitRefusal, Committed, GateReason, NoEvidence, UnitOutput, Walked,
 };
 use bsv_overlay_engine::engine::{Engine, EngineConfig, WalkBreachPolicy};
 use bsv_overlay_engine::lookup_service::{LookupService, LookupServiceError};
@@ -45,11 +45,16 @@ struct Judged {
     answers: BTreeMap<String, Answer>,
     refusals: BTreeMap<String, AdmitRefusal>,
     steaks: BTreeMap<String, String>,
+    /// Why the dependency gate held a body (absent: its own answer).
+    gates: BTreeMap<String, GateReason>,
 }
 
 impl Judged {
     fn of(&self, tx: &Transaction) -> Option<Answer> {
         self.answers.get(&tx.id()).cloned()
+    }
+    fn gate(&self, tx: &Transaction) -> Option<GateReason> {
+        self.gates.get(&tx.id()).cloned()
     }
 }
 
@@ -154,9 +159,17 @@ async fn admit(
 ) -> Judged {
     let walked = walk(engine, graph).await;
     let mut judged = Judged::default();
-    admit_graph_observed(engine, store.as_ref(), &walked, &mut |body, answer| {
-        record(&mut judged, body, answer);
-    });
+    admit_graph_observed(
+        engine,
+        store.as_ref(),
+        &walked,
+        &mut |body, answer, gate| {
+            if let Some(gate) = gate {
+                judged.gates.insert(body.txid.clone(), gate.clone());
+            }
+            record(&mut judged, body, answer);
+        },
+    );
     judged
 }
 
@@ -239,6 +252,9 @@ async fn d44_fan_in_the_good_parent_lands_the_erring_parent_and_the_root_wait() 
             Some(Answer::NotNow),
             "the root waits with the same word: {judged:?}"
         );
+        assert_eq!(judged.gate(&a), Some(GateReason::ParentError));
+        assert_eq!(judged.gate(&r), Some(GateReason::WaitingOn(vec![a.id()])));
+        assert_eq!(judged.gate(&b), None);
         let rows = rows(&store, &[&a, &b, &r]).await;
         assert_eq!(applied(&rows, &b), "true");
         assert_eq!(applied(&rows, &a), "false", "the erring unit wrote nothing");
@@ -264,6 +280,8 @@ async fn d44_chain_the_error_at_body_2_body_1_lands_2_and_3_wait() {
     assert_eq!(judged.of(&g), Some(Answer::Landed), "{judged:?}");
     assert_eq!(judged.of(&c), Some(Answer::NotNow), "{judged:?}");
     assert_eq!(judged.of(&d), Some(Answer::NotNow), "{judged:?}");
+    assert_eq!(judged.gate(&c), Some(GateReason::ParentError));
+    assert_eq!(judged.gate(&d), Some(GateReason::WaitingOn(vec![c.id()])));
     let rows = rows(&store, &[&g, &c, &d]).await;
     assert_eq!(applied(&rows, &g), "true");
     assert_eq!(applied(&rows, &c), "false");
@@ -357,6 +375,8 @@ async fn d44_a_lookup_refusal_is_terminal_and_its_descendants_take_its_word() {
         judged.refusals.get(&c.id()),
         "the same word"
     );
+    assert_eq!(judged.gate(&c), None, "its own refusal");
+    assert_eq!(judged.gate(&d), Some(GateReason::WaitingOn(vec![c.id()])));
     let rows = rows(&store, &[&g, &c, &d]).await;
     assert_eq!(
         applied(&rows, &c),

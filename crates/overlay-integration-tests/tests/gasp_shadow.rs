@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::{Rc, Weak};
 
 use async_trait::async_trait;
-use bsv_overlay_engine::admission::{UnitRunner, WalkOutcome};
+use bsv_overlay_engine::admission::{UnitRunner, WalkOutcome, GATE_PARENT_ERROR_SITE};
 use bsv_overlay_engine::engine::{Engine, EngineConfig};
 use bsv_overlay_engine::gasp_shadow::{
     AdmissionMode, DeltaClass, GaspCensusRow, GaspShadow, MemoryGaspShadow, ShadowBudget,
@@ -352,10 +352,9 @@ async fn w2_the_finalize_materialization_is_compared_to_the_served_materializati
     }
 
     // A manager that errs at the finalize on the middle link: the served
-    // finalize stops there (its graph's cursor waits); A's unit commits the
-    // topic's empty judgement (F5, C7) and its graph goes on to the next
-    // link, which waits for its unlanded predecessor. The erring body's words
-    // differ by the served stop alone (w2b); the graph's do not agree.
+    // finalize stops there (its graph's cursor waits); under the owner's D44
+    // (`dependency gate`) A refuses the erring unit `not now` and its spender
+    // waits on it. Both land `g` alone: the rows agree, the words do not.
     let scenario = erring_chain();
     let shadow = beside(&scenario).await;
     print_census("W2 delta", &shadow);
@@ -374,17 +373,16 @@ async fn w2_the_finalize_materialization_is_compared_to_the_served_materializati
         served["stopped"]["txid"],
         serde_json::json!(scenario.txs[1].id())
     );
-    assert_eq!(
-        ours["landed"],
-        serde_json::json!([scenario.txs[0].id(), scenario.txs[1].id()])
-    );
+    assert_eq!(ours["landed"], serde_json::json!([scenario.txs[0].id()]));
     assert_eq!(
         ours["stopped"]["txid"],
-        serde_json::json!(scenario.txs[2].id())
+        serde_json::json!(scenario.txs[1].id()),
+        "A's first held body is the erring one"
     );
+    assert_eq!(ours["stopped"]["status"], serde_json::json!(503));
     assert_eq!(
         served["rows"], ours["rows"],
-        "the rows agree; the landing does not"
+        "the rows agree; the words do not"
     );
     let bodies = shadow.of(ShadowKind::Body);
     assert_eq!(bodies.len(), 2, "the served finalize submitted two bodies");
@@ -432,36 +430,33 @@ async fn w2b_a_manager_error_at_the_finalize_shows_in_the_census() {
     let served = json(&row.served.bytes);
     let ours = json(&row.shadow.bytes);
     for (side, word) in [("served", &served), ("shadow", &ours)] {
-        assert_eq!(
-            word["applied_topics"],
-            serde_json::json!([]),
-            "{side}: {word}"
-        );
-        assert_eq!(
-            word["deduped_topics"],
-            serde_json::json!([]),
-            "{side}: {word}"
-        );
         let errors = word["manager_errors"].to_string();
         assert!(
             errors.contains(&manager) && errors.contains(error),
             "{side} names the manager and its error: {word}"
         );
     }
+    assert_eq!(served["applied_topics"], serde_json::json!([]), "{served}");
+    assert_eq!(served["deduped_topics"], serde_json::json!([]), "{served}");
     assert_eq!(
         served["not_landed"],
         serde_json::json!("the topic manager failed on it"),
         "the served word says why the finalize stopped: {served}"
     );
     assert_eq!(
-        ours["not_landed"],
-        serde_json::Value::Null,
-        "A committed the unit: {ours}"
+        row.shadow.status, 503,
+        "D44: A refuses the erring unit not now: {ours}"
+    );
+    assert!(
+        ours["refusal"]
+            .as_str()
+            .is_some_and(|r| r.starts_with(GATE_PARENT_ERROR_SITE)),
+        "the refusal is the gate's: {ours}"
     );
     assert_ne!(
         row.delta,
         DeltaClass::Same,
-        "the served finalize stopped at this body and A went on: {row:?}"
+        "the served finalize counted the body not landed, A refused it: {row:?}"
     );
 
     let graph = &shadow.of(ShadowKind::Materialization)[0];
@@ -521,11 +516,12 @@ fn erring_fan_in(erring: usize) -> Scenario {
 
 /// The shadow lens's MEDIUM 3: the two materialization deltas apart. D1 (the
 /// erring chain): the stop point differs and the rows agree, `materialization`.
-/// D2 (a fan-in, the manager erring on either parent): A lands the sibling and
-/// the root over the erring parent, the served finalize lands neither the root
-/// nor (when the erring parent comes first) the sibling, so the rows differ,
-/// `rows_differ`. The census names D2; A's behaviour on it is the owner's
-/// ruling to come, not changed here.
+/// D2 (a fan-in, the manager erring on either parent), under the owner's D44
+/// (`dependency gate`): A lands the sibling and holds the erring parent and
+/// the root; the served finalize stops at the erring parent. When the erring
+/// parent comes first the served path lands nothing after it and A lands the
+/// sibling: the rows differ, `rows_differ`. When it comes second both land
+/// the sibling alone: the rows agree, `materialization`.
 #[tokio::test]
 async fn w2c_the_census_names_a_stop_delta_and_a_rows_delta_apart() {
     let class = |row: &GaspCensusRow| serde_json::to_value(row.delta).unwrap();
@@ -544,41 +540,46 @@ async fn w2c_the_census_names_a_stop_delta_and_a_rows_delta_apart() {
         let scenario = erring_fan_in(erring);
         let shadow = beside_unordered(&scenario).await;
         print_census(&format!("W2c fan-in erring={erring}"), &shadow);
-        let [a, b, r] = [0, 1, 2].map(|i| scenario.txs[i].id());
+        let [bad, good, r] = [erring, 1 - erring, 2].map(|i| scenario.txs[i].id());
         let graph = &shadow.of(ShadowKind::Materialization)[0];
         let served = json(&graph.served.bytes);
         let ours = json(&graph.shadow.bytes);
-        let mut landed: Vec<_> = ours["landed"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t.as_str().unwrap().to_string())
-            .collect();
-        landed.sort();
-        let mut all = vec![a.clone(), b.clone(), r.clone()];
-        all.sort();
-        assert_eq!(landed, all, "A lands both parents and the root: {ours}");
-        assert!(ours["stopped"].is_null(), "{ours}");
-        assert!(
-            !served["landed"].to_string().contains(&r),
-            "the served finalize never lands the root: {served}"
-        );
-        assert_ne!(served["rows"], ours["rows"], "D2: the rows differ");
         assert_eq!(
-            ours["rows"][format!("applied {r}")],
-            serde_json::json!("true"),
-            "{ours}"
+            ours["landed"],
+            serde_json::json!([good]),
+            "A lands the sibling alone: {ours}"
         );
+        for (tx, held) in [(&bad, "false"), (&good, "true"), (&r, "false")] {
+            assert_eq!(
+                ours["rows"][format!("applied {tx}")],
+                serde_json::json!(held),
+                "{ours}"
+            );
+        }
         assert_eq!(
             served["rows"][format!("applied {r}")],
             serde_json::json!("false"),
-            "{served}"
+            "the served finalize never lands the root: {served}"
         );
-        assert_eq!(
-            class(graph),
-            serde_json::json!("rows_differ"),
-            "D2 erring={erring}: served {served}, shadow {ours}"
-        );
+        let erring_first = served["landed"] == serde_json::json!([]);
+        if erring_first {
+            assert_ne!(served["rows"], ours["rows"], "D2: the rows differ");
+            assert_eq!(
+                class(graph),
+                serde_json::json!("rows_differ"),
+                "D2 erring={erring}: served {served}, shadow {ours}"
+            );
+        } else {
+            assert_eq!(
+                served["rows"], ours["rows"],
+                "the sibling first: the rows agree"
+            );
+            assert_eq!(
+                class(graph),
+                serde_json::json!("materialization"),
+                "erring={erring}, the sibling first: served {served}, shadow {ours}"
+            );
+        }
     }
 }
 

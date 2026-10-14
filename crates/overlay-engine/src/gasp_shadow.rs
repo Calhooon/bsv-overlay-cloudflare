@@ -17,7 +17,7 @@
 //!   unit through `admit_graph`; one census row ([`ShadowKind::Body`]).
 //! - **per graph**: a snapshot taken before the graph's first served submit;
 //!   every body walked, then `admit_graph` over the whole graph (each body its
-//!   own unit, stopping at the first that does not land), and the rows the
+//!   own unit under the dependency gate, D44), and the rows the
 //!   graph touched (its "one materialization") compared with the rows the
 //!   served submits left; one census row ([`ShadowKind::Materialization`]).
 //!
@@ -329,7 +329,18 @@ impl Word {
                 bytes: b"done".to_vec(),
                 landed_topics: vec![],
             },
-            Err(refusal) => Self::refusal(refusal),
+            Err(refusal) if manager_errors.is_empty() => Self::refusal(refusal),
+            // The dependency gate (D44) refuses a unit whose manager erred
+            // `not now`: its word still names the manager and the error.
+            Err(refusal) => Self {
+                bytes: serde_json::json!({
+                    "refusal": refusal.to_string(),
+                    "manager_errors": manager_errors,
+                })
+                .to_string()
+                .into_bytes(),
+                ..Self::refusal(refusal)
+            },
         }
     }
 
