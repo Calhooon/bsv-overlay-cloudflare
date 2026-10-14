@@ -2161,7 +2161,7 @@ mod tests {
             .find("crate::change_park::drain_parked(env,&ops_db,crate::change_park::DrainTrigger::Tick)")
             .expect("the tick delivers");
         let gasp = tick
-            .find("engine.start_gasp_sync(),")
+            .find("engine.start_gasp_sync_metered(")
             .expect("the GASP step");
         assert!(deliver < gasp, "before the GASP step and its belt");
         let ops = include_str!("ops.rs");

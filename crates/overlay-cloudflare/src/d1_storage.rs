@@ -108,15 +108,16 @@ struct PeerHealthRow {
     secs_since: Option<f64>,
 }
 
+/// Quiet cadence uses the storage clock and leaves failure health unchanged.
+pub(crate) const PEER_CADENCE_SELECT_SQL: &str = "SELECT quiet_syncs, MAX(0, quiet_retry_at - unixepoch()) AS retry_after_secs, quiet_advert AS advertisement FROM gasp_peer_health WHERE host = ?1 AND topic = ?2";
+pub(crate) const PEER_CADENCE_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health (host, topic, quiet_syncs, quiet_retry_at, quiet_advert) VALUES (?1, ?2, ?3, unixepoch() + ?4, ?5) ON CONFLICT(host, topic) DO UPDATE SET quiet_syncs = ?3, quiet_retry_at = unixepoch() + ?4, quiet_advert = ?5";
+
 /// The SHIPPED upsert behind `record_peer_sync_outcome` (bsv-low#302) —
 /// a const so the real-SQLite test executes the production string. Binds:
 /// `?1` host, `?2` topic, `?3` success (1/0). Success resets the streak and
 /// stamps `last_success`; failure increments the streak. `last_attempt` is
 /// stamped either way (the re-probe window ages from here). The backend owns
 /// the clock (`unixepoch()`), matching the engine contract.
-pub(crate) const PEER_CADENCE_SELECT_SQL: &str = "SELECT quiet_syncs, MAX(0, quiet_retry_at - unixepoch()) AS retry_after_secs, quiet_advert AS advertisement FROM gasp_peer_health WHERE host = ?1 AND topic = ?2";
-pub(crate) const PEER_CADENCE_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health (host, topic, quiet_syncs, quiet_retry_at, quiet_advert) VALUES (?1, ?2, ?3, unixepoch() + ?4, ?5) ON CONFLICT(host, topic) DO UPDATE SET quiet_syncs = ?3, quiet_retry_at = unixepoch() + ?4, quiet_advert = ?5";
-
 pub(crate) const PEER_HEALTH_UPSERT_SQL: &str = "INSERT INTO gasp_peer_health \
      (host, topic, consecutive_failures, last_attempt, last_success) \
      VALUES (?1, ?2, CASE WHEN ?3 THEN 0 ELSE 1 END, unixepoch(), \

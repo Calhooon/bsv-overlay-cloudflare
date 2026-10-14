@@ -994,7 +994,7 @@ mod tests {
             "crate::gasp_deferred::sweep_stale(",
             "crate::ef_deferred::redrive(",
             "crate::beef_blob_sweep::run_ef_deferred_pass(",
-            "engine.start_gasp_sync()",
+            "engine.start_gasp_sync_metered(",
             "peer_crawler::crawl_peers(",
             "crate::tip_pass::run_arcade_reorg_pass(",
             "crate::proof_fetcher::run_pot_maintenance(",

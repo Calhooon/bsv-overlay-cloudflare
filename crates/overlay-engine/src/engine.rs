@@ -9912,6 +9912,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_0112_refused_save_does_not_restart_a_bounded_root() {
+        let UnanchorableFixture {
+            mut engine,
+            store,
+            root,
+            ..
+        } = unanchorable_fixture();
+        store.set_deferred_graph_ceiling(Some(0));
+        let calls = std::rc::Rc::new(Cell::new(0));
+        engine.set_gasp_ancestor_fetcher(std::rc::Rc::new(LoadCourier {
+            calls: calls.clone(),
+            bounded: true,
+        }));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(calls.get(), 1, "no retry after a hard root cut");
+        assert_eq!(topic.root_bounds.len(), 1);
+        assert_eq!(result.cost.courier_rungs, 12);
+        assert!(topic.cursor_held_by.contains(&root));
+        assert_eq!(
+            topic.strikes_refused, 0,
+            "a budget cut is not a fault strike"
+        );
+        assert!(topic.dropped_graphs.iter().any(|g| g.reason == "too_many"));
+        assert_eq!(topic.finalized_graphs, 2);
+    }
+
+    #[tokio::test]
+    async fn load_0112_refused_save_does_not_extend_root_time() {
+        let (mut engine, mut remote) = budget_page_engine(1);
+        remote.node_cost_ms = 16_000;
+        let elapsed = remote.elapsed.clone();
+        let sleep: SleepFactory = std::rc::Rc::new(move |ms| {
+            let clock = elapsed.clone();
+            let due = clock.get() + ms;
+            Box::pin(std::future::poll_fn(move |_| {
+                if clock.get() >= due {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }))
+        });
+        let store = std::rc::Rc::new(MemoryStorage::new());
+        store.set_deferred_graph_ceiling(Some(0));
+        engine.storage = Box::new(store);
+        engine.set_peer_sync_budget(sleep.clone(), 30_000);
+        engine.set_graph_budget(sleep, 100, 60_000);
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(
+            remote.asked.borrow().len(),
+            1,
+            "no request after the time cut"
+        );
+        assert_eq!(topic.root_bounds.len(), 1);
+        assert_eq!(topic.root_bounds[0].reason, "time");
+        assert_eq!(topic.finalized_graphs, 0);
+        assert!(!topic.cursor_held_by.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_0112_call_limit_fallback_keeps_the_root_deadline() {
+        let UnanchorableFixture {
+            mut engine,
+            mut remote,
+            store,
+            root,
+            serve,
+            ..
+        } = unanchorable_fixture();
+        store.set_deferred_graph_ceiling(Some(0));
+        serve.set(true);
+        remote.node_cost_ms = 8_000;
+        struct DelayedCourier {
+            inner: std::rc::Rc<dyn AncestorFetcher>,
+            clock: std::rc::Rc<Cell<u64>>,
+        }
+        #[async_trait(?Send)]
+        impl AncestorFetcher for DelayedCourier {
+            async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
+                self.clock.set(self.clock.get() + 8_000);
+                tokio::task::yield_now().await;
+                self.inner.fetch_ancestor(txid).await
+            }
+            async fn verified_proof_for(&self, txid: &str) -> Option<String> {
+                self.inner.verified_proof_for(txid).await
+            }
+        }
+        engine.set_gasp_ancestor_fetcher(std::rc::Rc::new(DelayedCourier {
+            inner: engine.gasp_ancestor_fetcher.as_ref().unwrap().clone(),
+            clock: remote.elapsed.clone(),
+        }));
+        let elapsed = remote.elapsed.clone();
+        let sleep: SleepFactory = std::rc::Rc::new(move |ms| {
+            let clock = elapsed.clone();
+            let due = clock.get() + ms;
+            Box::pin(std::future::poll_fn(move |_| {
+                if clock.get() >= due {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }))
+        });
+        engine.set_peer_sync_budget(sleep.clone(), 30_000);
+        engine.set_graph_budget(sleep, 1, 60_000);
+        engine.set_gasp_remote_factory(Box::new(remote));
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert!(
+            topic
+                .root_bounds
+                .iter()
+                .any(|b| b.outpoint == root && b.reason == "time"),
+            "{topic:?}"
+        );
+        assert!(topic.cursor_held_by.contains(&root));
+        assert!(topic.dropped_graphs.iter().any(|g| g.reason == "too_many"));
+    }
+
+    #[tokio::test]
     async fn load_0112_cost_matches_the_remote_call_log() {
         let (mut engine, remote) = budget_page_engine(2);
         remote.elapsed.set(0);

@@ -22,7 +22,9 @@
 - Bound a budgeted root pass to twelve courier HTTP attempts and at most
   15,000 ms of walking, with a 1,000 ms timeout per courier request.
   `root_bounds` names the root and limiting reason; the existing durable
-  deferral path retains its work. Storage/finalize completion retains its
+  deferral path retains its work. A refused save cannot extend a time or
+  courier limit; the call/size fallback keeps the same root deadline.
+  Storage/finalize completion retains its
   existing guarded semantics. Library users still opt into graph budgets.
 - Report `calls_out`, `peer_requests`, `courier_rungs`, `storage_reads`,
   `storage_writes` and `ms` per topic and for the whole sync. Storage
