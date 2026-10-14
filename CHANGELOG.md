@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.13] - 2026-10-14
+
+- Reserve at most four six-hour retries after an unanchorable verdict, including
+  interrupted walks. Exhausted roots become passable `dead:<class>` records,
+  never resumed on the same score. A changed peer score opens a new walk.
+- Sweep dead and unanchorable records at the advert's own expiry. Count terminal
+  records and expiry removals as `gaspDead` and `gaspFaultExpired`. The authenticated
+  proof probe accepts `walk=1&readmit=1` to clear the selected topic/outpoint's
+  fault records before its diagnostic walk; the response counts the removals.
+
+DEPLOYMENT NOTE: existing JSON records default to zero retry reservations and
+unknown expiry. No lifecycle table migration, var or dependency pin changes.
+Older records can be swept through the existing expired-outpoint memo; a future
+walk also captures the advert expiry. No version bump is included here.
+
 ## [0.1.12] - 2026-10-14
 
 - Accept optional `topics` and `peers` arrays on `POST /admin/startGASPSync`.

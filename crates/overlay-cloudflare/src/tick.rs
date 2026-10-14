@@ -375,6 +375,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 // idle pass, so a captain reads the idle rule firing.
                 sum(|t| t.idle_counted)
             );
+            worker::console_log!("Scheduled: GASP dead_graphs={} expired_swept={}", sum(|t| t.dead_graphs), sum(|t| t.expired_swept));
             crate::gasp_deferred::record_counters(&ops_db, &r.topics_synced).await;
             // bsv-low #552: what the tick got done under the per-peer
             // budget. Graphs are submitted as they finalize, so a peer

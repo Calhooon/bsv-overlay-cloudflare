@@ -1198,6 +1198,8 @@ mod tests {
                 faults: 0,
                 retry_at: 0,
                 idle_resumes: 0,
+                unanchorable_retries: 0,
+                expiry: None,
             };
             for peer in peers {
                 record.peer = peer.into();

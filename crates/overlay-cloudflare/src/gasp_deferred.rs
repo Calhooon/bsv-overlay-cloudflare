@@ -425,12 +425,77 @@ pub const DEFERRED_GRAPH_DELETE_SQL: &str = "DELETE FROM gasp_deferred_graphs \
 pub const DEFERRED_GRAPHS_SWEEP_SQL: &str = "DELETE FROM gasp_deferred_graphs \
      WHERE updated_at < unixepoch() - ?1 AND reason NOT LIKE 'held:%' RETURNING host, topic, outpoint";
 
+/// Fault facts have no age-only deletion: their own advert expiry ends them.
+/// The table is already bounded to 256 keys. JSON is read only for whole rows;
+/// old records without an expiry can still be retired by the expired memo.
+pub const FAULT_EXPIRY_SWEEP_SQL: &str = "DELETE FROM gasp_deferred_graphs \
+    WHERE (reason LIKE 'held:dead:%' OR reason LIKE 'held:unanchorable:%') \
+    AND ((CASE WHEN chunks = 0 AND json_valid(record) THEN json_extract(record, '$.expiry') END) <= unixepoch() \
+      OR EXISTS (SELECT 1 FROM gasp_expired_outpoints e WHERE e.topic = gasp_deferred_graphs.topic \
+        AND e.outpoint = gasp_deferred_graphs.outpoint AND e.keep_until > unixepoch())) \
+    RETURNING host, topic, outpoint";
+
+/// An authenticated probe resets the selected outpoint on all peers of its topic.
+pub const FAULT_READMIT_SQL: &str = "DELETE FROM gasp_deferred_graphs \
+    WHERE topic = ?1 AND outpoint = ?2 \
+    AND (reason LIKE 'held:dead:%' OR reason LIKE 'held:unanchorable:%' \
+      OR reason LIKE 'retry:fault:%' OR reason LIKE 'held:retry:fault:%') \
+    RETURNING host, topic, outpoint";
+
+#[derive(Deserialize)]
+struct RetiredFault {
+    host: String,
+    topic: String,
+    outpoint: String,
+}
+
+async fn delete_fault_parts(db: &D1Database, rows: &[RetiredFault]) -> worker::Result<()> {
+    for row in rows {
+        Query::new(DEFERRED_GRAPH_CHUNKS_DELETE_SQL)
+            .bind(row.host.as_str())
+            .bind(row.topic.as_str())
+            .bind(row.outpoint.as_str())
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn readmit_fault(db: &D1Database, topic: &str, outpoint: &str) -> worker::Result<u64> {
+    let rows = Query::new(FAULT_READMIT_SQL)
+        .bind(topic)
+        .bind(outpoint)
+        .fetch_all::<RetiredFault>(db)
+        .await?;
+    delete_fault_parts(db, &rows).await?;
+    Ok(rows.len() as u64)
+}
+
+async fn sweep_fault_expiry(db: &D1Database) {
+    match Query::new(FAULT_EXPIRY_SWEEP_SQL)
+        .fetch_all::<RetiredFault>(db)
+        .await
+    {
+        Ok(rows) => {
+            if let Err(error) = delete_fault_parts(db, &rows).await {
+                worker::console_log!("GASP retired fault parts: {error}");
+            }
+            if !rows.is_empty() {
+                crate::ops::bump_counter(db, COUNTER_GASP_FAULT_EXPIRED, rows.len() as u64).await;
+                worker::console_log!("Scheduled: GASP expired fault records swept={}", rows.len());
+            }
+        }
+        Err(error) => worker::console_log!("GASP fault expiry sweep failed: {error}"),
+    }
+}
+
 /// Rows swept for age: also counted in [`COUNTER_GASP_GRAPH_DROPPED`].
 pub const COUNTER_GASP_GRAPH_DROPPED_STALE: &str = "gasp_graph_dropped_stale_total";
 
 /// Sweep the rows older than [`DEFERRED_GRAPH_STALE_SECS`] (the cron, before
 /// its GASP sync): each logged, counted `stale` and in all drops. Best effort.
 pub async fn sweep_stale(db: &D1Database) {
+    sweep_fault_expiry(db).await;
     #[derive(Deserialize)]
     struct Swept {
         host: String,
@@ -557,6 +622,8 @@ pub const COUNTER_GASP_EXPIRED_REFUSED: &str = "gasp_expired_refused_total";
 /// `UNANCHORABLE_AFTER_FAULTED_RUNS` consecutive runs and the cursor passes
 /// them; invariants' `gaspUnanchorable`.
 pub const COUNTER_GASP_UNANCHORABLE: &str = "gasp_unanchorable_total";
+pub const COUNTER_GASP_DEAD: &str = "gasp_dead_total";
+pub const COUNTER_GASP_FAULT_EXPIRED: &str = "gasp_fault_expired_total";
 /// Strikes the engine could not write (engine 0.1.10): past
 /// `FAULT_RECORDS_PER_PEER_TOPIC`, at this store's ceiling or on its fault;
 /// invariants' `gaspStrikesRefused`. Each leaves its root a gap the cursor
@@ -579,6 +646,8 @@ pub fn counter_names() -> Vec<String> {
         COUNTER_GASP_ANCHOR_WALK_HELD.to_string(),
         COUNTER_GASP_EXPIRED_REFUSED.to_string(),
         COUNTER_GASP_UNANCHORABLE.to_string(),
+        COUNTER_GASP_DEAD.to_string(),
+        COUNTER_GASP_FAULT_EXPIRED.to_string(),
         COUNTER_GASP_STRIKES_REFUSED.to_string(),
         COUNTER_GASP_ROOTS_PROVEN.to_string(),
         COUNTER_GASP_ROOTS_UNPROVEN.to_string(),
@@ -598,6 +667,8 @@ pub fn counter_deltas(
 ) -> Vec<(String, u64)> {
     let mut deltas: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for r in results.values() {
+        *deltas.entry(COUNTER_GASP_DEAD.into()).or_default() += r.dead_graphs;
+        *deltas.entry(COUNTER_GASP_FAULT_EXPIRED.into()).or_default() += r.expired_swept;
         *deltas.entry(COUNTER_GASP_ROOTS_PROVEN.into()).or_default() += r.roots_proven;
         *deltas
             .entry(COUNTER_GASP_ROOTS_UNPROVEN.into())
@@ -797,6 +868,8 @@ mod tests {
             faults: 0,
             retry_at: 0,
             idle_resumes: 0,
+            unanchorable_retries: 0,
+            expiry: None,
         }
     }
 
@@ -1931,6 +2004,8 @@ mod tests {
             backed_off_graphs: 0,
             waiting_graphs: 0,
             idle_counted: 0,
+            dead_graphs: 0,
+            expired_swept: 0,
             unanchorable_graphs: 0,
             unanchorable_cleared: 0,
             strikes_refused: 0,
@@ -1958,7 +2033,7 @@ mod tests {
         let names = counter_names();
         // Seed both the anchor hold and the sync expiry refusal, the
         // unanchorable roots (engine 0.1.9) and the refused strikes (0.1.10).
-        assert_eq!(names.len(), 11 + 10);
+        assert_eq!(names.len(), 13 + 10);
         assert!(names.contains(&COUNTER_GASP_STRIKES_REFUSED.to_string()));
         assert!(names.contains(&COUNTER_GASP_UNANCHORABLE.to_string()));
         assert!(names.contains(&COUNTER_GASP_ANCHOR_WALK_HELD.to_string()));
@@ -1969,4 +2044,5 @@ mod tests {
         // The delta-2 fold's D2-M2: a resumed walk dropped after its idle faults.
         assert!(names.contains(&"gasp_graph_dropped_idle_faults_total".to_string()));
     }
+    include!("minutes_deferred_tests.rs");
 }

@@ -1485,7 +1485,7 @@ pub async fn health_invariants(
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);
     let gasp_load = crate::gasp_cost::view(db).await;
-    let body = json!({
+    let mut body = json!({
         "ok": !dead,
         "service": "low-overlay",
         "check": "proof-completion",
@@ -1568,6 +1568,14 @@ pub async fn health_invariants(
         "gasp": { "deferredGraphs": deferred_graphs },
     });
 
+    body["gaspDead"] = counters
+        .get(crate::gasp_deferred::COUNTER_GASP_DEAD)
+        .cloned()
+        .unwrap_or(json!(0));
+    body["gaspFaultExpired"] = counters
+        .get(crate::gasp_deferred::COUNTER_GASP_FAULT_EXPIRED)
+        .cloned()
+        .unwrap_or(json!(0));
     let mut resp = Response::from_json(&body)?.with_status(status);
     crate::routes::add_cors_headers(&mut resp);
     let _ = resp.headers_mut().set("Cache-Control", "no-store");
