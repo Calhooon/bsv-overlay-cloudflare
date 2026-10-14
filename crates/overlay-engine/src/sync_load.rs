@@ -23,3 +23,33 @@ impl SyncFilter {
         self.topics.is_some() || self.peers.is_some()
     }
 }
+
+/// Three empty answers tolerate short propagation gaps. Thereafter probe at
+/// 60, 120, 240, 480, 960, 1,920 and 3,600 seconds, independent of tick rate.
+pub const QUIET_SYNCS_BEFORE_BACKOFF: u32 = 3;
+pub const QUIET_RETRY_BASE_SECS: u64 = 60;
+pub const QUIET_RETRY_MAX_SECS: u64 = 3_600;
+
+pub fn quiet_retry_secs(syncs: u32) -> u64 {
+    if syncs < QUIET_SYNCS_BEFORE_BACKOFF {
+        0
+    } else {
+        (QUIET_RETRY_BASE_SECS << (syncs - QUIET_SYNCS_BEFORE_BACKOFF).min(6))
+            .min(QUIET_RETRY_MAX_SECS)
+    }
+}
+
+/// Storage owns the clock; retry_after_secs is relative both on read and write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerCadence {
+    pub quiet_syncs: u32,
+    pub retry_after_secs: u64,
+    pub advertisement: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedPeer {
+    pub peer: String,
+    pub reason: String,
+    pub retry_after_secs: u64,
+}

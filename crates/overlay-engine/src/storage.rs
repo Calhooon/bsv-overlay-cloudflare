@@ -262,6 +262,24 @@ pub trait Storage {
     /// Get the last interaction score for a host+topic pair. Returns 0 if not found.
     async fn get_last_interaction(&self, host: &str, topic: &str) -> Result<u64, StorageError>;
 
+    /// Optional load control. An older backend stays eligible on every run.
+    async fn get_peer_cadence(
+        &self,
+        _host: &str,
+        _topic: &str,
+    ) -> Result<crate::sync_load::PeerCadence, StorageError> {
+        Ok(crate::sync_load::PeerCadence::default())
+    }
+
+    async fn set_peer_cadence(
+        &self,
+        _host: &str,
+        _topic: &str,
+        _state: &crate::sync_load::PeerCadence,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     // ========================================================================
     // GASP peer health (bsv-low#302 — dead-peer quarantine)
     // ========================================================================
@@ -456,6 +474,21 @@ pub struct PeerSyncHealth {
 /// `Box<dyn Storage>` over the same instance. Pure delegation, no semantics.
 #[async_trait(?Send)]
 impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
+    async fn get_peer_cadence(
+        &self,
+        host: &str,
+        topic: &str,
+    ) -> Result<crate::sync_load::PeerCadence, StorageError> {
+        (**self).get_peer_cadence(host, topic).await
+    }
+    async fn set_peer_cadence(
+        &self,
+        host: &str,
+        topic: &str,
+        state: &crate::sync_load::PeerCadence,
+    ) -> Result<(), StorageError> {
+        (**self).set_peer_cadence(host, topic, state).await
+    }
     async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
         (**self).insert_output(output).await
     }
@@ -701,6 +734,7 @@ pub mod memory {
     /// NOT suitable for production — no persistence, no concurrency beyond Mutex.
     #[derive(Debug, Default)]
     pub struct MemoryStorage {
+        cadence: Mutex<HashMap<(String, String), (crate::sync_load::PeerCadence, u64)>>,
         /// outputs keyed by (txid, outputIndex, topic)
         outputs: Mutex<HashMap<(String, u32, String), Output>>,
         /// BEEF data keyed by txid
@@ -1284,6 +1318,36 @@ pub mod memory {
                 .unwrap_or(&0))
         }
 
+        async fn get_peer_cadence(
+            &self,
+            host: &str,
+            topic: &str,
+        ) -> Result<crate::sync_load::PeerCadence, StorageError> {
+            let now = *self.clock_secs.lock().unwrap();
+            Ok(self
+                .cadence
+                .lock()
+                .unwrap()
+                .get(&(host.into(), topic.into()))
+                .map_or_else(Default::default, |(s, at)| {
+                    let mut state = s.clone();
+                    state.retry_after_secs = at.saturating_sub(now);
+                    state
+                }))
+        }
+        async fn set_peer_cadence(
+            &self,
+            host: &str,
+            topic: &str,
+            state: &crate::sync_load::PeerCadence,
+        ) -> Result<(), StorageError> {
+            let now = *self.clock_secs.lock().unwrap();
+            self.cadence.lock().unwrap().insert(
+                (host.into(), topic.into()),
+                (state.clone(), now.saturating_add(state.retry_after_secs)),
+            );
+            Ok(())
+        }
         async fn record_peer_sync_outcome(
             &self,
             host: &str,

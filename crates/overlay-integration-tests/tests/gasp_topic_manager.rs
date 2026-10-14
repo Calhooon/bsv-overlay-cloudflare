@@ -9496,16 +9496,18 @@ async fn dead_port_adverts(dead_ports: u16) -> (usize, usize) {
 // them wrote ONE failure row (the origin's): eight quarantined the honest
 // peer (synced on 4 of 96 ticks), seven were never quarantined (672 dead-port
 // slices in 96 ticks). One peer per origin: the honest advert is the peer,
-// attended on every tick, and no dead port is ever asked.
+// attended at its quiet cadence, and no dead port is ever asked.
 #[tokio::test]
 async fn e555d4_m1_dead_port_adverts_of_an_honest_host_do_not_silence_it() {
     let (_logs, _guard) = capture_logs();
+    let baseline = dead_port_adverts(0).await;
+    assert_eq!(baseline, (30, 0), "quiet probes over 96 quarter-hour ticks");
     for dead_ports in [8, 12, 7, 1] {
         let (honest, dead) = dead_port_adverts(dead_ports).await;
         assert_eq!(
             (honest, dead),
-            (96, 0),
-            "{dead_ports} dead-port adverts: the honest peer on every tick, no dead-port slice"
+            baseline,
+            "{dead_ports} dead-port adverts: the honest cadence is unchanged, no dead-port slice"
         );
     }
 }
