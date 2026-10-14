@@ -5087,6 +5087,8 @@ impl Engine {
             let mut dropped_graphs: Vec<DroppedDeferral> = Vec::new();
             let mut stalled_graphs: u64 = 0;
             let mut held_back_graphs: u64 = 0;
+            let mut dead_graphs = 0;
+            let mut expired_swept = 0;
             let mut unanchorable_graphs: u64 = 0;
             let mut unanchorable_cleared: u64 = 0;
             let mut strikes_refused: u64 = 0;
@@ -5555,6 +5557,8 @@ impl Engine {
                         reason: d.reason.as_str().to_string(),
                     }));
                     // Engine 0.1.9: the roots dropped, each with why.
+                    dead_graphs += sync.dead_recorded();
+                    expired_swept += sync.expired_swept();
                     unanchorable_graphs += sync.unanchorable_recorded();
                     unanchorable_cleared += sync.unanchorable_cleared();
                     // Engine 0.1.10: a strike not written is a fact.
@@ -5633,6 +5637,8 @@ impl Engine {
                     backed_off_graphs,
                     waiting_graphs,
                     idle_counted,
+                    dead_graphs,
+                    expired_swept,
                     unanchorable_graphs,
                     unanchorable_cleared,
                     strikes_refused,
@@ -6226,6 +6232,10 @@ pub struct GASPSyncResult {
 /// Sync result for a single topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicSyncResult {
+    #[serde(default)]
+    pub dead_graphs: u64,
+    #[serde(default)]
+    pub expired_swept: u64,
     #[serde(default, flatten)]
     pub cost: crate::meter::SyncCost,
     #[serde(default)]
@@ -8958,6 +8968,8 @@ mod tests {
                 backed_off_graphs: 0,
                 waiting_graphs: 0,
                 idle_counted: 0,
+                dead_graphs: 0,
+                expired_swept: 0,
                 unanchorable_graphs: 0,
                 unanchorable_cleared: 0,
                 strikes_refused: 0,
@@ -10313,6 +10325,8 @@ mod tests {
             faults: 0,
             retry_at: 0,
             idle_resumes: 0,
+            unanchorable_retries: 0,
+            expiry: None,
         }
     }
 
@@ -13518,4 +13532,5 @@ mod tests {
             assert_eq!(verdict, Ok(()), "{what}");
         }
     }
+    include!("minutes_tests.rs");
 }

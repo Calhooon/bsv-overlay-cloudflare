@@ -524,6 +524,11 @@ pub const UNANCHORABLE_AFTER_FAULTED_RUNS: u32 = 3;
 /// root and clears the record; nothing is admitted unanchored (T2).
 pub const UNANCHORABLE_RETRY_SECS: u64 = 6 * 3600;
 
+/// Four retries, six hours apart, cover one day after an unanchorable verdict.
+/// A spent allowance is a durable fact until a new score or operator reset.
+pub const UNANCHORABLE_RETRIES: u32 = 4;
+pub const DEAD_REASON: &str = "dead:";
+
 /// A held (passable) record resumed this many CONSECUTIVE passes with no
 /// node appended goes to the long backoff (engine 0.1.10): it is not resumed
 /// again until [`IDLE_RESUME_RETRY_SECS`] have passed, so the resumes' shared
@@ -828,6 +833,12 @@ pub struct DeferredGraph {
     /// written, so their JSON is unchanged).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub idle_resumes: u32,
+    /// Retry reservations made after the unanchorable verdict, including cuts.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub unanchorable_retries: u32,
+    /// Advert expiry read by the topic manager from the content-addressed root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry: Option<u64>,
 }
 
 // serde's `skip_serializing_if` passes the field by reference.
@@ -846,12 +857,17 @@ impl DeferredGraph {
     pub fn is_struck(&self) -> bool {
         self.faults > 0
             && (self.reason.starts_with(FAULT_RETRY_REASON)
-                || self.reason.starts_with(UNANCHORABLE_REASON))
+                || self.reason.starts_with(UNANCHORABLE_REASON)
+                || self.reason.starts_with(DEAD_REASON))
     }
 
     /// Whether this record holds an unanchorable root (passable).
     pub fn is_unanchorable(&self) -> bool {
         self.is_struck() && self.reason.starts_with(UNANCHORABLE_REASON)
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.is_struck() && self.reason.starts_with(DEAD_REASON)
     }
 
     /// Whether this held record waits out the long backoff of its idle
@@ -868,7 +884,8 @@ impl DeferredGraph {
             return None;
         }
         self.reason
-            .strip_prefix(UNANCHORABLE_REASON)
+            .strip_prefix(DEAD_REASON)
+            .or_else(|| self.reason.strip_prefix(UNANCHORABLE_REASON))
             .or_else(|| self.reason.strip_prefix(FAULT_RETRY_REASON))
     }
 
@@ -1599,6 +1616,9 @@ pub struct GASPSync<'a> {
     unanchorable_recorded: std::cell::Cell<u64>,
     /// See [`Self::unanchorable_cleared`].
     unanchorable_cleared: std::cell::Cell<u64>,
+    dead_recorded: std::cell::Cell<u64>,
+    expired_swept: std::cell::Cell<u64>,
+    root_expiries: std::cell::RefCell<std::collections::HashMap<String, u64>>,
 }
 
 impl<'a> GASPSync<'a> {
@@ -1661,6 +1681,9 @@ impl<'a> GASPSync<'a> {
             faulted: std::cell::RefCell::default(),
             unanchorable_recorded: std::cell::Cell::new(0),
             unanchorable_cleared: std::cell::Cell::new(0),
+            dead_recorded: std::cell::Cell::new(0),
+            expired_swept: std::cell::Cell::new(0),
+            root_expiries: std::cell::RefCell::default(),
         }
     }
 
@@ -1736,6 +1759,14 @@ impl<'a> GASPSync<'a> {
     /// Roots with a fault record (unanchorable or not yet) that the last
     /// `sync` walked again and admitted or refused on a verdict: their
     /// record cleared.
+    pub fn dead_recorded(&self) -> u64 {
+        self.dead_recorded.get()
+    }
+
+    pub fn expired_swept(&self) -> u64 {
+        self.expired_swept.get()
+    }
+
     pub fn unanchorable_cleared(&self) -> u64 {
         self.unanchorable_cleared.get()
     }
@@ -1799,10 +1830,13 @@ impl<'a> GASPSync<'a> {
 
     fn root_expired(&self, node: &GASPNode, outpoint: &str) -> Result<bool, GASPError> {
         let now = (crate::engine::current_timestamp_ms() / 1000.0) as u64;
-        let expiry = self
-            .storage
-            .sync_expiry(node, outpoint)?
-            .filter(|expiry| *expiry <= now);
+        let expiry = self.storage.sync_expiry(node, outpoint)?;
+        if let Some(expiry) = expiry {
+            self.root_expiries
+                .borrow_mut()
+                .insert(outpoint.to_string(), expiry);
+        }
+        let expiry = expiry.filter(|expiry| *expiry <= now);
         if expiry.is_some() {
             self.refused_expiry.set(expiry);
         }
@@ -1860,6 +1894,71 @@ impl<'a> GASPSync<'a> {
             self.drop_record(outpoint, DropReason::Refused).await;
         }
         Ok(Ingested::Expired)
+    }
+
+    /// Retire only fault facts whose own advert expired. No remote read.
+    async fn sweep_expired_record(&self, outpoint: &str) -> Result<bool, GASPError> {
+        let record = self.storage.get_deferred_graph(outpoint).await?;
+        let Some(record) = record.filter(|r| r.is_unanchorable() || r.is_dead()) else {
+            return Ok(false);
+        };
+        self.read_record(Some(&record));
+        if record.expiry.is_none_or(|expiry| expiry > Self::now_secs())
+            && !self.expired.borrow().contains(outpoint)
+        {
+            return Ok(false);
+        }
+        // Remember before deletion, so a later page cannot reopen an expired root.
+        self.storage
+            .remember_expired(outpoint, record.expiry.unwrap_or(Self::now_secs()))
+            .await?;
+        self.storage.delete_deferred_graph(outpoint).await?;
+        self.forget_record(outpoint);
+        self.deferred.borrow_mut().remove(outpoint);
+        self.expired.borrow_mut().insert(outpoint.to_string());
+        self.expired_swept.set(self.expired_swept.get() + 1);
+        Ok(true)
+    }
+
+    fn note_dead(&self, record: &DeferredGraph) {
+        self.dead_recorded.set(self.dead_recorded.get() + 1);
+        let mut faulted = self.faulted.borrow_mut();
+        faulted.retain(|f| f.outpoint != record.outpoint);
+        faulted.push(FaultedRoot {
+            peer: String::new(),
+            outpoint: record.outpoint.clone(),
+            class: record.reason.clone(),
+            faults: record.faults,
+            unanchorable: true,
+            error: format!("retry allowance spent: {}", record.unanchorable_retries),
+            refused: String::new(),
+        });
+        warn!(
+            "{} Root {} {} after {} retries",
+            self.log_prefix, record.outpoint, record.reason, record.unanchorable_retries
+        );
+    }
+
+    async fn keep_unanchorable(&self, record: &DeferredGraph) -> Result<(), GASPError> {
+        let mut kept = record.clone();
+        kept.retry_at = Self::now_secs() + UNANCHORABLE_RETRY_SECS;
+        if kept.unanchorable_retries >= UNANCHORABLE_RETRIES {
+            kept.reason = format!(
+                "{DEAD_REASON}{}",
+                record.fault_class().unwrap_or(fault_class::OTHER)
+            );
+            kept.retry_at = 0;
+        }
+        if self.storage.save_deferred_graph(&kept).await? != DeferredGraphSave::Saved {
+            return Err(GASPError::StorageError(
+                "could not retain retry allowance".into(),
+            ));
+        }
+        self.know_fault_record(&kept.outpoint);
+        if kept.is_dead() && !record.is_dead() {
+            self.note_dead(&kept);
+        }
+        Ok(())
     }
 
     /// Unix seconds now, the clock of an unanchorable root's backoff.
@@ -2012,7 +2111,14 @@ impl<'a> GASPSync<'a> {
             return refuse(strike_refused::NO_ROOM);
         }
         let mut record = Self::fresh_walk(score, outpoint, PassCap::NONE).record;
-        record.faults = prior.map_or(0, |r| r.faults) + 1;
+        record.faults = prior.map_or(0, |r| r.faults).saturating_add(1);
+        record.unanchorable_retries = prior.map_or(0, |r| r.unanchorable_retries);
+        record.expiry = self
+            .root_expiries
+            .borrow()
+            .get(outpoint)
+            .copied()
+            .or_else(|| prior.and_then(|r| r.expiry));
         let unanchorable =
             class == fault_class::NOT_FOUND || record.faults >= UNANCHORABLE_AFTER_FAULTED_RUNS;
         // A record the cursor had passed stays passable (engine 0.1.11): the
@@ -2024,8 +2130,15 @@ impl<'a> GASPSync<'a> {
         } else {
             record.reason = format!("{FAULT_RETRY_REASON}{class}");
         }
+        if unanchorable && record.unanchorable_retries >= UNANCHORABLE_RETRIES {
+            record.reason = format!("{DEAD_REASON}{class}");
+            record.retry_at = 0;
+        }
         match self.storage.save_deferred_graph(&record).await {
             Ok(DeferredGraphSave::Saved) => {
+                if record.is_dead() && !prior.is_some_and(DeferredGraph::is_dead) {
+                    self.note_dead(&record);
+                }
                 // A new key holds a fault record and no deferred slot; a
                 // held record struck on its own slot frees its deferred
                 // slot for the fault record (engine 0.1.11); a prior fault
@@ -2072,12 +2185,12 @@ impl<'a> GASPSync<'a> {
         &self,
         utxo: &GASPOutput,
         outpoint: &str,
-        record: DeferredGraph,
+        mut record: DeferredGraph,
         deadline: &mut crate::engine::SleepFuture,
         cap: PassCap,
     ) -> Result<Ingested, GASPError> {
         let score = utxo.score as u64;
-        if record.is_unanchorable() && Self::now_secs() < record.retry_at {
+        if record.is_dead() || (record.is_unanchorable() && Self::now_secs() < record.retry_at) {
             // Not asked of the peer: not an attempt for the yieldless
             // streak (a quiet peer holding one is never quarantined for it).
             self.graphs_attempted
@@ -2088,6 +2201,22 @@ impl<'a> GASPSync<'a> {
             );
             return Ok(Ingested::Unanchorable);
         }
+        if record.is_unanchorable() {
+            if record.unanchorable_retries >= UNANCHORABLE_RETRIES {
+                self.keep_unanchorable(&record).await?;
+                self.graphs_attempted
+                    .set(self.graphs_attempted.get().saturating_sub(1));
+                return Ok(Ingested::Unanchorable);
+            }
+            // Reserve before dispatch: cancellation cannot buy another retry.
+            record.unanchorable_retries += 1;
+            record.retry_at = Self::now_secs() + UNANCHORABLE_RETRY_SECS;
+            if self.storage.save_deferred_graph(&record).await? != DeferredGraphSave::Saved {
+                return Err(GASPError::StorageError(
+                    "could not reserve unanchorable retry".into(),
+                ));
+            }
+        }
         info!(
             "{} Walking root {} again after {} faulted runs ({}) (engine 0.1.9)",
             self.log_prefix, outpoint, record.faults, record.reason
@@ -2097,23 +2226,21 @@ impl<'a> GASPSync<'a> {
         *self.walk.borrow_mut() = Some(walk);
         let ended = self.walk_graph(Some(&mut *deadline)).await;
         let out = self.finish_pass(outpoint, ended, deadline).await;
-        let keep_unanchorable = |record: &DeferredGraph| {
-            let mut record = record.clone();
-            record.retry_at = Self::now_secs() + UNANCHORABLE_RETRY_SECS;
-            record
-        };
         match out {
+            Ok(ingested)
+                if record.is_unanchorable()
+                    && !matches!(ingested, Ingested::Completed | Ingested::Expired) =>
+            {
+                self.keep_unanchorable(&record).await?;
+                Ok(Ingested::Unanchorable)
+            }
             // A stall of the graph's own deadline does not undo the record:
             // the empty retry `save_walk` wrote is replaced again. So for a
             // passable fault record struck on a held record's slot (engine
             // 0.1.11): the empty retry would hold the cursor it had passed.
             Ok(Ingested::Retry) if record.cursor_passable => {
                 let unanchorable = record.is_unanchorable();
-                let kept = if unanchorable {
-                    keep_unanchorable(&record)
-                } else {
-                    record.clone()
-                };
+                let kept = record.clone();
                 if let Ok(DeferredGraphSave::Saved) = self.storage.save_deferred_graph(&kept).await
                 {
                     // A fault record again, not a deferred slot (0.1.10).
@@ -2141,10 +2268,7 @@ impl<'a> GASPSync<'a> {
                         },
                     );
                     if record.is_unanchorable() {
-                        let _ = self
-                            .storage
-                            .save_deferred_graph(&keep_unanchorable(&record))
-                            .await;
+                        self.keep_unanchorable(&record).await?;
                         return Ok(Ingested::Unanchorable);
                     }
                     return Err(error);
@@ -2315,6 +2439,9 @@ impl<'a> GASPSync<'a> {
         self.faulted.borrow_mut().clear();
         self.unanchorable_recorded.set(0);
         self.unanchorable_cleared.set(0);
+        self.dead_recorded.set(0);
+        self.expired_swept.set(0);
+        self.root_expiries.borrow_mut().clear();
         self.strikes_refused.set(0);
         self.fault_records.borrow_mut().clear();
         self.fault_keys_unread.set(false);
@@ -2412,6 +2539,10 @@ impl<'a> GASPSync<'a> {
                 *self.resume_deadline.borrow_mut() = Some(deadline);
             }
         }
+        let held_scores: std::collections::HashMap<String, u64> = held_keys
+            .iter()
+            .map(|key| (key.outpoint.clone(), key.score))
+            .collect();
         for key in held_keys {
             // This key is reached now (engine 0.1.11: the fault bound of a
             // strike in the held loop counts the keys after it).
@@ -2420,6 +2551,10 @@ impl<'a> GASPSync<'a> {
             if known_outpoints.contains(&key.outpoint) {
                 self.deferred.borrow_mut().remove(&key.outpoint);
                 self.drop_record(&key.outpoint, DropReason::Held).await;
+                shared_outpoints.insert(key.outpoint);
+                continue;
+            }
+            if self.sweep_expired_record(&key.outpoint).await? {
                 shared_outpoints.insert(key.outpoint);
                 continue;
             }
@@ -2560,6 +2695,19 @@ impl<'a> GASPSync<'a> {
                 }
 
                 let outpoint = format!("{}.{}", utxo.txid, utxo.output_index);
+                if held_scores
+                    .get(&outpoint)
+                    .is_some_and(|score| *score != utxo.score as u64)
+                    && self
+                        .storage
+                        .get_deferred_graph(&outpoint)
+                        .await?
+                        .is_some_and(|r| r.is_unanchorable() || r.is_dead())
+                {
+                    shared_outpoints.remove(&outpoint);
+                    failed_outpoints.remove(&outpoint);
+                    self.deferred.borrow_mut().insert(outpoint.clone());
+                }
                 if known_outpoints.contains(&outpoint) {
                     self.cursor_yielded.set(true);
                     // A deferred graph whose UTXO the node now holds (it
@@ -2824,10 +2972,9 @@ impl<'a> GASPSync<'a> {
             }
             // An unanchorable root inside its backoff would not be walked
             // anyway: not held back, and no attempt (engine 0.1.11).
-            if record
-                .as_ref()
-                .is_some_and(|r| r.is_unanchorable() && Self::now_secs() < r.retry_at)
-            {
+            if record.as_ref().is_some_and(|r| {
+                r.is_dead() || (r.is_unanchorable() && Self::now_secs() < r.retry_at)
+            }) {
                 self.graphs_attempted
                     .set(self.graphs_attempted.get().saturating_sub(1));
                 return Ok(Ingested::Unanchorable);
@@ -2983,6 +3130,8 @@ impl<'a> GASPSync<'a> {
                 faults: 0,
                 retry_at: 0,
                 idle_resumes: 0,
+                unanchorable_retries: 0,
+                expiry: None,
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
@@ -3011,7 +3160,7 @@ impl<'a> GASPSync<'a> {
     ) -> Result<Ingested, GASPError> {
         let score = utxo.score as u64;
         // A read fault fails the UTXO and keeps the record for the next sync.
-        let record = if from_record {
+        let mut record = if from_record {
             let record = self.storage.get_deferred_graph(outpoint).await?;
             self.read_record(record.as_ref());
             if record.is_none() {
@@ -3023,6 +3172,14 @@ impl<'a> GASPSync<'a> {
         } else {
             None
         };
+        if record
+            .as_ref()
+            .is_some_and(|r| (r.is_unanchorable() || r.is_dead()) && r.score != score)
+        {
+            self.storage.delete_deferred_graph(outpoint).await?;
+            self.forget_record(outpoint);
+            record = None;
+        }
         if let Some(record) = record.as_ref().filter(|r| r.is_struck()) {
             return self
                 .rewalk_struck(utxo, outpoint, record.clone(), deadline, cap)
@@ -3719,11 +3876,10 @@ impl<'a> GASPSync<'a> {
             .borrow()
             .as_ref()
             .and_then(|w| w.struck.as_deref().filter(|r| r.is_unanchorable()).cloned());
-        if let Some(mut record) = unanchorable {
+        if let Some(record) = unanchorable {
             self.walk.borrow_mut().take();
-            record.retry_at = Self::now_secs() + UNANCHORABLE_RETRY_SECS;
             let outpoint = record.outpoint.clone();
-            if let Err(e) = self.storage.save_deferred_graph(&record).await {
+            if let Err(e) = self.keep_unanchorable(&record).await {
                 warn!(
                     "{} Could not keep unanchorable root {} at the deadline: {}",
                     self.log_prefix, outpoint, e
@@ -3940,6 +4096,8 @@ impl<'a> GASPSync<'a> {
                 faults: 0,
                 retry_at: 0,
                 idle_resumes: 0,
+                unanchorable_retries: 0,
+                expiry: None,
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,

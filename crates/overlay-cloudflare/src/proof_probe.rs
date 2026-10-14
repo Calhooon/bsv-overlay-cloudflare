@@ -1,4 +1,4 @@
-//! Authenticated, read-only evidence for one transaction's proof ladder.
+//! Authenticated proof evidence; explicit readmit resets a fault record.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -186,6 +186,12 @@ pub(crate) async fn handle(env: &Env, req: &Request) -> worker::Result<Response>
         {
             return Response::error("topic must be a topic manager name", 400);
         }
+        let cleared = if param("readmit").as_deref() == Some("1") {
+            let db = env.d1("OVERLAY_DB")?;
+            crate::gasp_deferred::readmit_fault(&db, &topic, &format!("{txid}.{vout}")).await?
+        } else {
+            0
+        };
         // The configured peers only (the SHIP and SLAP trackers, which
         // carry the UHRP history): never a URL from the request.
         let peers: Vec<(String, Box<dyn overlay_engine::gasp::GASPRemote>)> =
@@ -206,7 +212,9 @@ pub(crate) async fn handle(env: &Env, req: &Request) -> worker::Result<Response>
             Box::pin(crate::broadcaster::sleep_ms(PROBE_WALK_STEP_MS))
         };
         let walk = probe_walk(&peers, &courier, &txid, vout, &deadline).await;
-        return Response::from_json(&json!({"txid": txid, "topic": topic, "walk": walk}));
+        return Response::from_json(
+            &json!({"txid": txid, "topic": topic, "walk": walk, "faultRecordsCleared": cleared}),
+        );
     }
     // This path bypasses migrations and engine construction. A missing table
     // is an explicit read error, never a reason to initialize storage here.
