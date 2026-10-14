@@ -415,6 +415,100 @@ struct TopicValidation {
     read_fault: Option<(&'static str, String)>,
 }
 
+// Build preflight and notification payloads in one place. Only one payload is
+// held at a time, including WholeTx, so preflight does not retain a second
+// collection of scripts or BEEF bodies beside the apply phase.
+struct LookupPayloads<'a> {
+    tx: &'a Transaction,
+    txid: &'a str,
+    atomic_beef: &'a [u8],
+    off_chain_values: Option<&'a [u8]>,
+}
+
+impl LookupPayloads<'_> {
+    fn admitted(
+        &self,
+        topic: &str,
+        output_index: u32,
+        mode: AdmissionMode,
+    ) -> OutputAdmittedByTopic {
+        let tx = self.tx;
+        let txid = self.txid;
+        let (ls_script, ls_sats) = if let Some(tx_out) = tx.outputs.get(output_index as usize) {
+            (tx_out.locking_script.to_binary(), tx_out.get_satoshis())
+        } else {
+            (Vec::new(), 0)
+        };
+
+        match mode {
+            AdmissionMode::LockingScript => OutputAdmittedByTopic::LockingScript {
+                txid: txid.to_owned(),
+                output_index,
+                topic: topic.to_owned(),
+                satoshis: ls_sats,
+                locking_script: ls_script,
+                off_chain_values: self.off_chain_values.map(<[u8]>::to_vec),
+            },
+            AdmissionMode::WholeTx => OutputAdmittedByTopic::WholeTx {
+                atomic_beef: self.atomic_beef.to_vec(),
+                output_index,
+                topic: topic.to_owned(),
+                off_chain_values: self.off_chain_values.map(<[u8]>::to_vec),
+            },
+        }
+    }
+
+    fn spent(
+        &self,
+        topic: &str,
+        prev_output: &Output,
+        spending_input_idx: usize,
+        mode: SpendNotificationMode,
+    ) -> OutputSpent {
+        let tx = self.tx;
+        let txid = self.txid;
+        match mode {
+            SpendNotificationMode::None => OutputSpent::None {
+                txid: prev_output.txid.to_owned(),
+                output_index: prev_output.output_index,
+                topic: topic.to_owned(),
+            },
+            SpendNotificationMode::Txid => OutputSpent::Txid {
+                txid: prev_output.txid.to_owned(),
+                output_index: prev_output.output_index,
+                topic: topic.to_owned(),
+                spending_txid: txid.to_owned(),
+            },
+            SpendNotificationMode::Script => {
+                // Extract unlocking script and sequence from the spending input
+                let input = &tx.inputs[spending_input_idx];
+                let unlocking_script = input
+                    .unlocking_script
+                    .as_ref()
+                    .map(bsv_rs::UnlockingScript::to_binary)
+                    .unwrap_or_default();
+                OutputSpent::Script {
+                    txid: prev_output.txid.to_owned(),
+                    output_index: prev_output.output_index,
+                    topic: topic.to_owned(),
+                    spending_txid: txid.to_owned(),
+                    input_index: spending_input_idx as u32,
+                    unlocking_script,
+                    sequence_number: input.sequence,
+                    off_chain_values: self.off_chain_values.map(<[u8]>::to_vec),
+                }
+            }
+            SpendNotificationMode::WholeTx => OutputSpent::WholeTx {
+                txid: prev_output.txid.to_owned(),
+                output_index: prev_output.output_index,
+                topic: topic.to_owned(),
+                spending_atomic_beef: self.atomic_beef.to_vec(),
+                off_chain_values: self.off_chain_values.map(<[u8]>::to_vec),
+            },
+        }
+    }
+}
+
 /// One Phase-3 write — or the validation read it depends on — that FAILED
 /// during a submit (S2 queue-durable admission, bsv-low 2026-08-29).
 ///
@@ -1610,6 +1704,44 @@ impl Engine {
             }
         }
 
+        // Pure checks run after all judgements and successor handling, before
+        // the first apply write of any topic. Refusals suppress only their topic.
+        let payloads = LookupPayloads {
+            tx: &tx,
+            txid: &txid,
+            atomic_beef: &subject_named_beef,
+            off_chain_values: tagged_beef.off_chain_values.as_deref(),
+        };
+        let mut refused_topics = HashSet::new();
+        for v in &validations {
+            if v.is_dupe || v.failed || v.read_fault.is_some() || waits.contains_key(&v.topic) {
+                continue;
+            }
+            for (prev_idx, prev_output) in v.previous_outputs.iter().enumerate() {
+                for ls in self.lookup_services.values() {
+                    let payload = payloads.spent(
+                        &v.topic,
+                        prev_output,
+                        v.previous_coins[prev_idx] as usize,
+                        ls.spend_notification_mode(),
+                    );
+                    if let Err(error) = ls.check_spent(&payload) {
+                        report.fault(&v.topic, "lookup_service.check_spent", error.to_string());
+                        refused_topics.insert(v.topic.clone());
+                    }
+                }
+            }
+            for &output_index in &v.admittance.outputs_to_admit {
+                for ls in self.lookup_services.values() {
+                    let payload = payloads.admitted(&v.topic, output_index, ls.admission_mode());
+                    if let Err(error) = ls.check_admitted(&payload) {
+                        report.fault(&v.topic, "lookup_service.check_admitted", error.to_string());
+                        refused_topics.insert(v.topic.clone());
+                    }
+                }
+            }
+        }
+
         // =================================================================
         // PHASE 3: MUTATE STORAGE
         // =================================================================
@@ -1624,6 +1756,11 @@ impl Engine {
             // replay. Parity: the reference fails the topic and never
             // replays. Nothing was written, so the store is as it was.
             if v.failed {
+                continue;
+            }
+
+            if refused_topics.contains(&v.topic) {
+                self.hold_unapplied(&txid, &v.topic, "lookup check refused, nothing applied");
                 continue;
             }
 
@@ -1716,45 +1853,12 @@ impl Engine {
 
                 // Notify all lookup services about the spent output
                 for ls in self.lookup_services.values() {
-                    let payload = match ls.spend_notification_mode() {
-                        SpendNotificationMode::None => OutputSpent::None {
-                            txid: prev_output.txid.clone(),
-                            output_index: prev_output.output_index,
-                            topic: topic.clone(),
-                        },
-                        SpendNotificationMode::Txid => OutputSpent::Txid {
-                            txid: prev_output.txid.clone(),
-                            output_index: prev_output.output_index,
-                            topic: topic.clone(),
-                            spending_txid: txid.clone(),
-                        },
-                        SpendNotificationMode::Script => {
-                            // Extract unlocking script and sequence from the spending input
-                            let input = &tx.inputs[spending_input_idx];
-                            let unlocking_script = input
-                                .unlocking_script
-                                .as_ref()
-                                .map(bsv_rs::UnlockingScript::to_binary)
-                                .unwrap_or_default();
-                            OutputSpent::Script {
-                                txid: prev_output.txid.clone(),
-                                output_index: prev_output.output_index,
-                                topic: topic.clone(),
-                                spending_txid: txid.clone(),
-                                input_index: spending_input_idx as u32,
-                                unlocking_script,
-                                sequence_number: input.sequence,
-                                off_chain_values: tagged_beef.off_chain_values.clone(),
-                            }
-                        }
-                        SpendNotificationMode::WholeTx => OutputSpent::WholeTx {
-                            txid: prev_output.txid.clone(),
-                            output_index: prev_output.output_index,
-                            topic: topic.clone(),
-                            spending_atomic_beef: subject_named_beef.clone(),
-                            off_chain_values: tagged_beef.off_chain_values.clone(),
-                        },
-                    };
+                    let payload = payloads.spent(
+                        topic,
+                        prev_output,
+                        spending_input_idx,
+                        ls.spend_notification_mode(),
+                    );
                     if let Err(e) = hooked(bound, ls.output_spent(&payload)).await {
                         error!("Error notifying lookup service of spent output: {e}");
                         report.fault(topic, "lookup_service.output_spent", e);
@@ -1814,29 +1918,7 @@ impl Engine {
 
                 // Notify lookup services
                 for ls in self.lookup_services.values() {
-                    let (ls_script, ls_sats) =
-                        if let Some(tx_out) = tx.outputs.get(output_index as usize) {
-                            (tx_out.locking_script.to_binary(), tx_out.get_satoshis())
-                        } else {
-                            (Vec::new(), 0)
-                        };
-
-                    let payload = match ls.admission_mode() {
-                        AdmissionMode::LockingScript => OutputAdmittedByTopic::LockingScript {
-                            txid: txid.clone(),
-                            output_index,
-                            topic: topic.clone(),
-                            satoshis: ls_sats,
-                            locking_script: ls_script,
-                            off_chain_values: tagged_beef.off_chain_values.clone(),
-                        },
-                        AdmissionMode::WholeTx => OutputAdmittedByTopic::WholeTx {
-                            atomic_beef: subject_named_beef.clone(),
-                            output_index,
-                            topic: topic.clone(),
-                            off_chain_values: tagged_beef.off_chain_values.clone(),
-                        },
-                    };
+                    let payload = payloads.admitted(topic, output_index, ls.admission_mode());
 
                     if let Err(e) = hooked(bound, ls.output_admitted_by_topic(&payload)).await {
                         error!("Error notifying lookup service: {e}");
