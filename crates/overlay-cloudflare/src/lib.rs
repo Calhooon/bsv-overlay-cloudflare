@@ -36,6 +36,7 @@ pub mod ops;
 pub mod peer_crawler;
 pub mod pot_changes;
 pub mod proof_fetcher;
+mod proof_probe;
 pub mod proof_window;
 pub mod queue;
 pub mod relatch;
@@ -279,6 +280,13 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
             }
             _ => {}
         }
+    }
+
+    if req.method() == Method::Get && req.path() == "/admin/proof-probe" {
+        if let Err(response) = check_admin_auth(&req, &env) {
+            return response;
+        }
+        return proof_probe::handle(&env, &req).await;
     }
 
     // D1 database binding
@@ -649,6 +657,7 @@ pub(crate) fn courier_fetcher(
         f = f.with_arcade_url(u);
     }
     f.with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|k| k.to_string()))
+        .with_proof_fault_store(env.d1("OVERLAY_DB").ok().map(Rc::new))
 }
 
 pub(crate) fn lookup_service_chain_tracker(
@@ -1258,11 +1267,19 @@ const GASP_PROOF_FETCH_BUDGET: u32 = (GASP_PEER_SYNC_BUDGET_MS / 500) as u32;
 /// so this is what keeps a hung D1 call from holding them.
 const GASP_FINALIZE_SUBMIT_BUDGET_MS: u64 = 30_000;
 
-/// Complete admitted transactions before the network sync and maintenance.
-/// Its courier is independent of the sync courier and retains the default allowance.
-const TRANSACTION_PROOF_COMPLETION_LIMIT: u64 =
-    crate::proof_fetcher::DEFAULT_FETCH_BUDGET as u64 / 2;
+/// Completion has 30 s and plans 500 ms per candidate: 60 attempts.
+/// Proof-only work uses at most 5 HTTP reads + 3 header reads + 3 fault
+/// counter writes: 60 * 11 = 660 of the paid 1,000 subrequests. This leaves
+/// 340 for storage, setup and other work. This is an allowance
+/// per pass, not a guarantee for the whole invocation's aggregate traffic.
 const TRANSACTION_PROOF_COMPLETION_BUDGET_MS: u64 = 30_000;
+const TRANSACTION_PROOF_FETCH_BUDGET: u32 = (TRANSACTION_PROOF_COMPLETION_BUDGET_MS / 500) as u32;
+const TRANSACTION_PROOF_COMPLETION_LIMIT: u64 = TRANSACTION_PROOF_FETCH_BUDGET as u64;
+
+fn transaction_proof_fetcher(env: &Env) -> crate::proof_fetcher::ChainProofFetcher {
+    courier_fetcher(env, lookup_service_chain_tracker(env))
+        .with_budget(TRANSACTION_PROOF_FETCH_BUDGET)
+}
 
 #[event(scheduled)]
 async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::ScheduleContext) {
@@ -1422,16 +1439,28 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     // 1. transactions store (engine + ancestor fetcher). #228: backstop-gated —
     //    /arc-ingest push is the primary source; only rows older than
     //    PUSH_BACKSTOP_MIN_AGE_SECS are polled.
-    let budget = u64::from(crate::proof_fetcher::DEFAULT_FETCH_BUDGET);
+    let completion_fetcher = transaction_proof_fetcher(env);
     let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
-    let (tx_completed, tx_fetch_failed) =
-        match engine.complete_missing_proofs(budget, backstop_age).await {
-            Ok(s) => (s.completed as u64, s.fetch_failed as u64),
-            Err(e) => {
-                worker::console_log!("complete-proofs: transactions error: {e}");
-                (0, 0)
-            }
-        };
+    let (tx_completed, tx_fetch_failed) = match overlay_engine::gasp::race_or_deadline(
+        engine.complete_missing_proofs_with(
+            &completion_fetcher,
+            TRANSACTION_PROOF_COMPLETION_LIMIT,
+            backstop_age,
+        ),
+        crate::broadcaster::sleep_ms(TRANSACTION_PROOF_COMPLETION_BUDGET_MS),
+    )
+    .await
+    {
+        Some(Ok(s)) => (s.completed as u64, s.fetch_failed as u64),
+        Some(Err(e)) => {
+            worker::console_log!("complete-proofs: transactions error: {e}");
+            (0, 0)
+        }
+        None => {
+            worker::console_log!("complete-proofs: transaction deadline reached; retry next run");
+            (0, 0)
+        }
+    };
     // 2+3. Pot-store maintenance — chaser BEFORE the pot-beef bulk drain,
     //    encoded once in run_pot_maintenance (bsv-low#304 gate M-5; same
     //    order as the scheduled tick). Own fetchers, own budget cells.

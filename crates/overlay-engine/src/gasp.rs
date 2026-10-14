@@ -429,11 +429,9 @@ pub const DEFAULT_GRAPH_BUDGET_BYTES: u64 = 917_504;
 /// record around its nodes' hex, which the bytes limb does not count.
 pub const DEFAULT_GRAPH_BUDGET_NODES: u32 = 64;
 
-/// A deferred graph whose record has been deferred this many passes is
-/// dropped at its next resume (reason `max_passes`) and its UTXO fails as a
-/// failed ingest does: the gap guard asks for it again and the next pass
-/// walks it from its root. One hour at a one-minute cadence, fifteen at
-/// `*/15`.
+/// Reset a partial walk after this many passes (`max_passes`). If its cursor
+/// could have passed, keep a root retry obligation in the same bounded slot.
+/// One hour at a one-minute cadence, fifteen at `*/15`.
 pub const DEFERRED_GRAPH_MAX_PASSES: u32 = 60;
 
 /// The most records one (peer, topic) may hold. A new deferral past it is
@@ -447,14 +445,15 @@ pub const DEFERRED_GRAPH_MAX_PASSES: u32 = 60;
 /// room, under which a RESUMED walk keeps the record it holds.
 pub const DEFERRED_GRAPHS_PER_PEER_TOPIC: usize = 16;
 
-/// A RESUMED walk that faults having appended no node keeps its record (an
-/// honest peer's transient 5xx), but not for free (bsv-low #555, the
-/// delta-2 fold's D2-M2): at this many such passes in a row the record is
-/// dropped (reason `idle_faults`) and the UTXO fails, as a fresh walk's
-/// fault does. Before the fold a stranger's record was rewritten for one
-/// quick 503 a tick and held its place for its 60 passes (and the sync is
-/// yieldless, so it counts against the yieldless bound too).
+/// Reset a resumed partial walk after this many consecutive idle faults.
+/// Keep the root retry obligation if the cursor could have passed it. These
+/// attempts remain yieldless and count toward peer quarantine.
 pub const DEFERRED_GRAPH_MAX_IDLE_FAULTS: u32 = 3;
+
+/// Three consecutive deadline cuts distinguish a repeatedly stalled root
+/// from a single slow response. Keep a bounded retry record meanwhile; only
+/// the third cut permits the cursor to pass a root with no fetched node.
+pub const DEADLINE_STALL_DEFERRAL_RUNS: u32 = 3;
 
 /// The per-graph budget of a [`GASPSync`] (bsv-low #555,
 /// `Engine::set_graph_budget`). Setting one turns deferral ON for that sync.
@@ -515,7 +514,7 @@ impl PassCap {
 }
 
 /// The key of one held record (bsv-low #555): what a sync loads up front.
-/// The record itself is read only when the peer serves its UTXO
+/// The records resume independently of the peer's listing, one at a time
 /// ([`GASPStorage::get_deferred_graph`]), so at most one record is in memory
 /// at a time (the lens fold's L3: the up-front load held up to 16 of them).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -608,6 +607,10 @@ pub struct DeferredGraph {
     /// appends a node resets it.
     #[serde(default)]
     pub idle_faults: u32,
+    /// The cursor may pass this durable obligation. A false value also reads
+    /// records written before independent resume support.
+    #[serde(default)]
+    pub cursor_passable: bool,
 }
 
 impl DeferredGraph {
@@ -702,7 +705,7 @@ pub struct DeferralStats {
     pub resumed: u64,
     /// Resumed graphs that completed and landed (their record deleted).
     pub converged: u64,
-    /// Records deleted without converging.
+    /// Partial walks dropped or reset without converging.
     pub dropped: Vec<DroppedGraph>,
     /// Walks of the sync that ended unfinished (deferred, or dropped at a
     /// bound) having appended at least one node in their pass, or that
@@ -791,6 +794,7 @@ enum StepOut {
 
 /// How [`GASPSync::ingest_utxo`] ended for a UTXO.
 enum Ingested {
+    Retry,
     Expired,
     Completed,
     Deferred,
@@ -801,6 +805,7 @@ enum Ingested {
 /// What [`GASPSync::save_walk`] did with the walk in hand.
 enum Saved {
     Yes,
+    Retry,
     /// Not kept, for this reason; the walk is handed back so the caller can
     /// go on with it (L4) or drop it.
     Unkept(DropReason, Box<Walk>),
@@ -1161,6 +1166,12 @@ pub trait FinalizedGraphHook {
 /// environment (e.g., `OverlayGASPStorage` borrows from the Engine's storage).
 pub struct GASPSync<'a> {
     expired: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    root_proofs: std::cell::RefCell<std::collections::HashMap<String, bool>>,
+    roots_proven: std::cell::Cell<u64>,
+    roots_unproven: std::cell::Cell<u64>,
+    cursor_held_by: Option<(u64, String)>,
+    cursor_after_in_flight: u64,
+    cursor_yielded: std::cell::Cell<bool>,
     expired_refused: std::cell::Cell<u64>,
     storage: Box<dyn GASPStorage + 'a>,
     remote: Box<dyn GASPRemote + 'a>,
@@ -1202,7 +1213,7 @@ pub struct GASPSync<'a> {
     /// is deferred and the walk is the one before #555.
     graph_budget: Option<GraphBudget<'a>>,
     /// The roots of this (peer, topic)'s records not yet resumed in this
-    /// sync (their keys; a record is read when its UTXO is served).
+    /// sync (keys only; records are read one at a time).
     deferred: std::cell::RefCell<std::collections::HashSet<String>>,
     /// ONE deadline for every resume of the sync (the lens fold's M1), made
     /// at the first resume.
@@ -1242,6 +1253,12 @@ impl<'a> GASPSync<'a> {
             remote,
             expired: std::rc::Rc::default(),
             expired_refused: std::cell::Cell::new(0),
+            root_proofs: std::cell::RefCell::default(),
+            roots_proven: std::cell::Cell::new(0),
+            roots_unproven: std::cell::Cell::new(0),
+            cursor_held_by: None,
+            cursor_after_in_flight: last_interaction,
+            cursor_yielded: std::cell::Cell::new(false),
             last_interaction,
             unidirectional,
             log_prefix: log_prefix.into(),
@@ -1281,6 +1298,32 @@ impl<'a> GASPSync<'a> {
         self.expired_refused.get()
     }
 
+    pub fn roots_proven(&self) -> u64 {
+        self.roots_proven.get()
+    }
+    pub fn roots_unproven(&self) -> u64 {
+        self.roots_unproven.get()
+    }
+    pub fn cursor_held_by(&self) -> Option<String> {
+        self.cursor_held_by
+            .as_ref()
+            .map(|(_, outpoint)| outpoint.clone())
+    }
+
+    pub fn cursor_yielded(&self) -> bool {
+        self.cursor_yielded.get()
+    }
+
+    fn hold_cursor(&mut self, score: u64, outpoint: &str) {
+        if self
+            .cursor_held_by
+            .as_ref()
+            .is_none_or(|(held, _)| score < *held)
+        {
+            self.cursor_held_by = Some((score, outpoint.to_string()));
+        }
+    }
+
     fn root_expired(&self, node: &GASPNode, outpoint: &str) -> Result<bool, GASPError> {
         let now = (crate::engine::current_timestamp_ms() / 1000.0) as u64;
         Ok(self
@@ -1304,14 +1347,8 @@ impl<'a> GASPSync<'a> {
         Ok(Ingested::Expired)
     }
 
-    /// Bound each graph's walk by `budget` and DEFER a graph past it
-    /// (bsv-low #555): its partial walk is saved through
-    /// [`GASPStorage::save_deferred_graph`], its UTXO is held below the
-    /// cursor like a failed one, the sync goes on to the next UTXO, and the
-    /// next sync that is served the UTXO RESUMES the walk from the record,
-    /// asking only what is still pending. Without a budget nothing is
-    /// deferred and `sync` is unchanged.
-    #[must_use]
+    /// Bound each graph's walk and retain its pending work. A successfully
+    /// saved hold permits cursor progress; an unsaved graph remains a gap.
     pub fn with_graph_budget(mut self, budget: GraphBudget<'a>) -> Self {
         self.graph_budget = Some(budget);
         self
@@ -1438,6 +1475,11 @@ impl<'a> GASPSync<'a> {
         self.pruned.borrow_mut().clear();
         self.pruned_inputs.set(0);
         self.expired_refused.set(0);
+        self.root_proofs.borrow_mut().clear();
+        self.roots_proven.set(0);
+        self.roots_unproven.set(0);
+        self.cursor_held_by = None;
+        self.cursor_yielded.set(false);
         self.discarded_graphs.set(0);
         self.anchor_walk_held.set(0);
         self.completed_cursor = self.last_interaction;
@@ -1452,16 +1494,14 @@ impl<'a> GASPSync<'a> {
                 .as_ref()
                 .map_or(PassCap::NONE, GraphBudget::pass),
         );
-        // bsv-low #555: the deferred graphs of this (peer, topic), resumed
-        // as the peer serves their UTXOs again (the cursor was held below
-        // them). Only their keys: a record is read when its UTXO is served
-        // (the lens fold's L3). A read fault resumes nothing this sync: those
-        // UTXOs are walked from their roots and their records replaced, and
-        // the (peer, topic) is taken as FULL, so no new record is saved over
-        // a count not known (the lens fold's L6).
+        // Load only keys here. Records are resumed independently of pages,
+        // one at a time under the shared resume allowance. A key-read fault
+        // conservatively reserves all slots for the records already held.
+        let mut held_keys = Vec::new();
         if self.graph_budget.is_some() {
             match self.storage.load_deferred_graphs().await {
                 Ok(keys) => {
+                    held_keys.clone_from(&keys);
                     self.held_records.set(keys.len());
                     self.deferred
                         .borrow_mut()
@@ -1516,6 +1556,85 @@ impl<'a> GASPSync<'a> {
         let mut failed_outpoints: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
+        // Saved graphs are work independent of the peer's pagination cursor.
+        // Read one record at a time and share the existing resume allowance.
+        for key in held_keys {
+            if known_outpoints.contains(&key.outpoint) {
+                self.deferred.borrow_mut().remove(&key.outpoint);
+                self.drop_record(&key.outpoint, DropReason::Held).await;
+                shared_outpoints.insert(key.outpoint);
+                continue;
+            }
+            let Some((txid, output_index)) = parse_outpoint(&key.outpoint) else {
+                continue;
+            };
+            let utxo = GASPOutput {
+                txid,
+                output_index,
+                score: key.score as f64,
+            };
+            self.graph_in_flight = true;
+            self.cursor_after_in_flight = initial_interaction;
+            self.hold_cursor(key.score, &key.outpoint);
+            let result = self.ingest_utxo(&utxo, &key.outpoint).await;
+            self.graph_in_flight = false;
+            let settled = match result {
+                Ok(Ingested::Completed) => {
+                    let landed = match &self.finalized_hook {
+                        Some(hook) => hook.graph_completed().await.is_ok(),
+                        None => true,
+                    };
+                    self.settle_completed(landed).await;
+                    if landed {
+                        self.cursor_yielded.set(true);
+                    }
+                    landed
+                }
+                Ok(Ingested::Expired) => {
+                    self.cursor_yielded.set(true);
+                    true
+                }
+                Ok(Ingested::Deferred | Ingested::HeldBack) => true,
+                Ok(Ingested::Retry) => false,
+                Err(error) => {
+                    warn!(
+                        "{} Deferred graph {} retry failed: {}",
+                        self.log_prefix, key.outpoint, error
+                    );
+                    self.walk.borrow_mut().take();
+                    false
+                }
+            };
+            let settled = settled
+                || self
+                    .storage
+                    .get_deferred_graph(&key.outpoint)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|r| r.cursor_passable);
+            if settled {
+                if self
+                    .cursor_held_by
+                    .as_ref()
+                    .is_some_and(|(_, held)| held == &key.outpoint)
+                {
+                    self.cursor_held_by = None;
+                }
+                // A saved graph settles only itself. The current page must
+                // account for any earlier unsaved gap before its score can
+                // contribute to cursor movement.
+                shared_outpoints.insert(key.outpoint);
+            } else {
+                self.hold_cursor(key.score, &key.outpoint);
+                if key.score >= initial_interaction {
+                    min_failed_score =
+                        Some(min_failed_score.map_or(key.score, |s| s.min(key.score)));
+                }
+                failed_outpoints.insert(key.outpoint);
+            }
+        }
+
         // Paginated pull from remote
         loop {
             let cursor_before_page = self.last_interaction;
@@ -1564,6 +1683,7 @@ impl<'a> GASPSync<'a> {
 
                 let outpoint = format!("{}.{}", utxo.txid, utxo.output_index);
                 if known_outpoints.contains(&outpoint) {
+                    self.cursor_yielded.set(true);
                     // A deferred graph whose UTXO the node now holds (it
                     // landed another way): nothing to resume.
                     if self.deferred.borrow_mut().remove(&outpoint) {
@@ -1582,20 +1702,38 @@ impl<'a> GASPSync<'a> {
                         Some(lowest_unfinished),
                         initial_interaction,
                     );
+                    let mut with_current = completed_scores.clone();
+                    with_current.insert(utxo.score as u64);
+                    let remaining = lowest_ahead
+                        .get(position + 1)
+                        .copied()
+                        .into_iter()
+                        .chain(min_failed_score)
+                        .min();
+                    self.cursor_after_in_flight =
+                        Self::cursor_for_completed(&with_current, remaining, initial_interaction);
+                    self.hold_cursor(utxo.score as u64, &outpoint);
                     self.graph_in_flight = true;
                     let ingested = self.ingest_utxo(utxo, &outpoint).await;
                     self.graph_in_flight = false;
                     let ingested = match ingested {
-                        Ok(Ingested::Expired) => Ok(true),
+                        Ok(Ingested::Expired) => {
+                            self.cursor_yielded.set(true);
+                            Ok(true)
+                        }
                         Ok(Ingested::Completed) => {
                             let landed = match &self.finalized_hook {
                                 Some(hook) => hook.graph_completed().await,
                                 None => Ok(()),
                             };
                             self.settle_completed(landed.is_ok()).await;
+                            if landed.is_ok() {
+                                self.cursor_yielded.set(true);
+                            }
                             landed.map(|()| true)
                         }
-                        Ok(Ingested::Deferred | Ingested::HeldBack) => Ok(false),
+                        Ok(Ingested::Deferred | Ingested::HeldBack) => Ok(true),
+                        Ok(Ingested::Retry) => Ok(false),
                         Err(e) => {
                             self.walk.borrow_mut().take();
                             Err(e)
@@ -1603,13 +1741,17 @@ impl<'a> GASPSync<'a> {
                     };
                     match ingested {
                         Ok(true) => {
+                            if self
+                                .cursor_held_by
+                                .as_ref()
+                                .is_some_and(|(_, held)| held == &outpoint)
+                            {
+                                self.cursor_held_by = None;
+                            }
                             shared_outpoints.insert(outpoint.clone());
                         }
-                        // bsv-low #555: DEFERRED, its walk saved (or a
-                        // record held back for the next sync, M1). Held
-                        // below the cursor like a failed UTXO (the gap
-                        // guard) and not walked again in this sync (#554);
-                        // the next sync resumes it. The sync goes on.
+                        // An empty deadline retry has not earned a durable
+                        // hold yet; retain the gap until its named threshold.
                         Ok(false) => {
                             let s = utxo.score as u64;
                             min_failed_score = Some(min_failed_score.map_or(s, |cur| cur.min(s)));
@@ -1631,8 +1773,8 @@ impl<'a> GASPSync<'a> {
                 }
                 // Known outputs and graphs whose finalize hook landed are
                 // settled. Explicit anchor refusals retain the existing
-                // terminal-discard rule; deferred, held and faulted graphs
-                // remain gaps until a later pass completes them.
+                // terminal-discard rule. Saved holds can be passed; faults
+                // without a durable hold retain a gap.
                 if shared_outpoints.contains(&outpoint) {
                     completed_scores.insert(utxo.score as u64);
                 }
@@ -1694,13 +1836,8 @@ impl<'a> GASPSync<'a> {
         }
         self.last_interaction = self.completed_cursor;
 
-        // bsv-low #555: a record whose UTXO a sync that ran to its end was
-        // not served (spent at the peer, or no longer listed): nothing will
-        // resume it.
-        let unserved: Vec<String> = self.deferred.borrow_mut().drain().collect();
-        for outpoint in unserved {
-            self.drop_record(&outpoint, DropReason::NotServed).await;
-        }
+        // A saved graph can now lie below the peer cursor. Absence from a
+        // page is not evidence that its work may be deleted.
 
         // Bidirectional: push our UTXOs to remote
         if !self.unidirectional {
@@ -1722,28 +1859,10 @@ impl<'a> GASPSync<'a> {
         Ok(())
     }
 
-    /// Request a UTXO's graph from remote and ingest it locally.
-    ///
-    /// With a per-graph budget (bsv-low #555, [`Self::with_graph_budget`]) a
-    /// walk past it is DEFERRED (`Ok(Ingested::Deferred)`): its record is
-    /// saved and the caller holds the UTXO below the cursor like a failed
-    /// one. A record of this UTXO saved by an earlier sync is RESUMED: its
-    /// nodes are appended again (no request) and only its pending inputs are
-    /// asked. A RESUMED walk's error defers it again (the progress is kept),
-    /// except the peer's definite "not held" for an input an UNPROVEN node
-    /// needs (an SPV necessity, as in the reference): that one fails the UTXO
-    /// and drops the record. A FRESH walk's error keeps no record and fails
-    /// the UTXO, as before #555 (the delta fold's D-M1). On `Completed` the walk stays in hand until
-    /// [`Self::settle_completed`] knows whether it landed.
-    ///
-    /// Every RESUME of one sync shares ONE per-graph budget (the lens fold's
-    /// M1): one deadline, made at the first resume, and one call count. The
-    /// cursor is held below the deferred UTXOs, so the peer serves them
-    /// first; with a budget each, two of them took the whole per-peer budget
-    /// and no UTXO above them was reached. Now the resumes of a pass take at
-    /// most one graph's budget and the first new UTXO keeps its own. A record
-    /// served once that budget is spent is HELD BACK untouched (no read, no
-    /// pass counted) for the next sync.
+    /// Request a graph or resume its durable record. Saved holds are safe
+    /// to pass because the next run resumes keys independently of pagination.
+    /// Empty deadline retries hold the cursor until the stall threshold.
+    /// All resumed graphs share one allowance; fresh graphs retain theirs.
     async fn ingest_utxo(&self, utxo: &GASPOutput, outpoint: &str) -> Result<Ingested, GASPError> {
         if self.expired.borrow().contains(outpoint) {
             return self.refuse_expired(outpoint).await;
@@ -1783,6 +1902,18 @@ impl<'a> GASPSync<'a> {
                 "{} Deferred graph {} held back: the resumes of this pass spent their budget (bsv-low #555)",
                 self.log_prefix, outpoint
             );
+            let Some(mut record) = self.storage.get_deferred_graph(outpoint).await? else {
+                return Ok(Ingested::Retry);
+            };
+            if record.reason == "retry:deadline" {
+                return Ok(Ingested::Retry);
+            }
+            if !record.cursor_passable {
+                record.cursor_passable = true;
+                if self.storage.save_deferred_graph(&record).await? != DeferredGraphSave::Saved {
+                    return Ok(Ingested::Retry);
+                }
+            }
             return Ok(Ingested::HeldBack);
         }
         let before = (
@@ -1837,6 +1968,7 @@ impl<'a> GASPSync<'a> {
                 reason: String::new(),
                 configured: false,
                 idle_faults: 0,
+                cursor_passable: false,
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
@@ -1968,8 +2100,14 @@ impl<'a> GASPSync<'a> {
                             self.walk.borrow().as_ref().map_or((0, 0, 0), |w| {
                                 (w.calls_this_pass, w.bytes_this_pass, w.nodes_this_pass)
                             });
+                        let reserved = self
+                            .walk
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|w| w.record.cursor_passable);
                         self.drop_record(outpoint, DropReason::RootProven).await;
                         let mut restarted = Self::fresh_walk(score, outpoint, cap);
+                        restarted.resumed = reserved;
                         restarted.calls_this_pass = carried;
                         restarted.bytes_this_pass = carried_bytes;
                         restarted.nodes_this_pass = carried_nodes;
@@ -2108,6 +2246,10 @@ impl<'a> GASPSync<'a> {
             // Only a walk the per-graph budget cut may go on (L4).
             let budget_cut = matches!(reason, "calls" | "time" | "bytes" | "nodes");
             let (why, mut walk) = match self.save_walk(reason, completed).await {
+                Saved::Retry => {
+                    let _ = self.storage.discard_graph(&graph_id).await;
+                    return Ok(Ingested::Retry);
+                }
                 Saved::Yes => {
                     let _ = self.storage.discard_graph(&graph_id).await;
                     return Ok(Ingested::Deferred);
@@ -2235,15 +2377,30 @@ impl<'a> GASPSync<'a> {
                 stats.stalled += 1;
             }
         }
+        let was_held = walk.record.cursor_passable;
+        let deadline_cut = matches!(reason, "time" | "peer_deadline");
+        let deadline_streak = was_held || walk.record.reason == "retry:deadline";
+        if walk.record.nodes.is_empty() && !deadline_streak {
+            walk.record.passes = 0;
+        }
         walk.record.passes += 1;
-        walk.record.reason = reason.to_string();
+        let retry = walk.record.nodes.is_empty()
+            && deadline_cut
+            && !was_held
+            && walk.record.passes < DEADLINE_STALL_DEFERRAL_RUNS;
+        walk.record.cursor_passable = !retry;
+        walk.record.reason = if retry {
+            "retry:deadline".into()
+        } else {
+            reason.into()
+        };
         if walk.record.nodes.len() > walk.nodes_at_start {
             walk.record.idle_faults = 0;
         }
-        // H1: a walk that holds no node is never kept (nothing would be lost
-        // by not keeping it, and an empty record took one of the 16 places
-        // for up to 60 passes, L2): its UTXO fails as before #555.
-        if walk.record.nodes.is_empty() {
+        // Empty walks qualify only after repeated deadline cuts. The small
+        // retry record uses the same per-peer and global storage ceilings.
+        // A quick fresh fault still earns no record.
+        if walk.record.nodes.is_empty() && !deadline_cut && !was_held {
             return Saved::Unkept(DropReason::NoProgress, Box::new(walk));
         }
         if !walk.resumed && self.held_records.get() >= DEFERRED_GRAPHS_PER_PEER_TOPIC {
@@ -2258,7 +2415,9 @@ impl<'a> GASPSync<'a> {
                 if !walk.resumed {
                     self.held_records.set(self.held_records.get() + 1);
                 }
-                self.stats.borrow_mut().deferred += 1;
+                if !retry {
+                    self.stats.borrow_mut().deferred += 1;
+                }
                 info!(
                     "{} DEFERRED graph {} ({}): {} nodes, {} pending, {} calls ({} this pass), pass {}, {} bytes (bsv-low #555)",
                     self.log_prefix,
@@ -2271,7 +2430,11 @@ impl<'a> GASPSync<'a> {
                     walk.record.passes,
                     bytes
                 );
-                Saved::Yes
+                if retry {
+                    Saved::Retry
+                } else {
+                    Saved::Yes
+                }
             }
             // The storage's ceiling is a budget of room, not a verdict on
             // the graph (bsv-low #585): a RESUMED walk keeps the record it
@@ -2295,9 +2458,8 @@ impl<'a> GASPSync<'a> {
         }
     }
 
-    /// A walk [`Self::save_walk`] did not keep: its held record (if any) is
-    /// deleted with the reason, else the reason is counted; a fresh walk
-    /// that fetched nothing was never a record and is only logged.
+    /// A walk the save did not keep: reset its retained obligation or count
+    /// the drop. A fresh walk that fetched nothing is only logged.
     async fn unkept(&self, why: DropReason, walk: &mut Walk) {
         let outpoint = walk.record.outpoint.clone();
         if walk.resumed {
@@ -2343,8 +2505,23 @@ impl<'a> GASPSync<'a> {
         paid
     }
 
-    /// Delete a held record and count it dropped.
+    /// Drop the partial walk, preserving a retry obligation if the cursor may have passed.
     async fn drop_record(&self, outpoint: &str, reason: DropReason) {
+        if !matches!(reason, DropReason::Held | DropReason::Refused) {
+            let Ok(record) = self.storage.get_deferred_graph(outpoint).await else {
+                return;
+            };
+            if let Some(record) = record {
+                if record.cursor_passable {
+                    let mut retry = Self::fresh_walk(record.score, outpoint, PassCap::NONE).record;
+                    retry.reason = "retry".into();
+                    retry.cursor_passable = true;
+                    let _ = self.storage.save_deferred_graph(&retry).await;
+                    self.note_dropped(outpoint, reason);
+                    return;
+                }
+            }
+        }
         if let Err(e) = self.storage.delete_deferred_graph(outpoint).await {
             warn!(
                 "{} Could not delete the record of deferred graph {}: {}",
@@ -2373,10 +2550,16 @@ impl<'a> GASPSync<'a> {
     /// `sync` (bsv-low #555): the per-peer deadline (D16) defers it like the
     /// per-graph one, so the next pass resumes it instead of walking it
     /// again. No-op without a per-graph budget or with no walk in hand.
-    pub async fn defer_in_flight(&self) {
-        if self.graph_budget.is_some() {
-            if let Saved::Unkept(why, mut walk) = self.save_walk("peer_deadline", false).await {
-                self.unkept(why, &mut walk).await;
+    pub async fn defer_in_flight(&mut self) {
+        // A deadline during pagination has no graph to save. Preserve the
+        // completed cursor, including any earlier unsaved gap.
+        if self.graph_budget.is_some() && self.walk.borrow().is_some() {
+            match self.save_walk("peer_deadline", false).await {
+                Saved::Yes => {
+                    self.completed_cursor = self.cursor_after_in_flight;
+                }
+                Saved::Unkept(why, mut walk) => self.unkept(why, &mut walk).await,
+                _ => {}
             }
         }
     }
@@ -2541,6 +2724,7 @@ impl<'a> GASPSync<'a> {
                 reason: String::new(),
                 configured: false,
                 idle_faults: 0,
+                cursor_passable: false,
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
@@ -2594,6 +2778,9 @@ impl<'a> GASPSync<'a> {
                 }
             }
         }
+        self.root_proofs
+            .borrow_mut()
+            .insert(node.graph_id.clone(), node.proof.is_some());
         node
     }
 
@@ -2856,6 +3043,25 @@ impl<'a> GASPSync<'a> {
         match self.storage.validate_graph_anchor(graph_id).await {
             Ok(()) => {
                 self.storage.finalize_graph(graph_id).await?;
+                let proven =
+                    self.root_proofs
+                        .borrow_mut()
+                        .remove(graph_id)
+                        .or_else(|| {
+                            self.walk.borrow().as_ref().and_then(|w| {
+                                match w.record.nodes.as_slice() {
+                                    [root, ..] => Some(root.node.proof.is_some()),
+                                    [] => None,
+                                }
+                            })
+                        })
+                        .unwrap_or(false);
+                let count = if proven {
+                    &self.roots_proven
+                } else {
+                    &self.roots_unproven
+                };
+                count.set(count.get() + 1);
                 info!("{} Graph finalized: {}", self.log_prefix, graph_id);
                 Ok(true)
             }
@@ -3269,6 +3475,86 @@ mod tests {
     }
 
     // ── Tests ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn proofs_page_deadline_never_passes_a_failed_unsaved_graph() {
+        struct PageDeadline(std::rc::Rc<std::cell::Cell<bool>>);
+        #[async_trait(?Send)]
+        impl GASPRemote for PageDeadline {
+            async fn get_initial_response(
+                &self,
+                request: &GASPInitialRequest,
+            ) -> Result<GASPInitialResponse, GASPError> {
+                if request.since > 0 {
+                    self.0.set(true);
+                    std::future::pending::<()>().await;
+                }
+                Ok(GASPInitialResponse {
+                    since: request.since,
+                    utxo_list: vec![GASPOutput {
+                        txid: "11".repeat(32),
+                        output_index: 0,
+                        score: 10.0,
+                    }],
+                })
+            }
+            async fn get_initial_reply(
+                &self,
+                _: &GASPInitialResponse,
+            ) -> Result<GASPInitialReply, GASPError> {
+                unreachable!()
+            }
+            async fn request_node(
+                &self,
+                _: &str,
+                _: &str,
+                _: u32,
+                _: bool,
+            ) -> Result<GASPNode, GASPError> {
+                Err(GASPError::RemoteError("offline".into()))
+            }
+            async fn submit_node(
+                &self,
+                _: &GASPNode,
+            ) -> Result<Option<GASPNodeResponse>, GASPError> {
+                unreachable!()
+            }
+        }
+        let due = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut sync = GASPSync::new(
+            Box::new(MockGASPStorage::new(vec![])),
+            Box::new(PageDeadline(due.clone())),
+            0,
+            "test",
+            true,
+        )
+        .with_graph_budget(GraphBudget {
+            max_calls: 10,
+            max_bytes_fetched: u64::MAX,
+            max_nodes: u32::MAX,
+            deadline: Box::new(|| Box::pin(std::future::pending())),
+            half_deadline: None,
+        });
+        let deadline = std::future::poll_fn(move |_| {
+            if due.get() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        });
+        assert!(race_or_deadline(sync.sync(None), deadline).await.is_none());
+        assert!(!sync.graph_in_flight());
+        sync.defer_in_flight().await;
+        assert_eq!(
+            sync.completed_cursor(),
+            0,
+            "a failed graph has no durable hold"
+        );
+        assert_eq!(
+            sync.cursor_held_by(),
+            Some(format!("{}.0", "11".repeat(32)))
+        );
+    }
 
     #[tokio::test]
     async fn test_sync_pulls_remote_utxos() {

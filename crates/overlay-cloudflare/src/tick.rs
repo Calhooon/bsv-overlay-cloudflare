@@ -217,9 +217,10 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // Give stored proof completion its own early slot. Held GASP graphs are
     // not admitted transactions: their roots use hydrate_root during sync.
     // A timeout stamps no success heartbeat; the next tick retries the rows.
+    let completion_fetcher = transaction_proof_fetcher(env);
     let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
     let (tx_completed, tx_fetch_failed) = match race_or_deadline(
-        engine.complete_missing_proofs(TRANSACTION_PROOF_COMPLETION_LIMIT, backstop_age),
+        engine.complete_missing_proofs_with(&completion_fetcher, TRANSACTION_PROOF_COMPLETION_LIMIT, backstop_age),
         crate::broadcaster::sleep_ms(TRANSACTION_PROOF_COMPLETION_BUDGET_MS),
     )
     .await
@@ -386,6 +387,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 total_cursor_moves
             );
             for (topic, res) in &r.topics_synced {
+                worker::console_log!("Scheduled GASP topic={} gaspRootsProven={} gaspRootsUnproven={} cursor_held_by={:?}", topic, res.roots_proven, res.roots_unproven, res.cursor_held_by);
                 if !res.errors.is_empty()
                     || res.pruned_inputs > 0
                     || res.discarded_graphs > 0
@@ -858,7 +860,7 @@ mod tests {
         for step in [
             "ensure_overlay_migrations(&db)",
             "build_engine_with_storage(",
-            "engine.complete_missing_proofs(",
+            "engine.complete_missing_proofs_with(",
             "engine.sync_advertisements()",
             "crate::beef_blob_sweep::run_pass(",
             "crate::gasp_deferred::sweep_stale(",

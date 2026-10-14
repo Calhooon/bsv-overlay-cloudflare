@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.7] - 2026-10-14
+
+- Give scheduled and admin transaction proof completion a dedicated 60-attempt
+  courier and candidate allowance inside its 30-second deadline. Other passes
+  retain their own budgets and every accepted proof still requires headers.
+- Parse both WoC's single-object array and Bitails' object TSC response. Count
+  proof-rung HTTP, parse and judge faults, logging one detail per rung per run.
+- Preserve the root proof request before ancestry and report validated roots
+  through `gaspRootsProven` and `gaspRootsUnproven`.
+- Advance pagination past durably held graphs and resume their records without
+  relying on a peer to list them again. Three consecutive empty deadline cuts
+  turn a retry record into a deliberate hold. Held records survive age cleanup;
+  failed partial walks retain a root to retry. Report `cursor_held_by`.
+- Reject expired UHRP crawl answers before submission and count
+  `crawlExpiredRefused`. Direct submission retains its admission policy.
+- Add `GET /admin/proof-probe?txid=<hex>` with rung requests, HTTP status,
+  parsing and header verdicts, plus the stored BEEF's own-proof presence.
+- **DEPLOYMENT NOTE:** No new variable, dependency pin or migration. The probe
+  requires the admin bearer and writes no data. Explorer sources remain opt-in.
+  The keeper sets both workspace versions and internal floors for release.
+
 ## [0.1.6] - 2026-10-14
 
 - GASP skips expired UHRP roots before proof hydration, advances their cursor,

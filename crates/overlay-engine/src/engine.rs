@@ -4290,13 +4290,22 @@ impl Engine {
         limit: u64,
         min_age_secs: u64,
     ) -> Result<ProofCompletionSummary, EngineError> {
-        let mut summary = ProofCompletionSummary::default();
-
-        // Production-safe: with no fetcher there is no chain source to complete
-        // from, so this is a pure no-op (matches GASP-hydration opt-in).
-        let Some(fetcher) = self.ancestor_fetcher.clone() else {
-            return Ok(summary);
+        let Some(fetcher) = self.ancestor_fetcher.as_deref() else {
+            return Ok(ProofCompletionSummary::default());
         };
+        self.complete_missing_proofs_with(fetcher, limit, min_age_secs)
+            .await
+    }
+
+    /// Complete stored transactions using the caller's dedicated allowance.
+    /// The engine's other passes retain their configured ancestor courier.
+    pub async fn complete_missing_proofs_with(
+        &self,
+        fetcher: &dyn crate::gasp::AncestorFetcher,
+        limit: u64,
+        min_age_secs: u64,
+    ) -> Result<ProofCompletionSummary, EngineError> {
+        let mut summary = ProofCompletionSummary::default();
 
         let candidates = self
             .storage
@@ -5009,6 +5018,9 @@ impl Engine {
             let mut pruned_inputs: u64 = 0;
             let mut discarded_graphs: u64 = 0;
             let mut expired_refused: u64 = 0;
+            let mut roots_proven = 0;
+            let mut roots_unproven = 0;
+            let mut cursor_held_by = Vec::new();
             let expired = std::rc::Rc::default();
             let mut anchor_walk_held_graphs: u64 = 0;
             let mut finalized_graphs: u64 = 0;
@@ -5166,6 +5178,8 @@ impl Engine {
                     // counts twice.
                     pruned_inputs += sync.pruned_inputs();
                     expired_refused += sync.expired_refused();
+                    roots_proven += sync.roots_proven();
+                    roots_unproven += sync.roots_unproven();
                     // bsv-low #551: graphs the anchor check refused. Counted
                     // apart from `errors` for the same reason as a prune: a
                     // refused graph is not a failed sync (the reference
@@ -5229,7 +5243,7 @@ impl Engine {
                             // quarantined).
                             advanced_cursor = completed > last_interaction;
                             outcome_success = peer_finalized.get() > 0
-                                || completed > last_interaction
+                                || (completed > last_interaction && sync.cursor_yielded())
                                 || sync.deferral_stats().progressed > 0;
                             warn!(
                                 "[GASP SYNC] {peer_url} for {topic} at the deadline: finalized_graphs={} deadline_dropped_graphs={in_flight} cursor {last_interaction} -> {} (bsv-low #552)",
@@ -5258,7 +5272,9 @@ impl Engine {
                             if stats.stalled > 0
                                 && stats.progressed == 0
                                 && peer_finalized.get() == 0
-                                && !(landed && sync.last_interaction > last_interaction)
+                                && !(landed
+                                    && sync.last_interaction > last_interaction
+                                    && sync.cursor_yielded())
                             {
                                 outcome_success = false;
                                 let msg = format!(
@@ -5330,7 +5346,8 @@ impl Engine {
                     // Only with a per-graph budget: without one nothing is
                     // deferred and #302's rule is unchanged.
                     if ran && self.graph_budget.is_some() {
-                        let yielded = peer_finalized.get() > 0 || advanced_cursor;
+                        let yielded =
+                            peer_finalized.get() > 0 || (advanced_cursor && sync.cursor_yielded());
                         if yielded || sync.graphs_attempted() > 0 {
                             match self
                                 .storage
@@ -5358,6 +5375,11 @@ impl Engine {
                                     "[GASP SYNC] failed to record the yield of {peer_url}/{topic}: {e}"
                                 ),
                             }
+                        }
+                    }
+                    if !advanced_cursor {
+                        if let Some(outpoint) = sync.cursor_held_by() {
+                            cursor_held_by.push(outpoint);
                         }
                     }
                     finalized_graphs += peer_finalized.get();
@@ -5393,7 +5415,7 @@ impl Engine {
                     // its yieldless streak: 100 of 200 ticks. A health read
                     // that faulted read 0 failures: the old rule, fail-safe.
                     if outcome_success
-                        && !(peer_finalized.get() > 0 || advanced_cursor)
+                        && !(peer_finalized.get() > 0 || (advanced_cursor && sync.cursor_yielded()))
                         && self.graph_budget.is_some()
                         && health.consecutive_failures >= crate::gasp::PEER_QUARANTINE_THRESHOLD
                     {
@@ -5416,6 +5438,9 @@ impl Engine {
             topics_synced.insert(
                 topic.clone(),
                 TopicSyncResult {
+                    roots_proven,
+                    roots_unproven,
+                    cursor_held_by,
                     expired_refused,
                     peers,
                     sync_type,
@@ -5967,6 +5992,14 @@ pub struct GASPSyncResult {
 /// Sync result for a single topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicSyncResult {
+    /// Root proof status after successful anchor validation and finalization.
+    #[serde(default)]
+    pub roots_proven: u64,
+    #[serde(default)]
+    pub roots_unproven: u64,
+    /// Outstanding outpoints on peers whose cursor did not advance.
+    #[serde(default)]
+    pub cursor_held_by: Vec<String>,
     /// Distinct expired advert roots skipped before any proof request.
     #[serde(default)]
     pub expired_refused: u64,
@@ -8414,6 +8447,9 @@ mod tests {
         topics_synced.insert(
             "tm_test".to_string(),
             super::TopicSyncResult {
+                roots_proven: 0,
+                roots_unproven: 0,
+                cursor_held_by: Vec::new(),
                 expired_refused: 0,
                 peers: vec!["https://peer.com".to_string()],
                 sync_type: "ship".to_string(),
@@ -8756,6 +8792,10 @@ mod tests {
     #[async_trait(?Send)]
     impl AncestorFetcher for ProofOnlyRootFetcher {
         async fn fetch_ancestor(&self, _: &str) -> Result<FetchedAncestor, GASPError> {
+            assert!(
+                self.requested.get() > 0,
+                "root proof request must precede ancestry"
+            );
             Err(GASPError::RemoteError("raw source unavailable".to_string()))
         }
         async fn verified_proof_for(&self, txid: &str) -> Option<String> {
@@ -8788,6 +8828,19 @@ mod tests {
         engine.set_gasp_remote_factory(Box::new(remote));
         let result = engine.start_gasp_sync().await.unwrap();
         assert_eq!(result.topics_synced["tm_test"].finalized_graphs, 1);
+        assert_eq!(result.topics_synced["tm_test"].roots_proven, 1);
+        assert_eq!(result.topics_synced["tm_test"].roots_unproven, 0);
+        let stored = engine
+            .storage()
+            .find_output(&txid, 0, Some("tm_test"), None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::beef_limits::own_proof(stored.beef.as_ref().unwrap(), &txid)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(completion_asks.get(), 0);
         assert_eq!(sync_asks.get(), 1);
         let served = engine
@@ -8863,21 +8916,68 @@ mod tests {
         let held = engine.start_gasp_sync().await.unwrap();
         assert_eq!(held.topics_synced["tm_test"].finalized_graphs, 0);
         assert_eq!(held.topics_synced["tm_test"].deferred_graphs, 1);
-        assert!(held.topics_synced["tm_test"].cursor_moves.is_empty());
+        assert_eq!(held.topics_synced["tm_test"].cursor_moves[0].to, 10);
         engine.set_ancestor_fetcher(std::rc::Rc::new(ProofOnlyRootFetcher {
             proofs: HashMap::from([(txid.clone(), proof)]),
             requested,
         }));
+        engine
+            .storage()
+            .update_last_interaction("https://budget.example", "tm_test", 20)
+            .await
+            .unwrap();
         let landed = engine.start_gasp_sync().await.unwrap();
         assert_eq!(landed.topics_synced["tm_test"].resumed_graphs, 1);
         assert_eq!(landed.topics_synced["tm_test"].finalized_graphs, 1);
-        assert_eq!(landed.topics_synced["tm_test"].cursor_moves[0].to, 10);
+        assert!(landed.topics_synced["tm_test"].cursor_moves.is_empty());
         assert!(engine
             .storage
             .find_output(&txid, 0, Some("tm_test"), None, true)
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn proofs_deadline_stalls_become_durable_after_three_runs() {
+        let (mut engine, remote) = budget_page_engine(1);
+        let elapsed = remote.elapsed.clone();
+        let root = format!("{}.0", remote.outputs[0].txid);
+        engine.set_graph_budget(
+            std::rc::Rc::new(move |ms| {
+                let until = elapsed.get() + ms;
+                let elapsed = elapsed.clone();
+                Box::pin(std::future::poll_fn(move |_| {
+                    if elapsed.get() >= until {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }))
+            }),
+            10,
+            1_000,
+        );
+        engine.set_gasp_remote_factory(Box::new(remote));
+        for round in 1..=crate::gasp::DEADLINE_STALL_DEFERRAL_RUNS {
+            let result = engine.start_gasp_sync().await.unwrap();
+            let topic = &result.topics_synced["tm_test"];
+            if round < crate::gasp::DEADLINE_STALL_DEFERRAL_RUNS {
+                assert!(topic.cursor_moves.is_empty());
+                assert_eq!(topic.cursor_held_by, vec![root.clone()]);
+            } else {
+                assert_eq!(topic.cursor_moves[0].to, 10);
+                assert_eq!(topic.deferred_graphs, 1);
+            }
+        }
+        let held = engine
+            .storage()
+            .get_deferred_graph("https://budget.example", "tm_test", &root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(held.cursor_passable);
+        assert!(held.nodes.is_empty());
     }
 
     #[tokio::test]
@@ -10187,6 +10287,49 @@ mod tests {
             engine.set_ancestor_fetcher(f);
         }
         (engine, txid)
+    }
+
+    #[tokio::test]
+    async fn proofs_completion_uses_dedicated_courier() {
+        let (_, txid) = proofless_beef();
+        let shared = std::rc::Rc::new(StubFetcher {
+            proof: None,
+            calls: Cell::new(0),
+        });
+        let dedicated = StubFetcher {
+            proof: Some(single_leaf_bump_hex(&txid, 850_000)),
+            calls: Cell::new(0),
+        };
+        let (engine, _) = engine_with_proofless_output(Some(shared.clone())).await;
+        assert_eq!(
+            engine
+                .complete_missing_proofs(1, 0)
+                .await
+                .unwrap()
+                .completed,
+            0
+        );
+        assert_eq!(
+            engine
+                .complete_missing_proofs_with(&dedicated, 1, 0)
+                .await
+                .unwrap()
+                .completed,
+            1
+        );
+        assert_eq!(shared.calls.get(), 1);
+        assert_eq!(dedicated.calls.get(), 1);
+        let output = engine
+            .storage()
+            .find_output(&txid, 0, Some("Hello"), None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::beef_limits::own_proof(output.beef.as_ref().unwrap(), &txid)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
