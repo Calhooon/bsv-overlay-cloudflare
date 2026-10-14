@@ -47,7 +47,6 @@ pub trait Storage {
         ))
     }
 
-
     // ========================================================================
     // Write operations
     // ========================================================================
@@ -447,7 +446,6 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
     ) -> Result<Box<dyn crate::admission::DryRunScope + '_>, StorageError> {
         (**self).admission_dry_run(evidence)
     }
-
     async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
         (**self).insert_output(output).await
     }
@@ -667,6 +665,7 @@ pub enum StorageError {
 
 #[cfg(any(test, feature = "memory-storage"))]
 pub mod memory {
+    include!("memory_log.rs");
     #[cfg(test)]
     mod atomic_admission_tests {
         include!("atomic_admission_tests.rs");
@@ -680,7 +679,8 @@ pub mod memory {
     /// NOT suitable for production — no persistence, no concurrency beyond Mutex.
     #[derive(Debug, Default)]
     pub struct MemoryStorage {
-        #[cfg(test)]
+        log: Mutex<MemoryLogState>,
+        writer: Mutex<()>,
         admission_fault: Mutex<(Option<usize>, usize)>,
         /// outputs keyed by (txid, outputIndex, topic)
         outputs: Mutex<HashMap<(String, u32, String), Output>>,
@@ -752,19 +752,8 @@ pub mod memory {
     type YieldStreakRow = (u64, u64, u64);
 
     impl MemoryStorage {
-        #[cfg(test)]
-        fn fault_write(&self, at: Option<usize>) {
+        pub fn fault_write(&self, at: Option<usize>) {
             *self.admission_fault.lock().unwrap() = (at, 0);
-        }
-
-        #[cfg(test)]
-        fn write_pin(&self) -> Result<(), StorageError> {
-            let mut fault = self.admission_fault.lock().unwrap();
-            fault.1 += 1;
-            if fault.0 == Some(fault.1) {
-                return Err(StorageError::Other("E657 injected write fault".into()));
-            }
-            Ok(())
         }
 
         pub fn new() -> Self {
@@ -888,8 +877,16 @@ pub mod memory {
 
     #[async_trait(?Send)]
     impl Storage for MemoryStorage {
+        fn admission_log_id(&self) -> Option<usize> {
+            Some(std::ptr::from_ref(self) as usize)
+        }
+        fn admission_dry_run(
+            &self,
+            evidence: &crate::admission::AdmitEvidence,
+        ) -> Result<Box<dyn crate::admission::DryRunScope + '_>, StorageError> {
+            self.dry_scope(evidence)
+        }
         async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
-            #[cfg(test)]
             self.write_pin()?;
             let key = (
                 output.txid.clone(),
@@ -935,7 +932,6 @@ pub mod memory {
             output_index: u32,
             topic: &str,
         ) -> Result<(), StorageError> {
-            #[cfg(test)]
             self.write_pin()?;
             let key = (txid.to_string(), output_index, topic.to_string());
             let mut outputs = self.outputs.lock().unwrap();
@@ -957,7 +953,6 @@ pub mod memory {
             output_index: u32,
             topic: &str,
         ) -> Result<(), StorageError> {
-            #[cfg(test)]
             self.write_pin()?;
             let key = (txid.to_string(), output_index, topic.to_string());
             if let Some(output) = self.outputs.lock().unwrap().get_mut(&key) {
@@ -973,7 +968,6 @@ pub mod memory {
             topic: &str,
             consumed_by: &[Outpoint],
         ) -> Result<(), StorageError> {
-            #[cfg(test)]
             self.write_pin()?;
             let key = (txid.to_string(), output_index, topic.to_string());
             if let Some(output) = self.outputs.lock().unwrap().get_mut(&key) {
@@ -987,6 +981,7 @@ pub mod memory {
             txid: &str,
             beef: &[u8],
         ) -> Result<(), StorageError> {
+            self.write_pin()?;
             // Model the D1 backend: keep the proof flag accurate on every BEEF
             // write by inspecting whether the new BEEF proves the target tx.
             // (The proof-completion stitch calls back here with a proven BEEF,
@@ -1007,6 +1002,7 @@ pub mod memory {
         }
 
         async fn mark_transaction_proven(&self, txid: &str) -> Result<(), StorageError> {
+            self.write_pin()?;
             // Lightweight flag-flip (no BEEF rewrite), idempotent. Mirrors the
             // D1 `UPDATE transactions SET has_proof = 1 WHERE txid = ?`.
             self.proven.lock().unwrap().insert(txid.to_string());
@@ -1018,6 +1014,7 @@ pub mod memory {
             txid: &str,
             height: Option<u64>,
         ) -> Result<(), StorageError> {
+            self.write_pin()?;
             // Models the D1 `MARK_TX_PROVEN_AT_SQL`: flip has_proof AND record
             // the anchor (review MED-2/LOW-4). Recorded so the Rc-forward pin
             // can observe the height reaching the inner store.
@@ -1036,6 +1033,7 @@ pub mod memory {
             topic: &str,
             block_height: u32,
         ) -> Result<(), StorageError> {
+            self.write_pin()?;
             let key = (txid.to_string(), output_index, topic.to_string());
             if let Some(output) = self.outputs.lock().unwrap().get_mut(&key) {
                 output.block_height = Some(block_height);
@@ -1047,7 +1045,6 @@ pub mod memory {
             &self,
             tx: &AppliedTransaction,
         ) -> Result<(), StorageError> {
-            #[cfg(test)]
             self.write_pin()?;
             self.applied
                 .lock()
@@ -1071,6 +1068,7 @@ pub mod memory {
             &self,
             tx: &AppliedTransaction,
         ) -> Result<(), StorageError> {
+            self.write_pin()?;
             self.applied
                 .lock()
                 .unwrap()
@@ -1255,6 +1253,7 @@ pub mod memory {
             topic: &str,
             since: u64,
         ) -> Result<(), StorageError> {
+            self.write_pin()?;
             self.sync_state
                 .lock()
                 .unwrap()
@@ -1277,6 +1276,7 @@ pub mod memory {
             topic: &str,
             success: bool,
         ) -> Result<(), StorageError> {
+            self.write_pin()?;
             let now = *self.clock_secs.lock().unwrap();
             let mut health = self.peer_health.lock().unwrap();
             let entry = health
@@ -1311,6 +1311,7 @@ pub mod memory {
             topic: &str,
             yielded: bool,
         ) -> Result<PeerYieldStreak, StorageError> {
+            self.write_pin()?;
             let now = *self.clock_secs.lock().unwrap();
             let key = (host.to_string(), topic.to_string());
             // The delta-3 fold's D3-M1: the decay only for a peer that is
@@ -1345,6 +1346,7 @@ pub mod memory {
             &self,
             record: &crate::gasp::DeferredGraph,
         ) -> Result<crate::gasp::DeferredGraphSave, StorageError> {
+            self.write_pin()?;
             let key = (
                 record.peer.clone(),
                 record.topic.clone(),
@@ -1423,6 +1425,7 @@ pub mod memory {
             topic: &str,
             outpoint: &str,
         ) -> Result<(), StorageError> {
+            self.write_pin()?;
             self.deferred_graphs.lock().unwrap().remove(&(
                 host.to_string(),
                 topic.to_string(),
