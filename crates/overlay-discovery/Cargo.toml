@@ -12,7 +12,7 @@ categories = ["cryptography::cryptocurrencies"]
 include = ["src/**/*.rs", "src/pot/poc5_template.hex", "src/uhrp/fixtures/hash/*.json", "docs/*.md", "README.md", "LICENSE-*"]
 
 [dependencies]
-overlay-engine = { package = "bsv-overlay-engine", version = "0.1.5", path = "../overlay-engine" }
+overlay-engine = { package = "bsv-overlay-engine", version = "0.1.6", path = "../overlay-engine" }
 bsv-rs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -43,5 +43,5 @@ base64 = "0.22"
 js-sys = "0.3"
 
 [dev-dependencies]
-overlay-engine = { package = "bsv-overlay-engine", version = "0.1.5", path = "../overlay-engine", features = ["memory-storage"] }
+overlay-engine = { package = "bsv-overlay-engine", version = "0.1.6", path = "../overlay-engine", features = ["memory-storage"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
