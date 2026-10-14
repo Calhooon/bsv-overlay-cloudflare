@@ -469,6 +469,61 @@ pub async fn sweep_stale(db: &D1Database) {
     }
 }
 
+/// Engine 0.1.8: the GASP roots the walk refused as expired, one row per
+/// (topic, outpoint), so a later sync skips each with no node fetch
+/// (`overlay_engine::gasp::EXPIRED_OUTPOINT_MEMO_SECS`). Keyed by topic, not
+/// peer: the expiry is read from the outpoint's own bytes. Transient.
+pub const EXPIRED_OUTPOINTS_CREATE: &str = "CREATE TABLE IF NOT EXISTS gasp_expired_outpoints (topic TEXT NOT NULL, outpoint TEXT NOT NULL, keep_until INTEGER NOT NULL, written_at INTEGER NOT NULL, PRIMARY KEY (topic, outpoint))";
+
+/// The age sweep's index.
+pub const EXPIRED_OUTPOINTS_KEEP_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_gasp_expired_outpoints_keep ON gasp_expired_outpoints(keep_until)";
+
+/// Remember one refused root until `max(expiry, now) + margin`. Binds: `?1`
+/// topic, `?2` outpoint, `?3` the advert's expiry (unix seconds), `?4`
+/// the margin.
+pub const EXPIRED_OUTPOINT_PUT_SQL: &str = "INSERT INTO gasp_expired_outpoints (topic, outpoint, keep_until, written_at) \
+     VALUES (?1, ?2, MAX(?3, unixepoch()) + ?4, unixepoch()) \
+     ON CONFLICT(topic, outpoint) DO UPDATE SET keep_until = excluded.keep_until, written_at = excluded.written_at";
+
+/// Of a page's outpoints (`?2`, a JSON array), those of topic `?1` still
+/// remembered: one statement a page, primary-key reads only.
+pub const EXPIRED_OUTPOINTS_FIND_SQL: &str = "SELECT outpoint FROM gasp_expired_outpoints \
+     WHERE topic = ?1 AND keep_until > unixepoch() AND outpoint IN (SELECT value FROM json_each(?2))";
+
+/// The age sweep (every tick, an index range).
+pub const EXPIRED_OUTPOINTS_SWEEP_SQL: &str =
+    "DELETE FROM gasp_expired_outpoints WHERE keep_until <= unixepoch()";
+
+/// The row bound: past `?1` rows a topic, the oldest written go. It reads
+/// the whole table, so the cron runs it once an hour.
+pub const EXPIRED_OUTPOINTS_CAP_SQL: &str = "DELETE FROM gasp_expired_outpoints WHERE rowid IN \
+     (SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY topic ORDER BY written_at DESC, outpoint) AS n \
+     FROM gasp_expired_outpoints) WHERE n > ?1)";
+
+/// Sweep the remembered expired roots past their keep (every tick) and, in
+/// the tick of each hour's first minute, past the row bound. Best effort: a
+/// row kept too long costs nothing, a row lost costs one node fetch.
+pub async fn sweep_expired_outpoints(db: &D1Database, now_ms: f64) {
+    if let Err(e) = Query::new(EXPIRED_OUTPOINTS_SWEEP_SQL).execute(db).await {
+        worker::console_log!("Scheduled: GASP expired-root sweep failed: {e}");
+    }
+    if expired_outpoints_cap_due(now_ms) {
+        if let Err(e) = Query::new(EXPIRED_OUTPOINTS_CAP_SQL)
+            .bind(overlay_engine::gasp::EXPIRED_OUTPOINT_MEMO_MAX_ROWS as f64)
+            .execute(db)
+            .await
+        {
+            worker::console_log!("Scheduled: GASP expired-root bound failed: {e}");
+        }
+    }
+}
+
+/// Whether the row bound runs in the tick at `now_ms`: the hour's first
+/// minute.
+pub fn expired_outpoints_cap_due(now_ms: f64) -> bool {
+    ((now_ms / 60_000.0) as u64).is_multiple_of(60)
+}
+
 /// The health block lists at most this many graphs, oldest first.
 pub const HEALTH_LIST_MAX: u32 = 20;
 
@@ -932,6 +987,106 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect()
+    }
+
+    /// Engine 0.1.8: the remembered expired roots on real SQLite: the put
+    /// keeps a row until `max(expiry, now) + margin`, the find answers only
+    /// the page's remembered and unswept outpoints of its topic, the sweep
+    /// takes the rows past their keep, and the bound keeps the newest rows.
+    #[test]
+    fn cursor_018_the_expired_memo_statements() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(EXPIRED_OUTPOINTS_CREATE).unwrap();
+        db.execute_batch(EXPIRED_OUTPOINTS_KEEP_INDEX).unwrap();
+        let margin = overlay_engine::gasp::EXPIRED_OUTPOINT_MEMO_SECS as f64;
+        let put = |topic: &str, outpoint: &str, expiry: f64| {
+            db.execute(
+                EXPIRED_OUTPOINT_PUT_SQL,
+                rusqlite::params![topic, outpoint, expiry, margin],
+            )
+            .unwrap();
+        };
+        let find = |topic: &str, page: &[&str]| -> Vec<String> {
+            let list = serde_json::to_string(page).unwrap();
+            let mut stmt = db.prepare(EXPIRED_OUTPOINTS_FIND_SQL).unwrap();
+            let mut rows: Vec<String> = stmt
+                .query_map(rusqlite::params![topic, list], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            rows.sort();
+            rows
+        };
+        put("tm_uhrp", "a.0", 1.0);
+        put("tm_uhrp", "b.0", 2.0);
+        put("tm_other", "a.0", 1.0);
+        put("tm_uhrp", "a.0", 1.0); // a refusal again replaces, never appends
+        let count = |sql: &str| -> i64 { db.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM gasp_expired_outpoints"), 3);
+        assert_eq!(find("tm_uhrp", &["a.0", "c.0", "b.0"]), vec!["a.0", "b.0"]);
+        assert_eq!(find("tm_other", &["a.0", "b.0"]), vec!["a.0"]);
+        assert!(find("tm_uhrp", &[]).is_empty());
+        // Kept a margin past the refusal (the expiry is long past).
+        let keep: i64 = db
+            .query_row(
+                "SELECT keep_until - written_at FROM gasp_expired_outpoints WHERE outpoint = 'b.0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(keep, margin as i64);
+        // A row past its keep is not found and is swept.
+        db.execute(
+            "UPDATE gasp_expired_outpoints SET keep_until = unixepoch() - 1 WHERE outpoint = 'b.0'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(find("tm_uhrp", &["a.0", "b.0"]), vec!["a.0"]);
+        db.execute(EXPIRED_OUTPOINTS_SWEEP_SQL, []).unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM gasp_expired_outpoints"), 2);
+        // The bound, per topic: the newest written stay.
+        for (i, o) in ["x.0", "y.0", "z.0"].iter().enumerate() {
+            put("tm_uhrp", o, 1.0);
+            db.execute(
+                "UPDATE gasp_expired_outpoints SET written_at = ?1 WHERE outpoint = ?2",
+                rusqlite::params![1000 + i as i64, o],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "UPDATE gasp_expired_outpoints SET written_at = 1 WHERE topic = 'tm_uhrp' AND outpoint = 'a.0'",
+            [],
+        )
+        .unwrap();
+        db.execute(EXPIRED_OUTPOINTS_CAP_SQL, [2]).unwrap();
+        assert_eq!(
+            find("tm_uhrp", &["a.0", "x.0", "y.0", "z.0"]),
+            vec!["y.0", "z.0"]
+        );
+        assert_eq!(find("tm_other", &["a.0"]), vec!["a.0"]);
+        // The bound runs in the hour's first minute only.
+        assert!(expired_outpoints_cap_due(3_600_000.0 * 5.0 + 59_000.0));
+        assert!(!expired_outpoints_cap_due(3_600_000.0 * 5.0 + 60_000.0));
+    }
+
+    /// The migration list carries the table and its index, and the D1
+    /// storage binds the statements this test runs.
+    #[test]
+    fn cursor_018_the_expired_memo_is_migrated_and_bound() {
+        let m = crate::d1::OVERLAY_MIGRATIONS;
+        assert!(m.contains(&EXPIRED_OUTPOINTS_CREATE));
+        assert!(m.contains(&EXPIRED_OUTPOINTS_KEEP_INDEX));
+        let storage = include_str!("d1_storage.rs");
+        let put = &storage[storage.find("async fn remember_expired_outpoint").unwrap()..];
+        assert!(put[..put.find("async fn find_expired_outpoints").unwrap()]
+            .contains("EXPIRED_OUTPOINT_PUT_SQL"));
+        let find = &storage[storage.find("async fn find_expired_outpoints").unwrap()..];
+        assert!(find[..find
+            .find("async fn find_transactions_for_proof_check")
+            .unwrap()]
+            .contains("EXPIRED_OUTPOINTS_FIND_SQL"));
+        let tick = include_str!("tick.rs");
+        assert!(tick.contains("crate::gasp_deferred::sweep_expired_outpoints(&ops_db"));
     }
 
     #[test]

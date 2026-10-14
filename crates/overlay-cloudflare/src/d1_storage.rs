@@ -1153,6 +1153,45 @@ impl Storage for D1Storage {
             .map_err(d1_err)
     }
 
+    async fn remember_expired_outpoint(
+        &self,
+        topic: &str,
+        outpoint: &str,
+        expiry: u64,
+    ) -> Result<(), StorageError> {
+        Query::new(crate::gasp_deferred::EXPIRED_OUTPOINT_PUT_SQL)
+            .bind(topic)
+            .bind(outpoint)
+            .bind(expiry as f64)
+            .bind(overlay_engine::gasp::EXPIRED_OUTPOINT_MEMO_SECS as f64)
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)
+    }
+
+    async fn find_expired_outpoints(
+        &self,
+        topic: &str,
+        outpoints: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        #[derive(Deserialize)]
+        struct Row {
+            outpoint: String,
+        }
+        if outpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = serde_json::to_string(outpoints)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let rows: Vec<Row> = Query::new(crate::gasp_deferred::EXPIRED_OUTPOINTS_FIND_SQL)
+            .bind(topic)
+            .bind(list.as_str())
+            .fetch_all(&self.db)
+            .await
+            .map_err(d1_err)?;
+        Ok(rows.into_iter().map(|r| r.outpoint).collect())
+    }
+
     async fn find_transactions_for_proof_check(
         &self,
         limit: u64,

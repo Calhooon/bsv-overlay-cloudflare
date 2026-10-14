@@ -910,6 +910,17 @@
    "why": "D1's 2 MB row is routed around, not made a limit on a graph: a lost part drops its record, which costs the walk again from its root; transient"
   },
   {
+   "name": "gasp_expired_outpoints",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "engine 0.1.8: the GASP roots the walk refused because their own advert had expired, one row per (topic, outpoint), kept until max(expiry, refusal) + 7 days and at most 20,000 rows a topic (the cron's sweeps), so a later sync skips each with no node fetch",
+   "why": "a cache of refusals: a lost row costs one node fetch and one refusal again; transient"
+  },
+  {
    "name": "beef_blob_sweep",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

@@ -519,7 +519,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// (ordered and never reused) and the batch's room under the park's ceiling (N3); one table.
 /// 231 → 236 for engine 0.1.5 (2026-10-13): the tick lease, the source heartbeat and the one-day activity window
 /// (the tick shared by the cron and the `TickAlarm` Durable Object).
-pub const OVERLAY_MIGRATION_COUNT: usize = 236;
+/// 236 → 238 for engine 0.1.8 (2026-10-14): `gasp_expired_outpoints`, the GASP roots refused as expired and
+/// remembered across runs, and its age index; one table, one index.
+pub const OVERLAY_MIGRATION_COUNT: usize = 238;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1905,6 +1907,11 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::tick_ops::EVENTS_INDEX,
     crate::tick_ops::SOURCE_COLUMN,
     crate::tick_ops::AT_COLUMN,
+    // Engine 0.1.8 (2026-10-14): THE REMEMBERED DEAD. A GASP root the walk refused because its own advert expired,
+    // one row per (topic, outpoint), so a later sync skips it with no node fetch; swept by the cron past
+    // `max(expiry, refusal) + 7 days` and, hourly, past 20,000 rows a topic (`gasp_deferred.rs`). Transient.
+    crate::gasp_deferred::EXPIRED_OUTPOINTS_CREATE,
+    crate::gasp_deferred::EXPIRED_OUTPOINTS_KEEP_INDEX,
 ];
 
 // =============================================================================

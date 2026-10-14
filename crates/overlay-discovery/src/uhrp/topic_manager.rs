@@ -984,6 +984,122 @@ mod tests {
         }
     }
 
+    /// Engine 0.1.8: a root refused as expired is remembered across runs.
+    /// A later engine over the same storage, re-served the same page, skips
+    /// the dead with no node fetch and counts no refusal again; once the
+    /// memo's keep has passed they are fetched and refused once more.
+    #[tokio::test]
+    async fn cursor_018_the_dead_are_remembered_across_runs() {
+        use overlay_engine::engine::{Engine, EngineConfig};
+        use overlay_engine::storage::memory::MemoryStorage;
+        use overlay_engine::storage::Storage;
+        use overlay_engine::types::{GASPNode, SyncTarget};
+        use std::{collections::HashMap, rc::Rc};
+        let key = PrivateKey::from_hex(&format!("{:064x}", 7)).unwrap();
+        let mut nodes = Vec::new();
+        let mut tracker = bsv_rs::transaction::MockChainTracker::new(10);
+        for (i, expiry) in [1, u64::MAX, 2].into_iter().enumerate() {
+            let raw = format!(
+                "0100000001{}0000000000ffffffff010100000000000000015100000000",
+                "11".repeat(32)
+            );
+            let mut tx = Transaction::from_hex(&raw).unwrap();
+            tx.outputs.clear();
+            tx.add_output(make_signed_uhrp_output(
+                &key,
+                [i as u8; 32],
+                "https://content.example/item",
+                expiry,
+                1,
+            ))
+            .unwrap();
+            if i == 1 {
+                tracker.add_root(1, tx.id());
+            }
+            nodes.push(GASPNode {
+                graph_id: String::new(),
+                raw_tx: tx.to_hex(),
+                output_index: 0,
+                proof: None,
+                tx_metadata: None,
+                output_metadata: None,
+                inputs: None,
+            });
+        }
+        let dead: Vec<String> = [0, 2]
+            .iter()
+            .map(|i| {
+                format!(
+                    "{}.0",
+                    Transaction::from_hex(&nodes[*i].raw_tx).unwrap().id()
+                )
+            })
+            .collect();
+        let remote = CopyRemote {
+            nodes: Rc::new(nodes),
+            asks: Rc::default(),
+        };
+        let store = Rc::new(MemoryStorage::new());
+        let peer = "https://peer.example";
+        let run = |tracker: bsv_rs::transaction::MockChainTracker| {
+            let mut config = EngineConfig::default();
+            config
+                .sync_configuration
+                .insert("tm_uhrp".into(), SyncTarget::Peers(vec![peer.into()]));
+            let managers: HashMap<String, Box<dyn TopicManager>> = HashMap::from([(
+                "tm_uhrp".into(),
+                Box::new(UHRPTopicManager::new()) as Box<dyn TopicManager>,
+            )]);
+            let mut engine = Engine::with_chain_tracker(
+                managers,
+                HashMap::new(),
+                Box::new(store.clone()),
+                None,
+                None,
+                Some(Box::new(tracker)),
+                config,
+            );
+            engine.set_ancestor_fetcher(Rc::new(CopyFetcher(Rc::default())));
+            engine.set_gasp_remote_factory(Box::new(remote.clone()));
+            engine
+        };
+
+        let result = run(tracker.clone()).start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_uhrp"];
+        assert_eq!(remote.asks.get(), 3);
+        assert_eq!(topic.expired_refused, 2);
+        assert_eq!(topic.finalized_graphs, 1);
+        assert_eq!(topic.cursor_moves[0].to, 30);
+        let mut remembered = dead.clone();
+        remembered.sort();
+        assert_eq!(store.expired_outpoints("tm_uhrp"), remembered);
+
+        // A later run re-served the page: no node fetch for the dead.
+        store
+            .update_last_interaction(peer, "tm_uhrp", 0)
+            .await
+            .unwrap();
+        let result = run(tracker.clone()).start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_uhrp"];
+        assert_eq!(remote.asks.get(), 3, "the dead are not fetched again");
+        assert_eq!(topic.expired_refused, 0, "only new refusals count");
+        assert_eq!(
+            topic.cursor_moves[0].to, 30,
+            "a remembered refusal is finished"
+        );
+
+        // Past the memo's keep: fetched and refused once more.
+        store.advance_clock(overlay_engine::gasp::EXPIRED_OUTPOINT_MEMO_SECS + 3);
+        assert!(store.expired_outpoints("tm_uhrp").is_empty());
+        store
+            .update_last_interaction(peer, "tm_uhrp", 0)
+            .await
+            .unwrap();
+        let result = run(tracker).start_gasp_sync().await.unwrap();
+        assert_eq!(remote.asks.get(), 5);
+        assert_eq!(result.topics_synced["tm_uhrp"].expired_refused, 2);
+    }
+
     #[tokio::test]
     async fn copy_sync_expired_page_spends_proofs_on_live_only() {
         for budgeted in [false, true] {

@@ -285,6 +285,9 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // bsv-low #555 (the lens fold's M3): rows of deferred graphs nothing
     // will resume (a peer that never finishes a sync again) are swept initial.
     crate::gasp_deferred::sweep_stale(&ops_db).await;
+    // Engine 0.1.8: the remembered expired roots past their keep (hourly,
+    // past their row bound too).
+    crate::gasp_deferred::sweep_expired_outpoints(&ops_db, now_ms() as f64).await;
     // NL-6c: deferred EF jobs whose run ended without settling go back to the
     // queue; settled ones past their keep are swept with their bytes.
     crate::ef_deferred::redrive(env, &ops_db).await;

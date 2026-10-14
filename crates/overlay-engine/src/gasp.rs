@@ -458,6 +458,19 @@ pub const DEFERRED_GRAPH_MAX_IDLE_FAULTS: u32 = 3;
 /// (see [`GASPSync::defer_in_flight`]).
 pub const DEADLINE_STALL_DEFERRAL_RUNS: u32 = 3;
 
+/// How long a backend remembers an outpoint the walk refused as expired,
+/// past `max(expiry, refusal)`: seven days (engine 0.1.8). A peer keeps
+/// listing a dead advert while it is unspent there, so without the memo
+/// every run fetched its node to refuse it again (fact 3 of the 0.1.8
+/// brief: about 470 node fetches, most of a 30 s slice). With it, one fetch
+/// a week per dead outpoint; the sweep bounds the table by age.
+pub const EXPIRED_OUTPOINT_MEMO_SECS: u64 = 7 * 24 * 3600;
+
+/// The most expired roots a backend remembers for one topic: about nine
+/// times the 2,282 dead adverts of the old overlay's UHRP history. Past it
+/// the oldest rows go; a forgotten one costs one node fetch again.
+pub const EXPIRED_OUTPOINT_MEMO_MAX_ROWS: usize = 20_000;
+
 /// The per-graph budget of a [`GASPSync`] (bsv-low #555,
 /// `Engine::set_graph_budget`). Setting one turns deferral ON for that sync.
 pub struct GraphBudget<'a> {
@@ -897,6 +910,18 @@ pub trait GASPStorage {
 
     /// Delete the record of the graph rooted at `outpoint`.
     async fn delete_deferred_graph(&self, outpoint: &str) -> Result<(), GASPError>;
+
+    /// Remember a root refused as expired at `expiry` (engine 0.1.8), so a
+    /// later sync skips it with no node fetch. Default: nothing kept, the
+    /// walk fetches and refuses it again (fail-safe).
+    async fn remember_expired(&self, _outpoint: &str, _expiry: u64) -> Result<(), GASPError> {
+        Ok(())
+    }
+
+    /// Of `outpoints`, those remembered as expired. Default: none.
+    async fn remembered_expired(&self, _outpoints: &[String]) -> Result<Vec<String>, GASPError> {
+        Ok(Vec::new())
+    }
 }
 
 // ============================================================================
@@ -1185,6 +1210,9 @@ pub struct GASPSync<'a> {
     resumed_with_progress: std::cell::Cell<u64>,
     cursor_yielded: std::cell::Cell<bool>,
     expired_refused: std::cell::Cell<u64>,
+    /// The expiry `root_expired` last read off a refused root, for the
+    /// durable memo.
+    refused_expiry: std::cell::Cell<Option<u64>>,
     storage: Box<dyn GASPStorage + 'a>,
     remote: Box<dyn GASPRemote + 'a>,
     /// Score of last successful interaction with this peer.
@@ -1265,6 +1293,7 @@ impl<'a> GASPSync<'a> {
             remote,
             expired: std::rc::Rc::default(),
             expired_refused: std::cell::Cell::new(0),
+            refused_expiry: std::cell::Cell::new(None),
             root_proofs: std::cell::RefCell::default(),
             roots_proven: std::cell::Cell::new(0),
             roots_unproven: std::cell::Cell::new(0),
@@ -1365,16 +1394,54 @@ impl<'a> GASPSync<'a> {
 
     fn root_expired(&self, node: &GASPNode, outpoint: &str) -> Result<bool, GASPError> {
         let now = (crate::engine::current_timestamp_ms() / 1000.0) as u64;
-        Ok(self
+        let expiry = self
             .storage
             .sync_expiry(node, outpoint)?
-            .is_some_and(|expiry| expiry <= now))
+            .filter(|expiry| *expiry <= now);
+        if expiry.is_some() {
+            self.refused_expiry.set(expiry);
+        }
+        Ok(expiry.is_some())
+    }
+
+    /// Load the remembered dead among `outpoints` into the run's memo; they
+    /// are refused with no node fetch and are not counted again. A read
+    /// fault is fail-safe: they are fetched and refused as before.
+    async fn load_remembered_expired(&self, outpoints: Vec<String>) {
+        let outpoints: Vec<String> = {
+            let memo = self.expired.borrow();
+            outpoints
+                .into_iter()
+                .filter(|o| !memo.contains(o))
+                .collect()
+        };
+        if outpoints.is_empty() {
+            return;
+        }
+        match self.storage.remembered_expired(&outpoints).await {
+            Ok(dead) => self.expired.borrow_mut().extend(dead),
+            Err(e) => warn!(
+                "{} Could not read the remembered expired roots: {}",
+                self.log_prefix, e
+            ),
+        }
     }
 
     async fn refuse_expired(&self, outpoint: &str) -> Result<Ingested, GASPError> {
         let walk = self.walk.borrow_mut().take();
+        let expiry = self.refused_expiry.take();
         if self.expired.borrow_mut().insert(outpoint.to_string()) {
             self.expired_refused.set(self.expired_refused.get() + 1);
+            // Remembered across runs (0.1.8): the next sync skips it with no
+            // node fetch. Best effort: a lost row costs one fetch again.
+            if let Some(expiry) = expiry {
+                if let Err(e) = self.storage.remember_expired(outpoint, expiry).await {
+                    warn!(
+                        "{} Could not remember expired root {}: {}",
+                        self.log_prefix, outpoint, e
+                    );
+                }
+            }
         }
         let _ = self
             .storage
@@ -1600,6 +1667,9 @@ impl<'a> GASPSync<'a> {
 
         // Saved graphs are work independent of the peer's pagination cursor.
         // Read one record at a time and share the existing resume allowance.
+        // A held root remembered dead is refused with no fetch.
+        self.load_remembered_expired(held_keys.iter().map(|k| k.outpoint.clone()).collect())
+            .await;
         for key in held_keys {
             if known_outpoints.contains(&key.outpoint) {
                 self.deferred.borrow_mut().remove(&key.outpoint);
@@ -1701,6 +1771,17 @@ impl<'a> GASPSync<'a> {
                 "{} Processing page with {} UTXOs (since: {})",
                 self.log_prefix, page_size, response.since
             );
+
+            // The page's remembered dead are refused with no node fetch.
+            self.load_remembered_expired(
+                response
+                    .utxo_list
+                    .iter()
+                    .map(|u| format!("{}.{}", u.txid, u.output_index))
+                    .filter(|o| !known_outpoints.contains(o))
+                    .collect(),
+            )
+            .await;
 
             // lowest_ahead[i]: the lowest score among this page's UTXOs from
             // i on, for `completed_cursor` (a page is not assumed sorted).
