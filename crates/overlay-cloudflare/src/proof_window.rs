@@ -342,10 +342,10 @@ mod tests {
             1
         );
         let begin = tick_src.find("fn run_tick(").unwrap();
-        let tick = &tick_src[begin..];
+        let tick = tick_src[begin..].split("#[cfg(test)]").next().unwrap();
         assert!(
             tick.find("crate::proof_window::run_pass").unwrap()
-                < tick.find("engine.start_gasp_sync()").unwrap()
+                < tick.find("engine.start_gasp_sync_metered(").unwrap()
         );
         assert!(crate::d1_storage::D1Storage::served_outputs_sql().contains("json_each(?1)"));
         assert!(candidates_sql().contains(&format!("LIMIT {PEER_PROOF_ROW_LIMIT}")));
