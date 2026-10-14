@@ -5,7 +5,8 @@
 - Add pure `LookupService::check_admitted` and `check_spent` hooks, defaulting to `Ok(())`. All eligible payloads are checked after judgement and successor handling, before the first topic apply write. Refused topics are not applied; accepted siblings retain their existing behavior.
 - Add `MutationReport::refused` with typed `AdmissionRefusal` records carrying the topic, registered service, check site, and original service error. A refusal is not durable. Existing non-refusal STEAKs and fault summaries are unchanged.
 - Share payload construction between checks and notifications; keep one payload in memory at a time. Validate-only and deduplicated submissions do not run checks. This stopgap does not roll back manager writes, predecessor landing, or faults during apply.
-- Nine RED-first engine checks cover refusal byte equality, repeat judgement, payload modes and call counts, dry runs, report typing, ordering, and sibling topic isolation. The e592 memory ledger is unchanged.
+- Ten RED-first engine checks cover refusal byte equality, repeat judgement, payload modes and call counts, dry runs, report typing, ordering, sibling topic isolation, and typed carried-predecessor refusals. The e592 memory ledger is unchanged.
+- These API changes are additive for all known consumers, not strictly semver-additive: the exhaustive public `MutationReport` gains a field, and `LookupServiceError` gains `Clone`, `PartialEq`, and `Eq`, constraining future variants. All known report literals use `..Default`.
 
 ## Unreleased: health build metadata (L2-74)
 
