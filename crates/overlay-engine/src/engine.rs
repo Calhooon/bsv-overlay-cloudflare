@@ -5037,6 +5037,7 @@ impl Engine {
             let mut strikes_refused: u64 = 0;
             let mut backed_off_graphs: u64 = 0;
             let mut waiting_graphs: u64 = 0;
+            let mut idle_counted: u64 = 0;
             let mut faulted_roots: Vec<crate::gasp::FaultedRoot> = Vec::new();
 
             // If we have a remote factory, actually run GASP sync
@@ -5430,6 +5431,7 @@ impl Engine {
                     held_back_graphs += deferral.held_back;
                     backed_off_graphs += deferral.backed_off;
                     waiting_graphs += deferral.waiting;
+                    idle_counted += deferral.idle_counted;
                     dropped_graphs.extend(deferral.dropped.into_iter().map(|d| DroppedDeferral {
                         peer: peer_url.clone(),
                         outpoint: d.outpoint,
@@ -5509,6 +5511,7 @@ impl Engine {
                     held_back_graphs,
                     backed_off_graphs,
                     waiting_graphs,
+                    idle_counted,
                     unanchorable_graphs,
                     unanchorable_cleared,
                     strikes_refused,
@@ -6159,6 +6162,12 @@ pub struct TopicSyncResult {
     /// backoff: no request, the cursor passes them (engine 0.1.10).
     #[serde(default)]
     pub waiting_graphs: u64,
+    /// Held records whose resumed pass this sync counted one idle resume
+    /// on (engine 0.1.11, `gasp::DeferralStats::idle_counted`): the pass
+    /// asked the peer and appended nothing it kept, whether it ended in a
+    /// save, a drop or an error. A captain reads the idle rule firing here.
+    #[serde(default)]
+    pub idle_counted: u64,
     /// Roots recorded UNANCHORABLE in this sync (engine 0.1.9,
     /// `GASPSync::unanchorable_recorded`): their walk faulted in
     /// `gasp::UNANCHORABLE_AFTER_FAULTED_RUNS` consecutive runs; the cursor
@@ -8566,6 +8575,7 @@ mod tests {
                 held_back_graphs: 0,
                 backed_off_graphs: 0,
                 waiting_graphs: 0,
+                idle_counted: 0,
                 unanchorable_graphs: 0,
                 unanchorable_cleared: 0,
                 strikes_refused: 0,
@@ -9875,6 +9885,287 @@ mod tests {
         assert_eq!(held.reason, "nodes");
         assert_eq!(held.idle_resumes, 0);
         assert_eq!(held.retry_at, 0);
+    }
+
+    /// The courier of the 0.1.11 brief's fact 3: every rung exhausted, the
+    /// answer `NodeNotFound` ("no raw tx for <txid> (bitails + woc +
+    /// bananablocks exhausted)", `proof_fetcher.rs`), no proof for a root.
+    struct ExhaustedCourier {
+        asked: std::rc::Rc<Cell<u64>>,
+        /// Answer a fault of the moment instead (a rung's rate limit).
+        transient: std::rc::Rc<Cell<bool>>,
+    }
+
+    #[async_trait(?Send)]
+    impl AncestorFetcher for ExhaustedCourier {
+        async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
+            self.asked.set(self.asked.get() + 1);
+            if self.transient.get() {
+                return Err(GASPError::RemoteError(format!(
+                    "rung rate limited for {txid}"
+                )));
+            }
+            Err(GASPError::NodeNotFound(format!(
+                "no raw tx for {txid} (bitails + woc + bananablocks exhausted)"
+            )))
+        }
+        async fn verified_proof_for(&self, _: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// The production shape of the 0.1.11 brief (facts 2 and 3): a budget
+    /// page of `page` proven roots (scores 10, 20, ...) and `count` root
+    /// retry obligations written by 0.1.8 and 0.1.9 (`reason "retry"`,
+    /// passable, nodes 0, no `idleResumes`) at scores 1, 2, ..., each a root
+    /// the peer serves UNPROVEN whose parent no rung serves.
+    struct ObligationFixture {
+        engine: Engine,
+        remote: BudgetPageRemote,
+        store: std::rc::Rc<MemoryStorage>,
+        obligations: Vec<String>,
+        courier: std::rc::Rc<Cell<u64>>,
+        transient: std::rc::Rc<Cell<bool>>,
+    }
+
+    async fn obligation_fixture(page: u32, count: u32, node_cost_ms: u64) -> ObligationFixture {
+        let (mut engine, mut remote) = budget_page_engine(page);
+        remote.node_cost_ms = node_cost_ms;
+        let mut obligations = Vec::new();
+        let nodes = std::rc::Rc::make_mut(&mut remote.nodes);
+        let mut records = Vec::new();
+        for n in 0..count {
+            let parent = child_of(&format!("{:064x}", 0xbeef_0000 + n), 0);
+            let child = child_of(&parent.id(), 0);
+            nodes.insert(
+                child.id(),
+                crate::types::GASPNode {
+                    graph_id: String::new(),
+                    raw_tx: child.to_hex(),
+                    output_index: 0,
+                    proof: None,
+                    tx_metadata: None,
+                    output_metadata: None,
+                    inputs: None,
+                },
+            );
+            let mut record = bare_record(n, 1 + u64::from(n), "retry", true);
+            let outpoint = format!("{}.0", child.id());
+            record.outpoint.clone_from(&outpoint);
+            record.pending[0].outpoint.clone_from(&outpoint);
+            record.pending[0].graph_id.clone_from(&outpoint);
+            obligations.push(outpoint);
+            records.push(record);
+        }
+        let courier = std::rc::Rc::new(Cell::new(0));
+        let transient = std::rc::Rc::new(Cell::new(false));
+        engine.set_gasp_ancestor_fetcher(std::rc::Rc::new(ExhaustedCourier {
+            asked: courier.clone(),
+            transient: transient.clone(),
+        }));
+        let store = std::rc::Rc::new(MemoryStorage::new());
+        engine.storage = Box::new(store.clone());
+        virtual_peer_budget(&mut engine, &remote);
+        engine.set_graph_budget(
+            std::rc::Rc::new(|_| Box::pin(std::future::pending())),
+            100,
+            60_000,
+        );
+        engine.set_gasp_remote_factory(Box::new(remote.clone()));
+        for record in &records {
+            // The JSON 0.1.8 and 0.1.9 wrote: no `idleResumes`, no `faults`.
+            let json = serde_json::to_value(record).unwrap();
+            assert!(json.get("idleResumes").is_none() && json.get("faults").is_none());
+            engine.storage().put_deferred_graph(record).await.unwrap();
+        }
+        ObligationFixture {
+            engine,
+            remote,
+            store,
+            obligations,
+            courier,
+            transient,
+        }
+    }
+
+    /// 0.1.11 (a faulted resume is a strike): a held root retry obligation
+    /// whose root the peer serves and whose parent the courier cannot serve
+    /// (facts 2 and 3: `retry`, nodes 0, `courier`, `faults 0` on every run
+    /// of 0.1.10, never struck, never backed off) is struck on its own slot
+    /// on each run, recorded `unanchorable:courier` at the third, and not
+    /// resumed inside its backoff; the page's roots behind it are walked in
+    /// the same run, every run. The obligation stays passable throughout:
+    /// its cursor had passed it, and a strike never takes that back.
+    #[tokio::test]
+    async fn obligations_0111_a_faulted_resume_is_struck_and_the_page_is_walked() {
+        let ObligationFixture {
+            engine,
+            remote,
+            store,
+            obligations,
+            courier,
+            ..
+        } = obligation_fixture(3, 1, 0).await;
+        let host = "https://budget.example";
+        let held = &obligations[0];
+        let runs = crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS;
+        for run in 1..=runs {
+            let result = engine.start_gasp_sync().await.unwrap();
+            let topic = &result.topics_synced["tm_test"];
+            let named = topic
+                .faulted_roots
+                .iter()
+                .find(|f| &f.outpoint == held)
+                .unwrap_or_else(|| panic!("run {run}: {topic:?}"));
+            assert_eq!(named.class, crate::gasp::fault_class::COURIER);
+            assert!(named.error.contains("exhausted"), "{named:?}");
+            assert_eq!(named.faults, run, "run {run}: struck on its own slot");
+            assert!(named.refused.is_empty(), "{named:?}");
+            assert_eq!(topic.strikes_refused, 0);
+            assert!(topic.cursor_held_by.is_empty(), "run {run}: {topic:?}");
+            if run == 1 {
+                assert_eq!(topic.finalized_graphs, 3, "the page, the same run");
+                assert_eq!(topic.cursor_moves[0].to, 30);
+            }
+            let record = store
+                .get_deferred_graph(host, "tm_test", held)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.faults, run, "{record:?}");
+            assert!(record.cursor_passable, "run {run}: never holds the cursor");
+            assert!(record.nodes.is_empty());
+            if run < runs {
+                assert!(!named.unanchorable);
+                assert_eq!(record.reason, "retry:fault:courier");
+                assert_eq!(topic.unanchorable_graphs, 0);
+            } else {
+                assert!(named.unanchorable);
+                assert_eq!(record.reason, "unanchorable:courier");
+                assert!(record.retry_at > (current_timestamp_ms() / 1000.0) as u64);
+                assert_eq!(topic.unanchorable_graphs, 1, "{topic:?}");
+            }
+        }
+        // Inside its backoff: not resumed, nothing asked of the peer or the
+        // courier, nothing named, held.
+        let (asked, couriered) = (remote.asked.borrow().len(), courier.get());
+        let result = engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert!(topic.faulted_roots.is_empty(), "{topic:?}");
+        assert_eq!(topic.resumed_graphs, 0);
+        assert_eq!(remote.asked.borrow().len(), asked);
+        assert_eq!(courier.get(), couriered);
+        assert_eq!(store.deferred_graphs().len(), 1);
+    }
+
+    /// 0.1.11 (the idle count fires): a resumed pass of a held record that
+    /// asked and appended nothing it kept counts one idle resume whatever
+    /// its ending, and the sync's accounting says how many records counted
+    /// (`idle_counted`). Three endings: (a) the pass's own save (a rung's
+    /// fault of the moment: the record is kept, reason `fault`); (b) a drop
+    /// whose record is saved again as an obligation (the peer no longer
+    /// serves the root, `not_held`); (c) the production shape of fact 3 (the
+    /// root served, appended and thrown away with the drop, the courier
+    /// exhausted) when its strike is refused at the fault bound, so the drop
+    /// stands: on 0.1.10 the post-pass count read the sync's appended nodes,
+    /// which the thrown-away root had raised, and never fired.
+    #[tokio::test]
+    async fn obligations_0111_a_resume_that_appends_nothing_counts_on_every_ending() {
+        let host = "https://budget.example";
+        // (c) The production shape, its strike refused: the fault bound is
+        // full of unanchorable roots waiting out their backoff.
+        let fixture = obligation_fixture(1, 1, 0).await;
+        let later = (current_timestamp_ms() / 1000.0) as u64 + 3600;
+        for n in 0..crate::gasp::FAULT_RECORDS_PER_PEER_TOPIC {
+            let mut record = bare_record(100 + n as u32, 50, "unanchorable:courier", true);
+            record.faults = crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS;
+            record.retry_at = later;
+            fixture
+                .engine
+                .storage()
+                .put_deferred_graph(&record)
+                .await
+                .unwrap();
+        }
+        let held = &fixture.obligations[0];
+        let idle = crate::gasp::IDLE_RESUMES_BEFORE_BACKOFF;
+        for run in 1..=idle {
+            let result = fixture.engine.start_gasp_sync().await.unwrap();
+            let topic = &result.topics_synced["tm_test"];
+            let record = fixture
+                .store
+                .get_deferred_graph(host, "tm_test", held)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.idle_resumes, run, "run {run}: {record:?} {topic:?}");
+            assert_eq!(record.reason, "retry", "the drop stands");
+            assert!(record.cursor_passable && record.nodes.is_empty());
+            assert_eq!(topic.idle_counted, 1, "run {run}: {topic:?}");
+            let named = topic
+                .faulted_roots
+                .iter()
+                .find(|f| &f.outpoint == held)
+                .unwrap_or_else(|| panic!("run {run}: {topic:?}"));
+            assert_eq!(named.refused, crate::gasp::strike_refused::NO_ROOM);
+            assert_eq!(named.faults, 0);
+            assert_eq!(topic.strikes_refused, 1);
+            assert_eq!(topic.backed_off_graphs, u64::from(run == idle));
+        }
+        let result = fixture.engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.waiting_graphs, 1, "{topic:?}");
+        assert_eq!(topic.idle_counted, 0);
+
+        // (b) A drop: the peer no longer serves the root.
+        let mut fixture = obligation_fixture(1, 1, 0).await;
+        let gone = fixture.obligations[0].clone();
+        std::rc::Rc::make_mut(&mut fixture.remote.nodes).remove(gone.strip_suffix(".0").unwrap());
+        fixture
+            .engine
+            .set_gasp_remote_factory(Box::new(fixture.remote.clone()));
+        let result = fixture.engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.idle_counted, 1, "{topic:?}");
+        assert_eq!(
+            topic
+                .dropped_graphs
+                .iter()
+                .map(|d| d.reason.as_str())
+                .collect::<Vec<_>>(),
+            vec!["not_held"]
+        );
+        let record = fixture
+            .store
+            .get_deferred_graph(host, "tm_test", &gone)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((record.idle_resumes, record.faults), (1, 0), "{record:?}");
+
+        // (a) The pass's own save: a rung's fault of the moment. The pass
+        // that appends the root progresses; the next asks and appends
+        // nothing, and its save counts it.
+        let fixture = obligation_fixture(1, 1, 0).await;
+        fixture.transient.set(true);
+        let kept = &fixture.obligations[0];
+        let result = fixture.engine.start_gasp_sync().await.unwrap();
+        assert_eq!(result.topics_synced["tm_test"].idle_counted, 0, "progress");
+        let result = fixture.engine.start_gasp_sync().await.unwrap();
+        let topic = &result.topics_synced["tm_test"];
+        assert_eq!(topic.idle_counted, 1, "{topic:?}");
+        let record = fixture
+            .store
+            .get_deferred_graph(host, "tm_test", kept)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.reason, "fault");
+        assert_eq!(
+            (record.nodes.len(), record.idle_resumes),
+            (1, 1),
+            "{record:?}"
+        );
     }
 
     #[tokio::test]
