@@ -471,6 +471,82 @@ pub const EXPIRED_OUTPOINT_MEMO_SECS: u64 = 7 * 24 * 3600;
 /// the oldest rows go; a forgotten one costs one node fetch again.
 pub const EXPIRED_OUTPOINT_MEMO_MAX_ROWS: usize = 20_000;
 
+/// A root whose walk is dropped by a FAULT (not a deadline, not a bound) in
+/// this many consecutive runs is recorded unanchorable (engine 0.1.9): a
+/// record `unanchorable:<class>` the cursor passes, re-walked on the long
+/// backoff [`UNANCHORABLE_RETRY_SECS`]. Three, the deadline rule's number
+/// ([`DEADLINE_STALL_DEFERRAL_RUNS`]): one fault is the moment's (a 5xx, a
+/// rung's rate limit, a courier budget earlier graphs spent); a fault that
+/// survives three runs, each with a fresh peer slice and a fresh courier
+/// budget and each walking this root ahead of the pages, is the graph's own.
+/// Before 0.1.9 such a root held the cursor below it for ever (the 0.1.4
+/// rule) and every later output waited on a captain's hand.
+pub const UNANCHORABLE_AFTER_FAULTED_RUNS: u32 = 3;
+
+/// How long an unanchorable root waits before its next walk: six hours. What
+/// it lacks lands on that scale or not at all: an ancestor a rung indexes
+/// once mined (minutes to an hour), a peer that gains the history, a proof.
+/// Four walks a day of each of at most [`DEFERRED_GRAPHS_PER_PEER_TOPIC`]
+/// records is 64 walks a day for a (peer, topic) at worst, against 1,440
+/// ticks a day at a one-minute cadence. A later success admits it as any
+/// root and clears the record; nothing is admitted unanchored (T2).
+pub const UNANCHORABLE_RETRY_SECS: u64 = 6 * 3600;
+
+/// The reason prefix of a root's record while its fault streak is under
+/// [`UNANCHORABLE_AFTER_FAULTED_RUNS`]: not passable, the cursor holds.
+pub const FAULT_RETRY_REASON: &str = "retry:fault:";
+
+/// The reason prefix of an unanchorable root's record: passable.
+pub const UNANCHORABLE_REASON: &str = "unanchorable:";
+
+/// The fault classes a dropped root is named with (engine 0.1.9).
+pub mod fault_class {
+    /// The courier (the chain ancestor fetcher, its rungs) faulted or could
+    /// not serve an ancestor.
+    pub const COURIER: &str = "courier";
+    /// The peer answered it does not hold the root or an input an unproven
+    /// node needs (`NodeNotFound`).
+    pub const NOT_SERVED: &str = "not_served";
+    /// The peer faulted serving a node (a transport fault, a 5xx, a body
+    /// that does not parse). Named, never a strike: a peer that answers
+    /// with faults is the quarantine's to judge (bsv-low #302, #555's D-M1:
+    /// a 5xx keeps no record), not a reason to pass the roots it lists.
+    pub const PEER: &str = "peer";
+    /// A served node was refused when appended to the graph (it does not
+    /// parse or verify as the graph needs it).
+    pub const VERIFICATION: &str = "verification";
+    /// Any other failure (a storage fault of ours, a bound): named, never a
+    /// strike against the root.
+    pub const OTHER: &str = "other";
+
+    /// Whether a fault of `class` counts a faulted run of its root: the
+    /// three of the 0.1.9 brief (the courier, an input nobody served, a
+    /// verification refusal), never a peer's fault of the moment.
+    pub fn strikes(class: &str) -> bool {
+        matches!(class, COURIER | NOT_SERVED | VERIFICATION)
+    }
+}
+
+/// One root a sync dropped, named with why (engine 0.1.9): what the sync's
+/// accounting and the tick's summary line carry, once per (peer, root) per
+/// run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FaultedRoot {
+    /// The peer, filled by the engine (empty inside one `GASPSync`).
+    #[serde(default)]
+    pub peer: String,
+    /// The root outpoint.
+    pub outpoint: String,
+    /// Its class, one of [`fault_class`].
+    pub class: String,
+    /// The consecutive faulted runs its record counts (0: not recorded).
+    pub faults: u32,
+    /// Whether it is recorded unanchorable (the cursor passes it).
+    pub unanchorable: bool,
+    /// The error, cut to 160 characters.
+    pub error: String,
+}
+
 /// The per-graph budget of a [`GASPSync`] (bsv-low #555,
 /// `Engine::set_graph_budget`). Setting one turns deferral ON for that sync.
 pub struct GraphBudget<'a> {
@@ -608,7 +684,9 @@ pub struct DeferredGraph {
     /// Why it was last deferred: `calls`, `time`, `bytes`, `nodes`, `fault`,
     /// `anchor_unavailable`, `anchor_walk_held` (the E592 lens fold: the
     /// anchor's walk past the budget, held until the root is served proven),
-    /// `not_landed` or `peer_deadline`.
+    /// `not_landed` or `peer_deadline`; for a root whose walk faulted
+    /// (engine 0.1.9) `retry:fault:<class>` under
+    /// [`UNANCHORABLE_AFTER_FAULTED_RUNS`] runs, `unanchorable:<class>` at it.
     pub reason: String,
     /// Whether the peer is a CONFIGURED one (`SyncTarget::Peers`), not one
     /// `ls_ship` discovered (bsv-low #555, the delta-2 fold's D2-M2): a
@@ -627,9 +705,52 @@ pub struct DeferredGraph {
     /// records written before independent resume support.
     #[serde(default)]
     pub cursor_passable: bool,
+    /// Consecutive runs whose walk of this root faulted (engine 0.1.9): a
+    /// record `retry:fault:<class>` under [`UNANCHORABLE_AFTER_FAULTED_RUNS`],
+    /// `unanchorable:<class>` at it. 0 in every other record (and not
+    /// written, so their JSON is unchanged).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub faults: u32,
+    /// Unix seconds before which an unanchorable root is not walked again
+    /// ([`UNANCHORABLE_RETRY_SECS`]); 0 otherwise.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub retry_at: u64,
+}
+
+// serde's `skip_serializing_if` passes the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 impl DeferredGraph {
+    /// Whether this record counts a root's faulted runs (engine 0.1.9).
+    pub fn is_struck(&self) -> bool {
+        self.faults > 0
+            && (self.reason.starts_with(FAULT_RETRY_REASON)
+                || self.reason.starts_with(UNANCHORABLE_REASON))
+    }
+
+    /// Whether this record holds an unanchorable root (passable).
+    pub fn is_unanchorable(&self) -> bool {
+        self.is_struck() && self.reason.starts_with(UNANCHORABLE_REASON)
+    }
+
+    /// The fault class the record names, if it counts faulted runs.
+    pub fn fault_class(&self) -> Option<&str> {
+        if !self.is_struck() {
+            return None;
+        }
+        self.reason
+            .strip_prefix(UNANCHORABLE_REASON)
+            .or_else(|| self.reason.strip_prefix(FAULT_RETRY_REASON))
+    }
+
     /// The record's size as stored (its JSON): what the deferral's log line
     /// and a storage's byte budget read. Nothing refuses a record for it
     /// (bsv-low #585).
@@ -785,6 +906,11 @@ struct Walk {
     /// delta-2 fold's D2-L1); `None` for a resumed walk or with no
     /// [`GraphBudget::half_deadline`].
     half: Option<crate::engine::SleepFuture>,
+    /// The record of a root whose walk faulted in earlier runs (engine
+    /// 0.1.9), walked again from its root: the walk holds that record's
+    /// slot, a landing or a verdict deletes it, and a fault counts one more
+    /// run on it ([`GASPSync::strike`]).
+    struck: Option<Box<DeferredGraph>>,
 }
 
 /// How a graph's walk ended in this pass.
@@ -816,6 +942,9 @@ enum Ingested {
     Deferred,
     /// A record not resumed: the pass's resumes spent their shared budget.
     HeldBack,
+    /// An unanchorable root, held (engine 0.1.9): recorded at this walk, or
+    /// a record whose backoff has not run out. The cursor passes it.
+    Unanchorable,
 }
 
 /// What [`GASPSync::save_walk`] did with the walk in hand.
@@ -1274,6 +1403,17 @@ pub struct GASPSync<'a> {
     stats: std::cell::RefCell<DeferralStats>,
     /// See [`Self::graphs_attempted`].
     graphs_attempted: std::cell::Cell<u64>,
+    /// The fault class of the step that last failed a walk (engine 0.1.9),
+    /// set where the walk faults and read where its root is dropped;
+    /// `None` for a failure that is no fault of the graph (a storage fault
+    /// of ours, a bound).
+    last_fault: std::cell::Cell<Option<&'static str>>,
+    /// See [`Self::faulted_roots`].
+    faulted: std::cell::RefCell<Vec<FaultedRoot>>,
+    /// See [`Self::unanchorable_recorded`].
+    unanchorable_recorded: std::cell::Cell<u64>,
+    /// See [`Self::unanchorable_cleared`].
+    unanchorable_cleared: std::cell::Cell<u64>,
 }
 
 impl<'a> GASPSync<'a> {
@@ -1325,6 +1465,10 @@ impl<'a> GASPSync<'a> {
             walk: std::cell::RefCell::new(None),
             stats: std::cell::RefCell::new(DeferralStats::default()),
             graphs_attempted: std::cell::Cell::new(0),
+            last_fault: std::cell::Cell::new(None),
+            faulted: std::cell::RefCell::default(),
+            unanchorable_recorded: std::cell::Cell::new(0),
+            unanchorable_cleared: std::cell::Cell::new(0),
         }
     }
 
@@ -1382,6 +1526,26 @@ impl<'a> GASPSync<'a> {
     /// or converged.
     pub fn graphs_resumed_with_progress(&self) -> u64 {
         self.resumed_with_progress.get()
+    }
+
+    /// The roots the last `sync` dropped, each named once with its fault
+    /// class (engine 0.1.9): what `cursor_held_by` cannot say.
+    pub fn faulted_roots(&self) -> Vec<FaultedRoot> {
+        self.faulted.borrow().clone()
+    }
+
+    /// Roots the last `sync` recorded unanchorable: their walk faulted in
+    /// [`UNANCHORABLE_AFTER_FAULTED_RUNS`] consecutive runs, and the cursor
+    /// passes them from now on.
+    pub fn unanchorable_recorded(&self) -> u64 {
+        self.unanchorable_recorded.get()
+    }
+
+    /// Roots with a fault record (unanchorable or not yet) that the last
+    /// `sync` walked again and admitted or refused on a verdict: their
+    /// record cleared.
+    pub fn unanchorable_cleared(&self) -> u64 {
+        self.unanchorable_cleared.get()
     }
 
     /// Release the cursor's hold on `outpoint`: it is finished or held.
@@ -1460,10 +1624,230 @@ impl<'a> GASPSync<'a> {
             .storage
             .discard_graph(&Self::graph_id_of(walk.as_ref(), outpoint))
             .await;
-        if walk.as_ref().is_some_and(|w| w.resumed) || self.deferred.borrow_mut().remove(outpoint) {
+        if walk
+            .as_ref()
+            .is_some_and(|w| w.resumed || w.struck.is_some())
+            || self.deferred.borrow_mut().remove(outpoint)
+        {
             self.drop_record(outpoint, DropReason::Refused).await;
         }
         Ok(Ingested::Expired)
+    }
+
+    /// Unix seconds now, the clock of an unanchorable root's backoff.
+    fn now_secs() -> u64 {
+        (crate::engine::current_timestamp_ms() / 1000.0) as u64
+    }
+
+    /// Mark the walk's failure with its fault class (engine 0.1.9) and hand
+    /// the error back.
+    fn faulted(&self, class: &'static str, error: GASPError) -> GASPError {
+        if !matches!(error, GASPError::StorageError(_)) {
+            self.last_fault.set(Some(class));
+        }
+        error
+    }
+
+    /// The class of a peer's failure to serve a node.
+    fn peer_fault_class(error: &GASPError) -> &'static str {
+        match error {
+            GASPError::NodeNotFound(_) => fault_class::NOT_SERVED,
+            _ => fault_class::PEER,
+        }
+    }
+
+    /// Name a dropped root once in this run's accounting (engine 0.1.9).
+    fn note_faulted(
+        &self,
+        outpoint: &str,
+        error: &GASPError,
+        class: Option<&'static str>,
+        struck: Option<(u32, bool)>,
+    ) {
+        let mut faulted = self.faulted.borrow_mut();
+        if faulted.iter().any(|f| f.outpoint == outpoint) {
+            return;
+        }
+        let (faults, unanchorable) = struck.unwrap_or((0, false));
+        faulted.push(FaultedRoot {
+            peer: String::new(),
+            outpoint: outpoint.to_string(),
+            class: class.unwrap_or(fault_class::OTHER).to_string(),
+            faults,
+            unanchorable,
+            error: error.to_string().chars().take(160).collect(),
+        });
+    }
+
+    /// A fresh root dropped in the page walk: count its faulted run when
+    /// the failure is a fault and the root is the run's lowest gap, and name
+    /// it either way. Whether it is now unanchorable (the cursor passes it).
+    async fn strike_fresh(
+        &self,
+        score: u64,
+        outpoint: &str,
+        error: &GASPError,
+        lowest: bool,
+    ) -> bool {
+        let class = self.last_fault.take();
+        let struck = match class {
+            Some(class) if lowest && self.graph_budget.is_some() && fault_class::strikes(class) => {
+                self.strike(score, outpoint, class, None).await
+            }
+            _ => None,
+        };
+        self.note_faulted(outpoint, error, class, struck);
+        struck.is_some_and(|(_, unanchorable)| unanchorable)
+    }
+
+    /// Count one more faulted run of `outpoint` (engine 0.1.9), on its
+    /// record `prior` or on a new one: `retry:fault:<class>` (the cursor
+    /// holds) under [`UNANCHORABLE_AFTER_FAULTED_RUNS`], `unanchorable:<class>`
+    /// (passable, walked again after [`UNANCHORABLE_RETRY_SECS`]) at it. The
+    /// record holds nothing but the root to ask for: the walk starts again
+    /// from it. `None` when no record holds the count (no room, a storage
+    /// fault): the root stays a gap, as before 0.1.9.
+    async fn strike(
+        &self,
+        score: u64,
+        outpoint: &str,
+        class: &'static str,
+        prior: Option<&DeferredGraph>,
+    ) -> Option<(u32, bool)> {
+        if prior.is_none() && self.held_records.get() >= DEFERRED_GRAPHS_PER_PEER_TOPIC {
+            warn!(
+                "{} Root {} faulted ({}): no room for its record, the cursor holds (engine 0.1.9)",
+                self.log_prefix, outpoint, class
+            );
+            return None;
+        }
+        let mut record = Self::fresh_walk(score, outpoint, PassCap::NONE).record;
+        record.faults = prior.map_or(0, |r| r.faults) + 1;
+        let unanchorable = record.faults >= UNANCHORABLE_AFTER_FAULTED_RUNS;
+        record.cursor_passable = unanchorable;
+        if unanchorable {
+            record.reason = format!("{UNANCHORABLE_REASON}{class}");
+            record.retry_at = Self::now_secs() + UNANCHORABLE_RETRY_SECS;
+        } else {
+            record.reason = format!("{FAULT_RETRY_REASON}{class}");
+        }
+        match self.storage.save_deferred_graph(&record).await {
+            Ok(DeferredGraphSave::Saved) => {
+                if prior.is_none() {
+                    self.held_records.set(self.held_records.get() + 1);
+                }
+                if unanchorable && !prior.is_some_and(DeferredGraph::is_unanchorable) {
+                    self.unanchorable_recorded
+                        .set(self.unanchorable_recorded.get() + 1);
+                    warn!(
+                        "{} Root {} UNANCHORABLE ({}): faulted {} runs in a row; the cursor passes it, walked again in {} s (engine 0.1.9)",
+                        self.log_prefix, outpoint, class, record.faults, UNANCHORABLE_RETRY_SECS
+                    );
+                } else {
+                    warn!(
+                        "{} Root {} faulted ({}): run {} of {} (engine 0.1.9)",
+                        self.log_prefix,
+                        outpoint,
+                        class,
+                        record.faults,
+                        UNANCHORABLE_AFTER_FAULTED_RUNS
+                    );
+                }
+                Some((record.faults, unanchorable))
+            }
+            Ok(DeferredGraphSave::AtCeiling) | Err(_) => {
+                warn!(
+                    "{} Root {} faulted ({}): its record was not saved (engine 0.1.9)",
+                    self.log_prefix, outpoint, class
+                );
+                // A held unanchorable record stays as it was: passable.
+                prior
+                    .filter(|r| r.is_unanchorable())
+                    .map(|r| (r.faults, true))
+            }
+        }
+    }
+
+    /// Walk again the root of a fault record (engine 0.1.9), under this
+    /// pass's resume allowance. An unanchorable one waits out its backoff
+    /// (no request at all). The walk is fresh from the root and holds the
+    /// record's slot: a landing or a verdict clears the record, a budget
+    /// cut or a deadline replaces it with the hold it earned, and a fault
+    /// counts one more run on it.
+    async fn rewalk_struck(
+        &self,
+        utxo: &GASPOutput,
+        outpoint: &str,
+        record: DeferredGraph,
+        deadline: &mut crate::engine::SleepFuture,
+        cap: PassCap,
+    ) -> Result<Ingested, GASPError> {
+        let score = utxo.score as u64;
+        if record.is_unanchorable() && Self::now_secs() < record.retry_at {
+            // Not asked of the peer: not an attempt for the yieldless
+            // streak (a quiet peer holding one is never quarantined for it).
+            self.graphs_attempted
+                .set(self.graphs_attempted.get().saturating_sub(1));
+            debug!(
+                "{} Unanchorable root {} waits until {} (engine 0.1.9)",
+                self.log_prefix, outpoint, record.retry_at
+            );
+            return Ok(Ingested::Unanchorable);
+        }
+        info!(
+            "{} Walking root {} again after {} faulted runs ({}) (engine 0.1.9)",
+            self.log_prefix, outpoint, record.faults, record.reason
+        );
+        let mut walk = Self::fresh_walk(score, outpoint, cap);
+        walk.struck = Some(Box::new(record.clone()));
+        *self.walk.borrow_mut() = Some(walk);
+        let ended = self.walk_graph(Some(&mut *deadline)).await;
+        let out = self.finish_pass(outpoint, ended).await;
+        let keep_unanchorable = |record: &DeferredGraph| {
+            let mut record = record.clone();
+            record.retry_at = Self::now_secs() + UNANCHORABLE_RETRY_SECS;
+            record
+        };
+        match out {
+            // A stall of the graph's own deadline does not undo the record:
+            // the empty retry `save_walk` wrote is replaced again.
+            Ok(Ingested::Retry) if record.is_unanchorable() => {
+                let _ = self
+                    .storage
+                    .save_deferred_graph(&keep_unanchorable(&record))
+                    .await;
+                Ok(Ingested::Unanchorable)
+            }
+            Ok(ingested) => Ok(ingested),
+            Err(error) => {
+                self.walk.borrow_mut().take();
+                let class = self.last_fault.take();
+                let Some(class) = class.filter(|c| fault_class::strikes(c)) else {
+                    // No fault of the graph's: the record stands.
+                    self.note_faulted(
+                        outpoint,
+                        &error,
+                        class,
+                        Some((record.faults, record.is_unanchorable())),
+                    );
+                    if record.is_unanchorable() {
+                        let _ = self
+                            .storage
+                            .save_deferred_graph(&keep_unanchorable(&record))
+                            .await;
+                        return Ok(Ingested::Unanchorable);
+                    }
+                    return Err(error);
+                };
+                let struck = self.strike(score, outpoint, class, Some(&record)).await;
+                self.note_faulted(outpoint, &error, Some(class), struck);
+                if struck.is_some_and(|(_, unanchorable)| unanchorable) {
+                    Ok(Ingested::Unanchorable)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     /// Bound each graph's walk and retain its pending work. A successfully
@@ -1602,6 +1986,10 @@ impl<'a> GASPSync<'a> {
         self.retained.set(0);
         self.resumed_with_progress.set(0);
         self.cursor_yielded.set(false);
+        self.last_fault.set(None);
+        self.faulted.borrow_mut().clear();
+        self.unanchorable_recorded.set(0);
+        self.unanchorable_cleared.set(0);
         self.discarded_graphs.set(0);
         self.anchor_walk_held.set(0);
         self.completed_cursor = self.last_interaction;
@@ -1721,7 +2109,7 @@ impl<'a> GASPSync<'a> {
                     self.cursor_yielded.set(true);
                     true
                 }
-                Ok(Ingested::Deferred | Ingested::HeldBack) => true,
+                Ok(Ingested::Deferred | Ingested::HeldBack | Ingested::Unanchorable) => true,
                 Ok(Ingested::Retry) => false,
                 Err(error) => {
                     warn!(
@@ -1729,6 +2117,8 @@ impl<'a> GASPSync<'a> {
                         self.log_prefix, key.outpoint, error
                     );
                     self.walk.borrow_mut().take();
+                    let class = self.last_fault.take();
+                    self.note_faulted(&key.outpoint, &error, class, None);
                     false
                 }
             };
@@ -1872,7 +2262,9 @@ impl<'a> GASPSync<'a> {
                             }
                             landed.map(|()| true)
                         }
-                        Ok(Ingested::Deferred | Ingested::HeldBack) => Ok(true),
+                        Ok(Ingested::Deferred | Ingested::HeldBack | Ingested::Unanchorable) => {
+                            Ok(true)
+                        }
                         Ok(Ingested::Retry) => Ok(false),
                         Err(e) => {
                             self.walk.borrow_mut().take();
@@ -1902,12 +2294,29 @@ impl<'a> GASPSync<'a> {
                                 "{} Error ingesting UTXO {}: {}",
                                 self.log_prefix, outpoint, e
                             );
-                            // Remember the lowest failed score so the persisted
-                            // cursor cannot skip past it (see cap below).
                             let s = utxo.score as u64;
-                            min_failed_score = Some(min_failed_score.map_or(s, |cur| cur.min(s)));
-                            // Not again in this sync (bsv-low #554).
-                            failed_outpoints.insert(outpoint.clone());
+                            // Engine 0.1.9: a FAULT of the lowest gap of the
+                            // run counts the root's opening faulted run (a
+                            // record `retry:fault:<class>`); its next runs
+                            // walk it ahead of the pages, and the cursor
+                            // passes it once it is recorded unanchorable.
+                            // Only the lowest: one new record a (peer, topic)
+                            // a run, so a peer that faults every node cannot
+                            // fill the store in one tick (the delta fold's
+                            // D-M1).
+                            let lowest = min_failed_score.is_none_or(|m| s < m);
+                            if self.strike_fresh(s, &outpoint, &e, lowest).await {
+                                self.release_hold(&outpoint);
+                                shared_outpoints.insert(outpoint.clone());
+                            } else {
+                                // Remember the lowest failed score so the
+                                // persisted cursor cannot skip past it (see
+                                // cap below).
+                                min_failed_score =
+                                    Some(min_failed_score.map_or(s, |cur| cur.min(s)));
+                                // Not again in this sync (bsv-low #554).
+                                failed_outpoints.insert(outpoint.clone());
+                            }
                         }
                     }
                 }
@@ -2004,6 +2413,7 @@ impl<'a> GASPSync<'a> {
     /// Empty deadline retries hold the cursor until the stall threshold.
     /// All resumed graphs share one allowance; fresh graphs retain theirs.
     async fn ingest_utxo(&self, utxo: &GASPOutput, outpoint: &str) -> Result<Ingested, GASPError> {
+        self.last_fault.set(None);
         if self.expired.borrow().contains(outpoint) {
             return self.refuse_expired(outpoint).await;
         }
@@ -2046,6 +2456,11 @@ impl<'a> GASPSync<'a> {
                 return Ok(Ingested::Retry);
             };
             if record.reason == "retry:deadline" {
+                return Ok(Ingested::Retry);
+            }
+            // A fault streak not yet at its threshold holds the cursor; one
+            // not walked this run is not a faulted run (engine 0.1.9).
+            if record.is_struck() && !record.cursor_passable {
                 return Ok(Ingested::Retry);
             }
             if !record.cursor_passable {
@@ -2109,6 +2524,8 @@ impl<'a> GASPSync<'a> {
                 configured: false,
                 idle_faults: 0,
                 cursor_passable: false,
+                faults: 0,
+                retry_at: 0,
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
@@ -2120,6 +2537,7 @@ impl<'a> GASPSync<'a> {
             counted: false,
             gone_on: false,
             half: None,
+            struck: None,
         }
     }
 
@@ -2147,6 +2565,11 @@ impl<'a> GASPSync<'a> {
         } else {
             None
         };
+        if let Some(record) = record.as_ref().filter(|r| r.is_struck()) {
+            return self
+                .rewalk_struck(utxo, outpoint, record.clone(), deadline, cap)
+                .await;
+        }
         if let Some(record) = &record {
             if let [root, ..] = record.nodes.as_slice() {
                 if self.root_expired(&root.node, outpoint)? {
@@ -2205,6 +2628,7 @@ impl<'a> GASPSync<'a> {
                     counted: false,
                     gone_on: false,
                     half: None,
+                    struck: None,
                 }
             }
         };
@@ -2303,9 +2727,18 @@ impl<'a> GASPSync<'a> {
                     Ok(true) => return Ok(Ingested::Completed),
                     Ok(false) => {
                         // Refused by the anchor check: a verdict, the cursor
-                        // moves, nothing to resume.
-                        self.walk.borrow_mut().take();
-                        if resumed {
+                        // moves, nothing to resume. A root's fault record
+                        // goes with it (engine 0.1.9).
+                        let struck = self
+                            .walk
+                            .borrow_mut()
+                            .take()
+                            .is_some_and(|w| w.struck.is_some());
+                        if resumed || struck {
+                            if struck {
+                                self.unanchorable_cleared
+                                    .set(self.unanchorable_cleared.get() + 1);
+                            }
                             self.drop_record(outpoint, DropReason::Refused).await;
                         }
                         return Ok(Ingested::Completed);
@@ -2464,7 +2897,30 @@ impl<'a> GASPSync<'a> {
             let Some(walk) = self.walk.borrow_mut().take() else {
                 return;
             };
-            if walk.resumed {
+            if walk.struck.is_some() {
+                // A root walked again after faulted runs landed (engine
+                // 0.1.9): admitted as any root, its record cleared.
+                if let Err(e) = self
+                    .storage
+                    .delete_deferred_graph(&walk.record.outpoint)
+                    .await
+                {
+                    warn!(
+                        "{} Could not delete the fault record of landed root {}: {}",
+                        self.log_prefix, walk.record.outpoint, e
+                    );
+                }
+                self.held_records
+                    .set(self.held_records.get().saturating_sub(1));
+                self.unanchorable_cleared
+                    .set(self.unanchorable_cleared.get() + 1);
+                info!(
+                    "{} Root {} LANDED after {} faulted runs: its record cleared (engine 0.1.9)",
+                    self.log_prefix,
+                    walk.record.outpoint,
+                    walk.struck.as_ref().map_or(0, |r| r.faults)
+                );
+            } else if walk.resumed {
                 if let Err(e) = self
                     .storage
                     .delete_deferred_graph(&walk.record.outpoint)
@@ -2548,7 +3004,10 @@ impl<'a> GASPSync<'a> {
         if walk.record.nodes.is_empty() && !deadline_cut && !was_held {
             return Saved::Unkept(DropReason::NoProgress, Box::new(walk));
         }
-        if !walk.resumed && self.held_records.get() >= DEFERRED_GRAPHS_PER_PEER_TOPIC {
+        // A root walked again after faulted runs holds its record's slot
+        // (engine 0.1.9): a save replaces that record.
+        let holds_slot = walk.resumed || walk.struck.is_some();
+        if !holds_slot && self.held_records.get() >= DEFERRED_GRAPHS_PER_PEER_TOPIC {
             return Saved::Unkept(DropReason::TooMany, Box::new(walk));
         }
         // No bound on a record's size (bsv-low #585): the figure is logged
@@ -2558,7 +3017,9 @@ impl<'a> GASPSync<'a> {
         match self.storage.save_deferred_graph(&walk.record).await {
             Ok(DeferredGraphSave::Saved) => {
                 if !walk.resumed {
-                    self.held_records.set(self.held_records.get() + 1);
+                    if !holds_slot {
+                        self.held_records.set(self.held_records.get() + 1);
+                    }
                     if !retry && !walk.record.nodes.is_empty() {
                         self.retained.set(self.retained.get() + 1);
                     }
@@ -2724,6 +3185,29 @@ impl<'a> GASPSync<'a> {
                 self.release_hold(&outpoint);
                 return;
             }
+        }
+        // An unanchorable root cut mid-walk stays unanchorable (engine
+        // 0.1.9): its record is kept, its backoff starts again, the cursor
+        // passes it as before. A root whose fault streak is still under the
+        // threshold is held at the deadline as any graph in flight.
+        let unanchorable = self
+            .walk
+            .borrow()
+            .as_ref()
+            .and_then(|w| w.struck.as_deref().filter(|r| r.is_unanchorable()).cloned());
+        if let Some(mut record) = unanchorable {
+            self.walk.borrow_mut().take();
+            record.retry_at = Self::now_secs() + UNANCHORABLE_RETRY_SECS;
+            let outpoint = record.outpoint.clone();
+            if let Err(e) = self.storage.save_deferred_graph(&record).await {
+                warn!(
+                    "{} Could not keep unanchorable root {} at the deadline: {}",
+                    self.log_prefix, outpoint, e
+                );
+            }
+            self.completed_cursor = self.cursor_after_in_flight;
+            self.release_hold(&outpoint);
+            return;
         }
         // A deadline during pagination has no graph to save. Preserve the
         // completed cursor, including any earlier unsaved gap.
@@ -2910,6 +3394,8 @@ impl<'a> GASPSync<'a> {
                 configured: false,
                 idle_faults: 0,
                 cursor_passable: false,
+                faults: 0,
+                retry_at: 0,
             },
             seen: std::collections::HashSet::new(),
             calls_this_pass: 0,
@@ -2921,6 +3407,7 @@ impl<'a> GASPSync<'a> {
             counted: false,
             gone_on: false,
             half: None,
+            struck: None,
         });
         let node = self.hydrate_root(node.clone()).await;
         let out = self.absorb(&root, node).await?;
@@ -3035,8 +3522,14 @@ impl<'a> GASPSync<'a> {
         // with enough of them exceeds that budget and the sync is
         // dropped whole; what a dropped sync keeps is bsv-low #552's
         // ground, and a cap on the list is the manager's choice.
+        // Each failure below is marked with its fault class (engine 0.1.9),
+        // read where the root is dropped.
         let node = if item.spent_by.is_none() {
-            let Some(node) = self.fetch_root(item).await? else {
+            let Some(node) = self
+                .fetch_root(item)
+                .await
+                .map_err(|e| self.faulted(Self::peer_fault_class(&e), e))?
+            else {
                 return Ok(StepOut::Expired);
             };
             node
@@ -3079,7 +3572,10 @@ impl<'a> GASPSync<'a> {
                 // Every fetcher error fails the UTXO (the `?`):
                 // the fetcher arm never prunes, see the rule above.
                 Some(fetcher) => {
-                    let ancestor = fetcher.fetch_ancestor(&txid).await?;
+                    let ancestor = fetcher
+                        .fetch_ancestor(&txid)
+                        .await
+                        .map_err(|e| self.faulted(fault_class::COURIER, e))?;
                     let node = GASPNode {
                         graph_id: item.graph_id.clone(),
                         raw_tx: ancestor.raw_tx,
@@ -3119,11 +3615,13 @@ impl<'a> GASPSync<'a> {
                     }
                     // Any other error, and every error under an unproven
                     // parent: propagate, as the reference does.
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(self.faulted(Self::peer_fault_class(&e), e)),
                 },
             }
         };
-        self.absorb(item, node).await
+        self.absorb(item, node)
+            .await
+            .map_err(|e| self.faulted(fault_class::VERIFICATION, e))
     }
 
     /// The node of `item`, fetched: append it to the graph and name its

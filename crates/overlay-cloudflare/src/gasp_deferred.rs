@@ -779,6 +779,8 @@ mod tests {
             configured: false,
             idle_faults: 0,
             cursor_passable: false,
+            faults: 0,
+            retry_at: 0,
         }
     }
 
@@ -1837,6 +1839,9 @@ mod tests {
                 .collect(),
             stalled_graphs: 0,
             held_back_graphs: 0,
+            unanchorable_graphs: 0,
+            unanchorable_cleared: 0,
+            faulted_roots: Vec::new(),
         };
         let results = std::collections::HashMap::from([
             ("tm_a".to_string(), topic(2, 1, 0, &["max_passes"])),
