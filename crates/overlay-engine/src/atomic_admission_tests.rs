@@ -558,8 +558,8 @@ async fn a1_05_two_spenders_judge_the_serial_store() {
         })
         .count();
     assert_eq!(
-        landed, 1,
-        "a1_05 both spends admitted against one retained coin"
+        landed, 2,
+        "a1_05 retained spent coins remain visible to the manager"
     );
 }
 
@@ -1253,4 +1253,42 @@ async fn a1_c7_manager_error_fails_only_its_topic_unless_deferred() {
     let result = submit_log(&error_engine(&deferred_store, true), &deferred_store, &beef).await;
     assert!(matches!(result, Err(LogError::Refused(AdmitRefusal::NotNow { site, .. })) if site == "evidence_unavailable"));
     assert!(before == snapshot(&deferred_store, &index));
+}
+
+struct ObservingRetainManager { store: Rc<MemoryStorage>, first: String, saw_first: Rc<std::cell::Cell<bool>> }
+#[async_trait(?Send)]
+impl TopicManager for ObservingRetainManager {
+    async fn identify_admissible_outputs(&self, tx: &Transaction, previous: &[u8], offchain: Option<&[u8]>, mode: SubmitMode, context: &TopicAdmittanceContext) -> Result<AdmittanceInstructions, TopicManagerError> {
+        if tx.id() != self.first {
+            self.saw_first.set(self.store.find_output(&self.first, 0, Some(REGISTRY), None, false).await.unwrap().is_some());
+        }
+        RetainManager.identify_admissible_outputs(tx, previous, offchain, mode, context).await
+    }
+    async fn get_documentation(&self) -> String { String::new() }
+    async fn get_metadata(&self) -> ServiceMetadata { ServiceMetadata::default() }
+}
+#[tokio::test]
+async fn a1_c8_second_spender_matches_submit_and_sees_committed_rows() {
+    let mut words = Vec::new();
+    for atomic in [false, true] {
+        let (_, store, _, mut first, _) = fixture().await;
+        first.topics = vec![REGISTRY.into()];
+        let mut tx = Transaction::from_beef(&first.beef, None).unwrap();
+        let first_id = tx.id();
+        tx.lock_time += 1;
+        tx.invalidate_caches();
+        tx.merkle_path = Some(MerklePath::new(100, vec![vec![MerklePathLeaf::new_txid(0, tx.id())]]).unwrap());
+        let second = TaggedBEEF::new(tx.to_beef(false).unwrap(), first.topics.clone());
+        let saw_first = Rc::new(std::cell::Cell::new(false));
+        let engine = Engine::new(HashMap::from([(REGISTRY.into(), Box::new(ObservingRetainManager {
+            store: store.clone(), first: first_id, saw_first: saw_first.clone(),
+        }) as Box<dyn TopicManager>)]), HashMap::new(), Box::new(store.clone()), None, EngineConfig::default());
+        for beef in [first, second] {
+            let word = if atomic { submit_log(&engine, &store, &beef).await.unwrap().0 }
+                else { engine.submit(&beef, SubmitMode::HistoricalTxNoSpv).await.unwrap() };
+            words.push(serde_json::to_value(word).unwrap());
+        }
+        assert!(saw_first.get(), "second unit must judge against the first unit's committed row");
+    }
+    assert_eq!(words[0..2], words[2..4], "spent-coin judgement must match submit");
 }

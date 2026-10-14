@@ -258,7 +258,7 @@ impl Engine {
                         &source,
                         input.source_output_index,
                         Some(topic),
-                        Some(false),
+                        None,
                         false,
                     )
                     .await
