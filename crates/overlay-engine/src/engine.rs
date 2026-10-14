@@ -5043,6 +5043,8 @@ impl Engine {
                     .as_ref()
                     .is_none_or(|names| names.contains(peer))
             });
+            let mut peers_skipped = Vec::new();
+            let advertisements = self.peer_advertisement_versions(topic).await;
             let mut errors = Vec::new();
             let mut pruned_inputs: u64 = 0;
             let mut discarded_graphs: u64 = 0;
@@ -5091,12 +5093,35 @@ impl Engine {
                         .await
                         .unwrap_or_default();
                     if crate::gasp::peer_sync_quarantined(&health) {
+                        peers_skipped.push(crate::sync_load::SkippedPeer {
+                            peer: peer_url.clone(),
+                            reason: "quarantine".into(),
+                            retry_after_secs: crate::gasp::PEER_QUARANTINE_REPROBE_SECS
+                                .saturating_sub(health.secs_since_last_attempt.unwrap_or(0)),
+                        });
                         warn!(
                             "[GASP SYNC] Peer {peer_url} for {topic} QUARANTINED ({} consecutive failed syncs, last attempt {:?}s ago) — skipped until the {}s re-probe window (bsv-low#302)",
                             health.consecutive_failures,
                             health.secs_since_last_attempt,
                             crate::gasp::PEER_QUARANTINE_REPROBE_SECS
                         );
+                        continue;
+                    }
+
+                    let cadence = self
+                        .storage
+                        .get_peer_cadence(&health_key, topic)
+                        .await
+                        .unwrap_or_default();
+                    let advertisement =
+                        advertisements.get(&health_key).cloned().unwrap_or_default();
+                    let reset_cadence = filter.explicit() || cadence.advertisement != advertisement;
+                    if !reset_cadence && cadence.retry_after_secs > 0 {
+                        peers_skipped.push(crate::sync_load::SkippedPeer {
+                            peer: peer_url.clone(),
+                            reason: "no_yield".into(),
+                            retry_after_secs: cadence.retry_after_secs,
+                        });
                         continue;
                     }
 
@@ -5453,6 +5478,34 @@ impl Engine {
                             ),
                         }
                     }
+                    // Quiet success controls polling cadence, never peer health. Faults
+                    // retain #302's attempt cadence; retained work keeps its resume slice.
+                    let quiet = outcome_success
+                        && !yielded
+                        && !sync.did_work()
+                        && sync.faulted_roots().is_empty()
+                        && sync.deferral_stats().stalled == 0;
+                    let quiet_syncs = if quiet {
+                        if reset_cadence {
+                            1
+                        } else {
+                            cadence.quiet_syncs.saturating_add(1)
+                        }
+                    } else {
+                        0
+                    };
+                    let next = crate::sync_load::PeerCadence {
+                        quiet_syncs,
+                        retry_after_secs: crate::sync_load::quiet_retry_secs(quiet_syncs),
+                        advertisement,
+                    };
+                    if let Err(e) = self
+                        .storage
+                        .set_peer_cadence(&health_key, topic, &next)
+                        .await
+                    {
+                        warn!("[GASP SYNC] failed to record cadence for {peer_url}/{topic}: {e}");
+                    }
                     if !advanced_cursor {
                         if let Some(outpoint) = sync.cursor_held_by() {
                             cursor_held_by.push(outpoint);
@@ -5526,12 +5579,13 @@ impl Engine {
             topics_synced.insert(
                 topic.clone(),
                 TopicSyncResult {
+                    peers_skipped,
+                    peers_filtered,
                     roots_proven,
                     roots_unproven,
                     cursor_held_by,
                     expired_refused,
                     peers,
-                    peers_filtered,
                     sync_type,
                     errors,
                     pruned_inputs,
@@ -5827,6 +5881,39 @@ impl Engine {
             .map_err(|e| EngineError::StorageError(e.to_string()))
     }
 
+    /// Read our admitted advertisement set, not a foreign history. A changed
+    /// SLAP outpoint wakes its origin; SHIP scopes that wake to its topic.
+    async fn peer_advertisement_versions(&self, topic: &str) -> HashMap<String, String> {
+        let mut versions: HashMap<String, Vec<String>> = HashMap::new();
+        for (ad_topic, protocol, scope) in [
+            ("tm_slap", &b"SLAP"[..], None),
+            ("tm_ship", &b"SHIP"[..], Some(topic)),
+        ] {
+            let rows = self
+                .storage
+                .find_utxos_for_topic(ad_topic, None, None, false)
+                .await
+                .unwrap_or_default();
+            for row in rows {
+                if let Some(domain) =
+                    parse_advertisement_domain_from_script(&row.output_script, protocol, scope)
+                {
+                    versions
+                        .entry(crate::gasp::peer_origin(&domain))
+                        .or_default()
+                        .push(format!("{}:{}", row.txid, row.output_index));
+                }
+            }
+        }
+        versions
+            .into_iter()
+            .map(|(peer, mut keys)| {
+                keys.sort();
+                (peer, keys.join(","))
+            })
+            .collect()
+    }
+
     async fn discover_ship_peers(
         &self,
         topic: &str,
@@ -6104,6 +6191,8 @@ pub struct GASPSyncResult {
 /// Sync result for a single topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicSyncResult {
+    #[serde(default)]
+    pub peers_skipped: Vec<crate::sync_load::SkippedPeer>,
     #[serde(default)]
     pub peers_filtered: Vec<String>,
     /// Root proof status after successful anchor validation and finalization.
@@ -8145,6 +8234,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_0112_quiet_peer_costs_no_request_during_backoff() {
+        let calls = std::rc::Rc::default();
+        let store = std::rc::Rc::new(MemoryStorage::new());
+        let mut engine = Engine::new(
+            HashMap::new(),
+            HashMap::new(),
+            Box::new(store.clone()),
+            None,
+            EngineConfig {
+                sync_configuration: HashMap::from([(
+                    "tm_test".into(),
+                    SyncTarget::Peers(vec!["https://quiet.example".into()]),
+                )]),
+                ..Default::default()
+            },
+        );
+        engine.set_gasp_remote_factory(Box::new(RecordingDiscoverySyncFactory {
+            calls: std::rc::Rc::clone(&calls),
+        }));
+        for _ in 0..4 {
+            engine.start_gasp_sync().await.unwrap();
+        }
+        assert_eq!(calls.borrow().len(), 3);
+        assert_eq!(
+            store
+                .get_peer_sync_health("quiet.example", "tm_test")
+                .await
+                .unwrap()
+                .consecutive_failures,
+            0
+        );
+        store.advance_clock(60);
+        engine.start_gasp_sync().await.unwrap();
+        assert_eq!(calls.borrow().len(), 4);
+        engine.start_gasp_sync().await.unwrap();
+        assert_eq!(calls.borrow().len(), 4);
+        engine
+            .start_gasp_sync_filtered(&crate::sync_load::SyncFilter {
+                topics: Some(vec!["tm_test".into()]),
+                peers: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.borrow().len(), 5);
+        engine.start_gasp_sync().await.unwrap();
+        assert_eq!(
+            calls.borrow().len(),
+            6,
+            "explicit selection reset the quiet streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_0112_yield_and_advertisement_reset_cadence() {
+        let (mut engine, remote) = budget_page_engine(1);
+        engine.set_gasp_remote_factory(Box::new(remote));
+        engine
+            .storage
+            .set_peer_cadence(
+                "budget.example",
+                "tm_test",
+                &crate::sync_load::PeerCadence {
+                    quiet_syncs: 8,
+                    retry_after_secs: 0,
+                    advertisement: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert_eq!(result.topics_synced["tm_test"].finalized_graphs, 1);
+        assert_eq!(
+            engine
+                .storage
+                .get_peer_cadence("budget.example", "tm_test")
+                .await
+                .unwrap()
+                .quiet_syncs,
+            0
+        );
+        engine
+            .storage
+            .set_peer_cadence(
+                "budget.example",
+                "tm_test",
+                &crate::sync_load::PeerCadence {
+                    quiet_syncs: 8,
+                    retry_after_secs: 3_600,
+                    advertisement: "previous-advertisement".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let result = engine.start_gasp_sync().await.unwrap();
+        assert!(result.topics_synced["tm_test"].peers_skipped.is_empty());
+        assert!(
+            engine
+                .storage
+                .get_peer_cadence("budget.example", "tm_test")
+                .await
+                .unwrap()
+                .quiet_syncs
+                <= 1
+        );
+    }
+
+    #[tokio::test]
     async fn load_0112_filter_selects_only_named_topic_and_peer() {
         let calls = std::rc::Rc::default();
         let mut engine = Engine::new(
@@ -8658,6 +8854,7 @@ mod tests {
         topics_synced.insert(
             "tm_test".to_string(),
             super::TopicSyncResult {
+                peers_skipped: Vec::new(),
                 peers_filtered: Vec::new(),
                 roots_proven: 0,
                 roots_unproven: 0,
@@ -8690,7 +8887,7 @@ mod tests {
 
         let result = super::GASPSyncResult {
             topics_synced,
-            filter: Default::default(),
+            filter: crate::sync_load::SyncFilter::default(),
             topics_filtered: Vec::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
