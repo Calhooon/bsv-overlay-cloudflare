@@ -43,14 +43,17 @@ try {
       "CREATE TRIGGER require_held BEFORE INSERT ON trigger_guard WHEN NEW.ok != 1 BEGIN SELECT RAISE(ABORT, 'atomic_admission_precondition'); END",
     ])
     const effects = async () => (await ok(['SELECT * FROM effects ORDER BY id']))[0].results
-    const failedBatch = async guard => {
+    const failedBatch = async (guard, marker = /CHECK constraint failed: atomic_admission_precondition/) => {
       const result = await batch(['INSERT INTO effects VALUES (1)', guard, 'INSERT INTO effects VALUES (3)'])
       assert(result.error, 'the guard must FAIL, not merely change zero rows')
+      assert.equal(result.error.name, 'Error')
+      assert.match(result.error.message, marker)
+      assert.equal(result.error.cause.message, result.error.message.replace(/^D1_ERROR: /, ''))
       console.log(JSON.stringify(result.error))
       const rows = await effects()
       if (process.argv.includes('--red-rollback')) assert.deepEqual(rows, [{ id: 1 }], 'deliberately wrong: first statement survived')
       assert.deepEqual(rows, [], 'neither statement one nor three may remain')
-      assert.deepEqual((await ok(['SELECT * FROM admission_guard']))[0].results, [])
+      for (const table of ['admission_guard', 'trigger_guard']) assert.deepEqual((await ok([`SELECT * FROM ${table}`]))[0].results, [])
     }
     await failedBatch('INSERT INTO admission_guard VALUES (0)')
     // WHERE false inserts nothing: neither CHECK nor NOT NULL sees a row.
@@ -62,11 +65,18 @@ try {
     const check = 'INSERT INTO admission_guard SELECT EXISTS (SELECT 1 FROM held WHERE id = 7 AND spent = 0)'
     const scalar = 'INSERT INTO admission_guard VALUES ((SELECT 1 FROM held WHERE id = 7 AND spent = 0))'
     const trigger = 'INSERT INTO trigger_guard SELECT EXISTS (SELECT 1 FROM held WHERE id = 7 AND spent = 0)'
-    for (const guard of [check, scalar, trigger]) await failedBatch(guard)
+    const guards = [
+      [check, /CHECK constraint failed: atomic_admission_precondition/],
+      [scalar, /NOT NULL constraint failed: admission_guard.ok/],
+      [trigger, /atomic_admission_precondition: SQLITE_CONSTRAINT/],
+    ]
+    for (const args of guards) await failedBatch(...args)
+    await ok(['INSERT INTO held VALUES (7, 1)'])
+    for (const args of guards) await failedBatch(...args)
     const outside = await batch(["SELECT RAISE(ABORT, 'atomic_admission_precondition')"])
     assert(outside.error)
     console.log('RAISE outside trigger', JSON.stringify(outside.error))
-    await ok(['INSERT INTO held VALUES (7, 0)'])
+    await ok(['UPDATE held SET spent = 0 WHERE id = 7'])
     for (const guard of [check, scalar, trigger]) {
       await ok(['INSERT INTO effects VALUES (1)', guard, 'INSERT INTO effects VALUES (3)'])
       assert.deepEqual(await effects(), [{ id: 1 }, { id: 3 }])

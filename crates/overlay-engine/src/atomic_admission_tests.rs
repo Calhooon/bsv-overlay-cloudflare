@@ -159,7 +159,18 @@ fn snapshot(store: &MemoryStorage, index: &Index) -> Vec<u8> {
 async fn fixture() -> (Engine, Rc<MemoryStorage>, Index, TaggedBEEF, String) {
     let store = Rc::new(MemoryStorage::new());
     let index = Rc::new(Mutex::new(BTreeMap::new()));
-    let parent = "11".repeat(32);
+    let mut previous = Transaction::new();
+    let mut funding = TransactionInput::new("00".repeat(32), u32::MAX);
+    funding.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
+    previous.inputs.push(funding);
+    previous.outputs.push(TransactionOutput::new(
+        3,
+        LockingScript::from_binary(&[0x51]).unwrap(),
+    ));
+    let parent = previous.id();
+    previous.merkle_path =
+        Some(MerklePath::new(99, vec![vec![MerklePathLeaf::new_txid(0, parent.clone())]]).unwrap());
+    let previous_beef = previous.to_beef(false).unwrap();
     let mut tx = Transaction::new();
     let mut input = TransactionInput::new(parent.clone(), 0);
     input.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
@@ -187,7 +198,7 @@ async fn fixture() -> (Engine, Rc<MemoryStorage>, Index, TaggedBEEF, String) {
             spent: false,
             outputs_consumed: vec![],
             consumed_by: vec![],
-            beef: Some(vec![0x65, 0x07]),
+            beef: Some(previous_beef),
             block_height: Some(99),
             score: Some(1.0),
         })

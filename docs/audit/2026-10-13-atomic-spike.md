@@ -19,6 +19,11 @@ Repository rules checked: `CLAUDE.md`, `RELEASING.md`, storage ownership and the
 existing harness pattern. No RULES/CAPTAIN/AGENTS page or active git hooks found;
 no formal commit subject convention found, so subjects follow the issue-led log.
 Fixture SQL creates only its private local tables, no engine migration.
+The engine's own `D1Storage::insert_output` currently executes the output row
+and transaction/BEEF row in separate calls (`d1_storage.rs:419` onward), unlike
+the consumer backend described by the design. The new probe measures the JS
+D1 binding's batch primitive directly, not a Rust admission unit or the
+workers-rs error conversion. This spike adds no admission API.
 
 ## 1. Batch rollback and preconditions
 
@@ -31,8 +36,9 @@ npx --yes --package wrangler@4.150.0 -c 'node tools/lane-657/d1_pins.mjs'
 
 First command was RED (exit 1): deliberately expected `[{id:1}]` after the
 second statement failed; actual `[]`. Second command GREEN (exit 0): both the
-first and third effects absent; the guard table empty. False and true branches
+first and third effects absent; the guard table empty. False (missing row and spent row) and true branches
 of each working conditional guard are exercised, not just a constant failure.
+The runner also asserts the error marker and the nested cause text.
 
 Verbatim fixture schema and working conditional CHECK:
 
@@ -129,13 +135,14 @@ invocation and credential source are available, this part is blocked.
 ## 3. Engine witnesses, RED and retained
 
 The engine's native MemoryStorage harness, as a private child test module
-(`storage.rs:702`), includes `src/atomic_admission_tests.rs`. This avoids adding
+(`storage.rs:1339`), includes `src/atomic_admission_tests.rs`. This avoids adding
 an API just to inspect private tables. The two synthetic topic managers model
 registry TYPE 2 `[0, 2]` over a held coin and a proof topic admitting `[2]`.
 If the coin disappears the registry manager returns TYPE 1 `[0]`. The lookup
 hook refuses registry output 2 by payload, not by call count, on every attempt;
 it accepts and indexes the other outputs. One service avoids hook-order noise.
-The submitted fixture is a generated BEEF with a synthetic merkle path and no
+The held parent and submitted fixture are generated, parseable BEEFs with
+synthetic merkle paths and no
 network access, submitted as `HistoricalTxNoSpv`, like the design's apply path.
 It is not the captured Zanaadu transaction or a cryptographic proof test.
 
@@ -148,9 +155,9 @@ Storage/Engine/LookupService API or implementation behavior was changed.
 
 Tests in `crates/overlay-engine/src/atomic_admission_tests.rs`:
 
-- `e657_refused_submit_leaves_store_byte_equal`, line 236, ignored with
+- `e657_refused_submit_leaves_store_byte_equal`, line 247, ignored with
   `bsv-low #657: RED until A stages all admission writes and rolls back lookup refusal`.
-- `e657_same_bytes_same_word_after_refusal`, line 266, ignored with
+- `e657_same_bytes_same_word_after_refusal`, line 277, ignored with
   `bsv-low #657: RED until A leaves a refused submit unchanged so identical bytes get the same word`.
 
 Executed both explicitly:
@@ -162,10 +169,10 @@ cargo test -p bsv-overlay-engine --features memory-storage --lib e657_ -- --igno
 
 Exit 101, 2 failed at the intended assertions, not at setup or compilation:
 
-- Byte-equality assertion at line 247: canonical snapshot before 4,765 bytes,
-  after 18,409 bytes. The test first confirms exactly the intended lookup
+- Byte-equality assertion at line 258: canonical snapshot before 7,495 bytes,
+  after 18,952 bytes. The test first confirms exactly the intended lookup
   refusal and registry STEAK `[0, 2]`.
-- Same-word assertion at line 279: first report has the registry lookup
+- Same-word assertion at line 290: first report has the registry lookup
   refusal and proof topic applied; second report has no faults, registry
   applied and proof deduplicated. The test also requires equal STEAKs and
   unchanged bytes after both calls, once report equality can pass. The same
@@ -205,3 +212,53 @@ run skipped both witnesses, passed 205 library tests, and failed the existing
 wall-clock deadline for 4,096 proven parents (830,907 bytes). It stopped before
 integration tests. This lane changes no code on that path; an isolated rerun
 is recorded below. No timing bound was relaxed.
+
+
+The isolated scaling-test rerun also failed at the 4,096-parent deadline.
+A base comparison then temporarily used `storage.rs` verbatim from
+`970aad1291f5ea81cf9afeada0a725f218b0df48` in THIS worktree, excluding the new
+module (all other compiled Rust source was already base-identical). It failed
+the same test's 10 s deadline at 8,192 parents; the 4,096 case completed in
+4.142 s. An EXIT trap restored the committed witness include. This establishes
+a base failure on this host, not a new atomic-admission regression. No sibling
+worktree or main checkout was changed.
+
+The final witness fixture uses parseable BEEF for the held parent too. Both
+witnesses were rerun after that refinement and remain RED at the byte and
+report equality assertions, with the final sizes/lines listed above. All four
+D1 modes were rerun on the final code with pinned Wrangler: deliberately RED
+rollback and budget modes exit 1 with AssertionError; real rollback and local
+budget-observation modes exit 0. The rollback pin additionally checks a held
+but spent row, all three error markers and their nested causes.
+
+
+Remaining engine suite:
+
+```
+cargo test -p bsv-overlay-engine --features memory-storage -- --skip nl6e_the_script_walk_is_linear_in_a_bump_s_leaves
+```
+
+Exit 0: 461 passed, 67 ignored, 1 filtered out, no failures; unit tests,
+integration tests and doctests complete. The excluded test
+is the baseline timeout established above, not a new ignored test in the tree.
+Both #657 witnesses remain ignored by their issue/reason attributes. The normal
+unfiltered suite is NOT claimed green on this host. No whole-workspace, worker
+route, wasm, deploy, publish or live/hosted tests were run for this test-only
+spike. Formatting (`cargo fmt --all -- --check` and explicit rustfmt of the
+included test file) and `git diff --check` pass.
+
+
+`cargo clippy -p bsv-overlay-engine --features memory-storage --lib --tests --
+-D warnings` passes. Its first run required placing the private test module
+at the end of MemoryStorage (`items_after_test_module`); the module was moved,
+not the lint suppressed. Formatting was corrected and checked again.
+
+## Handoff
+
+STATUS blocked only on the hosted D1 experiment: no hosted rollback/error shape
+or per-invocation 1-versus-N measurement is claimed. Credential source and an
+authorized hosted invocation compatible with no deploy are still needed. The
+local probes, two retained RED witnesses and implementation-first-PR record
+are complete on the branch. The engine's main checkout was not modified;
+no stash, push, publish or deploy was used. The unrelated baseline timing
+failure prevents claiming an unfiltered green engine suite on this host.
