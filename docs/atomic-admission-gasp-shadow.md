@@ -427,3 +427,128 @@ seq.
   `bsv-overlay-cloudflare` and `low-overlay` 6,680,563 B, `low-app-layer`
   4,795,299 B, `low-overlay` with `gasp-shadow` 7,016,450 B (the record's
   6,675,401 B and 7,015,838 B were built at another path).
+
+## The lens's corrections taken (the gate lens, `lane/atomic-gasp-dependency-gate-2`)
+
+The gate lens (`docs/atomic-admission-gasp-dependency-gate-lens.md`,
+`lane/atomic-gasp-dependency-gate-lens` at `96ecc78`, on `8ed47d8`): ACCEPT
+WITH CORRECTIONS, three LOW and six NOTE. Each taken as a RED witness, then
+the fix, one commit each, on `lane/atomic-gasp-dependency-gate-2` (base
+`8ed47d8`).
+
+| # | severity | finding | taken | commits (RED, fix) |
+| --- | --- | --- | --- | --- |
+| 1 | LOW | the gate depends on batch order: a child handed before its parent waits `not now` and is not re-visited | the bodies are judged ancestors first (`admission::ancestors_first`: Kahn's order over the in-graph parents, the graph's order the tie-break); the out-of-order store read (line 2 of "D44 as built") can no longer fire and is gone | `943231a`, `0ee7bac` |
+| 2 | LOW | the shadow stops a graph by position at a walk refusal; siblings after it are never judged | `admit_graph_observed` takes the bodies its caller could not walk (`admission::Unwalked`, the walk's refusal), held before any unit, parents like any other; the shadow walks on past a refusal (`walk_refusal`: a 400 terminal, a 503 `not now`, else transient) and the graph's stop is the first held body in graph order | `8d539ca`, `8e8c4c7` |
+| 3 | LOW | draft #55's description is stale and does not say why the engine | rewritten (below, and the PR) | this record |
+| N1 | NOTE | a terminal refusal cloned onto a descendant names no parent | `AdmitRefusal::Lookup` and `::Deterministic` carry `refused_parent` (`Option<Box<str>>`: the enum keeps its size), set by the gate to the body whose own refusal it is, through every generation; the word reads `parent <txid> was refused: <the parent's word>` | `2c5f700`, `506553e` |
+| N2 | NOTE | the re-sync digest compares stored BEEFs by length | the gate witnesses' rows name each stored BEEF by its bytes (SHA-256); a waiting parent re-sent under another proof is a pin | `2c5f700` |
+| N3 | NOTE | the gate parses each body's BEEF once more | `Walked::spends` (serde-skipped): the subject's spent txids from `walk_with_mode`'s own parse; the gate parses only a body built without it | `506553e` |
+| N4, N5 | NOTE | `stopped.bytes` is the bare refusal; a funding parent whose manager admits nothing passes | no change asked; N5 stays read from the code (the world's manager admits every output) | none |
+| N6 | NOTE | the scratch witnesses were not committed | committed as pins (below) | `2c5f700` |
+
+**The rule now** (replacing lines 1 and 2 of "D44 as built"): the bodies of
+a graph are judged ancestors first, so every in-graph parent a body spends was
+judged before it; a parent that did not land in this graph (refused, held, or
+handed in unwalked) holds the body without a unit, with the parent's word
+(naming that parent) when it is terminal, else `not now`, `waiting_on`. A
+parent outside the graph is not the gate's (the walk's and the unit's own
+predecessor question's); a parent of the graph the store already holds is
+judged as its own unit and dedups. Lines 3 to 5 are unchanged. A body a caller
+DROPS (neither walks nor names as unwalked) is a parent the gate cannot see:
+its descendants are judged as if it were outside the graph. That is the
+stated limit; the shadow drops none.
+
+**The sort moves nothing recorded.** A GASP batch is `compute_ordered_beefs`,
+ancestors first, and Kahn's order with the graph's order as the tie-break is
+the identity on an ancestors-first batch (the smallest unjudged index always
+has every parent judged). Proven by a pin frozen on `8ed47d8` BEFORE the sort:
+w9 digests every census row (the wall clock `shadow_ms` left out) of every
+world of `gasp_shadow.rs` whose finalize order is our node's (the recorded
+world, budgeted and not; the erring chain; the four chaos records) and the
+fan-in in w8's order: **64 rows,
+`38044a236d2293d8f93942871c3dcaafd4e53cf4c6d13258802c19fbe6c29f2d`**, green on
+`943231a` (the base's engine) and unchanged on every commit after it. The `off`
+recording and w7's store calls are unchanged too (gates below).
+
+**Witnesses**, each RED on its commit, green on the next:
+
+| witness | RED | green |
+| --- | --- | --- |
+| `d44_l1_a_child_handed_before_its_parent_gets_the_in_order_answer` (`gasp_dependency_gate.rs`: the chain `g <- c <- d` reversed; the fan-in root first, healthy and with `a`'s manager erring) | on `943231a`: `a reversed chain: the same words and rows`, left: `g` Landed, `c` and `d` NotNow (`waiting_on`), applied `c` and `d` false; right: all three Landed | the reversed chain and the root-first fan-in give the in-order words, gates, STEAKs and rows |
+| `w10_d44_a_refused_walk_holds_its_descendants_and_its_siblings_land` (`gasp_shadow.rs`: `a` carries a 1.9 MB output so its BEEF rides R2, the host's R2 read faults, run until `a` comes first) | on `8d539ca`: `left: (Array [], String(a), Array []) right: (Array [b], String(a), Array [{"txid": r, "reason": {"waiting_on": [a]}}])` | `b` lands, the stop is `a`, `r` `waiting_on [a]`, the rows `rows_differ` against the served path (which lands all three) |
+| `d44_n1_a_terminal_refusals_descendants_name_the_refused_parent` (`g <- c <- d <- e`, the index refusing `c`) | on `2c5f700`: `the descendant's word names the refused parent: lookup preflight refused: [AdmissionRefusal { .. }]` | `d` and `e` `Lookup`, each `parent <c> was refused: <c's word>`; `c`'s own word unprefixed |
+| `d44_n6_a_fan_in_whose_parents_meet_a_manager_error_and_a_lookup_refusal` | on `2c5f700`, on its refused-parent line alone | `a` NotNow `parent_error`; `b` Lookup, its own; `r` Lookup (terminal wins), `waiting_on [a, b]`, naming `b`; nothing written |
+| `d44_n3_the_gate_reads_the_walks_spends` (pin) | does not compile before `506553e` (no `Walked::spends`) | the walk carries `r`'s `[a, b]`; a sibling whose carried spends name the erring parent is held `waiting_on [a]` |
+| `d44_n6_a_graph_whose_every_body_waits_lands_nothing_and_says_why`, `w11_d44_a_graph_whose_every_body_waits_says_so_in_the_census` (pins) | green on `2c5f700` | nothing lands; `g` `parent_error`, `c` `waiting_on [g]`; the graph row `materialization`, both `landed: []`, A's stop `g` at 503 with both gate entries; `g`'s body row `words` (200 against 503 naming the manager's error) |
+| `d44_n2_a_waiting_parent_re_sent_under_another_proof_lands_as_a_first_time_body` (pin) | green on `2c5f700` | `a` re-sent at height 105 (100 on the erring tick): `a` and `r` land with a first-time graph's STEAKs and rows, the stored BEEFs byte for byte equal to a first-time graph handed those bytes |
+
+Amended in `506553e`, stated: the fan-in witness now gives each body a fixed
+height whatever its batch order (its rows compare stored BEEFs by bytes, and
+the old witness handed `b` at 100 or 101 by its position); the lookup witness's
+"the same word" now names the refused parent. The re-sync digest over the rows
+with the BEEFs' bytes: `c1663764e38c18577a10f2bee2a1b80bd5774d4097d9714ef9a02d7d49ddaee0`,
+equal on both sides.
+
+**Why the gate lives in the engine** (the keeper's question, the lens's item
+5). The rule is the graph's: a body lands when the bodies of its graph it
+spends landed. Only `admit_graph` sees the graph; Zanaadu's executor
+(`UnitRunner::run_unit`) is handed one unit and its evidence and knows no
+graph, so the gate there would need a new seam carrying the graph's
+structure. The shadow's judgement and `on` both run `admit_graph`, so one rule
+serves both and the census measures what `on` will do. And it costs the
+executor nothing: the gate reaches it only as ordinary refusals (`NotNow` at
+`gasp_finalize.topic_manager` or `gasp_finalize.dependency_gate`, or a cloned
+terminal refusal), and since the sort it reads nothing of the store itself.
+
+**Gates, on the tip of `lane/atomic-gasp-dependency-gate-2`.**
+
+- `cargo test --workspace --features bsv-overlay-engine/memory-storage
+  --no-fail-fast`: **1,700 passed, 0 failed, 66 ignored** (103 binaries;
+  1,691 before, plus nine: `d44_l1`, `d44_n1`, `d44_n2`, `d44_n3`, two
+  `d44_n6`, w9, w10, w11). With the feature off (`-p overlay-integration-tests
+  --no-default-features --test gasp_shadow_off --test gasp_dependency_gate`):
+  the ten gate witnesses and `gasp_shadow_off` green.
+- `cargo test --manifest-path workers/Cargo.toml --workspace --no-fail-fast`:
+  **1,565 passed, 0 failed, 1 ignored** (93 binaries; unchanged).
+- clippy with warnings denied (the root workspace with `memory-storage`, the
+  engine with no feature and with `gasp-shadow,memory-storage`, the Workers'
+  workspace) and `cargo fmt --all -- --check`: clean.
+- **The `off` recording** `431baab4e305582981b14370ed9ee36007a0a922e25341e9ca7c772192d4d112`,
+  polls `[57, 11, 54, 11]`: unchanged, with the feature on and off. **The peer
+  calls** (w7): 29 under `off`, 29 under `shadow`; the served store 129 and
+  177 (unchanged). **The ordered census** (w9): 64 rows, `38044a23…`,
+  unchanged.
+- **The wasm, raw release** (`bsv-overlay-cloudflare`, both trees built at
+  this worktree's path under the same `--remap-path-prefix`, `8ed47d8` checked
+  out in place): feature OFF `8ed47d8` 8,963,085 B, this tip **8,964,054 B
+  (+969 B; +367, +344 and +256 at the three fixes)**, none of `gasp_shadow`,
+  `admit_graph`, `judge_dry`, `walk_with_mode`; within the 4,096 B tolerance
+  of `make gasp-shadow-size`. Feature ON: `8ed47d8` 9,407,662 B, this tip
+  9,527,096 B (**+119,436 B**: the sort +25,733, LOW 2 +92,290, the NOTEs
+  +1,411); 103 `gasp_shadow` names.
+- `make ci-deploy`: green, four dry runs through the real worker-build:
+  `bsv-overlay-cloudflare` and `low-overlay` **6,680,557 B** (the record's
+  6,680,563 B at the gate's tip), `low-app-layer` 4,795,674 B, `low-overlay`
+  with `gasp-shadow` **7,122,562 B (+106,112 B** against the record's
+  7,016,450 B).
+
+**The feature-on growth, stated (not chased to its end).** It is not the
+gate's code: `twiggy diff` of the two raw builds puts 28,175 B in 53 new
+functions (the largest the shadow's drain closure, 17,340 B, which loses
+15,444 B from `start_gasp_sync`'s closure: a move) and the rest in functions
+this lane does not touch growing, almost all the Worker's own JSON builders
+(`routes::build_health_response` +5,931 B, `ops::read_counters` +5,162 B,
+`beef_blob_sweep::queue_json` +4,941 B, `dead_letters::internal_discard`
++2,771 B, `dead_letters::health_json` +2,474 B, ...), while the base's one
+outlined `BTreeMap::insert` is gone: LLVM's inlining over the whole
+`gasp-shadow` Worker moved. Measured, then not kept: replacing the sort's
+`BTreeSet` and the shadow's `BTreeMap` of positions with plain vectors gave
+9,506,911 B (-20 KB); over that build, five builds each undoing one part of
+LOW 2 (the shadow's walk loop breaking again, `walk_refusal` a constant, `&[]`
+for the unwalked bodies, the stop rule as before, `shadow_walk`'s error a bare
+word) stayed within 3.4 KB of it; only the shadow file as it stood at
+`0ee7bac` came back to 9,420,123 B (+12.5 KB). So the growth follows the shape of the drain's code, not any one
+construct, and was left as built. It weighs only a `gasp-shadow` build: every
+Worker builds `off` (the dry runs above), whose size moved +969 B raw and
+-6 B deployed.
