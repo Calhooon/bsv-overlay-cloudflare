@@ -215,6 +215,12 @@ pub trait LogTxn: Storage {
     fn emit(&self, event: OutboxEvent) -> Result<(), StorageError>;
     /// Name the active hook so a Pending refusal identifies its owner.
     fn at(&self, site: &str);
+    /// Keep helper faults visible even when a legacy read helper returns a
+    /// conservative fallback. A unit with a recorded failure cannot commit.
+    fn fail(&self, reason: String);
+    /// A nested dry judgement shares reads and the unit sequence but refuses
+    /// every attempted write. Dropping the guard restores the prior mode.
+    fn read_only(&self) -> Box<dyn DryRunScope + '_>;
 }
 
 /// Transport uncertainty is distinct from a rollback refusal. A lost answer

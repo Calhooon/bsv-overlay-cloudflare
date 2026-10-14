@@ -985,3 +985,53 @@ async fn a1_walked_payload_is_serializable() {
     store.admit(&engine, &received).unwrap();
     assert_eq!(store.log_head(), 1);
 }
+
+struct AcceptingArc(Rc<std::cell::Cell<usize>>);
+#[async_trait(?Send)]
+impl crate::broadcaster::ArcBroadcaster for AcceptingArc {
+    async fn broadcast(&self, raw: &str) -> Result<String, String> {
+        self.0.set(self.0.get() + 1);
+        Ok(Transaction::from_hex(raw).unwrap().id())
+    }
+}
+
+#[tokio::test]
+async fn a1_current_walk_carries_its_broadcaster_accept_and_admit_never_broadcasts() {
+    let (_, store, _, original, parent) = fixture().await;
+    let parent_row = store
+        .find_output(&parent, 0, Some(REGISTRY), None, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tx = Transaction::from_beef(&original.beef, None).unwrap();
+    tx.merkle_path = None;
+    tx.inputs[0].source_transaction = Some(Box::new(
+        Transaction::from_beef(&parent_row.beef.unwrap(), None).unwrap(),
+    ));
+    tx.inputs[0].unlocking_script = Some(UnlockingScript::from_binary(&[]).unwrap());
+    tx.invalidate_caches();
+    let beef = TaggedBEEF::new(tx.to_beef(false).unwrap(), vec![PROOF.into()]);
+    let mut engine = accepting_engine(&store);
+    let calls = Rc::new(std::cell::Cell::new(0));
+    engine.set_arc_broadcaster(Box::new(AcceptingArc(calls.clone())));
+    let walked = engine
+        .walk(
+            &beef,
+            SubmitMode::CurrentTx,
+            crate::engine::WalkBreachPolicy::NotNow,
+            &NoEvidence,
+        )
+        .await
+        .unwrap();
+    assert_eq!(calls.get(), 1);
+    assert!(matches!(
+        walked.evidence.tx[&walked.txid].network,
+        Some(NetworkVerdict::Accepted {
+            by: NetworkSource::Broadcaster { .. },
+            ..
+        })
+    ));
+    store.admit(&engine, &walked).unwrap();
+    assert_eq!(calls.get(), 1, "admit must never reach the broadcaster");
+    assert_eq!(store.awaited_io(), 0);
+}

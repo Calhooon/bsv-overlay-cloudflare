@@ -380,6 +380,26 @@ impl LogTxn for MemoryStorage {
             .expect("open unit")
             .site = site.into();
     }
+    fn fail(&self, reason: String) {
+        self.log
+            .lock()
+            .unwrap()
+            .scope
+            .as_mut()
+            .expect("open unit")
+            .failed
+            .get_or_insert(reason);
+    }
+    fn read_only(&self) -> Box<dyn DryRunScope + '_> {
+        let mut log = self.log.lock().unwrap();
+        let scope = log.scope.as_mut().expect("open unit");
+        let was_dry = scope.dry;
+        scope.dry = true;
+        Box::new(MemoryReadOnly {
+            store: self,
+            was_dry,
+        })
+    }
     fn emit(&self, event: OutboxEvent) -> Result<(), StorageError> {
         if self.log.lock().unwrap().scope.is_none() {
             return Err(StorageError::Other("emit outside admission unit".into()));
@@ -513,5 +533,28 @@ impl MemoryStorage {
             rollback,
             _writer: writer,
         }))
+    }
+}
+
+struct MemoryReadOnly<'a> {
+    store: &'a MemoryStorage,
+    was_dry: bool,
+}
+impl DryRunScope for MemoryReadOnly<'_> {
+    fn failure(&self) -> Option<String> {
+        self.store
+            .log
+            .lock()
+            .unwrap()
+            .scope
+            .as_ref()
+            .and_then(|s| s.failed.clone())
+    }
+}
+impl Drop for MemoryReadOnly<'_> {
+    fn drop(&mut self) {
+        if let Some(scope) = self.store.log.lock().unwrap().scope.as_mut() {
+            scope.dry = self.was_dry;
+        }
     }
 }

@@ -43,10 +43,11 @@ impl Engine {
             let Some(body) = beef.find_txid(&id) else {
                 continue;
             };
-            if body.has_proof() && id != txid {
+            let proven_predecessor = body.has_proof() && id != txid;
+            stack.push((id, true));
+            if proven_predecessor {
                 continue;
             }
-            stack.push((id, true));
             if let Some(body) = body.tx() {
                 for input in &body.inputs {
                     if let Ok(parent) = input.get_source_txid() {
@@ -154,8 +155,32 @@ impl Engine {
                 });
             }
             drop(dry);
-            self.broadcast_validations(tagged_beef, mode, &tx, &validations)
-                .await;
+            let may_admit = validations.iter().any(|v| {
+                !v.is_dupe
+                    && !v.failed
+                    && v.read_fault.is_none()
+                    && !v.admittance.outputs_to_admit.is_empty()
+            });
+            if may_admit {
+                if let Some(accepted_txid) = self
+                    .broadcast_validations(tagged_beef, mode, &tx, &validations)
+                    .await
+                {
+                    if accepted_txid == txid {
+                        evidence
+                            .tx
+                            .get_mut(&txid)
+                            .expect("subject evidence")
+                            .network = Some(NetworkVerdict::Accepted {
+                            by: NetworkSource::Broadcaster {
+                                name: "ARC".into(),
+                                at_ms: current_timestamp_ms() as i64,
+                            },
+                            status: "accepted".into(),
+                        });
+                    }
+                }
+            }
         }
         // Account evidence separately; the existing e592 walk ledger and all
         // its limits remain unchanged. Sidecar bytes themselves never cross.
@@ -308,6 +333,7 @@ impl Engine {
                         &mut named_inputs,
                         &mut reads,
                         None,
+                        Some(log),
                     )
                     .await
                 {

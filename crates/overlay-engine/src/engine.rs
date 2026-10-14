@@ -2235,7 +2235,7 @@ impl Engine {
                 let admits = !v.admittance.outputs_to_admit.is_empty();
                 if admits && subject_names.is_none() {
                     subject_names = Some(
-                        self.named_history(manager.as_ref(), subject_named_beef, bound)
+                        self.named_history(manager.as_ref(), subject_named_beef, bound, None)
                             .await,
                     );
                 }
@@ -2267,6 +2267,7 @@ impl Engine {
                         &mut subject_names,
                         question_reads,
                         bound,
+                        None,
                     )
                     .await
                 else {
@@ -2692,7 +2693,13 @@ impl Engine {
         subject_names: &mut Option<HashSet<String>>,
         question_reads: &mut usize,
         bound: Option<&CallBound>,
+        admission: Option<&dyn crate::admission::LogTxn>,
     ) -> Option<NotNow> {
+        let _read_only = admission.map(crate::admission::LogTxn::read_only);
+        let dry_context = TopicAdmittanceContext {
+            dry_run: true,
+            admission_seq: admission.map(crate::admission::LogTxn::seq),
+        };
         let manager = self.managers.get(topic)?;
         let wait = |why: String| Some(NotNow { why, carried: None });
         // The outpoints `tx` spends, as `txid.vout`.
@@ -2760,7 +2767,7 @@ impl Engine {
                 }
                 if subject_names.is_none() {
                     *subject_names = Some(
-                        self.named_history(manager.as_ref(), beef_bytes, bound)
+                        self.named_history(manager.as_ref(), beef_bytes, bound, admission)
                             .await,
                     );
                 }
@@ -2895,7 +2902,7 @@ impl Engine {
                 let names = if spender == txid {
                     if subject_names.is_none() {
                         *subject_names = Some(
-                            self.named_history(manager.as_ref(), beef_bytes, bound)
+                            self.named_history(manager.as_ref(), beef_bytes, bound, admission)
                                 .await,
                         );
                     }
@@ -2907,8 +2914,13 @@ impl Engine {
                             .and_then(|spender| spender.to_atomic_beef(true).ok())
                         {
                             Some(spender_beef) => {
-                                self.named_history(manager.as_ref(), &spender_beef, bound)
-                                    .await
+                                self.named_history(
+                                    manager.as_ref(),
+                                    &spender_beef,
+                                    bound,
+                                    admission,
+                                )
+                                .await
                             }
                             None => HashSet::new(),
                         };
@@ -2930,13 +2942,7 @@ impl Engine {
                     .unwrap_or_else(|| body.clone());
                 let verdict = bounded(
                     bound,
-                    manager.identify_admissible_outputs(
-                        &judged,
-                        &[],
-                        None,
-                        mode,
-                        &TopicAdmittanceContext::DRY_RUN,
-                    ),
+                    manager.identify_admissible_outputs(&judged, &[], None, mode, &dry_context),
                 )
                 .await;
                 match verdict {
@@ -2981,14 +2987,21 @@ impl Engine {
         manager: &dyn TopicManager,
         beef_bytes: &[u8],
         bound: Option<&CallBound>,
+        admission: Option<&dyn crate::admission::LogTxn>,
     ) -> HashSet<String> {
         match bounded(bound, manager.identify_needed_inputs(beef_bytes, None)).await {
             Ok(Ok(named)) => named.iter().map(Outpoint::to_graph_id).collect(),
             Ok(Err(e)) => {
+                if let Some(log) = admission {
+                    log.fail(format!("identify_needed_inputs: {e}"));
+                }
                 warn!("the predecessor question: the manager could not name its inputs: {e}");
                 HashSet::new()
             }
             Err(no_answer) => {
+                if let Some(log) = admission {
+                    log.fail(format!("identify_needed_inputs: {no_answer}"));
+                }
                 warn!("the predecessor question: the manager did not name its inputs: {no_answer}");
                 HashSet::new()
             }
@@ -3516,7 +3529,8 @@ impl Engine {
         mode: SubmitMode,
         tx: &Transaction,
         validations: &[TopicValidation],
-    ) {
+    ) -> Option<String> {
+        let mut accepted_txid = None;
         // =============================================================
         // PHASE 2: BROADCAST / SHIP propagation (before mutations)
         // =============================================================
@@ -3546,6 +3560,7 @@ impl Engine {
                     match arc.broadcast(&raw_tx_hex).await {
                         Ok(arc_txid) => {
                             info!("ARC broadcast succeeded: txid={arc_txid}");
+                            accepted_txid = Some(arc_txid);
                         }
                         Err(e) => {
                             error!("ARC broadcast failed (non-fatal): {e}");
@@ -3627,6 +3642,7 @@ impl Engine {
                 }
             }
         }
+        accepted_txid
     }
 
     /// Run Phase 1 (topic validation) and Phase 2 (broadcast) without mutating storage.
