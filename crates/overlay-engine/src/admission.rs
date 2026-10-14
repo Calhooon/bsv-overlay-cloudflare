@@ -322,10 +322,10 @@ pub enum GateReason {
     /// refused `not now` (never terminal; nothing of it is written), and every
     /// descendant of it in the graph waits on it.
     ParentError,
-    /// A parent it spends (named, graph order) has not landed, in this graph
-    /// or before: refused without a unit, with that parent's word (a terminal
-    /// lookup or deterministic refusal is the same typed word; anything else
-    /// is `not now`).
+    /// A parent of this graph it spends (named, in the order of its inputs)
+    /// did not land in this graph: refused without a unit, with that parent's
+    /// word (a terminal lookup or deterministic refusal is the same typed
+    /// word; anything else is `not now`).
     WaitingOn(Vec<String>),
 }
 
@@ -375,18 +375,63 @@ fn spent_txids(walked: &Walked) -> Vec<String> {
     spent
 }
 
+/// The graph's bodies, each after every body of the graph it spends: Kahn's
+/// order, the graph's own the tie-break, so an ancestors-first batch (GASP's
+/// `compute_ordered_beefs`) is its own order. A cycle of txids cannot exist
+/// (a txid commits to its inputs'); were one met, its bodies follow in graph
+/// order.
+fn ancestors_first(graph: &[Walked], spends: &[Vec<String>]) -> Vec<usize> {
+    let mut by_txid: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (i, walked) in graph.iter().enumerate() {
+        by_txid.entry(walked.txid.as_str()).or_default().push(i);
+    }
+    let mut waiting = vec![0usize; graph.len()];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); graph.len()];
+    for (child, spent) in spends.iter().enumerate() {
+        for parent in spent
+            .iter()
+            .filter_map(|p| by_txid.get(p.as_str()))
+            .flatten()
+        {
+            waiting[child] += 1;
+            children[*parent].push(child);
+        }
+    }
+    let mut ready: std::collections::BTreeSet<usize> =
+        (0..graph.len()).filter(|i| waiting[*i] == 0).collect();
+    let mut order = Vec::with_capacity(graph.len());
+    while let Some(next) = ready.pop_first() {
+        order.push(next);
+        for child in &children[next] {
+            waiting[*child] -= 1;
+            if waiting[*child] == 0 {
+                ready.insert(*child);
+            }
+        }
+    }
+    if order.len() < graph.len() {
+        let met: std::collections::HashSet<usize> = order.iter().copied().collect();
+        order.extend((0..graph.len()).filter(|i| !met.contains(i)));
+    }
+    order
+}
+
 /// [`admit_graph`], handing each body's answer to `observe` as it is given,
 /// with the gate's reason when the gate held it (the GASP shadow words each
 /// body; bsv-low #657, R7.7 item 5).
 ///
-/// The dependency gate (the owner's D44), for every body in graph order:
-/// 1. A parent it spends that is a body of this graph and has not landed in
+/// The dependency gate (the owner's D44). The bodies are judged ancestors
+/// first ([`ancestors_first`]: the batch's order does not move a word or a
+/// row; the lens's LOW 1), so every parent of the graph a body spends was
+/// judged before it. For every body:
+/// 1. A parent it spends that is a body of this graph and did not land in
 ///    this graph (refused or held) holds it without a unit: `WaitingOn`, the
 ///    parent's typed word when that is terminal (`Lookup`, `Deterministic`:
 ///    D34's unit-wide refusal reaches its descendants), else `not now`.
-/// 2. A parent of this graph not yet met (a graph out of order) must hold an
-///    applied row in every topic of the body, read inside the body's unit;
-///    else the unit is refused `not now`, `WaitingOn`.
+/// 2. A parent outside the graph is not the gate's: it is the walk's (GASP
+///    strips held inputs and ends at proven nodes) and the unit's own
+///    predecessor question's. A parent of the graph the store already holds
+///    is judged as its own unit and dedups: landed "before".
 /// 3. A topic manager that answers `Err` at the finalize (a topic of the unit
 ///    neither applied nor deduped: F5's empty judgement) refuses the unit
 ///    `not now`, `ParentError`: it rolls back whole and its descendants wait.
@@ -401,48 +446,32 @@ pub fn admit_graph_observed(
     observe: &mut GraphObserver<'_>,
 ) -> GraphOutcome {
     let bodies: std::collections::HashSet<&str> = graph.iter().map(|w| w.txid.as_str()).collect();
+    let spends: Vec<Vec<String>> = graph
+        .iter()
+        .map(|walked| {
+            spent_txids(walked)
+                .into_iter()
+                .filter(|p| bodies.contains(p.as_str()))
+                .collect()
+        })
+        .collect();
     let mut seqs = Vec::new();
     let mut landed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut refused: BTreeMap<String, AdmitRefusal> = BTreeMap::new();
     let mut held = Vec::new();
-    for walked in graph {
-        let parents: Vec<String> = spent_txids(walked)
-            .into_iter()
-            .filter(|p| bodies.contains(p.as_str()) && !landed.contains(p))
+    for at in ancestors_first(graph, &spends) {
+        let walked = &graph[at];
+        let waiting: Vec<String> = spends[at]
+            .iter()
+            .filter(|p| !landed.contains(*p) && refused.contains_key(*p))
+            .cloned()
             .collect();
-        let (waiting, unmet): (Vec<_>, Vec<_>) =
-            parents.into_iter().partition(|p| refused.contains_key(p));
         let (answer, gate) = if waiting.is_empty() {
             let manager_failed = std::cell::Cell::new(false);
-            let store_waiting = std::cell::RefCell::new(Vec::new());
             let answer = runner.run_unit(
                 UnitKind::Admit,
                 &walked.evidence,
                 Box::pin(async {
-                    for parent in &unmet {
-                        for topic in &walked.topics {
-                            let held = engine
-                                .storage()
-                                .does_applied_transaction_exist(&crate::types::AppliedTransaction {
-                                    txid: parent.clone(),
-                                    topic: topic.clone(),
-                                })
-                                .await
-                                .map_err(|e| {
-                                    AdmitRefusal::transient("does_applied_transaction_exist", e)
-                                })?;
-                            if !held {
-                                store_waiting.borrow_mut().push(parent.clone());
-                                break;
-                            }
-                        }
-                    }
-                    if !store_waiting.borrow().is_empty() {
-                        return Err(AdmitRefusal::not_now(
-                            GATE_WAITING_SITE,
-                            format!("waiting on {}", store_waiting.borrow().join(", ")),
-                        ));
-                    }
                     let admitted = engine.admit(walked).await?;
                     let failed: Vec<&String> = walked
                         .topics
@@ -471,13 +500,7 @@ pub fn admit_graph_observed(
                     Ok(UnitOutput::Admitted(admitted))
                 }),
             );
-            let gate = if answer.is_err() && manager_failed.get() {
-                Some(GateReason::ParentError)
-            } else if answer.is_err() && !store_waiting.borrow().is_empty() {
-                Some(GateReason::WaitingOn(store_waiting.take()))
-            } else {
-                None
-            };
+            let gate = (answer.is_err() && manager_failed.get()).then_some(GateReason::ParentError);
             (answer, gate)
         } else {
             let terminal = waiting.iter().find_map(|p| match &refused[p] {
