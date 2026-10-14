@@ -150,7 +150,7 @@ pub trait LookupService {
 }
 
 /// Errors from LookupService operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LookupServiceError {
     /// The query is malformed or missing required fields.
     #[error("invalid query: {0}")]

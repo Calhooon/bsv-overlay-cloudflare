@@ -83,7 +83,8 @@ impl LookupService for RefusingLookup {
         SpendNotificationMode::None
     }
     fn check_admitted(&self, payload: &OutputAdmittedByTopic) -> Result<(), LookupServiceError> {
-        if matches!(payload, OutputAdmittedByTopic::LockingScript { topic, output_index: 2, .. } if topic == REGISTRY) {
+        if matches!(payload, OutputAdmittedByTopic::LockingScript { topic, output_index: 2, .. } if topic == REGISTRY)
+        {
             return Err(LookupServiceError::Other(REFUSAL.into()));
         }
         Ok(())
@@ -166,7 +167,9 @@ async fn fixture() -> (Engine, Rc<MemoryStorage>, Index, TaggedBEEF, String) {
     fixture_with_services(None).await
 }
 
-async fn fixture_with_services(services: Option<HashMap<String, Box<dyn LookupService>>>) -> (Engine, Rc<MemoryStorage>, Index, TaggedBEEF, String) {
+async fn fixture_with_services(
+    services: Option<HashMap<String, Box<dyn LookupService>>>,
+) -> (Engine, Rc<MemoryStorage>, Index, TaggedBEEF, String) {
     let store = Rc::new(MemoryStorage::new());
     let index = Rc::new(Mutex::new(BTreeMap::new()));
     let mut previous = Transaction::new();
@@ -194,10 +197,7 @@ async fn fixture_with_services(services: Option<HashMap<String, Box<dyn LookupSe
     // Proven fixture, like existing engine harness pins. No network or tracker.
     tx.merkle_path =
         Some(MerklePath::new(100, vec![vec![MerklePathLeaf::new_txid(0, tx.id())]]).unwrap());
-    let beef = TaggedBEEF::new(
-        tx.to_beef(false).unwrap(),
-        vec![REGISTRY.into()],
-    );
+    let beef = TaggedBEEF::new(tx.to_beef(false).unwrap(), vec![REGISTRY.into()]);
     store
         .insert_output(&Output {
             txid: parent.clone(),
@@ -224,10 +224,12 @@ async fn fixture_with_services(services: Option<HashMap<String, Box<dyn LookupSe
             Box::new(ProofManager) as Box<dyn TopicManager>,
         ),
     ]);
-    let services = services.unwrap_or_else(|| HashMap::from([(
-        "ls_refuse_657".into(),
-        Box::new(RefusingLookup(index.clone())) as Box<dyn LookupService>,
-    )]));
+    let services = services.unwrap_or_else(|| {
+        HashMap::from([(
+            "ls_refuse_657".into(),
+            Box::new(RefusingLookup(index.clone())) as Box<dyn LookupService>,
+        )])
+    });
     let engine = Engine::new(
         managers,
         services,
@@ -239,17 +241,18 @@ async fn fixture_with_services(services: Option<HashMap<String, Box<dyn LookupSe
 }
 
 fn refused(report: &MutationReport) {
+    assert!(report.faults.is_empty());
     assert_eq!(
-        report.faults.len(),
+        report.refused.len(),
         1,
-        "fixture must reach exactly the intended refusal"
+        "fixture reaches exactly the intended refusal"
     );
-    assert_eq!(report.faults[0].topic, REGISTRY);
-    assert_eq!(
-        report.faults[0].site,
-        "lookup_service.check_admitted"
+    assert_eq!(report.refused[0].topic, REGISTRY);
+    assert_eq!(report.refused[0].service, "ls_refuse_657");
+    assert_eq!(report.refused[0].site, "lookup_service.check_admitted");
+    assert!(
+        matches!(&report.refused[0].error, LookupServiceError::Other(error) if error == REFUSAL)
     );
-    assert_eq!(report.faults[0].error, REFUSAL);
 }
 
 #[tokio::test]
@@ -324,41 +327,88 @@ struct Probe {
 }
 #[async_trait(?Send)]
 impl LookupService for Probe {
-    fn admission_mode(&self) -> AdmissionMode { self.admission }
-    fn spend_notification_mode(&self) -> SpendNotificationMode { self.spend }
+    fn admission_mode(&self) -> AdmissionMode {
+        self.admission
+    }
+    fn spend_notification_mode(&self) -> SpendNotificationMode {
+        self.spend
+    }
     fn check_admitted(&self, payload: &OutputAdmittedByTopic) -> Result<(), LookupServiceError> {
-        self.calls.lock().unwrap().checked_admitted.push(format!("{payload:?}"));
+        self.calls
+            .lock()
+            .unwrap()
+            .checked_admitted
+            .push(format!("{payload:?}"));
         Ok(())
     }
     fn check_spent(&self, payload: &OutputSpent) -> Result<(), LookupServiceError> {
-        self.calls.lock().unwrap().checked_spent.push(format!("{payload:?}"));
-        if self.refuse_spent { return Err(LookupServiceError::Other("spent refusal".into())); }
+        self.calls
+            .lock()
+            .unwrap()
+            .checked_spent
+            .push(format!("{payload:?}"));
+        if self.refuse_spent {
+            return Err(LookupServiceError::Other("spent refusal".into()));
+        }
         Ok(())
     }
-    async fn output_admitted_by_topic(&self, payload: &OutputAdmittedByTopic) -> Result<(), LookupServiceError> {
-        self.calls.lock().unwrap().admitted.push(format!("{payload:?}"));
+    async fn output_admitted_by_topic(
+        &self,
+        payload: &OutputAdmittedByTopic,
+    ) -> Result<(), LookupServiceError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .admitted
+            .push(format!("{payload:?}"));
         Ok(())
     }
     async fn output_spent(&self, payload: &OutputSpent) -> Result<(), LookupServiceError> {
-        self.calls.lock().unwrap().spent.push(format!("{payload:?}"));
+        self.calls
+            .lock()
+            .unwrap()
+            .spent
+            .push(format!("{payload:?}"));
         Ok(())
     }
-    async fn output_evicted(&self, _: &str, _: u32) -> Result<(), LookupServiceError> { Ok(()) }
+    async fn output_evicted(&self, _: &str, _: u32) -> Result<(), LookupServiceError> {
+        Ok(())
+    }
     async fn lookup(&self, _: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
         Ok(LookupResult::OutputList(vec![]))
     }
-    async fn get_documentation(&self) -> String { String::new() }
-    async fn get_metadata(&self) -> ServiceMetadata { ServiceMetadata::default() }
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
 }
-fn probes(refuse_spent: bool) -> (HashMap<String, Box<dyn LookupService>>, Vec<Rc<Mutex<Calls>>>) {
+fn probes(
+    refuse_spent: bool,
+) -> (
+    HashMap<String, Box<dyn LookupService>>,
+    Vec<Rc<Mutex<Calls>>>,
+) {
     let mut services: HashMap<String, Box<dyn LookupService>> = HashMap::new();
     let mut captures = vec![];
     for admission in [AdmissionMode::LockingScript, AdmissionMode::WholeTx] {
-        for spend in [SpendNotificationMode::None, SpendNotificationMode::Txid, SpendNotificationMode::Script, SpendNotificationMode::WholeTx] {
+        for spend in [
+            SpendNotificationMode::None,
+            SpendNotificationMode::Txid,
+            SpendNotificationMode::Script,
+            SpendNotificationMode::WholeTx,
+        ] {
             let calls = Rc::new(Mutex::new(Calls::default()));
-            services.insert(format!("probe_{}", captures.len()), Box::new(Probe {
-                calls: calls.clone(), admission, spend, refuse_spent,
-            }));
+            services.insert(
+                format!("probe_{}", captures.len()),
+                Box::new(Probe {
+                    calls: calls.clone(),
+                    admission,
+                    spend,
+                    refuse_spent,
+                }),
+            );
             captures.push(calls);
         }
     }
@@ -370,17 +420,37 @@ async fn e657_checks_once_per_payload_and_service() {
     let (services, captures) = probes(false);
     let (engine, _, _, mut beef, _) = fixture_with_services(Some(services)).await;
     beef.off_chain_values = Some(vec![1, 2, 3]);
-    let (_, report) = engine.submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv).await.unwrap();
+    let (_, report) = engine
+        .submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv)
+        .await
+        .unwrap();
     assert!(report.is_durable());
     for capture in &captures {
         let calls = capture.lock().unwrap();
-        assert_eq!(calls.checked_admitted.len(), 2, "one admit check per output and service");
-        assert_eq!(calls.checked_spent.len(), 1, "one spent check per coin and service");
-        assert_eq!(calls.checked_admitted, calls.admitted, "checked payload equals notified payload");
-        assert_eq!(calls.checked_spent, calls.spent, "checked payload equals notified payload");
+        assert_eq!(
+            calls.checked_admitted.len(),
+            2,
+            "one admit check per output and service"
+        );
+        assert_eq!(
+            calls.checked_spent.len(),
+            1,
+            "one spent check per coin and service"
+        );
+        assert_eq!(
+            calls.checked_admitted, calls.admitted,
+            "checked payload equals notified payload"
+        );
+        assert_eq!(
+            calls.checked_spent, calls.spent,
+            "checked payload equals notified payload"
+        );
     }
     // A deduplicated submit applies nothing and checks nothing again.
-    engine.submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv).await.unwrap();
+    engine
+        .submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv)
+        .await
+        .unwrap();
     for capture in &captures {
         let calls = capture.lock().unwrap();
         assert_eq!(calls.checked_admitted.len(), 2);
@@ -393,7 +463,10 @@ async fn e657_checks_never_on_dry_run() {
     let (services, captures) = probes(false);
     let (engine, store, index, beef, _) = fixture_with_services(Some(services)).await;
     let before = snapshot(&store, &index);
-    engine.submit_validate_only(&beef, SubmitMode::HistoricalTxNoSpv).await.unwrap();
+    engine
+        .submit_validate_only(&beef, SubmitMode::HistoricalTxNoSpv)
+        .await
+        .unwrap();
     assert_eq!(before, snapshot(&store, &index));
     for capture in &captures {
         let calls = capture.lock().unwrap();
@@ -401,10 +474,17 @@ async fn e657_checks_never_on_dry_run() {
         assert!(calls.checked_spent.is_empty());
     }
     // The real apply after a dry run must still perform its checks.
-    engine.submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv).await.unwrap();
+    engine
+        .submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv)
+        .await
+        .unwrap();
     for capture in &captures {
         let calls = capture.lock().unwrap();
-        assert_eq!(calls.checked_admitted.len(), 2, "real apply after dry run must check");
+        assert_eq!(
+            calls.checked_admitted.len(),
+            2,
+            "real apply after dry run must check"
+        );
         assert_eq!(calls.checked_spent.len(), 1);
     }
 }
@@ -414,8 +494,14 @@ async fn e657_spent_refusal_leaves_store_byte_equal() {
     let (services, captures) = probes(true);
     let (engine, store, index, beef, _) = fixture_with_services(Some(services)).await;
     let before = snapshot(&store, &index);
-    let (_, report) = engine.submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv).await.unwrap();
-    assert!(before == snapshot(&store, &index), "spent refusal changed stored bytes");
+    let (_, report) = engine
+        .submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv)
+        .await
+        .unwrap();
+    assert!(
+        before == snapshot(&store, &index),
+        "spent refusal changed stored bytes"
+    );
     assert!(!report.is_durable());
     for capture in captures {
         let calls = capture.lock().unwrap();
@@ -423,5 +509,45 @@ async fn e657_spent_refusal_leaves_store_byte_equal() {
         assert_eq!(calls.checked_spent.len(), 1);
         assert!(calls.admitted.is_empty());
         assert!(calls.spent.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn e657_report_types_both_refusal_sites_and_service_errors() {
+    let (engine, _, _, beef, _) = fixture().await;
+    let (_, report) = engine
+        .submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv)
+        .await
+        .unwrap();
+    assert!(
+        report.faults.is_empty(),
+        "a pure refusal is not a mutation fault"
+    );
+    assert!(!report.is_durable());
+    assert!(report.applied_topics.is_empty());
+    assert_eq!(report.refused.len(), 1);
+    let refusal = &report.refused[0];
+    assert_eq!(refusal.topic, REGISTRY);
+    assert_eq!(refusal.service, "ls_refuse_657");
+    assert_eq!(refusal.site, "lookup_service.check_admitted");
+    assert!(matches!(&refusal.error, LookupServiceError::Other(error) if error == REFUSAL));
+    assert!(report.summary().contains("lookup_service.check_admitted"));
+
+    let (services, _) = probes(true);
+    let (engine, _, _, beef, _) = fixture_with_services(Some(services)).await;
+    let (_, report) = engine
+        .submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv)
+        .await
+        .unwrap();
+    assert!(report.faults.is_empty());
+    assert!(!report.is_durable());
+    assert_eq!(report.refused.len(), 8);
+    for (i, refusal) in report.refused.iter().enumerate() {
+        assert_eq!(refusal.topic, REGISTRY);
+        assert_eq!(refusal.service, format!("probe_{i}"));
+        assert_eq!(refusal.site, "lookup_service.check_spent");
+        assert!(
+            matches!(&refusal.error, LookupServiceError::Other(error) if error == "spent refusal")
+        );
     }
 }

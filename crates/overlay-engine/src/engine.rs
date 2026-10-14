@@ -535,6 +535,20 @@ pub struct MutationFault {
     pub error: String,
 }
 
+/// A pure lookup check refused before this topic's apply phase.
+///
+/// The service key is the name registered with the engine. A door can map
+/// the site to its refusal response without parsing the service's error text.
+/// This does not roll back manager judgement or carried predecessor writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionRefusal {
+    pub topic: String,
+    pub service: String,
+    /// `lookup_service.check_admitted` or `lookup_service.check_spent`.
+    pub site: &'static str,
+    pub error: crate::lookup_service::LookupServiceError,
+}
+
 /// What Phase 3 actually landed for a submit — the durability report.
 ///
 /// `applied_topics` are the topics whose EVERY write (and lookup-service
@@ -545,6 +559,10 @@ pub struct MutationFault {
 /// write-then-record; the record is now conditional on the writes).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MutationReport {
+    /// Pure checks that refused, ordered by topic, service and site. No apply
+    /// writes or notifications are made for these topics. Accepted siblings
+    /// can still apply. Empty under the default lookup-service checks.
+    pub refused: Vec<AdmissionRefusal>,
     pub faults: Vec<MutationFault>,
     pub applied_topics: Vec<String>,
     /// Topics this (txid, topic) pair had ALREADY been applied under — the
@@ -599,7 +617,7 @@ impl MutationReport {
     /// replay). A dupe-only submit is durable (there was nothing to write).
     #[must_use]
     pub fn is_durable(&self) -> bool {
-        self.faults.is_empty()
+        self.faults.is_empty() && self.refused.is_empty()
     }
 
     /// One log line naming every fault (`topic/site: error`), each error
@@ -612,6 +630,10 @@ impl MutationReport {
                 let err: String = f.error.chars().take(120).collect();
                 format!("{}/{}: {}", f.topic, f.site, err)
             })
+            .chain(self.refused.iter().map(|r| {
+                let err: String = r.error.to_string().chars().take(120).collect();
+                format!("{}/{} ({}): {}", r.topic, r.site, r.service, err)
+            }))
             .collect::<Vec<_>>()
             .join("; ")
     }
@@ -1456,7 +1478,13 @@ impl Engine {
         mode: SubmitMode,
     ) -> Result<Steak, EngineError> {
         let (steak, report) = self.submit_with_report(tagged_beef, mode).await?;
-        if !report.is_durable() {
+        if !report.refused.is_empty() {
+            warn!(
+                "submit: {} lookup refusal(s): {}",
+                report.refused.len(),
+                report.summary()
+            );
+        } else if !report.is_durable() {
             warn!(
                 "submit: {} mutation fault(s) — not durable: {}",
                 report.faults.len(),
@@ -1718,7 +1746,7 @@ impl Engine {
                 continue;
             }
             for (prev_idx, prev_output) in v.previous_outputs.iter().enumerate() {
-                for ls in self.lookup_services.values() {
+                for (service, ls) in &self.lookup_services {
                     let payload = payloads.spent(
                         &v.topic,
                         prev_output,
@@ -1726,21 +1754,35 @@ impl Engine {
                         ls.spend_notification_mode(),
                     );
                     if let Err(error) = ls.check_spent(&payload) {
-                        report.fault(&v.topic, "lookup_service.check_spent", error.to_string());
+                        report.refused.push(AdmissionRefusal {
+                            topic: v.topic.clone(),
+                            service: service.clone(),
+                            site: "lookup_service.check_spent",
+                            error,
+                        });
                         refused_topics.insert(v.topic.clone());
                     }
                 }
             }
             for &output_index in &v.admittance.outputs_to_admit {
-                for ls in self.lookup_services.values() {
+                for (service, ls) in &self.lookup_services {
                     let payload = payloads.admitted(&v.topic, output_index, ls.admission_mode());
                     if let Err(error) = ls.check_admitted(&payload) {
-                        report.fault(&v.topic, "lookup_service.check_admitted", error.to_string());
+                        report.refused.push(AdmissionRefusal {
+                            topic: v.topic.clone(),
+                            service: service.clone(),
+                            site: "lookup_service.check_admitted",
+                            error,
+                        });
                         refused_topics.insert(v.topic.clone());
                     }
                 }
             }
         }
+
+        report
+            .refused
+            .sort_by(|a, b| (&a.topic, &a.service, a.site).cmp(&(&b.topic, &b.service, b.site)));
 
         // =================================================================
         // PHASE 3: MUTATE STORAGE
