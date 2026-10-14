@@ -267,7 +267,14 @@ async fn submit_log(
         )
         .await
         .unwrap();
-    store.admit(engine, &walked).map(|a| (a.steak, a.report))
+    let started = std::time::Instant::now();
+    let result = store.admit(engine, &walked).map(|a| (a.steak, a.report));
+    eprintln!(
+        "A1 memory unit {}: {} us",
+        walked.txid,
+        started.elapsed().as_micros()
+    );
+    result
 }
 
 fn refused(error: &LogError) {
@@ -715,6 +722,7 @@ async fn a1_lost_answer_is_ambiguous_and_replay_deduplicates() {
         let committed = snapshot(&store, &index);
         let replay = store.admit(&engine, &walked).unwrap();
         assert_eq!(replay.report.deduped_topics.len(), 2);
+        assert_eq!(replay.seq, 1);
         assert_eq!(store.log_units().len(), 1);
         assert!(committed == snapshot(&store, &index));
     }
@@ -927,4 +935,53 @@ async fn a1_07_carried_body_has_its_own_transaction() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn a1_03_retained_coin_update_faults_roll_back() {
+    for at in 1..=4 {
+        let (_, store, index, mut beef, _) = fixture().await;
+        beef.topics = vec![REGISTRY.into()];
+        let engine = Engine::new(
+            HashMap::from([(
+                REGISTRY.into(),
+                Box::new(RetainManager) as Box<dyn TopicManager>,
+            )]),
+            HashMap::new(),
+            Box::new(store.clone()),
+            None,
+            EngineConfig::default(),
+        );
+        let before = snapshot(&store, &index);
+        store.fault_write(Some(at));
+        assert!(matches!(
+            submit_log(&engine, &store, &beef).await,
+            Err(LogError::Refused(AdmitRefusal::Transient { .. }))
+        ));
+        assert!(
+            before == snapshot(&store, &index),
+            "retained write {at} changed store"
+        );
+        store.fault_write(None);
+        submit_log(&engine, &store, &beef).await.unwrap();
+        assert_eq!(store.log_head(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a1_walked_payload_is_serializable() {
+    let (engine, store, _, beef, _) = fixture_refusal(false).await;
+    let walked = engine
+        .walk(
+            &beef,
+            SubmitMode::HistoricalTxNoSpv,
+            crate::engine::WalkBreachPolicy::NotNow,
+            &NoEvidence,
+        )
+        .await
+        .unwrap();
+    let bytes = serde_json::to_vec(&walked).unwrap();
+    let received: Walked = serde_json::from_slice(&bytes).unwrap();
+    store.admit(&engine, &received).unwrap();
+    assert_eq!(store.log_head(), 1);
 }

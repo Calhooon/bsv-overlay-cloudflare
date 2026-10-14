@@ -63,7 +63,7 @@ pub struct RefusalNote {
 pub type RefusalNotes = Vec<(String, RefusalNote)>;
 
 /// An independently walked predecessor. Its bytes remain in the one BEEF.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Carried {
     pub txid: String,
     pub topics: Vec<String>,
@@ -72,7 +72,7 @@ pub struct Carried {
 
 /// Local staged payload. Hosts may transport the bytes inline or by a verified
 /// content-addressed pointer; resolving that pointer must precede the unit.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Walked {
     pub txid: String,
     pub tagged_beef: TaggedBEEF,

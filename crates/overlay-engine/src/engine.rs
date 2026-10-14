@@ -697,7 +697,7 @@ type Validated = (
 /// Which limb of the [`DoorBudget`] a submit's own walk went past (bsv-low
 /// #592): the [`DoorLimb`] of the door's error, with the interpreter's own
 /// memory limit told apart from the static work estimate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WalkLimb {
     /// The static work estimate.
     OverWork,
@@ -740,7 +740,7 @@ impl WalkLimb {
 /// lock is charged 3,971 keys). So a breach says nothing about whether the
 /// spend is valid, and on a path where nothing else judges it an admission
 /// would admit a spend nobody checked: the lens's forged spend of a held coin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum WalkBreachPolicy {
     /// "Not now" ([`EngineError::WalkCouldNotRun`]): nothing judged, nothing
     /// written, never a final refusal. Every door but one: the ungated
@@ -765,7 +765,7 @@ pub enum WalkBreachPolicy {
 /// `HistoricalTxNoSpv` and this says so on its [`MutationReport`]. The
 /// reference (`Engine.submit`, `tx.verify`) has no budget; this is the
 /// platform's addition, on the door's lineage (D8).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalkCouldNotRun {
     /// The submitted transaction.
     pub subject_txid: String,

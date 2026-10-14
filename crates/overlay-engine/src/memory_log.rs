@@ -215,9 +215,11 @@ impl MemoryStorage {
     /// Predecessors commit as independent units. A refused successor never
     /// rolls back a predecessor; a predecessor fault stops the graph.
     pub fn admit(&self, engine: &Engine, walked: &Walked) -> Result<Admitted, LogError> {
-        let mut pending = vec![walked.clone()];
+        // Keep only keys on the landing stack. A full BEEF per stack frame
+        // would multiply a large carried body by the predecessor bound.
+        let mut pending = vec![(walked.txid.clone(), walked.tagged_beef.topics.clone())];
         let mut attempts = 0;
-        while let Some(unit) = pending.last() {
+        while let Some((txid, topics)) = pending.last() {
             attempts += 1;
             if attempts > 257 {
                 return Err(AdmitRefusal::not_now(
@@ -226,8 +228,37 @@ impl MemoryStorage {
                 )
                 .into());
             }
+            let carried_unit;
+            let unit = if txid == &walked.txid {
+                walked
+            } else {
+                let Some(carried) = walked.carried.iter().find(|c| &c.txid == txid) else {
+                    return Err(AdmitRefusal::not_now("evidence_missing", txid.clone()).into());
+                };
+                let mut beef = crate::beef_limits::parse_beef(
+                    &walked.tagged_beef.beef,
+                    &crate::beef_limits::ENGINE_BEEF_LIMITS,
+                )
+                .map_err(|e| AdmitRefusal::transient("carried_payload", e))?;
+                let bytes = beef
+                    .to_binary_atomic(txid)
+                    .map_err(|e| AdmitRefusal::transient("carried_payload", e))?;
+                carried_unit = Walked {
+                    txid: txid.clone(),
+                    tagged_beef: crate::types::TaggedBEEF::new(bytes, topics.clone()),
+                    mode: walked.mode,
+                    policy: walked.policy,
+                    walk: carried.walk,
+                    carried: walked.carried.clone(),
+                    evidence: walked.evidence.clone(),
+                    charge: walked.charge,
+                    could_not_run: None,
+                };
+                &carried_unit
+            };
             match self.transaction(&unit.txid, &unit.evidence, || engine.admit(unit, self)) {
-                Ok(admitted) => {
+                Ok(mut admitted) => {
+                    admitted.seq = self.log_head();
                     pending.pop();
                     if pending.is_empty() {
                         return Ok(admitted);
@@ -237,35 +268,14 @@ impl MemoryStorage {
                     predecessor: Some((id, topic)),
                     ..
                 })) => {
-                    if pending.iter().any(|u| u.txid == id) {
+                    if pending.iter().any(|(txid, _)| txid == &id) {
                         return Err(AdmitRefusal::not_now(
                             "predecessor_not_landed",
                             "cyclic landing",
                         )
                         .into());
                     }
-                    let Some(carried) = walked.carried.iter().find(|c| c.txid == id) else {
-                        return Err(AdmitRefusal::not_now("evidence_missing", id).into());
-                    };
-                    let mut beef = crate::beef_limits::parse_beef(
-                        &walked.tagged_beef.beef,
-                        &crate::beef_limits::ENGINE_BEEF_LIMITS,
-                    )
-                    .map_err(|e| AdmitRefusal::transient("carried_payload", e))?;
-                    let bytes = beef
-                        .to_binary_atomic(&id)
-                        .map_err(|e| AdmitRefusal::transient("carried_payload", e))?;
-                    pending.push(Walked {
-                        txid: id,
-                        tagged_beef: crate::types::TaggedBEEF::new(bytes, vec![topic]),
-                        mode: walked.mode,
-                        policy: walked.policy,
-                        walk: carried.walk,
-                        carried: walked.carried.clone(),
-                        evidence: walked.evidence.clone(),
-                        charge: walked.charge,
-                        could_not_run: None,
-                    });
+                    pending.push((id, vec![topic]));
                 }
                 Err(LogError::Refused(error)) if pending.len() > 1 => {
                     return Err(
