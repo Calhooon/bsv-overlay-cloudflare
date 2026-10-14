@@ -128,6 +128,9 @@ pub trait LookupService {
 /// Errors from LookupService operations.
 #[derive(Debug, thiserror::Error)]
 pub enum LookupServiceError {
+    /// Typed admission refusal, preserved by the log path.
+    #[error("{0}")]
+    Admission(#[from] crate::admission::LookupRefusal),
     /// The query is malformed or missing required fields.
     #[error("invalid query: {0}")]
     InvalidQuery(String),

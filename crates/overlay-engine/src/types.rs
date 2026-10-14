@@ -207,11 +207,16 @@ pub struct TopicAdmittanceContext {
     /// `false` (the default): a submit. What the manager admits here the
     /// engine goes on to store.
     pub dry_run: bool,
+    /// The open log unit, checked by managers built over its scope.
+    pub admission_seq: Option<u64>,
 }
 
 impl TopicAdmittanceContext {
     /// The context of a dry run (`dry_run: true`).
-    pub const DRY_RUN: Self = Self { dry_run: true };
+    pub const DRY_RUN: Self = Self {
+        dry_run: true,
+        admission_seq: None,
+    };
 }
 
 /// Mode for transaction submission to the Engine.

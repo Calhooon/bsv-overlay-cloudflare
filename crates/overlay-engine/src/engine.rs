@@ -8,6 +8,8 @@
 
 use crate::beef_limits;
 
+mod atomic;
+
 use bsv_rs::transaction::{Beef, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -3406,19 +3408,13 @@ impl Engine {
                 .all(|ls| !ls.reads_off_chain_values(topic))
     }
 
-    /// Run Phase 1 (topic validation) and Phase 2 (broadcast) without mutating storage.
-    ///
-    /// Returns (validations, steak, parsed_tx, txid) so the caller can either
-    /// stop (validate-only) or proceed with Phase 3 (mutations).
-    async fn run_validation(
+    async fn walk_transaction(
         &self,
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
-        context: &TopicAdmittanceContext,
-        bound: Option<&CallBound>,
         walked: Option<&HashSet<String>>,
         policy: WalkBreachPolicy,
-    ) -> Result<Validated, EngineError> {
+    ) -> Result<(Transaction, String, Option<WalkCouldNotRun>), EngineError> {
         // Validate all topics are supported
         for topic in &tagged_beef.topics {
             if !self.managers.contains_key(topic) {
@@ -3511,33 +3507,16 @@ impl Engine {
             }
         }
 
-        let mut steak = Steak::new();
+        Ok((tx, txid, could_not_run))
+    }
 
-        // =============================================================
-        // PHASE 1: VALIDATE (read-only)
-        // =============================================================
-        let mut validations = Vec::new();
-
-        for topic in &tagged_beef.topics {
-            validations.push(
-                self.validate_topic(
-                    &tx,
-                    &txid,
-                    topic,
-                    tagged_beef.off_chain_values.as_deref(),
-                    mode,
-                    context,
-                    bound,
-                )
-                .await,
-            );
-        }
-
-        // Build preliminary STEAK
-        for v in &validations {
-            steak.insert(v.topic.clone(), v.admittance.clone());
-        }
-
+    async fn broadcast_validations(
+        &self,
+        tagged_beef: &TaggedBEEF,
+        mode: SubmitMode,
+        tx: &Transaction,
+        validations: &[TopicValidation],
+    ) {
         // =============================================================
         // PHASE 2: BROADCAST / SHIP propagation (before mutations)
         // =============================================================
@@ -3648,6 +3627,54 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Run Phase 1 (topic validation) and Phase 2 (broadcast) without mutating storage.
+    ///
+    /// Returns (validations, steak, parsed_tx, txid) so the caller can either
+    /// stop (validate-only) or proceed with Phase 3 (mutations).
+    async fn run_validation(
+        &self,
+        tagged_beef: &TaggedBEEF,
+        mode: SubmitMode,
+        context: &TopicAdmittanceContext,
+        bound: Option<&CallBound>,
+        walked: Option<&HashSet<String>>,
+        policy: WalkBreachPolicy,
+    ) -> Result<Validated, EngineError> {
+        let (tx, txid, could_not_run) = self
+            .walk_transaction(tagged_beef, mode, walked, policy)
+            .await?;
+
+        let mut steak = Steak::new();
+
+        // =============================================================
+        // PHASE 1: VALIDATE (read-only)
+        // =============================================================
+        let mut validations = Vec::new();
+
+        for topic in &tagged_beef.topics {
+            validations.push(
+                self.validate_topic(
+                    &tx,
+                    &txid,
+                    topic,
+                    tagged_beef.off_chain_values.as_deref(),
+                    mode,
+                    context,
+                    bound,
+                )
+                .await,
+            );
+        }
+
+        // Build preliminary STEAK
+        for v in &validations {
+            steak.insert(v.topic.clone(), v.admittance.clone());
+        }
+
+        self.broadcast_validations(tagged_beef, mode, &tx, &validations)
+            .await;
 
         Ok((validations, steak, tx, txid, could_not_run))
     }

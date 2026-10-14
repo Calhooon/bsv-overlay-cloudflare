@@ -31,6 +31,23 @@ pub struct TransactionBeef {
 /// (Cloudflare Workers D1).
 #[async_trait(?Send)]
 pub trait Storage {
+    /// Identity of a log backend. Default keeps ordinary backends unchanged.
+    fn admission_log_id(&self) -> Option<usize> {
+        None
+    }
+
+    /// Install the host's read-only executor for the generic log path's dry
+    /// broadcast judgement. Ordinary submit never calls this method.
+    fn admission_dry_run(
+        &self,
+        _evidence: &crate::admission::AdmitEvidence,
+    ) -> Result<Box<dyn crate::admission::DryRunScope + '_>, StorageError> {
+        Err(StorageError::Other(
+            "read-only admission executor unavailable".into(),
+        ))
+    }
+
+
     // ========================================================================
     // Write operations
     // ========================================================================
@@ -421,6 +438,16 @@ pub struct PeerSyncHealth {
 /// `Box<dyn Storage>` over the same instance. Pure delegation, no semantics.
 #[async_trait(?Send)]
 impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
+    fn admission_log_id(&self) -> Option<usize> {
+        (**self).admission_log_id()
+    }
+    fn admission_dry_run(
+        &self,
+        evidence: &crate::admission::AdmitEvidence,
+    ) -> Result<Box<dyn crate::admission::DryRunScope + '_>, StorageError> {
+        (**self).admission_dry_run(evidence)
+    }
+
     async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
         (**self).insert_output(output).await
     }
