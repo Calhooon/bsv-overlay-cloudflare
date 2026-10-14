@@ -243,7 +243,6 @@ fn refused(report: &MutationReport) {
 }
 
 #[tokio::test]
-#[ignore = "bsv-low #657: RED until A stages all admission writes and rolls back lookup refusal"]
 async fn e657_refused_submit_leaves_store_byte_equal() {
     let (engine, store, index, beef, parent) = fixture().await;
     let before = snapshot(&store, &index);
@@ -273,7 +272,6 @@ async fn e657_refused_submit_leaves_store_byte_equal() {
 }
 
 #[tokio::test]
-#[ignore = "bsv-low #657: RED until A leaves a refused submit unchanged so identical bytes get the same word"]
 async fn e657_same_bytes_same_word_after_refusal() {
     let (engine, store, index, beef, _) = fixture().await;
     let before = snapshot(&store, &index);
