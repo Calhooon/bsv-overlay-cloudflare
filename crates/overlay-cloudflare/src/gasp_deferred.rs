@@ -501,7 +501,7 @@ pub const EXPIRED_OUTPOINTS_CAP_SQL: &str = "DELETE FROM gasp_expired_outpoints 
      FROM gasp_expired_outpoints) WHERE n > ?1)";
 
 /// Sweep the remembered expired roots past their keep (every tick) and, in
-/// the tick of each hour's first minute, past the row bound. Best effort: a
+/// the tick of each hour's opening minute, past the row bound. Best effort: a
 /// row kept too long costs nothing, a row lost costs one node fetch.
 pub async fn sweep_expired_outpoints(db: &D1Database, now_ms: f64) {
     if let Err(e) = Query::new(EXPIRED_OUTPOINTS_SWEEP_SQL).execute(db).await {
@@ -518,7 +518,7 @@ pub async fn sweep_expired_outpoints(db: &D1Database, now_ms: f64) {
     }
 }
 
-/// Whether the row bound runs in the tick at `now_ms`: the hour's first
+/// Whether the row bound runs in the tick at `now_ms`: the hour's opening
 /// minute.
 pub fn expired_outpoints_cap_due(now_ms: f64) -> bool {
     ((now_ms / 60_000.0) as u64).is_multiple_of(60)
@@ -1064,7 +1064,7 @@ mod tests {
             vec!["y.0", "z.0"]
         );
         assert_eq!(find("tm_other", &["a.0"]), vec!["a.0"]);
-        // The bound runs in the hour's first minute only.
+        // The bound runs in the hour's opening minute only.
         assert!(expired_outpoints_cap_due(3_600_000.0 * 5.0 + 59_000.0));
         assert!(!expired_outpoints_cap_due(3_600_000.0 * 5.0 + 60_000.0));
     }
