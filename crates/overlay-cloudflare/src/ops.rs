@@ -773,18 +773,35 @@ pub async fn latch_network_seen(db: &D1Database, txid: &str) {
     }
     crate::tracker_events::note(txid, "seen", None);
     // admit-fast step 4: the witness is a pot fact the felt renders
-    // ("awaiting the network" → "seen"), so every pot row of the txid is
-    // NOTED for the pots-room push (`ls_pot spentStatus.networkSeen`). The
-    // caller ships the note: the route's end-of-request flush for an
-    // in-request latch, `pot_changes::flush_inline` from a background job.
-    // A non-pot txid (a hop, a settle) has no row and notes nothing.
-    let rows: Vec<PotVoutRow> = Query::new(NETWORK_SEEN_POT_ROWS_SQL)
+    // ("awaiting the network" → "seen"), so every pot row the txid FUNDS is
+    // NOTED for the pots-room push (`ls_pot spentStatus.networkSeen`), and so
+    // is every pot row it SPENDS (bsv-low #660): a settle, refund or sweep
+    // funds no pot, but this latch publishes the spent pot's verdict (the
+    // app layer's #371 third arm, `spender_seen AND spender_final`), so its
+    // note is what makes `/internal/pot-changed` recompute the winner's owed
+    // row after the witness. The caller ships the notes: the route's
+    // end-of-request flush for an in-request latch, `pot_changes::flush_inline`
+    // from a background job. A txid that funds and spends no pot notes nothing.
+    let funded: Vec<PotVoutRow> = Query::new(NETWORK_SEEN_POT_ROWS_SQL)
         .bind(txid)
         .fetch_all(db)
         .await
         .unwrap_or_default();
-    for row in rows {
+    let spent: Vec<PotOutpointRow> = Query::new(NETWORK_SEEN_SPENT_POT_ROWS_SQL)
+        .bind(txid)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+    note_witnessed_pots(txid, &funded, &spent);
+}
+
+/// The notes of one latch: each pot `txid` funds and each pot it spends.
+fn note_witnessed_pots(txid: &str, funded: &[PotVoutRow], spent: &[PotOutpointRow]) {
+    for row in funded {
         crate::pot_changes::note(txid, row.output_index);
+    }
+    for row in spent {
+        crate::pot_changes::note(&row.txid, row.output_index);
     }
 }
 
@@ -792,8 +809,20 @@ pub async fn latch_network_seen(db: &D1Database, txid: &str) {
 pub const NETWORK_SEEN_POT_ROWS_SQL: &str =
     "SELECT outputIndex FROM pot_records WHERE txid = lower(?)";
 
+/// The pot rows a witnessed txid spends (bsv-low #660; one read by
+/// `idx_pot_spending`, pinned).
+pub const NETWORK_SEEN_SPENT_POT_ROWS_SQL: &str =
+    "SELECT txid, outputIndex FROM pot_records WHERE spendingTxid = lower(?)";
+
 #[derive(Deserialize)]
 struct PotVoutRow {
+    #[serde(rename = "outputIndex")]
+    output_index: u32,
+}
+
+#[derive(Deserialize)]
+struct PotOutpointRow {
+    txid: String,
     #[serde(rename = "outputIndex")]
     output_index: u32,
 }
@@ -1741,6 +1770,114 @@ mod tests {
         assert_eq!(arc_ingest_push_health(&counters(1, 0, 0, 0)), "flowing");
         assert_eq!(arc_ingest_push_health(&counters(0, 1, 0, 0)), "flowing");
         assert_eq!(arc_ingest_push_health(&counters(5, 7, 3, 2)), "flowing");
+    }
+
+    /// bsv-low #660, real SQLite over the SHIPPED strings: latching a SETTLE
+    /// txid (a pot row whose `spendingTxid` is that txid, whose own `txid`
+    /// differs) notes the pot it SPENDS, so the app layer recomputes the
+    /// winner's owed row after the witness; latching a FUNDING txid still
+    /// notes the pot it funds. The spent read is one indexed lookup. To red:
+    /// drop the spent read from the latch, or its notes.
+    #[test]
+    fn l25_the_seen_latch_notes_the_pots_the_txid_spends_real_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        let pot = "e160e530".repeat(8);
+        let settle = "0e37aca0".repeat(8);
+        let funding = "f0f0f0f0".repeat(8);
+        let other = "a1a1a1a1".repeat(8);
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid) VALUES (?1, 0, 1, ?2)",
+            rusqlite::params![pot, settle],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid) VALUES (?1, 0, 1, ?2)",
+            rusqlite::params![other, "b2".repeat(32)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent) VALUES (?1, 1, 0)",
+            rusqlite::params![funding],
+        )
+        .unwrap();
+        // The latch's two reads, as shipped, then its notes.
+        let latch = |txid: &str| -> Vec<(String, u32)> {
+            let funded: Vec<PotVoutRow> = conn
+                .prepare(NETWORK_SEEN_POT_ROWS_SQL)
+                .unwrap()
+                .query_map(rusqlite::params![txid], |r| {
+                    Ok(PotVoutRow {
+                        output_index: r.get(0)?,
+                    })
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let spent: Vec<PotOutpointRow> = conn
+                .prepare(NETWORK_SEEN_SPENT_POT_ROWS_SQL)
+                .unwrap()
+                .query_map(rusqlite::params![txid], |r| {
+                    Ok(PotOutpointRow {
+                        txid: r.get(0)?,
+                        output_index: r.get(1)?,
+                    })
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            crate::pot_changes::drain();
+            note_witnessed_pots(txid, &funded, &spent);
+            crate::pot_changes::drain()
+        };
+        assert_eq!(
+            latch(&settle.to_ascii_uppercase()),
+            vec![(pot.clone(), 0)],
+            "a settle's SEEN latch notes the pot it spends (bsv-low #660)"
+        );
+        assert_eq!(
+            latch(&funding),
+            vec![(funding.clone(), 1)],
+            "a funding's SEEN latch still notes the pot it funds"
+        );
+        assert!(
+            latch(&"c3".repeat(32)).is_empty(),
+            "a txid that funds and spends no pot notes nothing"
+        );
+        // One indexed read, never a scan of pot_records.
+        let plan: Vec<String> = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {NETWORK_SEEN_SPENT_POT_ROWS_SQL}"
+            ))
+            .unwrap()
+            .query_map(rusqlite::params![settle], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .all(|d| d.contains("USING INDEX") || d.contains("USING COVERING INDEX")),
+            "the spent read is indexed: {plan:?}"
+        );
+        // The shipped latch makes both reads and notes both sets.
+        let src = include_str!("ops.rs");
+        let latch_fn = &src[src.find("pub async fn latch_network_seen(").unwrap()..];
+        let latch_fn = &latch_fn[..latch_fn.find("\n}\n").unwrap()];
+        for needle in [
+            "Query::new(NETWORK_SEEN_POT_ROWS_SQL)",
+            "Query::new(NETWORK_SEEN_SPENT_POT_ROWS_SQL)",
+            "note_witnessed_pots(txid, &funded, &spent);",
+        ] {
+            assert!(latch_fn.contains(needle), "the latch: {needle}");
+        }
     }
 
     /// bsv-low handoff #2b, real SQLite over the SHIPPED strings: the

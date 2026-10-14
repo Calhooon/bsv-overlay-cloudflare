@@ -4994,8 +4994,8 @@ mod tests {
         let latch_fn = &ops[ops.find("pub async fn latch_network_seen(").unwrap()..];
         let latch_fn = &latch_fn[..latch_fn.find("\n}\n").unwrap()];
         assert!(
-            latch_fn.contains("crate::pot_changes::note(txid, row.output_index)"),
-            "the latch notes the pot rows"
+            latch_fn.contains("note_witnessed_pots(txid, &funded, &spent);"),
+            "the latch notes the pot rows it funds and spends"
         );
     }
 
