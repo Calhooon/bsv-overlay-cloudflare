@@ -383,6 +383,7 @@ fn derive_for_hops(
         courier_spenders: &Default::default(),
         my_pkh_by_game: &homes,
         home_spends: &Default::default(),
+        retired_spenders: &Default::default(),
     })
 }
 

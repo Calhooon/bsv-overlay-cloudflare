@@ -2761,6 +2761,7 @@ mod tests {
             courier_spenders: &none,
             my_pkh_by_game: &no_pkhs,
             home_spends: &no_home_words,
+            retired_spenders: &none,
         })
     }
 
