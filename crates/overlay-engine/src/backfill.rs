@@ -196,6 +196,11 @@ impl Run {
 
 impl GASPSyncResult {
     pub(crate) fn append_slice(&mut self, slice: Self) {
+        for topic in slice.topics_filtered {
+            if !self.topics_filtered.contains(&topic) {
+                self.topics_filtered.push(topic);
+            }
+        }
         for (name, mut incoming) in slice.topics_synced {
             let Some(topic) = self.topics_synced.get_mut(&name) else {
                 self.topics_synced.insert(name, incoming);
