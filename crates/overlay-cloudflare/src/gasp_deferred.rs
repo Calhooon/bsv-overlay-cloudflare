@@ -214,6 +214,15 @@ pub const DEFERRED_GRAPH_CHUNKS_DELETE_SQL: &str =
 /// it: a save in flight (its parts written, its head not yet) is never older.
 pub const DEFERRED_GRAPH_ORPHAN_CHUNK_SECS: u64 = 3600;
 
+/// The existing reason column carries retention state without a migration.
+pub(crate) fn retained_reason(record: &overlay_engine::gasp::DeferredGraph) -> String {
+    if record.cursor_passable {
+        format!("held:{}", record.reason)
+    } else {
+        record.reason.clone()
+    }
+}
+
 /// The cron's sweep of parts no head row names (a swept head's, a save that
 /// died between its parts and its head). Binds: `?1`
 /// [`DEFERRED_GRAPH_ORPHAN_CHUNK_SECS`].
@@ -412,9 +421,9 @@ pub(crate) async fn read_deferred_graph<P: DeferredRows>(
 pub const DEFERRED_GRAPH_DELETE_SQL: &str = "DELETE FROM gasp_deferred_graphs \
      WHERE host = ?1 AND topic = ?2 AND outpoint = ?3";
 
-/// The cron's sweep of stale rows. Binds: `?1` [`DEFERRED_GRAPH_STALE_SECS`].
+/// Sweep unheld retries only; a passed cursor needs its durable hold. Binds: `?1` [`DEFERRED_GRAPH_STALE_SECS`].
 pub const DEFERRED_GRAPHS_SWEEP_SQL: &str = "DELETE FROM gasp_deferred_graphs \
-     WHERE updated_at < unixepoch() - ?1 RETURNING host, topic, outpoint";
+     WHERE updated_at < unixepoch() - ?1 AND reason NOT LIKE 'held:%' RETURNING host, topic, outpoint";
 
 /// Rows swept for age: also counted in [`COUNTER_GASP_GRAPH_DROPPED`].
 pub const COUNTER_GASP_GRAPH_DROPPED_STALE: &str = "gasp_graph_dropped_stale_total";
@@ -484,6 +493,9 @@ pub const COUNTER_GASP_GRAPH_DROPPED: &str = "gasp_graph_dropped_total";
 /// Graphs HELD because their GASP anchor's script walk could not run within the engine's walk budget (bsv-low #592;
 /// the E592 lens fold, H1 and L3): not finalized, the UTXO below its cursor until the root is served proven.
 pub const COUNTER_GASP_ANCHOR_WALK_HELD: &str = "gasp_anchor_walk_held_total";
+/// Finalized roots carrying their own proof.
+pub const COUNTER_GASP_ROOTS_PROVEN: &str = "gasp_roots_proven_total";
+pub const COUNTER_GASP_ROOTS_UNPROVEN: &str = "gasp_roots_unproven_total";
 /// Expired roots omitted before proof hydration.
 pub const COUNTER_GASP_EXPIRED_REFUSED: &str = "gasp_expired_refused_total";
 
@@ -502,6 +514,8 @@ pub fn counter_names() -> Vec<String> {
         COUNTER_GASP_GRAPH_DROPPED_STALE.to_string(),
         COUNTER_GASP_ANCHOR_WALK_HELD.to_string(),
         COUNTER_GASP_EXPIRED_REFUSED.to_string(),
+        COUNTER_GASP_ROOTS_PROVEN.to_string(),
+        COUNTER_GASP_ROOTS_UNPROVEN.to_string(),
     ];
     names.extend(
         overlay_engine::gasp::DropReason::ALL
@@ -518,6 +532,10 @@ pub fn counter_deltas(
 ) -> Vec<(String, u64)> {
     let mut deltas: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for r in results.values() {
+        *deltas.entry(COUNTER_GASP_ROOTS_PROVEN.into()).or_default() += r.roots_proven;
+        *deltas
+            .entry(COUNTER_GASP_ROOTS_UNPROVEN.into())
+            .or_default() += r.roots_unproven;
         *deltas
             .entry(COUNTER_GASP_EXPIRED_REFUSED.into())
             .or_default() += r.expired_refused;
@@ -705,6 +723,7 @@ mod tests {
             reason: "calls".into(),
             configured: false,
             idle_faults: 0,
+            cursor_passable: false,
         }
     }
 
@@ -913,6 +932,26 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect()
+    }
+
+    #[test]
+    fn proofs_stale_sweep_preserves_cursor_holds() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE gasp_deferred_graphs (host TEXT, topic TEXT, outpoint TEXT, updated_at INTEGER, reason TEXT); INSERT INTO gasp_deferred_graphs VALUES ('p','t','held',0,'held:time'), ('p','t','retry',0,'retry:deadline');").unwrap();
+        let removed: Vec<String> = db
+            .prepare(DEFERRED_GRAPHS_SWEEP_SQL)
+            .unwrap()
+            .query_map([1], |r| r.get(2))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(removed, vec!["retry"]);
+        assert_eq!(
+            db.query_row("SELECT outpoint FROM gasp_deferred_graphs", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "held"
+        );
     }
 
     /// bsv-low #555, the lens fold's M3: the global ceiling is read in the
@@ -1617,6 +1656,9 @@ mod tests {
     #[test]
     fn e555_the_counters_sum_a_sync_and_count_drops_by_reason() {
         let topic = |deferred, resumed, converged, reasons: &[&str]| TopicSyncResult {
+            roots_proven: 0,
+            roots_unproven: 0,
+            cursor_held_by: Vec::new(),
             expired_refused: 0,
             peers: vec![],
             sync_type: "peers".into(),
@@ -1662,7 +1704,7 @@ mod tests {
         );
         let names = counter_names();
         // Seed both the anchor hold and the sync expiry refusal.
-        assert_eq!(names.len(), 7 + 10);
+        assert_eq!(names.len(), 9 + 10);
         assert!(names.contains(&COUNTER_GASP_ANCHOR_WALK_HELD.to_string()));
         assert!(names.contains(&COUNTER_GASP_EXPIRED_REFUSED.to_string()));
         // bsv-low #585: nothing is dropped for its size.

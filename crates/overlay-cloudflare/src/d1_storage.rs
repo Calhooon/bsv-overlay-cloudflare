@@ -1043,7 +1043,7 @@ impl Storage for D1Storage {
                 .bind(record.pending.len() as f64)
                 .bind(record.calls as f64)
                 .bind(f64::from(record.passes))
-                .bind(record.reason.as_str())
+                .bind(crate::gasp_deferred::retained_reason(record))
                 .bind(json.len() as f64)
                 .bind(plan.head)
                 .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_ROWS)

@@ -9,6 +9,16 @@ use overlay_engine::types::{SubmitMode, TaggedBEEF};
 use serde::Deserialize;
 use std::collections::HashMap;
 
+// Keep the same runtime log while allowing the crawl replay to run natively.
+macro_rules! crawl_log {
+    ($($arg:tt)*) => {{
+        #[cfg(target_arch = "wasm32")]
+        worker::console_log!($($arg)*);
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!($($arg)*);
+    }};
+}
+
 /// One (peer_url, service_to_topic) mapping. `service_to_topic` is a
 /// per-peer list of `(lookup_service_name, topic_manager_name)` pairs
 /// — e.g. `[("ls_uhrp", "tm_uhrp"), ("ls_ship", "tm_ship")]`. Separate
@@ -27,6 +37,7 @@ pub struct CrawlResult {
     /// Keyed by `"{peer_url}|{service}"`. Value = number of outputs
     /// admitted by the corresponding tm_X on our engine.
     pub admitted_by: HashMap<String, usize>,
+    pub expired_refused: u64,
     /// Per-peer, per-service total submission attempts (admitted +
     /// rejected). `admitted_by[k] <= attempted[k]` always.
     pub attempted: HashMap<String, usize>,
@@ -83,7 +94,8 @@ pub async fn crawl_peers(
         for (service, topic) in &peer.service_to_topic {
             let key = format!("{}|{}", peer.peer_url, service);
             match crawl_one(engine, &peer.peer_url, service, topic, origin, db).await {
-                Ok((attempted, admitted, errors, walks)) => {
+                Ok((attempted, admitted, errors, walks, expired)) => {
+                    result.expired_refused += expired;
                     result.walks_could_not_run.extend(walks);
                     result.attempted.insert(key.clone(), attempted);
                     result.admitted_by.insert(key.clone(), admitted);
@@ -93,7 +105,7 @@ pub async fn crawl_peers(
                 }
                 Err(e) => {
                     if !is_lookup_400(&e) || claim_400_log(db, &key).await {
-                        worker::console_log!(
+                        crawl_log!(
                             "[{origin}] peer-crawl: {peer}/{service} lookup failed: {err}",
                             peer = peer.peer_url,
                             service = service,
@@ -114,6 +126,7 @@ type CrawledOne = (
     usize,
     Vec<String>,
     Vec<overlay_engine::engine::WalkCouldNotRun>,
+    u64,
 );
 
 /// Crawl one (peer, service) and return `(attempted, admitted, errors, walks)`.
@@ -142,10 +155,72 @@ async fn crawl_one(
     } else {
         outputs = fetch_lookup(peer_url, service, None).await?;
     }
+    crawl_outputs(
+        engine,
+        &outputs,
+        topic,
+        (peer_url, service, origin),
+        db,
+        worker::Date::now().as_millis() / 1000,
+    )
+    .await
+}
+
+pub(crate) const COUNTER_CRAWL_EXPIRED_REFUSED: &str = "crawl_expired_refused_total";
+
+fn expired_answer(entry: &OutputEntry, topic: &str, now: u64) -> Result<u64, String> {
+    if topic != "tm_uhrp" {
+        return Ok(0);
+    }
+    use overlay_engine::topic_manager::TopicManager;
+    let tx = overlay_engine::beef_limits::transaction_from_beef(
+        &entry.beef,
+        None,
+        &overlay_engine::beef_limits::PEER_BEEF_LIMITS,
+    )
+    .map_err(|_| "invalid crawl BEEF".to_string())?;
+    let manager = overlay_discovery::uhrp::topic_manager::UHRPTopicManager::new();
+    Ok(tx
+        .outputs
+        .iter()
+        .filter(|output| {
+            manager
+                .sync_expiry(&output.locking_script)
+                .is_some_and(|expiry| expiry <= now)
+        })
+        .count() as u64)
+}
+
+async fn crawl_outputs(
+    engine: &Engine,
+    outputs: &[OutputEntry],
+    topic: &str,
+    context: (&str, &str, &str),
+    db: Option<&worker::D1Database>,
+    now: u64,
+) -> Result<CrawledOne, String> {
+    let (peer_url, service, origin) = context;
+    let mut attempted = 0;
+    let mut expired_refused = 0;
     let mut admitted_total: usize = 0;
     let mut errors: Vec<String> = Vec::new();
     let mut walks: Vec<overlay_engine::engine::WalkCouldNotRun> = Vec::new();
     for (i, entry) in outputs.iter().enumerate() {
+        match expired_answer(entry, topic, now) {
+            Ok(0) => {}
+            Ok(expired) => {
+                expired_refused += expired;
+                if let Some(db) = db {
+                    crate::ops::bump_counter(db, COUNTER_CRAWL_EXPIRED_REFUSED, expired).await;
+                }
+                continue;
+            }
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        }
+        attempted += 1;
         let tagged = TaggedBEEF {
             beef: entry.beef.clone(),
             topics: vec![topic.to_string()],
@@ -166,7 +241,7 @@ async fn crawl_one(
                 walks.extend(report.landed_walks_could_not_run);
             }
             Err(overlay_engine::engine::EngineError::WalkCouldNotRun(stop)) => {
-                worker::console_log!(
+                crawl_log!(
                     "[{origin}] peer-crawl: {peer}/{service} output[{i}]: the walk of {} could not run ({}): not now, retried next crawl",
                     stop.subject_txid,
                     stop.limb.as_str(),
@@ -180,7 +255,7 @@ async fn crawl_one(
             }
             Err(e) => {
                 let msg = format!("output[{i}] submit failed: {e}");
-                worker::console_log!(
+                crawl_log!(
                     "[{origin}] peer-crawl: {peer}/{service} {msg}",
                     peer = peer_url,
                     service = service,
@@ -189,15 +264,18 @@ async fn crawl_one(
             }
         }
     }
-    worker::console_log!(
+    if expired_refused > 0 {
+        tracing::info!(expired_refused, "peer-crawl expired adverts refused");
+    }
+    crawl_log!(
         "[{origin}] peer-crawl: {peer}/{service} attempted={attempted} admitted={admitted} errors={errs}",
         peer = peer_url,
         service = service,
-        attempted = outputs.len(),
+        attempted = attempted,
         admitted = admitted_total,
         errs = errors.len(),
     );
-    Ok((outputs.len(), admitted_total, errors, walks))
+    Ok((attempted, admitted_total, errors, walks, expired_refused))
 }
 
 /// POST `{peer_url}/lookup` with a `findAll` query and parse the
@@ -344,6 +422,76 @@ fn preview(s: &str) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[tokio::test]
+    async fn proofs_crawl_expired_answer_is_counted_without_submit() {
+        use bsv_rs::primitives::ec::PublicKey;
+        use bsv_rs::script::templates::PushDrop;
+        use bsv_rs::transaction::{Transaction, TransactionOutput};
+        let key = PublicKey::from_hex(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let lock = PushDrop::new(
+            key,
+            vec![
+                vec![2; 33],
+                vec![3; 32],
+                b"https://fixture.example".to_vec(),
+                vec![1],
+                vec![10],
+                vec![4; 70],
+            ],
+        )
+        .lock();
+        let mut tx = Transaction::new();
+        tx.inputs.push(bsv_rs::transaction::TransactionInput::new(
+            "11".repeat(32),
+            0,
+        ));
+        tx.outputs.push(TransactionOutput {
+            satoshis: Some(1),
+            locking_script: lock,
+            change: false,
+        });
+        let entries = vec![OutputEntry {
+            beef: tx.to_beef(true).unwrap(),
+        }];
+        assert_eq!(expired_answer(&entries[0], "tm_uhrp", 1).unwrap(), 1);
+        assert_eq!(expired_answer(&entries[0], "tm_uhrp", 0).unwrap(), 0);
+        let engine = Engine::new(
+            HashMap::new(),
+            HashMap::new(),
+            Box::new(overlay_engine::storage::memory::MemoryStorage::new()),
+            None,
+            Default::default(),
+        );
+        let (attempted, admitted, errors, _, expired) = crawl_outputs(
+            &engine,
+            &entries,
+            "tm_uhrp",
+            ("fixture", "ls_uhrp", "test"),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!((attempted, admitted, expired), (0, 0, 1));
+        assert!(errors.is_empty());
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE ops_counters (name TEXT PRIMARY KEY, value INTEGER);")
+            .unwrap();
+        db.execute(
+            crate::ops::BUMP_COUNTER_SQL,
+            rusqlite::params![COUNTER_CRAWL_EXPIRED_REFUSED, expired],
+        )
+        .unwrap();
+        assert_eq!(
+            db.query_row("SELECT value FROM ops_counters", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+    }
 
     #[test]
     fn copy_crawl_sql_samples_live_content_and_claims_one_400_log() {

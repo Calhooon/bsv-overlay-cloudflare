@@ -7689,6 +7689,46 @@ fn deferral(topic: &bsv_overlay_engine::engine::TopicSyncResult) -> (u64, u64, u
 // graph converges in three ticks, each node asked ONCE, through exactly one
 // record, replaced (two writes) and deleted at convergence.
 #[tokio::test]
+async fn proofs_resumed_graph_waits_for_listing_before_advancing_cursor() {
+    let (_logs, _guard) = capture_logs();
+    let low = salted_chain(1, 40);
+    let high = salted_chain(5, 41);
+    let nodes: Vec<GASPNode> = low.iter().chain(high.iter()).cloned().collect();
+    let remote = listing(&nodes, &[(0, 0), (5, 0)]);
+    let faults = remote.faults.clone();
+    faults.borrow_mut().insert(node_txid(&nodes[0]));
+    let state = Rc::new(RefCell::new(HeadState::default()));
+    let mut node = Budgeted::new(remote, Box::new(HeadChainManager(state)), 1000);
+    node.engine.set_graph_budget(never(), 3, 60_000);
+    let (topic, _) = node.tick().await;
+    assert_eq!(topic.deferred_graphs, 1);
+    assert_eq!(
+        node.cursor().await,
+        0,
+        "the lower graph failed without a record"
+    );
+
+    // The saved higher graph lands, then the page request hits the deadline.
+    node.clock.allowance.set(2);
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[2, 1]));
+    assert_eq!(topic.finalized_graphs, 1);
+    assert_eq!(topic.deadline_dropped_graphs, 0);
+    assert_eq!(
+        node.cursor().await,
+        0,
+        "the listing must still account for earlier gaps"
+    );
+    assert_eq!(held(&node.store, &nodes).await, vec![(5, 0)]);
+
+    faults.borrow_mut().clear();
+    node.clock.allowance.set(1000);
+    node.tick().await;
+    assert_eq!(held(&node.store, &nodes).await, vec![(0, 0), (5, 0)]);
+    assert_eq!(node.cursor().await, 2);
+}
+
+#[tokio::test]
 async fn e555_a_a_graph_deeper_than_its_budget_converges_in_three_ticks_through_one_record() {
     let (_logs, _guard) = capture_logs();
     let nodes = chain(8);
@@ -7721,7 +7761,11 @@ async fn e555_a_a_graph_deeper_than_its_budget_converges_in_three_ticks_through_
         "the nodes are kept with their proofs"
     );
     assert_eq!(node.store.deferred_graph_writes(), 1);
-    assert_eq!(node.cursor().await, 0, "held below the deferred UTXO");
+    assert_eq!(
+        node.cursor().await,
+        1,
+        "the durable record lets the cursor pass"
+    );
     assert!(state.borrow().admitted.is_empty());
     assert_eq!(node.failures().await, 0, "progress is not a failed attempt");
 
@@ -7735,7 +7779,7 @@ async fn e555_a_a_graph_deeper_than_its_budget_converges_in_three_ticks_through_
         (6, vec![outpoint_of(&nodes[1])], 6, 2, "calls".into())
     );
     assert_eq!(node.store.deferred_graph_writes(), 2);
-    assert_eq!(node.cursor().await, 0);
+    assert_eq!(node.cursor().await, 1);
 
     let (topic, sent) = node.tick().await;
     assert_eq!(sent, txids(&nodes, &[1, 0]));
@@ -7753,7 +7797,10 @@ async fn e555_a_a_graph_deeper_than_its_budget_converges_in_three_ticks_through_
     assert_eq!(held(&node.store, &nodes).await, vec![(7, 0)]);
     assert_eq!(applied_rows(&node.store, &nodes).await, [true; 8]);
     assert_eq!(node.cursor().await, 1);
-    assert_eq!(topic.cursor_moves, moved(0, 1));
+    assert!(
+        topic.cursor_moves.is_empty(),
+        "the cursor already passed the saved graph"
+    );
 
     let (topic, sent) = node.tick().await;
     assert!(sent.is_empty(), "held: nothing to walk");
@@ -7901,18 +7948,19 @@ async fn e555_b_a_stuck_peer_is_deferred_each_pass_and_dropped_after_max_passes(
             .await
             .unwrap();
     }
-    // The pass after the last: dropped with its reason, nothing asked, the
-    // UTXO failed (held below the cursor), no record left.
+    // The exhausted walk is reset, retaining its durable retry obligation.
     let (topic, sent) = node.tick().await;
     assert!(sent.is_empty());
     assert_eq!(deferral(&topic), (0, 0, 0, vec!["max_passes".to_string()]));
     assert_eq!(topic.dropped_graphs[0].outpoint, outpoint_of(&nodes[7]));
-    assert!(node.store.deferred_graphs().is_empty());
-    assert_eq!(node.cursor().await, 0);
-    // The next pass walks it from its root, a new record.
+    let retained = node.store.deferred_graphs();
+    assert_eq!(retained.len(), 1);
+    assert!(retained[0].cursor_passable && retained[0].nodes.is_empty());
+    assert_eq!(node.cursor().await, 1);
+    // The next pass resumes the retained obligation from its root.
     let (topic, sent) = node.tick().await;
     assert_eq!(sent, txids(&nodes, &[7, 6, 5, 4, 3]));
-    assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
+    assert_eq!(deferral(&topic), (1, 1, 0, vec![]));
     // The peer heals: the graph converges from the record.
     hangs.borrow_mut().clear();
     let (topic, sent) = node.tick().await;
@@ -8047,11 +8095,11 @@ async fn e555_d_a_deferred_utxo_is_resumed_once_per_sync_though_served_twice() {
     node.tick().await;
     let writes = node.store.deferred_graph_writes();
     let (topic, sent) = node.tick().await;
-    // Two pages (the second re-serves the UTXO) and three node requests.
+    // The saved graph resumes before the page and is not walked twice.
     assert_eq!(
         node.clock.spent.get(),
-        2 + 3,
-        "the UTXO was served by both pages"
+        1 + 3,
+        "one page and three pending nodes"
     );
     assert_eq!(sent, txids(&nodes, &[4, 3, 2]));
     assert_eq!((topic.resumed_graphs, topic.deferred_graphs), (1, 1));
@@ -8104,7 +8152,7 @@ async fn e555_e_a_resumed_graph_whose_finalize_does_not_land_records_no_successo
         record_shape(&records[0]),
         (4, vec![], 4, 2, "not_landed".into())
     );
-    assert_eq!(node.cursor().await, 0);
+    assert_eq!(node.cursor().await, 1);
 
     outage.borrow_mut().take();
     let (topic, sent) = node.tick().await;
@@ -8116,8 +8164,8 @@ async fn e555_e_a_resumed_graph_whose_finalize_does_not_land_records_no_successo
 }
 
 // PIN G. The other graphs of a pass complete while one is deferred: a deep
-// graph listed FIRST no longer holds the pass, the one after it is admitted
-// in the same tick, and the cursor stays below the deferred one.
+// graph listed ahead no longer holds the pass, the one after it is admitted
+// in the same tick, and the cursor passes the durable record.
 #[tokio::test]
 async fn e555_g_the_other_graphs_of_a_pass_complete_while_one_is_deferred() {
     let (_logs, _guard) = capture_logs();
@@ -8141,7 +8189,11 @@ async fn e555_g_the_other_graphs_of_a_pass_complete_while_one_is_deferred() {
         vec![(8, 0)],
         "the shallow graph is in"
     );
-    assert_eq!(node.cursor().await, 0, "below the deferred graph");
+    assert_eq!(
+        node.cursor().await,
+        2,
+        "both completed and durably saved graphs are passed"
+    );
 
     let (_, sent) = node.tick().await;
     assert_eq!(sent, txids(&nodes, &[4, 3, 2]), "the held one is not asked");
@@ -8194,10 +8246,10 @@ async fn e555_h_a_walk_cut_by_the_per_peer_deadline_is_deferred_and_converges() 
 // the root was served UNPROVEN (its every input an SPV necessity) and is
 // re-asked at each resume; once its block lands the peer serves it PROVEN,
 // the record is dropped (`root_proven`) and the walk restarts from the
-// proven root. (2) A record whose UTXO a completed sync is no longer served
-// (spent at the peer) is dropped (`not_served`).
+// proven root. (2) A saved graph resumes even when the peer no longer lists
+// its UTXO; the cursor has already passed its score.
 #[tokio::test]
-async fn e555_f_a_root_proven_since_restarts_and_an_unserved_record_is_dropped() {
+async fn e555_f_a_root_proven_since_restarts_and_an_unlisted_record_resumes() {
     let (_logs, _guard) = capture_logs();
     let nodes = chain(6);
     let mut unproven = nodes.clone();
@@ -8243,9 +8295,14 @@ async fn e555_f_a_root_proven_since_restarts_and_an_unserved_record_is_dropped()
         clock: node.clock.clone(),
     }));
     let (topic, sent) = node.tick().await;
-    assert!(sent.is_empty());
-    assert_eq!(deferral(&topic), (0, 0, 0, vec!["not_served".to_string()]));
+    assert_eq!(sent, txids(&nodes, &[3, 2, 1]));
+    assert_eq!(deferral(&topic), (1, 1, 0, vec![]));
+    assert_eq!(node.cursor().await, 1);
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[0]));
+    assert_eq!(deferral(&topic), (0, 1, 1, vec![]));
     assert!(node.store.deferred_graphs().is_empty());
+    assert_eq!(held(&node.store, &nodes).await, vec![(5, 0)]);
 }
 
 // ============================================================================
@@ -8257,10 +8314,11 @@ async fn e555_f_a_root_proven_since_restarts_and_an_unserved_record_is_dropped()
 // node request: under a per-graph budget every pass was deferred with ZERO
 // nodes, the sync answered `Ok` and #302's quarantine never moved (10 passes,
 // `consecutive_failures` 0). Now a walk that fetched nothing is no progress:
-// no record is kept (nothing would be lost), each such pass is a FAILED
-// attempt, and after PEER_QUARANTINE_THRESHOLD of them the peer is skipped.
+// a retry record keeps the consecutive deadline count, each such pass is a
+// FAILED attempt, and PEER_QUARANTINE_THRESHOLD skips the peer. After the
+// named stall allowance, the durable retry record permits cursor movement.
 #[tokio::test]
-async fn e555f_h1_a_hung_peer_keeps_no_record_and_is_quarantined() {
+async fn e555f_h1_a_hung_peer_keeps_a_retry_obligation_and_is_quarantined() {
     let (_logs, _guard) = capture_logs();
     let nodes = chain(4);
     let state = Rc::new(RefCell::new(HeadState::default()));
@@ -8280,23 +8338,28 @@ async fn e555f_h1_a_hung_peer_keeps_no_record_and_is_quarantined() {
     for pass in 1..=threshold {
         let (topic, sent) = node.tick().await;
         assert_eq!(sent, txids(&nodes, &[3]), "pass {pass}: the root, hung");
-        assert_eq!(topic.deferred_graphs, 0, "pass {pass}: nothing kept");
-        assert!(node.store.deferred_graphs().is_empty());
+        let durable = pass >= u64::from(bsv_overlay_engine::gasp::DEADLINE_STALL_DEFERRAL_RUNS);
+        assert_eq!(topic.deferred_graphs, u64::from(durable));
+        let records = node.store.deferred_graphs();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].nodes.is_empty());
+        assert_eq!(records[0].cursor_passable, durable);
+        assert_eq!(node.cursor().await, u64::from(durable));
         assert_eq!(node.failures().await, pass, "pass {pass}: a failed attempt");
     }
-    assert_eq!(node.store.deferred_graph_writes(), 0);
+    assert_eq!(node.store.deferred_graph_writes(), threshold);
     for _ in 0..2 {
         let (_, sent) = node.tick().await;
         assert!(sent.is_empty(), "quarantined: skipped");
     }
     assert_eq!(node.failures().await, threshold);
-    println!("#555 fold H1: a hung peer, {threshold} failed passes, then quarantined; 0 records");
+    println!("#555 fold H1: a hung peer, {threshold} failed passes, then quarantined; one retry obligation");
 }
 
 // H1, the deadline arm. The per-PEER deadline cuts a walk that has fetched
-// nothing (the root request is the one that overspends): no record, and the
-// tick is a failed attempt. On 03e1e17 the 0-node record was saved and the
-// tick counted a success (`deferred > 0`).
+// nothing (the root request is the one that overspends): a retry record is
+// kept, and the tick is a failed attempt. Retaining the obligation must not
+// count as productive peer progress.
 #[tokio::test]
 async fn e555f_h1_the_peer_deadline_over_a_walk_that_fetched_nothing_is_a_failure() {
     let (_logs, _guard) = capture_logs();
@@ -8309,13 +8372,21 @@ async fn e555f_h1_the_peer_deadline_over_a_walk_that_fetched_nothing_is_a_failur
         1,
     );
     node.engine.set_graph_budget(never(), 100, 60_000);
-    for pass in 1..=3u64 {
-        let (topic, sent) = node.tick().await;
-        assert_eq!(sent, txids(&nodes, &[3]));
-        assert_eq!(topic.deadline_dropped_graphs, 1);
-        assert!(node.store.deferred_graphs().is_empty(), "nothing kept");
-        assert_eq!(node.failures().await, pass);
-    }
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[3]));
+    assert_eq!(topic.deadline_dropped_graphs, 1);
+    assert_eq!(node.failures().await, 1);
+    let records = node.store.deferred_graphs();
+    assert_eq!(records.len(), 1);
+    assert!(!records[0].cursor_passable && records[0].nodes.is_empty());
+    // Resume precedes pagination, so the next slice can retain the root.
+    let (topic, sent) = node.tick().await;
+    assert_eq!(sent, txids(&nodes, &[3, 2]));
+    assert_eq!(topic.deadline_dropped_graphs, 1);
+    let records = node.store.deferred_graphs();
+    assert_eq!(records[0].nodes.len(), 1);
+    assert!(records[0].cursor_passable);
+    assert_eq!(node.failures().await, 0);
 }
 
 // M1 (the lens's `lens2`). Two deep graphs and a shallow one listed after
@@ -8361,10 +8432,10 @@ async fn e555f_m1_the_resumes_of_a_pass_share_one_budget_and_the_rest_is_reached
     println!("#555 fold M1: c admitted on pass 2; a and b converged by pass {ticks}");
 }
 
-// L3. A sync reads the records' KEYS up front and a record only when its
-// UTXO is served: two records held, the peer serves one, one record is read.
+// L3. A sync loads keys and then resumes each record individually, even
+// when the peer no longer lists its UTXO.
 #[tokio::test]
-async fn e555f_l3_a_record_is_read_only_when_its_utxo_is_served() {
+async fn e555f_l3_saved_records_resume_before_the_listing() {
     let (_logs, _guard) = capture_logs();
     let a = salted_chain(5, 1);
     let b = salted_chain(5, 2);
@@ -8379,8 +8450,8 @@ async fn e555f_l3_a_record_is_read_only_when_its_utxo_is_served() {
     node.tick().await;
     assert_eq!(node.store.deferred_graphs().len(), 2);
     assert_eq!(node.store.deferred_graph_reads(), 0);
-    // The peer now lists a's UTXO only, under a per-peer budget that ends
-    // the sync inside a's walk (so b is not dropped `not_served`).
+    // The peer lists only a. Both retained obligations are considered in
+    // order, sharing the same bounded resume allowance.
     let mut only_a = listing(&nodes, &[(4, 0)]);
     only_a.requests = node.requests.clone();
     node.engine.set_gasp_remote_factory(Box::new(MeteredRemote {
@@ -8389,7 +8460,13 @@ async fn e555f_l3_a_record_is_read_only_when_its_utxo_is_served() {
     }));
     node.clock.allowance.set(2);
     node.tick().await;
-    assert_eq!(node.store.deferred_graph_reads(), 1, "a's record alone");
+    assert_eq!(
+        node.store.deferred_graph_reads(),
+        2,
+        "each record read in turn"
+    );
+    assert_eq!(held(&node.store, &nodes).await, vec![(4, 0)]);
+    assert_eq!(node.store.deferred_graphs().len(), 1);
 }
 
 // L4. A walk past its per-graph budget that cannot be KEPT (the storage's own
@@ -9018,7 +9095,7 @@ async fn e555d2_m2_a_configured_peers_record_says_so() {
 // 5xx) until DEFERRED_GRAPH_MAX_IDLE_FAULTS in a row, then dropped
 // `idle_faults` and the UTXO fails. A pass that appends resets the count.
 #[tokio::test]
-async fn e555d2_m2_a_resumed_walk_that_faults_idle_is_dropped_after_three() {
+async fn e555d2_m2_idle_faults_reset_the_walk_but_keep_its_retry_obligation() {
     let (_logs, _guard) = capture_logs();
     let nodes = chain(8);
     let remote = RecordingRemote::new(&nodes, &[7]);
@@ -9041,7 +9118,9 @@ async fn e555d2_m2_a_resumed_walk_that_faults_idle_is_dropped_after_three() {
         assert!(topic.dropped_graphs.is_empty());
     }
     let (topic, _) = node.tick().await;
-    assert!(node.store.deferred_graphs().is_empty(), "dropped");
+    let retained = node.store.deferred_graphs();
+    assert_eq!(retained.len(), 1);
+    assert!(retained[0].cursor_passable && retained[0].nodes.is_empty());
     assert_eq!(deferral(&topic).3, vec!["idle_faults".to_string()]);
     // A pass that appends resets the count: heal, fault one node deeper.
     faults.borrow_mut().clear();
@@ -9374,7 +9453,7 @@ async fn e555d4_m1_dead_port_adverts_of_an_honest_host_do_not_silence_it() {
 // not recorded (the failures stay, the last attempt stays), the next sync
 // that serves work continues the streak, fails and re-arms the quarantine.
 #[tokio::test]
-async fn e555d4_l2_an_empty_listing_at_the_probe_does_not_lift_the_quarantine() {
+async fn e555d4_l2_an_empty_listing_with_pending_holds_does_not_lift_quarantine() {
     let (_logs, _guard) = capture_logs();
     let state = Rc::new(RefCell::new(HeadState::default()));
     let store = Rc::new(MemoryStorage::new());
@@ -9422,16 +9501,19 @@ async fn e555d4_l2_an_empty_listing_at_the_probe_does_not_lift_the_quarantine() 
         }
         if probe {
             empty_probes += 1;
-            assert!(sent.is_empty() && topic.errors.is_empty(), "tick {tick}");
-            assert_eq!(
-                after.consecutive_failures, before,
-                "tick {tick}: an empty probe keeps the failures"
-            );
+            assert_eq!(topic.finalized_graphs, 0);
             assert!(before >= PEER_QUARANTINE_THRESHOLD);
-            assert!(
-                after.secs_since_last_attempt >= Some(PEER_QUARANTINE_REPROBE_SECS),
-                "tick {tick}: and is not recorded as an attempt"
-            );
+            if sent.is_empty() && topic.dropped_graphs.is_empty() {
+                assert_eq!(after.consecutive_failures, before);
+                assert!(after.secs_since_last_attempt >= Some(PEER_QUARANTINE_REPROBE_SECS));
+            } else {
+                assert_eq!(
+                    after.consecutive_failures,
+                    before + 1,
+                    "tick {tick}: failed saved work re-arms quarantine"
+                );
+                assert_eq!(after.secs_since_last_attempt, Some(0));
+            }
             continue;
         }
         hostile_slices += 1;
@@ -9596,7 +9678,11 @@ async fn e586_b_a_graph_past_the_bytes_limb_defers_and_completes_over_two_passes
         record_shape(&records[0]),
         (5, vec![outpoint_of(&nodes[2])], 5, 1, "bytes".into())
     );
-    assert_eq!(node.cursor().await, 0, "held below the deferred UTXO");
+    assert_eq!(
+        node.cursor().await,
+        1,
+        "the durable record lets the cursor pass"
+    );
     assert!(state.borrow().admitted.is_empty());
     assert_eq!(node.failures().await, 0, "progress is not a failed attempt");
 
@@ -9639,7 +9725,7 @@ async fn e586_c_a_graph_past_the_nodes_limb_defers_and_completes_over_two_passes
         record_shape(&records[0]),
         (5, vec![outpoint_of(&nodes[2])], 5, 1, "nodes".into())
     );
-    assert_eq!(node.cursor().await, 0);
+    assert_eq!(node.cursor().await, 1);
     assert!(state.borrow().admitted.is_empty());
 
     let (topic, sent) = node.tick().await;
@@ -9806,6 +9892,7 @@ async fn e586_e_a_deferred_record_holds_raw_nodes_and_weighs_what_was_fetched() 
         [
             "calls",
             "configured",
+            "cursorPassable",
             "idleFaults",
             "nodes",
             "outpoint",
@@ -9951,7 +10038,11 @@ async fn e586f_l1_a_graph_of_26kb_heads_fills_the_bytes_limb_first_and_its_recor
     // crosses it, at most one node past the limb.
     let served = served_this_tick(&nodes, &sent);
     assert!(served >= DEFAULT_GRAPH_BUDGET_BYTES && served < DEFAULT_GRAPH_BUDGET_BYTES + head);
-    assert_eq!(node.cursor().await, 0, "held below the deferred UTXO");
+    assert_eq!(
+        node.cursor().await,
+        1,
+        "the durable record lets the cursor pass"
+    );
     assert!(state.borrow().admitted.is_empty());
     assert_eq!(
         DEFAULT_GRAPH_BUDGET_BYTES, 917_504,
@@ -10090,7 +10181,11 @@ async fn e585_d4_a_46_node_unmined_graph_of_26kb_heads_is_deferred_and_resumed_w
         "past the old cap: {second}"
     );
     assert!(state.borrow().admitted.is_empty());
-    assert_eq!(node.cursor().await, 0, "held below the deferred UTXO");
+    assert_eq!(
+        node.cursor().await,
+        1,
+        "the durable record lets the cursor pass"
+    );
 
     let (topic, sent) = node.tick().await;
     let mut expected = vec![45];
@@ -10145,7 +10240,7 @@ async fn e585_d4_a_resumed_walk_refused_room_keeps_its_record() {
         "as it was"
     );
     assert!(state.borrow().admitted.is_empty());
-    assert_eq!(node.cursor().await, 0);
+    assert_eq!(node.cursor().await, 1);
     // Room again: the next pass RESUMES from the held record (18 nodes in
     // hand: the root's re-ask and the pending inputs, never the 18 again).
     node.store.set_deferred_graph_byte_ceiling(None);
@@ -10451,7 +10546,11 @@ async fn e592_q8_4_an_anchor_walk_that_cannot_run_holds_the_graph_and_a_rejected
                 (3, vec![], 3, 1, "anchor_walk_held".to_string()),
                 "the whole graph, nothing pending"
             );
-            assert_eq!(anchored.cursor().await, 0, "the cursor below the UTXO");
+            assert_eq!(
+                anchored.cursor().await,
+                1,
+                "the durable hold lets the cursor pass"
+            );
             assert_eq!(
                 anchored.failures().await,
                 0,
@@ -10506,7 +10605,7 @@ async fn e592_q8_5_a_root_served_proven_lifts_the_hold_and_finalizes_with_no_scr
     assert_eq!(topic.anchor_walk_held_graphs, 1);
     assert_eq!(topic.finalized_graphs, 0);
     assert_eq!(deferral(&topic), (1, 0, 0, vec![]));
-    assert_eq!(anchored.cursor().await, 0);
+    assert_eq!(anchored.cursor().await, 1);
     let asked_after_hold = tracker.asked.load(Ordering::SeqCst);
     assert_eq!(asked_after_hold, 1);
 
@@ -10522,8 +10621,8 @@ async fn e592_q8_5_a_root_served_proven_lifts_the_hold_and_finalizes_with_no_scr
     assert_eq!(sent, txids(&nodes, &[2, 2, 1, 0]));
     assert_eq!(
         deferral(&topic),
-        (0, 1, 0, vec!["root_proven".to_string()]),
-        "resumed, its record dropped root_proven, the restart not counted converged"
+        (0, 1, 1, vec!["root_proven".to_string()]),
+        "the retained obligation converges after its root restart"
     );
     assert_eq!(topic.finalized_graphs, 1);
     assert_eq!(topic.anchor_walk_held_graphs, 0);
@@ -10541,5 +10640,8 @@ async fn e592_q8_5_a_root_served_proven_lifts_the_hold_and_finalizes_with_no_scr
     assert_eq!(applied_rows(&anchored.store, &nodes).await, [true; 3]);
     assert_eq!(state.borrow().admitted, txids(&nodes, &[0, 1, 2]));
     assert_eq!(anchored.cursor().await, 1);
-    assert_eq!(topic.cursor_moves, moved(0, 1));
+    assert!(
+        topic.cursor_moves.is_empty(),
+        "the cursor already passed the saved graph"
+    );
 }

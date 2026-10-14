@@ -1078,6 +1078,7 @@ mod tests {
                 reason: "time".into(),
                 configured: true,
                 idle_faults: 0,
+                cursor_passable: false,
             };
             for peer in peers {
                 record.peer = peer.into();

@@ -32,6 +32,9 @@
 //! / `tokio` — so this stays `wasm32-unknown-unknown`-clean. bsv-rs is used only
 //! for the wasm-clean `transaction` surface.
 
+mod diagnostics;
+pub(crate) use diagnostics::{ProofProbe, PROOF_RUNGS};
+
 use overlay_engine::beef_limits;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -214,6 +217,9 @@ struct ProofMemo {
 /// `AncestorFetcher` backed by the configured courier ladder, with a
 /// mandatory header verification before any BUMP is returned.
 pub struct ChainProofFetcher {
+    proof_tallies: RefCell<BTreeMap<&'static str, RungTally>>,
+    proof_fault_logged: RefCell<std::collections::HashSet<&'static str>>,
+    proof_fault_store: Option<Rc<worker::D1Database>>,
     proof_memo: RefCell<HashMap<String, ProofMemo>>,
     ancestor_memo: RefCell<HashMap<String, Result<FetchedAncestor, GASPError>>>,
     arcade_url: String,
@@ -263,7 +269,9 @@ pub fn circuit_open(consecutive: u32) -> bool {
 }
 
 /// The courier rungs, in the order the health surface lists them.
-pub const COURIER_RUNGS: [&str; 6] = [
+pub const COURIER_RUNGS: [&str; 8] = [
+    "arcade",
+    "bitails",
     "bananablocks",
     "woc",
     "bitails_tx",
@@ -306,6 +314,9 @@ impl ChainProofFetcher {
             woc_api_key: None,
             tracker,
             budget: Cell::new(DEFAULT_FETCH_BUDGET),
+            proof_tallies: RefCell::default(),
+            proof_fault_logged: RefCell::default(),
+            proof_fault_store: None,
             proof_memo: RefCell::new(HashMap::new()),
             ancestor_memo: RefCell::new(HashMap::new()),
             rung_stats: RefCell::new(BTreeMap::new()),
@@ -336,6 +347,11 @@ impl ChainProofFetcher {
         } else {
             String::new()
         };
+        self
+    }
+
+    pub(crate) fn with_proof_fault_store(mut self, db: Option<Rc<worker::D1Database>>) -> Self {
+        self.proof_fault_store = db;
         self
     }
 
@@ -497,174 +513,21 @@ impl ChainProofFetcher {
         arcade_stop: bool,
         exhaustive: &Cell<bool>,
     ) -> Result<Option<String>, String> {
-        if self.arcade_url.is_empty() && self.bitails_base.is_empty() && self.woc_base.is_empty() {
-            for name in ["arcade", "bitails", "woc"] {
-                self.source_enabled(name);
+        for rung in PROOF_RUNGS {
+            let probe = self.diagnose_rung(rung, txid).await;
+            self.note_proof_probe(&probe).await;
+            if let Some(RungStep::Abort(error)) = &probe.step {
+                return Err(error.clone());
             }
-            return Ok(None);
-        }
-        let tracker = self.tracker.as_deref();
-        // bsv-low M19B-G1 round 2 (review MED-3): one rung's candidate at a
-        // height OUR header source does not serve (`BlockNotFound`) is that
-        // rung's miss, not the ladder's fault: the next rung is asked (a
-        // courier re-anchored to a block chaintracks 404s used to abort the
-        // whole ladder with `?`, so Bitails/WoC were never reached and the
-        // caller faulted every pass). A transport fault still aborts.
-        async fn judge(
-            tracker: Option<&dyn ChainTracker>,
-            rung: &str,
-            bump_hex: &str,
-            txid: &str,
-        ) -> Result<bool, String> {
-            match rung_step(&verify_bump_outcome(tracker, bump_hex, txid).await) {
-                RungStep::Accept => Ok(true),
-                RungStep::NextRung(why) => {
-                    worker::console_log!(
-                        "[proof] {rung} bump for {txid} not accepted ({why}); next rung"
-                    );
-                    Ok(false)
-                }
-                RungStep::Abort(e) => Err(e),
+            if let Some(bump) = probe.bump {
+                return Ok(Some(bump));
+            }
+            if arcade_stop && probe.unmined {
+                exhaustive.set(false);
+                return Ok(None);
             }
         }
-
-        // 1. Arcade — our own broadcaster's free BUMP (MINED status merklePath).
-        match self.arcade_proof_look(txid).await {
-            ArcadeProofLook::Mined(bump_hex) => {
-                if judge(tracker, "arcade", &bump_hex, txid).await? {
-                    return Ok(Some(bump_hex));
-                }
-            }
-            // bsv-low #451 slice B (2026-09-17): Arcade HOLDS the tx on the network and said so within the last
-            // 30 minutes. No courier can hold a proof for a tx the network has not mined, so a COMPLETION pass stops
-            // here — the MINED push or the next tick asks again. The cost when Arcade is behind the couriers (a tx
-            // mined that Arcade still shows SEEN): this row's proof waits for the earlier of Arcade's MINED flip and
-            // the 30-minute freshness window, then the couriers are asked as before (the gate's HIGH-2; a wedged
-            // Arcade, the 2026-09-01 class, is bounded the same way). A caller that ACTS on this pass's answer asks
-            // exhaustively (`arcade_stop == false`). Measured before: every unmined row cost a Bitails read and a
-            // WoC read per tick that could only answer "no bump".
-            ArcadeProofLook::KnownUnmined(status) => {
-                if arcade_stop {
-                    exhaustive.set(false);
-                    push_log(&format!(
-                        "[proof] arcade holds {txid} unmined ({status}); couriers skipped this pass"
-                    ));
-                    return Ok(None);
-                }
-                worker::console_log!(
-                    "[proof] arcade holds {txid} unmined ({status}) — an exhaustive ask: the couriers are asked anyway"
-                );
-            }
-            ArcadeProofLook::Unknown => {}
-        }
-
-        // 2. Bitails TSC (secondary — tx mined outside Arcade).
-        match self.bitails_tsc_bump(txid).await {
-            Some(bump_hex) => {
-                if judge(tracker, "bitails", &bump_hex, txid).await? {
-                    return Ok(Some(bump_hex));
-                }
-            }
-            None => tracing::info!(
-                "[proof] bitails returned NO bump for {txid} (tracker_present={})",
-                tracker.is_some()
-            ),
-        }
-
-        // 3. WoC TSC (BREAK-GLASS, last resort — WoC 429s on the free tier).
-        if let Some(bump_hex) = self.woc_tsc_bump(txid).await {
-            if judge(tracker, "woc", &bump_hex, txid).await? {
-                return Ok(Some(bump_hex));
-            }
-        }
-
         Ok(None)
-    }
-
-    /// Arcade `GET /tx/{txid}` → what it says about the tx's PROOF (bsv-low #451 slice B): the BUMP when MINED,
-    /// "held unmined" when Arcade carries a live non-mined status, else unknown (the ladder goes on).
-    async fn arcade_proof_look(&self, txid: &str) -> ArcadeProofLook {
-        if !self.source_enabled("arcade") {
-            return ArcadeProofLook::Unknown;
-        }
-        let url = format!("{}/tx/{}", self.arcade_url, txid);
-        match http_get(&url, None).await {
-            Ok((status, body)) => {
-                parse_arcade_proof_look(status, &body, worker::Date::now().as_millis() as i64)
-            }
-            Err(_) => ArcadeProofLook::Unknown,
-        }
-    }
-
-    /// WoC `GET /tx/{txid}/proof/tsc` (TSC JSON) + height from
-    /// `GET /tx/hash/{txid}` → a BRC-74 BUMP hex, else `None`.
-    async fn woc_tsc_bump(&self, txid: &str) -> Option<String> {
-        let height = self.woc_block_height(txid).await?;
-        let url = format!("{}/tx/{}/proof/tsc", self.woc_base, txid);
-        let hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
-        let (status, body) = http_get(&url, hdr).await.ok()?;
-        if !(200..300).contains(&status) {
-            return None;
-        }
-        tsc_body_to_bump_hex(&body, height)
-    }
-
-    /// WoC block height for `txid` (`GET /tx/hash/{txid}` → `blockheight`), or
-    /// `None` if unmined / unknown.
-    async fn woc_block_height(&self, txid: &str) -> Option<u32> {
-        if !self.source_enabled("woc") {
-            return None;
-        }
-        let url = format!("{}/tx/hash/{}", self.woc_base, txid);
-        let hdr = self.woc_api_key.as_deref().map(|k| ("woc-api-key", k));
-        let (status, body) = http_get(&url, hdr).await.ok()?;
-        if !(200..300).contains(&status) {
-            return None;
-        }
-        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-        let h = v.get("blockheight").and_then(|h| h.as_u64())?;
-        if h == 0 {
-            return None; // 0 → unconfirmed / mempool.
-        }
-        u32::try_from(h).ok()
-    }
-
-    /// Bitails `GET /tx/{txid}/proof/tsc` (same TSC shape as WoC).
-    async fn bitails_tsc_bump(&self, txid: &str) -> Option<String> {
-        let height = self.bitails_block_height(txid).await?;
-        let url = format!("{}/tx/{}/proof/tsc", self.bitails_base, txid);
-        let (status, body) = http_get(&url, None).await.ok()?;
-        if !(200..300).contains(&status) {
-            return None;
-        }
-        tsc_body_to_bump_hex(&body, height)
-    }
-
-    /// Bitails block height for `txid` (`GET /tx/{txid}` → `blockHeight`).
-    async fn bitails_block_height(&self, txid: &str) -> Option<u32> {
-        if !self.source_enabled("bitails") {
-            return None;
-        }
-        let url = format!("{}/tx/{}", self.bitails_base, txid);
-        let (status, body) = http_get(&url, None).await.ok()?;
-        if !(200..300).contains(&status) {
-            return None;
-        }
-        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-        // Bitails returns ALL-LOWERCASE `blockheight` (verified live:
-        // {"txid":…,"blockhash":…,"blockheight":913691,…}). Reading only the
-        // camelCase `blockHeight` made this return None for EVERY tx, which
-        // short-circuited `bitails_tsc_bump` before it ever fetched the proof —
-        // silently starving both the pot-beef proof pass and the #186 spend
-        // chaser (both sat at 0 completions). Accept both spellings.
-        let h = v
-            .get("blockheight")
-            .or_else(|| v.get("blockHeight"))
-            .and_then(|h| h.as_u64())?;
-        if h == 0 {
-            return None;
-        }
-        u32::try_from(h).ok()
     }
 
     /// Fetch the raw tx hex for `txid`, content-addressed, trying Bitails FIRST
@@ -1417,7 +1280,16 @@ pub fn days_in_month(year: i64, month: u32) -> u32 {
 /// BRC-74 BUMP hex at `block_height`. The body may be the bare TSC object or a
 /// wrapper carrying it; we accept the object directly.
 fn tsc_body_to_bump_hex(body: &str, block_height: u32) -> Option<String> {
-    tsc_json_to_bump_hex(body, block_height)
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let proof = match &value {
+        serde_json::Value::Array(items) => match items.as_slice() {
+            [proof] => proof,
+            _ => return None,
+        },
+        serde_json::Value::Object(_) => &value,
+        _ => return None,
+    };
+    tsc_json_to_bump_hex(&proof.to_string(), block_height)
 }
 
 /// Convert a TSC proof JSON string to a BRC-74 BUMP hex string.
@@ -1434,8 +1306,8 @@ pub fn tsc_json_to_bump_hex(json_str: &str, block_height: u32) -> Option<String>
         .get("nodes")?
         .as_array()?
         .iter()
-        .filter_map(|n| n.as_str().map(|s| s.to_string()))
-        .collect();
+        .map(|n| n.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
 
     let mp = tsc_proof_to_merkle_path(txid, index, &nodes, block_height).ok()?;
     Some(mp.to_hex())
@@ -1491,13 +1363,16 @@ fn tsc_proof_to_merkle_path(
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 thread_local! {
+    static TEST_HTTP_RESPONSES: RefCell<HashMap<String, (u16, String)>> = RefCell::new(HashMap::new());
     static TEST_HTTP_CALLS: Cell<u32> = const { Cell::new(0) };
     static TEST_PROOF_LOGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 #[cfg(all(test, not(target_arch = "wasm32")))]
-pub(crate) async fn http_get(_: &str, _: Option<(&str, &str)>) -> Result<(u16, String), String> {
+pub(crate) async fn http_get(url: &str, _: Option<(&str, &str)>) -> Result<(u16, String), String> {
     TEST_HTTP_CALLS.with(|calls| calls.set(calls.get() + 1));
-    Ok((404, String::new()))
+    Ok(TEST_HTTP_RESPONSES
+        .with(|r| r.borrow().get(url).cloned())
+        .unwrap_or((404, String::new())))
 }
 
 /// Fetch a URL via `worker::Fetch`, returning `(status, body)`. `header` is an
@@ -4642,6 +4517,224 @@ pub(crate) mod tests {
     const HEIGHT: u32 = 830_000;
 
     // ── INCIDENT D1-CALLBACK-FLOOD 2026-09-01: the three pure decisions ──
+
+    #[tokio::test]
+    async fn proofs_completion_lands_after_shared_budget_is_spent() {
+        use overlay_engine::storage::{memory::MemoryStorage, Storage};
+        use overlay_engine::types::Output;
+        let tx = Transaction::from_hex(&format!(
+            "0100000001{}0000000000ffffffff010100000000000000015100000000",
+            "12".repeat(32)
+        ))
+        .unwrap();
+        let txid = tx.id();
+        let tsc =
+            serde_json::json!({"index":1,"txOrId":txid,"nodes":["22".repeat(32)]}).to_string();
+        let bump = tsc_body_to_bump_hex(&tsc, 904734).unwrap();
+        let root = MerklePath::from_hex(&bump)
+            .unwrap()
+            .compute_root(Some(&txid))
+            .unwrap();
+        let mut tracker = bsv_rs::transaction::MockChainTracker::new(1_000_000);
+        tracker.add_root(904734, root);
+        let tracker: Rc<dyn ChainTracker> = Rc::new(tracker);
+        TEST_HTTP_RESPONSES.with(|responses| {
+            let mut responses = responses.borrow_mut();
+            responses.clear();
+            responses.insert(
+                format!("{DEFAULT_WOC_BASE}/tx/hash/{txid}"),
+                (200, r#"{"blockheight":904734}"#.into()),
+            );
+            responses.insert(
+                format!("{DEFAULT_WOC_BASE}/tx/{txid}/proof/tsc"),
+                (200, format!("[{tsc}]")),
+            );
+        });
+        let shared = Rc::new(
+            ChainProofFetcher::new(Some(tracker.clone()))
+                .with_sources(ProofSources::parse("woc"))
+                .with_budget(0),
+        );
+        assert!(shared.verified_proof_for(&txid).await.is_none());
+        let store = MemoryStorage::new();
+        store
+            .insert_output(&Output {
+                txid: txid.clone(),
+                output_index: 0,
+                topic: "test".into(),
+                spent: false,
+                output_script: vec![0x51],
+                satoshis: 1,
+                outputs_consumed: vec![],
+                consumed_by: vec![],
+                beef: Some(tx.to_beef(true).unwrap()),
+                block_height: None,
+                score: Some(1.0),
+            })
+            .await
+            .unwrap();
+        let mut engine = overlay_engine::engine::Engine::new(
+            HashMap::new(),
+            HashMap::new(),
+            Box::new(store),
+            None,
+            Default::default(),
+        );
+        engine.set_ancestor_fetcher(shared.clone());
+        let completion = ChainProofFetcher::new(Some(tracker))
+            .with_sources(ProofSources::parse("woc"))
+            .with_budget(crate::TRANSACTION_PROOF_FETCH_BUDGET);
+        assert_eq!(
+            engine
+                .complete_missing_proofs(1, 0)
+                .await
+                .unwrap()
+                .completed,
+            0
+        );
+        assert_eq!(
+            engine
+                .complete_missing_proofs_with(
+                    &completion,
+                    crate::TRANSACTION_PROOF_COMPLETION_LIMIT,
+                    0
+                )
+                .await
+                .unwrap()
+                .completed,
+            1
+        );
+        assert_eq!(shared.budget.get(), 0);
+        assert_eq!(
+            completion.budget.get(),
+            crate::TRANSACTION_PROOF_FETCH_BUDGET - 1
+        );
+        let row = engine
+            .storage()
+            .find_output(&txid, 0, Some("test"), None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            beef_limits::own_proof(row.beef.as_ref().unwrap(), &txid)
+                .unwrap()
+                .unwrap()
+                .to_hex(),
+            bump
+        );
+    }
+
+    fn proofs_fixture_responses(txid: &str) {
+        TEST_HTTP_RESPONSES.with(|responses| {
+            let mut responses = responses.borrow_mut();
+            responses.clear();
+            responses.insert(
+                format!("{DEFAULT_WOC_BASE}/tx/hash/{txid}"),
+                (200, r#"{"blockheight":904734}"#.into()),
+            );
+            responses.insert(
+                format!("{DEFAULT_WOC_BASE}/tx/{txid}/proof/tsc"),
+                (200, include_str!("../tests/fixtures/proof-woc.json").into()),
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn proofs_diagnostics_share_parser_and_leave_state_untouched() {
+        let txid = "11".repeat(32);
+        proofs_fixture_responses(&txid);
+        let hex =
+            tsc_body_to_bump_hex(include_str!("../tests/fixtures/proof-bitails.json"), 904734)
+                .unwrap();
+        let root = MerklePath::from_hex(&hex)
+            .unwrap()
+            .compute_root(Some(&txid))
+            .unwrap();
+        let mut tracker = bsv_rs::transaction::MockChainTracker::new(1_000_000);
+        tracker.add_root(904734, root);
+        let fetcher =
+            ChainProofFetcher::new(Some(Rc::new(tracker))).with_sources(ProofSources::parse("woc"));
+        let probe = fetcher.diagnose_rung("woc", &txid).await;
+        let json = serde_json::to_value(&probe).unwrap();
+        assert_eq!(json["judge"], "valid");
+        assert_eq!(json["requests"][0]["httpStatus"], 200);
+        assert_eq!(json["requests"][1]["parseResult"], "bump");
+        assert!(json.get("bump").is_none());
+        assert_eq!(probe.bump, Some(hex.clone()));
+        assert!(fetcher.rung_stats().is_empty());
+        assert!(fetcher.proof_memo.borrow().is_empty());
+        assert_eq!(fetcher.budget.get(), DEFAULT_FETCH_BUDGET);
+        assert_eq!(fetcher.verified_proof_for(&txid).await, Some(hex));
+    }
+
+    #[tokio::test]
+    async fn proofs_rung_failures_are_counted_and_logged_once() {
+        TEST_PROOF_LOGS.with(|logs| logs.borrow_mut().clear());
+        TEST_HTTP_RESPONSES.with(|responses| responses.borrow_mut().clear());
+        let fetcher = ChainProofFetcher::new(None).with_sources(ProofSources::parse("woc"));
+        for n in 1..=3 {
+            assert!(fetcher
+                .verified_proof_for(&format!("{n:064x}"))
+                .await
+                .is_none());
+        }
+        assert_eq!(fetcher.proof_tallies.borrow()["woc"].fault, 3);
+        assert_eq!(
+            TEST_PROOF_LOGS.with(|logs| logs
+                .borrow()
+                .iter()
+                .filter(|s| s.contains("rung=woc"))
+                .count()),
+            1
+        );
+        let txid = "11".repeat(32);
+        proofs_fixture_responses(&txid);
+        let rejected = fetcher.diagnose_rung("woc", &txid).await;
+        assert_eq!(rejected.judge, "rejected");
+        fetcher.note_proof_probe(&rejected).await;
+        TEST_HTTP_RESPONSES.with(|r| {
+            r.borrow_mut().insert(
+                format!("{DEFAULT_WOC_BASE}/tx/{txid}/proof/tsc"),
+                (200, "invalid".into()),
+            )
+        });
+        let malformed = fetcher.diagnose_rung("woc", &txid).await;
+        assert_eq!(malformed.parse_result, "invalid-tsc");
+        fetcher.note_proof_probe(&malformed).await;
+        assert_eq!(fetcher.proof_tallies.borrow()["woc"].fault, 5);
+        assert_eq!(TEST_PROOF_LOGS.with(|logs| logs.borrow().len()), 1);
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE ops_counters (name TEXT PRIMARY KEY, value INTEGER);")
+            .unwrap();
+        let name = crate::ops::courier_counter_name("woc", "fault");
+        db.execute(
+            crate::ops::BUMP_COUNTER_SQL,
+            rusqlite::params![name, fetcher.proof_tallies.borrow()["woc"].fault],
+        )
+        .unwrap();
+        assert_eq!(
+            db.query_row("SELECT value FROM ops_counters", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn proofs_tsc_rejects_ambiguous_arrays_and_non_string_nodes() {
+        assert!(tsc_body_to_bump_hex("[]", 1).is_none());
+        assert!(tsc_body_to_bump_hex("[{},{}]", 1).is_none());
+        let body =
+            serde_json::json!({"index":1,"txOrId":"11".repeat(32),"nodes":["22".repeat(32),null]});
+        assert!(tsc_body_to_bump_hex(&body.to_string(), 1).is_none());
+    }
+
+    #[test]
+    fn proofs_tsc_provider_shapes_match() {
+        let object = include_str!("../tests/fixtures/proof-bitails.json");
+        let array = include_str!("../tests/fixtures/proof-woc.json");
+        let expected = tsc_body_to_bump_hex(object, 904734).expect("object proof");
+        assert_eq!(tsc_body_to_bump_hex(array, 904734), Some(expected));
+    }
 
     /// The attempt cap: first attempt always; then the per-attempt spacing
     /// must elapse; at the cap never again. Failure never SPEEDS a retry.
