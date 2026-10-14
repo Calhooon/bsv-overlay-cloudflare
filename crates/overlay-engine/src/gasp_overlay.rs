@@ -98,6 +98,7 @@ pub fn new_finalized_graph_sink() -> FinalizedGraphSink {
 /// the accumulated nodes are converted to BEEF format and pushed to the shared
 /// `FinalizedGraphSink` for later Engine submission.
 pub struct OverlayGASPStorage<'a> {
+    fault_memos: Mutex<HashMap<String, crate::gasp::DeferredGraph>>,
     /// The Engine's storage backend.
     storage: &'a dyn Storage,
     /// Topic being synchronized.
@@ -477,6 +478,7 @@ impl<'a> OverlayGASPStorage<'a> {
             topic: topic.into(),
             topic_manager: None,
             pending_graphs: Mutex::new(HashMap::new()),
+            fault_memos: Mutex::new(HashMap::new()),
             finalized_sink: sink,
             strict_beef: false,
             chain_tracker: None,
@@ -1526,6 +1528,25 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         Ok(())
     }
 
+    async fn read_fault_memos(
+        &self,
+        outpoints: Option<&[String]>,
+    ) -> Result<crate::fault_memo::FaultMemoBatch, GASPError> {
+        let batch = self
+            .storage
+            .read_fault_memos(&self.peer, &self.topic, outpoints)
+            .await
+            .map_err(|e| GASPError::StorageError(e.to_string()))?;
+        let mut cache = self.fault_memos.lock().unwrap();
+        // Only the active batch is cached. A walk spanning many pages does not
+        // keep the complete memo in isolate memory.
+        cache.clear();
+        for record in &batch.records {
+            cache.insert(record.outpoint.clone(), record.clone().into_record());
+        }
+        Ok(batch)
+    }
+
     async fn load_deferred_graphs(&self) -> Result<Vec<crate::gasp::DeferredGraphKey>, GASPError> {
         self.storage
             .find_deferred_graphs(&self.peer, &self.topic)
@@ -1537,6 +1558,9 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         &self,
         outpoint: &str,
     ) -> Result<Option<crate::gasp::DeferredGraph>, GASPError> {
+        if let Some(record) = self.fault_memos.lock().unwrap().get(outpoint).cloned() {
+            return Ok(Some(record));
+        }
         self.storage
             .get_deferred_graph(&self.peer, &self.topic, outpoint)
             .await
@@ -1551,10 +1575,20 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         record.peer.clone_from(&self.peer);
         record.topic.clone_from(&self.topic);
         record.configured = self.configured_peer;
-        self.storage
+        let result = self
+            .storage
             .put_deferred_graph(&record)
             .await
-            .map_err(|e| GASPError::StorageError(e.to_string()))
+            .map_err(|e| GASPError::StorageError(e.to_string()))?;
+        if result == crate::gasp::DeferredGraphSave::Saved {
+            let mut cache = self.fault_memos.lock().unwrap();
+            if record.is_struck() {
+                cache.insert(record.outpoint.clone(), record);
+            } else {
+                cache.remove(&record.outpoint);
+            }
+        }
+        Ok(result)
     }
 
     async fn reserve_unanchorable_retry(
@@ -1565,13 +1599,17 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         record.peer.clone_from(&self.peer);
         record.topic.clone_from(&self.topic);
         record.configured = self.configured_peer;
-        self.storage
+        let reserved = self
+            .storage
             .reserve_unanchorable_retry(&record)
             .await
-            .map_err(|e| GASPError::StorageError(e.to_string()))
+            .map_err(|e| GASPError::StorageError(e.to_string()))?;
+        self.fault_memos.lock().unwrap().remove(&record.outpoint);
+        Ok(reserved)
     }
 
     async fn delete_deferred_graph(&self, outpoint: &str) -> Result<(), GASPError> {
+        self.fault_memos.lock().unwrap().remove(outpoint);
         self.storage
             .delete_deferred_graph(&self.peer, &self.topic, outpoint)
             .await

@@ -26,6 +26,7 @@ pub mod ef_deferred;
 pub mod error;
 mod gasp_cost;
 pub mod gasp_deferred;
+pub mod gasp_fault_memo;
 pub mod gasp_remote;
 mod gasp_speed;
 pub mod health_checker;
@@ -1447,31 +1448,37 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         Ok(e) => e,
         Err(e) => return Response::error(format!("complete-proofs: engine: {e}"), 500),
     };
-    // 1. transactions store (engine + ancestor fetcher). #228: backstop-gated —
-    //    /arc-ingest push is the primary source; only rows older than
-    //    PUSH_BACKSTOP_MIN_AGE_SECS are polled.
+    // 1. Transactions store (engine + ancestor fetcher). Submitted rows give
+    //    /arc-ingest its callback window; GASP rows have no callback to await.
     let completion_fetcher = transaction_proof_fetcher(env);
     let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
-    let (tx_completed, tx_fetch_failed) = match overlay_engine::gasp::race_or_deadline(
-        engine.complete_missing_proofs_with(
-            &completion_fetcher,
-            TRANSACTION_PROOF_COMPLETION_LIMIT,
-            backstop_age,
-        ),
-        crate::broadcaster::sleep_ms(TRANSACTION_PROOF_COMPLETION_BUDGET_MS),
-    )
-    .await
-    {
-        Some(Ok(s)) => (s.completed as u64, s.fetch_failed as u64),
-        Some(Err(e)) => {
-            worker::console_log!("complete-proofs: transactions error: {e}");
-            (0, 0)
-        }
-        None => {
-            worker::console_log!("complete-proofs: transaction deadline reached; retry next run");
-            (0, 0)
-        }
-    };
+    let (tx_completed, tx_fetch_failed, tx_early_gasp) =
+        match overlay_engine::gasp::race_or_deadline(
+            engine.complete_missing_proofs_with(
+                &completion_fetcher,
+                TRANSACTION_PROOF_COMPLETION_LIMIT,
+                backstop_age,
+            ),
+            crate::broadcaster::sleep_ms(TRANSACTION_PROOF_COMPLETION_BUDGET_MS),
+        )
+        .await
+        {
+            Some(Ok(s)) => (
+                s.completed as u64,
+                s.fetch_failed as u64,
+                s.early_gasp as u64,
+            ),
+            Some(Err(e)) => {
+                worker::console_log!("complete-proofs: transactions error: {e}");
+                (0, 0, 0)
+            }
+            None => {
+                worker::console_log!(
+                    "complete-proofs: transaction deadline reached; retry next run"
+                );
+                (0, 0, 0)
+            }
+        };
     // 2+3. Pot-store maintenance — chaser BEFORE the pot-beef bulk drain,
     //    encoded once in run_pot_maintenance (bsv-low#304 gate M-5; same
     //    order as the scheduled tick). Own fetchers, own budget cells.
@@ -1677,6 +1684,7 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         "spends_sample": ss.sample,
         "proofless_over_24h": flagged,
     });
+    answer["tx_early_gasp"] = serde_json::json!(tx_early_gasp);
     // bsv-low #649 D3-H1: the shared parked drain's pass (`null`: no app layer configured, nothing read); set apart
     // from the literal above, which sits at `json!`'s recursion limit.
     answer["change_parked"] = change_parked.unwrap_or(serde_json::Value::Null);

@@ -292,6 +292,8 @@ struct NotNow {
 /// (production) build returns the all-zero default.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ProofCompletionSummary {
+    /// Young walk-admitted rows selected without waiting for a callback.
+    pub early_gasp: usize,
     /// Stored transactions inspected this tick (the bounded page size).
     pub scanned: usize,
     /// Of `scanned`, how many still lacked a merkle proof for their own tx.
@@ -1848,7 +1850,12 @@ impl Engine {
                 };
 
                 attempted.push(output_index);
-                if let Err(e) = stored(bound, self.storage.insert_output(&output)).await {
+                if let Err(e) = stored(
+                    bound,
+                    self.storage.insert_output_with_origin(&output, finalize),
+                )
+                .await
+                {
                     error!("Error inserting output for topic {topic}: {e}");
                     report.fault(topic, "insert_output", e.to_string());
                     insert_faulted = true;
@@ -4315,6 +4322,7 @@ impl Engine {
         summary.scanned = candidates.len();
 
         for cand in candidates {
+            summary.early_gasp += usize::from(cand.early_gasp);
             // Read the stored BEEF for the subject's OWN bump by streaming
             // folds (one element in hand, no `Beef` built: NL-6); skip
             // anything unparseable (don't error the whole pass on one bad row).
@@ -4409,6 +4417,7 @@ impl Engine {
             fetch_failed = summary.fetch_failed,
             stitch_failed = summary.stitch_failed,
             already_proven = summary.already_proven,
+            early_gasp = summary.early_gasp,
             "[PROOF COMPLETION] pass complete"
         );
 
@@ -5203,6 +5212,7 @@ impl Engine {
             let mut held_back_graphs: u64 = 0;
             let mut dead_graphs = 0;
             let mut expired_swept = 0;
+            let mut memo_folded = 0;
             let mut unanchorable_graphs: u64 = 0;
             let mut unanchorable_cleared: u64 = 0;
             let mut strikes_refused: u64 = 0;
@@ -5692,6 +5702,7 @@ impl Engine {
                     // Engine 0.1.9: the roots dropped, each with why.
                     dead_graphs += sync.dead_recorded();
                     expired_swept += sync.expired_swept();
+                    memo_folded += sync.memo_folded();
                     unanchorable_graphs += sync.unanchorable_recorded();
                     unanchorable_cleared += sync.unanchorable_cleared();
                     // Engine 0.1.10: a strike not written is a fact.
@@ -5785,6 +5796,7 @@ impl Engine {
                     peer_results,
                     dead_graphs,
                     expired_swept,
+                    memo_folded,
                     unanchorable_graphs,
                     unanchorable_cleared,
                     strikes_refused,
@@ -6384,6 +6396,8 @@ pub struct TopicSyncResult {
     pub dead_graphs: u64,
     #[serde(default)]
     pub expired_swept: u64,
+    #[serde(default)]
+    pub memo_folded: u64,
     #[serde(default, flatten)]
     pub cost: crate::meter::SyncCost,
     #[serde(default)]
@@ -6513,7 +6527,7 @@ pub struct TopicSyncResult {
     #[serde(default)]
     pub unanchorable_cleared: u64,
     /// Strikes this sync could not write (engine 0.1.10,
-    /// `GASPSync::strikes_refused`): past `gasp::FAULT_RECORDS_PER_PEER_TOPIC`,
+    /// `GASPSync::strikes_refused`):
     /// at the storage's ceiling or on its fault. Each root is named in
     /// `faulted_roots` with its `refused` reason.
     #[serde(default)]
@@ -9119,6 +9133,7 @@ mod tests {
                 peer_results: HashMap::new(),
                 dead_graphs: 0,
                 expired_swept: 0,
+                memo_folded: 0,
                 unanchorable_graphs: 0,
                 unanchorable_cleared: 0,
                 strikes_refused: 0,
@@ -10495,7 +10510,7 @@ mod tests {
     /// 0.1.10 (room): a (peer, topic) whose deferred slots are all held by
     /// root retry obligations that never progress still records the root
     /// that holds its cursor: a fault record is bounded on its own
-    /// (`FAULT_RECORDS_PER_PEER_TOPIC`), so the strike is written on each
+    /// (the separate compact memo), so the strike is written on each
     /// faulted run and the third passes the cursor. On 0.1.9 every strike
     /// found "no room" (`gasp.rs:1717`), the root was named with no run and
     /// the cursor stayed at 0 for ever (fact 2: the keeper's eighth hand).
@@ -10540,7 +10555,9 @@ mod tests {
             .into_iter()
             .map(|r| r.outpoint)
             .collect();
-        assert_eq!(held.len(), obligations.len() + 1, "{held:?}");
+        // 0.1.14: the fault fact no longer consumes a partial-graph row.
+        assert_eq!(held.len(), obligations.len(), "{held:?}");
+        assert_eq!(store.fault_memos().len(), 1);
         assert!(obligations.iter().all(|o| held.contains(o)));
         let record = store
             .get_deferred_graph(host, "tm_test", &root)
@@ -10552,8 +10569,8 @@ mod tests {
 
     /// 0.1.10 (the reason, readable): a strike the bound or the storage
     /// refuses is counted (`strikes_refused`) and named on the root
-    /// (`refused`): `no_room` past `FAULT_RECORDS_PER_PEER_TOPIC` fault
-    /// records and at the storage's ceiling, `store_fault` on its fault.
+    /// (`refused`): `no_room` at the storage's own ceiling, `store_fault`
+    /// on its fault. The compact memo replaces the old 32-fact limit.
     /// The root stays a gap the cursor holds below, as on 0.1.9, where the
     /// refusal was a `warn!` alone.
     #[tokio::test]
@@ -10564,15 +10581,8 @@ mod tests {
             root,
             ..
         } = unanchorable_fixture();
-        // The fault bound: as many unanchorable roots, inside their backoff
-        // (passable, never asked), as a (peer, topic) may hold.
-        let later = (current_timestamp_ms() / 1000.0) as u64 + 3600;
-        for n in 0..crate::gasp::FAULT_RECORDS_PER_PEER_TOPIC {
-            let mut record = bare_record(n as u32, 1, "unanchorable:courier", true);
-            record.faults = crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS;
-            record.retry_at = later;
-            engine.storage().put_deferred_graph(&record).await.unwrap();
-        }
+        // 0.1.14: only an actual storage ceiling refuses a compact fact.
+        store.set_fault_memo_ceiling(Some(0));
         let refused_as = |result: &super::GASPSyncResult, why: &str| {
             let topic = &result.topics_synced["tm_test"];
             assert_eq!(topic.strikes_refused, 1, "{topic:?}");
@@ -10594,19 +10604,8 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // Room again among the fault records, none in the storage.
-        let gone = bare_record(0, 1, "", false).outpoint;
-        engine
-            .storage()
-            .delete_deferred_graph("https://budget.example", "tm_test", &gone)
-            .await
-            .unwrap();
-        store.set_deferred_graph_ceiling(Some(store.deferred_graphs().len()));
-        let result = engine.start_gasp_sync().await.unwrap();
-        refused_as(&result, crate::gasp::strike_refused::NO_ROOM);
-
         // The storage faults.
-        store.set_deferred_graph_ceiling(None);
+        store.set_fault_memo_ceiling(None);
         store.set_deferred_graph_put_fault(true);
         let result = engine.start_gasp_sync().await.unwrap();
         refused_as(&result, crate::gasp::strike_refused::STORE_FAULT);
@@ -10952,7 +10951,9 @@ mod tests {
         assert_eq!(topic.resumed_graphs, 0);
         assert_eq!(remote.asked.borrow().len(), asked);
         assert_eq!(courier.get(), couriered);
-        assert_eq!(store.deferred_graphs().len(), 1);
+        // 0.1.14: the obligation's fault fact lives outside partial graphs.
+        assert!(store.deferred_graphs().is_empty());
+        assert_eq!(store.fault_memos().len(), 1);
     }
 
     /// 0.1.11 (the idle count fires): a resumed pass of a held record that
@@ -10969,21 +10970,10 @@ mod tests {
     #[tokio::test]
     async fn obligations_0111_a_resume_that_appends_nothing_counts_on_every_ending() {
         let host = "https://budget.example";
-        // (c) The production shape, its strike refused: the fault bound is
-        // full of unanchorable roots waiting out their backoff.
+        // 0.1.14: exercise the same refusal ending through a real storage
+        // ceiling, because the old per-peer fault bound no longer exists.
         let fixture = obligation_fixture(1, 1, 0).await;
-        let later = (current_timestamp_ms() / 1000.0) as u64 + 3600;
-        for n in 0..crate::gasp::FAULT_RECORDS_PER_PEER_TOPIC {
-            let mut record = bare_record(100 + n as u32, 50, "unanchorable:courier", true);
-            record.faults = crate::gasp::UNANCHORABLE_AFTER_FAULTED_RUNS;
-            record.retry_at = later;
-            fixture
-                .engine
-                .storage()
-                .put_deferred_graph(&record)
-                .await
-                .unwrap();
-        }
+        fixture.store.set_fault_memo_ceiling(Some(0));
         let held = &fixture.obligations[0];
         let idle = crate::gasp::IDLE_RESUMES_BEFORE_BACKOFF;
         for run in 1..=idle {
@@ -12956,6 +12946,27 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Storage for FaultingStorage {
+        async fn insert_output_with_origin(
+            &self,
+            output: &Output,
+            gasp: bool,
+        ) -> Result<(), StorageError> {
+            if self.fail_insert_output.get() {
+                return Err(StorageError::Database(
+                    "D1_ERROR: storage overloaded".into(),
+                ));
+            }
+            self.inner.insert_output_with_origin(output, gasp).await
+        }
+        async fn read_fault_memos(
+            &self,
+            host: &str,
+            topic: &str,
+            outpoints: Option<&[String]>,
+        ) -> Result<crate::fault_memo::FaultMemoBatch, StorageError> {
+            self.inner.read_fault_memos(host, topic, outpoints).await
+        }
+
         async fn put_deferred_graph(
             &self,
             record: &crate::gasp::DeferredGraph,
@@ -13021,12 +13032,7 @@ mod tests {
                 .await
         }
         async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
-            if self.fail_insert_output.get() {
-                return Err(StorageError::Database(
-                    "D1_ERROR: storage overloaded".into(),
-                ));
-            }
-            self.inner.insert_output(output).await
+            self.insert_output_with_origin(output, false).await
         }
         async fn delete_output(
             &self,
@@ -13688,4 +13694,5 @@ mod tests {
         }
     }
     include!("minutes_tests.rs");
+    include!("memo_tests.rs");
 }

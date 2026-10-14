@@ -1581,6 +1581,19 @@ pub async fn health_invariants(
         .get(crate::gasp_deferred::COUNTER_GASP_FAULT_EXPIRED)
         .cloned()
         .unwrap_or(json!(0));
+    match crate::gasp_fault_memo::health(db).await {
+        Ok(rows) => {
+            body["gaspFaultMemoRows"] = json!(rows);
+        }
+        Err(error) => {
+            body["gaspFaultMemoRows"] = serde_json::Value::Null;
+            body["gaspFaultMemoFault"] = json!(error);
+        }
+    }
+    body["gaspFaultMemoFolded"] = counters
+        .get("gasp_fault_memo_folded_total")
+        .cloned()
+        .unwrap_or(json!(0));
     let mut resp = Response::from_json(&body)?.with_status(status);
     crate::routes::add_cors_headers(&mut resp);
     let _ = resp.headers_mut().set("Cache-Control", "no-store");

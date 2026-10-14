@@ -169,7 +169,14 @@ pub(crate) const PEER_HEALTH_SELECT_SQL: &str = "SELECT consecutive_failures, \
 struct TxBeefRow {
     txid: String,
     beef: Option<String>,
+    early_gasp: u32,
 }
+
+pub(crate) const PROOF_CANDIDATES_SQL: &str = "SELECT txid, hex(beef) AS beef,
+    CASE WHEN admission_origin='gasp' AND created_at>unixepoch()-?1 THEN 1 ELSE 0 END AS early_gasp
+    FROM transactions WHERE has_proof=0 AND retired_ms IS NULL
+      AND (admission_origin='gasp' OR created_at IS NULL OR created_at<=unixepoch()-?1)
+    ORDER BY RANDOM() LIMIT ?2";
 
 /// The two `transactions` upsert statements, factored so the real-SQLite
 /// tier executes the SHIPPED strings (a transcribed copy could drift).
@@ -187,18 +194,24 @@ struct TxBeefRow {
 /// BEATS THE LATCH: a stitch that lands has_proof = 1 clears the retire
 /// columns (the pot_beefs #2b rule, mirrored) so a false retire self-heals.
 pub(crate) const INSERT_OUTPUT_TX_SQL: &str =
-    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason, proofHeight) \
+    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason, proofHeight, admission_origin) \
      VALUES (?1, ?2, 0, COALESCE((SELECT created_at FROM transactions WHERE txid = ?1), unixepoch()), \
              (SELECT retired_ms FROM transactions WHERE txid = ?1), \
-             (SELECT retired_reason FROM transactions WHERE txid = ?1), NULL)";
+             (SELECT retired_reason FROM transactions WHERE txid = ?1), NULL, COALESCE((SELECT admission_origin FROM transactions WHERE txid=?1), 'submit'))";
+/// The GASP finalization path records that no broadcaster callback is expected.
+pub(crate) const INSERT_OUTPUT_TX_GASP_SQL: &str =
+    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason, proofHeight, admission_origin) \
+     VALUES (?1, ?2, 0, COALESCE((SELECT created_at FROM transactions WHERE txid = ?1), unixepoch()), \
+             (SELECT retired_ms FROM transactions WHERE txid = ?1), \
+             (SELECT retired_reason FROM transactions WHERE txid = ?1), NULL, 'gasp')";
 /// bsv-low M19 round 2 (review M4): `?4` = the block height the stitched
 /// bump anchors the tx to (the sweep's transactions leg windows by it), NULL
 /// when the write carries no proof.
 pub(crate) const UPDATE_TX_BEEF_SQL: &str =
-    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason, proofHeight) \
+    "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason, proofHeight, admission_origin) \
      VALUES (?1, ?2, ?3, COALESCE((SELECT created_at FROM transactions WHERE txid = ?1), unixepoch()), \
              CASE WHEN ?3 = 1 THEN NULL ELSE (SELECT retired_ms FROM transactions WHERE txid = ?1) END, \
-             CASE WHEN ?3 = 1 THEN NULL ELSE (SELECT retired_reason FROM transactions WHERE txid = ?1) END, ?4)";
+             CASE WHEN ?3 = 1 THEN NULL ELSE (SELECT retired_reason FROM transactions WHERE txid = ?1) END, ?4, COALESCE((SELECT admission_origin FROM transactions WHERE txid=?1), 'submit'))";
 
 /// The revalidation sweep's transactions leg (bsv-low M19 round 2, review
 /// M4): PROVEN rows anchored in a height window, newest first, keyed by
@@ -340,7 +353,11 @@ impl D1Storage {
             .into_iter()
             .filter_map(|r| {
                 crate::d1::beef_of_hex_column(r.beef).map(|beef| RebroadcastCandidate {
-                    tx: TransactionBeef { txid: r.txid, beef },
+                    tx: TransactionBeef {
+                        txid: r.txid,
+                        beef,
+                        early_gasp: false,
+                    },
                     attempts: r.attempts.unwrap_or(0.0) as i64,
                     last_ms: r.last_ms.unwrap_or(0.0) as i64,
                 })
@@ -427,6 +444,14 @@ impl Storage for D1Storage {
     // `low-overlay-beefs-beta` and `low-overlay-beefs`); the Worker has no
     // R2 binding at this commit and this lane adds none.
     async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
+        self.insert_output_with_origin(output, false).await
+    }
+
+    async fn insert_output_with_origin(
+        &self,
+        output: &Output,
+        gasp: bool,
+    ) -> Result<(), StorageError> {
         // INSERT OR IGNORE — dedup on (txid, outputIndex, topic) unique index
         Query::new(
             "INSERT OR IGNORE INTO outputs \
@@ -483,12 +508,16 @@ impl Storage for D1Storage {
                 // exists to close. A re-present is not proof of life; a
                 // genuine revival heals through the verified proof push
                 // (has_proof=1 outranks the latch at every consumer).
-                Query::new(INSERT_OUTPUT_TX_SQL)
-                    .bind(&*output.txid)
-                    .bind(beef.as_slice())
-                    .execute(&self.db)
-                    .await
-                    .map_err(d1_err)?;
+                Query::new(if gasp {
+                    INSERT_OUTPUT_TX_GASP_SQL
+                } else {
+                    INSERT_OUTPUT_TX_SQL
+                })
+                .bind(&*output.txid)
+                .bind(beef.as_slice())
+                .execute(&self.db)
+                .await
+                .map_err(d1_err)?;
             }
         }
 
@@ -1046,6 +1075,12 @@ impl Storage for D1Storage {
         &self,
         record: &overlay_engine::gasp::DeferredGraph,
     ) -> Result<overlay_engine::gasp::DeferredGraphSave, StorageError> {
+        if let Some(memo) = overlay_engine::fault_memo::FaultMemo::from_record(record, 0) {
+            crate::gasp_fault_memo::put(&self.db, &memo)
+                .await
+                .map_err(d1_err)?;
+            return Ok(overlay_engine::gasp::DeferredGraphSave::Saved);
+        }
         #[derive(Deserialize)]
         struct Saved {
             #[allow(dead_code)]
@@ -1121,6 +1156,15 @@ impl Storage for D1Storage {
                 );
             }
         }
+        if matches!(head, Ok(Some(_))) {
+            Query::new(crate::gasp_fault_memo::DELETE)
+                .bind(record.peer.as_str())
+                .bind(record.topic.as_str())
+                .bind(record.outpoint.as_str())
+                .execute(&self.db)
+                .await
+                .map_err(d1_err)?;
+        }
         Ok(match head.map_err(d1_err)? {
             Some(_) => overlay_engine::gasp::DeferredGraphSave::Saved,
             None => overlay_engine::gasp::DeferredGraphSave::AtCeiling,
@@ -1131,32 +1175,33 @@ impl Storage for D1Storage {
         &self,
         record: &overlay_engine::gasp::DeferredGraph,
     ) -> Result<bool, StorageError> {
-        let Some(prior) = record.unanchorable_retries.checked_sub(1) else {
+        let Some(class) = record.fault_class() else {
             return Ok(false);
         };
-        let json = serde_json::to_string(record)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        if json.len() > crate::gasp_deferred::DEFERRED_GRAPH_CHUNK_BYTES {
-            return Ok(false);
-        }
-        let saved: Option<serde_json::Value> =
-            Query::new(crate::gasp_deferred::RESERVE_UNANCHORABLE_SQL)
-                .bind(record.peer.as_str())
-                .bind(record.topic.as_str())
-                .bind(record.outpoint.as_str())
-                .bind(json.as_str())
-                .bind(json.len() as u64)
-                .bind(crate::gasp_deferred::retained_reason(record))
-                .bind(record.score)
-                .bind(prior)
-                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_TOTAL_BYTES)
-                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_MAX_BYTES_PER_HOST)
-                .bind(crate::gasp_deferred::DEFERRED_GRAPHS_DISCOVERED_MAX_BYTES)
-                .bind(overlay_engine::gasp::UNANCHORABLE_RETRIES)
-                .fetch_optional(&self.db)
-                .await
-                .map_err(d1_err)?;
+        let saved: Option<serde_json::Value> = Query::new(crate::gasp_fault_memo::RESERVE)
+            .bind(record.peer.as_str())
+            .bind(record.topic.as_str())
+            .bind(record.outpoint.as_str())
+            .bind(record.unanchorable_retries)
+            .bind(record.retry_at)
+            .bind(record.score)
+            .bind(class)
+            .bind(overlay_engine::gasp::UNANCHORABLE_RETRIES)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(d1_err)?;
         Ok(saved.is_some())
+    }
+
+    async fn read_fault_memos(
+        &self,
+        host: &str,
+        topic: &str,
+        outpoints: Option<&[String]>,
+    ) -> Result<overlay_engine::fault_memo::FaultMemoBatch, StorageError> {
+        crate::gasp_fault_memo::read(&self.db, host, topic, outpoints)
+            .await
+            .map_err(d1_err)
     }
 
     async fn find_deferred_graphs(
@@ -1190,6 +1235,12 @@ impl Storage for D1Storage {
         topic: &str,
         outpoint: &str,
     ) -> Result<Option<overlay_engine::gasp::DeferredGraph>, StorageError> {
+        if let Some(memo) = crate::gasp_fault_memo::get(&self.db, host, topic, outpoint)
+            .await
+            .map_err(d1_err)?
+        {
+            return Ok(Some(memo.into_record()));
+        }
         use crate::gasp_deferred::{read_deferred_graph, DeferredRead};
         match read_deferred_graph(&D1DeferredRows(&self.db), host, topic, outpoint).await? {
             DeferredRead::Absent => Ok(None),
@@ -1214,6 +1265,13 @@ impl Storage for D1Storage {
         topic: &str,
         outpoint: &str,
     ) -> Result<(), StorageError> {
+        Query::new(crate::gasp_fault_memo::DELETE)
+            .bind(host)
+            .bind(topic)
+            .bind(outpoint)
+            .execute(&self.db)
+            .await
+            .map_err(d1_err)?;
         Query::new(crate::gasp_deferred::DEFERRED_GRAPH_DELETE_SQL)
             .bind(host)
             .bind(topic)
@@ -1296,20 +1354,21 @@ impl Storage for D1Storage {
         // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: retired rows (corroborated
         // network-dead) leave the poll pool too — polling a proven double-
         // spend's proof is a courier GET burned every tick, forever.
-        let sql = format!(
-            "SELECT txid, hex(beef) as beef FROM transactions \
-             WHERE has_proof = 0 \
-               AND retired_ms IS NULL \
-               AND (created_at IS NULL OR created_at <= unixepoch() - {min_age_secs}) \
-             ORDER BY RANDOM() LIMIT {limit}"
-        );
-        let rows: Vec<TxBeefRow> = Query::new(sql).fetch_all(&self.db).await.map_err(d1_err)?;
+        let rows: Vec<TxBeefRow> = Query::new(PROOF_CANDIDATES_SQL)
+            .bind(min_age_secs)
+            .bind(limit)
+            .fetch_all(&self.db)
+            .await
+            .map_err(d1_err)?;
 
         Ok(rows
             .into_iter()
             .filter_map(|r| {
-                crate::d1::beef_of_hex_column(r.beef)
-                    .map(|beef| TransactionBeef { txid: r.txid, beef })
+                crate::d1::beef_of_hex_column(r.beef).map(|beef| TransactionBeef {
+                    txid: r.txid,
+                    beef,
+                    early_gasp: r.early_gasp != 0,
+                })
             })
             .collect())
     }

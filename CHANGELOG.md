@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.1.14] - 2026-10-14
+
+- Store GASP fault facts in `gasp_fault_memo`, separately from partial graphs.
+  The memo holds 20,000 rows per topic and evicts the oldest observations.
+  Faults no longer compete for 32 fault slots or 16 partial-graph slots.
+  Batched page lookups preserve cursor passability without node requests;
+  bounded due reads retain the six-hour backoff, four retry reservations,
+  terminal verdicts, score changes and expiry sweep. Storage failures still
+  count as refused strikes; no admission or proof rule is relaxed.
+  Known expiry is swept by index every tick; unknown legacy expiry is
+  reconciled against the shared expiry memo on folding and hourly maintenance.
+- Fold legacy fault records into the memo on reading a peer/topic, atomically
+  freeing their old rows and counting each fold once. Invariants expose
+  `gaspFaultMemoRows` and `gaspFaultMemoFolded`; scheduled logs name memo
+  expiry removals and folds.
+- Mark GASP admissions in `transactions.admission_origin`. Proof completion
+  can fetch their missing root proof immediately, while submitted rows retain
+  the 30-minute callback window. Completion logs report `early_gasp`, and
+  the admin response exposes `tx_early_gasp`.
+
+DEPLOYMENT NOTE: eight additive schema statements (245 to 253) create
+`gasp_fault_memo`, its due/age/expiry indexes, `gasp_fault_memo_size` and two
+size-maintenance triggers, and add `transactions.admission_origin` with a
+`submit` default. Existing transactions retain that default; historic origin
+is not inferred. Legacy zero-node fault records are folded in a counted D1
+batch when their peer/topic is read. Other partial graphs stay in place.
+Rollback to 0.1.13 ignores these additions and reads the old store as it then
+stands; folded fault records are not copied back, so their below-cursor retry
+obligations are unavailable to the older worker. No schema reversal is needed.
+Custom `Storage` implementations must implement `read_fault_memos` and
+`insert_output_with_origin`, keeping fault storage independent of graph slots.
+No version, dependency pin or runtime var changes are included.
+
 ## [0.1.13] - 2026-10-14
 
 - Accept `until: "tip"` with a positive `budget_ms` for one selected topic and
