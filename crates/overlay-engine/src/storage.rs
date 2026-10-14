@@ -698,6 +698,11 @@ pub mod memory {
         peer_yieldless: Mutex<HashMap<(String, String), YieldStreakRow>>,
     }
 
+    #[cfg(test)]
+    mod atomic_admission_tests {
+        include!("atomic_admission_tests.rs");
+    }
+
     /// `(count, first_at, last_at)` of a yieldless streak, on the logical
     /// clock.
     type YieldStreakRow = (u64, u64, u64);

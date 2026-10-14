@@ -125,3 +125,83 @@ then width 1,001 in one batch, capturing completed batches/statements and the
 exact thrown error. Run rollback pins against that same scratch binding, then
 delete the scratch database and verify deletion. Until an authorized hosted
 invocation and credential source are available, this part is blocked.
+
+## 3. Engine witnesses, RED and retained
+
+The engine's native MemoryStorage harness, as a private child test module
+(`storage.rs:702`), includes `src/atomic_admission_tests.rs`. This avoids adding
+an API just to inspect private tables. The two synthetic topic managers model
+registry TYPE 2 `[0, 2]` over a held coin and a proof topic admitting `[2]`.
+If the coin disappears the registry manager returns TYPE 1 `[0]`. The lookup
+hook refuses registry output 2 by payload, not by call count, on every attempt;
+it accepts and indexes the other outputs. One service avoids hook-order noise.
+The submitted fixture is a generated BEEF with a synthetic merkle path and no
+network access, submitted as `HistoricalTxNoSpv`, like the design's apply path.
+It is not the captured Zanaadu transaction or a cryptographic proof test.
+
+The canonical snapshot sorts all keys and serialized rows, and compares BYTES
+of outputs (including spent/consumedBy), transactions/BEEF, proven flags,
+applied rows, created timestamps, proof heights, sync state, peer health,
+deferred graphs, yieldless streaks, the logical clock and the lookup index.
+Only fault switches and instrumentation counters are excluded. No public
+Storage/Engine/LookupService API or implementation behavior was changed.
+
+Tests in `crates/overlay-engine/src/atomic_admission_tests.rs`:
+
+- `e657_refused_submit_leaves_store_byte_equal`, line 236, ignored with
+  `bsv-low #657: RED until A stages all admission writes and rolls back lookup refusal`.
+- `e657_same_bytes_same_word_after_refusal`, line 266, ignored with
+  `bsv-low #657: RED until A leaves a refused submit unchanged so identical bytes get the same word`.
+
+Executed both explicitly:
+
+```
+export CARGO_TARGET_DIR=/Volumes/Lanes/targets/engine-atomic-spike
+cargo test -p bsv-overlay-engine --features memory-storage --lib e657_ -- --ignored --nocapture
+```
+
+Exit 101, 2 failed at the intended assertions, not at setup or compilation:
+
+- Byte-equality assertion at line 247: canonical snapshot before 4,765 bytes,
+  after 18,409 bytes. The test first confirms exactly the intended lookup
+  refusal and registry STEAK `[0, 2]`.
+- Same-word assertion at line 279: first report has the registry lookup
+  refusal and proof topic applied; second report has no faults, registry
+  applied and proof deduplicated. The test also requires equal STEAKs and
+  unchanged bytes after both calls, once report equality can pass. The same
+  `TaggedBEEF` instance is passed to both submits.
+
+These are acceptance tests, not `should_panic` tests. They must remain ignored
+until A makes their laws true. When the typed refusal API lands, adapt the
+fixture's current fault-site check to that typed refusal without weakening
+byte equality, the second-topic coverage or same-word equality.
+
+## The build's first PR
+
+This spike must not freeze an API while hosted accounting remains unknown.
+First complete the hosted scratch measurement and preserve its boundary/error
+record. The design's first implementation PR is B: a pure lookup preflight for
+admitted and spent payloads before any engine mutation, and a typed refusal in
+the report, default-compatible hooks, with no-write and same-word regression
+pins and documentation of the writing-manager limitation. B does not establish
+whole-submit atomicity for managers that write while judging, storage failures,
+or service writes; do not unignore these A witnesses merely to ship B.
+
+A's first implementation slice should provide a staged unit with read-your-writes
+and a guarded all-or-nothing commit, first in MemoryStorage and the engine's D1
+backend. Include the managers' and lookup services' writes across every topic,
+map only the reserved guard marker to Precondition, and run external effects
+only after commit. Hold BEEF once. Turn on these exact two witnesses when they
+pass; then add each statement's fault, concurrent guard loss, #559, carried
+predecessors and after-commit acceptance tests from the design. No pass-through
+bridge may be presented as an atomicity guarantee.
+
+## Verification
+
+The explicit RED witness run compiled and failed both new assertions (above).
+The first normal `cargo test -p bsv-overlay-engine --features memory-storage`
+run skipped both witnesses, passed 205 library tests, and failed the existing
+`engine::tests::nl6e_the_script_walk_is_linear_in_a_bump_s_leaves` at its 10 s
+wall-clock deadline for 4,096 proven parents (830,907 bytes). It stopped before
+integration tests. This lane changes no code on that path; an isolated rerun
+is recorded below. No timing bound was relaxed.
