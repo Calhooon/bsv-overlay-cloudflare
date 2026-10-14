@@ -1208,3 +1208,16 @@ fn a1_c5_sql_batch_after_commit_and_deferral_share_unit() {
     assert_eq!(store.sql_statements(), stmts);
     assert_eq!(store.after_commit_intents().len(), 1);
 }
+
+#[tokio::test]
+async fn a1_c6_dry_judgement_is_explicit_and_read_only() {
+    let (engine, store, index, beef, _) = fixture_refusal(false).await;
+    let before = snapshot(&store, &index);
+    let walked = engine.walk(&beef, crate::engine::WalkBreachPolicy::NotNow, &NoEvidence).await.unwrap();
+    let dry = engine.judge_dry(&walked).await.unwrap();
+    assert_eq!(dry.steak[REGISTRY].outputs_to_admit, vec![0, 2]);
+    assert_eq!(dry.seq, 0);
+    assert!(before == snapshot(&store, &index));
+    assert!(store.sql_statements().is_empty());
+    assert_eq!(store.log_head(), 0);
+}

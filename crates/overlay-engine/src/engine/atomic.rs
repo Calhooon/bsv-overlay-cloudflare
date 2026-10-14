@@ -159,6 +159,35 @@ impl Engine {
         })
     }
 
+    /// Generic host's optional broadcast gate. The host supplies a read-only
+    /// executor through storage; Zanaadu's evidence path does not call this.
+    /// No broadcast or durable mutation occurs in this judgement.
+    pub async fn judge_dry(&self, walked: &Walked) -> Result<Admitted, AdmitRefusal> {
+        let dry = self.storage.admission_dry_run(&walked.evidence)
+            .map_err(|e| AdmitRefusal::transient("dry_judgement", e))?;
+        let tx = beef_limits::transaction_from_beef(
+            &walked.tagged_beef.beef, Some(&walked.txid), &beef_limits::ENGINE_BEEF_LIMITS,
+        ).map_err(|e| AdmitRefusal::transient("walked_payload", e))?;
+        let mut steak = Steak::new();
+        let mut report = MutationReport::default();
+        for topic in &walked.tagged_beef.topics {
+            let validation = self.validate_topic(
+                &tx, &walked.txid, topic, walked.tagged_beef.off_chain_values.as_deref(),
+                walked.mode, &TopicAdmittanceContext::DRY_RUN, None,
+            ).await;
+            if let Some(fault) = validation.read_fault {
+                return Err(AdmitRefusal::transient("dry_judgement", format!("{fault:?}")));
+            }
+            if validation.is_dupe { report.deduped_topics.push(topic.clone()); }
+            steak.insert(topic.clone(), validation.admittance);
+        }
+        if let Some(reason) = dry.failure() {
+            return Err(AdmitRefusal::transient("dry_judgement", reason));
+        }
+        let notes = self.storage.admission_log().map_or_else(Vec::new, LogTxn::notes);
+        Ok(Admitted { steak, report, seq: 0, notes })
+    }
+
     /// Judge and mutate inside the caller's open log transaction. No network
     /// operation occurs here. The executor MUST poll once and roll back on
     /// Pending or Err, and catch swallowed failed storage statements.
