@@ -385,3 +385,61 @@ async fn d44_a_lookup_refusal_is_terminal_and_its_descendants_take_its_word() {
     );
     assert!(rows[&format!("output {}.0", g.id())].starts_with("spent=false"));
 }
+
+// ============================================================================
+// The lens's LOW 1: the gate does not depend on the batch's order. A child
+// handed before its parent gets the in-order answer, gate and rows (GASP's
+// own batch is ancestors first already; another caller's need not be).
+// ============================================================================
+
+/// Each body's answer, gate and STEAK, and the rows, of one `admit_graph`.
+async fn judged_in(
+    fails: Option<String>,
+    graph: &[(&Transaction, u32)],
+    txs: &[&Transaction],
+) -> (String, BTreeMap<String, String>) {
+    let store = Rc::new(MemoryStorage::new());
+    let engine = engine(&store, fails, None);
+    let judged = admit(&engine, &store, graph).await;
+    let word = format!(
+        "answers {:?} gates {:?} steaks {:?}",
+        judged.answers, judged.gates, judged.steaks
+    );
+    (word, rows(&store, txs).await)
+}
+
+#[tokio::test]
+async fn d44_l1_a_child_handed_before_its_parent_gets_the_in_order_answer() {
+    let g = genesis(64, 1);
+    let c = child(&g, 0, 1);
+    let d = child(&c, 0, 1);
+    let chain = [&g, &c, &d];
+    let in_order = judged_in(None, &[(&g, 100), (&c, 101), (&d, 102)], &chain).await;
+    let reversed = judged_in(None, &[(&d, 102), (&c, 101), (&g, 100)], &chain).await;
+    println!("D44 L1 chain in order: {}", in_order.0);
+    println!("D44 L1 chain reversed: {}", reversed.0);
+    assert!(in_order.0.contains("Landed") && !in_order.0.contains("NotNow"));
+    assert_eq!(
+        reversed, in_order,
+        "a reversed chain: the same words and rows"
+    );
+
+    let [a, b, r] = fan_in();
+    let txs = [&a, &b, &r];
+    for fails in [None, Some(a.id())] {
+        let parents_first =
+            judged_in(fails.clone(), &[(&a, 100), (&b, 101), (&r, 102)], &txs).await;
+        let root_first = judged_in(fails.clone(), &[(&r, 102), (&a, 100), (&b, 101)], &txs).await;
+        println!(
+            "D44 L1 fan-in fails={}: root first {}",
+            fails.is_some(),
+            root_first.0
+        );
+        assert_eq!(
+            root_first,
+            parents_first,
+            "a root-first fan-in (the manager erring on a: {}): the same words and rows",
+            fails.is_some()
+        );
+    }
+}

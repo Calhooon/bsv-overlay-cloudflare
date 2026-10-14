@@ -627,6 +627,58 @@ async fn w8_d44_the_census_row_carries_the_gates_reason_per_body() {
     panic!("no run took the erring parent first in 64 tries");
 }
 
+/// The census of every world above whose finalize order is our node's
+/// (`compute_ordered_beefs`, ancestors first), with the fan-in in the order
+/// w8 takes (the erring parent first), frozen on `8ed47d8` (the gate's tip,
+/// before the lens's corrections): the sort of the gate's bodies (LOW 1), a
+/// walk refusal handed to the gate (LOW 2) and the NOTEs leave every row as
+/// it was. Only the wall clock (`shadow_ms`) is left out.
+const ORDERED_CENSUS_DIGEST: &str =
+    "38044a236d2293d8f93942871c3dcaafd4e53cf4c6d13258802c19fbe6c29f2d";
+
+#[tokio::test]
+async fn w9_the_census_of_every_ordered_world_is_the_gates_tips() {
+    let mut lines = Vec::new();
+    let mut push = |name: &str, run: &Run| {
+        for row in &run.census {
+            let mut row = row.clone();
+            row.shadow_ms = 0;
+            lines.push(format!("{name} {}", serde_json::to_string(&row).unwrap()));
+        }
+    };
+    for budgeted in [false, true] {
+        let mut scenario = recorded_world();
+        scenario.budgeted = budgeted;
+        push(
+            &format!("recorded budgeted={budgeted}"),
+            &beside(&scenario).await,
+        );
+    }
+    push("erring chain", &beside(&erring_chain()).await);
+    for (name, scenario) in [
+        ("chaos 01", chaos_01()),
+        ("chaos 02", chaos_02()),
+        ("chaos 03", chaos_03()),
+        ("chaos 04", chaos_04()),
+    ] {
+        push(name, &beside(&scenario).await);
+    }
+    let fan_in = 'found: {
+        for _ in 0..64 {
+            let shadow = beside_unordered(&erring_fan_in(0)).await;
+            let graph = &shadow.of(ShadowKind::Materialization)[0];
+            if json(&graph.served.bytes)["landed"] == serde_json::json!([]) {
+                break 'found shadow;
+            }
+        }
+        panic!("no run took the erring parent first in 64 tries");
+    };
+    push("fan-in erring first", &fan_in);
+    let digest = digest(&lines);
+    println!("W9 ORDERED CENSUS: {} rows, digest {digest}", lines.len());
+    assert_eq!(digest, ORDERED_CENSUS_DIGEST, "the census moved");
+}
+
 // ============================================================================
 // Witness 3: the four GASP chaos records of the HTTP corpus
 // (`parity-harness/corpus/xanaverse/chaos/0{1..4}_*.json`, Zanaadu), each a
@@ -656,8 +708,7 @@ fn assert_shadowed(run: &Run, bodies: usize, graphs: usize) {
 
 /// 01_downtime_recovery (the re-sent range): the peer is down for a tick and
 /// re-serves the whole range on the next, a duplicate body among it.
-#[tokio::test]
-async fn w3_chaos_01_downtime_recovery() {
+fn chaos_01() -> Scenario {
     let parent = genesis(11, 2);
     let a = child(&parent, 0, 1);
     let b = child(&parent, 1, 1);
@@ -668,6 +719,12 @@ async fn w3_chaos_01_downtime_recovery() {
     scenario.ticks = vec![|remote, _| remote.down.set(true), |remote, _| {
         remote.down.set(false)
     }];
+    scenario
+}
+
+#[tokio::test]
+async fn w3_chaos_01_downtime_recovery() {
+    let scenario = chaos_01();
     let shadow = beside(&scenario).await;
     print_census("01_downtime_recovery", &shadow);
     assert!(shadow.results[0].contains("peer down"), "tick 1 fails safe");
@@ -677,8 +734,7 @@ async fn w3_chaos_01_downtime_recovery() {
 
 /// 02_partition_heal (the partial listing): the high-score half is withheld
 /// for a tick, then served.
-#[tokio::test]
-async fn w3_chaos_02_partition_heal() {
+fn chaos_02() -> Scenario {
     let txs: Vec<_> = (0..6).map(|n| genesis(20 + n, 1)).collect();
     let listed = (0..6).map(|i| (i, 0, (i + 1) as f64)).collect();
     let mut scenario = Scenario::honest(txs, listed);
@@ -686,6 +742,12 @@ async fn w3_chaos_02_partition_heal() {
         |remote, _| remote.withhold_from.set(Some(4.0)),
         |remote, _| remote.withhold_from.set(None),
     ];
+    scenario
+}
+
+#[tokio::test]
+async fn w3_chaos_02_partition_heal() {
+    let scenario = chaos_02();
     let shadow = beside(&scenario).await;
     print_census("02_partition_heal", &shadow);
     assert_shadowed(&shadow, 6, 6);
@@ -704,8 +766,7 @@ async fn w3_chaos_02_partition_heal() {
 /// 03_chain_fork: the canonical branch admits; the orphaned tip, whose proof
 /// no tracker knows, is discarded by the anchor check and never finalized,
 /// so it is never shadowed either.
-#[tokio::test]
-async fn w3_chaos_03_chain_fork() {
+fn chaos_03() -> Scenario {
     let txs: Vec<_> = (0..4).map(|n| genesis(30 + n, 1)).collect();
     let mut scenario = Scenario::honest(
         txs,
@@ -714,6 +775,13 @@ async fn w3_chaos_03_chain_fork() {
     scenario.tracker = Some(KnownRoots::of(&scenario.nodes));
     let orphan = scenario.txs[2].id();
     scenario.nodes[2].proof = Some(fabricated_proof(&orphan, 102));
+    scenario
+}
+
+#[tokio::test]
+async fn w3_chaos_03_chain_fork() {
+    let scenario = chaos_03();
+    let orphan = scenario.txs[2].id();
     let shadow = beside(&scenario).await;
     print_census("03_chain_fork", &shadow);
     assert!(shadow.results[0].contains("\"discarded_graphs\":1"));
@@ -724,8 +792,7 @@ async fn w3_chaos_03_chain_fork() {
 /// 04_cursor_no_skip_on_transient (the cursor skip): the middle UTXO's node
 /// blips on the first tick; the cursor stays below it and the next tick
 /// admits it.
-#[tokio::test]
-async fn w3_chaos_04_cursor_no_skip_on_transient() {
+fn chaos_04() -> Scenario {
     let txs: Vec<_> = (0..3).map(|n| genesis(40 + n, 1)).collect();
     let mut scenario = Scenario::honest(txs, vec![(0, 0, 10.0), (1, 0, 20.0), (2, 0, 30.0)]);
     scenario.ticks = vec![
@@ -734,6 +801,12 @@ async fn w3_chaos_04_cursor_no_skip_on_transient() {
         },
         |remote, _| remote.faults.borrow_mut().clear(),
     ];
+    scenario
+}
+
+#[tokio::test]
+async fn w3_chaos_04_cursor_no_skip_on_transient() {
+    let scenario = chaos_04();
     let shadow = beside(&scenario).await;
     print_census("04_cursor_no_skip_on_transient", &shadow);
     assert!(shadow.rows["cursor"].parse::<u64>().unwrap() >= 20);
