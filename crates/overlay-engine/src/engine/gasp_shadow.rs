@@ -48,6 +48,8 @@ pub(crate) struct FinalizeShadow {
     prepared: Prepared,
     landed: Vec<String>,
     stopped: Option<(String, Word)>,
+    /// The topic managers' errors the served submits met.
+    manager_errors: Vec<String>,
     /// The last served body's word.
     last: Option<Word>,
 }
@@ -71,6 +73,9 @@ pub(crate) enum ShadowJob {
     Body(Box<BodyJob>),
     Graph(Box<GraphJob>),
 }
+
+/// The topic managers' errors one capture keeps.
+const MANAGER_ERRORS_KEPT: usize = 64;
 
 /// The served finalize's evidence for a GASP body: none. It does not walk
 /// (`historical-tx-no-spv`, the anchor check already ran) and asks no network,
@@ -194,18 +199,38 @@ async fn materialized_rows(
     rows
 }
 
-/// A graph's materialization as one word: what landed, where it stopped, and
-/// the rows. Its status is the stopping body's (200 when all landed).
+/// A graph's materialization as one word: what landed, where it stopped (the
+/// stopping body's whole word: its txid, status and bytes), the topic
+/// managers' errors its bodies met, and the rows. Its status is 200 only when
+/// nothing stopped; else the stopping body's, and 503 when that body's own
+/// word is 200 (a durable report whose topic did not land, a manager that
+/// failed: the finalize's "not now", its graph held below the cursor; the
+/// shadow lens's MEDIUM 2).
 fn materialization_word(
     landed: &[String],
     stopped: Option<&(String, Word)>,
+    manager_errors: &[String],
     rows: &BTreeMap<String, String>,
 ) -> Word {
     Word {
-        status: stopped.map_or(200, |(_, word)| word.status),
+        status: stopped.map_or(
+            200,
+            |(_, word)| {
+                if word.status == 200 {
+                    503
+                } else {
+                    word.status
+                }
+            },
+        ),
         bytes: serde_json::json!({
             "landed": landed,
-            "stopped": stopped.map(|(txid, _)| txid),
+            "stopped": stopped.map(|(txid, word)| serde_json::json!({
+                "txid": txid,
+                "status": word.status,
+                "bytes": String::from_utf8_lossy(&word.bytes),
+            })),
+            "manager_errors": manager_errors,
             "rows": rows,
         })
         .to_string()
@@ -343,19 +368,53 @@ impl Engine {
             prepared,
             landed: Vec::new(),
             stopped: None,
+            manager_errors: Vec::new(),
             last: None,
         }
     }
 
     /// One body's snapshot, taken before its served submit (`body` is that
-    /// one BEEF).
+    /// one BEEF); the managers' errors of that submit are captured from here.
     pub(crate) async fn shadow_body_begin(
         &self,
         shadow: &FinalizeShadow,
         body: &[Vec<u8>],
     ) -> Prepared {
-        self.shadow_prepare(shadow.host.as_ref(), &shadow.peer, &shadow.topic, body)
-            .await
+        let prepared = self
+            .shadow_prepare(shadow.host.as_ref(), &shadow.peer, &shadow.topic, body)
+            .await;
+        self.capture_manager_errors();
+        prepared
+    }
+
+    /// From now on, keep each topic manager's error (`judge`'s `Err`).
+    pub(crate) fn capture_manager_errors(&self) {
+        *self.manager_errors.borrow_mut() = Some(Vec::new());
+    }
+
+    /// The errors kept since the capture began; the capture goes on.
+    pub(crate) fn take_manager_errors(&self) -> Vec<String> {
+        self.manager_errors
+            .borrow_mut()
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// The errors kept since the capture began; the capture ends.
+    fn end_manager_errors(&self) -> Vec<String> {
+        self.manager_errors.borrow_mut().take().unwrap_or_default()
+    }
+
+    /// A topic manager answered `Err` (from `judge`): kept while captured,
+    /// at most [`MANAGER_ERRORS_KEPT`] (a capture a dropped finalize left on
+    /// is ended by the next body or the drain).
+    pub(crate) fn note_manager_error(&self, topic: &str, error: &TopicManagerError) {
+        if let Some(errors) = self.manager_errors.borrow_mut().as_mut() {
+            if errors.len() < MANAGER_ERRORS_KEPT {
+                errors.push(format!("topic_manager.{topic}: {error}"));
+            }
+        }
     }
 
     /// Queue one body's comparison: its snapshot, and the served answer.
@@ -366,8 +425,11 @@ impl Engine {
         position: usize,
         beef: &[u8],
         served: &Result<(Steak, MutationReport), EngineError>,
+        not_landed: Option<&str>,
     ) {
-        let word = Word::served(served);
+        let errors = self.end_manager_errors();
+        let word = Word::served(served, not_landed, &errors);
+        shadow.manager_errors.extend(errors);
         shadow.last = Some(word.clone());
         let Some(prepared) = prepared else {
             return;
@@ -394,7 +456,12 @@ impl Engine {
         self.shadow_jobs
             .borrow_mut()
             .push(ShadowJob::Graph(Box::new(GraphJob {
-                served: materialization_word(&shadow.landed, shadow.stopped.as_ref(), &rows),
+                served: materialization_word(
+                    &shadow.landed,
+                    shadow.stopped.as_ref(),
+                    &shadow.manager_errors,
+                    &rows,
+                ),
                 peer: shadow.peer,
                 topic: shadow.topic,
                 graph: shadow.root,
@@ -410,6 +477,7 @@ impl Engine {
         let Some(host) = self.gasp_shadow_host() else {
             return;
         };
+        self.end_manager_errors();
         let jobs = std::mem::take(&mut *self.shadow_jobs.borrow_mut());
         for job in jobs {
             let row = match job {
@@ -509,17 +577,20 @@ impl Engine {
             row.shadow_judgement = judged.ok().map(|admitted| judgement_of(&admitted.steak));
             let mut word = Word::not_shadowed("no unit ran");
             let seqs = &mut row.shadow_seqs;
+            let engine = &snapshot.engine;
+            engine.capture_manager_errors();
             admit_graph_observed(
-                &snapshot.engine,
+                engine,
                 snapshot.runner.as_ref(),
                 std::slice::from_ref(&walked),
                 &mut |_, answer| {
                     if let Ok(committed) = answer {
                         seqs.push(committed.seq);
                     }
-                    word = Word::admission(answer);
+                    word = Word::admission(answer, &engine.take_manager_errors());
                 },
             );
+            engine.end_manager_errors();
             match spent.over() {
                 Some(why) => Word::not_shadowed(why),
                 None => word,
@@ -586,8 +657,10 @@ impl Engine {
             let mut landed = Vec::new();
             let mut refused = None;
             let seqs = &mut row.shadow_seqs;
+            let engine = &snapshot.engine;
+            engine.capture_manager_errors();
             admit_graph_observed(
-                &snapshot.engine,
+                engine,
                 snapshot.runner.as_ref(),
                 &walked,
                 &mut |body, answer| match answer {
@@ -598,11 +671,12 @@ impl Engine {
                     Err(refusal) => refused = Some((body.txid.clone(), Word::refusal(refusal))),
                 },
             );
+            let errors = engine.end_manager_errors();
             let stopped = refused.or(stopped);
             let rows = materialized_rows(snapshot.engine.storage(), &row.topic, &job.beefs).await;
             match spent.over() {
                 Some(why) => Word::not_shadowed(why),
-                None => materialization_word(&landed, stopped.as_ref(), &rows),
+                None => materialization_word(&landed, stopped.as_ref(), &errors, &rows),
             }
         };
         row.shadow_ms = spent.ms();

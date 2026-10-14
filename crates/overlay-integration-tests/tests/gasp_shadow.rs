@@ -304,18 +304,15 @@ async fn w2_the_finalize_materialization_is_compared_to_the_served_materializati
             .as_object()
             .is_some_and(|rows| !rows.is_empty()));
         assert!(word["stopped"].is_null());
+        assert_eq!(row.served.status, 200, "nothing stopped");
     }
 
     // A manager that errs at the finalize on the middle link: the served
     // finalize stops there (its graph's cursor waits); A's unit commits the
     // topic's empty judgement (F5, C7) and its graph goes on to the next
-    // link, which waits for its unlanded predecessor. Each body is the same
-    // word; the graph is not.
-    let g = genesis(7, 1);
-    let c = child(&g, 0, 1);
-    let d = child(&c, 0, 1);
-    let mut scenario = Scenario::honest(vec![g, c, d], vec![(2, 0, 1.0)]);
-    scenario.fails_at_finalize = Some(scenario.txs[1].id());
+    // link, which waits for its unlanded predecessor. The erring body's words
+    // differ by the served stop alone (w2b); the graph's do not agree.
+    let scenario = erring_chain();
     let shadow = beside(&scenario).await;
     print_census("W2 delta", &shadow);
     let graph = shadow.of(ShadowKind::Materialization);
@@ -329,19 +326,29 @@ async fn w2_the_finalize_materialization_is_compared_to_the_served_materializati
     let served: serde_json::Value = serde_json::from_slice(&graph[0].served.bytes).unwrap();
     let ours: serde_json::Value = serde_json::from_slice(&graph[0].shadow.bytes).unwrap();
     assert_eq!(served["landed"], serde_json::json!([scenario.txs[0].id()]));
-    assert_eq!(served["stopped"], serde_json::json!(scenario.txs[1].id()));
+    assert_eq!(
+        served["stopped"]["txid"],
+        serde_json::json!(scenario.txs[1].id())
+    );
     assert_eq!(
         ours["landed"],
         serde_json::json!([scenario.txs[0].id(), scenario.txs[1].id()])
     );
-    assert_eq!(ours["stopped"], serde_json::json!(scenario.txs[2].id()));
+    assert_eq!(
+        ours["stopped"]["txid"],
+        serde_json::json!(scenario.txs[2].id())
+    );
     assert_eq!(
         served["rows"], ours["rows"],
         "the rows agree; the landing does not"
     );
     let bodies = shadow.of(ShadowKind::Body);
     assert_eq!(bodies.len(), 2, "the served finalize submitted two bodies");
-    assert!(bodies.iter().all(|r| r.delta == DeltaClass::Same));
+    assert_eq!(
+        bodies.iter().map(|r| r.delta).collect::<Vec<_>>(),
+        [DeltaClass::Same, DeltaClass::Words],
+        "the erring body's word says the served finalize stopped there"
+    );
 }
 
 /// The w2 chain `g <- c <- d`, the manager erring on `c` at the finalize.

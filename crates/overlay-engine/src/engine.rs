@@ -139,6 +139,10 @@ pub struct Engine {
     /// The comparisons a peer's sync queued, run after it (outside its race).
     #[cfg(feature = "gasp-shadow")]
     shadow_jobs: std::cell::RefCell<Vec<gasp_shadow::ShadowJob>>,
+    /// The topic managers' errors while a shadow comparison captures them
+    /// (`None`: not capturing, nothing is kept).
+    #[cfg(feature = "gasp-shadow")]
+    manager_errors: std::cell::RefCell<Option<Vec<String>>>,
     config: EngineConfig,
 }
 
@@ -1142,6 +1146,8 @@ impl Engine {
             shadow_budget: crate::gasp_shadow::ShadowBudget::default(),
             #[cfg(feature = "gasp-shadow")]
             shadow_jobs: std::cell::RefCell::default(),
+            #[cfg(feature = "gasp-shadow")]
+            manager_errors: std::cell::RefCell::default(),
             config,
         }
     }
@@ -3606,7 +3612,7 @@ impl Engine {
             .collect::<Vec<u8>>();
         // Under a finalize submit's bound a manager that does not answer
         // is a manager that failed: nothing is written for the topic.
-        bounded(
+        let judged = bounded(
             bound,
             manager.identify_admissible_outputs(
                 // The ONE engine parse of the submitted BEEF, shared by
@@ -3623,7 +3629,14 @@ impl Engine {
         )
         .await
         .map_err(TopicManagerError::Other)
-        .and_then(|judged| judged)
+        .and_then(|judged| judged);
+        // GASP's shadow: a manager's error is named on the census row (the
+        // shadow lens's MEDIUM 2). Only while a comparison captures it.
+        #[cfg(feature = "gasp-shadow")]
+        if let Err(e) = &judged {
+            self.note_manager_error(topic, e);
+        }
+        judged
     }
 
     /// Whether the door may land a carried predecessor into `topic` (the
@@ -5764,11 +5777,7 @@ impl Engine {
                     )
                     .await
                 };
-                #[cfg(feature = "gasp-shadow")]
-                if let Some(shadow) = shadow.as_mut() {
-                    self.shadow_body_served(shadow, body_snapshot, position, beef_bytes, &outcome);
-                }
-                let not_landed = match outcome {
+                let not_landed = match &outcome {
                     Ok((_, report)) => {
                         let landed = report.is_durable()
                             && (report.applied_topics.contains(&graph.topic)
@@ -5783,6 +5792,17 @@ impl Engine {
                     }
                     Err(e) => Some(e.to_string()),
                 };
+                #[cfg(feature = "gasp-shadow")]
+                if let Some(shadow) = shadow.as_mut() {
+                    self.shadow_body_served(
+                        shadow,
+                        body_snapshot,
+                        position,
+                        beef_bytes,
+                        &outcome,
+                        not_landed.as_deref(),
+                    );
+                }
                 if let Some(why) = not_landed {
                     warn!(
                         "[GASP SYNC] A finalize submit for topic {} did not land ({why}); the rest of its graph is not submitted",

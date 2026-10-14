@@ -195,8 +195,19 @@ pub struct GaspCensusRow {
 
 impl Word {
     /// Today's finalize answer (the slice's `Word::legacy`), its STEAK in
-    /// topic order.
-    pub fn served(result: &Result<(Steak, MutationReport), EngineError>) -> Self {
+    /// topic order. Beside the STEAK the bytes carry what landed
+    /// (`applied_topics`, `deduped_topics`), why the served finalize did not
+    /// count the body landed (`not_landed`: the finalize loop's own reason;
+    /// `null` when it landed, and always `null` for A's unit, which commits
+    /// and goes on) and the topic managers' errors the submit met
+    /// (`manager_errors`, `topic_manager.<topic>: <error>`): a manager that
+    /// failed and one that admitted nothing read apart (the shadow lens's
+    /// MEDIUM 2).
+    pub fn served(
+        result: &Result<(Steak, MutationReport), EngineError>,
+        not_landed: Option<&str>,
+        manager_errors: &[String],
+    ) -> Self {
         match result {
             Ok((steak, report)) => {
                 let mut landed_topics: Vec<_> = steak
@@ -224,12 +235,20 @@ impl Word {
                     500
                 };
                 let steak: BTreeMap<_, _> = steak.iter().collect();
+                let mut applied = report.applied_topics.clone();
+                applied.sort();
+                let mut deduped = report.deduped_topics.clone();
+                deduped.sort();
                 Self {
                     status,
                     bytes: serde_json::json!({
                         "steak": steak,
                         "refused": report.refused.iter().map(|r| format!("{}/{}/{}: {}", r.topic, r.service, r.site, r.error)).collect::<Vec<_>>(),
                         "faults": report.faults.iter().map(|f| format!("{}/{}: {}", f.topic, f.site, f.error)).collect::<Vec<_>>(),
+                        "applied_topics": applied,
+                        "deduped_topics": deduped,
+                        "not_landed": not_landed,
+                        "manager_errors": manager_errors,
                     })
                     .to_string()
                     .into_bytes(),
@@ -248,13 +267,18 @@ impl Word {
         }
     }
 
-    /// A's unit, as the `on` runner's door will word it.
-    pub fn admission(result: &Result<Committed, AdmitRefusal>) -> Self {
+    /// A's unit, as the `on` runner's door will word it, with the managers'
+    /// errors its unit met.
+    pub fn admission(result: &Result<Committed, AdmitRefusal>, manager_errors: &[String]) -> Self {
         match result {
             Ok(Committed {
                 output: UnitOutput::Admitted(admitted),
                 ..
-            }) => Self::served(&Ok((admitted.steak.clone(), admitted.report.clone()))),
+            }) => Self::served(
+                &Ok((admitted.steak.clone(), admitted.report.clone())),
+                None,
+                manager_errors,
+            ),
             Ok(Committed {
                 output: UnitOutput::Done,
                 ..
