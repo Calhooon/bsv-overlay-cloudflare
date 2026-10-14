@@ -1563,6 +1563,22 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             .await
             .map_err(|e| GASPError::StorageError(e.to_string()))
     }
+
+    // Keyed by topic, not peer: the expiry is read from the outpoint's own
+    // bytes, so any peer that serves it serves the same dead advert.
+    async fn remember_expired(&self, outpoint: &str, expiry: u64) -> Result<(), GASPError> {
+        self.storage
+            .remember_expired_outpoint(&self.topic, outpoint, expiry)
+            .await
+            .map_err(|e| GASPError::StorageError(e.to_string()))
+    }
+
+    async fn remembered_expired(&self, outpoints: &[String]) -> Result<Vec<String>, GASPError> {
+        self.storage
+            .find_expired_outpoints(&self.topic, outpoints)
+            .await
+            .map_err(|e| GASPError::StorageError(e.to_string()))
+    }
 }
 
 // ============================================================================

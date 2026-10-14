@@ -386,6 +386,41 @@ pub trait Storage {
         topic: &str,
         outpoint: &str,
     ) -> Result<(), StorageError>;
+
+    // ========================================================================
+    // Expired GASP roots (engine 0.1.8)
+    // ========================================================================
+
+    /// Remember that the GASP walk refused `outpoint` of `topic` because its
+    /// own advert had expired at `expiry` (unix seconds, read from the
+    /// output's bytes bound to its txid, never a peer's word). The backend
+    /// keeps the row until `max(expiry, now) +`
+    /// [`crate::gasp::EXPIRED_OUTPOINT_MEMO_SECS`] on its own clock and at
+    /// most [`crate::gasp::EXPIRED_OUTPOINT_MEMO_MAX_ROWS`] rows a topic, so
+    /// a later sync skips it with no node fetch.
+    ///
+    /// Defaulted, unlike the deferred-graph methods: a backend or wrapper
+    /// that does not forward these is fail-safe, the walk fetches and
+    /// refuses the dead again each run as it did before 0.1.8. A wrapper
+    /// forwards both all the same.
+    async fn remember_expired_outpoint(
+        &self,
+        _topic: &str,
+        _outpoint: &str,
+        _expiry: u64,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Of `outpoints`, those of `topic` remembered as expired and not yet
+    /// swept (see [`Self::remember_expired_outpoint`]).
+    async fn find_expired_outpoints(
+        &self,
+        _topic: &str,
+        _outpoints: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        Ok(Vec::new())
+    }
 }
 
 /// A (host, topic)'s yieldless streak (bsv-low #555, the delta-2 fold's
@@ -609,6 +644,23 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
     ) -> Result<(), StorageError> {
         (**self).delete_deferred_graph(host, topic, outpoint).await
     }
+    async fn remember_expired_outpoint(
+        &self,
+        topic: &str,
+        outpoint: &str,
+        expiry: u64,
+    ) -> Result<(), StorageError> {
+        (**self)
+            .remember_expired_outpoint(topic, outpoint, expiry)
+            .await
+    }
+    async fn find_expired_outpoints(
+        &self,
+        topic: &str,
+        outpoints: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        (**self).find_expired_outpoints(topic, outpoints).await
+    }
 }
 
 // ============================================================================
@@ -703,6 +755,10 @@ pub mod memory {
         deferred_graph_byte_ceiling: Mutex<Option<usize>>,
         /// Test knob: every save of a deferred graph faults.
         deferred_graph_put_fault: Mutex<bool>,
+        /// Expired GASP roots (engine 0.1.8) keyed by (topic, outpoint):
+        /// `(keep_until, written_at)` on the logical clock. Models the D1
+        /// `gasp_expired_outpoints` table.
+        expired_outpoints: Mutex<HashMap<(String, String), (u64, u64)>>,
         /// How many saves of a deferred graph were ASKED (written, refused
         /// or faulted).
         deferred_graph_put_attempts: Mutex<u64>,
@@ -733,6 +789,21 @@ pub mod memory {
         /// Advance the deterministic logical clock by `secs` (test hook for
         /// the push-primary backstop age gate — see
         /// [`Storage::find_transactions_for_proof_check`]).
+        /// The expired roots remembered for `topic` and not yet swept.
+        pub fn expired_outpoints(&self, topic: &str) -> Vec<String> {
+            let now = *self.clock_secs.lock().unwrap();
+            let mut held: Vec<String> = self
+                .expired_outpoints
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((t, _), (keep, _))| t == topic && *keep > now)
+                .map(|((_, o), _)| o.clone())
+                .collect();
+            held.sort();
+            held
+        }
+
         pub fn advance_clock(&self, secs: u64) {
             *self.clock_secs.lock().unwrap() += secs;
         }
@@ -1371,6 +1442,55 @@ pub mod memory {
                 outpoint.to_string(),
             ));
             Ok(())
+        }
+
+        async fn remember_expired_outpoint(
+            &self,
+            topic: &str,
+            outpoint: &str,
+            expiry: u64,
+        ) -> Result<(), StorageError> {
+            let now = *self.clock_secs.lock().unwrap();
+            let mut held = self.expired_outpoints.lock().unwrap();
+            held.retain(|_, (keep, _)| *keep > now);
+            held.insert(
+                (topic.to_string(), outpoint.to_string()),
+                (
+                    expiry.max(now) + crate::gasp::EXPIRED_OUTPOINT_MEMO_SECS,
+                    now,
+                ),
+            );
+            // The bound: the most recently written rows of the topic stay.
+            let mut of_topic: Vec<(u64, String)> = held
+                .iter()
+                .filter(|((t, _), _)| t == topic)
+                .map(|((_, o), (_, at))| (*at, o.clone()))
+                .collect();
+            let cap = crate::gasp::EXPIRED_OUTPOINT_MEMO_MAX_ROWS;
+            if of_topic.len() > cap {
+                of_topic.sort();
+                for (_, o) in &of_topic[..of_topic.len() - cap] {
+                    held.remove(&(topic.to_string(), o.clone()));
+                }
+            }
+            Ok(())
+        }
+
+        async fn find_expired_outpoints(
+            &self,
+            topic: &str,
+            outpoints: &[String],
+        ) -> Result<Vec<String>, StorageError> {
+            let now = *self.clock_secs.lock().unwrap();
+            let held = self.expired_outpoints.lock().unwrap();
+            Ok(outpoints
+                .iter()
+                .filter(|o| {
+                    held.get(&(topic.to_string(), (*o).clone()))
+                        .is_some_and(|(keep, _)| *keep > now)
+                })
+                .cloned()
+                .collect())
         }
     }
 }
