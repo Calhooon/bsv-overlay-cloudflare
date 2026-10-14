@@ -314,10 +314,22 @@ async fn e657_same_bytes_same_word_after_refusal() {
 
 #[derive(Default)]
 struct Calls {
+    // Test-only observation of the apply boundary, never production check I/O.
+    before_apply: Option<(Rc<MemoryStorage>, Index, Vec<u8>)>,
     checked_admitted: Vec<String>,
     checked_spent: Vec<String>,
     admitted: Vec<String>,
     spent: Vec<String>,
+}
+impl Calls {
+    fn assert_before_apply(&self) {
+        if let Some((store, index, before)) = &self.before_apply {
+            assert!(
+                *before == snapshot(store, index),
+                "check ran after an apply write"
+            );
+        }
+    }
 }
 struct Probe {
     calls: Rc<Mutex<Calls>>,
@@ -334,6 +346,7 @@ impl LookupService for Probe {
         self.spend
     }
     fn check_admitted(&self, payload: &OutputAdmittedByTopic) -> Result<(), LookupServiceError> {
+        self.calls.lock().unwrap().assert_before_apply();
         self.calls
             .lock()
             .unwrap()
@@ -342,6 +355,7 @@ impl LookupService for Probe {
         Ok(())
     }
     fn check_spent(&self, payload: &OutputSpent) -> Result<(), LookupServiceError> {
+        self.calls.lock().unwrap().assert_before_apply();
         self.calls
             .lock()
             .unwrap()
@@ -550,4 +564,64 @@ async fn e657_report_types_both_refusal_sites_and_service_errors() {
             matches!(&refusal.error, LookupServiceError::Other(error) if error == "spent refusal")
         );
     }
+}
+
+#[tokio::test]
+async fn e657_all_topics_checked_before_first_apply_write() {
+    let (services, captures) = probes(false);
+    let (engine, store, index, mut beef, _) = fixture_with_services(Some(services)).await;
+    beef.topics.push(PROOF.into());
+    let before = snapshot(&store, &index);
+    for capture in &captures {
+        capture.lock().unwrap().before_apply = Some((store.clone(), index.clone(), before.clone()));
+    }
+    let (_, report) = engine
+        .submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv)
+        .await
+        .unwrap();
+    assert!(report.is_durable());
+    assert_eq!(report.applied_topics.len(), 2);
+    for capture in captures {
+        let calls = capture.lock().unwrap();
+        assert_eq!(
+            calls.checked_admitted.len(),
+            3,
+            "every topic checked before any apply"
+        );
+        assert_eq!(calls.checked_spent.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn e657_refused_topic_skips_apply_while_sibling_lands() {
+    let (engine, store, index, mut beef, parent) = fixture().await;
+    beef.topics.push(PROOF.into());
+    let (_, report) = engine
+        .submit_with_report(&beef, SubmitMode::HistoricalTxNoSpv)
+        .await
+        .unwrap();
+    let old = store
+        .find_output(&parent, 0, Some(REGISTRY), None, true)
+        .await
+        .unwrap();
+    assert!(
+        old.is_some_and(|old| !old.spent),
+        "refused topic lost its unspent previous coin"
+    );
+    refused(&report);
+    assert_eq!(report.applied_topics, vec![PROOF]);
+    let outputs = store.outputs.lock().unwrap();
+    assert_eq!(outputs.values().filter(|o| o.topic == REGISTRY).count(), 1);
+    assert_eq!(outputs.values().filter(|o| o.topic == PROOF).count(), 1);
+    assert!(store
+        .applied
+        .lock()
+        .unwrap()
+        .keys()
+        .all(|(_, topic)| topic == PROOF));
+    let rows = index.lock().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows
+        .iter()
+        .all(|((_, _, topic), writes)| topic == PROOF && *writes == 1));
 }
