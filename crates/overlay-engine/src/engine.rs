@@ -282,6 +282,12 @@ struct Landing {
     subject_walk_ran: bool,
 }
 
+/// A carried landing either applies or returns its original typed refusals.
+enum CarriedLanding {
+    Landed,
+    Refused(Vec<AdmissionRefusal>),
+}
+
 struct NotNow {
     why: String,
     carried: Option<String>,
@@ -419,6 +425,100 @@ struct TopicValidation {
     read_fault: Option<(&'static str, String)>,
 }
 
+// Build preflight and notification payloads in one place. Only one payload is
+// held at a time, including WholeTx, so preflight does not retain a second
+// collection of scripts or BEEF bodies beside the apply phase.
+struct LookupPayloads<'a> {
+    tx: &'a Transaction,
+    txid: &'a str,
+    atomic_beef: &'a [u8],
+    off_chain_values: Option<&'a [u8]>,
+}
+
+impl LookupPayloads<'_> {
+    fn admitted(
+        &self,
+        topic: &str,
+        output_index: u32,
+        mode: AdmissionMode,
+    ) -> OutputAdmittedByTopic {
+        let tx = self.tx;
+        let txid = self.txid;
+        let (ls_script, ls_sats) = if let Some(tx_out) = tx.outputs.get(output_index as usize) {
+            (tx_out.locking_script.to_binary(), tx_out.get_satoshis())
+        } else {
+            (Vec::new(), 0)
+        };
+
+        match mode {
+            AdmissionMode::LockingScript => OutputAdmittedByTopic::LockingScript {
+                txid: txid.to_owned(),
+                output_index,
+                topic: topic.to_owned(),
+                satoshis: ls_sats,
+                locking_script: ls_script,
+                off_chain_values: self.off_chain_values.map(<[u8]>::to_vec),
+            },
+            AdmissionMode::WholeTx => OutputAdmittedByTopic::WholeTx {
+                atomic_beef: self.atomic_beef.to_vec(),
+                output_index,
+                topic: topic.to_owned(),
+                off_chain_values: self.off_chain_values.map(<[u8]>::to_vec),
+            },
+        }
+    }
+
+    fn spent(
+        &self,
+        topic: &str,
+        prev_output: &Output,
+        spending_input_idx: usize,
+        mode: SpendNotificationMode,
+    ) -> OutputSpent {
+        let tx = self.tx;
+        let txid = self.txid;
+        match mode {
+            SpendNotificationMode::None => OutputSpent::None {
+                txid: prev_output.txid.clone(),
+                output_index: prev_output.output_index,
+                topic: topic.to_owned(),
+            },
+            SpendNotificationMode::Txid => OutputSpent::Txid {
+                txid: prev_output.txid.clone(),
+                output_index: prev_output.output_index,
+                topic: topic.to_owned(),
+                spending_txid: txid.to_owned(),
+            },
+            SpendNotificationMode::Script => {
+                // Extract unlocking script and sequence from the spending input
+                let input = &tx.inputs[spending_input_idx];
+                let unlocking_script = input
+                    .unlocking_script
+                    .as_ref()
+                    .map(bsv_rs::UnlockingScript::to_binary)
+                    .unwrap_or_default();
+                OutputSpent::Script {
+                    txid: prev_output.txid.clone(),
+                    output_index: prev_output.output_index,
+                    topic: topic.to_owned(),
+                    spending_txid: txid.to_owned(),
+                    input_index: spending_input_idx as u32,
+                    unlocking_script,
+                    sequence_number: input.sequence,
+                    off_chain_values: self.off_chain_values.map(<[u8]>::to_vec),
+                }
+            }
+            SpendNotificationMode::WholeTx => OutputSpent::WholeTx {
+                txid: prev_output.txid.clone(),
+                output_index: prev_output.output_index,
+                topic: topic.to_owned(),
+                spending_atomic_beef: self.atomic_beef.to_vec(),
+                off_chain_values: self.off_chain_values.map(<[u8]>::to_vec),
+            },
+        }
+    }
+}
+
 /// One Phase-3 write — or the validation read it depends on — that FAILED
 /// during a submit (S2 queue-durable admission, bsv-low 2026-08-29).
 ///
@@ -445,6 +545,20 @@ pub struct MutationFault {
     pub error: String,
 }
 
+/// A pure lookup check refused before this topic's apply phase.
+///
+/// The service key is the name registered with the engine. A door can map
+/// the site to its refusal response without parsing the service's error text.
+/// This does not roll back manager judgement or carried predecessor writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionRefusal {
+    pub topic: String,
+    pub service: String,
+    /// `lookup_service.check_admitted` or `lookup_service.check_spent`.
+    pub site: &'static str,
+    pub error: crate::lookup_service::LookupServiceError,
+}
+
 /// What Phase 3 actually landed for a submit — the durability report.
 ///
 /// `applied_topics` are the topics whose EVERY write (and lookup-service
@@ -455,6 +569,11 @@ pub struct MutationFault {
 /// write-then-record; the record is now conditional on the writes).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MutationReport {
+    /// Pure checks that refused, ordered by topic, service and site. No apply
+    /// writes or notifications are made for these topics. Accepted siblings
+    /// can still apply. Empty under the default lookup-service checks.
+    /// For a refused topic, the STEAK is the judgement, not an admission.
+    pub refused: Vec<AdmissionRefusal>,
     pub faults: Vec<MutationFault>,
     pub applied_topics: Vec<String>,
     /// Topics this (txid, topic) pair had ALREADY been applied under — the
@@ -507,9 +626,10 @@ impl MutationReport {
 
     /// True when every mutation this submit needed landed (nothing to
     /// replay). A dupe-only submit is durable (there was nothing to write).
+    /// A caller classifies `refused` before `faults`.
     #[must_use]
     pub fn is_durable(&self) -> bool {
-        self.faults.is_empty()
+        self.faults.is_empty() && self.refused.is_empty()
     }
 
     /// One log line naming every fault (`topic/site: error`), each error
@@ -522,6 +642,10 @@ impl MutationReport {
                 let err: String = f.error.chars().take(120).collect();
                 format!("{}/{}: {}", f.topic, f.site, err)
             })
+            .chain(self.refused.iter().map(|r| {
+                let err: String = r.error.to_string().chars().take(120).collect();
+                format!("{}/{} ({}): {}", r.topic, r.site, r.service, err)
+            }))
             .collect::<Vec<_>>()
             .join("; ")
     }
@@ -1374,6 +1498,7 @@ impl Engine {
     /// 3. **MUTATE** — mark spent, delete stale, insert new outputs, notify lookup services
     ///
     /// Returns a STEAK mapping each topic to its admittance instructions.
+    /// For a refused topic, the STEAK is the judgement, not an admission.
     ///
     /// Phase-3 faults are reported through [`Engine::submit_with_report`];
     /// this convenience keeps the historical signature and only LOGS the
@@ -1385,7 +1510,13 @@ impl Engine {
         mode: SubmitMode,
     ) -> Result<Steak, EngineError> {
         let (steak, report) = self.submit_with_report(tagged_beef, mode).await?;
-        if !report.is_durable() {
+        if !report.refused.is_empty() {
+            warn!(
+                "submit: {} lookup refusal(s): {}",
+                report.refused.len(),
+                report.summary()
+            );
+        } else if !report.is_durable() {
             warn!(
                 "submit: {} mutation fault(s) — not durable: {}",
                 report.faults.len(),
@@ -1599,13 +1730,21 @@ impl Engine {
                 &mut report.landed_predecessors,
                 landing,
                 &mut report.landed_walks_could_not_run,
+                &mut report.refused,
             )
             .await;
+        let mut refused_topics: HashSet<String> =
+            report.refused.iter().map(|r| r.topic.clone()).collect();
         // A carried predecessor's topic that does not wait is judged again,
         // for real: what it admits is this call's word, over the same coins.
         if carried {
             for v in &mut validations {
-                if v.is_dupe || v.failed || v.read_fault.is_some() || waits.contains_key(&v.topic) {
+                if v.is_dupe
+                    || v.failed
+                    || v.read_fault.is_some()
+                    || waits.contains_key(&v.topic)
+                    || refused_topics.contains(&v.topic)
+                {
                     continue;
                 }
                 match self
@@ -1633,6 +1772,62 @@ impl Engine {
             }
         }
 
+        // Pure checks run after all judgements and successor handling, before
+        // the first apply write of any topic. Refusals suppress only their topic.
+        let payloads = LookupPayloads {
+            tx: &tx,
+            txid: &txid,
+            atomic_beef: &subject_named_beef,
+            off_chain_values: tagged_beef.off_chain_values.as_deref(),
+        };
+        for v in &validations {
+            if v.is_dupe
+                || v.failed
+                || v.read_fault.is_some()
+                || waits.contains_key(&v.topic)
+                || refused_topics.contains(&v.topic)
+            {
+                continue;
+            }
+            for (prev_idx, prev_output) in v.previous_outputs.iter().enumerate() {
+                for (service, ls) in &self.lookup_services {
+                    let payload = payloads.spent(
+                        &v.topic,
+                        prev_output,
+                        v.previous_coins[prev_idx] as usize,
+                        ls.spend_notification_mode(),
+                    );
+                    if let Err(error) = ls.check_spent(&payload) {
+                        report.refused.push(AdmissionRefusal {
+                            topic: v.topic.clone(),
+                            service: service.clone(),
+                            site: "lookup_service.check_spent",
+                            error,
+                        });
+                        refused_topics.insert(v.topic.clone());
+                    }
+                }
+            }
+            for &output_index in &v.admittance.outputs_to_admit {
+                for (service, ls) in &self.lookup_services {
+                    let payload = payloads.admitted(&v.topic, output_index, ls.admission_mode());
+                    if let Err(error) = ls.check_admitted(&payload) {
+                        report.refused.push(AdmissionRefusal {
+                            topic: v.topic.clone(),
+                            service: service.clone(),
+                            site: "lookup_service.check_admitted",
+                            error,
+                        });
+                        refused_topics.insert(v.topic.clone());
+                    }
+                }
+            }
+        }
+
+        report
+            .refused
+            .sort_by(|a, b| (&a.topic, &a.service, a.site).cmp(&(&b.topic, &b.service, b.site)));
+
         // =================================================================
         // PHASE 3: MUTATE STORAGE
         // =================================================================
@@ -1647,6 +1842,12 @@ impl Engine {
             // replay. Parity: the reference fails the topic and never
             // replays. Nothing was written, so the store is as it was.
             if v.failed {
+                continue;
+            }
+
+            if refused_topics.contains(&v.topic) {
+                // A check refusal must be checked again on a later submit, not
+                // remembered as a predecessor fault by this Engine.
                 continue;
             }
 
@@ -1739,45 +1940,12 @@ impl Engine {
 
                 // Notify all lookup services about the spent output
                 for ls in self.lookup_services.values() {
-                    let payload = match ls.spend_notification_mode() {
-                        SpendNotificationMode::None => OutputSpent::None {
-                            txid: prev_output.txid.clone(),
-                            output_index: prev_output.output_index,
-                            topic: topic.clone(),
-                        },
-                        SpendNotificationMode::Txid => OutputSpent::Txid {
-                            txid: prev_output.txid.clone(),
-                            output_index: prev_output.output_index,
-                            topic: topic.clone(),
-                            spending_txid: txid.clone(),
-                        },
-                        SpendNotificationMode::Script => {
-                            // Extract unlocking script and sequence from the spending input
-                            let input = &tx.inputs[spending_input_idx];
-                            let unlocking_script = input
-                                .unlocking_script
-                                .as_ref()
-                                .map(bsv_rs::UnlockingScript::to_binary)
-                                .unwrap_or_default();
-                            OutputSpent::Script {
-                                txid: prev_output.txid.clone(),
-                                output_index: prev_output.output_index,
-                                topic: topic.clone(),
-                                spending_txid: txid.clone(),
-                                input_index: spending_input_idx as u32,
-                                unlocking_script,
-                                sequence_number: input.sequence,
-                                off_chain_values: tagged_beef.off_chain_values.clone(),
-                            }
-                        }
-                        SpendNotificationMode::WholeTx => OutputSpent::WholeTx {
-                            txid: prev_output.txid.clone(),
-                            output_index: prev_output.output_index,
-                            topic: topic.clone(),
-                            spending_atomic_beef: subject_named_beef.clone(),
-                            off_chain_values: tagged_beef.off_chain_values.clone(),
-                        },
-                    };
+                    let payload = payloads.spent(
+                        topic,
+                        prev_output,
+                        spending_input_idx,
+                        ls.spend_notification_mode(),
+                    );
                     if let Err(e) = hooked(bound, ls.output_spent(&payload)).await {
                         error!("Error notifying lookup service of spent output: {e}");
                         report.fault(topic, "lookup_service.output_spent", e);
@@ -1837,29 +2005,7 @@ impl Engine {
 
                 // Notify lookup services
                 for ls in self.lookup_services.values() {
-                    let (ls_script, ls_sats) =
-                        if let Some(tx_out) = tx.outputs.get(output_index as usize) {
-                            (tx_out.locking_script.to_binary(), tx_out.get_satoshis())
-                        } else {
-                            (Vec::new(), 0)
-                        };
-
-                    let payload = match ls.admission_mode() {
-                        AdmissionMode::LockingScript => OutputAdmittedByTopic::LockingScript {
-                            txid: txid.clone(),
-                            output_index,
-                            topic: topic.clone(),
-                            satoshis: ls_sats,
-                            locking_script: ls_script,
-                            off_chain_values: tagged_beef.off_chain_values.clone(),
-                        },
-                        AdmissionMode::WholeTx => OutputAdmittedByTopic::WholeTx {
-                            atomic_beef: subject_named_beef.clone(),
-                            output_index,
-                            topic: topic.clone(),
-                            off_chain_values: tagged_beef.off_chain_values.clone(),
-                        },
-                    };
+                    let payload = payloads.admitted(topic, output_index, ls.admission_mode());
 
                     if let Err(e) = hooked(bound, ls.output_admitted_by_topic(&payload)).await {
                         error!("Error notifying lookup service: {e}");
@@ -2182,7 +2328,9 @@ impl Engine {
     /// service reads off-chain values (the delta fold, L1: the landing has
     /// none to give, and the predecessor's own submit would be a dupe): the
     /// topic waits for that submit. The first predecessor that does not land
-    /// ends it: the topic waits. A predecessor whose body the BEEF does not
+    /// ends it: the topic waits unless its lookup check refused, in which case
+    /// the successor topic is refused with the same typed records.
+    /// A predecessor whose body the BEEF does not
     /// carry is never landed here: its successor converges only when it
     /// lands (its own replay, a GASP peer, a resubmit).
     #[allow(clippy::too_many_arguments)]
@@ -2203,6 +2351,7 @@ impl Engine {
         landed: &mut Vec<(String, String)>,
         landing: Landing,
         landed_breaches: &mut Vec<WalkCouldNotRun>,
+        refused: &mut Vec<AdmissionRefusal>,
     ) -> HashMap<String, String> {
         let mut waits = HashMap::new();
         let spent: Vec<(String, u32)> = tx
@@ -2320,7 +2469,13 @@ impl Engine {
                     )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(CarriedLanding::Refused(records)) => {
+                        // No re-judgement or apply follows a deterministic refusal.
+                        *question_reads -= rejudge;
+                        refused.extend(records);
+                        break;
+                    }
+                    Ok(CarriedLanding::Landed) => {
                         *v = self
                             .validate_topic(
                                 tx,
@@ -2411,8 +2566,8 @@ impl Engine {
     /// fold, L2). Each body is asked of the caller's landing guard first,
     /// once ([`Engine::set_landing_guard`]; the delta-2 fold, L2): a refusal
     /// ends the landing before that body is submitted.
-    /// `Ok` once `predecessor` LANDED in `topic` (recorded there,
-    /// now or before); otherwise why not, at the first that did not.
+    /// Returns `Landed` once `predecessor` is recorded in `topic`, or the
+    /// inner report's typed `Refused` records. Other failures return why not.
     #[allow(clippy::too_many_arguments)]
     async fn land_carried(
         &self,
@@ -2426,7 +2581,7 @@ impl Engine {
         landed: &mut Vec<(String, String)>,
         landing: Landing,
         landed_breaches: &mut Vec<WalkCouldNotRun>,
-    ) -> Result<(), String> {
+    ) -> Result<CarriedLanding, String> {
         let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
             .map_err(|e| format!("the BEEF could not be read again ({e})"))?;
         let mode = match mode {
@@ -2512,13 +2667,16 @@ impl Engine {
                 stack.pop();
                 continue;
             }
+            if !report.refused.is_empty() {
+                return Ok(CarriedLanding::Refused(report.refused));
+            }
             match blocked.get(topic) {
                 Some(under) if !stack.contains(under) => stack.push(under.clone()),
                 _ if report.is_durable() => return Err(format!("{next}: the manager failed it")),
                 _ => return Err(format!("{next}: {}", report.summary())),
             }
         }
-        Ok(())
+        Ok(CarriedLanding::Landed)
     }
 
     /// A topic of a submit that is NOT recorded as applied: logged, and

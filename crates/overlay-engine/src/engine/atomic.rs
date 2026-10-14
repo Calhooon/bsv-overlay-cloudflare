@@ -359,6 +359,59 @@ impl Engine {
             steak.insert(topic.clone(), admittance.clone());
             validations.push((topic, previous, outputs, admittance));
         }
+        // Check the serial unit's actual judgement and previous coins, not a
+        // potentially stale walk-time view. No topic apply or notification may
+        // precede any of these pure checks. Build the same payloads during apply.
+        let payloads = LookupPayloads {
+            tx: &tx,
+            txid,
+            atomic_beef: &named,
+            off_chain_values: tagged_beef.off_chain_values.as_deref(),
+        };
+        for (topic, previous, outputs, admittance) in &validations {
+            for (i, output) in outputs.iter().enumerate() {
+                for (name, service) in &services {
+                    log.at(&format!("lookup_service.{name}.check_spent"));
+                    let payload = payloads.spent(
+                        topic,
+                        output,
+                        previous[i] as usize,
+                        service.spend_notification_mode(),
+                    );
+                    if let Err(error) = service.check_spent(&payload) {
+                        report.refused.push(AdmissionRefusal {
+                            topic: (*topic).clone(),
+                            service: (*name).clone(),
+                            site: "lookup_service.check_spent",
+                            error,
+                        });
+                    }
+                }
+            }
+            for &vout in &admittance.outputs_to_admit {
+                for (name, service) in &services {
+                    log.at(&format!("lookup_service.{name}.check_admitted"));
+                    let payload = payloads.admitted(topic, vout, service.admission_mode());
+                    if let Err(error) = service.check_admitted(&payload) {
+                        report.refused.push(AdmissionRefusal {
+                            topic: (*topic).clone(),
+                            service: (*name).clone(),
+                            site: "lookup_service.check_admitted",
+                            error,
+                        });
+                    }
+                }
+            }
+        }
+        if !report.refused.is_empty() {
+            report.refused.sort_by(|a, b| {
+                (&a.topic, &a.service, a.site).cmp(&(&b.topic, &b.service, b.site))
+            });
+            return Err(AdmitRefusal::Lookup {
+                refused: report.refused,
+                notes: log.notes(),
+            });
+        }
         // All topics judge before any engine mutation, as on the ordinary path.
         for (topic, previous, outputs, admittance) in validations {
             let mut consumed = Vec::new();
@@ -386,43 +439,12 @@ impl Engine {
                     .map_err(|e| AdmitRefusal::transient("mark_utxo_as_spent", e))?;
                 for (name, service) in &services {
                     log.at(&format!("lookup_service.{name}.output_spent"));
-                    let payload = match service.spend_notification_mode() {
-                        SpendNotificationMode::None => OutputSpent::None {
-                            txid: output.txid.clone(),
-                            output_index: output.output_index,
-                            topic: topic.clone(),
-                        },
-                        SpendNotificationMode::Txid => OutputSpent::Txid {
-                            txid: output.txid.clone(),
-                            output_index: output.output_index,
-                            topic: topic.clone(),
-                            spending_txid: txid.clone(),
-                        },
-                        SpendNotificationMode::Script => {
-                            let input = &tx.inputs[previous[i] as usize];
-                            OutputSpent::Script {
-                                txid: output.txid.clone(),
-                                output_index: output.output_index,
-                                topic: topic.clone(),
-                                spending_txid: txid.clone(),
-                                input_index: previous[i],
-                                unlocking_script: input
-                                    .unlocking_script
-                                    .as_ref()
-                                    .map(bsv_rs::UnlockingScript::to_binary)
-                                    .unwrap_or_default(),
-                                sequence_number: input.sequence,
-                                off_chain_values: tagged_beef.off_chain_values.clone(),
-                            }
-                        }
-                        SpendNotificationMode::WholeTx => OutputSpent::WholeTx {
-                            txid: output.txid.clone(),
-                            output_index: output.output_index,
-                            topic: topic.clone(),
-                            spending_atomic_beef: named.clone(),
-                            off_chain_values: tagged_beef.off_chain_values.clone(),
-                        },
-                    };
+                    let payload = payloads.spent(
+                        topic,
+                        output,
+                        previous[i] as usize,
+                        service.spend_notification_mode(),
+                    );
                     service
                         .output_spent(&payload)
                         .await
@@ -455,22 +477,7 @@ impl Engine {
                 new_utxos.push(Outpoint::new(txid, vout));
                 for (name, service) in &services {
                     log.at(&format!("lookup_service.{name}.output_admitted_by_topic"));
-                    let payload = match service.admission_mode() {
-                        AdmissionMode::LockingScript => OutputAdmittedByTopic::LockingScript {
-                            txid: txid.clone(),
-                            output_index: vout,
-                            topic: topic.clone(),
-                            satoshis: sats,
-                            locking_script: script.clone(),
-                            off_chain_values: tagged_beef.off_chain_values.clone(),
-                        },
-                        AdmissionMode::WholeTx => OutputAdmittedByTopic::WholeTx {
-                            atomic_beef: named.clone(),
-                            output_index: vout,
-                            topic: topic.clone(),
-                            off_chain_values: tagged_beef.off_chain_values.clone(),
-                        },
-                    };
+                    let payload = payloads.admitted(topic, vout, service.admission_mode());
                     service
                         .output_admitted_by_topic(&payload)
                         .await

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bsv_rs::transaction::Transaction;
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{MutationReport, WalkBreachPolicy, WalkCouldNotRun};
+use crate::engine::{AdmissionRefusal, MutationReport, WalkBreachPolicy, WalkCouldNotRun};
 use crate::storage::{Storage, StorageError};
 use crate::types::{Steak, SubmitMode, TaggedBEEF};
 
@@ -105,6 +105,13 @@ impl EvidenceSource for NoEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AdmitRefusal {
+    /// Pure lookup checks refused before any topic apply. The original typed
+    /// service errors are retained, just as in `MutationReport::refused`.
+    #[error("lookup preflight refused: {refused:?}")]
+    Lookup {
+        refused: Vec<AdmissionRefusal>,
+        notes: RefusalNotes,
+    },
     #[error("{site}: {reason}")]
     Deterministic {
         topic: String,
@@ -148,7 +155,8 @@ impl AdmitRefusal {
     }
     pub fn with_notes(mut self, value: RefusalNotes) -> Self {
         match &mut self {
-            Self::Deterministic { notes, .. }
+            Self::Lookup { notes, .. }
+            | Self::Deterministic { notes, .. }
             | Self::Transient { notes, .. }
             | Self::NotNow { notes, .. } => *notes = value,
         }
@@ -156,7 +164,8 @@ impl AdmitRefusal {
     }
     pub fn notes(&self) -> &RefusalNotes {
         match self {
-            Self::Deterministic { notes, .. }
+            Self::Lookup { notes, .. }
+            | Self::Deterministic { notes, .. }
             | Self::Transient { notes, .. }
             | Self::NotNow { notes, .. } => notes,
         }

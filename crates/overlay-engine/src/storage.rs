@@ -670,6 +670,10 @@ pub mod memory {
     mod atomic_admission_tests {
         include!("atomic_admission_tests.rs");
     }
+    #[cfg(test)]
+    mod preflight_admission_tests {
+        include!("preflight_admission_tests.rs");
+    }
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;

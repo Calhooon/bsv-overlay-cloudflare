@@ -308,6 +308,9 @@ impl MemoryStorage {
                     }
                     pending.push((id, vec![topic]));
                 }
+                // Preserve B's typed check refusal when it comes from a
+                // carried unit. It is not an unavailable predecessor.
+                Err(error @ LogError::Refused(AdmitRefusal::Lookup { .. })) => return Err(error),
                 Err(LogError::Refused(error)) if pending.len() > 1 => {
                     return Err(
                         AdmitRefusal::not_now("predecessor_not_landed", error.to_string())
