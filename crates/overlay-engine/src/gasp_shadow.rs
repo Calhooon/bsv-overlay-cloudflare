@@ -32,7 +32,9 @@ use std::rc::Rc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::admission::{AdmitEvidence, AdmitRefusal, BeefCarry, Committed, UnitOutput, UnitRunner};
+use crate::admission::{
+    AdmitEvidence, AdmitRefusal, BeefCarry, Committed, GateReason, UnitOutput, UnitRunner,
+};
 use crate::engine::{Engine, EngineError, MutationReport};
 use crate::types::Steak;
 
@@ -172,9 +174,10 @@ pub enum ShadowKind {
 /// served path landed a topic, the intended change, counted. A graph row whose
 /// words differ is `Materialization` when the rows the graph reaches agree (a
 /// stop point or a status apart: D1, the erring chain) and `RowsDiffer` when
-/// they do not (D2: on a fan-in A lands the sibling and the root over a parent
-/// whose manager erred, where the served finalize lands neither). The census
-/// names D2; whether A should stop there is the owner's ruling.
+/// they do not (D2: on a fan-in whose erring parent comes first, A lands the
+/// sibling under the owner's D44, `dependency gate`, where the served finalize
+/// lands nothing after the error). The census names D2 against today's path
+/// until `on`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeltaClass {
@@ -230,9 +233,22 @@ pub struct GaspCensusRow {
     pub shadow_evidence: AdmitEvidence,
     /// The seq of each unit the shadow committed on its snapshot.
     pub shadow_seqs: Vec<u64>,
+    /// The dependency gate's reason (the owner's D44) for each body A held,
+    /// in graph order: a body row its own (none when it landed or met its
+    /// own refusal), a graph row every body the gate held.
+    #[serde(default)]
+    pub gate: Vec<GateEntry>,
     pub snapshot_rows: usize,
     pub snapshot_bytes: usize,
     pub shadow_ms: u64,
+}
+
+/// One body the dependency gate held, and why: `{"txid", "reason":
+/// "parent_error" | {"waiting_on": [txid, ...]}}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateEntry {
+    pub txid: String,
+    pub reason: GateReason,
 }
 
 impl Word {

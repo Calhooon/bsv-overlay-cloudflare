@@ -662,16 +662,21 @@ impl Engine {
             row.shadow_judgement = judged.ok().map(|admitted| judgement_of(&admitted.steak));
             let mut word = Word::not_shadowed("no unit ran");
             let seqs = &mut row.shadow_seqs;
+            let gates = &mut row.gate;
             let engine = &snapshot.engine;
             engine.capture_manager_errors();
             admit_graph_observed(
                 engine,
                 snapshot.runner.as_ref(),
                 std::slice::from_ref(&walked),
-                &mut |_, answer, _| {
+                &mut |body, answer, gate| {
                     if let Ok(committed) = answer {
                         seqs.push(committed.seq);
                     }
+                    gates.extend(gate.map(|reason| GateEntry {
+                        txid: body.txid.clone(),
+                        reason: reason.clone(),
+                    }));
                     word = Word::admission(answer, &engine.take_manager_errors());
                 },
             );
@@ -728,6 +733,7 @@ impl Engine {
             served_evidence: AdmitEvidence::default(),
             shadow_evidence: AdmitEvidence::default(),
             shadow_seqs: vec![],
+            gate: vec![],
             snapshot_rows: 0,
             snapshot_bytes: 0,
             shadow_ms: 0,
@@ -786,20 +792,27 @@ impl Engine {
             let mut errors = Vec::new();
             let mut first_answer = None;
             let mut seqs = Vec::new();
+            let mut gates = Vec::new();
             let engine = &snapshot.engine;
             engine.capture_manager_errors();
             admit_graph_observed(
                 engine,
                 snapshot.runner.as_ref(),
                 &walked,
-                &mut |body, answer, _| {
+                &mut |body, answer, gate| {
                     let met = engine.take_manager_errors();
+                    let gate = gate.map(|reason| GateEntry {
+                        txid: body.txid.clone(),
+                        reason: reason.clone(),
+                    });
                     if first_answer.is_none() {
                         first_answer = Some((
                             Word::admission(answer, &met),
                             answer.as_ref().ok().map(|committed| committed.seq),
+                            gate.clone(),
                         ));
                     }
+                    gates.extend(gate);
                     errors.extend(met);
                     match answer {
                         Ok(committed) => {
@@ -816,14 +829,16 @@ impl Engine {
                 },
             );
             engine.end_manager_errors();
-            if let (Some(row), Some((word, seq))) = (first.as_mut(), first_answer) {
+            if let (Some(row), Some((word, seq, gate))) = (first.as_mut(), first_answer) {
                 row.shadow = word;
                 row.shadow_seqs.extend(seq);
+                row.gate.extend(gate);
             }
             let Some(row) = graph.as_mut() else {
                 break 'judged Ok(Word::not_shadowed("no graph"));
             };
             row.shadow_seqs = seqs;
+            row.gate = gates;
             let stopped = refused.or(stopped);
             let rows = materialized_rows(snapshot.engine.storage(), &job.topic, &job.beefs).await;
             Ok(materialization_word(
@@ -892,6 +907,7 @@ fn body_row(peer: String, topic: String, graph: String, body: ServedParts) -> Ga
         served_evidence: AdmitEvidence::default(),
         shadow_evidence: AdmitEvidence::default(),
         shadow_seqs: vec![],
+        gate: vec![],
         snapshot_rows: 0,
         snapshot_bytes: 0,
         shadow_ms: 0,
