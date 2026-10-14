@@ -84,6 +84,7 @@ impl MemoryStorage {
     /// An isolated copy of every stored table and the log's committed state,
     /// for a shadow that must apply nothing to this store. Fault and crash
     /// switches, resolved objects and any open unit are not copied.
+    #[cfg(feature = "gasp-shadow")]
     pub fn shadow_copy(&self) -> MemoryStorage {
         let copy = MemoryStorage::new();
         MemorySnapshot::take(self).restore(&copy);
@@ -92,6 +93,7 @@ impl MemoryStorage {
 
     /// `(rows, bytes)` held: outputs, applied rows, stored BEEFs and the log's
     /// manager rows; the BEEFs', scripts' and rows' bytes.
+    #[cfg(feature = "gasp-shadow")]
     pub fn shadow_size(&self) -> (usize, usize) {
         let outputs = self.outputs.lock().unwrap();
         let transactions = self.transactions.lock().unwrap();

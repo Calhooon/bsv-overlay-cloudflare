@@ -5,6 +5,18 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+# GASP's shadow (bsv-low #657) is the engine's cargo feature `gasp-shadow`,
+# default off there and ON here, so `cargo test --workspace` runs its
+# witnesses. `--no-default-features` builds the engine without it: the `off`
+# recording (`gasp_shadow_off`) then runs on the build an `off` Worker links.
+[features]
+default = ["gasp-shadow"]
+gasp-shadow = ["bsv-overlay-engine/gasp-shadow"]
+
+[[test]]
+name = "gasp_shadow"
+required-features = ["gasp-shadow"]
+
 # Cross-crate tests live here to keep the engine publish graph acyclic.
 [dev-dependencies]
 bsv-overlay-engine = { version = "0.1.5", path = "../overlay-engine", features = ["memory-storage"] }

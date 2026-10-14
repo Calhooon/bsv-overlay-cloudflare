@@ -9,6 +9,7 @@
 use crate::beef_limits;
 
 mod atomic;
+#[cfg(feature = "gasp-shadow")]
 mod gasp_shadow;
 
 use bsv_rs::transaction::{Beef, Transaction};
@@ -125,13 +126,18 @@ pub struct Engine {
     /// door's [`DoorBudget`], [`DoorBudget::DEFAULT`] unless set. See
     /// [`Engine::set_walk_budget`].
     walk_budget: DoorBudget,
-    /// GASP's shadow under `admit_graph` (bsv-low #657, R7.7 item 5):
-    /// `Off` unless set, and then nothing of it runs. See
+    /// GASP's shadow under `admit_graph` (bsv-low #657, R7.7 item 5; the
+    /// cargo feature `gasp-shadow`, default off, so an `off` build links none
+    /// of it): `Off` unless set, and then nothing of it runs. See
     /// [`Engine::set_gasp_shadow`].
+    #[cfg(feature = "gasp-shadow")]
     admission_mode: crate::gasp_shadow::AdmissionMode,
+    #[cfg(feature = "gasp-shadow")]
     gasp_shadow: Option<std::rc::Rc<dyn crate::gasp_shadow::GaspShadow>>,
+    #[cfg(feature = "gasp-shadow")]
     shadow_budget: crate::gasp_shadow::ShadowBudget,
     /// The comparisons a peer's sync queued, run after it (outside its race).
+    #[cfg(feature = "gasp-shadow")]
     shadow_jobs: std::cell::RefCell<Vec<gasp_shadow::ShadowJob>>,
     config: EngineConfig,
 }
@@ -1128,9 +1134,13 @@ impl Engine {
             landing_guard: None,
             verify_scripts: true,
             walk_budget: DoorBudget::DEFAULT,
+            #[cfg(feature = "gasp-shadow")]
             admission_mode: crate::gasp_shadow::AdmissionMode::Off,
+            #[cfg(feature = "gasp-shadow")]
             gasp_shadow: None,
+            #[cfg(feature = "gasp-shadow")]
             shadow_budget: crate::gasp_shadow::ShadowBudget::default(),
+            #[cfg(feature = "gasp-shadow")]
             shadow_jobs: std::cell::RefCell::default(),
             config,
         }
@@ -1141,6 +1151,7 @@ impl Engine {
     /// every GASP finalize body and graph is compared on a fresh snapshot the
     /// `host` takes, and one census row each is handed to it; the served
     /// finalize is unchanged. Under `Off` the host is never asked.
+    #[cfg(feature = "gasp-shadow")]
     pub fn set_gasp_shadow(
         &mut self,
         mode: crate::gasp_shadow::AdmissionMode,
@@ -1152,11 +1163,13 @@ impl Engine {
 
     /// The allowance of one shadow comparison (the slice's: 4,096 rows,
     /// 16 MiB and 2,000 ms unless set).
+    #[cfg(feature = "gasp-shadow")]
     pub fn set_gasp_shadow_budget(&mut self, budget: crate::gasp_shadow::ShadowBudget) {
         self.shadow_budget = budget;
     }
 
     /// The mode the engine's GASP shadow runs under.
+    #[cfg(feature = "gasp-shadow")]
     pub fn admission_mode(&self) -> crate::gasp_shadow::AdmissionMode {
         self.admission_mode
     }
@@ -5538,6 +5551,7 @@ impl Engine {
                     // GASP's shadow (bsv-low #657, R7.7 item 5): the
                     // comparisons this peer's finalize queued run here, after
                     // its race, so their time moves no deadline. `Off` skips.
+                    #[cfg(feature = "gasp-shadow")]
                     if self.gasp_shadow_host().is_some() {
                         self.drain_gasp_shadow().await;
                     }
@@ -5703,40 +5717,26 @@ impl Engine {
 
         let mut all_landed = true;
         for graph in &finalized {
-            // GASP's shadow (bsv-low #657, R7.7 item 5): under `Shadow` only,
-            // a snapshot before the graph and before each body, the served
-            // word and rows queued; under `Off` nothing here runs or awaits.
-            let shadow = self.gasp_shadow_host();
-            let graph_snapshot = match &shadow {
-                Some(host) => Some(
-                    self.shadow_prepare(host.as_ref(), peer_url, &graph.topic, &graph.beefs)
-                        .await,
-                ),
+            // GASP's shadow (bsv-low #657, R7.7 item 5; the cargo feature
+            // `gasp-shadow`): under `Shadow` only, a snapshot before the
+            // graph and before each body, the served word and rows queued;
+            // under `Off` nothing here runs or awaits.
+            #[cfg(feature = "gasp-shadow")]
+            let mut shadow = match self.gasp_shadow_host() {
+                Some(host) => Some(self.shadow_graph_begin(host, peer_url, graph).await),
                 None => None,
             };
-            let graph_root = shadow.as_ref().map_or_else(String::new, |_| {
-                graph
-                    .beefs
-                    .last()
-                    .map_or_else(String::new, |b| gasp_shadow::body_txid(b))
-            });
-            let mut served_landed = Vec::new();
-            let mut served_stop = None;
             for (position, beef_bytes) in graph.beefs.iter().enumerate() {
                 self.finalize_gate.stop_if_due().await;
                 if position == 0 {
                     submitted.set(submitted.get() + 1);
                 }
                 let tagged = TaggedBEEF::new(beef_bytes.clone(), vec![graph.topic.clone()]);
+                #[cfg(feature = "gasp-shadow")]
                 let body_snapshot = match &shadow {
-                    Some(host) => Some(
-                        self.shadow_prepare(
-                            host.as_ref(),
-                            peer_url,
-                            &graph.topic,
-                            std::slice::from_ref(beef_bytes),
-                        )
-                        .await,
+                    Some(shadow) => Some(
+                        self.shadow_body_begin(shadow, std::slice::from_ref(beef_bytes))
+                            .await,
                     ),
                     None => None,
                 };
@@ -5764,18 +5764,10 @@ impl Engine {
                     )
                     .await
                 };
-                let served_word = body_snapshot.map(|prepared| {
-                    self.shadow_body_served(
-                        prepared,
-                        peer_url,
-                        &graph.topic,
-                        &graph_root,
-                        position,
-                        beef_bytes,
-                        &outcome,
-                    );
-                    crate::gasp_shadow::Word::served(&outcome)
-                });
+                #[cfg(feature = "gasp-shadow")]
+                if let Some(shadow) = shadow.as_mut() {
+                    self.shadow_body_served(shadow, body_snapshot, position, beef_bytes, &outcome);
+                }
                 let not_landed = match outcome {
                     Ok((_, report)) => {
                         let landed = report.is_durable()
@@ -5797,24 +5789,20 @@ impl Engine {
                         graph.topic
                     );
                     all_landed = false;
-                    served_stop =
-                        served_word.map(|word| (gasp_shadow::body_txid(beef_bytes), word));
+                    #[cfg(feature = "gasp-shadow")]
+                    if let Some(shadow) = shadow.as_mut() {
+                        shadow.stopped(beef_bytes);
+                    }
                     break;
                 }
-                if served_word.is_some() {
-                    served_landed.push(gasp_shadow::body_txid(beef_bytes));
+                #[cfg(feature = "gasp-shadow")]
+                if let Some(shadow) = shadow.as_mut() {
+                    shadow.landed(beef_bytes);
                 }
             }
-            if let Some(prepared) = graph_snapshot {
-                self.shadow_graph_served(
-                    prepared,
-                    peer_url,
-                    &graph.topic,
-                    &graph.beefs,
-                    &served_landed,
-                    served_stop.as_ref(),
-                )
-                .await;
+            #[cfg(feature = "gasp-shadow")]
+            if let Some(shadow) = shadow {
+                self.shadow_graph_served(shadow, &graph.beefs).await;
             }
         }
 

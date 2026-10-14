@@ -14,6 +14,12 @@ include = ["src/**/*.rs", "README.md", "LICENSE-*"]
 [features]
 default = []
 memory-storage = []
+# GASP's shadow under `admit_graph` (bsv-low #657, R7.7 item 5): the
+# `gasp_shadow` module, `Engine::set_gasp_shadow` and the finalize's shadow
+# arms. Default OFF, so an `off` Worker links none of A's GASP path (the shadow
+# lens's MEDIUM 1, `scripts/check-gasp-shadow-size.sh`). A host that runs
+# `ADMISSION_MODE=shadow` builds with it on.
+gasp-shadow = []
 
 [dependencies]
 bsv-rs.workspace = true

@@ -38,6 +38,34 @@ pub(crate) struct GraphJob {
     served: Word,
 }
 
+/// One graph's shadow while the served finalize submits it: its snapshot,
+/// and what the served path landed and where it stopped.
+pub(crate) struct FinalizeShadow {
+    host: Rc<dyn GaspShadow>,
+    peer: String,
+    topic: String,
+    root: String,
+    prepared: Prepared,
+    landed: Vec<String>,
+    stopped: Option<(String, Word)>,
+    /// The last served body's word.
+    last: Option<Word>,
+}
+
+impl FinalizeShadow {
+    /// The served body landed.
+    pub(crate) fn landed(&mut self, beef: &[u8]) {
+        self.landed.push(body_txid(beef));
+    }
+
+    /// The served finalize stopped at this body.
+    pub(crate) fn stopped(&mut self, beef: &[u8]) {
+        if let Some(word) = self.last.take() {
+            self.stopped = Some((body_txid(beef), word));
+        }
+    }
+}
+
 /// One comparison waiting for the end of its peer's sync.
 pub(crate) enum ShadowJob {
     Body(Box<BodyJob>),
@@ -276,7 +304,7 @@ impl Engine {
 
     /// The snapshot for one comparison, taken in the served path BEFORE the
     /// served write it is compared with.
-    pub(crate) async fn shadow_prepare(
+    async fn shadow_prepare(
         &self,
         host: &dyn GaspShadow,
         peer: &str,
@@ -293,54 +321,85 @@ impl Engine {
         }
     }
 
+    /// A graph's shadow, begun before its first served submit: the graph's
+    /// snapshot.
+    pub(crate) async fn shadow_graph_begin(
+        &self,
+        host: Rc<dyn GaspShadow>,
+        peer: &str,
+        graph: &crate::gasp_overlay::FinalizedGraph,
+    ) -> FinalizeShadow {
+        let prepared = self
+            .shadow_prepare(host.as_ref(), peer, &graph.topic, &graph.beefs)
+            .await;
+        FinalizeShadow {
+            root: graph
+                .beefs
+                .last()
+                .map_or_else(String::new, |b| body_txid(b)),
+            host,
+            peer: peer.into(),
+            topic: graph.topic.clone(),
+            prepared,
+            landed: Vec::new(),
+            stopped: None,
+            last: None,
+        }
+    }
+
+    /// One body's snapshot, taken before its served submit (`body` is that
+    /// one BEEF).
+    pub(crate) async fn shadow_body_begin(
+        &self,
+        shadow: &FinalizeShadow,
+        body: &[Vec<u8>],
+    ) -> Prepared {
+        self.shadow_prepare(shadow.host.as_ref(), &shadow.peer, &shadow.topic, body)
+            .await
+    }
+
     /// Queue one body's comparison: its snapshot, and the served answer.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn shadow_body_served(
         &self,
-        prepared: Prepared,
-        peer: &str,
-        topic: &str,
-        graph: &str,
+        shadow: &mut FinalizeShadow,
+        prepared: Option<Prepared>,
         position: usize,
         beef: &[u8],
         served: &Result<(Steak, MutationReport), EngineError>,
     ) {
+        let word = Word::served(served);
+        shadow.last = Some(word.clone());
+        let Some(prepared) = prepared else {
+            return;
+        };
         self.shadow_jobs
             .borrow_mut()
             .push(ShadowJob::Body(Box::new(BodyJob {
-                peer: peer.into(),
-                topic: topic.into(),
-                graph: graph.into(),
+                peer: shadow.peer.clone(),
+                topic: shadow.topic.clone(),
+                graph: shadow.root.clone(),
                 txid: body_txid(beef),
                 position: u32::try_from(position).unwrap_or(u32::MAX),
                 beef: beef.to_vec(),
                 prepared,
-                served: Word::served(served),
+                served: word,
                 served_judgement: served.as_ref().ok().map(|(steak, _)| judgement_of(steak)),
             })));
     }
 
     /// Queue one graph's comparison: its snapshot, and the rows the served
     /// submits left, read now (before a later graph moves them).
-    pub(crate) async fn shadow_graph_served(
-        &self,
-        prepared: Prepared,
-        peer: &str,
-        topic: &str,
-        beefs: &[Vec<u8>],
-        landed: &[String],
-        stopped: Option<&(String, Word)>,
-    ) {
-        let rows = materialized_rows(self.storage.as_ref(), topic, beefs).await;
+    pub(crate) async fn shadow_graph_served(&self, shadow: FinalizeShadow, beefs: &[Vec<u8>]) {
+        let rows = materialized_rows(self.storage.as_ref(), &shadow.topic, beefs).await;
         self.shadow_jobs
             .borrow_mut()
             .push(ShadowJob::Graph(Box::new(GraphJob {
-                peer: peer.into(),
-                topic: topic.into(),
-                graph: beefs.last().map_or_else(String::new, |b| body_txid(b)),
+                served: materialization_word(&shadow.landed, shadow.stopped.as_ref(), &rows),
+                peer: shadow.peer,
+                topic: shadow.topic,
+                graph: shadow.root,
                 beefs: beefs.to_vec(),
-                prepared,
-                served: materialization_word(landed, stopped, &rows),
+                prepared: shadow.prepared,
             })));
     }
 

@@ -23,8 +23,10 @@ wasm=wasm32-unknown-unknown/release/bsv_overlay_cloudflare.wasm
 # The shadow's names; none is in A1's Worker.
 names=(gasp_shadow admit_graph judge_dry walk_with_mode)
 
-scratch=$(mktemp -d /tmp/gasp-shadow-size.XXXXXX)
-trap 'rm -rf "$scratch"' EXIT
+# A fixed place for A1's tree, so its build is cached between runs.
+scratch=$targets/base-tree
+rm -rf "$scratch"
+mkdir -p "$scratch"
 git -C "$root" archive "$base" | tar -x -C "$scratch"
 
 build() { # tree target-dir [cargo args...]
@@ -37,7 +39,7 @@ build() { # tree target-dir [cargo args...]
 }
 
 count() { # file name
-  LC_ALL=C grep -a -o "$2" "$1" | wc -l | tr -d ' '
+  { LC_ALL=C grep -a -o "$2" "$1" || true; } | wc -l | tr -d ' '
 }
 
 a1=$(build "$scratch" "$targets/base")
