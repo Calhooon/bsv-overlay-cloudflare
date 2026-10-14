@@ -64,15 +64,22 @@ pub const SHADOW_READ_ALLOWANCE: usize = 4096;
 /// Bytes one shadow snapshot may read (the slice's `SHADOW_READ_BYTES`).
 pub const SHADOW_READ_BYTES: usize = 16 << 20;
 /// Milliseconds one shadow comparison may take, its snapshot and its own work
-/// together, never the served submit's (the slice's `SHADOW_TIME_BUDGET_MS`).
+/// together (the slice's `SHADOW_TIME_BUDGET_MS`). Never the served SUBMIT's
+/// time, but a snapshot is taken inside the served path (its race).
 pub const SHADOW_TIME_BUDGET_MS: u64 = 2_000;
+/// Snapshots one sync may hold at once, taken and not yet compared (the
+/// shadow lens's LOW 4). They are compared once, after every served write of
+/// the sync; past this no snapshot is taken.
+pub const SHADOW_SNAPSHOTS_HELD: usize = 64;
 
-/// One comparison's allowance. Past any limb the row is `not shadowed: budget`.
+/// The shadow's allowance: `rows`, `bytes` and `ms` per comparison,
+/// `snapshots` per sync. Past any limb the row is `not shadowed: budget`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShadowBudget {
     pub rows: usize,
     pub bytes: usize,
     pub ms: u64,
+    pub snapshots: usize,
 }
 
 impl Default for ShadowBudget {
@@ -81,7 +88,20 @@ impl Default for ShadowBudget {
             rows: SHADOW_READ_ALLOWANCE,
             bytes: SHADOW_READ_BYTES,
             ms: SHADOW_TIME_BUDGET_MS,
+            snapshots: SHADOW_SNAPSHOTS_HELD,
         }
+    }
+}
+
+impl ShadowBudget {
+    /// The reads limb's word, or `None` within it.
+    pub fn over_reads(&self, rows: usize, bytes: usize) -> Option<String> {
+        (rows > self.rows || bytes > self.bytes).then(|| {
+            format!(
+                "not shadowed: budget (reads: {rows} rows, {bytes} bytes; allowance {} rows, {} bytes)",
+                self.rows, self.bytes
+            )
+        })
     }
 }
 
@@ -113,6 +133,22 @@ pub struct ShadowSnapshot {
 /// The host of the engine's GASP shadow: the snapshot, the clock and the
 /// census. A failed snapshot is a `not shadowed` row; a failed record is
 /// logged; neither changes anything served.
+///
+/// The contract (the shadow lens's LOW 4 and NOTE 7):
+/// - `snapshot` honours the `budget` it is handed: it reads no more than
+///   `budget.rows` rows and `budget.bytes` bytes of the served store. Past
+///   either it reads no further and answers `Err` with the engine's words
+///   (`ShadowBudget::over_reads`, `not shadowed: budget (reads: ...)`), which
+///   the row carries as they are. The engine checks the snapshot's own
+///   `rows` and `bytes` again, so a host that reads past them still yields a
+///   `not shadowed` row, but its cost was paid inside the served race.
+/// - Nothing the snapshot's engine does reaches the network: it is built with
+///   no chain tracker, broadcaster, fetcher, peer factory or lookup service
+///   that calls out. The shadow is handed the served path's evidence and asks
+///   nobody (`tests/gasp_shadow.rs`, w7: the peer calls equal under `off` and
+///   `shadow`).
+/// - `snapshot` is called inside the served finalize (its per-peer race);
+///   everything else of a comparison runs after the sync's served writes.
 #[async_trait(?Send)]
 pub trait GaspShadow {
     async fn snapshot(
@@ -410,8 +446,13 @@ impl GaspShadow for MemoryGaspShadow {
     async fn snapshot(
         &self,
         _scope: &ShadowScope<'_>,
-        _budget: &ShadowBudget,
+        budget: &ShadowBudget,
     ) -> Result<ShadowSnapshot, String> {
+        // The whole store is the read: past the budget nothing is copied.
+        let (rows, bytes) = self.served.shadow_size();
+        if let Some(over) = budget.over_reads(rows, bytes) {
+            return Err(over);
+        }
         self.snapshots.set(self.snapshots.get() + 1);
         let store = Rc::new(self.served.shadow_copy());
         let (rows, bytes) = store.shadow_size();

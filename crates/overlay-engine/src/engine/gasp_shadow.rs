@@ -15,6 +15,24 @@ use std::rc::Rc;
 pub(crate) struct Prepared {
     snapshot: Result<ShadowSnapshot, String>,
     ms: u64,
+    /// Counts the snapshot among those held until it is dropped.
+    _held: Option<Held>,
+}
+
+/// One snapshot held: the engine's count, less one when it is dropped.
+pub(crate) struct Held(Rc<std::cell::Cell<usize>>);
+
+impl Held {
+    fn new(count: &Rc<std::cell::Cell<usize>>) -> Self {
+        count.set(count.get() + 1);
+        Self(count.clone())
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 pub(crate) struct BodyJob {
@@ -239,6 +257,16 @@ fn materialization_word(
     }
 }
 
+/// A snapshot that was not taken: the budget's words as they are, any other
+/// failure as the host's setup.
+fn not_snapshotted(error: &str) -> Word {
+    if error.starts_with("not shadowed") {
+        Word::not_shadowed(error)
+    } else {
+        Word::not_shadowed(format!("shadow setup: {error}"))
+    }
+}
+
 /// What a verdict decided, never who said it or when (the slice's).
 fn verdict_class(evidence: &TxEvidence) -> (Option<String>, Option<String>) {
     let network = evidence.network.as_ref().map(|verdict| match verdict {
@@ -345,11 +373,23 @@ impl Engine {
         topic: &str,
         beefs: &[Vec<u8>],
     ) -> Prepared {
+        let held = self.shadow_held.get();
+        if held >= self.shadow_budget.snapshots {
+            return Prepared {
+                snapshot: Err(format!(
+                    "not shadowed: budget (snapshots: {held} held; allowance {})",
+                    self.shadow_budget.snapshots
+                )),
+                ms: 0,
+                _held: None,
+            };
+        }
         let start = host.now_ms();
         let snapshot = host
             .snapshot(&ShadowScope { peer, topic, beefs }, &self.shadow_budget)
             .await;
         Prepared {
+            _held: snapshot.is_ok().then(|| Held::new(&self.shadow_held)),
             snapshot,
             ms: host.now_ms().saturating_sub(start),
         }
@@ -529,13 +569,7 @@ impl Engine {
     }
 
     fn over_reads(&self, snapshot: &ShadowSnapshot) -> Option<String> {
-        let budget = &self.shadow_budget;
-        (snapshot.rows > budget.rows || snapshot.bytes > budget.bytes).then(|| {
-            format!(
-                "not shadowed: budget (reads: {} rows, {} bytes; allowance {} rows, {} bytes)",
-                snapshot.rows, snapshot.bytes, budget.rows, budget.bytes
-            )
-        })
+        self.shadow_budget.over_reads(snapshot.rows, snapshot.bytes)
     }
 
     async fn shadow_body(&self, host: &dyn GaspShadow, job: BodyJob) -> GaspCensusRow {
@@ -567,7 +601,7 @@ impl Engine {
         row.shadow = 'judged: {
             let snapshot = match job.prepared.snapshot {
                 Ok(snapshot) => snapshot,
-                Err(e) => break 'judged Word::not_shadowed(format!("shadow setup: {e}")),
+                Err(e) => break 'judged not_snapshotted(&e),
             };
             row.snapshot_rows = snapshot.rows;
             row.snapshot_bytes = snapshot.bytes;
@@ -639,7 +673,7 @@ impl Engine {
         row.shadow = 'judged: {
             let snapshot = match job.prepared.snapshot {
                 Ok(snapshot) => snapshot,
-                Err(e) => break 'judged Word::not_shadowed(format!("shadow setup: {e}")),
+                Err(e) => break 'judged not_snapshotted(&e),
             };
             row.snapshot_rows = snapshot.rows;
             row.snapshot_bytes = snapshot.bytes;

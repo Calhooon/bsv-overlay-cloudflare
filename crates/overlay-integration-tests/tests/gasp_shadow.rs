@@ -753,12 +753,17 @@ async fn w5_past_the_budget_the_row_says_not_shadowed_budget_and_nothing_served_
     .await;
     assert_eq!(off.served(), rows.served());
     assert_eq!(rows.census.len(), 13);
+    // The memory host honours the budget it is handed: past it no copy is
+    // taken, and the row carries the engine's words. Only a snapshot of the
+    // empty store (the first graph's) is judged.
     for row in &rows.census {
         let word = String::from_utf8_lossy(&row.shadow.bytes).to_string();
-        if row.snapshot_rows > 0 {
-            assert_eq!(row.delta, DeltaClass::NotShadowed);
+        if row.delta == DeltaClass::NotShadowed {
             assert_eq!(row.shadow.status, 0);
-            assert!(word.starts_with("not shadowed: budget"), "{word}");
+            assert!(word.starts_with("not shadowed: budget (reads: "), "{word}");
+            assert_eq!(row.snapshot_rows, 0, "nothing was copied");
+        } else {
+            assert_eq!(row.snapshot_rows, 0, "{word}");
         }
     }
     assert!(rows

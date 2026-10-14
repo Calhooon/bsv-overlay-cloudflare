@@ -143,6 +143,9 @@ pub struct Engine {
     /// (`None`: not capturing, nothing is kept).
     #[cfg(feature = "gasp-shadow")]
     manager_errors: std::cell::RefCell<Option<Vec<String>>>,
+    /// The shadow's snapshots alive (taken, not yet compared or dropped).
+    #[cfg(feature = "gasp-shadow")]
+    shadow_held: std::rc::Rc<std::cell::Cell<usize>>,
     config: EngineConfig,
 }
 
@@ -1148,6 +1151,8 @@ impl Engine {
             shadow_jobs: std::cell::RefCell::default(),
             #[cfg(feature = "gasp-shadow")]
             manager_errors: std::cell::RefCell::default(),
+            #[cfg(feature = "gasp-shadow")]
+            shadow_held: std::rc::Rc::default(),
             config,
         }
     }
@@ -5195,6 +5200,11 @@ impl Engine {
             });
         }
 
+        // GASP's shadow: the comparisons a sync the caller dropped left queued
+        // go with it, their snapshots dropped.
+        #[cfg(feature = "gasp-shadow")]
+        self.shadow_jobs.borrow_mut().clear();
+
         let mut topics_synced: HashMap<String, TopicSyncResult> = HashMap::new();
         // Resolve SLAP providers once per invocation, sharing their host cap
         // across all SHIP topics. Every topic still queries each lookup host.
@@ -5561,13 +5571,6 @@ impl Engine {
                             errors.push(msg);
                         }
                     }
-                    // GASP's shadow (bsv-low #657, R7.7 item 5): the
-                    // comparisons this peer's finalize queued run here, after
-                    // its race, so their time moves no deadline. `Off` skips.
-                    #[cfg(feature = "gasp-shadow")]
-                    if self.gasp_shadow_host().is_some() {
-                        self.drain_gasp_shadow().await;
-                    }
                     // bsv-low #555, the delta fold's D-M2: "progress" (a node
                     // appended) is the peer's word. A sync the peer served
                     // work that finalized no graph and moved no cursor is
@@ -5689,6 +5692,16 @@ impl Engine {
             topics_synced.len()
         );
 
+        // GASP's shadow (bsv-low #657, R7.7 item 5; the shadow lens's LOW
+        // 4): the comparisons every peer's finalize queued run here, once,
+        // after every served write of the sync (each peer's race, cursor and
+        // health rows), so their time delays no peer, topic or served write.
+        // Inside a caller's race of this sync (the Worker's 240 s belt) they
+        // are the last thing cut. `Off` skips.
+        #[cfg(feature = "gasp-shadow")]
+        if self.gasp_shadow_host().is_some() {
+            self.drain_gasp_shadow().await;
+        }
         Ok(GASPSyncResult { topics_synced })
     }
 
