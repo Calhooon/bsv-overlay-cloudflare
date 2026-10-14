@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-overlay-discovery"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "base64",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-overlay-engine"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "bsv-overlay-engine",
@@ -1275,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "overlay-integration-tests"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "bsv-overlay-discovery",
@@ -1301,7 +1301,7 @@ dependencies = [
 
 [[package]]
 name = "parity-harness"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "clap",
