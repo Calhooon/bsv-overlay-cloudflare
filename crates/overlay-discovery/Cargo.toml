@@ -43,4 +43,5 @@ base64 = "0.22"
 js-sys = "0.3"
 
 [dev-dependencies]
+overlay-engine = { package = "bsv-overlay-engine", version = "0.1.5", path = "../overlay-engine", features = ["memory-storage"] }
 tokio = { workspace = true, features = ["rt", "macros"] }

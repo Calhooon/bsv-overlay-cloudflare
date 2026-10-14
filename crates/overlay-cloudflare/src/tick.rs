@@ -472,7 +472,9 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 }
             }
             for (k, e) in &crawl_result.peer_errors {
-                worker::console_log!("  Scheduled peer-crawl {k}: lookup failed: {e}");
+                if !crate::peer_crawler::is_lookup_400(e) {
+                    worker::console_log!("  Scheduled peer-crawl {k}: lookup failed: {e}");
+                }
             }
         }
     }

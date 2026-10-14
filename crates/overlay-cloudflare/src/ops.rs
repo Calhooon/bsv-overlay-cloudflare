@@ -1517,6 +1517,7 @@ pub async fn health_invariants(
         // rows are excluded at enrol AND dropped by the watch GC.
         "prooflessOver24h": flagged,
         "heldByWindow": held_by_window,
+        "gaspExpiredRefused": counters.get(crate::gasp_deferred::COUNTER_GASP_EXPIRED_REFUSED).and_then(serde_json::Value::as_u64).unwrap_or(0),
         "peerProofRequests": counters.get("peer_proof_requests_total").and_then(serde_json::Value::as_u64).unwrap_or(0),
         "peerProofsLanded": counters.get("peer_proofs_landed_total").and_then(serde_json::Value::as_u64).unwrap_or(0),
         "retiredExpiredUnprovenTotal": expired_unproven,
@@ -1577,6 +1578,32 @@ mod tests {
             COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN: no_token,
             COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN: bad_token,
         })
+    }
+
+    #[test]
+    fn copy_expired_counter_persists_real_sqlite_deltas() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            let _ = db.execute_batch(sql);
+        }
+        let topic: overlay_engine::engine::TopicSyncResult = serde_json::from_value(json!({
+            "peers": [], "sync_type": "peers", "errors": [], "expired_refused": 2
+        }))
+        .unwrap();
+        let topics = std::collections::HashMap::from([("tm_uhrp".to_string(), topic)]);
+        for (name, delta) in crate::gasp_deferred::counter_deltas(&topics) {
+            db.execute(BUMP_COUNTER_SQL, rusqlite::params![name, delta])
+                .unwrap();
+        }
+        let count: u64 = db
+            .query_row(
+                "SELECT value FROM ops_counters WHERE name = ?",
+                [crate::gasp_deferred::COUNTER_GASP_EXPIRED_REFUSED],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(include_str!("ops.rs").contains("\"gaspExpiredRefused\": counters.get(crate::gasp_deferred::COUNTER_GASP_EXPIRED_REFUSED)"));
     }
 
     #[test]

@@ -484,6 +484,8 @@ pub const COUNTER_GASP_GRAPH_DROPPED: &str = "gasp_graph_dropped_total";
 /// Graphs HELD because their GASP anchor's script walk could not run within the engine's walk budget (bsv-low #592;
 /// the E592 lens fold, H1 and L3): not finalized, the UTXO below its cursor until the root is served proven.
 pub const COUNTER_GASP_ANCHOR_WALK_HELD: &str = "gasp_anchor_walk_held_total";
+/// Expired roots omitted before proof hydration.
+pub const COUNTER_GASP_EXPIRED_REFUSED: &str = "gasp_expired_refused_total";
 
 /// The counter of one drop reason: `gasp_graph_dropped_<reason>_total`.
 pub fn dropped_counter_name(reason: &str) -> String {
@@ -499,6 +501,7 @@ pub fn counter_names() -> Vec<String> {
         COUNTER_GASP_GRAPH_DROPPED.to_string(),
         COUNTER_GASP_GRAPH_DROPPED_STALE.to_string(),
         COUNTER_GASP_ANCHOR_WALK_HELD.to_string(),
+        COUNTER_GASP_EXPIRED_REFUSED.to_string(),
     ];
     names.extend(
         overlay_engine::gasp::DropReason::ALL
@@ -515,6 +518,9 @@ pub fn counter_deltas(
 ) -> Vec<(String, u64)> {
     let mut deltas: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for r in results.values() {
+        *deltas
+            .entry(COUNTER_GASP_EXPIRED_REFUSED.into())
+            .or_default() += r.expired_refused;
         *deltas
             .entry(COUNTER_GASP_GRAPH_DEFERRED.into())
             .or_default() += r.deferred_graphs;
@@ -1611,6 +1617,7 @@ mod tests {
     #[test]
     fn e555_the_counters_sum_a_sync_and_count_drops_by_reason() {
         let topic = |deferred, resumed, converged, reasons: &[&str]| TopicSyncResult {
+            expired_refused: 0,
             peers: vec![],
             sync_type: "peers".into(),
             errors: vec![],
@@ -1654,9 +1661,10 @@ mod tests {
             ]
         );
         let names = counter_names();
-        // the E592 lens fold: the anchor's hold is seeded beside them
-        assert_eq!(names.len(), 6 + 10);
+        // Seed both the anchor hold and the sync expiry refusal.
+        assert_eq!(names.len(), 7 + 10);
         assert!(names.contains(&COUNTER_GASP_ANCHOR_WALK_HELD.to_string()));
+        assert!(names.contains(&COUNTER_GASP_EXPIRED_REFUSED.to_string()));
         // bsv-low #585: nothing is dropped for its size.
         assert!(!names.contains(&"gasp_graph_dropped_too_big_total".to_string()));
         assert!(names.contains(&"gasp_graph_dropped_root_proven_total".to_string()));
