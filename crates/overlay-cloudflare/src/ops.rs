@@ -1523,6 +1523,8 @@ pub async fn health_invariants(
         "gaspExpiredRefused": counters.get(crate::gasp_deferred::COUNTER_GASP_EXPIRED_REFUSED).and_then(serde_json::Value::as_u64).unwrap_or(0),
         // Engine 0.1.9: roots recorded unanchorable (the cursor passed them).
         "gaspUnanchorable": counters.get(crate::gasp_deferred::COUNTER_GASP_UNANCHORABLE).and_then(serde_json::Value::as_u64).unwrap_or(0),
+        // Engine 0.1.10: strikes not written (the root stays a gap, named).
+        "gaspStrikesRefused": counters.get(crate::gasp_deferred::COUNTER_GASP_STRIKES_REFUSED).and_then(serde_json::Value::as_u64).unwrap_or(0),
         "peerProofRequests": counters.get("peer_proof_requests_total").and_then(serde_json::Value::as_u64).unwrap_or(0),
         "peerProofsLanded": counters.get("peer_proofs_landed_total").and_then(serde_json::Value::as_u64).unwrap_or(0),
         "retiredExpiredUnprovenTotal": expired_unproven,

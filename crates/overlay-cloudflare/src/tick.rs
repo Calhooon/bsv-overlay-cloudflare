@@ -350,7 +350,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 r.topics_synced.values().map(f).sum()
             };
             worker::console_log!(
-                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={} anchor_walk_held_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped_graphs={} stalled_graphs={} held_back_graphs={} unanchorable_graphs={} unanchorable_cleared={}",
+                "Scheduled: GASP sync: topics={} peers={} errors={} pruned_inputs={} discarded_graphs={} anchor_walk_held_graphs={} deferred_graphs={} resumed_graphs={} converged_graphs={} dropped_graphs={} stalled_graphs={} held_back_graphs={} unanchorable_graphs={} unanchorable_cleared={} strikes_refused={} backed_off_graphs={} waiting_graphs={}",
                 r.topics_synced.len(),
                 total_peers,
                 total_errors,
@@ -364,7 +364,12 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 sum(|t| t.stalled_graphs),
                 sum(|t| t.held_back_graphs),
                 sum(|t| t.unanchorable_graphs),
-                sum(|t| t.unanchorable_cleared)
+                sum(|t| t.unanchorable_cleared),
+                // Engine 0.1.10: a strike not written is a fact on the line,
+                // and the held records the idle backoff sent away or kept.
+                sum(|t| t.strikes_refused),
+                sum(|t| t.backed_off_graphs),
+                sum(|t| t.waiting_graphs)
             );
             crate::gasp_deferred::record_counters(&ops_db, &r.topics_synced).await;
             // bsv-low #552: what the tick got done under the per-peer
@@ -851,15 +856,21 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
 
 /// PURE: one item per root a sync dropped (engine 0.1.9), for the tick's
 /// line: `<outpoint> <class> runs=<n>`, ` unanchorable` once the cursor
-/// passes it, then the peer.
+/// passes it, the reason its strike was refused (engine 0.1.10: ` no_room`
+/// or ` store_fault`), then the peer.
 pub(crate) fn faulted_summary(roots: &[overlay_engine::gasp::FaultedRoot]) -> Vec<String> {
     roots
         .iter()
         .map(|f| {
             let passed = if f.unanchorable { " unanchorable" } else { "" };
+            let refused = if f.refused.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", f.refused)
+            };
             format!(
-                "{} {} runs={}{} {}",
-                f.outpoint, f.class, f.faults, passed, f.peer
+                "{} {} runs={}{}{} {}",
+                f.outpoint, f.class, f.faults, passed, refused, f.peer
             )
         })
         .collect()
@@ -896,6 +907,39 @@ mod tests {
         let src = include_str!("tick.rs");
         assert!(src.contains("cursor_held_by={:?} faulted={:?}"));
         assert!(src.contains("faulted_summary(&res.faulted_roots)"));
+    }
+
+    /// Engine 0.1.10: a root whose strike was refused carries why on the
+    /// tick's per-topic line (`no_room`, `store_fault`), and the summary
+    /// line counts the refused strikes and the idle backoff's records.
+    #[test]
+    fn room_0110_the_tick_names_a_refused_strike() {
+        let root = |refused: &str| overlay_engine::gasp::FaultedRoot {
+            peer: "https://peer.example".into(),
+            outpoint: "aa.0".into(),
+            class: "courier".into(),
+            faults: 0,
+            unanchorable: false,
+            error: "no rung served".into(),
+            refused: refused.into(),
+        };
+        assert_eq!(
+            faulted_summary(&[
+                root(overlay_engine::gasp::strike_refused::NO_ROOM),
+                root(overlay_engine::gasp::strike_refused::STORE_FAULT),
+                root(""),
+            ]),
+            vec![
+                "aa.0 courier runs=0 no_room https://peer.example".to_string(),
+                "aa.0 courier runs=0 store_fault https://peer.example".to_string(),
+                "aa.0 courier runs=0 https://peer.example".to_string(),
+            ]
+        );
+        let src = include_str!("tick.rs");
+        assert!(src.contains(
+            "unanchorable_cleared={} strikes_refused={} backed_off_graphs={} waiting_graphs={}"
+        ));
+        assert!(src.contains("sum(|t| t.strikes_refused)"));
     }
 
     #[test]

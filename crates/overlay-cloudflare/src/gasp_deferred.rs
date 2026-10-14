@@ -557,6 +557,11 @@ pub const COUNTER_GASP_EXPIRED_REFUSED: &str = "gasp_expired_refused_total";
 /// `UNANCHORABLE_AFTER_FAULTED_RUNS` consecutive runs and the cursor passes
 /// them; invariants' `gaspUnanchorable`.
 pub const COUNTER_GASP_UNANCHORABLE: &str = "gasp_unanchorable_total";
+/// Strikes the engine could not write (engine 0.1.10): past
+/// `FAULT_RECORDS_PER_PEER_TOPIC`, at this store's ceiling or on its fault;
+/// invariants' `gaspStrikesRefused`. Each leaves its root a gap the cursor
+/// holds below, named `no_room` or `store_fault` on the tick's line.
+pub const COUNTER_GASP_STRIKES_REFUSED: &str = "gasp_strikes_refused_total";
 
 /// The counter of one drop reason: `gasp_graph_dropped_<reason>_total`.
 pub fn dropped_counter_name(reason: &str) -> String {
@@ -574,6 +579,7 @@ pub fn counter_names() -> Vec<String> {
         COUNTER_GASP_ANCHOR_WALK_HELD.to_string(),
         COUNTER_GASP_EXPIRED_REFUSED.to_string(),
         COUNTER_GASP_UNANCHORABLE.to_string(),
+        COUNTER_GASP_STRIKES_REFUSED.to_string(),
         COUNTER_GASP_ROOTS_PROVEN.to_string(),
         COUNTER_GASP_ROOTS_UNPROVEN.to_string(),
     ];
@@ -600,6 +606,9 @@ pub fn counter_deltas(
             .entry(COUNTER_GASP_EXPIRED_REFUSED.into())
             .or_default() += r.expired_refused;
         *deltas.entry(COUNTER_GASP_UNANCHORABLE.into()).or_default() += r.unanchorable_graphs;
+        *deltas
+            .entry(COUNTER_GASP_STRIKES_REFUSED.into())
+            .or_default() += r.strikes_refused;
         *deltas
             .entry(COUNTER_GASP_GRAPH_DEFERRED.into())
             .or_default() += r.deferred_graphs;
@@ -1850,6 +1859,40 @@ mod tests {
         ));
     }
 
+    /// Engine 0.1.10: the strikes a sync could not write are counted
+    /// (`gasp_strikes_refused_total`, summed over topics) and served on
+    /// invariants as `gaspStrikesRefused`; an older engine's results read 0.
+    #[test]
+    fn room_0110_the_refused_strikes_sum_and_are_served() {
+        let topic =
+            |json: serde_json::Value| -> TopicSyncResult { serde_json::from_value(json).unwrap() };
+        let results = std::collections::HashMap::from([
+            (
+                "tm_a".to_string(),
+                topic(
+                    serde_json::json!({"peers": [], "sync_type": "peers", "errors": [], "strikes_refused": 2}),
+                ),
+            ),
+            (
+                "tm_b".to_string(),
+                topic(
+                    serde_json::json!({"peers": [], "sync_type": "peers", "errors": [], "strikes_refused": 1, "backed_off_graphs": 4, "waiting_graphs": 9}),
+                ),
+            ),
+            (
+                "tm_c".to_string(),
+                topic(serde_json::json!({"peers": [], "sync_type": "peers", "errors": []})),
+            ),
+        ]);
+        assert_eq!(
+            counter_deltas(&results),
+            vec![(COUNTER_GASP_STRIKES_REFUSED.to_string(), 3)]
+        );
+        assert!(include_str!("ops.rs").contains(
+            "\"gaspStrikesRefused\": counters.get(crate::gasp_deferred::COUNTER_GASP_STRIKES_REFUSED)"
+        ));
+    }
+
     /// bsv-low #555: the counters of a sync, summed over topics, a drop
     /// counted in all and under its reason; every name seeded.
     #[test]
@@ -1908,9 +1951,10 @@ mod tests {
             ]
         );
         let names = counter_names();
-        // Seed both the anchor hold and the sync expiry refusal, and the
-        // unanchorable roots (engine 0.1.9).
-        assert_eq!(names.len(), 10 + 10);
+        // Seed both the anchor hold and the sync expiry refusal, the
+        // unanchorable roots (engine 0.1.9) and the refused strikes (0.1.10).
+        assert_eq!(names.len(), 11 + 10);
+        assert!(names.contains(&COUNTER_GASP_STRIKES_REFUSED.to_string()));
         assert!(names.contains(&COUNTER_GASP_UNANCHORABLE.to_string()));
         assert!(names.contains(&COUNTER_GASP_ANCHOR_WALK_HELD.to_string()));
         assert!(names.contains(&COUNTER_GASP_EXPIRED_REFUSED.to_string()));
