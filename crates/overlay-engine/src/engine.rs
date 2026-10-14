@@ -278,6 +278,12 @@ struct Landing {
     subject_walk_ran: bool,
 }
 
+/// A carried landing either applies or returns its original typed refusals.
+enum CarriedLanding {
+    Landed,
+    Refused(Vec<AdmissionRefusal>),
+}
+
 struct NotNow {
     why: String,
     carried: Option<String>,
@@ -1698,13 +1704,21 @@ impl Engine {
                 &mut report.landed_predecessors,
                 landing,
                 &mut report.landed_walks_could_not_run,
+                &mut report.refused,
             )
             .await;
+        let mut refused_topics: HashSet<String> =
+            report.refused.iter().map(|r| r.topic.clone()).collect();
         // A carried predecessor's topic that does not wait is judged again,
         // for real: what it admits is this call's word, over the same coins.
         if carried {
             for v in &mut validations {
-                if v.is_dupe || v.failed || v.read_fault.is_some() || waits.contains_key(&v.topic) {
+                if v.is_dupe
+                    || v.failed
+                    || v.read_fault.is_some()
+                    || waits.contains_key(&v.topic)
+                    || refused_topics.contains(&v.topic)
+                {
                     continue;
                 }
                 match self
@@ -1740,9 +1754,13 @@ impl Engine {
             atomic_beef: &subject_named_beef,
             off_chain_values: tagged_beef.off_chain_values.as_deref(),
         };
-        let mut refused_topics = HashSet::new();
         for v in &validations {
-            if v.is_dupe || v.failed || v.read_fault.is_some() || waits.contains_key(&v.topic) {
+            if v.is_dupe
+                || v.failed
+                || v.read_fault.is_some()
+                || waits.contains_key(&v.topic)
+                || refused_topics.contains(&v.topic)
+            {
                 continue;
             }
             for (prev_idx, prev_output) in v.previous_outputs.iter().enumerate() {
@@ -2283,7 +2301,9 @@ impl Engine {
     /// service reads off-chain values (the delta fold, L1: the landing has
     /// none to give, and the predecessor's own submit would be a dupe): the
     /// topic waits for that submit. The first predecessor that does not land
-    /// ends it: the topic waits. A predecessor whose body the BEEF does not
+    /// ends it: the topic waits unless its lookup check refused, in which case
+    /// the successor topic is refused with the same typed records.
+    /// A predecessor whose body the BEEF does not
     /// carry is never landed here: its successor converges only when it
     /// lands (its own replay, a GASP peer, a resubmit).
     #[allow(clippy::too_many_arguments)]
@@ -2304,6 +2324,7 @@ impl Engine {
         landed: &mut Vec<(String, String)>,
         landing: Landing,
         landed_breaches: &mut Vec<WalkCouldNotRun>,
+        refused: &mut Vec<AdmissionRefusal>,
     ) -> HashMap<String, String> {
         let mut waits = HashMap::new();
         let spent: Vec<(String, u32)> = tx
@@ -2420,7 +2441,13 @@ impl Engine {
                     )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(CarriedLanding::Refused(records)) => {
+                        // No re-judgement or apply follows a deterministic refusal.
+                        *question_reads -= rejudge;
+                        refused.extend(records);
+                        break;
+                    }
+                    Ok(CarriedLanding::Landed) => {
                         *v = self
                             .validate_topic(
                                 tx,
@@ -2511,8 +2538,8 @@ impl Engine {
     /// fold, L2). Each body is asked of the caller's landing guard first,
     /// once ([`Engine::set_landing_guard`]; the delta-2 fold, L2): a refusal
     /// ends the landing before that body is submitted.
-    /// `Ok` once `predecessor` LANDED in `topic` (recorded there,
-    /// now or before); otherwise why not, at the first that did not.
+    /// Returns `Landed` once `predecessor` is recorded in `topic`, or the
+    /// inner report's typed `Refused` records. Other failures return why not.
     #[allow(clippy::too_many_arguments)]
     async fn land_carried(
         &self,
@@ -2526,7 +2553,7 @@ impl Engine {
         landed: &mut Vec<(String, String)>,
         landing: Landing,
         landed_breaches: &mut Vec<WalkCouldNotRun>,
-    ) -> Result<(), String> {
+    ) -> Result<CarriedLanding, String> {
         let beef = beef_limits::parse_beef(beef_bytes, &beef_limits::ENGINE_BEEF_LIMITS)
             .map_err(|e| format!("the BEEF could not be read again ({e})"))?;
         let mode = match mode {
@@ -2612,13 +2639,16 @@ impl Engine {
                 stack.pop();
                 continue;
             }
+            if !report.refused.is_empty() {
+                return Ok(CarriedLanding::Refused(report.refused));
+            }
             match blocked.get(topic) {
                 Some(under) if !stack.contains(under) => stack.push(under.clone()),
                 _ if report.is_durable() => return Err(format!("{next}: the manager failed it")),
                 _ => return Err(format!("{next}: {}", report.summary())),
             }
         }
-        Ok(())
+        Ok(CarriedLanding::Landed)
     }
 
     /// A topic of a submit that is NOT recorded as applied: logged, and

@@ -4695,6 +4695,127 @@ fn unproven_beef(nodes: &[GASPNode], subject: usize, proven: usize) -> TaggedBEE
     TaggedBEEF::new(tx.to_beef(false).unwrap(), vec![TOPIC.to_string()])
 }
 
+// E657 correction 2: the lens probe, with genesis landed and two unproven
+// nodes carried by the successor. A refusal of node 1 must remain typed.
+#[tokio::test]
+async fn e657_carried_refusal_is_typed_for_the_successor() {
+    use bsv_overlay_engine::engine::AdmissionRefusal;
+    use bsv_overlay_engine::lookup_service::{LookupService, LookupServiceError};
+
+    struct RefuseCarried {
+        txid: String,
+        checked: Rc<RefCell<Vec<String>>>,
+        notified: Rc<RefCell<Vec<String>>>,
+    }
+    #[async_trait(?Send)]
+    impl LookupService for RefuseCarried {
+        fn admission_mode(&self) -> AdmissionMode {
+            AdmissionMode::LockingScript
+        }
+        fn spend_notification_mode(&self) -> SpendNotificationMode {
+            SpendNotificationMode::None
+        }
+        fn reads_off_chain_values(&self, _: &str) -> bool {
+            false
+        }
+        fn check_admitted(
+            &self,
+            payload: &OutputAdmittedByTopic,
+        ) -> Result<(), LookupServiceError> {
+            if let OutputAdmittedByTopic::LockingScript { txid, .. } = payload {
+                self.checked.borrow_mut().push(txid.clone());
+                if *txid == self.txid {
+                    return Err(LookupServiceError::Other("lens refusal".into()));
+                }
+            }
+            Ok(())
+        }
+        async fn output_admitted_by_topic(
+            &self,
+            payload: &OutputAdmittedByTopic,
+        ) -> Result<(), LookupServiceError> {
+            if let OutputAdmittedByTopic::LockingScript { txid, .. } = payload {
+                self.notified.borrow_mut().push(txid.clone());
+            }
+            Ok(())
+        }
+        async fn output_evicted(&self, _: &str, _: u32) -> Result<(), LookupServiceError> {
+            Ok(())
+        }
+        async fn lookup(&self, _: &LookupQuestion) -> Result<LookupResult, LookupServiceError> {
+            Ok(LookupResult::OutputList(Vec::new()))
+        }
+        async fn get_documentation(&self) -> String {
+            String::new()
+        }
+        async fn get_metadata(&self) -> ServiceMetadata {
+            ServiceMetadata::default()
+        }
+    }
+
+    let nodes = chain(3);
+    let store = Rc::new(MemoryStorage::new());
+    assert!(
+        submitted(&shape_door(&store, true), &proven_beef(&nodes[0]))
+            .await
+            .is_durable()
+    );
+    let before = admitted_digest(&store).await;
+    let checked = Rc::new(RefCell::new(Vec::new()));
+    let notified = Rc::new(RefCell::new(Vec::new()));
+    let engine = Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(ShapeHeadManager { names: true }) as Box<dyn TopicManager>,
+        )]),
+        HashMap::from([(
+            "ls_lens".to_string(),
+            Box::new(RefuseCarried {
+                txid: node_txid(&nodes[1]),
+                checked: checked.clone(),
+                notified: notified.clone(),
+            }) as Box<dyn LookupService>,
+        )]),
+        Box::new(store.clone()),
+        None,
+        EngineConfig::default(),
+    );
+    let report = submitted(&engine, &unproven_beef(&nodes, 2, 0)).await;
+    println!(
+        "refused={:?} faults={:?} landed={:?} store={:?}",
+        report.refused,
+        report.faults,
+        report.landed_predecessors,
+        rows(&store, &nodes).await,
+    );
+    assert_eq!(rows(&store, &nodes).await, ["0:spent=false"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true, false, false]);
+    assert_eq!(
+        admitted_digest(&store).await,
+        before,
+        "stored bytes changed"
+    );
+    assert!(notified.borrow().is_empty());
+    assert!(!report.is_durable());
+    assert!(report.applied_topics.is_empty());
+    assert!(report.landed_predecessors.is_empty());
+    assert_eq!(
+        report.refused,
+        vec![AdmissionRefusal {
+            topic: TOPIC.to_string(),
+            service: "ls_lens".to_string(),
+            site: "lookup_service.check_admitted",
+            error: LookupServiceError::Other("lens refusal".into()),
+        }],
+        "carried refusal must reach the successor as typed refusal"
+    );
+    assert!(
+        report.faults.is_empty(),
+        "a typed refusal is never a predecessor wait"
+    );
+    assert_eq!(*checked.borrow(), [node_txid(&nodes[1])]);
+}
+
 // F1: the DELETE of the stale coin answers an error, after the insert. The
 // first fold read the old head back held and took the new one out again; the
 // second delta fold of 2026-10-07 (M1) undoes nothing once a delete was
