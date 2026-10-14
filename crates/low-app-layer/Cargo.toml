@@ -15,10 +15,10 @@ workspace = "../../workers"
 crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
-bsv-worker-build-info = { version = "0.1.14", path = "../worker-build-info", features = ["build"] }
+bsv-worker-build-info = { version = "0.1.15", path = "../worker-build-info", features = ["build"] }
 
 [dependencies]
-bsv-worker-build-info = { version = "0.1.14", path = "../worker-build-info" }
+bsv-worker-build-info = { version = "0.1.15", path = "../worker-build-info" }
 getrandom = { version = "0.2", features = ["js"] }
 # worker 0.8 (bsv-low #318): `bsv-middleware-cloudflare` 0.3 — the canonical
 # BRC-103/104 middleware, the SAME major the low-watchtower pins — requires
@@ -59,15 +59,15 @@ base64 = "0.22"
 bsv-rs.workspace = true
 bsv-tracker = "=0.2.2"
 # Shared parser policies for client-derived BEEF read from the overlay's store.
-overlay-engine = { package = "bsv-overlay-engine", version = "0.1.14", path = "../overlay-engine" }
+overlay-engine = { package = "bsv-overlay-engine", version = "0.1.15", path = "../overlay-engine" }
 # The `Poc5TemplatePot` covenant recognizer + param-region accessor (the SAME
 # frozen template bytes `tm_pot` admits with) — used by the settle classifier
 # (bsv-low #227) to recover a pot's COMMITTED params from its funding lock.
-overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1.14", path = "../overlay-discovery" }
+overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1.15", path = "../overlay-discovery" }
 # bsv-low #553: the `LOW/proof/v1` replay (was `overlay_discovery::proof::replay`),
 # run on a posted bundle and on a row the overlay admitted before the replay
 # shipped. It carries the PATH deps on the private `bsv-low` checkout.
-low-proof-replay = { package = "bsv-low-proof-replay", version = "0.1.14", path = "../low-proof-replay" }
+low-proof-replay = { package = "bsv-low-proof-replay", version = "0.1.15", path = "../low-proof-replay" }
 # Readable wasm panics in `wrangler tail` (same pattern as the overlay worker).
 console_error_panic_hook = "0.1"
 # /live-view's bounded tower fan-out: `select` races each service-binding
@@ -82,7 +82,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # real schema rather than pinning its text (bsv-low #281). Test-only: neither
 # is linked into the wasm32 Worker build.
 rusqlite = { version = "0.32", features = ["bundled"] }
-bsv-overlay-cloudflare = { version = "0.1.14", path = "../overlay-cloudflare" }
+bsv-overlay-cloudflare = { version = "0.1.15", path = "../overlay-cloudflare" }
 # #318 real-crypto auth round-trip (tests/auth_real_crypto_roundtrip.rs):
 # the SDK's REAL BRC-103 `Peer` on both ends (the implementation the
 # middleware ports 1:1), real ECDSA over real random keys — never a mocked
