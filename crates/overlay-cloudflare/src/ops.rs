@@ -782,16 +782,30 @@ pub async fn latch_network_seen(db: &D1Database, txid: &str) {
     // row after the witness. The caller ships the notes: the route's
     // end-of-request flush for an in-request latch, `pot_changes::flush_inline`
     // from a background job. A txid that funds and spends no pot notes nothing.
-    let funded: Vec<PotVoutRow> = Query::new(NETWORK_SEEN_POT_ROWS_SQL)
+    // Best effort: a faulted read notes nothing (the latch above stays
+    // committed) and logs one line, so the operator sees why no note followed.
+    let funded: Vec<PotVoutRow> = match Query::new(NETWORK_SEEN_POT_ROWS_SQL)
         .bind(txid)
         .fetch_all(db)
         .await
-        .unwrap_or_default();
-    let spent: Vec<PotOutpointRow> = Query::new(NETWORK_SEEN_SPENT_POT_ROWS_SQL)
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            worker::console_log!("[#660] funded-pot read failed for {txid}: {e}");
+            Vec::new()
+        }
+    };
+    let spent: Vec<PotOutpointRow> = match Query::new(NETWORK_SEEN_SPENT_POT_ROWS_SQL)
         .bind(txid)
         .fetch_all(db)
         .await
-        .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            worker::console_log!("[#660] spent-pot read failed for {txid}: {e}");
+            Vec::new()
+        }
+    };
     note_witnessed_pots(txid, &funded, &spent);
 }
 
@@ -1863,9 +1877,12 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert!(
-            plan.iter()
-                .all(|d| d.contains("USING INDEX") || d.contains("USING COVERING INDEX")),
-            "the spent read is indexed: {plan:?}"
+            !plan.is_empty()
+                && plan.iter().all(|d| {
+                    d.contains("USING INDEX idx_pot_spending")
+                        || d.contains("USING COVERING INDEX idx_pot_spending")
+                }),
+            "the spent read uses idx_pot_spending: {plan:?}"
         );
         // The shipped latch makes both reads and notes both sets.
         let src = include_str!("ops.rs");
@@ -1875,6 +1892,8 @@ mod tests {
             "Query::new(NETWORK_SEEN_POT_ROWS_SQL)",
             "Query::new(NETWORK_SEEN_SPENT_POT_ROWS_SQL)",
             "note_witnessed_pots(txid, &funded, &spent);",
+            "[#660] funded-pot read failed for {txid}: {e}",
+            "[#660] spent-pot read failed for {txid}: {e}",
         ] {
             assert!(latch_fn.contains(needle), "the latch: {needle}");
         }
