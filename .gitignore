@@ -15,3 +15,5 @@ reference/.docker/
 # rendered deploy configs (ids injected from the private secrets store; never commit)
 wrangler.deploy.toml
 wrangler.low.deploy.toml
+# make ci-deploy's gasp-shadow dry run (bsv-low #657), removed after it
+.gasp-shadow.wrangler.low.toml

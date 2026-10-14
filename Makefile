@@ -597,6 +597,13 @@ ci-d1-budget:
 # cost ~0 here) and they give a clean compile error with no toolchain-install
 # or npx noise in front of it — and they are the only wasm coverage that
 # survives if this target ever has to be skipped offline.
+#
+# bsv-low #657 (the GASP shadow lens's MEDIUM 1): the engine's GASP shadow is
+# the cargo feature `gasp-shadow`, default off, so the three configs build
+# without it. A fourth dry run builds `wrangler.low.toml` with it ON (a copy of
+# the config whose build command adds `--features gasp-shadow`, removed after),
+# so the build a shadow host needs is proven deployable too. Each line prints
+# its bundle's wasm bytes.
 DEPLOY_CONFIGS ?= crates/overlay-cloudflare:wrangler.toml \
                   crates/overlay-cloudflare:wrangler.low.toml \
                   crates/low-app-layer:wrangler.toml
@@ -633,13 +640,18 @@ ci-deploy:
 	fi; \
 	echo "→ ci-deploy preflight ok: worker $$vers, worker-build ^$$pins, 3 configs"; \
 	out=$$(mktemp -d /tmp/ci-deploy.XXXXXX); \
-	trap 'rm -rf "$$out"' EXIT; \
-	for cfg in $(DEPLOY_CONFIGS); do \
+	shadow=crates/overlay-cloudflare/.gasp-shadow.wrangler.low.toml; \
+	trap 'rm -rf "$$out" "$$shadow"' EXIT; \
+	sed 's/worker-build --release"$$/worker-build --release --features gasp-shadow"/' \
+	    crates/overlay-cloudflare/wrangler.low.toml > "$$shadow"; \
+	grep -q -- '--features gasp-shadow"$$' "$$shadow"; \
+	for cfg in $(DEPLOY_CONFIGS) crates/overlay-cloudflare:.gasp-shadow.wrangler.low.toml; do \
 	  d=$${cfg%%:*}; f=$${cfg##*:}; \
 	  printf '→ deploy dry-run %s/%s … ' "$$d" "$$f"; \
+	  rm -rf "$$out/bundle"; \
 	  if ( cd "$$d" && npx wrangler deploy --config "$$f" --dry-run \
 	         --outdir "$$out/bundle" ) > "$$out/log" 2>&1; then \
-	    echo "ok"; \
+	    echo "ok ($$(find "$$out/bundle" -name '*.wasm' -exec wc -c {} + | awk 'END {print $$1}') B wasm)"; \
 	  else \
 	    echo "FAILED"; \
 	    echo "✗ ci-deploy: $$d/$$f does not build for DEPLOY. Nothing else in"; \
@@ -651,7 +663,7 @@ ci-deploy:
 	    exit 1; \
 	  fi; \
 	done; \
-	echo "✅ ci-deploy: all 3 deployable configs built through the real worker-build"
+	echo "✅ ci-deploy: all 3 deployable configs built through the real worker-build, and low-overlay with gasp-shadow on"
 
 # `extensions-build` is gone (bsv-low #553 lens L2): `bsv-overlay-cloudflare` has no `extensions` cargo feature, so the target could only fail; the superset is the RUNTIME var ENABLE_EXTENSIONS=true, compiled into every build.
 
