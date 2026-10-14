@@ -1143,3 +1143,10 @@ async fn a1_c1_unavailable_evidence_reaches_log_before_answer() {
     // A durable deterministic judgement wins over the unavailable ARC word.
     refused(&store.admit(&engine, &walked).unwrap_err());
 }
+
+#[test]
+fn a1_c2_unavailable_proof_roundtrips() {
+    let verdict = ProofVerdict::Unavailable { reason: "headers down".into() };
+    let wire = serde_json::to_vec(&verdict).unwrap();
+    assert_eq!(verdict, serde_json::from_slice(&wire).unwrap());
+}

@@ -33,6 +33,7 @@ pub enum NetworkVerdict {
 pub enum ProofVerdict {
     Holds { height: u32, merkle_root: [u8; 32] },
     Fails { refusal: String },
+    Unavailable { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
