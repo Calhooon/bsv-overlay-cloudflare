@@ -1898,6 +1898,7 @@ mod tests {
     #[test]
     fn e555_the_counters_sum_a_sync_and_count_drops_by_reason() {
         let topic = |deferred, resumed, converged, reasons: &[&str]| TopicSyncResult {
+            peers_filtered: Vec::new(),
             roots_proven: 0,
             roots_unproven: 0,
             cursor_held_by: Vec::new(),

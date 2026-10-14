@@ -536,7 +536,7 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
                 // external admin poker). Fail-closed on the tip like the cron.
                 "/admin/advert-lifecycle" => admin_advert_lifecycle(&env, &req).await,
                 "/admin/syncAdvertisements" => admin_sync_advertisements(&engine).await,
-                "/admin/startGASPSync" => admin_start_gasp_sync(&engine).await,
+                "/admin/startGASPSync" => admin_start_gasp_sync(&engine, req).await,
                 "/admin/evictOutpoint" => admin_evict_outpoint(&engine, req).await,
                 // bsv-low PLAN-PRE-LOOP4 §H4: re-notify (or re-submit, subject-named) a txid the index never came to know
                 "/admin/readmit" => admin_readmit(&engine, &env, req).await,

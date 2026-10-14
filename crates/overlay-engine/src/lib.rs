@@ -39,5 +39,6 @@ pub mod ship_lookup;
 pub mod storage;
 pub mod stream_sizing;
 pub mod subject;
+pub mod sync_load;
 pub mod topic_manager;
 pub mod types;
