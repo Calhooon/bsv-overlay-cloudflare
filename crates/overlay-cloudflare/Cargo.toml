@@ -23,14 +23,14 @@ workspace = "../../workers"
 crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
-bsv-worker-build-info = { version = "0.1.9", path = "../worker-build-info", features = ["build"] }
+bsv-worker-build-info = { version = "0.1.10", path = "../worker-build-info", features = ["build"] }
 
 [dependencies]
-bsv-worker-build-info = { version = "0.1.9", path = "../worker-build-info" }
-overlay-engine = { package = "bsv-overlay-engine", version = "0.1.9", path = "../overlay-engine" }
-overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1.9", path = "../overlay-discovery" }
+bsv-worker-build-info = { version = "0.1.10", path = "../worker-build-info" }
+overlay-engine = { package = "bsv-overlay-engine", version = "0.1.10", path = "../overlay-engine" }
+overlay-discovery = { package = "bsv-overlay-discovery", version = "0.1.10", path = "../overlay-discovery" }
 # Replay stays enabled for every Worker build and resolves from crates.io on publish.
-low-proof-replay = { package = "bsv-low-proof-replay", version = "0.1.9", path = "../low-proof-replay" }
+low-proof-replay = { package = "bsv-low-proof-replay", version = "0.1.10", path = "../low-proof-replay" }
 bsv-rs = { workspace = true, features = ["wasm"] }
 # 0.3 (bsv-low #348, was 0.1). Bumped because it is the only middleware line
 # compatible with `worker 0.8`, and it is the SAME major the low-watchtower
@@ -69,7 +69,7 @@ js-sys = "0.3"
 [dev-dependencies]
 # bsv-low #592: the queue replay pin runs a REAL engine over `MemoryStorage`
 # (the engine's own test store; test-only, never in the wasm32 build).
-overlay-engine = { package = "bsv-overlay-engine", version = "0.1.9", path = "../overlay-engine", features = ["memory-storage"] }
+overlay-engine = { package = "bsv-overlay-engine", version = "0.1.10", path = "../overlay-engine", features = ["memory-storage"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 # Real SQLite (bundled, no system dependency, deterministic version) so the
 # identity-scoped read-window tests EXECUTE the exact shipped SQL against the
