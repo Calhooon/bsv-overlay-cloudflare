@@ -3106,9 +3106,24 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     });
                     continue;
                 }
-                // THE CHAIN RUNG: the index's "unspent" alone never offers the sweep (the client's bar since #451: a
-                // read that could not look is never "unspent"). A chain word of unspent → the claim; spent by a pot →
-                // no row (the JOIN took it); spent by something else → could not judge; no word yet → the claim waits.
+                // THE CHAIN RUNG. The arms, by what the chain rung's probe (`/spent-any`) found for THIS outpoint:
+                //   - unspent (a positive clean word) → the claim (`chainProbe:"unspent"`);
+                //   - spent by a pot → no row (the JOIN took it);
+                //   - spent by something else (a KNOWN competitor) → could not judge / `spent-elsewhere`;
+                //   - NO positive word (the couriers could not look, 429/fault, or the probe has not run) → the `_`
+                //     arm. #451 held this case PENDING ("a read that could not look is never unspent"). bsv-low #669b
+                //     (the loop-28/deploy #669 red: WoC 429 held p1's genuine stranded sweep `no-affordance` for the
+                //     whole 45 s budget): for an index-UNSPENT stranded hop with a verified marker, the chain rung's
+                //     SILENCE no longer holds the honest press. No competitor is KNOWN (the spent arm above never
+                //     fired), the INDEX itself says unspent, and the hop is the owner's OWN output — the sweep is the
+                //     owner's own spend. So the index's unspent OFFERS the sweep (`chainProbe:"index-unspent"`); a
+                //     later positive spent word still DOWNGRADES it (the arm above), and a block arriving since the
+                //     probe still degrades it read-side (`degrade_stale_sweeps`) and re-probes it (`should_recompute`).
+                //     The dead case — the owner already spent its own hop elsewhere, unseen by LOW's index — MINES to
+                //     take the hop, which MOVES the tip and is caught by the tip gate; and a dead sweep that slips the
+                //     tip gate (a same-tip spend) costs at most a refused broadcast (the network refuses a second
+                //     spend of the owner's own output), never an honest party's sats. An index-UNKNOWN hop (nothing
+                //     says unspent: the container never indexed, the chain rung silent) stays pending as before.
                 let chain = i.hop_chain.get(&outpoint);
                 let mut facts = facts_base.clone();
                 facts["ageMs"] = json!(age_ms);
@@ -3192,14 +3207,49 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             reason: Some(reason.to_string()),
                         });
                     }
+                    _ if h.status == HopStatus::Unspent => {
+                        // bsv-low #669b: the index POSITIVELY says unspent and no competitor is KNOWN (the spent arm
+                        // above never fired), so the owner's own stranded hop is claimable on the index's own word.
+                        // The chain rung's silence (couriers 429/faulting, or an unrun probe) no longer holds the
+                        // honest press. `chainProbe:"index-unspent"` records that the chain rung did not corroborate
+                        // (distinct from the courier-corroborated `"unspent"`); the read-side `degrade_stale_sweeps`
+                        // and the `should_recompute` re-probe still withhold the sweep the instant a block arrives.
+                        facts["claim"] = json!("sweep-hop");
+                        facts["claimable"] = json!(true);
+                        facts["chainProbe"] = json!("index-unspent");
+                        // the FILED sweep rides the row when this identity filed one; without one the press signs a
+                        // sweep on the device that owns the key (the same source block as the corroborated arm above)
+                        match i.hop_sweeps.get(&outpoint) {
+                            Some(f) => {
+                                facts["sweepRawHex"] = json!(f.raw_hex);
+                                facts["sweepTxid"] = json!(f.sweep_txid);
+                                facts["sweepSource"] = json!("hopsweep-filing");
+                            }
+                            None => {
+                                facts["sweepSource"] = json!("sign-here");
+                            }
+                        }
+                        rows.push(OwedRow {
+                            identity: me.clone(),
+                            outpoint,
+                            family: OwedFamily::HopStranded,
+                            game_id: game,
+                            sats: Some(h.hop_sats),
+                            opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+                            at_height: None,
+                            facts,
+                            reason: if evicted {
+                                Some(JOIN_REFUSED_REASON.to_string())
+                            } else {
+                                door_refused.map(|door| door.sentence().to_string())
+                            },
+                        });
+                    }
                     _ => {
+                        // index-UNKNOWN with no positive chain word: NOTHING says the hop is unspent (the container
+                        // never indexed, the chain rung is silent), so the sweep waits for the chain rung's word.
                         facts["claim"] = Value::Null;
                         facts["chainProbe"] = json!("pending");
-                        let reason = if h.status == HopStatus::Unknown {
-                            "the hop's outpoint is not in the index (the funding never reached it, or it was evicted): the sats are likely still there; the sweep waits for the chain rung's word"
-                        } else {
-                            "the index says the hop is unspent; the chain rung has not corroborated it yet (the sweep waits for its word)"
-                        };
                         rows.push(OwedRow {
                             identity: me.clone(),
                             outpoint,
@@ -3209,7 +3259,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
                             at_height: None,
                             facts,
-                            reason: Some(reason.to_string()),
+                            reason: Some("the hop's outpoint is not in the index (the funding never reached it, or it was evicted): the sats are likely still there; the sweep waits for the chain rung's word".to_string()),
                         });
                     }
                 }
@@ -5964,9 +6014,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_sweep_claim_rests_on_the_chain_rung_too() {
-        // the index's "unspent" alone is a sentence; the chain's unspent is the claim; the chain's spent-by-a-pot is no
-        // row; the chain's spent-by-another is could-not-judge
+    fn the_index_unspent_offers_the_sweep_and_the_chain_rung_only_downgrades_it() {
+        // bsv-low #669b: for the owner's own index-UNSPENT stranded hop the index's own word OFFERS the sweep; the
+        // chain rung only DOWNGRADES it (a spent word -> spent-elsewhere / no row) and never holds the honest press
+        // on its silence. (Pre-#669b this was #451's "the index's unspent alone is a sentence; the chain's unspent is
+        // the claim", which held p1's GENUINE sweep no-affordance under a courier outage — the deploy #669 red.)
         let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
         let old = [hop(
             HopStatus::Unspent,
@@ -5974,20 +6026,26 @@ pub(crate) mod tests {
             Some(HOP_STRANDED_AFTER_MS + 1),
         )];
         let key = format!("{}:0", tx(0x07));
-        // no chain word yet
+        // no chain word yet: the index's unspent offers the sweep (index-unspent), no competitor known
         let rows = derive_owed_rows(&inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000)));
-        assert_eq!(rows[0].family, OwedFamily::Unbound);
-        assert_eq!(rows[0].facts["chainProbe"], "pending");
-        assert!(rows[0]
-            .reason
-            .as_deref()
-            .unwrap()
-            .contains("not corroborated"));
-        // the providers could not look
+        assert_eq!(rows[0].family, OwedFamily::HopStranded);
+        assert_eq!(rows[0].facts["claim"], "sweep-hop");
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["chainProbe"], "index-unspent");
+        // the providers could not look (a fault): still no competitor known -> still claimable on the index
         let not_looked = chain(&key, false, None, None);
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &not_looked;
-        assert_eq!(derive_owed_rows(&i)[0].family, OwedFamily::Unbound);
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].family, OwedFamily::HopStranded);
+        assert_eq!(rows[0].facts["chainProbe"], "index-unspent");
+        // the chain's UNSPENT word corroborates: the claim, with the courier-corroborated provenance
+        let looked_unspent = chain(&key, true, Some(false), None);
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &looked_unspent;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["claim"], "sweep-hop");
+        assert_eq!(rows[0].facts["chainProbe"], "unspent");
         // spent by a POT the index holds (the index lagged): no row
         let join = tx(0x02);
         let pots: HashSet<String> = [join.clone()].into_iter().collect();
@@ -5995,7 +6053,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &old, &v, &c, &pots, Some(900_000));
         i.hop_chain = &by_pot;
         assert!(derive_owed_rows(&i).is_empty());
-        // spent by something the index does not hold: could not judge, the spender named in the facts
+        // spent by something the index does not hold (a KNOWN competitor): could not judge, the spender named
         let elsewhere = chain(&key, true, Some(true), Some(&tx(0x09)));
         let mut i = inputs(&[], &[], &old, &v, &c, &pots, Some(900_000));
         i.hop_chain = &elsewhere;
@@ -8583,13 +8641,15 @@ pub(crate) mod tests {
                 Some(DOOR_REFUSED_REASON)
             )
         );
-        // the press still rests on the chain rung: no word yet is a waiting sentence that says why it will be sweepable
+        // bsv-low #669b: the index's unspent offers the sweep even with no chain word (the honest press stays fast
+        // under a courier outage); the door-refusal fact still rides the claimable row
         let rows = derive(&script, &NO_CHAIN);
         assert_eq!(
             (rows[0].family, rows[0].facts["joinRefused"].clone()),
-            (OwedFamily::Unbound, json!(true))
+            (OwedFamily::HopStranded, json!(true))
         );
-        assert!(rows[0].facts.get("claimable").is_none());
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["chainProbe"], "index-unspent");
         // without the ledger's word: in progress, rejoin, and no door fact
         let rows = derive(&HashMap::new(), &unspent);
         assert_eq!(
@@ -10630,6 +10690,152 @@ pub(crate) mod tests {
         assert!(
             should_recompute(false, 10_000, None, Some(971_115), &rows),
             "a NULL-tip claimable stranded snapshot re-arms on the next readable tip (it stores a real tip)"
+        );
+    }
+
+    // ── bsv-low #669b: the honest stranded-hop press stays fast; the #451 chain-rung SILENCE no longer holds it ──
+    //
+    // The deploy of #669 (beta `9330dbe6`, the `spec-admit-fast-join-refused` pair-13 red of 2026-10-15 07:08Z):
+    // p1's GENUINELY-UNSPENT stranded hop (`a67c52c0…:0`, 20,190 sats, JOIN evicted) was served `claim:null`,
+    // `chainProbe:"pending"`, family Unbound — "the sweep waits for its word" — for the WHOLE 45 s Collect budget,
+    // because the couriers (`/spent-any`) were rate-limiting (WoC 429) and never delivered a positive unspent word.
+    // The served tip was STATIC (971132) and NONE of the 10 served reads carried `tipMoved`/`tipUnknown`/`chainWait`,
+    // so `degrade_stale_sweeps` never fired: the hold was the pre-existing #451 `_` (no-word) arm, NOT the #669 tip
+    // gate. The hop is the owner's OWN output and the index itself says unspent, so the honest press must not wait on
+    // an external courier. A positive spent word (the spent arm) and the tip gate (`degrade_stale_sweeps` +
+    // `should_recompute`) still withhold a dead sweep; a dead sweep that slips both costs at most a refused broadcast.
+
+    /// The deploy shape as a reusable fixture: an index-UNSPENT, JOIN-refused (evicted), verified-marker stranded hop
+    /// with NO chain-rung word (`hop_chain` empty: the couriers 429'd), computed at a static `tip`.
+    fn index_unspent_no_word_rows(tip: u64) -> Vec<OwedRow> {
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let evicted: HashSet<String> = [key].into_iter().collect();
+        let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(tip));
+        i.evicted_hop_outpoints = &evicted; // the JOIN was evicted: the hop is stranded now
+        derive_owed_rows(&i)
+    }
+
+    /// PIN 669b-A (RED on `9330dbe6`): the deploy's served shape is now claimable on the index's own unspent word.
+    /// RED line: `assert_eq!(rows[0].facts["claim"], "sweep-hop")` — today the `_` arm serves `claim:null`,
+    /// `chainProbe:"pending"`, family Unbound (the honest press held `no-affordance` for the whole budget).
+    #[test]
+    fn pin669b_a_an_index_unspent_stranded_hop_with_no_chain_word_is_claimable() {
+        let rows = index_unspent_no_word_rows(971_132);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].facts["claim"], "sweep-hop",
+            "the owner's own index-unspent stranded hop is sweepable on the index's word (RED on 9330dbe6: claim was null)"
+        );
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(
+            rows[0].facts["chainProbe"], "index-unspent",
+            "the chain rung did not corroborate: the provenance says so, distinct from the courier-corroborated `unspent`"
+        );
+        assert_eq!(rows[0].family, OwedFamily::HopStranded);
+        assert_eq!(rows[0].facts["joinRefused"], true);
+        assert_eq!(rows[0].facts["joinRefusedBy"], "eviction");
+        // no filing in hand -> the device that owns the key signs the sweep (the corroborated arm's own source block)
+        assert_eq!(rows[0].facts["sweepSource"], "sign-here");
+        assert_eq!(rows[0].reason.as_deref(), Some(JOIN_REFUSED_REASON));
+    }
+
+    /// PIN 669b-B (GUARD, green before and after): an index-UNKNOWN hop (the container never indexed) with no chain
+    /// word has NOTHING saying unspent, so it stays a pending chain-wait. The fix broadens ONLY the index-UNSPENT case.
+    #[test]
+    fn pin669b_b_an_index_unknown_hop_with_no_chain_word_stays_pending() {
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let old = [hop(
+            HopStatus::Unknown,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let evicted: HashSet<String> = [key].into_iter().collect();
+        let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(971_132));
+        i.evicted_hop_outpoints = &evicted;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].facts["claim"].is_null(),
+            "index-unknown + no word: nothing says unspent -> pending, never a claim"
+        );
+        assert_eq!(rows[0].facts["chainProbe"], "pending");
+        assert_eq!(rows[0].family, OwedFamily::Unbound);
+    }
+
+    /// PIN 669b-C (GUARD, green before and after): a KNOWN competitor (the chain rung returned a positive spent word)
+    /// still flips the hop to `spent-elsewhere` / could-not-judge — the spent arm is unchanged, the dead sweep withheld.
+    #[test]
+    fn pin669b_c_a_known_competitor_still_withholds_the_sweep() {
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let evicted: HashSet<String> = [key.clone()].into_iter().collect();
+        let competitor = tx(0x1c);
+        let spent = chain_confirmed(&key, true, Some(true), Some(&competitor), Some(true));
+        let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(971_132));
+        i.evicted_hop_outpoints = &evicted;
+        i.hop_chain = &spent;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].facts["claim"].is_null(),
+            "a known competitor: never a claim"
+        );
+        assert_eq!(rows[0].facts["chainProbe"], "spent");
+        assert_eq!(rows[0].facts["chainSpender"], competitor);
+        assert_eq!(rows[0].family, OwedFamily::Unbound);
+    }
+
+    /// PIN 669b-D (RED on `9330dbe6` via the precondition): the new index-unspent claimable row is STILL subject to
+    /// the #669 read-side degrade — a block arriving since the compute (the dead-sweep case: the owner's own
+    /// competitor MINED, moving the tip) degrades it to a pending block-wait, never a dead sweep "on its way back".
+    #[test]
+    fn pin669b_d_the_index_unspent_sweep_still_degrades_when_a_block_arrived() {
+        let mut rows = index_unspent_no_word_rows(971_132);
+        assert_eq!(
+            rows[0].facts["claimable"], true,
+            "precondition: the index-unspent sweep is claimable (RED on 9330dbe6, where it is pending)"
+        );
+        assert_eq!(rows[0].facts["chainProbe"], "index-unspent");
+        degrade_stale_sweeps(&mut rows, Some(971_132), Some(971_133)); // a block arrived since the compute
+        assert_eq!(
+            rows[0].facts["claimable"], false,
+            "a block arrived: the sweep degrades, never a dead sweep"
+        );
+        assert_eq!(rows[0].facts["chainWait"], "block");
+        assert_eq!(rows[0].facts["tipMoved"], true);
+        assert!(rows[0].facts["claim"].is_null());
+    }
+
+    /// PIN 669b-E (RED on `9330dbe6` via the precondition): the fail-safe (MEDIUM-1 parity) covers the new row too — a
+    /// present tip that cannot be read degrades it; and a NULL-snapshot claimable index-unspent row re-arms on the
+    /// next readable tip, so a chaintracks blip never holds an honest press forever.
+    #[test]
+    fn pin669b_e_a_cold_or_null_tip_degrades_and_rearms() {
+        let mut rows = index_unspent_no_word_rows(971_132);
+        degrade_stale_sweeps(&mut rows, Some(971_132), None); // present tip unknown (cold isolate / chaintracks down)
+        assert_eq!(
+            rows[0].facts["claimable"], false,
+            "cannot prove tip-current -> pending (fail-safe)"
+        );
+        assert_eq!(rows[0].facts["chainWait"], "block");
+        assert_eq!(rows[0].facts["tipUnknown"], true);
+        // the re-arm: a NULL prev_tip claimable index-unspent stranded snapshot recomputes on the next readable tip.
+        let rows2 = index_unspent_no_word_rows(971_132);
+        assert!(
+            should_recompute(false, 10_000, None, Some(971_132), &rows2),
+            "a NULL-tip claimable index-unspent stranded snapshot re-arms (it does not hold past one re-probe cycle)"
         );
     }
 }
