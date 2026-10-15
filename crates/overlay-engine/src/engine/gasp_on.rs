@@ -23,14 +23,26 @@ struct OnGraph<'a> {
     engine: &'a Engine,
     host: &'a dyn GaspFinalizeHost,
     graph: &'a FinalizeGraph<'a>,
-    positions: HashMap<String, usize>,
+    /// The bodies the gate is handed (bare), and each one's place in the
+    /// sink: per OCCURRENCE (the seam lens's L4: a graph carries a txid once
+    /// per node, so a transaction two of whose outputs it spends is two
+    /// bodies), never by txid.
+    walked: &'a [Walked],
+    positions: Vec<usize>,
     /// The body the gate is on, made whole, by its place in the sink.
     current: std::cell::RefCell<Option<(usize, Walked)>>,
 }
 
 impl OnGraph<'_> {
+    /// `walked`'s place in the sink: the gate hands each body by reference
+    /// into the list it was given, so the body is found by identity.
     fn position(&self, walked: &Walked) -> usize {
-        self.positions.get(&walked.txid).copied().unwrap_or(0)
+        let at = self
+            .walked
+            .iter()
+            .position(|w| std::ptr::eq(w, walked))
+            .expect("the gate hands a body of the list it was given");
+        self.positions[at]
     }
 
     fn body<'b>(&'b self, position: usize, walked: &'b Walked) -> FinalizeBody<'b> {
@@ -173,7 +185,7 @@ impl Engine {
             // its siblings are still judged.
             let mut walked = Vec::new();
             let mut unwalked = Vec::new();
-            let mut positions = HashMap::new();
+            let mut positions = Vec::new();
             for (at, beef) in graph.beefs.iter().enumerate() {
                 let tagged = TaggedBEEF::new(beef.clone(), vec![graph.topic.clone()]);
                 match self
@@ -186,12 +198,11 @@ impl Engine {
                     .await
                 {
                     Ok(body) => {
-                        positions.entry(body.txid.clone()).or_insert(at);
+                        positions.push(at);
                         walked.push(bare(body));
                     }
                     Err(e) => {
                         let txid = body_txid(beef);
-                        positions.entry(txid.clone()).or_insert(at);
                         unwalked.push(Unwalked {
                             txid,
                             refusal: walk_refusal(&graph.topic, &e),
@@ -209,6 +220,7 @@ impl Engine {
                 engine: self,
                 host: host.as_ref(),
                 graph: &done,
+                walked: &walked,
                 positions,
                 current: std::cell::RefCell::default(),
             };
