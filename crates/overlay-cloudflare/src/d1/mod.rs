@@ -535,7 +535,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 256 to 258 for bsv-low #669C (2026-10-15): DROP + re-CREATE `idx_owed_rows_claimable_hop` as a PARTIAL index
 /// (`WHERE family = 'hop-stranded'`), so an in-progress owed row no longer pays an index write it never needed (the
 /// owed first read's 18 -> 26 budget regression); the stale-mark subquery's COVERING SEARCH plan is unchanged.
-pub const OVERLAY_MIGRATION_COUNT: usize = 258;
+/// 258 to 259 for bsv-low #672 (2026-10-15, RC-L30-COULD-NOT-JUDGE): `owed_spender_bytes`, the owed list's durable
+/// content-addressed store of a hop spender's immutable outputs + input outpoints, so a courier-budget-cut recompute
+/// never regresses a JUDGED "spent outside this game" row to "could not judge the spender". One table.
+pub const OVERLAY_MIGRATION_COUNT: usize = 259;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1976,6 +1979,15 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // `pin669c_the_claimable_hop_index_does_not_index_in_progress_rows` in `owed_tip_probe_sqlite.rs`.
     "DROP INDEX IF EXISTS idx_owed_rows_claimable_hop",
     "CREATE INDEX IF NOT EXISTS idx_owed_rows_claimable_hop ON owed_rows(json_extract(facts, '$.claimable'), family, identity) WHERE family = 'hop-stranded'",
+    // bsv-low #672 (2026-10-15, RC-L30-COULD-NOT-JUDGE): the owed list's DURABLE spender-bytes store,
+    // content-addressed by spender txid. A hop JUDGED "spent outside this game" (a competitor paying none of this
+    // identity's homes) was clobbered to "could not judge the spender" by a later recompute whose courier budget
+    // was cut before it re-read the competitor's bytes (loop 30's first red): the story is re-derived from scratch
+    // every pass and a budget-cut pass knows less than the snapshot it replaced. The outputs (pkh/sats/pot-lock per
+    // vout) and input outpoints of a spender are IMMUTABLE facts of its bytes, so the app layer persists them here
+    // at the first successful hash-verified fetch and reads them before the budget on every later pass. The app
+    // layer catches this table up on a cold isolate (`schema::OWED_SPENDER_BYTES_CREATE`, byte-identical).
+    "CREATE TABLE IF NOT EXISTS owed_spender_bytes (txid TEXT PRIMARY KEY, bytesJson TEXT NOT NULL, createdAtMs INTEGER NOT NULL)",
 ];
 
 // =============================================================================
