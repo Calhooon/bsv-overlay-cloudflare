@@ -19,6 +19,9 @@ enum PeerFailure {
     Local(String),
     /// The request could not be built for, or did not reach, the peer.
     Transport(String),
+    /// The platform answered before the peer was reached (engine 0.2.0,
+    /// #57): `class` is `overlay_engine::route_fault`'s.
+    Route { class: &'static str, detail: String },
     /// The peer answered outside 2xx.
     Status {
         url: String,
@@ -40,6 +43,10 @@ impl PeerFailure {
             PeerFailure::Status { url, status, body } => {
                 GASPError::RemoteError(format!("Peer {url} returned HTTP {status}: {body}"))
             }
+            PeerFailure::Route { class, detail } => GASPError::RouteFault {
+                class: class.to_string(),
+                detail,
+            },
         }
     }
 
@@ -115,10 +122,18 @@ impl WorkerGASPRemote {
             PeerFailure::Transport(format!("Failed to create request to {url}: {e}"))
         })?;
 
-        let mut response = worker::Fetch::Request(request)
-            .send()
-            .await
-            .map_err(|e| PeerFailure::Transport(format!("Fetch to {url} failed: {e}")))?;
+        // Engine 0.2.0 (#57): a failure the platform answers before the
+        // peer is reached is a route fault, never the peer's. The fetch's
+        // own error text is classified, never the URL (a peer's name may
+        // hold any word).
+        let mut response = worker::Fetch::Request(request).send().await.map_err(|e| {
+            let error = e.to_string();
+            let detail = format!("Fetch to {url} failed: {error}");
+            match overlay_engine::route_fault::of_transport(&error) {
+                Some(class) => PeerFailure::Route { class, detail },
+                None => PeerFailure::Transport(detail),
+            }
+        })?;
 
         let status = response.status_code();
         if !(200..300).contains(&status) {
@@ -126,6 +141,12 @@ impl WorkerGASPRemote {
                 .text()
                 .await
                 .unwrap_or_else(|_| "(no body)".to_string());
+            if let Some(class) = overlay_engine::route_fault::of_answer(status, &body_text) {
+                return Err(PeerFailure::Route {
+                    class,
+                    detail: format!("{url} answered by the platform HTTP {status}: {body_text}"),
+                });
+            }
             return Err(PeerFailure::Status {
                 url,
                 status,
@@ -291,6 +312,22 @@ mod tests {
 
     /// A 400 from any OTHER call (the initial request of a sync) is not an
     /// answer about a node: it stays a fault and fails the peer's sync.
+    #[test]
+    fn route_057_the_platforms_1042_is_a_route_fault_in_every_request() {
+        let route = || PeerFailure::Route {
+            class: overlay_engine::route_fault::class::CF_1042,
+            detail: "https://peer.example answered by the platform HTTP 404: error code: 1042"
+                .into(),
+        };
+        for class in [route().into_fault(), route().into_node_request_error()] {
+            assert!(
+                matches!(&class, GASPError::RouteFault { class, .. } if class == "cf_1042"),
+                "{class:?}"
+            );
+            assert!(class.to_string().starts_with("route_fault:cf_1042: "));
+        }
+    }
+
     #[test]
     fn a_400_outside_a_node_request_is_a_fault() {
         assert!(matches!(

@@ -529,7 +529,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// `claimable` predicate), so the `/internal/tip-changed` hop-stranded stale mark SEEKS a covering index instead of
 /// scanning `owed_rows` every block, without displacing the #662 withheld-payout read off its PK (the FIX-669
 /// lens's NOTE-5).
-pub const OVERLAY_MIGRATION_COUNT: usize = 254;
+/// 254 to 256 for engine 0.2.0 (#57): `gasp_route_faults`, one day of route faults counted apart from the peers'
+/// health, and its age index.
+pub const OVERLAY_MIGRATION_COUNT: usize = 256;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1927,6 +1929,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS gasp_sync_cost_age ON gasp_sync_cost(ended_ms)",
     crate::gasp_speed::CREATE,
     crate::gasp_speed::INDEX,
+    // Engine 0.2.0 (#57): one day of route faults, counted apart from the peers' health. Transient.
+    crate::gasp_route::CREATE,
+    crate::gasp_route::INDEX,
     // Engine 0.1.14: compact fault facts and explicit GASP admission origin.
     crate::gasp_fault_memo::CREATE,
     crate::gasp_fault_memo::DUE_INDEX,

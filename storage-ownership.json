@@ -866,6 +866,17 @@
    "why": "measured root walks and wall time"
   },
   {
+   "name": "gasp_route_faults",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "One day of route faults by topic, peer and class",
+   "why": "route faults counted apart from the peers' health (engine 0.2.0, #57)"
+  },
+  {
    "name": "gasp_sync_cost",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
