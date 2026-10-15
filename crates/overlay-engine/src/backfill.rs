@@ -238,6 +238,7 @@ impl GASPSyncResult {
             topic.root_bounds.append(&mut incoming.root_bounds);
             topic.peers_skipped.append(&mut incoming.peers_skipped);
             topic.errors.append(&mut incoming.errors);
+            topic.route_faults.append(&mut incoming.route_faults);
             topic.cursor_moves.append(&mut incoming.cursor_moves);
             topic.dropped_graphs.append(&mut incoming.dropped_graphs);
             topic.cursor_held_by = incoming.cursor_held_by;

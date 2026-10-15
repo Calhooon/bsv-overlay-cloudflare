@@ -5216,6 +5216,7 @@ impl Engine {
             let mut unanchorable_graphs: u64 = 0;
             let mut unanchorable_cleared: u64 = 0;
             let mut absent_struck: u64 = 0;
+            let mut route_faults: Vec<crate::route_fault::RouteFaultSeen> = Vec::new();
             let mut strikes_refused: u64 = 0;
             let mut backed_off_graphs: u64 = 0;
             let mut waiting_graphs: u64 = 0;
@@ -5409,6 +5410,12 @@ impl Engine {
                     };
 
                     let mut outcome_success = matches!(sync_outcome, Some(Ok(())));
+                    // Engine 0.2.0 (#57): the platform answered in the peer's
+                    // place, so this attempt says nothing about the peer.
+                    let route_faulted = matches!(
+                        sync_outcome,
+                        Some(Err(crate::gasp::GASPError::RouteFault { .. }))
+                    );
                     // D8 decoy rule: branches pruned in this peer's walk. Not
                     // an error and not a failed UTXO, so it is counted apart
                     // from `errors` and never touches the outcome or cursor.
@@ -5583,6 +5590,12 @@ impl Engine {
                             let msg = format!("{peer_url}: {e}");
                             warn!("[GASP SYNC] Sync failed: {msg}");
                             errors.push(msg);
+                            if let crate::gasp::GASPError::RouteFault { class, .. } = e {
+                                route_faults.push(crate::route_fault::RouteFaultSeen {
+                                    peer: peer_url.clone(),
+                                    class,
+                                });
+                            }
                         }
                     }
                     // Engine 0.1.8: work is not a failure. A sync that
@@ -5606,6 +5619,22 @@ impl Engine {
                         || sync.expired_refused() > 0;
                     if yielded || sync.did_work() {
                         outcome_success = true;
+                    }
+                    // Engine 0.2.0 (#57): a route fault with no work done
+                    // before it touches none of the peer's health rows: not
+                    // its failures (the quarantine), not its yieldless
+                    // streak, not its quiet cadence. The quarantine judges
+                    // the peer, never the route. A sync the peer served work
+                    // in before the route faulted is the peer's answer and
+                    // is recorded as one.
+                    let route_excused = route_faulted && !outcome_success;
+                    if route_excused {
+                        info!(
+                            "[GASP SYNC] {peer_url} for {topic}: {} before the peer was reached; nothing counted against the peer (#57)",
+                            route_faults
+                                .last()
+                                .map_or(String::new(), crate::route_fault::RouteFaultSeen::label)
+                        );
                     }
                     // bsv-low #555, the delta fold's D-M2: "progress" (a node
                     // appended) is the peer's word. A sync the peer served
@@ -5669,12 +5698,16 @@ impl Engine {
                         retry_after_secs: crate::sync_load::quiet_retry_secs(quiet_syncs),
                         advertisement,
                     };
-                    if let Err(e) = self
-                        .storage
-                        .set_peer_cadence(&health_key, topic, &next)
-                        .await
-                    {
-                        warn!("[GASP SYNC] failed to record cadence for {peer_url}/{topic}: {e}");
+                    if !route_excused {
+                        if let Err(e) = self
+                            .storage
+                            .set_peer_cadence(&health_key, topic, &next)
+                            .await
+                        {
+                            warn!(
+                                "[GASP SYNC] failed to record cadence for {peer_url}/{topic}: {e}"
+                            );
+                        }
                     }
                     if !advanced_cursor {
                         if let Some(outpoint) = sync.cursor_held_by() {
@@ -5733,7 +5766,9 @@ impl Engine {
                     // and (the decay being for a peer that is not failed)
                     // its yieldless streak: 100 of 200 ticks. A health read
                     // that faulted read 0 failures: the old rule, fail-safe.
-                    if outcome_success
+                    if route_excused {
+                        // Nothing recorded: see `route_excused` above.
+                    } else if outcome_success
                         && !yielded
                         && self.graph_budget.is_some()
                         && health.consecutive_failures >= crate::gasp::PEER_QUARANTINE_THRESHOLD
@@ -5802,6 +5837,7 @@ impl Engine {
                     unanchorable_graphs,
                     unanchorable_cleared,
                     absent_struck,
+                    route_faults,
                     strikes_refused,
                     faulted_roots,
                 },
@@ -5824,6 +5860,10 @@ impl Engine {
         let absent: u64 = topics_synced.values().map(|r| r.absent_struck).sum();
         if absent > 0 {
             info!("[GASP SYNC] gaspAbsentStruck={absent}");
+        }
+        let routes: usize = topics_synced.values().map(|r| r.route_faults.len()).sum();
+        if routes > 0 {
+            info!("[GASP SYNC] gaspRouteFaults={routes}");
         }
         let refused: u64 = topics_synced.values().map(|r| r.strikes_refused).sum();
         if refused > 0 {
@@ -6536,6 +6576,12 @@ pub struct TopicSyncResult {
     /// `gasp::ABSENCE_GAP_SECS` apart. Counted in `unanchorable_graphs` too.
     #[serde(default)]
     pub absent_struck: u64,
+    /// Syncs a ROUTE FAULT ended (engine 0.2.0, bsv-overlay-cloudflare #57;
+    /// [`crate::route_fault`]): the platform answered before the peer was
+    /// reached. Each names its peer and class; none counted against the
+    /// peer's health unless the peer had served work before it.
+    #[serde(default)]
+    pub route_faults: Vec<crate::route_fault::RouteFaultSeen>,
     /// Roots with a fault record that this sync walked again and admitted,
     /// or refused on a verdict: their record cleared (engine 0.1.9).
     #[serde(default)]
@@ -9151,6 +9197,7 @@ mod tests {
                 unanchorable_graphs: 0,
                 unanchorable_cleared: 0,
                 absent_struck: 0,
+                route_faults: Vec::new(),
                 strikes_refused: 0,
                 faulted_roots: Vec::new(),
             },
@@ -13803,4 +13850,5 @@ mod tests {
     include!("minutes_tests.rs");
     include!("memo_tests.rs");
     include!("absence_tests.rs");
+    include!("route_fault_tests.rs");
 }

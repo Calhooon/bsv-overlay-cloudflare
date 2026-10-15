@@ -2027,6 +2027,7 @@ mod tests {
             unanchorable_graphs: 0,
             unanchorable_cleared: 0,
             absent_struck: 0,
+            route_faults: Vec::new(),
             strikes_refused: 0,
             faulted_roots: Vec::new(),
         };

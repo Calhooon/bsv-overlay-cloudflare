@@ -605,6 +605,10 @@ pub mod fault_class {
     /// Any other failure (a storage fault of ours, a bound): named, never a
     /// strike against the root.
     pub const OTHER: &str = "other";
+    /// The route to the peer faulted before the peer was reached (engine
+    /// 0.2.0, #57; `GASPError::RouteFault`): named, never a strike, as it
+    /// says nothing of the root or of the peer.
+    pub const ROUTE: &str = "route";
 
     /// Whether a fault of `class` counts a faulted run of its root: the
     /// three of the 0.1.9 brief (the courier, an input nobody served, a
@@ -2028,6 +2032,7 @@ impl<'a> GASPSync<'a> {
     fn peer_fault_class(error: &GASPError) -> &'static str {
         match error {
             GASPError::NodeNotFound(_) => fault_class::NOT_FOUND,
+            GASPError::RouteFault { .. } => fault_class::ROUTE,
             _ => fault_class::PEER,
         }
     }
@@ -4765,6 +4770,13 @@ pub enum GASPError {
     /// Network/communication error.
     #[error("remote error: {0}")]
     RemoteError(String),
+
+    /// The platform answered before the peer was reached (engine 0.2.0,
+    /// bsv-overlay-cloudflare #57; [`crate::route_fault`]): a fault of the
+    /// route, never of the peer. It counts nothing against the peer's
+    /// health rows and is named `route_fault:<class>`.
+    #[error("route_fault:{class}: {detail}")]
+    RouteFault { class: String, detail: String },
 
     /// Storage error.
     #[error("storage error: {0}")]
