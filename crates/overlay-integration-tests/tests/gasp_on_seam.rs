@@ -670,6 +670,126 @@ async fn s3_a_terminal_refusal_lets_the_cursor_pass_its_graph_and_not_now_holds_
     }
 }
 
+/// A host recording each body's place in its graph as the engine hands it.
+struct Positions {
+    inner: Rc<SinkHost>,
+    /// (txid, position, the BEEF at that position) per `admit` and per
+    /// `answered`, in order.
+    admitted: RefCell<Vec<(String, usize, Vec<u8>)>>,
+    answered: RefCell<Vec<(String, usize, Vec<u8>)>>,
+    /// Each graph's BEEFs as the engine handed them.
+    beefs: RefCell<Vec<Vec<Vec<u8>>>>,
+}
+
+#[async_trait(?Send)]
+impl GaspFinalizeHost for Positions {
+    async fn admit(
+        &self,
+        body: &FinalizeBody<'_>,
+        resolved: Option<Vec<u8>>,
+    ) -> Result<Committed, AdmitRefusal> {
+        self.admitted.borrow_mut().push((
+            body.walked.txid.clone(),
+            body.position,
+            body.beef().to_vec(),
+        ));
+        self.inner.admit(body, resolved).await
+    }
+    fn answered(
+        &self,
+        body: &FinalizeBody<'_>,
+        answer: &Result<Committed, AdmitRefusal>,
+        gate: Option<&GateReason>,
+    ) {
+        self.answered.borrow_mut().push((
+            body.walked.txid.clone(),
+            body.position,
+            body.beef().to_vec(),
+        ));
+        self.inner.answered(body, answer, gate);
+    }
+    async fn graph_done(&self, graph: &FinalizeGraph<'_>, outcome: &GraphOutcome) -> bool {
+        self.beefs.borrow_mut().push(graph.beefs.to_vec());
+        self.inner.graph_done(graph, outcome).await
+    }
+}
+
+/// The seam lens's L4. A GASP graph can carry one txid twice: a transaction
+/// is a node once per output the graph spends of it, and the finalize hands
+/// on one BEEF per node (the reference's `computeOrderedBEEFsForGraph` drops
+/// no repeat either: "The assembly and the two limbs" in CLAUDE.md). Here `c`
+/// spends `p.0` and `p.1`, so `p` is two nodes and two BEEFs of the graph.
+/// Each occurrence is handed to the host at ITS OWN place in the graph, with
+/// the BEEF at that place: every position of the graph once, never the first
+/// copy's place for both.
+#[tokio::test]
+async fn s4_a_txid_twice_in_one_graph_is_handed_at_each_place() {
+    let p = genesis(53, 2);
+    let c = spends(&[(&p, 0), (&p, 1)], 1);
+    let nodes = vec![
+        node(&p, honest_proof(&p.id(), 110)),
+        node(&c, honest_proof(&c.id(), 111)),
+    ];
+    for budgeted in [false, true] {
+        let events = Events::default();
+        let remote = ChaosRemote::new(&nodes, &[(&c, 0, 1.0)], &events);
+        let store = Rc::new(MemoryStorage::new());
+        let submits = Rc::default();
+        let mut engine = sync_engine(&store, &remote, &submits);
+        if budgeted {
+            engine.set_peer_sync_budget(never_due(), 30_000);
+        }
+        let host = Rc::new(Positions {
+            inner: Rc::new(SinkHost::new(&store)),
+            admitted: RefCell::default(),
+            answered: RefCell::default(),
+            beefs: RefCell::default(),
+        });
+        engine.set_gasp_finalize_host(host.clone());
+        engine.set_admission_mode(AdmissionMode::On).unwrap();
+        engine.start_gasp_sync().await.unwrap();
+        let beefs = host.beefs.borrow().clone();
+        let answered = host.answered.borrow().clone();
+        let places: Vec<_> = answered
+            .iter()
+            .map(|(txid, at, _)| (txid[..12].to_string(), *at))
+            .collect();
+        println!(
+            "S4 budgeted={budgeted}: the graph's bodies {}, answered at {places:?}",
+            beefs.first().map_or(0, Vec::len)
+        );
+        assert_eq!(beefs.len(), 1, "one graph");
+        let graph = &beefs[0];
+        let p_twice = answered.iter().filter(|(txid, ..)| *txid == p.id()).count();
+        assert_eq!(p_twice, 2, "the graph carries p twice: {places:?}");
+        let mut at: Vec<usize> = answered.iter().map(|(_, at, _)| *at).collect();
+        at.sort_unstable();
+        assert_eq!(
+            at,
+            (0..graph.len()).collect::<Vec<_>>(),
+            "every place of the graph handed once: {places:?}"
+        );
+        for (txid, at, beef) in answered.iter().chain(host.admitted.borrow().iter()) {
+            assert_eq!(beef, &graph[*at], "the BEEF at its own place");
+            assert_eq!(
+                Transaction::from_beef(beef, None).unwrap().id(),
+                *txid,
+                "the BEEF at {at} is its body's"
+            );
+        }
+        assert_eq!(
+            host.inner
+                .heard
+                .borrow()
+                .iter()
+                .map(|h| h.word.clone())
+                .collect::<Vec<_>>(),
+            ["landed", "landed (dedup)", "landed"],
+            "p lands once and its second place dedups"
+        );
+    }
+}
+
 /// A shadow host that is never to be asked.
 struct Unasked;
 
