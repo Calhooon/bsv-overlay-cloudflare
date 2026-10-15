@@ -123,6 +123,37 @@ pub trait UHRPStorage {
         content_length: i64,
     ) -> Result<(), UHRPStorageError>;
 
+    /// Store a record unless `(txid, output_index)` is already indexed (the
+    /// lookup's admission). Default: [`Self::has_duplicate_record`], then
+    /// [`Self::store_record`]. A backend whose key makes the insert itself
+    /// the dedup (insert or ignore) answers in one statement (engine 0.2.2,
+    /// the Worker's D1, which also writes it in a GASP page's batch).
+    #[allow(clippy::too_many_arguments)]
+    async fn store_record_unless_held(
+        &self,
+        txid: &str,
+        output_index: u32,
+        uhrp_url: &str,
+        identity_key: &str,
+        download_url: &str,
+        expiry_time: i64,
+        content_length: i64,
+    ) -> Result<(), UHRPStorageError> {
+        if self.has_duplicate_record(txid, output_index).await? {
+            return Ok(());
+        }
+        self.store_record(
+            txid,
+            output_index,
+            uhrp_url,
+            identity_key,
+            download_url,
+            expiry_time,
+            content_length,
+        )
+        .await
+    }
+
     /// Delete a UHRP record by UTXO reference.
     async fn delete_record(&self, txid: &str, output_index: u32) -> Result<(), UHRPStorageError>;
 

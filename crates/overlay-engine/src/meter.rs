@@ -29,6 +29,11 @@ pub struct SyncCost {
     pub batch_requests: u64,
     /// Nodes the batch answers served, each in place of a single request.
     pub batch_nodes: u64,
+    /// Page batches the storage applied (engine 0.2.2): each is one
+    /// storage write, also counted in `storage_writes`.
+    pub storage_batches: u64,
+    /// The statements those batches ran, each in place of a write of its own.
+    pub storage_statements: u64,
     pub ms: u64,
     pub outputs_walked: u64,
     pub ms_per_1000_outputs: Option<u64>,
@@ -51,6 +56,10 @@ impl SyncCost {
                 .saturating_sub(before.peer_absent_memo_hits),
             batch_requests: self.batch_requests.saturating_sub(before.batch_requests),
             batch_nodes: self.batch_nodes.saturating_sub(before.batch_nodes),
+            storage_batches: self.storage_batches.saturating_sub(before.storage_batches),
+            storage_statements: self
+                .storage_statements
+                .saturating_sub(before.storage_statements),
             ms: self.ms.saturating_sub(before.ms),
             outputs_walked: self.outputs_walked.saturating_sub(before.outputs_walked),
             ms_per_1000_outputs: None,
@@ -81,6 +90,10 @@ impl SyncCost {
             .saturating_add(other.peer_absent_memo_hits);
         self.batch_requests = self.batch_requests.saturating_add(other.batch_requests);
         self.batch_nodes = self.batch_nodes.saturating_add(other.batch_nodes);
+        self.storage_batches = self.storage_batches.saturating_add(other.storage_batches);
+        self.storage_statements = self
+            .storage_statements
+            .saturating_add(other.storage_statements);
         self.ms = self.ms.saturating_add(other.ms);
         self.outputs_walked = self.outputs_walked.saturating_add(other.outputs_walked);
         self.refresh_speed();
@@ -183,6 +196,14 @@ pub fn storage_read() {
 }
 pub fn storage_write() {
     note(|v| v.storage_writes += 1);
+}
+/// One page batch applied (engine 0.2.2), of `statements` statements; its
+/// storage write is counted by [`storage_write`].
+pub fn storage_batch(statements: u64) {
+    note(|v| {
+        v.storage_batches += 1;
+        v.storage_statements = v.storage_statements.saturating_add(statements);
+    });
 }
 /// Count attempted SQL statements at the worker adapter, including batch members.
 pub fn d1_queries(count: u64) {

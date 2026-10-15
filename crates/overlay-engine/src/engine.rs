@@ -5376,6 +5376,12 @@ impl Engine {
                     let log_prefix = format!("[GASP {topic} <-> {peer_url}]");
                     // Graphs of this peer handed to submit (bsv-low #552).
                     let peer_finalized = std::cell::Cell::new(0u64);
+                    // Engine 0.2.2: this peer's page buffer (`page_batch`).
+                    let page = match &self.finalize_submit_budget {
+                        Some((sleep, budget_ms)) => crate::page_batch::PageBuffer::default()
+                            .with_bound(sleep.clone(), *budget_ms),
+                        None => crate::page_batch::PageBuffer::default(),
+                    };
                     let mut sync = GASPSync::new(
                         Box::new(gasp_storage),
                         gasp_remote,
@@ -5451,14 +5457,43 @@ impl Engine {
                                 }
                             });
                             crate::gasp::race_or_deadline_guarded(
-                                sync.sync(Some(ENGINE_GASP_SYNC_PAGE_LIMIT)),
+                                crate::page_batch::scope(
+                                    page.clone(),
+                                    sync.sync(Some(ENGINE_GASP_SYNC_PAGE_LIMIT)),
+                                ),
                                 deadline,
                                 &self.finalize_gate,
                             )
                             .await
                         }
-                        None => Some(sync.sync(Some(ENGINE_GASP_SYNC_PAGE_LIMIT)).await),
+                        None => Some(
+                            crate::page_batch::scope(
+                                page.clone(),
+                                sync.sync(Some(ENGINE_GASP_SYNC_PAGE_LIMIT)),
+                            )
+                            .await,
+                        ),
                     };
+                    // Engine 0.2.2: a sync stopped mid-page (its future
+                    // dropped at the deadline, or an error) left the page's
+                    // writes queued. They are written now; failing that,
+                    // nothing of the page is admitted and the cursor keeps to
+                    // the page's floor (below).
+                    let page_lost = page.pending() > 0
+                        && {
+                            page.close();
+                            match page.flush(self.storage.as_ref()).await {
+                                Ok(()) => false,
+                                Err(e) => {
+                                    warn!(
+                                    "[GASP SYNC] the page's storage batch for {topic} from {peer_url} failed, nothing of it admitted: {e}"
+                                );
+                                    page.discard();
+                                    true
+                                }
+                            }
+                        };
+                    page.close();
 
                     let mut outcome_success = matches!(sync_outcome, Some(Ok(())));
                     // Engine 0.2.0 (#57): the platform answered in the peer's
@@ -5511,7 +5546,10 @@ impl Engine {
                             // bsv-low #555: the walk in hand is saved, so the
                             // next tick resumes it instead of walking it again.
                             sync.defer_in_flight().await;
-                            let completed = sync.completed_cursor();
+                            let completed = match sync.page_floor() {
+                                Some(floor) if page_lost => sync.completed_cursor().min(floor),
+                                _ => sync.completed_cursor(),
+                            };
                             if completed > last_interaction {
                                 match self
                                     .storage
@@ -13903,4 +13941,5 @@ mod tests {
     include!("absence_tests.rs");
     include!("route_fault_tests.rs");
     include!("batch_tests.rs");
+    include!("page_batch_tests.rs");
 }

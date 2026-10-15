@@ -1,7 +1,30 @@
 //! Count each storage operation at the trait boundary and forward its result.
-use crate::{storage::*, types::*};
+//! While a sync's page is open (engine 0.2.2, `crate::page_batch`) the
+//! page's admission writes are queued and written in one batch, its reads
+//! answered from the page where it knows them; every other write, and every
+//! read of the tables the queue writes, flushes the queue before it.
+use crate::{page_batch, storage::*, types::*};
 use async_trait::async_trait;
 pub(crate) struct MeteredStorage(pub Box<dyn Storage>);
+
+impl MeteredStorage {
+    /// Before a call the page does not answer: apply what the page queued,
+    /// so the store has every earlier write. `rows` names a write that
+    /// changes output or applied rows, after which the page's answers are
+    /// forgotten.
+    async fn barrier(&self, rows: bool) -> Result<(), StorageError> {
+        let Some(page) = page_batch::current() else {
+            return Ok(());
+        };
+        if page.pending() > 0 {
+            page.flush(self).await?;
+        }
+        if rows {
+            page.forget_answers();
+        }
+        Ok(())
+    }
+}
 #[async_trait(?Send)]
 impl Storage for MeteredStorage {
     async fn insert_output_with_origin(
@@ -9,6 +32,10 @@ impl Storage for MeteredStorage {
         output: &Output,
         gasp: bool,
     ) -> Result<(), StorageError> {
+        if let Some(page) = page_batch::current() {
+            page.queue_output(output, gasp);
+            return Ok(());
+        }
         crate::meter::storage_write();
         self.0.insert_output_with_origin(output, gasp).await
     }
@@ -36,10 +63,15 @@ impl Storage for MeteredStorage {
         topic: &str,
         state: &crate::sync_load::PeerCadence,
     ) -> Result<(), StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_write();
         self.0.set_peer_cadence(host, topic, state).await
     }
     async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
+        if let Some(page) = page_batch::current() {
+            page.queue_output(output, false);
+            return Ok(());
+        }
         crate::meter::storage_write();
         self.0.insert_output(output).await
     }
@@ -49,6 +81,7 @@ impl Storage for MeteredStorage {
         output_index: u32,
         topic: &str,
     ) -> Result<(), StorageError> {
+        self.barrier(true).await?;
         crate::meter::storage_write();
         self.0.delete_output(txid, output_index, topic).await
     }
@@ -58,6 +91,7 @@ impl Storage for MeteredStorage {
         output_index: u32,
         topic: &str,
     ) -> Result<(), StorageError> {
+        self.barrier(true).await?;
         crate::meter::storage_write();
         self.0.mark_utxo_as_spent(txid, output_index, topic).await
     }
@@ -68,16 +102,19 @@ impl Storage for MeteredStorage {
         topic: &str,
         consumed_by: &[Outpoint],
     ) -> Result<(), StorageError> {
+        self.barrier(true).await?;
         crate::meter::storage_write();
         self.0
             .update_consumed_by(txid, output_index, topic, consumed_by)
             .await
     }
     async fn update_transaction_beef(&self, txid: &str, beef: &[u8]) -> Result<(), StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_write();
         self.0.update_transaction_beef(txid, beef).await
     }
     async fn mark_transaction_proven(&self, txid: &str) -> Result<(), StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_write();
         self.0.mark_transaction_proven(txid).await
     }
@@ -86,6 +123,7 @@ impl Storage for MeteredStorage {
         txid: &str,
         height: Option<u64>,
     ) -> Result<(), StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_write();
 
         self.0.mark_transaction_proven_at(txid, height).await
@@ -97,6 +135,7 @@ impl Storage for MeteredStorage {
         topic: &str,
         block_height: u32,
     ) -> Result<(), StorageError> {
+        self.barrier(true).await?;
         crate::meter::storage_write();
         self.0
             .update_output_block_height(txid, output_index, topic, block_height)
@@ -106,6 +145,10 @@ impl Storage for MeteredStorage {
         &self,
         tx: &AppliedTransaction,
     ) -> Result<(), StorageError> {
+        if let Some(page) = page_batch::current() {
+            page.queue_applied(tx);
+            return Ok(());
+        }
         crate::meter::storage_write();
         self.0.insert_applied_transaction(tx).await
     }
@@ -113,13 +156,22 @@ impl Storage for MeteredStorage {
         &self,
         tx: &AppliedTransaction,
     ) -> Result<bool, StorageError> {
+        let page = page_batch::current();
+        if let Some(held) = page.as_ref().and_then(|p| p.applied(tx)) {
+            return Ok(held);
+        }
         crate::meter::storage_read();
-        self.0.does_applied_transaction_exist(tx).await
+        let held = self.0.does_applied_transaction_exist(tx).await?;
+        if let Some(page) = page {
+            page.remember_applied(tx, held);
+        }
+        Ok(held)
     }
     async fn delete_applied_transaction(
         &self,
         tx: &AppliedTransaction,
     ) -> Result<(), StorageError> {
+        self.barrier(true).await?;
         crate::meter::storage_write();
         self.0.delete_applied_transaction(tx).await
     }
@@ -131,15 +183,35 @@ impl Storage for MeteredStorage {
         spent: Option<bool>,
         include_beef: bool,
     ) -> Result<Option<Output>, StorageError> {
+        // The page answers the admissions' question (a topic's output, no
+        // spent filter, no BEEF); any other shape reads the store whole.
+        let page = if let (Some(topic), None, false) = (topic, spent, include_beef) {
+            page_batch::current().map(|p| (p, topic))
+        } else {
+            self.barrier(false).await?;
+            None
+        };
+        if let Some(known) = page
+            .as_ref()
+            .and_then(|(p, topic)| p.output(txid, output_index, topic))
+        {
+            return Ok(known.0);
+        }
         crate::meter::storage_read();
-        self.0
+        let answer = self
+            .0
             .find_output(txid, output_index, topic, spent, include_beef)
-            .await
+            .await?;
+        if let Some((page, topic)) = page {
+            page.remember_output(txid, output_index, topic, answer.clone());
+        }
+        Ok(answer)
     }
     async fn find_served_outputs(
         &self,
         outpoints: &[Outpoint],
     ) -> Result<Vec<Output>, StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_read();
         self.0.find_served_outputs(outpoints).await
     }
@@ -149,6 +221,7 @@ impl Storage for MeteredStorage {
         txid: &str,
         include_beef: bool,
     ) -> Result<Vec<Output>, StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_read();
         self.0
             .find_outputs_for_transaction(txid, include_beef)
@@ -161,6 +234,7 @@ impl Storage for MeteredStorage {
         limit: Option<u64>,
         include_beef: bool,
     ) -> Result<Vec<Output>, StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_read();
         self.0
             .find_utxos_for_topic(topic, since, limit, include_beef)
@@ -171,6 +245,7 @@ impl Storage for MeteredStorage {
         limit: u64,
         min_age_secs: u64,
     ) -> Result<Vec<TransactionBeef>, StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_read();
         self.0
             .find_transactions_for_proof_check(limit, min_age_secs)
@@ -182,6 +257,7 @@ impl Storage for MeteredStorage {
         topic: &str,
         since: u64,
     ) -> Result<(), StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_write();
         self.0.update_last_interaction(host, topic, since).await
     }
@@ -195,6 +271,7 @@ impl Storage for MeteredStorage {
         topic: &str,
         success: bool,
     ) -> Result<(), StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_write();
         self.0.record_peer_sync_outcome(host, topic, success).await
     }
@@ -212,6 +289,7 @@ impl Storage for MeteredStorage {
         topic: &str,
         yielded: bool,
     ) -> Result<PeerYieldStreak, StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_write();
         self.0.record_peer_sync_yield(host, topic, yielded).await
     }
@@ -219,6 +297,7 @@ impl Storage for MeteredStorage {
         &self,
         record: &crate::gasp::DeferredGraph,
     ) -> Result<crate::gasp::DeferredGraphSave, StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_write();
         self.0.put_deferred_graph(record).await
     }
@@ -226,6 +305,7 @@ impl Storage for MeteredStorage {
         &self,
         record: &crate::gasp::DeferredGraph,
     ) -> Result<bool, StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_write();
         self.0.reserve_unanchorable_retry(record).await
     }
@@ -252,6 +332,7 @@ impl Storage for MeteredStorage {
         topic: &str,
         outpoint: &str,
     ) -> Result<(), StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_write();
         self.0.delete_deferred_graph(host, topic, outpoint).await
     }
@@ -261,6 +342,7 @@ impl Storage for MeteredStorage {
         outpoint: &str,
         expiry: u64,
     ) -> Result<(), StorageError> {
+        self.barrier(false).await?;
         crate::meter::storage_write();
         self.0
             .remember_expired_outpoint(topic, outpoint, expiry)
@@ -273,5 +355,27 @@ impl Storage for MeteredStorage {
     ) -> Result<Vec<String>, StorageError> {
         crate::meter::storage_read();
         self.0.find_expired_outpoints(topic, outpoints).await
+    }
+    async fn write_batch(&self, writes: &[page_batch::PageWrite]) -> Result<u64, StorageError> {
+        crate::meter::storage_write();
+        let statements = self.0.write_batch(writes).await?;
+        crate::meter::storage_batch(statements);
+        Ok(statements)
+    }
+    async fn find_topic_outputs(
+        &self,
+        topic: &str,
+        outpoints: &[(String, u32)],
+    ) -> Result<Vec<Output>, StorageError> {
+        crate::meter::storage_read();
+        self.0.find_topic_outputs(topic, outpoints).await
+    }
+    async fn find_applied_transactions(
+        &self,
+        topic: &str,
+        txids: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        crate::meter::storage_read();
+        self.0.find_applied_transactions(topic, txids).await
     }
 }

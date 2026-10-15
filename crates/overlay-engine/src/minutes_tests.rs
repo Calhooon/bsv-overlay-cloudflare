@@ -376,8 +376,12 @@ async fn minutes_0113_absence_memo_spans_the_backfill_call() {
 
 #[tokio::test]
 async fn minutes_0113_request_allowance_yields_a_continuation() {
-    let (mut engine, mut remote) = budget_page_engine(200);
+    // Engine 0.2.2: a page's storage is one batch, so 200 outputs in one
+    // page no longer reach the allowance (the lane's point); 3,000 served
+    // 100 a page do (about 22 operations a page, so about 23 pages).
+    let (mut engine, mut remote) = budget_page_engine(3000);
     remote.node_cost_ms = 0;
+    remote.clamp = Some(100);
     let meter = minutes_clock(&mut engine, &remote);
     engine.set_gasp_remote_factory(Box::new(remote.clone()));
     let result = engine
@@ -388,7 +392,7 @@ async fn minutes_0113_request_allowance_yields_a_continuation() {
     assert_eq!(result.stop_reason, "request_allowance");
     assert!(result.continuation.is_some());
     let done = result.sync.topics_synced["tm_test"].finalized_graphs;
-    assert!(done > 0 && done < 200);
+    assert!(done > 0 && done < 3000);
     let cursor = crate::backfill::Continuation::decode(result.continuation.as_ref().unwrap())
         .unwrap()
         .cursor;

@@ -125,19 +125,9 @@ impl LookupService for UHRPLookupService {
         let uhrp_url =
             bsv_rs::primitives::encoding::to_base58_check(&pushdrop.fields[1], &[0xce, 0x00]);
 
-        // Dedup: skip if (txid, output_index) is already indexed.
-        let is_dup = self
-            .storage
-            .has_duplicate_record(txid, output_index)
-            .await
-            .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
-        if is_dup {
-            debug!("UHRP: skipping duplicate record for {txid}:{output_index}");
-            return Ok(());
-        }
-
+        // Dedup: nothing is stored if (txid, output_index) is already indexed.
         self.storage
-            .store_record(
+            .store_record_unless_held(
                 txid,
                 output_index,
                 &uhrp_url,
