@@ -43,6 +43,12 @@ pub mod hop_probe_memos;
 pub mod janitor;
 pub mod lobby_changes;
 pub mod mainnet_fanout;
+// bsv-low promotion-repair, remedy B (Option 1, the #430 shape): the native
+// out-of-band migration emitter. NEVER part of the wasm32 Worker build — it
+// is host tooling (std::fs, the example `emit-migrations`), gated off wasm32
+// so `worker-build` and the wasm32 gate never see it.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod migration_emitter;
 pub mod ops;
 pub mod peer_crawler;
 pub mod pot_changes;

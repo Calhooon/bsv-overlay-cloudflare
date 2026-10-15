@@ -255,13 +255,14 @@
   {
    "file": "crates/overlay-cloudflare/src/d1/mod.rs",
    "op": "ALTER",
-   "count": 1,
+   "count": 2,
    "crate": "overlay-cloudflare",
    "statements": [
+    "ALTER TABLE",
     "ALTER TABLE"
    ],
    "tables": [],
-   "why": "migration_error_is_benign's `ALTER TABLE` prefix test, not a statement"
+   "why": "two `ALTER TABLE` prefix tests, not statements: migration_error_is_benign and migration_statement_is_additive (the shared additive predicate the emitter reuses)"
   },
   {
    "file": "crates/overlay-cloudflare/src/ops.rs",
