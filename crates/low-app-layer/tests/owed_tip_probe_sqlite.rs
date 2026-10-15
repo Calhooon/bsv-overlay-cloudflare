@@ -72,7 +72,10 @@ fn pin669_a5_the_hops_tip_sql_marks_only_claimable_stranded_identities() {
 
     // the new twin: marks only the claimable hop-stranded identity
     let marked = db.execute(OWED_STALE_ON_TIP_HOPS_SQL, []).unwrap();
-    assert_eq!(marked, 1, "exactly one identity (the claimable stranded hop) is marked");
+    assert_eq!(
+        marked, 1,
+        "exactly one identity (the claimable stranded hop) is marked"
+    );
     assert_eq!(
         stale_of(&db, "id-claimable-hop"),
         1,

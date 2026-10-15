@@ -661,6 +661,18 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
             "tip",
         )
         .await;
+        // bsv-low #669: the twin for HOP-STRANDED rows. A non-LOW competitor's confirming block fires no
+        // pot-changed / hop-changed / tx-word hook, so the pot gate above names no stranded-hop identity and its
+        // sweep claim stays frozen at the compute tip. This marks stale exactly the identities holding a live
+        // claimable stranded hop (no bind: the set is the derived rows), so the next read / the #648 deferred alarm
+        // re-probes the chain at the new tip and re-points the hop to spent-elsewhere.
+        crate::routes::owed_mark_stale(
+            &db,
+            crate::owed::OWED_STALE_ON_TIP_HOPS_SQL,
+            &[],
+            "tip-hops",
+        )
+        .await;
     });
     Response::from_json(&json!({ "ok": true, "room": TIP_ROOM, "height": height }))
 }
