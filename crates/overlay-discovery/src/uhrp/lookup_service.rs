@@ -274,7 +274,7 @@ mod tests {
     use super::super::storage::MemoryUHRPStorage;
     use super::*;
     use bsv_rs::primitives::ec::PrivateKey;
-    use bsv_rs::primitives::encoding::Writer;
+    use bsv_rs::primitives::to_var_int;
     use bsv_rs::script::templates::PushDrop as PushDropTemplate;
 
     fn make_service() -> UHRPLookupService {
@@ -285,12 +285,6 @@ mod tests {
         let storage = Rc::new(MemoryUHRPStorage::new());
         let svc = UHRPLookupService::new(storage.clone());
         (svc, storage)
-    }
-
-    fn varint(v: u64) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.write_var_int(v);
-        w.into_bytes()
     }
 
     /// Build a UHRP PushDrop locking script (binary bytes) suitable for
@@ -308,8 +302,8 @@ mod tests {
             identity_pubkey.to_vec(),
             hash32.to_vec(),
             url.as_bytes().to_vec(),
-            varint(expiry),
-            varint(length),
+            to_var_int(expiry),
+            to_var_int(length),
             vec![0x30, 0x04, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01], // mock sig
         ];
         let pushdrop = PushDropTemplate::new(locking_key, fields);

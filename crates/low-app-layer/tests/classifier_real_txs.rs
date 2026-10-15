@@ -432,9 +432,12 @@ fn build_funding(lock: &[u8], sats: u64) -> Vec<u8> {
     b.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
     b.push(1); // one output — the pot
     b.extend_from_slice(&sats.to_le_bytes());
-    // fd-length (the covenant lock is ~3150 bytes)
-    b.push(0xfd);
-    b.extend_from_slice(&u16::try_from(lock.len()).unwrap().to_le_bytes());
+    // The lock's length, canonical. Amended for bsv-rs 0.6.0 (lane
+    // L2-migrate-engine): this was always the 3-byte `fd` form (the covenant
+    // lock is ~3150 bytes, which still takes it), but the bare pot's lock is
+    // 105 bytes and 0.6.0's parser refuses a wide length as the node does
+    // (`NonCanonicalVarInt`).
+    b.extend(bsv_rs::primitives::to_var_int(lock.len() as u64));
     b.extend_from_slice(lock);
     b.extend_from_slice(&0u32.to_le_bytes());
     b

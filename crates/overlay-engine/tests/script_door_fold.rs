@@ -22,6 +22,7 @@
 //! doc comment. Below the line: the typed limb, and the memory estimate held
 //! against the measured heap with the limb lifted.
 
+use bsv_rs::primitives::to_var_int;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -98,15 +99,6 @@ fn engine() -> Engine {
 
 type Hash32 = [u8; 32];
 
-fn varint(n: u64) -> Vec<u8> {
-    match n {
-        0..=0xfc => vec![n as u8],
-        0xfd..=0xffff => [&[0xfd][..], &(n as u16).to_le_bytes()].concat(),
-        0x1_0000..=0xffff_ffff => [&[0xfe][..], &(n as u32).to_le_bytes()].concat(),
-        _ => [&[0xff][..], &n.to_le_bytes()].concat(),
-    }
-}
-
 struct In {
     prev: Hash32,
     vout: u32,
@@ -125,18 +117,18 @@ fn spend(prev: Hash32, vout: u32, script: &[u8]) -> In {
 
 fn raw_tx(version: u32, inputs: &[In], outputs: &[(u64, Vec<u8>)], lock_time: u32) -> Vec<u8> {
     let mut raw = version.to_le_bytes().to_vec();
-    raw.extend(varint(inputs.len() as u64));
+    raw.extend(to_var_int(inputs.len() as u64));
     for input in inputs {
         raw.extend_from_slice(&input.prev);
         raw.extend_from_slice(&input.vout.to_le_bytes());
-        raw.extend(varint(input.script.len() as u64));
+        raw.extend(to_var_int(input.script.len() as u64));
         raw.extend_from_slice(&input.script);
         raw.extend_from_slice(&input.sequence.to_le_bytes());
     }
-    raw.extend(varint(outputs.len() as u64));
+    raw.extend(to_var_int(outputs.len() as u64));
     for (satoshis, script) in outputs {
         raw.extend_from_slice(&satoshis.to_le_bytes());
-        raw.extend(varint(script.len() as u64));
+        raw.extend(to_var_int(script.len() as u64));
         raw.extend_from_slice(script);
     }
     raw.extend_from_slice(&lock_time.to_le_bytes());
@@ -163,7 +155,7 @@ fn funding_raw(outputs: &[(u64, Vec<u8>)]) -> Vec<u8> {
 
 /// The BUMP of a block of one transaction: one level, one leaf, the txid.
 fn one_leaf_bump(txid: &Hash32) -> Vec<u8> {
-    let mut bump = varint(800_000);
+    let mut bump = to_var_int(800_000);
     bump.extend_from_slice(&[0x01, 0x01, 0x00, 0x02]);
     bump.extend_from_slice(txid);
     bump
@@ -173,17 +165,17 @@ fn one_leaf_bump(txid: &Hash32) -> Vec<u8> {
 /// in the order given.
 fn beef_v1(bumps: &[Vec<u8>], txs: &[(Vec<u8>, Option<u64>)]) -> Vec<u8> {
     let mut body = vec![0x01, 0x00, 0xbe, 0xef];
-    body.extend(varint(bumps.len() as u64));
+    body.extend(to_var_int(bumps.len() as u64));
     for bump in bumps {
         body.extend_from_slice(bump);
     }
-    body.extend(varint(txs.len() as u64));
+    body.extend(to_var_int(txs.len() as u64));
     for (raw, bump) in txs {
         body.extend_from_slice(raw);
         match bump {
             Some(index) => {
                 body.push(0x01);
-                body.extend(varint(*index));
+                body.extend(to_var_int(*index));
             }
             None => body.push(0x00),
         }
@@ -360,7 +352,7 @@ fn e585f_m1_the_work_budget_bounds_the_ec_verifications_of_a_walk() {
 /// [`minimal_valid_transactions`].
 fn minimal_transactions(n: u32) -> (Vec<u8>, String) {
     let mut body = vec![0x01, 0x00, 0xbe, 0xef, 0x00];
-    body.extend(varint(u64::from(n)));
+    body.extend(to_var_int(u64::from(n)));
     for i in 0..n {
         body.extend_from_slice(&raw_tx(i, &[], &[], 0));
         body.push(0x00);
@@ -383,7 +375,7 @@ fn minimal_valid_transactions(n: u32) -> (Vec<u8>, String) {
     );
     let mut body = vec![0x01, 0x00, 0xbe, 0xef, 0x01];
     body.extend_from_slice(&one_leaf_bump(&funding_txid));
-    body.extend(varint(u64::from(n) + 2));
+    body.extend(to_var_int(u64::from(n) + 2));
     body.extend_from_slice(&funding);
     body.extend_from_slice(&[0x01, 0x00]);
     for i in 0..n {
@@ -418,11 +410,11 @@ fn wide_bump(levels: u8) -> (Vec<u8>, String) {
     );
     let subject_txid = display(&wire_txid(&subject));
     let leaves = 1u64 << levels;
-    let mut bump = varint(800_000);
+    let mut bump = to_var_int(800_000);
     bump.push(levels);
-    bump.extend(varint(leaves));
+    bump.extend(to_var_int(leaves));
     for i in 0..leaves {
-        bump.extend(varint(i));
+        bump.extend(to_var_int(i));
         bump.push(0x00);
         if i == 0 {
             bump.extend_from_slice(&funding_txid);

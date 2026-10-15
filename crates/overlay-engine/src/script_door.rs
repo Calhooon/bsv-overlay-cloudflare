@@ -322,19 +322,12 @@ impl<'a> Fields<'a> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 
+    /// A varint, read by bsv-rs's canonical reader (0.6.0): a short read or
+    /// a wider-than-necessary encoding is `None`, as the node refuses it.
     pub(crate) fn varint(&mut self) -> Option<u64> {
-        let lead = *self.take(1)?.first()?;
-        let wide = |bytes: &[u8]| {
-            let mut le = [0u8; 8];
-            le[..bytes.len()].copy_from_slice(bytes);
-            u64::from_le_bytes(le)
-        };
-        Some(match lead {
-            0xfd => wide(self.take(2)?),
-            0xfe => wide(self.take(4)?),
-            0xff => wide(self.take(8)?),
-            short => u64::from(short),
-        })
+        let (value, width) = bsv_rs::primitives::from_var_int(self.raw.get(self.at..)?).ok()?;
+        self.at += width;
+        Some(value)
     }
 
     /// A script: its length, then its place in the raw bytes.
@@ -884,7 +877,11 @@ mod tests {
     use super::*;
 
     /// One raw transaction: `inputs` empty-script inputs, then outputs with
-    /// the given scripts.
+    /// the given scripts. Amended for bsv-rs 0.6.0 (lane L2-migrate-engine):
+    /// a script's length was always the 3-byte `0xfd` form, which 0.6.0's
+    /// parser and the door now refuse below 253 as the node does
+    /// (`NonCanonicalVarInt`); it is written canonical, and the 300-byte
+    /// script below still takes the 3-byte form.
     fn raw_tx(inputs: usize, scripts: &[&[u8]]) -> Vec<u8> {
         let mut raw = 1u32.to_le_bytes().to_vec();
         raw.push(inputs as u8);
@@ -897,7 +894,7 @@ mod tests {
         raw.push(scripts.len() as u8);
         for (i, script) in scripts.iter().enumerate() {
             raw.extend_from_slice(&(1000 + i as u64).to_le_bytes());
-            raw.extend_from_slice(&[0xfd, script.len() as u8, (script.len() >> 8) as u8]);
+            raw.extend(bsv_rs::primitives::to_var_int(script.len() as u64));
             raw.extend_from_slice(script);
         }
         raw.extend_from_slice(&7u32.to_le_bytes());
@@ -934,6 +931,26 @@ mod tests {
         let mut longer = raw.clone();
         longer.push(0);
         assert!(Layout::of(&longer).is_none());
+    }
+
+    /// THE VARINT IS BSV-RS'S (0.6.0, lane L2-migrate-engine): the door
+    /// reads a length as the node does (bitcoin-sv@6504a3af
+    /// `src/serialize.h:315-340`, through bsv-rs's `from_var_int`), so a
+    /// length written wider than it needs is no layout, as it is no
+    /// transaction to the SDK.
+    #[test]
+    fn migrate_060_a_wide_length_is_no_layout() {
+        let raw = raw_tx(1, &[&[0x51]]);
+        assert!(Layout::of(&raw).is_some());
+        // The one output's script length, `01`, sits just before its byte.
+        let at = raw.len() - 4 - 2;
+        assert_eq!(&raw[at..at + 2], &[0x01, 0x51]);
+        let mut wide = raw[..at].to_vec();
+        wide.extend_from_slice(&[0xfd, 0x01, 0x00, 0x51]);
+        wide.extend_from_slice(&raw[raw.len() - 4..]);
+        assert!(bsv_rs::transaction::Transaction::from_binary(&wide).is_err());
+        assert!(Layout::of(&wide).is_none());
+        assert!(output_offsets(&wide).is_none());
     }
 
     /// THE INDEX: an entry per raw transaction and one per txid a BUMP

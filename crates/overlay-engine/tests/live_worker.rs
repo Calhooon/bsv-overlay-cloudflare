@@ -838,26 +838,6 @@ fn admin_sync_advertisements() {
 // 15. Lookup with x-aggregation: yes (binary response)
 // =============================================================================
 
-/// Bitcoin-style VarInt decoder. Returns (value, bytes_consumed).
-fn read_varint(data: &[u8]) -> (u64, usize) {
-    assert!(!data.is_empty(), "VarInt: empty data");
-    let first = data[0];
-    if first < 0xfd {
-        (first as u64, 1)
-    } else if first == 0xfd {
-        let val = u16::from_le_bytes([data[1], data[2]]);
-        (val as u64, 3)
-    } else if first == 0xfe {
-        let val = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-        (val as u64, 5)
-    } else {
-        let val = u64::from_le_bytes([
-            data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
-        ]);
-        (val, 9)
-    }
-}
-
 #[ignore]
 #[test]
 fn lookup_ship_aggregated_binary() {
@@ -911,7 +891,7 @@ fn lookup_ship_aggregated_binary() {
         let mut pos = 0;
 
         // Read number of outputs
-        let (num_outputs, consumed) = read_varint(&bytes[pos..]);
+        let (num_outputs, consumed) = bsv_rs::primitives::from_var_int(&bytes[pos..]).unwrap();
         pos += consumed;
         println!("Number of outputs: {num_outputs}");
 
@@ -932,11 +912,11 @@ fn lookup_ship_aggregated_binary() {
             let txid_hex: String = txid_bytes.iter().map(|b| format!("{b:02x}")).collect();
             println!("Output {i}: txid={txid_hex}");
 
-            let (output_index, consumed) = read_varint(&bytes[pos..]);
+            let (output_index, consumed) = bsv_rs::primitives::from_var_int(&bytes[pos..]).unwrap();
             pos += consumed;
             println!("Output {i}: outputIndex={output_index}");
 
-            let (ctx_len, consumed) = read_varint(&bytes[pos..]);
+            let (ctx_len, consumed) = bsv_rs::primitives::from_var_int(&bytes[pos..]).unwrap();
             pos += consumed;
 
             if ctx_len > 0 {

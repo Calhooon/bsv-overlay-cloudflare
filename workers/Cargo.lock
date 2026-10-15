@@ -159,14 +159,14 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-cloudflare"
-version = "0.6.0"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "240d359739b3c1cd340f43c8a7b02127ad4a7a719898132b93a3500ee9e27594"
+checksum = "8724654c82948755133092011d9db3d74dcd50a5ea35ea1b8067f0e1e7aae1ba"
 dependencies = [
  "async-trait",
  "base64",
  "bsv-middleware-core",
- "bsv-rs",
+ "bsv-rs 0.6.0",
  "console_error_panic_hook",
  "futures",
  "getrandom",
@@ -184,12 +184,12 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-core"
-version = "0.3.0"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66586845b2e562d2ee0093778409619b93b54c06603feadd1961778381996d87"
+checksum = "aa30141c960f70f200e93cf68e9f31acdd3711b6ef2918fa6f410974b0959f4e"
 dependencies = [
  "async-trait",
- "bsv-rs",
+ "bsv-rs 0.6.0",
  "getrandom",
  "hex",
  "hmac",
@@ -208,7 +208,7 @@ dependencies = [
  "bsv-middleware-cloudflare",
  "bsv-overlay-discovery",
  "bsv-overlay-engine",
- "bsv-rs",
+ "bsv-rs 0.6.0",
  "bsv-worker-build-info",
  "hex",
  "js-sys",
@@ -228,7 +228,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bsv-overlay-engine",
- "bsv-rs",
+ "bsv-rs 0.6.0",
  "hex",
  "js-sys",
  "serde",
@@ -243,7 +243,7 @@ name = "bsv-overlay-engine"
 version = "0.1.15"
 dependencies = [
  "async-trait",
- "bsv-rs",
+ "bsv-rs 0.6.0",
  "js-sys",
  "serde",
  "serde_json",
@@ -256,6 +256,40 @@ name = "bsv-rs"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72a8372f5500535f1d192765d88e123fc41c363b423516157a8fc7e5ae9326f0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "async-trait",
+ "base64",
+ "bs58",
+ "cbc",
+ "futures",
+ "getrandom",
+ "hex",
+ "hmac",
+ "k256",
+ "lazy_static",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "p256",
+ "pbkdf2",
+ "rand",
+ "ripemd",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "subtle",
+ "thiserror 1.0.69",
+ "urlencoding",
+]
+
+[[package]]
+name = "bsv-rs"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b9179f4007f1da092e0785bf8dd6bec1c9ffd46fbfc670c4af802aa31d1cc27"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -294,7 +328,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e807f07936e687ac9fe5b2abefc4ac7239de6e7e06899823dcacceb8c84c0fb1"
 dependencies = [
- "bsv-rs",
+ "bsv-rs 0.5.0",
  "serde",
  "serde_json",
 ]
@@ -962,7 +996,7 @@ dependencies = [
  "bsv-overlay-cloudflare",
  "bsv-overlay-discovery",
  "bsv-overlay-engine",
- "bsv-rs",
+ "bsv-rs 0.6.0",
  "bsv-tracker",
  "bsv-worker-build-info",
  "console_error_panic_hook",
