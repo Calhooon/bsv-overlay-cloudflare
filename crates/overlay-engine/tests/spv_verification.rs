@@ -2,6 +2,8 @@
 //!
 //! Verifies that submit() validates transactions before admitting them.
 //! Test-driven for #46.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use bsv_overlay_engine::engine::{Engine, EngineConfig, EngineError};

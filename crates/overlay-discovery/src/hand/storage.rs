@@ -138,6 +138,8 @@ pub struct MemoryHandStorage {
     records: std::sync::Mutex<Vec<HandRecord>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryHandStorage {
     pub fn new() -> Self {
         Self::default()
@@ -149,6 +151,8 @@ impl MemoryHandStorage {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl HandStorage for MemoryHandStorage {
     async fn store_record(&self, record: &HandRecord) -> Result<(), HandStorageError> {
         let mut records = self.records.lock().unwrap();

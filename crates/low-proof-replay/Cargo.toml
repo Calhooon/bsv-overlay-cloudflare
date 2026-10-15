@@ -40,3 +40,6 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # tests/admission.rs drives the real replay through `ProofLookupService`.
 overlay-engine = { package = "bsv-overlay-engine", version = "0.2.2", path = "../overlay-engine" }
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

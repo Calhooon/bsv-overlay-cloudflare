@@ -225,6 +225,8 @@ pub struct MemoryUHRPStorage {
     records: std::sync::Mutex<Vec<UHRPRecord>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryUHRPStorage {
     pub fn new() -> Self {
         Self::default()

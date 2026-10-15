@@ -16,6 +16,8 @@
 //! The file uses only what `74c2c15` has (`verify_scripts_only`,
 //! `verify_scripts_only_under`, the error's `limb`): it is run there as it
 //! stands, and each pin's RED word is in its doc comment.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_rs::primitives::to_var_int;
 use std::alloc::{GlobalAlloc, Layout, System};

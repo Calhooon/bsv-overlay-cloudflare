@@ -93,3 +93,6 @@ bsv-overlay-cloudflare = { version = "0.2.2", path = "../overlay-cloudflare" }
 bsv-rs = { workspace = true, features = ["auth"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 async-trait = "0.1"
+
+[lints]
+workspace = true

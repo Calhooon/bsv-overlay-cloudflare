@@ -221,6 +221,8 @@ pub struct MemoryPotpartyStorage {
     records: std::sync::Mutex<Vec<PotpartyRecord>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryPotpartyStorage {
     pub fn new() -> Self {
         Self::default()
@@ -232,6 +234,8 @@ impl MemoryPotpartyStorage {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl PotpartyStorage for MemoryPotpartyStorage {
     async fn store_record(&self, record: &PotpartyRecord) -> Result<(), PotpartyStorageError> {
         let mut records = self.records.lock().unwrap();

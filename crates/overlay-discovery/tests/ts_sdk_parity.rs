@@ -9,7 +9,8 @@
 //! byte-compatible with the TS reference and peer validators will reject
 //! them — a silent federation break.
 
-#![allow(clippy::unwrap_used)]
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[allow(deprecated)]
 use bsv_rs::overlay::create_overlay_admin_token;

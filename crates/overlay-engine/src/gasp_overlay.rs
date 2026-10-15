@@ -362,7 +362,9 @@ impl GraphAssembly {
                 entering.clone_from(source);
                 continue;
             }
-            let (key, node, _) = stack.pop().expect("the stack is not empty");
+            let Some((key, node, _)) = stack.pop() else {
+                return Ok(());
+            };
             if strict {
                 if let Some(missing) = node.sources.iter().rposition(Option::is_none) {
                     let source_txid = node.parsed.tx.inputs[missing]
@@ -436,7 +438,10 @@ impl GraphAssembly {
                 break;
             };
             if top.inputs_left == 0 {
-                let node = stack.pop().expect("the stack is not empty").node;
+                let Some(done) = stack.pop() else {
+                    break;
+                };
+                let node = done.node;
                 inside.remove(node.parsed.txid.as_str());
                 seen.insert(node.parsed.txid.as_str());
                 ancestors.push(node);
@@ -1578,7 +1583,10 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             .read_fault_memos(&self.peer, &self.topic, outpoints)
             .await
             .map_err(|e| GASPError::StorageError(e.to_string()))?;
-        let mut cache = self.fault_memos.lock().unwrap();
+        let mut cache = self
+            .fault_memos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Only the active batch is cached. A walk spanning many pages does not
         // keep the complete memo in isolate memory.
         cache.clear();
@@ -1599,7 +1607,13 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         &self,
         outpoint: &str,
     ) -> Result<Option<crate::gasp::DeferredGraph>, GASPError> {
-        if let Some(record) = self.fault_memos.lock().unwrap().get(outpoint).cloned() {
+        if let Some(record) = self
+            .fault_memos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(outpoint)
+            .cloned()
+        {
             return Ok(Some(record));
         }
         self.storage
@@ -1622,7 +1636,10 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             .await
             .map_err(|e| GASPError::StorageError(e.to_string()))?;
         if result == crate::gasp::DeferredGraphSave::Saved {
-            let mut cache = self.fault_memos.lock().unwrap();
+            let mut cache = self
+                .fault_memos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if record.is_struck() {
                 cache.insert(record.outpoint.clone(), record);
             } else {
@@ -1645,12 +1662,18 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             .reserve_unanchorable_retry(&record)
             .await
             .map_err(|e| GASPError::StorageError(e.to_string()))?;
-        self.fault_memos.lock().unwrap().remove(&record.outpoint);
+        self.fault_memos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&record.outpoint);
         Ok(reserved)
     }
 
     async fn delete_deferred_graph(&self, outpoint: &str) -> Result<(), GASPError> {
-        self.fault_memos.lock().unwrap().remove(outpoint);
+        self.fault_memos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(outpoint);
         self.storage
             .delete_deferred_graph(&self.peer, &self.topic, outpoint)
             .await

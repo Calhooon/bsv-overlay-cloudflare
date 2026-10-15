@@ -869,6 +869,8 @@ pub enum StorageError {
 // ============================================================================
 
 #[cfg(any(test, feature = "memory-storage"))]
+// bsv-stack-lean #134: the opt-in test store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 pub mod memory {
     use super::*;
     use std::collections::HashMap;

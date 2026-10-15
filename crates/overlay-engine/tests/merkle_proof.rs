@@ -2,6 +2,8 @@
 //! when transactions get mined.
 //!
 //! Test-driven for #45.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_overlay_engine::engine::{Engine, EngineConfig};
 use bsv_overlay_engine::storage::memory::MemoryStorage;

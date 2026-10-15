@@ -238,6 +238,8 @@ pub struct MemoryLowStorage {
     records: std::sync::Mutex<Vec<LowRecord>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryLowStorage {
     pub fn new() -> Self {
         Self::default()
@@ -249,6 +251,8 @@ impl MemoryLowStorage {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl LowStorage for MemoryLowStorage {
     async fn store_record(&self, record: &LowRecord) -> Result<(), LowStorageError> {
         let mut records = self.records.lock().unwrap();

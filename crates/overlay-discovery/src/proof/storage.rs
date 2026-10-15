@@ -155,6 +155,8 @@ pub struct MemoryProofStorage {
     records: std::sync::Mutex<Vec<ProofRecord>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryProofStorage {
     pub fn new() -> Self {
         Self::default()
@@ -166,6 +168,8 @@ impl MemoryProofStorage {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl ProofStorage for MemoryProofStorage {
     async fn store_record(&self, record: &ProofRecord) -> Result<(), ProofStorageError> {
         let mut records = self.records.lock().unwrap();

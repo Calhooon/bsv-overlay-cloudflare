@@ -100,6 +100,8 @@ pub struct MemorySLAPStorage {
     records: std::sync::Mutex<Vec<SLAPRecord>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemorySLAPStorage {
     pub fn new() -> Self {
         Self::default()
@@ -111,6 +113,8 @@ impl MemorySLAPStorage {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl SLAPStorage for MemorySLAPStorage {
     async fn has_duplicate_record(
         &self,

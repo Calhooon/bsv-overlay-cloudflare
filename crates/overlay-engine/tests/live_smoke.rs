@@ -2,6 +2,8 @@
 //!
 //! These tests hit real overlay nodes. Run with: cargo test -- --ignored
 //! They also test against saved fixtures for CI (non-ignored).
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_overlay_engine::types::*;
 use bsv_rs::overlay::decode_overlay_admin_token;

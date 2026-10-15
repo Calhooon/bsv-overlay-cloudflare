@@ -107,6 +107,8 @@ impl Continuation {
         }
     }
 
+    // bsv-stack-lean #134: four scalar fields cannot fail to serialize
+    #[allow(clippy::expect_used)]
     pub fn encode(&self) -> String {
         serde_json::to_string(self).expect("continuation has only scalar fields")
     }

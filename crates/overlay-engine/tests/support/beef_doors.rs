@@ -1,6 +1,8 @@
 //! Small shapes only. No deep ancestry or large-leaf BUMP: the sizes and
 //! counts here cross the former bounds (P0-5f) and nothing more.
 #![allow(dead_code)]
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_rs::script::{LockingScript, UnlockingScript};
 use bsv_rs::transaction::{

@@ -20,6 +20,8 @@
 //! allocator; the tests of this binary run one at a time, see `SERIAL`)
 //! inside `verify_scripts_only`, over the level at its entry. The body is the
 //! caller's and is not counted.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_rs::primitives::from_var_int;
 use std::alloc::{GlobalAlloc, Layout, System};

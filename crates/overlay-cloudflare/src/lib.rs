@@ -4,6 +4,9 @@
 //! initialization, and Engine setup.
 //!
 //! Pattern from ~/bsv/rust-wallet-infra/src/lib.rs.
+// The lint bar (bsv-stack-lean #134): the workspace table cannot deny these
+// for the LOW crates beside this one, so the engine's crate denies them here.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod admit_fast;
 pub mod advert_lifecycle;
@@ -1729,7 +1732,11 @@ mod _worker_queue {
             let ctx = ::worker::Context::new(ctx);
             if let Err(e) = super::queue_entry(event, env, ctx).await {
                 ::worker::console_log!("{}", &e);
-                panic!("{}", e);
+                // bsv-stack-lean #134: worker-macros' contract; the panic rejects the Promise so the platform retries
+                #[allow(clippy::panic)]
+                {
+                    panic!("{}", e);
+                }
             }
             Ok(::worker::wasm_bindgen::JsValue::UNDEFINED)
         }))

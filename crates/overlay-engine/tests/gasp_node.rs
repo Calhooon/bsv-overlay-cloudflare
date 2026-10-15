@@ -2,6 +2,8 @@
 //!
 //! Test-driven for #47. Based on TS Engine.test.ts provideForeignGASPNode tests
 //! and the OverlayGASPRemote patterns.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use bsv_overlay_engine::engine::{Engine, EngineConfig, EngineError};

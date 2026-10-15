@@ -2,6 +2,8 @@
 //!
 //! These tests hit the real Cloudflare Worker at <your-overlay>.workers.dev.
 //! Run with: cargo test --test live_worker -- --ignored
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 const BASE_URL: &str = "https://<your-overlay>.workers.dev";
 

@@ -109,6 +109,8 @@ pub struct MemoryDmDelegationStorage {
     rows: std::sync::Mutex<Vec<MemoryRow>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryDmDelegationStorage {
     pub fn new() -> Self {
         Self::default()
@@ -120,6 +122,8 @@ impl MemoryDmDelegationStorage {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl DmDelegationStorage for MemoryDmDelegationStorage {
     async fn has_duplicate_record(
         &self,

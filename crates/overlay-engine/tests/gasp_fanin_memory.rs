@@ -27,6 +27,8 @@
 //! parse, its raw bytes and its hex) and serialized it at every level: the
 //! cost followed the graph's PATHS, doubling with every link of the diamond
 //! chain.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
