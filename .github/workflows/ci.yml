@@ -108,3 +108,26 @@ jobs:
         toolchain: 1.95.0
     - run: cargo install cargo-machete --version 0.9.2 --locked --root "$RUNNER_TEMP/tools"
     - run: '"$RUNNER_TEMP/tools/bin/cargo-machete" --with-metadata .'
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      with:
+        toolchain: 1.88.0
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        workspaces: '. -> target
+
+          workers -> workers/target'
+    # The MSRV checked (bsv-stack-lean #139): the declaration is the toolchain
+    # above, and every target of both workspaces checks at it.
+    - run: grep -qx 'rust-version = "1.88"' Cargo.toml && grep -qx 'rust-version = "1.88"' workers/Cargo.toml
+    - run: cargo check --locked --workspace --all-targets --features bsv-overlay-engine/memory-storage
+    - run: cargo check --locked --manifest-path workers/Cargo.toml --workspace --all-targets
+    - run: cargo check --locked -p bsv-overlay-engine -p bsv-overlay-discovery --target wasm32-unknown-unknown
+        --lib
+    - run: cargo check --locked --manifest-path workers/Cargo.toml --workspace --target wasm32-unknown-unknown
+        --lib
