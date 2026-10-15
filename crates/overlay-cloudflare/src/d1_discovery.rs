@@ -813,6 +813,10 @@ impl D1UHRPStorage {
     }
 }
 
+/// The lookup's admission of a UHRP advert (engine 0.2.2): one statement,
+/// the primary key its dedup.
+pub(crate) const UHRP_INSERT_UNLESS_HELD_SQL: &str = "INSERT OR IGNORE INTO uhrp_records (txid, outputIndex, uhrpUrl, identityKey, downloadUrl, expiryTime, contentLength) VALUES (?, ?, ?, ?, ?, ?, ?)";
+
 fn uhrp_err(e: String) -> UHRPStorageError {
     UHRPStorageError::Database(e)
 }
@@ -916,6 +920,33 @@ impl UHRPStorage for D1UHRPStorage {
         .execute(&self.db)
         .await
         .map_err(uhrp_err)
+    }
+
+    /// One statement: the primary key `(txid, outputIndex)` makes the insert
+    /// its own dedup. In an open GASP page (engine 0.2.2) it is written in
+    /// the page's batch, after the output it indexes.
+    async fn store_record_unless_held(
+        &self,
+        txid: &str,
+        output_index: u32,
+        uhrp_url: &str,
+        identity_key: &str,
+        download_url: &str,
+        expiry_time: i64,
+        content_length: i64,
+    ) -> Result<(), UHRPStorageError> {
+        let query = Query::new(UHRP_INSERT_UNLESS_HELD_SQL)
+            .bind(txid)
+            .bind(output_index)
+            .bind(uhrp_url)
+            .bind(identity_key)
+            .bind(download_url)
+            .bind(expiry_time)
+            .bind(content_length);
+        match overlay_engine::page_batch::defer(Rc::new(query.clone())) {
+            Ok(()) => Ok(()),
+            Err(_) => query.execute(&self.db).await.map_err(uhrp_err),
+        }
     }
 
     async fn delete_record(&self, txid: &str, output_index: u32) -> Result<(), UHRPStorageError> {
