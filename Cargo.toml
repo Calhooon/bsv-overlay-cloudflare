@@ -24,7 +24,10 @@ resolver = "2"
 [workspace.package]
 version = "0.2.2"
 edition = "2021"
-rust-version = "1.95"
+# The lowest toolchain both workspaces build on, found by trying (bsv-stack-lean
+# #139): 1.87 stops in bsv-rs 0.6.0 and wasm-streams 0.6.0. The gate's `msrv`
+# job checks every target at it.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Calhooon/bsv-overlay-cloudflare"
 
