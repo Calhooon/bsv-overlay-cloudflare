@@ -304,6 +304,28 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
         && err.to_ascii_lowercase().contains("duplicate column")
 }
 
+/// True IFF `sql` is one of the additive, re-run-safe statement shapes the
+/// overlay migration list is permitted to hold: `CREATE` (IF NOT EXISTS),
+/// `ALTER TABLE` (additive; a re-run duplicate-column error is benign, see
+/// [`migration_error_is_benign`]), `INSERT OR IGNORE` (a PK-deduped data
+/// carry), or `DROP INDEX IF EXISTS` (an index is a derived structure, so
+/// dropping one loses no row and IF EXISTS makes the whole-list re-run a
+/// no-op). Plain `INSERT`, `DROP TABLE`, `DROP COLUMN` and a bare `DROP INDEX`
+/// are NOT additive and answer false.
+///
+/// This is the ONE predicate behind both the pinned `migrations_are_valid_sql`
+/// test and the native out-of-band migration emitter
+/// ([`crate::migration_emitter`]): one predicate, two callers, so the
+/// out-of-band prod `--file` step can never emit a statement the shipped
+/// runner would not treat as additive.
+pub fn migration_statement_is_additive(sql: &str) -> bool {
+    let trimmed = sql.trim().to_uppercase();
+    trimmed.starts_with("CREATE")
+        || trimmed.starts_with("ALTER TABLE")
+        || trimmed.starts_with("INSERT OR IGNORE")
+        || trimmed.starts_with("DROP INDEX IF EXISTS")
+}
+
 /// Set once THIS isolate has applied [`OVERLAY_MIGRATIONS`] successfully.
 ///
 /// Workers isolates are single-threaded, but the atomic keeps the guard sound
@@ -2420,10 +2442,10 @@ mod tests {
             // cold start.
             let trimmed = sql.trim().to_uppercase();
             assert!(
-                trimmed.starts_with("CREATE")
-                    || trimmed.starts_with("ALTER TABLE")
-                    || trimmed.starts_with("INSERT OR IGNORE")
-                    || trimmed.starts_with("DROP INDEX IF EXISTS"),
+                // The shared predicate (one predicate, two callers): the same
+                // `migration_statement_is_additive` the native migration
+                // emitter guards its `--file` output with.
+                super::migration_statement_is_additive(sql),
                 "Migration {i} should start with CREATE, ALTER TABLE, INSERT OR IGNORE, or DROP INDEX IF EXISTS, got: {}",
                 &trimmed[..30.min(trimmed.len())]
             );
