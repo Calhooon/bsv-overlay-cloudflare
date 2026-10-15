@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.2.2] - 2026-10-15
+
+- The sync's storage per page (#58's finding; the owner's word of
+  2026-10-15). Under the finalize hook (a peer budget, as both Workers run),
+  a GASP page's admissions are queued and written in ONE storage batch at
+  the page's end: each output with its transaction, each applied row, and
+  the Worker's UHRP index row. The page's reads are made for the page: one
+  read of the applied state of its fresh roots as it opens, one read of the
+  held inputs of a batch answer's nodes, each later question answered from
+  the page. Any other write, and any read of the queued tables, writes the
+  queue before it, so the store sees the writes in the order one at a time
+  wrote them; the absence rule, the fault memo, the proof window, the route
+  fault rule and the accounting read the same events. On D1 the batch is one
+  `batch()` (one transaction, one subrequest, metered as one D1 query) under
+  the finalize submit's bound. A batch that fails admits nothing of the page:
+  the sync fails, the cursor stays where it was, and the next run is served
+  the page again. A page of 100 costs its two reads and one batch where
+  0.2.1 made 500 storage calls (five an output), so the backfill allowance of
+  500 (unchanged) walks pages: the 1,339-output walk of 2026-10-14 is one
+  call in the witness, fourteen at 0.2.1. `SyncCost` gains `storage_batches`
+  and `storage_statements`; the tick lines name them. `Storage` gains the
+  defaulted `write_batch`, `find_topic_outputs` and
+  `find_applied_transactions`; `GASPStorage` the defaulted `open_page`,
+  `close_page` and `prefetch_page`; `UHRPStorage` the defaulted
+  `store_record_unless_held`, which the Worker answers in one
+  `INSERT OR IGNORE` on the record's primary key (two statements before).
+  Without a peer budget the graphs are submitted after the sync one at a
+  time, as before.
+
+DEPLOYMENT NOTE: no migration, no var, no table. Each Worker gains on its
+own; no peer needs 0.2.2.
+
 ## [0.2.1] - 2026-10-15
 
 - A batched node request between our own peers (#58).
