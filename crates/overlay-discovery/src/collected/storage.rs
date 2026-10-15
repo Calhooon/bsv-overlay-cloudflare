@@ -85,7 +85,9 @@ pub enum CollectedQuery {
     /// one entry per requested gameId.
     #[serde(rename = "collectedFor")]
     CollectedFor {
+        /// The identity key asking.
         identity: String,
+        /// The games asked about.
         #[serde(rename = "gameIds")]
         game_ids: Vec<String>,
     },
@@ -132,8 +134,10 @@ pub trait CollectedStorage {
 /// COLLECTED storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum CollectedStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -151,10 +155,12 @@ pub struct MemoryCollectedStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryCollectedStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }

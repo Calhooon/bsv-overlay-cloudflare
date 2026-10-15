@@ -138,6 +138,7 @@ pub const PUSH_BACKSTOP_MIN_AGE_SECS: u64 = 30 * 60;
 pub struct ProofSources(u8);
 
 impl ProofSources {
+    /// Parse a comma-separated `PROOF_SOURCES` list; an unknown name enables nothing.
     pub fn parse(value: &str) -> Self {
         let mut sources = Self::default();
         for name in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -154,6 +155,7 @@ impl ProofSources {
         }
         sources
     }
+    /// The sources the Worker's `PROOF_SOURCES` names.
     pub fn from_env(env: &worker::Env) -> Self {
         Self::parse(
             &env.var("PROOF_SOURCES")
@@ -161,6 +163,7 @@ impl ProofSources {
                 .unwrap_or_default(),
         )
     }
+    /// Whether `source` is enabled.
     pub fn enabled(self, source: &str) -> bool {
         self.0
             & match source {
@@ -281,8 +284,6 @@ pub const COURIER_RUNGS: [&str; 8] = [
     "bananablocks_txo",
 ];
 
-/// PURE: the call order for `n` rungs when this call's rotation index is
-/// `start` — every rung once, wrapping. `rotate_order(3, 4)` = `[1, 2, 0]`.
 /// bsv-low #451 slice B (2026-09-17): the spend ladder's rung ORDER. The two providers that still serve per-output
 /// spend data (BananaBlocks, WoC) rotate as each other's fallback (the 2026-09-04 ruling); Bitails' tx body is the
 /// TERMINAL rung, asked only after both — pruned Bitails answers an unspent output with a fault (measured on beta:
@@ -295,6 +296,8 @@ pub fn spend_rung_order(start: usize) -> Vec<usize> {
     order
 }
 
+/// PURE: the call order for `n` rungs when this call's rotation index is
+/// `start` — every rung once, wrapping. `rotate_order(3, 4)` = `[1, 2, 0]`.
 pub fn rotate_order(n: usize, start: usize) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
@@ -327,6 +330,7 @@ impl ChainProofFetcher {
         }
     }
 
+    /// Enable the explorers `sources` names, each at its default endpoint.
     #[must_use]
     pub fn with_sources(mut self, sources: ProofSources) -> Self {
         self.arcade_url = if sources.enabled("arcade") {
@@ -1644,11 +1648,17 @@ macro_rules! dlog {
 /// no courier is called.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MissingSpendSummary {
+    /// Stale unspent pots read.
     pub scanned: usize,
+    /// Spends discovered and recorded.
     pub discovered: usize,
+    /// Pots no rung named a spender for.
     pub no_hint: usize,
+    /// Hints whose spender did not bind (its raw does not consume the outpoint).
     pub unbound: usize,
+    /// Courier faults.
     pub faults: usize,
+    /// Spends found whose write failed.
     pub write_errors: usize,
     /// Of `scanned`, how many were hop/change rows (`lockKind = p2pkh`, the
     /// `tm_lowfund` index) — the pass takes pots first, so a non-zero here
@@ -1667,6 +1677,7 @@ pub struct MissingSpendSummary {
 /// Per tick: at most this many stale unspent pots, none younger than an hour
 /// (a live pot's spend arrives by submission; the couriers are for the forgotten).
 pub const MISSING_SPEND_PASS_LIMIT: u64 = 20;
+/// The youngest a pot may be for the discovery pass to ask about it, in seconds.
 pub const MISSING_SPEND_MIN_AGE_SECS: u64 = 3600;
 /// The discovery pass's own per-tick courier budget: 20 candidates × up to 4
 /// calls (three hint rungs + the binding raw).
@@ -1677,6 +1688,7 @@ pub const MISSING_SPEND_FETCH_BUDGET: u32 = 80;
 /// Rows before it are the legacy backlog (the 08-12…08-29 eras), never paged.
 pub const MISSING_SPEND_NEW_ERA_CUTOFF_SECS: u64 = 1_788_480_000;
 
+/// The discovery pass: ask the couriers who spent each stale unspent pot, bind the answer and record it as an unconfirmed pointer.
 pub async fn discover_missing_spends(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
@@ -1913,6 +1925,7 @@ async fn discover_spend_for_row(
     }
 }
 
+/// The pot maintenance passes: confirm recorded spends, then complete pot proofs; their two summaries.
 pub async fn run_pot_maintenance(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     spend_fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
@@ -3509,7 +3522,10 @@ pub const REBROADCAST_POST_BUDGET: usize = 48;
 pub enum NetworkPresence {
     /// At least one indexer holds the tx. A positive height is mined;
     /// None is mempool presence, never a terminal admission verdict.
-    Present { height: Option<u32> },
+    Present {
+        /// The block height when mined; `None` in the mempool.
+        height: Option<u32>,
+    },
     /// BOTH indexers answered a definitive 404 — the admitted tx is absent
     /// from the network (the #267 incident class): rebroadcast.
     Absent,
@@ -3572,6 +3588,7 @@ pub fn presence_bool(presence: NetworkPresence) -> bool {
     matches!(presence, NetworkPresence::Present { .. })
 }
 
+/// A bare yes or no as a presence (present at no known height, or absent).
 pub fn bool_presence(present: bool) -> NetworkPresence {
     if present {
         NetworkPresence::Present { height: None }
@@ -4085,9 +4102,13 @@ pub fn fold_arcade_look(
 /// Tally of one retire pass (logged by the cron twins).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RetireSummary {
+    /// Rows the pass read.
     pub scanned: usize,
+    /// Rows it retired.
     pub retired: usize,
+    /// Rows kept because an indexer holds the transaction.
     pub kept_present: usize,
+    /// Rows kept because a courier could not say.
     pub kept_uncertain: usize,
     /// #602 fold (MEDIUM-1): the conflict pass that runs first.
     pub conflict: crate::admit_fast::ConflictPassSummary,

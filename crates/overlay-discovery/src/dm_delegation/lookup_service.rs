@@ -11,11 +11,13 @@ use tracing::debug;
 use super::storage::{DmDelegationRecord, DmDelegationStorage};
 use super::topic_manager::DM_DELEGATION_MARKER;
 
+/// The `ls_dm_delegation` lookup service: indexes delegation revocation records and answers queries.
 pub struct DmDelegationLookupService {
     storage: Rc<dyn DmDelegationStorage>,
 }
 
 impl DmDelegationLookupService {
+    /// A lookup service over `storage`.
     pub fn new(storage: Rc<dyn DmDelegationStorage>) -> Self {
         Self { storage }
     }

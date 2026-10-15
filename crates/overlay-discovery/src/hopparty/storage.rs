@@ -110,8 +110,10 @@ pub struct HoppartyRecord {
     // once at admission from the admitted BEEF (`tx_facts`). Display tier —
     // the money views list them; nothing money-gating reads them. `None` on
     // pre-slice-2 rows and when the BEEF lacked an input's source tx.
+    /// The container transaction's serialized size in bytes.
     #[serde(rename = "sizeBytes", default)]
     pub size_bytes: Option<u64>,
+    /// The container transaction's exact fee in satoshis.
     #[serde(rename = "feeSats", default)]
     pub fee_sats: Option<u64>,
     /// The txid carrying the marker OP_RETURN — half of the primary key,
@@ -138,7 +140,9 @@ pub enum HoppartyQuery {
     /// first.
     #[serde(rename = "hopsFor")]
     HopsFor {
+        /// The identity key asking.
         identity: String,
+        /// The most hop outpoints to return.
         limit: Option<u32>,
     },
     /// "Which markers name this hop outpoint?" — oldest first (the honest
@@ -147,10 +151,13 @@ pub enum HoppartyQuery {
     /// marker's CONTAINING txid (one tx).
     #[serde(rename = "byHop")]
     ByHop {
+        /// The hop's containing txid.
         #[serde(rename = "hopTxid")]
         hop_txid: String,
+        /// The hop output's index.
         #[serde(rename = "hopVout")]
         hop_vout: u32,
+        /// The most markers to return.
         limit: Option<u32>,
     },
 }
@@ -197,8 +204,10 @@ pub trait HoppartyStorage {
 /// HOPPARTY storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum HoppartyStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -218,10 +227,12 @@ pub struct MemoryHoppartyStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryHoppartyStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }

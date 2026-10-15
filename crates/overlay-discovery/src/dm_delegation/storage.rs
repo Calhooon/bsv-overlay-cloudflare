@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 /// A stored delegation revocation record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DmDelegationRecord {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     #[serde(rename = "outputIndex")]
     pub output_index: u32,
     /// Cert serial number from the envelope (not the bitcoin tx serial).
@@ -27,6 +29,7 @@ pub struct DmDelegationRecord {
     pub created_at: String,
 }
 
+/// Backend-agnostic storage for delegation revocation records.
 #[async_trait(?Send)]
 pub trait DmDelegationStorage {
     /// Check if a record with the same `(txid, output_index)` already exists.
@@ -78,10 +81,13 @@ pub trait DmDelegationStorage {
     ) -> Result<Vec<UTXOReference>, DmDelegationStorageError>;
 }
 
+/// Delegation storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum DmDelegationStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -104,6 +110,7 @@ struct MemoryRow {
     created_at: std::time::SystemTime,
 }
 
+/// The in-memory [`DmDelegationStorage`], for tests.
 #[derive(Debug, Default)]
 pub struct MemoryDmDelegationStorage {
     rows: std::sync::Mutex<Vec<MemoryRow>>,
@@ -112,10 +119,12 @@ pub struct MemoryDmDelegationStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryDmDelegationStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.rows.lock().unwrap().len()
     }

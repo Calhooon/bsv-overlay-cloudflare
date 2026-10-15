@@ -125,7 +125,10 @@ pub fn should_reap(expiry_height: Option<u32>, cutoff: u32) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpentProbe {
     /// WoC 200 with a well-formed spender txid (lowercase hex).
-    Spent { spending_txid: String },
+    Spent {
+        /// The spender's txid, lowercase hex.
+        spending_txid: String,
+    },
     /// WoC 4xx: "unspent or not yet indexed".
     NotSpent,
     /// Transport / 5xx / rate-limit / malformed body.

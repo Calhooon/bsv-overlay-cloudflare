@@ -7,12 +7,16 @@ pub const PEER_PROOF_ROW_LIMIT: usize = 20;
 /// A silent peer must leave time for other peers in the pass.
 pub const PEER_PROOF_REQUEST_MS: u64 = 5_000;
 
+/// Whether an admitted output is served to lookups or held for its proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
+    /// Serve it: it has its proof, or it was observed within the window.
     Served,
+    /// Hold it: no proof and older than [`PROOFLESS_FLAG_MS`].
     Held,
 }
 
+/// The verdict for an output by its proof and when it was observed.
 pub fn verdict(has_proof: bool, observed_ms: Option<i64>, now_ms: i64) -> Verdict {
     if has_proof || observed_ms.is_some_and(|seen| seen >= now_ms.saturating_sub(PROOFLESS_FLAG_MS))
     {
@@ -22,19 +26,27 @@ pub fn verdict(has_proof: bool, observed_ms: Option<i64>, now_ms: i64) -> Verdic
     }
 }
 
+/// An output held for want of its proof.
 #[derive(Debug, Clone)]
 pub struct HeldOutput {
+    /// The id of the transaction that created it.
     pub txid: String,
+    /// Its index within that transaction.
     pub output_index: u32,
+    /// The topic that admitted it.
     pub topic: String,
 }
 
 /// Kept outside the pass future so a deadline preserves completed work.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PeerProofSummary {
+    /// Proof requests sent to peers.
     pub requests: u64,
+    /// Proofs that landed.
     pub landed: u64,
+    /// Proofs refused.
     pub refused: u64,
+    /// Requests that faulted.
     pub faults: u64,
 }
 

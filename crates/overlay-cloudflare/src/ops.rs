@@ -28,7 +28,9 @@ use crate::d1::Query;
 
 /// Counter names (persisted in `ops_counters`).
 pub const COUNTER_PROOFS_COMPLETED: &str = "proofs_completed_total";
+/// Proof fetches that failed.
 pub const COUNTER_FETCH_FAILED: &str = "fetch_failed_total";
+/// Pot BEEFs compacted once their proof landed.
 pub const COUNTER_POT_BEEFS_COMPACTED: &str = "pot_beefs_compacted_total";
 /// Pot spends UPGRADED to `spentConfirmed = 1` by the spend-confirmation
 /// chaser (#186). Name-keyed → additive, no schema change.
@@ -257,6 +259,7 @@ pub const COUNTER_SUBMIT_PENDING_ADMITTED: &str = "submit_pending_admitted_total
 /// Pending admissions the pending watch saw SEEN (the latch), and their
 /// summed admission→SEEN milliseconds (the mean SEEN latency is the ratio).
 pub const COUNTER_SUBMIT_PENDING_SEEN_LATCHED: &str = "submit_pending_seen_latched_total";
+/// The summed admission-to-SEEN milliseconds of those admissions.
 pub const COUNTER_SUBMIT_PENDING_SEEN_MS: &str = "submit_pending_seen_ms_total";
 /// Pending admissions the watch EVICTED on a corroborated refusal.
 pub const COUNTER_SUBMIT_PENDING_EVICTED: &str = "submit_pending_evicted_total";
@@ -266,6 +269,7 @@ pub const COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED: &str =
 /// Unwitnessed at the end of the watch: silent (unknown / below SEEN), or
 /// still an orphan view (the parents unseen by Arcade).
 pub const COUNTER_SUBMIT_PENDING_SILENT: &str = "submit_pending_silent_total";
+/// Unwitnessed at the end of the watch: still an orphan view.
 pub const COUNTER_SUBMIT_PENDING_ORPHAN: &str = "submit_pending_orphan_total";
 /// bsv-low loop 18 (2026-09-21, pair 11): an UNGATED write (the operator's historical modes; the lenient
 /// window) refused under an OPEN eviction (nothing written; a MINED proof or the operator's readmit opens it).
@@ -279,10 +283,15 @@ pub const COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT: &str =
 /// (never a broadcaster's echo): held by an indexer (admitted), absent past the age floor (the two-source refusal),
 /// absent but young (the retryable word), the indexers inconclusive, or this isolate's courier budget spent.
 pub const COUNTER_SUBMIT_TERMINAL_RACE: &str = "submit_terminal_judged_race_total";
+/// Judged by the indexers: held by one (admitted).
 pub const COUNTER_SUBMIT_TERMINAL_PRESENT: &str = "submit_terminal_judged_present_total";
+/// Judged: absent past the age floor (the two-source refusal).
 pub const COUNTER_SUBMIT_TERMINAL_ABSENT: &str = "submit_terminal_judged_absent_total";
+/// Judged: absent but young (the retryable word).
 pub const COUNTER_SUBMIT_TERMINAL_YOUNG: &str = "submit_terminal_judged_young_total";
+/// Judged: the indexers inconclusive.
 pub const COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE: &str = "submit_terminal_judged_inconclusive_total";
+/// Judged: this isolate's courier budget spent.
 pub const COUNTER_SUBMIT_TERMINAL_CAPPED: &str = "submit_terminal_judged_capped_total";
 /// loop 18: an admission write that outran its own eviction's table loop — re-evicted after the write, the
 /// submit answered as the refusal it is.
@@ -343,7 +352,9 @@ pub const COUNTER_QUEUE_R2_MISSING_FAULT: &str = "queue_r2_missing_fault_total";
 /// bsv-low #585 (door 3's fold): R2 objects the orphan sweep deleted (past the window, named by no dead letter),
 /// their bytes, and the sweep's reads and deletes that faulted (the object stays for the next round).
 pub const COUNTER_QUEUE_R2_ORPHANS_SWEPT: &str = "queue_r2_orphans_swept_total";
+/// The bytes of the R2 objects the orphan sweep deleted.
 pub const COUNTER_QUEUE_R2_ORPHANS_SWEPT_BYTES: &str = "queue_r2_orphans_swept_bytes_total";
+/// The orphan sweep's reads and deletes that faulted.
 pub const COUNTER_QUEUE_R2_ORPHAN_SWEEP_FAULTS: &str = "queue_r2_orphan_sweep_faults_total";
 /// bsv-low #585 (door 3's fold-4, the delta-2 lens's N3): listed objects the sweep could not read (a key or an
 /// `uploaded` date that does not read), skipped and never swept; each pass that meets one counts it again.
@@ -375,7 +386,9 @@ pub const COUNTER_ADMIT_FAST_READMIT_INCOMPLETE: &str = "admit_fast_readmit_inco
 /// bsv-low #602 fold (MEDIUM-1): the conflict pass's live unverified pots re-checked, the pots it evicted on a
 /// bound confirmed competitor, and the pots whose re-check faulted (a candidate read fault counts one).
 pub const COUNTER_ADMIT_FAST_CONFLICT_SCANNED: &str = "admit_fast_conflict_scanned_total";
+/// Pots the conflict pass evicted on a bound confirmed competitor.
 pub const COUNTER_ADMIT_FAST_CONFLICT_EVICTED: &str = "admit_fast_conflict_evicted_total";
+/// Conflict re-checks that faulted.
 pub const COUNTER_ADMIT_FAST_CONFLICT_FAULTS: &str = "admit_fast_conflict_faults_total";
 /// fleet loop 15 (2026-09-20): the pending watch confirmed a spend by its OWN proof read at its end — a tx that mined
 /// before the index saw it (Arcade's stored echo never says MINED, no callback is registered for an already-known tx).
@@ -401,12 +414,14 @@ pub const COUNTER_OPERATOR_REORG: &str = "operator_reorg_total";
 /// sweep re-asked the ladder for and HEALED (stitched an agreeing proof into
 /// the store); and the sweep's L1 re-anchors (a standing bump at a new height).
 pub const COUNTER_REORG_HEALED_FROM_COURIER: &str = "reorg_healed_from_courier_total";
+/// The routine sweep's re-anchors (a standing bump at a new height).
 pub const COUNTER_REORG_REANCHORED: &str = "reorg_reanchored_total";
 /// bsv-low M19 round 2 (review M4): the sweep's second and third legs, the
 /// pots' own proofs and the engine's transactions (hops) whose stitched
 /// bump chaintracks refutes: unlatched for the completion passes to
 /// re-prove. Zero on a healthy stream (#429).
 pub const COUNTER_REORG_STALE_POT_PROOFS: &str = "reorg_stale_pot_proofs_total";
+/// Transactions (hops) whose stitched bump chaintracks refutes, unlatched to be re-proved.
 pub const COUNTER_REORG_STALE_TX_PROOFS: &str = "reorg_stale_tx_proofs_total";
 // ── bsv-low M19B-G1 (2026-09-08): the Arcade reorg-event consumer ─────────
 /// Arcade orphan events the consumer FINISHED (applied in full, or skipped
@@ -457,8 +472,11 @@ pub const COUNTER_ARCADE_REORG_BUDGET_STOPS: &str = "arcade_reorg_budget_stops_t
 /// discoveries on NEW-era rows (admitted after the pointer heal shipped — a
 /// growing value is the page: a live pot's re-present never reached us).
 pub const COUNTER_MISSING_SPEND_SCANNED: &str = "missing_spend_scanned_total";
+/// Missing spends discovered (an unconfirmed pointer written).
 pub const COUNTER_MISSING_SPEND_DISCOVERED: &str = "missing_spend_discovered_total";
+/// Courier-ladder faults of the discovery pass.
 pub const COUNTER_MISSING_SPEND_FAULTS: &str = "missing_spend_faults_total";
+/// Discoveries on new-era rows.
 pub const COUNTER_MISSING_SPEND_DISCOVERED_NEW_ERA: &str = "missing_spend_discovered_new_era_total";
 /// bsv-low (2026-09-04): per-courier-rung lifetime tallies —
 /// `courier_<rung>_{ok,fault,skipped}_total` for every rung in
@@ -680,11 +698,6 @@ pub fn pots_push_view(counters: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-/// bsv-low (2026-09-04): the index janitor's live backlog, by row kind —
-/// `spent = 0` rows at least an hour old (the discovery pass's own candidate
-/// rule). `covenant` = real pots (the money), `p2pkh` = `tm_lowfund` hop /
-/// change rows (indexed for the hop's landing proof, never a pot), `other` =
-/// bare / undecoded. -1 = table unreadable (a pre-migration isolate).
 #[derive(serde::Deserialize)]
 struct KindCountRow {
     #[serde(rename = "lockKind")]
@@ -692,6 +705,11 @@ struct KindCountRow {
     c: f64,
 }
 
+/// bsv-low (2026-09-04): the index janitor's live backlog, by row kind —
+/// `spent = 0` rows at least an hour old (the discovery pass's own candidate
+/// rule). `covenant` = real pots (the money), `p2pkh` = `tm_lowfund` hop /
+/// change rows (indexed for the hop's landing proof, never a pot), `other` =
+/// bare / undecoded. -1 = table unreadable (a pre-migration isolate).
 pub async fn index_janitor_backlog(db: &D1Database) -> serde_json::Value {
     let rows: Result<Vec<KindCountRow>, _> = Query::new(
         "SELECT lockKind, COUNT(*) AS c FROM pot_records \
@@ -915,6 +933,7 @@ struct PotOutpointRow {
 pub const BUMP_COUNTER_SQL: &str = "INSERT INTO ops_counters (name, value) VALUES (?, ?) \
      ON CONFLICT(name) DO UPDATE SET value = ops_counters.value + excluded.value";
 
+/// Add `delta` to the counter `name`; a fault is logged and swallowed.
 pub async fn bump_counter(db: &D1Database, name: &str, delta: u64) {
     if delta == 0 {
         return;

@@ -13,12 +13,19 @@ use std::{
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncCost {
+    /// Every request sent out: peer requests and courier rungs.
     pub calls_out: u64,
+    /// Requests sent to peers, single and batch.
     pub peer_requests: u64,
+    /// HTTP attempts the courier made for a root's proof.
     pub courier_rungs: u64,
+    /// Storage read calls attempted.
     pub storage_reads: u64,
+    /// Storage write calls attempted.
     pub storage_writes: u64,
+    /// SQL statements the Worker adapter attempted, batch members included.
     pub d1_queries: u64,
+    /// Courier requests the remembered "not found" answers saved.
     pub courier_not_found_memo_hits: u64,
     /// Requests the peers' remembered absence saved (engine 0.1.15): an
     /// input the peer answered it does not hold, needed again in the same
@@ -34,12 +41,16 @@ pub struct SyncCost {
     pub storage_batches: u64,
     /// The statements those batches ran, each in place of a write of its own.
     pub storage_statements: u64,
+    /// Milliseconds the run took.
     pub ms: u64,
+    /// UTXOs the run walked.
     pub outputs_walked: u64,
+    /// Milliseconds per thousand outputs walked; `None` when none were walked.
     pub ms_per_1000_outputs: Option<u64>,
 }
 
 impl SyncCost {
+    /// The cost accrued since `before`, a snapshot taken earlier on the same meter.
     pub fn since(self, before: Self) -> Self {
         let mut cost = Self {
             calls_out: self.calls_out.saturating_sub(before.calls_out),
@@ -68,6 +79,7 @@ impl SyncCost {
         cost
     }
 
+    /// Recompute `ms_per_1000_outputs` from `ms` and `outputs_walked`.
     pub fn refresh_speed(&mut self) {
         self.ms_per_1000_outputs = (self.outputs_walked != 0).then(|| {
             ((u128::from(self.ms) * 1000) / u128::from(self.outputs_walked))
@@ -75,6 +87,7 @@ impl SyncCost {
         });
     }
 
+    /// Add another run's cost to this one, saturating.
     pub fn add(&mut self, other: Self) {
         self.calls_out = self.calls_out.saturating_add(other.calls_out);
         self.peer_requests = self.peer_requests.saturating_add(other.peer_requests);
@@ -105,6 +118,7 @@ struct Data {
     started: f64,
     clock: Rc<dyn Fn() -> f64>,
 }
+/// Counts the cost of the futures it scopes; clones share one count.
 #[derive(Clone)]
 pub struct LoadMeter(Rc<Data>);
 impl Default for LoadMeter {
@@ -121,12 +135,14 @@ impl LoadMeter {
             clock,
         }))
     }
+    /// The cost so far, with the time since the meter started.
     pub fn snapshot(&self) -> SyncCost {
         let mut cost = self.0.cost.get();
         cost.ms = ((self.0.clock)() - self.0.started).max(0.0) as u64;
         cost.refresh_speed();
         cost
     }
+    /// `future`, counted on this meter while it is polled.
     pub fn scope<F: Future>(&self, future: F) -> Measured<F> {
         Measured {
             meter: self.clone(),
@@ -144,6 +160,7 @@ impl Drop for Restore {
         CURRENT.with(|c| *c.borrow_mut() = self.0.take());
     }
 }
+/// A future counted on a [`LoadMeter`] while it is polled.
 pub struct Measured<F> {
     meter: LoadMeter,
     future: Pin<Box<F>>,
@@ -155,6 +172,7 @@ impl<F: Future> Future for Measured<F> {
         self.future.as_mut().poll(cx)
     }
 }
+/// The cost so far on the meter of the future being polled; zero outside one.
 pub fn snapshot() -> SyncCost {
     CURRENT.with(|c| {
         c.borrow()
@@ -171,9 +189,11 @@ fn note(f: impl FnOnce(&mut SyncCost)) {
         }
     });
 }
+/// Count one output walked.
 pub fn walk_output() {
     note(|v| v.outputs_walked += 1);
 }
+/// Count one single-node peer request.
 pub fn peer_request() {
     note(|v| {
         v.calls_out += 1;
@@ -188,12 +208,15 @@ pub fn batch_request() {
         v.batch_requests += 1;
     });
 }
+/// Count `count` nodes served by batch answers.
 pub fn batch_nodes(count: u64) {
     note(|v| v.batch_nodes = v.batch_nodes.saturating_add(count));
 }
+/// Count one storage read.
 pub fn storage_read() {
     note(|v| v.storage_reads += 1);
 }
+/// Count one storage write.
 pub fn storage_write() {
     note(|v| v.storage_writes += 1);
 }
@@ -209,9 +232,11 @@ pub fn storage_batch(statements: u64) {
 pub fn d1_queries(count: u64) {
     note(|v| v.d1_queries = v.d1_queries.saturating_add(count));
 }
+/// Count one courier request saved by the "not found" memo.
 pub fn not_found_memo_hit() {
     note(|v| v.courier_not_found_memo_hits += 1);
 }
+/// Count one request saved by a peer's remembered absence.
 pub fn peer_absent_memo_hit() {
     note(|v| v.peer_absent_memo_hits += 1);
 }
@@ -221,17 +246,21 @@ pub fn peer_absent_memo_hit() {
 /// peer slice and 9,900 ms resume share, the page retains 20,100 ms. These
 /// are stop bounds, not promises about finalize/storage latency.
 pub const ROOT_MAX_COURIER_RUNGS: u32 = 12;
+/// The most one courier HTTP attempt may take, in milliseconds.
 pub const COURIER_RUNG_TIMEOUT_MS: u64 = 1_000;
+/// The most one root's graph walk may take, in milliseconds.
 pub const ROOT_MAX_MS: u64 = 15_000;
 #[derive(Default)]
 struct RootLimit {
     calls: Cell<u32>,
     exhausted: Cell<bool>,
 }
+/// A future whose courier requests are charged to one root's rung budget.
 pub struct RootScope<F> {
     limit: Rc<RootLimit>,
     future: Pin<Box<F>>,
 }
+/// `future` with a fresh root budget of [`ROOT_MAX_COURIER_RUNGS`] courier requests.
 pub fn root_scope<F: Future>(future: F) -> RootScope<F> {
     RootScope {
         limit: Rc::default(),
@@ -251,9 +280,11 @@ impl<F: Future> Future for RootScope<F> {
         self.future.as_mut().poll(cx)
     }
 }
+/// Whether the future being polled runs under a root budget.
 pub fn root_scoped() -> bool {
     ROOT.with(|c| c.borrow().is_some())
 }
+/// Whether the root budget of the future being polled refused a request.
 pub fn root_exhausted() -> bool {
     ROOT.with(|c| c.borrow().as_ref().is_some_and(|r| r.exhausted.get()))
 }

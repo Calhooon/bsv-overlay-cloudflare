@@ -12,6 +12,7 @@ pub const SHIP_DISCOVERY_MAX_HOSTS_PER_TICK: usize = 4;
 /// The Worker supplies fetch and its deadline; native tests supply records.
 #[async_trait(?Send)]
 pub trait ShipLookupClient {
+    /// Ask `host` the lookup `question`; the outputs it answered, or the failure.
     async fn lookup(
         &self,
         host: &str,

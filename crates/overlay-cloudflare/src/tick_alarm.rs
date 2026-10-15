@@ -1,5 +1,9 @@
 //! A singleton alarm that can keep the tick alive when cron delivery stops.
 
+// The lint bar (bsv-stack-lean #135): worker's `#[durable_object]` generates
+// this export's wasm-bindgen methods without docs, and a doc cannot reach them.
+#![allow(missing_docs)]
+
 use serde::{Deserialize, Serialize};
 use worker::{durable_object, wasm_bindgen, DurableObject, Env, Method, Request, Response, State};
 
@@ -24,6 +28,7 @@ pub(crate) struct AlarmStatus {
     pub next_alarm_ms: Option<i64>,
 }
 
+/// The singleton Durable Object whose alarm keeps the tick alive when cron delivery stops.
 #[durable_object]
 pub struct TickAlarm {
     state: State,

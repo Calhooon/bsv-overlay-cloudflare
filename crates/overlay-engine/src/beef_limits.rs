@@ -51,8 +51,11 @@ pub use bsv_rs::transaction::{Kind, Reason, Refusal};
 /// callers that still name a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BeefLimits {
+    /// The former cap on transactions in one BEEF; a name only, nothing refuses by it.
     pub max_txs: usize,
+    /// The former cap on merkle paths (BUMPs) in one BEEF; a name only.
     pub max_bumps: usize,
+    /// The former cap on a BEEF's bytes; a name only.
     pub max_bytes: usize,
 }
 

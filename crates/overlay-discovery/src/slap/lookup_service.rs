@@ -18,6 +18,7 @@ pub struct SLAPLookupService {
 }
 
 impl SLAPLookupService {
+    /// A lookup service over `storage`.
     pub fn new(storage: Rc<dyn SLAPStorage>) -> Self {
         Self { storage }
     }

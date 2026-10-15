@@ -282,6 +282,7 @@ pub trait Storage {
         Ok(crate::sync_load::PeerCadence::default())
     }
 
+    /// Record a peer's load-control state; an older backend keeps nothing.
     async fn set_peer_cadence(
         &self,
         _host: &str,
@@ -848,18 +849,23 @@ impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
 /// Storage operation errors.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    /// The record was not found.
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// The record already exists.
     #[error("duplicate: {0}")]
     Duplicate(String),
 
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
 
+    /// A value did not serialize or deserialize.
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -870,6 +876,7 @@ pub enum StorageError {
 
 #[cfg(any(test, feature = "memory-storage"))]
 // bsv-stack-lean #134: the opt-in test store; a poisoned lock is a failed test
+/// The in-memory [`Storage`], for tests and local development (the `memory-storage` feature).
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub mod memory {
     use super::*;
@@ -959,14 +966,17 @@ pub mod memory {
     type YieldStreakRow = (u64, u64, u64);
 
     impl MemoryStorage {
+        /// Every fault memo held, in no order.
         pub fn fault_memos(&self) -> Vec<crate::fault_memo::FaultMemo> {
             self.fault_memos.lock().unwrap().values().cloned().collect()
         }
 
+        /// Cap the fault memos the store holds: saving a new root at the cap answers `AtCeiling`; `None` is no cap.
         pub fn set_fault_memo_ceiling(&self, ceiling: Option<usize>) {
             *self.fault_memo_ceiling.lock().unwrap() = ceiling;
         }
 
+        /// Store a legacy fault record as a pre-memo backend wrote it.
         pub fn seed_legacy_fault(&self, record: crate::gasp::DeferredGraph) {
             self.deferred_graphs.lock().unwrap().insert(
                 (
@@ -1001,6 +1011,7 @@ pub mod memory {
             }
         }
 
+        /// An empty store at logical time 0.
         pub fn new() -> Self {
             Self::default()
         }
@@ -1012,9 +1023,6 @@ pub mod memory {
             self.proven_at.lock().unwrap().get(txid).copied()
         }
 
-        /// Advance the deterministic logical clock by `secs` (test hook for
-        /// the push-primary backstop age gate — see
-        /// [`Storage::find_transactions_for_proof_check`]).
         /// The expired roots remembered for `topic` and not yet swept.
         pub fn expired_outpoints(&self, topic: &str) -> Vec<String> {
             let now = *self.clock_secs.lock().unwrap();
@@ -1030,6 +1038,9 @@ pub mod memory {
             held
         }
 
+        /// Advance the deterministic logical clock by `secs` (test hook for
+        /// the push-primary backstop age gate — see
+        /// [`Storage::find_transactions_for_proof_check`]).
         pub fn advance_clock(&self, secs: u64) {
             *self.clock_secs.lock().unwrap() += secs;
         }

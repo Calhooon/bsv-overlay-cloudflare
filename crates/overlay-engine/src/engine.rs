@@ -456,7 +456,9 @@ pub struct MutationFault {
 /// write-then-record; the record is now conditional on the writes).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MutationReport {
+    /// The writes that failed, each with its site and the backend's error.
     pub faults: Vec<MutationFault>,
+    /// Topics whose every write and lookup-service notification succeeded, recorded in `applied_transactions`.
     pub applied_topics: Vec<String>,
     /// Topics this (txid, topic) pair had ALREADY been applied under — the
     /// Phase-1 dedup skipped them, so their STEAK entry is an empty default
@@ -3912,6 +3914,7 @@ impl Engine {
     // Metadata
     // ========================================================================
 
+    /// List all registered topic managers with their metadata.
     pub async fn list_topic_managers(&self) -> HashMap<String, ServiceMetadata> {
         let mut result = HashMap::new();
         for (name, manager) in &self.managers {
@@ -4932,6 +4935,7 @@ impl Engine {
         Ok(true)
     }
 
+    /// Remove an output from storage under `topic` (every topic when `None`) and tell each lookup service it was evicted.
     pub async fn evict_output(
         &self,
         txid: &str,
@@ -6513,10 +6517,13 @@ impl crate::gasp::FinalizedGraphHook for SubmitAsFinalized<'_> {
 /// Returned by `Engine::start_gasp_sync()` to summarize what happened.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GASPSyncResult {
+    /// What the sync cost: peer requests, storage operations, D1 queries and time.
     #[serde(default, flatten)]
     pub cost: crate::meter::SyncCost,
+    /// The topics and peers the caller selected (an absent list selects everything).
     #[serde(default)]
     pub filter: crate::sync_load::SyncFilter,
+    /// Configured topics the filter left out of this sync.
     #[serde(default)]
     pub topics_filtered: Vec<String>,
     /// Per-topic sync results.
@@ -6526,25 +6533,34 @@ pub struct GASPSyncResult {
 /// Sync result for a single topic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TopicSyncResult {
+    /// Per-peer results of this topic's sync, by peer URL.
     #[serde(default)]
     pub peer_results: HashMap<String, crate::backfill::PeerSyncResult>,
+    /// Roots this sync recorded dead.
     #[serde(default)]
     pub dead_graphs: u64,
+    /// Expired roots this sync removed from the deferred-graph store.
     #[serde(default)]
     pub expired_swept: u64,
+    /// Legacy fault records this sync folded into the fault memo.
     #[serde(default)]
     pub memo_folded: u64,
+    /// What this topic's sync cost: peer requests, storage operations, D1 queries and time.
     #[serde(default, flatten)]
     pub cost: crate::meter::SyncCost,
+    /// Roots whose walk stopped at a bound (courier rungs, time) and was deferred, with the reason.
     #[serde(default)]
     pub root_bounds: Vec<crate::sync_load::RootBound>,
+    /// Peers skipped this sync (quarantine or a no-yield backoff), each with its retry time.
     #[serde(default)]
     pub peers_skipped: Vec<crate::sync_load::SkippedPeer>,
+    /// Peers the filter left out of this topic's sync.
     #[serde(default)]
     pub peers_filtered: Vec<String>,
     /// Root proof status after successful anchor validation and finalization.
     #[serde(default)]
     pub roots_proven: u64,
+    /// Roots finalized whose own transaction carried no proof.
     #[serde(default)]
     pub roots_unproven: u64,
     /// Outstanding outpoints on peers whose cursor did not advance.
@@ -6798,11 +6814,14 @@ fn parse_advertisement_domain_from_script(
 // Error type
 // ============================================================================
 
+/// Why an engine operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    /// The submit named a topic this engine does not host.
     #[error("This server does not support this topic: {0}")]
     UnsupportedTopic(String),
 
+    /// No lookup service is registered under the named provider.
     #[error("Lookup service not found for provider: {0}")]
     LookupServiceNotFound(String),
 
@@ -6811,6 +6830,7 @@ pub enum EngineError {
     #[error("No matching output found!")]
     NodeNotFound,
 
+    /// A lookup service failed to answer a well-formed query.
     #[error("lookup failed: {0}")]
     LookupFailed(String),
 
@@ -6823,15 +6843,19 @@ pub enum EngineError {
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
+    /// The storage backend failed.
     #[error("storage error: {0}")]
     StorageError(String),
 
+    /// Broadcasting the transaction failed.
     #[error("broadcast error: {0}")]
     BroadcastError(String),
 
+    /// The SPV check failed: a bad or unverifiable proof, a missing source, or a chain-tracker fault.
     #[error("SPV verification failed: {0}")]
     SpvError(String),
 
+    /// The submitted BEEF did not parse.
     #[error("BEEF parsing failed: {0}")]
     BeefParseError(String),
 
@@ -6846,8 +6870,11 @@ pub enum EngineError {
     /// message.
     #[error("script verification failed (subject {subject_txid}): input {input_index}: {reason}")]
     ScriptVerificationFailed {
+        /// The transaction whose submit was refused.
         subject_txid: String,
+        /// The failing input's index within the transaction whose script failed.
         input_index: u32,
+        /// The interpreter's own message.
         reason: String,
     },
 
@@ -6859,8 +6886,11 @@ pub enum EngineError {
     /// (an ancestor faulted) or not (the subject itself is unjudged).
     #[error("script walk inconclusive at {at_txid} (subject judged: {subject_judged}): {reason}")]
     ScriptWalkInconclusive {
+        /// The transaction the walk stopped at.
         at_txid: String,
+        /// Whether the subject's own inputs had all executed before the fault.
         subject_judged: bool,
+        /// What stopped the walk.
         reason: String,
     },
 
@@ -6870,9 +6900,13 @@ pub enum EngineError {
     /// the network's — the request proceeds to the network.
     #[error("script walk over budget at {at_txid} (subject judged: {subject_judged}): {what}")]
     ScriptWalkOverBudget {
+        /// The transaction the walk stopped at.
         at_txid: String,
+        /// Whether the subject's own inputs had all executed before the bound tripped.
         subject_judged: bool,
+        /// Which bound tripped.
         limb: DoorLimb,
+        /// What the bound measured when it tripped.
         what: String,
     },
 
@@ -6892,6 +6926,7 @@ pub enum EngineError {
     )]
     WalkCouldNotRun(WalkCouldNotRun),
 
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }

@@ -15,33 +15,44 @@ use crate::ship::storage::SortOrder;
 /// published advertisements from peer advertisements we've GASP-synced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SLAPDiscoveryRecord {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     #[serde(rename = "outputIndex")]
     pub output_index: u32,
     /// Publisher's identity public key (33-byte compressed, hex-encoded).
     /// Same rationale as `SHIPDiscoveryRecord::identity_key`.
     #[serde(rename = "identityKey")]
     pub identity_key: String,
+    /// The advertised domain (the URI the host serves).
     pub domain: String,
+    /// The advertised lookup service.
     pub service: String,
 }
 
 /// Query parameters for finding SLAP records.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SLAPQuery {
+    /// List every record (the reference's `findAll`).
     pub find_all: Option<bool>,
+    /// Only records advertising this domain.
     pub domain: Option<String>,
     /// Single service name (not an array, unlike SHIP's topics).
     pub service: Option<String>,
+    /// Only records published by this identity key.
     pub identity_key: Option<String>,
+    /// The most records to return.
     pub limit: Option<u32>,
+    /// Records to skip before those returned.
     pub skip: Option<u32>,
+    /// The order by creation time; descending when `None`.
     pub sort_order: Option<SortOrder>,
 }
 
 /// Backend-agnostic storage for SLAP advertisement records.
 #[async_trait(?Send)]
 pub trait SLAPStorage {
+    /// Whether a record with this identity key, domain and service is already stored.
     async fn has_duplicate_record(
         &self,
         identity_key: &str,
@@ -49,6 +60,7 @@ pub trait SLAPStorage {
         service: &str,
     ) -> Result<bool, SLAPStorageError>;
 
+    /// Store a SLAP advertisement record.
     async fn store_record(
         &self,
         txid: &str,
@@ -58,10 +70,13 @@ pub trait SLAPStorage {
         service: &str,
     ) -> Result<(), SLAPStorageError>;
 
+    /// Delete a record by its outpoint (called when the UTXO is spent).
     async fn delete_record(&self, txid: &str, output_index: u32) -> Result<(), SLAPStorageError>;
 
+    /// The outpoints of the records matching `query`.
     async fn find_record(&self, query: &SLAPQuery) -> Result<Vec<UTXOReference>, SLAPStorageError>;
 
+    /// The outpoints of every record, paged and sorted.
     async fn find_all(
         &self,
         limit: Option<u32>,
@@ -75,10 +90,13 @@ pub trait SLAPStorage {
     async fn find_all_records(&self) -> Result<Vec<SLAPDiscoveryRecord>, SLAPStorageError>;
 }
 
+/// SLAP storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum SLAPStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -95,6 +113,7 @@ struct SLAPRecord {
     created_at: std::time::SystemTime,
 }
 
+/// The in-memory [`SLAPStorage`], for tests.
 #[derive(Debug, Default)]
 pub struct MemorySLAPStorage {
     records: std::sync::Mutex<Vec<SLAPRecord>>,
@@ -103,10 +122,12 @@ pub struct MemorySLAPStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemorySLAPStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }

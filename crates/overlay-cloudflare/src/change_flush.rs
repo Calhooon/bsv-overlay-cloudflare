@@ -173,6 +173,7 @@ pub struct NotedBack<T> {
 }
 
 impl<T> NotedBack<T> {
+    /// An empty memory.
     pub const fn new() -> Self {
         Self {
             retried: BTreeSet::new(),

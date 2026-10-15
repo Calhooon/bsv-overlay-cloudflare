@@ -86,6 +86,7 @@ pub struct ProvedHands {
     pub winner_seat: u8,
     /// The two wire seat keys, positional (A, B).
     pub seats: [[u8; 33]; 2],
+    /// The winner's five cards, canonical.
     pub winner_cards: [u8; 5],
     /// `None` when the bundle carries no loser half (an older winner-only
     /// bundle, or a hand the loser never revealed): never guessed.

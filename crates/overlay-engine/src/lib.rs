@@ -6,6 +6,7 @@
 //! This crate is framework-agnostic — it contains zero HTTP or deployment logic.
 //! Deployment targets (Cloudflare Workers, Axum, etc.) wrap this crate with HTTP routing.
 
+#![forbid(unsafe_code)]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]

@@ -5,6 +5,7 @@
 //! we produce the same admittance results as the TS overlay.
 // bsv-stack-lean #134: test code
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![forbid(unsafe_code)]
 
 use bsv_overlay_engine::engine::{Engine, EngineConfig};
 use bsv_overlay_engine::types::*;

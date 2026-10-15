@@ -3,6 +3,10 @@
 // The lint bar (bsv-stack-lean #134): the workspace table cannot deny these
 // for the LOW crates beside this one, so the engine's crate denies them here.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// The lint bar (bsv-stack-lean #135): the public crate documents every public
+// item, and holds no unsafe code.
+#![deny(missing_docs)]
+#![forbid(unsafe_code)]
 #[doc(hidden)]
 pub use serde_json::json;
 

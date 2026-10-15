@@ -513,7 +513,10 @@ pub enum InputUnlock<'a> {
     /// locking pubkey inside the old advertisement's PushDrop lock
     /// (protocol `(2, "uhrp advertisement")`, keyID `"1"`,
     /// counterparty `"anyone"` — see [`crate::wallet::brc42`]).
-    PushDrop { key: &'a PrivateKey },
+    PushDrop {
+        /// The BRC-42-derived key that matches the old lock's pubkey.
+        key: &'a PrivateKey,
+    },
 }
 
 /// Sign a transaction where different inputs use different unlock strategies.

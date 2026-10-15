@@ -75,7 +75,9 @@ pub fn of_transport(message: &str) -> Option<&'static str> {
 /// One route fault a sync met: the peer it was meant for and its class.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteFaultSeen {
+    /// The peer the request was meant for.
     pub peer: String,
+    /// The route fault's class.
     pub class: String,
 }
 

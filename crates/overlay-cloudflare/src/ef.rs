@@ -35,7 +35,9 @@ pub enum EfError {
 
 /// One broadcastable Extended-Format entry from a BEEF.
 pub struct EfTx {
+    /// The transaction's txid.
     pub txid: String,
+    /// The transaction in Extended Format (BRC-30).
     pub ef: Vec<u8>,
 }
 

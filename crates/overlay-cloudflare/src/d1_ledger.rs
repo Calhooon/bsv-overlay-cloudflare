@@ -30,8 +30,11 @@ use std::task::{Context, Poll};
 /// What one request (or the unscoped remainder) cost D1.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Tally {
+    /// Rows read.
     pub reads: u64,
+    /// Rows written.
     pub writes: u64,
+    /// Statements run.
     pub stmts: u64,
     /// Largest single statement, so a fleet scan cannot hide in a request total.
     pub max_reads: u64,
@@ -50,14 +53,18 @@ impl Tally {
 /// One route's figures since the isolate booted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RouteBudget {
+    /// Requests recorded.
     pub requests: u64,
     /// Each field its own running maximum (the request that read the most need not be the one that wrote the most).
     pub max: Tally,
+    /// The last request's figures.
     pub last: Tally,
+    /// The sums over every request (`max_reads` its maximum).
     pub total: Tally,
 }
 
 impl RouteBudget {
+    /// Fold one request's tally in.
     pub fn record(&mut self, t: Tally) {
         self.requests = self.requests.saturating_add(1);
         self.max.reads = self.max.reads.max(t.reads);
@@ -299,8 +306,11 @@ pub fn budget_json() -> serde_json::Value {
 /// it answers is marshalled to wasm, though, so first-shaped SQL keeps its `LIMIT 1` (or a key that holds one row).
 #[allow(async_fn_in_trait)]
 pub trait Counted {
+    /// Run the statement (`all()`), counted.
     async fn counted_all(&self) -> worker::Result<worker::D1Result>;
+    /// Run the statement for its effect (`run()`), counted.
     async fn counted_run(&self) -> worker::Result<worker::D1Result>;
+    /// Run the statement and take its leading row, counted.
     async fn counted_first<T: serde::de::DeserializeOwned>(&self) -> worker::Result<Option<T>>;
 }
 
@@ -371,15 +381,10 @@ pub async fn counted_page_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::task::{RawWaker, RawWakerVTable, Waker};
+    use std::task::Waker;
 
     fn noop_waker() -> Waker {
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        fn noop(_: *const ()) {}
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        Waker::noop().clone()
     }
 
     /// A future that notes `n` statements, one per poll, yielding between them (an await on D1).

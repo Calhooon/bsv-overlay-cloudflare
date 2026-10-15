@@ -51,8 +51,10 @@ pub const CHANGE_PARKED_ADD_GENERATION: &str =
 /// migrations (#638).
 pub const CHANGE_PARKED_ADD_ATTEMPTS: &str =
     "ALTER TABLE change_parked ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0";
+/// Migration (N2): when the drain may select the row again, in milliseconds.
 pub const CHANGE_PARKED_ADD_NEXT_ATTEMPT: &str =
     "ALTER TABLE change_parked ADD COLUMN next_attempt_at_ms INTEGER NOT NULL DEFAULT 0";
+/// Migration (N2): whether the row left the drain after [`CHANGE_PARK_MAX_ATTEMPTS`] refusals.
 pub const CHANGE_PARKED_ADD_EXHAUSTED: &str =
     "ALTER TABLE change_parked ADD COLUMN exhausted INTEGER NOT NULL DEFAULT 0";
 /// bsv-low #649 D3-M1 (the third delta lens): the park tokens' COUNTER, one row (`id` 1), `n` the last token handed
@@ -171,9 +173,13 @@ pub const DRAIN_MAX_ROWS: usize =
 /// The wall the cron's delivery may spend STARTING POSTs, both sets together.
 pub const DRAIN_WALL_MS: u64 = 10_000;
 
+/// Entries the background flush withheld for want of its window.
 pub const COUNTER_ADMIT_FAST_FLUSH_WITHHELD: &str = "admit_fast_flush_withheld_total";
+/// Withheld entries parked.
 pub const COUNTER_CHANGE_PARKED: &str = "change_parked_total";
+/// Withheld entries whose park faulted (kept in the isolate's sets).
 pub const COUNTER_CHANGE_PARK_FAULTS: &str = "change_park_faults_total";
+/// Parked entries the drain delivered and deleted.
 pub const COUNTER_CHANGE_UNPARKED: &str = "change_unparked_total";
 /// N2: entries not parked because the table was full (kept in the isolate's sets).
 pub const COUNTER_CHANGE_PARK_FULL: &str = "change_park_full_total";
@@ -335,8 +341,11 @@ impl ParkPort for WorkerPark<'_> {
 /// One parked row as the drain read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParkedRow {
+    /// The entry: `txid:vout` for the pot set, an identity key for the hop set.
     pub item: String,
+    /// The generation the row was read at.
     pub generation: i64,
+    /// Refused POSTs of this generation.
     pub attempts: i64,
 }
 
@@ -381,7 +390,9 @@ pub(crate) trait UnparkPort {
 /// What one delivery did, by entries.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Delivered {
+    /// Rows the pass read.
     pub read: u64,
+    /// Rows it delivered and deleted.
     pub unparked: u64,
     /// Read by this pass and NOT deleted by it (refused, deferred past the wall, a delete that faulted, or a row
     /// re-parked since its read). A per-pass figure, never the rows parked now: another delivery may already have
@@ -389,6 +400,7 @@ pub struct Delivered {
     pub kept: u64,
     /// N2: refused this pass (backed off), of which `exhausted` left the drain.
     pub refused: u64,
+    /// Of `refused`, rows that left the drain.
     pub exhausted: u64,
     /// N2: exhausted rows deleted by the sweep.
     pub swept: u64,
@@ -721,6 +733,7 @@ pub enum DrainTrigger {
 }
 
 impl DrainTrigger {
+    /// The trigger's name in logs and counters.
     pub fn name(self) -> &'static str {
         match self {
             DrainTrigger::Tick => "tick",
@@ -2108,7 +2121,7 @@ mod tests {
         };
         let skip = doc_before(
             include_str!("pot_changes.rs"),
-            "    Skip { remaining_ms: u64 },",
+            "    Skip {\n",
         );
         let counter = doc_before(
             include_str!("ops.rs"),

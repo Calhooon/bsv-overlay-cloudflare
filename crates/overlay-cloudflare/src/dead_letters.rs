@@ -144,6 +144,7 @@ const _: () = assert!(
 pub const DLQ_RETRY_DELAY_S: u32 = 300;
 /// The backoff of a failed park: `DLQ_BACKOFF_BASE_S · 2^(attempts-1)`, capped at [`DLQ_BACKOFF_CAP_S`].
 pub const DLQ_BACKOFF_BASE_S: u32 = 60;
+/// The longest backoff of a failed park, in seconds.
 pub const DLQ_BACKOFF_CAP_S: u32 = 1800;
 
 /// Migration: the dead letters. Times are unix ms; `topics` is the sorted, comma-joined topic set; `history` is a
@@ -169,6 +170,7 @@ pub const DEAD_LETTERS_CLASS_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_mutat
 /// its key, and (next) its length. NULL for an inline letter and for a `failing` note.
 pub const DEAD_LETTERS_R2_KEY_COLUMN: &str =
     "ALTER TABLE mutation_dead_letters ADD COLUMN r2_key TEXT";
+/// Migration (door 3): the length of the R2 object named by `r2_key`.
 pub const DEAD_LETTERS_R2_BYTES_COLUMN: &str =
     "ALTER TABLE mutation_dead_letters ADD COLUMN r2_bytes INTEGER";
 /// Migration (door 3): the health block's bytes at rest ([`HEALTH_R2_SQL`]) read this index only.
@@ -340,10 +342,13 @@ pub const HEALTH_COUNTS_SQL: &str = "SELECT status, COUNT(*) AS c, MAX(redriven_
 pub const HEALTH_CLASSES_SQL: &str =
     "SELECT class, COUNT(*) AS c, SUM(CASE WHEN parked_at >= ?1 THEN 1 ELSE 0 END) AS recent \
      FROM mutation_dead_letters WHERE status IN ('parked', 'redriven') GROUP BY class";
+/// The health block's oldest parked letter.
 pub const HEALTH_OLDEST_SQL: &str =
     "SELECT txid, topics, parked_at FROM mutation_dead_letters WHERE status = 'parked' ORDER BY parked_at LIMIT 1";
+/// The health block's oldest re-driven letter.
 pub const HEALTH_OLDEST_REDRIVEN_SQL: &str =
     "SELECT txid, topics, redriven_at FROM mutation_dead_letters WHERE status = 'redriven' ORDER BY redriven_at LIMIT 1";
+/// The health block's last re-drive.
 pub const HEALTH_LAST_REDRIVE_SQL: &str = "SELECT txid, topics, redriven_at FROM mutation_dead_letters WHERE redriven_at IS NOT NULL ORDER BY redriven_at DESC LIMIT 1";
 /// Binds: the redrive ceiling, the list cap.
 pub const HEALTH_EXHAUSTED_SQL: &str =
@@ -353,7 +358,9 @@ pub const HEALTH_EXHAUSTED_SQL: &str =
 /// The key a re-driven message carries, so its re-death parks the same row.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RedriveTag {
+    /// The letter's txid.
     pub txid: String,
+    /// Its topics key (sorted, comma-joined).
     pub topics: String,
     /// The re-drive this message is (1 = the first).
     pub n: u64,
@@ -502,6 +509,7 @@ impl LetterClass {
     }
 }
 
+/// [`NOTE_FAILING_SQL`]'s query: note one failed replay of the letter, with its class.
 #[must_use]
 pub fn note_failing_query(
     txid: &str,
@@ -591,6 +599,7 @@ pub fn day_cutoff(now_ms: i64) -> i64 {
     now_ms - 86_400_000
 }
 
+/// [`RESOLVE_SQL`]'s query: the ack of landed bytes, the row deleted whatever its status.
 #[must_use]
 pub fn resolve_query(txid: &str, topics: &str) -> Query {
     Query::new(RESOLVE_SQL).bind(txid).bind(topics)
@@ -614,6 +623,7 @@ pub fn ceiling_query(txid: &str, topics: &str, day_cutoff_ms: i64) -> Query {
         .bind(day_cutoff_ms)
 }
 
+/// [`STALE_RETURN_SQL`]'s query: return the re-driven letters older than [`STALE_REDRIVE_MS`] to parked.
 #[must_use]
 pub fn stale_return_query(now_ms: i64, limit: u64) -> Query {
     Query::new(STALE_RETURN_SQL)
@@ -622,6 +632,7 @@ pub fn stale_return_query(now_ms: i64, limit: u64) -> Query {
         .bind(limit)
 }
 
+/// The lever's read for `req`: the parked letters it may re-drive, by ascending park time.
 #[must_use]
 pub fn select_parked_query(req: &RedriveRequest) -> Query {
     match (&req.txid, req.force) {
@@ -638,6 +649,7 @@ pub fn select_parked_query(req: &RedriveRequest) -> Query {
     }
 }
 
+/// The claim's compare-and-set for `row` (a forced claim passes the re-drive ceiling).
 #[must_use]
 pub fn claim_query(row: &ParkedRow, now_ms: i64, forced: bool) -> Query {
     Query::new(if forced { CLAIM_FORCED_SQL } else { CLAIM_SQL })
@@ -647,6 +659,7 @@ pub fn claim_query(row: &ParkedRow, now_ms: i64, forced: bool) -> Query {
         .bind(row.redrives_u64())
 }
 
+/// [`REVERT_SQL`]'s query: undo the claim of `row` whose send failed.
 #[must_use]
 pub fn revert_query(row: &ParkedRow) -> Query {
     Query::new(REVERT_SQL)
@@ -659,7 +672,9 @@ pub fn revert_query(row: &ParkedRow) -> Query {
 /// `POST /internal/redrive-dead-letters`'s body, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedriveRequest {
+    /// The most letters to re-drive.
     pub limit: u64,
+    /// Re-drive only this txid's letters.
     pub txid: Option<String>,
     /// L5: re-drive one txid's letters past [`MAX_REDRIVES`] (once per call, recorded in the history).
     pub force: bool,
@@ -711,7 +726,9 @@ pub fn parse_redrive_request(raw: &[u8]) -> std::result::Result<RedriveRequest, 
 /// parked row of the txid).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscardKey {
+    /// The txid, lowercased.
     pub txid: String,
+    /// Its topics key; `None` names every parked row of the txid.
     pub topics: Option<String>,
 }
 
@@ -762,10 +779,15 @@ pub fn parse_discard_request(raw: &[u8]) -> std::result::Result<Vec<DiscardKey>,
 /// One parked row the lever read (no bytes: the claim returns them).
 #[derive(Deserialize, Debug, Clone)]
 pub struct ParkedRow {
+    /// The letter's txid.
     pub txid: String,
+    /// Its topics key (sorted, comma-joined).
     pub topics: String,
+    /// The last fault noted, if any.
     pub fault: Option<String>,
+    /// Re-drives spent on it.
     pub redrives: f64,
+    /// When it was last re-driven, in milliseconds.
     pub redriven_at: Option<f64>,
 }
 
@@ -811,11 +833,17 @@ struct ClaimedRow {
 /// The ceiling's read ([`CEILING_SQL`]), as D1 answers it.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct CeilingRow {
+    /// Letters holding bytes (parked or re-driven).
     pub held: f64,
+    /// Whether this key is one of them (0 or 1).
     pub known: f64,
+    /// This key's class (`fault` when no note reached it).
     pub class: String,
+    /// "Not now" letters holding bytes.
     pub not_now: f64,
+    /// "Not now" letters of this txid holding bytes.
     pub not_now_txid: f64,
+    /// "Not now" letters parked since the day's cutoff.
     pub not_now_day: f64,
     /// Door 3: the R2 key of the row this key holds, if any ([`dropped_object`]).
     #[serde(default)]
@@ -1684,10 +1712,14 @@ struct StatusCountRow {
     recent: Option<f64>,
 }
 
+/// One row of [`HEALTH_CLASSES_SQL`].
 #[derive(Deserialize)]
 pub struct ClassCountRow {
+    /// The class.
     pub class: String,
+    /// Letters of the class holding bytes.
     pub c: f64,
+    /// Those parked since the cutoff.
     pub recent: Option<f64>,
 }
 

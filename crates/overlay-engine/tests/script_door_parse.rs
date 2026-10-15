@@ -39,6 +39,9 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 struct Counting;
 
+// SAFETY: every call forwards to `System` with the caller's own layout and
+// pointer, so `System`'s contract holds; the counters are atomics.
+#[allow(unsafe_code)]
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = System.alloc(layout);

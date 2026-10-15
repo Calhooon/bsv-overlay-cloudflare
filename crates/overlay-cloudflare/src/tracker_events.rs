@@ -35,6 +35,7 @@ fn enqueue(frame: Value) {
         events.entry(key).or_insert(frame);
     });
 }
+/// Queue a write event of `kind` for `txid` (128 held at most; a further key is dropped and counted).
 pub fn note(txid: &str, kind: &str, body: Option<Value>) {
     enqueue(
         json!({"txid":txid.to_ascii_lowercase(),"kind":kind,"body":body.unwrap_or(Value::Null)}),
@@ -71,6 +72,7 @@ pub async fn note_held(
     }
 }
 
+/// Take every queued event.
 pub fn drain() -> Vec<Value> {
     EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()).into_values().collect())
 }
@@ -93,9 +95,11 @@ where
         Err(_) => failed(frame),
     }
 }
+/// The event counters, for the health block.
 pub fn health_json() -> Value {
     COUNTS.with(|c| json!(*c.borrow()))
 }
+/// Ship `events` under a 20 s deadline of their own ([`ship_until`]).
 pub async fn ship(env: &worker::Env, events: Vec<Value>) {
     ship_until(env, events, worker::Date::now().as_millis() + 20_000).await;
 }

@@ -4,6 +4,8 @@
 //! canonicalises JSON responses, and writes a markdown report flagging any
 //! divergence. Exit code is non-zero if any entry diverges.
 
+#![forbid(unsafe_code)]
+
 mod canonical;
 mod client;
 mod corpus;

@@ -113,6 +113,7 @@ pub struct D1SHIPStorage {
 }
 
 impl D1SHIPStorage {
+    /// A SHIP storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }
@@ -263,6 +264,7 @@ pub struct D1SLAPStorage {
 }
 
 impl D1SLAPStorage {
+    /// A SLAP storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }
@@ -423,6 +425,7 @@ pub struct D1AgentStorage {
 }
 
 impl D1AgentStorage {
+    /// An agent registry storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }
@@ -637,11 +640,13 @@ impl AgentStorage for D1AgentStorage {
 // Backs `tm_dm_delegation` / `ls_dm_delegation` for dolphin-milk delegation
 // revocation cert tracking. Schema lives in `d1::OVERLAY_MIGRATIONS`.
 
+/// The D1 storage of `tm_dm_delegation` revocation records.
 pub struct D1DmDelegationStorage {
     db: Rc<D1Database>,
 }
 
 impl D1DmDelegationStorage {
+    /// A delegation storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }
@@ -808,6 +813,7 @@ pub struct D1UHRPStorage {
 }
 
 impl D1UHRPStorage {
+    /// A UHRP storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }
@@ -1172,6 +1178,7 @@ pub struct D1LowStorage {
 }
 
 impl D1LowStorage {
+    /// A LOW storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }
@@ -1370,6 +1377,7 @@ pub struct D1RevealStorage {
 }
 
 impl D1RevealStorage {
+    /// A reveal storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }
@@ -1844,6 +1852,7 @@ pub struct D1PotStorage {
 }
 
 impl D1PotStorage {
+    /// A pot storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }
@@ -2048,6 +2057,7 @@ pub fn lb_pot_flip_sql() -> &'static str {
      WHERE potTxid = ? AND unknownPot = 1"
 }
 
+/// The `UPDATE pot_records` that marks a pot spent: one statement per (confirmed, with a verdict).
 pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
     match (confirmed, with_verdict) {
         (true, true) => {
@@ -2490,6 +2500,7 @@ pub(crate) fn spender_payouts_candidates_sql(limit: u64) -> String {
     )
 }
 
+/// The `UPDATE pot_records` that writes the spender's size and fee once per spender, keyed on the live spending txid.
 pub fn spender_facts_cas_sql() -> &'static str {
     "UPDATE pot_records SET \
          spenderSizeBytes = CASE WHEN spenderFactsTxid = ? \
@@ -3615,6 +3626,7 @@ pub struct D1CollectedStorage {
 }
 
 impl D1CollectedStorage {
+    /// A collected storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }
@@ -3800,6 +3812,7 @@ pub struct D1HandStorage {
 }
 
 impl D1HandStorage {
+    /// A hand storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self {
             db: hand_write::HandDb::new(db),
@@ -3875,14 +3888,17 @@ pub mod hand_write {
     }
 
     impl LatchedHandRelatch {
+        /// The verdict the re-latch writes.
         pub fn row_valid(&self) -> bool {
             self.row_valid
         }
+        /// The `UPDATE` it runs.
         pub fn query(&self) -> &Query {
             &self.query
         }
     }
 
+    /// THE hand re-latch write for `record`, its verdict re-derived here.
     pub fn hand_relatch_query(record: &HandRecord) -> LatchedHandRelatch {
         let row_valid = overlay_discovery::hand::validity::row_valid(record);
         LatchedHandRelatch {
@@ -3902,18 +3918,22 @@ pub mod hand_write {
     pub struct HandDb(Rc<D1Database>);
 
     impl HandDb {
+        /// The handle over the D1 database `db`.
         pub fn new(db: Rc<D1Database>) -> Self {
             Self(db)
         }
+        /// Run a read; refuses any statement that is not a `SELECT`.
         pub async fn fetch_all<T: DeserializeOwned>(&self, q: Query) -> Result<Vec<T>, String> {
             if !is_select_only(q.sql()) {
                 return Err(NON_SELECT_ON_READ_PATH.to_string());
             }
             q.fetch_all(&self.0).await
         }
+        /// Run the hand admission write.
         pub async fn insert(&self, insert: LatchedHandInsert) -> Result<(), String> {
             insert.query.execute(&self.0).await
         }
+        /// Run the hand re-latch write.
         pub async fn relatch(&self, update: LatchedHandRelatch) -> Result<(), String> {
             update.query.execute(&self.0).await
         }
@@ -4067,6 +4087,7 @@ pub struct D1ResultStorage {
 }
 
 impl D1ResultStorage {
+    /// A result storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self {
             db: result_write::ResultDb::new(db),
@@ -4138,6 +4159,7 @@ pub mod result_write {
              WHERE (SELECT COUNT(*) FROM lb_marker_rows WHERE potTxid = ?) < ?"
     }
 
+    /// The leaderboard row write for `record`, admitted at `created_at` ([`lb_row_insert_sql`]).
     pub fn lb_row_insert_query(record: &ResultRecord, created_at: i64) -> Query {
         let pot = record.pot_txid.as_str();
         Query::new(lb_row_insert_sql())
@@ -4165,6 +4187,7 @@ pub mod result_write {
             .bind(overlay_discovery::result::storage::RESULT_ROWS_PER_POT as i64)
     }
 
+    /// THE result admission write for `record`, admitted at `created_at`, its tier derived here.
     pub fn result_insert_query(record: &ResultRecord, created_at: i64) -> LatchedResultInsert {
         let claim_tier = overlay_discovery::result::validity::claim_tier(record);
         LatchedResultInsert {
@@ -4198,14 +4221,17 @@ pub mod result_write {
     }
 
     impl LatchedResultRelatch {
+        /// The tier the re-latch writes.
         pub fn claim_tier(&self) -> i64 {
             self.claim_tier
         }
+        /// The `UPDATE` it runs.
         pub fn query(&self) -> &Query {
             &self.query
         }
     }
 
+    /// THE result re-latch write for `record`, its tier re-derived here.
     pub fn result_relatch_query(record: &ResultRecord) -> LatchedResultRelatch {
         let claim_tier = overlay_discovery::result::validity::claim_tier(record);
         LatchedResultRelatch {
@@ -4223,15 +4249,18 @@ pub mod result_write {
     pub struct ResultDb(Rc<D1Database>);
 
     impl ResultDb {
+        /// The handle over the D1 database `db`.
         pub fn new(db: Rc<D1Database>) -> Self {
             Self(db)
         }
+        /// Run a read; refuses any statement that is not a `SELECT`.
         pub async fn fetch_all<T: DeserializeOwned>(&self, q: Query) -> Result<Vec<T>, String> {
             if !is_select_only(q.sql()) {
                 return Err(NON_SELECT_ON_READ_PATH.to_string());
             }
             q.fetch_all(&self.0).await
         }
+        /// Run the result admission write.
         pub async fn insert(&self, insert: LatchedResultInsert) -> Result<(), String> {
             insert.query.execute(&self.0).await
         }
@@ -4241,6 +4270,7 @@ pub mod result_write {
         pub async fn lb_insert(&self, q: Query) -> Result<(), String> {
             q.execute(&self.0).await
         }
+        /// Run the result re-latch write.
         pub async fn relatch(&self, update: LatchedResultRelatch) -> Result<(), String> {
             update.query.execute(&self.0).await
         }
@@ -4450,6 +4480,7 @@ struct ResultRelatchDbRow {
     claim_valid: Option<f64>,
 }
 
+/// A scanned result row for the re-latch pass: its `rowid`, its stored tier and its record.
 pub struct ResultRelatchRow {
     rowid: i64,
     stored: Option<i64>,
@@ -4544,6 +4575,7 @@ struct HandRelatchDbRow {
     row_valid: Option<f64>,
 }
 
+/// A scanned hand row for the re-latch pass: its `rowid`, its stored verdict and its record.
 pub struct HandRelatchRow {
     rowid: i64,
     stored: Option<bool>,
@@ -4687,6 +4719,7 @@ pub struct D1PotpartyStorage {
 }
 
 impl D1PotpartyStorage {
+    /// A potparty storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self {
             db: PotpartyDb::new(db),
@@ -5665,6 +5698,7 @@ pub mod potparty_write {
     pub struct PotpartyDb(Rc<D1Database>);
 
     impl PotpartyDb {
+        /// The handle over the D1 database `db`.
         pub fn new(db: Rc<D1Database>) -> Self {
             Self(db)
         }
@@ -6011,6 +6045,7 @@ pub struct D1PotrefundStorage {
 }
 
 impl D1PotrefundStorage {
+    /// A pot refund storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }
@@ -6353,6 +6388,7 @@ pub mod hopparty_write {
     pub struct HoppartyDb(Rc<D1Database>);
 
     impl HoppartyDb {
+        /// The handle over the D1 database `db`.
         pub fn new(db: Rc<D1Database>) -> Self {
             Self(db)
         }
@@ -6399,6 +6435,7 @@ pub struct D1HoppartyStorage {
 }
 
 impl D1HoppartyStorage {
+    /// A hopparty storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self {
             db: HoppartyDb::new(db),
@@ -6917,6 +6954,7 @@ pub struct D1ProofStorage {
 }
 
 impl D1ProofStorage {
+    /// A proof storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }

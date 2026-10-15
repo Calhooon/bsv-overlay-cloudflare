@@ -25,7 +25,9 @@ macro_rules! crawl_log {
 /// per-peer because peers might carry different subsets of services.
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
+    /// The peer's base URL.
     pub peer_url: String,
+    /// The `(lookup service, topic manager)` pairs to crawl on this peer.
     pub service_to_topic: Vec<(String, String)>,
 }
 
@@ -37,6 +39,7 @@ pub struct CrawlResult {
     /// Keyed by `"{peer_url}|{service}"`. Value = number of outputs
     /// admitted by the corresponding tm_X on our engine.
     pub admitted_by: HashMap<String, usize>,
+    /// Expired adverts the crawl refused.
     pub expired_refused: u64,
     /// Per-peer, per-service total submission attempts (admitted +
     /// rejected). `admitted_by[k] <= attempted[k]` always.

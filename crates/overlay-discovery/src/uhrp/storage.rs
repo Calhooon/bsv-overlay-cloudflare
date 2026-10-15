@@ -16,8 +16,10 @@ use serde::{Deserialize, Serialize};
 /// wire shape is identical across discovery services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UHRPSortOrder {
+    /// Ascending creation time.
     #[serde(rename = "asc")]
     Asc,
+    /// Descending creation time.
     #[serde(rename = "desc")]
     Desc,
 }
@@ -25,13 +27,20 @@ pub enum UHRPSortOrder {
 /// A UHRP discovery record carrying the fields the lookup service indexes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UHRPDiscoveryRecord {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     #[serde(rename = "outputIndex")]
     pub output_index: u32,
+    /// The content's UHRP URL.
     pub uhrp_url: String,
+    /// The advertiser's identity key, 66-hex compressed.
     pub identity_key: String,
+    /// Where the content can be downloaded.
     pub download_url: String,
+    /// When the advertisement expires, in Unix seconds.
     pub expiry_time: i64,
+    /// The content's length in bytes.
     pub content_length: i64,
 }
 
@@ -176,8 +185,10 @@ pub trait UHRPStorage {
 /// UHRP storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum UHRPStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -228,10 +239,12 @@ pub struct MemoryUHRPStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryUHRPStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         // Lock poisoning only happens if a thread panicked inside the
         // guard; in tests we treat that as a hard failure via `.expect`

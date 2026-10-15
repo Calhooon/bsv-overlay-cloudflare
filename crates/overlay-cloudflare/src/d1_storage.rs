@@ -268,6 +268,7 @@ struct RebroadcastCandidateRow {
 /// D1-CALLBACK-FLOOD 2026-09-01: candidacy is now attempt-bounded — see
 /// `proof_fetcher::rebroadcast_eligible`).
 pub struct RebroadcastCandidate {
+    /// The transaction and its BEEF.
     pub tx: TransactionBeef,
     /// Prior recorded attempts (0 = never attempted).
     pub attempts: i64,
@@ -302,6 +303,7 @@ pub struct D1Storage {
 }
 
 impl D1Storage {
+    /// An engine storage over the D1 database `db`.
     pub fn new(db: Rc<D1Database>) -> Self {
         Self { db }
     }

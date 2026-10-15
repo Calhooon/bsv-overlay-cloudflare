@@ -82,7 +82,10 @@ fn tip_cache_read(cached: Option<(f64, u32)>, now_ms: f64, ttl_ms: f64) -> Optio
 }
 
 // SAFETY: wasm32 is single-threaded. There are no other threads to send to.
+#[allow(unsafe_code)]
 unsafe impl Send for WorkerChainTracker {}
+// SAFETY: wasm32 is single-threaded. There are no other threads to share with.
+#[allow(unsafe_code)]
 unsafe impl Sync for WorkerChainTracker {}
 
 impl WorkerChainTracker {
@@ -166,6 +169,7 @@ struct CtBlockHeader {
 struct UnsafeSendFuture<F>(F);
 
 // SAFETY: wasm32 is single-threaded — no cross-thread transfer occurs.
+#[allow(unsafe_code)]
 unsafe impl<F> Send for UnsafeSendFuture<F> {}
 
 impl<F: Future> Future for UnsafeSendFuture<F> {
@@ -176,7 +180,10 @@ impl<F: Future> Future for UnsafeSendFuture<F> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         // SAFETY: We only project to the inner future, maintaining pinning.
-        unsafe { self.map_unchecked_mut(|s| &mut s.0).poll(cx) }
+        #[allow(unsafe_code)]
+        unsafe {
+            self.map_unchecked_mut(|s| &mut s.0).poll(cx)
+        }
     }
 }
 

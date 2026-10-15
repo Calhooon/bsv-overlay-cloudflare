@@ -45,9 +45,12 @@ impl LowRecordType {
 /// returned to clients as BEEF, not in the index).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LowRecord {
+    /// Whether the row is a TABLE_OPEN or a GAME_UTXO record.
     #[serde(rename = "recordType")]
     pub record_type: LowRecordType,
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     #[serde(rename = "outputIndex")]
     pub output_index: u32,
     /// Host identity key (33-byte compressed pubkey, lowercase hex).
@@ -86,26 +89,33 @@ pub enum LowQuery {
     /// All unspent TABLE_OPEN records, optionally filtered by stake range.
     #[serde(rename = "findOpenTables")]
     FindOpenTables {
+        /// The least stake to return, in satoshis.
         #[serde(rename = "stakeMin", default, skip_serializing_if = "Option::is_none")]
         stake_min: Option<u64>,
+        /// The greatest stake to return, in satoshis.
         #[serde(rename = "stakeMax", default, skip_serializing_if = "Option::is_none")]
         stake_max: Option<u64>,
+        /// Answer with the decoded index columns instead of the BEEF output list.
         #[serde(default)]
         decoded: bool,
     },
     /// All records (TABLE_OPEN + GAME_UTXO) for one game.
     #[serde(rename = "byGameId")]
     ByGameId {
+        /// The game id, 64-hex.
         #[serde(rename = "gameId")]
         game_id: String,
+        /// Answer with the decoded index columns instead of the BEEF output list.
         #[serde(default)]
         decoded: bool,
     },
     /// All records published by one host identity key.
     #[serde(rename = "byHost")]
     ByHost {
+        /// The host's identity key, 66-hex compressed.
         #[serde(rename = "identityKey")]
         identity_key: String,
+        /// Answer with the decoded index columns instead of the BEEF output list.
         #[serde(default)]
         decoded: bool,
     },
@@ -222,8 +232,10 @@ pub trait LowStorage {
 /// LOW storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum LowStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -241,10 +253,12 @@ pub struct MemoryLowStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryLowStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }

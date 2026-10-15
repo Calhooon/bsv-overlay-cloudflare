@@ -89,7 +89,9 @@ pub enum PotpartyQuery {
     /// first (bsv-low #281).
     #[serde(rename = "partyFor")]
     PartyFor {
+        /// The identity key asking.
         identity: String,
+        /// The most pots to return.
         limit: Option<u32>,
     },
     /// "Who are the two parties to this pot outpoint?" — returns every
@@ -97,10 +99,13 @@ pub enum PotpartyQuery {
     /// (bsv-low #281).
     #[serde(rename = "byPot")]
     ByPot {
+        /// The pot's txid.
         #[serde(rename = "potTxid")]
         pot_txid: String,
+        /// The pot's output index.
         #[serde(rename = "potVout")]
         pot_vout: u32,
+        /// The most markers to return.
         limit: Option<u32>,
         /// Page start (rows to skip in the oldest-first total order),
         /// default 0 — the `ls_potrefund byPot` shape (bsv-low #291 gate
@@ -203,8 +208,10 @@ pub trait PotpartyStorage {
 /// POTPARTY storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum PotpartyStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -224,10 +231,12 @@ pub struct MemoryPotpartyStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryPotpartyStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }

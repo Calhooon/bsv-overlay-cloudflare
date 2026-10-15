@@ -499,6 +499,7 @@ pub const UNANCHORABLE_RETRY_SECS: u64 = 6 * 3600;
 /// Four retries, six hours apart, cover one day after an unanchorable verdict.
 /// A spent allowance is a durable fact until a new score or operator reset.
 pub const UNANCHORABLE_RETRIES: u32 = 4;
+/// The reason prefix of a dead root's record.
 pub const DEAD_REASON: &str = "dead:";
 
 /// The least time between two counted absences of one root (engine 0.1.15,
@@ -859,6 +860,7 @@ impl DeferredGraph {
         self.is_struck() && self.reason.starts_with(UNANCHORABLE_REASON)
     }
 
+    /// Whether this record holds a dead root.
     pub fn is_dead(&self) -> bool {
         self.is_struck() && self.reason.starts_with(DEAD_REASON)
     }
@@ -1790,32 +1792,40 @@ impl<'a> GASPSync<'a> {
     fn request_stopped(&self) -> bool {
         self.request_stop.as_ref().is_some_and(|stop| stop())
     }
+    /// Pages of the peer's UTXO list the last `sync` read.
     pub fn pages(&self) -> u64 {
         self.page.pages
     }
+    /// Whether the last `sync` moved past at least one page.
     pub fn page_advanced(&self) -> bool {
         self.page.advanced
     }
+    /// Whether the last `sync` reached the end of the peer's UTXO list.
     pub fn reached_tip(&self) -> bool {
         self.page.reached_tip
     }
 
+    /// Expired roots the last `sync` refused that it had not refused before.
     pub fn expired_refused(&self) -> u64 {
         self.expired_refused.get()
     }
 
+    /// Roots the last `sync` finalized whose own transaction carried a proof.
     pub fn roots_proven(&self) -> u64 {
         self.roots_proven.get()
     }
+    /// Roots the last `sync` finalized whose own transaction carried no proof.
     pub fn roots_unproven(&self) -> u64 {
         self.roots_unproven.get()
     }
+    /// The outpoint that held the cursor back in the last `sync`, if any: the lowest-scored root left unsettled.
     pub fn cursor_held_by(&self) -> Option<String> {
         self.cursor_held_by
             .as_ref()
             .map(|(_, outpoint)| outpoint.clone())
     }
 
+    /// Whether the last `sync` landed or expired a root, so the cursor may move.
     pub fn cursor_yielded(&self) -> bool {
         self.cursor_yielded.get()
     }
@@ -1874,14 +1884,17 @@ impl<'a> GASPSync<'a> {
         self.dead_recorded.get()
     }
 
+    /// Legacy fault records the last `sync` folded into the fault memo.
     pub fn memo_folded(&self) -> u64 {
         self.memo_folded.get()
     }
 
+    /// Expired deferred roots the last `sync` removed.
     pub fn expired_swept(&self) -> u64 {
         self.expired_swept.get()
     }
 
+    /// Roots with a fault record the last `sync` walked again and landed: their record cleared.
     pub fn unanchorable_cleared(&self) -> u64 {
         self.unanchorable_cleared.get()
     }
@@ -2447,6 +2460,7 @@ impl<'a> GASPSync<'a> {
         self
     }
 
+    /// Bound each graph's walk by `budget` and retain its pending work.
     pub fn with_graph_budget(mut self, budget: GraphBudget<'a>) -> Self {
         self.graph_budget = Some(budget);
         self
@@ -5040,7 +5054,12 @@ pub enum GASPError {
     CourierBudget,
     /// Version mismatch between peers.
     #[error("version mismatch: local={local}, remote={remote}")]
-    VersionMismatch { local: u32, remote: u32 },
+    VersionMismatch {
+        /// The GASP version this side speaks.
+        local: u32,
+        /// The version the peer answered with.
+        remote: u32,
+    },
 
     /// Invalid timestamp format.
     #[error("invalid timestamp: {0}")]
@@ -5063,7 +5082,12 @@ pub enum GASPError {
     /// route, never of the peer. It counts nothing against the peer's
     /// health rows and is named `route_fault:<class>`.
     #[error("route_fault:{class}: {detail}")]
-    RouteFault { class: String, detail: String },
+    RouteFault {
+        /// The route fault's class.
+        class: String,
+        /// What the route answered.
+        detail: String,
+    },
 
     /// Storage error.
     #[error("storage error: {0}")]

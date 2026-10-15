@@ -40,7 +40,12 @@ use std::{
 #[derive(Clone)]
 pub enum PageWrite {
     /// `Storage::insert_output_with_origin(output, gasp)`.
-    Output { output: Rc<Output>, gasp: bool },
+    Output {
+        /// The output to insert.
+        output: Rc<Output>,
+        /// Whether a GASP finalization admitted it (no broadcaster callback to wait for).
+        gasp: bool,
+    },
     /// `Storage::insert_applied_transaction`.
     Applied(AppliedTransaction),
     /// A statement of the backend's own (a lookup index row), opaque to the
@@ -102,6 +107,7 @@ impl PageBuffer {
         }
     }
 
+    /// Whether the buffer still takes writes.
     pub fn is_open(&self) -> bool {
         self.0.borrow().open
     }
@@ -238,6 +244,7 @@ pub struct Scoped<F> {
     future: Pin<Box<F>>,
 }
 
+/// `future` with `buffer` installed while it is polled.
 pub fn scope<F: Future>(buffer: PageBuffer, future: F) -> Scoped<F> {
     Scoped {
         buffer,

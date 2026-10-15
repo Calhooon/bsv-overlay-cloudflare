@@ -55,6 +55,7 @@ pub enum HandQuery {
     /// on-chain facts either way.
     #[serde(rename = "handsForGames")]
     HandsForGames {
+        /// The games asked about.
         #[serde(rename = "gameIds")]
         game_ids: Vec<String>,
     },
@@ -122,8 +123,10 @@ pub trait HandStorage {
 /// HAND storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum HandStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -141,10 +144,12 @@ pub struct MemoryHandStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryHandStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }

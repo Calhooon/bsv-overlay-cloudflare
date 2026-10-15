@@ -59,5 +59,12 @@ tracing = "0.1"
 # `warn` blocks a merge as well. Unwrap, expect and panic are denied by
 # crate attribute on the engine's two crates here (`overlay-cloudflare`,
 # `worker-build-info`), not in this table: the LOW crates' code is LOW's.
+# Unsafe code (bsv-stack-lean #135): a crate with no unsafe forbids it at
+# its root; each remaining unsafe item carries `// SAFETY:`. Missing docs are
+# denied by the engine's two crates here, by crate attribute, for the reason
+# above.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
