@@ -17,6 +17,7 @@
 //! `verify_scripts_only_under`, the error's `limb`): it is run there as it
 //! stands, and each pin's RED word is in its doc comment.
 
+use bsv_rs::primitives::to_var_int;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -92,27 +93,18 @@ async fn walked(
 
 type Hash32 = [u8; 32];
 
-fn varint(n: u64) -> Vec<u8> {
-    match n {
-        0..=0xfc => vec![n as u8],
-        0xfd..=0xffff => [&[0xfd][..], &(n as u16).to_le_bytes()].concat(),
-        0x1_0000..=0xffff_ffff => [&[0xfe][..], &(n as u32).to_le_bytes()].concat(),
-        _ => [&[0xff][..], &n.to_le_bytes()].concat(),
-    }
-}
-
 /// A version 2 transaction of one input (`prev`:0, `unlock`) and one output.
 fn one_in_one_out(prev: &Hash32, unlock: &[u8], sats: u64, lock: &[u8]) -> Vec<u8> {
     let mut raw = 2u32.to_le_bytes().to_vec();
     raw.push(1);
     raw.extend_from_slice(prev);
     raw.extend_from_slice(&0u32.to_le_bytes());
-    raw.extend(varint(unlock.len() as u64));
+    raw.extend(to_var_int(unlock.len() as u64));
     raw.extend_from_slice(unlock);
     raw.extend_from_slice(&u32::MAX.to_le_bytes());
     raw.push(1);
     raw.extend_from_slice(&sats.to_le_bytes());
-    raw.extend(varint(lock.len() as u64));
+    raw.extend(to_var_int(lock.len() as u64));
     raw.extend_from_slice(lock);
     raw.extend_from_slice(&0u32.to_le_bytes());
     raw
@@ -126,7 +118,7 @@ fn display(wire: &Hash32) -> String {
 
 /// The BUMP of a block of one transaction.
 fn one_leaf_bump(txid: &Hash32) -> Vec<u8> {
-    let mut bump = varint(800_000);
+    let mut bump = to_var_int(800_000);
     bump.extend_from_slice(&[0x01, 0x01, 0x00, 0x02]);
     bump.extend_from_slice(txid);
     bump
@@ -137,7 +129,7 @@ fn one_leaf_bump(txid: &Hash32) -> Vec<u8> {
 fn beef_v1(txs: &[Vec<u8>]) -> Vec<u8> {
     let mut body = vec![0x01, 0x00, 0xbe, 0xef, 0x01];
     body.extend(one_leaf_bump(&sha256d(&txs[0])));
-    body.extend(varint(txs.len() as u64));
+    body.extend(to_var_int(txs.len() as u64));
     for (i, raw) in txs.iter().enumerate() {
         body.extend_from_slice(raw);
         body.extend_from_slice(if i == 0 { &[0x01, 0x00] } else { &[0x00] });

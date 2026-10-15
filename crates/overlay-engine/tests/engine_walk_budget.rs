@@ -416,18 +416,18 @@ fn e592_the_budget_is_configured_on_the_engine() {
 /// script) and `outputs` (satoshis, locking script).
 fn raw_tx(inputs: &[(&[u8; 32], u32, &[u8])], outputs: &[(u64, &[u8])]) -> Vec<u8> {
     let mut raw = 2u32.to_le_bytes().to_vec();
-    raw.extend(walk_witness::varint(inputs.len() as u64));
+    raw.extend(bsv_rs::primitives::to_var_int(inputs.len() as u64));
     for (prev, vout, unlock) in inputs {
         raw.extend_from_slice(*prev);
         raw.extend_from_slice(&vout.to_le_bytes());
-        raw.extend(walk_witness::varint(unlock.len() as u64));
+        raw.extend(bsv_rs::primitives::to_var_int(unlock.len() as u64));
         raw.extend_from_slice(unlock);
         raw.extend_from_slice(&u32::MAX.to_le_bytes());
     }
-    raw.extend(walk_witness::varint(outputs.len() as u64));
+    raw.extend(bsv_rs::primitives::to_var_int(outputs.len() as u64));
     for (sats, lock) in outputs {
         raw.extend_from_slice(&sats.to_le_bytes());
-        raw.extend(walk_witness::varint(lock.len() as u64));
+        raw.extend(bsv_rs::primitives::to_var_int(lock.len() as u64));
         raw.extend_from_slice(lock);
     }
     raw.extend_from_slice(&0u32.to_le_bytes());

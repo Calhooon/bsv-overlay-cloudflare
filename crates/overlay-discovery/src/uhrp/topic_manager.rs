@@ -325,6 +325,7 @@ mod tests {
     use super::*;
     use bsv_rs::primitives::ec::PrivateKey;
     use bsv_rs::primitives::encoding::Writer;
+    use bsv_rs::primitives::to_var_int;
     use bsv_rs::script::templates::PushDrop as PushDropTemplate;
     use bsv_rs::transaction::TransactionOutput;
 
@@ -418,12 +419,6 @@ mod tests {
             .to_vec()
     }
 
-    fn varint(v: u64) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.write_var_int(v);
-        w.into_bytes()
-    }
-
     const FUTURE_EXPIRY: u64 = 4_000_000_000; // ~year 2096
 
     #[test]
@@ -445,8 +440,8 @@ mod tests {
             dummy_33_byte_pubkey(),
             vec![0u8; 32],
             b"https://example.com".to_vec(),
-            varint(FUTURE_EXPIRY),
-            varint(1024),
+            to_var_int(FUTURE_EXPIRY),
+            to_var_int(1024),
         ];
         let output = make_raw_uhrp_output(fields);
         let result = UHRPTopicManager::validate_uhrp_output(&output, 1_700_000_000).unwrap();
@@ -487,8 +482,8 @@ mod tests {
             vec![0x02, 0x03], // 2 bytes — not 33
             vec![0u8; 32],
             b"https://example.com".to_vec(),
-            varint(FUTURE_EXPIRY),
-            varint(1024),
+            to_var_int(FUTURE_EXPIRY),
+            to_var_int(1024),
             vec![0x30, 0x04, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
         ];
         let output = make_raw_uhrp_output(fields);
@@ -508,8 +503,8 @@ mod tests {
             bogus,
             vec![0u8; 32],
             b"https://example.com".to_vec(),
-            varint(FUTURE_EXPIRY),
-            varint(1024),
+            to_var_int(FUTURE_EXPIRY),
+            to_var_int(1024),
         ];
         // Need 5 data fields + a signature for the decoder to split them, but
         // for this test the validator should error out before signature check.
@@ -531,8 +526,8 @@ mod tests {
             identity_bytes,
             vec![0u8; 31],
             b"https://example.com".to_vec(),
-            varint(FUTURE_EXPIRY),
-            varint(1024),
+            to_var_int(FUTURE_EXPIRY),
+            to_var_int(1024),
             vec![0x30, 0x04, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
         ];
         let _ = wallet;
@@ -553,8 +548,8 @@ mod tests {
             dummy_33_byte_pubkey(),
             vec![0u8; 32],
             b"ftp://example.com".to_vec(), // wrong scheme
-            varint(FUTURE_EXPIRY),
-            varint(1024),
+            to_var_int(FUTURE_EXPIRY),
+            to_var_int(1024),
         ];
         let output = make_signed_from_raw_fields(fields);
         let result = UHRPTopicManager::validate_uhrp_output(&output, 1_700_000_000);
@@ -633,8 +628,8 @@ mod tests {
             dummy_33_byte_pubkey(),
             vec![0u8; 32],
             b"https://example.com".to_vec(),
-            varint(FUTURE_EXPIRY),
-            varint(1024),
+            to_var_int(FUTURE_EXPIRY),
+            to_var_int(1024),
         ];
         let output = make_signed_from_raw_fields(fields);
         let result = UHRPTopicManager::validate_uhrp_output(&output, 1_700_000_000).unwrap();
@@ -653,8 +648,8 @@ mod tests {
             admin.public_key().to_compressed().to_vec(),
             vec![0u8; 32],
             b"https://example.com".to_vec(),
-            varint(FUTURE_EXPIRY),
-            varint(1024),
+            to_var_int(FUTURE_EXPIRY),
+            to_var_int(1024),
         ];
         let sign_data: Vec<u8> = data_fields.iter().flat_map(|f| f.iter().copied()).collect();
         let sig_result = wallet
@@ -696,8 +691,8 @@ mod tests {
             victim.public_key().to_compressed().to_vec(),
             vec![0u8; 32],
             b"https://example.com".to_vec(),
-            varint(FUTURE_EXPIRY),
-            varint(1024),
+            to_var_int(FUTURE_EXPIRY),
+            to_var_int(1024),
         ];
         let sign_data: Vec<u8> = data_fields.iter().flat_map(|f| f.iter().copied()).collect();
         let sig_result = impostor_wallet

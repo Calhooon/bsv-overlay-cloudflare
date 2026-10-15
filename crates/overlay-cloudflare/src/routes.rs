@@ -311,57 +311,6 @@ fn binary_response(bytes: Vec<u8>) -> worker::Result<Response> {
     Ok(resp)
 }
 
-// =============================================================================
-// VarInt encoding (Bitcoin-style)
-// =============================================================================
-
-fn write_varint(buf: &mut Vec<u8>, n: u64) {
-    if n < 0xfd {
-        buf.push(n as u8);
-    } else if n <= 0xffff {
-        buf.push(0xfd);
-        buf.extend_from_slice(&(n as u16).to_le_bytes());
-    } else if n <= 0xffff_ffff {
-        buf.push(0xfe);
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-    } else {
-        buf.push(0xff);
-        buf.extend_from_slice(&n.to_le_bytes());
-    }
-}
-
-/// Read a Bitcoin-style varint from the start of a byte slice.
-/// Returns (value, bytes_consumed) or None if truncated.
-fn read_varint_prefix(data: &[u8]) -> Option<(usize, usize)> {
-    let first = *data.first()?;
-    match first {
-        0..=0xfc => Some((first as usize, 1)),
-        0xfd => {
-            if data.len() < 3 {
-                return None;
-            }
-            let v = u16::from_le_bytes([data[1], data[2]]) as usize;
-            Some((v, 3))
-        }
-        0xfe => {
-            if data.len() < 5 {
-                return None;
-            }
-            let v = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
-            Some((v, 5))
-        }
-        0xff => {
-            if data.len() < 9 {
-                return None;
-            }
-            let v = u64::from_le_bytes([
-                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
-            ]) as usize;
-            Some((v, 9))
-        }
-    }
-}
-
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     status: &'a str,
@@ -703,9 +652,13 @@ async fn submit_inner(
         .is_some_and(|v| v == "true");
 
     let (beef, off_chain_values) = if includes_off_chain && !raw_body.is_empty() {
-        // Read varint length prefix, then split
-        match read_varint_prefix(&raw_body) {
-            Some((beef_len, offset)) if offset + beef_len <= raw_body.len() => {
+        // Read the varint length prefix (bsv-rs's canonical reader, as the
+        // reference's `readVarIntNumStrict`), then split
+        match bsv_rs::primitives::from_var_int(&raw_body)
+            .ok()
+            .and_then(|(len, offset)| Some((usize::try_from(len).ok()?, offset)))
+        {
+            Some((beef_len, offset)) if beef_len <= raw_body.len() - offset => {
                 let beef = raw_body[offset..offset + beef_len].to_vec();
                 let ocv = if offset + beef_len < raw_body.len() {
                     Some(raw_body[offset + beef_len..].to_vec())
@@ -2523,12 +2476,13 @@ fn serialize_aggregated_lookup(
     outputs: &[overlay_engine::types::OutputListItem],
     txids: &[String],
 ) -> Result<Vec<u8>, String> {
+    use bsv_rs::primitives::to_var_int;
     use bsv_rs::transaction::Beef;
 
     let mut buf = Vec::new();
 
     // Number of outputs
-    write_varint(&mut buf, outputs.len() as u64);
+    buf.extend_from_slice(&to_var_int(outputs.len() as u64));
 
     // Merged BEEF accumulator — start with the first output's BEEF and merge the rest.
     let mut merged_beef: Option<Beef> = None;
@@ -2564,16 +2518,16 @@ fn serialize_aggregated_lookup(
         buf.extend_from_slice(&txid_bytes);
 
         // Write output index
-        write_varint(&mut buf, output.output_index as u64);
+        buf.extend_from_slice(&to_var_int(output.output_index as u64));
 
         // Write context
         match &output.context {
             Some(ctx) if !ctx.is_empty() => {
-                write_varint(&mut buf, ctx.len() as u64);
+                buf.extend_from_slice(&to_var_int(ctx.len() as u64));
                 buf.extend_from_slice(ctx);
             }
             _ => {
-                write_varint(&mut buf, 0);
+                buf.extend_from_slice(&to_var_int(0));
             }
         }
 

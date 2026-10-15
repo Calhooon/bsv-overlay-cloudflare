@@ -43,7 +43,7 @@
 
 use bsv_overlay_discovery::uhrp::topic_manager::UHRPTopicManager;
 use bsv_rs::primitives::ec::{PrivateKey, PublicKey};
-use bsv_rs::primitives::encoding::Writer;
+use bsv_rs::primitives::to_var_int;
 use bsv_rs::script::templates::PushDrop as PushDropTemplate;
 use bsv_rs::transaction::TransactionOutput;
 use bsv_rs::wallet::{
@@ -110,12 +110,6 @@ struct ShimVerdict {
 // Hand-crafted corpus builders
 // ---------------------------------------------------------------------------
 
-fn varint(v: u64) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.write_var_int(v);
-    w.into_bytes()
-}
-
 /// Build a correctly signed UHRP PushDrop output with the given field
 /// values. Mirrors `src/uhrp/topic_manager.rs::tests::make_signed_uhrp_output`.
 fn make_signed_uhrp_output(
@@ -141,8 +135,8 @@ fn make_signed_uhrp_output(
     let locking_key = PublicKey::from_hex(&locking_key_hex).unwrap();
 
     let identity_bytes = admin_key.public_key().to_compressed();
-    let expiry_bytes = varint(expiry_time);
-    let length_bytes = varint(content_length);
+    let expiry_bytes = to_var_int(expiry_time);
+    let length_bytes = to_var_int(content_length);
 
     let data_fields: Vec<Vec<u8>> = vec![
         identity_bytes.to_vec(),
@@ -260,8 +254,8 @@ fn build_hand_crafted_corpus() -> Vec<CorpusCase> {
         admin.public_key().to_compressed().to_vec(),
         vec![0u8; 31], // 31-byte hash
         b"https://example.com".to_vec(),
-        varint(FUTURE_EXPIRY),
-        varint(1024),
+        to_var_int(FUTURE_EXPIRY),
+        to_var_int(1024),
     ];
     let bad_hash_out = make_raw_uhrp_output_with_junk_sig(bad_hash_fields);
     cases.push(CorpusCase {
@@ -277,8 +271,8 @@ fn build_hand_crafted_corpus() -> Vec<CorpusCase> {
         admin.public_key().to_compressed().to_vec(),
         vec![0u8; 32],
         b"ftp://example.com".to_vec(),
-        varint(FUTURE_EXPIRY),
-        varint(1024),
+        to_var_int(FUTURE_EXPIRY),
+        to_var_int(1024),
     ];
     cases.push(CorpusCase {
         label: "hand_ftp_scheme_rejects".into(),
@@ -293,8 +287,8 @@ fn build_hand_crafted_corpus() -> Vec<CorpusCase> {
         admin.public_key().to_compressed().to_vec(),
         vec![0u8; 32],
         b"https://example.com".to_vec(),
-        varint(FUTURE_EXPIRY),
-        varint(1024),
+        to_var_int(FUTURE_EXPIRY),
+        to_var_int(1024),
     ];
     cases.push(CorpusCase {
         label: "hand_bad_signature".into(),
@@ -314,8 +308,8 @@ fn build_hand_crafted_corpus() -> Vec<CorpusCase> {
             admin.public_key().to_compressed().to_vec(),
             vec![0u8; 32],
             b"https://example.com".to_vec(),
-            varint(FUTURE_EXPIRY),
-            varint(1024),
+            to_var_int(FUTURE_EXPIRY),
+            to_var_int(1024),
         ];
         let sign_data: Vec<u8> = data_fields.iter().flat_map(|f| f.iter().copied()).collect();
         let sig = wallet
@@ -351,8 +345,8 @@ fn build_hand_crafted_corpus() -> Vec<CorpusCase> {
             victim.public_key().to_compressed().to_vec(),
             vec![0u8; 32],
             b"https://example.com".to_vec(),
-            varint(FUTURE_EXPIRY),
-            varint(1024),
+            to_var_int(FUTURE_EXPIRY),
+            to_var_int(1024),
         ];
         let sign_data: Vec<u8> = data_fields.iter().flat_map(|f| f.iter().copied()).collect();
         let sig = imp_wallet
@@ -423,8 +417,8 @@ fn build_hand_crafted_corpus() -> Vec<CorpusCase> {
         admin.public_key().to_compressed().to_vec(),
         vec![0u8; 32],
         b"not a url at all".to_vec(),
-        varint(FUTURE_EXPIRY),
-        varint(1024),
+        to_var_int(FUTURE_EXPIRY),
+        to_var_int(1024),
     ];
     cases.push(CorpusCase {
         label: "hand_malformed_url".into(),

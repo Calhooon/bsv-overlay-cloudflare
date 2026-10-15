@@ -21,6 +21,7 @@
 //! inside `verify_scripts_only`, over the level at its entry. The body is the
 //! caller's and is not counted.
 
+use bsv_rs::primitives::from_var_int;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -478,26 +479,15 @@ fn first_txid(beef: &[u8]) -> String {
 /// unlocking script.
 fn find_last_input_script(raw: &[u8]) -> usize {
     let mut at = 4;
-    let (count, used) = varint(&raw[at..]);
+    let (count, used) = from_var_int(&raw[at..]).unwrap();
     at += used;
     let mut script_at = 0;
     for _ in 0..count {
         at += 36;
-        let (len, used) = varint(&raw[at..]);
+        let (len, used) = from_var_int(&raw[at..]).unwrap();
         at += used;
         script_at = at;
         at += len as usize + 4;
     }
     script_at
-}
-
-fn varint(bytes: &[u8]) -> (u64, usize) {
-    match bytes[0] {
-        0xfd => (u64::from(u16::from_le_bytes([bytes[1], bytes[2]])), 3),
-        0xfe => (
-            u64::from(u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]])),
-            5,
-        ),
-        short => (u64::from(short), 1),
-    }
 }

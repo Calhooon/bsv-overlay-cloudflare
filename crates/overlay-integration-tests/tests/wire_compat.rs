@@ -6,6 +6,7 @@
 
 use bsv_overlay_engine::engine::{Engine, EngineConfig};
 use bsv_overlay_engine::types::*;
+use bsv_rs::primitives::{from_var_int, to_var_int};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -602,43 +603,10 @@ fn gasp_node_serde_roundtrip() {
 //     [context_len bytes: context]
 //   [remaining bytes: concatenated BEEF data]
 
-/// Bitcoin-style VarInt encoder (same as routes.rs).
-fn write_varint(buf: &mut Vec<u8>, n: u64) {
-    if n < 0xfd {
-        buf.push(n as u8);
-    } else if n <= 0xffff {
-        buf.push(0xfd);
-        buf.extend_from_slice(&(n as u16).to_le_bytes());
-    } else if n <= 0xffff_ffff {
-        buf.push(0xfe);
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-    } else {
-        buf.push(0xff);
-        buf.extend_from_slice(&n.to_le_bytes());
-    }
-}
-
-/// Bitcoin-style VarInt decoder. Returns (value, bytes_consumed).
-fn read_varint(data: &[u8]) -> (u64, usize) {
-    assert!(!data.is_empty(), "VarInt: empty data");
-    let first = data[0];
-    if first < 0xfd {
-        (first as u64, 1)
-    } else if first == 0xfd {
-        let val = u16::from_le_bytes([data[1], data[2]]);
-        (val as u64, 3)
-    } else if first == 0xfe {
-        let val = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-        (val as u64, 5)
-    } else {
-        let val = u64::from_le_bytes([
-            data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
-        ]);
-        (val, 9)
-    }
-}
-
-/// Verify write_varint produces correct encoding for edge cases.
+/// Verify the varint the route writes encodes the edge cases correctly.
+/// Amended for bsv-rs 0.6.0 (lane L2-migrate-engine): the route and this file
+/// read and write through bsv-rs's public varint (`to_var_int`, `from_var_int`),
+/// their own copies deleted; the cases and the expected bytes are unchanged.
 #[test]
 fn varint_encoding_roundtrip() {
     let cases: Vec<(u64, Vec<u8>)> = vec![
@@ -657,23 +625,23 @@ fn varint_encoding_roundtrip() {
 
     for (value, expected_bytes) in &cases {
         let mut buf = Vec::new();
-        write_varint(&mut buf, *value);
+        buf.extend_from_slice(&to_var_int(*value));
         assert_eq!(
             &buf, expected_bytes,
-            "write_varint({}) produced wrong bytes",
+            "to_var_int({}) produced wrong bytes",
             value
         );
 
-        let (decoded, consumed) = read_varint(&buf);
+        let (decoded, consumed) = from_var_int(&buf).unwrap();
         assert_eq!(
             decoded, *value,
-            "read_varint roundtrip failed for {}",
+            "from_var_int roundtrip failed for {}",
             value
         );
         assert_eq!(
             consumed,
             buf.len(),
-            "read_varint consumed wrong number of bytes for {}",
+            "from_var_int consumed wrong number of bytes for {}",
             value
         );
     }
@@ -698,18 +666,18 @@ fn aggregated_lookup_binary_format_roundtrip() {
     let mut buf = Vec::new();
 
     // Number of outputs
-    write_varint(&mut buf, 2);
+    buf.extend_from_slice(&to_var_int(2));
 
     // Output 1: txid1, outputIndex=0, context="hello context"
     buf.extend_from_slice(&txid1_bytes);
-    write_varint(&mut buf, 0);
-    write_varint(&mut buf, context1.len() as u64);
+    buf.extend_from_slice(&to_var_int(0));
+    buf.extend_from_slice(&to_var_int(context1.len() as u64));
     buf.extend_from_slice(&context1);
 
     // Output 2: txid2, outputIndex=5, no context
     buf.extend_from_slice(&txid2_bytes);
-    write_varint(&mut buf, 5);
-    write_varint(&mut buf, 0); // no context
+    buf.extend_from_slice(&to_var_int(5));
+    buf.extend_from_slice(&to_var_int(0)); // no context
 
     // Concatenated BEEF data
     buf.extend_from_slice(&beef1);
@@ -719,7 +687,7 @@ fn aggregated_lookup_binary_format_roundtrip() {
     let mut pos = 0;
 
     // Read number of outputs
-    let (num_outputs, consumed) = read_varint(&buf[pos..]);
+    let (num_outputs, consumed) = from_var_int(&buf[pos..]).unwrap();
     pos += consumed;
     assert_eq!(num_outputs, 2);
 
@@ -728,11 +696,11 @@ fn aggregated_lookup_binary_format_roundtrip() {
     pos += 32;
     assert_eq!(decoded_txid1, &txid1_bytes[..]);
 
-    let (output_index1, consumed) = read_varint(&buf[pos..]);
+    let (output_index1, consumed) = from_var_int(&buf[pos..]).unwrap();
     pos += consumed;
     assert_eq!(output_index1, 0);
 
-    let (ctx_len1, consumed) = read_varint(&buf[pos..]);
+    let (ctx_len1, consumed) = from_var_int(&buf[pos..]).unwrap();
     pos += consumed;
     assert_eq!(ctx_len1, context1.len() as u64);
 
@@ -745,11 +713,11 @@ fn aggregated_lookup_binary_format_roundtrip() {
     pos += 32;
     assert_eq!(decoded_txid2, &txid2_bytes[..]);
 
-    let (output_index2, consumed) = read_varint(&buf[pos..]);
+    let (output_index2, consumed) = from_var_int(&buf[pos..]).unwrap();
     pos += consumed;
     assert_eq!(output_index2, 5);
 
-    let (ctx_len2, consumed) = read_varint(&buf[pos..]);
+    let (ctx_len2, consumed) = from_var_int(&buf[pos..]).unwrap();
     pos += consumed;
     assert_eq!(ctx_len2, 0);
 
@@ -765,11 +733,11 @@ fn aggregated_lookup_binary_format_roundtrip() {
 #[test]
 fn aggregated_lookup_empty_output_list() {
     let mut buf = Vec::new();
-    write_varint(&mut buf, 0);
+    buf.extend_from_slice(&to_var_int(0));
 
     assert_eq!(buf, vec![0x00]);
 
-    let (num_outputs, consumed) = read_varint(&buf);
+    let (num_outputs, consumed) = from_var_int(&buf).unwrap();
     assert_eq!(num_outputs, 0);
     assert_eq!(consumed, 1);
     // No remaining bytes
@@ -797,23 +765,23 @@ async fn aggregated_lookup_with_real_beef() {
     let mut buf = Vec::new();
 
     // 1 output
-    write_varint(&mut buf, 1);
+    buf.extend_from_slice(&to_var_int(1));
 
     // txid (32 bytes)
     buf.extend_from_slice(&expected_txid_bytes);
 
     // output index
-    write_varint(&mut buf, *output_index as u64);
+    buf.extend_from_slice(&to_var_int(*output_index as u64));
 
     // no context
-    write_varint(&mut buf, 0);
+    buf.extend_from_slice(&to_var_int(0));
 
     // BEEF data
     buf.extend_from_slice(beef_bytes);
 
     // Parse it back
     let mut pos = 0;
-    let (n, consumed) = read_varint(&buf[pos..]);
+    let (n, consumed) = from_var_int(&buf[pos..]).unwrap();
     pos += consumed;
     assert_eq!(n, 1);
 
@@ -821,11 +789,11 @@ async fn aggregated_lookup_with_real_beef() {
     pos += 32;
     assert_eq!(txid, &expected_txid_bytes[..]);
 
-    let (oi, consumed) = read_varint(&buf[pos..]);
+    let (oi, consumed) = from_var_int(&buf[pos..]).unwrap();
     pos += consumed;
     assert_eq!(oi, *output_index as u64);
 
-    let (ctx_len, consumed) = read_varint(&buf[pos..]);
+    let (ctx_len, consumed) = from_var_int(&buf[pos..]).unwrap();
     pos += consumed;
     assert_eq!(ctx_len, 0);
 
