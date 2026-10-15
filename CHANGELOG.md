@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- The lint bar (bsv-stack-lean #134, #135, #137, #139, #140, #141, #144,
+  #145); no version move. Both workspaces carry a `[workspace.lints]`
+  table every member takes: `clippy::all` and unsafe code denied in both;
+  in the root workspace `missing_docs`, `unwrap_used`, `expect_used` and
+  `panic` denied too, which `overlay-cloudflare` and `worker-build-info`
+  deny by crate attribute (the LOW crates beside them keep their code). A
+  crate with no unsafe code forbids it at its root; the Worker crate's four
+  unsafe items each carry their `// SAFETY:` reason. Every public item of
+  the five published crates is documented, and the doc links resolve.
+  `rust-version` is 1.88 in both workspaces, the lowest toolchain they
+  build on (1.87 stops in bsv-rs 0.6.0). The gate gains `msrv`, `docs`
+  (`RUSTDOCFLAGS=-D warnings`), `secrets` (gitleaks), `actionlint` and a
+  non-blocking `machete`; the tools build from release sources pinned by
+  sha256, and every action is pinned by commit sha.
+
 ## [0.2.2] - 2026-10-15
 
 - The sync's storage per page (#58's finding; the owner's word of
