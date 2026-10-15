@@ -99,7 +99,8 @@ GET  /, /health, /health/live, /health/ready,
      /getDocumentationForTopicManager,
      /getDocumentationForLookupServiceProvider
 POST /submit, /lookup, /arc-ingest (gated on TAAL_API_KEY),
-     /requestSyncResponse, /requestForeignGASPNode
+     /requestSyncResponse, /requestForeignGASPNode,
+     /requestForeignGASPNodes (engine 0.2.1)
 GET  /admin/config (unauth)
 GET  /admin/stats, /admin/ship-records, /admin/slap-records,
      /admin/bans
