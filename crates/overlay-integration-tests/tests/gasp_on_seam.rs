@@ -141,6 +141,8 @@ fn word_of(answer: &Result<Committed, AdmitRefusal>) -> String {
 struct SinkHost {
     store: Rc<MemoryStorage>,
     fails: RefCell<Option<String>>,
+    /// Bodies the host's unit refuses with this word (run, nothing written).
+    refuses: RefCell<HashMap<String, AdmitRefusal>>,
     heard: RefCell<Vec<Heard>>,
     /// Each body the host ran as a unit, in order.
     ran: RefCell<Vec<String>>,
@@ -168,6 +170,9 @@ impl GaspFinalizeHost for SinkHost {
         resolved: Option<Vec<u8>>,
     ) -> Result<Committed, AdmitRefusal> {
         self.ran.borrow_mut().push(body.walked.txid.clone());
+        if let Some(refusal) = self.refuses.borrow().get(&body.walked.txid) {
+            return Err(refusal.clone());
+        }
         if let Some(bytes) = resolved {
             self.store.cache_admission_beef(&body.walked.beef, bytes)?;
         }
@@ -210,6 +215,28 @@ impl GaspFinalizeHost for SinkHost {
             .borrow_mut()
             .push((graph.root.to_string(), landed, held));
         matches!(outcome, GraphOutcome::AllLanded { .. })
+    }
+}
+
+/// [`SinkHost`] with the engine's default `graph_done` (the cursor's rule).
+struct DefaultDone(Rc<SinkHost>);
+
+#[async_trait(?Send)]
+impl GaspFinalizeHost for DefaultDone {
+    async fn admit(
+        &self,
+        body: &FinalizeBody<'_>,
+        resolved: Option<Vec<u8>>,
+    ) -> Result<Committed, AdmitRefusal> {
+        self.0.admit(body, resolved).await
+    }
+    fn answered(
+        &self,
+        body: &FinalizeBody<'_>,
+        answer: &Result<Committed, AdmitRefusal>,
+        gate: Option<&GateReason>,
+    ) {
+        self.0.answered(body, answer, gate);
     }
 }
 
@@ -261,6 +288,19 @@ async fn run_in(
     mode: Option<AdmissionMode>,
     budgeted: bool,
 ) -> Ran {
+    run_with(beside, &[], ticks, mode, budgeted).await
+}
+
+/// [`run_in`], the host's unit refusing on tick `i` the bodies `refuses[i]`
+/// names with their words, and the host's `graph_done` the engine's default
+/// when `refuses` is not empty.
+async fn run_with(
+    beside: bool,
+    refuses: &[Vec<(String, AdmitRefusal)>],
+    ticks: &[Option<String>],
+    mode: Option<AdmissionMode>,
+    budgeted: bool,
+) -> Ran {
     let (mut txs, mut nodes) = fan_in();
     if beside {
         let x = beside_x();
@@ -281,14 +321,22 @@ async fn run_in(
     }
     let host = Rc::new(SinkHost::new(&store));
     if let Some(mode) = mode {
-        engine.set_gasp_finalize_host(host.clone());
+        if refuses.is_empty() {
+            engine.set_gasp_finalize_host(host.clone());
+        } else {
+            engine.set_gasp_finalize_host(Rc::new(DefaultDone(host.clone())));
+        }
         engine.set_admission_mode(mode).unwrap();
     }
     let mut results = Vec::new();
     let mut heard = Vec::new();
     let mut cursors = Vec::new();
-    for fails in ticks {
+    for (tick, fails) in ticks.iter().enumerate() {
         *host.fails.borrow_mut() = fails.clone();
+        *host.refuses.borrow_mut() = refuses
+            .get(tick)
+            .map(|r| r.iter().cloned().collect())
+            .unwrap_or_default();
         let result = engine.start_gasp_sync().await.unwrap();
         let mut topics: Vec<_> = result.topics_synced.iter().collect();
         topics.sort_by_key(|(topic, _)| topic.as_str());
@@ -512,6 +560,113 @@ async fn s1b_a_healthy_graph_under_on_is_the_off_runs_and_off_never_asks_the_hos
                 sorted(&off.submits)
             ),
         );
+    }
+}
+
+/// A deterministic refusal of the host's unit (a terminal word).
+fn terminal(txid: &str) -> AdmitRefusal {
+    AdmitRefusal::Deterministic {
+        topic: TOPIC.into(),
+        site: "the host's unit".into(),
+        reason: format!("{} is refused for good", &txid[..12]),
+        notes: vec![],
+        refused_parent: None,
+    }
+}
+
+/// The seam lens's L3, the cursor's rule under `on` with the default
+/// `graph_done`: a graph whose every held body is held by a TERMINAL word
+/// (`Lookup`, `Deterministic`: its own, or a parent's the gate passed on)
+/// lets the cursor pass it once every other body is landed; a body held `not
+/// now` (or transient) holds the cursor below the graph, so the peer's next
+/// sync re-sends it. The fan-in with `x` listed above its root: the host
+/// refuses `a` for good, `b` lands, `r` is refused with `a`'s word, `x` lands,
+/// and the cursor passes both UTXOs (2) on the first tick; the next tick
+/// re-sends nothing. With `b` refused `not now` beside it, the cursor stays
+/// below the root (0) and the next tick re-sends the graph.
+#[tokio::test]
+async fn s3_a_terminal_refusal_lets_the_cursor_pass_its_graph_and_not_now_holds_it() {
+    let (txs, _) = fan_in();
+    let [a, b, r] = [0, 1, 2].map(|i| txs[i].id());
+    let x = beside_x().id();
+    for budgeted in [false, true] {
+        let only = vec![
+            vec![(a.clone(), terminal(&a))],
+            vec![(a.clone(), terminal(&a))],
+        ];
+        let on = run_with(
+            true,
+            &only,
+            &[None, None],
+            Some(AdmissionMode::On),
+            budgeted,
+        )
+        .await;
+        print_heard(&format!("S3 terminal budgeted={budgeted}"), &on);
+        println!("S3 terminal budgeted={budgeted} cursors {:?}", on.cursors);
+        let words: HashMap<_, _> = on.heard[0]
+            .iter()
+            .map(|h| (h.txid.clone(), (h.word.clone(), h.gate.clone())))
+            .collect();
+        assert!(
+            words[&a].0.starts_with("refused: the host's unit"),
+            "{words:?}"
+        );
+        assert_eq!(words[&b].0, "landed");
+        assert_eq!(
+            words[&r],
+            (
+                format!(
+                    "refused: parent {a} was refused: the host's unit: {} is refused for good",
+                    &a[..12]
+                ),
+                Some(GateReason::WaitingOn(vec![a.clone()]))
+            ),
+            "the root is refused with the parent's terminal word"
+        );
+        assert_eq!(words[&x].0, "landed");
+        assert_eq!(
+            on.cursors,
+            vec![2, 2],
+            "a graph held by terminal words alone lets the cursor pass it"
+        );
+        assert_eq!(
+            on.heard[1],
+            Vec::<Heard>::new(),
+            "the next tick re-sends nothing"
+        );
+
+        let mixed = vec![
+            vec![
+                (a.clone(), terminal(&a)),
+                (b.clone(), AdmitRefusal::not_now("the host's unit", "later")),
+            ],
+            vec![(a.clone(), terminal(&a))],
+        ];
+        let on = run_with(
+            true,
+            &mixed,
+            &[None, None],
+            Some(AdmissionMode::On),
+            budgeted,
+        )
+        .await;
+        print_heard(&format!("S3 mixed budgeted={budgeted}"), &on);
+        println!("S3 mixed budgeted={budgeted} cursors {:?}", on.cursors);
+        assert_eq!(
+            on.cursors,
+            vec![0, 2],
+            "a body held not now holds the cursor below its graph; once it lands the graph passes"
+        );
+        let resent: Vec<_> = on.heard[1].iter().map(|h| h.txid.clone()).collect();
+        assert!(
+            resent.contains(&b),
+            "the next tick re-sends the graph and b lands: {:?}",
+            on.heard[1]
+        );
+        assert!(on.heard[1]
+            .iter()
+            .any(|h| h.txid == b && h.word == "landed"));
     }
 }
 
