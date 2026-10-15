@@ -319,16 +319,27 @@ pub fn latch_present_tip(height: u64) {
     });
 }
 
+/// bsv-low #669 NOTE-6 (the FIX-669 lens): PURE — the cache-HIT decision [`present_tip`] makes (and so the owed
+/// read's hop-stranded freshness gate, which reads its tip through `present_tip`) before any chaintracks call. A
+/// cached `(height, expiry_ms)` entry is a hit iff it has not expired (`now_ms < expiry`): a PRIMED isolate returns
+/// the held tip with zero subrequests; a COLD (empty) or expired isolate returns `None` and `present_tip` falls to
+/// CHAINTRACKS. Extracted so a host test can pin the primed-vs-cold behavior directly (the brittle `include_str!`
+/// source-grep the lens flagged is replaced by this behavioral pin in `owed.rs`).
+pub(crate) fn tip_cache_hit(entry: Option<(u64, f64)>, now_ms: f64) -> Option<u64> {
+    match entry {
+        Some((h, exp)) if now_ms < exp => Some(h),
+        _ => None,
+    }
+}
+
 /// The present height: cached per isolate ([`PRESENT_TIP_TTL_MS`] = 30 s), else fetched through the CHAINTRACKS
 /// binding; a fetch fault falls back to a stale held value, latched by the `tip-changed` webhook. bsv-low #669: the
-/// owed read routes its hop-stranded freshness-gate tip read through this cache, so the gate costs nothing per
-/// request in the steady state (strictly cheaper than the uncached `chaintracks_present_height`).
+/// owed read routes its hop-stranded freshness-gate tip read through this cache ([`tip_cache_hit`]), so the gate
+/// costs nothing per request in the steady state (strictly cheaper than the uncached `chaintracks_present_height`).
 pub async fn present_tip(env: &Env) -> Option<u64> {
     let now = worker::Date::now().as_millis() as f64;
-    if let Some((h, exp)) = PRESENT_TIP.with(|c| c.get()) {
-        if now < exp {
-            return Some(h);
-        }
+    if let Some(h) = tip_cache_hit(PRESENT_TIP.with(|c| c.get()), now) {
+        return Some(h);
     }
     match crate::routes::chaintracks_present_height_env(env, "beef-guard").await {
         Ok(h) => {

@@ -10422,6 +10422,12 @@ pub(crate) mod tests {
     /// with a claimable stranded hop, one tip: each admits ≤ the ceiling per window + exactly one reserved deferred
     /// walk (the #648 ceiling+1), past which the read sheds. Nothing per request on the read path beyond the 30-s
     /// isolate-cached tip (`beef_guard::present_tip`), never the uncached `chaintracks_present_height`.
+    ///
+    /// bsv-low #669 NOTE-6 (the FIX-669 lens): the tip-cache part is now a BEHAVIORAL pin through the production
+    /// reader (`beef_guard::tip_cache_hit`, the exact cache-hit decision `present_tip` makes), primed vs cold —
+    /// replacing the brittle `include_str!` source-grep slice. A HARDENED structural belt (the owed read references
+    /// `present_tip` + `HopStranded`) is kept, but its end-marker is now REQUIRED (`.expect`), so a renamed
+    /// `gather_result_entries` fails loudly instead of silently widening the slice to the rest of the file.
     #[test]
     fn pin669_a4_the_budget_holds_and_the_read_reads_the_cached_tip() {
         let mut rate = RecomputeRate::default();
@@ -10452,13 +10458,39 @@ pub(crate) mod tests {
                 OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW
             );
         }
-        // the read path's tip for a hop-stranded row is the isolate cache, read at most once per 30 s, not a
-        // per-request chaintracks call
+        // NOTE-6 behavioral pin: the owed read's hop-stranded freshness-gate tip is `beef_guard::present_tip`, whose
+        // per-isolate 30-s cache decides a HIT through `tip_cache_hit`. PRIMED (a latched, unexpired entry) returns
+        // the held tip with ZERO subrequests; COLD (empty) or EXPIRED returns None and `present_tip` falls to
+        // chaintracks (at most one such call per 30 s per isolate — strictly cheaper than a per-request uncached
+        // read). TTL is 30 s (`beef_guard::PRESENT_TIP_TTL_MS`); `now` is an arbitrary isolate clock.
+        let now = 1_792_000_000_000.0;
+        assert_eq!(
+            crate::beef_guard::tip_cache_hit(Some((971_115, now + 30_000.0)), now),
+            Some(971_115),
+            "a primed, unexpired isolate serves the owed read's tip from cache with zero chaintracks calls"
+        );
+        assert_eq!(
+            crate::beef_guard::tip_cache_hit(Some((971_115, now - 1.0)), now),
+            None,
+            "an EXPIRED entry is a miss: present_tip re-reads chaintracks (self-heals to the new tip)"
+        );
+        assert_eq!(
+            crate::beef_guard::tip_cache_hit(None, now),
+            None,
+            "a COLD isolate is a miss: present_tip reads chaintracks once, then caches"
+        );
+        // Hardened structural belt (NOT the behavioral proof — A1/A2/A3/D6/M1 are): the owed read still WIRES the
+        // cached tip for a claimable hop-stranded row. The end-marker is REQUIRED, so a renamed `gather_result_
+        // entries` is a loud RED here, never a silent widening of the slice to the rest of the file (the lens's
+        // brittleness).
         let code = include_str!("routes.rs");
-        let read = &code[code.find("pub async fn owed(req:").expect("the owed read")..];
-        let read = &read[..read
+        let owed_start = code
+            .find("pub async fn owed(req:")
+            .expect("the owed read handler");
+        let owed_end = code[owed_start..]
             .find("\nasync fn gather_result_entries")
-            .unwrap_or(read.len())];
+            .expect("owed read end marker `gather_result_entries` renamed; re-anchor this pin");
+        let read = &code[owed_start..owed_start + owed_end];
         assert!(
             read.contains("beef_guard::present_tip"),
             "the owed read's tip must be the 30-s isolate cache, not the uncached chaintracks_present_height"
