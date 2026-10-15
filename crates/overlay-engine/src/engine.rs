@@ -9,6 +9,10 @@
 use crate::beef_limits;
 
 mod atomic;
+#[cfg(feature = "gasp-shadow")]
+mod gasp_on;
+#[cfg(feature = "gasp-shadow")]
+mod gasp_shadow;
 
 use bsv_rs::transaction::{Beef, Transaction};
 use serde::{Deserialize, Serialize};
@@ -124,6 +128,30 @@ pub struct Engine {
     /// door's [`DoorBudget`], [`DoorBudget::DEFAULT`] unless set. See
     /// [`Engine::set_walk_budget`].
     walk_budget: DoorBudget,
+    /// GASP's shadow under `admit_graph` (bsv-low #657, R7.7 item 5; the
+    /// cargo feature `gasp-shadow`, default off, so an `off` build links none
+    /// of it): `Off` unless set, and then nothing of it runs. See
+    /// [`Engine::set_gasp_shadow`].
+    #[cfg(feature = "gasp-shadow")]
+    admission_mode: crate::gasp_shadow::AdmissionMode,
+    #[cfg(feature = "gasp-shadow")]
+    gasp_shadow: Option<std::rc::Rc<dyn crate::gasp_shadow::GaspShadow>>,
+    /// The GASP finalize's host under `on` (the a17 seam). See
+    /// [`Engine::set_gasp_finalize_host`].
+    #[cfg(feature = "gasp-shadow")]
+    gasp_finalize: Option<std::rc::Rc<dyn crate::gasp_shadow::GaspFinalizeHost>>,
+    #[cfg(feature = "gasp-shadow")]
+    shadow_budget: crate::gasp_shadow::ShadowBudget,
+    /// The comparisons a peer's sync queued, run after it (outside its race).
+    #[cfg(feature = "gasp-shadow")]
+    shadow_jobs: std::cell::RefCell<Vec<gasp_shadow::ShadowJob>>,
+    /// The topic managers' errors while a shadow comparison captures them
+    /// (`None`: not capturing, nothing is kept).
+    #[cfg(feature = "gasp-shadow")]
+    manager_errors: std::cell::RefCell<Option<Vec<String>>>,
+    /// The shadow's snapshots alive (taken, not yet compared or dropped).
+    #[cfg(feature = "gasp-shadow")]
+    shadow_held: std::rc::Rc<std::cell::Cell<usize>>,
     config: EngineConfig,
 }
 
@@ -1119,8 +1147,80 @@ impl Engine {
             landing_guard: None,
             verify_scripts: true,
             walk_budget: DoorBudget::DEFAULT,
+            #[cfg(feature = "gasp-shadow")]
+            admission_mode: crate::gasp_shadow::AdmissionMode::Off,
+            #[cfg(feature = "gasp-shadow")]
+            gasp_shadow: None,
+            #[cfg(feature = "gasp-shadow")]
+            gasp_finalize: None,
+            #[cfg(feature = "gasp-shadow")]
+            shadow_budget: crate::gasp_shadow::ShadowBudget::default(),
+            #[cfg(feature = "gasp-shadow")]
+            shadow_jobs: std::cell::RefCell::default(),
+            #[cfg(feature = "gasp-shadow")]
+            manager_errors: std::cell::RefCell::default(),
+            #[cfg(feature = "gasp-shadow")]
+            shadow_held: std::rc::Rc::default(),
             config,
         }
+    }
+
+    /// GASP's shadow under `admit_graph` (bsv-low #657, R7.7 item 5; see
+    /// [`crate::gasp_shadow`]). Under [`crate::gasp_shadow::AdmissionMode::Shadow`]
+    /// every GASP finalize body and graph is compared on a fresh snapshot the
+    /// `host` takes, and one census row each is handed to it; the served
+    /// finalize is unchanged. Under `Off` the host is never asked. The mode
+    /// is set as [`Engine::set_admission_mode`] sets it (`On` refused where
+    /// no finalize host is set; the host is kept either way).
+    #[cfg(feature = "gasp-shadow")]
+    pub fn set_gasp_shadow(
+        &mut self,
+        mode: crate::gasp_shadow::AdmissionMode,
+        host: std::rc::Rc<dyn crate::gasp_shadow::GaspShadow>,
+    ) -> Result<(), crate::gasp_shadow::AdmissionModeRefused> {
+        self.gasp_shadow = Some(host);
+        self.set_admission_mode(mode)
+    }
+
+    /// The host seam of the GASP finalize under
+    /// [`crate::gasp_shadow::AdmissionMode::On`] (bsv-low #657, the a17
+    /// lane): each finalized graph's bodies are handed to `host` through the
+    /// dependency gate, one at a time, and the engine's own finalize submit
+    /// does not run. Asked only under `On`.
+    #[cfg(feature = "gasp-shadow")]
+    pub fn set_gasp_finalize_host(
+        &mut self,
+        host: std::rc::Rc<dyn crate::gasp_shadow::GaspFinalizeHost>,
+    ) {
+        self.gasp_finalize = Some(host);
+    }
+
+    /// The mode the engine's GASP finalize runs under. `On` is refused
+    /// ([`crate::gasp_shadow::AdmissionModeRefused::NoFinalizeHost`], the
+    /// mode unchanged) where no finalize host is set.
+    #[cfg(feature = "gasp-shadow")]
+    pub fn set_admission_mode(
+        &mut self,
+        mode: crate::gasp_shadow::AdmissionMode,
+    ) -> Result<(), crate::gasp_shadow::AdmissionModeRefused> {
+        if mode == crate::gasp_shadow::AdmissionMode::On && self.gasp_finalize.is_none() {
+            return Err(crate::gasp_shadow::AdmissionModeRefused::NoFinalizeHost);
+        }
+        self.admission_mode = mode;
+        Ok(())
+    }
+
+    /// The allowance of one shadow comparison (the slice's: 4,096 rows,
+    /// 16 MiB and 2,000 ms unless set).
+    #[cfg(feature = "gasp-shadow")]
+    pub fn set_gasp_shadow_budget(&mut self, budget: crate::gasp_shadow::ShadowBudget) {
+        self.shadow_budget = budget;
+    }
+
+    /// The mode the engine's GASP shadow runs under.
+    #[cfg(feature = "gasp-shadow")]
+    pub fn admission_mode(&self) -> crate::gasp_shadow::AdmissionMode {
+        self.admission_mode
     }
 
     /// Set the ARC broadcaster for network broadcast to miners.
@@ -3555,7 +3655,7 @@ impl Engine {
             .collect::<Vec<u8>>();
         // Under a finalize submit's bound a manager that does not answer
         // is a manager that failed: nothing is written for the topic.
-        bounded(
+        let judged = bounded(
             bound,
             manager.identify_admissible_outputs(
                 // The ONE engine parse of the submitted BEEF, shared by
@@ -3572,7 +3672,14 @@ impl Engine {
         )
         .await
         .map_err(TopicManagerError::Other)
-        .and_then(|judged| judged)
+        .and_then(|judged| judged);
+        // GASP's shadow: a manager's error is named on the census row (the
+        // shadow lens's MEDIUM 2). Only while a comparison captures it.
+        #[cfg(feature = "gasp-shadow")]
+        if let Err(e) = &judged {
+            self.note_manager_error(topic, e);
+        }
+        judged
     }
 
     /// Whether the door may land a carried predecessor into `topic` (the
@@ -5131,6 +5238,11 @@ impl Engine {
             });
         }
 
+        // GASP's shadow: the comparisons a sync the caller dropped left queued
+        // go with it, their snapshots dropped.
+        #[cfg(feature = "gasp-shadow")]
+        self.shadow_jobs.borrow_mut().clear();
+
         let mut topics_synced: HashMap<String, TopicSyncResult> = HashMap::new();
         // Resolve SLAP providers once per invocation, sharing their host cap
         // across all SHIP topics. Every topic still queries each lookup host.
@@ -5618,6 +5730,16 @@ impl Engine {
             topics_synced.len()
         );
 
+        // GASP's shadow (bsv-low #657, R7.7 item 5; the shadow lens's LOW
+        // 4): the comparisons every peer's finalize queued run here, once,
+        // after every served write of the sync (each peer's race, cursor and
+        // health rows), so their time delays no peer, topic or served write.
+        // Inside a caller's race of this sync (the Worker's 240 s belt) they
+        // are the last thing cut. `Off` skips.
+        #[cfg(feature = "gasp-shadow")]
+        if self.gasp_shadow_host().is_some() {
+            self.drain_gasp_shadow().await;
+        }
         Ok(GASPSyncResult { topics_synced })
     }
 
@@ -5651,6 +5773,15 @@ impl Engine {
         topic: &str,
         submitted: &std::cell::Cell<u64>,
     ) -> bool {
+        // Under `on` the graphs are the host's (the a17 seam): the engine's
+        // own submit below does not run. Under `off` and `shadow` nothing
+        // here awaits.
+        #[cfg(feature = "gasp-shadow")]
+        if let Some(host) = self.gasp_finalize_host() {
+            return self
+                .finalize_on(host, sink, peer_url, topic, submitted)
+                .await;
+        }
         let finalized: Vec<_> = sink
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5659,12 +5790,29 @@ impl Engine {
 
         let mut all_landed = true;
         for graph in &finalized {
+            // GASP's shadow (bsv-low #657, R7.7 item 5; the cargo feature
+            // `gasp-shadow`): under `Shadow` only, a snapshot before the
+            // graph and before each body, the served word and rows queued;
+            // under `Off` nothing here runs or awaits.
+            #[cfg(feature = "gasp-shadow")]
+            let mut shadow = match self.gasp_shadow_host() {
+                Some(host) => Some(self.shadow_graph_begin(host, peer_url, graph).await),
+                None => None,
+            };
             for (position, beef_bytes) in graph.beefs.iter().enumerate() {
                 self.finalize_gate.stop_if_due().await;
                 if position == 0 {
                     submitted.set(submitted.get() + 1);
                 }
                 let tagged = TaggedBEEF::new(beef_bytes.clone(), vec![graph.topic.clone()]);
+                #[cfg(feature = "gasp-shadow")]
+                let body_snapshot = match &shadow {
+                    Some(shadow) => {
+                        self.shadow_body_begin(shadow, position, std::slice::from_ref(beef_bytes))
+                            .await
+                    }
+                    None => None,
+                };
                 // No deadline drops a write section, and the section does
                 // not drop ITSELF either (bsv-low #559, the delta lens's
                 // DELTA-3 and the lens fold of 2026-10-07, F2,
@@ -5689,7 +5837,7 @@ impl Engine {
                     )
                     .await
                 };
-                let not_landed = match outcome {
+                let not_landed = match &outcome {
                     Ok((_, report)) => {
                         let landed = report.is_durable()
                             && (report.applied_topics.contains(&graph.topic)
@@ -5704,14 +5852,37 @@ impl Engine {
                     }
                     Err(e) => Some(e.to_string()),
                 };
+                #[cfg(feature = "gasp-shadow")]
+                if let Some(shadow) = shadow.as_mut() {
+                    self.shadow_body_served(
+                        shadow,
+                        body_snapshot,
+                        position,
+                        beef_bytes,
+                        &outcome,
+                        not_landed.as_deref(),
+                    );
+                }
                 if let Some(why) = not_landed {
                     warn!(
                         "[GASP SYNC] A finalize submit for topic {} did not land ({why}); the rest of its graph is not submitted",
                         graph.topic
                     );
                     all_landed = false;
+                    #[cfg(feature = "gasp-shadow")]
+                    if let Some(shadow) = shadow.as_mut() {
+                        shadow.stopped(beef_bytes);
+                    }
                     break;
                 }
+                #[cfg(feature = "gasp-shadow")]
+                if let Some(shadow) = shadow.as_mut() {
+                    shadow.landed(beef_bytes);
+                }
+            }
+            #[cfg(feature = "gasp-shadow")]
+            if let Some(shadow) = shadow {
+                self.shadow_graph_served(shadow, &graph.beefs).await;
             }
         }
 

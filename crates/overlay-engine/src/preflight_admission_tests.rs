@@ -688,7 +688,9 @@ async fn a1_b_typed_refusal_rolls_back_siblings_and_rechecks_reused_engine() {
             .unwrap();
         let mut previous = None;
         for _ in 0..2 {
-            let LogError::Refused(AdmitRefusal::Lookup { refused, notes }) =
+            let LogError::Refused(AdmitRefusal::Lookup {
+                refused, notes, ..
+            }) =
                 store.admit(&engine, &walked).unwrap_err()
             else {
                 panic!("lookup refusal lost its typed records");

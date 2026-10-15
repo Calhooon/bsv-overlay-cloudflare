@@ -5,7 +5,7 @@
 # in parity mode + runs the differential harness + writes PARITY_REPORT.md.
 # Exit is non-zero on any un-noted divergence.
 
-.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ownership \
+.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ownership gasp-shadow-size \
         wrangler-dev harness test e2e-bsv-storage clean help
 
 help:
@@ -22,6 +22,7 @@ help:
 	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c and NL-6d)"
 	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; four ports: :LANE_BASE+9 app layer, +10 overlay, +11 the e649 delivering overlay, +12 its mock app layer)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
+	@echo "  gasp-shadow-size The raw Worker wasm with the gasp-shadow feature off against A1 9d5a75a, and on (bsv-low #657)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
 
 ## -- Reference stack (TS overlay-express 2.2.0 + Mongo + MySQL in Docker) -----
@@ -129,6 +130,13 @@ ci:
 	$(MAKE) ci-deploy; \
 	$(MAKE) ci-route; \
 	echo "✅ local CI green"
+
+# bsv-low #657, the GASP shadow lens's MEDIUM 1: the shadow is the engine's
+# cargo feature `gasp-shadow`, default off. The raw Worker wasm with it off
+# against A1's (`9d5a75a`), within 4096 B and none of the shadow's names, and
+# with it on (the names linked). Three cold-ish release wasm builds.
+gasp-shadow-size:
+	@bash scripts/check-gasp-shadow-size.sh
 
 # bsv-low #474: the shared D1's ownership manifest. Every SQL statement of the
 # overlay, discovery and app-layer crates against storage-ownership.json (prose:
@@ -589,6 +597,13 @@ ci-d1-budget:
 # cost ~0 here) and they give a clean compile error with no toolchain-install
 # or npx noise in front of it — and they are the only wasm coverage that
 # survives if this target ever has to be skipped offline.
+#
+# bsv-low #657 (the GASP shadow lens's MEDIUM 1): the engine's GASP shadow is
+# the cargo feature `gasp-shadow`, default off, so the three configs build
+# without it. A fourth dry run builds `wrangler.low.toml` with it ON (a copy of
+# the config whose build command adds `--features gasp-shadow`, removed after),
+# so the build a shadow host needs is proven deployable too. Each line prints
+# its bundle's wasm bytes.
 DEPLOY_CONFIGS ?= crates/overlay-cloudflare:wrangler.toml \
                   crates/overlay-cloudflare:wrangler.low.toml \
                   crates/low-app-layer:wrangler.toml
@@ -625,13 +640,18 @@ ci-deploy:
 	fi; \
 	echo "→ ci-deploy preflight ok: worker $$vers, worker-build ^$$pins, 3 configs"; \
 	out=$$(mktemp -d /tmp/ci-deploy.XXXXXX); \
-	trap 'rm -rf "$$out"' EXIT; \
-	for cfg in $(DEPLOY_CONFIGS); do \
+	shadow=crates/overlay-cloudflare/.gasp-shadow.wrangler.low.toml; \
+	trap 'rm -rf "$$out" "$$shadow"' EXIT; \
+	sed 's/worker-build --release"$$/worker-build --release --features gasp-shadow"/' \
+	    crates/overlay-cloudflare/wrangler.low.toml > "$$shadow"; \
+	grep -q -- '--features gasp-shadow"$$' "$$shadow"; \
+	for cfg in $(DEPLOY_CONFIGS) crates/overlay-cloudflare:.gasp-shadow.wrangler.low.toml; do \
 	  d=$${cfg%%:*}; f=$${cfg##*:}; \
 	  printf '→ deploy dry-run %s/%s … ' "$$d" "$$f"; \
+	  rm -rf "$$out/bundle"; \
 	  if ( cd "$$d" && npx wrangler deploy --config "$$f" --dry-run \
 	         --outdir "$$out/bundle" ) > "$$out/log" 2>&1; then \
-	    echo "ok"; \
+	    echo "ok ($$(find "$$out/bundle" -name '*.wasm' -exec wc -c {} + | awk 'END {print $$1}') B wasm)"; \
 	  else \
 	    echo "FAILED"; \
 	    echo "✗ ci-deploy: $$d/$$f does not build for DEPLOY. Nothing else in"; \
@@ -643,7 +663,7 @@ ci-deploy:
 	    exit 1; \
 	  fi; \
 	done; \
-	echo "✅ ci-deploy: all 3 deployable configs built through the real worker-build"
+	echo "✅ ci-deploy: all 3 deployable configs built through the real worker-build, and low-overlay with gasp-shadow on"
 
 # `extensions-build` is gone (bsv-low #553 lens L2): `bsv-overlay-cloudflare` has no `extensions` cargo feature, so the target could only fail; the superset is the RUNTIME var ENABLE_EXTENSIONS=true, compiled into every build.
 

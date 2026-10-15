@@ -22,6 +22,14 @@ workspace = "../../workers"
 # skipped (the "running 0 tests" symptom).
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# GASP's shadow under `admit_graph` (bsv-low #657; the engine's feature of the
+# same name). Default OFF: no Worker sets a host or runs `ADMISSION_MODE=shadow`
+# today, and an `off` build links none of the shadow. The Worker that hosts it
+# builds with `worker-build --release --features gasp-shadow`
+# (`make ci-deploy` dry-runs `wrangler.low.toml` both ways).
+gasp-shadow = ["overlay-engine/gasp-shadow"]
+
 [build-dependencies]
 bsv-worker-build-info = { version = "0.1.5", path = "../worker-build-info", features = ["build"] }
 

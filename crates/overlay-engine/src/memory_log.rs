@@ -81,6 +81,40 @@ impl MemoryStorage {
         Ok(())
     }
 
+    /// The host's release of a resolved R2 object once its unit returned
+    /// (the a9 lane's one-body bound: the log holds one body's bytes).
+    pub fn release_admission_beef(&self, key: &str) {
+        self.admission_beefs.lock().unwrap().remove(key);
+    }
+
+    /// An isolated copy of every stored table and the log's committed state,
+    /// for a shadow that must apply nothing to this store. Fault and crash
+    /// switches, resolved objects and any open unit are not copied.
+    #[cfg(feature = "gasp-shadow")]
+    pub fn shadow_copy(&self) -> MemoryStorage {
+        let copy = MemoryStorage::new();
+        MemorySnapshot::take(self).restore(&copy);
+        copy
+    }
+
+    /// `(rows, bytes)` held: outputs, applied rows, stored BEEFs and the log's
+    /// manager rows; the BEEFs', scripts' and rows' bytes.
+    #[cfg(feature = "gasp-shadow")]
+    pub fn shadow_size(&self) -> (usize, usize) {
+        let outputs = self.outputs.lock().unwrap();
+        let transactions = self.transactions.lock().unwrap();
+        let applied = self.applied.lock().unwrap().len();
+        let log = self.log.lock().unwrap();
+        let rows = outputs.len() + transactions.len() + applied + log.rows.len();
+        let bytes = outputs
+            .values()
+            .map(|o| o.output_script.len())
+            .chain(transactions.values().map(Vec::len))
+            .chain(log.rows.iter().map(|((t, k), v)| t.len() + k.len() + v.len()))
+            .sum();
+        (rows, bytes)
+    }
+
     /// One-shot fault seam. Counts every engine, manager and outbox write.
     fn write_pin(&self) -> Result<(), StorageError> {
         let mut fault = self.admission_fault.lock().unwrap();
@@ -302,6 +336,7 @@ impl MemoryStorage {
                     charge: walked.charge,
                     could_not_run: None,
                     predecessor_reads: walked.predecessor_reads.clone(),
+                    spends: None,
                 };
                 &carried_unit
             };

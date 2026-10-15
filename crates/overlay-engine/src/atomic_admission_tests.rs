@@ -696,6 +696,7 @@ async fn a1_statement_guard_catches_swallowed_manager_write() {
             site: "manager".into(),
             reason: "missing row after failed write".into(),
             notes: vec![],
+            refused_parent: None,
         })
     });
     assert!(matches!(
@@ -1186,8 +1187,11 @@ async fn a1_c3_admit_uses_storages_open_unit() {
     assert_eq!(store.log_head(), 1);
 }
 
+/// A1's C4 pinned the graph stopping at its first refusal. The owner's D44
+/// (`dependency gate`): the refused body is held and a body that does not
+/// spend it is judged as its own unit (here the first body again, a dedup).
 #[tokio::test]
-async fn a1_c4_graph_stops_at_first_refusal() {
+async fn a1_c4_graph_holds_a_refused_body_and_judges_the_rest() {
     let (engine, store, _, beef, _) = fixture().await;
     let mut first = beef.clone();
     first.topics = vec![PROOF.into()];
@@ -1201,8 +1205,10 @@ async fn a1_c4_graph_stops_at_first_refusal() {
         .unwrap();
     let stopped = second.txid.clone();
     let graph = [first.clone(), second, first];
+    // The third body is the first again: a dedup, judged, writing nothing.
     assert!(matches!(admit_graph(&engine, store.as_ref(), &graph),
-        GraphOutcome::StoppedAt { txid, landed, .. } if txid == stopped && landed == vec![1]));
+        GraphOutcome::Held { landed, held } if landed == vec![1, 1]
+            && held.len() == 1 && held[0].txid == stopped && held[0].gate.is_none()));
     assert_eq!(store.log_units().len(), 1);
     let committed = store
         .run_unit(

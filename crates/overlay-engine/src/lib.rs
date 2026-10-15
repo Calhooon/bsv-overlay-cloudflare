@@ -32,6 +32,8 @@ pub mod builder;
 pub mod engine;
 pub mod gasp;
 pub mod gasp_overlay;
+#[cfg(feature = "gasp-shadow")]
+pub mod gasp_shadow;
 pub mod health_checker;
 pub mod lookup_service;
 pub mod proof_window;
