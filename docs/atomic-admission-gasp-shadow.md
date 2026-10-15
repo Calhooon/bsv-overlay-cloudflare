@@ -736,3 +736,135 @@ w6 restated (`parse("on") == Ok(On)`; an unknown word still refused).
   through the seam, the fan-in under workerd, the chaos rows with the gate's
   words), a Worker host over D1 and R2, wasm32 time and memory of the hosted
   gate.
+
+## The seam lens's corrections taken (`lane/atomic-gasp-seam-host-2`)
+
+The lens of record on the host seam (`docs/atomic-admission-gasp-seam-host-lens.md`,
+`lane/atomic-gasp-seam-host-lens` at `602db56`, on `2ea647a`): ACCEPT WITH
+CORRECTIONS. The engine-side findings (M1, L1, L3, L4) are taken here, each a
+RED witness, then the fix, one commit each, on `lane/atomic-gasp-seam-host-2`
+(base `2ea647a`). H1, M2, M3, L2 and L5 are Zanaadu's (a20) and are not
+touched.
+
+| # | finding | taken | commits (RED, fix) |
+| --- | --- | --- | --- |
+| M1 | under `on` the engine holds the graph's bytes twice (the sink and the walked list); `d44_s3`'s peak is a counter | the gate is handed the walked bodies BARE; the body it is on is made whole from the sink for the host's calls and released after its answer; `d44_s3` renamed for what it counts | `5fae541`, `971a8ea` |
+| L1 | s1 asserts nothing of the cursor between ticks, and its peer's `score >= since` makes the re-send prove nothing | s1 lists an independent `x` above the root and reads the cursor after each tick | `bdb50ce` (a pin; RED against a mutant) |
+| L3 | the default `graph_done` holds the cursor below a graph with a terminal refusal for good | the default is `cursor_may_pass`: every body landed or held by a terminal word | `28a7323`, `abe8c52` |
+| L4 | `position` collapses a txid that appears twice in one graph | the position is the occurrence's (a vector parallel to the walked list, a body found by identity) | `0a81157`, `1dc31a6` |
+
+**M1, the one copy.** `finalize_on` still walks every body before the gate
+(the gate needs every body's txid and spends up front, and the walk's reads
+and words are unchanged), but keeps each `Walked` bare (`bare`: an inline
+body's BEEF and an R2 body's raw transactions dropped; key, hash, length,
+spends, evidence and every other field kept). `OnGraph` makes the body the
+gate is on whole again from the sink (`whole`: the carry `BeefCarry::from_beef`
+makes of those bytes, the walk's own rule) for `resolve`, `admit` and
+`answered`, keeps it between those calls and releases it after `answered`. The
+host is handed the same `Walked` as before (the a17-2 host's hop encodes it).
+The engine holds the sink and one body; an R2 body's `admit` also holds its
+resolved bytes, as before.
+
+The witness, `crates/overlay-integration-tests/tests/gasp_on_memory.rs` (its
+own test binary, a counting global allocator; the lens's scratch witness,
+kept): a proven genesis and 12 proven 256 KiB links (13 bodies, the graph's
+BEEFs about 3.15 MB), the peer listing the tip, the live heap sampled at every
+finalize judgement (the manager's non-dry call, the same manager in both
+modes):
+
+```
+RED (5fae541, the engine of 2ea647a):
+M1 off: [28438135, 29227808, 29752469, ... 35004805]
+M1 on:  [31623006, 33463736, 34513034, ... 45019526]
+M1 at the first judgement: on 31623006 B, off 28438135 B, on over off 3184871 B (one body 262225 B)
+green (971a8ea; 1dc31a6 the same within 1,240 B):
+M1 on:  [28477807, 30580700, 31629998, ... 42136490]
+M1 at the first judgement: on 28477807 B, off 28438135 B, on over off 39672 B (one body 262225 B)
+```
+
+The pin holds `on` within one body of `off` at the first judgement (the lens's
++3,183,983 B, here +3,184,871 B, is now +39,672 B; at the L4 tip +38,432 B).
+The per-body slope under `on` (about 1.05 MB a body against `off`'s 0.52 MB) is
+unchanged by the fix: it is the test host's memory log keeping its units'
+writes (`after_commit` intents and statements), the host's and not the
+engine's, as the lens read it; the pin asserts the first judgement for that
+reason.
+
+`d44_s3` is renamed `d44_s3_the_gate_resolves_each_carried_body_just_before_its_own_unit`
+and its words say what it counts: the RESOLVED bytes the host holds, not the
+heap. A caller of `admit_graph_hosted` (Zanaadu's log graph route) hands the
+gate its `Walked` list, whose R2 carries hold every body's raw transactions
+for the whole gate: that list is the caller's to hold, and the engine's own
+caller now hands it bare.
+
+**L1, the cursor between ticks.** s1 now runs the fan-in with an independent
+`x` listed at score 2 above the root `r` at 1, and reads the cursor after each
+tick: 0 after the erring tick (`x` landed, `r` held), 2 after the re-sync,
+`off` 2; `x`'s word and graph are asserted. A cursor moved past `r` no longer
+lists it, so the re-send now proves the hold. RED against the mutant that
+lets the cursor pass a held graph (`finalize_on` ignoring `graph_done`'s
+`false`), unbudgeted and on the hook's path: `after the erring tick the cursor
+stays below the held root (score 1), though x (score 2) landed, left: 2 right:
+0`; with that assertion taken out, `the re-sync lands the waiting part, left:
+[]`. s1 as it stood on `2ea647a` is green against the same mutant (run here).
+
+**L3, the cursor's rule under `on`.** `gasp_shadow::cursor_may_pass(outcome)`,
+the default of `GaspFinalizeHost::graph_done`: the cursor may pass a graph
+once every body of it landed or is held by a TERMINAL word (`Lookup`,
+`Deterministic`: its own, a walk refused 400, or a parent's the gate passed
+on); a body held `not now` or transient holds it, so the peer's next sync
+re-sends the graph. As the reference moves past a refused graph and the anchor
+check's refusal moves it. Witness s3 (`gasp_on_seam.rs`, the default
+`graph_done`, `x` beside, both paths): the host refuses `a` for good, `b`
+lands, `r` is refused `parent a was refused: ...`, `x` lands; RED on `971a8ea`:
+`a graph held by terminal words alone lets the cursor pass it, left: [0, 0]
+right: [2, 2]` (the graph re-sent and re-judged on the next tick); green
+`[2, 2]`, the next tick re-sends nothing. Its second half: `b` refused `not
+now` beside `a`'s terminal word holds the cursor at 0; the next tick re-sends
+the graph, `b` lands, the cursor 2. A host that overrides `graph_done`
+(a17-2's `GaspHost`: `matches!(outcome, AllLanded { .. })`) keeps the old rule
+until it calls `cursor_may_pass`: that is a20's.
+
+**L4, one place per occurrence.** A GASP graph carries a txid once per NODE,
+and a transaction is a node once per output the graph spends of it; the
+finalize hands on one BEEF per node and drops no repeat (as the reference,
+"The assembly and the two limbs" in `CLAUDE.md`). So a graph does repeat a
+txid, and the fix is the position, not a refusal. `OnGraph` keeps each walked
+body's place in the sink in a vector parallel to the list the gate is handed
+and finds the body by identity (the gate hands each body by reference into
+that list). Witness s4: `c` spends `p.0` and `p.1`, so `p` is two bodies of a
+three-body graph. RED on `abe8c52`: `every place of the graph handed once,
+left: [0, 0, 2] right: [0, 1, 2]`; green: answered at `[0, 1, 2]`, each
+`FinalizeBody::beef()` the BEEF at its own place and its body's, `p` landing
+once and its second place `landed (dedup)`, on both paths.
+
+**Gates, on the tip of `lane/atomic-gasp-seam-host-2` (`1dc31a6`).**
+
+- `cargo test --workspace --features bsv-overlay-engine/memory-storage
+  --no-fail-fast`: **1,707 passed, 0 failed, 66 ignored** (105 result lines;
+  1,704 before, plus M1, s3, s4; s1 amended). With the feature off (`-p
+  overlay-integration-tests --no-default-features --test gasp_shadow_off
+  --test gasp_dependency_gate`): the eleven gate witnesses and
+  `gasp_shadow_off` green; the `off` recording
+  `431baab4e305582981b14370ed9ee36007a0a922e25341e9ca7c772192d4d112`, polls
+  `[57, 11, 54, 11]`, unchanged; the D44 re-sync digest `c1663764…` unchanged.
+- clippy with warnings denied (the root workspace all targets with
+  `memory-storage`; the engine all targets with no feature and with
+  `gasp-shadow,memory-storage`) and `cargo fmt --all -- --check`: clean.
+- **The wasm, raw release** (`bsv-overlay-cloudflare`, no path remap, as the
+  lens built it, both trees at THIS worktree's path, `2ea647a` checked out in
+  place): feature OFF `2ea647a` 8,989,118 B, this tip **8,989,118 B (+0 B**;
+  144 bytes differ, the same length: the engine crate's hash in mangled
+  names), none of `gasp_shadow`, `gasp_on`, `finalize_on`,
+  `admit_graph_hosted`, `walk_with_mode`. Feature ON: `2ea647a` 9,599,378 B,
+  this tip **9,539,411 B (-59,967 B)**; 101 `gasp_shadow` names, 18 `gasp_on`
+  (16). The lens's 8,986,373 B and 9,601,335 B were built at its own
+  worktree's path (a different length in every embedded path), so its figures
+  stand beside these, not against them. The feature-on shrink was not chased
+  (the txid map's `HashMap<String, usize>` is gone from `finalize_on`; the
+  gate-lens record shows how far LLVM's inlining moves a `gasp-shadow` build).
+- Not run in this lane: the Workers' workspace tests (no Worker crate
+  changed), `make ci-deploy`, `make gasp-shadow-size` (its `git archive` path
+  bias, stated above), any measure under workerd or wasm32 of the hosted
+  gate's heap, Zanaadu's a17-2 host against this tip (its `graph_done`
+  override, above).
