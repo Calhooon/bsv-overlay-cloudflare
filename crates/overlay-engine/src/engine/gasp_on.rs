@@ -13,27 +13,92 @@ use std::rc::Rc;
 
 /// One graph's [`GraphHost`]: the gate's calls, each with the body's place
 /// in its graph, handed to the engine's finalize host.
+///
+/// The graph's bytes live in the sink alone (`graph.beefs`; the seam lens's
+/// M1): the gate is handed the walked bodies BARE (an inline body's BEEF and
+/// an R2 body's raw transactions dropped, [`bare`]), and the one body the gate
+/// is on is made whole again from the sink ([`whole`]) for the host's calls
+/// and released after its answer, so the engine holds the sink and one body.
 struct OnGraph<'a> {
     engine: &'a Engine,
     host: &'a dyn GaspFinalizeHost,
     graph: &'a FinalizeGraph<'a>,
     positions: HashMap<String, usize>,
+    /// The body the gate is on, made whole, by its place in the sink.
+    current: std::cell::RefCell<Option<(usize, Walked)>>,
 }
 
 impl OnGraph<'_> {
-    fn body<'b>(&'b self, walked: &'b Walked) -> FinalizeBody<'b> {
+    fn position(&self, walked: &Walked) -> usize {
+        self.positions.get(&walked.txid).copied().unwrap_or(0)
+    }
+
+    fn body<'b>(&'b self, position: usize, walked: &'b Walked) -> FinalizeBody<'b> {
         FinalizeBody {
             graph: self.graph,
-            position: self.positions.get(&walked.txid).copied().unwrap_or(0),
+            position,
             walked,
         }
     }
+
+    /// `bare`'s body made whole from the sink: the one held since the gate's
+    /// last call for it, else made now.
+    fn take(&self, bare: &Walked) -> (usize, Walked) {
+        let position = self.position(bare);
+        match self.current.borrow_mut().take() {
+            Some((at, held)) if at == position => (position, held),
+            _ => (position, whole(bare, &self.graph.beefs[position])),
+        }
+    }
+
+    /// Keep the body the gate is on for its next call.
+    fn keep(&self, position: usize, walked: Walked) {
+        *self.current.borrow_mut() = Some((position, walked));
+    }
+}
+
+/// `walked` without its bytes: an inline body's BEEF and an R2 body's raw
+/// transactions dropped (the sink holds them), every other field kept.
+fn bare(mut walked: Walked) -> Walked {
+    walked.beef = match walked.beef {
+        BeefCarry::Inline(_) => BeefCarry::Inline(Vec::new()),
+        BeefCarry::R2 {
+            key, sha256, len, ..
+        } => BeefCarry::R2 {
+            key,
+            sha256,
+            len,
+            raw_txs: Vec::new(),
+        },
+    };
+    walked
+}
+
+/// A [`bare`] body made whole again from its BEEF in the sink: the carry the
+/// walk made of these bytes (`BeefCarry::from_beef`, the walk's own rule).
+fn whole(bare: &Walked, beef: &[u8]) -> Walked {
+    let mut walked = bare.clone();
+    walked.beef = match &bare.beef {
+        BeefCarry::Inline(_) => BeefCarry::Inline(beef.to_vec()),
+        BeefCarry::R2 { .. } => {
+            match beef_limits::parse_beef(beef, &beef_limits::ENGINE_BEEF_LIMITS) {
+                Ok(parsed) => BeefCarry::from_beef(beef, &parsed, &bare.txid),
+                // The walk parsed these very bytes: unreachable, and the host's
+                // verification of an R2 carry refuses an empty one.
+                Err(_) => bare.beef.clone(),
+            }
+        }
+    };
+    walked
 }
 
 #[async_trait::async_trait(?Send)]
 impl GraphHost for OnGraph<'_> {
     async fn resolve(&self, body: &Walked) -> Result<Vec<u8>, AdmitRefusal> {
-        self.host.resolve(&self.body(body)).await
+        let (position, walked) = self.take(body);
+        let resolved = self.host.resolve(&self.body(position, &walked)).await;
+        self.keep(position, walked);
+        resolved
     }
 
     async fn run(
@@ -41,11 +106,17 @@ impl GraphHost for OnGraph<'_> {
         body: &Walked,
         resolved: Option<Vec<u8>>,
     ) -> Result<Committed, AdmitRefusal> {
+        let (position, walked) = self.take(body);
         // The served finalize's rule: a due deadline stops the graph between
         // two bodies, never inside one's unit (one write section each).
         self.engine.finalize_gate.stop_if_due().await;
         let _writing = self.engine.finalize_gate.write_section();
-        self.host.admit(&self.body(body), resolved).await
+        let answer = self
+            .host
+            .admit(&self.body(position, &walked), resolved)
+            .await;
+        self.keep(position, walked);
+        answer
     }
 
     fn answered(
@@ -54,7 +125,10 @@ impl GraphHost for OnGraph<'_> {
         answer: &Result<Committed, AdmitRefusal>,
         gate: Option<&GateReason>,
     ) {
-        self.host.answered(&self.body(body), answer, gate);
+        // The body's last call: released when it returns.
+        let (position, walked) = self.take(body);
+        self.host
+            .answered(&self.body(position, &walked), answer, gate);
     }
 }
 
@@ -113,7 +187,7 @@ impl Engine {
                 {
                     Ok(body) => {
                         positions.entry(body.txid.clone()).or_insert(at);
-                        walked.push(body);
+                        walked.push(bare(body));
                     }
                     Err(e) => {
                         let txid = body_txid(beef);
@@ -136,6 +210,7 @@ impl Engine {
                 host: host.as_ref(),
                 graph: &done,
                 positions,
+                current: std::cell::RefCell::default(),
             };
             let outcome = admit_graph_hosted(&on, &walked, &unwalked).await;
             if !host.graph_done(&done, &outcome).await {

@@ -672,7 +672,8 @@ async fn d44_n3_the_gate_reads_the_walks_spends() {
 /// The host of the a9 lane's shape: the bodies' original BEEFs in its object
 /// store ("R2", by key), each read by `resolve`, handed into the memory log
 /// for that body's unit and released when the unit returns. It counts the
-/// resolved bytes it holds and their peak, and names each step.
+/// resolved bytes it holds and their peak (a counter of the resolver's
+/// bytes, not the heap), and names each step.
 struct R2Host<'a> {
     engine: &'a Engine,
     store: Rc<MemoryStorage>,
@@ -737,11 +738,16 @@ fn heavy(mut tx: Transaction, bytes: usize) -> Transaction {
 /// Item 3. The chain `g <- c <- d`, each body's BEEF 4 MiB (three R2
 /// carries), through `admit_graph_hosted` over a host whose resolver reads its
 /// object store: each body is resolved just before its own unit and released
-/// after it, so the host holds at most ONE body's bytes (the a9 lane's rule;
-/// the a17 record: a synchronous gate's caller must resolve them all first);
-/// a body the gate holds is never read (the erring `g`: `c` and `d` wait).
+/// after it, so the RESOLVED bytes the host holds are at most ONE body's (the
+/// a9 lane's rule; the a17 record: a synchronous gate's caller must resolve
+/// them all first); a body the gate holds is never read (the erring `g`: `c`
+/// and `d` wait). What this counts is the resolver's bytes, not the heap (the
+/// seam lens's M1): the `Walked` list the caller hands the gate carries each
+/// R2 body's raw transactions for the whole gate, the caller's to hold. The
+/// engine's own finalize under `on` hands the gate its bodies bare and is
+/// measured on the heap by `gasp_on_memory`'s M1 witness.
 #[tokio::test]
-async fn d44_s3_the_gate_resolves_each_carried_body_one_at_a_time() {
+async fn d44_s3_the_gate_resolves_each_carried_body_just_before_its_own_unit() {
     const MIB4: usize = 4 << 20;
     let g = heavy(genesis(80, 1), MIB4);
     let c = heavy(child(&g, 0, 1), MIB4);
@@ -777,13 +783,13 @@ async fn d44_s3_the_gate_resolves_each_carried_body_one_at_a_time() {
         let outcome = admit_graph_hosted(&host, &walked, &[]).await;
         let steps = host.steps.borrow().clone();
         println!(
-            "S3 fails={}: peak held {} B (one body {largest} B, the graph {total} B); steps {steps:?}",
+            "S3 fails={}: peak resolved bytes held {} B (one body {largest} B, the graph {total} B); steps {steps:?}",
             fails.is_some(),
             host.peak.get()
         );
         assert!(
             host.peak.get() <= largest,
-            "at most one body's bytes held at once: peak {} B, one body {largest} B, the graph {total} B",
+            "at most one body's resolved bytes held at once: peak {} B, one body {largest} B, the graph {total} B",
             host.peak.get()
         );
         assert_eq!(host.held.get(), 0, "every resolved body released");
