@@ -610,6 +610,76 @@ pub fn couriers_view(counters: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+/// bsv-low #668 (the observability bar): a histogram quantile over `(upper_bound_ms, count)` buckets sorted
+/// ascending (`u64::MAX` is the `+Inf` bucket). Returns the upper bound of the bucket the q-th sample falls in
+/// (Prometheus-style). A quantile that lands in the `+Inf` bucket reports the largest FINITE bound as a lower
+/// estimate (the real value is unbounded above it). Empty or zero-total reports 0.
+pub fn push_latency_quantile(buckets: &[(u64, u64)], q: f64) -> u64 {
+    let total: u64 = buckets.iter().map(|(_, c)| c).sum();
+    if total == 0 {
+        return 0;
+    }
+    let target = (q * total as f64).ceil().max(1.0) as u64;
+    let mut cum = 0u64;
+    for &(bound, c) in buckets {
+        cum += c;
+        if cum >= target {
+            if bound == u64::MAX {
+                return buckets
+                    .iter()
+                    .rev()
+                    .map(|(b, _)| *b)
+                    .find(|b| *b != u64::MAX)
+                    .unwrap_or(0);
+            }
+            return bound;
+        }
+    }
+    0
+}
+
+/// bsv-low #668 (step 0 / the observability bar): the pots-room push counters and the push-latency p50/p95
+/// derived from the `pots_push_latency_ms_le_<bound>_total` bucket counters the app layer emits. The bucket
+/// bounds are read FROM the counter names (the overlay never needs to know the app layer's bucket list), so the
+/// two crates stay decoupled. `latencyMsP50`/`_P95` are app-layer-measured (the hook's answer to the relay's 2xx).
+pub fn pots_push_view(counters: &serde_json::Value) -> serde_json::Value {
+    let get = |k: &str| {
+        counters
+            .get(k)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let mut buckets: Vec<(u64, u64)> = Vec::new();
+    if let Some(obj) = counters.as_object() {
+        for (name, val) in obj {
+            if let Some(rest) = name
+                .strip_prefix("pots_push_latency_ms_le_")
+                .and_then(|r| r.strip_suffix("_total"))
+            {
+                let bound = if rest == "inf" {
+                    u64::MAX
+                } else {
+                    match rest.parse::<u64>() {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    }
+                };
+                buckets.push((bound, val.as_u64().unwrap_or(0)));
+            }
+        }
+    }
+    buckets.sort_by_key(|(b, _)| *b);
+    let samples: u64 = buckets.iter().map(|(_, c)| c).sum();
+    json!({
+        "sentTotal": get("pots_push_sent_total"),
+        "walledTotal": get("pots_push_walled_total"),
+        "redrivenTotal": get("pots_push_redriven_total"),
+        "latencyMsP50": push_latency_quantile(&buckets, 0.50),
+        "latencyMsP95": push_latency_quantile(&buckets, 0.95),
+        "latencySamples": samples,
+    })
+}
+
 /// bsv-low (2026-09-04): the index janitor's live backlog, by row kind —
 /// `spent = 0` rows at least an hour old (the discovery pass's own candidate
 /// rule). `covenant` = real pots (the money), `p2pkh` = `tm_lowfund` hop /
@@ -1484,6 +1554,9 @@ pub async fn health_invariants(
     .await;
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);
+    // bsv-low #668: computed before `counters` is moved into the body; assigned after (the big `json!` is at the
+    // macro recursion limit). A UX/observability figure; the money never rests on this push.
+    let pots_push = pots_push_view(&counters);
     let gasp_load = crate::gasp_cost::view(db).await;
     let gasp_speed = crate::gasp_speed::view(db).await;
     let mut body = json!({
@@ -1573,6 +1646,8 @@ pub async fn health_invariants(
     body["gaspWalk24h"] = gasp_speed["totals24h"].clone();
     body["gaspWalkByTopicPeer24h"] = gasp_speed["byTopicPeer24h"].clone();
     body["gaspSpeedFault"] = gasp_speed["fault"].clone();
+    // bsv-low #668: the pots-room push totals + p50/p95 latency, beside the raw `pots_push_*` counters.
+    body["potsPush"] = pots_push;
     body["gaspDead"] = counters
         .get(crate::gasp_deferred::COUNTER_GASP_DEAD)
         .cloned()
@@ -1671,6 +1746,44 @@ mod tests {
         assert!(route.contains("pending_admission_counter(admit_fast, duplicate_echo)"));
         assert!(route.contains("COUNTER_SUBMIT_DUPLICATE_IN_FLIGHT"));
         assert!(route.contains("\"fast-echo\""));
+    }
+
+    /// bsv-low #668: `/health/invariants.potsPush` folds the app layer's `pots_push_*` counters into the
+    /// sent/walled/redriven totals and derives p50/p95 from the latency bucket counters (bounds read from the
+    /// names). RED without the view (the counters would be flat under `.counters` with no derived quantile).
+    #[test]
+    fn pots_push_view_derives_the_totals_and_latency_quantiles() {
+        let c = json!({
+            "pots_push_sent_total": 42,
+            "pots_push_walled_total": 5,
+            "pots_push_redriven_total": 4,
+            "pots_push_latency_ms_le_250_total": 1,
+            "pots_push_latency_ms_le_500_total": 2,
+            "pots_push_latency_ms_le_1000_total": 4,
+            "pots_push_latency_ms_le_2000_total": 2,
+            "pots_push_latency_ms_le_inf_total": 1,
+        });
+        let v = pots_push_view(&c);
+        assert_eq!(v["sentTotal"], 42);
+        assert_eq!(v["walledTotal"], 5);
+        assert_eq!(v["redrivenTotal"], 4);
+        assert_eq!(v["latencySamples"], 10);
+        // cumulative 250→1, 500→3, 1000→7, 2000→9, inf→10: p50 (target 5) in the le_1000 bucket; p95 (target 10)
+        // in the +Inf bucket → the largest FINITE bound (2000) as a lower estimate.
+        assert_eq!(v["latencyMsP50"], 1000);
+        assert_eq!(v["latencyMsP95"], 2000);
+        // empty counters: zeros, no panic.
+        let z = pots_push_view(&json!({}));
+        assert_eq!(z["latencyMsP50"], 0);
+        assert_eq!(z["latencySamples"], 0);
+        // the quantile helper's boundaries.
+        assert_eq!(
+            push_latency_quantile(&[(250, 0), (500, 0)], 0.5),
+            0,
+            "no samples → 0"
+        );
+        assert_eq!(push_latency_quantile(&[(250, 1), (500, 1)], 0.5), 250);
+        assert_eq!(push_latency_quantile(&[(250, 1), (500, 1)], 0.95), 500);
     }
 
     #[test]

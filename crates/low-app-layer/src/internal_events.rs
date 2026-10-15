@@ -242,6 +242,16 @@ pub fn parse_pot_changed(raw: &[u8]) -> Vec<(String, u32)> {
     parse_pot_changed_counted(raw).0
 }
 
+/// bsv-low #668 (step 0, hop A): the overlay's SHIP time (`admittedAt`), if the body carried one (the warm flush
+/// stamps it; the park-drain fallback and old overlays do not). Carried onto the pots-room push so the felt's
+/// first-wake latency is decomposable.
+pub fn parse_pot_admitted_at(raw: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<Value>(raw)
+        .ok()?
+        .get("admittedAt")
+        .and_then(Value::as_u64)
+}
+
 /// bsv-low #436: the parse, and HOW MANY well-formed distinct outpoints the cap refused. The overlay chunks its
 /// flush at this bound (`pot_changes::POT_CHANGED_CHUNK`, pinned equal), so the count is 0 from our own producer;
 /// a body that still carries more is never trimmed silently: the handler logs the count, adds it to
@@ -905,7 +915,9 @@ mod tests {
         let handler = &routes[start..start + routes[start + 1..].find(&squash("pub(crate) async fn")).expect("the next handler")];
         assert!(handler.contains(&squash("let (outpoints, dropped) = crate::internal_events::parse_pot_changed_counted(&raw);")));
         // E649 L4: the seam takes the whole parsed list (its plan announces every outpoint, `pot_hook`'s pins)
-        assert!(handler.contains(&squash("crate::pot_hook::serve_pot_changed(store, relay, wall, &detach, &outpoints, t0)")), "the seam runs over every parsed outpoint");
+        // bsv-low #668 (step 0): the seam carries the overlay ship time and a seconds re-drive.
+        assert!(handler.contains(&squash("crate::pot_hook::serve_pot_changed_at(")), "the seam runs over every parsed outpoint");
+        assert!(handler.contains(&squash("&outpoints, t0, admitted_at_ms, redrive,")), "the seam carries admittedAt and the re-drive");
         assert!(handler.contains(&squash("crate::internal_events::COUNTER_POT_CHANGED_DROPPED")), "a refused remainder is counted");
         assert!(handler.contains(&squash(r#""dropped": dropped"#)), "and answered to the overlay");
     }
@@ -1066,7 +1078,7 @@ mod tests {
             .expect("the handler");
         let body = &routes[start..];
         let detached = body
-            .find(&squash("crate::pot_hook::serve_pot_changed(store, relay, wall, &detach, &outpoints, t0)"))
+            .find(&squash("crate::pot_hook::serve_pot_changed_at(store, relay, wall, &detach, &outpoints, t0, admitted_at_ms, redrive,)"))
             .expect("the announce runs detached");
         assert!(body.contains(&squash("let detach = |f: crate::pot_hook::Detached| ctx.wait_until(f);")), "detach is wait_until");
         let hook_code = squash(&code_only(include_str!("pot_hook.rs")));

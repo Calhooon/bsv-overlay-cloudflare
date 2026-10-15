@@ -68,6 +68,18 @@ pub fn body_json(outpoints: &[(String, u32)]) -> String {
     serde_json::json!({ "outpoints": arr }).to_string()
 }
 
+/// bsv-low #668 (step 0, hop A): the webhook body with the overlay's SHIP time added
+/// (`admittedAt`), so the app layer can carry it onto the pots-room push and the felt's first-wake
+/// latency is decomposable (overlay ship → hook answer → relay call). Additive: the app layer reads
+/// `admittedAt` when present and tolerates its absence (the park-drain fallback ships `body_json`).
+pub fn body_json_at(outpoints: &[(String, u32)], admitted_at_ms: u64) -> String {
+    let arr: Vec<serde_json::Value> = outpoints
+        .iter()
+        .map(|(t, v)| serde_json::json!({ "txid": t, "vout": v }))
+        .collect();
+    serde_json::json!({ "outpoints": arr, "admittedAt": admitted_at_ms }).to_string()
+}
+
 /// bsv-low #436: the app layer's bound on one `/internal/pot-changed` body (`internal_events::POT_CHANGED_MAX`,
 /// pinned equal from the app layer's tests, which link this crate). One flush used to ship EVERY drained outpoint
 /// in one POST and the app layer kept the first eight: a tip pass confirming nine or more pot spends in one block
@@ -130,7 +142,17 @@ where
     Fut: std::future::Future<Output = std::result::Result<usize, ()>>,
     C: Fn() -> u64,
 {
-    crate::change_flush::ship_chunks(outpoints, body_json, post, now_ms, deadline_ms).await
+    // bsv-low #668 (step 0, hop A): stamp the overlay's SHIP time on every chunk's body, read once
+    // here so the whole flush carries one `admittedAt`. The park-drain fallback keeps `body_json`.
+    let admitted_at_ms = now_ms();
+    crate::change_flush::ship_chunks(
+        outpoints,
+        move |chunk| body_json_at(chunk, admitted_at_ms),
+        post,
+        now_ms,
+        deadline_ms,
+    )
+    .await
 }
 
 /// What a flush owes after its POSTs ([`crate::change_flush::settle`] over this set's memory): the deferred part
@@ -311,6 +333,37 @@ mod tests {
         let d = drain();
         assert_eq!(d, vec![("aa".to_string(), 0), ("bb".to_string(), 1)]);
         assert!(drain().is_empty());
+    }
+
+    /// bsv-low #668 (step 0, hop A): the overlay stamps its SHIP time (`admittedAt`) on the
+    /// pot-changed body, and `ship_with` reads it from its own clock. RED on `body_json` alone (no
+    /// `admittedAt` field). The outpoints stay the pre-#668 shape.
+    #[test]
+    fn the_ship_body_carries_the_overlay_admitted_at_stamp() {
+        let b = body_json_at(&[("ab".repeat(32), 0)], 1_788_000_000_123);
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["admittedAt"].as_u64(), Some(1_788_000_000_123));
+        assert_eq!(v["outpoints"].as_array().map(|a| a.len()), Some(1));
+        // the whole flush carries ONE admittedAt, read from ship_with's clock.
+        let clock = std::cell::Cell::new(555_000u64);
+        let bodies: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let ops: Vec<(String, u32)> = (0..3u32).map(|i| (format!("{i:064x}"), 0)).collect();
+        let _ = crate::change_flush::run(ship_with(
+            ops,
+            |body: String| {
+                bodies.borrow_mut().push(body);
+                async { Ok(0) }
+            },
+            move || clock.get(),
+            u64::MAX,
+        ));
+        let body = &bodies.borrow()[0];
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            v["admittedAt"].as_u64(),
+            Some(555_000),
+            "ship_with stamps admittedAt from its clock"
+        );
     }
 
     /// SOURCE PIN (2026-09-04; admit-fast step 4, 2026-09-15): every detached
@@ -536,7 +589,11 @@ mod tests {
         let with = squash(&code_only(
             &src[src.find("pub async fn ship_with<").expect("ship_with")..start],
         ));
-        assert!(with.contains(&squash("crate::change_flush::ship_chunks(outpoints, body_json, post, now_ms, deadline_ms).await")));
+        // bsv-low #668 (step 0, hop A): ship_with stamps the overlay's ship time (read once) on every chunk's body.
+        assert!(with.contains(&squash("let admitted_at_ms = now_ms();")));
+        assert!(with.contains(&squash(
+            "crate::change_flush::ship_chunks( outpoints, move |chunk| body_json_at(chunk, admitted_at_ms), post, now_ms, deadline_ms, ) .await"
+        )));
     }
 
     #[test]

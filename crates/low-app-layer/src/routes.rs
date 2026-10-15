@@ -2316,6 +2316,8 @@ pub(crate) async fn internal_pot_changed(
     }
     let raw = req.bytes().await?;
     let (outpoints, dropped) = crate::internal_events::parse_pot_changed_counted(&raw);
+    // bsv-low #668 (step 0, hop A): the overlay's ship time, carried onto the pots-room push (additive, optional).
+    let admitted_at_ms = crate::internal_events::parse_pot_admitted_at(&raw);
     if outpoints.is_empty() {
         return Response::error("body must be {\"outpoints\":[{\"txid\",\"vout\"}]}", 400);
     }
@@ -2349,9 +2351,33 @@ pub(crate) async fn internal_pot_changed(
     let wall = worker::Delay::from(core::time::Duration::from_millis(
         crate::pot_hook::ANNOUNCE_WALL_MS,
     ));
+    // bsv-low #668 (hop C): a seconds-cadence re-drive of a walled announce, within the same `wait_until` window,
+    // before the wake-up settles to the `*/15` drain. The relay/hub cold-DO band clears on a fresh subrequest.
+    let redrive = crate::pot_hook::Redrive {
+        tries: crate::pot_hook::ANNOUNCE_REDRIVE_TRIES,
+        attempt_wall: Box::new(|| {
+            Box::pin(worker::Delay::from(core::time::Duration::from_millis(
+                crate::pot_hook::ANNOUNCE_REDRIVE_WALL_MS,
+            ))) as crate::pot_hook::Detached
+        }),
+        backoff: Box::new(|| {
+            Box::pin(worker::Delay::from(core::time::Duration::from_millis(
+                crate::pot_hook::ANNOUNCE_REDRIVE_BACKOFF_MS,
+            ))) as crate::pot_hook::Detached
+        }),
+    };
     let detach = |f: crate::pot_hook::Detached| ctx.wait_until(f);
-    let outcome =
-        crate::pot_hook::serve_pot_changed(store, relay, wall, &detach, &outpoints, t0).await;
+    let outcome = crate::pot_hook::serve_pot_changed_at(
+        store,
+        relay,
+        wall,
+        &detach,
+        &outpoints,
+        t0,
+        admitted_at_ms,
+        redrive,
+    )
+    .await;
     if let Some(e) = &outcome.stale_fault {
         console_warn!("[pot-changed] write batch (stale marks and parks) failed: {e}");
     }
