@@ -175,6 +175,67 @@ pub const DRAIN_SETTLE_RESERVE_MS: u64 = 5_000;
 /// The sweep's bound per pass (and the age-out's).
 pub const SWEEP_MAX_PER_PASS: u32 = 50;
 
+/// bsv-low #668 (hop C): when the detached announce walls or the relay call fails, the wake-up is re-driven in
+/// SECONDS within this same `wait_until` window, BEFORE it settles to the [`PARK_RETRY_BASE_MS`] fallback the
+/// `*/15` drain picks up (the 150 s felt-latency this closes). At most this many extra delivery attempts.
+pub const ANNOUNCE_REDRIVE_TRIES: u32 = 2;
+/// The backoff before each re-drive attempt (a fresh subrequest typically hits a now-warm relay/hub DO).
+pub const ANNOUNCE_REDRIVE_BACKOFF_MS: u64 = 1_000;
+/// The per-attempt wall of a re-drive delivery (shorter than the first [`ANNOUNCE_WALL_MS`]).
+pub const ANNOUNCE_REDRIVE_WALL_MS: u64 = 2_500;
+/// The re-drive stops once this much of the task's own window has elapsed, so the settle write still fits inside
+/// the platform's 30 s `wait_until` ([`PARK_GRACE_MS`] after the park) whatever the first wall cost.
+pub const ANNOUNCE_REDRIVE_DEADLINE_MS: u64 = 25_000;
+
+/// bsv-low #668 (step 0 / the observability bar): the pots-room push counters on `/health/invariants`. Distinct
+/// from the pre-#668 `pot_changed_announce_*` counters; these measure the PUSH as a UX figure.
+pub const COUNTER_PUSH_SENT: &str = "pots_push_sent_total";
+/// Wake-ups whose FIRST delivery did not land (walled or a relay fault), so the seconds re-drive was tried.
+pub const COUNTER_PUSH_WALLED: &str = "pots_push_walled_total";
+/// Of the walled wake-ups, the ones the seconds re-drive recovered (delivered without the `*/15` drain).
+pub const COUNTER_PUSH_REDRIVEN: &str = "pots_push_redriven_total";
+
+/// bsv-low #668: the push-latency histogram's finite bucket bounds (ms), measured app-layer-side (the hook's
+/// answer to the relay's 2xx). A sample lands in the first bucket whose bound it is at or under, else the overflow
+/// bucket; the overlay's `/health/invariants.potsPush` derives p50/p95 from the bucket counters.
+pub const PUSH_LATENCY_BUCKETS_MS: [u64; 7] = [250, 500, 1_000, 2_000, 5_000, 10_000, 20_000];
+
+/// The `ops_counters` name for the bucket a `sample_ms` latency falls in (bsv-low #668).
+pub fn push_latency_bucket_counter(sample_ms: u64) -> String {
+    for b in PUSH_LATENCY_BUCKETS_MS {
+        if sample_ms <= b {
+            return format!("pots_push_latency_ms_le_{b}_total");
+        }
+    }
+    "pots_push_latency_ms_le_inf_total".to_string()
+}
+
+/// bsv-low #668 (hop C): a seconds-cadence re-drive of the failed announce calls, within the detached task's own
+/// `wait_until` window. `attempt_wall` and `backoff` are timer FACTORIES (the worker's `worker::Delay`, the pins'
+/// ready/injected futures). `tries == 0` is the pre-#668 behaviour (no re-drive), the pins' default.
+pub struct Redrive {
+    pub tries: u32,
+    pub attempt_wall: Box<dyn Fn() -> Detached>,
+    pub backoff: Box<dyn Fn() -> Detached>,
+}
+
+impl Redrive {
+    /// No re-drive: the pre-#668 settle-straight-to-park behaviour. Used by [`serve_pot_changed`] (the pins).
+    pub fn none() -> Self {
+        Redrive {
+            tries: 0,
+            attempt_wall: Box::new(|| Box::pin(async {})),
+            backoff: Box::new(|| Box::pin(async {})),
+        }
+    }
+}
+
+/// A delivery that did not land and is worth a re-drive: walled (`None`) or a relay fault (`Failed`). A `Sent` or a
+/// `NotConfigured` (no relay configured) is not re-driven.
+fn is_retryable(d: &Option<Delivery>) -> bool {
+    matches!(d, None | Some(Delivery::Failed))
+}
+
 /// When attempt `attempts` (1-based) may be retried, from `now`.
 pub fn retry_at(now: u64, attempts: u32) -> u64 {
     let shift = attempts.saturating_sub(1).min(16);
@@ -836,7 +897,11 @@ pub struct AnnouncePlan {
     pub outpoints: Vec<(String, u32)>,
     /// (identity, txid, vout): one `pot` event into the seat's `low_events` box.
     pub seat_events: Vec<(String, String, u32)>,
+    /// bsv-low #668 (step 0): the hook's answer time, carried onto the push as `hookedAt`.
     pub at_ms: u64,
+    /// bsv-low #668 (step 0, hop A): the overlay's SHIP time, if the body carried one; carried onto the push as
+    /// `admittedAt`. `None` when the producer did not stamp it (the park-drain fallback, an old overlay).
+    pub admitted_at_ms: Option<u64>,
     /// Per wake-up of [`AnnouncePlan::wakes`], the token its park WROTE (N1: read back by `RETURNING`); `None` is
     /// never planned since N6 (a refused body announces nothing; kept for the type).
     pub generations: Vec<Option<u64>>,
@@ -860,14 +925,16 @@ impl AnnouncePlan {
         });
         rooms.chain(seats).collect()
     }
-    /// Every wake-up with its token.
-    pub fn sends(&self) -> Vec<Call> {
+    /// Every wake-up with its token, stamped with the relay-call time (`broadcast_at_ms`, bsv-low #668 step 0).
+    pub fn sends(&self, broadcast_at_ms: u64) -> Vec<Call> {
         self.wakes()
             .into_iter()
             .enumerate()
             .map(|(i, wake)| Call {
                 wake,
                 at_ms: self.at_ms,
+                admitted_at_ms: self.admitted_at_ms,
+                broadcast_at_ms,
                 generation: self.generations.get(i).copied().flatten(),
             })
             .collect()
@@ -878,7 +945,12 @@ impl AnnouncePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Call {
     pub wake: Wake,
+    /// The hook's answer time (`hookedAt` on the push body, bsv-low #668 step 0).
     pub at_ms: u64,
+    /// The overlay's ship time (`admittedAt` on the push body), if the body carried one.
+    pub admitted_at_ms: Option<u64>,
+    /// The relay-call time (`broadcastAt` on the push body).
+    pub broadcast_at_ms: u64,
     pub generation: Option<u64>,
 }
 
@@ -918,12 +990,14 @@ pub async fn apply_pot_changed<S: HookStore>(
     store: &S,
     outpoints: &[(String, u32)],
     at_ms: u64,
+    admitted_at_ms: Option<u64>,
 ) -> PotChangedOutcome {
     let mut out = PotChangedOutcome {
         plan: AnnouncePlan {
             outpoints: outpoints.to_vec(),
             seat_events: Vec::new(),
             at_ms,
+            admitted_at_ms,
             generations: Vec::new(),
         },
         ..PotChangedOutcome::default()
@@ -1075,18 +1149,31 @@ async fn send_one<R: RelayPort>(relay: &R, s: &Call) -> Delivery {
         None => {
             let mut body = crate::internal_events::pot_changed_event_body(&w.txid, w.vout, s.at_ms);
             body["intentId"] = json!(room_intent_id(&w.txid, w.vout, &token));
+            stamp_hops(&mut body, s);
             relay
                 .broadcast(crate::internal_events::POTS_ROOM, body)
                 .await
         }
         Some(id) => {
-            let body =
+            let mut body =
                 crate::internal_events::pot_event_body(&w.txid, w.vout, carrier_entry(), s.at_ms);
+            stamp_hops(&mut body, s);
             relay
                 .push(id, &seat_message_id(&w.txid, w.vout, id, &token), body)
                 .await
         }
     }
+}
+
+/// bsv-low #668 (step 0): stamp the push body with the latency hops — `admittedAt` (the overlay's ship time, when
+/// the body carried one), `hookedAt` (the hook's answer time) and `broadcastAt` (the relay-call time). Additive:
+/// the client reads `potOutpoint`/`kind`/`at` and ignores these (`app/src/lib/lowEvents.ts`, `useServedWord.ts`).
+fn stamp_hops(body: &mut Value, s: &Call) {
+    if let Some(a) = s.admitted_at_ms {
+        body["admittedAt"] = json!(a);
+    }
+    body["hookedAt"] = json!(s.at_ms);
+    body["broadcastAt"] = json!(s.broadcast_at_ms);
 }
 
 /// Deliver `sends` together (the calls of one body run together, not one after another), all raced against ONE
@@ -1121,7 +1208,7 @@ pub async fn announce<R: RelayPort, W: Future<Output = ()>>(
     plan: &AnnouncePlan,
     wall: W,
 ) -> AnnounceTally {
-    let got = deliver(relay, &plan.sends(), wall).await;
+    let got = deliver(relay, &plan.sends(plan.at_ms), wall).await;
     let mut t = AnnounceTally::default();
     for d in got {
         match d {
@@ -1168,20 +1255,57 @@ pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = 
     relay: &R,
     plan: &AnnouncePlan,
     wall: W,
+    redrive: &Redrive,
 ) -> AnnounceTally {
     let t0 = store.now_ms();
-    let sends = plan.sends();
-    let got = deliver(relay, &sends, wall).await;
+    // bsv-low #668 (step 0): the relay-call time stamps `broadcastAt` on every push body.
+    let sends = plan.sends(t0);
+    let mut got = deliver(relay, &sends, wall).await;
+    // bsv-low #668 (hop C): the wake-ups whose FIRST delivery did not land are the re-drive candidates (walled or
+    // a relay fault), and only those that were PARKED (a generation) — a `NotConfigured` skip is not a failure.
+    let walled_first: Vec<usize> = (0..sends.len())
+        .filter(|&i| sends[i].generation.is_some() && is_retryable(&got[i]))
+        .collect();
+    let mut redriven = 0u64;
+    if redrive.tries > 0 && !walled_first.is_empty() {
+        let mut pending = walled_first.clone();
+        for _ in 0..redrive.tries {
+            if pending.is_empty()
+                || store.now_ms().saturating_sub(t0) >= ANNOUNCE_REDRIVE_DEADLINE_MS
+            {
+                break;
+            }
+            (redrive.backoff)().await;
+            let retry_sends: Vec<Call> = pending.iter().map(|&i| sends[i].clone()).collect();
+            let retry_got = deliver(relay, &retry_sends, (redrive.attempt_wall)()).await;
+            let mut still = Vec::new();
+            for (k, &i) in pending.iter().enumerate() {
+                match retry_got[k] {
+                    Some(d @ (Delivery::Sent | Delivery::NotConfigured)) => {
+                        got[i] = Some(d);
+                        if d == Delivery::Sent {
+                            redriven += 1;
+                        }
+                    }
+                    other => {
+                        got[i] = other;
+                        still.push(i);
+                    }
+                }
+            }
+            pending = still;
+        }
+    }
     let now = store.now_ms();
     let mut t = AnnounceTally::default();
     let mut ops = Vec::with_capacity(sends.len());
-    for (s, d) in sends.into_iter().zip(got) {
+    for (s, d) in sends.iter().zip(&got) {
         match d {
             Some(d @ (Delivery::Sent | Delivery::NotConfigured)) => {
-                t.note(d);
+                t.note(*d);
                 if let Some(generation) = s.generation {
                     ops.push(ParkOp::Delivered {
-                        wake: s.wake,
+                        wake: s.wake.clone(),
                         generation,
                     });
                 }
@@ -1192,7 +1316,7 @@ pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = 
                 if let Some(generation) = s.generation {
                     t.parked += 1;
                     ops.push(ParkOp::Retry {
-                        wake: s.wake,
+                        wake: s.wake.clone(),
                         generation,
                         attempts: 1,
                         next_ms: retry_at(now, 1),
@@ -1212,7 +1336,7 @@ pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = 
         }
     }
     store.log(&format!(
-        "[pot-changed] announce: {} outpoint(s), {} seat event(s): sent={} skipped={} failed={} parked={}{} in {} ms",
+        "[pot-changed] announce: {} outpoint(s), {} seat event(s): sent={} skipped={} failed={} parked={}{} redriven={} in {} ms",
         plan.outpoints.len(),
         plan.seat_events.len(),
         t.sent,
@@ -1220,9 +1344,24 @@ pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = 
         t.failed,
         t.parked,
         if t.walled { " (WALL)" } else { "" },
-        store.now_ms().saturating_sub(t0)
+        redriven,
+        now.saturating_sub(t0)
     ));
-    let counters = t.counters();
+    let mut counters = t.counters();
+    // bsv-low #668 (step 0 / the observability bar): the pots-room PUSH counters + the latency histogram, measured
+    // app-layer-side (the hook's answer `plan.at_ms` to the relay's 2xx `now`). A body that delivered at least one
+    // wake-up records one latency sample; the overlay's `/health/invariants.potsPush` derives p50/p95.
+    if t.sent > 0 {
+        counters.push((COUNTER_PUSH_SENT.to_string(), t.sent));
+        let sample_ms = now.saturating_sub(plan.at_ms);
+        counters.push((push_latency_bucket_counter(sample_ms), 1));
+    }
+    if !walled_first.is_empty() {
+        counters.push((COUNTER_PUSH_WALLED.to_string(), walled_first.len() as u64));
+    }
+    if redriven > 0 {
+        counters.push((COUNTER_PUSH_REDRIVEN.to_string(), redriven));
+    }
     if !counters.is_empty() {
         store.counters(counters).await;
     }
@@ -1309,6 +1448,10 @@ pub async fn drain_parked<S: HookStore, R: RelayPort>(
                 .map(|p| Call {
                     wake: p.wake.clone(),
                     at_ms: p.at_ms,
+                    // The park does not keep the overlay's ship time; the drain stamps its own send time as
+                    // broadcastAt and omits admittedAt (the fallback path, not the warm latency measurement).
+                    admitted_at_ms: None,
+                    broadcast_at_ms: now,
                     generation: Some(p.generation),
                 })
                 .collect();
@@ -1432,11 +1575,44 @@ where
     R: RelayPort + 'static,
     W: Future<Output = ()> + 'static,
 {
-    let outcome = apply_pot_changed(&*store, outpoints, at_ms).await;
+    serve_pot_changed_at(
+        store,
+        relay,
+        wall,
+        detach,
+        outpoints,
+        at_ms,
+        None,
+        Redrive::none(),
+    )
+    .await
+}
+
+/// bsv-low #668 (step 0 + hop C): as [`serve_pot_changed`], with the overlay's ship time (`admittedAt`) carried
+/// onto the push (the felt's first-wake latency is decomposable) and a seconds-cadence `redrive` of a walled
+/// announce. The worker's handler passes both; the pins use the [`serve_pot_changed`] wrapper (`None` /
+/// [`Redrive::none`]).
+#[allow(clippy::too_many_arguments)] // the seam carries the hook's inputs, the ship-time stamp and the re-drive
+pub async fn serve_pot_changed_at<S, R, W>(
+    store: std::rc::Rc<S>,
+    relay: std::rc::Rc<R>,
+    wall: W,
+    detach: &dyn Fn(Detached),
+    outpoints: &[(String, u32)],
+    at_ms: u64,
+    admitted_at_ms: Option<u64>,
+    redrive: Redrive,
+) -> PotChangedOutcome
+where
+    S: HookStore + 'static,
+    R: RelayPort + 'static,
+    W: Future<Output = ()> + 'static,
+{
+    let outcome = apply_pot_changed(&*store, outpoints, at_ms, admitted_at_ms).await;
     if outcome.stale_fault.is_none() {
         let plan = outcome.plan.clone();
         detach(Box::pin(async move {
-            announce_and_report(&*store, &*relay, &plan, wall).await;
+            announce_and_report(&*store, &*relay, &plan, wall, &redrive).await;
         }));
     }
     outcome
@@ -1743,9 +1919,9 @@ pub(crate) mod tests {
         let h = routes_item("pub(crate) async fn internal_pot_changed(");
         assert!(
             h.contains(&squash(
-                "crate::pot_hook::serve_pot_changed(store, relay, wall, &detach, &outpoints, t0)"
+                "crate::pot_hook::serve_pot_changed_at(store, relay, wall, &detach, &outpoints, t0, admitted_at_ms, redrive,)"
             )),
-            "the worker's handler is serve_pot_changed"
+            "the worker's handler is serve_pot_changed_at (bsv-low #668: carries admittedAt + the re-drive)"
         );
         assert!(
             h.contains(&squash(
@@ -1831,6 +2007,203 @@ pub(crate) mod tests {
             store.sql.counter(COUNTER_ANNOUNCE_FAILED),
             1,
             "the hung call counted at the wall"
+        );
+    }
+
+    /// bsv-low #668 (step 0): the pots-room push and a seat event carry the latency hops — `admittedAt` (the
+    /// overlay's ship time, when present), `hookedAt` (the hook's answer `at_ms`), `broadcastAt` (the relay-call
+    /// time `t0`). RED on a body without them. Additive: the client reads `potOutpoint`/`kind`/`at` and ignores
+    /// these (`app/src/lib/lowEvents.ts`, `useServedWord.ts`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_body_carries_the_hop_stamps() {
+        let store = Rc::new(HookD1 {
+            sql: SqliteSql::migrated(),
+        });
+        store.sql.now.set(333);
+        let relay = Rc::new(Relay::default());
+        let plan = AnnouncePlan {
+            outpoints: vec![op(1)],
+            seat_events: vec![(A.into(), op(1).0, op(1).1)],
+            at_ms: 222,
+            admitted_at_ms: Some(111),
+            generations: vec![Some(1), Some(2)],
+        };
+        announce_and_report(
+            &*store,
+            &*relay,
+            &plan,
+            tokio::time::sleep(Duration::from_millis(200)),
+            &Redrive::none(),
+        )
+        .await;
+        // Scoped so the borrow is dropped before the next await (clippy `await_holding_refcell_ref`).
+        {
+            let bodies = relay.bodies.borrow();
+            assert_eq!(bodies.len(), 2, "one room broadcast and one seat event");
+            for (_to, _mid, body) in bodies.iter() {
+                assert_eq!(
+                    body["admittedAt"].as_u64(),
+                    Some(111),
+                    "hop A: the overlay ship time"
+                );
+                assert_eq!(
+                    body["hookedAt"].as_u64(),
+                    Some(222),
+                    "hop C: the hook's answer"
+                );
+                assert_eq!(body["broadcastAt"].as_u64(), Some(333), "the relay call");
+            }
+        }
+        // Absent an overlay stamp, `admittedAt` is OMITTED; the other two stay.
+        let relay2 = Rc::new(Relay::default());
+        let plan2 = AnnouncePlan {
+            admitted_at_ms: None,
+            ..plan.clone()
+        };
+        announce_and_report(
+            &*store,
+            &*relay2,
+            &plan2,
+            tokio::time::sleep(Duration::from_millis(200)),
+            &Redrive::none(),
+        )
+        .await;
+        let b2 = relay2.bodies.borrow();
+        assert!(
+            b2[0].2.get("admittedAt").is_none(),
+            "no overlay stamp, no admittedAt"
+        );
+        assert_eq!(b2[0].2["hookedAt"].as_u64(), Some(222));
+        assert_eq!(b2[0].2["broadcastAt"].as_u64(), Some(333));
+    }
+
+    /// bsv-low #668 (hop C): a walled/failed announce is RE-DRIVEN in seconds within the same `wait_until` task,
+    /// recovering the wake-up instead of parking it for the `*/15` drain. RED without the re-drive
+    /// ([`Redrive::none`] parks it at +60 s); GREEN with two tries over a relay that fails once then lands.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_walled_announce_is_redriven_not_parked() {
+        let plan = AnnouncePlan {
+            outpoints: vec![op(1)],
+            seat_events: Vec::new(),
+            at_ms: 100,
+            admitted_at_ms: Some(50),
+            generations: vec![Some(7)],
+        };
+        let fail_pots = || {
+            Rc::new(Relay {
+                fail_once: RefCell::new(vec![crate::internal_events::POTS_ROOM.to_string()]),
+                ..Relay::default()
+            })
+        };
+        // WITHOUT the re-drive: the first delivery fails and the wake-up parks (the pre-#668 fallback).
+        let store0 = Rc::new(HookD1 {
+            sql: SqliteSql::migrated(),
+        });
+        let relay0 = fail_pots();
+        let t0 = announce_and_report(
+            &*store0,
+            &*relay0,
+            &plan,
+            tokio::time::sleep(Duration::from_millis(200)),
+            &Redrive::none(),
+        )
+        .await;
+        assert_eq!(
+            (t0.sent, t0.parked, t0.failed),
+            (0, 1, 1),
+            "no re-drive: the failed wake-up parks for the */15 drain"
+        );
+        // WITH the re-drive: the second attempt lands and the wake-up is delivered, not parked.
+        let store = Rc::new(HookD1 {
+            sql: SqliteSql::migrated(),
+        });
+        let relay = fail_pots();
+        let redrive = Redrive {
+            tries: 2,
+            attempt_wall: Box::new(|| {
+                Box::pin(tokio::time::sleep(Duration::from_millis(200))) as Detached
+            }),
+            backoff: Box::new(|| {
+                Box::pin(tokio::time::sleep(Duration::from_millis(30))) as Detached
+            }),
+        };
+        let t = announce_and_report(
+            &*store,
+            &*relay,
+            &plan,
+            tokio::time::sleep(Duration::from_millis(200)),
+            &redrive,
+        )
+        .await;
+        assert_eq!(
+            (t.sent, t.parked, t.failed),
+            (1, 0, 0),
+            "the seconds re-drive recovered the wake-up before the park"
+        );
+        assert_eq!(
+            relay.started.get(),
+            2,
+            "one failed call, then one re-drive call"
+        );
+        assert_eq!(
+            store.sql.counter(COUNTER_PUSH_REDRIVEN),
+            1,
+            "the recovery is counted"
+        );
+        assert_eq!(
+            store.sql.counter(COUNTER_PUSH_WALLED),
+            1,
+            "the first-try miss is counted"
+        );
+        assert_eq!(store.sql.counter(COUNTER_PUSH_SENT), 1);
+    }
+
+    /// bsv-low #668 (the observability bar): a delivered push records one latency sample into the histogram,
+    /// measured app-layer-side (the hook's answer `at_ms` to the relay's 2xx `now`); the bucket counter moves and
+    /// the bucket function's boundaries hold. The overlay's `/health/invariants.potsPush` derives p50/p95 from it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_push_latency_histogram_moves() {
+        let store = Rc::new(HookD1 {
+            sql: SqliteSql::migrated(),
+        });
+        store.sql.now.set(1_400); // broadcastAt/now; hookedAt 1000 → a 400 ms app-layer push latency
+        let relay = Rc::new(Relay::default());
+        let plan = AnnouncePlan {
+            outpoints: vec![op(1)],
+            seat_events: Vec::new(),
+            at_ms: 1_000,
+            admitted_at_ms: Some(900),
+            generations: vec![Some(1)],
+        };
+        announce_and_report(
+            &*store,
+            &*relay,
+            &plan,
+            tokio::time::sleep(Duration::from_millis(200)),
+            &Redrive::none(),
+        )
+        .await;
+        assert_eq!(
+            store.sql.counter("pots_push_latency_ms_le_500_total"),
+            1,
+            "a 400 ms push lands in the le_500 bucket"
+        );
+        assert_eq!(store.sql.counter(COUNTER_PUSH_SENT), 1);
+        assert_eq!(
+            push_latency_bucket_counter(0),
+            "pots_push_latency_ms_le_250_total"
+        );
+        assert_eq!(
+            push_latency_bucket_counter(250),
+            "pots_push_latency_ms_le_250_total"
+        );
+        assert_eq!(
+            push_latency_bucket_counter(251),
+            "pots_push_latency_ms_le_500_total"
+        );
+        assert_eq!(
+            push_latency_bucket_counter(999_999),
+            "pots_push_latency_ms_le_inf_total"
         );
     }
 
@@ -2072,6 +2445,7 @@ pub(crate) mod tests {
             outpoints: vec![op(1), op(2)],
             seat_events: vec![(A.into(), op(1).0, 1)],
             at_ms: 7,
+            admitted_at_ms: None,
             generations: Vec::new(),
         };
         let wall = || tokio::time::sleep(Duration::from_millis(200));
@@ -2743,7 +3117,14 @@ pub(crate) mod tests {
             if to == crate::internal_events::POTS_ROOM {
                 let mut want = crate::internal_events::pot_changed_event_body(&txid, 0, 7);
                 want["intentId"] = body["intentId"].clone();
-                assert_eq!(body, &want, "the room's body, its intent id beside (N8)");
+                // bsv-low #668 (step 0): additive hop stamps — hookedAt = at = 7, broadcastAt = the store clock
+                // (t0, 1_000_000 in this fixture); no admittedAt (the wrapper passes None).
+                want["hookedAt"] = json!(7);
+                want["broadcastAt"] = json!(1_000_000);
+                assert_eq!(
+                    body, &want,
+                    "the room's body, its intent id and the #668 hop stamps beside"
+                );
                 continue;
             }
             seats += 1;
@@ -2754,9 +3135,9 @@ pub(crate) mod tests {
             assert_eq!(
                 body.to_string(),
                 format!(
-                    r#"{{"at":7,"entry":{{}},"kind":"pot","potOutpoint":{{"txid":"{txid}","vout":0}},"v":1}}"#
+                    r#"{{"at":7,"broadcastAt":1000000,"entry":{{}},"hookedAt":7,"kind":"pot","potOutpoint":{{"txid":"{txid}","vout":0}},"v":1}}"#
                 ),
-                "the seat's pot event, byte for byte"
+                "the seat's pot event, byte for byte (bsv-low #668: the additive hop stamps)"
             );
             assert!(out
                 .filed
@@ -2829,7 +3210,7 @@ pub(crate) mod tests {
             ],
         };
         let ops: Vec<(String, u32)> = (0..6).map(op).collect();
-        let out = apply_pot_changed(&store, &ops, 7).await;
+        let out = apply_pot_changed(&store, &ops, 7, None).await;
         let why: Vec<String> = out
             .skipped
             .iter()
@@ -2877,7 +3258,7 @@ pub(crate) mod tests {
             .execute_batch("ALTER TABLE pot_records RENAME TO pot_records_away")
             .unwrap();
         let store = HookD1 { sql: db };
-        let out = apply_pot_changed(&store, &ops, 7).await;
+        let out = apply_pot_changed(&store, &ops, 7, None).await;
         assert_eq!((out.filed.len(), out.skipped.len(), out.parked), (0, 8, 8));
         assert!(out.skipped.iter().all(|s| s["why"]
             .as_str()
