@@ -24,6 +24,11 @@ pub struct SyncCost {
     /// input the peer answered it does not hold, needed again in the same
     /// sync, or a root whose counted absence waits out its gap or backoff.
     pub peer_absent_memo_hits: u64,
+    /// Batch node requests sent (engine 0.2.1, #58): each is one body, also
+    /// counted in `calls_out` and `peer_requests`.
+    pub batch_requests: u64,
+    /// Nodes the batch answers served, each in place of a single request.
+    pub batch_nodes: u64,
     pub ms: u64,
     pub outputs_walked: u64,
     pub ms_per_1000_outputs: Option<u64>,
@@ -44,6 +49,8 @@ impl SyncCost {
             peer_absent_memo_hits: self
                 .peer_absent_memo_hits
                 .saturating_sub(before.peer_absent_memo_hits),
+            batch_requests: self.batch_requests.saturating_sub(before.batch_requests),
+            batch_nodes: self.batch_nodes.saturating_sub(before.batch_nodes),
             ms: self.ms.saturating_sub(before.ms),
             outputs_walked: self.outputs_walked.saturating_sub(before.outputs_walked),
             ms_per_1000_outputs: None,
@@ -72,6 +79,8 @@ impl SyncCost {
         self.peer_absent_memo_hits = self
             .peer_absent_memo_hits
             .saturating_add(other.peer_absent_memo_hits);
+        self.batch_requests = self.batch_requests.saturating_add(other.batch_requests);
+        self.batch_nodes = self.batch_nodes.saturating_add(other.batch_nodes);
         self.ms = self.ms.saturating_add(other.ms);
         self.outputs_walked = self.outputs_walked.saturating_add(other.outputs_walked);
         self.refresh_speed();
@@ -157,6 +166,17 @@ pub fn peer_request() {
         v.calls_out += 1;
         v.peer_requests += 1;
     });
+}
+/// One batch node request (engine 0.2.1): a peer request like any other.
+pub fn batch_request() {
+    note(|v| {
+        v.calls_out += 1;
+        v.peer_requests += 1;
+        v.batch_requests += 1;
+    });
+}
+pub fn batch_nodes(count: u64) {
+    note(|v| v.batch_nodes = v.batch_nodes.saturating_add(count));
 }
 pub fn storage_read() {
     note(|v| v.storage_reads += 1);

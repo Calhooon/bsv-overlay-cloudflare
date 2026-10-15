@@ -1260,6 +1260,26 @@ pub trait GASPRemote {
 
     /// Submit a node to the peer and get back which inputs they need.
     async fn submit_node(&self, node: &GASPNode) -> Result<Option<GASPNodeResponse>, GASPError>;
+
+    /// Whether this remote can ask the peer for many nodes in one body
+    /// (engine 0.2.1, #58; [`crate::node_batch`]). `false` for a remote that
+    /// has no batch request: the sync then asks one node at a time.
+    fn batches(&self) -> bool {
+        false
+    }
+
+    /// Ask the peer for the nodes of `outpoints` in one body
+    /// (`POST /requestForeignGASPNodes`). Any error, a 404 from a peer that
+    /// does not answer the route included, makes the sync ask that peer one
+    /// node at a time for the rest of the run.
+    async fn request_nodes(
+        &self,
+        _outpoints: &[crate::node_batch::BatchOutpoint],
+    ) -> Result<crate::node_batch::NodeBatch, GASPError> {
+        Err(GASPError::Other(
+            "this remote has no batch node request".into(),
+        ))
+    }
 }
 
 // ============================================================================
@@ -1501,6 +1521,20 @@ struct PageProgress {
     reached_tip: bool,
 }
 
+/// The node batch's state in one sync (engine 0.2.1, #58).
+#[derive(Default)]
+struct BatchState {
+    /// The peer asked one node at a time for the rest of the run: its batch
+    /// request failed or its answer was refused. Shared across the run's
+    /// topics and slices, never persisted.
+    single_only: std::rc::Rc<std::cell::Cell<bool>>,
+    /// The page's outputs a batch may ask for, in page order.
+    queue: std::cell::RefCell<std::collections::VecDeque<String>>,
+    /// The batch answers not yet walked, each as its single request would
+    /// have answered.
+    prefetched: std::cell::RefCell<std::collections::HashMap<String, Result<GASPNode, GASPError>>>,
+}
+
 /// GASP sync orchestrator.
 ///
 /// Coordinates between local `GASPStorage` and a `GASPRemote` peer to
@@ -1510,6 +1544,9 @@ struct PageProgress {
 /// environment (e.g., `OverlayGASPStorage` borrows from the Engine's storage).
 pub struct GASPSync<'a> {
     expired: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    /// The node batch's state (engine 0.2.1, #58), boxed so the sync's
+    /// future does not grow by it.
+    batch: Box<BatchState>,
     root_proofs: std::cell::RefCell<std::collections::HashMap<String, bool>>,
     roots_proven: std::cell::Cell<u64>,
     roots_unproven: std::cell::Cell<u64>,
@@ -1653,6 +1690,7 @@ impl<'a> GASPSync<'a> {
             storage,
             remote,
             expired: std::rc::Rc::default(),
+            batch: Box::default(),
             expired_refused: std::cell::Cell::new(0),
             refused_expiry: std::cell::Cell::new(None),
             root_proofs: std::cell::RefCell::default(),
@@ -1713,6 +1751,13 @@ impl<'a> GASPSync<'a> {
         expired: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     ) -> Self {
         self.expired = expired;
+        self
+    }
+
+    /// Share the run's single-only memo of this peer (engine 0.2.1, #58).
+    #[must_use]
+    pub fn with_batch_memo(mut self, single_only: std::rc::Rc<std::cell::Cell<bool>>) -> Self {
+        self.batch.single_only = single_only;
         self
     }
 
@@ -2510,6 +2555,8 @@ impl<'a> GASPSync<'a> {
         self.pruned.borrow_mut().clear();
         self.pruned_inputs.set(0);
         self.absent.borrow_mut().clear();
+        self.batch.queue.borrow_mut().clear();
+        self.batch.prefetched.borrow_mut().clear();
         self.expired_refused.set(0);
         self.root_proofs.borrow_mut().clear();
         self.roots_proven.set(0);
@@ -2789,6 +2836,21 @@ impl<'a> GASPSync<'a> {
                     self.deferred.borrow_mut().insert(record.outpoint);
                 }
             }
+
+            // Engine 0.2.1 (#58): the outputs this page will ask the peer for
+            // as fresh roots, so a peer that answers the batch is asked for
+            // them in as few bodies as the budget allows.
+            self.queue_batch(
+                response
+                    .utxo_list
+                    .iter()
+                    .map(|u| format!("{}.{}", u.txid, u.output_index)),
+                |o| {
+                    !known_outpoints.contains(o)
+                        && !shared_outpoints.contains(o)
+                        && !failed_outpoints.contains(o)
+                },
+            );
 
             // lowest_ahead[i]: the lowest score among this page's UTXOs from
             // i on, for `completed_cursor` (a page is not assumed sorted).
@@ -4291,15 +4353,148 @@ impl<'a> GASPSync<'a> {
         let (txid, oi) = parse_outpoint(&item.outpoint)
             .ok_or_else(|| GASPError::Other(format!("bad outpoint {}", item.outpoint)))?;
         self.count_call();
-        let node = self
-            .remote
-            .request_node(&item.graph_id, &txid, oi, item.metadata)
-            .await?;
+        // Boxed: the batch's answer stays off the walk's future (clippy's
+        // `large_futures` on the sync that holds it).
+        let node = Box::pin(self.root_node(item, &txid, oi)).await?;
         self.count_fetched(&node);
         if self.root_expired(&node, &item.outpoint)? {
             return Ok(None);
         }
         Ok(Some(self.hydrate_root(node).await))
+    }
+
+    /// The peer's node for a root: its batch answer, or the single route's.
+    async fn root_node(
+        &self,
+        item: &PendingInput,
+        txid: &str,
+        output_index: u32,
+    ) -> Result<GASPNode, GASPError> {
+        if let Some(answer) = self.prefetched_root(item).await {
+            return answer;
+        }
+        self.remote
+            .request_node(&item.graph_id, txid, output_index, item.metadata)
+            .await
+    }
+
+    /// Queue the page's fresh roots for the batch request (engine 0.2.1):
+    /// the outputs `fresh` keeps, less those remembered expired and those
+    /// held in a record (resumed by their own path). A peer asked one node at
+    /// a time queues nothing.
+    fn queue_batch(&self, page: impl Iterator<Item = String>, fresh: impl Fn(&str) -> bool) {
+        self.batch.prefetched.borrow_mut().clear();
+        let mut queue = self.batch.queue.borrow_mut();
+        queue.clear();
+        if self.batch.single_only.get() || !self.remote.batches() {
+            return;
+        }
+        let expired = self.expired.borrow();
+        let deferred = self.deferred.borrow();
+        queue.extend(page.filter(|o| fresh(o) && !expired.contains(o) && !deferred.contains(o)));
+    }
+
+    /// Ask the peer once, for the rest of the run, one node at a time.
+    fn batch_refused(&self, why: &str) {
+        warn!(
+            "{} The node batch is refused ({}); the peer is asked one node at a time for the rest of the run (engine 0.2.1)",
+            self.log_prefix, why
+        );
+        self.batch.single_only.set(true);
+        self.batch.queue.borrow_mut().clear();
+    }
+
+    /// The root's answer from a batch body (engine 0.2.1, #58), or `None`
+    /// when it is asked on the single route: the peer does not batch, the
+    /// root was not queued, or the batch did not answer it.
+    ///
+    /// A missing answer asks the batch for the queued roots from this one
+    /// on, up to [`crate::node_batch::NODE_BATCH_MAX_OUTPOINTS`]. Each entry
+    /// becomes what its single request would have answered: a node is the
+    /// node, `not_found` is `GASPError::NodeNotFound` (the peer's word, as a
+    /// single HTTP 400), so the walk, the absence rule, the fault memo and
+    /// the proof window read it unchanged. Any other entry, and a root the
+    /// budget left out, is asked again: the left out in the next body, the
+    /// refused on the single route. A failed batch, or an answer over
+    /// [`crate::node_batch::NODE_BATCH_MAX_BYTES`], counts nothing against
+    /// the peer: the run asks it one node at a time from here on.
+    async fn prefetched_root(&self, item: &PendingInput) -> Option<Result<GASPNode, GASPError>> {
+        use crate::node_batch::{
+            refusal, BatchOutpoint, NODE_BATCH_MAX_BYTES, NODE_BATCH_MAX_OUTPOINTS,
+        };
+        if item.graph_id != item.outpoint {
+            return None;
+        }
+        if let Some(answer) = self.batch.prefetched.borrow_mut().remove(&item.outpoint) {
+            return Some(answer);
+        }
+        if self.batch.single_only.get() {
+            return None;
+        }
+        let asked: Vec<String> = {
+            let mut queue = self.batch.queue.borrow_mut();
+            let at = queue.iter().position(|o| *o == item.outpoint)?;
+            queue.drain(..at);
+            let n = queue.len().min(NODE_BATCH_MAX_OUTPOINTS);
+            queue.drain(..n).collect()
+        };
+        let request: Vec<BatchOutpoint> = asked
+            .iter()
+            .filter_map(|o| parse_outpoint(o))
+            .map(|(txid, vout)| BatchOutpoint { txid, vout })
+            .collect();
+        let batch = match self.remote.request_nodes(&request).await {
+            Ok(batch) => batch,
+            Err(e) => {
+                self.batch_refused(&e.to_string());
+                return None;
+            }
+        };
+        if batch.bytes > NODE_BATCH_MAX_BYTES {
+            self.batch_refused(&format!(
+                "an answer of {} bytes is over its budget of {NODE_BATCH_MAX_BYTES}",
+                batch.bytes
+            ));
+            return None;
+        }
+        let mut answered = std::collections::HashSet::new();
+        let mut served = 0u64;
+        {
+            let mut prefetched = self.batch.prefetched.borrow_mut();
+            for entry in batch.answer.nodes {
+                let key = entry.key();
+                if !asked.contains(&key) || !answered.insert(key.clone()) {
+                    continue;
+                }
+                match (entry.node, entry.refused.as_deref()) {
+                    (Some(node), None) => {
+                        served += 1;
+                        prefetched.insert(key, Ok(node));
+                    }
+                    (None, Some(refusal::NOT_FOUND)) => {
+                        prefetched.insert(
+                            key.clone(),
+                            Err(GASPError::NodeNotFound(format!(
+                                "{key}: the peer answered not_found in a node batch"
+                            ))),
+                        );
+                    }
+                    // Asked on the single route, whose answer stands.
+                    _ => {}
+                }
+            }
+        }
+        crate::meter::batch_nodes(served);
+        let mut queue = self.batch.queue.borrow_mut();
+        for left_out in asked
+            .iter()
+            .rev()
+            .filter(|o| !answered.contains(*o) && **o != item.outpoint)
+        {
+            queue.push_front(left_out.clone());
+        }
+        drop(queue);
+        self.batch.prefetched.borrow_mut().remove(&item.outpoint)
     }
 
     /// The root's own proof, hydrated by the ancestor fetcher when the peer

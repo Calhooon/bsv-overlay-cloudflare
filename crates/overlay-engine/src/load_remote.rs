@@ -37,4 +37,14 @@ impl GASPRemote for MeteredRemote {
         crate::meter::peer_request();
         self.0.submit_node(node).await
     }
+    fn batches(&self) -> bool {
+        self.0.batches()
+    }
+    async fn request_nodes(
+        &self,
+        outpoints: &[crate::node_batch::BatchOutpoint],
+    ) -> Result<crate::node_batch::NodeBatch, GASPError> {
+        crate::meter::batch_request();
+        self.0.request_nodes(outpoints).await
+    }
 }

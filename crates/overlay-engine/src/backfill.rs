@@ -176,14 +176,27 @@ type ExpiredMemo = std::rc::Rc<std::cell::RefCell<std::collections::HashSet<Stri
 pub(crate) struct Run {
     pub fetcher: Option<std::rc::Rc<dyn crate::gasp::AncestorFetcher>>,
     expired: std::cell::RefCell<std::collections::HashMap<String, ExpiredMemo>>,
+    /// The peers asked one node at a time for the rest of this run (engine
+    /// 0.2.1, #58), by peer: never persisted, so a peer that gains the batch
+    /// route is asked for it on the next run.
+    single_only: std::cell::RefCell<std::collections::HashMap<String, SingleOnly>>,
 }
+type SingleOnly = std::rc::Rc<std::cell::Cell<bool>>;
 impl Run {
     pub fn new(fetcher: Option<std::rc::Rc<dyn crate::gasp::AncestorFetcher>>) -> Self {
         Self {
             fetcher: fetcher
                 .map(|f| std::rc::Rc::new(crate::sync_fetcher::SyncFetcher::new(f)) as _),
             expired: std::cell::RefCell::default(),
+            single_only: std::cell::RefCell::default(),
         }
+    }
+    pub fn single_only(&self, peer: &str) -> SingleOnly {
+        self.single_only
+            .borrow_mut()
+            .entry(peer.to_string())
+            .or_default()
+            .clone()
     }
     pub fn expired(&self, topic: &str) -> ExpiredMemo {
         self.expired
