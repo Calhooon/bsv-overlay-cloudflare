@@ -470,6 +470,78 @@ pub trait Storage {
     ) -> Result<Vec<String>, StorageError> {
         Ok(Vec::new())
     }
+    // ========================================================================
+    // The sync's page (engine 0.2.2)
+    // ========================================================================
+
+    /// Apply a GASP page's writes as ONE unit, in order, and answer the
+    /// statements it ran. A backend that can make it atomic should (D1's
+    /// `batch()`); this default applies them one at a time and stops at the
+    /// earliest fault, which is safe because every page write is idempotent and
+    /// the engine keeps the whole page queued until this answers `Ok`. A
+    /// [`crate::page_batch::PageWrite::Backend`] statement belongs to the
+    /// backend that deferred it: a backend that defers none never sees one,
+    /// and this default refuses it.
+    async fn write_batch(
+        &self,
+        writes: &[crate::page_batch::PageWrite],
+    ) -> Result<u64, StorageError> {
+        use crate::page_batch::PageWrite;
+        for write in writes {
+            match write {
+                PageWrite::Output { output, gasp } => {
+                    self.insert_output_with_origin(output, *gasp).await?;
+                }
+                PageWrite::Applied(tx) => self.insert_applied_transaction(tx).await?,
+                PageWrite::Backend(_) => {
+                    return Err(StorageError::Other(
+                        "a backend statement this storage did not defer".into(),
+                    ))
+                }
+            }
+        }
+        Ok(writes.len() as u64)
+    }
+
+    /// Of `outpoints` (`(txid, output_index)`), the outputs held in `topic`,
+    /// without BEEF, spent or not: `find_output(txid, vout, Some(topic),
+    /// None, false)` for a page at once. Default: one read each.
+    async fn find_topic_outputs(
+        &self,
+        topic: &str,
+        outpoints: &[(String, u32)],
+    ) -> Result<Vec<Output>, StorageError> {
+        let mut held = Vec::new();
+        for (txid, vout) in outpoints {
+            if let Some(output) = self
+                .find_output(txid, *vout, Some(topic), None, false)
+                .await?
+            {
+                held.push(output);
+            }
+        }
+        Ok(held)
+    }
+
+    /// Of `txids`, those with an applied row in `topic`. Default: one read
+    /// each.
+    async fn find_applied_transactions(
+        &self,
+        topic: &str,
+        txids: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        let mut applied = Vec::new();
+        for txid in txids {
+            let tx = AppliedTransaction {
+                txid: txid.clone(),
+                topic: topic.to_string(),
+            };
+            if self.does_applied_transaction_exist(&tx).await? {
+                applied.push(txid.clone());
+            }
+        }
+        Ok(applied)
+    }
 }
 
 /// A (host, topic)'s yieldless streak (bsv-low #555, the delta-2 fold's
@@ -505,6 +577,26 @@ pub struct PeerSyncHealth {
 /// `Box<dyn Storage>` over the same instance. Pure delegation, no semantics.
 #[async_trait(?Send)]
 impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
+    async fn write_batch(
+        &self,
+        writes: &[crate::page_batch::PageWrite],
+    ) -> Result<u64, StorageError> {
+        (**self).write_batch(writes).await
+    }
+    async fn find_topic_outputs(
+        &self,
+        topic: &str,
+        outpoints: &[(String, u32)],
+    ) -> Result<Vec<Output>, StorageError> {
+        (**self).find_topic_outputs(topic, outpoints).await
+    }
+    async fn find_applied_transactions(
+        &self,
+        topic: &str,
+        txids: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        (**self).find_applied_transactions(topic, txids).await
+    }
     async fn insert_output_with_origin(
         &self,
         output: &Output,

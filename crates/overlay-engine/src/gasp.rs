@@ -1228,6 +1228,23 @@ pub trait GASPStorage {
     async fn remembered_expired(&self, _outpoints: &[String]) -> Result<Vec<String>, GASPError> {
         Ok(Vec::new())
     }
+
+    /// A page of the peer's list begins (engine 0.2.2): its admissions are
+    /// written in one batch at its end ([`Self::close_page`]). Default:
+    /// nothing buffered, every write is made as it comes.
+    fn open_page(&self) {}
+
+    /// The page ends: apply its writes. An `Err` admitted nothing of the
+    /// writes still queued; the sync then fails the page. Default: `Ok`.
+    async fn close_page(&self) -> Result<(), GASPError> {
+        Ok(())
+    }
+
+    /// Read at once what the page's admissions will ask the store: the
+    /// applied state of `roots` (the page's fresh txids, as it opens) and
+    /// the held inputs of `nodes` (a batch answer, once in hand). Default:
+    /// nothing read ahead.
+    async fn prefetch_page(&self, _roots: &[String], _nodes: &[&GASPNode]) {}
 }
 
 // ============================================================================
@@ -1519,6 +1536,10 @@ struct PageProgress {
     pages: u64,
     advanced: bool,
     reached_tip: bool,
+    /// The cursor safe before any admission of the open page (engine
+    /// 0.2.2): while the page's writes are queued, nothing above it is
+    /// written yet.
+    floor: Option<u64>,
 }
 
 /// The node batch's state in one sync (engine 0.2.1, #58).
@@ -2552,6 +2573,7 @@ impl<'a> GASPSync<'a> {
         self.page.pages = 0;
         self.page.advanced = false;
         self.page.reached_tip = false;
+        self.page.floor = None;
         self.pruned.borrow_mut().clear();
         self.pruned_inputs.set(0);
         self.absent.borrow_mut().clear();
@@ -2869,6 +2891,31 @@ impl<'a> GASPSync<'a> {
             self.completed_cursor =
                 Self::cursor_for_completed(&completed_scores, unfinished, initial_interaction);
 
+            // Engine 0.2.2: the page's admissions are written in one batch
+            // at its end, and the applied state of its fresh roots is read
+            // once now. Only where they are made inside the sync (the
+            // finalize hook): without it they are submitted after the sync,
+            // one at a time, as before.
+            let paged = self.finalized_hook.is_some();
+            if paged {
+                self.page.floor = Some(self.completed_cursor);
+                self.storage.open_page();
+            }
+            let roots: Vec<String> = response
+                .utxo_list
+                .iter()
+                .filter(|u| {
+                    let o = format!("{}.{}", u.txid, u.output_index);
+                    !known_outpoints.contains(&o)
+                        && !shared_outpoints.contains(&o)
+                        && !failed_outpoints.contains(&o)
+                })
+                .map(|u| u.txid.clone())
+                .collect();
+            if paged && !roots.is_empty() {
+                self.storage.prefetch_page(&roots, &[]).await;
+            }
+
             for (position, utxo) in response.utxo_list.iter().enumerate() {
                 if self.request_stopped() {
                     let score = lowest_ahead[position];
@@ -3024,6 +3071,8 @@ impl<'a> GASPSync<'a> {
                     Self::cursor_for_completed(&completed_scores, unfinished, initial_interaction);
             }
 
+            self.close_page().await?;
+
             // Keep the settled frontier and any completed scores above a gap.
             // An advancing page needs no older score again.
             completed_scores.retain(|score| *score >= self.completed_cursor);
@@ -3085,6 +3134,9 @@ impl<'a> GASPSync<'a> {
             }
         }
 
+        // A page left mid-way (the request's allowance) is written now.
+        self.close_page().await?;
+
         // Gap-guard: if any graph ingest failed transiently, cap the cursor
         // strictly below the lowest failed score so the next sync re-pulls it
         // (the remote serves `score >= since`). Floored at `initial_interaction`
@@ -3123,6 +3175,30 @@ impl<'a> GASPSync<'a> {
 
         info!("{} Sync completed!", self.log_prefix);
         Ok(())
+    }
+
+    /// Write the open page's admissions (engine 0.2.2). A batch that fails
+    /// admitted nothing of the page: the cursor falls back to the page's
+    /// floor and the sync fails, so the next run is served the page again.
+    async fn close_page(&mut self) -> Result<(), GASPError> {
+        let Some(floor) = self.page.floor.take() else {
+            return Ok(());
+        };
+        if let Err(e) = self.storage.close_page().await {
+            warn!("{} {}", self.log_prefix, e);
+            self.completed_cursor = self.completed_cursor.min(floor);
+            self.last_interaction = self.completed_cursor;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// The cursor safe before the page whose writes are still queued, if a
+    /// page was open when `sync` last stopped (engine 0.2.2): its future was
+    /// dropped mid-page. The caller writes the queue or, failing that, keeps
+    /// the cursor at this floor.
+    pub fn page_floor(&self) -> Option<u64> {
+        self.page.floor
     }
 
     /// Request a graph or resume its durable record. Saved holds are safe
@@ -4485,6 +4561,22 @@ impl<'a> GASPSync<'a> {
             }
         }
         crate::meter::batch_nodes(served);
+        // Engine 0.2.2: the store is asked once for what these nodes'
+        // admissions will read (their held inputs).
+        let nodes: Vec<GASPNode> = {
+            let prefetched = self.batch.prefetched.borrow();
+            asked
+                .iter()
+                .filter_map(|o| match prefetched.get(o) {
+                    Some(Ok(node)) => Some(node.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        if !nodes.is_empty() {
+            let nodes: Vec<&GASPNode> = nodes.iter().collect();
+            self.storage.prefetch_page(&[], &nodes).await;
+        }
         let mut queue = self.batch.queue.borrow_mut();
         for left_out in asked
             .iter()

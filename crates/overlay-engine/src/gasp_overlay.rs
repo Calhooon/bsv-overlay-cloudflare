@@ -767,6 +767,47 @@ impl<'a> OverlayGASPStorage<'a> {
 
 #[async_trait(?Send)]
 impl GASPStorage for OverlayGASPStorage<'_> {
+    fn open_page(&self) {
+        if let Some(page) = crate::page_batch::installed() {
+            page.open();
+        }
+    }
+
+    async fn close_page(&self) -> Result<(), GASPError> {
+        let Some(page) = crate::page_batch::installed() else {
+            return Ok(());
+        };
+        page.close();
+        match page.flush(self.storage).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                page.discard();
+                Err(GASPError::StorageError(format!(
+                    "the page's storage batch failed, nothing of it admitted: {e}"
+                )))
+            }
+        }
+    }
+
+    async fn prefetch_page(&self, roots: &[String], nodes: &[&GASPNode]) {
+        if crate::page_batch::current().is_none() {
+            return;
+        }
+        let mut inputs = Vec::new();
+        for node in nodes {
+            let Ok(tx) = Transaction::from_hex(&node.raw_tx) else {
+                continue;
+            };
+            for input in &tx.inputs {
+                let source = input.get_source_txid().unwrap_or_default();
+                if !source.is_empty() {
+                    inputs.push((source, input.source_output_index));
+                }
+            }
+        }
+        crate::page_batch::prefetch(self.storage, &self.topic, &inputs, roots).await;
+    }
+
     fn sync_expiry(&self, node: &GASPNode, outpoint: &str) -> Result<Option<u64>, GASPError> {
         let Some(manager) = self.topic_manager else {
             return Ok(None);
