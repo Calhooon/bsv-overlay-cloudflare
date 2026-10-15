@@ -532,7 +532,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// lens's NOTE-5).
 /// 254 to 256 for engine 0.2.0 (#57): `gasp_route_faults`, one day of route faults counted apart from the peers'
 /// health, and its age index.
-pub const OVERLAY_MIGRATION_COUNT: usize = 256;
+/// 256 to 258 for bsv-low #669C (2026-10-15): DROP + re-CREATE `idx_owed_rows_claimable_hop` as a PARTIAL index
+/// (`WHERE family = 'hop-stranded'`), so an in-progress owed row no longer pays an index write it never needed (the
+/// owed first read's 18 -> 26 budget regression); the stale-mark subquery's COVERING SEARCH plan is unchanged.
+pub const OVERLAY_MIGRATION_COUNT: usize = 258;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1956,6 +1959,23 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // by contract); a cold app-layer isolate ahead of the overlay still runs the query (the PK-autoindex scan) until
     // the overlay warms. Pinned in `owed_tip_probe_sqlite.rs`.
     "CREATE INDEX IF NOT EXISTS idx_owed_rows_claimable_hop ON owed_rows(json_extract(facts, '$.claimable'), family, identity)",
+    // bsv-low #669C (2026-10-15): the index above is replaced by a PARTIAL one, `WHERE family = 'hop-stranded'`.
+    // The full index covered EVERY claimable row, and an in-progress "rejoin" row is `claimable = 1` too, so every
+    // owed snapshot paid one index write per in-progress row it inserted: identity A's 8 in-progress pots pushed the
+    // D1 budget tier's owed first read from 18 to 26 writes, over the 20 ceiling (the only engine `make ci` red; the
+    // #669 design promised no read-path cost). The partial index indexes ONLY the rows the `/internal/tip-changed`
+    // stale mark asks for (`family = 'hop-stranded' AND json_extract(claimable) = 1`), so an in-progress INSERT
+    // writes NOTHING to it (the write is back to 18) while the stale-mark subquery is UNCHANGED: it keeps the same
+    // three key columns, so its plan stays the byte-identical COVERING index SEARCH
+    // `(json_extract(claimable)=? AND family=?)` (pin669_n5), and the #662 withheld-payout read (`family='payout'`,
+    // no claimable predicate) still cannot use it and keeps its PK (write_derived_reads.rs). The full index shipped
+    // to beta (migration 254), so this is a DROP + CREATE pair APPENDED to the list (data-safe for an index,
+    // #638's rule), never an edit of the shipped statement. `run_migrations` is a whole-list re-run, so the net is
+    // always the partial index: a fresh DB runs CREATE-full then DROP then CREATE-partial; a re-run's CREATE-full
+    // IF-NOT-EXISTS is a no-op over the existing partial, then the DROP + CREATE-partial recreate it. Pinned by
+    // `pin669c_the_claimable_hop_index_does_not_index_in_progress_rows` in `owed_tip_probe_sqlite.rs`.
+    "DROP INDEX IF EXISTS idx_owed_rows_claimable_hop",
+    "CREATE INDEX IF NOT EXISTS idx_owed_rows_claimable_hop ON owed_rows(json_extract(facts, '$.claimable'), family, identity) WHERE family = 'hop-stranded'",
 ];
 
 // =============================================================================
@@ -2354,18 +2374,26 @@ mod tests {
             assert!(!sql.is_empty(), "Migration {i} is empty");
             // Should start with CREATE (idempotent IF NOT EXISTS), ALTER
             // (additive; the runner ignores the re-run duplicate-column
-            // error via migration_error_is_benign), or INSERT OR IGNORE
+            // error via migration_error_is_benign), INSERT OR IGNORE
             // (a re-run-safe data carry: the PK dedups replays — used by
             // the result_markers → result_markers_v2 carry, whose source
-            // table is write-frozen). Plain INSERT / DROP / RENAME are
-            // still banned: the runner re-executes every statement on
-            // every cold start.
+            // table is write-frozen), or DROP INDEX IF EXISTS (re-run-safe
+            // and DATA-safe: an index is a derived structure, so dropping
+            // one loses no row, and IF EXISTS makes the whole-list re-run a
+            // no-op — the index-equivalent of #638's DROP TRIGGER IF EXISTS
+            // + CREATE pair; used by bsv-low #669C to re-CREATE
+            // idx_owed_rows_claimable_hop as a partial index). Plain INSERT,
+            // DROP TABLE / DROP COLUMN and RENAME are still banned (data
+            // loss), as is a bare DROP INDEX without IF EXISTS (it errors on
+            // the re-run): the runner re-executes every statement on every
+            // cold start.
             let trimmed = sql.trim().to_uppercase();
             assert!(
                 trimmed.starts_with("CREATE")
                     || trimmed.starts_with("ALTER TABLE")
-                    || trimmed.starts_with("INSERT OR IGNORE"),
-                "Migration {i} should start with CREATE, ALTER TABLE, or INSERT OR IGNORE, got: {}",
+                    || trimmed.starts_with("INSERT OR IGNORE")
+                    || trimmed.starts_with("DROP INDEX IF EXISTS"),
+                "Migration {i} should start with CREATE, ALTER TABLE, INSERT OR IGNORE, or DROP INDEX IF EXISTS, got: {}",
                 &trimmed[..30.min(trimmed.len())]
             );
         }
