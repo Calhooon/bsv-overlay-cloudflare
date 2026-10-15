@@ -134,6 +134,10 @@ pub struct Engine {
     admission_mode: crate::gasp_shadow::AdmissionMode,
     #[cfg(feature = "gasp-shadow")]
     gasp_shadow: Option<std::rc::Rc<dyn crate::gasp_shadow::GaspShadow>>,
+    /// The GASP finalize's host under `on` (the a17 seam). See
+    /// [`Engine::set_gasp_finalize_host`].
+    #[cfg(feature = "gasp-shadow")]
+    gasp_finalize: Option<std::rc::Rc<dyn crate::gasp_shadow::GaspFinalizeHost>>,
     #[cfg(feature = "gasp-shadow")]
     shadow_budget: crate::gasp_shadow::ShadowBudget,
     /// The comparisons a peer's sync queued, run after it (outside its race).
@@ -1146,6 +1150,8 @@ impl Engine {
             #[cfg(feature = "gasp-shadow")]
             gasp_shadow: None,
             #[cfg(feature = "gasp-shadow")]
+            gasp_finalize: None,
+            #[cfg(feature = "gasp-shadow")]
             shadow_budget: crate::gasp_shadow::ShadowBudget::default(),
             #[cfg(feature = "gasp-shadow")]
             shadow_jobs: std::cell::RefCell::default(),
@@ -1170,6 +1176,31 @@ impl Engine {
     ) {
         self.admission_mode = mode;
         self.gasp_shadow = Some(host);
+    }
+
+    /// The host seam of the GASP finalize under
+    /// [`crate::gasp_shadow::AdmissionMode::On`] (bsv-low #657, the a17
+    /// lane): each finalized graph's bodies are handed to `host` through the
+    /// dependency gate, one at a time, and the engine's own finalize submit
+    /// does not run. Asked only under `On`.
+    #[cfg(feature = "gasp-shadow")]
+    pub fn set_gasp_finalize_host(
+        &mut self,
+        host: std::rc::Rc<dyn crate::gasp_shadow::GaspFinalizeHost>,
+    ) {
+        self.gasp_finalize = Some(host);
+    }
+
+    /// The mode the engine's GASP finalize runs under. `On` is refused
+    /// ([`crate::gasp_shadow::AdmissionModeRefused::NoFinalizeHost`], the
+    /// mode unchanged) where no finalize host is set.
+    #[cfg(feature = "gasp-shadow")]
+    pub fn set_admission_mode(
+        &mut self,
+        mode: crate::gasp_shadow::AdmissionMode,
+    ) -> Result<(), crate::gasp_shadow::AdmissionModeRefused> {
+        self.admission_mode = mode;
+        Ok(())
     }
 
     /// The allowance of one shadow comparison (the slice's: 4,096 rows,

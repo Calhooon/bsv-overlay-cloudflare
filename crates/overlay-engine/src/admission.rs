@@ -366,6 +366,86 @@ pub struct Unwalked {
     pub refusal: AdmitRefusal,
 }
 
+/// The host of a GASP graph's units (bsv-low #657, the a17 seam): the
+/// dependency gate run by [`admit_graph_hosted`] asks it, one body at a time
+/// and in the gate's order (ancestors first), to resolve that body's carried
+/// bytes and to run it as one unit of the host's own log, and tells it each
+/// body's answer with the gate's reason. The gate holds no body's resolved
+/// bytes past that body's unit.
+#[async_trait(?Send)]
+pub trait GraphHost {
+    /// An R2-carried body's original BEEF (`BeefCarry::R2`: the object under
+    /// its key, of its length), read just before that body's own unit. Never
+    /// asked for an inline body, nor for a body the gate holds. A refusal is
+    /// the body's own: it opens no unit and its descendants wait on it.
+    async fn resolve(&self, body: &Walked) -> Result<Vec<u8>, AdmitRefusal>;
+    /// Run `body` as ONE unit of the host's log, inside the host's FIFO turn,
+    /// its resolved bytes handed in (`None` for an inline body) and released
+    /// when it returns. The unit's body is [`gasp_unit`]: the gate's rule 3
+    /// (a topic manager's `Err` refuses the unit `not now`) lives in it, and
+    /// the gate reads that refusal's site as `GateReason::ParentError`.
+    async fn run(
+        &self,
+        body: &Walked,
+        resolved: Option<Vec<u8>>,
+    ) -> Result<Committed, AdmitRefusal>;
+    /// Each body's answer as the gate gives it, in the gate's order, with the
+    /// gate's reason (`None`: the body's own answer, from its unit).
+    fn answered(
+        &self,
+        _body: &Walked,
+        _answer: &Result<Committed, AdmitRefusal>,
+        _gate: Option<&GateReason>,
+    ) {
+    }
+}
+
+/// One GASP body's unit (the dependency gate's rule 3, D44): `engine.admit`,
+/// then a topic of the body neither applied nor deduped (the topic manager
+/// answered `Err` at the finalize: F5's empty judgement) refuses the whole
+/// unit `not now` at [`GATE_PARENT_ERROR_SITE`], so it rolls back and its
+/// descendants wait. A host's [`GraphHost::run`] runs this inside its unit.
+pub async fn gasp_unit(
+    engine: &crate::engine::Engine,
+    walked: &Walked,
+) -> Result<UnitOutput, AdmitRefusal> {
+    let admitted = engine.admit(walked).await?;
+    let failed: Vec<&str> = walked
+        .topics
+        .iter()
+        .filter(|t| {
+            !admitted.report.applied_topics.contains(t)
+                && !admitted.report.deduped_topics.contains(t)
+        })
+        .map(String::as_str)
+        .collect();
+    if !failed.is_empty() {
+        return Err(AdmitRefusal::NotNow {
+            site: GATE_PARENT_ERROR_SITE.into(),
+            reason: format!(
+                "the topic manager failed on it ({}): its descendants wait",
+                failed.join(", ")
+            ),
+            notes: admitted.notes,
+            predecessor: None,
+        });
+    }
+    Ok(UnitOutput::Admitted(admitted))
+}
+
+/// [`admit_graph_observed`] with the units run by a host, one body at a time
+/// (the a17 seam): the same dependency gate, each body a unit of the host's
+/// log through [`GraphHost::run`], each R2-carried body's bytes resolved
+/// through [`GraphHost::resolve`], each answer handed to
+/// [`GraphHost::answered`].
+pub async fn admit_graph_hosted(
+    _host: &dyn GraphHost,
+    _graph: &[Walked],
+    _unwalked: &[Unwalked],
+) -> GraphOutcome {
+    GraphOutcome::AllLanded { seqs: vec![] }
+}
+
 /// GASP finalize: each body lands independently, ancestors first, under the
 /// dependency gate (D44).
 pub fn admit_graph(

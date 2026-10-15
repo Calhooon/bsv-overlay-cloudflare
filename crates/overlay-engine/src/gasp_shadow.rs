@@ -33,7 +33,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::admission::{
-    AdmitEvidence, AdmitRefusal, BeefCarry, Committed, GateReason, UnitOutput, UnitRunner,
+    AdmitEvidence, AdmitRefusal, BeefCarry, Committed, GateReason, GraphOutcome, UnitOutput,
+    UnitRunner, Walked,
 };
 use crate::engine::{Engine, EngineError, MutationReport};
 use crate::types::Steak;
@@ -45,6 +46,89 @@ pub enum AdmissionMode {
     #[default]
     Off,
     Shadow,
+    /// A's GASP finalize (the a17 seam): every finalized graph's bodies are
+    /// walked by the engine and handed, through the dependency gate, to the
+    /// host's log ([`GaspFinalizeHost`]); the engine's own finalize submit
+    /// does not run. Set only where a host is set
+    /// ([`crate::engine::Engine::set_admission_mode`]).
+    On,
+}
+
+/// The engine's refusal of a mode it cannot run.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AdmissionModeRefused {
+    /// `on` with no GASP finalize host set: nothing would admit the graphs.
+    #[error(
+        "ADMISSION_MODE=on is refused: no GASP finalize host is set (Engine::set_gasp_finalize_host)"
+    )]
+    NoFinalizeHost,
+}
+
+/// One finalized GASP graph handed to the host under [`AdmissionMode::On`].
+pub struct FinalizeGraph<'a> {
+    pub peer: &'a str,
+    pub topic: &'a str,
+    /// The root's txid: the graph's last body.
+    pub root: &'a str,
+    /// Every body's original BEEF in the peer's order (ancestors first).
+    pub beefs: &'a [Vec<u8>],
+}
+
+/// One body of a [`FinalizeGraph`], as the dependency gate hands it on.
+pub struct FinalizeBody<'a> {
+    pub graph: &'a FinalizeGraph<'a>,
+    /// Its place in [`FinalizeGraph::beefs`].
+    pub position: usize,
+    /// The engine's walk of it (`historical-tx-no-spv`, no network; an R2
+    /// carry past the inline bound, whose bytes the host puts before its hop).
+    pub walked: &'a Walked,
+}
+
+impl FinalizeBody<'_> {
+    /// The body's original BEEF.
+    pub fn beef(&self) -> &[u8] {
+        &self.graph.beefs[self.position]
+    }
+}
+
+/// The host seam of the GASP finalize under [`AdmissionMode::On`] (bsv-low
+/// #657, the a17 lane). The engine walks each finalized graph's bodies, runs
+/// the dependency gate (D44) over them through
+/// [`crate::admission::admit_graph_hosted`], and hands each body the gate
+/// does not hold to [`Self::admit`], one at a time, ancestors first: the
+/// host runs it as ONE unit of its own log inside its FIFO turn (the unit's
+/// body [`crate::admission::gasp_unit`]), so the finalize's one
+/// materialization is the host's. The engine writes nothing of a graph. The
+/// cursor follows the host's word: [`Self::graph_done`] says whether the
+/// cursor may pass the graph (by default only when every body landed; a
+/// graph with a held body stays below it, so the peer's next sync re-sends
+/// the waiting part).
+#[async_trait(?Send)]
+pub trait GaspFinalizeHost {
+    /// An R2-carried body's original bytes, asked just before its own unit
+    /// and released after it (one body at a time). By default the graph's
+    /// own copy of that body.
+    async fn resolve(&self, body: &FinalizeBody<'_>) -> Result<Vec<u8>, AdmitRefusal> {
+        Ok(body.beef().to_vec())
+    }
+    /// Run one body as one unit of the host's log, inside its FIFO turn.
+    async fn admit(
+        &self,
+        body: &FinalizeBody<'_>,
+        resolved: Option<Vec<u8>>,
+    ) -> Result<Committed, AdmitRefusal>;
+    /// Each body's answer in the gate's order, with the gate's reason.
+    fn answered(
+        &self,
+        _body: &FinalizeBody<'_>,
+        _answer: &Result<Committed, AdmitRefusal>,
+        _gate: Option<&GateReason>,
+    ) {
+    }
+    /// The graph's outcome; `true` lets the cursor pass it.
+    async fn graph_done(&self, _graph: &FinalizeGraph<'_>, outcome: &GraphOutcome) -> bool {
+        matches!(outcome, GraphOutcome::AllLanded { .. })
+    }
 }
 
 impl AdmissionMode {
