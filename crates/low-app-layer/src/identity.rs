@@ -637,11 +637,15 @@ pub struct Upstream {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamError {
-    /// No binding, a transport fault, or a body read fault.
+    /// A transport fault or a body read fault.
     Transport(String),
     Timeout,
     /// The body (declared or read) is over the caller's cap.
     TooLarge,
+    /// The `IDENTITY` binding is absent (the prod null-resolver mode): a
+    /// nameable 503 distinct from a bound-but-broken resolver's upstreamFault
+    /// (bsv-low DESIGN-NULL-RESOLVER-2026-10-15).
+    NoResolver,
 }
 
 /// The resolver, reached through the `IDENTITY` service binding in the worker
@@ -695,9 +699,14 @@ pub enum Outcome {
     /// The kill list could not be read: the picture route answered 503, a
     /// JSON route answered without pictures (`no-store`).
     KillListFault,
+    /// The `IDENTITY` binding is absent (the prod null-resolver mode): the JSON
+    /// routes answered 503 `{"status":"error","code":"ERR_NO_RESOLVER"}`
+    /// (`no-store`); its own counter, apart from `upstreamFault`, so a real
+    /// resolver outage stays distinct (bsv-low DESIGN-NULL-RESOLVER-2026-10-15).
+    NoResolver,
 }
 
-const OUTCOME_NAMES: [&str; 11] = [
+const OUTCOME_NAMES: [&str; 12] = [
     "served",
     "badRequest",
     "notFound",
@@ -709,6 +718,7 @@ const OUTCOME_NAMES: [&str; 11] = [
     "unauthorized",
     "upstreamFault",
     "killListFault",
+    "noResolver",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -761,6 +771,7 @@ impl Answer {
 
 fn upstream_fault(e: &UpstreamError) -> Answer {
     match e {
+        UpstreamError::NoResolver => no_resolver_answer(),
         UpstreamError::Timeout | UpstreamError::Transport(_) => {
             Answer::error(503, "identity resolver unavailable", Outcome::UpstreamFault)
         }
@@ -770,6 +781,26 @@ fn upstream_fault(e: &UpstreamError) -> Answer {
             Outcome::UpstreamFault,
         ),
     }
+}
+
+/// The binding-absent answer (the prod null-resolver mode): 503
+/// `{"status":"error","code":"ERR_NO_RESOLVER"}`, `no-store`,
+/// [`Outcome::NoResolver`]. Deliberately DISTINCT from a bound-but-broken
+/// resolver's opaque `upstreamFault` 503 so a real outage stays red and the
+/// prod-gate legs read the null-resolver mode by name (bsv-low
+/// DESIGN-NULL-RESOLVER-2026-10-15 §1.2).
+fn no_resolver_answer() -> Answer {
+    #[derive(Serialize)]
+    struct Body {
+        status: &'static str,
+        code: &'static str,
+    }
+    let body = serde_json::to_string(&Body {
+        status: "error",
+        code: "ERR_NO_RESOLVER",
+    })
+    .expect("a fixed struct serializes");
+    Answer::json(503, body, NO_STORE, Outcome::NoResolver)
 }
 
 /// Ask the resolver for `keys` and parse the answer, or the error answer.
@@ -977,6 +1008,16 @@ pub async fn picture_answer<R: Resolver, K: KillList>(r: &R, k: &K, hash_param: 
     {
         Ok(up) => up,
         Err(UpstreamError::TooLarge) => return Answer::picture_not_found(Outcome::Oversize),
+        // The picture route stays OPAQUE with no resolver bound: it is
+        // front-door-exempt bytes, read by no leg, and must never become an
+        // ERR_NO_RESOLVER oracle. Byte-identical to a bound-but-broken
+        // resolver's 503 (DESIGN-NULL-RESOLVER-2026-10-15 §1.2).
+        Err(UpstreamError::NoResolver) => {
+            let mut a = Answer::error(503, "identity resolver unavailable", Outcome::UpstreamFault);
+            a.headers
+                .push(("Content-Security-Policy", PICTURE_CSP.to_string()));
+            return a;
+        }
         Err(e) => {
             let mut a = upstream_fault(&e);
             a.headers
@@ -1184,7 +1225,7 @@ fn charge_isolate(ip: &str, identity: Option<&str>, units: u32) -> Option<Answer
 // Counters
 // ---------------------------------------------------------------------------
 
-static COUNTS: [[AtomicU64; 11]; 5] = [const { [const { AtomicU64::new(0) }; 11] }; 5];
+static COUNTS: [[AtomicU64; 12]; 5] = [const { [const { AtomicU64::new(0) }; 12] }; 5];
 /// Resolver entries that carried no `display` (an old resolver): mapped all null.
 static DISPLAY_ABSENT: AtomicU64 = AtomicU64::new(0);
 /// Picks whose `name` is no row of the same body's `names[]`: `since` null.
@@ -1417,14 +1458,14 @@ impl Resolver for BindingResolver {
     }
 }
 
-/// A resolver that is not bound: every call is a transport fault.
+/// A resolver that is not bound (the prod null-resolver mode): every call is
+/// [`UpstreamError::NoResolver`], answered as a nameable 503 distinct from a
+/// bound-but-broken resolver's `upstreamFault`.
 pub struct Unbound;
 
 impl Resolver for Unbound {
     async fn get(&self, _: &str, _: usize) -> std::result::Result<Upstream, UpstreamError> {
-        Err(UpstreamError::Transport(
-            "the IDENTITY binding is not configured".to_string(),
-        ))
+        Err(UpstreamError::NoResolver)
     }
 }
 

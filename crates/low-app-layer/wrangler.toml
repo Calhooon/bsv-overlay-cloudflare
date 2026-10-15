@@ -173,17 +173,16 @@ service = "low-relay"
 [[services]]
 binding = "OVERLAY"
 service = "low-overlay"
-# bsv-low #532: LOW's identity resolver (same account) for the identity views (`src/identity.rs`): names,
-# pictures and their SMT proofs. Same 1042 rule as RELAY. `service` is a worker name, not a secret.
-[[services]]
-binding = "IDENTITY"
-service = "low-identity-resolver"
-
-# bsv-low #532: the identity views' kill list (one key per killed picture hash, written only by
-# `POST /internal/identity/kill`). id is a placeholder, injected at deploy time like AUTH_SESSIONS'.
-[[kv_namespaces]]
-binding = "IDENTITY_KILL"
-id = "__LOW_APPLAYER_DEFAULT_KV_IDENTITY_KILL_ID__"  # low-app-layer-identity-kill
+# bsv-low DESIGN-NULL-RESOLVER-2026-10-15 (remedy B): the IDENTITY service
+# binding (LOW's identity resolver, for the `src/identity.rs` views) and the
+# IDENTITY_KILL KV are DELIBERATELY ABSENT from prod until the identity window
+# (remedy A) creates the resolver worker and the prod kill KV. With no binding
+# the identity reads answer one nameable 503, {"status":"error","code":
+# "ERR_NO_RESOLVER"} (Outcome::NoResolver), distinct from a bound-but-broken
+# resolver's upstreamFault 503 so a real outage stays red. The IDENTITY_URL and
+# IDENTITY_APP_ORIGINS vars stay in [vars] above (IDENTITY_APP_ORIGINS is
+# load-bearing for CORS). The identity window re-adds both blocks here as a
+# config-only redeploy. [env.beta] keeps the resolver and its kill KV bound.
 
 # ══════════════════════════════════════════════════════════════════════════
 # beta — the ISOLATED pre-release stack (bsv-low, 2026-08-12)
