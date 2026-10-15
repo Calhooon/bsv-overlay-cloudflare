@@ -5206,6 +5206,11 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             });
             // bsv-low #469/#669: the present tip is the 30-s isolate cache (`beef_guard::present_tip`): at most one
             // chaintracks call per 30 s per isolate, self-healed from CHAINTRACKS, never a per-request uncached read.
+            // DELIBERATE (the FIX-669 lens's NOTE-4): #669 routed the #469 in-progress REFUND gate through this cache
+            // too (it was the uncached `chaintracks_present_height` before). The cached tip is always <= the real tip
+            // (`latch_present_tip` holds `height.max(held)`, and the cold/expired self-heal fetches the real height),
+            // so the refund gate can only open up to ~30 s LATE, never early — fail-safe (a refund is never shown
+            // claimable before its recovery height). Do not revert this to the uncached read to shave that window.
             let mut tip_now: Option<u64> = if needs_tip {
                 crate::beef_guard::present_tip(&ctx.env).await
             } else {
