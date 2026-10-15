@@ -3199,7 +3199,11 @@ pub async fn request_foreign_gasp_nodes(
     mut req: Request,
 ) -> worker::Result<Response> {
     use overlay_engine::node_batch::NodeBatchRequest;
-    let body: NodeBatchRequest = match req.json().await {
+    // Read as text and parsed by serde_json, so the request's
+    // `deny_unknown_fields` holds (the route witness found `req.json()`
+    // answering an unknown field 200).
+    let text = req.text().await?;
+    let body: NodeBatchRequest = match serde_json::from_str(&text) {
         Ok(b) => b,
         Err(e) => return json_error(&format!("Invalid GASP node batch request: {e}"), 400),
     };
