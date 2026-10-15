@@ -91,6 +91,7 @@ const _: () = assert!(
 /// number is the default). Lower sends more bodies through R2 and nothing
 /// else; the route tier sets it to drive the R2 path with small bodies.
 pub const QUEUE_MESSAGE_ROOM_VAR: &str = "MUTATION_QUEUE_INLINE_ROOM";
+/// The least inline room the var may set.
 pub const QUEUE_MESSAGE_ROOM_MIN: usize = 1024;
 
 /// PURE: the inline room in force ([`QUEUE_MESSAGE_ROOM_VAR`]).
@@ -356,6 +357,7 @@ pub enum Carriage {
 }
 
 impl Carriage {
+    /// The message, however it rides.
     #[must_use]
     pub fn message(&self) -> &MutationMessage {
         match self {
@@ -631,7 +633,12 @@ pub enum ReadStep {
     Acked(MissingVerdict),
     /// The replay's fault: noted and handed back. `missing`: the object was MISSING and the verdict did not show it
     /// landed; that note KEEPS the letter's class (E585-D3-L4: a missing object never promotes a "not now" letter).
-    Fault { fault: String, missing: bool },
+    Fault {
+        /// The fault noted.
+        fault: String,
+        /// Whether the object was missing.
+        missing: bool,
+    },
 }
 
 /// The consumer's read of a message's bytes, and its use of the verdict over a MISSING object: a
@@ -686,7 +693,9 @@ pub fn landed_ack_leaves_object(topics: &[String], applied: &[String], deduped: 
 /// and `row_object`, the object of the parked letter row the ack resolved; both left when `leaves`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LandedAck {
+    /// Whether the ack leaves the message's object in R2.
     pub leaves: bool,
+    /// The objects the ack deletes at the end of the batch.
     pub delete: Vec<String>,
 }
 

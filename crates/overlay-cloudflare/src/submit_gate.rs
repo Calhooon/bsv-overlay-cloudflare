@@ -500,14 +500,19 @@ pub enum SubmitAction {
     /// The one public path: run the broadcast + SEEN gate, then admit —
     /// executing the spend's scripts at the door first when `scripts` says so.
     ProceedWithNetworkGate {
+        /// The admission path.
         path: AdmissionPath,
+        /// Whether to execute the spend's scripts at the door before the gate.
         scripts: ScriptPolicy,
+        /// How to admit once the gate passes.
         admit: AdmitPolicy,
     },
     /// An operator on an unbarred path, or the lenient window → admit
     /// without the gate. `lenient_unbarred` marks the counted soak case.
     ProceedWithoutGate {
+        /// The admission path.
         path: AdmissionPath,
+        /// Whether this is the lenient window's counted soak case.
         lenient_unbarred: bool,
     },
 }

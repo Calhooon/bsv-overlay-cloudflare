@@ -54,7 +54,9 @@ pub mod refusal {
 /// One outpoint of a batch request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BatchOutpoint {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     pub vout: u32,
 }
 
@@ -69,21 +71,27 @@ impl BatchOutpoint {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeBatchRequest {
+    /// The outpoints asked for, in order.
     pub outpoints: Vec<BatchOutpoint>,
 }
 
 /// One entry of a batch answer: the node, or a refusal word.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeBatchEntry {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     pub vout: u32,
+    /// The node, when the peer served it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<GASPNode>,
+    /// The refusal word, when it did not ([`refusal`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
 }
 
 impl NodeBatchEntry {
+    /// The `txid.vout` form the sync keys outputs by.
     pub fn key(&self) -> String {
         format!("{}.{}", self.txid, self.vout)
     }
@@ -93,6 +101,7 @@ impl NodeBatchEntry {
 /// budget left out has no entry; the asker names it again in its next body.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeBatchAnswer {
+    /// The entries, in the asked order.
     pub nodes: Vec<NodeBatchEntry>,
 }
 
@@ -100,7 +109,9 @@ pub struct NodeBatchAnswer {
 /// of its body, which the sync holds to [`NODE_BATCH_MAX_BYTES`].
 #[derive(Debug, Clone, Default)]
 pub struct NodeBatch {
+    /// The answer.
     pub answer: NodeBatchAnswer,
+    /// The size of its body in bytes.
     pub bytes: usize,
 }
 

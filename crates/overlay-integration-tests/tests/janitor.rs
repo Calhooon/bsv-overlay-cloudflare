@@ -3,6 +3,7 @@
 //! Tests the janitor logic using mock HealthChecker and in-memory SHIP/SLAP storage.
 // bsv-stack-lean #134: test code
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![forbid(unsafe_code)]
 
 use async_trait::async_trait;
 use bsv_overlay_discovery::ship::storage::MemorySHIPStorage;

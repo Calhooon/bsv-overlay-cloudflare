@@ -37,16 +37,20 @@ use super::pot_covenant_param_region;
 pub struct RawInput {
     /// Previous txid, lowercase hex (display order).
     pub prev_txid: String,
+    /// The output index the input spends.
     pub prev_vout: u32,
+    /// The input's sequence number.
     pub sequence: u32,
 }
 
 /// A parsed raw tx — just the fields classification needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawTx {
+    /// The inputs, in order.
     pub inputs: Vec<RawInput>,
     /// `(satoshis, locking_script)` in output order.
     pub outputs: Vec<(u64, Vec<u8>)>,
+    /// The transaction's lock time.
     pub lock_time: u32,
 }
 
@@ -81,15 +85,25 @@ impl RawTx {
 /// The 10 committed params of a `Poc5TemplatePot` lock, as funded on-chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CovenantParams {
+    /// Seat A's public key, compressed.
     pub pub_a: [u8; 33],
+    /// Seat B's public key, compressed.
     pub pub_b: [u8; 33],
+    /// The tower's public key, compressed.
     pub pub_tower: [u8; 33],
+    /// The hash of the key seat A is paid to (P2PKH).
     pub pay_pkh_a: [u8; 20],
+    /// The hash of the key seat B is paid to (P2PKH).
     pub pay_pkh_b: [u8; 20],
+    /// The hash of the key the rake is paid to (P2PKH).
     pub rake_pkh: [u8; 20],
+    /// Seat A's stake, in satoshis.
     pub stake_a: u64,
+    /// Seat B's stake, in satoshis.
     pub stake_b: u64,
+    /// The fee each exit takes from the pot, in satoshis.
     pub fee_sats: u64,
+    /// The recovery height committed in the lock.
     pub recovery_height: u64,
 }
 
@@ -471,9 +485,13 @@ fn refund_template(p: &CovenantParams) -> Option<OutputSet> {
 /// (seat → identity is not derivable server-side — the app-layer's job).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PotVerdict {
+    /// Seat A won the pot.
     WinnerA,
+    /// Seat B won the pot.
     WinnerB,
+    /// The hand tied.
     Tie,
+    /// The stakes were refunded.
     Refund,
 }
 

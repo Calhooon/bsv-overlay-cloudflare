@@ -81,7 +81,9 @@ pub struct JanitorResult {
 /// Health-check result for a single domain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainHealthResult {
+    /// The domain checked.
     pub domain: String,
+    /// Whether it answered healthy.
     pub healthy: bool,
     /// Number of records associated with this domain.
     pub record_count: u32,

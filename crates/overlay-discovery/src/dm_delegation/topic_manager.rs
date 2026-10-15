@@ -25,6 +25,7 @@ pub const DM_DELEGATION_MARKER: &[u8] = b"delegation_revocation";
 pub struct DmDelegationTopicManager;
 
 impl DmDelegationTopicManager {
+    /// The topic manager; it holds no state.
     pub fn new() -> Self {
         Self
     }

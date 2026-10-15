@@ -10,6 +10,7 @@ use overlay_engine::types::{LookupQuestion, OutputListItem};
 pub(crate) const SHIP_DISCOVERY_LOOKUP_TIMEOUT_MS: u64 =
     bsv_rs::overlay::types::MAX_SHIP_QUERY_TIMEOUT_MS;
 
+/// The Worker's [`ShipLookupClient`]: a bounded `POST /lookup` over fetch.
 pub struct WorkerShipLookupClient;
 
 #[async_trait(?Send)]

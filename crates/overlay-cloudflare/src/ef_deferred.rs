@@ -125,6 +125,7 @@ pub const POLL_PREFIX: &str = "/submit-deferred/";
 /// them for `/health/invariants.queue.r2.efDeferred` and deleting an object no
 /// job row names past [`JOB_KEEP_MS`] (L1 (b)).
 pub const BEEF_BLOBS_BINDING: &str = "BEEF_BLOBS";
+/// The key prefix of the deferred bytes in `BEEF_BLOBS`.
 pub const R2_PREFIX: &str = "ef-deferred/";
 
 /// Where the arm runs: in the request, under the budget, or resumed by the
@@ -132,8 +133,13 @@ pub const R2_PREFIX: &str = "ef-deferred/";
 /// corroboration's cursor, the ancestors earlier invocations primed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkBudget {
+    /// In the request, under its budget.
     InRequest,
-    Resumed { from_leg: usize },
+    /// Resumed by the consumer.
+    Resumed {
+        /// The leg the walk continues at.
+        from_leg: usize,
+    },
 }
 
 impl WorkBudget {
@@ -176,7 +182,9 @@ impl WorkBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EfWork {
+    /// The subject transaction's EF bytes.
     pub subject_ef_bytes: usize,
+    /// The batch's EF bytes: the subject and its unproven ancestors.
     pub batch_ef_bytes: usize,
     /// NL-6d: the EF legs (the subject and its unproven ancestors).
     pub legs: usize,
@@ -419,22 +427,39 @@ const CHUNKS_DELETE_SQL: &str = "DELETE FROM ef_deferred_chunks WHERE reference 
 /// One job row.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Job {
+    /// The job's reference, the poll's key.
     pub reference: String,
+    /// The subject transaction's txid.
     pub subject_txid: String,
+    /// The topics the submission named.
     pub topics: String,
+    /// The submission's mode.
     pub submit_mode: String,
+    /// Whether the stored stream carries off-chain values (1) or not (0).
     pub has_off_chain: f64,
+    /// The BEEF's length within the stored stream.
     pub beef_len: f64,
+    /// The stored stream's length in bytes.
     pub bytes: f64,
+    /// Where the bytes rest: `d1` (the chunks table) or `r2` (`BEEF_BLOBS`).
     pub at_rest: String,
+    /// The chunks the bytes take in D1 (1 in R2).
     pub chunks: f64,
+    /// The subject transaction's EF bytes.
     pub subject_ef_bytes: f64,
+    /// The batch's EF bytes.
     pub batch_ef_bytes: f64,
+    /// The job's state: `queued`, `running`, `done` or `failed`.
     pub state: String,
+    /// Runs attempted since the job was last queued.
     pub attempts: f64,
+    /// The HTTP status of the arm's answer, once settled.
     pub status: Option<f64>,
+    /// The arm's answer, once settled (at most [`ANSWER_KEEP_BYTES`]).
     pub answer: Option<String>,
+    /// When the job was created, in milliseconds.
     pub created_at: f64,
+    /// When it last changed, in milliseconds.
     pub updated_at: f64,
     /// NL-6d: the corroboration's cursor.
     #[serde(default)]

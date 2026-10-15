@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 /// not in the index — the index only needs the lookup key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevealRecord {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     #[serde(rename = "outputIndex")]
     pub output_index: u32,
     /// Game ID (32 bytes, lowercase hex).
@@ -43,17 +45,22 @@ pub enum RevealQuery {
     /// "did the accused seat reveal?" query.
     #[serde(rename = "byGameSeat")]
     ByGameSeat {
+        /// The game id, 64-hex.
         #[serde(rename = "gameId")]
         game_id: String,
+        /// The seat: 0 for seat A, 1 for seat B.
         seat: u8,
+        /// Answer with the decoded index columns instead of the BEEF output list.
         #[serde(default)]
         decoded: bool,
     },
     /// All reveal records for one game (both seats).
     #[serde(rename = "byGameId")]
     ByGameId {
+        /// The game id, 64-hex.
         #[serde(rename = "gameId")]
         game_id: String,
+        /// Answer with the decoded index columns instead of the BEEF output list.
         #[serde(default)]
         decoded: bool,
     },
@@ -97,8 +104,10 @@ pub trait RevealStorage {
 /// REVEAL storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum RevealStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -116,10 +125,12 @@ pub struct MemoryRevealStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryRevealStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }

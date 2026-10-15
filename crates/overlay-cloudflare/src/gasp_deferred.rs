@@ -51,6 +51,7 @@ pub const GASP_GRAPH_BUDGET_NODES: u32 = overlay_engine::gasp::DEFAULT_GRAPH_BUD
 
 /// The names of the two vars (`[vars]` of a wrangler config): the consts'.
 pub const GASP_GRAPH_BUDGET_BYTES_VAR: &str = "GASP_GRAPH_BUDGET_BYTES";
+/// The var naming the graph budget's node count.
 pub const GASP_GRAPH_BUDGET_NODES_VAR: &str = "GASP_GRAPH_BUDGET_NODES";
 
 /// The two limbs this worker runs with, (bytes, nodes), from the vars
@@ -140,6 +141,7 @@ pub const DEFERRED_GRAPH_CHUNKS_CREATE: &str =
 /// their generation.
 pub const DEFERRED_GRAPHS_CHUNKS_COLUMN: &str =
     "ALTER TABLE gasp_deferred_graphs ADD COLUMN chunks INTEGER NOT NULL DEFAULT 0";
+/// The generation of a record's chunk rows.
 pub const DEFERRED_GRAPHS_GEN_COLUMN: &str =
     "ALTER TABLE gasp_deferred_graphs ADD COLUMN gen TEXT NOT NULL DEFAULT ''";
 
@@ -461,6 +463,7 @@ async fn delete_fault_parts(db: &D1Database, rows: &[RetiredFault]) -> worker::R
     Ok(())
 }
 
+/// Reset `outpoint`'s fault records on every peer of `topic` (an authenticated probe); the count reset.
 pub async fn readmit_fault(db: &D1Database, topic: &str, outpoint: &str) -> worker::Result<u64> {
     let rows = Query::new(FAULT_READMIT_SQL)
         .bind(topic)
@@ -631,6 +634,7 @@ pub const COUNTER_GASP_GRAPH_DROPPED: &str = "gasp_graph_dropped_total";
 pub const COUNTER_GASP_ANCHOR_WALK_HELD: &str = "gasp_anchor_walk_held_total";
 /// Finalized roots carrying their own proof.
 pub const COUNTER_GASP_ROOTS_PROVEN: &str = "gasp_roots_proven_total";
+/// Finalized roots carrying no proof of their own.
 pub const COUNTER_GASP_ROOTS_UNPROVEN: &str = "gasp_roots_unproven_total";
 /// Expired roots omitted before proof hydration.
 pub const COUNTER_GASP_EXPIRED_REFUSED: &str = "gasp_expired_refused_total";
@@ -638,7 +642,9 @@ pub const COUNTER_GASP_EXPIRED_REFUSED: &str = "gasp_expired_refused_total";
 /// `UNANCHORABLE_AFTER_FAULTED_RUNS` consecutive runs and the cursor passes
 /// them; invariants' `gaspUnanchorable`.
 pub const COUNTER_GASP_UNANCHORABLE: &str = "gasp_unanchorable_total";
+/// Roots recorded dead.
 pub const COUNTER_GASP_DEAD: &str = "gasp_dead_total";
+/// Expired fault records removed.
 pub const COUNTER_GASP_FAULT_EXPIRED: &str = "gasp_fault_expired_total";
 /// Strikes the engine could not write (engine 0.1.10): past
 /// this store's own ceiling or on its fault;
@@ -727,15 +733,25 @@ pub async fn record_counters(
 /// One row of the health list.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthRow {
+    /// The peer the graph is walked from.
     pub host: String,
+    /// The topic.
     pub topic: String,
+    /// The root UTXO, `txid.outputIndex`.
     pub outpoint: String,
+    /// Nodes fetched so far.
     pub nodes: f64,
+    /// Inputs still to ask for.
     pub pending: f64,
+    /// Calls spent on the graph over every pass.
     pub calls: f64,
+    /// Passes that deferred it.
     pub passes: f64,
+    /// Why it was last deferred.
     pub reason: String,
+    /// The record's size in bytes.
     pub bytes: f64,
+    /// Seconds since it was saved, when known.
     #[serde(rename = "ageSecs")]
     pub age_secs: Option<f64>,
 }

@@ -33,6 +33,7 @@ pub struct OrphanEvent {
     /// lexicographic order IS chronological order for this fixed shape, and
     /// [`parse_block_status_page`] admits no other shape.
     pub orphaned_at: String,
+    /// The orphaned block's height.
     pub height: u64,
     /// Lower-cased 64-hex display hash.
     pub hash: String,
@@ -55,8 +56,11 @@ impl OrphanEvent {
 /// resurrected and orphaned again carries a NEWER stamp and is a new event.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EventKey {
+    /// Arcade's orphan stamp, the leading key.
     pub orphaned_at: String,
+    /// The orphaned block's height, compared second.
     pub height: u64,
+    /// The orphaned block's display hash, compared last.
     pub hash: String,
 }
 
@@ -249,7 +253,9 @@ pub fn next_page_before(next_cursor: Option<u64>) -> Option<u64> {
 /// stopped, and whether the leg reached the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LegProgress {
+    /// The last row the leg examined; `None` before any page.
     pub after: Option<RowKey>,
+    /// Whether the leg walked its height to the end.
     pub exhausted: bool,
 }
 
@@ -258,9 +264,13 @@ pub struct LegProgress {
 /// isolates, until every leg is exhausted; only then does the cursor move.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingEvent {
+    /// The orphaned block being applied.
     pub event: OrphanEvent,
+    /// The spenders leg's progress through the orphaned height.
     pub spenders: LegProgress,
+    /// The pot BEEFs leg's progress through the orphaned height.
     pub pot_beefs: LegProgress,
+    /// The transactions leg's progress through the orphaned height.
     pub transactions: LegProgress,
     /// Consecutive passes this event was HELD (chaintracks not yet past it).
     pub held_passes: u32,
@@ -272,6 +282,7 @@ pub struct PendingEvent {
 }
 
 impl PendingEvent {
+    /// A fresh pending event with no leg walked.
     pub fn new(event: OrphanEvent) -> Self {
         Self {
             event,
@@ -321,7 +332,9 @@ pub enum ReleaseReason {
 /// One released event: the key (height + hash + stamp) and the reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnresolvedEvent {
+    /// The released event's key.
     pub key: EventKey,
+    /// Why it was released.
     pub why: ReleaseReason,
 }
 
@@ -339,12 +352,16 @@ pub const UNRESOLVED_KEPT: usize = 32;
 /// `/internal/reorg` over.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsumerState {
+    /// The document's version ([`CONSUMER_STATE_VERSION`]).
     #[serde(default = "default_version")]
     pub v: u32,
+    /// The last event finished; `None` before any.
     #[serde(default)]
     pub cursor: Option<EventKey>,
+    /// The event being applied, if any.
     #[serde(default)]
     pub pending: Option<PendingEvent>,
+    /// The released events, newest kept ([`UNRESOLVED_KEPT`]).
     #[serde(default)]
     pub unresolved: Vec<UnresolvedEvent>,
 }
@@ -415,6 +432,7 @@ impl ConsumerState {
         Ok(s)
     }
 
+    /// The state as its JSON document.
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }

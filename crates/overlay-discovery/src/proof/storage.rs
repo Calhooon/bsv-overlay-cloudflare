@@ -77,17 +77,20 @@ pub struct ProofRecord {
     /// hands below are the replay's OWN derivation, never the bundle's words.
     #[serde(rename = "bundleValid", default)]
     pub bundle_valid: Option<bool>,
+    /// The seat the replay found the winner: 0 for seat A, 1 for seat B.
     #[serde(rename = "winnerSeat", default)]
     pub winner_seat: Option<u8>,
     /// The two wire seat keys, positional (66-hex lowercase).
     #[serde(rename = "seatA", default)]
     pub seat_a: Option<String>,
+    /// Seat B's wire key, 66-hex lowercase.
     #[serde(rename = "seatB", default)]
     pub seat_b: Option<String>,
     /// Canonical (sorted) 10-hex card sets; the loser's is `None` when the
     /// bundle carried no provable loser half.
     #[serde(rename = "winnerCardsHex", default)]
     pub winner_cards_hex: Option<String>,
+    /// The loser's canonical card set, 10-hex; `None` when the bundle carried no provable loser half.
     #[serde(rename = "loserCardsHex", default)]
     pub loser_cards_hex: Option<String>,
 }
@@ -103,9 +106,12 @@ pub enum ProofQuery {
     /// leaderboard badge-gather question. Newest first.
     #[serde(rename = "proofsFor")]
     ProofsFor {
+        /// The game id, 64-hex.
         #[serde(rename = "gameId")]
         game_id: String,
+        /// The winner's identity key.
         winner: String,
+        /// The most bundles to return.
         limit: Option<u32>,
     },
 }
@@ -136,8 +142,10 @@ pub trait ProofStorage {
 /// PROOF storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ProofStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -158,10 +166,12 @@ pub struct MemoryProofStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryProofStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }

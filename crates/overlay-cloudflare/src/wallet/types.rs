@@ -83,6 +83,7 @@ pub struct AbortActionResult {
     pub aborted: bool,
 }
 
+/// The body of a wallet-infra `createAction` request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateActionRequest {

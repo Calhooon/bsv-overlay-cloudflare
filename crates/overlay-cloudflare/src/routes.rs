@@ -104,6 +104,7 @@ async fn walk_not_now(
 // CORS
 // =============================================================================
 
+/// Add the permissive CORS headers mainline answers with.
 pub fn add_cors_headers(resp: &mut Response) {
     let h = resp.headers_mut();
     let _ = h.set("Access-Control-Allow-Origin", "*");
@@ -113,6 +114,7 @@ pub fn add_cors_headers(resp: &mut Response) {
     let _ = h.set("Access-Control-Allow-Private-Network", "true");
 }
 
+/// The answer to an `OPTIONS` preflight: 200 `OK` with the CORS headers.
 pub fn cors_preflight() -> worker::Result<Response> {
     // Body "OK" + status 200 matches mainline @bsv/overlay-express 2.2.0
     // (cors middleware defaults). Keeps the parity harness green on
@@ -345,6 +347,7 @@ struct SuccessBody<'a> {
 // Routes
 // =============================================================================
 
+/// `GET /health`: the full health report.
 pub async fn health(env: &worker::Env) -> worker::Result<Response> {
     build_health_response(env, None).await
 }
@@ -482,6 +485,7 @@ async fn build_health_response(
     json_ok(&body)
 }
 
+/// `GET /listTopicManagers`: the topic managers and their metadata.
 pub async fn list_topic_managers(engine: &Engine) -> worker::Result<Response> {
     worker::console_log!("GET /listTopicManagers");
     let managers = engine.list_topic_managers().await;
@@ -489,6 +493,7 @@ pub async fn list_topic_managers(engine: &Engine) -> worker::Result<Response> {
     json_ok(&managers)
 }
 
+/// `GET /listLookupServiceProviders`: the lookup services and their metadata.
 pub async fn list_lookup_service_providers(engine: &Engine) -> worker::Result<Response> {
     worker::console_log!("GET /listLookupServiceProviders");
     let services = engine.list_lookup_service_providers().await;
@@ -496,6 +501,7 @@ pub async fn list_lookup_service_providers(engine: &Engine) -> worker::Result<Re
     json_ok(&services)
 }
 
+/// `GET /getDocumentationForTopicManager?manager=`: the manager's documentation, as markdown.
 pub async fn get_doc_for_topic_manager(engine: &Engine, req: &Request) -> worker::Result<Response> {
     let url = req.url()?;
     let manager = url
@@ -509,6 +515,7 @@ pub async fn get_doc_for_topic_manager(engine: &Engine, req: &Request) -> worker
     text_response(&docs, "text/markdown")
 }
 
+/// `GET /getDocumentationForLookupServiceProvider?lookupService=`: the service's documentation, as markdown.
 pub async fn get_doc_for_lookup_service(
     engine: &Engine,
     req: &Request,
@@ -2787,6 +2794,7 @@ fn arc_ingest_refusal_log(
     )
 }
 
+/// `POST /arc-ingest`: Arcade's status callback, the push path of proofs and refusals.
 pub async fn arc_ingest(
     engine: &Engine,
     mut req: Request,
@@ -3851,6 +3859,7 @@ pub async fn admin_janitor(
 // /admin/config  — public config readback (RO-002)
 // -----------------------------------------------------------------------------
 
+/// `GET /admin/config`: the node's public configuration.
 pub async fn admin_config(env: &worker::Env) -> worker::Result<Response> {
     worker::console_log!("GET /admin/config");
     let node_name = env
@@ -3885,6 +3894,7 @@ pub async fn admin_config(env: &worker::Env) -> worker::Result<Response> {
 // /admin/stats  — authed aggregate stats (RO-003)
 // -----------------------------------------------------------------------------
 
+/// `GET /admin/stats`: aggregate counts of the node's records and bans.
 pub async fn admin_stats(
     env: &worker::Env,
     ship_storage: &dyn overlay_discovery::ship::storage::SHIPStorage,
@@ -3985,6 +3995,7 @@ fn parse_csv_env(env: &worker::Env, name: &str, default: &str) -> Vec<String> {
 // /admin/ship-records + /admin/slap-records (RO-004, RO-005)
 // -----------------------------------------------------------------------------
 
+/// `GET /admin/ship-records`: every SHIP record.
 pub async fn admin_ship_records(
     ship_storage: &dyn overlay_discovery::ship::storage::SHIPStorage,
 ) -> worker::Result<Response> {
@@ -4012,6 +4023,7 @@ pub async fn admin_ship_records(
     }
 }
 
+/// `GET /admin/slap-records`: every SLAP record.
 pub async fn admin_slap_records(
     slap_storage: &dyn overlay_discovery::slap::storage::SLAPStorage,
 ) -> worker::Result<Response> {
@@ -4061,6 +4073,7 @@ fn paginated_records_response(rows: Vec<serde_json::Value>) -> worker::Result<Re
 // /admin/bans  + /admin/ban  + /admin/unban (RO-006/007/008)
 // -----------------------------------------------------------------------------
 
+/// `GET /admin/bans`: every ban.
 pub async fn admin_bans(
     ban_storage: &crate::ban_storage::D1BanStorage,
 ) -> worker::Result<Response> {
@@ -4074,6 +4087,7 @@ pub async fn admin_bans(
     }
 }
 
+/// `POST /admin/ban`: ban a domain or outpoint, and remove its records.
 pub async fn admin_ban(
     ban_storage: &crate::ban_storage::D1BanStorage,
     ship_storage: &dyn overlay_discovery::ship::storage::SHIPStorage,
@@ -4149,6 +4163,7 @@ pub async fn admin_ban(
     }))
 }
 
+/// `POST /admin/unban`: lift a ban.
 pub async fn admin_unban(
     ban_storage: &crate::ban_storage::D1BanStorage,
     mut req: Request,
@@ -4187,6 +4202,7 @@ pub async fn admin_unban(
 // /admin/health-check (RO-009)
 // -----------------------------------------------------------------------------
 
+/// `POST /admin/health-check`: whether a URL answers healthy.
 pub async fn admin_health_check(mut req: Request) -> worker::Result<Response> {
     #[derive(Deserialize)]
     struct Body {
@@ -4220,6 +4236,7 @@ pub async fn admin_health_check(mut req: Request) -> worker::Result<Response> {
 // /admin/remove-token (RO-010)
 // -----------------------------------------------------------------------------
 
+/// `POST /admin/remove-token`: evict an output from the engine.
 pub async fn admin_remove_token(engine: &Engine, mut req: Request) -> worker::Result<Response> {
     #[derive(Deserialize)]
     struct Body {
@@ -4495,6 +4512,7 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// A 404 answer.
 pub fn not_found() -> worker::Result<Response> {
     json_response(
         &serde_json::json!({

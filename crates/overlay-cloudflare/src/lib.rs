@@ -7,6 +7,10 @@
 // The lint bar (bsv-stack-lean #134): the workspace table cannot deny these
 // for the LOW crates beside this one, so the engine's crate denies them here.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// The lint bar (bsv-stack-lean #135): the public crate documents every public
+// item; the workspace table denies unsafe code, allowed at each item below
+// with its `// SAFETY:` reason.
+#![deny(missing_docs)]
 
 pub mod admit_fast;
 pub mod advert_lifecycle;

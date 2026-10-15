@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 /// published advertisements from peer advertisements we've GASP-synced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SHIPDiscoveryRecord {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     #[serde(rename = "outputIndex")]
     pub output_index: u32,
     /// Publisher's identity public key (33-byte compressed, hex-encoded).
@@ -20,15 +22,19 @@ pub struct SHIPDiscoveryRecord {
     /// rather than peer records it's ingested.
     #[serde(rename = "identityKey")]
     pub identity_key: String,
+    /// The advertised domain (the URI the host serves).
     pub domain: String,
+    /// The advertised topic.
     pub topic: String,
 }
 
 /// Sort order for query results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortOrder {
+    /// Ascending creation time.
     #[serde(rename = "asc")]
     Asc,
+    /// Descending creation time.
     #[serde(rename = "desc")]
     Desc,
 }
@@ -96,8 +102,10 @@ pub trait SHIPStorage {
 /// SHIP storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum SHIPStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -126,10 +134,12 @@ pub struct MemorySHIPStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemorySHIPStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }

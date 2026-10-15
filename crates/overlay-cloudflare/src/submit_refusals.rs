@@ -98,7 +98,9 @@ fn reason_rank(reason: &str) -> u8 {
 /// One hop outpoint whose own key signed a refused subject.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SignedSpend {
+    /// The hop's txid.
     pub txid: String,
+    /// The hop output's index.
     pub vout: u32,
 }
 
@@ -158,13 +160,18 @@ pub fn index_read_query(signed: &[SignedSpend]) -> Query {
 /// One row of [`index_read_query`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct IndexedHop {
+    /// The hop's txid.
     pub txid: String,
+    /// The hop output's index.
     #[serde(rename = "outputIndex")]
     pub output_index: i64,
+    /// The index's spend word for the hop (1 spent, 0 unspent), when indexed.
     #[serde(default)]
     pub spent: Option<i64>,
+    /// The refusal the ledger already holds for the hop, if any.
     #[serde(rename = "heldReason", default)]
     pub held_reason: Option<String>,
+    /// When that refusal was recorded, in milliseconds.
     #[serde(rename = "heldAt", default)]
     pub held_at: Option<i64>,
 }

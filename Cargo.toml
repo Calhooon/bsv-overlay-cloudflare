@@ -64,6 +64,12 @@ tracing = "0.1"
 # `warn` blocks a merge as well; unwrap, expect and panic are denied outside
 # tests (`clippy.toml` allows them in test code). Mirrored in part in
 # `workers/Cargo.toml`, whose LOW crate is not held to the last three.
+# Unsafe code and missing docs (bsv-stack-lean #135): a crate with no unsafe
+# forbids it at its root; each remaining unsafe item carries `// SAFETY:`.
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 unwrap_used = "deny"

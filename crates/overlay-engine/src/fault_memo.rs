@@ -15,25 +15,41 @@ pub const FAULT_MEMO_DUE_LIMIT: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Persist the existing lifecycle flags independently, including passability.
+/// One root's compact fault fact: what a deferred-graph fault record says, without its graph.
 #[allow(clippy::struct_excessive_bools)]
 pub struct FaultMemo {
+    /// The peer the root was walked from.
     pub peer: String,
+    /// The topic.
     pub topic: String,
+    /// The root UTXO, `txid.outputIndex`.
     pub outpoint: String,
+    /// The fault class of the walk that faulted.
     pub class: String,
+    /// Consecutive runs whose walk of this root faulted.
     pub faults: u32,
+    /// Retry reservations made after the unanchorable verdict.
     pub retries: u32,
+    /// Unix seconds when the fact was observed, kept while its score holds.
     pub first_at: u64,
+    /// Unix seconds before which the root is not walked again.
     pub next_at: u64,
+    /// The root UTXO's score at the peer.
     pub score: u64,
+    /// Whether the root is recorded dead.
     pub dead: bool,
+    /// Whether the root is recorded unanchorable.
     pub unanchorable: bool,
+    /// Whether the cursor may pass this root.
     pub cursor_passable: bool,
+    /// The advert expiry the topic manager read from the root, if any.
     pub expiry: Option<u64>,
+    /// Whether the peer is a configured one, not one `ls_ship` discovered.
     pub configured: bool,
 }
 
 impl FaultMemo {
+    /// The memo of a fault record observed at `observed_at`; `None` for a record that is not a fault.
     pub fn from_record(record: &DeferredGraph, observed_at: u64) -> Option<Self> {
         Some(Self {
             peer: record.peer.clone(),
@@ -84,9 +100,13 @@ impl FaultMemo {
     }
 }
 
+/// The fault memos a read returned, with what the read folded and swept.
 #[derive(Debug, Default)]
 pub struct FaultMemoBatch {
+    /// The memos, one per root.
     pub records: Vec<FaultMemo>,
+    /// Legacy fault records the read folded into the memo.
     pub folded: u64,
+    /// Expired memos the read removed.
     pub swept: u64,
 }

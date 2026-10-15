@@ -688,9 +688,13 @@ pub async fn detect_announce(
 /// `POST /internal/reorg`'s body, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReorgTrigger {
+    /// The lowest height to demote.
     pub from_height: u64,
+    /// The highest height (defaults to `from_height`).
     pub to_height: u64,
+    /// The most rows per call, clamped to [`REORG_DEMOTE_LIMIT`].
     pub limit: u64,
+    /// Where an earlier answer stopped (its `nextCursor`).
     pub after: Option<overlay_discovery::pot::reorg::RowKey>,
 }
 

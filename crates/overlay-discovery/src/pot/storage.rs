@@ -88,24 +88,31 @@ pub struct PotRecord {
     /// Committed settle keys, 66-hex lowercase (covenant locks only).
     #[serde(rename = "pubA", default)]
     pub pub_a: Option<String>,
+    /// Seat B's committed settle key, 66-hex lowercase.
     #[serde(rename = "pubB", default)]
     pub pub_b: Option<String>,
+    /// The tower's committed settle key, 66-hex lowercase.
     #[serde(rename = "pubTower", default)]
     pub pub_tower: Option<String>,
     /// Committed payout/rake homes, 40-hex lowercase.
     #[serde(rename = "payPkhA", default)]
     pub pay_pkh_a: Option<String>,
+    /// Seat B's committed payout home, 40-hex lowercase.
     #[serde(rename = "payPkhB", default)]
     pub pay_pkh_b: Option<String>,
+    /// The committed rake home, 40-hex lowercase.
     #[serde(rename = "rakePkh", default)]
     pub rake_pkh: Option<String>,
     /// Committed amounts/height.
     #[serde(rename = "stakeA", default)]
     pub stake_a: Option<u64>,
+    /// Seat B's committed stake, in satoshis.
     #[serde(rename = "stakeB", default)]
     pub stake_b: Option<u64>,
+    /// The committed fee, in satoshis.
     #[serde(rename = "feeSats", default)]
     pub fee_sats: Option<u64>,
+    /// The committed recovery height.
     #[serde(rename = "recoveryHeight", default)]
     pub recovery_height: Option<u64>,
     /// The funding output's satoshi value (from the admitted BEEF's parsed
@@ -122,6 +129,7 @@ pub struct PotRecord {
     /// stale verdict behind on purpose (the reader's equality check guards).
     #[serde(rename = "verdict", default)]
     pub verdict: Option<String>,
+    /// The spend `verdict` was judged on; the verdict holds only while it equals `spending_txid`.
     #[serde(rename = "verdictTxid", default)]
     pub verdict_txid: Option<String>,
     /// Block height from the SPV-verified BUMP at spend-confirm time.
@@ -159,6 +167,7 @@ pub struct PotRecord {
     /// other decoded column.
     #[serde(rename = "fundingSizeBytes", default)]
     pub funding_size_bytes: Option<u64>,
+    /// The funding transaction's exact fee in satoshis (see `funding_size_bytes`).
     #[serde(rename = "fundingFeeSats", default)]
     pub funding_fee_sats: Option<u64>,
     /// bsv-low P4 slice 2: the recorded SPENDER's own size + exact fee,
@@ -172,8 +181,10 @@ pub struct PotRecord {
     /// guards, exactly like `verdict_txid`). DISPLAY-TIER.
     #[serde(rename = "spenderFactsTxid", default)]
     pub spender_facts_txid: Option<String>,
+    /// The recorded spender's serialized size in bytes (see `spender_facts_txid`).
     #[serde(rename = "spenderSizeBytes", default)]
     pub spender_size_bytes: Option<u64>,
+    /// The recorded spender's exact fee in satoshis (see `spender_facts_txid`).
     #[serde(rename = "spenderFeeSats", default)]
     pub spender_fee_sats: Option<u64>,
     /// bsv-low #468 (2026-09-19): the spender's outputs paying the pot's
@@ -186,6 +197,7 @@ pub struct PotRecord {
     /// credit still verifies its own bytes.
     #[serde(rename = "spenderPayASats", default)]
     pub spender_pay_a_sats: Option<u64>,
+    /// What the spender paid seat B's committed home, in satoshis (see `spender_pay_a_sats`).
     #[serde(rename = "spenderPayBSats", default)]
     pub spender_pay_b_sats: Option<u64>,
 }
@@ -242,7 +254,9 @@ impl PotRecord {
 /// One outpoint in a `spentStatus` query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutpointJson {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The pot's output index.
     pub vout: u32,
 }
 
@@ -254,14 +268,18 @@ pub enum PotQuery {
     /// Ask the spent status of a batch of pot outpoints. The answer is an
     /// input-ordered array, one entry per requested outpoint.
     #[serde(rename = "spentStatus")]
-    SpentStatus { outpoints: Vec<OutpointJson> },
+    SpentStatus {
+        /// The outpoints asked about, in order.
+        outpoints: Vec<OutpointJson>,
+    },
 }
 
-/// Backend-agnostic storage for pot-spend records.
 /// bsv-low E649 L6: one eviction ledger row (`pot_evictions`), host-typed: `evictedAt` and `readmittedAt` in ms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvictionLedgerEntry {
+    /// When the pot was evicted, in milliseconds.
     pub evicted_at: i64,
+    /// When it was readmitted, in milliseconds; `None` while the eviction is open.
     pub readmitted_at: Option<i64>,
 }
 
@@ -294,6 +312,7 @@ pub fn evictions_by_txid_sql(n: usize) -> String {
 /// Txids per ledger statement (D1 binds at most 100).
 pub const EVICTIONS_CHUNK: usize = 90;
 
+/// Backend-agnostic storage for pot-spend records.
 #[async_trait(?Send)]
 pub trait PotStorage {
     /// Record an admitted pot outpoint (called with `spent = false`).
@@ -398,6 +417,7 @@ pub trait PotStorage {
         ))
     }
 
+    /// Write the recorded spender's size and fee under a CAS on the live pointer (`spending_txid`); a store without it refuses.
     async fn store_spender_facts(
         &self,
         txid: &str,
@@ -1048,8 +1068,10 @@ pub fn pot_beef_has_proof(txid: &str, beef: &[u8]) -> bool {
 /// POT storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum PotStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -1134,10 +1156,12 @@ impl MemoryPotStorage {
         self
     }
 
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }
@@ -1177,6 +1201,7 @@ impl MemoryPotStorage {
         *self.evictions.lock().unwrap() = Some(Err(()));
     }
 
+    /// How many pot BEEFs the store holds.
     pub fn beef_count(&self) -> usize {
         self.beefs.lock().unwrap().len()
     }

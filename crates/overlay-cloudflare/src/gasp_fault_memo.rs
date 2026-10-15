@@ -4,6 +4,7 @@ use overlay_engine::fault_memo::{FaultMemo, FaultMemoBatch, FAULT_MEMO_DUE_LIMIT
 use serde::Deserialize;
 use worker::D1Database;
 
+/// The fault memo's table: one compact fault fact per (host, topic, root outpoint).
 pub const CREATE: &str = "CREATE TABLE IF NOT EXISTS gasp_fault_memo (
     host TEXT NOT NULL, topic TEXT NOT NULL, outpoint TEXT NOT NULL,
     class TEXT NOT NULL, faults INTEGER NOT NULL, retries INTEGER NOT NULL,
@@ -11,10 +12,14 @@ pub const CREATE: &str = "CREATE TABLE IF NOT EXISTS gasp_fault_memo (
     dead INTEGER NOT NULL, unanchorable INTEGER NOT NULL, cursor_passable INTEGER NOT NULL,
     expiry INTEGER, configured INTEGER NOT NULL,
     PRIMARY KEY(host, topic, outpoint))";
+/// The index the due read walks: a peer's live facts by retry time.
 pub const DUE_INDEX: &str = "CREATE INDEX IF NOT EXISTS gasp_fault_memo_due ON gasp_fault_memo(host, topic, dead, next_at, score, outpoint)";
+/// The index the per-topic cap evicts by: the oldest observation goes.
 pub const AGE_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS gasp_fault_memo_age ON gasp_fault_memo(topic, first_at)";
+/// The index the expiry sweep reads.
 pub const EXPIRY_INDEX: &str = "CREATE INDEX IF NOT EXISTS gasp_fault_memo_expiry ON gasp_fault_memo(expiry) WHERE expiry IS NOT NULL";
+/// The per-topic row count the cap reads, kept by the two triggers.
 pub const SIZE_CREATE: &str = "CREATE TABLE IF NOT EXISTS gasp_fault_memo_size (topic TEXT PRIMARY KEY, rows INTEGER NOT NULL)";
 /// The count avoids scanning twenty thousand rows for every new fact. Both
 /// triggers run inside the writer's transaction, including the cap eviction.
@@ -22,6 +27,7 @@ pub const DELETE_TRIGGER: &str =
     "CREATE TRIGGER IF NOT EXISTS gasp_fault_memo_delete AFTER DELETE ON gasp_fault_memo BEGIN
     UPDATE gasp_fault_memo_size SET rows = rows - 1 WHERE topic = old.topic;
     END";
+/// The trigger that counts an insert and evicts the topic's oldest facts past twenty thousand.
 pub const INSERT_TRIGGER: &str =
     "CREATE TRIGGER IF NOT EXISTS gasp_fault_memo_insert AFTER INSERT ON gasp_fault_memo BEGIN
     INSERT INTO gasp_fault_memo_size(topic, rows) VALUES(new.topic, 1)
@@ -31,6 +37,7 @@ pub const INSERT_TRIGGER: &str =
       LIMIT MAX(0, (SELECT rows FROM gasp_fault_memo_size WHERE topic = new.topic) - 20000));
     END";
 
+/// Write one fault fact (insert, or replace the held one).
 pub const PUT: &str = "INSERT INTO gasp_fault_memo
     (host, topic, outpoint, class, faults, retries, first_at, next_at, score, dead, unanchorable, cursor_passable, expiry, configured)
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch(), ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -40,17 +47,24 @@ pub const PUT: &str = "INSERT INTO gasp_fault_memo
       next_at=excluded.next_at, score=excluded.score, dead=excluded.dead,
       unanchorable=excluded.unanchorable, cursor_passable=excluded.cursor_passable,
       expiry=excluded.expiry, configured=excluded.configured";
+/// Delete one fact.
 pub const DELETE: &str = "DELETE FROM gasp_fault_memo WHERE host=?1 AND topic=?2 AND outpoint=?3";
+/// Read one fact by its key.
 pub const GET: &str =
     "SELECT host AS peer, * FROM gasp_fault_memo WHERE host=?1 AND topic=?2 AND outpoint=?3";
+/// Read the facts of a page's outpoints (bind: a JSON array).
 pub const PAGE: &str = "SELECT host AS peer, * FROM gasp_fault_memo WHERE host=?1 AND topic=?2 AND outpoint IN (SELECT value FROM json_each(?3))";
+/// Read a peer's due live facts, by ascending retry time (bind: the limit).
 pub const DUE: &str = "SELECT host AS peer, * FROM gasp_fault_memo WHERE host=?1 AND topic=?2 AND dead=0 AND next_at<=unixepoch() ORDER BY next_at, score, outpoint LIMIT ?3";
+/// Reserve one unanchorable retry: a compare-and-set on the retry count, score and class, returning the outpoint when it holds.
 pub const RESERVE: &str = "UPDATE gasp_fault_memo SET retries=?4, next_at=?5
     WHERE host=?1 AND topic=?2 AND outpoint=?3 AND dead=0 AND unanchorable=1
       AND retries=?4-1 AND ?4<=?8 AND next_at<=unixepoch() AND score=?6 AND class=?7
     RETURNING outpoint";
+/// Delete a topic's fact of a readmitted outpoint.
 pub const READMIT: &str =
     "DELETE FROM gasp_fault_memo WHERE topic=?1 AND outpoint=?2 RETURNING outpoint";
+/// The memo's total row count.
 pub const COUNT: &str = "SELECT COUNT(*) AS rows FROM gasp_fault_memo";
 /// Engine 0.1.15 (#56): the absence facts recorded in the last day (by the
 /// row's `first_at`),
@@ -62,6 +76,7 @@ pub const PEER_ABSENT_24H: &str = "SELECT COUNT(*) AS recorded,
 
 // Fault rows written by 0.1.9 through 0.1.13 have no nodes or chunks. Keep
 // malformed/unknown records in the old store for its ordinary error handling.
+/// Fold a peer's legacy fault records (deferred graphs with no nodes) into the memo.
 pub const FOLD: &str = "INSERT INTO gasp_fault_memo
     (host, topic, outpoint, class, faults, retries, first_at, next_at, score, dead, unanchorable, cursor_passable, expiry, configured)
     SELECT host, topic, outpoint,
@@ -78,11 +93,13 @@ pub const FOLD: &str = "INSERT INTO gasp_fault_memo
       AND (json_extract(record,'$.reason') LIKE 'dead:%' OR json_extract(record,'$.reason') LIKE 'unanchorable:%'
         OR json_extract(record,'$.reason') LIKE 'retry:fault:%')
     ON CONFLICT(host,topic,outpoint) DO NOTHING";
+/// Delete the legacy records the fold copied.
 pub const FOLD_DELETE: &str = "DELETE FROM gasp_deferred_graphs WHERE host=?1 AND topic=?2 AND chunks=0 AND json_valid(record)
     AND COALESCE(json_array_length(record,'$.nodes'),0)=0 AND json_extract(record,'$.faults')>0
     AND (json_extract(record,'$.reason') LIKE 'dead:%' OR json_extract(record,'$.reason') LIKE 'unanchorable:%'
       OR json_extract(record,'$.reason') LIKE 'retry:fault:%') RETURNING outpoint";
 
+/// Count the folded records in `gasp_fault_memo_folded_total`.
 pub const FOLD_COUNT: &str = "INSERT INTO ops_counters(name,value)
     SELECT 'gasp_fault_memo_folded_total',COUNT(*) FROM gasp_deferred_graphs WHERE host=?1 AND topic=?2 AND chunks=0 AND json_valid(record)
     AND COALESCE(json_array_length(record,'$.nodes'),0)=0 AND json_extract(record,'$.faults')>0
@@ -97,6 +114,7 @@ pub const REMEMBER_EXPIRED: &str = "INSERT INTO gasp_expired_outpoints(topic,out
     WHERE (?1 IS NULL OR host=?1) AND (?2 IS NULL OR topic=?2) AND (dead=1 OR unanchorable=1)
       AND expiry<=unixepoch()
     ON CONFLICT(topic,outpoint) DO UPDATE SET keep_until=MAX(gasp_expired_outpoints.keep_until,excluded.keep_until)";
+/// Remove expired dead or unanchorable facts, including those the shared expired-outpoint memo names.
 pub const SWEEP: &str = "DELETE FROM gasp_fault_memo
     WHERE (?1 IS NULL OR host=?1) AND (?2 IS NULL OR topic=?2) AND (dead=1 OR unanchorable=1)
       AND (expiry<=unixepoch() OR EXISTS (SELECT 1 FROM gasp_expired_outpoints e
@@ -104,6 +122,7 @@ pub const SWEEP: &str = "DELETE FROM gasp_fault_memo
     RETURNING outpoint";
 // Sync slices use the expiry index; the scheduled sweep also reconciles facts
 // whose expiry was learned through the shared expired-outpoint memo.
+/// Remove expired dead or unanchorable facts by their own expiry only.
 pub const SWEEP_EXPIRED: &str = "DELETE FROM gasp_fault_memo
     WHERE (?1 IS NULL OR host=?1) AND (?2 IS NULL OR topic=?2) AND (dead=1 OR unanchorable=1)
       AND expiry<=unixepoch() RETURNING outpoint";
@@ -146,6 +165,7 @@ impl From<Row> for FaultMemo {
     }
 }
 
+/// [`PUT`]'s query for one fact.
 pub fn put_query(r: &FaultMemo) -> Query {
     Query::new(PUT)
         .bind(r.peer.as_str())
@@ -173,6 +193,7 @@ async fn batch(db: &D1Database, queries: Vec<Query>) -> Result<Vec<worker::D1Res
         .map_err(|e| e.to_string())
 }
 
+/// Write one fact and drop the deferred graph it replaces, in one batch.
 pub async fn put(db: &D1Database, r: &FaultMemo) -> Result<(), String> {
     batch(
         db,
@@ -192,6 +213,7 @@ pub async fn put(db: &D1Database, r: &FaultMemo) -> Result<(), String> {
     Ok(())
 }
 
+/// One fact, if held.
 pub async fn get(
     db: &D1Database,
     host: &str,
@@ -207,6 +229,7 @@ pub async fn get(
         .map(Into::into))
 }
 
+/// Remember and remove the expired facts (`reconcile_shared` also reads the shared memo); the count removed.
 pub async fn sweep(
     db: &D1Database,
     host: Option<&str>,
@@ -235,6 +258,7 @@ pub async fn sweep(
         .len() as u64)
 }
 
+/// The facts of the outpoints asked, or (none asked) a peer's due facts after folding its legacy records and sweeping.
 pub async fn read(
     db: &D1Database,
     host: &str,
@@ -279,6 +303,7 @@ pub async fn read(
     Ok(out)
 }
 
+/// The memo's total row count, for the health block.
 pub async fn health(db: &D1Database) -> Result<u64, String> {
     #[derive(Deserialize)]
     struct Count {

@@ -13,27 +13,39 @@ use serde::{Deserialize, Serialize};
 /// Source: https://developers.cloudflare.com/workers/platform/limits/
 /// Source: https://developers.cloudflare.com/d1/platform/limits/
 pub const BACKFILL_REQUEST_MS: u64 = 180_000;
+/// The most trait and network operations one backfill request runs ([`BACKFILL_REQUEST_MS`] gives the reasoning).
 pub const BACKFILL_OPERATIONS: u64 = 500;
+/// The most SQL statements one backfill request runs.
 pub const BACKFILL_D1_QUERIES: u64 = 600;
+/// The most sync slices one backfill request runs.
 pub const BACKFILL_MAX_SLICES: u64 = 64;
 
+/// The body of a sync or backfill request: the selection, and for a backfill the bound and where to resume.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncRequest {
+    /// The topics to sync; `None` selects every configured topic.
     pub topics: Option<Vec<String>>,
+    /// The peers to sync with; `None` selects every peer.
     pub peers: Option<Vec<String>>,
+    /// Walk to the peer's tip (a backfill); `None` is one ordinary sync.
     pub until: Option<Until>,
+    /// The backfill's wall-clock budget in milliseconds, capped at [`BACKFILL_REQUEST_MS`].
     pub budget_ms: Option<u64>,
+    /// The continuation token of an earlier backfill to resume.
     pub continuation: Option<String>,
 }
 
+/// How far a backfill walks.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Until {
+    /// To the peer's tip.
     Tip,
 }
 
 impl SyncRequest {
+    /// Parse and validate a request body; an empty body is the default request.
     pub fn parse(body: &str) -> Result<Self, String> {
         let request = if body.trim().is_empty() {
             Self::default()
@@ -44,6 +56,7 @@ impl SyncRequest {
         Ok(request)
     }
 
+    /// The topics and peers the request selects.
     pub fn filter(&self) -> SyncFilter {
         SyncFilter {
             topics: self.topics.clone(),
@@ -51,6 +64,7 @@ impl SyncRequest {
         }
     }
 
+    /// Refuse a request whose fields do not fit together: a budget or continuation without `until`, or a backfill that names other than one topic and one peer.
     pub fn validate(&self) -> Result<(), String> {
         if self.until.is_none() {
             if self.budget_ms.is_some() || self.continuation.is_some() {
@@ -71,6 +85,7 @@ impl SyncRequest {
         Ok(())
     }
 
+    /// The one topic and one peer a backfill names, each within its length bound.
     pub fn pair(&self) -> Result<(&str, &str), String> {
         match (self.topics.as_deref(), self.peers.as_deref()) {
             (Some([topic]), Some([peer]))
@@ -88,16 +103,21 @@ impl SyncRequest {
     }
 }
 
+/// Where a backfill stopped: its topic, its peer and the durable cursor, as an opaque token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Continuation {
     version: u8,
+    /// The topic the backfill walked.
     pub topic: String,
+    /// The peer it walked.
     pub peer: String,
+    /// The peer's durable cursor when the token was made.
     pub cursor: u64,
 }
 
 impl Continuation {
+    /// The token for `topic` and `peer` at `cursor`.
     pub fn new(topic: &str, peer: &str, cursor: u64) -> Self {
         Self {
             version: 1,
@@ -108,11 +128,13 @@ impl Continuation {
     }
 
     // bsv-stack-lean #134: four scalar fields cannot fail to serialize
+    /// The token's JSON form.
     #[allow(clippy::expect_used)]
     pub fn encode(&self) -> String {
         serde_json::to_string(self).expect("continuation has only scalar fields")
     }
 
+    /// Read a token, refusing one too long, malformed or of another version.
     pub fn decode(token: &str) -> Result<Self, String> {
         if token.len() > 16_384 {
             return Err("continuation exceeds 16384 bytes".into());
@@ -125,23 +147,35 @@ impl Continuation {
     }
 }
 
+/// One peer's part of a sync: its cost, its slices and pages, and where its cursor ended.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerSyncResult {
+    /// What the peer's sync cost.
     #[serde(flatten)]
     pub cost: SyncCost,
+    /// Slices that moved the walk: a page passed or an output walked.
     pub slices: u64,
+    /// Pages of the peer's UTXO list read.
     pub pages: u64,
+    /// Whether the walk reached the peer's tip.
     pub reached_tip: bool,
+    /// The peer's durable cursor after the sync.
     pub cursor: u64,
 }
 
+/// What a backfill request did: the merged sync result, how far it got, why it stopped and where to resume.
 #[derive(Debug, Clone, Serialize)]
 pub struct BackfillResult {
+    /// The slices' merged sync result.
     #[serde(flatten)]
     pub sync: GASPSyncResult,
+    /// Slices run.
     pub slices: u64,
+    /// Whether the walk reached the peer's tip.
     pub reached_tip: bool,
+    /// Why it stopped: `tip`, `wall_budget`, `request_allowance`, `no_progress`, `peer_wait` or `slice_allowance`.
     pub stop_reason: String,
+    /// The token to resume from; `None` once the tip is reached.
     pub continuation: Option<String>,
 }
 

@@ -15,15 +15,22 @@ use worker::{D1Database, D1PreparedStatement};
 /// A value that can be bound to a D1 prepared statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QVal {
+    /// SQL NULL.
     Null,
+    /// An integer.
     Int(i64),
+    /// Text.
     Text(String),
+    /// A boolean, bound as 1 or 0.
     Bool(bool),
+    /// A blob.
     Blob(Vec<u8>),
+    /// A float.
     Float(f64),
 }
 
 impl QVal {
+    /// The value as D1's JavaScript binding takes it.
     pub fn to_js(&self) -> JsValue {
         match self {
             Self::Null => JsValue::null(),
@@ -109,6 +116,7 @@ pub struct Query {
 }
 
 impl Query {
+    /// A query of `sql` with no binds yet.
     pub fn new(sql: impl Into<String>) -> Self {
         Self {
             sql: sql.into(),
@@ -116,6 +124,7 @@ impl Query {
         }
     }
 
+    /// Bind the next `?` to `val`.
     pub fn bind(mut self, val: impl Into<QVal>) -> Self {
         self.params.push(val.into());
         self
@@ -138,6 +147,7 @@ impl Query {
         &self.params
     }
 
+    /// Prepare the query on `db` with its binds.
     pub fn prepare(&self, db: &D1Database) -> Result<D1PreparedStatement, String> {
         let stmt = db.prepare(&self.sql);
         if self.params.is_empty() {
@@ -149,12 +159,14 @@ impl Query {
 
     // bsv-low #499: the three awaits below are the overlay's ONE D1 seam, each counted on the request's rows
     // ledger (`crate::d1_ledger`): every engine and discovery statement goes through them.
+    /// Run the query on `db` and read every row, counted on the request's rows ledger.
     pub async fn fetch_all<T: DeserializeOwned>(self, db: &D1Database) -> Result<Vec<T>, String> {
         let stmt = self.prepare(db)?;
         let result = stmt.counted_all().await.map_err(|e| e.to_string())?;
         result.results::<T>().map_err(|e| e.to_string())
     }
 
+    /// Run the query on `db` and read one row, the leading one if any, counted on the request's rows ledger.
     pub async fn fetch_optional<T: DeserializeOwned>(
         self,
         db: &D1Database,
@@ -163,6 +175,7 @@ impl Query {
         stmt.counted_first::<T>().await.map_err(|e| e.to_string())
     }
 
+    /// Run the query on `db` for its effect, counted on the request's rows ledger.
     pub async fn execute(self, db: &D1Database) -> Result<(), String> {
         let stmt = self.prepare(db)?;
         stmt.counted_run().await.map_err(|e| e.to_string())?;
@@ -174,6 +187,7 @@ impl Query {
 // WHERE clause builder
 // =============================================================================
 
+/// Builds a `WHERE` clause from `AND`ed conditions and their binds.
 #[derive(Default)]
 pub struct WhereBuilder {
     clauses: Vec<String>,
@@ -181,10 +195,12 @@ pub struct WhereBuilder {
 }
 
 impl WhereBuilder {
+    /// An empty builder.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Add `col = ?` bound to `val`.
     pub fn eq(mut self, col: &str, val: impl Into<QVal>) -> Self {
         self.clauses.push(format!("{col} = ?"));
         self.params.push(val.into());
@@ -200,6 +216,7 @@ impl WhereBuilder {
         self
     }
 
+    /// Add `col >= ?` bound to `val`.
     pub fn gte(mut self, col: &str, val: impl Into<QVal>) -> Self {
         self.clauses.push(format!("{col} >= ?"));
         self.params.push(val.into());
@@ -217,6 +234,7 @@ impl WhereBuilder {
         self
     }
 
+    /// The ` WHERE ...` text (empty with no clause) and its binds, in order.
     pub fn build(self) -> (String, Vec<QVal>) {
         if self.clauses.is_empty() {
             (String::new(), Vec::new())
@@ -543,6 +561,7 @@ pub const OVERLAY_MIGRATION_COUNT: usize = 259;
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
 
+/// The `tx_words` index by age.
 pub const TX_WORDS_AGE_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS tx_words_age ON tx_words(updated_at,txid)";
 

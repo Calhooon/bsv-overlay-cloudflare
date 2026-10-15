@@ -20,12 +20,15 @@ pub use bsv_rs::overlay::types::{
 /// A transaction outpoint — txid + output index.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Outpoint {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     #[serde(rename = "outputIndex")]
     pub output_index: u32,
 }
 
 impl Outpoint {
+    /// An outpoint from a txid and an output index.
     pub fn new(txid: impl Into<String>, output_index: u32) -> Self {
         Self {
             txid: txid.into(),
@@ -266,18 +269,28 @@ pub enum SpendNotificationMode {
 pub enum OutputAdmittedByTopic {
     /// Locking-script mode — provides parsed output fields.
     LockingScript {
+        /// The id of the transaction that created the output.
         txid: String,
+        /// The output's index within that transaction.
         output_index: u32,
+        /// The topic that admitted the output.
         topic: String,
+        /// The output's value in satoshis.
         satoshis: u64,
+        /// The output's locking script bytes.
         locking_script: Vec<u8>,
+        /// The off-chain values submitted with the transaction, if any.
         off_chain_values: Option<Vec<u8>>,
     },
     /// Whole-tx mode — provides the entire Atomic BEEF.
     WholeTx {
+        /// The transaction that created the output, as Atomic BEEF.
         atomic_beef: Vec<u8>,
+        /// The output's index within that transaction.
         output_index: u32,
+        /// The topic that admitted the output.
         topic: String,
+        /// The off-chain values submitted with the transaction, if any.
         off_chain_values: Option<Vec<u8>>,
     },
 }
@@ -287,34 +300,54 @@ pub enum OutputAdmittedByTopic {
 pub enum OutputSpent {
     /// No details — just that it was spent.
     None {
+        /// The id of the transaction that created the spent output.
         txid: String,
+        /// The spent output's index within that transaction.
         output_index: u32,
+        /// The topic the spent output was admitted under.
         topic: String,
     },
     /// Spending txid provided.
     Txid {
+        /// The id of the transaction that created the spent output.
         txid: String,
+        /// The spent output's index within that transaction.
         output_index: u32,
+        /// The topic the spent output was admitted under.
         topic: String,
+        /// The id of the transaction that spent the output.
         spending_txid: String,
     },
     /// Spending txid + unlocking script + input details.
     Script {
+        /// The id of the transaction that created the spent output.
         txid: String,
+        /// The spent output's index within that transaction.
         output_index: u32,
+        /// The topic the spent output was admitted under.
         topic: String,
+        /// The id of the transaction that spent the output.
         spending_txid: String,
+        /// The index of the spending input within the spending transaction.
         input_index: u32,
+        /// The spending input's unlocking script bytes.
         unlocking_script: Vec<u8>,
+        /// The spending input's sequence number.
         sequence_number: u32,
+        /// The off-chain values submitted with the spending transaction, if any.
         off_chain_values: Option<Vec<u8>>,
     },
     /// Full spending transaction as Atomic BEEF.
     WholeTx {
+        /// The id of the transaction that created the spent output.
         txid: String,
+        /// The spent output's index within that transaction.
         output_index: u32,
+        /// The topic the spent output was admitted under.
         topic: String,
+        /// The spending transaction, as Atomic BEEF.
         spending_atomic_beef: Vec<u8>,
+        /// The off-chain values submitted with the spending transaction, if any.
         off_chain_values: Option<Vec<u8>>,
     },
 }
@@ -416,7 +449,9 @@ pub struct GASPInputRequest {
 /// Applied transaction record (deduplication tracking).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppliedTransaction {
+    /// The id of the applied transaction.
     pub txid: String,
+    /// The topic it was applied under.
     pub topic: String,
 }
 
@@ -428,7 +463,9 @@ pub struct AppliedTransaction {
 /// Returned by SHIP/SLAP lookup services.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UTXOReference {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     #[serde(rename = "outputIndex")]
     pub output_index: u32,
 }

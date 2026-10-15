@@ -227,7 +227,9 @@ pub trait RelatchTable {
 /// Durable storage for [`RelatchCursor`]s, keyed by table name.
 #[async_trait(?Send)]
 pub trait RelatchCursorStore {
+    /// The cursor stored for `table`.
     async fn load(&self, table: &str) -> Result<RelatchCursor, String>;
+    /// Store `cursor` for `table`.
     async fn store(&self, table: &str, cursor: RelatchCursor) -> Result<(), String>;
 }
 
@@ -356,6 +358,7 @@ pub async fn relatch_pass<T: RelatchTable, C: RelatchCursorStore>(
 pub struct D1RelatchCursors(std::rc::Rc<worker::D1Database>);
 
 impl D1RelatchCursors {
+    /// Cursors over the D1 database `db`.
     pub fn new(db: std::rc::Rc<worker::D1Database>) -> Self {
         Self(db)
     }

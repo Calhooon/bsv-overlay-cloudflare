@@ -101,7 +101,9 @@ pub fn sweep_window(tip: u64, depth: u64) -> Option<(u64, u64)> {
 /// cursor inside its JSON state document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowKey {
+    /// The row's block height.
     pub height: u64,
+    /// The row's SQLite rowid.
     pub rowid: i64,
 }
 
@@ -113,7 +115,9 @@ pub struct RowKey {
 /// from the newest with continuity (see [`next_sweep_window`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepState {
+    /// The window's lowest height.
     pub lo: u64,
+    /// The window's highest height.
     pub hi: u64,
     /// The last row examined; `None` = the walk has not started.
     pub cursor: Option<RowKey>,
@@ -184,7 +188,9 @@ pub fn arcade_reorg_marker(extra_info: Option<&str>) -> Option<ArcadeReorgMarker
 /// reorg keeps its height and changes its root).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BumpAnchor {
+    /// The block height the bump names.
     pub height: u64,
+    /// The merkle root the bump computes, hex.
     pub root: String,
 }
 

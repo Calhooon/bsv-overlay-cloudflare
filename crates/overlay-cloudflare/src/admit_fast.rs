@@ -102,6 +102,7 @@ pub fn ident_ok(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// The name of `table`'s shadow twin, which holds its evicted rows.
 pub fn shadow_table(table: &str) -> String {
     format!("{table}_evicted")
 }
@@ -109,7 +110,9 @@ pub fn shadow_table(table: &str) -> String {
 /// One `PRAGMA table_info` row.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 pub struct ColumnInfo {
+    /// The column's name.
     pub name: String,
+    /// The column's declared type.
     #[serde(rename = "type", default)]
     pub ty: String,
     /// `PRAGMA table_info`'s `notnull` (round 4 of the loop-18 gate).
@@ -296,8 +299,11 @@ async fn vouts_of(db: &D1Database, table: &str, txid: &str) -> Vec<u32> {
 /// One spend pointer the eviction released: the row and the txid that named it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReleasedSpend {
+    /// The table whose row the pointer was on.
     pub table: String,
+    /// The txid of the outpoint the row keys.
     pub txid: String,
+    /// The outpoint's output index.
     pub vout: u32,
 }
 
@@ -573,10 +579,13 @@ async fn count_keyed_checked(
 /// under the real logic, not a hand-driven copy of its SQL). Every method is fail-LOUD.
 #[async_trait(?Send)]
 pub trait ShadowDb {
+    /// The columns of `table`, as `PRAGMA table_info` reports them.
     async fn columns(&self, table: &str) -> Result<Vec<ColumnInfo>, String>;
+    /// How many rows of `table` carry `txid` in the column `key`.
     async fn count(&self, table: &str, key: &str, txid: &str) -> Result<u64, String>;
     /// The `outputIndex` values the keyed rows carry (asked only of the tables that have the column).
     async fn vouts(&self, table: &str, txid: &str) -> Result<Vec<u32>, String>;
+    /// Run one write with its binds.
     async fn exec(&self, sql: &str, binds: Vec<QVal>) -> Result<(), String>;
     /// One optional integer (the column aliased `v`), for the ledger's readmission stamp.
     async fn query_i64(&self, sql: &str, binds: Vec<QVal>) -> Result<Option<i64>, String>;
@@ -856,7 +865,9 @@ pub const RELEASED_SPENDS_SQL: &str = "SELECT releasedSpends FROM pot_evictions 
 /// An eviction the ledger holds OPEN (not readmitted): what every admission writer must honour.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenEviction {
+    /// Why the txid was evicted.
     pub reason: String,
+    /// When it was evicted, in milliseconds.
     pub evicted_at_ms: u64,
 }
 
@@ -1093,13 +1104,18 @@ pub async fn restore_twins(db: &dyn ShadowDb, txid: &str) -> (u64, Vec<String>) 
 /// What an eviction's core did (the marker, the passes, the readmission checks), for the D1 wrapper.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EvictionCore {
+    /// Rows moved by both passes.
     pub moved: u64,
     /// Everything that leaves the eviction INCOMPLETE (a faulted marker, the verification pass's verdicts, a
     /// faulted restore when yielding).
     pub faults: Vec<String>,
+    /// Faults of the opening pass that the verification pass healed.
     pub retried: Vec<String>,
+    /// What the verification pass found and did, for the caller's log.
     pub notes: Vec<String>,
+    /// The pot outpoints the moves carried.
     pub pot_vouts: Vec<u32>,
+    /// The lobby adverts the moves carried.
     pub advert_vouts: Vec<u32>,
     /// A readmission (the chain's word) stamped after this pass began: `Some(stamp)`. Found BEFORE the passes
     /// → nothing moved; found AFTER them → the pass's own moves were restored. The wrapper releases no spends
@@ -1412,8 +1428,6 @@ struct EvictedRow {
     released_spends: Option<String>,
 }
 
-/// If the txid is in the ledger as evicted and not yet readmitted, move every
-/// twin row back and mark the readmission. `true` when a readmission happened.
 /// bsv-low #451 (the second gate's HIGH-1): the `refused` verdict memo for an evicted txid — `/tx-any` serves it as
 /// `present: false` with zero courier calls; a readmission deletes it (`readmit_if_evicted`). Fail-soft.
 pub async fn write_refused_verdict(db: &D1Database, txid: &str, now_ms: i64, reason: &str) {
@@ -1429,6 +1443,8 @@ pub async fn write_refused_verdict(db: &D1Database, txid: &str, now_ms: i64, rea
     }
 }
 
+/// If the txid is in the ledger as evicted and not yet readmitted, move every
+/// twin row back and mark the readmission. `true` when a readmission happened.
 pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> bool {
     let txid = txid.to_ascii_lowercase();
     // the second gate's MEDIUM-3b: a readmission (a pushed MINED proof — the chain overrules a courier) deletes the
@@ -1583,11 +1599,15 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
 /// #602: indexer confirmation is distinct from a broadcaster's stored echo.
 #[async_trait(?Send)]
 pub trait ConflictPresence {
+    /// What the indexers say of `txid`; `None` when the presence could not be read.
     async fn presence(&self, txid: &str) -> Option<crate::proof_fetcher::NetworkPresence>;
 }
 
+/// The production [`ConflictPresence`]: asks Bitails and WhatsOnChain and classifies the two answers.
 pub struct CourierConflictPresence {
+    /// The courier sources to ask.
     pub sources: crate::proof_fetcher::ProofSources,
+    /// The WhatsOnChain API key, if one is configured.
     pub woc_api_key: Option<String>,
 }
 
@@ -1609,7 +1629,9 @@ impl ConflictPresence for CourierConflictPresence {
 /// eviction: it does not stand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictEvictOutcome {
+    /// The eviction stands.
     Evicted,
+    /// A readmission landed under the pass; the pot is served.
     Yielded,
 }
 
@@ -1627,6 +1649,7 @@ pub trait ConflictEviction {
         now_ms: u64,
         repointed: &[ReleasedSpend],
     ) -> Result<ConflictEvictOutcome, String>;
+    /// Write `competitor` as the spender of the outpoint `outpoint_txid:vout` that `evicted` named; `Ok(true)` when the row now names the competitor ([`record_conflict_spender`]).
     async fn record_conflict_spender(
         &self,
         outpoint_txid: &str,
@@ -1790,8 +1813,11 @@ pub const CONFLICT_CANDIDATES_SQL: &str = "SELECT b.txid, hex(b.beef) AS beef FR
 /// #602 fold (MEDIUM-1): what one conflict pass did, counted and on the tick's line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ConflictPassSummary {
+    /// Candidates the pass re-checked.
     pub scanned: u64,
+    /// Candidates it evicted.
     pub evicted: u64,
+    /// Re-checks that faulted (retried next pass).
     pub faults: u64,
 }
 
@@ -1899,6 +1925,7 @@ impl ConflictPassPort for WorkerConflictPass<'_> {
     async fn flush(&self) {}
 }
 
+/// One confirmed-conflict pass over up to eight unconfirmed live pots ([`CONFLICT_CANDIDATES_SQL`]): each re-checked against the couriers and evicted when a confirmed competitor conflicts with it.
 pub async fn confirmed_conflict_pass(
     db: &D1Database,
     woc_api_key: Option<&str>,
@@ -2014,13 +2041,16 @@ pub fn evidence_verdict(
 /// What the deferred evidence check needs (cloned into the `wait_until` job).
 #[derive(Clone)]
 pub struct EvidenceEnv {
+    /// The Arcade base URL (`ARCADE_URL`, or the default).
     pub arcade_base: String,
+    /// The WhatsOnChain API key, if one is configured.
     pub woc_api_key: Option<String>,
     /// The worker env (Clone): the job opens `OVERLAY_DB` itself (a D1 handle is not Clone).
     pub env: worker::Env,
 }
 
 impl EvidenceEnv {
+    /// The evidence environment from the Worker's environment.
     pub fn from_env(env: &worker::Env) -> Self {
         Self {
             arcade_base: env
@@ -2477,9 +2507,13 @@ pub enum ConfirmNow {
     /// a verified proof: the rows' confirmations latched through the guarded CAS (a CAS read fault on one row is
     /// counted in `cas_faults` and the loop continues — the cron's shape; the rows that confirmed stay confirmed)
     Confirmed {
+        /// Rows whose confirmation latched.
         rows: usize,
+        /// Rows whose CAS did not hit (the row moved meanwhile).
         cas_missed: usize,
+        /// Rows whose CAS read faulted.
         cas_faults: usize,
+        /// The block height the proof names, if known.
         height: Option<u64>,
     },
     /// a read fault (a courier, chaintracks, or the store): retryable, never a verdict

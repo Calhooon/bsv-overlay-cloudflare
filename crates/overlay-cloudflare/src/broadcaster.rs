@@ -949,7 +949,10 @@ pub enum LegWalk {
     Decided(Result<ArcOutcome, String>),
     /// The window's budget was spent with ancestors left: `reached` ancestors
     /// are primed (in ancestry order); the next invocation starts there.
-    Paused { reached: usize },
+    Paused {
+        /// The ancestors primed so far.
+        reached: usize,
+    },
 }
 
 /// PURE (#216/#267): does this EF batch carry UNPROVEN ancestry — legs beyond
@@ -2075,6 +2078,7 @@ pub const TERMINAL_MEMO_TTL_MS: f64 = 60_000.0;
 /// checks, the retire pass (capped at 8 per tick for the same reason) and the backstop. Over the cap the ask is
 /// `Inconclusive` (a retryable 502), counted.
 pub const TERMINAL_ASKS_PER_WINDOW: usize = 20;
+/// The window the terminal-ask cap counts over, in milliseconds.
 pub const TERMINAL_ASK_WINDOW_MS: f64 = 60_000.0;
 
 /// PURE: the memo lookup — a remembered verdict younger than `ttl_ms`.
@@ -2138,15 +2142,22 @@ thread_local! {
 /// How the ladder judged an Arcade-terminal subject (the gate's LOW-2: the operator sees which arm fired).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalJudgement {
+    /// An indexer holds it mined: admitted.
     Present,
+    /// An indexer holds it in the mempool: a race with Arcade's word.
     Race,
+    /// Both indexers say absent past the age floor: refused.
     Absent,
+    /// Absent but young: the retryable word.
     Young,
+    /// The indexers could not say.
     Inconclusive,
+    /// This isolate's terminal-ask cap was spent.
     Capped,
 }
 
 impl TerminalJudgement {
+    /// The judgement of an indexer presence, for a young subject or a capped ask.
     pub fn of(presence: crate::proof_fetcher::NetworkPresence, young: bool, capped: bool) -> Self {
         use crate::proof_fetcher::NetworkPresence;
         if capped {
@@ -2379,10 +2390,12 @@ pub struct ArcadeBroadcaster {
 }
 
 impl ArcadeBroadcaster {
+    /// Whether the submit's own answer already reached the gate (Arcade echoed SEEN or MINED for a known transaction).
     pub fn duplicate_echo(&self) -> bool {
         self.duplicate_echo.get()
     }
 
+    /// Mark the subject evicted at `at` milliseconds (the ledger's open eviction), if any.
     pub fn with_evicted_at_ms(mut self, at: Option<i64>) -> Self {
         self.evicted_at_ms = at;
         self
@@ -2445,6 +2458,7 @@ impl ArcadeBroadcaster {
         self
     }
 
+    /// Enable the explorers `sources` names for the presence reads.
     pub fn with_proof_sources(mut self, sources: crate::proof_fetcher::ProofSources) -> Self {
         self.proof_sources = sources;
         self

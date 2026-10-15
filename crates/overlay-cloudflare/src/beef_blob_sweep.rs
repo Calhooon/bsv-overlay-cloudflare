@@ -119,8 +119,10 @@ pub const SWEEP_STATE_CREATE: &str = "CREATE TABLE IF NOT EXISTS beef_blob_sweep
 /// runner ignores the re-run "duplicate column".
 pub const SWEEP_STATE_UNREADABLE_COLUMN: &str =
     "ALTER TABLE beef_blob_sweep ADD COLUMN last_unreadable INTEGER NOT NULL DEFAULT 0";
+/// The d3 fold-4: the lowest readable key of the last pass's unreadable entries.
 pub const SWEEP_STATE_UNREADABLE_KEY_COLUMN: &str =
     "ALTER TABLE beef_blob_sweep ADD COLUMN last_unreadable_key TEXT";
+/// The sweep's state read.
 pub const SWEEP_STATE_SQL: &str = "SELECT start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at, last_pass_at, last_listed, last_swept, last_unreadable, last_unreadable_key FROM beef_blob_sweep WHERE id = 1";
 /// Binds: start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at,
 /// last_pass_at, last_listed, last_swept, last_unreadable, last_unreadable_key.
@@ -140,6 +142,7 @@ pub const EF_JOB_ROWS_SQL: &str =
     "SELECT reference FROM ef_deferred_jobs WHERE reference IN (SELECT value FROM json_each(?1))";
 /// N5: that pass's state at rest, the same one-row shape as `beef_blob_sweep`. Transient.
 pub const EF_SWEEP_STATE_CREATE: &str = "CREATE TABLE IF NOT EXISTS ef_deferred_sweep (id INTEGER PRIMARY KEY CHECK (id = 1), start_after TEXT NOT NULL DEFAULT '', round_objects INTEGER NOT NULL DEFAULT 0, round_bytes INTEGER NOT NULL DEFAULT 0, round_started_at INTEGER, full_objects INTEGER, full_bytes INTEGER, full_at INTEGER, last_pass_at INTEGER, last_listed INTEGER NOT NULL DEFAULT 0, last_swept INTEGER NOT NULL DEFAULT 0, last_unreadable INTEGER NOT NULL DEFAULT 0, last_unreadable_key TEXT)";
+/// The EF sweep's state read.
 pub const EF_SWEEP_STATE_SQL: &str = "SELECT start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at, last_pass_at, last_listed, last_swept, last_unreadable, last_unreadable_key FROM ef_deferred_sweep WHERE id = 1";
 /// Binds as [`SWEEP_STATE_SAVE_SQL`].
 pub const EF_SWEEP_STATE_SAVE_SQL: &str = "INSERT INTO ef_deferred_sweep (id, start_after, round_objects, round_bytes, round_started_at, full_objects, full_bytes, full_at, last_pass_at, last_listed, last_swept, last_unreadable, last_unreadable_key) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
@@ -148,7 +151,9 @@ pub const EF_SWEEP_STATE_SAVE_SQL: &str = "INSERT INTO ef_deferred_sweep (id, st
 /// One listed object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
+    /// The object's key.
     pub key: String,
+    /// The object's size in bytes.
     pub bytes: u64,
     /// R2's `uploaded` stamp, ms.
     pub uploaded_ms: i64,
@@ -173,17 +178,25 @@ pub struct SweepState {
     pub start_after: String,
     /// The objects and bytes left at rest by the passes of the round in progress.
     pub round_objects: u64,
+    /// The bytes left at rest by the passes of the round in progress.
     pub round_bytes: u64,
+    /// When the round in progress started, in milliseconds.
     pub round_started_at: Option<i64>,
     /// The last COMPLETE round: every object under the prefix, as the listing said.
     pub full_objects: Option<u64>,
+    /// The bytes of the last complete round.
     pub full_bytes: Option<u64>,
+    /// When the last complete round ended, in milliseconds.
     pub full_at: Option<i64>,
+    /// When the last pass ran, in milliseconds.
     pub last_pass_at: Option<i64>,
+    /// Entries the last pass listed.
     pub last_listed: u64,
+    /// Objects the last pass swept.
     pub last_swept: u64,
     /// The entries the last pass could not read (skipped, never swept), and the first of their keys that read.
     pub last_unreadable: u64,
+    /// The lowest readable key of the last pass's unreadable entries.
     pub last_unreadable_key: Option<String>,
 }
 
@@ -288,13 +301,16 @@ pub fn next_state(
 /// key when that reads).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
+    /// A readable object.
     Object(Listed),
+    /// An entry whose key or date does not read; its key when that reads.
     Unreadable(Option<String>),
 }
 
 /// A listed page, split: the objects a pass plans over, the entries it skips, and the last key on the page.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Page {
+    /// The readable objects the pass plans over.
     pub listed: Vec<Listed>,
     /// Each unreadable entry's key, `None` where the key itself does not read.
     pub unreadable: Vec<Option<String>>,
@@ -566,15 +582,21 @@ pub struct PassOutcome {
     /// The entries the listing returned, the objects the pass handled, the entries it could not read and the first
     /// of their keys.
     pub listed: u64,
+    /// Objects the pass handled.
     pub handled: u64,
+    /// Entries it could not read.
     pub unreadable: u64,
+    /// The lowest readable key of those entries.
     pub unreadable_key: Option<String>,
+    /// Objects it swept (deleted).
     pub swept: u64,
+    /// The bytes of those objects.
     pub swept_bytes: u64,
     /// `head`s and deletes that faulted (each object stays for the next round).
     pub faults: u64,
     /// The cursor at rest before the pass (`None`: the state did not read) and after it (`None`: not saved).
     pub cursor_before: Option<String>,
+    /// The cursor at rest after the pass (`None`: not saved).
     pub cursor_after: Option<String>,
     /// The pass's stamp, as saved (`None`: not saved).
     pub last_pass_at: Option<i64>,

@@ -234,12 +234,18 @@ pub const FLUSH_WINDOW_FLOOR_MS: u64 = 3_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundFlush {
     /// Ship, starting no POST at or past `deadline_ms` (hops, pots and tracker events under this ONE deadline).
-    Ship { deadline_ms: u64 },
+    Ship {
+        /// The deadline, in milliseconds.
+        deadline_ms: u64,
+    },
     /// Less than [`FLUSH_WINDOW_FLOOR_MS`] left: nothing POSTed, counted. The pot and hop notes are PARKED in D1
     /// for the cron (`change_park::park_withheld`): a successful park takes them out of the isolate's sets; a park
     /// that faults (or a table at its ceiling) leaves them in the sets for this isolate's next flush. The tracker
     /// frames are not parked: they stay in the isolate's memory.
-    Skip { remaining_ms: u64 },
+    Skip {
+        /// What was left of the window, in milliseconds.
+        remaining_ms: u64,
+    },
 }
 
 /// PURE (bsv-low #649): the budget of a flush made by a `wait_until` job that started at `started_ms`, read at

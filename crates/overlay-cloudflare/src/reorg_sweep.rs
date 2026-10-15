@@ -99,7 +99,9 @@ pub(crate) async fn verify_bump_memoized(
 
 /// The persisted walk names (one `reorg_sweep_state` row each).
 pub const WALK_SPENDERS: &str = "spenders";
+/// The pot BEEFs walk.
 pub const WALK_POT_BEEFS: &str = "pot_beefs";
+/// The engine's transactions walk.
 pub const WALK_TRANSACTIONS: &str = "transactions";
 
 /// What a stored BEEF's OWN bump for `txid` anchors it to (height + the
@@ -789,15 +791,21 @@ pub async fn handle_reorg(
 /// pot_beefs and transactions legs).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ProofLegSummary {
+    /// Rows the pass read.
     pub scanned: usize,
+    /// Rows whose stitched bump chaintracks still holds.
     pub standing: usize,
     /// Refuted stitched bumps unlatched / un-proved for the completion pass.
     pub stale: usize,
     /// Rows whose bytes carry no bump for their own txid (nothing to verify).
     pub no_bump: usize,
+    /// Header reads that faulted (not a verdict).
     pub faults: usize,
+    /// Storage reads or writes that failed.
     pub errors: usize,
+    /// Whether the walk reached the end of its window.
     pub exhausted: bool,
+    /// Where the next pass resumes; `None` at the start.
     pub next_cursor: Option<RowKey>,
     /// Distinct (height, root) chaintracks reads this pass (review MED-3).
     pub memo_reads: usize,
@@ -891,6 +899,7 @@ pub async fn reverify_pot_beefs_window_with(
 /// The engine's transactions store as the sweep's third leg sees it: a
 /// keyed page of PROVEN rows in a height window, and the un-prove write.
 pub trait ProvenTxStore {
+    /// One page of proven rows at heights `lo..=hi` after `after`, at most `limit`: each key, txid and stored bytes.
     fn proven_window_page(
         &self,
         lo: u64,
@@ -898,6 +907,7 @@ pub trait ProvenTxStore {
         after: Option<RowKey>,
         limit: u64,
     ) -> impl std::future::Future<Output = Result<Vec<(RowKey, String, Vec<u8>)>, String>>;
+    /// Un-prove `txid`: its stitched proof refuted.
     fn unprove(&self, txid: &str) -> impl std::future::Future<Output = Result<(), String>>;
 }
 
@@ -1071,12 +1081,17 @@ impl ProvenTxStore for D1ProvenTxStore<'_> {
 /// What the revalidation sweep did this pass, per leg.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReorgSweepSummary {
+    /// The spenders leg.
     pub spenders: ReverifyPassSummary,
+    /// The pot BEEFs leg.
     pub pot_beefs: ProofLegSummary,
+    /// The transactions leg.
     pub transactions: ProofLegSummary,
     /// The window each leg walked, `(lo, hi)`, when it ran.
     pub spenders_window: Option<(u64, u64)>,
+    /// The window the pot BEEFs leg walked, `(lo, hi)`, when it ran.
     pub pot_beefs_window: Option<(u64, u64)>,
+    /// The window the transactions leg walked, `(lo, hi)`, when it ran.
     pub transactions_window: Option<(u64, u64)>,
     /// Walk-state read/write faults (the leg still ran from what it had).
     pub state_errors: usize,
@@ -1269,7 +1284,9 @@ pub struct UnminedHintSummary {
     pub uncorroborated: usize,
     /// Rows with no stored proof to check: nothing changed.
     pub no_stored_proof: usize,
+    /// Header reads that faulted (not a verdict).
     pub faults: usize,
+    /// Storage reads that failed.
     pub errors: usize,
 }
 

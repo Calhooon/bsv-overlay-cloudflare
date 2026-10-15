@@ -102,14 +102,19 @@ pub const ARCADE_STATE_NAME: &str = "events";
 /// older than its window, so the heal is `POST /internal/reorg {"fromHeight":
 /// H, "toHeight": H}` for the recorded H.
 pub const ARCADE_HELD_CEILING: u32 = 24;
+/// The passes an event may FAULT before it is released ([`ARCADE_HELD_CEILING`] gives the rule).
 pub const ARCADE_FAULT_CEILING: u32 = 12;
 
 /// What one feed read handed the pass.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FeedRead {
+    /// The orphan events on the listing, in ascending order.
     pub events: Vec<OrphanEvent>,
+    /// Rows the listing carried.
     pub rows: usize,
+    /// Rows that did not parse as an event.
     pub malformed: usize,
+    /// Listing pages read.
     pub pages: u32,
     /// The newest height the listing carried: Arcade's view of the tip.
     pub newest_height: Option<u64>,
@@ -117,6 +122,7 @@ pub struct FeedRead {
 
 /// The orphan feed (Arcade's block status listing) as the pass sees it.
 pub trait OrphanFeed {
+    /// Read the recent orphan events.
     fn recent_orphans(&self) -> impl std::future::Future<Output = Result<FeedRead, String>>;
 }
 
@@ -124,17 +130,21 @@ pub trait OrphanFeed {
 /// carried it, the merkle root (the memo's seed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalHeader {
+    /// The block hash at the height.
     pub hash: String,
+    /// The block's merkle root, when the frame carried it.
     pub merkle_root: Option<String>,
 }
 
 /// The header source for corroboration: what chaintracks holds at a height
 /// (`Ok(None)` = no header there) and its tip.
 pub trait HeaderSource {
+    /// The header chaintracks holds at `height`; `Ok(None)` when it holds none there.
     fn hash_at(
         &self,
         height: u64,
     ) -> impl std::future::Future<Output = Result<Option<CanonicalHeader>, String>>;
+    /// Chaintracks' tip height.
     fn tip(&self) -> impl std::future::Future<Output = Result<u64, String>>;
 }
 
@@ -143,9 +153,11 @@ pub trait HeaderSource {
 /// against that version (`Ok(Some(new))`), `Ok(None)` = another isolate
 /// wrote in between and this pass must stop.
 pub trait ConsumerStateStore {
+    /// The state and its write version.
     fn read(
         &self,
     ) -> impl std::future::Future<Output = Result<(ConsumerState, Option<u64>), String>>;
+    /// Write `state` against `expected_version`; `Ok(None)` when another isolate wrote in between.
     fn write(
         &self,
         state: &ConsumerState,
@@ -156,11 +168,17 @@ pub trait ConsumerStateStore {
 /// The per-pass bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PassLimits {
+    /// Events finished per pass at most.
     pub events_per_pass: u32,
+    /// Rows per leg per pass.
     pub leg_limit: u64,
+    /// An uncorroborated hash at least this many blocks below the tip is skipped.
     pub skip_depth: u64,
+    /// Passes an event may be held before it is released.
     pub held_ceiling: u32,
+    /// Passes an event may fault before it is released.
     pub fault_ceiling: u32,
+    /// Chaintracks this many blocks behind the listing's newest height counts as lagging.
     pub lag_tolerance: u64,
 }
 
@@ -199,7 +217,9 @@ impl Default for PassLimits {
 pub struct ArcadePassSummary {
     /// The feed was read this pass (once per pass, at most).
     pub feed_read: bool,
+    /// Rows the feed read carried.
     pub feed_rows: usize,
+    /// Rows that did not parse as an event.
     pub feed_malformed: usize,
     /// Events on the feed after the cursor (before the per-pass budget).
     pub feed_events: usize,
@@ -223,7 +243,9 @@ pub struct ArcadePassSummary {
     pub tracker_lagging: usize,
     /// The spenders leg, accumulated over the events this pass touched.
     pub spenders: ReverifyPassSummary,
+    /// The pot BEEFs leg, accumulated over the events this pass touched.
     pub pot_beefs: ProofLegSummary,
+    /// The transactions leg, accumulated over the events this pass touched.
     pub transactions: ProofLegSummary,
     /// The spenders leg stopped its page because the ladder's budget was
     /// spent (nothing judged blind of the couriers; resumed next pass).
@@ -753,6 +775,7 @@ pub struct ArcadeBlockStatusFeed {
 }
 
 impl ArcadeBlockStatusFeed {
+    /// The feed at the Arcade base URL `base_url`.
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -816,7 +839,9 @@ impl OrphanFeed for ArcadeBlockStatusFeed {
 /// Chaintracks through the worker's binding for the corroborating header
 /// read, and the tracker for the tip (its 30 s memo is fine here).
 pub struct EnvHeaderSource<'a> {
+    /// The Worker's environment (its chaintracks binding).
     pub env: &'a worker::Env,
+    /// The chain tracker the tip is read from.
     pub tracker: &'a dyn ChainTracker,
 }
 

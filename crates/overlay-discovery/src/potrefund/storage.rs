@@ -77,10 +77,13 @@ pub enum PotrefundQuery {
     /// may publish its own). Oldest first (bsv-low #281).
     #[serde(rename = "byPot")]
     ByPot {
+        /// The pot's txid.
         #[serde(rename = "potTxid")]
         pot_txid: String,
+        /// The pot's output index.
         #[serde(rename = "potVout")]
         pot_vout: u32,
+        /// The most markers to return.
         limit: Option<u32>,
         /// Page start (rows to skip in the oldest-first total order),
         /// default 0 (bsv-low #291 gate finding M2): each response is
@@ -95,7 +98,9 @@ pub enum PotrefundQuery {
     /// At most one row per pot, newest pot first (bsv-low #281).
     #[serde(rename = "partyFor")]
     PartyFor {
+        /// The identity key asking.
         identity: String,
+        /// The most pots to return.
         limit: Option<u32>,
     },
 }
@@ -159,8 +164,10 @@ pub trait PotrefundStorage {
 /// POTREFUND storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum PotrefundStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -180,10 +187,12 @@ pub struct MemoryPotrefundStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryPotrefundStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }

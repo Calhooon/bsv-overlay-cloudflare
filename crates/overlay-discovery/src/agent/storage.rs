@@ -10,22 +10,32 @@ use serde::{Deserialize, Serialize};
 /// An Agent discovery record — used by the Janitor to health-check agents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDiscoveryRecord {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     #[serde(rename = "outputIndex")]
     pub output_index: u32,
+    /// The agent's display name.
     pub name: String,
 }
 
 /// A stored Agent record with all fields from the PushDrop output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
+    /// The id of the transaction, hex.
     pub txid: String,
+    /// The output's index within the transaction.
     #[serde(rename = "outputIndex")]
     pub output_index: u32,
+    /// The registered agent's identity key, 66-hex compressed.
     pub identity_key: String,
+    /// The certifier's identity key, 66-hex compressed.
     pub certifier_key: String,
+    /// The agent's display name.
     pub name: String,
+    /// The agent's capabilities, one per comma-separated entry.
     pub capabilities: Vec<String>,
+    /// When the record was stored (the storage backend sets it).
     pub created_at: String,
 }
 
@@ -103,8 +113,10 @@ pub trait AgentStorage {
 /// Agent storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentStorageError {
+    /// The database failed.
     #[error("database error: {0}")]
     Database(String),
+    /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
 }
@@ -135,10 +147,12 @@ pub struct MemoryAgentStorage {
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryAgentStorage {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// How many records the store holds.
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }

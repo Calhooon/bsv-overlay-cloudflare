@@ -7,7 +7,9 @@ use serde::Deserialize;
 use std::cell::Cell;
 use worker::D1Database;
 
+/// The most rows a lookup reads within the proof window.
 pub const LOOKUP_WINDOW_LIMIT: usize = 1000;
+/// The proof-window pass's wall budget, in milliseconds.
 pub const PROOF_WINDOW_BUDGET_MS: u64 = 30_000;
 
 /// Aliases t and w name the transaction and its watch. An existing watch
@@ -39,6 +41,7 @@ struct Candidate {
     topic: String,
 }
 
+/// One proof-window pass: retire expired unproven rows, then ask peers for the held outputs' proofs, under [`PROOF_WINDOW_BUDGET_MS`].
 pub async fn run_pass(engine: &overlay_engine::engine::Engine, db: &D1Database) {
     let progress = Cell::new(PeerProofSummary::default());
     let pass = async {
