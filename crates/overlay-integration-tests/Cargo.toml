@@ -21,6 +21,10 @@ required-features = ["gasp-shadow"]
 name = "gasp_on_seam"
 required-features = ["gasp-shadow"]
 
+[[test]]
+name = "gasp_on_memory"
+required-features = ["gasp-shadow"]
+
 # Cross-crate tests live here to keep the engine publish graph acyclic.
 [dev-dependencies]
 bsv-overlay-engine = { version = "0.1.5", path = "../overlay-engine", features = ["memory-storage"] }
