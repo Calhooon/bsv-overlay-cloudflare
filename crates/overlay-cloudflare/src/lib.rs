@@ -229,6 +229,7 @@ pub const D1_LEDGER_ROUTES: &[&str] = &[
     "/arc-ingest",
     "/requestSyncResponse",
     "/requestForeignGASPNode",
+    "/requestForeignGASPNodes",
     "/health/invariants",
     "/health",
     "/beef-any",
@@ -487,6 +488,9 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
         }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
+        (Method::Post, "/requestForeignGASPNodes") => {
+            request_foreign_gasp_nodes(&engine, req).await
+        }
 
         // /admin/config is public (no auth) per mainline overlay-express 2.2.0
         (Method::Get, "/admin/config") => admin_config(&env).await,

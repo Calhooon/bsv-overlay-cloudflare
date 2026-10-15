@@ -7,6 +7,9 @@
 
 use async_trait::async_trait;
 use overlay_engine::gasp::{GASPError, GASPRemote};
+use overlay_engine::node_batch::{
+    BatchOutpoint, NodeBatch, NodeBatchAnswer, NodeBatchRequest, NODE_BATCH_MAX_BYTES,
+};
 use overlay_engine::types::{
     GASPInitialReply, GASPInitialRequest, GASPInitialResponse, GASPNode, GASPNodeResponse,
 };
@@ -100,6 +103,17 @@ impl WorkerGASPRemote {
         path: &str,
         body: &B,
     ) -> Result<T, PeerFailure> {
+        let (url, text) = self.post_text(path, body).await?;
+        serde_json::from_str(&text)
+            .map_err(|e| PeerFailure::BadBody(format!("Failed to parse response from {url}: {e}")))
+    }
+
+    /// POST JSON to a peer endpoint; the 2xx answer's body as text.
+    async fn post_text<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<(String, String), PeerFailure> {
         let url = format!("{}{}", self.peer_url, path);
 
         let body_json =
@@ -154,10 +168,10 @@ impl WorkerGASPRemote {
             });
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| PeerFailure::BadBody(format!("Failed to parse response from {url}: {e}")))
+        let text = response.text().await.map_err(|e| {
+            PeerFailure::BadBody(format!("Failed to read response from {url}: {e}"))
+        })?;
+        Ok((url, text))
     }
 }
 
@@ -221,6 +235,38 @@ impl GASPRemote for WorkerGASPRemote {
         )
         .await
         .map_err(PeerFailure::into_node_request_error)
+    }
+
+    /// Our peers answer `/requestForeignGASPNodes` (engine 0.2.1, #58); a
+    /// peer that does not answers it 404 and the sync asks it one node at a
+    /// time for the rest of the run.
+    fn batches(&self) -> bool {
+        true
+    }
+
+    /// POST to `{peer_url}/requestForeignGASPNodes`. An answer over the byte
+    /// budget is returned unparsed, its size named, for the sync to refuse.
+    async fn request_nodes(&self, outpoints: &[BatchOutpoint]) -> Result<NodeBatch, GASPError> {
+        let (url, text) = self
+            .post_text(
+                "/requestForeignGASPNodes",
+                &NodeBatchRequest {
+                    outpoints: outpoints.to_vec(),
+                },
+            )
+            .await
+            .map_err(PeerFailure::into_fault)?;
+        let bytes = text.len();
+        if bytes > NODE_BATCH_MAX_BYTES {
+            return Ok(NodeBatch {
+                answer: NodeBatchAnswer::default(),
+                bytes,
+            });
+        }
+        let answer = serde_json::from_str(&text).map_err(|e| {
+            PeerFailure::BadBody(format!("Failed to parse response from {url}: {e}")).into_fault()
+        })?;
+        Ok(NodeBatch { answer, bytes })
     }
 
     /// Submit a node to the peer and get back which inputs they need.
