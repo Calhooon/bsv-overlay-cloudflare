@@ -4020,6 +4020,53 @@ impl Engine {
             .await
     }
 
+    /// The nodes of up to [`crate::node_batch::NODE_BATCH_MAX_OUTPOINTS`]
+    /// outpoints in one answer of at most
+    /// [`crate::node_batch::NODE_BATCH_MAX_BYTES`] (engine 0.2.1, #58): each
+    /// as [`Self::provide_foreign_gasp_node`] answers it for its own graph,
+    /// in the asked order, a repeat answered once. `NodeNotFound` is the
+    /// entry `not_found`; any other error the entry `error`. The outpoints
+    /// from the one that does not fit on are left out (the asker names
+    /// them again); a node larger than the whole budget is `over_budget`.
+    pub async fn provide_foreign_gasp_nodes(
+        &self,
+        outpoints: &[crate::node_batch::BatchOutpoint],
+    ) -> Result<crate::node_batch::NodeBatchAnswer, EngineError> {
+        use crate::node_batch::{
+            refusal, NodeBatchEntry, Packer, NODE_BATCH_MAX_BYTES, NODE_BATCH_MAX_OUTPOINTS,
+        };
+        if outpoints.len() > NODE_BATCH_MAX_OUTPOINTS {
+            return Err(EngineError::InvalidQuery(format!(
+                "a node batch names at most {NODE_BATCH_MAX_OUTPOINTS} outpoints"
+            )));
+        }
+        let mut packer = Packer::new(NODE_BATCH_MAX_BYTES);
+        let mut seen = std::collections::HashSet::new();
+        for outpoint in outpoints {
+            if !seen.insert(outpoint) {
+                continue;
+            }
+            let graph_id = outpoint.key();
+            let answer = self
+                .provide_foreign_gasp_node(&graph_id, &outpoint.txid, outpoint.vout)
+                .await;
+            let (node, refused) = match answer {
+                Ok(node) => (Some(node), None),
+                Err(EngineError::NodeNotFound) => (None, Some(refusal::NOT_FOUND)),
+                Err(_) => (None, Some(refusal::ERROR)),
+            };
+            if !packer.push(NodeBatchEntry {
+                txid: outpoint.txid.clone(),
+                vout: outpoint.vout,
+                node,
+                refused: refused.map(str::to_string),
+            }) {
+                break;
+            }
+        }
+        Ok(packer.answer)
+    }
+
     /// Recursively search a BEEF tree for a specific txid and return a GASPNode.
     fn hydrate_gasp_node<'a>(
         &'a self,
@@ -5046,7 +5093,10 @@ impl Engine {
                         result.stop_reason = reason.into();
                         break;
                     }
-                    let slice = self.run_gasp_sync(&filter, &run, Some(&control)).await?;
+                    // Boxed: the slice's sync is the largest future here
+                    // (clippy's `large_futures`, past its bound since the
+                    // run's batch memo of engine 0.2.1).
+                    let slice = Box::pin(self.run_gasp_sync(&filter, &run, Some(&control))).await?;
                     let topic_result = slice.topics_synced.get(topic).ok_or_else(|| {
                         EngineError::InvalidQuery("backfill selection matched no topic".into())
                     })?;
@@ -5334,7 +5384,8 @@ impl Engine {
                         true, // unidirectional — overlay GASP is pull-only (submitNode throws); matches TS Engine.startGASPSync
                     )
                     .with_ancestor_fetcher(sync_fetcher.clone())
-                    .with_expired_outpoints(std::rc::Rc::clone(&expired));
+                    .with_expired_outpoints(std::rc::Rc::clone(&expired))
+                    .with_batch_memo(run.single_only(peer_url));
                     if let Some(control) = control {
                         let control = control.clone();
                         sync = sync.with_page_slice(std::rc::Rc::new(move || {
@@ -13851,4 +13902,5 @@ mod tests {
     include!("memo_tests.rs");
     include!("absence_tests.rs");
     include!("route_fault_tests.rs");
+    include!("batch_tests.rs");
 }

@@ -38,6 +38,7 @@ mod load_remote;
 mod load_storage;
 pub mod lookup_service;
 pub mod meter;
+pub mod node_batch;
 pub mod proof_window;
 pub mod route_fault;
 mod script_door;
