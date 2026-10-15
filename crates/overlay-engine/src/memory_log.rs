@@ -81,6 +81,12 @@ impl MemoryStorage {
         Ok(())
     }
 
+    /// The host's release of a resolved R2 object once its unit returned
+    /// (the a9 lane's one-body bound: the log holds one body's bytes).
+    pub fn release_admission_beef(&self, key: &str) {
+        self.admission_beefs.lock().unwrap().remove(key);
+    }
+
     /// An isolated copy of every stored table and the log's committed state,
     /// for a shadow that must apply nothing to this store. Fault and crash
     /// switches, resolved objects and any open unit are not copied.

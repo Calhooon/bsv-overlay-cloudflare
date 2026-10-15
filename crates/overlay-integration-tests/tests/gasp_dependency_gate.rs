@@ -15,12 +15,14 @@
 #[path = "support/gasp_shadow_world.rs"]
 mod world;
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use async_trait::async_trait;
 use bsv_overlay_engine::admission::{
-    admit_graph_observed, AdmitRefusal, Committed, GateReason, NoEvidence, UnitOutput, Walked,
+    admit_graph_hosted, admit_graph_observed, gasp_unit, AdmitRefusal, BeefCarry, Committed,
+    GateReason, GraphHost, GraphOutcome, NoEvidence, UnitKind, UnitOutput, UnitRunner, Walked,
 };
 use bsv_overlay_engine::engine::{Engine, EngineConfig, WalkBreachPolicy};
 use bsv_overlay_engine::lookup_service::{LookupService, LookupServiceError};
@@ -660,4 +662,163 @@ async fn d44_n3_the_gate_reads_the_walks_spends() {
         Some(&GateReason::WaitingOn(vec![a.id()])),
         "the gate took the walk's spends"
     );
+}
+
+// ============================================================================
+// The a17 seam, item 3: the gate resolves each carried body through the
+// host's resolver just before its own unit, one body at a time.
+// ============================================================================
+
+/// The host of the a9 lane's shape: the bodies' original BEEFs in its object
+/// store ("R2", by key), each read by `resolve`, handed into the memory log
+/// for that body's unit and released when the unit returns. It counts the
+/// resolved bytes it holds and their peak, and names each step.
+struct R2Host<'a> {
+    engine: &'a Engine,
+    store: Rc<MemoryStorage>,
+    objects: HashMap<String, Vec<u8>>,
+    held: Cell<usize>,
+    peak: Cell<usize>,
+    steps: RefCell<Vec<String>>,
+}
+
+#[async_trait(?Send)]
+impl GraphHost for R2Host<'_> {
+    async fn resolve(&self, body: &Walked) -> Result<Vec<u8>, AdmitRefusal> {
+        let BeefCarry::R2 { key, .. } = &body.beef else {
+            panic!("only an R2 carry is resolved");
+        };
+        let bytes = self.objects[key].clone();
+        self.held.set(self.held.get() + bytes.len());
+        self.peak.set(self.peak.get().max(self.held.get()));
+        self.steps
+            .borrow_mut()
+            .push(format!("resolve {}", &body.txid[..8]));
+        Ok(bytes)
+    }
+    async fn run(
+        &self,
+        body: &Walked,
+        resolved: Option<Vec<u8>>,
+    ) -> Result<Committed, AdmitRefusal> {
+        self.steps
+            .borrow_mut()
+            .push(format!("run {}", &body.txid[..8]));
+        let len = resolved.as_ref().map_or(0, Vec::len);
+        if let Some(bytes) = resolved {
+            self.store.cache_admission_beef(&body.beef, bytes)?;
+        }
+        let answer = self.store.run_unit(
+            UnitKind::Admit,
+            &body.evidence,
+            Box::pin(gasp_unit(self.engine, body)),
+        );
+        if let BeefCarry::R2 { key, .. } = &body.beef {
+            self.store.release_admission_beef(key);
+        }
+        self.held.set(self.held.get() - len);
+        answer
+    }
+}
+
+/// A transaction carrying `bytes` of data in a second output, its BEEF past
+/// the inline bound (an R2 carry).
+fn heavy(mut tx: Transaction, bytes: usize) -> Transaction {
+    let mut data = vec![0x00, 0x6a, 0x4e];
+    data.extend(u32::try_from(bytes).unwrap().to_le_bytes());
+    data.resize(data.len() + bytes, 0xcd);
+    tx.outputs.push(bsv_rs::transaction::TransactionOutput::new(
+        1,
+        bsv_rs::script::LockingScript::from_binary(&data).unwrap(),
+    ));
+    tx
+}
+
+/// Item 3. The chain `g <- c <- d`, each body's BEEF 4 MiB (three R2
+/// carries), through `admit_graph_hosted` over a host whose resolver reads its
+/// object store: each body is resolved just before its own unit and released
+/// after it, so the host holds at most ONE body's bytes (the a9 lane's rule;
+/// the a17 record: a synchronous gate's caller must resolve them all first);
+/// a body the gate holds is never read (the erring `g`: `c` and `d` wait).
+#[tokio::test]
+async fn d44_s3_the_gate_resolves_each_carried_body_one_at_a_time() {
+    const MIB4: usize = 4 << 20;
+    let g = heavy(genesis(80, 1), MIB4);
+    let c = heavy(child(&g, 0, 1), MIB4);
+    let d = heavy(child(&c, 0, 1), MIB4);
+    let graph = [(&g, 100), (&c, 101), (&d, 102)];
+    let objects: HashMap<String, Vec<u8>> = graph
+        .iter()
+        .map(|(tx, height)| {
+            let beef = proven_beef(tx, *height);
+            (hex::encode(bsv_rs::primitives::hash::sha256(&beef)), beef)
+        })
+        .collect();
+    let largest = objects.values().map(Vec::len).max().unwrap();
+    let total: usize = objects.values().map(Vec::len).sum();
+    for fails in [None, Some(g.id())] {
+        let store = Rc::new(MemoryStorage::new());
+        let engine = engine(&store, fails.clone(), None);
+        let walked = walk(&engine, &graph).await;
+        assert!(
+            walked
+                .iter()
+                .all(|w| matches!(w.beef, BeefCarry::R2 { .. })),
+            "every body rides R2"
+        );
+        let host = R2Host {
+            engine: &engine,
+            store: store.clone(),
+            objects: objects.clone(),
+            held: Cell::new(0),
+            peak: Cell::new(0),
+            steps: RefCell::default(),
+        };
+        let outcome = admit_graph_hosted(&host, &walked, &[]).await;
+        let steps = host.steps.borrow().clone();
+        println!(
+            "S3 fails={}: peak held {} B (one body {largest} B, the graph {total} B); steps {steps:?}",
+            fails.is_some(),
+            host.peak.get()
+        );
+        assert!(
+            host.peak.get() <= largest,
+            "at most one body's bytes held at once: peak {} B, one body {largest} B, the graph {total} B",
+            host.peak.get()
+        );
+        assert_eq!(host.held.get(), 0, "every resolved body released");
+        let [g8, c8, d8] = [&g, &c, &d].map(|tx| tx.id()[..8].to_string());
+        if fails.is_none() {
+            assert!(matches!(outcome, GraphOutcome::AllLanded { ref seqs } if seqs.len() == 3));
+            assert_eq!(
+                steps,
+                [
+                    format!("resolve {g8}"),
+                    format!("run {g8}"),
+                    format!("resolve {c8}"),
+                    format!("run {c8}"),
+                    format!("resolve {d8}"),
+                    format!("run {d8}"),
+                ]
+            );
+        } else {
+            let GraphOutcome::Held { landed, held } = outcome else {
+                panic!("the erring genesis holds the chain");
+            };
+            assert!(landed.is_empty());
+            assert_eq!(
+                held.iter().map(|h| h.gate.clone()).collect::<Vec<_>>(),
+                [
+                    Some(GateReason::ParentError),
+                    Some(GateReason::WaitingOn(vec![g.id()])),
+                    Some(GateReason::WaitingOn(vec![c.id()])),
+                ]
+            );
+            assert_eq!(
+                steps,
+                [format!("resolve {g8}"), format!("run {g8}")],
+                "a body the gate holds is never read"
+            );
+        }
+    }
 }
