@@ -418,12 +418,16 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
                 // is neither finished nor held, so the two together say why
                 // the cursor stopped or moved.
                 // Engine 0.1.15: the roots struck absent by the peers' word.
+                // Engine 0.2.0 (#57): the syncs a route fault ended, each as
+                // `<peer> route_fault:<class>`, none counted against the peer.
+                let route_faults: Vec<String> = res.route_faults.iter().map(|f| f.label()).collect();
                 worker::console_log!(
-                    "Scheduled GASP topic={} gaspRootsProven={} gaspRootsUnproven={} absences_struck={} cursor_held_by={:?} faulted={:?}",
+                    "Scheduled GASP topic={} gaspRootsProven={} gaspRootsUnproven={} absences_struck={} route_faults={:?} cursor_held_by={:?} faulted={:?}",
                     topic,
                     res.roots_proven,
                     res.roots_unproven,
                     res.absent_struck,
+                    route_faults,
                     res.cursor_held_by,
                     faulted_summary(&res.faulted_roots)
                 );
@@ -484,6 +488,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         gasp_cost.outputs_walked, gasp_cost.ms, gasp_cost.ms_per_1000_outputs);
     crate::gasp_cost::record(&ops_db, "tick", gasp_cost).await;
     crate::gasp_speed::record(&ops_db, "tick", gasp_cost, gasp_result.as_ref()).await;
+    crate::gasp_route::record(&ops_db, "tick", gasp_result.as_ref()).await;
 
     // Peer crawl: bridge for non-GASP peers (bsvb today). `/lookup` +
     // `/submit` instead of `/requestSyncResponse`. Engine's tm_X

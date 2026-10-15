@@ -28,6 +28,7 @@ mod gasp_cost;
 pub mod gasp_deferred;
 pub mod gasp_fault_memo;
 pub mod gasp_remote;
+mod gasp_route;
 mod gasp_speed;
 pub mod health_checker;
 pub mod hop_changes;

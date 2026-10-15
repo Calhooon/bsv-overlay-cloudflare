@@ -3382,6 +3382,7 @@ pub async fn admin_start_gasp_sync(
             .map(|(r, _)| r);
         crate::gasp_cost::record(&db, "admin", cost).await;
         crate::gasp_speed::record(&db, "admin", cost, result).await;
+        crate::gasp_route::record(&db, "admin", result).await;
         if let Some(result) = result {
             crate::gasp_deferred::record_counters(&db, &result.topics_synced).await;
         }

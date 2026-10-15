@@ -1595,6 +1595,8 @@ pub async fn health_invariants(
         Ok(absent) => absent,
         Err(error) => json!({"fault": error}),
     };
+    // Engine 0.2.0 (#57): the route faults of a day, none counted against a peer.
+    body["gaspRouteFaults24h"] = crate::gasp_route::view(db).await;
     body["gaspFaultMemoFolded"] = counters
         .get("gasp_fault_memo_folded_total")
         .cloned()
