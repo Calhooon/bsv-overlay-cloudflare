@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.2.1] - 2026-10-15
+
+- A batched node request between our own peers (#58).
+  `POST /requestForeignGASPNodes` takes `{"outpoints":[{"txid","vout"}...]}`,
+  at most `NODE_BATCH_MAX_OUTPOINTS` (100, the engine's page; a request over
+  it is answered 400 with `maxOutpoints` in the body), and answers
+  `{"nodes":[...]}`: each entry names its outpoint and carries the node as
+  `/requestForeignGASPNode` serves it (its proof included) or a refusal
+  (`not_found`, `over_budget`, `error`), in an answer of at most
+  `NODE_BATCH_MAX_BYTES` (4 MiB); the outpoints the budget leaves out have
+  no entry and are named again in the next body. The same auth as the single
+  route (none). The sync asks a peer that answers it for each page's fresh
+  roots in as few bodies as the budget allows; every entry feeds the code a
+  single answer feeds (`not_found` is the peer's `NodeNotFound`, counted by
+  the absence rule as before), and any other refusal is asked on the single
+  route. A batch that fails (a 404 from a peer without the route, a route
+  fault, any error) or an answer over the byte budget counts nothing against
+  the peer: the peer is asked one node at a time for the rest of the run,
+  remembered per (peer, run) and never persisted. A reference peer is asked
+  exactly as before, after one 404 a run. `SyncCost` gains `batch_requests`
+  and `batch_nodes`; the tick lines name them. `GASPRemote` gains the
+  defaulted `batches` and `request_nodes`.
+
+DEPLOYMENT NOTE: no migration, no var, no table. Both of our Workers need
+0.2.1 for the batch to be used between them; until the peer has it, the
+asker reads one 404 a run and walks as 0.2.0 does.
+
 ## [0.2.0] - 2026-10-15
 
 - bsv-rs 0.6.0 in both workspaces (caret `0.6.0`), and the home of the
