@@ -27,7 +27,8 @@ records "not shadowed". This PR is their shadow, the engine's.
   (`gasp_shadow.rs`). `AdmissionMode::parse` reads the Worker's words: `off`
   (the default), `shadow`, and `on` refused ("ADMISSION_MODE=on is not
   enabled: the admission log runner is a later slice"). The shadow runs only
-  under `Shadow` with a host set.
+  under `Shadow` with a host set. (Since the host seam, below: `on` parses,
+  and the engine takes it only where a `GaspFinalizeHost` is set.)
 - **The host** (`GaspShadow`): `snapshot(scope, budget)` (a disposable engine
   over an isolated copy of the served store, its unit runner, and the rows and
   bytes it read), `now_ms()` and `record(row)`. Its contract, in the trait's
@@ -552,3 +553,186 @@ word) stayed within 3.4 KB of it; only the shadow file as it stood at
 construct, and was left as built. It weighs only a `gasp-shadow` build: every
 Worker builds `off` (the dry runs above), whose size moved +969 B raw and
 -6 B deployed.
+
+## The host seam as built (`lane/atomic-gasp-seam-host`, the a17 lane)
+
+Zanaadu's a17 lane (zanaadu-v2 `lane/atomic-admission-a17-gasp-seam` at
+`bffd6ccd`, its record `docs/audit/2026-10-13-eve/atomic-admission-a17-gasp-seam.md`)
+pinned the engine to `6389501` and found the tick could not run the GASP
+finalize through the log's `admit_graph` under `on`: the engine handed the host
+no graph (the sink is drained inside `submit_finalized_graphs` through the
+served `submit_bounded`), `AdmissionMode::parse("on")` was refused, and the
+gate was one synchronous call, so a host whose units are awaited (an RPC to
+its log) could not run under it, and every R2-carried body had to be resolved
+before the call (the graph's bytes at once). This lane builds that seam in the
+engine, on draft #55's branch (base `6389501`), under the same feature
+(`gasp-shadow`, default off).
+
+**The host API** (the exact signatures; `admission` is ungated, the rest is
+`gasp-shadow`):
+
+```rust
+// bsv_overlay_engine::admission (no feature)
+#[async_trait(?Send)]
+pub trait GraphHost {
+    async fn resolve(&self, body: &Walked) -> Result<Vec<u8>, AdmitRefusal>;
+    async fn run(&self, body: &Walked, resolved: Option<Vec<u8>>)
+        -> Result<Committed, AdmitRefusal>;
+    fn answered(&self, _body: &Walked, _answer: &Result<Committed, AdmitRefusal>,
+        _gate: Option<&GateReason>) {}
+}
+pub async fn gasp_unit(engine: &Engine, walked: &Walked)
+    -> Result<UnitOutput, AdmitRefusal>;
+pub async fn admit_graph_hosted(host: &dyn GraphHost, graph: &[Walked],
+    unwalked: &[Unwalked]) -> GraphOutcome;
+
+// bsv_overlay_engine::gasp_shadow (feature `gasp-shadow`)
+pub enum AdmissionMode { Off, Shadow, On }          // parse("on") == Ok(On)
+pub enum AdmissionModeRefused { NoFinalizeHost }
+pub struct FinalizeGraph<'a> { pub peer: &'a str, pub topic: &'a str,
+    pub root: &'a str, pub beefs: &'a [Vec<u8>] }
+pub struct FinalizeBody<'a> { pub graph: &'a FinalizeGraph<'a>,
+    pub position: usize, pub walked: &'a Walked }  // .beef() -> &[u8]
+#[async_trait(?Send)]
+pub trait GaspFinalizeHost {
+    async fn resolve(&self, body: &FinalizeBody<'_>) -> Result<Vec<u8>, AdmitRefusal>
+        { Ok(body.beef().to_vec()) }
+    async fn admit(&self, body: &FinalizeBody<'_>, resolved: Option<Vec<u8>>)
+        -> Result<Committed, AdmitRefusal>;
+    fn answered(&self, _body: &FinalizeBody<'_>,
+        _answer: &Result<Committed, AdmitRefusal>, _gate: Option<&GateReason>) {}
+    async fn graph_done(&self, _graph: &FinalizeGraph<'_>, outcome: &GraphOutcome)
+        -> bool { matches!(outcome, GraphOutcome::AllLanded { .. }) }
+}
+
+// bsv_overlay_engine::engine::Engine (feature `gasp-shadow`)
+pub fn set_gasp_finalize_host(&mut self, host: Rc<dyn GaspFinalizeHost>);
+pub fn set_admission_mode(&mut self, mode: AdmissionMode)
+    -> Result<(), AdmissionModeRefused>;
+pub fn set_gasp_shadow(&mut self, mode: AdmissionMode, host: Rc<dyn GaspShadow>)
+    -> Result<(), AdmissionModeRefused>;            // was `()`
+// memory-storage: MemoryStorage::release_admission_beef(&self, key: &str)
+```
+
+**What runs under `on`.** `Engine::submit_finalized_graphs`, with the mode
+`On` and a finalize host set (`engine/gasp_on.rs`, `finalize_on`), drains the
+sink and, for each graph: walks every body on the engine
+(`walk_with_mode`, `historical-tx-no-spv`, `NotNow`, `NoEvidence`: no network,
+the anchor check already ran; a refused walk is an `Unwalked` parent, the
+shadow's `walk_refusal`), then runs `admit_graph_hosted` over the walked
+bodies. The gate (the one rule of D44 as the gate lens left it, now a stepper
+`admission::Gate` that `admit_graph_observed` and `admit_graph_hosted` share)
+takes the bodies ancestors first; a body whose in-graph parent did not land is
+held without a unit (`WaitingOn`, the parent's word when terminal); any other
+body is handed to `GaspFinalizeHost::admit`, ONE AT A TIME, its R2 bytes
+resolved through `resolve` just before it and moved into it, each in its own
+write section of the finalize gate (a due per-peer deadline stops the graph
+between two bodies, never inside one's unit, the served rule). The host runs
+the body as one unit of its own log inside its FIFO turn, the unit's body
+`gasp_unit` (rule 3: a topic manager's `Err` refuses the unit `not now` at
+`gasp_finalize.topic_manager`, which the gate reads as `ParentError`). Every
+body's word, held or run, reaches `answered` in the gate's order with the
+gate's reason. The engine writes nothing of a graph: the finalize's one
+materialization is the host's. **The cursor follows the host's word:**
+`graph_done` (by default: every body landed) says whether the cursor may pass
+the graph; `false` is a graph that did not land (without a per-peer budget
+the peer's whole cursor stays for the tick; under one, the hook fails that
+UTXO and the gap guard holds the cursor below it), so the peer's next sync
+re-sends the waiting part. `off` and `shadow` are untouched: one `if let` on
+`None` with no await, before the served loop.
+
+**`on` is taken only where the seam is set.** `AdmissionMode::parse("on")` is
+`Ok(On)`; `Engine::set_admission_mode(On)` (and `set_gasp_shadow(On, _)`, which
+now goes through it) with no `GaspFinalizeHost` answers
+`AdmissionModeRefused::NoFinalizeHost`, "ADMISSION_MODE=on is refused: no GASP
+finalize host is set (Engine::set_gasp_finalize_host)", and leaves the mode as
+it was.
+
+**The per-body resolver.** `admit_graph_hosted` asks `GraphHost::resolve` for
+an R2-carried body only when the gate runs it, just before its `run`, and
+moves the bytes into that run (the host releases them when it returns): the
+host holds one body's bytes at a time, and a body the gate holds is never read.
+A refused resolve is the body's own refusal (no unit; its descendants wait).
+The same function serves the log's own graph route (Zanaadu's
+`OnLog::admit_graph_in_turn`: its R2 resolver as `resolve`, `admit_in_turn` as
+`run`, inside its one FIFO turn), so the one-body bound (the a4 lens's
+correction 4, a9's `peak`) and its carried-predecessor loop stay the host's.
+
+**Witnesses**, each RED on its commit, green on the next
+(`crates/overlay-integration-tests/tests/gasp_on_seam.rs`, a sync engine over
+the shadow world's scripted peer and a `SinkHost` running each body through
+`gasp_unit` in the memory log over the served store; `gasp_dependency_gate.rs`
+for item 3, no feature):
+
+| witness | RED | green |
+| --- | --- | --- |
+| s1 the fan-in under `on` (`r` spends `a.0`, `b.0`; the log's manager erring at the finalize on `a`), unbudgeted and under a per-peer budget (the hook's path) | on `def6f52` (the API inert): `the engine's own finalize did not submit`, `left: [the three txids] right: []` | the sink hears `a` `not now at gasp_finalize.topic_manager`, `parent_error`; `b` `landed`; `r` (last) `not now at gasp_finalize.dependency_gate`, `{"waiting_on": [a]}`; the graph `landed 1, held [[a, "parent_error"], [r, {"waiting_on": [a]}]]`; the root never run; the engine submits nothing; the re-sync (the manager healed) hears `a` `landed`, `r` `landed`, the graph `landed 2`, and the rows and cursor equal the `off` run's healthy fan-in |
+| s1b a healthy fan-in: `on` against `off`; `off` with a host set | on `def6f52`: `left: [the three txids] right: []` | `on`: the host runs 3 bodies, the engine none; the peer's calls (as a multiset), the sync results, the rows and the cursor equal `off`'s; `off` with a host set never asks it and equals `off` |
+| s2 `on` where the seam is not set | on `44e714b` (set_admission_mode inert): `on without the seam is refused`, `left: Ok(()) right: Err(NoFinalizeHost)` | refused with the typed word through both setters, the mode left `Off`; `shadow`/`off` need no seam; `parse("on") == Ok(On)`; with the seam set, `On` taken |
+| `d44_s3` the chain `g <- c <- d`, three 4 MiB BEEFs riding R2, through `admit_graph_hosted` over a host resolving from its object store | on `f1b7e89` (every carried body resolved before the first unit, as item 1 built it): `at most one body's bytes held at once: peak 12583291 B, one body 4194431 B, the graph 12583291 B`, steps `resolve, resolve, resolve, run, run, run` | peak **4,194,431 B** (one body; the graph 12,583,291 B), steps `resolve g, run g, resolve c, run c, resolve d, run d`; the erring genesis: only `g` read, `c` and `d` held `waiting_on` and never resolved |
+
+w6 restated (`parse("on") == Ok(On)`; an unknown word still refused).
+
+**Gates, on the tip of `lane/atomic-gasp-seam-host`.**
+
+- `cargo test --workspace --features bsv-overlay-engine/memory-storage
+  --no-fail-fast`: **1,704 passed, 0 failed, 66 ignored** (104 binaries;
+  1,700 before, plus s1, s1b, s2, `d44_s3`). With the feature off (`-p
+  overlay-integration-tests --no-default-features --test gasp_shadow_off
+  --test gasp_dependency_gate`): the eleven gate witnesses (`d44_s3` among
+  them) and `gasp_shadow_off` green.
+- `cargo test --manifest-path workers/Cargo.toml --workspace --no-fail-fast`:
+  **1,565 passed, 0 failed, 1 ignored** (93 binaries; unchanged).
+- **The `off` recording** `431baab4e305582981b14370ed9ee36007a0a922e25341e9ca7c772192d4d112`,
+  polls `[57, 11, 54, 11]`: unchanged, with the feature on and off. **The peer
+  calls** (w7): 29 under `off`, 29 under `shadow`; the served store 129 and 177
+  (unchanged). **The ordered census** (w9): 64 rows, `38044a23…`, unchanged
+  (the gate's refactor into a stepper moves no word).
+- clippy with warnings denied (the root workspace all targets with
+  `memory-storage`; the engine all targets with no feature and with
+  `gasp-shadow,memory-storage`; the Workers' workspace all targets; the
+  overlay Worker with `--features gasp-shadow`) and `cargo fmt --all -- --check`:
+  clean. `cargo build --target wasm32-unknown-unknown` of the engine and
+  discovery, and of the engine with `gasp-shadow`: green.
+- **The wasm, raw release** (`bsv-overlay-cloudflare`, both trees built at
+  this worktree's path under the same `--remap-path-prefix`, `6389501` checked
+  out in place): feature OFF `6389501` 8,964,028 B, this tip **8,964,066 B
+  (+38 B)**, none of `gasp_shadow`, `gasp_on`, `admit_graph`, `judge_dry`,
+  `walk_with_mode`, `finalize_on`. Feature ON: `6389501` 9,525,805 B, this tip
+  9,579,116 B (**+53,311 B**: the hosted gate, `finalize_on` and the host
+  adapter; 101 `gasp_shadow` names, 16 `gasp_on`).
+- Not run in this lane: `make ci-deploy` (the dry runs through the real
+  worker-build), `make gasp-shadow-size` (its `git archive` path bias, stated
+  above, is unchanged).
+
+**Limits, stated.**
+
+- Rule 3 lives in the unit: a host whose `run`/`admit` does not run
+  `gasp_unit` commits F5's empty judgement after a manager `Err` and the gate
+  sees a landed body (the gate reads `ParentError` from the refusal's site,
+  `gasp_finalize.topic_manager`; the synchronous gate reads it the same way
+  now, equivalent to the old flag since nothing else answers that site).
+- The engine bounds no host call: the served finalize bounds each storage
+  call inside a submit (`set_finalize_submit_budget`); `GaspFinalizeHost::admit`
+  is one await the per-peer race waits for (a write section, never dropped
+  inside). A host whose call can hang must bound it itself, and a lost answer
+  (a unit that committed behind a dropped RPC) is the host's replay to settle
+  (`LogError::AnswerLost`'s rule).
+- A graph's bodies are handed one call each; whether they share one FIFO turn
+  is the host's (a host that wants the graph in one turn runs
+  `admit_graph_hosted` itself inside it, as the log's own graph route can).
+  A carried predecessor (`NotNow { predecessor }`) is the host's to land inside
+  its `run`, as `OnLog::admit_in_turn` does; the gate passes the word on.
+- The walk is the engine's, on the served store, before the host's units (as
+  the shadow walks on its snapshot); under `on` the engine still writes the
+  cursor and the peer-health rows (the sync's own bookkeeping), never a graph's
+  rows.
+- On the engine's finalize the graph is already whole in memory (the sink, as
+  before); `GaspFinalizeHost::resolve`'s default copies that one body. The
+  one-body bound is the log's (bodies by pointer), measured by `d44_s3`.
+- Under `on` the shadow does not run (it is `Shadow`'s alone): no census row
+  compares the host's finalize with anything.
+- Not run: Zanaadu's a17 re-run against this tip (the tick's GASP intake
+  through the seam, the fan-in under workerd, the chaos rows with the gate's
+  words), a Worker host over D1 and R2, wasm32 time and memory of the hosted
+  gate.
