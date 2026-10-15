@@ -1,0 +1,13 @@
+# The secrets scan (bsv-stack-lean #140): gitleaks' default rules, plus one
+# allowlist. A compressed secp256k1 public key (33 bytes, 66 hex, prefix 02
+# or 03) is public by definition; the generic-api-key rule reads the identity
+# and locking keys of the tests and fixtures as secrets.
+title = "bsv-overlay-cloudflare"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "compressed secp256k1 public keys"
+regexTarget = "secret"
+regexes = ['''^0[23][0-9a-fA-F]{64}$''']

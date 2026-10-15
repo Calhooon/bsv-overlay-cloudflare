@@ -131,3 +131,27 @@ jobs:
         --lib
     - run: cargo check --locked --manifest-path workers/Cargo.toml --workspace --target wasm32-unknown-unknown
         --lib
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    # The secrets scan (bsv-stack-lean #140): gitleaks 8.28.0 built from its
+    # release source, refused unless the tarball's sha256 is the one Homebrew's
+    # formula pins; the runner's Go builds it, go.sum checks its modules.
+    - name: gitleaks 8.28.0
+      env:
+        GITLEAKS_VERSION: 8.28.0
+        GITLEAKS_SHA256: c681af8aeacacf9d14f7ad97d534cf087f6d2d6fbd50dd02020b0f929b7a1c41
+      run: |
+        curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" "https://github.com/gitleaks/gitleaks/archive/refs/tags/v${GITLEAKS_VERSION}.tar.gz"
+        echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP"
+        cd "$RUNNER_TEMP/gitleaks-${GITLEAKS_VERSION}" && go build -o "$RUNNER_TEMP/gitleaks" .
+    # Every commit of the history and the tree, findings redacted; the
+    # allowlist is .gitleaks.toml's.
+    - run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 .'
+    - run: '"$RUNNER_TEMP/gitleaks" dir --redact --no-banner --exit-code 1 .'
