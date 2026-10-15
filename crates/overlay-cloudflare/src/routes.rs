@@ -3190,6 +3190,63 @@ pub async fn request_foreign_gasp_node(
     }
 }
 
+/// POST /requestForeignGASPNodes: the nodes of up to
+/// `NODE_BATCH_MAX_OUTPOINTS` outpoints in one answer (engine 0.2.1, #58).
+/// The same auth as `/requestForeignGASPNode` (none: a GASP peer route). A
+/// request over the cap is answered 400 with the cap in the body.
+pub async fn request_foreign_gasp_nodes(
+    engine: &Engine,
+    mut req: Request,
+) -> worker::Result<Response> {
+    use overlay_engine::node_batch::NodeBatchRequest;
+    let body: NodeBatchRequest = match req.json().await {
+        Ok(b) => b,
+        Err(e) => return json_error(&format!("Invalid GASP node batch request: {e}"), 400),
+    };
+    worker::console_log!(
+        "POST /requestForeignGASPNodes outpoints={}",
+        body.outpoints.len()
+    );
+    if let Some(refusal) = node_batch_over_cap(body.outpoints.len()) {
+        worker::console_log!("POST /requestForeignGASPNodes -> 400 (over the cap)");
+        return json_response(&refusal, 400);
+    }
+    match engine.provide_foreign_gasp_nodes(&body.outpoints).await {
+        Ok(answer) => {
+            worker::console_log!(
+                "POST /requestForeignGASPNodes -> 200 entries={}",
+                answer.nodes.len()
+            );
+            json_ok(&answer)
+        }
+        Err(e) => {
+            let status = engine_error_status(&e);
+            worker::console_log!("POST /requestForeignGASPNodes -> {}", status);
+            json_error(&e.to_string(), status)
+        }
+    }
+}
+
+/// The 400 body of a node batch over the cap, naming the cap.
+#[derive(Debug, Serialize)]
+pub(crate) struct NodeBatchOverCap {
+    status: &'static str,
+    message: String,
+    #[serde(rename = "maxOutpoints")]
+    max_outpoints: usize,
+}
+
+pub(crate) fn node_batch_over_cap(asked: usize) -> Option<NodeBatchOverCap> {
+    use overlay_engine::node_batch::NODE_BATCH_MAX_OUTPOINTS;
+    (asked > NODE_BATCH_MAX_OUTPOINTS).then(|| NodeBatchOverCap {
+        status: "error",
+        message: format!(
+            "a node batch names at most {NODE_BATCH_MAX_OUTPOINTS} outpoints; {asked} were named"
+        ),
+        max_outpoints: NODE_BATCH_MAX_OUTPOINTS,
+    })
+}
+
 // =============================================================================
 // Submit-operator auth (#347) + admin auth
 // =============================================================================
@@ -4454,6 +4511,29 @@ mod tests {
     use super::beef_any_txid;
     use super::engine_error_status;
     use super::false_ok_refusal_applies;
+
+    /// Engine 0.2.1 (#58): a node batch over the cap is answered 400 with
+    /// the cap in the body; at the cap it is served.
+    #[test]
+    fn batch_021_a_request_over_the_cap_names_the_cap() {
+        use overlay_engine::node_batch::NODE_BATCH_MAX_OUTPOINTS;
+        assert!(super::node_batch_over_cap(NODE_BATCH_MAX_OUTPOINTS).is_none());
+        let body =
+            serde_json::to_value(super::node_batch_over_cap(NODE_BATCH_MAX_OUTPOINTS + 1).unwrap())
+                .unwrap();
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["maxOutpoints"], NODE_BATCH_MAX_OUTPOINTS);
+        assert!(body["message"].as_str().unwrap().contains("at most 100"));
+        // The route is the D1 ledger's own key, never the single route's.
+        assert_eq!(
+            crate::d1_ledger::route_of("/requestForeignGASPNodes", crate::D1_LEDGER_ROUTES),
+            "/requestForeignGASPNodes"
+        );
+        assert_eq!(
+            crate::d1_ledger::route_of("/requestForeignGASPNode", crate::D1_LEDGER_ROUTES),
+            "/requestForeignGASPNode"
+        );
+    }
 
     /// Loop-1 hardening (2026-09-05): a KNOWN pot re-presented after the
     /// refund/settle consumed its last output must NOT trip the #413 false-ok
