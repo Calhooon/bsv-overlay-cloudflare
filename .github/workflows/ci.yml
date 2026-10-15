@@ -1,5 +1,8 @@
 # Shared Worker gate: PR head, read-only token, pinned Rust, cached cargo.
 # Host clippy covers all targets; wasm clippy covers libraries because SQLite dev tests are native.
+# The lint bar (bsv-stack-lean #137 to #145) adds machete (non-blocking), msrv, secrets, docs and
+# actionlint; the protection requires test, fmt, clippy and wasm32 until the keeper adds them.
+# Every action is pinned by commit sha.
 name: ci
 'on':
   pull_request: null
@@ -20,13 +23,13 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@master
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
       with:
         toolchain: 1.95.0
         components: rustfmt, clippy
         targets: wasm32-unknown-unknown
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: '. -> target
 
@@ -42,13 +45,13 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@master
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
       with:
         toolchain: 1.95.0
         components: rustfmt, clippy
         targets: wasm32-unknown-unknown
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: '. -> target
 
@@ -59,13 +62,13 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@master
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
       with:
         toolchain: 1.95.0
         components: rustfmt, clippy
         targets: wasm32-unknown-unknown
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: '. -> target
 
@@ -80,13 +83,13 @@ jobs:
     name: wasm32
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@master
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
       with:
         toolchain: 1.95.0
         components: rustfmt, clippy
         targets: wasm32-unknown-unknown
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: '. -> target
 
@@ -176,3 +179,23 @@ jobs:
     - run: cargo doc --locked --no-deps --workspace
     - run: cargo doc --locked --no-deps --workspace --features bsv-overlay-engine/memory-storage
     - run: cargo doc --locked --no-deps --manifest-path workers/Cargo.toml --workspace --exclude low-app-layer
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
+    # actionlint on every workflow (bsv-stack-lean #145): 1.7.12 built from its
+    # release source, refused unless the tarball's sha256 is the one Homebrew's
+    # formula pins; shellcheck on the runner checks the run scripts.
+    - name: actionlint 1.7.12
+      env:
+        ACTIONLINT_VERSION: 1.7.12
+        ACTIONLINT_SHA256: 454800bd4f854592bcfe79b161f71d56e35940eb7016e48a26dd356adc9d400a
+      run: |
+        curl -fsSL -o "$RUNNER_TEMP/actionlint.tar.gz" "https://github.com/rhysd/actionlint/archive/refs/tags/v${ACTIONLINT_VERSION}.tar.gz"
+        echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP"
+        cd "$RUNNER_TEMP/actionlint-${ACTIONLINT_VERSION}" && go build -o "$RUNNER_TEMP/actionlint" ./cmd/actionlint
+    - run: '"$RUNNER_TEMP/actionlint"'
