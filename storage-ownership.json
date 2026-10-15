@@ -756,6 +756,17 @@
    "why": "recomputed on the next read"
   },
   {
+   "name": "owed_spender_bytes",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "bsv-low #672 (RC-L30): a hop spender's immutable outputs + input outpoints, content-addressed by spender txid, persisted at the first hash-verified fetch and read before the owed recompute's budget",
+   "why": "a cache of immutable facts a courier re-fetches; a sweep ages it out, and a lost row is re-read when its spender is asked again (the honest could-not-judge word, never a wrong one)"
+  },
+  {
    "name": "pot_announce_parked",
    "database": "low-overlay-db",
    "owner": "low-app-layer",

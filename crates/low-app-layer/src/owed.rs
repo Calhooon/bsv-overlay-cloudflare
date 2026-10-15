@@ -1105,7 +1105,10 @@ pub fn markerless_should_carry(
 /// bsv-low #662: the previous snapshot's PAYOUT rows at the hop outpoints whose spender's bytes this pass WITHHELD
 /// (one statement, the identity's own rows by their primary key: `(identity, outpoint)`, at most one row an
 /// outpoint; the outpoints bound as one JSON array).
-pub const OWED_WITHHELD_PREVIOUS_SQL: &str = "SELECT identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason FROM owed_rows WHERE identity = ?1 AND outpoint IN (SELECT value FROM json_each(?2)) AND family = 'payout'";
+/// bsv-low #672 (RC-L30): the read also returns the identity's PREVIOUS `unbound` rows at the withheld outpoints, so
+/// [`keep_withheld_elsewhere`] can carry a JUDGED `spent-elsewhere` row forward the same way (both callers filter the
+/// family they want, so the broadened read is one statement for two carriers).
+pub const OWED_WITHHELD_PREVIOUS_SQL: &str = "SELECT identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason FROM owed_rows WHERE identity = ?1 AND outpoint IN (SELECT value FROM json_each(?2)) AND family IN ('payout','unbound')";
 /// The row word of a payout kept from the previous snapshot because this pass could not look at its spender.
 pub const OWED_REFRESH_WITHHELD: &str = "withheld";
 /// The L25-WITHHELD lens's MEDIUM-1 (1): how long a kept row may stand on its last judgement (`judgedAtMs`, the pass
@@ -1116,6 +1119,117 @@ pub const OWED_REFRESH_WITHHELD: &str = "withheld";
 /// walk names) and the honest "could not judge the spender" row returns.
 pub const OWED_WITHHELD_KEEP_MAX_MS: i64 = 60 * 60_000;
 const _: () = assert!(OWED_WITHHELD_KEEP_MAX_MS >= 12 * OWED_RECOMPUTE_OPEN_AFTER_MS);
+
+// =============================================================================
+// bsv-low #672 (2026-10-15, RC-L30-COULD-NOT-JUDGE): THE DURABLE SPENDER-BYTES STORE.
+//
+// THE RULE, in one place (cites #608 and the north-star program):
+//   A JUDGED owed row never regresses on a courier budget cut. A hop spender's OUTPUTS (pkh/sats/pot-lock per vout)
+//   and INPUT outpoints are IMMUTABLE facts of the spender's bytes, so the owed judgement PERSISTS them here at the
+//   first successful hash-verified fetch (DERIVE AT WRITE TIME, the north-star program's "next step" for the owed
+//   list on evidence) content-addressed by the spender txid, and READS the store BEFORE the recompute's clock on
+//   every later pass. A spender the store holds is never asked of a courier again, so a budget cut (the loop-30
+//   regression: a cut recompute lost a competitor's bytes and clobbered "spent outside this game" with "could not
+//   judge the spender") cannot starve a hop's known confirmed spender. As a BELT for a row JUDGED before the store
+//   existed (the store holds nothing for it), [`keep_withheld_elsewhere`] carries the PREVIOUS snapshot's judged word
+//   forward, keyed by the hop UTXO plus the content-addressed spender txid, while the couriers fill the store in the
+//   background; the word changes only on NEW evidence (a DIFFERENT spender, a reorg, the eviction ledger). This is
+//   #608's "stale could-not-judge mark re-judged on the next recompute" made durable at the source instead of
+//   re-derived from scratch every pass.
+// =============================================================================
+
+/// Byte-identical to overlay migration #672 (pinned by `schema.rs`). Content-addressed by the spender txid.
+pub const OWED_SPENDER_BYTES_CREATE: &str =
+    "CREATE TABLE IF NOT EXISTS owed_spender_bytes (txid TEXT PRIMARY KEY, bytesJson TEXT NOT NULL, createdAtMs INTEGER NOT NULL)";
+/// Persist a spender's parsed bytes once. ON CONFLICT DO NOTHING: content-addressed, so a re-write is the SAME parse
+/// (never `INSERT OR REPLACE` — #638's ban is for the guarded derived tables, and a REPLACE here would reset the age
+/// stamp a sweep rests on). A row written once is never written again.
+pub const OWED_SPENDER_BYTES_UPSERT_SQL: &str =
+    "INSERT INTO owed_spender_bytes (txid, bytesJson, createdAtMs) VALUES (?1, ?2, ?3) ON CONFLICT(txid) DO NOTHING";
+/// Read the store for the pass's named spenders in ONE statement (the txids as a JSON array), by the PRIMARY KEY.
+pub const OWED_SPENDER_BYTES_SELECT_SQL: &str =
+    "SELECT txid, bytesJson FROM owed_spender_bytes WHERE txid IN (SELECT value FROM json_each(?1))";
+/// The age sweep (the existing janitor's shape, `tracker_host::stored::SWEEP`): a bounded DELETE of rows older than
+/// the retention, run in the scheduled pass. `?1` the cutoff ms, `?2` the per-pass limit.
+pub const OWED_SPENDER_BYTES_SWEEP_SQL: &str =
+    "DELETE FROM owed_spender_bytes WHERE txid IN (SELECT txid FROM owed_spender_bytes WHERE createdAtMs < ?1 ORDER BY createdAtMs, txid LIMIT ?2)";
+/// The row-cap sweep: delete the OLDEST rows beyond the count ceiling, bounded per pass. `?1` the ceiling (OFFSET),
+/// `?2` the per-pass limit. A guard against a high write-rate outrunning the age sweep; the age sweep is the primary.
+pub const OWED_SPENDER_BYTES_CAP_SWEEP_SQL: &str =
+    "DELETE FROM owed_spender_bytes WHERE txid IN (SELECT txid FROM owed_spender_bytes ORDER BY createdAtMs DESC, txid LIMIT ?2 OFFSET ?1)";
+/// Eight days, as the tracker's stranger-projection sweep (`tracker_host::stored::SWEEP`). A spender's bytes outlive
+/// every honest recompute window of its hop many times over; past it an un-revisited row is dead weight.
+pub const OWED_SPENDER_BYTES_RETENTION_MS: i64 = 8 * 86_400_000;
+/// The store's hard row ceiling. Writes are bounded (at most the courier cap per recompute), so the age sweep bounds
+/// the table under any honest load; this ceiling is the belt against an adversarial write-rate.
+pub const OWED_SPENDER_BYTES_ROW_CAP: i64 = 50_000;
+/// How many rows one sweep pass may delete (the tracker's `LIMIT 64` shape, larger because this table has no read
+/// cost per row). Each sweep statement is bounded; a backlog drains over passes.
+pub const OWED_SPENDER_BYTES_SWEEP_LIMIT: i64 = 256;
+/// The per-ROW size cap: a spender whose serialized bytes exceed this is not persisted (it is re-read if asked
+/// again — the honest could-not-judge word, never a wrong one). A normal competitor/sweep is well under a KiB; this
+/// bounds one row against a pathological many-output transaction.
+pub const OWED_SPENDER_BYTES_MAX_JSON: usize = 64 * 1024;
+
+/// One output of a stored spender, the IMMUTABLE facts only (never the index's mutable per-output spend word): the
+/// vout, the P2PKH pkh when the output is one, the sats, and whether the output is a LOW pot covenant lock.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredSpenderOutput {
+    pub vout: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pkh: Option<String>,
+    pub sats: u64,
+    #[serde(default)]
+    pub pot: bool,
+}
+
+/// A spender's bytes as the store holds them: its input outpoints and its outputs' immutable facts. Content-addressed
+/// (the bytes were hash-checked against the txid before this was written), so the parse never goes stale.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredSpenderBytes {
+    pub inputs: Vec<(String, u32)>,
+    pub outputs: Vec<StoredSpenderOutput>,
+}
+
+impl StoredSpenderBytes {
+    /// Build from the owed brain's spender outputs + input outpoints, dropping the mutable per-output spend word.
+    pub fn from_parts(inputs: &[(String, u32)], outputs: &[SpenderOutput]) -> Self {
+        StoredSpenderBytes {
+            inputs: inputs.to_vec(),
+            outputs: outputs
+                .iter()
+                .map(|o| StoredSpenderOutput {
+                    vout: o.vout,
+                    pkh: o.pkh_hex.clone(),
+                    sats: o.sats,
+                    pot: o.pot_lock,
+                })
+                .collect(),
+        }
+    }
+    /// The owed brain's outputs, with `spent: None` — the store holds immutable facts, and the index's own spend word
+    /// (a different, mutable fact) is read from `pot_records` on the phases that have the bytes already.
+    pub fn to_outputs(&self) -> Vec<SpenderOutput> {
+        self.outputs
+            .iter()
+            .map(|o| SpenderOutput {
+                vout: o.vout,
+                pkh_hex: o.pkh.clone(),
+                sats: o.sats,
+                spent: None,
+                pot_lock: o.pot,
+            })
+            .collect()
+    }
+    /// The JSON this is persisted as, or `None` when it is larger than [`OWED_SPENDER_BYTES_MAX_JSON`] (not kept).
+    pub fn to_json_capped(&self) -> Option<String> {
+        let s = serde_json::to_string(self).ok()?;
+        (s.len() <= OWED_SPENDER_BYTES_MAX_JSON).then_some(s)
+    }
+    pub fn from_json(s: &str) -> Option<Self> {
+        serde_json::from_str(s).ok()
+    }
+}
 
 /// PURE (bsv-low #662): the spender a hop's row is judged on (the index's recorded spend, else the chain rung's
 /// spent word), lowercase: the same name the route asks the spender's bytes of.
@@ -1244,6 +1358,76 @@ pub fn keep_withheld_payouts(
     kept
 }
 
+/// PURE (bsv-low #672, RC-L30-COULD-NOT-JUDGE): a hop JUDGED `spent-elsewhere` (the chain rung named a competitor
+/// paying none of this identity's homes) does not flap to "could not judge the spender" when a later pass's spender
+/// courier cap or its clock WITHHELD the competitor's bytes. The sibling of [`keep_withheld_payouts`] for the
+/// `unbound` spender-judgement row, and the BELT behind the durable store ([`StoredSpenderBytes`]): once a pass
+/// persists the competitor's bytes, later passes read them before the clock and judge FRESH, so this fires only for
+/// a row JUDGED before the store held its spender (the transition, and any pass that genuinely has nothing). For each
+/// outpoint of [`withheld_hop_outpoints`] the identity's PREVIOUS row replaces this pass's could-not-judge row when it
+/// was a POSITIVE spender judgement (a `spendKind`, so `spent-elsewhere` or `pot-unindexed`, or `spenderPkhs` for the
+/// home-unknown sentence) of the SAME spender the hop still names (keyed on the hop UTXO plus the content-addressed
+/// spender txid: a DIFFERENT spender is NEW evidence and is never carried). The kept row is served as it was with
+/// `refresh: "withheld"`, `carried: true` (the additive mark) and `judgedAtMs`, within the same
+/// [`OWED_WITHHELD_KEEP_MAX_MS`] bound; it stays unclaimable (an `unbound` row always is), so the read re-judges it.
+/// Returns the count.
+pub fn keep_withheld_elsewhere(
+    i: &OwedInputs,
+    rows: &mut [OwedRow],
+    previous: &[(OwedRow, i64)],
+    withheld: &HashSet<String>,
+) -> usize {
+    let outpoints = withheld_hop_outpoints(i, rows, withheld);
+    let mut kept = 0;
+    for h in i.hops {
+        let key = outpoint_key(&h.hop_txid, h.hop_vout);
+        if !outpoints.contains(&key) {
+            continue;
+        }
+        let Some(sp) = hop_named_spender(i, h) else {
+            continue;
+        };
+        // the read binds the identity (`WHERE identity = ?1`): the PREVIOUS unbound row at this outpoint, a POSITIVE
+        // spender judgement of the SAME spender (the content-addressed txid), never a could-not-judge or fault row
+        let Some((prev, updated_at_ms)) = previous.iter().find(|(p, _)| {
+            p.outpoint == key
+                && p.family == OwedFamily::Unbound
+                && prev_names_spender(p, &sp)
+                && (p.facts.get("spendKind").is_some() || p.facts.get("spenderPkhs").is_some())
+                && p.facts["markerlessReadFault"] != true
+        }) else {
+            continue;
+        };
+        let game = prev.game_id.to_ascii_lowercase();
+        if i.collected_verified.contains(&game) || i.held_verified.contains(&held_key(&game, &sp)) {
+            continue;
+        }
+        let judged_at = prev.facts["judgedAtMs"].as_i64().unwrap_or(*updated_at_ms);
+        if i.now_ms.saturating_sub(judged_at) > OWED_WITHHELD_KEEP_MAX_MS {
+            continue;
+        }
+        let Some(slot) = rows.iter_mut().find(|r| is_spender_judgement(r, &key, &sp)) else {
+            continue;
+        };
+        let mut row = prev.clone();
+        row.facts["claimable"] = json!(false);
+        row.facts["refresh"] = json!(OWED_REFRESH_WITHHELD);
+        row.facts["carried"] = json!(true);
+        row.facts["judgedAtMs"] = json!(judged_at);
+        *slot = row;
+        kept += 1;
+    }
+    kept
+}
+
+/// PURE: the previous row's own spender fact (`chainSpender`, else `spendingTxid`) names `sp` (lowercase compare).
+fn prev_names_spender(p: &OwedRow, sp: &str) -> bool {
+    p.facts["chainSpender"]
+        .as_str()
+        .or_else(|| p.facts["spendingTxid"].as_str())
+        .is_some_and(|named| named.eq_ignore_ascii_case(sp))
+}
+
 /// How a named spender's bytes were LOOKED at this pass (the L25-WITHHELD lens's LOW-1): a read was made, or an
 /// answer already held was used, faulted or not. A looked spender is never withheld: its row (a judgement or a
 /// fault) is this pass's word.
@@ -1259,6 +1443,9 @@ pub enum SpenderLooked {
     TrackerRow,
     /// A courier was asked (`resolve_tx_any`), whatever it answered.
     CourierAsked,
+    /// bsv-low #672 (RC-L30): the DURABLE spender-bytes store answered (a spender a prior pass hash-verified and
+    /// persisted). A look, never a withhold: the bytes are in hand before the clock, so the budget cannot starve it.
+    StoredDurable,
 }
 
 /// Why a named spender's bytes were NOT looked at this pass: the only causes of a WITHHELD spender.
@@ -3667,6 +3854,30 @@ static WITHHELD_PREVIOUS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub fn note_withheld_previous_read_fault() {
     WITHHELD_PREVIOUS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
+/// bsv-low #672 (RC-L30): the durable spender-bytes store's counters. HITS: a named spender served from the store
+/// before the budget (no courier). PERSISTED: a hash-verified spender's bytes written for the first time. CARRIED:
+/// a judged `spent-elsewhere` row kept by [`keep_withheld_elsewhere`] (the belt). READ FAULTS: the store read
+/// faulted (the pass judges as before, nothing invented). SWEEP: a sweep pass ran.
+static SPENDER_STORE_HITS: AtomicU64 = AtomicU64::new(0);
+static SPENDER_STORE_PERSISTED: AtomicU64 = AtomicU64::new(0);
+static SPENDER_STORE_CARRIED: AtomicU64 = AtomicU64::new(0);
+static SPENDER_STORE_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
+static SPENDER_STORE_SWEEP_PASSES: AtomicU64 = AtomicU64::new(0);
+pub fn note_spender_store_hits(n: u64) {
+    SPENDER_STORE_HITS.fetch_add(n, Ordering::Relaxed);
+}
+pub fn note_spender_store_persisted(n: u64) {
+    SPENDER_STORE_PERSISTED.fetch_add(n, Ordering::Relaxed);
+}
+pub fn note_spender_store_carried(n: u64) {
+    SPENDER_STORE_CARRIED.fetch_add(n, Ordering::Relaxed);
+}
+pub fn note_spender_store_read_fault() {
+    SPENDER_STORE_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
+pub fn note_spender_store_sweep_pass() {
+    SPENDER_STORE_SWEEP_PASSES.fetch_add(1, Ordering::Relaxed);
+}
 /// Reads that served the rows in hand and kicked a background refresh (the stale / aged arms of the read rule).
 static READ_REFRESHES: AtomicU64 = AtomicU64::new(0);
 /// Reads that found a refresh of the same identity already in flight on this isolate (served, no second kick).
@@ -3959,6 +4170,11 @@ pub fn owed_health_json() -> Value {
         "sweepProofContradictions": SWEEP_PROOF_CONTRADICTIONS.load(Ordering::Relaxed),
         "spenderReadFaults": SPENDER_READ_FAULTS.load(Ordering::Relaxed),
         "withheldPreviousReadFaults": WITHHELD_PREVIOUS_READ_FAULTS.load(Ordering::Relaxed),
+        "spenderStoreHits": SPENDER_STORE_HITS.load(Ordering::Relaxed),
+        "spenderStorePersisted": SPENDER_STORE_PERSISTED.load(Ordering::Relaxed),
+        "spenderStoreCarried": SPENDER_STORE_CARRIED.load(Ordering::Relaxed),
+        "spenderStoreReadFaults": SPENDER_STORE_READ_FAULTS.load(Ordering::Relaxed),
+        "spenderStoreSweepPasses": SPENDER_STORE_SWEEP_PASSES.load(Ordering::Relaxed),
         "spenderReadsPerRecompute": OWED_SPENDER_READS_PER_RECOMPUTE,
         "recomputeTimeBudgetMs": OWED_RECOMPUTE_TIME_BUDGET_MS,
         "readRefreshesKicked": READ_REFRESHES.load(Ordering::Relaxed),
@@ -4921,6 +5137,300 @@ pub(crate) mod tests {
         assert!(rows[0].facts.get("refresh").is_none());
     }
 
+    /// bsv-low #672 (RC-L30-COULD-NOT-JUDGE, loop 30's first red, pair 13, hop 16821e21…:0): pass A judged the hop
+    /// `spent-elsewhere` (the chain rung named a competitor paying none of this identity's homes) and served "spent
+    /// outside this game"; pass B's courier budget was cut before it re-read the competitor's bytes and the row
+    /// REGRESSED to "could not judge the spender" — a completed recompute that knew LESS than the snapshot it
+    /// replaced. The belt ([`keep_withheld_elsewhere`]) carries the judged word forward, keyed on the hop UTXO plus
+    /// the content-addressed spender txid, within the same bound; past it the honest could-not-judge row returns; the
+    /// bytes in hand this pass judge fresh and carry nothing. (Pin 1.)
+    /// To RED: stub `keep_withheld_elsewhere` to `0` — the post-keep assertion fails on the derived could-not-judge
+    /// row (the inline `contains("could not judge the spender")` assertion IS pass B's served loop-30 word).
+    #[test]
+    fn i672_a_a_withheld_spender_keeps_the_judged_spent_elsewhere_row_not_could_not_judge() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let competitor = tx(0x0d);
+        let my_pkh = "cc".repeat(20);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh); // this identity's committed home for the game
+                                       // a competitor paying 20_170 to a pkh that is NOT any home of this identity: the spent-outside story
+        let elsewhere = pays(&competitor, &[(0, &"99".repeat(20), 20_170, Some(false))]);
+        let hops = [hop(
+            HopStatus::Unknown,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let chain = chain_confirmed(&key, true, Some(true), Some(&competitor), Some(true));
+        let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends_it.insert(competitor.clone(), vec![(tx(0x07), 0)]);
+        let no_bytes: HashMap<String, Vec<SpenderOutput>> = HashMap::new();
+        let no_inputs: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        // pass A: the competitor's bytes in hand, the row JUDGED spent-elsewhere (the good body at 15:05:38Z)
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &chain;
+        i.spender_outputs = &elsewhere;
+        i.spender_inputs = &spends_it;
+        i.my_pkh_by_game = &pkhs;
+        let judged = derive_owed_rows(&i);
+        assert_eq!(judged.len(), 1);
+        assert_eq!(judged[0].outpoint, key);
+        assert_eq!(judged[0].family, OwedFamily::Unbound);
+        assert_eq!(judged[0].facts["spendKind"], "spent-elsewhere");
+        assert_eq!(judged[0].reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
+        let judged_at = 1_800_000_000_000i64 - 10 * 60_000;
+        let previous = vec![(judged[0].clone(), judged_at)];
+        // pass B (the loop-30 recompute, the budget cut): the SAME hop, the competitor's bytes WITHHELD
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &chain;
+        i.spender_outputs = &no_bytes;
+        i.spender_inputs = &no_inputs;
+        i.my_pkh_by_game = &pkhs;
+        let derived = derive_owed_rows(&i);
+        // the regression, in one line: derive alone serves the clobbered word (pass B's `9c422cba…` body)
+        assert_eq!(derived[0].family, OwedFamily::Unbound);
+        assert!(derived[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("could not judge the spender"));
+        assert!(derived[0].facts.get("spendKind").is_none());
+        let mut withheld: HashSet<String> = HashSet::new();
+        withheld.insert(competitor.clone());
+        let mut rows = derived.clone();
+        assert_eq!(
+            keep_withheld_elsewhere(&i, &mut rows, &previous, &withheld),
+            1
+        );
+        let r = &rows[0];
+        assert_eq!(
+            r.facts["spendKind"], "spent-elsewhere",
+            "a withheld read never clobbers a judged spent-elsewhere row: {r:?}"
+        );
+        assert_eq!(r.reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
+        assert_eq!(r.facts["refresh"], OWED_REFRESH_WITHHELD);
+        assert_eq!(r.facts["carried"], true);
+        assert_eq!(r.facts["judgedAtMs"], judged_at);
+        assert_eq!(r.facts["claimable"], false);
+        assert!(
+            row_is_open(r),
+            "the carried row is open: the read re-judges it"
+        );
+        // a second withheld pass keeps the FIRST judgement's stamp
+        let again = vec![(r.clone(), judged_at + 5 * 60_000)];
+        let mut rows2 = derived.clone();
+        assert_eq!(
+            keep_withheld_elsewhere(&i, &mut rows2, &again, &withheld),
+            1
+        );
+        assert_eq!(rows2[0].facts["judgedAtMs"], judged_at);
+        // past the bound the honest could-not-judge row returns
+        let mut at_bound = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        at_bound.hop_chain = &chain;
+        at_bound.spender_outputs = &no_bytes;
+        at_bound.spender_inputs = &no_inputs;
+        at_bound.my_pkh_by_game = &pkhs;
+        at_bound.now_ms = judged_at + OWED_WITHHELD_KEEP_MAX_MS;
+        let mut rows3 = derived.clone();
+        assert_eq!(
+            keep_withheld_elsewhere(&at_bound, &mut rows3, &previous, &withheld),
+            1,
+            "at the bound the judgement still stands"
+        );
+        at_bound.now_ms = judged_at + OWED_WITHHELD_KEEP_MAX_MS + 1;
+        let mut rows3 = derived.clone();
+        assert_eq!(
+            keep_withheld_elsewhere(&at_bound, &mut rows3, &previous, &withheld),
+            0,
+            "a judgement older than OWED_WITHHELD_KEEP_MAX_MS is never kept"
+        );
+        assert_eq!(
+            rows3, derived,
+            "past the bound the could-not-judge row stands"
+        );
+        // the bytes in hand this pass: the derivation judges, nothing carried
+        let mut i3 = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i3.hop_chain = &chain;
+        i3.spender_outputs = &elsewhere;
+        i3.spender_inputs = &spends_it;
+        i3.my_pkh_by_game = &pkhs;
+        let mut rows4 = derive_owed_rows(&i3);
+        assert_eq!(
+            keep_withheld_elsewhere(&i3, &mut rows4, &previous, &withheld),
+            0
+        );
+        assert!(rows4[0].facts.get("carried").is_none());
+    }
+
+    /// bsv-low #672 (Pin 3): a spender the store lacks AND no prior judgement says could-not-judge HONESTLY. The belt
+    /// carries nothing: a prior row that was itself could-not-judge (no `spendKind`) is not a positive judgement, an
+    /// empty previous keeps nothing, and a FAULTED read (never withheld) keeps nothing.
+    #[test]
+    fn i672_b_no_prior_judgement_or_a_fault_stays_could_not_judge() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let competitor = tx(0x0d);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), "cc".repeat(20));
+        let hops = [hop(
+            HopStatus::Unknown,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let chain = chain_confirmed(&key, true, Some(true), Some(&competitor), Some(true));
+        let no_bytes: HashMap<String, Vec<SpenderOutput>> = HashMap::new();
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &chain;
+        i.spender_outputs = &no_bytes;
+        i.my_pkh_by_game = &pkhs;
+        let derived = derive_owed_rows(&i);
+        assert!(derived[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("could not judge the spender"));
+        let judged_at = 1_800_000_000_000i64 - 10 * 60_000;
+        let mut withheld: HashSet<String> = HashSet::new();
+        withheld.insert(competitor.clone());
+        // no previous at all
+        let mut rows = derived.clone();
+        assert_eq!(keep_withheld_elsewhere(&i, &mut rows, &[], &withheld), 0);
+        assert_eq!(rows, derived, "no prior judgement: the honest word stands");
+        // a previous row that is ITSELF could-not-judge (no spendKind, no spenderPkhs): not a positive judgement
+        let prev_cnj = vec![(derived[0].clone(), judged_at)];
+        let mut rows2 = derived.clone();
+        assert_eq!(
+            keep_withheld_elsewhere(&i, &mut rows2, &prev_cnj, &withheld),
+            0
+        );
+        assert_eq!(rows2, derived);
+        // a FAULTED read (the spender looked at, the answer bad): never withheld, the fault row stands
+        let elsewhere = pays(&competitor, &[(0, &"99".repeat(20), 20_170, Some(false))]);
+        let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends_it.insert(competitor.clone(), vec![(tx(0x07), 0)]);
+        let mut ij = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        ij.hop_chain = &chain;
+        ij.spender_outputs = &elsewhere;
+        ij.spender_inputs = &spends_it;
+        ij.my_pkh_by_game = &pkhs;
+        let judged = derive_owed_rows(&ij);
+        let previous = vec![(judged[0].clone(), judged_at)];
+        let none: HashSet<String> = HashSet::new();
+        let mut rows3 = derived.clone();
+        assert_eq!(
+            keep_withheld_elsewhere(&i, &mut rows3, &previous, &none),
+            0,
+            "a faulted read is never withheld; the fault row stands"
+        );
+    }
+
+    /// bsv-low #672 (Pin 4): NEW evidence moves a carried word. A prior judged `spent-elsewhere` by competitor X is
+    /// never carried onto a hop the chain now names spent by a DIFFERENT competitor Y (a second spend, a reorg): the
+    /// carry is keyed on the hop UTXO PLUS the content-addressed spender txid, so a changed spender is new evidence
+    /// the pass must judge from (or honestly could-not-judge).
+    #[test]
+    fn i672_c_a_different_spender_is_new_evidence_and_the_old_word_is_not_carried() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let (x, y) = (tx(0x0d), tx(0x0e));
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), "cc".repeat(20));
+        let elsewhere_x = pays(&x, &[(0, &"99".repeat(20), 20_170, Some(false))]);
+        let hops = [hop(
+            HopStatus::Unknown,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends_it.insert(x.clone(), vec![(tx(0x07), 0)]);
+        // the prior judged row names X
+        let chain_x = chain_confirmed(&key, true, Some(true), Some(&x), Some(true));
+        let mut ix = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        ix.hop_chain = &chain_x;
+        ix.spender_outputs = &elsewhere_x;
+        ix.spender_inputs = &spends_it;
+        ix.my_pkh_by_game = &pkhs;
+        let judged_x = derive_owed_rows(&ix);
+        assert_eq!(judged_x[0].facts["chainSpender"], x);
+        let previous_x = vec![(judged_x[0].clone(), 1_800_000_000_000i64 - 10 * 60_000)];
+        // this pass: the chain names Y, Y withheld, no bytes
+        let no_bytes: HashMap<String, Vec<SpenderOutput>> = HashMap::new();
+        let chain_y = chain_confirmed(&key, true, Some(true), Some(&y), Some(true));
+        let mut iy = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        iy.hop_chain = &chain_y;
+        iy.spender_outputs = &no_bytes;
+        iy.my_pkh_by_game = &pkhs;
+        let derived_y = derive_owed_rows(&iy);
+        let mut withheld_y: HashSet<String> = HashSet::new();
+        withheld_y.insert(y.clone());
+        let mut rows = derived_y.clone();
+        assert_eq!(
+            keep_withheld_elsewhere(&iy, &mut rows, &previous_x, &withheld_y),
+            0
+        );
+        assert_eq!(
+            rows, derived_y,
+            "a different spender is new evidence; X's word is not carried onto Y"
+        );
+    }
+
+    /// bsv-low #672 (Pin 2b): the store's bytes JUDGE, and a store hit is never withheld. A spender served from the
+    /// durable store (`StoredSpenderBytes::to_outputs`) drives `derive_owed_rows` to the SAME `spent-elsewhere` word
+    /// a fresh fetch gives, and with the spender in `spender_outputs` the pass's `withheld_hop_outpoints` is empty
+    /// even when the spender is marked withheld — so the phases never ask a courier for it and the belt need not
+    /// fire. The round-trip through the production SQL (and the bounds) is `owed_spender_store_sqlite.rs`.
+    #[test]
+    fn i672_store_bytes_judge_spent_elsewhere_and_a_store_hit_is_never_withheld() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let competitor = tx(0x0d);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), "cc".repeat(20));
+        // the store's parse (immutable facts, spent dropped) round-tripped through JSON
+        let stored = StoredSpenderBytes::from_parts(
+            &[(tx(0x07), 0)],
+            &[SpenderOutput {
+                vout: 0,
+                pkh_hex: Some("99".repeat(20)),
+                sats: 20_170,
+                spent: Some(true), // a mutable word the store must NOT keep
+                pot_lock: false,
+            }],
+        );
+        let json = stored.to_json_capped().expect("under the size cap");
+        let back = StoredSpenderBytes::from_json(&json).expect("round-trips");
+        assert_eq!(back, stored);
+        assert!(
+            back.to_outputs().iter().all(|o| o.spent.is_none()),
+            "the store holds immutable facts only; the mutable spend word is dropped"
+        );
+        let mut from_store: HashMap<String, Vec<SpenderOutput>> = HashMap::new();
+        from_store.insert(competitor.clone(), back.to_outputs());
+        let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends_it.insert(competitor.clone(), back.inputs.clone());
+        let hops = [hop(
+            HopStatus::Unknown,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let chain = chain_confirmed(&key, true, Some(true), Some(&competitor), Some(true));
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &chain;
+        i.spender_outputs = &from_store;
+        i.spender_inputs = &spends_it;
+        i.my_pkh_by_game = &pkhs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["spendKind"], "spent-elsewhere");
+        assert_eq!(rows[0].reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
+        // the spender is marked withheld this pass, but the store already filled its bytes: not withheld, no carry
+        let mut withheld: HashSet<String> = HashSet::new();
+        withheld.insert(competitor);
+        assert!(
+            withheld_hop_outpoints(&i, &rows, &withheld).is_empty(),
+            "a store-filled spender is never withheld: the phases ask no courier for it"
+        );
+    }
+
     /// bsv-low L25 (the courier-retire story-row flap; RC-L25POST2, pair 19, 05:34:17Z): a hop an EARLIER pass
     /// PROVED home-spent — THIS crate verified MY key's signature over the spender and latched it durably under
     /// `homeproof:` — is RETIRED on every recompute, BYTE-FREE. On the 05:34Z recompute the spender courier cap
@@ -5161,6 +5671,7 @@ pub(crate) mod tests {
             SpenderLooked::CachedAnswer,
             SpenderLooked::TrackerRow,
             SpenderLooked::CourierAsked,
+            SpenderLooked::StoredDurable,
         ] {
             // looked first (phase 1), then a later cap names it (phase 2 never reaches it): looked
             let mut look = SpenderLook::default();

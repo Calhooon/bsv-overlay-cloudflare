@@ -226,6 +226,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         if let Err(e) = tracker_host::runtime::tick(&env).await {
             worker::console_warn!("[tracker-tick] deferred: {e}");
         }
+        // bsv-low #672 (RC-L30): the durable spender-bytes store's bounded age + row-cap sweep (the janitor's shape),
+        // best-effort on the scheduled path, never on a read.
+        routes::sweep_owed_spender_bytes(&env).await;
     });
     pot_hook::schedule_tick(&|f| ctx.wait_until(f), drain, tracker);
 }

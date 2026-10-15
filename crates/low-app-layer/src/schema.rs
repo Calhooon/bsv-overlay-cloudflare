@@ -267,6 +267,10 @@ pub const CREATE_TABLE_CATCHUPS: &[&str] = &[
     crate::pot_hook::PARKED_CREATE,
     // E649 L4 N1: the park tokens' counter (overlay migration 231), bumped in the park's own batch.
     crate::pot_hook::PARK_SEQ_CREATE,
+    // bsv-low #672 (overlay migration 259, RC-L30-COULD-NOT-JUDGE): the owed list's durable content-addressed
+    // spender-bytes store, READ by `/owed` before its recompute budget and WRITTEN in the snapshot batch, so a cold
+    // app-layer isolate ahead of the overlay must create it (the module's membership rule).
+    crate::owed::OWED_SPENDER_BYTES_CREATE,
 ];
 
 /// Set once THIS isolate has issued (or knowingly skipped) EVERY statement.
@@ -506,14 +510,15 @@ mod tests {
     fn every_create_table_catchup_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             CREATE_TABLE_CATCHUPS.len(),
-            11,
+            12,
             "tx_words and tracker_backfill (NS-3), network_seen (#371), collected_markers_v2 (#252 stage A), \
              hand_markers (#382, mirrored for the brain-cutover M2 join), \
              proof_posts (bsv-low P1.1 proof-in-DB, owner GO 2026-09-02), \
              owed_rows + owed_state (bsv-low #469, the owed list), \
              hopsweep_records (bsv-low #469 decision 3, the filed hop sweeps), \
              pot_announce_parked (E649 L4 H1, the pot hook's parked wake-ups), \
-             pot_announce_seq (E649 L4 N1, the park's tokens)"
+             pot_announce_seq (E649 L4 N1, the park's tokens), \
+             owed_spender_bytes (bsv-low #672, RC-L30, the durable spender-bytes store)"
         );
         for stmt in CREATE_TABLE_CATCHUPS {
             assert!(stmt.starts_with("CREATE TABLE IF NOT EXISTS "), "{stmt}");

@@ -3929,6 +3929,10 @@ async fn owed_recompute_inner(
     let mut spender_look = crate::owed::SpenderLook::default();
     // MEDIUM-1 (2): the spenders a courier was really asked for this pass, stamped durably in the write batch
     let mut spenders_asked: Vec<String> = Vec::new();
+    // bsv-low #672 (RC-L30): the spenders newly HASH-VERIFIED from a courier this pass, to persist in the durable
+    // store (the snapshot batch), content-addressed by txid — so a later budget-cut recompute reads them before its
+    // clock instead of losing them and clobbering a judged `spent-elsewhere` row. Bounded by the courier cap.
+    let mut spender_bytes_to_persist: Vec<(String, crate::owed::StoredSpenderBytes)> = Vec::new();
     {
         // the spenders, newest hop first (the marker's filing time), dedup'd, pots excluded
         let mut ordered: Vec<(i64, String)> = Vec::new();
@@ -3973,8 +3977,36 @@ async fn owed_recompute_inner(
             #[serde(default)]
             spent: Option<f64>,
         }
-        // phase 1: the index's bytes (D1), a parsed courier memo, or the isolate's tx-any cache — no courier asked
-        let mut ordered: Vec<String> = ordered.into_iter().map(|(_, sp)| sp).collect();
+        // bsv-low #672 (RC-L30-COULD-NOT-JUDGE): the DURABLE spender-bytes store, READ here BEFORE the budget loop so
+        // a time cut can never starve a hop's known confirmed spender (loop 30's regression). One PK read of the
+        // named spenders; a hit fills the brain's maps with the immutable bytes a prior pass hash-verified, marks the
+        // spender LOOKED (never withheld), and the phases skip it (no courier ever asked again). A read fault leaves
+        // the maps as they were — the pass judges as before and the belt (keep_withheld_elsewhere) still catches a
+        // previously-judged row.
+        if !seen_spenders.is_empty() {
+            match owed_spender_store_read(db, &seen_spenders).await {
+                Ok(hits) => {
+                    crate::owed::note_spender_store_hits(hits.len() as u64);
+                    for (sp, bytes) in hits {
+                        spender_look.look(&sp, crate::owed::SpenderLooked::StoredDurable);
+                        courier_spenders.insert(sp.clone());
+                        spender_inputs.insert(sp.clone(), bytes.inputs.clone());
+                        spender_outputs.insert(sp, bytes.to_outputs());
+                    }
+                }
+                Err(e) => {
+                    crate::owed::note_spender_store_read_fault();
+                    console_warn!("[owed] spender-bytes store read failed: {e}");
+                }
+            }
+        }
+        // phase 1: the index's bytes (D1), a parsed courier memo, or the isolate's tx-any cache — no courier asked.
+        // A spender the durable store already filled is dropped here (its bytes are in hand, budget-free).
+        let mut ordered: Vec<String> = ordered
+            .into_iter()
+            .map(|(_, sp)| sp)
+            .filter(|sp| !spender_outputs.contains_key(sp))
+            .collect();
         let tail = ordered.split_off(
             ordered
                 .len()
@@ -4131,6 +4163,12 @@ async fn owed_recompute_inner(
             }
             if let Some(parsed) = parse_spender_answer(&a, &sp) {
                 owed_spender_outputs_memo_put(&sp, &parsed);
+                // bsv-low #672 (RC-L30): persist this hash-verified spender durably (the snapshot batch), so no
+                // later recompute asks a courier for it or loses it to a budget cut. Content-addressed by txid.
+                spender_bytes_to_persist.push((
+                    sp.clone(),
+                    crate::owed::StoredSpenderBytes::from_parts(&parsed.inputs, &parsed.outputs),
+                ));
                 courier_spenders.insert(sp.clone());
                 spender_inputs.insert(sp.clone(), parsed.inputs);
                 spender_outputs.insert(sp, parsed.outputs);
@@ -4282,6 +4320,22 @@ async fn owed_recompute_inner(
                         &identity_lc[..12.min(identity_lc.len())]
                     );
                 }
+                // bsv-low #672 (RC-L30): the belt — a JUDGED `spent-elsewhere` row (a competitor the chain named
+                // paying none of my homes) whose bytes this pass withheld keeps its previous word (the store has
+                // nothing for a row judged before it existed); the durable store makes this the transition case only.
+                let carried = crate::owed::keep_withheld_elsewhere(
+                    &inputs,
+                    &mut rows,
+                    &prev,
+                    &spenders_withheld,
+                );
+                if carried > 0 {
+                    crate::owed::note_spender_store_carried(carried as u64);
+                    worker::console_log!(
+                        "[owed] recompute {source} for {}…: {carried} judged spent-elsewhere row(s) carried forward (the spender's bytes were withheld this pass)",
+                        &identity_lc[..12.min(identity_lc.len())]
+                    );
+                }
             }
             // the read faulted: this pass's rows stand as derived (the pre-#662 word), nothing invented; counted
             Err(e) => {
@@ -4406,11 +4460,33 @@ async fn owed_recompute_inner(
             .map_err(|e| format!("owed ask stamp bind: {e}"))?;
         stmts.insert(stmts.len() - 1, ask_stmt);
     }
+    // bsv-low #672 (RC-L30): persist this pass's hash-verified spender bytes durably, in the SAME atomic batch (at
+    // most the courier cap). Content-addressed; a row over the per-row size cap is not kept (re-read if asked again,
+    // never a wrong word). `ON CONFLICT DO NOTHING` so a re-write is the same parse at no cost.
+    let mut spender_bytes_persisted = 0usize;
+    for (sp, bytes) in &spender_bytes_to_persist {
+        let Some(json) = bytes.to_json_capped() else {
+            continue;
+        };
+        let put_stmt = db
+            .prepare(crate::owed::OWED_SPENDER_BYTES_UPSERT_SQL)
+            .bind(&[
+                JsValue::from_str(sp),
+                JsValue::from_str(&json),
+                JsValue::from_f64(now_ms as f64),
+            ])
+            .map_err(|e| format!("owed spender-bytes bind: {e}"))?;
+        stmts.insert(stmts.len() - 1, put_stmt);
+        spender_bytes_persisted += 1;
+    }
+    if spender_bytes_persisted > 0 {
+        crate::owed::note_spender_store_persisted(spender_bytes_persisted as u64);
+    }
     debug_assert!(
         stmts.len()
-            <= 4 + crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE
+            <= 4 + 2 * crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE
                 + crate::owed::OWED_MAX_ROWS,
-        "the batch stays under the row cap + the bookends, the cursor and the ask stamps"
+        "the batch stays under the row cap + the bookends, the cursor, the ask stamps and the spender-bytes puts"
     );
     let written = crate::d1_ledger::counted_batch(db, stmts)
         .await
@@ -7799,6 +7875,78 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
 
 /// One cached `/tx-any` answer.
 type TxAnyCached = crate::txany::TxAnyAnswer;
+
+/// bsv-low #672 (RC-L30): read the durable spender-bytes store for a pass's named spenders in ONE statement, by the
+/// PRIMARY KEY (the txids as a JSON array). A fault is an `Err` (the caller judges as before, the belt still holds);
+/// a row whose stored JSON will not parse is skipped (never a wrong word). The hits are content-addressed: the bytes
+/// were hash-verified against the txid before they were ever written.
+async fn owed_spender_store_read(
+    db: &worker::D1Database,
+    spenders: &std::collections::HashSet<String>,
+) -> std::result::Result<Vec<(String, crate::owed::StoredSpenderBytes)>, String> {
+    #[derive(Deserialize)]
+    struct StoreRowD1 {
+        txid: String,
+        #[serde(rename = "bytesJson")]
+        bytes_json: String,
+    }
+    let list = serde_json::Value::from(spenders.iter().cloned().collect::<Vec<_>>()).to_string();
+    let rows = db
+        .prepare(crate::owed::OWED_SPENDER_BYTES_SELECT_SQL)
+        .bind(&[JsValue::from_str(&list)])
+        .map_err(|e| e.to_string())?
+        .counted_all()
+        .await
+        .and_then(|r| r.results::<StoreRowD1>())
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            crate::owed::StoredSpenderBytes::from_json(&r.bytes_json)
+                .map(|b| (r.txid.to_ascii_lowercase(), b))
+        })
+        .collect())
+}
+
+/// bsv-low #672 (RC-L30): the durable spender-bytes store's age + row-cap sweep, the tracker janitor's shape
+/// (`tracker_host::stored::SWEEP`): two bounded DELETEs per scheduled pass. The age sweep (older than the retention)
+/// is the primary; the row-cap sweep (oldest beyond the ceiling) is the belt against an adversarial write-rate.
+/// Fail-soft: a fault is logged and the next pass retries. Returns nothing.
+pub async fn sweep_owed_spender_bytes(env: &worker::Env) {
+    let Ok(db) = env.d1("OVERLAY_DB") else {
+        return;
+    };
+    let now_ms = worker::Date::now().as_millis() as i64;
+    let cutoff = now_ms.saturating_sub(crate::owed::OWED_SPENDER_BYTES_RETENTION_MS);
+    let limit = crate::owed::OWED_SPENDER_BYTES_SWEEP_LIMIT as f64;
+    // the age sweep (primary): rows older than the retention, bounded this pass
+    match db
+        .prepare(crate::owed::OWED_SPENDER_BYTES_SWEEP_SQL)
+        .bind(&[JsValue::from_f64(cutoff as f64), JsValue::from_f64(limit)])
+    {
+        Ok(stmt) => {
+            if let Err(e) = stmt.counted_run().await {
+                console_warn!("[owed] spender-bytes age sweep failed: {e}");
+            }
+        }
+        Err(e) => console_warn!("[owed] spender-bytes age sweep bind failed: {e}"),
+    }
+    // the row-cap sweep (belt): the oldest rows beyond the ceiling, bounded this pass
+    match db
+        .prepare(crate::owed::OWED_SPENDER_BYTES_CAP_SWEEP_SQL)
+        .bind(&[
+            JsValue::from_f64(crate::owed::OWED_SPENDER_BYTES_ROW_CAP as f64),
+            JsValue::from_f64(limit),
+        ]) {
+        Ok(stmt) => {
+            if let Err(e) = stmt.counted_run().await {
+                console_warn!("[owed] spender-bytes cap sweep failed: {e}");
+            }
+        }
+        Err(e) => console_warn!("[owed] spender-bytes cap sweep bind failed: {e}"),
+    }
+    crate::owed::note_spender_store_sweep_pass();
+}
 
 fn spender_outputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<crate::owed::SpenderOutput> {
     tx.outputs
