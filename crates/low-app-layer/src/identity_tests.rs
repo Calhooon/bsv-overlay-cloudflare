@@ -1310,3 +1310,182 @@ fn e597_a_dev_server_origin_reads_the_identity_views_in_both_envs() {
         assert!(!is_identity_path(p), "{p} keeps the base's CORS");
     }
 }
+
+// -- the null-resolver mode (bsv-low DESIGN-NULL-RESOLVER-2026-10-15) --------
+
+/// §3 pin 1 (RED-first): with NO resolver bound (the prod null-resolver mode),
+/// the JSON identity reads answer ONE nameable shape, 503
+/// `{"status":"error","code":"ERR_NO_RESOLVER"}`, `no-store`,
+/// `Outcome::NoResolver`, for the batch, single and verify routes. RED on main
+/// (`c09ea00`): the `Unbound` resolver answered the generic
+/// `{"error":"identity resolver unavailable"}` / `upstreamFault` 503.
+#[tokio::test]
+async fn no_resolver_answers_err_no_resolver() {
+    const SHAPE: &[u8] = br#"{"status":"error","code":"ERR_NO_RESOLVER"}"#;
+    let k = FakeKill::default();
+    let batch = batch_answer(&Unbound, &k, &[ALICE.to_string()], ORIGIN).await;
+    let single = single_answer(&Unbound, &k, ALICE, ORIGIN).await;
+    let verify = verify_answer(&Unbound, &k, ALICE, ORIGIN).await;
+    for a in [&batch, &single, &verify] {
+        assert_eq!((a.status, a.outcome), (503, Outcome::NoResolver));
+        assert_eq!(a.header("Cache-Control"), Some(NO_STORE));
+        assert_eq!(a.header("Content-Type"), Some("application/json"));
+        assert_eq!(a.body, SHAPE, "the one nameable shape, byte for byte");
+    }
+    // The outcome is its OWN counter, apart from upstreamFault.
+    assert_ne!(Outcome::NoResolver, Outcome::UpstreamFault);
+    assert_eq!(OUTCOME_NAMES[Outcome::NoResolver as usize], "noResolver");
+}
+
+/// §3 pin 2: a BOUND resolver never emits `ERR_NO_RESOLVER`. A bound-but-broken
+/// resolver still answers the opaque `upstreamFault` 503 (byte-identical to
+/// main), and a bound resolver that serves keeps the frozen served body (pinned
+/// in full by `the_resolver_answer_maps_to_the_contract_shape`). The two 503s
+/// stay distinct, so a real outage stays red.
+#[tokio::test]
+async fn a_bound_resolver_never_emits_err_no_resolver() {
+    const SHAPE: &str = r#"{"status":"error","code":"ERR_NO_RESOLVER"}"#;
+    // A bound-but-broken resolver: the opaque upstreamFault 503, unchanged.
+    let r = FakeResolver::default();
+    r.fault.set(Some(UpstreamError::Timeout));
+    let a = batch_answer(&r, &FakeKill::default(), &[ALICE.to_string()], ORIGIN).await;
+    assert_eq!((a.status, a.outcome), (503, Outcome::UpstreamFault));
+    assert_eq!(a.body, br#"{"error":"identity resolver unavailable"}"#);
+    assert!(!String::from_utf8_lossy(&a.body).contains("ERR_NO_RESOLVER"));
+    // A bound resolver answering an unexpected shape: still upstreamFault.
+    let r = FakeResolver::with_batch("{\"not\":\"the shape\"}", ALICE);
+    let a = batch_answer(&r, &FakeKill::default(), &[ALICE.to_string()], ORIGIN).await;
+    assert_eq!((a.status, a.outcome), (502, Outcome::UpstreamFault));
+    // A bound resolver that serves the fixture: the served 200, never NoResolver.
+    let r = FakeResolver::with_batch(DISPLAY_FIXTURE, ALICE);
+    let a = batch_answer(&r, &FakeKill::default(), &[ALICE.to_string()], ORIGIN).await;
+    assert_eq!((a.status, a.outcome), (200, Outcome::Served));
+    assert!(!String::from_utf8_lossy(&a.body).contains(SHAPE));
+}
+
+/// §1.2: the picture route stays OPAQUE with no resolver bound; it is never an
+/// `ERR_NO_RESOLVER` oracle. Byte-identical to a bound-but-broken resolver's
+/// 503 (status, body, CSP, `Outcome::UpstreamFault`).
+#[tokio::test]
+async fn the_picture_route_stays_opaque_with_no_resolver() {
+    let bytes = png(1000);
+    let h = hash_of(&bytes);
+    let a = picture_answer(&Unbound, &FakeKill::default(), &h).await;
+    assert_eq!((a.status, a.outcome), (503, Outcome::UpstreamFault));
+    assert_eq!(a.body, br#"{"error":"identity resolver unavailable"}"#);
+    assert!(!String::from_utf8_lossy(&a.body).contains("ERR_NO_RESOLVER"));
+    assert_eq!(a.header("Content-Security-Policy"), Some("sandbox"));
+    // The same as a bound-but-broken resolver's picture refusal.
+    let r = FakeResolver::default();
+    r.fault.set(Some(UpstreamError::Timeout));
+    let b = picture_answer(&r, &FakeKill::default(), &h).await;
+    assert_eq!(
+        (b.status, b.outcome, b.body.clone()),
+        (a.status, a.outcome, a.body)
+    );
+}
+
+/// §3 pin 3: the no-resolver answer leaves the budget tier and Server-Timing
+/// exactly as a served answer. It is produced at the fetch seam AFTER the same
+/// `charge_isolate` and key parse (pinned on the source: both resolver arms of
+/// `serve` run through the one `run`, which charges before it asks), and the
+/// identity reads touch no D1, so the ledger is `reads=0`.
+#[tokio::test]
+async fn the_no_resolver_answer_leaves_the_budget_tier_unchanged() {
+    let k = FakeKill::default();
+    let (a, t) =
+        crate::d1_ledger::scoped(batch_answer(&Unbound, &k, &[ALICE.to_string()], ORIGIN)).await;
+    assert_eq!((a.status, a.outcome), (503, Outcome::NoResolver));
+    assert_eq!(
+        t,
+        crate::d1_ledger::Tally::default(),
+        "the identity reads touch no D1"
+    );
+    let h = stamped(&a, Some(ORIGIN), t);
+    assert_eq!(
+        crate::d1_ledger::parse_segment(header_of(&h, "Server-Timing").unwrap(), "d1"),
+        Some(t)
+    );
+    assert_eq!(header_of(&h, "Access-Control-Allow-Origin"), Some(ORIGIN));
+
+    // The charge and the key parse are in `run`, upstream of the resolver call,
+    // so the no-resolver answer is produced after the identical charge.
+    fn squash(s: &str) -> String {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect()
+    }
+    let src = squash(include_str!("identity.rs"));
+    assert!(src.contains(&squash(
+        "Some(r) => run(&r, env, route, req, identity, key_param).await,"
+    )));
+    assert!(src.contains(&squash(
+        "None => run(&Unbound, env, route, req, identity, key_param).await,"
+    )));
+    let charge = src
+        .find(&squash(
+            "charge_isolate(&client_ip(req), identity, keys.len() as u32)",
+        ))
+        .expect("the batch charge");
+    let ask = src
+        .find(&squash("batch_answer(r, &kill, &keys, &origin).await"))
+        .expect("the batch answer");
+    assert!(
+        charge < ask,
+        "the keys are charged before the resolver is asked"
+    );
+}
+
+/// §3 pin 4: the PROD config binds no identity resolver. The `IDENTITY` service
+/// binding and the `IDENTITY_KILL` KV appear under `[env.beta]` and NOT at the
+/// top level (prod), and prod keeps `IDENTITY_URL` + `IDENTITY_APP_ORIGINS`
+/// (the latter load-bearing for CORS). RED on main (`c09ea00`): prod bound
+/// `IDENTITY -> low-identity-resolver`. The `ci-deploy` dry-run of the prod
+/// config then no longer references the missing worker (the STOP this clears).
+#[test]
+fn the_prod_config_binds_no_identity_resolver() {
+    let toml = include_str!("../wrangler.toml");
+    let (prod, beta) = toml.split_at(toml.find("\n[env.beta]").expect("a beta env"));
+    let code = |part: &str| -> Vec<String> {
+        part.lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .map(|l| l.split(" #").next().unwrap_or(l).trim().to_string())
+            .collect()
+    };
+    let has = |part: &str, needle: &str| code(part).iter().any(|l| l == needle);
+    // The STOP this clears: prod binds no IDENTITY service, no IDENTITY_KILL KV,
+    // and names no identity resolver worker.
+    assert!(
+        !has(prod, r#"binding = "IDENTITY""#),
+        "prod must not bind the IDENTITY service"
+    );
+    assert!(
+        !has(prod, r#"binding = "IDENTITY_KILL""#),
+        "prod must not bind the IDENTITY_KILL KV"
+    );
+    assert!(
+        !has(prod, r#"service = "low-identity-resolver""#),
+        "prod names no identity resolver worker"
+    );
+    // beta keeps both blocks.
+    assert!(
+        has(beta, r#"binding = "IDENTITY""#),
+        "beta keeps the IDENTITY service binding"
+    );
+    assert!(
+        has(beta, r#"binding = "IDENTITY_KILL""#),
+        "beta keeps the IDENTITY_KILL KV"
+    );
+    // The load-bearing vars stay at prod.
+    assert!(
+        code(prod).iter().any(|l| l.starts_with("IDENTITY_URL")),
+        "prod keeps IDENTITY_URL"
+    );
+    assert!(
+        code(prod).iter().any(|l| l.starts_with(APP_ORIGINS_VAR)),
+        "prod keeps IDENTITY_APP_ORIGINS (load-bearing for CORS)"
+    );
+}
