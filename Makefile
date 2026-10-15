@@ -19,7 +19,7 @@ help:
 	@echo "  test             cargo test of BOTH workspaces (root: engine crates + harness; workers/: the LOW workers)"
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
 	@echo "  ownership        The storage ownership check (bsv-low #474): every SQL statement against storage-ownership.json (part of ci)"
-	@echo "  ci-route         Route-level /submit + /arc-ingest cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c and NL-6d)"
+	@echo "  ci-route         Route-level /submit + /arc-ingest + /requestForeignGASPNodes cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c and NL-6d)"
 	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; four ports: :LANE_BASE+9 app layer, +10 overlay, +11 the e649 delivering overlay, +12 its mock app layer)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
@@ -396,6 +396,7 @@ ci-route: ci-d1-budget
 	EXPECT_DOOR=off FIXTURE_PORT=$$P8 \
 	  node tools/lane-script/script_refusal_route_ci.mjs http://127.0.0.1:$$P9; \
 	node tools/lane-nl6/submit_any_size_ci.mjs http://127.0.0.1:$$P1; \
+	node tools/lane-058/node_batch_route_ci.mjs http://127.0.0.1:$$P1; \
 	FIXTURE_PORT=$$P11 \
 	  node tools/lane-nl6c/ef_work_bound_ci.mjs http://127.0.0.1:$$P10; \
 	FIXTURE_PORT=$$P11 \
