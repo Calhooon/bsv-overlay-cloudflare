@@ -22,7 +22,14 @@ pub const PROVIDERS: [&str; 5] = ["woc", "bananablocks", "bitails", "arcade", "o
 /// The outcome classes, in the tally's index order.
 pub const OUTCOMES: [&str; 4] = ["ok", "notfound", "ratelimited", "fault"];
 /// The routes that ask, in the tally's index order (`"other"` catches a label this list does not know).
-pub const CALLERS: [&str; 6] = ["spent_any", "hops_view", "tx_any", "tx_any_unconfirmable", "owed", "other"];
+pub const CALLERS: [&str; 6] = [
+    "spent_any",
+    "hops_view",
+    "tx_any",
+    "tx_any_unconfirmable",
+    "owed",
+    "other",
+];
 
 /// PURE: the provider a courier URL belongs to, by host.
 pub fn provider_of(url: &str) -> &'static str {
@@ -81,7 +88,9 @@ fn add_pending(map: &mut BTreeMap<String, u64>, provider: &str, outcome: &str, c
 }
 
 fn index_of(list: &[&str], want: &str) -> usize {
-    list.iter().position(|x| *x == want).unwrap_or(list.len() - 1)
+    list.iter()
+        .position(|x| *x == want)
+        .unwrap_or(list.len() - 1)
 }
 
 thread_local! {
@@ -103,7 +112,12 @@ pub const COURIER_FLUSH_AT_CALLS: u64 = 64;
 pub const COURIER_FLUSH_INTERVAL_MS: f64 = 60_000.0;
 
 /// PURE: is a flush due (the gate's MEDIUM-2: the beef guard's L3 batching, with an exact head)?
-pub fn should_flush(pending_calls: u64, flushes_so_far: u64, now_ms: f64, last_flush_ms: f64) -> bool {
+pub fn should_flush(
+    pending_calls: u64,
+    flushes_so_far: u64,
+    now_ms: f64,
+    last_flush_ms: f64,
+) -> bool {
     if pending_calls == 0 {
         return false;
     }
@@ -136,11 +150,14 @@ pub fn note_presence(name: &str) {
 pub fn note(url: &str, caller: &str, status: Option<u16>, ms: f64) {
     let provider = provider_of(url);
     let outcome = outcome_of(status);
-    TALLY[index_of(&PROVIDERS, provider)][index_of(&OUTCOMES, outcome)].fetch_add(1, Ordering::Relaxed);
+    TALLY[index_of(&PROVIDERS, provider)][index_of(&OUTCOMES, outcome)]
+        .fetch_add(1, Ordering::Relaxed);
     BY_CALLER[index_of(&CALLERS, caller)].fetch_add(1, Ordering::Relaxed);
     PENDING.with(|p| add_pending(&mut p.borrow_mut(), provider, outcome, caller));
     PENDING_CALLS.with(|c| c.set(c.get() + 1));
-    let st = status.map(|s| s.to_string()).unwrap_or_else(|| "-".to_string());
+    let st = status
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "-".to_string());
     worker::console_log!("[courier] {provider} {outcome} {st} {ms:.0}ms caller={caller} {url}");
 }
 
@@ -197,7 +214,10 @@ pub async fn flush(db: Option<worker::D1Database>, pending: Vec<(String, u64)>) 
         return;
     }
     if let Err(e) = crate::d1_ledger::counted_batch(&db, stmts).await {
-        worker::console_warn!("[courier] counter flush failed ({} rows): {e}", pending.len());
+        worker::console_warn!(
+            "[courier] counter flush failed ({} rows): {e}",
+            pending.len()
+        );
     }
 }
 
@@ -207,13 +227,19 @@ pub fn health_json() -> serde_json::Value {
     for (pi, provider) in PROVIDERS.iter().enumerate() {
         let mut row = serde_json::Map::new();
         for (oi, outcome) in OUTCOMES.iter().enumerate() {
-            row.insert((*outcome).to_string(), serde_json::json!(TALLY[pi][oi].load(Ordering::Relaxed)));
+            row.insert(
+                (*outcome).to_string(),
+                serde_json::json!(TALLY[pi][oi].load(Ordering::Relaxed)),
+            );
         }
         by_provider.insert((*provider).to_string(), serde_json::Value::Object(row));
     }
     let mut by_caller = serde_json::Map::new();
     for (ci, caller) in CALLERS.iter().enumerate() {
-        by_caller.insert((*caller).to_string(), serde_json::json!(BY_CALLER[ci].load(Ordering::Relaxed)));
+        by_caller.insert(
+            (*caller).to_string(),
+            serde_json::json!(BY_CALLER[ci].load(Ordering::Relaxed)),
+        );
     }
     serde_json::json!({
         "scope": "isolate",
@@ -229,12 +255,28 @@ mod tests {
 
     #[test]
     fn provider_is_read_off_the_host() {
-        assert_eq!(provider_of("https://api.whatsonchain.com/v1/bsv/main/tx/hash/ab"), "woc");
-        assert_eq!(provider_of("https://bananablocks.com/api/v1/txo/ab/0/spend"), "bananablocks");
-        assert_eq!(provider_of("https://api.bitails.io/download/tx/ab"), "bitails");
-        assert_eq!(provider_of("https://arcade-v2-us-1.bsvblockchain.tech/tx/ab"), "arcade");
+        assert_eq!(
+            provider_of("https://api.whatsonchain.com/v1/bsv/main/tx/hash/ab"),
+            "woc"
+        );
+        assert_eq!(
+            provider_of("https://bananablocks.com/api/v1/txo/ab/0/spend"),
+            "bananablocks"
+        );
+        assert_eq!(
+            provider_of("https://api.bitails.io/download/tx/ab"),
+            "bitails"
+        );
+        assert_eq!(
+            provider_of("https://arcade-v2-us-1.bsvblockchain.tech/tx/ab"),
+            "arcade"
+        );
         assert_eq!(provider_of("https://example.com/x"), "other");
-        assert_eq!(provider_of("https://bsvarcade.com/tx/ab"), "other", "our own site is not the Arcade courier (LOW-3)");
+        assert_eq!(
+            provider_of("https://bsvarcade.com/tx/ab"),
+            "other",
+            "our own site is not the Arcade courier (LOW-3)"
+        );
     }
 
     #[test]
@@ -274,13 +316,31 @@ mod tests {
     /// the gate's MEDIUM-2: an exact head, then batched by calls or by time; nothing pending flushes nothing.
     #[test]
     fn flushes_exactly_at_first_then_by_calls_or_time() {
-        assert!(!should_flush(0, 0, 1_000.0, 0.0), "nothing pending: no write");
-        assert!(should_flush(1, 0, 1_000.0, 0.0), "the exact head flushes one call at once");
+        assert!(
+            !should_flush(0, 0, 1_000.0, 0.0),
+            "nothing pending: no write"
+        );
+        assert!(
+            should_flush(1, 0, 1_000.0, 0.0),
+            "the exact head flushes one call at once"
+        );
         assert!(should_flush(1, COURIER_FLUSH_EXACT_HEAD - 1, 1_000.0, 0.0));
-        assert!(!should_flush(1, COURIER_FLUSH_EXACT_HEAD, 1_000.0, 1_000.0), "past the head: one call waits");
-        assert!(!should_flush(COURIER_FLUSH_AT_CALLS - 1, 10, 30_000.0, 0.0), "63 calls inside the minute wait");
-        assert!(should_flush(COURIER_FLUSH_AT_CALLS, 10, 30_000.0, 0.0), "64 calls flush");
-        assert!(should_flush(1, 10, 61_000.0, 1_000.0), "a minute since the last flush flushes one call");
+        assert!(
+            !should_flush(1, COURIER_FLUSH_EXACT_HEAD, 1_000.0, 1_000.0),
+            "past the head: one call waits"
+        );
+        assert!(
+            !should_flush(COURIER_FLUSH_AT_CALLS - 1, 10, 30_000.0, 0.0),
+            "63 calls inside the minute wait"
+        );
+        assert!(
+            should_flush(COURIER_FLUSH_AT_CALLS, 10, 30_000.0, 0.0),
+            "64 calls flush"
+        );
+        assert!(
+            should_flush(1, 10, 61_000.0, 1_000.0),
+            "a minute since the last flush flushes one call"
+        );
         assert!(!should_flush(1, 10, 60_999.0, 1_000.0));
     }
 

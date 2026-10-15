@@ -2784,10 +2784,16 @@ impl PotStorage for D1PotStorage {
     async fn evictions_for(
         &self,
         txids: &[String],
-    ) -> Result<Option<Vec<Option<overlay_discovery::pot::storage::EvictionLedgerEntry>>>, PotStorageError> {
-        use overlay_discovery::pot::storage::{evictions_by_txid_sql, EvictionLedgerEntry, EVICTIONS_CHUNK};
+    ) -> Result<
+        Option<Vec<Option<overlay_discovery::pot::storage::EvictionLedgerEntry>>>,
+        PotStorageError,
+    > {
+        use overlay_discovery::pot::storage::{
+            evictions_by_txid_sql, EvictionLedgerEntry, EVICTIONS_CHUNK,
+        };
         // bsv-low E649 L6 fold (L1): the `ls_pot spentStatus` ledger read, primary key, one statement per chunk.
-        let mut by_txid: std::collections::HashMap<String, EvictionLedgerEntry> = std::collections::HashMap::new();
+        let mut by_txid: std::collections::HashMap<String, EvictionLedgerEntry> =
+            std::collections::HashMap::new();
         let lower: Vec<String> = txids.iter().map(|t| t.to_ascii_lowercase()).collect();
         for chunk in lower.chunks(EVICTIONS_CHUNK) {
             let mut q = Query::new(evictions_by_txid_sql(chunk.len()));
@@ -2805,7 +2811,9 @@ impl PotStorage for D1PotStorage {
                 );
             }
         }
-        Ok(Some(lower.iter().map(|t| by_txid.get(t).copied()).collect()))
+        Ok(Some(
+            lower.iter().map(|t| by_txid.get(t).copied()).collect(),
+        ))
     }
 
     async fn network_seen_for(&self, txids: &[String]) -> Result<Vec<bool>, PotStorageError> {
@@ -7904,29 +7912,55 @@ mod tests {
                 .unwrap()
                 .count()
         };
-        exec_store(&conn, "potP", 0, 1_000, Some("covenant"), None, Some(500), Some(1_000), 1);
+        exec_store(
+            &conn,
+            "potP",
+            0,
+            1_000,
+            Some("covenant"),
+            None,
+            Some(500),
+            Some(1_000),
+            1,
+        );
         assert_eq!(candidates(10), 0, "an UNSPENT row is not a candidate");
         exec_mark_spent(&conn, "potP", 0, "settleP", false, Some("winner-a"), None);
-        assert_eq!(candidates(10), 0, "spent with NO decoded home is not a candidate (a hop row, a bare pot)");
+        assert_eq!(
+            candidates(10),
+            0,
+            "spent with NO decoded home is not a candidate (a hop row, a bare pot)"
+        );
         conn.execute(
             "UPDATE pot_records SET payPkhA = ?1 WHERE txid = 'potP'",
             rusqlite::params!["11".repeat(20)],
         )
         .unwrap();
-        assert_eq!(candidates(10), 1, "spent + a decoded home + no payouts = a candidate");
+        assert_eq!(
+            candidates(10),
+            1,
+            "spent + a decoded home + no payouts = a candidate"
+        );
         // The CAS: a stale pointer writes nothing; the live one measures; stored-wins.
         conn.execute(
             spender_payouts_cas_sql(),
             rusqlite::params![Some(900_i64), Some(0_i64), "potP", 0_i64, "settleOLD"],
         )
         .unwrap();
-        assert_eq!(candidates(10), 1, "a write naming a spender that is not the live pointer is a no-op");
+        assert_eq!(
+            candidates(10),
+            1,
+            "a write naming a spender that is not the live pointer is a no-op"
+        );
         conn.execute(
             spender_payouts_cas_sql(),
             rusqlite::params![Some(900_i64), Some(0_i64), "potP", 0_i64, "settleP"],
         )
         .unwrap();
-        assert_eq!(candidates(10), 0, "a measured row (a Some(0) side included) leaves the set");
+        assert_eq!(
+            candidates(10),
+            0,
+            "a measured row (a Some(0) side included) leaves the set"
+        );
         conn.execute(
             spender_payouts_cas_sql(),
             rusqlite::params![Some(1_i64), Some(1_i64), "potP", 0_i64, "settleP"],
@@ -7939,7 +7973,11 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!((a, b), (900, 0), "stored-wins: a second measure never rewrites");
+        assert_eq!(
+            (a, b),
+            (900, 0),
+            "stored-wins: a second measure never rewrites"
+        );
     }
 
     #[test]
@@ -8825,16 +8863,25 @@ mod tests {
         let sql = overlay_discovery::pot::storage::evictions_by_txid_sql(3);
         let mut stmt = conn.prepare(&sql).unwrap();
         let mut rows: Vec<(String, i64, Option<i64>)> = stmt
-            .query_map([h64(0xaa), h64(0xbb), h64(0xcc)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_map([h64(0xaa), h64(0xbb), h64(0xcc)], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .unwrap()
             .map(Result::unwrap)
             .collect();
         rows.sort();
         assert_eq!(rows, vec![(h64(0xaa), 5, None), (h64(0xbb), 6, Some(9))]);
         let plan: String = conn
-            .query_row(&format!("EXPLAIN QUERY PLAN {sql}"), [h64(0xaa), h64(0xbb), h64(0xcc)], |r| r.get(3))
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {sql}"),
+                [h64(0xaa), h64(0xbb), h64(0xcc)],
+                |r| r.get(3),
+            )
             .unwrap();
-        assert!(!plan.contains("SCAN"), "the ledger read rides its primary key: {plan}");
+        assert!(
+            !plan.contains("SCAN"),
+            "the ledger read rides its primary key: {plan}"
+        );
     }
 
     #[test]
