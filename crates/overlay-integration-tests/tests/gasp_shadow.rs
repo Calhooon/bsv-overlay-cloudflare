@@ -185,7 +185,7 @@ async fn run(
         let mut host = Measured::new(host);
         host.r2_faults = scenario.r2_faults;
         let host = Rc::new(host);
-        engine.set_gasp_shadow(mode, host.clone());
+        engine.set_gasp_shadow(mode, host.clone()).unwrap();
         host
     });
     if let Some(budget) = budget {
@@ -994,7 +994,9 @@ impl GaspShadow for Untouchable {
 #[test]
 fn w4_off_with_a_host_set_is_a1s_recording_timing_included() {
     let (transcript, polls) = recording(&|engine, _, _| {
-        engine.set_gasp_shadow(AdmissionMode::Off, Rc::new(Untouchable));
+        engine
+            .set_gasp_shadow(AdmissionMode::Off, Rc::new(Untouchable))
+            .unwrap();
     });
     assert_eq!(digest(&transcript), OFF_A1_DIGEST);
     assert_eq!(polls, OFF_A1_POLLS);
@@ -1088,13 +1090,15 @@ impl GaspShadow for Logged {
 /// carrying a line per census row.
 fn shadow_recording() -> (Vec<String>, Vec<u64>) {
     recording(&|engine, store, events| {
-        engine.set_gasp_shadow(
-            AdmissionMode::Shadow,
-            Rc::new(Logged {
-                inner: shadow_host(store, None),
-                events: events.clone(),
-            }),
-        );
+        engine
+            .set_gasp_shadow(
+                AdmissionMode::Shadow,
+                Rc::new(Logged {
+                    inner: shadow_host(store, None),
+                    events: events.clone(),
+                }),
+            )
+            .unwrap();
     })
 }
 

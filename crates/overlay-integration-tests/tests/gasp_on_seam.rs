@@ -23,7 +23,8 @@ use bsv_overlay_engine::admission::{
 };
 use bsv_overlay_engine::engine::{Engine, EngineConfig};
 use bsv_overlay_engine::gasp_shadow::{
-    AdmissionMode, FinalizeBody, FinalizeGraph, GaspFinalizeHost,
+    AdmissionMode, AdmissionModeRefused, FinalizeBody, FinalizeGraph, GaspCensusRow,
+    GaspFinalizeHost, GaspShadow, ShadowBudget, ShadowScope, ShadowSnapshot,
 };
 use bsv_overlay_engine::storage::memory::MemoryStorage;
 use bsv_overlay_engine::storage::Storage;
@@ -454,4 +455,76 @@ async fn s1b_a_healthy_graph_under_on_is_the_off_runs_and_off_never_asks_the_hos
             ),
         );
     }
+}
+
+/// A shadow host that is never to be asked.
+struct Unasked;
+
+#[async_trait(?Send)]
+impl GaspShadow for Unasked {
+    async fn snapshot(
+        &self,
+        _: &ShadowScope<'_>,
+        _: &ShadowBudget,
+    ) -> Result<ShadowSnapshot, String> {
+        panic!("the shadow host is not asked here")
+    }
+    fn now_ms(&self) -> u64 {
+        0
+    }
+    async fn record(&self, _: &GaspCensusRow) -> Result<(), String> {
+        panic!("the shadow host is not asked here")
+    }
+}
+
+/// Item 2. `on` is the engine's word now, and the engine accepts it only
+/// where the finalize seam is set: without a `GaspFinalizeHost`, through
+/// either setter, it is refused with the typed word and the mode is left as
+/// it was; `off` and `shadow` need no seam; with the seam set `on` is taken.
+#[test]
+fn s2_on_is_accepted_where_the_seam_is_set_and_refused_with_the_typed_word_where_not() {
+    let store = Rc::new(MemoryStorage::new());
+    let mut engine = Engine::new(
+        managers(None),
+        HashMap::new(),
+        Box::new(store.clone()),
+        None,
+        EngineConfig::default(),
+    );
+    let refused = engine.set_admission_mode(AdmissionMode::On);
+    println!("S2 on without the seam: {refused:?}");
+    assert_eq!(
+        refused,
+        Err(AdmissionModeRefused::NoFinalizeHost),
+        "on without the seam is refused"
+    );
+    assert_eq!(
+        engine.admission_mode(),
+        AdmissionMode::Off,
+        "the mode is left as it was"
+    );
+    assert_eq!(
+        refused.unwrap_err().to_string(),
+        "ADMISSION_MODE=on is refused: no GASP finalize host is set (Engine::set_gasp_finalize_host)"
+    );
+    assert_eq!(
+        engine.set_gasp_shadow(AdmissionMode::On, Rc::new(Unasked)),
+        Err(AdmissionModeRefused::NoFinalizeHost),
+        "nor through the shadow's setter"
+    );
+    assert_eq!(engine.admission_mode(), AdmissionMode::Off);
+    assert_eq!(engine.set_admission_mode(AdmissionMode::Shadow), Ok(()));
+    assert_eq!(engine.set_admission_mode(AdmissionMode::Off), Ok(()));
+    assert_eq!(
+        AdmissionMode::parse(Some("on")),
+        Ok(AdmissionMode::On),
+        "on is the engine's word"
+    );
+    engine.set_gasp_finalize_host(Rc::new(SinkHost::new(&store)));
+    assert_eq!(engine.set_admission_mode(AdmissionMode::On), Ok(()));
+    assert_eq!(engine.admission_mode(), AdmissionMode::On);
+    assert_eq!(
+        engine.set_gasp_shadow(AdmissionMode::On, Rc::new(Unasked)),
+        Ok(())
+    );
 }

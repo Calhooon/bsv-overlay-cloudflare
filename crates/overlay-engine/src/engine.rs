@@ -1175,9 +1175,9 @@ impl Engine {
         &mut self,
         mode: crate::gasp_shadow::AdmissionMode,
         host: std::rc::Rc<dyn crate::gasp_shadow::GaspShadow>,
-    ) {
-        self.admission_mode = mode;
+    ) -> Result<(), crate::gasp_shadow::AdmissionModeRefused> {
         self.gasp_shadow = Some(host);
+        self.set_admission_mode(mode)
     }
 
     /// The host seam of the GASP finalize under
