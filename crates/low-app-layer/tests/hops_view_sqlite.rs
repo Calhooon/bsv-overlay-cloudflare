@@ -2108,13 +2108,16 @@ fn issue_526_a_stranded_hop_with_a_hopparty_row_and_an_unspent_output_is_served_
     assert_eq!(r.facts["markerVerified"], "verified");
     assert_eq!(r.facts["joinRefused"], false);
     assert_eq!(r.reason, None);
-    // before the chain rung has answered (the walk buys eight probes a pass): a sentence, never silence
+    // bsv-low #669b: before the chain rung has answered (the couriers may be down), the index's own unspent OFFERS
+    // the sweep — the honest press stays fast; a later spent word downgrades it, a moved tip re-probes it
     let rows = derive(&HashMap::new(), &no_outs, &no_set);
     assert_eq!(
         (rows.len(), rows[0].family, rows[0].sats),
-        (1, OwedFamily::Unbound, Some(20_190))
+        (1, OwedFamily::HopStranded, Some(20_190))
     );
-    assert_eq!(rows[0].facts["chainProbe"], "pending");
+    assert_eq!(rows[0].facts["claim"], "sweep-hop");
+    assert_eq!(rows[0].facts["claimable"], true);
+    assert_eq!(rows[0].facts["chainProbe"], "index-unspent");
 
     // THE LEDGER'S TRUTH (2026-09-02): the chain rung names the 08-29 sweep, which the index never held. The game is
     // hop-only (no pot ever committed a home), so the brain cannot call it a payout: a claimless row with a sentence
