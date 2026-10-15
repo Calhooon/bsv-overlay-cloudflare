@@ -319,9 +319,11 @@ pub fn latch_present_tip(height: u64) {
     });
 }
 
-/// The present height: cached per isolate, else fetched through the
-/// CHAINTRACKS binding; a fetch fault falls back to a stale held value.
-async fn present_tip(env: &Env) -> Option<u64> {
+/// The present height: cached per isolate ([`PRESENT_TIP_TTL_MS`] = 30 s), else fetched through the CHAINTRACKS
+/// binding; a fetch fault falls back to a stale held value, latched by the `tip-changed` webhook. bsv-low #669: the
+/// owed read routes its hop-stranded freshness-gate tip read through this cache, so the gate costs nothing per
+/// request in the steady state (strictly cheaper than the uncached `chaintracks_present_height`).
+pub async fn present_tip(env: &Env) -> Option<u64> {
     let now = worker::Date::now().as_millis() as f64;
     if let Some((h, exp)) = PRESENT_TIP.with(|c| c.get()) {
         if now < exp {
