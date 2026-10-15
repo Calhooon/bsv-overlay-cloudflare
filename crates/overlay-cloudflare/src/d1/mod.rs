@@ -525,7 +525,11 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 241 to 243: rolling sync cost readings and their age index.
 /// 243 to 245: per-sync speed readings and their age index.
 /// 245 to 253: compact fault memo, size accounting and transaction origin.
-pub const OVERLAY_MIGRATION_COUNT: usize = 253;
+/// 253 to 254 for bsv-low #669 (2026-10-15): the owed list's `idx_owed_rows_claimable_hop` (leading with the json
+/// `claimable` predicate), so the `/internal/tip-changed` hop-stranded stale mark SEEKS a covering index instead of
+/// scanning `owed_rows` every block, without displacing the #662 withheld-payout read off its PK (the FIX-669
+/// lens's NOTE-5).
+pub const OVERLAY_MIGRATION_COUNT: usize = 254;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -1932,7 +1936,20 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::gasp_fault_memo::DELETE_TRIGGER,
     crate::gasp_fault_memo::INSERT_TRIGGER,
     "ALTER TABLE transactions ADD COLUMN admission_origin TEXT NOT NULL DEFAULT 'submit'",
-
+    // bsv-low #669 (the FIX-669 lens's NOTE-5, 2026-10-15): the owed list's `/internal/tip-changed` twin
+    // `OWED_STALE_ON_TIP_HOPS_SQL` marks stale every identity holding a LIVE claimable hop-stranded row, once per
+    // synced block. Its subquery `SELECT DISTINCT identity FROM owed_rows WHERE family = 'hop-stranded' AND
+    // json_extract(facts,'$.claimable') = 1` otherwise SCANs `owed_rows` (its PK autoindex) every block, a cost that
+    // grows with every owed row the fleet writes. This index LEADS with the json `claimable` predicate, so the
+    // subquery becomes a COVERING index SEARCH on `(json_extract(claimable)=1 AND family='hop-stranded')` (no row
+    // fetch, no temp b-tree for the DISTINCT identity). It leads with the json expression DELIBERATELY: a
+    // `(family, …)`-leading index would be preferred by the #662 withheld-payout read (`family='payout'`) and knock
+    // it off its (identity, outpoint) PK; this index has no predicate the withheld read constrains on its leading
+    // column, so that read keeps its PK (pinned in `write_derived_reads.rs`). `owed_rows` is the overlay's table
+    // (migration 156), so its index is the overlay's alone (the app layer's catch-up list is CREATE TABLE statements
+    // by contract); a cold app-layer isolate ahead of the overlay still runs the query (the PK-autoindex scan) until
+    // the overlay warms. Pinned in `owed_tip_probe_sqlite.rs`.
+    "CREATE INDEX IF NOT EXISTS idx_owed_rows_claimable_hop ON owed_rows(json_extract(facts, '$.claimable'), family, identity)",
 ];
 
 // =============================================================================
