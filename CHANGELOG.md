@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.2.0] - 2026-10-15
+
+- bsv-rs 0.6.0 in both workspaces (caret `0.6.0`), and the home of the
+  overlay's varint: the route's `write_varint` and `read_varint_prefix`, the
+  script door's reader, and the test copies (`wire_compat.rs`,
+  `live_worker.rs`, the script door's and the walk witness's helpers, the
+  UHRP tests) are deleted for bsv-rs's public `to_var_int` and canonical
+  `from_var_int`. A length written wider than it needs (`fd 01 00` for 1) is
+  now refused by the script door and by bsv-rs's transaction and BEEF
+  parsers, as the node refuses it; the `/submit` off-chain prefix is read as
+  the reference's `readVarIntNumStrict` reads it. bsv-middleware-cloudflare
+  `=0.6.2` (its release on bsv-rs 0.6.0), so the lock holds one bsv-rs. A
+  bsv-rs type sits in the public API (`types` re-exports bsv-rs's overlay
+  types; `beef_limits` returns its `Beef` and `MerklePath`), hence 0.2.0.
+- The stack's `deny.toml`, byte for byte (sha256 `ba065ed0...8ed5083`); the
+  root workspace passes it: parity-harness's lock moves anyhow, h2, rustls
+  and rustls-webpki past six RustSec advisories, and its reqwest takes the
+  system's roots (`rustls-tls-native-roots`) for the bundled webpki-roots,
+  whose license the template does not allow.
+- A route fault counts nothing against the peer (#57). A failure the
+  platform answers before the peer is reached (an HTTP 404 carrying the
+  platform's `error code: 1042`; a fetch with no answer whose error names DNS,
+  TLS or a connect timeout) is `GASPError::RouteFault`. A sync it ends with
+  no work done writes none of the peer's health rows: not its failures or
+  attempt stamp (the quarantine), not its yieldless streak, not its quiet
+  cadence. Only an answer from the peer counts (a 5xx, a malformed body, a
+  verification failure, a GASP error); a failure the classifier does not
+  name counts as before. The sync result carries `route_faults` (peer,
+  class), the error and tick lines read `route_fault:<class>`, a node-level
+  route fault is the walk's class `route` (never a strike), and invariants
+  carry `gaspRouteFaults24h` (`total`, `byPeerClass`).
+
+DEPLOYMENT NOTE: one transient table, `gasp_route_faults`, and its age index
+join the runtime schema list (254 to 256), created on the next cold start;
+no var. The workers lock needs a bsv-tracker release on bsv-rs 0.6 before it
+builds: until then bsv-tracker 0.2.2 holds bsv-rs 0.5.0 beside 0.6.0 and the
+build stamp refuses the lock. Constructors of `TopicSyncResult` gain
+`route_faults`; a match on `GASPError` gains `RouteFault`.
+
 ## [0.1.15] - 2026-10-14
 
 - An absence is the peers' word, never an explorer's (#56). A peer's
