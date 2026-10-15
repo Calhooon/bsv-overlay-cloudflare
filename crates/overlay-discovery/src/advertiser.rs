@@ -104,6 +104,8 @@ impl WalletAdvertiser {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory advertisement list; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl Advertiser for WalletAdvertiser {
     async fn create_advertisements(
         &self,

@@ -58,3 +58,14 @@ url = "2"
 
 # Logging
 tracing = "0.1"
+
+# The lint bar (bsv-stack-lean #134): every member takes this table with
+# `lints.workspace = true`. The gate runs clippy with `-D warnings`, so a
+# `warn` blocks a merge as well; unwrap, expect and panic are denied outside
+# tests (`clippy.toml` allows them in test code). Mirrored in part in
+# `workers/Cargo.toml`, whose LOW crate is not held to the last three.
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

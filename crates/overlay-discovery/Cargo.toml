@@ -45,3 +45,6 @@ js-sys = "0.3"
 [dev-dependencies]
 overlay-engine = { package = "bsv-overlay-engine", version = "0.2.2", path = "../overlay-engine", features = ["memory-storage"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

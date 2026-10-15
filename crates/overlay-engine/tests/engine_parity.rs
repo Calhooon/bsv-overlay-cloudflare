@@ -3,6 +3,8 @@
 //! Each test is tagged with the original TS test description for traceability.
 //! Tests cover SPV verification, previous coin lookup, spend notifications,
 //! deleteUTXODeep, consumedBy updates, handleNewMerkleProof, and getUTXOHistory.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use bsv_overlay_engine::advertiser::*;

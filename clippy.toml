@@ -1,0 +1,5 @@
+# The lint bar (bsv-stack-lean #134): unwrap, expect and panic are denied in
+# the libraries by the workspace lint tables and allowed in test code.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

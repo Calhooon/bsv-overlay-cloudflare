@@ -1916,17 +1916,17 @@ where
             } else {
                 None
             };
-            let ask = if cached.is_none() {
-                Some(corroborate(kind))
-            } else {
-                None
+            // The cached walk, or the corroboration to ask when none is cached.
+            let pending = match cached {
+                Some(walk) => Ok(walk),
+                None => Err(corroborate(kind)),
             };
             let paused = &paused;
             let cached_walk = &cached_walk;
             async move {
-                let walk = match cached {
-                    Some(walk) => walk,
-                    None => ask.unwrap().await,
+                let walk = match pending {
+                    Ok(walk) => walk,
+                    Err(ask) => ask.await,
                 };
                 if kind == CorroborationKind::WithAncestry {
                     *cached_walk.borrow_mut() = Some(walk.clone());

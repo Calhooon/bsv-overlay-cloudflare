@@ -3,6 +3,8 @@
 //!
 //! These tests verify the CRITICAL gaps identified in GAP_ANALYSIS.md (#43, #44).
 //! Test-driven: tests written first, then implementation.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use bsv_overlay_engine::engine::{Engine, EngineConfig};

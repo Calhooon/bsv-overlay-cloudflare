@@ -36,3 +36,6 @@ hex = "0.4"
 # wire D1 / SQLite), but every integration test instantiates it, so we
 # enable it for `cargo test` via a self-feature dev-dep.
 bsv-overlay-engine = { path = ".", version = "0.2.2", features = ["memory-storage"] }
+
+[lints]
+workspace = true

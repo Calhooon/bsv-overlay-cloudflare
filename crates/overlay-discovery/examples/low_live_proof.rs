@@ -12,6 +12,8 @@
 //! # then POST the BEEFs to /submit with x-topics: ["tm_low"] and
 //! # x-submit-mode: historical-tx-no-spv, and query /lookup ls_low.
 //! ```
+// bsv-stack-lean #134: example
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_rs::primitives::ec::{PrivateKey, PublicKey};
 use bsv_rs::script::templates::PushDrop;

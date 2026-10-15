@@ -123,6 +123,8 @@ pub struct MemorySHIPStorage {
     records: std::sync::Mutex<Vec<SHIPRecord>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemorySHIPStorage {
     pub fn new() -> Self {
         Self::default()
@@ -134,6 +136,8 @@ impl MemorySHIPStorage {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl SHIPStorage for MemorySHIPStorage {
     async fn has_duplicate_record(
         &self,

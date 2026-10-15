@@ -1,6 +1,8 @@
 //! Tests for getUTXOHistory — lookup response enrichment with ancestor spend history.
 //!
 //! Test-driven for #48.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_overlay_engine::engine::{Engine, EngineConfig, HistorySelector};
 use bsv_overlay_engine::storage::memory::MemoryStorage;

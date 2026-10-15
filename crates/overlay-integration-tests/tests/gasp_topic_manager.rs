@@ -1,4 +1,6 @@
 //! bsv-low #530 (E1): topic history can continue behind a proven GASP node.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};

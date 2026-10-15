@@ -12,6 +12,8 @@
 //! # x-submit-mode: historical-tx-no-spv, and query /lookup ls_reveal:
 //! #   {"service":"ls_reveal","query":{"type":"byGameSeat","gameId":"<GAME_ID>","seat":<SEAT>}}
 //! ```
+// bsv-stack-lean #134: example
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_rs::transaction::Transaction;
 

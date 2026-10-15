@@ -78,3 +78,6 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 # production `OVERLAY_MIGRATIONS` schema instead of merely pinning the string
 # (bsv-low #281). Test-only: never linked into the wasm32 Worker build.
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lints]
+workspace = true

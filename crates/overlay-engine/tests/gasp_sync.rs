@@ -2,6 +2,8 @@
 //!
 //! Porting the critical test cases: version mismatch, known UTXO skip,
 //! graph discard on validation failure, timestamp filtering, multiple graphs.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use bsv_overlay_engine::gasp::*;

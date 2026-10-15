@@ -148,6 +148,8 @@ pub struct MemoryCollectedStorage {
     records: std::sync::Mutex<Vec<CollectedRecord>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryCollectedStorage {
     pub fn new() -> Self {
         Self::default()
@@ -159,6 +161,8 @@ impl MemoryCollectedStorage {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl CollectedStorage for MemoryCollectedStorage {
     async fn store_record(&self, record: &CollectedRecord) -> Result<(), CollectedStorageError> {
         let mut records = self.records.lock().unwrap();

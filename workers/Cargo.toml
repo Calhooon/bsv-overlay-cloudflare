@@ -53,3 +53,11 @@ tracing = "0.1"
 # Since bsv-low #588 (2026-10-09) both workers crates pinned `=0.4.1` (with `bsv-middleware-core` 0.1.0, on bsv-rs 0.3).
 # Since align-engine-050 (2026-10-10) both pin `=0.5.0`, so the lock holds ONE middleware (0.5.0) beside
 # `bsv-middleware-core` 0.2.0, both on bsv-rs 0.4: one bsv-rs (the `=0.4.3` above) in the lock.
+
+# The lint bar (bsv-stack-lean #134): every member takes this table with
+# `lints.workspace = true`. The gate runs clippy with `-D warnings`, so a
+# `warn` blocks a merge as well. Unwrap, expect and panic are denied by
+# crate attribute on the engine's two crates here (`overlay-cloudflare`,
+# `worker-build-info`), not in this table: the LOW crates' code is LOW's.
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }

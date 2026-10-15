@@ -134,6 +134,8 @@ pub const POC5_TEMPLATE_SHA256: &str =
 
 /// Fixed HEAD bytes = the template hex before the first `<` param marker,
 /// hex-decoded (122 bytes). Cached after the first decode.
+// bsv-stack-lean #134: the compiled-in template constant always holds both markers and valid hex
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 fn head_bytes() -> &'static [u8] {
     static HEAD: OnceLock<Vec<u8>> = OnceLock::new();
     HEAD.get_or_init(|| {
@@ -146,6 +148,8 @@ fn head_bytes() -> &'static [u8] {
 
 /// Fixed TAIL bytes = the template hex after the last `>` param marker,
 /// hex-decoded (2850 bytes). Cached after the first decode.
+// bsv-stack-lean #134: the compiled-in template constant always holds both markers and valid hex
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 fn tail_bytes() -> &'static [u8] {
     static TAIL: OnceLock<Vec<u8>> = OnceLock::new();
     TAIL.get_or_init(|| {

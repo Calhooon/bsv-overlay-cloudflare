@@ -17,6 +17,8 @@
 //! # Budget
 //! Each AGENT token costs ~1 sat + ~200 sats fee. Budget: <20,000 sats total.
 //! These tests create at most 8 transactions (~1,600 sats).
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_rs::primitives::ec::PublicKey;
 use bsv_rs::script::templates::PushDrop;

@@ -21,6 +21,8 @@
 //! cut at that line, is run there as it stands: each pin's RED word is in its
 //! doc comment. Below the line: the typed limb, and the memory estimate held
 //! against the measured heap with the limb lifted.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_rs::primitives::to_var_int;
 use std::alloc::{GlobalAlloc, Layout, System};

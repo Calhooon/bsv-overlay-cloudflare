@@ -1122,6 +1122,8 @@ pub struct MemoryPotStorage {
     unprovable: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryPotStorage {
     /// TEST HOOK: stamp a row's creation time (unix seconds) for `find_unspent_stale_with_age`.
     pub fn with_created_at(self, txid: &str, output_index: u32, secs: u64) -> Self {
@@ -1281,6 +1283,8 @@ impl MemoryPotStorage {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl PotStorage for MemoryPotStorage {
     async fn evictions_for(
         &self,

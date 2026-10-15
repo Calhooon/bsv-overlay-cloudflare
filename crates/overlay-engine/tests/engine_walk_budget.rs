@@ -16,6 +16,8 @@
 //! door's default; under `NetworkAccepted` (the queue replay of a gated
 //! submission) the submit goes on exactly as under `historical-tx-no-spv`
 //! and says so on `MutationReport::walk_could_not_run`.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::rc::Rc;

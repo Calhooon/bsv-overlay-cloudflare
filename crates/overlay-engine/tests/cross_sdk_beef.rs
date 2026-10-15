@@ -4,6 +4,8 @@
 //! ~/bsv/overlay-services/src/__tests/Engine.test.ts (line 22)
 //!
 //! The expected values (txid, previousTXID, satoshis) are from the same TS test file.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_rs::transaction::Transaction;
 

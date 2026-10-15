@@ -3,6 +3,8 @@
 //! Takes actual overlay responses saved as fixtures and runs them through
 //! Engine.submit() with our SHIPTopicManager/SLAPTopicManager to verify
 //! we produce the same admittance results as the TS overlay.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bsv_overlay_engine::engine::{Engine, EngineConfig};
 use bsv_overlay_engine::types::*;

@@ -113,6 +113,8 @@ pub struct MemoryRevealStorage {
     records: std::sync::Mutex<Vec<RevealRecord>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryRevealStorage {
     pub fn new() -> Self {
         Self::default()
@@ -124,6 +126,8 @@ impl MemoryRevealStorage {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl RevealStorage for MemoryRevealStorage {
     async fn store_record(&self, record: &RevealRecord) -> Result<(), RevealStorageError> {
         let mut records = self.records.lock().unwrap();

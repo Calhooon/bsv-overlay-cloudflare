@@ -132,6 +132,8 @@ pub struct MemoryAgentStorage {
     records: std::sync::Mutex<Vec<MemoryAgentRecord>>,
 }
 
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl MemoryAgentStorage {
     pub fn new() -> Self {
         Self::default()
@@ -143,6 +145,8 @@ impl MemoryAgentStorage {
 }
 
 #[async_trait(?Send)]
+// bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 impl AgentStorage for MemoryAgentStorage {
     async fn has_duplicate_record(
         &self,

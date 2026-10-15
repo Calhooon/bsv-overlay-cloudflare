@@ -22,6 +22,8 @@
 //! - the builder's escape hatch (`with_script_verification(false)`);
 //! - one deliberately expensive spend (~7 KB lock, ~20 KB unlock, ~7000
 //!   opcodes) whose verification time is printed; run with `--nocapture`.
+// bsv-stack-lean #134: test code
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use async_trait::async_trait;
 use bsv_overlay_engine::builder::EngineBuilder;
