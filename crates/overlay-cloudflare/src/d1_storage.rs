@@ -193,6 +193,9 @@ pub(crate) const PROOF_CANDIDATES_SQL: &str = "SELECT txid, hex(beef) AS beef,
 /// txid, ?2 beef, ?3 has_proof (the verified-stitch path) — and CONFIRM
 /// BEATS THE LATCH: a stitch that lands has_proof = 1 clears the retire
 /// columns (the pot_beefs #2b rule, mirrored) so a false retire self-heals.
+/// A page's applied state (engine 0.2.2): `?1` topic, `?2` a JSON array of
+/// txids.
+pub(crate) const APPLIED_OF_TXIDS_SQL: &str = "SELECT txid FROM applied_transactions WHERE topic = ?1 AND txid IN (SELECT value FROM json_each(?2))";
 pub(crate) const INSERT_OUTPUT_TX_SQL: &str =
     "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason, proofHeight, admission_origin) \
      VALUES (?1, ?2, 0, COALESCE((SELECT created_at FROM transactions WHERE txid = ?1), unixepoch()), \
@@ -309,6 +312,95 @@ impl D1Storage {
         } else {
             format!("SELECT {OUTPUT_COLS} {FROM_OUTPUTS}")
         }
+    }
+
+    /// The statements of `insert_output_with_origin`, in order: the output
+    /// row, then its transaction's BEEF when one is given (engine 0.2.2: the
+    /// same statements whether run one at a time or in a page's batch).
+    fn output_queries(output: &Output, gasp: bool) -> Vec<Query> {
+        // INSERT OR IGNORE: dedup on (txid, outputIndex, topic) unique index
+        let mut queries = Vec::with_capacity(2);
+        queries.push(
+            Query::new(
+                "INSERT OR IGNORE INTO outputs \
+             (txid, outputIndex, outputScript, topic, satoshis, \
+              outputsConsumed, consumedBy, spent, blockHeight, score) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&*output.txid)
+            .bind(output.output_index)
+            .bind(output.output_script.as_slice())
+            .bind(&*output.topic)
+            .bind(output.satoshis)
+            .bind(serde_json::to_string(&output.outputs_consumed).unwrap_or_else(|_| "[]".into()))
+            .bind(serde_json::to_string(&output.consumed_by).unwrap_or_else(|_| "[]".into()))
+            .bind(output.spent)
+            .bind(output.block_height.map(|h| h as i64))
+            .bind(output.score.unwrap_or(0.0)),
+        );
+
+        // Upsert BEEF into transactions table if provided
+        // Upsert the BEEF. `INSERT OR IGNORE` silently kept an EMPTY/short
+        // pre-existing row, so a later insert of the REAL BEEF was dropped and
+        // the tx stayed un-hydrated → the lookup returned an empty-BEEF row →
+        // a fresh LOW table was undecodable/invisible to opponents (the
+        // "vanishing table", 2026-07-11). Overwrite only when the incoming BEEF
+        // is longer (never clobber a good row with a shorter/empty one).
+        if let Some(ref beef) = output.beef {
+            if !beef.is_empty() {
+                // OR REPLACE (matching update_transaction_beef below), NOT
+                // OR IGNORE: IGNORE silently kept an empty/short pre-existing
+                // row so the real BEEF was dropped and the tx stayed
+                // un-hydrated. The `!beef.is_empty()` guard means we only ever
+                // write a real BEEF here, so REPLACE can never clobber a good
+                // row with an empty one.
+                // ADMIT-TIME BEEFs are NEVER trusted-proven (#192/#193 FIX 3).
+                // `/submit` skips SPV on historical topics, so a submitted BEEF
+                // may carry a merkle bump that is unverified, or outright
+                // forged. A STRUCTURAL bump here is NOT a fact, and serve-time
+                // BEEF trimming trusts `has_proof`, so latching one at admit
+                // would let a forged bump be trimmed on. Force `has_proof = 0`
+                // ALWAYS: the VERIFYING cron pass (`complete_missing_proofs` →
+                // ChainProofFetcher → chaintracks verify → `mark_transaction_proven`,
+                // or a genuine bump re-verified before it flips the flag) is the
+                // SOLE thing that ever latches `has_proof = 1`.
+                // created_at is preserve-or-stamp (#228 backstop age anchor):
+                // a REPLACE keeps the original store time so the
+                // push-primary backstop's age gate measures real age.
+                // retired_ms/-reason preserve too (INCIDENT D1-CALLBACK-FLOOD
+                // 2026-09-01): INSERT OR REPLACE deletes-and-reinserts, so an
+                // unlisted column silently NULLs: a RE-PRESENT of a retired
+                // tx would un-retire it and re-open the retry loops the latch
+                // exists to close. A re-present is not proof of life; a
+                // genuine revival heals through the verified proof push
+                // (has_proof=1 outranks the latch at every consumer).
+                queries.push(
+                    Query::new(if gasp {
+                        INSERT_OUTPUT_TX_GASP_SQL
+                    } else {
+                        INSERT_OUTPUT_TX_SQL
+                    })
+                    .bind(&*output.txid)
+                    .bind(beef.as_slice()),
+                );
+            }
+        }
+
+        queries
+    }
+
+    fn applied_query(tx: &AppliedTransaction) -> Query {
+        Query::new("INSERT OR IGNORE INTO applied_transactions (txid, topic) VALUES (?, ?)")
+            .bind(&*tx.txid)
+            .bind(&*tx.topic)
+    }
+
+    /// A page's held inputs (engine 0.2.2): `?1` topic, `?2` a JSON array of
+    /// `[txid, vout]`. One row per outpoint (the unique index on
+    /// `(txid, outputIndex, topic)`), no BEEF.
+    pub(crate) fn topic_outputs_sql() -> String {
+        let base = Self::select_outputs(false);
+        format!("{base} JOIN json_each(?2) wanted ON o.txid = json_extract(wanted.value, '$[0]') AND o.outputIndex = json_extract(wanted.value, '$[1]') WHERE o.topic = ?1")
     }
 
     pub(crate) fn served_outputs_sql() -> String {
@@ -452,76 +544,96 @@ impl Storage for D1Storage {
         output: &Output,
         gasp: bool,
     ) -> Result<(), StorageError> {
-        // INSERT OR IGNORE — dedup on (txid, outputIndex, topic) unique index
-        Query::new(
-            "INSERT OR IGNORE INTO outputs \
-             (txid, outputIndex, outputScript, topic, satoshis, \
-              outputsConsumed, consumedBy, spent, blockHeight, score) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&*output.txid)
-        .bind(output.output_index)
-        .bind(output.output_script.as_slice())
-        .bind(&*output.topic)
-        .bind(output.satoshis)
-        .bind(serde_json::to_string(&output.outputs_consumed).unwrap_or_else(|_| "[]".into()))
-        .bind(serde_json::to_string(&output.consumed_by).unwrap_or_else(|_| "[]".into()))
-        .bind(output.spent)
-        .bind(output.block_height.map(|h| h as i64))
-        .bind(output.score.unwrap_or(0.0))
-        .execute(&self.db)
-        .await
-        .map_err(d1_err)?;
+        for query in Self::output_queries(output, gasp) {
+            query.execute(&self.db).await.map_err(d1_err)?;
+        }
+        Ok(())
+    }
 
-        // Upsert BEEF into transactions table if provided
-        // Upsert the BEEF. `INSERT OR IGNORE` silently kept an EMPTY/short
-        // pre-existing row, so a later insert of the REAL BEEF was dropped and
-        // the tx stayed un-hydrated → the lookup returned an empty-BEEF row →
-        // a fresh LOW table was undecodable/invisible to opponents (the
-        // "vanishing table", 2026-07-11). Overwrite only when the incoming BEEF
-        // is longer (never clobber a good row with a shorter/empty one).
-        if let Some(ref beef) = output.beef {
-            if !beef.is_empty() {
-                // OR REPLACE (matching update_transaction_beef below), NOT
-                // OR IGNORE: IGNORE silently kept an empty/short pre-existing
-                // row so the real BEEF was dropped and the tx stayed
-                // un-hydrated. The `!beef.is_empty()` guard means we only ever
-                // write a real BEEF here, so REPLACE can never clobber a good
-                // row with an empty one.
-                // ADMIT-TIME BEEFs are NEVER trusted-proven (#192/#193 FIX 3).
-                // `/submit` skips SPV on historical topics, so a submitted BEEF
-                // may carry a merkle bump that is unverified — or outright
-                // forged. A STRUCTURAL bump here is NOT a fact, and serve-time
-                // BEEF trimming trusts `has_proof`, so latching one at admit
-                // would let a forged bump be trimmed on. Force `has_proof = 0`
-                // ALWAYS: the VERIFYING cron pass (`complete_missing_proofs` →
-                // ChainProofFetcher → chaintracks verify → `mark_transaction_proven`,
-                // or a genuine bump re-verified before it flips the flag) is the
-                // SOLE thing that ever latches `has_proof = 1`.
-                // created_at is preserve-or-stamp (#228 backstop age anchor):
-                // a REPLACE keeps the original first-store time so the
-                // push-primary backstop's age gate measures real age.
-                // retired_ms/-reason preserve too (INCIDENT D1-CALLBACK-FLOOD
-                // 2026-09-01): INSERT OR REPLACE deletes-and-reinserts, so an
-                // unlisted column silently NULLs — a RE-PRESENT of a retired
-                // tx would un-retire it and re-open the retry loops the latch
-                // exists to close. A re-present is not proof of life; a
-                // genuine revival heals through the verified proof push
-                // (has_proof=1 outranks the latch at every consumer).
-                Query::new(if gasp {
-                    INSERT_OUTPUT_TX_GASP_SQL
-                } else {
-                    INSERT_OUTPUT_TX_SQL
-                })
-                .bind(&*output.txid)
-                .bind(beef.as_slice())
-                .execute(&self.db)
-                .await
-                .map_err(d1_err)?;
+    /// Engine 0.2.2: a GASP page's writes in ONE `batch()`. D1 runs a batch
+    /// as one transaction: a statement that fails rolls the whole batch
+    /// back, so the page is admitted whole or not at all. The statements are
+    /// those the one-at-a-time writers run, in the page's order; a backend
+    /// statement is a lookup index row this Worker deferred (`d1::Query`).
+    async fn write_batch(
+        &self,
+        writes: &[overlay_engine::page_batch::PageWrite],
+    ) -> Result<u64, StorageError> {
+        use overlay_engine::page_batch::PageWrite;
+        let mut queries = Vec::new();
+        for write in writes {
+            match write {
+                PageWrite::Output { output, gasp } => {
+                    queries.extend(Self::output_queries(output, *gasp));
+                }
+                PageWrite::Applied(tx) => queries.push(Self::applied_query(tx)),
+                PageWrite::Backend(statement) => {
+                    let Some(query) = statement.downcast_ref::<Query>() else {
+                        return Err(StorageError::Other(
+                            "a page statement this storage did not defer".into(),
+                        ));
+                    };
+                    queries.push(query.clone());
+                }
             }
         }
+        if queries.is_empty() {
+            return Ok(0);
+        }
+        let statements = queries
+            .iter()
+            .map(|q| q.prepare(&self.db))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(d1_err)?;
+        crate::d1_ledger::counted_page_batch(&self.db, statements)
+            .await
+            .map_err(|e| d1_err(e.to_string()))?;
+        Ok(queries.len() as u64)
+    }
 
-        Ok(())
+    /// One read for a page's held inputs (engine 0.2.2): the outpoints as a
+    /// JSON array of `[txid, vout]` pairs, one bound parameter however many.
+    async fn find_topic_outputs(
+        &self,
+        topic: &str,
+        outpoints: &[(String, u32)],
+    ) -> Result<Vec<Output>, StorageError> {
+        if outpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted =
+            serde_json::to_string(outpoints).map_err(|e| StorageError::Database(e.to_string()))?;
+        let rows: Vec<OutputRow> = Query::new(Self::topic_outputs_sql())
+            .bind(topic)
+            .bind(wanted)
+            .fetch_all(&self.db)
+            .await
+            .map_err(d1_err)?;
+        Ok(rows.into_iter().map(OutputRow::into_output).collect())
+    }
+
+    /// One read for a page's applied state (engine 0.2.2).
+    async fn find_applied_transactions(
+        &self,
+        topic: &str,
+        txids: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        if txids.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[derive(Deserialize)]
+        struct TxidRow {
+            txid: String,
+        }
+        let wanted =
+            serde_json::to_string(txids).map_err(|e| StorageError::Database(e.to_string()))?;
+        let rows: Vec<TxidRow> = Query::new(APPLIED_OF_TXIDS_SQL)
+            .bind(topic)
+            .bind(wanted)
+            .fetch_all(&self.db)
+            .await
+            .map_err(d1_err)?;
+        Ok(rows.into_iter().map(|r| r.txid).collect())
     }
 
     async fn delete_output(
@@ -712,9 +824,7 @@ impl Storage for D1Storage {
         &self,
         tx: &AppliedTransaction,
     ) -> Result<(), StorageError> {
-        Query::new("INSERT OR IGNORE INTO applied_transactions (txid, topic) VALUES (?, ?)")
-            .bind(&*tx.txid)
-            .bind(&*tx.topic)
+        Self::applied_query(tx)
             .execute(&self.db)
             .await
             .map_err(d1_err)
@@ -2269,5 +2379,104 @@ mod tests {
         assert!(output.beef.is_none());
         assert!(output.block_height.is_none());
         assert!(output.score.is_none());
+    }
+
+    /// Engine 0.2.2: the page's two reads and the UHRP index row run on the
+    /// production schema (`OVERLAY_MIGRATIONS` under real SQLite): the held
+    /// inputs of a topic by `[txid, vout]` pairs, exact per outpoint and per
+    /// topic; the applied txids of a topic; the index row inserted once,
+    /// a second insert of the same key ignored, not an error.
+    #[test]
+    fn page_022_the_page_reads_and_the_uhrp_row_run_on_the_production_schema() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "{e}\n{sql}"
+                );
+            }
+        }
+        for (txid, vout, topic) in [("aa", 0, "tm_t"), ("aa", 1, "tm_t"), ("bb", 0, "tm_other")] {
+            conn.execute(
+                "INSERT INTO outputs (txid, outputIndex, topic, spent) VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params![txid, vout, topic],
+            )
+            .unwrap();
+        }
+        let mut stmt = conn.prepare(&D1Storage::topic_outputs_sql()).unwrap();
+        let mut held: Vec<(String, i64)> = stmt
+            .query_map(
+                rusqlite::params!["tm_t", r#"[["aa",0],["aa",1],["bb",0],["cc",3]]"#],
+                |r| Ok((r.get("txid")?, r.get("outputIndex")?)),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        held.sort();
+        assert_eq!(held, [("aa".to_string(), 0), ("aa".to_string(), 1)]);
+
+        for (txid, topic) in [("aa", "tm_t"), ("bb", "tm_other")] {
+            conn.execute(
+                "INSERT INTO applied_transactions (txid, topic) VALUES (?1, ?2)",
+                rusqlite::params![txid, topic],
+            )
+            .unwrap();
+        }
+        let mut stmt = conn.prepare(APPLIED_OF_TXIDS_SQL).unwrap();
+        let applied: Vec<String> = stmt
+            .query_map(rusqlite::params!["tm_t", r#"["aa","bb","cc"]"#], |r| {
+                r.get(0)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(applied, ["aa"]);
+
+        for _ in 0..2 {
+            conn.execute(
+                crate::d1_discovery::UHRP_INSERT_UNLESS_HELD_SQL,
+                rusqlite::params!["aa", 0, "url", "key", "https://x.example", 0, 1],
+            )
+            .unwrap();
+        }
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM uhrp_records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// Engine 0.2.2: an output's statements are the same one at a time and
+    /// in a page's batch: the row, then its BEEF (the GASP form when GASP).
+    #[test]
+    fn page_022_an_output_is_the_same_statements_in_a_batch() {
+        let mut output = Output {
+            txid: "aa".into(),
+            output_index: 0,
+            output_script: vec![],
+            satoshis: 1,
+            topic: "tm_t".into(),
+            spent: false,
+            outputs_consumed: vec![],
+            consumed_by: vec![],
+            beef: Some(vec![0xbe, 0xef]),
+            block_height: None,
+            score: None,
+        };
+        let sqls = |o: &Output, gasp| {
+            D1Storage::output_queries(o, gasp)
+                .iter()
+                .map(|q| q.sql().to_string())
+                .collect::<Vec<_>>()
+        };
+        let gasp = sqls(&output, true);
+        assert_eq!(gasp.len(), 2);
+        assert!(gasp[0].starts_with("INSERT OR IGNORE INTO outputs"));
+        assert_eq!(gasp[1], INSERT_OUTPUT_TX_GASP_SQL);
+        assert_eq!(sqls(&output, false)[1], INSERT_OUTPUT_TX_SQL);
+        output.beef = None;
+        assert_eq!(sqls(&output, true).len(), 1);
     }
 }

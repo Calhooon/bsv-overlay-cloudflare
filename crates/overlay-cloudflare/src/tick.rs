@@ -408,11 +408,12 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
             for (topic, res) in &r.topics_synced {
                 worker::console_log!("Scheduled GASP speed topic={} outputs_walked={} ms={} ms_per_1000_outputs={:?} peers={:?}",
                     topic, res.cost.outputs_walked, res.cost.ms, res.cost.ms_per_1000_outputs, res.peer_results);
-                worker::console_log!("Scheduled GASP topic={} calls_out={} peer_requests={} courier_rungs={} storage_reads={} storage_writes={} ms={} courier_not_found_memo_hits={} peer_absent_memo_hits={} batch_requests={} batch_nodes={} peers_skipped={:?} root_bounds={:?}",
+                worker::console_log!("Scheduled GASP topic={} calls_out={} peer_requests={} courier_rungs={} storage_reads={} storage_writes={} ms={} courier_not_found_memo_hits={} peer_absent_memo_hits={} batch_requests={} batch_nodes={} storage_batches={} storage_statements={} peers_skipped={:?} root_bounds={:?}",
                     topic, res.cost.calls_out, res.cost.peer_requests, res.cost.courier_rungs,
                     res.cost.storage_reads, res.cost.storage_writes, res.cost.ms,
                     res.cost.courier_not_found_memo_hits, res.cost.peer_absent_memo_hits,
                     res.cost.batch_requests, res.cost.batch_nodes,
+                    res.cost.storage_batches, res.cost.storage_statements,
                     res.peers_skipped, res.root_bounds);
                 // Engine 0.1.9: every root a peer's sync dropped, once a
                 // run, with its fault class; `cursor_held_by` names only what
@@ -481,10 +482,11 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     }
 
     let gasp_cost = gasp_meter.snapshot();
-    worker::console_log!("Scheduled GASP totals calls_out={} peer_requests={} courier_rungs={} storage_reads={} storage_writes={} ms={} courier_not_found_memo_hits={} peer_absent_memo_hits={} batch_requests={} batch_nodes={}",
+    worker::console_log!("Scheduled GASP totals calls_out={} peer_requests={} courier_rungs={} storage_reads={} storage_writes={} ms={} courier_not_found_memo_hits={} peer_absent_memo_hits={} batch_requests={} batch_nodes={} storage_batches={} storage_statements={}",
         gasp_cost.calls_out, gasp_cost.peer_requests, gasp_cost.courier_rungs,
         gasp_cost.storage_reads, gasp_cost.storage_writes, gasp_cost.ms, gasp_cost.courier_not_found_memo_hits,
-        gasp_cost.peer_absent_memo_hits, gasp_cost.batch_requests, gasp_cost.batch_nodes);
+        gasp_cost.peer_absent_memo_hits, gasp_cost.batch_requests, gasp_cost.batch_nodes,
+        gasp_cost.storage_batches, gasp_cost.storage_statements);
     worker::console_log!("Scheduled GASP speed outputs_walked={} ms={} ms_per_1000_outputs={:?}",
         gasp_cost.outputs_walked, gasp_cost.ms, gasp_cost.ms_per_1000_outputs);
     crate::gasp_cost::record(&ops_db, "tick", gasp_cost).await;

@@ -102,6 +102,7 @@ impl<T: Into<QVal>> From<Option<T>> for QVal {
 // =============================================================================
 
 /// Builds a parameterized D1 query with bind values.
+#[derive(Clone)]
 pub struct Query {
     sql: String,
     params: Vec<QVal>,
@@ -137,7 +138,7 @@ impl Query {
         &self.params
     }
 
-    pub fn prepare(self, db: &D1Database) -> Result<D1PreparedStatement, String> {
+    pub fn prepare(&self, db: &D1Database) -> Result<D1PreparedStatement, String> {
         let stmt = db.prepare(&self.sql);
         if self.params.is_empty() {
             return Ok(stmt);

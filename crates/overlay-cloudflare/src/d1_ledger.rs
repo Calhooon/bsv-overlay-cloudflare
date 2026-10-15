@@ -352,6 +352,22 @@ pub async fn counted_batch(
     Ok(out)
 }
 
+/// A GASP page's batch (engine 0.2.2): one `D1Database::batch`, one
+/// subrequest of the invocation, so the meter counts it as ONE query; its
+/// statements are counted by the engine (`SyncCost::storage_statements`).
+/// Each member's meta is noted on the ledger as `counted_batch` notes it.
+pub async fn counted_page_batch(
+    db: &worker::D1Database,
+    stmts: Vec<worker::D1PreparedStatement>,
+) -> worker::Result<Vec<worker::D1Result>> {
+    overlay_engine::meter::d1_queries(1);
+    let out = db.batch(stmts).await?;
+    for r in &out {
+        note_meta(r.meta().ok().flatten().as_ref());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
