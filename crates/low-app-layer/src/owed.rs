@@ -682,6 +682,14 @@ pub async fn home_walk_pass<W: HomeWalkWorld>(
 pub const SPENT_ELSEWHERE_REASON: &str =
     "the hop was spent outside this game by a transaction that pays none of your homes (your wallet's own spend, or a sweep elsewhere): if it was yours, the money is already there; nothing here can move it";
 
+/// bsv-low #669: the sweep claim of a `hop-stranded` row was computed against a chain probe taken at an EARLIER tip
+/// than the one being served (a block has arrived since, or the present tip cannot be read at all). The chain probe
+/// is no longer provably current, so the claim is no longer trustworthy: the served row degrades to a `pending`
+/// chain-wait (`claimable:false`, no press), never a dead sweep. A fresh probe at the new tip re-points it to the
+/// claim (still unspent) or to `spent-elsewhere` (a competitor took it).
+pub const SWEEP_TIP_MOVED_REASON: &str =
+    "the chain moved since this was judged; re-checking the hop against the new block";
+
 /// The families, in the order the page lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OwedFamily {
@@ -3252,6 +3260,23 @@ pub fn owed_body(
     .to_string()
 }
 
+/// bsv-low #669: the READ-TIME freshness gate for a `hop-stranded` sweep claim (the design's §2a). The claimable
+/// verdict in a served row rests on a chain probe taken when its snapshot was computed, at `snapshot_tip`. If the
+/// chain has moved on since (`present_tip > snapshot_tip`), or the present tip cannot be read at all, that verdict
+/// is no longer provably current and the row degrades, IN THE SERVED BODY ONLY, to a `pending` chain-wait:
+/// `claim:null`, `claimable:false`, `chainWait:"block"`, so the client offers no press and the harness reads a block
+/// wait. The write path still stores the honest probe-current verdict; this is read-time provenance, not stored
+/// state, and the ONE place the rule lives. Fail-safe: an uncertain read never offers a dead sweep. A fresh compute
+/// (snapshot_tip == present_tip) never degrades; the tip-triggered recompute re-points the row at the new tip.
+///
+/// STUB (bsv-low #669 fix, step B): the pins land RED against this pre-fix no-op; the body is filled in the fix.
+pub fn degrade_stale_sweeps(
+    _rows: &mut [OwedRow],
+    _snapshot_tip: Option<u64>,
+    _present_tip: Option<u64>,
+) {
+}
+
 /// The `owed_rows` table (the overlay's migration 156 owns the DDL; this crate
 /// issues the byte-identical catch-up). `facts` is the row's JSON.
 pub const OWED_ROWS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_rows (identity TEXT NOT NULL, outpoint TEXT NOT NULL, family TEXT NOT NULL, gameId TEXT NOT NULL, sats INTEGER, opponentIdentity TEXT, atHeight INTEGER, facts TEXT NOT NULL, updatedAtMs INTEGER NOT NULL, reason TEXT, PRIMARY KEY (identity, outpoint))";
@@ -3387,6 +3412,17 @@ pub const OWED_ROWS_READ_SQL: &str = "SELECT identity, outpoint, family, gameId,
 /// HIGH-4: the tip flips the gate — every identity party to an UNSPENT pot whose recovery height the new tip has
 /// reached (a small band below it, so a missed block still lands) is marked STALE; its next read recomputes.
 pub const OWED_STALE_ON_TIP_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE identity IN (SELECT DISTINCT pp.identity FROM potparty_records pp JOIN pot_records p ON p.txid = pp.potTxid AND p.outputIndex = pp.potVout WHERE p.spent = 0 AND p.recoveryHeight IS NOT NULL AND p.recoveryHeight <= ?1 AND p.recoveryHeight >= ?1 - 6)";
+/// bsv-low #669: the twin of [`OWED_STALE_ON_TIP_SQL`] for HOP-STRANDED rows. A non-LOW competitor's confirming
+/// block fires no `pot-changed` / `hop-changed` / `/internal/tx-word` hook (LOW's door never saw the spend), so the
+/// #469 pot gate above never names a stranded-hop identity and the sweep claim stays frozen at the compute tip. This
+/// marks STALE exactly the identities that currently hold a LIVE claimable stranded-hop row (keyed on the derived
+/// row, itself keyed on the hop OUTPOINT — never a name): the next read / the #648 deferred alarm re-probes the chain
+/// at the new tip and re-points the hop to `spent-elsewhere` (or restores the claim if the hop is genuinely unspent).
+/// It takes NO bind (the set is the derived rows, not a height band), and marks nothing but claimable stranded hops.
+///
+/// STUB (bsv-low #669 fix, step B): the pins land RED against this pre-fix no-op (it marks nothing, as the #469 pot
+/// gate above marks no stranded-hop identity); the real statement is filled in the fix.
+pub const OWED_STALE_ON_TIP_HOPS_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE 0";
 /// HIGH-4: a filing on a pot marks BOTH parties stale (the counterparty's valid refund makes MY pot claimable).
 /// The gate's MEDIUM-1 (2026-09-19): an outpoint the pot-changed hook cannot attribute through decoded params (an
 /// EVICTED pot's row is gone; a released HOP is a P2PKH row) is attributed through the seats' OWN markers — the
@@ -10213,5 +10249,173 @@ pub(crate) mod tests {
                 "NOTE-2: retryAfterMs must be at least 1000"
             );
         }
+    }
+
+    // ── bsv-low #669: the owed list's hop-stranded `claimable` rests on a chain probe at the SERVED tip ──────────
+    //
+    // The loop-28 defect: a `hop-stranded sweep-hop` snapshot computed at tip 971114 (chain probe `unspent`, because
+    // the competitor was a mempool double-spend) was served byte-identical through and past block 971115, so Collect
+    // offered a dead sweep of an already-mined input. These pins drive the pure fix (`degrade_stale_sweeps`,
+    // `should_recompute`, the SQL twin's budget) with NO network; the SQL twin's selectivity under real SQLite and
+    // the live cell are elsewhere (`tests/owed_tip_probe_sqlite.rs`, `app/e2e/admit-fast-join-refused.spec.ts`).
+
+    /// A claimable `hop-stranded` row the derivation produces at `snapshot_tip`, chain probe `unspent` (the loop-28
+    /// shape): index-unspent past the window, verified marker, the chain rung says unspent.
+    fn stranded_sweep_rows(snapshot_tip: u64) -> Vec<OwedRow> {
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let key = format!("{}:0", tx(0x07));
+        let unspent = chain(&key, true, Some(false), None);
+        let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(snapshot_tip));
+        i.hop_chain = &unspent;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].family, OwedFamily::HopStranded, "precondition");
+        assert_eq!(rows[0].facts["claim"], "sweep-hop", "precondition");
+        assert_eq!(rows[0].facts["claimable"], true, "precondition");
+        assert_eq!(rows[0].facts["chainProbe"], "unspent", "precondition");
+        rows
+    }
+
+    /// PIN A1 (RED on the stub): the loop-28 body (probe tip 971114, served tip 971115) degrades the sweep to a
+    /// `pending` chain-wait — never `claim: sweep-hop` pressable. RED line: `assert_eq!(…["claimable"], false)`.
+    #[test]
+    fn pin669_a1_a_moved_tip_degrades_the_loop28_sweep_to_pending() {
+        let mut rows = stranded_sweep_rows(971_114);
+        degrade_stale_sweeps(&mut rows, Some(971_114), Some(971_115));
+        assert_eq!(
+            rows[0].facts["claimable"], false,
+            "a block arrived since the compute: never a dead sweep"
+        );
+        assert!(rows[0].facts["claim"].is_null());
+        assert_eq!(rows[0].facts["chainWait"], "block");
+        assert_eq!(rows[0].facts["tipMoved"], true);
+        assert_eq!(rows[0].facts["snapshotTip"], 971_114);
+        assert_eq!(rows[0].facts["servedTip"], 971_115);
+        assert_eq!(rows[0].reason.as_deref(), Some(SWEEP_TIP_MOVED_REASON));
+        // the row stays hop-stranded (a degraded display, re-probed on the next tip), not a different family
+        assert_eq!(rows[0].family, OwedFamily::HopStranded);
+    }
+
+    /// PIN A2 (guard): a probe at the SERVED tip stays claimable — the fix does not pend an honest sweep on a quiet
+    /// chain. A cold isolate (present tip unknown) is the fail-safe: it degrades.
+    #[test]
+    fn pin669_a2_a_tip_current_probe_stays_claimable() {
+        let mut rows = stranded_sweep_rows(971_114);
+        degrade_stale_sweeps(&mut rows, Some(971_114), Some(971_114));
+        assert_eq!(rows[0].facts["claim"], "sweep-hop", "tip-current: the claim stands");
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert!(rows[0].facts.get("chainWait").is_none());
+        assert!(rows[0].facts.get("tipMoved").is_none());
+        // fail-safe: the present tip cannot be read -> degrade (cannot prove tip-current)
+        let mut rows = stranded_sweep_rows(971_114);
+        degrade_stale_sweeps(&mut rows, Some(971_114), None);
+        assert_eq!(rows[0].facts["claimable"], false, "cannot prove tip-current -> pending");
+        assert_eq!(rows[0].facts["chainWait"], "block");
+        assert_eq!(rows[0].facts["tipUnknown"], true);
+    }
+
+    /// PIN A3 (RED on the stub): a competitor mined between two reads. Read 1 (tip 971114) is claimable; served
+    /// across block 971115 it degrades to pending (RED line: the middle assert); the re-probe at the new tip sees
+    /// the competitor and re-points the hop to `spent-elsewhere` (Unbound, no claim) — never a dead sweep.
+    #[test]
+    fn pin669_a3_a_competitor_mined_between_two_reads_flips_to_spent_elsewhere() {
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let old = [hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1))];
+        let key = format!("{}:0", tx(0x07));
+        // read 1 at tip 971114: index + chain unspent -> claimable sweep-hop
+        let mut read1 = stranded_sweep_rows(971_114);
+        // the block arrives (971115): the SAME snapshot, served, degrades to a block wait
+        degrade_stale_sweeps(&mut read1, Some(971_114), Some(971_115));
+        assert_eq!(
+            read1[0].facts["claimable"], false,
+            "the stale snapshot must not keep offering a dead sweep across a block"
+        );
+        assert_eq!(read1[0].facts["chainWait"], "block");
+        // read 2 at tip 971115: the re-probe sees the competitor spend -> the hop left this game
+        let competitor = tx(0x1c);
+        let spent = chain_confirmed(&key, true, Some(true), Some(&competitor), Some(true));
+        let mut i2 = inputs(&[], &[], &old, &v, &c, &p, Some(971_115));
+        i2.hop_chain = &spent;
+        let read2 = derive_owed_rows(&i2);
+        assert_eq!(read2[0].family, OwedFamily::Unbound);
+        assert!(read2[0].facts["claim"].is_null());
+        assert_eq!(read2[0].facts["chainProbe"], "spent");
+        assert_eq!(read2[0].facts["chainSpender"], competitor);
+    }
+
+    /// PIN A4 (RED on the stub): the budget holds, and the read path reads the CACHED present tip. N identities each
+    /// with a claimable stranded hop, one tip: each admits ≤ the ceiling per window + exactly one reserved deferred
+    /// walk (the #648 ceiling+1), past which the read sheds. Nothing per request on the read path beyond the 30-s
+    /// isolate-cached tip (`beef_guard::present_tip`), never the uncached `chaintracks_present_height`.
+    #[test]
+    fn pin669_a4_the_budget_holds_and_the_read_reads_the_cached_tip() {
+        let mut rate = RecomputeRate::default();
+        let ids: Vec<String> = (0u8..8).map(|n| format!("id-stranded-{n}")).collect();
+        for id in &ids {
+            for k in 0..OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW {
+                assert!(rate.admit(id, 1_000 + k as i64, true), "{id}: walk {k} within the ceiling");
+            }
+            assert!(!rate.admit(id, 2_000, true), "{id}: past the ceiling the read sheds");
+            assert_eq!(
+                rate.arm_deferred(id, 2_001),
+                Some(61_000),
+                "{id}: one reserved deferred walk (ceiling + 1)"
+            );
+            assert_eq!(rate.arm_deferred(id, 2_002), None, "{id}: no second reservation");
+            assert_eq!(rate.in_window(id, 2_000), OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW);
+        }
+        // the read path's tip for a hop-stranded row is the isolate cache, read at most once per 30 s, not a
+        // per-request chaintracks call
+        let code = include_str!("routes.rs");
+        let read = &code[code.find("pub async fn owed(req:").expect("the owed read")..];
+        let read = &read[..read.find("\nasync fn gather_result_entries").unwrap_or(read.len())];
+        assert!(
+            read.contains("beef_guard::present_tip"),
+            "the owed read's tip must be the 30-s isolate cache, not the uncached chaintracks_present_height"
+        );
+        assert!(
+            read.contains("OwedFamily::HopStranded"),
+            "the read must read the tip for a claimable hop-stranded row (needs_tip), to gate its sweep"
+        );
+    }
+
+    /// PIN A6 (RED on the stub): the served body is ADDITIVE. A tip-current serve is byte-identical to the
+    /// pre-degrade body; a degraded row keeps every other fact and gains only the freshness fields. (The #638
+    /// byte-identity pins are untouched: this change writes no `pot_records`/`hopparty_records`/trigger.)
+    #[test]
+    fn pin669_a6_the_served_body_shape_is_additive() {
+        // tip-current: the body does not change
+        let mut rows = stranded_sweep_rows(971_114);
+        let before = owed_body(ME, Some(971_114), &rows, 1_792_000_000_000, false);
+        degrade_stale_sweeps(&mut rows, Some(971_114), Some(971_114));
+        let after = owed_body(ME, Some(971_114), &rows, 1_792_000_000_000, false);
+        assert_eq!(before, after, "a tip-current serve is byte-identical");
+        // degraded: every other fact survives; only the freshness fields are added and the claim flips
+        let mut rows = stranded_sweep_rows(971_114);
+        let chain_probe = rows[0].facts["chainProbe"].clone();
+        let age = rows[0].facts.get("chainProbeAgeMs").cloned();
+        let sweep_source = rows[0].facts["sweepSource"].clone();
+        degrade_stale_sweeps(&mut rows, Some(971_114), Some(971_115));
+        assert!(rows[0].facts["claim"].is_null());
+        assert_eq!(rows[0].facts["claimable"], false);
+        assert_eq!(rows[0].facts["chainProbe"], chain_probe, "chainProbe is kept as provenance");
+        assert_eq!(rows[0].facts.get("chainProbeAgeMs").cloned(), age);
+        assert_eq!(rows[0].facts["sweepSource"], sweep_source);
+    }
+
+    /// PIN D6 (RED on the base): `should_recompute` fires on a moved tip for a claimable hop-stranded row — the
+    /// serve-then-refresh re-probe runs on the block, not only after the 5-minute open age. A tip that has not moved
+    /// does not kick it (no churn). RED line: the first `assert!(should_recompute(…))`.
+    #[test]
+    fn pin669_d6_should_recompute_fires_on_a_moved_tip_for_a_claimable_hop_stranded_row() {
+        let rows = stranded_sweep_rows(971_114);
+        assert!(
+            should_recompute(false, 10_000, Some(971_114), Some(971_115), &rows),
+            "a block must kick the re-probe of a claimable stranded hop (gate_flipped), not wait 5 minutes"
+        );
+        assert!(
+            !should_recompute(false, 10_000, Some(971_115), Some(971_115), &rows),
+            "a tip that has not moved does not churn the recompute"
+        );
     }
 }
