@@ -24,7 +24,7 @@ use bsv_rs::transaction::{ChainTracker, ChainTrackerError};
 use serde::Deserialize;
 
 /// ChainTracker implementation using Cloudflare Workers `Fetch` API
-/// against a ChainTracks API server (e.g. <your-chain-tracker-api>).
+/// against a ChainTracks API server (e.g. `<your-chain-tracker-api>`).
 ///
 /// Endpoints used:
 /// - `GET /findHeaderHexForHeight?height={N}` — returns block header with merkle root

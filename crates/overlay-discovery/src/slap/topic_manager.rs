@@ -2,8 +2,8 @@
 //!
 //! SLAP (Service Lookup Availability Protocol) advertisements use the same
 //! 5-field PushDrop format as SHIP, but with:
-//! - Field[0] = "SLAP" (not "SHIP")
-//! - Field[3] must start with "ls_" (not "tm_")
+//! - `Field[0]` = "SLAP" (not "SHIP")
+//! - `Field[3]` must start with "ls_" (not "tm_")
 //!
 //! Ported from `~/bsv/overlay-discovery-services/src/SLAP/SLAPTopicManager.ts`.
 

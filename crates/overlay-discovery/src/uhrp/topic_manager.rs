@@ -9,7 +9,7 @@
 //! 4. Expiry time: unix seconds, Bitcoin VarInt
 //! 5. Content length: bytes, Bitcoin VarInt
 //! 6. ECDSA signature (DER): over `concat(field[0..4])`, linked via BRC-42
-//!    to field[0].
+//!    to `field[0]`.
 //!
 //! Submission admission follows uhrp-services@b9ed638: a positive expiry is
 //! accepted even after its time passes. The sync walk may skip an expired

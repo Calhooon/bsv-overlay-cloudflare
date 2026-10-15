@@ -82,7 +82,7 @@ impl PeerFailure {
 /// Makes HTTP POST requests to peer overlay nodes at their standard
 /// GASP endpoints (`/requestSyncResponse`, `/requestForeignGASPNode`).
 pub struct WorkerGASPRemote {
-    /// Base URL of the peer overlay node (e.g. "https://peer.example.com").
+    /// Base URL of the peer overlay node (e.g. `https://peer.example.com`).
     peer_url: String,
     /// Topic being synchronized (sent in `x-bsv-topic` header).
     topic: String,

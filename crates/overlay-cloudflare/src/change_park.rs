@@ -755,7 +755,7 @@ pub const COUNTER_CHANGE_PARK_DRAIN_TICK: &str = "change_park_drain_tick_total";
 pub const COUNTER_CHANGE_PARK_DRAIN_COMPLETE_PROOFS: &str =
     "change_park_drain_complete_proofs_total";
 
-/// THE SHARED DRAIN (bsv-low #649 M1; D3-H1): one bounded pass of [`deliver_parked`] over D1, called by the
+/// THE SHARED DRAIN (bsv-low #649 M1; D3-H1): one bounded pass of `deliver_parked` over D1, called by the
 /// scheduled handler and by `/admin/complete-proofs`, counted per trigger. Unconfigured (`APP_LAYER_URL` /
 /// `INTERNAL_TOKEN`): nothing is read, the rows stay parked, nothing counted (`None`).
 pub async fn drain_parked(env: &Env, db: &D1Database, trigger: DrainTrigger) -> Option<Delivered> {
@@ -863,9 +863,9 @@ impl UnparkPort for NoTransport<'_> {
 /// `POST /internal/change-park` (bsv-low #649 N3; bearer `INTERNAL_TOKEN`): ONE step of the parked set's shipped
 /// code on demand, so the D1 budget tier measures it on a populated table (each answer carries its `d1`
 /// Server-Timing). Body `{"op":"park","items":["<txid>:<vout>",..],"hops"?:["<identity>",..]}` (the pot items and
-/// the hop identities noted, then the shipped skip [`park_withheld`]: what this isolate holds is parked with them;
+/// the hop identities noted, then the shipped skip `park_withheld`: what this isolate holds is parked with them;
 /// the hops since D2-L2, so the route tier re-parks both sets during a delivery's POST), `{"op":"drain"}` (the shipped
-/// [`deliver_parked`]; with no `APP_LAYER_URL` no POST leaves and each read row is refused and backed off) or
+/// `deliver_parked`; with no `APP_LAYER_URL` no POST leaves and each read row is refused and backed off) or
 /// `{"op":"health"}` (the gauge).
 pub async fn internal_lever(
     mut req: worker::Request,
@@ -2119,10 +2119,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let skip = doc_before(
-            include_str!("pot_changes.rs"),
-            "    Skip {\n",
-        );
+        let skip = doc_before(include_str!("pot_changes.rs"), "    Skip {\n");
         let counter = doc_before(
             include_str!("ops.rs"),
             "pub const COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW",

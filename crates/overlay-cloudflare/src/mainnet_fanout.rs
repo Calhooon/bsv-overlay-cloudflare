@@ -62,7 +62,7 @@ const LS_SHIP: &str = "ls_ship";
 
 /// Fan out a tagged BEEF to every mainnet peer that runs any of its
 /// topics. Discovers peers by querying `ls_ship` at each
-/// [`DEFAULT_SLAP_TRACKERS`] and parsing the returned SHIP PushDrop records
+/// `DEFAULT_SLAP_TRACKERS` and parsing the returned SHIP PushDrop records
 /// for host URLs. `self_host`, if set, is filtered out of the peer set so
 /// we never round-trip a submit through ourselves.
 ///

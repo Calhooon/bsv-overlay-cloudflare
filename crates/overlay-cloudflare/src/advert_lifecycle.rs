@@ -370,7 +370,7 @@ pub trait SpendProbeTransport {
 }
 
 /// The production transport — `worker::Fetch` via the shared
-/// [`http_get`] helper.
+/// `http_get` helper.
 pub struct WorkerFetchTransport;
 
 #[async_trait::async_trait(?Send)]

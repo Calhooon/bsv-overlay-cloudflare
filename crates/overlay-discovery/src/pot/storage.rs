@@ -226,10 +226,10 @@ impl<'a> VerdictWrite<'a> {
 }
 
 impl PotRecord {
-    /// Rebuild the committed [`CovenantParams`] from this row's decoded
+    /// Rebuild the committed [`CovenantParams`](crate::pot::covenant::CovenantParams) from this row's decoded
     /// columns. `Some` ONLY when the row is a decoded covenant lock with
     /// every param present and well-formed (strict hex/length validation in
-    /// [`covenant_params_from_hex`]) — a malformed stored value degrades to
+    /// [`covenant_params_from_hex`](crate::pot::covenant::covenant_params_from_hex)) — a malformed stored value degrades to
     /// `None` (the caller falls back to the BEEF parse / classifies
     /// nothing), never a trust-shortcut.
     pub fn decoded_covenant_params(&self) -> Option<crate::pot::covenant::CovenantParams> {
@@ -526,7 +526,7 @@ pub trait PotStorage {
 
     /// bsv-low W4 (2026-09-04): pots the index still marks UNSPENT that are at
     /// least `min_age_secs` old, OLDEST first, at most `limit`. The candidate
-    /// set of [`discover_missing_spends`]: eight pre-heal-era rows on beta sat
+    /// set of `discover_missing_spends`: eight pre-heal-era rows on beta sat
     /// `spent = 0` while `/spent-any` proved them spent with known spenders —
     /// nothing ever asked the couriers about a pot nobody submitted a spend
     /// for. Backends that can't enumerate return an empty `Vec` (no-op).
@@ -628,7 +628,7 @@ pub trait PotStorage {
     /// Record the header the block-event pass acted on at `height`, and
     /// answer what was held before (the reorg detector's two facts). A
     /// repeat of the same `(height, hash)` is idempotent. Backends that do
-    /// not persist headers answer the empty [`HeaderSeen`] (no reorg can
+    /// not persist headers answer the empty [`HeaderSeen`](crate::pot::reorg::HeaderSeen) (no reorg can
     /// ever be detected through them; the sweep still covers the window).
     async fn record_header_seen(
         &self,
@@ -878,7 +878,7 @@ pub trait PotStorage {
     /// the signers from the STORED spender BEEF and re-attaches the whole
     /// group via [`mark_verdict_for_spender`](Self::mark_verdict_for_spender)
     /// (idempotent: same bytes ⇒ same verdict). RANDOM order per tick, same
-    /// starvation rationale as [`find_params_undecoded`]. A row whose
+    /// starvation rationale as [`find_params_undecoded`](PotStorage::find_params_undecoded). A row whose
     /// signatures never verify would re-enter forever — the backfill caller
     /// bounds that by latching the row out of the candidate set explicitly
     /// (see its docs). Backends that can't enumerate return empty → no-op.
@@ -902,7 +902,7 @@ pub trait PotStorage {
     /// live pointer, stored-wins). A measured side is `Some(0)` when the
     /// spend pays that home nothing, so a measured row LEAVES the set; a
     /// row whose spender bytes are missing stays (bounded per tick, RANDOM
-    /// order, same starvation rationale as [`find_params_undecoded`]).
+    /// order, same starvation rationale as [`find_params_undecoded`](PotStorage::find_params_undecoded)).
     /// Backends that can't enumerate return empty → no-op.
     async fn find_spender_payouts_unlatched(
         &self,

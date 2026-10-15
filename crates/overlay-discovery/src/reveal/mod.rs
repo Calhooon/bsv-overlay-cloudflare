@@ -26,7 +26,7 @@
 //! a permanent fact. The beacon P2PKH gets reclaimed/spent later
 //! (`stake.ts::reclaimRevealBeacon`); had we indexed it, its spend would
 //! evict the record. The lookup service therefore uses
-//! [`SpendNotificationMode::None`] and treats spend/eviction as no-ops:
+//! [`SpendNotificationMode::None`](overlay_engine::types::SpendNotificationMode::None) and treats spend/eviction as no-ops:
 //! a reveal record is NEVER removed.
 //!
 //! # Artifact wire format (`LOW/reveal/v2`)

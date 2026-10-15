@@ -74,7 +74,7 @@
 //! ## The deferred EF jobs' objects (N5, LOW's E585 land2 lens)
 //!
 //! The NL-6c deferral puts a job's bytes under [`EF_SWEEP_PREFIX`] (`ef_deferred::R2_PREFIX`), a prefix the pass
-//! above never lists. Their own pass ([`ef_sweep_pass`], on the same tick, under the same [`SWEEP_BUDGET_MS`]) lists
+//! above never lists. Their own pass (`ef_sweep_pass`, on the same tick, under the same [`SWEEP_BUDGET_MS`]) lists
 //! that prefix [`SWEEP_MAX_OBJECTS`] at a time from its own key at rest (`ef_deferred_sweep`, the same one-row
 //! shape) and counts the objects and bytes as the pass above counts `atRest`; `/health/invariants.queue.r2.
 //! efDeferred` serves that count, never a listing at the health call.
@@ -133,7 +133,7 @@ pub const SWEEP_STATE_SAVE_SQL: &str = "INSERT INTO beef_blob_sweep (id, start_a
 pub const NAMED_KEYS_SQL: &str =
     "SELECT r2_key FROM mutation_dead_letters WHERE r2_key IS NOT NULL";
 
-/// N5: the deferred EF jobs' objects, listed and counted by their own pass ([`ef_sweep_pass`]).
+/// N5: the deferred EF jobs' objects, listed and counted by their own pass (`ef_sweep_pass`).
 pub const EF_SWEEP_PREFIX: &str = crate::ef_deferred::R2_PREFIX;
 /// L1 (b): a rowless object under [`EF_SWEEP_PREFIX`] older than this is deleted: a settled job's keep.
 pub const EF_ORPHAN_WINDOW_S: u64 = (crate::ef_deferred::JOB_KEEP_MS / 1000) as u64;
@@ -614,8 +614,8 @@ impl PassOutcome {
     }
 }
 
-/// What a pass has done SO FAR (the d3 fold-5, E585-D3-DELTA3-L1): written by [`sweep_pass`] as each step lands
-/// (a delete the moment it answered), read by [`run_pass_with`] when the budget drops the pass, so a dropped pass
+/// What a pass has done SO FAR (the d3 fold-5, E585-D3-DELTA3-L1): written by `sweep_pass` as each step lands
+/// (a delete the moment it answered), read by `run_pass_with` when the budget drops the pass, so a dropped pass
 /// answers and counts the deletes it made before the drop.
 #[derive(Debug, Default)]
 pub struct PassProgress {
@@ -857,7 +857,7 @@ pub(crate) async fn run_pass_with<P: SweepPort, D: std::future::Future<Output = 
 }
 
 /// ONE bounded pass, as the scheduled tick and the operator's lever both run it (the d3 fold-4, DELTA2-L1): the
-/// pass under its [`SWEEP_BUDGET_MS`] race ([`run_pass_with`]: a dropped pass answers and counts its deletes up to
+/// pass under its [`SWEEP_BUDGET_MS`] race (`run_pass_with`: a dropped pass answers and counts its deletes up to
 /// the drop and saved no cursor, unless its save was in flight), and one log line.
 pub async fn run_pass(env: &Env, db: &D1Database, by: &str) -> PassOutcome {
     let out = match env.bucket(crate::queue::BEEF_BLOBS_BINDING) {

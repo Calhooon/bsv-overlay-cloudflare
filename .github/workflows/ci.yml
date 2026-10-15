@@ -155,3 +155,24 @@ jobs:
     # allowlist is .gitleaks.toml's.
     - run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 .'
     - run: '"$RUNNER_TEMP/gitleaks" dir --redact --no-banner --exit-code 1 .'
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    # Doc warnings denied (bsv-stack-lean #141): both workspaces, the root
+    # one with and without the test-store feature (docs.rs builds without).
+    # low-app-layer is LOW's crate: its own doc warnings are LOW's to fix.
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      with:
+        toolchain: 1.95.0
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        workspaces: '. -> target
+
+          workers -> workers/target'
+    - run: cargo doc --locked --no-deps --workspace
+    - run: cargo doc --locked --no-deps --workspace --features bsv-overlay-engine/memory-storage
+    - run: cargo doc --locked --no-deps --manifest-path workers/Cargo.toml --workspace --exclude low-app-layer

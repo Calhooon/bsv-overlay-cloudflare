@@ -267,7 +267,7 @@ pub fn background_flush_plan(started_ms: u64, now_ms: u64) -> BackgroundFlush {
 /// [`flush_inline`] for a `wait_until` job that started at `started_ms` (bsv-low #649): ONE wall, bounded by what
 /// remains of the job's window ([`background_flush_plan`]), shared by the hop set, the pot set and the tracker
 /// events (whose own 20 s no longer stacks on top). Under the floor no POST is started: the pot and hop notes are
-/// PARKED in D1 (bsv-low #649 M1, [`crate::change_park::park_withheld`]) for the cron to deliver, the skip and the
+/// PARKED in D1 (bsv-low #649 M1, `crate::change_park::park_withheld`) for the cron to deliver, the skip and the
 /// withheld entries counted (`admit_fast_flush_skipped_no_window_total`, `admit_fast_flush_withheld_total`). A POST
 /// already in flight is not raced: the deadline only stops the flush from STARTING one it cannot afford.
 pub async fn flush_inline_within(env: Env, started_ms: u64) {
