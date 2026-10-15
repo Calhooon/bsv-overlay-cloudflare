@@ -5114,9 +5114,14 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
         .and_then(|s| s.markerless_progress.as_deref())
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
     // bsv-low #669: the read-side freshness gate for a hop-stranded sweep. `present_tip_for_degrade` is the present
-    // tip this request read (the 30-s isolate cache); `served_snapshot_is_fresh` is set when the rows were (re)computed
-    // at the present tip this request, so the degrade (applied once, after the match) skips a just-computed snapshot.
+    // tip this request read (the 30-s isolate cache); `snapshot_tip_for_degrade` is the TRUE tip the served
+    // snapshot's chain probe was taken at (the stored `owed_state.tip`, possibly None) — the gate's snapshot tip,
+    // MEDIUM-1 (the FIX-669 lens): it is carried end to end separately from the body's display `tip`
+    // (`owed_served_tips`), so a NULL stored tip reaches the gate as None (fail-safe) instead of collapsing to the
+    // present tip and reading tip-current. `served_snapshot_is_fresh` is set when the rows were (re)computed at the
+    // present tip this request, so the degrade (applied once, after the match) skips a just-computed snapshot.
     let mut present_tip_for_degrade: Option<u64> = None;
+    let mut snapshot_tip_for_degrade: Option<u64> = None;
     let mut served_snapshot_is_fresh = false;
     let (rows, tip, computed_at_ms, walk_cut) = match state {
         None => {
@@ -5207,6 +5212,12 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                 None
             };
             present_tip_for_degrade = tip_now;
+            // bsv-low #669 MEDIUM-1: the body's display tip (`served_tip = prev_tip.or(tip_now)`, unchanged) and the
+            // freshness gate's snapshot tip (`snapshot_tip_for_degrade = prev_tip`, possibly None) are decoupled, so a
+            // NULL stored tip degrades fail-safe instead of reading tip-current. Computed before the recompute branch
+            // (`tip_now` is not reassigned on the serve-stored arms that reach the gate).
+            let (served_tip, gate_tip) = crate::owed::owed_served_tips(prev_tip, tip_now);
+            snapshot_tip_for_degrade = gate_tip;
             let cut = st.truncated.unwrap_or(0.0) != 0.0;
             if crate::owed::should_recompute(stale, age_ms, prev_tip, tip_now, &rows) {
                 let source: &'static str = if stale { "read-stale" } else { "read-aged" };
@@ -5286,7 +5297,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                 }
                             }
                         }
-                        (rows, prev_tip.or(tip_now), st.computed_at_ms as i64, cut)
+                        (rows, served_tip, st.computed_at_ms as i64, cut)
                     }
                     // no fetch context (a test harness): the inline compute, as before
                     None => {
@@ -5330,7 +5341,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                     }
                 }
             } else {
-                (rows, prev_tip.or(tip_now), st.computed_at_ms as i64, cut)
+                (rows, served_tip, st.computed_at_ms as i64, cut)
             }
         }
     };
@@ -5338,10 +5349,15 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
     let mut served: Vec<crate::owed::OwedRow> =
         rows.into_iter().take(crate::owed::OWED_MAX_ROWS).collect();
     // bsv-low #669: the ONE place the freshness rule lives. A STORED snapshot's hop-stranded sweep claim rests on a
-    // chain probe taken at `tip`; if the chain has moved on since (or the present tip cannot be read), the served row
-    // degrades to a `pending` chain-wait — never a dead sweep. A fresh compute is tip-current, so it is skipped.
+    // chain probe taken at `snapshot_tip_for_degrade` (the TRUE stored `owed_state.tip`, possibly None — NOT the
+    // body's display `tip`, MEDIUM-1); if the chain has moved on since (or the present/snapshot tip cannot be read),
+    // the served row degrades to a `pending` chain-wait — never a dead sweep. A fresh compute is tip-current, skipped.
     if !served_snapshot_is_fresh {
-        crate::owed::degrade_stale_sweeps(&mut served, tip, present_tip_for_degrade);
+        crate::owed::degrade_stale_sweeps(
+            &mut served,
+            snapshot_tip_for_degrade,
+            present_tip_for_degrade,
+        );
     }
     let mut body: serde_json::Value = serde_json::from_str(&crate::owed::owed_body(
         &identity,

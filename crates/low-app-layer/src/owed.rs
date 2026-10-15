@@ -3260,6 +3260,25 @@ pub fn owed_body(
     .to_string()
 }
 
+/// bsv-low #669 MEDIUM-1 (the fold of the FIX-669 from-scratch lens): the two tips a served `/owed` body carries,
+/// decoupled. Given the STORED snapshot tip (`owed_state.tip`, `prev_tip`, possibly `None` when that column is SQL
+/// NULL) and the present tip this request read (`tip_now`, the 30-s isolate cache), this returns
+/// `(display_tip, gate_tip)`:
+///   - `display_tip = prev_tip.or(tip_now)` — the body's `tip` field, UNCHANGED: a NULL stored snapshot still shows
+///     the present tip, so the client's "as of block N" line is never blank.
+///   - `gate_tip = prev_tip` — the TRUE tip the snapshot's chain probe was taken at, fed to
+///     [`degrade_stale_sweeps`]. A NULL stored tip reaches the gate as `None`, so the gate hits its fail-safe
+///     `Degrade::Unknown` arm and degrades the sweep, instead of reading the collapsed display tip as tip-current.
+///
+/// Why the decoupling is load-bearing: feeding the gate the DISPLAY tip (`prev_tip.or(tip_now)`, the pre-fold route)
+/// collapses a NULL stored tip to `tip_now`, so the serve reads `(Some(tn), Some(tn))` -> `Degrade::TipCurrent` and
+/// the `Degrade::Unknown` arm is DEAD in production: an identity whose FIRST owed compute coincided with a
+/// chaintracks blip (`owed_state.tip` written NULL) keeps offering a claimable (dead) sweep across a block. The
+/// money is network-safe either way (consensus refuses the second spend), but the PRESS must not lie.
+pub fn owed_served_tips(prev_tip: Option<u64>, tip_now: Option<u64>) -> (Option<u64>, Option<u64>) {
+    (prev_tip.or(tip_now), prev_tip)
+}
+
 /// bsv-low #669: the READ-TIME freshness gate for a `hop-stranded` sweep claim (the design's §2a). The claimable
 /// verdict in a served row rests on a chain probe taken when its snapshot was computed, at `snapshot_tip`. If the
 /// chain has moved on since (`present_tip > snapshot_tip`), or the present tip cannot be read at all, that verdict
@@ -10490,6 +10509,95 @@ pub(crate) mod tests {
         assert!(
             !should_recompute(false, 10_000, Some(971_115), Some(971_115), &rows),
             "a tip that has not moved does not churn the recompute"
+        );
+    }
+
+    /// PIN M1 (the FIX-669 lens's MEDIUM-1; RED on the pre-fold route wiring): a NULL stored `owed_state.tip` must
+    /// reach the freshness gate as `None`, so a claimable stranded hop served across a block DEGRADES to pending —
+    /// never a dead sweep. The route serves `prev_tip.or(tip_now)` as the BODY's display tip (unchanged: a NULL
+    /// stored tip still shows the present tip), but `owed_served_tips` decouples the GATE's snapshot tip (`prev_tip`,
+    /// here `None`) from it. The pre-fold route fed the gate the display tip, collapsing `None` to `tip_now`, so the
+    /// serve read `(Some(tn), Some(tn))` -> `Degrade::TipCurrent` and the `Degrade::Unknown` fail-safe arm was DEAD.
+    /// RED line (demonstrated by reverting `owed_served_tips` to the route's pre-fold `(prev_tip.or(tip_now),
+    /// prev_tip.or(tip_now))`): `assert_eq!(gate_tip, None, ...)` gets `Some(971_115)`, and the degrade's
+    /// `assert_eq!(rows[0].facts["claimable"], false)` gets `true`.
+    #[test]
+    fn pin669_m1_a_null_stored_tip_reaches_the_gate_as_none_and_degrades() {
+        // the identity's FIRST owed compute coincided with a chaintracks blip: owed_state.tip is SQL NULL.
+        let prev_tip: Option<u64> = None;
+        let tip_now: Option<u64> = Some(971_115); // the present tip this request read (beef_guard::present_tip)
+        let (display_tip, gate_tip) = owed_served_tips(prev_tip, tip_now);
+        assert_eq!(
+            display_tip,
+            Some(971_115),
+            "the body still shows the present tip for a NULL stored snapshot (display unchanged)"
+        );
+        assert_eq!(
+            gate_tip, None,
+            "the gate sees the TRUE stored snapshot tip (None), never the collapsed display tip"
+        );
+        // the serve path (snapshot not fresh) feeds the GATE tip, not the display tip:
+        let mut rows = stranded_sweep_rows(971_114);
+        degrade_stale_sweeps(&mut rows, gate_tip, tip_now);
+        assert_eq!(
+            rows[0].facts["claimable"], false,
+            "a NULL stored tip cannot prove tip-current -> pending (never a dead sweep across a block)"
+        );
+        assert!(rows[0].facts["claim"].is_null());
+        assert_eq!(rows[0].facts["chainWait"], "block");
+        assert_eq!(rows[0].facts["tipUnknown"], true);
+        // a stored tip equal to the present tip is still tip-current: the body unchanged, the claim stands.
+        let (d2, g2) = owed_served_tips(Some(971_115), Some(971_115));
+        assert_eq!((d2, g2), (Some(971_115), Some(971_115)));
+        let mut rows = stranded_sweep_rows(971_115);
+        degrade_stale_sweeps(&mut rows, g2, Some(971_115));
+        assert_eq!(
+            rows[0].facts["claimable"], true,
+            "a tip-current stored snapshot is not degraded"
+        );
+    }
+
+    /// PIN M1b (characterization of the self-heal rule MEDIUM-1 leans on; GREEN on the pre-fold tip — it states the
+    /// EXISTING recompute/write behavior, unchanged by this fold). A recompute STORES the tip it computed at:
+    ///   - chaintracks answered -> `owed_write_plan` binds `Some(height)` into `OWED_STATE_UPSERT_SQL` (the gate then
+    ///     serves it tip-current, or degrades it on the next block);
+    ///   - chaintracks did not answer AND a prior tip existed -> `owed_recompute_inner` bails BEFORE the write
+    ///     (`routes.rs`: "the previous rows stand"), so a good tip is never overwritten with NULL;
+    ///   - chaintracks did not answer AND no prior tip (a FIRST compute under a blip) -> the snapshot stores NULL,
+    ///     which (a) the read-side gate degrades fail-safe (MEDIUM-1), and (b) `should_recompute` re-arms on the NEXT
+    ///     readable tip (`gate_flipped` fires for a claimable hop-stranded row when `prev_tip` is None < `tip_now`),
+    ///     so the next read with chaintracks back up stores a real tip. The NULL state is gone after one such read.
+    #[test]
+    fn pin669_m1b_a_recompute_stores_the_tip_it_computed_at_and_a_null_tip_self_heals() {
+        let rows = stranded_sweep_rows(971_115);
+        // chaintracks answered: the state upsert binds the computed height.
+        let plan = owed_write_plan(ME, &rows, 1_792_000_000_000, Some(971_115), false);
+        let binds = &plan
+            .iter()
+            .find(|(sql, _)| *sql == OWED_STATE_UPSERT_SQL)
+            .expect("the state upsert is in the write plan")
+            .1;
+        assert_eq!(
+            binds[2],
+            OwedBind::Int(971_115),
+            "a recompute stores the tip chaintracks answered"
+        );
+        // chaintracks did not answer on a first compute: the upsert binds NULL (fail-safe at read, re-armed next tip).
+        let plan = owed_write_plan(ME, &rows, 1_792_000_000_000, None, false);
+        let binds = &plan
+            .iter()
+            .find(|(sql, _)| *sql == OWED_STATE_UPSERT_SQL)
+            .expect("the state upsert is in the write plan")
+            .1;
+        assert_eq!(
+            binds[2],
+            OwedBind::Null,
+            "a tip-less first compute stores NULL (the degrade + the re-arm self-heal it)"
+        );
+        // the re-arm: a NULL prev_tip claimable hop-stranded snapshot recomputes the moment a tip is readable.
+        assert!(
+            should_recompute(false, 10_000, None, Some(971_115), &rows),
+            "a NULL-tip claimable stranded snapshot re-arms on the next readable tip (it stores a real tip)"
         );
     }
 }
