@@ -367,14 +367,16 @@ pub struct Unwalked {
 }
 
 /// The host of a GASP graph's units (bsv-low #657, the a17 seam): the
-/// dependency gate run by [`admit_graph_hosted`] asks it to resolve each
-/// body's carried bytes and to run each body, one at a time and in the
-/// gate's order (ancestors first), as one unit of the host's own log, and
-/// tells it each body's answer with the gate's reason.
+/// dependency gate run by [`admit_graph_hosted`] asks it, one body at a time
+/// and in the gate's order (ancestors first), to resolve that body's carried
+/// bytes and to run it as one unit of the host's own log, and tells it each
+/// body's answer with the gate's reason. The gate holds no body's resolved
+/// bytes past that body's unit, so the host holds one body's at a time.
 #[async_trait(?Send)]
 pub trait GraphHost {
     /// An R2-carried body's original BEEF (`BeefCarry::R2`: the object under
-    /// its key, of its length). Never asked for an inline body. A refusal is
+    /// its key, of its length), read just before that body's own unit. Never
+    /// asked for an inline body, nor for a body the gate holds. A refusal is
     /// the body's own: it opens no unit and its descendants wait on it.
     async fn resolve(&self, body: &Walked) -> Result<Vec<u8>, AdmitRefusal>;
     /// Run `body` as ONE unit of the host's log, inside the host's FIFO turn,
@@ -577,28 +579,27 @@ pub fn admit_graph_observed(
 /// the same dependency gate, in the same order, each body the gate does not
 /// hold run as one unit of the host's log through [`GraphHost::run`], each
 /// answer handed to [`GraphHost::answered`]. An R2-carried body's bytes are
-/// resolved through [`GraphHost::resolve`]; a resolve refused is that body's
-/// own refusal (its descendants wait on it).
+/// resolved through [`GraphHost::resolve`] just before its own unit and moved
+/// into it, one body at a time (never the graph's bytes at once; a held body
+/// is never read); a resolve refused is that body's own refusal (its
+/// descendants wait on it).
 pub async fn admit_graph_hosted(
     host: &dyn GraphHost,
     graph: &[Walked],
     unwalked: &[Unwalked],
 ) -> GraphOutcome {
-    // Every carried body resolved before the first unit, as a synchronous
-    // gate's caller must.
-    let mut resolved: std::collections::HashMap<usize, Result<Vec<u8>, AdmitRefusal>> =
-        std::collections::HashMap::new();
-    for (at, walked) in graph.iter().enumerate() {
-        if matches!(walked.beef, BeefCarry::R2 { .. }) {
-            resolved.insert(at, host.resolve(walked).await);
-        }
-    }
     let mut gate = Gate::new(graph, unwalked);
     while let Some((walked, held)) = gate.next() {
         let (answer, reason) = match held {
             None => {
-                let at = gate.at();
-                let answer = match resolved.remove(&at).transpose() {
+                // This body's bytes alone, read just before its own unit and
+                // moved into it: released when `run` returns, before the next
+                // body is read (the a9 lane's one-body bound).
+                let resolved = match &walked.beef {
+                    BeefCarry::R2 { .. } => host.resolve(walked).await.map(Some),
+                    BeefCarry::Inline(_) => Ok(None),
+                };
+                let answer = match resolved {
                     Ok(bytes) => host.run(walked, bytes).await,
                     Err(refusal) => Err(refusal),
                 };
@@ -630,7 +631,6 @@ struct Gate<'g> {
     graph: &'g [Walked],
     spends: Vec<Vec<String>>,
     order: std::vec::IntoIter<usize>,
-    at: usize,
     seqs: Vec<u64>,
     landed: std::collections::HashSet<String>,
     refused: BTreeMap<String, AdmitRefusal>,
@@ -668,17 +668,11 @@ impl<'g> Gate<'g> {
             graph,
             spends,
             order,
-            at: 0,
             seqs: Vec::new(),
             landed: std::collections::HashSet::new(),
             refused,
             held,
         }
-    }
-
-    /// The place in the graph of the body [`Gate::next`] named last.
-    fn at(&self) -> usize {
-        self.at
     }
 
     /// The next body, and the gate's refusal and reason when it is held: a
@@ -689,7 +683,6 @@ impl<'g> Gate<'g> {
     /// `not now`.
     fn next(&mut self) -> Option<(&'g Walked, Option<(AdmitRefusal, GateReason)>)> {
         let at = self.order.next()?;
-        self.at = at;
         let walked = &self.graph[at];
         let waiting: Vec<String> = self.spends[at]
             .iter()
