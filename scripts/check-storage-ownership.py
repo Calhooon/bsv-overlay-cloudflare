@@ -218,6 +218,13 @@ def hits_in(text):
             name = t.group(1) if t else None
             after = rest[t.end():] if t else rest
             token = rest.strip()[:24].split("\n")[0]
+            if op == "DROP" and re.search(r"\bINDEX\b", text[m.start():m.end()], re.I):
+                # A `DROP INDEX name` names an INDEX, not a table, and is DATA-safe: an index is a derived
+                # structure, so dropping it loses no row, and (unlike `CREATE INDEX ... ON tbl`) the statement
+                # carries no table to attribute. Its lifecycle is already governed by the matching CREATE INDEX
+                # grant (mapped to the ON table). Skip it — the index name is not a table (bsv-low #669C: the
+                # partial-index re-CREATE of idx_owed_rows_claimable_hop needs a DROP INDEX IF EXISTS first).
+                continue
             if op == "SELECT":
                 if re.search(r"\bDELETE\s+$", text[:m.start()], re.I):
                     continue  # the FROM of a DELETE, a write seen above
@@ -593,6 +600,9 @@ def self_test():
     nw = lambda r: any("NEVER-WIPE" in x and "`shared`" in x for x in r)
     reds, _, _ = tree(own_extra='const X: &str = "DROP TABLE IF EXISTS shared";\n')
     check("the owner's DROP of a never-wipe table is red (lens M1)", nw(reds) and any("own/src/lib.rs:3" in x for x in reds))
+    # bsv-low #669C: a DROP INDEX names an index (data-safe, no table), not a table — skipped, never a red.
+    reds, _, _ = tree(own_extra='const X: &str = "DROP INDEX IF EXISTS idx_shared_k";\n')
+    check("a DROP INDEX is skipped, not read as a table DROP (bsv-low #669C)", not any("idx_shared_k" in x for x in reds))
     reds, _, _ = tree(own_extra='const X: &str = "DELETE FROM shared";\n')
     check("the owner's DELETE with no WHERE on a never-wipe table is red (lens M1)", nw(reds) and any("no WHERE" in x for x in reds))
     reds, _, _ = tree(own_extra='const X: &str = "TRUNCATE TABLE shared";\nconst Y: &str = "ALTER TABLE shared DROP COLUMN k";\n')
