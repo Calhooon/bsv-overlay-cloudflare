@@ -118,6 +118,10 @@ struct Heard {
     gate: Option<GateReason>,
 }
 
+/// A graph's outcome as the host hears it: its root, how many bodies landed,
+/// and each body held with the gate's reason.
+type GraphHeard = (String, usize, Vec<(String, Option<GateReason>)>);
+
 fn word_of(answer: &Result<Committed, AdmitRefusal>) -> String {
     match answer {
         Ok(Committed {
@@ -140,7 +144,7 @@ struct SinkHost {
     /// Each body the host ran as a unit, in order.
     ran: RefCell<Vec<String>>,
     /// Each graph's outcome: (root, landed seqs, held (txid, gate)).
-    graphs: RefCell<Vec<(String, usize, Vec<(String, Option<GateReason>)>)>>,
+    graphs: RefCell<Vec<GraphHeard>>,
 }
 
 impl SinkHost {
@@ -231,7 +235,7 @@ struct Ran {
     submits: Vec<String>,
     heard: Vec<Vec<Heard>>,
     ran: Vec<String>,
-    graphs: Vec<(String, usize, Vec<(String, Option<GateReason>)>)>,
+    graphs: Vec<GraphHeard>,
 }
 
 /// Each tick: the log's manager errs at the finalize on that txid (`None`:
@@ -284,6 +288,12 @@ async fn run(ticks: &[Option<String>], mode: Option<AdmissionMode>, budgeted: bo
         ran,
         graphs,
     }
+}
+
+fn sorted(calls: &[String]) -> Vec<String> {
+    let mut calls = calls.to_vec();
+    calls.sort();
+    calls
 }
 
 fn print_heard(name: &str, ran: &Ran) {
@@ -419,9 +429,9 @@ async fn s1b_a_healthy_graph_under_on_is_the_off_runs_and_off_never_asks_the_hos
         assert_eq!(on.submits, Vec::<String>::new());
         assert_eq!(on.ran.len(), 3, "on: the host runs each body");
         assert_eq!(
-            (&on.peer, &on.results, &on.rows),
-            (&off.peer, &off.results, &off.rows),
-            "the peer's calls, the sync results, the rows and the cursor"
+            (sorted(&on.peer), &on.results, &on.rows),
+            (sorted(&off.peer), &off.results, &off.rows),
+            "the peer's calls (a multiset: the siblings' order is a HashMap's), the sync results, the rows and the cursor"
         );
         let off_with_host = run(&[None], Some(AdmissionMode::Off), budgeted).await;
         assert_eq!(
@@ -431,12 +441,17 @@ async fn s1b_a_healthy_graph_under_on_is_the_off_runs_and_off_never_asks_the_hos
         );
         assert_eq!(
             (
-                &off_with_host.peer,
+                sorted(&off_with_host.peer),
                 &off_with_host.results,
                 &off_with_host.rows,
-                &off_with_host.submits
+                sorted(&off_with_host.submits)
             ),
-            (&off.peer, &off.results, &off.rows, &off.submits),
+            (
+                sorted(&off.peer),
+                &off.results,
+                &off.rows,
+                sorted(&off.submits)
+            ),
         );
     }
 }

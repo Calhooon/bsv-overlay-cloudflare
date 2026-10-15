@@ -272,7 +272,7 @@ fn materialization_word(
 /// 2), by the class its word's status names: a 400 is the walk's final word
 /// (terminal: its descendants take it), a 503 "not now", anything else a
 /// fault (`Transient`: its descendants wait `not now`).
-fn walk_refusal(topic: &str, error: &EngineError) -> AdmitRefusal {
+pub(crate) fn walk_refusal(topic: &str, error: &EngineError) -> AdmitRefusal {
     match engine_error_status(error) {
         400 => AdmitRefusal::Deterministic {
             topic: topic.to_string(),

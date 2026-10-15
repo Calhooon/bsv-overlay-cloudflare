@@ -367,16 +367,14 @@ pub struct Unwalked {
 }
 
 /// The host of a GASP graph's units (bsv-low #657, the a17 seam): the
-/// dependency gate run by [`admit_graph_hosted`] asks it, one body at a time
-/// and in the gate's order (ancestors first), to resolve that body's carried
-/// bytes and to run it as one unit of the host's own log, and tells it each
-/// body's answer with the gate's reason. The gate holds no body's resolved
-/// bytes past that body's unit.
+/// dependency gate run by [`admit_graph_hosted`] asks it to resolve each
+/// body's carried bytes and to run each body, one at a time and in the
+/// gate's order (ancestors first), as one unit of the host's own log, and
+/// tells it each body's answer with the gate's reason.
 #[async_trait(?Send)]
 pub trait GraphHost {
     /// An R2-carried body's original BEEF (`BeefCarry::R2`: the object under
-    /// its key, of its length), read just before that body's own unit. Never
-    /// asked for an inline body, nor for a body the gate holds. A refusal is
+    /// its key, of its length). Never asked for an inline body. A refusal is
     /// the body's own: it opens no unit and its descendants wait on it.
     async fn resolve(&self, body: &Walked) -> Result<Vec<u8>, AdmitRefusal>;
     /// Run `body` as ONE unit of the host's log, inside the host's FIFO turn,
@@ -431,19 +429,6 @@ pub async fn gasp_unit(
         });
     }
     Ok(UnitOutput::Admitted(admitted))
-}
-
-/// [`admit_graph_observed`] with the units run by a host, one body at a time
-/// (the a17 seam): the same dependency gate, each body a unit of the host's
-/// log through [`GraphHost::run`], each R2-carried body's bytes resolved
-/// through [`GraphHost::resolve`], each answer handed to
-/// [`GraphHost::answered`].
-pub async fn admit_graph_hosted(
-    _host: &dyn GraphHost,
-    _graph: &[Walked],
-    _unwalked: &[Unwalked],
-) -> GraphOutcome {
-    GraphOutcome::AllLanded { seqs: vec![] }
 }
 
 /// GASP finalize: each body lands independently, ancestors first, under the
@@ -568,107 +553,190 @@ pub fn admit_graph_observed(
     unwalked: &[Unwalked],
     observe: &mut GraphObserver<'_>,
 ) -> GraphOutcome {
-    let bodies: std::collections::HashSet<&str> = graph
-        .iter()
-        .map(|w| w.txid.as_str())
-        .chain(unwalked.iter().map(|u| u.txid.as_str()))
-        .collect();
-    let spends: Vec<Vec<String>> = graph
-        .iter()
-        .map(|walked| {
-            spent_txids(walked)
-                .into_iter()
-                .filter(|p| bodies.contains(p.as_str()))
-                .collect()
-        })
-        .collect();
-    let mut seqs = Vec::new();
-    let mut landed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut refused: BTreeMap<String, AdmitRefusal> = BTreeMap::new();
-    let mut held = Vec::new();
-    for body in unwalked {
-        refused.insert(body.txid.clone(), body.refusal.clone());
-        held.push(HeldBody {
-            txid: body.txid.clone(),
-            refusal: body.refusal.clone(),
-            gate: None,
-        });
+    let mut gate = Gate::new(graph, unwalked);
+    while let Some((walked, held)) = gate.next() {
+        let (answer, reason) = match held {
+            None => {
+                let answer = runner.run_unit(
+                    UnitKind::Admit,
+                    &walked.evidence,
+                    Box::pin(gasp_unit(engine, walked)),
+                );
+                let reason = parent_error(&answer);
+                (answer, reason)
+            }
+            Some((refusal, reason)) => (Err(refusal), Some(reason)),
+        };
+        observe(walked, &answer, reason.as_ref());
+        gate.answer(walked, answer, reason);
     }
-    for at in ancestors_first(graph, &spends) {
-        let walked = &graph[at];
-        let waiting: Vec<String> = spends[at]
+    gate.outcome()
+}
+
+/// [`admit_graph_observed`] with the units run by a host (the a17 seam):
+/// the same dependency gate, in the same order, each body the gate does not
+/// hold run as one unit of the host's log through [`GraphHost::run`], each
+/// answer handed to [`GraphHost::answered`]. An R2-carried body's bytes are
+/// resolved through [`GraphHost::resolve`]; a resolve refused is that body's
+/// own refusal (its descendants wait on it).
+pub async fn admit_graph_hosted(
+    host: &dyn GraphHost,
+    graph: &[Walked],
+    unwalked: &[Unwalked],
+) -> GraphOutcome {
+    // Every carried body resolved before the first unit, as a synchronous
+    // gate's caller must.
+    let mut resolved: std::collections::HashMap<usize, Result<Vec<u8>, AdmitRefusal>> =
+        std::collections::HashMap::new();
+    for (at, walked) in graph.iter().enumerate() {
+        if matches!(walked.beef, BeefCarry::R2 { .. }) {
+            resolved.insert(at, host.resolve(walked).await);
+        }
+    }
+    let mut gate = Gate::new(graph, unwalked);
+    while let Some((walked, held)) = gate.next() {
+        let (answer, reason) = match held {
+            None => {
+                let at = gate.at();
+                let answer = match resolved.remove(&at).transpose() {
+                    Ok(bytes) => host.run(walked, bytes).await,
+                    Err(refusal) => Err(refusal),
+                };
+                let reason = parent_error(&answer);
+                (answer, reason)
+            }
+            Some((refusal, reason)) => (Err(refusal), Some(reason)),
+        };
+        host.answered(walked, &answer, reason.as_ref());
+        gate.answer(walked, answer, reason);
+    }
+    gate.outcome()
+}
+
+/// The gate's reason for a unit's own refusal: `ParentError` when its topic
+/// manager erred ([`gasp_unit`]'s refusal at [`GATE_PARENT_ERROR_SITE`]).
+fn parent_error(answer: &Result<Committed, AdmitRefusal>) -> Option<GateReason> {
+    matches!(answer, Err(AdmitRefusal::NotNow { site, .. }) if site == GATE_PARENT_ERROR_SITE)
+        .then_some(GateReason::ParentError)
+}
+
+/// The dependency gate (D44) over one graph, stepped one body at a time, so
+/// the synchronous [`admit_graph_observed`] and the host's
+/// [`admit_graph_hosted`] run the one rule: [`Gate::next`] names the next
+/// body in the order [`ancestors_first`] gives and, when a parent of it in
+/// the graph did not land, the refusal and reason it is held with (it opens
+/// no unit); [`Gate::answer`] records the body's answer.
+struct Gate<'g> {
+    graph: &'g [Walked],
+    spends: Vec<Vec<String>>,
+    order: std::vec::IntoIter<usize>,
+    at: usize,
+    seqs: Vec<u64>,
+    landed: std::collections::HashSet<String>,
+    refused: BTreeMap<String, AdmitRefusal>,
+    held: Vec<HeldBody>,
+}
+
+impl<'g> Gate<'g> {
+    fn new(graph: &'g [Walked], unwalked: &[Unwalked]) -> Self {
+        let bodies: std::collections::HashSet<&str> = graph
             .iter()
-            .filter(|p| !landed.contains(*p) && refused.contains_key(*p))
+            .map(|w| w.txid.as_str())
+            .chain(unwalked.iter().map(|u| u.txid.as_str()))
+            .collect();
+        let spends: Vec<Vec<String>> = graph
+            .iter()
+            .map(|walked| {
+                spent_txids(walked)
+                    .into_iter()
+                    .filter(|p| bodies.contains(p.as_str()))
+                    .collect()
+            })
+            .collect();
+        let mut refused = BTreeMap::new();
+        let mut held = Vec::new();
+        for body in unwalked {
+            refused.insert(body.txid.clone(), body.refusal.clone());
+            held.push(HeldBody {
+                txid: body.txid.clone(),
+                refusal: body.refusal.clone(),
+                gate: None,
+            });
+        }
+        let order = ancestors_first(graph, &spends).into_iter();
+        Self {
+            graph,
+            spends,
+            order,
+            at: 0,
+            seqs: Vec::new(),
+            landed: std::collections::HashSet::new(),
+            refused,
+            held,
+        }
+    }
+
+    /// The place in the graph of the body [`Gate::next`] named last.
+    fn at(&self) -> usize {
+        self.at
+    }
+
+    /// The next body, and the gate's refusal and reason when it is held: a
+    /// parent it spends that is a body of this graph and did not land in
+    /// this graph (refused, held or unwalked) holds it, with the parent's
+    /// typed word when that is terminal (`Lookup`, `Deterministic`, naming
+    /// the parent: D34's unit-wide refusal reaches its descendants), else
+    /// `not now`.
+    fn next(&mut self) -> Option<(&'g Walked, Option<(AdmitRefusal, GateReason)>)> {
+        let at = self.order.next()?;
+        self.at = at;
+        let walked = &self.graph[at];
+        let waiting: Vec<String> = self.spends[at]
+            .iter()
+            .filter(|p| !self.landed.contains(*p) && self.refused.contains_key(*p))
             .cloned()
             .collect();
-        let (answer, gate) = if waiting.is_empty() {
-            let manager_failed = std::cell::Cell::new(false);
-            let answer = runner.run_unit(
-                UnitKind::Admit,
-                &walked.evidence,
-                Box::pin(async {
-                    let admitted = engine.admit(walked).await?;
-                    let failed: Vec<&String> = walked
-                        .topics
-                        .iter()
-                        .filter(|t| {
-                            !admitted.report.applied_topics.contains(t)
-                                && !admitted.report.deduped_topics.contains(t)
-                        })
-                        .collect();
-                    if !failed.is_empty() {
-                        manager_failed.set(true);
-                        return Err(AdmitRefusal::NotNow {
-                            site: GATE_PARENT_ERROR_SITE.into(),
-                            reason: format!(
-                                "the topic manager failed on it ({}): its descendants wait",
-                                failed
-                                    .iter()
-                                    .map(|t| t.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ),
-                            notes: admitted.notes,
-                            predecessor: None,
-                        });
-                    }
-                    Ok(UnitOutput::Admitted(admitted))
-                }),
-            );
-            let gate = (answer.is_err() && manager_failed.get()).then_some(GateReason::ParentError);
-            (answer, gate)
-        } else {
-            let terminal = waiting.iter().find_map(|p| {
-                let mut refusal = refused[p].clone();
-                match &mut refusal {
-                    AdmitRefusal::Lookup { refused_parent, .. }
-                    | AdmitRefusal::Deterministic { refused_parent, .. } => {
-                        refused_parent.get_or_insert_with(|| p.as_str().into());
-                        Some(refusal)
-                    }
-                    _ => None,
+        if waiting.is_empty() {
+            return Some((walked, None));
+        }
+        let terminal = waiting.iter().find_map(|p| {
+            let mut refusal = self.refused[p].clone();
+            match &mut refusal {
+                AdmitRefusal::Lookup { refused_parent, .. }
+                | AdmitRefusal::Deterministic { refused_parent, .. } => {
+                    refused_parent.get_or_insert_with(|| p.as_str().into());
+                    Some(refusal)
                 }
-            });
-            let refusal = terminal.unwrap_or_else(|| {
-                AdmitRefusal::not_now(
-                    GATE_WAITING_SITE,
-                    format!("waiting on {}", waiting.join(", ")),
-                )
-            });
-            (Err(refusal), Some(GateReason::WaitingOn(waiting)))
-        };
-        observe(walked, &answer, gate.as_ref());
+                _ => None,
+            }
+        });
+        let refusal = terminal.unwrap_or_else(|| {
+            AdmitRefusal::not_now(
+                GATE_WAITING_SITE,
+                format!("waiting on {}", waiting.join(", ")),
+            )
+        });
+        Some((walked, Some((refusal, GateReason::WaitingOn(waiting)))))
+    }
+
+    /// Record `walked`'s answer and the gate's reason.
+    fn answer(
+        &mut self,
+        walked: &Walked,
+        answer: Result<Committed, AdmitRefusal>,
+        gate: Option<GateReason>,
+    ) {
         match answer {
             Ok(committed) => {
-                seqs.push(committed.seq);
-                refused.remove(&walked.txid);
-                landed.insert(walked.txid.clone());
+                self.seqs.push(committed.seq);
+                self.refused.remove(&walked.txid);
+                self.landed.insert(walked.txid.clone());
             }
             Err(refusal) => {
-                if !landed.contains(&walked.txid) {
-                    refused.insert(walked.txid.clone(), refusal.clone());
+                if !self.landed.contains(&walked.txid) {
+                    self.refused.insert(walked.txid.clone(), refusal.clone());
                 }
-                held.push(HeldBody {
+                self.held.push(HeldBody {
                     txid: walked.txid.clone(),
                     refusal,
                     gate,
@@ -676,10 +744,16 @@ pub fn admit_graph_observed(
             }
         }
     }
-    if held.is_empty() {
-        GraphOutcome::AllLanded { seqs }
-    } else {
-        GraphOutcome::Held { landed: seqs, held }
+
+    fn outcome(self) -> GraphOutcome {
+        if self.held.is_empty() {
+            GraphOutcome::AllLanded { seqs: self.seqs }
+        } else {
+            GraphOutcome::Held {
+                landed: self.seqs,
+                held: self.held,
+            }
+        }
     }
 }
 

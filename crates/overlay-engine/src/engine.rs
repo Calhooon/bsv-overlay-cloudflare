@@ -10,6 +10,8 @@ use crate::beef_limits;
 
 mod atomic;
 #[cfg(feature = "gasp-shadow")]
+mod gasp_on;
+#[cfg(feature = "gasp-shadow")]
 mod gasp_shadow;
 
 use bsv_rs::transaction::{Beef, Transaction};
@@ -5766,6 +5768,15 @@ impl Engine {
         topic: &str,
         submitted: &std::cell::Cell<u64>,
     ) -> bool {
+        // Under `on` the graphs are the host's (the a17 seam): the engine's
+        // own submit below does not run. Under `off` and `shadow` nothing
+        // here awaits.
+        #[cfg(feature = "gasp-shadow")]
+        if let Some(host) = self.gasp_finalize_host() {
+            return self
+                .finalize_on(host, sink, peer_url, topic, submitted)
+                .await;
+        }
         let finalized: Vec<_> = sink
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
