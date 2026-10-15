@@ -1233,7 +1233,10 @@ fn w6_the_mode_is_the_workers_word() {
         AdmissionMode::parse(Some("shadow")),
         Ok(AdmissionMode::Shadow)
     );
-    assert!(AdmissionMode::parse(Some("on"))
+    // The a17 seam: `on` is the engine's word, taken only where the
+    // finalize seam is set (`gasp_on_seam` s2).
+    assert_eq!(AdmissionMode::parse(Some("on")), Ok(AdmissionMode::On));
+    assert!(AdmissionMode::parse(Some("yes"))
         .unwrap_err()
-        .contains("is not enabled"));
+        .contains("unsupported ADMISSION_MODE"));
 }

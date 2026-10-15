@@ -1169,7 +1169,9 @@ impl Engine {
     /// [`crate::gasp_shadow`]). Under [`crate::gasp_shadow::AdmissionMode::Shadow`]
     /// every GASP finalize body and graph is compared on a fresh snapshot the
     /// `host` takes, and one census row each is handed to it; the served
-    /// finalize is unchanged. Under `Off` the host is never asked.
+    /// finalize is unchanged. Under `Off` the host is never asked. The mode
+    /// is set as [`Engine::set_admission_mode`] sets it (`On` refused where
+    /// no finalize host is set; the host is kept either way).
     #[cfg(feature = "gasp-shadow")]
     pub fn set_gasp_shadow(
         &mut self,
@@ -1201,6 +1203,9 @@ impl Engine {
         &mut self,
         mode: crate::gasp_shadow::AdmissionMode,
     ) -> Result<(), crate::gasp_shadow::AdmissionModeRefused> {
+        if mode == crate::gasp_shadow::AdmissionMode::On && self.gasp_finalize.is_none() {
+            return Err(crate::gasp_shadow::AdmissionModeRefused::NoFinalizeHost);
+        }
         self.admission_mode = mode;
         Ok(())
     }

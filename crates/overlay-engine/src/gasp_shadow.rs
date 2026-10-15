@@ -40,7 +40,8 @@ use crate::engine::{Engine, EngineError, MutationReport};
 use crate::types::Steak;
 
 /// The engine's word for `ADMISSION_MODE`, as the Worker's (`off` default,
-/// `shadow` accepted, `on` refused until the log runner exists).
+/// `shadow`, and `on`, which the engine takes only where its GASP finalize
+/// seam is set: [`crate::engine::Engine::set_admission_mode`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionMode {
     #[default]
@@ -136,10 +137,7 @@ impl AdmissionMode {
         match value {
             None | Some("off") => Ok(Self::Off),
             Some("shadow") => Ok(Self::Shadow),
-            Some("on") => Err(
-                "ADMISSION_MODE=on is not enabled: the admission log runner is a later slice"
-                    .into(),
-            ),
+            Some("on") => Ok(Self::On),
             Some(other) => Err(format!("unsupported ADMISSION_MODE: {other}")),
         }
     }
