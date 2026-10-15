@@ -101,9 +101,10 @@ impl FinalizeBody<'_> {
 /// body [`crate::admission::gasp_unit`]), so the finalize's one
 /// materialization is the host's. The engine writes nothing of a graph. The
 /// cursor follows the host's word: [`Self::graph_done`] says whether the
-/// cursor may pass the graph (by default only when every body landed; a
-/// graph with a held body stays below it, so the peer's next sync re-sends
-/// the waiting part).
+/// cursor may pass the graph (by default [`cursor_may_pass`]: every body
+/// landed or held by a terminal word; a graph with a body held `not now` or
+/// transient stays below it, so the peer's next sync re-sends the waiting
+/// part).
 #[async_trait(?Send)]
 pub trait GaspFinalizeHost {
     /// An R2-carried body's original bytes, asked just before its own unit
@@ -126,9 +127,31 @@ pub trait GaspFinalizeHost {
         _gate: Option<&GateReason>,
     ) {
     }
-    /// The graph's outcome; `true` lets the cursor pass it.
+    /// The graph's outcome; `true` lets the cursor pass it. By default
+    /// [`cursor_may_pass`].
     async fn graph_done(&self, _graph: &FinalizeGraph<'_>, outcome: &GraphOutcome) -> bool {
-        matches!(outcome, GraphOutcome::AllLanded { .. })
+        cursor_may_pass(outcome)
+    }
+}
+
+/// The cursor's rule under [`AdmissionMode::On`] (the seam lens's L3): the
+/// cursor may pass a graph once every body of it landed or is held by a
+/// TERMINAL word (`Lookup`, `Deterministic`: its own, or a parent's the
+/// dependency gate passed on), as the reference moves past a refused graph
+/// and the anchor check's refusal moves it. A body held `not now` or
+/// transient (a manager error, a parent waiting on one, a host fault) holds
+/// the cursor below the graph, so the peer's next sync re-sends it. Without
+/// it a graph holding a terminal refusal was re-fetched and re-judged on
+/// every tick for good.
+pub fn cursor_may_pass(outcome: &GraphOutcome) -> bool {
+    match outcome {
+        GraphOutcome::AllLanded { .. } => true,
+        GraphOutcome::Held { held, .. } => held.iter().all(|body| {
+            matches!(
+                body.refusal,
+                AdmitRefusal::Lookup { .. } | AdmitRefusal::Deterministic { .. }
+            )
+        }),
     }
 }
 
