@@ -166,7 +166,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bsv-middleware-core",
- "bsv-rs 0.6.0",
+ "bsv-rs",
  "console_error_panic_hook",
  "futures",
  "getrandom",
@@ -189,7 +189,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa30141c960f70f200e93cf68e9f31acdd3711b6ef2918fa6f410974b0959f4e"
 dependencies = [
  "async-trait",
- "bsv-rs 0.6.0",
+ "bsv-rs",
  "getrandom",
  "hex",
  "hmac",
@@ -208,7 +208,7 @@ dependencies = [
  "bsv-middleware-cloudflare",
  "bsv-overlay-discovery",
  "bsv-overlay-engine",
- "bsv-rs 0.6.0",
+ "bsv-rs",
  "bsv-worker-build-info",
  "hex",
  "js-sys",
@@ -228,7 +228,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bsv-overlay-engine",
- "bsv-rs 0.6.0",
+ "bsv-rs",
  "hex",
  "js-sys",
  "serde",
@@ -243,46 +243,12 @@ name = "bsv-overlay-engine"
 version = "0.1.15"
 dependencies = [
  "async-trait",
- "bsv-rs 0.6.0",
+ "bsv-rs",
  "js-sys",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
-]
-
-[[package]]
-name = "bsv-rs"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72a8372f5500535f1d192765d88e123fc41c363b423516157a8fc7e5ae9326f0"
-dependencies = [
- "aes",
- "aes-gcm",
- "async-trait",
- "base64",
- "bs58",
- "cbc",
- "futures",
- "getrandom",
- "hex",
- "hmac",
- "k256",
- "lazy_static",
- "num-bigint",
- "num-integer",
- "num-traits",
- "p256",
- "pbkdf2",
- "rand",
- "ripemd",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "subtle",
- "thiserror 1.0.69",
- "urlencoding",
 ]
 
 [[package]]
@@ -324,11 +290,11 @@ dependencies = [
 
 [[package]]
 name = "bsv-tracker"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e807f07936e687ac9fe5b2abefc4ac7239de6e7e06899823dcacceb8c84c0fb1"
+checksum = "590106cb780bec9249550442e94f852e17b73c0b155252196bb8e129ad2625ab"
 dependencies = [
- "bsv-rs 0.5.0",
+ "bsv-rs",
  "serde",
  "serde_json",
 ]
@@ -996,7 +962,7 @@ dependencies = [
  "bsv-overlay-cloudflare",
  "bsv-overlay-discovery",
  "bsv-overlay-engine",
- "bsv-rs 0.6.0",
+ "bsv-rs",
  "bsv-tracker",
  "bsv-worker-build-info",
  "console_error_panic_hook",
