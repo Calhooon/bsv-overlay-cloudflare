@@ -239,7 +239,6 @@ pub async fn table_columns(db: &D1Database, table: &str) -> Vec<ColumnInfo> {
         .unwrap_or_default()
 }
 
-
 /// Make sure the twin exists and carries every column the source has now (over the shadow storage: D1 in
 /// production, SQLite under the pins).
 async fn ensure_shadow(db: &dyn ShadowDb, table: &str, cols: &[ColumnInfo]) -> Result<(), String> {
@@ -546,7 +545,12 @@ async fn table_columns_checked(db: &D1Database, table: &str) -> Result<Vec<Colum
 
 /// The keyed rows a table holds NOW, or the fault (never a silent zero: loop 18; a COUNT that answers no row at
 /// all is a fault too — the gate's NIT).
-async fn count_keyed_checked(db: &D1Database, table: &str, key: &str, txid: &str) -> Result<u64, String> {
+async fn count_keyed_checked(
+    db: &D1Database,
+    table: &str,
+    key: &str,
+    txid: &str,
+) -> Result<u64, String> {
     #[derive(serde::Deserialize)]
     struct C {
         c: i64,
@@ -749,7 +753,9 @@ pub async fn shadow_move_passes(
     if skip_verification {
         // a readmission stamped after this pass began: its restore stands; the first pass's faults are its own
         for (where_, e) in pass1_faults {
-            report.incomplete.push(format!("{where_}: {e} (no verification pass: a readmission landed under this pass)"));
+            report.incomplete.push(format!(
+                "{where_}: {e} (no verification pass: a readmission landed under this pass)"
+            ));
         }
         return report;
     }
@@ -768,7 +774,9 @@ pub async fn shadow_move_passes(
                         take(&mut report, table, m, vouts);
                         match db.count(table, key, txid).await {
                             Ok(0) => Ok(()),
-                            Ok(left) => Err(format!("{left} row(s) still present after the second move")),
+                            Ok(left) => {
+                                Err(format!("{left} row(s) still present after the second move"))
+                            }
                             Err(e) => Err(format!("the recount faulted ({e})")),
                         }
                     }
@@ -785,7 +793,9 @@ pub async fn shadow_move_passes(
                         .find(|(w, _)| *w == where_)
                         .map(|(_, e)| e.clone())
                         .unwrap_or_default();
-                    report.retried.push(format!("{where_}: first pass {e}; the verification pass found it clean"));
+                    report.retried.push(format!(
+                        "{where_}: first pass {e}; the verification pass found it clean"
+                    ));
                 }
             }
             Err(e) => report.incomplete.push(format!("{where_}: {e}")),
@@ -793,7 +803,10 @@ pub async fn shadow_move_passes(
     }
     // a first-pass fault on a table the verification pass never saw (its columns were unreadable in pass 1)
     for (where_, e) in pass1_faults {
-        if !moved_tables.iter().any(|(t, k, _)| format!("{t} by {k}") == where_) {
+        if !moved_tables
+            .iter()
+            .any(|(t, k, _)| format!("{t} by {k}") == where_)
+        {
             report.incomplete.push(format!("{where_}: {e}"));
         }
     }
@@ -925,7 +938,12 @@ pub async fn guard_landed(db: &D1Database, landed: &[(String, String)], origin: 
             Ok(Some(ev)) => {
                 let now_ms = worker::Date::now().as_millis();
                 let outcome = evict_txid_everywhere(db, txid, &ev.reason, now_ms).await;
-                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1).await;
+                crate::ops::bump_counter(
+                    db,
+                    crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
+                    1,
+                )
+                .await;
                 worker::console_log!(
                     "{origin}: {txid}, landed first into {topic} from a successor's BEEF, is under an OPEN eviction (at {} ms — {}): re-evicted {} row(s)",
                     ev.evicted_at_ms,
@@ -935,7 +953,8 @@ pub async fn guard_landed(db: &D1Database, landed: &[(String, String)], origin: 
             }
             Ok(None) => {}
             Err(e) => {
-                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1).await;
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1)
+                    .await;
                 worker::console_log!(
                     "{origin}: the eviction ledger could not be read for {txid}, landed first into {topic} ({e}); not asked again"
                 );
@@ -1094,7 +1113,11 @@ pub struct EvictionCore {
 }
 
 /// The ledger's readmission stamp newer than a pass's own (the gate's LOW-4 / NEW-1), over the shadow storage.
-async fn readmitted_after(db: &dyn ShadowDb, txid: &str, now_ms: u64) -> Result<Option<i64>, String> {
+async fn readmitted_after(
+    db: &dyn ShadowDb,
+    txid: &str,
+    now_ms: u64,
+) -> Result<Option<i64>, String> {
     db.query_i64(
         READMITTED_AFTER_SQL,
         vec![QVal::Text(txid.to_string()), QVal::Int(now_ms as i64)],
@@ -1127,12 +1150,16 @@ pub async fn evict_core(db: &dyn ShadowDb, txid: &str, reason: &str, now_ms: u64
     }
     match readmitted_after(db, txid, now_ms).await {
         Ok(Some(at)) => {
-            core.notes.push(format!("a readmission at {at} ms stands over this pass ({now_ms} ms): nothing moved"));
+            core.notes.push(format!(
+                "a readmission at {at} ms stands over this pass ({now_ms} ms): nothing moved"
+            ));
             core.yielded_to_readmission = Some(at);
             return core;
         }
         Ok(None) => {}
-        Err(e) => core.notes.push(format!("the readmission read faulted before the passes ({e}) — the passes run")),
+        Err(e) => core.notes.push(format!(
+            "the readmission read faulted before the passes ({e}) — the passes run"
+        )),
     }
     let report = shadow_move_passes(db, txid, reason, now_ms, false).await;
     core.moved = report.moved;
@@ -1149,12 +1176,17 @@ pub async fn evict_core(db: &dyn ShadowDb, txid: &str, reason: &str, now_ms: u64
                 core.moved
             ));
             core.restored = restored;
-            core.restore_faults = faults.iter().map(|f| format!("yielding to the readmission: {f}")).collect();
+            core.restore_faults = faults
+                .iter()
+                .map(|f| format!("yielding to the readmission: {f}"))
+                .collect();
             core.faults.extend(core.restore_faults.iter().cloned());
             core.yielded_to_readmission = Some(at);
         }
         Ok(None) => {}
-        Err(e) => core.faults.push(format!("the readmission read faulted after the passes ({e})")),
+        Err(e) => core.faults.push(format!(
+            "the readmission read faulted after the passes ({e})"
+        )),
     }
     core
 }
@@ -1322,14 +1354,18 @@ pub async fn evict_txid_everywhere_repointed(
         if !core.restore_faults.is_empty() {
             let (in_twins, twins_unreadable) = twin_rows_of(db, &txid).await;
             if in_twins > 0 || twins_unreadable {
-                if let Err(e) = Query::new("UPDATE pot_evictions SET readmittedAt = NULL WHERE txid = ?")
-                    .bind(txid.as_str())
-                    .execute(db)
-                    .await
+                if let Err(e) =
+                    Query::new("UPDATE pot_evictions SET readmittedAt = NULL WHERE txid = ?")
+                        .bind(txid.as_str())
+                        .execute(db)
+                        .await
                 {
-                    worker::console_log!("[admit-fast] evict {txid}: re-opening after a faulted yield failed ({e})");
+                    worker::console_log!(
+                        "[admit-fast] evict {txid}: re-opening after a faulted yield failed ({e})"
+                    );
                 }
-                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_READMIT_INCOMPLETE, 1).await;
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_READMIT_INCOMPLETE, 1)
+                    .await;
                 worker::console_log!(
                     "[admit-fast] evict {txid}: the yield's restore faulted with {in_twins} row(s) still in the twins (unreadable: {twins_unreadable}) — the row re-opened"
                 );
@@ -1453,11 +1489,13 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
     // the stamp is THIS moment's clock (round 3, residual A): a pass whose clock read predates this restore but
     // whose marker lands after it must read the readmission as newer
     let stamp_ms = worker::Date::now().as_millis();
-    if let Err(e) = Query::new("UPDATE pot_evictions SET readmittedAt = ? WHERE txid = ? AND readmittedAt IS NULL")
-        .bind(QVal::Int(stamp_ms as i64))
-        .bind(txid.as_str())
-        .execute(db)
-        .await
+    if let Err(e) = Query::new(
+        "UPDATE pot_evictions SET readmittedAt = ? WHERE txid = ? AND readmittedAt IS NULL",
+    )
+    .bind(QVal::Int(stamp_ms as i64))
+    .bind(txid.as_str())
+    .execute(db)
+    .await
     {
         worker::console_log!("[admit-fast] readmit {txid}: the stamp failed ({e}) — the row stays open (the rows are back; the next accept or proof stamps it)");
         crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_READMIT_INCOMPLETE, 1).await;
@@ -1520,14 +1558,16 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
             // only while the twins still hold the txid, count, the next pass restores
             let (left, unreadable) = twin_rows_of(db, &txid).await;
             if left > 0 || unreadable {
-                if let Err(e) = Query::new("UPDATE pot_evictions SET readmittedAt = NULL WHERE txid = ?")
-                    .bind(txid.as_str())
-                    .execute(db)
-                    .await
+                if let Err(e) =
+                    Query::new("UPDATE pot_evictions SET readmittedAt = NULL WHERE txid = ?")
+                        .bind(txid.as_str())
+                        .execute(db)
+                        .await
                 {
                     worker::console_log!("[admit-fast] readmit {txid}: re-opening after the belt's faulted restore failed ({e})");
                 }
-                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_READMIT_INCOMPLETE, 1).await;
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_READMIT_INCOMPLETE, 1)
+                    .await;
                 return false;
             }
         }
@@ -2046,39 +2086,40 @@ struct AgeRow {
 /// ms) with the pot row's `createdAt` (seconds) as the fallback; `None` when the index holds no admission.
 pub async fn admission_age_ms(db: &D1Database, txid: &str, now_ms: u64) -> Option<u64> {
     let txid = txid.to_ascii_lowercase();
-    let stamp_ms: Option<f64> = match Query::new("SELECT MIN(score) AS s FROM outputs WHERE txid = ?")
-        .bind(txid.as_str())
-        .fetch_optional::<AgeRow>(db)
-        .await
-    {
-        Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s),
-        // #519 (the delta-verify's observation): an EVICTED subject's outputs live in the twin with the admission's
-        // own stamp — without this rung a hop or a marker the eviction moved read "young" forever at the door
-        _ => match Query::new("SELECT MIN(score) AS s FROM outputs_evicted WHERE txid = ?")
+    let stamp_ms: Option<f64> =
+        match Query::new("SELECT MIN(score) AS s FROM outputs WHERE txid = ?")
             .bind(txid.as_str())
             .fetch_optional::<AgeRow>(db)
             .await
         {
             Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s),
-            _ => match Query::new("SELECT MIN(createdAt) AS s FROM pot_records WHERE txid = ?")
-            .bind(txid.as_str())
-            .fetch_optional::<AgeRow>(db)
-            .await
-        {
-            Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s * 1000.0),
-            // a spender (a settle, a refund, a sweep) admits no output and holds no pot row: its BEEF's
-            // first-store stamp (seconds) is the third rung (the gate's NEW-6)
-            _ => match Query::new("SELECT createdAt AS s FROM pot_beefs WHERE txid = ?")
+            // #519 (the delta-verify's observation): an EVICTED subject's outputs live in the twin with the admission's
+            // own stamp — without this rung a hop or a marker the eviction moved read "young" forever at the door
+            _ => match Query::new("SELECT MIN(score) AS s FROM outputs_evicted WHERE txid = ?")
                 .bind(txid.as_str())
                 .fetch_optional::<AgeRow>(db)
                 .await
             {
-                Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s * 1000.0),
-                _ => None,
+                Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s),
+                _ => match Query::new("SELECT MIN(createdAt) AS s FROM pot_records WHERE txid = ?")
+                    .bind(txid.as_str())
+                    .fetch_optional::<AgeRow>(db)
+                    .await
+                {
+                    Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s * 1000.0),
+                    // a spender (a settle, a refund, a sweep) admits no output and holds no pot row: its BEEF's
+                    // first-store stamp (seconds) is the third rung (the gate's NEW-6)
+                    _ => match Query::new("SELECT createdAt AS s FROM pot_beefs WHERE txid = ?")
+                        .bind(txid.as_str())
+                        .fetch_optional::<AgeRow>(db)
+                        .await
+                    {
+                        Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s * 1000.0),
+                        _ => None,
+                    },
+                },
             },
-            },
-        },
-    };
+        };
     stamp_ms.map(|s| (now_ms as f64 - s).max(0.0) as u64)
 }
 
@@ -2379,7 +2420,8 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
             cas_faults,
             height,
         } if rows >= 1 => {
-            crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_CONFIRMED_NOW, 1).await;
+            crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_CONFIRMED_NOW, 1)
+                .await;
             worker::console_log!(
                 "[admit-fast] {txid} CONFIRMED by the watch's own proof read (height {height:?}; {rows} row(s), {cas_missed} CAS miss(es), {cas_faults} CAS fault(s)) — the block had come before the index saw the spend"
             );
@@ -2664,7 +2706,12 @@ mod tests {
         };
         assert_eq!(
             confirm_spend_now_with(&store, &proven, &spender).await,
-            ConfirmNow::Confirmed { rows: 1, cas_missed: 0, cas_faults: 0, height: Some(967_603) }
+            ConfirmNow::Confirmed {
+                rows: 1,
+                cas_missed: 0,
+                cas_faults: 0,
+                height: Some(967_603)
+            }
         );
         let r = store.get_spent_status(&pot, 0).await.unwrap().unwrap();
         assert!(r.spent_confirmed);
@@ -2687,8 +2734,14 @@ mod tests {
     fn the_watch_end_confirm_asks_the_couriers_once_a_minute_per_txid() {
         assert!(!confirm_now_memoised(None, 1e12));
         assert!(confirm_now_memoised(Some(1e12), 1e12 + 1.0));
-        assert!(confirm_now_memoised(Some(1e12), 1e12 + CONFIRM_NOW_MEMO_MS - 1.0));
-        assert!(!confirm_now_memoised(Some(1e12), 1e12 + CONFIRM_NOW_MEMO_MS));
+        assert!(confirm_now_memoised(
+            Some(1e12),
+            1e12 + CONFIRM_NOW_MEMO_MS - 1.0
+        ));
+        assert!(!confirm_now_memoised(
+            Some(1e12),
+            1e12 + CONFIRM_NOW_MEMO_MS
+        ));
     }
 
     /// The watch fits the post-response budget (gate LOW-1: eviction of the
@@ -3044,7 +3097,11 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         // round 5 (N7): the advert row's own end state — moved, then restored with its coalesced createdAt
-        assert_eq!(count(&conn, "low_records", "txid", &pot), 1, "the advert row restored (its expression-default createdAt coalesced)");
+        assert_eq!(
+            count(&conn, "low_records", "txid", &pot),
+            1,
+            "the advert row restored (its expression-default createdAt coalesced)"
+        );
         assert_eq!(count(&conn, "low_records_evicted", "txid", &pot), 0);
     }
 
@@ -3105,7 +3162,10 @@ mod tests {
         let verified = f
             .find("crate::proof_fetcher::verify_bump(tracker, &merkle_path, &txid)")
             .expect("the bump verification");
-        assert!(verified < readmit, "the readmission follows the verified bump, never precedes it");
+        assert!(
+            verified < readmit,
+            "the readmission follows the verified bump, never precedes it"
+        );
     }
 
     /// The spends an evicted tx left on the rows it CONSUMED are released at
@@ -3280,7 +3340,9 @@ mod tests {
         );
         let readmit = &src[src.find("pub async fn readmit_if_evicted(").unwrap()..];
         let readmit = &readmit[..readmit.find("pub enum EvidenceVerdict").unwrap()];
-        let restore = readmit.find("restore_twins(db, &txid)").expect("the restore");
+        let restore = readmit
+            .find("restore_twins(db, &txid)")
+            .expect("the restore");
         let remark = readmit
             .find("remark_spends(db, &txid, &released, now_ms)")
             .expect("the re-mark");
@@ -3331,8 +3393,11 @@ mod tests {
         let conn = shipped_conn();
         let pot = "ab".repeat(32);
         let open = |at: i64, reason: &str| {
-            conn.execute(OPEN_EVICTION_MARKER_SQL, rusqlite::params![&pot, reason, at])
-                .unwrap()
+            conn.execute(
+                OPEN_EVICTION_MARKER_SQL,
+                rusqlite::params![&pot, reason, at],
+            )
+            .unwrap()
         };
         let close = |at: i64, reason: &str, moved: i64, released: &str| {
             conn.execute(
@@ -3366,27 +3431,49 @@ mod tests {
         };
         assert_eq!(guard(), None, "nothing open before any eviction");
         open(1_000, "REJECTED (a)");
-        assert_eq!(row(), ("REJECTED (a)".into(), 1_000, None, 0, Some("[]".into())));
-        assert_eq!(guard(), Some(("REJECTED (a)".into(), 1_000)), "open from the marker on");
+        assert_eq!(
+            row(),
+            ("REJECTED (a)".into(), 1_000, None, 0, Some("[]".into()))
+        );
+        assert_eq!(
+            guard(),
+            Some(("REJECTED (a)".into(), 1_000)),
+            "open from the marker on"
+        );
         // a concurrent second eviction of the same txid: the first open stamp stands
         open(1_500, "REJECTED (b)");
         assert_eq!(row().1, 1_000, "the first open stamp is kept");
         // the close ADDS the pass's rows and records the list; a later close with '[]' keeps it
-        close(1_000, "REJECTED (a)", 3, r#"[{"table":"pot_records","txid":"cd","vout":0}]"#);
+        close(
+            1_000,
+            "REJECTED (a)",
+            3,
+            r#"[{"table":"pot_records","txid":"cd","vout":0}]"#,
+        );
         close(1_500, "REJECTED (b)", 2, "[]");
         let r = row();
-        assert_eq!((r.1, r.3), (1_000, 5), "both passes' rows added; the stamp unmoved");
+        assert_eq!(
+            (r.1, r.3),
+            (1_000, 5),
+            "both passes' rows added; the stamp unmoved"
+        );
         assert_eq!(
             r.4.as_deref(),
             Some(r#"[{"table":"pot_records","txid":"cd","vout":0}]"#),
             "an empty later list never erases the first"
         );
         // readmitted: the guard sees nothing; a new eviction re-opens with the NEW stamp and fresh counts
-        conn.execute("UPDATE pot_evictions SET readmittedAt = 2000 WHERE txid = ?1", [&pot])
-            .unwrap();
+        conn.execute(
+            "UPDATE pot_evictions SET readmittedAt = 2000 WHERE txid = ?1",
+            [&pot],
+        )
+        .unwrap();
         assert_eq!(guard(), None, "a readmitted row is not open");
         open(3_000, "REJECTED (c)");
-        assert_eq!(row(), ("REJECTED (c)".into(), 3_000, None, 0, Some("[]".into())));
+        assert_eq!(
+            row(),
+            ("REJECTED (c)".into(), 3_000, None, 0, Some("[]".into()))
+        );
         close(3_000, "REJECTED (c)", 1, "[]");
         assert_eq!(row().3, 1, "fresh counts after a readmission");
         // a close with NO open marker (the marker faulted) still leaves the row
@@ -3434,7 +3521,10 @@ mod tests {
             mv(t);
         }
         assert_eq!(count(&conn, "outputs", "txid", &pot), 0);
-        assert_eq!(count(&conn, "applied_transactions_evicted", "txid", &pot), 1);
+        assert_eq!(
+            count(&conn, "applied_transactions_evicted", "txid", &pot),
+            1
+        );
         // …then the write lands the pot row and the tm_lowfund applied row (pair 11's 12.8 s Phase 3)
         conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, 0, 1789959998, 'covenant')", [&pot]).unwrap();
         conn.execute(
@@ -3523,29 +3613,62 @@ mod tests {
         // the core: the marker → the readmission check → the passes → the readmission check again → the restore
         let core = &src[src.find("pub async fn evict_core(").unwrap()..];
         let core = &core[..core.find("\n}\n").unwrap()];
-        let marker = core.find("OPEN_EVICTION_MARKER_SQL").expect("the open marker");
-        let pre = core.find("match readmitted_after(db, txid, now_ms).await").expect("the readmission check before the passes");
+        let marker = core
+            .find("OPEN_EVICTION_MARKER_SQL")
+            .expect("the open marker");
+        let pre = core
+            .find("match readmitted_after(db, txid, now_ms).await")
+            .expect("the readmission check before the passes");
         let passes = core
             .find("shadow_move_passes(db, txid, reason, now_ms, false)")
             .expect("the two passes, over the shadow storage");
-        let post = core[passes..].find("match readmitted_after(db, txid, now_ms).await").expect("the readmission check after the passes") + passes;
-        let restore = core[post..].find("restore_twins(db, txid)").expect("the pass yields: its own moves restored") + post;
-        assert!(marker < pre && pre < passes && passes < post && post < restore, "marker → check → passes → check → restore");
-        assert!(core[pre..passes].contains("return core;"), "a readmission found BEFORE the passes: nothing moves");
+        let post = core[passes..]
+            .find("match readmitted_after(db, txid, now_ms).await")
+            .expect("the readmission check after the passes")
+            + passes;
+        let restore = core[post..]
+            .find("restore_twins(db, txid)")
+            .expect("the pass yields: its own moves restored")
+            + post;
+        assert!(
+            marker < pre && pre < passes && passes < post && post < restore,
+            "marker → check → passes → check → restore"
+        );
+        assert!(
+            core[pre..passes].contains("return core;"),
+            "a readmission found BEFORE the passes: nothing moves"
+        );
         // the wrapper: the core → the release unless the pass yielded → the merge → the close → the counters
         let evict = &src[src.find("pub async fn evict_txid_everywhere(").unwrap()..];
         let evict = &evict[..evict.find("struct EvictedRow").unwrap()];
-        let c = evict.find("evict_core(db, &txid, reason, now_ms)").expect("the core");
-        let release = evict.find("release_spends_of(db, &txid)").expect("the release");
-        let merge = evict.find("merge_released(").expect("the released list merged");
-        let close = evict.find("Query::new(CLOSE_EVICTION_MARKER_SQL)").expect("the close");
-        assert!(c < release && release < merge && merge < close, "core → release → merge → close");
+        let c = evict
+            .find("evict_core(db, &txid, reason, now_ms)")
+            .expect("the core");
+        let release = evict
+            .find("release_spends_of(db, &txid)")
+            .expect("the release");
+        let merge = evict
+            .find("merge_released(")
+            .expect("the released list merged");
+        let close = evict
+            .find("Query::new(CLOSE_EVICTION_MARKER_SQL)")
+            .expect("the close");
+        assert!(
+            c < release && release < merge && merge < close,
+            "core → release → merge → close"
+        );
         assert!(
             evict[..release].contains("core.yielded_to_readmission.is_some()"),
             "no release when the pass yielded to a readmission (the readmission re-marked them)"
         );
-        assert!(evict.contains("COUNTER_ADMIT_FAST_EVICT_INCOMPLETE"), "an incomplete pass is counted");
-        assert!(evict.contains("COUNTER_ADMIT_FAST_EVICT_YIELDED"), "a yielded pass is counted");
+        assert!(
+            evict.contains("COUNTER_ADMIT_FAST_EVICT_INCOMPLETE"),
+            "an incomplete pass is counted"
+        );
+        assert!(
+            evict.contains("COUNTER_ADMIT_FAST_EVICT_YIELDED"),
+            "a yielded pass is counted"
+        );
         let squashed: String = evict.split_whitespace().collect();
         assert!(
             squashed.contains("ifcore.yielded_to_readmission.is_none(){forvin&advert_vouts{crate::lobby_changes::note_evicted("),
@@ -3619,7 +3742,10 @@ mod tests {
             let job = &job[..job.find("\n}\n").unwrap()];
             let guard = job.find("if yielded {").expect("the yield guard");
             let memo = job[guard..].find("port.write_memo(").expect("the memo") + guard;
-            assert!(job[guard..memo].contains("} else {"), "{job_name}: the memo sits in the else of the yield guard");
+            assert!(
+                job[guard..memo].contains("} else {"),
+                "{job_name}: the memo sits in the else of the yield guard"
+            );
             let cnt = job.find(counter).expect("the eviction counter");
             let cnt_guard = job[..cnt]
                 .rfind("if yielded {")
@@ -3633,22 +3759,55 @@ mod tests {
         // the passes never touch the console and read through the shadow storage only
         let passes_src = &src[src.find("pub async fn shadow_move_passes(").unwrap()..];
         let passes_src = &passes_src[..passes_src.find("\n}\n").unwrap()];
-        let looping = passes_src.find("for (table, keys) in MOVED_TABLES").expect("the table loop");
-        let seam = passes_src.find("db.between_passes().await").expect("the seam");
-        let verify = passes_src.find("THE VERIFICATION PASS").expect("the verification pass");
-        assert!(looping < seam && seam < verify, "pass 1 → the seam → the verification pass");
-        for f in [core, passes_src, &src[src.find("pub async fn restore_twins(").unwrap()..][..2_000]] {
-            assert!(!f.contains("console_log!"), "the generic halves never touch the console");
-            assert!(!f.contains("count_keyed(db") && !f.contains("table_columns(db"), "the generic halves read through the shadow storage only");
+        let looping = passes_src
+            .find("for (table, keys) in MOVED_TABLES")
+            .expect("the table loop");
+        let seam = passes_src
+            .find("db.between_passes().await")
+            .expect("the seam");
+        let verify = passes_src
+            .find("THE VERIFICATION PASS")
+            .expect("the verification pass");
+        assert!(
+            looping < seam && seam < verify,
+            "pass 1 → the seam → the verification pass"
+        );
+        for f in [
+            core,
+            passes_src,
+            &src[src.find("pub async fn restore_twins(").unwrap()..][..2_000],
+        ] {
+            assert!(
+                !f.contains("console_log!"),
+                "the generic halves never touch the console"
+            );
+            assert!(
+                !f.contains("count_keyed(db") && !f.contains("table_columns(db"),
+                "the generic halves read through the shadow storage only"
+            );
         }
         // the readmission stamps only after a CLEAN restore (NEW-2), never over a faulted table
         let readmit = &src[src.find("pub async fn readmit_if_evicted(").unwrap()..];
         let readmit = &readmit[..readmit.find("\n}\n").unwrap()];
-        let restore_at = readmit.find("restore_twins(db, &txid)").expect("the restore");
-        let incomplete = readmit.find("COUNTER_ADMIT_FAST_READMIT_INCOMPLETE").expect("the incomplete counter");
-        let stamp = readmit.find("UPDATE pot_evictions SET readmittedAt = ? WHERE txid = ? AND readmittedAt IS NULL").expect("the stamp");
-        assert!(restore_at < incomplete && incomplete < stamp, "restore → (faults: open, counted, return) → the stamp");
-        assert!(readmit[incomplete..stamp].contains("return false;"), "a faulted restore never stamps");
+        let restore_at = readmit
+            .find("restore_twins(db, &txid)")
+            .expect("the restore");
+        let incomplete = readmit
+            .find("COUNTER_ADMIT_FAST_READMIT_INCOMPLETE")
+            .expect("the incomplete counter");
+        let stamp = readmit
+            .find(
+                "UPDATE pot_evictions SET readmittedAt = ? WHERE txid = ? AND readmittedAt IS NULL",
+            )
+            .expect("the stamp");
+        assert!(
+            restore_at < incomplete && incomplete < stamp,
+            "restore → (faults: open, counted, return) → the stamp"
+        );
+        assert!(
+            readmit[incomplete..stamp].contains("return false;"),
+            "a faulted restore never stamps"
+        );
         // the guard's read is the ledger's open row, never the twins (a twin can hold duplicates; the ledger is one row)
         assert!(OPEN_EVICTION_SQL.contains("readmittedAt IS NULL"));
     }
@@ -3699,7 +3858,11 @@ mod tests {
     }
     impl SqliteShadow {
         fn new(conn: rusqlite::Connection) -> Self {
-            Self { conn, late: std::cell::RefCell::new(None), fail_first_copy_of: std::cell::RefCell::new(None) }
+            Self {
+                conn,
+                late: std::cell::RefCell::new(None),
+                fail_first_copy_of: std::cell::RefCell::new(None),
+            }
         }
     }
     fn to_sql(v: &QVal) -> rusqlite::types::Value {
@@ -3723,7 +3886,9 @@ mod tests {
         async fn vouts(&self, table: &str, txid: &str) -> Result<Vec<u32>, String> {
             let mut st = self
                 .conn
-                .prepare(&format!("SELECT \"outputIndex\" FROM \"{table}\" WHERE \"txid\" = ?1"))
+                .prepare(&format!(
+                    "SELECT \"outputIndex\" FROM \"{table}\" WHERE \"txid\" = ?1"
+                ))
                 .map_err(|e| e.to_string())?;
             let rows = st
                 .query_map([txid], |r| r.get::<_, i64>(0))
@@ -3753,7 +3918,9 @@ mod tests {
             use rusqlite::OptionalExtension;
             let params: Vec<rusqlite::types::Value> = binds.iter().map(to_sql).collect();
             self.conn
-                .query_row(sql, rusqlite::params_from_iter(params.iter()), |r| r.get::<_, Option<i64>>(0))
+                .query_row(sql, rusqlite::params_from_iter(params.iter()), |r| {
+                    r.get::<_, Option<i64>>(0)
+                })
                 .optional()
                 .map(|o| o.flatten())
                 .map_err(|e| e.to_string())
@@ -3770,35 +3937,55 @@ mod tests {
     /// verification pass switched off); the verification pass takes them, notes their outpoints, and the
     /// eviction ends complete.
     #[tokio::test]
-    async fn the_verification_pass_takes_a_row_that_lands_between_the_passes_under_the_real_logic() {
+    async fn the_verification_pass_takes_a_row_that_lands_between_the_passes_under_the_real_logic()
+    {
         let pot = "ab".repeat(32);
         let seed = |conn: &rusqlite::Connection| {
             conn.execute("INSERT INTO outputs (txid, outputIndex, outputScript, topic, satoshis, spent) VALUES (?1, 0, X'51', 'tm_pot', 40000, 0)", [&pot]).unwrap();
-            conn.execute("INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_pot')", [&pot]).unwrap();
+            conn.execute(
+                "INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_pot')",
+                [&pot],
+            )
+            .unwrap();
         };
         // THE RED CONTROL: the pre-fix shape (no verification pass) leaves the late rows served
         let db = SqliteShadow::new(shipped_conn());
         seed(&db.conn);
         let pot_c = pot.clone();
-        *db.late.borrow_mut() = Some(Box::new(move |c: &rusqlite::Connection| late_rows(c, &pot_c)));
+        *db.late.borrow_mut() = Some(Box::new(move |c: &rusqlite::Connection| {
+            late_rows(c, &pot_c)
+        }));
         let r0 = shadow_move_passes(&db, &pot, "REJECTED", 1_000, true).await;
         assert_eq!(r0.moved, 2);
-        assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 1, "the pre-fix end state: a pot the index still knows");
+        assert_eq!(
+            count(&db.conn, "pot_records", "txid", &pot),
+            1,
+            "the pre-fix end state: a pot the index still knows"
+        );
         assert_eq!(count(&db.conn, "applied_transactions", "txid", &pot), 1);
         assert!(r0.pot_vouts.is_empty(), "nothing noted for the survivor");
         // THE FIX: the verification pass takes the survivors and notes the pot's outpoint
         let db = SqliteShadow::new(shipped_conn());
         seed(&db.conn);
         let pot_c = pot.clone();
-        *db.late.borrow_mut() = Some(Box::new(move |c: &rusqlite::Connection| late_rows(c, &pot_c)));
+        *db.late.borrow_mut() = Some(Box::new(move |c: &rusqlite::Connection| {
+            late_rows(c, &pot_c)
+        }));
         let r1 = shadow_move_passes(&db, &pot, "REJECTED", 1_000, false).await;
         assert_eq!(r1.moved, 4, "both passes' rows");
         assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 0);
         assert_eq!(count(&db.conn, "applied_transactions", "txid", &pot), 0);
         assert_eq!(count(&db.conn, "outputs", "txid", &pot), 0);
         assert_eq!(count(&db.conn, "pot_records_evicted", "txid", &pot), 1);
-        assert_eq!(count(&db.conn, "applied_transactions_evicted", "txid", &pot), 2);
-        assert_eq!(r1.pot_vouts, vec![0], "the survivor's outpoint is noted (the gate's MEDIUM-1)");
+        assert_eq!(
+            count(&db.conn, "applied_transactions_evicted", "txid", &pot),
+            2
+        );
+        assert_eq!(
+            r1.pot_vouts,
+            vec![0],
+            "the survivor's outpoint is noted (the gate's MEDIUM-1)"
+        );
         assert!(r1.incomplete.is_empty(), "complete: {:?}", r1.incomplete);
         assert!(r1.retried.is_empty());
         // and the restore brings everything back once
@@ -3815,7 +4002,11 @@ mod tests {
     }
     fn late_rows(conn: &rusqlite::Connection, pot: &str) {
         conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, 0, 1789959998, 'covenant')", [pot]).unwrap();
-        conn.execute("INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_lowfund')", [pot]).unwrap();
+        conn.execute(
+            "INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_lowfund')",
+            [pot],
+        )
+        .unwrap();
     }
 
     /// The gate's LOW-2: a first-pass fault the verification pass HEALS is said (`retried`), not alarmed
@@ -3828,10 +4019,18 @@ mod tests {
         db.conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, 0, 1789959998, 'covenant')", [&pot]).unwrap();
         *db.fail_first_copy_of.borrow_mut() = Some("pot_records".to_string());
         let r = shadow_move_passes(&db, &pot, "REJECTED", 1_000, false).await;
-        assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 0, "healed by the verification pass");
+        assert_eq!(
+            count(&db.conn, "pot_records", "txid", &pot),
+            0,
+            "healed by the verification pass"
+        );
         assert_eq!(r.moved, 2);
         assert_eq!(r.retried.len(), 1, "{:?}", r.retried);
-        assert!(r.retried[0].starts_with("pot_records by txid: first pass copy: simulated"), "{:?}", r.retried);
+        assert!(
+            r.retried[0].starts_with("pot_records by txid: first pass copy: simulated"),
+            "{:?}",
+            r.retried
+        );
         assert!(r.incomplete.is_empty(), "{:?}", r.incomplete);
         assert_eq!(r.pot_vouts, vec![0]);
     }
@@ -3843,63 +4042,148 @@ mod tests {
         use rusqlite::OptionalExtension;
         let conn = shipped_conn();
         let pot = "ab".repeat(32);
-        conn.execute(OPEN_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED (a)", 1_000i64]).unwrap();
+        conn.execute(
+            OPEN_EVICTION_MARKER_SQL,
+            rusqlite::params![&pot, "REJECTED (a)", 1_000i64],
+        )
+        .unwrap();
         // the chain's word lands under the pass: readmittedAt 1_500 > the pass's 1_000
-        conn.execute("UPDATE pot_evictions SET readmittedAt = 1500 WHERE txid = ?1", [&pot]).unwrap();
+        conn.execute(
+            "UPDATE pot_evictions SET readmittedAt = 1500 WHERE txid = ?1",
+            [&pot],
+        )
+        .unwrap();
         let under: Option<i64> = conn
-            .query_row(READMITTED_AFTER_SQL, rusqlite::params![&pot, 1_000i64], |r| r.get(0))
+            .query_row(
+                READMITTED_AFTER_SQL,
+                rusqlite::params![&pot, 1_000i64],
+                |r| r.get(0),
+            )
             .optional()
             .unwrap();
-        assert_eq!(under, Some(1_500), "the pass sees the readmission that landed under it");
+        assert_eq!(
+            under,
+            Some(1_500),
+            "the pass sees the readmission that landed under it"
+        );
         // a marker with an OLDER stamp keeps the readmission AND its reason (round 3, NIT 6)
-        conn.execute(OPEN_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED (late)", 1_100i64]).unwrap();
+        conn.execute(
+            OPEN_EVICTION_MARKER_SQL,
+            rusqlite::params![&pot, "REJECTED (late)", 1_100i64],
+        )
+        .unwrap();
         let (kept_reason, kept_at): (String, Option<i64>) = conn
-            .query_row("SELECT reason, readmittedAt FROM pot_evictions WHERE txid = ?1", [&pot], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT reason, readmittedAt FROM pot_evictions WHERE txid = ?1",
+                [&pot],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!((kept_reason.as_str(), kept_at), ("REJECTED (a)", Some(1_500)));
-        conn.execute(CLOSE_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED (closing)", 1_000i64, 3i64, "[]"]).unwrap();
+        assert_eq!(
+            (kept_reason.as_str(), kept_at),
+            ("REJECTED (a)", Some(1_500))
+        );
+        conn.execute(
+            CLOSE_EVICTION_MARKER_SQL,
+            rusqlite::params![&pot, "REJECTED (closing)", 1_000i64, 3i64, "[]"],
+        )
+        .unwrap();
         let (readmitted, moved, reason): (Option<i64>, i64, String) = conn
-            .query_row("SELECT readmittedAt, rowsMoved, reason FROM pot_evictions WHERE txid = ?1", [&pot], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_row(
+                "SELECT readmittedAt, rowsMoved, reason FROM pot_evictions WHERE txid = ?1",
+                [&pot],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .unwrap();
-        assert_eq!(readmitted, Some(1_500), "the close keeps a readmission stamped after the pass");
+        assert_eq!(
+            readmitted,
+            Some(1_500),
+            "the close keeps a readmission stamped after the pass"
+        );
         assert_eq!(moved, 3);
-        assert_eq!(reason, "REJECTED (a)", "and keeps the reason too (round 4, the CLOSE half of NIT 6)");
+        assert_eq!(
+            reason, "REJECTED (a)",
+            "and keeps the reason too (round 4, the CLOSE half of NIT 6)"
+        );
         let open: Option<String> = conn
             .query_row(OPEN_EVICTION_SQL, [&pot], |r| r.get(0))
             .optional()
             .unwrap();
         assert_eq!(open, None, "not open: the chain's word stands");
         // an OLDER readmission (before the pass's stamp) is re-opened by the close, as before
-        conn.execute("UPDATE pot_evictions SET readmittedAt = 900 WHERE txid = ?1", [&pot]).unwrap();
-        conn.execute(CLOSE_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED (b)", 2_000i64, 1i64, "[]"]).unwrap();
+        conn.execute(
+            "UPDATE pot_evictions SET readmittedAt = 900 WHERE txid = ?1",
+            [&pot],
+        )
+        .unwrap();
+        conn.execute(
+            CLOSE_EVICTION_MARKER_SQL,
+            rusqlite::params![&pot, "REJECTED (b)", 2_000i64, 1i64, "[]"],
+        )
+        .unwrap();
         let open: Option<String> = conn
             .query_row(OPEN_EVICTION_SQL, [&pot], |r| r.get(0))
             .optional()
             .unwrap();
-        assert_eq!(open.as_deref(), Some("REJECTED (b)"), "re-opened with fresh counts");
-        let moved: i64 = conn.query_row("SELECT rowsMoved FROM pot_evictions WHERE txid = ?1", [&pot], |r| r.get(0)).unwrap();
+        assert_eq!(
+            open.as_deref(),
+            Some("REJECTED (b)"),
+            "re-opened with fresh counts"
+        );
+        let moved: i64 = conn
+            .query_row(
+                "SELECT rowsMoved FROM pot_evictions WHERE txid = ?1",
+                [&pot],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(moved, 1);
     }
 
     /// The gate's LOW-1: the released list is a UNION across passes (a re-eviction releasing only hop B keeps hop A).
     #[test]
     fn the_released_list_merges_across_passes() {
-        let a = ReleasedSpend { table: "pot_records".into(), txid: "aa".repeat(32), vout: 0 };
-        let b = ReleasedSpend { table: "pot_records".into(), txid: "bb".repeat(32), vout: 0 };
+        let a = ReleasedSpend {
+            table: "pot_records".into(),
+            txid: "aa".repeat(32),
+            vout: 0,
+        };
+        let b = ReleasedSpend {
+            table: "pot_records".into(),
+            txid: "bb".repeat(32),
+            vout: 0,
+        };
         let first = serde_json::to_string(&vec![a.clone()]).unwrap();
         let merged = merge_released(Some(&first), std::slice::from_ref(&b));
         assert_eq!(merged, vec![a.clone(), b.clone()]);
-        let again = merge_released(Some(&serde_json::to_string(&merged).unwrap()), std::slice::from_ref(&a));
+        let again = merge_released(
+            Some(&serde_json::to_string(&merged).unwrap()),
+            std::slice::from_ref(&a),
+        );
         assert_eq!(again, vec![a.clone(), b.clone()], "no duplicate");
-        assert_eq!(merge_released(None, std::slice::from_ref(&b)), vec![b.clone()]);
-        assert_eq!(merge_released(Some("not json"), std::slice::from_ref(&a)), vec![a]);
+        assert_eq!(
+            merge_released(None, std::slice::from_ref(&b)),
+            vec![b.clone()]
+        );
+        assert_eq!(
+            merge_released(Some("not json"), std::slice::from_ref(&a)),
+            vec![a]
+        );
     }
 
     /// The gate's NIT: the client-facing line carries the status WORD only (never Arcade's extraInfo).
     #[test]
     fn the_refusal_status_word_is_the_first_token() {
-        assert_eq!(refusal_status_word("REJECTED (arcade live REJECTED: UTXO_SPENT (70): x; both indexers absent)"), "REJECTED");
-        assert_eq!(refusal_status_word("DOUBLE_SPEND_ATTEMPTED (arcade live …)"), "DOUBLE_SPEND_ATTEMPTED");
+        assert_eq!(
+            refusal_status_word(
+                "REJECTED (arcade live REJECTED: UTXO_SPENT (70): x; both indexers absent)"
+            ),
+            "REJECTED"
+        );
+        assert_eq!(
+            refusal_status_word("DOUBLE_SPEND_ATTEMPTED (arcade live …)"),
+            "DOUBLE_SPEND_ATTEMPTED"
+        );
         assert_eq!(refusal_status_word(""), "REJECTED");
         assert_eq!(refusal_status_word("(257) already known"), "257");
     }
@@ -3914,7 +4198,11 @@ mod tests {
         let seed = |conn: &rusqlite::Connection| {
             conn.execute("INSERT INTO outputs (txid, outputIndex, outputScript, topic, satoshis, spent) VALUES (?1, 0, X'51', 'tm_pot', 40000, 0)", [&pot]).unwrap();
             conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, 0, 1789959998, 'covenant')", [&pot]).unwrap();
-            conn.execute("INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_pot')", [&pot]).unwrap();
+            conn.execute(
+                "INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_pot')",
+                [&pot],
+            )
+            .unwrap();
         };
         // the readmission under the pass: restore every twin row, stamp the ledger AFTER the pass's stamp (1_000)
         let readmit_under = |conn: &rusqlite::Connection, pot: &str| {
@@ -3924,33 +4212,70 @@ mod tests {
                 conn.execute(&ins, [pot]).unwrap();
                 conn.execute(&del, [pot]).unwrap();
             }
-            conn.execute("UPDATE pot_evictions SET readmittedAt = 1500 WHERE txid = ?1", [pot]).unwrap();
+            conn.execute(
+                "UPDATE pot_evictions SET readmittedAt = 1500 WHERE txid = ?1",
+                [pot],
+            )
+            .unwrap();
         };
         // THE CONTROL: the passes alone re-move the restored rows
         let db = SqliteShadow::new(shipped_conn());
         seed(&db.conn);
-        db.conn.execute(OPEN_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED", 1_000i64]).unwrap();
+        db.conn
+            .execute(
+                OPEN_EVICTION_MARKER_SQL,
+                rusqlite::params![&pot, "REJECTED", 1_000i64],
+            )
+            .unwrap();
         let pot_c = pot.clone();
-        *db.late.borrow_mut() = Some(Box::new(move |c: &rusqlite::Connection| readmit_under(c, &pot_c)));
+        *db.late.borrow_mut() = Some(Box::new(move |c: &rusqlite::Connection| {
+            readmit_under(c, &pot_c)
+        }));
         let r = shadow_move_passes(&db, &pot, "REJECTED", 1_000, false).await;
         assert!(r.moved >= 3);
-        assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 0, "the control: the restored rows re-moved");
+        assert_eq!(
+            count(&db.conn, "pot_records", "txid", &pot),
+            0,
+            "the control: the restored rows re-moved"
+        );
         // THE FIX: the core checks for the readmission after the passes and restores its own moves
         let db = SqliteShadow::new(shipped_conn());
         seed(&db.conn);
         let pot_c = pot.clone();
-        *db.late.borrow_mut() = Some(Box::new(move |c: &rusqlite::Connection| readmit_under(c, &pot_c)));
+        *db.late.borrow_mut() = Some(Box::new(move |c: &rusqlite::Connection| {
+            readmit_under(c, &pot_c)
+        }));
         let core = evict_core(&db, &pot, "REJECTED", 1_000).await;
-        assert_eq!(core.yielded_to_readmission, Some(1_500), "the readmission under the pass was seen");
-        assert!(core.restored >= 3, "the pass's own moves restored again: {:?}", core);
+        assert_eq!(
+            core.yielded_to_readmission,
+            Some(1_500),
+            "the readmission under the pass was seen"
+        );
+        assert!(
+            core.restored >= 3,
+            "the pass's own moves restored again: {:?}",
+            core
+        );
         assert!(core.faults.is_empty(), "{:?}", core.faults);
         assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 1);
         assert_eq!(count(&db.conn, "outputs", "txid", &pot), 1);
         assert_eq!(count(&db.conn, "applied_transactions", "txid", &pot), 1);
         assert_eq!(count(&db.conn, "pot_records_evicted", "txid", &pot), 0);
         // the wrapper's close keeps the stamp: the ledger says readmitted and the tables hold the rows
-        db.conn.execute(CLOSE_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED", 1_000i64, core.moved as i64, "[]"]).unwrap();
-        let readmitted: Option<i64> = db.conn.query_row("SELECT readmittedAt FROM pot_evictions WHERE txid = ?1", [&pot], |r| r.get(0)).unwrap();
+        db.conn
+            .execute(
+                CLOSE_EVICTION_MARKER_SQL,
+                rusqlite::params![&pot, "REJECTED", 1_000i64, core.moved as i64, "[]"],
+            )
+            .unwrap();
+        let readmitted: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT readmittedAt FROM pot_evictions WHERE txid = ?1",
+                [&pot],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(readmitted, Some(1_500));
     }
 
@@ -3961,8 +4286,18 @@ mod tests {
         let pot = "ab".repeat(32);
         let db = SqliteShadow::new(shipped_conn());
         db.conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, 0, 1789959998, 'covenant')", [&pot]).unwrap();
-        db.conn.execute(OPEN_EVICTION_MARKER_SQL, rusqlite::params![&pot, "REJECTED", 900i64]).unwrap();
-        db.conn.execute("UPDATE pot_evictions SET readmittedAt = 1200 WHERE txid = ?1", [&pot]).unwrap();
+        db.conn
+            .execute(
+                OPEN_EVICTION_MARKER_SQL,
+                rusqlite::params![&pot, "REJECTED", 900i64],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE pot_evictions SET readmittedAt = 1200 WHERE txid = ?1",
+                [&pot],
+            )
+            .unwrap();
         let core = evict_core(&db, &pot, "REJECTED", 1_000).await;
         assert_eq!(core.yielded_to_readmission, Some(1_200));
         assert_eq!(core.moved, 0);
@@ -3974,7 +4309,8 @@ mod tests {
     /// in a twin healed before that is coalesced onto it), is idempotent, and names a table whose copy back landed
     /// nothing instead of deleting its twin rows.
     #[tokio::test]
-    async fn restore_twins_lands_the_default_of_a_column_added_after_the_eviction_and_is_fail_loud() {
+    async fn restore_twins_lands_the_default_of_a_column_added_after_the_eviction_and_is_fail_loud()
+    {
         let pot = "ab".repeat(32);
         let db = SqliteShadow::new(shipped_conn());
         db.conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, 0, 1789959998, 'covenant')", [&pot]).unwrap();
@@ -3982,28 +4318,64 @@ mod tests {
         assert_eq!(r.moved, 1);
         // the source gains a NOT NULL DEFAULT column after the eviction (the schema's own class: has_proof,
         // spentConfirmed, paramsDecoded)
-        db.conn.execute_batch("ALTER TABLE pot_records ADD COLUMN loop18_new TEXT NOT NULL DEFAULT 'd'").unwrap();
-        assert!(!cols(&db.conn, "pot_records_evicted").iter().any(|c| c.name == "loop18_new"));
+        db.conn
+            .execute_batch(
+                "ALTER TABLE pot_records ADD COLUMN loop18_new TEXT NOT NULL DEFAULT 'd'",
+            )
+            .unwrap();
+        assert!(!cols(&db.conn, "pot_records_evicted")
+            .iter()
+            .any(|c| c.name == "loop18_new"));
         let (restored, faults) = restore_twins(&db, &pot).await;
         assert_eq!((restored, faults.len()), (1, 0), "{faults:?}");
         assert!(
             !cols(&db.conn, "pot_records_evicted").iter().any(|c| c.name == "loop18_new"),
             "the restore never heals the twin: the added column is omitted and takes the source's default"
         );
-        assert_eq!(count(&db.conn, "pot_records", "txid", &pot), 1, "the row LANDED (an explicit NULL would have been dropped)");
-        let new_col: String = db.conn.query_row("SELECT loop18_new FROM pot_records WHERE txid = ?1", [&pot], |r| r.get(0)).unwrap();
+        assert_eq!(
+            count(&db.conn, "pot_records", "txid", &pot),
+            1,
+            "the row LANDED (an explicit NULL would have been dropped)"
+        );
+        let new_col: String = db
+            .conn
+            .query_row(
+                "SELECT loop18_new FROM pot_records WHERE txid = ?1",
+                [&pot],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(new_col, "d", "the added column carries its DEFAULT");
         // a twin HEALED after the migration (a later eviction) carries the default for its older rows too
         let r = shadow_move_passes(&db, &pot, "REJECTED", 2_000, false).await;
         assert_eq!(r.moved, 1);
         let twin_cols = cols(&db.conn, "pot_records_evicted");
-        let healed = twin_cols.iter().find(|c| c.name == "loop18_new").expect("the later eviction healed the twin");
-        assert_eq!(healed.dflt_value.as_deref(), Some("'d'"), "healed WITH the default (round 4)");
+        let healed = twin_cols
+            .iter()
+            .find(|c| c.name == "loop18_new")
+            .expect("the later eviction healed the twin");
+        assert_eq!(
+            healed.dflt_value.as_deref(),
+            Some("'d'"),
+            "healed WITH the default (round 4)"
+        );
         // and even a twin row holding NULL there (a twin healed before the heal carried defaults) restores onto the default
-        db.conn.execute("UPDATE pot_records_evicted SET loop18_new = NULL WHERE txid = ?1", [&pot]).unwrap();
+        db.conn
+            .execute(
+                "UPDATE pot_records_evicted SET loop18_new = NULL WHERE txid = ?1",
+                [&pot],
+            )
+            .unwrap();
         let (restored, faults) = restore_twins(&db, &pot).await;
         assert_eq!((restored, faults.len()), (1, 0), "{faults:?}");
-        let new_col: String = db.conn.query_row("SELECT loop18_new FROM pot_records WHERE txid = ?1", [&pot], |r| r.get(0)).unwrap();
+        let new_col: String = db
+            .conn
+            .query_row(
+                "SELECT loop18_new FROM pot_records WHERE txid = ?1",
+                [&pot],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(new_col, "d", "COALESCEd onto the default");
         // idempotent
         let (again, faults) = restore_twins(&db, &pot).await;
@@ -4011,34 +4383,77 @@ mod tests {
         // a copy back that lands nothing is named and the twin keeps its row (the twin dropped from under the restore)
         let r = shadow_move_passes(&db, &pot, "REJECTED", 3_000, false).await;
         assert_eq!(r.moved, 1);
-        db.conn.execute_batch("DROP TABLE pot_records_evicted").unwrap();
+        db.conn
+            .execute_batch("DROP TABLE pot_records_evicted")
+            .unwrap();
         db.conn.execute_batch("CREATE TABLE pot_records_evicted (af_evictedAt INTEGER NOT NULL, af_reason TEXT NOT NULL, txid TEXT)").unwrap();
         db.conn.execute("INSERT INTO pot_records_evicted (af_evictedAt, af_reason, txid) VALUES (1, 'x', ?1)", [&pot]).unwrap();
         let (restored, faults) = restore_twins(&db, &pot).await;
         assert_eq!(restored, 0);
         assert!(
-            faults.iter().any(|f| f.starts_with("pot_records by txid: the copy back landed 0 of 1 row(s)")),
+            faults
+                .iter()
+                .any(|f| f.starts_with("pot_records by txid: the copy back landed 0 of 1 row(s)")),
             "{faults:?}"
         );
-        assert_eq!(count(&db.conn, "pot_records_evicted", "txid", &pot), 1, "the twin keeps the row it could not land");
+        assert_eq!(
+            count(&db.conn, "pot_records_evicted", "txid", &pot),
+            1,
+            "the twin keeps the row it could not land"
+        );
     }
 
     /// Round 5 (N7): the heal carries only a LITERAL default; an expression default is left to the restore's COALESCE.
     #[test]
     fn the_heal_carries_a_literal_default_only() {
-        for d in ["0", "-1", "1.5", "'d'", "''", "NULL", "null", "CURRENT_TIMESTAMP"] {
+        for d in [
+            "0",
+            "-1",
+            "1.5",
+            "'d'",
+            "''",
+            "NULL",
+            "null",
+            "CURRENT_TIMESTAMP",
+        ] {
             assert!(literal_default(d), "{d}");
         }
-        for d in ["datetime('now')", "(datetime('now'))", "", "  ", "abc", "1; DROP TABLE x"] {
+        for d in [
+            "datetime('now')",
+            "(datetime('now'))",
+            "",
+            "  ",
+            "abc",
+            "1; DROP TABLE x",
+        ] {
             assert!(!literal_default(d), "{d}");
         }
-        let lit = ColumnInfo { name: "c".into(), ty: "INTEGER".into(), notnull: 1, dflt_value: Some("0".into()) };
-        assert_eq!(heal_shadow_sql("pot_records", &lit), "ALTER TABLE \"pot_records_evicted\" ADD COLUMN \"c\" INTEGER DEFAULT 0");
-        let expr = ColumnInfo { name: "createdAt".into(), ty: "TEXT".into(), notnull: 1, dflt_value: Some("datetime('now')".into()) };
-        assert_eq!(heal_shadow_sql("low_records", &expr), "ALTER TABLE \"low_records_evicted\" ADD COLUMN \"createdAt\" TEXT");
+        let lit = ColumnInfo {
+            name: "c".into(),
+            ty: "INTEGER".into(),
+            notnull: 1,
+            dflt_value: Some("0".into()),
+        };
+        assert_eq!(
+            heal_shadow_sql("pot_records", &lit),
+            "ALTER TABLE \"pot_records_evicted\" ADD COLUMN \"c\" INTEGER DEFAULT 0"
+        );
+        let expr = ColumnInfo {
+            name: "createdAt".into(),
+            ty: "TEXT".into(),
+            notnull: 1,
+            dflt_value: Some("datetime('now')".into()),
+        };
+        assert_eq!(
+            heal_shadow_sql("low_records", &expr),
+            "ALTER TABLE \"low_records_evicted\" ADD COLUMN \"createdAt\" TEXT"
+        );
         // the restore coalesces the NOT NULL expression default all the same (legal in a SELECT)
         let (ins, _) = restore_sql("low_records", "txid", std::slice::from_ref(&expr));
-        assert!(ins.contains("COALESCE(\"createdAt\", datetime('now'))"), "{ins}");
+        assert!(
+            ins.contains("COALESCE(\"createdAt\", datetime('now'))"),
+            "{ins}"
+        );
     }
 
     // lane E1D's delta fold (L2, the delta lens on `0da3a82`): a predecessor the engine LANDS first from a
@@ -4048,21 +4463,29 @@ mod tests {
     // and the guard re-evicts under an open row. RED on `0da3a82` (no `guard_landed`).
     #[test]
     fn e1d_delta_l2_every_submit_with_a_report_guards_what_it_landed() {
-        for (file, src) in [("routes.rs", include_str!("routes.rs")), ("lib.rs", include_str!("lib.rs"))] {
+        for (file, src) in [
+            ("routes.rs", include_str!("routes.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+        ] {
             // a call, never a comment that names one
             // the E592 lens fold: the queue's replay names its breach policy (`submit_with_report_under`)
             let calls: Vec<usize> = src
                 .match_indices(".submit_with_report(")
                 .chain(src.match_indices(".submit_with_report_under("))
                 .map(|(at, _)| at)
-                .filter(|&at| !src[src[..at].rfind('\n').map_or(0, |nl| nl + 1)..at].trim_start().starts_with("//"))
+                .filter(|&at| {
+                    !src[src[..at].rfind('\n').map_or(0, |nl| nl + 1)..at]
+                        .trim_start()
+                        .starts_with("//")
+                })
                 .collect();
             assert!(!calls.is_empty(), "{file}: no submit with a report");
             for at in calls {
                 let after = &src[at..];
                 let window = &after[..after.len().min(1_500)];
                 assert!(
-                    window.contains("crate::admit_fast::guard_landed(") && window.contains("landed_predecessors"),
+                    window.contains("crate::admit_fast::guard_landed(")
+                        && window.contains("landed_predecessors"),
                     "{file}: the submit at byte {at} does not guard what it landed"
                 );
             }
@@ -4070,11 +4493,21 @@ mod tests {
         let src = include_str!("admit_fast.rs");
         let guard = &src[src.find("pub async fn guard_landed(").unwrap()..];
         let guard = &guard[..guard.find("\n}\n").unwrap()];
-        let open = guard.find("open_eviction(db, txid)").expect("the ledger is read per landed txid");
-        let evict = guard.find("evict_txid_everywhere(db, txid, &ev.reason").expect("an open row re-evicts");
+        let open = guard
+            .find("open_eviction(db, txid)")
+            .expect("the ledger is read per landed txid");
+        let evict = guard
+            .find("evict_txid_everywhere(db, txid, &ev.reason")
+            .expect("an open row re-evicts");
         assert!(open < evict);
-        assert!(guard.contains("COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE"), "counted");
-        assert!(guard.contains("COUNTER_ADMIT_FAST_LEDGER_UNREADABLE"), "an unreadable ledger is counted");
+        assert!(
+            guard.contains("COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE"),
+            "counted"
+        );
+        assert!(
+            guard.contains("COUNTER_ADMIT_FAST_LEDGER_UNREADABLE"),
+            "an unreadable ledger is counted"
+        );
     }
 
     /// bsv-low #649: the settle's world, recorded; its flush HANGS (never answers), as the app layer's

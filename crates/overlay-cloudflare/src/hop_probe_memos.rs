@@ -119,7 +119,9 @@ pub fn proof_leg_rejudged(s: &ProofLegSummary) -> bool {
 
 /// PURE: the routine R2 sweep re-judged something on any of its three legs.
 pub fn sweep_rejudged(s: &ReorgSweepSummary) -> bool {
-    reverify_rejudged(&s.spenders) || proof_leg_rejudged(&s.pot_beefs) || proof_leg_rejudged(&s.transactions)
+    reverify_rejudged(&s.spenders)
+        || proof_leg_rejudged(&s.pot_beefs)
+        || proof_leg_rejudged(&s.transactions)
 }
 
 /// PURE: the D7 Arcade pass has reorg evidence: an orphan event applied (chaintracks corroborated it, whether
@@ -140,7 +142,9 @@ async fn delete(db: &D1Database, sql: &str, binds: &[JsValue]) -> Result<u64, St
     } else {
         stmt.bind(binds).map_err(|e| e.to_string())?
     };
-    let res = crate::d1_ledger::Counted::counted_run(&stmt).await.map_err(|e| e.to_string())?;
+    let res = crate::d1_ledger::Counted::counted_run(&stmt)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(res
         .meta()
         .ok()
@@ -157,7 +161,13 @@ pub async fn clear_on_reorg(db: &D1Database, origin: &str, evidence: bool) -> u6
     }
     // rule 3: the tombstone FIRST (a memo the delete misses is then held to the short window by its stamp)
     let now_ms = worker::Date::now().as_millis() as f64;
-    if let Err(e) = delete(db, HOP_PROBE_MEMO_REORG_MARK_SQL, &[JsValue::from_f64(now_ms)]).await {
+    if let Err(e) = delete(
+        db,
+        HOP_PROBE_MEMO_REORG_MARK_SQL,
+        &[JsValue::from_f64(now_ms)],
+    )
+    .await
+    {
         console_log!("[hop-probe-memos] ({origin}) reorg tombstone write FAILED (a memo re-written right after this clear keeps the long window): {e}");
     }
     match delete(db, HOP_PROBE_MEMO_REORG_CLEAR_SQL, &[]).await {
@@ -201,13 +211,22 @@ mod tests {
         for sql in crate::d1::OVERLAY_MIGRATIONS {
             if let Err(e) = conn.execute_batch(sql) {
                 let msg = e.to_string().to_ascii_lowercase();
-                assert!(msg.contains("duplicate column"), "production migration failed under real SQLite: {e}\n{sql}");
+                assert!(
+                    msg.contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
             }
         }
         conn
     }
 
-    fn plant(conn: &rusqlite::Connection, outpoint: &str, at_ms: i64, spent: bool, confirmed: Option<bool>) {
+    fn plant(
+        conn: &rusqlite::Connection,
+        outpoint: &str,
+        at_ms: i64,
+        spent: bool,
+        confirmed: Option<bool>,
+    ) {
         conn.execute(
             "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![outpoint, at_ms, spent, spent.then(|| "e5".repeat(32)), confirmed],
@@ -216,7 +235,9 @@ mod tests {
     }
 
     fn held(conn: &rusqlite::Connection) -> Vec<String> {
-        let mut stmt = conn.prepare("SELECT outpoint FROM hop_chain_probes ORDER BY outpoint").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT outpoint FROM hop_chain_probes ORDER BY outpoint")
+            .unwrap();
         let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
         rows.map(|r| r.unwrap()).collect()
     }
@@ -236,7 +257,11 @@ mod tests {
         let cleared = conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap();
         assert_eq!(cleared, 2, "both confirmed memos, whatever their age");
         assert_eq!(held(&conn), vec!["b.0", "c.0", "d.0"]);
-        assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 0, "idempotent");
+        assert_eq!(
+            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(),
+            0,
+            "idempotent"
+        );
     }
 
     /// bsv-low #484, the TTL the memo's contract states: no reader honours a memo older than the confirmed
@@ -244,16 +269,38 @@ mod tests {
     /// or move the bound.
     #[test]
     fn the_ttl_sweep_deletes_exactly_the_memos_no_reader_honours_real_sqlite() {
-        assert_eq!(HOP_PROBE_MEMO_TTL_MS, 2 * 60 * 60_000, "the longest window a reader passes (the confirmed one)");
+        assert_eq!(
+            HOP_PROBE_MEMO_TTL_MS,
+            2 * 60 * 60_000,
+            "the longest window a reader passes (the confirmed one)"
+        );
         let conn = db();
         let now: i64 = 1_800_000_000_000;
-        plant(&conn, "old.0", now - HOP_PROBE_MEMO_TTL_MS - 1, true, Some(true));
-        plant(&conn, "edge.0", now - HOP_PROBE_MEMO_TTL_MS, true, Some(true));
+        plant(
+            &conn,
+            "old.0",
+            now - HOP_PROBE_MEMO_TTL_MS - 1,
+            true,
+            Some(true),
+        );
+        plant(
+            &conn,
+            "edge.0",
+            now - HOP_PROBE_MEMO_TTL_MS,
+            true,
+            Some(true),
+        );
         plant(&conn, "young.0", now - 60_000, false, None);
         plant(&conn, "ancient.0", 5, false, None);
         // the reorg tombstone is not a memo: the sweep never takes it, however old (rule 3)
-        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![7]).unwrap();
-        let expired = conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![now - HOP_PROBE_MEMO_TTL_MS]).unwrap();
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![7])
+            .unwrap();
+        let expired = conn
+            .execute(
+                HOP_PROBE_MEMO_EXPIRE_SQL,
+                rusqlite::params![now - HOP_PROBE_MEMO_TTL_MS],
+            )
+            .unwrap();
         assert_eq!(expired, 3, "the row read exactly at the bound is one no reader honours (`age >= window`): the lens's N2");
         assert_eq!(held(&conn), vec![HOP_PROBE_MEMO_REORG_MARK, "young.0"]);
     }
@@ -268,26 +315,52 @@ mod tests {
     fn neither_delete_takes_the_app_layers_latch_or_cursor_rows_real_sqlite() {
         let conn = db();
         let now: i64 = 1_800_000_000_000;
-        let latch = format!("{}{}.0", HOP_PROBE_MEMO_APP_LAYER_PREFIXES[0], "ab".repeat(32));
-        let unconfirmed_latch = format!("{}{}.1", HOP_PROBE_MEMO_APP_LAYER_PREFIXES[0], "cd".repeat(32));
-        let cursor = format!("{}02{}.0", HOP_PROBE_MEMO_APP_LAYER_PREFIXES[1], "aa".repeat(32));
+        let latch = format!(
+            "{}{}.0",
+            HOP_PROBE_MEMO_APP_LAYER_PREFIXES[0],
+            "ab".repeat(32)
+        );
+        let unconfirmed_latch = format!(
+            "{}{}.1",
+            HOP_PROBE_MEMO_APP_LAYER_PREFIXES[0],
+            "cd".repeat(32)
+        );
+        let cursor = format!(
+            "{}02{}.0",
+            HOP_PROBE_MEMO_APP_LAYER_PREFIXES[1],
+            "aa".repeat(32)
+        );
         plant(&conn, &latch, 5, true, Some(true));
         plant(&conn, &unconfirmed_latch, 5, true, None);
         plant(&conn, &cursor, 5, false, None);
         plant(&conn, "a.0", 5, true, Some(true));
         plant(&conn, "b.0", 5, true, None);
-        assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 1, "the confirmed memo, not the confirmed latch");
-        assert_eq!(conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![now]).unwrap(), 1, "the memo past the window, not the rows beside it");
+        assert_eq!(
+            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(),
+            1,
+            "the confirmed memo, not the confirmed latch"
+        );
+        assert_eq!(
+            conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![now])
+                .unwrap(),
+            1,
+            "the memo past the window, not the rows beside it"
+        );
         let mut left = vec![cursor, latch, unconfirmed_latch];
         left.sort();
         assert_eq!(held(&conn), left);
         for sql in [HOP_PROBE_MEMO_REORG_CLEAR_SQL, HOP_PROBE_MEMO_EXPIRE_SQL] {
             for prefix in HOP_PROBE_MEMO_APP_LAYER_PREFIXES {
-                assert!(sql.contains(&format!("outpoint NOT LIKE '{prefix}%'")), "{sql}");
+                assert!(
+                    sql.contains(&format!("outpoint NOT LIKE '{prefix}%'")),
+                    "{sql}"
+                );
                 assert!(!prefix.contains(['%', '_']), "no LIKE wildcard in a prefix");
             }
         }
-        assert!(!HOP_PROBE_MEMO_APP_LAYER_PREFIXES.iter().any(|p| HOP_PROBE_MEMO_REORG_MARK.starts_with(p)));
+        assert!(!HOP_PROBE_MEMO_APP_LAYER_PREFIXES
+            .iter()
+            .any(|p| HOP_PROBE_MEMO_REORG_MARK.starts_with(p)));
     }
 
     /// bsv-low #484 (lens fold, M2), the tombstone over the SHIPPED schema (real SQLite): the clear stamps one
@@ -297,28 +370,61 @@ mod tests {
     fn the_reorg_tombstone_is_one_row_that_only_grows_and_no_sweep_deletes_real_sqlite() {
         let conn = db();
         let stamp = |conn: &rusqlite::Connection| -> i64 {
-            conn.query_row("SELECT probedAtMs FROM hop_chain_probes WHERE outpoint = ?1", [HOP_PROBE_MEMO_REORG_MARK], |r| r.get(0)).unwrap()
+            conn.query_row(
+                "SELECT probedAtMs FROM hop_chain_probes WHERE outpoint = ?1",
+                [HOP_PROBE_MEMO_REORG_MARK],
+                |r| r.get(0),
+            )
+            .unwrap()
         };
         plant(&conn, "a.0", 1_000, true, Some(true));
-        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![5_000]).unwrap();
-        assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 1, "the confirmed memo, not the tombstone");
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![5_000])
+            .unwrap();
+        assert_eq!(
+            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(),
+            1,
+            "the confirmed memo, not the tombstone"
+        );
         assert_eq!(held(&conn), vec![HOP_PROBE_MEMO_REORG_MARK]);
         assert_eq!(stamp(&conn), 5_000);
-        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![9_000]).unwrap();
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![9_000])
+            .unwrap();
         assert_eq!(stamp(&conn), 9_000, "a later clear moves it");
-        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![6_000]).unwrap();
-        assert_eq!(stamp(&conn), 9_000, "an earlier stamp (two isolates racing) never moves it back");
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![6_000])
+            .unwrap();
+        assert_eq!(
+            stamp(&conn),
+            9_000,
+            "an earlier stamp (two isolates racing) never moves it back"
+        );
         assert_eq!(held(&conn).len(), 1, "one row");
-        assert_eq!(conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![i64::MAX]).unwrap(), 0, "the TTL sweep never takes it");
+        assert_eq!(
+            conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![i64::MAX])
+                .unwrap(),
+            0,
+            "the TTL sweep never takes it"
+        );
         for sql in [HOP_PROBE_MEMO_REORG_MARK_SQL, HOP_PROBE_MEMO_EXPIRE_SQL] {
-            assert!(sql.contains(&format!("'{HOP_PROBE_MEMO_REORG_MARK}'")), "{sql}");
+            assert!(
+                sql.contains(&format!("'{HOP_PROBE_MEMO_REORG_MARK}'")),
+                "{sql}"
+            );
         }
-        const { assert!(HOP_PROBE_MEMO_REORG_GRACE_MS < HOP_PROBE_MEMO_TTL_MS && HOP_PROBE_MEMO_REORG_GRACE_MS > 5 * 60_000, "longer than the short window, shorter than the long one") };
+        const {
+            assert!(
+                HOP_PROBE_MEMO_REORG_GRACE_MS < HOP_PROBE_MEMO_TTL_MS
+                    && HOP_PROBE_MEMO_REORG_GRACE_MS > 5 * 60_000,
+                "longer than the short window, shorter than the long one"
+            )
+        };
         // the clear writes the tombstone before it deletes
         let src = include_str!("hop_probe_memos.rs");
         let src = &src[..src.find("#[cfg(test)]").unwrap()];
         let body = &src[src.find("pub async fn clear_on_reorg(").unwrap()..];
-        assert!(body.find("HOP_PROBE_MEMO_REORG_MARK_SQL").unwrap() < body.find("HOP_PROBE_MEMO_REORG_CLEAR_SQL").unwrap());
+        assert!(
+            body.find("HOP_PROBE_MEMO_REORG_MARK_SQL").unwrap()
+                < body.find("HOP_PROBE_MEMO_REORG_CLEAR_SQL").unwrap()
+        );
     }
 
     /// bsv-low #484: what counts as a reorg pass having RE-JUDGED something. A pass that scanned and left every
@@ -327,18 +433,42 @@ mod tests {
     /// unresolved (never one chaintracks refused to corroborate, nor one still held).
     #[test]
     fn only_a_pass_that_rejudged_something_is_reorg_evidence() {
-        let quiet = ReverifyPassSummary { scanned: 40, standing: 40, stored_from_courier: 2, ..Default::default() };
+        let quiet = ReverifyPassSummary {
+            scanned: 40,
+            standing: 40,
+            stored_from_courier: 2,
+            ..Default::default()
+        };
         assert!(!reverify_rejudged(&quiet));
         for s in [
-            ReverifyPassSummary { stale: 1, ..Default::default() },
-            ReverifyPassSummary { demoted_blind: 1, ..Default::default() },
-            ReverifyPassSummary { reanchored: 1, ..Default::default() },
-            ReverifyPassSummary { reanchored_from_courier: 1, ..Default::default() },
+            ReverifyPassSummary {
+                stale: 1,
+                ..Default::default()
+            },
+            ReverifyPassSummary {
+                demoted_blind: 1,
+                ..Default::default()
+            },
+            ReverifyPassSummary {
+                reanchored: 1,
+                ..Default::default()
+            },
+            ReverifyPassSummary {
+                reanchored_from_courier: 1,
+                ..Default::default()
+            },
         ] {
             assert!(reverify_rejudged(&s), "{s:?}");
         }
-        assert!(!proof_leg_rejudged(&ProofLegSummary { scanned: 9, standing: 9, ..Default::default() }));
-        assert!(proof_leg_rejudged(&ProofLegSummary { stale: 1, ..Default::default() }));
+        assert!(!proof_leg_rejudged(&ProofLegSummary {
+            scanned: 9,
+            standing: 9,
+            ..Default::default()
+        }));
+        assert!(proof_leg_rejudged(&ProofLegSummary {
+            stale: 1,
+            ..Default::default()
+        }));
         let mut sweep = ReorgSweepSummary::default();
         assert!(!sweep_rejudged(&sweep));
         sweep.transactions.stale = 1;
@@ -350,14 +480,37 @@ mod tests {
         sweep.spenders.reanchored = 1;
         assert!(sweep_rejudged(&sweep));
         use crate::arcade_reorg::ArcadePassSummary;
-        assert!(!arcade_pass_rejudged(&ArcadePassSummary { idle: true, ..Default::default() }));
-        assert!(!arcade_pass_rejudged(&ArcadePassSummary { skipped_uncorroborated: 1, held: 1, tracker_lagging: 1, ..Default::default() }));
-        assert!(arcade_pass_rejudged(&ArcadePassSummary { applied: 1, ..Default::default() }), "an orphan event applied, even with no row of ours at its height");
-        assert!(arcade_pass_rejudged(&ArcadePassSummary { skipped_unresolved: 1, ..Default::default() }));
-        assert!(arcade_pass_rejudged(&ArcadePassSummary { released_by_operator: 1, ..Default::default() }));
+        assert!(!arcade_pass_rejudged(&ArcadePassSummary {
+            idle: true,
+            ..Default::default()
+        }));
+        assert!(!arcade_pass_rejudged(&ArcadePassSummary {
+            skipped_uncorroborated: 1,
+            held: 1,
+            tracker_lagging: 1,
+            ..Default::default()
+        }));
+        assert!(
+            arcade_pass_rejudged(&ArcadePassSummary {
+                applied: 1,
+                ..Default::default()
+            }),
+            "an orphan event applied, even with no row of ours at its height"
+        );
+        assert!(arcade_pass_rejudged(&ArcadePassSummary {
+            skipped_unresolved: 1,
+            ..Default::default()
+        }));
+        assert!(arcade_pass_rejudged(&ArcadePassSummary {
+            released_by_operator: 1,
+            ..Default::default()
+        }));
         let mut partial = ArcadePassSummary::default();
         partial.spenders.stale = 1;
-        assert!(arcade_pass_rejudged(&partial), "a row demoted by an event still pending");
+        assert!(
+            arcade_pass_rejudged(&partial),
+            "a row demoted by an event still pending"
+        );
     }
 
     /// `/health/invariants.arcadeReorg` counts the memos cleared (the issue's acceptance): the lifetime counter
@@ -367,14 +520,25 @@ mod tests {
         let view = serde_json::json!({ "readable": true, "everRan": true });
         let none = crate::ops::with_probe_memos_cleared(view.clone(), &serde_json::json!({}));
         assert_eq!(none["probeMemosCleared"], 0);
-        let some = crate::ops::with_probe_memos_cleared(view, &serde_json::json!({ COUNTER_HOP_PROBE_MEMOS_CLEARED: 7 }));
+        let some = crate::ops::with_probe_memos_cleared(
+            view,
+            &serde_json::json!({ COUNTER_HOP_PROBE_MEMOS_CLEARED: 7 }),
+        );
         assert_eq!(some["probeMemosCleared"], 7);
         assert_eq!(some["everRan"], true, "the view's own keys stand");
         let ops = include_str!("ops.rs");
-        assert!(ops.contains("let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);"));
+        assert!(ops.contains(
+            "let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);"
+        ));
         // the merged lens's LOW-3: the app layer's faulted memo reads are a seeded row of the same surface
-        assert!(ops.contains("crate::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,"), "seeded at 0 in `read_counters`");
-        assert_eq!(COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS, "applayer_probe_memo_read_faults_total");
+        assert!(
+            ops.contains("crate::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,"),
+            "seeded at 0 in `read_counters`"
+        );
+        assert_eq!(
+            COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,
+            "applayer_probe_memo_read_faults_total"
+        );
     }
 
     /// SOURCE PIN (bsv-low #484): BOTH reorg judges invalidate, each where it has its outcome in hand: the D7
@@ -384,14 +548,26 @@ mod tests {
     /// To red: drop any one call.
     #[test]
     fn both_reorg_judges_invalidate_and_the_ttl_rides_the_block_event_pass() {
-        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let code_only = |s: &str| {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // The reading of a function body is independent of rustfmt: whitespace out, and the
+        // trailing comma a vertical argument list carries before its closing paren out too.
+        let squash = |s: &str| s.split_whitespace().collect::<String>().replace(",)", ")");
         let src = include_str!("tip_pass.rs");
         let src = code_only(&src[..src.find("#[cfg(test)]").unwrap_or(src.len())]);
         let body = |name: &str| -> String {
-            let start = src.find(&format!("pub async fn {name}(")).unwrap_or_else(|| panic!("{name}"));
+            let start = src
+                .find(&format!("pub async fn {name}("))
+                .unwrap_or_else(|| panic!("{name}"));
             let rest = &src[start + 1..];
-            let end = rest.find("\npub async fn ").or_else(|| rest.find("\npub fn ")).unwrap_or(rest.len());
+            let end = rest
+                .find("\npub async fn ")
+                .or_else(|| rest.find("\npub fn "))
+                .unwrap_or(rest.len());
             squash(&rest[..end.min(rest.find("\npub fn ").unwrap_or(rest.len()))])
         };
         let arcade = body("run_arcade_reorg_pass");
@@ -401,9 +577,19 @@ mod tests {
             tip.contains(&squash("reorg_from.is_some() || crate::hop_probe_memos::reverify_rejudged(&demotion) || crate::hop_probe_memos::sweep_rejudged(&sweep)")),
             "the R2 legs of the block-event pass"
         );
-        assert!(tip.contains(&squash("crate::hop_probe_memos::expire(db, worker::Date::now().as_millis() as i64).await")), "the TTL sweep");
+        assert!(
+            tip.contains(&squash(
+                "crate::hop_probe_memos::expire(db, worker::Date::now().as_millis() as i64).await"
+            )),
+            "the TTL sweep"
+        );
         let operator = body("internal_reorg");
-        assert!(operator.contains(&squash("crate::hop_probe_memos::clear_on_reorg(db, \"operator\", true).await")), "the operator's window");
+        assert!(
+            operator.contains(&squash(
+                "crate::hop_probe_memos::clear_on_reorg(db, \"operator\", true).await"
+            )),
+            "the operator's window"
+        );
     }
 
     /// bsv-low #484 (lens fold, M3): THE OPERATOR'S WINDOW IS REORG EVIDENCE BY ITSELF. Both feeds can miss a
@@ -415,21 +601,49 @@ mod tests {
     #[test]
     fn the_operators_reorg_window_clears_the_memos_whether_or_not_a_pot_row_moved() {
         // the pass an operator's window gets when no pot row sits at the orphaned height
-        let nothing_moved = ReverifyPassSummary { scanned: 0, ..Default::default() };
-        assert!(!reverify_rejudged(&nothing_moved), "the pass itself is no evidence: the old gate cleared nothing here");
-        let code_only = |s: &str| s.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let nothing_moved = ReverifyPassSummary {
+            scanned: 0,
+            ..Default::default()
+        };
+        assert!(
+            !reverify_rejudged(&nothing_moved),
+            "the pass itself is no evidence: the old gate cleared nothing here"
+        );
+        let code_only = |s: &str| {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // The reading of a function body is independent of rustfmt: whitespace out, and the
+        // trailing comma a vertical argument list carries before its closing paren out too.
+        let squash = |s: &str| s.split_whitespace().collect::<String>().replace(",)", ")");
         let src = include_str!("tip_pass.rs");
         let src = code_only(&src[..src.find("#[cfg(test)]").unwrap_or(src.len())]);
-        let start = src.find("pub async fn internal_reorg(").expect("the operator's route");
-        let route = squash(&src[start..start + src[start + 1..].find("\npub async fn ").unwrap_or(src.len() - start - 1)]);
-        let clears: Vec<_> = route.match_indices("hop_probe_memos::clear_on_reorg(").collect();
+        let start = src
+            .find("pub async fn internal_reorg(")
+            .expect("the operator's route");
+        let route = squash(
+            &src[start
+                ..start
+                    + src[start + 1..]
+                        .find("\npub async fn ")
+                        .unwrap_or(src.len() - start - 1)],
+        );
+        let clears: Vec<_> = route
+            .match_indices("hop_probe_memos::clear_on_reorg(")
+            .collect();
         assert_eq!(clears.len(), 1, "one clear in the operator's route");
         assert!(
-            route.contains(&squash(r#"crate::hop_probe_memos::clear_on_reorg(db, "operator", true).await"#)),
+            route.contains(&squash(
+                r#"crate::hop_probe_memos::clear_on_reorg(db, "operator", true).await"#
+            )),
             "the operator's window clears unconditionally"
         );
-        assert!(!route.contains("reverify_rejudged(&pass)"), "never gated on a pot row having moved");
+        assert!(
+            !route.contains("reverify_rejudged(&pass)"),
+            "never gated on a pot row having moved"
+        );
         // and it runs after the pass (the tombstone's stamp is the heal's time), on the 200 arm only
         assert!(route.find("crate::reorg_sweep::handle_reorg(").unwrap() < clears[0].0);
     }

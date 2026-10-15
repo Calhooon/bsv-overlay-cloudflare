@@ -99,14 +99,15 @@ pub const HOP_CHANGED_NOTED_BACK_UNRESENT: &str = "hop_changed_noted_back_unrese
 /// to its `COUNTER_HOP_CHANGED_DROPPED` from its tests).
 pub const COUNTER_HOP_CHANGED_DROPPED: &str = "hop_changed_dropped_total";
 
-pub(crate) const COUNTERS: crate::change_flush::FlushCounters = crate::change_flush::FlushCounters {
-    undelivered: COUNTER_HOP_CHANGED_UNDELIVERED,
-    deferred: COUNTER_HOP_CHANGED_DEFERRED,
-    retried: COUNTER_HOP_CHANGED_RETRIED,
-    retry_failed: COUNTER_HOP_CHANGED_RETRY_FAILED,
-    resent: COUNTER_HOP_CHANGED_RESENT,
-    noted_back_unresent: HOP_CHANGED_NOTED_BACK_UNRESENT,
-};
+pub(crate) const COUNTERS: crate::change_flush::FlushCounters =
+    crate::change_flush::FlushCounters {
+        undelivered: COUNTER_HOP_CHANGED_UNDELIVERED,
+        deferred: COUNTER_HOP_CHANGED_DEFERRED,
+        retried: COUNTER_HOP_CHANGED_RETRIED,
+        retry_failed: COUNTER_HOP_CHANGED_RETRY_FAILED,
+        resent: COUNTER_HOP_CHANGED_RESENT,
+        noted_back_unresent: HOP_CHANGED_NOTED_BACK_UNRESENT,
+    };
 
 thread_local! {
     /// The identities noted back once after a failed POST (the retry is bounded at one), and those deferred past a
@@ -117,7 +118,12 @@ thread_local! {
 /// THE FLUSH of the hop set, transport injected (`ship` runs exactly this, and so do the pins, through a fake
 /// `post`): the identities in POSTs of at most [`HOP_CHANGED_CHUNK`], each body built by [`body_json`], under
 /// the bounds of [`crate::change_flush::ship_chunks`].
-pub async fn ship_with<P, Fut, C>(identities: Vec<String>, post: P, now_ms: C, deadline_ms: u64) -> crate::change_flush::Shipped<String>
+pub async fn ship_with<P, Fut, C>(
+    identities: Vec<String>,
+    post: P,
+    now_ms: C,
+    deadline_ms: u64,
+) -> crate::change_flush::Shipped<String>
 where
     P: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<usize, ()>>,
@@ -129,7 +135,8 @@ where
 /// What a flush owes after its POSTs ([`crate::change_flush::settle`] over this set's memory): the deferred part
 /// and a failed POST's entries (once) are noted back for the next flush. Returns the flush's account.
 pub fn settle(shipped: &crate::change_flush::Shipped<String>) -> crate::change_flush::Tally {
-    let (back, tally) = NOTED_BACK.with(|m| crate::change_flush::settle(&mut m.borrow_mut(), shipped));
+    let (back, tally) =
+        NOTED_BACK.with(|m| crate::change_flush::settle(&mut m.borrow_mut(), shipped));
     for id in back {
         insert(id);
     }
@@ -151,13 +158,26 @@ pub async fn ship(env: Env, identities: Vec<String>, deadline_ms: u64) {
     let total = identities.len();
     let shipped = ship_with(
         identities,
-        |body| crate::change_flush::post_body(&env, &url, &token, "/internal/hop-changed", "hop-changes", body),
+        |body| {
+            crate::change_flush::post_body(
+                &env,
+                &url,
+                &token,
+                "/internal/hop-changed",
+                "hop-changes",
+                body,
+            )
+        },
         || Date::now().as_millis(),
         deadline_ms,
     )
     .await;
     if !shipped.delivered.is_empty() {
-        console_log!("[hop-changes] notified {} identity(ies) in {} POST(s)", shipped.delivered.len(), shipped.posts);
+        console_log!(
+            "[hop-changes] notified {} identity(ies) in {} POST(s)",
+            shipped.delivered.len(),
+            shipped.posts
+        );
     }
     let tally = settle(&shipped);
     crate::change_flush::account(&env, "hop-changes", &COUNTERS, total, tally).await;
@@ -177,7 +197,10 @@ mod tests {
         let d = drain();
         assert_eq!(d, vec![a.clone(), b.clone()]);
         assert!(drain().is_empty());
-        assert_eq!(body_json(&d), format!("{{\"identities\":[\"{a}\",\"{b}\"]}}"));
+        assert_eq!(
+            body_json(&d),
+            format!("{{\"identities\":[\"{a}\",\"{b}\"]}}")
+        );
     }
 
     /// bsv-low #436 (lens fold, L6) through the real flush and a fake transport: nineteen identities ride three
@@ -192,7 +215,13 @@ mod tests {
             |b: String| {
                 bodies.borrow_mut().push(b);
                 let n = bodies.borrow().len();
-                async move { if n == 3 { Err(()) } else { Ok(0) } }
+                async move {
+                    if n == 3 {
+                        Err(())
+                    } else {
+                        Ok(0)
+                    }
+                }
             },
             || 0,
             1,
@@ -206,10 +235,34 @@ mod tests {
             seen.extend(arr.iter().map(|x| x.as_str().unwrap().to_string()));
         }
         assert_eq!(seen, ids, "every identity in exactly one body");
-        assert_eq!(settle(&shipped), crate::change_flush::Tally { retried: 3, ..Default::default() });
-        assert_eq!(drain(), ids[16..].to_vec(), "the failed chunk rides the next flush");
-        let again = crate::change_flush::run(ship_with(ids[16..].to_vec(), |_b: String| async { Err(()) }, || 0, 1));
-        assert_eq!(settle(&again), crate::change_flush::Tally { undelivered: 3, retry_failed: 3, resent: 3, ..Default::default() }, "a second failure is counted and let go");
+        assert_eq!(
+            settle(&shipped),
+            crate::change_flush::Tally {
+                retried: 3,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            drain(),
+            ids[16..].to_vec(),
+            "the failed chunk rides the next flush"
+        );
+        let again = crate::change_flush::run(ship_with(
+            ids[16..].to_vec(),
+            |_b: String| async { Err(()) },
+            || 0,
+            1,
+        ));
+        assert_eq!(
+            settle(&again),
+            crate::change_flush::Tally {
+                undelivered: 3,
+                retry_failed: 3,
+                resent: 3,
+                ..Default::default()
+            },
+            "a second failure is counted and let go"
+        );
         assert!(drain().is_empty());
     }
 }

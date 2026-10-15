@@ -134,7 +134,8 @@ fn e602_courier_functions_keep_the_response_body() {
 #[test]
 fn e602_fold_retire_callers_pass_the_woc_key_and_print_the_conflict_summary() {
     // The admin caller remains in lib.rs; cron and alarm share tick.rs.
-    let callers = (source("lib.rs") + &source("tick.rs")).replace("from_env(&env)", "from_env(env)");
+    let callers =
+        (source("lib.rs") + &source("tick.rs")).replace("from_env(&env)", "from_env(env)");
     let call = "run_retire_pass(&ops_db,&arcade_base,woc_key.as_deref(),crate::proof_fetcher::ProofSources::from_env(env),).await;";
     assert_eq!(
         callers.matches(call).count(),

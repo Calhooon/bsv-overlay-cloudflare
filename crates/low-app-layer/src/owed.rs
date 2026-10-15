@@ -1133,7 +1133,11 @@ fn hop_named_spender(i: &OwedInputs, h: &HopEntry) -> Option<String> {
 /// whose durable `homeproof:` latch the recompute reads byte-free ([`latched_retired_spenders`]) to retire a hop an
 /// earlier pass already proved home-spent, whatever this pass's spender courier cap withheld.
 pub fn hop_named_spenders(i: &OwedInputs) -> Vec<String> {
-    let mut out: Vec<String> = i.hops.iter().filter_map(|h| hop_named_spender(i, h)).collect();
+    let mut out: Vec<String> = i
+        .hops
+        .iter()
+        .filter_map(|h| hop_named_spender(i, h))
+        .collect();
     out.sort();
     out.dedup();
     out
@@ -5027,7 +5031,11 @@ pub(crate) mod tests {
         let without = build(&NONE);
         assert_eq!(without.len(), 1, "{without:?}");
         assert_eq!(
-            (without[0].outpoint.as_str(), without[0].family, without[0].sats),
+            (
+                without[0].outpoint.as_str(),
+                without[0].family,
+                without[0].sats
+            ),
             (kb.as_str(), OwedFamily::Unbound, Some(20_190))
         );
         assert!(without[0]
@@ -5061,7 +5069,13 @@ pub(crate) mod tests {
         let sweep = tx(0x31);
         let k = format!("{}:0", tx(0x11));
         let mut chain: HashMap<String, HopChainWord> = HashMap::new();
-        chain.extend(chain_confirmed(&k, true, Some(true), Some(sweep.as_str()), Some(true)));
+        chain.extend(chain_confirmed(
+            &k,
+            true,
+            Some(true),
+            Some(sweep.as_str()),
+            Some(true),
+        ));
         let mut pkhs: HashMap<String, String> = HashMap::new();
         pkhs.insert(tx(0x21), my_pkh.clone());
         let courier: HashSet<String> = [sweep.clone()].into_iter().collect();
