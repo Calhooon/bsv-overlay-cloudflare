@@ -461,7 +461,7 @@ pub fn decide(path: AdmissionPath, operator_authed: bool, mode: GateMode) -> Gat
 /// What actually constrains the route now is [`SubmitAction`]: the route
 /// consumes it through an EXHAUSTIVE match, so deleting the refusal arm is a
 /// COMPILE ERROR rather than a silent green. See
-/// [`crate::routes::tests`]' source pins for the branch that a match cannot
+/// `crate::routes::tests`' source pins for the branch that a match cannot
 /// cover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubmitPlan {
@@ -535,7 +535,7 @@ impl SubmitAction {
 
 /// Derive the ACTION — the form the route is obliged to consume exhaustively.
 ///
-/// **This also RECORDS the classification** ([`note`]), because the caller must
+/// **This also RECORDS the classification** (`note`), because the caller must
 /// not be able to choose what gets counted. `note` used to be `pub` and to take
 /// a `SubmitAction` by value, so the route could hand it a fabricated one: a
 /// re-gate passed `note(SubmitAction::ProceedWithNetworkGate(action.path()))`

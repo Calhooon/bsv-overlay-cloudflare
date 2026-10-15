@@ -1846,7 +1846,7 @@ fn beef_write_allowed(existing_len: Option<usize>, new_len: usize) -> bool {
 /// landing proof. `pot_beefs` (keyed
 /// by the stored tx's own txid) durably holds the funding AND spending
 /// (settle/refund) BEEFs; `store_beef` writes only when absent-or-longer
-/// ([`beef_write_allowed`]) and nothing ever deletes a row.
+/// (`beef_write_allowed`) and nothing ever deletes a row.
 pub struct D1PotStorage {
     db: Rc<D1Database>,
 }
@@ -3577,7 +3577,7 @@ const COLLECTED_ROWS_PER_PAIR: usize = 8;
 ///
 /// #327 S8: reads `collected_markers_v2` and returns every marker row per pair
 /// (the old table is write-frozen and its rows were carried over by the
-/// one-time migration), bounded to [`COLLECTED_ROWS_PER_PAIR`] per pair.
+/// one-time migration), bounded to `COLLECTED_ROWS_PER_PAIR` per pair.
 ///
 /// **The ordering is chosen against the documented attack, not by habit.** The
 /// squat is PRE-EMPTIVE — filed at deal time, long before the victim ever
@@ -6339,7 +6339,7 @@ pub mod hopparty_write {
     }
 
     /// A hopparty RE-LATCH that PROVABLY carries a freshly recomputed
-    /// `markerValid` (bsv-low#367) — the [`LatchedPotpartyRelatch`] shape,
+    /// `markerValid` (bsv-low#367) — the [`LatchedPotpartyRelatch`](crate::d1_discovery::potparty_write::LatchedPotpartyRelatch) shape,
     /// for the same reason and with the same guarantees.
     pub struct LatchedHoppartyRelatch {
         query: Query,

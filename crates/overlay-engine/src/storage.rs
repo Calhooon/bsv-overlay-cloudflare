@@ -88,7 +88,7 @@ pub trait Storage {
     /// rewriting its BEEF.
     ///
     /// This is the lightweight flag-flip used by
-    /// [`Engine::complete_missing_proofs`](crate::Engine::complete_missing_proofs)
+    /// [`Engine::complete_missing_proofs`](crate::engine::Engine::complete_missing_proofs)
     /// when a scanned candidate turns out to ALREADY be proven (its stored BEEF
     /// proves the target tx) yet its backend `has_proof` flag is still `0` —
     /// e.g. a GASP-synced tx that arrived with a proof, written before overlay
@@ -223,7 +223,7 @@ pub trait Storage {
     ///
     /// Backends MUST return only transactions whose own merkle proof is still
     /// missing — i.e. the historical/recent backlog the
-    /// [`Engine::complete_missing_proofs`](crate::Engine::complete_missing_proofs)
+    /// [`Engine::complete_missing_proofs`](crate::engine::Engine::complete_missing_proofs)
     /// cron is meant to clear. The reference D1 backend keeps a `has_proof`
     /// flag (overlay migration 0010), set on every BEEF write, and answers this
     /// with `WHERE has_proof = 0 LIMIT {limit}` — so every proofless tx is
@@ -574,7 +574,7 @@ pub struct PeerSyncHealth {
 
 /// Delegating impl so an `Rc<T: Storage>` is itself a `Storage` — lets a
 /// caller keep a shared handle to the concrete backend (e.g. a test advancing
-/// [`memory::MemoryStorage::advance_clock`]) while the engine owns a
+/// `memory::MemoryStorage::advance_clock`) while the engine owns a
 /// `Box<dyn Storage>` over the same instance. Pure delegation, no semantics.
 #[async_trait(?Send)]
 impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {

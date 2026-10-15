@@ -7,7 +7,7 @@
 //!    auth via `bsv-middleware-cloudflare`'s [`WorkerStorageClient`]. Exposes
 //!    typed methods — `create_action`, `list_outputs`, `process_action` —
 //!    that the `/renew` and `/advertise` route handlers will call.
-//! 2. **Local signer** ([`signer::sign_beef`]) — loads the
+//! 2. **Local signer** (`signer::sign_beef`) — loads the
 //!    `ADMIN_WALLET_PRIVATE_KEY` secret, consumes the unsigned transaction
 //!    template returned by `createAction`, produces a BIP-143 sighash per
 //!    input, and emits raw signed transaction bytes ready for

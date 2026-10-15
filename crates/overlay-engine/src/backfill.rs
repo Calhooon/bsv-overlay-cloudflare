@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 /// 600 measured SQL statements or 500 trait/network operations, leaving room for
 /// schema startup, an in-flight guarded submit and bookkeeping.
 /// These are conservative application bounds, not a CPU or SQL-row estimate.
-/// Source: https://developers.cloudflare.com/workers/platform/limits/
-/// Source: https://developers.cloudflare.com/d1/platform/limits/
+/// Source: <https://developers.cloudflare.com/workers/platform/limits/>
+/// Source: <https://developers.cloudflare.com/d1/platform/limits/>
 pub const BACKFILL_REQUEST_MS: u64 = 180_000;
 /// The most trait and network operations one backfill request runs ([`BACKFILL_REQUEST_MS`] gives the reasoning).
 pub const BACKFILL_OPERATIONS: u64 = 500;

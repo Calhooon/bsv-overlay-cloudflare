@@ -1021,7 +1021,7 @@ impl AncestorFetcher for ChainProofFetcher {
     /// Re-verify a STORED bump against chaintracks (the header source is the
     /// only arbiter of a merkle root). Used by proof completion to refuse
     /// trusting an admit-time structural bump that was never SPV-verified or is
-    /// forged. Fail-closed via [`verify_bump`].
+    /// forged. Fail-closed via `verify_bump`.
     async fn verify_proof(&self, txid: &str, bump_hex: &str) -> bool {
         verify_bump(self.tracker.as_deref(), bump_hex, txid).await
     }
@@ -1497,7 +1497,7 @@ pub struct PotProofSummary {
 /// PROOF-ONLY fetch → chaintracks-verify (both inside
 /// [`ChainProofFetcher::verified_proof_for`], reusing the raw already in the
 /// stored BEEF — no redundant raw fetch, #192/#193 FIX 2) → stitch the BUMP →
-/// `trim_known_proven` → [`PotStorage::compact_pot_beef`] (which BYPASSES the
+/// `trim_known_proven` → [`PotStorage::compact_pot_beef`](overlay_discovery::pot::storage::PotStorage::compact_pot_beef) (which BYPASSES the
 /// longer-wins guard AND re-checks the proof, fail-closed).
 ///
 /// FAIL-CLOSED throughout: a candidate the fetcher can't verify is skipped
@@ -2573,7 +2573,7 @@ pub struct SpendConfirmSummary {
     pub displaced: usize,
     /// Reconcile pipelines ENTERED this tick — an `Ok(None)` row the chaser
     /// asked the chain about, whatever the outcome. Bounded by
-    /// [`DISPLACE_CAP_PER_TICK`].
+    /// `DISPLACE_CAP_PER_TICK`.
     pub displace_attempts: usize,
     /// Reconcile pipeline REFUSALS + READ FAULTS: hint/raw/proof transport
     /// faults, plus hints that FAILED the content-addressed input binding (a
@@ -2608,7 +2608,7 @@ const DISPLACE_CAP_PER_TICK: usize = 4;
 /// fetch + chaintracks-verify the SPENDING tx's bump
 /// ([`AncestorFetcher::verified_proof_for`] — the raw-free, budget-bounded
 /// path), and on a verified `Some` latch `spentConfirmed = 1` via
-/// [`PotStorage::mark_spent`] with `confirmed = true` (an UPGRADE that never
+/// [`PotStorage::mark_spent`](overlay_discovery::pot::storage::PotStorage::mark_spent) with `confirmed = true` (an UPGRADE that never
 /// downgrades a confirmed row).
 ///
 /// FAIL-CLOSED: a spend the fetcher can't verify against chaintracks is left
@@ -2619,7 +2619,7 @@ const DISPLACE_CAP_PER_TICK: usize = 4;
 ///
 /// The candidate read and the confirmed write are separated by awaits (the
 /// proof fetch), so the write goes through
-/// [`PotStorage::mark_confirmed_for_spender`] — conditional on the row's
+/// [`PotStorage::mark_confirmed_for_spender`](overlay_discovery::pot::storage::PotStorage::mark_confirmed_for_spender) — conditional on the row's
 /// spend pointer STILL being the spender the proof was verified FOR
 /// (`WHERE … AND spendingTxid = ?`, the `verdict_cas_sql` idiom). Pre-#301
 /// the unguarded `mark_spent(confirmed = true)` re-wrote the pointer from
@@ -2632,7 +2632,7 @@ const DISPLACE_CAP_PER_TICK: usize = 4;
 /// covers both miss shapes:
 /// - pointer moved to an UNCONFIRMED S2 (an `output_spent` last-writer
 ///   displacement): the row still matches `spent = 1 AND spentConfirmed =
-///   0`, so [`PotStorage::find_spent_unconfirmed`] re-surfaces it and the
+///   0`, so [`PotStorage::find_spent_unconfirmed`](overlay_discovery::pot::storage::PotStorage::find_spent_unconfirmed) re-surfaces it and the
 ///   next tick chases the CURRENT pointer (the displacement restamped
 ///   `spentAt`, so the #228 push-first age gate re-applies to S2 —
 ///   correct: it is S2's push window now);
@@ -2985,7 +2985,7 @@ pub struct ParamsBackfillSummary {
 ///    failure still records `lockKind='covenant'` with NULL params), bare
 ///    2-of-3, plain P2PKH, or unrecognized (`lockKind` NULL) — in EVERY
 ///    case `paramsDecoded` latches 1 (decode attempted + recorded), written
-///    through [`PotStorage::store_record`]'s decoded-column upsert (which
+///    through [`PotStorage::store_record`](overlay_discovery::pot::storage::PotStorage::store_record)'s decoded-column upsert (which
 ///    never touches spend state);
 /// 4. if the row is SPENT, its spender's BEEF is stored, and the lock
 ///    decoded to a covenant: compute the verdict for the CURRENT
@@ -3302,7 +3302,7 @@ pub struct SettleSignersBackfillSummary {
 ///    verified against the committed triple over the network\'s own BIP-143
 ///    digest). No pair verifying latches 'unresolved';
 /// 4. re-derive the verdict from the same bytes and CAS the whole group via
-///    [`PotStorage::mark_verdict_for_spender`] (pointer-guarded — a moved
+///    [`PotStorage::mark_verdict_for_spender`](overlay_discovery::pot::storage::PotStorage::mark_verdict_for_spender) (pointer-guarded — a moved
 ///    pointer makes it a no-op). The re-derived verdict equals the stored
 ///    one for any row the same classifier wrote (deterministic function of
 ///    bytes); if the re-derivation comes up empty the STORED verdict string
@@ -4353,12 +4353,12 @@ pub(crate) fn push_log(msg: &str) {
 ///    VERIFIED-proven (the `proof_verified` latch, bsv-low#304 — NOT byte
 ///    structure: a structurally-bumped admit row carries an untrusted bump
 ///    this free verified push should REPLACE and latch), stitch the bump,
-///    trim, and [`PotStorage::compact_pot_beef`] (which re-checks the
+///    trim, and [`PotStorage::compact_pot_beef`](overlay_discovery::pot::storage::PotStorage::compact_pot_beef) (which re-checks the
 ///    proof, fail-closed) — same shape as one [`complete_pot_beef_proofs`]
 ///    candidate, minus the courier fetch.
 /// 2. `pot_records`: every outpoint whose recorded spender is `txid` and is
 ///    still unconfirmed is upgraded via the #301 GUARDED CAS
-///    ([`PotStorage::mark_confirmed_for_spender`]) — the spending tx
+///    ([`PotStorage::mark_confirmed_for_spender`](overlay_discovery::pot::storage::PotStorage::mark_confirmed_for_spender)) — the spending tx
 ///    verifiably mined, which is exactly the #186 chaser's latch condition.
 ///    The rows were SELECTED by `spendingTxid = txid`, but the selection and
 ///    the per-row writes straddle awaits (gate M1 — the same race class the

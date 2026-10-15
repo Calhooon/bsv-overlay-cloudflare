@@ -471,7 +471,7 @@ pub async fn broadcast_tx_hex_gated(
 /// gate that ALSO polls, but a corroborator's word overrides another
 /// broadcaster's explicit REJECTED — a 200-shaped ack without a real
 /// network-accept marker must NOT do that. The bar is the SAME one the primary
-/// Arcade gate uses: `txStatus` rank ≥ [`ARCADE_GATE_STATUS`]
+/// Arcade gate uses: `txStatus` rank ≥ `ARCADE_GATE_STATUS`
 /// (`SEEN_ON_NETWORK`; ARC and Arcade share the status vocabulary), or an
 /// already-known dress (the network provably HAS the tx).
 ///
@@ -1952,7 +1952,7 @@ where
 
 /// INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — the ladder for a subject Arcade
 /// ALREADY holds terminal (pre-flight probe: REJECTED / DOUBLE_SPEND_ATTEMPTED).
-/// PURE control flow, natively wiring-tested like [`broadcast_efs_gated_with`].
+/// PURE control flow, natively wiring-tested like `broadcast_efs_gated_with`.
 ///
 /// No submit rung runs: re-POSTing the subject to Arcade cannot change a
 /// verdict its engine has already reached, and every such POST re-spins its
@@ -2544,7 +2544,7 @@ impl ArcadeBroadcaster {
 
     /// admit-fast (bsv-low 2026-09-15): answer the gate on Arcade's
     /// synchronous accept — `submit_once_and_gate` returns
-    /// [`GateStep::SyncAccepted`] on a 2xx whose echo is below SEEN instead of
+    /// `GateStep::SyncAccepted` on a 2xx whose echo is below SEEN instead of
     /// polling; a fatal / orphan / already-SEEN echo still decides first. The
     /// witness moves to the background (the route's pending watch).
     #[must_use]
@@ -2745,14 +2745,14 @@ impl ArcadeBroadcaster {
     /// its validator view has gone provably stale (REJECTED for txs that MINED)
     /// — so before an exhausted ladder becomes a definitive `Rejected` (→ 422,
     /// which the client treats as terminal by design), a SECOND broadcaster
-    /// (TAAL → GorillaPool, [`corroborate_tx_hex`]) must corroborate. Its real
+    /// (TAAL → GorillaPool, `corroborate_tx_hex`) must corroborate. Its real
     /// network accept admits; its rejection confirms the 422; anything else is
     /// an honest `Err`/502. A synchronous validation failure (SyncRejected)
-    /// stays uncorroborated — see [`ladder_step`].
+    /// stays uncorroborated — see `ladder_step`.
     ///
     /// #267: Arcade's ACCEPT is not trusted on its own either, when the
     /// subject has UNPROVEN ancestry — every accept-shaped exit passes
-    /// [`gate_accept_claim_with`] (corroborate-on-accept; a single-EF subject
+    /// `gate_accept_claim_with` (corroborate-on-accept; a single-EF subject
     /// keeps the fast path — see that function's honest-residual note and
     /// bsv-low#268). And an ORPHAN view (`SEEN_IN_ORPHAN_MEMPOOL`)
     /// short-circuits the subject-only rungs straight to the ancestry rungs —
@@ -2760,7 +2760,7 @@ impl ArcadeBroadcaster {
     /// parents, never with a Pending→timeout→502 and never with an admit.
     ///
     /// This is a thin transport-injection wrapper: the ladder control flow
-    /// lives in [`broadcast_efs_gated_with`] (natively wiring-tested); this
+    /// lives in `broadcast_efs_gated_with` (natively wiring-tested); this
     /// method supplies the real Arcade submit/poll and TAAL→GorillaPool
     /// corroboration transports.
     pub async fn broadcast_efs_gated<Y>(

@@ -273,7 +273,7 @@ pub fn classify_spend_signers(
 /// The ONE production entry point (bsv-low #406): classify a covenant pot
 /// spend's signers from the committed params + the spender's raw bytes.
 ///
-/// Rebuilds the funding lock from the params ([`covenant_lock_of`] — proven
+/// Rebuilds the funding lock from the params ([`covenant_lock_of`](crate::pot::covenant_lock_of) — proven
 /// inverse of the extractor, so byte-exact for every builder-made lock; a
 /// non-canonical hand-built lock degrades to `None`, never a wrong answer)
 /// and re-checks stake conservation (`stakeA + stakeB == pot_sats`, the

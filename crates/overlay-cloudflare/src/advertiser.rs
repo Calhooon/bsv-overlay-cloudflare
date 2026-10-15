@@ -10,7 +10,7 @@
 //! deployment crate is us.
 //!
 //! Without a real advertiser, the every-15-minutes
-//! [`overlay_engine::Engine::sync_advertisements`] no-ops, so our overlay
+//! [`overlay_engine::Engine::sync_advertisements`](overlay_engine::engine::Engine::sync_advertisements) no-ops, so our overlay
 //! publishes no on-chain `SHIP`/`SLAP` tokens and no peer (bsvb.tech, other
 //! rust-overlays) can discover the topics we carry. GASP sync then has no
 //! peers and every UHRP advert lives only on this instance — the network
@@ -27,8 +27,8 @@
 //! 4. `wallet-infra.processAction` — records + broadcasts via ARC.
 //! 5. Wrap in AtomicBEEF and return as [`TaggedBEEF`] tagged `tm_ship` /
 //!    `tm_slap`; the engine feeds it to its own `submit` which runs
-//!    [`overlay_discovery::ship::SHIPTopicManager`] /
-//!    [`overlay_discovery::slap::SLAPTopicManager`] → writes to D1.
+//!    [`overlay_discovery::ship::SHIPTopicManager`](overlay_discovery::ship::topic_manager::SHIPTopicManager) /
+//!    [`overlay_discovery::slap::SLAPTopicManager`](overlay_discovery::slap::topic_manager::SLAPTopicManager) → writes to D1.
 //!
 //! `find_all_advertisements` does **not** go through `LookupResolver` — it
 //! reads directly from our own [`SHIPStorage`] / [`SLAPStorage`] D1 tables

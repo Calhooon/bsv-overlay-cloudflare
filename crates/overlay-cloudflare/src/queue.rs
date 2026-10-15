@@ -726,7 +726,7 @@ pub fn landed_ack(
     }
 }
 
-/// The consumer's read of a keyed message's bytes: the object, checked ([`check_replay_blob`]).
+/// The consumer's read of a keyed message's bytes: the object, checked (`check_replay_blob`).
 pub async fn read_beef(env: &worker::Env, r: &BeefRef) -> Result<Vec<u8>, BlobFault> {
     let bucket = env
         .bucket(BEEF_BLOBS_BINDING)

@@ -466,7 +466,7 @@ pub struct MutationReport {
     /// belt re-presents read the empty STEAK as index-pending).
     pub deduped_topics: Vec<String>,
     /// The predecessors the door LANDED first from this submit's BEEF, as
-    /// `(txid, topic)`, ancestors first ([`Engine::land_carried`]; the E1D
+    /// `(txid, topic)`, ancestors first (`Engine::land_carried`; the E1D
     /// delta fold, L2). Each is an admission write of its own that no
     /// caller asked for: a caller that guards its admission writes (the
     /// worker's eviction ledger, bsv-low #513) guards these too.
@@ -479,7 +479,7 @@ pub struct MutationReport {
     /// report undurable.
     pub walk_could_not_run: Option<WalkCouldNotRun>,
     /// The walks of the carried predecessors this submit tried to land
-    /// ([`Engine::land_carried`]) that could not run within the budget (the
+    /// (`Engine::land_carried`) that could not run within the budget (the
     /// E592 lens fold, L3): under `NotNow` each one's landing did not happen
     /// (the successor waits), under `NetworkAccepted` each went on. Counted
     /// by the caller beside `walk_could_not_run`.
@@ -545,7 +545,7 @@ impl MutationReport {
 /// counted the BODY: 64 unproven transactions, 256 inputs per transaction,
 /// 512 KB per transaction, and the parse's own size and counts. A valid BEEF
 /// is never left unjudged for its size or its counts, so those are gone: the
-/// walk reads the body through the streaming reader ([`crate::script_door`]).
+/// walk reads the body through the streaming reader (`crate::script_door`).
 ///
 /// TWO LIMBS, both a budget whose breach is "the network judges" and never a
 /// refusal: the WORK the interpreter will do, and the MEMORY the door will
@@ -1059,7 +1059,7 @@ impl Engine {
 
     /// Set the admission predicate asked BEFORE the door lands a carried
     /// predecessor (bsv-low #575, the E1D delta-2 fold, L2;
-    /// [`Engine::land_carried`]). It is asked once per body the landing
+    /// `Engine::land_carried`). It is asked once per body the landing
     /// would submit, before that body's submit (a dry one included) and
     /// before its reads are charged; an `Err` (the caller's refusal, or its
     /// own read fault) ends the landing with nothing of that body written
@@ -1260,7 +1260,7 @@ impl Engine {
     /// The budget of the submit's own script walk (bsv-low #592, the owner's
     /// ruling 3a of 2026-10-10). Every submit that walks (every mode but
     /// `HistoricalTxNoSpv`), and the GASP anchor check, read the BEEF through
-    /// the door's stream walk ([`crate::script_door`]) under this budget's
+    /// the door's stream walk (`crate::script_door`) under this budget's
     /// two limbs, the work and the memory, each estimated from the bytes
     /// before it is spent. A breach is "the walk could not run"
     /// ([`WalkCouldNotRun`], on [`MutationReport::walk_could_not_run`]),
@@ -1301,7 +1301,7 @@ impl Engine {
     /// engine, the E592 lens fold's NOTE-2): the work is bounded statically
     /// before anything executes, and the interpreter's stack memory limit is
     /// the budget's element limit. The body is read through the streaming
-    /// reader ([`crate::script_door`], bsv-low #585): no bound on its size,
+    /// reader (`crate::script_door`, bsv-low #585): no bound on its size,
     /// its transactions or a transaction's inputs or bytes; the budget's two
     /// limbs are the work and the memory beside the body.
     ///
@@ -4329,7 +4329,7 @@ impl Engine {
     /// 4. Skips (does NOT error) txs the fetcher can't prove yet (still
     ///    unconfirmed) — those are simply retried on a later tick.
     ///
-    /// **No-op when no [`AncestorFetcher`] is configured** — production-safe
+    /// **No-op when no [`AncestorFetcher`](crate::gasp::AncestorFetcher) is configured** — production-safe
     /// default (the same opt-in switch as GASP ancestor hydration). Bounded by
     /// `limit` (a per-tick budget, like the platform fetcher's own budget).
     ///

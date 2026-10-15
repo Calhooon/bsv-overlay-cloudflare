@@ -810,7 +810,7 @@ async fn settle_job(db: &D1Database, reference: &str, state: &str, status: u16, 
 /// 3, no `retry_delay`, `wrangler.toml`). A redelivery that finds the row
 /// `running` and touched less than [`JOB_RESUME_AFTER_MS`] ago takes nothing
 /// and is acked (the live-run guard below). A redelivery later than that
-/// (the platform's delay is its own) is a [`JOB_TAKE_SQL`], one of the
+/// (the platform's delay is its own) is a `JOB_TAKE_SQL`, one of the
 /// [`JOB_ATTEMPTS`]; after `max_retries` the message dead-letters and the
 /// dead letter consumer parks it as an `unparsed:` fault letter (its body
 /// carries no BEEF and no `r2`), counted against the ceiling's 2,000 rows.

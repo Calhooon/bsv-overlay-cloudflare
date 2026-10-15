@@ -177,7 +177,7 @@ impl RelatchSummary {
 /// `Row` carries the stored verdict AND the record, because the decision "does
 /// this need writing?" belongs to the pass while the VERDICT belongs to the
 /// write (epoch Rule 15: never hand a call site a decision it can get wrong —
-/// [`RelatchTable::relatch`] derives the verdict from the record itself and is
+/// [`RelatchTable::relatch_if_changed`] derives the verdict from the record itself and is
 /// given no way to be told one).
 #[async_trait(?Send)]
 pub trait RelatchTable {

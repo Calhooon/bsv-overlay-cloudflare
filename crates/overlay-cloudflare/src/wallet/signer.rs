@@ -533,7 +533,7 @@ pub enum InputUnlock<'a> {
 ///   non-P2PKH locking script
 /// - [`SignError::WrongKey`] — neither the BRC-29-derived child nor the
 ///   admin root owns a `P2pkh` input's script (see
-///   [`resolve_p2pkh_input_key`])
+///   `resolve_p2pkh_input_key`)
 /// - [`SignError::Crypto`] — ECDSA failure
 pub fn sign_transaction_mixed(
     template: &CreateActionResult,

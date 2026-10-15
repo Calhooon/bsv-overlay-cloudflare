@@ -206,7 +206,7 @@ pub enum UnevalWhy {
     /// tx and land on the NETWORK's verdict for it — unknowable here, so the
     /// honest state is the third one. An honest submit never trips this: its
     /// subject is the tip of its own ancestry, so the closure covers every
-    /// entry (see [`beef_has_entries_outside_subject_ancestry`] for the
+    /// entry (see `beef_has_entries_outside_subject_ancestry` for the
     /// probe-earned generalisation from "childless" to "closure-covering").
     ///
     /// Also the answer when NO reader gives the ancestry (the stream refuses

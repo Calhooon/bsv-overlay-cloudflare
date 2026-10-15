@@ -65,7 +65,7 @@ pub struct CreateActionInput {
     pub input_description: String,
 }
 
-/// Arguments for [`client::Wallet::create_action`].
+/// Arguments for [`client::Wallet::create_action`](crate::wallet::client::Wallet::create_action).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AbortActionRequest {
@@ -74,7 +74,7 @@ pub struct AbortActionRequest {
     pub reference: String,
 }
 
-/// Result of [`client::Wallet::abort_action`].
+/// Result of [`client::Wallet::abort_action`](crate::wallet::client::Wallet::abort_action).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AbortActionResult {
@@ -178,10 +178,10 @@ pub struct UnsignedOutput {
     pub derivation_suffix: Option<String>,
 }
 
-/// What [`client::Wallet::create_action`] returns.
+/// What [`client::Wallet::create_action`](crate::wallet::client::Wallet::create_action) returns.
 ///
 /// This is the "template" the Worker must sign. After signing, pass it into
-/// [`client::Wallet::process_action`] alongside the raw signed tx bytes.
+/// [`client::Wallet::process_action`](crate::wallet::client::Wallet::process_action) alongside the raw signed tx bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateActionResult {
@@ -219,7 +219,7 @@ fn default_version() -> u32 {
 // listOutputs
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Arguments for [`client::Wallet::list_outputs`]. Used by `/renew` to find
+/// Arguments for [`client::Wallet::list_outputs`](crate::wallet::client::Wallet::list_outputs). Used by `/renew` to find
 /// the caller's existing UHRP advert UTXO, and by `/list` to enumerate all
 /// adverts owned by a given identity key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,7 +279,7 @@ pub struct Outpoint {
     pub vout: u32,
 }
 
-/// What [`client::Wallet::list_outputs`] returns.
+/// What [`client::Wallet::list_outputs`](crate::wallet::client::Wallet::list_outputs) returns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListOutputsResult {
@@ -298,7 +298,7 @@ pub struct ListOutputsResult {
 // processAction
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Arguments for [`client::Wallet::process_action`].
+/// Arguments for [`client::Wallet::process_action`](crate::wallet::client::Wallet::process_action).
 ///
 /// Exactly matches wallet-infra's `StorageProcessActionArgs` shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,7 +327,7 @@ pub struct ProcessActionRequest {
     pub send_with: Vec<String>,
 }
 
-/// What [`client::Wallet::process_action`] returns.
+/// What [`client::Wallet::process_action`](crate::wallet::client::Wallet::process_action) returns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessActionResult {
