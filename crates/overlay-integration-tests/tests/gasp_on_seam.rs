@@ -228,23 +228,51 @@ fn fan_in() -> (Vec<Transaction>, Vec<GASPNode>) {
 }
 
 /// What one run gave: the peer's calls, the sync results, the rows, the
-/// cursor, the engine's own submits and, per tick, the host's words.
+/// cursor (at the end, and after each tick), the engine's own submits and,
+/// per tick, the host's words.
 struct Ran {
     peer: Vec<String>,
     results: Vec<String>,
     rows: BTreeMap<String, String>,
+    cursors: Vec<u64>,
     submits: Vec<String>,
     heard: Vec<Vec<Heard>>,
     ran: Vec<String>,
     graphs: Vec<GraphHeard>,
 }
 
+/// The independent `x` the peer lists ABOVE the fan-in's root (score 2; the
+/// root `r` at 1), so a cursor moved past a held root is seen: the peer
+/// lists `score >= since`, and a cursor at 2 no longer lists `r`.
+fn beside_x() -> Transaction {
+    genesis(52, 1)
+}
+
 /// Each tick: the log's manager errs at the finalize on that txid (`None`:
 /// healthy). `mode` `None`: no host is set and the mode stays `off`.
 async fn run(ticks: &[Option<String>], mode: Option<AdmissionMode>, budgeted: bool) -> Ran {
-    let (txs, nodes) = fan_in();
+    run_in(false, ticks, mode, budgeted).await
+}
+
+/// [`run`], with [`beside_x`] listed above the root when `beside`.
+async fn run_in(
+    beside: bool,
+    ticks: &[Option<String>],
+    mode: Option<AdmissionMode>,
+    budgeted: bool,
+) -> Ran {
+    let (mut txs, mut nodes) = fan_in();
+    if beside {
+        let x = beside_x();
+        nodes.push(node(&x, honest_proof(&x.id(), 103)));
+        txs.push(x);
+    }
     let events = Events::default();
-    let remote = ChaosRemote::new(&nodes, &[(&txs[2], 0, 1.0)], &events);
+    let mut listed = vec![(&txs[2], 0, 1.0)];
+    if beside {
+        listed.push((&txs[3], 0, 2.0));
+    }
+    let remote = ChaosRemote::new(&nodes, &listed, &events);
     let store = Rc::new(MemoryStorage::new());
     let submits = Rc::default();
     let mut engine = sync_engine(&store, &remote, &submits);
@@ -258,6 +286,7 @@ async fn run(ticks: &[Option<String>], mode: Option<AdmissionMode>, budgeted: bo
     }
     let mut results = Vec::new();
     let mut heard = Vec::new();
+    let mut cursors = Vec::new();
     for fails in ticks {
         *host.fails.borrow_mut() = fails.clone();
         let result = engine.start_gasp_sync().await.unwrap();
@@ -265,6 +294,7 @@ async fn run(ticks: &[Option<String>], mode: Option<AdmissionMode>, budgeted: bo
         topics.sort_by_key(|(topic, _)| topic.as_str());
         results.push(serde_json::to_string(&topics).unwrap());
         heard.push(host.take());
+        cursors.push(store.get_last_interaction(PEER, TOPIC).await.unwrap());
     }
     let all: Vec<_> = txs.iter().collect();
     let mut rows = served_rows(store.as_ref(), &all).await;
@@ -284,6 +314,7 @@ async fn run(ticks: &[Option<String>], mode: Option<AdmissionMode>, budgeted: bo
         peer,
         results,
         rows,
+        cursors,
         submits,
         heard,
         ran,
@@ -317,39 +348,50 @@ fn print_heard(name: &str, ran: &Ran) {
     }
 }
 
-/// Item 1. The fan-in, the log's manager erring at the finalize on `a`: the
-/// host's sink hears the bodies parents first (`a` and `b` in the peer's
-/// order, `r` last) with the gate's reasons: `b` lands; `a` `not now`,
-/// `parent_error`; `r` `not now`, `waiting_on [a]` (the erring parent and the
-/// root held, neither run past `a`'s unit). The engine submits nothing of its
-/// own. The cursor stays below `r` (the host's word). The next sync, the
-/// manager healed, re-sends the waiting part: `a` and `r` land, and the rows
-/// are a first-time graph's (the same as the engine's own `off` finalize of a
-/// healthy fan-in). With and without a per-peer budget (the hook's path).
+/// Item 1. The fan-in, the log's manager erring at the finalize on `a`, the
+/// independent `x` listed above its root: the host's sink hears the bodies
+/// parents first (`a` and `b` in the peer's order, `r` last) with the gate's
+/// reasons: `b` lands; `a` `not now`, `parent_error`; `r` `not now`,
+/// `waiting_on [a]` (the erring parent and the root held, neither run past
+/// `a`'s unit); `x` lands. The engine submits nothing of its own. The cursor
+/// stays below `r` (the host's word) after the erring tick, though `x` above
+/// it landed (the seam lens's L1: a cursor moved past `r` no longer lists
+/// it, so the re-send below proves the cursor held). The next sync, the
+/// manager healed, re-sends the waiting part: `a` and `r` land, the cursor
+/// passes both UTXOs, and the rows are a first-time graph's (the same as the
+/// engine's own `off` finalize of a healthy fan-in). With and without a
+/// per-peer budget (the hook's path).
 #[tokio::test]
 async fn s1_the_host_hears_the_fan_in_parents_first_with_the_gates_reasons_and_the_resync_lands() {
     let (txs, _) = fan_in();
     let [a, b, r] = [0, 1, 2].map(|i| txs[i].id());
+    let x = beside_x().id();
     for budgeted in [false, true] {
-        let on = run(&[Some(a.clone()), None], Some(AdmissionMode::On), budgeted).await;
+        let on = run_in(
+            true,
+            &[Some(a.clone()), None],
+            Some(AdmissionMode::On),
+            budgeted,
+        )
+        .await;
         print_heard(&format!("S1 budgeted={budgeted}"), &on);
+        println!("S1 budgeted={budgeted} cursors {:?}", on.cursors);
         assert_eq!(
             on.submits,
             Vec::<String>::new(),
             "the engine's own finalize did not submit"
         );
-        let first = &on.heard[0];
+        let first: Vec<_> = on.heard[0].iter().filter(|h| h.txid != x).collect();
         assert_eq!(
-            first
-                .iter()
-                .map(|h| h.txid.clone())
-                .collect::<Vec<_>>()
-                .len(),
+            first.len(),
             3,
             "the host heard every body of the graph: {first:?}"
         );
         assert_eq!(first[2].txid, r, "parents first: the root last");
-        let by: HashMap<_, _> = first.iter().map(|h| (h.txid.clone(), h.clone())).collect();
+        let by: HashMap<_, _> = on.heard[0]
+            .iter()
+            .map(|h| (h.txid.clone(), h.clone()))
+            .collect();
         assert_eq!(
             by[&b],
             Heard {
@@ -375,6 +417,15 @@ async fn s1_the_host_hears_the_fan_in_parents_first_with_the_gates_reasons_and_t
             }
         );
         assert_eq!(
+            by[&x],
+            Heard {
+                txid: x.clone(),
+                word: "landed".into(),
+                gate: None
+            },
+            "the independent UTXO above the root lands"
+        );
+        assert_eq!(
             on.graphs[0],
             (
                 r.clone(),
@@ -386,10 +437,15 @@ async fn s1_the_host_hears_the_fan_in_parents_first_with_the_gates_reasons_and_t
             ),
             "the erring parent and the root held"
         );
+        assert_eq!(on.graphs[1], (x.clone(), 1, vec![]));
         assert!(
             !on.ran.iter().take(2).any(|t| t == &r),
             "the root never ran on the erring tick: {:?}",
             on.ran
+        );
+        assert_eq!(
+            on.cursors[0], 0,
+            "after the erring tick the cursor stays below the held root (score 1), though x (score 2) landed"
         );
         // The re-sync: the waiting part, re-sent, lands.
         assert_eq!(
@@ -408,8 +464,10 @@ async fn s1_the_host_hears_the_fan_in_parents_first_with_the_gates_reasons_and_t
             ],
             "the re-sync lands the waiting part"
         );
-        assert_eq!(on.graphs[1], (r.clone(), 2, vec![]));
-        let off = run(&[None], None, budgeted).await;
+        assert_eq!(on.graphs[2], (r.clone(), 2, vec![]));
+        assert_eq!(on.cursors[1], 2, "the re-sync passes both UTXOs");
+        let off = run_in(true, &[None], None, budgeted).await;
+        assert_eq!(off.cursors, vec![2], "off: the cursor passes both");
         assert_eq!(
             on.rows, off.rows,
             "after the re-sync the rows (and the cursor) are a first-time graph's"
