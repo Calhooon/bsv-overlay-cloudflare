@@ -95,3 +95,16 @@ jobs:
         --lib
     - run: cargo build --manifest-path workers/Cargo.toml --workspace --release --target wasm32-unknown-unknown
         --lib
+  machete:
+    name: machete
+    runs-on: ubuntu-latest
+    # Unused dependencies (bsv-stack-lean #137): non-blocking until the keeper
+    # names it a required context.
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      with:
+        toolchain: 1.95.0
+    - run: cargo install cargo-machete --version 0.9.2 --locked --root "$RUNNER_TEMP/tools"
+    - run: '"$RUNNER_TEMP/tools/bin/cargo-machete" --with-metadata .'
