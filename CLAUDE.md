@@ -2844,3 +2844,5 @@ both KV and SQLite backends to delete the alarm only at dates `2026-02-24` or la
 The workerd DO pin sets an alarm, deletes all keys, and observes the alarm still set at the configured date.
 The folded cleanup sets its tombstone alarm AFTER delete_all and retains only the consumed deadline until
 that alarm removes it; its correctness no longer depends on the old alarm surviving deleteAll().
+
+The owed list's courier-bytes swept payout also reaches confirmed ("home on chain") from a CHAINTRACKS-checked mined proof of the sweep (`OwedInputs::proof_mined_spenders`, gated by `txany::proof_mined_word`'s `confirmed && height` bound through `mined_proof_matches`, never a courier's bare height) read beside the spent-any ladder's single-WoC `spent_confirmed` so a hop whose only confirming courier faulted still confirms, the rows staying `claimable:false`; the MEDIUM-1 residual (bsv-low #692, follow-up #693) is that the proof fallback is timing-dependent, firing only on a pass that asks the sweep's `/tx-any` before its bytes go durable (#672), narrowed not eliminated and self-healing either way.
