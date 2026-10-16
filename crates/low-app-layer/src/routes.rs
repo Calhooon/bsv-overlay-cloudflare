@@ -1193,15 +1193,21 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
 ///    pots; **attribution** built from the spine's own latched resolution
 ///    ([`crate::logic::attributions_from_pot_rows`]) so the fold and the
 ///    page can never disagree.
-/// 4. **Decoration**: each pot's oldest `RESULT_ROWS_PER_POT` markers
+/// 4. **Markers**: each pot's oldest `RESULT_ROWS_PER_POT` markers
 ///    ([`crate::logic::pot_markers_sql`], chunked) plus the ERA-WIDE lowest
-///    verified winner hands ([`crate::logic::era_hands_sql`]) — both
-///    bounded by the page, never by the history — and the `proof_markers`
-///    pointer superset keyed to the markers' `(gameId, winner)` pairs.
+///    verified winner hands ([`crate::logic::era_hands_sql`]) — both bounded
+///    by the page, never by the history.
 /// 5. **The fold** (`aggregate_leaderboard_attributed`, UNCHANGED): wins
 ///    minted from chain facts only, the winner's own verified marker
 ///    decorating; then the board is cut to the page's owners in rank order
 ///    (the hands pots' owners may lie beyond the page).
+/// 6. **Proof decoration** (bsv-low #685, RC-L32): over the PAGE-LOCAL
+///    evidence set, in DISPLAY priority (`leaderboard_decoration_pairs`: the
+///    lowest-hand board, each identity's pinned best, then the top rows), the
+///    `proof_markers` pointer superset and the `proof_posts` posted-set are
+///    fetched for the first [`crate::logic::LEADERBOARD_PROOF_PAIRS_CAP`]
+///    pairs and stamped on. A pair past that budget is served `proofPending`
+///    (`stamp_leaderboard_decoration`), NEVER a false `proofPosted: false`.
 ///
 /// FAIL-SAFE, as before: a spine / pots / statuses D1 fault is the SAME 503
 /// the client handles — NEVER a fabricated empty board; the marker, hands
@@ -1499,26 +1505,40 @@ pub async fn compute_leaderboard_body_string(
             )
         };
 
-    // proof_markers pointers, KEYED to the markers' own (gameId, winner)
-    // pairs — the bounded SUPERSET per key (#332 HIGH-1; the client filters
-    // by transcript validity). BEST-EFFORT.
+    // 5) The fold (UNCHANGED) — wins minted from chain facts, the winner's own
+    // verified marker decorating — then cut to the page in rank order. Proof
+    // decoration is DEFERRED to the page-local set below (#685): the aggregator
+    // is handed NO pointers, so the budget is spent on the served rows in
+    // display priority, not on an incidental marker-order prefix.
+    let mut lb = crate::logic::aggregate_leaderboard_attributed(
+        &markers,
+        &statuses,
+        &std::collections::HashMap::new(),
+        page,
+        &verdicts,
+        &attributions,
+        &params_by_pot,
+        &signers_by_pot,
+    );
+    crate::logic::retain_page_owners(&mut lb, &owners);
+
+    // Proof DECORATION as a budget of ROOM over the PAGE-LOCAL evidence set,
+    // ordered by display priority (bsv-low #685, RC-L32): the lowest-hand
+    // board, each identity's pinned best, then the top-ranked rows are fetched
+    // FIRST, so a board larger than LEADERBOARD_PROOF_PAIRS_CAP drops only its
+    // deep tail to `proofPending` — never the rows a client renders, and never
+    // a false `proofPosted: false`. The two chunk loops stay bounded by the cap
+    // exactly as before; only the SELECTION (and ORDER) of pairs changed, and
+    // the pairs are already lowercase (the page's own evidence keys).
+    let decorate_pairs =
+        crate::logic::leaderboard_decoration_pairs(&lb, crate::logic::LEADERBOARD_PROOF_PAIRS_CAP);
+
+    // proof_markers pointers, KEYED to the page-local (gameId, winner) pairs —
+    // the bounded SUPERSET per key (#332 HIGH-1; the client filters by
+    // transcript validity). BEST-EFFORT: a fault omits the hint, never a count.
     let mut proof_map: std::collections::HashMap<(String, String), Vec<String>> =
         std::collections::HashMap::new();
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    let mut seen_pairs = std::collections::HashSet::new();
-    for m in &markers {
-        if pairs.len() >= crate::logic::LEADERBOARD_PROOF_PAIRS_CAP {
-            break; // display-hint bound only — counts are unaffected
-        }
-        let key = (
-            m.game_id.to_ascii_lowercase(),
-            m.winner.to_ascii_lowercase(),
-        );
-        if seen_pairs.insert(key) {
-            pairs.push((m.game_id.clone(), m.winner.clone()));
-        }
-    }
-    for chunk in pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+    for chunk in decorate_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
         let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
         for (g, w) in chunk {
             b.push(JsValue::from_str(g));
@@ -1556,16 +1576,15 @@ pub async fn compute_leaderboard_body_string(
         }
     }
 
-    // 5) The fold — unchanged — then cut to the page in rank order.
-    // Proof-in-DB (2026-09-02): the posted-bundle set over the same pairs —
-    // stamped onto the evidence AFTER aggregation (a posted proof is not a
-    // marker; the aggregator has nothing to count).
+    // Proof-in-DB (2026-09-02): the posted-bundle set over the same page-local
+    // pairs (a posted proof is not a marker; the aggregator has nothing to
+    // count). BEST-EFFORT.
     let mut posted: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    for chunk in pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+    for chunk in decorate_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
         let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
         for (g, w) in chunk {
-            b.push(JsValue::from_str(&g.to_ascii_lowercase()));
-            b.push(JsValue::from_str(&w.to_ascii_lowercase()));
+            b.push(JsValue::from_str(g));
+            b.push(JsValue::from_str(w));
         }
         let stmt = match db
             .prepare(crate::proof_post::proof_posted_sql(chunk.len()))
@@ -1596,24 +1615,17 @@ pub async fn compute_leaderboard_body_string(
         }
     }
 
-    let mut lb = crate::logic::aggregate_leaderboard_attributed(
-        &markers,
-        &statuses,
-        &proof_map,
-        page,
-        &verdicts,
-        &attributions,
-        &params_by_pot,
-        &signers_by_pot,
-    );
-    if !posted.is_empty() {
-        for row in lb.board.iter_mut() {
-            for e in row.evidence.iter_mut() {
-                e.proof_posted = posted.contains(&(e.game_id.clone(), e.winner.clone()));
-            }
-        }
+    // Stamp the decorated rows; a row the budget could not reach is served
+    // `proofPending`, counted for the budget-hit signal (#685).
+    let budget_hits =
+        crate::logic::stamp_leaderboard_decoration(&mut lb, &decorate_pairs, &proof_map, &posted);
+    if budget_hits > 0 {
+        crate::courier::note_presence_n(
+            crate::logic::LEADERBOARD_DECORATION_BUDGET_HIT,
+            budget_hits as u64,
+        );
     }
-    crate::logic::retain_page_owners(&mut lb, &owners);
+
     Ok((
         200,
         leaderboard_body(&lb, computed_at, markers.len(), truncated, next_after),

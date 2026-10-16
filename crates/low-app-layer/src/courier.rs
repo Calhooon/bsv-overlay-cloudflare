@@ -142,7 +142,18 @@ static BY_CALLER: [AtomicU64; 6] = [z(), z(), z(), z(), z(), z()];
 
 /// Semantic outcomes share the existing batched durable counter flush.
 pub fn note_presence(name: &str) {
-    PENDING.with(|p| *p.borrow_mut().entry(name.to_string()).or_insert(0) += 1);
+    note_presence_n(name, 1);
+}
+
+/// Add `n` to a semantic counter in one borrow (a per-request total, e.g. the
+/// rows a `/leaderboard` served past its decoration budget, #685). `n == 0` is
+/// a no-op, so the caller need not guard it. Counts as ONE call for the flush
+/// gate — it is one request's tally, not `n` courier calls.
+pub fn note_presence_n(name: &str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    PENDING.with(|p| *p.borrow_mut().entry(name.to_string()).or_insert(0) += n);
     PENDING_CALLS.with(|c| c.set(c.get() + 1));
 }
 
@@ -349,5 +360,26 @@ mod tests {
         assert_eq!(index_of(&CALLERS, "nope"), CALLERS.len() - 1);
         assert_eq!(index_of(&PROVIDERS, "other"), PROVIDERS.len() - 1);
         assert_eq!(index_of(&CALLERS, "hops_view"), 1);
+    }
+
+    /// `note_presence_n` adds the whole per-request total in one borrow and
+    /// counts as ONE call; `n == 0` is a no-op (so the #685 budget-hit caller
+    /// need not guard it). Runs on this test's own thread, so PENDING is fresh.
+    #[test]
+    fn note_presence_n_adds_the_total_and_zero_is_a_no_op() {
+        note_presence_n("leaderboard_decoration_budget_hit_total", 3);
+        note_presence_n("leaderboard_decoration_budget_hit_total", 2);
+        note_presence_n("ignored_total", 0);
+        let drained = take_pending_if_due(1_000.0);
+        let got: BTreeMap<String, u64> = drained.into_iter().collect();
+        assert_eq!(
+            got.get("leaderboard_decoration_budget_hit_total").copied(),
+            Some(5),
+            "both bumps fold into the one durable delta"
+        );
+        assert!(
+            !got.contains_key("ignored_total"),
+            "a zero bump writes nothing"
+        );
     }
 }
