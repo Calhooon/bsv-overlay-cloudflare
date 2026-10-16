@@ -2762,6 +2762,7 @@ mod tests {
             my_pkh_by_game: &no_pkhs,
             home_spends: &no_home_words,
             retired_spenders: &none,
+            proof_mined_spenders: &none,
         })
     }
 

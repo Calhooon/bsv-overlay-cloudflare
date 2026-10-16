@@ -2071,6 +2071,7 @@ fn issue_526_a_stranded_hop_with_a_hopparty_row_and_an_unspent_output_is_served_
             my_pkh_by_game: &no_pkhs,
             home_spends: &no_home,
             retired_spenders: &Default::default(),
+            proof_mined_spenders: &Default::default(),
         })
     };
     let word = |spent: bool, spender: Option<&str>| -> HashMap<String, HopChainWord> {
@@ -2418,6 +2419,7 @@ mod door_refusals {
             my_pkh_by_game: &no_pkhs,
             home_spends: &no_home,
             retired_spenders: &Default::default(),
+            proof_mined_spenders: &Default::default(),
         });
         (rows, door)
     }

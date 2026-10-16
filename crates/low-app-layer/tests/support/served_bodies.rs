@@ -176,6 +176,7 @@ fn fleet_served_bodies_are_byte_identical_before_and_after_derivation() {
                 my_pkh_by_game: &Default::default(),
                 home_spends: &Default::default(),
                 retired_spenders: &Default::default(),
+                proof_mined_spenders: &Default::default(),
             });
             let mut owed = owed;
             for row in &mut owed {

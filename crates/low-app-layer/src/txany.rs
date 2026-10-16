@@ -507,6 +507,18 @@ pub fn fact_reader_raw_hex(answer: &TxAnyAnswer) -> Option<&str> {
     answer.raw_hex.as_deref()
 }
 
+/// bsv-low #692 (RC-L34-OWED-COURIER-RETIRE): is this `/tx-any` answer a CHAINTRACKS-CHECKED mined word?
+/// `confirmed == Some(true)` AND a proven `height` — the index BUMP's (`decide_tx_any`'s index leg), or the
+/// external leg's `/proof/tsc` bound through [`mined_proof_matches`] against the canonical root chaintracks holds
+/// at that height (`routes::tx_any_external_leg`). It is NEVER a courier's bare `claimed_height` (that never sets
+/// `confirmed`/`height`), never a first-party SEEN (`confirmed == Some(false)`), never the honest unknown
+/// (`confirmed == None`). The owed recompute reads it to let a swept payout's mined-confirmation fall back to the
+/// proof when the spent-any ladder's only confirming courier (WoC `/0/spent`) faults; absence stays "could not
+/// look" (this answers `false`, never a fabricated confirmation).
+pub fn proof_mined_word(answer: &TxAnyAnswer) -> bool {
+    answer.confirmed == Some(true) && answer.height.is_some()
+}
+
 /// The pure `/tx-any` decision table (unit-tested; the route feeds it real
 /// observations). `index_raw_hex` is the raw extracted from a STORED BEEF
 /// (already txid-bound by `extract_raw_tx_hex`); `index_height` is the BUMP
@@ -942,6 +954,56 @@ mod tests {
             970733,
             &"33".repeat(32)
         ));
+    }
+
+    /// bsv-low #692 (RC-L34): [`proof_mined_word`] is a CHAINTRACKS-CHECKED mined word (`confirmed == Some(true)`
+    /// AND a proven `height`), never a courier's BARE claimed height, never a first-party SEEN, never the honest
+    /// unknown. This is the sole gate between the owed recompute's swept-payout confirmation and the external leg,
+    /// so a courier's `blockheight` (#606) can never confirm a payout without a proof checked against our headers.
+    #[test]
+    fn e692_c_only_a_chaintracks_checked_mined_word_is_a_proof_mined_word() {
+        // a proven mined word: the external leg's `/proof/tsc` bound against the canonical root, or the index BUMP
+        let proven = TxAnyAnswer {
+            present: Some(true),
+            confirmed: Some(true),
+            height: Some(970_733),
+            source: Some("external"),
+            ..TxAnyAnswer::default()
+        };
+        assert!(proof_mined_word(&proven));
+        // a courier's BARE claimed height (#606: a display-tier claim, NEVER verified): confirmed/height unset
+        let bare_height = TxAnyAnswer {
+            raw_hex: Some("0100".into()),
+            claimed_height: Some(970_733),
+            hint_source: Some("woc"),
+            source: Some("external"),
+            ..TxAnyAnswer::default()
+        };
+        assert!(
+            !proof_mined_word(&bare_height),
+            "a courier's bare blockheight never confirms"
+        );
+        // confirmed CLAIM with NO proven height (never trust it as mined): the owed caller must see a proven height
+        let no_height = TxAnyAnswer {
+            present: Some(true),
+            confirmed: Some(true),
+            height: None,
+            claimed_height: Some(970_733),
+            ..TxAnyAnswer::default()
+        };
+        assert!(
+            !proof_mined_word(&no_height),
+            "confirmed without a proven height is never a proof-mined word"
+        );
+        // first-party SEEN (present, unconfirmed): not mined
+        let seen = TxAnyAnswer {
+            present: Some(true),
+            confirmed: Some(false),
+            ..TxAnyAnswer::default()
+        };
+        assert!(!proof_mined_word(&seen));
+        // the honest unknown (a courier fault): could not look, never a confirmation
+        assert!(!proof_mined_word(&TxAnyAnswer::default()));
     }
 
     #[test]
