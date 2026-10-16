@@ -1465,7 +1465,27 @@ pub fn leaderboard_unknown_pot_quota(limit: usize) -> usize {
 /// is "not evaluated") — NEVER a false `proofPosted: false`, and never a
 /// count. This is a DISPLAY bound; the `proof_pointers` superset-per-key
 /// bound ([`PROOF_POINTERS_PER_KEY`]) is a different, orthogonal cost cap.
-pub const LEADERBOARD_PROOF_PAIRS_CAP: usize = 512;
+///
+/// bsv-low #685 MEDIUM-1 (RC option (c)): the cap IS the full page-local set's
+/// own bound, so every rendered row is decorated and the residual is closed (a
+/// low-ranked identity's pinned best falling to `proofPending` at a near-max
+/// page, where priorities (1) hands and (2) pinned-bests could together exceed
+/// a flat 512). [`leaderboard_decoration_pairs`] draws its candidates ONLY from
+/// `lb.board[].evidence[]`, and the marker window is at most
+/// [`LEADERBOARD_RESULT_ROWS_PER_POT`] rows per pot over at most
+/// [`LEADERBOARD_MAX_LIMIT`] distinct pots, so the page-local pair count can
+/// never exceed this product: the two chunk loops stay bounded by the PAGE,
+/// never the history. The display-priority order and the `proofPending` tail
+/// stay as a defensive backstop (a page that somehow exceeded this bound would
+/// drop only its deep tail, never a hand or a pinned best).
+pub const LEADERBOARD_PROOF_PAIRS_CAP: usize =
+    LEADERBOARD_MAX_LIMIT * LEADERBOARD_RESULT_ROWS_PER_POT;
+
+// The decoration cap must cover the whole page-local set (#685 MEDIUM-1): if a
+// later edit lowers it below the page's own marker bound, a near-max page would
+// drop rendered rows to `proofPending` again. Guarded at compile time.
+const _: () =
+    assert!(LEADERBOARD_PROOF_PAIRS_CAP >= LEADERBOARD_MAX_LIMIT * LEADERBOARD_RESULT_ROWS_PER_POT);
 
 /// The durable counter the route bumps by the number of board-evidence rows
 /// served PAST the decoration budget (#685) — rows carried as `proofPending`
@@ -4918,22 +4938,57 @@ mod tests {
         format!("000102030{last:01x}")
     }
 
-    /// RC-L32: a fleet page with MORE distinct (gameId, winner) pairs than the
-    /// cap, where a LATE-sorting identity (its whole history past an `owner
-    /// ASC` prefix) carries the viewer's pinned best. Every rendered row's
-    /// pointer is present when filed; the deep tail degrades to pending.
+    /// Reproduce MAIN's pre-#685 decoration selection so its RED is
+    /// reproducible BY CONSTRUCTION, not by reverting the fix in place
+    /// (bsv-low #685 MEDIUM-2). Main built the decorated pairs from the marker
+    /// window in `owner ASC` (identity-lexicographic) order and broke at the
+    /// budget, so a late-sorting identity's games all fell past the boundary
+    /// and lost their pointer. This mirrors that order over the board's own
+    /// evidence: identity-ascending, evidence order within a row, deduped,
+    /// truncated to `budget`.
+    fn main_owner_order_pairs(lb: &Leaderboard, budget: usize) -> Vec<(String, String)> {
+        use std::collections::HashSet;
+        let mut rows: Vec<&LeaderboardBoardRow> = lb.board.iter().collect();
+        rows.sort_by(|a, b| a.identity.cmp(&b.identity));
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for row in rows {
+            for e in &row.evidence {
+                if pairs.len() >= budget {
+                    return pairs;
+                }
+                let key = (e.game_id.clone(), e.winner.clone());
+                if seen.insert(key.clone()) {
+                    pairs.push(key);
+                }
+            }
+        }
+        pairs
+    }
+
+    /// RC-L32: a fleet page with MORE distinct (gameId, winner) pairs than a
+    /// FLAT 512 budget, where a LATE-sorting identity (its whole history past
+    /// an `owner ASC` prefix) carries the viewer's pinned best. Under the fix's
+    /// DISPLAY priority every rendered row's pointer is present when filed; the
+    /// deep tail degrades to pending.
     ///
-    /// RED on main: main spends the budget over the marker window in owner
-    /// order, so the late identity's games are ALL past the cap and served
-    /// `proofPosted: false` — the pinned best never carries its filed proof.
+    /// RED ON MAIN BY CONSTRUCTION (bsv-low #685 MEDIUM-2): `main_owner_order_pairs`
+    /// reproduces main's owner-ASC selection over the SAME fixture and the SAME
+    /// budget, and the pin asserts it DROPS the late identity's filed-proof
+    /// pinned best (the RC defect), while `leaderboard_decoration_pairs` COVERS
+    /// it. The defect is the ORDER, not the budget size, so the two selections
+    /// are compared at one fixed budget.
     #[test]
     fn decoration_budget_covers_every_rendered_row_not_an_owner_prefix() {
-        // 30 identities, each with 25 games = 750 distinct pairs > the 512 cap.
+        // Main's historical FLAT cap (the fixture exceeds it; the production cap
+        // now covers the whole page-local set, MEDIUM-1, pinned separately).
+        let budget = 512usize;
+        // 30 identities, each with 25 games = 750 distinct pairs > the budget.
         // Equal wins ⇒ the board is ranked `owner ASC`, so the lexicographically
         // LAST identity's games are exactly the owner-order tail main dropped.
         let n_ids = 30usize;
         let games_each = 25usize;
-        assert!(n_ids * games_each > LEADERBOARD_PROOF_PAIRS_CAP);
+        assert!(n_ids * games_each > budget);
         let mut board = Vec::new();
         for i in 0..n_ids {
             let identity = format!("02{:064x}", i); // ascending ⇒ owner-ASC order
@@ -4965,16 +5020,24 @@ mod tests {
             created_at: Some(1),
         }];
         let mut lb = Leaderboard { board, hands };
+        let viewer_pair = (viewer_best_game.clone(), viewer.clone());
 
-        // The decoration pairs under the real cap.
-        let pairs = leaderboard_decoration_pairs(&lb, LEADERBOARD_PROOF_PAIRS_CAP);
-        assert_eq!(
-            pairs.len(),
-            LEADERBOARD_PROOF_PAIRS_CAP,
-            "the budget is spent"
-        );
+        // RED ON MAIN BY CONSTRUCTION: main's owner-ASC prefix spends the flat
+        // budget before it reaches the late identity, so the viewer's
+        // filed-proof pinned best is DROPPED (served `proofPosted: false`).
+        let main_pairs = main_owner_order_pairs(&lb, budget);
+        assert_eq!(main_pairs.len(), budget, "main spends the flat budget");
         assert!(
-            pairs.contains(&(viewer_best_game.clone(), viewer.clone())),
+            !main_pairs.contains(&viewer_pair),
+            "RED on main: the owner-ASC prefix drops the late identity's pinned best"
+        );
+
+        // The fix: display priority decorates the viewer's pinned best FIRST,
+        // at the SAME budget (the defect was the ORDER, not the budget size).
+        let pairs = leaderboard_decoration_pairs(&lb, budget);
+        assert_eq!(pairs.len(), budget, "the budget is spent");
+        assert!(
+            pairs.contains(&viewer_pair),
             "the late identity's pinned best is decorated FIRST (display priority), \
              not dropped as an owner-order tail"
         );
@@ -4983,11 +5046,9 @@ mod tests {
         // pointer indexed (proof_markers). A deep-tail pair of the late
         // identity is NOT filed.
         let posted: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::from([(viewer_best_game.clone(), viewer.clone())]);
-        let proof_map = std::collections::HashMap::from([(
-            (viewer_best_game.clone(), viewer.clone()),
-            vec!["txPROOF".to_string()],
-        )]);
+            std::collections::HashSet::from([viewer_pair.clone()]);
+        let proof_map =
+            std::collections::HashMap::from([(viewer_pair.clone(), vec!["txPROOF".to_string()])]);
         let hits = stamp_leaderboard_decoration(&mut lb, &pairs, &proof_map, &posted);
 
         // The viewer's pinned-best row carries its filed proof.
@@ -5010,7 +5071,7 @@ mod tests {
 
         // Some rows fell past the budget (750 - 512 = 238) and are PENDING,
         // never a false proofPosted:false.
-        assert_eq!(hits, n_ids * games_each - LEADERBOARD_PROOF_PAIRS_CAP);
+        assert_eq!(hits, n_ids * games_each - budget);
         let pending_row = lb
             .board
             .iter()
@@ -5043,6 +5104,58 @@ mod tests {
             }
         }
         assert!(saw_pending, "the deep tail reached the wire as pending");
+    }
+
+    /// bsv-low #685 MEDIUM-1: at the PRODUCTION cap the whole page-local set is
+    /// decorated, so a near-max page leaves NO rendered row pending. The cap is
+    /// the page-local set's own upper bound, so a page can never exceed it; a
+    /// fixture past a flat 512 (but within the bound) decorates every pair and
+    /// pends none.
+    #[test]
+    fn decoration_at_the_production_cap_covers_the_full_page_local_set() {
+        // The cap covers the whole page-local set (its own marker bound); that
+        // invariant is guarded at compile time beside the constant.
+        // 25 identities x 25 games = 625 distinct pairs: past a flat 512, well
+        // inside the production cap.
+        let n_ids = 25usize;
+        let games_each = 25usize;
+        assert!(n_ids * games_each > 512);
+        assert!(n_ids * games_each <= LEADERBOARD_PROOF_PAIRS_CAP);
+        let mut board = Vec::new();
+        for i in 0..n_ids {
+            let identity = format!("03{i:064x}");
+            let mut evs = Vec::new();
+            for g in 0..games_each {
+                let game = format!("{:064x}", 900_000 + i * 1000 + g);
+                let cards = cards_scoring(((g % 8) + 4) as u8);
+                evs.push(decor_ev(&game, &identity, Some(&cards), (g as i64) + 1));
+            }
+            board.push(decor_row(&identity, evs));
+        }
+        let mut lb = Leaderboard {
+            board,
+            hands: Vec::new(),
+        };
+        let pairs = leaderboard_decoration_pairs(&lb, LEADERBOARD_PROOF_PAIRS_CAP);
+        assert_eq!(
+            pairs.len(),
+            n_ids * games_each,
+            "every page-local pair is decorated at the production cap"
+        );
+        let hits = stamp_leaderboard_decoration(
+            &mut lb,
+            &pairs,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(hits, 0, "no rendered row falls to proofPending");
+        assert!(
+            lb.board
+                .iter()
+                .flat_map(|r| r.evidence.iter())
+                .all(|e| !e.proof_pending),
+            "the near-max page pends no row"
+        );
     }
 
     /// The display priority order: hands first (score asc), then each board

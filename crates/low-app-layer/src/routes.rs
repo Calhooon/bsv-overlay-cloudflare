@@ -1525,11 +1525,14 @@ pub async fn compute_leaderboard_body_string(
     // Proof DECORATION as a budget of ROOM over the PAGE-LOCAL evidence set,
     // ordered by display priority (bsv-low #685, RC-L32): the lowest-hand
     // board, each identity's pinned best, then the top-ranked rows are fetched
-    // FIRST, so a board larger than LEADERBOARD_PROOF_PAIRS_CAP drops only its
-    // deep tail to `proofPending` — never the rows a client renders, and never
-    // a false `proofPosted: false`. The two chunk loops stay bounded by the cap
-    // exactly as before; only the SELECTION (and ORDER) of pairs changed, and
-    // the pairs are already lowercase (the page's own evidence keys).
+    // FIRST. Since #685 MEDIUM-1 the budget (LEADERBOARD_PROOF_PAIRS_CAP) is
+    // the page-local set's own bound (LEADERBOARD_MAX_LIMIT times
+    // RESULT_ROWS_PER_POT), so every rendered row is decorated and carries its
+    // filed proof; the display priority and the `proofPending` tail stay a
+    // defensive backstop (a page past that bound would drop only its deep tail,
+    // never the rows a client renders, and never a false `proofPosted: false`).
+    // The two chunk loops stay bounded by the PAGE, never the history; the
+    // pairs are already lowercase (the page's own evidence keys).
     let decorate_pairs =
         crate::logic::leaderboard_decoration_pairs(&lb, crate::logic::LEADERBOARD_PROOF_PAIRS_CAP);
 
