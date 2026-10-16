@@ -3937,6 +3937,11 @@ async fn owed_recompute_inner(
     let mut spender_inputs: HashMap<String, Vec<(String, u32)>> = HashMap::new();
     // the spenders whose bytes the COURIERS supplied (the gate's M3): a real payout with no index proof to credit from
     let mut courier_spenders: HashSet<String> = HashSet::new();
+    // bsv-low #692 (RC-L34): the spenders this pass holds a CHAINTRACKS-CHECKED mined proof for (a `/tx-any` answer,
+    // `caller=owed`, whose `/proof/tsc` was bound through `mined_proof_matches`): `crate::txany::proof_mined_word`.
+    // A swept payout's `confirmed` reads it beside the spent-any ladder's `spent_confirmed`, so a hop's mined
+    // confirmation survives a WoC `/0/spent` fault. Captured wherever a `/tx-any` answer is in hand this pass.
+    let mut proof_mined_spenders: HashSet<String> = HashSet::new();
     let mut courier_cap_hit = false;
     // bsv-low #662, the L25-WITHHELD lens's LOW-1: the spender look ledger (`owed::SpenderLook`). A spender is
     // WITHHELD only on a noted cap, clock or tail and no look; every read made or answer used, faulted or not, is
@@ -4054,6 +4059,9 @@ async fn owed_recompute_inner(
                     // is never re-bought
                     if let Some(a) = tx_any_cached(&sp, now_f) {
                         spender_look.look(&sp, crate::owed::SpenderLooked::CachedAnswer);
+                        if crate::txany::proof_mined_word(&a) {
+                            proof_mined_spenders.insert(sp.clone());
+                        }
                         if let Some(parsed) = parse_spender_answer(&a, &sp) {
                             owed_spender_outputs_memo_put(&sp, &parsed);
                             courier_spenders.insert(sp.clone());
@@ -4158,6 +4166,9 @@ async fn owed_recompute_inner(
             }
             if let Some(a) = tx_any_cached(&sp, now_f) {
                 spender_look.look(&sp, crate::owed::SpenderLooked::CachedAnswer);
+                if crate::txany::proof_mined_word(&a) {
+                    proof_mined_spenders.insert(sp.clone());
+                }
                 if let Some(parsed) = parse_spender_answer(&a, &sp) {
                     owed_spender_outputs_memo_put(&sp, &parsed);
                     courier_spenders.insert(sp.clone());
@@ -4168,6 +4179,12 @@ async fn owed_recompute_inner(
             }
             spender_look.look(&sp, crate::owed::SpenderLooked::CourierAsked);
             let a = resolve_tx_any(None, None, &sp, now_f, "owed", env).await;
+            // bsv-low #692 (RC-L34): the sweep's own `/tx-any`, `caller=owed`, fetched and bound its `/proof/tsc`
+            // against chaintracks; a checked-mined word lets the swept payout reach "home on chain" even when the
+            // spent-any ladder's only confirming courier (WoC `/0/spent`) faulted. Never a courier's bare height.
+            if crate::txany::proof_mined_word(&a) {
+                proof_mined_spenders.insert(sp.clone());
+            }
             if a.source != Some("memo") {
                 // a courier was really asked: the slot, and the stamp that sends this spender to the back of the
                 // never-asked-first order (a verdict-memo answer costs nothing and is not an ask); the durable
@@ -4236,6 +4253,7 @@ async fn owed_recompute_inner(
         my_pkh_by_game: &my_pkh_by_game,
         home_spends: &no_home_words,
         retired_spenders: &no_retired,
+        proof_mined_spenders: &proof_mined_spenders,
     };
     // 6c. bsv-low #485: the home outputs of the CONFIRMED courier-proven payouts (the candidates are the derivation's
     //     own: `owed::courier_home_outputs`), looked at within a small budget, so such a row can RETIRE on evidence
@@ -4272,6 +4290,41 @@ async fn owed_recompute_inner(
     }
     inputs.retired_spenders = &retired;
     let mut rows = derive_owed_rows(&inputs);
+    // bsv-low #692 (RC-L34): a swept payout that reached "home on chain" from a chaintracks-checked mined PROOF of
+    // the sweep (the spent-any ladder's confirming courier WoC `/0/spent` faulted). Counted for the operator, and —
+    // for the chain-rung path (an around-the-overlay sweep the index never held, `spent` not the index's word) —
+    // the hop's chain-rung probe memo is UPGRADED to a confirmed spend so the confirmation is durable and does not
+    // FLAP back to "not mined yet" on the next pass once the sweep's bytes are served from the durable store
+    // (no `/tx-any` is re-asked then). The memo is a plain hop outpoint, so the overlay's reorg clear demotes it on
+    // reorg (never an app-layer latch prefix): the proof stays chaintracks-bound, a reorg unmakes it. Zero extra
+    // statements when no row confirmed by proof (the common case, and the budget fixture): the write is guarded.
+    let swept_by_proof = crate::owed::count_swept_confirmed_by_proof(&rows);
+    if swept_by_proof > 0 {
+        crate::owed::note_swept_confirmed_by_proof(swept_by_proof);
+        let proof_memos: Vec<crate::hops_view::ProbeMemo> = rows
+            .iter()
+            .filter(|r| {
+                r.facts.get("confirmedSource").and_then(|v| v.as_str()) == Some("proof")
+                    && r.facts.get("spent").and_then(|v| v.as_bool()) != Some(true)
+            })
+            .filter_map(|r| {
+                let hop_txid = r.facts.get("hopTxid").and_then(|v| v.as_str())?;
+                let hop_vout =
+                    u32::try_from(r.facts.get("hopVout").and_then(|v| v.as_u64())?).ok()?;
+                let sweep = r.facts.get("sweepTxid").and_then(|v| v.as_str())?;
+                Some(crate::hops_view::ProbeMemo {
+                    outpoint: crate::hops_view::probe_memo_key(hop_txid, hop_vout),
+                    probed_at_ms: now_ms,
+                    spent: true,
+                    spending_txid: Some(sweep.to_ascii_lowercase()),
+                    spent_confirmed: Some(true),
+                })
+            })
+            .collect();
+        if !proof_memos.is_empty() {
+            write_probe_memos(db, &proof_memos).await;
+        }
+    }
     // H1/L2: a deferred older row keeps a counted "could not judge" sentence, with its press cleared.
     // The next cursor page refreshes it from evidence; no bounded pass silently erases the tail.
     for r in &mut rows {

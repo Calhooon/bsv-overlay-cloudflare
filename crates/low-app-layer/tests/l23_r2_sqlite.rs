@@ -384,6 +384,7 @@ fn derive_for_hops(
         my_pkh_by_game: &homes,
         home_spends: &Default::default(),
         retired_spenders: &Default::default(),
+        proof_mined_spenders: &Default::default(),
     })
 }
 

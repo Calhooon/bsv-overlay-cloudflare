@@ -899,6 +899,16 @@ pub struct OwedInputs<'a> {
     /// Consulted in [`derive_owed_rows`] only on the byte-free path (`swept_home` `None`), so the bytes-in-hand
     /// answer is unchanged. Empty when no latch was read or the read faulted (then the pass judges as before).
     pub retired_spenders: &'a HashSet<String>,
+    /// bsv-low #692 (RC-L34-OWED-COURIER-RETIRE): non-pot spender txids (lowercase) for which THIS recompute holds
+    /// a CHAINTRACKS-CHECKED mined proof — the `/tx-any` answer's `confirmed == Some(true)` with a proven `height`
+    /// (the index BUMP's, or the external leg's `/proof/tsc` bound through [`crate::txany::mined_proof_matches`],
+    /// `caller=owed`). A courier's bare `claimedHeight` is NEVER here ([`crate::txany::proof_mined_word`]). A swept
+    /// payout's `confirmed` reads it BESIDE the spent-any ladder's `spent_confirmed` ([`non_pot_spender`]), so a
+    /// hop's mined-confirmation gains a fallback when the ladder's only confirming courier (WoC `/0/spent`) faults
+    /// and the fallback (BananaBlocks) cannot carry the confirmation. The proof stays chaintracks-bound; absence
+    /// stays "could not look" (the set is simply empty for that spender). Empty when no spender was proof-mined
+    /// this pass.
+    pub proof_mined_spenders: &'a HashSet<String>,
 }
 
 /// The 20-byte pkh of a standard P2PKH locking script (`76 a9 14 <20> 88 ac`), lowercase hex; `None` for any other lock.
@@ -2284,10 +2294,9 @@ fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(Stri
             return if i.pot_spenders.contains(&s) || pointer_refuted(i, &s, h) {
                 None
             } else {
-                Some((
-                    s.clone(),
-                    spender_mined(i, Some(&s), h.spent_confirmed == Some(true)),
-                ))
+                let confirmed = spender_mined(i, Some(&s), h.spent_confirmed == Some(true))
+                    || i.proof_mined_spenders.contains(&s);
+                Some((s.clone(), confirmed))
             };
         }
     }
@@ -2299,10 +2308,11 @@ fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(Stri
     if i.pot_spenders.contains(&s) || pointer_refuted(i, &s, h) {
         return None;
     }
-    Some((
-        s.clone(),
-        spender_mined(i, Some(&s), w.spent_confirmed == Some(true)),
-    ))
+    // bsv-low #692 (RC-L34): the spent-any ladder's `spent_confirmed` OR a chaintracks-checked mined proof of the
+    // sweep this pass holds (the only confirming courier, WoC `/0/spent`, can fault; the proof is the fallback).
+    let confirmed = spender_mined(i, Some(&s), w.spent_confirmed == Some(true))
+        || i.proof_mined_spenders.contains(&s);
+    Some((s.clone(), confirmed))
 }
 
 /// The games whose `collected` filings the recompute must read: every SPENT pot the results name AND every hop the
@@ -3101,12 +3111,25 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     .is_some_and(|s| s.eq_ignore_ascii_case(&swept.sweep_txid))
                     && h.spent_confirmed == Some(true);
                 let word = i.hop_chain.get(&outpoint);
+                // bsv-low #692 (RC-L34): the spent-any ladder's own word (the hop row's `by_index`, or the chain
+                // rung's `spent_confirmed`) is the courier-confirmed source; a proof-confirmation the ladder did NOT
+                // supply (its only confirming courier WoC `/0/spent` faulted) is named "proof" — a chaintracks-checked
+                // mined word of the sweep, never a courier's bare status or height. The order keeps every prior label.
+                let chain_rung_confirmed = word.is_some_and(|w| w.spent_confirmed == Some(true));
                 facts["confirmedSource"] = json!(if swept.index_proven {
                     "index-proof"
                 } else if spender_mined(i, Some(&swept.sweep_txid), false) {
                     "tracker-proof"
                 } else if by_index {
                     "index"
+                } else if chain_rung_confirmed {
+                    if word.and_then(|w| w.age_ms).is_some() {
+                        "chain-memo"
+                    } else {
+                        "chain-probe"
+                    }
+                } else if i.proof_mined_spenders.contains(&swept.sweep_txid) {
+                    "proof"
                 } else if word.and_then(|w| w.age_ms).is_some() {
                     "chain-memo"
                 } else {
@@ -3844,6 +3867,10 @@ static SWEEP_PROOFS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// #517 (the gate's LOW-1): a proven filed sweep met a CONTRADICTING confirmed spender (the hop row's or the chain
 /// rung's) and the proof did not decide — a reorg the latch missed, for the operator to see.
 static SWEEP_PROOF_CONTRADICTIONS: AtomicU64 = AtomicU64::new(0);
+/// bsv-low #692 (RC-L34): a swept-payout row reached "home on chain" (confirmed) from a CHAINTRACKS-CHECKED mined
+/// proof of the sweep ([`OwedInputs::proof_mined_spenders`]) rather than the spent-any ladder's `spent_confirmed`:
+/// the row the only confirming courier (WoC `/0/spent`) could not confirm because it faulted.
+static SWEPT_CONFIRMED_BY_PROOF: AtomicU64 = AtomicU64::new(0);
 static SPENDER_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub fn note_spender_read_fault() {
     SPENDER_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
@@ -3952,6 +3979,19 @@ pub fn count_sweep_proof_contradictions(rows: &[OwedRow]) -> u64 {
                 .and_then(|v| v.as_bool())
                 == Some(true)
         })
+        .count() as u64
+}
+/// bsv-low #692 (RC-L34): the route counts the confirmed swept-payout rows whose confirmation came from a
+/// chaintracks-checked mined PROOF of the sweep (`confirmedSource == "proof"`), not the spent-any ladder.
+pub fn note_swept_confirmed_by_proof(n: u64) {
+    if n > 0 {
+        SWEPT_CONFIRMED_BY_PROOF.fetch_add(n, Ordering::Relaxed);
+    }
+}
+/// PURE: how many rows of one derivation reached "home on chain" from the proof (`confirmedSource == "proof"`).
+pub fn count_swept_confirmed_by_proof(rows: &[OwedRow]) -> u64 {
+    rows.iter()
+        .filter(|r| r.facts.get("confirmedSource").and_then(|v| v.as_str()) == Some("proof"))
         .count() as u64
 }
 
@@ -4168,6 +4208,7 @@ pub fn owed_health_json() -> Value {
         "markerlessIgnoredMarkers": MARKERLESS_IGNORED_MARKERS.load(Ordering::Relaxed),
         "probeMemoReadFaults": PROBE_MEMO_READ_FAULTS.load(Ordering::Relaxed),
         "sweepProofContradictions": SWEEP_PROOF_CONTRADICTIONS.load(Ordering::Relaxed),
+        "owed_swept_confirmed_by_proof_total": SWEPT_CONFIRMED_BY_PROOF.load(Ordering::Relaxed),
         "spenderReadFaults": SPENDER_READ_FAULTS.load(Ordering::Relaxed),
         "withheldPreviousReadFaults": WITHHELD_PREVIOUS_READ_FAULTS.load(Ordering::Relaxed),
         "spenderStoreHits": SPENDER_STORE_HITS.load(Ordering::Relaxed),
@@ -4938,6 +4979,94 @@ pub(crate) mod tests {
         let rows = derive_owed_rows(&i);
         assert_eq!(rows[0].facts["sweepSource"], "index-bytes");
         assert_eq!(rows[0].facts["claimable"], true);
+    }
+
+    /// bsv-low #692 (RC-L34-OWED-COURIER-RETIRE), the fleet-shaped fixture: an AROUND-THE-OVERLAY sweep (the index
+    /// never held it, so the hop is index-UNSPENT and the chain rung names the sweep). WoC `/0/spent` 429'd on both
+    /// of the hop's probes, so the spent-any ladder fell to BananaBlocks, which cannot say whether the spend is
+    /// mined (`spent_confirmed == Some(false)`). A CHAINTRACKS-CHECKED mined proof of the sweep is in hand this pass
+    /// (`proof_mined_spenders`, the `/tx-any`, caller=owed, whose `/proof/tsc` bound against the canonical root):
+    /// the courier-bytes payout reaches "home on chain", named `confirmedSource = "proof"`. RED on main (the field
+    /// and the OR do not exist: the row read `UNCONFIRMED_PAYOUT_REASON`, the loop-34 red).
+    #[test]
+    fn e692_a_woc_fault_bananablocks_unconfirmed_but_the_checked_proof_confirms_home_on_chain() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let my_pkh = "cc".repeat(20);
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        // index-UNSPENT hop, stranded (its JOIN evicted around the overlay); the chain rung names the sweep SPENT
+        // but UNCONFIRMED (WoC faulted, BananaBlocks could not carry the confirmation)
+        let hops = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(false));
+        let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends_it.insert(sweep.clone(), vec![(tx(0x07), 0)]);
+        let mut courier: HashSet<String> = HashSet::new();
+        courier.insert(sweep.clone());
+        let mut proof: HashSet<String> = HashSet::new();
+        proof.insert(sweep.clone());
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &chain;
+        i.spender_outputs = &mine;
+        i.spender_inputs = &spends_it;
+        i.my_pkh_by_game = &pkhs;
+        i.courier_spenders = &courier;
+        i.proof_mined_spenders = &proof;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].family, OwedFamily::Payout);
+        assert_eq!(rows[0].facts["sweepSource"], "courier-bytes");
+        assert_eq!(
+            rows[0].facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON,
+            "the sats sit at your home on chain"
+        );
+        assert_eq!(rows[0].facts["confirmedSource"], "proof");
+        assert_eq!(count_swept_confirmed_by_proof(&rows), 1);
+    }
+
+    /// bsv-low #692 (RC-L34): the SAME fixture with NO checked proof in hand (`proof_mined_spenders` empty) and WoC
+    /// still faulting: the row STAYS "not mined yet", never a false confirmed. Absence is "could not look", not
+    /// "not mined": the row waits for the proof, a succeeding WoC, or a `collected` filing, exactly as before.
+    #[test]
+    fn e692_b_without_a_checked_proof_a_woc_fault_leaves_the_swept_payout_unconfirmed() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let my_pkh = "cc".repeat(20);
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        let hops = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(false));
+        let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends_it.insert(sweep.clone(), vec![(tx(0x07), 0)]);
+        let mut courier: HashSet<String> = HashSet::new();
+        courier.insert(sweep.clone());
+        let no_proof: HashSet<String> = HashSet::new();
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &chain;
+        i.spender_outputs = &mine;
+        i.spender_inputs = &spends_it;
+        i.my_pkh_by_game = &pkhs;
+        i.courier_spenders = &courier;
+        i.proof_mined_spenders = &no_proof;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].family, OwedFamily::Payout);
+        assert_eq!(rows[0].facts["sweepSource"], "courier-bytes");
+        assert_eq!(rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
+        assert_ne!(rows[0].facts["confirmedSource"], "proof");
+        assert_eq!(count_swept_confirmed_by_proof(&rows), 0);
     }
 
     /// bsv-low #662 (live 2026-10-14 00:35:35Z, pair 19, hop d4029675ccb65a4b:0, sweep 96448ef1fc3b): pass B judged
@@ -6010,6 +6139,7 @@ pub(crate) mod tests {
             my_pkh_by_game: &NO_PKHS,
             home_spends: &NO_HOME_SPENDS,
             retired_spenders: &NONE,
+            proof_mined_spenders: &NONE,
         }
     }
     static NO_SPENDERS: std::sync::LazyLock<HashMap<String, Vec<SpenderOutput>>> =
