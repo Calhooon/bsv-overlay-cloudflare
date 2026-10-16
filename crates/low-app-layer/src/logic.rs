@@ -1449,14 +1449,29 @@ pub fn leaderboard_unknown_pot_quota(limit: usize) -> usize {
     (limit / 10).max(1)
 }
 
-/// Cap on DISTINCT `(gameId, winner)` pairs the route fetches `proof_markers`
-/// pointers for (#332). Pairs come from the marker window in rank order, so
-/// the honest population is ~1–2 per pot (≤ the pot limit); the cap only
-/// bounds the D1 chunk fan-out when an attacker stuffs a pot's
+/// Budget of ROOM on DISTINCT `(gameId, winner)` pairs the route decorates
+/// (`proof_markers` pointers + `proof_posts`) per `/leaderboard` request
+/// (#332). It bounds the D1 chunk fan-out when a lived-in page carries more
+/// games than the cap (or an attacker stuffs a pot's
 /// [`overlay_discovery::result::storage::RESULT_ROWS_PER_POT`]-row superset
-/// with distinct invented gameIds. Exceeding it degrades ONLY the
-/// `proofTxid` display hint for the overflow pairs — never a count.
+/// with distinct invented gameIds).
+///
+/// bsv-low #685 (RC-L32): the pairs are the PAGE-LOCAL evidence set, ordered
+/// by DISPLAY priority (`leaderboard_decoration_pairs`) — the lowest-hand
+/// board, each identity's pinned best, then the top-ranked rows — so the
+/// budget is spent first on the rows a client renders, never on an incidental
+/// `owner ASC` prefix that starves a freshly-proven hand. A pair PAST the
+/// budget degrades to `proofPending` (the pointer is absent, the proof state
+/// is "not evaluated") — NEVER a false `proofPosted: false`, and never a
+/// count. This is a DISPLAY bound; the `proof_pointers` superset-per-key
+/// bound ([`PROOF_POINTERS_PER_KEY`]) is a different, orthogonal cost cap.
 pub const LEADERBOARD_PROOF_PAIRS_CAP: usize = 512;
+
+/// The durable counter the route bumps by the number of board-evidence rows
+/// served PAST the decoration budget (#685) — rows carried as `proofPending`
+/// because [`LEADERBOARD_PROOF_PAIRS_CAP`] could not reach them. A non-zero
+/// rate is the signal to revisit the cap against the page size.
+pub const LEADERBOARD_DECORATION_BUDGET_HIT: &str = "leaderboard_decoration_budget_hit_total";
 
 /// How many `proof_markers` pointers the fetch returns PER `(gameId, winner)`
 /// key (#332 HIGH-1). `gameId` and `winner` are BOTH public, claimable names,
@@ -1638,7 +1653,17 @@ pub struct LeaderboardEvidence {
     /// app-layer instead of buying an on-chain marker. Stamped by the route
     /// from `proof_posts` (never by the aggregator: no marker carries it).
     /// Display hint only — the client fetches + replays the bundle itself.
+    /// MEANINGLESS when `proof_pending` is true (the row's proof state was
+    /// never evaluated): the route then omits both from the wire.
     pub proof_posted: bool,
+    /// bsv-low #685 (RC-L32): this row was left OUTSIDE the decoration budget
+    /// (`leaderboard_decoration_pairs` past [`LEADERBOARD_PROOF_PAIRS_CAP`]),
+    /// so `proof_txids`/`proof_posted` were NEVER evaluated for it. The route
+    /// serves such a row with `proofPending: true` and OMITS the proof fields,
+    /// never a false `proofPosted: false` (a false claim of "no proof filed").
+    /// The aggregator leaves it `false` (it decorates nothing); the route sets
+    /// it on the page-local rows the budget could not reach.
+    pub proof_pending: bool,
     /// The server-derived CHAIN classification of this pot's recorded spend
     /// (bsv-low #227): which mandated covenant template the settle paid.
     /// `None` = not classified (legacy bare pot, missing bytes, or ambiguous
@@ -2125,6 +2150,10 @@ pub fn aggregate_leaderboard_attributed(
                         anchored: anchored[i],
                         proof_txids,
                         proof_posted: false,
+                        // The aggregator decorates nothing (no marker carries
+                        // a posted bundle); the route decorates the page-local
+                        // rows and marks the budget overflow PENDING (#685).
+                        proof_pending: false,
                         server_verdict: verdict,
                         chain_attributed_winner: counted.get(&pot).map(|(o, _)| o.clone()),
                         settle_signers: signers_by_pot.get(&pot).cloned(),
@@ -2527,6 +2556,123 @@ pub fn retain_page_owners(lb: &mut Leaderboard, owners: &[String]) {
     });
 }
 
+/// The board row's PINNED-BEST evidence — its lowest-score carded win, the
+/// hand the client pins as the identity's "best hand". `None` when the row
+/// carries no v2 (carded) evidence. Score ties break on the earliest claim
+/// (`created_at`, then `game_id`) so the choice is a total function of the
+/// data, the same order [`aggregate_leaderboard_attributed`] ranks hands by.
+fn pinned_best_evidence(row: &LeaderboardBoardRow) -> Option<&LeaderboardEvidence> {
+    row.evidence
+        .iter()
+        .filter_map(|e| {
+            e.cards_hex
+                .as_deref()
+                .and_then(leaderboard_cards_from_hex)
+                .map(|c| (hand_score(&c), e))
+        })
+        .min_by(|(sa, a), (sb, b)| {
+            sa.cmp(sb)
+                .then_with(|| {
+                    a.created_at
+                        .unwrap_or(i64::MAX)
+                        .cmp(&b.created_at.unwrap_or(i64::MAX))
+                })
+                .then_with(|| a.game_id.cmp(&b.game_id))
+        })
+        .map(|(_, e)| e)
+}
+
+/// Choose, in DISPLAY-PRIORITY order, the distinct `(gameId, winner)` evidence
+/// pairs of a PAGE-LOCAL board to decorate with proof hints, up to `cap`
+/// (bsv-low #685, RC-L32). The budget is a budget of ROOM: the pairs returned
+/// are decorated; every other board-evidence pair is served `proofPending`.
+///
+/// The candidate set is exactly the board's own evidence pairs (the games that
+/// survived to the served page — call AFTER [`retain_page_owners`]), never the
+/// whole marker window. Priority, so a `cap` smaller than the board spends
+/// first on the rows a client renders prominently:
+///
+///  1. the lowest-hand board rows, in `lb.hands` order (lowest score first);
+///  2. each board row's pinned-best (lowest-score) evidence;
+///  3. the rest, in board rank order (`wins DESC, owner ASC`), evidence order
+///     within each row.
+///
+/// Deduped, so a pair that is a hand AND a pinned best takes its earliest slot.
+/// The result is a prefix of this priority order, so the EXACT bytes a client
+/// sees under the cap are unchanged (every pair is decorated); only a board
+/// larger than the cap drops its deep tail to `proofPending`.
+pub fn leaderboard_decoration_pairs(lb: &Leaderboard, cap: usize) -> Vec<(String, String)> {
+    use std::collections::HashSet;
+    let board_pairs: HashSet<(String, String)> = lb
+        .board
+        .iter()
+        .flat_map(|r| {
+            r.evidence
+                .iter()
+                .map(|e| (e.game_id.clone(), e.winner.clone()))
+        })
+        .collect();
+    let mut ordered: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut push = |g: &str, w: &str| {
+        let key = (g.to_string(), w.to_string());
+        if board_pairs.contains(&key) && seen.insert(key.clone()) {
+            ordered.push(key);
+        }
+    };
+    // (1) the lowest-hand board, in its own score-ascending order.
+    for h in &lb.hands {
+        push(&h.game_id, &h.winner);
+    }
+    // (2) every identity's pinned best hand.
+    for row in &lb.board {
+        if let Some(best) = pinned_best_evidence(row) {
+            push(&best.game_id, &best.winner);
+        }
+    }
+    // (3) the rest, in the board's rank order.
+    for row in &lb.board {
+        for e in &row.evidence {
+            push(&e.game_id, &e.winner);
+        }
+    }
+    ordered.truncate(cap);
+    ordered
+}
+
+/// Stamp proof decoration onto a PAGE-LOCAL board as a budget of ROOM (#685):
+/// the rows whose pair is in `decorate_pairs` (the display-priority prefix the
+/// route fetched `proof_map`/`posted` over) get their `proof_txids` and
+/// `proof_posted` set and `proof_pending` cleared; every other board-evidence
+/// row is left `proof_pending` (the route omits its proof fields on the wire).
+/// Returns the number of rows left pending — the
+/// [`LEADERBOARD_DECORATION_BUDGET_HIT`] count (0 when the whole page fit).
+pub fn stamp_leaderboard_decoration(
+    lb: &mut Leaderboard,
+    decorate_pairs: &[(String, String)],
+    proof_map: &std::collections::HashMap<(String, String), Vec<String>>,
+    posted: &std::collections::HashSet<(String, String)>,
+) -> usize {
+    let decorated: std::collections::HashSet<&(String, String)> = decorate_pairs.iter().collect();
+    let mut budget_hits = 0usize;
+    for row in lb.board.iter_mut() {
+        for e in row.evidence.iter_mut() {
+            let key = (e.game_id.clone(), e.winner.clone());
+            if decorated.contains(&key) {
+                if let Some(txids) = proof_map.get(&key) {
+                    e.proof_txids = txids.clone();
+                }
+                e.proof_posted = posted.contains(&key);
+                e.proof_pending = false;
+            } else {
+                e.proof_pending = true;
+                budget_hits += 1;
+            }
+        }
+    }
+    budget_hits
+}
+
 /// Assemble the `/leaderboard` wire body (the endpoint CONTRACT):
 /// `{"board":[…],"hands":[…],"computedAt":<unix>,"resultCount":<int>,
 /// "truncated":<bool>}`.
@@ -2559,7 +2705,7 @@ pub fn leaderboard_body(
                 .evidence
                 .iter()
                 .map(|e| {
-                    json!({
+                    let mut obj = json!({
                         "gameId": e.game_id,
                         "winner": e.winner,
                         "loser": e.loser,
@@ -2606,7 +2752,23 @@ pub fn leaderboard_body(
                         // date and nothing else; the client parses it as
                         // optional and simply omits the date when it is absent.
                         "createdAt": e.created_at,
-                    })
+                    });
+                    // bsv-low #685 (RC-L32): a row the decoration budget never
+                    // reached (`proof_pending`) carries NO proof claim. Drop the
+                    // three proof hints and flag it PENDING, so the wire never
+                    // serves a false `proofPosted: false` for a hand whose proof
+                    // was simply never looked up. A row INSIDE the budget keeps
+                    // the exact fields (and byte shape) it always had.
+                    if e.proof_pending {
+                        let m = obj
+                            .as_object_mut()
+                            .expect("an evidence row serializes to a JSON object");
+                        m.remove("proofTxid");
+                        m.remove("proofTxids");
+                        m.remove("proofPosted");
+                        m.insert("proofPending".to_string(), serde_json::Value::Bool(true));
+                    }
+                    obj
                 })
                 .collect();
             // #336/#337: the chain-win anchors — one `{potTxid, settleTxid}`
@@ -4695,6 +4857,315 @@ mod tests {
         let lb2 = agg(&markers, &statuses, &no_proofs(), &world);
         assert!(lb2.board[0].evidence[0].proof_txids.is_empty());
         assert_eq!(lb2.board[0].wins, 1);
+    }
+
+    // ── the #685 (RC-L32) proof-decoration budget ──────────────────────
+    //
+    // The decoration budget must cover the PAGE-LOCAL rows a client renders
+    // (the lowest-hand board, each identity's pinned best, the top rows),
+    // ordered by DISPLAY priority, NOT an incidental `owner ASC` prefix that
+    // starves a late-sorting identity's freshly-proven hand. A row past the
+    // budget is `proofPending`, NEVER a false `proofPosted: false`. These pins
+    // run directly over the fix's functions (`leaderboard_decoration_pairs`,
+    // `stamp_leaderboard_decoration`, `leaderboard_body`).
+
+    /// One carded (v2) evidence row for identity `winner` of game `game`.
+    fn decor_ev(
+        game: &str,
+        winner: &str,
+        cards_hex: Option<&str>,
+        created_at: i64,
+    ) -> LeaderboardEvidence {
+        LeaderboardEvidence {
+            game_id: game.to_string(),
+            winner: winner.to_string(),
+            loser: "ff".repeat(33),
+            pot_txid: game.to_string(),
+            settle_txid: "ee".repeat(32),
+            winner_sig_hex: "3045aa".to_string(),
+            loser_sig_hex: Some("3045bb".to_string()),
+            cards_hex: cards_hex.map(str::to_string),
+            anchored: true,
+            proof_txids: Vec::new(),
+            proof_posted: false,
+            proof_pending: false,
+            server_verdict: None,
+            chain_attributed_winner: Some(winner.to_string()),
+            settle_signers: Some("coop".to_string()),
+            claim_tier: Some(2),
+            created_at: Some(created_at),
+        }
+    }
+
+    fn decor_row(identity: &str, evidence: Vec<LeaderboardEvidence>) -> LeaderboardBoardRow {
+        LeaderboardBoardRow {
+            identity: identity.to_string(),
+            wins: evidence.len() as u32,
+            proven: true,
+            chain_proven: true,
+            identity_is_key: false,
+            chain_wins: Vec::new(),
+            evidence,
+        }
+    }
+
+    /// A deterministic 10-hex v2 cards push whose `hand_score` is `score`
+    /// (five distinct face cards; the 0x0C=12='A'=1 point card lets a low
+    /// total be hit): cards [0,1,2,3, k] → 2+3+4+5 + score_of(k). Here we just
+    /// need DISTINCT scores to order pinned-bests, so vary the last card.
+    fn cards_scoring(last: u8) -> String {
+        // 0x00,0x01,0x02,0x03 then `last` (all distinct 0..=51).
+        format!("000102030{last:01x}")
+    }
+
+    /// RC-L32: a fleet page with MORE distinct (gameId, winner) pairs than the
+    /// cap, where a LATE-sorting identity (its whole history past an `owner
+    /// ASC` prefix) carries the viewer's pinned best. Every rendered row's
+    /// pointer is present when filed; the deep tail degrades to pending.
+    ///
+    /// RED on main: main spends the budget over the marker window in owner
+    /// order, so the late identity's games are ALL past the cap and served
+    /// `proofPosted: false` — the pinned best never carries its filed proof.
+    #[test]
+    fn decoration_budget_covers_every_rendered_row_not_an_owner_prefix() {
+        // 30 identities, each with 25 games = 750 distinct pairs > the 512 cap.
+        // Equal wins ⇒ the board is ranked `owner ASC`, so the lexicographically
+        // LAST identity's games are exactly the owner-order tail main dropped.
+        let n_ids = 30usize;
+        let games_each = 25usize;
+        assert!(n_ids * games_each > LEADERBOARD_PROOF_PAIRS_CAP);
+        let mut board = Vec::new();
+        for i in 0..n_ids {
+            let identity = format!("02{:064x}", i); // ascending ⇒ owner-ASC order
+            let mut evs = Vec::new();
+            for g in 0..games_each {
+                let game = format!("{:064x}", i * 1000 + g);
+                // Give the LAST identity one very low-score hand (its pinned
+                // best, and the global lowest) at a distinct game.
+                let cards = if i == n_ids - 1 && g == 0 {
+                    cards_scoring(0x0c) // 'A' last card ⇒ lowest score on the page
+                } else {
+                    cards_scoring(((g % 8) + 4) as u8)
+                };
+                evs.push(decor_ev(&game, &identity, Some(&cards), (g as i64) + 1));
+            }
+            board.push(decor_row(&identity, evs));
+        }
+        // Hands board: the era-wide lowest hands (score asc). Put the late
+        // identity's low hand first (it is the page's lowest).
+        let viewer = format!("02{:064x}", n_ids - 1);
+        let viewer_best_game = format!("{:064x}", (n_ids - 1) * 1000);
+        let hands = vec![LeaderboardHandRow {
+            game_id: viewer_best_game.clone(),
+            score: hand_score(&leaderboard_cards_from_hex(&cards_scoring(0x0c)).unwrap()),
+            cards_hex: cards_scoring(0x0c),
+            winner: viewer.clone(),
+            loser: "ff".repeat(33),
+            anchored: true,
+            created_at: Some(1),
+        }];
+        let mut lb = Leaderboard { board, hands };
+
+        // The decoration pairs under the real cap.
+        let pairs = leaderboard_decoration_pairs(&lb, LEADERBOARD_PROOF_PAIRS_CAP);
+        assert_eq!(
+            pairs.len(),
+            LEADERBOARD_PROOF_PAIRS_CAP,
+            "the budget is spent"
+        );
+        assert!(
+            pairs.contains(&(viewer_best_game.clone(), viewer.clone())),
+            "the late identity's pinned best is decorated FIRST (display priority), \
+             not dropped as an owner-order tail"
+        );
+
+        // The proof is FILED for the viewer's pinned best (proof_posts) and a
+        // pointer indexed (proof_markers). A deep-tail pair of the late
+        // identity is NOT filed.
+        let posted: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::from([(viewer_best_game.clone(), viewer.clone())]);
+        let proof_map = std::collections::HashMap::from([(
+            (viewer_best_game.clone(), viewer.clone()),
+            vec!["txPROOF".to_string()],
+        )]);
+        let hits = stamp_leaderboard_decoration(&mut lb, &pairs, &proof_map, &posted);
+
+        // The viewer's pinned-best row carries its filed proof.
+        let vrow = lb
+            .board
+            .iter()
+            .find(|r| r.identity == viewer)
+            .expect("the viewer is on the page");
+        let best = vrow
+            .evidence
+            .iter()
+            .find(|e| e.game_id == viewer_best_game)
+            .expect("the pinned-best row is present");
+        assert!(
+            best.proof_posted,
+            "the filed proof is served on the rendered row"
+        );
+        assert!(!best.proof_pending, "the rendered row was evaluated");
+        assert_eq!(best.proof_txids, vec!["txPROOF".to_string()]);
+
+        // Some rows fell past the budget (750 - 512 = 238) and are PENDING,
+        // never a false proofPosted:false.
+        assert_eq!(hits, n_ids * games_each - LEADERBOARD_PROOF_PAIRS_CAP);
+        let pending_row = lb
+            .board
+            .iter()
+            .flat_map(|r| r.evidence.iter())
+            .find(|e| e.proof_pending)
+            .expect("a deep-tail row is pending");
+        assert!(!pending_row.proof_posted || pending_row.proof_pending);
+        // The wire for a pending row OMITS the proof claim and flags pending.
+        let body: serde_json::Value =
+            serde_json::from_str(&leaderboard_body(&lb, 1, 1, false, None)).unwrap();
+        let mut saw_pending = false;
+        for row in body["board"].as_array().unwrap() {
+            for e in row["evidence"].as_array().unwrap() {
+                let o = e.as_object().unwrap();
+                if o.get("proofPending").and_then(|v| v.as_bool()) == Some(true) {
+                    saw_pending = true;
+                    assert!(
+                        !o.contains_key("proofPosted"),
+                        "no false proofPosted on a pending row"
+                    );
+                    assert!(!o.contains_key("proofTxid"));
+                    assert!(!o.contains_key("proofTxids"));
+                } else {
+                    // A decorated row keeps the exact proof fields.
+                    assert!(o.contains_key("proofPosted"));
+                    assert!(o.contains_key("proofTxid"));
+                    assert!(o.contains_key("proofTxids"));
+                    assert!(!o.contains_key("proofPending"));
+                }
+            }
+        }
+        assert!(saw_pending, "the deep tail reached the wire as pending");
+    }
+
+    /// The display priority order: hands first (score asc), then each board
+    /// row's pinned best, then the rest in board order — deduped.
+    #[test]
+    fn decoration_pairs_are_display_priority_ordered() {
+        let id_a = "02".to_string() + &"aa".repeat(32);
+        let id_b = "02".to_string() + &"bb".repeat(32);
+        // id_a: two games (g1 high score, g2 LOW score = its pinned best).
+        // id_b: one game (g3).
+        let (g1, g2, g3) = ("a1".repeat(32), "a2".repeat(32), "b3".repeat(32));
+        let a_rows = vec![
+            decor_ev(&g1, &id_a, Some(&cards_scoring(7)), 10),
+            decor_ev(&g2, &id_a, Some(&cards_scoring(0x0c)), 20), // lowest score
+        ];
+        let b_rows = vec![decor_ev(&g3, &id_b, Some(&cards_scoring(5)), 30)];
+        // Hands: g3 is the era-wide lowest hand (ranked first).
+        let hands = vec![LeaderboardHandRow {
+            game_id: g3.clone(),
+            score: 1,
+            cards_hex: cards_scoring(0x0c),
+            winner: id_b.clone(),
+            loser: "ff".repeat(33),
+            anchored: true,
+            created_at: Some(1),
+        }];
+        let lb = Leaderboard {
+            board: vec![decor_row(&id_a, a_rows), decor_row(&id_b, b_rows)],
+            hands,
+        };
+        let pairs = leaderboard_decoration_pairs(&lb, 100);
+        // Priority: (0) hands → g3; (1) pinned bests → id_a:g2 (lowest), id_b:g3
+        // (already taken); (2) rest → id_a:g1, id_a:g2(taken), id_b:g3(taken).
+        assert_eq!(
+            pairs,
+            vec![
+                (g3.clone(), id_b.clone()), // hand row, first
+                (g2.clone(), id_a.clone()), // id_a pinned best
+                (g1.clone(), id_a.clone()), // the remainder
+            ]
+        );
+    }
+
+    /// Budget as ROOM: `leaderboard_decoration_pairs` returns a prefix of the
+    /// priority order; `stamp_leaderboard_decoration` leaves the rest pending
+    /// and returns the count. The pinned best survives a tight budget.
+    #[test]
+    fn decoration_budget_is_room_and_keeps_the_pinned_best() {
+        let id = "02".to_string() + &"cc".repeat(32);
+        let (g_lo, g_hi1, g_hi2) = ("c1".repeat(32), "c2".repeat(32), "c3".repeat(32));
+        let evs = vec![
+            decor_ev(&g_hi1, &id, Some(&cards_scoring(7)), 10),
+            decor_ev(&g_hi2, &id, Some(&cards_scoring(8)), 11),
+            decor_ev(&g_lo, &id, Some(&cards_scoring(0x0c)), 12), // lowest = pinned best
+        ];
+        let mut lb = Leaderboard {
+            board: vec![decor_row(&id, evs)],
+            hands: Vec::new(),
+        };
+        // A budget of ONE: only the pinned best is decorated.
+        let pairs = leaderboard_decoration_pairs(&lb, 1);
+        assert_eq!(pairs, vec![(g_lo.clone(), id.clone())]);
+        let posted = std::collections::HashSet::from([(g_lo.clone(), id.clone())]);
+        let hits = stamp_leaderboard_decoration(
+            &mut lb,
+            &pairs,
+            &std::collections::HashMap::new(),
+            &posted,
+        );
+        assert_eq!(hits, 2, "the two higher-score rows are past the budget");
+        let row = &lb.board[0];
+        let best = row.evidence.iter().find(|e| e.game_id == g_lo).unwrap();
+        assert!(best.proof_posted && !best.proof_pending);
+        for e in row.evidence.iter().filter(|e| e.game_id != g_lo) {
+            assert!(
+                e.proof_pending,
+                "the deep tail is pending, never a false 'no proof'"
+            );
+        }
+    }
+
+    /// FROZEN BODY: an all-within-budget page serializes BYTE-FOR-BYTE as it
+    /// did before #685 — no `proofPending` key appears, and the three proof
+    /// fields are present on every decorated row. (If this body ever changes,
+    /// the under-cap wire contract moved and the client must be reviewed.)
+    #[test]
+    fn decoration_under_the_cap_is_byte_frozen() {
+        let id = "02".to_string() + &"11".repeat(32);
+        let g = "cc".repeat(32);
+        let evs = vec![decor_ev(&g, &id, Some("000102030c"), 100)];
+        let mut lb = Leaderboard {
+            board: vec![decor_row(&id, evs)],
+            hands: Vec::new(),
+        };
+        let pairs = leaderboard_decoration_pairs(&lb, LEADERBOARD_PROOF_PAIRS_CAP);
+        let posted = std::collections::HashSet::from([(g.clone(), id.clone())]);
+        let proof_map =
+            std::collections::HashMap::from([((g.clone(), id.clone()), vec!["px".to_string()])]);
+        let hits = stamp_leaderboard_decoration(&mut lb, &pairs, &proof_map, &posted);
+        assert_eq!(hits, 0, "the whole page fits the budget");
+        let body = leaderboard_body(&lb, 1_700_000_000, 1, false, None);
+        let expected = format!(
+            concat!(
+                r#"{{"board":[{{"chainProven":true,"chainWins":[],"evidence":"#,
+                r#"[{{"anchored":true,"cardsHex":"000102030c","chainAttributedWinner":"{id}","#,
+                r#""claimTier":2,"createdAt":100,"gameId":"{g}","loser":"{loser}","#,
+                r#""loserSigHex":"3045bb","potTxid":"{g}","proofPosted":true,"proofTxid":"px","#,
+                r#""proofTxids":["px"],"serverVerdict":null,"settleSigners":"coop","#,
+                r#""settleTxid":"{settle}","winner":"{id}","winnerSigHex":"3045aa"}}],"#,
+                r#""identity":"{id}","identityIsKey":false,"proven":true,"wins":1}}],"#,
+                r#""computedAt":1700000000,"hands":[],"nextAfter":null,"resultCount":1,"#,
+                r#""truncated":false}}"#,
+            ),
+            id = id,
+            g = g,
+            loser = "ff".repeat(33),
+            settle = "ee".repeat(32),
+        );
+        assert_eq!(
+            body, expected,
+            "the under-cap body must stay byte-identical"
+        );
+        assert!(!body.contains("proofPending"));
     }
 
     // ── the #227 chain-classification fold ─────────────────────────────
