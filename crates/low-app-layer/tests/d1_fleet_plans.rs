@@ -48,7 +48,14 @@ fn hot_routes_never_scan_fleet_tables() {
     // recompute; each OR'd PK-range term must stay on the hop_chain_probes PRIMARY KEY autoindex (SEARCH /
     // MULTI-INDEX OR), never a scan, at every arity up to the chunk bound. A future WITHOUT ROWID or a dropped
     // PK index would regress it silently without this pin.
-    for n in [1, 24, low_app_layer::owed::HOME_LATCH_READ_CHUNK] {
+    // bsv-low #693 fold-2: the `proofmined:` latch read is the same statement with one range more (the reorg
+    // tombstone's, `owed::proof_latch_range_binds`), so its arity reaches the chunk bound + 1
+    for n in [
+        1,
+        24,
+        low_app_layer::owed::HOME_LATCH_READ_CHUNK,
+        low_app_layer::owed::HOME_LATCH_READ_CHUNK + 1,
+    ] {
         for detail in plan(&db, &low_app_layer::owed::home_latch_range_read_sql(n)) {
             assert!(
                 !detail.starts_with("SCAN"),
@@ -76,6 +83,13 @@ fn hot_routes_never_scan_fleet_tables() {
         (
             "owed recompute proofs",
             low_app_layer::hopsweep::sweep_proofs_sql(16),
+        ),
+        // bsv-low #723: `/spent-any`'s index-proof read, at its most spenders (one per outpoint)
+        (
+            "/spent-any index proofs",
+            low_app_layer::hopsweep::sweep_proofs_sql(
+                low_app_layer::results::SPENT_ANY_MAX_OUTPOINTS,
+            ),
         ),
         (
             "/recovery-view",

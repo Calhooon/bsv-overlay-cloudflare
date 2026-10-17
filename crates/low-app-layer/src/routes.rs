@@ -10070,7 +10070,7 @@ mod e606_tests {
             serde_json::from_str(include_str!("../../../tools/lane-499/ceilings.json")).unwrap();
         assert_eq!(
             ceilings["scenarios"]["owed-first-read"]["ceiling"]["stmts"],
-            30 // #638 merged measurement: 331 rows read; the owed scope skip remains above.
+            41 // #693 fold-2: 39 measured (#638's 30, plus A's durable swept hop, 9); the owed scope skip remains above.
         );
     }
 

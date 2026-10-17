@@ -64,6 +64,7 @@ that starts writing reds); statements measured + 2 (a loop that reads per row ov
 | results-forward | `/results?identity=A`, the forwarding request (`d1`) | 0 / 0 / 0 | 4 / 0 / 2 |
 | owed-first-read | `/owed?identity=A`, the first read (compute on read, its write) | 363 / 18 / 28 | 528 / 20 / 28 |
 | owed-served-read | `/owed?identity=A`, a served read | 17 / 0 / 2 | 26 / 0 / 4 |
+| spent-any-20 | `/spent-any?outpoints=` 20 known spends of proven fleet transactions (the index-proof read) | 120 / 0 / 5 | 180 / 0 / 7 |
 | submit-admit-1 | `/submit`, an operator `historical-tx-no-spv` submit admitting one tm_collected output | 0 / 13 / 7 | 4 / 15 / 9 |
 
 | record-potparty-filing | `/record?kind=potparty`, signed stranger naming A's live pot | 11 / 7 / 6 | 17 / 9 / 8 |
@@ -279,3 +280,24 @@ cap (25,001 at 3,000 wins and at any larger board); the rest of a page follows i
 Stated: the statement COUNT is the page's own (statuses, classification and markers chunked at 45 pots), unchanged
 by #642 and not held to a ceiling here; #674 (`docs/DESIGN-674-LEADERBOARD-WRITE-TIME.md`) is the read whose
 reads follow the page alone.
+
+## #693 fold-2 and #723: the latch range read and the spent-any proof read (2026-10-17)
+
+The W1-OWED-693 re-lens found two statements no scenario measured: the owed recompute's `proofmined:` latch range
+read (one statement per 45 durable spenders, now with one range more for the reorg tombstone) and `/spent-any`'s
+index-proof read (`hopsweep::sweep_proofs_sql`, a PK seek of at most 20 spenders). Both are plan-pinned scan-free
+(`tests/d1_fleet_plans.rs`: the latch read at arity 46, the proof read at 20). Measured with
+`D1_BUDGET_MEASURE=1 make ci-d1-budget` on the fixture D1:
+
+- The fixture gives A one swept hop on its first game whose sweep is a DURABLE spender (its bytes in
+  `owed_spender_bytes`) with a `proofmined:` latch past the grace (`d1_budget_seed.rs`
+  `identity_a_durable_spender_rows`); the tier asserts the row is served from the latch (`confirmedSource: "proof"`)
+  and A now has 9 rows. `owed-first-read` measures **382 / 20 / 39** (largest statement 160), against **340 / 18 /
+  30** for the same tier without those rows: the durable-spender path is 9 statements (the spender store, the latch
+  range read and the reads a swept hop brings). Ceiling by the margin: **573 / 22 / 41**, `maxReads` 573. The served
+  read measures 20 / 0 / 2 under its unchanged 26 / 0 / 4. The detached `owed-recompute` maximum (held to the same
+  statement figure) measured 37.
+- `spent-any-20` (new): twenty fresh probe memos name twenty proven fleet transactions as spenders with no confirmed
+  word, so each row is a known spend and the one proof read confirms it (`spentConfirmedSource: "index-proof"`,
+  asserted). Measured **120 / 0 / 5**, largest statement 40; ceiling **180 / 0 / 7**, `maxReads` 60. Census key
+  `/spent-any` (advisory in production).

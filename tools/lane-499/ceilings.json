@@ -60,24 +60,25 @@
       "censusKey": "/results"
     },
     "owed-first-read": {
-      "route": "/owed?identity=A: the first read (the compute on read and its write)",
+      "route": "/owed?identity=A: the first read (the compute on read and its write); A's swept hop's sweep is a DURABLE spender with a proofmined: latch, so the recompute makes the latch range read (bsv-low #693 fold-2)",
       "measured": {
-        "reads": 331,
-        "writes": 18,
-        "stmts": 30
+        "reads": 382,
+        "writes": 20,
+        "stmts": 39,
+        "maxReads": 160
       },
       "ceiling": {
-        "reads": 528,
-        "writes": 20,
-        "stmts": 30,
-        "maxReads": 528
+        "reads": 573,
+        "writes": 22,
+        "stmts": 41,
+        "maxReads": 573
       },
       "censusKey": "/owed"
     },
     "owed-served-read": {
       "route": "/owed?identity=A: a served read",
       "measured": {
-        "reads": 17,
+        "reads": 20,
         "writes": 0,
         "stmts": 2
       },
@@ -87,6 +88,22 @@
         "stmts": 4
       },
       "censusKey": null
+    },
+    "spent-any-20": {
+      "route": "/spent-any?outpoints=<20 outpoints>: twenty fresh probe memos naming twenty of the fleet's proven transactions as spenders, no confirmed word, so every row is a known spend and the one index-proof read (hopsweep::sweep_proofs_sql, a PK seek, 20 spenders) confirms each (bsv-low #723)",
+      "measured": {
+        "reads": 120,
+        "writes": 0,
+        "stmts": 5,
+        "maxReads": 40
+      },
+      "ceiling": {
+        "reads": 180,
+        "writes": 0,
+        "stmts": 7,
+        "maxReads": 60
+      },
+      "censusKey": "/spent-any"
     },
     "submit-admit-1": {
       "route": "/submit: an operator historical-tx-no-spv submit admitting one tm_collected output",
