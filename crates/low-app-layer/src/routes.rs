@@ -7531,7 +7531,12 @@ pub(crate) async fn provider_get_with(
     let started = worker::Date::now().as_millis() as f64;
     let got = provider_get_raw(url, extra_header).await;
     let ms = worker::Date::now().as_millis() as f64 - started;
-    crate::courier::note(url, caller, got.as_ref().map(|(s, _)| *s), ms);
+    crate::courier::note(
+        url,
+        caller,
+        got.as_ref().map(|(s, b)| (*s, b.as_slice())),
+        ms,
+    );
     got
 }
 

@@ -15,6 +15,7 @@
 pub mod admit_fast;
 pub mod advert_lifecycle;
 pub mod advertiser;
+pub mod applayer_counters;
 pub mod arcade_reorg;
 pub mod ban_storage;
 pub mod beef_blob_sweep;

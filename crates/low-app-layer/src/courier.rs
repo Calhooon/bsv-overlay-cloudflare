@@ -64,6 +64,65 @@ pub fn outcome_of(status: Option<u16>) -> &'static str {
     }
 }
 
+/// bsv-low #625 (the observability bar, issue 1): the reader this worker is in the overlay's per-reader courier
+/// census, `courier_<reader>_<provider>_<outcome>_total` (the overlay's readers are `door` and `janitor`).
+pub const READER: &str = "applayer";
+/// The per-reader outcomes: the overlay's four (`ok`, `notfound`, `fault`, `shape`) and this reader's `ratelimited`
+/// (a 429 is its own class here, as on the `applayer_courier_*` family; the overlay folds it into `fault`).
+pub const SHAPED_OUTCOMES: [&str; 5] = ["ok", "notfound", "ratelimited", "fault", "shape"];
+
+/// PURE: does a 2xx body read as its route's format? A `/hex` route answers hex text, Bitails' `/download/tx/`
+/// raw bytes; every other route this worker asks answers JSON (any JSON value: a WoC mempool body with no
+/// `confirmations` is a well-formed answer, the #606 shape, never a fault).
+pub fn body_reads(url: &str, body: &[u8]) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    if path.ends_with("/hex") {
+        let text = std::str::from_utf8(body)
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"');
+        return !text.is_empty() && text.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    if path.contains("/download/tx/") {
+        return !body.is_empty();
+    }
+    serde_json::from_slice::<serde_json::Value>(body).is_ok()
+}
+
+/// PURE: the per-reader outcome of one courier answer. A transport fault (no status) is `fault`; a 2xx whose body
+/// does not read as its route's format is `shape`, apart from a transport fault (the #606 discriminator); a 404 or
+/// 410 is `notfound` (Bitails is pruned: its 404 on an unmined subject is an absence of record, never a fault).
+pub fn shaped_outcome(url: &str, answer: Option<(u16, &[u8])>) -> &'static str {
+    match answer {
+        Some((s, body)) if (200..300).contains(&s) => {
+            if body_reads(url, body) {
+                "ok"
+            } else {
+                "shape"
+            }
+        }
+        Some((s, _)) => outcome_of(Some(s)),
+        None => "fault",
+    }
+}
+
+/// PURE: the per-reader durable name of one answer.
+pub fn shaped_counter_name(provider: &str, outcome: &str) -> String {
+    format!("courier_{READER}_{provider}_{outcome}_total")
+}
+
+/// Every per-reader name this worker can write (the overlay seeds each at 0).
+pub fn shaped_counter_names() -> Vec<String> {
+    PROVIDERS
+        .iter()
+        .flat_map(|p| {
+            SHAPED_OUTCOMES
+                .iter()
+                .map(move |o| shaped_counter_name(p, o))
+        })
+        .collect()
+}
+
 /// PURE: the two durable counter names one call bumps.
 pub fn counter_names(provider: &str, outcome: &str, caller: &str) -> [String; 2] {
     [
@@ -158,18 +217,38 @@ pub fn note_presence_n(name: &str, n: u64) {
 }
 
 /// Count one courier call: the isolate tally, this request's pending durable deltas, and the log line.
-pub fn note(url: &str, caller: &str, status: Option<u16>, ms: f64) {
+pub fn note(url: &str, caller: &str, answer: Option<(u16, &[u8])>, ms: f64) {
+    let (provider, outcome, shaped) = record(url, caller, answer);
+    let st = answer
+        .map(|(s, _)| s.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let shape = if shaped == "shape" { " shape" } else { "" };
+    worker::console_log!(
+        "[courier] {provider} {outcome}{shape} {st} {ms:.0}ms caller={caller} {url}"
+    );
+}
+
+/// The counting half of [`note`] (no log line, so a native pin runs it): the isolate tally, the
+/// `applayer_courier_*` deltas and, bsv-low #625, the per-reader `courier_applayer_<provider>_<outcome>_total`.
+/// Answers (provider, the `applayer_courier_*` outcome, the per-reader outcome).
+pub fn record(
+    url: &str,
+    caller: &str,
+    answer: Option<(u16, &[u8])>,
+) -> (&'static str, &'static str, &'static str) {
     let provider = provider_of(url);
-    let outcome = outcome_of(status);
+    let outcome = outcome_of(answer.map(|(s, _)| s));
+    let shaped = shaped_outcome(url, answer);
     TALLY[index_of(&PROVIDERS, provider)][index_of(&OUTCOMES, outcome)]
         .fetch_add(1, Ordering::Relaxed);
     BY_CALLER[index_of(&CALLERS, caller)].fetch_add(1, Ordering::Relaxed);
-    PENDING.with(|p| add_pending(&mut p.borrow_mut(), provider, outcome, caller));
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        add_pending(&mut p, provider, outcome, caller);
+        *p.entry(shaped_counter_name(provider, shaped)).or_insert(0) += 1;
+    });
     PENDING_CALLS.with(|c| c.set(c.get() + 1));
-    let st = status
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    worker::console_log!("[courier] {provider} {outcome} {st} {ms:.0}ms caller={caller} {url}");
+    (provider, outcome, shaped)
 }
 
 /// Take the isolate's pending durable deltas when a flush is due (`should_flush`), else nothing.
