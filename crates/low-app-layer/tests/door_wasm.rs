@@ -115,6 +115,8 @@ async fn assert_the_503(mut resp: Response) {
         h.get("Access-Control-Allow-Origin").unwrap().as_deref(),
         Some("*")
     );
+    let expose = h.get("Access-Control-Expose-Headers").unwrap().unwrap();
+    assert!(expose.split(", ").any(|n| n == "Retry-After"), "{expose}");
     let text = resp.text().await.unwrap();
     let body: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(body["code"], "ERR_AUTH_UNAVAILABLE");
