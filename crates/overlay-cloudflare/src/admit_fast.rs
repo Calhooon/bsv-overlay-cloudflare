@@ -1431,7 +1431,7 @@ struct EvictedRow {
 /// bsv-low #451 (the second gate's HIGH-1): the `refused` verdict memo for an evicted txid — `/tx-any` serves it as
 /// `present: false` with zero courier calls; a readmission deletes it (`readmit_if_evicted`). Fail-soft.
 pub async fn write_refused_verdict(db: &D1Database, txid: &str, now_ms: i64, reason: &str) {
-    if let Err(e) = Query::new(crate::proof_fetcher::TX_ANY_VERDICT_UPSERT_SQL)
+    match Query::new(crate::proof_fetcher::TX_ANY_VERDICT_UPSERT_SQL)
         .bind(txid)
         .bind(now_ms)
         .bind("refused")
@@ -1439,7 +1439,16 @@ pub async fn write_refused_verdict(db: &D1Database, txid: &str, now_ms: i64, rea
         .execute(db)
         .await
     {
-        worker::console_log!("[admit-fast] verdict memo write failed for {txid}: {e}");
+        // bsv-low #626: the memo write counted by its kind (one per eviction).
+        Ok(()) => {
+            crate::ops::bump_counter(
+                db,
+                crate::applayer_counters::COUNTER_TXANY_MEMO_WRITE_REFUSED,
+                1,
+            )
+            .await
+        }
+        Err(e) => worker::console_log!("[admit-fast] verdict memo write failed for {txid}: {e}"),
     }
 }
 

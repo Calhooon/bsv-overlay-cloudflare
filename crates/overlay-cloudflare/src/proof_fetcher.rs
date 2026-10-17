@@ -4327,18 +4327,28 @@ pub async fn run_retire_pass(
                             summary.retired += 1;
                             // bsv-low #451 slice C (iv): the verdict memo for `/tx-any` (the request path never
                             // asks a courier for an index-held row; this pass did, once, here). Fail-soft.
-                            if let Err(e) = Query::new(TX_ANY_VERDICT_UPSERT_SQL)
+                            let kind = verdict_kind_of_retire_reason(&reason);
+                            match Query::new(TX_ANY_VERDICT_UPSERT_SQL)
                                 .bind(row.txid.as_str())
                                 .bind(now)
-                                .bind(verdict_kind_of_retire_reason(&reason))
+                                .bind(kind)
                                 .bind(reason.as_str())
                                 .execute(db)
                                 .await
                             {
-                                worker::console_log!(
+                                // bsv-low #626: the memo write counted by its kind (the retire pass is bounded per tick).
+                                Ok(()) => {
+                                    crate::ops::bump_counter(
+                                        db,
+                                        crate::applayer_counters::memo_write_counter(kind),
+                                        1,
+                                    )
+                                    .await
+                                }
+                                Err(e) => worker::console_log!(
                                     "[retire] verdict memo write failed for {}: {e}",
                                     row.txid
-                                );
+                                ),
                             }
                             // Evidence on record (write-once — a webhook row
                             // already present makes this a no-op).

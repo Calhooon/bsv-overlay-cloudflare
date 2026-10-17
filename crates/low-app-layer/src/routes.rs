@@ -8403,7 +8403,14 @@ where
     }
     // A HELD, proven anchor tests route reachability, never subject absence.
     // Both outcomes expire, so a stale Arcade rank cannot cause an endless probe.
-    if ours && matches!(response, Some((404, _))) && arcade_anchor_probe_due(now_ms) {
+    let held_404 = ours && matches!(response, Some((404, _)));
+    let anchor_probe = held_404 && arcade_anchor_probe_due(now_ms);
+    // bsv-low #626: a held 404 either writes the anchor memo (the probe below) or is answered by it.
+    if held_404 {
+        let op = if anchor_probe { "write" } else { "hit" };
+        crate::courier::note_presence(&crate::txany::memo_counter(op, "anchor"));
+    }
+    if anchor_probe {
         let healthy = if let Some(anchor) = held_anchor {
             let response = get(format!("{}/tx/{anchor}", arcade_url())).await;
             let healthy = response.as_ref().is_some_and(|(status, body)| {
@@ -8599,18 +8606,29 @@ where
 
 /// The in-isolate `/tx-any` cache hit for `key`, if still inside its TTL.
 fn tx_any_cached(key: &str, now: f64) -> Option<TxAnyCached> {
-    TX_ANY_CACHE.with(|c| {
+    let hit = TX_ANY_CACHE.with(|c| {
         c.borrow()
             .get(key)
             .filter(|(expiry, _)| *expiry > now)
             .map(|(_, a)| a.clone())
-    })
+    });
+    // bsv-low #626: the isolate's ten-minute unconfirmable memo, counted when it answers.
+    if hit.as_ref().is_some_and(|a| a.unconfirmable) {
+        crate::courier::note_presence(&crate::txany::memo_counter("hit", "isolate_unconfirmable"));
+    }
+    hit
 }
 
 /// The in-isolate cache write — ONE writer for the single and the batched
 /// route (bsv-low W-C.3), so an answer either route produced is the answer the
 /// other serves for the TTL.
 fn cache_tx_any_answer(key: &str, answer: &TxAnyCached, now: f64) {
+    if answer.unconfirmable {
+        crate::courier::note_presence(&crate::txany::memo_counter(
+            "write",
+            "isolate_unconfirmable",
+        ));
+    }
     TX_ANY_CACHE.with(|c| {
         let mut map = c.borrow_mut();
         map.retain(|_, (expiry, _)| *expiry > now);
@@ -8678,6 +8696,7 @@ async fn resolve_tx_any(
             crate::txany::AbsenceCorroboration::Unknown,
         )
     } else if let Some(memo) = read_verdict_memo(env, key, now as i64).await {
+        crate::courier::note_presence(&crate::txany::memo_counter("hit", memo.kind.as_str()));
         let a = crate::txany::answer_from_verdict_memo(&memo, index_raw);
         cache_tx_any_answer(key, &a, now);
         return a;
@@ -8945,6 +8964,10 @@ pub async fn tx_any_batch(req: Request, ctx: RouteContext<AuthState>) -> Result<
         for (k, index_raw, reason) in undecided {
             match memos.iter().find(|m| m.txid == k) {
                 Some(m) => {
+                    crate::courier::note_presence(&crate::txany::memo_counter(
+                        "hit",
+                        m.kind.as_str(),
+                    ));
                     let a = crate::txany::answer_from_verdict_memo(m, index_raw);
                     cache_tx_any_answer(&k, &a, now_ms as f64);
                     answers.push((k, a));
@@ -9817,6 +9840,69 @@ mod e606_tests {
         }
         assert_eq!(anchor_reads.get(), 1);
         ARCADE_ROUTE_HEALTHY.with(|c| c.set(None));
+    }
+
+    /// bsv-low #626: the anchor memo's write (the probe) and its hit (a held 404 the memo answered), and the
+    /// isolate's ten-minute unconfirmable memo, counted by the producers themselves.
+    #[test]
+    fn obs_626_the_tx_any_memos_are_counted_by_kind() {
+        ARCADE_ROUTE_HEALTHY.with(|c| c.set(None));
+        WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
+        let subject = tx(0x11);
+        let held = tx(0x22);
+        let now = crate::txany::rfc3339_utc_ms("2026-10-12T18:15:00Z").unwrap();
+        let get = |url: String| {
+            let response = if url == format!("{}/tx/{held}", arcade_url()) {
+                (
+                    200,
+                    serde_json::json!({"txid":held,"txStatus":"SEEN_ON_NETWORK",
+                    "timestamp":"2026-10-12T18:15:00Z"})
+                    .to_string()
+                    .into_bytes(),
+                )
+            } else {
+                (404, vec![])
+            };
+            std::future::ready(Some(response))
+        };
+        for at in [now, now + 1, now + 2] {
+            run(tx_any_presence_leg_via(
+                &subject,
+                at,
+                true,
+                Some(&held),
+                get,
+                |_, _| async { false },
+            ));
+        }
+        ARCADE_ROUTE_HEALTHY.with(|c| c.set(None));
+        let key = tx(0x33);
+        let a = TxAnyCached {
+            unconfirmable: true,
+            ..Default::default()
+        };
+        cache_tx_any_answer(&key, &a, 0.0);
+        assert!(tx_any_cached(&key, 1.0).is_some());
+        let d: std::collections::BTreeMap<String, u64> = crate::courier::take_pending_if_due(0.0)
+            .into_iter()
+            .collect();
+        assert_eq!(d["applayer_txany_memo_write_anchor_total"], 1, "{d:?}");
+        assert_eq!(d["applayer_txany_memo_hit_anchor_total"], 2, "{d:?}");
+        assert_eq!(
+            d["applayer_txany_memo_write_isolate_unconfirmable_total"],
+            1
+        );
+        assert_eq!(d["applayer_txany_memo_hit_isolate_unconfirmable_total"], 1);
+        // the durable verdict memo's hits, by its kind, on both routes' reads
+        let src: String = include_str!("routes.rs").split_whitespace().collect();
+        assert!(src.contains("crate::courier::note_presence(&crate::txany::memo_counter(\"hit\",memo.kind.as_str()));"));
+        assert!(src.contains(
+            "crate::courier::note_presence(&crate::txany::memo_counter(\"hit\",m.kind.as_str(),));"
+        ));
+        assert_eq!(
+            crate::txany::memo_counter("hit", crate::txany::VerdictKind::Absent.as_str()),
+            "applayer_txany_memo_hit_absent_total"
+        );
     }
 
     #[test]
