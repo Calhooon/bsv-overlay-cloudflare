@@ -61,6 +61,7 @@ pub mod reorg_sweep;
 pub mod routes;
 pub mod ship_lookup;
 pub mod submit_census;
+mod submit_counters;
 pub mod submit_gate;
 pub mod submit_refusals;
 mod tick;

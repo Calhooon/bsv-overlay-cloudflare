@@ -1370,15 +1370,16 @@ mod e592 {
             .expect("the synchronous submit");
         let tail = &routes[submit..];
         assert!(tail.contains(
-            "Err(EngineError::WalkCouldNotRun(stop)) => return walk_not_now(env, &stop, \"POST /submit\").await,"
+            "return walk_not_now(env, &stop, \"POST /submit\", Some(counters)).await;"
         ));
+        assert!(tail.contains("counters.reason(SubmitReason::WalkCouldNotRun);"));
         assert!(
             tail.contains("crate::ops::note_engine_walk(&db, &mutation_report, \"POST /submit\")")
         );
         assert!(
             routes.contains("crate::ops::note_engine_walk(&db, &report, \"POST /admin/readmit\")")
         );
-        assert!(routes.contains("walk_not_now(env, &stop, \"POST /admin/readmit\").await"));
+        assert!(routes.contains("walk_not_now(env, &stop, \"POST /admin/readmit\", None).await"));
         assert!(routes.contains("crate::ops::note_engine_walk_not_now(&db, stop, door).await;"));
         // only the gated arm marks its replay
         assert!(routes.contains("gated_subject.is_some(),\n            )\n            .await,"));

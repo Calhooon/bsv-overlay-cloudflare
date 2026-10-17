@@ -5269,6 +5269,16 @@ mod tests {
         assert!(post.contains("headers.set(\"X-CallbackUrl\", cb)"));
     }
 
+    #[test]
+    fn submit_612_corroboration_failure_has_a_fixed_answer_reason() {
+        let error = corroborated_accept_claim(Err("provider detail".into()), "subject")
+            .unwrap_err();
+        assert_eq!(
+            crate::submit_counters::Reason::broadcast(&error),
+            crate::submit_counters::Reason::CorroboratorUnconfirmed,
+        );
+    }
+
     /// SOURCE PIN (#519, the gate's LOW-1): the production ladder's terminal branch judges by the indexers BEFORE any
     /// rung and never through a corroborator — the ordering inside `broadcast_efs_gated`, the branch's own text
     /// free of every corroborator and rung name, and the mined-claim dispatch (an all-proven BEEF) after the return

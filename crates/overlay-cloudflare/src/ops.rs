@@ -933,6 +933,27 @@ struct PotOutpointRow {
 pub const BUMP_COUNTER_SQL: &str = "INSERT INTO ops_counters (name, value) VALUES (?, ?) \
      ON CONFLICT(name) DO UPDATE SET value = ops_counters.value + excluded.value";
 
+/// Flush one request or pass as one D1 batch. Failure loses telemetry only.
+pub(crate) async fn bump_counters(
+    db: &D1Database,
+    deltas: std::collections::BTreeMap<String, u64>,
+) {
+    let statements = deltas
+        .into_iter()
+        .filter(|(_, delta)| *delta > 0)
+        .map(|(name, delta)| Query::new(BUMP_COUNTER_SQL).bind(name).bind(delta).prepare(db))
+        .collect::<Result<Vec<_>, _>>();
+    match statements {
+        Ok(statements) if statements.is_empty() => {}
+        Ok(statements) => {
+            if let Err(e) = crate::d1_ledger::counted_batch(db, statements).await {
+                worker::console_log!("[ops] counter batch failed: {e}");
+            }
+        }
+        Err(e) => worker::console_log!("[ops] counter batch could not be prepared: {e}"),
+    }
+}
+
 /// Add `delta` to the counter `name`; a fault is logged and swallowed.
 pub async fn bump_counter(db: &D1Database, name: &str, delta: u64) {
     if delta == 0 {
@@ -1318,6 +1339,9 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         for name in [set.undelivered, set.retry_failed, set.deferred, set.retried, set.resent] {
             obj[name] = json!(0);
         }
+    }
+    for name in crate::submit_counters::all_names() {
+        obj[name] = json!(0);
     }
     for r in rows {
         obj[r.name] = json!(r.value.max(0.0) as u64);
