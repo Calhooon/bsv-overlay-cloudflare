@@ -38,6 +38,12 @@ fn query(db: &Connection, sql: &str, binds: &[Value]) -> (String, Vec<serde_json
     (expanded, out)
 }
 
+/// bsv-low #644: the signers-backfill candidate read on local D1 (docs/D1-BUDGETS.md).
+/// Measured 2 with no row pending (22,591 before); the reads are the pending set's.
+const SIGNERS_CANDIDATES_READ_CEILING: u64 = 6;
+/// bsv-low #644: the payouts-backfill candidate read on local D1.
+/// Measured 2 with no row pending (22,591 before).
+const PAYOUTS_CANDIDATES_READ_CEILING: u64 = 6;
 pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
     let mut sql = String::new();
     let mut expected = Vec::new();
@@ -108,6 +114,28 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
             sql.push_str(&format!("{expanded};\n"));
             expected.push(json!({"name":format!("{name} hydration page={page}"),"rows":rows,"sql":expanded,"ceiling":owed_cursor::PAGE_READ_CEILING}));
         }
+    }
+    // bsv-low #644 (W1.6): the hot passes' reads on the fleet fixture, each under its own ceiling
+    // (docs/D1-BUDGETS.md).
+    for (name, statement, binds, ceiling, unordered) in [
+        (
+            "#644 signers-backfill candidates",
+            bsv_overlay_cloudflare::d1_discovery::settle_signers_candidates_sql(20),
+            vec![],
+            SIGNERS_CANDIDATES_READ_CEILING,
+            true,
+        ),
+        (
+            "#644 payouts-backfill candidates",
+            bsv_overlay_cloudflare::d1_discovery::spender_payouts_candidates_sql(20),
+            vec![],
+            PAYOUTS_CANDIDATES_READ_CEILING,
+            true,
+        ),
+    ] {
+        let (expanded, rows) = query(db, &statement, &binds);
+        sql.push_str(&format!("{expanded};\n"));
+        expected.push(json!({"name":name,"rows":rows,"sql":expanded,"ceiling":ceiling,"unordered":unordered,"bound":true}));
     }
     // Compile-time and runtime proof this diagnostic never changes the fixture.
     assert!(sql.lines().all(|s| s.starts_with("SELECT ")));
