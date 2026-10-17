@@ -1338,6 +1338,11 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
     for name in crate::gasp_deferred::counter_names() {
         obj[name] = json!(0);
     }
+    // bsv-low #625, #626, #628: the app layer's observability families and this worker's memo writes read 0
+    // until they fire (the app layer writes the `applayer_*` and `courier_applayer_*` rows).
+    for name in crate::applayer_counters::seeded_names() {
+        obj[name] = json!(0);
+    }
     // 2026-09-04: every courier rung reads an explicit 0 until it is called.
     for rung in crate::proof_fetcher::COURIER_RUNGS {
         for kind in ["ok", "fault", "skipped"] {
