@@ -578,7 +578,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 258 to 259 for bsv-low #672 (2026-10-15, RC-L30-COULD-NOT-JUDGE): `owed_spender_bytes`, the owed list's durable
 /// content-addressed store of a hop spender's immutable outputs + input outpoints, so a courier-budget-cut recompute
 /// never regresses a JUDGED "spent outside this game" row to "could not judge the spender". One table.
-pub const OVERLAY_MIGRATION_COUNT: usize = 259;
+/// 259 to 260 for bsv-low #566 (2026-10-17, the W1-OBS-APPLAYER lens's M1): `owed_state.recomputeSeq`, the
+/// identity's own recompute sequence, bumped by the snapshot's upsert and served on `/owed`. One column.
+pub const OVERLAY_MIGRATION_COUNT: usize = 260;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2029,6 +2031,10 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // at the first successful hash-verified fetch and reads them before the budget on every later pass. The app
     // layer catches this table up on a cold isolate (`schema::OWED_SPENDER_BYTES_CREATE`, byte-identical).
     "CREATE TABLE IF NOT EXISTS owed_spender_bytes (txid TEXT PRIMARY KEY, bytesJson TEXT NOT NULL, createdAtMs INTEGER NOT NULL)",
+    // 260: bsv-low #566, the identity's own recompute sequence on `owed_state` (the app layer's snapshot upsert bumps
+    // it, `/owed` serves it). The app layer catches it up on a cold isolate (`owed::OWED_STATE_SEQ_ALTER`,
+    // byte-identical; its duplicate-column outcome is benign on both sides).
+    "ALTER TABLE owed_state ADD COLUMN recomputeSeq INTEGER",
 ];
 
 // =============================================================================

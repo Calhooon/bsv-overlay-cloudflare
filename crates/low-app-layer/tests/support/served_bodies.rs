@@ -189,6 +189,7 @@ fn fleet_served_bodies_are_byte_identical_before_and_after_derivation() {
                 &owed,
                 1_790_000_000_000,
                 false,
+                None,
             );
             (
                 result_body,

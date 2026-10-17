@@ -2661,6 +2661,8 @@ pub(crate) struct OwedComputed {
     /// bsv-low #487: the write refused this snapshot (the marker already carried a newer one); nothing was written
     /// and the page is not told (the newer walk told it).
     pub superseded: bool,
+    /// bsv-low #566: the identity's recompute sequence the write's read-back carried (its own on a landed write).
+    pub recompute_seq: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -2705,6 +2707,9 @@ struct OwedStateD1 {
     stale: Option<f64>,
     #[serde(default)]
     truncated: Option<f64>,
+    /// bsv-low #566: the identity's recompute sequence (NULL on a row no snapshot wrote since the column).
+    #[serde(rename = "recomputeSeq", default)]
+    recompute_seq: Option<f64>,
     #[serde(rename = "markerlessProgress", default)]
     markerless_progress: Option<String>,
 }
@@ -4559,11 +4564,18 @@ async fn owed_recompute_inner(
     struct StampD1 {
         #[serde(rename = "computedAtMs")]
         computed_at_ms: f64,
+        #[serde(rename = "recomputeSeq", default)]
+        recompute_seq: Option<f64>,
     }
-    let stamp_after = written
+    let back = written
         .last()
         .and_then(|r| r.results::<StampD1>().ok())
-        .and_then(|v| v.first().map(|s| s.computed_at_ms as i64));
+        .and_then(|v| {
+            v.first()
+                .map(|s| (s.computed_at_ms as i64, s.recompute_seq.map(|q| q as i64)))
+        });
+    let stamp_after = back.map(|b| b.0);
+    let recompute_seq = back.and_then(|b| b.1);
     // bsv-low #487: the write is monotonic in the walk's stamp; a snapshot older than the marker's changed nothing
     // (a walk that outlived its takeover, or the slower of two isolates). An unreadable read-back is taken as landed
     // (the batch itself succeeded; the pre-#487 word).
@@ -4582,6 +4594,7 @@ async fn owed_recompute_inner(
             computed_at_ms: now_ms,
             truncated: walk_cut,
             superseded,
+            recompute_seq,
         });
     }
     crate::owed::note_recompute(source, &rows);
@@ -4610,6 +4623,7 @@ async fn owed_recompute_inner(
         computed_at_ms: now_ms,
         truncated: walk_cut,
         superseded,
+        recompute_seq,
     })
 }
 
@@ -5131,7 +5145,7 @@ pub(crate) async fn owed_recompute_claimed(
 async fn owed_read_stored(
     db: &worker::D1Database,
     identity_lc: &str,
-) -> Option<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool)> {
+) -> Option<crate::owed::OwedSnapshot> {
     let id = [JsValue::from_str(identity_lc)];
     let st = db
         .prepare(crate::owed::OWED_STATE_READ_SQL)
@@ -5153,6 +5167,7 @@ async fn owed_read_stored(
         st.tip.map(|t| t as u64),
         st.computed_at_ms as i64,
         st.truncated.unwrap_or(0.0) != 0.0,
+        st.recompute_seq.map(|q| q as i64),
     ))
 }
 
@@ -5163,7 +5178,7 @@ pub(crate) async fn owed_compute_on_read(
     identity_lc: &str,
     source: &'static str,
     tip_hint: Option<u64>,
-) -> std::result::Result<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool), Result<Response>> {
+) -> std::result::Result<crate::owed::OwedSnapshot, Result<Response>> {
     match owed_recompute(env, db, identity_lc, source, tip_hint).await {
         // the lens fold's LOW-2: the write refused this walk's snapshot because a NEWER one stands (#487), so this
         // reader is served the stored rows, never its own older ones. The delta fold's LOW-4: when the stored read
@@ -5179,10 +5194,22 @@ pub(crate) async fn owed_compute_on_read(
             }
             Ok(crate::owed::superseded_read_snapshot(
                 stored,
-                (c.rows, c.tip, c.computed_at_ms, c.truncated),
+                (
+                    c.rows,
+                    c.tip,
+                    c.computed_at_ms,
+                    c.truncated,
+                    c.recompute_seq,
+                ),
             ))
         }
-        Ok(c) => Ok((c.rows, c.tip, c.computed_at_ms, c.truncated)),
+        Ok(c) => Ok((
+            c.rows,
+            c.tip,
+            c.computed_at_ms,
+            c.truncated,
+            c.recompute_seq,
+        )),
         Err(e) => {
             crate::owed::note_recompute_fault();
             console_warn!("[owed] compute on read ({source}) failed: {e}");
@@ -5203,7 +5230,7 @@ async fn owed_first_read_reserved(
     env: &worker::Env,
     db: &worker::D1Database,
     identity: &str,
-) -> std::result::Result<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool), Result<Response>> {
+) -> std::result::Result<crate::owed::OwedSnapshot, Result<Response>> {
     let end = OWED_RATE
         .with(|r| r.borrow().window_end(identity))
         .unwrap_or(0);
@@ -5225,9 +5252,7 @@ async fn owed_first_read_reserved(
         if response.status_code() != 200 {
             return Err(worker::Error::RustError(response.text().await?));
         }
-        response
-            .json::<(Vec<crate::owed::OwedRow>, Option<u64>, i64, bool)>()
-            .await
+        response.json::<crate::owed::OwedSnapshot>().await
     }
     .await;
     result.map_err(|e| {
@@ -5248,7 +5273,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
     let mut refresh_retry = None;
     if !crate::logic::valid_identity(&identity) {
         return json_response(
-            crate::owed::owed_body(&identity, None, &[], now_ms, false),
+            crate::owed::owed_body(&identity, None, &[], now_ms, false, None),
             200,
         );
     }
@@ -5289,7 +5314,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
     let mut present_tip_for_degrade: Option<u64> = None;
     let mut snapshot_tip_for_degrade: Option<u64> = None;
     let mut served_snapshot_is_fresh = false;
-    let (rows, tip, computed_at_ms, walk_cut) = match state {
+    let (rows, tip, computed_at_ms, walk_cut, recompute_seq) = match state {
         None => {
             // a first read computes the snapshot at the present tip: it is fresh, never degraded.
             served_snapshot_is_fresh = true;
@@ -5318,7 +5343,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             };
             if !known {
                 return json_response(
-                    crate::owed::owed_body(&identity, None, &[], now_ms, false),
+                    crate::owed::owed_body(&identity, None, &[], now_ms, false, None),
                     200,
                 );
             }
@@ -5336,6 +5361,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             }
         }
         Some(st) => {
+            let stored_seq = st.recompute_seq.map(|q| q as i64);
             let rows: Vec<crate::owed::OwedRow> = match db
                 .prepare(crate::owed::OWED_ROWS_READ_SQL)
                 .bind(&[JsValue::from_str(&identity)])
@@ -5468,7 +5494,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                 }
                             }
                         }
-                        (rows, served_tip, st.computed_at_ms as i64, cut)
+                        (rows, served_tip, st.computed_at_ms as i64, cut, stored_seq)
                     }
                     // no fetch context (a test harness): the inline compute, as before
                     None => {
@@ -5491,7 +5517,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                             let deferred = owed_deferred_deadline(&identity);
                             owed_shed_remark(&db, &identity).await;
                             owed_schedule_deferred(&ctx.env, &identity, deferred).await;
-                            (rows, prev_tip, st.computed_at_ms as i64, cut)
+                            (rows, prev_tip, st.computed_at_ms as i64, cut, stored_seq)
                         } else {
                             match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)
                                 .await
@@ -5506,13 +5532,14 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                     prev_tip,
                                     st.computed_at_ms as i64,
                                     true,
+                                    stored_seq,
                                 ),
                             }
                         }
                     }
                 }
             } else {
-                (rows, served_tip, st.computed_at_ms as i64, cut)
+                (rows, served_tip, st.computed_at_ms as i64, cut, stored_seq)
             }
         }
     };
@@ -5536,6 +5563,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
         &served,
         computed_at_ms,
         truncated,
+        recompute_seq,
     ))
     .map_err(|e| worker::Error::RustError(e.to_string()))?;
     crate::owed::mark_shed_refresh(&mut body, refresh_retry);
