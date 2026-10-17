@@ -9394,6 +9394,8 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     body["rate"] = crate::rate::health_json(worker::Date::now().as_millis() as f64);
     // bsv-low #532: the identity views' outcomes per route and the budget (this isolate's).
     body["identity"] = crate::identity::health_json();
+    // bsv-low #670 (round 2, question 6): the TEST-ONLY knobs this deploy honours (empty on prod: no beta marker).
+    body["testKnobs"] = serde_json::json!(crate::auth::test_knobs_honored(&ctx.env));
     // #375 (review MED-2's surface half): the ACTIVE era cutoff — post the
     // future-cutoff belt, i.e. exactly what the views are filtering by and
     // what /epoch serves. `null` = write-off inert. One glance answers

@@ -15,7 +15,10 @@ use bsv_middleware_cloudflare::types::StoredSession;
 use bsv_middleware_cloudflare::{
     process_auth_with_storage, AuthCloudflareError, AuthMiddlewareOptions, SessionStorage,
 };
-use low_app_layer::auth::{auth_fault_class, auth_fault_reply, auth_input_guard, AuthFaultClass};
+use low_app_layer::auth::{
+    auth_fault_class, auth_fault_reply, auth_input_guard, planted_store_fault_error,
+    planted_store_fault_on, AuthFaultClass,
+};
 use wasm_bindgen_test::wasm_bindgen_test;
 use worker::{Headers, Method, Request, RequestInit, Response};
 
@@ -235,4 +238,21 @@ async fn s670_g_the_guard_on_real_requests() {
         Some("application/json")
     );
     assert_eq!(passed.bytes().await.unwrap(), real);
+}
+
+/// Round 2's question 6: the planted store fault's header is read from a real
+/// request, the gate needs the beta marker, and the answer is the real 503 as
+/// `serve` sends it.
+#[wasm_bindgen_test]
+async fn s670_j_the_planted_fault_on_a_real_request() {
+    let asked = request(
+        "/owed",
+        &[("x-low-test-store-fault", "1".into())],
+        Some(b"{}"),
+    );
+    assert!(planted_store_fault_on(&asked, Some("_beta"), Some("1")));
+    assert!(!planted_store_fault_on(&asked, None, Some("1")));
+    let plain = request("/owed", &[], Some(b"{}"));
+    assert!(!planted_store_fault_on(&plain, Some("_beta"), Some("1")));
+    assert_the_503(as_served(&planted_store_fault_error())).await;
 }

@@ -245,6 +245,11 @@ IDENTITY_APP_ORIGINS = "https://low-beta.pages.dev,https://low-harness.pages.dev
 # never anonymous; prod stays lenient until the promotion.
 AUTH_ENFORCE = "true"
 SESSION_LANE = "true"
+# bsv-low #670 (round 2, question 6): the beta-only marker a TEST-ONLY knob needs
+# (`auth::test_knob_n`). Never in the prod [vars] (pinned): wrangler env vars do not
+# inherit, so prod has no marker and a knob put there is inert. The planted store
+# fault's knob `AUTH_STORE_FAULT_TEST` is set beside it only by the drill's deploy.
+LOW_BETA_MARKER = "_beta"
 # Beta's own storage epoch — bumping THIS orders beta clients to clear their
 # local state without touching prod clients.
 STORAGE_EPOCH = "beta-2026-08-12-1"
