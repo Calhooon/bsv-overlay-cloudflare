@@ -390,6 +390,34 @@ pub fn verdict_memo_answers(memo: &VerdictMemo, txid: &str, now_ms: i64, max_age
     }
 }
 
+/// bsv-low #626 (the observability bar, issue 2): the tx-any memos this worker reads or writes, counted on the
+/// overlay's durable counters as `applayer_txany_memo_<op>_<kind>_total`. The durable verdict memo's kinds
+/// (`tx_any_verdicts.kind`) are HIT here only: the overlay writes them (its retire pass and its eviction, counted
+/// there as `txany_memo_write_<kind>_total`). `anchor` is the Arcade anchor probe's thirty-second route memo,
+/// `isolate_unconfirmable` the ten-minute isolate cache of an unconfirmable answer; both are written here.
+pub const MEMO_HIT_KINDS: [&str; 6] = [
+    "absent",
+    "unconfirmable",
+    "refused",
+    "retired",
+    "anchor",
+    "isolate_unconfirmable",
+];
+/// The kinds this worker writes (see [`MEMO_HIT_KINDS`]).
+pub const MEMO_WRITE_KINDS: [&str; 2] = ["anchor", "isolate_unconfirmable"];
+
+/// PURE: the durable name of one memo write or hit.
+pub fn memo_counter(op: &str, kind: &str) -> String {
+    format!("applayer_txany_memo_{op}_{kind}_total")
+}
+
+/// Every memo name this worker can write (the overlay seeds each at 0).
+pub fn memo_counter_names() -> Vec<String> {
+    let hits = MEMO_HIT_KINDS.iter().map(|k| memo_counter("hit", k));
+    let writes = MEMO_WRITE_KINDS.iter().map(|k| memo_counter("write", k));
+    writes.chain(hits).collect()
+}
+
 /// The memo read for one txid, column order = the row's fields.
 pub const VERDICT_MEMO_READ_SQL: &str =
     "SELECT txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence FROM tx_any_verdicts WHERE txid = ?";
