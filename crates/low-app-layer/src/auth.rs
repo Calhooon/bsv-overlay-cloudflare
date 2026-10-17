@@ -721,6 +721,135 @@ pub(crate) fn auth_fault_answer(
     }
 }
 
+// ── bsv-low #670 fold (lens HIGH-1): a caller's own bytes never reach the store ──
+//
+// The middleware (0.6.2) uses the caller's nonce headers as storage keys and
+// values without a shape check: `x-bsv-auth-your-nonce` (or `x-bsv-auth-nonce`
+// when it is absent) is the session key (`auth:session:<nonce>`, the DO's
+// `id_from_name`), `x-bsv-auth-nonce` the consumed-nonce key
+// (`auth:nonce:<session>:<nonce>`), and a handshake's `initialNonce` is stored
+// whole as the session's `peer_nonce`. An over-long one makes Cloudflare refuse
+// the key (KV: 512 bytes) or the value (a KV-backed DO: 128 KiB), which the
+// crate raises as `KvError`, the store-fault class: a stranger could raise the
+// 503 (and `auth_handshake_unavailable_total`) at will. The door refuses those
+// inputs FIRST, with the pre-#670 400.
+
+/// The longest nonce header handed to the middleware. The reference's nonce
+/// (`createNonce`: 16 random bytes + a 16-byte HMAC, base64) is 44 characters;
+/// the server's session nonce is the same shape. 128 leaves room for any
+/// encoding and keeps every derived KV key under the 512-byte limit.
+pub const AUTH_NONCE_MAX_BYTES: usize = 128;
+/// The longest `/.well-known/auth` body handed to the middleware. A real
+/// InitialRequest is 246 bytes (`s670_e` builds and measures one); the app
+/// layer requests no certificates, so no honest handshake carries a
+/// certificate list. The reference bounds an auth message at 16 MiB
+/// (`MAX_AUTH_MESSAGE_BYTES`) and a handshake RESPONSE at 1 MiB; 16 KiB is
+/// ours, under the DO's 128 KiB value cap.
+pub const AUTH_HANDSHAKE_BODY_MAX_BYTES: usize = 16 * 1024;
+/// Every `x-bsv-auth-*` header the middleware turns into a storage key or a
+/// stored value. The others are parsed to a fixed shape before any store call
+/// (the identity key a public key, the request id 32 bytes, the signature
+/// bytes, the requested certificates JSON never stored) or only compared.
+pub const AUTH_NONCE_HEADERS: [&str; 3] = [
+    bsv_middleware_cloudflare::auth_headers::NONCE,
+    bsv_middleware_cloudflare::auth_headers::YOUR_NONCE,
+    bsv_middleware_cloudflare::auth_headers::INITIAL_NONCE,
+];
+/// The durable `ops_counters` row an oversize auth input bumps (the census's
+/// batched flush), apart from the store-fault row.
+pub const COUNTER_AUTH_HANDSHAKE_OVERSIZE: &str = "auth_handshake_oversize_total";
+
+/// The first nonce header over [`AUTH_NONCE_MAX_BYTES`], named.
+pub fn auth_nonce_oversize(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    AUTH_NONCE_HEADERS.iter().find_map(|h| {
+        get(h)
+            .filter(|v| v.len() > AUTH_NONCE_MAX_BYTES)
+            .map(|_| format!("{h} over {AUTH_NONCE_MAX_BYTES} bytes"))
+    })
+}
+
+/// The handshake body's reason, when its length is over the bound.
+pub fn handshake_body_oversize(len: usize) -> Option<String> {
+    (len > AUTH_HANDSHAKE_BODY_MAX_BYTES)
+        .then(|| format!("handshake body over {AUTH_HANDSHAKE_BODY_MAX_BYTES} bytes"))
+}
+
+/// Append a chunk of the handshake body; `false` once the bound is passed (the
+/// read stops there, so an oversize body is never held whole).
+pub fn push_bounded(buf: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    if buf.len() + chunk.len() > AUTH_HANDSHAKE_BODY_MAX_BYTES {
+        return false;
+    }
+    buf.extend_from_slice(chunk);
+    true
+}
+
+/// The oversize answer: the door's pre-#670 400, a caller fault, never the 503.
+pub fn auth_oversize_answer(reason: &str) -> (u16, serde_json::Value) {
+    (
+        400,
+        json!({ "error": format!("authentication handshake failed: {reason}") }),
+    )
+}
+
+/// Read a handshake body up to the bound and hand the middleware a request
+/// with the SAME method, URL, headers and bytes. `Err(reason)` when it is over.
+async fn bound_handshake_body(mut req: Request) -> Result<std::result::Result<Request, String>> {
+    use futures_util::StreamExt;
+    let declared = req
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    if let Some(reason) = declared.and_then(handshake_body_oversize) {
+        return Ok(Err(reason));
+    }
+    let mut buf = Vec::new();
+    // A request with no body has no stream: the middleware reads it as empty.
+    if let Ok(mut stream) = req.stream() {
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else {
+                return Ok(Err("handshake body could not be read".into()));
+            };
+            if !push_bounded(&mut buf, &chunk) {
+                return Ok(Err(handshake_body_oversize(AUTH_HANDSHAKE_BODY_MAX_BYTES + 1)
+                    .unwrap_or_default()));
+            }
+        }
+    }
+    let mut init = worker::RequestInit::new();
+    init.with_method(req.method());
+    init.with_headers(req.headers().clone());
+    if !buf.is_empty() {
+        init.with_body(Some(worker::js_sys::Uint8Array::from(buf.as_slice()).into()));
+    }
+    Request::new_with_init(req.url()?.as_str(), &init)
+        .map(Ok)
+}
+
+/// The guard the door runs BEFORE `process_auth*`: an over-long nonce header
+/// or handshake body is the 400 (counted `auth_handshake_oversize_total`, and
+/// in the isolate tally as the refusal the old 400 was); anything else passes,
+/// a handshake re-built byte for byte.
+pub async fn auth_input_guard(req: Request) -> Result<std::result::Result<Request, Response>> {
+    let reason = if let Some(r) = auth_nonce_oversize(|h| req.headers().get(h).ok().flatten()) {
+        r
+    } else if CloudflareTransport::is_handshake_request(&req) {
+        match bound_handshake_body(req).await? {
+            Ok(rebuilt) => return Ok(Ok(rebuilt)),
+            Err(r) => r,
+        }
+    } else {
+        return Ok(Ok(req));
+    };
+    crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_OVERSIZE);
+    // The old 400 was the middleware's `Err`: the same durable reason (#628).
+    count_auth_refused("handshake_fault");
+    let (status, body) = auth_oversize_answer(&reason);
+    json_reply(status, &body).map(Err)
+}
+
 /// A secret/var read that treats "bound but empty" as absent.
 fn nonempty_var(env: &Env, name: &str) -> Option<String> {
     env.secret(name)
@@ -846,6 +975,13 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
             };
             // ONE outcome shape for both doors: the lane's `Laned` arm folds
             // into the same verified-caller construction as BRC-104's.
+            // bsv-low #670 fold (HIGH-1): an over-long nonce or handshake body
+            // is the caller's 400 here, before the middleware can turn it into
+            // a store fault.
+            let req = match auth_input_guard(req).await? {
+                Ok(req) => req,
+                Err(resp) => return Ok(FrontDoor::Reply(resp)),
+            };
             let outcome = if lane_on {
                 process_auth_lane(req, env, &opts, AUTH_SESSION_STORE_BINDING).await
             } else {
@@ -1136,6 +1272,73 @@ mod tests {
         assert!(
             include_str!("../Cargo.toml").contains("bsv-middleware-cloudflare = \"=0.6.2\""),
             "the middleware pin moved: re-read AuthCloudflareError and its KvError sites first"
+        );
+    }
+
+    /// (e) The lens's HIGH-1: a caller's over-long nonce header or handshake
+    /// body is the caller's 400 (`authentication handshake failed: <reason>`),
+    /// never the store-fault 503; a real-size handshake passes, bytes unchanged.
+    #[test]
+    fn s670_e_an_oversize_auth_input_is_the_callers_400() {
+        use bsv_middleware_cloudflare::auth_headers as h;
+        let long = "A".repeat(600);
+        for header in [h::YOUR_NONCE, h::NONCE, h::INITIAL_NONCE] {
+            let get = |name: &str| (name == header).then(|| long.clone());
+            let reason = auth_nonce_oversize(get).expect(header);
+            assert_eq!(reason, format!("{header} over 128 bytes"));
+            let (status, body) = auth_oversize_answer(&reason);
+            assert_eq!(status, 400);
+            assert_eq!(
+                serde_json::to_string(&body).unwrap(),
+                format!(r#"{{"error":"authentication handshake failed: {header} over 128 bytes"}}"#)
+            );
+        }
+        let nonce = bsv_middleware_cloudflare::core::auth::generate_random_nonce();
+        assert_eq!(nonce.len(), 44);
+        let at = |n: usize| move |name: &str| (name == h::YOUR_NONCE).then(|| "n".repeat(n));
+        assert_eq!(auth_nonce_oversize(|_| Some(nonce.clone())), None);
+        assert_eq!(auth_nonce_oversize(at(128)), None);
+        assert!(auth_nonce_oversize(at(129)).is_some());
+        assert_eq!(auth_nonce_oversize(|_| None), None);
+        let mut buf = Vec::new();
+        let chunk = vec![b'x'; 1024];
+        let fits = (0..17).take_while(|_| push_bounded(&mut buf, &chunk)).count();
+        assert_eq!((fits, buf.len()), (16, 16 * 1024), "the read stops at the bound");
+        assert_eq!(
+            handshake_body_oversize(17 * 1024).as_deref(),
+            Some("handshake body over 16384 bytes")
+        );
+        assert_eq!(handshake_body_oversize(16 * 1024), None);
+        let key = bsv_rs::primitives::PrivateKey::from_hex(&format!("{:064x}", 2)).unwrap();
+        let mut m = bsv_rs::auth::AuthMessage::new(
+            bsv_rs::auth::MessageType::InitialRequest,
+            key.public_key(),
+        );
+        m.initial_nonce = Some(nonce);
+        m.requested_certificates = Some(Default::default());
+        let real = serde_json::to_vec(&m).unwrap();
+        assert_eq!(real.len(), 246, "a real InitialRequest");
+        assert_eq!(handshake_body_oversize(real.len()), None);
+        let mut read = Vec::new();
+        for piece in real.chunks(7) {
+            assert!(push_bounded(&mut read, piece));
+        }
+        assert_eq!(read, real, "the bytes handed on are the bytes received");
+        // The door runs the guard BEFORE the middleware, once.
+        let whole = include_str!("auth.rs");
+        let code: String = whole[..whole.find("#[cfg(test)]").unwrap()]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let at = code.find("letreq=matchauth_input_guard(req).await?{").expect("the door runs the guard");
+        assert!(code[at..].find("process_auth_lane(req,").is_some());
+        assert_eq!(code.matches("auth_input_guard(req).await?").count(), 1);
+        assert_eq!(COUNTER_AUTH_HANDSHAKE_OVERSIZE, "auth_handshake_oversize_total");
+        assert_eq!(
+            code.matches("crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_OVERSIZE);")
+                .count(),
+            1,
+            "the oversize 400 is counted apart"
         );
     }
 
