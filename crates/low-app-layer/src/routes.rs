@@ -8043,9 +8043,13 @@ where
             get(format!("{WOC_BASE}/tx/hash/{txid_lc}")).await,
             Some((404, _))
         );
-    let st = crate::results::sharpen_unmined_absence(
-        crate::results::decide_spent_any(&woc, spender_raw_ok, bitails),
-        woc_node_absent,
+    // bsv-low #723: a spend a FALLBACK rung named (WoC faulted) carries no confirmation word: `null`, never `false`
+    let st = crate::results::spent_confirmed_unknown_after_fault(
+        crate::results::sharpen_unmined_absence(
+            crate::results::decide_spent_any(&woc, spender_raw_ok, bitails),
+            woc_node_absent,
+        ),
+        primary == "woc",
     );
     let row = SpentAnyCached {
         known: st.known,
@@ -8195,12 +8199,94 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         .filter_map(|entry| entry.spending_txid.clone())
         .collect();
     let stored_words = crate::tracker_host::runtime::read_soft(&ctx.env, &ids).await?;
-    let value = serde_json::from_str(&crate::txany::spent_any_body(&entries, &terminals))?;
+    let views = match stored_words {
+        Some(rows) => Some(crate::tracker_host::runtime::views(&ctx.env, &rows).await),
+        None => None,
+    };
+    // bsv-low #723: a KNOWN spend's `spentConfirmed` from a checked proof of its VERIFIED spender where the app
+    // layer holds one (the index's verified proof, the tracker's checked mined word, an isolate-held chaintracks-bound
+    // `/tx-any` proof), the courier's status only when none is held, `null` when the ladder's confirming rung
+    // faulted; the source named (`spentConfirmedSource`). The memo written above keeps the ladder's own word.
+    let spenders: Vec<String> = entries
+        .iter()
+        .filter(|e| e.known && e.spent == Some(true))
+        .filter_map(|e| e.spending_txid.as_deref().map(str::to_ascii_lowercase))
+        .collect();
+    let index_proven = spent_any_index_proven(&ctx.env, &spenders).await;
+    let now_f = worker::Date::now().as_millis() as f64;
+    let mut sources: Vec<Option<&'static str>> = Vec::with_capacity(entries.len());
+    for e in &mut entries {
+        let Some(sp) = e
+            .spending_txid
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .filter(|_| e.known && e.spent == Some(true))
+        else {
+            sources.push(None);
+            continue;
+        };
+        let (confirmed, source) = crate::results::spent_confirmed_word(
+            e.spent_confirmed,
+            index_proven.contains(&sp),
+            crate::owed::checked_tracker_mined(views.as_ref(), &sp) == Some(true),
+            tx_any_cached(&sp, now_f).is_some_and(|a| crate::txany::proof_mined_word(&a)),
+        );
+        e.spent_confirmed = confirmed;
+        sources.push(source);
+    }
+    let value = serde_json::from_str(&crate::txany::spent_any_body_sourced(
+        &entries, &terminals, &sources,
+    ))?;
     // Read-only decoration; missing words remain unknown until the scheduled pass.
     json_response(
-        crate::tracker_host::runtime::body_loaded(&ctx.env, value, None, stored_words).await?,
+        crate::tracker_host::runtime::decorate_lookup(value, None, views.as_ref()),
         200,
     )
+}
+
+/// bsv-low #723: the spenders of `/spent-any`'s known spends the INDEX holds a VERIFIED proof for
+/// (`transactions.has_proof`, latched only by the chaintracks-verified stitch), byte-free, by the PRIMARY KEY (the
+/// shipped `hopsweep::sweep_proofs_sql`). No statement when no row is a known spend; a fault is no proof (the
+/// courier's word stands, the safe direction), logged.
+async fn spent_any_index_proven(
+    env: &worker::Env,
+    spenders: &[String],
+) -> std::collections::HashSet<String> {
+    #[derive(Deserialize)]
+    struct ProofRowD1 {
+        txid: String,
+    }
+    let mut out = std::collections::HashSet::new();
+    if spenders.is_empty() {
+        return out;
+    }
+    let Ok(db) = env.d1("OVERLAY_DB") else {
+        return out;
+    };
+    for chunk in spenders.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let binds: Vec<JsValue> = chunk.iter().map(|t| JsValue::from_str(t)).collect();
+        let rows = match db
+            .prepare(crate::hopsweep::sweep_proofs_sql(chunk.len()))
+            .bind(&binds)
+        {
+            Ok(stmt) => stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<ProofRowD1>()),
+            Err(e) => Err(e),
+        };
+        match rows {
+            Ok(rows) => out.extend(rows.into_iter().map(|r| r.txid.to_ascii_lowercase())),
+            Err(e) => {
+                console_warn!(
+                    "[spent-any] index proof read failed ({} spenders): {e}",
+                    spenders.len()
+                );
+                return std::collections::HashSet::new();
+            }
+        }
+    }
+    out
 }
 
 // ── /tx-any — tx-level presence/confirmation/raw, index-first (bsv-low #229) ──
@@ -10689,6 +10775,189 @@ mod e606_tests {
                 "{s:?}"
             );
         }
+    }
+
+    /// bsv-low #723: the body `/spent-any` serves for one ladder row after the held-proof word (the route's own entry
+    /// shape, `results::spent_confirmed_word` and `txany::spent_any_body_sourced`).
+    fn e723_body(row: &SpentAnyCached, index: bool, tracker: bool, txany: bool) -> String {
+        // the route's gate: only a KNOWN SPEND is asked for a held proof
+        let (spent_confirmed, source) = if row.known && row.spent == Some(true) {
+            crate::results::spent_confirmed_word(row.spent_confirmed, index, tracker, txany)
+        } else {
+            (row.spent_confirmed, None)
+        };
+        let entry = crate::logic::OutpointStatus {
+            txid: tx(0x07),
+            vout: 0,
+            known: row.known,
+            spent: row.spent,
+            spending_txid: row.spending_txid.clone(),
+            spent_confirmed,
+            spender_seen: None,
+            spender_final: None,
+            reason: row.reason,
+            funding_seen: None,
+            evicted: crate::logic::ServedEviction::NotRead,
+        };
+        crate::txany::spent_any_body_sourced(&[entry], &[false], &[source])
+    }
+
+    /// bsv-low #723: the ladder over a WoC `/spent` answer for `tx(0x07):0` (`None`: a transport fault), BananaBlocks
+    /// naming the competitor spend, and WoC's hex of it (so the spender verifies).
+    fn e723_ladder(woc_spent: Option<(u16, Vec<u8>)>) -> SpentAnyCached {
+        let (sp, raw) = competitor();
+        let t = tx(0x07);
+        let mut m = HashMap::new();
+        if let Some(w) = woc_spent {
+            m.insert(format!("{WOC_BASE}/tx/{t}/0/spent"), w);
+        }
+        m.insert(
+            format!("{BANANABLOCKS_BASE}/txo/{t}/0/spend"),
+            (
+                200,
+                serde_json::json!({"spent": true, "spentTxid": sp})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+        m.insert(
+            format!("{WOC_BASE}/tx/{sp}/hex"),
+            (200, hex::encode(&raw).into_bytes()),
+        );
+        let (row, raw_kept) = run(spent_any_resolve_via(&t, 0, courier(m)));
+        assert!(raw_kept.is_some(), "the spender verified");
+        assert_eq!(
+            (row.known, row.spent, row.spending_txid.as_deref()),
+            (true, Some(true), Some(sp.as_str()))
+        );
+        row
+    }
+
+    /// bsv-low #723 (a): THE FLAP. A long-mined spend whose WoC `/0/spent` rung faults (a 429, a 5xx, a transport
+    /// fault): BananaBlocks names the spender and cannot say it is mined, so the ladder's word is `null`, never
+    /// `false`; with the INDEX's verified proof of that spender held the row answers `spentConfirmed: true`,
+    /// `spentConfirmedSource: "index-proof"` (and the tracker's checked mined word, or a chaintracks-bound `/tx-any`
+    /// proof, when the index holds none), so two reads cannot flap without a chain change. A held proof outranks a
+    /// courier's "unconfirmed" too. RED on `aa57054`: the row read `spentConfirmed: false` under the fault (run as the
+    /// mutant `primary == "woc"` forced true: `left: Some(false)`), and the source and the held-proof word do not
+    /// exist there.
+    #[test]
+    fn e723_a_a_held_proof_answers_confirmed_under_a_faulting_woc_rung() {
+        for woc in [Some((429u16, Vec::new())), Some((503, Vec::new())), None] {
+            let row = e723_ladder(woc.clone());
+            assert_eq!(row.spent_confirmed, None, "{woc:?}: no word, never false");
+            let body = e723_body(&row, true, false, false);
+            assert!(
+                body.contains(r#""spentConfirmed":true,"spentConfirmedSource":"index-proof""#),
+                "{body}"
+            );
+            for (tracker, txany, source) in [
+                (true, false, "tracker-mined"),
+                (false, true, "txany-proof"),
+                (true, true, "tracker-mined"),
+            ] {
+                let body = e723_body(&row, false, tracker, txany);
+                assert!(
+                    body.contains(&format!(
+                        r#""spentConfirmed":true,"spentConfirmedSource":"{source}""#
+                    )),
+                    "{body}"
+                );
+            }
+        }
+        // a courier's "unconfirmed" against a held index proof: the proof speaks
+        let (sp, _) = competitor();
+        let row = e723_ladder(Some((
+            200,
+            serde_json::json!({"txid": sp, "vin": 0, "status": "unconfirmed"})
+                .to_string()
+                .into_bytes(),
+        )));
+        assert_eq!(row.spent_confirmed, Some(false), "WoC's own word");
+        assert!(e723_body(&row, true, false, false)
+            .contains(r#""spentConfirmed":true,"spentConfirmedSource":"index-proof""#));
+        // the route: the ladder's null, the held-proof word over the VERIFIED spender, the body with its source
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let src = squash(include_str!("routes.rs"));
+        for wired in [
+            "crate::results::spent_confirmed_unknown_after_fault(",
+            "primary==\"woc\",",
+            "letindex_proven=spent_any_index_proven(&ctx.env,&spenders).await;",
+            "crate::results::spent_confirmed_word(e.spent_confirmed,index_proven.contains(&sp),crate::owed::checked_tracker_mined(views.as_ref(),&sp)==Some(true),tx_any_cached(&sp,now_f).is_some_and(|a|crate::txany::proof_mined_word(&a)),);",
+            "crate::txany::spent_any_body_sourced(&entries,&terminals,&sources,)",
+            ".filter(|_|e.known&&e.spent==Some(true))",
+            ".prepare(crate::hopsweep::sweep_proofs_sql(chunk.len()))",
+        ] {
+            assert!(src.contains(wired), "the route: {wired}");
+        }
+    }
+
+    /// bsv-low #723 (b): NO HELD PROOF AND A WoC FAULT: `spentConfirmed: null`, `spentConfirmedSource: null` (the
+    /// confirming rung could not look; BananaBlocks' placeholder is not a word). RED on `aa57054`: `false`.
+    #[test]
+    fn e723_b_no_held_proof_and_a_woc_fault_answers_null_and_null() {
+        let row = e723_ladder(Some((429, Vec::new())));
+        let body = e723_body(&row, false, false, false);
+        assert!(
+            body.contains(r#""spentConfirmed":null,"spentConfirmedSource":null"#),
+            "{body}"
+        );
+        assert_eq!(
+            crate::results::spent_confirmed_word(None, false, false, false),
+            (None, None)
+        );
+    }
+
+    /// bsv-low #723 (c): WHERE NO RUNG FAULTED the bodies are byte-identical: WoC's confirmed spend keeps its word
+    /// (`courier`) and its body is the old one plus the additive source; an unspent, an unknown and a provider-fault row
+    /// carry no source key at all (the #695 frozen bodies, through the sourced builder).
+    #[test]
+    fn e723_c_the_bodies_where_no_rung_faulted_are_byte_identical() {
+        let (sp, _) = competitor();
+        let row = e723_ladder(Some((
+            200,
+            serde_json::json!({"txid": sp, "vin": 0, "status": "confirmed"})
+                .to_string()
+                .into_bytes(),
+        )));
+        assert_eq!(row.spent_confirmed, Some(true));
+        let entry = |r: &SpentAnyCached| crate::logic::OutpointStatus {
+            txid: tx(0x07),
+            vout: 0,
+            known: r.known,
+            spent: r.spent,
+            spending_txid: r.spending_txid.clone(),
+            spent_confirmed: r.spent_confirmed,
+            spender_seen: None,
+            spender_final: None,
+            reason: r.reason,
+            funding_seen: None,
+            evicted: crate::logic::ServedEviction::NotRead,
+        };
+        let old = crate::txany::spent_any_body(&[entry(&row)], &[false]);
+        let new = e723_body(&row, false, false, false);
+        let mut v: serde_json::Value = serde_json::from_str(&new).unwrap();
+        assert_eq!(v[0]["spentConfirmedSource"], "courier");
+        v[0].as_object_mut().unwrap().remove("spentConfirmedSource");
+        assert_eq!(v.to_string(), old, "the old body plus the additive source");
+        let frozen_fault = r#"[{"known":false,"networkSeen":null,"reason":"provider-fault","spenderFinal":null,"spenderSeen":null,"spendingTxid":null,"spent":null,"spentConfirmed":null,"txid":"0707070707070707070707070707070707070707070707070707070707070707","vout":0}]"#;
+        let frozen_unspent = r#"[{"known":true,"networkSeen":null,"reason":null,"spenderFinal":null,"spenderSeen":null,"spendingTxid":null,"spent":false,"spentConfirmed":false,"txid":"0707070707070707070707070707070707070707070707070707070707070707","vout":0}]"#;
+        let fault = SpentAnyCached {
+            known: false,
+            spent: None,
+            spending_txid: None,
+            spent_confirmed: None,
+            reason: Some(crate::logic::SPENT_ANY_REASON_PROVIDER_FAULT),
+        };
+        let unspent = SpentAnyCached {
+            known: true,
+            spent: Some(false),
+            spending_txid: None,
+            spent_confirmed: Some(false),
+            reason: None,
+        };
+        assert_eq!(e723_body(&fault, true, true, true), frozen_fault);
+        assert_eq!(e723_body(&unspent, true, true, true), frozen_unspent);
     }
 
     /// The E606 lens's L4: the spender memo is bounded by bytes beside its count. Entries of many outputs fill the
