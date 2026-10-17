@@ -3942,6 +3942,10 @@ async fn owed_recompute_inner(
     // A swept payout's `confirmed` reads it beside the spent-any ladder's `spent_confirmed`, so a hop's mined
     // confirmation survives a WoC `/0/spent` fault. Captured wherever a `/tx-any` answer is in hand this pass.
     let mut proof_mined_spenders: HashSet<String> = HashSet::new();
+    // bsv-low #693 fold (HIGH-1): this pass's checked-proof answers (to latch), and the spenders whose durable
+    // `proofmined:` latch is honoured this pass (`owed::latched_proof_mined_spenders`, the seed of the proof set)
+    let mut proof_answers: Vec<(String, crate::txany::TxAnyAnswer)> = Vec::new();
+    let mut proof_latched: HashSet<String> = HashSet::new();
     let mut courier_cap_hit = false;
     // bsv-low #662, the L25-WITHHELD lens's LOW-1: the spender look ledger (`owed::SpenderLook`). A spender is
     // WITHHELD only on a noted cap, clock or tail and no look; every read made or answer used, faulted or not, is
@@ -4022,12 +4026,36 @@ async fn owed_recompute_inner(
                 }
             }
         }
+        // bsv-low #693 fold (the W1-OWED-693 lens's HIGH-1): the durable `proofmined:` latches of the durable
+        // spenders, read BYTE-FREE (one indexed PK range read, none when no spender is durable) BEFORE this pass's own
+        // answers: a spender whose checked mined proof an earlier pass latched joins the proof set here, so its row
+        // reads confirmed on every later pass whatever this pass's slots, budget or re-ask order did. Each latch's
+        // root is re-read against chaintracks at its height (at most `OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE`
+        // heights, cached per isolate); a moved root is not honoured, a faulted read is (the reorg clear demotes).
+        if !durable_spenders.is_empty() {
+            let mut latch_spenders: Vec<String> = durable_spenders.iter().cloned().collect();
+            latch_spenders.sort();
+            let latches = crate::owed::proof_latches_of(
+                &latch_spenders,
+                &read_proof_latches(db, &latch_spenders).await,
+            );
+            let mut canonical: HashMap<u64, Option<String>> = HashMap::new();
+            for h in crate::owed::proof_latch_recheck_heights(&latches) {
+                if over_budget() {
+                    break;
+                }
+                canonical.insert(h, crate::beef_guard::canonical_root(env, h).await);
+            }
+            proof_latched = crate::owed::latched_proof_mined_spenders(&latches, &canonical);
+            proof_mined_spenders.extend(proof_latched.iter().cloned());
+        }
         // bsv-low #693 (the #692 lens's MEDIUM-1): the durable spenders whose row still needs the proof (no tracker
-        // mined word, no ladder confirmation), newest hop first; phase 2b below re-asks at most one of them
+        // mined word, no ladder confirmation, no honoured latch), newest hop first; phase 2b below re-asks at most one
         let durable_unconfirmed: Vec<String> = ordered
             .iter()
             .map(|(_, sp)| sp)
             .filter(|sp| durable_spenders.contains(*sp))
+            .filter(|sp| !proof_latched.contains(*sp))
             .filter(|sp| {
                 // the tracker's word as `spender_mined` reads it (a row that is not mined outranks the ladder)
                 let tracker = word_lookup_available
@@ -4084,6 +4112,7 @@ async fn owed_recompute_inner(
                         spender_look.look(&sp, crate::owed::SpenderLooked::CachedAnswer);
                         if crate::txany::proof_mined_word(&a) {
                             proof_mined_spenders.insert(sp.clone());
+                            proof_answers.push((sp.clone(), a.clone()));
                         }
                         if let Some(parsed) = parse_spender_answer(&a, &sp) {
                             owed_spender_outputs_memo_put(&sp, &parsed);
@@ -4191,6 +4220,7 @@ async fn owed_recompute_inner(
                 spender_look.look(&sp, crate::owed::SpenderLooked::CachedAnswer);
                 if crate::txany::proof_mined_word(&a) {
                     proof_mined_spenders.insert(sp.clone());
+                    proof_answers.push((sp.clone(), a.clone()));
                 }
                 if let Some(parsed) = parse_spender_answer(&a, &sp) {
                     owed_spender_outputs_memo_put(&sp, &parsed);
@@ -4207,6 +4237,7 @@ async fn owed_recompute_inner(
             // spent-any ladder's only confirming courier (WoC `/0/spent`) faulted. Never a courier's bare height.
             if crate::txany::proof_mined_word(&a) {
                 proof_mined_spenders.insert(sp.clone());
+                proof_answers.push((sp.clone(), a.clone()));
             }
             if a.source != Some("memo") {
                 // a courier was really asked: the slot, and the stamp that sends this spender to the back of the
@@ -4254,13 +4285,14 @@ async fn owed_recompute_inner(
                     (a, asked)
                 })
                 .await;
-            for (r, _) in reasks {
+            for (r, a) in reasks {
                 if r.courier_asked {
                     courier_reads += 1;
                     owed_courier_note_asked(&r.spender, worker::Date::now().as_millis() as f64);
                     spenders_asked.push(r.spender.clone());
                 }
                 if r.outcome == crate::owed::DurableReaskOutcome::MinedByProof {
+                    proof_answers.push((r.spender.clone(), a));
                     proof_mined_spenders.insert(r.spender);
                 }
             }
@@ -4367,7 +4399,8 @@ async fn owed_recompute_inner(
                 // NOT upgraded, because `owed::non_pot_spender` confirms that arm from the index's own
                 // `spent_confirmed` and never reads a chain-rung memo, so such a memo would change nothing, and making
                 // that arm read one would let a non-index word confirm an `index-bytes` row, whose claimability IS its
-                // `confirmed`; that row's flap is closed instead by phase 2b's re-ask of its durable spender.
+                // `confirmed`; that row is held instead by its spender's `proofmined:` latch (#693 fold, HIGH-1: latched once
+                // checked by phase 2 or 2b, served from the latch on every later pass).
                 r.facts.get("confirmedSource").and_then(|v| v.as_str()) == Some("proof")
                     && r.facts.get("spent").and_then(|v| v.as_bool()) != Some(true)
             })
@@ -4376,6 +4409,11 @@ async fn owed_recompute_inner(
                 let hop_vout =
                     u32::try_from(r.facts.get("hopVout").and_then(|v| v.as_u64())?).ok()?;
                 let sweep = r.facts.get("sweepTxid").and_then(|v| v.as_str())?;
+                // bsv-low #693 fold (HIGH-1): a row confirmed from an honoured `proofmined:` latch is upgraded no
+                // more (the latch serves it every pass; the upgrade is for a proof first seen this pass)
+                if proof_latched.contains(&sweep.to_ascii_lowercase()) {
+                    return None;
+                }
                 Some(crate::hops_view::ProbeMemo {
                     outpoint: crate::hops_view::probe_memo_key(hop_txid, hop_vout),
                     probed_at_ms: now_ms,
@@ -4614,11 +4652,46 @@ async fn owed_recompute_inner(
     if spender_bytes_persisted > 0 {
         crate::owed::note_spender_store_persisted(spender_bytes_persisted as u64);
     }
+    // bsv-low #693 fold (HIGH-1): latch this pass's checked mined proofs of courier-bytes spenders no honoured latch
+    // covers, in the SAME atomic batch (at most `OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE`): the height and the
+    // canonical root the proof was bound against (chaintracks, cached per isolate since the check), never bytes. A
+    // root that cannot be read writes no latch this pass (the proof still serves this pass; a later one latches it).
+    let mut proofs_to_latch: Vec<(String, crate::txany::TxAnyAnswer, Option<String>)> = Vec::new();
+    for (sp, a) in proof_answers
+        .into_iter()
+        .filter(|(sp, _)| !proof_latched.contains(sp) && courier_spenders.contains(sp))
+        .take(crate::owed::OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE)
+    {
+        let root = match a.height {
+            Some(h) => crate::beef_guard::canonical_root(env, h).await,
+            None => None,
+        };
+        proofs_to_latch.push((sp, a, root));
+    }
+    for latch in crate::owed::proof_latches_to_write(
+        &proofs_to_latch,
+        &proof_latched,
+        &courier_spenders,
+        now_ms,
+    ) {
+        let latch_stmt = db
+            .prepare(crate::hops_view::PROBE_MEMO_UPSERT_SQL)
+            .bind(&[
+                JsValue::from_str(&latch.outpoint),
+                JsValue::from_f64(latch.probed_at_ms as f64),
+                JsValue::from_f64(1.0),
+                JsValue::from_str(latch.spending_txid.as_deref().unwrap_or_default()),
+                JsValue::from_f64(1.0),
+            ])
+            .map_err(|e| format!("owed proof latch bind: {e}"))?;
+        stmts.insert(stmts.len() - 1, latch_stmt);
+    }
     debug_assert!(
         stmts.len()
             <= 4 + 2 * crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE
+                + crate::owed::OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE
                 + crate::owed::OWED_MAX_ROWS,
-        "the batch stays under the row cap + the bookends, the cursor, the ask stamps and the spender-bytes puts"
+        "the batch stays under the row cap + the bookends, the cursor, the ask stamps, the spender-bytes puts and the proof latches"
     );
     let written = crate::d1_ledger::counted_batch(db, stmts)
         .await
@@ -6787,9 +6860,27 @@ async fn read_home_latches(
     db: &worker::D1Database,
     spenders: &[String],
 ) -> Vec<crate::hops_view::ProbeMemo> {
+    read_latch_ranges(db, spenders, crate::owed::home_latch_range_binds).await
+}
+
+/// bsv-low #693 fold (HIGH-1): the durable `proofmined:` latches of the named spenders, BYTE-FREE, through the same
+/// indexed PK range read as the home latches (`owed::proof_latch_range_binds`). A read fault returns no latch: the
+/// pass judges on its own answers, as before the latch.
+async fn read_proof_latches(
+    db: &worker::D1Database,
+    spenders: &[String],
+) -> Vec<crate::hops_view::ProbeMemo> {
+    read_latch_ranges(db, spenders, crate::owed::proof_latch_range_binds).await
+}
+
+async fn read_latch_ranges(
+    db: &worker::D1Database,
+    spenders: &[String],
+    range_binds: fn(&[String]) -> Vec<String>,
+) -> Vec<crate::hops_view::ProbeMemo> {
     let mut rows: Vec<ProbeMemoRow> = Vec::new();
     for chunk in spenders.chunks(crate::owed::HOME_LATCH_READ_CHUNK) {
-        let binds: Vec<JsValue> = crate::owed::home_latch_range_binds(chunk)
+        let binds: Vec<JsValue> = range_binds(chunk)
             .iter()
             .map(|b| JsValue::from_str(b))
             .collect();
@@ -6805,7 +6896,7 @@ async fn read_home_latches(
                 Ok(got) => rows.extend(got),
                 Err(e) => {
                     console_warn!(
-                        "[owed] home latch read failed ({} spenders): {e}",
+                        "[owed] latch read failed ({} spenders): {e}",
                         spenders.len()
                     );
                     return Vec::new();
@@ -6813,7 +6904,7 @@ async fn read_home_latches(
             },
             Err(e) => {
                 console_warn!(
-                    "[owed] home latch bind failed ({} spenders): {e}",
+                    "[owed] latch bind failed ({} spenders): {e}",
                     spenders.len()
                 );
                 return Vec::new();
