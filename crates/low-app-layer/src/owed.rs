@@ -4256,12 +4256,20 @@ pub const OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE: usize = 4;
 /// OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE)` header reads.
 pub const LATCH_RECHECK_DEPTH: u64 = 6;
 
-/// One proof latch read back: the spender, the height and the root it was checked against.
+/// bsv-low #693 fold-2 (the re-lens's R-HIGH-1 (2), (3)): the oldest an UNRECHECKED, reorg-reachable latch may be
+/// and still be honoured: the two hours the confirmed memos had (`hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS`, the
+/// overlay's `HOP_PROBE_MEMO_TTL_MS`). Past it, with no successful recheck this pass, the latch is not honoured and
+/// its spender is re-asked; a new proof re-latches it with a new write time. The TTL sweep still spares the row.
+pub const PROOF_LATCH_UNRECHECKED_MAX_AGE_MS: i64 =
+    crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS;
+
+/// One proof latch read back: the spender, the height and the root it was checked against, and when it was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProofLatch {
     pub spender: String,
     pub height: u64,
     pub root: String,
+    pub written_at_ms: i64,
 }
 
 fn is_hex64(s: &str) -> bool {
@@ -4298,16 +4306,24 @@ pub fn proof_latch_memo(
 }
 
 /// PURE: the range binds of each spender's `proofmined:` latches, for [`home_latch_range_read_sql`] (the same
-/// indexed PK range read; `/` is the byte after `.`, so the range is exactly `proofmined:<spender>.<height>`).
+/// indexed PK range read; `/` is the byte after `.`, so the range is exactly `proofmined:<spender>.<height>`), and
+/// one range more, the overlay's reorg TOMBSTONE (`reorg-clear.0` exactly; bsv-low #693 fold-2, the re-lens's
+/// R-HIGH-1 (2)), so the latches and the time of the last clear arrive in one read, together or not at all, as the
+/// memo walk reads them (`hops_view::reorg_clear_at`). One range per spender plus one: [`HOME_LATCH_READ_CHUNK`]
+/// spenders stay under D1's bound limit.
 pub fn proof_latch_range_binds(spenders: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(spenders.len() * 2);
+    let mut out = Vec::with_capacity(spenders.len() * 2 + 2);
     for sp in spenders {
         let sp = sp.to_ascii_lowercase();
         out.push(format!("{PROOF_MINED_LATCH_PREFIX}{sp}."));
         out.push(format!("{PROOF_MINED_LATCH_PREFIX}{sp}/"));
     }
+    out.push(crate::hops_view::PROBE_MEMO_REORG_MARK.to_string());
+    // the mark is `reorg-clear.0`: the range up to `reorg-clear.1` (exclusive) holds it and no other key
+    out.push("reorg-clear.1".to_string());
     out
 }
+const _: () = assert!(2 * (HOME_LATCH_READ_CHUNK + 1) <= crate::logic::D1_MAX_BOUND_PARAMS);
 
 /// PURE: the proof latches the range read returned for the named spenders. Only a well-formed latch counts: the key
 /// `proofmined:<spender>.<height>`, `spent`, `spentConfirmed = 1` and a 64-hex root.
@@ -4335,6 +4351,7 @@ pub fn proof_latches_of(
                     spender: sp.clone(),
                     height,
                     root: root.to_ascii_lowercase(),
+                    written_at_ms: m.probed_at_ms,
                 });
             }
         }
@@ -4379,22 +4396,50 @@ pub fn latch_is_deep(height: u64, tip: u64) -> bool {
 
 /// PURE: the spenders whose latch is HONOURED this pass, the seed of the pass's `proof_mined_spenders` (before its
 /// own answers). `canonical` is chaintracks' root at each re-read height (`None`: the header read faulted). A latch
-/// whose height was re-read and whose root is NOT the canonical one is not honoured (a reorg moved the block: the
-/// row waits again until a new proof, which latches at its new height); a latch whose header could not be read, or
-/// past the re-read bound, is honoured on the reorg clear's word (it was checked against chaintracks when written,
-/// and the clear deletes it on reorg evidence).
+/// whose height was re-read THIS pass is honoured exactly when its root is the canonical one (a reorg moved the
+/// block: the row waits again until a new proof, which latches at its new height). A latch NOT re-read this pass
+/// (its header read faulted, the pass was `over_budget`, or it is past the rechecks) is honoured only on a CLEAN
+/// CLEAR HISTORY (bsv-low #693 fold-2, the re-lens's R-HIGH-1 (2), (3); the #484 grace rule,
+/// `hops_view::in_reorg_grace`): written at or after `reorg_clear_at_ms + PROBE_MEMO_REORG_GRACE_MS`. A latch
+/// written before a clear survived a clear that faulted, and one written inside the grace after it may carry a root
+/// checked before the reorg (a pass's proof outlives the clear by up to its 30 s header cache and 12 s clock): both
+/// wait for a recheck. With that history it is honoured when reorg-proof ([`latch_is_deep`] under `tip`), or when
+/// written more than the grace ago and less than [`PROOF_LATCH_UNRECHECKED_MAX_AGE_MS`] ago; past two hours
+/// unrechecked it is re-asked (a clear that faulted with no tombstone leaves a latch for two hours, not for ever).
+/// Not honoured is display only: the row reads "waiting for the block" one pass more, never `claimable`.
 pub fn latched_proof_mined_spenders(
     latches: &[ProofLatch],
     canonical: &HashMap<u64, Option<String>>,
+    tip: Option<u64>,
+    reorg_clear_at_ms: Option<i64>,
+    now_ms: i64,
 ) -> HashSet<String> {
+    let tip = latch_tip(latches, tip);
     latches
         .iter()
         .filter(|l| match canonical.get(&l.height) {
             Some(Some(root)) => root.eq_ignore_ascii_case(&l.root),
-            Some(None) | None => true,
+            Some(None) | None => unrechecked_latch_honoured(l, tip, reorg_clear_at_ms, now_ms),
         })
         .map(|l| l.spender.clone())
         .collect()
+}
+
+/// PURE: the rule [`latched_proof_mined_spenders`] applies to a latch whose height was not re-read this pass.
+pub fn unrechecked_latch_honoured(
+    l: &ProofLatch,
+    tip: u64,
+    reorg_clear_at_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    if crate::hops_view::in_reorg_grace(l.written_at_ms, reorg_clear_at_ms) {
+        return false;
+    }
+    if latch_is_deep(l.height, tip) {
+        return true;
+    }
+    let age = now_ms.saturating_sub(l.written_at_ms);
+    (crate::hops_view::PROBE_MEMO_REORG_GRACE_MS..PROOF_LATCH_UNRECHECKED_MAX_AGE_MS).contains(&age)
 }
 
 /// PURE: the latches a pass writes: each spender this pass holds a checked proof for (`proofs`: spender, answer,
@@ -5959,7 +6004,7 @@ pub(crate) mod tests {
     ) -> Vec<crate::hops_view::ProbeMemo> {
         let binds = proof_latch_range_binds(spenders);
         let mut stmt = conn
-            .prepare(&home_latch_range_read_sql(spenders.len()))
+            .prepare(&home_latch_range_read_sql(binds.len() / 2))
             .unwrap();
         stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
             Ok(crate::hops_view::ProbeMemo {
@@ -5976,6 +6021,8 @@ pub(crate) mod tests {
     }
 
     const E693F_ROOT: &str = "abababababababababababababababababababababababababababababababab";
+    /// The clock of [`e693f_pass`]: the latch it writes is stamped at it, and judged at it.
+    const E693F_NOW: i64 = 1_800_000_000_000;
 
     /// bsv-low #693 fold: ONE pass of the route's proof path over real SQLite, in the route's order: the durable
     /// spenders' latches read and honoured (the seed), the re-ask candidates (no honoured latch, still needing the
@@ -5992,8 +6039,34 @@ pub(crate) mod tests {
         mined: &HashSet<String>,
         canonical: &HashMap<u64, Option<String>>,
     ) -> (HashSet<String>, Vec<String>) {
-        let latches = proof_latches_of(durable, &e693f_read_latches(conn, durable));
-        let latched = latched_proof_mined_spenders(&latches, canonical);
+        e693f_pass_at(
+            conn, durable, hops, courier, room, budget_cut, mined, canonical, E693F_NOW,
+        )
+    }
+
+    /// [`e693f_pass`] at `now_ms`, with no tip (the newest latch stands in), the tombstone read with the latches as
+    /// the route reads it.
+    #[allow(clippy::too_many_arguments)]
+    fn e693f_pass_at(
+        conn: &rusqlite::Connection,
+        durable: &[String],
+        hops: &[HopEntry],
+        courier: &HashSet<String>,
+        room: usize,
+        budget_cut: bool,
+        mined: &HashSet<String>,
+        canonical: &HashMap<u64, Option<String>>,
+        now_ms: i64,
+    ) -> (HashSet<String>, Vec<String>) {
+        let memos = e693f_read_latches(conn, durable);
+        let latches = proof_latches_of(durable, &memos);
+        let latched = latched_proof_mined_spenders(
+            &latches,
+            canonical,
+            None,
+            crate::hops_view::reorg_clear_at(&memos),
+            now_ms,
+        );
         let mut proof = latched.clone();
         let candidates: Vec<String> = durable
             .iter()
@@ -6026,7 +6099,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        let writes = proof_latches_to_write(&answers, &latched, courier, 1_800_000_000_000);
+        let writes = proof_latches_to_write(&answers, &latched, courier, now_ms);
         write_memos(conn, &writes);
         (proof, asked.into_inner())
     }
@@ -6112,7 +6185,8 @@ pub(crate) mod tests {
             vec![ProofLatch {
                 spender: sweep_a.clone(),
                 height: 900_000,
-                root: E693F_ROOT.to_string()
+                root: E693F_ROOT.to_string(),
+                written_at_ms: E693F_NOW,
             }],
             "the height and the root, never bytes"
         );
@@ -6146,9 +6220,20 @@ pub(crate) mod tests {
                 r.facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON,
                 "{case}"
             );
-            // a header read that faulted honours the latch too (the reorg clear is what demotes it)
+            // a header read that faulted honours the latch once it is past the #484 grace with a clean clear history
+            // (bsv-low #693 fold-2, the re-lens's R-HIGH-1 (2): a young latch waits for its recheck)
             let fault: HashMap<u64, Option<String>> = [(900_000u64, None)].into();
-            let (proof, _) = e693f_pass(&conn, &order, &hops, &courier, room, cut, &none, &fault);
+            let (proof, _) = e693f_pass_at(
+                &conn,
+                &order,
+                &hops,
+                &courier,
+                room,
+                cut,
+                &none,
+                &fault,
+                E693F_NOW + crate::hops_view::PROBE_MEMO_REORG_GRACE_MS,
+            );
             assert_eq!(
                 row_a(&proof).facts["confirmedSource"],
                 "proof",
@@ -6159,7 +6244,7 @@ pub(crate) mod tests {
         // the snapshot batch, the read through the shipped range read
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = squash(include_str!("routes.rs"));
-        let seed = "proof_latched=crate::owed::latched_proof_mined_spenders(&latches,&canonical);proof_mined_spenders.extend(proof_latched.iter().cloned());";
+        let seed = "proof_latched=crate::owed::latched_proof_mined_spenders(&latches,&canonical,latch_tip,latch_clear,now_ms,);proof_mined_spenders.extend(proof_latched.iter().cloned());";
         let cands = ".filter(|sp|!proof_latched.contains(*sp))";
         let reask = "crate::owed::durable_reasks(candidates,room,&over_budget,";
         for wired in [
@@ -6334,7 +6419,8 @@ pub(crate) mod tests {
     /// bsv-low #693 fold-2 (the W1-OWED-693 re-lens's R-HIGH-1 (1)): THE RECHECK TAKES THE NEWEST HEIGHTS. Five
     /// latches at 900000..900004 and the newest's root moved by a reorg: its height is re-read and the latch is NOT
     /// honoured. Every height inside `LATCH_RECHECK_DEPTH` of the tip is re-read, at least the four newest; a latch
-    /// deeper than the window is reorg-proof and is not re-read; an unreadable tip counts from the newest latch. RED
+    /// deeper than the window is reorg-proof and is not re-read; an unreadable tip counts from the newest latch. The
+    /// route hands the pass's own tip (read at its start). RED
     /// on `ffb4a98` (the lowest four re-read: `honoured: 5`).
     #[test]
     fn e693f2_h1_the_recheck_takes_the_newest_heights() {
@@ -6345,6 +6431,7 @@ pub(crate) mod tests {
                 spender: tx(0x40 + i),
                 height: 900_000 + u64::from(i),
                 root: E693F_ROOT.to_string(),
+                written_at_ms: E693F_NOW,
             })
             .collect();
         let moved = "cd".repeat(32);
@@ -6359,7 +6446,7 @@ pub(crate) mod tests {
             let heights = proof_latch_recheck_heights(&latches, tip);
             let canonical: HashMap<u64, Option<String>> =
                 heights.iter().map(|h| (*h, chain(*h))).collect();
-            let honoured = latched_proof_mined_spenders(&latches, &canonical);
+            let honoured = latched_proof_mined_spenders(&latches, &canonical, tip, None, E693F_NOW);
             assert_eq!(
                 honoured.len(),
                 4,
@@ -6389,6 +6476,7 @@ pub(crate) mod tests {
                 spender: tx(0x50),
                 height: 900_000 + i,
                 root: E693F_ROOT.to_string(),
+                written_at_ms: E693F_NOW,
             })
             .collect();
         assert_eq!(
@@ -6398,14 +6486,183 @@ pub(crate) mod tests {
         // the route reads the tip before the rechecks and hands it to the shipped choice
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = squash(include_str!("routes.rs"));
-        let tip = "crate::beef_guard::present_tip(env).await";
+        let tip = "letlatch_tip=tip;";
         let recheck = "forhincrate::owed::proof_latch_recheck_heights(&latches,latch_tip){";
         assert!(routes.contains(recheck), "the route's recheck: {recheck}");
         let at = routes.find(recheck).unwrap();
         assert!(
             routes[..at].rfind(tip).is_some_and(|t| at - t < 200),
-            "the tip read just before the recheck"
+            "the pass's tip handed to the recheck"
         );
+    }
+
+    /// bsv-low #693 fold-2 (the W1-OWED-693 re-lens's R-HIGH-1 (2), (3)): A LATCH NOT RE-READ THIS PASS IS HONOURED
+    /// ONLY PAST THE #484 GRACE WITH A CLEAN CLEAR HISTORY, AND FOR TWO HOURS UNLESS REORG-PROOF. Over real SQLite,
+    /// the tombstone written by the overlay's shipped statement and read in the latch read itself. (a) A latch written
+    /// 5 s after a clear (a pass's proof checked before the reorg, committed after the clear) is not honoured on a
+    /// skipped or faulted recheck at any age, nor once reorg-proof by depth, until a recheck matches. (b) A recheck
+    /// skipped under `over_budget()`: a young latch is not honoured, one past the grace with no clear (or a clear
+    /// long before it) is, until two hours. (c) A clear that FAULTED: with its tombstone written the latch, written
+    /// before it, waits for a recheck; with no tombstone either it stands two hours, then its spender is re-asked and
+    /// a new proof re-latches it. RED on `fb26a34` (every unrechecked latch honoured: (a) at its first assertion).
+    #[test]
+    fn e693f2_h2_an_unrechecked_latch_is_honoured_only_past_the_grace_with_a_clean_clear_history_real_sqlite(
+    ) {
+        use crate::hops_view::{reorg_clear_at, PROBE_MEMO_REORG_GRACE_MS as GRACE};
+        use bsv_overlay_cloudflare::hop_probe_memos::{
+            HOP_PROBE_MEMO_REORG_MARK_SQL, HOP_PROBE_MEMO_TTL_MS,
+        };
+        assert_eq!(PROOF_LATCH_UNRECHECKED_MAX_AGE_MS, HOP_PROBE_MEMO_TTL_MS);
+        const MIN: i64 = 60_000;
+        let t0 = E693F_NOW;
+        let sp = tx(0x0e);
+        let s = std::slice::from_ref(&sp);
+        let latch_at = |conn: &rusqlite::Connection, at: i64| {
+            write_memos(
+                conn,
+                &[proof_latch_memo(&sp, &e693_answer(true), Some(E693F_ROOT), at).unwrap()],
+            )
+        };
+        let clear_at = |conn: &rusqlite::Connection, at: i64| {
+            conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![at])
+                .unwrap();
+        };
+        let judge = |conn: &rusqlite::Connection,
+                     canonical: &HashMap<u64, Option<String>>,
+                     tip: Option<u64>,
+                     now: i64|
+         -> bool {
+            let memos = e693f_read_latches(conn, s);
+            latched_proof_mined_spenders(
+                &proof_latches_of(s, &memos),
+                canonical,
+                tip,
+                reorg_clear_at(&memos),
+                now,
+            )
+            .contains(&sp)
+        };
+        let skipped: HashMap<u64, Option<String>> = HashMap::new();
+        let fault: HashMap<u64, Option<String>> = [(900_000u64, None)].into();
+        let checked: HashMap<u64, Option<String>> =
+            [(900_000u64, Some(E693F_ROOT.to_string()))].into();
+        let moved: HashMap<u64, Option<String>> = [(900_000u64, Some("cd".repeat(32)))].into();
+        let deep = Some(900_000 + LATCH_RECHECK_DEPTH);
+
+        // (a) written 5 s after a clear
+        let conn = memo_db();
+        clear_at(&conn, t0);
+        latch_at(&conn, t0 + 5_000);
+        assert_eq!(
+            reorg_clear_at(&e693f_read_latches(&conn, s)),
+            Some(t0),
+            "the tombstone rides the latch read"
+        );
+        for now in [t0 + 6_000, t0 + GRACE + 5_000, t0 + 90 * MIN] {
+            for (what, c) in [("skipped", &skipped), ("faulted", &fault)] {
+                assert!(
+                    !judge(&conn, c, None, now),
+                    "(a) a {what} recheck, {} min on",
+                    (now - t0) / MIN
+                );
+            }
+        }
+        assert!(
+            !judge(&conn, &skipped, deep, t0 + 5 * 60 * MIN),
+            "(a) reorg-proof by depth, still unrechecked"
+        );
+        assert!(
+            judge(&conn, &checked, None, t0 + 6_000),
+            "(a) a recheck that matches"
+        );
+        assert!(!judge(&conn, &moved, None, t0 + 6_000), "(a) a moved root");
+
+        // (b) a recheck skipped under over_budget, no clear
+        let conn = memo_db();
+        latch_at(&conn, t0);
+        assert!(!judge(&conn, &skipped, None, t0 + 10 * MIN), "(b) young");
+        assert!(
+            judge(&conn, &skipped, None, t0 + 40 * MIN),
+            "(b) old, no clear"
+        );
+        clear_at(&conn, t0 - GRACE);
+        assert!(
+            judge(&conn, &skipped, None, t0 + 40 * MIN),
+            "(b) old, the clear a grace before its write"
+        );
+        assert!(
+            !judge(&conn, &skipped, None, t0 + 2 * 60 * MIN),
+            "(b) two hours unrechecked"
+        );
+        assert!(
+            judge(&conn, &skipped, deep, t0 + 5 * 60 * MIN),
+            "(b) reorg-proof, clean history"
+        );
+
+        // (c) a clear that faulted, its tombstone written: the latch was written before it
+        let conn = memo_db();
+        latch_at(&conn, t0);
+        clear_at(&conn, t0 + 60 * MIN);
+        for now in [t0 + 61 * MIN, t0 + 3 * 60 * MIN] {
+            assert!(
+                !judge(&conn, &skipped, None, now),
+                "(c) a clear after its write"
+            );
+            assert!(
+                !judge(&conn, &skipped, deep, now),
+                "(c) deep, a clear after its write"
+            );
+        }
+        assert!(judge(&conn, &checked, None, t0 + 61 * MIN), "(c) rechecked");
+        // both writes of the clear faulted (no tombstone): two hours, not for ever, then re-asked
+        let conn = memo_db();
+        latch_at(&conn, t0);
+        assert!(judge(&conn, &fault, None, t0 + 60 * MIN), "(c) one hour");
+        assert!(
+            !judge(&conn, &fault, None, t0 + 2 * 60 * MIN),
+            "(c) two hours"
+        );
+        let mut h = hop(HopStatus::Spent, Some(&sp), Some(10_000_000));
+        h.spent_confirmed = Some(false);
+        let hops = [h];
+        let courier: HashSet<String> = [sp.clone()].into();
+        let mined: HashSet<String> = [sp.clone()].into();
+        let later = t0 + 2 * 60 * MIN;
+        let (proof, asked) =
+            e693f_pass_at(&conn, s, &hops, &courier, 1, false, &mined, &fault, later);
+        assert_eq!(
+            asked,
+            vec![sp.clone()],
+            "(c) the stale latch's spender is re-asked"
+        );
+        assert!(proof.contains(&sp));
+        assert_eq!(
+            proof_latches_of(s, &e693f_read_latches(&conn, s))[0].written_at_ms,
+            later,
+            "(c) re-latched at the new proof's time"
+        );
+        assert!(
+            judge(&conn, &fault, None, later + GRACE),
+            "(c) the new latch, past its grace"
+        );
+        // the read: one range per spender and the tombstone's
+        let binds = proof_latch_range_binds(&[]);
+        assert_eq!(
+            binds,
+            vec![
+                crate::hops_view::PROBE_MEMO_REORG_MARK.to_string(),
+                "reorg-clear.1".into()
+            ]
+        );
+        // the route judges with the tombstone of the latch read and the pass's clock
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        for wired in [
+            "letlatch_memos=read_proof_latches(db,&latch_spenders).await;letlatch_clear=crate::hops_view::reorg_clear_at(&latch_memos);",
+            ".prepare(crate::owed::home_latch_range_read_sql(binds.len()/2))",
+        ] {
+            assert!(routes.contains(wired), "the route's latch judgement: {wired}");
+        }
     }
 
     /// bsv-low #662 (live 2026-10-14 00:35:35Z, pair 19, hop d4029675ccb65a4b:0, sweep 96448ef1fc3b): pass B judged
