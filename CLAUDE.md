@@ -2757,6 +2757,38 @@ unread row failing the run; each RED on `e2c561c`, grafted). Left, stated: a
 table or column the export lacks reads as empty, and the deferred tables are
 given their own migrations first, as the Worker's first request would.
 
+## The app layer's mirrored counters (bsv-low #625, #626, #628)
+
+The app layer's fault-shaped `/health` fields are isolate samples; their durable twins are rows of this worker's
+`ops_counters`, written by the app layer through its existing courier-census flush (`courier::note_presence`,
+`take_pending_if_due`, `flush`: the shared `OVERLAY_DB`, one D1 batch, in `wait_until`), and seeded at 0 by
+`read_counters` (`applayer_counters::seeded_names`, pinned equal to the app layer's names by its
+`obs_counters_tests`). The families: #625 `courier_applayer_<provider>_<outcome>_total` (the sibling overlay
+readers' `courier_<reader>_<provider>_<outcome>_total` convention; outcomes `ok`, `notfound`, `fault`, `shape`,
+and this reader's `ratelimited`; a 2xx whose body does not read as its route's format is `shape`, a 404 or 410
+`notfound`, so a Bitails 404 on an unmined subject is never a fault and a WoC mempool body with no
+`confirmations` is `ok`; the older `applayer_courier_<provider>_<outcome>_total` family is unchanged); #626
+`applayer_txany_memo_hit_{absent,unconfirmable,refused,retired,anchor,isolate_unconfirmable}_total` and
+`applayer_txany_memo_write_{anchor,isolate_unconfirmable}_total` (the app layer only READS the durable verdict
+memo; this worker writes it and counts `txany_memo_write_{refused,retired}_total`, one statement per write: the
+retire pass's at most 16 a tick and one per eviction; no writer of an `absent` or `unconfirmable` memo exists on
+this tip); #628 `applayer_owed_*` (recompute faults, shed, deferred abandoned and faulted, arm failed, lock
+takeovers, sweep-proof contradictions, read faults by kind and summed, and `applayer_owed_recomputes_total`, the
+durable twin of #566's new `/health.owed.recomputeSeq`), `applayer_record_refused_<class>_total` beside the
+total, `applayer_auth_refused_<reason>_total` beside the total (the session lane's `ERR_SESSION_REFUSED` by its
+reason as `lane_<reason>`, the reference door's 401 by its code, read off the middleware's own response bytes)
+and `applayer_identity_<route>_{upstream_fault,hash_mismatch,no_resolver,kill_list_fault}_total`. THE FLUSH
+BOUND: a take is made when an answer leaves (the router's, the front door's own reply, an exempt identity route,
+the BoardView actor's fetch and alarm, the scheduled drain) and flushes the isolate's first 4 takes at once, then
+only once 64 increments are pending or 60 s have passed since its last flush; one flush is ONE D1 batch, one
+subrequest. Worst case per isolate per minute: the 4 head flushes once per isolate's life, then
+`ceil(R / 64) + 1` subrequests for R increments a minute, and never more than one per answered request (one take
+per answer). Stated: an isolate that answers nothing more loses its unflushed tail (an under-count, never a wrong
+answer), and a deferred owed walk's counts are flushed by its actor's isolate, not the fetch isolate. Alerts are
+OFF (counters only, the owner's word). Pins: `cargo test --manifest-path workers/Cargo.toml -p low-app-layer
+--lib obs_` (`obs_625_*`, `obs_626_*`, `obs_628_*`, the identity pin in `identity::tests`) and `-p
+bsv-overlay-cloudflare --lib applayer_counters`.
+
 ## Storage ownership (bsv-low #474)
 
 The overlay and the app layer share ONE D1 per environment (`OVERLAY_DB`).

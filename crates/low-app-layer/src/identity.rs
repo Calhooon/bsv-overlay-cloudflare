@@ -1233,6 +1233,42 @@ static DISPLAY_SINCE_MISS: AtomicU64 = AtomicU64::new(0);
 
 pub fn count(route: RouteId, outcome: Outcome) {
     COUNTS[route as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
+    if let Some(name) = mirrored_counter(route, outcome) {
+        crate::courier::note_presence(&name);
+    }
+}
+
+/// bsv-low #628 (the observability bar, issue 4): the fault-shaped outcomes, mirrored on the overlay's
+/// `ops_counters` as `applayer_identity_<route>_<outcome>_total` through the courier census's batched flush:
+/// the resolver's own faults (`upstream_fault`, `hash_mismatch`), the binding absent (`no_resolver`, the
+/// `ERR_NO_RESOLVER` 503) and the kill list unread (`kill_list_fault`). `/health.identity.routes` stays the
+/// isolate sample.
+pub const MIRRORED_OUTCOMES: [(Outcome, &str); 4] = [
+    (Outcome::UpstreamFault, "upstream_fault"),
+    (Outcome::HashMismatch, "hash_mismatch"),
+    (Outcome::NoResolver, "no_resolver"),
+    (Outcome::KillListFault, "kill_list_fault"),
+];
+
+/// PURE: the durable name one counted outcome bumps, if it is fault-shaped.
+pub fn mirrored_counter(route: RouteId, outcome: Outcome) -> Option<String> {
+    let (_, slug) = MIRRORED_OUTCOMES.iter().find(|(o, _)| *o == outcome)?;
+    Some(format!(
+        "applayer_identity_{}_{slug}_total",
+        ROUTE_NAMES[route as usize]
+    ))
+}
+
+/// Every identity name this worker mirrors (the overlay seeds each at 0).
+pub fn identity_mirrored_counter_names() -> Vec<String> {
+    ROUTE_NAMES
+        .iter()
+        .flat_map(|r| {
+            MIRRORED_OUTCOMES
+                .iter()
+                .map(move |(_, slug)| format!("applayer_identity_{r}_{slug}_total"))
+        })
+        .collect()
 }
 
 /// The `/health` block: `routes.<route>.<outcome>`, `display` and the budget.

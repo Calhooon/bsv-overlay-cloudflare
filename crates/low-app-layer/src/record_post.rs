@@ -339,6 +339,70 @@ impl RecordRefusal {
             Self::DailyCapReached => 429,
         }
     }
+    /// bsv-low #628: the refusal's class in its durable name, `applayer_record_refused_<class>_total`.
+    pub fn class(self) -> &'static str {
+        match self {
+            Self::BadKind => "bad_kind",
+            Self::BadScriptHex => "bad_script_hex",
+            Self::BodyTooLarge => "body_too_large",
+            Self::ScriptTooLarge => "script_too_large",
+            Self::NotCanonical => "not_canonical",
+            Self::NotAMarker => "not_a_marker",
+            Self::PosterMismatch => "poster_mismatch",
+            Self::SignatureInvalid => "signature_invalid",
+            Self::RefundDoesNotSpendThePot => "refund_does_not_spend_the_pot",
+            Self::RefundNotThePresignedSpend => "refund_not_the_presigned_spend",
+            Self::TooManyFiled => "too_many_filed",
+            Self::DailyCapReached => "daily_cap_reached",
+            Self::HopNotIndexed => "hop_not_indexed",
+            Self::HopMarkerUnverified => "hop_marker_unverified",
+            Self::SweepDoesNotSpendTheHop => "sweep_does_not_spend_the_hop",
+            Self::SweepNotTheSeatsSpend => "sweep_not_the_seats_spend",
+        }
+    }
+    /// Every refusal, in declaration order (the durable names' list).
+    pub const ALL: [RecordRefusal; 16] = [
+        Self::BadKind,
+        Self::BadScriptHex,
+        Self::BodyTooLarge,
+        Self::ScriptTooLarge,
+        Self::NotCanonical,
+        Self::NotAMarker,
+        Self::PosterMismatch,
+        Self::SignatureInvalid,
+        Self::RefundDoesNotSpendThePot,
+        Self::RefundNotThePresignedSpend,
+        Self::TooManyFiled,
+        Self::DailyCapReached,
+        Self::HopNotIndexed,
+        Self::HopMarkerUnverified,
+        Self::SweepDoesNotSpendTheHop,
+        Self::SweepNotTheSeatsSpend,
+    ];
+}
+
+/// bsv-low #628: the class of a body that is not a record post (the door's one refusal outside [`RecordRefusal`]).
+pub const REFUSED_BAD_BODY_CLASS: &str = "bad_body";
+
+/// bsv-low #628 (the observability bar, issue 4): mirror one door refusal durably, its class beside the total,
+/// on the overlay's `ops_counters` through the courier census's batched flush. `refusedByKind` on `/health.record`
+/// stays the isolate sample.
+pub fn mirror_refused(class: &str) {
+    crate::courier::note_presence("applayer_record_refused_total");
+    crate::courier::note_presence(&format!("applayer_record_refused_{class}_total"));
+}
+
+/// Every record name this worker mirrors (the overlay seeds each at 0).
+pub fn record_mirrored_counter_names() -> Vec<String> {
+    let mut names = vec!["applayer_record_refused_total".to_string()];
+    names.extend(
+        RecordRefusal::ALL
+            .iter()
+            .map(|r| r.class())
+            .chain([REFUSED_BAD_BODY_CLASS])
+            .map(|c| format!("applayer_record_refused_{c}_total")),
+    );
+    names
 }
 
 // ── canonical bytes ─────────────────────────────────────────────────────────
@@ -1667,6 +1731,7 @@ fn refuse(kind: Option<RecordKind>, r: RecordRefusal) -> Result<Response> {
     if let Some(k) = kind {
         bump(&REFUSED_BY_KIND, k);
     }
+    mirror_refused(r.class());
     crate::routes::json_error(r.as_str(), r.status())
 }
 
@@ -1703,6 +1768,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
         Ok(b) => b,
         Err(e) => {
             bump(&REFUSED_BY_KIND, kind);
+            mirror_refused(REFUSED_BAD_BODY_CLASS);
             return crate::routes::json_error(&format!("body is not a record post: {e}"), 400);
         }
     };

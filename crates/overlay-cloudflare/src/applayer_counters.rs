@@ -1,7 +1,8 @@
-//! bsv-low #625, #626 (the observability bar, the app layer's half): the names the app layer writes on this
-//! worker's `ops_counters` through its batched courier-census flush, and the names of this worker's own tx-any
-//! memo writes. `read_counters` seeds every one at 0, so a family that never bumped reads an explicit 0 on
-//! `/health/invariants.counters` and a delta rule can tell "never bumped" from "renamed".
+//! bsv-low #625, #626, #628 (the observability bar, the app layer's half): the names the app layer writes on
+//! this worker's `ops_counters` through its batched courier-census flush, and the names of this worker's own
+//! tx-any memo writes. `read_counters` seeds every one at 0, so a family that never bumped reads an explicit 0
+//! on `/health/invariants.counters` and a delta rule can tell "never bumped" from "renamed". The app layer's
+//! `obs_counters_tests` pins its own names equal to [`names`].
 
 /// The courier providers and the per-reader outcomes of the app layer (`courier_applayer_<provider>_<outcome>_total`).
 const PROVIDERS: [&str; 5] = ["woc", "bananablocks", "bitails", "arcade", "other"];
@@ -16,6 +17,74 @@ const MEMO_HIT_KINDS: [&str; 6] = [
     "isolate_unconfirmable",
 ];
 const MEMO_WRITE_KINDS: [&str; 2] = ["anchor", "isolate_unconfirmable"];
+const OWED: [&str; 7] = [
+    "applayer_owed_recompute_faults_total",
+    "applayer_owed_recompute_shed_total",
+    "applayer_owed_recompute_deferred_abandoned_total",
+    "applayer_owed_recompute_deferred_faulted_total",
+    "applayer_owed_recompute_arm_failed_total",
+    "applayer_owed_recompute_lock_takeovers_total",
+    "applayer_owed_sweep_proof_contradictions_total",
+];
+const OWED_READ_FAULT_KINDS: [&str; 9] = [
+    "spender",
+    "withheld_previous",
+    "spender_store",
+    "collected",
+    "pay_vout",
+    "pot_spenders",
+    "hop_sweeps",
+    "sweep_proofs",
+    "markerless",
+];
+const RECORD_REFUSAL_CLASSES: [&str; 17] = [
+    "bad_kind",
+    "bad_script_hex",
+    "body_too_large",
+    "script_too_large",
+    "not_canonical",
+    "not_a_marker",
+    "poster_mismatch",
+    "signature_invalid",
+    "refund_does_not_spend_the_pot",
+    "refund_not_the_presigned_spend",
+    "too_many_filed",
+    "daily_cap_reached",
+    "hop_not_indexed",
+    "hop_marker_unverified",
+    "sweep_does_not_spend_the_hop",
+    "sweep_not_the_seats_spend",
+    "bad_body",
+];
+const AUTH_REFUSAL_REASONS: [&str; 19] = [
+    "lane_unknown_session",
+    "lane_expired",
+    "lane_replay",
+    "lane_bad_mac",
+    "lane_malformed",
+    "lane_unsupported",
+    "lane_unavailable",
+    "lane_other",
+    "unauthorized",
+    "invalid_auth",
+    "session_not_found",
+    "replayed_request",
+    "server_misconfigured",
+    "middleware_other",
+    "handshake_fault",
+    "no_session",
+    "mismatch",
+    "strict_unauthenticated",
+    "misconfigured",
+];
+const IDENTITY_ROUTES: [&str; 5] = ["batch", "single", "picture", "verify", "kill"];
+const IDENTITY_OUTCOMES: [&str; 4] = [
+    "upstream_fault",
+    "hash_mismatch",
+    "no_resolver",
+    "kill_list_fault",
+];
+
 /// bsv-low #626: this worker's durable verdict memo writes (`tx_any_verdicts`), by the kind written: the retire
 /// pass's `refused` / `retired` and the eviction's `refused`. The app layer only reads these rows.
 pub const COUNTER_TXANY_MEMO_WRITE_REFUSED: &str = "txany_memo_write_refused_total";
@@ -50,6 +119,31 @@ pub fn names() -> Vec<String> {
             .iter()
             .map(|k| format!("applayer_txany_memo_hit_{k}_total")),
     );
+    v.extend(OWED.iter().map(|n| n.to_string()));
+    v.push("applayer_owed_recomputes_total".to_string());
+    v.push("applayer_owed_read_faults_total".to_string());
+    v.extend(
+        OWED_READ_FAULT_KINDS
+            .iter()
+            .map(|k| format!("applayer_owed_read_faults_{k}_total")),
+    );
+    v.push("applayer_record_refused_total".to_string());
+    v.extend(
+        RECORD_REFUSAL_CLASSES
+            .iter()
+            .map(|c| format!("applayer_record_refused_{c}_total")),
+    );
+    v.push("applayer_auth_refused_total".to_string());
+    v.extend(
+        AUTH_REFUSAL_REASONS
+            .iter()
+            .map(|r| format!("applayer_auth_refused_{r}_total")),
+    );
+    v.extend(IDENTITY_ROUTES.iter().flat_map(|r| {
+        IDENTITY_OUTCOMES
+            .iter()
+            .map(move |o| format!("applayer_identity_{r}_{o}_total"))
+    }));
     v
 }
 
@@ -66,19 +160,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn obs_625_the_seed_list_is_distinct_and_names_each_outcome() {
+    fn obs_628_the_seed_list_is_distinct_and_names_each_family() {
         let names = seeded_names();
         let set: std::collections::BTreeSet<&String> = names.iter().collect();
         assert_eq!(set.len(), names.len(), "no name is seeded twice");
-        for name in [
+        for family in [
             "courier_applayer_bitails_notfound_total",
             "courier_applayer_woc_shape_total",
-            "courier_applayer_woc_ratelimited_total",
             "applayer_txany_memo_hit_absent_total",
             "applayer_txany_memo_write_anchor_total",
+            "applayer_owed_recompute_faults_total",
+            "applayer_owed_recomputes_total",
+            "applayer_record_refused_total",
+            "applayer_auth_refused_lane_bad_mac_total",
+            "applayer_identity_batch_no_resolver_total",
             "txany_memo_write_retired_total",
         ] {
-            assert!(names.iter().any(|n| n == name), "{name} is seeded");
+            assert!(names.iter().any(|n| n == family), "{family} is seeded");
         }
         assert_eq!(
             memo_write_counter("refused"),

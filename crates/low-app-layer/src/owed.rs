@@ -3859,6 +3859,56 @@ static ROWS_BY_FAMILY: [AtomicU64; 5] = [
     AtomicU64::new(0),
 ];
 static RECOMPUTE_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// bsv-low #566 / #628: every recompute this isolate finished ([`note_recompute`]), served as `recomputeSeq`; its
+/// durable twin [`COUNTER_RECOMPUTE_SEQ`] is the fleet's, the denominator of the owed fault rates.
+static RECOMPUTE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// The durable recompute count (the overlay seeds it at 0).
+pub const COUNTER_RECOMPUTE_SEQ: &str = "applayer_owed_recomputes_total";
+/// bsv-low #628 (the observability bar, issue 4): the owed list's fault-shaped isolate counters, each mirrored on
+/// the overlay's `ops_counters` through the courier census's batched flush (`courier::note_presence`). The
+/// isolate fields on `/health.owed` stay the sample; these are the census.
+pub const OWED_MIRRORED_COUNTERS: [&str; 7] = [
+    "applayer_owed_recompute_faults_total",
+    "applayer_owed_recompute_shed_total",
+    "applayer_owed_recompute_deferred_abandoned_total",
+    "applayer_owed_recompute_deferred_faulted_total",
+    "applayer_owed_recompute_arm_failed_total",
+    "applayer_owed_recompute_lock_takeovers_total",
+    "applayer_owed_sweep_proof_contradictions_total",
+];
+/// The owed reads whose faults are mirrored, each as `applayer_owed_read_faults_<kind>_total` beside the sum
+/// `applayer_owed_read_faults_total` (the probe memo read keeps its own durable row,
+/// [`COUNTER_PROBE_MEMO_READ_FAULTS`]).
+pub const OWED_READ_FAULT_KINDS: [&str; 9] = [
+    "spender",
+    "withheld_previous",
+    "spender_store",
+    "collected",
+    "pay_vout",
+    "pot_spenders",
+    "hop_sweeps",
+    "sweep_proofs",
+    "markerless",
+];
+fn mirror_read_fault(kind: &str) {
+    crate::courier::note_presence("applayer_owed_read_faults_total");
+    crate::courier::note_presence(&format!("applayer_owed_read_faults_{kind}_total"));
+}
+/// Every owed name this worker mirrors (the overlay seeds each at 0).
+pub fn owed_mirrored_counter_names() -> Vec<String> {
+    let mut names: Vec<String> = OWED_MIRRORED_COUNTERS
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+    names.push(COUNTER_RECOMPUTE_SEQ.to_string());
+    names.push("applayer_owed_read_faults_total".to_string());
+    names.extend(
+        OWED_READ_FAULT_KINDS
+            .iter()
+            .map(|k| format!("applayer_owed_read_faults_{k}_total")),
+    );
+    names
+}
 static COLLECTED_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 static POT_SPENDERS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 static HOP_SWEEPS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -3874,12 +3924,14 @@ static SWEPT_CONFIRMED_BY_PROOF: AtomicU64 = AtomicU64::new(0);
 static SPENDER_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub fn note_spender_read_fault() {
     SPENDER_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+    mirror_read_fault("spender");
 }
 /// The L25-WITHHELD lens's LOW-3: the withheld payouts' previous-row read (`OWED_WITHHELD_PREVIOUS_SQL`) faulted
 /// (that pass's rows stand as derived: could not judge).
 static WITHHELD_PREVIOUS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub fn note_withheld_previous_read_fault() {
     WITHHELD_PREVIOUS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+    mirror_read_fault("withheld_previous");
 }
 /// bsv-low #672 (RC-L30): the durable spender-bytes store's counters. HITS: a named spender served from the store
 /// before the budget (no courier). PERSISTED: a hash-verified spender's bytes written for the first time. CARRIED:
@@ -3901,6 +3953,7 @@ pub fn note_spender_store_carried(n: u64) {
 }
 pub fn note_spender_store_read_fault() {
     SPENDER_STORE_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+    mirror_read_fault("spender_store");
 }
 pub fn note_spender_store_sweep_pass() {
     SPENDER_STORE_SWEEP_PASSES.fetch_add(1, Ordering::Relaxed);
@@ -3918,6 +3971,7 @@ pub fn note_read_refresh(kicked: bool) {
 }
 pub fn note_collected_read_fault() {
     COLLECTED_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+    mirror_read_fault("collected");
 }
 static HELD_FILINGS_KEY_MISMATCH: AtomicU64 = AtomicU64::new(0);
 static HELD_FILINGS_MATCHED: AtomicU64 = AtomicU64::new(0);
@@ -3931,15 +3985,19 @@ static PAY_VOUT_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// bsv-low #512: a chunk of the `payVout` read faulted (its rows serve `payVout: null` that pass).
 pub fn note_pay_vout_read_fault() {
     PAY_VOUT_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+    mirror_read_fault("pay_vout");
 }
 pub fn note_pot_spenders_read_fault() {
     POT_SPENDERS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+    mirror_read_fault("pot_spenders");
 }
 pub fn note_hop_sweeps_read_fault() {
     HOP_SWEEPS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+    mirror_read_fault("hop_sweeps");
 }
 pub fn note_sweep_proofs_read_fault() {
     SWEEP_PROOFS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+    mirror_read_fault("sweep_proofs");
 }
 /// The merged lens's LOW-3 (2026-10-06): a probe memo read faulted (`routes::read_probe_memos`, all or nothing: the
 /// answer is empty). It was a `console_warn` only, and it is not free: the hop walk gets no memo and no reorg
@@ -3952,6 +4010,7 @@ static MARKERLESS_READ_FAULTS: AtomicU64 = AtomicU64::new(0);
 static MARKERLESS_IGNORED_MARKERS: AtomicU64 = AtomicU64::new(0);
 pub fn note_markerless_read_fault() {
     MARKERLESS_READ_FAULTS.fetch_add(1, Ordering::Relaxed);
+    mirror_read_fault("markerless");
 }
 pub fn note_markerless_ignored_markers(n: usize) {
     MARKERLESS_IGNORED_MARKERS.fetch_add(n as u64, Ordering::Relaxed);
@@ -3968,6 +4027,7 @@ pub const COUNTER_PROBE_MEMO_READ_FAULTS: &str = "applayer_probe_memo_read_fault
 pub fn note_sweep_proof_contradictions(n: u64) {
     if n > 0 {
         SWEEP_PROOF_CONTRADICTIONS.fetch_add(n, Ordering::Relaxed);
+        crate::courier::note_presence_n("applayer_owed_sweep_proof_contradictions_total", n);
     }
 }
 /// PURE: how many rows of one derivation carry the contradiction fact (the route's count, pinned).
@@ -3996,6 +4056,8 @@ pub fn count_swept_confirmed_by_proof(rows: &[OwedRow]) -> u64 {
 }
 
 pub fn note_recompute(source: &str, rows: &[OwedRow]) {
+    RECOMPUTE_SEQ.fetch_add(1, Ordering::Relaxed);
+    crate::courier::note_presence(COUNTER_RECOMPUTE_SEQ);
     if let Some(i) = RECOMPUTE_SOURCES.iter().position(|s| *s == source) {
         RECOMPUTE_BY_SOURCE[i].fetch_add(1, Ordering::Relaxed);
     }
@@ -4005,6 +4067,7 @@ pub fn note_recompute(source: &str, rows: &[OwedRow]) {
 }
 pub fn note_recompute_fault() {
     RECOMPUTE_FAULTS.fetch_add(1, Ordering::Relaxed);
+    crate::courier::note_presence("applayer_owed_recompute_faults_total");
 }
 /// Asks that found a recompute of the same identity in flight on this isolate and were folded into ONE re-run
 /// after it (fleet loop 11, 2026-09-19: the hooks' twins under the t=0 herd).
@@ -4017,6 +4080,7 @@ pub fn note_recompute_coalesced() {
 static RECOMPUTE_LOCK_TAKEOVERS: AtomicU64 = AtomicU64::new(0);
 pub fn note_recompute_lock_takeover() {
     RECOMPUTE_LOCK_TAKEOVERS.fetch_add(1, Ordering::Relaxed);
+    crate::courier::note_presence("applayer_owed_recompute_lock_takeovers_total");
 }
 /// bsv-low #487: walks whose snapshot the write REFUSED because the marker already carried a newer one (a walk that
 /// outlived its takeover, or the slower of two isolates).
@@ -4140,14 +4204,17 @@ static RECOMPUTE_DEFERRED: AtomicU64 = AtomicU64::new(0);
 static RECOMPUTE_ARM_FAILED: AtomicU64 = AtomicU64::new(0);
 pub fn note_recompute_arm_failed() {
     RECOMPUTE_ARM_FAILED.fetch_add(1, Ordering::Relaxed);
+    crate::courier::note_presence("applayer_owed_recompute_arm_failed_total");
 }
 static RECOMPUTE_DEFERRED_ABANDONED: AtomicU64 = AtomicU64::new(0);
 pub fn note_recompute_deferred_abandoned() {
     RECOMPUTE_DEFERRED_ABANDONED.fetch_add(1, Ordering::Relaxed);
+    crate::courier::note_presence("applayer_owed_recompute_deferred_abandoned_total");
 }
 static RECOMPUTE_DEFERRED_FAULTED: AtomicU64 = AtomicU64::new(0);
 pub fn note_recompute_deferred_faulted() {
     RECOMPUTE_DEFERRED_FAULTED.fetch_add(1, Ordering::Relaxed);
+    crate::courier::note_presence("applayer_owed_recompute_deferred_faulted_total");
 }
 /// Retry only in a later window, even when a slow fault crossed several windows.
 pub fn owed_fault_retry_due(due: i64, now: i64) -> i64 {
@@ -4160,6 +4227,7 @@ pub fn note_recompute_deferred() {
 }
 pub fn note_recompute_shed() {
     RECOMPUTE_SHED.fetch_add(1, Ordering::Relaxed);
+    crate::courier::note_presence("applayer_owed_recompute_shed_total");
 }
 pub fn recompute_shed_total() -> u64 {
     RECOMPUTE_SHED.load(Ordering::Relaxed)
@@ -4181,7 +4249,7 @@ pub fn owed_health_json() -> Value {
             json!(ROWS_BY_FAMILY[f.index()].load(Ordering::Relaxed)),
         );
     }
-    json!({
+    let mut v = json!({
         "countersScope": "isolate",
         "recomputeBySource": by_source,
         "rowsWrittenByFamily": by_family,
@@ -4223,7 +4291,10 @@ pub fn owed_health_json() -> Value {
         "hopStrandedAfterMs": HOP_STRANDED_AFTER_MS,
         "recomputeOpenAfterMs": OWED_RECOMPUTE_OPEN_AFTER_MS,
         "recomputeAnyAfterMs": OWED_RECOMPUTE_ANY_AFTER_MS,
-    })
+    });
+    // bsv-low #566 / #628 (outside the literal: `json!`'s recursion limit)
+    v["recomputeSeq"] = json!(RECOMPUTE_SEQ.load(Ordering::Relaxed));
+    v
 }
 
 /// Additive v1 read word: a snapshot whose refresh hit the ceiling is served with its retry delay.

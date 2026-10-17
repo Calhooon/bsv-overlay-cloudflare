@@ -251,6 +251,16 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     Ok(resp)
 }
 
+/// bsv-low #628: the census's batched flush for an answer that leaves before the router (the front door's own
+/// refusals, the exempt identity routes), under the same due rule (`courier::should_flush`) and in `wait_until`.
+fn flush_counters_if_due(ctx: &Context, env: &Env) {
+    let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
+    if !pending.is_empty() {
+        let db = env.d1("OVERLAY_DB").ok();
+        ctx.wait_until(async move { courier::flush(db, pending).await });
+    }
+}
+
 /// The fetch body, under the ledger [`fetch`] scopes.
 async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // 2026-09-04: the WoC api key for this isolate's provider reads (see routes::provider_get).
@@ -319,6 +329,7 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
         if let Some(c) = &identity_cors {
             c.apply(&mut resp);
         }
+        flush_counters_if_due(&ctx, &env);
         return Ok(resp);
     }
 
@@ -330,6 +341,7 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
         auth::FrontDoor::Proceed(req, state) => (req, state),
         auth::FrontDoor::Reply(mut resp) => {
             stamp_cors(&mut resp, &identity_cors);
+            flush_counters_if_due(&ctx, &env);
             return Ok(resp);
         }
     };
@@ -585,6 +597,9 @@ mod beef_door_replay;
 
 #[cfg(test)]
 mod obs_625_tests;
+
+#[cfg(test)]
+mod obs_counters_tests;
 
 #[cfg(test)]
 #[path = "../../worker-build-info/src/worker_tests.rs"]

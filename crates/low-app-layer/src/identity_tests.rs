@@ -1489,3 +1489,31 @@ fn the_prod_config_binds_no_identity_resolver() {
         "prod keeps IDENTITY_APP_ORIGINS (load-bearing for CORS)"
     );
 }
+
+/// bsv-low #628: the null-resolver answer and a bound resolver's fault are mirrored durably by route, through the
+/// census's batched flush, from the outcome the router counts.
+#[tokio::test]
+async fn obs_628_identity_faults_are_mirrored_by_route() {
+    let k = FakeKill::default();
+    let batch = batch_answer(&Unbound, &k, &[ALICE.to_string()], ORIGIN).await;
+    count(RouteId::Batch, batch.outcome);
+    let r = FakeResolver::default();
+    r.fault.set(Some(UpstreamError::Timeout));
+    let single = single_answer(&r, &k, ALICE, ORIGIN).await;
+    count(RouteId::Single, single.outcome);
+    count(RouteId::Batch, Outcome::Served);
+    let d: std::collections::BTreeMap<String, u64> = crate::courier::take_pending_if_due(0.0)
+        .into_iter()
+        .collect();
+    assert_eq!(
+        d.get("applayer_identity_batch_no_resolver_total"),
+        Some(&1),
+        "{d:?}"
+    );
+    assert_eq!(
+        d.get("applayer_identity_single_upstream_fault_total"),
+        Some(&1),
+        "{d:?}"
+    );
+    assert_eq!(d.len(), 2, "a served answer is not mirrored: {d:?}");
+}
