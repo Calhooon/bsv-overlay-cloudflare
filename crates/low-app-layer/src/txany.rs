@@ -911,6 +911,17 @@ pub fn tx_any_body(txid: &str, a: &TxAnyAnswer) -> String {
 
 /// #639: preserve the outpoint body, adding only the absence verdict's finality.
 pub fn spent_any_body(entries: &[crate::logic::OutpointStatus], terminals: &[bool]) -> String {
+    spent_any_body_sourced(entries, terminals, &[])
+}
+
+/// bsv-low #723: the `/spent-any` body with each KNOWN SPENT row's `spentConfirmedSource` (additive; `sources[i]`
+/// for row `i`, `results::spent_confirmed_word`'s source, `null` when no word). A row that is not a known spend, or
+/// past `sources`, carries no such key, so its bytes are unchanged.
+pub fn spent_any_body_sourced(
+    entries: &[crate::logic::OutpointStatus],
+    terminals: &[bool],
+    sources: &[Option<&'static str>],
+) -> String {
     let mut body: serde_json::Value =
         serde_json::from_str(&crate::logic::utxo_status_body(entries))
             .expect("the status builder emits JSON");
@@ -918,6 +929,11 @@ pub fn spent_any_body(entries: &[crate::logic::OutpointStatus], terminals: &[boo
         for (row, terminal) in rows.iter_mut().zip(terminals) {
             if row["reason"] == SPENT_ANY_REASON_TX_ABSENT {
                 row["terminal"] = json!(terminal);
+            }
+        }
+        for (row, source) in rows.iter_mut().zip(sources) {
+            if row["known"] == true && row["spent"] == true {
+                row["spentConfirmedSource"] = json!(source);
             }
         }
     }

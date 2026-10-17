@@ -3374,6 +3374,71 @@ pub fn decide_spent_any(
     }
 }
 
+/// bsv-low #695 (DESIGN-641 section (2) option (b)): WoC's `/spent` answers 400 for an outpoint of a tx its node
+/// does not know (measured on prod 2026-10-16, `RC-PROD-MONITOR-BLIND`), where a 429, a 5xx, an auth refusal or a
+/// transport fault means it could not look. Only that 400 opens the one extra read of WoC's `/tx/hash/{txid}`.
+pub fn woc_spent_may_name_an_unknown_tx(woc_spent_status: Option<u16>) -> bool {
+    woc_spent_status == Some(400)
+}
+
+/// bsv-low #695: the ladder's PRIMARY rungs all faulted and WoC's node (a capable mempool source, #614) answered a
+/// conclusive 404 for the subject itself (`woc_node_absent`: neither its chain nor its mempool holds it, so it is
+/// unmined): one capable source saw nothing and the pruned Bitails cannot corroborate, so the honest word is
+/// `uncorroborated-unspent`, never `provider-fault`. `known:false` either way; every other row is unchanged.
+pub fn sharpen_unmined_absence(
+    mut st: crate::logic::OutpointStatus,
+    woc_node_absent: bool,
+) -> crate::logic::OutpointStatus {
+    if woc_node_absent && st.reason == Some(crate::logic::SPENT_ANY_REASON_PROVIDER_FAULT) {
+        st.reason = Some(crate::logic::SPENT_ANY_REASON_UNCORROBORATED);
+    }
+    st
+}
+
+/// bsv-low #723: the ladder's confirmation word of a KNOWN spend is a courier's: WoC `/0/spent`'s `status`. When WoC
+/// faulted and a fallback rung named the spender (BananaBlocks, Bitails' tx body), that rung cannot say whether the
+/// spend is mined (its `confirmed: false` is a placeholder, not a word), so the row's `spentConfirmed` is `None`
+/// (wire `null`, "could not look"), never `false`. Every other row is unchanged.
+pub fn spent_confirmed_unknown_after_fault(
+    mut st: crate::logic::OutpointStatus,
+    woc_was_primary: bool,
+) -> crate::logic::OutpointStatus {
+    if !woc_was_primary && st.known && st.spent == Some(true) {
+        st.spent_confirmed = None;
+    }
+    st
+}
+
+/// bsv-low #723: `spentConfirmedSource` of a known spend: which word `spentConfirmed` rests on.
+pub const SPENT_CONFIRMED_SOURCE_INDEX_PROOF: &str = "index-proof";
+pub const SPENT_CONFIRMED_SOURCE_TRACKER_MINED: &str = "tracker-mined";
+pub const SPENT_CONFIRMED_SOURCE_TXANY_PROOF: &str = "txany-proof";
+pub const SPENT_CONFIRMED_SOURCE_COURIER: &str = "courier";
+
+/// PURE (bsv-low #723): `/spent-any`'s `spentConfirmed` of a KNOWN spend and its source. A checked proof of the
+/// VERIFIED spender the app layer HOLDS decides, strongest first: the index's verified proof (`transactions.has_proof`,
+/// the chaintracks-verified stitch), the tracker's checked mined word (`word == "mined"` AND a `verifyPath`), an
+/// isolate-held `/tx-any` answer whose proof was bound against chaintracks (`txany::proof_mined_word`). Only when none
+/// is held does the courier's status speak (`courier`: WoC's word, or `None` when the ladder's confirming rung
+/// faulted, then the source is `None` too). A held proof makes a long-mined spend read confirmed whatever the couriers
+/// do this read, so two reads of it cannot flap without a chain change.
+pub fn spent_confirmed_word(
+    courier: Option<bool>,
+    index_proof: bool,
+    tracker_mined: bool,
+    txany_proof: bool,
+) -> (Option<bool>, Option<&'static str>) {
+    if index_proof {
+        (Some(true), Some(SPENT_CONFIRMED_SOURCE_INDEX_PROOF))
+    } else if tracker_mined {
+        (Some(true), Some(SPENT_CONFIRMED_SOURCE_TRACKER_MINED))
+    } else if txany_proof {
+        (Some(true), Some(SPENT_CONFIRMED_SOURCE_TXANY_PROOF))
+    } else {
+        (courier, courier.map(|_| SPENT_CONFIRMED_SOURCE_COURIER))
+    }
+}
+
 /// Verify a fetched spender raw: hashes to `spender_txid` AND spends
 /// `(outpoint_txid, vout)`. The one-provider-positive rule rests on this.
 pub fn spender_raw_verifies(

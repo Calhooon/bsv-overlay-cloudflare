@@ -2236,13 +2236,21 @@ pub async fn pay_vout_pass(
 /// confirmation the source carried; `None` when nothing names a spender, or the spender IS a covenant pot (the JOIN
 /// took it: the pot's own row tells the story).
 fn spender_mined(i: &OwedInputs, txid: Option<&str>, legacy: bool) -> bool {
-    match i.spender_words {
-        None => legacy, // base index arm
-        Some(words) => match txid.and_then(|id| words.get(&id.to_ascii_lowercase())) {
-            None => legacy,
-            Some(v) => v["word"] == "mined" && !v["verifyPath"].is_null(),
-        },
-    }
+    // no views (the base index arm) or no row for the spender: the legacy word
+    txid.and_then(|id| checked_tracker_mined(i.spender_words, id))
+        .unwrap_or(legacy)
+}
+/// PURE (bsv-low #693 fold, the W1-OWED-693 lens's MEDIUM-1): the tracker's word for `txid` as the RECHECKED view
+/// reads it, the one rule [`spender_mined`] and the re-ask's candidate predicate share: `None` when there are no
+/// views or no row, else `word == "mined"` AND a non-null `verifyPath` (a stored `mined` row whose recheck could not
+/// check this pass is NOT mined).
+pub fn checked_tracker_mined(
+    words: Option<&std::collections::BTreeMap<String, Value>>,
+    txid: &str,
+) -> Option<bool> {
+    words?
+        .get(&txid.to_ascii_lowercase())
+        .map(|v| v["word"] == "mined" && !v["verifyPath"].is_null())
 }
 /// The coin judgement's tracker input; a competitor only wins on a checked
 /// mined word, never on a courier's positive height or a SEEN pointer.
@@ -3995,6 +4003,309 @@ pub fn count_swept_confirmed_by_proof(rows: &[OwedRow]) -> u64 {
         .count() as u64
 }
 
+/// bsv-low #693 (the #692 lens's MEDIUM-1): the re-asks of a DURABLE spender (its bytes served from the #672 store,
+/// so phase 1 and 2 never ask its `/tx-any`) whose confirmation is still unconfirmed: at most ONE a pass. It is taken
+/// from the courier slots the never-asked spenders left (`OWED_SPENDER_COURIER_READS_PER_RECOMPUTE`, 2), never
+/// beside them, and under the pass's clock, so a pass still makes at most 2 courier `/tx-any` asks (each with its
+/// one `/proof/tsc`) and no new budget, table or D1 statement is added.
+pub const OWED_DURABLE_REASKS_PER_RECOMPUTE: usize = 1;
+/// The durable `ops_counters` rows of the re-ask (via `courier::note_presence`, the census flush): every re-ask made
+/// (an answer the isolate held inside its TTL, or a fresh courier ask), then exactly one outcome each.
+pub const COUNTER_DURABLE_REASK_ASKED: &str = "owed_durable_spender_reask_asked_total";
+pub const COUNTER_DURABLE_REASK_MINED_BY_PROOF: &str =
+    "owed_durable_spender_reask_mined_by_proof_total";
+pub const COUNTER_DURABLE_REASK_STILL_UNCONFIRMED: &str =
+    "owed_durable_spender_reask_still_unconfirmed_total";
+pub const COUNTER_DURABLE_REASK_FAULT: &str = "owed_durable_spender_reask_fault_total";
+
+/// The outcome of one re-ask of a durable spender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableReaskOutcome {
+    /// A chaintracks-checked mined proof (`txany::proof_mined_word`): the spender joins `proof_mined_spenders`.
+    MinedByProof,
+    /// An answer with a word (present, raw bytes, or an absence) but no checked mined proof.
+    StillUnconfirmed,
+    /// No word at all (a courier fault, or a fault the isolate cached inside its TTL): could not look.
+    Fault,
+}
+
+impl DurableReaskOutcome {
+    pub fn of(a: &crate::txany::TxAnyAnswer) -> Self {
+        if crate::txany::proof_mined_word(a) {
+            DurableReaskOutcome::MinedByProof
+        } else if a.present.is_none() && a.confirmed.is_none() && a.raw_hex.is_none() {
+            DurableReaskOutcome::Fault
+        } else {
+            DurableReaskOutcome::StillUnconfirmed
+        }
+    }
+    pub fn counter(self) -> &'static str {
+        match self {
+            DurableReaskOutcome::MinedByProof => COUNTER_DURABLE_REASK_MINED_BY_PROOF,
+            DurableReaskOutcome::StillUnconfirmed => COUNTER_DURABLE_REASK_STILL_UNCONFIRMED,
+            DurableReaskOutcome::Fault => COUNTER_DURABLE_REASK_FAULT,
+        }
+    }
+}
+
+/// One re-ask made: the spender, what it answered, and whether a courier was really asked (a slot) or the isolate's
+/// cached answer served (free).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableReask {
+    pub spender: String,
+    pub outcome: DurableReaskOutcome,
+    pub courier_asked: bool,
+}
+
+/// PURE (bsv-low #693): does a durable spender's row still need the proof? True when some hop names it through
+/// [`non_pot_spender`]'s two arms (the index's recorded spend, else the chain rung's word of spent) and that arm's
+/// confirmation is not already in hand: the tracker's word (`tracker_mined`: `Some(true)` mined, `Some(false)` a row
+/// that is not mined, which [`spender_mined`] reads in place of the ladder; `None` no row) or the ladder's
+/// `spent_confirmed`. A hop whose FILED sweep is this spender is skipped: the filed arm of [`swept_home`] judges it
+/// and never reads the proof. A spender already confirmed is never re-asked.
+pub fn durable_spender_needs_proof(
+    spender: &str,
+    hops: &[HopEntry],
+    hop_chain: &HashMap<String, HopChainWord>,
+    hop_sweeps: &HashMap<String, crate::hopsweep::FiledHopSweep>,
+    tracker_mined: Option<bool>,
+) -> bool {
+    if tracker_mined == Some(true) {
+        return false;
+    }
+    let unconfirmed = |ladder: Option<bool>| tracker_mined.is_some() || ladder != Some(true);
+    hops.iter().any(|h| {
+        let outpoint = outpoint_key(&h.hop_txid, h.hop_vout);
+        if hop_sweeps
+            .get(&outpoint)
+            .is_some_and(|f| f.sweep_txid.eq_ignore_ascii_case(spender))
+        {
+            return false;
+        }
+        if h.spent == Some(true) {
+            if let Some(s) = h.spending_txid.as_deref() {
+                return s.eq_ignore_ascii_case(spender) && unconfirmed(h.spent_confirmed);
+            }
+        }
+        hop_chain.get(&outpoint).is_some_and(|w| {
+            w.looked
+                && w.spent == Some(true)
+                && w.spending_txid
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(spender))
+                && unconfirmed(w.spent_confirmed)
+        })
+    })
+}
+
+/// bsv-low #693: the re-asks of one pass. `candidates` are the durable spenders that still need the proof, in the
+/// courier phase's ask order; `courier_room` the slots the phase left; `stop` the pass's clock. At most
+/// [`OWED_DURABLE_REASKS_PER_RECOMPUTE`] are made, none when no slot is left (a re-ask may need a fresh ask).
+/// `ask` answers one spender: `(answer, courier_asked)`. Each re-ask is counted (asked, then its outcome).
+pub async fn durable_reasks<A, Fut>(
+    candidates: Vec<String>,
+    courier_room: usize,
+    stop: impl Fn() -> bool,
+    mut ask: A,
+) -> Vec<(DurableReask, crate::txany::TxAnyAnswer)>
+where
+    A: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = (crate::txany::TxAnyAnswer, bool)>,
+{
+    let mut out = Vec::new();
+    for sp in candidates
+        .into_iter()
+        .take(OWED_DURABLE_REASKS_PER_RECOMPUTE.min(courier_room))
+    {
+        if stop() {
+            break;
+        }
+        let (answer, courier_asked) = ask(sp.clone()).await;
+        let outcome = DurableReaskOutcome::of(&answer);
+        crate::courier::note_presence(COUNTER_DURABLE_REASK_ASKED);
+        crate::courier::note_presence(outcome.counter());
+        out.push((
+            DurableReask {
+                spender: sp,
+                outcome,
+                courier_asked,
+            },
+            answer,
+        ));
+    }
+    out
+}
+
+/// PURE (bsv-low #693 fold, the W1-OWED-693 lens's LOW-2): the sweeps whose served row WAITS FOR THE BLOCK (a
+/// courier-bytes payout, `chainWait == "block"`), lowercase: the only spenders phase 2b re-asks. A payout the
+/// derivation retires (a verified `collected`, a held filing, the home output spent) or a pointer the bytes refute
+/// serves no such row, so its durable spender is never re-asked.
+pub fn sweeps_waiting_for_the_block(rows: &[OwedRow]) -> HashSet<String> {
+    rows.iter()
+        .filter(|r| {
+            r.family == OwedFamily::Payout
+                && r.facts["sweepSource"] == "courier-bytes"
+                && r.facts["chainWait"] == "block"
+        })
+        .filter_map(|r| r.facts["sweepTxid"].as_str().map(str::to_ascii_lowercase))
+        .collect()
+}
+
+/// bsv-low #693 fold (the W1-OWED-693 lens's HIGH-1): THE PROOF LATCH. The proof set of one pass is filled only by
+/// that pass's `/tx-any` answers, and a durable spender gets at most one re-ask a pass, only from a slot phase 2
+/// left and never on a `budget_cut` pass, so a row the re-ask confirmed on pass N read "waiting for the block" again
+/// on the next pass that had no slot (or re-asked another spender). A chaintracks-checked mined proof of a spender,
+/// once in hand on any pass, is therefore LATCHED durably: a `hop_chain_probes` row keyed
+/// `proofmined:<spenderTxid>.<height>` (the memo key's shape, so the `homeproof:` range read serves it byte-free),
+/// `spent = 1`, `spendingTxid` the canonical merkle ROOT the proof was checked against at that height,
+/// `spentConfirmed = 1`. It holds the height and the root's identity, never bytes. It is written in the snapshot's
+/// atomic batch and read each pass before the pass's own answers ([`latched_proof_mined_spenders`]), so the row is
+/// served from the latch on every later pass. A reorg DEMOTES it: the overlay's reorg clear deletes every
+/// `spentConfirmed = 1` row outside the `homeproof:`/`homecursor:` prefixes (this prefix is NOT spared by it), and
+/// the TTL sweep spares it (`bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES`,
+/// pinned equal); and a latch whose root is no longer the canonical root at its height is not honoured.
+pub const PROOF_MINED_LATCH_PREFIX: &str = "proofmined:";
+/// The most proof latches one pass writes (its proofs come from at most two courier asks and one re-ask; the rest of
+/// a pass's proofs, from answers the isolate already held, are latched by a later pass, which holds them too).
+pub const OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE: usize =
+    OWED_SPENDER_COURIER_READS_PER_RECOMPUTE + OWED_DURABLE_REASKS_PER_RECOMPUTE;
+/// The most latch HEIGHTS one pass re-reads against chaintracks (a header each, cached per isolate); a latch past it
+/// is honoured on the reorg clear's word alone, as one whose header read faulted is.
+pub const OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE: usize = 4;
+
+/// One proof latch read back: the spender, the height and the root it was checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofLatch {
+    pub spender: String,
+    pub height: u64,
+    pub root: String,
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// PURE: the latch of one spender's `/tx-any` answer, ONLY for a chaintracks-checked mined word
+/// ([`crate::txany::proof_mined_word`]: `confirmed` AND a proven `height`) and the canonical root at that height. A
+/// courier's bare `confirmed`, a bare `claimed_height`, a SEEN or a fault writes nothing; nor does a missing root.
+pub fn proof_latch_memo(
+    spender: &str,
+    answer: &crate::txany::TxAnyAnswer,
+    canonical_root: Option<&str>,
+    now_ms: i64,
+) -> Option<crate::hops_view::ProbeMemo> {
+    if !crate::txany::proof_mined_word(answer) {
+        return None;
+    }
+    let height = u32::try_from(answer.height?).ok()?;
+    let root = canonical_root.filter(|r| is_hex64(r))?;
+    if !is_hex64(spender) {
+        return None;
+    }
+    Some(crate::hops_view::ProbeMemo {
+        outpoint: crate::hops_view::probe_memo_key(
+            &format!("{PROOF_MINED_LATCH_PREFIX}{}", spender.to_ascii_lowercase()),
+            height,
+        ),
+        probed_at_ms: now_ms,
+        spent: true,
+        spending_txid: Some(root.to_ascii_lowercase()),
+        spent_confirmed: Some(true),
+    })
+}
+
+/// PURE: the range binds of each spender's `proofmined:` latches, for [`home_latch_range_read_sql`] (the same
+/// indexed PK range read; `/` is the byte after `.`, so the range is exactly `proofmined:<spender>.<height>`).
+pub fn proof_latch_range_binds(spenders: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(spenders.len() * 2);
+    for sp in spenders {
+        let sp = sp.to_ascii_lowercase();
+        out.push(format!("{PROOF_MINED_LATCH_PREFIX}{sp}."));
+        out.push(format!("{PROOF_MINED_LATCH_PREFIX}{sp}/"));
+    }
+    out
+}
+
+/// PURE: the proof latches the range read returned for the named spenders. Only a well-formed latch counts: the key
+/// `proofmined:<spender>.<height>`, `spent`, `spentConfirmed = 1` and a 64-hex root.
+pub fn proof_latches_of(
+    named_spenders: &[String],
+    memos: &[crate::hops_view::ProbeMemo],
+) -> Vec<ProofLatch> {
+    let mut out = Vec::new();
+    for sp in named_spenders {
+        let sp = sp.to_ascii_lowercase();
+        let prefix = format!("{PROOF_MINED_LATCH_PREFIX}{sp}.");
+        for m in memos {
+            let Some(height) = m
+                .outpoint
+                .strip_prefix(&prefix)
+                .and_then(|h| h.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let Some(root) = m.spending_txid.as_deref().filter(|r| is_hex64(r)) else {
+                continue;
+            };
+            if m.spent && m.spent_confirmed == Some(true) {
+                out.push(ProofLatch {
+                    spender: sp.clone(),
+                    height,
+                    root: root.to_ascii_lowercase(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// PURE: the latch heights a pass re-reads against chaintracks, lowest first, at most
+/// [`OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE`].
+pub fn proof_latch_recheck_heights(latches: &[ProofLatch]) -> Vec<u64> {
+    let mut h: Vec<u64> = latches.iter().map(|l| l.height).collect();
+    h.sort_unstable();
+    h.dedup();
+    h.truncate(OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE);
+    h
+}
+
+/// PURE: the spenders whose latch is HONOURED this pass, the seed of the pass's `proof_mined_spenders` (before its
+/// own answers). `canonical` is chaintracks' root at each re-read height (`None`: the header read faulted). A latch
+/// whose height was re-read and whose root is NOT the canonical one is not honoured (a reorg moved the block: the
+/// row waits again until a new proof, which latches at its new height); a latch whose header could not be read, or
+/// past the re-read bound, is honoured on the reorg clear's word (it was checked against chaintracks when written,
+/// and the clear deletes it on reorg evidence).
+pub fn latched_proof_mined_spenders(
+    latches: &[ProofLatch],
+    canonical: &HashMap<u64, Option<String>>,
+) -> HashSet<String> {
+    latches
+        .iter()
+        .filter(|l| match canonical.get(&l.height) {
+            Some(Some(root)) => root.eq_ignore_ascii_case(&l.root),
+            Some(None) | None => true,
+        })
+        .map(|l| l.spender.clone())
+        .collect()
+}
+
+/// PURE: the latches a pass writes: each spender this pass holds a checked proof for (`proofs`: spender, answer,
+/// the canonical root at its height) that no honoured latch already covers, the courier-bytes ones only (an
+/// index-bytes spender is judged on the index's own proof), at most [`OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE`].
+pub fn proof_latches_to_write(
+    proofs: &[(String, crate::txany::TxAnyAnswer, Option<String>)],
+    honoured: &HashSet<String>,
+    courier_spenders: &HashSet<String>,
+    now_ms: i64,
+) -> Vec<crate::hops_view::ProbeMemo> {
+    proofs
+        .iter()
+        .filter(|(sp, _, _)| !honoured.contains(sp) && courier_spenders.contains(sp))
+        .filter_map(|(sp, a, root)| proof_latch_memo(sp, a, root.as_deref(), now_ms))
+        .take(OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE)
+        .collect()
+}
+
 pub fn note_recompute(source: &str, rows: &[OwedRow]) {
     if let Some(i) = RECOMPUTE_SOURCES.iter().position(|s| *s == source) {
         RECOMPUTE_BY_SOURCE[i].fetch_add(1, Ordering::Relaxed);
@@ -5067,6 +5378,838 @@ pub(crate) mod tests {
         assert_eq!(rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
         assert_ne!(rows[0].facts["confirmedSource"], "proof");
         assert_eq!(count_swept_confirmed_by_proof(&rows), 0);
+    }
+
+    /// bsv-low #693: a courier's answer for a re-ask: a chaintracks-checked mined proof, or a present unmined hint.
+    fn e693_answer(mined: bool) -> crate::txany::TxAnyAnswer {
+        crate::txany::TxAnyAnswer {
+            present: Some(true),
+            confirmed: mined.then_some(true),
+            height: mined.then_some(900_000),
+            raw_hex: Some("00".into()),
+            source: Some("external"),
+            ..Default::default()
+        }
+    }
+
+    /// bsv-low #693: the route's phase 2b over a fake courier that counts its asks: the durable spenders filtered by
+    /// [`durable_spender_needs_proof`], then [`durable_reasks`] with the slots left. Returns the proof set and the asks.
+    fn e693_pass(
+        durable: &[String],
+        hops: &[HopEntry],
+        chain: &HashMap<String, HopChainWord>,
+        tracker: Option<bool>,
+        room: usize,
+        mined: bool,
+    ) -> (HashSet<String>, usize) {
+        let asks = std::cell::Cell::new(0usize);
+        let candidates: Vec<String> = durable
+            .iter()
+            .filter(|sp| durable_spender_needs_proof(sp, hops, chain, &HashMap::new(), tracker))
+            .cloned()
+            .collect();
+        let reasks = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(durable_reasks(
+                candidates,
+                room,
+                || false,
+                |_sp| {
+                    asks.set(asks.get() + 1);
+                    async move { (e693_answer(mined), true) }
+                },
+            ));
+        let proof = reasks
+            .into_iter()
+            .filter(|(r, _)| r.outcome == DurableReaskOutcome::MinedByProof)
+            .map(|(r, _)| r.spender)
+            .collect();
+        (proof, asks.get())
+    }
+
+    /// bsv-low #693 (a): the #692 lens's MEDIUM-1 window. The e692 fixture (the chain rung names the sweep spent but
+    /// UNCONFIRMED, WoC faulted) with the sweep's bytes served from the #672 DURABLE store, so phase 1 and 2 never
+    /// ask its `/tx-any`. The re-ask serves a checked mined proof: the courier-bytes payout reaches "home on chain",
+    /// `confirmedSource = "proof"`. RED on `b4ae1c6` (no re-ask: the proof set stays empty, `UNCONFIRMED_PAYOUT_REASON`;
+    /// run as the mutant `durable_reasks` making no ask).
+    #[test]
+    fn e693_a_a_durable_unconfirmed_spender_is_re_asked_and_its_checked_proof_confirms_home_on_chain(
+    ) {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let my_pkh = "cc".repeat(20);
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        let hops = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(false));
+        let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends_it.insert(sweep.clone(), vec![(tx(0x07), 0)]);
+        let mut courier: HashSet<String> = HashSet::new();
+        courier.insert(sweep.clone());
+        let (proof, asks) = e693_pass(
+            std::slice::from_ref(&sweep),
+            &hops,
+            &chain,
+            None,
+            OWED_SPENDER_COURIER_READS_PER_RECOMPUTE,
+            true,
+        );
+        assert_eq!(asks, 1, "the durable unconfirmed spender is re-asked once");
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &chain;
+        i.spender_outputs = &mine;
+        i.spender_inputs = &spends_it;
+        i.my_pkh_by_game = &pkhs;
+        i.courier_spenders = &courier;
+        i.proof_mined_spenders = &proof;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].facts["sweepSource"], "courier-bytes");
+        assert_eq!(
+            rows[0].facts["claimable"], false,
+            "a courier-bytes row is never claimable"
+        );
+        assert_eq!(rows[0].facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON);
+        assert_eq!(rows[0].facts["confirmedSource"], "proof");
+        // an unmined answer confirms nothing (never a courier's bare presence)
+        let (proof, asks) = e693_pass(std::slice::from_ref(&sweep), &hops, &chain, None, 2, false);
+        assert_eq!((proof.len(), asks), (0, 1));
+        // the outcomes: a word-less answer is a fault, an unmined one still unconfirmed, a checked proof mined
+        assert_eq!(
+            DurableReaskOutcome::of(&crate::txany::TxAnyAnswer::default()),
+            DurableReaskOutcome::Fault
+        );
+        assert_eq!(
+            DurableReaskOutcome::of(&e693_answer(false)),
+            DurableReaskOutcome::StillUnconfirmed
+        );
+        assert_eq!(
+            DurableReaskOutcome::of(&e693_answer(true)),
+            DurableReaskOutcome::MinedByProof
+        );
+        let bare_height = crate::txany::TxAnyAnswer {
+            height: Some(900_000),
+            ..e693_answer(false)
+        };
+        assert_eq!(
+            DurableReaskOutcome::of(&bare_height),
+            DurableReaskOutcome::StillUnconfirmed
+        );
+    }
+
+    /// bsv-low #693 (b): a durable spender ALREADY CONFIRMED is never re-asked: by the chain rung's
+    /// `spent_confirmed`, by the index's hop row, or by the tracker's mined word. The fake counts zero asks. A tracker
+    /// row that is NOT mined outranks a confirmed ladder (as `spender_mined` reads it), so that spender IS re-asked.
+    #[test]
+    fn e693_b_a_durable_confirmed_spender_is_never_re_asked() {
+        let sweep = tx(0x0e);
+        let key = format!("{}:0", tx(0x07));
+        let stranded = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let chain_ok = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        let s = std::slice::from_ref(&sweep);
+        assert_eq!(
+            e693_pass(s, &stranded, &chain_ok, None, 2, true).1,
+            0,
+            "chain rung confirmed"
+        );
+        let mut by_index = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        by_index.spent_confirmed = Some(true);
+        let indexed = [by_index];
+        assert_eq!(
+            e693_pass(s, &indexed, &HashMap::new(), None, 2, true).1,
+            0,
+            "index confirmed"
+        );
+        let chain_u = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(false));
+        assert_eq!(
+            e693_pass(s, &stranded, &chain_u, Some(true), 2, true).1,
+            0,
+            "tracker mined"
+        );
+        assert_eq!(
+            e693_pass(s, &stranded, &chain_ok, Some(false), 2, true).1,
+            1,
+            "tracker not mined"
+        );
+        // a spender no hop names (or a filed sweep's own) is not a candidate either
+        assert_eq!(
+            e693_pass(&[tx(0x0f)], &stranded, &chain_u, None, 2, true).1,
+            0
+        );
+        let mut filed = HashMap::new();
+        filed.insert(
+            key.clone(),
+            crate::hopsweep::FiledHopSweep {
+                sweep_txid: sweep.clone(),
+                raw_hex: String::new(),
+                pays_sats: None,
+                index_proven: false,
+                index_proof_height: None,
+            },
+        );
+        assert!(!durable_spender_needs_proof(
+            &sweep, &stranded, &chain_u, &filed, None
+        ));
+        assert!(durable_spender_needs_proof(
+            &sweep,
+            &stranded,
+            &chain_u,
+            &HashMap::new(),
+            None
+        ));
+    }
+
+    /// bsv-low #693 (c): THE BOUND. Five durable unconfirmed spenders, the fake courier counts at most
+    /// `OWED_DURABLE_REASKS_PER_RECOMPUTE` (1) asks whatever slots are left, none when phase 2 spent both slots, none
+    /// once the pass's clock is out; and the route takes the slots from what phase 2 left (source pin).
+    #[test]
+    fn e693_c_the_per_pass_re_ask_bound_holds_over_many_durable_unconfirmed_spenders() {
+        assert_eq!(OWED_DURABLE_REASKS_PER_RECOMPUTE, 1);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let five: Vec<String> = (0x20u8..0x25).map(tx).collect();
+        for (room, clock_out, want) in [
+            (2usize, false, 1usize),
+            (1, false, 1),
+            (0, false, 0),
+            (2, true, 0),
+        ] {
+            let asks = std::cell::Cell::new(0usize);
+            let made = rt.block_on(durable_reasks(
+                five.clone(),
+                room,
+                || clock_out,
+                |_sp| {
+                    asks.set(asks.get() + 1);
+                    async move { (e693_answer(true), true) }
+                },
+            ));
+            assert_eq!(
+                (asks.get(), made.len()),
+                (want, want),
+                "room={room} clock_out={clock_out}"
+            );
+        }
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        for wired in [
+            "letroom=crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE.saturating_sub(courier_reads);",
+            "crate::owed::durable_reasks(candidates,room,&over_budget,",
+            "ifr.courier_asked{courier_reads+=1;",
+            "ifr.outcome==crate::owed::DurableReaskOutcome::MinedByProof{proof_answers.push((r.spender.clone(),a));proof_mined_spenders.insert(r.spender);}",
+            "if!budget_cut&&!durable_unconfirmed.is_empty(){",
+        ] {
+            assert!(routes.contains(wired), "the route's phase 2b: {wired}");
+        }
+    }
+
+    /// bsv-low #693 (d), the #692 lens's LOW-1, a STATED residual: the index-hop-row arm (`spent == true`) is not
+    /// memo-upgraded because that arm confirms from the index's own `spent_confirmed` and never reads a chain-rung
+    /// memo: a confirmed memo naming the sweep leaves its row unconfirmed (so the upgrade would change nothing). What
+    /// THIS pin proves is ONE pass: the arm's durable spender IS a re-ask candidate while the index's word is
+    /// unconfirmed, and that pass's checked proof confirms the row (`confirmedSource = "proof"`). Across passes the
+    /// row is held by the proof LATCH (the W1-OWED-693 lens's HIGH-1: latched once checked, served from the latch on
+    /// every later pass), pinned by `e693f_h1_*`. The route's filter and its stated reason stand (source pin).
+    #[test]
+    fn e693_d_the_index_arm_reads_no_memo_and_one_pass_s_re_ask_confirms_it() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let my_pkh = "cc".repeat(20);
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        let mut spent = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        spent.spent_confirmed = Some(false);
+        let hops = [spent];
+        let key = format!("{}:0", tx(0x07));
+        let memo = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        let mut spends_it: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends_it.insert(sweep.clone(), vec![(tx(0x07), 0)]);
+        let mut courier: HashSet<String> = HashSet::new();
+        courier.insert(sweep.clone());
+        let no_proof: HashSet<String> = HashSet::new();
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &memo;
+        i.spender_outputs = &mine;
+        i.spender_inputs = &spends_it;
+        i.my_pkh_by_game = &pkhs;
+        i.courier_spenders = &courier;
+        i.proof_mined_spenders = &no_proof;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["spent"], true, "the index-hop-row arm");
+        assert_eq!(
+            rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON,
+            "a confirmed chain memo is not read on the index arm"
+        );
+        // the re-ask: the index arm's spender is a candidate (even beside that memo) and its proof confirms the row
+        let (proof, asks) = e693_pass(std::slice::from_ref(&sweep), &hops, &memo, None, 2, true);
+        assert_eq!(asks, 1);
+        let no_chain = HashMap::new();
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_chain = &no_chain;
+        i.spender_outputs = &mine;
+        i.spender_inputs = &spends_it;
+        i.my_pkh_by_game = &pkhs;
+        i.courier_spenders = &courier;
+        i.proof_mined_spenders = &proof;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON);
+        assert_eq!(rows[0].facts["confirmedSource"], "proof");
+        let routes = include_str!("routes.rs");
+        assert!(routes.contains("bsv-low #693 (the #692 lens's LOW-1), a stated residual"));
+        assert!(
+            routes.contains("&& r.facts.get(\"spent\").and_then(|v| v.as_bool()) != Some(true)")
+        );
+    }
+
+    /// bsv-low #693 fold (the W1-OWED-693 lens's MEDIUM-1): the re-ask's candidate predicate reads the tracker's
+    /// word as the CONFIRMATION does, the RECHECKED view (`word == "mined"` AND `verifyPath` non-null), never the
+    /// stored row. A stored `mined` row whose recheck could not check this pass (served `verifyPath: null`) leaves
+    /// the row unconfirmed in `spender_mined` AND is a re-ask candidate; a checked one confirms the row and is never
+    /// re-asked; no row falls to the ladder. The route passes `checked_tracker_mined` over the views it built before
+    /// phase 2b (source pin). RED on `a789f9e` by the lens's mutant B shape (the route's tracker input from the
+    /// stored row, or forced to `None`): the source assertions fail; the stored row answered `Some(true)` there and
+    /// the spender was never re-asked.
+    #[test]
+    fn e693f_m1_the_candidates_read_the_rechecked_view_as_spender_mined_does() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let my_pkh = "cc".repeat(20);
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        let hops = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        let mut spends: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends.insert(sweep.clone(), vec![(tx(0x07), 0)]);
+        let courier: HashSet<String> = [sweep.clone()].into();
+        let view = |verify: Value| {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                sweep.clone(),
+                serde_json::json!({"word": "mined", "verifyPath": verify}),
+            );
+            m
+        };
+        let unchecked = view(Value::Null);
+        let checked = view(serde_json::json!(["merkle"]));
+        let reason = |words: &std::collections::BTreeMap<String, Value>| -> Value {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.spender_words = Some(words);
+            i.hop_chain = &chain;
+            i.spender_outputs = &mine;
+            i.spender_inputs = &spends;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = &courier;
+            derive_owed_rows(&i)[0].facts["claimReason"].clone()
+        };
+        let s = std::slice::from_ref(&sweep);
+        // the stored row says mined; the recheck could not check it: unconfirmed, and re-asked
+        assert_eq!(checked_tracker_mined(Some(&unchecked), &sweep), Some(false));
+        assert_eq!(reason(&unchecked), UNCONFIRMED_PAYOUT_REASON);
+        let tracker = checked_tracker_mined(Some(&unchecked), &sweep);
+        assert_eq!(
+            e693_pass(s, &hops, &chain, tracker, 2, true).1,
+            1,
+            "re-asked"
+        );
+        // checked: confirmed, never re-asked
+        assert_eq!(checked_tracker_mined(Some(&checked), &sweep), Some(true));
+        assert_eq!(reason(&checked), COURIER_BYTES_NO_CREDIT_REASON);
+        let tracker = checked_tracker_mined(Some(&checked), &sweep);
+        assert_eq!(e693_pass(s, &hops, &chain, tracker, 2, true).1, 0);
+        // no views, or no row: the ladder decides both
+        assert_eq!(checked_tracker_mined(None, &sweep), None);
+        assert_eq!(
+            checked_tracker_mined(Some(&std::collections::BTreeMap::new()), &sweep),
+            None
+        );
+        // the route: the views built before phase 2b, the candidates chosen after them, from the views
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        let views = "letspender_words=crate::tracker_host::runtime::views(env,&word_rows).await;";
+        let input = "lettracker=crate::owed::checked_tracker_mined(word_lookup_available.then_some(&spender_words),sp,);crate::owed::durable_spender_needs_proof(sp,&hops,&hop_chain,&hop_sweeps,tracker,)";
+        let reask = "crate::owed::durable_reasks(candidates,room,&over_budget,";
+        for wired in [views, input, reask] {
+            assert!(routes.contains(wired), "the route's candidates: {wired}");
+        }
+        assert!(routes.find(views).unwrap() < routes.find(input).unwrap());
+        assert!(routes.find(input).unwrap() < routes.find(reask).unwrap());
+        assert!(
+            !routes.contains("word_rows.get(sp.as_str()).map(|r|r.word==\"mined\")"),
+            "never the stored row"
+        );
+    }
+
+    /// bsv-low #693 fold (the W1-OWED-693 lens's LOW-2): RETIRED AND REFUTED ROWS ARE NOT RE-ASKED. The index-arm
+    /// fixture (the index names the sweep spent, unconfirmed; its bytes durable) serves a payout waiting for the
+    /// block, so its spender is a candidate; the same spender is NOT when the derivation retires the payout (a
+    /// verified `collected`, a held filing naming the sweep, the home output spent) or the bytes refute the pointer
+    /// (they do not spend the hop). The route filters phase 2b's candidates by the provisional derivation (source
+    /// pin). RED on `6eb00a2` (no filter: each of the four was re-asked every pass; the source assertion fails).
+    #[test]
+    fn e693f_l2_a_retired_or_refuted_spender_is_not_re_asked() {
+        let (v, no_pots) = (HashMap::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let game = tx(0x01);
+        let my_pkh = "cc".repeat(20);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(game.clone(), my_pkh.clone());
+        let mut h = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        h.spent_confirmed = Some(false);
+        let hops = [h];
+        let courier: HashSet<String> = [sweep.clone()].into();
+        let spends_hop: HashMap<String, Vec<(String, u32)>> =
+            [(sweep.clone(), vec![(tx(0x07), 0)])].into();
+        let refuted: HashMap<String, Vec<(String, u32)>> =
+            [(sweep.clone(), vec![(tx(0x09), 3)])].into();
+        let unspent_home = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let spent_home = pays(&sweep, &[(0, &my_pkh, 20_000, Some(true))]);
+        let none: HashSet<String> = HashSet::new();
+        let collected: HashSet<String> = [game.clone()].into();
+        let held: HashSet<String> = [held_key(&game, &sweep)].into();
+        let waiting = |collected: &HashSet<String>,
+                       held: &HashSet<String>,
+                       inputs_of: &HashMap<String, Vec<(String, u32)>>,
+                       outputs: &HashMap<String, Vec<SpenderOutput>>|
+         -> bool {
+            let mut i = inputs(&[], &[], &hops, &v, collected, &no_pots, Some(900_000));
+            i.collected_present = collected;
+            i.held_verified = held;
+            i.spender_outputs = outputs;
+            i.spender_inputs = inputs_of;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = &courier;
+            sweeps_waiting_for_the_block(&derive_owed_rows(&i)).contains(&sweep)
+        };
+        assert!(
+            waiting(&none, &none, &spends_hop, &unspent_home),
+            "the waiting payout's spender is a candidate"
+        );
+        assert!(
+            !waiting(&collected, &none, &spends_hop, &unspent_home),
+            "collected"
+        );
+        assert!(
+            !waiting(&none, &held, &spends_hop, &unspent_home),
+            "a held filing"
+        );
+        assert!(
+            !waiting(&none, &none, &spends_hop, &spent_home),
+            "the home output spent"
+        );
+        assert!(
+            !waiting(&none, &none, &refuted, &unspent_home),
+            "the bytes refute the pointer"
+        );
+        // the route: the candidates filtered by the provisional derivation before the re-ask
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        let filter = ".into_iter().filter(|sp|waiting.contains(sp)).collect()";
+        let derive =
+            "letwaiting=crate::owed::sweeps_waiting_for_the_block(&derive_owed_rows(&OwedInputs{";
+        let reask = "crate::owed::durable_reasks(candidates,room,&over_budget,";
+        for wired in [derive, filter, reask] {
+            assert!(routes.contains(wired), "the route's LOW-2 filter: {wired}");
+        }
+        assert!(routes.find(derive).unwrap() < routes.find(reask).unwrap());
+    }
+
+    /// bsv-low #693 fold: the latch range read over real SQLite, as the route's `read_proof_latches` makes it (the
+    /// shipped `home_latch_range_read_sql` with `proof_latch_range_binds`).
+    fn e693f_read_latches(
+        conn: &rusqlite::Connection,
+        spenders: &[String],
+    ) -> Vec<crate::hops_view::ProbeMemo> {
+        let binds = proof_latch_range_binds(spenders);
+        let mut stmt = conn
+            .prepare(&home_latch_range_read_sql(spenders.len()))
+            .unwrap();
+        stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+            Ok(crate::hops_view::ProbeMemo {
+                outpoint: r.get(0)?,
+                probed_at_ms: r.get::<_, i64>(1)?,
+                spent: r.get::<_, i64>(2)? != 0,
+                spending_txid: r.get(3)?,
+                spent_confirmed: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+            })
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    const E693F_ROOT: &str = "abababababababababababababababababababababababababababababababab";
+
+    /// bsv-low #693 fold: ONE pass of the route's proof path over real SQLite, in the route's order: the durable
+    /// spenders' latches read and honoured (the seed), the re-ask candidates (no honoured latch, still needing the
+    /// proof), the re-ask under `room` unless `budget_cut`, then this pass's checked proofs latched through the
+    /// shipped memo upsert. `mined` is what the courier's `/tx-any` would prove. Returns the proof set and the asks.
+    #[allow(clippy::too_many_arguments)]
+    fn e693f_pass(
+        conn: &rusqlite::Connection,
+        durable: &[String],
+        hops: &[HopEntry],
+        courier: &HashSet<String>,
+        room: usize,
+        budget_cut: bool,
+        mined: &HashSet<String>,
+        canonical: &HashMap<u64, Option<String>>,
+    ) -> (HashSet<String>, Vec<String>) {
+        let latches = proof_latches_of(durable, &e693f_read_latches(conn, durable));
+        let latched = latched_proof_mined_spenders(&latches, canonical);
+        let mut proof = latched.clone();
+        let candidates: Vec<String> = durable
+            .iter()
+            .filter(|sp| !latched.contains(*sp))
+            .filter(|sp| {
+                durable_spender_needs_proof(sp, hops, &HashMap::new(), &HashMap::new(), None)
+            })
+            .cloned()
+            .collect();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut answers = Vec::new();
+        if !budget_cut {
+            let reasks = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(durable_reasks(
+                    candidates,
+                    room,
+                    || false,
+                    |sp| {
+                        asked.borrow_mut().push(sp.clone());
+                        let m = mined.contains(&sp);
+                        async move { (e693_answer(m), true) }
+                    },
+                ));
+            for (r, a) in reasks {
+                if r.outcome == DurableReaskOutcome::MinedByProof {
+                    proof.insert(r.spender.clone());
+                    answers.push((r.spender, a, Some(E693F_ROOT.to_string())));
+                }
+            }
+        }
+        let writes = proof_latches_to_write(&answers, &latched, courier, 1_800_000_000_000);
+        write_memos(conn, &writes);
+        (proof, asked.into_inner())
+    }
+
+    /// bsv-low #693 fold (the W1-OWED-693 lens's HIGH-1): LATCHED ONCE CHECKED, SERVED FROM THE LATCH ON EVERY LATER
+    /// PASS. Two index-arm rows (the index names each hop's sweep spent, unconfirmed), both sweeps' bytes in the
+    /// durable store. Pass N re-asks sweep A, whose `/tx-any` carries a checked mined proof: row A reads "home on
+    /// chain" (`confirmedSource = "proof"`) and the proof is latched. Then the lens's three cases, each a later pass
+    /// that makes no confirming ask of A: (a) the never-asked-first order puts B first and B's answer is unmined, (b)
+    /// no slot (room 0), (c) `budget_cut`. Row A still reads "home on chain" from the latch, and A is never re-asked.
+    /// The TTL sweep (the overlay's shipped statement) leaves the latch. RED on `e30e445` (no latch: the proof set of
+    /// each later pass is empty and row A read `UNCONFIRMED_PAYOUT_REASON`; the API does not compile there, and the
+    /// mutant `latched_proof_mined_spenders` answering empty is RED here).
+    #[test]
+    fn e693f_h1_a_checked_proof_is_latched_and_served_on_every_later_pass_real_sqlite() {
+        use bsv_overlay_cloudflare::hop_probe_memos::{
+            HOP_PROBE_MEMO_EXPIRE_SQL, HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES,
+        };
+        assert_eq!(
+            HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES,
+            [PROOF_MINED_LATCH_PREFIX]
+        );
+        let conn = memo_db();
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let (sweep_a, sweep_b) = (tx(0x0e), tx(0x0d));
+        let my_pkh = "cc".repeat(20);
+        let mut mine = pays(&sweep_a, &[(0, &my_pkh, 20_000, None)]);
+        mine.extend(pays(&sweep_b, &[(0, &my_pkh, 20_000, None)]));
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        let mut hop_a = hop(HopStatus::Spent, Some(&sweep_a), Some(10_000_000));
+        hop_a.spent_confirmed = Some(false);
+        let mut hop_b = hop(HopStatus::Spent, Some(&sweep_b), Some(10_000_000));
+        hop_b.spent_confirmed = Some(false);
+        hop_b.hop_txid = tx(0x08);
+        let hops = [hop_a, hop_b];
+        let mut spends: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends.insert(sweep_a.clone(), vec![(tx(0x07), 0)]);
+        spends.insert(sweep_b.clone(), vec![(tx(0x08), 0)]);
+        let courier: HashSet<String> = [sweep_a.clone(), sweep_b.clone()].into();
+        let row_a = |proof: &HashSet<String>| -> OwedRow {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.spender_outputs = &mine;
+            i.spender_inputs = &spends;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = &courier;
+            i.proof_mined_spenders = proof;
+            let rows = derive_owed_rows(&i);
+            let r = rows
+                .into_iter()
+                .find(|r| r.facts["sweepTxid"] == sweep_a.as_str())
+                .expect("row A");
+            assert_eq!(r.facts["spent"], true, "the index-hop-row arm");
+            assert_eq!(
+                r.facts["claimable"], false,
+                "a courier-bytes row is never claimable"
+            );
+            r
+        };
+        let checked: HashMap<u64, Option<String>> =
+            [(900_000u64, Some(E693F_ROOT.to_string()))].into();
+        let a_mined: HashSet<String> = [sweep_a.clone()].into();
+        let none: HashSet<String> = HashSet::new();
+        // pass N: a slot, A re-asked, its proof confirms the row and is latched
+        let (proof, asked) = e693f_pass(
+            &conn,
+            &[sweep_a.clone(), sweep_b.clone()],
+            &hops,
+            &courier,
+            1,
+            false,
+            &a_mined,
+            &checked,
+        );
+        assert_eq!(asked, vec![sweep_a.clone()]);
+        assert_eq!(row_a(&proof).facts["confirmedSource"], "proof");
+        let latches = proof_latches_of(
+            std::slice::from_ref(&sweep_a),
+            &e693f_read_latches(&conn, std::slice::from_ref(&sweep_a)),
+        );
+        assert_eq!(
+            latches,
+            vec![ProofLatch {
+                spender: sweep_a.clone(),
+                height: 900_000,
+                root: E693F_ROOT.to_string()
+            }],
+            "the height and the root, never bytes"
+        );
+        // the overlay's TTL sweep, far past every window, leaves the latch
+        conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![i64::MAX])
+            .unwrap();
+        for (case, order, room, cut) in [
+            (
+                "(a) B first, its answer unmined",
+                [sweep_b.clone(), sweep_a.clone()],
+                1usize,
+                false,
+            ),
+            ("(b) no slot", [sweep_a.clone(), sweep_b.clone()], 0, false),
+            (
+                "(c) budget_cut",
+                [sweep_a.clone(), sweep_b.clone()],
+                2,
+                true,
+            ),
+        ] {
+            let (proof, asked) =
+                e693f_pass(&conn, &order, &hops, &courier, room, cut, &none, &checked);
+            assert!(
+                !asked.contains(&sweep_a),
+                "{case}: a latched spender is never re-asked"
+            );
+            let r = row_a(&proof);
+            assert_eq!(r.facts["confirmedSource"], "proof", "{case}");
+            assert_eq!(
+                r.facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON,
+                "{case}"
+            );
+            // a header read that faulted honours the latch too (the reorg clear is what demotes it)
+            let fault: HashMap<u64, Option<String>> = [(900_000u64, None)].into();
+            let (proof, _) = e693f_pass(&conn, &order, &hops, &courier, room, cut, &none, &fault);
+            assert_eq!(
+                row_a(&proof).facts["confirmedSource"],
+                "proof",
+                "{case}, header fault"
+            );
+        }
+        // the route wiring: the seed before the candidates, the candidates without a latched spender, the latch in
+        // the snapshot batch, the read through the shipped range read
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        let seed = "proof_latched=crate::owed::latched_proof_mined_spenders(&latches,&canonical);proof_mined_spenders.extend(proof_latched.iter().cloned());";
+        let cands = ".filter(|sp|!proof_latched.contains(*sp))";
+        let reask = "crate::owed::durable_reasks(candidates,room,&over_budget,";
+        for wired in [
+            seed,
+            cands,
+            reask,
+            "proof_answers.push((r.spender.clone(),a));",
+            "forlatchincrate::owed::proof_latches_to_write(&proofs_to_latch,&proof_latched,&courier_spenders,now_ms,){",
+            ".prepare(crate::hops_view::PROBE_MEMO_UPSERT_SQL)",
+            "read_latch_ranges(db,spenders,crate::owed::proof_latch_range_binds).await",
+        ] {
+            assert!(routes.contains(wired), "the route's latch: {wired}");
+        }
+        assert!(routes.find(seed).unwrap() < routes.find(cands).unwrap());
+        assert!(routes.find(cands).unwrap() < routes.find(reask).unwrap());
+    }
+
+    /// bsv-low #693 fold (HIGH-1 (b)): A REORG DEMOTES THE LATCH. The overlay's shipped reorg clear deletes it (a mined
+    /// proof is a chain word, never spared), and the next pass with no slot reads row A "waiting for the block" again
+    /// until a new proof latches. A latch whose root is no longer chaintracks' root at its height is not honoured
+    /// either (a reorg the clear has not yet run for). To red: spare `proofmined:` in the clear, or honour a moved root.
+    #[test]
+    fn e693f_h1_b_a_reorg_demotes_the_latch_and_the_row_waits_again_real_sqlite() {
+        use bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_REORG_CLEAR_SQL;
+        let conn = memo_db();
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let my_pkh = "cc".repeat(20);
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        let mut h = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        h.spent_confirmed = Some(false);
+        let hops = [h];
+        let mut spends: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends.insert(sweep.clone(), vec![(tx(0x07), 0)]);
+        let courier: HashSet<String> = [sweep.clone()].into();
+        let reason = |proof: &HashSet<String>| -> serde_json::Value {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.spender_outputs = &mine;
+            i.spender_inputs = &spends;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = &courier;
+            i.proof_mined_spenders = proof;
+            derive_owed_rows(&i)[0].facts["claimReason"].clone()
+        };
+        let checked: HashMap<u64, Option<String>> =
+            [(900_000u64, Some(E693F_ROOT.to_string()))].into();
+        let mined: HashSet<String> = [sweep.clone()].into();
+        let none: HashSet<String> = HashSet::new();
+        let s = std::slice::from_ref(&sweep);
+        let (proof, _) = e693f_pass(&conn, s, &hops, &courier, 1, false, &mined, &checked);
+        assert_eq!(reason(&proof), COURIER_BYTES_NO_CREDIT_REASON);
+        let (proof, _) = e693f_pass(&conn, s, &hops, &courier, 0, false, &none, &checked);
+        assert_eq!(
+            reason(&proof),
+            COURIER_BYTES_NO_CREDIT_REASON,
+            "served from the latch"
+        );
+        // a moved root at the latch's height: not honoured
+        let moved: HashMap<u64, Option<String>> = [(900_000u64, Some("cd".repeat(32)))].into();
+        let (proof, _) = e693f_pass(&conn, s, &hops, &courier, 0, false, &none, &moved);
+        assert_eq!(
+            reason(&proof),
+            UNCONFIRMED_PAYOUT_REASON,
+            "a moved root is not honoured"
+        );
+        // the overlay's reorg clear takes the latch
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 1);
+        assert!(e693f_read_latches(&conn, s).is_empty());
+        let (proof, _) = e693f_pass(&conn, s, &hops, &courier, 0, false, &none, &checked);
+        assert_eq!(
+            reason(&proof),
+            UNCONFIRMED_PAYOUT_REASON,
+            "the row waits for the block again"
+        );
+        // the next checked proof latches again
+        let (proof, asked) = e693f_pass(&conn, s, &hops, &courier, 1, false, &mined, &checked);
+        assert_eq!(
+            (asked.len(), reason(&proof)),
+            (1, COURIER_BYTES_NO_CREDIT_REASON.into())
+        );
+        assert_eq!(proof_latches_of(s, &e693f_read_latches(&conn, s)).len(), 1);
+    }
+
+    /// bsv-low #693 fold (HIGH-1 (c)): A LATCH NEVER EXISTS WITHOUT A CHECKED PROOF. Only `proof_mined_word` (confirmed
+    /// AND a proven height) and a canonical root write one: a courier's bare `confirmed`, a bare claimed height, a SEEN,
+    /// a fault or a missing root writes nothing; nor does an index-bytes spender (not courier-bytes), nor one a
+    /// latch already covers. A malformed row read back is no latch. To red: latch on `confirmed` alone.
+    #[test]
+    fn e693f_h1_c_a_latch_never_exists_without_a_checked_proof() {
+        let sp = tx(0x0e);
+        let root = Some(E693F_ROOT);
+        assert!(proof_latch_memo(&sp, &e693_answer(true), root, 1).is_some());
+        let bare_confirmed = crate::txany::TxAnyAnswer {
+            confirmed: Some(true),
+            height: None,
+            ..e693_answer(false)
+        };
+        let bare_height = crate::txany::TxAnyAnswer {
+            claimed_height: Some(900_000),
+            ..e693_answer(false)
+        };
+        for (what, a) in [
+            ("a bare confirmed", bare_confirmed),
+            ("a bare claimed height", bare_height),
+            ("a SEEN", e693_answer(false)),
+            ("a fault", crate::txany::TxAnyAnswer::default()),
+        ] {
+            assert!(proof_latch_memo(&sp, &a, root, 1).is_none(), "{what}");
+        }
+        assert!(
+            proof_latch_memo(&sp, &e693_answer(true), None, 1).is_none(),
+            "no root"
+        );
+        assert!(
+            proof_latch_memo(&sp, &e693_answer(true), Some("zz"), 1).is_none(),
+            "a malformed root"
+        );
+        let courier: HashSet<String> = [sp.clone()].into();
+        let proofs = vec![(sp.clone(), e693_answer(true), root.map(str::to_string))];
+        assert_eq!(
+            proof_latches_to_write(&proofs, &HashSet::new(), &courier, 1).len(),
+            1
+        );
+        assert!(
+            proof_latches_to_write(&proofs, &HashSet::new(), &HashSet::new(), 1).is_empty(),
+            "index-bytes"
+        );
+        assert!(
+            proof_latches_to_write(&proofs, &courier, &courier, 1).is_empty(),
+            "already latched"
+        );
+        // the bound
+        let many: Vec<_> = (0x30u8..0x38)
+            .map(|b| (tx(b), e693_answer(true), root.map(str::to_string)))
+            .collect();
+        let all: HashSet<String> = many.iter().map(|(s, _, _)| s.clone()).collect();
+        assert_eq!(
+            proof_latches_to_write(&many, &HashSet::new(), &all, 1).len(),
+            OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE
+        );
+        // a row that is not a whole latch is no latch
+        let key = |h: &str| format!("{PROOF_MINED_LATCH_PREFIX}{sp}.{h}");
+        let memo =
+            |k: String, confirmed: Option<bool>, root: Option<&str>| crate::hops_view::ProbeMemo {
+                outpoint: k,
+                probed_at_ms: 1,
+                spent: true,
+                spending_txid: root.map(str::to_string),
+                spent_confirmed: confirmed,
+            };
+        let s = std::slice::from_ref(&sp);
+        for bad in [
+            memo(key("900000"), None, root),
+            memo(key("900000"), Some(true), None),
+            memo(key("x"), Some(true), root),
+            memo(format!("{HOME_SPEND_LATCH_PREFIX}{sp}.0"), Some(true), root),
+        ] {
+            assert!(
+                proof_latches_of(s, std::slice::from_ref(&bad)).is_empty(),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            proof_latches_of(s, &[memo(key("900000"), Some(true), root)]).len(),
+            1
+        );
+        assert_eq!(proof_latch_recheck_heights(&[]).len(), 0);
     }
 
     /// bsv-low #662 (live 2026-10-14 00:35:35Z, pair 19, hop d4029675ccb65a4b:0, sweep 96448ef1fc3b): pass B judged
