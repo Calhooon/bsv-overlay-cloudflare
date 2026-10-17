@@ -652,10 +652,11 @@ pub enum AuthFaultClass {
     /// The session store (KV, the `AuthSessionStore` DO: its stub, its fetch,
     /// its status, its body) could not be asked or written: 503, `Retry-After`.
     Transport,
-    /// Everything else: the 400 as before (a body the middleware could not
-    /// serialize, the transport's own request plumbing, the server's key or a
-    /// missing binding, an SDK fault). None of these heals by waiting two
-    /// seconds, and a malformed caller must never be told to retry.
+    /// Everything else, kept at the pre-#670 400 byte for byte. Not only the
+    /// caller's faults: server and operator faults land here too (`ConfigError`:
+    /// a missing binding or a bad server key; `SdkError`: the session nonce;
+    /// `TransportError`: a body read or a Response build; `SerializationError`).
+    /// None of these heals by waiting two seconds, so none is told to retry.
     Caller,
 }
 
@@ -664,8 +665,12 @@ pub enum AuthFaultClass {
 /// `storage/` are byte-identical to 0.6.0's). The match is exhaustive on
 /// purpose: a crate bump that adds a variant does not compile until it is
 /// classified. Every store fault the middleware raises is `KvError`
-/// (`storage/kv_session.rs`, `storage/do_session.rs`, and `From<worker::Error>`);
-/// no other variant carries one.
+/// (`storage/kv_session.rs`, `storage/do_session.rs`, and `From<worker::Error>`,
+/// which maps EVERY bare-`?` worker error to it). The converse does not hold in
+/// the crate: a caller's over-long nonce or handshake body also comes back
+/// `KvError` (the platform refusing the key or value), so the door refuses
+/// those inputs first (`auth_input_guard`, the lens's HIGH-1); with the guard,
+/// a `KvError` at the door is the store's.
 pub fn auth_fault_class(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> AuthFaultClass {
     use bsv_middleware_cloudflare::AuthCloudflareError as E;
     match e {
@@ -692,7 +697,10 @@ pub const AUTH_UNAVAILABLE_RETRY_AFTER: &str = "2";
 /// The 503's code.
 pub const AUTH_UNAVAILABLE_CODE: &str = "ERR_AUTH_UNAVAILABLE";
 /// The durable `ops_counters` row a store fault at the door bumps (through the
-/// courier census's batched flush, never one D1 write per fault).
+/// courier census's batched flush, never one D1 write per fault). It is the
+/// ONLY count of a store fault: the isolate `/health` auth tally holds none
+/// (not `authRefused`, since a store fault is not a refusal; not
+/// `authenticated`), stated (the lens's LOW-3).
 pub const COUNTER_AUTH_HANDSHAKE_UNAVAILABLE: &str = "auth_handshake_unavailable_total";
 
 /// The door's answer to an `Err` out of `process_auth*`: `(status, body,
@@ -1024,9 +1032,9 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
             // malformed handshake, a signature that does not verify, NEW-1's
             // identity that is not the session's; 0.3.8 raised those as `Err`
             // and they were this 400). An `Err` is now a FAULT only (the
-            // session store, the server's key, the transport, the SDK); its
-            // answer here is unchanged: the 400 a 0.3.8 fault got, never a
-            // bare 500.
+            // session store, the server's key, the transport, the SDK); since
+            // bsv-low #670 a store fault is the retryable 503 and every other
+            // fault the 400 a 0.3.8 fault got, never a bare 500.
             let mut pending_offer: Option<LaneOffer> = None;
             let auth = match outcome {
                 Ok(LaneAuthResult::Laned {
