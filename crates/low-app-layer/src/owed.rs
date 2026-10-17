@@ -3497,6 +3497,7 @@ pub fn owed_body(
     rows: &[OwedRow],
     computed_at_ms: i64,
     truncated: bool,
+    recompute_seq: Option<i64>,
 ) -> String {
     let arr: Vec<Value> = rows
         .iter()
@@ -3513,15 +3514,21 @@ pub fn owed_body(
             })
         })
         .collect();
-    json!({
+    let mut body = json!({
         "v": OWED_WIRE_VERSION,
         "identity": identity.to_ascii_lowercase(),
         "tip": tip,
         "rows": arr,
         "truncated": truncated,
         "computedAtMs": computed_at_ms,
-    })
-    .to_string()
+    });
+    // bsv-low #566: the identity's own recompute sequence (its `owed_state` row), additive: absent when the served
+    // snapshot carries none (no snapshot yet, a row no write has stamped since the column, a superseded walk's
+    // fallback), so a body without one is byte-identical to the one before the field.
+    if let Some(seq) = recompute_seq {
+        body["recomputeSeq"] = json!(seq);
+    }
+    body.to_string()
 }
 
 /// bsv-low #669 MEDIUM-1 (the fold of the FIX-669 from-scratch lens): the two tips a served `/owed` body carries,
@@ -3619,7 +3626,13 @@ pub const OWED_ROWS_DELETE_SQL: &str =
 pub const OWED_ROW_INSERT_SQL: &str = "INSERT INTO owed_rows (identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 WHERE NOT EXISTS (SELECT 1 FROM owed_state WHERE identity = ?1 AND computedAtMs > ?9)";
 /// A refused stamp leaves the marker whole: its tip, its row count and its `stale` mark (a filing that marked the
 /// newer snapshot stale is still owed its recompute).
-pub const OWED_STATE_UPSERT_SQL: &str = "INSERT INTO owed_state (identity, computedAtMs, tip, rows, stale, truncated) VALUES (?1, ?2, ?3, ?4, 0, ?5) ON CONFLICT(identity) DO UPDATE SET computedAtMs = excluded.computedAtMs, tip = excluded.tip, rows = excluded.rows, stale = 0, truncated = excluded.truncated WHERE excluded.computedAtMs >= owed_state.computedAtMs";
+/// bsv-low #566: the same upsert bumps the identity's `recomputeSeq` (1 on its first snapshot), so the sequence moves
+/// once per LANDED write and a refused one (the `WHERE`) leaves it; a row written before the column reads NULL and
+/// counts from 1.
+pub const OWED_STATE_UPSERT_SQL: &str = "INSERT INTO owed_state (identity, computedAtMs, tip, rows, stale, truncated, recomputeSeq) VALUES (?1, ?2, ?3, ?4, 0, ?5, 1) ON CONFLICT(identity) DO UPDATE SET computedAtMs = excluded.computedAtMs, tip = excluded.tip, rows = excluded.rows, stale = 0, truncated = excluded.truncated, recomputeSeq = COALESCE(owed_state.recomputeSeq, 0) + 1 WHERE excluded.computedAtMs >= owed_state.computedAtMs";
+/// bsv-low #566: the per-identity recompute sequence served on `/owed` (overlay migration 260, byte-identical; a cold
+/// app-layer isolate adds it, `schema::LATCH_COLUMN_ALTERS`, because the snapshot's upsert and read name it).
+pub const OWED_STATE_SEQ_ALTER: &str = "ALTER TABLE owed_state ADD COLUMN recomputeSeq INTEGER";
 /// One bind of the owed write, host-typed so the route (D1) and the real-SQLite pin run the SAME statements with the
 /// SAME values (`owed_write_plan`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3629,7 +3642,8 @@ pub enum OwedBind {
     Null,
 }
 /// The read-back that closes the write batch: the stamp the identity's marker carries once the batch ran.
-pub const OWED_STATE_STAMP_SQL: &str = "SELECT computedAtMs FROM owed_state WHERE identity = ?1";
+pub const OWED_STATE_STAMP_SQL: &str =
+    "SELECT computedAtMs, recomputeSeq FROM owed_state WHERE identity = ?1";
 
 /// PURE: the ONE batch that writes a snapshot (the identity's rows replaced, the marker stamped, the marker's stamp
 /// read back), in order, all or nothing. The route binds it to D1; the pin runs it on real SQLite.
@@ -3718,15 +3732,16 @@ pub fn superseded_fallback_rows(mut rows: Vec<OwedRow>) -> Vec<OwedRow> {
     }
     rows
 }
-/// One served snapshot: the rows, the tip, the walk's stamp, the cut bit.
-pub type OwedSnapshot = (Vec<OwedRow>, Option<u64>, i64, bool);
+/// One served snapshot: the rows, the tip, the walk's stamp, the cut bit, the identity's recompute sequence (#566).
+pub type OwedSnapshot = (Vec<OwedRow>, Option<u64>, i64, bool, Option<i64>);
 /// PURE: what a SUPERSEDED read answers with: the table's snapshot (the newer walk's) when the stored read
-/// returned one, else its own with every claimable word cleared (`superseded_fallback_rows`).
+/// returned one, else its own with every claimable word cleared (`superseded_fallback_rows`) and no sequence (the
+/// walk's snapshot is not the one the row's sequence counts).
 pub fn superseded_read_snapshot(stored: Option<OwedSnapshot>, own: OwedSnapshot) -> OwedSnapshot {
-    stored.unwrap_or_else(|| (superseded_fallback_rows(own.0), own.1, own.2, own.3))
+    stored.unwrap_or_else(|| (superseded_fallback_rows(own.0), own.1, own.2, own.3, None))
 }
 
-pub const OWED_STATE_READ_SQL: &str = "SELECT s.identity, s.computedAtMs, s.tip, s.rows, s.stale, s.truncated, c.spendingTxid AS markerlessProgress FROM owed_state s LEFT JOIN hop_chain_probes c ON c.outpoint = 'homecursor:markerless:' || s.identity || '.0' WHERE s.identity = ?1";
+pub const OWED_STATE_READ_SQL: &str = "SELECT s.identity, s.computedAtMs, s.tip, s.rows, s.stale, s.truncated, c.spendingTxid AS markerlessProgress, s.recomputeSeq FROM owed_state s LEFT JOIN hop_chain_probes c ON c.outpoint = 'homecursor:markerless:' || s.identity || '.0' WHERE s.identity = ?1";
 pub const OWED_ROWS_READ_SQL: &str = "SELECT identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason FROM owed_rows WHERE identity = ?1 ORDER BY CASE family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END, COALESCE(atHeight, 0) DESC, outpoint ASC LIMIT 501";
 /// HIGH-4: the tip flips the gate — every identity party to an UNSPENT pot whose recovery height the new tip has
 /// reached (a small band below it, so a missed block still lands) is marked STALE; its next read recomputes.
@@ -3859,11 +3874,12 @@ static ROWS_BY_FAMILY: [AtomicU64; 5] = [
     AtomicU64::new(0),
 ];
 static RECOMPUTE_FAULTS: AtomicU64 = AtomicU64::new(0);
-/// bsv-low #566 / #628: every recompute this isolate finished ([`note_recompute`]), served as `recomputeSeq`; its
-/// durable twin [`COUNTER_RECOMPUTE_SEQ`] is the fleet's, the denominator of the owed fault rates.
-static RECOMPUTE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// bsv-low #628: every recompute this isolate finished ([`note_recompute`]), served on `/health.owed` as
+/// `recomputesThisIsolate` (reset with the isolate); its durable twin [`COUNTER_RECOMPUTES`] is the fleet's, the
+/// denominator of the owed fault rates. Not #566's sequence: that one is per identity, in `owed_state.recomputeSeq`.
+static RECOMPUTES_THIS_ISOLATE: AtomicU64 = AtomicU64::new(0);
 /// The durable recompute count (the overlay seeds it at 0).
-pub const COUNTER_RECOMPUTE_SEQ: &str = "applayer_owed_recomputes_total";
+pub const COUNTER_RECOMPUTES: &str = "applayer_owed_recomputes_total";
 /// bsv-low #628 (the observability bar, issue 4): the owed list's fault-shaped isolate counters, each mirrored on
 /// the overlay's `ops_counters` through the courier census's batched flush (`courier::note_presence`). The
 /// isolate fields on `/health.owed` stay the sample; these are the census.
@@ -3900,7 +3916,7 @@ pub fn owed_mirrored_counter_names() -> Vec<String> {
         .iter()
         .map(|n| n.to_string())
         .collect();
-    names.push(COUNTER_RECOMPUTE_SEQ.to_string());
+    names.push(COUNTER_RECOMPUTES.to_string());
     names.push("applayer_owed_read_faults_total".to_string());
     names.extend(
         OWED_READ_FAULT_KINDS
@@ -4056,8 +4072,8 @@ pub fn count_swept_confirmed_by_proof(rows: &[OwedRow]) -> u64 {
 }
 
 pub fn note_recompute(source: &str, rows: &[OwedRow]) {
-    RECOMPUTE_SEQ.fetch_add(1, Ordering::Relaxed);
-    crate::courier::note_presence(COUNTER_RECOMPUTE_SEQ);
+    RECOMPUTES_THIS_ISOLATE.fetch_add(1, Ordering::Relaxed);
+    crate::courier::note_presence(COUNTER_RECOMPUTES);
     if let Some(i) = RECOMPUTE_SOURCES.iter().position(|s| *s == source) {
         RECOMPUTE_BY_SOURCE[i].fetch_add(1, Ordering::Relaxed);
     }
@@ -4293,7 +4309,7 @@ pub fn owed_health_json() -> Value {
         "recomputeAnyAfterMs": OWED_RECOMPUTE_ANY_AFTER_MS,
     });
     // bsv-low #566 / #628 (outside the literal: `json!`'s recursion limit)
-    v["recomputeSeq"] = json!(RECOMPUTE_SEQ.load(Ordering::Relaxed));
+    v["recomputesThisIsolate"] = json!(RECOMPUTES_THIS_ISOLATE.load(Ordering::Relaxed));
     v
 }
 
@@ -8790,6 +8806,7 @@ pub(crate) mod tests {
             &rows,
             1_800_000_000_000,
             false,
+            None,
         ))
         .unwrap();
         assert_eq!(body["v"], 1);
@@ -8948,6 +8965,7 @@ pub(crate) mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         conn.execute_batch(OWED_ROWS_CREATE).unwrap();
         conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_SEQ_ALTER).unwrap();
         conn.execute_batch(
             bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
                 .iter()
@@ -9617,6 +9635,7 @@ pub(crate) mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         conn.execute_batch(OWED_ROWS_CREATE).unwrap();
         conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_SEQ_ALTER).unwrap();
         conn.execute_batch(
             bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
                 .iter()
@@ -10569,6 +10588,7 @@ pub(crate) mod tests {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         conn.execute_batch(OWED_ROWS_CREATE).unwrap();
         conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_SEQ_ALTER).unwrap();
         conn.execute_batch(
             bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
                 .iter()
@@ -10609,9 +10629,13 @@ pub(crate) mod tests {
         let marker = conn.query_row(OWED_STATE_READ_SQL, [ME], |r| r.get::<_, i64>(1));
         assert!(matches!(marker, Err(rusqlite::Error::QueryReturnedNoRows)));
         assert_eq!(read_answer_after_compute(true), ReadAnswer::Stored);
-        let (rows, tip, at, cut) =
-            superseded_read_snapshot(None, (older.clone(), Some(900_000), 1_000, false));
+        let (rows, tip, at, cut, seq) =
+            superseded_read_snapshot(None, (older.clone(), Some(900_000), 1_000, false, Some(3)));
         assert_eq!((rows.len(), tip, at, cut), (4, Some(900_000), 1_000, false));
+        assert_eq!(
+            seq, None,
+            "the fallback is not the snapshot the row's sequence counts"
+        );
         assert!(
             rows.iter()
                 .all(|r| r.facts.get("claimable") != Some(&json!(true))),
@@ -10641,7 +10665,7 @@ pub(crate) mod tests {
             (&older[2], &older[3]),
             "a row with no claimable word is served as it was"
         );
-        assert!(!owed_body(ME, tip, &rows, at, cut).contains("\"claimable\":true"));
+        assert!(!owed_body(ME, tip, &rows, at, cut, seq).contains("\"claimable\":true"));
         // with a stored snapshot the reader gets it, untouched
         let newer = vec![row(
             0x0b,
@@ -10650,10 +10674,10 @@ pub(crate) mod tests {
         )];
         assert_eq!(
             superseded_read_snapshot(
-                Some((newer.clone(), Some(900_001), 71_000, true)),
-                (older, Some(900_000), 1_000, false)
+                Some((newer.clone(), Some(900_001), 71_000, true, Some(4))),
+                (older, Some(900_000), 1_000, false, Some(3))
             ),
-            (newer, Some(900_001), 71_000, true)
+            (newer, Some(900_001), 71_000, true, Some(4))
         );
     }
 
@@ -10712,6 +10736,7 @@ pub(crate) mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         conn.execute_batch(OWED_ROWS_CREATE).unwrap();
         conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_SEQ_ALTER).unwrap();
         conn.execute_batch(
             bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
                 .iter()
@@ -10855,7 +10880,7 @@ pub(crate) mod tests {
         assert!(routes.contains(&squash(
             "if owed_recompute_admit(&identity, \"read-first\", false) {"
         )));
-        assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, source, true) { refresh_retry = Some(OWED_RATE.with(|r| { r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64) }).unwrap_or(0)); let deferred = owed_deferred_deadline(&identity); owed_shed_remark(&db, &identity).await; owed_schedule_deferred(&ctx.env, &identity, deferred).await; (rows, prev_tip, st.computed_at_ms as i64, cut) } else { match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)")));
+        assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, source, true) { refresh_retry = Some(OWED_RATE.with(|r| { r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64) }).unwrap_or(0)); let deferred = owed_deferred_deadline(&identity); owed_shed_remark(&db, &identity).await; owed_schedule_deferred(&ctx.env, &identity, deferred).await; (rows, prev_tip, st.computed_at_ms as i64, cut, stored_seq) } else { match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)")));
         assert_eq!(
             routes
                 .matches(&squash("owed_recompute(env, db, identity_lc,"))
@@ -10886,6 +10911,7 @@ pub(crate) mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(OWED_ROWS_CREATE).unwrap();
         conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_SEQ_ALTER).unwrap();
         conn.execute_batch(
             bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
                 .iter()
@@ -10947,7 +10973,7 @@ pub(crate) mod tests {
         assert_eq!(rate.retry_after_ms(ME, 60_999), Some(1));
         assert_eq!(rate.retry_after_ms(ME, 61_000), None);
         let mut body: Value =
-            serde_json::from_str(&owed_body(ME, None, &[], 1_000, false)).unwrap();
+            serde_json::from_str(&owed_body(ME, None, &[], 1_000, false, None)).unwrap();
         let original = body.clone();
         mark_shed_refresh(&mut body, None);
         assert_eq!(body, original);
@@ -11294,9 +11320,9 @@ pub(crate) mod tests {
     fn pin669_a6_the_served_body_shape_is_additive() {
         // tip-current: the body does not change
         let mut rows = stranded_sweep_rows(971_114);
-        let before = owed_body(ME, Some(971_114), &rows, 1_792_000_000_000, false);
+        let before = owed_body(ME, Some(971_114), &rows, 1_792_000_000_000, false, None);
         degrade_stale_sweeps(&mut rows, Some(971_114), Some(971_114));
-        let after = owed_body(ME, Some(971_114), &rows, 1_792_000_000_000, false);
+        let after = owed_body(ME, Some(971_114), &rows, 1_792_000_000_000, false, None);
         assert_eq!(before, after, "a tip-current serve is byte-identical");
         // degraded: every other fact survives; only the freshness fields are added and the claim flips
         let mut rows = stranded_sweep_rows(971_114);

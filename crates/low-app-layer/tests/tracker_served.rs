@@ -177,7 +177,7 @@ fn ns3d_l3_real_main_body_builders_preserve_every_legacy_key() {
         reason: None,
     }];
     check(
-        owed::owed_body(&id, Some(10), &rows, 123000, false),
+        owed::owed_body(&id, Some(10), &rows, 123000, false, None),
         None,
         &views,
     );

@@ -169,6 +169,10 @@ pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     SPENDER_PAY_A_ALTER,
     SPENDER_PAY_B_ALTER,
     PAY_TXID_ALTER,
+    // bsv-low #566: the per-identity recompute sequence (overlay migration 260). The snapshot's upsert and the `/owed`
+    // state read name it, so a cold isolate ahead of the overlay must add it; its table is `OWED_STATE_CREATE`'s, a
+    // CREATE catch-up, which runs first.
+    crate::owed::OWED_STATE_SEQ_ALTER,
 ];
 
 /// The bsv-low #371 `network_seen` TABLE, same Rule-24 contract as the
@@ -441,11 +445,12 @@ mod tests {
     fn every_app_layer_alter_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             LATCH_COLUMN_ALTERS.len(),
-            10,
+            11,
             "sigValid (#283), markerValid (#362), firstSpentAt (#217), \
              spenderFinal (#371), claimValid + rowValid (brain-cutover M1), \
              settleSigners (#406), spenderPayASats + spenderPayBSats (#468), \
-             payTxid (#492, the held filing's paying transaction)"
+             payTxid (#492, the held filing's paying transaction), \
+             recomputeSeq (#566, the identity's owed recompute sequence)"
         );
         for stmt in LATCH_COLUMN_ALTERS {
             let column = stmt
