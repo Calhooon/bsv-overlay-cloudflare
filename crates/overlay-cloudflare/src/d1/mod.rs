@@ -581,7 +581,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 259 to 260 for bsv-low #566 (2026-10-17, the W1-OBS-APPLAYER lens's M1): `owed_state.recomputeSeq`, the
 /// identity's own recompute sequence, bumped by the snapshot's upsert and served on `/owed`. One column.
 /// 260 to 262 for bsv-low #644 (W1.6): the two backfill passes' partial candidate indexes on `pot_records`.
-pub const OVERLAY_MIGRATION_COUNT: usize = 262;
+/// 262 to 263 for bsv-low #643 (W1.6): the tip mark's (spent, recoveryHeight) index.
+pub const OVERLAY_MIGRATION_COUNT: usize = 263;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2043,6 +2044,12 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // pending set, never the table. The SQL of both passes is unchanged.
     "CREATE INDEX IF NOT EXISTS idx_pot_signers_pending ON pot_records(verdict) WHERE verdict IS NOT NULL AND settleSigners IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_pot_payouts_pending ON pot_records(spendingTxid) WHERE spendingTxid IS NOT NULL AND spenderPayASats IS NULL AND spenderPayBSats IS NULL AND (payPkhA IS NOT NULL OR payPkhB IS NOT NULL)",
+    // 263: bsv-low #643 (W1.6), the app layer's tip mark (`owed::OWED_STALE_ON_TIP_SQL`, once per block) read every
+    // unspent pot through `idx_pot_spent_unconfirmed (spent=?)` (6,944 rows on the fleet fixture's local D1) to keep
+    // those whose recovery height sits in the block's seven-block window. Keyed on (spent, recoveryHeight), the mark
+    // is an index RANGE over the pots the block can change; its SQL is unchanged. Partial on `recoveryHeight IS NOT
+    // NULL` (a term of the mark): a hop's P2PKH row and an undecoded pot are never written to it.
+    "CREATE INDEX IF NOT EXISTS idx_pot_unspent_recovery ON pot_records(spent, recoveryHeight) WHERE recoveryHeight IS NOT NULL",
 ];
 
 // =============================================================================

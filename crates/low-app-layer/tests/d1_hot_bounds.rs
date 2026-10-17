@@ -1,4 +1,4 @@
-//! bsv-low #644 (W1.6): the D1 read bounds on the hot passes, on the fleet-shaped fixture.
+//! bsv-low #643, #644 (W1.6): the D1 read bounds on the hot passes, on the fleet-shaped fixture.
 //!
 //! Each statement keeps the #638 pins: its answer is the answer of the same SQL over the old plan (the table read
 //! `NOT INDEXED`, so the row set cannot depend on the new index), its plan reads no fleet table whole, and its
@@ -248,4 +248,57 @@ fn w16_644_the_backfill_candidates_are_the_old_set_and_read_no_whole_table() {
     ] {
         assert_no_fleet_scan_analyzed(&db, name, &sql);
     }
+}
+
+#[test]
+fn w16_643_the_tip_mark_reads_only_the_pots_the_block_reaches() {
+    use low_app_layer::owed::OWED_STALE_ON_TIP_SQL;
+    let db = fixture();
+    // Spread the fixture's unspent pots over heights so a block's window holds a few (the rest stay at 958846).
+    db.execute_batch(
+        "UPDATE pot_records SET recoveryHeight = 958700 + (rowid % 300) WHERE spent = 0 AND rowid % 5 = 0; \
+         UPDATE pot_records SET recoveryHeight = NULL WHERE spent = 0 AND rowid % 97 = 0",
+    )
+    .unwrap();
+    let at = OWED_STALE_ON_TIP_SQL.find("IN (SELECT").unwrap() + 4;
+    let select = &OWED_STALE_ON_TIP_SQL[at..OWED_STALE_ON_TIP_SQL.len() - 1];
+    assert!(select
+        .starts_with("SELECT DISTINCT pp.identity FROM potparty_records pp JOIN pot_records p "));
+    let old = select.replacen("JOIN pot_records p ", "JOIN pot_records p NOT INDEXED ", 1);
+    let mut total = 0;
+    for tip in [
+        958_699i64, 958_700, 958_705, 958_846, 958_852, 958_853, 958_999, 959_100,
+    ] {
+        let new_rows = sorted(rows(&db, select, &[Value::Integer(tip)]));
+        assert_eq!(
+            new_rows,
+            sorted(rows(&db, &old, &[Value::Integer(tip)])),
+            "tip {tip}: the identities marked are the old plan's"
+        );
+        total += new_rows.len();
+    }
+    assert!(total > 0, "the windows name identities");
+    let details = plan(&db, select);
+    println!("tip mark plan: {details:?}");
+    assert_no_fleet_scan("tip mark", &details);
+    assert!(
+        details.iter().any(|d| d
+            == "SEARCH p USING INDEX idx_pot_unspent_recovery (spent=? AND recoveryHeight>? AND recoveryHeight<?)"),
+        "the block's window is an index range, never every unspent pot: {details:?}"
+    );
+    // The UPDATE itself runs the same subquery plan.
+    let update = plan(&db, OWED_STALE_ON_TIP_SQL);
+    assert!(
+        update
+            .iter()
+            .any(|d| d.contains("idx_pot_unspent_recovery")),
+        "{update:?}"
+    );
+    assert_no_fleet_scan_analyzed(&db, "tip mark", select);
+    assert!(
+        plan(&db, select)
+            .iter()
+            .any(|d| d.contains("idx_pot_unspent_recovery")),
+        "the range holds under statistics"
+    );
 }

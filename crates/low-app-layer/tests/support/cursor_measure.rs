@@ -1,4 +1,5 @@
 //! Local D1 executes these exact native-pinned cursor pages and reports rows_read for each.
+use low_app_layer::owed;
 use low_app_layer::owed_cursor::{self, Source, PAGE};
 use rusqlite::{
     types::{Value, ValueRef},
@@ -44,6 +45,9 @@ const SIGNERS_CANDIDATES_READ_CEILING: u64 = 6;
 /// bsv-low #644: the payouts-backfill candidate read on local D1.
 /// Measured 2 with no row pending (22,591 before).
 const PAYOUTS_CANDIDATES_READ_CEILING: u64 = 6;
+/// bsv-low #643: the tip mark's subquery at a block whose window holds no pot.
+/// Measured 1 (6,944 before).
+const TIP_MARK_READ_CEILING: u64 = 5;
 pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
     let mut sql = String::new();
     let mut expected = Vec::new();
@@ -115,8 +119,10 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
             expected.push(json!({"name":format!("{name} hydration page={page}"),"rows":rows,"sql":expanded,"ceiling":owed_cursor::PAGE_READ_CEILING}));
         }
     }
-    // bsv-low #644 (W1.6): the hot passes' reads on the fleet fixture, each under its own ceiling
-    // (docs/D1-BUDGETS.md).
+    // bsv-low #643, #644 (W1.6): the hot passes' reads on the fleet fixture, each under its own ceiling
+    // (docs/D1-BUDGETS.md). The tip mark is its UPDATE's subquery at a block whose window holds no pot.
+    let tip_at = owed::OWED_STALE_ON_TIP_SQL.find("IN (SELECT").unwrap() + 4;
+    let tip_select = &owed::OWED_STALE_ON_TIP_SQL[tip_at..owed::OWED_STALE_ON_TIP_SQL.len() - 1];
     for (name, statement, binds, ceiling, unordered) in [
         (
             "#644 signers-backfill candidates",
@@ -131,6 +137,13 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
             vec![],
             PAYOUTS_CANDIDATES_READ_CEILING,
             true,
+        ),
+        (
+            "#643 tip mark at a block reaching no pot",
+            tip_select.to_string(),
+            vec![Value::Integer(958_900)],
+            TIP_MARK_READ_CEILING,
+            false,
         ),
     ] {
         let (expanded, rows) = query(db, &statement, &binds);
