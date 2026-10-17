@@ -3947,6 +3947,8 @@ async fn owed_recompute_inner(
     // `proofmined:` latch is honoured this pass (`owed::latched_proof_mined_spenders`, the seed of the proof set)
     let mut proof_answers: Vec<(String, crate::txany::TxAnyAnswer)> = Vec::new();
     let mut proof_latched: HashSet<String> = HashSet::new();
+    // bsv-low #693 fold-3 (R2-HIGH-1 (a)): the latches this pass's recheck found MOVED, deleted in the snapshot batch
+    let mut proof_latches_moved: Vec<(String, String)> = Vec::new();
     let mut courier_cap_hit = false;
     // bsv-low #662, the L25-WITHHELD lens's LOW-1: the spender look ledger (`owed::SpenderLook`). A spender is
     // WITHHELD only on a noted cap, clock or tail and no look; every read made or answer used, faulted or not, is
@@ -4063,6 +4065,7 @@ async fn owed_recompute_inner(
                 now_ms,
             );
             proof_mined_spenders.extend(proof_latched.iter().cloned());
+            proof_latches_moved = crate::owed::moved_proof_latches(&latches, &canonical);
         }
         // bsv-low #693: the durable spenders no honoured latch covers, newest hop first: phase 2b's candidates are
         // chosen from them, after the tracker's views are rechecked (below)
@@ -4721,6 +4724,16 @@ async fn owed_recompute_inner(
     // covers, in the SAME atomic batch (at most `OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE`): the height and the
     // canonical root the proof was bound against (chaintracks, cached per isolate since the check), never bytes. A
     // root that cannot be read writes no latch this pass (the proof still serves this pass; a later one latches it).
+    // bsv-low #693 fold-3 (the delta lens's R2-HIGH-1 (a)): a latch this pass's recheck found MOVED is DELETED in the
+    // same atomic batch (one statement, before the latch writes; none when nothing moved), so the refusal is durable:
+    // never honoured again by depth or by age, its spender re-asked, a later checked proof latching its new height.
+    if let Some(moved) = crate::owed::moved_proof_latch_delete_bind(&proof_latches_moved) {
+        let moved_stmt = db
+            .prepare(crate::owed::PROOF_LATCH_MOVED_DELETE_SQL)
+            .bind(&[JsValue::from_str(&moved)])
+            .map_err(|e| format!("owed moved latch bind: {e}"))?;
+        stmts.insert(stmts.len() - 1, moved_stmt);
+    }
     let mut proofs_to_latch: Vec<(String, crate::txany::TxAnyAnswer, Option<String>)> = Vec::new();
     for (sp, a) in proof_answers
         .into_iter()
@@ -4755,8 +4768,9 @@ async fn owed_recompute_inner(
         stmts.len()
             <= 4 + 2 * crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE
                 + crate::owed::OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE
+                + 1
                 + crate::owed::OWED_MAX_ROWS,
-        "the batch stays under the row cap + the bookends, the cursor, the ask stamps, the spender-bytes puts and the proof latches"
+        "the batch stays under the row cap + the bookends, the cursor, the ask stamps, the spender-bytes puts, the proof latches and the moved latches' delete"
     );
     let written = crate::d1_ledger::counted_batch(db, stmts)
         .await
