@@ -28,6 +28,13 @@ use worker::*;
 /// so the actor strictly improves staleness while removing the herd.
 const FRESH_MS: u64 = 10_000;
 
+/// bsv-low #642: the board's keyset-cursor pages are cached under keys from
+/// this base, one per held `(cursor, limit)`, at most [`CURSOR_SLOTS`] of them
+/// (a cursor is a client's string, so the set it names is not bounded by the
+/// route; the slots are).
+const CURSOR_KEY_BASE: u32 = 2_000_000;
+const CURSOR_SLOTS: usize = 32;
+
 /// Storage::put_multiple serializes a STRUCT as an object; a serde_json map becomes a JS Map
 /// whose properties the storage API does not store.
 #[derive(serde::Serialize)]
@@ -54,6 +61,9 @@ pub struct BoardView {
     /// Cleared INSIDE the detached task, so an aborted caller can never wedge
     /// a key in "refreshing" forever (the 2026-08-27 layer-9 bug).
     refreshing: Rc<RefCell<HashSet<u32>>>,
+    /// #642: slot `i` holds the `(cursor, limit)` cached under
+    /// `CURSOR_KEY_BASE + i`.
+    cursor_slots: RefCell<Vec<(String, u32)>>,
 }
 
 impl DurableObject for BoardView {
@@ -64,6 +74,7 @@ impl DurableObject for BoardView {
             cache: Rc::new(RefCell::new(HashMap::new())),
             computed: Rc::new(RefCell::new(HashMap::new())),
             refreshing: Rc::new(RefCell::new(HashSet::new())),
+            cursor_slots: RefCell::new(Vec::new()),
         }
     }
 
@@ -205,12 +216,40 @@ impl DurableObject for BoardView {
             .query_pairs()
             .find(|(k, _)| k == "after")
             .and_then(|(_, v)| v.parse::<u32>().ok());
-        let key = after_raw.unwrap_or(0).min(999) * 1000 + limit_raw.unwrap_or(0).min(999);
+        // #642: the keyset cursor (validated by the route).
+        let cursor_raw = url
+            .query_pairs()
+            .find(|(k, _)| k == "cursor")
+            .map(|(_, v)| v.into_owned());
+        let key = match &cursor_raw {
+            None => after_raw.unwrap_or(0).min(999) * 1000 + limit_raw.unwrap_or(0).min(999),
+            Some(c) => match self.cursor_key(c, limit_raw.unwrap_or(0)) {
+                Some(key) => key,
+                // Every slot has a compute in flight: serve this page uncached.
+                None => {
+                    let (status, body) = crate::routes::compute_leaderboard_body_string(
+                        &self.env,
+                        limit_raw,
+                        after_raw,
+                        Some(c),
+                    )
+                    .await?;
+                    return crate::routes::json_response_cached(body, status, 5);
+                }
+            },
+        };
         let env = self.env.clone();
         self.serve_view(key, move || {
             let env = env.clone();
+            let cursor = cursor_raw.clone();
             async move {
-                crate::routes::compute_leaderboard_body_string(&env, limit_raw, after_raw).await
+                crate::routes::compute_leaderboard_body_string(
+                    &env,
+                    limit_raw,
+                    after_raw,
+                    cursor.as_deref(),
+                )
+                .await
             }
         })
         .await
@@ -421,9 +460,10 @@ impl BoardView {
                 cache
                     .borrow_mut()
                     .insert(key, (new_body, Date::now().as_millis()));
-                // Board keys live below 1_000_000 (results pages above) — only
-                // board changes fan out the S3b push.
-                if changed && key < 1_000_000 {
+                // Board keys live below 1_000_000 and from CURSOR_KEY_BASE
+                // (results pages between): only board changes fan out the S3b
+                // push.
+                if changed && !(1_000_000..CURSOR_KEY_BASE).contains(&key) {
                     push_board_changed(&env).await;
                 }
             }
@@ -448,6 +488,36 @@ async fn push_board_changed(env: &Env) {
 }
 
 impl BoardView {
+    /// #642: the cache key of a cursor page. A held `(cursor, limit)` keeps its
+    /// slot; a new one takes a free slot, or the slot whose copy is oldest among
+    /// those with no compute in flight (its copy is dropped). `None` when every
+    /// slot has a compute in flight.
+    fn cursor_key(&self, cursor: &str, limit: u32) -> Option<u32> {
+        let mut slots = self.cursor_slots.borrow_mut();
+        if let Some(i) = slots.iter().position(|(c, l)| c == cursor && *l == limit) {
+            return Some(CURSOR_KEY_BASE + i as u32);
+        }
+        if slots.len() < CURSOR_SLOTS {
+            slots.push((cursor.to_string(), limit));
+            return Some(CURSOR_KEY_BASE + (slots.len() - 1) as u32);
+        }
+        let refreshing = self.refreshing.borrow();
+        let cache = self.cache.borrow();
+        let i = (0..slots.len())
+            .filter(|i| !refreshing.contains(&(CURSOR_KEY_BASE + *i as u32)))
+            .min_by_key(|i| {
+                cache
+                    .get(&(CURSOR_KEY_BASE + *i as u32))
+                    .map_or(0, |(_, at)| *at)
+            })?;
+        drop((refreshing, cache));
+        let key = CURSOR_KEY_BASE + i as u32;
+        self.cache.borrow_mut().remove(&key);
+        self.computed.borrow_mut().remove(&key);
+        slots[i] = (cursor.to_string(), limit);
+        Some(key)
+    }
+
     fn last_compute(&self, key: u32) -> Option<crate::d1_ledger::Tally> {
         self.computed.borrow().get(&key).copied()
     }

@@ -252,3 +252,30 @@ The same merged run measures `/results:view` 256 reads / 8 statements, served
 and 177 identical cursor/hydration pages, max 160/287 reads. Refund, recovery,
 and backup reads are 143, 401, and 10. These merged figures supersede the
 branch-only and inherited recorded baselines for this landing.
+
+## `/leaderboard:view`, the bounded candidate read (bsv-low #642, 2026-10-17)
+
+Before #642 every page walked the whole board four times (the #403 spine, the page owners' pots, the era hands,
+the hands owners' pots, each a full `chain_wins_cte`): 80,189 rows over 16 statements on beta (OBS-RC-D1ROWS). The
+page is now ranked over ONE candidate read, the last `LEADERBOARD_CANDIDATE_WINS` (2,000) counted wins, walked
+backwards on `idx_pot_records_chain_wins` and stopped at the cap (`logic::chain_wins_candidates_sql`). The tier is
+`make ci-d1-board` (a prerequisite of `ci-route`): the shipped pipeline runs natively over the fleet-shaped board
+(`tests/support/d1_board.rs`) and records every statement of three requests; local D1 replays each, rows identical.
+
+| board | request | statements | reads (largest statement) | ceiling (`maxReads` per request / per statement) |
+|---|---|---|---|---|
+| 1,500 wins | page 1, limit 50 | 108 | 28,403 (17,834) | 58,574 / 37,502 |
+| 1,500 wins | page 1, limit 200 | 167 | 34,361 (17,834) | 70,289 / 37,502 |
+| 1,500 wins | page 2 by cursor, limit 50 | 53 | 22,747 (17,834) | 58,574 / 37,502 |
+| 1,500 wins | the whole-board read, page 1, limit 50 | 112 | 76,577 (20,323) | must exceed 58,574 |
+| 3,000 wins | page 1, limit 50 | 143 | 39,049 (25,001) | 58,574 / 37,502 |
+| 3,000 wins | page 1, limit 200 | 217 | 46,859 (25,001) | 70,289 / 37,502 |
+| 3,000 wins | page 2 by cursor, limit 50 | 73 | 31,589 (25,001) | 58,574 / 37,502 |
+| 3,000 wins | the whole-board read, page 1, limit 50 | 212 | 151,781 (40,697) | must exceed 58,574 |
+
+Ceilings are the larger board's figure times 1.5 rounded up (`LEADERBOARD_VIEW_MAX_READS`,
+`LEADERBOARD_VIEW_MAX_READS_PAGE_MAX`, `LEADERBOARD_STATEMENT_MAX_READS`). The candidate read is flat past the
+cap (25,001 at 3,000 wins and at any larger board); the rest of a page follows its owners' pots inside the window.
+Stated: the statement COUNT is the page's own (statuses, classification and markers chunked at 45 pots), unchanged
+by #642 and not held to a ceiling here; #674 (`docs/DESIGN-674-LEADERBOARD-WRITE-TIME.md`) is the read whose
+reads follow the page alone.

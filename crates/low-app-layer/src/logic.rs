@@ -2527,6 +2527,268 @@ pub fn era_hands_sql(written_off_before_ms: Option<i64>) -> String {
     )
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// bsv-low #642 THE BOUNDED CANDIDATE READ (2026-10-17)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The #403 spine above ranks owners by `COUNT(*)` over EVERY counted win of
+// the era, so each page walked the whole board, and the route walked it four
+// times a request (the spine, the page owners' pots, the era hands, the hands
+// owners' pots): 80,189 rows over 16 statements on beta (OBS-RC-D1ROWS). A
+// ranking by an aggregate cannot be paged by an index without the aggregate
+// stored at the write (#674, the next lane). Until then the board is ranked
+// over a BOUNDED candidate set: the most recent [`LEADERBOARD_CANDIDATE_WINS`]
+// counted wins by the pot's own admission stamp, read ONCE per request in index
+// order, every fact the page needs in the same row (the latched owner, the
+// seat resolutions, the winner's earliest verified hand). Ranking, paging and
+// the hands board are Rust over those rows. When the era holds more, the body
+// says so (`candidatesBounded: true`, `candidates: N`): "top N of the last M
+// games", never a complete-looking partial board. Under the bound the served
+// body is byte-identical to the whole-board read's (pinned).
+
+/// The classification fallback's stored BEEFs for `n` txids (the
+/// leaderboard's `pot_beefs` read; named so the #642 plan pin holds it).
+pub fn leaderboard_pot_beefs_sql(n: usize) -> String {
+    let placeholders = vec!["?"; n].join(",");
+    format!("SELECT txid, hex(beef) AS beef FROM pot_beefs WHERE txid IN ({placeholders})")
+}
+
+/// The most recent counted wins a `/leaderboard` request ranks over (#642).
+pub const LEADERBOARD_CANDIDATE_WINS: usize = 2_000;
+
+/// The D1 rows one `/leaderboard:view` page request may read at the default
+/// page, at [`LEADERBOARD_PAGE_MAX`], and in any one of its statements (#642).
+/// Measured on local D1 over the fleet-shaped board (`make ci-d1-board`,
+/// docs/D1-BUDGETS.md): the largest of the 1,500 and 3,000 win boards, 39,049,
+/// 46,859 and 25,001 (the candidate read at the cap), times 1.5 rounded up.
+/// The whole-board read it replaces read 76,577 and 151,781 at the default
+/// page on the same boards.
+pub const LEADERBOARD_VIEW_MAX_READS: u64 = 58_574;
+pub const LEADERBOARD_VIEW_MAX_READS_PAGE_MAX: u64 = 70_289;
+pub const LEADERBOARD_STATEMENT_MAX_READS: u64 = 37_502;
+
+/// The candidate read. BINDS: `?1` = the candidate cap + 1 (the bound probe),
+/// `?2` = the era cutoff (ms) iff configured. One arm per winner verdict, each
+/// walking `idx_pot_records_chain_wins (outputIndex, verdict, spent,
+/// createdAt)` backwards and stopping at `?1` rows; the per-pot seat
+/// resolutions and the hand are computed only for the rows kept. The
+/// predicates are [`chain_wins_cte`]'s, verbatim; `wins` is MATERIALIZED so
+/// each seat resolution runs once per kept row (flattened, SQLite repeats the
+/// correlated subquery at every use of its column); `hand` is
+/// [`era_hands_sql`]'s marker for the pot (its `rn = 1`) as a JSON object with
+/// its SQL score.
+pub fn chain_wins_candidates_sql(written_off_before_ms: Option<i64>) -> String {
+    let era = era_filter_sql("p.createdAt", "?2", written_off_before_ms);
+    let arm = |verdict: &str| {
+        format!(
+            "SELECT rid, potCreatedAt FROM ( \
+               SELECT p.rowid AS rid, p.createdAt AS potCreatedAt \
+                 FROM pot_records p \
+                 LEFT JOIN network_seen ns ON p.spendingTxid IS NOT NULL \
+                      AND ns.txid = lower(p.spendingTxid) \
+                WHERE p.outputIndex = {vout} \
+                  AND p.verdict = '{verdict}' \
+                  AND p.spent = 1 \
+                  AND p.paramsDecoded = 1 \
+                  AND p.pubA IS NOT NULL AND p.pubB IS NOT NULL \
+                  AND p.spendingTxid IS NOT NULL \
+                  AND p.verdictTxid = p.spendingTxid \
+                  AND (p.spentConfirmed = 1 OR (ns.txid IS NOT NULL AND p.spenderFinal = 1)){era} \
+                ORDER BY p.createdAt DESC, p.rowid DESC \
+                LIMIT ?1)",
+            vout = LEADERBOARD_POT_VOUT,
+        )
+    };
+    let slot = |key: &str| {
+        format!(
+            "(SELECT CASE WHEN COUNT(DISTINCT lower(q.identity)) = 1 \
+                          THEN MIN(lower(q.identity)) END \
+                FROM potparty_records q \
+               WHERE q.potTxid = p.txid AND q.potVout = p.outputIndex \
+                 AND q.sigValid = 1 \
+                 AND lower(q.seatSettlePubkey) = lower(p.{key}))"
+        )
+    };
+    format!(
+        "WITH recent AS ( \
+           {a} UNION ALL {b} \
+           ORDER BY potCreatedAt DESC, rid DESC LIMIT ?1 \
+         ), \
+         wins AS MATERIALIZED ( \
+           SELECT p.txid AS potTxid, lower(p.spendingTxid) AS settleTxid, \
+                  p.verdict AS verdict, lower(p.pubA) AS pubA, lower(p.pubB) AS pubB, \
+                  p.settleSigners AS settleSigners, r.potCreatedAt AS potCreatedAt, \
+                  r.rid AS potRowid, {slot_a} AS slotA, {slot_b} AS slotB \
+             FROM recent r JOIN pot_records p ON p.rowid = r.rid \
+         ), \
+         owned AS ( \
+           SELECT w.potTxid, w.settleTxid, w.verdict, w.pubA, w.pubB, w.settleSigners, \
+                  w.potCreatedAt, w.potRowid, \
+                  CASE WHEN w.pubA = w.pubB THEN NULL ELSE w.slotA END AS identityA, \
+                  CASE WHEN w.pubA = w.pubB THEN NULL ELSE w.slotB END AS identityB, \
+                  CASE WHEN w.pubA = w.pubB THEN NULL \
+                       WHEN w.verdict = 'winner-a' THEN w.slotA \
+                       ELSE w.slotB END AS winnerIdentity, \
+                  CASE WHEN w.verdict = 'winner-a' THEN w.pubA ELSE w.pubB END AS winKey \
+             FROM wins w \
+         ) \
+         SELECT COALESCE(o.winnerIdentity, o.winKey) AS owner, \
+                CASE WHEN o.winnerIdentity IS NULL THEN 1 ELSE 0 END AS identityIsKey, \
+                o.potTxid, o.settleTxid, o.verdict, o.pubA, o.pubB, o.settleSigners, \
+                o.identityA, o.identityB, o.potCreatedAt, o.potRowid, \
+                CASE WHEN o.winnerIdentity IS NULL THEN NULL ELSE ( \
+                  SELECT json_object('gameId', m.gameId, 'winner', m.winner, 'loser', m.loser, \
+                                     'potTxid', m.potTxid, 'settleTxid', m.settleTxid, \
+                                     'winnerSigHex', m.winnerSigHex, 'loserSigHex', m.loserSigHex, \
+                                     'cardsHex', m.cardsHex, 'txid', m.txid, \
+                                     'createdAt', m.createdAt, 'claimValid', m.claimValid, \
+                                     'handScore', ({score})) \
+                    FROM result_markers_v2 m \
+                   WHERE m.potTxid = o.potTxid \
+                     AND lower(m.winner) = o.winnerIdentity \
+                     AND lower(m.settleTxid) = o.settleTxid \
+                     AND m.claimValid IN (1, 2) \
+                     AND m.cardsHex IS NOT NULL AND length(m.cardsHex) = 10 \
+                   ORDER BY m.createdAt ASC, m.rowid ASC LIMIT 1) END AS hand \
+           FROM owned o \
+          ORDER BY o.potCreatedAt DESC, o.potRowid DESC",
+        a = arm("winner-a"),
+        b = arm("winner-b"),
+        slot_a = slot("pubA"),
+        slot_b = slot("pubB"),
+        score = sql_hand_score_expr("m.cardsHex"),
+    )
+}
+
+/// The ordering facts of a candidate's hand (the [`era_hands_sql`] order:
+/// SQL score, then the claim's `createdAt`, then `gameId`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateHand {
+    pub score: i64,
+    pub created_at: Option<i64>,
+    pub game_id: String,
+}
+
+/// One candidate win: the row the owners query served, its admission stamp,
+/// and its hand's ordering facts when it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainWinCandidate {
+    pub row: ChainWinPotRow,
+    /// The pot's admission stamp (`potCreatedAt`; NULL sorts last, as in SQL).
+    pub pot_created_at: Option<i64>,
+    pub hand: Option<CandidateHand>,
+}
+
+/// Where a page starts: the deployed client's rank offset (`?after`), or the
+/// keyset cursor (`?cursor`, the last served owner's `(wins, owner)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageStart {
+    Offset(usize),
+    After { wins: usize, owner: String },
+}
+
+/// Parse `?cursor` (`<wins>.<owner>`, the body's own `nextCursor`): `None` when
+/// it is not one this route served (the route answers 400).
+pub fn parse_leaderboard_cursor(raw: &str) -> Option<PageStart> {
+    let (wins, owner) = raw.split_once('.')?;
+    let wins: usize = wins.parse().ok()?;
+    let ok = !owner.is_empty()
+        && owner.len() <= 130
+        && owner
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    ok.then(|| PageStart::After {
+        wins,
+        owner: owner.to_string(),
+    })
+}
+
+/// The page cut from the ranked candidates: what the #403 spine, the owners
+/// query and the era hands query answered, in their orders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidatePage {
+    /// The page's owners in rank order (`wins DESC, owner ASC`).
+    pub owners: Vec<String>,
+    pub truncated: bool,
+    pub next_after: Option<usize>,
+    /// The keyset cursor of the next page (`<wins>.<owner>` of this page's
+    /// last owner), when `truncated`.
+    pub next_cursor: Option<String>,
+    /// The page owners' wins in [`chain_wins_owners_sql`]'s order, per chunk
+    /// of [`D1_CHUNK_OUTPOINTS`] owners (the route's chunking).
+    pub pot_rows: Vec<ChainWinPotRow>,
+    /// Indices into the candidates of the hands board, in [`era_hands_sql`]'s
+    /// order, at most `hands_limit`.
+    pub hands: Vec<usize>,
+}
+
+/// Rank the candidates (`wins DESC, owner ASC`, [`chain_wins_spine_sql`]'s
+/// order and grouping), cut the page at `start`, and order the page's pots and
+/// the hands board as the whole-board queries did.
+pub fn leaderboard_candidate_page(
+    cands: &[ChainWinCandidate],
+    start: &PageStart,
+    page: usize,
+    hands_limit: usize,
+) -> CandidatePage {
+    let mut wins: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for c in cands {
+        *wins.entry(c.row.owner.as_str()).or_insert(0) += 1;
+    }
+    let mut ranked: Vec<(&str, usize)> = wins.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let first = match start {
+        PageStart::Offset(after) => (*after).min(ranked.len()),
+        PageStart::After { wins, owner } => ranked
+            .iter()
+            .position(|(o, w)| *w < *wins || (*w == *wins && *o > owner.as_str()))
+            .unwrap_or(ranked.len()),
+    };
+    let shown = &ranked[first..(first + page).min(ranked.len())];
+    let truncated = ranked.len() > first + page;
+    let owners: Vec<String> = shown.iter().map(|(o, _)| o.to_string()).collect();
+    let next_cursor = truncated
+        .then(|| shown.last().map(|(o, w)| format!("{w}.{o}")))
+        .flatten();
+    let mut pot_rows = Vec::new();
+    for chunk in owners.chunks(D1_CHUNK_OUTPOINTS) {
+        let mut rows: Vec<&ChainWinCandidate> = cands
+            .iter()
+            .filter(|c| chunk.contains(&c.row.owner))
+            .collect();
+        rows.sort_by(|a, b| {
+            a.row
+                .owner
+                .cmp(&b.row.owner)
+                .then_with(|| b.pot_created_at.cmp(&a.pot_created_at))
+                .then_with(|| a.row.pot_txid.cmp(&b.row.pot_txid))
+        });
+        pot_rows.extend(rows.into_iter().map(|c| c.row.clone()));
+    }
+    let mut hands: Vec<usize> = (0..cands.len())
+        .filter(|&i| cands[i].hand.is_some())
+        .collect();
+    hands.sort_by(|&a, &b| {
+        let (x, y) = (
+            cands[a].hand.as_ref().unwrap(),
+            cands[b].hand.as_ref().unwrap(),
+        );
+        x.score
+            .cmp(&y.score)
+            .then_with(|| x.created_at.cmp(&y.created_at))
+            .then_with(|| x.game_id.cmp(&y.game_id))
+    });
+    hands.truncate(hands_limit);
+    CandidatePage {
+        owners,
+        truncated,
+        next_after: leaderboard_next_after(first, page, truncated),
+        next_cursor,
+        pot_rows,
+        hands,
+    }
+}
+
 /// One row of [`chain_wins_owners_sql`] — a counted win with its owner and
 /// the latched seat identities.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2717,6 +2979,36 @@ pub fn leaderboard_body(
     truncated: bool,
     next_after: Option<usize>,
 ) -> String {
+    leaderboard_body_paged(
+        lb,
+        computed_at,
+        result_count,
+        truncated,
+        next_after,
+        &LeaderboardPageExtras::default(),
+    )
+}
+
+/// The fields the #642 candidate read adds to the body, each only when it has
+/// something to say, so a body without them is the pre-#642 bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeaderboardPageExtras {
+    /// `nextCursor`: the keyset cursor of the next page (`?cursor=`).
+    pub next_cursor: Option<String>,
+    /// `candidates` with `candidatesBounded: true`: the era holds more counted
+    /// wins than the read ranked, so the board is the top of the last N games.
+    pub candidates_bounded: Option<usize>,
+}
+
+/// [`leaderboard_body`] with the #642 fields.
+pub fn leaderboard_body_paged(
+    lb: &Leaderboard,
+    computed_at: i64,
+    result_count: usize,
+    truncated: bool,
+    next_after: Option<usize>,
+    extras: &LeaderboardPageExtras,
+) -> String {
     let board: Vec<serde_json::Value> = lb
         .board
         .iter()
@@ -2846,15 +3138,25 @@ pub fn leaderboard_body(
             })
         })
         .collect();
-    json!({
+    let mut body = json!({
         "board": board,
         "hands": hands,
         "computedAt": computed_at,
         "resultCount": result_count,
         "truncated": truncated,
         "nextAfter": next_after,
-    })
-    .to_string()
+    });
+    let m = body
+        .as_object_mut()
+        .expect("the leaderboard body serializes to a JSON object");
+    if let Some(c) = &extras.next_cursor {
+        m.insert("nextCursor".to_string(), json!(c));
+    }
+    if let Some(n) = extras.candidates_bounded {
+        m.insert("candidates".to_string(), json!(n));
+        m.insert("candidatesBounded".to_string(), json!(true));
+    }
+    body.to_string()
 }
 
 #[cfg(test)]

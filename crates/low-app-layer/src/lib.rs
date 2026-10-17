@@ -132,6 +132,7 @@ pub use bsv_middleware_cloudflare::AuthSessionStore;
 pub mod armed_pots;
 pub mod auth;
 pub mod beef_guard;
+pub mod board_db;
 pub mod compaction;
 pub mod cors;
 pub mod courier;

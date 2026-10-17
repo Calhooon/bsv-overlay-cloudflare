@@ -30,10 +30,10 @@ use crate::auth::{AuthState, IdentityDecision};
 use crate::logic::{
     assemble_pots_view, assemble_recovery_view, assemble_statuses, attach_evictions,
     batch_where_sql, beef_body, chunk_outpoints, decode_beef_hex, distinct_db_txids,
-    evictions_by_txid_sql, health_body, leaderboard_body, parse_outpoints, parse_present_height,
-    pots_view_body, pots_view_join_sql, recovery_view_body, recovery_view_sql, tip_body,
-    utxo_status_body, valid_identity, valid_txid, EvictionLedgerRow, Outpoint, PotRecordRow,
-    PotsViewRow, RecoveryRow, ResultMarkerRow,
+    evictions_by_txid_sql, health_body, parse_outpoints, parse_present_height, pots_view_body,
+    pots_view_join_sql, recovery_view_body, recovery_view_sql, tip_body, utxo_status_body,
+    valid_identity, valid_txid, EvictionLedgerRow, Outpoint, PotRecordRow, PotsViewRow,
+    RecoveryRow, ResultMarkerRow,
 };
 
 /// The chaintracks present-height endpoint, fetched through the service
@@ -1140,6 +1140,17 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         .query_pairs()
         .find(|(k, _)| k == "after")
         .and_then(|(_, v)| v.parse::<u32>().ok());
+    // #642: the keyset cursor (the body's `nextCursor`). One this route did not
+    // serve is refused here, before the actor is asked.
+    let cursor_raw = url
+        .query_pairs()
+        .find(|(k, _)| k == "cursor")
+        .map(|(_, v)| v.into_owned());
+    if let Some(c) = &cursor_raw {
+        if crate::logic::parse_leaderboard_cursor(c).is_none() {
+            return json_error("invalid cursor", 400);
+        }
+    }
     if let Ok(ns) = ctx.env.durable_object("BOARD_VIEW") {
         if let Ok(stub) = ns.id_from_name("board:v1").and_then(|id| id.get_stub()) {
             let mut q: Vec<String> = Vec::new();
@@ -1148,6 +1159,9 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
             }
             if let Some(a) = after_raw {
                 q.push(format!("after={a}"));
+            }
+            if let Some(c) = &cursor_raw {
+                q.push(format!("cursor={c}"));
             }
             let q = if q.is_empty() {
                 String::new()
@@ -1168,7 +1182,9 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
             }
         }
     }
-    let (status, body) = compute_leaderboard_body_string(&ctx.env, limit_raw, after_raw).await?;
+    let (status, body) =
+        compute_leaderboard_body_string(&ctx.env, limit_raw, after_raw, cursor_raw.as_deref())
+            .await?;
     json_response_cached(body, status, 15)
 }
 
@@ -1217,9 +1233,16 @@ pub async fn compute_leaderboard_body_string(
     env: &worker::Env,
     limit_raw: Option<u32>,
     after_raw: Option<u32>,
+    cursor_raw: Option<&str>,
 ) -> Result<(u16, String)> {
     let page = crate::logic::clamp_leaderboard_page(limit_raw);
-    let after = crate::logic::clamp_leaderboard_after(after_raw);
+    let start = match cursor_raw {
+        Some(raw) => match crate::logic::parse_leaderboard_cursor(raw) {
+            Some(start) => start,
+            None => return Ok((400, "{\"error\":\"invalid cursor\"}".to_string())),
+        },
+        None => crate::logic::PageStart::Offset(crate::logic::clamp_leaderboard_after(after_raw)),
+    };
 
     let db = match env.d1("OVERLAY_DB") {
         Ok(db) => db,
@@ -1229,63 +1252,64 @@ pub async fn compute_leaderboard_body_string(
         }
     };
     let era = written_off_before_ms_env(env);
+    let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
+    Ok(leaderboard_page_body(
+        &crate::board_db::D1Board(&db),
+        page,
+        &start,
+        era,
+        crate::logic::LEADERBOARD_CANDIDATE_WINS,
+        computed_at,
+    )
+    .await)
+}
 
-    // 1) The owner page (the counting spine, whole era).
-    let mut binds: Vec<JsValue> = vec![
-        JsValue::from_f64((page + 1) as f64),
-        JsValue::from_f64(after as f64),
-    ];
+/// The #642 pipeline over the [`crate::board_db::BoardDb`] port (the Worker's
+/// D1, or rusqlite in the native pins): ONE candidate read
+/// ([`crate::logic::chain_wins_candidates_sql`], at most `candidate_cap`
+/// counted wins), the page, the hands board and the hands pots' attribution
+/// cut from it in Rust ([`crate::logic::leaderboard_candidate_page`]), then
+/// steps 3 to 6 of [`compute_leaderboard_body_string`] unchanged.
+pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
+    db: &B,
+    page: usize,
+    start: &crate::logic::PageStart,
+    era: Option<i64>,
+    candidate_cap: usize,
+    computed_at: i64,
+) -> (u16, String) {
+    use crate::board_db::{warn, Bind};
+
+    // 1) + 2) The candidates: the page, its owners' pots and the hands board.
+    let mut binds = vec![Bind::Num((candidate_cap + 1) as f64)];
     if let Some(ms) = era {
-        binds.push(era_bind(ms));
+        binds.push(Bind::Num(ms as f64));
     }
-    let stmt = db
-        .prepare(crate::logic::chain_wins_spine_sql(era))
-        .bind(&binds)?;
-    let mut owner_rows: Vec<OwnerRowD1> = match stmt
-        .counted_all()
+    let rows: Vec<ChainWinCandidateRowD1> = match db
+        .all(crate::logic::chain_wins_candidates_sql(era), binds)
         .await
-        .and_then(|r| r.results::<OwnerRowD1>())
     {
         Ok(rows) => rows,
         Err(e) => {
-            console_warn!("[leaderboard] chain-wins spine query failed: {e}");
-            return Ok((503, "{\"error\":\"database query failed\"}".to_string()));
+            warn(&format!(
+                "[leaderboard] chain-wins candidates query failed: {e}"
+            ));
+            return (503, "{\"error\":\"database query failed\"}".to_string());
         }
     };
-    let truncated = owner_rows.len() > page;
-    owner_rows.truncate(page);
-    let owners: Vec<String> = owner_rows
-        .iter()
-        .map(|r| r.owner.to_ascii_lowercase())
-        .collect();
-    let next_after = crate::logic::leaderboard_next_after(after, page, truncated);
-    let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
-
-    // 2) The page owners' counted pots (chunked at the D1 bind cap).
-    let mut pot_rows: Vec<crate::logic::ChainWinPotRow> = Vec::new();
-    for chunk in owners.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-        // Bind order is a pinned fact: era slot FIRST (bound even when
-        // unreferenced), then the owners — `chain_wins_owner_binds_era_first`.
-        let mut b: Vec<JsValue> = vec![era.map(era_bind).unwrap_or_else(|| JsValue::from_f64(0.0))];
-        debug_assert!(crate::logic::chain_wins_owner_binds_era_first());
-        for o in chunk {
-            b.push(JsValue::from_str(o));
-        }
-        let stmt = db
-            .prepare(crate::logic::chain_wins_owners_sql(chunk.len(), era))
-            .bind(&b)?;
-        match stmt
-            .counted_all()
-            .await
-            .and_then(|r| r.results::<ChainWinPotRowD1>())
-        {
-            Ok(rows) => pot_rows.extend(rows.into_iter().map(ChainWinPotRowD1::into_row)),
-            Err(e) => {
-                console_warn!("[leaderboard] chain-wins owners query failed: {e}");
-                return Ok((503, "{\"error\":\"database query failed\"}".to_string()));
-            }
-        }
+    let bounded = rows.len() > candidate_cap;
+    let mut cands: Vec<crate::logic::ChainWinCandidate> = Vec::with_capacity(rows.len());
+    let mut hand_markers: Vec<Option<ResultMarkerRow>> = Vec::with_capacity(rows.len());
+    for r in rows.into_iter().take(candidate_cap) {
+        let (c, m) = r.into_candidate();
+        cands.push(c);
+        hand_markers.push(m);
     }
+    let sel = crate::logic::leaderboard_candidate_page(&cands, start, page, page);
+    let truncated = sel.truncated;
+    let next_after = sel.next_after;
+    let owners = sel.owners;
+    let pot_rows = sel.pot_rows;
 
     // 3) Statuses (the SAME table /utxo-status reads) — FAIL-SAFE 503.
     let mut outpoints: Vec<crate::logic::Outpoint> = Vec::new();
@@ -1302,28 +1326,25 @@ pub async fn compute_leaderboard_body_string(
     }
     let mut status_rows: Vec<PotRecordRow> = Vec::with_capacity(outpoints.len());
     for chunk in chunk_outpoints(&outpoints) {
-        let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+        let mut b: Vec<Bind> = Vec::with_capacity(chunk.len() * 2);
         for op in chunk {
-            b.push(JsValue::from_str(&op.db_txid()));
-            b.push(JsValue::from_f64(f64::from(op.vout)));
+            b.push(Bind::Text(op.db_txid()));
+            b.push(Bind::Num(f64::from(op.vout)));
         }
-        let stmt = db.prepare(batch_where_sql(chunk.len())).bind(&b)?;
-        match stmt
-            .counted_all()
-            .await
-            .and_then(|r| r.results::<PotRowD1>())
-        {
+        match db.all::<PotRowD1>(batch_where_sql(chunk.len()), b).await {
             Ok(rows) => status_rows.extend(rows.into_iter().map(PotRowD1::into_row)),
             Err(e) => {
-                console_warn!("[leaderboard] pot_records batch query failed: {e}");
-                return Ok((503, "{\"error\":\"database query failed\"}".to_string()));
+                warn(&format!(
+                    "[leaderboard] pot_records batch query failed: {e}"
+                ));
+                return (503, "{\"error\":\"database query failed\"}".to_string());
             }
         }
     }
     let statuses = assemble_statuses(&outpoints, &status_rows);
     // Classification (column tier — verdict, committed params, signers) for
-    // the page's pots; attribution from the spine's own latched resolution.
-    let (verdicts, params_by_pot, signers_by_pot) = classify_spent_pots(&db, &statuses).await;
+    // the page's pots; attribution from the candidates' own latched resolution.
+    let (verdicts, params_by_pot, signers_by_pot) = classify_spent_pots(db, &statuses).await;
     let attributions = crate::logic::attributions_from_pot_rows(&pot_rows);
 
     // 4) Decoration — BEST-EFFORT: a fault omits decoration, never a count.
@@ -1342,21 +1363,10 @@ pub async fn compute_leaderboard_body_string(
     };
     let pot_txids: Vec<String> = outpoints.iter().map(|o| o.txid.clone()).collect();
     for chunk in pot_txids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-        let b: Vec<JsValue> = chunk.iter().map(|t| JsValue::from_str(t)).collect();
-        let stmt = match db
-            .prepare(crate::logic::pot_markers_sql(chunk.len()))
-            .bind(&b)
-        {
-            Ok(s) => s,
-            Err(e) => {
-                console_warn!("[leaderboard] pot markers bind failed (decoration omitted): {e}");
-                continue;
-            }
-        };
-        match stmt
-            .counted_all()
+        let b: Vec<Bind> = chunk.iter().map(|t| Bind::Text(t.clone())).collect();
+        match db
+            .all::<ResultRowD1>(crate::logic::pot_markers_sql(chunk.len()), b)
             .await
-            .and_then(|r| r.results::<ResultRowD1>())
         {
             Ok(rows) => {
                 for m in rows.into_iter().filter_map(ResultRowD1::into_marker) {
@@ -1364,31 +1374,16 @@ pub async fn compute_leaderboard_body_string(
                 }
             }
             Err(e) => {
-                console_warn!("[leaderboard] pot markers query failed (decoration omitted): {e}");
+                warn(&format!(
+                    "[leaderboard] pot markers query failed (decoration omitted): {e}"
+                ));
             }
         }
     }
-    {
-        let mut b: Vec<JsValue> = vec![JsValue::from_f64(page as f64)];
-        if let Some(ms) = era {
-            b.push(era_bind(ms));
-        }
-        match db.prepare(crate::logic::era_hands_sql(era)).bind(&b) {
-            Ok(stmt) => match stmt
-                .counted_all()
-                .await
-                .and_then(|r| r.results::<ResultRowD1>())
-            {
-                Ok(rows) => {
-                    for m in rows.into_iter().filter_map(ResultRowD1::into_marker) {
-                        push_marker(m);
-                    }
-                }
-                Err(e) => {
-                    console_warn!("[leaderboard] era hands query failed (hands omitted): {e}")
-                }
-            },
-            Err(e) => console_warn!("[leaderboard] era hands bind failed (hands omitted): {e}"),
+    // The hands board, from the candidates (the era hands query's rows).
+    for &i in &sel.hands {
+        if let Some(m) = hand_markers[i].clone() {
+            push_marker(m);
         }
     }
     // The hands pots may lie beyond the page: their statuses/verdicts are
@@ -1416,78 +1411,40 @@ pub async fn compute_leaderboard_body_string(
         } else {
             let mut extra_rows: Vec<PotRecordRow> = Vec::new();
             for chunk in chunk_outpoints(&extra_outpoints) {
-                let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+                let mut b: Vec<Bind> = Vec::with_capacity(chunk.len() * 2);
                 for op in chunk {
-                    b.push(JsValue::from_str(&op.db_txid()));
-                    b.push(JsValue::from_f64(f64::from(op.vout)));
+                    b.push(Bind::Text(op.db_txid()));
+                    b.push(Bind::Num(f64::from(op.vout)));
                 }
-                match db.prepare(batch_where_sql(chunk.len())).bind(&b) {
-                    Ok(stmt) => match stmt
-                        .counted_all()
-                        .await
-                        .and_then(|r| r.results::<PotRowD1>())
-                    {
-                        Ok(rows) => extra_rows.extend(rows.into_iter().map(PotRowD1::into_row)),
-                        Err(e) => console_warn!(
-                            "[leaderboard] hands pots status query failed (hands omitted): {e}"
-                        ),
-                    },
-                    Err(e) => {
-                        console_warn!(
-                            "[leaderboard] hands pots status bind failed (hands omitted): {e}"
-                        )
-                    }
+                match db.all::<PotRowD1>(batch_where_sql(chunk.len()), b).await {
+                    Ok(rows) => extra_rows.extend(rows.into_iter().map(PotRowD1::into_row)),
+                    Err(e) => warn(&format!(
+                        "[leaderboard] hands pots status query failed (hands omitted): {e}"
+                    )),
                 }
             }
             let extra_statuses = assemble_statuses(&extra_outpoints, &extra_rows);
-            let (ev, ep, es) = classify_spent_pots(&db, &extra_statuses).await;
-            // The hands pots' attribution comes from the SAME spine resolution
-            // (the era_hands query only emits identity-resolved winners), read
-            // back through the owners query for exactly those pots' owners.
+            let (ev, ep, es) = classify_spent_pots(db, &extra_statuses).await;
+            // The hands pots' attribution comes from the SAME candidate
+            // resolution (the hands are only identity-resolved winners): every
+            // candidate win of those pots' winners, as the owners query read
+            // them before #642.
             let mut hands_attr = attributions;
-            let hands_owners: Vec<String> = {
-                let mut v: Vec<String> = markers
-                    .iter()
-                    .filter(|m| {
-                        extra_outpoints
-                            .iter()
-                            .any(|o| o.txid.eq_ignore_ascii_case(&m.pot_txid))
-                    })
-                    .map(|m| m.winner.to_ascii_lowercase())
-                    .collect();
-                v.sort();
-                v.dedup();
-                v
-            };
-            for chunk in hands_owners.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-                let mut b: Vec<JsValue> =
-                    vec![era.map(era_bind).unwrap_or_else(|| JsValue::from_f64(0.0))];
-                for o in chunk {
-                    b.push(JsValue::from_str(o));
-                }
-                match db
-                    .prepare(crate::logic::chain_wins_owners_sql(chunk.len(), era))
-                    .bind(&b)
-                {
-                    Ok(stmt) => match stmt
-                        .counted_all()
-                        .await
-                        .and_then(|r| r.results::<ChainWinPotRowD1>())
-                    {
-                        Ok(rows) => {
-                            let rows: Vec<crate::logic::ChainWinPotRow> =
-                                rows.into_iter().map(ChainWinPotRowD1::into_row).collect();
-                            hands_attr.extend(crate::logic::attributions_from_pot_rows(&rows));
-                        }
-                        Err(e) => console_warn!(
-                        "[leaderboard] hands owners query failed (hands attribution omitted): {e}"
-                    ),
-                    },
-                    Err(e) => console_warn!(
-                        "[leaderboard] hands owners bind failed (hands attribution omitted): {e}"
-                    ),
-                }
-            }
+            let hands_owners: std::collections::HashSet<String> = markers
+                .iter()
+                .filter(|m| {
+                    extra_outpoints
+                        .iter()
+                        .any(|o| o.txid.eq_ignore_ascii_case(&m.pot_txid))
+                })
+                .map(|m| m.winner.to_ascii_lowercase())
+                .collect();
+            let rows: Vec<crate::logic::ChainWinPotRow> = cands
+                .iter()
+                .filter(|c| hands_owners.contains(&c.row.owner))
+                .map(|c| c.row.clone())
+                .collect();
+            hands_attr.extend(crate::logic::attributions_from_pot_rows(&rows));
             let mut statuses = statuses;
             statuses.extend(extra_statuses);
             let mut verdicts = verdicts;
@@ -1505,22 +1462,68 @@ pub async fn compute_leaderboard_body_string(
             )
         };
 
+    // 5) + 6) The fold, cut to the page, then the #685 decoration.
+    let (lb, result_count) = leaderboard_fold_and_decorate(
+        db,
+        &markers,
+        &statuses,
+        page,
+        &verdicts,
+        &attributions,
+        &params_by_pot,
+        &signers_by_pot,
+        &owners,
+    )
+    .await;
+    let extras = crate::logic::LeaderboardPageExtras {
+        next_cursor: sel.next_cursor,
+        candidates_bounded: bounded.then_some(candidate_cap),
+    };
+    (
+        200,
+        crate::logic::leaderboard_body_paged(
+            &lb,
+            computed_at,
+            result_count,
+            truncated,
+            next_after,
+            &extras,
+        ),
+    )
+}
+
+/// Steps 5 and 6 of [`compute_leaderboard_body_string`]: the fold (UNCHANGED),
+/// the cut to the page's owners, and the #685 proof decoration over the
+/// page-local set. Returns the board and `resultCount` (the markers read).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn leaderboard_fold_and_decorate<B: crate::board_db::BoardDb>(
+    db: &B,
+    markers: &[ResultMarkerRow],
+    statuses: &[crate::logic::OutpointStatus],
+    page: usize,
+    verdicts: &std::collections::HashMap<String, crate::results::PotVerdict>,
+    attributions: &std::collections::HashMap<String, crate::results::SeatAttribution>,
+    params_by_pot: &std::collections::HashMap<String, crate::results::CovenantParams>,
+    signers_by_pot: &std::collections::HashMap<String, String>,
+    owners: &[String],
+) -> (crate::logic::Leaderboard, usize) {
+    use crate::board_db::{warn, Bind};
     // 5) The fold (UNCHANGED) — wins minted from chain facts, the winner's own
     // verified marker decorating — then cut to the page in rank order. Proof
     // decoration is DEFERRED to the page-local set below (#685): the aggregator
     // is handed NO pointers, so the budget is spent on the served rows in
     // display priority, not on an incidental marker-order prefix.
     let mut lb = crate::logic::aggregate_leaderboard_attributed(
-        &markers,
-        &statuses,
+        markers,
+        statuses,
         &std::collections::HashMap::new(),
         page,
-        &verdicts,
-        &attributions,
-        &params_by_pot,
-        &signers_by_pot,
+        verdicts,
+        attributions,
+        params_by_pot,
+        signers_by_pot,
     );
-    crate::logic::retain_page_owners(&mut lb, &owners);
+    crate::logic::retain_page_owners(&mut lb, owners);
 
     // Proof DECORATION as a budget of ROOM over the PAGE-LOCAL evidence set,
     // ordered by display priority (bsv-low #685, RC-L32): the lowest-hand
@@ -1542,25 +1545,14 @@ pub async fn compute_leaderboard_body_string(
     let mut proof_map: std::collections::HashMap<(String, String), Vec<String>> =
         std::collections::HashMap::new();
     for chunk in decorate_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-        let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+        let mut b: Vec<Bind> = Vec::with_capacity(chunk.len() * 2);
         for (g, w) in chunk {
-            b.push(JsValue::from_str(g));
-            b.push(JsValue::from_str(w));
+            b.push(Bind::Text(g.clone()));
+            b.push(Bind::Text(w.clone()));
         }
-        let stmt = match db
-            .prepare(crate::logic::proof_pointers_sql(chunk.len()))
-            .bind(&b)
-        {
-            Ok(s) => s,
-            Err(e) => {
-                console_warn!("[leaderboard] proof_markers bind failed (proofTxid omitted): {e}");
-                continue;
-            }
-        };
-        match stmt
-            .counted_all()
+        match db
+            .all::<ProofPointerRowD1>(crate::logic::proof_pointers_sql(chunk.len()), b)
             .await
-            .and_then(|r| r.results::<ProofPointerRowD1>())
         {
             Ok(rows) => {
                 for pr in rows {
@@ -1573,9 +1565,9 @@ pub async fn compute_leaderboard_body_string(
                         .push(pr.txid);
                 }
             }
-            Err(e) => {
-                console_warn!("[leaderboard] proof_markers query failed (proofTxid omitted): {e}")
-            }
+            Err(e) => warn(&format!(
+                "[leaderboard] proof_markers query failed (proofTxid omitted): {e}"
+            )),
         }
     }
 
@@ -1584,25 +1576,14 @@ pub async fn compute_leaderboard_body_string(
     // count). BEST-EFFORT.
     let mut posted: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for chunk in decorate_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-        let mut b: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+        let mut b: Vec<Bind> = Vec::with_capacity(chunk.len() * 2);
         for (g, w) in chunk {
-            b.push(JsValue::from_str(g));
-            b.push(JsValue::from_str(w));
+            b.push(Bind::Text(g.clone()));
+            b.push(Bind::Text(w.clone()));
         }
-        let stmt = match db
-            .prepare(crate::proof_post::proof_posted_sql(chunk.len()))
-            .bind(&b)
-        {
-            Ok(s) => s,
-            Err(e) => {
-                console_warn!("[leaderboard] proof_posts bind failed (proofPosted omitted): {e}");
-                continue;
-            }
-        };
-        match stmt
-            .counted_all()
+        match db
+            .all::<ProofPostedRowD1>(crate::proof_post::proof_posted_sql(chunk.len()), b)
             .await
-            .and_then(|r| r.results::<ProofPostedRowD1>())
         {
             Ok(rows) => {
                 for pr in rows {
@@ -1612,9 +1593,9 @@ pub async fn compute_leaderboard_body_string(
                     ));
                 }
             }
-            Err(e) => {
-                console_warn!("[leaderboard] proof_posts query failed (proofPosted omitted): {e}")
-            }
+            Err(e) => warn(&format!(
+                "[leaderboard] proof_posts query failed (proofPosted omitted): {e}"
+            )),
         }
     }
 
@@ -1628,27 +1609,14 @@ pub async fn compute_leaderboard_body_string(
             budget_hits as u64,
         );
     }
-
-    Ok((
-        200,
-        leaderboard_body(&lb, computed_at, markers.len(), truncated, next_after),
-    ))
+    (lb, markers.len())
 }
 
-/// One owner-page row of the #403 chain-wins spine.
+/// One row of the #642 candidate read
+/// ([`crate::logic::chain_wins_candidates_sql`]): the owners query's columns,
+/// the pot's stamp and rowid, and the winner's hand marker as JSON.
 #[derive(Deserialize)]
-struct OwnerRowD1 {
-    owner: String,
-    #[serde(rename = "identityIsKey", default)]
-    #[allow(dead_code)]
-    identity_is_key: Option<f64>,
-    #[allow(dead_code)]
-    wins: Option<f64>,
-}
-
-/// One counted-win row of the #403 owners query.
-#[derive(Deserialize)]
-struct ChainWinPotRowD1 {
+struct ChainWinCandidateRowD1 {
     owner: String,
     #[serde(rename = "identityIsKey", default)]
     identity_is_key: Option<f64>,
@@ -1667,22 +1635,55 @@ struct ChainWinPotRowD1 {
     identity_a: Option<String>,
     #[serde(rename = "identityB", default)]
     identity_b: Option<String>,
+    #[serde(rename = "potCreatedAt", default)]
+    pot_created_at: Option<f64>,
+    /// The hand marker (`json_object` of the `result_markers_v2` columns plus
+    /// `handScore`), or NULL.
+    #[serde(default)]
+    hand: Option<String>,
 }
 
-impl ChainWinPotRowD1 {
-    fn into_row(self) -> crate::logic::ChainWinPotRow {
-        crate::logic::ChainWinPotRow {
-            owner: self.owner,
-            identity_is_key: self.identity_is_key.is_some_and(|v| v != 0.0),
-            pot_txid: self.pot_txid,
-            settle_txid: self.settle_txid,
-            verdict: self.verdict,
-            pub_a: self.pub_a,
-            pub_b: self.pub_b,
-            settle_signers: self.settle_signers,
-            identity_a: self.identity_a,
-            identity_b: self.identity_b,
-        }
+impl ChainWinCandidateRowD1 {
+    /// The candidate and its hand marker through the production
+    /// [`ResultRowD1::into_marker`] (a hand whose marker does not map still
+    /// holds its place in the hands order, as its row did in the SQL `LIMIT`).
+    fn into_candidate(self) -> (crate::logic::ChainWinCandidate, Option<ResultMarkerRow>) {
+        let hand_json: Option<serde_json::Value> = self
+            .hand
+            .as_deref()
+            .and_then(|h| serde_json::from_str(h).ok());
+        let hand = hand_json.as_ref().map(|v| crate::logic::CandidateHand {
+            score: v["handScore"]
+                .as_i64()
+                .or_else(|| v["handScore"].as_f64().map(|f| f as i64))
+                .unwrap_or(0),
+            created_at: v["createdAt"]
+                .as_i64()
+                .or_else(|| v["createdAt"].as_f64().map(|f| f as i64)),
+            game_id: v["gameId"].as_str().unwrap_or_default().to_string(),
+        });
+        let marker = hand_json
+            .and_then(|v| serde_json::from_value::<ResultRowD1>(v).ok())
+            .and_then(ResultRowD1::into_marker);
+        (
+            crate::logic::ChainWinCandidate {
+                row: crate::logic::ChainWinPotRow {
+                    owner: self.owner,
+                    identity_is_key: self.identity_is_key.is_some_and(|v| v != 0.0),
+                    pot_txid: self.pot_txid,
+                    settle_txid: self.settle_txid,
+                    verdict: self.verdict,
+                    pub_a: self.pub_a,
+                    pub_b: self.pub_b,
+                    settle_signers: self.settle_signers,
+                    identity_a: self.identity_a,
+                    identity_b: self.identity_b,
+                },
+                pot_created_at: self.pot_created_at.map(|v| v as i64),
+                hand,
+            },
+            marker,
+        )
     }
 }
 
@@ -1774,8 +1775,8 @@ impl DecodedPotRowD1 {
 /// committed covenant params (the #230 attribution needs its lock keys);
 /// every fault or ambiguity simply omits that pot (see `results.rs` for the
 /// conservatism contract).
-async fn classify_spent_pots(
-    db: &worker::D1Database,
+async fn classify_spent_pots<B: crate::board_db::BoardDb>(
+    db: &B,
     statuses: &[crate::logic::OutpointStatus],
 ) -> (
     std::collections::HashMap<String, crate::results::PotVerdict>,
@@ -1822,25 +1823,20 @@ async fn classify_spent_pots(
     let mut column_resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
     for chunk in all_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
         let sql = crate::results::decoded_pots_sql(chunk.len());
-        let mut binds: Vec<JsValue> = Vec::with_capacity(chunk.len() * 2);
+        let mut binds: Vec<crate::board_db::Bind> = Vec::with_capacity(chunk.len() * 2);
         for (pot, _) in chunk {
-            binds.push(JsValue::from_str(pot));
-            binds.push(JsValue::from_f64(f64::from(
+            binds.push(crate::board_db::Bind::Text(pot.clone()));
+            binds.push(crate::board_db::Bind::Num(f64::from(
                 crate::logic::LEADERBOARD_POT_VOUT,
             )));
         }
-        let stmt = match db.prepare(sql).bind(&binds) {
-            Ok(s) => s,
-            Err(e) => {
-                console_warn!("[leaderboard] decoded-pots bind failed (column tier skipped): {e}");
+        match db.all::<DecodedPotRowD1>(sql, binds).await {
+            Err(crate::board_db::BoardDbError::Bind(e)) => {
+                crate::board_db::warn(&format!(
+                    "[leaderboard] decoded-pots bind failed (column tier skipped): {e}"
+                ));
                 break;
             }
-        };
-        match stmt
-            .counted_all()
-            .await
-            .and_then(|r| r.results::<DecodedPotRowD1>())
-        {
             Ok(rows) => {
                 let by_txid: std::collections::HashMap<String, DecodedPotRowD1> = rows
                     .into_iter()
@@ -1888,7 +1884,9 @@ async fn classify_spent_pots(
                 }
             }
             Err(e) => {
-                console_warn!("[leaderboard] decoded-pots query failed (column tier partial): {e}");
+                crate::board_db::warn(&format!(
+                    "[leaderboard] decoded-pots query failed (column tier partial): {e}"
+                ));
             }
         }
     }
@@ -1937,22 +1935,18 @@ async fn classify_spent_pots(
     keys.dedup();
     let mut beefs: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
     for chunk in keys.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-        let placeholders = vec!["?"; chunk.len()].join(",");
-        let sql =
-            format!("SELECT txid, hex(beef) AS beef FROM pot_beefs WHERE txid IN ({placeholders})");
-        let binds: Vec<JsValue> = chunk.iter().map(|k| JsValue::from_str(k)).collect();
-        let stmt = match db.prepare(sql).bind(&binds) {
-            Ok(s) => s,
-            Err(e) => {
-                console_warn!("[leaderboard] pot_beefs bind failed (classification omitted): {e}");
+        let sql = crate::logic::leaderboard_pot_beefs_sql(chunk.len());
+        let binds: Vec<crate::board_db::Bind> = chunk
+            .iter()
+            .map(|k| crate::board_db::Bind::Text(k.clone()))
+            .collect();
+        match db.all::<PotBeefRowD1>(sql, binds).await {
+            Err(crate::board_db::BoardDbError::Bind(e)) => {
+                crate::board_db::warn(&format!(
+                    "[leaderboard] pot_beefs bind failed (classification omitted): {e}"
+                ));
                 return (verdicts, params_by_pot, signers_by_pot);
             }
-        };
-        match stmt
-            .counted_all()
-            .await
-            .and_then(|r| r.results::<PotBeefRowD1>())
-        {
             Ok(rows) => {
                 for r in rows {
                     if let Some(bytes) = r.beef.and_then(|h| decode_beef_hex(&h)) {
@@ -1961,7 +1955,9 @@ async fn classify_spent_pots(
                 }
             }
             Err(e) => {
-                console_warn!("[leaderboard] pot_beefs query failed (classification partial): {e}");
+                crate::board_db::warn(&format!(
+                    "[leaderboard] pot_beefs query failed (classification partial): {e}"
+                ));
                 // Keep whatever chunks already loaded — a missing BEEF only
                 // leaves its pot unclassified.
             }
@@ -10255,3 +10251,7 @@ mod e606_tests {
 #[cfg(test)]
 #[path = "../tests/support/served_bodies.rs"]
 mod ns2_d1bound_compat;
+
+#[cfg(test)]
+#[path = "../tests/support/leaderboard_642.rs"]
+mod leaderboard_642;
