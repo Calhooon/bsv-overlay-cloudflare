@@ -582,7 +582,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// identity's own recompute sequence, bumped by the snapshot's upsert and served on `/owed`. One column.
 /// 260 to 262 for bsv-low #644 (W1.6): the two backfill passes' partial candidate indexes on `pot_records`.
 /// 262 to 263 for bsv-low #643 (W1.6): the tip mark's (spent, recoveryHeight) index.
-pub const OVERLAY_MIGRATION_COUNT: usize = 263;
+/// 263 to 267 for bsv-low #645 (W1.6): `count_network_seen`, its two triggers and its stamped backfill.
+pub const OVERLAY_MIGRATION_COUNT: usize = 267;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2050,6 +2051,17 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // is an index RANGE over the pots the block can change; its SQL is unchanged. Partial on `recoveryHeight IS NOT
     // NULL` (a term of the mark): a hop's P2PKH row and an undecoded pot are never written to it.
     "CREATE INDEX IF NOT EXISTS idx_pot_unspent_recovery ON pot_records(spent, recoveryHeight) WHERE recoveryHeight IS NOT NULL",
+    // 264-267: bsv-low #645 (W1.6), `/health/invariants.networkSeenTotal` was a `COUNT(*)` of `network_seen` on
+    // every read (27,000 rows on the fixture). The count is now one row maintained INSIDE every write of the table
+    // by its two triggers (the latch's `INSERT OR IGNORE` fires the insert trigger only for a row it inserts; any
+    // DELETE fires the other), and backfilled once: the triggers are created FIRST, so a latch landing before the
+    // backfill is in its COUNT and one after it bumps the row. The row is its own stamp, its guard in the OUTER
+    // derived table (#638's rule). No writer may `INSERT OR REPLACE` into `network_seen` (a REPLACE skips the
+    // delete trigger). Derived (`rebuild_class: derived`): a lost row is recounted by the next version's run.
+    "CREATE TABLE IF NOT EXISTS count_network_seen (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS count_network_seen_insert AFTER INSERT ON network_seen BEGIN UPDATE count_network_seen SET n = n + 1 WHERE id = 1; END",
+    "CREATE TRIGGER IF NOT EXISTS count_network_seen_delete AFTER DELETE ON network_seen BEGIN UPDATE count_network_seen SET n = n - 1 WHERE id = 1; END",
+    crate::ops::NETWORK_SEEN_COUNT_BACKFILL,
 ];
 
 // =============================================================================
@@ -2715,6 +2727,8 @@ mod tests {
                         crate::derived_hops::LINKS_BACKFILL,
                         crate::derived_hops::SEATS_BACKFILL,
                         crate::derived_hops::STATE_DONE,
+                        // bsv-low #645: the count's stamped backfill, pinned in `d1_hot_bounds.rs`.
+                        crate::ops::NETWORK_SEEN_COUNT_BACKFILL,
                     ]
                     .contains(sql)
             })

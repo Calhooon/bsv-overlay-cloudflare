@@ -43,6 +43,12 @@ pub fn rows(now: u64) -> Vec<String> {
             rows.push(format!("INSERT INTO pot_evictions (txid, reason, evictedAt) VALUES ('e3{i:062x}', 'fixture', {})", now * 1000));
         }
     }
+    // bsv-low #645: beta's network_seen latches (about 27,000), keyed apart from every pot and spender above.
+    for i in 0..27_000u32 {
+        rows.push(format!(
+            "INSERT INTO network_seen (txid, seenAt) VALUES ('e4{i:062x}', {now})"
+        ));
+    }
     rows
 }
 
