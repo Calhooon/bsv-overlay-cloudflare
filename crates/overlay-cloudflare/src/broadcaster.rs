@@ -2904,6 +2904,7 @@ impl ArcadeBroadcaster {
                         .await
                     }
                     SubmitRung::FullBatch => {
+                        // Only single-leg /tx posts register; the full /txs feed below never does.
                         // #640: 32 ancestors per request, 256 per consumer run,
                         // nearest registrations first; feed the whole batch parents-first.
                         // Each /tx body carries only the leg named by its token.
@@ -5273,9 +5274,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn arcreg_full_batch_source_registers_one_body_per_leg() {
-        let src = include_str!("broadcaster.rs");
+    fn assert_registering_posts_are_single_tx(src: &str) {
         let prod = &src[..src.find("#[cfg(test)]").unwrap()];
         let f = &prod[prod.find("pub async fn broadcast_efs_gated").unwrap()..];
         let f = &f[..f.find("async fn submit_once_and_gate(").unwrap()];
@@ -5297,6 +5296,26 @@ mod tests {
         let post = &prod[prod.find("async fn post_ef_raw(").unwrap()..];
         assert!(post.contains("headers.set(\"X-CallbackToken\", token)"));
         assert!(post.contains("headers.set(\"X-CallbackUrl\", cb)"));
+        assert_eq!(batch.matches("self.post_ef_raw(").count(), 1);
+        assert_eq!(batch.matches("self.submit_ef(").count(), 1);
+        assert_eq!(batch.matches("self.submit_once_and_gate(").count(), 1);
+    }
+
+    #[test]
+    fn arcreg_full_batch_source_registers_one_body_per_leg() {
+        assert_registering_posts_are_single_tx(include_str!("broadcaster.rs"));
+    }
+
+    #[test]
+    fn arcreg_registering_batch_mutant_is_rejected() {
+        let source = include_str!("broadcaster.rs");
+        let mutant = source.replacen(
+            "&format!(\"{}/txs\", self.base_url), subject_txid, &body, false,",
+            "&format!(\"{}/txs\", self.base_url), subject_txid, &body, true,",
+            1,
+        );
+        assert_ne!(source, mutant);
+        assert!(std::panic::catch_unwind(|| assert_registering_posts_are_single_tx(&mutant)).is_err());
     }
 
     #[test]

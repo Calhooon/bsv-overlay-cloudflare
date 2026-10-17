@@ -111,6 +111,8 @@ POST /admin/health-check, /admin/ban, /admin/unban,
 
 Admin routes except `/admin/config` require `Authorization: Bearer <ADMIN_TOKEN>`.
 
+The observability counters (#627, #625, #640/#632) are durable `ops_counters` rows served by `/health/invariants`: `submit_answer_{status}_total`, `submit_answer_reason_{slug}_total` (fixed reason classes), and `courier_{door|janitor}_{arcade|bitails|woc|bananablocks|other}_{ok|notfound|fault|shape}_total`. The door reader covers submit source, status and terminal-presence reads; the janitor reader covers completion, spender and history ladders, including admin completion. Body-shape failures are `shape`, transport and HTTP failures are `fault`, and a Bitails 404 and pruned Bitails' no-spend-data answer (`spent: ""`) are `notfound` (the ladder still reads the latter as "could not look"). The S2 queued 200 is its own reason, `admit_queued`. Each HTTP answer flushes its status, reason and existing operation deltas in one post-answer D1 batch; queue replays contribute operation and courier deltas only. Every registering post carries one transaction under its own txid; the full ancestry feed to `/txs` disables callbacks, bounded ancestor registrations precede the subject, and known-txid registrations remain suppressed. `arc_ingest_unauthorized_{bad_token,no_token}_total` stays distinct, and refusal logs name the push with bearer shape and length only. Alerts remain OFF.
+
 ## Submit verification (reference parity)
 
 `Engine::submit` verifies the subject transaction the way the reference does

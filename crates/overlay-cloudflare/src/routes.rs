@@ -2744,11 +2744,11 @@ fn arc_ingest_refusal_log(
     bearer: ArcBearerShape,
 ) -> String {
     let txid = if is_hex_txid(txid) { txid } else { "other" };
-    let tx_status: String = tx_status.chars().take(80).collect();
-    let ua: String = user_agent.unwrap_or("").chars().take(64).collect();
-    // Debug quoting keeps all untrusted fields on one bounded log line.
+    let tx_status: String = tx_status.chars().take(80).flat_map(char::escape_default).collect();
+    let ua: String = user_agent.unwrap_or("").chars().take(64).flat_map(char::escape_default).collect();
+    // Escaping keeps untrusted fields on one bounded line; no credential enters here.
     format!(
-        "POST /arc-ingest txid={txid:?} txStatus={tx_status:?} ua={ua:?} bearer={} bearerLen={} -> 401 ({why})",
+        "POST /arc-ingest txid={txid} txStatus={tx_status} ua={ua} -> 401 ({why}: bearer {}, {} bytes)",
         bearer.kind, bearer.len,
     )
 }
@@ -2809,11 +2809,11 @@ pub async fn arc_ingest(
             let (counter, why) = match refused {
                 ArcCallbackAuth::NoToken => (
                     crate::ops::COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN,
-                    "no bearer token in Authorization or X-CallbackToken",
+                    "no token",
                 ),
                 _ => (
                     crate::ops::COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN,
-                    "token presented but != subject txid",
+                    "bad token",
                 ),
             };
             let tx_status = match &body {
@@ -5596,6 +5596,12 @@ mod tests {
                 "{auth:?} / {hdr:?}"
             );
         }
+        let line = arc_ingest_refusal_log(
+            CB_TXID, "MINED", Some("arcade-test/640"), "bad token",
+            arc_bearer_shape(Some(&format!("Bearer {wrong}")), None),
+        );
+        assert_eq!(line, format!("POST /arc-ingest txid={CB_TXID} txStatus=MINED ua=arcade-test/640 -> 401 (bad token: bearer 64-hex, 64 bytes)"));
+        assert!(!line.contains(&wrong));
     }
 
     #[test]
@@ -5609,10 +5615,10 @@ mod tests {
             CB_TXID,
             "MINED",
             Some("arcade-test/640"),
-            "token presented but != subject txid",
+            "bad token",
             arc_bearer_shape(Some(&format!("Bearer {wrong}")), None),
         );
-        assert_eq!(line, format!("POST /arc-ingest txid={CB_TXID:?} txStatus=\"MINED\" ua=\"arcade-test/640\" bearer=64-hex bearerLen=64 -> 401 (token presented but != subject txid)"));
+        assert_eq!(line, format!("POST /arc-ingest txid={CB_TXID} txStatus=MINED ua=arcade-test/640 -> 401 (bad token: bearer 64-hex, 64 bytes)"));
         assert!(!line.contains(&wrong));
         let escaped = arc_ingest_refusal_log(
             CB_TXID,
@@ -5673,8 +5679,8 @@ mod tests {
             "no token",
             arc_bearer_shape(Some(bad_header), None),
         );
-        assert!(line.contains("txid=\"other\" txStatus=\"MINED\""));
-        assert!(line.contains(&format!("ua={:?} bearer=other bearerLen=0", "u".repeat(64))));
+        assert!(line.contains("txid=other txStatus=MINED"));
+        assert!(line.contains(&format!("ua={} -> 401 (no token: bearer other, 0 bytes)", "u".repeat(64))));
         assert!(line.len() < 256);
         assert!(!line.contains(bad_header));
         let wrong = "sensitive-credential-value";
@@ -5685,7 +5691,7 @@ mod tests {
             "bad token",
             arc_bearer_shape(Some(&format!("Bearer {wrong}")), None),
         );
-        assert!(line.contains(&format!("bearer=other bearerLen={}", wrong.len())));
+        assert!(line.contains(&format!("bearer other, {} bytes", wrong.len())));
         assert!(!line.contains(wrong));
         assert!(line.len() < 512);
         assert_eq!(line.lines().count(), 1);
