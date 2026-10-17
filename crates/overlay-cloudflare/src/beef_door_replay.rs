@@ -1302,6 +1302,25 @@ mod e592 {
     /// and `/admin/readmit` count theirs, the engine the Worker builds walks under the Worker's budget, and the
     /// gated door under the same instance. The route itself (an ungated `historical-tx` of the witness answering
     /// as before and bumping the counter) is the captain's route tier: not run in this lane.
+    /// The W1-OBS lens's LOW-1: `/submit`'s batched arm still logs the detail line
+    /// (`subject_txid`, `at_txid`, `subject_judged`, `what`) that
+    /// `note_engine_walk_not_now` logs at every other door.
+    #[test]
+    fn obs_627_fold_l1_the_submit_walk_not_now_keeps_its_detail_line() {
+        let routes = include_str!("routes.rs");
+        let start = routes.find("async fn walk_not_now(").expect("walk_not_now");
+        let body = &routes[start..start + routes[start..].find("\n}\n").expect("its end")];
+        let some_arm = &body[body.find("if let Some(counters) = counters {").expect("the batched arm")
+            ..body.find("} else if let Ok(db)").expect("the unbatched arm")];
+        assert!(
+            some_arm.contains("crate::ops::engine_walk_not_now_line(stop, door)"),
+            "the batched arm logs the detail line: {some_arm}"
+        );
+        let ops = include_str!("ops.rs");
+        let note = &ops[ops.find("pub async fn note_engine_walk_not_now(").expect("note")..];
+        assert!(note[..note.find("\n}\n").unwrap()].contains("engine_walk_not_now_line(stop, door)"));
+    }
+
     #[test]
     fn e592_d_every_door_that_walks_counts_the_engine_walk() {
         let lib = include_str!("lib.rs");
