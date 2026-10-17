@@ -331,6 +331,9 @@ static ANON_WRITE_BY_ROUTE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(
 static LANE_SERVED: AtomicU64 = AtomicU64::new(0);
 static PUBLIC_SERVED: AtomicU64 = AtomicU64::new(0);
 static AUTHENTICATED_SERVED: AtomicU64 = AtomicU64::new(0);
+/// EVERY front-door refusal, the middleware's arms and the app's three (each of those also counted apart below): the
+/// isolate twin of the durable `applayer_auth_refused_total`, bumped by the one [`note_auth_refused`] (the
+/// W1-OBS-APPLAYER lens's L2; before it this counted the middleware's arms only).
 static AUTH_REFUSED: AtomicU64 = AtomicU64::new(0);
 static MISMATCH_REFUSED: AtomicU64 = AtomicU64::new(0);
 static STRICT_REFUSED_UNAUTHENTICATED: AtomicU64 = AtomicU64::new(0);
@@ -363,27 +366,27 @@ pub fn count_lane_served() {
 }
 /// `reason`: the refusal's class in its durable name (bsv-low #628, [`AUTH_REFUSAL_REASONS`]).
 pub fn count_auth_refused(reason: &str) {
-    AUTH_REFUSED.fetch_add(1, Ordering::Relaxed);
-    mirror_auth_refused(reason);
+    note_auth_refused(reason);
 }
 pub fn count_mismatch_refused() {
     MISMATCH_REFUSED.fetch_add(1, Ordering::Relaxed);
-    mirror_auth_refused("mismatch");
+    note_auth_refused("mismatch");
 }
 pub fn count_strict_refused_unauthenticated() {
     STRICT_REFUSED_UNAUTHENTICATED.fetch_add(1, Ordering::Relaxed);
-    mirror_auth_refused("strict_unauthenticated");
+    note_auth_refused("strict_unauthenticated");
 }
 pub fn count_misconfigured_refused() {
     MISCONFIGURED_REFUSED.fetch_add(1, Ordering::Relaxed);
-    mirror_auth_refused("misconfigured");
+    note_auth_refused("misconfigured");
 }
 
 /// bsv-low #628 (the observability bar, issue 4): every front-door refusal by reason, mirrored on the overlay's
 /// `ops_counters` as `applayer_auth_refused_<reason>_total` beside `applayer_auth_refused_total`, through the
 /// courier census's batched flush. The session lane's refusals (`ERR_SESSION_REFUSED`) are `lane_<reason>` by the
 /// middleware's own reason; the reference door's 401s are their code; `handshake_fault` is a middleware `Err`
-/// (a fault, the 400), `no_session` its contract break (the 500). The isolate fields on `/health.auth` stay.
+/// (a fault, the 400), `no_session` its contract break (the 500). The isolate fields on `/health.auth` stay;
+/// `authRefused` counts the same 19 as the durable total.
 pub const AUTH_REFUSAL_REASONS: [&str; 19] = [
     "lane_unknown_session",
     "lane_expired",
@@ -406,7 +409,9 @@ pub const AUTH_REFUSAL_REASONS: [&str; 19] = [
     "misconfigured",
 ];
 
-fn mirror_auth_refused(reason: &str) {
+/// One refusal: the isolate's `authRefused` and the durable total with its reason, together.
+fn note_auth_refused(reason: &str) {
+    AUTH_REFUSED.fetch_add(1, Ordering::Relaxed);
     crate::courier::note_presence("applayer_auth_refused_total");
     crate::courier::note_presence(&format!("applayer_auth_refused_{reason}_total"));
 }

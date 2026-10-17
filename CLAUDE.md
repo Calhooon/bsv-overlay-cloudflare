@@ -2781,7 +2781,10 @@ bumped by the snapshot's own upsert once per LANDED write (a superseded walk's r
 by the batch's closing statement and the existing state read (no new statement), monotone across isolates, absent
 from a body whose snapshot carries none (pin `obs_566_*`). Then `applayer_record_refused_<class>_total` beside the
 total, `applayer_auth_refused_<reason>_total` beside the total (the session lane's `ERR_SESSION_REFUSED` by its
-reason as `lane_<reason>`, the reference door's 401 by its code, read off the middleware's own response bytes)
+reason as `lane_<reason>`, the reference door's 401 by its code, read off the middleware's own response bytes;
+the total and the isolate's `/health.auth.authRefused` count the same 19 arms, the app's `mismatch`,
+`strict_unauthenticated` and `misconfigured` included, which keep their own isolate fields too: since the lens's L2
+`authRefused` is no longer the middleware's arms alone)
 and `applayer_identity_<route>_{upstream_fault,hash_mismatch,no_resolver,kill_list_fault}_total`. THE FLUSH
 BOUND: a take is made when an answer leaves (the router's, the front door's own reply, an exempt identity route,
 the BoardView actor's fetch and alarm, the scheduled drain) and flushes the isolate's first 4 takes at once, then
