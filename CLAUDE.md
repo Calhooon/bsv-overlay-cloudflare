@@ -2774,7 +2774,12 @@ memo; this worker writes it and counts `txany_memo_write_{refused,retired}_total
 retire pass's at most 16 a tick and one per eviction; no writer of an `absent` or `unconfirmable` memo exists on
 this tip); #628 `applayer_owed_*` (recompute faults, shed, deferred abandoned and faulted, arm failed, lock
 takeovers, sweep-proof contradictions, read faults by kind and summed, and `applayer_owed_recomputes_total`, the
-durable twin of #566's new `/health.owed.recomputeSeq`), `applayer_record_refused_<class>_total` beside the
+fleet's count of landed recomputes, the durable twin of the isolate's `/health.owed.recomputesThisIsolate`; both are
+#628's and neither is per identity). #566's `recomputeSeq` is the one on the `/owed` ANSWER, beside `computedAtMs`:
+the identity's own sequence, in its `owed_state` row (migration 260, the app layer's byte-identical ALTER catch-up),
+bumped by the snapshot's own upsert once per LANDED write (a superseded walk's refused upsert leaves it), read back
+by the batch's closing statement and the existing state read (no new statement), monotone across isolates, absent
+from a body whose snapshot carries none (pin `obs_566_*`). Then `applayer_record_refused_<class>_total` beside the
 total, `applayer_auth_refused_<reason>_total` beside the total (the session lane's `ERR_SESSION_REFUSED` by its
 reason as `lane_<reason>`, the reference door's 401 by its code, read off the middleware's own response bytes)
 and `applayer_identity_<route>_{upstream_fault,hash_mismatch,no_resolver,kill_list_fault}_total`. THE FLUSH
