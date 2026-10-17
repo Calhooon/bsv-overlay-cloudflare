@@ -5,7 +5,7 @@
 # in parity mode + runs the differential harness + writes PARITY_REPORT.md.
 # Exit is non-zero on any un-noted divergence.
 
-.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ownership \
+.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ci-d1-board ownership \
         wrangler-dev harness test e2e-bsv-storage clean help
 
 help:
@@ -227,7 +227,7 @@ ownership:
 # deleting the bound.
 ROUTE_UP_TRIES ?= 60
 ROUTE_UP_SLEEP ?= 3
-ci-route: ci-d1-budget
+ci-route: ci-d1-budget ci-d1-board
 	@set -e; \
 	B=$${LANE_BASE:-8791}; P1=$$B; P2=$$((B+1)); P3=$$((B+2)); P4=$$((B+3)); P5=$$((B+4)); P6=$$((B+5)); P7=$$((B+6)); P8=$$((B+7)); P9=$$((B+8)); P10=$$((B+11)); P11=$$((B+12)); \
 	strict_log=/tmp/lane347-route-$$B-strict.log; \
@@ -401,6 +401,24 @@ ci-route: ci-d1-budget
 	  node tools/lane-nl6c/ef_work_bound_ci.mjs http://127.0.0.1:$$P10; \
 	FIXTURE_PORT=$$P11 \
 	  node tools/lane-nl6d/corroboration_legs_ci.mjs http://127.0.0.1:$$P10
+
+# bsv-low #642: the /leaderboard:view rows-read ceilings on local D1. The shipped pipeline runs natively over the
+# fleet-shaped board (1,500 and 3,000 counted wins) and records every statement of three page requests
+# (`lb642_emit_the_d1_cell`); each board is loaded into a local D1 and every statement is replayed there, its
+# rows identical and its `rows_read` under the per-statement ceiling, each request under its per-request ceiling
+# (`logic::LEADERBOARD_VIEW_MAX_READS*`), and the whole-board read it replaced past the default page's ceiling.
+ci-d1-board:
+	@set -e; \
+	dir=$$(mktemp -d "$${TMPDIR:-/tmp}/lane642-board.XXXXXX"); \
+	trap 'rm -rf "$$dir"' EXIT; \
+	LB642_D1_PIN="$$dir" cargo test -q $(WORKERS) -p low-app-layer --lib lb642_emit_the_d1_cell -- --ignored > "$$dir/emit.log" 2>&1 \
+	  || { echo "✗ ci-d1-board: the emit failed"; cat "$$dir/emit.log"; exit 1; }; \
+	for w in w1500 w3000; do \
+	  ( cd crates/low-app-layer && npx wrangler d1 execute low-overlay-db --local --persist-to "$$dir/$$w/d1" --file "$$dir/$$w/seed.sql" ) > "$$dir/$$w/seed.log" 2>&1 \
+	    || { echo "✗ ci-d1-board: the $$w seed did not load"; cat "$$dir/$$w/seed.log"; exit 1; }; \
+	  node tools/lane-642/board_pin.mjs "$$dir/$$w/expected.json" "$$dir/$$w/d1"; \
+	done; \
+	echo "✅ ci-d1-board green"
 
 # bsv-low #499: THE D1 BUDGET TIER. A prerequisite of `ci-route` (so part of `ci`), in its own block.
 #

@@ -93,6 +93,41 @@ fn hot_routes_never_scan_fleet_tables() {
             "owed recompute backups",
             low_app_layer::owed::valid_refunds_sql(16),
         ),
+        // bsv-low #642: every statement `/leaderboard:view` runs, at the chunk bound.
+        (
+            "/leaderboard:view candidates",
+            low_app_layer::logic::chain_wins_candidates_sql(None),
+        ),
+        (
+            "/leaderboard:view candidates (era)",
+            low_app_layer::logic::chain_wins_candidates_sql(Some(1)),
+        ),
+        (
+            "/leaderboard:view statuses",
+            low_app_layer::logic::batch_where_sql(low_app_layer::logic::D1_CHUNK_OUTPOINTS),
+        ),
+        (
+            "/leaderboard:view decoded pots",
+            low_app_layer::results::decoded_pots_sql(low_app_layer::logic::D1_CHUNK_OUTPOINTS),
+        ),
+        (
+            "/leaderboard:view pot beefs",
+            low_app_layer::logic::leaderboard_pot_beefs_sql(
+                low_app_layer::logic::D1_CHUNK_OUTPOINTS,
+            ),
+        ),
+        (
+            "/leaderboard:view pot markers",
+            low_app_layer::logic::pot_markers_sql(low_app_layer::logic::D1_CHUNK_OUTPOINTS),
+        ),
+        (
+            "/leaderboard:view proof pointers",
+            low_app_layer::logic::proof_pointers_sql(low_app_layer::logic::D1_CHUNK_OUTPOINTS),
+        ),
+        (
+            "/leaderboard:view proof posts",
+            low_app_layer::proof_post::proof_posted_sql(low_app_layer::logic::D1_CHUNK_OUTPOINTS),
+        ),
     ] {
         for detail in plan(&db, &sql) {
             if detail.contains("SEARCH x USING INDEX idx_potparty_identity") {
@@ -432,4 +467,50 @@ fn initial_cursor_uses_maximum_even_when_union_arm_rows_are_reordered() {
     assert_eq!(cursor.last, Some((None, 100)));
     cursor.start(&[]);
     assert_eq!(cursor.last, None);
+}
+
+/// bsv-low #642: each candidate arm walks `idx_pot_records_chain_wins` in its
+/// own ORDER BY (no sort inside the arm), so its LIMIT stops the walk; a sort
+/// there would read every counted win of the era before the LIMIT, the
+/// whole-board read again. The #403 spine is the contrast: it reads every
+/// decoded pot (`idx_pot_params_undecoded`) to group them.
+#[test]
+fn the_leaderboard_candidate_arms_stop_at_their_limit() {
+    let db = fixture();
+    for era in [None, Some(1)] {
+        let p = plan(&db, &low_app_layer::logic::chain_wins_candidates_sql(era));
+        println!("candidates plan (era {era:?}):\n{}", p.join("\n"));
+        for arm in ["(subquery-1)", "(subquery-3)"] {
+            let at = p
+                .iter()
+                .position(|d| *d == format!("CO-ROUTINE {arm}"))
+                .unwrap_or_else(|| panic!("the arm {arm} is a co-routine: {p:?}"));
+            assert_eq!(
+                p[at + 1],
+                "SEARCH p USING INDEX idx_pot_records_chain_wins (outputIndex=? AND verdict=? AND spent=?)",
+                "the arm walks the chain-wins index"
+            );
+            assert_eq!(
+                p[at + 2],
+                "SEARCH ns USING COVERING INDEX sqlite_autoindex_network_seen_1 (txid=?) LEFT-JOIN"
+            );
+            assert_eq!(
+                p[at + 3],
+                format!("SCAN {arm}"),
+                "no sort inside the arm: {p:?}"
+            );
+        }
+        assert!(
+            p.iter().any(|d| d == "MATERIALIZE wins"),
+            "one seat resolution per row"
+        );
+    }
+    let spine = plan(&db, &low_app_layer::logic::chain_wins_spine_sql(None));
+    println!("#403 spine plan:\n{}", spine.join("\n"));
+    assert!(
+        spine
+            .iter()
+            .any(|d| d.contains("USE TEMP B-TREE FOR GROUP BY")),
+        "the whole-board spine groups every counted win"
+    );
 }
