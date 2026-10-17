@@ -4136,6 +4136,21 @@ where
     out
 }
 
+/// PURE (bsv-low #693 fold, the W1-OWED-693 lens's LOW-2): the sweeps whose served row WAITS FOR THE BLOCK (a
+/// courier-bytes payout, `chainWait == "block"`), lowercase: the only spenders phase 2b re-asks. A payout the
+/// derivation retires (a verified `collected`, a held filing, the home output spent) or a pointer the bytes refute
+/// serves no such row, so its durable spender is never re-asked.
+pub fn sweeps_waiting_for_the_block(rows: &[OwedRow]) -> HashSet<String> {
+    rows.iter()
+        .filter(|r| {
+            r.family == OwedFamily::Payout
+                && r.facts["sweepSource"] == "courier-bytes"
+                && r.facts["chainWait"] == "block"
+        })
+        .filter_map(|r| r.facts["sweepTxid"].as_str().map(str::to_ascii_lowercase))
+        .collect()
+}
+
 /// bsv-low #693 fold (the W1-OWED-693 lens's HIGH-1): THE PROOF LATCH. The proof set of one pass is filled only by
 /// that pass's `/tx-any` answers, and a durable spender gets at most one re-ask a pass, only from a slot phase 2
 /// left and never on a `budget_cut` pass, so a row the re-ask confirmed on pass N read "waiting for the block" again
@@ -5741,6 +5756,80 @@ pub(crate) mod tests {
             !routes.contains("word_rows.get(sp.as_str()).map(|r|r.word==\"mined\")"),
             "never the stored row"
         );
+    }
+
+    /// bsv-low #693 fold (the W1-OWED-693 lens's LOW-2): RETIRED AND REFUTED ROWS ARE NOT RE-ASKED. The index-arm
+    /// fixture (the index names the sweep spent, unconfirmed; its bytes durable) serves a payout waiting for the
+    /// block, so its spender is a candidate; the same spender is NOT when the derivation retires the payout (a
+    /// verified `collected`, a held filing naming the sweep, the home output spent) or the bytes refute the pointer
+    /// (they do not spend the hop). The route filters phase 2b's candidates by the provisional derivation (source
+    /// pin). RED on `6eb00a2` (no filter: each of the four was re-asked every pass; the source assertion fails).
+    #[test]
+    fn e693f_l2_a_retired_or_refuted_spender_is_not_re_asked() {
+        let (v, no_pots) = (HashMap::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let game = tx(0x01);
+        let my_pkh = "cc".repeat(20);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(game.clone(), my_pkh.clone());
+        let mut h = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        h.spent_confirmed = Some(false);
+        let hops = [h];
+        let courier: HashSet<String> = [sweep.clone()].into();
+        let spends_hop: HashMap<String, Vec<(String, u32)>> =
+            [(sweep.clone(), vec![(tx(0x07), 0)])].into();
+        let refuted: HashMap<String, Vec<(String, u32)>> =
+            [(sweep.clone(), vec![(tx(0x09), 3)])].into();
+        let unspent_home = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let spent_home = pays(&sweep, &[(0, &my_pkh, 20_000, Some(true))]);
+        let none: HashSet<String> = HashSet::new();
+        let collected: HashSet<String> = [game.clone()].into();
+        let held: HashSet<String> = [held_key(&game, &sweep)].into();
+        let waiting = |collected: &HashSet<String>,
+                       held: &HashSet<String>,
+                       inputs_of: &HashMap<String, Vec<(String, u32)>>,
+                       outputs: &HashMap<String, Vec<SpenderOutput>>|
+         -> bool {
+            let mut i = inputs(&[], &[], &hops, &v, collected, &no_pots, Some(900_000));
+            i.collected_present = collected;
+            i.held_verified = held;
+            i.spender_outputs = outputs;
+            i.spender_inputs = inputs_of;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = &courier;
+            sweeps_waiting_for_the_block(&derive_owed_rows(&i)).contains(&sweep)
+        };
+        assert!(
+            waiting(&none, &none, &spends_hop, &unspent_home),
+            "the waiting payout's spender is a candidate"
+        );
+        assert!(
+            !waiting(&collected, &none, &spends_hop, &unspent_home),
+            "collected"
+        );
+        assert!(
+            !waiting(&none, &held, &spends_hop, &unspent_home),
+            "a held filing"
+        );
+        assert!(
+            !waiting(&none, &none, &spends_hop, &spent_home),
+            "the home output spent"
+        );
+        assert!(
+            !waiting(&none, &none, &refuted, &unspent_home),
+            "the bytes refute the pointer"
+        );
+        // the route: the candidates filtered by the provisional derivation before the re-ask
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        let filter = ".into_iter().filter(|sp|waiting.contains(sp)).collect()";
+        let derive =
+            "letwaiting=crate::owed::sweeps_waiting_for_the_block(&derive_owed_rows(&OwedInputs{";
+        let reask = "crate::owed::durable_reasks(candidates,room,&over_budget,";
+        for wired in [derive, filter, reask] {
+            assert!(routes.contains(wired), "the route's LOW-2 filter: {wired}");
+        }
+        assert!(routes.find(derive).unwrap() < routes.find(reask).unwrap());
     }
 
     /// bsv-low #693 fold: the latch range read over real SQLite, as the route's `read_proof_latches` makes it (the
