@@ -5294,8 +5294,35 @@ mod tests {
             "self.post_ef_raw(&format!(\"{}/txs\",self.base_url),subject_txid,&body,false,"
         ));
         let post = &prod[prod.find("async fn post_ef_raw(").unwrap()..];
-        assert!(post.contains("headers.set(\"X-CallbackToken\", token)"));
-        assert!(post.contains("headers.set(\"X-CallbackUrl\", cb)"));
+        let post: String = post[..post.find("\n    }\n").unwrap()]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars().filter(|c| !c.is_whitespace()))
+            .collect();
+        // Both callback headers sit inside the `if register_callback {` block
+        // and nowhere else: a `false` post sends neither (the lens's LOW-4).
+        let open = post.find("ifregister_callback{").expect("the guard");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, c) in post[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let guarded = &post[open..close.expect("the guard's end")];
+        for header in ["headers.set(\"X-CallbackToken\",token)", "headers.set(\"X-CallbackUrl\",cb)"] {
+            assert_eq!(guarded.matches(header).count(), 1, "{header} under the guard");
+            assert_eq!(post.matches(header).count(), 1, "{header} only under the guard");
+        }
+        assert_eq!(post.matches("X-Callback").count(), 2);
         assert_eq!(batch.matches("self.post_ef_raw(").count(), 1);
         assert_eq!(batch.matches("self.submit_ef(").count(), 1);
         assert_eq!(batch.matches("self.submit_once_and_gate(").count(), 1);
@@ -5316,6 +5343,27 @@ mod tests {
         );
         assert_ne!(source, mutant);
         assert!(std::panic::catch_unwind(|| assert_registering_posts_are_single_tx(&mutant)).is_err());
+    }
+
+    /// The W1-OBS lens's LOW-4: a mutant that drops `post_ef_raw`'s
+    /// `if register_callback {` (every leg of the `/txs` feed registered under
+    /// the subject's token) reds the helper, as does one that sets either
+    /// callback header outside the guard.
+    #[test]
+    fn arc640_fold_l4_callback_headers_only_under_register_callback() {
+        let source = include_str!("broadcaster.rs");
+        for (from, to) in [
+            ("        if register_callback {\n            let _ = headers.set(\"X-CallbackToken\"", "        {\n            let _ = headers.set(\"X-CallbackToken\""),
+            ("        if register_callback {\n            let _ = headers.set(\"X-CallbackToken\"", "        if true {\n            let _ = headers.set(\"X-CallbackToken\""),
+            ("        let _ = headers.set(\"User-Agent\", OVERLAY_USER_AGENT);\n        // Each leg", "        let _ = headers.set(\"User-Agent\", OVERLAY_USER_AGENT);\n        let _ = headers.set(\"X-CallbackToken\", token);\n        // Each leg"),
+        ] {
+            let mutant = source.replacen(from, to, 1);
+            assert_ne!(source, mutant, "{from}");
+            assert!(
+                std::panic::catch_unwind(|| assert_registering_posts_are_single_tx(&mutant)).is_err(),
+                "the mutant {to:?} passes"
+            );
+        }
     }
 
     #[test]
