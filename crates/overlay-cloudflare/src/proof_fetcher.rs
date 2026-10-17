@@ -4896,7 +4896,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn obs_625_bitails_unmined_404_is_not_a_fault() {
+    async fn obs_625_bitails_unmined_404_is_notfound_in_the_new_family_only() {
         TEST_HTTP_RESPONSES.with(|responses| responses.borrow_mut().clear());
         let counts = CourierCounters::new(crate::courier_counters::Reader::Janitor);
         let fetcher = ChainProofFetcher::new(None)
@@ -4904,8 +4904,9 @@ pub(crate) mod tests {
             .with_courier_counters(counts.clone());
         let probe = fetcher.diagnose_rung("bitails", &"ab".repeat(32)).await;
         fetcher.note_proof_probe(&probe).await;
-        assert!(!probe.fault, "a pruned indexer's 404 is a known absence");
-        assert_eq!(fetcher.proof_tallies.borrow()["bitails"].fault, 0);
+        // The legacy tally keeps the 404 a fault (the lens's MEDIUM-1).
+        assert!(probe.fault);
+        assert_eq!(fetcher.proof_tallies.borrow()["bitails"].fault, 1);
         fetcher
             .fetch_verified_proof(&"ab".repeat(32))
             .await
@@ -4992,15 +4993,43 @@ pub(crate) mod tests {
         assert_eq!(counts.take()["courier_door_bitails_notfound_total"], 12);
     }
 
+    /// The lens's MEDIUM-1: a proof rung's 404 stays a FAULT on the legacy
+    /// tally (the `courier_{rung}_fault_total` row, the `[proof]` line and the
+    /// probe's `parseResult`), exactly as on main b4ae1c6; only the new
+    /// per-reader family records it `notfound`.
+    #[tokio::test]
+    async fn obs_625_fold_a_proof_rung_404_is_a_legacy_fault_and_a_new_notfound() {
+        TEST_PROOF_LOGS.with(|logs| logs.borrow_mut().clear());
+        TEST_HTTP_RESPONSES.with(|r| r.borrow_mut().clear());
+        let counts = CourierCounters::new(crate::courier_counters::Reader::Janitor);
+        let fetcher = ChainProofFetcher::new(None)
+            .with_sources(ProofSources::parse("woc"))
+            .with_courier_counters(counts.clone());
+        let txid = "44".repeat(32);
+        assert!(fetcher.verified_proof_for(&txid).await.is_none());
+        assert_eq!(fetcher.proof_tallies.borrow()["woc"].fault, 1);
+        assert_eq!(
+            TEST_PROOF_LOGS.with(|logs| logs.borrow().clone()),
+            vec!["[proof] rung=woc status=Some(404) parse=http-error judge=not-run".to_string()]
+        );
+        let rows = counts.take();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows["courier_janitor_woc_notfound_total"], 1);
+        let probe = fetcher.diagnose_rung("woc", &txid).await;
+        assert_eq!(probe.parse_result, "http-error");
+        assert!(probe.fault);
+        assert_eq!(
+            serde_json::to_value(&probe).unwrap()["parseResult"],
+            "http-error"
+        );
+    }
+
     #[tokio::test]
     async fn proofs_rung_failures_are_counted_and_logged_once() {
         TEST_PROOF_LOGS.with(|logs| logs.borrow_mut().clear());
         TEST_HTTP_RESPONSES.with(|responses| responses.borrow_mut().clear());
         let fetcher = ChainProofFetcher::new(None).with_sources(ProofSources::parse("woc"));
         for n in 1..=3 {
-            TEST_HTTP_RESPONSES.with(|responses| responses.borrow_mut().insert(
-                format!("{DEFAULT_WOC_BASE}/tx/hash/{n:064x}"), (503, String::new()),
-            ));
             assert!(fetcher
                 .verified_proof_for(&format!("{n:064x}"))
                 .await
