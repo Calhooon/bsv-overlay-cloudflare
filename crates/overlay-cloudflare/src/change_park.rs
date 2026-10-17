@@ -2208,14 +2208,14 @@ mod tests {
         let sq = |s: &str| s.split_whitespace().collect::<String>();
         let lib = sq(include_str!("lib.rs"));
         let dispatch = lib
-            .find("\"/admin/complete-proofs\"=>admin_complete_proofs(&env).await,")
+            .find("\"/admin/complete-proofs\"=>admin_complete_proofs(&env,&ctx).await,")
             .expect("the dispatch routes the external cron's fetch");
         let gate = lib[..dispatch]
             .rfind("check_admin_auth(&req,&env)")
             .expect("behind the admin bearer");
         assert!(gate < dispatch);
         let at = lib
-            .find("asyncfnadmin_complete_proofs(env:&Env)")
+            .find("asyncfnadmin_complete_proofs(env:&Env,ctx:&Context)")
             .expect("the fallback");
         let body = &lib[at..];
         let retire = body
