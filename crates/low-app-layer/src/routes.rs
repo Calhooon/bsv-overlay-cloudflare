@@ -4279,6 +4279,49 @@ async fn owed_recompute_inner(
                 )
             })
             .collect();
+        // bsv-low #693 fold (the W1-OWED-693 lens's LOW-2): only a spender whose row THIS pass would serve waiting for
+        // the block is re-asked, read off a provisional derivation over this pass's own inputs (pure, made only when a
+        // candidate is left), so a retired payout (a verified `collected`, a held filing, the home output spent) or a
+        // pointer the spender's bytes refute never spends the slot. The home walk (6c) and the `homeproof:` latches
+        // (6e) are not in it: neither retires a row that is still waiting (the walk takes confirmed payouts only, the
+        // latch only a row with no bytes in hand)
+        let durable_unconfirmed: Vec<String> = if budget_cut || durable_unconfirmed.is_empty() {
+            durable_unconfirmed
+        } else {
+            let (no_home, no_retired) = (HashMap::new(), HashSet::new());
+            let waiting =
+                crate::owed::sweeps_waiting_for_the_block(&derive_owed_rows(&OwedInputs {
+                    spender_words: word_lookup_available.then_some(&spender_words),
+                    identity_lc,
+                    tip,
+                    now_ms,
+                    results: &results,
+                    refunds: &refunds,
+                    hops: &hops,
+                    valid_refunds: &valid_refunds,
+                    collected_verified: &collected.verified,
+                    collected_present: &collected.present,
+                    held_verified: &collected.held,
+                    pot_spenders: &pot_spenders,
+                    pot_spenders_faulted,
+                    hop_chain: &hop_chain,
+                    hop_sweeps: &hop_sweeps,
+                    evicted_pots: &evicted_pots,
+                    evicted_hop_outpoints: &evicted_hop_outpoints,
+                    door_refused_hop_outpoints: &door_refused_hop_outpoints,
+                    spender_outputs: &spender_outputs,
+                    spender_inputs: &spender_inputs,
+                    courier_spenders: &courier_spenders,
+                    my_pkh_by_game: &my_pkh_by_game,
+                    home_spends: &no_home,
+                    retired_spenders: &no_retired,
+                    proof_mined_spenders: &proof_mined_spenders,
+                }));
+            durable_unconfirmed
+                .into_iter()
+                .filter(|sp| waiting.contains(sp))
+                .collect()
+        };
         if !budget_cut && !durable_unconfirmed.is_empty() {
             let room =
                 crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE.saturating_sub(courier_reads);
