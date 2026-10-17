@@ -152,14 +152,21 @@ async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, want
     let line
     for (let i = 0; i < 10; i++) {
       delta = readFileSync(WORKER_LOG, 'utf8').slice(logStart)
-      line = delta.split('\n').find((l) => l.includes('POST /arc-ingest txid=') && l.includes(`ua=${JSON.stringify(loggedUa)}`))
+      line = delta.split('\n').find((l) => l.includes('POST /arc-ingest txid=') && l.includes(`ua=${loggedUa}`))
       if (line) break
       await new Promise((r) => setTimeout(r, 100))
     }
-    if (!line || !line.includes(`txid=${JSON.stringify(txid)}`)
-      || !line.includes(`txStatus=${JSON.stringify(txStatus)}`)
-      || !line.includes(`ua=${JSON.stringify(loggedUa)}`) || !line.includes('-> 401 (')) {
+    if (!line || !line.includes(`txid=${txid}`)
+      || !line.includes(`txStatus=${txStatus}`)
+      || !line.includes(`ua=${loggedUa}`) || !line.includes('-> 401 (')) {
       fail(label, 'refusal log must name the pushed txid, status and User-Agent on one 401 line')
+      return
+    }
+    const reason = wantCounter === C_BAD_TOKEN ? 'bad token' : 'no token'
+    const bearer = refusedToken ?? ''
+    const kind = /^[0-9a-f]{64}$/i.test(bearer) ? '64-hex' : 'other'
+    if (!line.includes(`(${reason}: bearer ${kind}, ${Buffer.byteLength(bearer)} bytes)`)) {
+      fail(label, 'refusal log must name the token class, shape and byte length')
       return
     }
     if (refusedToken && delta.includes(refusedToken)) {
