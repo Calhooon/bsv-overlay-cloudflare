@@ -370,3 +370,34 @@ fn obs_566_recompute_seq_is_per_identity_and_rides_the_snapshot_row() {
         "the /owed answer serves the snapshot's recomputeSeq"
     );
 }
+
+/// The W1-OBS-APPLAYER lens's L2: the isolate field `/health.auth.authRefused` is the twin of the durable
+/// `applayer_auth_refused_total`, so both count EVERY front-door refusal: the middleware's arms and the app's three
+/// (`mismatch`, `strict_unauthenticated`, `misconfigured`, each still counted apart in its own isolate field). One
+/// function bumps both, so they cannot drift again.
+#[test]
+fn obs_628_the_isolate_auth_refused_counts_every_arm_the_durable_total_does() {
+    use crate::auth::{
+        count_misconfigured_refused, count_mismatch_refused, count_strict_refused_unauthenticated,
+        counters_snapshot,
+    };
+    let before = counters_snapshot().auth_refused;
+    count_mismatch_refused();
+    count_strict_refused_unauthenticated();
+    count_misconfigured_refused();
+    let d = drained();
+    assert_eq!(d["applayer_auth_refused_total"], 3);
+    assert!(
+        counters_snapshot().auth_refused >= before + 3,
+        "the isolate field counts the app's three arms as the durable total does"
+    );
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let src = squash(include_str!("auth.rs"));
+    assert!(
+        src.contains(&squash(
+            "fn note_auth_refused(reason: &str) { AUTH_REFUSED.fetch_add(1, Ordering::Relaxed); crate::courier::note_presence(\"applayer_auth_refused_total\");"
+        )),
+        "one function bumps the isolate field and the durable total"
+    );
+    assert_eq!(src.matches("AUTH_REFUSED.fetch_add").count(), 1);
+}
