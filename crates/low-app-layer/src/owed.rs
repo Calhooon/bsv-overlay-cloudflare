@@ -2236,13 +2236,21 @@ pub async fn pay_vout_pass(
 /// confirmation the source carried; `None` when nothing names a spender, or the spender IS a covenant pot (the JOIN
 /// took it: the pot's own row tells the story).
 fn spender_mined(i: &OwedInputs, txid: Option<&str>, legacy: bool) -> bool {
-    match i.spender_words {
-        None => legacy, // base index arm
-        Some(words) => match txid.and_then(|id| words.get(&id.to_ascii_lowercase())) {
-            None => legacy,
-            Some(v) => v["word"] == "mined" && !v["verifyPath"].is_null(),
-        },
-    }
+    // no views (the base index arm) or no row for the spender: the legacy word
+    txid.and_then(|id| checked_tracker_mined(i.spender_words, id))
+        .unwrap_or(legacy)
+}
+/// PURE (bsv-low #693 fold, the W1-OWED-693 lens's MEDIUM-1): the tracker's word for `txid` as the RECHECKED view
+/// reads it, the one rule [`spender_mined`] and the re-ask's candidate predicate share: `None` when there are no
+/// views or no row, else `word == "mined"` AND a non-null `verifyPath` (a stored `mined` row whose recheck could not
+/// check this pass is NOT mined).
+pub fn checked_tracker_mined(
+    words: Option<&std::collections::BTreeMap<String, Value>>,
+    txid: &str,
+) -> Option<bool> {
+    words?
+        .get(&txid.to_ascii_lowercase())
+        .map(|v| v["word"] == "mined" && !v["verifyPath"].is_null())
 }
 /// The coin judgement's tracker input; a competitor only wins on a checked
 /// mined word, never on a courier's positive height or a SEEN pointer.
@@ -5648,6 +5656,90 @@ pub(crate) mod tests {
         assert!(routes.contains("bsv-low #693 (the #692 lens's LOW-1), a stated residual"));
         assert!(
             routes.contains("&& r.facts.get(\"spent\").and_then(|v| v.as_bool()) != Some(true)")
+        );
+    }
+
+    /// bsv-low #693 fold (the W1-OWED-693 lens's MEDIUM-1): the re-ask's candidate predicate reads the tracker's
+    /// word as the CONFIRMATION does, the RECHECKED view (`word == "mined"` AND `verifyPath` non-null), never the
+    /// stored row. A stored `mined` row whose recheck could not check this pass (served `verifyPath: null`) leaves
+    /// the row unconfirmed in `spender_mined` AND is a re-ask candidate; a checked one confirms the row and is never
+    /// re-asked; no row falls to the ladder. The route passes `checked_tracker_mined` over the views it built before
+    /// phase 2b (source pin). RED on `a789f9e` by the lens's mutant B shape (the route's tracker input from the
+    /// stored row, or forced to `None`): the source assertions fail; the stored row answered `Some(true)` there and
+    /// the spender was never re-asked.
+    #[test]
+    fn e693f_m1_the_candidates_read_the_rechecked_view_as_spender_mined_does() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let my_pkh = "cc".repeat(20);
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        let hops = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let key = format!("{}:0", tx(0x07));
+        let chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        let mut spends: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends.insert(sweep.clone(), vec![(tx(0x07), 0)]);
+        let courier: HashSet<String> = [sweep.clone()].into();
+        let view = |verify: Value| {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                sweep.clone(),
+                serde_json::json!({"word": "mined", "verifyPath": verify}),
+            );
+            m
+        };
+        let unchecked = view(Value::Null);
+        let checked = view(serde_json::json!(["merkle"]));
+        let reason = |words: &std::collections::BTreeMap<String, Value>| -> Value {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.spender_words = Some(words);
+            i.hop_chain = &chain;
+            i.spender_outputs = &mine;
+            i.spender_inputs = &spends;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = &courier;
+            derive_owed_rows(&i)[0].facts["claimReason"].clone()
+        };
+        let s = std::slice::from_ref(&sweep);
+        // the stored row says mined; the recheck could not check it: unconfirmed, and re-asked
+        assert_eq!(checked_tracker_mined(Some(&unchecked), &sweep), Some(false));
+        assert_eq!(reason(&unchecked), UNCONFIRMED_PAYOUT_REASON);
+        let tracker = checked_tracker_mined(Some(&unchecked), &sweep);
+        assert_eq!(
+            e693_pass(s, &hops, &chain, tracker, 2, true).1,
+            1,
+            "re-asked"
+        );
+        // checked: confirmed, never re-asked
+        assert_eq!(checked_tracker_mined(Some(&checked), &sweep), Some(true));
+        assert_eq!(reason(&checked), COURIER_BYTES_NO_CREDIT_REASON);
+        let tracker = checked_tracker_mined(Some(&checked), &sweep);
+        assert_eq!(e693_pass(s, &hops, &chain, tracker, 2, true).1, 0);
+        // no views, or no row: the ladder decides both
+        assert_eq!(checked_tracker_mined(None, &sweep), None);
+        assert_eq!(
+            checked_tracker_mined(Some(&std::collections::BTreeMap::new()), &sweep),
+            None
+        );
+        // the route: the views built before phase 2b, the candidates chosen after them, from the views
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        let views = "letspender_words=crate::tracker_host::runtime::views(env,&word_rows).await;";
+        let input = "lettracker=crate::owed::checked_tracker_mined(word_lookup_available.then_some(&spender_words),sp,);crate::owed::durable_spender_needs_proof(sp,&hops,&hop_chain,&hop_sweeps,tracker,)";
+        let reask = "crate::owed::durable_reasks(candidates,room,&over_budget,";
+        for wired in [views, input, reask] {
+            assert!(routes.contains(wired), "the route's candidates: {wired}");
+        }
+        assert!(routes.find(views).unwrap() < routes.find(input).unwrap());
+        assert!(routes.find(input).unwrap() < routes.find(reask).unwrap());
+        assert!(
+            !routes.contains("word_rows.get(sp.as_str()).map(|r|r.word==\"mined\")"),
+            "never the stored row"
         );
     }
 

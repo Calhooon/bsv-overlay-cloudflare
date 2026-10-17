@@ -3957,6 +3957,9 @@ async fn owed_recompute_inner(
     // store (the snapshot batch), content-addressed by txid — so a later budget-cut recompute reads them before its
     // clock instead of losing them and clobbering a judged `spent-elsewhere` row. Bounded by the courier cap.
     let mut spender_bytes_to_persist: Vec<(String, crate::owed::StoredSpenderBytes)> = Vec::new();
+    // the tracker's words RECHECKED against chaintracks (the views `spender_mined` reads), built before the spender
+    // phases so phase 2b's candidates read the same word the confirmation does (the #693 fold's MEDIUM-1)
+    let spender_words = crate::tracker_host::runtime::views(env, &word_rows).await;
     {
         // the spenders, newest hop first (the marker's filing time), dedup'd, pots excluded
         let mut ordered: Vec<(i64, String)> = Vec::new();
@@ -4049,26 +4052,13 @@ async fn owed_recompute_inner(
             proof_latched = crate::owed::latched_proof_mined_spenders(&latches, &canonical);
             proof_mined_spenders.extend(proof_latched.iter().cloned());
         }
-        // bsv-low #693 (the #692 lens's MEDIUM-1): the durable spenders whose row still needs the proof (no tracker
-        // mined word, no ladder confirmation, no honoured latch), newest hop first; phase 2b below re-asks at most one
-        let durable_unconfirmed: Vec<String> = ordered
+        // bsv-low #693: the durable spenders no honoured latch covers, newest hop first: phase 2b's candidates are
+        // chosen from them, after the tracker's views are rechecked (below)
+        let durable_ordered: Vec<String> = ordered
             .iter()
             .map(|(_, sp)| sp)
             .filter(|sp| durable_spenders.contains(*sp))
             .filter(|sp| !proof_latched.contains(*sp))
-            .filter(|sp| {
-                // the tracker's word as `spender_mined` reads it (a row that is not mined outranks the ladder)
-                let tracker = word_lookup_available
-                    .then(|| word_rows.get(sp.as_str()).map(|r| r.word == "mined"))
-                    .flatten();
-                crate::owed::durable_spender_needs_proof(
-                    sp,
-                    &hops,
-                    &hop_chain,
-                    &hop_sweeps,
-                    tracker,
-                )
-            })
             .cloned()
             .collect();
         // phase 1: the index's bytes (D1), a parsed courier memo, or the isolate's tx-any cache — no courier asked.
@@ -4267,6 +4257,27 @@ async fn owed_recompute_inner(
         // courier asks stay at most 2 and its time budget is the one it had; an answer the isolate holds inside its
         // TTL (a fault included) is used and never re-bought. Its bytes are in hand: only the proof is read here.
         // The never-asked-first order of phase 2 picks which durable spender gets the slot.
+        // bsv-low #693 (the #692 lens's MEDIUM-1): the durable spenders whose row still needs the proof (no CHECKED
+        // tracker mined word, no ladder confirmation, no honoured latch). The fold's MEDIUM-1 (the W1-OWED-693 lens):
+        // the tracker input is the RECHECKED view `spender_mined` reads (`word == "mined"` AND `verifyPath` non-null:
+        // `owed::checked_tracker_mined`), never the stored row, so a stored `mined` row whose recheck could not
+        // check this pass (a header fault, a stored proof the canonical chain no longer matches) is re-asked
+        let durable_unconfirmed: Vec<String> = durable_ordered
+            .into_iter()
+            .filter(|sp| {
+                let tracker = crate::owed::checked_tracker_mined(
+                    word_lookup_available.then_some(&spender_words),
+                    sp,
+                );
+                crate::owed::durable_spender_needs_proof(
+                    sp,
+                    &hops,
+                    &hop_chain,
+                    &hop_sweeps,
+                    tracker,
+                )
+            })
+            .collect();
         if !budget_cut && !durable_unconfirmed.is_empty() {
             let room =
                 crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE.saturating_sub(courier_reads);
@@ -4316,7 +4327,6 @@ async fn owed_recompute_inner(
     if held_key_mismatches > 0 {
         console_warn!("[owed] {held_key_mismatches} collected row(s) carry a payTxid their key was not filed for (they retire nothing)");
     }
-    let spender_words = crate::tracker_host::runtime::views(env, &word_rows).await;
     // The D3 SEEN + spenderFinal verdict-publication arm is deliberately
     // retained in the results producer until the from-scratch lens rules it.
     let mut inputs = OwedInputs {
