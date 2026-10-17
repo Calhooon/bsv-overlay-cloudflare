@@ -4034,8 +4034,9 @@ async fn owed_recompute_inner(
         // spenders, read BYTE-FREE (one indexed PK range read, none when no spender is durable) BEFORE this pass's own
         // answers: a spender whose checked mined proof an earlier pass latched joins the proof set here, so its row
         // reads confirmed on every later pass whatever this pass's slots, budget or re-ask order did. Each latch's
-        // root is re-read against chaintracks at its height (at most `OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE`
-        // heights, cached per isolate); a moved root is not honoured, a faulted read is (the reorg clear demotes).
+        // root is re-read against chaintracks at its height, NEWEST first (every height inside `LATCH_RECHECK_DEPTH`
+        // of the served tip and at least the newest `OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE`, cached per isolate; the
+        // re-lens's R-HIGH-1 (1)); a moved root is not honoured, a faulted read is (the reorg clear demotes).
         if !durable_spenders.is_empty() {
             let mut latch_spenders: Vec<String> = durable_spenders.iter().cloned().collect();
             latch_spenders.sort();
@@ -4044,7 +4045,12 @@ async fn owed_recompute_inner(
                 &read_proof_latches(db, &latch_spenders).await,
             );
             let mut canonical: HashMap<u64, Option<String>> = HashMap::new();
-            for h in crate::owed::proof_latch_recheck_heights(&latches) {
+            let latch_tip = if latches.is_empty() || over_budget() {
+                None
+            } else {
+                crate::beef_guard::present_tip(env).await
+            };
+            for h in crate::owed::proof_latch_recheck_heights(&latches, latch_tip) {
                 if over_budget() {
                     break;
                 }
