@@ -4004,11 +4004,13 @@ async fn owed_recompute_inner(
         // spender LOOKED (never withheld), and the phases skip it (no courier ever asked again). A read fault leaves
         // the maps as they were — the pass judges as before and the belt (keep_withheld_elsewhere) still catches a
         // previously-judged row.
+        let mut durable_spenders: HashSet<String> = HashSet::new();
         if !seen_spenders.is_empty() {
             match owed_spender_store_read(db, &seen_spenders).await {
                 Ok(hits) => {
                     crate::owed::note_spender_store_hits(hits.len() as u64);
                     for (sp, bytes) in hits {
+                        durable_spenders.insert(sp.clone());
                         spender_look.look(&sp, crate::owed::SpenderLooked::StoredDurable);
                         courier_spenders.insert(sp.clone());
                         spender_inputs.insert(sp.clone(), bytes.inputs.clone());
@@ -4021,6 +4023,27 @@ async fn owed_recompute_inner(
                 }
             }
         }
+        // bsv-low #693 (the #692 lens's MEDIUM-1): the durable spenders whose row still needs the proof (no tracker
+        // mined word, no ladder confirmation), newest hop first; phase 2b below re-asks at most one of them
+        let durable_unconfirmed: Vec<String> = ordered
+            .iter()
+            .map(|(_, sp)| sp)
+            .filter(|sp| durable_spenders.contains(*sp))
+            .filter(|sp| {
+                // the tracker's word as `spender_mined` reads it (a row that is not mined outranks the ladder)
+                let tracker = word_lookup_available
+                    .then(|| word_rows.get(sp.as_str()).map(|r| r.word == "mined"))
+                    .flatten();
+                crate::owed::durable_spender_needs_proof(
+                    sp,
+                    &hops,
+                    &hop_chain,
+                    &hop_sweeps,
+                    tracker,
+                )
+            })
+            .cloned()
+            .collect();
         // phase 1: the index's bytes (D1), a parsed courier memo, or the isolate's tx-any cache — no courier asked.
         // A spender the durable store already filled is dropped here (its bytes are in hand, budget-free).
         let mut ordered: Vec<String> = ordered
@@ -4207,6 +4230,42 @@ async fn owed_recompute_inner(
                 spender_outputs.insert(sp, parsed.outputs);
             }
         }
+        // phase 2b, bsv-low #693 (the #692 lens's MEDIUM-1): a durable spender's `/tx-any` is otherwise never asked
+        // again, so a sweep persisted while still UNMINED never met its proof. THE BOUND: at most
+        // `OWED_DURABLE_REASKS_PER_RECOMPUTE` (1) re-ask a pass, only from the courier slots phase 2 left
+        // (`OWED_SPENDER_COURIER_READS_PER_RECOMPUTE` less `courier_reads`) and under `over_budget`, so the pass's
+        // courier asks stay at most 2 and its time budget is the one it had; an answer the isolate holds inside its
+        // TTL (a fault included) is used and never re-bought. Its bytes are in hand: only the proof is read here.
+        // The never-asked-first order of phase 2 picks which durable spender gets the slot.
+        if !budget_cut && !durable_unconfirmed.is_empty() {
+            let room =
+                crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE.saturating_sub(courier_reads);
+            let candidates =
+                crate::owed::spender_ask_order(durable_unconfirmed, &durable_asks, |sp| {
+                    owed_courier_asked_at(sp).map(|t| t as i64)
+                });
+            let reasks =
+                crate::owed::durable_reasks(candidates, room, &over_budget, |sp| async move {
+                    let now_f = worker::Date::now().as_millis() as f64;
+                    if let Some(a) = tx_any_cached(&sp, now_f) {
+                        return (a, false);
+                    }
+                    let a = resolve_tx_any(None, None, &sp, now_f, "owed", env).await;
+                    let asked = a.source != Some("memo");
+                    (a, asked)
+                })
+                .await;
+            for (r, _) in reasks {
+                if r.courier_asked {
+                    courier_reads += 1;
+                    owed_courier_note_asked(&r.spender, worker::Date::now().as_millis() as f64);
+                    spenders_asked.push(r.spender.clone());
+                }
+                if r.outcome == crate::owed::DurableReaskOutcome::MinedByProof {
+                    proof_mined_spenders.insert(r.spender);
+                }
+            }
+        }
     }
 
     // 7. derive (pure), then the ONE service order and the write cap (N2: a planted-marker flood can derive
@@ -4305,6 +4364,11 @@ async fn owed_recompute_inner(
         let proof_memos: Vec<crate::hops_view::ProbeMemo> = rows
             .iter()
             .filter(|r| {
+                // bsv-low #693 (the #692 lens's LOW-1), a stated residual: the index-hop-row arm (`spent == true`) is
+                // NOT upgraded, because `owed::non_pot_spender` confirms that arm from the index's own
+                // `spent_confirmed` and never reads a chain-rung memo, so such a memo would change nothing, and making
+                // that arm read one would let a non-index word confirm an `index-bytes` row, whose claimability IS its
+                // `confirmed`; that row's flap is closed instead by phase 2b's re-ask of its durable spender.
                 r.facts.get("confirmedSource").and_then(|v| v.as_str()) == Some("proof")
                     && r.facts.get("spent").and_then(|v| v.as_bool()) != Some(true)
             })
