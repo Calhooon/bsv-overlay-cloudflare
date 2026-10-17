@@ -86,13 +86,27 @@ fn request(path: &str, headers: &[(&str, String)], body: Option<&[u8]>) -> Reque
     Request::new_with_init(&format!("https://app-layer.test{path}"), &init).unwrap()
 }
 
+/// The SDK's InitialRequest: a 64-character `createNonce` nonce (16 random
+/// bytes + a 32-byte HMAC, made by the middleware's own `create_session_nonce`),
+/// 266 bytes, as the lens measured the SDK's.
 fn initial_request() -> Vec<u8> {
+    use futures_util::FutureExt;
+    let wallet = bsv_rs::wallet::ProtoWallet::new(Some(
+        bsv_rs::primitives::PrivateKey::from_hex(&format!("{:064x}", 3)).unwrap(),
+    ));
+    let nonce = bsv_middleware_cloudflare::core::auth::create_session_nonce(&wallet, "low-670")
+        .now_or_never()
+        .expect("a ProtoWallet answers at once")
+        .unwrap();
+    assert_eq!(nonce.len(), 64);
     let key = bsv_rs::primitives::PrivateKey::from_hex(&format!("{:064x}", 2)).unwrap();
     let mut m =
         bsv_rs::auth::AuthMessage::new(bsv_rs::auth::MessageType::InitialRequest, key.public_key());
-    m.initial_nonce = Some(bsv_middleware_cloudflare::core::auth::generate_random_nonce());
+    m.initial_nonce = Some(nonce);
     m.requested_certificates = Some(Default::default());
-    serde_json::to_vec(&m).unwrap()
+    let bytes = serde_json::to_vec(&m).unwrap();
+    assert_eq!(bytes.len(), 266);
+    bytes
 }
 
 /// The reply as `serve` sends it: the door's reply, then the door's CORS.

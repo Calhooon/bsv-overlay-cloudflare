@@ -785,14 +785,16 @@ pub fn auth_unavailable_log_line(e: &bsv_middleware_cloudflare::AuthCloudflareEr
 // the structured clone 139,952 to 155,909, so the cell overran and every later
 // request on that session was the 503 (and a count) until the session's TTL.
 
-/// The longest nonce header handed to the middleware. The reference's nonce
-/// (`createNonce`: 16 random bytes + a 16-byte HMAC, base64) is 44 characters;
-/// the server's session nonce is the same shape. 128 leaves room for any
+/// The longest nonce header handed to the middleware. The SDK's per-request
+/// nonce (`x-bsv-auth-nonce`, 32 random bytes, base64) is 44 characters; its
+/// `createNonce` (a handshake's `initialNonce`) and the server's session nonce
+/// (`x-bsv-auth-your-nonce`, the middleware's `create_session_nonce`) are 16
+/// random bytes + a 32-byte HMAC, base64: 64 characters. 80 leaves room for any
 /// encoding, keeps every derived KV key under the 512-byte limit, and keeps the
 /// worst DO session cell under the 128 KiB value cap (`s670_i`).
 pub const AUTH_NONCE_MAX_BYTES: usize = 80;
 /// The longest `/.well-known/auth` body handed to the middleware. A real
-/// InitialRequest is 246 bytes (`s670_e` builds and measures one); the app
+/// InitialRequest is 266 bytes (`s670_e` builds and measures one); the app
 /// layer requests no certificates, so no honest handshake carries a
 /// certificate list. The reference bounds an auth message at 16 MiB
 /// (`MAX_AUTH_MESSAGE_BYTES`) and a handshake RESPONSE at 1 MiB; 4 KiB is
@@ -1381,16 +1383,42 @@ mod tests {
             Some("handshake body over 4096 bytes")
         );
         assert_eq!(handshake_body_oversize(4 * 1024), None);
-        let key = bsv_rs::primitives::PrivateKey::from_hex(&format!("{:064x}", 2)).unwrap();
-        let mut m = bsv_rs::auth::AuthMessage::new(
-            bsv_rs::auth::MessageType::InitialRequest,
-            key.public_key(),
+        // A real InitialRequest (the SDK's shape: version, type, identity key,
+        // a 64-character `createNonce` nonce, an empty certificate request) is
+        // 266 bytes, as the lens measured the SDK's (round 2, question 1).
+        let session_nonce = create_nonce_shaped();
+        assert_eq!(
+            session_nonce.len(),
+            64,
+            "createNonce: 16 + 32 bytes, base64"
         );
-        m.initial_nonce = Some(nonce);
-        m.requested_certificates = Some(Default::default());
-        let real = serde_json::to_vec(&m).unwrap();
-        assert_eq!(real.len(), 246, "a real InitialRequest");
+        assert_eq!(auth_nonce_oversize(|_| Some(session_nonce.clone())), None);
+        let real =
+            serde_json::to_vec(&initial_request_with(session_nonce, Default::default())).unwrap();
+        assert_eq!(real.len(), 266, "a real InitialRequest");
         assert_eq!(handshake_body_oversize(real.len()), None);
+        // A certificate-bearing one (5 certifiers x 5 types x 5 fields; the
+        // lens measured the SDK's at 1,049 bytes) passes the 4 KiB bound.
+        let mut certs = bsv_rs::auth::RequestedCertificateSet::default();
+        for i in 0..5u8 {
+            let certifier = bsv_rs::primitives::PrivateKey::from_hex(&format!("{:064x}", 10 + i))
+                .unwrap()
+                .public_key()
+                .to_hex();
+            certs.certifiers.push(certifier);
+            let type_id = bsv_middleware_cloudflare::core::auth::generate_random_nonce();
+            certs
+                .types
+                .insert(type_id, (0..5).map(|f| format!("field{f}")).collect());
+        }
+        let with_certs =
+            serde_json::to_vec(&initial_request_with(create_nonce_shaped(), certs)).unwrap();
+        assert!(
+            (1_000..AUTH_HANDSHAKE_BODY_MAX_BYTES).contains(&with_certs.len()),
+            "a certificate-bearing InitialRequest is {} bytes",
+            with_certs.len()
+        );
+        assert_eq!(handshake_body_oversize(with_certs.len()), None);
         let mut read = Vec::new();
         for piece in real.chunks(7) {
             assert!(push_bounded(&mut read, piece));
@@ -1458,6 +1486,33 @@ mod tests {
             bound(128, 16 * 1024) > DO_VALUE_CAP,
             "the old bounds overrun"
         );
+    }
+
+    /// A nonce of the SDK's `createNonce` shape, made by the middleware's own
+    /// `create_session_nonce` (16 random bytes + a 32-byte HMAC: 64 characters).
+    fn create_nonce_shaped() -> String {
+        use futures_util::FutureExt;
+        let key = bsv_rs::primitives::PrivateKey::from_hex(&format!("{:064x}", 3)).unwrap();
+        let wallet = bsv_rs::wallet::ProtoWallet::new(Some(key));
+        bsv_middleware_cloudflare::core::auth::create_session_nonce(&wallet, "low-670")
+            .now_or_never()
+            .expect("a ProtoWallet answers at once")
+            .unwrap()
+    }
+
+    /// An InitialRequest of the SDK's shape with this nonce and certificate ask.
+    fn initial_request_with(
+        nonce: String,
+        certs: bsv_rs::auth::RequestedCertificateSet,
+    ) -> bsv_rs::auth::AuthMessage {
+        let key = bsv_rs::primitives::PrivateKey::from_hex(&format!("{:064x}", 2)).unwrap();
+        let mut m = bsv_rs::auth::AuthMessage::new(
+            bsv_rs::auth::MessageType::InitialRequest,
+            key.public_key(),
+        );
+        m.initial_nonce = Some(nonce);
+        m.requested_certificates = Some(certs);
+        m
     }
 
     /// (f) The lens's HIGH-2: the store fault's log line carries `ERR_STORAGE`,
