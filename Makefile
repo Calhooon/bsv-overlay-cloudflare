@@ -5,7 +5,7 @@
 # in parity mode + runs the differential harness + writes PARITY_REPORT.md.
 # Exit is non-zero on any un-noted divergence.
 
-.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ci-d1-board ownership \
+.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ci-d1-board ownership app-layer-door \
         wrangler-dev harness test e2e-bsv-storage clean help
 
 help:
@@ -125,9 +125,19 @@ ci:
 	cargo build -p bsv-overlay-engine -p bsv-overlay-discovery --target wasm32-unknown-unknown; \
 	cargo build $(WORKERS) -p bsv-overlay-cloudflare --target wasm32-unknown-unknown --release; \
 	cargo build $(WORKERS) -p low-app-layer --target wasm32-unknown-unknown --release; \
+	$(MAKE) app-layer-door; \
 	$(MAKE) ci-deploy; \
 	$(MAKE) ci-route; \
 	echo "✅ local CI green"
+
+# bsv-low #670 (the lens's HIGH-3): the app layer's auth door on its REAL
+# middleware path, wasm32 under Node (`crates/low-app-layer/tests/door_wasm.rs`):
+# a store fault through `process_auth_with_storage` is the door's 503 with
+# `Retry-After` and CORS, and the oversize guard on real requests. The
+# runner's version must equal the workers lock's wasm-bindgen (0.2.126).
+WASM_BINDGEN_TEST_RUNNER ?= $(firstword $(wildcard $(HOME)/bsv/targets/wbg-0.2.126/bin/wasm-bindgen-test-runner) wasm-bindgen-test-runner)
+app-layer-door:
+	CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=$(WASM_BINDGEN_TEST_RUNNER) cargo test $(WORKERS) -p low-app-layer --target wasm32-unknown-unknown --test door_wasm
 
 # bsv-low #474: the shared D1's ownership manifest. Every SQL statement of the
 # overlay, discovery and app-layer crates against storage-ownership.json (prose:
