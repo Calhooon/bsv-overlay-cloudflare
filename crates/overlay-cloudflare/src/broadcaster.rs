@@ -2348,6 +2348,7 @@ fn arcade_fatal_reason(txid: &str, status: &str, extra_info: &str) -> String {
 /// on the returned `ArcOutcome`. It ALSO implements `ArcBroadcaster` (best-effort
 /// single-tx submit) so it can occupy the engine's generic-broadcast slot.
 pub struct ArcadeBroadcaster {
+    courier_counters: Option<crate::courier_counters::Counters>,
     /// Base URL, e.g. `https://arcade-v2-us-1.bsvblockchain.tech` (no trailing `/tx`).
     base_url: String,
     /// `X-CallbackUrl` for the MINED webhook (our `/arc-ingest`). `None` → no
@@ -2390,6 +2391,14 @@ pub struct ArcadeBroadcaster {
 }
 
 impl ArcadeBroadcaster {
+    pub(crate) fn with_courier_counters(
+        mut self,
+        counters: crate::courier_counters::Counters,
+    ) -> Self {
+        self.courier_counters = Some(counters);
+        self
+    }
+
     /// Whether the submit's own answer already reached the gate (Arcade echoed SEEN or MINED for a known transaction).
     pub fn duplicate_echo(&self) -> bool {
         self.duplicate_echo.get()
@@ -2412,6 +2421,7 @@ impl ArcadeBroadcaster {
         Self {
             base_url,
             callback_url: None,
+            courier_counters: None,
             corroborator_taal_key: None,
             corroborate_ms: std::cell::Cell::new(0.0),
             poll_ms: std::cell::Cell::new(0.0),
@@ -2519,10 +2529,10 @@ impl ArcadeBroadcaster {
         if !allowed {
             return (NetworkPresence::Inconclusive, "capped");
         }
-        let bitails = self.proof_sources.bitails_presence(txid).await;
+        let bitails = self.proof_sources.bitails_presence_counted(txid, self.courier_counters.as_ref()).await;
         let woc = self
             .proof_sources
-            .woc_presence(self.woc_api_key.as_deref(), txid)
+            .woc_presence_counted(self.woc_api_key.as_deref(), txid, self.courier_counters.as_ref())
             .await;
         (
             crate::proof_fetcher::classify_presence(bitails, woc),
@@ -3284,18 +3294,38 @@ impl ArcadeBroadcaster {
         let mut init = worker::RequestInit::new();
         init.with_method(worker::Method::Get);
         init.with_headers(headers);
-        let request = worker::Request::new_with_init(&url, &init).ok()?;
-        let mut response = worker::Fetch::Request(request).send().await.ok()?;
-        if !(200..300).contains(&response.status_code()) {
-            return None;
+        let mut observation = self.courier_counters.as_ref().map(|c| c.attempt("arcade"));
+        let mut outcome = crate::courier_counters::Outcome::Fault;
+        let answer = async {
+            let request = worker::Request::new_with_init(&url, &init).ok()?;
+            let mut response = worker::Fetch::Request(request).send().await.ok()?;
+            let status = response.status_code();
+            outcome = crate::courier_counters::Outcome::response(status, false, true);
+            if !(200..300).contains(&status) {
+                return None;
+            }
+            let text = match response.text().await {
+                Ok(text) => text,
+                Err(_) => {
+                    outcome = crate::courier_counters::Outcome::Fault;
+                    return None;
+                }
+            };
+            let parsed: ArcadeStatusResponse = serde_json::from_str(&text).ok()?;
+            if parsed.tx_status.is_empty() {
+                None
+            } else {
+                outcome = if parsed.txid.eq_ignore_ascii_case(txid) {
+                    crate::courier_counters::Outcome::Ok
+                } else {
+                    crate::courier_counters::Outcome::Shape
+                };
+                Some(parsed)
+            }
         }
-        let text = response.text().await.ok()?;
-        let parsed: ArcadeStatusResponse = serde_json::from_str(&text).ok()?;
-        if parsed.tx_status.is_empty() {
-            None
-        } else {
-            Some(parsed)
-        }
+        .await;
+        crate::courier_counters::Attempt::set(&mut observation, outcome);
+        answer
     }
 }
 

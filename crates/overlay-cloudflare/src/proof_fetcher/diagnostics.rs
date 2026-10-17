@@ -10,11 +10,15 @@ pub(crate) struct ProofRequest {
     pub url: String,
     pub http_status: Option<u16>,
     pub parse_result: &'static str,
+    #[serde(skip)]
+    observation: Option<CourierAttempt>,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProofProbe {
+    #[serde(skip)]
+    pub(super) counters: Option<CourierCounters>,
     pub rung: &'static str,
     pub requests: Vec<ProofRequest>,
     pub parse_result: &'static str,
@@ -33,6 +37,7 @@ impl ProofProbe {
     pub(crate) fn new(rung: &'static str) -> Self {
         Self {
             rung,
+            counters: None,
             requests: Vec::new(),
             parse_result: "disabled",
             judge: "not-run",
@@ -59,8 +64,10 @@ impl ProofProbe {
             url: safe_url,
             http_status: None,
             parse_result: "pending",
+            observation: None,
         });
-        let response = http_get(&url, header).await;
+        let (response, observation) =
+            http_get_counted(&url, header, self.counters.as_ref(), self.rung).await;
         let (status, body) = match response {
             Ok((status, body)) => (Some(status), Some(body)),
             Err(_) => (None, None),
@@ -69,14 +76,23 @@ impl ProofProbe {
         if let Some(request) = self.requests.last_mut() {
             request.http_status = status;
             request.parse_result = if ok { "pending" } else { "not-run" };
+            request.observation = observation;
+            CourierAttempt::set(
+                &mut request.observation,
+                status.map_or(CourierOutcome::Fault, |s| {
+                    CourierOutcome::response(s, true, true)
+                }),
+            );
         }
         if !ok {
-            self.parse_result = if status.is_some() {
+            self.parse_result = if matches!(status, Some(404 | 410)) {
+                "notfound"
+            } else if status.is_some() {
                 "http-error"
             } else {
                 "transport-error"
             };
-            self.fault = true;
+            self.fault = !matches!(status, Some(404 | 410));
             return None;
         }
         body
@@ -87,6 +103,14 @@ impl ProofProbe {
         self.fault |= fault;
         if let Some(request) = self.requests.last_mut() {
             request.parse_result = result;
+            let outcome = if fault {
+                CourierOutcome::Shape
+            } else if matches!(result, "no-proof" | "unmined-hint") {
+                CourierOutcome::NotFound
+            } else {
+                CourierOutcome::Ok
+            };
+            CourierAttempt::set(&mut request.observation, outcome);
         }
     }
 }
@@ -94,6 +118,7 @@ impl ProofProbe {
 impl ChainProofFetcher {
     /// Read one rung and judge its candidate. No store, memo, counter or event
     /// is changed here, so the admin probe exercises the production parser.
+    #[cfg(test)]
     pub(crate) async fn diagnose_rung(&self, rung: &'static str, txid: &str) -> ProofProbe {
         let mut probe = ProofProbe::new(rung);
         self.diagnose_rung_into(&mut probe, txid).await;
@@ -200,6 +225,11 @@ impl ChainProofFetcher {
             BumpVerdict::Fault(_) => "header-fault",
         };
         probe.fault = probe.judge != "valid";
+        if probe.judge == "rejected" {
+            if let Some(request) = probe.requests.last_mut() {
+                CourierAttempt::set(&mut request.observation, CourierOutcome::Shape);
+            }
+        }
     }
 
     pub(super) async fn note_proof_probe(&self, probe: &ProofProbe) {

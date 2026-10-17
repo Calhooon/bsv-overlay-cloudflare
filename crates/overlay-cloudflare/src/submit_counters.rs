@@ -108,6 +108,7 @@ pub(crate) fn all_names() -> Vec<String> {
 /// Request owned, with no isolate tail to lose or mix into another answer.
 pub(crate) struct SubmitCounters {
     reason: Cell<Reason>,
+    couriers: crate::courier_counters::Counters,
     deltas: RefCell<BTreeMap<String, u64>>,
 }
 
@@ -115,8 +116,13 @@ impl SubmitCounters {
     pub(crate) fn new() -> Self {
         Self {
             reason: Cell::new(Reason::RequestFault),
+            couriers: crate::courier_counters::Counters::new(crate::courier_counters::Reader::Door),
             deltas: RefCell::default(),
         }
+    }
+
+    pub(crate) fn couriers(&self) -> crate::courier_counters::Counters {
+        self.couriers.clone()
     }
 
     pub(crate) fn reason(&self, reason: Reason) {
@@ -142,6 +148,9 @@ impl SubmitCounters {
     }
 
     pub(crate) async fn flush(self, db: worker::D1Database) {
+        for (name, delta) in self.couriers.take() {
+            self.bump(name, delta);
+        }
         crate::ops::bump_counters(&db, self.deltas.into_inner()).await;
     }
 }

@@ -33,6 +33,7 @@
 //! for the wasm-clean `transaction` surface.
 
 mod diagnostics;
+use crate::courier_counters::{Counters as CourierCounters, Outcome as CourierOutcome, Attempt as CourierAttempt};
 pub(crate) use diagnostics::{ProofProbe, PROOF_RUNGS};
 
 use overlay_engine::beef_limits;
@@ -183,20 +184,47 @@ impl ProofSources {
         enabled
     }
     pub(crate) async fn bitails_presence(self, txid: &str) -> Option<NetworkPresence> {
+        self.bitails_presence_counted(txid, None).await
+    }
+    pub(crate) async fn bitails_presence_counted(
+        self,
+        txid: &str,
+        counters: Option<&CourierCounters>,
+    ) -> Option<NetworkPresence> {
         if !self.permits("bitails") {
             return None;
         }
-        bitails_presence(DEFAULT_BITAILS_BASE, txid).await
+        presence_counted(
+            &format!("{DEFAULT_BITAILS_BASE}/tx/{txid}"),
+            None,
+            "bitails",
+            counters,
+        )
+        .await
     }
     pub(crate) async fn woc_presence(
         self,
         key: Option<&str>,
         txid: &str,
     ) -> Option<NetworkPresence> {
+        self.woc_presence_counted(key, txid, None).await
+    }
+    pub(crate) async fn woc_presence_counted(
+        self,
+        key: Option<&str>,
+        txid: &str,
+        counters: Option<&CourierCounters>,
+    ) -> Option<NetworkPresence> {
         if !self.permits("woc") {
             return None;
         }
-        woc_presence(DEFAULT_WOC_BASE, key, txid).await
+        presence_counted(
+            &format!("{DEFAULT_WOC_BASE}/tx/hash/{txid}"),
+            key.map(|k| ("woc-api-key", k)),
+            "woc",
+            counters,
+        )
+        .await
     }
     pub(crate) async fn arcade_look(
         self,
@@ -220,6 +248,7 @@ struct ProofMemo {
 /// `AncestorFetcher` backed by the configured courier ladder, with a
 /// mandatory header verification before any BUMP is returned.
 pub struct ChainProofFetcher {
+    courier_counters: Option<CourierCounters>,
     proof_tallies: RefCell<BTreeMap<&'static str, RungTally>>,
     proof_fault_logged: RefCell<std::collections::HashSet<&'static str>>,
     proof_fault_store: Option<Rc<worker::D1Database>>,
@@ -322,6 +351,7 @@ impl ChainProofFetcher {
             proof_tallies: RefCell::default(),
             proof_fault_logged: RefCell::default(),
             proof_fault_store: None,
+            courier_counters: None,
             proof_memo: RefCell::new(HashMap::new()),
             ancestor_memo: RefCell::new(HashMap::new()),
             rung_stats: RefCell::new(BTreeMap::new()),
@@ -353,6 +383,11 @@ impl ChainProofFetcher {
         } else {
             String::new()
         };
+        self
+    }
+
+    pub(crate) fn with_courier_counters(mut self, counters: CourierCounters) -> Self {
+        self.courier_counters = Some(counters);
         self
     }
 
@@ -521,7 +556,9 @@ impl ChainProofFetcher {
         exhaustive: &Cell<bool>,
     ) -> Result<Option<String>, String> {
         for rung in PROOF_RUNGS {
-            let probe = self.diagnose_rung(rung, txid).await;
+            let mut probe = ProofProbe::new(rung);
+            probe.counters = self.courier_counters.clone();
+            self.diagnose_rung_into(&mut probe, txid).await;
             self.note_proof_probe(&probe).await;
             if let Some(RungStep::Abort(error)) = &probe.step {
                 return Err(error.clone());
@@ -585,16 +622,34 @@ impl ChainProofFetcher {
         if !self.source_enabled(source) {
             return Err(());
         }
-        let (status, body) = http_get(url, header).await.map_err(|_| ())?;
+        let (response, mut observation) =
+            http_get_counted(url, header, self.courier_counters.as_ref(), source).await;
+        let (status, body) = match response {
+            Ok(response) => response,
+            Err(_) => {
+                CourierAttempt::set(&mut observation, CourierOutcome::Fault);
+                return Err(());
+            }
+        };
         if raw_not_found(status, &body) {
+            CourierAttempt::set(&mut observation, CourierOutcome::NotFound);
             return Ok(None);
         }
         if !(200..300).contains(&status) {
+            CourierAttempt::set(&mut observation, CourierOutcome::Fault);
             return Err(());
         }
         let raw = body.trim().to_string();
-        let recomputed = Transaction::from_hex(&raw).map_err(|_| ())?.id();
-        if recomputed.eq_ignore_ascii_case(txid) {
+        let valid = Transaction::from_hex(&raw).is_ok_and(|tx| tx.id().eq_ignore_ascii_case(txid));
+        CourierAttempt::set(
+            &mut observation,
+            if valid {
+                CourierOutcome::Ok
+            } else {
+                CourierOutcome::Shape
+            },
+        );
+        if valid {
             Ok(Some(raw))
         } else {
             Err(())
@@ -825,21 +880,35 @@ impl ChainProofFetcher {
             return RungCall::Fault(format!("{name}: disabled source skipped"));
         }
         self.budget.set(remaining - 1);
-        match http_get(url, hdr).await {
+        let (response, mut observation) =
+            http_get_counted(url, hdr, self.courier_counters.as_ref(), name).await;
+        match response {
             Err(e) => {
+                CourierAttempt::set(&mut observation, CourierOutcome::Fault);
                 self.rung_fault(name);
                 RungCall::Fault(format!("{name}: {e}"))
             }
-            Ok((status, body)) => match parse(status, &body) {
-                Ok(answer) => {
-                    self.rung_ok(name);
-                    RungCall::Answer(answer)
+            Ok((status, body)) => {
+                let answer = parse(status, &body);
+                CourierAttempt::set(
+                    &mut observation,
+                    CourierOutcome::response(
+                        status,
+                        answer.is_ok(),
+                        answer.as_ref().is_ok_and(Option::is_some),
+                    ),
+                );
+                match answer {
+                    Ok(answer) => {
+                        self.rung_ok(name);
+                        RungCall::Answer(answer)
+                    }
+                    Err(e) => {
+                        self.rung_fault(name);
+                        RungCall::Fault(format!("{name}: {e}"))
+                    }
                 }
-                Err(e) => {
-                    self.rung_fault(name);
-                    RungCall::Fault(format!("{name}: {e}"))
-                }
-            },
+            }
         }
     }
 }
@@ -1408,8 +1477,20 @@ pub(crate) async fn http_get(
     url: &str,
     header: Option<(&str, &str)>,
 ) -> Result<(u16, String), String> {
-    overlay_engine::meter::courier_request().map_err(str::to_string)?;
-    if overlay_engine::meter::root_scoped() {
+    http_get_counted(url, header, None, "other").await.0
+}
+
+async fn http_get_counted(
+    url: &str,
+    header: Option<(&str, &str)>,
+    counters: Option<&CourierCounters>,
+    rung: &str,
+) -> (Result<(u16, String), String>, Option<CourierAttempt>) {
+    if let Err(error) = overlay_engine::meter::courier_request() {
+        return (Err(error.to_string()), None);
+    }
+    let observation = counters.map(|c| c.attempt(rung));
+    let response = if overlay_engine::meter::root_scoped() {
         overlay_engine::gasp::race_or_deadline(
             http_get_inner(url, header),
             crate::broadcaster::sleep_ms(overlay_engine::meter::COURIER_RUNG_TIMEOUT_MS),
@@ -1418,7 +1499,8 @@ pub(crate) async fn http_get(
         .unwrap_or_else(|| Err("courier rung timeout".into()))
     } else {
         http_get_inner(url, header).await
-    }
+    };
+    (response, observation)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -3668,27 +3750,27 @@ fn rebroadcast_legs(beef: &[u8]) -> Option<(String, Vec<RebroadcastLeg>)> {
     }
 }
 
-/// Bitails presence with the body's mined height, definitive 404 or fault.
-pub(crate) async fn bitails_presence(base: &str, txid: &str) -> Option<NetworkPresence> {
-    let url = format!("{}/tx/{}", base.trim_end_matches('/'), txid);
-    match http_get(&url, None).await {
-        Ok((status, body)) => presence_response(status, &body),
-        _ => None,
-    }
-}
-
-/// WoC `GET /tx/hash/{txid}` presence — same three-way contract.
-pub(crate) async fn woc_presence(
-    base: &str,
-    api_key: Option<&str>,
-    txid: &str,
+async fn presence_counted(
+    url: &str,
+    header: Option<(&str, &str)>,
+    provider: &str,
+    counters: Option<&CourierCounters>,
 ) -> Option<NetworkPresence> {
-    let url = format!("{}/tx/hash/{}", base.trim_end_matches('/'), txid);
-    let hdr = api_key.map(|k| ("woc-api-key", k));
-    match http_get(&url, hdr).await {
-        Ok((status, body)) => presence_response(status, &body),
-        _ => None,
-    }
+    let (response, mut observation) = http_get_counted(url, header, counters, provider).await;
+    let (presence, outcome) = match response {
+        Ok((status, body)) => {
+            let presence = presence_response(status, &body);
+            let outcome = CourierOutcome::response(
+                status,
+                presence.is_some(),
+                matches!(presence, Some(NetworkPresence::Present { .. })),
+            );
+            (presence, outcome)
+        }
+        Err(_) => (None, CourierOutcome::Fault),
+    };
+    CourierAttempt::set(&mut observation, outcome);
+    presence
 }
 
 /// The #273 backstop: admitted (broadcast-gated) rows that are STILL
@@ -4809,11 +4891,91 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn obs_625_bitails_unmined_404_is_not_a_fault() {
+        TEST_HTTP_RESPONSES.with(|responses| responses.borrow_mut().clear());
+        let counts = CourierCounters::new(crate::courier_counters::Reader::Janitor);
+        let fetcher = ChainProofFetcher::new(None)
+            .with_sources(ProofSources::parse("bitails"))
+            .with_courier_counters(counts.clone());
+        let probe = fetcher.diagnose_rung("bitails", &"ab".repeat(32)).await;
+        fetcher.note_proof_probe(&probe).await;
+        assert!(!probe.fault, "a pruned indexer's 404 is a known absence");
+        assert_eq!(fetcher.proof_tallies.borrow()["bitails"].fault, 0);
+        fetcher
+            .fetch_verified_proof(&"ab".repeat(32))
+            .await
+            .unwrap();
+        let rows = counts.take();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows["courier_janitor_bitails_notfound_total"], 1);
+    }
+
+    #[tokio::test]
+    async fn obs_625_spend_and_presence_readers_split_shape_from_transport() {
+        use crate::courier_counters::Reader;
+        let txid = "ab".repeat(32);
+        let spent = format!(
+            r#"{{"outputs":[{{"index":0,"spent":true,"spentIn":{{"txid":"{}"}}}}]}}"#,
+            "cd".repeat(32)
+        );
+        for (status, body, outcome) in [
+            (404, "", "notfound"),
+            (503, "", "fault"),
+            (200, "broken json", "shape"),
+            (200, spent.as_str(), "ok"),
+        ] {
+            let counts = CourierCounters::new(Reader::Janitor);
+            let fetcher = ChainProofFetcher::new(None)
+                .with_sources(ProofSources::parse("bitails"))
+                .with_courier_counters(counts.clone());
+            let url = bitails_tx_url(DEFAULT_BITAILS_BASE, &txid);
+            TEST_HTTP_RESPONSES.with(|r| r.borrow_mut().insert(url.clone(), (status, body.into())));
+            let _ = fetcher
+                .call_rung("bitails_tx", &url, None, |s, b| {
+                    parse_bitails_tx_spend_body(s, b, &txid, 0)
+                })
+                .await;
+            let rows = counts.take();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[&format!("courier_janitor_bitails_{outcome}_total")], 1);
+            let door = CourierCounters::new(Reader::Door);
+            let _ = ProofSources::parse("bitails")
+                .bitails_presence_counted(&txid, Some(&door))
+                .await;
+            let rows = door.take();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[&format!("courier_door_bitails_{outcome}_total")], 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn obs_625_budget_stops_and_disabled_sources_are_not_asks() {
+        TEST_HTTP_RESPONSES.with(|r| r.borrow_mut().clear());
+        let counts = CourierCounters::new(crate::courier_counters::Reader::Door);
+        let disabled = ChainProofFetcher::new(None).with_courier_counters(counts.clone());
+        let _ = disabled.fetch_raw_hex(TXID).await;
+        assert!(counts.take().is_empty());
+        let enabled = ChainProofFetcher::new(None)
+            .with_sources(ProofSources::parse("bitails"))
+            .with_courier_counters(counts.clone());
+        overlay_engine::meter::root_scope(async {
+            for n in 0..16 {
+                let _ = enabled.fetch_raw_hex(&format!("{n:064x}")).await;
+            }
+        })
+        .await;
+        assert_eq!(counts.take()["courier_door_bitails_notfound_total"], 12);
+    }
+
+    #[tokio::test]
     async fn proofs_rung_failures_are_counted_and_logged_once() {
         TEST_PROOF_LOGS.with(|logs| logs.borrow_mut().clear());
         TEST_HTTP_RESPONSES.with(|responses| responses.borrow_mut().clear());
         let fetcher = ChainProofFetcher::new(None).with_sources(ProofSources::parse("woc"));
         for n in 1..=3 {
+            TEST_HTTP_RESPONSES.with(|responses| responses.borrow_mut().insert(
+                format!("{DEFAULT_WOC_BASE}/tx/hash/{n:064x}"), (503, String::new()),
+            ));
             assert!(fetcher
                 .verified_proof_for(&format!("{n:064x}"))
                 .await

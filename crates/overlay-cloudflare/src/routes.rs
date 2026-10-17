@@ -1058,7 +1058,8 @@ async fn submit_parts(
                 );
                 tagged_beef.beef.clone()
             } else {
-                let fetcher = crate::courier_fetcher(env, crate::lookup_service_chain_tracker(env));
+                let fetcher = crate::courier_fetcher(env, crate::lookup_service_chain_tracker(env))
+                    .with_courier_counters(counters.couriers());
                 let mut raws: Vec<(String, String)> = Vec::new();
                 for txid in &missing {
                     match fetcher.fetch_raw_hex(txid).await {
@@ -1285,6 +1286,7 @@ async fn submit_parts(
         let mut arcade =
             crate::broadcaster::ArcadeBroadcaster::new(arcade_url.clone().unwrap_or_default())
                 .with_proof_sources(crate::proof_fetcher::ProofSources::from_env(env))
+                .with_courier_counters(counters.couriers())
                 // #214: Arcade's async REJECTED is never authoritative
                 // uncorroborated — an exhausted ladder gets a second
                 // broadcaster's word (TAAL → GorillaPool) before any 422.
