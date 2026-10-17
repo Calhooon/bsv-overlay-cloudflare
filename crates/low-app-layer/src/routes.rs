@@ -4036,27 +4036,32 @@ async fn owed_recompute_inner(
         // reads confirmed on every later pass whatever this pass's slots, budget or re-ask order did. Each latch's
         // root is re-read against chaintracks at its height, NEWEST first (every height inside `LATCH_RECHECK_DEPTH`
         // of the served tip and at least the newest `OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE`, cached per isolate; the
-        // re-lens's R-HIGH-1 (1)); a moved root is not honoured, a faulted read is (the reorg clear demotes).
+        // re-lens's R-HIGH-1 (1)); a moved root is not honoured. A latch not re-read this pass (a faulted header,
+        // `over_budget`) is honoured only on a clean clear history (the tombstone rides the latch read: written past
+        // the #484 grace after the last clear), and then only when reorg-proof or between the grace and two hours old
+        // (R-HIGH-1 (2), (3)).
         if !durable_spenders.is_empty() {
             let mut latch_spenders: Vec<String> = durable_spenders.iter().cloned().collect();
             latch_spenders.sort();
-            let latches = crate::owed::proof_latches_of(
-                &latch_spenders,
-                &read_proof_latches(db, &latch_spenders).await,
-            );
+            let latch_memos = read_proof_latches(db, &latch_spenders).await;
+            let latch_clear = crate::hops_view::reorg_clear_at(&latch_memos);
+            let latches = crate::owed::proof_latches_of(&latch_spenders, &latch_memos);
             let mut canonical: HashMap<u64, Option<String>> = HashMap::new();
-            let latch_tip = if latches.is_empty() || over_budget() {
-                None
-            } else {
-                crate::beef_guard::present_tip(env).await
-            };
+            // the pass's own tip (read once at its start, no further call)
+            let latch_tip = tip;
             for h in crate::owed::proof_latch_recheck_heights(&latches, latch_tip) {
                 if over_budget() {
                     break;
                 }
                 canonical.insert(h, crate::beef_guard::canonical_root(env, h).await);
             }
-            proof_latched = crate::owed::latched_proof_mined_spenders(&latches, &canonical);
+            proof_latched = crate::owed::latched_proof_mined_spenders(
+                &latches,
+                &canonical,
+                latch_tip,
+                latch_clear,
+                now_ms,
+            );
             proof_mined_spenders.extend(proof_latched.iter().cloned());
         }
         // bsv-low #693: the durable spenders no honoured latch covers, newest hop first: phase 2b's candidates are
@@ -6968,7 +6973,7 @@ async fn read_latch_ranges(
             .map(|b| JsValue::from_str(b))
             .collect();
         match db
-            .prepare(crate::owed::home_latch_range_read_sql(chunk.len()))
+            .prepare(crate::owed::home_latch_range_read_sql(binds.len() / 2))
             .bind(&binds)
         {
             Ok(stmt) => match stmt
