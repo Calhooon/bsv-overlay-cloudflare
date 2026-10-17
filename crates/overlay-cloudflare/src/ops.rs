@@ -148,15 +148,24 @@ pub async fn note_engine_walk_not_now(
     stop: &overlay_engine::engine::WalkCouldNotRun,
     door: &str,
 ) {
-    worker::console_log!(
+    worker::console_log!("{}", engine_walk_not_now_line(stop, door));
+    bump_counter(db, engine_walk_over_counter(stop.limb), 1).await;
+}
+
+/// The detail line of a NOT NOW walk at `door`, logged by every door whether its counter is written at once
+/// ([`note_engine_walk_not_now`]) or rides `/submit`'s request batch.
+pub fn engine_walk_not_now_line(
+    stop: &overlay_engine::engine::WalkCouldNotRun,
+    door: &str,
+) -> String {
+    format!(
         "{door}: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): not now, nothing admitted; present it proven",
         stop.subject_txid,
         stop.limb.as_str(),
         stop.at_txid,
         stop.subject_judged,
         stop.what
-    );
-    bump_counter(db, engine_walk_over_counter(stop.limb), 1).await;
+    )
 }
 
 /// The counter of a door walk past its own bound, by the limb it passed.

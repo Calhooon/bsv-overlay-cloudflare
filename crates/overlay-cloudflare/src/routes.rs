@@ -80,8 +80,9 @@ pub fn walk_not_now_body(stop: &overlay_engine::engine::WalkCouldNotRun) -> serd
     })
 }
 
-/// The door's answer for [`walk_not_now_body`] at `door`: counted (`ops::note_engine_walk_not_now`), logged, 503
-/// with `Retry-After`. Nothing was written and nothing is queued: the same unproven bytes would breach again.
+/// The door's answer for [`walk_not_now_body`] at `door`: counted (into the request's batch when `counters` is
+/// given, else `ops::note_engine_walk_not_now`), its detail line logged on both arms, 503 with `Retry-After`.
+/// Nothing was written and nothing is queued: the same unproven bytes would breach again.
 async fn walk_not_now(
     env: &worker::Env,
     stop: &overlay_engine::engine::WalkCouldNotRun,
@@ -89,6 +90,7 @@ async fn walk_not_now(
     counters: Option<&SubmitCounters>,
 ) -> worker::Result<Response> {
     if let Some(counters) = counters {
+        worker::console_log!("{}", crate::ops::engine_walk_not_now_line(stop, door));
         counters.bump(crate::ops::engine_walk_over_counter(stop.limb), 1);
     } else if let Ok(db) = env.d1("OVERLAY_DB") {
         crate::ops::note_engine_walk_not_now(&db, stop, door).await;
