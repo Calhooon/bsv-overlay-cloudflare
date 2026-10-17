@@ -4245,9 +4245,16 @@ pub const PROOF_MINED_LATCH_PREFIX: &str = "proofmined:";
 /// a pass's proofs, from answers the isolate already held, are latched by a later pass, which holds them too).
 pub const OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE: usize =
     OWED_SPENDER_COURIER_READS_PER_RECOMPUTE + OWED_DURABLE_REASKS_PER_RECOMPUTE;
-/// The most latch HEIGHTS one pass re-reads against chaintracks (a header each, cached per isolate); a latch past it
-/// is honoured on the reorg clear's word alone, as one whose header read faulted is.
+/// The FEWEST latch heights one pass re-reads against chaintracks (a header each, cached per isolate): the newest
+/// four, whatever their depth (bsv-low #693 fold-2, the W1-OWED-693 re-lens's R-HIGH-1 (1)).
 pub const OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE: usize = 4;
+/// bsv-low #693 fold-2 (the re-lens's R-HIGH-1 (1)): the REORG WINDOW of a proof latch, in blocks. A latch less than
+/// this deep below the served tip is reorg-reachable and its height is re-read every pass (newest first); a latch
+/// this deep or deeper is reorg-proof and needs no recheck. Twice the overlay's revalidation window
+/// (`bsv_overlay_cloudflare::tip_pass::REORG_SWEEP_DEPTH`, 3, the reference's `reorgScanDepth`; pinned at least
+/// twice it from the tests). The rechecks of one pass are therefore at most `max(LATCH_RECHECK_DEPTH,
+/// OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE)` header reads.
+pub const LATCH_RECHECK_DEPTH: u64 = 6;
 
 /// One proof latch read back: the spender, the height and the root it was checked against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4335,14 +4342,39 @@ pub fn proof_latches_of(
     out
 }
 
-/// PURE: the latch heights a pass re-reads against chaintracks, lowest first, at most
-/// [`OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE`].
-pub fn proof_latch_recheck_heights(latches: &[ProofLatch]) -> Vec<u64> {
+/// PURE: the latch heights a pass re-reads against chaintracks, NEWEST first (the only ones a reorg can move; the
+/// re-lens's R-HIGH-1 (1): the oldest-first bound rechecked the four deepest, reorg-proof heights every pass and never
+/// the newest). Every height less than [`LATCH_RECHECK_DEPTH`] below the tip, and at least the
+/// [`OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE`] newest. `tip` is the served tip (`None`: unreadable); the tip is never
+/// below the newest latched height, so that height stands in for an unreadable or stale tip (the window then
+/// counts from it, the conservative side).
+pub fn proof_latch_recheck_heights(latches: &[ProofLatch], tip: Option<u64>) -> Vec<u64> {
     let mut h: Vec<u64> = latches.iter().map(|l| l.height).collect();
-    h.sort_unstable();
+    h.sort_unstable_by(|a, b| b.cmp(a));
     h.dedup();
-    h.truncate(OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE);
-    h
+    let tip = latch_tip(latches, tip);
+    h.into_iter()
+        .enumerate()
+        .take_while(|(i, height)| {
+            *i < OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE || !latch_is_deep(*height, tip)
+        })
+        .map(|(_, height)| height)
+        .collect()
+}
+
+/// PURE: the tip a latch's depth counts from: the served tip, never below the newest latched height.
+pub fn latch_tip(latches: &[ProofLatch], tip: Option<u64>) -> u64 {
+    latches
+        .iter()
+        .map(|l| l.height)
+        .chain(tip)
+        .max()
+        .unwrap_or(0)
+}
+
+/// PURE: a latch at `height` is REORG-PROOF under `tip`: [`LATCH_RECHECK_DEPTH`] blocks deep or deeper.
+pub fn latch_is_deep(height: u64, tip: u64) -> bool {
+    tip.saturating_sub(height) >= LATCH_RECHECK_DEPTH
 }
 
 /// PURE: the spenders whose latch is HONOURED this pass, the seed of the pass's `proof_mined_spenders` (before its
@@ -6296,7 +6328,84 @@ pub(crate) mod tests {
             proof_latches_of(s, &[memo(key("900000"), Some(true), root)]).len(),
             1
         );
-        assert_eq!(proof_latch_recheck_heights(&[]).len(), 0);
+        assert_eq!(proof_latch_recheck_heights(&[], None).len(), 0);
+    }
+
+    /// bsv-low #693 fold-2 (the W1-OWED-693 re-lens's R-HIGH-1 (1)): THE RECHECK TAKES THE NEWEST HEIGHTS. Five
+    /// latches at 900000..900004 and the newest's root moved by a reorg: its height is re-read and the latch is NOT
+    /// honoured. Every height inside `LATCH_RECHECK_DEPTH` of the tip is re-read, at least the four newest; a latch
+    /// deeper than the window is reorg-proof and is not re-read; an unreadable tip counts from the newest latch. RED
+    /// on `ffb4a98` (the lowest four re-read: `honoured: 5`).
+    #[test]
+    fn e693f2_h1_the_recheck_takes_the_newest_heights() {
+        use bsv_overlay_cloudflare::tip_pass::REORG_SWEEP_DEPTH;
+        assert!(LATCH_RECHECK_DEPTH >= 2 * REORG_SWEEP_DEPTH);
+        let latches: Vec<ProofLatch> = (0..5u8)
+            .map(|i| ProofLatch {
+                spender: tx(0x40 + i),
+                height: 900_000 + u64::from(i),
+                root: E693F_ROOT.to_string(),
+            })
+            .collect();
+        let moved = "cd".repeat(32);
+        let chain = |h: u64| {
+            Some(if h == 900_004 {
+                moved.clone()
+            } else {
+                E693F_ROOT.to_string()
+            })
+        };
+        for tip in [None, Some(900_004), Some(900_005)] {
+            let heights = proof_latch_recheck_heights(&latches, tip);
+            let canonical: HashMap<u64, Option<String>> =
+                heights.iter().map(|h| (*h, chain(*h))).collect();
+            let honoured = latched_proof_mined_spenders(&latches, &canonical);
+            assert_eq!(
+                honoured.len(),
+                4,
+                "tip {tip:?}: honoured: {}",
+                honoured.len()
+            );
+            assert!(!honoured.contains(&tx(0x44)), "the newest, its root moved");
+            assert_eq!(
+                heights,
+                vec![900_004, 900_003, 900_002, 900_001, 900_000],
+                "tip {tip:?}: every height inside the window, newest first"
+            );
+        }
+        // 900000 is six blocks under 900006: reorg-proof, not re-read; the four newest are, whatever their depth
+        assert_eq!(
+            proof_latch_recheck_heights(&latches, Some(900_006)),
+            vec![900_004, 900_003, 900_002, 900_001]
+        );
+        assert_eq!(
+            proof_latch_recheck_heights(&latches, Some(901_000)),
+            vec![900_004, 900_003, 900_002, 900_001]
+        );
+        assert!(latch_is_deep(900_000, 900_006) && !latch_is_deep(900_001, 900_006));
+        // a bound: at most the window's heights, or the four newest
+        let many: Vec<ProofLatch> = (0..40u64)
+            .map(|i| ProofLatch {
+                spender: tx(0x50),
+                height: 900_000 + i,
+                root: E693F_ROOT.to_string(),
+            })
+            .collect();
+        assert_eq!(
+            proof_latch_recheck_heights(&many, Some(900_039)).len() as u64,
+            LATCH_RECHECK_DEPTH.max(OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE as u64)
+        );
+        // the route reads the tip before the rechecks and hands it to the shipped choice
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        let tip = "crate::beef_guard::present_tip(env).await";
+        let recheck = "forhincrate::owed::proof_latch_recheck_heights(&latches,latch_tip){";
+        assert!(routes.contains(recheck), "the route's recheck: {recheck}");
+        let at = routes.find(recheck).unwrap();
+        assert!(
+            routes[..at].rfind(tip).is_some_and(|t| at - t < 200),
+            "the tip read just before the recheck"
+        );
     }
 
     /// bsv-low #662 (live 2026-10-14 00:35:35Z, pair 19, hop d4029675ccb65a4b:0, sweep 96448ef1fc3b): pass B judged
