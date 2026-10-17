@@ -122,13 +122,17 @@ fn e602_only_broadcaster_admissions_carry_a_witness() {
 
 #[test]
 fn e602_courier_functions_keep_the_response_body() {
+    // bsv-low #625: both presence reads go through the one counted reader.
     let proof = source("proof_fetcher.rs");
-    for name in ["bitails_presence", "woc_presence"] {
-        let start = proof.find(&format!("asyncfn{name}(base:")).unwrap();
-        let body = &proof[start..];
-        let body = &body[..body.find("_=>None,").unwrap()];
-        assert_eq!(body.matches("presence_response(status,&body)").count(), 1);
+    for name in ["bitails_presence_counted", "woc_presence_counted"] {
+        let head = format!("asyncfn{name}(");
+        let body = &proof[proof.find(&head).unwrap() + head.len()..];
+        let body = &body[..body.find(".await").unwrap()];
+        assert_eq!(body.matches("presence_counted(").count(), 1, "{name}");
     }
+    let body = &proof[proof.find("asyncfnpresence_counted(").unwrap()..];
+    let body = &body[..body.find("CourierAttempt::set").unwrap()];
+    assert_eq!(body.matches("presence_response(status,&body)").count(), 1);
 }
 
 #[test]

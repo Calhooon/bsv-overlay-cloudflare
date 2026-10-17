@@ -890,14 +890,15 @@ impl ChainProofFetcher {
             }
             Ok((status, body)) => {
                 let answer = parse(status, &body);
-                CourierAttempt::set(
-                    &mut observation,
-                    CourierOutcome::response(
+                let outcome = match &answer {
+                    Err(e) if e == BITAILS_PRUNED_NO_SPEND => CourierOutcome::NotFound,
+                    _ => CourierOutcome::response(
                         status,
                         answer.is_ok(),
                         answer.as_ref().is_ok_and(Option::is_some),
                     ),
-                );
+                };
+                CourierAttempt::set(&mut observation, outcome);
                 match answer {
                     Ok(answer) => {
                         self.rung_ok(name);
@@ -2241,6 +2242,10 @@ fn bitails_tx_url(base: &str, txid: &str) -> String {
 /// `spentIn.txid` names the spender; `spent: false` is a clean negative;
 /// anything else (`spent: ""` — pruned/unknown — a missing output, no
 /// `outputs`) is "could not look" (a fault). Never "unspent" by absence.
+/// Pruned Bitails' known answer for an output it keeps no spend data for: the
+/// ladder still reads it as "could not look", the courier counters as `notfound`.
+const BITAILS_PRUNED_NO_SPEND: &str = "no spend data for the output (Bitails pruned mode)";
+
 fn parse_bitails_tx_spend_body(
     status: u16,
     body: &str,
@@ -2277,7 +2282,7 @@ fn parse_bitails_tx_spend_body(
                 body,
             )
         }),
-        None => Err("no spend data for the output (Bitails pruned mode)".to_string()),
+        None => Err(BITAILS_PRUNED_NO_SPEND.to_string()),
     }
 }
 
@@ -4946,6 +4951,26 @@ pub(crate) mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[&format!("courier_door_bitails_{outcome}_total")], 1);
         }
+    }
+
+    #[tokio::test]
+    async fn obs_625_bitails_pruned_spend_answer_is_notfound_not_shape() {
+        let txid = "ab".repeat(32);
+        let counts = CourierCounters::new(crate::courier_counters::Reader::Janitor);
+        let fetcher = ChainProofFetcher::new(None)
+            .with_sources(ProofSources::parse("bitails"))
+            .with_courier_counters(counts.clone());
+        let url = bitails_tx_url(DEFAULT_BITAILS_BASE, &txid);
+        let pruned = r#"{"outputs":[{"index":0,"spent":""}]}"#;
+        TEST_HTTP_RESPONSES.with(|r| r.borrow_mut().insert(url.clone(), (200, pruned.into())));
+        let call = fetcher
+            .call_rung("bitails_tx", &url, None, |s, b| parse_bitails_tx_spend_body(s, b, &txid, 0))
+            .await;
+        // The ladder keeps "could not look"; only the courier family reads a known absence.
+        assert!(matches!(call, RungCall::Fault(_)));
+        let rows = counts.take();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows["courier_janitor_bitails_notfound_total"], 1);
     }
 
     #[tokio::test]
