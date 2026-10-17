@@ -3374,6 +3374,27 @@ pub fn decide_spent_any(
     }
 }
 
+/// bsv-low #695 (DESIGN-641 section (2) option (b)): WoC's `/spent` answers 400 for an outpoint of a tx its node
+/// does not know (measured on prod 2026-10-16, `RC-PROD-MONITOR-BLIND`), where a 429, a 5xx, an auth refusal or a
+/// transport fault means it could not look. Only that 400 opens the one extra read of WoC's `/tx/hash/{txid}`.
+pub fn woc_spent_may_name_an_unknown_tx(woc_spent_status: Option<u16>) -> bool {
+    woc_spent_status == Some(400)
+}
+
+/// bsv-low #695: the ladder's PRIMARY rungs all faulted and WoC's node (a capable mempool source, #614) answered a
+/// conclusive 404 for the subject itself (`woc_node_absent`: neither its chain nor its mempool holds it, so it is
+/// unmined): one capable source saw nothing and the pruned Bitails cannot corroborate, so the honest word is
+/// `uncorroborated-unspent`, never `provider-fault`. `known:false` either way; every other row is unchanged.
+pub fn sharpen_unmined_absence(
+    mut st: crate::logic::OutpointStatus,
+    woc_node_absent: bool,
+) -> crate::logic::OutpointStatus {
+    if woc_node_absent && st.reason == Some(crate::logic::SPENT_ANY_REASON_PROVIDER_FAULT) {
+        st.reason = Some(crate::logic::SPENT_ANY_REASON_UNCORROBORATED);
+    }
+    st
+}
+
 /// Verify a fetched spender raw: hashes to `spender_txid` AND spends
 /// `(outpoint_txid, vout)`. The one-provider-positive rule rests on this.
 pub fn spender_raw_verifies(
