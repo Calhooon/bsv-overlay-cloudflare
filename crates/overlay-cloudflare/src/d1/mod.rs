@@ -580,7 +580,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// never regresses a JUDGED "spent outside this game" row to "could not judge the spender". One table.
 /// 259 to 260 for bsv-low #566 (2026-10-17, the W1-OBS-APPLAYER lens's M1): `owed_state.recomputeSeq`, the
 /// identity's own recompute sequence, bumped by the snapshot's upsert and served on `/owed`. One column.
-pub const OVERLAY_MIGRATION_COUNT: usize = 260;
+/// 260 to 262 for bsv-low #644 (W1.6): the two backfill passes' partial candidate indexes on `pot_records`.
+pub const OVERLAY_MIGRATION_COUNT: usize = 262;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2035,6 +2036,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // it, `/owed` serves it). The app layer catches it up on a cold isolate (`owed::OWED_STATE_SEQ_ALTER`,
     // byte-identical; its duplicate-column outcome is benign on both sides).
     "ALTER TABLE owed_state ADD COLUMN recomputeSeq INTEGER",
+    // 261-262: bsv-low #644 (W1.6), the two backfill passes' candidate reads (`settle_signers_candidates_sql`,
+    // `spender_payouts_candidates_sql`) scanned `pot_records` on every tick (22,591 rows each on the fleet
+    // fixture's local D1). Each partial index holds exactly the rows its pass can still change, under the pass's
+    // own predicates (so the planner may use it), and the row leaves it when the pass latches it: the reads are the
+    // pending set, never the table. The SQL of both passes is unchanged.
+    "CREATE INDEX IF NOT EXISTS idx_pot_signers_pending ON pot_records(verdict) WHERE verdict IS NOT NULL AND settleSigners IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_pot_payouts_pending ON pot_records(spendingTxid) WHERE spendingTxid IS NOT NULL AND spenderPayASats IS NULL AND spenderPayBSats IS NULL AND (payPkhA IS NOT NULL OR payPkhB IS NOT NULL)",
 ];
 
 // =============================================================================

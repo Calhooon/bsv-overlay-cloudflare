@@ -38,10 +38,13 @@ try {
   for (const e of expected) {
     const a = await db.prepare(e.sql).all()
     assert.equal(a.success, true, e.name)
-    assert.deepEqual(a.results, e.rows, `${e.name}: identical ordered rows`)
+    // W1.6: a RANDOM-ordered read is compared as a set.
+    const key = (rows) => e.unordered ? rows.map((r) => JSON.stringify(r)).sort() : rows
+    assert.deepEqual(key(a.results), key(e.rows), `${e.name}: identical ${e.unordered ? 'row set' : 'ordered rows'}`)
     assert.ok(Number.isInteger(a.meta.rows_read), `${e.name}: rows_read exists`)
+    if (e.bound) console.log(`  ${e.name}: ${a.meta.rows_read} reads (ceiling ${e.ceiling})`)
     assert.ok(a.meta.rows_read <= e.ceiling, `${e.name}: ${a.meta.rows_read} reads > ${e.ceiling}`)
-    max = Math.max(max, a.meta.rows_read)
+    if (!e.bound) max = Math.max(max, a.meta.rows_read)
   }
-  console.log(`PASS createdAt cursor: ${expected.length} pages, identical rows, max reads ${max}/287`)
+  console.log(`PASS createdAt cursor and the W1.6 bounds: ${expected.length} statements, identical rows, max reads ${max}/287`)
 } finally { await mf.dispose() }

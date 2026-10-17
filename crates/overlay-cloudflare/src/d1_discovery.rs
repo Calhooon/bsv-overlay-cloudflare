@@ -2104,7 +2104,7 @@ pub fn mark_spent_sql(confirmed: bool, with_verdict: bool) -> &'static str {
 /// never-verifying row leaves the set permanently. RANDOM-sampled — the
 /// anti-starvation idiom of the #284 scan. A const-shaped helper so the
 /// real-SQLite pin executes the production string.
-pub(crate) fn settle_signers_candidates_sql(limit: u64) -> String {
+pub fn settle_signers_candidates_sql(limit: u64) -> String {
     format!(
         // Recency band first (bsv-low 2026-08-26: a fresh settle waiting on
         // pure RANDOM sampling under a 15-min cron could sit unclassified for
@@ -2489,7 +2489,7 @@ pub fn spender_payouts_cas_sql() -> &'static str {
 /// bsv-low #468 backfill candidates (see `PotStorage::find_spender_payouts_unlatched`),
 /// pinned against real SQLite below. Recency band first, RANDOM within (the
 /// #284 anti-starvation shape shared with the signers pass).
-pub(crate) fn spender_payouts_candidates_sql(limit: u64) -> String {
+pub fn spender_payouts_candidates_sql(limit: u64) -> String {
     format!(
         "SELECT {POT_RECORD_COLUMNS} FROM pot_records \
          WHERE spendingTxid IS NOT NULL \
