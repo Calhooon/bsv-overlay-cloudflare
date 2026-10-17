@@ -3,6 +3,7 @@
 //! Maps OverlayExpress-compatible routes to Engine methods.
 //! Wire formats match ~/bsv/overlay-express/src/OverlayExpress.ts.
 
+use crate::submit_counters::{Reason as SubmitReason, SubmitCounters};
 use overlay_discovery::ship::storage::SHIPStorage;
 use overlay_discovery::slap::storage::SLAPStorage;
 use overlay_engine::beef_limits;
@@ -85,8 +86,11 @@ async fn walk_not_now(
     env: &worker::Env,
     stop: &overlay_engine::engine::WalkCouldNotRun,
     door: &str,
+    counters: Option<&SubmitCounters>,
 ) -> worker::Result<Response> {
-    if let Ok(db) = env.d1("OVERLAY_DB") {
+    if let Some(counters) = counters {
+        counters.bump(crate::ops::engine_walk_over_counter(stop.limb), 1);
+    } else if let Ok(db) = env.d1("OVERLAY_DB") {
         crate::ops::note_engine_walk_not_now(&db, stop, door).await;
     }
     worker::console_log!(
@@ -582,12 +586,25 @@ pub async fn submit(
     // #366 also derives the census counters' D1 handle (`OVERLAY_DB`) from it.
     env: &Env,
 ) -> worker::Result<Response> {
-    let out = submit_inner(engine, req, hosting_url, arcade_url, taal_api_key, ctx, env).await;
+    let counters = SubmitCounters::new();
+    let out = submit_inner(
+        engine, req, hosting_url, arcade_url, taal_api_key, ctx, env, &counters,
+    )
+    .await;
+    if out.is_err() {
+        counters.reason(SubmitReason::RequestFault);
+    }
+    let counters = counters.finish_answer(out.as_ref().map_or(500, Response::status_code));
+    match env.d1("OVERLAY_DB") {
+        Ok(db) => ctx.wait_until(counters.flush(db)),
+        Err(e) => worker::console_log!("submit counters: OVERLAY_DB unavailable, count lost: {e}"),
+    }
     crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));
     crate::lobby_changes::flush(env, |fut| ctx.wait_until(fut));
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_inner(
     engine: &Engine,
     mut req: Request,
@@ -605,15 +622,22 @@ async fn submit_inner(
     // (deliberately NOT ADMIN_TOKEN — see `check_submit_operator_auth`).
     // #366 also derives the census counters' D1 handle (`OVERLAY_DB`) from it.
     env: &Env,
+    counters: &SubmitCounters,
 ) -> worker::Result<Response> {
     // Parse x-topics header (required)
     let topics_header = match req.headers().get("x-topics")? {
         Some(h) => h,
-        None => return json_error("Missing x-topics header", 400),
+        None => {
+            counters.reason(SubmitReason::MissingTopics);
+            return json_error("Missing x-topics header", 400);
+        }
     };
     let topics: Vec<String> = match serde_json::from_str(&topics_header) {
         Ok(t) => t,
-        Err(e) => return json_error(&format!("Invalid x-topics JSON: {e}"), 400),
+        Err(e) => {
+            counters.reason(SubmitReason::InvalidTopics);
+            return json_error(&format!("Invalid x-topics JSON: {e}"), 400);
+        }
     };
 
     worker::console_log!("POST /submit topics={:?}", topics);
@@ -646,6 +670,7 @@ async fn submit_inner(
     // Input validation
     if topics.len() > 100 {
         worker::console_log!("POST /submit -> 400 (too many topics: {})", topics.len());
+        counters.reason(SubmitReason::TooManyTopics);
         return json_error("Too many topics (max 100)", 400);
     }
 
@@ -706,6 +731,7 @@ async fn submit_inner(
         ctx,
         env,
         crate::ef_deferred::WorkBudget::InRequest,
+        counters,
     )
     .await
 }
@@ -739,6 +765,7 @@ pub(crate) async fn submit_resumed(
     env: &Env,
     from_leg: usize,
 ) -> worker::Result<Response> {
+    let counters = SubmitCounters::new();
     let out = submit_parts(
         engine,
         parts,
@@ -748,8 +775,12 @@ pub(crate) async fn submit_resumed(
         ctx,
         env,
         crate::ef_deferred::WorkBudget::Resumed { from_leg },
+        &counters,
     )
     .await;
+    if let Ok(db) = env.d1("OVERLAY_DB") {
+        ctx.wait_until(counters.flush(db));
+    }
     crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));
     crate::lobby_changes::flush(env, |fut| ctx.wait_until(fut));
     out
@@ -767,7 +798,9 @@ async fn submit_parts(
     // NL-6c: in the request the broadcast-gated arm keeps a work budget and
     // defers the work past it; a resumed run owes none.
     budget: crate::ef_deferred::WorkBudget,
+    counters: &SubmitCounters,
 ) -> worker::Result<Response> {
+    counters.reason(SubmitReason::Admit);
     let SubmitParts {
         topics,
         beef,
@@ -884,6 +917,7 @@ async fn submit_parts(
     // is not.
     match action {
         crate::submit_gate::SubmitAction::RefuseUnauthenticated(path) => {
+            counters.reason(SubmitReason::OperatorAuthRequired);
             worker::console_log!(
                 "POST /submit -> 401 (unbarred path {} requires operator auth; SUBMIT_ENFORCE=true)",
                 path.as_str()
@@ -940,25 +974,11 @@ async fn submit_parts(
                 verdict.as_str(),
                 state_counter
             );
-            // Precisely (gate LOW-1): the CLASSIFICATION above is SYNCHRONOUS
-            // on every ungated submit — the gated arm's own parse, the
-            // subject's EF conversions and an ancestry walk over the stream's
-            // index, with no stop by size (bsv-low #585) — and only the
-            // durable D1 WRITE below
-            // is backgrounded (`ctx.wait_until`). A D1 fault can only lose a
-            // count, never a submit (`bump_counter` logs and swallows its own
-            // errors; a missing binding logs and loses the count, never the
-            // request).
-            match env.d1("OVERLAY_DB") {
-                Ok(census_db) => ctx.wait_until(async move {
-                    crate::ops::bump_counter(&census_db, state_counter, 1).await;
-                    if let Some(reason) = reason_counter {
-                        crate::ops::bump_counter(&census_db, reason, 1).await;
-                    }
-                }),
-                Err(e) => {
-                    worker::console_log!("census(#366): OVERLAY_DB unavailable, count lost: {e}");
-                }
+            // Classification stays synchronous; the existing census writes share
+            // the request's post-answer batch with its status and reason.
+            counters.bump(state_counter, 1);
+            if let Some(reason) = reason_counter {
+                counters.bump(reason, 1);
             }
         }
     }
@@ -1071,6 +1091,7 @@ async fn submit_parts(
             Ok(v) => v,
             Err(e) => {
                 worker::console_log!("POST /submit(broadcast-gated) -> 400 (EF: {e})");
+                counters.reason(SubmitReason::InvalidBeef);
                 return json_error(&format!("broadcast-gated: {e}"), 400);
             }
         };
@@ -1096,12 +1117,7 @@ async fn submit_parts(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    crate::ops::bump_counter(
-                        &ledger_db,
-                        crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
-                        1,
-                    )
-                    .await;
+                    counters.bump(crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1);
                     worker::console_log!(
                         "POST /submit(broadcast-gated): the eviction ledger could not be read for {subject_txid} ({e}) — proceeding; the post-write guard asks again"
                     );
@@ -1123,6 +1139,7 @@ async fn submit_parts(
         // (`GET /submit-deferred/<reference>`). Never a 429 or a 413 for size.
         let work = crate::ef_deferred::EfWork::of(&efs, &subject_txid);
         if budget == crate::ef_deferred::WorkBudget::InRequest && !work.fits_request() {
+            counters.reason(SubmitReason::Queued);
             return crate::ef_deferred::defer(
                 env,
                 &tagged_beef,
@@ -1161,16 +1178,7 @@ async fn submit_parts(
             let walk_started = js_sys::Date::now();
             let verdict = engine.verify_scripts_only(&gated_beef, &subject_txid).await;
             script_verify_ms = js_sys::Date::now() - walk_started;
-            // One counter bump per verdict; a missing binding is said, never
-            // silent (gate NIT c).
-            let count = |name: &'static str| match env.d1("OVERLAY_DB") {
-                Ok(db) => ctx.wait_until(async move {
-                    crate::ops::bump_counter(&db, name, 1).await;
-                }),
-                Err(e) => {
-                    worker::console_log!("door({name}): OVERLAY_DB unavailable, count lost: {e}")
-                }
-            };
+            let count = |name: &'static str| counters.bump(name, 1);
             match verdict {
                 Ok(stats) => {
                     script_walk_desc = format!(
@@ -1194,6 +1202,7 @@ async fn submit_parts(
                     worker::console_log!(
                         "POST /submit(broadcast-gated) -> 400 (script-refused: {failed_txid} input {input_index}: {reason}; subject {subject_txid}; NOTHING broadcast)"
                     );
+                    counters.reason(SubmitReason::ScriptRefused);
                     count(crate::ops::COUNTER_SUBMIT_SCRIPT_REFUSED);
                     // bsv-low #486: the refusal's durable word for the owed list (the hops whose own keys signed
                     // this subject), written after the verdict and never part of it
@@ -1405,21 +1414,15 @@ async fn submit_parts(
                 }
             })
             .await;
-        if let Ok(count_db) = env.d1("OVERLAY_DB") {
-            let skipped = arcade.registration_legs_skipped();
-            if skipped > 0 {
-                crate::ops::bump_counter(
-                    &count_db,
-                    crate::ops::COUNTER_ARC_REGISTRATION_SKIPPED,
-                    skipped as u64,
-                )
-                .await;
-            }
-        }
+        counters.bump(
+            crate::ops::COUNTER_ARC_REGISTRATION_SKIPPED,
+            arcade.registration_legs_skipped() as u64,
+        );
         // NL-6d / ARCREGD-H2: a paused walk stopped the ladder, never a 502
         // for a count. The request defers from the cursor (202); in a run
         // the answer names the next run's cursor.
         if let Some(reached) = arcade.corroboration_paused_at() {
+            counters.reason(SubmitReason::Queued);
             return crate::ef_deferred::pause(
                 env,
                 &tagged_beef,
@@ -1434,26 +1437,12 @@ async fn submit_parts(
         // #519: the terminal judgement, counted for the operator (which arm fired), its wall-clock its own segment
         let terminal_ms = arcade.terminal_ms();
         if let Some(judgement) = arcade.terminal_judgement() {
-            // counted off the request path, like its sibling counters (the delta-verify's NIT)
-            let judged_env = env.clone();
-            ctx.wait_until(async move {
-                if let Ok(count_db) = judged_env.d1("OVERLAY_DB") {
-                    crate::ops::bump_counter(&count_db, judgement.counter(), 1).await;
-                }
-            });
+            counters.bump(judgement.counter(), 1);
+            counters.reason(SubmitReason::terminal(judgement));
         }
         let duplicate_echo = arcade.duplicate_echo();
         if duplicate_echo {
-            if let Ok(db) = env.d1("OVERLAY_DB") {
-                ctx.wait_until(async move {
-                    crate::ops::bump_counter(
-                        &db,
-                        crate::ops::COUNTER_SUBMIT_DUPLICATE_IN_FLIGHT,
-                        1,
-                    )
-                    .await;
-                });
-            }
+            counters.bump(crate::ops::COUNTER_SUBMIT_DUPLICATE_IN_FLIGHT, 1);
         }
         // #195: keep segments DISJOINT and attributable — the corroborate leg
         // runs inside the gated broadcast's wall-clock, so it is carved out of
@@ -1510,12 +1499,7 @@ async fn submit_parts(
                         )
                         .await;
                         if readmitted {
-                            crate::ops::bump_counter(
-                                &ledger_db,
-                                crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
-                                1,
-                            )
-                            .await;
+                            counters.bump(crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT, 1);
                         } else {
                             door_readmit_failed = true;
                         }
@@ -1564,6 +1548,7 @@ async fn submit_parts(
                             worker::console_log!(
                                 "POST /submit(broadcast-gated) -> 502 (mined-claim BEEF for {subject_txid} could not be sanitized — refusing to store an unverified bump)"
                             );
+                            counters.reason(SubmitReason::MinedClaimUnsanitized);
                             let resp = json_error(
                                 "broadcast failed: mined-claim BEEF could not be sanitized — retry via fallback",
                                 502,
@@ -1621,12 +1606,7 @@ async fn submit_parts(
                         )
                         .await;
                         if readmitted {
-                            crate::ops::bump_counter(
-                                &ledger_db,
-                                crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
-                                1,
-                            )
-                            .await;
+                            counters.bump(crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT, 1);
                         } else {
                             door_readmit_failed = true;
                         }
@@ -1638,11 +1618,9 @@ async fn submit_parts(
                         );
                     }
                 }
-                if let Ok(count_db) = env.d1("OVERLAY_DB") {
-                    let name = crate::ops::pending_admission_counter(admit_fast, duplicate_echo);
-                    ctx.wait_until(async move {
-                        crate::ops::bump_counter(&count_db, name, 1).await;
-                    });
+                counters.bump(crate::ops::pending_admission_counter(admit_fast, duplicate_echo), 1);
+                if admit_fast && duplicate_echo {
+                    counters.reason(SubmitReason::AdmitFastEcho);
                 }
                 let watch_env = crate::admit_fast::EvidenceEnv::from_env(env);
                 let watch_txid = subject_txid.clone();
@@ -1694,6 +1672,9 @@ async fn submit_parts(
                     ),
                     worker::Date::now().as_millis() as i64,
                 ));
+                if arcade.terminal_judgement().is_none() {
+                    counters.reason(SubmitReason::NetworkRejected);
+                }
                 let resp = json_error(&format!("network rejected: {reason}"), 422)?;
                 return Ok(with_server_timing(resp, &gated_timing));
             }
@@ -1701,6 +1682,9 @@ async fn submit_parts(
                 worker::console_log!(
                     "POST /submit(broadcast-gated) -> 502 (broadcast transport: {transport})"
                 );
+                if arcade.terminal_judgement().is_none() {
+                    counters.reason(SubmitReason::broadcast(&transport));
+                }
                 let resp = json_error(&format!("broadcast failed: {transport}"), 502)?;
                 return Ok(with_server_timing(resp, &gated_timing));
             }
@@ -1720,17 +1704,13 @@ async fn submit_parts(
                 if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
                     match crate::admit_fast::open_eviction(&ledger_db, &subject).await {
                         Ok(Some(ev)) => {
-                            crate::ops::bump_counter(
-                                &ledger_db,
-                                crate::ops::COUNTER_SUBMIT_REFUSED_EVICTED,
-                                1,
-                            )
-                            .await;
+                            counters.bump(crate::ops::COUNTER_SUBMIT_REFUSED_EVICTED, 1);
                             worker::console_log!(
                                 "POST /submit -> 422 (an ungated write of {subject} under an OPEN eviction (at {} ms — {}); nothing written; a MINED proof or the operator's readmit opens it)",
                                 ev.evicted_at_ms,
                                 ev.reason
                             );
+                            counters.reason(SubmitReason::Evicted);
                             return json_error(
                                 &format!(
                                     "network rejected: evicted ({}) — the index re-admits it on a MINED proof or the operator's readmit",
@@ -1741,15 +1721,11 @@ async fn submit_parts(
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            crate::ops::bump_counter(
-                                &ledger_db,
-                                crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
-                                1,
-                            )
-                            .await;
+                            counters.bump(crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1);
                             worker::console_log!(
                                 "POST /submit -> 502 (the eviction ledger could not be read for {subject} before an ungated write: {e})"
                             );
+                            counters.reason(SubmitReason::LedgerUnreadable);
                             return json_error_retryable(
                                 "the eviction ledger could not be read — retry",
                                 502,
@@ -1767,9 +1743,12 @@ async fn submit_parts(
     let (steak, mutation_report) = match engine.submit_with_report(&tagged_beef, mode).await {
         Ok(v) => v,
         // E592 fold: a walk past the budget is NOT NOW (nothing written or queued), counted
-        #[rustfmt::skip] // Keep main's source-pinned guard layout.
-        Err(EngineError::WalkCouldNotRun(stop)) => return walk_not_now(env, &stop, "POST /submit").await,
+        Err(EngineError::WalkCouldNotRun(stop)) => {
+            counters.reason(SubmitReason::WalkCouldNotRun);
+            return walk_not_now(env, &stop, "POST /submit", Some(counters)).await;
+        }
         Err(e) => {
+            counters.reason(SubmitReason::engine(&e));
             let status = engine_error_status(&e);
             worker::console_log!("POST /submit -> {} (submit failed)", status);
             return json_error(&e.to_string(), status);
@@ -1830,12 +1809,7 @@ async fn submit_parts(
                     )
                     .await;
                     if again {
-                        crate::ops::bump_counter(
-                            &ledger_db,
-                            crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
-                            1,
-                        )
-                        .await;
+                        counters.bump(crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT, 1);
                         worker::console_log!(
                             "POST /submit: {subject} readmitted on the second try after the write (the door's readmission had faulted; evicted at {} ms — {})",
                             ev.evicted_at_ms,
@@ -1845,6 +1819,7 @@ async fn submit_parts(
                         worker::console_log!(
                             "POST /submit -> 502 (the network accepted {subject} under an open eviction and its readmission faulted twice; retryable)"
                         );
+                        counters.reason(SubmitReason::ReadmitFault);
                         let resp = json_error_retryable(
                             "the accepted subject's readmission faulted — retry",
                             502,
@@ -1857,12 +1832,7 @@ async fn submit_parts(
                     #[rustfmt::skip] // Main's exact eviction wiring pin.
                     let outcome = crate::admit_fast::evict_txid_everywhere(&ledger_db, subject, &ev.reason, now_ms).await;
                     let moved = outcome.moved;
-                    crate::ops::bump_counter(
-                        &ledger_db,
-                        crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
-                        1,
-                    )
-                    .await;
+                    counters.bump(crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1);
                     // the eviction is the event the felt voids on: ship its notes now (this answer is not a 200)
                     crate::pot_changes::flush_inline(env.clone()).await;
                     worker::console_log!(
@@ -1872,6 +1842,7 @@ async fn submit_parts(
                     );
                     // the status WORD only (the gate's NIT): the reason embeds Arcade's extraInfo, and the client's
                     // already-known belt classifies on text
+                    counters.reason(SubmitReason::Evicted);
                     let resp = json_error(
                         &format!(
                             "network rejected: evicted ({})",
@@ -1885,15 +1856,11 @@ async fn submit_parts(
                 Err(e) => {
                     // the gate's LOW-3: a 200 here would stand over rows nobody re-evicts (the callbacks do not
                     // repeat); 502 retryable — the client re-presents, the door asks again, a durable write dedups
-                    crate::ops::bump_counter(
-                        &ledger_db,
-                        crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
-                        1,
-                    )
-                    .await;
+                    counters.bump(crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1);
                     worker::console_log!(
                         "POST /submit -> 502 (the eviction ledger could not be read for {subject} after the write: {e}; the write stands, the answer is retryable)"
                     );
+                    counters.reason(SubmitReason::LedgerUnreadable);
                     let resp = json_error_retryable(
                         "the eviction ledger could not be read after the write — retry",
                         502,
@@ -1937,11 +1904,7 @@ async fn submit_parts(
             mutation_report.faults.len(),
             mutation_report.summary()
         );
-        if let Ok(db) = env.d1("OVERLAY_DB") {
-            ctx.wait_until(async move {
-                crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_FAULT, 1).await;
-            });
-        }
+        counters.bump(crate::ops::COUNTER_SUBMIT_MUTATION_FAULT, 1);
         // the E592 lens fold: the gated arm's message says the network accepted these bytes (`gated`), and only it
         Some(
             crate::queue::enqueue_replay(
@@ -1964,24 +1927,15 @@ async fn submit_parts(
                 "POST /submit: replay QUEUED for {} (S2) — acking; the queue is the guarantee",
                 tagged_beef.topics.join(",")
             );
-            if let Ok(db) = env.d1("OVERLAY_DB") {
-                ctx.wait_until(async move {
-                    crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_QUEUED, 1)
-                        .await;
-                });
-            }
+            counters.bump(crate::ops::COUNTER_SUBMIT_MUTATION_QUEUED, 1);
             true
         }
         crate::queue::MutationAck::Refused(reason) => {
             worker::console_log!(
                 "POST /submit -> 502 (admission NOT durable and the replay could not be queued: {reason})"
             );
-            if let Ok(db) = env.d1("OVERLAY_DB") {
-                ctx.wait_until(async move {
-                    crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_REFUSED, 1)
-                        .await;
-                });
-            }
+            counters.bump(crate::ops::COUNTER_SUBMIT_MUTATION_REFUSED, 1);
+            counters.reason(SubmitReason::MutationRefused);
             return json_error_retryable(&format!("admission not durable ({reason}) — retry"), 502);
         }
     };
@@ -2145,6 +2099,7 @@ async fn submit_parts(
                         "POST /submit(broadcast-gated) -> 502 ({subject_txid}: 0 outputs admitted and \
                          nothing stored — refusing the false ok; the client ladder re-presents (#413)"
                     );
+                    counters.reason(SubmitReason::NoOutputsAdmitted);
                     return json_error(
                         "broadcast-gated submit admitted nothing and stored nothing — retry",
                         502,
@@ -3709,7 +3664,7 @@ pub async fn admin_readmit(
         // the E592 lens fold: not now, counted, the way out named (readmit's BEEF carries the subject's proof, so
         // this is reached only by a proof the engine does not take as the subject's)
         Err(EngineError::WalkCouldNotRun(stop)) => {
-            walk_not_now(env, &stop, "POST /admin/readmit").await
+            walk_not_now(env, &stop, "POST /admin/readmit", None).await
         }
         Err(e) => {
             let status = engine_error_status(&e);
@@ -5602,6 +5557,22 @@ mod tests {
             ),
             ArcCallbackAuth::Authorized
         );
+    }
+
+    #[test]
+    fn submit_answers_share_one_request_batch_and_never_count_queue_replays() {
+        let src = include_str!("routes.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let route = &prod[prod.find("pub async fn submit(").unwrap()..];
+        let route = &route[..route.find("async fn submit_inner(").unwrap()];
+        assert_eq!(route.matches("finish_answer(").count(), 1);
+        assert!(route.contains("ctx.wait_until(counters.flush(db))"));
+        let resumed = &prod[prod.find("pub(crate) async fn submit_resumed(").unwrap()..];
+        let resumed = &resumed[..resumed.find("async fn submit_parts(").unwrap()];
+        assert!(!resumed.contains("finish_answer("));
+        let parts = &prod[prod.find("async fn submit_parts(").unwrap()..];
+        let parts = &parts[..parts.find("fn with_server_timing(").unwrap()];
+        assert!(!parts.contains("crate::ops::bump_counter("));
     }
 
     #[test]
