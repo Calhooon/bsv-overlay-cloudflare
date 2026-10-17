@@ -116,13 +116,17 @@ fn no_request_header_is_ever_read_as_an_identity() {
     // headers for their LENGTH only, before the middleware runs (the nonce
     // headers and `content-length`); neither value is ever an identity or
     // leaves the guard (`auth_input_guard`). Reviewed against Rule 8b.
+    // bsv-low #670 fold round 2 (question 6): the TEST-ONLY planted store
+    // fault reads `x-low-test-store-fault`, compared with "1" and nothing
+    // else, beta only (`planted_store_fault_on`); never an identity.
     assert_eq!(
-        header_reads, 4,
-        "exactly FOUR .headers().get( calls may exist in src/ (the live-view \
+        header_reads, 5,
+        "exactly FIVE .headers().get( calls may exist in src/ (the live-view \
          response Content-Length budget, the view actor's response \
          Server-Timing, bsv-low #499; the #670 guard's nonce lengths and \
-         handshake content-length); a new header read must be reviewed \
-         against Rule 8b and this count updated deliberately"
+         handshake content-length; the #670 planted-fault test header); a new \
+         header read must be reviewed against Rule 8b and this count updated \
+         deliberately"
     );
     assert_eq!(
         identity_header_mentions, 0,

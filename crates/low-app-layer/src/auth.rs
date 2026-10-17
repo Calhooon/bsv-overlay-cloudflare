@@ -762,6 +762,106 @@ pub fn auth_unavailable_log_line(e: &bsv_middleware_cloudflare::AuthCloudflareEr
     format!("[auth] handshake unavailable: {}", e.error_code())
 }
 
+// ── bsv-low #670 (round 2, question 6): the TEST-ONLY planted store fault ──
+//
+// The beta drill of the 503 (the deploy lane's Node cell, bsv-low
+// `docs/CELL-670-PLANTED-FAULT.md`) needs a store fault on demand. It is
+// honoured only when ALL of three hold: the knob var `AUTH_STORE_FAULT_TEST`
+// is a positive number, the beta marker `LOW_BETA_MARKER` is set (only
+// `[env.beta.vars]` carries it; wrangler env vars do not inherit, so prod has
+// none and a `secret put` of the knob there is inert: the tower's
+// `test_knob_n` shape), and the request carries `x-low-test-store-fault: 1`.
+// The door answers the store fault BEFORE the middleware: no store is asked
+// for that request, so no session is minted and no nonce is consumed; every
+// other request is untouched. The answer is the real 503's bytes (the client
+// must treat it as one); its count and log line are its own
+// (`auth_handshake_unavailable_planted_total`, `[auth] handshake unavailable
+// (planted)`), so a drill never reads as an outage.
+
+/// The knob's var.
+pub const AUTH_STORE_FAULT_TEST_VAR: &str = "AUTH_STORE_FAULT_TEST";
+/// The beta-only marker the knob needs (`[env.beta.vars]` only).
+pub const BETA_MARKER_VAR: &str = "LOW_BETA_MARKER";
+/// The request header that plants the fault on one request.
+pub const AUTH_STORE_FAULT_HEADER: &str = "x-low-test-store-fault";
+/// The durable row a planted fault bumps, apart from a real fault's.
+pub const COUNTER_AUTH_HANDSHAKE_UNAVAILABLE_PLANTED: &str =
+    "auth_handshake_unavailable_planted_total";
+
+/// A TEST-ONLY knob's honoured value (the tower's `test_knob_n`): no beta
+/// marker means 0 whatever the value says; absent, 0 or not a number is 0.
+pub fn test_knob_n(beta_marker: Option<&str>, value: Option<&str>) -> u64 {
+    if beta_marker.is_none_or(|m| m.trim().is_empty()) {
+        return 0;
+    }
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// The gate, a pure function of (the beta marker, the knob var, the header).
+pub fn planted_store_fault(
+    beta_marker: Option<&str>,
+    knob: Option<&str>,
+    header: Option<&str>,
+) -> bool {
+    test_knob_n(beta_marker, knob) > 0 && header.map(str::trim) == Some("1")
+}
+
+/// [`planted_store_fault`] over a real request's header.
+pub fn planted_store_fault_on(
+    req: &Request,
+    beta_marker: Option<&str>,
+    knob: Option<&str>,
+) -> bool {
+    let header = req.headers().get(AUTH_STORE_FAULT_HEADER).ok().flatten();
+    planted_store_fault(beta_marker, knob, header.as_deref())
+}
+
+fn plain_var(env: &Env, name: &str) -> Option<String> {
+    env.var(name).ok().map(|v| v.to_string())
+}
+
+/// Whether this request plants the fault on this deploy.
+fn planted_store_fault_requested(env: &Env, req: &Request) -> bool {
+    let marker = plain_var(env, BETA_MARKER_VAR);
+    let knob = plain_var(env, AUTH_STORE_FAULT_TEST_VAR);
+    planted_store_fault_on(req, marker.as_deref(), knob.as_deref())
+}
+
+/// The planted fault: the store-fault class, its text naming the drill.
+pub fn planted_store_fault_error() -> bsv_middleware_cloudflare::AuthCloudflareError {
+    bsv_middleware_cloudflare::AuthCloudflareError::KvError(
+        "planted store fault (x-low-test-store-fault)".into(),
+    )
+}
+
+/// The planted fault's one log line, apart from a real fault's.
+pub fn planted_unavailable_log_line() -> String {
+    format!(
+        "[auth] handshake unavailable (planted): {}",
+        planted_store_fault_error().error_code()
+    )
+}
+
+/// The TEST-ONLY knobs this deploy honours (`/health.testKnobs`).
+pub fn test_knobs_honored(env: &Env) -> Vec<String> {
+    test_knobs_list(test_knob_n(
+        plain_var(env, BETA_MARKER_VAR).as_deref(),
+        plain_var(env, AUTH_STORE_FAULT_TEST_VAR).as_deref(),
+    ))
+}
+
+/// `testKnobs` from the honoured value (0 = off).
+pub fn test_knobs_list(store_fault: u64) -> Vec<String> {
+    if store_fault == 0 {
+        return Vec::new();
+    }
+    vec![format!(
+        "{AUTH_STORE_FAULT_TEST_VAR}={store_fault} (per request: {AUTH_STORE_FAULT_HEADER}: 1)"
+    )]
+}
+
 // ── bsv-low #670 fold (lens HIGH-1): a caller's own bytes never reach the store ──
 //
 // The middleware (0.6.2) uses the caller's nonce headers as storage keys and
@@ -1042,6 +1142,14 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                 Ok(req) => req,
                 Err(resp) => return Ok(FrontDoor::Reply(resp)),
             };
+            // bsv-low #670 (round 2, question 6): the TEST-ONLY planted store
+            // fault (beta only, this request only), answered before any store
+            // is asked, counted and logged apart.
+            if planted_store_fault_requested(env, &req) {
+                crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_UNAVAILABLE_PLANTED);
+                worker::console_warn!("{}", planted_unavailable_log_line());
+                return auth_fault_reply(&planted_store_fault_error()).map(FrontDoor::Reply);
+            }
             let outcome = if lane_on {
                 process_auth_lane(req, env, &opts, AUTH_SESSION_STORE_BINDING).await
             } else {
@@ -1505,6 +1613,100 @@ mod tests {
             bound(128, 16 * 1024) > DO_VALUE_CAP,
             "the old bounds overrun"
         );
+    }
+
+    /// (j) Round 2's question 6: the TEST-ONLY planted store fault. The gate is
+    /// a pure function of (the beta marker, the knob var, the header), OFF
+    /// without the marker whatever the var says; the answer is the real 503's
+    /// bytes; its count and log line are its own; it shows in `testKnobs`; the
+    /// prod `[vars]` carry neither the knob nor the marker.
+    #[test]
+    fn s670_j_the_planted_store_fault_is_beta_only_and_per_request() {
+        let beta = Some("_beta");
+        assert!(planted_store_fault(beta, Some("1"), Some("1")));
+        assert!(planted_store_fault(beta, Some(" 1 "), Some(" 1 ")));
+        // The prod marker (none, or empty): off whatever the var says.
+        for marker in [None, Some(""), Some("  ")] {
+            for knob in ["1", "2", "999"] {
+                assert!(
+                    !planted_store_fault(marker, Some(knob), Some("1")),
+                    "{marker:?} {knob}"
+                );
+            }
+        }
+        for knob in [None, Some(""), Some("0"), Some("x")] {
+            assert!(!planted_store_fault(beta, knob, Some("1")), "{knob:?}");
+        }
+        for header in [None, Some(""), Some("0"), Some("true"), Some("11")] {
+            assert!(!planted_store_fault(beta, Some("1"), header), "{header:?}");
+        }
+        // The answer: the real store fault's 503, Retry-After and all.
+        let e = planted_store_fault_error();
+        assert_eq!(auth_fault_class(&e), AuthFaultClass::Transport);
+        assert_eq!(
+            auth_fault_answer(&e),
+            auth_fault_answer(&kv("auth-session-store fetch: Error"))
+        );
+        // Its count and log line are its own, never the outage's.
+        assert_eq!(
+            COUNTER_AUTH_HANDSHAKE_UNAVAILABLE_PLANTED,
+            "auth_handshake_unavailable_planted_total"
+        );
+        assert_eq!(
+            planted_unavailable_log_line(),
+            "[auth] handshake unavailable (planted): ERR_STORAGE"
+        );
+        assert_ne!(
+            planted_unavailable_log_line(),
+            auth_unavailable_log_line(&e)
+        );
+        assert_eq!(
+            test_knobs_list(1),
+            vec!["AUTH_STORE_FAULT_TEST=1 (per request: x-low-test-store-fault: 1)".to_string()]
+        );
+        assert!(test_knobs_list(0).is_empty());
+        // The door: the planted check after the guard and before any
+        // middleware call; it bumps its own row and logs its own line.
+        let whole = include_str!("auth.rs");
+        let code: String = whole[..whole.find("#[cfg(test)]").unwrap()]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let body = fn_body(&code, "pubasyncfnfront_door(");
+        let planted = "ifplanted_store_fault_requested(env,&req){\
+            crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_UNAVAILABLE_PLANTED);\
+            worker::console_warn!(\"{}\",planted_unavailable_log_line());\
+            returnauth_fault_reply(&planted_store_fault_error()).map(FrontDoor::Reply);}";
+        let g = body
+            .find("letreq=matchauth_input_guard(req).await?{")
+            .unwrap();
+        let p = body.find(planted).expect("the door plants");
+        assert!(g < p, "the guard first");
+        assert!(guard_precedes_middleware(
+            &body[p..],
+            "ifplanted_store_fault_requested"
+        ));
+        assert_eq!(
+            code.matches("planted_store_fault_requested(env,&req)")
+                .count(),
+            1
+        );
+        // The health body names the knobs.
+        assert!(include_str!("routes.rs").contains(
+            "body[\"testKnobs\"] = serde_json::json!(crate::auth::test_knobs_honored(&ctx.env));"
+        ));
+        // The config: the prod [vars] (everything before [env.beta]) assign
+        // neither the knob nor the marker; beta's carry the marker.
+        let toml = include_str!("../wrangler.toml");
+        let (prod, beta) = toml.split_at(toml.find("[env.beta]").unwrap());
+        let assigns = |text: &str, name: &str| {
+            text.lines()
+                .map(str::trim_start)
+                .any(|l| !l.starts_with('#') && l.starts_with(name))
+        };
+        assert!(!assigns(prod, AUTH_STORE_FAULT_TEST_VAR));
+        assert!(!assigns(prod, BETA_MARKER_VAR));
+        assert!(assigns(beta, "LOW_BETA_MARKER = \"_beta\""));
     }
 
     /// The body of the function whose signature starts at `sig`: from its first
