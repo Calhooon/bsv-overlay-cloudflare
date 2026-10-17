@@ -6425,7 +6425,7 @@ pub(crate) mod tests {
     #[test]
     fn e693f2_h1_the_recheck_takes_the_newest_heights() {
         use bsv_overlay_cloudflare::tip_pass::REORG_SWEEP_DEPTH;
-        assert!(LATCH_RECHECK_DEPTH >= 2 * REORG_SWEEP_DEPTH);
+        const _: () = assert!(LATCH_RECHECK_DEPTH >= 2 * REORG_SWEEP_DEPTH);
         let latches: Vec<ProofLatch> = (0..5u8)
             .map(|i| ProofLatch {
                 spender: tx(0x40 + i),
