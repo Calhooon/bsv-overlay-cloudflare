@@ -635,6 +635,13 @@ pub(crate) fn auth_fault_answer(
     }
 }
 
+/// The store fault's one log line: the crate's CODE (`ERR_STORAGE`), never
+/// the error's text: the DO's fault carries the platform's `reference = …`
+/// id, and under HIGH-1 the text was the caller's (the lens's HIGH-2).
+pub fn auth_unavailable_log_line(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> String {
+    format!("[auth] handshake unavailable: {}", e.error_code())
+}
+
 // ── bsv-low #670 fold (lens HIGH-1): a caller's own bytes never reach the store ──
 //
 // The middleware (0.6.2) uses the caller's nonce headers as storage keys and
@@ -941,14 +948,14 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                     auth
                 }
                 // bsv-low #670: a store fault is the retryable 503 (counted
-                // durably, logged with its text); any other fault the 400.
+                // durably, logged by its code); any other fault the 400.
                 Err(e) => {
                     let (status, body, retry_after) = auth_fault_answer(&e);
                     let mut resp = json_reply(status, &body)?;
                     match retry_after {
                         Some(secs) => {
                             crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_UNAVAILABLE);
-                            worker::console_warn!("[auth] handshake unavailable: {e}");
+                            worker::console_warn!("{}", auth_unavailable_log_line(&e));
                             resp.headers_mut().set("Retry-After", secs)?;
                         }
                         None => {
@@ -1252,6 +1259,20 @@ mod tests {
             1,
             "the oversize 400 is counted apart"
         );
+    }
+
+    /// (f) The lens's HIGH-2: the store fault's log line carries `ERR_STORAGE`,
+    /// never the error's text or a platform reference id.
+    #[test]
+    fn s670_f_the_unavailable_log_line_carries_no_error_text() {
+        let e = kv("auth-session-store fetch: Error: internal error; reference = abc123");
+        let line = auth_unavailable_log_line(&e);
+        assert_eq!(line, "[auth] handshake unavailable: ERR_STORAGE");
+        assert!(!line.contains("abc123") && !line.contains("reference"), "{line}");
+        let whole = include_str!("auth.rs");
+        let code = &whole[..whole.find("#[cfg(test)]").unwrap()];
+        assert_eq!(code.matches("console_warn!(\"{}\", auth_unavailable_log_line(&e));").count(), 1);
+        assert!(!code.contains("handshake unavailable: {e}"));
     }
 
     // ── AuthMode::from_flag ────────────────────────────────────────────────
