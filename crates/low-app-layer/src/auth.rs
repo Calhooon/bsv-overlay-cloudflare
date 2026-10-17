@@ -648,7 +648,7 @@ pub(crate) fn json_reply(status: u16, body: &serde_json::Value) -> Result<Respon
 /// splits the faults the client should retry (the session store could not be
 /// asked or written) from the rest, which keep the door's 400 byte for byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthFaultClass {
+pub enum AuthFaultClass {
     /// The session store (KV, the `AuthSessionStore` DO: its stub, its fetch,
     /// its status, its body) could not be asked or written: 503, `Retry-After`.
     Transport,
@@ -666,9 +666,7 @@ pub(crate) enum AuthFaultClass {
 /// classified. Every store fault the middleware raises is `KvError`
 /// (`storage/kv_session.rs`, `storage/do_session.rs`, and `From<worker::Error>`);
 /// no other variant carries one.
-pub(crate) fn auth_fault_class(
-    e: &bsv_middleware_cloudflare::AuthCloudflareError,
-) -> AuthFaultClass {
+pub fn auth_fault_class(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> AuthFaultClass {
     use bsv_middleware_cloudflare::AuthCloudflareError as E;
     match e {
         E::KvError(_) => AuthFaultClass::Transport,
@@ -690,9 +688,9 @@ pub(crate) fn auth_fault_class(
 }
 
 /// The 503's `Retry-After`, in seconds.
-pub(crate) const AUTH_UNAVAILABLE_RETRY_AFTER: &str = "2";
+pub const AUTH_UNAVAILABLE_RETRY_AFTER: &str = "2";
 /// The 503's code.
-pub(crate) const AUTH_UNAVAILABLE_CODE: &str = "ERR_AUTH_UNAVAILABLE";
+pub const AUTH_UNAVAILABLE_CODE: &str = "ERR_AUTH_UNAVAILABLE";
 /// The durable `ops_counters` row a store fault at the door bumps (through the
 /// courier census's batched flush, never one D1 write per fault).
 pub const COUNTER_AUTH_HANDSHAKE_UNAVAILABLE: &str = "auth_handshake_unavailable_total";
@@ -701,7 +699,7 @@ pub const COUNTER_AUTH_HANDSHAKE_UNAVAILABLE: &str = "auth_handshake_unavailable
 /// Retry-After)`. A store fault names its class only, never the error's text
 /// (it carries the platform's reference id). Any other fault is the pre-#670
 /// 400, `authentication handshake failed: {e}`.
-pub(crate) fn auth_fault_answer(
+pub fn auth_fault_answer(
     e: &bsv_middleware_cloudflare::AuthCloudflareError,
 ) -> (u16, serde_json::Value, Option<&'static str>) {
     match auth_fault_class(e) {
@@ -719,6 +717,28 @@ pub(crate) fn auth_fault_answer(
             None,
         ),
     }
+}
+
+/// The headers a fault's answer carries beside `json_reply`'s: the store
+/// fault's `Retry-After` (the lens's HIGH-3: one list the reply renders and a
+/// pin reads, so a dropped hint reds), none for any other fault (the pre-#670
+/// bytes). CORS is stamped after, on every door reply (`serve`'s `stamp_cors`).
+pub fn auth_fault_headers(class: AuthFaultClass) -> &'static [(&'static str, &'static str)] {
+    match class {
+        AuthFaultClass::Transport => &[("Retry-After", AUTH_UNAVAILABLE_RETRY_AFTER)],
+        AuthFaultClass::Caller => &[],
+    }
+}
+
+/// The door's reply to an `Err` out of `process_auth*`: [`auth_fault_answer`]
+/// rendered with [`auth_fault_headers`].
+pub fn auth_fault_reply(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> Result<Response> {
+    let (status, body, _) = auth_fault_answer(e);
+    let mut resp = json_reply(status, &body)?;
+    for (name, value) in auth_fault_headers(auth_fault_class(e)) {
+        resp.headers_mut().set(name, value)?;
+    }
+    Ok(resp)
 }
 
 /// The store fault's one log line: the crate's CODE (`ERR_STORAGE`), never
@@ -820,8 +840,10 @@ async fn bound_handshake_body(mut req: Request) -> Result<std::result::Result<Re
                 return Ok(Err("handshake body could not be read".into()));
             };
             if !push_bounded(&mut buf, &chunk) {
-                return Ok(Err(handshake_body_oversize(AUTH_HANDSHAKE_BODY_MAX_BYTES + 1)
-                    .unwrap_or_default()));
+                return Ok(Err(handshake_body_oversize(
+                    AUTH_HANDSHAKE_BODY_MAX_BYTES + 1,
+                )
+                .unwrap_or_default()));
             }
         }
     }
@@ -829,10 +851,11 @@ async fn bound_handshake_body(mut req: Request) -> Result<std::result::Result<Re
     init.with_method(req.method());
     init.with_headers(req.headers().clone());
     if !buf.is_empty() {
-        init.with_body(Some(worker::js_sys::Uint8Array::from(buf.as_slice()).into()));
+        init.with_body(Some(
+            worker::js_sys::Uint8Array::from(buf.as_slice()).into(),
+        ));
     }
-    Request::new_with_init(req.url()?.as_str(), &init)
-        .map(Ok)
+    Request::new_with_init(req.url()?.as_str(), &init).map(Ok)
 }
 
 /// The guard the door runs BEFORE `process_auth*`: an over-long nonce header
@@ -1037,19 +1060,16 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                 // bsv-low #670: a store fault is the retryable 503 (counted
                 // durably, logged by its code); any other fault the 400.
                 Err(e) => {
-                    let (status, body, retry_after) = auth_fault_answer(&e);
-                    let mut resp = json_reply(status, &body)?;
-                    match retry_after {
-                        Some(secs) => {
+                    match auth_fault_class(&e) {
+                        AuthFaultClass::Transport => {
                             crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_UNAVAILABLE);
                             worker::console_warn!("{}", auth_unavailable_log_line(&e));
-                            resp.headers_mut().set("Retry-After", secs)?;
                         }
-                        None => {
+                        AuthFaultClass::Caller => {
                             count_auth_refused("handshake_fault");
                         }
                     }
-                    return Ok(FrontDoor::Reply(resp));
+                    return auth_fault_reply(&e).map(FrontDoor::Reply);
                 }
             };
             match auth {
@@ -1166,11 +1186,14 @@ mod tests {
         }
     }
 
-    /// (c, the 503) The handshake's session write fails at the store: the door
-    /// answers 503 `ERR_AUTH_UNAVAILABLE` with `Retry-After: 2`, the body
-    /// naming the class only (never the platform's reference id). Before #670: 400.
+    /// (c, the 503) The CLASSIFIER: a `KvError` of the shape the store raises
+    /// (built by a port fake, no middleware code run) is answered 503
+    /// `ERR_AUTH_UNAVAILABLE` with `Retry-After: 2`, the body naming the class
+    /// only (never the platform's reference id). Before #670: 400. The
+    /// middleware's real path over a failing store is `tests/door_wasm.rs`
+    /// (wasm32, Node).
     #[tokio::test]
-    async fn s670_a_store_fault_at_the_handshake_is_a_retryable_503() {
+    async fn s670_a_the_classifier_answers_a_store_fault_503() {
         use bsv_middleware_cloudflare::SessionStorage;
         // Every field by hand (`StoredSession::new` reads the JS clock).
         let session = Stored {
@@ -1221,7 +1244,7 @@ mod tests {
         let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
         let whole = include_str!("auth.rs");
         let code = strip(&whole[..whole.find("#[cfg(test)]").unwrap()]);
-        assert_eq!(code.matches("auth_fault_answer(&e)").count(), 1);
+        assert_eq!(code.matches("auth_fault_reply(&e)").count(), 1);
         assert_eq!(
             code.matches("json!({\"error\":format!(\"authenticationhandshakefailed:{e}\")})")
                 .count(),
@@ -1297,7 +1320,9 @@ mod tests {
             assert_eq!(status, 400);
             assert_eq!(
                 serde_json::to_string(&body).unwrap(),
-                format!(r#"{{"error":"authentication handshake failed: {header} over 128 bytes"}}"#)
+                format!(
+                    r#"{{"error":"authentication handshake failed: {header} over 128 bytes"}}"#
+                )
             );
         }
         let nonce = bsv_middleware_cloudflare::core::auth::generate_random_nonce();
@@ -1309,8 +1334,14 @@ mod tests {
         assert_eq!(auth_nonce_oversize(|_| None), None);
         let mut buf = Vec::new();
         let chunk = vec![b'x'; 1024];
-        let fits = (0..17).take_while(|_| push_bounded(&mut buf, &chunk)).count();
-        assert_eq!((fits, buf.len()), (16, 16 * 1024), "the read stops at the bound");
+        let fits = (0..17)
+            .take_while(|_| push_bounded(&mut buf, &chunk))
+            .count();
+        assert_eq!(
+            (fits, buf.len()),
+            (16, 16 * 1024),
+            "the read stops at the bound"
+        );
         assert_eq!(
             handshake_body_oversize(17 * 1024).as_deref(),
             Some("handshake body over 16384 bytes")
@@ -1337,10 +1368,15 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        let at = code.find("letreq=matchauth_input_guard(req).await?{").expect("the door runs the guard");
+        let at = code
+            .find("letreq=matchauth_input_guard(req).await?{")
+            .expect("the door runs the guard");
         assert!(code[at..].find("process_auth_lane(req,").is_some());
         assert_eq!(code.matches("auth_input_guard(req).await?").count(), 1);
-        assert_eq!(COUNTER_AUTH_HANDSHAKE_OVERSIZE, "auth_handshake_oversize_total");
+        assert_eq!(
+            COUNTER_AUTH_HANDSHAKE_OVERSIZE,
+            "auth_handshake_oversize_total"
+        );
         assert_eq!(
             code.matches("crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_OVERSIZE);")
                 .count(),
@@ -1356,11 +1392,46 @@ mod tests {
         let e = kv("auth-session-store fetch: Error: internal error; reference = abc123");
         let line = auth_unavailable_log_line(&e);
         assert_eq!(line, "[auth] handshake unavailable: ERR_STORAGE");
-        assert!(!line.contains("abc123") && !line.contains("reference"), "{line}");
+        assert!(
+            !line.contains("abc123") && !line.contains("reference"),
+            "{line}"
+        );
         let whole = include_str!("auth.rs");
         let code = &whole[..whole.find("#[cfg(test)]").unwrap()];
-        assert_eq!(code.matches("console_warn!(\"{}\", auth_unavailable_log_line(&e));").count(), 1);
+        assert_eq!(
+            code.matches("console_warn!(\"{}\", auth_unavailable_log_line(&e));")
+                .count(),
+            1
+        );
         assert!(!code.contains("handshake unavailable: {e}"));
+    }
+
+    /// (h) The lens's HIGH-3, natively: the fault's extra headers are one list,
+    /// the store fault's carries `Retry-After: 2`, any other none; the reply
+    /// renders that list and the door answers with that reply.
+    #[test]
+    fn s670_h_the_fault_header_list_carries_retry_after() {
+        assert_eq!(
+            auth_fault_headers(AuthFaultClass::Transport),
+            &[("Retry-After", "2")]
+        );
+        assert!(auth_fault_headers(AuthFaultClass::Caller).is_empty());
+        let whole = include_str!("auth.rs");
+        let code: String = whole[..whole.find("#[cfg(test)]").unwrap()]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let reply = &code[code.find("pubfnauth_fault_reply(").unwrap()..];
+        let reply = &reply[..reply.find("Ok(resp)").unwrap()];
+        assert!(
+            reply.contains("for(name,value)inauth_fault_headers(auth_fault_class(e)){resp.headers_mut().set(name,value)?;}"),
+            "{reply}"
+        );
+        assert_eq!(
+            code.matches("returnauth_fault_reply(&e).map(FrontDoor::Reply);")
+                .count(),
+            1
+        );
     }
 
     // ── AuthMode::from_flag ────────────────────────────────────────────────
