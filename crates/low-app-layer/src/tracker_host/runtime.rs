@@ -804,7 +804,7 @@ mod budget_pins {
             "tx-any read still writes a word"
         );
         let owed = &routes[routes.find("async fn owed_recompute_inner(").unwrap()
-            ..routes.find("let spender_words =").unwrap()];
+            ..routes.find("let mut rows = derive_owed_rows(&inputs);").unwrap()];
         assert!(
             !owed.contains("runtime::event("),
             "owed read still writes a word"
