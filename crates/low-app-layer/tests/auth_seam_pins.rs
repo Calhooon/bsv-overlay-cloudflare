@@ -320,8 +320,15 @@ fn every_front_door_outcome_is_counted() {
     // The authenticated path counts once (the Authenticated+session arm)…
     assert_eq!(count(&auth, "count_authenticated_served();"), 1);
     // …and middleware refusals are counted at each refusal site (Err, the
-    // contract-break 500, and the non-handshake Response refusal).
-    assert_eq!(count(&auth, "count_auth_refused();"), 3);
+    // contract-break 500, and the non-handshake Response refusal), each with
+    // its reason since bsv-low #628 (the durable `applayer_auth_refused_*`).
+    for site in [
+        "count_auth_refused(\"handshake_fault\");",
+        "count_auth_refused(\"no_session\");",
+        "count_auth_refused(response_refusal_reason(&resp));",
+    ] {
+        assert_eq!(count(&auth, site), 1, "{site}");
+    }
 }
 
 /// The pinned needles genuinely match the current source (Rule 9's

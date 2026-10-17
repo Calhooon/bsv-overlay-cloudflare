@@ -79,6 +79,31 @@ impl DurableObject for BoardView {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
+        let out = self.serve_fetch(req).await;
+        self.flush_counters_if_due();
+        out
+    }
+    /// bsv-low #628: the deferred owed walk runs in this actor's isolate, so its counts (the walk's couriers,
+    /// its faults, the abandoned retry) are flushed here, under the census's due rule, never only by a fetch
+    /// isolate that never saw them.
+    async fn alarm(&self) -> Result<Response> {
+        let out = self.serve_alarm().await;
+        self.flush_counters_if_due();
+        out
+    }
+}
+
+impl BoardView {
+    fn flush_counters_if_due(&self) {
+        let pending = crate::courier::take_pending_if_due(Date::now().as_millis() as f64);
+        if !pending.is_empty() {
+            let db = self.env.d1("OVERLAY_DB").ok();
+            self.state
+                .wait_until(async move { crate::courier::flush(db, pending).await });
+        }
+    }
+
+    async fn serve_fetch(&self, req: Request) -> Result<Response> {
         let url = req.url()?;
         // Separate object names from the board/results actors; no cache or polling path reaches this arm.
         if req.path() == "/owed-deferred" {
@@ -254,7 +279,7 @@ impl DurableObject for BoardView {
         })
         .await
     }
-    async fn alarm(&self) -> Result<Response> {
+    async fn serve_alarm(&self) -> Result<Response> {
         if self.owed_alarm_not_due().await? {
             return Response::ok("owed retry not due");
         }

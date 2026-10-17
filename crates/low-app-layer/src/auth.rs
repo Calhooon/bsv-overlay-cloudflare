@@ -361,17 +361,98 @@ pub fn count_anonymous_write_served(write_route: usize) {
 pub fn count_lane_served() {
     LANE_SERVED.fetch_add(1, Ordering::Relaxed);
 }
-pub fn count_auth_refused() {
+/// `reason`: the refusal's class in its durable name (bsv-low #628, [`AUTH_REFUSAL_REASONS`]).
+pub fn count_auth_refused(reason: &str) {
     AUTH_REFUSED.fetch_add(1, Ordering::Relaxed);
+    mirror_auth_refused(reason);
 }
 pub fn count_mismatch_refused() {
     MISMATCH_REFUSED.fetch_add(1, Ordering::Relaxed);
+    mirror_auth_refused("mismatch");
 }
 pub fn count_strict_refused_unauthenticated() {
     STRICT_REFUSED_UNAUTHENTICATED.fetch_add(1, Ordering::Relaxed);
+    mirror_auth_refused("strict_unauthenticated");
 }
 pub fn count_misconfigured_refused() {
     MISCONFIGURED_REFUSED.fetch_add(1, Ordering::Relaxed);
+    mirror_auth_refused("misconfigured");
+}
+
+/// bsv-low #628 (the observability bar, issue 4): every front-door refusal by reason, mirrored on the overlay's
+/// `ops_counters` as `applayer_auth_refused_<reason>_total` beside `applayer_auth_refused_total`, through the
+/// courier census's batched flush. The session lane's refusals (`ERR_SESSION_REFUSED`) are `lane_<reason>` by the
+/// middleware's own reason; the reference door's 401s are their code; `handshake_fault` is a middleware `Err`
+/// (a fault, the 400), `no_session` its contract break (the 500). The isolate fields on `/health.auth` stay.
+pub const AUTH_REFUSAL_REASONS: [&str; 19] = [
+    "lane_unknown_session",
+    "lane_expired",
+    "lane_replay",
+    "lane_bad_mac",
+    "lane_malformed",
+    "lane_unsupported",
+    "lane_unavailable",
+    "lane_other",
+    "unauthorized",
+    "invalid_auth",
+    "session_not_found",
+    "replayed_request",
+    "server_misconfigured",
+    "middleware_other",
+    "handshake_fault",
+    "no_session",
+    "mismatch",
+    "strict_unauthenticated",
+    "misconfigured",
+];
+
+fn mirror_auth_refused(reason: &str) {
+    crate::courier::note_presence("applayer_auth_refused_total");
+    crate::courier::note_presence(&format!("applayer_auth_refused_{reason}_total"));
+}
+
+/// Every auth name this worker mirrors (the overlay seeds each at 0).
+pub fn auth_mirrored_counter_names() -> Vec<String> {
+    std::iter::once("applayer_auth_refused_total".to_string())
+        .chain(
+            AUTH_REFUSAL_REASONS
+                .iter()
+                .map(|r| format!("applayer_auth_refused_{r}_total")),
+        )
+        .collect()
+}
+
+/// PURE: the reason of one middleware refusal, read off its body (`{"code": .., "reason": ..}`): the session
+/// lane's `ERR_SESSION_REFUSED` by its reason, the reference door's 401 by its code; an unread body or a code
+/// this list does not know is `middleware_other` (the cardinality stays bounded).
+pub fn middleware_refusal_reason(body: &[u8]) -> &'static str {
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    match v["code"].as_str().unwrap_or("") {
+        "ERR_SESSION_REFUSED" => match v["reason"].as_str().unwrap_or("") {
+            "unknown-session" => "lane_unknown_session",
+            "expired" => "lane_expired",
+            "replay" => "lane_replay",
+            "bad-mac" => "lane_bad_mac",
+            "malformed" => "lane_malformed",
+            "lane-unsupported" => "lane_unsupported",
+            "lane-unavailable" => "lane_unavailable",
+            _ => "lane_other",
+        },
+        "UNAUTHORIZED" => "unauthorized",
+        "ERR_INVALID_AUTH" => "invalid_auth",
+        "ERR_SESSION_NOT_FOUND" => "session_not_found",
+        "ERR_REPLAYED_REQUEST" => "replayed_request",
+        "ERR_SERVER_MISCONFIGURED" => "server_misconfigured",
+        _ => "middleware_other",
+    }
+}
+
+/// The reason of a middleware `Response`, from the bytes it already holds (no read of the stream).
+fn response_refusal_reason(resp: &Response) -> &'static str {
+    match resp.body() {
+        worker::ResponseBody::Body(bytes) => middleware_refusal_reason(bytes),
+        _ => "middleware_other",
+    }
 }
 
 /// A point-in-time copy of the counters (pure input to the health JSON so the
@@ -726,7 +807,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                     auth
                 }
                 Err(e) => {
-                    count_auth_refused();
+                    count_auth_refused("handshake_fault");
                     return json_reply(
                         400,
                         &json!({ "error": format!("authentication handshake failed: {e}") }),
@@ -764,7 +845,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                     // middleware contract break — refuse, never serve as
                     // anonymous-with-identity.
                     None => {
-                        count_auth_refused();
+                        count_auth_refused("no_session");
                         json_reply(
                             500,
                             &json!({ "error": "auth middleware returned an authenticated result without a session" }),
@@ -779,7 +860,7 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                 // 0.4.1, counted as its `Err` was before, bsv-low #588).
                 AuthResult::Response(resp) => {
                     if !is_handshake || resp.status_code() == 401 {
-                        count_auth_refused();
+                        count_auth_refused(response_refusal_reason(&resp));
                     }
                     Ok(FrontDoor::Reply(resp))
                 }
