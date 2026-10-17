@@ -18,6 +18,7 @@ macro_rules! reasons {
 reasons! {
     Admit => "admit",
     AdmitFastEcho => "admit_fast_echo",
+    AdmitQueued => "admit_queued",
     Evicted => "evicted",
     ScriptRefused => "script_refused",
     WalkCouldNotRun => "walk_could_not_run",
@@ -177,6 +178,7 @@ mod tests {
             (401, Reason::OperatorAuthRequired),
             (422, Reason::NetworkRejected),
             (502, Reason::Queued),
+            (200, Reason::AdmitQueued),
         ];
         for (status, reason) in cases {
             let counters = SubmitCounters::new();
@@ -196,7 +198,8 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(count("submit_answer_200_total"), 2);
+        assert_eq!(count("submit_answer_200_total"), 3);
+        assert_eq!(count("submit_answer_reason_admit_queued_total"), 1);
         assert_eq!(count("submit_answer_422_total"), 2);
         assert_eq!(count("submit_answer_reason_queued_total"), 1);
         assert_eq!(count("submit_answer_reason_queue_fault_total"), 1);

@@ -1930,6 +1930,8 @@ async fn submit_parts(
                 tagged_beef.topics.join(",")
             );
             counters.bump(crate::ops::COUNTER_SUBMIT_MUTATION_QUEUED, 1);
+            // The 200 is the queue's word, not D1's: its own reason (S2).
+            counters.reason(SubmitReason::AdmitQueued);
             true
         }
         crate::queue::MutationAck::Refused(reason) => {
