@@ -555,6 +555,86 @@ pub(crate) fn json_reply(status: u16, body: &serde_json::Value) -> Result<Respon
     Ok(resp)
 }
 
+// ── bsv-low #670: a store FAULT at the auth door is a retryable 503 ──────────
+
+/// What an `Err` out of `process_auth*` is. Since the middleware's 0.4.1 every
+/// REFUSAL it decides is its own 401 `Response`, so an `Err` is a fault; this
+/// splits the faults the client should retry (the session store could not be
+/// asked or written) from the rest, which keep the door's 400 byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthFaultClass {
+    /// The session store (KV, the `AuthSessionStore` DO: its stub, its fetch,
+    /// its status, its body) could not be asked or written: 503, `Retry-After`.
+    Transport,
+    /// Everything else: the 400 as before (a body the middleware could not
+    /// serialize, the transport's own request plumbing, the server's key or a
+    /// missing binding, an SDK fault). None of these heals by waiting two
+    /// seconds, and a malformed caller must never be told to retry.
+    Caller,
+}
+
+/// Classify by VARIANT (bsv-middleware-cloudflare 0.6.2's `AuthCloudflareError`,
+/// the version in the workers lock; `error.rs`, `middleware/auth.rs` and
+/// `storage/` are byte-identical to 0.6.0's). The match is exhaustive on
+/// purpose: a crate bump that adds a variant does not compile until it is
+/// classified. Every store fault the middleware raises is `KvError`
+/// (`storage/kv_session.rs`, `storage/do_session.rs`, and `From<worker::Error>`);
+/// no other variant carries one.
+pub(crate) fn auth_fault_class(
+    e: &bsv_middleware_cloudflare::AuthCloudflareError,
+) -> AuthFaultClass {
+    use bsv_middleware_cloudflare::AuthCloudflareError as E;
+    match e {
+        E::KvError(_) => AuthFaultClass::Transport,
+        E::Unauthorized
+        | E::InvalidAuthentication(_)
+        | E::SessionNotFound(_)
+        | E::ServerMisconfigured
+        | E::PaymentInternal(_)
+        | E::PaymentRequired { .. }
+        | E::MalformedPayment(_)
+        | E::InvalidDerivationPrefix
+        | E::PaymentFailed(_)
+        | E::InvalidPayment(_)
+        | E::SdkError(_)
+        | E::TransportError(_)
+        | E::ConfigError(_)
+        | E::SerializationError(_) => AuthFaultClass::Caller,
+    }
+}
+
+/// The 503's `Retry-After`, in seconds.
+pub(crate) const AUTH_UNAVAILABLE_RETRY_AFTER: &str = "2";
+/// The 503's code.
+pub(crate) const AUTH_UNAVAILABLE_CODE: &str = "ERR_AUTH_UNAVAILABLE";
+/// The durable `ops_counters` row a store fault at the door bumps (through the
+/// courier census's batched flush, never one D1 write per fault).
+pub const COUNTER_AUTH_HANDSHAKE_UNAVAILABLE: &str = "auth_handshake_unavailable_total";
+
+/// The door's answer to an `Err` out of `process_auth*`: `(status, body,
+/// Retry-After)`. A store fault names its class only, never the error's text
+/// (it carries the platform's reference id). Any other fault is the pre-#670
+/// 400, `authentication handshake failed: {e}`.
+pub(crate) fn auth_fault_answer(
+    e: &bsv_middleware_cloudflare::AuthCloudflareError,
+) -> (u16, serde_json::Value, Option<&'static str>) {
+    match auth_fault_class(e) {
+        AuthFaultClass::Transport => (
+            503,
+            json!({
+                "error": "authentication handshake unavailable: session store",
+                "code": AUTH_UNAVAILABLE_CODE,
+            }),
+            Some(AUTH_UNAVAILABLE_RETRY_AFTER),
+        ),
+        AuthFaultClass::Caller => (
+            400,
+            json!({ "error": format!("authentication handshake failed: {e}") }),
+            None,
+        ),
+    }
+}
+
 /// A secret/var read that treats "bound but empty" as absent.
 fn nonempty_var(env: &Env, name: &str) -> Option<String> {
     env.secret(name)
@@ -725,13 +805,22 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                     pending_offer = Some(offer);
                     auth
                 }
+                // bsv-low #670: a store fault is the retryable 503 (counted
+                // durably, logged with its text); any other fault the 400.
                 Err(e) => {
-                    count_auth_refused();
-                    return json_reply(
-                        400,
-                        &json!({ "error": format!("authentication handshake failed: {e}") }),
-                    )
-                    .map(FrontDoor::Reply);
+                    let (status, body, retry_after) = auth_fault_answer(&e);
+                    let mut resp = json_reply(status, &body)?;
+                    match retry_after {
+                        Some(secs) => {
+                            crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_UNAVAILABLE);
+                            worker::console_warn!("[auth] handshake unavailable: {e}");
+                            resp.headers_mut().set("Retry-After", secs)?;
+                        }
+                        None => {
+                            count_auth_refused();
+                        }
+                    }
+                    return Ok(FrontDoor::Reply(resp));
                 }
             };
             match auth {
@@ -799,6 +888,168 @@ mod tests {
 
     fn verified_a() -> CallerAuth {
         CallerAuth::verified(&ID_A.to_ascii_uppercase())
+    }
+
+    // ── bsv-low #670: a store fault at the auth door is a retryable 503 ──────
+
+    /// A session store whose writes fail the way Cloudflare's KV failed on
+    /// 2026-10-15 (`KV PUT failed: 500`) and whose reads fail the way the DO
+    /// fetch did (`auth-session-store fetch: Error: internal error; reference = …`).
+    struct FailingStore;
+
+    const KV_PUT_500: &str = "js error: KV PUT failed: 500 Internal Server Error";
+    const DO_FETCH_FAULT: &str =
+        "auth-session-store fetch: Error: internal error; reference = dc291hl7example";
+
+    type Stored = bsv_middleware_cloudflare::types::StoredSession;
+    fn kv(text: &str) -> bsv_middleware_cloudflare::AuthCloudflareError {
+        bsv_middleware_cloudflare::AuthCloudflareError::KvError(text.into())
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl bsv_middleware_cloudflare::SessionStorage for FailingStore {
+        async fn get_session(&self, _: &str) -> bsv_middleware_cloudflare::Result<Option<Stored>> {
+            Err(kv(DO_FETCH_FAULT))
+        }
+        async fn get_session_by_identity(
+            &self,
+            k: &str,
+        ) -> bsv_middleware_cloudflare::Result<Option<Stored>> {
+            self.get_session(k).await
+        }
+        async fn save_session(&self, _: &Stored) -> bsv_middleware_cloudflare::Result<()> {
+            // `kv_session.rs` maps the worker error through `KvError(e.to_string())`.
+            Err(kv(KV_PUT_500))
+        }
+        async fn update_session(&self, s: &Stored) -> bsv_middleware_cloudflare::Result<()> {
+            self.save_session(s).await
+        }
+        async fn try_consume_nonce(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<u64>,
+        ) -> bsv_middleware_cloudflare::Result<bool> {
+            Err(kv(KV_PUT_500))
+        }
+        async fn release_nonce(&self, _: &str, _: &str) -> bsv_middleware_cloudflare::Result<()> {
+            Err(kv(KV_PUT_500))
+        }
+    }
+
+    /// (c, the 503) The handshake's session write fails at the store: the door
+    /// answers 503 `ERR_AUTH_UNAVAILABLE` with `Retry-After: 2`, the body
+    /// naming the class only (never the platform's reference id). Before #670: 400.
+    #[tokio::test]
+    async fn s670_a_store_fault_at_the_handshake_is_a_retryable_503() {
+        use bsv_middleware_cloudflare::SessionStorage;
+        // Every field by hand (`StoredSession::new` reads the JS clock).
+        let session = Stored {
+            session_nonce: "s-nonce".into(),
+            peer_identity_key: ID_A.into(),
+            peer_nonce: None,
+            is_authenticated: true,
+            certificates_required: false,
+            certificates_validated: false,
+            created_at: 1,
+            last_update: 1,
+        };
+        let put = FailingStore.save_session(&session).await.unwrap_err();
+        let read = FailingStore.get_session("s-nonce").await.unwrap_err();
+        for e in [&put, &read] {
+            assert_eq!(auth_fault_class(e), AuthFaultClass::Transport, "{e}");
+            let (status, body, retry_after) = auth_fault_answer(e);
+            assert_eq!((status, retry_after), (503, Some("2")), "{e}");
+            assert_eq!(
+                serde_json::to_string(&body).unwrap(),
+                r#"{"code":"ERR_AUTH_UNAVAILABLE","error":"authentication handshake unavailable: session store"}"#
+            );
+            let text = body.to_string();
+            assert!(
+                !text.contains("reference") && !text.contains("KV PUT"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            COUNTER_AUTH_HANDSHAKE_UNAVAILABLE,
+            "auth_handshake_unavailable_total"
+        );
+    }
+
+    /// (c, the 400) A fault that is not the store's keeps the door's 400 byte
+    /// for byte, and the door routes its `Err` through the classifier; the
+    /// door's own replies flush the census like a proceeded request.
+    #[test]
+    fn s670_b_a_non_store_fault_keeps_the_old_400_bytes() {
+        use bsv_middleware_cloudflare::AuthCloudflareError as E;
+        let ser = E::SerializationError("expected value at line 1 column 1".into());
+        let (status, body, retry_after) = auth_fault_answer(&ser);
+        assert_eq!((status, retry_after), (400, None));
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"error":"authentication handshake failed: Serialization error: expected value at line 1 column 1"}"#
+        );
+        let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        let whole = include_str!("auth.rs");
+        let code = strip(&whole[..whole.find("#[cfg(test)]").unwrap()]);
+        assert_eq!(code.matches("auth_fault_answer(&e)").count(), 1);
+        assert_eq!(
+            code.matches("json!({\"error\":format!(\"authenticationhandshakefailed:{e}\")})")
+                .count(),
+            1,
+            "the 400's text lives in the classifier's answer only"
+        );
+        let lib = include_str!("lib.rs");
+        let lib = strip(&lib[..lib.find("#[cfg(test)]").unwrap_or(lib.len())]);
+        let reply = &lib[lib.find("auth::FrontDoor::Reply(mutresp)=>{").unwrap()..];
+        let reply = &reply[..reply.find("returnOk(resp);").unwrap()];
+        assert!(reply.contains("courier::take_pending_if_due("), "{reply}");
+    }
+
+    /// (d) The classifier's table, on every variant of bsv-middleware-cloudflare
+    /// 0.6.2's `AuthCloudflareError` (the match in `auth_fault_class` is
+    /// exhaustive, so a new variant does not compile until classified). The pin
+    /// moves only after re-reading the crate's storage error paths.
+    #[test]
+    fn s670_d_the_classifier_table() {
+        use bsv_middleware_cloudflare::AuthCloudflareError as E;
+        use AuthFaultClass::{Caller, Transport};
+        let table: Vec<(E, AuthFaultClass)> = vec![
+            (kv(KV_PUT_500), Transport),
+            (kv(DO_FETCH_FAULT), Transport),
+            (kv("auth-session-store PUT answered 500"), Transport),
+            (kv("auth-session-store stub: x"), Transport),
+            (E::Unauthorized, Caller),
+            (E::InvalidAuthentication("x".into()), Caller),
+            (E::SessionNotFound("x".into()), Caller),
+            (E::ServerMisconfigured, Caller),
+            (E::PaymentInternal("x".into()), Caller),
+            (
+                E::PaymentRequired {
+                    satoshis: 1,
+                    derivation_prefix: "x".into(),
+                },
+                Caller,
+            ),
+            (E::MalformedPayment("x".into()), Caller),
+            (E::InvalidDerivationPrefix, Caller),
+            (E::PaymentFailed("x".into()), Caller),
+            (E::InvalidPayment("x".into()), Caller),
+            (E::SdkError("x".into()), Caller),
+            (E::TransportError("x".into()), Caller),
+            (E::ConfigError("x".into()), Caller),
+            (E::SerializationError("x".into()), Caller),
+        ];
+        for (e, class) in &table {
+            assert_eq!(auth_fault_class(e), *class, "{e:?}");
+        }
+        // A worker::Error out of the store arrives as `KvError` (the crate's From).
+        let from_worker: E = worker::Error::RustError("KV PUT failed: 500".into()).into();
+        assert_eq!(auth_fault_class(&from_worker), Transport);
+        assert!(
+            include_str!("../Cargo.toml").contains("bsv-middleware-cloudflare = \"=0.6.2\""),
+            "the middleware pin moved: re-read AuthCloudflareError and its KvError sites first"
+        );
     }
 
     // ── AuthMode::from_flag ────────────────────────────────────────────────

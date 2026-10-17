@@ -329,6 +329,13 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
         auth::FrontDoor::Proceed(req, state) => (req, state),
         auth::FrontDoor::Reply(mut resp) => {
             stamp_cors(&mut resp, &identity_cors);
+            // bsv-low #670: the door's own replies (a store fault's 503 among
+            // them) flush the census's due deltas as a proceeded request does.
+            let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
+            if !pending.is_empty() {
+                let counters_db = env.d1("OVERLAY_DB").ok();
+                ctx.wait_until(async move { courier::flush(counters_db, pending).await });
+            }
             return Ok(resp);
         }
     };

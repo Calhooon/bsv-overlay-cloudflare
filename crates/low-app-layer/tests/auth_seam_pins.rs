@@ -322,6 +322,15 @@ fn every_front_door_outcome_is_counted() {
     // …and middleware refusals are counted at each refusal site (Err, the
     // contract-break 500, and the non-handshake Response refusal).
     assert_eq!(count(&auth, "count_auth_refused();"), 3);
+    // bsv-low #670: a store fault at the door is not a refusal; its 503 counts
+    // into the durable census instead.
+    assert_eq!(
+        count(
+            &auth,
+            "crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_UNAVAILABLE);"
+        ),
+        1
+    );
 }
 
 /// The pinned needles genuinely match the current source (Rule 9's
