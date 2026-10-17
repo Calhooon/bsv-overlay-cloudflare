@@ -4425,6 +4425,54 @@ pub fn latched_proof_mined_spenders(
         .collect()
 }
 
+/// bsv-low #693 fold-3 (the W1-OWED-693 delta lens's R2-HIGH-1 (a)): the latches a pass DELETES, in its snapshot's
+/// atomic batch (ONE statement, one bind: the JSON array of `[key, root]` pairs, [`moved_proof_latch_delete_bind`]).
+/// A row is taken only while it still holds the root the recheck refused, so a fresh latch a concurrent pass wrote at
+/// the same key with another root stands. PK-indexed (`outpoint=?`, pinned in `d1_fleet_plans`).
+pub const PROOF_LATCH_MOVED_DELETE_SQL: &str = "DELETE FROM hop_chain_probes WHERE (outpoint, spendingTxid) IN (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?1))";
+
+/// PURE: the latches whose height was re-read THIS pass and whose root is no longer chaintracks' root there (a reorg
+/// moved the block): `(key, root)`, the key `proofmined:<spender>.<height>` as written. The refusal is made DURABLE by
+/// deleting them (R2-HIGH-1 (a)): a refusal that only filtered held for that pass, and once the latch was
+/// [`LATCH_RECHECK_DEPTH`] deep and outside the newest rechecks (or its header read faulted, or the pass was
+/// `over_budget`) it was honoured again by depth. A DELETE, not a `proofmoved:` tombstone: it is what the overlay's
+/// reorg clear does to a confirmed memo (rule 1), it needs no new prefix in the TTL sweep's exemptions and no new
+/// arm in the read, and the absence of a latch already means "re-ask" (`durable_spender_needs_proof`); a later
+/// checked proof writes a fresh latch at its new height. A faulted header read (`None`) deletes nothing.
+pub fn moved_proof_latches(
+    latches: &[ProofLatch],
+    canonical: &HashMap<u64, Option<String>>,
+) -> Vec<(String, String)> {
+    latches
+        .iter()
+        .filter(|l| {
+            matches!(canonical.get(&l.height), Some(Some(root)) if !root.eq_ignore_ascii_case(&l.root))
+        })
+        .filter_map(|l| {
+            let height = u32::try_from(l.height).ok()?;
+            Some((
+                crate::hops_view::probe_memo_key(
+                    &format!("{PROOF_MINED_LATCH_PREFIX}{}", l.spender),
+                    height,
+                ),
+                l.root.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// PURE: the one bind of [`PROOF_LATCH_MOVED_DELETE_SQL`]; `None` when nothing moved (no statement is added).
+pub fn moved_proof_latch_delete_bind(moved: &[(String, String)]) -> Option<String> {
+    if moved.is_empty() {
+        return None;
+    }
+    let pairs: Vec<[&str; 2]> = moved
+        .iter()
+        .map(|(k, r)| [k.as_str(), r.as_str()])
+        .collect();
+    serde_json::to_string(&pairs).ok()
+}
+
 /// PURE: the rule [`latched_proof_mined_spenders`] applies to a latch whose height was not re-read this pass.
 pub fn unrechecked_latch_honoured(
     l: &ProofLatch,
@@ -6663,6 +6711,154 @@ pub(crate) mod tests {
         ] {
             assert!(routes.contains(wired), "the route's latch judgement: {wired}");
         }
+    }
+
+    /// bsv-low #693 fold-3 (the W1-OWED-693 delta lens's R2-HIGH-1 (a)): A MOVED-ROOT REFUSAL IS DURABLE. Over real
+    /// SQLite, the delta lens's reproduction: five latches at 900000..900004, the OLDEST's root moved by a reorg that
+    /// NO detector recorded (no clear, no tombstone), judged 3 h after the write. Pass 1 at tip 900003 re-reads every
+    /// height and refuses it, and its batch deletes that latch (the shipped statement, one bind, the other four kept).
+    /// Pass 2 at tip 900010 re-reads only the four newest (900000 is 10 deep): the moved latch is NOT honoured
+    /// (`honoured: false`; on `18b4226` the refusal was a filter only and the latch, now reorg-proof by depth, was
+    /// honoured again). One latch alone, refused once, then its header read FAULTED at tip 900010: not honoured. A
+    /// later checked proof at the new height latches afresh and is honoured. A fresh latch at the same key with
+    /// another root is not taken by the delete. RED on `18b4226` (the API does not compile there; the mutant
+    /// `moved_proof_latches` answering empty is RED here at pass 2).
+    #[test]
+    fn e693f3_h1_a_moved_root_refusal_is_durable_real_sqlite() {
+        const MIN: i64 = 60_000;
+        let t0 = E693F_NOW;
+        let moved_root = "cd".repeat(32);
+        let spenders: Vec<String> = (0..5u8).map(|i| tx(0x60 + i)).collect();
+        let latch = |conn: &rusqlite::Connection, sp: &str, height: u64, root: &str, at: i64| {
+            let mut a = e693_answer(true);
+            a.height = Some(height);
+            write_memos(conn, &[proof_latch_memo(sp, &a, Some(root), at).unwrap()]);
+        };
+        // one pass in the route's order: the latch read, the newest-first recheck against `chain`, the judgement,
+        // then the batch's delete of the moved latches through the shipped statement
+        let pass = |conn: &rusqlite::Connection,
+                    s: &[String],
+                    tip: u64,
+                    chain: &dyn Fn(u64) -> Option<String>,
+                    now: i64|
+         -> (HashSet<String>, Vec<u64>, usize) {
+            let memos = e693f_read_latches(conn, s);
+            let latches = proof_latches_of(s, &memos);
+            let heights = proof_latch_recheck_heights(&latches, Some(tip));
+            let canonical: HashMap<u64, Option<String>> =
+                heights.iter().map(|h| (*h, chain(*h))).collect();
+            let honoured = latched_proof_mined_spenders(
+                &latches,
+                &canonical,
+                Some(tip),
+                crate::hops_view::reorg_clear_at(&memos),
+                now,
+            );
+            let deleted =
+                match moved_proof_latch_delete_bind(&moved_proof_latches(&latches, &canonical)) {
+                    Some(bind) => conn
+                        .execute(PROOF_LATCH_MOVED_DELETE_SQL, rusqlite::params![bind])
+                        .unwrap(),
+                    None => 0,
+                };
+            (honoured, heights, deleted)
+        };
+        let reorged = |h: u64| {
+            Some(if h == 900_000 {
+                moved_root.clone()
+            } else {
+                E693F_ROOT.to_string()
+            })
+        };
+
+        // the lens's reproduction
+        let conn = memo_db();
+        for (i, sp) in spenders.iter().enumerate() {
+            latch(&conn, sp, 900_000 + i as u64, E693F_ROOT, t0);
+        }
+        let (h1, heights1, deleted1) = pass(&conn, &spenders, 900_003, &reorged, t0 + 3 * 60 * MIN);
+        assert_eq!(heights1, vec![900_004, 900_003, 900_002, 900_001, 900_000]);
+        assert!(!h1.contains(&spenders[0]), "pass 1: the moved root refused");
+        assert_eq!(h1.len(), 4);
+        let (h2, heights2, deleted2) = pass(&conn, &spenders, 900_010, &reorged, t0 + 3 * 60 * MIN);
+        assert_eq!(
+            heights2,
+            vec![900_004, 900_003, 900_002, 900_001],
+            "pass 2: 900000 is reorg-proof by depth and not re-read"
+        );
+        assert!(
+            !h2.contains(&spenders[0]),
+            "pass 2: honoured: {} (the moved latch, 10 deep, unrechecked)",
+            h2.contains(&spenders[0])
+        );
+        assert_eq!(deleted1, 1, "pass 1: the moved latch alone is deleted");
+        assert_eq!((h2.len(), deleted2), (4, 0));
+
+        // one latch alone: refused once, then its header read faulted, deep, no clear
+        let conn = memo_db();
+        let s = std::slice::from_ref(&spenders[0]);
+        latch(&conn, &spenders[0], 900_000, E693F_ROOT, t0);
+        let (h, _, d) = pass(&conn, s, 900_003, &reorged, t0 + 3 * 60 * MIN);
+        assert!(!h.contains(&spenders[0]) && d == 1);
+        let (h, _, _) = pass(&conn, s, 900_010, &|_| None, t0 + 3 * 60 * MIN);
+        assert!(!h.contains(&spenders[0]), "a faulted header read, deep");
+        // the spender is re-asked; the sweep re-mined at 900002: a fresh latch, honoured
+        latch(&conn, &spenders[0], 900_002, E693F_ROOT, t0 + 4 * 60 * MIN);
+        let (h, _, d) = pass(&conn, s, 900_010, &reorged, t0 + 4 * 60 * MIN + 1_000);
+        assert!(h.contains(&spenders[0]) && d == 0, "the new height's latch");
+
+        // the delete takes a row only while it holds the refused root
+        let conn = memo_db();
+        latch(&conn, &spenders[1], 900_000, &moved_root, t0);
+        let stale = vec![(
+            crate::hops_view::probe_memo_key(
+                &format!("{PROOF_MINED_LATCH_PREFIX}{}", spenders[1]),
+                900_000,
+            ),
+            E693F_ROOT.to_string(),
+        )];
+        let bind = moved_proof_latch_delete_bind(&stale).unwrap();
+        assert_eq!(
+            conn.execute(PROOF_LATCH_MOVED_DELETE_SQL, rusqlite::params![bind])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            proof_latches_of(&spenders[1..2], &e693f_read_latches(&conn, &spenders[1..2])).len(),
+            1
+        );
+        assert_eq!(
+            moved_proof_latch_delete_bind(&[]),
+            None,
+            "nothing moved: no statement"
+        );
+        assert!(
+            moved_proof_latches(
+                &proof_latches_of(&spenders[1..2], &e693f_read_latches(&conn, &spenders[1..2])),
+                &[(900_000u64, None)].into()
+            )
+            .is_empty(),
+            "a faulted header read deletes nothing"
+        );
+
+        // the route: the moved latches taken from the shipped judgement's recheck, deleted in the snapshot batch
+        // before the latch writes, one statement
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        let collect = "proof_latches_moved=crate::owed::moved_proof_latches(&latches,&canonical);";
+        let delete = ".prepare(crate::owed::PROOF_LATCH_MOVED_DELETE_SQL)";
+        let writes = "forlatchincrate::owed::proof_latches_to_write(";
+        assert!(
+            routes.contains(collect),
+            "the route keeps the moved latches"
+        );
+        let (d, w) = (routes.find(delete), routes.find(writes));
+        assert!(
+            d.is_some() && w.is_some() && d < w,
+            "the moved latches' delete rides the batch before the latch writes"
+        );
+        assert_eq!(routes.matches(delete).count(), 1);
+        assert!(routes[d.unwrap()..w.unwrap()].contains("stmts.insert(stmts.len()-1,moved_stmt);"));
     }
 
     /// bsv-low #662 (live 2026-10-14 00:35:35Z, pair 19, hop d4029675ccb65a4b:0, sweep 96448ef1fc3b): pass B judged

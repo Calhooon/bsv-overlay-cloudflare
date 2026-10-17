@@ -63,6 +63,18 @@ fn hot_routes_never_scan_fleet_tables() {
             );
         }
     }
+    // bsv-low #693 fold-3 (R2-HIGH-1 (a)): the moved latches' delete in the /owed snapshot batch searches the PK
+    let moved = plan(&db, low_app_layer::owed::PROOF_LATCH_MOVED_DELETE_SQL);
+    assert!(
+        moved
+            .iter()
+            .any(|d| d.starts_with("SEARCH hop_chain_probes USING INDEX")),
+        "the moved latches' delete must stay index-backed: {moved:?}"
+    );
+    assert!(
+        !moved.iter().any(|d| d.starts_with("SCAN hop_chain_probes")),
+        "the moved latches' delete must never scan: {moved:?}"
+    );
     for (route, sql) in [
         (
             "/results:view",
