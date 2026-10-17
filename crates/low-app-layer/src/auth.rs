@@ -1424,17 +1424,36 @@ mod tests {
             assert!(push_bounded(&mut read, piece));
         }
         assert_eq!(read, real, "the bytes handed on are the bytes received");
-        // The door runs the guard BEFORE the middleware, once.
+        // The door runs the guard BEFORE the middleware, once, in its OWN body
+        // (round 2's R2-LOW-2: a search from the guard to the end of the file
+        // passes on any later call). The order is also held by the borrow
+        // checker: the guard consumes `req` and returns the request the
+        // middleware gets, so a swap does not compile; this pin is the
+        // readable one.
         let whole = include_str!("auth.rs");
         let code: String = whole[..whole.find("#[cfg(test)]").unwrap()]
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        let at = code
-            .find("letreq=matchauth_input_guard(req).await?{")
-            .expect("the door runs the guard");
-        assert!(code[at..].find("process_auth_lane(req,").is_some());
+        let guard = "letreq=matchauth_input_guard(req).await?{";
+        assert!(
+            guard_precedes_middleware(fn_body(&code, "pubasyncfnfront_door("), guard),
+            "the door runs the guard before the middleware"
+        );
         assert_eq!(code.matches("auth_input_guard(req).await?").count(), 1);
+        // The check reds on a swap the old search passed: the middleware call
+        // first, the guard after it, another call later in the file.
+        let swapped = "pubasyncfnfront_door(req:Request){letx=process_auth_lane(req,env);\
+            letreq=matchauth_input_guard(req).await?{}}fnlater(){process_auth_lane(req,env)}";
+        let at = swapped.find(guard).unwrap();
+        assert!(
+            swapped[at..].contains("process_auth_lane(req,"),
+            "the old search passes"
+        );
+        assert!(!guard_precedes_middleware(
+            fn_body(swapped, "pubasyncfnfront_door("),
+            guard
+        ));
         assert_eq!(
             COUNTER_AUTH_HANDSHAKE_OVERSIZE,
             "auth_handshake_oversize_total"
@@ -1486,6 +1505,40 @@ mod tests {
             bound(128, 16 * 1024) > DO_VALUE_CAP,
             "the old bounds overrun"
         );
+    }
+
+    /// The body of the function whose signature starts at `sig`: from its first
+    /// `{` to the brace that closes it (the door's code has balanced braces in
+    /// its strings and macros).
+    fn fn_body<'a>(code: &'a str, sig: &str) -> &'a str {
+        let start = code.find(sig).unwrap_or_else(|| panic!("{sig}"));
+        let open = start + code[start..].find('{').unwrap();
+        let mut depth = 0usize;
+        for (i, c) in code[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &code[open..=open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{sig}: unbalanced braces")
+    }
+
+    /// The guard is in this body, and no middleware CALL precedes it while one
+    /// follows it.
+    fn guard_precedes_middleware(body: &str, guard: &str) -> bool {
+        let Some(at) = body.find(guard) else {
+            return false;
+        };
+        let before = &body[..at];
+        !before.contains("process_auth(req,")
+            && !before.contains("process_auth_lane(req,")
+            && body[at..].contains("process_auth_lane(req,")
     }
 
     /// A nonce of the SDK's `createNonce` shape, made by the middleware's own
