@@ -802,7 +802,6 @@ async fn submit_parts(
     budget: crate::ef_deferred::WorkBudget,
     counters: &SubmitCounters,
 ) -> worker::Result<Response> {
-    counters.reason(SubmitReason::Admit);
     let SubmitParts {
         topics,
         beef,
@@ -1925,7 +1924,11 @@ async fn submit_parts(
         mutation_report.is_durable(),
         enqueue_outcome,
     ) {
-        crate::queue::MutationAck::Durable => false,
+        crate::queue::MutationAck::Durable => {
+            // The admission is durable: the only place `admit` is named.
+            counters.admitted();
+            false
+        }
         crate::queue::MutationAck::Queued => {
             worker::console_log!(
                 "POST /submit: replay QUEUED for {} (S2) — acking; the queue is the guarantee",
@@ -5579,6 +5582,56 @@ mod tests {
         let parts = &prod[prod.find("async fn submit_parts(").unwrap()..];
         let parts = &parts[..parts.find("fn with_server_timing(").unwrap()];
         assert!(!parts.contains("crate::ops::bump_counter("));
+    }
+
+    /// The W1-OBS lens's LOW-2: no default reason. Every early answer of the
+    /// route names its own reason in its own block, and `admit` is named only
+    /// where the admission went durable (and never over a reason an earlier
+    /// arm named); an answer that names none counts `unclassified`.
+    #[test]
+    fn obs_627_fold_l2_every_answer_arm_names_its_reason() {
+        let src = include_str!("routes.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let start = prod.find("async fn submit_inner(").unwrap();
+        let end = prod.find("fn with_server_timing(").unwrap();
+        let lines: Vec<&str> = prod[start..end].lines().collect();
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let mut checked = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if !t.starts_with("return ") || t.starts_with("return None") || t == "return;" {
+                continue;
+            }
+            // The return's own block: back to the line that opened it.
+            let mut j = i;
+            while j > 0 && (lines[j - 1].trim().is_empty() || indent(lines[j - 1]) >= indent(line)) {
+                j -= 1;
+            }
+            let block = lines[j..i].join("\n");
+            assert!(
+                block.contains("counters.reason(SubmitReason::"),
+                "the answer at `{}` names no reason in its block:\n{block}",
+                t
+            );
+            checked += 1;
+        }
+        assert!(checked >= 20, "walked {checked} answer arms");
+        let parts = &prod[prod.find("async fn submit_parts(").unwrap()..end];
+        assert!(!parts.contains("counters.reason(SubmitReason::Admit)"));
+        assert_eq!(parts.matches("counters.admitted()").count(), 1);
+        let durable = &parts[parts.find("crate::queue::MutationAck::Durable =>").unwrap()..];
+        assert!(durable[..durable.find("crate::queue::MutationAck::Queued").unwrap()]
+            .contains("counters.admitted()"));
+        let counters = SubmitCounters::new().finish_answer(200);
+        let names = counters.take_deltas();
+        assert_eq!(names["submit_answer_reason_unclassified_total"], 1);
+        let echo = SubmitCounters::new();
+        echo.reason(SubmitReason::AdmitFastEcho);
+        echo.admitted();
+        assert_eq!(
+            echo.finish_answer(200).take_deltas()["submit_answer_reason_admit_fast_echo_total"],
+            1
+        );
     }
 
     #[test]

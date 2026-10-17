@@ -48,6 +48,7 @@ reasons! {
     StorageFault => "storage_fault",
     EngineFault => "engine_fault",
     RequestFault => "request_fault",
+    Unclassified => "unclassified",
 }
 
 impl Reason {
@@ -108,7 +109,9 @@ pub(crate) fn all_names() -> Vec<String> {
 
 /// Request owned, with no isolate tail to lose or mix into another answer.
 pub(crate) struct SubmitCounters {
-    reason: Cell<Reason>,
+    /// No default: an answer whose arm named none counts `unclassified`, never
+    /// an admission (the W1-OBS lens's LOW-2).
+    reason: Cell<Option<Reason>>,
     couriers: crate::courier_counters::Counters,
     deltas: RefCell<BTreeMap<String, u64>>,
 }
@@ -116,7 +119,7 @@ pub(crate) struct SubmitCounters {
 impl SubmitCounters {
     pub(crate) fn new() -> Self {
         Self {
-            reason: Cell::new(Reason::RequestFault),
+            reason: Cell::new(None),
             couriers: crate::courier_counters::Counters::new(crate::courier_counters::Reader::Door),
             deltas: RefCell::default(),
         }
@@ -127,7 +130,15 @@ impl SubmitCounters {
     }
 
     pub(crate) fn reason(&self, reason: Reason) {
-        self.reason.set(reason);
+        self.reason.set(Some(reason));
+    }
+
+    /// The admission went durable: `admit`, unless an earlier arm already
+    /// named a more specific 2xx reason (a fast echo, a terminal judgement).
+    pub(crate) fn admitted(&self) {
+        if self.reason.get().is_none() {
+            self.reason.set(Some(Reason::Admit));
+        }
     }
 
     pub(crate) fn bump(&self, name: impl Into<String>, delta: u64) {
@@ -139,13 +150,18 @@ impl SubmitCounters {
     /// Consuming the request prevents a second answer from being counted.
     pub(crate) fn finish_answer(self, status: u16) -> Self {
         // A deferred job can fail before it is queued; only a 202 is queued.
-        if self.reason.get() == Reason::Queued && status != 202 {
-            self.reason.set(Reason::QueueFault);
+        if self.reason.get() == Some(Reason::Queued) && status != 202 {
+            self.reason.set(Some(Reason::QueueFault));
         }
-        for name in counter_names(status, self.reason.get()) {
+        for name in counter_names(status, self.reason.get().unwrap_or(Reason::Unclassified)) {
             self.bump(name, 1);
         }
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_deltas(self) -> BTreeMap<String, u64> {
+        self.deltas.into_inner()
     }
 
     pub(crate) async fn flush(self, db: worker::D1Database) {
