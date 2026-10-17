@@ -7764,7 +7764,9 @@ where
     // then BananaBlocks, then Bitails' tx body — a fault falls through, a
     // real answer (spent OR not) stops the ladder. Every positive still
     // passes the same raw-verification bar below, whoever named it.
-    let mut woc = match get(format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await {
+    let woc_spent = get(format!("{WOC_BASE}/tx/{txid_lc}/{vout}/spent")).await;
+    let woc_spent_status = woc_spent.as_ref().map(|(s, _)| *s);
+    let mut woc = match woc_spent {
         Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(v) => parse_woc_spent_body(&v),
             Err(_) => SpentObservation::Fault,
@@ -7888,7 +7890,19 @@ where
         SpentObservation::Fault => {}
     }
 
-    let st = crate::results::decide_spent_any(&woc, spender_raw_ok, bitails);
+    // bsv-low #695: every primary rung faulted after WoC's `/spent` named an unknown tx (its 400): ONE read of WoC's
+    // node for the tx itself; its conclusive 404 (the subject is unmined) is `uncorroborated-unspent`, never
+    // `provider-fault`. A 429, a 5xx, a transport or a body-shape fault of either read keeps `provider-fault`.
+    let woc_node_absent = matches!(woc, SpentObservation::Fault)
+        && crate::results::woc_spent_may_name_an_unknown_tx(woc_spent_status)
+        && matches!(
+            get(format!("{WOC_BASE}/tx/hash/{txid_lc}")).await,
+            Some((404, _))
+        );
+    let st = crate::results::sharpen_unmined_absence(
+        crate::results::decide_spent_any(&woc, spender_raw_ok, bitails),
+        woc_node_absent,
+    );
     let row = SpentAnyCached {
         known: st.known,
         spent: st.spent,
@@ -10377,6 +10391,160 @@ mod e606_tests {
                 && rung.contains("owed_spender_outputs_memo_put("),
             "the rung memoises its verified raw"
         );
+    }
+
+    /// bsv-low #695: the body `/spent-any` serves for one ladder row (the route's own entry shape and body builder).
+    fn e695_body(row: &SpentAnyCached) -> String {
+        let entry = crate::logic::OutpointStatus {
+            txid: tx(0x31),
+            vout: 0,
+            known: row.known,
+            spent: row.spent,
+            spending_txid: row.spending_txid.clone(),
+            spent_confirmed: row.spent_confirmed,
+            spender_seen: None,
+            spender_final: None,
+            reason: row.reason,
+            funding_seen: None,
+            evicted: crate::logic::ServedEviction::NotRead,
+        };
+        crate::txany::spent_any_body(&[entry], &[false])
+    }
+
+    /// bsv-low #695 (a), DESIGN-641 option (b), the prod shape of 2026-10-16 (`RC-PROD-MONITOR-BLIND`: WoC `/spent`
+    /// 400 for an unknown tx, BananaBlocks 404, Bitails 404) plus WoC's node answering a conclusive 404 for the tx
+    /// itself: `known:false, reason:"uncorroborated-unspent"`, never `provider-fault`. The body differs from the
+    /// provider-fault body by the reason alone. RED on `b4ae1c6` (run as the mutant `woc_node_absent = false`, the
+    /// base's ladder): `provider-fault`.
+    #[test]
+    fn e695_a_a_conclusive_woc_404_of_an_unmined_subject_is_uncorroborated_unspent() {
+        let t = tx(0x31);
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/{t}/0/spent"), (400, b"bad".to_vec()));
+        m.insert(
+            format!("{BANANABLOCKS_BASE}/txo/{t}/0/spend"),
+            (404, Vec::new()),
+        );
+        m.insert(format!("{BITAILS_BASE}/tx/{t}"), (404, Vec::new()));
+        m.insert(format!("{WOC_BASE}/tx/hash/{t}"), (404, Vec::new()));
+        let (row, raw) = run(spent_any_resolve_via(&t, 0, courier(m.clone())));
+        assert_eq!(raw, None);
+        assert_eq!(
+            (row.known, row.spent, row.reason),
+            (
+                false,
+                None,
+                Some(crate::logic::SPENT_ANY_REASON_UNCORROBORATED)
+            )
+        );
+        let fault = SpentAnyCached {
+            reason: Some(crate::logic::SPENT_ANY_REASON_PROVIDER_FAULT),
+            ..row.clone()
+        };
+        assert_eq!(
+            e695_body(&row),
+            e695_body(&fault).replace("provider-fault", "uncorroborated-unspent"),
+            "nothing else in the body changes"
+        );
+        assert!(
+            !e695_body(&row).contains("terminal"),
+            "never a terminal word"
+        );
+    }
+
+    /// bsv-low #695 (b): `provider-fault` stays for a transport fault or a body-shape fault. A WoC 429 (the extra
+    /// read is never made), a 5xx, a transport fault, a 200 body that does not parse; and a 400 whose node read is a
+    /// 429, a 200 or a transport fault. The old bodies are byte-identical (frozen), and so is the two-source absent
+    /// case (WoC 404, BananaBlocks a clean `spent:false`): `known:true, spent:false`.
+    #[test]
+    fn e695_b_a_fault_keeps_provider_fault_and_the_old_bodies_are_byte_identical() {
+        let t = tx(0x31);
+        let frozen_fault = r#"[{"known":false,"networkSeen":null,"reason":"provider-fault","spenderFinal":null,"spenderSeen":null,"spendingTxid":null,"spent":null,"spentConfirmed":null,"txid":"3131313131313131313131313131313131313131313131313131313131313131","vout":0}]"#;
+        let base = |woc_spent: Option<(u16, Vec<u8>)>, node: Option<(u16, Vec<u8>)>| {
+            let mut m = HashMap::new();
+            if let Some(w) = woc_spent {
+                m.insert(format!("{WOC_BASE}/tx/{t}/0/spent"), w);
+            }
+            m.insert(
+                format!("{BANANABLOCKS_BASE}/txo/{t}/0/spend"),
+                (404, Vec::new()),
+            );
+            m.insert(format!("{BITAILS_BASE}/tx/{t}"), (404, Vec::new()));
+            if let Some(n) = node {
+                m.insert(format!("{WOC_BASE}/tx/hash/{t}"), n);
+            }
+            m
+        };
+        let absent = Some((404u16, Vec::new()));
+        for (label, woc_spent, node) in [
+            ("woc 429", Some((429u16, Vec::new())), absent.clone()),
+            ("woc 503", Some((503, Vec::new())), absent.clone()),
+            ("woc transport", None, absent.clone()),
+            (
+                "woc 200 not json",
+                Some((200, b"<html>".to_vec())),
+                absent.clone(),
+            ),
+            (
+                "woc 200 no txid",
+                Some((200, b"{}".to_vec())),
+                absent.clone(),
+            ),
+            (
+                "400, node 429",
+                Some((400, Vec::new())),
+                Some((429, Vec::new())),
+            ),
+            (
+                "400, node 200",
+                Some((400, Vec::new())),
+                Some((200, b"{}".to_vec())),
+            ),
+            ("400, node transport", Some((400, Vec::new())), None),
+        ] {
+            let asked = std::cell::RefCell::new(Vec::new());
+            let m = base(woc_spent, node);
+            let get = |url: String| {
+                asked.borrow_mut().push(url.clone());
+                std::future::ready(m.get(&url).cloned())
+            };
+            let (row, _) = run(spent_any_resolve_via(&t, 0, get));
+            assert_eq!(e695_body(&row), frozen_fault, "{label}");
+            let node_asked = asked.borrow().iter().any(|u| u.contains("/tx/hash/"));
+            assert_eq!(
+                node_asked,
+                label.starts_with("400"),
+                "{label}: the node read only after a 400"
+            );
+        }
+        // the two-source absent case: WoC 404, BananaBlocks corroborates, byte-identical, no node read
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/{t}/0/spent"), (404, Vec::new()));
+        m.insert(
+            format!("{BANANABLOCKS_BASE}/txo/{t}/0/spend"),
+            (200, br#"{"spent":false}"#.to_vec()),
+        );
+        let (row, _) = run(spent_any_resolve_via(&t, 0, courier(m)));
+        assert_eq!(
+            e695_body(&row),
+            r#"[{"known":true,"networkSeen":null,"reason":null,"spenderFinal":null,"spenderSeen":null,"spendingTxid":null,"spent":false,"spentConfirmed":false,"txid":"3131313131313131313131313131313131313131313131313131313131313131","vout":0}]"#
+        );
+        // and WoC's own 404 of the OUTPOINT with no corroboration stays the reason it always was
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/{t}/0/spent"), (404, Vec::new()));
+        let (row, _) = run(spent_any_resolve_via(&t, 0, courier(m)));
+        assert_eq!(
+            row.reason,
+            Some(crate::logic::SPENT_ANY_REASON_UNCORROBORATED)
+        );
+        // the pure rule: only a provider-fault row is sharpened, only on the node's 404
+        assert!(crate::results::woc_spent_may_name_an_unknown_tx(Some(400)));
+        for s in [None, Some(404), Some(429), Some(500), Some(200)] {
+            assert!(
+                !crate::results::woc_spent_may_name_an_unknown_tx(s),
+                "{s:?}"
+            );
+        }
     }
 
     /// The E606 lens's L4: the spender memo is bounded by bytes beside its count. Entries of many outputs fill the
