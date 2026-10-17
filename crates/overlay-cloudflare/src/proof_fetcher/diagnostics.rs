@@ -85,14 +85,15 @@ impl ProofProbe {
             );
         }
         if !ok {
-            self.parse_result = if matches!(status, Some(404 | 410)) {
-                "notfound"
-            } else if status.is_some() {
+            // The legacy tally, the `[proof]` line and the probe's `parseResult`
+            // keep a 404/410 a fault, as on main b4ae1c6 (the design's baseline
+            // rows); only the per-reader family above records it `notfound`.
+            self.parse_result = if status.is_some() {
                 "http-error"
             } else {
                 "transport-error"
             };
-            self.fault = !matches!(status, Some(404 | 410));
+            self.fault = true;
             return None;
         }
         body
