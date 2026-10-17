@@ -105,3 +105,49 @@ fn obs_625_the_606_discriminator_is_counted_per_reader_and_provider() {
         "a Bitails 404 is never a fault"
     );
 }
+
+/// The W1-OBS-APPLAYER lens's L1: a 2xx whose BODY READ failed is a transport fault, never a body-shape fault.
+/// `provider_get_raw` used to hand `courier::note` the status with an EMPTY body (`unwrap_or_default`), which
+/// `shaped_outcome` read as a 2xx that is not its route's format: `shape`. The courier is now told `None` (the
+/// transport fault) for that answer, and only for that one: a status without a 2xx keeps its own outcome, and a
+/// clean read is passed as it was. The caller still gets what it got before (the status and the empty body).
+#[test]
+fn obs_625_a_2xx_whose_body_read_failed_is_a_transport_fault_never_shape() {
+    use crate::courier::record;
+    use crate::routes::courier_answer;
+    let txid = "ab".repeat(32);
+    let url = format!("https://api.whatsonchain.com/v1/bsv/main/tx/hash/{txid}");
+    let failed = (200u16, Vec::new(), false);
+    assert_eq!(
+        courier_answer(Some(&failed)),
+        None,
+        "a failed 2xx body read is the transport fault"
+    );
+    let (_, o, s) = record(&url, "tx_any", courier_answer(Some(&failed)));
+    assert_eq!((o, s), ("fault", "fault"));
+    // a clean read is passed as it was; a non-2xx keeps its status-based outcome even when its body did not read
+    let clean = (200u16, b"<html>busy</html>".to_vec(), true);
+    assert_eq!(
+        courier_answer(Some(&clean)),
+        Some((200, clean.1.as_slice()))
+    );
+    let gone = (404u16, Vec::new(), false);
+    assert_eq!(courier_answer(Some(&gone)), Some((404, &b""[..])));
+    assert_eq!(courier_answer(None), None);
+    let d = drained();
+    assert_eq!(
+        d.get("courier_applayer_woc_fault_total").copied(),
+        Some(1),
+        "{d:?}"
+    );
+    assert!(!d.contains_key("courier_applayer_woc_shape_total"), "{d:?}");
+    // the route notes what `courier_answer` says, and still returns the status with the bytes it read
+    let routes = include_str!("routes.rs");
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    assert!(squash(routes).contains(&squash(
+        "crate::courier::note(url, caller, courier_answer(got.as_ref()), ms);"
+    )));
+    assert!(squash(routes).contains(&squash(
+        "let (body, body_read) = match response.bytes().await { Ok(b) => (b, true), Err(_) => (Vec::new(), false), };"
+    )));
+}
