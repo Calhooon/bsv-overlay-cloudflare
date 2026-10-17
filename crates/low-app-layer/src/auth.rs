@@ -555,6 +555,252 @@ pub(crate) fn json_reply(status: u16, body: &serde_json::Value) -> Result<Respon
     Ok(resp)
 }
 
+// ── bsv-low #670: a store FAULT at the auth door is a retryable 503 ──────────
+
+/// What an `Err` out of `process_auth*` is. Since the middleware's 0.4.1 every
+/// REFUSAL it decides is its own 401 `Response`, so an `Err` is a fault; this
+/// splits the faults the client should retry (the session store could not be
+/// asked or written) from the rest, which keep the door's 400 byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFaultClass {
+    /// The session store (KV, the `AuthSessionStore` DO: its stub, its fetch,
+    /// its status, its body) could not be asked or written: 503, `Retry-After`.
+    Transport,
+    /// Everything else, kept at the pre-#670 400 byte for byte. Not only the
+    /// caller's faults: server and operator faults land here too (`ConfigError`:
+    /// a missing binding or a bad server key; `SdkError`: the session nonce;
+    /// `TransportError`: a body read or a Response build; `SerializationError`).
+    /// None of these heals by waiting two seconds, so none is told to retry.
+    Caller,
+}
+
+/// Classify by VARIANT (bsv-middleware-cloudflare 0.6.2's `AuthCloudflareError`,
+/// the version in the workers lock; `error.rs`, `middleware/auth.rs` and
+/// `storage/` are byte-identical to 0.6.0's). The match is exhaustive on
+/// purpose: a crate bump that adds a variant does not compile until it is
+/// classified. Every store fault the middleware raises is `KvError`
+/// (`storage/kv_session.rs`, `storage/do_session.rs`, and `From<worker::Error>`,
+/// which maps EVERY bare-`?` worker error to it). The converse does not hold in
+/// the crate: a caller's over-long nonce or handshake body also comes back
+/// `KvError` (the platform refusing the key or value), so the door refuses
+/// those inputs first (`auth_input_guard`, the lens's HIGH-1); with the guard,
+/// a `KvError` at the door is the store's.
+pub fn auth_fault_class(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> AuthFaultClass {
+    use bsv_middleware_cloudflare::AuthCloudflareError as E;
+    match e {
+        E::KvError(_) => AuthFaultClass::Transport,
+        E::Unauthorized
+        | E::InvalidAuthentication(_)
+        | E::SessionNotFound(_)
+        | E::ServerMisconfigured
+        | E::PaymentInternal(_)
+        | E::PaymentRequired { .. }
+        | E::MalformedPayment(_)
+        | E::InvalidDerivationPrefix
+        | E::PaymentFailed(_)
+        | E::InvalidPayment(_)
+        | E::SdkError(_)
+        | E::TransportError(_)
+        | E::ConfigError(_)
+        | E::SerializationError(_) => AuthFaultClass::Caller,
+    }
+}
+
+/// The 503's `Retry-After`, in seconds.
+pub const AUTH_UNAVAILABLE_RETRY_AFTER: &str = "2";
+/// The 503's code.
+pub const AUTH_UNAVAILABLE_CODE: &str = "ERR_AUTH_UNAVAILABLE";
+/// The durable `ops_counters` row a store fault at the door bumps (through the
+/// courier census's batched flush, never one D1 write per fault). It is the
+/// ONLY count of a store fault: the isolate `/health` auth tally holds none
+/// (not `authRefused`, since a store fault is not a refusal; not
+/// `authenticated`), stated (the lens's LOW-3).
+pub const COUNTER_AUTH_HANDSHAKE_UNAVAILABLE: &str = "auth_handshake_unavailable_total";
+
+/// The door's answer to an `Err` out of `process_auth*`: `(status, body,
+/// Retry-After)`. A store fault names its class only, never the error's text
+/// (it carries the platform's reference id). Any other fault is the pre-#670
+/// 400, `authentication handshake failed: {e}`.
+pub fn auth_fault_answer(
+    e: &bsv_middleware_cloudflare::AuthCloudflareError,
+) -> (u16, serde_json::Value, Option<&'static str>) {
+    match auth_fault_class(e) {
+        AuthFaultClass::Transport => (
+            503,
+            json!({
+                "error": "authentication handshake unavailable: session store",
+                "code": AUTH_UNAVAILABLE_CODE,
+            }),
+            Some(AUTH_UNAVAILABLE_RETRY_AFTER),
+        ),
+        AuthFaultClass::Caller => (
+            400,
+            json!({ "error": format!("authentication handshake failed: {e}") }),
+            None,
+        ),
+    }
+}
+
+/// The headers a fault's answer carries beside `json_reply`'s: the store
+/// fault's `Retry-After` (the lens's HIGH-3: one list the reply renders and a
+/// pin reads, so a dropped hint reds), none for any other fault (the pre-#670
+/// bytes). CORS is stamped after, on every door reply (`serve`'s `stamp_cors`).
+pub fn auth_fault_headers(class: AuthFaultClass) -> &'static [(&'static str, &'static str)] {
+    match class {
+        AuthFaultClass::Transport => &[("Retry-After", AUTH_UNAVAILABLE_RETRY_AFTER)],
+        AuthFaultClass::Caller => &[],
+    }
+}
+
+/// The door's reply to an `Err` out of `process_auth*`: [`auth_fault_answer`]
+/// rendered with [`auth_fault_headers`].
+pub fn auth_fault_reply(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> Result<Response> {
+    let (status, body, _) = auth_fault_answer(e);
+    let mut resp = json_reply(status, &body)?;
+    for (name, value) in auth_fault_headers(auth_fault_class(e)) {
+        resp.headers_mut().set(name, value)?;
+    }
+    Ok(resp)
+}
+
+/// The store fault's one log line: the crate's CODE (`ERR_STORAGE`), never
+/// the error's text: the DO's fault carries the platform's `reference = …`
+/// id, and under HIGH-1 the text was the caller's (the lens's HIGH-2).
+pub fn auth_unavailable_log_line(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> String {
+    format!("[auth] handshake unavailable: {}", e.error_code())
+}
+
+// ── bsv-low #670 fold (lens HIGH-1): a caller's own bytes never reach the store ──
+//
+// The middleware (0.6.2) uses the caller's nonce headers as storage keys and
+// values without a shape check: `x-bsv-auth-your-nonce` (or `x-bsv-auth-nonce`
+// when it is absent) is the session key (`auth:session:<nonce>`, the DO's
+// `id_from_name`), `x-bsv-auth-nonce` the consumed-nonce key
+// (`auth:nonce:<session>:<nonce>`), and a handshake's `initialNonce` is stored
+// whole as the session's `peer_nonce`. An over-long one makes Cloudflare refuse
+// the key (KV: 512 bytes) or the value (a KV-backed DO: 128 KiB), which the
+// crate raises as `KvError`, the store-fault class: a stranger could raise the
+// 503 (and `auth_handshake_unavailable_total`) at will. The door refuses those
+// inputs FIRST, with the pre-#670 400.
+
+/// The longest nonce header handed to the middleware. The reference's nonce
+/// (`createNonce`: 16 random bytes + a 16-byte HMAC, base64) is 44 characters;
+/// the server's session nonce is the same shape. 128 leaves room for any
+/// encoding and keeps every derived KV key under the 512-byte limit.
+pub const AUTH_NONCE_MAX_BYTES: usize = 128;
+/// The longest `/.well-known/auth` body handed to the middleware. A real
+/// InitialRequest is 246 bytes (`s670_e` builds and measures one); the app
+/// layer requests no certificates, so no honest handshake carries a
+/// certificate list. The reference bounds an auth message at 16 MiB
+/// (`MAX_AUTH_MESSAGE_BYTES`) and a handshake RESPONSE at 1 MiB; 16 KiB is
+/// ours, under the DO's 128 KiB value cap.
+pub const AUTH_HANDSHAKE_BODY_MAX_BYTES: usize = 16 * 1024;
+/// Every `x-bsv-auth-*` header the middleware turns into a storage key or a
+/// stored value. The others are parsed to a fixed shape before any store call
+/// (the identity key a public key, the request id 32 bytes, the signature
+/// bytes, the requested certificates JSON never stored) or only compared.
+pub const AUTH_NONCE_HEADERS: [&str; 3] = [
+    bsv_middleware_cloudflare::auth_headers::NONCE,
+    bsv_middleware_cloudflare::auth_headers::YOUR_NONCE,
+    bsv_middleware_cloudflare::auth_headers::INITIAL_NONCE,
+];
+/// The durable `ops_counters` row an oversize auth input bumps (the census's
+/// batched flush), apart from the store-fault row.
+pub const COUNTER_AUTH_HANDSHAKE_OVERSIZE: &str = "auth_handshake_oversize_total";
+
+/// The first nonce header over [`AUTH_NONCE_MAX_BYTES`], named.
+pub fn auth_nonce_oversize(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    AUTH_NONCE_HEADERS.iter().find_map(|h| {
+        get(h)
+            .filter(|v| v.len() > AUTH_NONCE_MAX_BYTES)
+            .map(|_| format!("{h} over {AUTH_NONCE_MAX_BYTES} bytes"))
+    })
+}
+
+/// The handshake body's reason, when its length is over the bound.
+pub fn handshake_body_oversize(len: usize) -> Option<String> {
+    (len > AUTH_HANDSHAKE_BODY_MAX_BYTES)
+        .then(|| format!("handshake body over {AUTH_HANDSHAKE_BODY_MAX_BYTES} bytes"))
+}
+
+/// Append a chunk of the handshake body; `false` once the bound is passed (the
+/// read stops there, so an oversize body is never held whole).
+pub fn push_bounded(buf: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    if buf.len() + chunk.len() > AUTH_HANDSHAKE_BODY_MAX_BYTES {
+        return false;
+    }
+    buf.extend_from_slice(chunk);
+    true
+}
+
+/// The oversize answer: the door's pre-#670 400, a caller fault, never the 503.
+pub fn auth_oversize_answer(reason: &str) -> (u16, serde_json::Value) {
+    (
+        400,
+        json!({ "error": format!("authentication handshake failed: {reason}") }),
+    )
+}
+
+/// Read a handshake body up to the bound and hand the middleware a request
+/// with the SAME method, URL, headers and bytes. `Err(reason)` when it is over.
+async fn bound_handshake_body(mut req: Request) -> Result<std::result::Result<Request, String>> {
+    use futures_util::StreamExt;
+    let declared = req
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    if let Some(reason) = declared.and_then(handshake_body_oversize) {
+        return Ok(Err(reason));
+    }
+    let mut buf = Vec::new();
+    // A request with no body has no stream: the middleware reads it as empty.
+    if let Ok(mut stream) = req.stream() {
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else {
+                return Ok(Err("handshake body could not be read".into()));
+            };
+            if !push_bounded(&mut buf, &chunk) {
+                return Ok(Err(handshake_body_oversize(
+                    AUTH_HANDSHAKE_BODY_MAX_BYTES + 1,
+                )
+                .unwrap_or_default()));
+            }
+        }
+    }
+    let mut init = worker::RequestInit::new();
+    init.with_method(req.method());
+    init.with_headers(req.headers().clone());
+    if !buf.is_empty() {
+        init.with_body(Some(
+            worker::js_sys::Uint8Array::from(buf.as_slice()).into(),
+        ));
+    }
+    Request::new_with_init(req.url()?.as_str(), &init).map(Ok)
+}
+
+/// The guard the door runs BEFORE `process_auth*`: an over-long nonce header
+/// or handshake body is the 400 (counted `auth_handshake_oversize_total`, and
+/// in the isolate tally as the refusal the old 400 was); anything else passes,
+/// a handshake re-built byte for byte.
+pub async fn auth_input_guard(req: Request) -> Result<std::result::Result<Request, Response>> {
+    let reason = if let Some(r) = auth_nonce_oversize(|h| req.headers().get(h).ok().flatten()) {
+        r
+    } else if CloudflareTransport::is_handshake_request(&req) {
+        match bound_handshake_body(req).await? {
+            Ok(rebuilt) => return Ok(Ok(rebuilt)),
+            Err(r) => r,
+        }
+    } else {
+        return Ok(Ok(req));
+    };
+    crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_OVERSIZE);
+    count_auth_refused();
+    let (status, body) = auth_oversize_answer(&reason);
+    json_reply(status, &body).map(Err)
+}
+
 /// A secret/var read that treats "bound but empty" as absent.
 fn nonempty_var(env: &Env, name: &str) -> Option<String> {
     env.secret(name)
@@ -680,6 +926,13 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
             };
             // ONE outcome shape for both doors: the lane's `Laned` arm folds
             // into the same verified-caller construction as BRC-104's.
+            // bsv-low #670 fold (HIGH-1): an over-long nonce or handshake body
+            // is the caller's 400 here, before the middleware can turn it into
+            // a store fault.
+            let req = match auth_input_guard(req).await? {
+                Ok(req) => req,
+                Err(resp) => return Ok(FrontDoor::Reply(resp)),
+            };
             let outcome = if lane_on {
                 process_auth_lane(req, env, &opts, AUTH_SESSION_STORE_BINDING).await
             } else {
@@ -692,9 +945,9 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
             // malformed handshake, a signature that does not verify, NEW-1's
             // identity that is not the session's; 0.3.8 raised those as `Err`
             // and they were this 400). An `Err` is now a FAULT only (the
-            // session store, the server's key, the transport, the SDK); its
-            // answer here is unchanged: the 400 a 0.3.8 fault got, never a
-            // bare 500.
+            // session store, the server's key, the transport, the SDK); since
+            // bsv-low #670 a store fault is the retryable 503 and every other
+            // fault the 400 a 0.3.8 fault got, never a bare 500.
             let mut pending_offer: Option<LaneOffer> = None;
             let auth = match outcome {
                 Ok(LaneAuthResult::Laned {
@@ -725,13 +978,19 @@ pub async fn front_door(req: Request, env: &Env) -> Result<FrontDoor> {
                     pending_offer = Some(offer);
                     auth
                 }
+                // bsv-low #670: a store fault is the retryable 503 (counted
+                // durably, logged by its code); any other fault the 400.
                 Err(e) => {
-                    count_auth_refused();
-                    return json_reply(
-                        400,
-                        &json!({ "error": format!("authentication handshake failed: {e}") }),
-                    )
-                    .map(FrontDoor::Reply);
+                    match auth_fault_class(&e) {
+                        AuthFaultClass::Transport => {
+                            crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_UNAVAILABLE);
+                            worker::console_warn!("{}", auth_unavailable_log_line(&e));
+                        }
+                        AuthFaultClass::Caller => {
+                            count_auth_refused();
+                        }
+                    }
+                    return auth_fault_reply(&e).map(FrontDoor::Reply);
                 }
             };
             match auth {
@@ -799,6 +1058,300 @@ mod tests {
 
     fn verified_a() -> CallerAuth {
         CallerAuth::verified(&ID_A.to_ascii_uppercase())
+    }
+
+    // ── bsv-low #670: a store fault at the auth door is a retryable 503 ──────
+
+    /// A session store whose writes fail the way Cloudflare's KV failed on
+    /// 2026-10-15 (`KV PUT failed: 500`) and whose reads fail the way the DO
+    /// fetch did (`auth-session-store fetch: Error: internal error; reference = …`).
+    struct FailingStore;
+
+    const KV_PUT_500: &str = "js error: KV PUT failed: 500 Internal Server Error";
+    const DO_FETCH_FAULT: &str =
+        "auth-session-store fetch: Error: internal error; reference = dc291hl7example";
+
+    type Stored = bsv_middleware_cloudflare::types::StoredSession;
+    fn kv(text: &str) -> bsv_middleware_cloudflare::AuthCloudflareError {
+        bsv_middleware_cloudflare::AuthCloudflareError::KvError(text.into())
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl bsv_middleware_cloudflare::SessionStorage for FailingStore {
+        async fn get_session(&self, _: &str) -> bsv_middleware_cloudflare::Result<Option<Stored>> {
+            Err(kv(DO_FETCH_FAULT))
+        }
+        async fn get_session_by_identity(
+            &self,
+            k: &str,
+        ) -> bsv_middleware_cloudflare::Result<Option<Stored>> {
+            self.get_session(k).await
+        }
+        async fn save_session(&self, _: &Stored) -> bsv_middleware_cloudflare::Result<()> {
+            // `kv_session.rs` maps the worker error through `KvError(e.to_string())`.
+            Err(kv(KV_PUT_500))
+        }
+        async fn update_session(&self, s: &Stored) -> bsv_middleware_cloudflare::Result<()> {
+            self.save_session(s).await
+        }
+        async fn try_consume_nonce(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<u64>,
+        ) -> bsv_middleware_cloudflare::Result<bool> {
+            Err(kv(KV_PUT_500))
+        }
+        async fn release_nonce(&self, _: &str, _: &str) -> bsv_middleware_cloudflare::Result<()> {
+            Err(kv(KV_PUT_500))
+        }
+    }
+
+    /// (c, the 503) The CLASSIFIER: a `KvError` of the shape the store raises
+    /// (built by a port fake, no middleware code run) is answered 503
+    /// `ERR_AUTH_UNAVAILABLE` with `Retry-After: 2`, the body naming the class
+    /// only (never the platform's reference id). Before #670: 400. The
+    /// middleware's real path over a failing store is `tests/door_wasm.rs`
+    /// (wasm32, Node).
+    #[tokio::test]
+    async fn s670_a_the_classifier_answers_a_store_fault_503() {
+        use bsv_middleware_cloudflare::SessionStorage;
+        // Every field by hand (`StoredSession::new` reads the JS clock).
+        let session = Stored {
+            session_nonce: "s-nonce".into(),
+            peer_identity_key: ID_A.into(),
+            peer_nonce: None,
+            is_authenticated: true,
+            certificates_required: false,
+            certificates_validated: false,
+            created_at: 1,
+            last_update: 1,
+        };
+        let put = FailingStore.save_session(&session).await.unwrap_err();
+        let read = FailingStore.get_session("s-nonce").await.unwrap_err();
+        for e in [&put, &read] {
+            assert_eq!(auth_fault_class(e), AuthFaultClass::Transport, "{e}");
+            let (status, body, retry_after) = auth_fault_answer(e);
+            assert_eq!((status, retry_after), (503, Some("2")), "{e}");
+            assert_eq!(
+                serde_json::to_string(&body).unwrap(),
+                r#"{"code":"ERR_AUTH_UNAVAILABLE","error":"authentication handshake unavailable: session store"}"#
+            );
+            let text = body.to_string();
+            assert!(
+                !text.contains("reference") && !text.contains("KV PUT"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            COUNTER_AUTH_HANDSHAKE_UNAVAILABLE,
+            "auth_handshake_unavailable_total"
+        );
+    }
+
+    /// (c, the 400) A fault that is not the store's keeps the door's 400 byte
+    /// for byte, and the door routes its `Err` through the classifier; the
+    /// door's own replies flush the census like a proceeded request.
+    #[test]
+    fn s670_b_a_non_store_fault_keeps_the_old_400_bytes() {
+        use bsv_middleware_cloudflare::AuthCloudflareError as E;
+        let ser = E::SerializationError("expected value at line 1 column 1".into());
+        let (status, body, retry_after) = auth_fault_answer(&ser);
+        assert_eq!((status, retry_after), (400, None));
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"error":"authentication handshake failed: Serialization error: expected value at line 1 column 1"}"#
+        );
+        let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        let whole = include_str!("auth.rs");
+        let code = strip(&whole[..whole.find("#[cfg(test)]").unwrap()]);
+        assert_eq!(code.matches("auth_fault_reply(&e)").count(), 1);
+        assert_eq!(
+            code.matches("json!({\"error\":format!(\"authenticationhandshakefailed:{e}\")})")
+                .count(),
+            1,
+            "the 400's text lives in the classifier's answer only"
+        );
+        let lib = include_str!("lib.rs");
+        let lib = strip(&lib[..lib.find("#[cfg(test)]").unwrap_or(lib.len())]);
+        let reply = &lib[lib.find("auth::FrontDoor::Reply(mutresp)=>{").unwrap()..];
+        let reply = &reply[..reply.find("returnOk(resp);").unwrap()];
+        assert!(reply.contains("courier::take_pending_if_due("), "{reply}");
+    }
+
+    /// (d) The classifier's table, on every variant of bsv-middleware-cloudflare
+    /// 0.6.2's `AuthCloudflareError` (the match in `auth_fault_class` is
+    /// exhaustive, so a new variant does not compile until classified). The pin
+    /// moves only after re-reading the crate's storage error paths.
+    #[test]
+    fn s670_d_the_classifier_table() {
+        use bsv_middleware_cloudflare::AuthCloudflareError as E;
+        use AuthFaultClass::{Caller, Transport};
+        let table: Vec<(E, AuthFaultClass)> = vec![
+            (kv(KV_PUT_500), Transport),
+            (kv(DO_FETCH_FAULT), Transport),
+            (kv("auth-session-store PUT answered 500"), Transport),
+            (kv("auth-session-store stub: x"), Transport),
+            (E::Unauthorized, Caller),
+            (E::InvalidAuthentication("x".into()), Caller),
+            (E::SessionNotFound("x".into()), Caller),
+            (E::ServerMisconfigured, Caller),
+            (E::PaymentInternal("x".into()), Caller),
+            (
+                E::PaymentRequired {
+                    satoshis: 1,
+                    derivation_prefix: "x".into(),
+                },
+                Caller,
+            ),
+            (E::MalformedPayment("x".into()), Caller),
+            (E::InvalidDerivationPrefix, Caller),
+            (E::PaymentFailed("x".into()), Caller),
+            (E::InvalidPayment("x".into()), Caller),
+            (E::SdkError("x".into()), Caller),
+            (E::TransportError("x".into()), Caller),
+            (E::ConfigError("x".into()), Caller),
+            (E::SerializationError("x".into()), Caller),
+        ];
+        for (e, class) in &table {
+            assert_eq!(auth_fault_class(e), *class, "{e:?}");
+        }
+        // A worker::Error out of the store arrives as `KvError` (the crate's From).
+        let from_worker: E = worker::Error::RustError("KV PUT failed: 500".into()).into();
+        assert_eq!(auth_fault_class(&from_worker), Transport);
+        assert!(
+            include_str!("../Cargo.toml").contains("bsv-middleware-cloudflare = \"=0.6.2\""),
+            "the middleware pin moved: re-read AuthCloudflareError and its KvError sites first"
+        );
+    }
+
+    /// (e) The lens's HIGH-1: a caller's over-long nonce header or handshake
+    /// body is the caller's 400 (`authentication handshake failed: <reason>`),
+    /// never the store-fault 503; a real-size handshake passes, bytes unchanged.
+    #[test]
+    fn s670_e_an_oversize_auth_input_is_the_callers_400() {
+        use bsv_middleware_cloudflare::auth_headers as h;
+        let long = "A".repeat(600);
+        for header in [h::YOUR_NONCE, h::NONCE, h::INITIAL_NONCE] {
+            let get = |name: &str| (name == header).then(|| long.clone());
+            let reason = auth_nonce_oversize(get).expect(header);
+            assert_eq!(reason, format!("{header} over 128 bytes"));
+            let (status, body) = auth_oversize_answer(&reason);
+            assert_eq!(status, 400);
+            assert_eq!(
+                serde_json::to_string(&body).unwrap(),
+                format!(
+                    r#"{{"error":"authentication handshake failed: {header} over 128 bytes"}}"#
+                )
+            );
+        }
+        let nonce = bsv_middleware_cloudflare::core::auth::generate_random_nonce();
+        assert_eq!(nonce.len(), 44);
+        let at = |n: usize| move |name: &str| (name == h::YOUR_NONCE).then(|| "n".repeat(n));
+        assert_eq!(auth_nonce_oversize(|_| Some(nonce.clone())), None);
+        assert_eq!(auth_nonce_oversize(at(128)), None);
+        assert!(auth_nonce_oversize(at(129)).is_some());
+        assert_eq!(auth_nonce_oversize(|_| None), None);
+        let mut buf = Vec::new();
+        let chunk = vec![b'x'; 1024];
+        let fits = (0..17)
+            .take_while(|_| push_bounded(&mut buf, &chunk))
+            .count();
+        assert_eq!(
+            (fits, buf.len()),
+            (16, 16 * 1024),
+            "the read stops at the bound"
+        );
+        assert_eq!(
+            handshake_body_oversize(17 * 1024).as_deref(),
+            Some("handshake body over 16384 bytes")
+        );
+        assert_eq!(handshake_body_oversize(16 * 1024), None);
+        let key = bsv_rs::primitives::PrivateKey::from_hex(&format!("{:064x}", 2)).unwrap();
+        let mut m = bsv_rs::auth::AuthMessage::new(
+            bsv_rs::auth::MessageType::InitialRequest,
+            key.public_key(),
+        );
+        m.initial_nonce = Some(nonce);
+        m.requested_certificates = Some(Default::default());
+        let real = serde_json::to_vec(&m).unwrap();
+        assert_eq!(real.len(), 246, "a real InitialRequest");
+        assert_eq!(handshake_body_oversize(real.len()), None);
+        let mut read = Vec::new();
+        for piece in real.chunks(7) {
+            assert!(push_bounded(&mut read, piece));
+        }
+        assert_eq!(read, real, "the bytes handed on are the bytes received");
+        // The door runs the guard BEFORE the middleware, once.
+        let whole = include_str!("auth.rs");
+        let code: String = whole[..whole.find("#[cfg(test)]").unwrap()]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let at = code
+            .find("letreq=matchauth_input_guard(req).await?{")
+            .expect("the door runs the guard");
+        assert!(code[at..].find("process_auth_lane(req,").is_some());
+        assert_eq!(code.matches("auth_input_guard(req).await?").count(), 1);
+        assert_eq!(
+            COUNTER_AUTH_HANDSHAKE_OVERSIZE,
+            "auth_handshake_oversize_total"
+        );
+        assert_eq!(
+            code.matches("crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_OVERSIZE);")
+                .count(),
+            1,
+            "the oversize 400 is counted apart"
+        );
+    }
+
+    /// (f) The lens's HIGH-2: the store fault's log line carries `ERR_STORAGE`,
+    /// never the error's text or a platform reference id.
+    #[test]
+    fn s670_f_the_unavailable_log_line_carries_no_error_text() {
+        let e = kv("auth-session-store fetch: Error: internal error; reference = abc123");
+        let line = auth_unavailable_log_line(&e);
+        assert_eq!(line, "[auth] handshake unavailable: ERR_STORAGE");
+        assert!(
+            !line.contains("abc123") && !line.contains("reference"),
+            "{line}"
+        );
+        let whole = include_str!("auth.rs");
+        let code = &whole[..whole.find("#[cfg(test)]").unwrap()];
+        assert_eq!(
+            code.matches("console_warn!(\"{}\", auth_unavailable_log_line(&e));")
+                .count(),
+            1
+        );
+        assert!(!code.contains("handshake unavailable: {e}"));
+    }
+
+    /// (h) The lens's HIGH-3, natively: the fault's extra headers are one list,
+    /// the store fault's carries `Retry-After: 2`, any other none; the reply
+    /// renders that list and the door answers with that reply.
+    #[test]
+    fn s670_h_the_fault_header_list_carries_retry_after() {
+        assert_eq!(
+            auth_fault_headers(AuthFaultClass::Transport),
+            &[("Retry-After", "2")]
+        );
+        assert!(auth_fault_headers(AuthFaultClass::Caller).is_empty());
+        let whole = include_str!("auth.rs");
+        let code: String = whole[..whole.find("#[cfg(test)]").unwrap()]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let reply = &code[code.find("pubfnauth_fault_reply(").unwrap()..];
+        let reply = &reply[..reply.find("Ok(resp)").unwrap()];
+        assert!(
+            reply.contains("for(name,value)inauth_fault_headers(auth_fault_class(e)){resp.headers_mut().set(name,value)?;}"),
+            "{reply}"
+        );
+        assert_eq!(
+            code.matches("returnauth_fault_reply(&e).map(FrontDoor::Reply);")
+                .count(),
+            1
+        );
     }
 
     // ── AuthMode::from_flag ────────────────────────────────────────────────

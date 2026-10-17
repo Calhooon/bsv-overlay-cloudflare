@@ -112,11 +112,16 @@ fn no_request_header_is_ever_read_as_an_identity() {
         // whitespace-stripping ("X-Identity-Key", "x-identity-key", …).
         identity_header_mentions += count(&code.to_ascii_lowercase(), "identity-key\"");
     }
+    // bsv-low #670 fold (HIGH-1): the auth door's guard reads two REQUEST
+    // headers for their LENGTH only, before the middleware runs (the nonce
+    // headers and `content-length`); neither value is ever an identity or
+    // leaves the guard (`auth_input_guard`). Reviewed against Rule 8b.
     assert_eq!(
-        header_reads, 2,
-        "exactly TWO .headers().get( calls may exist in src/ (the live-view \
+        header_reads, 4,
+        "exactly FOUR .headers().get( calls may exist in src/ (the live-view \
          response Content-Length budget, the view actor's response \
-         Server-Timing, bsv-low #499); a new header read must be reviewed \
+         Server-Timing, bsv-low #499; the #670 guard's nonce lengths and \
+         handshake content-length); a new header read must be reviewed \
          against Rule 8b and this count updated deliberately"
     );
     assert_eq!(
@@ -320,8 +325,18 @@ fn every_front_door_outcome_is_counted() {
     // The authenticated path counts once (the Authenticated+session arm)…
     assert_eq!(count(&auth, "count_authenticated_served();"), 1);
     // …and middleware refusals are counted at each refusal site (Err, the
-    // contract-break 500, and the non-handshake Response refusal).
-    assert_eq!(count(&auth, "count_auth_refused();"), 3);
+    // contract-break 500, the non-handshake Response refusal, and the #670
+    // oversize guard's caller 400).
+    assert_eq!(count(&auth, "count_auth_refused();"), 4);
+    // bsv-low #670: a store fault at the door is not a refusal; its 503 counts
+    // into the durable census instead.
+    assert_eq!(
+        count(
+            &auth,
+            "crate::courier::note_presence(COUNTER_AUTH_HANDSHAKE_UNAVAILABLE);"
+        ),
+        1
+    );
 }
 
 /// The pinned needles genuinely match the current source (Rule 9's

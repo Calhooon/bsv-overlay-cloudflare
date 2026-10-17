@@ -70,9 +70,18 @@ pub(crate) fn lane_header_lists() -> (String, String) {
     )
 }
 
+/// The response headers a cross-origin client may read: the signed-reply
+/// headers the AuthFetch client must read, the lane's seal and offer (#441),
+/// and `Retry-After` (bsv-low #670: the auth door's store-fault 503 carries
+/// it, and it is not a CORS-safelisted response header). Pure.
+pub fn expose_list() -> String {
+    let (_, lane_expose) = lane_header_lists();
+    format!("{}, {lane_expose}, Retry-After", auth_header_list())
+}
+
 pub fn add_cors_headers(resp: &mut Response) {
     let auth_list = auth_header_list();
-    let (lane_allow, lane_expose) = lane_header_lists();
+    let (lane_allow, _) = lane_header_lists();
     let h = resp.headers_mut();
     let _ = h.set("Access-Control-Allow-Origin", "*");
     // POST is the BRC-103/104 handshake (`/.well-known/auth`); every data
@@ -82,12 +91,8 @@ pub fn add_cors_headers(resp: &mut Response) {
         "Access-Control-Allow-Headers",
         &format!("Content-Type, {auth_list}, {lane_allow}"),
     );
-    // The signed-reply headers the AuthFetch client must read cross-origin,
-    // and the lane's seal (#441).
-    let _ = h.set(
-        "Access-Control-Expose-Headers",
-        &format!("{auth_list}, {lane_expose}"),
-    );
+    // The headers the client must read cross-origin (`expose_list`).
+    let _ = h.set("Access-Control-Expose-Headers", &expose_list());
     let _ = h.set("Access-Control-Max-Age", "86400");
 }
 
@@ -129,5 +134,40 @@ mod tests {
             !expose.contains(lane::LANE_ASK_HEADER),
             "the ask is a request header, never exposed"
         );
+    }
+
+    /// bsv-low #670 (the lens's MEDIUM-1): `Retry-After` is exposed on every
+    /// door reply, the default CORS and the identity CORS alike, beside the
+    /// signed-reply headers and the lane's seal and offer; the default stamp
+    /// renders `expose_list`.
+    #[test]
+    fn retry_after_is_exposed_by_both_cors_sets() {
+        let expose = expose_list();
+        let names: Vec<&str> = expose.split(", ").collect();
+        assert!(names.contains(&"Retry-After"), "{expose}");
+        for h in auth_header_list().split(", ").chain([
+            lane::SESSION_COUNTER_HEADER,
+            lane::SESSION_MAC_HEADER,
+            lane::LANE_OFFER_HEADER,
+        ]) {
+            assert!(names.contains(&h), "expose list must carry {h}: {expose}");
+        }
+        let identity = crate::identity::cors_headers(Some("https://bsvarcade.com"));
+        let (_, identity_expose) = identity
+            .iter()
+            .find(|(k, _)| *k == "Access-Control-Expose-Headers")
+            .unwrap();
+        assert!(
+            identity_expose.split(", ").any(|h| h == "Retry-After"),
+            "{identity_expose}"
+        );
+        let code: String = include_str!("cors.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(code.contains("h.set(\"Access-Control-Expose-Headers\",&expose_list());"));
     }
 }
