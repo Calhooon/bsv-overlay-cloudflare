@@ -546,7 +546,7 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
                 // this authenticated admin FETCH route is an ADDITIONAL trigger that an
                 // external cron (e.g. low-monitor) or an operator may POST. Same logic
                 // as the scheduled block; fail-closed.
-                "/admin/complete-proofs" => admin_complete_proofs(&env).await,
+                "/admin/complete-proofs" => admin_complete_proofs(&env, &ctx).await,
                 // bsv-low#304 M-2: one-shot operator drain of the verified-
                 // latch backlog (chaintracks-only stored-bump re-verify —
                 // never a courier fetch). Drive repeatedly post-deploy until
@@ -1454,7 +1454,7 @@ async fn admin_advert_lifecycle(env: &Env, req: &Request) -> worker::Result<Resp
     }))
 }
 
-async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
+async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Response> {
     let db = match env.d1("OVERLAY_DB") {
         Ok(d) => Rc::new(d),
         Err(e) => return Response::error(format!("complete-proofs: D1 binding: {e}"), 500),
@@ -1516,7 +1516,6 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         backstop_age,
     )
     .await;
-    courier_counts.flush(&ops_db).await;
     // 4. pot_records decoded-params lazy backfill (#284) — no courier/tracker,
     //    pure re-reads of our own admitted pot_beefs bytes.
     let bf = crate::proof_fetcher::backfill_decoded_params(
@@ -1711,6 +1710,8 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     // bsv-low #649 D3-H1: the shared parked drain's pass (`null`: no app layer configured, nothing read); set apart
     // from the literal above, which sits at `json!`'s recursion limit.
     answer["change_parked"] = change_parked.unwrap_or(serde_json::Value::Null);
+    // The courier counters ride the answer's `wait_until`, as the door's do: no D1 batch on the answer path.
+    ctx.wait_until(async move { courier_counts.flush(&ops_db).await });
     Response::from_json(&answer)
 }
 
@@ -2096,6 +2097,23 @@ async fn queue_handler(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The W1-OBS lens's LOW-3: `/admin/complete-proofs` writes its courier
+    /// counters in `ctx.wait_until` after the answer is built, as the door does,
+    /// never an inline D1 batch on the answer path.
+    #[test]
+    fn obs_625_fold_l3_complete_proofs_flushes_its_couriers_after_the_answer() {
+        let src = include_str!("lib.rs");
+        let prod = &src[..src.find("#[cfg(test)]\n#[allow(clippy::unwrap_used, clippy::expect_used)]\nmod tests").unwrap()];
+        assert!(prod.contains("\"/admin/complete-proofs\" => admin_complete_proofs(&env, &ctx).await,"));
+        let body = &prod[prod.find("async fn admin_complete_proofs(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(!body.contains("\n    courier_counts.flush(&ops_db).await;"), "no inline flush");
+        let flush = body
+            .find("ctx.wait_until(async move { courier_counts.flush(&ops_db).await });")
+            .expect("the flush rides wait_until");
+        assert!(flush > body.find("answer[\"change_parked\"]").unwrap(), "after the answer is built");
+    }
 
     struct RegisteredTopicRemote;
 
