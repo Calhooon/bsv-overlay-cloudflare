@@ -48,6 +48,10 @@ const PAYOUTS_CANDIDATES_READ_CEILING: u64 = 6;
 /// bsv-low #643: the tip mark's subquery at a block whose window holds no pot.
 /// Measured 1 (6,944 before).
 const TIP_MARK_READ_CEILING: u64 = 5;
+/// bsv-low #645: `/health/invariants.networkSeenTotal`.
+/// Measured 1, and 1 for the backfill's re-run (27,000 before).
+const SEEN_TOTAL_READ_CEILING: u64 = 5;
+
 pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
     let mut sql = String::new();
     let mut expected = Vec::new();
@@ -119,7 +123,7 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
             expected.push(json!({"name":format!("{name} hydration page={page}"),"rows":rows,"sql":expanded,"ceiling":owed_cursor::PAGE_READ_CEILING}));
         }
     }
-    // bsv-low #643, #644 (W1.6): the hot passes' reads on the fleet fixture, each under its own ceiling
+    // bsv-low #643, #644, #645 (W1.6): the hot passes' reads on the fleet fixture, each under its own ceiling
     // (docs/D1-BUDGETS.md). The tip mark is its UPDATE's subquery at a block whose window holds no pot.
     let tip_at = owed::OWED_STALE_ON_TIP_SQL.find("IN (SELECT").unwrap() + 4;
     let tip_select = &owed::OWED_STALE_ON_TIP_SQL[tip_at..owed::OWED_STALE_ON_TIP_SQL.len() - 1];
@@ -143,6 +147,24 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
             tip_select.to_string(),
             vec![Value::Integer(958_900)],
             TIP_MARK_READ_CEILING,
+            false,
+        ),
+        (
+            "#645 the count's backfill on a re-run (its SELECT)",
+            bsv_overlay_cloudflare::ops::NETWORK_SEEN_COUNT_BACKFILL
+                [bsv_overlay_cloudflare::ops::NETWORK_SEEN_COUNT_BACKFILL
+                    .find("SELECT")
+                    .unwrap()..]
+                .to_string(),
+            vec![],
+            SEEN_TOTAL_READ_CEILING,
+            false,
+        ),
+        (
+            "#645 networkSeenTotal",
+            bsv_overlay_cloudflare::ops::NETWORK_SEEN_TOTAL_SQL.to_string(),
+            vec![],
+            SEEN_TOTAL_READ_CEILING,
             false,
         ),
     ] {

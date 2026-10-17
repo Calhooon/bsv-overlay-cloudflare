@@ -1,4 +1,4 @@
-//! bsv-low #643, #644 (W1.6): the D1 read bounds on the hot passes, on the fleet-shaped fixture.
+//! bsv-low #643, #644, #645 (W1.6): the D1 read bounds on the hot passes, on the fleet-shaped fixture.
 //!
 //! Each statement keeps the #638 pins: its answer is the answer of the same SQL over the old plan (the table read
 //! `NOT INDEXED`, so the row set cannot depend on the new index), its plan reads no fleet table whole, and its
@@ -301,4 +301,90 @@ fn w16_643_the_tip_mark_reads_only_the_pots_the_block_reaches() {
             .any(|d| d.contains("idx_pot_unspent_recovery")),
         "the range holds under statistics"
     );
+}
+
+#[test]
+fn w16_645_the_seen_total_is_the_count_and_the_read_counts_nothing() {
+    use bsv_overlay_cloudflare::ops::{NETWORK_SEEN_INSERT_SQL, NETWORK_SEEN_TOTAL_SQL};
+    let count = |db: &Connection| -> i64 {
+        db.query_row("SELECT COUNT(*) FROM network_seen", [], |r| r.get(0))
+            .unwrap()
+    };
+    let served = |db: &Connection| -> i64 {
+        db.query_row(NETWORK_SEEN_TOTAL_SQL, [], |r| {
+            r.get::<_, f64>(0).map(|v| v as i64)
+        })
+        .unwrap()
+    };
+    // An EXISTING database: its latches were written before the counter's migrations.
+    let at = OVERLAY_MIGRATIONS
+        .iter()
+        .position(|s| s.contains("CREATE TABLE IF NOT EXISTS network_seen "))
+        .unwrap();
+    let db = Connection::open_in_memory().unwrap();
+    migrate(&db, &OVERLAY_MIGRATIONS[..=at]);
+    for i in 0..500u32 {
+        db.execute(NETWORK_SEEN_INSERT_SQL, [format!("AB{i:062X}")])
+            .unwrap();
+    }
+    migrate(&db, OVERLAY_MIGRATIONS);
+    assert_eq!(
+        (served(&db), count(&db)),
+        (500, 500),
+        "the backfill counts what was held"
+    );
+    // The fleet fixture, then the latch's own write-once shape (a repeat, any case, is no new row).
+    let db = fixture();
+    assert_eq!(served(&db), count(&db));
+    let before = count(&db);
+    for txid in [
+        "e4".repeat(32),
+        "AA".repeat(32),
+        "aa".repeat(32),
+        "bb".repeat(32),
+    ] {
+        db.execute(NETWORK_SEEN_INSERT_SQL, [txid]).unwrap();
+        assert_eq!(served(&db), count(&db));
+    }
+    assert_eq!(
+        count(&db),
+        before + 3,
+        "e4e4.., aa.. (AA.. is its repeat) and bb.."
+    );
+    // A delete (none ships today; a future reorg clear or eviction move) keeps it exact.
+    db.execute(
+        "DELETE FROM network_seen WHERE txid = ?1",
+        ["aa".repeat(32)],
+    )
+    .unwrap();
+    db.execute("DELETE FROM network_seen WHERE txid LIKE 'e40000%'", [])
+        .unwrap();
+    assert_eq!(served(&db), count(&db));
+    // A re-run of the whole list (a new version) neither recounts nor drifts.
+    let mut replays = Vec::new();
+    for sql in OVERLAY_MIGRATIONS {
+        let Ok(mut stmt) = db.prepare(sql) else {
+            replays.push(0); // a re-run ALTER: the duplicate column the runner tolerates
+            continue;
+        };
+        let _ = stmt.raw_execute();
+        replays.push(stmt.get_status(rusqlite::StatementStatus::FullscanStep));
+    }
+    assert_eq!(served(&db), count(&db), "the re-run keeps the count");
+    let backfill = OVERLAY_MIGRATIONS
+        .iter()
+        .position(|s| s.starts_with("INSERT OR IGNORE INTO count_network_seen"))
+        .expect("the backfill ships");
+    assert_eq!(
+        replays[backfill], 0,
+        "the stamped backfill scans nothing on a re-run"
+    );
+    let details = plan(&db, NETWORK_SEEN_TOTAL_SQL);
+    println!("seen total plan: {details:?}");
+    assert_eq!(
+        details,
+        ["SEARCH count_network_seen USING INTEGER PRIMARY KEY (rowid=?)"],
+        "the read is the one row, never network_seen"
+    );
+    assert_no_fleet_scan("seen total", &details);
 }

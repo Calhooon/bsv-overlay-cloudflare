@@ -1453,6 +1453,17 @@
    "why": "rebuild from admitted hop markers, pot columns and party rows"
    },
    {
+   "name": "count_network_seen",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "one row: the count of network_seen (bsv-low #645), kept by that table's insert and delete triggers inside each write and served as /health/invariants.networkSeenTotal",
+   "why": "rebuild from network_seen: its guarded backfill recounts a missing row at the next version's migration run; until then the field reads -1"
+   },
+   {
    "name": "tx_words",
    "database": "low-overlay-db",
    "owner": "low-app-layer",

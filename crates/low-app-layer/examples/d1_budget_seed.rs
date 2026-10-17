@@ -147,6 +147,12 @@ fn main() {
         out.push_str(r);
         out.push_str(";\n");
     }
+    // bsv-low #645: the schema dump carries the count's triggers, not its row: the backfill the overlay's migration
+    // runs, run here after the rows (a no-op on the native connection, which already holds it).
+    conn.execute_batch(bsv_overlay_cloudflare::ops::NETWORK_SEEN_COUNT_BACKFILL)
+        .unwrap();
+    out.push_str(bsv_overlay_cloudflare::ops::NETWORK_SEEN_COUNT_BACKFILL);
+    out.push_str(";\n");
     if let Ok(path) = std::env::var("D1_CURSOR_PIN_SQL") {
         cursor_measure::write(&conn, &path, now_s, d1_fleet::WHALE);
     }

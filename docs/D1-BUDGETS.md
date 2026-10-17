@@ -301,3 +301,34 @@ index-proof read (`hopsweep::sweep_proofs_sql`, a PK seek of at most 20 spenders
   word, so each row is a known spend and the one proof read confirms it (`spentConfirmedSource: "index-proof"`,
   asserted). Measured **120 / 0 / 5**, largest statement 40; ceiling **180 / 0 / 7**, `maxReads` 60. Census key
   `/spent-any` (advisory in production).
+## The hot passes' reads, bounded (bsv-low #643, #644, #645, W1.6, 2026-10-17)
+
+Measured on the budget tier's fleet fixture in local D1 (`d1_budget_seed`, then `tools/lane-499/cursor_pin.mjs`,
+which `make ci-d1-budget` runs): 22,591 `pot_records` rows (6,944 unspent) and 27,000 `network_seen` latches.
+Rows are D1's own `rows_read` for the shipped statement. Before is `154e53b`.
+
+| issue | statement | before | after | ceiling |
+|---|---|---|---|---|
+| #644 | the signers backfill's candidates (`d1_discovery::settle_signers_candidates_sql`, each tick) | 22,591 | 2 | 6 |
+| #644 | the payouts backfill's candidates (`d1_discovery::spender_payouts_candidates_sql`, each tick) | 22,591 | 2 | 6 |
+| #643 | the app layer's tip mark (`owed::OWED_STALE_ON_TIP_SQL`, once per block), its subquery at a block whose window holds no pot | 6,944 | 1 | 5 |
+| #645 | `/health/invariants.networkSeenTotal` (`ops::NETWORK_SEEN_TOTAL_SQL`) | 27,000 | 1 | 5 |
+| #645 | the count's backfill on a migration re-run, its SELECT | | 1 | 5 |
+
+How. #644: two partial indexes (`idx_pot_signers_pending`, `idx_pot_payouts_pending`) hold exactly the rows each
+pass can still change, under the pass's own predicates, so the read is the pending set (none on the fixture) and a
+latched row leaves it; the SQL is unchanged. #643: `idx_pot_unspent_recovery` on `(spent, recoveryHeight)`, partial
+on `recoveryHeight IS NOT NULL`, makes the mark an index range over the block's seven-block window; at a block whose
+window holds every one of the fixture's 6,944 unspent pots the mark reads 19,927 rows, the same rows as before (the
+pots it must mark and their party rows). #645: `count_network_seen`, one row kept by `network_seen`'s insert and
+delete triggers and backfilled once behind its own row.
+
+Pins: `crates/low-app-layer/tests/d1_hot_bounds.rs` (the answer equals the same SQL over the old plan, the table
+read `NOT INDEXED`; no fleet scan, with and without `ANALYZE`; the count equal to `COUNT(*)` through a backfill, the
+latch's repeats and deletes and a re-run of the list), each RED on `154e53b`; the four statements in
+`d1_fleet_plans.rs` `hot_routes_never_scan_fleet_tables`; the D1 ceilings in `tests/support/cursor_measure.rs`.
+Stated: the two backfill candidate reads were measured with no row pending (the fixture holds none); with a backlog
+they read the backlog plus about two. The write cost: a `pot_records` row with a recovery height writes one more
+index entry at its insert and at its spend, a settle verdict and a spend of a decoded pot enter one partial index
+until their pass latches them, and every `network_seen` latch writes the count's row. The route tier's write
+ceilings were not re-measured in this lane unless the gate below says so.

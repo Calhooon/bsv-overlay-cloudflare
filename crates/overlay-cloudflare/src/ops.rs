@@ -858,6 +858,15 @@ pub fn arcade_reorg_state_json(
 pub const NETWORK_SEEN_INSERT_SQL: &str =
     "INSERT OR IGNORE INTO network_seen (txid, seenAt) VALUES (lower(?), unixepoch())";
 
+/// The `/health/invariants.networkSeenTotal` read (bsv-low #371): the one row the table's triggers keep equal to
+/// its `COUNT(*)` (bsv-low #645), never a count of the table. No row (an isolate before the migrations) is the
+/// served `-1`, as an unreadable table was.
+pub const NETWORK_SEEN_TOTAL_SQL: &str = "SELECT n AS c FROM count_network_seen WHERE id = 1";
+
+/// bsv-low #645: the count's one-time backfill. Its guard is the row itself, in the OUTER derived table, so a
+/// re-run of the list never counts the table (#638's rule).
+pub const NETWORK_SEEN_COUNT_BACKFILL: &str = "INSERT OR IGNORE INTO count_network_seen (id, n) SELECT 1, c.n FROM (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM count_network_seen WHERE id = 1)) g CROSS JOIN (SELECT COUNT(*) AS n FROM network_seen) c";
+
 /// Latch [`NETWORK_SEEN_INSERT_SQL`] for `txid`. Best-effort: the latch only
 /// ACCELERATES verdict publication (the #371 third arm); a lost write leaves
 /// the row behind the merkle bar, which is the pre-#371 behaviour — so a D1
@@ -1557,7 +1566,7 @@ pub async fn health_invariants(
     // wasm-route-only, so without a served count the feature could be
     // deleted with every native tier green). -1 = the table is unreadable
     // (pre-migration isolate), distinct from a real 0 (Rule 13).
-    let network_seen_total: i64 = Query::new("SELECT COUNT(*) AS c FROM network_seen")
+    let network_seen_total: i64 = Query::new(NETWORK_SEEN_TOTAL_SQL)
         .fetch_optional::<CountRow>(db)
         .await
         .ok()

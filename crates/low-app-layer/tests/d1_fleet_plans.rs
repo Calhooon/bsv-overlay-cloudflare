@@ -154,7 +154,7 @@ fn hot_routes_never_scan_fleet_tables() {
             "/leaderboard:view proof posts",
             low_app_layer::proof_post::proof_posted_sql(low_app_layer::logic::D1_CHUNK_OUTPOINTS),
         ),
-        // bsv-low #643, #644 (W1.6; their own pins are `d1_hot_bounds.rs`).
+        // bsv-low #643, #644, #645 (W1.6; their own pins are `d1_hot_bounds.rs`).
         (
             "overlay tick signers-backfill candidates",
             bsv_overlay_cloudflare::d1_discovery::settle_signers_candidates_sql(20),
@@ -166,6 +166,10 @@ fn hot_routes_never_scan_fleet_tables() {
         (
             "/internal/tip-changed tip mark",
             low_app_layer::owed::OWED_STALE_ON_TIP_SQL.to_string(),
+        ),
+        (
+            "/health/invariants networkSeenTotal",
+            bsv_overlay_cloudflare::ops::NETWORK_SEEN_TOTAL_SQL.to_string(),
         ),
     ] {
         for detail in plan(&db, &sql) {

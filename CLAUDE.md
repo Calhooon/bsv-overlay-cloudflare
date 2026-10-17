@@ -2797,6 +2797,18 @@ OFF (counters only, the owner's word). Pins: `cargo test --manifest-path workers
 --lib obs_` (`obs_625_*`, `obs_626_*`, `obs_628_*`, the identity pin in `identity::tests`) and `-p
 bsv-overlay-cloudflare --lib applayer_counters`.
 
+## The hot passes' D1 reads (bsv-low #643, #644, #645, W1.6)
+
+The tick's signers and payouts backfills (`settle_signers_candidates_sql`, `spender_payouts_candidates_sql`) read
+their pending rows through two partial indexes under their own predicates (`idx_pot_signers_pending`,
+`idx_pot_payouts_pending`), never the whole `pot_records` (22,591 rows to 2 on the fleet fixture's local D1).
+The app layer's per-block tip mark (`OWED_STALE_ON_TIP_SQL`) is an index range over the block's seven-block window
+(`idx_pot_unspent_recovery` on `(spent, recoveryHeight)`), never every unspent pot (6,944 rows to 1 at a block
+whose window holds none). `/health/invariants.networkSeenTotal` reads the one row `count_network_seen`, kept by
+`network_seen`'s insert and delete triggers and backfilled once behind its own row (27,000 rows to 1), so no writer
+may `INSERT OR REPLACE` into `network_seen`. Pins `crates/low-app-layer/tests/d1_hot_bounds.rs`, the ceilings in
+`tests/support/cursor_measure.rs`, the figures in `docs/D1-BUDGETS.md`.
+
 ## Storage ownership (bsv-low #474)
 
 The overlay and the app layer share ONE D1 per environment (`OVERLAY_DB`).
