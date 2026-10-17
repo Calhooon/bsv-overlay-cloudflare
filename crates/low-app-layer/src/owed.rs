@@ -4204,6 +4204,161 @@ where
     out
 }
 
+/// bsv-low #693 fold (the W1-OWED-693 lens's HIGH-1): THE PROOF LATCH. The proof set of one pass is filled only by
+/// that pass's `/tx-any` answers, and a durable spender gets at most one re-ask a pass, only from a slot phase 2
+/// left and never on a `budget_cut` pass, so a row the re-ask confirmed on pass N read "waiting for the block" again
+/// on the next pass that had no slot (or re-asked another spender). A chaintracks-checked mined proof of a spender,
+/// once in hand on any pass, is therefore LATCHED durably: a `hop_chain_probes` row keyed
+/// `proofmined:<spenderTxid>.<height>` (the memo key's shape, so the `homeproof:` range read serves it byte-free),
+/// `spent = 1`, `spendingTxid` the canonical merkle ROOT the proof was checked against at that height,
+/// `spentConfirmed = 1`. It holds the height and the root's identity, never bytes. It is written in the snapshot's
+/// atomic batch and read each pass before the pass's own answers ([`latched_proof_mined_spenders`]), so the row is
+/// served from the latch on every later pass. A reorg DEMOTES it: the overlay's reorg clear deletes every
+/// `spentConfirmed = 1` row outside the `homeproof:`/`homecursor:` prefixes (this prefix is NOT spared by it), and
+/// the TTL sweep spares it (`bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES`,
+/// pinned equal); and a latch whose root is no longer the canonical root at its height is not honoured.
+pub const PROOF_MINED_LATCH_PREFIX: &str = "proofmined:";
+/// The most proof latches one pass writes (its proofs come from at most two courier asks and one re-ask; the rest of
+/// a pass's proofs, from answers the isolate already held, are latched by a later pass, which holds them too).
+pub const OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE: usize =
+    OWED_SPENDER_COURIER_READS_PER_RECOMPUTE + OWED_DURABLE_REASKS_PER_RECOMPUTE;
+/// The most latch HEIGHTS one pass re-reads against chaintracks (a header each, cached per isolate); a latch past it
+/// is honoured on the reorg clear's word alone, as one whose header read faulted is.
+pub const OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE: usize = 4;
+
+/// One proof latch read back: the spender, the height and the root it was checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofLatch {
+    pub spender: String,
+    pub height: u64,
+    pub root: String,
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// PURE: the latch of one spender's `/tx-any` answer, ONLY for a chaintracks-checked mined word
+/// ([`crate::txany::proof_mined_word`]: `confirmed` AND a proven `height`) and the canonical root at that height. A
+/// courier's bare `confirmed`, a bare `claimed_height`, a SEEN or a fault writes nothing; nor does a missing root.
+pub fn proof_latch_memo(
+    spender: &str,
+    answer: &crate::txany::TxAnyAnswer,
+    canonical_root: Option<&str>,
+    now_ms: i64,
+) -> Option<crate::hops_view::ProbeMemo> {
+    if !crate::txany::proof_mined_word(answer) {
+        return None;
+    }
+    let height = u32::try_from(answer.height?).ok()?;
+    let root = canonical_root.filter(|r| is_hex64(r))?;
+    if !is_hex64(spender) {
+        return None;
+    }
+    Some(crate::hops_view::ProbeMemo {
+        outpoint: crate::hops_view::probe_memo_key(
+            &format!("{PROOF_MINED_LATCH_PREFIX}{}", spender.to_ascii_lowercase()),
+            height,
+        ),
+        probed_at_ms: now_ms,
+        spent: true,
+        spending_txid: Some(root.to_ascii_lowercase()),
+        spent_confirmed: Some(true),
+    })
+}
+
+/// PURE: the range binds of each spender's `proofmined:` latches, for [`home_latch_range_read_sql`] (the same
+/// indexed PK range read; `/` is the byte after `.`, so the range is exactly `proofmined:<spender>.<height>`).
+pub fn proof_latch_range_binds(spenders: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(spenders.len() * 2);
+    for sp in spenders {
+        let sp = sp.to_ascii_lowercase();
+        out.push(format!("{PROOF_MINED_LATCH_PREFIX}{sp}."));
+        out.push(format!("{PROOF_MINED_LATCH_PREFIX}{sp}/"));
+    }
+    out
+}
+
+/// PURE: the proof latches the range read returned for the named spenders. Only a well-formed latch counts: the key
+/// `proofmined:<spender>.<height>`, `spent`, `spentConfirmed = 1` and a 64-hex root.
+pub fn proof_latches_of(
+    named_spenders: &[String],
+    memos: &[crate::hops_view::ProbeMemo],
+) -> Vec<ProofLatch> {
+    let mut out = Vec::new();
+    for sp in named_spenders {
+        let sp = sp.to_ascii_lowercase();
+        let prefix = format!("{PROOF_MINED_LATCH_PREFIX}{sp}.");
+        for m in memos {
+            let Some(height) = m
+                .outpoint
+                .strip_prefix(&prefix)
+                .and_then(|h| h.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let Some(root) = m.spending_txid.as_deref().filter(|r| is_hex64(r)) else {
+                continue;
+            };
+            if m.spent && m.spent_confirmed == Some(true) {
+                out.push(ProofLatch {
+                    spender: sp.clone(),
+                    height,
+                    root: root.to_ascii_lowercase(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// PURE: the latch heights a pass re-reads against chaintracks, lowest first, at most
+/// [`OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE`].
+pub fn proof_latch_recheck_heights(latches: &[ProofLatch]) -> Vec<u64> {
+    let mut h: Vec<u64> = latches.iter().map(|l| l.height).collect();
+    h.sort_unstable();
+    h.dedup();
+    h.truncate(OWED_PROOF_LATCH_RECHECKS_PER_RECOMPUTE);
+    h
+}
+
+/// PURE: the spenders whose latch is HONOURED this pass, the seed of the pass's `proof_mined_spenders` (before its
+/// own answers). `canonical` is chaintracks' root at each re-read height (`None`: the header read faulted). A latch
+/// whose height was re-read and whose root is NOT the canonical one is not honoured (a reorg moved the block: the
+/// row waits again until a new proof, which latches at its new height); a latch whose header could not be read, or
+/// past the re-read bound, is honoured on the reorg clear's word (it was checked against chaintracks when written,
+/// and the clear deletes it on reorg evidence).
+pub fn latched_proof_mined_spenders(
+    latches: &[ProofLatch],
+    canonical: &HashMap<u64, Option<String>>,
+) -> HashSet<String> {
+    latches
+        .iter()
+        .filter(|l| match canonical.get(&l.height) {
+            Some(Some(root)) => root.eq_ignore_ascii_case(&l.root),
+            Some(None) | None => true,
+        })
+        .map(|l| l.spender.clone())
+        .collect()
+}
+
+/// PURE: the latches a pass writes: each spender this pass holds a checked proof for (`proofs`: spender, answer,
+/// the canonical root at its height) that no honoured latch already covers, the courier-bytes ones only (an
+/// index-bytes spender is judged on the index's own proof), at most [`OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE`].
+pub fn proof_latches_to_write(
+    proofs: &[(String, crate::txany::TxAnyAnswer, Option<String>)],
+    honoured: &HashSet<String>,
+    courier_spenders: &HashSet<String>,
+    now_ms: i64,
+) -> Vec<crate::hops_view::ProbeMemo> {
+    proofs
+        .iter()
+        .filter(|(sp, _, _)| !honoured.contains(sp) && courier_spenders.contains(sp))
+        .filter_map(|(sp, a, root)| proof_latch_memo(sp, a, root.as_deref(), now_ms))
+        .take(OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE)
+        .collect()
+}
+
 pub fn note_recompute(source: &str, rows: &[OwedRow]) {
     RECOMPUTES_THIS_ISOLATE.fetch_add(1, Ordering::Relaxed);
     crate::courier::note_presence(COUNTER_RECOMPUTES);
@@ -5517,7 +5672,7 @@ pub(crate) mod tests {
             "letroom=crate::owed::OWED_SPENDER_COURIER_READS_PER_RECOMPUTE.saturating_sub(courier_reads);",
             "crate::owed::durable_reasks(candidates,room,&over_budget,",
             "ifr.courier_asked{courier_reads+=1;",
-            "ifr.outcome==crate::owed::DurableReaskOutcome::MinedByProof{proof_mined_spenders.insert(r.spender);}",
+            "ifr.outcome==crate::owed::DurableReaskOutcome::MinedByProof{proof_answers.push((r.spender.clone(),a));proof_mined_spenders.insert(r.spender);}",
             "if!budget_cut&&!durable_unconfirmed.is_empty(){",
         ] {
             assert!(routes.contains(wired), "the route's phase 2b: {wired}");
@@ -5526,12 +5681,13 @@ pub(crate) mod tests {
 
     /// bsv-low #693 (d), the #692 lens's LOW-1, a STATED residual: the index-hop-row arm (`spent == true`) is not
     /// memo-upgraded because that arm confirms from the index's own `spent_confirmed` and never reads a chain-rung
-    /// memo: a confirmed memo naming the sweep leaves its row unconfirmed (so the upgrade would change nothing). The
-    /// flap is closed by the re-ask instead: the arm's durable spender IS a candidate while the index's word is
-    /// unconfirmed, and its checked proof confirms the row (`confirmedSource = "proof"`). The route's filter and its
-    /// stated reason stand (source pin).
+    /// memo: a confirmed memo naming the sweep leaves its row unconfirmed (so the upgrade would change nothing). What
+    /// THIS pin proves is ONE pass: the arm's durable spender IS a re-ask candidate while the index's word is
+    /// unconfirmed, and that pass's checked proof confirms the row (`confirmedSource = "proof"`). Across passes the
+    /// row is held by the proof LATCH (the W1-OWED-693 lens's HIGH-1: latched once checked, served from the latch on
+    /// every later pass), pinned by `e693f_h1_*`. The route's filter and its stated reason stand (source pin).
     #[test]
-    fn e693_d_the_index_arm_reads_no_memo_and_its_flap_is_closed_by_the_re_ask() {
+    fn e693_d_the_index_arm_reads_no_memo_and_one_pass_s_re_ask_confirms_it() {
         let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
         let sweep = tx(0x0e);
         let my_pkh = "cc".repeat(20);
@@ -5580,6 +5736,386 @@ pub(crate) mod tests {
         assert!(
             routes.contains("&& r.facts.get(\"spent\").and_then(|v| v.as_bool()) != Some(true)")
         );
+    }
+
+    /// bsv-low #693 fold: the latch range read over real SQLite, as the route's `read_proof_latches` makes it (the
+    /// shipped `home_latch_range_read_sql` with `proof_latch_range_binds`).
+    fn e693f_read_latches(
+        conn: &rusqlite::Connection,
+        spenders: &[String],
+    ) -> Vec<crate::hops_view::ProbeMemo> {
+        let binds = proof_latch_range_binds(spenders);
+        let mut stmt = conn
+            .prepare(&home_latch_range_read_sql(spenders.len()))
+            .unwrap();
+        stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+            Ok(crate::hops_view::ProbeMemo {
+                outpoint: r.get(0)?,
+                probed_at_ms: r.get::<_, i64>(1)?,
+                spent: r.get::<_, i64>(2)? != 0,
+                spending_txid: r.get(3)?,
+                spent_confirmed: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+            })
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    const E693F_ROOT: &str = "abababababababababababababababababababababababababababababababab";
+
+    /// bsv-low #693 fold: ONE pass of the route's proof path over real SQLite, in the route's order: the durable
+    /// spenders' latches read and honoured (the seed), the re-ask candidates (no honoured latch, still needing the
+    /// proof), the re-ask under `room` unless `budget_cut`, then this pass's checked proofs latched through the
+    /// shipped memo upsert. `mined` is what the courier's `/tx-any` would prove. Returns the proof set and the asks.
+    #[allow(clippy::too_many_arguments)]
+    fn e693f_pass(
+        conn: &rusqlite::Connection,
+        durable: &[String],
+        hops: &[HopEntry],
+        courier: &HashSet<String>,
+        room: usize,
+        budget_cut: bool,
+        mined: &HashSet<String>,
+        canonical: &HashMap<u64, Option<String>>,
+    ) -> (HashSet<String>, Vec<String>) {
+        let latches = proof_latches_of(durable, &e693f_read_latches(conn, durable));
+        let latched = latched_proof_mined_spenders(&latches, canonical);
+        let mut proof = latched.clone();
+        let candidates: Vec<String> = durable
+            .iter()
+            .filter(|sp| !latched.contains(*sp))
+            .filter(|sp| {
+                durable_spender_needs_proof(sp, hops, &HashMap::new(), &HashMap::new(), None)
+            })
+            .cloned()
+            .collect();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut answers = Vec::new();
+        if !budget_cut {
+            let reasks = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(durable_reasks(
+                    candidates,
+                    room,
+                    || false,
+                    |sp| {
+                        asked.borrow_mut().push(sp.clone());
+                        let m = mined.contains(&sp);
+                        async move { (e693_answer(m), true) }
+                    },
+                ));
+            for (r, a) in reasks {
+                if r.outcome == DurableReaskOutcome::MinedByProof {
+                    proof.insert(r.spender.clone());
+                    answers.push((r.spender, a, Some(E693F_ROOT.to_string())));
+                }
+            }
+        }
+        let writes = proof_latches_to_write(&answers, &latched, courier, 1_800_000_000_000);
+        write_memos(conn, &writes);
+        (proof, asked.into_inner())
+    }
+
+    /// bsv-low #693 fold (the W1-OWED-693 lens's HIGH-1): LATCHED ONCE CHECKED, SERVED FROM THE LATCH ON EVERY LATER
+    /// PASS. Two index-arm rows (the index names each hop's sweep spent, unconfirmed), both sweeps' bytes in the
+    /// durable store. Pass N re-asks sweep A, whose `/tx-any` carries a checked mined proof: row A reads "home on
+    /// chain" (`confirmedSource = "proof"`) and the proof is latched. Then the lens's three cases, each a later pass
+    /// that makes no confirming ask of A: (a) the never-asked-first order puts B first and B's answer is unmined, (b)
+    /// no slot (room 0), (c) `budget_cut`. Row A still reads "home on chain" from the latch, and A is never re-asked.
+    /// The TTL sweep (the overlay's shipped statement) leaves the latch. RED on `e30e445` (no latch: the proof set of
+    /// each later pass is empty and row A read `UNCONFIRMED_PAYOUT_REASON`; the API does not compile there, and the
+    /// mutant `latched_proof_mined_spenders` answering empty is RED here).
+    #[test]
+    fn e693f_h1_a_checked_proof_is_latched_and_served_on_every_later_pass_real_sqlite() {
+        use bsv_overlay_cloudflare::hop_probe_memos::{
+            HOP_PROBE_MEMO_EXPIRE_SQL, HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES,
+        };
+        assert_eq!(
+            HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES,
+            [PROOF_MINED_LATCH_PREFIX]
+        );
+        let conn = memo_db();
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let (sweep_a, sweep_b) = (tx(0x0e), tx(0x0d));
+        let my_pkh = "cc".repeat(20);
+        let mut mine = pays(&sweep_a, &[(0, &my_pkh, 20_000, None)]);
+        mine.extend(pays(&sweep_b, &[(0, &my_pkh, 20_000, None)]));
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        let mut hop_a = hop(HopStatus::Spent, Some(&sweep_a), Some(10_000_000));
+        hop_a.spent_confirmed = Some(false);
+        let mut hop_b = hop(HopStatus::Spent, Some(&sweep_b), Some(10_000_000));
+        hop_b.spent_confirmed = Some(false);
+        hop_b.hop_txid = tx(0x08);
+        let hops = [hop_a, hop_b];
+        let mut spends: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends.insert(sweep_a.clone(), vec![(tx(0x07), 0)]);
+        spends.insert(sweep_b.clone(), vec![(tx(0x08), 0)]);
+        let courier: HashSet<String> = [sweep_a.clone(), sweep_b.clone()].into();
+        let row_a = |proof: &HashSet<String>| -> OwedRow {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.spender_outputs = &mine;
+            i.spender_inputs = &spends;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = &courier;
+            i.proof_mined_spenders = proof;
+            let rows = derive_owed_rows(&i);
+            let r = rows
+                .into_iter()
+                .find(|r| r.facts["sweepTxid"] == sweep_a.as_str())
+                .expect("row A");
+            assert_eq!(r.facts["spent"], true, "the index-hop-row arm");
+            assert_eq!(
+                r.facts["claimable"], false,
+                "a courier-bytes row is never claimable"
+            );
+            r
+        };
+        let checked: HashMap<u64, Option<String>> =
+            [(900_000u64, Some(E693F_ROOT.to_string()))].into();
+        let a_mined: HashSet<String> = [sweep_a.clone()].into();
+        let none: HashSet<String> = HashSet::new();
+        // pass N: a slot, A re-asked, its proof confirms the row and is latched
+        let (proof, asked) = e693f_pass(
+            &conn,
+            &[sweep_a.clone(), sweep_b.clone()],
+            &hops,
+            &courier,
+            1,
+            false,
+            &a_mined,
+            &checked,
+        );
+        assert_eq!(asked, vec![sweep_a.clone()]);
+        assert_eq!(row_a(&proof).facts["confirmedSource"], "proof");
+        let latches = proof_latches_of(
+            std::slice::from_ref(&sweep_a),
+            &e693f_read_latches(&conn, std::slice::from_ref(&sweep_a)),
+        );
+        assert_eq!(
+            latches,
+            vec![ProofLatch {
+                spender: sweep_a.clone(),
+                height: 900_000,
+                root: E693F_ROOT.to_string()
+            }],
+            "the height and the root, never bytes"
+        );
+        // the overlay's TTL sweep, far past every window, leaves the latch
+        conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![i64::MAX])
+            .unwrap();
+        for (case, order, room, cut) in [
+            (
+                "(a) B first, its answer unmined",
+                [sweep_b.clone(), sweep_a.clone()],
+                1usize,
+                false,
+            ),
+            ("(b) no slot", [sweep_a.clone(), sweep_b.clone()], 0, false),
+            (
+                "(c) budget_cut",
+                [sweep_a.clone(), sweep_b.clone()],
+                2,
+                true,
+            ),
+        ] {
+            let (proof, asked) =
+                e693f_pass(&conn, &order, &hops, &courier, room, cut, &none, &checked);
+            assert!(
+                !asked.contains(&sweep_a),
+                "{case}: a latched spender is never re-asked"
+            );
+            let r = row_a(&proof);
+            assert_eq!(r.facts["confirmedSource"], "proof", "{case}");
+            assert_eq!(
+                r.facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON,
+                "{case}"
+            );
+            // a header read that faulted honours the latch too (the reorg clear is what demotes it)
+            let fault: HashMap<u64, Option<String>> = [(900_000u64, None)].into();
+            let (proof, _) = e693f_pass(&conn, &order, &hops, &courier, room, cut, &none, &fault);
+            assert_eq!(
+                row_a(&proof).facts["confirmedSource"],
+                "proof",
+                "{case}, header fault"
+            );
+        }
+        // the route wiring: the seed before the candidates, the candidates without a latched spender, the latch in
+        // the snapshot batch, the read through the shipped range read
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        let seed = "proof_latched=crate::owed::latched_proof_mined_spenders(&latches,&canonical);proof_mined_spenders.extend(proof_latched.iter().cloned());";
+        let cands = ".filter(|sp|!proof_latched.contains(*sp))";
+        let reask = "crate::owed::durable_reasks(candidates,room,&over_budget,";
+        for wired in [
+            seed,
+            cands,
+            reask,
+            "proof_answers.push((r.spender.clone(),a));",
+            "forlatchincrate::owed::proof_latches_to_write(&proofs_to_latch,&proof_latched,&courier_spenders,now_ms,){",
+            ".prepare(crate::hops_view::PROBE_MEMO_UPSERT_SQL)",
+            "read_latch_ranges(db,spenders,crate::owed::proof_latch_range_binds).await",
+        ] {
+            assert!(routes.contains(wired), "the route's latch: {wired}");
+        }
+        assert!(routes.find(seed).unwrap() < routes.find(cands).unwrap());
+        assert!(routes.find(cands).unwrap() < routes.find(reask).unwrap());
+    }
+
+    /// bsv-low #693 fold (HIGH-1 (b)): A REORG DEMOTES THE LATCH. The overlay's shipped reorg clear deletes it (a mined
+    /// proof is a chain word, never spared), and the next pass with no slot reads row A "waiting for the block" again
+    /// until a new proof latches. A latch whose root is no longer chaintracks' root at its height is not honoured
+    /// either (a reorg the clear has not yet run for). To red: spare `proofmined:` in the clear, or honour a moved root.
+    #[test]
+    fn e693f_h1_b_a_reorg_demotes_the_latch_and_the_row_waits_again_real_sqlite() {
+        use bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_REORG_CLEAR_SQL;
+        let conn = memo_db();
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let sweep = tx(0x0e);
+        let my_pkh = "cc".repeat(20);
+        let mine = pays(&sweep, &[(0, &my_pkh, 20_000, None)]);
+        let mut pkhs: HashMap<String, String> = HashMap::new();
+        pkhs.insert(tx(0x01), my_pkh.clone());
+        let mut h = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        h.spent_confirmed = Some(false);
+        let hops = [h];
+        let mut spends: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        spends.insert(sweep.clone(), vec![(tx(0x07), 0)]);
+        let courier: HashSet<String> = [sweep.clone()].into();
+        let reason = |proof: &HashSet<String>| -> serde_json::Value {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.spender_outputs = &mine;
+            i.spender_inputs = &spends;
+            i.my_pkh_by_game = &pkhs;
+            i.courier_spenders = &courier;
+            i.proof_mined_spenders = proof;
+            derive_owed_rows(&i)[0].facts["claimReason"].clone()
+        };
+        let checked: HashMap<u64, Option<String>> =
+            [(900_000u64, Some(E693F_ROOT.to_string()))].into();
+        let mined: HashSet<String> = [sweep.clone()].into();
+        let none: HashSet<String> = HashSet::new();
+        let s = std::slice::from_ref(&sweep);
+        let (proof, _) = e693f_pass(&conn, s, &hops, &courier, 1, false, &mined, &checked);
+        assert_eq!(reason(&proof), COURIER_BYTES_NO_CREDIT_REASON);
+        let (proof, _) = e693f_pass(&conn, s, &hops, &courier, 0, false, &none, &checked);
+        assert_eq!(
+            reason(&proof),
+            COURIER_BYTES_NO_CREDIT_REASON,
+            "served from the latch"
+        );
+        // a moved root at the latch's height: not honoured
+        let moved: HashMap<u64, Option<String>> = [(900_000u64, Some("cd".repeat(32)))].into();
+        let (proof, _) = e693f_pass(&conn, s, &hops, &courier, 0, false, &none, &moved);
+        assert_eq!(
+            reason(&proof),
+            UNCONFIRMED_PAYOUT_REASON,
+            "a moved root is not honoured"
+        );
+        // the overlay's reorg clear takes the latch
+        assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 1);
+        assert!(e693f_read_latches(&conn, s).is_empty());
+        let (proof, _) = e693f_pass(&conn, s, &hops, &courier, 0, false, &none, &checked);
+        assert_eq!(
+            reason(&proof),
+            UNCONFIRMED_PAYOUT_REASON,
+            "the row waits for the block again"
+        );
+        // the next checked proof latches again
+        let (proof, asked) = e693f_pass(&conn, s, &hops, &courier, 1, false, &mined, &checked);
+        assert_eq!(
+            (asked.len(), reason(&proof)),
+            (1, COURIER_BYTES_NO_CREDIT_REASON.into())
+        );
+        assert_eq!(proof_latches_of(s, &e693f_read_latches(&conn, s)).len(), 1);
+    }
+
+    /// bsv-low #693 fold (HIGH-1 (c)): A LATCH NEVER EXISTS WITHOUT A CHECKED PROOF. Only `proof_mined_word` (confirmed
+    /// AND a proven height) and a canonical root write one: a courier's bare `confirmed`, a bare claimed height, a SEEN,
+    /// a fault or a missing root writes nothing; nor does an index-bytes spender (not courier-bytes), nor one a
+    /// latch already covers. A malformed row read back is no latch. To red: latch on `confirmed` alone.
+    #[test]
+    fn e693f_h1_c_a_latch_never_exists_without_a_checked_proof() {
+        let sp = tx(0x0e);
+        let root = Some(E693F_ROOT);
+        assert!(proof_latch_memo(&sp, &e693_answer(true), root, 1).is_some());
+        let bare_confirmed = crate::txany::TxAnyAnswer {
+            confirmed: Some(true),
+            height: None,
+            ..e693_answer(false)
+        };
+        let bare_height = crate::txany::TxAnyAnswer {
+            claimed_height: Some(900_000),
+            ..e693_answer(false)
+        };
+        for (what, a) in [
+            ("a bare confirmed", bare_confirmed),
+            ("a bare claimed height", bare_height),
+            ("a SEEN", e693_answer(false)),
+            ("a fault", crate::txany::TxAnyAnswer::default()),
+        ] {
+            assert!(proof_latch_memo(&sp, &a, root, 1).is_none(), "{what}");
+        }
+        assert!(
+            proof_latch_memo(&sp, &e693_answer(true), None, 1).is_none(),
+            "no root"
+        );
+        assert!(
+            proof_latch_memo(&sp, &e693_answer(true), Some("zz"), 1).is_none(),
+            "a malformed root"
+        );
+        let courier: HashSet<String> = [sp.clone()].into();
+        let proofs = vec![(sp.clone(), e693_answer(true), root.map(str::to_string))];
+        assert_eq!(
+            proof_latches_to_write(&proofs, &HashSet::new(), &courier, 1).len(),
+            1
+        );
+        assert!(
+            proof_latches_to_write(&proofs, &HashSet::new(), &HashSet::new(), 1).is_empty(),
+            "index-bytes"
+        );
+        assert!(
+            proof_latches_to_write(&proofs, &courier, &courier, 1).is_empty(),
+            "already latched"
+        );
+        // the bound
+        let many: Vec<_> = (0x30u8..0x38)
+            .map(|b| (tx(b), e693_answer(true), root.map(str::to_string)))
+            .collect();
+        let all: HashSet<String> = many.iter().map(|(s, _, _)| s.clone()).collect();
+        assert_eq!(
+            proof_latches_to_write(&many, &HashSet::new(), &all, 1).len(),
+            OWED_PROOF_LATCH_WRITES_PER_RECOMPUTE
+        );
+        // a row that is not a whole latch is no latch
+        let key = |h: &str| format!("{PROOF_MINED_LATCH_PREFIX}{sp}.{h}");
+        let memo =
+            |k: String, confirmed: Option<bool>, root: Option<&str>| crate::hops_view::ProbeMemo {
+                outpoint: k,
+                probed_at_ms: 1,
+                spent: true,
+                spending_txid: root.map(str::to_string),
+                spent_confirmed: confirmed,
+            };
+        let s = std::slice::from_ref(&sp);
+        for bad in [
+            memo(key("900000"), None, root),
+            memo(key("900000"), Some(true), None),
+            memo(key("x"), Some(true), root),
+            memo(format!("{HOME_SPEND_LATCH_PREFIX}{sp}.0"), Some(true), root),
+        ] {
+            assert!(
+                proof_latches_of(s, std::slice::from_ref(&bad)).is_empty(),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            proof_latches_of(s, &[memo(key("900000"), Some(true), root)]).len(),
+            1
+        );
+        assert_eq!(proof_latch_recheck_heights(&[]).len(), 0);
     }
 
     /// bsv-low #662 (live 2026-10-14 00:35:35Z, pair 19, hop d4029675ccb65a4b:0, sweep 96448ef1fc3b): pass B judged

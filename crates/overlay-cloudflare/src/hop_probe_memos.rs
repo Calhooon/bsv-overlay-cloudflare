@@ -70,6 +70,13 @@ pub const HOP_PROBE_MEMO_TTL_MS: i64 = 2 * 60 * 60_000;
 /// tests, which link this crate). Neither rule below touches them, nor counts them.
 pub const HOP_PROBE_MEMO_APP_LAYER_PREFIXES: [&str; 2] = ["homeproof:", "homecursor:"];
 
+/// The app layer's rows that a REORG demotes and no window ages (bsv-low #693 fold, the W1-OWED-693 lens's HIGH-1):
+/// its proof latch (`proofmined:<spenderTxid>.<height>`, a chaintracks-checked mined proof of a spender: the height
+/// and the canonical root, `spentConfirmed = 1`; `low-app-layer` `owed::PROOF_MINED_LATCH_PREFIX`, pinned equal).
+/// A mined proof is a CHAIN word, so rule 1 deletes it like any confirmed memo (it is not spared); rule 2 spares it,
+/// so the latch outlives the two-hour window and the row it confirms stops flapping across passes.
+pub const HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES: [&str; 1] = ["proofmined:"];
+
 /// Rule 1: every memo that recorded a CONFIRMED spend, never the app layer's own rows (a latch written from a
 /// confirmed probe carries `spentConfirmed = 1` too).
 pub const HOP_PROBE_MEMO_REORG_CLEAR_SQL: &str =
@@ -77,9 +84,9 @@ pub const HOP_PROBE_MEMO_REORG_CLEAR_SQL: &str =
 
 /// Rule 2: every memo no reader honours (bind: `now - HOP_PROBE_MEMO_TTL_MS`; the reader refuses
 /// `age >= window`, so the row read exactly at the bound goes too: the lens's N2), never the reorg tombstone,
-/// never the app layer's own rows.
+/// never the app layer's own rows (its proof latch included: [`HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES`]).
 pub const HOP_PROBE_MEMO_EXPIRE_SQL: &str =
-    "DELETE FROM hop_chain_probes WHERE probedAtMs <= ? AND outpoint <> 'reorg-clear.0' AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%'";
+    "DELETE FROM hop_chain_probes WHERE probedAtMs <= ? AND outpoint <> 'reorg-clear.0' AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%' AND outpoint NOT LIKE 'proofmined:%'";
 
 /// Rule 3: the tombstone's key in `hop_chain_probes.outpoint`. It has the memo key's shape (`<txid>.<vout>`)
 /// with a txid no transaction has, so the app layer reads it in the same `IN` read as the memos it judges (one
@@ -361,6 +368,39 @@ mod tests {
         assert!(!HOP_PROBE_MEMO_APP_LAYER_PREFIXES
             .iter()
             .any(|p| HOP_PROBE_MEMO_REORG_MARK.starts_with(p)));
+    }
+
+    /// bsv-low #693 fold (HIGH-1), real SQLite: the app layer's proof latch is a CHAIN word, so the reorg clear takes
+    /// it (it is not spared) and the TTL sweep does not (it outlives the window). To red: spare the prefix in the
+    /// clear, or drop it from the sweep.
+    #[test]
+    fn the_reorg_clear_takes_the_proof_latch_and_the_ttl_sweep_spares_it_real_sqlite() {
+        let conn = db();
+        let latch = format!(
+            "{}{}.900000",
+            HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES[0],
+            "ab".repeat(32)
+        );
+        plant(&conn, &latch, 5, true, Some(true));
+        plant(&conn, "a.0", 5, true, None);
+        assert_eq!(
+            conn.execute(HOP_PROBE_MEMO_EXPIRE_SQL, rusqlite::params![i64::MAX])
+                .unwrap(),
+            1,
+            "the memo past the window, not the latch"
+        );
+        assert_eq!(held(&conn), vec![latch]);
+        assert_eq!(
+            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(),
+            1,
+            "a reorg demotes the latch"
+        );
+        assert!(held(&conn).is_empty());
+        for prefix in HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES {
+            assert!(HOP_PROBE_MEMO_EXPIRE_SQL.contains(&format!("outpoint NOT LIKE '{prefix}%'")));
+            assert!(!HOP_PROBE_MEMO_REORG_CLEAR_SQL.contains(prefix));
+            assert!(!prefix.contains(['%', '_']), "no LIKE wildcard in a prefix");
+        }
     }
 
     /// bsv-low #484 (lens fold, M2), the tombstone over the SHIPPED schema (real SQLite): the clear stamps one
