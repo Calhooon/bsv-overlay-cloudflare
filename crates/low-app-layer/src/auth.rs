@@ -668,9 +668,15 @@ pub enum AuthFaultClass {
 /// (`storage/kv_session.rs`, `storage/do_session.rs`, and `From<worker::Error>`,
 /// which maps EVERY bare-`?` worker error to it). The converse does not hold in
 /// the crate: a caller's over-long nonce or handshake body also comes back
-/// `KvError` (the platform refusing the key or value), so the door refuses
-/// those inputs first (`auth_input_guard`, the lens's HIGH-1); with the guard,
-/// a `KvError` at the door is the store's.
+/// `KvError` (the platform refusing the key or value), so the door refuses an
+/// over-long input first (`auth_input_guard`, the lens's HIGH-1). The guard
+/// bounds each input once; it does not make every `KvError` the store's: on the
+/// DO backend a caller's own session cell ACCUMULATES its consumed nonces (up
+/// to the crate's `CONSUMED_CAP`, consumed before the signature is checked, the
+/// whole cell one value under the 128 KiB cap), so the guard's bounds are sized
+/// for the cell (round 2's R2-HIGH-1, pinned by `s670_i`), and the crate's own
+/// fix (a cell capped in bytes, or the consume after the signature) is asked
+/// upstream: <https://github.com/Calhooon/bsv-middleware-cloudflare/issues/14>.
 pub fn auth_fault_class(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> AuthFaultClass {
     use bsv_middleware_cloudflare::AuthCloudflareError as E;
     match e {
@@ -768,19 +774,33 @@ pub fn auth_unavailable_log_line(e: &bsv_middleware_cloudflare::AuthCloudflareEr
 // crate raises as `KvError`, the store-fault class: a stranger could raise the
 // 503 (and `auth_handshake_unavailable_total`) at will. The door refuses those
 // inputs FIRST, with the pre-#670 400.
+//
+// The bounds are sized for the DO cell, not one input (round 2's R2-HIGH-1):
+// the cell holds the session (its `peer_nonce` from the handshake body) and up
+// to `CONSUMED_CAP` consumed nonces, each consumed before the signature is
+// checked, so a stranger on its own session fills its own cell with unsigned
+// messages. `CONSUMED_CAP x (AUTH_NONCE_MAX_BYTES + 16) +
+// AUTH_HANDSHAKE_BODY_MAX_BYTES + 1,024` is 103,424 bytes, under 131,072
+// (`s670_i`); at the old 128 / 16 KiB it was 164,864 and the lens's model of
+// the structured clone 139,952 to 155,909, so the cell overran and every later
+// request on that session was the 503 (and a count) until the session's TTL.
 
 /// The longest nonce header handed to the middleware. The reference's nonce
 /// (`createNonce`: 16 random bytes + a 16-byte HMAC, base64) is 44 characters;
 /// the server's session nonce is the same shape. 128 leaves room for any
-/// encoding and keeps every derived KV key under the 512-byte limit.
-pub const AUTH_NONCE_MAX_BYTES: usize = 128;
+/// encoding, keeps every derived KV key under the 512-byte limit, and keeps the
+/// worst DO session cell under the 128 KiB value cap (`s670_i`).
+pub const AUTH_NONCE_MAX_BYTES: usize = 80;
 /// The longest `/.well-known/auth` body handed to the middleware. A real
 /// InitialRequest is 246 bytes (`s670_e` builds and measures one); the app
 /// layer requests no certificates, so no honest handshake carries a
 /// certificate list. The reference bounds an auth message at 16 MiB
-/// (`MAX_AUTH_MESSAGE_BYTES`) and a handshake RESPONSE at 1 MiB; 16 KiB is
-/// ours, under the DO's 128 KiB value cap.
-pub const AUTH_HANDSHAKE_BODY_MAX_BYTES: usize = 16 * 1024;
+/// (`MAX_AUTH_MESSAGE_BYTES`) and a handshake RESPONSE at 1 MiB; 4 KiB is
+/// ours: a certificate-bearing request (5 certifiers x 5 types x 5 fields)
+/// measured 1,049 bytes with the client's SDK 2.1.4 (bsv-low
+/// `docs/audit/W1-DOOR-670-lens-2-2026-10-17.md`, question 1), and the body
+/// bounds the session's `peer_nonce` in the cell (`s670_i`).
+pub const AUTH_HANDSHAKE_BODY_MAX_BYTES: usize = 4 * 1024;
 /// Every `x-bsv-auth-*` header the middleware turns into a storage key or a
 /// stored value. The others are parsed to a fixed shape before any store call
 /// (the identity key a public key, the request id 32 bytes, the signature
@@ -1323,38 +1343,44 @@ mod tests {
         for header in [h::YOUR_NONCE, h::NONCE, h::INITIAL_NONCE] {
             let get = |name: &str| (name == header).then(|| long.clone());
             let reason = auth_nonce_oversize(get).expect(header);
-            assert_eq!(reason, format!("{header} over 128 bytes"));
+            assert_eq!(reason, format!("{header} over 80 bytes"));
             let (status, body) = auth_oversize_answer(&reason);
             assert_eq!(status, 400);
             assert_eq!(
                 serde_json::to_string(&body).unwrap(),
-                format!(
-                    r#"{{"error":"authentication handshake failed: {header} over 128 bytes"}}"#
-                )
+                format!(r#"{{"error":"authentication handshake failed: {header} over 80 bytes"}}"#)
             );
         }
         let nonce = bsv_middleware_cloudflare::core::auth::generate_random_nonce();
         assert_eq!(nonce.len(), 44);
         let at = |n: usize| move |name: &str| (name == h::YOUR_NONCE).then(|| "n".repeat(n));
         assert_eq!(auth_nonce_oversize(|_| Some(nonce.clone())), None);
-        assert_eq!(auth_nonce_oversize(at(128)), None);
-        assert!(auth_nonce_oversize(at(129)).is_some());
+        assert_eq!(auth_nonce_oversize(at(80)), None);
+        assert!(auth_nonce_oversize(at(81)).is_some());
+        // Round 2's R2-HIGH-1: a 100-byte nonce (accepted under the old 128) is
+        // the 400; at 100 bytes 1,024 consumed entries fill a session cell to
+        // about 111 KB, at 128 past the DO's 128 KiB value cap.
+        assert_eq!(
+            auth_nonce_oversize(at(100)).as_deref(),
+            Some("x-bsv-auth-your-nonce over 80 bytes")
+        );
         assert_eq!(auth_nonce_oversize(|_| None), None);
+        // An 8 KiB handshake body is over (accepted under the old 16 KiB).
         let mut buf = Vec::new();
         let chunk = vec![b'x'; 1024];
-        let fits = (0..17)
+        let fits = (0..8)
             .take_while(|_| push_bounded(&mut buf, &chunk))
             .count();
         assert_eq!(
             (fits, buf.len()),
-            (16, 16 * 1024),
+            (4, 4 * 1024),
             "the read stops at the bound"
         );
         assert_eq!(
-            handshake_body_oversize(17 * 1024).as_deref(),
-            Some("handshake body over 16384 bytes")
+            handshake_body_oversize(8 * 1024).as_deref(),
+            Some("handshake body over 4096 bytes")
         );
-        assert_eq!(handshake_body_oversize(16 * 1024), None);
+        assert_eq!(handshake_body_oversize(4 * 1024), None);
         let key = bsv_rs::primitives::PrivateKey::from_hex(&format!("{:064x}", 2)).unwrap();
         let mut m = bsv_rs::auth::AuthMessage::new(
             bsv_rs::auth::MessageType::InitialRequest,
@@ -1390,6 +1416,47 @@ mod tests {
                 .count(),
             1,
             "the oversize 400 is counted apart"
+        );
+    }
+
+    /// (i) Round 2's R2-HIGH-1: on the DO backend the per-request nonce is
+    /// consumed into the caller's own session cell BEFORE the signature is
+    /// checked, and the cell is stored whole as one value under the DO's
+    /// 128 KiB cap. With the crate's `CONSUMED_CAP` read from the crate (a bump
+    /// of the cap reds here), the worst cell the guard admits stays under it:
+    /// `CONSUMED_CAP x (nonce + 16) + handshake body + 1,024 < 128 KiB`.
+    #[test]
+    fn s670_i_the_worst_session_cell_fits_the_do_value_cap() {
+        use bsv_middleware_cloudflare::storage::do_session::CONSUMED_CAP;
+        const DO_VALUE_CAP: usize = 128 * 1024;
+        // The cell bound: per consumed entry its key, a 16-byte allowance for
+        // the structured clone's tags, the key's length varint and the expiry
+        // (a double, 9 bytes); the session's `peer_nonce` is bounded by the
+        // handshake body; 1,024 for the session's fixed fields.
+        let bound = |nonce: usize, peer: usize| CONSUMED_CAP * (nonce + 16) + peer + 1_024;
+        assert_eq!(CONSUMED_CAP, 1_024, "bsv-middleware-cloudflare =0.6.2");
+        let worst = bound(AUTH_NONCE_MAX_BYTES, AUTH_HANDSHAKE_BODY_MAX_BYTES);
+        assert_eq!(worst, 103_424);
+        assert!(worst < DO_VALUE_CAP, "{worst} >= {DO_VALUE_CAP}");
+        // The cell MODEL (round 2's R2-HIGH-1 table: Node's `v8.serialize` of
+        // the cell's structured clone, a JS Map of 1,024 entries, measured by
+        // the lens): (nonce, peer_nonce, serialized). The bound dominates every
+        // measured row, so it is an upper bound and not a guess, and the old
+        // bounds (128, 16 KiB) model over the cap.
+        for (nonce, peer, measured) in [
+            (44, 44, 55_207),
+            (64, 44, 75_147),
+            (64, 16_000, 91_104),
+            (100, 44, 111_039),
+            (110, 44, 121_009),
+            (128, 44, 139_952),
+            (128, 16_000, 155_909),
+        ] {
+            assert!(bound(nonce, peer) >= measured, "({nonce}, {peer})");
+        }
+        assert!(
+            bound(128, 16 * 1024) > DO_VALUE_CAP,
+            "the old bounds overrun"
         );
     }
 

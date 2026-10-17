@@ -175,17 +175,30 @@ async fn s670_g_the_guard_on_real_requests() {
     assert_eq!(resp.headers().get("Retry-After").unwrap(), None);
     assert_eq!(
         resp.text().await.unwrap(),
-        r#"{"error":"authentication handshake failed: x-bsv-auth-your-nonce over 128 bytes"}"#
+        r#"{"error":"authentication handshake failed: x-bsv-auth-your-nonce over 80 bytes"}"#
     );
-    // A 17 KiB handshake body: the 400.
-    let big = request("/.well-known/auth", &[], Some(&vec![b' '; 17 * 1024]));
+    // Round 2's R2-HIGH-1: a 100-byte per-request nonce is the 400 too.
+    let hundred = request(
+        "/owed",
+        &[("x-bsv-auth-nonce", "A".repeat(100))],
+        Some(b"{}"),
+    );
+    let Err(mut resp) = auth_input_guard(hundred).await.unwrap() else {
+        panic!("a 100-byte nonce must not reach the middleware");
+    };
+    assert_eq!(
+        resp.text().await.unwrap(),
+        r#"{"error":"authentication handshake failed: x-bsv-auth-nonce over 80 bytes"}"#
+    );
+    // An 8 KiB handshake body: the 400.
+    let big = request("/.well-known/auth", &[], Some(&vec![b' '; 8 * 1024]));
     let Err(mut resp) = auth_input_guard(big).await.unwrap() else {
-        panic!("a 17 KiB handshake body must not reach the middleware");
+        panic!("an 8 KiB handshake body must not reach the middleware");
     };
     assert_eq!(resp.status_code(), 400);
     assert_eq!(
         resp.text().await.unwrap(),
-        r#"{"error":"authentication handshake failed: handshake body over 16384 bytes"}"#
+        r#"{"error":"authentication handshake failed: handshake body over 4096 bytes"}"#
     );
     // A real handshake passes, re-built with the same method, URL, headers
     // and bytes.
