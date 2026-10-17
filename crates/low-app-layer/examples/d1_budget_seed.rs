@@ -106,6 +106,8 @@ fn main() {
     rows.push(format!("UPDATE potparty_records SET seatSettlePubkey='{ID_A}', seatSigHex='00', sigValid=1 WHERE identity='{ID_A}'"));
     rows.extend(d1_fleet::rows(now_s));
     let l23_start = rows.len();
+    // executed whole (its bytes JSON holds commas): after `l23_start`
+    rows.extend(identity_a_durable_spender_rows(now_s));
     rows.extend(l23_r2_route_rows(now_s));
     // NS-3 route pins: separate subjects, untouched by the budget scenarios.
     let parent = "f1".repeat(32);
@@ -149,6 +151,34 @@ fn main() {
         cursor_measure::write(&conn, &path, now_s, d1_fleet::WHALE);
     }
     print!("{out}");
+}
+
+/// bsv-low #693 fold-2 / #723: identity A's one swept hop whose sweep is a DURABLE spender (its bytes in the
+/// spender store) with a `proofmined:` latch past the #484 grace, so A's owed recompute makes the latch range read
+/// (`owed-first-read`) and serves the row from the latch. A synthetic hop and sweep: no transaction is broadcast.
+fn identity_a_durable_spender_rows(now_s: u64) -> Vec<String> {
+    let hop = "a7".repeat(32);
+    let sweep = "a8".repeat(32);
+    // A's first game (pot `aa..0`, seat A, payPkhA `11..`): the sweep pays A's committed home
+    let game = format!("a0{:062x}", 0);
+    let bytes = low_app_layer::owed::StoredSpenderBytes {
+        inputs: vec![(hop.clone(), 0)],
+        outputs: vec![low_app_layer::owed::StoredSpenderOutput {
+            vout: 0,
+            pkh: Some("11".repeat(20)),
+            sats: 19_800,
+            pot: false,
+        }],
+    }
+    .to_json_capped()
+    .expect("under the cap");
+    let latched_at_ms = now_s * 1000 - 40 * 60_000;
+    vec![
+        format!("INSERT INTO hopparty_records (identity, opponentIdentity, gameId, hopVout, hopSats, seatSettlePubkey, seatSigHex, identitySigHex, hopLockHex, hopSatsOnChain, containerOutputs, markerValid, txid, outputIndex, createdAt) VALUES ('{ID_A}', '{ID_B}', '{game}', 0, 20000, '{ID_A}', '00', '00', 'aa', 20000, 3, 1, '{hop}', 2, {now_s})"),
+        format!("INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt) VALUES ('{hop}', 0, 1, '{sweep}', 0, {now_s})"),
+        format!("INSERT INTO owed_spender_bytes (txid, bytesJson, createdAtMs) VALUES ('{sweep}', '{bytes}', {})", now_s * 1000),
+        format!("INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) VALUES ('{}{sweep}.900000', {latched_at_ms}, 1, '{}', 1)", low_app_layer::owed::PROOF_MINED_LATCH_PREFIX, "ab".repeat(32)),
+    ]
 }
 
 // E649 L4 M1: the pot hook's maximum body on the fleet (the review's H2 shape): seven decoded pots with two latched

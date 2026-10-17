@@ -161,7 +161,7 @@ const measured = {}
 
   const o1 = await get(APP, `/owed?identity=${ID_A}`)
   if (o1.status !== 200) fail('/owed first read answers', `${o1.status}: ${o1.text.slice(0, 200)}`)
-  else if (JSON.parse(o1.text).rows?.length !== 8) fail('/owed computes A\'s 8 rows', o1.text.slice(0, 200))
+  else if (JSON.parse(o1.text).rows?.length !== 9) fail('/owed computes A\'s 9 rows (8 pots and the swept hop)', o1.text.slice(0, 200))
   const first = segment(o1.timing, 'd1')
   check('owed-first-read', first)
   const o2 = await get(APP, `/owed?identity=${ID_A}`)
@@ -169,6 +169,36 @@ const measured = {}
   const served = segment(o2.timing, 'd1')
   check('owed-served-read', served)
   measured['/owed'] = first && served ? { reads: Math.max(first.reads, served.reads), writes: Math.max(first.writes, served.writes), stmts: Math.max(first.stmts, served.stmts) } : null
+}
+
+// bsv-low #693 fold-2: A's swept hop (the seed's `identity_a_durable_spender_rows`): its sweep is a DURABLE spender
+// with a `proofmined:` latch past the grace, so the first read above made the latch range read and served the row
+// from the latch (owed-first-read carries it).
+{
+  const sweep = 'a8'.repeat(32)
+  const o = await get(APP, `/owed?identity=${ID_A}`)
+  const row = JSON.parse(o.text).rows?.find((r) => r.facts?.sweepTxid === sweep)
+  if (o.status === 200 && row?.facts?.confirmedSource === 'proof') pass('#693 A\'s durable sweep is served from its proof latch')
+  else fail('#693 A\'s durable sweep is served from its proof latch', `${o.status} ${JSON.stringify(row ?? JSON.parse(o.text).rows?.filter((r) => r.outpoint?.startsWith('a7')))}`)
+}
+
+// bsv-low #723: /spent-any's index-proof read (`hopsweep::sweep_proofs_sql`) at its most outpoints. Twenty fresh
+// probe memos name twenty of the fleet's PROVEN transactions as spenders with no confirmed word, so every row is a
+// known spend and the one statement reads the index's proofs (`spentConfirmedSource: "index-proof"`).
+{
+  const crate = fileURLToPath(new URL('../../crates/low-app-layer/', import.meta.url))
+  const wr = (args) => execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', process.env.D1_BUDGET_STATE, ...args], { cwd: crate, timeout: 30_000, stdio: 'pipe' })
+  const proven = JSON.parse(wr(['--json', '--command', 'SELECT lower(txid) AS txid FROM transactions WHERE has_proof = 1 ORDER BY txid LIMIT 20']).toString())[0].results.map((r) => r.txid)
+  const subject = (i) => 'e7' + i.toString(16).padStart(62, '0')
+  const now = Date.now()
+  wr(['--command', proven.map((sp, i) => `INSERT OR REPLACE INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) VALUES ('${subject(i)}.0', ${now}, 1, '${sp}', NULL);`).join(' ')])
+  const ops = proven.map((_, i) => `${subject(i)}.0`).join(',')
+  const r = await get(APP, `/spent-any?outpoints=${ops}`)
+  let sourced = 0
+  try { sourced = JSON.parse(r.text).filter((e) => e.spentConfirmedSource === 'index-proof' && e.spentConfirmed === true).length } catch {}
+  if (r.status === 200 && proven.length === 20 && sourced === 20) pass('#723 /spent-any confirms 20 known spends from the index proof read')
+  else fail('#723 /spent-any confirms 20 known spends from the index proof read', `${r.status} proven=${proven.length} sourced=${sourced} ${r.text.slice(0, 300)}`)
+  check('spent-any-20', (measured['/spent-any'] = segment(r.timing, 'd1')))
 }
 
 // L23R2-H1/M2/M3/M4: the real /owed route over captured, markerless, twin-only 25h evidence.
