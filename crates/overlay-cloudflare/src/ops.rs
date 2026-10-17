@@ -1340,7 +1340,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
             obj[name] = json!(0);
         }
     }
-    for name in crate::submit_counters::all_names() {
+    for name in crate::submit_counters::all_names().into_iter().chain(crate::courier_counters::all_names()) {
         obj[name] = json!(0);
     }
     for r in rows {

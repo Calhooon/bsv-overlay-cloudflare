@@ -217,7 +217,8 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // Give stored proof completion its own early slot. Held GASP graphs are
     // not admitted transactions: their roots use hydrate_root during sync.
     // A timeout stamps no success heartbeat; the next tick retries the rows.
-    let completion_fetcher = transaction_proof_fetcher(env);
+    let courier_counts = crate::courier_counters::Counters::new(crate::courier_counters::Reader::Janitor);
+    let completion_fetcher = transaction_proof_fetcher(env).with_courier_counters(courier_counts.clone());
     let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
     let (tx_completed, tx_fetch_failed) = match race_or_deadline(
         engine.complete_missing_proofs_with(&completion_fetcher, TRANSACTION_PROOF_COMPLETION_LIMIT, backstop_age),
@@ -568,9 +569,10 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         false,
     )
     .await;
-    let spend_fetcher = courier_fetcher(env, lookup_service_chain_tracker(env)).with_budget(20);
+    let spend_fetcher = courier_fetcher(env, lookup_service_chain_tracker(env)).with_budget(20)
+        .with_courier_counters(courier_counts.clone());
     let pot_tracker = lookup_service_chain_tracker(env);
-    let pot_fetcher = courier_fetcher(env, pot_tracker);
+    let pot_fetcher = courier_fetcher(env, pot_tracker).with_courier_counters(courier_counts.clone());
     let (spend_summary, pot_summary) = crate::proof_fetcher::run_pot_maintenance(
         pot_storage.as_ref(),
         &spend_fetcher,
@@ -601,7 +603,8 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // "budget exhausted"): up to 4 courier calls per candidate, never a call
     // taken from the money-relevant confirmation pass.
     let discovery_fetcher = courier_fetcher(env, lookup_service_chain_tracker(env))
-        .with_budget(crate::proof_fetcher::MISSING_SPEND_FETCH_BUDGET);
+        .with_budget(crate::proof_fetcher::MISSING_SPEND_FETCH_BUDGET)
+        .with_courier_counters(courier_counts.clone());
     let missing = crate::proof_fetcher::discover_missing_spends(
         pot_storage.as_ref(),
         &discovery_fetcher,
@@ -625,6 +628,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // 2026-09-04: each rung's ok/fault/skipped this tick → the lifetime
     // `courier_<rung>_*_total` counters (`/health/invariants`, the monitor).
     crate::ops::record_courier_tallies(&ops_db, &discovery_fetcher.rung_stats()).await;
+    courier_counts.flush(&ops_db).await;
     // 2026-09-04: the pass's lifetime counters ride `/health/invariants`
     // (`counters.missing_spend_*`) so the backlog's drain, the couriers'
     // faults and ; the paged one ; NEW-era discoveries are observable without

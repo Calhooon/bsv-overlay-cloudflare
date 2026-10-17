@@ -62,6 +62,7 @@ pub mod routes;
 pub mod ship_lookup;
 pub mod submit_census;
 mod submit_counters;
+mod courier_counters;
 pub mod submit_gate;
 pub mod submit_refusals;
 mod tick;
@@ -1469,7 +1470,8 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     };
     // 1. Transactions store (engine + ancestor fetcher). Submitted rows give
     //    /arc-ingest its callback window; GASP rows have no callback to await.
-    let completion_fetcher = transaction_proof_fetcher(env);
+    let courier_counts = crate::courier_counters::Counters::new(crate::courier_counters::Reader::Janitor);
+    let completion_fetcher = transaction_proof_fetcher(env).with_courier_counters(courier_counts.clone());
     let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
     let (tx_completed, tx_fetch_failed, tx_early_gasp) =
         match overlay_engine::gasp::race_or_deadline(
@@ -1501,9 +1503,10 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
     // 2+3. Pot-store maintenance — chaser BEFORE the pot-beef bulk drain,
     //    encoded once in run_pot_maintenance (bsv-low#304 gate M-5; same
     //    order as the scheduled tick). Own fetchers, own budget cells.
-    let spend_fetcher = courier_fetcher(env, lookup_service_chain_tracker(env)).with_budget(20);
+    let spend_fetcher = courier_fetcher(env, lookup_service_chain_tracker(env)).with_budget(20)
+        .with_courier_counters(courier_counts.clone());
     let pot_tracker = lookup_service_chain_tracker(env);
-    let pot_fetcher = courier_fetcher(env, pot_tracker);
+    let pot_fetcher = courier_fetcher(env, pot_tracker).with_courier_counters(courier_counts.clone());
     let (ss, ps) = crate::proof_fetcher::run_pot_maintenance(
         pot_storage.as_ref(),
         &spend_fetcher,
@@ -1513,6 +1516,7 @@ async fn admin_complete_proofs(env: &Env) -> worker::Result<Response> {
         backstop_age,
     )
     .await;
+    courier_counts.flush(&ops_db).await;
     // 4. pot_records decoded-params lazy backfill (#284) — no courier/tracker,
     //    pure re-reads of our own admitted pot_beefs bytes.
     let bf = crate::proof_fetcher::backfill_decoded_params(
