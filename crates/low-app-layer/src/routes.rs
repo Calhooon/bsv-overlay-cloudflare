@@ -7559,19 +7559,29 @@ pub(crate) async fn provider_get_with(
     let started = worker::Date::now().as_millis() as f64;
     let got = provider_get_raw(url, extra_header).await;
     let ms = worker::Date::now().as_millis() as f64 - started;
-    crate::courier::note(
-        url,
-        caller,
-        got.as_ref().map(|(s, b)| (*s, b.as_slice())),
-        ms,
-    );
-    got
+    crate::courier::note(url, caller, courier_answer(got.as_ref()), ms);
+    got.map(|(status, body, _)| (status, body))
+}
+
+/// PURE (the W1-OBS-APPLAYER lens's L1): what the courier census is told of one answer, given the status, the body
+/// and whether the body READ. A 2xx whose body did not read is a transport fault (`None`), never the body-shape fault
+/// an empty body would be read as; any other answer is passed as it is (a non-2xx's outcome is its status).
+pub(crate) fn courier_answer(got: Option<&(u16, Vec<u8>, bool)>) -> Option<(u16, &[u8])> {
+    match got {
+        Some((status, _, false)) if (200..300).contains(status) => None,
+        Some((status, body, _)) => Some((*status, body.as_slice())),
+        None => None,
+    }
 }
 
 /// This worker's courier identity (see `provider_get`).
 const APP_LAYER_USER_AGENT: &str = "low-app-layer/1.0 (+https://bsvarcade.com)";
 
-async fn provider_get_raw(url: &str, extra_header: Option<(&str, &str)>) -> Option<(u16, Vec<u8>)> {
+/// The status, the body and whether the body read (a failed read answers an empty body, as before).
+async fn provider_get_raw(
+    url: &str,
+    extra_header: Option<(&str, &str)>,
+) -> Option<(u16, Vec<u8>, bool)> {
     let mut init = RequestInit::new();
     init.with_method(Method::Get);
     let headers = Headers::new();
@@ -7588,8 +7598,11 @@ async fn provider_get_raw(url: &str, extra_header: Option<(&str, &str)>) -> Opti
     let request = worker::Request::new_with_init(url, &init).ok()?;
     let mut response = worker::Fetch::Request(request).send().await.ok()?;
     let status = response.status_code();
-    let body = response.bytes().await.unwrap_or_default();
-    Some((status, body))
+    let (body, body_read) = match response.bytes().await {
+        Ok(b) => (b, true),
+        Err(_) => (Vec::new(), false),
+    };
+    Some((status, body, body_read))
 }
 
 const WOC_BASE: &str = "https://api.whatsonchain.com/v1/bsv/main";
