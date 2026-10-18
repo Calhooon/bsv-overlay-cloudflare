@@ -2410,7 +2410,11 @@ pub const POT_BLOCK_TIME_STAMP_SQL: &str = "UPDATE pot_records SET blockTime = ?
 /// key `?1`, and the first of the key space (so a row that can never be stamped, unmined or with no
 /// latched BEEF, holds no other row back for good), each probed by `pot_beefs`' key (`CROSS JOIN` keeps the
 /// windows the outer loop and `+` keeps `proof_verified`'s index out: driven from `pot_beefs` the read was
-/// every latched BEEF); at most `?3` answered.
+/// every latched BEEF); at most `?3` answered, the random window's rows FIRST (`ORDER BY (c.txid >= ?1)
+/// DESC`, at most 200 rows sorted; the delta lens's MEDIUM-N1): a latched row the step can never stamp
+/// (a header chaintracks no longer holds at the bump's root) takes a cap slot every pass it is read, so the
+/// bottom window's rows fill only what the random window leaves and held rows at the start of the key space
+/// never take the cap from the rest for good.
 /// Bind order: start key, scan rows per window, limit. Pub for the REAL-SQLite harnesses.
 pub const VERIFIED_POTS_WITHOUT_BLOCK_TIME_SQL: &str =
     "SELECT c.txid AS txid, hex(b.beef) AS beef \
@@ -2421,6 +2425,7 @@ pub const VERIFIED_POTS_WITHOUT_BLOCK_TIME_SQL: &str =
                              WHERE blockTime IS NULL ORDER BY txid LIMIT ?2)) c \
      CROSS JOIN pot_beefs b ON b.txid = c.txid \
      WHERE +b.proof_verified = 1 \
+     ORDER BY (c.txid >= ?1) DESC, c.txid \
      LIMIT ?3";
 
 /// The unstamped rows each window of [`VERIFIED_POTS_WITHOUT_BLOCK_TIME_SQL`] reads at most (two windows:

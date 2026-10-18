@@ -373,6 +373,33 @@ fn pre557_e_the_stamp_candidates_are_the_latched_unstamped_pots() {
     );
 }
 
+/// The delta lens's MEDIUM-N1: latched rows the step can never stamp (a header chaintracks no longer holds
+/// at the bump's root) sitting at the BOTTOM of the key space must not take the cap ahead of the random
+/// window. With 48 of them at `00..` and one latched pot at `80..`, a pass whose random key is `7f..` names
+/// the `80..` pot; the bottom rows fill only what the random window leaves, so they are still read.
+#[test]
+fn pre557_n1_held_bottom_rows_never_take_the_cap_from_the_random_window() {
+    let conn = production_schema_db();
+    let held: Vec<String> = (0..48u32).map(|i| format!("00{i:062x}")).collect();
+    for txid in &held {
+        admit_pot(&conn, txid, PRE557_NOW_SECS);
+        store_pot_beef(&conn, txid, true);
+    }
+    let mid = h64(0x80);
+    admit_pot(&conn, &mid, PRE557_NOW_SECS);
+    store_pot_beef(&conn, &mid, true);
+    let start = format!("7f{}", "ff".repeat(31));
+    let got = stamp_candidates(&conn, &start, 48);
+    assert_eq!(got.len(), 48, "the cap");
+    assert!(
+        got.contains(&mid),
+        "the random window's latched pot is named ahead of the held bottom rows: {got:?}"
+    );
+    // the bottom window still reaches the held rows: a pass whose random window is empty names them
+    let past = "ff".repeat(32);
+    assert_eq!(stamp_candidates(&conn, &past, 48), held);
+}
+
 /// The lens's LOW-4 under real SQLite: the shipped statement keeps an admission 7,200 s after its block and
 /// moves one 7,201 s after.
 #[test]
