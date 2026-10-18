@@ -1051,7 +1051,8 @@ pub trait PotStorage {
     /// `/arc-ingest` push, a reorg re-anchor) and whose pot row has no confirming block's time yet
     /// (`pot_records.blockTime IS NULL`), each with its STORED BEEF (whose own bump is the verified one).
     /// `start_key` is where the D1 scan of the unstamped rows begins (a random key a pass, beside the
-    /// first rows of the key space, so a row that can never be stamped starves none). Default: none (a
+    /// first rows of the key space, so a row that can never be stamped starves none); the rows from
+    /// `start_key` up are answered first (the delta lens's MEDIUM-N1). Default: none (a
     /// backend with no `createdAt` has nothing to stamp).
     async fn verified_pots_without_block_time(
         &self,
@@ -2223,11 +2224,12 @@ impl PotStorage for MemoryPotStorage {
 
     async fn verified_pots_without_block_time(
         &self,
-        _start_key: &str,
+        start_key: &str,
         limit: usize,
     ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
         // The memory twin reads every unstamped row (its sets are small); the D1 scan's window is the
-        // statement's own, pinned under real SQLite.
+        // statement's own, pinned under real SQLite. The order is the statement's (the delta lens's
+        // MEDIUM-N1): the rows from `start_key` up first, then the start of the key space.
         let records = self.records.lock().unwrap();
         let stamped = self.block_times.lock().unwrap();
         let verified = self.verified.lock().unwrap();
@@ -2237,8 +2239,11 @@ impl PotStorage for MemoryPotStorage {
             .map(|r| &r.txid)
             .filter(|t| !stamped.contains_key(*t) && verified.contains(*t))
             .collect();
-        Ok(txids
+        let (from_start, below): (Vec<&String>, Vec<&String>) =
+            txids.into_iter().partition(|t| t.as_str() >= start_key);
+        Ok(from_start
             .into_iter()
+            .chain(below)
             .filter_map(|t| beefs.get(t).map(|b| (t.clone(), b.clone())))
             .take(limit)
             .collect())
