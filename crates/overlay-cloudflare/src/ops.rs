@@ -886,12 +886,29 @@ pub const UNPROVABLE_SET_BACKFILL: &str = "INSERT OR IGNORE INTO pot_beefs_unpro
 /// NS-COST-BAR-1: the count's one-time backfill, the set counted once behind its own row.
 pub const UNPROVABLE_COUNT_BACKFILL: &str = "INSERT OR IGNORE INTO count_pot_beefs_unprovable (id, n) SELECT 1, c.n FROM (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM count_pot_beefs_unprovable WHERE id = 1)) g CROSS JOIN (SELECT COUNT(*) AS n FROM pot_beefs_unprovable_set) c";
 
+/// NS-COST-BAR-1: `/health/invariants.txRetiredTotal` (INCIDENT D1-CALLBACK-FLOOD 2026-09-01) was a `COUNT(*)` of
+/// `transactions` on every read (21,724 rows a read on beta, 7.5 M a day). It reads one row, kept equal to `COUNT(*)
+/// FROM transactions WHERE retired_ms IS NOT NULL` the way [`RETIRED_UNPROVABLE_TOTAL_SQL`] is (`transactions` is
+/// written by `INSERT OR REPLACE` too, `d1_storage`): a membership set (`transactions_retired_set`, each retired
+/// row's txid and whether its reason is `expired-unproven`) kept idempotently by `transactions`' triggers, the
+/// count row by the set's own. A row whose txid is NULL is not counted (no writer writes one).
+pub const TX_RETIRED_TOTAL_SQL: &str =
+    "SELECT retired AS c FROM count_transactions_retired WHERE id = 1";
+
+/// NS-COST-BAR-1: the retired set's one-time backfill, behind the count's row in the OUTER derived table.
+pub const RETIRED_SET_BACKFILL: &str = "INSERT OR IGNORE INTO transactions_retired_set (txid, expired) SELECT t.txid, t.retired_reason IS 'expired-unproven' FROM (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM count_transactions_retired WHERE id = 1)) g CROSS JOIN transactions t WHERE t.retired_ms IS NOT NULL AND t.txid IS NOT NULL";
+
+/// NS-COST-BAR-1: the retired count's one-time backfill, the set counted once behind its own row.
+pub const RETIRED_COUNT_BACKFILL: &str = "INSERT OR IGNORE INTO count_transactions_retired (id, retired, expired) SELECT 1, c.n, c.e FROM (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM count_transactions_retired WHERE id = 1)) g CROSS JOIN (SELECT COUNT(*) AS n, COALESCE(SUM(expired), 0) AS e FROM transactions_retired_set) c";
+
 /// Every trigger-kept count's stamped backfill, in the list's order (bsv-low #645, NS-COST-BAR-1): what a database
 /// loaded from a schema dump (no count row) runs after its rows, as the budget tier's seed does.
 pub const COUNT_ROW_BACKFILLS: &[&str] = &[
     NETWORK_SEEN_COUNT_BACKFILL,
     UNPROVABLE_SET_BACKFILL,
     UNPROVABLE_COUNT_BACKFILL,
+    RETIRED_SET_BACKFILL,
+    RETIRED_COUNT_BACKFILL,
 ];
 
 /// Latch [`NETWORK_SEEN_INSERT_SQL`] for `txid`. Best-effort: the latch only
@@ -1630,13 +1647,12 @@ pub async fn health_invariants(
         .ok()
         .flatten()
         .map_or(-1, |r| r.c.max(0.0) as i64);
-    let tx_retired_total: i64 =
-        Query::new("SELECT COUNT(*) AS c FROM transactions WHERE retired_ms IS NOT NULL")
-            .fetch_optional::<CountRow>(db)
-            .await
-            .ok()
-            .flatten()
-            .map_or(-1, |r| r.c.max(0.0) as i64);
+    let tx_retired_total: i64 = Query::new(TX_RETIRED_TOTAL_SQL)
+        .fetch_optional::<CountRow>(db)
+        .await
+        .ok()
+        .flatten()
+        .map_or(-1, |r| r.c.max(0.0) as i64);
 
     let status = if strict && dead { 503 } else { 200 };
     let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);
@@ -1797,6 +1813,111 @@ mod tests {
         conn.pragma_update(None, "recursive_triggers", recursive_triggers)
             .unwrap();
         conn
+    }
+
+    /// NS-COST-BAR-1: `txRetiredTotal` and the expired-unproven total equal their `COUNT(*)`s after every SHIPPED
+    /// `transactions` writer, the three `INSERT OR REPLACE` writes included, with `recursive_triggers` off and on.
+    #[test]
+    fn ns_cost_retired_counts_are_exact_under_every_shipped_writer() {
+        use crate::d1_storage as s;
+        for recursive in [false, true] {
+            let conn = ns_cost_migrated(recursive);
+            let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+            let check = |what: &str| -> (i64, i64) {
+                let counted = (
+                    one("SELECT COUNT(*) FROM transactions WHERE retired_ms IS NOT NULL"),
+                    one("SELECT COUNT(*) FROM transactions WHERE retired_ms IS NOT NULL AND retired_reason = 'expired-unproven'"),
+                );
+                assert_eq!(
+                    (
+                        one(TX_RETIRED_TOTAL_SQL),
+                        one(crate::proof_window::EXPIRED_COUNT_SQL)
+                    ),
+                    counted,
+                    "{what} (recursive_triggers {recursive})"
+                );
+                counted
+            };
+            let retire = |txid: &str, reason: &str| {
+                conn.execute(
+                    crate::proof_fetcher::RETIRE_TRANSACTIONS_SQL,
+                    rusqlite::params![5i64, reason, txid],
+                )
+                .unwrap();
+            };
+            assert_eq!(check("empty"), (0, 0));
+            for t in ["a", "b", "c"] {
+                conn.execute(s::INSERT_OUTPUT_TX_SQL, rusqlite::params![t, vec![1u8]])
+                    .unwrap();
+            }
+            conn.execute(
+                s::INSERT_OUTPUT_TX_GASP_SQL,
+                rusqlite::params!["d", vec![1u8]],
+            )
+            .unwrap();
+            retire("a", "expired-unproven");
+            retire("b", "utxo-spent");
+            retire("d", "expired-unproven");
+            assert_eq!(check("the retire pass"), (3, 2));
+            retire("a", "utxo-spent");
+            assert_eq!(check("a retired row is never re-retired"), (3, 2));
+            conn.execute(s::INSERT_OUTPUT_TX_SQL, rusqlite::params!["a", vec![2u8]])
+                .unwrap();
+            conn.execute(
+                s::INSERT_OUTPUT_TX_GASP_SQL,
+                rusqlite::params!["d", vec![2u8]],
+            )
+            .unwrap();
+            assert_eq!(check("the REPLACE writes keep the latches"), (3, 2));
+            conn.execute(
+                s::UPDATE_TX_BEEF_SQL,
+                rusqlite::params!["b", vec![3u8], 0i64, Option::<i64>::None],
+            )
+            .unwrap();
+            assert_eq!(check("an unproven beef REPLACE keeps b's latch"), (3, 2));
+            conn.execute(
+                s::UPDATE_TX_BEEF_SQL,
+                rusqlite::params!["a", vec![3u8], 1i64, 9i64],
+            )
+            .unwrap();
+            assert_eq!(check("a proven beef REPLACE clears a"), (2, 1));
+            conn.execute(s::MARK_TX_PROVEN_AT_SQL, rusqlite::params![9i64, "d"])
+                .unwrap();
+            assert_eq!(check("the anchored flip clears d"), (1, 0));
+            conn.execute(
+                "UPDATE transactions SET has_proof = 1, retired_ms = NULL, retired_reason = NULL WHERE txid = ?",
+                ["b"],
+            )
+            .unwrap();
+            assert_eq!(check("the stored-proof flip clears b"), (0, 0));
+            conn.execute(s::TRANSACTION_UNPROVE_SQL, ["b"]).unwrap();
+            retire("b", "expired-unproven");
+            retire("c", "expired-unproven");
+            assert_eq!(check("unproved, then retired"), (2, 2));
+            conn.execute(
+                "UPDATE transactions SET retired_reason = 'utxo-spent' WHERE txid = 'c'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(check("the reason moves alone"), (2, 1));
+            conn.execute("DELETE FROM transactions WHERE txid = ?", ["c"])
+                .unwrap();
+            assert_eq!(check("the deep delete"), (1, 1));
+            for _ in 0..2 {
+                conn.execute(
+                    "INSERT OR IGNORE INTO transactions (txid, beef, retired_ms, retired_reason) VALUES ('c', x'00', 1, 'expired-unproven')",
+                    [],
+                )
+                .unwrap();
+                assert_eq!(check("an eviction's restore, twice"), (2, 2));
+            }
+            conn.execute(
+                "UPDATE transactions SET txid = 'e', retired_reason = NULL WHERE txid = 'c'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(check("a new key with no reason"), (2, 1));
+        }
     }
 
     /// NS-COST-BAR-1: `retiredUnprovableTotal` equals `COUNT(*)` after every SHIPPED `pot_beefs` writer, the two

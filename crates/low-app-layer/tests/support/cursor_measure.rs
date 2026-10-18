@@ -92,6 +92,26 @@ fn ns_cost_statements() -> Vec<(&'static str, String, u64)> {
             bsv_overlay_cloudflare::ops::RETIRED_UNPROVABLE_TOTAL_SQL.to_string(),
             COUNT_ROW_READ_CEILING,
         ),
+        (
+            "NS-COST before: txRetiredTotal",
+            "SELECT COUNT(*) AS c FROM transactions WHERE retired_ms IS NOT NULL".to_string(),
+            BEFORE_SHAPE_CEILING,
+        ),
+        (
+            "NS-COST txRetiredTotal",
+            bsv_overlay_cloudflare::ops::TX_RETIRED_TOTAL_SQL.to_string(),
+            COUNT_ROW_READ_CEILING,
+        ),
+        (
+            "NS-COST before: the expired-unproven total",
+            "SELECT COUNT(*) AS c FROM transactions WHERE retired_ms IS NOT NULL AND retired_reason = 'expired-unproven'".to_string(),
+            BEFORE_SHAPE_CEILING,
+        ),
+        (
+            "NS-COST the expired-unproven total",
+            bsv_overlay_cloudflare::proof_window::EXPIRED_COUNT_SQL.to_string(),
+            COUNT_ROW_READ_CEILING,
+        ),
     ];
     // Each count backfill's SELECT on a re-run (the row present): the stamp alone.
     for backfill in bsv_overlay_cloudflare::ops::COUNT_ROW_BACKFILLS

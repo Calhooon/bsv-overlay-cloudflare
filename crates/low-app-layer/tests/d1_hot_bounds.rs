@@ -611,3 +611,42 @@ fn ns_cost_unprovable_total_is_the_count_and_the_read_counts_nothing() {
         ],
     );
 }
+
+#[test]
+fn ns_cost_retired_totals_are_the_counts_and_the_reads_count_nothing() {
+    let seed = |db: &Connection| {
+        for i in 0..300u32 {
+            let (ms, reason) = [
+                (Some(1i64), Some("expired-unproven")),
+                (Some(1), Some("utxo-spent")),
+                (Some(1), None),
+                (None, Some("expired-unproven")),
+            ][i as usize % 4];
+            db.execute(
+                "INSERT INTO transactions (txid, beef, has_proof, retired_ms, retired_reason) VALUES (?1, x'00', 0, ?2, ?3)",
+                rusqlite::params![format!("ac{i:062x}"), ms, reason],
+            )
+            .unwrap();
+        }
+    };
+    let backfills = [
+        "INSERT OR IGNORE INTO transactions_retired_set",
+        "INSERT OR IGNORE INTO count_transactions_retired",
+    ];
+    assert_count_row(
+        "txRetiredTotal",
+        bsv_overlay_cloudflare::ops::TX_RETIRED_TOTAL_SQL,
+        "SELECT COUNT(*) FROM transactions WHERE retired_ms IS NOT NULL",
+        "CREATE TABLE IF NOT EXISTS transactions_retired_set",
+        &seed,
+        &backfills,
+    );
+    assert_count_row(
+        "expiredUnproven",
+        bsv_overlay_cloudflare::proof_window::EXPIRED_COUNT_SQL,
+        "SELECT COUNT(*) FROM transactions WHERE retired_ms IS NOT NULL AND retired_reason = 'expired-unproven'",
+        "CREATE TABLE IF NOT EXISTS transactions_retired_set",
+        &seed,
+        &backfills,
+    );
+}
