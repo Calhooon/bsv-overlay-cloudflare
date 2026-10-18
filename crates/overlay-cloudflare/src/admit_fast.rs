@@ -2015,7 +2015,7 @@ pub fn evidence_verdict(
         // REJECTED is never the network's verdict (#214: Arcade held txs
         // MINED in 958776 at a sticky REJECTED), and an indexer that holds
         // the tx is a witness against the refusal.
-        ArcadeLook::Fatal(..) | ArcadeLook::Missing | ArcadeLook::Fault => {
+        ArcadeLook::Fatal(..) | ArcadeLook::Recorded(..) | ArcadeLook::Missing | ArcadeLook::Fault => {
             match crate::proof_fetcher::classify_presence(bitails.map(crate::proof_fetcher::bool_presence), woc.map(crate::proof_fetcher::bool_presence)) {
                 NetworkPresence::Present { .. } => EvidenceVerdict::Present,
                 // Absence-based (Arcade missing or faulted, not its own fatal word): a young or never-admitted
@@ -2031,6 +2031,12 @@ pub fn evidence_verdict(
                 NetworkPresence::Absent => EvidenceVerdict::Refused(match arcade {
                     ArcadeLook::Fatal(status, extra) => {
                         format!("arcade live {status}: {extra}; both indexers absent")
+                    }
+                    // bsv-low #621 (the W2-WORDS-L5 lens, MEDIUM-1): Arcade could not be asked and the recorded
+                    // word (a public-bearer push) filled it: the same refusal, but its reason names its provenance,
+                    // so the served chain word is no word (`eviction_chain_word`'s absence marks), never `rejected`
+                    ArcadeLook::Recorded(status, extra) => {
+                        format!("arcade faulted, recorded {status}: {extra}; both indexers absent")
                     }
                     ArcadeLook::Missing => "arcade missing, both indexers absent".to_string(),
                     _ => "arcade faulted, both indexers absent".to_string(),
@@ -2871,8 +2877,12 @@ mod tests {
         let fatal = refused(ArcadeLook::Fatal("DOUBLE_SPEND_ATTEMPTED".into(), "utxo spent by tx".into()));
         let missing = refused(ArcadeLook::Missing);
         let faulted = refused(ArcadeLook::Fault);
+        // the W2-WORDS-L5 lens, MEDIUM-1: Arcade faulted and the recorded (pushed) word filled it: no chain word,
+        // even when the recorded text carries Arcade's live mark
+        let recorded = refused(ArcadeLook::Recorded("REJECTED".into(), "arcade live REJECTED: x".into()));
         // the callback's and the watch's wrap (`refusal_job`, `pending_watch_job`)
         for status in ["REJECTED", "DOUBLE_SPEND_ATTEMPTED", "SEEN_ON_NETWORK"] {
+            assert_eq!(eviction_chain_word(&format!("{status} ({recorded})")), None, "a recorded word behind a fault: no word");
             assert_eq!(eviction_chain_word(&format!("{status} ({fatal})")), Some("rejected"));
             assert_eq!(eviction_chain_word(&format!("{status} ({missing})")), None, "absence alone: no word");
             assert_eq!(eviction_chain_word(&format!("{status} ({faulted})")), None, "absence alone: no word");
