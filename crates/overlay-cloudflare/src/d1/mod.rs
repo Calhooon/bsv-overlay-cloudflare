@@ -592,7 +592,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// frags included), the guarded backfill and its `board-v1` stamp.
 /// 327 to 329 for bsv-low #470 PRE557: `pot_records.blockTime`, the confirming block's header time, and the same
 /// column on `pot_records_evicted`. Overlay-internal (no app-layer read, so epoch Rule 24 does not bite).
-pub const OVERLAY_MIGRATION_COUNT: usize = 329;
+/// 329 to 330 for the PRE557 lens fold: `idx_pot_records_block_time_null`, the stamp step's partial index.
+pub const OVERLAY_MIGRATION_COUNT: usize = 330;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2179,14 +2180,20 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_board::STATE_DONE,
     // 328: bsv-low #470 PRE557, the time of the block that confirms the pot's funding tx (the header time, unix
     // seconds, of the chaintracks header its verified bump binds to), written once by the pot-beef completion
-    // pass (`POT_BLOCK_TIME_STAMP_SQL`). NULL = no confirming block known: `createdAt` is the overlay's own clock
-    // (an unmined pot, or a row the pass has not reached). The same pass moves a re-indexed row's `createdAt`
+    // pass's stamp step (`POT_BLOCK_TIME_STAMP_SQL`). NULL = no confirming block's time recorded yet: `createdAt` is
+    // the overlay's own clock (an unmined pot, a pot with no latched BEEF, or a latched row the step has not
+    // reached or could not stamp yet). The same step moves a re-indexed row's `createdAt`
     // (stamped NOW at its re-admission) to this time, so the #375 era filter keeps its row set.
     "ALTER TABLE pot_records ADD COLUMN blockTime INTEGER",
     // 329: the same column on the eviction twin (created at its own migration with the source's columns of that
     // day; the shadow move copies the source's columns by name, and the run-time heal adds a missing one, but the
     // shipped schema carries it, so a move or a byte-for-byte readmission never depends on the heal).
     "ALTER TABLE pot_records_evicted ADD COLUMN blockTime INTEGER",
+    // 330: the PRE557 lens fold (HIGH-1): the stamp step's own read of the unstamped pots
+    // (`VERIFIED_POTS_WITHOUT_BLOCK_TIME_SQL`, every scheduled pass) walks this partial index in two windows
+    // of 100, never `pot_records` whole. Its rows are the pots with no confirming block's time: the unmined,
+    // those with no latched BEEF, and those the step has not reached yet.
+    "CREATE INDEX IF NOT EXISTS idx_pot_records_block_time_null ON pot_records(txid) WHERE blockTime IS NULL",
 ];
 
 // =============================================================================

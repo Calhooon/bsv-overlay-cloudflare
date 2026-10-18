@@ -19,7 +19,8 @@
 
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use bsv_overlay_cloudflare::d1_discovery::{
-    pots_without_block_time_sql, store_record_sql, POT_BLOCK_TIME_STAMP_SQL,
+    store_record_sql, POT_BLOCK_TIME_SCAN_ROWS, POT_BLOCK_TIME_STAMP_SQL,
+    VERIFIED_POTS_WITHOUT_BLOCK_TIME_SQL,
 };
 use low_app_layer::logic::{assemble_pots_view, pots_view_join_sql, Outpoint, PotsViewRow};
 use overlay_discovery::pot::storage::BLOCK_TIME_STAMP_SLACK_SECS;
@@ -252,34 +253,123 @@ fn pre557_b_a_reindexed_post_cutoff_pot_keeps_its_real_time() {
     );
 }
 
+/// A stored pot BEEF row, latched (`proof_verified = 1`) or not.
+fn store_pot_beef(conn: &Connection, txid: &str, verified: bool) {
+    conn.execute(
+        "INSERT INTO pot_beefs (txid, beef, createdAt, proof_verified) VALUES (?1, x'0102', 0, ?2)",
+        params![txid, i64::from(verified)],
+    )
+    .expect("pot_beefs");
+}
+
+/// The stamp step's candidates, the SHIPPED statement and binds (`D1PotStorage::verified_pots_without_block_time`).
+fn stamp_candidates(conn: &Connection, start_key: &str, limit: i64) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(VERIFIED_POTS_WITHOUT_BLOCK_TIME_SQL)
+        .expect("prepare");
+    let rows = stmt
+        .query_map(
+            params![start_key, i64::from(POT_BLOCK_TIME_SCAN_ROWS), limit],
+            |r| r.get::<_, String>(0),
+        )
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows");
+    let mut rows = rows;
+    rows.sort();
+    rows
+}
+
 #[test]
 fn pre557_c_an_unmined_reindexed_pot_is_now_and_marked() {
     let conn = production_schema_db();
     let pot = h64(0xe3);
     admit_pot(&conn, &pot, PRE557_NOW_SECS);
-    // the pass never stamps an unverified bump: the row is as admitted
+    store_pot_beef(&conn, &pot, false);
+    // an unlatched proof is no stamp candidate: the row is as admitted
+    assert!(stamp_candidates(&conn, "00", 48).is_empty());
     assert_eq!(
         created_and_block_time(&conn, &pot),
         (Some(PRE557_NOW_SECS), None),
-        "NOW, and the NULL blockTime marks it"
-    );
-    let mut stmt = conn
-        .prepare(&pots_without_block_time_sql(2))
-        .expect("prepare");
-    let other = h64(0xe4);
-    let found: Vec<String> = stmt
-        .query_map(params![pot, other], |r| r.get(0))
-        .expect("query")
-        .collect::<Result<_, _>>()
-        .expect("rows");
-    assert_eq!(
-        found,
-        vec![pot.clone()],
-        "named as unstamped; a txid with no pot row is not"
+        "NOW, and no block time"
     );
     assert_eq!(
         pots_view_rows(&conn, &one(&pot), Some(PRE557_CUT_MS)).len(),
         1
+    );
+}
+
+/// The lens fold, HIGH-1: the stamp step's own read names every LATCHED pot with no block time, whatever
+/// latched it (here a push: the row is latched and no completion candidate), never an unlatched one, one
+/// with no BEEF or a stamped one; both windows; through the partial index, never a scan of `pot_records`.
+#[test]
+fn pre557_e_the_stamp_candidates_are_the_latched_unstamped_pots() {
+    let conn = production_schema_db();
+    let pushed = h64(0x10);
+    let unmined = h64(0x20);
+    let no_beef = h64(0x30);
+    let stamped = h64(0x40);
+    let late = h64(0xf0);
+    for (txid, beef) in [
+        (&pushed, Some(true)),
+        (&unmined, Some(false)),
+        (&no_beef, None),
+        (&stamped, Some(true)),
+        (&late, Some(true)),
+    ] {
+        admit_pot(&conn, txid, PRE557_NOW_SECS);
+        if let Some(verified) = beef {
+            store_pot_beef(&conn, txid, verified);
+        }
+    }
+    let block = PRE557_CUT_MS / 1000 - 86_400;
+    assert_eq!(stamp_block_time(&conn, &stamped, block), 1);
+    // a random start past every row: the first window still reaches them
+    assert_eq!(
+        stamp_candidates(&conn, &"ff".repeat(32), 48),
+        vec![pushed.clone(), late.clone()]
+    );
+    // a start inside the key space: both windows, one answer per pot
+    assert_eq!(
+        stamp_candidates(&conn, &h64(0x50), 48),
+        vec![pushed.clone(), late.clone()]
+    );
+    assert_eq!(stamp_candidates(&conn, &h64(0x50), 1).len(), 1, "the limit");
+    // the stamp takes the pushed pot out of the set, and out of the written-off era's view
+    assert_eq!(stamp_block_time(&conn, &pushed, block), 1);
+    assert_eq!(stamp_candidates(&conn, "00", 48), vec![late.clone()]);
+    assert!(pots_view_rows(&conn, &one(&pushed), Some(PRE557_CUT_MS)).is_empty());
+
+    let mut stmt = conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {VERIFIED_POTS_WITHOUT_BLOCK_TIME_SQL}"
+        ))
+        .unwrap();
+    let plan: Vec<String> = stmt
+        .query_map(params!["00", 100, 48], |r| r.get(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    println!("stamp candidates plan: {plan:?}");
+    for d in &plan {
+        assert!(
+            !d.starts_with("SCAN")
+                || d == "SCAN c"
+                || d.contains("idx_pot_records_block_time_null")
+                || d.contains("subquery"),
+            "never a scan of a fleet table: {d} (plan {plan:?})"
+        );
+        assert!(
+            !d.starts_with("SEARCH b") || d.contains("(txid=?)"),
+            "pot_beefs is probed by its key, never walked by its latch: {d} (plan {plan:?})"
+        );
+    }
+    assert!(
+        plan.iter()
+            .filter(|d| d.contains("idx_pot_records_block_time_null"))
+            .count()
+            == 2,
+        "both windows read the partial index of the unstamped rows: {plan:?}"
     );
 }
 

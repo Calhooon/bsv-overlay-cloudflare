@@ -2402,18 +2402,30 @@ pub const POT_BLOCK_TIME_STAMP_SQL: &str = "UPDATE pot_records SET blockTime = ?
          createdAt = CASE WHEN createdAt IS NULL OR createdAt > ?1 + ?2 THEN ?1 ELSE createdAt END \
      WHERE txid = ?3 AND blockTime IS NULL";
 
-/// bsv-low #470 PRE557: of `n` txids, those naming a pot row with no `blockTime` (the primary key's
-/// leading column, a seek per txid). Pub for the REAL-SQLite harnesses.
-pub fn pots_without_block_time_sql(n: usize) -> String {
-    debug_assert!(n >= 1);
-    let placeholders = vec!["?"; n].join(", ");
-    format!(
-        "SELECT DISTINCT txid FROM pot_records WHERE txid IN ({placeholders}) AND blockTime IS NULL"
-    )
-}
+/// bsv-low #470 PRE557 (the lens fold, HIGH-1): the stamp step's candidates, its own read, independent of
+/// the latch: pots whose proof is LATCHED (`pot_beefs.proof_verified = 1`, by the completion pass, the
+/// `/arc-ingest` push or a reorg re-anchor) and whose pot row has no `blockTime`, with the STORED BEEF
+/// (its own bump is the verified one). The unstamped rows are read through `idx_pot_records_block_time_null`
+/// (the partial index of migration 330) in two windows of at most `?2` rows each: from the pass's random
+/// key `?1`, and the first of the key space (so a row that can never be stamped, unmined or with no
+/// latched BEEF, holds no other row back for good), each probed by `pot_beefs`' key (`CROSS JOIN` keeps the
+/// windows the outer loop and `+` keeps `proof_verified`'s index out: driven from `pot_beefs` the read was
+/// every latched BEEF); at most `?3` answered.
+/// Bind order: start key, scan rows per window, limit. Pub for the REAL-SQLite harnesses.
+pub const VERIFIED_POTS_WITHOUT_BLOCK_TIME_SQL: &str =
+    "SELECT c.txid AS txid, hex(b.beef) AS beef \
+     FROM (SELECT txid FROM (SELECT DISTINCT txid FROM pot_records \
+                             WHERE blockTime IS NULL AND txid >= ?1 ORDER BY txid LIMIT ?2) \
+           UNION \
+           SELECT txid FROM (SELECT DISTINCT txid FROM pot_records \
+                             WHERE blockTime IS NULL ORDER BY txid LIMIT ?2)) c \
+     CROSS JOIN pot_beefs b ON b.txid = c.txid \
+     WHERE +b.proof_verified = 1 \
+     LIMIT ?3";
 
-/// The txids per [`pots_without_block_time_sql`] statement (D1 binds at most 100).
-pub(crate) const POTS_WITHOUT_BLOCK_TIME_CHUNK: usize = 90;
+/// The unstamped rows each window of [`VERIFIED_POTS_WITHOUT_BLOCK_TIME_SQL`] reads at most (two windows:
+/// at most 200 index entries and 200 `pot_beefs` probes a pass).
+pub const POT_BLOCK_TIME_SCAN_ROWS: u32 = 100;
 
 /// Chunk size for the batched anchored latch flip: 3 binds per row (the
 /// CASE arm's txid + height, the IN list's txid), 99 binds per statement.
@@ -3531,24 +3543,22 @@ impl PotStorage for D1PotStorage {
         Ok(row.is_some_and(|r| r.proof_verified.unwrap_or(0.0) != 0.0))
     }
 
-    async fn pots_without_block_time(
+    async fn verified_pots_without_block_time(
         &self,
-        txids: &[String],
-    ) -> Result<Vec<String>, PotStorageError> {
-        #[derive(Deserialize)]
-        struct Row {
-            txid: String,
-        }
-        let mut out = Vec::new();
-        for chunk in txids.chunks(POTS_WITHOUT_BLOCK_TIME_CHUNK) {
-            let mut q = Query::new(pots_without_block_time_sql(chunk.len()));
-            for txid in chunk {
-                q = q.bind(txid.as_str());
-            }
-            let rows: Vec<Row> = q.fetch_all(&self.db).await.map_err(pot_err)?;
-            out.extend(rows.into_iter().map(|r| r.txid));
-        }
-        Ok(out)
+        start_key: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
+        let rows: Vec<PotBeefProofRow> = Query::new(VERIFIED_POTS_WITHOUT_BLOCK_TIME_SQL)
+            .bind(start_key)
+            .bind(f64::from(POT_BLOCK_TIME_SCAN_ROWS))
+            .bind(limit as f64)
+            .fetch_all(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| crate::d1::beef_of_hex_column(r.beef).map(|beef| (r.txid, beef)))
+            .collect())
     }
 
     async fn stamp_pot_block_time(

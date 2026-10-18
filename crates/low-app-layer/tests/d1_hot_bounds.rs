@@ -862,3 +862,74 @@ fn ns_cost_relatch_censuses_are_the_old_aggregate_and_read_no_whole_table() {
         assert_no_fleet_scan_analyzed(&db, table, &sql);
     }
 }
+
+/// bsv-low #470 PRE557 lens fold (HIGH-1): the stamp step's candidate read runs on every scheduled pass. On the
+/// fleet fixture (every pot unstamped, the first deploy's shape) and again with every pot stamped but a few, it
+/// walks the partial index of the unstamped rows in its two windows and probes `pot_beefs` by key: never a pot
+/// table whole, never `pot_beefs` by its latch, under statistics too.
+#[test]
+fn pre557_the_stamp_candidates_read_two_windows_of_the_null_index() {
+    use bsv_overlay_cloudflare::d1_discovery::{
+        POT_BLOCK_TIME_SCAN_ROWS, VERIFIED_POTS_WITHOUT_BLOCK_TIME_SQL as SQL,
+    };
+    let check_plan = |db: &Connection, what: &str| {
+        let details = plan(db, SQL);
+        println!("{what} plan: {details:?}");
+        for d in &details {
+            assert!(
+                !d.starts_with("SCAN")
+                    || d == "SCAN c"
+                    || d.contains("subquery")
+                    || d.contains("idx_pot_records_block_time_null"),
+                "{what}: a fleet scan: {d} (plan {details:?})"
+            );
+            assert!(
+                !d.starts_with("SEARCH b") || d.contains("(txid=?)"),
+                "{what}: pot_beefs walked by its latch: {d} (plan {details:?})"
+            );
+        }
+    };
+    let steps = |db: &Connection| {
+        let mut stmt = db.prepare(SQL).unwrap();
+        let mut rows = stmt
+            .query(rusqlite::params![
+                "80",
+                i64::from(POT_BLOCK_TIME_SCAN_ROWS),
+                48
+            ])
+            .unwrap();
+        let mut n = 0;
+        while rows.next().unwrap().is_some() {
+            n += 1;
+        }
+        drop(rows);
+        (n, stmt.get_status(rusqlite::StatementStatus::FullscanStep))
+    };
+    let db = fixture();
+    let pots: i64 = db
+        .query_row("SELECT COUNT(*) FROM pot_records", [], |r| r.get(0))
+        .unwrap();
+    assert!(pots > 1_000, "the fleet fixture: {pots} pot rows");
+    check_plan(&db, "unstamped fleet");
+    let (n, scan) = steps(&db);
+    println!("unstamped fleet: {n} candidates, {scan} scan steps of {pots} pot rows");
+    assert!(
+        scan <= 2 * POT_BLOCK_TIME_SCAN_ROWS as i32 + 2,
+        "two windows of the index: {scan}"
+    );
+    // the steady state: every pot stamped but a few
+    db.execute_batch("UPDATE pot_records SET blockTime = 1 WHERE rowid % 50 <> 0")
+        .unwrap();
+    let (_, scan) = steps(&db);
+    assert!(
+        scan <= 2 * POT_BLOCK_TIME_SCAN_ROWS as i32 + 2,
+        "steady state: {scan}"
+    );
+    db.execute_batch("ANALYZE").unwrap();
+    check_plan(&db, "after ANALYZE");
+    let (_, scan) = steps(&db);
+    assert!(
+        scan <= 2 * POT_BLOCK_TIME_SCAN_ROWS as i32 + 2,
+        "under statistics: {scan}"
+    );
+}

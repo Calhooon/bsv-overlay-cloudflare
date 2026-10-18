@@ -1572,9 +1572,9 @@ pub struct PotProofSummary {
     pub stitch_failed: usize,
     /// bsv-low #470 PRE557: pot rows given their confirming block's time (`pot_records.blockTime`).
     pub block_time_stamped: usize,
-    /// bsv-low #470 PRE557: verified candidates held back (not latched, not compacted, retried next
-    /// tick) because their pot row's block time could not be read or written this pass: the header
-    /// source faulted, held no header there, or held another root.
+    /// bsv-low #470 PRE557: latched pots the stamp step could not stamp this pass (asked again on a
+    /// later one): no own bump in the stored BEEF, the header source faulted, held no header there or
+    /// held another root, or the write faulted. A held stamp holds nothing else (never the latch).
     pub block_time_held: usize,
 }
 
@@ -1586,70 +1586,116 @@ pub trait BlockTimeSource {
     async fn block_time(&self, height: u32, merkle_root: &str) -> Result<Option<u64>, String>;
 }
 
-/// bsv-low #470 PRE557: the pot rows one completion pass stamps at most (each at most one header read,
-/// memoised per block, and one D1 write: at most 96 more operations on the pass's budget, beside the
-/// one candidate read). A verified candidate past it is held, not latched, and stamped on a later pass
-/// (a re-index's 1,100 pots: about 23 scheduled passes, or the operator's `/admin/reverifyPotBeefs`).
+/// bsv-low #470 PRE557: the pot rows one stamp step stamps at most (each at most one header read,
+/// memoised per block, and one D1 write: at most 96 operations on the pass's budget, beside the one
+/// candidate read). The rest wait for a later pass (a re-index's 1,100 pots: about 23 scheduled passes,
+/// or the operator's `/admin/reverifyPotBeefs`). It bounds the stamp step alone: the latch is never held
+/// for a stamp (the lens fold, MEDIUM-3).
 pub const POT_BLOCK_TIME_STAMPS_PER_PASS: usize = 48;
 
 /// The (height, root) and the time-read outcome of one pass, memoised so a block's pots cost one read.
 type BlockTimeMemo = HashMap<(u32, String), Result<Option<u64>, String>>;
 
-/// bsv-low #470 PRE557: stamp `txid`'s pot row with the time of the block `bump_hex` binds it to. `true`
-/// when the row may be latched now (stamped, or no source configured); `false` holds it for a later pass.
-async fn stamp_block_time(
+/// The start key of the stamp step's random window (64 hex digits): `Math.random` on the Worker, a
+/// per-thread xorshift natively. Its distribution is not a correctness matter: the first window of the
+/// statement reaches the start of the key space whatever it is.
+fn stamp_scan_start() -> String {
+    #[cfg(target_arch = "wasm32")]
+    let words = [
+        js_sys::Math::random().to_bits(),
+        js_sys::Math::random().to_bits(),
+    ];
+    #[cfg(not(target_arch = "wasm32"))]
+    let words = {
+        thread_local!(static STATE: Cell<u64> = const { Cell::new(0x9e37_79b9_7f4a_7c15) });
+        STATE.with(|st| {
+            let next = || {
+                let mut x = st.get();
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                st.set(x);
+                x
+            };
+            [next(), next()]
+        })
+    };
+    format!("{:016x}{:016x}{:032x}", words[0], words[1], 0u128)
+}
+
+/// bsv-low #470 PRE557 (the lens fold, HIGH-1 and MEDIUM-3): the STAMP STEP, its own read, independent
+/// of the latch. Every pot whose proof is LATCHED, by whichever path latched it (the completion pass,
+/// the `/arc-ingest` MINED push, a reorg re-anchor), and whose pot row has no `blockTime`, is stamped
+/// from the header its STORED verified bump binds to (chaintracks' header at the bump's height, taken
+/// only when that header's merkle root is the root the bump computes; never a courier's word). A
+/// re-indexed pot's `createdAt` (NOW at its re-admission) becomes its block's time, so the #375 era
+/// filter keeps the written-off era written off. A stamp that cannot be made (no own bump, a header
+/// fault, no header with that root, a write fault) is counted held and asked again on a later pass; it
+/// holds nothing else. An unmined pot has no latched proof and is never a candidate: it keeps NOW.
+///
+/// Stated (the lens's LOW-1): `blockTime` is written once (`blockTime IS NULL`); a reorg's re-anchor does
+/// not re-stamp it, so it can be off by the minutes between two competing blocks at the tip. The #375
+/// cutoff sits months below any reorg, so the era judgement cannot flip.
+pub async fn stamp_pot_block_times(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     block_times: &dyn BlockTimeSource,
-    memo: &mut BlockTimeMemo,
-    txid: &str,
-    bump_hex: &str,
     summary: &mut PotProofSummary,
-    attempts: &mut usize,
-) -> bool {
-    if *attempts >= POT_BLOCK_TIME_STAMPS_PER_PASS {
-        summary.block_time_held += 1;
-        return false;
-    }
-    *attempts += 1;
-    let Some((height, root)) = MerklePath::from_hex(bump_hex)
-        .ok()
-        .and_then(|mp| mp.compute_root(Some(txid)).ok().map(|r| (mp.block_height, r)))
-    else {
-        summary.block_time_held += 1;
-        return false;
-    };
-    let key = (height, root.to_ascii_lowercase());
-    if !memo.contains_key(&key) {
-        let read = block_times.block_time(height, &key.1).await;
-        memo.insert(key.clone(), read);
-    }
-    match memo.get(&key) {
-        Some(Ok(Some(secs))) => match pot_storage.stamp_pot_block_time(txid, *secs).await {
-            Ok(()) => {
-                summary.block_time_stamped += 1;
-                true
-            }
-            Err(e) => {
-                push_log(&format!("[pot-proof] {txid} block-time stamp write failed (retry): {e}"));
-                summary.block_time_held += 1;
-                false
-            }
-        },
-        Some(Ok(None)) => {
+) {
+    let candidates = match pot_storage
+        .verified_pots_without_block_time(&stamp_scan_start(), POT_BLOCK_TIME_STAMPS_PER_PASS)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
             push_log(&format!(
-                "[pot-proof] {txid} no header with the bump's root at {height} for its block time (retry)"
+                "[pot-proof] block-time candidate read failed (retry): {e}"
+            ));
+            return;
+        }
+    };
+    let mut memo = BlockTimeMemo::new();
+    for (txid, stored_beef) in candidates.into_iter().take(POT_BLOCK_TIME_STAMPS_PER_PASS) {
+        let Some((height, root)) = own_bump_hex(&stored_beef, &txid).and_then(|bump_hex| {
+            MerklePath::from_hex(&bump_hex).ok().and_then(|mp| {
+                mp.compute_root(Some(&txid))
+                    .ok()
+                    .map(|r| (mp.block_height, r))
+            })
+        }) else {
+            push_log(&format!(
+                "[pot-proof] {txid} latched BEEF carries no own bump to stamp from (retry)"
             ));
             summary.block_time_held += 1;
-            false
+            continue;
+        };
+        let key = (height, root.to_ascii_lowercase());
+        if !memo.contains_key(&key) {
+            let read = block_times.block_time(height, &key.1).await;
+            memo.insert(key.clone(), read);
         }
-        Some(Err(e)) => {
-            push_log(&format!("[pot-proof] {txid} block-time header read failed at {height} (retry): {e}"));
-            summary.block_time_held += 1;
-            false
-        }
-        None => {
-            summary.block_time_held += 1;
-            false
+        match memo.get(&key) {
+            Some(Ok(Some(secs))) => match pot_storage.stamp_pot_block_time(&txid, *secs).await {
+                Ok(()) => summary.block_time_stamped += 1,
+                Err(e) => {
+                    push_log(&format!(
+                        "[pot-proof] {txid} block-time stamp write failed (retry): {e}"
+                    ));
+                    summary.block_time_held += 1;
+                }
+            },
+            Some(Ok(None)) => {
+                push_log(&format!(
+                    "[pot-proof] {txid} no header with the bump's root at {height} for its block time (retry)"
+                ));
+                summary.block_time_held += 1;
+            }
+            Some(Err(e)) => {
+                push_log(&format!(
+                    "[pot-proof] {txid} block-time header read failed at {height} (retry): {e}"
+                ));
+                summary.block_time_held += 1;
+            }
+            None => summary.block_time_held += 1,
         }
     }
 }
@@ -1668,16 +1714,28 @@ async fn stamp_block_time(
 /// FAIL-CLOSED throughout: a candidate the fetcher can't verify is skipped
 /// (retried next tick), never written proofless. Bounded by `limit`.
 ///
-/// bsv-low #470 PRE557: before a verified candidate that names a pot row with no block time is latched
-/// or compacted, the row is stamped from `block_times` (the header the verified bump binds to; never a
-/// courier's word), so a re-indexed pot's `createdAt` (NOW at its re-admission) becomes its block's time
-/// and the #375 era filter keeps the written-off era written off. A stamp that cannot be made holds the
-/// candidate for a later pass. An unmined pot is never a verified candidate: it keeps NOW and its NULL
-/// `blockTime` marks it. `None` stamps nothing (the pre-PRE557 pass).
+/// bsv-low #470 PRE557: with `block_times`, the pass then runs the STAMP STEP
+/// ([`stamp_pot_block_times`]) over every latched, unstamped pot, whatever latched it and whether or not
+/// this pass's candidate scan answered. The latch never waits for a stamp. `None` stamps nothing (the
+/// pre-PRE557 pass).
 pub async fn complete_pot_beef_proofs(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
     block_times: Option<&dyn BlockTimeSource>,
+    limit: u64,
+    min_age_secs: u64,
+) -> PotProofSummary {
+    let mut summary = complete_pot_beef_latches(pot_storage, fetcher, limit, min_age_secs).await;
+    if let Some(source) = block_times {
+        stamp_pot_block_times(pot_storage, source, &mut summary).await;
+    }
+    summary
+}
+
+/// The completion pass's latch and compaction, exactly as before bsv-low #470 PRE557.
+async fn complete_pot_beef_latches(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
     limit: u64,
     min_age_secs: u64,
 ) -> PotProofSummary {
@@ -1701,24 +1759,6 @@ pub async fn complete_pot_beef_proofs(
     // POT_PROOF_PASS_LIMIT counts on this).
     let mut latched: Vec<(String, Option<u64>)> = Vec::new();
 
-    // bsv-low #470 PRE557: the candidates naming a pot row with no block time yet (one read per page).
-    let unstamped: std::collections::HashSet<String> = match block_times {
-        Some(_) if !candidates.is_empty() => {
-            let txids: Vec<String> = candidates.iter().map(|(t, _)| t.clone()).collect();
-            match pot_storage.pots_without_block_time(&txids).await {
-                Ok(v) => v.into_iter().collect(),
-                Err(e) => {
-                    push_log(&format!("[pot-proof] block-time candidate read failed (retry): {e}"));
-                    summary.block_time_held = candidates.len();
-                    return summary;
-                }
-            }
-        }
-        _ => std::collections::HashSet::new(),
-    };
-    let mut memo = BlockTimeMemo::new();
-    let mut stamp_attempts = 0usize;
-
     for (txid, stored_beef) in candidates {
         // bsv-low#304 fast path (mirrors the engine's transactions pass): a
         // candidate whose STORED bytes already carry a bump for its own txid
@@ -1734,11 +1774,6 @@ pub async fn complete_pot_beef_proofs(
         let stored_bump = own_bump_hex(&stored_beef, &txid);
         if let Some(bump_hex) = stored_bump {
             if fetcher.verify_proof(&txid, &bump_hex).await {
-                if let (Some(source), true) = (block_times, unstamped.contains(&txid)) {
-                    if !stamp_block_time(pot_storage, source, &mut memo, &txid, &bump_hex, &mut summary, &mut stamp_attempts).await {
-                        continue;
-                    }
-                }
                 // round-2 review M4: the anchor rides the latch, so the
                 // revalidation sweep can window this row later
                 let anchor = bsv_rs::transaction::MerklePath::from_hex(&bump_hex)
@@ -1761,12 +1796,6 @@ pub async fn complete_pot_beef_proofs(
             summary.still_unconfirmed += 1;
             continue;
         };
-
-        if let (Some(source), true) = (block_times, unstamped.contains(&txid)) {
-            if !stamp_block_time(pot_storage, source, &mut memo, &txid, &bump_hex, &mut summary, &mut stamp_attempts).await {
-                continue;
-            }
-        }
 
         match stitch_and_trim_pot_beef(&txid, &stored_beef, &bump_hex) {
             Some(compacted) => {
@@ -2139,8 +2168,14 @@ pub async fn run_pot_maintenance(
 ) -> (SpendConfirmSummary, PotProofSummary) {
     let spend =
         complete_spend_confirmations(pot_storage, spend_fetcher, spend_limit, min_age_secs).await;
-    let pot =
-        complete_pot_beef_proofs(pot_storage, pot_fetcher, block_times, pot_limit, min_age_secs).await;
+    let pot = complete_pot_beef_proofs(
+        pot_storage,
+        pot_fetcher,
+        block_times,
+        pot_limit,
+        min_age_secs,
+    )
+    .await;
     (spend, pot)
 }
 
@@ -6872,13 +6907,20 @@ pub(crate) mod tests {
         pre557_store_pot(&store, &txid, &beef, PRE557_NOW_SECS).await;
         let block = PRE557_CUTOFF_SECS - 86_400;
         // a one-leaf bump's root is the txid itself
-        let times = FakeBlockTimes::new(BlockTimeMemo::from([((HEIGHT, txid.clone()), Ok(Some(block)))]));
+        let times = FakeBlockTimes::new(BlockTimeMemo::from([(
+            (HEIGHT, txid.clone()),
+            Ok(Some(block)),
+        )]));
 
         let fetcher = ReverifyFetcher::new(true);
         let pass = complete_pot_beef_proofs(&store, &fetcher, Some(&times), 20, 0).await;
         assert_eq!(pass.already_proven, 1, "the verified row still latches");
         assert_eq!(pass.block_time_stamped, 1);
-        assert_eq!(times.reads.get(), 1, "one header read, at the bump's height and root");
+        assert_eq!(
+            times.reads.get(),
+            1,
+            "one header read, at the bump's height and root"
+        );
         assert_eq!(
             pre557_created_at(&store, &txid),
             Some(block),
@@ -6893,9 +6935,14 @@ pub(crate) mod tests {
         let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, 8);
         pre557_store_pot(&store, &txid, &beef, PRE557_NOW_SECS).await;
         let block = PRE557_CUTOFF_SECS + 30 * 86_400;
-        let times = FakeBlockTimes::new(BlockTimeMemo::from([((HEIGHT, txid.clone()), Ok(Some(block)))]));
+        let times = FakeBlockTimes::new(BlockTimeMemo::from([(
+            (HEIGHT, txid.clone()),
+            Ok(Some(block)),
+        )]));
 
-        let pass = complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), 20, 0).await;
+        let pass =
+            complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), 20, 0)
+                .await;
         assert_eq!(pass.block_time_stamped, 1);
         assert_eq!(pre557_created_at(&store, &txid), Some(block));
     }
@@ -6905,33 +6952,68 @@ pub(crate) mod tests {
         let store = MemoryPotStorage::new();
         let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, 9);
         pre557_store_pot(&store, &txid, &beef, PRE557_NOW_SECS).await;
-        let times = FakeBlockTimes::new(BlockTimeMemo::from([((HEIGHT, txid.clone()), Ok(Some(1)))]));
+        let times =
+            FakeBlockTimes::new(BlockTimeMemo::from([((HEIGHT, txid.clone()), Ok(Some(1)))]));
 
         // chaintracks refutes the stored bump and no courier holds a proof: unmined
-        let pass = complete_pot_beef_proofs(&store, &ReverifyFetcher::new(false), Some(&times), 20, 0).await;
+        let pass =
+            complete_pot_beef_proofs(&store, &ReverifyFetcher::new(false), Some(&times), 20, 0)
+                .await;
         assert_eq!(pass.still_unconfirmed, 1);
         assert_eq!(pass.block_time_stamped, 0);
-        assert_eq!(times.reads.get(), 0, "no header is read for an unverified bump");
-        assert_eq!(pre557_created_at(&store, &txid), Some(PRE557_NOW_SECS), "unmined: NOW");
+        assert_eq!(
+            times.reads.get(),
+            0,
+            "no header is read for an unlatched proof"
+        );
+        assert_eq!(
+            pre557_created_at(&store, &txid),
+            Some(PRE557_NOW_SECS),
+            "unmined: NOW"
+        );
         assert!(
-            store.pots_without_block_time(std::slice::from_ref(&txid)).await.unwrap() == vec![txid.clone()],
-            "and marked: no block time"
+            !store.block_times.lock().unwrap().contains_key(&txid),
+            "and no block time"
         );
     }
 
     #[tokio::test]
-    async fn pre557_d_an_unreadable_header_holds_the_latch() {
+    async fn pre557_d_an_unreadable_header_holds_the_stamp_never_the_latch() {
         for answer in [Err("chaintracks 503".to_string()), Ok(None)] {
             let store = MemoryPotStorage::new();
             let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, 10);
             pre557_store_pot(&store, &txid, &beef, PRE557_NOW_SECS).await;
-            let times = FakeBlockTimes::new(BlockTimeMemo::from([((HEIGHT, txid.clone()), answer.clone())]));
+            let times = FakeBlockTimes::new(BlockTimeMemo::from([(
+                (HEIGHT, txid.clone()),
+                answer.clone(),
+            )]));
 
-            let pass = complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), 20, 0).await;
-            assert_eq!(pass.already_proven, 0, "{answer:?}: not latched");
+            let pass =
+                complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), 20, 0)
+                    .await;
+            assert_eq!(
+                pass.already_proven, 1,
+                "{answer:?}: the latch never waits for a stamp (MEDIUM-3)"
+            );
+            assert!(store.pot_beef_proof_verified(&txid).await.unwrap());
             assert_eq!(pass.block_time_held, 1);
-            assert!(!store.pot_beef_proof_verified(&txid).await.unwrap(), "a candidate again next tick");
             assert_eq!(pre557_created_at(&store, &txid), Some(PRE557_NOW_SECS));
+
+            // the header source answers on a later pass: the latched row is stamped then
+            let block = PRE557_CUTOFF_SECS - 86_400;
+            let later = FakeBlockTimes::new(BlockTimeMemo::from([(
+                (HEIGHT, txid.clone()),
+                Ok(Some(block)),
+            )]));
+            let again =
+                complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&later), 20, 0)
+                    .await;
+            assert_eq!(
+                again.scanned, 0,
+                "{answer:?}: no longer a completion candidate"
+            );
+            assert_eq!(again.block_time_stamped, 1);
+            assert_eq!(pre557_created_at(&store, &txid), Some(block));
         }
     }
 
@@ -6943,10 +7025,19 @@ pub(crate) mod tests {
             let store = MemoryPotStorage::new();
             let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, salt);
             pre557_store_pot(&store, &txid, &beef, admitted).await;
-            let times = FakeBlockTimes::new(BlockTimeMemo::from([((HEIGHT, txid.clone()), Ok(Some(block)))]));
-            let pass = complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), 20, 0).await;
+            let times = FakeBlockTimes::new(BlockTimeMemo::from([(
+                (HEIGHT, txid.clone()),
+                Ok(Some(block)),
+            )]));
+            let pass =
+                complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), 20, 0)
+                    .await;
             assert_eq!(pass.block_time_stamped, 1);
-            assert_eq!(pre557_created_at(&store, &txid), Some(admitted), "the admission time stands");
+            assert_eq!(
+                pre557_created_at(&store, &txid),
+                Some(admitted),
+                "the admission time stands"
+            );
         }
     }
 
@@ -6964,15 +7055,63 @@ pub(crate) mod tests {
         }
         let times = FakeBlockTimes::new(answers);
         let limit = txids.len() as u64;
-        let first = complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), limit, 0).await;
+        let first =
+            complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), limit, 0)
+                .await;
+        assert_eq!(
+            first.already_proven,
+            txids.len(),
+            "every row latches: the cap bounds the stamp step alone"
+        );
         assert_eq!(first.block_time_stamped, POT_BLOCK_TIME_STAMPS_PER_PASS);
-        assert_eq!(first.block_time_held, 5, "past the bound: held, not latched");
-        assert_eq!(first.already_proven, POT_BLOCK_TIME_STAMPS_PER_PASS);
-        let second = complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), limit, 0).await;
-        assert_eq!(second.block_time_stamped, 5, "the held rows are stamped on the next pass");
+        assert_eq!(
+            first.block_time_held, 0,
+            "the rest are not read this pass, nothing is held"
+        );
+        let second =
+            complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), limit, 0)
+                .await;
+        assert_eq!(second.scanned, 0);
+        assert_eq!(
+            second.block_time_stamped, 5,
+            "the rest are stamped on the next pass"
+        );
         for txid in &txids {
             assert_eq!(pre557_created_at(&store, txid), Some(block));
         }
+    }
+
+    /// The PRE557 lens's HIGH-1 witness: a re-indexed pot whose proof the `/arc-ingest` MINED push (or a
+    /// reorg re-anchor) latches is never a completion candidate again, so a stamp that rides the latch
+    /// never reaches it. The stamp is its own step over the verified, unstamped rows.
+    #[tokio::test]
+    async fn lens_w2_push_latched_reindexed_pot_is_never_stamped() {
+        let store = MemoryPotStorage::new();
+        let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, 13);
+        pre557_store_pot(&store, &txid, &beef, PRE557_NOW_SECS).await;
+        let block = PRE557_CUTOFF_SECS - 86_400;
+        let pushed = apply_pushed_proof_to_pot_stores(
+            &store,
+            &txid,
+            &single_tx_bump(&txid, HEIGHT).to_hex(),
+        )
+        .await;
+        assert!(pushed.pot_beef_compacted, "the push latched the pot");
+        assert!(store.pot_beef_proof_verified(&txid).await.unwrap());
+        let times = FakeBlockTimes::new(BlockTimeMemo::from([(
+            (HEIGHT, txid.clone()),
+            Ok(Some(block)),
+        )]));
+        let pass =
+            complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), 20, 0)
+                .await;
+        assert_eq!(pass.scanned, 0, "a latched pot is no completion candidate");
+        assert_eq!(
+            pre557_created_at(&store, &txid),
+            Some(block),
+            "the push-latched pot's NOW becomes its block's time"
+        );
+        assert_eq!(pass.block_time_stamped, 1);
     }
 
     #[test]
@@ -6983,11 +7122,29 @@ pub(crate) mod tests {
             merkle_root: Some("bb".repeat(32)),
             time: Some(1_786_000_000),
         };
-        assert_eq!(header_time_for_root(Some(&facts), &"BB".repeat(32)), Some(1_786_000_000));
-        assert_eq!(header_time_for_root(Some(&facts), &"cc".repeat(32)), None, "another root");
-        assert_eq!(header_time_for_root(None, &"bb".repeat(32)), None, "no header");
-        let untimed = CtHeaderFacts { time: None, ..facts };
-        assert_eq!(header_time_for_root(Some(&untimed), &"bb".repeat(32)), None, "no time");
+        assert_eq!(
+            header_time_for_root(Some(&facts), &"BB".repeat(32)),
+            Some(1_786_000_000)
+        );
+        assert_eq!(
+            header_time_for_root(Some(&facts), &"cc".repeat(32)),
+            None,
+            "another root"
+        );
+        assert_eq!(
+            header_time_for_root(None, &"bb".repeat(32)),
+            None,
+            "no header"
+        );
+        let untimed = CtHeaderFacts {
+            time: None,
+            ..facts
+        };
+        assert_eq!(
+            header_time_for_root(Some(&untimed), &"bb".repeat(32)),
+            None,
+            "no time"
+        );
     }
 
     #[tokio::test]
@@ -7213,7 +7370,8 @@ pub(crate) mod tests {
         tracker.add_root(HEIGHT, txid_bumped.clone());
         let fetcher = ChainProofFetcher::new(Some(std::rc::Rc::new(tracker))).with_budget(0);
 
-        let pass = complete_pot_beef_proofs(&store, &fetcher, None, ADMIN_REVERIFY_MAX_LIMIT, 0).await;
+        let pass =
+            complete_pot_beef_proofs(&store, &fetcher, None, ADMIN_REVERIFY_MAX_LIMIT, 0).await;
         assert_eq!(pass.scanned, 2);
         assert_eq!(
             pass.already_proven, 1,
