@@ -2,7 +2,8 @@
 // `lb642_emit_the_d1_cell`) through local D1 and hold its rows_read: identical ordered rows, each statement under its
 // ceiling, each request under the per-request ceiling. The whole-board read's statements are replayed for the record.
 // bsv-low #674 fold (MEDIUM-1): a request marked `flat` must read the same rows on every board the run replays; the
-// third argument names the file that carries the first board's figure to the next.
+// third argument names the file that carries the first board's figure to the next. bsv-low #674, the cutoff: a request
+// marked `flatHead: N` holds its first N statements flat the same way.
 // Usage: node board_pin.mjs <expected.json> <persisted D1 dir> [<flat figures file>]
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -35,6 +36,7 @@ try {
   for (const req of expected.requests) {
     let total = 0
     let max = 0
+    let head = 0
     for (const [i, s] of req.statements.entries()) {
       const a = await db.prepare(s.sql).all()
       assert.equal(a.success, true, `${req.name} #${i}`)
@@ -44,6 +46,7 @@ try {
         assert.ok(a.meta.rows_read <= req.statementCeiling, `${req.name} #${i}: ${a.meta.rows_read} reads > ${req.statementCeiling}: ${s.sql.slice(0, 120)}`)
       }
       total += a.meta.rows_read
+      if (i < (req.flatHead ?? 0)) head += a.meta.rows_read
       max = Math.max(max, a.meta.rows_read)
     }
     if (req.ceiling !== null) {
@@ -57,6 +60,18 @@ try {
       } else {
         assert.equal(total, flat[req.name].reads, `${req.name}: ${total} reads at ${expected.wins} wins, ${flat[req.name].reads} at ${flat[req.name].wins}: not flat`)
         console.log(`FLAT ${req.name}: ${total} reads at ${flat[req.name].wins} and ${expected.wins} wins`)
+      }
+    }
+    // bsv-low #674, the cutoff: a request marked `flatHead` holds its first N statements' reads flat across boards.
+    if (req.flatHead && process.argv[4]) {
+      const key = `${req.name} (its first ${req.flatHead} statements)`
+      const flat = existsSync(process.argv[4]) ? JSON.parse(readFileSync(process.argv[4], 'utf8')) : {}
+      if (flat[key] === undefined) {
+        flat[key] = { wins: expected.wins, reads: head }
+        writeFileSync(process.argv[4], JSON.stringify(flat))
+      } else {
+        assert.equal(head, flat[key].reads, `${key}: ${head} reads at ${expected.wins} wins, ${flat[key].reads} at ${flat[key].wins}: not flat`)
+        console.log(`FLAT ${key}: ${head} reads at ${flat[key].wins} and ${expected.wins} wins`)
       }
     }
     // The whole-board read is the RED side: past the page ceiling on the same board.

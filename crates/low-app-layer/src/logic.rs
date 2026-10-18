@@ -2675,11 +2675,26 @@ pub fn chain_wins_candidates_sql(written_off_before_ms: Option<i64>) -> String {
 // is a keyset walk of `board_owners`' rank index, the page owners' rows of
 // `board_wins` by owner, and the hands by their rank index: the top N read N
 // rows, whatever the era holds. Served only once the overlay's backfill has
-// stamped `board-v1` and only with no era cutoff; otherwise the candidate read.
+// stamped `board-v1` and only when the cutoff the tables are derived under
+// (`board_era`, the overlay's stamp) is the route's own era cutoff; otherwise
+// the candidate read.
 
-/// The board tables' readiness (the `board-v1` stamp) and the count of every
-/// counted win. Fails to prepare on a database the overlay has not migrated.
-pub const BOARD_READY_SQL: &str = "SELECT (SELECT 1 FROM view_derivation_state WHERE name = 'board-v1') AS ready, (SELECT wins FROM board_total WHERE id = 1) AS total";
+/// The board tables' readiness (the `board-v1` stamp), the count of every
+/// counted win, and the cutoff the tables are derived under (`era` 1 when the
+/// overlay's `board_era` row exists, `cutoffMs` its cutoff, NULL for none).
+/// Fails to prepare on a database the overlay has not migrated.
+pub const BOARD_READY_SQL: &str = "SELECT (SELECT 1 FROM view_derivation_state WHERE name = 'board-v1') AS ready, (SELECT wins FROM board_total WHERE id = 1) AS total, (SELECT 1 FROM board_era WHERE id = 1) AS era, (SELECT cutoffMs FROM board_era WHERE id = 1) AS cutoffMs";
+
+/// bsv-low #674, the cutoff: the app layer's era cutoff (`?1`, ms) stamped into
+/// the overlay's `board_era`, on the scheduled pass only. A no-op when it is
+/// already the stamp; otherwise the overlay's `board_era_update` trigger
+/// re-derives the whole board under it in this statement.
+pub const BOARD_ERA_SET_SQL: &str =
+    "UPDATE board_era SET cutoffMs = ?1 WHERE id = 1 AND cutoffMs IS NOT ?1";
+
+/// No era cutoff (the var unset): the stamp cleared, a no-op when none is.
+pub const BOARD_ERA_CLEAR_SQL: &str =
+    "UPDATE board_era SET cutoffMs = NULL WHERE id = 1 AND cutoffMs IS NOT NULL";
 
 /// The owner page by rank offset (`?after`): a range SEARCH of the rank index
 /// (every row holds at least one win; the overlay deletes a row at 0). BINDS:

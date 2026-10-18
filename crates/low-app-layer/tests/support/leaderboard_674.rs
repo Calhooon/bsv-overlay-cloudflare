@@ -400,3 +400,406 @@ fn lb674_fold_lowa_an_owner_past_the_card_bound_is_read_by_its_wins() {
     }
     compare("readmitted");
 }
+
+// bsv-low #674, the cutoff (lane W2-LB-674-CUTOFF): beta and prod both set `WRITTEN_OFF_BEFORE_MS`, so these are the
+// pins of the read as it is served. The tables are derived under the cutoff the scheduled pass stamps into the
+// overlay's `board_era` (`sync_board_era`), and the route reads them only under that same cutoff.
+
+/// The era cutoff (ms) that keeps the fixture's counted wins from the `nth` oldest admission stamp on.
+fn cutoff_at(db: &Connection, nth: usize) -> i64 {
+    let cte = crate::logic::chain_wins_cte("?1", None);
+    let stamps: Vec<i64> = db
+        .prepare(&format!(
+            "{cte} SELECT potCreatedAt FROM owned ORDER BY potCreatedAt ASC"
+        ))
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    stamps[nth] * 1000
+}
+
+/// The counted wins of the era `era` (the from-scratch read).
+fn counted_under(db: &Connection, era: Option<i64>) -> usize {
+    let cte = crate::logic::chain_wins_cte("?1", era);
+    let sql = format!("{cte} SELECT COUNT(*) FROM owned");
+    match era {
+        Some(ms) => db.query_row(&sql, [ms], |r| r.get::<_, i64>(0)),
+        None => db.query_row(&sql, [], |r| r.get::<_, i64>(0)),
+    }
+    .unwrap() as usize
+}
+
+/// The scheduled pass's stamp (`sync_board_era`), over rusqlite.
+fn stamp(db: &Connection, era: Option<i64>) {
+    run(sync_board_era(&SqliteBoard::new(db), era)).unwrap();
+}
+
+/// The SHIPPED dispatcher under the era cutoff `era`.
+fn served_under(
+    db: &Connection,
+    page: usize,
+    start: &crate::logic::PageStart,
+    era: Option<i64>,
+) -> (String, Vec<(String, Vec<serde_json::Value>)>) {
+    let board = SqliteBoard::new(db);
+    let (status, body) = run(leaderboard_page_body(
+        &board,
+        page,
+        start,
+        era,
+        crate::logic::LEADERBOARD_CANDIDATE_WINS,
+        NOW,
+    ));
+    assert_eq!(status, 200, "{body}");
+    (body, board.log.into_inner())
+}
+
+/// #642's candidate read under the era cutoff `era`.
+fn candidates_under(
+    db: &Connection,
+    page: usize,
+    start: &crate::logic::PageStart,
+    era: Option<i64>,
+) -> String {
+    let board = SqliteBoard::new(db);
+    let (status, body) = run(leaderboard_candidate_body(
+        &board,
+        page,
+        start,
+        era,
+        crate::logic::LEADERBOARD_CANDIDATE_WINS,
+        NOW,
+    ));
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+/// The whole-board read (pre-#642) under the era cutoff `era`.
+fn whole_under(db: &Connection, page: usize, after: usize, era: Option<i64>) -> String {
+    let board = SqliteBoard::new(db);
+    let (status, body) = run(super::leaderboard_642::whole_board_page_body(
+        &board, page, after, era, NOW,
+    ));
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+/// Every page shape and offset of the 1,500 win board under `era`: the table read served it, and its body is #642's
+/// candidate read's and the whole-board read's under the same cutoff, byte for byte but the counting fields (which
+/// say which read ranked it); it counts the era's wins. Returns whether a posted proof was among the compared bytes.
+fn identical_under(db: &Connection, era: Option<i64>, label: &str) -> bool {
+    let total = counted_under(db, era);
+    let mut decorated = false;
+    for page in [
+        crate::logic::LEADERBOARD_PAGE_DEFAULT,
+        7,
+        crate::logic::LEADERBOARD_PAGE_MAX,
+    ] {
+        for after in [0usize, 7, 51, 140, 400] {
+            let start = crate::logic::PageStart::Offset(after);
+            let (table, log) = served_under(db, page, &start, era);
+            assert!(
+                used_the_tables(&log),
+                "{label}: page {page} after {after}: the table read served it under the cutoff"
+            );
+            let cands = candidates_under(db, page, &start, era);
+            assert_eq!(
+                without_count(&table),
+                without_count(&cands),
+                "{label}: page {page} after {after}: the table read is the candidate read's body under the cutoff"
+            );
+            assert_eq!(
+                without_642_fields(&table),
+                whole_under(db, page, after, era),
+                "{label}: page {page} after {after}: and the whole-board read's"
+            );
+            let v = served(&table);
+            assert_eq!(v["candidatesBounded"], serde_json::json!(false));
+            assert_eq!(
+                v["candidates"],
+                serde_json::json!(total),
+                "{label}: the era's wins"
+            );
+            decorated |= v["board"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|r| r["evidence"].as_array().unwrap())
+                .any(|e| e["proofPosted"] == serde_json::json!(true));
+        }
+    }
+    decorated
+}
+
+/// THE PIN OF THE LANE. Under a cutoff stamped into the derivation, the table read serves every page and its body
+/// is #642's candidate read's under the same cutoff (the #685 decoration included), a board that is not the
+/// cutoff-free one. RED on main (`b444fc7`): under any cutoff `leaderboard_page_body` took the candidate read, "the
+/// table read served it under the cutoff"; RED with the overlay's `board_win_era` guard removed alone: the tables
+/// count the wins before the cutoff, "the table read is the candidate read's body under the cutoff".
+#[test]
+fn lb674_cut_under_the_cutoff_the_table_read_is_the_candidate_read() {
+    let db = fixture(1_500);
+    let era = cutoff_at(&db, 600);
+    assert!(counted_under(&db, Some(era)) < counted_under(&db, None));
+    stamp(&db, Some(era));
+    assert!(
+        identical_under(&db, Some(era), "cut at the 600th win"),
+        "the #685 decoration is part of the compared bytes"
+    );
+    let start = crate::logic::PageStart::Offset(0);
+    assert_ne!(
+        without_count(&served_under(&db, 50, &start, Some(era)).0),
+        without_count(&candidates_under(&db, 50, &start, None)),
+        "the era's board is not the cutoff-free board"
+    );
+}
+
+/// The keyset cursor walk under the cutoff, page by page (`nextCursor`, `nextAfter`), is the candidate read's: a
+/// walk of at least four pages, every page served by the table read.
+#[test]
+fn lb674_cut_the_cursor_walk_under_the_cutoff_is_the_candidate_walk() {
+    let db = fixture(1_500);
+    let era = cutoff_at(&db, 600);
+    stamp(&db, Some(era));
+    let page = 40;
+    let mut start = crate::logic::PageStart::Offset(0);
+    let mut pages = 0;
+    loop {
+        let (table, log) = served_under(&db, page, &start, Some(era));
+        assert!(used_the_tables(&log), "page {pages}: the table read");
+        let cands = candidates_under(&db, page, &start, Some(era));
+        assert_eq!(without_count(&table), without_count(&cands), "page {pages}");
+        pages += 1;
+        match served(&table).get("nextCursor").and_then(|c| c.as_str()) {
+            Some(c) => start = crate::logic::parse_leaderboard_cursor(c).unwrap(),
+            None => break,
+        }
+    }
+    assert!(pages >= 4, "a walk of four pages or more: {pages}");
+}
+
+/// A moved cutoff re-derives the board behind its stamp: raised, cleared, lowered and set again, each stamp's board
+/// is the candidate read's under that cutoff. A route whose cutoff is not the stamp (the var moved, the scheduled
+/// pass not yet run) reads the candidates, under its own cutoff, never the tables of another.
+#[test]
+fn lb674_cut_a_moved_cutoff_rederives_behind_the_stamp() {
+    let db = fixture(1_500);
+    let (low, mid, high) = (
+        cutoff_at(&db, 200),
+        cutoff_at(&db, 600),
+        cutoff_at(&db, 1_100),
+    );
+    let start = crate::logic::PageStart::Offset(0);
+    for (step, era) in [
+        ("set", Some(mid)),
+        ("raised", Some(high)),
+        ("cleared", None),
+        ("lowered", Some(low)),
+        ("set again", Some(mid)),
+    ] {
+        stamp(&db, era);
+        identical_under(&db, era, step);
+        for other in [None, Some(low), Some(mid), Some(high)]
+            .into_iter()
+            .filter(|o| *o != era)
+        {
+            let (body, log) = served_under(&db, 50, &start, other);
+            assert!(
+                !used_the_tables(&log),
+                "{step}: a route under another cutoff ({other:?}) reads the candidates"
+            );
+            assert_eq!(body, candidates_under(&db, 50, &start, other), "{step}");
+        }
+    }
+    // The stamp again is a no-op: the board's rows are not rewritten.
+    let before: i64 = db
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    stamp(&db, Some(mid));
+    let after: i64 = db
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after, "the same stamp writes nothing");
+}
+
+/// Past #642's bound under a cutoff the table read is still the era's WHOLE board: on the 3,000 win board cut after
+/// its 300th win (2,700 era wins), the candidate read ranks the last 2,000 and says so; the table read is the
+/// whole-board read's body under the cutoff, byte for byte.
+#[test]
+fn lb674_cut_past_the_candidate_bound_the_table_read_is_the_eras_whole_board() {
+    let db = fixture(3_000);
+    let era = cutoff_at(&db, 300);
+    let total = counted_under(&db, Some(era));
+    assert!(total > crate::logic::LEADERBOARD_CANDIDATE_WINS);
+    stamp(&db, Some(era));
+    for after in [0usize, 51] {
+        let start = crate::logic::PageStart::Offset(after);
+        let (table, log) = served_under(&db, 50, &start, Some(era));
+        assert!(used_the_tables(&log));
+        assert_eq!(
+            without_642_fields(&table),
+            whole_under(&db, 50, after, Some(era)),
+            "after {after}"
+        );
+        let v = served(&table);
+        assert_eq!(v["candidatesBounded"], serde_json::json!(false));
+        assert_eq!(v["candidates"], serde_json::json!(total));
+        let cands = candidates_under(&db, 50, &start, Some(era));
+        assert_eq!(served(&cands)["candidatesBounded"], serde_json::json!(true));
+    }
+}
+
+/// Beta's own cutoff (`crates/low-app-layer/wrangler.toml`, `[env.beta.vars] WRITTEN_OFF_BEFORE_MS`).
+const BETA_CUTOFF_MS: i64 = 1_789_995_861_000;
+
+/// A snapshot of beta's board sources (`LB674_BETA_ROWS` names the directory: one JSON array a table, each row its
+/// columns and `_rid` its rowid, exported read-only; the bundles' bytes are not exported and load as `x''`, which no
+/// board read touches), loaded into the production schema through the triggers, rowids kept.
+fn beta_board(dir: &str) -> Connection {
+    let db = super::leaderboard_642::schema();
+    db.execute_batch("BEGIN").unwrap();
+    for table in [
+        "pot_records",
+        "network_seen",
+        "potparty_records",
+        "result_markers_v2",
+        "proof_markers",
+        "proof_posts",
+    ] {
+        let local: Vec<String> = db
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let rows: Vec<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/{table}.json")).unwrap())
+                .unwrap();
+        let mut skipped = std::collections::BTreeSet::new();
+        for row in &rows {
+            let mut cols = vec!["rowid".to_string()];
+            let mut vals: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Integer(
+                row["_rid"].as_i64().unwrap(),
+            )];
+            for (k, v) in row {
+                if k == "_rid" {
+                    continue;
+                }
+                if !local.contains(k) {
+                    skipped.insert(k.clone());
+                    continue;
+                }
+                cols.push(k.clone());
+                vals.push(match v {
+                    serde_json::Value::Null => rusqlite::types::Value::Null,
+                    serde_json::Value::Number(n) if n.is_i64() => {
+                        rusqlite::types::Value::Integer(n.as_i64().unwrap())
+                    }
+                    serde_json::Value::Number(n) => {
+                        rusqlite::types::Value::Real(n.as_f64().unwrap())
+                    }
+                    serde_json::Value::String(s) => rusqlite::types::Value::Text(s.clone()),
+                    other => panic!("{table}.{k}: {other}"),
+                });
+            }
+            if local.iter().any(|c| c == "bundle") {
+                cols.push("bundle".to_string());
+                vals.push(rusqlite::types::Value::Blob(Vec::new()));
+            }
+            let marks = vec!["?"; cols.len()].join(",");
+            db.execute(
+                &format!("INSERT INTO {table} ({}) VALUES ({marks})", cols.join(",")),
+                rusqlite::params_from_iter(vals),
+            )
+            .unwrap_or_else(|e| panic!("{table}: {e}"));
+        }
+        println!(
+            "{table}: {} rows (columns not in the local schema: {skipped:?})",
+            rows.len()
+        );
+    }
+    db.execute_batch("COMMIT").unwrap();
+    db
+}
+
+/// THE LANE'S PIN ON BETA'S ROWS (`LB674_BETA_ROWS=<dir> cargo test ... lb674_cut_beta -- --ignored`): the snapshot's
+/// board, derived through the triggers with no cutoff, is beta's own (every counted win in `board_total`); under beta's
+/// cutoff, stamped as the scheduled pass stamps it, every page shape and the cursor walk at `?limit=10` are served by
+/// the table read and are #642's candidate read's bodies (and the whole-board read's) byte for byte but the counting
+/// fields.
+#[test]
+#[ignore]
+fn lb674_cut_beta_rows_under_the_beta_cutoff_the_table_read_is_the_candidate_read() {
+    let Ok(dir) = std::env::var("LB674_BETA_ROWS") else {
+        return;
+    };
+    let db = beta_board(&dir);
+    let all = counted_under(&db, None);
+    let total: i64 = db
+        .query_row("SELECT wins FROM board_total WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        total as usize, all,
+        "the triggers derived every counted win"
+    );
+    let era = Some(BETA_CUTOFF_MS);
+    let era_wins = counted_under(&db, era);
+    stamp(&db, era);
+    let owners: i64 = db
+        .query_row("SELECT COUNT(*) FROM board_owners", [], |r| r.get(0))
+        .unwrap();
+    println!("beta rows: {all} counted wins; under the cutoff {era_wins} wins of {owners} owners");
+    let mut bodies = 0;
+    for page in [
+        crate::logic::LEADERBOARD_PAGE_DEFAULT,
+        7,
+        10,
+        crate::logic::LEADERBOARD_PAGE_MAX,
+    ] {
+        for after in [0usize, 7, 10, 30, 51] {
+            let start = crate::logic::PageStart::Offset(after);
+            let (table, log) = served_under(&db, page, &start, era);
+            assert!(
+                used_the_tables(&log),
+                "page {page} after {after}: the table read"
+            );
+            assert_eq!(
+                without_count(&table),
+                without_count(&candidates_under(&db, page, &start, era)),
+                "page {page} after {after}: the candidate read's body"
+            );
+            assert_eq!(
+                without_642_fields(&table),
+                whole_under(&db, page, after, era),
+                "page {page} after {after}: the whole-board read's"
+            );
+            assert_eq!(served(&table)["candidates"], serde_json::json!(era_wins));
+            bodies += 1;
+        }
+    }
+    let mut start = crate::logic::PageStart::Offset(0);
+    let mut pages = 0;
+    loop {
+        let (table, log) = served_under(&db, 10, &start, era);
+        assert!(used_the_tables(&log), "cursor page {pages}: the table read");
+        assert_eq!(
+            without_count(&table),
+            without_count(&candidates_under(&db, 10, &start, era)),
+            "cursor page {pages}"
+        );
+        pages += 1;
+        match served(&table).get("nextCursor").and_then(|c| c.as_str()) {
+            Some(c) => start = crate::logic::parse_leaderboard_cursor(c).unwrap(),
+            None => break,
+        }
+    }
+    println!(
+        "beta rows: {bodies} page bodies and a {pages}-page cursor walk at limit 10 identical"
+    );
+    assert!(pages >= 4, "{pages}");
+}

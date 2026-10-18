@@ -593,7 +593,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 327 to 329 for bsv-low #470 PRE557: `pot_records.blockTime`, the confirming block's header time, and the same
 /// column on `pot_records_evicted`. Overlay-internal (no app-layer read, so epoch Rule 24 does not bite).
 /// 329 to 330 for the PRE557 lens fold: `idx_pot_records_block_time_null`, the stamp step's partial index.
-pub const OVERLAY_MIGRATION_COUNT: usize = 330;
+/// 330 to 334 for bsv-low #674's cutoff (lane W2-LB-674-CUTOFF): `board_era`, the `board_win_era` guard, the
+/// `board_era_update` re-derivation, the row.
+pub const OVERLAY_MIGRATION_COUNT: usize = 334;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2194,6 +2196,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // of 100, never `pot_records` whole. Its rows are the pots with no confirming block's time: the unmined,
     // those with no latched BEEF, and those the step has not reached yet.
     "CREATE INDEX IF NOT EXISTS idx_pot_records_block_time_null ON pot_records(txid) WHERE blockTime IS NULL",
+    // 331-334: bsv-low #674, the cutoff inside the derivation (lane W2-LB-674-CUTOFF, `derived_board.rs`): the
+    // stamped cutoff's table, the guard that refuses a win before it, the re-derivation a moved cutoff runs, then the
+    // row (no cutoff: the tables as they stand). No shipped trigger is dropped or rewritten.
+    crate::derived_board::ERA_CREATE,
+    crate::derived_board::WIN_ERA,
+    crate::derived_board::ERA_UPDATE,
+    crate::derived_board::ERA_SEED,
 ];
 
 // =============================================================================
@@ -2864,6 +2873,7 @@ mod tests {
                         crate::derived_board::TOTAL_SEED,
                         crate::derived_board::WINS_BACKFILL,
                         crate::derived_board::STATE_DONE,
+                        crate::derived_board::ERA_SEED,
                         // NS-COST-BAR-1: the counts' stamped backfills, pinned in `d1_hot_bounds.rs`.
                         crate::ops::UNPROVABLE_SET_BACKFILL,
                         crate::ops::UNPROVABLE_COUNT_BACKFILL,

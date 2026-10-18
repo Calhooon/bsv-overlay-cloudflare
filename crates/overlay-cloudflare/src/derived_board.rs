@@ -501,6 +501,62 @@ pub const STATE_DONE: &str =
 /// The stamp's name.
 pub const STATE_NAME: &str = "board-v1";
 
+// bsv-low #674, the cutoff (lane W2-LB-674-CUTOFF): the board counts only the wins of the era. The era is the app
+// layer's `WRITTEN_OFF_BEFORE_MS` (the #375 write-off; beta and prod both set one), so the board was derived over
+// every win and read by nothing under a cutoff: the route took #642's candidate read. The cutoff now lives INSIDE
+// the derivation: `board_era` holds the cutoff the tables are derived under (NULL: none), `board_win_era` refuses a
+// `board_wins` row before it (the era filter's own predicate, `p.createdAt * 1000 >= cutoff`, a NULL stamp outside
+// the era), so every trigger that derives a win counts only the era's, and `board_era_update` re-derives the whole
+// board in the same statement that moves the cutoff (the backfill re-run behind the stamp, `board_era` the stamp).
+// The app layer writes its own cutoff there on its scheduled pass (its `BOARD_ERA_SET_SQL`, `BOARD_ERA_CLEAR_SQL`) and serves the
+// tables only when the stamped cutoff is the one it reads. No shipped trigger is touched: the guard is a NEW trigger
+// on the derived table, so an old worker's re-run of its own list (`CREATE TRIGGER IF NOT EXISTS`) changes nothing.
+
+/// The era predicate over a `board_wins` row's `NEW.potCreatedAt` (seconds), the era filter's (`era_filter_sql`):
+/// in the era when no cutoff is stamped, or when the stamp times 1,000 is at or after the cutoff (a NULL stamp is
+/// not).
+macro_rules! in_era {
+    () => {
+        "((SELECT e.cutoffMs FROM board_era e WHERE e.id=1) IS NULL OR (NEW.potCreatedAt*1000 >= (SELECT e.cutoffMs FROM board_era e WHERE e.id=1)) IS 1)"
+    };
+}
+
+/// The whole board re-derived from the source under the stamped cutoff: the derived rows cleared (the owners first,
+/// so the per-win delete trigger finds no card to rewrite), then every counted win inserted through `board_wins`'
+/// own triggers, `board_win_era` refusing the rows before the cutoff.
+macro_rules! rederive {
+    () => {
+        concat!(
+            "DELETE FROM board_owners; DELETE FROM board_wins; DELETE FROM board_hands; UPDATE board_total SET wins=0 WHERE id=1; ",
+            wins_insert!("pot_records p", "1", ""),
+            ";"
+        )
+    };
+}
+
+/// The cutoff the board is derived under, one row (`cutoffMs` in ms since epoch, NULL: no cutoff).
+pub const ERA_CREATE: &str =
+    "CREATE TABLE IF NOT EXISTS board_era (id INTEGER PRIMARY KEY CHECK (id = 1), cutoffMs INTEGER)";
+
+/// A win before the stamped cutoff is not a counted win of the board: its row is refused (the statement goes on
+/// with its next row).
+pub const WIN_ERA: &str = concat!(
+    "CREATE TRIGGER IF NOT EXISTS board_win_era BEFORE INSERT ON board_wins WHEN NOT ",
+    in_era!(),
+    " BEGIN SELECT RAISE(IGNORE); END"
+);
+
+/// A moved cutoff re-derives the board in the same statement.
+pub const ERA_UPDATE: &str = concat!(
+    "CREATE TRIGGER IF NOT EXISTS board_era_update AFTER UPDATE OF cutoffMs ON board_era WHEN OLD.cutoffMs IS NOT NEW.cutoffMs BEGIN ",
+    rederive!(),
+    " END"
+);
+
+/// The row, no cutoff: the tables as the `board-v1` backfill and the triggers derived them. Written after both
+/// triggers, so a reader that finds the row finds them.
+pub const ERA_SEED: &str = "INSERT OR IGNORE INTO board_era (id, cutoffMs) VALUES (1, NULL)";
+
 #[cfg(test)]
 mod tests {
     /// wrangler 4.54's `splitSqlIntoStatements` (the local `wrangler d1 execute --file` of `ci-d1-board` and the
@@ -678,6 +734,64 @@ mod tests {
         )));
         assert!(super::STATE_DONE.contains(super::STATE_NAME));
     }
+
+    /// bsv-low #674, the cutoff (lane W2-LB-674-CUTOFF): the era block follows the shipped block, every statement
+    /// additive and benign on a re-run, the table before the triggers and the row after both (a reader that finds the
+    /// row finds the guard and the re-derivation), no DROP anywhere; and the 32 shipped statements are byte for byte
+    /// main's `b444fc7` (an edit in place would run nowhere: `CREATE TRIGGER IF NOT EXISTS` keeps the old body).
+    #[test]
+    fn lb674_cut_the_era_block_is_appended_benign_and_ordered_and_the_shipped_block_is_untouched() {
+        let list = crate::d1::OVERLAY_MIGRATIONS;
+        let at = |s: &str| list.iter().position(|x| *x == s).unwrap();
+        let shipped_done = at(super::STATE_DONE);
+        // PRE557's three migrations (328-330) sit between the shipped block and the era block since the rebase.
+        let done = at(super::ERA_CREATE) - 1;
+        assert!(done > shipped_done);
+        assert_eq!(
+            [
+                at(super::ERA_CREATE),
+                at(super::WIN_ERA),
+                at(super::ERA_UPDATE),
+                at(super::ERA_SEED)
+            ],
+            [done + 1, done + 2, done + 3, done + 4]
+        );
+        for sql in &list[done + 1..=done + 4] {
+            assert!(crate::d1::migration_statement_is_additive(sql), "{sql}");
+            let u = sql.to_ascii_uppercase();
+            assert!(
+                u.starts_with("CREATE TABLE IF NOT EXISTS")
+                    || u.starts_with("CREATE TRIGGER IF NOT EXISTS")
+                    || u.starts_with("INSERT OR IGNORE"),
+                "{sql}"
+            );
+            assert!(!u.contains("DROP ") && !u.contains("RENAME"), "{sql}");
+            assert!(sql.len() < 100_000, "{} bytes", sql.len());
+        }
+        assert!(
+            super::WIN_ERA.contains("BEFORE INSERT ON board_wins")
+                && super::WIN_ERA.contains("RAISE(IGNORE)")
+        );
+        assert!(super::ERA_UPDATE
+            .contains(" WHEN OLD.cutoffMs IS NOT NEW.cutoffMs BEGIN DELETE FROM board_owners;"));
+        let fnv = |sqls: &[&str]| {
+            sqls.iter().fold(0u32, |acc, sql| {
+                let h = sql.as_bytes().iter().fold(0x811c_9dc5u32, |h, b| {
+                    (h ^ u32::from(*b)).wrapping_mul(0x0100_0193)
+                });
+                acc.wrapping_add(h)
+            })
+        };
+        assert_eq!(block().len(), 32);
+        assert_eq!(
+            fnv(block()),
+            SHIPPED_BLOCK_FNV,
+            "a shipped #674 statement was edited in place"
+        );
+    }
+
+    /// The #674 block's fingerprint at main `b444fc7` (beta runs it since 2026-10-18 08:42Z).
+    const SHIPPED_BLOCK_FNV: u32 = 1_455_068_236;
 
     /// No production writer REPLACEs a row of a table the board's triggers derive from (#638's rule, widened to
     /// #674's sources): a REPLACE fires no delete trigger. The triggers recompute their pot from the source, so a

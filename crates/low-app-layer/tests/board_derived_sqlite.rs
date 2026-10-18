@@ -225,9 +225,21 @@ fn frag_and_card_drift(db: &Connection, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The derived tables against the from-scratch read; `Err` names what drifted.
+/// The cutoff the board is derived under (the overlay's `board_era` stamp), if any.
+fn stamped(db: &Connection) -> Option<i64> {
+    db.query_row("SELECT cutoffMs FROM board_era WHERE id = 1", [], |r| {
+        r.get::<_, Option<i64>>(0)
+    })
+    .ok()
+    .flatten()
+}
+
+/// The derived tables against the from-scratch read under the stamped cutoff (the era filter the app layer's reads
+/// apply, its bind written in); `Err` names what drifted.
 fn drift(db: &Connection, label: &str) -> Result<(), String> {
-    let cte = low_app_layer::logic::chain_wins_cte("?1", None);
+    let era = stamped(db);
+    let cut = era.map_or("?1".to_string(), |ms| ms.to_string());
+    let cte = low_app_layer::logic::chain_wins_cte(&cut, era);
     let checks = [
         (
             "board_wins",
@@ -241,8 +253,9 @@ fn drift(db: &Connection, label: &str) -> Result<(), String> {
         ),
         (
             "board_owners",
-            low_app_layer::logic::chain_wins_spine_sql(None)
-                .replace("LIMIT ?1 OFFSET ?2", "LIMIT -1 OFFSET 0"),
+            low_app_layer::logic::chain_wins_spine_sql(era)
+                .replace("LIMIT ?1 OFFSET ?2", "LIMIT -1 OFFSET 0")
+                .replace("?3", &cut),
             "SELECT owner, CASE WHEN keyWins > 0 THEN 1 ELSE 0 END, wins FROM board_owners ORDER BY wins DESC, owner ASC"
                 .to_string(),
         ),
@@ -250,7 +263,9 @@ fn drift(db: &Connection, label: &str) -> Result<(), String> {
             "board_hands",
             format!(
                 "SELECT potTxid, txid FROM ({})",
-                low_app_layer::logic::era_hands_sql(None).replace("LIMIT ?1", "LIMIT -1")
+                low_app_layer::logic::era_hands_sql(era)
+                    .replace("LIMIT ?1", "LIMIT -1")
+                    .replace("?2", &cut)
             ),
             "SELECT h.potTxid, m.txid FROM board_hands h LEFT JOIN result_markers_v2 m ON m.rowid = h.markerRowid \
              ORDER BY h.score, h.claimCreatedAt, h.gameId"
@@ -1498,4 +1513,211 @@ fn pre557_a_stamp_moves_the_derived_board_as_the_era_filter_reads_it() {
         "a live win keeps its admission time"
     );
     drift(&db, "after the stamps").unwrap();
+}
+
+// bsv-low #674, the cutoff (lane W2-LB-674-CUTOFF): the board derived under the era cutoff the app layer stamps into
+// `board_era` (`BOARD_ERA_SET_SQL`, `BOARD_ERA_CLEAR_SQL`, its scheduled pass), the `board_win_era` guard refusing a
+// win before it and `board_era_update` re-deriving the board when it moves. `drift` compares under the stamp.
+
+/// The admission stamp (ms) of the seeded game `g` (`d1_board::rows`): a cutoff there keeps the games from `g` on.
+fn cut_at(g: u64) -> i64 {
+    ((NOW - 7 * (100_000 - g)) * 1000) as i64
+}
+
+/// The app layer's stamp of the era cutoff `era`, as its scheduled pass writes it.
+fn set_era(db: &Connection, era: Option<i64>) {
+    match era {
+        Some(ms) => db.execute(low_app_layer::logic::BOARD_ERA_SET_SQL, [ms]),
+        None => db.execute(low_app_layer::logic::BOARD_ERA_CLEAR_SQL, []),
+    }
+    .unwrap();
+}
+
+/// Every hook path under a cutoff stamped on the empty board (so every write is derived through the guard), then
+/// the cutoff moved: raised, cleared, lowered, set again, each followed by the drift check under the new stamp. The
+/// cutoff (game 10) puts `paths`' games 2 to 8 before it and its games 11 to 47 in the era, so each family of
+/// trigger is exercised on an era win and on a win the guard refuses.
+fn era_paths(db: &Connection) -> Result<(), String> {
+    set_era(db, Some(cut_at(10)));
+    paths(db)?;
+    // A frag-only pot write on a counted win of the era.
+    db.execute(
+        "UPDATE pot_records SET spentHeight = 971000, potSats = 2000 WHERE txid = ?1 AND outputIndex = 0",
+        [pot(150)],
+    )
+    .unwrap();
+    drift(db, "an era win's frag-only columns")?;
+    for (label, era) in [
+        ("raised", Some(cut_at(30))),
+        ("cleared", None),
+        ("lowered", Some(cut_at(5))),
+        ("set again", Some(cut_at(10))),
+    ] {
+        set_era(db, era);
+        if stamped(db) != era {
+            return Err(format!("the cutoff {label}: not stamped"));
+        }
+        drift(db, &format!("the cutoff {label}"))?;
+    }
+    Ok(())
+}
+
+/// THE DRIFT PIN UNDER A CUTOFF: after every hook path and every move of the cutoff, the derived board equals the
+/// from-scratch read under the stamped cutoff, and it is a smaller board than the cutoff-free one.
+#[test]
+fn lb674_cut_drift_under_a_cutoff_after_every_hook_path_and_every_move() {
+    let db = schema_without(None);
+    era_paths(&db).unwrap();
+    let era_wins = rows(&db, "SELECT wins FROM board_total")[0][0].clone();
+    let cte = low_app_layer::logic::chain_wins_cte("?1", None);
+    let all = rows(&db, &format!("{cte} SELECT COUNT(*) FROM owned"))[0][0].clone();
+    println!("drift pin under the cutoff: every path green; {era_wins} era wins of {all} counted");
+    assert!(era_wins.parse::<u32>().unwrap() < all.parse::<u32>().unwrap());
+}
+
+/// Each trigger removed alone turns the cutoff's drift pin red: the 21 shipped triggers, the guard and the
+/// re-derivation. (The `board_era` row removed is not a drift: the stamp then never lands, and the route never reads
+/// the tables under a cutoff, `lb674_the_route_reads_the_candidates_until_the_tables_are_stamped`.)
+#[test]
+fn lb674_cut_drift_each_trigger_removed_alone_is_red() {
+    for (name, trigger) in [
+        ("WIN_ERA", board::WIN_ERA),
+        ("ERA_UPDATE", board::ERA_UPDATE),
+        ("WIN_INSERT", board::WIN_INSERT),
+        ("WIN_DELETE", board::WIN_DELETE),
+        ("WIN_FRAG", board::WIN_FRAG),
+        ("POT_FRAG", board::POT_FRAG),
+        ("PROOF_INSERT", board::PROOF_INSERT),
+        ("PROOF_UPDATE", board::PROOF_UPDATE),
+        ("PROOF_DELETE", board::PROOF_DELETE),
+        ("POST_INSERT", board::POST_INSERT),
+        ("POST_UPDATE", board::POST_UPDATE),
+        ("POST_DELETE", board::POST_DELETE),
+        ("MARKER_INSERT", board::MARKER_INSERT),
+        ("MARKER_UPDATE", board::MARKER_UPDATE),
+        ("MARKER_DELETE", board::MARKER_DELETE),
+        ("POT_INSERT", board::POT_INSERT),
+        ("POT_UPDATE", board::POT_UPDATE),
+        ("POT_DELETE", board::POT_DELETE),
+        ("SEEN_INSERT", board::SEEN_INSERT),
+        ("SEEN_DELETE", board::SEEN_DELETE),
+        ("PARTY_INSERT", board::PARTY_INSERT),
+        ("PARTY_UPDATE", board::PARTY_UPDATE),
+        ("PARTY_DELETE", board::PARTY_DELETE),
+    ] {
+        let db = schema_without(Some(trigger));
+        let err = era_paths(&db).expect_err(&format!("{name} removed: the drift pin stayed green"));
+        println!("{name} removed: RED at {err}");
+    }
+}
+
+/// The cutoff's block of the migration list (`ERA_CREATE` through `ERA_SEED`).
+fn era_block() -> &'static [&'static str] {
+    let start = OVERLAY_MIGRATIONS
+        .iter()
+        .position(|s| *s == board::ERA_CREATE)
+        .unwrap();
+    let end = OVERLAY_MIGRATIONS
+        .iter()
+        .position(|s| *s == board::ERA_SEED)
+        .unwrap();
+    &OVERLAY_MIGRATIONS[start..=end]
+}
+
+/// The deploy, as beta and prod meet it: a populated database at migration 295, the #674 block (its backfill derives
+/// every win, no cutoff), the cutoff's block (the row: no cutoff, the tables unchanged), then the scheduled pass's
+/// stamp re-derives the board under the cutoff: the from-scratch era board, byte for byte what a database stamped
+/// before its first write derives through the guard. A re-run of the whole list, and an OLD worker's re-run of its
+/// own list (every statement through `board-v1`, the shipped triggers' texts untouched), change nothing.
+#[test]
+fn lb674_cut_the_deploy_then_the_stamp_rederives_and_a_rerun_is_benign() {
+    let cut = cut_at(150);
+    let legacy = legacy_board(400);
+    apply(&legacy, board_block());
+    let before = dump(&legacy);
+    apply(&legacy, era_block());
+    assert_eq!(stamped(&legacy), None);
+    assert_eq!(dump(&legacy), before, "the row alone moves no board row");
+    drift(&legacy, "the deploy, no cutoff").unwrap();
+    set_era(&legacy, Some(cut));
+    assert_eq!(stamped(&legacy), Some(cut));
+    drift(&legacy, "the stamp after the deploy").unwrap();
+    let live = schema_without(None);
+    set_era(&live, Some(cut));
+    live.execute_batch("BEGIN").unwrap();
+    for sql in d1_board::rows(NOW, 400) {
+        live.execute_batch(&sql).unwrap();
+    }
+    live.execute_batch("COMMIT").unwrap();
+    assert_eq!(
+        dump(&legacy),
+        dump(&live),
+        "re-derivation == the guard's derivation, byte for byte"
+    );
+    let stamped_board = dump(&legacy);
+    apply(&legacy, OVERLAY_MIGRATIONS);
+    assert_eq!(
+        dump(&legacy),
+        stamped_board,
+        "a re-run of the list is benign"
+    );
+    assert_eq!(stamped(&legacy), Some(cut), "and keeps the stamp");
+    let shipped = OVERLAY_MIGRATIONS
+        .iter()
+        .position(|s| *s == board::STATE_DONE)
+        .unwrap();
+    apply(&legacy, &OVERLAY_MIGRATIONS[..=shipped]);
+    assert_eq!(
+        dump(&legacy),
+        stamped_board,
+        "an old worker's re-run of its own list is benign"
+    );
+    // A write after an old worker's re-run is still derived under the cutoff (its triggers are the guarded ones).
+    legacy
+        .execute_batch(&format!(
+            "UPDATE pot_records SET spentConfirmed = 0 WHERE txid = '{}' AND outputIndex = 0; \
+             UPDATE pot_records SET spentConfirmed = 1 WHERE txid = '{}' AND outputIndex = 0;",
+            pot(160),
+            pot(160)
+        ))
+        .unwrap();
+    drift(&legacy, "a write after the old re-run").unwrap();
+}
+
+/// The stamp is the app layer's to write and costs nothing when it holds: the same cutoff stamped again changes no
+/// row (the statement's `IS NOT` guard), and the re-derivation is one statement.
+#[test]
+fn lb674_cut_the_same_stamp_again_writes_nothing() {
+    let db = legacy_board(200);
+    apply(
+        &db,
+        &OVERLAY_MIGRATIONS[OVERLAY_MIGRATIONS
+            .iter()
+            .position(|s| *s == board::WINS_CREATE)
+            .unwrap()..],
+    );
+    let cut = cut_at(100);
+    assert_eq!(
+        db.execute(low_app_layer::logic::BOARD_ERA_SET_SQL, [cut])
+            .unwrap(),
+        1,
+        "the move: one statement"
+    );
+    assert_eq!(
+        db.execute(low_app_layer::logic::BOARD_ERA_SET_SQL, [cut])
+            .unwrap(),
+        0,
+        "the same stamp again: no row"
+    );
+    assert_eq!(
+        db.execute(low_app_layer::logic::BOARD_ERA_CLEAR_SQL, [])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute(low_app_layer::logic::BOARD_ERA_CLEAR_SQL, [])
+            .unwrap(),
+        0
+    );
+    drift(&db, "cleared").unwrap();
 }

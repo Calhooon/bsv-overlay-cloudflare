@@ -779,5 +779,37 @@ fn the_board_table_read_and_its_triggers_never_scan() {
         }
         assert!(searches > 0, "{name}: its statements were planned");
     }
+    // bsv-low #674, the cutoff: the guard's condition, asked on every `board_wins` insert, reads the one `board_era`
+    // row by its key (a trigger body cannot be planned alone: its `RAISE` exists only in a trigger program). The
+    // re-derivation (`ERA_UPDATE`) scans `pot_records` by design, once a cutoff move, as the backfill does; it is no
+    // hook's statement, so it is not held here.
+    let guard = &board::WIN_ERA
+        [board::WIN_ERA.find(" WHEN ").unwrap() + 6..board::WIN_ERA.find(" BEGIN ").unwrap()];
+    let p = plan(
+        &db,
+        &format!("SELECT {}", guard.replace("NEW.potCreatedAt", "0")),
+    );
+    println!("trigger board_win_era (its condition): {}", p.join(" | "));
+    let tables: Vec<&String> = p
+        .iter()
+        .filter(|d| {
+            (d.starts_with("SEARCH ") || d.starts_with("SCAN ")) && *d != "SCAN CONSTANT ROW"
+        })
+        .collect();
+    if tables.len() != 2
+        || !tables
+            .iter()
+            .all(|d| *d == "SEARCH e USING INTEGER PRIMARY KEY (rowid=?)")
+    {
+        failures.push(format!("board_win_era: {p:?}"));
+    }
+    let p = plan(&db, l::BOARD_READY_SQL);
+    if p.iter()
+        .filter(|d| d.contains("SEARCH board_era USING INTEGER PRIMARY KEY (rowid=?)"))
+        .count()
+        != 2
+    {
+        failures.push(format!("ready: the board_era row by its key: {p:?}"));
+    }
     assert!(failures.is_empty(), "board plans:\n{}", failures.join("\n"));
 }

@@ -1576,6 +1576,21 @@
    "why": "rebuild: the board-v1 backfill over pot_records, network_seen, potparty_records and result_markers_v2"
    },
    {
+   "name": "board_era",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "UPDATE"
+    ]
+   },
+   "readers": ["low-app-layer"],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the era cutoff the board tables are derived under, one row (NULL: none); the app layer's scheduled pass stamps its WRITTEN_OFF_BEFORE_MS there and the board_era_update trigger re-derives the board in that statement (#674, the cutoff)",
+   "why": "the app layer's next scheduled pass writes it again from its own var; a lost row leaves the route on #642's candidate read until the next migration run seeds it"
+   },
+   {
    "name": "tx_words",
    "database": "low-overlay-db",
    "owner": "low-app-layer",

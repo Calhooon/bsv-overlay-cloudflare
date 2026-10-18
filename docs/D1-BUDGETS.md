@@ -396,6 +396,43 @@ marker) and writes its owner's card; a result marker, proof pointer or posted bu
 counted pots it names, and a frag-only `pot_records` column (`spentHeight`, the decoded params) its pot's frag. The
 `ci-d1-budget` tier's per-hook write ceilings were measured before the fold and are owed a re-run.
 
+### The cutoff inside the derivation (bsv-low #674, lane W2-LB-674-CUTOFF, 2026-10-18)
+
+Beta and prod both set `WRITTEN_OFF_BEFORE_MS`, and the route read the tables only with no cutoff, so the table read
+above served nothing on either: beta's `?limit=50` stayed at 34,077 rows (`docs/audit/OVERLAY-WINDOW-W2-2026-10-17.md`
+in bsv-low). The board is now derived under the cutoff the app layer's scheduled pass stamps into `board_era`
+(`derived_board.rs`: `board_win_era` refuses a win before it, `board_era_update` re-derives the board when it moves),
+and the route reads the tables when the stamp is its own cutoff. The ready statement reads the `board_era` row twice
+(4 rows where it read 2), so the uncut default page is 325. `ci-d1-board` replays each board again under a cutoff kept
+from its `2/5 * wins`th win on, stamped as the seed's last statement (the re-derivation runs on local D1):
+
+| board | request | statements | reads (largest statement) | ceiling |
+|---|---|---|---|---|
+| 1,500 wins | page 1, limit 50 | 8 | 325 (100) | 728 / 600 |
+| 1,500 wins | page 1, limit 200 | 8 | 980 (400) | 1,505 / 600 |
+| 1,500 wins | page 2 by cursor, limit 50 | 9 | 487 (100) | 728 / 600 |
+| 3,000 wins | page 1, limit 50 | 8 | 325 (100) | 728 / 600 |
+| 3,000 wins | page 1, limit 200 | 8 | 1,005 (400) | 1,505 / 600 |
+| 3,000 wins | page 2 by cursor, limit 50 | 9 | 469 (100) | 728 / 600 |
+| 1,500 wins, cut (900 era wins) | page 1, limit 50 | 8 | 304 (100) | 728 / 600 |
+| 1,500 wins, cut | page 1, limit 200 | 7 | 875 (400) | 1,505 / 600 |
+| 1,500 wins, cut | page 2 by cursor, limit 50 | 9 | 473 (100) | 728 / 600 |
+| 1,500 wins, cut | #642's candidate read, page 1, limit 50 | 68 | 17,851 (11,386) | record |
+| 3,000 wins, cut (1,800 era wins) | page 1, limit 50 | 8 | 303 (100) | 728 / 600 |
+| 3,000 wins, cut | page 1, limit 200 | 8 | 1,005 (400) | 1,505 / 600 |
+| 3,000 wins, cut | page 2 by cursor, limit 50 | 9 | 505 (100) | 728 / 600 |
+| 3,000 wins, cut | #642's candidate read, page 1, limit 50 | 133 | 35,450 (22,807) | record |
+
+The uncut default page is still asserted equal across the boards (325). Under the cutoff the two boards' default
+pages differ by one row (304 and 303), in the statuses of the hands' pots beyond the page: one of the 1,500 board's
+twelve has a witnessed spender, so its `network_seen` LEFT JOIN finds a row. That is the off-page hands' data, not
+the page owners' wins, so the cut pair is held flat over the page's own five statements (the ready read, the owner
+page, the cards' two chunks and the hands: 255 reads on both, `flatHead`). The writes: every `board_wins` insert
+asks `board_win_era`'s condition (the `board_era` row by its key, twice; `EXPLAIN QUERY PLAN` pinned); a write that
+derives a win before the cutoff still computes the row the guard then refuses (a written-off pot is rarely written);
+a cutoff's move re-derives the board in one statement (`board_era_update`, the cost of the `board-v1` backfill over
+the era's wins), once per move and only on the scheduled pass.
+
 ## The census's per-tick whole-table reads, bounded (NS-COST-BAR-1, the owner's cost word of 2026-10-18)
 
 Source: the 24-hour D1 census of 2026-10-17 (2026-10-17T00:03:52Z to 2026-10-18T00:03:52Z, bsv-low

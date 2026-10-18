@@ -1227,8 +1227,9 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
 ///
 /// bsv-low #674: steps 1 and 2 read the tables the overlay derives at the
 /// write (`board_owners` by its rank index, `board_wins` by owner, `board_hands`
-/// by its rank index) once its backfill stamped `board-v1` and with no era
-/// cutoff; otherwise #642's bounded candidate read ([`leaderboard_page_body`]).
+/// by its rank index) once its backfill stamped `board-v1` and its `board_era`
+/// stamp is this era cutoff; otherwise #642's bounded candidate read
+/// ([`leaderboard_page_body`]).
 ///
 /// FAIL-SAFE, as before: a spine / pots / statuses D1 fault is the SAME 503
 /// the client handles — NEVER a fabricated empty board; the marker, hands
@@ -1270,11 +1271,13 @@ pub async fn compute_leaderboard_body_string(
 }
 
 /// The `/leaderboard:view` pipeline over the [`crate::board_db::BoardDb`] port
-/// (the Worker's D1, or rusqlite in the native pins). bsv-low #674: with no era
-/// cutoff and the board tables stamped (`board-v1`), the page is the indexed
-/// read of the tables the overlay derives at the write
-/// ([`leaderboard_table_body`]); otherwise (an unmigrated database, a cutoff)
-/// the #642 candidate read ([`leaderboard_candidate_body`]).
+/// (the Worker's D1, or rusqlite in the native pins). bsv-low #674: with the
+/// board tables stamped (`board-v1`) and derived under the route's own era
+/// cutoff (the overlay's `board_era`, which the scheduled pass stamps:
+/// [`sync_board_era`]), the page is the indexed read of the tables the overlay
+/// derives at the write ([`leaderboard_table_body`]); otherwise (an unmigrated
+/// database, a stamp that is not this cutoff yet) the #642 candidate read
+/// ([`leaderboard_candidate_body`]).
 pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
     db: &B,
     page: usize,
@@ -1283,24 +1286,30 @@ pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
     candidate_cap: usize,
     computed_at: i64,
 ) -> (u16, String) {
-    if era.is_none() {
-        if let Some(total) = board_tables_ready(db).await {
-            return leaderboard_table_body(db, page, start, total, computed_at).await;
-        }
+    if let Some(total) = board_tables_ready(db, era).await {
+        return leaderboard_table_body(db, page, start, total, computed_at).await;
     }
     leaderboard_candidate_body(db, page, start, era, candidate_cap, computed_at).await
 }
 
 /// The count of every counted win when the board tables are derived (the
-/// overlay's `board-v1` stamp), else `None`: a database the overlay has not
-/// migrated fails the statement, and the route reads the candidates.
-pub(crate) async fn board_tables_ready<B: crate::board_db::BoardDb>(db: &B) -> Option<usize> {
+/// overlay's `board-v1` stamp) under the era cutoff `era` (the `board_era`
+/// stamp equal to it, `None` to none), else `None`: a database the overlay has
+/// not migrated fails the statement, and the route reads the candidates.
+pub(crate) async fn board_tables_ready<B: crate::board_db::BoardDb>(
+    db: &B,
+    era: Option<i64>,
+) -> Option<usize> {
     #[derive(Deserialize)]
     struct ReadyRowD1 {
         #[serde(default)]
         ready: Option<f64>,
         #[serde(default)]
         total: Option<f64>,
+        #[serde(default)]
+        era: Option<f64>,
+        #[serde(rename = "cutoffMs", default)]
+        cutoff_ms: Option<f64>,
     }
     match db
         .all::<ReadyRowD1>(crate::logic::BOARD_READY_SQL.to_string(), Vec::new())
@@ -1308,7 +1317,9 @@ pub(crate) async fn board_tables_ready<B: crate::board_db::BoardDb>(db: &B) -> O
     {
         Ok(rows) => rows
             .first()
-            .filter(|r| r.ready == Some(1.0))
+            .filter(|r| {
+                r.ready == Some(1.0) && r.era == Some(1.0) && r.cutoff_ms == era.map(|ms| ms as f64)
+            })
             .map(|r| r.total.unwrap_or(0.0).max(0.0) as usize),
         Err(e) => {
             crate::board_db::warn(&format!(
@@ -1316,6 +1327,47 @@ pub(crate) async fn board_tables_ready<B: crate::board_db::BoardDb>(db: &B) -> O
             ));
             None
         }
+    }
+}
+
+/// bsv-low #674, the cutoff: stamp the era cutoff `era` (`None`: none) into the
+/// overlay's `board_era`, the cutoff the board tables are derived under. A
+/// no-op when it already is; otherwise the overlay's `board_era_update` trigger
+/// re-derives the whole board under it inside this one statement, so the stamp
+/// never names a cutoff the tables were not derived under. Until it lands
+/// [`board_tables_ready`] finds another stamp and the route reads #642's
+/// candidates. A database the overlay has not migrated fails the statement.
+pub(crate) async fn sync_board_era<B: crate::board_db::BoardDb>(
+    db: &B,
+    era: Option<i64>,
+) -> std::result::Result<(), crate::board_db::BoardDbError> {
+    use crate::board_db::Bind;
+    let (sql, binds) = match era {
+        Some(ms) => (crate::logic::BOARD_ERA_SET_SQL, vec![Bind::Num(ms as f64)]),
+        None => (crate::logic::BOARD_ERA_CLEAR_SQL, Vec::new()),
+    };
+    db.all::<serde_json::Value>(sql.to_string(), binds)
+        .await
+        .map(|_| ())
+}
+
+/// [`sync_board_era`] on the Worker's D1 with the route's own cutoff
+/// ([`written_off_before_ms_env`]), on the scheduled pass only (never a read).
+pub async fn sync_board_era_env(env: &worker::Env) {
+    let db = match env.d1("OVERLAY_DB") {
+        Ok(db) => db,
+        Err(e) => {
+            console_warn!("[leaderboard] board era: OVERLAY_DB unavailable ({e})");
+            return;
+        }
+    };
+    if let Err(e) = sync_board_era(
+        &crate::board_db::D1Board(&db),
+        written_off_before_ms_env(env),
+    )
+    .await
+    {
+        console_warn!("[leaderboard] board era not stamped ({e}): the candidate read stands");
     }
 }
 

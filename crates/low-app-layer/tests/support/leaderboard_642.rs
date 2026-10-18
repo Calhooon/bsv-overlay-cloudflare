@@ -635,8 +635,32 @@ fn lb642_emit_the_d1_cell() {
     let Ok(dir) = std::env::var("LB642_D1_PIN") else {
         return;
     };
-    for wins in [1_500u32, 3_000] {
+    // bsv-low #674, the cutoff: each board twice, the second under an era cutoff kept from its `2/5 * wins`th win
+    // on, stamped after the board loads (the seed's last statement: the re-derivation runs on local D1).
+    for (wins, cut) in [
+        (1_500u32, false),
+        (3_000, false),
+        (1_500, true),
+        (3_000, true),
+    ] {
         let db = fixture(wins);
+        let era = cut.then(|| {
+            let cte = crate::logic::chain_wins_cte("?1", None);
+            let at: i64 = db
+                .query_row(
+                    &format!(
+                        "{cte} SELECT potCreatedAt FROM owned ORDER BY potCreatedAt ASC LIMIT 1 OFFSET {}",
+                        wins as usize * 2 / 5
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            at * 1000
+        });
+        if let Some(ms) = era {
+            run(sync_board_era(&SqliteBoard::new(&db), Some(ms))).unwrap();
+        }
         let mut seed = String::new();
         let mut stmt = db
             .prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY rowid")
@@ -650,6 +674,7 @@ fn lb642_emit_the_d1_cell() {
         for sql in [
             bsv_overlay_cloudflare::derived_board::TOTAL_SEED,
             bsv_overlay_cloudflare::derived_board::STATE_DONE,
+            bsv_overlay_cloudflare::derived_board::ERA_SEED,
         ] {
             seed.push_str(sql);
             seed.push_str(";\n");
@@ -658,6 +683,24 @@ fn lb642_emit_the_d1_cell() {
             seed.push_str(&row);
             seed.push_str(";\n");
         }
+        if let Some(ms) = era {
+            seed.push_str(&crate::logic::BOARD_ERA_SET_SQL.replace("?1", &ms.to_string()));
+            seed.push_str(";\n");
+        }
+        let served_body = |db: &Connection, page: usize, start: &crate::logic::PageStart| {
+            let board = SqliteBoard::new(db);
+            let (status, body) = run(leaderboard_page_body(
+                &board,
+                page,
+                start,
+                era,
+                crate::logic::LEADERBOARD_CANDIDATE_WINS,
+                NOW as i64,
+            ));
+            assert_eq!(status, 200, "{body}");
+            (body, board.log.into_inner())
+        };
+        let under = if cut { ", under the cutoff" } else { "" };
         let cap = crate::logic::LEADERBOARD_CANDIDATE_WINS;
         let mut requests = Vec::new();
         // The SHIPPED read (#674's table read on the stamped board).
@@ -684,38 +727,51 @@ fn lb642_emit_the_d1_cell() {
         ] {
             assert!(
                 log.iter().any(|(sql, _)| sql.contains("FROM board_owners")),
-                "{name}: the table read"
+                "{name}{under}: the table read"
             );
             requests.push(serde_json::json!({
-                "name": name,
+                "name": format!("{name}{under}"),
                 "ceiling": ceiling,
                 "statementCeiling": crate::logic::LEADERBOARD_STATEMENT_MAX_READS,
-                // bsv-low #674 fold, MEDIUM-1: the default page reads the same rows on both boards.
-                "flat": name == "page 1, limit 50",
+                // bsv-low #674 fold, MEDIUM-1: the default page reads the same rows on both boards. Under the
+                // cutoff the boards' off-page hand pots differ in their witnesses (one `network_seen` row more on
+                // the 1,500 board's statuses), so the page's own statements are held flat: the ready read, the
+                // owner page, the cards' two chunks and the hands.
+                "flat": name == "page 1, limit 50" && !cut,
+                "flatHead": (name == "page 1, limit 50" && cut).then_some(5),
                 "statements": log.iter().map(|(sql, rows)| serde_json::json!({"sql": sql, "rows": rows})).collect::<Vec<_>>(),
             }));
         }
         // #642's candidate read on the same board, for the record.
-        let (_, log) = new_body(&db, 50, &crate::logic::PageStart::Offset(0), cap);
+        let board = SqliteBoard::new(&db);
+        let (status, _) = run(leaderboard_candidate_body(
+            &board,
+            50,
+            &crate::logic::PageStart::Offset(0),
+            era,
+            cap,
+            NOW as i64,
+        ));
+        assert_eq!(status, 200);
         requests.push(serde_json::json!({
-            "name": "the #642 candidate read, page 1, limit 50",
+            "name": format!("the #642 candidate read, page 1, limit 50{under}"),
             "ceiling": null,
-            "statements": log.iter().map(|(sql, rows)| serde_json::json!({"sql": sql, "rows": rows})).collect::<Vec<_>>(),
+            "statements": board.log.into_inner().iter().map(|(sql, rows)| serde_json::json!({"sql": sql, "rows": rows})).collect::<Vec<_>>(),
         }));
         let board = SqliteBoard::new(&db);
-        run(whole_board_page_body(&board, 50, 0, None, NOW as i64));
+        run(whole_board_page_body(&board, 50, 0, era, NOW as i64));
         requests.push(serde_json::json!({
-            "name": "the whole-board read (pre-#642), page 1, limit 50",
+            "name": format!("the whole-board read (pre-#642), page 1, limit 50{under}"),
             "ceiling": null,
             "mustExceed": crate::logic::LEADERBOARD_VIEW_MAX_READS,
             "statements": board.log.into_inner().iter().map(|(sql, rows)| serde_json::json!({"sql": sql, "rows": rows})).collect::<Vec<_>>(),
         }));
-        let out = format!("{dir}/w{wins}");
+        let out = format!("{dir}/w{wins}{}", if cut { "cut" } else { "" });
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(format!("{out}/seed.sql"), seed).unwrap();
         std::fs::write(
             format!("{out}/expected.json"),
-            serde_json::json!({"wins": wins, "candidateCap": cap, "requests": requests})
+            serde_json::json!({"wins": wins, "cutoffMs": era, "candidateCap": cap, "requests": requests})
                 .to_string(),
         )
         .unwrap();

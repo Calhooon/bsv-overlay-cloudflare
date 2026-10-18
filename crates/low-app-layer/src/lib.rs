@@ -221,6 +221,9 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     });
     let tracker: pot_hook::Detached = Box::pin(async move {
         d1_ledger::boot(schema::ensure_latch_columns(&env)).await;
+        // bsv-low #674, the cutoff: the era cutoff stamped into the board's derivation (a no-op once it is; the
+        // re-derivation once when it moves). Before the tracker's backfill, which awaits CHAINTRACKS unbounded.
+        routes::sync_board_era_env(&env).await;
         if let Err(e) = tracker_host::runtime::backfill(&env).await {
             courier::note_presence("tracker_backfill_faulted_total");
             worker::console_warn!("[tracker-backfill] deferred: {e}");
