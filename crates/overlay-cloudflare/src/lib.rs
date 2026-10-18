@@ -27,6 +27,7 @@ pub mod d1;
 pub mod d1_discovery;
 pub mod d1_ledger;
 pub mod d1_storage;
+pub mod door_words;
 pub mod dead_letters;
 pub mod derived_board;
 pub mod derived_hops;

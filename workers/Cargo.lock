@@ -209,6 +209,7 @@ dependencies = [
  "bsv-overlay-discovery",
  "bsv-overlay-engine",
  "bsv-rs",
+ "bsv-tracker",
  "bsv-worker-build-info",
  "hex",
  "js-sys",

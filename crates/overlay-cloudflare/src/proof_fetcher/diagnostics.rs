@@ -173,7 +173,9 @@ impl ChainProofFetcher {
                         .get("txStatus")
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|s| {
-                            arcade_verdict(&s.trim().to_ascii_uppercase()) == ArcadeVerdict::Mined
+                            crate::door_words::proof_class(
+                                crate::door_words::arcade_hint(s, "", 0).as_ref(),
+                            ) == crate::door_words::ProofClass::Mined
                         });
                     probe.parsed(if mined { "missing-bump" } else { "no-proof" }, mined);
                     return;

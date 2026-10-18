@@ -63,15 +63,11 @@ pub enum CallbackAction {
 /// block (STUMP_PROCESSING) or mined triggers the live read; a refusal or any
 /// ORPHAN word is corroborated; pending, parked and an undefined word do
 /// nothing.
+///
+/// bsv-low #619 (L3): the push's word as the tracker's hint, the action the
+/// host's policy over it (`door_words::callback`).
 pub fn callback_action(tx_status: &str) -> CallbackAction {
-    use overlay_discovery::arcade_words::{arcade_verdict, ArcadeVerdict};
-    match arcade_verdict(tx_status) {
-        v if v.network_holds() => CallbackAction::LatchSeen,
-        ArcadeVerdict::Rejected | ArcadeVerdict::Conflict | ArcadeVerdict::Orphan => {
-            CallbackAction::EvidenceCheck(tx_status.trim().to_ascii_uppercase())
-        }
-        _ => CallbackAction::Ignore,
-    }
+    crate::door_words::callback(crate::door_words::arcade_hint(tx_status, "", 0).as_ref())
 }
 
 /// The tables a txid can own rows in, and the columns that key them.

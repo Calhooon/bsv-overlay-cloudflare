@@ -43,7 +43,6 @@ use std::rc::Rc;
 
 use async_trait::async_trait;
 use bsv_rs::transaction::{Beef, ChainTracker, MerklePath, MerklePathLeaf, Transaction};
-use overlay_discovery::arcade_words::{arcade_verdict, ArcadeVerdict};
 use overlay_engine::gasp::{AncestorFetcher, FetchedAncestor, GASPError};
 
 /// WoC mainnet base URL (mainnet only).
@@ -1240,8 +1239,11 @@ pub(crate) fn rung_step(verdict: &BumpVerdict) -> RungStep {
 fn parse_arcade_merklepath(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let status = v.get("txStatus").and_then(|s| s.as_str()).unwrap_or("");
-    // P0-2d (bsv-stack-lean #52): the one verdict function, any letter case
-    if arcade_verdict(status) != ArcadeVerdict::Mined {
+    // P0-2d (bsv-stack-lean #52): the one verdict function, any letter case;
+    // bsv-low #619 (L3): read as the tracker's hint, classed by the host
+    if crate::door_words::proof_class(crate::door_words::arcade_hint(status, "", 0).as_ref())
+        != crate::door_words::ProofClass::Mined
+    {
         return None;
     }
     let mp = v.get("merklePath").and_then(|m| m.as_str())?;
@@ -1291,14 +1293,14 @@ pub fn parse_arcade_proof_look(status: u16, body: &str, now_ms: i64) -> ArcadePr
         .unwrap_or("")
         .trim()
         .to_ascii_uppercase();
-    match arcade_verdict(&tx_status) {
-        ArcadeVerdict::Mined => {
+    match crate::door_words::proof_class(crate::door_words::arcade_hint(&tx_status, "", 0).as_ref()) {
+        crate::door_words::ProofClass::Mined => {
             return match parse_arcade_merklepath(body) {
                 Some(bump_hex) => ArcadeProofLook::Mined(bump_hex),
                 None => ArcadeProofLook::Unknown,
             };
         }
-        ArcadeVerdict::Seen => {}
+        crate::door_words::ProofClass::Seen => {}
         // STUMP_PROCESSING is in a block with no path yet: the couriers may
         // hold one, so the ladder asks on
         _ => return ArcadeProofLook::Unknown,
@@ -4323,12 +4325,11 @@ pub(crate) async fn arcade_look(
 /// case); a word Arcade does not define, empty included, is no answer, a
 /// `Fault` (the webhook evidence and the both-indexer bar decide, as behind an
 /// outage); every other defined word, an ORPHAN view among them, is `Present`.
+///
+/// bsv-low #619 (L3): the word as the tracker's hint, the look the host's
+/// policy over it (`door_words::live_look`).
 pub fn live_arcade_look(tx_status: &str, extra_info: String) -> ArcadeLook {
-    match arcade_verdict(tx_status) {
-        v if v.is_refusal() => ArcadeLook::Fatal(tx_status.trim().to_ascii_uppercase(), extra_info),
-        ArcadeVerdict::Invalid => ArcadeLook::Fault,
-        _ => ArcadeLook::Present,
-    }
+    crate::door_words::live_look(crate::door_words::arcade_hint(tx_status, "", 0).as_ref(), extra_info)
 }
 
 /// PURE: the live Arcade answer wins; webhook evidence only fills a FAULT.

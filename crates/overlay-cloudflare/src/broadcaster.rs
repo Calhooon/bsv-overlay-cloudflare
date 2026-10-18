@@ -2,7 +2,6 @@
 //! transactions to SHIP peers and to the BSV network via ARC.
 
 use async_trait::async_trait;
-use overlay_discovery::arcade_words::{arcade_verdict, ArcadeVerdict};
 use overlay_engine::broadcaster::{ArcBroadcaster, Broadcaster};
 use overlay_engine::types::TaggedBEEF;
 
@@ -1054,8 +1053,12 @@ pub(crate) const ARCADE_GATE_STATUS: &str = "SEEN_ON_NETWORK";
 /// P0-2d (bsv-stack-lean #52): read through the one verdict function
 /// (`overlay_discovery::arcade_words`), so a lower-case `rejected` is the same
 /// refusal as `REJECTED`.
+/// bsv-low #619 (L3): the word is the tracker's hint, the refusal the host's
+/// policy over it (`door_words`).
 pub(crate) fn is_arcade_fatal(tx_status: &str) -> bool {
-    arcade_verdict(tx_status).is_refusal()
+    crate::door_words::arcade_hint(tx_status, "", 0)
+        .as_ref()
+        .is_some_and(crate::door_words::refusal)
 }
 
 /// Give up waiting for propagation after this long — the tx was submitted but
@@ -1129,13 +1132,13 @@ pub(crate) enum GateVerdict {
 /// orphan-pool view is never a network accept. A word Arcade does not define
 /// is no answer: Pending (never admits, never refuses; the ladder ends at the
 /// second broadcaster).
+///
+/// bsv-low #619 (L3): Arcade's word enters as the tracker's `Hint`
+/// (`door_words::arcade_hint`, fed by `arcade_words`) and the verdict is the
+/// host's admission policy over that hint (`door_words::gate`); the answers
+/// are pinned byte-identical (`door_answer_table`).
 pub(crate) fn classify_arcade_status(status: &str) -> GateVerdict {
-    match arcade_verdict(status) {
-        ArcadeVerdict::Orphan => GateVerdict::Orphan,
-        v if v.is_refusal() => GateVerdict::Fatal,
-        v if v.network_holds() => GateVerdict::Reached,
-        _ => GateVerdict::Pending,
-    }
+    crate::door_words::gate(crate::door_words::arcade_hint(status, "", 0).as_ref())
 }
 
 /// Async sleep via JS `setTimeout` (Cloudflare Workers runtime). Compiles on the

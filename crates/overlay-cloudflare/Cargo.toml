@@ -32,6 +32,9 @@ overlay-discovery = { package = "bsv-overlay-discovery", version = "0.2.2", path
 # Replay stays enabled for every Worker build and resolves from crates.io on publish.
 low-proof-replay = { package = "bsv-low-proof-replay", version = "0.2.2", path = "../low-proof-replay" }
 bsv-rs = { workspace = true, features = ["wasm"] }
+# bsv-low #619 (L3): the door hosts the tracker for Arcade's words
+# (`door_words`); the same exact pin as the app layer, one copy in the lock.
+bsv-tracker = "=0.3.0"
 # 0.3 (bsv-low #348, was 0.1). Bumped because it is the only middleware line
 # compatible with `worker 0.8`, and it is the SAME major the low-watchtower
 # and low-app-layer already pin, so the fleet is now on one middleware lineage
