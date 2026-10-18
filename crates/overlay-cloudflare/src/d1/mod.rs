@@ -595,7 +595,16 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 329 to 330 for the PRE557 lens fold: `idx_pot_records_block_time_null`, the stamp step's partial index.
 /// 330 to 334 for bsv-low #674's cutoff (lane W2-LB-674-CUTOFF): `board_era`, the `board_win_era` guard, the
 /// `board_era_update` re-derivation, the row.
-pub const OVERLAY_MIGRATION_COUNT: usize = 334;
+/// 334 to 336 for bsv-low #621 (L5): `network_seen.seenSource` and `network_seen.sourceAtMs`, the broadcaster that said
+/// SEEN and its time. The app layer reads both (`/utxo-status.networkSeenBy`), so epoch Rule 24 bites: its
+/// `LATCH_COLUMN_ALTERS` carry the same two statements.
+pub const OVERLAY_MIGRATION_COUNT: usize = 336;
+
+/// bsv-low #621 (L5): who said SEEN (`ops::SeenSource::wire`); NULL on a row latched before it shipped.
+pub const NETWORK_SEEN_BY_ALTER: &str = "ALTER TABLE network_seen ADD COLUMN seenSource TEXT";
+
+/// bsv-low #621 (L5): when the named broadcaster said SEEN, in ms; NULL on a row latched before it shipped.
+pub const NETWORK_SEEN_BY_AT_ALTER: &str = "ALTER TABLE network_seen ADD COLUMN sourceAtMs INTEGER";
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2203,6 +2212,11 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_board::WIN_ERA,
     crate::derived_board::ERA_UPDATE,
     crate::derived_board::ERA_SEED,
+    // 335, 336: bsv-low #621 (L5), the `network_seen` latch names its broadcaster and that broadcaster's time
+    // (`ops::NETWORK_SEEN_INSERT_SQL`, `ops::SeenSource`). Additive: a row latched before carries NULL in both and is
+    // served with `source: null` and its `seenAt` time; `networkSeen` itself is unchanged.
+    NETWORK_SEEN_BY_ALTER,
+    NETWORK_SEEN_BY_AT_ALTER,
 ];
 
 // =============================================================================

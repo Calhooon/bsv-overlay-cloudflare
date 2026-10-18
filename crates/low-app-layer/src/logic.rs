@@ -176,6 +176,9 @@ pub struct OutpointStatus {
     /// the FUNDING (`network_seen` on the pot txid). Present on the D1 batch
     /// path (null elsewhere and for an unknown outpoint).
     pub funding_seen: Option<bool>,
+    /// bsv-low #621 (L5): the funding latch's witness (its broadcaster and time), served beside `networkSeen` as
+    /// `networkSeenBy` wherever `funding_seen` is (the D1 batch path); `None` = unwitnessed or not read.
+    pub funding_seen_by: Option<SeenWitness>,
     /// WHY this answer is `known:false` — `None` on every `known:true` row
     /// and on the D1-backed `/utxo-status` path (where absence genuinely
     /// means "no row"). Set by `/spent-any` so an upstream OUTAGE is legible
@@ -205,12 +208,20 @@ pub enum ServedEviction {
     NotRead,
     /// Read, and the ledger holds no row for the txid: the wire value is `null`.
     NoRow,
-    /// The ledger's row: `evictedAt` (ms) and `readmittedAt` (ms, `None` while the eviction is open).
-    Row { at: i64, readmitted_at: Option<i64> },
+    /// The ledger's row: `evictedAt` (ms), `readmittedAt` (ms, `None` while the eviction is open) and the chain
+    /// word it rests on (bsv-low #621: `rejected` / `conflicted`, `None` for an eviction on absence alone).
+    Row {
+        at: i64,
+        readmitted_at: Option<i64>,
+        chain_word: Option<&'static str>,
+    },
 }
 
 /// The served word of an OPEN eviction (shared with `ls_pot spentStatus`, bsv-low E649 L6 fold L1).
 pub use overlay_discovery::pot::storage::EVICTED_WORD;
+
+/// bsv-low #621 (L5): the `network_seen` witness pair (shared with `ls_pot spentStatus`).
+pub use overlay_discovery::pot::storage::SeenWitness;
 
 impl ServedEviction {
     /// The wire value, `None` when the key is omitted.
@@ -218,9 +229,15 @@ impl ServedEviction {
         match self {
             ServedEviction::NotRead => None,
             ServedEviction::NoRow => Some(serde_json::Value::Null),
-            ServedEviction::Row { at, readmitted_at } => Some(
-                overlay_discovery::pot::storage::served_eviction_value(*at, *readmitted_at),
-            ),
+            ServedEviction::Row {
+                at,
+                readmitted_at,
+                chain_word,
+            } => Some(overlay_discovery::pot::storage::served_eviction_value(
+                *at,
+                *readmitted_at,
+                *chain_word,
+            )),
         }
     }
 }
@@ -231,6 +248,8 @@ pub struct EvictionLedgerRow {
     pub txid: String,
     pub evicted_at: i64,
     pub readmitted_at: Option<i64>,
+    /// bsv-low #621: the ledger row's `reason` (its chain word is read from it).
+    pub reason: String,
 }
 
 /// bsv-low E649 L6: the `/utxo-status` ledger read, one statement per chunk of DISTINCT txids. `txid IN`
@@ -261,6 +280,7 @@ pub fn attach_evictions(entries: &mut [OutpointStatus], rows: &[EvictionLedgerRo
             Some(r) => ServedEviction::Row {
                 at: r.evicted_at,
                 readmitted_at: r.readmitted_at,
+                chain_word: overlay_discovery::pot::storage::eviction_chain_word(&r.reason),
             },
             None => ServedEviction::NoRow,
         };
@@ -293,6 +313,7 @@ impl OutpointStatus {
             spender_seen: None,
             spender_final: None,
             funding_seen: None,
+            funding_seen_by: None,
             reason: None,
             evicted: ServedEviction::NotRead,
         }
@@ -341,6 +362,7 @@ impl OutpointStatus {
             spender_seen,
             spender_final,
             funding_seen,
+            funding_seen_by: None,
             reason: None,
             evicted: ServedEviction::NotRead,
         }
@@ -385,6 +407,14 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
             if let Some(v) = e.evicted.to_json() {
                 row["evicted"] = v;
             }
+            // bsv-low #621 (L5, ADDITIVE): the funding witness as the tracker's `seen` HINT with its source and
+            // time, served where `networkSeen` was read (the D1 batch path's known rows), omitted elsewhere so every
+            // other producer's bytes stand. A hint, never evidence: no money view reads it.
+            if e.funding_seen.is_some() {
+                row["networkSeenBy"] = overlay_discovery::pot::storage::served_seen_by_value(
+                    e.funding_seen_by.as_ref().filter(|_| e.funding_seen == Some(true)),
+                );
+            }
             row
         })
         .collect();
@@ -410,7 +440,8 @@ pub fn batch_where_sql(n: usize) -> String {
     format!(
         "SELECT p.txid, p.outputIndex, p.spent, p.spendingTxid, p.spentConfirmed, \
                 p.spenderFinal, ns.txid IS NOT NULL AS spenderSeen, \
-                fs.txid IS NOT NULL AS fundingSeen \
+                fs.txid IS NOT NULL AS fundingSeen, \
+                fs.seenAt AS fundingSeenAt, fs.seenSource AS fundingSeenBy, fs.sourceAtMs AS fundingSeenByAt \
          FROM pot_records p \
          LEFT JOIN network_seen ns ON p.spendingTxid IS NOT NULL \
               AND ns.txid = lower(p.spendingTxid) \
@@ -437,6 +468,8 @@ pub struct PotRecordRow {
     /// the D1 batch path (every test/fixture row that predates it).
     #[allow(dead_code)]
     pub funding_seen: Option<bool>,
+    /// bsv-low #621 (L5): the funding latch's witness pair (`None` off the D1 batch path or unwitnessed).
+    pub funding_seen_by: Option<SeenWitness>,
 }
 
 /// Map the batch-query rows back onto the REQUESTED outpoints, input-ordered.
@@ -451,15 +484,18 @@ pub fn assemble_statuses(outpoints: &[Outpoint], rows: &[PotRecordRow]) -> Vec<O
                 .iter()
                 .find(|r| r.txid.eq_ignore_ascii_case(&key_txid) && r.vout == op.vout)
             {
-                Some(r) => OutpointStatus::known_with_witness(
-                    op,
-                    r.spent,
-                    r.spending_txid.clone(),
-                    r.spent_confirmed,
-                    r.spender_seen,
-                    r.spender_final,
-                    r.funding_seen,
-                ),
+                Some(r) => OutpointStatus {
+                    funding_seen_by: r.funding_seen_by.clone(),
+                    ..OutpointStatus::known_with_witness(
+                        op,
+                        r.spent,
+                        r.spending_txid.clone(),
+                        r.spent_confirmed,
+                        r.spender_seen,
+                        r.spender_final,
+                        r.funding_seen,
+                    )
+                },
                 None => OutpointStatus::unknown(op),
             }
         })
@@ -3530,7 +3566,8 @@ mod tests {
             batch_where_sql(1),
             "SELECT p.txid, p.outputIndex, p.spent, p.spendingTxid, p.spentConfirmed, \
                 p.spenderFinal, ns.txid IS NOT NULL AS spenderSeen, \
-                fs.txid IS NOT NULL AS fundingSeen \
+                fs.txid IS NOT NULL AS fundingSeen, \
+                fs.seenAt AS fundingSeenAt, fs.seenSource AS fundingSeenBy, fs.sourceAtMs AS fundingSeenByAt \
          FROM pot_records p \
          LEFT JOIN network_seen ns ON p.spendingTxid IS NOT NULL \
               AND ns.txid = lower(p.spendingTxid) \
@@ -3572,6 +3609,7 @@ mod tests {
                 spending_txid: None,
                 spent_confirmed: false,
                 funding_seen: None,
+                funding_seen_by: None,
             },
             PotRecordRow {
                 spender_final: None,
@@ -3582,6 +3620,7 @@ mod tests {
                 spending_txid: Some("f0".repeat(32)),
                 spent_confirmed: true,
                 funding_seen: None,
+                funding_seen_by: None,
             },
         ];
         let out = assemble_statuses(&ops, &rows);
@@ -3618,6 +3657,7 @@ mod tests {
             spending_txid: None,
             spent_confirmed: false,
             funding_seen: None,
+            funding_seen_by: None,
         }];
         let out = assemble_statuses(&ops, &rows);
         assert!(out[0].known);
@@ -3788,6 +3828,7 @@ mod tests {
                     spending_txid: Some(spender.clone()),
                     spent_confirmed: true,
                     funding_seen: None,
+                    funding_seen_by: None,
                 },
                 spender_beef_hex: Some(beef_hex_upper),
             },
@@ -3801,6 +3842,7 @@ mod tests {
                     spending_txid: Some(spender.clone()),
                     spent_confirmed: false,
                     funding_seen: None,
+                    funding_seen_by: None,
                 },
                 spender_beef_hex: None,
             },
@@ -3814,6 +3856,7 @@ mod tests {
                     spending_txid: None,
                     spent_confirmed: false,
                     funding_seen: None,
+                    funding_seen_by: None,
                 },
                 spender_beef_hex: None,
             },
@@ -3860,6 +3903,7 @@ mod tests {
                 spending_txid: Some("f0".repeat(32)),
                 spent_confirmed: true,
                 funding_seen: None,
+                funding_seen_by: None,
             },
             spender_beef_hex: Some("not-hex!!".to_string()),
         }];
@@ -4827,6 +4871,7 @@ mod tests {
                         spending_txid: Some(tx(*settle)),
                         spent_confirmed: confirmed,
                         funding_seen: None,
+                        funding_seen_by: None,
                     });
                 }
             }
@@ -4897,6 +4942,7 @@ mod tests {
                         spending_txid: Some(tx(*settle)),
                         spent_confirmed: true,
                         funding_seen: None,
+                        funding_seen_by: None,
                     });
                 }
             }
@@ -5964,6 +6010,7 @@ mod tests {
                             spending_txid: Some(tx(*settle)),
                             spent_confirmed: true,
                             funding_seen: None,
+                            funding_seen_by: None,
                         });
                     }
                 }

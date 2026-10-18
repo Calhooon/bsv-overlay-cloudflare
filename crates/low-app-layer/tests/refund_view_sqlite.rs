@@ -406,7 +406,7 @@ fn seen_and_final_settle_supersedes_unconfirmed_end_to_end() {
     mark_spent_final(&conn, &pot, &settle, false, Some("winner-a"), None, Some(1));
     conn.execute(
         bsv_overlay_cloudflare::ops::NETWORK_SEEN_INSERT_SQL,
-        params![settle],
+        params![settle, "arcade", 1_i64],
     )
     .expect("network_seen latch");
 
@@ -457,7 +457,7 @@ fn seen_and_final_settle_supersedes_unconfirmed_end_to_end() {
     mark_spent_final(&conn, &pot3, &parked, false, Some("refund"), None, Some(0));
     conn.execute(
         bsv_overlay_cloudflare::ops::NETWORK_SEEN_INSERT_SQL,
-        params![parked],
+        params![parked, "arcade", 1_i64],
     )
     .expect("network_seen latch");
     let e3 = assemble_refund_view(query_rows(&conn, &me), Some(900_200))

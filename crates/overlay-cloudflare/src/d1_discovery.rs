@@ -2155,6 +2155,33 @@ struct EvictionRow {
     evicted_at: f64,
     #[serde(rename = "readmittedAt", default)]
     readmitted_at: Option<f64>,
+    /// bsv-low #621: the eviction's reason, read for its chain word (`eviction_chain_word`).
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// One `network_seen` row with its witness (bsv-low #621, `network_seen_by_batch_sql`).
+#[derive(serde::Deserialize)]
+struct NetworkSeenByRow {
+    txid: String,
+    #[serde(rename = "seenAt", default)]
+    seen_at: Option<f64>,
+    #[serde(rename = "seenSource", default)]
+    seen_by: Option<String>,
+    #[serde(rename = "sourceAtMs", default)]
+    seen_by_at: Option<f64>,
+}
+
+impl NetworkSeenByRow {
+    /// The served witness (the shared mapping, `seen_witness_of_row`).
+    fn witness(self) -> Option<overlay_discovery::pot::storage::SeenWitness> {
+        overlay_discovery::pot::storage::seen_witness_of_row(
+            true,
+            self.seen_by,
+            self.seen_by_at.map(|v| v as i64),
+            self.seen_at.map(|v| v as i64),
+        )
+    }
 }
 
 /// The #284 backfill's verdict write (gate finding MEDIUM-2, 2026-07-28): a
@@ -2888,6 +2915,9 @@ impl PotStorage for D1PotStorage {
                     EvictionLedgerEntry {
                         evicted_at: row.evicted_at as i64,
                         readmitted_at: row.readmitted_at.map(|v| v as i64),
+                        chain_word: overlay_discovery::pot::storage::eviction_chain_word(
+                            row.reason.as_deref().unwrap_or(""),
+                        ),
                     },
                 );
             }
@@ -2917,6 +2947,36 @@ impl PotStorage for D1PotStorage {
         Ok(txids
             .iter()
             .map(|t| seen.contains(&t.to_ascii_lowercase()))
+            .collect())
+    }
+
+    async fn network_seen_witness_for(
+        &self,
+        txids: &[String],
+    ) -> Result<Vec<Option<overlay_discovery::pot::storage::SeenWitness>>, PotStorageError> {
+        if txids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // bsv-low #621: the same primary-key read as `network_seen_for`, with the witness pair; chunks of 90.
+        const CHUNK: usize = 90;
+        let mut seen: std::collections::HashMap<String, overlay_discovery::pot::storage::SeenWitness> =
+            std::collections::HashMap::new();
+        for chunk in txids.chunks(CHUNK) {
+            let mut q = Query::new(overlay_discovery::pot::storage::network_seen_by_batch_sql(chunk.len()));
+            for txid in chunk {
+                q = q.bind(txid.to_ascii_lowercase());
+            }
+            let rows: Vec<NetworkSeenByRow> = q.fetch_all(&self.db).await.map_err(pot_err)?;
+            for row in rows {
+                let txid = row.txid.to_ascii_lowercase();
+                if let Some(w) = row.witness() {
+                    seen.insert(txid, w);
+                }
+            }
+        }
+        Ok(txids
+            .iter()
+            .map(|t| seen.get(&t.to_ascii_lowercase()).cloned())
             .collect())
     }
 
@@ -8819,16 +8879,18 @@ mod tests {
         let conn = production_schema_db();
         conn.execute(
             crate::ops::NETWORK_SEEN_INSERT_SQL,
-            rusqlite::params!["ABCDEF01"],
+            rusqlite::params!["ABCDEF01", crate::ops::SeenSource::Taal.wire(), 1_760_000_000_123_i64],
         )
         .expect("latch executes");
-        let (txid, seen_at): (String, i64) = conn
-            .query_row("SELECT txid, seenAt FROM network_seen", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+        let (txid, seen_at, by, by_at): (String, i64, String, i64) = conn
+            .query_row("SELECT txid, seenAt, seenSource, sourceAtMs FROM network_seen", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .expect("one row");
         assert_eq!(txid, "abcdef01", "keyed lowercase");
         assert!(seen_at > 0, "stamped by unixepoch()");
+        // bsv-low #621: the latch names its broadcaster and that broadcaster's time
+        assert_eq!((by.as_str(), by_at), ("taal", 1_760_000_000_123));
         // Re-latch: ignored, first stamp kept.
         conn.execute(
             "UPDATE network_seen SET seenAt = 1 WHERE txid = 'abcdef01'",
@@ -8837,9 +8899,15 @@ mod tests {
         .expect("age the row");
         conn.execute(
             crate::ops::NETWORK_SEEN_INSERT_SQL,
-            rusqlite::params!["abcDEF01"],
+            rusqlite::params!["abcDEF01", crate::ops::SeenSource::Arcade.wire(), 9_i64],
         )
         .expect("re-latch executes");
+        let kept_by: (String, i64) = conn
+            .query_row("SELECT seenSource, sourceAtMs FROM network_seen WHERE txid = 'abcdef01'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("kept by");
+        assert_eq!(kept_by, ("taal".to_string(), 1_760_000_000_123), "the first witness's pair stands");
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM network_seen", [], |r| r.get(0))
             .expect("count");

@@ -544,9 +544,11 @@ impl LookupService for PotLookupService {
         // admit-fast step 4: the pot's OWN network witness (the overlay's
         // broadcaster-witnessed SEEN latch, D3) — one batched read, aligned.
         let txids: Vec<String> = keys.iter().map(|(t, _)| t.clone()).collect();
+        // bsv-low #621 (L5): the same read with each latch's witness (its broadcaster and time); `networkSeen` is
+        // `is_some()` of it, byte for byte the bool it was.
         let witnessed = self
             .storage
-            .network_seen_for(&txids)
+            .network_seen_witness_for(&txids)
             .await
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
 
@@ -629,12 +631,16 @@ impl LookupService for PotLookupService {
                 // admitted. Under admit-fast an admitted pot can be
                 // unwitnessed for seconds: the felt says "awaiting the
                 // network" until this flips, from the pots-room push.
-                "networkSeen": if known { serde_json::Value::Bool(seen) } else { serde_json::Value::Null },
+                "networkSeen": if known { serde_json::Value::Bool(seen.is_some()) } else { serde_json::Value::Null },
+                // bsv-low #621 (L5, ADDITIVE): the witness as the tracker's `seen` HINT with its source and time
+                // (`{word: "seen", tier: "hint", source, at}`; `source` null on a row latched before it shipped);
+                // null when unwitnessed or unknown. A hint, never evidence: no money view reads it.
+                "networkSeenBy": if known { super::storage::served_seen_by_value(seen.as_ref()) } else { serde_json::Value::Null },
             });
             if let Some(ledger) = &ledger {
                 let row = ledger.get(&op.txid.to_ascii_lowercase()).copied().flatten();
                 entry["evicted"] = match row {
-                    Some(r) => super::storage::served_eviction_value(r.evicted_at, r.readmitted_at),
+                    Some(r) => super::storage::served_eviction_value(r.evicted_at, r.readmitted_at, r.chain_word),
                     None => serde_json::Value::Null,
                 };
             }
@@ -1010,6 +1016,74 @@ mod tests {
         assert!(
             arr[2]["networkSeen"].is_null(),
             "never admitted: never a witness"
+        );
+    }
+
+    /// bsv-low #621 (L5): beside the old `networkSeen` (its bytes unchanged), `spentStatus` serves the witness as
+    /// the tracker's `seen` hint WITH its source and time; a legacy latch (no pair) serves `source: null`; an
+    /// unwitnessed or unknown outpoint serves `null`.
+    #[tokio::test]
+    async fn spent_status_serves_the_witness_with_its_source_and_time() {
+        let (svc, storage) = make_service_with_storage();
+        let named = funding_tx(1);
+        let legacy = funding_tx(2);
+        let unseen = funding_tx(3);
+        for tx in [&named, &legacy, &unseen] {
+            svc.output_admitted_by_topic(&admit(beef_of(tx), 0)).await.unwrap();
+        }
+        storage.mark_network_seen_by(&named.id(), "taal", 1_760_000_000_123);
+        storage.mark_network_seen(&legacy.id());
+        let arr = spent_status(
+            &svc,
+            serde_json::json!([
+                {"txid": named.id(), "vout": 0},
+                {"txid": legacy.id(), "vout": 0},
+                {"txid": unseen.id(), "vout": 0},
+                {"txid": "ab".repeat(32), "vout": 0},
+            ]),
+        )
+        .await;
+        assert_eq!(
+            (arr[0]["networkSeen"].clone(), arr[0]["networkSeenBy"].clone()),
+            (
+                serde_json::json!(true),
+                serde_json::json!({"word": "seen", "tier": "hint", "source": "taal", "at": 1_760_000_000_123_i64})
+            )
+        );
+        assert_eq!(
+            arr[1]["networkSeenBy"],
+            serde_json::json!({"word": "seen", "tier": "hint", "source": null, "at": null}),
+            "a legacy latch names no source"
+        );
+        assert_eq!(arr[1]["networkSeen"], true);
+        assert_eq!((arr[2]["networkSeen"].clone(), arr[2]["networkSeenBy"].clone()), (serde_json::json!(false), serde_json::Value::Null));
+        assert!(arr[3]["networkSeen"].is_null() && arr[3]["networkSeenBy"].is_null());
+    }
+
+    /// bsv-low #621 (L5): the served eviction word is the chain word the eviction rests on: `conflicted` for the
+    /// conflict pass, `rejected` for Arcade's own terminal word, `null` for an eviction on absence alone (the felt
+    /// never voids on it).
+    #[tokio::test]
+    async fn spent_status_serves_the_evictions_chain_word_never_an_absence() {
+        let (svc, storage) = make_service_with_storage();
+        let conflicted = "ab".repeat(32);
+        let rejected = "cd".repeat(32);
+        let absent = "ef".repeat(32);
+        storage.serve_evictions();
+        storage.record_eviction_word(&conflicted, 5, None, crate::pot::storage::eviction_chain_word("input aa:0 spent by confirmed competitor bb at 9"));
+        storage.record_eviction_word(&rejected, 6, None, crate::pot::storage::eviction_chain_word("REJECTED (arcade live REJECTED: bad; both indexers absent)"));
+        storage.record_eviction_word(&absent, 7, None, crate::pot::storage::eviction_chain_word("SEEN_ON_NETWORK (arcade missing, both indexers absent)"));
+        let arr = spent_status(
+            &svc,
+            serde_json::json!([{"txid": conflicted, "vout": 0}, {"txid": rejected, "vout": 0}, {"txid": absent, "vout": 0}]),
+        )
+        .await;
+        assert_eq!(arr[0]["evicted"]["word"], "conflicted");
+        assert_eq!(arr[1]["evicted"]["word"], "rejected");
+        assert_eq!(
+            arr[2]["evicted"],
+            serde_json::json!({"at": 7, "word": null, "readmittedAt": null}),
+            "an eviction on absence alone serves no chain word"
         );
     }
 

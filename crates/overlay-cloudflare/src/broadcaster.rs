@@ -89,8 +89,9 @@ struct ArcResponse {
 /// (the pending watch's input; [`ArcadeBroadcaster::witness_look`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WitnessLook {
-    /// SEEN_ON_NETWORK or better: the network holds it (the #371 bar).
-    Seen(String),
+    /// SEEN_ON_NETWORK or better: the network holds it (the #371 bar). The second member is Arcade's own stamp
+    /// of that status in ms (its `timestamp`, `None` when absent or unreadable; bsv-low #621).
+    Seen(String, Option<i64>),
     /// REJECTED / DOUBLE_SPEND_ATTEMPTED (status, extra_info): the evidence
     /// check decides, never this look alone.
     Fatal(String, String),
@@ -780,11 +781,14 @@ fn fold_refuse_bar(
 /// `host`: NL-6d, both hosts' base replaced by one (`CORROBORATOR_URL`, the
 /// route tier's local fixture, so a CI witness never posts to TAAL or
 /// GorillaPool); `None` in production.
+///
+/// bsv-low #621 (L5): the answer also names the broadcaster whose answer ACCEPTED (TAAL first, then GorillaPool),
+/// `None` when neither did; the verdict is unchanged.
 pub(crate) async fn corroborate_tx_hex(
     taal_api_key: Option<&str>,
     host: Option<&str>,
     tx_hex: &str,
-) -> Result<ArcOutcome, String> {
+) -> (Result<ArcOutcome, String>, Option<crate::ops::SeenSource>) {
     let taal_url = host.unwrap_or(WorkerArcBroadcaster::ARC_URL);
     let gp_url = host.unwrap_or(GORILLAPOOL_ARC_URL);
     let taal = match post_arc_raw(taal_url, taal_api_key, tx_hex).await {
@@ -792,7 +796,7 @@ pub(crate) async fn corroborate_tx_hex(
         Err(e) => Err(e),
     };
     if matches!(taal, Ok(ArcOutcome::Accepted(_))) {
-        return taal;
+        return (taal, Some(crate::ops::SeenSource::Taal));
     }
     worker::console_log!(
         "corroborate: TAAL did not accept ({}); consulting GorillaPool (two-provider bar)",
@@ -808,7 +812,16 @@ pub(crate) async fn corroborate_tx_hex(
         Ok((status, body)) => corroborator_verdict(status, &body),
         Err(e) => Err(e),
     };
-    fold_refuse_bar(taal, gp)
+    let by = named_accept(&gp, crate::ops::SeenSource::GorillaPool);
+    (fold_refuse_bar(taal, gp), by)
+}
+
+/// PURE (bsv-low #621): the broadcaster an answer names, only when the answer is an ACCEPT.
+fn named_accept(
+    answer: &Result<ArcOutcome, String>,
+    source: crate::ops::SeenSource,
+) -> Option<crate::ops::SeenSource> {
+    matches!(answer, Ok(ArcOutcome::Accepted(_))).then_some(source)
 }
 
 /// PURE (#216): corroborate a subject WITH its ancestry. Feed each ANCESTOR ef
@@ -2391,6 +2404,10 @@ pub struct ArcadeBroadcaster {
     registration_skipped: std::cell::Cell<usize>,
     /// NL-6d: set when a corroboration's walk paused at this many primed ancestors (the caller defers the rest).
     legs_paused: std::cell::Cell<Option<usize>>,
+    /// bsv-low #621 (L5): the FIRST broadcaster this request saw say SEEN or better for the subject (Arcade's
+    /// poll, stored echo or pre-flight probe; a corroborator's accept), with its stamp when its answer carried one.
+    /// The route latches `network_seen` under this name ([`Self::witnessed_by`]).
+    witnessed_by: std::cell::Cell<Option<(crate::ops::SeenSource, Option<i64>)>>,
 }
 
 impl ArcadeBroadcaster {
@@ -2439,6 +2456,7 @@ impl ArcadeBroadcaster {
             legs: LegWindow::in_request(),
             registration_skipped: std::cell::Cell::new(0),
             legs_paused: std::cell::Cell::new(None),
+            witnessed_by: std::cell::Cell::new(None),
         }
     }
 
@@ -2595,6 +2613,19 @@ impl ArcadeBroadcaster {
         self.corroborate_ms.get()
     }
 
+    /// bsv-low #621 (L5): who witnessed the subject in this request, first writer first (`None`: nobody said SEEN
+    /// or better; an admission under the fast answer is witnessed later, by the pending watch).
+    pub fn witnessed_by(&self) -> Option<(crate::ops::SeenSource, Option<i64>)> {
+        self.witnessed_by.get()
+    }
+
+    /// Record a witness unless one is recorded: the first SEEN of the request names the latch.
+    fn note_witness(&self, source: Option<crate::ops::SeenSource>, at_ms: Option<i64>) {
+        if let (Some(source), None) = (source, self.witnessed_by.get()) {
+            self.witnessed_by.set(Some((source, at_ms)));
+        }
+    }
+
     /// Milliseconds ACCUMULATED inside the SEEN-gate poll loop across this
     /// broadcaster instance (bsv-low #272 — read per request in routes.rs
     /// as the `arcade-poll` Server-Timing segment; the remainder of
@@ -2607,12 +2638,13 @@ impl ArcadeBroadcaster {
     /// accounting its wall-clock into [`Self::corroborate_ms`].
     async fn corroborate_subject(&self, subject_ef: &EfTx) -> Result<ArcOutcome, String> {
         let started = worker::js_sys::Date::now();
-        let res = corroborate_tx_hex(
+        let (res, by) = corroborate_tx_hex(
             self.corroborator_taal_key.as_deref(),
             self.corroborator_url.as_deref(),
             &hex::encode(&subject_ef.ef),
         )
         .await;
+        self.note_witness(by, None);
         self.corroborate_ms
             .set(self.corroborate_ms.get() + (worker::js_sys::Date::now() - started));
         res
@@ -2627,12 +2659,13 @@ impl ArcadeBroadcaster {
     /// Wall-clock accounted into [`Self::corroborate_ms`].
     async fn corroborate_mined_raw(&self, subject_raw: &[u8]) -> Result<ArcOutcome, String> {
         let started = worker::js_sys::Date::now();
-        let res = corroborate_tx_hex(
+        let (res, by) = corroborate_tx_hex(
             self.corroborator_taal_key.as_deref(),
             self.corroborator_url.as_deref(),
             &hex::encode(subject_raw),
         )
         .await;
+        self.note_witness(by, None);
         self.corroborate_ms
             .set(self.corroborate_ms.get() + (worker::js_sys::Date::now() - started));
         res
@@ -2661,14 +2694,27 @@ impl ArcadeBroadcaster {
         let started = worker::js_sys::Date::now();
         let key = self.corroborator_taal_key.clone();
         let host = self.corroborator_url.clone();
+        // bsv-low #621: the LAST call's accepting broadcaster; the subject's verdict is always the last call
+        // (subject-first's accept returns at once; otherwise the primed subject closes the walk)
+        let last_by: std::rc::Rc<std::cell::Cell<Option<crate::ops::SeenSource>>> = Default::default();
         let walk = corroborate_batch_with(efs, subject_txid, self.legs, |tx_hex| {
             let key = key.clone();
             let host = host.clone();
-            async move { corroborate_tx_hex(key.as_deref(), host.as_deref(), &tx_hex).await }
+            let last_by = last_by.clone();
+            async move {
+                let (res, by) = corroborate_tx_hex(key.as_deref(), host.as_deref(), &tx_hex).await;
+                last_by.set(by);
+                res
+            }
         })
         .await;
         let res = match walk {
-            LegWalk::Decided(res) => res,
+            LegWalk::Decided(res) => {
+                if matches!(res, Ok(ArcOutcome::Accepted(_))) {
+                    self.note_witness(last_by.get(), None);
+                }
+                res
+            }
             // NL-6d / ARCREGD-H2: preserve pause through the typed ladder
             // adapter. No later rung runs; the route defers from this cursor.
             LegWalk::Paused { reached } => {
@@ -2818,6 +2864,11 @@ impl ArcadeBroadcaster {
             gate_log(&format!(
                 "[arcade] {subject_txid} already >= {ARCADE_GATE_STATUS} (pre-flight probe) — ladder + callback re-registration skipped"
             ));
+            // bsv-low #621: Arcade's stored SEEN names the latch, at its own stamp
+            self.note_witness(
+                Some(crate::ops::SeenSource::Arcade),
+                probe.as_ref().and_then(|r| r.timestamp.as_deref()).and_then(crate::proof_fetcher::rfc3339_utc_ms),
+            );
             // Payload contract: `Accepted` carries the txid.
             return Ok(ArcOutcome::Accepted(subject_txid.to_string()));
         }
@@ -3028,6 +3079,11 @@ impl ArcadeBroadcaster {
                             "[arcade] {subject_txid} accepted at {} (no poll needed)",
                             parsed.tx_status
                         );
+                        if !self.fast_answer {
+                            // bsv-low #621: the witnessed mode's stored echo names the latch (the POST echo
+                            // carries no stamp: the overlay's clock)
+                            self.note_witness(Some(crate::ops::SeenSource::Arcade), None);
+                        }
                         return Ok(reached_submit_echo(self.fast_answer));
                     }
                     GateVerdict::Fatal => {
@@ -3210,6 +3266,11 @@ impl ArcadeBroadcaster {
                             resp.tx_status
                         );
                         stamp(&self.poll_ms);
+                        // bsv-low #621: Arcade's polled SEEN names the latch, at its own stamp
+                        self.note_witness(
+                            Some(crate::ops::SeenSource::Arcade),
+                            resp.timestamp.as_deref().and_then(crate::proof_fetcher::rfc3339_utc_ms),
+                        );
                         return Ok(GateStep::Accepted);
                     }
                     GateVerdict::Fatal => {
@@ -3261,12 +3322,21 @@ impl ArcadeBroadcaster {
     /// different echo is an upstream answering about something else — it
     /// must never latch OUR subject. Fails toward the merkle bar only.
     pub async fn network_witnessed(&self, txid: &str) -> bool {
+        self.network_seen_stamp(txid).await.is_some()
+    }
+
+    /// bsv-low #621 (L5): [`Self::network_witnessed`] with Arcade's own stamp of the status: `Some(stamp)` when
+    /// Arcade's live word is SEEN or better for THIS txid (`stamp` its `timestamp` in ms, `None` when the body
+    /// carries none or an unreadable one), `None` when it is not.
+    pub async fn network_seen_stamp(&self, txid: &str) -> Option<Option<i64>> {
         match self.tx_status(txid).await {
-            Some(r) => {
-                r.txid.eq_ignore_ascii_case(txid)
-                    && matches!(classify_arcade_status(&r.tx_status), GateVerdict::Reached)
+            Some(r)
+                if r.txid.eq_ignore_ascii_case(txid)
+                    && matches!(classify_arcade_status(&r.tx_status), GateVerdict::Reached) =>
+            {
+                Some(r.timestamp.as_deref().and_then(crate::proof_fetcher::rfc3339_utc_ms))
             }
-            None => false,
+            _ => None,
         }
     }
 
@@ -3278,7 +3348,10 @@ impl ArcadeBroadcaster {
         match self.tx_status(txid).await {
             Some(r) if r.txid.eq_ignore_ascii_case(txid) => {
                 match classify_arcade_status(&r.tx_status) {
-                    GateVerdict::Reached => WitnessLook::Seen(r.tx_status),
+                    GateVerdict::Reached => WitnessLook::Seen(
+                        r.tx_status,
+                        r.timestamp.as_deref().and_then(crate::proof_fetcher::rfc3339_utc_ms),
+                    ),
                     GateVerdict::Fatal => WitnessLook::Fatal(r.tx_status, r.extra_info),
                     GateVerdict::Orphan => WitnessLook::Orphan(r.tx_status),
                     GateVerdict::Pending => WitnessLook::Pending(r.tx_status),

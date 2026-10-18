@@ -100,6 +100,15 @@ fn jrows(db: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]) -> Vec<serde_js
 /// `proof_posted_sql`), and every card holds exactly its owner's wins, each its `board_wins` row and frag.
 fn frag_and_card_drift(db: &Connection, label: &str) -> Result<(), String> {
     use low_app_layer::logic as l;
+    // bsv-low #621: the app layer's own catch-up adds the seen latch's pair before any read names it (a database at
+    // an earlier migration, as the legacy board is, gets it here exactly as a cold isolate does)
+    apply(
+        db,
+        &[
+            low_app_layer::schema::NETWORK_SEEN_SOURCE_ALTER,
+            low_app_layer::schema::NETWORK_SEEN_SOURCE_AT_ALTER,
+        ],
+    );
     let wins = jrows(db, "SELECT * FROM board_wins ORDER BY potTxid", &[]);
     for w in &wins {
         let pot = w["potTxid"].as_str().unwrap();
@@ -110,7 +119,10 @@ fn frag_and_card_drift(db: &Connection, label: &str) -> Result<(), String> {
         let lower = pot.to_ascii_lowercase();
         let mut status = jrows(db, &l::batch_where_sql(1), &[&lower, &0]);
         status.iter_mut().for_each(|r| {
-            r.as_object_mut().unwrap().remove("fundingSeen");
+            // the funding witness (and, bsv-low #621, its pair) is the felt's, never the board's
+            for k in ["fundingSeen", "fundingSeenAt", "fundingSeenBy", "fundingSeenByAt"] {
+                r.as_object_mut().unwrap().remove(k);
+            }
         });
         let decoded = jrows(
             db,
@@ -642,7 +654,7 @@ fn paths(db: &Connection) -> Result<(), String> {
     assert_eq!(
         db.execute(
             bsv_overlay_cloudflare::ops::NETWORK_SEEN_INSERT_SQL,
-            [spender(13)],
+            rusqlite::params![spender(13), "arcade", 1_i64],
         )
         .unwrap(),
         1,
@@ -824,7 +836,7 @@ fn paths(db: &Connection) -> Result<(), String> {
     assert_eq!(
         db.execute(
             bsv_overlay_cloudflare::ops::NETWORK_SEEN_INSERT_SQL,
-            [spender(11)]
+            rusqlite::params![spender(11), "arcade", 1_i64]
         )
         .unwrap(),
         0

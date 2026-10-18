@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- The seen witness names its source (bsv-low #621, LOW's words map L5).
+  `network_seen` gains `seenSource` and `sourceAtMs` (migrations 331 and
+  332, additive; the app layer's catch-up carries the same two ALTERs):
+  every latch names the broadcaster whose answer said SEEN (Arcade, TAAL or
+  GorillaPool; a courier never writes it) and that broadcaster's stamp when
+  its answer carried one. `ls_pot spentStatus` and `/utxo-status` keep
+  `networkSeen` byte for byte and add `networkSeenBy` (`{word: "seen",
+  tier: "hint", source, at}`). The served eviction word is the chain word
+  the eviction rests on: `rejected` (Arcade's own terminal word),
+  `conflicted` (the conflict pass), `null` for an eviction on absence alone
+  (`eviction_chain_word`). In `bsv-overlay-discovery`:
+  `EvictionLedgerEntry` gains `chain_word`, `served_eviction_value` takes
+  it, and `PotStorage` gains `network_seen_witness_for` (defaulted).
+
 - The lint bar (bsv-stack-lean #134, #135, #137, #139, #140, #141, #144,
   #145); no version move. Both workspaces carry a `[workspace.lints]`
   table every member takes: `clippy::all` and unsafe code denied in both;

@@ -115,6 +115,7 @@ fn status(txid: &str, spent: Option<bool>, spender: Option<&str>) -> logic::Outp
         spender_final: Some(true),
         reason: None,
         funding_seen: Some(true),
+        funding_seen_by: None,
         evicted: logic::ServedEviction::NotRead,
     }
 }
