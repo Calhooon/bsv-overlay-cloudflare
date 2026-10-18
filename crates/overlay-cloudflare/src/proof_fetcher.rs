@@ -4207,6 +4207,11 @@ pub enum ArcadeLook {
     Present,
     /// Transport/HTTP fault — no verdict.
     Fault,
+    /// bsv-low #621 (the W2-WORDS-L5 lens, MEDIUM-1): Arcade could not be asked (a [`ArcadeLook::Fault`]) and the
+    /// RECORDED terminal word fills it ([`fold_arcade_look`]): an `arc_terminal` row or a callback's pushed status,
+    /// whose bearer (`/arc-ingest`) is the public txid. Every DECISION reads it exactly as [`ArcadeLook::Fatal`];
+    /// only its provenance differs, so the eviction's ledger reason never reads as Arcade's own live word.
+    Recorded(String, String),
 }
 
 /// bsv-low #451 slice C (iv): the verdict memo the dead-letter pass leaves for `/tx-any` (the app layer's
@@ -4272,7 +4277,7 @@ pub fn retire_verdict(
         return None;
     }
     match arcade {
-        ArcadeLook::Fatal(status, extra) => {
+        ArcadeLook::Fatal(status, extra) | ArcadeLook::Recorded(status, extra) => {
             let head: String = extra.chars().take(120).collect();
             Some(format!("arcade {status}: {head}"))
         }
@@ -4332,13 +4337,14 @@ pub fn live_arcade_look(tx_status: &str, extra_info: String) -> ArcadeLook {
     crate::door_words::live_look(crate::door_words::arcade_hint(tx_status, "", 0).as_ref(), extra_info)
 }
 
-/// PURE: the live Arcade answer wins; webhook evidence only fills a FAULT.
+/// PURE: the live Arcade answer wins; webhook evidence only fills a FAULT, as [`ArcadeLook::Recorded`] (its own
+/// provenance: the decisions read it as `Fatal`, the eviction's reason does not name it Arcade's live word).
 pub fn fold_arcade_look(
     live: ArcadeLook,
     webhook_evidence: Option<(String, String)>,
 ) -> ArcadeLook {
     match (live, webhook_evidence) {
-        (ArcadeLook::Fault, Some((status, extra))) => ArcadeLook::Fatal(status, extra),
+        (ArcadeLook::Fault, Some((status, extra))) => ArcadeLook::Recorded(status, extra),
         (live, _) => live,
     }
 }
@@ -4509,7 +4515,7 @@ pub async fn run_retire_pass(
                             }
                             // Evidence on record (write-once — a webhook row
                             // already present makes this a no-op).
-                            if let ArcadeLook::Fatal(status, extra) = &look {
+                            if let ArcadeLook::Fatal(status, extra) | ArcadeLook::Recorded(status, extra) = &look {
                                 crate::ops::record_arc_terminal(
                                     db,
                                     &row.txid,
@@ -5368,10 +5374,11 @@ pub(crate) mod tests {
             fold_arcade_look(live_fatal.clone(), plant.clone()),
             live_fatal
         );
-        // Only an unreachable Arcade lets the recorded evidence speak.
+        // Only an unreachable Arcade lets the recorded evidence speak, under its own provenance (bsv-low #621,
+        // the W2-WORDS-L5 lens MEDIUM-1: never Arcade's live `Fatal`).
         assert_eq!(
             fold_arcade_look(ArcadeLook::Fault, plant),
-            ArcadeLook::Fatal("REJECTED".into(), "planted".into())
+            ArcadeLook::Recorded("REJECTED".into(), "planted".into())
         );
         assert_eq!(fold_arcade_look(ArcadeLook::Fault, None), ArcadeLook::Fault);
     }

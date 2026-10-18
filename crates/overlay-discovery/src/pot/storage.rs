@@ -301,9 +301,14 @@ pub const CONFLICT_REASON_MARK: &str = " spent by confirmed competitor ";
 
 /// bsv-low #621 (L5): the marks of an eviction on ABSENCE alone (`admit_fast::evidence_verdict`'s Missing and Fault
 /// arms: Arcade does not hold it or could not be asked, and both indexers say absent). No chain word rests on them.
-pub const ABSENCE_REASON_MARKS: [&str; 2] = [
+/// The third (the W2-WORDS-L5 lens, MEDIUM-1) is the Recorded arm: Arcade could not be asked and a RECORDED terminal
+/// word filled it (a push to the public `/arc-ingest`, or the watch's earlier look), so the eviction rests on that
+/// record and the absence, never on Arcade's live word. It opens that arm's reason, and absence is read before
+/// rejection, so a recorded text carrying a rejection mark is still no word.
+pub const ABSENCE_REASON_MARKS: [&str; 3] = [
     "arcade missing, both indexers absent",
     "arcade faulted, both indexers absent",
+    "arcade faulted, recorded ",
 ];
 
 /// bsv-low #621 (L5): the marks of an eviction on Arcade's OWN terminal word (REJECTED / DOUBLE_SPEND_ATTEMPTED,
