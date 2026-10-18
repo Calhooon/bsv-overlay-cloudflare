@@ -1,0 +1,8 @@
+;; bsv-low #731: the D1 budget tier's egress SEAL (macOS sandbox-exec). The tier's `wrangler dev` workers may reach
+;; the loopback only; a subrequest to any other address fails closed (the worker sees a transport fault, the same
+;; "could not look" a courier outage gives), so no cell can pass or fail on what mainnet answered. DNS still
+;; resolves (a unix socket), so the attempt is still logged and `egress_guard.mjs` reds on it.
+(version 1)
+(allow default)
+(deny network-outbound (remote ip "*:*"))
+(allow network-outbound (remote ip "localhost:*"))

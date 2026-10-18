@@ -183,6 +183,7 @@ use worker::{event, Context, Env, Request, Response, Result, Router};
 /// Deploy convergence runs only on the scheduled owed-clock pass, never a fetch.
 #[event(scheduled)]
 async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
+    routes::set_courier_sink(env.var("COURIER_SINK").ok().map(|v| v.to_string()));
     // E649 L4 N4: the pot hook's drain is its OWN task, handed first, under its own wall: the tracker's backfill
     // awaits CHAINTRACKS with no timeout, so it no longer holds the drain behind it. N7: ONE deadline for the whole
     // task: the boot, the pass (its every read, relay call, settle and counter) and the courier flush run under it.
@@ -267,6 +268,8 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     routes::set_woc_api_key(env.secret("WOC_API_KEY").ok().map(|k| k.to_string()));
     // bsv-low #451 slice B: the Arcade endpoint for `/tx-any`'s first external witness (`routes::arcade_url`).
     routes::set_arcade_url(env.var("ARCADE_URL").ok().map(|v| v.to_string()));
+    // bsv-low #731: the D1 budget tier's courier sink (a loopback origin only; unset everywhere but the tier).
+    routes::set_courier_sink(env.var("COURIER_SINK").ok().map(|v| v.to_string()));
     // Readable wasm panics in `wrangler tail` (set_once → cheap on re-entry).
     console_error_panic_hook::set_once();
 

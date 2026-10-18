@@ -2286,7 +2286,13 @@ async fn submit_parts(
     }
 
     let fanout_started = js_sys::Date::now();
-    if total_admitted > 0 {
+    let fanout_on = crate::mainnet_fanout::enabled(
+        env.var("MAINNET_FANOUT")
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
+    if total_admitted > 0 && fanout_on {
         let owned_host = hosting_url.map(str::to_string);
         ctx.wait_until(async move {
             crate::mainnet_fanout::fan_out(&tagged_beef, owned_host.as_deref()).await;

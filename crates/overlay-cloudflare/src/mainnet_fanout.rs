@@ -60,6 +60,16 @@ const DEFAULT_SLAP_TRACKERS: &[&str] = &[
 /// SHIP lookup question name — constant per BRC-95.
 const LS_SHIP: &str = "ls_ship";
 
+/// PURE (bsv-low #731): whether an admission fans out (`MAINNET_FANOUT`). Unset, or any value but `false`, `0` or
+/// `off`, fans out as before; the D1 budget tier sets `false`, so its admissions never ask the mainnet trackers
+/// (a cell reads only what it seeded). The reference's `SHIPBroadcaster` is likewise the deployment's to configure.
+pub fn enabled(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("false" | "0" | "off")
+    )
+}
+
 /// Fan out a tagged BEEF to every mainnet peer that runs any of its
 /// topics. Discovers peers by querying `ls_ship` at each
 /// `DEFAULT_SLAP_TRACKERS` and parsing the returned SHIP PushDrop records
@@ -246,6 +256,17 @@ async fn post_beef_to_peer(peer_host: &str, tagged: &TaggedBEEF) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fanout_knob_defaults_on_and_turns_off_by_name() {
+        assert!(enabled(None));
+        assert!(enabled(Some("")));
+        assert!(enabled(Some("true")));
+        assert!(enabled(Some("yes")));
+        for off in ["false", "0", "off", " FALSE ", "Off"] {
+            assert!(!enabled(Some(off)), "{off:?} must turn the fan-out off");
+        }
+    }
 
     #[test]
     fn default_trackers_are_https() {

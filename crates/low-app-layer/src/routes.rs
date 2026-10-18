@@ -8258,6 +8258,94 @@ fn woc_api_key() -> Option<String> {
     WOC_API_KEY.with(|k| k.borrow().clone())
 }
 
+thread_local! {
+    /// bsv-low #731: the COURIER SINK (`COURIER_SINK`), set per isolate at every entry (the fetch, the scheduled
+    /// tick, the board actor's fetch and alarm), like the WoC key.
+    static COURIER_SINK: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// PURE (bsv-low #731): the sink a `COURIER_SINK` value names, accepted ONLY as a plain-http LOOPBACK origin
+/// (`http://127.0.0.1:<port>` or `http://localhost:<port>`, no path). Anything else is no sink: the var can blind
+/// this worker's couriers (every read a transport fault, "could not look", the fail-safe direction), never send
+/// them to another host.
+pub fn courier_sink_of(value: Option<&str>) -> Option<String> {
+    let v = value?.trim().trim_end_matches('/');
+    let rest = v.strip_prefix("http://")?;
+    let (host, port) = rest.split_once(':')?;
+    if !matches!(host, "127.0.0.1" | "localhost")
+        || port.is_empty()
+        || !port.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+/// Install the courier sink for this isolate (idempotent; an unset or refused value clears it).
+pub fn set_courier_sink(value: Option<String>) {
+    COURIER_SINK.with(|s| *s.borrow_mut() = courier_sink_of(value.as_deref()));
+}
+
+/// PURE (bsv-low #731): where a courier read goes. With no sink, the URL itself; with one, the sink's origin and the
+/// URL's own path and query, so the D1 budget tier's couriers are a closed loopback port (every ask the same
+/// transport fault, run after run) and never mainnet. The census still names the ORIGINAL URL's provider.
+pub fn courier_target(url: &str, sink: Option<&str>) -> String {
+    let Some(sink) = sink else {
+        return url.to_string();
+    };
+    let after_scheme = url.split_once("://").map_or(url, |(_, r)| r);
+    let path = after_scheme.find('/').map_or("/", |i| &after_scheme[i..]);
+    format!("{sink}{path}")
+}
+
+#[cfg(test)]
+mod courier_sink_731 {
+    use super::{courier_sink_of, courier_target};
+
+    #[test]
+    fn only_a_loopback_http_origin_is_a_sink() {
+        assert_eq!(
+            courier_sink_of(Some("http://127.0.0.1:9")).as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+        assert_eq!(
+            courier_sink_of(Some(" http://localhost:4000/ ")).as_deref(),
+            Some("http://localhost:4000")
+        );
+        for refused in [
+            "",
+            "https://127.0.0.1:9",
+            "http://127.0.0.1",
+            "http://127.0.0.1:9/path",
+            "http://127.0.0.1:x9",
+            "http://api.whatsonchain.com:80",
+            "http://127.0.0.1.attacker.example:80",
+            "http://10.0.0.1:80",
+        ] {
+            assert_eq!(
+                courier_sink_of(Some(refused)),
+                None,
+                "{refused:?} must not be a sink"
+            );
+        }
+        assert_eq!(courier_sink_of(None), None);
+    }
+
+    #[test]
+    fn a_sink_keeps_the_path_and_query_and_no_sink_is_the_url() {
+        let url = "https://api.whatsonchain.com/v1/bsv/main/tx/ab/0/spent?x=1";
+        assert_eq!(courier_target(url, None), url);
+        assert_eq!(
+            courier_target(url, Some("http://127.0.0.1:9")),
+            "http://127.0.0.1:9/v1/bsv/main/tx/ab/0/spent?x=1"
+        );
+        assert_eq!(
+            courier_target("https://bananablocks.com", Some("http://127.0.0.1:9")),
+            "http://127.0.0.1:9/"
+        );
+    }
+}
+
 /// bsv-low #451 slice B: the Arcade endpoint `/tx-any`'s first external witness asks (`ARCADE_URL`; the overlay's
 /// default when unset). Set per isolate at request entry, like the WoC key.
 pub const DEFAULT_ARCADE_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech";
@@ -8376,7 +8464,8 @@ async fn provider_get_raw(
         let _ = headers.set(k, v);
     }
     init.with_headers(headers);
-    let request = worker::Request::new_with_init(url, &init).ok()?;
+    let target = COURIER_SINK.with(|s| courier_target(url, s.borrow().as_deref()));
+    let request = worker::Request::new_with_init(&target, &init).ok()?;
     let mut response = worker::Fetch::Request(request).send().await.ok()?;
     let status = response.status_code();
     let (body, body_read) = match response.bytes().await {

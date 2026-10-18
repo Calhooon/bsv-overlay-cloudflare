@@ -79,6 +79,7 @@ impl DurableObject for BoardView {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
+        self.install_courier_sink();
         let out = self.serve_fetch(req).await;
         self.flush_counters_if_due();
         out
@@ -87,6 +88,7 @@ impl DurableObject for BoardView {
     /// its faults, the abandoned retry) are flushed here, under the census's due rule, never only by a fetch
     /// isolate that never saw them.
     async fn alarm(&self) -> Result<Response> {
+        self.install_courier_sink();
         let out = self.serve_alarm().await;
         self.flush_counters_if_due();
         out
@@ -94,6 +96,12 @@ impl DurableObject for BoardView {
 }
 
 impl BoardView {
+    /// bsv-low #731: the deferred owed walk asks couriers from this actor's isolate, which may never have run the
+    /// front door's entry, so the actor installs the courier sink itself.
+    fn install_courier_sink(&self) {
+        crate::routes::set_courier_sink(self.env.var("COURIER_SINK").ok().map(|v| v.to_string()));
+    }
+
     fn flush_counters_if_due(&self) {
         let pending = crate::courier::take_pending_if_due(Date::now().as_millis() as f64);
         if !pending.is_empty() {
