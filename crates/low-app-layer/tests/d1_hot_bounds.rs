@@ -494,10 +494,8 @@ fn ns_cost_gc_deletes_the_old_rows_and_probes_the_stores_by_key() {
     }
     for store in ["pot_beefs", "transactions"] {
         assert!(
-            details
-                .iter()
-                .any(|d| d.starts_with(&format!("CORRELATED SCALAR SUBQUERY"))
-                    || d.contains(&format!("sqlite_autoindex_{store}_1 (txid=?)"))),
+            details.iter().any(|d| d.starts_with("SEARCH ")
+                && d.ends_with(&format!("USING INDEX sqlite_autoindex_{store}_1 (txid=?)"))),
             "{store} is probed by its key: {details:?}"
         );
     }
@@ -731,9 +729,8 @@ fn ns_cost_index_janitor_backlog_is_the_old_figure_and_reads_the_hour_alone() {
         0,
         "the stamped backfill scans nothing on a re-run"
     );
-    assert_eq!(
+    assert!(
         stmt.get_status(rusqlite::StatementStatus::VmStep) < 100,
-        true,
         "nor steps through the pots"
     );
     drop(stmt);
