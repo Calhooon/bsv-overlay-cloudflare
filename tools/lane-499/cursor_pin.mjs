@@ -39,7 +39,8 @@ try {
     const a = await db.prepare(e.sql).all()
     assert.equal(a.success, true, e.name)
     // W1.6: a RANDOM-ordered read is compared as a set.
-    const key = (rows) => e.unordered ? rows.map((r) => JSON.stringify(r)).sort() : rows
+    // NS-COST-BAR-1: each row's keys sorted too (the native side's map is alphabetical, D1's in column order).
+    const key = (rows) => e.unordered ? rows.map((r) => JSON.stringify(Object.fromEntries(Object.entries(r).sort()))).sort() : rows
     assert.deepEqual(key(a.results), key(e.rows), `${e.name}: identical ${e.unordered ? 'row set' : 'ordered rows'}`)
     assert.ok(Number.isInteger(a.meta.rows_read), `${e.name}: rows_read exists`)
     if (e.bound) console.log(`  ${e.name}: ${a.meta.rows_read} reads (ceiling ${e.ceiling})`)
