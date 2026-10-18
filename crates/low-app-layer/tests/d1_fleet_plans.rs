@@ -171,6 +171,11 @@ fn hot_routes_never_scan_fleet_tables() {
             "/health/invariants networkSeenTotal",
             bsv_overlay_cloudflare::ops::NETWORK_SEEN_TOTAL_SQL.to_string(),
         ),
+        // NS-COST-BAR-1 (their own pins are `d1_hot_bounds.rs` `ns_cost_*`).
+        (
+            "overlay tick proofless-watch GC",
+            bsv_overlay_cloudflare::ops::PROOFLESS_WATCH_GC_SQL.to_string(),
+        ),
     ] {
         for detail in plan(&db, &sql) {
             if detail.contains("SEARCH x USING INDEX idx_potparty_identity") {

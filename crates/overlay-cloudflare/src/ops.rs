@@ -1146,11 +1146,17 @@ pub(crate) fn proofless_watch_enrol_sql(table: &str) -> String {
 /// had deleted, and the old GC (proven-only) could never release them, so
 /// `prooflessOver24h` counted ghosts forever. All four arms are "no longer
 /// genuine backlog", which is the only thing the 24h flag may count.
-pub(crate) const PROOFLESS_WATCH_GC_SQL: &str = "DELETE FROM proofless_watch WHERE \
-     txid IN (SELECT txid FROM pot_beefs WHERE has_proof = 1) OR \
-     txid IN (SELECT txid FROM transactions WHERE has_proof = 1) OR \
-     txid IN (SELECT txid FROM pot_beefs WHERE structurally_unprovable = 1) OR \
-     txid IN (SELECT txid FROM transactions WHERE retired_ms IS NOT NULL) OR \
+///
+/// NS-COST-BAR-1 (bsv-low, the owner's cost word of 2026-10-18): the four store arms are primary-key probes of
+/// each WATCHED txid (`EXISTS ... WHERE b.txid = proofless_watch.txid`), never a list built over the whole store:
+/// the `txid IN (SELECT txid FROM pot_beefs WHERE has_proof = 1)` shape materialised all four filtered lists every
+/// tick (84,852 rows a run on beta, 30.8 M a day). Same rows deleted: inside the `OR` chain a list's NULL is a
+/// false, and an `EXISTS` over the key is true exactly when the `IN` was. The orphan arm already probes the key.
+pub const PROOFLESS_WATCH_GC_SQL: &str = "DELETE FROM proofless_watch WHERE \
+     EXISTS (SELECT 1 FROM pot_beefs b WHERE b.txid = proofless_watch.txid \
+             AND (b.has_proof = 1 OR b.structurally_unprovable = 1)) OR \
+     EXISTS (SELECT 1 FROM transactions t WHERE t.txid = proofless_watch.txid \
+             AND (t.has_proof = 1 OR t.retired_ms IS NOT NULL)) OR \
      (txid NOT IN (SELECT txid FROM pot_beefs) AND \
       txid NOT IN (SELECT txid FROM transactions))";
 
