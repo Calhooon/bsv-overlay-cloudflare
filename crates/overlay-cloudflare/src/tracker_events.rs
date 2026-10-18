@@ -49,10 +49,13 @@ pub fn note_submit(txid: &str, gated: bool, admitted_any: bool) {
 }
 
 /// bsv-low #757: the one live-hold predicate of the word events, here and at the app layer's `/internal/tx-word`
-/// (`tracker_host::runtime::live_hold`, `stored::DUE`, `stored::SWEEP`): the engine holds the subject (`transactions`),
-/// or the pot index records it as the spender of a live pot coin (`pot_records.spendingTxid`: the admitted submit
-/// that consumed the coin, `discover_missing_spends`' spender of that outpoint, or #605's mined competitor; a pot
-/// evicted to its shadow table holds nothing). A settle, refund or sweep admits no output, so it never has a
+/// (`tracker_host::runtime::live_hold`; `stored::DUE` and `stored::SWEEP` read the same two tables): the engine holds
+/// the subject (`transactions`), or the pot index records it as a pot or hop coin's spender (`pot_records.spendingTxid`:
+/// the admitted submit that consumed the coin, a JOIN spending its hops, `discover_missing_spends`' courier-found
+/// spender of that outpoint, a hop sweep's included, or #605's mined competitor; a pot evicted to its shadow table, and
+/// an evicted spender whose unconfirmed pointer the eviction released, hold nothing). The sweep and the scheduled
+/// refresh spare a recorded pot or hop spender only while its word is not yet mined or terminal, so the pointer buys
+/// no permanent word row. A settle, refund or sweep admits no output, so it never has a
 /// `transactions` row; held by `transactions` alone its `seen`, `proof` and `callback` events were dropped and its
 /// word stayed `built`. Its retained bytes (`pot_beefs`) stay no authority.
 pub const LIVE_HOLD_SQL: &str = "SELECT 1 AS held FROM transactions WHERE txid = lower(?1) UNION ALL SELECT 1 AS held FROM pot_records WHERE spendingTxid = lower(?1) LIMIT 1";

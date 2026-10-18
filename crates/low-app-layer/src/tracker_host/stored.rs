@@ -218,16 +218,22 @@ pub const BACKFILL_POT_PAGE: &str = "SELECT pot_beefs.txid, CASE WHEN pot_beefs.
 pub const BACKFILL_SAVE: &str = "INSERT INTO tracker_backfill(version,cursor,complete) VALUES (?1,?2,?3) ON CONFLICT(version) DO UPDATE SET cursor=MAX(tracker_backfill.cursor,excluded.cursor),complete=MAX(tracker_backfill.complete,excluded.complete)";
 
 /// bsv-low #757: a live hold, the authority of a word event (`runtime::live_hold`): the engine's `transactions` row,
-/// or the pot index's record of the subject as a live pot coin's spender (`pot_records.spendingTxid`; a settle,
-/// refund or sweep admits no output and never has a `transactions` row). Equal to the overlay's
-/// `tracker_events::LIVE_HOLD_SQL` (pinned); [`SWEEP`] and [`DUE`] read the same two tables.
+/// or the pot index's record of the subject as a pot or hop coin's spender (`pot_records.spendingTxid`; a settle,
+/// refund or sweep admits no output and never has a `transactions` row; `pot_records` holds hop rows too, so a JOIN
+/// and a courier-found hop sweep spender are held). Equal to the overlay's `tracker_events::LIVE_HOLD_SQL` (pinned);
+/// [`SWEEP`] and [`DUE`] read the same two tables, the spender arm only while its word still matters.
 pub const LIVE_HOLD: &str = "SELECT 1 AS held FROM transactions WHERE txid = lower(?1) UNION ALL SELECT 1 AS held FROM pot_records WHERE spendingTxid = lower(?1) LIMIT 1";
 
-/// Expire stranger projections after eight days. Only live held subjects are outside this sweep (bsv-low #757: the
-/// overlay's `tracker_events::LIVE_HOLD_SQL`, a `transactions` row or a live pot coin's recorded spender).
-pub const SWEEP: &str = "DELETE FROM tx_words WHERE txid IN (SELECT w.txid FROM tx_words w WHERE w.updated_at < ?1 AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) AND NOT EXISTS (SELECT 1 FROM pot_records p WHERE p.spendingTxid=w.txid) ORDER BY w.updated_at,w.txid LIMIT 64)";
+/// Expire stranger projections after eight days. Outside this sweep: a subject with a `transactions` row (main's arm,
+/// byte for byte), and (bsv-low #757) a recorded pot or hop spender whose word is not yet mined or terminal: the
+/// spender arm holds only while [`DUE`] would still refresh the row (`unknown`, `built`, `announced`, `seen`, not
+/// `trackerTerminal`). Once the spender is mined (the index's own proof then decides its owed row), stale, abandoned
+/// or terminal, its row ages out at eight days as on main, so `pot_records`' permanent pointers buy no permanent row
+/// and no walk (the FIX-757 lens's MEDIUM-1; pinned by `tests/i757_sweep_walk.rs`).
+pub const SWEEP: &str = "DELETE FROM tx_words WHERE txid IN (SELECT w.txid FROM tx_words w WHERE w.updated_at < ?1 AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) AND NOT EXISTS (SELECT 1 FROM pot_records p WHERE p.spendingTxid=w.txid AND w.word IN ('unknown','built','announced','seen') AND COALESCE(json_extract(w.legacy_body,'$.trackerTerminal'),0) = 0) ORDER BY w.updated_at,w.txid LIMIT 64)";
 
-/// Only live held subjects buy scheduled refreshes (the same hold as [`SWEEP`]). A
+/// Only live held subjects buy scheduled refreshes (the same hold as [`SWEEP`]: its spender arm's word filter is this
+/// statement's own, so a spender DUE stops refreshing is one SWEEP no longer spares). A
 /// stranger's historic built projection cannot renew its own sweep age.
 pub const DUE: &str = "SELECT w.txid FROM tx_words w WHERE w.word IN ('unknown','built','announced','seen') AND w.updated_at <= ?1 AND (EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) OR EXISTS (SELECT 1 FROM pot_records p WHERE p.spendingTxid=w.txid)) AND COALESCE(json_extract(w.legacy_body,'$.trackerTerminal'),0) = 0 ORDER BY w.updated_at,w.txid LIMIT 2";
 

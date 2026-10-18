@@ -400,32 +400,35 @@ pub async fn owed_body(env: &worker::Env, value: &mut Value) {
 struct BeefRow {
     beef: Option<Vec<u8>>,
 }
+/// [`held_proof`]'s reads, in its order: the first row found is the subject's held bytes.
+pub const HELD_PROOF_READS: [&str; 2] = [
+    "SELECT beef FROM pot_beefs WHERE txid = ?",
+    "SELECT beef FROM transactions WHERE txid = ?",
+];
+/// PURE: the subject's own proof out of its held BEEF, if the bytes carry one.
+pub fn proof_of_held_beef(txid: &str, beef: Option<Vec<u8>>) -> Option<Proof> {
+    beef.and_then(|bytes| {
+        overlay_engine::beef_limits::transaction_from_beef(
+            &bytes,
+            Some(txid),
+            &overlay_engine::beef_limits::STORED_BEEF_LIMITS,
+        )
+        .ok()
+    })
+    .and_then(|tx| tx.merkle_path.clone())
+    .and_then(|path| Proof::new(txid, path).ok())
+}
 /// Read held bytes only: absence is no evidence and never a terminal word.
 pub async fn held_proof(env: &worker::Env, txid: &str) -> worker::Result<(bool, Option<Proof>)> {
     let db = env.d1("OVERLAY_DB")?;
-    for sql in [
-        "SELECT beef FROM pot_beefs WHERE txid = ?",
-        "SELECT beef FROM transactions WHERE txid = ?",
-    ] {
+    for sql in HELD_PROOF_READS {
         if let Some(row) = db
             .prepare(sql)
             .bind(&[JsValue::from_str(txid)])?
             .counted_first::<BeefRow>()
             .await?
         {
-            let proof = row
-                .beef
-                .and_then(|bytes| {
-                    overlay_engine::beef_limits::transaction_from_beef(
-                        &bytes,
-                        Some(txid),
-                        &overlay_engine::beef_limits::STORED_BEEF_LIMITS,
-                    )
-                    .ok()
-                })
-                .and_then(|tx| tx.merkle_path.clone())
-                .and_then(|path| Proof::new(txid, path).ok());
-            return Ok((true, proof));
+            return Ok((true, proof_of_held_beef(txid, row.beef)));
         }
     }
     Ok((false, None))
@@ -534,9 +537,10 @@ pub async fn event(
 }
 
 /// A retained pot BEEF or an Arcade source is bytes, never live authority. bsv-low #757: a live hold is the engine's
-/// `transactions` row OR the pot index's record of the subject as a live pot coin's spender ([`stored::LIVE_HOLD`],
+/// `transactions` row OR the pot index's record of the subject as a pot or hop coin's spender ([`stored::LIVE_HOLD`],
 /// pinned equal to the overlay's `tracker_events::LIVE_HOLD_SQL`, its `note_held`): a settle never has a
-/// `transactions` row.
+/// `transactions` row. The sweep and the scheduled refresh spare a recorded pot or hop spender only while its word is
+/// not yet mined or terminal ([`stored::SWEEP`], [`stored::DUE`]).
 pub async fn live_hold(env: &worker::Env, txid: &str) -> worker::Result<bool> {
     #[derive(serde::Deserialize)]
     struct Held {
@@ -951,10 +955,18 @@ mod seen_hint_pins {
         let b = json!({"source": "taal", "at": 1_790_000_000_123_u64});
         assert_eq!(seen_hint_source(Some(&b), now), ("taal", 1_790_000_000));
         let b = json!({"source": "gorillapool", "at": 9_999_999_999_999_u64});
-        assert_eq!(seen_hint_source(Some(&b), now), ("gorillapool", now), "a stamp ahead of the clock is the clock's");
+        assert_eq!(
+            seen_hint_source(Some(&b), now),
+            ("gorillapool", now),
+            "a stamp ahead of the clock is the clock's"
+        );
         assert_eq!(seen_hint_source(None, now), ("arcade", now));
         let b = json!({"source": "woc", "at": 1_u64});
-        assert_eq!(seen_hint_source(Some(&b), now).0, "arcade", "a courier never names a seen hint");
+        assert_eq!(
+            seen_hint_source(Some(&b), now).0,
+            "arcade",
+            "a courier never names a seen hint"
+        );
     }
 }
 
@@ -977,7 +989,9 @@ mod budget_pins {
             "tx-any read still writes a word"
         );
         let owed = &routes[routes.find("async fn owed_recompute_inner(").unwrap()
-            ..routes.find("let mut rows = derive_owed_rows(&inputs);").unwrap()];
+            ..routes
+                .find("let mut rows = derive_owed_rows(&inputs);")
+                .unwrap()];
         assert!(
             !owed.contains("runtime::event("),
             "owed read still writes a word"

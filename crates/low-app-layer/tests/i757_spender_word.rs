@@ -9,12 +9,18 @@
 //! The pins run the overlay's real hook sender (`tracker_events::note`, `drain`, `deliver`, the frame
 //! `ops::latch_network_seen` and `proof_fetcher::verify_bump_detailed` note) into the `/internal/tx-word` handler's
 //! own steps (`runtime::ingest` -> `event` -> `event_held`: the shipped `stored::LIVE_HOLD`, equal to the overlay's `LIVE_HOLD_SQL`, `event_for_subject`,
-//! `stored::seed_hint`, `runtime::event_hints`, `runtime::pushed_proof`, the tracker's checked proof,
-//! `stored::project`, `stored::UPSERT`) over SQLite under the overlay's real migrations. The handler's D1 binding and
-//! `worker::Request` are the only parts not run; `i757_the_handler_runs_these_steps` pins the source to them.
+//! `stored::seed_hint`, `runtime::held_proof`'s reads (`HELD_PROOF_READS`, `proof_of_held_beef`), `runtime::event_hints`
+//! given that answer as its bytes, `runtime::pushed_proof`, the tracker's checked proof, `stored::project`,
+//! `stored::UPSERT`) over SQLite under the overlay's real migrations; the scheduled pass's `stored::DUE` and its
+//! `tick` steps; an eviction and a readmission through the overlay's own statements (`admit_fast::move_sql`,
+//! `restore_sql`, `release_pot_spends_sql`, `remark_pot_spend_sql`). The handler's D1 binding, `worker::Request`, the
+//! tick's Arcade re-ask and the latch's own D1 insert are the parts not run; `i757_the_handler_runs_these_steps` pins
+//! the source to them.
+use bsv_overlay_cloudflare::admit_fast::{self, ColumnInfo};
+use bsv_overlay_cloudflare::ops::SeenSource;
 use bsv_overlay_cloudflare::tracker_events;
-use bsv_rs::transaction::MerklePath;
-use bsv_tracker::{Evidence, Header, Input, Params, Proof};
+use bsv_rs::transaction::{MerklePath, Transaction};
+use bsv_tracker::{Evidence, Header, HostAction, Input, Params, Proof};
 use low_app_layer::owed::{coin_landing, word_arm, CoinLanding};
 use low_app_layer::tracker_host::{
     runtime,
@@ -116,6 +122,60 @@ fn pot_spent_by(db: &Connection, pot: &str, vout: u32, spender: &str) {
     .unwrap();
 }
 
+/// The settle's retained bytes, as the pot lookup service keeps them (`pot_beefs`): the handler's `held_proof` finds
+/// this row, so its `bytes` answer is true, and reads the subject's proof out of it when the BEEF carries one.
+fn retain(db: &Connection, txid: &str, beef: &[u8]) {
+    db.execute(
+        "INSERT INTO pot_beefs (txid, beef) VALUES (?, ?)",
+        params![txid, beef],
+    )
+    .unwrap();
+}
+
+/// `runtime::held_proof` over SQLite: its own reads in its order, its own parse of the first row found.
+fn held_proof(db: &Connection, txid: &str) -> (bool, Option<Proof>) {
+    for sql in runtime::HELD_PROOF_READS {
+        let row: Option<Option<Vec<u8>>> =
+            db.query_row(sql, [txid], |r| r.get(0)).optional().unwrap();
+        if let Some(beef) = row {
+            return (true, runtime::proof_of_held_beef(txid, beef));
+        }
+    }
+    (false, None)
+}
+
+/// A settle-shaped transaction of its own txid, its BEEF raw only or carrying its own proof at `height`.
+fn settle_tx(n: u32, height: Option<u32>) -> (String, Vec<u8>) {
+    let mut tx = Transaction::from_hex(
+        include_str!(
+            "fixtures/176885049985a858244993ab5591bfeb61b9368ac12fc7f12540d0824e5f891e.hex"
+        )
+        .trim(),
+    )
+    .unwrap();
+    tx.lock_time = n;
+    tx.invalidate_caches();
+    let id = tx.id();
+    tx.merkle_path = height.map(|h| MerklePath::from_coinbase_txid(&id, h));
+    (id, tx.to_beef(true).unwrap())
+}
+
+fn cols(db: &Connection, table: &str) -> Vec<ColumnInfo> {
+    db.prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap()
+        .query_map([], |r| {
+            Ok(ColumnInfo {
+                name: r.get(1)?,
+                ty: r.get(2)?,
+                notnull: r.get(3)?,
+                dflt_value: r.get(4)?,
+            })
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
 /// A checked proof's header: the block whose root the path computes, at its height.
 fn headers_for(proof: &Proof) -> HeaderSnapshot {
     HeaderSnapshot {
@@ -130,11 +190,13 @@ fn headers_for(proof: &Proof) -> HeaderSnapshot {
     }
 }
 
-/// The `/internal/tx-word` handler's steps for one shipped frame (`runtime::ingest` -> `event` -> `event_held`):
-/// the frame's txid and kind, the live hold, the authority gate, the stored row's seed, the event's hints, a pushed
-/// proof checked against our header, the projection and the guarded upsert. `held_proof` (the subject's own
-/// retained proof) and the Arcade GETs of `callback` / `tick` are not on the `seen`, `proof` or `submit` path's
-/// decision and are not modelled.
+/// The `/internal/tx-word` handler's steps for one frame (`runtime::ingest` -> `event` -> `event_held`), and the
+/// scheduled pass's (`runtime::tick` -> `event(.., "tick", ..)`): the frame's txid and kind, the live hold, the
+/// authority gate, the stored row's seed, a tick's clock and spend-attempt inputs, `held_proof`'s answer (its bytes
+/// flag as `event_hints`' `bytes`, as the handler passes `held || raw_bytes`; no legacy body on these paths, so
+/// `raw_bytes` is false), a pushed proof then the held one checked against our header, the projection, the mined
+/// marker and the guarded upsert. Not modelled: the Arcade GETs of `callback` and a tick's re-ask (`hook_may_reask`,
+/// reached only when no proof checked), and a stranger tick's courier leg (a held subject is first party).
 async fn tx_word(db: &Connection, hold_sql: &str, body: String, now: u64) -> Result<(), String> {
     let frame: Value = serde_json::from_str(&body).unwrap();
     let txid = frame["txid"].as_str().unwrap().to_ascii_lowercase();
@@ -144,18 +206,45 @@ async fn tx_word(db: &Connection, hold_sql: &str, body: String, now: u64) -> Res
     let row = runtime::event_for_subject(live, kind == "submit", || async {
         let old = read(db, &txid);
         let mut state = stored::seed_hint(old.as_ref(), &txid);
-        runtime::event_hints(&mut state, &kind, live, callback.as_ref(), now);
-        if let Some(proof) = runtime::pushed_proof(&txid, callback.as_ref()) {
-            let headers = headers_for(&proof);
+        let params = Params { age_threshold: 60 };
+        let empty = HeaderSnapshot {
+            tip: Ok(0),
+            headers: Default::default(),
+        };
+        if kind == "tick" {
             state
-                .step(
-                    &Params { age_threshold: 60 },
-                    &headers,
-                    Input::Evidence(Evidence::Proof(proof)),
-                )
-                .map_err(|e| worker::Error::RustError(e.to_string()))?;
+                .step(&params, &empty, Input::Host(HostAction::Tick(now)))
+                .unwrap();
+            if matches!(
+                state.word(),
+                bsv_tracker::Word::Unknown | bsv_tracker::Word::Built
+            ) {
+                state
+                    .step(&params, &empty, Input::Host(HostAction::SpendAttempt))
+                    .unwrap();
+            }
         }
-        Ok(stored::project(old.as_ref(), &state, now, None))
+        let (bytes, proof) = if kind == "proof" {
+            (true, None)
+        } else {
+            held_proof(db, &txid)
+        };
+        runtime::event_hints(&mut state, &kind, bytes, callback.as_ref(), now);
+        let pushed = runtime::pushed_proof(&txid, callback.as_ref());
+        for proof in [pushed, proof].into_iter().flatten() {
+            let headers = headers_for(&proof);
+            if state
+                .step(&params, &headers, Input::Evidence(Evidence::Proof(proof)))
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let mut row = stored::project(old.as_ref(), &state, now, None);
+        if row.word == "mined" {
+            row.legacy_body = Some(json!({"trackerTerminal": false}).to_string());
+        }
+        Ok(row)
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -172,25 +261,35 @@ async fn ship(db: &Connection, hold_sql: &str, now: u64) {
     }
 }
 
+/// `ops::latch_network_seen`'s note, its body as shipped (pinned by `i757_the_handler_runs_these_steps`). The latch
+/// itself cannot run here: it takes a `worker::D1Database` for its `network_seen` insert before the note.
 fn latch_seen(txid: &str, at_ms: u64) {
-    // `ops::latch_network_seen`'s note, as shipped
-    tracker_events::note(txid, "seen", Some(json!({"source": "arcade", "at": at_ms})));
+    tracker_events::note(
+        txid,
+        "seen",
+        Some(json!({"source": SeenSource::Arcade.wire(), "at": at_ms})),
+    );
 }
 
 fn pot(n: u8) -> String {
     format!("{n:02x}").repeat(32)
 }
 
-/// (1) The latch-to-word bound: a settle (a pot's recorded spender, no `transactions` row) stored `built` reads
-/// `seen` after ONE delivery of the latch's event, with the latch's broadcaster and time. RED on main's predicate:
-/// the event is dropped and the word stays `built`. The M1 bar holds: a stranger's `seen` writes no row, and an
-/// evicted pot's spender is no longer held.
+/// (1) The latch-to-word bound: a settle (a pot's recorded spender, no `transactions` row, its bytes in `pot_beefs`)
+/// stored `built` reads `seen` after ONE delivery of the latch's event, with the latch's broadcaster and time. RED on
+/// main's predicate: the event is dropped and the word stays `built`. The M1 bar holds: a stranger's `seen` writes no
+/// row; an evicted spender (its UNCONFIRMED pointer released by the overlay's own `release_pot_spends_sql`) and an
+/// evicted pot (its row shadow-moved by `move_sql`) leave the hold, and their readmissions (`remark_pot_spend_sql`,
+/// `restore_sql`) re-hold the spender.
 #[tokio::test]
 async fn i757_a_the_settles_seen_event_writes_seen_within_one_delivery() {
     for (hold, want) in [(stored::LIVE_HOLD, "seen"), (MAIN_LIVE_HOLD, "built")] {
         let db = db();
-        let (funding, settle) = (pot(1), pot(2));
+        let funding = pot(1);
+        let (settle, beef) = settle_tx(1, None);
         pot_spent_by(&db, &funding, 0, &settle);
+        retain(&db, &settle, &beef);
+        assert_eq!(held_proof(&db, &settle).0, true, "held bytes");
         seed_built(&db, &settle, 1_000);
         tracker_events::drain();
         latch_seen(&settle, 1_000_500);
@@ -216,14 +315,62 @@ async fn i757_a_the_settles_seen_event_writes_seen_within_one_delivery() {
         read(&db, &stranger).is_none(),
         "a stranger's seen planted a row"
     );
+    // an evicted SPENDER: the eviction releases its unconfirmed pointer, its events are dropped, the readmission
+    // re-marks it and its next event lands
+    let pot_cols = cols(&db, "pot_records");
     let (funding, settle) = (pot(4), pot(5));
-    pot_spent_by(&db, &funding, 0, &settle);
+    db.execute(
+        "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed) VALUES (?, 0, 1, ?, 0)",
+        params![funding, settle],
+    )
+    .unwrap();
+    seed_built(&db, &settle, 1_000);
     assert!(held(&db, stored::LIVE_HOLD, &settle));
-    db.execute("DELETE FROM pot_records WHERE txid = ?", [&funding])
+    db.execute(&admit_fast::release_pot_spends_sql(&pot_cols), [&settle])
         .unwrap();
     assert!(
         !held(&db, stored::LIVE_HOLD, &settle),
+        "an evicted spender is still held"
+    );
+    tracker_events::drain();
+    latch_seen(&settle, 1_000_500);
+    ship(&db, stored::LIVE_HOLD, 1_002).await;
+    assert_eq!(
+        read(&db, &settle).unwrap().word,
+        "built",
+        "an evicted spender's seen was written"
+    );
+    let (remark, with_at) = admit_fast::remark_pot_spend_sql(&pot_cols);
+    assert!(with_at);
+    db.execute(&remark, params![settle, 1_003, funding, 0])
+        .unwrap();
+    assert!(
+        held(&db, stored::LIVE_HOLD, &settle),
+        "a readmitted spender is not re-held"
+    );
+    latch_seen(&settle, 1_003_500);
+    ship(&db, stored::LIVE_HOLD, 1_004).await;
+    assert_eq!(read(&db, &settle).unwrap().word, "seen");
+    // an evicted POT: its row shadow-moved out of `pot_records`, then restored byte for byte
+    let (funding, settle) = (pot(10), pot(11));
+    pot_spent_by(&db, &funding, 0, &settle);
+    assert!(held(&db, stored::LIVE_HOLD, &settle));
+    db.execute_batch(&admit_fast::create_shadow_sql("pot_records", &pot_cols))
+        .unwrap();
+    let (copy, delete) = admit_fast::move_sql("pot_records", "txid", &pot_cols);
+    db.execute(&copy, params![1_005, "refused", funding])
+        .unwrap();
+    db.execute(&delete, [&funding]).unwrap();
+    assert!(
+        !held(&db, stored::LIVE_HOLD, &settle),
         "an evicted pot's spender is still held"
+    );
+    let (back, drop) = admit_fast::restore_sql("pot_records", "txid", &pot_cols);
+    db.execute(&back, [&funding]).unwrap();
+    db.execute(&drop, [&funding]).unwrap();
+    assert!(
+        held(&db, stored::LIVE_HOLD, &settle),
+        "a readmitted pot's spender is not re-held"
     );
 }
 
@@ -233,8 +380,10 @@ async fn i757_a_the_settles_seen_event_writes_seen_within_one_delivery() {
 async fn i757_b_the_settles_proof_event_writes_mined_with_its_verify_path() {
     for (hold, want) in [(stored::LIVE_HOLD, "mined"), (MAIN_LIVE_HOLD, "built")] {
         let db = db();
-        let (funding, settle) = (pot(6), pot(7));
+        let funding = pot(6);
+        let (settle, beef) = settle_tx(2, None);
         pot_spent_by(&db, &funding, 0, &settle);
+        retain(&db, &settle, &beef);
         seed_built(&db, &settle, 1_000);
         tracker_events::drain();
         latch_seen(&settle, 1_000_500);
@@ -418,6 +567,59 @@ async fn i757_d_loop37s_ten_settles_are_held_and_their_seen_lands() {
     }
 }
 
+/// (5) The FIX-757 lens's LOW-4 gap converges at the block: a settle whose only `seen` reached the app layer BEFORE
+/// the pot index recorded the spend (the S2 replay after a write fault; a readmitted spender's MINED callback) stays
+/// `built`; once its retained BEEF carries its proof the scheduled pass (`stored::DUE`, then the handler's `tick`
+/// steps and `held_proof`) writes a checked `mined`. On main's `DUE` the settle is never chosen.
+#[tokio::test]
+async fn i757_e_a_seen_dropped_before_the_mark_converges_through_due_and_the_held_proof() {
+    const MAIN_DUE: &str = "SELECT w.txid FROM tx_words w WHERE w.word IN ('unknown','built','announced','seen') AND w.updated_at <= ?1 AND EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) AND COALESCE(json_extract(w.legacy_body,'$.trackerTerminal'),0) = 0 ORDER BY w.updated_at,w.txid LIMIT 2";
+    let db = db();
+    let funding = pot(12);
+    let (settle, unproven) = settle_tx(3, None);
+    seed_built(&db, &settle, 1_000);
+    retain(&db, &settle, &unproven);
+    // the seen arrives before the mark: dropped
+    tracker_events::drain();
+    latch_seen(&settle, 1_000_500);
+    ship(&db, stored::LIVE_HOLD, 1_001).await;
+    assert_eq!(read(&db, &settle).unwrap().word, "built");
+    // the mark lands, then the block: the retained BEEF is stitched with its proof
+    pot_spent_by(&db, &funding, 0, &settle);
+    let (_, proven) = settle_tx(3, Some(971_700));
+    db.execute(
+        "UPDATE pot_beefs SET beef = ? WHERE txid = ?",
+        params![proven, settle],
+    )
+    .unwrap();
+    let due = |sql: &str| -> Vec<String> {
+        db.prepare(sql)
+            .unwrap()
+            .query_map([1_000 + 900_u64], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert!(due(MAIN_DUE).is_empty(), "main's DUE chose the settle");
+    assert_eq!(due(stored::DUE), vec![settle.clone()]);
+    for txid in due(stored::DUE) {
+        tx_word(
+            &db,
+            stored::LIVE_HOLD,
+            json!({"txid": txid, "kind": "tick"}).to_string(),
+            1_900,
+        )
+        .await
+        .unwrap();
+    }
+    let row = read(&db, &settle).unwrap();
+    assert_eq!((row.word.as_str(), row.height), ("mined", Some(971_700.0)));
+    assert_eq!(row.view()["verifyPath"]["height"], 971_700);
+    // mined: the scheduled pass is done with it, and the sweep no longer spares it (MEDIUM-1)
+    assert!(due(stored::DUE).is_empty());
+    assert_eq!(db.execute(stored::SWEEP, [1_900 + 1]).unwrap(), 1);
+}
+
 /// The handler's source runs the steps the model above composes: the live hold is the shared predicate, the event
 /// hints and the pushed proof are the extracted functions, and the overlay's two route doors still read the hold.
 #[test]
@@ -433,7 +635,19 @@ fn i757_the_handler_runs_these_steps() {
     );
     let held = &runtime[runtime.find("async fn event_held(").unwrap()..];
     let held = &held[..held.find("\npub async fn ingest(").unwrap()];
+    let reads = &runtime[runtime.find("pub async fn held_proof(").unwrap()..];
+    let reads = &reads[..reads.find("\n}\n").unwrap()];
+    assert!(reads.contains("for sql in HELD_PROOF_READS {"));
+    assert!(reads.contains("proof_of_held_beef(txid, row.beef)"));
+    let tick = &runtime[runtime.find("pub async fn tick(").unwrap()..];
+    let tick = &tick[..tick.find("\n}\n").unwrap()];
+    assert!(tick.contains(".prepare(stored::DUE)"));
+    assert!(tick.contains("event(env, &row.txid, \"tick\", None, None)"));
     for call in [
+        "held_proof(env, txid).await?",
+        "Input::Host(HostAction::Tick(now))",
+        "Input::Host(HostAction::SpendAttempt)",
+        "for proof in [pushed, proof].into_iter().flatten() {",
         "stored::seed_hint(old.as_ref(), txid)",
         "event_hints(&mut state, kind, held || raw_bytes, callback, now);",
         "let pushed = pushed_proof(txid, callback);",
@@ -442,6 +656,10 @@ fn i757_the_handler_runs_these_steps() {
     ] {
         assert!(held.contains(call), "event_held lost {call}");
     }
+    let ops = include_str!("../../overlay-cloudflare/src/ops.rs");
+    let latch = &ops[ops.find("pub async fn latch_network_seen(").unwrap()..];
+    assert!(latch[..latch.find("\n}\n").unwrap()]
+        .contains("Some(serde_json::json!({\"source\": source.wire(), \"at\": at_ms})),"));
     let events = include_str!("../../overlay-cloudflare/src/tracker_events.rs");
     let note_held = &events[events.find("pub async fn note_held(").unwrap()..];
     assert!(note_held[..note_held.find("\n}\n").unwrap()].contains("Query::new(LIVE_HOLD_SQL)"));
