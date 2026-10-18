@@ -1508,6 +1508,17 @@
    "why": "rebuild from transactions_retired_set: its guarded backfill recounts a missing row at the next version's migration run; until then both fields read -1"
    },
    {
+   "name": "count_pot_unspent_kind",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "three rows (covenant, p2pkh, other): the unspent pot_records rows per lock class (NS-COST-BAR-1), kept by pot_records' insert, update and delete triggers; the index janitor's backlog is these less the hour's young rows",
+   "why": "rebuild from pot_records: its guarded backfill recounts the classes at the next version's migration run when the table holds no row; until then the backlog reads -1"
+   },
+   {
    "name": "tx_words",
    "database": "low-overlay-db",
    "owner": "low-app-layer",
