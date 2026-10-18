@@ -587,7 +587,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 276 to 285 for NS-COST-BAR-1: `transactions_retired_set`, `count_transactions_retired`, five triggers, two backfills.
 /// 285 to 291 for NS-COST-BAR-1: `count_pot_unspent_kind`, three triggers, `idx_pot_unspent_created`, its backfill.
 /// 291 to 295 for NS-COST-BAR-1: the four relatch censuses' NULL-tier partial indexes.
-pub const OVERLAY_MIGRATION_COUNT: usize = 295;
+/// 295 to 327 for bsv-low #674 (2026-10-17, with its lens fold): the leaderboard derived at the write
+/// (`derived_board.rs`): four tables, four indexes, the total's row, twenty-one triggers (the page's cards and their
+/// frags included), the guarded backfill and its `board-v1` stamp.
+pub const OVERLAY_MIGRATION_COUNT: usize = 327;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2136,6 +2139,42 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_hopparty_marker_null ON hopparty_records(markerValid) WHERE markerValid IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_result_claim_null ON result_markers_v2(claimValid) WHERE claimValid IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_hand_row_null ON hand_markers(rowValid) WHERE rowValid IS NULL",
+    // 296-327: bsv-low #674, the leaderboard derived at the write (#638's doctrine, `derived_board.rs`). The tables
+    // and the total's row; the `board_wins` and marker triggers (owners, cards, total, hands, frags); the source
+    // triggers (pot, witness, seat, proof pointer, posted bundle); then the backfill behind the `board-v1` stamp and the stamp. Every statement is benign on a
+    // re-run: `IF NOT EXISTS`, `INSERT OR IGNORE`, and the backfill guarded in its outer derived table.
+    crate::derived_board::WINS_CREATE,
+    crate::derived_board::WINS_OWNER_INDEX,
+    crate::derived_board::OWNERS_CREATE,
+    crate::derived_board::OWNERS_RANK_INDEX,
+    crate::derived_board::HANDS_CREATE,
+    crate::derived_board::HANDS_RANK_INDEX,
+    crate::derived_board::TOTAL_CREATE,
+    crate::derived_board::TOTAL_SEED,
+    crate::derived_board::MARKERS_LOWER_GAME_INDEX,
+    crate::derived_board::WIN_INSERT,
+    crate::derived_board::WIN_DELETE,
+    crate::derived_board::WIN_FRAG,
+    crate::derived_board::MARKER_INSERT,
+    crate::derived_board::MARKER_UPDATE,
+    crate::derived_board::MARKER_DELETE,
+    crate::derived_board::POT_INSERT,
+    crate::derived_board::POT_UPDATE,
+    crate::derived_board::POT_FRAG,
+    crate::derived_board::POT_DELETE,
+    crate::derived_board::SEEN_INSERT,
+    crate::derived_board::SEEN_DELETE,
+    crate::derived_board::PARTY_INSERT,
+    crate::derived_board::PARTY_UPDATE,
+    crate::derived_board::PARTY_DELETE,
+    crate::derived_board::PROOF_INSERT,
+    crate::derived_board::PROOF_UPDATE,
+    crate::derived_board::PROOF_DELETE,
+    crate::derived_board::POST_INSERT,
+    crate::derived_board::POST_UPDATE,
+    crate::derived_board::POST_DELETE,
+    crate::derived_board::WINS_BACKFILL,
+    crate::derived_board::STATE_DONE,
 ];
 
 // =============================================================================
@@ -2794,7 +2833,7 @@ mod tests {
         // through an over-broad filter (Rule 9).
         let carries: Vec<&&str> = OVERLAY_MIGRATIONS
             .iter()
-            // #638's named backfills/stamp are pinned separately; every other INSERT remains a carry.
+            // #638's and #674's named backfills/stamps/seed are pinned separately; every other INSERT remains a carry.
             .filter(|sql| {
                 sql.trim_start().to_uppercase().starts_with("INSERT")
                     && ![
@@ -2803,6 +2842,9 @@ mod tests {
                         crate::derived_hops::STATE_DONE,
                         // bsv-low #645: the count's stamped backfill, pinned in `d1_hot_bounds.rs`.
                         crate::ops::NETWORK_SEEN_COUNT_BACKFILL,
+                        crate::derived_board::TOTAL_SEED,
+                        crate::derived_board::WINS_BACKFILL,
+                        crate::derived_board::STATE_DONE,
                         // NS-COST-BAR-1: the counts' stamped backfills, pinned in `d1_hot_bounds.rs`.
                         crate::ops::UNPROVABLE_SET_BACKFILL,
                         crate::ops::UNPROVABLE_COUNT_BACKFILL,

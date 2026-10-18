@@ -171,6 +171,36 @@ fn hot_routes_never_scan_fleet_tables() {
             "/health/invariants networkSeenTotal",
             bsv_overlay_cloudflare::ops::NETWORK_SEEN_TOTAL_SQL.to_string(),
         ),
+        // bsv-low #674: the table read (its own pin, `the_board_table_read_and_its_triggers_never_scan`, holds the
+        // plans line by line).
+        (
+            "/leaderboard:view board owners",
+            low_app_layer::logic::BOARD_OWNERS_PAGE_SQL.to_string(),
+        ),
+        (
+            "/leaderboard:view board owners after the cursor",
+            low_app_layer::logic::BOARD_OWNERS_AFTER_SQL.to_string(),
+        ),
+        (
+            "/leaderboard:view board cursor rank",
+            low_app_layer::logic::BOARD_CURSOR_RANK_SQL.to_string(),
+        ),
+        (
+            "/leaderboard:view board cards",
+            low_app_layer::logic::board_cards_sql(low_app_layer::logic::D1_CHUNK_OUTPOINTS),
+        ),
+        (
+            "/leaderboard:view board wins",
+            low_app_layer::logic::board_wins_owners_sql(low_app_layer::logic::D1_CHUNK_OUTPOINTS),
+        ),
+        (
+            "/leaderboard:view board hands pots",
+            low_app_layer::logic::board_wins_pots_sql(low_app_layer::logic::D1_CHUNK_OUTPOINTS),
+        ),
+        (
+            "/leaderboard:view board hands",
+            low_app_layer::logic::BOARD_HANDS_SQL.to_string(),
+        ),
         // NS-COST-BAR-1 (their own pins are `d1_hot_bounds.rs` `ns_cost_*`).
         (
             "overlay tick proofless-watch GC",
@@ -231,6 +261,9 @@ fn hot_routes_never_scan_fleet_tables() {
                     "network_seen",
                     "hop_pot_links",
                     "pot_hop_seats",
+                    "board_wins",
+                    "board_owners",
+                    "board_hands",
                     "link",
                     "seat",
                     "hp",
@@ -593,4 +626,158 @@ fn the_leaderboard_candidate_arms_stop_at_their_limit() {
             .any(|d| d.contains("USE TEMP B-TREE FOR GROUP BY")),
         "the whole-board spine groups every counted win"
     );
+}
+
+/// bsv-low #674: every statement of the table read is an index SEARCH with no temp B-tree for its ORDER BY (the
+/// owner page on `idx_board_owners_rank`, the page owners' wins on `idx_board_wins_owner`, the hands on
+/// `idx_board_hands_rank`), so the top N read N rows whatever the era holds; and every statement a #674 trigger
+/// runs on a write is keyed by the written row (no SCAN of any table), so a settle hook's cost does not grow with
+/// the fleet.
+#[test]
+fn the_board_table_read_and_its_triggers_never_scan() {
+    use bsv_overlay_cloudflare::derived_board as board;
+    use low_app_layer::logic as l;
+    let db = fixture();
+    let chunk = l::D1_CHUNK_OUTPOINTS;
+    let mut failures = Vec::new();
+    for (name, sql, must) in [
+        ("ready", l::BOARD_READY_SQL.to_string(), vec![]),
+        (
+            "owner page",
+            l::BOARD_OWNERS_PAGE_SQL.to_string(),
+            vec!["SEARCH board_owners USING COVERING INDEX idx_board_owners_rank (wins>?)"],
+        ),
+        (
+            "owner page after the cursor",
+            l::BOARD_OWNERS_AFTER_SQL.to_string(),
+            vec![
+                "SEARCH board_owners USING COVERING INDEX idx_board_owners_rank (wins=? AND owner>?)",
+                "SEARCH board_owners USING COVERING INDEX idx_board_owners_rank (wins<?)",
+            ],
+        ),
+        ("cursor rank", l::BOARD_CURSOR_RANK_SQL.to_string(), vec![]),
+        (
+            "page owners' cards",
+            l::board_cards_sql(chunk),
+            vec!["SEARCH board_owners USING INDEX sqlite_autoindex_board_owners_1 (owner=?)"],
+        ),
+        (
+            "page owners' wins (an owner past its card)",
+            l::board_wins_owners_sql(chunk),
+            vec!["SEARCH board_wins USING INDEX idx_board_wins_owner (owner=?)"],
+        ),
+        ("hands pots' wins", l::board_wins_pots_sql(chunk), vec![]),
+        (
+            "hands",
+            l::BOARD_HANDS_SQL.to_string(),
+            vec!["SCAN h USING INDEX idx_board_hands_rank"],
+        ),
+    ] {
+        let p = plan(&db, &sql);
+        println!("{name}:\n  {}", p.join("\n  "));
+        for d in &p {
+            if d.contains("TEMP B-TREE") {
+                failures.push(format!("{name}: {d}"));
+            }
+            // A co-routine or the constant row is not a table.
+            let scanned = d
+                .strip_prefix("SCAN ")
+                .and_then(|s| s.split_whitespace().next())
+                .filter(|t| *t != "CONSTANT" && !t.starts_with('('));
+            // The hands walk their rank index in order and stop at the LIMIT: the one index-ordered SCAN allowed.
+            if scanned.is_some_and(|t| t != "h" || !d.contains("USING INDEX idx_board_hands_rank")) {
+                failures.push(format!("{name}: {d}"));
+            }
+        }
+        for m in must {
+            if !p.iter().any(|d| d == m) {
+                failures.push(format!("{name}: no `{m}` in {p:?}"));
+            }
+        }
+    }
+    // Each trigger's statements, with the written row's columns as literals.
+    for trigger in [
+        board::WIN_INSERT,
+        board::WIN_DELETE,
+        board::WIN_FRAG,
+        board::POT_FRAG,
+        board::PROOF_INSERT,
+        board::PROOF_UPDATE,
+        board::PROOF_DELETE,
+        board::POST_INSERT,
+        board::POST_UPDATE,
+        board::POST_DELETE,
+        board::MARKER_INSERT,
+        board::MARKER_UPDATE,
+        board::MARKER_DELETE,
+        board::POT_INSERT,
+        board::POT_UPDATE,
+        board::POT_DELETE,
+        board::SEEN_INSERT,
+        board::SEEN_DELETE,
+        board::PARTY_INSERT,
+        board::PARTY_UPDATE,
+        board::PARTY_DELETE,
+    ] {
+        let name = trigger.split_whitespace().nth(5).unwrap();
+        let body = &trigger[trigger.find(" BEGIN ").unwrap() + 7..trigger.rfind(" END").unwrap()];
+        let mut literal = body.to_string();
+        for col in [
+            "potCreatedAt",
+            "potTxid",
+            "txid",
+            "outputIndex",
+            "owner",
+            "identityIsKey",
+            "frag",
+            "gameId",
+            "winner",
+            "settleTxid",
+            "verdict",
+            "pubA",
+            "pubB",
+            "settleSigners",
+            "identityA",
+            "identityB",
+        ] {
+            for row in ["NEW", "OLD"] {
+                let v = if matches!(col, "outputIndex" | "identityIsKey" | "potCreatedAt") {
+                    "0"
+                } else {
+                    "'ab'"
+                };
+                literal = literal.replace(&format!("{row}.{col}"), v);
+            }
+        }
+        assert!(
+            !literal.contains("NEW.") && !literal.contains("OLD."),
+            "{name}: {literal}"
+        );
+        let mut searches = 0;
+        for stmt in literal.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let p = plan(&db, stmt);
+            println!("trigger {name}: {}", p.join(" | "));
+            searches += p.iter().filter(|d| d.contains("SEARCH ")).count();
+            // A co-routine (the #674 fold's frag: its markers, pointers and guard) is the output of a subquery the
+            // plan lists on its own lines; scanning it reads no table.
+            let coroutines: Vec<&str> = p
+                .iter()
+                .filter_map(|d| d.strip_prefix("CO-ROUTINE "))
+                .collect();
+            for d in &p {
+                let table = d
+                    .strip_prefix("SCAN ")
+                    .and_then(|s| s.split_whitespace().next())
+                    .filter(|t| *t != "CONSTANT" && !t.starts_with('(') && !coroutines.contains(t));
+                if table.is_some() {
+                    failures.push(format!(
+                        "trigger {name}: {d} in `{}`",
+                        &stmt[..stmt.len().min(90)]
+                    ));
+                }
+            }
+        }
+        assert!(searches > 0, "{name}: its statements were planned");
+    }
+    assert!(failures.is_empty(), "board plans:\n{}", failures.join("\n"));
 }

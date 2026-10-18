@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { delimiter, resolve } from 'node:path'
@@ -12,27 +11,23 @@ const { Miniflare, convertV4MiniflareOptions = v => v } = require('miniflare')
 const root = fileURLToPath(new URL('../../', import.meta.url))
 const compatibilityDate = readFileSync(root + 'crates/low-app-layer/wrangler.toml', 'utf8').match(/^compatibility_date = "([^"]+)"/m)[1]
 assert.equal(compatibilityDate, '2024-12-01', 'NOTE-C compatibility date must match the register evidence')
-const mf = new Miniflare(convertV4MiniflareOptions({name: "pin",
+// The tier's fixture D1 as the seed loaded it (`D1_BUDGET_SEED_V3`, a copy of its `v3` taken before any worker ran),
+// under the app layer's own database id. Loading the seed again here, in this one workerd, ran its SQLite out of
+// memory under the board's triggers (lane W1-LB-674-NOMEM: Miniflare holds each statement's compiled program, its
+// triggers' programs inside it, until its isolate's GC, and 102,000 statements in one process pass the heap).
+const seedV3 = process.env.D1_BUDGET_SEED_V3
+assert(seedV3 && existsSync(resolve(seedV3, 'd1')), 'D1_BUDGET_SEED_V3 names the copy of the tier\'s loaded v3')
+const overlayDb = readFileSync(root + 'crates/low-app-layer/wrangler.toml', 'utf8').match(/binding = "OVERLAY_DB"[\s\S]*?database_id = "([^"]+)"/)[1]
+const mf = new Miniflare(convertV4MiniflareOptions({name: "pin", d1Persist: resolve(seedV3, 'd1'),
   modules: ['tools/lane-ns2/owed_do_pin_worker.mjs', 'crates/low-app-layer/build/worker/shim.mjs', 'crates/low-app-layer/build/index.js', 'crates/low-app-layer/build/index_bg.wasm'].map(path => ({path: root + path, type: path.endsWith('.wasm') ? 'CompiledWasm' : 'ESModule', contents: readFileSync(root + path)})),
   modulesRoot: root,
   compatibilityDate, compatibilityFlags: ['nodejs_compat'],
   durableObjects: {BOARD_VIEW: {className: 'OwedPin', useSQLite: true}, AUTH_SESSIONS: 'AuthSessionStore'},
-  d1Databases: {OVERLAY_DB: 'ns2-pin'},
+  d1Databases: {OVERLAY_DB: overlayDb},
   bindings: {AUTH_ENFORCE: 'false', SESSION_LANE: 'false', INTERNAL_TOKEN: 'ci-internal-tok'},
 }))
 try {
   const db = await mf.getD1Database('OVERLAY_DB')
-  const statements = JSON.parse(execFileSync('python3', ['-c', `
-import sqlite3,json,sys
-buf=''; out=[]
-for line in open(sys.argv[1]):
- if line.startswith('--'): continue
- buf+=line
- if sqlite3.complete_statement(buf): out.append(buf); buf=''
-assert not buf.strip()
-print(json.dumps(out))
-`, process.env.D1_BUDGET_SEED], {maxBuffer: 64 * 1024 * 1024, timeout: 30000}))
-  for (let n = 0; n < statements.length; n += 100) await db.batch(statements.slice(n, n + 100).map(s => db.prepare(s)))
   const ns = await mf.getDurableObjectNamespace('BOARD_VIEW')
   const cleanup = ns.get(ns.idFromName('ns2-delete-all-compatibility'))
   const cleared = await (await cleanup.fetch('http://pin/pin/delete-all')).json()

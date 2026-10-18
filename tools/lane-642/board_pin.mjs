@@ -1,8 +1,10 @@
 // bsv-low #642: replay every statement a /leaderboard:view page request runs (the shipped pipeline's, emitted by
 // `lb642_emit_the_d1_cell`) through local D1 and hold its rows_read: identical ordered rows, each statement under its
 // ceiling, each request under the per-request ceiling. The whole-board read's statements are replayed for the record.
-// Usage: node board_pin.mjs <expected.json> <persisted D1 dir>
-import { readFileSync, realpathSync } from 'node:fs'
+// bsv-low #674 fold (MEDIUM-1): a request marked `flat` must read the same rows on every board the run replays; the
+// third argument names the file that carries the first board's figure to the next.
+// Usage: node board_pin.mjs <expected.json> <persisted D1 dir> [<flat figures file>]
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
@@ -46,6 +48,16 @@ try {
     }
     if (req.ceiling !== null) {
       assert.ok(total <= req.ceiling, `${req.name}: ${total} reads > ${req.ceiling}`)
+    }
+    if (req.flat && process.argv[4]) {
+      const flat = existsSync(process.argv[4]) ? JSON.parse(readFileSync(process.argv[4], 'utf8')) : {}
+      if (flat[req.name] === undefined) {
+        flat[req.name] = { wins: expected.wins, reads: total }
+        writeFileSync(process.argv[4], JSON.stringify(flat))
+      } else {
+        assert.equal(total, flat[req.name].reads, `${req.name}: ${total} reads at ${expected.wins} wins, ${flat[req.name].reads} at ${flat[req.name].wins}: not flat`)
+        console.log(`FLAT ${req.name}: ${total} reads at ${flat[req.name].wins} and ${expected.wins} wins`)
+      }
     }
     // The whole-board read is the RED side: past the page ceiling on the same board.
     if (req.mustExceed !== undefined) {
