@@ -1433,3 +1433,69 @@ fn lb674_fold3_old_and_new_triggers_derive_the_same_cards_at_the_bound() {
     }
     println!("{} states byte-identical", old.len());
 }
+
+/// bsv-low #470 PRE557 (the lens's NOTES, after the rebase onto #674): the stamp step's SHIPPED statement moves a
+/// counted win's `createdAt` to its block's time, and `board_pot_update` moves the derived `board_wins` row the
+/// same way (its `potCreatedAt`, the era's anchor on the board), so the derived board still equals the from-scratch
+/// read; a stamp inside the slack moves neither.
+#[test]
+fn pre557_a_stamp_moves_the_derived_board_as_the_era_filter_reads_it() {
+    let db = schema_without(None);
+    db.execute_batch("BEGIN").unwrap();
+    for sql in d1_board::rows(NOW, 160) {
+        db.execute_batch(&sql).unwrap();
+    }
+    db.execute_batch("COMMIT").unwrap();
+    drift(&db, "the seeded board").unwrap();
+    let won = rows(
+        &db,
+        "SELECT potTxid, potCreatedAt FROM board_wins ORDER BY potTxid LIMIT 2",
+    );
+    assert_eq!(won.len(), 2, "two counted wins");
+    let slack = overlay_discovery::pot::storage::BLOCK_TIME_STAMP_SLACK_SECS as i64;
+    let (moved, kept) = (&won[0], &won[1]);
+    let created = |txid: &str| -> i64 {
+        rows(
+            &db,
+            &format!("SELECT createdAt FROM pot_records WHERE txid = '{txid}' AND outputIndex = 0"),
+        )[0][0]
+            .parse()
+            .unwrap()
+    };
+    // a re-indexed win: admitted long after its block, moved to the block's time
+    let block = created(&moved[0]) - 30 * 86_400;
+    assert!(
+        db.execute(
+            d1d::POT_BLOCK_TIME_STAMP_SQL,
+            rusqlite::params![block, slack, moved[0]],
+        )
+        .unwrap()
+            >= 1,
+        "every row of the pot's txid is stamped"
+    );
+    // a live win: admitted inside the slack of its block, kept
+    let live_block = created(&kept[0]) - slack;
+    db.execute(
+        d1d::POT_BLOCK_TIME_STAMP_SQL,
+        rusqlite::params![live_block, slack, kept[0]],
+    )
+    .unwrap();
+    let after = |txid: &str| {
+        rows(
+            &db,
+            &format!("SELECT potCreatedAt FROM board_wins WHERE potTxid = '{txid}'"),
+        )[0][0]
+            .clone()
+    };
+    assert_eq!(
+        after(&moved[0]),
+        block.to_string(),
+        "the board's anchor is the block's time"
+    );
+    assert_eq!(
+        after(&kept[0]),
+        kept[1],
+        "a live win keeps its admission time"
+    );
+    drift(&db, "after the stamps").unwrap();
+}
