@@ -23,7 +23,7 @@ fn ns3_l1_sweep_is_eight_days_bounded_and_spares_first_party() {
     use low_app_layer::tracker_host::stored;
     let db = rusqlite::Connection::open_in_memory().unwrap();
     db.execute_batch(stored::CREATE).unwrap();
-    db.execute_batch("CREATE TABLE transactions(txid TEXT PRIMARY KEY); CREATE TABLE pot_beefs(txid TEXT PRIMARY KEY)").unwrap();
+    db.execute_batch("CREATE TABLE transactions(txid TEXT PRIMARY KEY); CREATE TABLE pot_beefs(txid TEXT PRIMARY KEY); CREATE TABLE pot_records(txid TEXT, outputIndex INTEGER, spendingTxid TEXT)").unwrap();
     for n in 0..100 {
         db.execute(
             "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?,'unknown','host',1)",
@@ -59,7 +59,7 @@ fn ns3d_m3_untouched_built_stranger_is_swept_after_eight_days() {
     use low_app_layer::tracker_host::stored;
     let db = rusqlite::Connection::open_in_memory().unwrap();
     db.execute_batch(stored::CREATE).unwrap();
-    db.execute_batch("CREATE TABLE transactions(txid TEXT PRIMARY KEY); CREATE TABLE pot_beefs(txid TEXT PRIMARY KEY); INSERT INTO tx_words(txid,word,tier,updated_at) VALUES ('stranger','built','host',1),('held','built','host',1); INSERT INTO transactions VALUES ('held')").unwrap();
+    db.execute_batch("CREATE TABLE transactions(txid TEXT PRIMARY KEY); CREATE TABLE pot_beefs(txid TEXT PRIMARY KEY); CREATE TABLE pot_records(txid TEXT, outputIndex INTEGER, spendingTxid TEXT); INSERT INTO tx_words(txid,word,tier,updated_at) VALUES ('stranger','built','host',1),('held','built','host',1); INSERT INTO transactions VALUES ('held')").unwrap();
     let due: Vec<String> = db
         .prepare(stored::DUE)
         .unwrap()
@@ -161,7 +161,7 @@ fn ns3d2_m1_evicted_arcade_row_is_swept_and_terminal_is_not_due() {
     use low_app_layer::tracker_host::stored;
     let db = rusqlite::Connection::open_in_memory().unwrap();
     db.execute_batch(stored::CREATE).unwrap();
-    db.execute_batch("CREATE TABLE transactions(txid TEXT PRIMARY KEY); CREATE TABLE pot_beefs(txid TEXT PRIMARY KEY); INSERT INTO tx_words(txid,word,tier,hint_source,updated_at,legacy_body) VALUES ('evicted','seen','hint','arcade',1,NULL),('held','seen','hint','arcade',1,'{\"trackerTerminal\":true}'); INSERT INTO transactions VALUES ('held')").unwrap();
+    db.execute_batch("CREATE TABLE transactions(txid TEXT PRIMARY KEY); CREATE TABLE pot_beefs(txid TEXT PRIMARY KEY); CREATE TABLE pot_records(txid TEXT, outputIndex INTEGER, spendingTxid TEXT); INSERT INTO tx_words(txid,word,tier,hint_source,updated_at,legacy_body) VALUES ('evicted','seen','hint','arcade',1,NULL),('held','seen','hint','arcade',1,'{\"trackerTerminal\":true}'); INSERT INTO transactions VALUES ('held')").unwrap();
     assert_eq!(
         db.execute(stored::SWEEP, [700001 - 8 * 86400]).unwrap(),
         1,

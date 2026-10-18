@@ -48,6 +48,15 @@ pub fn note_submit(txid: &str, gated: bool, admitted_any: bool) {
     }
 }
 
+/// bsv-low #757: the one live-hold predicate of the word events, here and at the app layer's `/internal/tx-word`
+/// (`tracker_host::runtime::live_hold`, `stored::DUE`, `stored::SWEEP`): the engine holds the subject (`transactions`),
+/// or the pot index records it as the spender of a live pot coin (`pot_records.spendingTxid`: the admitted submit
+/// that consumed the coin, `discover_missing_spends`' spender of that outpoint, or #605's mined competitor; a pot
+/// evicted to its shadow table holds nothing). A settle, refund or sweep admits no output, so it never has a
+/// `transactions` row; held by `transactions` alone its `seen`, `proof` and `callback` events were dropped and its
+/// word stayed `built`. Its retained bytes (`pot_beefs`) stay no authority.
+pub const LIVE_HOLD_SQL: &str = "SELECT 1 AS held FROM transactions WHERE txid = lower(?1) UNION ALL SELECT 1 AS held FROM pot_records WHERE spendingTxid = lower(?1) LIMIT 1";
+
 /// The public txid bearer is a trigger, not authority for a word row.
 pub async fn note_held(
     db: Option<&worker::D1Database>,
@@ -62,11 +71,10 @@ pub async fn note_held(
     let Some(db) = db else {
         return;
     };
-    let held =
-        crate::d1::Query::new("SELECT 1 AS held FROM transactions WHERE txid = lower(?) LIMIT 1")
-            .bind(txid)
-            .fetch_optional::<Held>(db)
-            .await;
+    let held = crate::d1::Query::new(LIVE_HOLD_SQL)
+        .bind(txid)
+        .fetch_optional::<Held>(db)
+        .await;
     if held.is_ok_and(|row| row.is_some_and(|r| r.held == 1.0)) {
         note(txid, kind, body);
     }
