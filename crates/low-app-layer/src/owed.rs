@@ -2252,6 +2252,95 @@ pub fn checked_tracker_mined(
         .get(&txid.to_ascii_lowercase())
         .map(|v| v["word"] == "mined" && !v["verifyPath"].is_null())
 }
+/// bsv-low #618 (L2): what the owed judgement may conclude from a recorded spender's coin word, the one input that
+/// replaces the shared landing bar's hand-written SEEN+final arm (`logic::is_confirmed_landing_with_proof`'s third
+/// arm, the overlay's `network_seen` latch AND the spender's bytes-finality) on the owed path. The index's own proof
+/// (`spentConfirmed`, a chaintracks-verified spender proof) is the bar's first two arms and is never read here, so no
+/// word vetoes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoinLanding {
+    /// The spender's word is a CHECKED `mined` (a merkle path against our header at its height, rechecked this
+    /// pass): the spend landed; the payout's `claimable` reads the same word.
+    Landed,
+    /// The spend is decided but not confirmed: `seen` with final bytes (a broadcaster's SEEN; a non-final spend
+    /// cannot mine before its height, #323), or a chain-tier word this pass could not hold as checked (`stale`, a
+    /// stored `mined` whose recheck failed, `cannotCheck`). The row tells the outcome, "awaiting the chain", and is
+    /// never claimable on it.
+    Awaiting,
+    /// `announced`, `unknown`, `built`, `abandoned`, `rejected`, `conflicted`, a non-final `seen`, or no word: the
+    /// outcome is withheld until the index's proof or a checked word lands.
+    Withheld,
+}
+
+/// PURE (bsv-low #618): the [`CoinLanding`] of a spender from its RECHECKED tracker view (`runtime::views`); `None`
+/// (no row) is `Withheld`.
+pub fn coin_landing(word: Option<&Value>, spender_final: Option<bool>) -> CoinLanding {
+    let Some(w) = word else {
+        return CoinLanding::Withheld;
+    };
+    if w["word"] == "mined" && !w["verifyPath"].is_null() {
+        CoinLanding::Landed
+    } else if w["word"] == "mined"
+        || w["word"] == "stale"
+        || w.get("cannotCheck").is_some()
+        || (w["word"] == "seen" && spender_final == Some(true))
+    {
+        CoinLanding::Awaiting
+    } else {
+        CoinLanding::Withheld
+    }
+}
+
+/// PURE (bsv-low #618): the shared bar's third-arm pair `(spender_seen, spender_final)` the owed path hands the
+/// unchanged assemblers, carrying the coin word's [`CoinLanding`] instead of the `network_seen` latch: `Landed` and
+/// `Awaiting` are `(true, true)` (a word the chain tier wrote is final by the chain), `Withheld` is `(false, final)`.
+/// The pair feeds nothing but the bar (`results`, `refund_view`, `hops_view`), so the latch is no longer read by the
+/// owed judgement.
+pub fn word_arm(
+    spending_txid: Option<&str>,
+    spender_final: Option<bool>,
+    words: &std::collections::BTreeMap<String, Value>,
+) -> (Option<bool>, Option<bool>) {
+    let word = spending_txid.and_then(|t| words.get(&t.to_ascii_lowercase()));
+    match coin_landing(word, spender_final) {
+        CoinLanding::Landed | CoinLanding::Awaiting => (Some(true), Some(true)),
+        CoinLanding::Withheld => (Some(false), spender_final),
+    }
+}
+
+/// bsv-low #618: the recorded spenders (lowercase, sorted, deduplicated) whose words the owed path reads BEFORE
+/// assembling its views: every hydrated row's `spending_txid`.
+pub fn word_arm_subjects<'a>(spenders: impl IntoIterator<Item = Option<&'a str>>) -> Vec<String> {
+    let ids: std::collections::BTreeSet<String> = spenders
+        .into_iter()
+        .flatten()
+        .filter(|t| crate::logic::valid_txid(t))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    ids.into_iter().collect()
+}
+
+/// bsv-low #618: the owed path's hydrated rows take [`word_arm`]'s pair in place of the latch's.
+pub fn apply_word_arm(
+    results: &mut [crate::results::ResultsRow],
+    refunds: &mut [crate::refund_view::RefundViewRow],
+    hops: &mut [crate::hops_view::HopsViewRow],
+    words: &std::collections::BTreeMap<String, Value>,
+) {
+    for r in results {
+        (r.spender_seen, r.spender_final) =
+            word_arm(r.spending_txid.as_deref(), r.spender_final, words);
+    }
+    for r in refunds {
+        (r.spender_seen, r.spender_final) =
+            word_arm(r.spending_txid.as_deref(), r.spender_final, words);
+    }
+    for r in hops {
+        (r.spender_seen, r.spender_final) =
+            word_arm(r.spending_txid.as_deref(), r.spender_final, words);
+    }
+}
+
 /// The coin judgement's tracker input; a competitor only wins on a checked
 /// mined word, never on a courier's positive height or a SEEN pointer.
 pub fn spender_coin_word(word: &Value, txid: &str, intended: Option<&str>) -> Value {
@@ -5967,7 +6056,8 @@ pub(crate) mod tests {
         // the route: the views built before phase 2b, the candidates chosen after them, from the views
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = squash(include_str!("routes.rs"));
-        let views = "letspender_words=crate::tracker_host::runtime::views(env,&word_rows).await;";
+        // bsv-low #618: the arm's subjects' views (3b) are merged into the rest's, both before phase 2b
+        let views = "letmutspender_words=crate::tracker_host::runtime::views(env,&extra_rows).await;spender_words.extend(arm_views.unwrap_or_default());";
         let input = "lettracker=crate::owed::checked_tracker_mined(word_lookup_available.then_some(&spender_words),sp,);crate::owed::durable_spender_needs_proof(sp,&hops,&hop_chain,&hop_sweeps,tracker,)";
         let reask = "crate::owed::durable_reasks(candidates,room,&over_budget,";
         for wired in [views, input, reask] {
@@ -7905,6 +7995,112 @@ pub(crate) mod tests {
             Some("the spend is not classified yet (no verdict)")
         );
         assert!(rows2[0].facts.get("chainWait").is_none());
+    }
+
+    /// bsv-low #618 (L2): the coin word's landing table, the one input that replaces the SEEN+final arm on the owed
+    /// path: a checked `mined` lands; a final `seen` and the chain words this pass could not check (`stale`, a stored
+    /// `mined` with no verify path, `cannotCheck`) await; `announced`, `unknown`, a non-final `seen`, the terminal
+    /// words and no word withhold. The arm's pair carries the verdict; the latch is never read.
+    #[test]
+    fn l2_coin_landing_table() {
+        let w = |word: &str, path: bool| json!({"word": word, "tier": "x", "height": null, "verifyPath": if path { json!({"root": "r"}) } else { Value::Null }});
+        let mut cannot = w("unknown", false);
+        cannot["cannotCheck"] = json!("header snapshot changed");
+        for (word, fin, want) in [
+            (Some(w("mined", true)), Some(false), CoinLanding::Landed),
+            (Some(w("mined", true)), None, CoinLanding::Landed),
+            (Some(w("mined", false)), Some(true), CoinLanding::Awaiting),
+            (Some(w("stale", false)), None, CoinLanding::Awaiting),
+            (Some(cannot.clone()), None, CoinLanding::Awaiting),
+            (Some(w("seen", false)), Some(true), CoinLanding::Awaiting),
+            (Some(w("seen", false)), Some(false), CoinLanding::Withheld),
+            (Some(w("seen", false)), None, CoinLanding::Withheld),
+            (
+                Some(w("announced", false)),
+                Some(true),
+                CoinLanding::Withheld,
+            ),
+            (Some(w("unknown", false)), Some(true), CoinLanding::Withheld),
+            (Some(w("built", false)), Some(true), CoinLanding::Withheld),
+            (
+                Some(w("rejected", false)),
+                Some(true),
+                CoinLanding::Withheld,
+            ),
+            (
+                Some(w("conflicted", false)),
+                Some(true),
+                CoinLanding::Withheld,
+            ),
+            (None, Some(true), CoinLanding::Withheld),
+        ] {
+            assert_eq!(
+                coin_landing(word.as_ref(), fin),
+                want,
+                "{word:?} final {fin:?}"
+            );
+        }
+        let words = std::collections::BTreeMap::from([
+            (tx(1), w("mined", true)),
+            (tx(2), w("seen", false)),
+            (tx(3), w("announced", false)),
+        ]);
+        // the pair: the latch's own (true, true) is ignored, the word decides
+        assert_eq!(
+            word_arm(Some(&tx(1)), Some(false), &words),
+            (Some(true), Some(true))
+        );
+        assert_eq!(
+            word_arm(Some(&tx(2)), Some(true), &words),
+            (Some(true), Some(true))
+        );
+        assert_eq!(
+            word_arm(Some(&tx(3)), Some(true), &words),
+            (Some(false), Some(true))
+        );
+        assert_eq!(
+            word_arm(Some(&tx(4)), Some(true), &words),
+            (Some(false), Some(true))
+        );
+        assert_eq!(word_arm(None, None, &words), (Some(false), None));
+        assert_eq!(
+            word_arm_subjects([
+                Some(tx(2).to_uppercase().as_str()),
+                None,
+                Some("zz"),
+                Some(tx(1).as_str()),
+                Some(tx(2).as_str())
+            ]),
+            vec![tx(1), tx(2)]
+        );
+    }
+
+    /// bsv-low #618: the owed recompute applies the word arm to every hydrated row BEFORE it assembles the three
+    /// views, and the later word read never re-reads the arm's subjects.
+    #[test]
+    fn l2_owed_recompute_assembles_after_the_word_arm() {
+        let routes = include_str!("routes.rs");
+        let body = &routes[routes.find("async fn owed_recompute_inner(").unwrap()
+            ..routes
+                .find("let mut rows = derive_owed_rows(&inputs);")
+                .unwrap()];
+        let arm = body
+            .find("crate::owed::apply_word_arm(")
+            .expect("the word arm is applied");
+        for assembler in [
+            "gather_result_rows(",
+            "crate::refund_view::assemble_refund_view(",
+            "crate::hops_view::assemble_hops_view(",
+        ] {
+            let at = body
+                .find(assembler)
+                .unwrap_or_else(|| panic!("{assembler} missing"));
+            assert!(arm < at, "{assembler} runs before the word arm");
+        }
+        assert!(
+            body.contains("arm_ids.binary_search(id).is_err()"),
+            "the later read re-reads the arm's subjects"
+        );
     }
 
     static NONE: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
