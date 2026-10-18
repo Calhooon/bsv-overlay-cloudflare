@@ -1046,14 +1046,19 @@ pub trait PotStorage {
         Ok(false)
     }
 
-    /// bsv-low #470 PRE557: of `txids`, the ones naming a pot row whose confirming block's time is not
-    /// yet recorded (`pot_records.blockTime IS NULL`). The completion pass reads a header only for these.
-    /// Default: none (a backend with no `createdAt` has nothing to stamp).
-    async fn pots_without_block_time(
+    /// bsv-low #470 PRE557 (the lens fold, HIGH-1): at most `limit` pots whose proof is LATCHED
+    /// (`pot_beefs.proof_verified = 1`, by whichever path latched it: the completion pass, the
+    /// `/arc-ingest` push, a reorg re-anchor) and whose pot row has no confirming block's time yet
+    /// (`pot_records.blockTime IS NULL`), each with its STORED BEEF (whose own bump is the verified one).
+    /// `start_key` is where the D1 scan of the unstamped rows begins (a random key a pass, beside the
+    /// first rows of the key space, so a row that can never be stamped starves none). Default: none (a
+    /// backend with no `createdAt` has nothing to stamp).
+    async fn verified_pots_without_block_time(
         &self,
-        txids: &[String],
-    ) -> Result<Vec<String>, PotStorageError> {
-        let _ = txids;
+        start_key: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
+        let _ = (start_key, limit);
         Ok(Vec::new())
     }
 
@@ -2216,16 +2221,26 @@ impl PotStorage for MemoryPotStorage {
         Ok(self.verified.lock().unwrap().contains(txid))
     }
 
-    async fn pots_without_block_time(
+    async fn verified_pots_without_block_time(
         &self,
-        txids: &[String],
-    ) -> Result<Vec<String>, PotStorageError> {
+        _start_key: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>, PotStorageError> {
+        // The memory twin reads every unstamped row (its sets are small); the D1 scan's window is the
+        // statement's own, pinned under real SQLite.
         let records = self.records.lock().unwrap();
         let stamped = self.block_times.lock().unwrap();
-        Ok(txids
+        let verified = self.verified.lock().unwrap();
+        let beefs = self.beefs.lock().unwrap();
+        let txids: std::collections::BTreeSet<&String> = records
             .iter()
-            .filter(|t| records.iter().any(|r| &r.txid == *t) && !stamped.contains_key(*t))
-            .cloned()
+            .map(|r| &r.txid)
+            .filter(|t| !stamped.contains_key(*t) && verified.contains(*t))
+            .collect();
+        Ok(txids
+            .into_iter()
+            .filter_map(|t| beefs.get(t).map(|b| (t.clone(), b.clone())))
+            .take(limit)
             .collect())
     }
 
