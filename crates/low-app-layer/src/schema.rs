@@ -158,7 +158,7 @@ pub const SPENDER_PAY_B_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN spende
 /// NULL = the row names no transaction (a chain marker, the v1 filing): it retires nothing by transaction.
 pub const PAY_TXID_ALTER: &str = "ALTER TABLE collected_markers_v2 ADD COLUMN payTxid TEXT";
 
-/// bsv-low #621 (L5): the `network_seen` latch's broadcaster and its time (overlay migrations 331 and 332).
+/// bsv-low #621 (L5): the `network_seen` latch's broadcaster and its time (overlay migrations 335 and 336).
 /// `/utxo-status`'s batch read names both (`networkSeenBy`), so a cold isolate ahead of the overlay must add them;
 /// the table is `NETWORK_SEEN_CREATE`'s, a CREATE catch-up, which runs first.
 pub const NETWORK_SEEN_SOURCE_ALTER: &str = "ALTER TABLE network_seen ADD COLUMN seenSource TEXT";

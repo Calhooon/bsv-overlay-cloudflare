@@ -689,7 +689,7 @@
    "rebuild_class": "chain",
    "never_wipe": false,
    "holds": "the overlay's own witness that the network accepted a txid, and since bsv-low #621 the broadcaster that said SEEN and its time",
-   "why": "re-ask Arcade; bar-lowering only. The app layer's ALTERs are its Rule-24 catch-up of the two #621 columns (byte-identical to the overlay's migrations 331 and 332); overlay-discovery reads the witness pair for ls_pot spentStatus.networkSeenBy"
+   "why": "re-ask Arcade; bar-lowering only. The app layer's ALTERs are its Rule-24 catch-up of the two #621 columns (byte-identical to the overlay's migrations 335 and 336); overlay-discovery reads the witness pair for ls_pot spentStatus.networkSeenBy"
   },
   {
    "name": "arc_terminal",
