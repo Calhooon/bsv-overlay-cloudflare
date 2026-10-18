@@ -746,6 +746,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     //    48h+ absence, PLUS both indexers' definitive 404) must not be
     //    re-presented by the very next step. Bounded: ≤8 candidates per
     //    store, ≤3 courier GETs each; every uncertainty keeps (fail-safe).
+    crate::d1_ledger::label("retire");
     let arcade_base = env
         .var("ARCADE_URL")
         .ok()
@@ -754,7 +755,6 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
     // #602 fold (MEDIUM-2): the conflict pass's GETs ride the WoC key when one is installed.
     let woc_key = env.secret("WOC_API_KEY").ok().map(|k| k.to_string());
-    crate::d1_ledger::label("retire");
     let retire =
         crate::proof_fetcher::run_retire_pass(
         &ops_db,
