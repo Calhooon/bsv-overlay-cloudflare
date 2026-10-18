@@ -323,9 +323,11 @@ fn l23_r2_route_rows(now_s: u64) -> Vec<String> {
     rows.push(format!("INSERT INTO owed_state(identity,computedAtMs,rows,stale,truncated) VALUES ('{cached_id}',{},1,1,0)", now_s*1000-900000));
     rows.push(format!("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs) VALUES ('{cached_id}','{hop}:0','hop-stranded','{game}','{{\"markerlessEvidence\":true,\"claim\":\"sweep-hop\",\"claimable\":true}}',{})",now_s*1000-900000));
     // A separate captured seat has NO live marker: this leg specifically depends on the twin probe.
+    // Its hop's unspent probe memo is written by the cell itself, at the read (overlay #85): an unspent memo answers
+    // for five minutes (`PROBE_MEMO_MAX_AGE_MS`), and stamped here it aged past that behind the tier's three
+    // `wrangler dev` builds on a loaded host, so the walk asked mainnet WoC, which knows this captured hop swept home.
     let other_hop = "9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62";
     rows.push(format!("INSERT INTO pot_records(txid,outputIndex,spent,spentConfirmed,createdAt) VALUES ('{other_hop}',0,0,0,{now_s})"));
-    rows.push(format!("INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES ('{other_hop}.0',{},0,NULL,0)",now_s*1000));
     // Budget noise claims p28, but every latch is INVALID; the verified-seat covering indexes must skip it.
     for i in 1..=300 {
         rows.push(format!("INSERT INTO potparty_records_evicted(identity,potTxid,gameId,opponentIdentity,seatSettlePubkey,sigValid,af_evictedAt) VALUES ('{me}','{i:064x}','{game}','opponent','{}',0,{})", "02".repeat(33), now_s*1000));

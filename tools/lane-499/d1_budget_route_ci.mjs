@@ -219,8 +219,17 @@ const measured = {}
 }
 
 // M3 independently: the other captured identity has only permanent twin party rows, no hopparty row.
+// Overlay #85: the hop's unspent probe memo is stamped HERE, by the cell's clock, just before the read. Seeded at
+// seed time it outlived its five minutes (`hops_view::PROBE_MEMO_MAX_AGE_MS`) behind the tier's builds on a loaded
+// host; the walk then asked mainnet WoC, which knows this captured hop swept home, and served 0 rows (or 1 when WoC
+// answered 429), at 33 to 35 statements against the offline read's 23 (the "owed surface 35 > 30" row).
 {
   const other = '030d9e9fbe045a8130f190b103609c8a6bf13b1887d5c4f15e2f918d68aca8ad67'
+  const hop = '9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62'
+  const crate = fileURLToPath(new URL('../../crates/low-app-layer/', import.meta.url))
+  execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', process.env.D1_BUDGET_STATE, '--command',
+    `INSERT OR REPLACE INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES ('${hop}.0',${Date.now()},0,NULL,0)`],
+  { cwd: crate, timeout: 30_000, stdio: 'pipe' })
   const r = await get(APP, `/owed?identity=${other}`)
   const row = JSON.parse(r.text).rows?.find(r => r.outpoint === '9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62:0')
   if (r.status === 200 && row?.facts?.markerlessCandidates === 1) pass('L23R2-M3 twin-only captured seat computes through owed route')
