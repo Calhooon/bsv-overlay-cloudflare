@@ -1048,6 +1048,64 @@ pub(crate) async fn bump_counters(
     }
 }
 
+/// NS-COST-BAR-1 (the owner's cost word of 2026-10-18): the pass families whose D1 rows read are counted durably,
+/// each as `d1_rows_read_<family>_total` (D1's own `meta.rows_read`, summed by `d1_ledger`): the maintenance tick's
+/// steps, labelled in `tick.rs` (`setup` is the engine's build and everything before the first label), and
+/// `/health/invariants`, the fleet's most-polled read. A closed set: the tick's labels are pinned to it.
+pub const D1_ROWS_READ_FAMILIES: &[&str] = &[
+    "setup",
+    "proof_window",
+    "tx_completion",
+    "ad_sync",
+    "beef_blob_sweep",
+    "gasp_deferred_sweep",
+    "ef_deferred",
+    "change_park",
+    "gasp_sync",
+    "peer_crawl",
+    "arcade_reorg",
+    "pot_maintenance",
+    "missing_spends",
+    "backfills",
+    "relatch",
+    "retire",
+    "rebroadcast",
+    "advert_lifecycle",
+    "proofless_watch",
+    "janitor",
+    "health_invariants",
+];
+
+/// The durable counter of one family's D1 rows read (NS-COST-BAR-1).
+pub fn d1_rows_read_counter(family: &str) -> String {
+    format!("d1_rows_read_{family}_total")
+}
+
+/// PURE (NS-COST-BAR-1): the counter deltas of one tick's per-pass tallies. A label outside
+/// [`D1_ROWS_READ_FAMILIES`] is folded into `setup` (it cannot happen: the labels are pinned), so no name is minted.
+pub fn d1_rows_read_deltas(
+    by_pass: &std::collections::BTreeMap<&'static str, crate::d1_ledger::Tally>,
+) -> std::collections::BTreeMap<String, u64> {
+    let mut out = std::collections::BTreeMap::new();
+    for (pass, t) in by_pass {
+        let family = if D1_ROWS_READ_FAMILIES.contains(pass) {
+            pass
+        } else {
+            "setup"
+        };
+        *out.entry(d1_rows_read_counter(family)).or_insert(0) += t.reads;
+    }
+    out
+}
+
+/// NS-COST-BAR-1: add one tick's rows read by pass to the durable counters, one batch. Best-effort (telemetry).
+pub async fn record_d1_rows_read(
+    db: &D1Database,
+    by_pass: &std::collections::BTreeMap<&'static str, crate::d1_ledger::Tally>,
+) {
+    bump_counters(db, d1_rows_read_deltas(by_pass)).await;
+}
+
 /// Add `delta` to the counter `name`; a fault is logged and swallowed.
 pub async fn bump_counter(db: &D1Database, name: &str, delta: u64) {
     if delta == 0 {
@@ -1426,6 +1484,10 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         obj[name] = json!(0);
     }
     // bsv-low #555: the deferred GASP graphs' counters (by reason too) read 0 until they fire.
+    // NS-COST-BAR-1: each pass family's rows read reads 0 until its first tick.
+    for family in D1_ROWS_READ_FAMILIES {
+        obj[d1_rows_read_counter(family)] = json!(0);
+    }
     for name in crate::gasp_deferred::counter_names() {
         obj[name] = json!(0);
     }
@@ -1822,14 +1884,82 @@ pub async fn health_invariants(
         .get("gasp_fault_memo_folded_total")
         .cloned()
         .unwrap_or(json!(0));
+    body["d1RowsRead"] = d1_rows_read_view(&body["counters"]);
+    // NS-COST-BAR-1: this read's own rows (every statement above), durable, so the fleet can judge the poll's cost
+    // per day. One statement more, not in its own figure.
+    if let Some(t) = crate::d1_ledger::current() {
+        bump_counter(db, &d1_rows_read_counter("health_invariants"), t.reads).await;
+    }
     let mut resp = Response::from_json(&body)?.with_status(status);
     crate::routes::add_cors_headers(&mut resp);
     let _ = resp.headers_mut().set("Cache-Control", "no-store");
     Ok(resp)
 }
 
+/// PURE (NS-COST-BAR-1): `/health/invariants.d1RowsRead`, the families' durable rows-read counters in one place
+/// (the same values as `counters.d1_rows_read_<family>_total`), for the invariants cell and the daily census to
+/// judge against the daily budget in `tools/lane-499/ceilings.json` (`d1RowsReadPerDay`).
+pub fn d1_rows_read_view(counters: &serde_json::Value) -> serde_json::Value {
+    let mut by = serde_json::Map::new();
+    let mut total = 0u64;
+    for family in D1_ROWS_READ_FAMILIES {
+        let n = counters[d1_rows_read_counter(family)].as_u64().unwrap_or(0);
+        total = total.saturating_add(n);
+        by.insert((*family).to_string(), json!(n));
+    }
+    json!({
+        "unit": "D1 meta.rows_read, summed since each counter's first bump (a delta over a day is the day's figure)",
+        "byFamily": by,
+        "total": total,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    /// NS-COST-BAR-1: one tick's per-pass tallies become one delta per family; the view serves the counters.
+    #[test]
+    fn ns_cost_rows_read_deltas_and_view() {
+        use crate::d1_ledger::Tally;
+        let t = |reads| Tally {
+            reads,
+            writes: 1,
+            stmts: 1,
+            max_reads: reads,
+        };
+        let by_pass = std::collections::BTreeMap::from([
+            ("setup", t(3)),
+            ("proofless_watch", t(389)),
+            ("relatch", t(0)),
+            ("not_a_family", t(7)),
+        ]);
+        let deltas = d1_rows_read_deltas(&by_pass);
+        assert_eq!(
+            deltas,
+            std::collections::BTreeMap::from([
+                ("d1_rows_read_proofless_watch_total".to_string(), 389),
+                ("d1_rows_read_relatch_total".to_string(), 0),
+                ("d1_rows_read_setup_total".to_string(), 10),
+            ]),
+            "an unknown label folds into setup; no name is minted"
+        );
+        let counters = json!({ "d1_rows_read_proofless_watch_total": 389, "d1_rows_read_health_invariants_total": 11 });
+        let view = d1_rows_read_view(&counters);
+        assert_eq!(view["byFamily"]["proofless_watch"], 389);
+        assert_eq!(view["byFamily"]["janitor"], 0);
+        assert_eq!(view["total"], 400);
+        assert_eq!(
+            view["byFamily"].as_object().unwrap().len(),
+            D1_ROWS_READ_FAMILIES.len()
+        );
+        // Every family's counter is seeded 0 by `read_counters`, and the health read bumps its own.
+        let src = include_str!("ops.rs");
+        let read = &src[src.find("async fn read_counters(").unwrap()..];
+        assert!(read[..read.find("\n}\n").unwrap()].contains("for family in D1_ROWS_READ_FAMILIES"));
+        assert!(src.contains(
+            "bump_counter(db, &d1_rows_read_counter(\"health_invariants\"), t.reads).await"
+        ));
+    }
+
     /// NS-COST-BAR-1: a migrated SQLite connection with `recursive_triggers` as given (D1's setting is not
     /// documented, and an `INSERT OR REPLACE` fires the delete trigger only when it is on).
     pub(crate) fn ns_cost_migrated(recursive_triggers: bool) -> rusqlite::Connection {
