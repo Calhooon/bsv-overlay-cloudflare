@@ -1113,6 +1113,8 @@ fn lb674_fold_l1_the_trigger_hand_score_is_the_app_layers() {
 ///   `2 * CARD_MAX_BYTES` card bytes rewritten and that many plus `PAGES_SLACK` pages of WAL (measured 743 to 745
 ///   pages, about 3.05 MB, at the bound). RED on `f0c15b9`, whose `POT_UPDATE` recomputed the same pot as OLD and as
 ///   NEW (four rewrites): "a packed win's signers backfilled: 5991694 card bytes rewritten, past twice the card".
+///   The seat relatch on a packed win's pot (the lens-3's LOW-1): 2,996,418 bytes, 742 pages; RED with
+///   `PARTY_UPDATE`'s guard removed alone: "a seat on a packed win's pot relatched: 5992836 card bytes rewritten".
 #[test]
 fn lb674_nomem_the_triggers_prepare_and_write_within_their_bound() {
     const PREPARED_MAX: u64 = 256 * 1024;
@@ -1270,8 +1272,164 @@ fn lb674_nomem_the_triggers_prepare_and_write_within_their_bound() {
         pages <= card_pages,
         "a claim on a packed win: {pages} pages written, past {card_pages}"
     );
+    // The seat guard (the lens-3's LOW-1): a seat of the LOSER's key keeps the win on the packed owner's card, so its
+    // relatch rewrites that card; recomputing the unmoved seat's pot as OLD and as NEW rewrote it four times.
+    let seat = "5ea".repeat(21) + "0";
+    let ida = d1_board::identity(3);
+    for (label, sql, p) in [
+        (
+            "a seat filed on a packed win's pot",
+            "INSERT INTO potparty_records (txid,outputIndex,potTxid,potVout,identity,opponentIdentity,gameId,recoveryHeight,seatSettlePubkey,sigValid,createdAt) VALUES (?1,0,?2,0,?3,'x','g1',1,?4,1,6)",
+            vec![seat.clone(), packed_pot.clone(), ida, pub_b.clone()],
+        ),
+        (
+            "a seat on a packed win's pot relatched",
+            "UPDATE potparty_records SET sigValid = 1 WHERE txid = ?1",
+            vec![seat.clone()],
+        ),
+    ] {
+        let params: Vec<&dyn rusqlite::ToSql> =
+            p.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let pages = written(label, sql, &params);
+        assert!(
+            pages <= card_pages,
+            "{label}: {pages} pages written, past {card_pages}"
+        );
+    }
+    let owner: String = db
+        .query_row(
+            "SELECT owner FROM board_wins WHERE potTxid = ?1",
+            [&packed_pot],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner, pub_a, "the seated win stays on the packed card");
     drop(db);
     for ext in ["db", "db-wal", "db-shm"] {
         let _ = std::fs::remove_file(path.with_extension(ext));
     }
+}
+
+/// The shipped `POT_UPDATE` / `PARTY_UPDATE` with the OLD recompute's guard cut out, whatever it says: the
+/// four-rewrite text of `f0c15b9`. Each trigger names its OLD pot in exactly two places (the delete, the insert).
+fn unguarded(trigger: &str, old: &str) -> String {
+    let mut out = trigger.to_string();
+    for (from, to) in [
+        (format!("potTxid={old} AND potVout=0"), ";"),
+        (format!("p.txid={old}"), ") w) o"),
+    ] {
+        assert_eq!(out.matches(&from).count(), 1, "{from} in {trigger}");
+        let start = out.find(&from).unwrap() + from.len();
+        let end = start + out[start..].find(to).unwrap();
+        assert!(
+            !out[start..end].is_empty(),
+            "the OLD recompute after {from} is unguarded"
+        );
+        out.replace_range(start..end, "");
+    }
+    out
+}
+
+fn schema_with(pot_update: &str, party_update: &str) -> Connection {
+    let db = Connection::open_in_memory().unwrap();
+    for sql in OVERLAY_MIGRATIONS {
+        let sql = match *sql {
+            s if s == board::POT_UPDATE => pot_update,
+            s if s == board::PARTY_UPDATE => party_update,
+            s => s,
+        };
+        if let Err(e) = db.execute_batch(sql) {
+            assert!(e.to_string().contains("duplicate column"), "{e}: {sql}");
+        }
+    }
+    db
+}
+
+/// The lens-3's LOW-2: the two-rewrite triggers (the OLD pot recomputed only when the row moved) derive the same
+/// bytes as the four-rewrite ones (`f0c15b9`'s text: the guard cut out), `board_wins` with its frags,
+/// `board_owners` with its cards and `packed`, `board_hands` and `board_total`, after every write of one owner
+/// whose card is past `CARD_MAX_BYTES`: a packed win backfilled and relatched; a win leaving and re-entering; a win
+/// past the bound updated; a verdict flipped and back; a pot moved to a new txid, its `outputIndex` moved off 0 and
+/// back, both in one update; a seat filed, unlatched and relatched, moved to another pot, moved with its key, its
+/// `potVout` moved off 0 and back with its pot, its identity changed; a whole-table no-op update. RED against a
+/// guard that never recomputes the OLD pot (`" AND 0"`): the moved pot's row stays where it was.
+#[test]
+fn lb674_fold3_old_and_new_triggers_derive_the_same_cards_at_the_bound() {
+    let old = schema_with(
+        &unguarded(board::POT_UPDATE, "OLD.txid"),
+        &unguarded(board::PARTY_UPDATE, "OLD.potTxid"),
+    );
+    let new = schema_with(board::POT_UPDATE, board::PARTY_UPDATE);
+    let scenario = |db: &Connection| -> Vec<(String, Vec<Vec<Vec<String>>>)> {
+        let (pub_a, pub_b) = (
+            format!("02{}", "ab".repeat(32)),
+            format!("03{}", "cd".repeat(32)),
+        );
+        let t = |i: u32| format!("b0b{i:061x}");
+        let ins = |i: u32| {
+            db.execute(
+                "INSERT INTO pot_records (txid,outputIndex,spent,spendingTxid,createdAt,spentConfirmed,pubA,pubB,paramsDecoded,verdict,verdictTxid,spenderFinal,lockKind,potSats) VALUES (?1,0,1,?2,?3,1,?4,?5,1,'winner-a',?2,1,'cov',1000)",
+                rusqlite::params![t(i), format!("5e7{i:061x}"), 1000 + i, pub_a, pub_b],
+            )
+            .unwrap();
+        };
+        db.execute_batch("BEGIN").unwrap();
+        let mut n = 0;
+        loop {
+            ins(n);
+            n += 1;
+            let (wins, packed): (u32, u32) = db
+                .query_row(
+                    "SELECT wins, packed FROM board_owners WHERE owner = ?1",
+                    [&pub_a],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            if packed < wins {
+                break;
+            }
+        }
+        for k in 0..3 {
+            ins(n + k);
+        }
+        db.execute_batch("COMMIT").unwrap();
+        let seat = "e1".repeat(32);
+        let steps = [
+            format!("UPDATE pot_records SET settleSigners='ab' WHERE txid='{}' AND outputIndex=0", t(3)),
+            format!("UPDATE pot_records SET spentConfirmed=1 WHERE txid='{}' AND outputIndex=0", t(4)),
+            format!("UPDATE pot_records SET spentConfirmed=0 WHERE txid='{}' AND outputIndex=0", t(5)),
+            format!("UPDATE pot_records SET settleSigners='cd' WHERE txid='{}' AND outputIndex=0", t(n + 1)),
+            format!("UPDATE pot_records SET spentConfirmed=1 WHERE txid='{}' AND outputIndex=0", t(5)),
+            format!("UPDATE pot_records SET verdict='winner-b' WHERE txid='{}' AND outputIndex=0", t(6)),
+            format!("UPDATE pot_records SET verdict='winner-a' WHERE txid='{}' AND outputIndex=0", t(6)),
+            format!("UPDATE pot_records SET txid='{}' WHERE txid='{}' AND outputIndex=0", "d0".repeat(32), t(7)),
+            format!("UPDATE pot_records SET outputIndex=1 WHERE txid='{}' AND outputIndex=0", t(8)),
+            format!("UPDATE pot_records SET outputIndex=0 WHERE txid='{}' AND outputIndex=1", t(8)),
+            format!("UPDATE pot_records SET txid='{}', outputIndex=0 WHERE txid='{}' AND outputIndex=0", "d2".repeat(32), t(9)),
+            format!("INSERT INTO potparty_records (txid,outputIndex,potTxid,potVout,identity,opponentIdentity,gameId,recoveryHeight,seatSettlePubkey,sigValid,createdAt) VALUES ('{seat}',0,'{}',0,'{}','x','g',1,'{pub_a}',1,1)", t(10), d1_board::identity(3)),
+            format!("UPDATE potparty_records SET sigValid=0 WHERE txid='{seat}'"),
+            format!("UPDATE potparty_records SET sigValid=1 WHERE txid='{seat}'"),
+            format!("UPDATE potparty_records SET potTxid='{}' WHERE txid='{seat}'", t(11)),
+            format!("UPDATE potparty_records SET potTxid='{}', seatSettlePubkey='{}' WHERE txid='{seat}'", t(12), pub_a.to_uppercase()),
+            format!("UPDATE potparty_records SET potVout=1 WHERE txid='{seat}'"),
+            format!("UPDATE potparty_records SET potVout=0, potTxid='{}' WHERE txid='{seat}'", t(13)),
+            format!("UPDATE potparty_records SET identity='{}' WHERE txid='{seat}'", d1_board::identity(5)),
+            "UPDATE pot_records SET spentConfirmed=spentConfirmed".to_string(),
+        ];
+        let mut out = vec![("the card past its bound".to_string(), dump(db))];
+        for s in steps {
+            db.execute_batch(&s).unwrap_or_else(|e| panic!("{e}: {s}"));
+            out.push((s.clone(), dump(db)));
+        }
+        out
+    };
+    let (old, new) = (scenario(&old), scenario(&new));
+    assert_eq!(old.len(), new.len());
+    for ((step, a), (_, b)) in old.iter().zip(&new) {
+        assert!(
+            a == b,
+            "{step}: the two-rewrite triggers derived other bytes"
+        );
+    }
+    println!("{} states byte-identical", old.len());
 }
