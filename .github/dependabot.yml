@@ -1,64 +1,15 @@
 # The stack's update loop (bsv-stack-lean docs/UPDATE-LOOP.md, template B): the
-# stack's crates only, every day, one PR per crate across both workspaces (the
-# root and workers/ share one bsv-rs line and must move together), the gate on
-# its head.
+# stack's crates only, every day, one PR per crate, the gate on its head.
+# Dependabot reads the ROOT workspace only. The workers/ workspace (a virtual
+# manifest whose members live under crates/, outside its directory) is not
+# readable by Dependabot's cargo parser ("No Cargo.toml!" on every run of a
+# /workers entry, 2026-10-18, bsv-stack-lean #165), so a loop PR on the root is
+# completed by hand for workers/ (the same bsv-rs line in both, one
+# workers/Cargo.lock) before it merges; the gate's --locked legs red otherwise.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
-    schedule:
-      interval: cron
-      cronjob: "0 18 * * *"
-      timezone: Etc/UTC
-    allow:
-      - dependency-name: bsv-rs
-      - dependency-name: bsv-middleware-core
-      - dependency-name: bsv-middleware-cloudflare
-      - dependency-name: bsv-middleware-rs
-      - dependency-name: bsv-overlay-engine
-      - dependency-name: bsv-overlay-discovery
-      - dependency-name: bsv-overlay-cloudflare
-      - dependency-name: bsv-low-proof-replay
-      - dependency-name: bsv-worker-build-info
-      - dependency-name: bsv-wallet-toolbox-rs
-      - dependency-name: bsv-tracker
-    cooldown:
-      exclude:
-        - bsv-rs
-        - bsv-middleware-core
-        - bsv-middleware-cloudflare
-        - bsv-middleware-rs
-        - bsv-overlay-engine
-        - bsv-overlay-discovery
-        - bsv-overlay-cloudflare
-        - bsv-low-proof-replay
-        - bsv-worker-build-info
-        - bsv-wallet-toolbox-rs
-        - bsv-tracker
-    versioning-strategy: auto
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: deps(stack)
-    labels:
-      - stack-line
-      - dependencies
-    groups:
-      bsv-stack:
-        group-by: dependency-name
-        patterns:
-          - bsv-rs
-          - bsv-middleware-core
-          - bsv-middleware-cloudflare
-          - bsv-middleware-rs
-          - bsv-overlay-engine
-          - bsv-overlay-discovery
-          - bsv-overlay-cloudflare
-          - bsv-low-proof-replay
-          - bsv-worker-build-info
-          - bsv-wallet-toolbox-rs
-          - bsv-tracker
-  - package-ecosystem: cargo
-    directory: /workers
     schedule:
       interval: cron
       cronjob: "0 18 * * *"
