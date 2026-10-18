@@ -380,7 +380,7 @@ gate	STORED	Pending
 callback	STORED	Ignore
 fatal	STORED	false
 live_look	STORED	Fault
-live_look_fold_plant	STORED	Fatal("REJECTED", "planted")
+live_look_fold_plant	STORED	Recorded("REJECTED", "planted")
 retire_absent_2h	STORED	None
 retire_absent_49h	STORED	None
 evidence_absent_young_true	STORED	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -398,7 +398,7 @@ gate	QUEUED	Pending
 callback	QUEUED	Ignore
 fatal	QUEUED	false
 live_look	QUEUED	Fault
-live_look_fold_plant	QUEUED	Fatal("REJECTED", "planted")
+live_look_fold_plant	QUEUED	Recorded("REJECTED", "planted")
 retire_absent_2h	QUEUED	None
 retire_absent_49h	QUEUED	None
 evidence_absent_young_true	QUEUED	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -416,7 +416,7 @@ gate	SUCCESS	Pending
 callback	SUCCESS	Ignore
 fatal	SUCCESS	false
 live_look	SUCCESS	Fault
-live_look_fold_plant	SUCCESS	Fatal("REJECTED", "planted")
+live_look_fold_plant	SUCCESS	Recorded("REJECTED", "planted")
 retire_absent_2h	SUCCESS	None
 retire_absent_49h	SUCCESS	None
 evidence_absent_young_true	SUCCESS	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -434,7 +434,7 @@ gate	ANNOUNCED_TO_NETWORK	Pending
 callback	ANNOUNCED_TO_NETWORK	Ignore
 fatal	ANNOUNCED_TO_NETWORK	false
 live_look	ANNOUNCED_TO_NETWORK	Fault
-live_look_fold_plant	ANNOUNCED_TO_NETWORK	Fatal("REJECTED", "planted")
+live_look_fold_plant	ANNOUNCED_TO_NETWORK	Recorded("REJECTED", "planted")
 retire_absent_2h	ANNOUNCED_TO_NETWORK	None
 retire_absent_49h	ANNOUNCED_TO_NETWORK	None
 evidence_absent_young_true	ANNOUNCED_TO_NETWORK	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -452,7 +452,7 @@ gate	REQUESTED_BY_NETWORK	Pending
 callback	REQUESTED_BY_NETWORK	Ignore
 fatal	REQUESTED_BY_NETWORK	false
 live_look	REQUESTED_BY_NETWORK	Fault
-live_look_fold_plant	REQUESTED_BY_NETWORK	Fatal("REJECTED", "planted")
+live_look_fold_plant	REQUESTED_BY_NETWORK	Recorded("REJECTED", "planted")
 retire_absent_2h	REQUESTED_BY_NETWORK	None
 retire_absent_49h	REQUESTED_BY_NETWORK	None
 evidence_absent_young_true	REQUESTED_BY_NETWORK	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -470,7 +470,7 @@ gate	CONFIRMED	Pending
 callback	CONFIRMED	Ignore
 fatal	CONFIRMED	false
 live_look	CONFIRMED	Fault
-live_look_fold_plant	CONFIRMED	Fatal("REJECTED", "planted")
+live_look_fold_plant	CONFIRMED	Recorded("REJECTED", "planted")
 retire_absent_2h	CONFIRMED	None
 retire_absent_49h	CONFIRMED	None
 evidence_absent_young_true	CONFIRMED	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -488,7 +488,7 @@ gate	MINED_IN_STALE_BLOCK	Pending
 callback	MINED_IN_STALE_BLOCK	Ignore
 fatal	MINED_IN_STALE_BLOCK	false
 live_look	MINED_IN_STALE_BLOCK	Fault
-live_look_fold_plant	MINED_IN_STALE_BLOCK	Fatal("REJECTED", "planted")
+live_look_fold_plant	MINED_IN_STALE_BLOCK	Recorded("REJECTED", "planted")
 retire_absent_2h	MINED_IN_STALE_BLOCK	None
 retire_absent_49h	MINED_IN_STALE_BLOCK	None
 evidence_absent_young_true	MINED_IN_STALE_BLOCK	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -506,7 +506,7 @@ gate	REORG_UNMINED	Pending
 callback	REORG_UNMINED	Ignore
 fatal	REORG_UNMINED	false
 live_look	REORG_UNMINED	Fault
-live_look_fold_plant	REORG_UNMINED	Fatal("REJECTED", "planted")
+live_look_fold_plant	REORG_UNMINED	Recorded("REJECTED", "planted")
 retire_absent_2h	REORG_UNMINED	None
 retire_absent_49h	REORG_UNMINED	None
 evidence_absent_young_true	REORG_UNMINED	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -524,7 +524,7 @@ gate	INVALID	Pending
 callback	INVALID	Ignore
 fatal	INVALID	false
 live_look	INVALID	Fault
-live_look_fold_plant	INVALID	Fatal("REJECTED", "planted")
+live_look_fold_plant	INVALID	Recorded("REJECTED", "planted")
 retire_absent_2h	INVALID	None
 retire_absent_49h	INVALID	None
 evidence_absent_young_true	INVALID	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -542,7 +542,7 @@ gate	MALFORMED	Pending
 callback	MALFORMED	Ignore
 fatal	MALFORMED	false
 live_look	MALFORMED	Fault
-live_look_fold_plant	MALFORMED	Fatal("REJECTED", "planted")
+live_look_fold_plant	MALFORMED	Recorded("REJECTED", "planted")
 retire_absent_2h	MALFORMED	None
 retire_absent_49h	MALFORMED	None
 evidence_absent_young_true	MALFORMED	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -560,7 +560,7 @@ gate	UTXO_SPENT	Pending
 callback	UTXO_SPENT	Ignore
 fatal	UTXO_SPENT	false
 live_look	UTXO_SPENT	Fault
-live_look_fold_plant	UTXO_SPENT	Fatal("REJECTED", "planted")
+live_look_fold_plant	UTXO_SPENT	Recorded("REJECTED", "planted")
 retire_absent_2h	UTXO_SPENT	None
 retire_absent_49h	UTXO_SPENT	None
 evidence_absent_young_true	UTXO_SPENT	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -578,7 +578,7 @@ gate	NOT_A_STATUS	Pending
 callback	NOT_A_STATUS	Ignore
 fatal	NOT_A_STATUS	false
 live_look	NOT_A_STATUS	Fault
-live_look_fold_plant	NOT_A_STATUS	Fatal("REJECTED", "planted")
+live_look_fold_plant	NOT_A_STATUS	Recorded("REJECTED", "planted")
 retire_absent_2h	NOT_A_STATUS	None
 retire_absent_49h	NOT_A_STATUS	None
 evidence_absent_young_true	NOT_A_STATUS	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -596,7 +596,7 @@ gate		Pending
 callback		Ignore
 fatal		false
 live_look		Fault
-live_look_fold_plant		Fatal("REJECTED", "planted")
+live_look_fold_plant		Recorded("REJECTED", "planted")
 retire_absent_2h		None
 retire_absent_49h		None
 evidence_absent_young_true		Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
@@ -614,7 +614,7 @@ gate	  	Pending
 callback	  	Ignore
 fatal	  	false
 live_look	  	Fault
-live_look_fold_plant	  	Fatal("REJECTED", "planted")
+live_look_fold_plant	  	Recorded("REJECTED", "planted")
 retire_absent_2h	  	None
 retire_absent_49h	  	None
 evidence_absent_young_true	  	Uncertain("a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission")
