@@ -217,11 +217,18 @@ pub const BACKFILL_PAGE: &str = "SELECT transactions.txid, CASE WHEN transaction
 pub const BACKFILL_POT_PAGE: &str = "SELECT pot_beefs.txid, CASE WHEN pot_beefs.has_proof = 1 AND tx_words.txid IS NULL THEN pot_beefs.beef END AS beef, pot_beefs.has_proof, tx_words.txid AS tracked FROM pot_beefs LEFT JOIN tx_words ON tx_words.txid = pot_beefs.txid WHERE pot_beefs.txid > ?1 ORDER BY pot_beefs.txid LIMIT 64";
 pub const BACKFILL_SAVE: &str = "INSERT INTO tracker_backfill(version,cursor,complete) VALUES (?1,?2,?3) ON CONFLICT(version) DO UPDATE SET cursor=MAX(tracker_backfill.cursor,excluded.cursor),complete=MAX(tracker_backfill.complete,excluded.complete)";
 
-/// Expire stranger projections after eight days. Only live held subjects are outside this sweep.
-pub const SWEEP: &str = "DELETE FROM tx_words WHERE txid IN (SELECT w.txid FROM tx_words w WHERE w.updated_at < ?1 AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) ORDER BY w.updated_at,w.txid LIMIT 64)";
+/// bsv-low #757: a live hold, the authority of a word event (`runtime::live_hold`): the engine's `transactions` row,
+/// or the pot index's record of the subject as a live pot coin's spender (`pot_records.spendingTxid`; a settle,
+/// refund or sweep admits no output and never has a `transactions` row). Equal to the overlay's
+/// `tracker_events::LIVE_HOLD_SQL` (pinned); [`SWEEP`] and [`DUE`] read the same two tables.
+pub const LIVE_HOLD: &str = "SELECT 1 AS held FROM transactions WHERE txid = lower(?1) UNION ALL SELECT 1 AS held FROM pot_records WHERE spendingTxid = lower(?1) LIMIT 1";
 
-/// Only live held subjects buy scheduled refreshes. A
+/// Expire stranger projections after eight days. Only live held subjects are outside this sweep (bsv-low #757: the
+/// overlay's `tracker_events::LIVE_HOLD_SQL`, a `transactions` row or a live pot coin's recorded spender).
+pub const SWEEP: &str = "DELETE FROM tx_words WHERE txid IN (SELECT w.txid FROM tx_words w WHERE w.updated_at < ?1 AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) AND NOT EXISTS (SELECT 1 FROM pot_records p WHERE p.spendingTxid=w.txid) ORDER BY w.updated_at,w.txid LIMIT 64)";
+
+/// Only live held subjects buy scheduled refreshes (the same hold as [`SWEEP`]). A
 /// stranger's historic built projection cannot renew its own sweep age.
-pub const DUE: &str = "SELECT w.txid FROM tx_words w WHERE w.word IN ('unknown','built','announced','seen') AND w.updated_at <= ?1 AND EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) AND COALESCE(json_extract(w.legacy_body,'$.trackerTerminal'),0) = 0 ORDER BY w.updated_at,w.txid LIMIT 2";
+pub const DUE: &str = "SELECT w.txid FROM tx_words w WHERE w.word IN ('unknown','built','announced','seen') AND w.updated_at <= ?1 AND (EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) OR EXISTS (SELECT 1 FROM pot_records p WHERE p.spendingTxid=w.txid)) AND COALESCE(json_extract(w.legacy_body,'$.trackerTerminal'),0) = 0 ORDER BY w.updated_at,w.txid LIMIT 2";
 
 pub const AGE_INDEX: &str = "CREATE INDEX IF NOT EXISTS tx_words_age ON tx_words(updated_at,txid)";

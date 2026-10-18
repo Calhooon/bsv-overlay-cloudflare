@@ -447,6 +447,60 @@ pub fn seen_hint_source(body: Option<&Value>, now: u64) -> (&'static str, u64) {
     (source, at)
 }
 
+/// PURE (bsv-low #757): the host and hint inputs of a held subject's event, before any proof: `Build` when the word
+/// is `unknown` and the subject has bytes (`bytes`: held, or a legacy body carrying its raw hex) or the event is a
+/// broadcaster's (`seen`, `accepted`), then the event's own hint (`accepted`: Arcade's accept; `seen`: the latch's
+/// broadcaster at its time, [`seen_hint_source`]).
+pub fn event_hints(state: &mut State, kind: &str, bytes: bool, callback: Option<&Value>, now: u64) {
+    let params = Params { age_threshold: 60 };
+    let empty = HeaderSnapshot {
+        tip: Ok(0),
+        headers: Default::default(),
+    };
+    if (bytes || kind == "seen" || kind == "accepted")
+        && state.word() == &bsv_tracker::Word::Unknown
+    {
+        state
+            .step(&params, &empty, Input::Host(HostAction::Build))
+            .expect("host input");
+    }
+    if kind == "accepted" {
+        state
+            .step(
+                &params,
+                &empty,
+                Input::Hint(Hint::new("arcade", HintStatus::Accepted, now)),
+            )
+            .expect("admission hint input");
+    }
+    if kind == "seen" {
+        // bsv-low #621 (L5): the hint names the broadcaster the overlay's latch named, at its time
+        let (source, observed) = seen_hint_source(callback, now);
+        state
+            .step(
+                &params,
+                &empty,
+                Input::Hint(Hint::new(source, HintStatus::Seen, observed)),
+            )
+            .expect("hint input");
+    }
+}
+
+/// PURE (bsv-low #757): the merkle path an event carries (the overlay's `proof` event from a checked bump, an Arcade
+/// callback's), bounded as a courier proof; it is evidence only once checked against our header.
+pub fn pushed_proof(txid: &str, callback: Option<&Value>) -> Option<Proof> {
+    callback
+        .and_then(|v| v["merklePath"].as_str())
+        .and_then(|h| {
+            overlay_engine::beef_limits::merkle_path_from_hex(
+                h,
+                overlay_engine::beef_limits::COURIER_PROOF_MAX_BYTES,
+            )
+            .ok()
+        })
+        .and_then(|p| Proof::new(txid, p).ok())
+}
+
 /// The event boundary runs effects only for an authoritative subject.
 pub async fn event_for_subject<F, Fut>(
     held: bool,
@@ -479,7 +533,10 @@ pub async fn event(
     .await
 }
 
-/// A retained pot BEEF or an Arcade source is bytes, never live authority.
+/// A retained pot BEEF or an Arcade source is bytes, never live authority. bsv-low #757: a live hold is the engine's
+/// `transactions` row OR the pot index's record of the subject as a live pot coin's spender ([`stored::LIVE_HOLD`],
+/// pinned equal to the overlay's `tracker_events::LIVE_HOLD_SQL`, its `note_held`): a settle never has a
+/// `transactions` row.
 pub async fn live_hold(env: &worker::Env, txid: &str) -> worker::Result<bool> {
     #[derive(serde::Deserialize)]
     struct Held {
@@ -487,7 +544,7 @@ pub async fn live_hold(env: &worker::Env, txid: &str) -> worker::Result<bool> {
     }
     Ok(env
         .d1("OVERLAY_DB")?
-        .prepare("SELECT 1 AS held FROM transactions WHERE txid = ? LIMIT 1")
+        .prepare(stored::LIVE_HOLD)
         .bind(&[JsValue::from_str(txid)])?
         .counted_first::<Held>()
         .await?
@@ -545,40 +602,12 @@ async fn event_held(
         answer.claimed_height = claimed_height;
         legacy = Some(crate::txany::tx_any_body(txid, &answer));
     }
-    if (held
-        || kind == "seen"
-        || kind == "accepted"
-        || legacy.as_ref().is_some_and(|s| {
-            serde_json::from_str::<Value>(s)
-                .ok()
-                .is_some_and(|v| v["rawHex"].is_string())
-        }))
-        && state.word() == &bsv_tracker::Word::Unknown
-    {
-        state
-            .step(&params, &empty, Input::Host(HostAction::Build))
-            .expect("host input");
-    }
-    if kind == "accepted" {
-        state
-            .step(
-                &params,
-                &empty,
-                Input::Hint(Hint::new("arcade", HintStatus::Accepted, now)),
-            )
-            .expect("admission hint input");
-    }
-    if kind == "seen" {
-        // bsv-low #621 (L5): the hint names the broadcaster the overlay's latch named, at its time
-        let (source, observed) = seen_hint_source(callback, now);
-        state
-            .step(
-                &params,
-                &empty,
-                Input::Hint(Hint::new(source, HintStatus::Seen, observed)),
-            )
-            .expect("hint input");
-    }
+    let raw_bytes = legacy.as_ref().is_some_and(|s| {
+        serde_json::from_str::<Value>(s)
+            .ok()
+            .is_some_and(|v| v["rawHex"].is_string())
+    });
+    event_hints(&mut state, kind, held || raw_bytes, callback, now);
     let arc = crate::routes::arcade_url();
     // Public callback is a trigger; live GET owns its hint. A callback's
     // merkle path is independently checked evidence even if GET faults.
@@ -607,16 +636,7 @@ async fn event_held(
             }
         }
     }
-    let pushed = callback
-        .and_then(|v| v["merklePath"].as_str())
-        .and_then(|h| {
-            overlay_engine::beef_limits::merkle_path_from_hex(
-                h,
-                overlay_engine::beef_limits::COURIER_PROOF_MAX_BYTES,
-            )
-            .ok()
-        })
-        .and_then(|p| Proof::new(txid, p).ok());
+    let pushed = pushed_proof(txid, callback);
     let mut checked = false;
     for proof in [pushed, proof].into_iter().flatten() {
         let headers = super::headers(env, &[proof.height()]).await;
