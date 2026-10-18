@@ -14,8 +14,8 @@
 //! Arcade's vocabulary and feeds [`arcade_hint`] (#624, L8): the tracker's
 //! `Verdict::from_arc_body` and `into_hint` cannot replace it yet without
 //! changing the door's answers, which this item does not do. K3
-//! (bsv-stack-lean #82) is open at the pinned 0.3.0 and on the crate's main
-//! (0.4.0): `into_hint` maps STUMP_PROCESSING and PENDING_RETRY to
+//! (bsv-stack-lean #82) is open at the pinned 0.4.0 (as at 0.3.0; 0.4.1
+//! moves `from_arc_body`'s vocabulary and is its own re-pin): `into_hint` maps STUMP_PROCESSING and PENDING_RETRY to
 //! `HintStatus::Unknown`, and a MINED or IMMUTABLE word needs a `blockHeight`
 //! to be `Mined`. The other differences are pinned by name in
 //! `tracker_vocabulary_differs_from_the_door_exactly_here` below.
