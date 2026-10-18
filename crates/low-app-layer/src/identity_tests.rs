@@ -1439,14 +1439,15 @@ async fn the_no_resolver_answer_leaves_the_budget_tier_unchanged() {
     );
 }
 
-/// §3 pin 4: the PROD config binds no identity resolver. The `IDENTITY` service
-/// binding and the `IDENTITY_KILL` KV appear under `[env.beta]` and NOT at the
-/// top level (prod), and prod keeps `IDENTITY_URL` + `IDENTITY_APP_ORIGINS`
-/// (the latter load-bearing for CORS). RED on main (`c09ea00`): prod bound
-/// `IDENTITY -> low-identity-resolver`. The `ci-deploy` dry-run of the prod
-/// config then no longer references the missing worker (the STOP this clears).
+/// §3 pin 4, INVERTED by bsv-low #656 (the identity window 2, 2026-10-18): BOTH envs bind the identity
+/// resolver. From DESIGN-NULL-RESOLVER-2026-10-15 (remedy B) to that window the `IDENTITY` service binding
+/// and the `IDENTITY_KILL` KV appeared under `[env.beta]` only and prod answered `ERR_NO_RESOLVER`
+/// (`Outcome::NoResolver`, still the nameable answer for a render that binds none). The prod resolver
+/// `low-identity-resolver` exists since 21:2xZ on Zanaadu's final era seed artifact, so prod binds it and
+/// the prod kill KV, each env naming its own worker; prod keeps `IDENTITY_URL` + `IDENTITY_APP_ORIGINS`
+/// (the latter load-bearing for CORS). RED on e86c168 (prod bound none).
 #[test]
-fn the_prod_config_binds_no_identity_resolver() {
+fn both_configs_bind_their_own_identity_resolver() {
     let toml = include_str!("../wrangler.toml");
     let (prod, beta) = toml.split_at(toml.find("\n[env.beta]").expect("a beta env"));
     let code = |part: &str| -> Vec<String> {
@@ -1456,24 +1457,37 @@ fn the_prod_config_binds_no_identity_resolver() {
             .collect()
     };
     let has = |part: &str, needle: &str| code(part).iter().any(|l| l == needle);
-    // The STOP this clears: prod binds no IDENTITY service, no IDENTITY_KILL KV,
-    // and names no identity resolver worker.
     assert!(
-        !has(prod, r#"binding = "IDENTITY""#),
-        "prod must not bind the IDENTITY service"
+        has(prod, r#"binding = "IDENTITY""#),
+        "prod binds the IDENTITY service (the null-resolver mode ended with the identity window)"
     );
     assert!(
-        !has(prod, r#"binding = "IDENTITY_KILL""#),
-        "prod must not bind the IDENTITY_KILL KV"
+        has(prod, r#"binding = "IDENTITY_KILL""#),
+        "prod binds the IDENTITY_KILL KV"
     );
     assert!(
-        !has(prod, r#"service = "low-identity-resolver""#),
-        "prod names no identity resolver worker"
+        has(prod, r#"service = "low-identity-resolver""#),
+        "prod names the prod identity resolver worker"
     );
-    // beta keeps both blocks.
+    assert!(
+        !has(prod, r#"service = "low-identity-resolver-beta""#),
+        "prod never names the beta resolver"
+    );
+    assert!(
+        has(
+            prod,
+            r#"id = "__LOW_APPLAYER_DEFAULT_KV_IDENTITY_KILL_ID__""#
+        ),
+        "the prod kill KV id is a placeholder rendered by name"
+    );
+    // beta keeps both blocks, on its own worker.
     assert!(
         has(beta, r#"binding = "IDENTITY""#),
         "beta keeps the IDENTITY service binding"
+    );
+    assert!(
+        has(beta, r#"service = "low-identity-resolver-beta""#),
+        "beta names the beta identity resolver worker"
     );
     assert!(
         has(beta, r#"binding = "IDENTITY_KILL""#),
