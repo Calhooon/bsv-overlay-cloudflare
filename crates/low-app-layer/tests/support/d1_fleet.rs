@@ -49,6 +49,45 @@ pub fn rows(now: u64) -> Vec<String> {
             "INSERT INTO network_seen (txid, seenAt) VALUES ('e4{i:062x}', {now})"
         ));
     }
+    // NS-COST-BAR-1: beta's pot_beefs (20,837 rows), its retired transactions (21,724 rows with the 19,005 above)
+    // and a proofless watch of 221 rows over every arm of the GC, keyed apart from everything above.
+    for i in 0..20_837u32 {
+        let unprovable = if i % 3 == 0 {
+            "1"
+        } else if i % 3 == 1 {
+            "0"
+        } else {
+            "NULL"
+        };
+        rows.push(format!(
+            "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof, structurally_unprovable) VALUES ('e5{i:062x}', x'00', {now}, {}, {unprovable})",
+            u8::from(i % 2 == 0)
+        ));
+    }
+    for i in 0..2_719u32 {
+        let reason = if i % 2 == 0 {
+            "expired-unproven"
+        } else {
+            "utxo-spent"
+        };
+        rows.push(format!(
+            "INSERT INTO transactions (txid, beef, has_proof, retired_ms, retired_reason) VALUES ('e6{i:062x}', x'00', 0, {}, '{reason}')",
+            now * 1000
+        ));
+    }
+    for i in 0..221u32 {
+        let txid = match i % 4 {
+            // Spread over pot_beefs' four latch shapes: proven, unprovable, NULL-latch and live backlog survive or go.
+            0 => format!("e5{:062x}", i * 5 + 1),
+            1 => format!("e6{i:062x}"),
+            2 => format!("e2{i:062x}"),
+            _ => format!("e7{i:062x}"),
+        };
+        rows.push(format!(
+            "INSERT INTO proofless_watch (txid, first_seen_ms) VALUES ('{txid}', {})",
+            now * 1000
+        ));
+    }
     rows
 }
 
@@ -62,7 +101,9 @@ pub fn execute_row(db: &rusqlite::Connection, sql: &str) {
         .split(',')
         .map(|v| {
             let v = v.trim();
-            if let Some(hex) = v.strip_prefix("x'").and_then(|v| v.strip_suffix('\'')) {
+            if v == "NULL" {
+                Value::Null
+            } else if let Some(hex) = v.strip_prefix("x'").and_then(|v| v.strip_suffix('\'')) {
                 Value::Blob(hex::decode(hex).expect("fixture blob"))
             } else if let Some(text) = v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
                 Value::Text(text.to_string())

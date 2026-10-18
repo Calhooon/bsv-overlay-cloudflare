@@ -51,6 +51,37 @@ const TIP_MARK_READ_CEILING: u64 = 5;
 /// bsv-low #645: `/health/invariants.networkSeenTotal`.
 /// Measured 1, and 1 for the backfill's re-run (27,000 before).
 const SEEN_TOTAL_READ_CEILING: u64 = 5;
+/// NS-COST-BAR-1: the proofless-watch GC's read set (its predicate as a SELECT) on the fixture's 221 watched rows.
+const GC_READ_CEILING: u64 = 1_000;
+/// NS-COST-BAR-1: the BEFORE shapes are measured beside the AFTER ones (each line prints its reads), under a
+/// ceiling that only says they ran: they are the figures `docs/D1-BUDGETS.md` quotes.
+const BEFORE_SHAPE_CEILING: u64 = 10_000_000;
+
+/// The GC before NS-COST-BAR-1 (`d1_hot_bounds.rs` pins the shipped one deletes exactly its rows).
+const PROOFLESS_WATCH_GC_BEFORE_SELECT: &str = "SELECT txid FROM proofless_watch WHERE \
+     txid IN (SELECT txid FROM pot_beefs WHERE has_proof = 1) OR \
+     txid IN (SELECT txid FROM transactions WHERE has_proof = 1) OR \
+     txid IN (SELECT txid FROM pot_beefs WHERE structurally_unprovable = 1) OR \
+     txid IN (SELECT txid FROM transactions WHERE retired_ms IS NOT NULL) OR \
+     (txid NOT IN (SELECT txid FROM pot_beefs) AND \
+      txid NOT IN (SELECT txid FROM transactions))";
+
+/// NS-COST-BAR-1's statements on the fixture: `(name, sql, ceiling)`, the before shapes beside the shipped ones.
+fn ns_cost_statements() -> Vec<(&'static str, String, u64)> {
+    let gc = bsv_overlay_cloudflare::ops::PROOFLESS_WATCH_GC_SQL.replacen(
+        "DELETE FROM proofless_watch WHERE",
+        "SELECT txid FROM proofless_watch WHERE",
+        1,
+    );
+    vec![
+        (
+            "NS-COST before: the proofless-watch GC",
+            PROOFLESS_WATCH_GC_BEFORE_SELECT.to_string(),
+            BEFORE_SHAPE_CEILING,
+        ),
+        ("NS-COST the proofless-watch GC", gc, GC_READ_CEILING),
+    ]
+}
 
 pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
     let mut sql = String::new();
@@ -171,6 +202,11 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
         let (expanded, rows) = query(db, &statement, &binds);
         sql.push_str(&format!("{expanded};\n"));
         expected.push(json!({"name":name,"rows":rows,"sql":expanded,"ceiling":ceiling,"unordered":unordered,"bound":true}));
+    }
+    for (name, statement, ceiling) in ns_cost_statements() {
+        let (expanded, rows) = query(db, &statement, &[]);
+        sql.push_str(&format!("{expanded};\n"));
+        expected.push(json!({"name":name,"rows":rows,"sql":expanded,"ceiling":ceiling,"unordered":true,"bound":true}));
     }
     // Compile-time and runtime proof this diagnostic never changes the fixture.
     assert!(sql.lines().all(|s| s.starts_with("SELECT ")));

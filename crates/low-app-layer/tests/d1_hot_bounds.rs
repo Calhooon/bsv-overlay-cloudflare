@@ -388,3 +388,135 @@ fn w16_645_the_seen_total_is_the_count_and_the_read_counts_nothing() {
     );
     assert_no_fleet_scan("seen total", &details);
 }
+
+// ── NS-COST-BAR-1 (the owner's cost word of 2026-10-18): the per-tick whole-table reads of the 24-hour census ──
+
+/// The proofless-watch GC before NS-COST-BAR-1: four filtered lists built over the whole stores every tick.
+const PROOFLESS_WATCH_GC_BEFORE: &str = "DELETE FROM proofless_watch WHERE \
+     txid IN (SELECT txid FROM pot_beefs WHERE has_proof = 1) OR \
+     txid IN (SELECT txid FROM transactions WHERE has_proof = 1) OR \
+     txid IN (SELECT txid FROM pot_beefs WHERE structurally_unprovable = 1) OR \
+     txid IN (SELECT txid FROM transactions WHERE retired_ms IS NOT NULL) OR \
+     (txid NOT IN (SELECT txid FROM pot_beefs) AND \
+      txid NOT IN (SELECT txid FROM transactions))";
+
+/// The rows a DELETE would take, as a SELECT of the same predicate (the read the local-D1 harness measures).
+fn gc_as_select(delete: &str) -> String {
+    delete.replacen(
+        "DELETE FROM proofless_watch WHERE",
+        "SELECT txid FROM proofless_watch WHERE",
+        1,
+    )
+}
+
+fn watch_after(db: &Connection, gc: &str) -> Vec<String> {
+    db.execute_batch("SAVEPOINT gc").unwrap();
+    db.execute(gc, []).unwrap();
+    let left = sorted(rows(db, "SELECT txid FROM proofless_watch", &[]));
+    db.execute_batch("ROLLBACK TO gc; RELEASE gc").unwrap();
+    left
+}
+
+#[test]
+fn ns_cost_gc_deletes_the_old_rows_and_probes_the_stores_by_key() {
+    use bsv_overlay_cloudflare::ops::PROOFLESS_WATCH_GC_SQL;
+    let db = fixture();
+    let before = watch_after(&db, PROOFLESS_WATCH_GC_BEFORE);
+    let after = watch_after(&db, PROOFLESS_WATCH_GC_SQL);
+    let held = sorted(rows(&db, "SELECT txid FROM proofless_watch", &[]));
+    assert_eq!(
+        after, before,
+        "the shipped GC keeps exactly the old GC's rows"
+    );
+    assert!(
+        !after.is_empty() && after.len() < held.len(),
+        "the fixture exercises both: {} kept of {}",
+        after.len(),
+        held.len()
+    );
+    // Every arm's edge, on rows no other pin reads: both stores at once, a NULL latch, a proven row that is also
+    // retired, a txid in neither store, and the stores' own NULL keys (a NULL in an `IN` list is a false in the OR).
+    db.execute_batch(
+        "INSERT INTO pot_beefs (txid, beef, has_proof, structurally_unprovable) VALUES ('f9a', x'00', 0, NULL), ('f9b', x'00', 0, 0), ('f9c', x'00', 1, 1), ('f9d', x'00', 0, 2); \
+         INSERT INTO transactions (txid, beef, has_proof, retired_ms) VALUES ('f9a', x'00', 0, NULL), ('f9b', x'00', 0, 5), ('f9e', x'00', 1, NULL), ('f9f', x'00', 0, NULL); \
+         INSERT INTO pot_beefs (txid, beef, has_proof, structurally_unprovable) VALUES (NULL, x'00', 1, 1); \
+         INSERT INTO proofless_watch (txid, first_seen_ms) VALUES ('f9a', 1), ('f9b', 1), ('f9c', 1), ('f9d', 1), ('f9e', 1), ('f9f', 1), ('f9g', 1), ('F9A', 1);",
+    )
+    .unwrap();
+    assert_eq!(
+        watch_after(&db, PROOFLESS_WATCH_GC_SQL),
+        watch_after(&db, PROOFLESS_WATCH_GC_BEFORE),
+        "the edges, with a NULL pot_beefs key (the orphan arm is NULL for every row)"
+    );
+    db.execute_batch("DELETE FROM pot_beefs WHERE txid IS NULL")
+        .unwrap();
+    let edges = watch_after(&db, PROOFLESS_WATCH_GC_SQL);
+    assert_eq!(
+        edges,
+        watch_after(&db, PROOFLESS_WATCH_GC_BEFORE),
+        "the edges"
+    );
+    // f9a: unproven in both; f9b: retired in transactions; f9c: proven and unprovable; f9d: a latch of 2 is not
+    // 1; f9e: proven in transactions; f9f: live in transactions; f9g: in neither; F9A: case is a different key.
+    for (txid, kept) in [
+        ("f9a", true),
+        ("f9b", false),
+        ("f9c", false),
+        ("f9d", true),
+        ("f9e", false),
+        ("f9f", true),
+        ("f9g", false),
+        ("F9A", false),
+    ] {
+        assert_eq!(
+            edges.contains(&format!(
+                "{:?}",
+                rusqlite::types::ValueRef::Text(txid.as_bytes())
+            )),
+            kept,
+            "{txid}: {edges:?}"
+        );
+    }
+    let details = plan(&db, PROOFLESS_WATCH_GC_SQL);
+    println!("gc plan: {details:?}");
+    for d in &details {
+        let name = d
+            .strip_prefix("SCAN ")
+            .and_then(|s| s.split_whitespace().next());
+        assert!(
+            name.is_none_or(|n| n == "proofless_watch"),
+            "the GC scans the watch alone: {d} (plan {details:?})"
+        );
+        assert!(
+            !d.contains("LIST SUBQUERY"),
+            "no list is built over a store: {d} (plan {details:?})"
+        );
+    }
+    for store in ["pot_beefs", "transactions"] {
+        assert!(
+            details
+                .iter()
+                .any(|d| d.starts_with(&format!("CORRELATED SCALAR SUBQUERY"))
+                    || d.contains(&format!("sqlite_autoindex_{store}_1 (txid=?)"))),
+            "{store} is probed by its key: {details:?}"
+        );
+    }
+    assert!(
+        plan(&db, PROOFLESS_WATCH_GC_BEFORE)
+            .iter()
+            .any(|d| d.contains("LIST SUBQUERY")),
+        "the old shape built lists (the pin can tell them apart)"
+    );
+    // The read the harness measures is the same plan (the SELECT may walk the watch through its key's index).
+    let measured = plan(&db, &gc_as_select(PROOFLESS_WATCH_GC_SQL));
+    assert!(
+        measured[0].starts_with("SCAN proofless_watch")
+            && details[0].starts_with("SCAN proofless_watch")
+    );
+    assert_eq!(
+        measured[1..],
+        details[1..],
+        "the measured SELECT is the DELETE's plan"
+    );
+    assert_no_fleet_scan_analyzed(&db, "gc", PROOFLESS_WATCH_GC_SQL);
+}
