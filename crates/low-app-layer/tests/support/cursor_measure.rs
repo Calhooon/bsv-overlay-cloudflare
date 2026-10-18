@@ -57,6 +57,8 @@ const GC_READ_CEILING: u64 = 1_000;
 const COUNT_ROW_READ_CEILING: u64 = 5;
 /// NS-COST-BAR-1: the backlog read: three count rows and the hour's young pots (none, two hours on).
 const BACKLOG_READ_CEILING: u64 = 10;
+/// NS-COST-BAR-1: a relatch census mid-sweep: the rows after the cursor (half the table) and the NULL tier.
+const RELATCH_CENSUS_READ_CEILING: u64 = 8_000;
 /// NS-COST-BAR-1: the BEFORE shapes are measured beside the AFTER ones (each line prints its reads), under a
 /// ceiling that only says they ran: they are the figures `docs/D1-BUDGETS.md` quotes.
 const BEFORE_SHAPE_CEILING: u64 = 10_000_000;
@@ -133,6 +135,35 @@ fn ns_cost_statements() -> Vec<(&'static str, String, u64)> {
             BACKLOG_READ_CEILING,
         ),
     ];
+    // The relatch censuses mid-sweep (the cursor at the table's middle rowid: the sweep's average place), the old
+    // single aggregate beside each.
+    for (table, column, census) in [
+        (
+            "potparty_records",
+            "sigValid",
+            bsv_overlay_cloudflare::d1_discovery::potparty_relatch_census_sql(),
+        ),
+        (
+            "hopparty_records",
+            "markerValid",
+            bsv_overlay_cloudflare::d1_discovery::hopparty_relatch_census_sql(),
+        ),
+    ] {
+        let mid = format!("(SELECT MAX(rowid) / 2 FROM {table})");
+        out.push((
+            "NS-COST before: a relatch census, mid-sweep",
+            format!(
+                "SELECT COALESCE(SUM(CASE WHEN rowid > {mid} THEN 1 ELSE 0 END), 0) AS remaining, \
+                        COALESCE(SUM(CASE WHEN {column} IS NULL THEN 1 ELSE 0 END), 0) AS stillNull FROM {table}"
+            ),
+            BEFORE_SHAPE_CEILING,
+        ));
+        out.push((
+            "NS-COST a relatch census, mid-sweep",
+            census.replace("?1", &mid),
+            RELATCH_CENSUS_READ_CEILING,
+        ));
+    }
     // Each count backfill's SELECT on a re-run (the row present): the stamp alone.
     for backfill in bsv_overlay_cloudflare::ops::COUNT_ROW_BACKFILLS
         .iter()

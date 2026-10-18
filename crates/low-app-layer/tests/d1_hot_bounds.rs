@@ -767,3 +767,101 @@ fn ns_cost_index_janitor_backlog_is_the_old_figure_and_reads_the_hour_alone() {
         "the range holds under statistics"
     );
 }
+
+#[test]
+fn ns_cost_relatch_censuses_are_the_old_aggregate_and_read_no_whole_table() {
+    use bsv_overlay_cloudflare::d1_discovery as d;
+    let db = fixture();
+    // Every table's legacy NULL tier, both latched tiers, and rowid gaps (a deleted row) on rows no other pin reads.
+    db.execute_batch(
+        "UPDATE potparty_records SET sigValid = CASE rowid % 3 WHEN 0 THEN NULL WHEN 1 THEN 0 ELSE 1 END WHERE rowid % 5 = 0; \
+         UPDATE hopparty_records SET markerValid = CASE rowid % 3 WHEN 0 THEN NULL WHEN 1 THEN 0 ELSE 1 END WHERE rowid % 5 = 0; \
+         DELETE FROM potparty_records WHERE rowid % 997 = 0; \
+         DELETE FROM hopparty_records WHERE rowid % 991 = 0;",
+    )
+    .unwrap();
+    for i in 0..500u32 {
+        db.execute(
+            "INSERT INTO result_markers_v2 (gameId, winner, loser, potTxid, settleTxid, winnerSigHex, loserSigHex, cardsHex, txid, outputIndex, createdAt, claimValid) VALUES (?1, 'w', 'l', ?1, ?1, '00', '00', '00', ?1, 0, 1, ?2)",
+            rusqlite::params![format!("af{i:062x}"), [None, Some(0), Some(1)][i as usize % 3]],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO hand_markers (gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex, createdAt, rowValid) VALUES (?1, 'i', ?1, '00', ?1, 0, '00', 1, ?2)",
+            rusqlite::params![format!("ae{i:062x}"), [None, Some(0), Some(1)][i as usize % 3]],
+        )
+        .unwrap();
+    }
+    for (table, column, sql) in [
+        (
+            "potparty_records",
+            "sigValid",
+            d::potparty_relatch_census_sql(),
+        ),
+        (
+            "hopparty_records",
+            "markerValid",
+            d::hopparty_relatch_census_sql(),
+        ),
+        (
+            "result_markers_v2",
+            "claimValid",
+            d::result_relatch_census_sql(),
+        ),
+        ("hand_markers", "rowValid", d::hand_relatch_census_sql()),
+    ] {
+        let old = format!(
+            "SELECT COALESCE(SUM(CASE WHEN rowid > ?1 THEN 1 ELSE 0 END), 0) AS remaining, \
+                    COALESCE(SUM(CASE WHEN {column} IS NULL THEN 1 ELSE 0 END), 0) AS stillNull FROM {table}"
+        );
+        let max: i64 = db
+            .query_row(&format!("SELECT MAX(rowid) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        let mut nulls = 0;
+        for cursor in [
+            -1,
+            0,
+            1,
+            2,
+            63,
+            64,
+            max / 2,
+            max - 1,
+            max,
+            max + 1,
+            i64::MAX,
+        ] {
+            let new = rows(&db, &sql, &[Value::Integer(cursor)]);
+            assert_eq!(
+                new,
+                rows(&db, &old, &[Value::Integer(cursor)]),
+                "{table} at {cursor}"
+            );
+            nulls = db
+                .query_row(&sql, [cursor], |r| r.get::<_, i64>(1))
+                .unwrap();
+        }
+        assert!(nulls > 0, "{table}: the fixture holds a NULL tier");
+        let details = plan(&db, &sql);
+        println!("{table} census plan: {details:?}");
+        assert!(
+            details
+                .iter()
+                .all(|d| !d.starts_with("SCAN ") || d == "SCAN CONSTANT ROW"),
+            "{table}: no whole-table read: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d == &format!("SEARCH {table} USING INTEGER PRIMARY KEY (rowid>?)")),
+            "{table}: the sweep's rows are a rowid range: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("_null (") && d.contains("USING COVERING INDEX")),
+            "{table}: the NULL tier is its partial index: {details:?}"
+        );
+        assert_no_fleet_scan_analyzed(&db, table, &sql);
+    }
+}

@@ -4463,10 +4463,12 @@ fn result_relatch_scan_sql() -> String {
         .to_string()
 }
 
-fn result_relatch_census_sql() -> String {
-    "SELECT COALESCE(SUM(CASE WHEN rowid > ?1 THEN 1 ELSE 0 END), 0) AS remaining, \
-            COALESCE(SUM(CASE WHEN claimValid IS NULL THEN 1 ELSE 0 END), 0) AS stillNull \
-     FROM result_markers_v2"
+/// NS-COST-BAR-1: a rowid range and the NULL tier's partial index (`idx_result_claim_null`), never every row: the
+/// one aggregate over the table read all of it on every tick (the census's `SUM(CASE WHEN rowid > ?)` family).
+pub fn result_relatch_census_sql() -> String {
+    "SELECT (SELECT COUNT(*) FROM result_markers_v2 WHERE rowid > ?1) AS remaining, \
+            (SELECT COUNT(*) FROM result_markers_v2 INDEXED BY idx_result_claim_null \
+             WHERE claimValid IS NULL) AS stillNull"
         .to_string()
 }
 
@@ -4558,10 +4560,11 @@ fn hand_relatch_scan_sql() -> String {
         .to_string()
 }
 
-fn hand_relatch_census_sql() -> String {
-    "SELECT COALESCE(SUM(CASE WHEN rowid > ?1 THEN 1 ELSE 0 END), 0) AS remaining, \
-            COALESCE(SUM(CASE WHEN rowValid IS NULL THEN 1 ELSE 0 END), 0) AS stillNull \
-     FROM hand_markers"
+/// NS-COST-BAR-1: a rowid range and the NULL tier's partial index (`idx_hand_row_null`), never every row.
+pub fn hand_relatch_census_sql() -> String {
+    "SELECT (SELECT COUNT(*) FROM hand_markers WHERE rowid > ?1) AS remaining, \
+            (SELECT COUNT(*) FROM hand_markers INDEXED BY idx_hand_row_null \
+             WHERE rowValid IS NULL) AS stillNull"
         .to_string()
 }
 
@@ -5848,15 +5851,17 @@ fn potparty_relatch_scan_sql() -> String {
     )
 }
 
-/// Both convergence readouts in one aggregate: rows left in this sweep, and
+/// Both convergence readouts in one statement: rows left in this sweep, and
 /// the size of the legacy tier. Reported, never used as a filter.
-fn potparty_relatch_census_sql() -> String {
+/// NS-COST-BAR-1: a rowid range (the rows after the cursor) and the NULL tier's partial index
+/// (`idx_potparty_sig_null`), never every row: the one aggregate over the table read all of it on every tick
+/// (19,246 rows a run on beta, 1.4 M a day).
+pub fn potparty_relatch_census_sql() -> String {
     use overlay_discovery::potparty::validity::SIG_VALID_COLUMN;
     format!(
-        "SELECT COALESCE(SUM(CASE WHEN rowid > ?1 THEN 1 ELSE 0 END), 0) AS remaining, \
-                COALESCE(SUM(CASE WHEN {SIG_VALID_COLUMN} IS NULL THEN 1 ELSE 0 END), 0) \
-                    AS stillNull \
-         FROM potparty_records"
+        "SELECT (SELECT COUNT(*) FROM potparty_records WHERE rowid > ?1) AS remaining, \
+                (SELECT COUNT(*) FROM potparty_records INDEXED BY idx_potparty_sig_null \
+                 WHERE {SIG_VALID_COLUMN} IS NULL) AS stillNull"
     )
 }
 
@@ -6693,13 +6698,13 @@ fn hopparty_relatch_scan_sql() -> String {
 
 /// Both convergence readouts in one aggregate — see
 /// [`potparty_relatch_census_sql`].
-fn hopparty_relatch_census_sql() -> String {
+/// NS-COST-BAR-1: a rowid range and the NULL tier's partial index (`idx_hopparty_marker_null`), never every row.
+pub fn hopparty_relatch_census_sql() -> String {
     use overlay_discovery::hopparty::validity::MARKER_VALID_COLUMN;
     format!(
-        "SELECT COALESCE(SUM(CASE WHEN rowid > ?1 THEN 1 ELSE 0 END), 0) AS remaining, \
-                COALESCE(SUM(CASE WHEN {MARKER_VALID_COLUMN} IS NULL THEN 1 ELSE 0 END), 0) \
-                    AS stillNull \
-         FROM hopparty_records"
+        "SELECT (SELECT COUNT(*) FROM hopparty_records WHERE rowid > ?1) AS remaining, \
+                (SELECT COUNT(*) FROM hopparty_records INDEXED BY idx_hopparty_marker_null \
+                 WHERE {MARKER_VALID_COLUMN} IS NULL) AS stillNull"
     )
 }
 
