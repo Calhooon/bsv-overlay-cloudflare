@@ -650,3 +650,120 @@ fn ns_cost_retired_totals_are_the_counts_and_the_reads_count_nothing() {
         &backfills,
     );
 }
+
+/// The index janitor's backlog before NS-COST-BAR-1.
+const INDEX_JANITOR_BACKLOG_BEFORE: &str = "SELECT lockKind, COUNT(*) AS c FROM pot_records \
+     WHERE spent = 0 AND (createdAt IS NULL OR createdAt <= unixepoch() - 3600) GROUP BY lockKind";
+
+/// The served three figures, folded as `ops::index_janitor_backlog` folds its rows.
+fn backlog_fold(db: &Connection, sql: &str) -> (i64, i64, i64) {
+    let mut stmt = db.prepare(sql).unwrap();
+    let mut out = (0, 0, 0);
+    for row in stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, f64>(1)? as i64))
+        })
+        .unwrap()
+    {
+        let (kind, n) = row.unwrap();
+        match kind.as_deref() {
+            Some("covenant") => out.0 += n.max(0),
+            Some("p2pkh") => out.1 += n.max(0),
+            _ => out.2 += n.max(0),
+        }
+    }
+    out
+}
+
+#[test]
+fn ns_cost_index_janitor_backlog_is_the_old_figure_and_reads_the_hour_alone() {
+    use bsv_overlay_cloudflare::ops::{INDEX_JANITOR_BACKLOG_SQL, UNSPENT_KIND_BACKFILL};
+    let shapes = |db: &Connection| {
+        // Young rows (this hour), an hour old to the second, NULL ages, and the classes' every spelling.
+        db.execute_batch(
+            "UPDATE pot_records SET createdAt = unixepoch() WHERE spent = 0 AND rowid % 7 = 0; \
+             UPDATE pot_records SET createdAt = unixepoch() - 3600 WHERE spent = 0 AND rowid % 11 = 0; \
+             UPDATE pot_records SET createdAt = NULL WHERE spent = 0 AND rowid % 13 = 0; \
+             UPDATE pot_records SET lockKind = 'p2pkh' WHERE spent = 0 AND rowid % 5 = 0; \
+             UPDATE pot_records SET lockKind = NULL WHERE spent = 0 AND rowid % 17 = 0; \
+             UPDATE pot_records SET lockKind = 'Covenant' WHERE spent = 0 AND rowid % 19 = 0;",
+        )
+        .unwrap();
+    };
+    // An EXISTING database: its pots were written before the count's migrations.
+    let at = OVERLAY_MIGRATIONS
+        .iter()
+        .position(|s| s.starts_with("CREATE TABLE IF NOT EXISTS count_pot_unspent_kind"))
+        .unwrap();
+    let db = Connection::open_in_memory().unwrap();
+    migrate(&db, &OVERLAY_MIGRATIONS[..at]);
+    for i in 0..400u32 {
+        db.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, ?2, 1700000000, 'covenant')",
+            rusqlite::params![format!("ad{i:062x}"), i % 3 == 0],
+        )
+        .unwrap();
+    }
+    shapes(&db);
+    let held = backlog_fold(&db, INDEX_JANITOR_BACKLOG_BEFORE);
+    migrate(&db, OVERLAY_MIGRATIONS);
+    assert_eq!(
+        backlog_fold(&db, INDEX_JANITOR_BACKLOG_SQL),
+        held,
+        "the backfill"
+    );
+    assert!(held.0 > 0 && held.1 > 0 && held.2 > 0, "{held:?}");
+    // The fleet fixture.
+    let db = fixture();
+    shapes(&db);
+    let before = backlog_fold(&db, INDEX_JANITOR_BACKLOG_BEFORE);
+    assert!(before.0 > 0 && before.1 > 0 && before.2 > 0, "{before:?}");
+    assert_eq!(
+        backlog_fold(&db, INDEX_JANITOR_BACKLOG_SQL),
+        before,
+        "the fleet fixture"
+    );
+    // A re-run of the list: the stamped backfill scans nothing and the figures hold.
+    let mut stmt = db.prepare(UNSPENT_KIND_BACKFILL).unwrap();
+    stmt.raw_execute().unwrap();
+    assert_eq!(
+        stmt.get_status(rusqlite::StatementStatus::FullscanStep),
+        0,
+        "the stamped backfill scans nothing on a re-run"
+    );
+    assert_eq!(
+        stmt.get_status(rusqlite::StatementStatus::VmStep) < 100,
+        true,
+        "nor steps through the pots"
+    );
+    drop(stmt);
+    migrate(&db, OVERLAY_MIGRATIONS);
+    assert_eq!(
+        backlog_fold(&db, INDEX_JANITOR_BACKLOG_SQL),
+        before,
+        "the re-run"
+    );
+    let details = plan(&db, INDEX_JANITOR_BACKLOG_SQL);
+    println!("backlog plan: {details:?}");
+    assert_no_fleet_scan("backlog", &details);
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("USING COVERING INDEX idx_pot_unspent_created (createdAt>?)")),
+        "the young rows are the hour's index range: {details:?}"
+    );
+    assert!(
+        !details
+            .iter()
+            .any(|d| d.contains("idx_pot_spent_unconfirmed")
+                || d.contains("idx_pot_unspent_recovery")),
+        "never every unspent pot: {details:?}"
+    );
+    assert_no_fleet_scan_analyzed(&db, "backlog", INDEX_JANITOR_BACKLOG_SQL);
+    assert!(
+        plan(&db, INDEX_JANITOR_BACKLOG_SQL)
+            .iter()
+            .any(|d| d.contains("idx_pot_unspent_created")),
+        "the range holds under statistics"
+    );
+}

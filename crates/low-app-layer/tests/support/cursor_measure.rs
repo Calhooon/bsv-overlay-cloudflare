@@ -55,6 +55,8 @@ const SEEN_TOTAL_READ_CEILING: u64 = 5;
 const GC_READ_CEILING: u64 = 1_000;
 /// NS-COST-BAR-1: a trigger-kept count row's read, and a count backfill's SELECT on a re-run.
 const COUNT_ROW_READ_CEILING: u64 = 5;
+/// NS-COST-BAR-1: the backlog read: three count rows and the hour's young pots (none, two hours on).
+const BACKLOG_READ_CEILING: u64 = 10;
 /// NS-COST-BAR-1: the BEFORE shapes are measured beside the AFTER ones (each line prints its reads), under a
 /// ceiling that only says they ran: they are the figures `docs/D1-BUDGETS.md` quotes.
 const BEFORE_SHAPE_CEILING: u64 = 10_000_000;
@@ -67,6 +69,11 @@ const PROOFLESS_WATCH_GC_BEFORE_SELECT: &str = "SELECT txid FROM proofless_watch
      txid IN (SELECT txid FROM transactions WHERE retired_ms IS NOT NULL) OR \
      (txid NOT IN (SELECT txid FROM pot_beefs) AND \
       txid NOT IN (SELECT txid FROM transactions))";
+
+/// The index janitor's backlog before NS-COST-BAR-1.
+const INDEX_JANITOR_BACKLOG_BEFORE_SELECT: &str =
+    "SELECT lockKind, COUNT(*) AS c FROM pot_records \
+     WHERE spent = 0 AND (createdAt IS NULL OR createdAt <= unixepoch() - 3600) GROUP BY lockKind";
 
 /// NS-COST-BAR-1's statements on the fixture: `(name, sql, ceiling)`, the before shapes beside the shipped ones.
 fn ns_cost_statements() -> Vec<(&'static str, String, u64)> {
@@ -111,6 +118,19 @@ fn ns_cost_statements() -> Vec<(&'static str, String, u64)> {
             "NS-COST the expired-unproven total",
             bsv_overlay_cloudflare::proof_window::EXPIRED_COUNT_SQL.to_string(),
             COUNT_ROW_READ_CEILING,
+        ),
+        // The seed stamps every pot this hour, so both backlog shapes are measured as of two hours later (the
+        // hour's young range empty, as on beta, whose 14,313 backlog rows are all older than an hour).
+        (
+            "NS-COST before: the indexJanitor backlog, two hours on",
+            INDEX_JANITOR_BACKLOG_BEFORE_SELECT.replace("unixepoch()", "(unixepoch() + 7200)"),
+            BEFORE_SHAPE_CEILING,
+        ),
+        (
+            "NS-COST the indexJanitor backlog, two hours on",
+            bsv_overlay_cloudflare::ops::INDEX_JANITOR_BACKLOG_SQL
+                .replace("unixepoch()", "(unixepoch() + 7200)"),
+            BACKLOG_READ_CEILING,
         ),
     ];
     // Each count backfill's SELECT on a re-run (the row present): the stamp alone.

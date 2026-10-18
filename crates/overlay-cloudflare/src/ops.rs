@@ -714,19 +714,50 @@ struct KindCountRow {
     c: f64,
 }
 
+/// The class a `pot_records.lockKind` is served under by [`index_janitor_backlog`] (`covenant`, `p2pkh`, every
+/// other value and NULL `other`), as SQL over `{col}`: the one spelling the count's triggers, its backfill and the
+/// read share.
+macro_rules! lock_class {
+    ($col:literal) => {
+        concat!(
+            "CASE ",
+            $col,
+            " WHEN 'covenant' THEN 'covenant' WHEN 'p2pkh' THEN 'p2pkh' ELSE 'other' END"
+        )
+    };
+}
+pub(crate) use lock_class;
+
+/// NS-COST-BAR-1: the index janitor's backlog was a `GROUP BY lockKind` over every unspent `pot_records` row on
+/// every `/health/invariants` read (14,313 rows a read on beta, 5.2 M a day). The backlog is the unspent rows
+/// minus the YOUNG ones (`createdAt` in the last hour, the exact complement of `createdAt IS NULL OR createdAt <=
+/// unixepoch() - 3600` among unspent rows): the unspent rows per class are one row each in
+/// `count_pot_unspent_kind`, kept by `pot_records`' insert, update and delete triggers (no writer of `pot_records`
+/// uses `INSERT OR REPLACE`, #638's rule, so a +1/-1 count is exact), and the young ones an index range over the
+/// last hour (`idx_pot_unspent_created`, partial on `spent = 0`, named by `INDEXED BY`: without statistics the
+/// planner prefers the `spent = ?` equality of `idx_pot_spent_unconfirmed`, every unspent pot). Three rows, one
+/// per class. Before the migrations both the table and the index are absent: the read errs and serves `-1`.
+pub const INDEX_JANITOR_BACKLOG_SQL: &str = concat!(
+    "SELECT k.kind AS lockKind, k.n - COALESCE(y.c, 0) AS c FROM count_pot_unspent_kind k LEFT JOIN (SELECT ",
+    lock_class!("lockKind"),
+    " AS kind, COUNT(*) AS c FROM pot_records INDEXED BY idx_pot_unspent_created WHERE spent = 0 AND createdAt > unixepoch() - 3600 GROUP BY 1) y ON y.kind = k.kind"
+);
+
+/// NS-COST-BAR-1: the class counts' one-time backfill, behind the table's rows in the OUTER derived table.
+pub const UNSPENT_KIND_BACKFILL: &str = concat!(
+    "INSERT OR IGNORE INTO count_pot_unspent_kind (kind, n) SELECT k.kind, (SELECT COUNT(*) FROM pot_records p WHERE p.spent = 0 AND ",
+    lock_class!("p.lockKind"),
+    " = k.kind) FROM (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM count_pot_unspent_kind)) g CROSS JOIN (SELECT 'covenant' AS kind UNION ALL SELECT 'p2pkh' UNION ALL SELECT 'other') k"
+);
+
 /// bsv-low (2026-09-04): the index janitor's live backlog, by row kind —
 /// `spent = 0` rows at least an hour old (the discovery pass's own candidate
 /// rule). `covenant` = real pots (the money), `p2pkh` = `tm_lowfund` hop /
 /// change rows (indexed for the hop's landing proof, never a pot), `other` =
 /// bare / undecoded. -1 = table unreadable (a pre-migration isolate).
 pub async fn index_janitor_backlog(db: &D1Database) -> serde_json::Value {
-    let rows: Result<Vec<KindCountRow>, _> = Query::new(
-        "SELECT lockKind, COUNT(*) AS c FROM pot_records \
-         WHERE spent = 0 AND (createdAt IS NULL OR createdAt <= unixepoch() - 3600) \
-         GROUP BY lockKind",
-    )
-    .fetch_all(db)
-    .await;
+    let rows: Result<Vec<KindCountRow>, _> =
+        Query::new(INDEX_JANITOR_BACKLOG_SQL).fetch_all(db).await;
     match rows {
         Ok(rows) => {
             let (mut covenant, mut p2pkh, mut other) = (0u64, 0u64, 0u64);
@@ -909,6 +940,7 @@ pub const COUNT_ROW_BACKFILLS: &[&str] = &[
     UNPROVABLE_COUNT_BACKFILL,
     RETIRED_SET_BACKFILL,
     RETIRED_COUNT_BACKFILL,
+    UNSPENT_KIND_BACKFILL,
 ];
 
 /// Latch [`NETWORK_SEEN_INSERT_SQL`] for `txid`. Best-effort: the latch only
@@ -1813,6 +1845,163 @@ mod tests {
         conn.pragma_update(None, "recursive_triggers", recursive_triggers)
             .unwrap();
         conn
+    }
+
+    /// NS-COST-BAR-1: the backlog before the count row (`index_janitor_backlog`'s old statement).
+    pub(crate) const INDEX_JANITOR_BACKLOG_BEFORE_SQL: &str =
+        "SELECT lockKind, COUNT(*) AS c FROM pot_records \
+         WHERE spent = 0 AND (createdAt IS NULL OR createdAt <= unixepoch() - 3600) \
+         GROUP BY lockKind";
+
+    /// The three served figures, folded the way [`index_janitor_backlog`] folds its rows.
+    pub(crate) fn ns_cost_backlog_fold(conn: &rusqlite::Connection, sql: &str) -> (i64, i64, i64) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+            })
+            .unwrap();
+        let (mut covenant, mut p2pkh, mut other) = (0, 0, 0);
+        for row in rows {
+            let (kind, n) = row.unwrap();
+            let n = n.max(0);
+            match kind.as_deref() {
+                Some("covenant") => covenant += n,
+                Some("p2pkh") => p2pkh += n,
+                _ => other += n,
+            }
+        }
+        (covenant, p2pkh, other)
+    }
+
+    /// NS-COST-BAR-1: the index janitor's backlog equals the old `GROUP BY` after every SHIPPED `pot_records` writer
+    /// of `spent` or `lockKind` (the #284 upsert's insert and its conflict fill, the four spend marks, both CASes,
+    /// an eviction's delete and restore), its class counts equal a count of the unspent rows, and the hour boundary
+    /// is the old one to the second.
+    #[test]
+    fn ns_cost_unspent_kind_counts_are_exact_under_every_shipped_writer() {
+        use crate::d1_discovery as d;
+        use rusqlite::types::Value;
+        let conn = ns_cost_migrated(false);
+        let check = |what: &str| {
+            let new = ns_cost_backlog_fold(&conn, INDEX_JANITOR_BACKLOG_SQL);
+            assert_eq!(
+                new,
+                ns_cost_backlog_fold(&conn, INDEX_JANITOR_BACKLOG_BEFORE_SQL),
+                "{what}: the served backlog"
+            );
+            let counted = ns_cost_backlog_fold(
+                &conn,
+                "SELECT lockKind, COUNT(*) FROM pot_records WHERE spent = 0 GROUP BY lockKind",
+            );
+            let held = ns_cost_backlog_fold(&conn, "SELECT kind, n FROM count_pot_unspent_kind");
+            assert_eq!(held, counted, "{what}: the class counts");
+            new
+        };
+        let store = |txid: &str, spent: i64, created: Value, kind: Value| {
+            let mut binds = vec![Value::Null; 19];
+            binds[0] = Value::Text(txid.into());
+            binds[1] = Value::Integer(0);
+            binds[2] = Value::Integer(spent);
+            binds[4] = Value::Integer(0);
+            binds[5] = created;
+            binds[6] = kind;
+            binds[18] = Value::Integer(0);
+            conn.execute(d::store_record_sql(), rusqlite::params_from_iter(binds))
+                .unwrap();
+        };
+        let at_end = |sql: &str, txid: &str| {
+            let n = conn.prepare(sql).unwrap().parameter_count();
+            let mut binds = vec![Value::Null; n - 2];
+            binds.push(Value::Text(txid.into()));
+            binds.push(Value::Integer(0));
+            conn.execute(sql, rusqlite::params_from_iter(binds))
+                .unwrap();
+        };
+        // The two CASes end in `RETURNING`: stepped to their end.
+        let returning = |sql: &str, binds: &[&dyn rusqlite::ToSql]| {
+            conn.prepare(sql)
+                .unwrap()
+                .query_map(binds, |_| Ok(()))
+                .unwrap()
+                .for_each(|r| r.unwrap());
+        };
+        let old = Value::Integer(1_700_000_000);
+        let t = |s: &str| Value::Text(s.into());
+        assert_eq!(check("empty"), (0, 0, 0));
+        store("c1", 0, old.clone(), t("covenant"));
+        store("c2", 0, Value::Null, t("covenant"));
+        store("p1", 0, old.clone(), t("p2pkh"));
+        store("o1", 0, old.clone(), Value::Null);
+        store("o2", 0, old.clone(), t("bare"));
+        store("s1", 1, old.clone(), t("covenant"));
+        assert_eq!(check("the #284 upsert's inserts"), (2, 1, 2));
+        store("o1", 0, old.clone(), t("covenant"));
+        assert_eq!(check("the conflict fill decodes o1"), (3, 1, 1));
+        store("o1", 0, old.clone(), t("p2pkh"));
+        assert_eq!(check("stored-wins: o1 stays covenant"), (3, 1, 1));
+        for (i, (confirmed, verdict)) in
+            [(true, true), (true, false), (false, true), (false, false)]
+                .into_iter()
+                .enumerate()
+        {
+            let txid = ["c1", "c2", "p1", "o2"][i];
+            at_end(d::mark_spent_sql(confirmed, verdict), txid);
+        }
+        assert_eq!(check("the four spend marks"), (1, 0, 0));
+        returning(
+            d::confirm_spend_cas_sql(),
+            rusqlite::params![Option::<i64>::None, "o1", 0i64, Option::<String>::None],
+        );
+        assert_eq!(check("a confirm CAS that misses"), (1, 0, 0));
+        store("y1", 0, Value::Null, t("p2pkh"));
+        conn.execute(
+            "UPDATE pot_records SET createdAt = unixepoch() WHERE txid = 'y1'",
+            [],
+        )
+        .unwrap();
+        store("y2", 0, Value::Null, t("covenant"));
+        conn.execute(
+            "UPDATE pot_records SET createdAt = unixepoch() - 3600 WHERE txid = 'y2'",
+            [],
+        )
+        .unwrap();
+        store("y3", 0, Value::Null, Value::Null);
+        conn.execute(
+            "UPDATE pot_records SET createdAt = unixepoch() - 3599 WHERE txid = 'y3'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            check("a young row is not backlog; the hour's edge is the old one"),
+            (2, 0, 0)
+        );
+        conn.execute("DELETE FROM pot_records WHERE txid = 'o1'", [])
+            .unwrap();
+        assert_eq!(check("the eviction's delete"), (1, 0, 0));
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT OR IGNORE INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES ('o1', 0, 0, 5, 'covenant')",
+                [],
+            )
+            .unwrap();
+            assert_eq!(check("the restore, twice"), (2, 0, 0));
+        }
+        returning(
+            d::displace_spend_cas_sql(),
+            rusqlite::params!["s9", 1i64, 1i64, "o1", 0i64, "nobody"],
+        );
+        assert_eq!(check("a displace CAS that misses"), (2, 0, 0));
+        conn.execute(
+            "UPDATE pot_records SET spendingTxid = 'x' WHERE txid = 'o1'",
+            [],
+        )
+        .unwrap();
+        returning(
+            d::displace_spend_cas_sql(),
+            rusqlite::params!["s9", 1i64, 1i64, "o1", 0i64, "x"],
+        );
+        assert_eq!(check("a displace CAS that lands"), (1, 0, 0));
     }
 
     /// NS-COST-BAR-1: `txRetiredTotal` and the expired-unproven total equal their `COUNT(*)`s after every SHIPPED

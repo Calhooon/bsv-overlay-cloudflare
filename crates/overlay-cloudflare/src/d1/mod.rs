@@ -585,7 +585,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 263 to 267 for bsv-low #645 (W1.6): `count_network_seen`, its two triggers and its stamped backfill.
 /// 267 to 276 for NS-COST-BAR-1: `pot_beefs_unprovable_set`, `count_pot_beefs_unprovable`, five triggers, two backfills.
 /// 276 to 285 for NS-COST-BAR-1: `transactions_retired_set`, `count_transactions_retired`, five triggers, two backfills.
-pub const OVERLAY_MIGRATION_COUNT: usize = 285;
+/// 285 to 291 for NS-COST-BAR-1: `count_pot_unspent_kind`, three triggers, `idx_pot_unspent_created`, its backfill.
+pub const OVERLAY_MIGRATION_COUNT: usize = 291;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2097,6 +2098,35 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE TRIGGER IF NOT EXISTS transactions_retired_delete AFTER DELETE ON transactions BEGIN DELETE FROM transactions_retired_set WHERE txid = OLD.txid; END",
     crate::ops::RETIRED_SET_BACKFILL,
     crate::ops::RETIRED_COUNT_BACKFILL,
+    // 286-291: NS-COST-BAR-1, the index janitor's backlog (`ops::index_janitor_backlog`) grouped every unspent
+    // `pot_records` row on every `/health/invariants` read (5.2 M rows a day on beta). The unspent rows per lock
+    // class are one row each, kept by the three triggers (no `pot_records` writer may `INSERT OR REPLACE`, #638),
+    // and the hour's young rows an index range (`idx_pot_unspent_created`); the read is their difference.
+    // Backfilled once behind the table's rows, the guard in the OUTER derived table.
+    "CREATE TABLE IF NOT EXISTS count_pot_unspent_kind (kind TEXT PRIMARY KEY NOT NULL, n INTEGER NOT NULL)",
+    concat!(
+        "CREATE TRIGGER IF NOT EXISTS count_pot_unspent_insert AFTER INSERT ON pot_records WHEN NEW.spent = 0 BEGIN UPDATE count_pot_unspent_kind SET n = n + 1 WHERE kind = ",
+        crate::ops::lock_class!("NEW.lockKind"),
+        "; END"
+    ),
+    concat!(
+        "CREATE TRIGGER IF NOT EXISTS count_pot_unspent_delete AFTER DELETE ON pot_records WHEN OLD.spent = 0 BEGIN UPDATE count_pot_unspent_kind SET n = n - 1 WHERE kind = ",
+        crate::ops::lock_class!("OLD.lockKind"),
+        "; END"
+    ),
+    concat!(
+        "CREATE TRIGGER IF NOT EXISTS count_pot_unspent_update AFTER UPDATE OF spent, lockKind ON pot_records WHEN (OLD.spent = 0) IS NOT (NEW.spent = 0) OR ",
+        crate::ops::lock_class!("OLD.lockKind"),
+        " IS NOT ",
+        crate::ops::lock_class!("NEW.lockKind"),
+        " BEGIN UPDATE count_pot_unspent_kind SET n = n - 1 WHERE OLD.spent = 0 AND kind = ",
+        crate::ops::lock_class!("OLD.lockKind"),
+        "; UPDATE count_pot_unspent_kind SET n = n + 1 WHERE NEW.spent = 0 AND kind = ",
+        crate::ops::lock_class!("NEW.lockKind"),
+        "; END"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_pot_unspent_created ON pot_records(createdAt, lockKind) WHERE spent = 0",
+    crate::ops::UNSPENT_KIND_BACKFILL,
 ];
 
 // =============================================================================
@@ -2769,6 +2799,7 @@ mod tests {
                         crate::ops::UNPROVABLE_COUNT_BACKFILL,
                         crate::ops::RETIRED_SET_BACKFILL,
                         crate::ops::RETIRED_COUNT_BACKFILL,
+                        crate::ops::UNSPENT_KIND_BACKFILL,
                     ]
                     .contains(sql)
             })
