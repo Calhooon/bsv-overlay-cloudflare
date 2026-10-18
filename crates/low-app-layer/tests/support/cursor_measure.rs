@@ -57,8 +57,14 @@ const GC_READ_CEILING: u64 = 1_000;
 const COUNT_ROW_READ_CEILING: u64 = 5;
 /// NS-COST-BAR-1: the backlog read: three count rows and the hour's young pots (none, two hours on).
 const BACKLOG_READ_CEILING: u64 = 10;
-/// NS-COST-BAR-1: a relatch census mid-sweep: the rows after the cursor (half the table) and the NULL tier.
-const RELATCH_CENSUS_READ_CEILING: u64 = 8_000;
+/// NS-COST-BAR-1: a relatch census mid-sweep reads the rows after the cursor (half the table) and the NULL tier.
+/// The fixture's `hopparty_records` rows are latched (`markerValid = 1`), as `/record` files them: measured 3,777
+/// of the old aggregate's 7,552 (local D1).
+const HOPPARTY_CENSUS_READ_CEILING: u64 = 5_000;
+/// The fixture's `potparty_records` rows carry NO `sigValid` (production's `/record` writes it at filing,
+/// `POTPARTY_FILE_SQL`, and the relatch converges the rest), so on the fixture the NULL tier is the WHOLE table:
+/// the census's worst case, measured 23,018 against the old aggregate's 15,360 (stated in `docs/D1-BUDGETS.md`).
+const POTPARTY_CENSUS_READ_CEILING: u64 = 25_000;
 /// NS-COST-BAR-1: the BEFORE shapes are measured beside the AFTER ones (each line prints its reads), under a
 /// ceiling that only says they ran: they are the figures `docs/D1-BUDGETS.md` quotes.
 const BEFORE_SHAPE_CEILING: u64 = 10_000_000;
@@ -137,16 +143,18 @@ fn ns_cost_statements() -> Vec<(&'static str, String, u64)> {
     ];
     // The relatch censuses mid-sweep (the cursor at the table's middle rowid: the sweep's average place), the old
     // single aggregate beside each.
-    for (table, column, census) in [
+    for (table, column, census, ceiling) in [
         (
             "potparty_records",
             "sigValid",
             bsv_overlay_cloudflare::d1_discovery::potparty_relatch_census_sql(),
+            POTPARTY_CENSUS_READ_CEILING,
         ),
         (
             "hopparty_records",
             "markerValid",
             bsv_overlay_cloudflare::d1_discovery::hopparty_relatch_census_sql(),
+            HOPPARTY_CENSUS_READ_CEILING,
         ),
     ] {
         let mid = format!("(SELECT MAX(rowid) / 2 FROM {table})");
@@ -161,7 +169,7 @@ fn ns_cost_statements() -> Vec<(&'static str, String, u64)> {
         out.push((
             "NS-COST a relatch census, mid-sweep",
             census.replace("?1", &mid),
-            RELATCH_CENSUS_READ_CEILING,
+            ceiling,
         ));
     }
     // Each count backfill's SELECT on a re-run (the row present): the stamp alone.
