@@ -216,7 +216,9 @@ pub fn outpoint_ids(value: &Value) -> Vec<String> {
 /// - `fundingWord`: the tracker's tuple `{word, tier, height, verifyPath, ...}` for the entry's own creating txid (the
 ///   design's `networkSeen` successor; `unknown` with no row);
 /// - `lock`: the coin word of the outpoint, `{word, txid, tier, height, verifyPath}`: `spent` when the recorded
-///   spender's word is a CHECKED `mined` (its verify path served), `suspended` when that word is `stale`, `locked`
+///   spender's word is a CHECKED `mined` (its verify path served) or the index has PROVEN the spend
+///   ([`index_proven_spend`]: tier `chain`, `verifiedBy` naming the proof, a null path, the index's proof read
+///   first so no tracker word vetoes it), `suspended` when that word is `stale`, `locked`
 ///   for any other pointer (a recorded spender the chain has not confirmed), `unspent` for a known outpoint with no
 ///   spender (`unspent_word`: the index's `free` on `/utxo-status`, the couriers' `unspentAsFarAsAsked` on
 ///   `/spent-any`, with `unspent_tier`), and `unknown` where the route could not say. `lost(c)` needs an intended
@@ -246,14 +248,15 @@ pub fn decorate_outpoints(
         let lock = match (&entry["known"], &entry["spent"], spender) {
             (Value::Bool(true), Value::Bool(true), Some(s)) => {
                 let w = word_of(&s);
-                let coin = if w["word"] == "mined" && !w["verifyPath"].is_null() {
-                    "spent"
+                if w["word"] == "mined" && !w["verifyPath"].is_null() {
+                    crate::owed::coin_word_value("spent", &s, &w)
+                } else if let Some(by) = index_proven_spend(entry) {
+                    json!({"word":"spent","txid":s,"tier":"chain","height":null,"verifyPath":null,"verifiedBy":by})
                 } else if w["word"] == "stale" {
-                    "suspended"
+                    crate::owed::coin_word_value("suspended", &s, &w)
                 } else {
-                    "locked"
-                };
-                crate::owed::coin_word_value(coin, &s, &w)
+                    crate::owed::coin_word_value("locked", &s, &w)
+                }
             }
             (Value::Bool(true), Value::Bool(false), _) => {
                 json!({"word":unspent_word,"txid":null,"tier":unspent_tier,"height":null,"verifyPath":null})
@@ -266,6 +269,26 @@ pub fn decorate_outpoints(
             obj.insert("fundingWord".into(), funding);
             obj.insert("lock".into(), lock);
         }
+    }
+}
+
+/// The W2-WORDS lens's MEDIUM-1 (NS-3: the index's verified proof decides first): the checked proof an outpoint
+/// entry's `spentConfirmed: true` rests on, named as `spentConfirmedSource` names it, or `None` when it rests on none.
+/// `/utxo-status` serves no source: its `spentConfirmed` is `pot_records.spentConfirmed`, latched only when the
+/// overlay SPV-verified the spend's bump (`index-proof`). `/spent-any` names its source: a checked proof
+/// (`index-proof`, `tracker-mined`, `txany-proof`) counts; `courier` (WoC's status) and `null` do not.
+fn index_proven_spend(entry: &Value) -> Option<&'static str> {
+    use crate::results::{
+        SPENT_CONFIRMED_SOURCE_INDEX_PROOF as INDEX,
+        SPENT_CONFIRMED_SOURCE_TRACKER_MINED as TRACKER,
+        SPENT_CONFIRMED_SOURCE_TXANY_PROOF as TXANY,
+    };
+    if entry["spentConfirmed"] != true {
+        return None;
+    }
+    match entry.get("spentConfirmedSource") {
+        None => Some(INDEX),
+        Some(src) => [INDEX, TRACKER, TXANY].into_iter().find(|p| src == *p),
     }
 }
 

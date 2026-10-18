@@ -268,3 +268,68 @@ fn l1_routes_wire_the_outpoint_words() {
         "the owed read rebuilds coinWord without its tuple"
     );
 }
+
+/// The W2-WORDS lens's MEDIUM-1: an entry whose spend the INDEX has proven (`/utxo-status`'s `spentConfirmed`, the
+/// overlay's SPV latch; `/spent-any`'s `spentConfirmedSource` naming a checked proof) serves `lock: spent` at tier
+/// `chain` even when the spender has no checked word yet, never `locked` beside its own `spentConfirmed: true`. A
+/// checked tracker word keeps its own tuple; a courier's bare `spentConfirmed` is no proof and stays `locked`.
+#[test]
+fn l1_lock_is_spent_when_the_index_has_proven_the_spend() {
+    let proven = |spender: &str| {
+        let mut s = status(&tx(1), Some(true), Some(spender));
+        s.spent_confirmed = Some(true);
+        s
+    };
+    // tx(2) seen, tx(4) stale, tx(7) no row, tx(3) checked mined at 11
+    let entries = [
+        proven(&tx(7)),
+        proven(&tx(2)),
+        proven(&tx(4)),
+        proven(&tx(3)),
+    ];
+    let v = views();
+    let utxo = logic::utxo_status_body(&entries);
+    let spent_any_index = txany::spent_any_body_sourced(
+        &entries,
+        &[false; 4],
+        &[
+            Some("index-proof"),
+            Some("txany-proof"),
+            Some("index-proof"),
+            Some("tracker-mined"),
+        ],
+    );
+    for (route, raw, unspent, tier) in [
+        ("/utxo-status", utxo, "free", "host"),
+        ("/spent-any", spent_any_index, "unspentAsFarAsAsked", "hint"),
+    ] {
+        let mut after: Value = serde_json::from_str(&raw).unwrap();
+        runtime::decorate_outpoints(&mut after, &v, unspent, tier);
+        let rows = after.as_array().unwrap();
+        for (i, spender) in [(0, tx(7)), (1, tx(2)), (2, tx(4))] {
+            let lock = &rows[i]["lock"];
+            assert_eq!(rows[i]["spentConfirmed"], true, "{route} row {i}");
+            assert_eq!(lock["word"], "spent", "{route} row {i}: {lock}");
+            assert_eq!(lock["tier"], "chain", "{route} row {i}: {lock}");
+            assert_eq!(lock["txid"], spender, "{route} row {i}");
+            assert!(lock["verifyPath"].is_null(), "{route} row {i}: {lock}");
+            assert!(lock["verifiedBy"].is_string(), "{route} row {i}: {lock}");
+            assert_tuple(lock, &format!("{route} row {i}"));
+        }
+        assert_eq!(
+            rows[0]["lock"]["verifiedBy"], "index-proof",
+            "{route}: the index's proof named"
+        );
+        // a checked tracker word serves its own tuple, its path included
+        assert_eq!(rows[3]["lock"]["word"], "spent", "{route}");
+        assert_eq!(rows[3]["lock"]["height"], 11, "{route}");
+        assert!(!rows[3]["lock"]["verifyPath"].is_null(), "{route}");
+        assert!(rows[3]["lock"].get("verifiedBy").is_none(), "{route}");
+    }
+    // a courier's `spentConfirmed: true` (WoC's status) is no checked proof: `locked`
+    let courier = txany::spent_any_body_sourced(&entries[..1], &[false], &[Some("courier")]);
+    let mut after: Value = serde_json::from_str(&courier).unwrap();
+    runtime::decorate_outpoints(&mut after, &v, "unspentAsFarAsAsked", "hint");
+    assert_eq!(after[0]["spentConfirmed"], true);
+    assert_eq!(after[0]["lock"]["word"], "locked", "{}", after[0]["lock"]);
+}
