@@ -122,7 +122,8 @@ id = "__LOW_APPLAYER_DEFAULT_KV_AUTH_SESSIONS_ID__"  # injected at deploy time f
 #   WRITES INSERT potparty_records; INSERT, UPDATE potrefund_records;
 #     INSERT hopsweep_records, result_markers_v2, collected_markers_v2,
 #     proof_posts, lb_marker_rows, tx_any_verdicts, hop_chain_probes,
-#     ops_counters; INSERT, DELETE owed_rows; INSERT, UPDATE owed_state
+#     ops_counters; INSERT, DELETE owed_rows; INSERT, UPDATE owed_state;
+#     UPDATE board_era (#674, the cutoff: the scheduled pass's stamp)
 #   CATCH-UP DDL (schema.rs, each byte-identical to an overlay migration):
 #     ALTER pot_records, potparty_records, hopparty_records,
 #     result_markers_v2, hand_markers, collected_markers_v2, owed_state

@@ -420,13 +420,15 @@ ci-route: ci-d1-budget ci-d1-board
 # bsv-low #674: the requests are the SHIPPED dispatcher's (the board tables' read; the seed carries the total's row and
 # the `board-v1` stamp, and its INSERTs fire the triggers on local D1); #642's candidate read is recorded beside it.
 # bsv-low #674 fold (MEDIUM-1): the default page reads the same rows on both boards (`flat.json` carries the first).
+# bsv-low #674, the cutoff: each board again under an era cutoff (`w1500cut`, `w3000cut`), the seed's last statement the
+# stamp, so the re-derivation runs on local D1 and the requests are the table read under the cutoff (flat between them).
 ci-d1-board:
 	@set -e; \
 	dir=$$(mktemp -d "$${TMPDIR:-/tmp}/lane642-board.XXXXXX"); \
 	trap 'rm -rf "$$dir"' EXIT; \
 	LB642_D1_PIN="$$dir" cargo test -q $(WORKERS) -p low-app-layer --lib lb642_emit_the_d1_cell -- --ignored > "$$dir/emit.log" 2>&1 \
 	  || { echo "✗ ci-d1-board: the emit failed"; cat "$$dir/emit.log"; exit 1; }; \
-	for w in w1500 w3000; do \
+	for w in w1500 w3000 w1500cut w3000cut; do \
 	  python3 scripts/d1-load-chunked.py crates/low-app-layer low-overlay-db "$$dir/$$w/d1" "$$dir/$$w/seed.sql" > "$$dir/$$w/seed.log" 2>&1 \
 	    || { echo "✗ ci-d1-board: the $$w seed did not load"; cat "$$dir/$$w/seed.log"; exit 1; }; \
 	  node tools/lane-642/board_pin.mjs "$$dir/$$w/expected.json" "$$dir/$$w/d1" "$$dir/flat.json"; \
