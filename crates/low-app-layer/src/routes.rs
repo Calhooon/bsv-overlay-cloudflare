@@ -332,7 +332,7 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
         attach_evictions(&mut entries, &ledger);
     }
     json_response(
-        crate::tracker_host::runtime::body(&ctx.env, &utxo_status_body(&entries), None).await?,
+        crate::tracker_host::runtime::outpoint_body(&ctx.env, &utxo_status_body(&entries)).await?,
         200,
     )
 }
@@ -8855,10 +8855,14 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             write_probe_memos(&db, &fresh).await;
         }
     }
-    // Look up the served pointer, including a freshly probed replacement.
+    // Look up the served pointer, including a freshly probed replacement, and (bsv-low #617) each entry's own
+    // creating txid for its `fundingWord`.
     let ids: Vec<_> = entries
         .iter()
         .filter_map(|entry| entry.spending_txid.clone())
+        .chain(entries.iter().map(|entry| entry.txid.to_ascii_lowercase()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect();
     let stored_words = crate::tracker_host::runtime::read_soft(&ctx.env, &ids).await?;
     let views = match stored_words {
@@ -8896,9 +8900,18 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         e.spent_confirmed = confirmed;
         sources.push(source);
     }
-    let value = serde_json::from_str(&crate::txany::spent_any_body_sourced(
+    let mut value = serde_json::from_str(&crate::txany::spent_any_body_sourced(
         &entries, &terminals, &sources,
     ))?;
+    // bsv-low #617: each entry's `fundingWord` and `lock` (a courier's clean negative is `unspentAsFarAsAsked`).
+    if let Some(views) = views.as_ref() {
+        crate::tracker_host::runtime::decorate_outpoints(
+            &mut value,
+            views,
+            "unspentAsFarAsAsked",
+            "hint",
+        );
+    }
     // Read-only decoration; missing words remain unknown until the scheduled pass.
     json_response(
         crate::tracker_host::runtime::decorate_lookup(value, None, views.as_ref()),

@@ -2265,7 +2265,18 @@ pub fn spender_coin_word(word: &Value, txid: &str, intended: Option<&str>) -> Va
     } else {
         "pending"
     };
-    json!({"word":coin,"txid":txid,"height":word["height"]})
+    coin_word_value(coin, txid, word)
+}
+/// bsv-low #617 (L1): one coin word as served, the tuple `{word, tier, height, verifyPath}` beside the spender's
+/// `txid`. The tier and the height are the spender word's own; the verify path is served only on a coin the
+/// spender's CHECKED mined word spent (`spent`, `lost`), so a client re-verifies exactly what made the coin spent.
+pub fn coin_word_value(coin: &str, txid: &str, word: &Value) -> Value {
+    let verify = if matches!(coin, "spent" | "lost") {
+        word["verifyPath"].clone()
+    } else {
+        Value::Null
+    };
+    json!({"word":coin,"txid":txid,"height":word["height"],"tier":word["tier"],"verifyPath":verify})
 }
 fn owed_words(i: &OwedInputs, facts: &mut Value, txid: Option<&str>, intended: Option<&str>) {
     if let (Some(words), Some(id)) = (i.spender_words, txid) {

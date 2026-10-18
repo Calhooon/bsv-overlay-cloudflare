@@ -5,14 +5,14 @@
     "utxo-status-8": {
       "route": "/utxo-status?outpoints=<A's 8 pots>",
       "measured": {
-        "reads": 16,
-        "writes": 0,
-        "stmts": 2
-      },
-      "ceiling": {
         "reads": 24,
         "writes": 0,
-        "stmts": 4
+        "stmts": 3
+      },
+      "ceiling": {
+        "reads": 36,
+        "writes": 0,
+        "stmts": 5
       },
       "censusKey": "/utxo-status"
     },
@@ -92,13 +92,13 @@
     "spent-any-20": {
       "route": "/spent-any?outpoints=<20 outpoints>: twenty fresh probe memos naming twenty of the fleet's proven transactions as spenders, no confirmed word, so every row is a known spend and the one index-proof read (hopsweep::sweep_proofs_sql, a PK seek, 20 spenders) confirms each (bsv-low #723)",
       "measured": {
-        "reads": 120,
+        "reads": 140,
         "writes": 0,
         "stmts": 5,
         "maxReads": 40
       },
       "ceiling": {
-        "reads": 180,
+        "reads": 210,
         "writes": 0,
         "stmts": 7,
         "maxReads": 60
