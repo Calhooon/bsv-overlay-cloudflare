@@ -36,7 +36,7 @@ The resolver (`workers/low-identity-resolver`, lane M29-3a) reads the D1. What i
 
 ## The tables of `low-overlay-db`
 
-60 rows: 52 owned by `overlay-cloudflare`, 8 by `low-app-layer` (`hopsweep_records`, `proof_posts`, `owed_rows`, `owed_state`, `owed_spender_bytes`, `hop_chain_probes`, `pot_announce_parked`, `pot_announce_seq`). 23 are never-wipe: the money tables and filings (`pot_records`, `potparty_records`, `potrefund_records`, `hopsweep_records`, `hopparty_records`, `result_markers_v2`, `collected_markers_v2`, `proof_posts`), the eviction ledger (`pot_evictions` and its 11 `_evicted` twins), the dead v1 `collected_markers` (the copy source of v2) `banned_hosts` (the operator's word, held nowhere else) and `mutation_dead_letters` (the parked dead letters, #576: the only copy once the DLQ acks).
+62 rows: 54 owned by `overlay-cloudflare`, 8 by `low-app-layer` (`hopsweep_records`, `proof_posts`, `owed_rows`, `owed_state`, `owed_spender_bytes`, `hop_chain_probes`, `pot_announce_parked`, `pot_announce_seq`). 23 are never-wipe: the money tables and filings (`pot_records`, `potparty_records`, `potrefund_records`, `hopsweep_records`, `hopparty_records`, `result_markers_v2`, `collected_markers_v2`, `proof_posts`), the eviction ledger (`pot_evictions` and its 11 `_evicted` twins), the dead v1 `collected_markers` (the copy source of v2) `banned_hosts` (the operator's word, held nowhere else) and `mutation_dead_letters` (the parked dead letters, #576: the only copy once the DLQ acks).
 
 The filed rows of `potparty_records`, `potrefund_records`, `result_markers_v2`, `collected_markers_v2` and `lb_marker_rows` are written today only by the app layer's `/record` (`crates/low-app-layer/src/record_post.rs`); the overlay is still named their owner, as it holds the schema and its topic managers wrote the old era's rows.
 
@@ -217,4 +217,6 @@ A new table: its CREATE in `OVERLAY_MIGRATIONS`, its row in `storage-ownership.j
 | `pot_hop_seats` | overlay-cloudflare | derived | no | App-layer outpoint lookup, source-write triggers. |
 | `view_derivation_state` | overlay-cloudflare | derived | no | Guarded one-time legacy backfill. |
 | `count_network_seen` | overlay-cloudflare | derived | no | bsv-low #645: one row, the count of `network_seen` kept by its insert and delete triggers; guarded one-time backfill. |
+| `pot_beefs_unprovable_set` | overlay-cloudflare | derived | no | NS-COST-BAR-1: the txids of the latched `structurally_unprovable = 1` rows, kept by `pot_beefs`' triggers (idempotent under `INSERT OR REPLACE`); wiped only with its count row. |
+| `count_pot_beefs_unprovable` | overlay-cloudflare | derived | no | NS-COST-BAR-1: one row, the count of `pot_beefs_unprovable_set` kept by its insert and delete triggers; guarded one-time backfill. |
 | `tracker_backfill` | low-app-layer | re-askable | Bounded, resumed proof-only deploy cursor; a lost cursor restarts the pass. |

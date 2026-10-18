@@ -520,3 +520,94 @@ fn ns_cost_gc_deletes_the_old_rows_and_probes_the_stores_by_key() {
     );
     assert_no_fleet_scan_analyzed(&db, "gc", PROOFLESS_WATCH_GC_SQL);
 }
+
+/// NS-COST-BAR-1: one trigger-kept count row, served instead of a `COUNT(*)`. Proves on an EXISTING database (rows
+/// written before the count's migrations, by `seed_old`) and on the fleet fixture that the served value is the
+/// count, that a re-run of the whole list scans nothing at the backfills (`backfills`, by prefix), and that the read
+/// is the row's key alone.
+fn assert_count_row(
+    what: &str,
+    served_sql: &str,
+    count_sql: &str,
+    first_new: &str,
+    seed_old: &dyn Fn(&Connection),
+    backfills: &[&str],
+) {
+    let read = |db: &Connection, sql: &str| -> i64 {
+        db.query_row(sql, [], |r| r.get::<_, f64>(0).map(|v| v as i64))
+            .unwrap()
+    };
+    let at = OVERLAY_MIGRATIONS
+        .iter()
+        .position(|s| s.starts_with(first_new))
+        .unwrap_or_else(|| panic!("{what}: {first_new}"));
+    let db = Connection::open_in_memory().unwrap();
+    migrate(&db, &OVERLAY_MIGRATIONS[..at]);
+    seed_old(&db);
+    let held = read(&db, count_sql);
+    assert!(held > 0, "{what}: the old rows hold some");
+    migrate(&db, OVERLAY_MIGRATIONS);
+    assert_eq!(
+        (read(&db, served_sql), read(&db, count_sql)),
+        (held, held),
+        "{what}: the backfill counts what was held"
+    );
+    let db = fixture();
+    let n = read(&db, count_sql);
+    assert!(n > 0, "{what}: the fixture holds some");
+    assert_eq!(read(&db, served_sql), n, "{what}: the fixture");
+    let mut replays = Vec::new();
+    for sql in OVERLAY_MIGRATIONS {
+        let Ok(mut stmt) = db.prepare(sql) else {
+            replays.push(0);
+            continue;
+        };
+        let _ = stmt.raw_execute();
+        replays.push(stmt.get_status(rusqlite::StatementStatus::FullscanStep));
+    }
+    assert_eq!(
+        read(&db, served_sql),
+        n,
+        "{what}: the re-run keeps the count"
+    );
+    for prefix in backfills {
+        let i = OVERLAY_MIGRATIONS
+            .iter()
+            .position(|s| s.starts_with(prefix))
+            .unwrap_or_else(|| panic!("{what}: the backfill {prefix} ships"));
+        assert!(i > at, "{what}: {prefix} after the triggers");
+        assert_eq!(replays[i], 0, "{what}: {prefix} scans nothing on a re-run");
+    }
+    let details = plan(&db, served_sql);
+    println!("{what} plan: {details:?}");
+    assert_eq!(details.len(), 1, "{what}: one step: {details:?}");
+    assert!(
+        details[0].starts_with("SEARCH count_")
+            && details[0].ends_with("USING INTEGER PRIMARY KEY (rowid=?)"),
+        "{what}: the read is the one row: {details:?}"
+    );
+    assert_no_fleet_scan(what, &details);
+}
+
+#[test]
+fn ns_cost_unprovable_total_is_the_count_and_the_read_counts_nothing() {
+    assert_count_row(
+        "retiredUnprovableTotal",
+        bsv_overlay_cloudflare::ops::RETIRED_UNPROVABLE_TOTAL_SQL,
+        "SELECT COUNT(*) FROM pot_beefs WHERE structurally_unprovable = 1",
+        "CREATE TABLE IF NOT EXISTS pot_beefs_unprovable_set",
+        &|db| {
+            for i in 0..300u32 {
+                db.execute(
+                    "INSERT INTO pot_beefs (txid, beef, has_proof, structurally_unprovable) VALUES (?1, x'00', 0, ?2)",
+                    rusqlite::params![format!("ab{i:062x}"), [Some(1), Some(0), None][i as usize % 3]],
+                )
+                .unwrap();
+            }
+        },
+        &[
+            "INSERT OR IGNORE INTO pot_beefs_unprovable_set",
+            "INSERT OR IGNORE INTO count_pot_beefs_unprovable",
+        ],
+    );
+}

@@ -583,7 +583,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 260 to 262 for bsv-low #644 (W1.6): the two backfill passes' partial candidate indexes on `pot_records`.
 /// 262 to 263 for bsv-low #643 (W1.6): the tip mark's (spent, recoveryHeight) index.
 /// 263 to 267 for bsv-low #645 (W1.6): `count_network_seen`, its two triggers and its stamped backfill.
-pub const OVERLAY_MIGRATION_COUNT: usize = 267;
+/// 267 to 276 for NS-COST-BAR-1: `pot_beefs_unprovable_set`, `count_pot_beefs_unprovable`, five triggers, two backfills.
+pub const OVERLAY_MIGRATION_COUNT: usize = 276;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2062,6 +2063,24 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE TRIGGER IF NOT EXISTS count_network_seen_insert AFTER INSERT ON network_seen BEGIN UPDATE count_network_seen SET n = n + 1 WHERE id = 1; END",
     "CREATE TRIGGER IF NOT EXISTS count_network_seen_delete AFTER DELETE ON network_seen BEGIN UPDATE count_network_seen SET n = n - 1 WHERE id = 1; END",
     crate::ops::NETWORK_SEEN_COUNT_BACKFILL,
+    // 268-276: NS-COST-BAR-1 (the owner's cost word of 2026-10-18), `/health/invariants.retiredUnprovableTotal`
+    // was a `COUNT(*)` of `pot_beefs` on every read (10.4 M rows a day on beta). `pot_beefs` is written by
+    // `INSERT OR REPLACE`, whose implicit delete fires no delete trigger unless `recursive_triggers` is on, so the
+    // source triggers keep a MEMBERSHIP set (delete the key, then insert it while the row is latched: right
+    // whether or not the REPLACE fired the delete trigger), and the count is kept by the set's own two triggers
+    // (the set is written by nothing else). The update trigger fires only when the key or the latch's truth moves.
+    // Backfilled once behind the count's row, the set first, both guards in the OUTER derived table (#638's rule).
+    // Derived: a lost count row recounts the set at the next version's run; set and row are wiped together or not
+    // at all (`storage-ownership.json`).
+    "CREATE TABLE IF NOT EXISTS pot_beefs_unprovable_set (txid TEXT PRIMARY KEY NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS count_pot_beefs_unprovable (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS pot_beefs_unprovable_set_insert AFTER INSERT ON pot_beefs_unprovable_set BEGIN UPDATE count_pot_beefs_unprovable SET n = n + 1 WHERE id = 1; END",
+    "CREATE TRIGGER IF NOT EXISTS pot_beefs_unprovable_set_delete AFTER DELETE ON pot_beefs_unprovable_set BEGIN UPDATE count_pot_beefs_unprovable SET n = n - 1 WHERE id = 1; END",
+    "CREATE TRIGGER IF NOT EXISTS pot_beefs_unprovable_insert AFTER INSERT ON pot_beefs BEGIN DELETE FROM pot_beefs_unprovable_set WHERE txid = NEW.txid; INSERT INTO pot_beefs_unprovable_set (txid) SELECT NEW.txid WHERE NEW.structurally_unprovable = 1 AND NEW.txid IS NOT NULL; END",
+    "CREATE TRIGGER IF NOT EXISTS pot_beefs_unprovable_update AFTER UPDATE OF txid, structurally_unprovable ON pot_beefs WHEN OLD.txid IS NOT NEW.txid OR (OLD.structurally_unprovable = 1) IS NOT (NEW.structurally_unprovable = 1) BEGIN DELETE FROM pot_beefs_unprovable_set WHERE txid = OLD.txid; INSERT INTO pot_beefs_unprovable_set (txid) SELECT NEW.txid WHERE NEW.structurally_unprovable = 1 AND NEW.txid IS NOT NULL; END",
+    "CREATE TRIGGER IF NOT EXISTS pot_beefs_unprovable_delete AFTER DELETE ON pot_beefs BEGIN DELETE FROM pot_beefs_unprovable_set WHERE txid = OLD.txid; END",
+    crate::ops::UNPROVABLE_SET_BACKFILL,
+    crate::ops::UNPROVABLE_COUNT_BACKFILL,
 ];
 
 // =============================================================================
@@ -2729,6 +2748,9 @@ mod tests {
                         crate::derived_hops::STATE_DONE,
                         // bsv-low #645: the count's stamped backfill, pinned in `d1_hot_bounds.rs`.
                         crate::ops::NETWORK_SEEN_COUNT_BACKFILL,
+                        // NS-COST-BAR-1: the counts' stamped backfills, pinned in `d1_hot_bounds.rs`.
+                        crate::ops::UNPROVABLE_SET_BACKFILL,
+                        crate::ops::UNPROVABLE_COUNT_BACKFILL,
                     ]
                     .contains(sql)
             })

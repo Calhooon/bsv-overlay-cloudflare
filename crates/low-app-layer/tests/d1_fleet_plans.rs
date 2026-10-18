@@ -176,6 +176,10 @@ fn hot_routes_never_scan_fleet_tables() {
             "overlay tick proofless-watch GC",
             bsv_overlay_cloudflare::ops::PROOFLESS_WATCH_GC_SQL.to_string(),
         ),
+        (
+            "/health/invariants retiredUnprovableTotal",
+            bsv_overlay_cloudflare::ops::RETIRED_UNPROVABLE_TOTAL_SQL.to_string(),
+        ),
     ] {
         for detail in plan(&db, &sql) {
             if detail.contains("SEARCH x USING INDEX idx_potparty_identity") {
