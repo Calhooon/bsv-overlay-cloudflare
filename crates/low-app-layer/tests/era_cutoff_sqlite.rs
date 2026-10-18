@@ -373,6 +373,28 @@ fn pre557_e_the_stamp_candidates_are_the_latched_unstamped_pots() {
     );
 }
 
+/// The lens's LOW-4 under real SQLite: the shipped statement keeps an admission 7,200 s after its block and
+/// moves one 7,201 s after.
+#[test]
+fn pre557_f_the_slack_boundary_is_7200_kept_and_7201_moved() {
+    let conn = production_schema_db();
+    let block = PRE557_CUT_MS / 1000 - 86_400;
+    let kept = h64(0xe6);
+    let moved = h64(0xe7);
+    admit_pot(&conn, &kept, block + 7_200);
+    admit_pot(&conn, &moved, block + 7_201);
+    stamp_block_time(&conn, &kept, block);
+    stamp_block_time(&conn, &moved, block);
+    assert_eq!(
+        created_and_block_time(&conn, &kept),
+        (Some(block + 7_200), Some(block))
+    );
+    assert_eq!(
+        created_and_block_time(&conn, &moved),
+        (Some(block), Some(block))
+    );
+}
+
 #[test]
 fn pre557_d_a_live_pot_keeps_its_admission_time() {
     let conn = production_schema_db();

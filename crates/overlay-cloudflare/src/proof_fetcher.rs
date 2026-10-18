@@ -7041,6 +7041,76 @@ pub(crate) mod tests {
         }
     }
 
+    /// The lens's LOW-4: the slack is pinned at its boundary. An admission 7,200 s after the block is the
+    /// overlay's own and kept; 7,201 s after is moved to the block's time.
+    #[tokio::test]
+    async fn pre557_h_the_slack_boundary_is_7200_kept_and_7201_moved() {
+        let block = PRE557_CUTOFF_SECS - 86_400;
+        for (salt, admitted, want) in [
+            (14, block + 7_200, block + 7_200),
+            (15, block + 7_201, block),
+        ] {
+            let store = MemoryPotStorage::new();
+            let (beef, txid) = structurally_bumped_pot_beef(HEIGHT, salt);
+            pre557_store_pot(&store, &txid, &beef, admitted).await;
+            let times = FakeBlockTimes::new(BlockTimeMemo::from([(
+                (HEIGHT, txid.clone()),
+                Ok(Some(block)),
+            )]));
+            let pass =
+                complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), 20, 0)
+                    .await;
+            assert_eq!(pass.block_time_stamped, 1);
+            assert_eq!(
+                pre557_created_at(&store, &txid),
+                Some(want),
+                "admitted at block + {}",
+                admitted - block
+            );
+        }
+    }
+
+    /// The lens's MEDIUM-2: a TWO-LEAF bump, whose root is not the txid. The header source is keyed on the
+    /// ROOT the bump computes, so a stamp that asks with the txid (the lens's mutant M3) finds no header.
+    #[tokio::test]
+    async fn pre557_i_a_two_leaf_bump_asks_the_header_by_its_computed_root() {
+        use bsv_rs::transaction::Transaction;
+        let mut raw = hex::decode(RAW_A).unwrap();
+        let n = raw.len();
+        raw[n - 4..].copy_from_slice(&16u32.to_le_bytes());
+        let mut tx = Transaction::from_binary(&raw).unwrap();
+        let txid = tx.id();
+        let bump = MerklePath::new(
+            HEIGHT,
+            vec![vec![
+                MerklePathLeaf::new_txid(0, txid.clone()),
+                MerklePathLeaf::new(1, "cd".repeat(32)),
+            ]],
+        )
+        .expect("a valid two-leaf merkle path");
+        let root = bump.compute_root(Some(&txid)).unwrap().to_ascii_lowercase();
+        assert_ne!(root, txid, "the fixture's root is not its txid");
+        tx.merkle_path = Some(bump);
+        let beef = tx.to_beef(true).unwrap();
+
+        let store = MemoryPotStorage::new();
+        pre557_store_pot(&store, &txid, &beef, PRE557_NOW_SECS).await;
+        let block = PRE557_CUTOFF_SECS - 86_400;
+        let times = FakeBlockTimes::new(BlockTimeMemo::from([(
+            (HEIGHT, root.clone()),
+            Ok(Some(block)),
+        )]));
+        let pass =
+            complete_pot_beef_proofs(&store, &ReverifyFetcher::new(true), Some(&times), 20, 0)
+                .await;
+        assert_eq!(pass.already_proven, 1);
+        assert_eq!(
+            pass.block_time_stamped, 1,
+            "the header is found by the bump's computed root"
+        );
+        assert_eq!(pre557_created_at(&store, &txid), Some(block));
+    }
+
     #[tokio::test]
     async fn pre557_g_the_stamps_per_pass_are_bounded_and_the_rest_wait() {
         let store = MemoryPotStorage::new();
