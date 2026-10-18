@@ -739,7 +739,7 @@ pub fn courier_presence_hint(value: &Value, now: u64) -> Option<Hint> {
     let source = value["hintSource"]
         .as_str()
         .or_else(|| (value["present"] == true && value["source"] == "external").then_some("woc"))?;
-    // 0.2.2 has no Announced hint. Unknown retains the courier source without promotion.
+    // 0.4.0 still has no Announced hint. Unknown retains the courier source without promotion.
     Some(Hint::new(source, HintStatus::Unknown, now))
 }
 

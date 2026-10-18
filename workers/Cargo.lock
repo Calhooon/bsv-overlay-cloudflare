@@ -291,9 +291,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-tracker"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "590106cb780bec9249550442e94f852e17b73c0b155252196bb8e129ad2625ab"
+checksum = "f41f9b9b5f77609748a27ddebd2af053347ffcb356bb1a1c4bf47a035fe77777"
 dependencies = [
  "bsv-rs",
  "serde",
