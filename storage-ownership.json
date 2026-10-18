@@ -1464,6 +1464,28 @@
    "why": "rebuild from network_seen: its guarded backfill recounts a missing row at the next version's migration run; until then the field reads -1"
    },
    {
+   "name": "pot_beefs_unprovable_set",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "the txids of the pot_beefs rows latched structurally_unprovable = 1 (NS-COST-BAR-1), kept by pot_beefs' insert, update and delete triggers, idempotent under INSERT OR REPLACE",
+   "why": "rebuild from pot_beefs: wiped together with count_pot_beefs_unprovable, its guarded backfill refills it at the next version's migration run"
+   },
+   {
+   "name": "count_pot_beefs_unprovable",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "one row: the count of pot_beefs_unprovable_set (NS-COST-BAR-1), kept by that set's insert and delete triggers and served as /health/invariants.retiredUnprovableTotal",
+   "why": "rebuild from pot_beefs_unprovable_set: its guarded backfill recounts a missing row at the next version's migration run; until then the field reads -1"
+   },
+   {
    "name": "tx_words",
    "database": "low-overlay-db",
    "owner": "low-app-layer",

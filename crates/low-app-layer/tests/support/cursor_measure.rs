@@ -53,6 +53,8 @@ const TIP_MARK_READ_CEILING: u64 = 5;
 const SEEN_TOTAL_READ_CEILING: u64 = 5;
 /// NS-COST-BAR-1: the proofless-watch GC's read set (its predicate as a SELECT) on the fixture's 221 watched rows.
 const GC_READ_CEILING: u64 = 1_000;
+/// NS-COST-BAR-1: a trigger-kept count row's read, and a count backfill's SELECT on a re-run.
+const COUNT_ROW_READ_CEILING: u64 = 5;
 /// NS-COST-BAR-1: the BEFORE shapes are measured beside the AFTER ones (each line prints its reads), under a
 /// ceiling that only says they ran: they are the figures `docs/D1-BUDGETS.md` quotes.
 const BEFORE_SHAPE_CEILING: u64 = 10_000_000;
@@ -73,14 +75,37 @@ fn ns_cost_statements() -> Vec<(&'static str, String, u64)> {
         "SELECT txid FROM proofless_watch WHERE",
         1,
     );
-    vec![
+    let mut out = vec![
         (
             "NS-COST before: the proofless-watch GC",
             PROOFLESS_WATCH_GC_BEFORE_SELECT.to_string(),
             BEFORE_SHAPE_CEILING,
         ),
         ("NS-COST the proofless-watch GC", gc, GC_READ_CEILING),
-    ]
+        (
+            "NS-COST before: retiredUnprovableTotal",
+            "SELECT COUNT(*) AS c FROM pot_beefs WHERE structurally_unprovable = 1".to_string(),
+            BEFORE_SHAPE_CEILING,
+        ),
+        (
+            "NS-COST retiredUnprovableTotal",
+            bsv_overlay_cloudflare::ops::RETIRED_UNPROVABLE_TOTAL_SQL.to_string(),
+            COUNT_ROW_READ_CEILING,
+        ),
+    ];
+    // Each count backfill's SELECT on a re-run (the row present): the stamp alone.
+    for backfill in bsv_overlay_cloudflare::ops::COUNT_ROW_BACKFILLS
+        .iter()
+        .filter(|b| **b != bsv_overlay_cloudflare::ops::NETWORK_SEEN_COUNT_BACKFILL)
+    {
+        let select = &backfill[backfill.find("SELECT").unwrap()..];
+        out.push((
+            "NS-COST a count backfill's re-run (its SELECT)",
+            select.to_string(),
+            COUNT_ROW_READ_CEILING,
+        ));
+    }
+    out
 }
 
 pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {

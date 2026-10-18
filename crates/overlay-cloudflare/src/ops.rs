@@ -867,6 +867,33 @@ pub const NETWORK_SEEN_TOTAL_SQL: &str = "SELECT n AS c FROM count_network_seen 
 /// re-run of the list never counts the table (#638's rule).
 pub const NETWORK_SEEN_COUNT_BACKFILL: &str = "INSERT OR IGNORE INTO count_network_seen (id, n) SELECT 1, c.n FROM (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM count_network_seen WHERE id = 1)) g CROSS JOIN (SELECT COUNT(*) AS n FROM network_seen) c";
 
+/// NS-COST-BAR-1: `/health/invariants.retiredUnprovableTotal` (#2b) was a `COUNT(*)` of `pot_beefs` on every read
+/// (20,837 rows a read on beta, 10.4 M a day). It reads one row, kept equal to `COUNT(*) FROM pot_beefs WHERE
+/// structurally_unprovable = 1` by triggers inside every write. `pot_beefs` is written by `INSERT OR REPLACE`
+/// (`d1_discovery`), whose implicit delete fires no delete trigger unless `recursive_triggers` is on, so a +1/-1
+/// counter on `pot_beefs` itself could drift: the triggers keep a MEMBERSHIP set
+/// (`pot_beefs_unprovable_set`, the txids of the latched rows), written idempotently on every insert, update and
+/// delete (delete the key, then insert it if the row is latched), and the count is kept by the SET's own insert
+/// and delete triggers, which no writer but those triggers touches. A row whose txid is NULL is not counted (no
+/// writer writes one). No row (an isolate before the migrations) is the served `-1`, as an unreadable table was.
+pub const RETIRED_UNPROVABLE_TOTAL_SQL: &str =
+    "SELECT n AS c FROM count_pot_beefs_unprovable WHERE id = 1";
+
+/// NS-COST-BAR-1: the set's one-time backfill, behind the count's row in the OUTER derived table (#638's rule): a
+/// re-run of the list never reads `pot_beefs`. Runs after the triggers, so a write landing before it is in the set.
+pub const UNPROVABLE_SET_BACKFILL: &str = "INSERT OR IGNORE INTO pot_beefs_unprovable_set (txid) SELECT b.txid FROM (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM count_pot_beefs_unprovable WHERE id = 1)) g CROSS JOIN pot_beefs b WHERE b.structurally_unprovable = 1 AND b.txid IS NOT NULL";
+
+/// NS-COST-BAR-1: the count's one-time backfill, the set counted once behind its own row.
+pub const UNPROVABLE_COUNT_BACKFILL: &str = "INSERT OR IGNORE INTO count_pot_beefs_unprovable (id, n) SELECT 1, c.n FROM (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM count_pot_beefs_unprovable WHERE id = 1)) g CROSS JOIN (SELECT COUNT(*) AS n FROM pot_beefs_unprovable_set) c";
+
+/// Every trigger-kept count's stamped backfill, in the list's order (bsv-low #645, NS-COST-BAR-1): what a database
+/// loaded from a schema dump (no count row) runs after its rows, as the budget tier's seed does.
+pub const COUNT_ROW_BACKFILLS: &[&str] = &[
+    NETWORK_SEEN_COUNT_BACKFILL,
+    UNPROVABLE_SET_BACKFILL,
+    UNPROVABLE_COUNT_BACKFILL,
+];
+
 /// Latch [`NETWORK_SEEN_INSERT_SQL`] for `txid`. Best-effort: the latch only
 /// ACCELERATES verdict publication (the #371 third arm); a lost write leaves
 /// the row behind the merkle bar, which is the pre-#371 behaviour — so a D1
@@ -1585,13 +1612,12 @@ pub async fn health_invariants(
     // this is where the residue went — a LIVE count (a reorg-cleared latch
     // honestly decrements), -1 = unreadable (pre-migration isolate),
     // distinct from a real 0.
-    let retired_unprovable_total: i64 =
-        Query::new("SELECT COUNT(*) AS c FROM pot_beefs WHERE structurally_unprovable = 1")
-            .fetch_optional::<CountRow>(db)
-            .await
-            .ok()
-            .flatten()
-            .map_or(-1, |r| r.c.max(0.0) as i64);
+    let retired_unprovable_total: i64 = Query::new(RETIRED_UNPROVABLE_TOTAL_SQL)
+        .fetch_optional::<CountRow>(db)
+        .await
+        .ok()
+        .flatten()
+        .map_or(-1, |r| r.c.max(0.0) as i64);
     // INCIDENT D1-CALLBACK-FLOOD 2026-09-01: the two new Rule-13 surfaces.
     // `arcTerminalTotal` = distinct txids with a courier-delivered terminal
     // verdict on record (evidence intake is ALIVE); `txRetiredTotal` = the
@@ -1756,6 +1782,129 @@ pub async fn health_invariants(
 
 #[cfg(test)]
 mod tests {
+    /// NS-COST-BAR-1: a migrated SQLite connection with `recursive_triggers` as given (D1's setting is not
+    /// documented, and an `INSERT OR REPLACE` fires the delete trigger only when it is on).
+    pub(crate) fn ns_cost_migrated(recursive_triggers: bool) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string().contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        conn.pragma_update(None, "recursive_triggers", recursive_triggers)
+            .unwrap();
+        conn
+    }
+
+    /// NS-COST-BAR-1: `retiredUnprovableTotal` equals `COUNT(*)` after every SHIPPED `pot_beefs` writer, the two
+    /// `INSERT OR REPLACE` writes included, whether or not the REPLACE fires the delete trigger.
+    #[test]
+    fn ns_cost_unprovable_count_is_exact_under_every_shipped_writer() {
+        use crate::d1_discovery as d;
+        for recursive in [false, true] {
+            let conn = ns_cost_migrated(recursive);
+            let check = |what: &str| {
+                let served: i64 = conn
+                    .query_row(RETIRED_UNPROVABLE_TOTAL_SQL, [], |r| r.get(0))
+                    .unwrap();
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM pot_beefs WHERE structurally_unprovable = 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(served, count, "{what} (recursive_triggers {recursive})");
+                count
+            };
+            let admit = |txid: &str| {
+                conn.execute(
+                    d::POT_BEEF_ADMIT_WRITE_SQL,
+                    rusqlite::params![txid, vec![1u8], txid, 1i64, 0i64, txid],
+                )
+                .unwrap();
+            };
+            assert_eq!(check("empty"), 0);
+            for t in ["a", "b", "c", "d"] {
+                admit(t);
+            }
+            conn.execute(crate::proof_fetcher::RETIRE_POT_BEEFS_SQL, ["a"])
+                .unwrap();
+            assert_eq!(check("the retire pass latches a"), 1);
+            admit("a");
+            assert_eq!(check("an admit REPLACE keeps a's latch"), 1);
+            conn.execute(&d::pot_beef_retire_sql(3), ["b", "c", "d"])
+                .unwrap();
+            assert_eq!(check("the sibling latch of three"), 4);
+            conn.execute(&d::pot_beef_retire_sql(2), ["b", "c"])
+                .unwrap();
+            assert_eq!(check("a latch that changes nothing"), 4);
+            conn.execute(
+                d::POT_BEEF_VERIFIED_WRITE_SQL,
+                rusqlite::params!["b", vec![2u8], 1i64, 7i64],
+            )
+            .unwrap();
+            assert_eq!(check("a verified REPLACE clears b"), 3);
+            conn.execute(d::POT_BEEF_MARK_PROVEN_SQL, ["c"]).unwrap();
+            assert_eq!(check("mark proven clears c"), 2);
+            conn.execute(d::POT_BEEF_CLEAR_UNPROVABLE_SQL, ["a"])
+                .unwrap();
+            assert_eq!(check("the confirm clear of a"), 1);
+            conn.execute(crate::proof_fetcher::RETIRE_POT_BEEFS_SQL, ["a"])
+                .unwrap();
+            conn.execute(&d::pot_beef_mark_proven_batch_sql(2), ["d", "zz"])
+                .unwrap();
+            assert_eq!(check("the batched flip clears d"), 1);
+            conn.execute(d::POT_BEEF_MARK_PROVEN_AT_SQL, rusqlite::params![9i64, "a"])
+                .unwrap();
+            assert_eq!(check("the anchored flip clears a"), 0);
+            conn.execute(crate::proof_fetcher::RETIRE_POT_BEEFS_SQL, ["d"])
+                .unwrap();
+            assert_eq!(check("a proven row is not retired"), 0);
+            admit("e");
+            conn.execute(crate::proof_fetcher::RETIRE_POT_BEEFS_SQL, ["e"])
+                .unwrap();
+            conn.execute(
+                &d::pot_beef_mark_proven_at_batch_sql(1),
+                rusqlite::params!["e", 3i64, "e"],
+            )
+            .unwrap();
+            assert_eq!(check("the batched anchored flip clears e"), 0);
+            // An eviction's move and restore (plain DELETE, INSERT OR IGNORE), a latch value that is not 1, and a
+            // raw 2.
+            admit("f");
+            conn.execute(crate::proof_fetcher::RETIRE_POT_BEEFS_SQL, ["f"])
+                .unwrap();
+            assert_eq!(check("f latched"), 1);
+            conn.execute("DELETE FROM pot_beefs WHERE txid = 'f'", [])
+                .unwrap();
+            assert_eq!(check("the eviction's delete"), 0);
+            for _ in 0..2 {
+                conn.execute(
+                    "INSERT OR IGNORE INTO pot_beefs (txid, beef, structurally_unprovable) VALUES ('f', x'00', 1)",
+                    [],
+                )
+                .unwrap();
+                assert_eq!(check("the restore, twice"), 1);
+            }
+            conn.execute(
+                "UPDATE pot_beefs SET structurally_unprovable = 2 WHERE txid = 'f'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(check("a latch of 2 is not 1"), 0);
+            conn.execute(
+                "UPDATE pot_beefs SET structurally_unprovable = 1.0, txid = 'g' WHERE txid = 'f'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(check("1.0 under a new key"), 1);
+        }
+    }
+
     use super::*;
 
     /// Build the counters object the way `read_counters` does (all four

@@ -14140,7 +14140,8 @@ mod tests {
                     t("s4"),
                 ],
             ),
-            "SEARCH pot_beefs USING INDEX sqlite_autoindex_pot_beefs_1 (txid=?)",
+            // NS-COST-BAR-1: under the unprovable set's update trigger the batch reads the key COVERING (the same search).
+            "INDEX sqlite_autoindex_pot_beefs_1 (txid=?)",
         );
         conn.execute("UPDATE pot_beefs SET proofHeight = 7 WHERE txid = 's4'", [])
             .unwrap();
