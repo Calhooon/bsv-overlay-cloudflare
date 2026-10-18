@@ -2809,6 +2809,20 @@ whose window holds none). `/health/invariants.networkSeenTotal` reads the one ro
 may `INSERT OR REPLACE` into `network_seen`. Pins `crates/low-app-layer/tests/d1_hot_bounds.rs`, the ceilings in
 `tests/support/cursor_measure.rs`, the figures in `docs/D1-BUDGETS.md`.
 
+NS-COST-BAR-1 (the owner's cost word of 2026-10-18; the 24-hour census of 2026-10-17). The tick's proofless-watch GC
+(`ops::PROOFLESS_WATCH_GC_SQL`) probes `pot_beefs` and `transactions` by key for each watched txid, never a list built
+over a store (63,638 rows to 389 on the fixture). `retiredUnprovableTotal` reads `count_pot_beefs_unprovable`, kept by
+the triggers of the membership set `pot_beefs_unprovable_set`, which `pot_beefs`' own triggers keep idempotently
+because its writers `INSERT OR REPLACE` (20,839 to 1). `txRetiredTotal` and the expired-unproven total read
+`count_transactions_retired`, the same shape over `transactions_retired_set` (17,438 to 1 each). The index janitor's
+backlog is `count_pot_unspent_kind` (unspent pots per lock class, kept by `pot_records`' triggers) less the hour's
+young pots through `idx_pot_unspent_created` (13,887 to 8). The four relatch censuses are a rowid range plus a
+partial index of their NULL tier. The tick and `/health/invariants` count their own rows read by family
+(`d1_rows_read_<family>_total`, `/health/invariants.d1RowsRead`) against the daily budget in
+`tools/lane-499/ceilings.json` `d1RowsReadPerDay` (prod 20 M, beta 60 M). The keeper's `rust-chaintracks` count of
+headers and its split trigger are its own (`docs/D1-BUDGETS.md`, the ask). Pins `d1_hot_bounds.rs` `ns_cost_*`, the
+writers under `recursive_triggers` off and on in `ops::tests::ns_cost_*`.
+
 ## Storage ownership (bsv-low #474)
 
 The overlay and the app layer share ONE D1 per environment (`OVERLAY_DB`).

@@ -332,3 +332,86 @@ they read the backlog plus about two. The write cost: a `pot_records` row with a
 index entry at its insert and at its spend, a settle verdict and a spend of a decoded pot enter one partial index
 until their pass latches them, and every `network_seen` latch writes the count's row. The route tier's write
 ceilings were not re-measured in this lane unless the gate below says so.
+
+## The census's per-tick whole-table reads, bounded (NS-COST-BAR-1, the owner's cost word of 2026-10-18)
+
+Source: the 24-hour D1 census of 2026-10-17 (2026-10-17T00:03:52Z to 2026-10-18T00:03:52Z, bsv-low
+`docs/audit/D1-CENSUS-{PROD,BETA}-24H-2026-10-17.md`): prod read 73 M rows that day, beta 122 M. Measured on the
+budget tier's fleet fixture in local D1 (`d1_budget_seed`, then `tools/lane-499/cursor_pin.mjs`, which `make
+ci-d1-budget` runs; each line prints D1's own `rows_read`, the before shape beside the shipped one). The fixture now
+carries beta's shapes: 20,837 `pot_beefs` rows over every latch, 21,724 `transactions` (2,719 retired), 221 watched
+txids over every GC arm. Before is `221a203` (PR #86).
+
+| statement (file) | census, beta / prod, rows a day | fixture before | fixture after | ceiling |
+|---|---|---|---|---|
+| the proofless-watch GC (`ops::PROOFLESS_WATCH_GC_SQL`, each tick), its read set | 30.8 M / 2.6 M | 63,638 | 389 | 1,000 |
+| `retiredUnprovableTotal` (`ops::RETIRED_UNPROVABLE_TOTAL_SQL`, each `/health/invariants`) | 10.4 M / 0.15 M | 20,839 | 1 | 5 |
+| `txRetiredTotal` (`ops::TX_RETIRED_TOTAL_SQL`) | 7.5 M / 0.54 M | 17,438 | 1 | 5 |
+| the expired-unproven total (`proof_window::EXPIRED_COUNT_SQL`) | 9.5 M / 0.37 M | 17,438 | 1 | 5 |
+| the index janitor's backlog (`ops::INDEX_JANITOR_BACKLOG_SQL`), as of two hours on | 5.2 M / 0.12 M | 13,887 | 8 | 10 |
+| the hopparty relatch census (`d1_discovery::hopparty_relatch_census_sql`), mid-sweep | 1.1 M / 0.11 M | 7,552 | 3,777 | 5,000 |
+| the potparty relatch census (`potparty_relatch_census_sql`), mid-sweep, the fixture's worst case | 1.4 M / 0.15 M | 15,360 | 23,018 | 25,000 |
+| each count's backfill on a re-run, its SELECT | | | 1 | 5 |
+
+How. The GC's four filtered `IN (SELECT ..)` lists were each a scan of a store, rebuilt every tick; they are two
+primary-key `EXISTS` probes of each watched txid (the orphan arm already probed the key), the same rows deleted.
+The three counts are trigger-kept rows (the #645 shape), but `pot_beefs` and `transactions` are written by `INSERT
+OR REPLACE`, whose implicit delete fires no delete trigger unless `recursive_triggers` is on (measured: a +1/-1 row
+reads 2 for 1 row), so each source's triggers keep a MEMBERSHIP set (delete the key, then insert it while the row
+qualifies: right either way) and the count row is kept by the set's own two triggers. The backlog's predicate is the
+clock's (an hour old): three class rows of unspent pots kept by `pot_records`' triggers (no REPLACE there, #638) less
+the hour's young pots, an index range (`idx_pot_unspent_created`, `INDEXED BY`: without statistics the planner took
+every unspent pot by `spent = ?`). The relatch census is a rowid range plus a partial index of the NULL tier.
+
+Stated. (1) The backlog is measured two hours on because the seed stamps every pot this hour; read at once, the
+young range holds every unspent fixture pot. (2) The relatch census still reads the rows after its cursor, half the
+table on average over a sweep (it feeds the relatch log line only); its NULL tier is a partial index, so the census is
+cheaper only where the tier is small: production's `/record` writes `sigValid` and `markerValid` at filing and the
+relatch converges the legacy rows, but the fixture's potparty rows carry none, so there the census is worse than the
+aggregate (23,018 against 15,360). (3) The write cost: a `pot_beefs` or `transactions` write probes its set by key
+and writes the set and the count row only when the row's latch moves; a `pot_records` insert, delete, spend or class
+change writes one or two class rows; the four relatch tables and the young pots each enter one partial index. (4) A
+row whose txid is NULL is not in a count (no writer writes one). (5) The two sets and their count rows are derived:
+wiped together or not at all (`storage-ownership.json`).
+
+### The rows-read-per-day invariant
+
+The overlay counts its own rows read durably: `d1_rows_read_<family>_total`, one per tick step (the 19 labels in
+`tick.rs`, `setup` before the first) and one for `/health/invariants`, from D1's `meta.rows_read` at the one seam
+(`d1_ledger::passes`, `label`), served as counters and as `/health/invariants.d1RowsRead {byFamily, total}`. A day's
+figure is the delta of a day. The budget is `tools/lane-499/ceilings.json` `d1RowsReadPerDay`: prod 20 M and beta
+60 M rows a day over LOW's own databases, the keeper's `rust-chaintracks` reported beside and never inside, with the
+census's 3x rule beside it unchanged. Why: the census's listed tags held 8.9 M a day on prod `low-overlay-db`, about
+3.8 M after PR #86 and this lane (20 M is about 5x, room for the 105 unlisted tags and the 3x margin); beta 105.5 M
+over its LOW databases, about 16.7 M after (60 M is about 3.5x). Work a step hands to `wait_until` is polled outside
+the scope and is no pass's.
+
+### The keeper's two statements (rust-chaintracks, filed by the captain)
+
+`SELECT COUNT(*) as cnt FROM headers` (`storage.rs` `SQL_COUNT_HEADERS`, `get_info`, every `/getInfo`) read 971,547
+rows each time: 61.2 M rows a day on prod at 63 calls, 1.9 M on beta at 2. Its callers on LOW's side are the
+monitor's chaintracks lag row (bsv-low #631, `workers/low-monitor/src/lib.rs` `read_chaintracks`, one `/getInfo`
+every `*/5` tick through the `CHAINTRACKS` binding to prod `rust-chaintracks`, deployed about 22:13Z on 2026-10-17,
+so the census saw about 22 of its calls), the runner's `scripts/runner/patterns/chaintracks-gate.py` and the fleet
+cell `app/e2e/matrix/invariants.mjs`. At the monitor's full cadence (288 a day) the count alone is about 280 M rows
+a day. The monitor reads `heightLive`, `liveLagBlocks`, `lastSyncError` and `syncSchemaFault`, which only `/getInfo`
+serves, so no cheaper field exists on LOW's side: the ask is the keeper's. Measured on local D1: `COUNT(*)` over
+2,000 headers reads 2,000 rows, `MAX(header_id)` (the INTEGER PRIMARY KEY) reads 1.
+
+`UPDATE chain_split_signal SET depth = ?, tick = tick + 1 WHERE id = 1` (`rungs.rs`, each rung observation) read
+14,472 rows each time (13.2 M a day on beta at 914 calls, 2.8 M on prod at 193): its `AFTER UPDATE OF tick` trigger
+`chain_split_detect` (`migrations/0010_rung_tips.sql`) evaluates the view `chain_rung_pairs`, a self-join of the
+recursive `chain_rung_ancestry` (each rung's tip walked 400 headers deep) on every poll, whether or not a tip moved.
+Reproduced on local D1 with the keeper's migrations, 2,000 headers and three rung tips: 14,457 rows per UPDATE, one
+read of `chain_rung_pairs` 14,448, of `chain_rung_ancestry` 2,416 (1,203 rows); the resolve arm is skipped when no
+split is open.
+
+The ask, as the captain may file it on the keeper's repository:
+
+> rust-chaintracks reads about 64 M D1 rows a day on prod in two statements (bsv-low census 2026-10-17). (1)
+> `get_info`'s `SELECT COUNT(*) as cnt FROM headers` reads every header (971,547) on each `/getInfo`; LOW's monitor
+> calls it every 5 minutes (about 280 M rows a day at full cadence): serve `headerCount` from a counter row kept by
+> the header writes, or from the sync state the sync already writes, or as `MAX(header_id)` if gaps are acceptable
+> (1 row read). (2) `chain_split_detect` recomputes the 400-deep rung ancestry on every rung poll (14,472 rows per
+> `UPDATE chain_split_signal`, 13.2 M a day on beta): bump `tick` only when a rung tip changed, or bound the walk to
+> the split depth window.
