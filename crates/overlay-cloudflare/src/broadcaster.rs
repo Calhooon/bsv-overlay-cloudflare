@@ -6729,3 +6729,8 @@ mod tests {
         );
     }
 }
+
+// bsv-low #619 (L3): the byte-identity pin over the door's answer table.
+#[cfg(test)]
+#[path = "door_answer_table.rs"]
+mod door_answer_table;

@@ -1,0 +1,364 @@
+//! bsv-low #619 (L3): the byte-identity pin over the door's answer table.
+//!
+//! L3 moves WHO decides the door's reading of Arcade's words (the host's
+//! policy over the tracker's `Hint`, `door_words`), never WHAT the door
+//! answers. This table is every pure answer the door gives on the recorded
+//! inputs: each Arcade word through the gate, the `/arc-ingest` callback, the
+//! fatal test, the retire pass's live look and its webhook fold, the proof
+//! look, the retire verdict and the refusal's evidence verdict; every captured
+//! body of `arcade_status_verdicts.json` through each surface it reaches; the
+//! submit HTTP answers and their ladder rung; the #612 stored echo and its
+//! freshness under an open eviction; the #519 / #602 presence shapes and the
+//! terminal judgement. The fixture `tests/fixtures/door_answer_table.txt` was
+//! written on the base (`fe6c83d`) before the change: a changed answer is a
+//! red line by name. Regenerate only with a stated reason:
+//! `DOOR_ANSWER_TABLE_WRITE=1 cargo test ... door_answer_table`.
+
+use super::*;
+use crate::admit_fast::{callback_action, evidence_verdict};
+use crate::proof_fetcher::{
+    classify_presence, fold_arcade_look, live_arcade_look, parse_arcade_proof_look,
+    presence_response, retire_verdict, rfc3339_utc_ms, NetworkPresence,
+};
+use crate::routes::classify_arc_ingest_body;
+
+const FIXTURE: &str = include_str!("../tests/fixtures/door_answer_table.txt");
+const VECTOR: &str = include_str!("../../overlay-discovery/vectors/arcade_status_verdicts.json");
+const NOW: &str = "2026-10-08T12:00:00Z";
+const STALE: &str = "2026-10-08T10:00:00Z";
+const TXID: &str = "aa00000000000000000000000000000000000000000000000000000000000001";
+const COMPETITOR: &str = "bb00000000000000000000000000000000000000000000000000000000000002";
+const BLOCKHASH: &str = "0000000000000000000000000000000000000000000000000000000000000abc";
+const BUMP: &str = "fed0ac0c000101020304";
+
+/// Arcade's twelve words, their spellings, and the words Arcade does not
+/// define but ARC or a stranger might send.
+const WORDS: &[&str] = &[
+    "UNKNOWN",
+    "RECEIVED",
+    "SENT_TO_NETWORK",
+    "ACCEPTED_BY_NETWORK",
+    "SEEN_ON_NETWORK",
+    "SEEN_MULTIPLE_NODES",
+    "DOUBLE_SPEND_ATTEMPTED",
+    "REJECTED",
+    "PENDING_RETRY",
+    "STUMP_PROCESSING",
+    "MINED",
+    "IMMUTABLE",
+    "seen_on_network",
+    " MINED\n",
+    "rejected",
+    "Double_Spend_Attempted",
+    " stump_processing ",
+    "pending_retry",
+    "SEEN_IN_ORPHAN_MEMPOOL",
+    "orphaned",
+    "ORPHAN",
+    "STORED",
+    "QUEUED",
+    "SUCCESS",
+    "ANNOUNCED_TO_NETWORK",
+    "REQUESTED_BY_NETWORK",
+    "CONFIRMED",
+    "MINED_IN_STALE_BLOCK",
+    "REORG_UNMINED",
+    "INVALID",
+    "MALFORMED",
+    "UTXO_SPENT",
+    "NOT_A_STATUS",
+    "",
+    "  ",
+];
+
+fn fill(s: &str) -> String {
+    s.replace("{TXID}", TXID)
+        .replace("{COMPETITOR}", COMPETITOR)
+        .replace("{BLOCKHASH}", BLOCKHASH)
+        .replace("{BUMP}", BUMP)
+        .replace("{NOW}", NOW)
+}
+
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+}
+
+/// The whole table, one `surface\tinput\tanswer` line per answer.
+fn table() -> String {
+    let mut out = Vec::<String>::new();
+    let mut row = |surface: &str, input: &str, answer: String| {
+        out.push(format!("{surface}\t{}\t{}", esc(input), esc(&answer)));
+    };
+    let now_ms = rfc3339_utc_ms(NOW).unwrap();
+
+    for w in WORDS {
+        row("gate", w, format!("{:?}", classify_arcade_status(w)));
+        row("callback", w, format!("{:?}", callback_action(w)));
+        row("fatal", w, format!("{:?}", is_arcade_fatal(w)));
+        let live = live_arcade_look(w, "info".to_string());
+        row("live_look", w, format!("{live:?}"));
+        row(
+            "live_look_fold_plant",
+            w,
+            format!(
+                "{:?}",
+                fold_arcade_look(live.clone(), Some(("REJECTED".into(), "planted".into())))
+            ),
+        );
+        for (age, label) in [(7_200, "2h"), (49 * 3_600, "49h")] {
+            row(
+                &format!("retire_absent_{label}"),
+                w,
+                format!("{:?}", retire_verdict(&live, Some(false), Some(false), age)),
+            );
+        }
+        for young in [true, false] {
+            row(
+                &format!("evidence_absent_young_{young}"),
+                w,
+                format!(
+                    "{:?}",
+                    evidence_verdict(&live, Some(false), Some(false), young)
+                ),
+            );
+            row(
+                &format!("evidence_woc_holds_young_{young}"),
+                w,
+                format!("{:?}", evidence_verdict(&live, Some(false), Some(true), young)),
+            );
+            row(
+                &format!("evidence_fault_young_{young}"),
+                w,
+                format!("{:?}", evidence_verdict(&live, None, Some(false), young)),
+            );
+        }
+        for (shape, body) in [
+            (
+                "path_fresh",
+                serde_json::json!({"txid": TXID, "txStatus": w, "timestamp": NOW, "merklePath": BUMP}),
+            ),
+            (
+                "nopath_fresh",
+                serde_json::json!({"txid": TXID, "txStatus": w, "timestamp": NOW}),
+            ),
+            (
+                "nopath_stale",
+                serde_json::json!({"txid": TXID, "txStatus": w, "timestamp": STALE}),
+            ),
+            (
+                "nopath_nostamp",
+                serde_json::json!({"txid": TXID, "txStatus": w}),
+            ),
+        ] {
+            row(
+                &format!("proof_look_{shape}"),
+                w,
+                format!("{:?}", parse_arcade_proof_look(200, &body.to_string(), now_ms)),
+            );
+        }
+        let push = serde_json::json!({"txid": TXID, "txStatus": w}).to_string();
+        row(
+            "arc_ingest_body",
+            w,
+            format!("{:?}", classify_arc_ingest_body(&push)),
+        );
+    }
+
+    // every captured body of the vector, through each surface it reaches
+    let v: serde_json::Value = serde_json::from_str(VECTOR).unwrap();
+    for case in v["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let raw = fill(&serde_json::to_string(&case["body"]).unwrap());
+        if let Some(http) = case["http"].as_u64() {
+            let outcome = classify_submit_response(http as u16, &raw);
+            row("vector_submit", name, format!("{outcome:?}"));
+            match submit_entry(outcome) {
+                SubmitEntry::Step(step) => {
+                    row("vector_submit_ladder", name, format!("{:?}", ladder_step(step, TXID)))
+                }
+                other => row("vector_submit_entry", name, format!("{other:?}")),
+            }
+        }
+        row(
+            "vector_proof_look",
+            name,
+            format!("{:?}", parse_arcade_proof_look(200, &raw, now_ms)),
+        );
+        row(
+            "vector_arc_ingest_body",
+            name,
+            format!("{:?}", classify_arc_ingest_body(&raw)),
+        );
+        if let Some(word) = case["body"]["txStatus"].as_str() {
+            row("vector_gate", name, format!("{:?}", classify_arcade_status(word)));
+            row("vector_callback", name, format!("{:?}", callback_action(word)));
+        }
+    }
+
+    // the submit HTTP answers outside the vector (#213, #228 arcade#260)
+    for (http, body) in [
+        (200, r#"{"txid":"T","txStatus":"SEEN_ON_NETWORK"}"#),
+        (202, r#"{"txid":"T","txStatus":"RECEIVED"}"#),
+        (
+            400,
+            r#"{"error":"transaction failed validation","reason":"script"}"#,
+        ),
+        (
+            400,
+            r#"{"error":"transaction failed validation","reason":"x","status":466}"#,
+        ),
+        (
+            400,
+            r#"{"error":"transaction failed validation","reason":"x","status":467}"#,
+        ),
+        (
+            400,
+            r#"{"error":"transaction failed validation","reason":"x","status":476}"#,
+        ),
+        (400, r#"{"error":"other","reason":"x","status":499}"#),
+        (400, r#"{"error":"other"}"#),
+        (400, "not json"),
+        (401, ""),
+        (404, "nope"),
+        (429, "slow down"),
+        (500, "boom"),
+        (503, ""),
+    ] {
+        let outcome = classify_submit_response(http, body);
+        let input = format!("{http} {body}");
+        row("submit", &input, format!("{outcome:?}"));
+        if let SubmitEntry::Step(step) = submit_entry(outcome) {
+            row("submit_ladder", &input, format!("{:?}", ladder_step(step, TXID)));
+        }
+    }
+    for step in [
+        GateStep::Accepted,
+        GateStep::SyncRejected("r".into()),
+        GateStep::AsyncRejected("r".into()),
+        GateStep::AsyncRejected(format!(
+            "{ARCADE_CASCADE_PREFIX} {ARCADE_CASCADE_RETRYABLE_HINT}"
+        )),
+        GateStep::Orphan("o".into()),
+        GateStep::AcceptedUnseen,
+        GateStep::SyncAccepted,
+    ] {
+        let input = format!("{step:?}");
+        row("ladder", &input, format!("{:?}", ladder_step(step, TXID)));
+    }
+
+    // #612: the stored echo, and its freshness under an open eviction
+    for fast in [true, false] {
+        row(
+            "stored_echo",
+            &format!("fast_answer={fast}"),
+            format!("{:?}", reached_submit_echo(fast)),
+        );
+    }
+    let evicted = now_ms - 10 * 60_000;
+    for (label, stamp) in [
+        ("none", None),
+        ("after_eviction", Some("2026-10-08T11:55:00Z")),
+        ("before_eviction", Some("2026-10-08T11:45:00Z")),
+        ("older_than_30m", Some("2026-10-08T11:20:00Z")),
+        ("future", Some("2026-10-08T12:05:00Z")),
+        ("garbage", Some("yesterday")),
+    ] {
+        for (ev_label, ev) in [("no_eviction", None), ("open_eviction", Some(evicted))] {
+            row(
+                "stored_echo_fresh",
+                &format!("{label} {ev_label}"),
+                format!("{:?}", submit_echo_is_fresh(stamp, now_ms, ev)),
+            );
+        }
+    }
+
+    // #519 / #602: the couriers' presence shapes and the terminal judgement
+    let presences = [
+        None,
+        Some(NetworkPresence::Absent),
+        Some(NetworkPresence::Inconclusive),
+        Some(NetworkPresence::Present { height: None }),
+        Some(NetworkPresence::Present {
+            height: Some(970_710),
+        }),
+    ];
+    for b in presences {
+        for w in presences {
+            row(
+                "presence",
+                &format!("bitails={b:?} woc={w:?}"),
+                format!("{:?}", classify_presence(b, w)),
+            );
+        }
+    }
+    for (http, body) in [
+        (200, r#"{"blockheight":970710}"#),
+        (200, r#"{"blockHeight":970710}"#),
+        (200, r#"{"txid":"t","vin":[],"vout":[]}"#),
+        (200, r#"{"confirmations":0}"#),
+        (200, "not json"),
+        (404, ""),
+        (429, ""),
+        (500, ""),
+    ] {
+        row(
+            "presence_response",
+            &format!("{http} {body}"),
+            format!("{:?}", presence_response(http, body)),
+        );
+    }
+    for p in presences.into_iter().flatten() {
+        for young in [true, false] {
+            for (status, extra) in [
+                ("REJECTED", ""),
+                ("REJECTED", "already known, seen and mined"),
+                (
+                    "DOUBLE_SPEND_ATTEMPTED",
+                    "UTXO_SPENT: input already spent by competitor",
+                ),
+            ] {
+                row(
+                    "terminal_by_presence",
+                    &format!("{p:?} young={young} {status} {extra}"),
+                    format!(
+                        "{:?}",
+                        terminal_at_arcade_by_presence(p, young, TXID, status, extra)
+                    ),
+                );
+            }
+        }
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+#[test]
+fn the_doors_answers_are_byte_identical_to_the_recorded_table() {
+    let got = table();
+    if std::env::var_os("DOOR_ANSWER_TABLE_WRITE").is_some() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/door_answer_table.txt"
+        );
+        std::fs::write(path, &got).unwrap();
+        return;
+    }
+    let want: Vec<&str> = FIXTURE.lines().collect();
+    let have: Vec<&str> = got.lines().collect();
+    let changed: Vec<String> = want
+        .iter()
+        .zip(have.iter())
+        .filter(|(w, h)| w != h)
+        .map(|(w, h)| format!("recorded: {w}\n     now: {h}"))
+        .collect();
+    assert!(
+        changed.is_empty() && want.len() == have.len(),
+        "the door's answer changed ({} lines recorded, {} now):\n{}",
+        want.len(),
+        have.len(),
+        changed.join("\n")
+    );
+}
