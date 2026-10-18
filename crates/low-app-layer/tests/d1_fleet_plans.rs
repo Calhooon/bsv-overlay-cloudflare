@@ -180,6 +180,14 @@ fn hot_routes_never_scan_fleet_tables() {
             "/health/invariants retiredUnprovableTotal",
             bsv_overlay_cloudflare::ops::RETIRED_UNPROVABLE_TOTAL_SQL.to_string(),
         ),
+        (
+            "/health/invariants txRetiredTotal",
+            bsv_overlay_cloudflare::ops::TX_RETIRED_TOTAL_SQL.to_string(),
+        ),
+        (
+            "/health/invariants expired-unproven total",
+            bsv_overlay_cloudflare::proof_window::EXPIRED_COUNT_SQL.to_string(),
+        ),
     ] {
         for detail in plan(&db, &sql) {
             if detail.contains("SEARCH x USING INDEX idx_potparty_identity") {

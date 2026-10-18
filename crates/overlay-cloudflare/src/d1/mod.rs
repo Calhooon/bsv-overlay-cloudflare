@@ -584,7 +584,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 262 to 263 for bsv-low #643 (W1.6): the tip mark's (spent, recoveryHeight) index.
 /// 263 to 267 for bsv-low #645 (W1.6): `count_network_seen`, its two triggers and its stamped backfill.
 /// 267 to 276 for NS-COST-BAR-1: `pot_beefs_unprovable_set`, `count_pot_beefs_unprovable`, five triggers, two backfills.
-pub const OVERLAY_MIGRATION_COUNT: usize = 276;
+/// 276 to 285 for NS-COST-BAR-1: `transactions_retired_set`, `count_transactions_retired`, five triggers, two backfills.
+pub const OVERLAY_MIGRATION_COUNT: usize = 285;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2081,6 +2082,21 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "CREATE TRIGGER IF NOT EXISTS pot_beefs_unprovable_delete AFTER DELETE ON pot_beefs BEGIN DELETE FROM pot_beefs_unprovable_set WHERE txid = OLD.txid; END",
     crate::ops::UNPROVABLE_SET_BACKFILL,
     crate::ops::UNPROVABLE_COUNT_BACKFILL,
+    // 277-285: NS-COST-BAR-1, `/health/invariants.txRetiredTotal` and the expired-unproven total were two
+    // `COUNT(*)`s of `transactions` on every read (17 M rows a day on beta). `transactions` is written by `INSERT
+    // OR REPLACE` (`d1_storage`), so the shape is the unprovable count's above: a membership set of the retired
+    // rows (with whether each reason is `expired-unproven`) kept idempotently by the source triggers, one count row
+    // (both counts) kept by the set's own triggers. The update trigger fires only when the key, the retirement or
+    // the expired reason moves.
+    "CREATE TABLE IF NOT EXISTS transactions_retired_set (txid TEXT PRIMARY KEY NOT NULL, expired INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS count_transactions_retired (id INTEGER PRIMARY KEY CHECK (id = 1), retired INTEGER NOT NULL, expired INTEGER NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS transactions_retired_set_insert AFTER INSERT ON transactions_retired_set BEGIN UPDATE count_transactions_retired SET retired = retired + 1, expired = expired + NEW.expired WHERE id = 1; END",
+    "CREATE TRIGGER IF NOT EXISTS transactions_retired_set_delete AFTER DELETE ON transactions_retired_set BEGIN UPDATE count_transactions_retired SET retired = retired - 1, expired = expired - OLD.expired WHERE id = 1; END",
+    "CREATE TRIGGER IF NOT EXISTS transactions_retired_insert AFTER INSERT ON transactions BEGIN DELETE FROM transactions_retired_set WHERE txid = NEW.txid; INSERT INTO transactions_retired_set (txid, expired) SELECT NEW.txid, NEW.retired_reason IS 'expired-unproven' WHERE NEW.retired_ms IS NOT NULL AND NEW.txid IS NOT NULL; END",
+    "CREATE TRIGGER IF NOT EXISTS transactions_retired_update AFTER UPDATE OF txid, retired_ms, retired_reason ON transactions WHEN OLD.txid IS NOT NEW.txid OR (OLD.retired_ms IS NULL) IS NOT (NEW.retired_ms IS NULL) OR (OLD.retired_reason IS 'expired-unproven') IS NOT (NEW.retired_reason IS 'expired-unproven') BEGIN DELETE FROM transactions_retired_set WHERE txid = OLD.txid; INSERT INTO transactions_retired_set (txid, expired) SELECT NEW.txid, NEW.retired_reason IS 'expired-unproven' WHERE NEW.retired_ms IS NOT NULL AND NEW.txid IS NOT NULL; END",
+    "CREATE TRIGGER IF NOT EXISTS transactions_retired_delete AFTER DELETE ON transactions BEGIN DELETE FROM transactions_retired_set WHERE txid = OLD.txid; END",
+    crate::ops::RETIRED_SET_BACKFILL,
+    crate::ops::RETIRED_COUNT_BACKFILL,
 ];
 
 // =============================================================================
@@ -2751,6 +2767,8 @@ mod tests {
                         // NS-COST-BAR-1: the counts' stamped backfills, pinned in `d1_hot_bounds.rs`.
                         crate::ops::UNPROVABLE_SET_BACKFILL,
                         crate::ops::UNPROVABLE_COUNT_BACKFILL,
+                        crate::ops::RETIRED_SET_BACKFILL,
+                        crate::ops::RETIRED_COUNT_BACKFILL,
                     ]
                     .contains(sql)
             })

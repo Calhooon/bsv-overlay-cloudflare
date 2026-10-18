@@ -1486,6 +1486,28 @@
    "why": "rebuild from pot_beefs_unprovable_set: its guarded backfill recounts a missing row at the next version's migration run; until then the field reads -1"
    },
    {
+   "name": "transactions_retired_set",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "the txids of the transactions rows with retired_ms set and whether each reason is expired-unproven (NS-COST-BAR-1), kept by transactions' insert, update and delete triggers, idempotent under INSERT OR REPLACE",
+   "why": "rebuild from transactions: wiped together with count_transactions_retired, its guarded backfill refills it at the next version's migration run"
+   },
+   {
+   "name": "count_transactions_retired",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "one row: the count of transactions_retired_set and of its expired-unproven rows (NS-COST-BAR-1), kept by that set's insert and delete triggers and served as /health/invariants.txRetiredTotal and the expired-unproven total",
+   "why": "rebuild from transactions_retired_set: its guarded backfill recounts a missing row at the next version's migration run; until then both fields read -1"
+   },
+   {
    "name": "tx_words",
    "database": "low-overlay-db",
    "owner": "low-app-layer",

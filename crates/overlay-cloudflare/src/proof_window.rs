@@ -32,7 +32,11 @@ pub(crate) fn held_count_sql() -> String {
 pub(crate) fn retire_expired_sql() -> String {
     format!("UPDATE transactions SET retired_ms = ?1, retired_reason = 'expired-unproven' WHERE has_proof = 0 AND retired_ms IS NULL AND txid IN (SELECT t.txid FROM transactions t LEFT JOIN proofless_watch w ON w.txid = t.txid WHERE {} AND EXISTS (SELECT 1 FROM outputs o WHERE o.txid = t.txid) AND NOT EXISTS (SELECT 1 FROM outputs o LEFT JOIN uhrp_records u ON u.txid = o.txid AND u.outputIndex = o.outputIndex WHERE o.txid = t.txid AND (u.txid IS NULL OR u.expiryTime = 0 OR u.expiryTime * 1000 >= ?1)) ORDER BY t.txid LIMIT {PEER_PROOF_ROW_LIMIT})", held_predicate("?1"))
 }
-pub(crate) const EXPIRED_COUNT_SQL: &str = "SELECT COUNT(*) AS c FROM transactions WHERE retired_ms IS NOT NULL AND retired_reason = 'expired-unproven'";
+/// `/health/invariants`' expired-unproven total. NS-COST-BAR-1: one row, the `expired` count the retired set's
+/// triggers keep equal to `COUNT(*) FROM transactions WHERE retired_ms IS NOT NULL AND retired_reason =
+/// 'expired-unproven'` (`ops::TX_RETIRED_TOTAL_SQL`), never a count of `transactions` (21,723 rows a read on beta).
+pub const EXPIRED_COUNT_SQL: &str =
+    "SELECT expired AS c FROM count_transactions_retired WHERE id = 1";
 
 #[derive(Deserialize)]
 struct Candidate {
