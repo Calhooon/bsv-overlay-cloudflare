@@ -269,6 +269,15 @@ fn l1_routes_wire_the_outpoint_words() {
     );
 }
 
+/// A `mined` word whose path this pass did not check: `suspect` (the served shape drops the path) or `cannotCheck`
+/// (the recheck could not run).
+fn unchecked_mined(flag: &str) -> Value {
+    let mut v = mined(&tx(3), 11);
+    v["verifyPath"] = Value::Null;
+    v[flag] = json!(true);
+    v
+}
+
 /// The W2-WORDS lens's MEDIUM-1: an entry whose spend the INDEX has proven (`/utxo-status`'s `spentConfirmed`, the
 /// overlay's SPV latch; `/spent-any`'s `spentConfirmedSource` naming a checked proof) serves `lock: spent` at tier
 /// `chain` even when the spender has no checked word yet, never `locked` beside its own `spentConfirmed: true`. A
@@ -332,4 +341,39 @@ fn l1_lock_is_spent_when_the_index_has_proven_the_spend() {
     runtime::decorate_outpoints(&mut after, &v, "unspentAsFarAsAsked", "hint");
     assert_eq!(after[0]["spentConfirmed"], true);
     assert_eq!(after[0]["lock"]["word"], "locked", "{}", after[0]["lock"]);
+}
+
+/// The W2-WORDS lens's LOW-1 (mutant M5): a `mined` word with no checked path (`suspect`, `cannotCheck`) never
+/// serves `lock: spent`; with no index proof it is `locked`, its path null.
+#[test]
+fn l1_lock_is_never_spent_on_an_unchecked_mined_word() {
+    let mut v = views();
+    v.insert(tx(8), unchecked_mined("suspect"));
+    v.insert(tx(9), unchecked_mined("cannotCheck"));
+    let entries = [
+        status(&tx(1), Some(true), Some(&tx(8))),
+        status(&tx(1), Some(true), Some(&tx(9))),
+    ];
+    for (route, raw, unspent, tier) in [
+        (
+            "/utxo-status",
+            logic::utxo_status_body(&entries),
+            "free",
+            "host",
+        ),
+        (
+            "/spent-any",
+            txany::spent_any_body(&entries, &[false; 2]),
+            "unspentAsFarAsAsked",
+            "hint",
+        ),
+    ] {
+        let mut after: Value = serde_json::from_str(&raw).unwrap();
+        runtime::decorate_outpoints(&mut after, &v, unspent, tier);
+        for (i, flag) in [(0, "suspect"), (1, "cannotCheck")] {
+            let lock = &after[i]["lock"];
+            assert_eq!(lock["word"], "locked", "{route} {flag}: {lock}");
+            assert!(lock["verifyPath"].is_null(), "{route} {flag}: {lock}");
+        }
+    }
 }
