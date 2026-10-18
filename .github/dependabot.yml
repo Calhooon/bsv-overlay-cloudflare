@@ -37,7 +37,7 @@ updates:
         - bsv-worker-build-info
         - bsv-wallet-toolbox-rs
         - bsv-tracker
-    versioning-strategy: increase
+    versioning-strategy: auto
     open-pull-requests-limit: 5
     commit-message:
       prefix: deps(stack)
