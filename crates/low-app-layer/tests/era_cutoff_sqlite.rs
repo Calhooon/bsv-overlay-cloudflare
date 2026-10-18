@@ -18,8 +18,11 @@
 //! `the_written_off_era_is_dropped_and_the_unset_cutoff_is_inert`).
 
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
-use bsv_overlay_cloudflare::d1_discovery::store_record_sql;
+use bsv_overlay_cloudflare::d1_discovery::{
+    pots_without_block_time_sql, store_record_sql, POT_BLOCK_TIME_STAMP_SQL,
+};
 use low_app_layer::logic::{assemble_pots_view, pots_view_join_sql, Outpoint, PotsViewRow};
+use overlay_discovery::pot::storage::BLOCK_TIME_STAMP_SLACK_SECS;
 use rusqlite::{params, Connection};
 
 fn production_schema_db() -> Connection {
@@ -169,5 +172,126 @@ fn the_admission_stamp_writer_produces_unix_seconds() {
     assert!(
         now < 100_000_000_000,
         "current_unix_seconds_i64 must be SECONDS (an ms stamp would be ~1.7e12), got {now}"
+    );
+}
+
+// ── bsv-low #470 PRE557: a re-indexed pot is stamped from its confirming block, never NOW ──────────
+
+/// The production cutoff (2026-08-08 01:26:29Z), ms, and a re-index's NOW (2026-10-18), seconds.
+const PRE557_CUT_MS: i64 = 1_786_152_389_000;
+const PRE557_NOW_SECS: i64 = 1_792_300_000;
+
+/// The completion pass's stamp, the SHIPPED statement and binds (`D1PotStorage::stamp_pot_block_time`).
+fn stamp_block_time(conn: &Connection, txid: &str, block_secs: i64) -> usize {
+    conn.execute(
+        POT_BLOCK_TIME_STAMP_SQL,
+        params![block_secs, BLOCK_TIME_STAMP_SLACK_SECS as i64, txid],
+    )
+    .expect("POT_BLOCK_TIME_STAMP_SQL")
+}
+
+fn created_and_block_time(conn: &Connection, txid: &str) -> (Option<i64>, Option<i64>) {
+    conn.query_row(
+        "SELECT createdAt, blockTime FROM pot_records WHERE txid = ?1",
+        [txid],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .expect("row")
+}
+
+fn one(txid: &str) -> [Outpoint; 1] {
+    [Outpoint {
+        txid: txid.to_string(),
+        vout: 0,
+    }]
+}
+
+#[test]
+fn pre557_a_a_reindexed_pre_cutoff_pot_stays_written_off() {
+    let conn = production_schema_db();
+    let pot = h64(0xe1);
+    admit_pot(&conn, &pot, PRE557_NOW_SECS);
+    // what a NOW stamp alone does: the written-off era comes back
+    assert_eq!(
+        pots_view_rows(&conn, &one(&pot), Some(PRE557_CUT_MS)).len(),
+        1
+    );
+
+    let block = PRE557_CUT_MS / 1000 - 86_400;
+    assert_eq!(stamp_block_time(&conn, &pot, block), 1);
+    assert_eq!(
+        created_and_block_time(&conn, &pot),
+        (Some(block), Some(block))
+    );
+    assert!(
+        pots_view_rows(&conn, &one(&pot), Some(PRE557_CUT_MS)).is_empty(),
+        "stamped from its block, the pre-cutoff pot is written off again"
+    );
+}
+
+#[test]
+fn pre557_b_a_reindexed_post_cutoff_pot_keeps_its_real_time() {
+    let conn = production_schema_db();
+    let pot = h64(0xe2);
+    admit_pot(&conn, &pot, PRE557_NOW_SECS);
+    let block = PRE557_CUT_MS / 1000 + 30 * 86_400;
+    stamp_block_time(&conn, &pot, block);
+    assert_eq!(
+        created_and_block_time(&conn, &pot),
+        (Some(block), Some(block))
+    );
+    assert_eq!(
+        pots_view_rows(&conn, &one(&pot), Some(PRE557_CUT_MS)).len(),
+        1
+    );
+    // once: a later stamp (a re-anchored proof) moves nothing
+    assert_eq!(stamp_block_time(&conn, &pot, block - 99_999), 0);
+    assert_eq!(
+        created_and_block_time(&conn, &pot),
+        (Some(block), Some(block))
+    );
+}
+
+#[test]
+fn pre557_c_an_unmined_reindexed_pot_is_now_and_marked() {
+    let conn = production_schema_db();
+    let pot = h64(0xe3);
+    admit_pot(&conn, &pot, PRE557_NOW_SECS);
+    // the pass never stamps an unverified bump: the row is as admitted
+    assert_eq!(
+        created_and_block_time(&conn, &pot),
+        (Some(PRE557_NOW_SECS), None),
+        "NOW, and the NULL blockTime marks it"
+    );
+    let mut stmt = conn
+        .prepare(&pots_without_block_time_sql(2))
+        .expect("prepare");
+    let other = h64(0xe4);
+    let found: Vec<String> = stmt
+        .query_map(params![pot, other], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(
+        found,
+        vec![pot.clone()],
+        "named as unstamped; a txid with no pot row is not"
+    );
+    assert_eq!(
+        pots_view_rows(&conn, &one(&pot), Some(PRE557_CUT_MS)).len(),
+        1
+    );
+}
+
+#[test]
+fn pre557_d_a_live_pot_keeps_its_admission_time() {
+    let conn = production_schema_db();
+    let pot = h64(0xe5);
+    let block = PRE557_NOW_SECS;
+    admit_pot(&conn, &pot, block + 3_600);
+    stamp_block_time(&conn, &pot, block);
+    assert_eq!(
+        created_and_block_time(&conn, &pot),
+        (Some(block + 3_600), Some(block))
     );
 }

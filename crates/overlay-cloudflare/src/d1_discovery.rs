@@ -2393,6 +2393,28 @@ pub(crate) const POT_BEEF_MARK_PROVEN_AT_SQL: &str =
          proofHeight = COALESCE(?, proofHeight) \
      WHERE txid = ?";
 
+/// bsv-low #470 PRE557: the confirming block's time onto the pot row, once (`blockTime IS NULL`), and
+/// `createdAt` moved to it when the stamp sits more than the slack after the block
+/// (`overlay_discovery::pot::storage::created_at_after_block_time`, the same rule): a re-indexed row's
+/// NOW becomes its block's time, a live row admitted before its block keeps its admission time.
+/// Bind order: block time (secs), slack (secs), txid. Pub for the REAL-SQLite harnesses.
+pub const POT_BLOCK_TIME_STAMP_SQL: &str = "UPDATE pot_records SET blockTime = ?1, \
+         createdAt = CASE WHEN createdAt IS NULL OR createdAt > ?1 + ?2 THEN ?1 ELSE createdAt END \
+     WHERE txid = ?3 AND blockTime IS NULL";
+
+/// bsv-low #470 PRE557: of `n` txids, those naming a pot row with no `blockTime` (the primary key's
+/// leading column, a seek per txid). Pub for the REAL-SQLite harnesses.
+pub fn pots_without_block_time_sql(n: usize) -> String {
+    debug_assert!(n >= 1);
+    let placeholders = vec!["?"; n].join(", ");
+    format!(
+        "SELECT DISTINCT txid FROM pot_records WHERE txid IN ({placeholders}) AND blockTime IS NULL"
+    )
+}
+
+/// The txids per [`pots_without_block_time_sql`] statement (D1 binds at most 100).
+pub(crate) const POTS_WITHOUT_BLOCK_TIME_CHUNK: usize = 90;
+
 /// Chunk size for the batched anchored latch flip: 3 binds per row (the
 /// CASE arm's txid + height, the IN list's txid), 99 binds per statement.
 pub(crate) const POT_BEEF_MARK_PROVEN_AT_CHUNK: usize = 33;
@@ -3507,6 +3529,40 @@ impl PotStorage for D1PotStorage {
             .await
             .map_err(pot_err)?;
         Ok(row.is_some_and(|r| r.proof_verified.unwrap_or(0.0) != 0.0))
+    }
+
+    async fn pots_without_block_time(
+        &self,
+        txids: &[String],
+    ) -> Result<Vec<String>, PotStorageError> {
+        #[derive(Deserialize)]
+        struct Row {
+            txid: String,
+        }
+        let mut out = Vec::new();
+        for chunk in txids.chunks(POTS_WITHOUT_BLOCK_TIME_CHUNK) {
+            let mut q = Query::new(pots_without_block_time_sql(chunk.len()));
+            for txid in chunk {
+                q = q.bind(txid.as_str());
+            }
+            let rows: Vec<Row> = q.fetch_all(&self.db).await.map_err(pot_err)?;
+            out.extend(rows.into_iter().map(|r| r.txid));
+        }
+        Ok(out)
+    }
+
+    async fn stamp_pot_block_time(
+        &self,
+        txid: &str,
+        block_time_secs: u64,
+    ) -> Result<(), PotStorageError> {
+        Query::new(POT_BLOCK_TIME_STAMP_SQL)
+            .bind(block_time_secs as f64)
+            .bind(overlay_discovery::pot::storage::BLOCK_TIME_STAMP_SLACK_SECS as f64)
+            .bind(txid)
+            .execute(&self.db)
+            .await
+            .map_err(pot_err)
     }
 }
 

@@ -590,7 +590,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 295 to 327 for bsv-low #674 (2026-10-17, with its lens fold): the leaderboard derived at the write
 /// (`derived_board.rs`): four tables, four indexes, the total's row, twenty-one triggers (the page's cards and their
 /// frags included), the guarded backfill and its `board-v1` stamp.
-pub const OVERLAY_MIGRATION_COUNT: usize = 327;
+/// 327 to 329 for bsv-low #470 PRE557: `pot_records.blockTime`, the confirming block's header time, and the same
+/// column on `pot_records_evicted`. Overlay-internal (no app-layer read, so epoch Rule 24 does not bite).
+pub const OVERLAY_MIGRATION_COUNT: usize = 329;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2175,6 +2177,16 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_board::POST_DELETE,
     crate::derived_board::WINS_BACKFILL,
     crate::derived_board::STATE_DONE,
+    // 328: bsv-low #470 PRE557, the time of the block that confirms the pot's funding tx (the header time, unix
+    // seconds, of the chaintracks header its verified bump binds to), written once by the pot-beef completion
+    // pass (`POT_BLOCK_TIME_STAMP_SQL`). NULL = no confirming block known: `createdAt` is the overlay's own clock
+    // (an unmined pot, or a row the pass has not reached). The same pass moves a re-indexed row's `createdAt`
+    // (stamped NOW at its re-admission) to this time, so the #375 era filter keeps its row set.
+    "ALTER TABLE pot_records ADD COLUMN blockTime INTEGER",
+    // 329: the same column on the eviction twin (created at its own migration with the source's columns of that
+    // day; the shadow move copies the source's columns by name, and the run-time heal adds a missing one, but the
+    // shipped schema carries it, so a move or a byte-for-byte readmission never depends on the heal).
+    "ALTER TABLE pot_records_evicted ADD COLUMN blockTime INTEGER",
 ];
 
 // =============================================================================
