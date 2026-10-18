@@ -98,7 +98,14 @@ pub(crate) async fn run_tick(env: &Env, source: TickSource) -> TickReport {
     )
     .await;
     let result = match setup {
-        Some(Ok(())) => run_steps(env, deadline).await,
+        // NS-COST-BAR-1: every statement of the steps is summed by the step that issued it (`d1_ledger::label`),
+        // then added to the durable `d1_rows_read_<pass>_total` counters in one batch.
+        Some(Ok(())) => {
+            let (result, by_pass) =
+                crate::d1_ledger::passes("setup", run_steps(env, deadline)).await;
+            crate::ops::record_d1_rows_read(&db, &by_pass).await;
+            result
+        }
         Some(Err(e)) => Err(e),
         None => Err("tick setup exceeded its budget".to_string()),
     };
@@ -212,6 +219,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     );
     let result = overlay_engine::gasp::race_or_deadline_guarded(async {
 
+    crate::d1_ledger::label("proof_window");
     crate::proof_window::run_pass(&engine, &ops_db).await;
 
     // Give stored proof completion its own early slot. Held GASP graphs are
@@ -220,6 +228,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     let courier_counts = crate::courier_counters::Counters::new(crate::courier_counters::Reader::Janitor);
     let completion_fetcher = transaction_proof_fetcher(env).with_courier_counters(courier_counts.clone());
     let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
+    crate::d1_ledger::label("tx_completion");
     let (tx_completed, tx_fetch_failed) = match race_or_deadline(
         engine.complete_missing_proofs_with(&completion_fetcher, TRANSACTION_PROOF_COMPLETION_LIMIT, backstop_age),
         crate::broadcaster::sleep_ms(TRANSACTION_PROOF_COMPLETION_BUDGET_MS),
@@ -249,6 +258,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         }
     };
 
+    crate::d1_ledger::label("ad_sync");
     // Sync advertisements (if advertiser + hosting URL are configured).
     // Publishes any new SHIP/SLAP ads on-chain so peers can discover us.
     match engine.sync_advertisements().await {
@@ -282,15 +292,18 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // that step holds to its belt has swept. A dropped pass saved no cursor
     // and is made again. `run_pass` is the bounded pass the operator's lever
     // (`POST /internal/beef-blob-sweep`) runs too (the d3 fold-4).
+    crate::d1_ledger::label("beef_blob_sweep");
     crate::beef_blob_sweep::run_pass(env, &ops_db, "tick").await;
     // bsv-low #555 (the lens fold's M3): rows of deferred graphs nothing
     // will resume (a peer that never finishes a sync again) are swept initial.
+    crate::d1_ledger::label("gasp_deferred_sweep");
     crate::gasp_deferred::sweep_stale(&ops_db).await;
     // Engine 0.1.8: the remembered expired roots past their keep (hourly,
     // past their row bound too).
     crate::gasp_deferred::sweep_expired_outpoints(&ops_db, now_ms() as f64).await;
     // NL-6c: deferred EF jobs whose run ended without settling go back to the
     // queue; settled ones past their keep are swept with their bytes.
+    crate::d1_ledger::label("ef_deferred");
     crate::ef_deferred::redrive(env, &ops_db).await;
     // N5 (LOW's E585 land2 lens): one bounded pass over the deferred EF jobs'
     // R2 objects (`ef-deferred/`), counted for the health figure; an object no
@@ -302,6 +315,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // path) runs the same drain when invoked. An eligible fresh parked note within the next 128 rows of its set
     // reaches the app layer within one scheduled tick, about 16 minutes in the normal worst case, plus the app
     // layer's own delivery. The authenticated admin maintenance call can also drain it when invoked.
+    crate::d1_ledger::label("change_park");
     crate::change_park::drain_parked(env, &ops_db, crate::change_park::DrainTrigger::Tick).await;
     // The order (bsv-low #585 land2): the sweep's pass (its own 30 s race),
     // the stale graphs, the EF jobs' hand-back and keep sweep (no race of its
@@ -318,6 +332,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // graph is being submitted, and a submit dropped between its writes
     // leaves a head chain with no head. It waits for the transaction being
     // written and drops the sync at the boundary.
+    crate::d1_ledger::label("gasp_sync");
     let gasp_meter = overlay_engine::meter::LoadMeter::default();
     let mut gasp_result = None;
     match overlay_engine::gasp::race_or_deadline_guarded(
@@ -498,6 +513,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // `/submit` instead of `/requestSyncResponse`. Engine's tm_X
     // is_dupe check makes this idempotent ; crawling the same peer
     // twice in a row costs compute but admits nothing new.
+    crate::d1_ledger::label("peer_crawl");
     let peers = non_gasp_peers();
     // #257: bounded like GASP sync ; crawl submits are dupe-checked, so a
     // dropped crawl re-does nothing next tick.
@@ -559,6 +575,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // block-event pass is its fast path; this is the drought fallback and
     // the initial catch-up), BEFORE the confirmation chaser so a row it
     // demotes is re-chased in this same tick. Bounded on its own budget.
+    crate::d1_ledger::label("arcade_reorg");
     let _arcade = crate::tip_pass::run_arcade_reorg_pass(
         env,
         pot_storage.as_ref(),
@@ -569,6 +586,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         false,
     )
     .await;
+    crate::d1_ledger::label("pot_maintenance");
     let spend_fetcher = courier_fetcher(env, lookup_service_chain_tracker(env)).with_budget(20)
         .with_courier_counters(courier_counts.clone());
     let pot_tracker = lookup_service_chain_tracker(env);
@@ -602,6 +620,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // confirmation pass's 20-call budget and faulted 11 of 20 candidates on
     // "budget exhausted"): up to 4 courier calls per candidate, never a call
     // taken from the money-relevant confirmation pass.
+    crate::d1_ledger::label("missing_spends");
     let discovery_fetcher = courier_fetcher(env, lookup_service_chain_tracker(env))
         .with_budget(crate::proof_fetcher::MISSING_SPEND_FETCH_BUDGET)
         .with_courier_counters(courier_counts.clone());
@@ -657,6 +676,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     //    the durable pot_beefs bytes. No courier, no tracker ; pure re-reads
     //    of our own admitted bytes; a row with a missing funding BEEF stays
     //    a candidate (bounded per tick, RANDOM-sampled).
+    crate::d1_ledger::label("backfills");
     let backfill_summary = crate::proof_fetcher::backfill_decoded_params(
         pot_storage.as_ref(),
         crate::proof_fetcher::PARAMS_BACKFILL_LIMIT,
@@ -713,6 +733,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     //     chain, so no republish can ever re-latch it, and a row a transient
     //     predicate fault latched 0 sorts below even the legacy tier forever.
     //     `changed`/`demoted` in the log lines are the regression detector.
+    crate::d1_ledger::label("relatch");
     for summary in
         crate::relatch::run_relatch(ops_db.clone(), crate::relatch::RELATCH_PAGE_LIMIT).await
     {
@@ -733,6 +754,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
     // #602 fold (MEDIUM-2): the conflict pass's GETs ride the WoC key when one is installed.
     let woc_key = env.secret("WOC_API_KEY").ok().map(|k| k.to_string());
+    crate::d1_ledger::label("retire");
     let retire =
         crate::proof_fetcher::run_retire_pass(
         &ops_db,
@@ -762,6 +784,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     //    LOW-1), so it can never starve proof completion. Since the incident
     //    fix the attempts are RECORDED AND CAPPED (`run_rebroadcast_backstop`
     //    ; 3 lifetime attempts, spacing 1h/6h, dead-letter log at the cap).
+    crate::d1_ledger::label("rebroadcast");
     let tx_storage = D1Storage::new(ops_db.clone());
     let taal_key = env.secret("TAAL_API_KEY").ok().map(|s| s.to_string());
     let rb = crate::proof_fetcher::run_rebroadcast_backstop(
@@ -790,6 +813,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     //    ls_low. Raced like the other network-bound steps; both passes are
     //    idempotent, so a dropped tick just retries. Also poke-able via
     //    POST /admin/advert-lifecycle (the cron-poker doctrine).
+    crate::d1_ledger::label("advert_lifecycle");
     let advert_tracker = lookup_service_chain_tracker(env);
     match race_or_deadline(
         async {
@@ -830,6 +854,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     }
 
     // Add later LOW maintenance results without counting the early pass twice.
+    crate::d1_ledger::label("proofless_watch");
     let proofs_completed = tx_completed + pot_summary.completed as u64;
     let fetch_failed = tx_fetch_failed + pot_summary.fetch_failed as u64;
     let pot_beefs_compacted = pot_summary.completed as u64;
@@ -856,6 +881,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // so once GASP sync stopped eating the whole budget this step would be
     // the next unbounded candidate. A dropped janitor just retries evictions
     // next tick.
+    crate::d1_ledger::label("janitor");
     let janitor_config = overlay_engine::health_checker::JanitorConfig::default();
     let checker = WorkerHealthChecker;
     let hosting_url = env.var("HOSTING_URL").ok().map(|v| v.to_string());
@@ -920,6 +946,37 @@ pub(crate) fn faulted_summary(roots: &[overlay_engine::gasp::FaultedRoot]) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NS-COST-BAR-1: every step of the tick is labelled from the closed family set, each family once, the steps run
+    /// inside the pass scope, and the tick flushes the per-pass rows to the durable counters.
+    #[test]
+    fn ns_cost_every_tick_step_is_labelled_from_the_closed_set() {
+        let src = include_str!("tick.rs");
+        let body = &src[src.find("async fn run_steps(").unwrap()
+            ..src.find("pub(crate) fn faulted_summary").unwrap()];
+        let mut labels: Vec<&str> = body
+            .split("crate::d1_ledger::label(\"")
+            .skip(1)
+            .map(|rest| &rest[..rest.find('"').unwrap()])
+            .collect();
+        labels.sort_unstable();
+        let mut expected: Vec<&str> = crate::ops::D1_ROWS_READ_FAMILIES
+            .iter()
+            .copied()
+            .filter(|f| !["setup", "health_invariants"].contains(f))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            labels, expected,
+            "each tick family labelled once, none outside the set"
+        );
+        let tick = &src[src.find("pub(crate) async fn run_tick(").unwrap()
+            ..src.find("async fn run_steps(").unwrap()];
+        assert!(
+            tick.contains("crate::d1_ledger::passes(\"setup\", run_steps(env, deadline)).await")
+        );
+        assert!(tick.contains("crate::ops::record_d1_rows_read(&db, &by_pass).await"));
+    }
 
     /// Engine 0.1.9: the tick's per-topic line names each dropped root with
     /// its class, its faulted runs and whether the cursor passes it.

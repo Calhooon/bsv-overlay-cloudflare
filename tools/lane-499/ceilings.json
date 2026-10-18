@@ -278,5 +278,21 @@
       "censusKey": null
     }
   },
-  "censusKey": "the d1Budget route a production census holds against this ceiling (advisory there: production rows are not the fixture's); null = the route's maximum is another scenario's"
+  "censusKey": "the d1Budget route a production census holds against this ceiling (advisory there: production rows are not the fixture's); null = the route's maximum is another scenario's",
+  "d1RowsReadPerDay": {
+    "doc": "NS-COST-BAR-1 (the owner's cost word of 2026-10-18: no self-inflicted Cloudflare bill): the DAILY rows-read budget of LOW's own D1 databases per environment, judged by the daily census (scripts/d1-census.py, bsv-low docs/audit/D1-CENSUS-*-24H-*.md) and by the deltas of /health/invariants.d1RowsRead (the overlay's d1_rows_read_<family>_total counters) over a day. Scope: every LOW database of the environment (prod: low-overlay-db, low-relay-prod; beta: low-overlay-db-beta, low-identity-db-beta, low-identity-resolver-db-beta, low-relay-beta); the keeper's rust-chaintracks is FOREIGN, reported beside the budget and never inside it (its count of headers is the keeper's ask, docs/D1-BUDGETS.md). Raise a figure only with a new census and its reason in docs/D1-BUDGETS.md.",
+    "rule": "a day's rows over the environment's budget is RED; beside it the census's own 3x rule stands unchanged (a statement tag whose rows per query exceed 3x the previous loop's committed table is RED at the fold, bsv-low invariants.rules.json d1_census, floor 100 rows).",
+    "prod": {
+      "budget": 20000000,
+      "why": "the 24-hour census of 2026-10-17 (2026-10-17T00:03:52Z to 2026-10-18T00:03:52Z) read 8.9 M rows a day on low-overlay-db in its 60 listed tags; the statements PR #86 (#643, #644, #645) and NS-COST-BAR-1 bound account for 5.1 M of them, leaving about 3.8 M plus the 105 unlisted tags. 20 M is about 5x that remainder: the census's own 3x margin over it with room for the unlisted tail; and well under the 73 M the environment read that day, 61 M of it the keeper's count of headers.",
+      "censusBefore": 8944413,
+      "expectedAfter": 3822258
+    },
+    "beta": {
+      "budget": 60000000,
+      "why": "the same census read 98.5 M rows a day on low-overlay-db-beta (60 listed tags), 88.8 M of them in the statements PR #86 and NS-COST-BAR-1 bound, leaving about 9.7 M, plus 6.4 M on low-identity-db-beta and 0.6 M on the resolver's: about 16.7 M. 60 M is about 3.5x that (the census's 3x margin and the fleet's beta load, which runs ahead of prod), and half the 122 M the environment read that day.",
+      "censusBefore": 105450042,
+      "expectedAfter": 16682414
+    }
+  }
 }

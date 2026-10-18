@@ -80,13 +80,21 @@ impl RouteBudget {
 }
 
 thread_local! {
+    /// NS-COST-BAR-1: the pass ledger of the [`Passes`] future being polled, if any (see [`passes`]).
+    static PASS: RefCell<Option<Rc<RefCell<PassLedger>>>> = const { RefCell::new(None) };
     static CURRENT: RefCell<Option<Rc<Cell<Tally>>>> = const { RefCell::new(None) };
     static UNSCOPED: Cell<Tally> = const { Cell::new(Tally { reads: 0, writes: 0, stmts: 0, max_reads: 0 }) };
     static ROUTES: RefCell<BTreeMap<&'static str, RouteBudget>> = const { RefCell::new(BTreeMap::new()) };
 }
 
-/// Fold one statement into the request in scope, or into `unscoped` when none is.
+/// Fold one statement into the request in scope, or into `unscoped` when none is (and, NS-COST-BAR-1, into the
+/// pass in scope, if any: the two are independent, so a pass inside a request counts on both).
 pub fn note(reads: u64, writes: u64) {
+    if let Some(p) = PASS.with(|c| c.borrow().clone()) {
+        let mut p = p.borrow_mut();
+        let label = p.label;
+        p.by_pass.entry(label).or_default().add(reads, writes);
+    }
     let scoped = CURRENT.with(|c| c.borrow().clone());
     match scoped {
         Some(t) => {
@@ -135,6 +143,63 @@ pub fn scoped<F: Future>(fut: F) -> Scoped<F> {
         tally: Rc::new(Cell::new(Tally::default())),
         fut: Box::pin(fut),
     }
+}
+
+/// NS-COST-BAR-1: what one run of a pass family (one maintenance tick's steps) cost D1, by the pass that issued
+/// each statement. The labels are a closed set chosen by the caller ([`label`]), so the map cannot grow from input.
+#[derive(Debug, Default)]
+pub struct PassLedger {
+    label: &'static str,
+    by_pass: BTreeMap<&'static str, Tally>,
+}
+
+/// NS-COST-BAR-1: name the pass the next statements of the [`Passes`] future in scope belong to (a no-op outside
+/// one). Called between a tick's steps: they run one after another inside one future, so each statement lands on the
+/// step that issued it. Work a step hands to `wait_until` is polled outside the scope and is not a pass's.
+pub fn label(name: &'static str) {
+    if let Some(p) = PASS.with(|c| c.borrow().clone()) {
+        p.borrow_mut().label = name;
+    }
+}
+
+/// A future whose D1 statements are summed per [`label`] (see [`passes`]).
+pub struct Passes<F> {
+    ledger: Rc<RefCell<PassLedger>>,
+    fut: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for Passes<F> {
+    type Output = (F::Output, BTreeMap<&'static str, Tally>);
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mine = self.ledger.clone();
+        let prev = PASS.with(|c| c.borrow_mut().replace(mine));
+        let out = self.fut.as_mut().poll(cx);
+        PASS.with(|c| *c.borrow_mut() = prev);
+        match out {
+            Poll::Ready(v) => {
+                Poll::Ready((v, std::mem::take(&mut self.ledger.borrow_mut().by_pass)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// NS-COST-BAR-1: run `fut` with its statements summed per pass, starting under `first`; resolves to its output and
+/// the per-pass tallies. Independent of the request's tally ([`scoped`]): both count every statement.
+pub fn passes<F: Future>(first: &'static str, fut: F) -> Passes<F> {
+    Passes {
+        ledger: Rc::new(RefCell::new(PassLedger {
+            label: first,
+            by_pass: BTreeMap::new(),
+        })),
+        fut: Box::pin(fut),
+    }
+}
+
+/// NS-COST-BAR-1: the tally of the request in scope so far (`None` outside one): what a handler has cost D1 up to
+/// the call, for a handler that records its own figure durably (`/health/invariants`).
+pub fn current() -> Option<Tally> {
+    CURRENT.with(|c| c.borrow().as_ref().map(|t| t.get()))
 }
 
 /// The ledger's key for a path: the known route it names (exact, or the route followed by `/` for a route with a
@@ -403,6 +468,66 @@ mod tests {
             cx.waker().wake_by_ref();
             Poll::Pending
         }
+    }
+
+    #[test]
+    fn ns_cost_each_statement_lands_on_the_pass_that_issued_it_and_on_the_request() {
+        // NS-COST-BAR-1: a tick's steps run one after another inside one `passes` future; each statement lands on the
+        // label in force when it was noted, a neighbour request polled between them is not a pass's, and the
+        // request's own tally still counts the pass's statements.
+        struct Steps {
+            at: u32,
+        }
+        impl Future for Steps {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                match self.at {
+                    0 => note(5, 0),
+                    1 => {
+                        label("gc");
+                        note(7, 1);
+                    }
+                    2 => note(11, 0),
+                    3 => {
+                        label("relatch");
+                        note(13, 0);
+                    }
+                    _ => return Poll::Ready(()),
+                }
+                self.at += 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut request = Box::pin(scoped(passes("first", Steps { at: 0 })));
+        let mut neighbour = Box::pin(scoped(Statements {
+            left: 4,
+            reads_each: 1000,
+        }));
+        let mut by_pass = None;
+        let mut total = None;
+        while by_pass.is_none() {
+            if let Poll::Ready((((), p), t)) = request.as_mut().poll(&mut cx) {
+                by_pass = Some(p);
+                total = Some(t);
+            }
+            let _ = neighbour.as_mut().poll(&mut cx);
+        }
+        label("ignored"); // outside any pass: a no-op
+        let by_pass = by_pass.unwrap();
+        let reads: Vec<_> = by_pass
+            .iter()
+            .map(|(k, t)| (*k, t.reads, t.stmts))
+            .collect();
+        assert_eq!(reads, [("first", 5, 1), ("gc", 18, 2), ("relatch", 13, 1)]);
+        assert_eq!(
+            total.unwrap().reads,
+            36,
+            "the request counts the pass's statements too"
+        );
+        assert_eq!(current(), None, "no request in scope here");
     }
 
     #[test]
