@@ -6751,6 +6751,240 @@ mod tests {
             2 * SEAT_MARKERS_BINDS_PER_POT
         );
     }
+
+    /// bsv-low #618 (L2): the owed judgement over coin words, through the REAL assembly of a real covenant settle (a
+    /// winner-A payout the overlay holds unconfirmed) and the real derivation, for the winner and the loser. Legacy =
+    /// the latch's pair as hydrated; L2 = `owed::apply_word_arm` over the same rows. Both runs carry the same tracker
+    /// views (production supplies them), so the third arm is the only difference. Every row whose word and arm AGREE
+    /// is byte-identical; the four classes that change are named, each with its why.
+    #[test]
+    fn l2_owed_rows_follow_the_coin_word_byte_identical_where_word_and_arm_agree() {
+        use crate::owed::{apply_word_arm, derive_owed_rows, OwedFamily};
+        use crate::tracker_host::{served, HeaderSnapshot};
+        use bsv_tracker::{
+            Evidence, Header, Hint, HintStatus, HostAction, Input, Params, Proof, State,
+        };
+        use serde_json::Value;
+        let (ka, pa) = real_key(41);
+        let (kb, pb) = real_key(42);
+        let w_winner = wallet_of(0x51);
+        let w_loser = wallet_of(0x52);
+        let winner = identity_of(&w_winner);
+        let loser = identity_of(&w_loser);
+        let gid = tx(0x01);
+        let params = params_with_keys(&pa, &pb);
+        let lock = covenant_lock(&params);
+        let f_raw = raw_tx(&"11".repeat(32), 0, 0xffff_ffff, &[(1000, lock)], 0);
+        let f_id = bsv_rs::transaction::Transaction::from_binary(&f_raw)
+            .unwrap()
+            .id();
+        let outs = vec![
+            (10u64, p2pkh_lock(&params.rake_pkh)),
+            (980u64, p2pkh_lock(&params.pay_pkh_a)),
+        ];
+        let s_raw = raw_tx(&f_id, 0, 0xffff_ffff, &outs, 0);
+        let s_id = bsv_rs::transaction::Transaction::from_binary(&s_raw)
+            .unwrap()
+            .id();
+        let won = real_seat_marker(&ka, &pa, &w_winner, &winner, &loser, &gid, &f_id, 0);
+        let lost = real_seat_marker(&kb, &pb, &w_loser, &loser, &winner, &gid, &f_id, 0);
+        let marker_of = |who: &str| if who == winner { &won } else { &lost };
+        let row_of = |who: &str, confirmed: bool, latch: bool, fin: bool| {
+            let marker = marker_of(who);
+            ResultsRow {
+                identity: marker.identity.clone(),
+                game_id: gid.clone(),
+                pot_txid: f_id.clone(),
+                pot_vout: 0,
+                recovery_height: marker.recovery_height,
+                opponent_identity: marker.opponent_identity.clone(),
+                spent: Some(true),
+                spending_txid: Some(s_id.clone()),
+                spent_confirmed: Some(confirmed),
+                funding_beef_hex: Some(beef_hex_of(&f_raw)),
+                spender_beef_hex: Some(beef_hex_of(&s_raw)),
+                seat_settle_pubkey: Some(marker.seat_settle_pubkey.clone()),
+                seat_sig_hex: Some(marker.seat_sig_hex.clone()),
+                marker_sig_hex: Some(marker.identity_sig_hex.clone()),
+                spender_seen: Some(latch),
+                spender_final: Some(fin),
+                ..Default::default()
+            }
+        };
+        // the seat a row is assembled for is the identity it is read for
+        let row = |confirmed: bool, latch: bool, fin: bool| (confirmed, latch, fin);
+        // the spender's words, as `runtime::views` serves them (rechecked against the header at 900)
+        let headers = HeaderSnapshot {
+            tip: Ok(900),
+            headers: std::collections::BTreeMap::from([(
+                900,
+                Ok(Some(Header {
+                    hash: tx(0x77),
+                    merkle_root: s_id.clone(),
+                })),
+            )]),
+        };
+        let p = Params { age_threshold: 60 };
+        let hinted = |status: HintStatus| {
+            let mut st = State::new(&s_id);
+            st.step(&p, &headers, Input::Host(HostAction::Build))
+                .unwrap();
+            st.step(&p, &headers, Input::Hint(Hint::new("arcade", status, 5)))
+                .unwrap();
+            served::fields(&st)
+        };
+        let mined = {
+            let mut st = State::new(&s_id);
+            st.step(
+                &p,
+                &headers,
+                Input::Evidence(Evidence::Proof(
+                    Proof::new(
+                        &s_id,
+                        bsv_rs::transaction::MerklePath::from_coinbase_txid(&s_id, 900),
+                    )
+                    .unwrap(),
+                )),
+            )
+            .unwrap();
+            served::fields(&st)
+        };
+        let mut stale = mined.clone();
+        stale["word"] = serde_json::json!("stale");
+        stale["verifyPath"] = Value::Null;
+        let mut cannot = mined.clone();
+        cannot["verifyPath"] = Value::Null;
+        cannot["cannotCheck"] = serde_json::json!("header snapshot changed");
+        let words = |w: Option<Value>| {
+            w.map(|w| std::collections::BTreeMap::from([(s_id.clone(), w)]))
+                .unwrap_or_default()
+        };
+        let owed_rows = |who: &str,
+                         r: (bool, bool, bool),
+                         views: &std::collections::BTreeMap<String, Value>,
+                         l2: bool| {
+            let mut rows = vec![row_of(who, r.0, r.1, r.2)];
+            if l2 {
+                apply_word_arm(&mut rows, &mut [], &mut [], views);
+            }
+            let entries = assemble_like_the_route(
+                who,
+                rows,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            );
+            let (v, c, pots) = Default::default();
+            let mut i = crate::owed::tests::inputs(&entries, &[], &[], &v, &c, &pots, Some(901));
+            i.identity_lc = who;
+            i.spender_words = Some(views);
+            derive_owed_rows(&i)
+        };
+        // AGREE: the coin word says what the latch said
+        for (name, r, w) in [
+            (
+                "latch, final, seen",
+                row(false, true, true),
+                Some(hinted(HintStatus::Seen)),
+            ),
+            (
+                "latch, final, checked mined",
+                row(false, true, true),
+                Some(mined.clone()),
+            ),
+            (
+                "latch, NON-final, seen",
+                row(false, true, false),
+                Some(hinted(HintStatus::Seen)),
+            ),
+            (
+                "no latch, announced",
+                row(false, false, true),
+                Some(hinted(HintStatus::Accepted)),
+            ),
+            ("no latch, no word", row(false, false, true), None),
+            (
+                "index proof, stale",
+                row(true, false, true),
+                Some(stale.clone()),
+            ),
+            (
+                "index proof, cannotCheck",
+                row(true, true, true),
+                Some(cannot.clone()),
+            ),
+            ("index proof, no word", row(true, false, false), None),
+        ] {
+            let views = words(w);
+            for who in [winner.as_str(), loser.as_str()] {
+                let legacy = owed_rows(who, r, &views, false);
+                let after = owed_rows(who, r, &views, true);
+                assert_eq!(
+                    serde_json::to_string(&legacy).unwrap(),
+                    serde_json::to_string(&after).unwrap(),
+                    "{name} ({who}): an agreeing row must be byte-identical"
+                );
+            }
+        }
+        // CHANGED, class 1: the latch without a word (a dropped `seen` event, the word store behind) withholds the
+        // verdict: the winner's awaiting payout becomes the unbound chain wait, the loser's hidden loss becomes one too.
+        // Neither was claimable; both converge when the spend mines (the index proof or a checked word).
+        for w in [None, Some(hinted(HintStatus::Accepted))] {
+            let views = words(w);
+            let legacy = owed_rows(&winner, row(false, true, true), &views, false);
+            let after = owed_rows(&winner, row(false, true, true), &views, true);
+            assert_eq!(
+                (legacy[0].family, legacy[0].facts["claimable"].clone()),
+                (OwedFamily::Payout, serde_json::json!(false))
+            );
+            assert_eq!(after[0].family, OwedFamily::Unbound);
+            assert_eq!(
+                after[0].reason.as_deref(),
+                Some(crate::owed::SPEND_AWAITING_BLOCK_REASON)
+            );
+            assert_eq!(after[0].facts["chainWait"], "block");
+            assert!(owed_rows(&loser, row(false, true, true), &views, false).is_empty());
+            let loser_after = owed_rows(&loser, row(false, true, true), &views, true);
+            assert_eq!(loser_after[0].family, OwedFamily::Unbound);
+            assert_eq!(
+                loser_after[0].reason.as_deref(),
+                Some(crate::owed::SPEND_AWAITING_BLOCK_REASON)
+            );
+        }
+        // CHANGED, class 2: a CHECKED mined word with no latch and no index proof lands: the winner's unclassified row
+        // becomes the claimable payout (the coin word is the claim's own bar), the loser's row leaves.
+        let views = words(Some(mined.clone()));
+        let legacy = owed_rows(&winner, row(false, false, true), &views, false);
+        assert_eq!(
+            legacy[0].reason.as_deref(),
+            Some("the spend is not classified yet (no verdict)")
+        );
+        let after = owed_rows(&winner, row(false, false, true), &views, true);
+        assert_eq!(after[0].family, OwedFamily::Payout);
+        assert_eq!(after[0].facts["claimable"], true);
+        assert_eq!(after[0].facts["coinWord"]["word"], "spent");
+        assert!(owed_rows(&loser, row(false, false, true), &views, true).is_empty());
+        // CHANGED, class 3: a chain word this pass could not hold as checked (stale, cannotCheck) with no latch and no
+        // index proof: the outcome is told, awaiting the chain, never claimable.
+        for w in [stale.clone(), cannot.clone()] {
+            let views = words(Some(w));
+            let legacy = owed_rows(&winner, row(false, false, true), &views, false);
+            assert_eq!(legacy[0].family, OwedFamily::Unbound);
+            let after = owed_rows(&winner, row(false, false, true), &views, true);
+            assert_eq!(after[0].family, OwedFamily::Payout);
+            assert_eq!(after[0].facts["claimable"], false);
+            assert_eq!(after[0].facts["chainWait"], "block");
+        }
+        // CHANGED, class 4: a final `seen` word with no latch (the latch's write lost, the word written): the outcome is
+        // told, awaiting the chain, never claimable.
+        let views = words(Some(hinted(HintStatus::Seen)));
+        let after = owed_rows(&winner, row(false, false, true), &views, true);
+        assert_eq!(after[0].family, OwedFamily::Payout);
+        assert_eq!(after[0].facts["claimable"], false);
+        assert_eq!(
+            after[0].facts["claimReason"],
+            crate::owed::UNCONFIRMED_PAYOUT_REASON
+        );
+    }
 }
 
 #[cfg(test)]

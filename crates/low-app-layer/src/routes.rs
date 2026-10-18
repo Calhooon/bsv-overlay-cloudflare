@@ -3431,8 +3431,8 @@ async fn owed_recompute_inner(
         crate::owed_cursor::select(candidates, era, crate::results::RESULTS_UNKNOWN_POT_QUOTA);
     let (party_pages, mut walk_cut) =
         crate::owed_cursor::party_walk(&selected, OWED_WALK_MAX_PAGES);
-    let mut results = Vec::new();
-    let mut refunds = Vec::new();
+    // bsv-low #618 (L2): every page is hydrated first and assembled after the coin words are read (below)
+    let mut party_rows = Vec::new();
     for page in party_pages {
         let mut result_rows = Vec::new();
         let mut refund_rows = Vec::new();
@@ -3461,12 +3461,7 @@ async fn owed_recompute_inner(
                 );
             }
         }
-        results.extend(
-            gather_result_rows(db, identity_lc, result_rows, false)
-                .await?
-                .0,
-        );
-        refunds.extend(crate::refund_view::assemble_refund_view(refund_rows, tip));
+        party_rows.push((result_rows, refund_rows));
     }
 
     // 3. Same cursor discipline for the funded hop outpoints and their oldest marker rows.
@@ -3481,7 +3476,7 @@ async fn owed_recompute_inner(
     let (hop_pages, hop_cut) = crate::owed_cursor::hop_walk(&selected_hops, OWED_WALK_MAX_PAGES);
     walk_cut |= hop_cut;
     let selected_hops: Vec<_> = hop_pages.into_iter().flatten().collect();
-    let mut hops = Vec::new();
+    let mut hop_chunks: Vec<Vec<crate::hops_view::HopsViewRow>> = Vec::new();
     for chunk in selected_hops.chunks(crate::owed_cursor::PAGE) {
         let encoded = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
         let rows = db
@@ -3495,6 +3490,60 @@ async fn owed_recompute_inner(
             .into_iter()
             .map(HopsViewRowD1::into_row)
             .collect();
+        hop_chunks.push(rows);
+    }
+
+    // 3b. bsv-low #618 (L2): the owed judgement reads each recorded spender's COIN WORD (the tracker's rechecked
+    //     view) for the landing bar's third arm, never the `network_seen` latch (`owed::apply_word_arm`): a checked
+    //     `mined` lands, a final `seen` (or a chain word this pass could not check) awaits the chain, the rest are
+    //     withheld; the index's own proof (the bar's first two arms) is never read here, so no word vetoes it. One
+    //     PK read of `tx_words` for these spenders; the later read (6) asks only the subjects not read here. A
+    //     word-store fault keeps the latch's pair (NS-3's fault contract: the legacy answer, counted
+    //     `tracker_lookup_faults_total`), and the later read is then skipped so every word input of the pass is
+    //     the legacy one.
+    let arm_ids = crate::owed::word_arm_subjects(
+        party_rows
+            .iter()
+            .flat_map(|(results, refunds)| {
+                results
+                    .iter()
+                    .map(|r| r.spending_txid.as_deref())
+                    .chain(refunds.iter().map(|r| r.spending_txid.as_deref()))
+            })
+            .chain(
+                hop_chunks
+                    .iter()
+                    .flatten()
+                    .map(|r| r.spending_txid.as_deref()),
+            ),
+    );
+    let arm_rows = crate::tracker_host::runtime::read_soft(env, &arm_ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    let arm_views = match &arm_rows {
+        Some(rows) => Some(crate::tracker_host::runtime::views(env, rows).await),
+        None => None,
+    };
+    if let Some(views) = &arm_views {
+        for (result_rows, refund_rows) in &mut party_rows {
+            crate::owed::apply_word_arm(result_rows, refund_rows, &mut [], views);
+        }
+        for rows in &mut hop_chunks {
+            crate::owed::apply_word_arm(&mut [], &mut [], rows, views);
+        }
+    }
+    let mut results = Vec::new();
+    let mut refunds = Vec::new();
+    for (result_rows, refund_rows) in party_rows {
+        results.extend(
+            gather_result_rows(db, identity_lc, result_rows, false)
+                .await?
+                .0,
+        );
+        refunds.extend(crate::refund_view::assemble_refund_view(refund_rows, tip));
+    }
+    let mut hops = Vec::new();
+    for rows in hop_chunks {
         hops.extend(crate::hops_view::assemble_hops_view(rows).0);
     }
 
@@ -4465,12 +4514,20 @@ async fn owed_recompute_inner(
     word_ids.extend(hops.iter().filter_map(|h| h.spending_txid.clone()));
     word_ids.extend(hop_chain.values().filter_map(|h| h.spending_txid.clone()));
     word_ids.extend(hop_sweeps.values().map(|h| h.sweep_txid.clone()));
-    let word_ids: Vec<_> = word_ids.into_iter().collect();
-    let word_lookup = crate::tracker_host::runtime::read_soft(env, &word_ids)
-        .await
-        .map_err(|e| e.to_string())?;
+    // bsv-low #618: the arm's subjects were read at 3b; only the rest are read here, and both maps are one
+    let word_ids: Vec<_> = word_ids
+        .into_iter()
+        .filter(|id| arm_ids.binary_search(id).is_err())
+        .collect();
+    let word_lookup = match &arm_rows {
+        Some(_) => crate::tracker_host::runtime::read_soft(env, &word_ids)
+            .await
+            .map_err(|e| e.to_string())?,
+        None => None,
+    };
     let word_lookup_available = word_lookup.is_some();
-    let word_rows = word_lookup.unwrap_or_default();
+    let extra_rows = word_lookup.unwrap_or_default();
+    let mut word_rows = arm_rows.unwrap_or_default();
 
     // 6b. the NON-POT spenders' bytes (a sweep, a wallet's own spend, the seat's own competitor), bounded per recompute:
     //     every P2PKH output's pkh + sats and every INPUT outpoint, from the BEEF the index holds (with the index's own
@@ -4510,7 +4567,9 @@ async fn owed_recompute_inner(
     let mut spender_bytes_to_persist: Vec<(String, crate::owed::StoredSpenderBytes)> = Vec::new();
     // the tracker's words RECHECKED against chaintracks (the views `spender_mined` reads), built before the spender
     // phases so phase 2b's candidates read the same word the confirmation does (the #693 fold's MEDIUM-1)
-    let spender_words = crate::tracker_host::runtime::views(env, &word_rows).await;
+    let mut spender_words = crate::tracker_host::runtime::views(env, &extra_rows).await;
+    spender_words.extend(arm_views.unwrap_or_default());
+    word_rows.extend(extra_rows);
     {
         // the spenders, newest hop first (the marker's filing time), dedup'd, pots excluded
         let mut ordered: Vec<(i64, String)> = Vec::new();
