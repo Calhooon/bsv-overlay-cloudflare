@@ -3503,7 +3503,9 @@ async fn owed_recompute_inner(
     //     the legacy one. The mixed direction (this read answers, the later one faults) is conservative: the arm's
     //     words are applied, but `word_lookup_available` is false, so `spender_mined` falls back to the legacy
     //     claimability and for that pass a checked word tells the outcome without the press (the W2-WORDS lens's
-    //     NOTE-3).
+    //     NOTE-3). Stated (its LOW-4): the public `/results`, `/refund-view` and `/hops-view` still read the latch,
+    //     so during convergence they can tell an outcome `/owed` withholds and the reverse (display only; the
+    //     press reads `/owed`), until C1 moves them to the coin word (bsv-low #737).
     let arm_ids = crate::owed::word_arm_subjects(
         party_rows
             .iter()
