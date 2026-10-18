@@ -194,6 +194,96 @@ pub async fn body_loaded(
     };
     Ok(decorate_lookup(value, subject, views.as_ref()))
 }
+/// bsv-low #617 (L1): the outpoint routes' (`/utxo-status`, `/spent-any`) txids to read words for: every entry's
+/// own creating txid (its `fundingWord`) beside the spender subjects [`body`] reads.
+pub fn outpoint_ids(value: &Value) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    subjects(value, &mut ids);
+    if let Some(entries) = value.as_array() {
+        ids.extend(
+            entries
+                .iter()
+                .filter_map(|e| e["txid"].as_str())
+                .filter(|s| crate::logic::valid_txid(s))
+                .map(str::to_ascii_lowercase),
+        );
+    }
+    ids.into_iter().collect()
+}
+
+/// bsv-low #617 (L1): each outpoint entry of `/utxo-status` and `/spent-any` serves two words beside every legacy
+/// field (additive, the legacy keys and values untouched):
+/// - `fundingWord`: the tracker's tuple `{word, tier, height, verifyPath, ...}` for the entry's own creating txid (the
+///   design's `networkSeen` successor; `unknown` with no row);
+/// - `lock`: the coin word of the outpoint, `{word, txid, tier, height, verifyPath}`: `spent` when the recorded
+///   spender's word is a CHECKED `mined` (its verify path served), `suspended` when that word is `stale`, `locked`
+///   for any other pointer (a recorded spender the chain has not confirmed), `unspent` for a known outpoint with no
+///   spender (`unspent_word`: the index's `free` on `/utxo-status`, the couriers' `unspentAsFarAsAsked` on
+///   `/spent-any`, with `unspent_tier`), and `unknown` where the route could not say. `lost(c)` needs an intended
+///   spender, which a public outpoint read does not have, so it is never served here.
+pub fn decorate_outpoints(
+    value: &mut Value,
+    views: &BTreeMap<String, Value>,
+    unspent_word: &str,
+    unspent_tier: &str,
+) {
+    let Some(entries) = value.as_array_mut() else {
+        return;
+    };
+    let word_of = |id: &str| {
+        let id = id.to_ascii_lowercase();
+        views
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| super::served::fields(&State::new(&id)))
+    };
+    for entry in entries {
+        let Some(txid) = entry["txid"].as_str().map(str::to_string) else {
+            continue;
+        };
+        let funding = word_of(&txid);
+        let spender = entry["spendingTxid"].as_str().map(str::to_ascii_lowercase);
+        let lock = match (&entry["known"], &entry["spent"], spender) {
+            (Value::Bool(true), Value::Bool(true), Some(s)) => {
+                let w = word_of(&s);
+                let coin = if w["word"] == "mined" && !w["verifyPath"].is_null() {
+                    "spent"
+                } else if w["word"] == "stale" {
+                    "suspended"
+                } else {
+                    "locked"
+                };
+                crate::owed::coin_word_value(coin, &s, &w)
+            }
+            (Value::Bool(true), Value::Bool(false), _) => {
+                json!({"word":unspent_word,"txid":null,"tier":unspent_tier,"height":null,"verifyPath":null})
+            }
+            _ => {
+                json!({"word":"unknown","txid":null,"tier":"host","height":null,"verifyPath":null})
+            }
+        };
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("fundingWord".into(), funding);
+            obj.insert("lock".into(), lock);
+        }
+    }
+}
+
+/// bsv-low #617 (L1): `/utxo-status`'s body: [`body`]'s spender words plus each entry's `fundingWord` and `lock`
+/// ([`decorate_outpoints`], the index's `free`). A word-store read fault serves the legacy body unchanged.
+pub async fn outpoint_body(env: &worker::Env, raw: &str) -> worker::Result<String> {
+    let mut value: Value =
+        serde_json::from_str(raw).map_err(|e| worker::Error::RustError(e.to_string()))?;
+    let ids = outpoint_ids(&value);
+    let Some(rows) = read_soft(env, &ids).await? else {
+        return Ok(value.to_string());
+    };
+    let views = views(env, &rows).await;
+    decorate(&mut value, None, &views);
+    decorate_outpoints(&mut value, &views, "free", "host");
+    Ok(value.to_string())
+}
+
 /// Owed snapshots already persist their word tuples in facts. Recheck those
 /// proofs without another D1 lookup or a read-triggered fallback write.
 pub async fn owed_body(env: &worker::Env, value: &mut Value) {
@@ -255,7 +345,7 @@ pub async fn owed_body(env: &worker::Env, value: &mut Value) {
                     };
                     obj.insert(
                         "coinWord".into(),
-                        json!({"word":coin,"txid":id,"height":word["height"]}),
+                        crate::owed::coin_word_value(coin, &id, word),
                     );
                     obj.insert("spenderWord".into(), word.clone());
                 }

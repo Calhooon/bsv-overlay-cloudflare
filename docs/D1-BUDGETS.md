@@ -58,13 +58,13 @@ that starts writing reds); statements measured + 2 (a loop that reads per row ov
 
 | scenario | route | measured reads / writes / stmts | ceiling reads / writes / stmts |
 |---|---|---|---|
-| utxo-status-8 | `/utxo-status?outpoints=` A's 8 pots | 16 / 0 / 2 | 24 / 0 / 4 |
+| utxo-status-8 | `/utxo-status?outpoints=` A's 8 pots | 24 / 0 / 3 | 36 / 0 / 5 |
 | pots-view-8 | `/pots-view?outpoints=` A's 8 pots | 8 / 0 / 1 | 12 / 0 / 3 |
 | results-view-compute | `/results?identity=A`, the actor's compute (`d1view`) | 191 / 0 / 6 | 287 / 0 / 8 |
 | results-forward | `/results?identity=A`, the forwarding request (`d1`) | 0 / 0 / 0 | 4 / 0 / 2 |
 | owed-first-read | `/owed?identity=A`, the first read (compute on read, its write) | 363 / 18 / 28 | 528 / 20 / 28 |
 | owed-served-read | `/owed?identity=A`, a served read | 17 / 0 / 2 | 26 / 0 / 4 |
-| spent-any-20 | `/spent-any?outpoints=` 20 known spends of proven fleet transactions (the index-proof read) | 120 / 0 / 5 | 180 / 0 / 7 |
+| spent-any-20 | `/spent-any?outpoints=` 20 known spends of proven fleet transactions (the index-proof read) | 140 / 0 / 5 | 210 / 0 / 7 |
 | submit-admit-1 | `/submit`, an operator `historical-tx-no-spv` submit admitting one tm_collected output | 0 / 13 / 7 | 4 / 15 / 9 |
 
 | record-potparty-filing | `/record?kind=potparty`, signed stranger naming A's live pot | 11 / 7 / 6 | 17 / 9 / 8 |
@@ -140,6 +140,8 @@ next read. The filing baseline is 11 reads / 7 writes / 6 statements on the 300-
 margin rule gives 17 / 9 / 8. Its detached filer walk retains the `owed-recompute` ledger.
 
 `/utxo-status` re-measured 2026-10-13 (bsv-low E649 L6, `make ci-d1-budget`, local fixture D1): 16 reads / 0 writes / 2 statements, from 8 / 0 / 1. The added statement is the eviction ledger read (`logic::evictions_by_txid_sql`, `pot_evictions WHERE txid IN (..)` on its primary key, one chunk of distinct txids per 45): one row read per distinct requested txid, so at most 64 more per request at the route's 64-outpoint cap. It writes nothing. The margin rule gives 24 / 0 / 4.
+
+`/utxo-status` and `/spent-any` re-measured 2026-10-18 (bsv-low #617, the LOW words map L1, `make ci-d1-budget`, local fixture D1): `/utxo-status` 24 reads / 0 writes / 3 statements, from 16 / 0 / 2; `/spent-any` 140 / 0 / 5, from 120 / 0 / 5 (its `maxReads` 40 unchanged). Each entry now serves `fundingWord`, the tracker word of the outpoint's own creating txid, so the word read (`tracker_host::stored::READ`, `tx_words` by primary key over `json_each`) names the entries' txids beside their spenders: one row read per distinct requested txid that holds a word, at most 64 more at the route's 64-outpoint cap. `/utxo-status` had no word read before a spender existed, hence its added statement; `/spent-any` already read words for its spenders, so its statement count holds. Neither writes. The margin rule gives 36 / 0 / 5 and 210 / 0 / 7.
 
 Owed first read re-measured 2026-10-12 after the #610 fold rebased onto main `13f0e66`: 363 reads / 18 writes / 28 statements (`make ci-d1-budget`, local fixture D1). The markerless cursor and candidates reads, #610, account for the two additional statements. The existing 28-statement ceiling is retained: zero statement margin; it is a bar, not a knob. Other scenario baselines above remain the 2026-10-07 measurements.
 

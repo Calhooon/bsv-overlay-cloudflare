@@ -15,7 +15,7 @@ const get = async (path) => {
 }
 const legacy = (v) => {
   if (Array.isArray(v)) return v.map(legacy)
-  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).filter(([k]) => !['tracker','spenderWord','coinWord'].includes(k)).map(([k,v]) => [k,legacy(v)]))
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).filter(([k]) => !['tracker','spenderWord','coinWord','fundingWord','lock'].includes(k)).map(([k,v]) => [k,legacy(v)]))
   return v
 }
 d1(`UPDATE hop_chain_probes SET probedAtMs=${Date.now()}, spendingTxid='${seen}', spent=1, spentConfirmed=1 WHERE outpoint='${parent}.0'`)
