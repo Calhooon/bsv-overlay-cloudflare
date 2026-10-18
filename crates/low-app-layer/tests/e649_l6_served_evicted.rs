@@ -34,6 +34,7 @@ fn served(db: &Connection, param: &str) -> serde_json::Value {
                 txid: r.get::<_, String>(0)?.to_ascii_lowercase(),
                 evicted_at: r.get(1)?,
                 readmitted_at: r.get(2)?,
+                reason: r.get(3)?,
             })
         })
         .unwrap()
@@ -54,7 +55,7 @@ fn e649_l6_a_an_evicted_pot_carries_the_ledger_row_and_a_readmission_moves_the_w
         CLOSE_EVICTION_MARKER_SQL,
         rusqlite::params![
             pot,
-            "REJECTED (corroborated)",
+            "REJECTED (arcade live REJECTED: bad script; both indexers absent)",
             1_760_000_000_000_i64,
             2,
             "[]"

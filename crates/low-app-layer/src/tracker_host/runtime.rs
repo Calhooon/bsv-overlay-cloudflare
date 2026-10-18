@@ -430,6 +430,23 @@ pub async fn held_proof(env: &worker::Env, txid: &str) -> worker::Result<(bool, 
     }
     Ok((false, None))
 }
+/// PURE (bsv-low #621, L5): the source and time of a `seen` event's hint. The overlay's latch ships
+/// `{source, at}` (`ops::latch_network_seen`): a broadcaster's name (`arcade`, `taal`, `gorillapool`; anything else,
+/// or none from an older overlay, is `arcade`, the pre-#621 attribution) and its stamp in ms, read as seconds and
+/// never later than `now` (a stamp ahead of the clock is the clock's).
+pub fn seen_hint_source(body: Option<&Value>, now: u64) -> (&'static str, u64) {
+    let source = match body.and_then(|b| b["source"].as_str()) {
+        Some("taal") => "taal",
+        Some("gorillapool") => "gorillapool",
+        _ => "arcade",
+    };
+    let at = body
+        .and_then(|b| b["at"].as_u64())
+        .map(|ms| (ms / 1000).min(now))
+        .unwrap_or(now);
+    (source, at)
+}
+
 /// The event boundary runs effects only for an authoritative subject.
 pub async fn event_for_subject<F, Fut>(
     held: bool,
@@ -552,11 +569,13 @@ async fn event_held(
             .expect("admission hint input");
     }
     if kind == "seen" {
+        // bsv-low #621 (L5): the hint names the broadcaster the overlay's latch named, at its time
+        let (source, observed) = seen_hint_source(callback, now);
         state
             .step(
                 &params,
                 &empty,
-                Input::Hint(Hint::new("arcade", HintStatus::Seen, now)),
+                Input::Hint(Hint::new(source, HintStatus::Seen, observed)),
             )
             .expect("hint input");
     }
@@ -896,6 +915,27 @@ pub fn terminal_hint(hint: &Hint) -> bool {
         hint.status,
         HintStatus::Rejected { .. } | HintStatus::DoubleSpend { .. }
     )
+}
+
+#[cfg(test)]
+mod seen_hint_pins {
+    use super::seen_hint_source;
+    use serde_json::json;
+
+    /// bsv-low #621 (L5): the `seen` hint names the broadcaster the overlay's latch named, at its stamp (ms read as
+    /// seconds, never after now); an older overlay's event (no body) or a name that is not a broadcaster's is
+    /// Arcade, the attribution before the pair.
+    #[test]
+    fn i621_the_seen_hint_names_the_latchs_broadcaster_and_time() {
+        let now = 1_790_000_100;
+        let b = json!({"source": "taal", "at": 1_790_000_000_123_u64});
+        assert_eq!(seen_hint_source(Some(&b), now), ("taal", 1_790_000_000));
+        let b = json!({"source": "gorillapool", "at": 9_999_999_999_999_u64});
+        assert_eq!(seen_hint_source(Some(&b), now), ("gorillapool", now), "a stamp ahead of the clock is the clock's");
+        assert_eq!(seen_hint_source(None, now), ("arcade", now));
+        let b = json!({"source": "woc", "at": 1_u64});
+        assert_eq!(seen_hint_source(Some(&b), now).0, "arcade", "a courier never names a seen hint");
+    }
 }
 
 #[cfg(test)]

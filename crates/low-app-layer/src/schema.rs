@@ -158,6 +158,12 @@ pub const SPENDER_PAY_B_ALTER: &str = "ALTER TABLE pot_records ADD COLUMN spende
 /// NULL = the row names no transaction (a chain marker, the v1 filing): it retires nothing by transaction.
 pub const PAY_TXID_ALTER: &str = "ALTER TABLE collected_markers_v2 ADD COLUMN payTxid TEXT";
 
+/// bsv-low #621 (L5): the `network_seen` latch's broadcaster and its time (overlay migrations 331 and 332).
+/// `/utxo-status`'s batch read names both (`networkSeenBy`), so a cold isolate ahead of the overlay must add them;
+/// the table is `NETWORK_SEEN_CREATE`'s, a CREATE catch-up, which runs first.
+pub const NETWORK_SEEN_SOURCE_ALTER: &str = "ALTER TABLE network_seen ADD COLUMN seenSource TEXT";
+pub const NETWORK_SEEN_SOURCE_AT_ALTER: &str = "ALTER TABLE network_seen ADD COLUMN sourceAtMs INTEGER";
+
 pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     SIG_VALID_ALTER,
     MARKER_VALID_ALTER,
@@ -173,6 +179,8 @@ pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     // state read name it, so a cold isolate ahead of the overlay must add it; its table is `OWED_STATE_CREATE`'s, a
     // CREATE catch-up, which runs first.
     crate::owed::OWED_STATE_SEQ_ALTER,
+    NETWORK_SEEN_SOURCE_ALTER,
+    NETWORK_SEEN_SOURCE_AT_ALTER,
 ];
 
 /// The bsv-low #371 `network_seen` TABLE, same Rule-24 contract as the
@@ -445,12 +453,13 @@ mod tests {
     fn every_app_layer_alter_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             LATCH_COLUMN_ALTERS.len(),
-            11,
+            13,
             "sigValid (#283), markerValid (#362), firstSpentAt (#217), \
              spenderFinal (#371), claimValid + rowValid (brain-cutover M1), \
              settleSigners (#406), spenderPayASats + spenderPayBSats (#468), \
              payTxid (#492, the held filing's paying transaction), \
-             recomputeSeq (#566, the identity's owed recompute sequence)"
+             recomputeSeq (#566, the identity's owed recompute sequence), \
+             seenSource + sourceAtMs (#621, the seen latch's broadcaster and time)"
         );
         for stmt in LATCH_COLUMN_ALTERS {
             let column = stmt

@@ -1373,26 +1373,33 @@ async fn submit_parts(
                 ctx.wait_until(async move {
                     let mut subject_outcome: Result<crate::broadcaster::ArcOutcome, String> =
                         Err("subject leg never pushed".to_string());
+                    // bsv-low #621: the broadcaster whose answer accepted the SUBJECT names the latch
+                    let mut subject_by: Option<crate::ops::SeenSource> = None;
                     for (leg_txid, hex_body) in &dual_legs {
-                        let res =
+                        let (res, by) =
                             crate::broadcaster::corroborate_tx_hex(dual_key.as_deref(), dual_host.as_deref(), hex_body).await;
                         if *leg_txid == dual_txid {
                             subject_outcome = res;
+                            subject_by = by;
                         }
                     }
-                    match subject_outcome {
-                        Ok(crate::broadcaster::ArcOutcome::Accepted(_)) => {
-                            crate::ops::latch_network_seen(&dual_db, &dual_txid).await;
+                    match (subject_outcome, subject_by) {
+                        (Ok(crate::broadcaster::ArcOutcome::Accepted(_)), Some(by)) => {
+                            crate::ops::latch_network_seen(&dual_db, &dual_txid, by, None).await;
                             // step 4: a background latch ships its own push.
                             crate::pot_changes::flush_inline(dual_env).await;
                             worker::console_log!(
-                                "[#413] dual-broadcast delivered {dual_txid} (TAAL >=SEEN) — network_seen latched"
+                                "[#413] dual-broadcast delivered {dual_txid} ({} >=SEEN): network_seen latched",
+                                by.wire()
                             );
                         }
-                        Ok(other) => worker::console_log!(
+                        (Ok(crate::broadcaster::ArcOutcome::Accepted(_)), None) => worker::console_log!(
+                            "[#413] dual-broadcast for {dual_txid}: an accept no broadcaster named (impossible by construction); no latch"
+                        ),
+                        (Ok(other), _) => worker::console_log!(
                             "[#413] dual-broadcast for {dual_txid}: non-accept ({other:?}) — no latch"
                         ),
-                        Err(e) => worker::console_log!(
+                        (Err(e), _) => worker::console_log!(
                             "[#413] dual-broadcast for {dual_txid} inconclusive: {} — no latch",
                             e.chars().take(80).collect::<String>()
                         ),
@@ -1515,10 +1522,17 @@ async fn submit_parts(
                     }
                 }
                 // #602: a courier's mined admission is not a broadcaster SEEN word.
+                // bsv-low #621: the latch names the broadcaster that said SEEN in this request (Arcade's poll, stored
+                // echo or probe; a corroborator's accept) at its stamp; an accept no broadcaster named latches nothing
                 if arcade.admission_is_witnessed() {
-                    match env.d1("OVERLAY_DB") {
-                        Ok(db) => crate::ops::latch_network_seen(&db, &subject_txid).await,
-                        Err(e) => {
+                    match (env.d1("OVERLAY_DB"), arcade.witnessed_by()) {
+                        (Ok(db), Some((by, at_ms))) => {
+                            crate::ops::latch_network_seen(&db, &subject_txid, by, at_ms).await
+                        }
+                        (Ok(_), None) => worker::console_log!(
+                            "network_seen for {subject_txid}: an accept no broadcaster named (impossible by construction); not latched"
+                        ),
+                        (Err(e), _) => {
                             worker::console_log!("network_seen unavailable for {subject_txid}: {e}")
                         }
                     }
@@ -1648,7 +1662,7 @@ async fn submit_parts(
                         let outcome = crate::admit_fast::evict_txid_everywhere(
                             &ledger_db,
                             &subject_txid,
-                            &format!("REJECTED ({reason}; re-refused at the ladder)"),
+                            &crate::admit_fast::ladder_rerefusal_reason(&reason),
                             worker::Date::now().as_millis(),
                         )
                         .await;
@@ -2275,8 +2289,8 @@ async fn submit_parts(
                 )
                 .map(|t| t.id());
                 if let Ok(subject) = subject {
-                    if seen_arcade.network_witnessed(&subject).await {
-                        crate::ops::latch_network_seen(&seen_db, &subject).await;
+                    if let Some(at_ms) = seen_arcade.network_seen_stamp(&subject).await {
+                        crate::ops::latch_network_seen(&seen_db, &subject, crate::ops::SeenSource::Arcade, at_ms).await;
                         // step 4: a background latch ships its own push.
                         crate::pot_changes::flush_inline(seen_env).await;
                     }

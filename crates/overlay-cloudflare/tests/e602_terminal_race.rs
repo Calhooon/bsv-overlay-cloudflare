@@ -81,7 +81,8 @@ fn e602_readmission_latch_requires_broadcaster_witness() {
         .find("Ok(crate::broadcaster::ArcOutcome::AcceptedPending(pending))")
         .unwrap()];
     assert_eq!(arm.matches("latch_network_seen(").count(), 1);
-    assert!(arm.contains("ifarcade.admission_is_witnessed(){matchenv.d1"));
+    // bsv-low #621: the latch names the broadcaster that witnessed it in this request
+    assert!(arm.contains("ifarcade.admission_is_witnessed(){match(env.d1(\"OVERLAY_DB\"),arcade.witnessed_by()){"));
     assert!(arm.contains("ctx.wait_until(crate::admit_fast::pending_watch_job("));
 }
 

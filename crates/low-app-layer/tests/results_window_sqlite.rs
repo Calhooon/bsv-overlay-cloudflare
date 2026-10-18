@@ -1580,7 +1580,7 @@ fn a_seen_and_final_settle_classifies_with_no_proof_through_the_real_sql() {
         &beef_bytes_of(ENFORCED_SETTLE_HEX),
     );
     latch_finality(&conn, ENFORCED_FUNDING_TXID, ENFORCED_SETTLE_TXID, 1);
-    conn.execute(NETWORK_SEEN_INSERT_SQL, params![ENFORCED_SETTLE_TXID])
+    conn.execute(NETWORK_SEEN_INSERT_SQL, params![ENFORCED_SETTLE_TXID, "arcade", 1_i64])
         .expect("network_seen latch");
 
     let rows = query_results_rows(&conn, &victim);
@@ -1660,7 +1660,7 @@ fn a_seen_and_final_settle_classifies_with_no_proof_through_the_real_sql() {
     );
     latch_finality(&conn3, ENFORCED_FUNDING_TXID, ENFORCED_SETTLE_TXID, 0);
     conn3
-        .execute(NETWORK_SEEN_INSERT_SQL, params![ENFORCED_SETTLE_TXID])
+        .execute(NETWORK_SEEN_INSERT_SQL, params![ENFORCED_SETTLE_TXID, "arcade", 1_i64])
         .expect("network_seen latch");
     let parked = assemble_like_the_route(
         &victim,

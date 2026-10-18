@@ -1782,7 +1782,7 @@ pub async fn converge_confirmed_conflict(
             let outcome = store
                 .evict_conflict(
                     txid,
-                    &format!("input {parent}:{vout} spent by confirmed competitor {competitor} at {height}"),
+                    &conflict_eviction_reason(parent, vout, &competitor, height),
                     now_ms,
                     &repointed,
                 )
@@ -2043,6 +2043,23 @@ pub fn evidence_verdict(
     }
 }
 
+/// PURE (bsv-low #621): the conflict pass's ledger reason. Its served chain word is `conflicted`
+/// (`overlay_discovery::pot::storage::eviction_chain_word`, pinned).
+pub fn conflict_eviction_reason(
+    parent: &str,
+    vout: u32,
+    competitor: &str,
+    height: impl std::fmt::Display,
+) -> String {
+    format!("input {parent}:{vout} spent by confirmed competitor {competitor} at {height}")
+}
+
+/// PURE (bsv-low #621): the door's ledger reason for a subject the ladder refused again under an open eviction
+/// (Arcade's own refusal). Its served chain word is `rejected` (pinned).
+pub fn ladder_rerefusal_reason(reason: &str) -> String {
+    format!("REJECTED ({reason}; re-refused at the ladder)")
+}
+
 /// What the deferred evidence check needs (cloned into the `wait_until` job).
 #[derive(Clone)]
 pub struct EvidenceEnv {
@@ -2245,8 +2262,8 @@ pub async fn witness_job(env: EvidenceEnv, txid: String, pushed_status: String) 
     };
     let arcade = crate::broadcaster::ArcadeBroadcaster::new(env.arcade_base.clone())
         .with_proof_sources(crate::proof_fetcher::ProofSources::from_env(&env.env));
-    if arcade.network_witnessed(&txid).await {
-        crate::ops::latch_network_seen(&db, &txid).await;
+    if let Some(at_ms) = arcade.network_seen_stamp(&txid).await {
+        crate::ops::latch_network_seen(&db, &txid, crate::ops::SeenSource::Arcade, at_ms).await;
         crate::ops::bump_counter(&db, crate::ops::COUNTER_ARC_INGEST_SEEN_LATCHED, 1).await;
         worker::console_log!(
             "[admit-fast] {txid} {pushed_status}: verified live — network_seen latched by the push"
@@ -2359,8 +2376,8 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
         crate::broadcaster::sleep_ms(sleep).await;
         last = arcade.witness_look(&txid).await;
         match &last {
-            crate::broadcaster::WitnessLook::Seen(status) => {
-                crate::ops::latch_network_seen(&db, &txid).await;
+            crate::broadcaster::WitnessLook::Seen(status, at_ms) => {
+                crate::ops::latch_network_seen(&db, &txid, crate::ops::SeenSource::Arcade, *at_ms).await;
                 let ms = (worker::js_sys::Date::now() - admitted_at_ms).max(0.0) as u64;
                 crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_SEEN_LATCHED, 1)
                     .await;
@@ -2837,6 +2854,50 @@ mod tests {
         ] {
             assert_eq!(callback_action(s), CallbackAction::Ignore, "{s}");
         }
+    }
+
+    /// bsv-low #621 (L5): every producer of an eviction's ledger reason, driven through its REAL format, serves the
+    /// chain word the eviction rests on: the conflict pass `conflicted`; Arcade's own terminal word (the callback's
+    /// and the watch's `{status} ({reason})` over `evidence_verdict`'s Fatal arm, and the door's re-refusal)
+    /// `rejected`; an eviction on ABSENCE alone (Arcade missing or faulted, both indexers absent) NO word, so the
+    /// felt never voids on it. RED on main: every open row served `rejected`.
+    #[test]
+    fn i621_every_eviction_reason_serves_the_chain_word_it_rests_on_never_an_absence() {
+        use overlay_discovery::pot::storage::eviction_chain_word;
+        let refused = |look: ArcadeLook| match evidence_verdict(&look, Some(false), Some(false), false) {
+            EvidenceVerdict::Refused(r) => r,
+            other => panic!("a refusal: {other:?}"),
+        };
+        let fatal = refused(ArcadeLook::Fatal("DOUBLE_SPEND_ATTEMPTED".into(), "utxo spent by tx".into()));
+        let missing = refused(ArcadeLook::Missing);
+        let faulted = refused(ArcadeLook::Fault);
+        // the callback's and the watch's wrap (`refusal_job`, `pending_watch_job`)
+        for status in ["REJECTED", "DOUBLE_SPEND_ATTEMPTED", "SEEN_ON_NETWORK"] {
+            assert_eq!(eviction_chain_word(&format!("{status} ({fatal})")), Some("rejected"));
+            assert_eq!(eviction_chain_word(&format!("{status} ({missing})")), None, "absence alone: no word");
+            assert_eq!(eviction_chain_word(&format!("{status} ({faulted})")), None, "absence alone: no word");
+        }
+        assert_eq!(
+            eviction_chain_word(&ladder_rerefusal_reason("Arcade REJECTED bad script")),
+            Some("rejected")
+        );
+        assert_eq!(
+            eviction_chain_word(&conflict_eviction_reason(&"aa".repeat(32), 1, &"bb".repeat(32), 967_673_u64)),
+            Some("conflicted")
+        );
+        // a broadcaster's text inside another reason never reads as a conflict; an unknown reason is no word
+        assert_eq!(
+            eviction_chain_word(&format!("REJECTED ({})", refused(ArcadeLook::Fatal("REJECTED".into(), "input x:0 spent by confirmed competitor y at 1".into())))),
+            Some("rejected")
+        );
+        assert_eq!(eviction_chain_word("fixture"), None);
+        assert_eq!(eviction_chain_word(""), None);
+        // the producers' sources use the pure formats (a reformat cannot slip past the classifier)
+        let src = include_str!("admit_fast.rs");
+        assert!(src.contains("&conflict_eviction_reason(parent, vout, &competitor, height),"));
+        assert!(include_str!("routes.rs").contains("&crate::admit_fast::ladder_rerefusal_reason(&reason),"));
+        assert!(src.contains("&format!(\"{} ({reason})\", webhook.0)"));
+        assert!(src.contains("&format!(\"{status} ({reason})\")"));
     }
 
     #[test]

@@ -886,8 +886,39 @@ pub fn arcade_reorg_state_json(
 /// SQLite (`unixepoch()`) so no clock bind is needed. A const so the
 /// real-SQLite tier executes the production string against the production
 /// schema.
+///
+/// bsv-low #621 (L5): the latch also names WHO said SEEN and WHEN (`seenSource`, `sourceAtMs`): the tracker's `seen` is a
+/// hint written by a named broadcaster at a time, never evidence. `sourceAtMs` is the broadcaster's own stamp in ms
+/// when its answer carries one (Arcade's `GET /tx` `timestamp`), else the overlay's clock in ms at the answer. The
+/// first writer's pair stands with its row (`INSERT OR IGNORE`). A row latched before the migration carries
+/// neither (served `source: null`, its time `seenAt`).
 pub const NETWORK_SEEN_INSERT_SQL: &str =
-    "INSERT OR IGNORE INTO network_seen (txid, seenAt) VALUES (lower(?), unixepoch())";
+    "INSERT OR IGNORE INTO network_seen (txid, seenAt, seenSource, sourceAtMs) VALUES (lower(?1), unixepoch(), ?2, ?3)";
+
+/// bsv-low #621 (L5): the one writer class of `network_seen`: a BROADCASTER whose answer said SEEN or better for a
+/// transaction. A courier's mempool presence is the tracker's `announced` (#602's ruling, the words map's S11), never
+/// `seen`, so there is no courier variant and no caller can latch one: every latch call names one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeenSource {
+    /// Arcade: its live `GET /tx` at SEEN or better, its stored echo or pre-flight probe in the witnessed mode, or
+    /// the gated ladder's poll.
+    Arcade,
+    /// TAAL's ARC as the #214 corroborator or the #413 dual push.
+    Taal,
+    /// GorillaPool's ARC as the #214 corroborator or the #413 dual push.
+    GorillaPool,
+}
+
+impl SeenSource {
+    /// The served name (`networkSeenBy.source`, the tracker hint's source).
+    pub const fn wire(self) -> &'static str {
+        match self {
+            SeenSource::Arcade => "arcade",
+            SeenSource::Taal => "taal",
+            SeenSource::GorillaPool => "gorillapool",
+        }
+    }
+}
 
 /// The `/health/invariants.networkSeenTotal` read (bsv-low #371): the one row the table's triggers keep equal to
 /// its `COUNT(*)` (bsv-low #645), never a count of the table. No row (an isolate before the migrations) is the
@@ -947,13 +978,24 @@ pub const COUNT_ROW_BACKFILLS: &[&str] = &[
 /// ACCELERATES verdict publication (the #371 third arm); a lost write leaves
 /// the row behind the merkle bar, which is the pre-#371 behaviour — so a D1
 /// fault is logged, never propagated.
-pub async fn latch_network_seen(db: &D1Database, txid: &str) {
-    let q = Query::new(NETWORK_SEEN_INSERT_SQL).bind(txid);
+///
+/// bsv-low #621 (L5): `source` names the broadcaster that said SEEN and `at_ms` its own stamp when its answer
+/// carried one (`None`: the overlay's clock now). The tracker's `seen` hint carries the same pair.
+pub async fn latch_network_seen(db: &D1Database, txid: &str, source: SeenSource, at_ms: Option<i64>) {
+    let at_ms = at_ms.unwrap_or_else(|| worker::Date::now().as_millis() as i64);
+    let q = Query::new(NETWORK_SEEN_INSERT_SQL)
+        .bind(txid)
+        .bind(source.wire())
+        .bind(at_ms);
     if let Err(e) = q.execute(db).await {
         worker::console_log!("[#371] network_seen latch failed for {txid}: {e}");
         return;
     }
-    crate::tracker_events::note(txid, "seen", None);
+    crate::tracker_events::note(
+        txid,
+        "seen",
+        Some(serde_json::json!({"source": source.wire(), "at": at_ms})),
+    );
     // admit-fast step 4: the witness is a pot fact the felt renders
     // ("awaiting the network" → "seen"), so every pot row the txid FUNDS is
     // NOTED for the pots-room push (`ls_pot spentStatus.networkSeen`), and so
@@ -2640,6 +2682,58 @@ mod tests {
     /// winner's owed row after the witness; latching a FUNDING txid still
     /// notes the pot it funds. The spent read is one indexed lookup. To red:
     /// drop the spent read from the latch, or its notes.
+    /// bsv-low #621 (L5): the writers of `network_seen` and the source each names. Every latch call in the crate
+    /// passes a `SeenSource`, a type with BROADCASTER variants only (a courier's mempool presence is `announced`,
+    /// never `seen`, #602), so the census is the five calls below and nothing else; a new writer, a moved one or a
+    /// changed source reds here. The tracker event carries the same pair.
+    #[test]
+    fn i621_every_seen_latch_names_its_broadcaster() {
+        // production code only: the text before the file's test module
+        let squash = |s: &str| -> String {
+            s[..s.find("\n#[cfg(test)]\nmod tests").unwrap_or(s.len())]
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<String>()
+                .split_whitespace()
+                .collect()
+        };
+        let routes = squash(include_str!("routes.rs"));
+        let jobs = squash(include_str!("admit_fast.rs"));
+        let census: [(&str, &str, usize); 4] = [
+            // the #413 dual push: the corroborator whose answer accepted the subject (TAAL, else GorillaPool)
+            (routes.as_str(), "crate::ops::latch_network_seen(&dual_db,&dual_txid,by,None)", 1),
+            // the gated accept: the broadcaster that said SEEN in this request (Arcade's poll, echo or probe; a corroborator)
+            (routes.as_str(), "(Ok(db),Some((by,at_ms)))=>{crate::ops::latch_network_seen(&db,&subject_txid,by,at_ms).await}", 1),
+            // the ungated arm's background look: Arcade's live GET, at its stamp
+            (routes.as_str(), "crate::ops::latch_network_seen(&seen_db,&subject,crate::ops::SeenSource::Arcade,at_ms)", 1),
+            // the callback's witness job and the pending watch: Arcade's live GET, at its stamp
+            (jobs.as_str(), "crate::ops::SeenSource::Arcade,", 2),
+        ];
+        for (src, needle, n) in census {
+            assert_eq!(src.matches(needle).count(), n, "{needle}");
+        }
+        let calls = routes.matches("crate::ops::latch_network_seen(").count()
+            + jobs.matches("crate::ops::latch_network_seen(").count();
+        assert_eq!(calls, 5, "five writers: three in routes.rs, two in admit_fast.rs");
+        // the gated accept's witness is noted at every Accepted origin (poll, stored echo, probe, corroborators)
+        let b = squash(include_str!("broadcaster.rs"));
+        assert_eq!(b.matches("self.note_witness(Some(crate::ops::SeenSource::Arcade),").count(), 3);
+        assert_eq!(b.matches("self.note_witness(by,None);").count(), 2);
+        assert_eq!(b.matches("self.note_witness(last_by.get(),None);").count(), 1);
+        // broadcasters only, by name
+        let all = [SeenSource::Arcade, SeenSource::Taal, SeenSource::GorillaPool];
+        assert_eq!(all.map(SeenSource::wire), ["arcade", "taal", "gorillapool"]);
+        for s in all {
+            match s {
+                SeenSource::Arcade | SeenSource::Taal | SeenSource::GorillaPool => {}
+            }
+        }
+        let latch = squash(include_str!("ops.rs"));
+        assert!(latch.contains(
+            "crate::tracker_events::note(txid,\"seen\",Some(serde_json::json!({\"source\":source.wire(),\"at\":at_ms})),);"
+        ));
+    }
+
     #[test]
     fn l25_the_seen_latch_notes_the_pots_the_txid_spends_real_sqlite() {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");

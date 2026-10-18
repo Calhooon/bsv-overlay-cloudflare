@@ -281,6 +281,10 @@ pub struct EvictionLedgerEntry {
     pub evicted_at: i64,
     /// When it was readmitted, in milliseconds; `None` while the eviction is open.
     pub readmitted_at: Option<i64>,
+    /// bsv-low #621 (L5): the chain word the eviction rests on, read from its `reason` by [`eviction_chain_word`]:
+    /// `rejected` (Arcade's own terminal word on the bytes), `conflicted` (a competitor spending the pot's own input,
+    /// confirmed), `None` (an eviction on ABSENCE alone, or a reason no producer writes).
+    pub chain_word: Option<&'static str>,
 }
 
 /// The served word of an OPEN eviction: bsv-tracker 0.2.2's `Word::Rejected`, wire `rejected`. A readmitted
@@ -288,14 +292,109 @@ pub struct EvictionLedgerEntry {
 /// pot again.
 pub const EVICTED_WORD: &str = "rejected";
 
+/// bsv-low #621 (L5): the served word of an OPEN eviction that rests on a competitor spending the pot's own input,
+/// confirmed (the conflict pass): bsv-tracker's `Word::Conflicted`, wire `conflicted`.
+pub const CONFLICTED_WORD: &str = "conflicted";
+
+/// bsv-low #621 (L5): the mark of the conflict pass's reason (`admit_fast::conflict_eviction_reason`).
+pub const CONFLICT_REASON_MARK: &str = " spent by confirmed competitor ";
+
+/// bsv-low #621 (L5): the marks of an eviction on ABSENCE alone (`admit_fast::evidence_verdict`'s Missing and Fault
+/// arms: Arcade does not hold it or could not be asked, and both indexers say absent). No chain word rests on them.
+pub const ABSENCE_REASON_MARKS: [&str; 2] = [
+    "arcade missing, both indexers absent",
+    "arcade faulted, both indexers absent",
+];
+
+/// bsv-low #621 (L5): the marks of an eviction on Arcade's OWN terminal word (REJECTED / DOUBLE_SPEND_ATTEMPTED,
+/// with both indexers absent): `evidence_verdict`'s Fatal arm, and the door's re-refusal at the ladder
+/// (`admit_fast::ladder_rerefusal_reason`).
+pub const REJECTION_REASON_MARKS: [&str; 2] = ["arcade live ", "; re-refused at the ladder)"];
+
+/// PURE (bsv-low #621, L5): the chain word an eviction's ledger `reason` rests on. A VOID on the felt follows only
+/// the two chain words (`conflicted`, `rejected`), never an absence: an eviction on absence alone serves `None`,
+/// and so does a reason no producer writes (an unknown is never a void). The conflict mark is read first, then the
+/// absence marks (so a refusal that carries both Arcade's word and an absence mark is no chain word: the
+/// fail-safe direction), then the rejection marks. Every producer's reason is pinned through this function in `overlay-cloudflare`.
+pub fn eviction_chain_word(reason: &str) -> Option<&'static str> {
+    // the conflict pass's reason OPENS with its input (no other producer's reason does: theirs open with a
+    // broadcaster status), so text a broadcaster echoes inside another reason can never read as a conflict
+    if reason.starts_with("input ") && reason.contains(CONFLICT_REASON_MARK) {
+        return Some(CONFLICTED_WORD);
+    }
+    if ABSENCE_REASON_MARKS.iter().any(|m| reason.contains(m)) {
+        return None;
+    }
+    if REJECTION_REASON_MARKS.iter().any(|m| reason.contains(m)) {
+        return Some(EVICTED_WORD);
+    }
+    None
+}
+
 /// The ONE projection of a ledger row on the wire (`/utxo-status.evicted`, `ls_pot spentStatus.evicted`):
-/// `{at, word, readmittedAt}`, `word` `rejected` while open and `null` once readmitted.
-pub fn served_eviction_value(at: i64, readmitted_at: Option<i64>) -> serde_json::Value {
+/// `{at, word, readmittedAt}`, `word` the eviction's chain word while open (`rejected` / `conflicted`; `null` for
+/// an eviction on absence alone, bsv-low #621) and `null` once readmitted.
+pub fn served_eviction_value(
+    at: i64,
+    readmitted_at: Option<i64>,
+    chain_word: Option<&'static str>,
+) -> serde_json::Value {
     serde_json::json!({
         "at": at,
-        "word": if readmitted_at.is_none() { Some(EVICTED_WORD) } else { None },
+        "word": if readmitted_at.is_none() { chain_word } else { None },
         "readmittedAt": readmitted_at,
     })
+}
+
+/// bsv-low #621 (L5): the `network_seen` latch's witness for one txid: the broadcaster that said SEEN and its
+/// time in ms. `source` is `None` (and `at_ms` the latch's own `seenAt`) on a row latched before the pair shipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenWitness {
+    /// `arcade` / `taal` / `gorillapool` (`ops::SeenSource::wire`), `None` on a legacy row.
+    pub source: Option<String>,
+    /// The broadcaster's own stamp when it carried one, else the overlay's clock at the answer (ms); a legacy row's
+    /// `seenAt` in ms; `None` when the row carries no time at all.
+    pub at_ms: Option<i64>,
+}
+
+/// PURE (bsv-low #621, L5): one `network_seen` row's witness, the ONE mapping both D1 readers use (`ls_pot`'s and the
+/// app layer's `/utxo-status`): the named pair (`seenSource`, `sourceAtMs`), or a legacy latch's `seenAt` (unix
+/// seconds) in ms with no source. `None` when the row is absent (`witnessed` false).
+pub fn seen_witness_of_row(
+    witnessed: bool,
+    seen_source: Option<String>,
+    source_at_ms: Option<i64>,
+    seen_at_secs: Option<i64>,
+) -> Option<SeenWitness> {
+    witnessed.then(|| SeenWitness {
+        at_ms: match (&seen_source, source_at_ms, seen_at_secs) {
+            (Some(_), Some(at), _) => Some(at),
+            (_, _, Some(secs)) => Some(secs.saturating_mul(1000)),
+            _ => None,
+        },
+        source: seen_source,
+    })
+}
+
+/// bsv-low #621 (L5): the served witness tuple (`ls_pot spentStatus.networkSeenBy`, `/utxo-status.networkSeenBy`):
+/// the tracker's `seen` HINT with its source and time, never evidence. `null` when the overlay has not witnessed
+/// the txid (or the outpoint is unknown); `networkSeen` keeps its own bytes beside it.
+pub fn served_seen_by_value(witness: Option<&SeenWitness>) -> serde_json::Value {
+    match witness {
+        None => serde_json::Value::Null,
+        Some(w) => serde_json::json!({
+            "word": "seen",
+            "tier": "hint",
+            "source": w.source,
+            "at": w.at_ms,
+        }),
+    }
+}
+
+/// bsv-low #621 (L5): the witness batch read (one statement per chunk; `txid` the primary key).
+pub fn network_seen_by_batch_sql(n: usize) -> String {
+    let placeholders = vec!["?"; n].join(", ");
+    format!("SELECT txid, seenAt, seenSource, sourceAtMs FROM network_seen WHERE txid IN ({placeholders})")
 }
 
 /// The ledger read, one statement per chunk of DISTINCT lowercase txids: `txid IN` rides the primary key (the
@@ -306,7 +405,7 @@ pub fn evictions_by_txid_sql(n: usize) -> String {
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("SELECT lower(txid) AS txid, evictedAt, readmittedAt FROM pot_evictions WHERE txid IN ({marks})")
+    format!("SELECT lower(txid) AS txid, evictedAt, readmittedAt, reason FROM pot_evictions WHERE txid IN ({marks})")
 }
 
 /// Txids per ledger statement (D1 binds at most 100).
@@ -468,6 +567,26 @@ pub trait PotStorage {
     /// never from a poll.
     async fn network_seen_for(&self, txids: &[String]) -> Result<Vec<bool>, PotStorageError> {
         Ok(vec![false; txids.len()])
+    }
+
+    /// bsv-low #621 (L5): [`Self::network_seen_for`] with each latch's witness (the broadcaster and its time),
+    /// ALIGNED index-for-index; `None` = unwitnessed. The default derives it from `network_seen_for` with no
+    /// source or time (a store that does not keep them); the D1 backend reads [`network_seen_by_batch_sql`].
+    async fn network_seen_witness_for(
+        &self,
+        txids: &[String],
+    ) -> Result<Vec<Option<SeenWitness>>, PotStorageError> {
+        Ok(self
+            .network_seen_for(txids)
+            .await?
+            .into_iter()
+            .map(|seen| {
+                seen.then_some(SeenWitness {
+                    source: None,
+                    at_ms: None,
+                })
+            })
+            .collect())
     }
 
     /// bsv-low E649 L6 fold (L1): the overlay's eviction ledger (`pot_evictions`) for a batch of txids, ALIGNED
@@ -1163,6 +1282,8 @@ pub struct MemoryPotStorage {
     /// admit-fast step 4: the txids this store reports as network-witnessed
     /// (`network_seen_for`); `mark_network_seen` is the test hook.
     network_seen: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// bsv-low #621: the witness pairs `mark_network_seen_by` recorded.
+    seen_by: std::sync::Mutex<std::collections::HashMap<String, SeenWitness>>,
     /// bsv-low E649 L6 fold: the eviction ledger twin (`evictions_for`): `None` = this store serves no ledger
     /// (the trait default), `Some(Err)` = the read faults; test hooks `serve_evictions`, `record_eviction`,
     /// `fault_evictions`.
@@ -1223,6 +1344,18 @@ impl MemoryPotStorage {
             .insert(txid.to_ascii_lowercase());
     }
 
+    /// bsv-low #621: report `txid` as witnessed by `source` at `at_ms` (the latch with its pair).
+    pub fn mark_network_seen_by(&self, txid: &str, source: &str, at_ms: i64) {
+        self.mark_network_seen(txid);
+        self.seen_by.lock().unwrap().insert(
+            txid.to_ascii_lowercase(),
+            SeenWitness {
+                source: Some(source.to_string()),
+                at_ms: Some(at_ms),
+            },
+        );
+    }
+
     /// bsv-low E649 L6 fold: this store now serves an (empty) eviction ledger.
     pub fn serve_evictions(&self) {
         *self.evictions.lock().unwrap() = Some(Ok(Default::default()));
@@ -1230,6 +1363,17 @@ impl MemoryPotStorage {
 
     /// bsv-low E649 L6 fold: a ledger row for `txid` (serves the ledger if it did not).
     pub fn record_eviction(&self, txid: &str, evicted_at: i64, readmitted_at: Option<i64>) {
+        self.record_eviction_word(txid, evicted_at, readmitted_at, Some(EVICTED_WORD));
+    }
+
+    /// bsv-low #621: a ledger row resting on `chain_word` (`None`: an eviction on absence alone).
+    pub fn record_eviction_word(
+        &self,
+        txid: &str,
+        evicted_at: i64,
+        readmitted_at: Option<i64>,
+        chain_word: Option<&'static str>,
+    ) {
         let mut g = self.evictions.lock().unwrap();
         if !matches!(*g, Some(Ok(_))) {
             *g = Some(Ok(Default::default()));
@@ -1240,6 +1384,7 @@ impl MemoryPotStorage {
                 EvictionLedgerEntry {
                     evicted_at,
                     readmitted_at,
+                    chain_word,
                 },
             );
         }
@@ -1383,6 +1528,26 @@ impl PotStorage for MemoryPotStorage {
         Ok(txids
             .iter()
             .map(|t| seen.contains(&t.to_ascii_lowercase()))
+            .collect())
+    }
+
+    async fn network_seen_witness_for(
+        &self,
+        txids: &[String],
+    ) -> Result<Vec<Option<SeenWitness>>, PotStorageError> {
+        let seen = self.network_seen.lock().unwrap();
+        let by = self.seen_by.lock().unwrap();
+        Ok(txids
+            .iter()
+            .map(|t| {
+                let t = t.to_ascii_lowercase();
+                seen.contains(&t).then(|| {
+                    by.get(&t).cloned().unwrap_or(SeenWitness {
+                        source: None,
+                        at_ms: None,
+                    })
+                })
+            })
             .collect())
     }
 

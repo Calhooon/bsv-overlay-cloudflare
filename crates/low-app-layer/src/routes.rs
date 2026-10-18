@@ -240,6 +240,13 @@ struct PotRowD1 {
     /// admit-fast step 4: `fundingSeen` (the pot's own witness).
     #[serde(rename = "fundingSeen", default)]
     funding_seen: Option<f64>,
+    /// bsv-low #621 (L5): the funding latch's witness pair and its legacy stamp (`network_seen` columns).
+    #[serde(rename = "fundingSeenAt", default)]
+    funding_seen_at: Option<f64>,
+    #[serde(rename = "fundingSeenBy", default)]
+    funding_seen_by: Option<String>,
+    #[serde(rename = "fundingSeenByAt", default)]
+    funding_seen_by_at: Option<f64>,
 }
 
 impl PotRowD1 {
@@ -253,6 +260,13 @@ impl PotRowD1 {
             spender_final: self.spender_final.map(|v| v != 0.0),
             spender_seen: self.spender_seen.map(|v| v != 0.0),
             funding_seen: self.funding_seen.map(|v| v != 0.0),
+            // bsv-low #621: the shared mapping (the named pair, or a legacy latch's `seenAt` in ms with no source)
+            funding_seen_by: overlay_discovery::pot::storage::seen_witness_of_row(
+                self.funding_seen.is_some_and(|v| v != 0.0),
+                self.funding_seen_by,
+                self.funding_seen_by_at.map(|v| v as i64),
+                self.funding_seen_at.map(|v| v as i64),
+            ),
         }
     }
 }
@@ -350,6 +364,8 @@ async fn read_eviction_ledger(
         evicted_at: f64,
         #[serde(rename = "readmittedAt", default)]
         readmitted_at: Option<f64>,
+        #[serde(default)]
+        reason: Option<String>,
     }
     let mut out = Vec::new();
     for chunk in txids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
@@ -366,6 +382,7 @@ async fn read_eviction_ledger(
                 txid: r.txid.to_ascii_lowercase(),
                 evicted_at: r.evicted_at as i64,
                 readmitted_at: r.readmitted_at.map(|v| v as i64),
+                reason: r.reason.unwrap_or_default(),
             })),
             Err(e) => {
                 console_warn!(
@@ -701,6 +718,7 @@ impl PotsViewRowD1 {
                 spender_final: None,
                 spender_seen: None,
                 funding_seen: None,
+                funding_seen_by: None,
             },
             spender_beef_hex: self.spender_beef,
         }
@@ -8962,6 +8980,7 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             spender_final: None,
             reason: row.reason,
             funding_seen: None,
+            funding_seen_by: None,
             evicted: crate::logic::ServedEviction::NotRead,
         });
     }
@@ -11429,6 +11448,7 @@ mod e606_tests {
             spender_final: None,
             reason: row.reason,
             funding_seen: None,
+            funding_seen_by: None,
             evicted: crate::logic::ServedEviction::NotRead,
         };
         crate::txany::spent_any_body(&[entry], &[false])
@@ -11590,6 +11610,7 @@ mod e606_tests {
             spender_final: None,
             reason: row.reason,
             funding_seen: None,
+            funding_seen_by: None,
             evicted: crate::logic::ServedEviction::NotRead,
         };
         crate::txany::spent_any_body_sourced(&[entry], &[false], &[source])
@@ -11725,6 +11746,7 @@ mod e606_tests {
             spender_final: None,
             reason: r.reason,
             funding_seen: None,
+            funding_seen_by: None,
             evicted: crate::logic::ServedEviction::NotRead,
         };
         let old = crate::txany::spent_any_body(&[entry(&row)], &[false]);
