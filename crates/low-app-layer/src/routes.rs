@@ -3500,7 +3500,10 @@ async fn owed_recompute_inner(
     //     PK read of `tx_words` for these spenders; the later read (6) asks only the subjects not read here. A
     //     word-store fault keeps the latch's pair (NS-3's fault contract: the legacy answer, counted
     //     `tracker_lookup_faults_total`), and the later read is then skipped so every word input of the pass is
-    //     the legacy one.
+    //     the legacy one. The mixed direction (this read answers, the later one faults) is conservative: the arm's
+    //     words are applied, but `word_lookup_available` is false, so `spender_mined` falls back to the legacy
+    //     claimability and for that pass a checked word tells the outcome without the press (the W2-WORDS lens's
+    //     NOTE-3).
     let arm_ids = crate::owed::word_arm_subjects(
         party_rows
             .iter()
