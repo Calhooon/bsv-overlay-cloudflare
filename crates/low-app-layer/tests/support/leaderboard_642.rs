@@ -143,9 +143,15 @@ pub(crate) fn run<F: std::future::Future>(f: F) -> F::Output {
 }
 
 pub(crate) fn schema() -> Connection {
+    schema_under(&|sql| sql.to_string())
+}
+
+/// The production migrations, each statement text passed through `edit` first.
+pub(crate) fn schema_under(edit: &dyn Fn(&str) -> String) -> Connection {
     let db = Connection::open_in_memory().unwrap();
     for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
-        if let Err(e) = db.execute_batch(sql) {
+        let sql = edit(sql);
+        if let Err(e) = db.execute_batch(&sql) {
             assert!(e.to_string().contains("duplicate column"), "{e}: {sql}");
         }
     }
@@ -154,7 +160,11 @@ pub(crate) fn schema() -> Connection {
 
 /// The fleet-shaped board of `wins` counted wins.
 pub(crate) fn fixture(wins: u32) -> Connection {
-    let db = schema();
+    fill(schema(), wins)
+}
+
+/// The fleet-shaped board of `wins` counted wins over the schema `db`.
+pub(crate) fn fill(db: Connection, wins: u32) -> Connection {
     db.execute_batch("BEGIN").unwrap();
     for sql in board::rows(NOW, wins) {
         db.execute_batch(&sql)
@@ -353,7 +363,7 @@ pub(crate) async fn whole_board_page_body<B: BoardDb>(
             hands_attr,
         )
     };
-    let (lb, result_count) = leaderboard_fold_and_decorate(
+    let (lb, result_count) = leaderboard_fold_and_decorate_with(
         db,
         &markers,
         &statuses,
@@ -363,6 +373,7 @@ pub(crate) async fn whole_board_page_body<B: BoardDb>(
         &params_by_pot,
         &signers_by_pot,
         &owners,
+        &PagePrefetch::default(),
     )
     .await;
     (
@@ -378,8 +389,28 @@ pub(crate) fn new_body(
     cap: usize,
 ) -> (String, Vec<(String, Vec<serde_json::Value>)>) {
     let board = SqliteBoard::new(db);
-    let (status, body) = run(leaderboard_page_body(
+    let (status, body) = run(leaderboard_candidate_body(
         &board, page, start, None, cap, NOW as i64,
+    ));
+    assert_eq!(status, 200, "{body}");
+    (body, board.log.into_inner())
+}
+
+/// The SHIPPED dispatcher (`leaderboard_page_body`): the #674 table read on a
+/// stamped database.
+pub(crate) fn served_body(
+    db: &Connection,
+    page: usize,
+    start: &crate::logic::PageStart,
+) -> (String, Vec<(String, Vec<serde_json::Value>)>) {
+    let board = SqliteBoard::new(db);
+    let (status, body) = run(leaderboard_page_body(
+        &board,
+        page,
+        start,
+        None,
+        crate::logic::LEADERBOARD_CANDIDATE_WINS,
+        NOW as i64,
     ));
     assert_eq!(status, 200, "{body}");
     (body, board.log.into_inner())
@@ -614,13 +645,23 @@ fn lb642_emit_the_d1_cell() {
             seed.push_str(&sql.unwrap());
             seed.push_str(";\n");
         }
+        // bsv-low #674: the data rows the migrations write (the total's row, the
+        // stamp), then the board, whose INSERTs fire the triggers on local D1.
+        for sql in [
+            bsv_overlay_cloudflare::derived_board::TOTAL_SEED,
+            bsv_overlay_cloudflare::derived_board::STATE_DONE,
+        ] {
+            seed.push_str(sql);
+            seed.push_str(";\n");
+        }
         for row in board::rows(NOW, wins) {
             seed.push_str(&row);
             seed.push_str(";\n");
         }
         let cap = crate::logic::LEADERBOARD_CANDIDATE_WINS;
         let mut requests = Vec::new();
-        let first = new_body(&db, 50, &crate::logic::PageStart::Offset(0), cap);
+        // The SHIPPED read (#674's table read on the stamped board).
+        let first = served_body(&db, 50, &crate::logic::PageStart::Offset(0));
         let cursor = served(&first.0)["nextCursor"].as_str().unwrap().to_string();
         let start = crate::logic::parse_leaderboard_cursor(&cursor).unwrap();
         let max = crate::logic::LEADERBOARD_PAGE_MAX;
@@ -633,21 +674,34 @@ fn lb642_emit_the_d1_cell() {
             (
                 "page 1, limit 200",
                 crate::logic::LEADERBOARD_VIEW_MAX_READS_PAGE_MAX,
-                new_body(&db, max, &crate::logic::PageStart::Offset(0), cap),
+                served_body(&db, max, &crate::logic::PageStart::Offset(0)),
             ),
             (
                 "page 2 by cursor, limit 50",
                 crate::logic::LEADERBOARD_VIEW_MAX_READS,
-                new_body(&db, 50, &start, cap),
+                served_body(&db, 50, &start),
             ),
         ] {
+            assert!(
+                log.iter().any(|(sql, _)| sql.contains("FROM board_owners")),
+                "{name}: the table read"
+            );
             requests.push(serde_json::json!({
                 "name": name,
                 "ceiling": ceiling,
                 "statementCeiling": crate::logic::LEADERBOARD_STATEMENT_MAX_READS,
+                // bsv-low #674 fold, MEDIUM-1: the default page reads the same rows on both boards.
+                "flat": name == "page 1, limit 50",
                 "statements": log.iter().map(|(sql, rows)| serde_json::json!({"sql": sql, "rows": rows})).collect::<Vec<_>>(),
             }));
         }
+        // #642's candidate read on the same board, for the record.
+        let (_, log) = new_body(&db, 50, &crate::logic::PageStart::Offset(0), cap);
+        requests.push(serde_json::json!({
+            "name": "the #642 candidate read, page 1, limit 50",
+            "ceiling": null,
+            "statements": log.iter().map(|(sql, rows)| serde_json::json!({"sql": sql, "rows": rows})).collect::<Vec<_>>(),
+        }));
         let board = SqliteBoard::new(&db);
         run(whole_board_page_body(&board, 50, 0, None, NOW as i64));
         requests.push(serde_json::json!({

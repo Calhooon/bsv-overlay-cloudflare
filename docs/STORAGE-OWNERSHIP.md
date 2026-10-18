@@ -222,4 +222,11 @@ A new table: its CREATE in `OVERLAY_MIGRATIONS`, its row in `storage-ownership.j
 | `transactions_retired_set` | overlay-cloudflare | derived | no | NS-COST-BAR-1: the txids of the retired `transactions` rows and whether each is `expired-unproven`, kept by `transactions`' triggers (idempotent under `INSERT OR REPLACE`); wiped only with its count row. |
 | `count_transactions_retired` | overlay-cloudflare | derived | no | NS-COST-BAR-1: one row, the retired and expired counts of `transactions_retired_set` kept by its insert and delete triggers; guarded one-time backfill. |
 | `count_pot_unspent_kind` | overlay-cloudflare | derived | no | NS-COST-BAR-1: three rows, the unspent `pot_records` per lock class kept by `pot_records`' triggers; the index janitor's backlog is these less the hour's young rows; guarded one-time backfill. |
+
+#674 adds `board_wins`, `board_owners`, `board_hands` and `board_total`: the leaderboard derived at the write, overlay-owned, read by the app layer's `/leaderboard`. Triggers in the settle hooks' own statements (pot, witness, seat, claim; the eviction's shadow move and the readmission) maintain them; the backfill behind the `board-v1` stamp in `view_derivation_state` runs once. The lens fold (MEDIUM-1) adds each win's `frag` (the rows the page reads for it) and each owner's `card` (its wins and frags), so the page reads `board_owners` alone; the proof pointer (`proof_markers`) and posted bundle (`proof_posts`, read by the overlay's triggers) writes refresh the frags they feed.
+
+| `board_wins` | overlay-cloudflare | derived | no | One row per counted win and its frag; source-write triggers. |
+| `board_owners` | overlay-cloudflare | derived | no | Counted wins per owner and their card; `board_wins` triggers. |
+| `board_hands` | overlay-cloudflare | derived | no | Each identity-owned win's hand; `board_wins` and marker triggers. |
+| `board_total` | overlay-cloudflare | derived | no | The count of every counted win, one row. |
 | `tracker_backfill` | low-app-layer | re-askable | Bounded, resumed proof-only deploy cursor; a lost cursor restarts the pass. |

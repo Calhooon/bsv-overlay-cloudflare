@@ -99,6 +99,19 @@
  },
  "dynamic_sites": [
   {
+   "file": "crates/overlay-cloudflare/src/derived_board.rs",
+   "op": "SELECT",
+   "count": 1,
+   "crate": "overlay-cloudflare",
+   "statements": [
+    "AS frag FROM"
+   ],
+   "tables": [
+    "pot_records"
+   ],
+   "why": "wins_insert!: the pot rows of a recompute (pot_records p) or of the guarded backfill"
+  },
+  {
    "file": "crates/overlay-cloudflare/src/admit_fast.rs",
    "op": "CREATE",
    "count": 1,
@@ -636,7 +649,7 @@
    "database": "low-overlay-db",
    "owner": "low-app-layer",
    "writers": {},
-   "readers": [],
+   "readers": ["overlay-cloudflare"],
    "rebuild_class": "filings",
    "never_wipe": true,
    "holds": "the filed proof bundle + its replay verdict",
@@ -1446,7 +1459,7 @@
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
    "writers": {},
-   "readers": [],
+   "readers": ["low-app-layer"],
    "rebuild_class": "derived",
    "never_wipe": false,
    "holds": "transactional hop view derivation",
@@ -1517,6 +1530,50 @@
    "never_wipe": false,
    "holds": "three rows (covenant, p2pkh, other): the unspent pot_records rows per lock class (NS-COST-BAR-1), kept by pot_records' insert, update and delete triggers; the index janitor's backlog is these less the hour's young rows",
    "why": "rebuild from pot_records: its guarded backfill recounts the classes at the next version's migration run when the table holds no row; until then the backlog reads -1"
+   },
+   {
+   "name": "board_wins",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": ["low-app-layer"],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "one row per counted win and its frag (the page's rows for it), maintained by source-statement triggers (#674)",
+   "why": "rebuild: the board-v1 backfill over pot_records, network_seen, potparty_records and result_markers_v2"
+   },
+   {
+   "name": "board_owners",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": ["low-app-layer"],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "counted wins per owner and the page's card of them, maintained by board_wins triggers (#674)",
+   "why": "rebuild: the board-v1 backfill over pot_records, network_seen, potparty_records and result_markers_v2"
+   },
+   {
+   "name": "board_hands",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": ["low-app-layer"],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "each identity-owned win's hand, maintained by board_wins and marker triggers (#674)",
+   "why": "rebuild: the board-v1 backfill over pot_records, network_seen, potparty_records and result_markers_v2"
+   },
+   {
+   "name": "board_total",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": ["low-app-layer"],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "the count of every counted win, one row (#674)",
+   "why": "rebuild: the board-v1 backfill over pot_records, network_seen, potparty_records and result_markers_v2"
    },
    {
    "name": "tx_words",

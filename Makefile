@@ -417,6 +417,9 @@ ci-route: ci-d1-budget ci-d1-board
 # (`lb642_emit_the_d1_cell`); each board is loaded into a local D1 and every statement is replayed there, its
 # rows identical and its `rows_read` under the per-statement ceiling, each request under its per-request ceiling
 # (`logic::LEADERBOARD_VIEW_MAX_READS*`), and the whole-board read it replaced past the default page's ceiling.
+# bsv-low #674: the requests are the SHIPPED dispatcher's (the board tables' read; the seed carries the total's row and
+# the `board-v1` stamp, and its INSERTs fire the triggers on local D1); #642's candidate read is recorded beside it.
+# bsv-low #674 fold (MEDIUM-1): the default page reads the same rows on both boards (`flat.json` carries the first).
 ci-d1-board:
 	@set -e; \
 	dir=$$(mktemp -d "$${TMPDIR:-/tmp}/lane642-board.XXXXXX"); \
@@ -424,9 +427,9 @@ ci-d1-board:
 	LB642_D1_PIN="$$dir" cargo test -q $(WORKERS) -p low-app-layer --lib lb642_emit_the_d1_cell -- --ignored > "$$dir/emit.log" 2>&1 \
 	  || { echo "✗ ci-d1-board: the emit failed"; cat "$$dir/emit.log"; exit 1; }; \
 	for w in w1500 w3000; do \
-	  ( cd crates/low-app-layer && npx wrangler d1 execute low-overlay-db --local --persist-to "$$dir/$$w/d1" --file "$$dir/$$w/seed.sql" ) > "$$dir/$$w/seed.log" 2>&1 \
+	  python3 scripts/d1-load-chunked.py crates/low-app-layer low-overlay-db "$$dir/$$w/d1" "$$dir/$$w/seed.sql" > "$$dir/$$w/seed.log" 2>&1 \
 	    || { echo "✗ ci-d1-board: the $$w seed did not load"; cat "$$dir/$$w/seed.log"; exit 1; }; \
-	  node tools/lane-642/board_pin.mjs "$$dir/$$w/expected.json" "$$dir/$$w/d1"; \
+	  node tools/lane-642/board_pin.mjs "$$dir/$$w/expected.json" "$$dir/$$w/d1" "$$dir/flat.json"; \
 	done; \
 	echo "✅ ci-d1-board green"
 
@@ -440,6 +443,11 @@ ci-d1-board:
 # scenario and reds BY NAME when a figure passes its ceiling (`tools/lane-499/ceilings.json`, the table and the
 # margin in `docs/D1-BUDGETS.md`), then pins the brain's recompute ceiling through the route.
 # `D1_BUDGET_MEASURE=1 make ci-d1-budget` prints the measured table and enforces nothing.
+# The seed is loaded 2,000 statements a batch (`scripts/d1-load-chunked.py`, bsv-low #674): wrangler's local
+# `--file` is ONE batch whose prepared programs (each carrying its triggers') add up, and the whole seed under the
+# board's triggers died `SQLITE_NOMEM`; the triggers' own per-statement cost is pinned apart (`board_derived_sqlite.rs`).
+# The NS2 cell opens a copy of the loaded `v3` (taken before any worker runs) instead of loading the seed again in
+# its own workerd, which held every statement's program and died the same way in batches of 100.
 # Last, on the same overlay worker (after the budget legs, so their figures are untouched): bsv-low #575's
 # landing-guard cell (`tools/lane-e1d`), which seeds an OPEN eviction row into that worker's `--persist-to` D1
 # and reads its tables back with `wrangler d1 execute --local`: a carried predecessor under an open eviction is
@@ -476,7 +484,7 @@ ci-d1-budget:
 	app_log=/tmp/lane499-d1-$$B-app.log; ov_log=/tmp/lane499-d1-$$B-overlay.log; seed_log=/tmp/lane499-d1-$$B-seed.log; \
 	dv_log=/tmp/lane499-d1-$$B-delivering.log; \
 	state=$$(mktemp -d /tmp/lane499-d1-state.XXXXXX); ov_state=$$(mktemp -d /tmp/lane499-d1-ovstate.XXXXXX); \
-	dv_state=$$(mktemp -d /tmp/lane499-d1-dvstate.XXXXXX); \
+	dv_state=$$(mktemp -d /tmp/lane499-d1-dvstate.XXXXXX); seed_v3=$$(mktemp -d /tmp/lane499-d1-seedv3.XXXXXX); \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -496,7 +504,7 @@ ci-d1-budget:
 	    _n=$$((_n+1)); sleep 1; \
 	  done; \
 	  if [ -n "$$_left" ]; then echo "⚠ ci-d1-budget: could not free$$owned_ports (still held by:$$_left)"; fi; \
-	  rm -rf "$$state" "$$ov_state" "$$dv_state"; \
+	  rm -rf "$$state" "$$ov_state" "$$dv_state" "$$seed_v3"; \
 	}; \
 	trap 'cleanup; exit 130' INT TERM; \
 	trap cleanup EXIT; \
@@ -521,9 +529,10 @@ ci-d1-budget:
 	}; \
 	echo "→ ci-d1-budget: the fixture D1 (seed + wrangler d1 execute --local)…"; \
 	D1_CURSOR_PIN_SQL="$$state/cursor.sql" cargo run -q $(WORKERS) -p low-app-layer --example d1_budget_seed > "$$state/seed.sql"; \
-	( cd crates/low-app-layer && npx wrangler d1 execute low-overlay-db --local --persist-to "$$state" --file "$$state/seed.sql" ) > "$$seed_log" 2>&1 \
+	python3 scripts/d1-load-chunked.py crates/low-app-layer low-overlay-db "$$state" "$$state/seed.sql" > "$$seed_log" 2>&1 \
 	  || { echo "✗ ci-d1-budget: the seed did not load"; cat "$$seed_log"; exit 1; }; \
 	node tools/lane-499/cursor_pin.mjs "$$state/cursor.sql.expected.json" "$$state"; \
+	cp -R "$$state/v3/." "$$seed_v3/"; \
 	echo "→ starting wrangler dev :$$PA (the app layer on the fixture D1)…"; \
 	( cd crates/low-app-layer && exec npx wrangler dev --local --port $$PA --ip 127.0.0.1 --persist-to "$$state" \
 	    --var AUTH_ENFORCE:false --var SESSION_LANE:false \
@@ -554,7 +563,7 @@ ci-d1-budget:
 	wait_up http://127.0.0.1:$$PD/listTopicManagers "$$dv_log" "delivering overlay"; \
 	D1_BUDGET_SEED="$$state/seed.sql" D1_BUDGET_STATE="$$state" node tools/lane-499/d1_budget_route_ci.mjs http://127.0.0.1:$$PA http://127.0.0.1:$$PO; \
 	python3 tools/lane-ns2/register_pin.py; \
-	D1_BUDGET_SEED="$$state/seed.sql" npx --package wrangler -c 'node tools/lane-ns2/owed_do_pins.mjs'; \
+	D1_BUDGET_SEED_V3="$$seed_v3" npx --package wrangler -c 'node tools/lane-ns2/owed_do_pins.mjs'; \
 	node tools/lane-499/tracker_fault_route_ci.mjs http://127.0.0.1:$$PA "$$state"; \
 	python3 scripts/d1-census.py --self-test; \
 	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO; \

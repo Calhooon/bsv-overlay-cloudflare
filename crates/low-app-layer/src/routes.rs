@@ -1225,6 +1225,11 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
 ///    pairs and stamped on. A pair past that budget is served `proofPending`
 ///    (`stamp_leaderboard_decoration`), NEVER a false `proofPosted: false`.
 ///
+/// bsv-low #674: steps 1 and 2 read the tables the overlay derives at the
+/// write (`board_owners` by its rank index, `board_wins` by owner, `board_hands`
+/// by its rank index) once its backfill stamped `board-v1` and with no era
+/// cutoff; otherwise #642's bounded candidate read ([`leaderboard_page_body`]).
+///
 /// FAIL-SAFE, as before: a spine / pots / statuses D1 fault is the SAME 503
 /// the client handles — NEVER a fabricated empty board; the marker, hands
 /// and proof-pointer joins are best-effort (a fault there only omits
@@ -1264,13 +1269,62 @@ pub async fn compute_leaderboard_body_string(
     .await)
 }
 
-/// The #642 pipeline over the [`crate::board_db::BoardDb`] port (the Worker's
-/// D1, or rusqlite in the native pins): ONE candidate read
+/// The `/leaderboard:view` pipeline over the [`crate::board_db::BoardDb`] port
+/// (the Worker's D1, or rusqlite in the native pins). bsv-low #674: with no era
+/// cutoff and the board tables stamped (`board-v1`), the page is the indexed
+/// read of the tables the overlay derives at the write
+/// ([`leaderboard_table_body`]); otherwise (an unmigrated database, a cutoff)
+/// the #642 candidate read ([`leaderboard_candidate_body`]).
+pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
+    db: &B,
+    page: usize,
+    start: &crate::logic::PageStart,
+    era: Option<i64>,
+    candidate_cap: usize,
+    computed_at: i64,
+) -> (u16, String) {
+    if era.is_none() {
+        if let Some(total) = board_tables_ready(db).await {
+            return leaderboard_table_body(db, page, start, total, computed_at).await;
+        }
+    }
+    leaderboard_candidate_body(db, page, start, era, candidate_cap, computed_at).await
+}
+
+/// The count of every counted win when the board tables are derived (the
+/// overlay's `board-v1` stamp), else `None`: a database the overlay has not
+/// migrated fails the statement, and the route reads the candidates.
+pub(crate) async fn board_tables_ready<B: crate::board_db::BoardDb>(db: &B) -> Option<usize> {
+    #[derive(Deserialize)]
+    struct ReadyRowD1 {
+        #[serde(default)]
+        ready: Option<f64>,
+        #[serde(default)]
+        total: Option<f64>,
+    }
+    match db
+        .all::<ReadyRowD1>(crate::logic::BOARD_READY_SQL.to_string(), Vec::new())
+        .await
+    {
+        Ok(rows) => rows
+            .first()
+            .filter(|r| r.ready == Some(1.0))
+            .map(|r| r.total.unwrap_or(0.0).max(0.0) as usize),
+        Err(e) => {
+            crate::board_db::warn(&format!(
+                "[leaderboard] board tables unread ({e}): the candidate read"
+            ));
+            None
+        }
+    }
+}
+
+/// The #642 pipeline: ONE candidate read
 /// ([`crate::logic::chain_wins_candidates_sql`], at most `candidate_cap`
 /// counted wins), the page, the hands board and the hands pots' attribution
 /// cut from it in Rust ([`crate::logic::leaderboard_candidate_page`]), then
 /// steps 3 to 6 of [`compute_leaderboard_body_string`] unchanged.
-pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
+pub(crate) async fn leaderboard_candidate_body<B: crate::board_db::BoardDb>(
     db: &B,
     page: usize,
     start: &crate::logic::PageStart,
@@ -1306,10 +1360,396 @@ pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
         hand_markers.push(m);
     }
     let sel = crate::logic::leaderboard_candidate_page(&cands, start, page, page);
-    let truncated = sel.truncated;
-    let next_after = sel.next_after;
-    let owners = sel.owners;
-    let pot_rows = sel.pot_rows;
+    let hands: Vec<ResultMarkerRow> = sel
+        .hands
+        .iter()
+        .filter_map(|&i| hand_markers[i].clone())
+        .collect();
+    let head = BoardPageHead {
+        owners: sel.owners,
+        truncated: sel.truncated,
+        next_after: sel.next_after,
+        extras: crate::logic::LeaderboardPageExtras {
+            next_cursor: sel.next_cursor,
+            candidates_bounded: bounded.then_some(candidate_cap),
+            candidates_whole: None,
+        },
+        pot_rows: sel.pot_rows,
+        hands,
+    };
+    leaderboard_page_tail(
+        db,
+        page,
+        head,
+        HandsPotRows::Candidates(&cands),
+        computed_at,
+    )
+    .await
+}
+
+/// The #674 table read: the owner page by the rank index (by offset, or by the
+/// keyset cursor and its rank), the page owners' counted wins and the era hands
+/// by their indexes, then steps 3 to 6 of [`compute_leaderboard_body_string`]
+/// unchanged. A fault before the decoration is the same 503.
+pub(crate) async fn leaderboard_table_body<B: crate::board_db::BoardDb>(
+    db: &B,
+    page: usize,
+    start: &crate::logic::PageStart,
+    total: usize,
+    computed_at: i64,
+) -> (u16, String) {
+    use crate::board_db::{warn, Bind};
+    #[derive(Deserialize)]
+    struct OwnerRowD1 {
+        owner: String,
+        wins: f64,
+    }
+    #[derive(Deserialize)]
+    struct RankRowD1 {
+        rank: f64,
+    }
+    let failed = |what: &str, e: crate::board_db::BoardDbError| {
+        warn(&format!("[leaderboard] board {what} query failed: {e}"));
+        (503, "{\"error\":\"database query failed\"}".to_string())
+    };
+
+    // 1) The owner page and its rank offset.
+    let probe = Bind::Num((page + 1) as f64);
+    let (first, mut ranked): (usize, Vec<(String, usize)>) = match start {
+        crate::logic::PageStart::Offset(after) => {
+            match db
+                .all::<OwnerRowD1>(
+                    crate::logic::BOARD_OWNERS_PAGE_SQL.to_string(),
+                    vec![probe, Bind::Num(*after as f64)],
+                )
+                .await
+            {
+                Ok(rows) => (
+                    *after,
+                    rows.into_iter()
+                        .map(|r| (r.owner, r.wins as usize))
+                        .collect(),
+                ),
+                Err(e) => return failed("owners", e),
+            }
+        }
+        crate::logic::PageStart::After { wins, owner } => {
+            let key = || vec![Bind::Num(*wins as f64), Bind::Text(owner.clone())];
+            let rank = match db
+                .all::<RankRowD1>(crate::logic::BOARD_CURSOR_RANK_SQL.to_string(), key())
+                .await
+            {
+                Ok(rows) => rows.first().map_or(0, |r| r.rank.max(0.0) as usize),
+                Err(e) => return failed("cursor rank", e),
+            };
+            let mut b = key();
+            b.push(probe);
+            match db
+                .all::<OwnerRowD1>(crate::logic::BOARD_OWNERS_AFTER_SQL.to_string(), b)
+                .await
+            {
+                Ok(rows) => (
+                    rank,
+                    rows.into_iter()
+                        .map(|r| (r.owner, r.wins as usize))
+                        .collect(),
+                ),
+                Err(e) => return failed("owners", e),
+            }
+        }
+    };
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let truncated = ranked.len() > page;
+    ranked.truncate(page);
+    let next_cursor = truncated
+        .then(|| ranked.last().map(|(o, w)| format!("{w}.{o}")))
+        .flatten();
+    let owners: Vec<String> = ranked.into_iter().map(|(o, _)| o).collect();
+
+    // 2) The page owners' counted wins, from their cards (bsv-low #674 fold,
+    // MEDIUM-1: one `board_owners` row per owner holds every win and every row
+    // steps 3 to 6 read for it, so the page never reads its owners' per-win
+    // rows). An owner whose card does not hold all its wins (past the card's
+    // bound, or not readable) is read by its wins, as before. Chunked at the
+    // D1 bind cap; each chunk's wins in `board_wins_owners_sql`'s order.
+    let mut pot_rows: Vec<crate::logic::ChainWinPotRow> = Vec::new();
+    let mut pre = PagePrefetch::default();
+    for chunk in owners.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+        let b: Vec<Bind> = chunk.iter().map(|o| Bind::Text(o.clone())).collect();
+        let cards = match db
+            .all::<BoardCardRowD1>(crate::logic::board_cards_sql(chunk.len()), b)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => return failed("cards", e),
+        };
+        let mut wins: Vec<(Option<f64>, crate::logic::ChainWinPotRow)> = Vec::new();
+        let mut unpacked: Vec<String> = Vec::new();
+        for owner in chunk {
+            match cards
+                .iter()
+                .find(|c| c.owner == *owner)
+                .and_then(BoardCardRowD1::entries)
+            {
+                Some(entries) => {
+                    for e in entries {
+                        pre.take(&e);
+                        wins.push((e.pot_created_at, e.row));
+                    }
+                }
+                None => unpacked.push(owner.clone()),
+            }
+        }
+        if !unpacked.is_empty() {
+            let b: Vec<Bind> = unpacked.iter().map(|o| Bind::Text(o.clone())).collect();
+            match db
+                .all::<ChainWinCandidateRowD1>(
+                    crate::logic::board_wins_owners_sql(unpacked.len()),
+                    b,
+                )
+                .await
+            {
+                Ok(rows) => wins.extend(rows.into_iter().map(|r| {
+                    let c = r.into_candidate().0;
+                    (c.pot_created_at.map(|v| v as f64), c.row)
+                })),
+                Err(e) => return failed("wins", e),
+            }
+        }
+        // `ORDER BY owner ASC, potCreatedAt DESC, potTxid ASC` (a NULL stamp last).
+        wins.sort_by(|(at_a, a), (at_b, b)| {
+            a.owner
+                .cmp(&b.owner)
+                .then_with(|| {
+                    at_b.unwrap_or(f64::NEG_INFINITY)
+                        .total_cmp(&at_a.unwrap_or(f64::NEG_INFINITY))
+                })
+                .then_with(|| a.pot_txid.cmp(&b.pot_txid))
+        });
+        pot_rows.extend(wins.into_iter().map(|(_, r)| r));
+    }
+
+    // The era hands, BEST-EFFORT (a fault omits the hands board, never a count).
+    let hands: Vec<ResultMarkerRow> = match db
+        .all::<ResultRowD1>(
+            crate::logic::BOARD_HANDS_SQL.to_string(),
+            vec![Bind::Num(page as f64)],
+        )
+        .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(ResultRowD1::into_marker)
+            .collect(),
+        Err(e) => {
+            warn(&format!(
+                "[leaderboard] board hands query failed (hands omitted): {e}"
+            ));
+            Vec::new()
+        }
+    };
+    let head = BoardPageHead {
+        next_after: crate::logic::leaderboard_next_after(first, page, truncated),
+        owners,
+        truncated,
+        extras: crate::logic::LeaderboardPageExtras {
+            next_cursor,
+            candidates_bounded: None,
+            candidates_whole: Some(total),
+        },
+        pot_rows,
+        hands,
+    };
+    leaderboard_page_tail_with(db, page, head, HandsPotRows::Table, &pre, computed_at).await
+}
+
+/// One `board_owners` card row (bsv-low #674 fold): the owner, its counted
+/// wins and the card holding `packed` of them.
+#[derive(Deserialize)]
+struct BoardCardRowD1 {
+    owner: String,
+    wins: f64,
+    packed: f64,
+    card: Option<String>,
+}
+
+/// One win of a card: the owners query's row and the rows the page tail reads
+/// for its pot.
+struct CardWin {
+    row: crate::logic::ChainWinPotRow,
+    pot_created_at: Option<f64>,
+    status: PotRecordRow,
+    decoded: DecodedPotRowD1,
+    markers: Vec<ResultMarkerRow>,
+    /// Each marker's proof key (`lower(gameId)`, `lower(winner)`), its proof
+    /// pointers in `proof_pointers_sql`'s order and its posted bundle.
+    proofs: Vec<((String, String), Vec<String>, bool)>,
+}
+
+impl BoardCardRowD1 {
+    /// The card's wins, or `None` when it does not hold every win of the owner
+    /// (or a byte of it does not read): the owner is then read by its wins.
+    fn entries(&self) -> Option<Vec<CardWin>> {
+        if self.packed != self.wins {
+            return None;
+        }
+        let card: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(self.card.as_deref()?).ok()?;
+        if card.len() as f64 != self.wins {
+            return None;
+        }
+        card.into_values().map(CardWin::from_entry).collect()
+    }
+}
+
+impl CardWin {
+    fn from_entry(mut entry: serde_json::Value) -> Option<CardWin> {
+        let mut frag = entry.as_object_mut()?.remove("f")?;
+        let c = serde_json::from_value::<ChainWinCandidateRowD1>(entry)
+            .ok()?
+            .into_candidate()
+            .0;
+        let f = frag.as_object_mut()?;
+        let status = serde_json::from_value::<PotRowD1>(f.remove("s")?)
+            .ok()?
+            .into_row();
+        let decoded = serde_json::from_value::<DecodedPotRowD1>(f.remove("d")?).ok()?;
+        let mut rows: Vec<(f64, serde_json::Value)> = Vec::new();
+        for mut m in f.remove("m")?.as_array()?.clone() {
+            let rn = m.as_object_mut()?.remove("rn")?.as_f64()?;
+            rows.push((rn, m));
+        }
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut markers = Vec::new();
+        let mut proofs = Vec::new();
+        for (_, mut m) in rows {
+            let o = m.as_object_mut()?;
+            let pointers = o.remove("pp")?;
+            let posted = o.remove("po")?.as_f64()? != 0.0;
+            let key = (
+                o.get("gameId")?.as_str()?.to_ascii_lowercase(),
+                o.get("winner")?.as_str()?.to_ascii_lowercase(),
+            );
+            // `[createdAt, rowid, txid]`, ordered `createdAt DESC, rowid DESC`
+            // (a NULL stamp last), as `proof_pointers_sql`'s window numbers them.
+            let mut pp: Vec<(Option<f64>, f64, String)> = Vec::new();
+            for p in pointers.as_array()? {
+                let p = p.as_array()?;
+                pp.push((
+                    p.first()?.as_f64(),
+                    p.get(1)?.as_f64()?,
+                    p.get(2)?.as_str()?.to_string(),
+                ));
+            }
+            pp.sort_by(|a, b| {
+                b.0.unwrap_or(f64::NEG_INFINITY)
+                    .total_cmp(&a.0.unwrap_or(f64::NEG_INFINITY))
+                    .then_with(|| b.1.total_cmp(&a.1))
+            });
+            proofs.push((key, pp.into_iter().map(|p| p.2).collect(), posted));
+            if let Some(marker) = serde_json::from_value::<ResultRowD1>(m).ok()?.into_marker() {
+                markers.push(marker);
+            }
+        }
+        Some(CardWin {
+            pot_created_at: c.pot_created_at.map(|v| v as f64),
+            row: c.row,
+            status,
+            decoded,
+            markers,
+            proofs,
+        })
+    }
+}
+
+/// The rows steps 3 to 6 would read for the page's own pots, taken from the
+/// page owners' cards (bsv-low #674 fold, MEDIUM-1). A pot or a proof key not
+/// held here is read from D1 as before.
+#[derive(Default)]
+pub(crate) struct PagePrefetch {
+    /// The status row, by the pot's txid as `board_wins` holds it.
+    status: std::collections::HashMap<String, PotRecordRow>,
+    /// The decoded row, by the lowercase pot txid.
+    decoded: std::collections::HashMap<String, DecodedPotRowD1>,
+    /// The pot's markers in `pot_markers_sql`'s order, by the pot's txid.
+    markers: std::collections::HashMap<String, Vec<ResultMarkerRow>>,
+    /// The proof pointers and posted bundles of every key a held marker names.
+    proofs: std::collections::HashMap<(String, String), (Vec<String>, bool)>,
+}
+
+impl PagePrefetch {
+    fn take(&mut self, w: &CardWin) {
+        let pot = w.row.pot_txid.clone();
+        self.status.insert(pot.clone(), w.status.clone());
+        self.decoded
+            .insert(pot.to_ascii_lowercase(), w.decoded.clone());
+        self.markers.insert(pot, w.markers.clone());
+        for (key, pp, posted) in &w.proofs {
+            self.proofs.insert(key.clone(), (pp.clone(), *posted));
+        }
+    }
+}
+
+/// What steps 1 and 2 hand the tail: the page, its owners' counted wins and the
+/// hands board's markers in order.
+pub(crate) struct BoardPageHead {
+    owners: Vec<String>,
+    truncated: bool,
+    next_after: Option<usize>,
+    extras: crate::logic::LeaderboardPageExtras,
+    pot_rows: Vec<crate::logic::ChainWinPotRow>,
+    hands: Vec<ResultMarkerRow>,
+}
+
+/// Where the hands pots beyond the page take their attribution from: the
+/// candidates (every candidate win of those pots' winners), or `board_wins` by
+/// pot. The fold reads an attribution only for a pot it classified, so both
+/// answer the same for the hands pots.
+pub(crate) enum HandsPotRows<'a> {
+    Candidates(&'a [crate::logic::ChainWinCandidate]),
+    Table,
+}
+
+/// Steps 3 to 6 of [`compute_leaderboard_body_string`]: the statuses, the
+/// classification, the markers, the hands pots, the fold and the #685
+/// decoration, then the body.
+pub(crate) async fn leaderboard_page_tail<B: crate::board_db::BoardDb>(
+    db: &B,
+    page: usize,
+    head: BoardPageHead,
+    hands_pots: HandsPotRows<'_>,
+    computed_at: i64,
+) -> (u16, String) {
+    leaderboard_page_tail_with(
+        db,
+        page,
+        head,
+        hands_pots,
+        &PagePrefetch::default(),
+        computed_at,
+    )
+    .await
+}
+
+/// [`leaderboard_page_tail`] over the rows the page owners' cards already hold
+/// (`pre`): a pot or a proof key held there is not read again.
+pub(crate) async fn leaderboard_page_tail_with<B: crate::board_db::BoardDb>(
+    db: &B,
+    page: usize,
+    head: BoardPageHead,
+    hands_pots: HandsPotRows<'_>,
+    pre: &PagePrefetch,
+    computed_at: i64,
+) -> (u16, String) {
+    use crate::board_db::{warn, Bind};
+    let BoardPageHead {
+        owners,
+        truncated,
+        next_after,
+        extras,
+        pot_rows,
+        hands,
+    } = head;
 
     // 3) Statuses (the SAME table /utxo-status reads) — FAIL-SAFE 503.
     let mut outpoints: Vec<crate::logic::Outpoint> = Vec::new();
@@ -1325,7 +1765,18 @@ pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
         }
     }
     let mut status_rows: Vec<PotRecordRow> = Vec::with_capacity(outpoints.len());
-    for chunk in chunk_outpoints(&outpoints) {
+    let unheld: Vec<crate::logic::Outpoint> = outpoints
+        .iter()
+        .filter(|o| match pre.status.get(&o.txid) {
+            Some(row) => {
+                status_rows.push(row.clone());
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect();
+    for chunk in chunk_outpoints(&unheld) {
         let mut b: Vec<Bind> = Vec::with_capacity(chunk.len() * 2);
         for op in chunk {
             b.push(Bind::Text(op.db_txid()));
@@ -1343,8 +1794,9 @@ pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
     }
     let statuses = assemble_statuses(&outpoints, &status_rows);
     // Classification (column tier — verdict, committed params, signers) for
-    // the page's pots; attribution from the candidates' own latched resolution.
-    let (verdicts, params_by_pot, signers_by_pot) = classify_spent_pots(db, &statuses).await;
+    // the page's pots; attribution from the page rows' own latched resolution.
+    let (verdicts, params_by_pot, signers_by_pot) =
+        classify_spent_pots_with(db, &statuses, &pre.decoded).await;
     let attributions = crate::logic::attributions_from_pot_rows(&pot_rows);
 
     // 4) Decoration — BEST-EFFORT: a fault omits decoration, never a count.
@@ -1363,28 +1815,48 @@ pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
     };
     let pot_txids: Vec<String> = outpoints.iter().map(|o| o.txid.clone()).collect();
     for chunk in pot_txids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-        let b: Vec<Bind> = chunk.iter().map(|t| Bind::Text(t.clone())).collect();
-        match db
-            .all::<ResultRowD1>(crate::logic::pot_markers_sql(chunk.len()), b)
-            .await
-        {
-            Ok(rows) => {
-                for m in rows.into_iter().filter_map(ResultRowD1::into_marker) {
-                    push_marker(m);
+        // A chunk's markers in `pot_markers_sql`'s order (`potTxid ASC`, then
+        // each pot's own order), the held pots' from their cards.
+        let mut by_pot: Vec<(String, Vec<ResultMarkerRow>)> = Vec::new();
+        let unheld: Vec<&String> = chunk
+            .iter()
+            .filter(|t| match pre.markers.get(*t) {
+                Some(ms) => {
+                    by_pot.push(((*t).clone(), ms.clone()));
+                    false
+                }
+                None => true,
+            })
+            .collect();
+        if !unheld.is_empty() {
+            let b: Vec<Bind> = unheld.iter().map(|t| Bind::Text((*t).clone())).collect();
+            match db
+                .all::<ResultRowD1>(crate::logic::pot_markers_sql(unheld.len()), b)
+                .await
+            {
+                Ok(rows) => {
+                    for m in rows.into_iter().filter_map(ResultRowD1::into_marker) {
+                        match by_pot.last_mut() {
+                            Some((pot, ms)) if *pot == m.pot_txid => ms.push(m),
+                            _ => by_pot.push((m.pot_txid.clone(), vec![m])),
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn(&format!(
+                        "[leaderboard] pot markers query failed (decoration omitted): {e}"
+                    ));
                 }
             }
-            Err(e) => {
-                warn(&format!(
-                    "[leaderboard] pot markers query failed (decoration omitted): {e}"
-                ));
-            }
         }
-    }
-    // The hands board, from the candidates (the era hands query's rows).
-    for &i in &sel.hands {
-        if let Some(m) = hand_markers[i].clone() {
+        by_pot.sort_by(|a, b| a.0.cmp(&b.0));
+        for m in by_pot.into_iter().flat_map(|(_, ms)| ms) {
             push_marker(m);
         }
+    }
+    // The hands board (the era hands query's rows).
+    for m in hands {
+        push_marker(m);
     }
     // The hands pots may lie beyond the page: their statuses/verdicts are
     // needed for the fold to count (and so decorate) them. Top up the
@@ -1399,71 +1871,99 @@ pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
             .filter(|o| !have.contains(&o.txid.to_ascii_lowercase()))
             .collect()
     };
-    let (statuses, verdicts, params_by_pot, signers_by_pot, attributions) =
-        if extra_outpoints.is_empty() {
-            (
-                statuses,
-                verdicts,
-                params_by_pot,
-                signers_by_pot,
-                attributions,
-            )
-        } else {
-            let mut extra_rows: Vec<PotRecordRow> = Vec::new();
-            for chunk in chunk_outpoints(&extra_outpoints) {
-                let mut b: Vec<Bind> = Vec::with_capacity(chunk.len() * 2);
-                for op in chunk {
-                    b.push(Bind::Text(op.db_txid()));
-                    b.push(Bind::Num(f64::from(op.vout)));
-                }
-                match db.all::<PotRowD1>(batch_where_sql(chunk.len()), b).await {
-                    Ok(rows) => extra_rows.extend(rows.into_iter().map(PotRowD1::into_row)),
-                    Err(e) => warn(&format!(
-                        "[leaderboard] hands pots status query failed (hands omitted): {e}"
-                    )),
+    let (statuses, verdicts, params_by_pot, signers_by_pot, attributions) = if extra_outpoints
+        .is_empty()
+    {
+        (
+            statuses,
+            verdicts,
+            params_by_pot,
+            signers_by_pot,
+            attributions,
+        )
+    } else {
+        let mut extra_rows: Vec<PotRecordRow> = Vec::new();
+        for chunk in chunk_outpoints(&extra_outpoints) {
+            let mut b: Vec<Bind> = Vec::with_capacity(chunk.len() * 2);
+            for op in chunk {
+                b.push(Bind::Text(op.db_txid()));
+                b.push(Bind::Num(f64::from(op.vout)));
+            }
+            match db.all::<PotRowD1>(batch_where_sql(chunk.len()), b).await {
+                Ok(rows) => extra_rows.extend(rows.into_iter().map(PotRowD1::into_row)),
+                Err(e) => warn(&format!(
+                    "[leaderboard] hands pots status query failed (hands omitted): {e}"
+                )),
+            }
+        }
+        let extra_statuses = assemble_statuses(&extra_outpoints, &extra_rows);
+        let (ev, ep, es) = classify_spent_pots(db, &extra_statuses).await;
+        let mut hands_attr = attributions;
+        match hands_pots {
+            // The hands pots' attribution comes from the SAME candidate
+            // resolution (the hands are only identity-resolved winners):
+            // every candidate win of those pots' winners, as the owners
+            // query read them before #642.
+            HandsPotRows::Candidates(cands) => {
+                let hands_owners: std::collections::HashSet<String> = markers
+                    .iter()
+                    .filter(|m| {
+                        extra_outpoints
+                            .iter()
+                            .any(|o| o.txid.eq_ignore_ascii_case(&m.pot_txid))
+                    })
+                    .map(|m| m.winner.to_ascii_lowercase())
+                    .collect();
+                let rows: Vec<crate::logic::ChainWinPotRow> = cands
+                    .iter()
+                    .filter(|c| hands_owners.contains(&c.row.owner))
+                    .map(|c| c.row.clone())
+                    .collect();
+                hands_attr.extend(crate::logic::attributions_from_pot_rows(&rows));
+            }
+            // #674: the hands pots' own `board_wins` rows. BEST-EFFORT.
+            HandsPotRows::Table => {
+                let pots: Vec<String> = extra_outpoints.iter().map(|o| o.txid.clone()).collect();
+                for chunk in pots.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+                    let b: Vec<Bind> = chunk.iter().map(|t| Bind::Text(t.clone())).collect();
+                    match db
+                        .all::<ChainWinCandidateRowD1>(
+                            crate::logic::board_wins_pots_sql(chunk.len()),
+                            b,
+                        )
+                        .await
+                    {
+                        Ok(rows) => {
+                            let rows: Vec<crate::logic::ChainWinPotRow> =
+                                rows.into_iter().map(|r| r.into_candidate().0.row).collect();
+                            hands_attr.extend(crate::logic::attributions_from_pot_rows(&rows));
+                        }
+                        Err(e) => warn(&format!(
+                            "[leaderboard] hands pots wins query failed (hands unattributed): {e}"
+                        )),
+                    }
                 }
             }
-            let extra_statuses = assemble_statuses(&extra_outpoints, &extra_rows);
-            let (ev, ep, es) = classify_spent_pots(db, &extra_statuses).await;
-            // The hands pots' attribution comes from the SAME candidate
-            // resolution (the hands are only identity-resolved winners): every
-            // candidate win of those pots' winners, as the owners query read
-            // them before #642.
-            let mut hands_attr = attributions;
-            let hands_owners: std::collections::HashSet<String> = markers
-                .iter()
-                .filter(|m| {
-                    extra_outpoints
-                        .iter()
-                        .any(|o| o.txid.eq_ignore_ascii_case(&m.pot_txid))
-                })
-                .map(|m| m.winner.to_ascii_lowercase())
-                .collect();
-            let rows: Vec<crate::logic::ChainWinPotRow> = cands
-                .iter()
-                .filter(|c| hands_owners.contains(&c.row.owner))
-                .map(|c| c.row.clone())
-                .collect();
-            hands_attr.extend(crate::logic::attributions_from_pot_rows(&rows));
-            let mut statuses = statuses;
-            statuses.extend(extra_statuses);
-            let mut verdicts = verdicts;
-            verdicts.extend(ev);
-            let mut params_by_pot = params_by_pot;
-            params_by_pot.extend(ep);
-            let mut signers_by_pot = signers_by_pot;
-            signers_by_pot.extend(es);
-            (
-                statuses,
-                verdicts,
-                params_by_pot,
-                signers_by_pot,
-                hands_attr,
-            )
-        };
+        }
+        let mut statuses = statuses;
+        statuses.extend(extra_statuses);
+        let mut verdicts = verdicts;
+        verdicts.extend(ev);
+        let mut params_by_pot = params_by_pot;
+        params_by_pot.extend(ep);
+        let mut signers_by_pot = signers_by_pot;
+        signers_by_pot.extend(es);
+        (
+            statuses,
+            verdicts,
+            params_by_pot,
+            signers_by_pot,
+            hands_attr,
+        )
+    };
 
     // 5) + 6) The fold, cut to the page, then the #685 decoration.
-    let (lb, result_count) = leaderboard_fold_and_decorate(
+    let (lb, result_count) = leaderboard_fold_and_decorate_with(
         db,
         &markers,
         &statuses,
@@ -1473,12 +1973,9 @@ pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
         &params_by_pot,
         &signers_by_pot,
         &owners,
+        pre,
     )
     .await;
-    let extras = crate::logic::LeaderboardPageExtras {
-        next_cursor: sel.next_cursor,
-        candidates_bounded: bounded.then_some(candidate_cap),
-    };
     (
         200,
         crate::logic::leaderboard_body_paged(
@@ -1495,8 +1992,10 @@ pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
 /// Steps 5 and 6 of [`compute_leaderboard_body_string`]: the fold (UNCHANGED),
 /// the cut to the page's owners, and the #685 proof decoration over the
 /// page-local set. Returns the board and `resultCount` (the markers read).
+/// The proof pointers and posted bundles the page owners' cards hold (`pre`,
+/// bsv-low #674 fold) are not read again.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn leaderboard_fold_and_decorate<B: crate::board_db::BoardDb>(
+pub(crate) async fn leaderboard_fold_and_decorate_with<B: crate::board_db::BoardDb>(
     db: &B,
     markers: &[ResultMarkerRow],
     statuses: &[crate::logic::OutpointStatus],
@@ -1506,6 +2005,7 @@ pub(crate) async fn leaderboard_fold_and_decorate<B: crate::board_db::BoardDb>(
     params_by_pot: &std::collections::HashMap<String, crate::results::CovenantParams>,
     signers_by_pot: &std::collections::HashMap<String, String>,
     owners: &[String],
+    pre: &PagePrefetch,
 ) -> (crate::logic::Leaderboard, usize) {
     use crate::board_db::{warn, Bind};
     // 5) The fold (UNCHANGED) — wins minted from chain facts, the winner's own
@@ -1538,13 +2038,32 @@ pub(crate) async fn leaderboard_fold_and_decorate<B: crate::board_db::BoardDb>(
     // pairs are already lowercase (the page's own evidence keys).
     let decorate_pairs =
         crate::logic::leaderboard_decoration_pairs(&lb, crate::logic::LEADERBOARD_PROOF_PAIRS_CAP);
+    // The pairs the page owners' cards hold answer from there (bsv-low #674
+    // fold); the rest are read.
+    let mut proof_map: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
+    let mut posted: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let unheld_pairs: Vec<(String, String)> = decorate_pairs
+        .iter()
+        .filter(|k| match pre.proofs.get(*k) {
+            Some((pointers, is_posted)) => {
+                if !pointers.is_empty() {
+                    proof_map.insert((*k).clone(), pointers.clone());
+                }
+                if *is_posted {
+                    posted.insert((*k).clone());
+                }
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect();
 
     // proof_markers pointers, KEYED to the page-local (gameId, winner) pairs —
     // the bounded SUPERSET per key (#332 HIGH-1; the client filters by
     // transcript validity). BEST-EFFORT: a fault omits the hint, never a count.
-    let mut proof_map: std::collections::HashMap<(String, String), Vec<String>> =
-        std::collections::HashMap::new();
-    for chunk in decorate_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+    for chunk in unheld_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
         let mut b: Vec<Bind> = Vec::with_capacity(chunk.len() * 2);
         for (g, w) in chunk {
             b.push(Bind::Text(g.clone()));
@@ -1574,8 +2093,7 @@ pub(crate) async fn leaderboard_fold_and_decorate<B: crate::board_db::BoardDb>(
     // Proof-in-DB (2026-09-02): the posted-bundle set over the same page-local
     // pairs (a posted proof is not a marker; the aggregator has nothing to
     // count). BEST-EFFORT.
-    let mut posted: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    for chunk in decorate_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+    for chunk in unheld_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
         let mut b: Vec<Bind> = Vec::with_capacity(chunk.len() * 2);
         for (g, w) in chunk {
             b.push(Bind::Text(g.clone()));
@@ -1696,7 +2214,7 @@ struct PotBeefRowD1 {
 
 /// `pot_records` decoded-column row for the #284 classification partition
 /// (`decoded_pots_sql`). All optional/`default` — a legacy row is NULLs.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub(crate) struct DecodedPotRowD1 {
     txid: String,
     #[serde(rename = "spendingTxid", default)]
@@ -1783,6 +2301,21 @@ async fn classify_spent_pots<B: crate::board_db::BoardDb>(
     std::collections::HashMap<String, crate::results::CovenantParams>,
     std::collections::HashMap<String, String>,
 ) {
+    classify_spent_pots_with(db, statuses, &std::collections::HashMap::new()).await
+}
+
+/// [`classify_spent_pots`] with the decoded rows the page owners' cards hold
+/// (`held`, by lowercase pot txid; bsv-low #674 fold): the column tier reads
+/// only the pots not held. The tiers are unchanged.
+async fn classify_spent_pots_with<B: crate::board_db::BoardDb>(
+    db: &B,
+    statuses: &[crate::logic::OutpointStatus],
+    held: &std::collections::HashMap<String, DecodedPotRowD1>,
+) -> (
+    std::collections::HashMap<String, crate::results::PotVerdict>,
+    std::collections::HashMap<String, crate::results::CovenantParams>,
+    std::collections::HashMap<String, String>,
+) {
     let mut verdicts = std::collections::HashMap::new();
     let mut params_by_pot = std::collections::HashMap::new();
     // bsv-low #406: who signed each pot's settle — COLUMN-TIER ONLY (the
@@ -1821,16 +2354,31 @@ async fn classify_spent_pots<B: crate::board_db::BoardDb>(
     // BEST-EFFORT: any fault leaves rows unresolved here and the fallback
     // picks them up — never a 5xx, never a guessed verdict.
     let mut column_resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for chunk in all_pairs.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
-        let sql = crate::results::decoded_pots_sql(chunk.len());
-        let mut binds: Vec<crate::board_db::Bind> = Vec::with_capacity(chunk.len() * 2);
-        for (pot, _) in chunk {
-            binds.push(crate::board_db::Bind::Text(pot.clone()));
-            binds.push(crate::board_db::Bind::Num(f64::from(
-                crate::logic::LEADERBOARD_POT_VOUT,
-            )));
-        }
-        match db.all::<DecodedPotRowD1>(sql, binds).await {
+    let (held_pairs, read_pairs): (Vec<_>, Vec<_>) = all_pairs
+        .iter()
+        .cloned()
+        .partition(|(pot, _): &(String, String)| held.contains_key(pot));
+    let mut chunks: Vec<(&[(String, String)], bool)> = vec![(&held_pairs, true)];
+    chunks.extend(
+        read_pairs
+            .chunks(crate::logic::D1_CHUNK_OUTPOINTS)
+            .map(|c| (c, false)),
+    );
+    for (chunk, is_held) in chunks {
+        let read = if is_held {
+            Ok(Vec::new())
+        } else {
+            let sql = crate::results::decoded_pots_sql(chunk.len());
+            let mut binds: Vec<crate::board_db::Bind> = Vec::with_capacity(chunk.len() * 2);
+            for (pot, _) in chunk {
+                binds.push(crate::board_db::Bind::Text(pot.clone()));
+                binds.push(crate::board_db::Bind::Num(f64::from(
+                    crate::logic::LEADERBOARD_POT_VOUT,
+                )));
+            }
+            db.all::<DecodedPotRowD1>(sql, binds).await
+        };
+        match read {
             Err(crate::board_db::BoardDbError::Bind(e)) => {
                 crate::board_db::warn(&format!(
                     "[leaderboard] decoded-pots bind failed (column tier skipped): {e}"
@@ -1843,7 +2391,7 @@ async fn classify_spent_pots<B: crate::board_db::BoardDb>(
                     .map(|r| (r.txid.to_ascii_lowercase(), r))
                     .collect();
                 for (pot, spender) in chunk {
-                    let Some(row) = by_txid.get(pot) else {
+                    let Some(row) = by_txid.get(pot).or_else(|| held.get(pot)) else {
                         continue;
                     };
                     // The stored verdict counts ONLY for the spender being
@@ -11059,3 +11607,6 @@ mod ns2_d1bound_compat;
 #[cfg(test)]
 #[path = "../tests/support/leaderboard_642.rs"]
 mod leaderboard_642;
+#[cfg(test)]
+#[path = "../tests/support/leaderboard_674.rs"]
+mod leaderboard_674;

@@ -333,6 +333,67 @@ index entry at its insert and at its spend, a settle verdict and a spend of a de
 until their pass latches them, and every `network_seen` latch writes the count's row. The route tier's write
 ceilings were not re-measured in this lane unless the gate below says so.
 
+## `/leaderboard:view`, the board tables (bsv-low #674, 2026-10-17)
+
+The ranking is stored at the write (`derived_board.rs`: `board_wins`, `board_owners`, `board_hands`, `board_total`,
+kept by triggers in the settle hooks' own statements). The page reads `board_owners` by its rank index, the page
+owners' `board_wins` rows by owner and the hands by `board_hands`' rank index; steps 3 to 6 (statuses,
+classification, markers, the #685 decoration) are unchanged. The candidate read's 2,000-win window is gone: the body
+ranks every counted win (`candidatesBounded: false`, `candidates` the era's count). Same tier, same boards; the
+requests are the SHIPPED dispatcher's (the table read), #642's candidate read and the whole-board read recorded
+beside them.
+
+| board | request | statements | reads (largest statement) | ceiling (`maxReads` per request / per statement) |
+|---|---|---|---|---|
+| 1,500 wins | page 1, limit 50 | 113 | 11,801 (987) | 33,879 / 2,757 |
+| 1,500 wins | page 1, limit 200 | 174 | 19,004 (987) | 52,343 / 2,757 |
+| 1,500 wins | page 2 by cursor, limit 50 | 59 | 5,771 (492) | 33,879 / 2,757 |
+| 1,500 wins | #642's candidate read, page 1, limit 50 | 108 | 28,403 (17,834) | record |
+| 1,500 wins | the whole-board read, page 1, limit 50 | 112 | 76,577 (20,323) | must exceed 33,879 |
+| 3,000 wins | page 1, limit 50 | 213 | 22,586 (1,838) | 33,879 / 2,757 |
+| 3,000 wins | page 1, limit 200 | 293 | 34,895 (1,838) | 52,343 / 2,757 |
+| 3,000 wins | page 2 by cursor, limit 50 | 114 | 11,841 (928) | 33,879 / 2,757 |
+| 3,000 wins | #642's candidate read, page 1, limit 50 | 143 | 39,049 (25,001) | record |
+| 3,000 wins | the whole-board read, page 1, limit 50 | 212 | 151,781 (40,697) | must exceed 33,879 |
+
+The table above is the read as first built (`eaf122e`): NOT flat. The body carries every counted win of every owner
+on the page (the `chainWins` anchors and the evidence), and the page read each owner's `board_wins` rows and then the
+statuses, classification, markers and proof decoration of every one of those pots: about 12 reads a page-owner win
+(the default page's 50 owners hold 945 counted wins at 1,500 and 1,843 at 3,000), past the default ceiling at about
+2,700 such wins and past #642's own read at about 3,250 (the #674 lens, MEDIUM-1).
+
+### The lens fold: the page reads the owners' cards (flat)
+
+Each `board_wins` row carries `frag`, the rows the page tail reads for that win (its status and decoded `pot_records`
+columns, its first four result markers, each marker's proof pointers and posted bundle), and each `board_owners` row
+carries `card`, its wins and their frags (`derived_board.rs`; the triggers keep both, the drift pin holds each frag
+equal to the app layer's own statements run from scratch and each card equal to its owner's wins). The page reads
+the owner page, one card row per page owner, the hands, and the hands' pots beyond the page: never the page owners'
+per-win rows. An owner whose card does not hold every win (a card past 1,500,000 bytes, a frag past 200,000) is read
+by its wins as before.
+
+| board | request | statements | reads (largest statement) | ceiling |
+|---|---|---|---|---|
+| 1,500 wins | page 1, limit 50 | 8 | 323 (100) | 728 / 600 |
+| 1,500 wins | page 1, limit 200 | 8 | 978 (400) | 1,505 / 600 |
+| 1,500 wins | page 2 by cursor, limit 50 | 9 | 485 (100) | 728 / 600 |
+| 3,000 wins | page 1, limit 50 | 8 | 323 (100) | 728 / 600 |
+| 3,000 wins | page 1, limit 200 | 8 | 1,003 (400) | 1,505 / 600 |
+| 3,000 wins | page 2 by cursor, limit 50 | 9 | 467 (100) | 728 / 600 |
+
+The default page reads 323 rows on both boards (asserted equal by `ci-d1-board`'s `flat.json`): a constant of the page
+(the owner page, its cards, the hands and their off-page pots), whatever its owners' wins. Limit 200 and the cursor
+page differ between the boards by the hands' off-page pots and the cursor's rank (one index row per owner ranked above
+it, NOTE-2), both bounded by the page and the owner count, not the wins. Ceilings: the larger figure times 1.5 rounded
+up (`LEADERBOARD_VIEW_MAX_READS` 728, `_PAGE_MAX` 1,505, `LEADERBOARD_STATEMENT_MAX_READS` 600); #642's candidate read
+(28,403 and 39,049) and the first table read (11,801 and 22,586) are each past them. The writes: each
+settle-hook statement adds its triggers' statements, each keyed by the written row (`EXPLAIN QUERY PLAN` pinned in
+`d1_fleet_plans.rs`, `the_board_table_read_and_its_triggers_never_scan`); not measured on D1 here. Since the fold a
+counted win's insert also builds its frag (its pot's markers, at most four proof pointers and one posted bundle per
+marker) and writes its owner's card; a result marker, proof pointer or posted bundle write refreshes the frags of the
+counted pots it names, and a frag-only `pot_records` column (`spentHeight`, the decoded params) its pot's frag. The
+`ci-d1-budget` tier's per-hook write ceilings were measured before the fold and are owed a re-run.
+
 ## The census's per-tick whole-table reads, bounded (NS-COST-BAR-1, the owner's cost word of 2026-10-18)
 
 Source: the 24-hour D1 census of 2026-10-17 (2026-10-17T00:03:52Z to 2026-10-18T00:03:52Z, bsv-low

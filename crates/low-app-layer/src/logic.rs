@@ -2557,15 +2557,19 @@ pub fn leaderboard_pot_beefs_sql(n: usize) -> String {
 pub const LEADERBOARD_CANDIDATE_WINS: usize = 2_000;
 
 /// The D1 rows one `/leaderboard:view` page request may read at the default
-/// page, at [`LEADERBOARD_PAGE_MAX`], and in any one of its statements (#642).
-/// Measured on local D1 over the fleet-shaped board (`make ci-d1-board`,
-/// docs/D1-BUDGETS.md): the largest of the 1,500 and 3,000 win boards, 39,049,
-/// 46,859 and 25,001 (the candidate read at the cap), times 1.5 rounded up.
-/// The whole-board read it replaces read 76,577 and 151,781 at the default
-/// page on the same boards.
-pub const LEADERBOARD_VIEW_MAX_READS: u64 = 58_574;
-pub const LEADERBOARD_VIEW_MAX_READS_PAGE_MAX: u64 = 70_289;
-pub const LEADERBOARD_STATEMENT_MAX_READS: u64 = 37_502;
+/// page, at [`LEADERBOARD_PAGE_MAX`], and in any one of its statements.
+/// bsv-low #674 and its lens fold (MEDIUM-1): measured on local D1 over the
+/// fleet-shaped board (`make ci-d1-board`, docs/D1-BUDGETS.md) for the SHIPPED
+/// read (the page owners' cards): the largest of the 1,500 and 3,000 win boards
+/// at the default page (its cursor page, 485, the larger), at limit 200 (1,003)
+/// and in one statement (400), times 1.5 rounded up. The default page reads 323
+/// on both boards (its owners hold 945 and 1,843 wins): a constant of the page.
+/// Before the fold the table read read 11,801 and 22,586 there (ceilings 33,879,
+/// 52,343, 2,757); #642's candidate read 28,403 and 39,049, the whole-board
+/// read 76,577 and 151,781.
+pub const LEADERBOARD_VIEW_MAX_READS: u64 = 728;
+pub const LEADERBOARD_VIEW_MAX_READS_PAGE_MAX: u64 = 1_505;
+pub const LEADERBOARD_STATEMENT_MAX_READS: u64 = 600;
 
 /// The candidate read. BINDS: `?1` = the candidate cap + 1 (the bound probe),
 /// `?2` = the era cutoff (ms) iff configured. One arm per winner verdict, each
@@ -2659,6 +2663,82 @@ pub fn chain_wins_candidates_sql(written_off_before_ms: Option<i64>) -> String {
         score = sql_hand_score_expr("m.cardsHex"),
     )
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// bsv-low #674 THE BOARD TABLES (2026-10-17)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The ranking #642 bounded is stored at the write (the #638 doctrine): the
+// overlay's triggers keep `board_wins` (one row per counted win, the owners
+// query's columns), `board_owners` (the count per owner), `board_hands` (each
+// identity-owned win's hand) and `board_total` (`derived_board.rs`). The read
+// is a keyset walk of `board_owners`' rank index, the page owners' rows of
+// `board_wins` by owner, and the hands by their rank index: the top N read N
+// rows, whatever the era holds. Served only once the overlay's backfill has
+// stamped `board-v1` and only with no era cutoff; otherwise the candidate read.
+
+/// The board tables' readiness (the `board-v1` stamp) and the count of every
+/// counted win. Fails to prepare on a database the overlay has not migrated.
+pub const BOARD_READY_SQL: &str = "SELECT (SELECT 1 FROM view_derivation_state WHERE name = 'board-v1') AS ready, (SELECT wins FROM board_total WHERE id = 1) AS total";
+
+/// The owner page by rank offset (`?after`): a range SEARCH of the rank index
+/// (every row holds at least one win; the overlay deletes a row at 0). BINDS:
+/// `?1` = page + 1, `?2` = the offset.
+pub const BOARD_OWNERS_PAGE_SQL: &str = "SELECT owner, wins FROM board_owners WHERE wins >= 1 ORDER BY wins DESC, owner ASC LIMIT ?1 OFFSET ?2";
+
+/// The owner page after the keyset cursor `(wins, owner)`: the cursor's tie
+/// group past its owner, then the ranks below it, each arm a SEARCH of the rank
+/// index (the route orders the union). BINDS: `?1` = wins, `?2` = owner, `?3` =
+/// page + 1.
+pub const BOARD_OWNERS_AFTER_SQL: &str = "SELECT owner, wins FROM (SELECT owner, wins FROM board_owners WHERE wins = ?1 AND owner > ?2 ORDER BY wins DESC, owner ASC LIMIT ?3) UNION ALL SELECT owner, wins FROM (SELECT owner, wins FROM board_owners WHERE wins < ?1 ORDER BY wins DESC, owner ASC LIMIT ?3)";
+
+/// The cursor's rank (the owners ranked at or before it), for `nextAfter`.
+/// BINDS: `?1` = wins, `?2` = owner.
+pub const BOARD_CURSOR_RANK_SQL: &str = "SELECT (SELECT COUNT(*) FROM board_owners WHERE wins > ?1) + (SELECT COUNT(*) FROM board_owners WHERE wins = ?1 AND owner <= ?2) AS rank";
+
+/// The columns of a `board_wins` row as the candidate read names them.
+const BOARD_WINS_COLUMNS: &str = "owner, identityIsKey, potTxid, settleTxid, verdict, pubA, pubB, settleSigners, identityA, identityB, potCreatedAt";
+
+/// The counted wins of `n` owners in [`chain_wins_owners_sql`]'s order. BINDS:
+/// the owners as `?1..`.
+pub fn board_wins_owners_sql(n: usize) -> String {
+    debug_assert!((1..=D1_CHUNK_OUTPOINTS).contains(&n));
+    let owners = (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT {BOARD_WINS_COLUMNS} FROM board_wins WHERE owner IN ({owners}) \
+         ORDER BY owner ASC, potCreatedAt DESC, potTxid ASC"
+    )
+}
+
+/// The cards of `n` page owners (bsv-low #674 fold, MEDIUM-1): each owner's
+/// counted wins and every row the page reads for them, one `board_owners` row
+/// per owner, by its key. BINDS: the owners as `?1..`.
+pub fn board_cards_sql(n: usize) -> String {
+    debug_assert!((1..=D1_CHUNK_OUTPOINTS).contains(&n));
+    let owners = (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT owner, wins, packed, card FROM board_owners WHERE owner IN ({owners})")
+}
+
+/// The counted wins of `n` pots (the hands pots beyond the page). BINDS: the
+/// pot txids as `?1..`.
+pub fn board_wins_pots_sql(n: usize) -> String {
+    debug_assert!((1..=D1_CHUNK_OUTPOINTS).contains(&n));
+    let pots = (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {BOARD_WINS_COLUMNS} FROM board_wins WHERE potTxid IN ({pots}) AND potVout = 0")
+}
+
+/// The era's lowest hands, in [`era_hands_sql`]'s order, with their markers.
+/// BINDS: `?1` = the hands limit.
+pub const BOARD_HANDS_SQL: &str = "SELECT m.gameId, m.winner, m.loser, m.potTxid, m.settleTxid, m.winnerSigHex, m.loserSigHex, m.cardsHex, m.txid, m.createdAt, m.claimValid FROM board_hands h JOIN result_markers_v2 m ON m.rowid = h.markerRowid AND m.potTxid = h.potTxid ORDER BY h.score ASC, h.claimCreatedAt ASC, h.gameId ASC LIMIT ?1";
 
 /// The ordering facts of a candidate's hand (the [`era_hands_sql`] order:
 /// SQL score, then the claim's `createdAt`, then `gameId`).
@@ -2998,6 +3078,9 @@ pub struct LeaderboardPageExtras {
     /// `candidates` with `candidatesBounded: true`: the era holds more counted
     /// wins than the read ranked, so the board is the top of the last N games.
     pub candidates_bounded: Option<usize>,
+    /// `candidates` with `candidatesBounded: false` (bsv-low #674): the board
+    /// tables ranked every counted win of the era, this many.
+    pub candidates_whole: Option<usize>,
 }
 
 /// [`leaderboard_body`] with the #642 fields.
@@ -3155,6 +3238,10 @@ pub fn leaderboard_body_paged(
     if let Some(n) = extras.candidates_bounded {
         m.insert("candidates".to_string(), json!(n));
         m.insert("candidatesBounded".to_string(), json!(true));
+    }
+    if let Some(n) = extras.candidates_whole {
+        m.insert("candidates".to_string(), json!(n));
+        m.insert("candidatesBounded".to_string(), json!(false));
     }
     body.to_string()
 }
