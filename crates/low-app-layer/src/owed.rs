@@ -8103,6 +8103,33 @@ pub(crate) mod tests {
         );
     }
 
+    /// The W2-WORDS lens's LOW-2 (mutant M4): the route applies the word arm to the PARTY rows (results and
+    /// refunds) and to the HOP rows, each by its own call, both before any assembler; a pin that found either call
+    /// was satisfied by the hop rows' alone.
+    #[test]
+    fn l2_fold_the_route_applies_the_arm_to_party_and_hop_rows() {
+        let routes = include_str!("routes.rs");
+        let body = &routes[routes.find("async fn owed_recompute_inner(").unwrap()
+            ..routes
+                .find("let mut rows = derive_owed_rows(&inputs);")
+                .unwrap()];
+        let first_assembler = body.find("gather_result_rows(").unwrap();
+        for call in [
+            "crate::owed::apply_word_arm(result_rows, refund_rows, &mut [], views);",
+            "crate::owed::apply_word_arm(&mut [], &mut [], rows, views);",
+        ] {
+            let at = body
+                .find(call)
+                .unwrap_or_else(|| panic!("the route does not call `{call}`"));
+            assert!(at < first_assembler, "`{call}` runs after an assembler");
+        }
+        let party = body
+            .find("for (result_rows, refund_rows) in &mut party_rows {")
+            .unwrap();
+        let hops = body.find("for rows in &mut hop_chunks {").unwrap();
+        assert!(party < first_assembler && hops < first_assembler);
+    }
+
     static NONE: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
     pub(crate) fn inputs<'a>(
         results: &'a [ResultEntry],
