@@ -1721,3 +1721,103 @@ fn lb674_cut_the_same_stamp_again_writes_nothing() {
     );
     drift(&db, "cleared").unwrap();
 }
+
+// The W2-LB-674-CUTOFF lens's two pins (adopted at the rebase onto PRE557): the cutoff at a win's instant and one
+// ms either side, a NULL admission stamp, and a PRE557 block-time stamp that moves an era win across the cutoff.
+
+fn cut_seeded() -> Connection {
+    let db = schema_without(None);
+    db.execute_batch("BEGIN").unwrap();
+    for sql in d1_board::rows(NOW, 160) {
+        db.execute_batch(&sql).unwrap();
+    }
+    db.execute_batch("COMMIT").unwrap();
+    db
+}
+
+#[test]
+fn lb674_cut_the_cutoff_boundary_at_the_instant_and_one_ms_either_side() {
+    let db = cut_seeded();
+    let won = rows(
+        &db,
+        "SELECT potTxid, potCreatedAt FROM board_wins ORDER BY potCreatedAt, potTxid",
+    );
+    let (txid, t): (String, i64) = (
+        won[won.len() / 2][0].clone(),
+        won[won.len() / 2][1].parse().unwrap(),
+    );
+    for (d, kept) in [(-1i64, true), (0, true), (1, false)] {
+        set_era(&db, Some(t * 1000 + d));
+        let n = rows(
+            &db,
+            &format!("SELECT COUNT(*) FROM board_wins WHERE potTxid = '{txid}'"),
+        )[0][0]
+            .clone();
+        assert_eq!(n == "1", kept, "cutoff {d:+} ms");
+        drift(&db, &format!("boundary {d:+}")).unwrap();
+    }
+    // a NULL admission stamp is outside the era under a cutoff, inside with none
+    set_era(&db, Some(t * 1000));
+    let late = won.last().unwrap()[0].clone();
+    db.execute(
+        "UPDATE pot_records SET createdAt = NULL WHERE txid = ?1 AND outputIndex = 0",
+        [&late],
+    )
+    .unwrap();
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT COUNT(*) FROM board_wins WHERE potTxid = '{late}'")
+        )[0][0],
+        "0"
+    );
+    drift(&db, "null stamp under a cutoff").unwrap();
+    set_era(&db, None);
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT COUNT(*) FROM board_wins WHERE potTxid = '{late}'")
+        )[0][0],
+        "1"
+    );
+    drift(&db, "null stamp, no cutoff").unwrap();
+}
+
+#[test]
+fn lb674_cut_pre557_a_stamp_across_the_cutoff_leaves_the_board_as_the_era_filter_reads_it() {
+    let db = cut_seeded();
+    let won = rows(
+        &db,
+        "SELECT potTxid, potCreatedAt FROM board_wins ORDER BY potCreatedAt, potTxid",
+    );
+    let mid: i64 = won[won.len() / 2][1].parse().unwrap();
+    set_era(&db, Some(mid * 1000));
+    drift(&db, "cut").unwrap();
+    let late = won.last().unwrap()[0].clone();
+    let slack = overlay_discovery::pot::storage::BLOCK_TIME_STAMP_SLACK_SECS as i64;
+    let block = mid - 86_400;
+    let n = db
+        .execute(
+            d1d::POT_BLOCK_TIME_STAMP_SQL,
+            rusqlite::params![block, slack, late],
+        )
+        .unwrap();
+    assert!(n >= 1);
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT COUNT(*) FROM board_wins WHERE potTxid = '{late}'")
+        )[0][0],
+        "0"
+    );
+    drift(&db, "a PRE557 stamp moved an era win before the cutoff").unwrap();
+    set_era(&db, Some(block * 1000));
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT COUNT(*) FROM board_wins WHERE potTxid = '{late}'")
+        )[0][0],
+        "1"
+    );
+    drift(&db, "the cutoff lowered past it").unwrap();
+}
