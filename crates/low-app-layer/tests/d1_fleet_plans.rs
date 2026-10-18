@@ -192,6 +192,22 @@ fn hot_routes_never_scan_fleet_tables() {
             "/health/invariants indexJanitor backlog",
             bsv_overlay_cloudflare::ops::INDEX_JANITOR_BACKLOG_SQL.to_string(),
         ),
+        (
+            "overlay tick potparty relatch census",
+            bsv_overlay_cloudflare::d1_discovery::potparty_relatch_census_sql(),
+        ),
+        (
+            "overlay tick hopparty relatch census",
+            bsv_overlay_cloudflare::d1_discovery::hopparty_relatch_census_sql(),
+        ),
+        (
+            "overlay tick result relatch census",
+            bsv_overlay_cloudflare::d1_discovery::result_relatch_census_sql(),
+        ),
+        (
+            "overlay tick hand relatch census",
+            bsv_overlay_cloudflare::d1_discovery::hand_relatch_census_sql(),
+        ),
     ] {
         for detail in plan(&db, &sql) {
             if detail.contains("SEARCH x USING INDEX idx_potparty_identity") {

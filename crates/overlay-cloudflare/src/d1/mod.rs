@@ -586,7 +586,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 267 to 276 for NS-COST-BAR-1: `pot_beefs_unprovable_set`, `count_pot_beefs_unprovable`, five triggers, two backfills.
 /// 276 to 285 for NS-COST-BAR-1: `transactions_retired_set`, `count_transactions_retired`, five triggers, two backfills.
 /// 285 to 291 for NS-COST-BAR-1: `count_pot_unspent_kind`, three triggers, `idx_pot_unspent_created`, its backfill.
-pub const OVERLAY_MIGRATION_COUNT: usize = 291;
+/// 291 to 295 for NS-COST-BAR-1: the four relatch censuses' NULL-tier partial indexes.
+pub const OVERLAY_MIGRATION_COUNT: usize = 295;
 
 /// Named NS-3 production migration (historically migration 190).
 pub const TX_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)";
@@ -2127,6 +2128,14 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     ),
     "CREATE INDEX IF NOT EXISTS idx_pot_unspent_created ON pot_records(createdAt, lockKind) WHERE spent = 0",
     crate::ops::UNSPENT_KIND_BACKFILL,
+    // 292-295: NS-COST-BAR-1, the four relatch passes' census read its whole table on every tick (one
+    // `SUM(CASE WHEN rowid > ?)` aggregate; 2.9 M rows a day on beta). Each census is now a rowid range and a count
+    // of the legacy NULL tier through its own partial index (named by the census's `INDEXED BY`), which holds only
+    // the rows the relatch has not yet latched.
+    "CREATE INDEX IF NOT EXISTS idx_potparty_sig_null ON potparty_records(sigValid) WHERE sigValid IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_hopparty_marker_null ON hopparty_records(markerValid) WHERE markerValid IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_result_claim_null ON result_markers_v2(claimValid) WHERE claimValid IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_hand_row_null ON hand_markers(rowValid) WHERE rowValid IS NULL",
 ];
 
 // =============================================================================
