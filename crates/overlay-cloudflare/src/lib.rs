@@ -1369,15 +1369,14 @@ async fn admin_reverify_pot_beefs(env: &Env, req: &Request) -> worker::Result<Re
     // min_age 0: the drain is operator-driven and the fast path only ever
     // LATCHES verified truth — the #228 push-primary age gate protects
     // courier polling, which budget 0 already forbids.
-    let s =
-        crate::proof_fetcher::complete_pot_beef_proofs(
-            pot_storage.as_ref(),
-            &fetcher,
-            Some(&crate::chain_tracker::ChaintracksBlockTime::new(env)),
-            limit,
-            0,
-        )
-        .await;
+    let s = crate::proof_fetcher::complete_pot_beef_proofs(
+        pot_storage.as_ref(),
+        &fetcher,
+        Some(&crate::chain_tracker::ChaintracksBlockTime::new(env)),
+        limit,
+        0,
+    )
+    .await;
     Response::from_json(&serde_json::json!({
         "status": "ok",
         "limit": limit,
