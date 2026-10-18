@@ -796,7 +796,8 @@ pub(crate) async fn corroborate_tx_hex(
         Err(e) => Err(e),
     };
     if matches!(taal, Ok(ArcOutcome::Accepted(_))) {
-        return (taal, Some(crate::ops::SeenSource::Taal));
+        let by = accepting_corroborator(&taal, None);
+        return (taal, by);
     }
     worker::console_log!(
         "corroborate: TAAL did not accept ({}); consulting GorillaPool (two-provider bar)",
@@ -812,7 +813,7 @@ pub(crate) async fn corroborate_tx_hex(
         Ok((status, body)) => corroborator_verdict(status, &body),
         Err(e) => Err(e),
     };
-    let by = named_accept(&gp, crate::ops::SeenSource::GorillaPool);
+    let by = accepting_corroborator(&taal, Some(&gp));
     (fold_refuse_bar(taal, gp), by)
 }
 
@@ -822,6 +823,17 @@ fn named_accept(
     source: crate::ops::SeenSource,
 ) -> Option<crate::ops::SeenSource> {
     matches!(answer, Ok(ArcOutcome::Accepted(_))).then_some(source)
+}
+
+/// PURE (bsv-low #621; the W2-WORDS-L5 lens, LOW-2): the corroborator [`corroborate_tx_hex`] names as the one that
+/// ACCEPTED (the #413 dual push's `network_seen` source): TAAL's accept is TAAL's, else GorillaPool's accept
+/// (`gorillapool`, `None` when GorillaPool was not asked) is GorillaPool's, else none.
+fn accepting_corroborator(
+    taal: &Result<ArcOutcome, String>,
+    gorillapool: Option<&Result<ArcOutcome, String>>,
+) -> Option<crate::ops::SeenSource> {
+    named_accept(taal, crate::ops::SeenSource::Taal)
+        .or_else(|| gorillapool.and_then(|gp| named_accept(gp, crate::ops::SeenSource::GorillaPool)))
 }
 
 /// PURE (#216): corroborate a subject WITH its ancestry. Feed each ANCESTOR ef
@@ -6803,6 +6815,33 @@ mod tests {
             classify_arcade_status(&parsed.tx_status),
             GateVerdict::Pending
         );
+    }
+
+    /// bsv-low #621 (the W2-WORDS-L5 lens, LOW-2; its mutation O2, TAAL's accept named `GorillaPool`, survived every
+    /// test on `df03d2e`): each corroborator's accept is attributed to its OWN name, and `corroborate_tx_hex` names
+    /// its answer through this one function at both of its returns.
+    #[test]
+    fn i621_fold_l2_each_corroborators_accept_is_named_its_own() {
+        use crate::ops::SeenSource;
+        let acc = || -> Result<ArcOutcome, String> { Ok(ArcOutcome::Accepted("ok".into())) };
+        let rej = || -> Result<ArcOutcome, String> { Ok(ArcOutcome::Rejected("no".into())) };
+        let err = || -> Result<ArcOutcome, String> { Err("down".into()) };
+        assert_eq!(accepting_corroborator(&acc(), None), Some(SeenSource::Taal), "TAAL's short-circuit accept");
+        assert_eq!(accepting_corroborator(&acc(), Some(&rej())), Some(SeenSource::Taal));
+        assert_eq!(accepting_corroborator(&rej(), Some(&acc())), Some(SeenSource::GorillaPool));
+        assert_eq!(accepting_corroborator(&err(), Some(&acc())), Some(SeenSource::GorillaPool));
+        assert_eq!(accepting_corroborator(&rej(), Some(&rej())), None);
+        assert_eq!(accepting_corroborator(&err(), Some(&err())), None);
+        assert_eq!(accepting_corroborator(&rej(), None), None);
+        assert_eq!(SeenSource::Taal.wire(), "taal");
+        assert_eq!(SeenSource::GorillaPool.wire(), "gorillapool");
+        // the shipped body names through the function, never a literal source
+        let src = include_str!("broadcaster.rs");
+        let at = src.find("pub(crate) async fn corroborate_tx_hex(").unwrap();
+        let body = &src[at..at + src[at..].find("\n}\n").unwrap()];
+        assert_eq!(body.matches("accepting_corroborator(&taal, None)").count(), 1, "the TAAL short-circuit");
+        assert_eq!(body.matches("accepting_corroborator(&taal, Some(&gp))").count(), 1, "the GorillaPool return");
+        assert!(!body.contains("SeenSource::"), "no literal source in corroborate_tx_hex");
     }
 }
 
