@@ -6,7 +6,7 @@
 //! witness, the `/arc-ingest` callback, the retire pass's live look, the proof
 //! look) now carries it as the tracker's own value, a [`bsv_tracker::Hint`]
 //! from source `arcade`, and the door's answer is the HOST'S POLICY over that
-//! hint ([`gate`], [`callback`], [`refusal`], [`live_look`], [`proof_class`]).
+//! hint (`gate`, [`callback`], [`refusal`], [`live_look`], [`proof_class`]).
 //! A hint writes no chain word (the tracker charter's tier rule): admitting
 //! an index row on it is the host's own act, as the words map's S1 states.
 //!
@@ -23,7 +23,7 @@
 //! The K3 residue. `HintStatus` has no word for "in a block, the path
 //! pending" or "parked", and the gate's bar admits STUMP_PROCESSING and a
 //! height-less MINED. Such a hint is `Unknown` and carries Arcade's word in
-//! its `verdict`; [`k3_residue`] is the one place the policy reads that word,
+//! its `verdict`; `k3_residue` is the one place the policy reads that word,
 //! and the place L8 deletes once K3 lands.
 //!
 //! What this slice does NOT move (bsv-low #619's other halves, stopped on the

@@ -640,7 +640,11 @@ impl LookupService for PotLookupService {
             if let Some(ledger) = &ledger {
                 let row = ledger.get(&op.txid.to_ascii_lowercase()).copied().flatten();
                 entry["evicted"] = match row {
-                    Some(r) => super::storage::served_eviction_value(r.evicted_at, r.readmitted_at, r.chain_word),
+                    Some(r) => super::storage::served_eviction_value(
+                        r.evicted_at,
+                        r.readmitted_at,
+                        r.chain_word,
+                    ),
                     None => serde_json::Value::Null,
                 };
             }
@@ -1029,7 +1033,9 @@ mod tests {
         let legacy = funding_tx(2);
         let unseen = funding_tx(3);
         for tx in [&named, &legacy, &unseen] {
-            svc.output_admitted_by_topic(&admit(beef_of(tx), 0)).await.unwrap();
+            svc.output_admitted_by_topic(&admit(beef_of(tx), 0))
+                .await
+                .unwrap();
         }
         storage.mark_network_seen_by(&named.id(), "taal", 1_760_000_000_123);
         storage.mark_network_seen(&legacy.id());
@@ -1044,7 +1050,10 @@ mod tests {
         )
         .await;
         assert_eq!(
-            (arr[0]["networkSeen"].clone(), arr[0]["networkSeenBy"].clone()),
+            (
+                arr[0]["networkSeen"].clone(),
+                arr[0]["networkSeenBy"].clone()
+            ),
             (
                 serde_json::json!(true),
                 serde_json::json!({"word": "seen", "tier": "hint", "source": "taal", "at": 1_760_000_000_123_i64})
@@ -1056,7 +1065,13 @@ mod tests {
             "a legacy latch names no source"
         );
         assert_eq!(arr[1]["networkSeen"], true);
-        assert_eq!((arr[2]["networkSeen"].clone(), arr[2]["networkSeenBy"].clone()), (serde_json::json!(false), serde_json::Value::Null));
+        assert_eq!(
+            (
+                arr[2]["networkSeen"].clone(),
+                arr[2]["networkSeenBy"].clone()
+            ),
+            (serde_json::json!(false), serde_json::Value::Null)
+        );
         assert!(arr[3]["networkSeen"].is_null() && arr[3]["networkSeenBy"].is_null());
     }
 
@@ -1070,9 +1085,30 @@ mod tests {
         let rejected = "cd".repeat(32);
         let absent = "ef".repeat(32);
         storage.serve_evictions();
-        storage.record_eviction_word(&conflicted, 5, None, crate::pot::storage::eviction_chain_word("input aa:0 spent by confirmed competitor bb at 9"));
-        storage.record_eviction_word(&rejected, 6, None, crate::pot::storage::eviction_chain_word("REJECTED (arcade live REJECTED: bad; both indexers absent)"));
-        storage.record_eviction_word(&absent, 7, None, crate::pot::storage::eviction_chain_word("SEEN_ON_NETWORK (arcade missing, both indexers absent)"));
+        storage.record_eviction_word(
+            &conflicted,
+            5,
+            None,
+            crate::pot::storage::eviction_chain_word(
+                "input aa:0 spent by confirmed competitor bb at 9",
+            ),
+        );
+        storage.record_eviction_word(
+            &rejected,
+            6,
+            None,
+            crate::pot::storage::eviction_chain_word(
+                "REJECTED (arcade live REJECTED: bad; both indexers absent)",
+            ),
+        );
+        storage.record_eviction_word(
+            &absent,
+            7,
+            None,
+            crate::pot::storage::eviction_chain_word(
+                "SEEN_ON_NETWORK (arcade missing, both indexers absent)",
+            ),
+        );
         let arr = spent_status(
             &svc,
             serde_json::json!([{"txid": conflicted, "vout": 0}, {"txid": rejected, "vout": 0}, {"txid": absent, "vout": 0}]),
