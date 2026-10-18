@@ -467,9 +467,9 @@ ci-d1-board:
 #
 # Ports (four): LANE_BASE+9 (app layer), LANE_BASE+10 (overlay), LANE_BASE+11 (the e649 cell's delivering overlay)
 # and LANE_BASE+12 (its mock app layer, served by the cell), :8800 to :8803 by default; the same pre-flight,
-# bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network: no
-# fixture pot is spent and no hop filed (no courier), the app layer's service bindings are absent (its tip reads
-# answer 503 and the views serve without a tip), and the overlay's ARCADE_URL is a closed local port. The logs carry
+# bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network (the NO
+# EGRESS paragraph below proves it): no fixture pot is spent, the app layer's service bindings are absent (its tip
+# reads answer 503 and the views serve without a tip), and the overlay's ARCADE_URL is a closed local port. The logs carry
 # the port base (`/tmp/lane499-d1-<LANE_BASE>-app.log`, `-overlay.log`, `-seed.log`; the d3 fold-3, E585-D3-DELTA-M2):
 # two tiers on different bases never overwrite each other's logs (`ci-route`'s own logs too, the d3 fold-4:
 # `/tmp/lane347-route-<LANE_BASE>-strict.log` and the rest). No cell fires the scheduled tick (the d3 fold-4,
@@ -478,11 +478,26 @@ ci-d1-board:
 # background (18 rows under the e555 cell's counts in the captain's re-run of the fold-2) and could reach the
 # rebroadcast backstop's broadcasters; the cell ran last only to keep its writes away from the others. Leg 7 now
 # runs one pass of the sweep through its lever, synchronously, and the order of the cells is free again.
+#
+# NO EGRESS (bsv-low #731): every cell reads only what it seeded, and the tier PROVES it. Before #731 cells still
+# reached mainnet (#85's class: a pass or a red that rested on what WhatsOnChain answered that minute): every
+# admission fanned out to the four mainnet SLAP trackers (`mainnet_fanout::fan_out`), and the app layer's owed home
+# walk, `/spent-any`, `/utxo-status` and `/tx-any` asked WhatsOnChain, BananaBlocks and Bitails. Now the overlays run
+# with `MAINNET_FANOUT=false` and the app layer with `COURIER_SINK=http://127.0.0.1:9` (a closed loopback port: every
+# courier ask the same transport fault, "could not look", run after run; the var accepts a loopback origin only). Each
+# `wrangler dev` runs at `--log-level debug` (wrangler prints the runtime's `Network.requestWillBeSent` for every
+# subrequest) and `tools/lane-731/egress_guard.mjs` reds BY NAME on any subrequest whose host is the network (binding
+# calls such as `http://d1/`, the absent CHAINTRACKS binding's `https://chaintracks/` 503 and a Durable Object stub's
+# dotless host are not), with a positive control (the e649 cell's loopback post must be seen). On macOS the workers'
+# RUNTIME is also SEALED (`MINIFLARE_WORKERD_PATH` = `tools/lane-731/workerd-sealed.sh`, `sandbox-exec` with
+# `loopback-only.sb`): a missed ask fails closed instead of reaching mainnet; `D1_EGRESS_SEAL=0` runs unsealed (the
+# guard still reds). A red cell prints the guard's verdict over the logs so far.
 ci-d1-budget:
 	@set -e; \
 	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); PD=$$((B+11)); PM=$$((B+12)); \
 	app_log=/tmp/lane499-d1-$$B-app.log; ov_log=/tmp/lane499-d1-$$B-overlay.log; seed_log=/tmp/lane499-d1-$$B-seed.log; \
 	dv_log=/tmp/lane499-d1-$$B-delivering.log; \
+	: > "$$app_log"; : > "$$ov_log"; : > "$$dv_log"; \
 	state=$$(mktemp -d /tmp/lane499-d1-state.XXXXXX); ov_state=$$(mktemp -d /tmp/lane499-d1-ovstate.XXXXXX); \
 	dv_state=$$(mktemp -d /tmp/lane499-d1-dvstate.XXXXXX); seed_v3=$$(mktemp -d /tmp/lane499-d1-seedv3.XXXXXX); \
 	job_pids=""; owned_ports=""; \
@@ -506,8 +521,14 @@ ci-d1-budget:
 	  if [ -n "$$_left" ]; then echo "⚠ ci-d1-budget: could not free$$owned_ports (still held by:$$_left)"; fi; \
 	  rm -rf "$$state" "$$ov_state" "$$dv_state" "$$seed_v3"; \
 	}; \
+	guard_ran=""; \
+	egress_diag() { \
+	  [ -s "$$app_log" ] && [ -z "$$guard_ran" ] || return 0; \
+	  echo "→ ci-d1-budget: a cell red; the egress guard over the logs so far (a red that rested on mainnet is named here):"; \
+	  node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" || true; \
+	}; \
 	trap 'cleanup; exit 130' INT TERM; \
-	trap cleanup EXIT; \
+	trap '_rc=$$?; if [ $$_rc -ne 0 ]; then egress_diag; fi; cleanup' EXIT; \
 	for _pt in $$PA $$PO $$PD $$PM; do \
 	  _held=$$(lsof -nP -tiTCP:$$_pt -sTCP:LISTEN 2>/dev/null || true); \
 	  if [ -n "$$_held" ]; then \
@@ -517,6 +538,14 @@ ci-d1-budget:
 	  fi; \
 	done; \
 	owned_ports="$$PA $$PO $$PD"; \
+	seal=""; \
+	if [ "$${D1_EGRESS_SEAL:-1}" != 0 ] && command -v sandbox-exec >/dev/null 2>&1; then \
+	  D1_REAL_WORKERD=$$(node tools/lane-731/real_workerd.mjs); export D1_REAL_WORKERD; \
+	  seal="MINIFLARE_WORKERD_PATH=$(CURDIR)/tools/lane-731/workerd-sealed.sh"; \
+	  echo "→ ci-d1-budget: the workers' runtime is SEALED to the loopback ($$D1_REAL_WORKERD under tools/lane-731/loopback-only.sb)"; \
+	else \
+	  echo "→ ci-d1-budget: no egress seal (D1_EGRESS_SEAL=0 or no sandbox-exec); the egress guard still reds on any attempt"; \
+	fi; \
 	wait_up() { \
 	  _url=$$1; _log=$$2; _label=$$3; _i=0; _t0=$$(date +%s); \
 	  while [ $$_i -lt $(ROUTE_UP_TRIES) ]; do \
@@ -527,6 +556,7 @@ ci-d1-budget:
 	  cat "$$_log" 2>/dev/null || true; \
 	  return 1; \
 	}; \
+	node tools/lane-731/egress_guard.test.mjs; \
 	echo "→ ci-d1-budget: the fixture D1 (seed + wrangler d1 execute --local)…"; \
 	D1_CURSOR_PIN_SQL="$$state/cursor.sql" cargo run -q $(WORKERS) -p low-app-layer --example d1_budget_seed > "$$state/seed.sql"; \
 	python3 scripts/d1-load-chunked.py crates/low-app-layer low-overlay-db "$$state" "$$state/seed.sql" > "$$seed_log" 2>&1 \
@@ -534,14 +564,15 @@ ci-d1-budget:
 	node tools/lane-499/cursor_pin.mjs "$$state/cursor.sql.expected.json" "$$state"; \
 	cp -R "$$state/v3/." "$$seed_v3/"; \
 	echo "→ starting wrangler dev :$$PA (the app layer on the fixture D1)…"; \
-	( cd crates/low-app-layer && exec npx wrangler dev --local --port $$PA --ip 127.0.0.1 --persist-to "$$state" \
+	( cd crates/low-app-layer && exec env $$seal npx wrangler dev --local --log-level debug --port $$PA --ip 127.0.0.1 --persist-to "$$state" \
 	    --var AUTH_ENFORCE:false --var SESSION_LANE:false \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
+	    --var COURIER_SINK:http://127.0.0.1:9 \
 	) > "$$app_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PA/health "$$app_log" "app layer"; \
 	echo "→ starting wrangler dev :$$PO (the overlay, tm_collected, ARCADE_URL a closed port)…"; \
-	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$PO --ip 127.0.0.1 --persist-to "$$ov_state" \
+	( cd crates/overlay-cloudflare && exec env $$seal npx wrangler dev --local --log-level debug --port $$PO --ip 127.0.0.1 --persist-to "$$ov_state" \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
@@ -549,15 +580,17 @@ ci-d1-budget:
 	    --var ARCADE_URL:http://127.0.0.1:9 \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
 	    --var MUTATION_QUEUE_INLINE_ROOM:4096 \
+	    --var MAINNET_FANOUT:false \
 	) > "$$ov_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PO/listTopicManagers "$$ov_log" "overlay"; \
 	echo "→ starting wrangler dev :$$PD (the delivering overlay of the e649 cell, APP_LAYER_URL its mock on :$$PM)…"; \
-	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$PD --ip 127.0.0.1 --persist-to "$$dv_state" \
+	( cd crates/overlay-cloudflare && exec env $$seal npx wrangler dev --local --log-level debug --port $$PD --ip 127.0.0.1 --persist-to "$$dv_state" \
 	    --var ARCADE_URL:http://127.0.0.1:9 \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
 	    --var APP_LAYER_URL:http://127.0.0.1:$$PM \
 	    --var ADMIN_TOKEN:ci-admin-tok \
+	    --var MAINNET_FANOUT:false \
 	) > "$$dv_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PD/listTopicManagers "$$dv_log" "delivering overlay"; \
@@ -571,7 +604,9 @@ ci-d1-budget:
 	node tools/lane-e576/dead_letter_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e555/deferred_graphs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e585/beef_blobs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
-	node tools/lane-e649/change_park_budget_ci.mjs http://127.0.0.1:$$PO "$$ov_state" http://127.0.0.1:$$PD "$$dv_state" $$PM
+	node tools/lane-e649/change_park_budget_ci.mjs http://127.0.0.1:$$PO "$$ov_state" http://127.0.0.1:$$PD "$$dv_state" $$PM; \
+	guard_ran=1; \
+	node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log"
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`
