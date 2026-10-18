@@ -8130,6 +8130,42 @@ pub(crate) mod tests {
         assert!(party < first_assembler && hops < first_assembler);
     }
 
+    /// The W2-WORDS lens's LOW-3 (mutant M7): a word-store fault (`read_soft` answering `None`) keeps the latch's
+    /// pair (NS-3: a fault serves the legacy answer). The arm's views are `None` on a fault and the arm runs only on
+    /// `Some`; an empty map in their place would withhold every row's third arm, which this pins is not neutral.
+    #[test]
+    fn l2_fold_a_word_store_fault_keeps_the_legacy_pair() {
+        let routes = include_str!("routes.rs");
+        let body = &routes[routes
+            .find("let arm_rows = crate::tracker_host::runtime::read_soft(")
+            .unwrap()..];
+        let body = &body[..body.find("let mut results = Vec::new();").unwrap()];
+        let compact: String = body.split_whitespace().collect();
+        assert!(
+            compact.contains(
+                "letarm_views=match&arm_rows{Some(rows)=>Some(crate::tracker_host::runtime::views(env,rows).await),None=>None,};"
+            ),
+            "a word-store fault must leave the arm's views None"
+        );
+        assert!(
+            compact.contains("ifletSome(views)=&arm_views{"),
+            "the arm must run only on views the store answered"
+        );
+        for empty in ["Default::default()", "BTreeMap::new()", "unwrap_or_default"] {
+            assert!(
+                !body.contains(empty),
+                "the fault path builds an empty map ({empty})"
+            );
+        }
+        // why an empty map is not the legacy answer: it withholds a latched, final spend
+        let words = std::collections::BTreeMap::new();
+        let t = "ab".repeat(32);
+        assert_eq!(
+            word_arm(Some(&t), Some(true), &words),
+            (Some(false), Some(true))
+        );
+    }
+
     static NONE: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
     pub(crate) fn inputs<'a>(
         results: &'a [ResultEntry],
