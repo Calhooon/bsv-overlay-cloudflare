@@ -10,7 +10,7 @@ updates:
       - /workers
     schedule:
       interval: cron
-      cronjob: "0 6,18 * * *"
+      cronjob: "0 18 * * *"
       timezone: Etc/UTC
     allow:
       - dependency-name: bsv-rs
