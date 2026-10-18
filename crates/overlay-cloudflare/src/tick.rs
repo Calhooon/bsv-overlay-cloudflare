@@ -596,6 +596,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         &spend_fetcher,
         20,
         &pot_fetcher,
+        Some(&crate::chain_tracker::ChaintracksBlockTime::new(env)),
         crate::proof_fetcher::POT_PROOF_PASS_LIMIT,
         backstop_age,
     )
@@ -662,13 +663,15 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     .await;
     worker::console_log!(
         "Scheduled: proof-completion (pot_beefs) ; scanned={} completed={} already_proven={} \
-         still_unconfirmed={} fetch_failed={} stitch_failed={}",
+         still_unconfirmed={} fetch_failed={} stitch_failed={} block_time_stamped={} block_time_held={}",
         pot_summary.scanned,
         pot_summary.completed,
         pot_summary.already_proven,
         pot_summary.still_unconfirmed,
         pot_summary.fetch_failed,
         pot_summary.stitch_failed,
+        pot_summary.block_time_stamped,
+        pot_summary.block_time_held,
     );
 
     // 4. LOW `pot_records` decoded-params lazy backfill (#284): decode the

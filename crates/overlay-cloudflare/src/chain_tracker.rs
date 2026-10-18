@@ -284,11 +284,35 @@ pub(crate) async fn chaintracks_block_hash_detailed(
     env: &worker::Env,
     height: u64,
 ) -> Result<Option<(String, Option<String>)>, String> {
+    Ok(chaintracks_header_detailed(env, height)
+        .await?
+        .map(|h| (h.hash, h.merkle_root)))
+}
+
+/// The facts of the header chaintracks holds at a height (the hash, and the merkle root and header time
+/// when well formed).
+pub(crate) struct CtHeaderFacts {
+    /// The block hash, lowercase hex.
+    pub hash: String,
+    /// The merkle root, lowercase hex, when well formed.
+    pub merkle_root: Option<String>,
+    /// The header time, unix seconds, when served.
+    pub time: Option<u64>,
+}
+
+/// bsv-low #470 PRE557: [`chaintracks_block_hash_detailed`]'s read with the header's `time` kept; the
+/// same `Ok(None)` (a 404) and `Err` (could not read) arms.
+pub(crate) async fn chaintracks_header_detailed(
+    env: &worker::Env,
+    height: u64,
+) -> Result<Option<CtHeaderFacts>, String> {
     #[derive(serde::Deserialize)]
     struct CtHash {
         hash: String,
         #[serde(rename = "merkleRoot", default)]
         merkle_root: Option<String>,
+        #[serde(default)]
+        time: Option<u64>,
     }
     let base_url = env
         .var("CHAIN_TRACKER_URL")
@@ -339,7 +363,47 @@ pub(crate) async fn chaintracks_block_hash_detailed(
         .merkle_root
         .map(|r| r.trim().to_ascii_lowercase())
         .filter(|r| r.len() == 64 && r.bytes().all(|b| b.is_ascii_hexdigit()));
-    Ok(Some((hash, root)))
+    Ok(Some(CtHeaderFacts {
+        hash,
+        merkle_root: root,
+        time: header.time,
+    }))
+}
+
+/// bsv-low #470 PRE557: the confirming block's time from OUR header source, never a courier: the header
+/// chaintracks holds at the bump's height, accepted only when its merkle root is the root the bump
+/// computes (so the time is the time of the block the proof binds to).
+pub struct ChaintracksBlockTime {
+    env: worker::Env,
+}
+
+impl ChaintracksBlockTime {
+    /// The source over the env's `CHAINTRACKS` binding (or `CHAIN_TRACKER_URL`), the tracker's own path.
+    pub fn new(env: &worker::Env) -> Self {
+        Self { env: env.clone() }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::proof_fetcher::BlockTimeSource for ChaintracksBlockTime {
+    async fn block_time(&self, height: u32, merkle_root: &str) -> Result<Option<u64>, String> {
+        let facts = chaintracks_header_detailed(&self.env, u64::from(height)).await?;
+        Ok(header_time_for_root(facts.as_ref(), merkle_root))
+    }
+}
+
+/// Pure: the header's time when the header carries `merkle_root`; a missing header, another root or a
+/// header with no time is `None` (the row stays unstamped and is asked again on a later pass).
+pub(crate) fn header_time_for_root(
+    facts: Option<&CtHeaderFacts>,
+    merkle_root: &str,
+) -> Option<u64> {
+    let facts = facts?;
+    let root = facts.merkle_root.as_deref()?;
+    if !root.eq_ignore_ascii_case(merkle_root.trim()) {
+        return None;
+    }
+    facts.time.filter(|t| *t > 0)
 }
 
 /// Fetch the current chain height from ChainTracks.

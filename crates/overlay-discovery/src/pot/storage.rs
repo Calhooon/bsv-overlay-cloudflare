@@ -1045,6 +1045,47 @@ pub trait PotStorage {
         let _ = txid;
         Ok(false)
     }
+
+    /// bsv-low #470 PRE557: of `txids`, the ones naming a pot row whose confirming block's time is not
+    /// yet recorded (`pot_records.blockTime IS NULL`). The completion pass reads a header only for these.
+    /// Default: none (a backend with no `createdAt` has nothing to stamp).
+    async fn pots_without_block_time(
+        &self,
+        txids: &[String],
+    ) -> Result<Vec<String>, PotStorageError> {
+        let _ = txids;
+        Ok(Vec::new())
+    }
+
+    /// bsv-low #470 PRE557: record the time of the block that confirms `txid` (the header time, unix
+    /// seconds, of the header its chaintracks-verified bump binds to) on its pot row, once, and move the
+    /// row's `createdAt` to it when the stamp is later than the block by more than
+    /// [`BLOCK_TIME_STAMP_SLACK_SECS`] (a re-indexed row, stamped NOW at its re-admission). A live row
+    /// admitted before its block keeps its admission time. Never called with a courier's word.
+    /// Default: no-op.
+    async fn stamp_pot_block_time(
+        &self,
+        txid: &str,
+        block_time_secs: u64,
+    ) -> Result<(), PotStorageError> {
+        let _ = (txid, block_time_secs);
+        Ok(())
+    }
+}
+
+/// bsv-low #470 PRE557: how far an admission stamp may sit after its confirming block's header time and
+/// still be the overlay's own admission time. Two hours is the consensus bound on a header time ahead of
+/// the network's clock, so an honest pot admitted before (or near) its block is never moved; a re-indexed
+/// pot, stamped NOW long after its block, moves to the block's time and the era filter keeps its row set.
+pub const BLOCK_TIME_STAMP_SLACK_SECS: u64 = 7_200;
+
+/// bsv-low #470 PRE557: the stamp rule of [`PotStorage::stamp_pot_block_time`], pure (the D1 statement
+/// carries the same `CASE`; the memory store calls this).
+pub fn created_at_after_block_time(created_at: Option<u64>, block_time_secs: u64) -> u64 {
+    match created_at {
+        Some(c) if c <= block_time_secs.saturating_add(BLOCK_TIME_STAMP_SLACK_SECS) => c,
+        _ => block_time_secs,
+    }
 }
 
 /// The block height `beef`'s OWN bump for `txid` names, when it carries one
@@ -1142,6 +1183,8 @@ pub struct MemoryPotStorage {
     /// indexed source), this backend derives the SAME fact from the bytes
     /// it actually owns: each stored beef's subject inputs.
     unprovable: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// bsv-low #470 PRE557: the confirming block's header time per pot txid (`pot_records.blockTime`).
+    pub block_times: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
@@ -2171,6 +2214,43 @@ impl PotStorage for MemoryPotStorage {
 
     async fn pot_beef_proof_verified(&self, txid: &str) -> Result<bool, PotStorageError> {
         Ok(self.verified.lock().unwrap().contains(txid))
+    }
+
+    async fn pots_without_block_time(
+        &self,
+        txids: &[String],
+    ) -> Result<Vec<String>, PotStorageError> {
+        let records = self.records.lock().unwrap();
+        let stamped = self.block_times.lock().unwrap();
+        Ok(txids
+            .iter()
+            .filter(|t| records.iter().any(|r| &r.txid == *t) && !stamped.contains_key(*t))
+            .cloned()
+            .collect())
+    }
+
+    async fn stamp_pot_block_time(
+        &self,
+        txid: &str,
+        block_time_secs: u64,
+    ) -> Result<(), PotStorageError> {
+        let records = self.records.lock().unwrap();
+        let mut stamped = self.block_times.lock().unwrap();
+        if stamped.contains_key(txid) {
+            return Ok(());
+        }
+        let mut created = self.created_at_secs.lock().unwrap();
+        let mut any = false;
+        for r in records.iter().filter(|r| r.txid == txid) {
+            any = true;
+            let key = (r.txid.clone(), r.output_index);
+            let next = created_at_after_block_time(created.get(&key).copied(), block_time_secs);
+            created.insert(key, next);
+        }
+        if any {
+            stamped.insert(txid.to_string(), block_time_secs);
+        }
+        Ok(())
     }
 }
 

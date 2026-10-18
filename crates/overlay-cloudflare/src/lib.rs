@@ -1370,8 +1370,14 @@ async fn admin_reverify_pot_beefs(env: &Env, req: &Request) -> worker::Result<Re
     // LATCHES verified truth — the #228 push-primary age gate protects
     // courier polling, which budget 0 already forbids.
     let s =
-        crate::proof_fetcher::complete_pot_beef_proofs(pot_storage.as_ref(), &fetcher, limit, 0)
-            .await;
+        crate::proof_fetcher::complete_pot_beef_proofs(
+            pot_storage.as_ref(),
+            &fetcher,
+            Some(&crate::chain_tracker::ChaintracksBlockTime::new(env)),
+            limit,
+            0,
+        )
+        .await;
     Response::from_json(&serde_json::json!({
         "status": "ok",
         "limit": limit,
@@ -1380,6 +1386,8 @@ async fn admin_reverify_pot_beefs(env: &Env, req: &Request) -> worker::Result<Re
         "completed": s.completed,
         "still_unconfirmed": s.still_unconfirmed,
         "stitch_failed": s.stitch_failed,
+        "block_time_stamped": s.block_time_stamped,
+        "block_time_held": s.block_time_held,
     }))
 }
 
@@ -1514,6 +1522,7 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
         &spend_fetcher,
         20,
         &pot_fetcher,
+        Some(&crate::chain_tracker::ChaintracksBlockTime::new(env)),
         crate::proof_fetcher::POT_PROOF_PASS_LIMIT,
         backstop_age,
     )
@@ -1708,6 +1717,8 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
         "spends_sample": ss.sample,
         "proofless_over_24h": flagged,
     });
+    answer["pot_block_time_stamped"] = serde_json::json!(ps.block_time_stamped);
+    answer["pot_block_time_held"] = serde_json::json!(ps.block_time_held);
     answer["tx_early_gasp"] = serde_json::json!(tx_early_gasp);
     // bsv-low #649 D3-H1: the shared parked drain's pass (`null`: no app layer configured, nothing read); set apart
     // from the literal above, which sits at `json!`'s recursion limit.
