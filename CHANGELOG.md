@@ -3,8 +3,8 @@
 ## Unreleased
 
 - The seen witness names its source (bsv-low #621, LOW's words map L5).
-  `network_seen` gains `seenSource` and `sourceAtMs` (migrations 331 and
-  332, additive; the app layer's catch-up carries the same two ALTERs):
+  `network_seen` gains `seenSource` and `sourceAtMs` (migrations 335 and
+  336, additive; the app layer's catch-up carries the same two ALTERs):
   every latch names the broadcaster whose answer said SEEN (Arcade, TAAL or
   GorillaPool; a courier never writes it) and that broadcaster's stamp when
   its answer carried one. `ls_pot spentStatus` and `/utxo-status` keep
