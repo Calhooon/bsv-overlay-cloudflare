@@ -4340,7 +4340,10 @@ pub fn live_arcade_look(tx_status: &str, extra_info: String) -> ArcadeLook {
 }
 
 /// PURE: the live Arcade answer wins; webhook evidence only fills a FAULT, as [`ArcadeLook::Recorded`] (its own
-/// provenance: the decisions read it as `Fatal`, the eviction's reason does not name it Arcade's live word).
+/// provenance, bsv-low #621 and #740: a recorded word is never Arcade's own live word, so the decisions give it
+/// loop 18's absence age floor exactly as `Missing` and `Fault` (a young or never-admitted subject is uncorroborated
+/// and evicts nothing), an aged subject takes the absence-based refusal with the absence shape, and the eviction's
+/// reason does not name it Arcade's live word; only a LIVE `Fatal` has no floor).
 pub fn fold_arcade_look(
     live: ArcadeLook,
     webhook_evidence: Option<(String, String)>,
