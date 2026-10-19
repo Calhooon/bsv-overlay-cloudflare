@@ -15,10 +15,10 @@ workspace = "../../workers"
 crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
-bsv-worker-build-info = { version = "0.2.2", path = "../worker-build-info", features = ["build"] }
+bsv-worker-build-info = { version = "0.3.0", path = "../worker-build-info", features = ["build"] }
 
 [dependencies]
-bsv-worker-build-info = { version = "0.2.2", path = "../worker-build-info" }
+bsv-worker-build-info = { version = "0.3.0", path = "../worker-build-info" }
 getrandom = { version = "0.2", features = ["js"] }
 # worker 0.8 (bsv-low #318): `bsv-middleware-cloudflare` 0.3 — the canonical
 # BRC-103/104 middleware, the SAME major the low-watchtower pins — requires
@@ -49,7 +49,10 @@ worker = { version = "0.8", features = ["d1"] }
 # `BadBeef` gone); none of the auth, session-lane or signing items this crate calls moved, and it compiled unchanged.
 # Exactly 0.6.2 (lane L2-migrate-engine, 2026-10-15): the middleware's release on bsv-rs 0.6.0 (core 0.3.2),
 # so the lock holds one bsv-rs, as the build stamp requires.
-bsv-middleware-cloudflare = "=0.6.2"
+# Exactly 0.7.0 (lane W8e, 2026-10-19): the middleware's release on bsv-rs 0.7.0 (core 0.4.0), one
+# bsv-rs in the lock. Its payment-prefix claim (`PaymentPrefixStore`, `PAYMENT_CLAIMS_MIGRATION`) is on
+# the payment path, which this crate does not link: no claims table here, the migration does not apply.
+bsv-middleware-cloudflare = "=0.7.0"
 serde.workspace = true
 # bsv-low #532: `raw_value` so the identity views pass the resolver's JSON through byte for byte.
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -59,17 +62,20 @@ base64 = "0.22"
 # BEEF parsing for /pots-view's spenderRawHex extraction (the same crate the
 # sibling overlay worker uses; `overlay` feature only — no net/tokio on wasm32).
 bsv-rs.workspace = true
-bsv-tracker = "=0.4.0"
+# Exactly 0.6.0 (lane W8e): the tracker on bsv-rs 0.7.0, the minor its public types carry with them
+# (0.5.0 adds `HintStatus::MempoolPresent` and the compact State; 0.4.1 trims the Arcade word and reads
+# `extraInfo` as text). The same pin as the overlay's door, one copy in the lock.
+bsv-tracker = "=0.6.0"
 # Shared parser policies for client-derived BEEF read from the overlay's store.
-overlay-engine = { package = "bsv-overlay-engine", version = "0.2.2", path = "../overlay-engine" }
+overlay-engine = { package = "bsv-overlay-engine", version = "0.3.0", path = "../overlay-engine" }
 # The `Poc5TemplatePot` covenant recognizer + param-region accessor (the SAME
 # frozen template bytes `tm_pot` admits with) — used by the settle classifier
 # (bsv-low #227) to recover a pot's COMMITTED params from its funding lock.
-overlay-discovery = { package = "bsv-overlay-discovery", version = "0.2.2", path = "../overlay-discovery" }
+overlay-discovery = { package = "bsv-overlay-discovery", version = "0.3.0", path = "../overlay-discovery" }
 # bsv-low #553: the `LOW/proof/v1` replay (was `overlay_discovery::proof::replay`),
 # run on a posted bundle and on a row the overlay admitted before the replay
 # shipped. It carries the PATH deps on the private `bsv-low` checkout.
-low-proof-replay = { package = "bsv-low-proof-replay", version = "0.2.2", path = "../low-proof-replay" }
+low-proof-replay = { package = "bsv-low-proof-replay", version = "0.3.0", path = "../low-proof-replay" }
 # Readable wasm panics in `wrangler tail` (same pattern as the overlay worker).
 console_error_panic_hook = "0.1"
 # /live-view's bounded tower fan-out: `select` races each service-binding
@@ -93,7 +99,7 @@ async-trait = "0.1"
 # real schema rather than pinning its text (bsv-low #281). Test-only: neither
 # is linked into the wasm32 Worker build.
 rusqlite = { version = "0.32", features = ["bundled"] }
-bsv-overlay-cloudflare = { version = "0.2.2", path = "../overlay-cloudflare" }
+bsv-overlay-cloudflare = { version = "0.3.0", path = "../overlay-cloudflare" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 
 # bsv-low #670 (the lens's HIGH-3): `tests/door_wasm.rs` drives the door's real

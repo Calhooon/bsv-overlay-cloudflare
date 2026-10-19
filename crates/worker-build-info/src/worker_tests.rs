@@ -32,14 +32,14 @@ fn build_object_shape() {
     assert!(t[11..13].parse::<u8>().unwrap() < 24);
     assert!(t[14..16].parse::<u8>().unwrap() < 60);
     assert!(t[17..19].parse::<u8>().unwrap() < 60);
-    // Amended for bsv-rs 0.6.0 (lane L2-migrate-engine): the lock's versions
-    // moved with it, the middleware to its release on 0.6.0.
+    // Amended for bsv-rs 0.7.0 (lane W8e): the lock's versions moved with it,
+    // the middleware to its release on 0.7.0 (adapter 0.7.0, core 0.4.0).
     assert_eq!(
         b["crates"],
         serde_json::json!({
-            "bsv-rs": "0.6.0",
-            "bsv-middleware-cloudflare": "0.6.2",
-            "bsv-middleware-core": "0.3.2",
+            "bsv-rs": "0.7.0",
+            "bsv-middleware-cloudflare": "0.7.0",
+            "bsv-middleware-core": "0.4.0",
         })
     );
 }

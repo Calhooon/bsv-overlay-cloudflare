@@ -23,18 +23,18 @@ workspace = "../../workers"
 crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
-bsv-worker-build-info = { version = "0.2.2", path = "../worker-build-info", features = ["build"] }
+bsv-worker-build-info = { version = "0.3.0", path = "../worker-build-info", features = ["build"] }
 
 [dependencies]
-bsv-worker-build-info = { version = "0.2.2", path = "../worker-build-info" }
-overlay-engine = { package = "bsv-overlay-engine", version = "0.2.2", path = "../overlay-engine" }
-overlay-discovery = { package = "bsv-overlay-discovery", version = "0.2.2", path = "../overlay-discovery" }
+bsv-worker-build-info = { version = "0.3.0", path = "../worker-build-info" }
+overlay-engine = { package = "bsv-overlay-engine", version = "0.3.0", path = "../overlay-engine" }
+overlay-discovery = { package = "bsv-overlay-discovery", version = "0.3.0", path = "../overlay-discovery" }
 # Replay stays enabled for every Worker build and resolves from crates.io on publish.
-low-proof-replay = { package = "bsv-low-proof-replay", version = "0.2.2", path = "../low-proof-replay" }
+low-proof-replay = { package = "bsv-low-proof-replay", version = "0.3.0", path = "../low-proof-replay" }
 bsv-rs = { workspace = true, features = ["wasm"] }
 # bsv-low #619 (L3): the door hosts the tracker for Arcade's words
 # (`door_words`); the same exact pin as the app layer, one copy in the lock.
-bsv-tracker = "=0.4.0"
+bsv-tracker = "=0.6.0"
 # 0.3 (bsv-low #348, was 0.1). Bumped because it is the only middleware line
 # compatible with `worker 0.8`, and it is the SAME major the low-watchtower
 # and low-app-layer already pin, so the fleet is now on one middleware lineage
@@ -47,7 +47,10 @@ bsv-tracker = "=0.4.0"
 # (`wallet/client.rs`); the payment verdict's move does not touch this crate.
 # Exactly 0.6.2 (lane L2-migrate-engine, 2026-10-15): the middleware's release on bsv-rs 0.6.0
 # (core 0.3.2), so the lock holds one bsv-rs, as the build stamp requires.
-bsv-middleware-cloudflare = "=0.6.2"
+# Exactly 0.7.0 (lane W8e, 2026-10-19): the middleware's release on bsv-rs 0.7.0 (core 0.4.0), one
+# bsv-rs in the lock. Its payment-prefix claim (`PaymentPrefixStore`, `PAYMENT_CLAIMS_MIGRATION`) is on
+# the payment path, which this crate does not link: no claims table here, the migration does not apply.
+bsv-middleware-cloudflare = "=0.7.0"
 async-trait.workspace = true
 base64 = "0.22"
 hex.workspace = true
@@ -74,7 +77,7 @@ js-sys = "0.3"
 [dev-dependencies]
 # bsv-low #592: the queue replay pin runs a REAL engine over `MemoryStorage`
 # (the engine's own test store; test-only, never in the wasm32 build).
-overlay-engine = { package = "bsv-overlay-engine", version = "0.2.2", path = "../overlay-engine", features = ["memory-storage"] }
+overlay-engine = { package = "bsv-overlay-engine", version = "0.3.0", path = "../overlay-engine", features = ["memory-storage"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 # Real SQLite (bundled, no system dependency, deterministic version) so the
 # identity-scoped read-window tests EXECUTE the exact shipped SQL against the

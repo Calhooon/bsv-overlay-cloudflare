@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+## [0.3.0] - 2026-10-19
+
+- bsv-rs `=0.7.0` in both workspaces (the line's exact pin of record; 0.7.1
+  is in range and moves at the recon), bsv-middleware-cloudflare `=0.7.0` in
+  both workers crates (its release on bsv-rs 0.7.0, whose core the lock holds
+  at exactly 0.4.0), and bsv-tracker `=0.6.0` (its release on bsv-rs 0.7.0)
+  in the door and the app layer: one bsv-rs in each lock. A bsv-rs type sits
+  in the public API (`types` re-exports bsv-rs's overlay types), hence 0.3.0.
+  No compile break and no source change was needed for the new APIs: no
+  `SigningContext` struct literal exists here.
+- The signing digest. bsv-rs 0.7.0 moved its default signing digest to the
+  node's dispatch (BIP-143 only for a FORKID type without CHRONICLE). The
+  admin signer (`wallet/signer.rs`, both paths) signs `ALL | FORKID` over the
+  P2PKH or PushDrop lock, and now calls the SDK's dispatcher
+  (`compute_sighash_dispatched_for_signing`), the one rule its interpreter
+  verifies with; for that scope it is the BIP-143 digest 0.6.0 signed, byte
+  for byte. Pinned by `w8e_the_digest_the_admin_signer_signs_is_the_nodes`
+  (`--manifest-path workers/Cargo.toml -p bsv-overlay-cloudflare --lib
+  w8e_`): the digest `85f5575e...b881f824` and the txid `d6d6879a...21a890e1`
+  of the sample template, both computed again on bsv-rs 0.6.0 and equal; the
+  digest equal to the SDK's BIP-143 function; the signed transaction run by
+  `Spend` under `ScriptFlags::block(ProtocolEra::PostChronicle)` and valid.
+- The tracker's vocabulary pin (`door_words`,
+  `tracker_vocabulary_differs_from_the_door_exactly_here`) moves with
+  bsv-tracker 0.4.1: the padded word (`" SEEN_ON_NETWORK "`) is trimmed and an
+  `ORPHAN` in `extraInfo` no longer makes an orphan, so those two no longer
+  differ from the door; seven differences stand for #624. The app layer's
+  hosted tracker reads Arcade through the same `Verdict::from_arc_body`, so
+  its hints take 0.4.1's vocabulary (`PENDING_RETRY` and `STUMP_PROCESSING`
+  are `Accepted`, the word is trimmed, `extraInfo` is text); every hint is
+  still a hint, never a chain word, and no app-layer pin moved.
+- The middleware's 0.7.0 payment-prefix claim (`PaymentPrefixStore`,
+  `PAYMENT_CLAIMS_MIGRATION`) is on its payment path, which neither workers
+  crate links: no claims table, no migration applies here. The classifier
+  of `AuthCloudflareError` was re-read (the enum is 0.6.2's; every new
+  `KvError` site is a store fault) and its pin moved to 0.7.0.
+
 - The seen witness names its source (bsv-low #621, LOW's words map L5).
   `network_seen` gains `seenSource` and `sourceAtMs` (migrations 335 and
   336, additive; the app layer's catch-up carries the same two ALTERs):

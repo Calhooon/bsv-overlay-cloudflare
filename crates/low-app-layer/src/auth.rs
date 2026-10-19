@@ -1398,9 +1398,13 @@ mod tests {
     }
 
     /// (d) The classifier's table, on every variant of bsv-middleware-cloudflare
-    /// 0.6.2's `AuthCloudflareError` (the match in `auth_fault_class` is
+    /// 0.7.0's `AuthCloudflareError` (the match in `auth_fault_class` is
     /// exhaustive, so a new variant does not compile until classified). The pin
-    /// moves only after re-reading the crate's storage error paths.
+    /// moves only after re-reading the crate's storage error paths. Re-read for
+    /// 0.7.0 (lane W8e): the enum is 0.6.2's variant for variant; its new
+    /// `KvError` sites are store faults (the KV session store, the DO session
+    /// store, the payment prefix store of a path this crate does not link), so
+    /// `Transport` stays right for every one.
     #[test]
     fn s670_d_the_classifier_table() {
         use bsv_middleware_cloudflare::AuthCloudflareError as E;
@@ -1438,7 +1442,7 @@ mod tests {
         let from_worker: E = worker::Error::RustError("KV PUT failed: 500".into()).into();
         assert_eq!(auth_fault_class(&from_worker), Transport);
         assert!(
-            include_str!("../Cargo.toml").contains("bsv-middleware-cloudflare = \"=0.6.2\""),
+            include_str!("../Cargo.toml").contains("bsv-middleware-cloudflare = \"=0.7.0\""),
             "the middleware pin moved: re-read AuthCloudflareError and its KvError sites first"
         );
     }
