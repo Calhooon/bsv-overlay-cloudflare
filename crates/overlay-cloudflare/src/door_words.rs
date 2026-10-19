@@ -192,6 +192,9 @@ mod tests {
     /// tracker's own `Verdict::from_arc_body` + `into_hint` and this host's
     /// policy, against the door's answer. The differences are exactly these;
     /// a tracker bump that closes one (K3) reds here and tells L8 to look.
+    /// bsv-tracker 0.4.1 closed two (lane W8e, at 0.6.0): the status word is
+    /// trimmed (" spaced") and an `ORPHAN` in `extraInfo` no longer makes an
+    /// orphan ("SEEN stale orphan extraInfo"); the seven below stand.
     #[test]
     fn tracker_vocabulary_differs_from_the_door_exactly_here() {
         let bodies: &[(&str, &str)] = &[
@@ -240,9 +243,7 @@ mod tests {
                 "STUMP_PROCESSING: door Reached, tracker Pending",
                 "MINED no height: door Reached, tracker Pending",
                 "IMMUTABLE no height: door Reached, tracker Pending",
-                "SEEN stale orphan extraInfo: door Reached, tracker Orphan",
                 "SEEN with competitors: door Reached, tracker Fatal",
-                " spaced: door Reached, tracker Pending",
                 "INVALID: door Pending, tracker Fatal",
                 "UTXO_SPENT: door Pending, tracker Fatal",
                 "CONFIRMED: door Pending, tracker Reached",

@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-low-proof-replay"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "bsv-low-core",
  "bsv-low-wire",
@@ -159,9 +159,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-cloudflare"
-version = "0.6.2"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8724654c82948755133092011d9db3d74dcd50a5ea35ea1b8067f0e1e7aae1ba"
+checksum = "6fa26eaf0549228994035890673bfbd6dc2e68588bc0374713535bcdba2c7552"
 dependencies = [
  "async-trait",
  "base64",
@@ -175,7 +175,6 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
- "sha2",
  "thiserror 1.0.69",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -184,23 +183,21 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-core"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa30141c960f70f200e93cf68e9f31acdd3711b6ef2918fa6f410974b0959f4e"
+checksum = "069d8476cbf724674122bb32850e06c73b352f59829184045a9f47c2acb8c80f"
 dependencies = [
  "async-trait",
  "bsv-rs",
  "getrandom",
  "hex",
- "hmac",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
 name = "bsv-overlay-cloudflare"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -224,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-overlay-discovery"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -241,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-overlay-engine"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bsv-rs",
@@ -254,9 +251,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-rs"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b9179f4007f1da092e0785bf8dd6bec1c9ffd46fbfc670c4af802aa31d1cc27"
+checksum = "a4bd3df9f2d8d2277dc3965692de93e4dc5f669e736c7c89937b4a805601b71d"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -291,9 +288,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-tracker"
-version = "0.4.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f41f9b9b5f77609748a27ddebd2af053347ffcb356bb1a1c4bf47a035fe77777"
+checksum = "e249db0895ecd3f87730cd58d166189c8e84fea622dcc1fff71eed44c3224c35"
 dependencies = [
  "bsv-rs",
  "serde",
@@ -302,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-worker-build-info"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "serde_json",
 ]
@@ -966,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "low-app-layer"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64",

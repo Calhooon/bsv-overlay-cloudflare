@@ -26,7 +26,8 @@
 //! unit tests below assert byte-exact output.
 
 use bsv_rs::primitives::bsv::sighash::{
-    compute_sighash_for_signing, SighashParams, TxInput, TxOutput, SIGHASH_ALL, SIGHASH_FORKID,
+    compute_sighash_dispatched_for_signing, SighashParams, TxInput, TxOutput, SIGHASH_ALL,
+    SIGHASH_FORKID,
 };
 use bsv_rs::primitives::bsv::tx_signature::TransactionSignature;
 use bsv_rs::primitives::ec::PrivateKey;
@@ -42,6 +43,15 @@ const DEFAULT_SEQUENCE: u32 = 0xFFFF_FFFF;
 
 /// Sighash scope for all admin signatures. `SIGHASH_ALL | SIGHASH_FORKID` —
 /// the standard BSV sighash.
+///
+/// The digest is bsv-rs's `compute_sighash_dispatched_for_signing` (since
+/// bsv-rs 0.7.0, lane W8e): the node's dispatch, the one rule the SDK's
+/// interpreter verifies with. For this scope (FORKID, no CHRONICLE) it is the
+/// BIP-143 digest, byte for byte what 0.6.0's `compute_sighash_for_signing`
+/// gave; the subscript is the source output's locking script, which is right
+/// because every input signed here is a P2PKH or PushDrop lock whose CHECKSIG
+/// is in the lock with no `OP_CODESEPARATOR`. Pinned by
+/// `w8e_the_digest_the_admin_signer_signs_is_the_nodes`.
 const SCOPE: u32 = SIGHASH_ALL | SIGHASH_FORKID;
 
 /// A resolved per-input signing plan: `(signing key, compressed pubkey
@@ -181,7 +191,7 @@ pub fn sign_transaction(
             satoshis: di.satoshis,
             scope: SCOPE,
         };
-        let sighash = compute_sighash_for_signing(&params);
+        let sighash = compute_sighash_dispatched_for_signing(&params);
         let ecdsa_sig = signing_key.sign(&sighash).map_err(|_| SignError::Crypto)?;
         let tx_sig = TransactionSignature::new(ecdsa_sig, SCOPE);
         let sig_bytes = tx_sig.to_checksig_format();
@@ -610,7 +620,7 @@ pub fn sign_transaction_mixed(
             satoshis: di.satoshis,
             scope: SCOPE,
         };
-        let sighash = compute_sighash_for_signing(&params);
+        let sighash = compute_sighash_dispatched_for_signing(&params);
 
         let unlock_bytes = match (&unlocks[i], &p2pkh_keys[i]) {
             (InputUnlock::P2pkh, Some((key, pubkey_bytes, _))) => {
@@ -727,6 +737,78 @@ mod tests {
             derivation_prefix: String::new(),
         }
     }
+
+    // ── The digest the signer signs (bsv-rs 0.7.0, lane W8e) ───────────────
+
+    /// bsv-rs 0.7.0 moved the default signing digest to the node's dispatch.
+    /// The admin signer signs `ALL | FORKID` over the P2PKH lock, so its digest
+    /// must be the BIP-143 one it signed on 0.6.0: frozen here (the digest and
+    /// the txid were computed again on bsv-rs 0.6.0 and agree), equal to the
+    /// SDK's BIP-143 function, and the signed transaction must verify under
+    /// the node's post-Chronicle block word.
+    #[test]
+    fn w8e_the_digest_the_admin_signer_signs_is_the_nodes() {
+        use bsv_rs::primitives::bsv::sighash::compute_sighash_for_signing;
+        use bsv_rs::script::{
+            LockingScript, ProtocolEra, ScriptFlags, Spend, SpendParams, UnlockingScript,
+        };
+
+        let key = admin_key();
+        let template = sample_template(&key);
+        let lock = p2pkh_for_key(&key);
+        let mut source_txid = [0u8; 32];
+        source_txid.copy_from_slice(&from_hex(&template.inputs[0].source_txid).unwrap());
+        source_txid.reverse();
+        let inputs = [TxInput {
+            txid: source_txid,
+            output_index: 0,
+            script: Vec::new(),
+            sequence: DEFAULT_SEQUENCE,
+        }];
+        let outputs = [TxOutput {
+            satoshis: 99_000,
+            script: lock.clone(),
+        }];
+        let params = SighashParams {
+            version: 1,
+            inputs: &inputs,
+            outputs: &outputs,
+            locktime: 0,
+            input_index: 0,
+            subscript: &lock,
+            satoshis: 100_000,
+            scope: SCOPE,
+        };
+        let digest = compute_sighash_dispatched_for_signing(&params);
+        assert_eq!(digest, compute_sighash_for_signing(&params));
+        assert_eq!(hex_encode(&digest), PINNED_DIGEST, "the admin signer's digest moved");
+
+        // The signer signs that digest: its signature verifies over it.
+        let signed = sign_transaction(&template, &key).unwrap();
+        let tx = bsv_rs::transaction::Transaction::from_binary(&signed.raw_tx).unwrap();
+        let unlock = tx.inputs[0].unlocking_script.clone().unwrap();
+        let mut spend = Spend::new(SpendParams {
+            source_txid,
+            source_output_index: 0,
+            source_satoshis: 100_000,
+            locking_script: LockingScript::from_binary(&lock).unwrap(),
+            transaction_version: 1,
+            other_inputs: Vec::new(),
+            outputs: outputs.to_vec(),
+            input_index: 0,
+            unlocking_script: UnlockingScript::from_binary(&unlock.to_binary()).unwrap(),
+            input_sequence: DEFAULT_SEQUENCE,
+            lock_time: 0,
+            memory_limit: None,
+            work_limit: None,
+        });
+        spend.set_flags(ScriptFlags::block(ProtocolEra::PostChronicle));
+        assert!(matches!(spend.validate(), Ok(true)), "the node word refuses the signature");
+        assert_eq!(signed.txid, PINNED_TXID, "the admin signer's transaction moved");
+    }
+
+    const PINNED_DIGEST: &str = "85f5575efe26ac91a90e320829381117a936e965b39f69886e30d402b881f824";
+    const PINNED_TXID: &str = "d6d6879af17b19bc726d71982fc9df8660363293eda9ca11ff81f6e421a890e1";
 
     // ── ECDSA determinism ───────────────────────────────────────────────────
 
