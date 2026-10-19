@@ -5509,6 +5509,172 @@ pub(crate) mod tests {
         assert!(body.contains("RETIRE_TRANSACTIONS_SQL") && body.contains("RETIRE_POT_BEEFS_SQL"));
     }
 
+    /// bsv-low #765: one candidate through the retire pass's own steps, under real SQLite. The candidate is a
+    /// `transactions` row, `proofless_ago_ms` proofless, with `recorded` (a recorded status) in `arc_terminal` when
+    /// given; the live look is `live`, both indexers answer absent. The pass's statements read it, its evidence is
+    /// built and folded as `run_retire_pass` does, `retire_verdict` decides, and the pass's latch and memo statements
+    /// write. Returns the stored `retired_reason` and the memo's (kind, evidence), or None when the row is kept.
+    fn i765_pass_one(
+        live: ArcadeLook,
+        recorded: Option<(&str, &str)>,
+        proofless_ago_ms: i64,
+    ) -> Option<(String, (String, String))> {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        let now: i64 = 1_800_000_000_000;
+        let txid = "e5".repeat(32);
+        let at = now - proofless_ago_ms;
+        conn.execute(
+            "INSERT INTO transactions (txid, beef, has_proof, created_at) VALUES (?1, X'00', 0, ?2)",
+            rusqlite::params![txid, at / 1000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO proofless_watch (txid, first_seen_ms) VALUES (?1, ?2)",
+            rusqlite::params![txid, at],
+        )
+        .unwrap();
+        if let Some((status, extra)) = recorded {
+            conn.execute(
+                "INSERT INTO arc_terminal (txid, status, extra, first_ms) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![txid, status, extra, at],
+            )
+            .unwrap();
+        }
+        let mut st = conn.prepare(RETIRE_CANDIDATES_TRANSACTIONS_SQL).unwrap();
+        let rows: Vec<RetireCandidateRow> = st
+            .query_map(rusqlite::params![now], |r| {
+                Ok(RetireCandidateRow {
+                    txid: r.get(0)?,
+                    age_secs: r.get::<_, i64>(1)? as f64,
+                    term_status: r.get(2)?,
+                    term_extra: r.get(3)?,
+                })
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        drop(st);
+        assert_eq!(rows.len(), 1, "the candidate is read");
+        let row = &rows[0];
+        let webhook_evidence = row
+            .term_status
+            .clone()
+            .map(|s| (s, row.term_extra.clone().unwrap_or_default()));
+        let look = fold_arcade_look(live, webhook_evidence);
+        if matches!(look, ArcadeLook::Present) {
+            return None;
+        }
+        let reason = retire_verdict(&look, Some(false), Some(false), row.age_secs as i64)?;
+        let changed = conn
+            .execute(
+                RETIRE_TRANSACTIONS_SQL,
+                rusqlite::params![now, reason, row.txid],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the latch is written");
+        let kind = verdict_kind_of_retire_reason(&reason);
+        conn.execute(
+            TX_ANY_VERDICT_UPSERT_SQL,
+            rusqlite::params![row.txid, now, kind, reason],
+        )
+        .unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT retired_reason FROM transactions WHERE txid = ?1",
+                [&row.txid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let memo: (String, String) = conn
+            .query_row(
+                "SELECT kind, evidence FROM tx_any_verdicts WHERE txid = ?1",
+                [&row.txid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        Some((stored, memo))
+    }
+
+    const I765_HOUR_MS: i64 = 3_600_000;
+
+    /// bsv-low #765 (1): a recorded REJECTED status for a candidate whose live look faulted at the pass, both
+    /// indexers absent, 2 h proofless, is kept: a recorded word takes the absence arm and its 48 h floor.
+    #[test]
+    fn i765_b_a_recorded_status_on_a_2h_candidate_is_not_retired() {
+        let out = i765_pass_one(
+            ArcadeLook::Fault,
+            Some(("REJECTED", "UTXO_SPENT (70): recorded")),
+            2 * I765_HOUR_MS,
+        );
+        assert_eq!(out, None, "a recorded status retires nothing under 48 h");
+    }
+
+    /// bsv-low #765 (2): the same recorded status on a candidate 49 h proofless is retired as an absence, byte for
+    /// byte what a live 404 (`Missing`) yields for the same candidate: the absence reason and the `retired` memo.
+    #[test]
+    fn i765_c_a_recorded_status_on_a_49h_candidate_is_the_absence_retirement() {
+        let recorded = i765_pass_one(
+            ArcadeLook::Fault,
+            Some(("REJECTED", "UTXO_SPENT (70): recorded")),
+            49 * I765_HOUR_MS,
+        )
+        .expect("retired past 48 h");
+        let missing =
+            i765_pass_one(ArcadeLook::Missing, None, 49 * I765_HOUR_MS).expect("retired past 48 h");
+        assert_eq!(
+            recorded, missing,
+            "byte-identical to the absence retirement"
+        );
+        assert!(recorded.0.starts_with("network-absent "), "{}", recorded.0);
+        assert_eq!(recorded.1 .0, "retired");
+        assert_eq!(recorded.1 .1, recorded.0);
+        assert!(!recorded.0.contains("REJECTED"), "{}", recorded.0);
+    }
+
+    /// bsv-low #765 (3): a LIVE REJECTED (`Fatal`, Arcade's own answer at the pass), both indexers absent, 2 h
+    /// proofless, is retired as before: the 1 h floor, the `arcade REJECTED: ...` reason, the `refused` memo.
+    #[test]
+    fn i765_d_a_live_rejected_on_a_2h_candidate_is_retired_as_refused() {
+        let (stored, (kind, evidence)) = i765_pass_one(
+            ArcadeLook::Fatal("REJECTED".into(), "UTXO_SPENT (70): live".into()),
+            None,
+            2 * I765_HOUR_MS,
+        )
+        .expect("a live refusal retires past 1 h");
+        assert_eq!(stored, "arcade REJECTED: UTXO_SPENT (70): live");
+        assert_eq!(kind, "refused");
+        assert_eq!(evidence, stored);
+        // A recorded row beside it changes nothing: the live word wins.
+        let with_row = i765_pass_one(
+            ArcadeLook::Fatal("REJECTED".into(), "UTXO_SPENT (70): live".into()),
+            Some(("REJECTED", "recorded")),
+            2 * I765_HOUR_MS,
+        );
+        assert_eq!(with_row, Some((stored.clone(), (kind, evidence))));
+    }
+
+    /// bsv-low #765 (4): a bare `Fault` (no recorded status), both indexers absent, is never retired at any age.
+    #[test]
+    fn i765_e_a_bare_fault_is_never_retired() {
+        for hours in [2, 47, 49, 24 * 365] {
+            assert_eq!(
+                i765_pass_one(ArcadeLook::Fault, None, hours * I765_HOUR_MS),
+                None,
+                "{hours} h"
+            );
+        }
+    }
+
     /// P0-2d (bsv-stack-lean #52): the live look reads the one verdict
     /// function. A refusal in any case is Fatal; an ORPHAN view or any other
     /// defined word is Present; a word Arcade does not define is no answer
