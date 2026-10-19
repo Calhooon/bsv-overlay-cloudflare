@@ -1259,8 +1259,8 @@ fn parse_arcade_merklepath(body: &str) -> Option<String> {
 pub enum ArcadeProofLook {
     /// MINED / IMMUTABLE with a `merklePath`: the BUMP hex (the caller judges it against chaintracks).
     Mined(String),
-    /// Arcade holds the tx on the network unmined (`SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES`, the seen class of
-    /// `overlay_discovery::arcade_words::arcade_verdict`) and said so within [`ARCADE_WORD_FRESH_MS`]: no proof exists anywhere yet. Carries the
+    /// Arcade holds the tx on the network unmined (`SEEN_ON_NETWORK` / `SEEN_MULTIPLE_NODES`, the tracker's `Seen`
+    /// hint, `door_words::arcade_hint`) and said so within [`ARCADE_WORD_FRESH_MS`]: no proof exists anywhere yet. Carries the
     /// status for the log line.
     KnownUnmined(String),
     /// Everything else — the ladder goes on to the couriers (the gate's HIGH-1 / HIGH-2, 2026-09-17): Arcade does
