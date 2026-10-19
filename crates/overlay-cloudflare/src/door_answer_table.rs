@@ -335,8 +335,121 @@ fn table() -> String {
     s
 }
 
+/// bsv-low #624 (L8): the rows whose answer moved when Arcade's words became
+/// bsv-tracker's reading, recorded line then the answer now. Three inputs
+/// only, none a word Arcade sends: ` MINED\n` (a control character, which
+/// the tracker's metadata bound refuses) and `orphaned` / `ORPHAN` (outside
+/// every broadcaster's vocabulary; the orphan view is ARC's
+/// SEEN_IN_ORPHAN_MEMPOOL, unchanged). Each is now no input: never admits,
+/// never refuses (D1), and a live look of it is a fault-shaped look whose
+/// refusal needs the two-source absence bar and the age floor (#513, #740).
+/// `docs/words/L8-ARCADE-VERDICT-TABLE.md`, the vocabulary rows. The fixture
+/// stays the base's record; only these lines are read through this list.
+const L8_MOVED: &[(&str, &str)] = &[
+    (
+        "gate\t MINED\\n\tReached",
+        "gate\t MINED\\n\tPending",
+    ),
+    (
+        "callback\t MINED\\n\tLatchSeen",
+        "callback\t MINED\\n\tIgnore",
+    ),
+    (
+        "live_look\t MINED\\n\tPresent",
+        "live_look\t MINED\\n\tFault",
+    ),
+    (
+        "live_look_fold_plant\t MINED\\n\tPresent",
+        "live_look_fold_plant\t MINED\\n\tRecorded(\"REJECTED\", \"planted\")",
+    ),
+    (
+        "evidence_absent_young_true\t MINED\\n\tPresent",
+        "evidence_absent_young_true\t MINED\\n\tUncertain(\"a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission\")",
+    ),
+    (
+        "evidence_fault_young_true\t MINED\\n\tPresent",
+        "evidence_fault_young_true\t MINED\\n\tUncertain(\"a courier faulted\")",
+    ),
+    (
+        "evidence_absent_young_false\t MINED\\n\tPresent",
+        "evidence_absent_young_false\t MINED\\n\tRefused(\"arcade faulted, both indexers absent\")",
+    ),
+    (
+        "evidence_fault_young_false\t MINED\\n\tPresent",
+        "evidence_fault_young_false\t MINED\\n\tUncertain(\"a courier faulted\")",
+    ),
+    (
+        "proof_look_path_fresh\t MINED\\n\tMined(\"fed0ac0c000101020304\")",
+        "proof_look_path_fresh\t MINED\\n\tUnknown",
+    ),
+    (
+        "gate\torphaned\tOrphan",
+        "gate\torphaned\tPending",
+    ),
+    (
+        "callback\torphaned\tEvidenceCheck(\"ORPHANED\")",
+        "callback\torphaned\tIgnore",
+    ),
+    (
+        "live_look\torphaned\tPresent",
+        "live_look\torphaned\tFault",
+    ),
+    (
+        "live_look_fold_plant\torphaned\tPresent",
+        "live_look_fold_plant\torphaned\tRecorded(\"REJECTED\", \"planted\")",
+    ),
+    (
+        "evidence_absent_young_true\torphaned\tPresent",
+        "evidence_absent_young_true\torphaned\tUncertain(\"a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission\")",
+    ),
+    (
+        "evidence_fault_young_true\torphaned\tPresent",
+        "evidence_fault_young_true\torphaned\tUncertain(\"a courier faulted\")",
+    ),
+    (
+        "evidence_absent_young_false\torphaned\tPresent",
+        "evidence_absent_young_false\torphaned\tRefused(\"arcade faulted, both indexers absent\")",
+    ),
+    (
+        "evidence_fault_young_false\torphaned\tPresent",
+        "evidence_fault_young_false\torphaned\tUncertain(\"a courier faulted\")",
+    ),
+    (
+        "gate\tORPHAN\tOrphan",
+        "gate\tORPHAN\tPending",
+    ),
+    (
+        "callback\tORPHAN\tEvidenceCheck(\"ORPHAN\")",
+        "callback\tORPHAN\tIgnore",
+    ),
+    (
+        "live_look\tORPHAN\tPresent",
+        "live_look\tORPHAN\tFault",
+    ),
+    (
+        "live_look_fold_plant\tORPHAN\tPresent",
+        "live_look_fold_plant\tORPHAN\tRecorded(\"REJECTED\", \"planted\")",
+    ),
+    (
+        "evidence_absent_young_true\tORPHAN\tPresent",
+        "evidence_absent_young_true\tORPHAN\tUncertain(\"a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission\")",
+    ),
+    (
+        "evidence_fault_young_true\tORPHAN\tPresent",
+        "evidence_fault_young_true\tORPHAN\tUncertain(\"a courier faulted\")",
+    ),
+    (
+        "evidence_absent_young_false\tORPHAN\tPresent",
+        "evidence_absent_young_false\tORPHAN\tRefused(\"arcade faulted, both indexers absent\")",
+    ),
+    (
+        "evidence_fault_young_false\tORPHAN\tPresent",
+        "evidence_fault_young_false\tORPHAN\tUncertain(\"a courier faulted\")",
+    ),
+];
+
 #[test]
-fn the_doors_answers_are_byte_identical_to_the_recorded_table() {
+fn the_doors_answers_are_the_recorded_table_save_where_the_tracker_refuses_the_word() {
     let got = table();
     if std::env::var_os("DOOR_ANSWER_TABLE_WRITE").is_some() {
         let path = concat!(
@@ -346,7 +459,23 @@ fn the_doors_answers_are_byte_identical_to_the_recorded_table() {
         std::fs::write(path, &got).unwrap();
         return;
     }
-    let want: Vec<&str> = FIXTURE.lines().collect();
+    let want: Vec<&str> = FIXTURE
+        .lines()
+        .map(|line| {
+            L8_MOVED
+                .iter()
+                .find(|(recorded, _)| *recorded == line)
+                .map_or(line, |(_, now)| *now)
+        })
+        .collect();
+    assert_eq!(
+        L8_MOVED
+            .iter()
+            .filter(|(recorded, _)| FIXTURE.lines().any(|l| l == *recorded))
+            .count(),
+        L8_MOVED.len(),
+        "every L8 row names a recorded line"
+    );
     let have: Vec<&str> = got.lines().collect();
     let changed: Vec<String> = want
         .iter()
