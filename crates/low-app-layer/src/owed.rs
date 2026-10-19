@@ -5071,20 +5071,26 @@ pub(crate) mod tests {
         }
     }
 
-    /// The gate of 2026-09-20 (M1): a hop spender whose bytes carry a POT covenant output is a JOIN the index does
-    /// not hold — never the custody story, on the index pointer and on the chain rung alike.
+    /// NS-3 (bsv-low #736 folded this pin, which asserted the veto): with the index's latch and no height the settle
+    /// payout is claimable under a checked `seen`, `stale` or `cannotCheck` word; without the latch the word decides.
     #[test]
-    fn ns3_owed_tracker_word_controls_claim_even_when_legacy_flags_disagree() {
-        let mut unproved = entry(
+    fn ns3_owed_index_latch_claims_under_any_word_and_the_word_controls_without_it() {
+        let mut latched = entry(
             Some(true),
             Some(PotVerdict::WinnerA),
             Outcome::Won,
             Some(SeatLetter::A),
         );
-        unproved.at_height = None;
-        let entries = [unproved];
+        latched.at_height = None;
+        let mut unlatched = latched.clone();
+        unlatched.spent_confirmed = Some(false);
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let mut inputs = inputs(&entries, &[], &[], &v, &c, &p, Some(900_200));
+        let derive = |e: &ResultEntry, words: &std::collections::BTreeMap<String, Value>| {
+            let entries = [e.clone()];
+            let mut i = inputs(&entries, &[], &[], &v, &c, &p, Some(900_200));
+            i.spender_words = Some(words);
+            derive_owed_rows(&i)[0].facts.clone()
+        };
         let mut state = bsv_tracker::State::new(tx(3));
         let headers = crate::tracker_host::HeaderSnapshot {
             tip: Ok(900_100),
@@ -5119,12 +5125,31 @@ pub(crate) mod tests {
             tx(3),
             crate::tracker_host::served::fields(&state),
         )]);
-        inputs.spender_words = Some(&seen);
-        let rows = derive_owed_rows(&inputs);
-        assert_eq!(rows[0].facts["claimable"], false);
-        assert_eq!(rows[0].facts["spentConfirmed"], true);
-        assert_eq!(rows[0].facts["spenderWord"]["word"], "seen");
-        assert_eq!(rows[0].facts["coinWord"]["word"], "pending");
+        // (a) the index's latch, no height: claimable under the checked `seen` word, the word still served as it says
+        let facts = derive(&latched, &seen);
+        assert_eq!(
+            facts["claimable"], true,
+            "a seen word vetoed the index's latch"
+        );
+        assert_eq!(facts["spentConfirmed"], true);
+        assert_eq!(facts["spenderWord"]["word"], "seen");
+        assert_eq!(facts["coinWord"]["word"], "pending");
+        for word in [
+            json!({"word":"stale","verifyPath":null}),
+            json!({"word":"mined","verifyPath":null,"cannotCheck":"header snapshot changed"}),
+        ] {
+            let words = std::collections::BTreeMap::from([(tx(3), word.clone())]);
+            assert_eq!(
+                derive(&latched, &words)["claimable"],
+                true,
+                "{word} vetoed the index's latch"
+            );
+        }
+        // (b) no latch: the word controls, as the pin asserted before #736
+        let facts = derive(&unlatched, &seen);
+        assert_eq!(facts["claimable"], false, "a seen word with no index latch");
+        assert_eq!(facts["spentConfirmed"], false);
+        assert_eq!(facts["spenderWord"]["word"], "seen");
         state
             .step(
                 &params,
@@ -5142,8 +5167,8 @@ pub(crate) mod tests {
             tx(3),
             crate::tracker_host::served::fields(&state),
         )]);
-        inputs.spender_words = Some(&mined);
-        assert_eq!(derive_owed_rows(&inputs)[0].facts["claimable"], true);
+        assert_eq!(derive(&unlatched, &mined)["claimable"], true);
+        assert_eq!(derive(&latched, &mined)["claimable"], true);
         let checked = &mined[&tx(3)];
         assert_eq!(
             spender_coin_word(checked, &tx(3), Some(&tx(5)))["word"],
@@ -5155,6 +5180,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// The gate of 2026-09-20 (M1): a hop spender whose bytes carry a POT covenant output is a JOIN the index does
+    /// not hold — never the custody story, on the index pointer and on the chain rung alike.
     #[test]
     fn a_spender_with_a_pot_covenant_output_is_an_unindexed_pot_never_spent_elsewhere() {
         let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
