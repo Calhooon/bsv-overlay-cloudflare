@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 (2026-10-19)
+
+- The engine crate's dev-dependency on itself is path-only again (as at 0.2.2): 0.3.0's `version = "0.3.0"` on it made `cargo publish --dry-run` resolve `bsv-overlay-engine ^0.3.0` from the registry before the crate was there, and the v0.3.0 Release run published nothing. No code change; every crate to 0.3.1 so the tag matches the workspace.
+
 ## Unreleased
 
 ## [0.3.0] - 2026-10-19
