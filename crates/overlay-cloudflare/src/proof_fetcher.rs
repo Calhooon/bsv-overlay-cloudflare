@@ -5388,6 +5388,127 @@ pub(crate) mod tests {
         assert_eq!(fold_arcade_look(ArcadeLook::Fault, None), ArcadeLook::Fault);
     }
 
+    /// bsv-low #765: what the retire pass does with a recorded status for a subject whose live look faulted at the
+    /// pass, read through the pass's own candidate statements under real SQLite and its own verdict. The pass
+    /// examines only a STORED row (`transactions` or `pot_beefs`) at least `RETIRE_MIN_AGE_SECS` proofless, so a
+    /// subject younger than loop 18's `REFUSAL_ABSENT_MIN_AGE_MS` or never admitted is never read, whatever
+    /// `arc_terminal` holds; and the pass retires (a store latch and a `/tx-any` memo), it opens no eviction.
+    #[test]
+    fn i765_a_recorded_status_reaches_no_young_or_never_admitted_subject_at_the_retire_pass() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        let now_ms: i64 = 1_800_000_000_000;
+        let floor_ms = crate::admit_fast::REFUSAL_ABSENT_MIN_AGE_MS as i64;
+        // The candidate statements' own floor is the verdict's, and it lies above loop 18's floor.
+        for sql in [
+            RETIRE_CANDIDATES_TRANSACTIONS_SQL,
+            RETIRE_CANDIDATES_POT_BEEFS_SQL,
+        ] {
+            assert!(
+                sql.contains(&format!(
+                    "w.first_seen_ms <= ?1 - {}",
+                    RETIRE_MIN_AGE_SECS * 1000
+                )),
+                "{sql}"
+            );
+        }
+        assert!(RETIRE_MIN_AGE_SECS * 1000 > floor_ms);
+        // Subjects, each with a recorded REJECTED status written two hours before the pass.
+        let young = "a1".repeat(32); // admitted 9 min ago: under loop 18's floor
+        let mid = "b2".repeat(32); // admitted 30 min ago: past loop 18's floor, under the candidate floor
+        let never = "c3".repeat(32); // a recorded status and a watch row, no stored row
+        let aged = "d4".repeat(32); // admitted 2 h ago: the only candidate
+        let admitted = [
+            (&young, 9 * 60_000i64),
+            (&mid, 30 * 60_000),
+            (&aged, 2 * 3_600_000),
+        ];
+        for (txid, ago) in admitted {
+            let at = now_ms - ago;
+            conn.execute(
+                "INSERT INTO transactions (txid, beef, has_proof, created_at) VALUES (?1, X'00', 0, ?2)",
+                rusqlite::params![txid, at / 1000],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof) VALUES (?1, X'00', ?2, 0)",
+                rusqlite::params![txid, at / 1000],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO proofless_watch (txid, first_seen_ms) VALUES (?1, ?2)",
+                rusqlite::params![txid, at],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO proofless_watch (txid, first_seen_ms) VALUES (?1, ?2)",
+            rusqlite::params![never, now_ms - 2 * 3_600_000],
+        )
+        .unwrap();
+        for txid in [&young, &mid, &never, &aged] {
+            conn.execute(
+                "INSERT INTO arc_terminal (txid, status, extra, first_ms) VALUES (?1, 'REJECTED', 'recorded', ?2)",
+                rusqlite::params![txid, now_ms - 2 * 3_600_000],
+            )
+            .unwrap();
+        }
+        for sql in [
+            RETIRE_CANDIDATES_TRANSACTIONS_SQL,
+            RETIRE_CANDIDATES_POT_BEEFS_SQL,
+        ] {
+            let mut st = conn.prepare(sql).unwrap();
+            let rows: Vec<(String, i64, Option<String>)> = st
+                .query_map(rusqlite::params![now_ms], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                rows,
+                vec![(aged.clone(), 2 * 3_600, Some("REJECTED".to_string()))],
+                "only the stored subject past the candidate floor is read: {sql}"
+            );
+        }
+        // The verdict, given the young subjects' ages anyway, keeps them.
+        let recorded = fold_arcade_look(
+            ArcadeLook::Fault,
+            Some(("REJECTED".to_string(), "recorded".to_string())),
+        );
+        for age_secs in [9 * 60, 30 * 60, RETIRE_MIN_AGE_SECS - 1] {
+            assert_eq!(
+                retire_verdict(&recorded, Some(false), Some(false), age_secs),
+                None
+            );
+        }
+        // The pass writes a store latch and a memo; it opens no eviction and serves no eviction word.
+        let src = include_str!("proof_fetcher.rs");
+        let start = src
+            .find("pub async fn run_retire_pass(")
+            .expect("the retire pass");
+        let end = start + src[start..].find("\n}\n").expect("its end");
+        let body = &src[start..end];
+        for absent in [
+            "evict_txid_everywhere",
+            "pot_evictions",
+            "OpenEviction",
+            "eviction_word",
+        ] {
+            assert!(!body.contains(absent), "the retire pass names {absent}");
+        }
+        assert!(body.contains("RETIRE_TRANSACTIONS_SQL") && body.contains("RETIRE_POT_BEEFS_SQL"));
+    }
+
     /// P0-2d (bsv-stack-lean #52): the live look reads the one verdict
     /// function. A refusal in any case is Fatal; an ORPHAN view or any other
     /// defined word is Present; a word Arcade does not define is no answer
