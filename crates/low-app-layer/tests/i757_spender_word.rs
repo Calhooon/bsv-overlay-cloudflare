@@ -289,7 +289,7 @@ async fn i757_a_the_settles_seen_event_writes_seen_within_one_delivery() {
         let (settle, beef) = settle_tx(1, None);
         pot_spent_by(&db, &funding, 0, &settle);
         retain(&db, &settle, &beef);
-        assert_eq!(held_proof(&db, &settle).0, true, "held bytes");
+        assert!(held_proof(&db, &settle).0, "held bytes");
         seed_built(&db, &settle, 1_000);
         tracker_events::drain();
         latch_seen(&settle, 1_000_500);
