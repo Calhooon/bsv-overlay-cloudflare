@@ -2240,6 +2240,19 @@ fn spender_mined(i: &OwedInputs, txid: Option<&str>, legacy: bool) -> bool {
     txid.and_then(|id| checked_tracker_mined(i.spender_words, id))
         .unwrap_or(legacy)
 }
+/// bsv-low #736 (NS-3: the index's verified proof decides first, and no word vetoes it): [`spender_mined`] with the
+/// INDEX's own proven spend read BEFORE the word. `index_proven` is `pot_records.spentConfirmed` for this spender
+/// (the latch only an SPV-verified height or a chaintracks-verified proof writes), with or without a stored
+/// `spentHeight`; a `stale`, `cannotCheck` or unchecked `mined` word no longer turns it into a chain wait. `legacy` is
+/// what the caller passed before (a courier's claim among it), still yielding to the word as before.
+fn index_proven_or_spender_mined(
+    i: &OwedInputs,
+    txid: Option<&str>,
+    index_proven: bool,
+    legacy: bool,
+) -> bool {
+    index_proven || spender_mined(i, txid, legacy)
+}
 /// PURE (bsv-low #693 fold, the W1-OWED-693 lens's MEDIUM-1): the tracker's word for `txid` as the RECHECKED view
 /// reads it, the one rule [`spender_mined`] and the re-ask's candidate predicate share: `None` when there are no
 /// views or no row, else `word == "mined"` AND a non-null `verifyPath` (a stored `mined` row whose recheck could not
@@ -2402,8 +2415,11 @@ fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(Stri
             return if i.pot_spenders.contains(&s) || pointer_refuted(i, &s, h) {
                 None
             } else {
-                let confirmed = spender_mined(i, Some(&s), h.spent_confirmed == Some(true))
-                    || i.proof_mined_spenders.contains(&s);
+                // bsv-low #736: the hop row's `spentConfirmed` is the index's own latch for this pointer
+                let index_proven = h.spent_confirmed == Some(true);
+                let confirmed =
+                    index_proven_or_spender_mined(i, Some(&s), index_proven, index_proven)
+                        || i.proof_mined_spenders.contains(&s);
                 Some((s.clone(), confirmed))
             };
         }
@@ -2608,11 +2624,15 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
             // the gate's LOW-3 (2026-09-19): the confirming chain word must NAME the filed sweep (`by_chain` does) — a
             // hop the JOIN took after all (evicted, then readmitted on its mine) reads spent+confirmed by a DIFFERENT
             // tx, and that must never turn the sweep's payout claimable for a tx that can never mine
+            // bsv-low #736: the hop row's latch naming the filed sweep is the index's proof (never vetoed by the
+            // sweep's word, still yielding to a contradicting confirmed spender); the chain rung's is a courier's
+            let index_latched = named_by_index && h.spent_confirmed == Some(true) && !contradicted;
             let confirmed = index_word
                 || tracker_word
-                || spender_mined(
+                || index_proven_or_spender_mined(
                     i,
                     Some(&filed.sweep_txid),
+                    index_latched,
                     index_word
                         || (named_by_index && h.spent_confirmed == Some(true))
                         || by_chain.and_then(|w| w.spent_confirmed) == Some(true),
@@ -2890,10 +2910,12 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     // NOTE-22: the press is offered only once the spend is CONFIRMED (the credit path's landing bar).
                     // the review's LOW-1 (2026-09-20): a spend with a VERIFIED proof height is mined whatever the flag says
                     // (the landing bar's third arm, the unbound arm's L1 rule) — never a chain wait said by machine on a mined tx
+                    // bsv-low #736: `spentConfirmed` is the index's latch, a proof with or without its height
                     let confirmed = e.at_height.is_some()
-                        || spender_mined(
+                        || index_proven_or_spender_mined(
                             i,
                             e.settle_txid.as_deref(),
+                            e.spent_confirmed == Some(true),
                             e.spent_confirmed == Some(true) || e.at_height.is_some(),
                         );
                     facts["claimable"] = json!(confirmed);
@@ -2941,9 +2963,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     let awaiting_block = e.verdict.is_none()
                         && e.settle_txid.is_some()
                         && e.at_height.is_none()
-                        && !spender_mined(
+                        && !index_proven_or_spender_mined(
                             i,
                             e.settle_txid.as_deref(),
+                            e.spent_confirmed == Some(true),
                             e.spent_confirmed == Some(true) || e.at_height.is_some(),
                         );
                     let reason = if awaiting_block {
@@ -8878,6 +8901,43 @@ pub(crate) mod tests {
             .as_deref()
             .unwrap()
             .contains("not verified yet"));
+    }
+
+    #[test]
+    fn i736_a_filed_sweeps_index_latch_is_read_before_the_word_and_a_couriers_is_not() {
+        // bsv-low #736: the hop row's latch naming my filed sweep (the index's proof, unproven filing) is not vetoed
+        // by the sweep's unchecked word; the chain rung's confirmation (a courier's) still is, as before
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let sweeps = filed(&key, &sweep);
+        let unchecked = std::collections::BTreeMap::from([(
+            sweep.clone(),
+            json!({"word":"stale","verifyPath":null}),
+        )]);
+        let none = std::collections::BTreeMap::new();
+        let mut latched = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+        latched.spent_confirmed = Some(true);
+        let hops = [latched];
+        for words in [&none, &unchecked] {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+            i.hop_sweeps = &sweeps;
+            i.spender_words = Some(words);
+            assert_eq!(derive_owed_rows(&i)[0].facts["claimable"], true);
+        }
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let by_chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        for (words, claimable) in [(&none, true), (&unchecked, false)] {
+            let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+            i.hop_sweeps = &sweeps;
+            i.hop_chain = &by_chain;
+            i.spender_words = Some(words);
+            assert_eq!(derive_owed_rows(&i)[0].facts["claimable"], claimable);
+        }
     }
 
     #[test]
