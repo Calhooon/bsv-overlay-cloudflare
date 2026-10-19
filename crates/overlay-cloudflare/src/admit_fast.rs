@@ -1999,6 +1999,21 @@ pub enum EvidenceVerdict {
 /// it is a positive verdict on the bytes. The retire pass keeps its own 48 h floor for its own question.
 pub const REFUSAL_ABSENT_MIN_AGE_MS: u64 = 10 * 60_000;
 
+/// PURE (bsv-low #740): a refusal on this look rests on ABSENCE, so it takes the age floor: Arcade does not hold
+/// the txid, or could not be asked, or could not be asked and the RECORDED word filled it ([`ArcadeLook::Recorded`]:
+/// a pushed status on the public `/arc-ingest` bearer, or a status the watch read earlier, is not Arcade's own word
+/// now). Only Arcade's live fatal word ([`ArcadeLook::Fatal`]) refuses a young or never-admitted txid.
+///
+/// [`ArcadeLook::Recorded`]: crate::proof_fetcher::ArcadeLook::Recorded
+/// [`ArcadeLook::Fatal`]: crate::proof_fetcher::ArcadeLook::Fatal
+pub(crate) fn refusal_rests_on_absence(arcade: &crate::proof_fetcher::ArcadeLook) -> bool {
+    use crate::proof_fetcher::ArcadeLook;
+    matches!(
+        arcade,
+        ArcadeLook::Missing | ArcadeLook::Fault | ArcadeLook::Recorded(..)
+    )
+}
+
 /// PURE: fold the three couriers' words (pinned). `young`: the admission is younger than
 /// `REFUSAL_ABSENT_MIN_AGE_MS`, or the index holds no admission at all.
 pub fn evidence_verdict(
@@ -2018,10 +2033,9 @@ pub fn evidence_verdict(
         ArcadeLook::Fatal(..) | ArcadeLook::Recorded(..) | ArcadeLook::Missing | ArcadeLook::Fault => {
             match crate::proof_fetcher::classify_presence(bitails.map(crate::proof_fetcher::bool_presence), woc.map(crate::proof_fetcher::bool_presence)) {
                 NetworkPresence::Present { .. } => EvidenceVerdict::Present,
-                // Absence-based (Arcade missing or faulted, not its own fatal word): a young or never-admitted
-                // txid is UNCERTAIN (counted), never refused (the gate's HIGH-2).
-                NetworkPresence::Absent
-                    if young && matches!(arcade, ArcadeLook::Missing | ArcadeLook::Fault) =>
+                // Absence-based (Arcade missing or faulted, its recorded word included: not its own fatal word):
+                // a young or never-admitted txid is UNCERTAIN (counted), never refused (the gate's HIGH-2; #740).
+                NetworkPresence::Absent if young && refusal_rests_on_absence(arcade) =>
                 {
                     EvidenceVerdict::Uncertain(
                         "a young or unknown admission: an absence-based refusal needs Arcade's own word or an older admission"
@@ -2137,12 +2151,10 @@ pub(crate) async fn verdict_of_look(
         crate::proof_fetcher::ArcadeLook::Present => (None, None),
         _ => indexers.await,
     };
-    let young = match look {
-        crate::proof_fetcher::ArcadeLook::Missing | crate::proof_fetcher::ArcadeLook::Fault => admission_age
+    let young = refusal_rests_on_absence(look)
+        && admission_age
             .await
-            .is_none_or(|age| age < REFUSAL_ABSENT_MIN_AGE_MS),
-        _ => false,
-    };
+            .is_none_or(|age| age < REFUSAL_ABSENT_MIN_AGE_MS);
     evidence_verdict(look, bitails, woc, young)
 }
 

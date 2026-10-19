@@ -4209,8 +4209,10 @@ pub enum ArcadeLook {
     Fault,
     /// bsv-low #621 (the W2-WORDS-L5 lens, MEDIUM-1): Arcade could not be asked (a [`ArcadeLook::Fault`]) and the
     /// RECORDED terminal word fills it ([`fold_arcade_look`]): an `arc_terminal` row or a callback's pushed status,
-    /// whose bearer (`/arc-ingest`) is the public txid. Every DECISION reads it exactly as [`ArcadeLook::Fatal`];
-    /// only its provenance differs, so the eviction's ledger reason never reads as Arcade's own live word.
+    /// whose bearer (`/arc-ingest`) is the public txid. Its ledger reason never reads as Arcade's own live word, and
+    /// (bsv-low #740) the evidence check reads it as a refusal on ABSENCE, never as [`ArcadeLook::Fatal`]: a young
+    /// or never-admitted txid is uncertain under it (`admit_fast::refusal_rests_on_absence`). The retire pass's
+    /// verdict reads it as its fatal arm (its own 1 h floor).
     Recorded(String, String),
 }
 
