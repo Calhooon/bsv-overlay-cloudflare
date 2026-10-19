@@ -4212,7 +4212,7 @@ pub enum ArcadeLook {
     /// whose bearer (`/arc-ingest`) is the public txid. Its ledger reason never reads as Arcade's own live word, and
     /// (bsv-low #740) the evidence check reads it as a refusal on ABSENCE, never as [`ArcadeLook::Fatal`]: a young
     /// or never-admitted txid is uncertain under it (`admit_fast::refusal_rests_on_absence`). The retire pass's
-    /// verdict reads it as its fatal arm (its own 1 h floor).
+    /// verdict reads it as its absence arm (bsv-low #765: 48 h, the absence reason, the `retired` memo).
     Recorded(String, String),
 }
 
@@ -4260,7 +4260,10 @@ pub const RETIRE_SCAN_LIMIT: u64 = 8;
 /// rests on one provider. Arcade's terminal word alone retires nothing — it
 /// must be corroborated by BOTH indexers' definitive 404 (`classify_presence`
 /// == Absent). Absence alone retires only past
-/// [`RETIRE_ABSENT_MIN_AGE_SECS`], and an Arcade fault never retires.
+/// [`RETIRE_ABSENT_MIN_AGE_SECS`], and an Arcade fault never retires. A
+/// RECORDED word filling a fault ([`ArcadeLook::Recorded`]) is absence, not
+/// Arcade's own word (bsv-low #765, the rule of #740): only a LIVE `Fatal`
+/// takes the 1 h terminal arm.
 pub fn retire_verdict(
     arcade: &ArcadeLook,
     bitails: Option<bool>,
@@ -4279,13 +4282,19 @@ pub fn retire_verdict(
         return None;
     }
     match arcade {
-        ArcadeLook::Fatal(status, extra) | ArcadeLook::Recorded(status, extra) => {
+        ArcadeLook::Fatal(status, extra) => {
             let head: String = extra.chars().take(120).collect();
             Some(format!("arcade {status}: {head}"))
         }
-        ArcadeLook::Missing if age_secs >= RETIRE_ABSENT_MIN_AGE_SECS => Some(format!(
-            "network-absent {age_secs}s: arcade 404 + both indexers 404"
-        )),
+        // bsv-low #765: a recorded word is never Arcade's own (#740), so it takes the absence arm, 48 h and the
+        // absence reason (memo kind `retired`), exactly as a live 404.
+        ArcadeLook::Missing | ArcadeLook::Recorded(..)
+            if age_secs >= RETIRE_ABSENT_MIN_AGE_SECS =>
+        {
+            Some(format!(
+                "network-absent {age_secs}s: arcade 404 + both indexers 404"
+            ))
+        }
         _ => None,
     }
 }
@@ -4519,8 +4528,9 @@ pub async fn run_retire_pass(
                                 ),
                             }
                             // Evidence on record (write-once — a webhook row
-                            // already present makes this a no-op).
-                            if let ArcadeLook::Fatal(status, extra) | ArcadeLook::Recorded(status, extra) = &look {
+                            // already present makes this a no-op). Only the
+                            // live poll's word: a Recorded look came from that row.
+                            if let ArcadeLook::Fatal(status, extra) = &look {
                                 crate::ops::record_arc_terminal(
                                     db,
                                     &row.txid,
