@@ -1075,8 +1075,8 @@ pub(crate) const ARCADE_GATE_STATUS: &str = "SEEN_ON_NETWORK";
 /// pub(crate) since INCIDENT D1-CALLBACK-FLOOD 2026-09-01: `/arc-ingest`
 /// matches webhook statuses against this same reading to RECORD terminal verdicts
 /// (evidence intake only — the corroboration bar above is unchanged).
-/// P0-2d (bsv-stack-lean #52): read through the one verdict function
-/// (`overlay_discovery::arcade_words`), so a lower-case `rejected` is the same
+/// P0-2d (bsv-stack-lean #52): read through the one reading of Arcade's
+/// words (the tracker's since #624), so a lower-case `rejected` is the same
 /// refusal as `REJECTED`.
 /// bsv-low #619 (L3): the word is the tracker's hint, the refusal the host's
 /// policy over it (`door_words`).
@@ -1109,7 +1109,7 @@ const ARCADE_POLL_INTERVAL_MS: u64 = 2_000;
 /// Rank ARC lifecycle statuses so "target or better" comparisons work.
 /// Unknown statuses rank lowest (0). Since P0-2d (bsv-stack-lean #52) only
 /// the ARC corroborator ranks with this; Arcade's words are read by
-/// [`classify_arcade_status`] through `overlay_discovery::arcade_words`.
+/// [`classify_arcade_status`] through the tracker (`door_words::arcade_hint`).
 fn arcade_status_rank(status: &str) -> u8 {
     match status {
         "RECEIVED" => 1,
@@ -1149,17 +1149,17 @@ pub(crate) enum GateVerdict {
 }
 
 ///
-/// P0-2d (bsv-stack-lean #52): one word, one verdict, through
-/// `overlay_discovery::arcade_words::arcade_verdict` (any letter case). The
+/// P0-2d (bsv-stack-lean #52): one word, one verdict (any letter case). The
 /// gate's bar is [`ARCADE_GATE_STATUS`] or better: seen, in a block
-/// (STUMP_PROCESSING) or mined. #267: the orphan check comes FIRST inside the
-/// verdict function — `SEEN_IN_ORPHAN_MEMPOOL` contains "SEEN", and an
-/// orphan-pool view is never a network accept. A word Arcade does not define
+/// (STUMP_PROCESSING) or mined. #267: `SEEN_IN_ORPHAN_MEMPOOL` is the
+/// tracker's `OrphanMempool`, never `Seen`, and an orphan-pool view is never
+/// a network accept. A word Arcade does not define
 /// is no answer: Pending (never admits, never refuses; the ladder ends at the
 /// second broadcaster).
 ///
 /// bsv-low #619 (L3): Arcade's word enters as the tracker's `Hint`
-/// (`door_words::arcade_hint`, fed by `arcade_words`) and the verdict is the
+/// (`door_words::arcade_hint`, since #624 (L8) read by bsv-tracker's
+/// `Verdict::from_arc_body` + `into_hint`) and the verdict is the
 /// host's admission policy over that hint (`door_words::gate`); the answers
 /// are pinned byte-identical (`door_answer_table`).
 pub(crate) fn classify_arcade_status(status: &str) -> GateVerdict {

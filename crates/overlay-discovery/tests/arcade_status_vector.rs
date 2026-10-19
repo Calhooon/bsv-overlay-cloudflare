@@ -13,8 +13,10 @@
 //! `engine_proof` columns are the overlay-cloudflare crate's readings,
 //! replayed in that crate (`src/arcade_vector_replay.rs`, P0-2d); it builds
 //! only beside the bsv-low sources (`crates/low-proof-replay/Cargo.toml:21-22`).
-//! Every one of those readings calls `arcade_words::arcade_verdict`, whose
-//! classes are replayed here against the vector's `words`.
+//! Since bsv-low #624 (L8) every one of those readings is bsv-tracker's
+//! `Verdict::from_arc_body` + `into_hint` under the door's policy, and the
+//! vector's `words` classes are replayed there too
+//! (`arcade_vector_replay::every_arcade_word_reads_its_class_through_the_tracker`).
 //!
 //! The copy's source (align-engine-050, 2026-10-10): bsv-wallet-toolbox-rs
 //! 0.7.4 (tag `v0.7.4`, main `623f890`), `tests/vectors/
@@ -23,7 +25,6 @@
 //! byte for byte (sha256 `80d2ac72112d…`, pinned whole below), never an edit
 //! here. A change is made in the toolbox's copy and copied back.
 
-use bsv_overlay_discovery::arcade_words::{arcade_verdict, ArcadeVerdict};
 use bsv_overlay_discovery::pot::reorg::{arcade_reorg_marker, ArcadeReorgMarker};
 
 const VECTOR: &str = include_str!("../vectors/arcade_status_verdicts.json");
@@ -91,37 +92,4 @@ fn the_latch_sequence_carries_unmined_then_reanchor() {
             Some(ArcadeReorgMarker::Reanchor)
         ]
     );
-}
-
-/// P0-2d: every word Arcade defines reads its vector class through the one
-/// verdict function, in any letter case.
-#[test]
-fn every_arcade_word_reads_its_class() {
-    let v: serde_json::Value = serde_json::from_str(VECTOR).unwrap();
-    let words = v["words"].as_array().unwrap();
-    assert_eq!(
-        words.len(),
-        12,
-        "arcade@1ae1208 models/transaction.go:89-126"
-    );
-    let mut wrong = Vec::new();
-    for w in words {
-        let word = w["word"].as_str().unwrap();
-        let want = w["class"].as_str().unwrap();
-        for spelled in [word.to_string(), word.to_ascii_lowercase()] {
-            let got = match arcade_verdict(&spelled) {
-                ArcadeVerdict::Pending | ArcadeVerdict::Parked => "pending",
-                ArcadeVerdict::Seen | ArcadeVerdict::InBlock => "seen",
-                ArcadeVerdict::Mined => "mined",
-                ArcadeVerdict::Rejected => "rejected",
-                ArcadeVerdict::Conflict => "conflict",
-                ArcadeVerdict::Orphan => "orphan",
-                ArcadeVerdict::Invalid => "invalid",
-            };
-            if got != want {
-                wrong.push(format!("{spelled}: expected {want}, got {got}"));
-            }
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

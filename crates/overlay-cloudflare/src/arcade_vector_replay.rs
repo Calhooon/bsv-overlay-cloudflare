@@ -155,3 +155,42 @@ fn every_engine_column_of_the_arcade_vector_holds() {
         wrong.join("\n  ")
     );
 }
+
+/// P0-2d, moved here at L8 (#624) from overlay-discovery with the reading it
+/// pins: every word Arcade defines reads its vector class, in any letter case,
+/// through the tracker's `Verdict::from_arc_body` + `into_hint` and the door's
+/// policy over the hint (`door_words`).
+#[test]
+fn every_arcade_word_reads_its_class_through_the_tracker() {
+    use crate::door_words::{arcade_hint, network_holds, proof_class, ProofClass};
+    use bsv_tracker::HintStatus;
+    let v: serde_json::Value = serde_json::from_str(VECTOR).unwrap();
+    let words = v["words"].as_array().unwrap();
+    assert_eq!(
+        words.len(),
+        12,
+        "arcade@1ae1208 models/transaction.go:89-126"
+    );
+    let mut wrong = Vec::new();
+    for w in words {
+        let word = w["word"].as_str().unwrap();
+        let want = w["class"].as_str().unwrap();
+        for spelled in [word.to_string(), word.to_ascii_lowercase()] {
+            let got = match arcade_hint(&spelled, "", 0) {
+                None => "invalid",
+                Some(h) => match h.status {
+                    HintStatus::Rejected { .. } => "rejected",
+                    HintStatus::DoubleSpend { .. } => "conflict",
+                    HintStatus::OrphanMempool => "orphan",
+                    _ if proof_class(Some(&h)) == ProofClass::Mined => "mined",
+                    _ if network_holds(&h) => "seen",
+                    _ => "pending",
+                },
+            };
+            if got != want {
+                wrong.push(format!("{spelled}: expected {want}, got {got}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

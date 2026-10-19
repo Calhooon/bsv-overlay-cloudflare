@@ -10,21 +10,28 @@
 //! A hint writes no chain word (the tracker charter's tier rule): admitting
 //! an index row on it is the host's own act, as the words map's S1 states.
 //!
-//! The adapter. `overlay_discovery::arcade_words` stays the ONE reading of
-//! Arcade's vocabulary and feeds [`arcade_hint`] (#624, L8): the tracker's
-//! `Verdict::from_arc_body` and `into_hint` cannot replace it yet without
-//! changing the door's answers, which this item does not do. K3
-//! (bsv-stack-lean #82) is open at the pinned 0.4.0 (as at 0.3.0; 0.4.1
-//! moves `from_arc_body`'s vocabulary and is its own re-pin): `into_hint` maps STUMP_PROCESSING and PENDING_RETRY to
-//! `HintStatus::Unknown`, and a MINED or IMMUTABLE word needs a `blockHeight`
-//! to be `Mined`. The other differences are pinned by name in
-//! `tracker_vocabulary_differs_from_the_door_exactly_here` below.
+//! The adapter (bsv-low #624, L8). Arcade's words are read by the tracker
+//! alone: [`arcade_hint`] hands the status word to bsv-tracker 0.6.0's
+//! `Verdict::from_arc_body` (the vocabulary, the trim and the letter case,
+//! the metadata bounds) and `Verdict::into_hint` (the hint tier).
+//! `overlay_discovery::arcade_words::ArcadeVerdict` is deleted. The door
+//! reads the status word ONLY, as it always has (#213: no gate reads
+//! `extraInfo`); a body's `blockHeight`, `merklePath` and `competingTxs` are
+//! read by their own readers (the proof look against chaintracks, the
+//! conflict pass of #602), never by this adapter.
 //!
-//! The K3 residue. `HintStatus` has no word for "in a block, the path
-//! pending" or "parked", and the gate's bar admits STUMP_PROCESSING and a
-//! height-less MINED. Such a hint is `Unknown` and carries Arcade's word in
-//! its `verdict`; `k3_residue` is the one place the policy reads that word,
-//! and the place L8 deletes once K3 lands.
+//! The host's policy over the hint (#619's rule: admission is host policy
+//! over hints) keeps three readings the tracker's `HintStatus` does not
+//! carry, each decided in `docs/words/L8-ARCADE-VERDICT-TABLE.md`:
+//! - [`arcade_speaks`]: a word the tracker knows that Arcade does not define
+//!   (ARC's INVALID, UTXO_SPENT, CONFIRMED, STORED, ...) is no input, the
+//!   vector's `invalid` rule (P0-2d, #52), except ARC's
+//!   SEEN_IN_ORPHAN_MEMPOOL, the #267 orphan view;
+//! - STUMP_PROCESSING (the tracker's `Accepted`) holds: in a block, the gate's
+//!   bar;
+//! - MINED / IMMUTABLE with no height (the tracker's `Unknown`, the word on
+//!   `verdict.status`) holds and is the proof look's mined claim, checked
+//!   against chaintracks by its caller.
 //!
 //! What this slice does NOT move (bsv-low #619's other halves, stopped on the
 //! byte-identity bar, see the PR): the eviction still rests on #214's
@@ -36,74 +43,80 @@ use crate::admit_fast::CallbackAction;
 use crate::broadcaster::GateVerdict;
 use crate::proof_fetcher::ArcadeLook;
 use bsv_tracker::{Hint, HintStatus, Timestamp, Verdict};
-use overlay_discovery::arcade_words::{arcade_verdict, ArcadeVerdict};
 
 /// The hint source the door names Arcade by (the app layer's `tracker_host`
 /// names it the same).
 pub const ARCADE_SOURCE: &str = "arcade";
 
-/// The one adapter: an Arcade transaction word as the tracker's hint, read
-/// through `arcade_words` (any letter case, any surrounding space). `None`:
-/// not a word Arcade defines, empty included, which is no input. The hint's
-/// `verdict` keeps Arcade's word (trimmed, upper case) and `extraInfo` as
-/// metadata: the reason text of a refusal, never a gate input (the #213
+/// The words Arcade defines (`[SRC] arcade@1ae1208 models/transaction.go:89-126`,
+/// `AllStatuses`; the vector's `words`, pinned equal). The tracker's
+/// vocabulary is wider (it reads ARC too); this list is the SOURCE's, the
+/// host's rule of which words this source speaks, never a parse.
+pub const ARCADE_WORDS: [&str; 12] = [
+    "UNKNOWN",
+    "RECEIVED",
+    "SENT_TO_NETWORK",
+    "ACCEPTED_BY_NETWORK",
+    "SEEN_ON_NETWORK",
+    "SEEN_MULTIPLE_NODES",
+    "DOUBLE_SPEND_ATTEMPTED",
+    "REJECTED",
+    "PENDING_RETRY",
+    "STUMP_PROCESSING",
+    "MINED",
+    "IMMUTABLE",
+];
+
+/// The one adapter: an Arcade transaction word as the tracker's hint. The
+/// word is read by `Verdict::from_arc_body` over the word's own body and
+/// reduced by `into_hint`; `None` is a body the tracker refuses (a word
+/// outside its vocabulary, empty, or carrying a control character) or a word
+/// Arcade does not speak ([`arcade_speaks`]), which is no input. The hint's
+/// `verdict` keeps the word (trimmed, upper case, the tracker's) and
+/// `extraInfo` as the reason: text attached after the word is read, so its
+/// bounds never unread a word and it is never a gate input (the #213
 /// stale-extraInfo trap). The pure classifiers pass `observed = 0`: the door
 /// stores no hint; the served state is the app layer's.
 pub fn arcade_hint(tx_status: &str, extra_info: &str, observed: Timestamp) -> Option<Hint> {
-    let word = tx_status.trim().to_ascii_uppercase();
-    let status = match arcade_verdict(tx_status) {
-        ArcadeVerdict::Invalid => return None,
-        ArcadeVerdict::Pending => HintStatus::Accepted,
-        ArcadeVerdict::Seen => HintStatus::Seen,
-        ArcadeVerdict::Rejected => HintStatus::Rejected {
-            reason: if extra_info.is_empty() {
-                word.clone()
-            } else {
-                extra_info.to_string()
-            },
-        },
-        // the competitor is named by the couriers and the conflict pass,
-        // never by this word
-        ArcadeVerdict::Conflict => HintStatus::DoubleSpend {
-            competitors: Vec::new(),
-        },
-        ArcadeVerdict::Orphan => HintStatus::OrphanMempool,
-        // the K3 residue: no HintStatus carries these yet
-        ArcadeVerdict::Parked | ArcadeVerdict::InBlock | ArcadeVerdict::Mined => {
-            HintStatus::Unknown
-        }
-    };
-    Some(Hint {
-        source: ARCADE_SOURCE.to_string(),
-        status,
-        observed,
-        verdict: Some(Verdict {
-            status: word,
-            height: None,
-            reason: (!extra_info.is_empty()).then(|| extra_info.to_string()),
-            competitors: Vec::new(),
-        }),
-    })
+    let body = serde_json::json!({ "txStatus": tx_status }).to_string();
+    let mut verdict = Verdict::from_arc_body("", body.as_bytes()).ok()?;
+    verdict.reason = (!extra_info.is_empty()).then(|| extra_info.to_string());
+    let hint = verdict.into_hint(ARCADE_SOURCE, observed);
+    arcade_speaks(&hint).then_some(hint)
 }
 
-/// K3 (bsv-stack-lean #82): Arcade's word behind an `Unknown` hint, the one
-/// place the policy reads it. Deleted by L8 (#624) when the tracker's
-/// vocabulary carries "in a block" and "parked".
-fn k3_residue(hint: &Hint) -> Option<ArcadeVerdict> {
-    match hint.status {
-        HintStatus::Unknown => hint.verdict.as_ref().map(|v| arcade_verdict(&v.status)),
-        _ => None,
-    }
+/// The host's rule of the source: Arcade speaks its twelve words, and the
+/// orphan view is read wherever it comes from (#267: an orphan-pool residence
+/// is never a network accept, and the answer is the ancestry rungs).
+pub fn arcade_speaks(hint: &Hint) -> bool {
+    matches!(hint.status, HintStatus::OrphanMempool)
+        || word_of_hint(hint).is_some_and(|w| ARCADE_WORDS.contains(&w))
+}
+
+/// The tracker's word behind the hint (its `verdict.status`).
+fn word_of_hint(hint: &Hint) -> Option<&str> {
+    hint.verdict.as_ref().map(|v| v.status.as_str())
+}
+
+/// In a block, the path pending: the tracker reads STUMP_PROCESSING as
+/// `Accepted` (a broadcaster still working); the gate's bar holds it.
+fn in_a_block(hint: &Hint) -> bool {
+    matches!(hint.status, HintStatus::Accepted) && word_of_hint(hint) == Some("STUMP_PROCESSING")
+}
+
+/// A mined word with no height: the tracker keeps it `Unknown` (no evidence of
+/// a height); the host reads it as Arcade's mined claim, never a chain word.
+fn mined_without_height(hint: &Hint) -> bool {
+    matches!(hint.status, HintStatus::Unknown)
+        && matches!(word_of_hint(hint), Some("MINED" | "IMMUTABLE"))
 }
 
 /// The host's bar: the network holds it (seen, in a block, or mined). Never
 /// an orphan view (#267), never a refusal.
 pub fn network_holds(hint: &Hint) -> bool {
     matches!(hint.status, HintStatus::Seen | HintStatus::Mined { .. })
-        || matches!(
-            k3_residue(hint),
-            Some(ArcadeVerdict::InBlock | ArcadeVerdict::Mined)
-        )
+        || in_a_block(hint)
+        || mined_without_height(hint)
 }
 
 /// Arcade's refusal (REJECTED, DOUBLE_SPEND_ATTEMPTED): a HINT the door
@@ -168,7 +181,7 @@ pub enum ProofClass {
 pub fn proof_class(hint: Option<&Hint>) -> ProofClass {
     match hint {
         Some(h) if matches!(h.status, HintStatus::Mined { .. }) => ProofClass::Mined,
-        Some(h) if matches!(k3_residue(h), Some(ArcadeVerdict::Mined)) => ProofClass::Mined,
+        Some(h) if mined_without_height(h) => ProofClass::Mined,
         Some(h) if matches!(h.status, HintStatus::Seen) => ProofClass::Seen,
         _ => ProofClass::Other,
     }
@@ -176,10 +189,7 @@ pub fn proof_class(hint: Option<&Hint>) -> ProofClass {
 
 /// Arcade's word as the hint carries it (trimmed, upper case).
 fn word_of(hint: &Hint) -> String {
-    hint.verdict
-        .as_ref()
-        .map(|v| v.status.clone())
-        .unwrap_or_default()
+    word_of_hint(hint).unwrap_or_default().to_string()
 }
 
 #[cfg(test)]
@@ -188,15 +198,16 @@ mod tests {
 
     const TXID: &str = "aa00000000000000000000000000000000000000000000000000000000000001";
 
-    /// L8's blocker, measured: each Arcade-shaped body read through the
-    /// tracker's own `Verdict::from_arc_body` + `into_hint` and this host's
-    /// policy, against the door's answer. The differences are exactly these;
-    /// a tracker bump that closes one (K3) reds here and tells L8 to look.
-    /// bsv-tracker 0.4.1 closed two (lane W8e, at 0.6.0): the status word is
-    /// trimmed (" spaced") and an `ORPHAN` in `extraInfo` no longer makes an
-    /// orphan ("SEEN stale orphan extraInfo"); the seven below stand.
+    /// The tracker's bare hint tier against the door's answer, after L8
+    /// (#624, bsv-tracker 0.6.0): every body is read by the tracker on both
+    /// sides; `bare` is the gate a host with NO policy would give
+    /// (`HintStatus` alone), `door` is [`gate`] over [`arcade_hint`]. The rows
+    /// that still differ differ by POLICY, not vocabulary, each named with its
+    /// rule (`docs/words/L8-ARCADE-VERDICT-TABLE.md`). Closed at 0.4.1 and gone
+    /// from this list: STUMP_PROCESSING's word (now `Accepted`, held by the
+    /// door's in-a-block rule), the spaced word, the stale ORPHAN `extraInfo`.
     #[test]
-    fn tracker_vocabulary_differs_from_the_door_exactly_here() {
+    fn the_doors_policy_differs_from_the_bare_hint_exactly_here() {
         let bodies: &[(&str, &str)] = &[
             ("UNKNOWN", r#"{"txStatus":"UNKNOWN"}"#),
             ("RECEIVED", r#"{"txStatus":"RECEIVED"}"#),
@@ -220,10 +231,24 @@ mod tests {
                 r#"{"txStatus":"SEEN_ON_NETWORK","competingTxs":["bb00000000000000000000000000000000000000000000000000000000000002"]}"#,
             ),
             (" spaced", r#"{"txStatus":" SEEN_ON_NETWORK "}"#),
+            (
+                "SEEN_IN_ORPHAN_MEMPOOL",
+                r#"{"txStatus":"SEEN_IN_ORPHAN_MEMPOOL"}"#,
+            ),
             ("INVALID", r#"{"txStatus":"INVALID"}"#),
             ("UTXO_SPENT", r#"{"txStatus":"UTXO_SPENT"}"#),
             ("CONFIRMED", r#"{"txStatus":"CONFIRMED","blockHeight":970710}"#),
         ];
+        fn bare(hint: Option<&Hint>) -> GateVerdict {
+            match hint.map(|h| &h.status) {
+                Some(HintStatus::OrphanMempool) => GateVerdict::Orphan,
+                Some(HintStatus::Rejected { .. } | HintStatus::DoubleSpend { .. }) => {
+                    GateVerdict::Fatal
+                }
+                Some(HintStatus::Seen | HintStatus::Mined { .. }) => GateVerdict::Reached,
+                _ => GateVerdict::Pending,
+            }
+        }
         let mut differs = Vec::new();
         for (label, body) in bodies {
             let word: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -232,23 +257,65 @@ mod tests {
             let tracker = Verdict::from_arc_body(TXID, body.as_bytes())
                 .ok()
                 .map(|v| v.into_hint(ARCADE_SOURCE, 0));
-            let tracker = gate(tracker.as_ref().filter(|h| h.status != HintStatus::Unknown));
-            if door != tracker {
-                differs.push(format!("{label}: door {door:?}, tracker {tracker:?}"));
+            let bare = bare(tracker.as_ref());
+            if door != bare {
+                differs.push(format!("{label}: door {door:?}, bare hint {bare:?}"));
             }
         }
         assert_eq!(
             differs,
             [
-                "STUMP_PROCESSING: door Reached, tracker Pending",
-                "MINED no height: door Reached, tracker Pending",
-                "IMMUTABLE no height: door Reached, tracker Pending",
-                "SEEN with competitors: door Reached, tracker Fatal",
-                "INVALID: door Pending, tracker Fatal",
-                "UTXO_SPENT: door Pending, tracker Fatal",
-                "CONFIRMED: door Pending, tracker Reached",
+                // the gate's bar: in a block (D1, SEEN or better; the vector's engine_gate)
+                "STUMP_PROCESSING: door Reached, bare hint Pending",
+                // Arcade's mined claim with no height: the gate's bar; the
+                // proof look checks the path against chaintracks
+                "MINED no height: door Reached, bare hint Pending",
+                "IMMUTABLE no height: door Reached, bare hint Pending",
+                // the door reads the status word only (#213); a competitor is
+                // the conflict pass's (#602), never a refusal by this body
+                "SEEN with competitors: door Reached, bare hint Fatal",
+                // ARC's words: Arcade does not define them, no input (the
+                // vector's invalid rule, P0-2d #52)
+                "INVALID: door Pending, bare hint Fatal",
+                "UTXO_SPENT: door Pending, bare hint Fatal",
+                "CONFIRMED: door Pending, bare hint Reached",
             ],
-            "the tracker's vocabulary moved: re-read L8 (#624) against K3"
+            "the tracker's vocabulary or the door's policy moved: re-read the L8 table"
+        );
+    }
+
+    /// The host's list of Arcade's words is the vector's `words`, in order.
+    #[test]
+    fn arcade_words_are_the_vectors_twelve() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../overlay-discovery/vectors/arcade_status_verdicts.json"
+        ))
+        .unwrap();
+        let words: Vec<&str> = v["words"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["word"].as_str().unwrap())
+            .collect();
+        assert_eq!(words, ARCADE_WORDS);
+    }
+
+    /// The three inputs whose answer moved at L8 (the table's vocabulary rows):
+    /// a word with a control character and two ORPHAN-bearing words no
+    /// broadcaster defines are bodies the tracker refuses, so no input.
+    #[test]
+    fn l8_moved_a_control_character_word_and_undefined_orphan_words_to_no_input() {
+        for w in [" MINED\n", "orphaned", "ORPHAN"] {
+            assert!(arcade_hint(w, "", 0).is_none(), "{w:?}");
+            assert_eq!(gate(None), GateVerdict::Pending);
+        }
+        assert_eq!(
+            arcade_hint(" stump_processing ", "", 0).map(|h| h.status),
+            Some(HintStatus::Accepted)
+        );
+        assert_eq!(
+            gate(arcade_hint("SEEN_IN_ORPHAN_MEMPOOL", "", 0).as_ref()),
+            GateVerdict::Orphan
         );
     }
 

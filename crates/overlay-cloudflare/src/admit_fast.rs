@@ -58,11 +58,11 @@ pub enum CallbackAction {
     Ignore,
 }
 
-/// P0-2d (bsv-stack-lean #52): through the one verdict function
-/// (`overlay_discovery::arcade_words`), the gate's own reading: seen, in a
-/// block (STUMP_PROCESSING) or mined triggers the live read; a refusal or any
-/// ORPHAN word is corroborated; pending, parked and an undefined word do
-/// nothing.
+/// P0-2d (bsv-stack-lean #52): through the one reading of Arcade's words
+/// (bsv-tracker's since #624), the gate's own reading: seen, in a block
+/// (STUMP_PROCESSING) or mined triggers the live read; a refusal or the
+/// orphan view (SEEN_IN_ORPHAN_MEMPOOL) is corroborated; pending, parked and
+/// an undefined word do nothing.
 ///
 /// bsv-low #619 (L3): the push's word as the tracker's hint, the action the
 /// host's policy over it (`door_words::callback`).
