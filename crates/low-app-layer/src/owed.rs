@@ -4963,6 +4963,65 @@ pub(crate) mod tests {
         }
     }
 
+    /// bsv-low #736: the payout of a settle the index has proven (`spentConfirmed`) with NO stored height (an
+    /// unparseable bump) is claimable whatever the settle's word says, as with no word row; the `awaiting_block`
+    /// sentence of an unclassified spend reads the same proof. `ns3_m2` above holds only with a height.
+    #[test]
+    fn i736_a_heightless_index_proof_is_read_before_the_settles_word() {
+        let mut won = entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        );
+        won.at_height = None;
+        let mut unclassified = entry(Some(true), None, Outcome::Unresolved, Some(SeatLetter::A));
+        unclassified.at_height = None;
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let judge = |e: &ResultEntry, words: &std::collections::BTreeMap<String, Value>| {
+            let entries = [e.clone()];
+            let mut i = inputs(&entries, &[], &[], &v, &c, &p, Some(900_200));
+            i.spender_words = Some(words);
+            let mut row = serde_json::to_value(&derive_owed_rows(&i)[0]).unwrap();
+            let facts = row["facts"].as_object_mut().unwrap();
+            facts.remove("coinWord");
+            facts.remove("spenderWord");
+            row
+        };
+        let none = std::collections::BTreeMap::new();
+        for word in [
+            json!({"word":"mined","verifyPath":null,"cannotCheck":"header snapshot changed"}),
+            json!({"word":"stale","verifyPath":null}),
+            json!({"word":"mined","verifyPath":null}),
+        ] {
+            let words = std::collections::BTreeMap::from([(tx(3), word.clone())]);
+            let (base, judged) = (judge(&won, &none), judge(&won, &words));
+            assert_eq!(base["facts"]["claimable"], true);
+            assert_eq!(
+                judged, base,
+                "the payout under {word} is the payout with no word row"
+            );
+            let (base, judged) = (judge(&unclassified, &none), judge(&unclassified, &words));
+            assert_eq!(
+                base["reason"], "the spend is not classified yet (no verdict)",
+                "the index's proof is no block wait"
+            );
+            assert_eq!(
+                judged, base,
+                "the unclassified row under {word} is the row with no word row"
+            );
+        }
+        // a courier never reaches this field: `spent_confirmed` here is the index's latch. With no index proof the
+        // word still decides, as before #736
+        let mut unproven = won.clone();
+        unproven.spent_confirmed = Some(false);
+        let words = std::collections::BTreeMap::from([(
+            tx(3),
+            json!({"word":"mined","verifyPath":null,"cannotCheck":"header snapshot changed"}),
+        )]);
+        assert_eq!(judge(&unproven, &words)["facts"]["claimable"], false);
+    }
+
     #[test]
     fn ns3_m2_index_proof_survives_missing_row_and_cannot_check() {
         let entries = [entry(
