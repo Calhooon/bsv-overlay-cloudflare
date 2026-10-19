@@ -23,7 +23,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 # The lowest toolchain both workspaces build on, found by trying (bsv-stack-lean
 # #139): 1.87 stops in bsv-rs 0.6.0 and wasm-streams 0.6.0. The gate's `msrv`
