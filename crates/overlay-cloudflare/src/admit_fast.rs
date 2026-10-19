@@ -2103,36 +2103,47 @@ pub async fn evidence_check(
     let look = sources
         .arcade_look(&env.arcade_base, txid, Some(webhook))
         .await;
+    let indexers = async {
+        let b = sources.bitails_presence(txid).await;
+        let w = sources.woc_presence(env.woc_api_key.as_deref(), txid).await;
+        (
+            b.map(crate::proof_fetcher::presence_bool),
+            w.map(crate::proof_fetcher::presence_bool),
+        )
+    };
+    let age = async {
+        match env.env.d1("OVERLAY_DB") {
+            Ok(db) => {
+                let now_ms = worker::Date::now().as_millis();
+                admission_age_ms(&db, txid, now_ms).await
+            }
+            Err(_) => None, // no ledger to ask: the conservative word (young)
+        }
+    };
+    verdict_of_look(&look, indexers, age).await
+}
+
+/// The evidence check after the look (bsv-low #740: the seam the pins run under real SQLite). `indexers` and
+/// `admission_age` are LAZY: the indexers are asked only when Arcade does not hold the txid, the admission's age
+/// only when the refusal would rest on absence. An unknown age (no admission, no ledger) is young.
+pub(crate) async fn verdict_of_look(
+    look: &crate::proof_fetcher::ArcadeLook,
+    indexers: impl std::future::Future<Output = (Option<bool>, Option<bool>)>,
+    admission_age: impl std::future::Future<Output = Option<u64>>,
+) -> EvidenceVerdict {
     let (bitails, woc) = match look {
         // Arcade holds it: nothing to corroborate. Every other word (fatal,
         // missing, a fault) is one source; the indexers are the second.
         crate::proof_fetcher::ArcadeLook::Present => (None, None),
-        _ => {
-            let b = sources.bitails_presence(txid).await;
-            let w = sources.woc_presence(env.woc_api_key.as_deref(), txid).await;
-            (b, w)
-        }
+        _ => indexers.await,
     };
-    let young = match &look {
-        crate::proof_fetcher::ArcadeLook::Missing | crate::proof_fetcher::ArcadeLook::Fault => {
-            match env.env.d1("OVERLAY_DB") {
-                Ok(db) => {
-                    let now_ms = worker::Date::now().as_millis();
-                    admission_age_ms(&db, txid, now_ms)
-                        .await
-                        .is_none_or(|age| age < REFUSAL_ABSENT_MIN_AGE_MS)
-                }
-                Err(_) => true, // no ledger to ask: the conservative word
-            }
-        }
+    let young = match look {
+        crate::proof_fetcher::ArcadeLook::Missing | crate::proof_fetcher::ArcadeLook::Fault => admission_age
+            .await
+            .is_none_or(|age| age < REFUSAL_ABSENT_MIN_AGE_MS),
         _ => false,
     };
-    evidence_verdict(
-        &look,
-        bitails.map(crate::proof_fetcher::presence_bool),
-        woc.map(crate::proof_fetcher::presence_bool),
-        young,
-    )
+    evidence_verdict(look, bitails, woc, young)
 }
 
 #[derive(serde::Deserialize)]
@@ -2140,45 +2151,50 @@ struct AgeRow {
     s: Option<f64>,
 }
 
-/// How long ago the index admitted this txid (ms), from the engine's own stamp (`outputs.score`, the admission's
-/// ms) with the pot row's `createdAt` (seconds) as the fallback; `None` when the index holds no admission.
+/// The admission's stamp, rung by rung (`?` the txid, lowercase), each with its unit's factor to ms: the engine's
+/// own stamp (`outputs.score`, ms), the twin's for an EVICTED subject (#519, the delta-verify's observation: its
+/// outputs live in the twin with the admission's own stamp; without this rung a hop or a marker the eviction moved
+/// read "young" forever at the door), the pot row's `createdAt` (seconds), and a spender's BEEF first-store stamp
+/// (seconds; a settle, a refund, a sweep admits no output and holds no pot row: the gate's NEW-6).
+pub(crate) const ADMISSION_AGE_RUNGS: [(&str, f64); 4] = [
+    ("SELECT MIN(score) AS s FROM outputs WHERE txid = ?", 1.0),
+    ("SELECT MIN(score) AS s FROM outputs_evicted WHERE txid = ?", 1.0),
+    ("SELECT MIN(createdAt) AS s FROM pot_records WHERE txid = ?", 1000.0),
+    ("SELECT createdAt AS s FROM pot_beefs WHERE txid = ?", 1000.0),
+];
+
+/// How long ago the index admitted this txid (ms), from the first rung of [`ADMISSION_AGE_RUNGS`] that holds a
+/// positive stamp; `None` when the index holds no admission. `read` asks one rung's statement (a fault, no row or a
+/// NULL is no stamp).
+pub(crate) async fn admission_age_over<F, Fut>(read: F, now_ms: u64) -> Option<u64>
+where
+    F: Fn(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Option<f64>>,
+{
+    for (sql, to_ms) in ADMISSION_AGE_RUNGS {
+        if let Some(s) = read(sql).await {
+            if s > 0.0 {
+                return Some((now_ms as f64 - s * to_ms).max(0.0) as u64);
+            }
+        }
+    }
+    None
+}
+
+/// How long ago the index admitted this txid (ms), over D1 ([`admission_age_over`]).
 pub async fn admission_age_ms(db: &D1Database, txid: &str, now_ms: u64) -> Option<u64> {
     let txid = txid.to_ascii_lowercase();
-    let stamp_ms: Option<f64> =
-        match Query::new("SELECT MIN(score) AS s FROM outputs WHERE txid = ?")
-            .bind(txid.as_str())
-            .fetch_optional::<AgeRow>(db)
-            .await
-        {
-            Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s),
-            // #519 (the delta-verify's observation): an EVICTED subject's outputs live in the twin with the admission's
-            // own stamp — without this rung a hop or a marker the eviction moved read "young" forever at the door
-            _ => match Query::new("SELECT MIN(score) AS s FROM outputs_evicted WHERE txid = ?")
-                .bind(txid.as_str())
-                .fetch_optional::<AgeRow>(db)
-                .await
-            {
-                Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s),
-                _ => match Query::new("SELECT MIN(createdAt) AS s FROM pot_records WHERE txid = ?")
-                    .bind(txid.as_str())
-                    .fetch_optional::<AgeRow>(db)
-                    .await
-                {
-                    Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s * 1000.0),
-                    // a spender (a settle, a refund, a sweep) admits no output and holds no pot row: its BEEF's
-                    // first-store stamp (seconds) is the third rung (the gate's NEW-6)
-                    _ => match Query::new("SELECT createdAt AS s FROM pot_beefs WHERE txid = ?")
-                        .bind(txid.as_str())
-                        .fetch_optional::<AgeRow>(db)
-                        .await
-                    {
-                        Ok(Some(AgeRow { s: Some(s) })) if s > 0.0 => Some(s * 1000.0),
-                        _ => None,
-                    },
-                },
-            },
-        };
-    stamp_ms.map(|s| (now_ms as f64 - s).max(0.0) as u64)
+    let txid = txid.as_str();
+    admission_age_over(
+        |sql| async move {
+            match Query::new(sql).bind(txid).fetch_optional::<AgeRow>(db).await {
+                Ok(Some(AgeRow { s })) => s,
+                _ => None,
+            }
+        },
+        now_ms,
+    )
+    .await
 }
 
 /// What a corroborated refusal's settle does to the world, after the shadow move (bsv-low #649). A port so the
@@ -5183,5 +5199,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── bsv-low #740: a pushed status for a subject whose live look faulted takes the absence floor ──
+
+    /// What one refusal's evidence did under real SQLite: the verdict, the ledger row's reason (if one was opened),
+    /// the uncorroborated counter, and the subject's rows still live (`outputs`, `applied_transactions`).
+    struct I740Run {
+        verdict: EvidenceVerdict,
+        ledger_reason: Option<String>,
+        uncorroborated: i64,
+        live_rows: i64,
+    }
+
+    /// The pinned shape: the subject's admission (one output and its applied row, stamped `admitted_ms` ago), or
+    /// none; both indexers answer definitively absent (`Some(false)`); the refusal callback's status is `pushed`.
+    /// The look goes through the SHIPPED fold (`fold_arcade_look`), the decision through the SHIPPED seam
+    /// (`verdict_of_look`, the admission age read over `ADMISSION_AGE_RUNGS`), a refusal through the SHIPPED core
+    /// (`evict_core`, the ledger's open marker first) with the callback's reason wrap, and a kept refusal bumps the
+    /// callback's counter by the SHIPPED statement: the three arms of `refusal_job` after its check.
+    async fn i740_run(live: ArcadeLook, admitted_ms_ago: Option<u64>) -> I740Run {
+        use rusqlite::OptionalExtension;
+        let txid = "74".repeat(32);
+        let now_ms: u64 = 1_800_000_000_000;
+        let conn = shipped_conn();
+        if let Some(ago) = admitted_ms_ago {
+            conn.execute(
+                "INSERT INTO outputs (txid, outputIndex, outputScript, topic, satoshis, spent, score) VALUES (?1, 0, X'51', 'tm_pot', 40000, 0, ?2)",
+                rusqlite::params![&txid, (now_ms - ago) as f64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_pot')",
+                [&txid],
+            )
+            .unwrap();
+        }
+        let db = SqliteShadow::new(conn);
+        let pushed = ("REJECTED".to_string(), "pushed extra".to_string());
+        let look = crate::proof_fetcher::fold_arcade_look(live, Some(pushed.clone()));
+        let indexers = async { (Some(false), Some(false)) };
+        let conn = &db.conn;
+        let txid_ref = txid.as_str();
+        let age = admission_age_over(
+            |sql| async move {
+                conn.query_row(sql, [txid_ref], |r| r.get::<_, Option<f64>>(0))
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .flatten()
+            },
+            now_ms,
+        );
+        let verdict = verdict_of_look(&look, indexers, age).await;
+        match &verdict {
+            EvidenceVerdict::Refused(reason) => {
+                let core = evict_core(&db, &txid, &format!("{} ({reason})", pushed.0), now_ms).await;
+                assert!(core.faults.is_empty(), "{:?}", core.faults);
+            }
+            EvidenceVerdict::Present | EvidenceVerdict::Uncertain(_) => {
+                db.conn
+                    .execute(
+                        crate::ops::BUMP_COUNTER_SQL,
+                        rusqlite::params![crate::ops::COUNTER_ARC_INGEST_REFUSAL_UNCORROBORATED, 1i64],
+                    )
+                    .unwrap();
+            }
+        }
+        let ledger_reason = db
+            .conn
+            .query_row("SELECT reason FROM pot_evictions WHERE txid = ?1", [&txid], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .unwrap();
+        let uncorroborated = db
+            .conn
+            .query_row(
+                "SELECT value FROM ops_counters WHERE name = ?1",
+                [crate::ops::COUNTER_ARC_INGEST_REFUSAL_UNCORROBORATED],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .unwrap_or(0);
+        let live_rows = count(&db.conn, "outputs", "txid", &txid)
+            + count(&db.conn, "applied_transactions", "txid", &txid);
+        I740Run {
+            verdict,
+            ledger_reason,
+            uncorroborated,
+            live_rows,
+        }
+    }
+
+    /// The served eviction word of a ledger reason (`/utxo-status.evicted.word`, `ls_pot spentStatus.evicted.word`).
+    fn i740_word(reason: &str) -> Option<&'static str> {
+        overlay_discovery::pot::storage::eviction_chain_word(reason)
+    }
+
+    /// bsv-low #740 (1): the live look faulted, the pushed REJECTED filled it, both indexers are absent, and the
+    /// subject was admitted a minute ago: a refusal on absence alone, under the floor. Nothing is evicted, the
+    /// refusal is counted uncorroborated, every row of the subject is still live.
+    #[tokio::test]
+    async fn i740_a_pushed_status_under_a_faulted_look_on_a_young_admission_evicts_nothing() {
+        let run = i740_run(ArcadeLook::Fault, Some(60_000)).await;
+        assert!(
+            matches!(run.verdict, EvidenceVerdict::Uncertain(_)),
+            "the pushed word under a faulted look is not Arcade's own word: {:?}",
+            run.verdict
+        );
+        assert_eq!(run.ledger_reason, None, "no eviction opened");
+        assert_eq!(run.uncorroborated, 1);
+        assert_eq!(run.live_rows, 2, "the subject's output and applied row stay live");
+    }
+
+    /// bsv-low #740 (2): the same with a subject the index never admitted: nothing evicted, counted, no ledger row.
+    #[tokio::test]
+    async fn i740_b_a_pushed_status_under_a_faulted_look_on_a_never_admitted_subject_opens_no_eviction() {
+        let run = i740_run(ArcadeLook::Fault, None).await;
+        assert!(
+            matches!(run.verdict, EvidenceVerdict::Uncertain(_)),
+            "{:?}",
+            run.verdict
+        );
+        assert_eq!(run.ledger_reason, None, "no eviction ledger row is opened");
+        assert_eq!(run.uncorroborated, 1);
+    }
+
+    /// bsv-low #740 (3): the same with the subject admitted past the floor: the absence-based refusal stands, as a
+    /// faulted look with no pushed word yields it, and the ledger reason serves the ABSENCE shape (no chain word),
+    /// never Arcade's `rejected`.
+    #[tokio::test]
+    async fn i740_c_a_pushed_status_under_a_faulted_look_on_an_aged_admission_is_the_absence_refusal() {
+        let run = i740_run(ArcadeLook::Fault, Some(REFUSAL_ABSENT_MIN_AGE_MS + 60_000)).await;
+        let EvidenceVerdict::Refused(reason) = &run.verdict else {
+            panic!("an aged admission keeps the absence refusal: {:?}", run.verdict);
+        };
+        assert!(reason.starts_with("arcade faulted, recorded REJECTED: "), "{reason}");
+        let ledger = run.ledger_reason.expect("the eviction is opened");
+        assert_eq!(ledger, format!("REJECTED ({reason})"));
+        assert_eq!(i740_word(&ledger), None, "an eviction on absence serves no chain word");
+        assert_eq!(run.uncorroborated, 0);
+        assert_eq!(run.live_rows, 0, "the shadow move took the subject's rows");
+        // the same aged subject under a faulted look with NO pushed word: the same decision, the same served word
+        let bare = evidence_verdict(&ArcadeLook::Fault, Some(false), Some(false), false);
+        let EvidenceVerdict::Refused(bare) = bare else {
+            panic!("{bare:?}")
+        };
+        assert_eq!(i740_word(&format!("REJECTED ({bare})")), None);
+    }
+
+    /// bsv-low #740 (4), the guard against widening: Arcade's OWN live REJECTED, a young subject, both indexers
+    /// absent: evicted as before (Arcade's own word needs no age), served `rejected`.
+    #[tokio::test]
+    async fn i740_d_a_live_rejected_on_a_young_admission_still_evicts_and_serves_rejected() {
+        let run = i740_run(
+            ArcadeLook::Fatal("REJECTED".into(), "live extra".into()),
+            Some(60_000),
+        )
+        .await;
+        let EvidenceVerdict::Refused(reason) = &run.verdict else {
+            panic!("Arcade's own word needs no age: {:?}", run.verdict);
+        };
+        assert_eq!(reason, "arcade live REJECTED: live extra; both indexers absent");
+        let ledger = run.ledger_reason.expect("the eviction is opened");
+        assert_eq!(i740_word(&ledger), Some("rejected"));
+        assert_eq!(run.uncorroborated, 0);
+        assert_eq!(run.live_rows, 0);
     }
 }
