@@ -2193,7 +2193,7 @@ where
     None
 }
 
-/// How long ago the index admitted this txid (ms), over D1 ([`admission_age_over`]).
+/// How long ago the index admitted this txid (ms), over D1 (`admission_age_over`, private).
 pub async fn admission_age_ms(db: &D1Database, txid: &str, now_ms: u64) -> Option<u64> {
     let txid = txid.to_ascii_lowercase();
     let txid = txid.as_str();
