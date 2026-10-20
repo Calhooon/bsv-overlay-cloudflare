@@ -18,20 +18,20 @@ pub const TIP_ROOM: &str = "broadcast-low-tip";
 /// Constant-shape bearer check against the `INTERNAL_TOKEN` secret. An
 /// unconfigured deploy refuses everything (never an open webhook).
 pub fn internal_bearer_ok(req: &Request, env: &Env) -> bool {
-    let Ok(expected) = env.secret("INTERNAL_TOKEN").map(|s| s.to_string()) else {
+    let expected = env.secret("INTERNAL_TOKEN").map(|s| s.to_string()).ok();
+    let got = req.headers().get("Authorization").ok().flatten();
+    bearer_matches(got.as_deref(), expected.as_deref())
+}
+
+/// The bearer rule itself, natively testable: an `Authorization: Bearer <token>` equal to a configured, non-empty
+/// `INTERNAL_TOKEN`; anything else (no header, another scheme, no secret) is refused.
+pub fn bearer_matches(got: Option<&str>, expected: Option<&str>) -> bool {
+    let Some(expected) = expected.map(str::trim).filter(|e| !e.is_empty()) else {
         return false;
     };
-    if expected.trim().is_empty() {
-        return false;
-    }
-    let got = req
-        .headers()
-        .get("Authorization")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    got.strip_prefix("Bearer ")
-        .map(|t| t.trim() == expected.trim())
+    got.unwrap_or_default()
+        .strip_prefix("Bearer ")
+        .map(|t| t.trim() == expected)
         .unwrap_or(false)
 }
 

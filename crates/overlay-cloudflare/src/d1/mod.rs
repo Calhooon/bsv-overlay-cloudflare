@@ -605,7 +605,10 @@ pub fn migration_list_fingerprint() -> u32 {
 pub const OVERLAY_MIGRATION_COUNT: usize = 341;
 
 /// bsv-low #771 (L1b): the chain-event feed's cursor, one row (`low-app-layer` `tracker_host::chain_events`).
-pub const TRACKER_CHAIN_EVENTS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tracker_chain_events (id INTEGER PRIMARY KEY CHECK (id = 1), cursor TEXT NOT NULL, at INTEGER NOT NULL, last_kind TEXT, last_cursor TEXT, held_cursor TEXT, held_height INTEGER, held_txid TEXT, stop_cursor TEXT, stop_fault TEXT, tip_height INTEGER, tip_age_seconds INTEGER)";
+/// FIX-771-L1: `seed` and `started_at` (the cursor the row was first written at, from `CHAIN_EVENTS_START_CURSOR`
+/// or the operator's lever, and when) are in the CREATE itself, not an ALTER: the statement had shipped to no
+/// deployment when they were added (PR 118 unreleased), so the count stays 341 and the fingerprint moves.
+pub const TRACKER_CHAIN_EVENTS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tracker_chain_events (id INTEGER PRIMARY KEY CHECK (id = 1), cursor TEXT NOT NULL, at INTEGER NOT NULL, last_kind TEXT, last_cursor TEXT, held_cursor TEXT, held_height INTEGER, held_txid TEXT, stop_cursor TEXT, stop_fault TEXT, tip_height INTEGER, tip_age_seconds INTEGER, seed TEXT, started_at INTEGER)";
 
 /// bsv-low #771 (L1b): the durable re-ask queue a chain event writes in its cursor's batch.
 pub const TRACKER_REASKS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tracker_reasks (txid TEXT PRIMARY KEY, kind TEXT NOT NULL, height INTEGER NOT NULL, event_cursor TEXT NOT NULL, written_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)";
