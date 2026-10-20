@@ -297,7 +297,7 @@ fn count_landed(
     *reads += into.len();
     (*reads > PREDECESSOR_READS).then(|| {
         format!(
-            "{} is not known to have landed: the question ran out of its {PREDECESSOR_READS} reads (a coin read into {candidate}, landed)",
+            "{}: the question ran out of its {PREDECESSOR_READS} reads at a coin read into {candidate}, landed (the spender was judged unlanded; the budget, not its state, is the refusal)",
             into.last().map_or("", String::as_str)
         )
     })

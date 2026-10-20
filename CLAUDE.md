@@ -1041,10 +1041,14 @@ body the reads reached).
 The question costs at most 256 store reads per SUBMIT over every body it
 reads, in every topic of the submit together (the third delta fold, M1:
 `PREDECESSOR_READS_PER_SUBMIT`; a later topic's question starts from what the
-earlier ones left). Inside that, at most 16 per topic are spent on bodies the
+earlier ones left). Inside that, 16 per topic is a COUNT over the bodies the
 BEEF does not prove and the store does not hold as landed (the second delta
-fold, M2): a proven body and one whose applied row or held output answers
-"landed" are read and cost nothing against the 16, though an unproven body
+fold, M2; since FIX-791-B, 616a226, a coin read into a carried source counts
+only once that source is found landed, so the 16 is a count of two a body plus
+one per input whose source the BEEF does not carry or is later found landed,
+and the reads MADE per topic are bounded by the 256 alone): a proven body and
+one whose applied row or held output answers "landed" are read and cost
+nothing against the 16, though an unproven body
 needs room under it for the reads that find it landed (with 15 spent, one
 landed by a held output and no applied row is refused at its second read).
 "Proven" is the BEEF's word here (a body carrying a merkle path): no proof is
@@ -1191,8 +1195,9 @@ room rides by key in R2, and the door refuses none for its size; "The queued
 BEEF in R2" below). It cannot tell a faulted predecessor from one nobody submitted
 yet: the successor is "not now" until it lands. And a transaction that admits
 nothing, found no coin and carries more UNPROVEN, UNLANDED bodies than 16
-reads settle (six single-input ancestors or more: five are settled, measured
-by the #576 delta-2 lens; fewer with more inputs) is "not
+reads settle (a carried single-input chain settles eight bodies at two a body,
+five when their sources are absent from the BEEF: FIX-791-B, 616a226; fewer
+with more inputs) is "not
 now" on every submit, where the reference records it: three retries and a
 dead letter each. So is one whose question needs more than 256 reads over
 the submit's topics, whatever its bodies are (a landed body costs one read by
