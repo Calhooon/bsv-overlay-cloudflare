@@ -10739,3 +10739,176 @@ async fn e592_q8_5_a_root_served_proven_lifts_the_hold_and_finalizes_with_no_scr
         "the cursor already passed the saved graph"
     );
 }
+
+// ============================================================================
+// bsv-low #791 (loop 38, 2026-10-20): a JOIN over the hand's first JOIN, the
+// first JOIN APPLIED in the hop ledger's topic (`tm_lowfund`, every P2PKH
+// output) ninety seconds earlier, parked as a `not_now` dead letter and
+// re-parked on every re-drive: "<first JOIN> is not known to have landed: the
+// question ran out of its 16 reads". The second JOIN admits nothing there
+// (its pot output is no P2PKH) and finds no coin (the first JOIN's pot output
+// is not held there either), so the predecessor question walks every input.
+// The walk is depth first from the LAST input: the second seat's funding
+// input, whose unproven ancestry the topic never saw, was walked to its end
+// first, and when it cost the 16 exactly the first JOIN was refused before
+// its one read. The read that ate the budget is the walk's per-body triple
+// (the applied row, the outputs, one coin per input) over that unproven
+// ancestry; the identity's other rows in the topic are never read (the
+// question reads by txid), so N, the hop rows the flood holds for one
+// identity, does not move the answer (0 and 300 alike, below). Now the walk
+// is breadth first in input order: every input of the subject is asked
+// before any body further up, the first JOIN is landed by its applied row
+// (one read, nothing against the 16), and the funding ancestry gets the 16
+// whole. RED on `9878684` at 5 hops +1, the first JOIN named.
+// ============================================================================
+
+// The P2PKH script of one identity (the hop ledger admits P2PKH outputs).
+fn identity_p2pkh() -> LockingScript {
+    LockingScript::from_hex("76a914111111111111111111111111111111111111111188ac").unwrap()
+}
+
+// A pot's output: no P2PKH, so the hop ledger admits nothing of it.
+fn pot_output(satoshis: u64) -> TransactionOutput {
+    TransactionOutput::new(satoshis, LockingScript::from_binary(&[0x51]).unwrap())
+}
+
+// An input over an outpoint whose body no BEEF carries.
+fn absent_input(n: u32) -> TransactionInput {
+    let mut input = TransactionInput::new("bb".repeat(32), n);
+    input.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
+    input
+}
+
+// An input spending `parent`'s `vout`, its body linked for the BEEF.
+fn spend_of(parent: &Transaction, vout: u32) -> TransactionInput {
+    let mut input = TransactionInput::new(parent.id(), vout);
+    input.unlocking_script = Some(UnlockingScript::from_binary(&[0x51]).unwrap());
+    input.source_transaction = Some(Box::new(parent.clone()));
+    input
+}
+
+// The second seat's funding: `hops` unproven single-input transactions the
+// topic never saw (each one output, no P2PKH), the first of them over
+// `1 + extra` outpoints whose bodies the BEEF does not carry. The walk reads
+// each body's applied row, its outputs and one coin per input: `3 * hops +
+// extra` reads, every one counted against the 16. The last hop.
+fn unseen_funding(hops: usize, extra: u32) -> Transaction {
+    let mut tx = Transaction::new();
+    for n in 0..=extra {
+        tx.inputs.push(absent_input(7000 + n));
+    }
+    tx.outputs.push(pot_output(5000));
+    for _ in 1..hops {
+        let mut next = Transaction::new();
+        next.inputs.push(spend_of(&tx, 0));
+        next.outputs.push(pot_output(5000));
+        tx = next;
+    }
+    tx
+}
+
+// `tx`'s BEEF, the bodies of its ancestors it links and no others.
+fn partial_beef(tx: &Transaction) -> TaggedBEEF {
+    TaggedBEEF::new(tx.to_beef(true).unwrap(), vec![TOPIC.to_string()])
+}
+
+// One `/submit` engine of the hop ledger over `storage`.
+fn hop_ledger(storage: ScriptedStore) -> Engine {
+    door(
+        bsv_overlay_discovery::pot::lowfund_topic_manager::LowFundTopicManager::new(),
+        storage,
+    )
+}
+
+#[tokio::test]
+async fn fix791_a_join_over_a_first_join_the_topic_holds_is_recorded_whatever_the_other_seats_ancestry(
+) {
+    let (_logs, _guard) = capture_logs();
+    let mut wrong = Vec::new();
+    // (the identity's hop rows held, the funding hops, extra absent inputs
+    // of the deepest, recorded): the funding ancestry at 16 reads (5 hops,
+    // one extra input) is the beta shape (the first JOIN named); at 18 (6
+    // hops) the walk runs out inside that ancestry, which the 16 still
+    // bound (D17's stated cost, unchanged).
+    for (rows, hops, extra, recorded) in [
+        (0usize, 4usize, 0u32, true),
+        (0, 5, 0, true),
+        (0, 5, 1, true),
+        (300, 5, 1, true),
+        (300, 6, 0, false),
+    ] {
+        let store = Rc::new(MemoryStorage::new());
+        // The flood's rows: hops of one identity, each applied and held.
+        for n in 0..rows {
+            let mut hop = Transaction::new();
+            hop.inputs.push(absent_input(n as u32));
+            hop.outputs
+                .push(TransactionOutput::new(1000, identity_p2pkh()));
+            let r = submitted(
+                &hop_ledger(ScriptedStore::plain(&store)),
+                &partial_beef(&hop),
+            )
+            .await;
+            assert_eq!(r.applied_topics, vec![TOPIC.to_string()]);
+        }
+        // The hand's first JOIN: its pot output and the seat's change, the
+        // change admitted, the JOIN applied.
+        let mut first = Transaction::new();
+        first.inputs.push(absent_input(9000));
+        first.outputs.push(pot_output(10_000));
+        first
+            .outputs
+            .push(TransactionOutput::new(900, identity_p2pkh()));
+        let r = submitted(
+            &hop_ledger(ScriptedStore::plain(&store)),
+            &partial_beef(&first),
+        )
+        .await;
+        assert_eq!(r.applied_topics, vec![TOPIC.to_string()], "the first JOIN");
+        // The second JOIN: the first JOIN's pot output, then the second
+        // seat's funding; one pot output, nothing the hop ledger admits.
+        let funding = unseen_funding(hops, extra);
+        let mut second = Transaction::new();
+        second.inputs.push(spend_of(&first, 0));
+        second.inputs.push(spend_of(&funding, 0));
+        second.outputs.push(pot_output(15_000));
+        let storage = ScriptedStore::plain(&store);
+        let reads = storage.reads.clone();
+        let r = submitted(&hop_ledger(storage), &partial_beef(&second)).await;
+        // The submit's own reads: the dedup read and one previous coin per
+        // input. The rest are the question's.
+        let asked = reads.get() - 1 - second.inputs.len();
+        println!(
+            "#791: {rows} identity rows, {hops} funding hops (+{extra}): the question read {asked}, durable {} applied {:?} ({})",
+            r.is_durable(),
+            r.applied_topics,
+            r.summary()
+        );
+        let row = AppliedTransaction {
+            txid: second.id(),
+            topic: TOPIC.to_string(),
+        };
+        let got = store.does_applied_transaction_exist(&row).await.unwrap();
+        if got != recorded || r.is_durable() != recorded {
+            wrong.push(format!(
+                "{rows} rows, {hops} hops +{extra}: recorded {got}, expected {recorded} (the first JOIN {}): {}",
+                first.id(),
+                r.summary()
+            ));
+        }
+        if !recorded {
+            assert_eq!(r.faults.len(), 1, "{}", r.summary());
+            assert_eq!(r.faults[0].site, "predecessor_not_landed");
+            assert!(
+                !r.faults[0].error.contains(&first.id()),
+                "never the first JOIN, which the topic holds: {}",
+                r.summary()
+            );
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a JOIN over a first JOIN the hop ledger holds is recorded unless the other seat's own ancestry passes the 16:\n{}",
+        wrong.join("\n")
+    );
+}
