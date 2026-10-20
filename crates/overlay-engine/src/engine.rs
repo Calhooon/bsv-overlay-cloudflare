@@ -10,7 +10,7 @@ use crate::beef_limits;
 
 use bsv_rs::transaction::{Beef, Transaction};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{error, info, warn};
 
 use crate::advertiser::{Advertiser, AdvertiserError};
@@ -2739,7 +2739,17 @@ impl Engine {
         // each: a dry run asks only of an output its spender names.
         let mut spent_of: HashMap<String, HashSet<u32>> = HashMap::new();
         let mut spenders: HashMap<String, Vec<(String, u32)>> = HashMap::new();
-        let mut ask: Vec<String> = Vec::new();
+        // The walk is BREADTH first from the subject's inputs in input order
+        // (bsv-low #791): every input of `tx` is asked before any body one
+        // step further up, and so on, nearest first. Depth first from the
+        // LAST input, another input's unproven ancestry spent the 16 before
+        // the first input's applied row was read: a JOIN over the hand's
+        // first JOIN, applied in `tm_lowfund` ninety seconds earlier, was
+        // "not now" on every presentation, the first JOIN named as the body
+        // the question ran out at. Each body still costs what it cost (its
+        // applied row, its outputs, one coin per input) and the 16 and the
+        // 256 bound the rest as before; only the order changed.
+        let mut ask: VecDeque<String> = VecDeque::new();
         for (source, vout) in &starts {
             if admits
                 && subject_names
@@ -2753,7 +2763,7 @@ impl Engine {
                 .entry(source.clone())
                 .or_default()
                 .push((txid.to_string(), *vout));
-            ask.push(source.clone());
+            ask.push_back(source.clone());
         }
         // Nothing to ask (a transaction that admits and names nothing, every
         // manager of this workspace): the BEEF is not even parsed.
@@ -2777,7 +2787,7 @@ impl Engine {
         // The reads spent on bodies neither proven nor found landed.
         let mut reads = 0usize;
         let mut asked: HashSet<String> = HashSet::new();
-        while let Some(candidate) = ask.pop() {
+        while let Some(candidate) = ask.pop_front() {
             if candidate.is_empty() || !asked.insert(candidate.clone()) {
                 continue;
             }
@@ -2913,7 +2923,7 @@ impl Engine {
                             .entry(source.clone())
                             .or_default()
                             .push((candidate.clone(), input.source_output_index));
-                        ask.push(source);
+                        ask.push_back(source);
                     }
                     Err(e) => return unread(e),
                 }
