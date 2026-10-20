@@ -598,7 +598,29 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 334 to 336 for bsv-low #621 (L5): `network_seen.seenSource` and `network_seen.sourceAtMs`, the broadcaster that said
 /// SEEN and its time. The app layer reads both (`/utxo-status.networkSeenBy`), so epoch Rule 24 bites: its
 /// `LATCH_COLUMN_ALTERS` carry the same two statements.
-pub const OVERLAY_MIGRATION_COUNT: usize = 336;
+/// 336 to 341 for bsv-low #771 (L1b): the app layer's chain-event intake, `tracker_chain_events` (the feed cursor, one
+/// row), `tracker_reasks` (the durable re-ask queue) and its age index, and two partial indexes of `tx_words`' mined
+/// rows (by height, by header hash) that select an event's affected set. The app layer's catch-up carries the two
+/// CREATE TABLEs byte for byte and issues the three indexes on its scheduled path.
+pub const OVERLAY_MIGRATION_COUNT: usize = 341;
+
+/// bsv-low #771 (L1b): the chain-event feed's cursor, one row (`low-app-layer` `tracker_host::chain_events`).
+pub const TRACKER_CHAIN_EVENTS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tracker_chain_events (id INTEGER PRIMARY KEY CHECK (id = 1), cursor TEXT NOT NULL, at INTEGER NOT NULL, last_kind TEXT, last_cursor TEXT, held_cursor TEXT, held_height INTEGER, held_txid TEXT, stop_cursor TEXT, stop_fault TEXT, tip_height INTEGER, tip_age_seconds INTEGER)";
+
+/// bsv-low #771 (L1b): the durable re-ask queue a chain event writes in its cursor's batch.
+pub const TRACKER_REASKS_CREATE: &str = "CREATE TABLE IF NOT EXISTS tracker_reasks (txid TEXT PRIMARY KEY, kind TEXT NOT NULL, height INTEGER NOT NULL, event_cursor TEXT NOT NULL, written_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)";
+
+/// bsv-low #771 (L1b): the drain's oldest-first read.
+pub const TRACKER_REASKS_AGE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS tracker_reasks_age ON tracker_reasks(written_at, txid)";
+
+/// bsv-low #771 (L1b): a fork's, reorg's or split's affected set, the mined rows at or above its height.
+pub const TX_WORDS_MINED_HEIGHT_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS tx_words_mined_height ON tx_words(height, txid) WHERE word = 'mined'";
+
+/// bsv-low #771 (L1b): an invalidated block's affected set, the mined rows whose proof names its header.
+pub const TX_WORDS_MINED_HEADER_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS tx_words_mined_header ON tx_words(header_hash, txid) WHERE word = 'mined'";
 
 /// bsv-low #621 (L5): who said SEEN (`ops::SeenSource::wire`); NULL on a row latched before it shipped.
 pub const NETWORK_SEEN_BY_ALTER: &str = "ALTER TABLE network_seen ADD COLUMN seenSource TEXT";
@@ -2217,6 +2239,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // served with `source: null` and its `seenAt` time; `networkSeen` itself is unchanged.
     NETWORK_SEEN_BY_ALTER,
     NETWORK_SEEN_BY_AT_ALTER,
+    // 337-341: bsv-low #771 (L1b), the app layer's chain-event intake: the feed cursor, the re-ask queue and its age
+    // index, and the two partial indexes that select a chain event's affected mined rows without a scan of `tx_words`.
+    TRACKER_CHAIN_EVENTS_CREATE,
+    TRACKER_REASKS_CREATE,
+    TRACKER_REASKS_AGE_INDEX,
+    TX_WORDS_MINED_HEIGHT_INDEX,
+    TX_WORDS_MINED_HEADER_INDEX,
 ];
 
 // =============================================================================

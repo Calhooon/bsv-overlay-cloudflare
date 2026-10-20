@@ -231,3 +231,5 @@ A new table: its CREATE in `OVERLAY_MIGRATIONS`, its row in `storage-ownership.j
 | `board_total` | overlay-cloudflare | derived | no | The count of every counted win, one row. |
 | `board_era` | overlay-cloudflare | transient | no | #674, the cutoff: the era cutoff the board is derived under, one row; the app layer's scheduled pass UPDATEs it from its `WRITTEN_OFF_BEFORE_MS` and `board_era_update` re-derives the board in that statement; `board_win_era` refuses a win before it. |
 | `tracker_backfill` | low-app-layer | re-askable | Bounded, resumed proof-only deploy cursor; a lost cursor restarts the pass. |
+| `tracker_chain_events` | low-app-layer | re-askable | #771: the chaintracks feed cursor, one row; a lost row replays the feed from 0 and re-queues the affected mined rows. |
+| `tracker_reasks` | low-app-layer | re-askable | #771: the re-ask queue a chain event writes in its cursor's batch, drained eight a pass; a lost entry is a mined row rechecked at its next read or event. |
