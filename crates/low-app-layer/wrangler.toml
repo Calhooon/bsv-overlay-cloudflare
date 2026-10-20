@@ -49,9 +49,12 @@ command = "cargo install -q --version ^0.8 worker-build && worker-build --releas
 [vars]
 AUTH_ENFORCE = "true"  # the promotion 2026-09-21: the identity reads enforced (C6), as proven on beta
 # bsv-low #441: the session lane (one BRC-103 handshake per origin, then a MAC'd lane
-# on `x-low-session*`). OFF on prod until the promotion decides; the store binding
-# must exist for the flag to mean anything (`session_lane_configured`).
-SESSION_LANE = "false"
+# on `x-low-session*`); the store binding must exist for the flag to mean anything
+# (`session_lane_configured`). ON on prod since bsv-low #773 (2026-10-20): beta has run
+# the lane since 2026-09-14 (D12); prod stayed off by this block alone, so every signed
+# app-layer read on prod paid a BRC-104 wallet signature and the relay legs R1/R2
+# could not pass there (record 817). The AUTH_SESSION_STORE DO is bound below.
+SESSION_LANE = "true"
 # The relay this worker pushes events to (its /broadcast rooms + /push boxes),
 # reached through the RELAY service binding; the URL names the path/host the
 # relay sees. Pushes no-op without the BROADCAST_TOKEN secret.
