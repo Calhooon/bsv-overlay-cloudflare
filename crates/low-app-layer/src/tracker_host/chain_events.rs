@@ -464,8 +464,169 @@ async fn step_event<S: SqlPort>(
 /// refuses stops the pull at its cursor, recorded on the row; a 409 resets the cursor to `0`; a transport or page
 /// fault ends the pull with the cursor kept.
 pub async fn pull<S: SqlPort, F: Feed>(sql: &S, feed: &F, now: u64) -> PullOutcome {
-    let _ = (sql, feed, now, step_event::<S>, advance_batch, parse_page, RESET);
-    PullOutcome::default()
+    let mut out = PullOutcome::default();
+    let count = |out: &mut PullOutcome, name: &str, n: u64| {
+        if n > 0 {
+            out.counters.push((name.to_string(), n));
+        }
+    };
+    let stored = match read_cursor(sql).await {
+        Ok(c) => c,
+        Err(e) => {
+            out.fault = Some(e);
+            count(&mut out, "tracker_chain_events_faults_total", 1);
+            return out;
+        }
+    };
+    let mut next = stored.clone();
+    let mut room = ROWS_PER_PASS;
+    'pages: for _ in 0..PAGES_PER_PASS {
+        let since = next.cursor.clone();
+        out.pages += 1;
+        let (status, body) = match feed.page(&since).await {
+            Ok(answer) => answer,
+            Err(e) => {
+                out.fault = Some(format!("events binding: {e}"));
+                break;
+            }
+        };
+        if status == 409 {
+            out.reset_from = Some(since);
+            break;
+        }
+        if status != 200 {
+            out.fault = Some(format!("events HTTP {status}"));
+            break;
+        }
+        let page = match parse_page(&body) {
+            Ok(p) => p,
+            Err(e) => {
+                out.fault = Some(e);
+                break;
+            }
+        };
+        for (at, envelope) in page.events {
+            if at <= next.position() {
+                continue;
+            }
+            let bytes = serde_json::to_vec(&envelope).unwrap_or_default();
+            let event = match decode_envelope(&bytes) {
+                Ok(event) => event,
+                Err(e) => {
+                    out.stopped = Some((at, e.to_string()));
+                    next.stop_cursor = Some(at.to_string());
+                    next.stop_fault = Some(e.to_string());
+                    break 'pages;
+                }
+            };
+            let resume = (next.held_cursor.as_deref() == Some(at.to_string().as_str()))
+                .then(|| {
+                    (
+                        next.held_height.map(|h| h as u32),
+                        next.held_txid.clone().unwrap_or_default(),
+                    )
+                });
+            match step_event(sql, &event, at, resume, room).await {
+                Ok(Stepped::Consumed(queued)) => {
+                    room -= queued.len().min(room);
+                    out.queued.extend(queued);
+                    out.consumed.push((at, kind_name(&event)));
+                    next.cursor = at.to_string();
+                    next.last_kind = Some(kind_name(&event).into());
+                    next.last_cursor = Some(at.to_string());
+                    next.held_cursor = None;
+                    next.held_height = None;
+                    next.held_txid = None;
+                    next.stop_cursor = None;
+                    next.stop_fault = None;
+                    match &event {
+                        ChainEvent::Tip { height, .. } => {
+                            next.tip_height = Some(f64::from(*height));
+                        }
+                        ChainEvent::TipAge { seconds, tip } => {
+                            next.tip_height = Some(f64::from(tip.height));
+                            next.tip_age_seconds = Some(*seconds as f64);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Stepped::Held(queued, height, txid)) => {
+                    out.queued.extend(queued);
+                    out.held = Some(at);
+                    next.held_cursor = Some(at.to_string());
+                    next.held_height = height.map(f64::from);
+                    next.held_txid = Some(txid);
+                    break 'pages;
+                }
+                Ok(Stepped::NoRoom) => break 'pages,
+                Err(e) => {
+                    out.fault = Some(e);
+                    break 'pages;
+                }
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+    }
+    if next != stored {
+        if let Err(e) = sql.run_batch(advance_batch(&out.queued, &next, now)).await {
+            out.fault = Some(format!("advance batch: {e}"));
+            out.queued.clear();
+            out.consumed.clear();
+            out.held = None;
+            next = stored.clone();
+        }
+    }
+    if let Some((at, fault)) = &out.stopped {
+        sql.log(&format!(
+            "[chain-events] STOPPED at cursor {at}: {fault} (the cursor is not passed; the operator reads the stored row)"
+        ));
+        if stored.stop_cursor.as_deref() != Some(at.to_string().as_str()) {
+            count(&mut out, "tracker_chain_events_unreadable_total", 1);
+        }
+    }
+    if let Some(old) = out.reset_from.clone() {
+        match sql
+            .run_batch(vec![stmt(RESET, vec![Bind::Int(now as i64), text(next.cursor.clone())])])
+            .await
+        {
+            Ok(_) => {
+                sql.log(&format!(
+                    "[chain-events] RESET: the feed answered 409 cursorAhead at cursor {old}; replaying from 0"
+                ));
+                count(&mut out, "tracker_chain_events_cursor_reset_total", 1);
+                next = Cursor {
+                    cursor: "0".into(),
+                    ..next
+                };
+            }
+            Err(e) => out.fault = Some(format!("reset: {e}")),
+        }
+    }
+    if let Some(fault) = &out.fault {
+        sql.log(&format!(
+            "[chain-events] pull ended at cursor {}: {fault}",
+            next.cursor
+        ));
+        count(&mut out, "tracker_chain_events_faults_total", 1);
+    }
+    let mut kinds: BTreeMap<&str, u64> = BTreeMap::new();
+    for (_, kind) in &out.consumed {
+        *kinds.entry(kind).or_default() += 1;
+    }
+    let consumed = out.consumed.len() as u64;
+    count(&mut out, "tracker_chain_events_total", consumed);
+    for (kind, n) in kinds {
+        count(&mut out, &format!("tracker_chain_events_{kind}_total"), n);
+    }
+    let queued = out.queued.len() as u64;
+    count(&mut out, "tracker_chain_events_queued_total", queued);
+    if out.held.is_some() {
+        count(&mut out, "tracker_chain_events_held_total", 1);
+    }
+    out.cursor = next;
+    out
 }
 
 /// What the drain did with one queued re-ask.
