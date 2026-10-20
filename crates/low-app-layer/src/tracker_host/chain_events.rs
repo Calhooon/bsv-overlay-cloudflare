@@ -1134,11 +1134,11 @@ pub fn note(counters: &[(String, u64)]) {
     }
 }
 
-/// `/health.chainEvents`: the cursor row as this isolate's last pass left it (no read route touches D1 for it), and
-/// this isolate's counters.
+/// `/health.chainEvents`: the cursor row as this isolate's last pass (or its lever) left it, `seed` and `startedAt`
+/// included (no read route touches D1 for it), and this isolate's counters.
 pub fn health_json() -> Value {
     let mut v = LAST.with(|l| l.borrow().as_ref().map(Cursor::health)).unwrap_or_else(|| {
-        json!({"cursor": null, "lastKind": null, "lastAt": null, "tipHeight": null, "tipAgeSeconds": null})
+        json!({"cursor": null, "lastKind": null, "lastAt": null, "tipHeight": null, "tipAgeSeconds": null, "seed": null, "startedAt": null})
     });
     v["counters"] = COUNTS.with(|c| json!(*c.borrow()));
     v
