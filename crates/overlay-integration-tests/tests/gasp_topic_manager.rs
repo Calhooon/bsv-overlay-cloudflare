@@ -10912,3 +10912,307 @@ async fn fix791_a_join_over_a_first_join_the_topic_holds_is_recorded_whatever_th
         wrong.join("\n")
     );
 }
+
+// ============================================================================
+// bsv-low #791, FIX-791-B (`docs/DESIGN-791-HOP-LEDGER-2026-10-20.md` in
+// bsv-low; the lens `docs/audit/FIX-791-lens-2026-10-20.md`, HIGH-1 and
+// MEDIUM-1). Beta's two parked letters are a JOIN over two seats' hops that
+// the hop ledger never recorded (the client's post is best-effort), each hop
+// over the previous hand's settle (which only `tm_pot` holds), up to the
+// previous JOIN, which `tm_lowfund_beta` holds. No body of either walk spends
+// a coin the topic holds and the manager names nothing, so neither JOIN has a
+// predecessor by D17's contract, and the reference records both. The walk
+// was refused at 16 and 18 counted reads: each unlanded body paid its applied
+// row, its outputs and one coin read per input, and a coin read into a
+// CARRIED body asks what that body's own outputs read answers for every
+// spender. Such a read now counts only once its body is found landed.
+//
+// The fixtures are the letters' bytes as the queue replays them (the inline
+// letter, and the R2 object) and beta's `applied_transactions` / `outputs`
+// rows of every body and every named source, read 2026-10-20 read-only. The
+// store is seeded with the hop ledger's rows alone (the question reads its
+// own topic): its applied rows, and its outputs with the script and value of
+// the carried body that made them.
+// ============================================================================
+
+const FIX791_TOPIC: &str = "tm_lowfund_beta";
+
+// The hop ledger under beta's topic name over `storage`.
+fn beta_hop_ledger(storage: ScriptedStore) -> Engine {
+    Engine::new(
+        HashMap::from([(
+            FIX791_TOPIC.to_string(),
+            Box::new(bsv_overlay_discovery::pot::lowfund_topic_manager::LowFundTopicManager::new())
+                as Box<dyn TopicManager>,
+        )]),
+        HashMap::new(),
+        Box::new(storage),
+        None,
+        EngineConfig::default(),
+    )
+}
+
+fn fix791_fixture(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/tests/fixtures/fix791/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
+// A store holding beta's hop ledger rows for the letter's bodies.
+async fn beta_rows(beef: &Beef) -> Rc<MemoryStorage> {
+    let rows: serde_json::Value =
+        serde_json::from_slice(&fix791_fixture("beta_rows.json")).unwrap();
+    let store = Rc::new(MemoryStorage::new());
+    for row in rows["applied_transactions"].as_array().unwrap() {
+        if row["topic"] != FIX791_TOPIC {
+            continue;
+        }
+        store
+            .insert_applied_transaction(&AppliedTransaction {
+                txid: row["txid"].as_str().unwrap().to_string(),
+                topic: FIX791_TOPIC.to_string(),
+            })
+            .await
+            .unwrap();
+    }
+    for row in rows["outputs"].as_array().unwrap() {
+        if row["topic"] != FIX791_TOPIC {
+            continue;
+        }
+        let txid = row["txid"].as_str().unwrap();
+        let index = row["outputIndex"].as_u64().unwrap() as u32;
+        // A row whose body this letter does not carry is another letter's.
+        let Some(body) = beef
+            .txs
+            .iter()
+            .find(|t| t.txid() == txid)
+            .and_then(|t| t.tx())
+        else {
+            continue;
+        };
+        let out = &body.outputs[index as usize];
+        store
+            .insert_output(&Output {
+                txid: txid.to_string(),
+                output_index: index,
+                output_script: out.locking_script.to_binary(),
+                satoshis: out.satoshis.unwrap_or_default(),
+                topic: FIX791_TOPIC.to_string(),
+                spent: row["spent"].as_i64().unwrap() != 0,
+                outputs_consumed: vec![],
+                consumed_by: vec![],
+                beef: None,
+                block_height: None,
+                score: None,
+            })
+            .await
+            .unwrap();
+    }
+    store
+}
+
+#[tokio::test]
+async fn fix791b_a_betas_two_parked_joins_land_in_the_hop_ledger() {
+    let (_logs, _guard) = capture_logs();
+    let mut wrong = Vec::new();
+    // (the letter, its subject, the sha256 of its bytes, its bodies).
+    for (file, subject, digest, bodies) in [
+        (
+            "2d548801.beef",
+            "2d5488015b04b92e443c6f5b1629f6869bc45c65353bc733edb9470496c96f71",
+            "3ce00adf76ac2431c24abeb6b17978e803bc1f7d33708ae90169e2717bc09d20",
+            15,
+        ),
+        (
+            "24df0d33.beef",
+            "24df0d33a6f601cc",
+            "8c8e407531a083b5160e7b3996febc5fab65733fc0a9775d10373e09cf3b5f10",
+            58,
+        ),
+    ] {
+        let bytes = fix791_fixture(file);
+        assert_eq!(
+            hex::encode(bsv_rs::primitives::hash::sha256(&bytes)),
+            digest,
+            "{file}: the letter's bytes"
+        );
+        let beef = Beef::from_binary(&bytes).unwrap();
+        assert_eq!(beef.txs.len(), bodies, "{file}");
+        let store = beta_rows(&beef).await;
+        let storage = ScriptedStore::plain(&store);
+        let reads = storage.reads.clone();
+        // As the queue replays a gated message (`lib.rs`): its mode, the
+        // network's accept on record.
+        let (_, r) = beta_hop_ledger(storage)
+            .submit_with_report_under(
+                &TaggedBEEF::new(bytes, vec![FIX791_TOPIC.to_string()]),
+                SubmitMode::HistoricalTxNoSpv,
+                bsv_overlay_engine::engine::WalkBreachPolicy::NetworkAccepted,
+            )
+            .await
+            .unwrap();
+        let txid = beef
+            .txs
+            .iter()
+            .map(|t| t.txid())
+            .find(|t| t.starts_with(subject))
+            .unwrap();
+        println!(
+            "#791-B: {file} ({txid}): {} reads, durable {} applied {:?} landed {:?} ({})",
+            reads.get(),
+            r.is_durable(),
+            r.applied_topics,
+            r.landed_predecessors,
+            r.summary()
+        );
+        let recorded = store
+            .does_applied_transaction_exist(&AppliedTransaction {
+                txid: txid.clone(),
+                topic: FIX791_TOPIC.to_string(),
+            })
+            .await
+            .unwrap();
+        if !r.is_durable() || r.applied_topics != vec![FIX791_TOPIC.to_string()] || !recorded {
+            wrong.push(format!(
+                "{file} ({txid}): recorded {recorded}: {}",
+                r.summary()
+            ));
+        }
+        // Nothing but the JOIN's applied row: it admits nothing (its one
+        // output is the pot covenant) and no body is a predecessor.
+        assert!(r.landed_predecessors.is_empty(), "{file}");
+        assert!(
+            store
+                .find_outputs_for_transaction(&txid, false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{file}"
+        );
+    }
+    assert!(
+        wrong.is_empty(),
+        "beta's parked JOINs are recorded under the hop ledger, as in the reference:\n{}",
+        wrong.join("\n")
+    );
+}
+
+// MEDIUM-1 of the lens, and the bound of the cure. A JOIN whose direct inputs
+// are six unlanded hops, then (last) the hand's first JOIN, which the topic
+// holds; each hop spends an output of `funding`. With `funding` CARRIED (one
+// unproven body over an outpoint no BEEF carries) a hop counts 2 reads (its
+// applied row, its outputs; its coin read into `funding` counts nothing once
+// `funding` is found unlanded) and `funding` 3: 15, recorded. On 4ec0507 a hop
+// counted 3, and the sixth was refused before the first JOIN was read. With
+// the hops over outpoints no BEEF carries (the lens's literal shape) each coin
+// read is the only read of its outpoint: 3 a hop, 18, "not now" (D17's stated
+// cost, unchanged). With the hops over the first JOIN itself (carried, LANDED)
+// each coin read says which of its outputs is held and counts: 18 once the
+// first JOIN is judged, "not now" (a walk that runs to its end never counts
+// more than 16).
+#[tokio::test]
+async fn fix791b_b_six_unlanded_hops_before_a_held_join_count_their_carried_sources_once() {
+    let (_logs, _guard) = capture_logs();
+    let mut wrong = Vec::new();
+    for (shape, recorded) in [("carried", true), ("absent", false), ("landed", false)] {
+        let store = Rc::new(MemoryStorage::new());
+        let mut first = Transaction::new();
+        first.inputs.push(absent_input(9000));
+        for _ in 0..7 {
+            first.outputs.push(pot_output(10_000));
+        }
+        store
+            .insert_applied_transaction(&AppliedTransaction {
+                txid: first.id(),
+                topic: TOPIC.to_string(),
+            })
+            .await
+            .unwrap();
+        let mut funding = Transaction::new();
+        funding.inputs.push(absent_input(8000));
+        for _ in 0..6 {
+            funding.outputs.push(pot_output(5000));
+        }
+        let mut join = Transaction::new();
+        for k in 0..6u32 {
+            let mut hop = Transaction::new();
+            hop.inputs.push(match shape {
+                "carried" => spend_of(&funding, k),
+                "absent" => absent_input(7000 + k),
+                _ => spend_of(&first, k),
+            });
+            hop.outputs.push(pot_output(4000));
+            join.inputs.push(spend_of(&hop, 0));
+        }
+        join.inputs.push(spend_of(&first, 6));
+        join.outputs.push(pot_output(15_000));
+        let storage = ScriptedStore::plain(&store);
+        let reads = storage.reads.clone();
+        let r = submitted(&hop_ledger(storage), &partial_beef(&join)).await;
+        let asked = reads.get() - 1 - join.inputs.len();
+        println!(
+            "#791-B M1: hops over a {shape} source: the question read {asked}, durable {} applied {:?} ({})",
+            r.is_durable(),
+            r.applied_topics,
+            r.summary()
+        );
+        let got = store
+            .does_applied_transaction_exist(&AppliedTransaction {
+                txid: join.id(),
+                topic: TOPIC.to_string(),
+            })
+            .await
+            .unwrap();
+        if got != recorded || r.is_durable() != recorded {
+            wrong.push(format!(
+                "{shape}: recorded {got}, expected {recorded}: {}",
+                r.summary()
+            ));
+        }
+        if !recorded {
+            assert_eq!(r.faults.len(), 1, "{shape}: {}", r.summary());
+            assert_eq!(r.faults[0].site, "predecessor_not_landed");
+            assert!(
+                r.faults[0].error.contains("ran out of its 16 reads"),
+                "{shape}: {}",
+                r.faults[0].error
+            );
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// LOW-1 of the lens: the dead letter is `not durable: ` and the report's
+// summary, which clipped every fault at 120 characters, so a 64-hex txid cut
+// the question's text before its figure ("the question ran out of it"). A
+// `predecessor_not_landed` fault now keeps its figure.
+#[tokio::test]
+async fn fix791b_c_the_letters_fault_text_keeps_the_budgets_figure() {
+    let report = bsv_overlay_engine::engine::MutationReport {
+        faults: vec![
+            bsv_overlay_engine::engine::MutationFault {
+                topic: "tm_lowfund_beta".to_string(),
+                site: "predecessor_not_landed",
+                error: format!(
+                    "{} is not known to have landed: the question ran out of its 16 reads",
+                    "25".repeat(32)
+                ),
+            },
+            bsv_overlay_engine::engine::MutationFault {
+                topic: "tm_lowfund_beta".to_string(),
+                site: "insert_output",
+                error: "x".repeat(500),
+            },
+        ],
+        ..Default::default()
+    };
+    let summary = report.summary();
+    assert!(
+        summary.contains("the question ran out of its 16 reads; "),
+        "{summary}"
+    );
+    // Every other fault is clipped as before.
+    assert!(summary.ends_with(&format!("insert_output: {}", "x".repeat(120))));
+}
