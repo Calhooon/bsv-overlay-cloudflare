@@ -228,6 +228,10 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             courier::note_presence("tracker_backfill_faulted_total");
             worker::console_warn!("[tracker-backfill] deferred: {e}");
         }
+        // bsv-low #771 (L1b): the chain-event intake, after the backfill, under its own one deadline: the feed pulled
+        // over the CHAINTRACKS binding on its durable cursor, each event's affected mined rows queued in the cursor's
+        // batch, then eight queued re-asks drained.
+        tracker_host::chain_events::run(&env).await;
         if let Err(e) = tracker_host::runtime::tick(&env).await {
             worker::console_warn!("[tracker-tick] deferred: {e}");
         }

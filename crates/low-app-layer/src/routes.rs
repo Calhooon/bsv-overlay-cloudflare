@@ -10175,6 +10175,8 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     // bsv-low #451 slice B: the isolate's courier tally (the durable one is the overlay's /health/invariants).
     body["couriers"] = crate::courier::health_json();
     body["trackerReask"] = crate::tracker_host::pacing::health_json();
+    // bsv-low #771 (L1b): the chain-event intake as this isolate's last scheduled pass left it (no D1 read here).
+    body["chainEvents"] = crate::tracker_host::chain_events::health_json();
     // bsv-low #497: the exchange rate's sample, its age and every rung's counts (this isolate's).
     body["rate"] = crate::rate::health_json(worker::Date::now().as_millis() as f64);
     // bsv-low #532: the identity views' outcomes per route and the budget (this isolate's).
