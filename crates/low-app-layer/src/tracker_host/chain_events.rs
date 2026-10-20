@@ -22,7 +22,6 @@ pub const INDEXES: [&str; 3] = [
     "CREATE INDEX IF NOT EXISTS tx_words_mined_header ON tx_words(header_hash, txid) WHERE word = 'mined'",
 ];
 
-
 use super::{stored::Row, HeaderSnapshot};
 use crate::pot_hook::{Bind, SqlPort, Stmt};
 use bsv_tracker::{
@@ -169,7 +168,9 @@ pub struct Queued {
 impl Queued {
     fn json(&self) -> Option<Value> {
         let (kind, height) = reask_columns(&self.reask)?;
-        Some(json!({"txid": self.txid, "kind": kind, "height": height, "cursor": self.cursor.to_string()}))
+        Some(
+            json!({"txid": self.txid, "kind": kind, "height": height, "cursor": self.cursor.to_string()}),
+        )
     }
 }
 
@@ -259,7 +260,10 @@ pub fn reask_of(row: &Row, event: &ChainEvent) -> Option<Reask> {
 /// height `Reask::Reorg { fork_height }`; a fork or a split there `Reask::Fork { height }`; an invalidation of the
 /// row's own header `Reask::Reorg` at the row's height; nothing else.
 pub fn host_reask(row: &Row, event: &ChainEvent) -> Option<Reask> {
-    let height = row.height.map(|h| h as u32).filter(|_| row.word == "mined")?;
+    let height = row
+        .height
+        .map(|h| h as u32)
+        .filter(|_| row.word == "mined")?;
     match event {
         ChainEvent::Reorg { fork_height, .. } if *fork_height <= height => Some(Reask::Reorg {
             fork_height: *fork_height,
@@ -306,7 +310,10 @@ pub fn advance_batch(queued: &[Queued], next: &Cursor, now: u64) -> Vec<Stmt> {
     if !entries.is_empty() {
         out.push(stmt(
             QUEUE,
-            vec![text(Value::Array(entries).to_string()), Bind::Int(now as i64)],
+            vec![
+                text(Value::Array(entries).to_string()),
+                Bind::Int(now as i64),
+            ],
         ));
     }
     out.push(stmt(
@@ -356,7 +363,10 @@ fn parse_page(body: &[u8]) -> Result<Page, String> {
         .as_bool()
         .ok_or("events page: hasMore missing")?;
     let mut events = Vec::new();
-    for item in v["events"].as_array().ok_or("events page: events missing")? {
+    for item in v["events"]
+        .as_array()
+        .ok_or("events page: events missing")?
+    {
         let c = match &item["cursor"] {
             Value::String(s) => parse_cursor(s),
             Value::Number(n) => n.as_u64(),
@@ -381,7 +391,11 @@ fn rows_of(out: Vec<crate::pot_hook::StmtOut>) -> Result<Vec<Row>, String> {
 /// The stored cursor, or the empty row's `0`.
 pub async fn read_cursor<S: SqlPort>(sql: &S) -> Result<Cursor, String> {
     let out = sql.run_batch(vec![stmt(STATE_READ, vec![])]).await?;
-    match out.into_iter().next().and_then(|o| o.rows.into_iter().next()) {
+    match out
+        .into_iter()
+        .next()
+        .and_then(|o| o.rows.into_iter().next())
+    {
         Some(row) => serde_json::from_value(row).map_err(|e| format!("tracker_chain_events: {e}")),
         None => Ok(Cursor::default()),
     }
@@ -519,8 +533,8 @@ pub async fn pull<S: SqlPort, F: Feed>(sql: &S, feed: &F, now: u64) -> PullOutco
                     break 'pages;
                 }
             };
-            let resume = (next.held_cursor.as_deref() == Some(at.to_string().as_str()))
-                .then(|| {
+            let resume =
+                (next.held_cursor.as_deref() == Some(at.to_string().as_str())).then(|| {
                     (
                         next.held_height.map(|h| h as u32),
                         next.held_txid.clone().unwrap_or_default(),
@@ -588,7 +602,10 @@ pub async fn pull<S: SqlPort, F: Feed>(sql: &S, feed: &F, now: u64) -> PullOutco
     }
     if let Some(old) = out.reset_from.clone() {
         match sql
-            .run_batch(vec![stmt(RESET, vec![Bind::Int(now as i64), text(next.cursor.clone())])])
+            .run_batch(vec![stmt(
+                RESET,
+                vec![Bind::Int(now as i64), text(next.cursor.clone())],
+            )])
             .await
         {
             Ok(_) => {
@@ -637,7 +654,7 @@ pub enum Drained {
     /// The stored proof's root is still the active header's: the row untouched, the entry deleted.
     Held,
     /// The row rewritten (`mined` from a fresh checked proof, or `stale`), the entry deleted in the same batch.
-    Rewritten(Row),
+    Rewritten(Box<Row>),
     /// Not judged this pass (`cannot_check` on a header fault, `faulted` on a fetch fault): one more attempt.
     Retry(&'static str),
 }
@@ -670,16 +687,18 @@ pub async fn drain_one<W: ReaskWorld>(
             let headers = world.headers(proof.height()).await;
             let mut fresh = State::new(&row.txid);
             match fresh.step(&PARAMS, &headers, Input::Evidence(Evidence::Proof(proof))) {
-                Ok(()) if matches!(fresh.word(), Word::Mined(_)) => {
-                    Drained::Rewritten(Row::from_state(&fresh, now, row.legacy_body.clone()))
-                }
+                Ok(()) if matches!(fresh.word(), Word::Mined(_)) => Drained::Rewritten(Box::new(
+                    Row::from_state(&fresh, now, row.legacy_body.clone()),
+                )),
                 _ => Drained::Retry("cannot_check"),
             }
         }
         Ok(None) => match stale {
-            Some(state) => {
-                Drained::Rewritten(Row::from_state(&state, now, row.legacy_body.clone()))
-            }
+            Some(state) => Drained::Rewritten(Box::new(Row::from_state(
+                &state,
+                now,
+                row.legacy_body.clone(),
+            ))),
             None => Drained::Retry("faulted"),
         },
     }
@@ -721,7 +740,10 @@ pub struct DrainOutcome {
 pub async fn drain<S: SqlPort, W: ReaskWorld>(sql: &S, world: &W, now: u64) -> DrainOutcome {
     let mut out = DrainOutcome::default();
     let read = match sql
-        .run_batch(vec![stmt(DRAIN_READ, vec![Bind::Int(DRAINS_PER_PASS as i64)])])
+        .run_batch(vec![stmt(
+            DRAIN_READ,
+            vec![Bind::Int(DRAINS_PER_PASS as i64)],
+        )])
         .await
     {
         Ok(read) => read,
@@ -751,7 +773,11 @@ pub async fn drain<S: SqlPort, W: ReaskWorld>(sql: &S, world: &W, now: u64) -> D
             Drained::Gone => ("gone", vec![stmt(DRAIN_DELETE, key)]),
             Drained::Held => ("held", vec![stmt(DRAIN_DELETE, key)]),
             Drained::Rewritten(row) => (
-                if row.word == "mined" { "mined" } else { "stale" },
+                if row.word == "mined" {
+                    "mined"
+                } else {
+                    "stale"
+                },
                 vec![upsert_stmt(&row), stmt(DRAIN_DELETE, key)],
             ),
             Drained::Retry(why) if attempts + 1 >= DRAIN_ATTEMPTS => {
@@ -788,6 +814,86 @@ pub async fn drain<S: SqlPort, W: ReaskWorld>(sql: &S, world: &W, now: u64) -> D
     out
 }
 
+/// The Worker's feed: the CHAINTRACKS service binding (Worker to Worker is a binding, never a URL fetch; the host
+/// below is only the path the callee sees, as `super::headers` reads it).
+pub struct BindingFeed<'a>(pub &'a worker::Env);
+
+impl Feed for BindingFeed<'_> {
+    async fn page(&self, since: &str) -> Result<(u16, Vec<u8>), String> {
+        let svc = self.0.service("CHAINTRACKS").map_err(|e| e.to_string())?;
+        let mut resp = svc
+            .fetch(format!("https://chaintracks/events?since={since}"), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status_code();
+        let body = resp.bytes().await.map_err(|e| e.to_string())?;
+        Ok((status, body))
+    }
+}
+
+/// The Worker's drain world: the host's headers over CHAINTRACKS and the existing courier ladder
+/// (`super::execute_reask`, Arcade first for a live-held subject), under `pacing.rs`'s circuits.
+pub struct WorkerReasks<'a> {
+    pub env: &'a worker::Env,
+    pub arcade: String,
+}
+
+impl ReaskWorld for WorkerReasks<'_> {
+    async fn headers(&self, height: u32) -> HeaderSnapshot {
+        super::headers(self.env, &[height]).await
+    }
+    async fn fresh_proof(&self, txid: &str, reask: &Reask) -> Result<Option<Proof>, String> {
+        let env = self.env;
+        let first_party = super::runtime::live_hold(env, txid).await.unwrap_or(false);
+        super::execute_reask(
+            txid,
+            first_party,
+            &self.arcade,
+            reask,
+            |url| async move { crate::routes::provider_get("tracker-reask", &url).await },
+            |height| async move { super::headers(env, &[height]).await },
+        )
+        .await
+    }
+}
+
+/// THE SCHEDULED STEP (`lib.rs` `scheduled`, after the backfill), under ONE deadline ([`WALL_MS`]): the indexes'
+/// catch-up, the pull and its step, then the drain. A pass the deadline drops has written only whole batches.
+pub async fn run(env: &worker::Env) {
+    use bsv_tracker::Clock;
+    let sql = match crate::routes::D1Sql::of(env) {
+        Ok(sql) => sql,
+        Err(e) => {
+            worker::console_warn!("[chain-events] no OVERLAY_DB: {e}");
+            return;
+        }
+    };
+    let deadline = crate::routes::worker_deadline(WALL_MS, 0);
+    let now = super::WorkerClock.now();
+    let pass = async {
+        for index in INDEXES {
+            if let Err(e) = sql.run_batch(vec![stmt(index, vec![])]).await {
+                sql.log(&format!("[chain-events] index deferred: {e}"));
+            }
+        }
+        let pulled = pull(&sql, &BindingFeed(env), now).await;
+        note(&pulled.counters);
+        if pulled.pages > 0 {
+            LAST.with(|l| *l.borrow_mut() = Some(pulled.cursor.clone()));
+        }
+        super::pacing::begin_tick(now / 900);
+        let world = WorkerReasks {
+            env,
+            arcade: crate::routes::arcade_url(),
+        };
+        note(&drain(&sql, &world, now).await.counters);
+    };
+    if deadline.run(pass).await.is_none() {
+        note(&[("tracker_chain_events_deadline_total".into(), 1)]);
+        worker::console_warn!("[chain-events] the pass met its {WALL_MS} ms deadline");
+    }
+}
+
 thread_local! {
     static LAST: RefCell<Option<Cursor>> = const { RefCell::new(None) };
     static COUNTS: RefCell<BTreeMap<String, u64>> = const { RefCell::new(BTreeMap::new()) };
@@ -811,7 +917,6 @@ pub fn health_json() -> Value {
     v["counters"] = COUNTS.with(|c| json!(*c.borrow()));
     v
 }
-
 
 #[cfg(test)]
 mod schema_pins {
@@ -938,10 +1043,12 @@ mod pins {
             .conn
             .prepare("SELECT txid, kind, height, event_cursor, attempts FROM tracker_reasks ORDER BY txid")
             .unwrap();
-        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
+        q.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
     }
     fn queued_txids(db: &SqliteSql) -> Vec<String> {
         queue_of(db).into_iter().map(|q| q.0).collect()
@@ -990,7 +1097,9 @@ mod pins {
                 .take(100)
                 .map(|(c, e)| json!({"cursor": c.to_string(), "event": e}))
                 .collect();
-            let cursor = after.iter().take(100).last().map_or(since_n, |e| e.0);
+            let cursor = after[..after.len().min(100)]
+                .last()
+                .map_or(since_n, |e| e.0);
             Ok((
                 200,
                 json!({"v": 1, "cursor": cursor.to_string(), "events": page, "hasMore": after.len() > 100})
@@ -1007,16 +1116,32 @@ mod pins {
     fn i771_a_the_recorded_envelopes_queue_exactly_the_rows_at_or_above_the_height() {
         let expect: [(&str, Vec<(u32, Reask)>); 8] = [
             (TIP, vec![]),
-            (FORK, (101..=103).map(|h| (h, Reask::Fork { height: 101 })).collect()),
-            (REORG, (101..=103).map(|h| (h, Reask::Reorg { fork_height: 101 })).collect()),
+            (
+                FORK,
+                (101..=103)
+                    .map(|h| (h, Reask::Fork { height: 101 }))
+                    .collect(),
+            ),
+            (
+                REORG,
+                (101..=103)
+                    .map(|h| (h, Reask::Reorg { fork_height: 101 }))
+                    .collect(),
+            ),
             (INVALIDATED, vec![(101, Reask::Reorg { fork_height: 101 })]),
             (FROZEN, vec![]),
             (TIP_AGE, vec![]),
-            (SPLIT, (101..=103).map(|h| (h, Reask::Fork { height: 101 })).collect()),
+            (
+                SPLIT,
+                (101..=103)
+                    .map(|h| (h, Reask::Fork { height: 101 }))
+                    .collect(),
+            ),
             (SPLIT_RESOLVED, vec![]),
         ];
         for (envelope, want) in expect {
-            let event = decode_envelope(envelope.as_bytes()).expect("the crate decodes the recorded envelope");
+            let event = decode_envelope(envelope.as_bytes())
+                .expect("the crate decodes the recorded envelope");
             let db = fixture();
             let out = block(pull(&db, &Journal::of(vec![(1, envelope)]), 2_000));
             assert_eq!(out.consumed.len(), 1, "{envelope}: {out:?}");
@@ -1033,7 +1158,11 @@ mod pins {
             // The crate's own step and the host's reproduction agree on every row, the unmined one included.
             for h in 99..=103 {
                 let row = mined(&txid(h), h, &header_of(h));
-                assert_eq!(reask_of(&row, &event), host_reask(&row, &event), "{h} {event:?}");
+                assert_eq!(
+                    reask_of(&row, &event),
+                    host_reask(&row, &event),
+                    "{h} {event:?}"
+                );
             }
         }
         // The whole scenario in order: the reorg supersedes the fork, the invalidation lands on the same row.
@@ -1065,7 +1194,10 @@ mod pins {
         assert_eq!(c.tip_age_seconds, Some(600.0));
         assert_eq!(counter(&out.counters, "tracker_chain_events_total"), 7);
         assert_eq!(counter(&out.counters, "tracker_chain_events_tip_total"), 2);
-        assert_eq!(counter(&out.counters, "tracker_chain_events_queued_total"), 7);
+        assert_eq!(
+            counter(&out.counters, "tracker_chain_events_queued_total"),
+            7
+        );
         assert_eq!(c.health()["tipAgeSeconds"], 600);
     }
 
@@ -1079,17 +1211,31 @@ mod pins {
             let out = block(pull(&db, &journal, 2_000));
             assert_eq!(out.consumed, vec![(1, "tip")], "{bad}");
             assert_eq!(out.stopped.as_ref().map(|s| s.0), Some(2));
-            assert!(queued_txids(&db).is_empty(), "nothing past the stop is queued");
+            assert!(
+                queued_txids(&db).is_empty(),
+                "nothing past the stop is queued"
+            );
             let c = stored_cursor(&db);
             assert_eq!(c.cursor, "1");
             assert_eq!(c.stop_cursor.as_deref(), Some("2"));
             assert!(c.stop_fault.is_some());
-            assert!(db.lines.borrow().iter().any(|l| l.contains("STOPPED at cursor 2")));
-            assert_eq!(counter(&out.counters, "tracker_chain_events_unreadable_total"), 1);
+            assert!(db
+                .lines
+                .borrow()
+                .iter()
+                .any(|l| l.contains("STOPPED at cursor 2")));
+            assert_eq!(
+                counter(&out.counters, "tracker_chain_events_unreadable_total"),
+                1
+            );
             let again = block(pull(&db, &journal, 2_100));
             assert!(again.consumed.is_empty());
             assert_eq!(again.stopped.as_ref().map(|s| s.0), Some(2));
-            assert_eq!(counter(&again.counters, "tracker_chain_events_unreadable_total"), 0, "counted once");
+            assert_eq!(
+                counter(&again.counters, "tracker_chain_events_unreadable_total"),
+                0,
+                "counted once"
+            );
             assert_eq!(stored_cursor(&db).cursor, "1");
         }
     }
@@ -1102,11 +1248,18 @@ mod pins {
             Err(bsv_tracker::DecodeError::UnknownKind(k)) if k == "unreadable"
         ));
         let db = fixture();
-        let out = block(pull(&db, &Journal::of(vec![(1, FORK), (2, UNREADABLE), (3, REORG)]), 2_000));
+        let out = block(pull(
+            &db,
+            &Journal::of(vec![(1, FORK), (2, UNREADABLE), (3, REORG)]),
+            2_000,
+        ));
         assert_eq!(out.consumed, vec![(1, "fork")]);
         assert_eq!(out.stopped.as_ref().map(|s| s.0), Some(2));
         assert_eq!(stored_cursor(&db).cursor, "1");
-        assert!(queue_of(&db).iter().all(|q| q.1 == "fork"), "the reorg past the stop is not stepped");
+        assert!(
+            queue_of(&db).iter().all(|q| q.1 == "fork"),
+            "the reorg past the stop is not stepped"
+        );
     }
 
     /// (d) A 409 `cursorAhead` resets the cursor to 0 ONCE, counted and logged with the old cursor; the next pass
@@ -1114,16 +1267,33 @@ mod pins {
     #[test]
     fn i771_d_cursor_ahead_resets_to_zero_once() {
         let db = fixture();
-        block(db.run_batch(advance_batch(&[], &Cursor { cursor: "50".into(), ..Cursor::default() }, 1)))
-            .unwrap();
+        block(db.run_batch(advance_batch(
+            &[],
+            &Cursor {
+                cursor: "50".into(),
+                ..Cursor::default()
+            },
+            1,
+        )))
+        .unwrap();
         let journal = Journal::of(vec![(1, TIP), (2, FORK)]);
         let out = block(pull(&db, &journal, 2_000));
         assert_eq!(out.reset_from.as_deref(), Some("50"));
-        assert_eq!(counter(&out.counters, "tracker_chain_events_cursor_reset_total"), 1);
-        assert!(db.lines.borrow().iter().any(|l| l.contains("409 cursorAhead at cursor 50")));
+        assert_eq!(
+            counter(&out.counters, "tracker_chain_events_cursor_reset_total"),
+            1
+        );
+        assert!(db
+            .lines
+            .borrow()
+            .iter()
+            .any(|l| l.contains("409 cursorAhead at cursor 50")));
         assert_eq!(stored_cursor(&db).cursor, "0");
         let next = block(pull(&db, &journal, 2_100));
-        assert_eq!(counter(&next.counters, "tracker_chain_events_cursor_reset_total"), 0);
+        assert_eq!(
+            counter(&next.counters, "tracker_chain_events_cursor_reset_total"),
+            0
+        );
         assert_eq!(next.consumed.len(), 2);
         assert_eq!(stored_cursor(&db).cursor, "2");
     }
@@ -1136,7 +1306,11 @@ mod pins {
         let mut journal = Journal::of(vec![(1, FORK), (1, FORK), (3, TIP), (5, INVALIDATED)]);
         journal.replay = true;
         let first = block(pull(&db, &journal, 2_000));
-        assert_eq!(first.consumed.len(), 3, "cursor 1 twice on one page is consumed once");
+        assert_eq!(
+            first.consumed.len(),
+            3,
+            "cursor 1 twice on one page is consumed once"
+        );
         let before = queue_of(&db);
         let second = block(pull(&db, &journal, 2_100));
         assert!(second.consumed.is_empty());
@@ -1167,7 +1341,10 @@ mod pins {
 
         struct SaveFaults(SqliteSql, Cell<u32>);
         impl SqlPort for SaveFaults {
-            async fn run_batch(&self, mut stmts: Vec<Stmt>) -> Result<Vec<crate::pot_hook::StmtOut>, String> {
+            async fn run_batch(
+                &self,
+                mut stmts: Vec<Stmt>,
+            ) -> Result<Vec<crate::pot_hook::StmtOut>, String> {
                 if stmts.iter().any(|s| s.sql == SAVE) {
                     self.1.set(self.1.get() + 1);
                     stmts.last_mut().unwrap().sql = "INSERT INTO no_such_table VALUES (1)".into();
@@ -1188,12 +1365,20 @@ mod pins {
         let out = block(pull(&db, &Journal::of(vec![(1, REORG)]), 2_000));
         assert_eq!(db.1.get(), 1, "one advance batch");
         assert!(out.fault.is_some());
-        assert!(queued_txids(&db.0).is_empty(), "the queue rolled back with the cursor");
+        assert!(
+            queued_txids(&db.0).is_empty(),
+            "the queue rolled back with the cursor"
+        );
         assert_eq!(stored_cursor(&db.0).cursor, "0");
         // The pull writes nothing outside that batch: its only other statements are reads.
         let src = include_str!("chain_events.rs");
-        let pull_src = &src[src.find("pub async fn pull<").unwrap()..src.find("/// What the drain did").unwrap()];
-        assert_eq!(pull_src.matches("run_batch(").count(), 2, "the advance batch and the reset, nothing else");
+        let pull_src = &src
+            [src.find("pub async fn pull<").unwrap()..src.find("/// What the drain did").unwrap()];
+        assert_eq!(
+            pull_src.matches("run_batch(").count(),
+            2,
+            "the advance batch and the reset, nothing else"
+        );
     }
 
     struct World {
@@ -1237,24 +1422,54 @@ mod pins {
                 reask: Reask::Reorg { fork_height: 101 },
                 cursor: 3,
             })
-            .chain([Queued { txid: txid(500), reask: Reask::Fork { height: 101 }, cursor: 3 }])
+            .chain([Queued {
+                txid: txid(500),
+                reask: Reask::Fork { height: 101 },
+                cursor: 3,
+            }])
             .collect();
-        block(db.run_batch(advance_batch(&queued, &Cursor { cursor: "3".into(), ..Cursor::default() }, 10)))
-            .unwrap();
+        block(db.run_batch(advance_batch(
+            &queued,
+            &Cursor {
+                cursor: "3".into(),
+                ..Cursor::default()
+            },
+            10,
+        )))
+        .unwrap();
         let untouched_before = word_of(&db, &txid(104));
         // The active chain after the reorg: 101 is B1 (another root), 102 is B2 (another root), 103 holds its root;
         // 101's transaction is re-mined at 105 (a fresh proof the host's headers check).
-        let header = |h: &str, root: &str| Ok(Some(Header { hash: h.into(), merkle_root: root.into() }));
+        let header = |h: &str, root: &str| {
+            Ok(Some(Header {
+                hash: h.into(),
+                merkle_root: root.into(),
+            }))
+        };
         let world = World {
             headers: BTreeMap::from([
-                (101, header("11d40824c809fb901bd1d593fdcae111008d3441abccc2e1c26879a2e5fd1105", &"aa".repeat(32))),
-                (102, header("3422cb84faba77c01514deff35bb5106a6b1027e7b19a9048b5b14e1876b40bf", &"bb".repeat(32))),
+                (
+                    101,
+                    header(
+                        "11d40824c809fb901bd1d593fdcae111008d3441abccc2e1c26879a2e5fd1105",
+                        &"aa".repeat(32),
+                    ),
+                ),
+                (
+                    102,
+                    header(
+                        "3422cb84faba77c01514deff35bb5106a6b1027e7b19a9048b5b14e1876b40bf",
+                        &"bb".repeat(32),
+                    ),
+                ),
                 (103, header(&header_of(103), &txid(103))),
                 (105, header(&header_of(105), &txid(101))),
             ]),
             proofs: BTreeMap::from([(
                 txid(101),
-                Ok(Some(Proof::new(txid(101), MerklePath::from_coinbase_txid(&txid(101), 105)).unwrap())),
+                Ok(Some(
+                    Proof::new(txid(101), MerklePath::from_coinbase_txid(&txid(101), 105)).unwrap(),
+                )),
             )]),
             asked: RefCell::default(),
         };
@@ -1264,17 +1479,47 @@ mod pins {
         assert_eq!(outcomes[&txid(102)], "stale");
         assert_eq!(outcomes[&txid(103)], "held");
         assert_eq!(outcomes[&txid(500)], "gone");
-        assert_eq!(word_of(&db, &txid(101)), ("mined".into(), Some(105), Some(header_of(105))));
+        assert_eq!(
+            word_of(&db, &txid(101)),
+            ("mined".into(), Some(105), Some(header_of(105)))
+        );
         assert_eq!(word_of(&db, &txid(102)).0, "stale");
-        assert_eq!(word_of(&db, &txid(103)), ("mined".into(), Some(103), Some(header_of(103))));
-        assert_eq!(word_of(&db, &txid(104)), untouched_before, "an unqueued row is not touched");
+        assert_eq!(
+            word_of(&db, &txid(103)),
+            ("mined".into(), Some(103), Some(header_of(103)))
+        );
+        assert_eq!(
+            word_of(&db, &txid(104)),
+            untouched_before,
+            "an unqueued row is not touched"
+        );
         assert_eq!(word_of(&db, &txid(99)).0, "mined");
-        assert_eq!(word_of(&db, &txid(500)).0, "seen", "a queued row that is not mined is not rewritten");
-        assert!(queue_of(&db).is_empty(), "every judged entry deleted with its rewrite");
-        assert_eq!(*world.asked.borrow(), vec![txid(101), txid(102)], "only a moved root asks the couriers");
-        assert_eq!(counter(&out.counters, "tracker_chain_events_reask_total"), 4);
-        assert_eq!(counter(&out.counters, "tracker_chain_events_reask_mined_total"), 1);
-        assert_eq!(counter(&out.counters, "tracker_chain_events_reask_stale_total"), 1);
+        assert_eq!(
+            word_of(&db, &txid(500)).0,
+            "seen",
+            "a queued row that is not mined is not rewritten"
+        );
+        assert!(
+            queue_of(&db).is_empty(),
+            "every judged entry deleted with its rewrite"
+        );
+        assert_eq!(
+            *world.asked.borrow(),
+            vec![txid(101), txid(102)],
+            "only a moved root asks the couriers"
+        );
+        assert_eq!(
+            counter(&out.counters, "tracker_chain_events_reask_total"),
+            4
+        );
+        assert_eq!(
+            counter(&out.counters, "tracker_chain_events_reask_mined_total"),
+            1
+        );
+        assert_eq!(
+            counter(&out.counters, "tracker_chain_events_reask_stale_total"),
+            1
+        );
     }
 
     /// (h) The bounds: two pages a pass; 256 rows an event, the rest walked on the next pass with the event HELD
@@ -1295,7 +1540,10 @@ mod pins {
         // 300 mined rows above the fork: 256 queued and the event held, then the 44 and the event passed.
         let db = SqliteSql::migrated();
         for i in 0..300u32 {
-            put(&db, &mined(&txid(10_000 + i), 200 + i / 7, &header_of(200 + i / 7)));
+            put(
+                &db,
+                &mined(&txid(10_000 + i), 200 + i / 7, &header_of(200 + i / 7)),
+            );
         }
         let journal = Journal::of(vec![(1, TIP), (2, REORG), (3, TIP_AGE)]);
         let first = block(pull(&db, &journal, 2_000));
@@ -1321,11 +1569,18 @@ mod pins {
         let out = block(drain(&db, &world, 3_000));
         assert_eq!(out.entries.len(), 8);
         assert_eq!(queue_of(&db).len(), 300);
-        let waiting: Vec<i64> = queue_of(&db).iter().map(|q| q.4).filter(|a| *a > 0).collect();
+        let waiting: Vec<i64> = queue_of(&db)
+            .iter()
+            .map(|q| q.4)
+            .filter(|a| *a > 0)
+            .collect();
         assert_eq!(waiting, vec![1; 8]);
         block(drain(&db, &world, 3_001));
         let third = block(drain(&db, &world, 3_002));
-        assert_eq!(counter(&third.counters, "tracker_chain_events_reask_dropped_total"), 8);
+        assert_eq!(
+            counter(&third.counters, "tracker_chain_events_reask_dropped_total"),
+            8
+        );
         assert_eq!(queue_of(&db).len(), 292);
     }
 
@@ -1334,24 +1589,41 @@ mod pins {
     fn i771_i_the_statements_walk_their_indexes() {
         let db = fixture();
         let plan = |sql: &str, n: usize| -> Vec<String> {
-            let mut q = db.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            let binds: Vec<rusqlite::types::Value> =
-                (0..n).map(|_| rusqlite::types::Value::Text("1".into())).collect();
-            q.query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(3))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
+            let mut q = db
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let binds: Vec<rusqlite::types::Value> = (0..n)
+                .map(|_| rusqlite::types::Value::Text("1".into()))
+                .collect();
+            q.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
         };
         for (sql, n, uses) in [
-            (AFFECTED_AT_OR_ABOVE, 3, "SEARCH tx_words USING INDEX tx_words_mined_height ((height,txid)>(?,?))"),
-            (AFFECTED_BY_HEADER, 3, "SEARCH tx_words USING INDEX tx_words_mined_header (header_hash=? AND txid>?)"),
+            (
+                AFFECTED_AT_OR_ABOVE,
+                3,
+                "SEARCH tx_words USING INDEX tx_words_mined_height ((height,txid)>(?,?))",
+            ),
+            (
+                AFFECTED_BY_HEADER,
+                3,
+                "SEARCH tx_words USING INDEX tx_words_mined_header (header_hash=? AND txid>?)",
+            ),
             (DRAIN_READ, 1, "tracker_reasks_age"),
             (DRAIN_DELETE, 2, "sqlite_autoindex_tracker_reasks_1"),
             (DRAIN_RETRY, 2, "sqlite_autoindex_tracker_reasks_1"),
             (STATE_READ, 0, "INTEGER PRIMARY KEY"),
         ] {
             let details = plan(sql, n);
-            assert!(details.iter().any(|d| d.contains(uses)), "{sql}: {details:?}");
+            assert!(
+                details.iter().any(|d| d.contains(uses)),
+                "{sql}: {details:?}"
+            );
             assert!(
                 !details.iter().any(|d| (d.starts_with("SCAN tx_words")
                     || d.starts_with("SCAN tracker_reasks"))
@@ -1360,9 +1632,50 @@ mod pins {
             );
             // The drain read's outer order sorts the at most DRAINS_PER_PASS rows its LIMIT took; nothing else sorts.
             if sql != DRAIN_READ {
-                assert!(!details.iter().any(|d| d.contains("USE TEMP B-TREE")), "{sql}: {details:?}");
+                assert!(
+                    !details.iter().any(|d| d.contains("USE TEMP B-TREE")),
+                    "{sql}: {details:?}"
+                );
             }
         }
-        assert!(plan(DRAIN_READ, 1).iter().any(|d| d.contains("SEARCH w USING INDEX sqlite_autoindex_tx_words_1")));
+        assert!(plan(DRAIN_READ, 1)
+            .iter()
+            .any(|d| d.contains("SEARCH w USING INDEX sqlite_autoindex_tx_words_1")));
+    }
+
+    /// The wiring: the scheduled pass runs the intake after the backfill and before the tick; no fetch handler and
+    /// no read route runs it (NS-3: no read writes a word); the feed is the CHAINTRACKS binding, never a URL fetch;
+    /// `/health` serves `chainEvents` from this isolate's memory, no D1 read.
+    #[test]
+    fn i771_the_scheduled_pass_alone_runs_the_intake_over_the_binding() {
+        let lib = include_str!("../lib.rs");
+        let at = |needle: &str| lib.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(
+            at("tracker_host::runtime::backfill(&env)")
+                < at("tracker_host::chain_events::run(&env)")
+        );
+        assert!(
+            at("tracker_host::chain_events::run(&env)") < at("tracker_host::runtime::tick(&env)")
+        );
+        assert!(at("tracker_host::chain_events::run(&env)") < at("pub async fn fetch("));
+        assert_eq!(lib.matches("chain_events::run(").count(), 1);
+        let routes = include_str!("../routes.rs");
+        for call in [
+            "chain_events::run(",
+            "chain_events::pull(",
+            "chain_events::drain(",
+        ] {
+            assert!(!routes.contains(call), "a route runs {call}");
+        }
+        let health = &routes[routes.find("pub fn health(").unwrap()..];
+        let health = &health[..health.find("\n}\n").unwrap()];
+        assert!(health.contains("chain_events::health_json()"));
+        let src = include_str!("chain_events.rs");
+        let feed = &src[src.find("impl Feed for BindingFeed").unwrap()
+            ..src.find("pub struct WorkerReasks").unwrap()];
+        assert!(feed.contains(".service(\"CHAINTRACKS\")"));
+        assert!(!feed.contains("Fetch::Url") && !feed.contains("Fetch::Request"));
+        let health_fn = &src[src.find("pub fn health_json()").unwrap()..];
+        assert!(!health_fn[..health_fn.find("\n}\n").unwrap()].contains("d1("));
     }
 }
