@@ -54,12 +54,10 @@ impl Row {
         };
         json!({"word":self.word,"tier":self.tier,"height":self.height.map(|h| h as u32),"verifyPath":verify,"source":self.hint_source,"at":self.hint_at.map(|t| t as u64)})
     }
-    /// One retained proof seeds a fresh State against its recorded snapshot;
-    /// the only current evidence input is Recheck. No historical input replay.
-    pub fn rechecked(&self, current: &HeaderSnapshot) -> Result<Value, String> {
-        if self.word != "mined" {
-            return Ok(self.view());
-        }
+    /// The stored mined row's State: its retained proof stepped against the snapshot it recorded (its own header),
+    /// so the word is `mined` with no re-ask. [`Row::rechecked`] and the chain-event intake
+    /// (`chain_events::reask_of`, `chain_events::drain_one`) step it on.
+    pub fn restored_state(&self) -> Result<State, String> {
         let path = overlay_engine::beef_limits::merkle_path_from_hex(
             self.proof_hex.as_deref().ok_or("missing stored proof")?,
             overlay_engine::beef_limits::COURIER_PROOF_MAX_BYTES,
@@ -83,10 +81,23 @@ impl Row {
             )]),
         };
         let mut state = State::new(&self.txid);
-        let params = Params { age_threshold: 60 };
         state
-            .step(&params, &old, Input::Evidence(Evidence::Proof(proof)))
+            .step(
+                &Params { age_threshold: 60 },
+                &old,
+                Input::Evidence(Evidence::Proof(proof)),
+            )
             .map_err(|e| e.to_string())?;
+        Ok(state)
+    }
+    /// One retained proof seeds a fresh State against its recorded snapshot;
+    /// the only current evidence input is Recheck. No historical input replay.
+    pub fn rechecked(&self, current: &HeaderSnapshot) -> Result<Value, String> {
+        if self.word != "mined" {
+            return Ok(self.view());
+        }
+        let mut state = self.restored_state()?;
+        let params = Params { age_threshold: 60 };
         let fault = state
             .step(&params, current, Input::Evidence(Evidence::Recheck))
             .err();
