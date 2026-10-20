@@ -283,6 +283,7 @@ where
     }
     Ok(None)
 }
+pub mod chain_events;
 pub mod served;
 
 pub mod stored;

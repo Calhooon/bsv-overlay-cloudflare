@@ -1623,6 +1623,36 @@
    "why": "Deleting restarts a bounded proof-only pass; no authority"
   },
   {
+   "name": "tracker_chain_events",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {
+    "low-app-layer": [
+     "CREATE"
+    ]
+   },
+   "readers": [],
+   "rebuild_class": "re-askable",
+   "never_wipe": false,
+   "holds": "the chaintracks chain-event feed cursor, one row (bsv-low #771)",
+   "why": "Deleting replays the feed from cursor 0: every event re-queues its affected mined rows, which the drain rechecks; no authority"
+  },
+  {
+   "name": "tracker_reasks",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {
+    "low-app-layer": [
+     "CREATE"
+    ]
+   },
+   "readers": [],
+   "rebuild_class": "re-askable",
+   "never_wipe": false,
+   "holds": "the durable re-ask queue a chain event writes with its cursor (bsv-low #771)",
+   "why": "A lost entry is a stored mined row not rechecked until the next event or read; the cursor reset replays it"
+  },
+  {
    "name": "gasp_fault_memo",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
