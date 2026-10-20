@@ -6,9 +6,10 @@
 //! D1 batch as the cursor's advance; the drain re-asks the queued rows, a few a pass. No read route writes here.
 
 /// The feed cursor, one row: the last cursor consumed and its stamp, the last event's kind and cursor, an event held
-/// across passes (its cursor and the sub-cursor of its affected rows), the envelope the pull stopped at, the tip.
+/// across passes (its cursor and the sub-cursor of its affected rows), the envelope the pull stopped at, the tip, and
+/// (FIX-771-L1) the cursor the row was first written at (`seed`: [`START_VAR`] or the operator's [`lever`]) and when.
 /// Byte-identical to the overlay's migration (`d1::TRACKER_CHAIN_EVENTS_CREATE`; the catch-up pin).
-pub const CREATE: &str = "CREATE TABLE IF NOT EXISTS tracker_chain_events (id INTEGER PRIMARY KEY CHECK (id = 1), cursor TEXT NOT NULL, at INTEGER NOT NULL, last_kind TEXT, last_cursor TEXT, held_cursor TEXT, held_height INTEGER, held_txid TEXT, stop_cursor TEXT, stop_fault TEXT, tip_height INTEGER, tip_age_seconds INTEGER)";
+pub const CREATE: &str = "CREATE TABLE IF NOT EXISTS tracker_chain_events (id INTEGER PRIMARY KEY CHECK (id = 1), cursor TEXT NOT NULL, at INTEGER NOT NULL, last_kind TEXT, last_cursor TEXT, held_cursor TEXT, held_height INTEGER, held_txid TEXT, stop_cursor TEXT, stop_fault TEXT, tip_height INTEGER, tip_age_seconds INTEGER, seed TEXT, started_at INTEGER)";
 
 /// The durable re-ask queue: one row per txid, the crate's `Reask` (`reorg` or `fork`) and its height, the cursor of
 /// the event that queued it, when, and the drain's failed attempts. Byte-identical to `d1::TRACKER_REASKS_CREATE`.
@@ -46,8 +47,46 @@ pub const WALL_MS: u64 = 25_000;
 
 const PARAMS: Params = Params { age_threshold: 60 };
 
-/// The row, or none before the first pass (the cursor `0`: the journal replays from its start).
-pub const STATE_READ: &str = "SELECT cursor, at, last_kind, last_cursor, held_cursor, held_height, held_txid, stop_cursor, stop_fault, tip_height, tip_age_seconds FROM tracker_chain_events WHERE id = 1";
+/// The row, or none before the first pass (the pull then seeds it from [`START_VAR`], or does not start).
+pub const STATE_READ: &str = "SELECT cursor, at, last_kind, last_cursor, held_cursor, held_height, held_txid, stop_cursor, stop_fault, tip_height, tip_age_seconds, seed, started_at FROM tracker_chain_events WHERE id = 1";
+
+/// FIX-771-L1 (bsv-low #771, record 845): where a FRESH consumer begins, a decimal cursor (`0` replays the journal).
+/// The production journal holds bootstrap-era rows the crate accepts (a fork at 956433, depth 13,906, and a reorg
+/// whose newTip is at 530359) that would queue most of the store; the intake's purpose is future events, so a
+/// deployment sets this to the journal's head. Unset or empty: the intake does not start ([`Start`]).
+pub const START_VAR: &str = "CHAIN_EVENTS_START_CURSOR";
+
+/// The seed of an ABSENT row: the cursor, its stamp, and the same two as `seed` / `started_at`. A row already there
+/// (a concurrent pass, the lever) is kept; the batch's [`STATE_READ`] after it reads whichever row stands.
+pub const SEED: &str = "INSERT INTO tracker_chain_events (id, cursor, at, seed, started_at) VALUES (1, ?1, ?2, ?1, ?2) ON CONFLICT(id) DO NOTHING";
+
+/// The operator's lever ([`lever`]): the cursor set to `?1` (back or forward, the operator's word), the held event and
+/// the recorded stop cleared, so the next pull asks `since=?1` and consumes only past it. An absent row is created
+/// with `seed` = `?1`. No other table is touched.
+pub const LEVER_SET: &str = "INSERT INTO tracker_chain_events (id, cursor, at, seed, started_at) VALUES (1, ?1, ?2, ?1, ?2) ON CONFLICT(id) DO UPDATE SET cursor = excluded.cursor, at = excluded.at, held_cursor = NULL, held_height = NULL, held_txid = NULL, stop_cursor = NULL, stop_fault = NULL";
+
+/// What [`START_VAR`] says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Start {
+    /// Unset or empty: no start cursor is configured, the intake pulls nothing.
+    Unset,
+    /// Not a feed cursor: treated as unset, its text logged.
+    Malformed(String),
+    /// Seed an absent row here.
+    At(String),
+}
+
+impl Start {
+    pub fn of(raw: Option<&str>) -> Start {
+        match raw.map(str::trim) {
+            None | Some("") => Start::Unset,
+            Some(t) => match parse_cursor(t) {
+                Some(n) => Start::At(n.to_string()),
+                None => Start::Malformed(t.to_string()),
+            },
+        }
+    }
+}
 
 /// A fork's, reorg's or split's affected set: the mined rows at or above its height, after the sub-cursor
 /// `(?1, ?2)` (the event's height and `''` to start), in `(height, txid)` order, `?3` at most. The partial index
@@ -96,6 +135,8 @@ pub struct Cursor {
     pub stop_fault: Option<String>,
     pub tip_height: Option<f64>,
     pub tip_age_seconds: Option<f64>,
+    pub seed: Option<String>,
+    pub started_at: Option<f64>,
 }
 
 impl Default for Cursor {
@@ -112,6 +153,8 @@ impl Default for Cursor {
             stop_fault: None,
             tip_height: None,
             tip_age_seconds: None,
+            seed: None,
+            started_at: None,
         }
     }
 }
@@ -132,6 +175,26 @@ impl Cursor {
             "heldCursor": self.held_cursor,
             "stopCursor": self.stop_cursor,
             "stopFault": self.stop_fault,
+            "seed": self.seed,
+            "startedAt": self.started_at.map(|t| t as u64),
+        })
+    }
+    /// The row whole, for the operator's read (`GET /internal/chain-events-cursor`).
+    pub fn whole(&self) -> Value {
+        json!({
+            "cursor": self.cursor,
+            "at": self.at.map(|t| t as u64),
+            "lastKind": self.last_kind,
+            "lastCursor": self.last_cursor,
+            "heldCursor": self.held_cursor,
+            "heldHeight": self.held_height.map(|h| h as u64),
+            "heldTxid": self.held_txid,
+            "stopCursor": self.stop_cursor,
+            "stopFault": self.stop_fault,
+            "tipHeight": self.tip_height.map(|h| h as u64),
+            "tipAgeSeconds": self.tip_age_seconds.map(|s| s as u64),
+            "seed": self.seed,
+            "startedAt": self.started_at.map(|t| t as u64),
         })
     }
 }
@@ -390,15 +453,19 @@ fn rows_of(out: Vec<crate::pot_hook::StmtOut>) -> Result<Vec<Row>, String> {
 
 /// The stored cursor, or the empty row's `0`.
 pub async fn read_cursor<S: SqlPort>(sql: &S) -> Result<Cursor, String> {
+    Ok(read_row(sql).await?.unwrap_or_default())
+}
+
+/// The stored row, or none.
+pub async fn read_row<S: SqlPort>(sql: &S) -> Result<Option<Cursor>, String> {
     let out = sql.run_batch(vec![stmt(STATE_READ, vec![])]).await?;
-    match out
-        .into_iter()
-        .next()
-        .and_then(|o| o.rows.into_iter().next())
-    {
-        Some(row) => serde_json::from_value(row).map_err(|e| format!("tracker_chain_events: {e}")),
-        None => Ok(Cursor::default()),
-    }
+    row_of(out.into_iter().next())
+}
+
+fn row_of(out: Option<crate::pot_hook::StmtOut>) -> Result<Option<Cursor>, String> {
+    out.and_then(|o| o.rows.into_iter().next())
+        .map(|row| serde_json::from_value(row).map_err(|e| format!("tracker_chain_events: {e}")))
+        .transpose()
 }
 
 enum Stepped {
@@ -477,7 +544,8 @@ async fn step_event<S: SqlPort>(
 /// A cursor at or below the stored one is never consumed again (delivery is at least once). An envelope the crate
 /// refuses stops the pull at its cursor, recorded on the row; a 409 resets the cursor to `0`; a transport or page
 /// fault ends the pull with the cursor kept.
-pub async fn pull<S: SqlPort, F: Feed>(sql: &S, feed: &F, now: u64) -> PullOutcome {
+pub async fn pull<S: SqlPort, F: Feed>(sql: &S, feed: &F, now: u64, start: &Start) -> PullOutcome {
+    let _ = start;
     let mut out = PullOutcome::default();
     let count = |out: &mut PullOutcome, name: &str, n: u64| {
         if n > 0 {
@@ -876,7 +944,8 @@ pub async fn run(env: &worker::Env) {
                 sql.log(&format!("[chain-events] index deferred: {e}"));
             }
         }
-        let pulled = pull(&sql, &BindingFeed(env), now).await;
+        let start = Start::of(env.var(START_VAR).ok().map(|v| v.to_string()).as_deref());
+        let pulled = pull(&sql, &BindingFeed(env), now, &start).await;
         note(&pulled.counters);
         if pulled.pages > 0 {
             LAST.with(|l| *l.borrow_mut() = Some(pulled.cursor.clone()));
@@ -892,6 +961,69 @@ pub async fn run(env: &worker::Env) {
         note(&[("tracker_chain_events_deadline_total".into(), 1)]);
         worker::console_warn!("[chain-events] the pass met its {WALL_MS} ms deadline");
     }
+}
+
+/// What the operator's lever answered: the status, the JSON body, the counters to note, and the row it read back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LeverAnswer {
+    pub status: u16,
+    pub body: Value,
+    pub counters: Vec<(String, u64)>,
+    pub row: Option<Cursor>,
+}
+
+fn refused(status: u16, error: impl Into<String>) -> LeverAnswer {
+    LeverAnswer {
+        status,
+        body: json!({"error": error.into()}),
+        counters: Vec::new(),
+        row: None,
+    }
+}
+
+/// THE OPERATOR'S LEVER (FIX-771-L1), `/internal/chain-events-cursor`, bearer `INTERNAL_TOKEN` (`authorized` is the
+/// caller's [`crate::internal_events::internal_bearer_ok`]). `GET` answers the row whole. `POST {"cursor":
+/// "<decimal>"}` sets the cursor ([`LEVER_SET`]: the held event and the recorded stop cleared, an absent row created
+/// with that `seed`) and answers the old and the new cursor, counted `tracker_chain_events_cursor_set_total` and
+/// logged with both. It is the way past a bootstrap row or an `unreadable` envelope the pull stopped at. It never
+/// touches `tracker_reasks` or `tx_words`.
+pub async fn lever<S: SqlPort>(
+    sql: &S,
+    authorized: bool,
+    post: bool,
+    body: &[u8],
+    now: u64,
+) -> LeverAnswer {
+    let _ = (sql, authorized, post, body, now);
+    refused(501, "not built")
+}
+
+/// The Worker's lever route: the bearer first (401 before any read), then [`lever`] over `OVERLAY_DB`.
+pub async fn internal_cursor(
+    mut req: worker::Request,
+    env: &worker::Env,
+) -> worker::Result<worker::Response> {
+    use bsv_tracker::Clock;
+    let authorized = crate::internal_events::internal_bearer_ok(&req, env);
+    if !authorized {
+        return worker::Response::error("unauthorized", 401);
+    }
+    let post = match req.method() {
+        worker::Method::Post => true,
+        worker::Method::Get => false,
+        _ => return worker::Response::error("method not allowed", 405),
+    };
+    let body = if post { req.bytes().await? } else { Vec::new() };
+    let sql = match crate::routes::D1Sql::of(env) {
+        Ok(sql) => sql,
+        Err(e) => return worker::Response::error(format!("no OVERLAY_DB: {e}"), 503),
+    };
+    let answer = lever(&sql, authorized, post, &body, super::WorkerClock.now()).await;
+    note(&answer.counters);
+    if post && answer.status == 200 {
+        LAST.with(|l| *l.borrow_mut() = answer.row.clone());
+    }
+    Ok(worker::Response::from_json(&answer.body)?.with_status(answer.status))
 }
 
 thread_local! {
@@ -1143,7 +1275,12 @@ mod pins {
             let event = decode_envelope(envelope.as_bytes())
                 .expect("the crate decodes the recorded envelope");
             let db = fixture();
-            let out = block(pull(&db, &Journal::of(vec![(1, envelope)]), 2_000));
+            let out = block(pull(
+                &db,
+                &Journal::of(vec![(1, envelope)]),
+                2_000,
+                &replay(),
+            ));
             assert_eq!(out.consumed.len(), 1, "{envelope}: {out:?}");
             let got: Vec<(String, String, i64)> =
                 queue_of(&db).into_iter().map(|q| (q.0, q.1, q.2)).collect();
@@ -1176,7 +1313,7 @@ mod pins {
             (6, INVALIDATED),
             (7, FROZEN),
         ]);
-        let out = block(pull(&db, &journal, 2_000));
+        let out = block(pull(&db, &journal, 2_000, &replay()));
         assert_eq!(out.consumed.len(), 7);
         assert_eq!(
             queue_of(&db),
@@ -1208,7 +1345,7 @@ mod pins {
         for bad in [UNKNOWN_KIND, UNKNOWN_VERSION, GO_SHAPE] {
             let db = fixture();
             let journal = Journal::of(vec![(1, TIP), (2, bad), (3, REORG)]);
-            let out = block(pull(&db, &journal, 2_000));
+            let out = block(pull(&db, &journal, 2_000, &replay()));
             assert_eq!(out.consumed, vec![(1, "tip")], "{bad}");
             assert_eq!(out.stopped.as_ref().map(|s| s.0), Some(2));
             assert!(
@@ -1228,7 +1365,7 @@ mod pins {
                 counter(&out.counters, "tracker_chain_events_unreadable_total"),
                 1
             );
-            let again = block(pull(&db, &journal, 2_100));
+            let again = block(pull(&db, &journal, 2_100, &replay()));
             assert!(again.consumed.is_empty());
             assert_eq!(again.stopped.as_ref().map(|s| s.0), Some(2));
             assert_eq!(
@@ -1252,6 +1389,7 @@ mod pins {
             &db,
             &Journal::of(vec![(1, FORK), (2, UNREADABLE), (3, REORG)]),
             2_000,
+            &replay(),
         ));
         assert_eq!(out.consumed, vec![(1, "fork")]);
         assert_eq!(out.stopped.as_ref().map(|s| s.0), Some(2));
@@ -1277,7 +1415,7 @@ mod pins {
         )))
         .unwrap();
         let journal = Journal::of(vec![(1, TIP), (2, FORK)]);
-        let out = block(pull(&db, &journal, 2_000));
+        let out = block(pull(&db, &journal, 2_000, &replay()));
         assert_eq!(out.reset_from.as_deref(), Some("50"));
         assert_eq!(
             counter(&out.counters, "tracker_chain_events_cursor_reset_total"),
@@ -1289,7 +1427,7 @@ mod pins {
             .iter()
             .any(|l| l.contains("409 cursorAhead at cursor 50")));
         assert_eq!(stored_cursor(&db).cursor, "0");
-        let next = block(pull(&db, &journal, 2_100));
+        let next = block(pull(&db, &journal, 2_100, &replay()));
         assert_eq!(
             counter(&next.counters, "tracker_chain_events_cursor_reset_total"),
             0
@@ -1305,14 +1443,14 @@ mod pins {
         let db = fixture();
         let mut journal = Journal::of(vec![(1, FORK), (1, FORK), (3, TIP), (5, INVALIDATED)]);
         journal.replay = true;
-        let first = block(pull(&db, &journal, 2_000));
+        let first = block(pull(&db, &journal, 2_000, &replay()));
         assert_eq!(
             first.consumed.len(),
             3,
             "cursor 1 twice on one page is consumed once"
         );
         let before = queue_of(&db);
-        let second = block(pull(&db, &journal, 2_100));
+        let second = block(pull(&db, &journal, 2_100, &replay()));
         assert!(second.consumed.is_empty());
         assert!(second.queued.is_empty());
         assert_eq!(queue_of(&db), before);
@@ -1362,7 +1500,7 @@ mod pins {
             }
         }
         let db = SaveFaults(fixture(), Cell::new(0));
-        let out = block(pull(&db, &Journal::of(vec![(1, REORG)]), 2_000));
+        let out = block(pull(&db, &Journal::of(vec![(1, REORG)]), 2_000, &replay()));
         assert_eq!(db.1.get(), 1, "one advance batch");
         assert!(out.fault.is_some());
         assert!(
@@ -1530,11 +1668,11 @@ mod pins {
         let db = fixture();
         let tips: Vec<(u64, &str)> = (1..=450).map(|c| (c, TIP)).collect();
         let journal = Journal::of(tips);
-        let out = block(pull(&db, &journal, 2_000));
+        let out = block(pull(&db, &journal, 2_000, &replay()));
         assert_eq!(out.pages, 2);
         assert_eq!(*journal.calls.borrow(), vec!["0", "100"]);
         assert_eq!(stored_cursor(&db).cursor, "200");
-        block(pull(&db, &journal, 2_001));
+        block(pull(&db, &journal, 2_001, &replay()));
         assert_eq!(stored_cursor(&db).cursor, "400");
 
         // 300 mined rows above the fork: 256 queued and the event held, then the 44 and the event passed.
@@ -1546,14 +1684,14 @@ mod pins {
             );
         }
         let journal = Journal::of(vec![(1, TIP), (2, REORG), (3, TIP_AGE)]);
-        let first = block(pull(&db, &journal, 2_000));
+        let first = block(pull(&db, &journal, 2_000, &replay()));
         assert_eq!(first.queued.len(), 256);
         assert_eq!(first.held, Some(2));
         let c = stored_cursor(&db);
         assert_eq!(c.cursor, "1", "the held event's cursor is not passed");
         assert_eq!(c.held_cursor.as_deref(), Some("2"));
         assert_eq!(queue_of(&db).len(), 256);
-        let second = block(pull(&db, &journal, 2_100));
+        let second = block(pull(&db, &journal, 2_100, &replay()));
         assert_eq!(second.queued.len(), 44);
         assert_eq!(second.consumed, vec![(2, "reorg"), (3, "tip_age")]);
         assert_eq!(stored_cursor(&db).cursor, "3");
@@ -1677,5 +1815,370 @@ mod pins {
         assert!(!feed.contains("Fetch::Url") && !feed.contains("Fetch::Request"));
         let health_fn = &src[src.find("pub fn health_json()").unwrap()..];
         assert!(!health_fn[..health_fn.find("\n}\n").unwrap()].contains("d1("));
+    }
+
+    // FIX-771-L1 (bsv-low #771, record 845): the start cursor and the operator's lever.
+
+    /// The pins' replay start (`0`): the journal from its first row, as every pin above reads it.
+    fn replay() -> Start {
+        Start::At("0".into())
+    }
+    fn rows_of_cursor_table(db: &SqliteSql) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM tracker_chain_events", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+    fn count_of(db: &SqliteSql, table: &str) -> i64 {
+        db.conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+    /// The production shape of record 845: a bootstrap fork and reorg the crate accepts, then a live tip.
+    fn bootstrap_journal() -> Journal {
+        Journal::of(vec![(147, FORK), (627, REORG), (700, TIP)])
+    }
+    fn post(cursor: &str) -> Vec<u8> {
+        json!({ "cursor": cursor }).to_string().into_bytes()
+    }
+
+    /// (a) An absent row with the var set seeds exactly that cursor (`seed`, `started_at`), and the first pull asks
+    /// `since=<seed>`: the bootstrap rows at or below it are never stepped, nothing is queued.
+    #[test]
+    fn i771b_a_an_absent_row_seeds_the_configured_cursor() {
+        let db = fixture();
+        let journal = bootstrap_journal();
+        let out = block(pull(&db, &journal, 2_000, &Start::At("627".into())));
+        assert_eq!(
+            journal.calls.borrow().first().map(String::as_str),
+            Some("627")
+        );
+        assert_eq!(out.consumed, vec![(700, "tip")]);
+        assert!(queued_txids(&db).is_empty(), "no bootstrap row is queued");
+        let row = stored_cursor(&db);
+        assert_eq!(row.cursor, "700");
+        assert_eq!(row.seed.as_deref(), Some("627"));
+        assert_eq!(row.started_at, Some(2_000.0));
+        assert!(db
+            .lines
+            .borrow()
+            .iter()
+            .any(|l| l.contains("SEEDED") && l.contains("627")));
+        // The var's own parse: a decimal feed cursor, canonical; anything else is no start.
+        assert_eq!(Start::of(Some("627")), Start::At("627".into()));
+        assert_eq!(Start::of(Some(" 0 ")), Start::At("0".into()));
+        assert_eq!(Start::of(Some("007")), Start::At("7".into()));
+    }
+
+    /// (b) An absent row with the var unset (or empty, or not a cursor) pulls nothing, logs and counts, and the next
+    /// pass does the same: no row is written, so a later configured pass still seeds.
+    #[test]
+    fn i771b_b_an_unconfigured_consumer_pulls_nothing_and_writes_nothing() {
+        assert_eq!(Start::of(None), Start::Unset);
+        assert_eq!(Start::of(Some("")), Start::Unset);
+        assert_eq!(Start::of(Some("  ")), Start::Unset);
+        assert_eq!(Start::of(Some("12a")), Start::Malformed("12a".into()));
+        assert_eq!(Start::of(Some("-1")), Start::Malformed("-1".into()));
+        for start in [Start::Unset, Start::Malformed("12a".into())] {
+            let db = fixture();
+            let journal = bootstrap_journal();
+            for pass in 0..2u64 {
+                let out = block(pull(&db, &journal, 2_000 + pass, &start));
+                assert_eq!(out.pages, 0, "{start:?}: nothing pulled");
+                assert!(out.consumed.is_empty() && out.queued.is_empty());
+                assert_eq!(
+                    counter(&out.counters, "tracker_chain_events_unconfigured_total"),
+                    1,
+                    "{start:?}: pass {pass} counted"
+                );
+                assert_eq!(rows_of_cursor_table(&db), 0, "{start:?}: no row written");
+            }
+            assert!(journal.calls.borrow().is_empty(), "the feed is never asked");
+            assert!(queued_txids(&db).is_empty());
+            let lines = db.lines.borrow();
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| l.contains("no start cursor is configured"))
+                    .count(),
+                2,
+                "one line a pass: {lines:?}"
+            );
+        }
+        // Configured later, it seeds.
+        let db = fixture();
+        block(pull(&db, &bootstrap_journal(), 2_000, &Start::Unset));
+        block(pull(
+            &db,
+            &bootstrap_journal(),
+            2_100,
+            &Start::At("700".into()),
+        ));
+        assert_eq!(stored_cursor(&db).seed.as_deref(), Some("700"));
+    }
+
+    /// (c) A present row ignores the var, whatever it says (set elsewhere, unset, malformed): the pull asks from the
+    /// stored cursor and the seed is the row's own.
+    #[test]
+    fn i771b_c_a_present_row_ignores_the_var() {
+        let db = fixture();
+        let journal = Journal::of(vec![(1, TIP), (2, TIP_AGE), (3, TIP)]);
+        block(pull(&db, &journal, 2_000, &Start::At("1".into())));
+        assert_eq!(stored_cursor(&db).cursor, "3");
+        for (i, start) in [
+            Start::At("0".into()),
+            Start::At("999".into()),
+            Start::Unset,
+            Start::Malformed("x".into()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            journal.calls.borrow_mut().clear();
+            let out = block(pull(&db, &journal, 2_100 + i as u64, &start));
+            assert_eq!(
+                journal.calls.borrow().first().map(String::as_str),
+                Some("3"),
+                "{start:?}"
+            );
+            assert_eq!(
+                counter(&out.counters, "tracker_chain_events_unconfigured_total"),
+                0
+            );
+            assert_eq!(stored_cursor(&db).seed.as_deref(), Some("1"), "{start:?}");
+            assert_eq!(stored_cursor(&db).started_at, Some(2_000.0));
+        }
+    }
+
+    /// (d) The lever sets the cursor, clears the held event and the recorded stop, answers the old and the new
+    /// cursor, counts and logs both; `tracker_reasks` and `tx_words` are untouched.
+    #[test]
+    fn i771b_d_the_lever_sets_the_cursor_and_clears_the_held_fields() {
+        let db = fixture();
+        let held = Cursor {
+            cursor: "3".into(),
+            held_cursor: Some("4".into()),
+            held_height: Some(101.0),
+            held_txid: Some(txid(101)),
+            stop_cursor: Some("5".into()),
+            stop_fault: Some("unknown kind".into()),
+            seed: None,
+            ..Cursor::default()
+        };
+        let q = vec![Queued {
+            txid: txid(102),
+            reask: Reask::Fork { height: 101 },
+            cursor: 3,
+        }];
+        block(db.run_batch(advance_batch(&q, &held, 1_500))).unwrap();
+        block(db.run_batch(vec![stmt(SEED, vec![text("0"), Bind::Int(1_000)])])).unwrap();
+        let reasks = queue_of(&db);
+        let words = count_of(&db, "tx_words");
+        let answer = block(lever(&db, true, true, &post("5"), 3_000));
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert_eq!(answer.body["old"], json!("3"));
+        assert_eq!(answer.body["new"], json!("5"));
+        assert_eq!(
+            counter(&answer.counters, "tracker_chain_events_cursor_set_total"),
+            1
+        );
+        let row = stored_cursor(&db);
+        assert_eq!(row.cursor, "5");
+        assert_eq!(row.at, Some(3_000.0));
+        assert_eq!(
+            (row.held_cursor, row.held_height, row.held_txid),
+            (None, None, None),
+            "the held sub-cursor cleared"
+        );
+        assert_eq!((row.stop_cursor, row.stop_fault), (None, None));
+        assert_eq!(answer.body["row"]["cursor"], json!("5"));
+        assert_eq!(queue_of(&db), reasks, "tracker_reasks untouched");
+        assert_eq!(count_of(&db, "tx_words"), words, "tx_words untouched");
+        assert!(db
+            .lines
+            .borrow()
+            .iter()
+            .any(|l| l.contains("CURSOR SET") && l.contains("3") && l.contains("5")));
+        // Backwards too (the operator's word), and an absent row is created with that seed.
+        let db = fixture();
+        let answer = block(lever(&db, true, true, &post("42"), 3_100));
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert_eq!(answer.body["old"], Value::Null);
+        let row = stored_cursor(&db);
+        assert_eq!(
+            (row.cursor.as_str(), row.seed.as_deref(), row.started_at),
+            ("42", Some("42"), Some(3_100.0))
+        );
+        let answer = block(lever(&db, true, true, &post("7"), 3_200));
+        assert_eq!(
+            (answer.body["old"].clone(), answer.body["new"].clone()),
+            (json!("42"), json!("7"))
+        );
+        assert_eq!(stored_cursor(&db).cursor, "7");
+        assert_eq!(
+            stored_cursor(&db).seed.as_deref(),
+            Some("42"),
+            "the seed is the row's first"
+        );
+        // The lever writes ONE statement and touches no other table.
+        let src = include_str!("chain_events.rs");
+        assert!(!LEVER_SET.contains("tracker_reasks") && !LEVER_SET.contains("tx_words"));
+        let body = &src[src.find("pub async fn lever<").unwrap()
+            ..src.find("/// The Worker's lever route").unwrap()];
+        assert!(!body.contains("QUEUE") && !body.contains("DRAIN_") && !body.contains("UPSERT"));
+    }
+
+    /// (e) The lever refuses a missing or wrong bearer (401, the sibling routes' answer, before any read), a
+    /// malformed body and a cursor that is not a decimal string (400), each by name, and writes nothing.
+    #[test]
+    fn i771b_e_the_lever_refuses_by_name() {
+        use crate::internal_events::bearer_matches;
+        assert!(bearer_matches(Some("Bearer tok"), Some("tok")));
+        assert!(!bearer_matches(Some("Bearer nope"), Some("tok")));
+        assert!(!bearer_matches(None, Some("tok")));
+        assert!(
+            !bearer_matches(Some("tok"), Some("tok")),
+            "the scheme is required"
+        );
+        assert!(
+            !bearer_matches(Some("Bearer "), Some("")),
+            "no secret, no door"
+        );
+        assert!(!bearer_matches(Some("Bearer tok"), None));
+        let db = fixture();
+        for post_it in [true, false] {
+            let answer = block(lever(&db, false, post_it, &post("5"), 3_000));
+            assert_eq!(answer.status, 401);
+            assert_eq!(answer.body["error"], json!("unauthorized"));
+        }
+        let cases: [(&[u8], &str); 8] = [
+            (b"not json", "malformed body"),
+            (b"[]", "malformed body"),
+            (br#"{}"#, "cursor is required"),
+            (br#"{"cursor": 5}"#, "cursor must be a decimal string"),
+            (br#"{"cursor": ""}"#, "cursor is not a decimal feed cursor"),
+            (
+                br#"{"cursor": "-1"}"#,
+                "cursor is not a decimal feed cursor",
+            ),
+            (
+                br#"{"cursor": "12a"}"#,
+                "cursor is not a decimal feed cursor",
+            ),
+            (
+                br#"{"cursor": "12345678901234567"}"#,
+                "cursor is not a decimal feed cursor",
+            ),
+        ];
+        for (body, name) in cases {
+            let answer = block(lever(&db, true, true, body, 3_000));
+            assert_eq!(answer.status, 400, "{}", String::from_utf8_lossy(body));
+            assert!(
+                answer.body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(name),
+                "{}: {}",
+                String::from_utf8_lossy(body),
+                answer.body
+            );
+            assert!(answer.counters.is_empty());
+        }
+        assert_eq!(rows_of_cursor_table(&db), 0, "nothing written");
+        // The route: bearer first, 401 as `/internal/tx-word`, both methods served before the front door.
+        let src = include_str!("chain_events.rs");
+        let route = &src[src.find("pub async fn internal_cursor(").unwrap()..];
+        let route = &route[..route.find("\n}\n").unwrap()];
+        assert!(route.contains("internal_bearer_ok(&req, env)"));
+        assert!(route.find("internal_bearer_ok").unwrap() < route.find("D1Sql::of").unwrap());
+        assert!(route.contains("Response::error(\"unauthorized\", 401)"));
+        let lib = include_str!("../lib.rs");
+        let at = |n: &str| lib.find(n).unwrap_or_else(|| panic!("{n}"));
+        assert!(
+            at("req.path() == \"/internal/chain-events-cursor\"")
+                < at("identity::is_front_door_exempt(")
+        );
+        assert!(lib.contains("tracker_host::chain_events::internal_cursor(req, &env)"));
+    }
+
+    /// (f) The lever's cursor is honoured by the next pull: it asks `since=<cursor>` and consumes nothing at or
+    /// below it, even when the feed serves those rows again (delivery is at least once).
+    #[test]
+    fn i771b_f_the_next_pull_honours_the_levers_cursor() {
+        let db = fixture();
+        let mut journal = Journal::of(vec![(1, FORK), (2, REORG), (3, TIP)]);
+        let answer = block(lever(&db, true, true, &post("2"), 3_000));
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        journal.replay = true;
+        let out = block(pull(&db, &journal, 3_100, &Start::Unset));
+        assert_eq!(
+            journal.calls.borrow().first().map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(out.consumed, vec![(3, "tip")]);
+        assert!(
+            queued_txids(&db).is_empty(),
+            "the fork and the reorg are not stepped"
+        );
+        assert_eq!(stored_cursor(&db).cursor, "3");
+        // Past a stop: the pull stopped at an unreadable row, the lever skips it, the next pull goes on.
+        let db = fixture();
+        let journal = Journal::of(vec![(1, TIP), (2, UNREADABLE), (3, TIP_AGE)]);
+        block(pull(&db, &journal, 2_000, &replay()));
+        assert_eq!(stored_cursor(&db).stop_cursor.as_deref(), Some("2"));
+        block(lever(&db, true, true, &post("2"), 2_100));
+        let out = block(pull(&db, &journal, 2_200, &replay()));
+        assert_eq!(out.consumed, vec![(3, "tip_age")]);
+        assert_eq!(stored_cursor(&db).stop_cursor, None);
+    }
+
+    /// (g) The served health object carries `seed` and `startedAt` (null before any pass), and the operator's read
+    /// answers the row whole.
+    #[test]
+    fn i771b_g_the_health_and_the_read_carry_the_seed() {
+        let db = fixture();
+        let out = block(pull(
+            &db,
+            &bootstrap_journal(),
+            2_000,
+            &Start::At("627".into()),
+        ));
+        let health = out.cursor.health();
+        assert_eq!(health["seed"], json!("627"));
+        assert_eq!(health["startedAt"], json!(2_000));
+        assert_eq!(health["cursor"], json!("700"));
+        let empty = health_json();
+        for key in ["seed", "startedAt", "cursor", "lastKind"] {
+            assert!(
+                empty.get(key).is_some(),
+                "/health.chainEvents.{key} before any pass"
+            );
+        }
+        let read = block(lever(&db, true, false, b"", 2_100));
+        assert_eq!(read.status, 200, "{}", read.body);
+        let row = &read.body["row"];
+        for key in [
+            "cursor",
+            "at",
+            "lastKind",
+            "lastCursor",
+            "heldCursor",
+            "heldHeight",
+            "heldTxid",
+            "stopCursor",
+            "stopFault",
+            "tipHeight",
+            "tipAgeSeconds",
+            "seed",
+            "startedAt",
+        ] {
+            assert!(row.get(key).is_some(), "the read carries {key}: {row}");
+        }
+        assert_eq!(row["seed"], json!("627"));
+        assert_eq!(row["lastKind"], json!("tip"));
+        assert!(read.counters.is_empty(), "a read counts nothing");
+        let none = block(lever(&fixture(), true, false, b"", 2_100));
+        assert_eq!((none.status, none.body["row"].clone()), (200, Value::Null));
     }
 }
