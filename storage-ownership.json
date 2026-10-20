@@ -1635,7 +1635,7 @@
    "rebuild_class": "re-askable",
    "never_wipe": false,
    "holds": "the chaintracks chain-event feed cursor, one row (bsv-low #771)",
-   "why": "Deleting replays the feed from cursor 0: every event re-queues its affected mined rows, which the drain rechecks; no authority"
+   "why": "Deleting stops the intake until it is re-seeded from CHAIN_EVENTS_START_CURSOR (unset: it pulls nothing) or set by the operator's lever (POST /internal/chain-events-cursor); a seed below the journal's head re-queues the affected mined rows of every event past it, which the drain rechecks; no authority"
   },
   {
    "name": "tracker_reasks",
