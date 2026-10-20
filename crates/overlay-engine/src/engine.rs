@@ -250,7 +250,11 @@ async fn hooked(
 /// the 17th of those is never made: out of reads is "not now" (the delta
 /// fold of 2026-10-07, M2). An unproven body still needs room under it for
 /// the reads that find it landed (one for an applied row, two for a held
-/// output): each is tested before it is made.
+/// output): each is tested before it is made. A coin read into a body the
+/// BEEF CARRIES is counted only once that body is found landed (bsv-low
+/// #791, FIX-791-B): found unlanded, its own outputs read answered it, so an
+/// unlanded body whose sources the BEEF carries counts two reads, not two
+/// plus one an input.
 const PREDECESSOR_READS: usize = 16;
 
 /// The most store reads [`Engine::unlanded_predecessor`] makes for one
@@ -264,6 +268,40 @@ const PREDECESSOR_READS: usize = 16;
 /// invocation's D1 allowance, is per invocation; 256 is the door's own unit
 /// ([`DoorBudget`]'s inputs per transaction), no derived figure.
 const PREDECESSOR_READS_PER_SUBMIT: usize = 256;
+
+/// The characters of a `predecessor_not_landed` fault that
+/// [`MutationReport::summary`] keeps (bsv-low #791, the lens's LOW-1). At
+/// the 120 of every other fault a 64-hex txid cut the text before its
+/// figure ("the question ran out of it"), so the dead letter could not tell
+/// the 16 from the 256. The longest text the question and the door write
+/// is 246 (an opener's reason, then "its landing and the re-judgement after
+/// it do not fit in the submit's 256 reads"); a store error inside one is
+/// still cut.
+pub const PREDECESSOR_FAULT_TEXT: usize = 320;
+
+/// A carried body the predecessor question found LANDED (bsv-low #791,
+/// FIX-791-B): the coin reads its unproven spenders made into it are counted
+/// against [`PREDECESSOR_READS`] now, since each said which of its outputs is
+/// held, which nothing else read. Past the 16 that way (only where the walk
+/// before the cure had already been refused) the answer is "not now", naming
+/// the last such spender, so a walk that runs to its end never counts more
+/// than 16.
+fn count_landed(
+    candidate: &str,
+    reads: &mut usize,
+    judged: &mut HashMap<String, bool>,
+    uncounted: &mut HashMap<String, Vec<String>>,
+) -> Option<String> {
+    judged.insert(candidate.to_string(), true);
+    let into = uncounted.remove(candidate).unwrap_or_default();
+    *reads += into.len();
+    (*reads > PREDECESSOR_READS).then(|| {
+        format!(
+            "{} is not known to have landed: the question ran out of its {PREDECESSOR_READS} reads (a coin read into {candidate}, landed)",
+            into.last().map_or("", String::as_str)
+        )
+    })
+}
 
 /// Why a successor must wait ([`Engine::unlanded_predecessor`]), and the
 /// unlanded predecessor whose body the BEEF carries, when the answer names
@@ -516,13 +554,21 @@ impl MutationReport {
     }
 
     /// One log line naming every fault (`topic/site: error`), each error
-    /// clipped so a D1 stack dump cannot flood the log stream.
+    /// clipped so a D1 stack dump cannot flood the log stream: at 120
+    /// characters, and a `predecessor_not_landed` fault at
+    /// [`PREDECESSOR_FAULT_TEXT`], so the line (and the dead letter it
+    /// becomes) keeps the budget's figure (bsv-low #791, the lens's LOW-1).
     #[must_use]
     pub fn summary(&self) -> String {
         self.faults
             .iter()
             .map(|f| {
-                let err: String = f.error.chars().take(120).collect();
+                let clip = if f.site == "predecessor_not_landed" {
+                    PREDECESSOR_FAULT_TEXT
+                } else {
+                    120
+                };
+                let err: String = f.error.chars().take(clip).collect();
                 format!("{}/{}: {}", f.topic, f.site, err)
             })
             .collect::<Vec<_>>()
@@ -2681,6 +2727,22 @@ impl Engine {
     /// spent one that landed by a held output (no applied row) is refused at
     /// its second read, and with 16 spent any unproven body at its first.
     ///
+    /// A coin read into a CARRIED body (bsv-low #791, FIX-791-B) asks "is
+    /// this output of it held here", which that body's own outputs read (every
+    /// output, every topic) answers for every spender. So it is counted only
+    /// once the body is found landed, when it said which output is held; a
+    /// body found unlanded makes the coin reads into it free. It is made all
+    /// the same, in the same order, and the 256 count it: the question's
+    /// reads and answers are unchanged, and only its count against the 16
+    /// can be lower, never higher, at any read. A coin read into a body the
+    /// BEEF does not carry is the only read of that outpoint and is counted
+    /// as before. Counting a landed body's coin reads late can pass the 16
+    /// only where the walk had already been refused before the cure; it is
+    /// then "not now", naming the spender, so a walk that runs to its end
+    /// counts at most 16. Measured: beta's two parked JOINs (#791, two seats'
+    /// unrecorded hops over their settles) counted 16 and 18 and were
+    /// refused; they count 12 and 13 now and are recorded.
+    ///
     /// "Proven" is the BEEF's word here: a body that carries a merkle path
     /// (a bump index) is counted as proven for the read bound ONLY. No proof
     /// is checked at this question; the SPV walk of the submit and the GASP
@@ -2698,8 +2760,9 @@ impl Engine {
     /// topic's question starts from what the earlier ones left.
     ///
     /// The costs, stated. A transaction that admits nothing, found no coin
-    /// and carries more UNPROVEN, UNLANDED bodies than 16 reads settle (five
-    /// single-input ancestors, fewer with more inputs), or a BEEF whose
+    /// and carries more UNPROVEN, UNLANDED bodies than 16 reads settle (eight
+    /// single-input ancestors in a carried chain, five over sources the BEEF
+    /// does not carry, fewer with more inputs), or a BEEF whose
     /// question needs more than 256 reads over the submit's topics (a
     /// landed body costs one read by its applied row or two by a held
     /// output, a proven, unlanded one two and one per input), is never
@@ -2787,6 +2850,24 @@ impl Engine {
         // The reads spent on bodies neither proven nor found landed.
         let mut reads = 0usize;
         let mut asked: HashSet<String> = HashSet::new();
+        // What the walk found of each CARRIED body it judged: `true` landed
+        // (an applied row or an output held), `false` neither (bsv-low #791,
+        // FIX-791-B). And, per carried body not yet judged, the coin reads an
+        // unproven spender made into it that are not yet counted against the
+        // 16: a coin read into a carried body is counted only once that body
+        // is found LANDED. Found unlanded, its own outputs read (every output
+        // in every topic) already said "nothing of it is held here", the
+        // fact each of those coin reads asked, so they were paid for twice
+        // and are never counted. Every read is still MADE, in the same order
+        // as before, and the 256 count every one; only the 16's count moves,
+        // and it is never higher than before at any read, so the walk is
+        // refused nowhere it was not and answers the same wherever it ran to
+        // its end before. On beta's two letters (a JOIN over two seats' hops
+        // the hop ledger never recorded, each hop over a settle) the walk
+        // counted 16 and 18 and was refused; it counts 12 and 13 now and
+        // records them, as the reference does.
+        let mut judged: HashMap<String, bool> = HashMap::new();
+        let mut uncounted: HashMap<String, Vec<String>> = HashMap::new();
         while let Some(candidate) = ask.pop_front() {
             if candidate.is_empty() || !asked.insert(candidate.clone()) {
                 continue;
@@ -2858,7 +2939,11 @@ impl Engine {
             *question_reads += 1;
             match stored(bound, self.storage.does_applied_transaction_exist(&record)).await {
                 Ok(false) => {}
-                Ok(true) => continue,
+                Ok(true) => match count_landed(&candidate, &mut reads, &mut judged, &mut uncounted)
+                {
+                    Some(why) => return wait(why),
+                    None => continue,
+                },
                 Err(e) => return unread(e),
             }
             if out_of(spent) {
@@ -2876,11 +2961,20 @@ impl Engine {
             .await
             {
                 Ok(outputs) if outputs.iter().all(|o| o.topic != topic) => {}
-                Ok(_) => continue,
+                Ok(_) => match count_landed(&candidate, &mut reads, &mut judged, &mut uncounted) {
+                    Some(why) => return wait(why),
+                    None => continue,
+                },
                 Err(e) => return unread(e),
             }
             // Not landed. With no body to walk, the manager's word is the
             // whole answer (E1D).
+            if body.is_some() {
+                // Found unlanded: nothing of it is held in the topic, so the
+                // coin reads into it are never counted (#791).
+                judged.insert(candidate.clone(), false);
+                uncounted.remove(&candidate);
+            }
             let Some((body, _)) = body else {
                 return wait(format!(
                     "{candidate} has not landed (the manager names it as history; the BEEF does not carry it)"
@@ -2891,13 +2985,28 @@ impl Engine {
                 if source.is_empty() {
                     continue;
                 }
-                if out_of(spent) {
+                // Counted against the 16 now: a coin read into a body the
+                // BEEF does not carry (nothing else will read that outpoint),
+                // or into a carried body found landed. Into a carried body
+                // found unlanded it is never counted; into one not yet
+                // judged it is counted when that body is found landed (#791,
+                // `judged` above). The 256 count it whatever it is.
+                let counts_now =
+                    !bodies.contains_key(&source) || judged.get(&source) == Some(&true);
+                if counts_now && out_of(spent) {
                     return out_of_reads();
                 }
                 if *question_reads >= PREDECESSOR_READS_PER_SUBMIT {
                     return out_of_allowance();
                 }
-                spent += 1;
+                if counts_now {
+                    spent += 1;
+                } else if !proven && !judged.contains_key(&source) {
+                    uncounted
+                        .entry(source.clone())
+                        .or_default()
+                        .push(candidate.clone());
+                }
                 *question_reads += 1;
                 let coin = stored(
                     bound,

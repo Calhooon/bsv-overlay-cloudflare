@@ -1050,7 +1050,22 @@ landed by a held output and no applied row is refused at its second read).
 "Proven" is the BEEF's word here (a body carrying a merkle path): no proof is
 checked at this question (the SPV walk and the anchor check are where proofs
 are checked), it switches the 16 off for that body and nothing else, and the
-256 do not ask it. A GASP finalize
+256 do not ask it. Since bsv-low #791 (FIX-791-B, 2026-10-20) a coin read
+into a body the BEEF CARRIES counts against the 16 only once that body is
+found landed: found unlanded, its own outputs read (every output, every
+topic) already answered it, so a body whose sources the BEEF carries counts
+two reads, not two plus one an input. The reads made are unchanged, read for
+read and in order, and the 256 count them all; the count against the 16 is
+never higher at any read, and a walk that runs to its end counts at most 16.
+It is what records beta's two parked JOINs (two seats' hops the hop ledger
+never got, over their settles: 16 and 18 counted, refused; now 12 and 13),
+pinned by `fix791b_a` over the letters' bytes and beta's rows (`--test
+gasp_topic_manager fix791b`). The 16 still bounds an honest hand's unproven
+depth (about eight carried single-input bodies); the owner's question, the
+bound and the hop ledger's content, is in bsv-low
+`docs/DESIGN-791-HOP-LEDGER-2026-10-20.md`. A `predecessor_not_landed`
+fault keeps 320 characters in `MutationReport::summary` (120 for every
+other site), so the dead letter keeps the budget's figure. A GASP finalize
 submit does not ask the store at all (its graph passed the anchor check, its
 in-graph parents were submitted just before it and the sequence stops at the
 first that does not land); it keeps the engine's own memory.
