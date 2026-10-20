@@ -306,6 +306,10 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     if req.method() == worker::Method::Post && req.path() == "/internal/tx-word" {
         return tracker_host::runtime::ingest(req, &env).await;
     }
+    // bsv-low #771 FIX-771-L1: the operator's chain-event cursor lever (POST sets, GET reads; bearer INTERNAL_TOKEN).
+    if req.path() == "/internal/chain-events-cursor" {
+        return tracker_host::chain_events::internal_cursor(req, &env).await;
+    }
 
     // W2-P4: first-party internal webhooks (bearer INTERNAL_TOKEN) — served
     // BEFORE the BRC-103 front door, exactly like the relay's /broadcast:
