@@ -543,16 +543,46 @@ async fn step_event<S: SqlPort>(
 /// event's affected rows (at most [`ROWS_PER_PASS`] over the pass) queued in the batch that advances the cursor.
 /// A cursor at or below the stored one is never consumed again (delivery is at least once). An envelope the crate
 /// refuses stops the pull at its cursor, recorded on the row; a 409 resets the cursor to `0`; a transport or page
-/// fault ends the pull with the cursor kept.
+/// fault ends the pull with the cursor kept. An ABSENT row (FIX-771-L1) is seeded from `start` ([`SEED`], one batch
+/// with its read-back) before the first page; with no start configured the pull asks nothing and writes nothing.
 pub async fn pull<S: SqlPort, F: Feed>(sql: &S, feed: &F, now: u64, start: &Start) -> PullOutcome {
-    let _ = start;
     let mut out = PullOutcome::default();
     let count = |out: &mut PullOutcome, name: &str, n: u64| {
         if n > 0 {
             out.counters.push((name.to_string(), n));
         }
     };
-    let stored = match read_cursor(sql).await {
+    let read = match read_row(sql).await {
+        Ok(None) => match start {
+            Start::At(seed) => sql
+                .run_batch(vec![
+                    stmt(SEED, vec![text(seed.clone()), Bind::Int(now as i64)]),
+                    stmt(STATE_READ, vec![]),
+                ])
+                .await
+                .and_then(|o| row_of(o.into_iter().nth(1)))
+                .and_then(|row| row.ok_or_else(|| "seed: no row read back".to_string()))
+                .inspect(|row| {
+                    sql.log(&format!(
+                        "[chain-events] SEEDED the cursor at {} from {START_VAR}={seed}",
+                        row.cursor
+                    ))
+                }),
+            Start::Unset | Start::Malformed(_) => {
+                let said = match start {
+                    Start::Malformed(t) => format!(" ({START_VAR}={t:?} is not a decimal cursor)"),
+                    _ => String::new(),
+                };
+                sql.log(&format!(
+                    "[chain-events] no start cursor is configured{said}: the intake pulls nothing (set {START_VAR} to the journal's head, or POST /internal/chain-events-cursor)"
+                ));
+                count(&mut out, "tracker_chain_events_unconfigured_total", 1);
+                return out;
+            }
+        },
+        other => other.map(|row| row.unwrap_or_default()),
+    };
+    let stored = match read {
         Ok(c) => c,
         Err(e) => {
             out.fault = Some(e);
@@ -1514,8 +1544,8 @@ mod pins {
             [src.find("pub async fn pull<").unwrap()..src.find("/// What the drain did").unwrap()];
         assert_eq!(
             pull_src.matches("run_batch(").count(),
-            2,
-            "the advance batch and the reset, nothing else"
+            3,
+            "the seed of an absent row (FIX-771-L1, the cursor row alone), the advance batch and the reset, nothing else"
         );
     }
 
