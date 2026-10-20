@@ -1024,8 +1024,72 @@ pub async fn lever<S: SqlPort>(
     body: &[u8],
     now: u64,
 ) -> LeverAnswer {
-    let _ = (sql, authorized, post, body, now);
-    refused(501, "not built")
+    if !authorized {
+        return refused(401, "unauthorized");
+    }
+    if !post {
+        return match read_row(sql).await {
+            Ok(row) => LeverAnswer {
+                status: 200,
+                body: json!({ "row": row.as_ref().map(Cursor::whole) }),
+                counters: Vec::new(),
+                row,
+            },
+            Err(e) => refused(503, format!("read: {e}")),
+        };
+    }
+    let Ok(Value::Object(posted)) = serde_json::from_slice::<Value>(body) else {
+        return refused(400, "malformed body: expected {\"cursor\": \"<decimal>\"}");
+    };
+    let cursor = match posted.get("cursor") {
+        None => return refused(400, "cursor is required"),
+        Some(Value::String(c)) => c,
+        Some(other) => {
+            return refused(400, format!("cursor must be a decimal string, not {other}"))
+        }
+    };
+    let Some(cursor) = parse_cursor(cursor).map(|n| n.to_string()) else {
+        return refused(
+            400,
+            format!("cursor is not a decimal feed cursor: {cursor:?}"),
+        );
+    };
+    let out = match sql
+        .run_batch(vec![
+            stmt(STATE_READ, vec![]),
+            stmt(LEVER_SET, vec![text(cursor.clone()), Bind::Int(now as i64)]),
+            stmt(STATE_READ, vec![]),
+        ])
+        .await
+    {
+        Ok(out) => out,
+        Err(e) => return refused(503, format!("lever batch: {e}")),
+    };
+    let mut out = out.into_iter();
+    let old = match row_of(out.next()) {
+        Ok(old) => old,
+        Err(e) => return refused(503, e),
+    };
+    let new = match row_of(out.nth(1)) {
+        Ok(new) => new,
+        Err(e) => return refused(503, e),
+    };
+    let old_cursor = old.as_ref().map(|r| r.cursor.clone());
+    sql.log(&format!(
+        "[chain-events] CURSOR SET by the operator: {} -> {cursor} (the held event and the stop cleared)",
+        old_cursor.as_deref().unwrap_or("none")
+    ));
+    LeverAnswer {
+        status: 200,
+        body: json!({
+            "ok": true,
+            "old": old_cursor,
+            "new": cursor,
+            "row": new.as_ref().map(Cursor::whole),
+        }),
+        counters: vec![("tracker_chain_events_cursor_set_total".into(), 1)],
+        row: new,
+    }
 }
 
 /// The Worker's lever route: the bearer first (401 before any read), then [`lever`] over `OVERLAY_DB`.
