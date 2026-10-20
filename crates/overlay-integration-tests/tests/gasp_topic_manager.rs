@@ -5577,13 +5577,18 @@ async fn delta559_m1_x9_a_read_fault_inside_the_predecessor_question_is_not_now(
 // head past the bound was recorded: after every replay the chain stopped
 // behind it for good. Now out of reads is "not now". Since the second delta
 // fold of 2026-10-07 the bound counts the reads of bodies the BEEF does not
-// prove (head 1 carries its proof here, so its three reads are free): head 7
-// spends 15 counted reads on heads 6 to 2 and is answered by the store on
-// head 1, head 8 runs out on its 16th counted read.
+// prove (head 1 carries its proof here, so its three reads are free). Since
+// bsv-low #791 (FIX-791-B) a coin read into a CARRIED body counts only once
+// that body is found landed: each unproven head's coin read goes into the
+// head below it, carried and found unlanded, so a head counts two reads (its
+// applied row, its outputs) where it counted three. The reads MADE are the
+// same, read for read; the boundary moved: head 10 spends 16 counted reads on
+// heads 9 to 2 and is answered by the store on head 1 (it was head 7, at 15),
+// head 11 runs out on head 2 (it was head 8).
 #[tokio::test]
 async fn delta559_m2_x7_the_read_bound_of_the_predecessor_question_is_sixteen_and_not_now() {
     let (_logs, _guard) = capture_logs();
-    let nodes = chain(10);
+    let nodes = chain(13);
     let store = Rc::new(MemoryStorage::new());
     let calls = Calls::default();
     let scripted = ScriptedStore::armed(&store, node_txid(&nodes[1]), 0, InsertEvent::Faults);
@@ -5595,7 +5600,7 @@ async fn delta559_m2_x7_the_read_bound_of_the_predecessor_question_is_sixteen_an
     assert!(!submitted(&a, &proven_beef(&nodes[1])).await.is_durable());
     drop(a);
 
-    for k in 2..=8 {
+    for k in 2..=11 {
         // Head 1's insert stays refused: the landing the door tries first
         // (the E1D lens fold, M1) does not land, so the bound is what is
         // measured.
@@ -5619,26 +5624,30 @@ async fn delta559_m2_x7_the_read_bound_of_the_predecessor_question_is_sixteen_an
             "head {k}: {}",
             r.summary()
         );
-        // Up to head 7 the store answers (head 1 has not landed) and the
+        // Up to head 10 the store answers (head 1 has not landed) and the
         // door then submits head 1 first, three reads of that submit's own
         // (its applied row, its coin, the read-back of its refused insert);
-        // head 8 runs out of its 16 counted reads on head 2. Each then reads
-        // its own outputs once before it answers "not now" (the E1D lens
-        // fold, L4).
+        // head 11 runs out of its 16 counted reads on head 2, after the 24
+        // reads of heads 10 to 3. Each then reads its own outputs once before
+        // it answers "not now" (the E1D lens fold, L4).
         assert_eq!(
             asked,
-            if k <= 7 { 3 * (k - 1) + 3 + 1 } else { 16 + 1 },
+            if k <= 10 {
+                3 * (k - 1) + 3 + 1
+            } else {
+                3 * 8 + 1
+            },
             "head {k}"
         );
         assert_eq!(
             r.summary().contains("is not known to have landed"),
-            k == 8,
+            k == 11,
             "head {k}: {}",
             r.summary()
         );
         assert_eq!(
             applied_rows(&store, &nodes).await[1..],
-            [false; 9],
+            [false; 12],
             "head {k} is not recorded"
         );
     }
@@ -5649,12 +5658,12 @@ async fn delta559_m2_x7_the_read_bound_of_the_predecessor_question_is_sixteen_an
             .await
             .is_durable()
     );
-    for k in 2..=9 {
+    for k in 2..=12 {
         let r = submitted(&head_door(&store, &calls), &unproven_beef(&nodes, k, 1)).await;
         assert!(r.is_durable(), "head {k}: {}", r.summary());
     }
-    assert_eq!(rows(&store, &nodes).await, ["9:spent=false"], "the tip");
-    assert_eq!(applied_rows(&store, &nodes).await, [true; 10]);
+    assert_eq!(rows(&store, &nodes).await, ["12:spent=false"], "the tip");
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 13]);
 }
 
 // ============================================================================
@@ -10791,7 +10800,9 @@ fn spend_of(parent: &Transaction, vout: u32) -> TransactionInput {
 // topic never saw (each one output, no P2PKH), the first of them over
 // `1 + extra` outpoints whose bodies the BEEF does not carry. The walk reads
 // each body's applied row, its outputs and one coin per input: `3 * hops +
-// extra` reads, every one counted against the 16. The last hop.
+// extra` reads. Since FIX-791-B a coin read into a carried body found
+// unlanded is not counted against the 16 (the hop below answers it with its
+// own outputs read), so `2 * hops + 1 + extra` are counted. The last hop.
 fn unseen_funding(hops: usize, extra: u32) -> Transaction {
     let mut tx = Transaction::new();
     for n in 0..=extra {
@@ -10827,15 +10838,19 @@ async fn fix791_a_join_over_a_first_join_the_topic_holds_is_recorded_whatever_th
     let mut wrong = Vec::new();
     // (the identity's hop rows held, the funding hops, extra absent inputs
     // of the deepest, recorded): the funding ancestry at 16 reads (5 hops,
-    // one extra input) is the beta shape (the first JOIN named); at 18 (6
-    // hops) the walk runs out inside that ancestry, which the 16 still
-    // bound (D17's stated cost, unchanged).
+    // one extra input) was the beta shape on 9878684 (the first JOIN named).
+    // Counted since FIX-791-B at two a hop and one an absent input: 6 hops
+    // count 13; 7 hops and one extra 16, recorded; 8 hops 17, and the walk
+    // runs out inside that ancestry, which the 16 still bound (D17's stated
+    // cost, unchanged).
     for (rows, hops, extra, recorded) in [
         (0usize, 4usize, 0u32, true),
         (0, 5, 0, true),
         (0, 5, 1, true),
         (300, 5, 1, true),
-        (300, 6, 0, false),
+        (300, 6, 0, true),
+        (300, 7, 1, true),
+        (300, 8, 0, false),
     ] {
         let store = Rc::new(MemoryStorage::new());
         // The flood's rows: hops of one identity, each applied and held.
