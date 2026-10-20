@@ -719,8 +719,73 @@ pub struct DrainOutcome {
 /// one batch of its own: the row's rewrite and the entry's delete together, or the entry's delete alone, or one more
 /// attempt (the [`DRAIN_ATTEMPTS`]th failure drops it, counted). No row but the entry's own is touched.
 pub async fn drain<S: SqlPort, W: ReaskWorld>(sql: &S, world: &W, now: u64) -> DrainOutcome {
-    let _ = (sql, world, now, drain_one::<W>, upsert_stmt);
-    DrainOutcome::default()
+    let mut out = DrainOutcome::default();
+    let read = match sql
+        .run_batch(vec![stmt(DRAIN_READ, vec![Bind::Int(DRAINS_PER_PASS as i64)])])
+        .await
+    {
+        Ok(read) => read,
+        Err(e) => {
+            out.fault = Some(e);
+            out.counters
+                .push(("tracker_chain_events_faults_total".into(), 1));
+            return out;
+        }
+    };
+    let entries = read.into_iter().next().map(|o| o.rows).unwrap_or_default();
+    let mut tally: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for entry in entries {
+        let txid = entry["q_txid"].as_str().unwrap_or_default().to_string();
+        let cursor = entry["q_cursor"].as_str().unwrap_or_default().to_string();
+        let height = entry["q_height"].as_f64().unwrap_or(0.0) as u32;
+        let attempts = entry["q_attempts"].as_f64().unwrap_or(0.0) as i64;
+        let reask = reask_of_columns(entry["q_kind"].as_str().unwrap_or("fork"), height);
+        let row = if entry["word"].is_string() {
+            serde_json::from_value::<Row>(entry.clone()).ok()
+        } else {
+            None
+        };
+        let key = vec![text(txid.clone()), text(cursor)];
+        let judged = drain_one(row, &reask, world, now).await;
+        let (outcome, stmts) = match judged {
+            Drained::Gone => ("gone", vec![stmt(DRAIN_DELETE, key)]),
+            Drained::Held => ("held", vec![stmt(DRAIN_DELETE, key)]),
+            Drained::Rewritten(row) => (
+                if row.word == "mined" { "mined" } else { "stale" },
+                vec![upsert_stmt(&row), stmt(DRAIN_DELETE, key)],
+            ),
+            Drained::Retry(why) if attempts + 1 >= DRAIN_ATTEMPTS => {
+                sql.log(&format!(
+                    "[chain-events] re-ask of {txid} dropped after {DRAIN_ATTEMPTS} attempts ({why})"
+                ));
+                *tally.entry("dropped").or_default() += 1;
+                (why, vec![stmt(DRAIN_DELETE, key)])
+            }
+            Drained::Retry(why) => (why, vec![stmt(DRAIN_RETRY, key)]),
+        };
+        if let Err(e) = sql.run_batch(stmts).await {
+            out.fault = Some(format!("drain batch: {e}"));
+            out.counters
+                .push(("tracker_chain_events_faults_total".into(), 1));
+            break;
+        }
+        *tally.entry(outcome).or_default() += 1;
+        out.entries.push((txid, outcome));
+    }
+    let total = out.entries.len() as u64;
+    if total > 0 {
+        out.counters
+            .push(("tracker_chain_events_reask_total".into(), total));
+    }
+    for (outcome, n) in tally {
+        let name = if outcome == "dropped" {
+            "tracker_chain_events_reask_dropped_total".to_string()
+        } else {
+            format!("tracker_chain_events_reask_{outcome}_total")
+        };
+        out.counters.push((name, n));
+    }
+    out
 }
 
 thread_local! {
