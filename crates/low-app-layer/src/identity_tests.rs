@@ -18,7 +18,12 @@ use std::cell::{Cell, RefCell};
 
 const FIXTURE: &str = include_str!("fixtures/resolver_identity_batch.fixture.json");
 const DISPLAY_FIXTURE: &str = include_str!("fixtures/resolver_identity_display_batch.fixture.json");
-const ORIGIN: &str = "https://low-app-layer-beta.dev-a3e.workers.dev";
+/// The app layer's origin the picture URLs are built on: `LOW_TEST_APP_LAYER_ORIGIN` at build time, else a
+/// placeholder-shaped origin (a deployment's real hostname is never in this tree; the renderer injects it at deploy).
+const ORIGIN: &str = match option_env!("LOW_TEST_APP_LAYER_ORIGIN") {
+    Some(o) => o,
+    None => "https://app-layer.example.invalid",
+};
 
 /// Zanaadu's `expected.identityQuery`: the eight holders, in its order.
 const QUERY: &str = "0222ca50390e660f601036dd7502bb973bdcd104b5dcb8f2e74de8edc6c292b03a,027670d1cbc190bc530ebde2669e76e7ab3c23b3ac0add9aa0902170d1280bddb4,029acb7d8ce958f7e5189676c3e7248ad79f717a672d4c80b59c425663e078810d,02ea0a856277a766272a1825aee660ef8bafcbdcfba1ca8a0878259611bf07996c,027cdcaef67e477fca8fe105bc67fab43132747330468be11bb62bdfe8734de17e,029f004a5bab5dd55346dbdf50832f100c3ce460bb2c2ace8016ade927f863bb55,027525d8e66c44ad84f6d5f785e26f6936be264a859278086502173085febc5b8b,025710158d4bc87e484ac205f67ad5c8e4438e12afa09eed71bc28381ea8e358cd";
@@ -808,14 +813,14 @@ fn the_identity_reads_are_anonymous_under_strict() {
 
 #[test]
 fn cors_answers_the_app_origins_only_and_exposes_what_the_browser_reads() {
-    let allow = parse_origins(" https://bsvarcade.com/, https://LOW-POT.pages.dev ,,");
+    let allow = parse_origins(" https://bsvarcade.com/, https://APP.Example.Invalid ,,");
     assert_eq!(
         allow,
-        vec!["https://bsvarcade.com", "https://low-pot.pages.dev"]
+        vec!["https://bsvarcade.com", "https://app.example.invalid"]
     );
     assert_eq!(
-        allowed_origin(Some("https://low-pot.pages.dev"), &allow).as_deref(),
-        Some("https://low-pot.pages.dev")
+        allowed_origin(Some("https://app.example.invalid"), &allow).as_deref(),
+        Some("https://app.example.invalid")
     );
     assert_eq!(allowed_origin(Some("https://evil.example"), &allow), None);
     assert_eq!(
@@ -1241,9 +1246,9 @@ fn localhost_is_a_beta_origin_only() {
 #[test]
 fn e597_a_dev_server_origin_reads_the_identity_views_in_both_envs() {
     let prod =
-        parse_origins("https://bsvarcade.com,https://www.bsvarcade.com,https://low-pot.pages.dev");
+        parse_origins("https://bsvarcade.com,https://www.bsvarcade.com,https://app.example.invalid");
     let beta = parse_origins(
-        "https://low-beta.pages.dev,https://low-harness.pages.dev,http://localhost:5173",
+        "https://app-beta.example.invalid,https://harness.example.invalid,http://localhost:5173",
     );
     for allow in [&prod, &beta, &Vec::new()] {
         for o in [

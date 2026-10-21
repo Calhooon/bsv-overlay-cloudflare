@@ -66,7 +66,7 @@ the header name is the *registration* spelling, not the *delivery* spelling.
 Arcade's own delivery record for settle `ee37b606…`:
 
 ```json
-{ "callbackUrl": "https://low-overlay.dev-a3e.workers.dev/arc-ingest",
+{ "callbackUrl": "https://<your-overlay>.workers.dev/arc-ingest",
   "lastDeliveredStatus": "MINED", "attempts": 10,
   "lastAttemptAt": "2026-08-06T03:51:29.445425Z", "lastResult": "status 401" }
 ```

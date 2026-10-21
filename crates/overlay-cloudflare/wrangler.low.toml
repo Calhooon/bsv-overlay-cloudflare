@@ -30,13 +30,16 @@ binding = "OVERLAY_DB"
 database_name = "low-overlay-db"
 database_id = "__LOW_APPLAYER_DEFAULT_D1_LOW_OVERLAY_DB_ID__"  # the same prod D1 the app-layer reads; injected at deploy time by name
 
+# Hostnames are `__HOST_<NAME>__` placeholders (bsv-low RENDER-HOSTNAMES, record 926): a bare hostname each, injected
+# BY NAME at deploy by bsv-low's scripts/runner/patterns/render-wrangler.sh beside the `__LOW_..._ID__` ids; a name it
+# does not know refuses the render, so a literal `__HOST_` never reaches a deployed [vars].
 [vars]
 # W2-P4: the app-layer told which pot rows changed (bearer secret INTERNAL_TOKEN),
 # reached through the APP_LAYER service binding; no-ops without the secret.
-APP_LAYER_URL = "https://low-app-layer.dev-a3e.workers.dev"
+APP_LAYER_URL = "https://__HOST_APP_LAYER__"
 ENVIRONMENT = "production"
-CHAIN_TRACKER_URL = "https://rust-chaintracks.dev-a3e.workers.dev"
-HOSTING_URL = "https://low-overlay.dev-a3e.workers.dev"
+CHAIN_TRACKER_URL = "https://__HOST_CHAINTRACKS__"
+HOSTING_URL = "https://__HOST_OVERLAY__"
 # THE PROMOTION 2026-09-21 (bsv-low loops 11 to 21, the clean pass): prod runs the configuration the fleet proved.
 # SUBMIT_ENFORCE (#347): the unbarred submit modes are operator-only; the client's only mode is broadcast-gated (#407).
 SUBMIT_ENFORCE = "true"
@@ -226,7 +229,7 @@ name = "low-overlay-beta"
 
 [env.beta.vars]
 # W2-P4: the app-layer told which pot rows changed (bearer secret INTERNAL_TOKEN).
-APP_LAYER_URL = "https://low-app-layer-beta.dev-a3e.workers.dev"
+APP_LAYER_URL = "https://__HOST_APP_LAYER_BETA__"
 ENVIRONMENT = "production"
 # The per-environment topic namespace. MUST match the client's
 # VITE_OVERLAY_TOPIC_SUFFIX (app/.env.beta) — a mismatch means every submit
@@ -235,9 +238,9 @@ ENVIRONMENT = "production"
 # validator rejects digits, so `_beta2` would make our own SHIP ad
 # self-reject.
 TOPIC_SUFFIX = "_beta"
-CHAIN_TRACKER_URL = "https://rust-chaintracks.dev-a3e.workers.dev"
+CHAIN_TRACKER_URL = "https://__HOST_CHAINTRACKS__"
 # Its OWN hosting URL — also what scopes this deploy's advertisement set.
-HOSTING_URL = "https://low-overlay-beta.dev-a3e.workers.dev"
+HOSTING_URL = "https://__HOST_OVERLAY_BETA__"
 WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 # BASE names in both envs — the suffix is applied at registration, in one
 # place (src/lib.rs), so a topic added later cannot be forgotten by it.
