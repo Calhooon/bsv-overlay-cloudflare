@@ -6,6 +6,8 @@
 
 ## Unreleased
 
+- `ls_uhrp`'s lookup takes the reference's door (bsv-low #819, ts-stack@9262cac66 `UHRPLookupService.ts:81-136`, `shared/queryValidation.ts`): the allow-list `outpoint`, `uhrpUrl`, `expiryTime`, `hostIdentityKey`, `limit`, `offset`; a filter required; `limit` 1 to 200 (default 50, 201 refused), `offset` 0 to 100,000; invalid values refused, never an empty filter; no public find-all (the string `"findAll"`, `findAll`, `skip`, `sortOrder`, `includeExpired`, `nowUnixSeconds` are refused by name). `UHRPQuery` denies unknown fields. A refused lookup query answers 400 `{status:"error", code:"ERR_INVALID_LOOKUP_QUERY", description, message}`. The stack's thirty vectors replayed as a pin (`tests/uhrp_lookup_door_819.rs`).
+
 ## [0.3.0] - 2026-10-19
 
 - bsv-rs `=0.7.0` in both workspaces (the line's exact pin of record; 0.7.1

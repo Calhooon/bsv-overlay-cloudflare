@@ -2449,8 +2449,40 @@ pub async fn lookup(engine: &Engine, mut req: Request) -> worker::Result<Respons
         Err(e) => {
             let status = engine_error_status(&e);
             worker::console_log!("POST /lookup -> {}", status);
-            json_error(&e.to_string(), status)
+            let (body, status) = lookup_error_body(&e);
+            json_response(&body, status)
         }
+    }
+}
+
+/// The `code` of a lookup query refused at a lookup service's door (bsv-low
+/// #819): a key off the service's allow-list, a missing filter, a value out of
+/// its bounds. The `description` is the service's own sentence (for `ls_uhrp`
+/// the reference's, `Invalid lookup query: unexpected field uhrp_url`).
+pub const INVALID_LOOKUP_QUERY_CODE: &str = "ERR_INVALID_LOOKUP_QUERY";
+
+/// The JSON body and status of a refused `/lookup`. A refused QUERY is coded,
+/// `{status:"error", code, description, message}` at 400 (`message` the
+/// engine's line every earlier body carried, unchanged); every other fault
+/// keeps its `{status, message}` body and status. Pure, so it is pinned
+/// without a Worker.
+pub(crate) fn lookup_error_body(e: &EngineError) -> (serde_json::Value, u16) {
+    let status = engine_error_status(e);
+    let message = e.to_string();
+    match e {
+        EngineError::InvalidQuery(description) => (
+            serde_json::json!({
+                "status": "error",
+                "code": INVALID_LOOKUP_QUERY_CODE,
+                "description": description,
+                "message": message,
+            }),
+            status,
+        ),
+        _ => (
+            serde_json::json!({"status": "error", "message": message}),
+            status,
+        ),
     }
 }
 
@@ -4519,6 +4551,32 @@ pub fn not_found() -> worker::Result<Response> {
 
 #[cfg(test)]
 mod tests {
+    /// bsv-low #819: a refused lookup query is the coded 400, the service's
+    /// sentence its `description`; any other fault keeps its body.
+    #[test]
+    fn i819_a_refused_lookup_query_is_the_coded_400() {
+        use super::{lookup_error_body, EngineError};
+        let (body, status) = lookup_error_body(&EngineError::InvalidQuery(
+            "Invalid lookup query: unexpected field uhrp_url".into(),
+        ));
+        assert_eq!(status, 400);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "status": "error",
+                "code": "ERR_INVALID_LOOKUP_QUERY",
+                "description": "Invalid lookup query: unexpected field uhrp_url",
+                "message": "invalid query: Invalid lookup query: unexpected field uhrp_url",
+            })
+        );
+        let (body, status) = lookup_error_body(&EngineError::StorageError("down".into()));
+        assert_eq!(status, 500);
+        assert_eq!(
+            body,
+            serde_json::json!({"status": "error", "message": "storage error: down"})
+        );
+    }
+
     use super::beef_any_txid;
     use super::engine_error_status;
     use super::false_ok_refusal_applies;

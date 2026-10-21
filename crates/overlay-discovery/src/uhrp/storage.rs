@@ -51,9 +51,23 @@ pub struct UHRPDiscoveryRecord {
 /// this serde rename, client queries from `@bsv/sdk` `LookupResolver` sent
 /// `uhrpUrl`/`hostIdentityKey` which silently deserialized as `None`, so
 /// every filtered query fell through to an unfiltered find_all.
+///
+/// Since bsv-low #819 this is the STORAGE's question, built by the lookup's
+/// door (`lookup_service::door_query`, the reference's allow-list and bounds)
+/// and never deserialized from a caller's query; `deny_unknown_fields` is the
+/// belt for any reader that does, so a misspelt key is an error, never an
+/// empty filter.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UHRPQuery {
+    /// One output by `(txid, outputIndex)`, the txid lowercase hex (the
+    /// reference's `outpoint` filter). Built by the door, never on the wire.
+    #[serde(skip)]
+    pub outpoint: Option<(String, u32)>,
+    /// Filter by the advert's exact expiry, Unix seconds (the reference's
+    /// `expiryTime`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expiry_time: Option<i64>,
     /// If true, return all records with pagination.
     pub find_all: Option<bool>,
     /// Filter by canonical Base58Check URL (matches TS `uhrpUrl`).
@@ -324,6 +338,16 @@ impl UHRPStorage for MemoryUHRPStorage {
         let mut results: Vec<&UHRPRecord> = records
             .iter()
             .filter(|r| {
+                if let Some((ref txid, index)) = query.outpoint {
+                    if r.txid != *txid || r.output_index != index {
+                        return false;
+                    }
+                }
+                if let Some(expiry) = query.expiry_time {
+                    if r.expiry_time != expiry {
+                        return false;
+                    }
+                }
                 if let Some(ref u) = query.uhrp_url {
                     if r.uhrp_url != *u {
                         return false;
@@ -550,6 +574,8 @@ mod tests {
             sort_order: Some(UHRPSortOrder::Asc),
             include_expired: None,
             now_unix_seconds: None,
+            outpoint: None,
+            expiry_time: Some(7),
         };
         let json = serde_json::to_value(&query).unwrap();
         let back: UHRPQuery = serde_json::from_value(json).unwrap();
@@ -558,5 +584,15 @@ mod tests {
         assert_eq!(back.limit, Some(10));
         assert_eq!(back.skip, Some(5));
         assert_eq!(back.sort_order, Some(UHRPSortOrder::Asc));
+        assert_eq!(back.expiry_time, Some(7));
+    }
+
+    /// bsv-low #819: a misspelt key is an error, never an empty filter.
+    #[test]
+    fn query_refuses_an_unknown_key() {
+        let err = serde_json::from_value::<UHRPQuery>(serde_json::json!({"uhrp_url": "x"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `uhrp_url`"), "{err}");
     }
 }
