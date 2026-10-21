@@ -1,0 +1,18 @@
+{
+  "about": "bsv-low #810: the overlay's two open-eviction 422 bodies for an ungated /submit, byte for byte (serde_json of overlay-cloudflare routes.rs ErrorBody{status,message}), with refusal_status_word = REJECTED. Shared with the overlay (one sha256 in both repos).",
+  "overlayRev": "c6b5bff",
+  "vectors": [
+    {
+      "producer": "overlay-cloudflare/src/routes.rs:1733 (the ungated pre-write refusal, submit_refused_evicted_total)",
+      "status": 422,
+      "body": "{\"status\":\"error\",\"message\":\"network rejected: evicted (REJECTED) — the index re-admits it on a MINED proof or the operator's readmit\"}",
+      "word": "REJECTED"
+    },
+    {
+      "producer": "overlay-cloudflare/src/routes.rs:1865 (the #513 write-side guard, re-evicted)",
+      "status": 422,
+      "body": "{\"status\":\"error\",\"message\":\"network rejected: evicted (REJECTED)\"}",
+      "word": "REJECTED"
+    }
+  ]
+}

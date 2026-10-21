@@ -319,6 +319,21 @@ fn binary_response(bytes: Vec<u8>) -> worker::Result<Response> {
     Ok(resp)
 }
 
+/// The ungated `/submit`'s 422 message under an OPEN eviction, before any write (bsv-low LOOP 18).
+/// The tower's classifier reads this prefix (bsv-low #810, `tests/vectors/index-evicted-422.json`):
+/// a change here is a change there, both copies bumped together.
+pub(crate) fn evicted_refusal_message(word: &str) -> String {
+    format!(
+        "network rejected: evicted ({word}) — the index re-admits it on a MINED proof or the operator's readmit"
+    )
+}
+
+/// The #513 write-side guard's 422 message: the write outran its eviction and was re-evicted. Read by the
+/// tower's classifier like [`evicted_refusal_message`] (bsv-low #810).
+pub(crate) fn evicted_after_write_message(word: &str) -> String {
+    format!("network rejected: evicted ({word})")
+}
+
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     status: &'a str,
@@ -1728,13 +1743,8 @@ async fn submit_parts(
                                 ev.reason
                             );
                             counters.reason(SubmitReason::Evicted);
-                            return json_error(
-                                &format!(
-                                    "network rejected: evicted ({}) — the index re-admits it on a MINED proof or the operator's readmit",
-                                    crate::admit_fast::refusal_status_word(&ev.reason)
-                                ),
-                                422,
-                            );
+                            let word = crate::admit_fast::refusal_status_word(&ev.reason);
+                            return json_error(&evicted_refusal_message(word), 422);
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -1860,13 +1870,8 @@ async fn submit_parts(
                     // the status WORD only (the gate's NIT): the reason embeds Arcade's extraInfo, and the client's
                     // already-known belt classifies on text
                     counters.reason(SubmitReason::Evicted);
-                    let resp = json_error(
-                        &format!(
-                            "network rejected: evicted ({})",
-                            crate::admit_fast::refusal_status_word(&ev.reason)
-                        ),
-                        422,
-                    )?;
+                    let word = crate::admit_fast::refusal_status_word(&ev.reason);
+                    let resp = json_error(&evicted_after_write_message(word), 422)?;
                     return Ok(with_server_timing(resp, "admit;desc=\"evicted\""));
                 }
                 Ok(None) => {}
@@ -5983,6 +5988,98 @@ mod tests {
         assert!(
             consumer[..q_guard].contains(&subject_needle),
             "the consumer's subject is the ONE rule over the enqueued bytes, never an EF conversion (the gate's MEDIUM-3)"
+        );
+    }
+}
+
+/// bsv-low #810 (round 2, LOW-2): the overlay's copy of the tower's eviction-422 vectors, pinned on both
+/// producers. The file is the tower's, byte for byte, under the tower's sha256.
+#[cfg(test)]
+mod vectors_810 {
+    use super::{evicted_after_write_message, evicted_refusal_message, ErrorBody};
+
+    const VECTORS: &str = include_str!("../tests/vectors/index-evicted-422.json");
+    /// The tower's pinned constant (bsv-low `relay_lib.rs`): one sha256 in both repositories.
+    const VECTORS_SHA256: &str = "fb0731e0cb7f9300545117b7fd86b1f5a9fd118dfbdac3f99f12e56e0f45f5c2";
+    const BUMP: &str =
+        "the tower's classifier reads this prefix: bump both copies together, bsv-low #810";
+
+    /// The bytes the route answers (compared as `str`: equality is byte equality): `json_error` -> `Response::from_json(&ErrorBody{..})`, i.e. serde_json.
+    fn rendered(message: &str) -> String {
+        serde_json::to_string(&ErrorBody {
+            status: "error",
+            message,
+        })
+        .unwrap()
+    }
+
+    fn vector(i: usize) -> (u64, String, String) {
+        let v: serde_json::Value = serde_json::from_str(VECTORS).unwrap();
+        let e = &v["vectors"][i];
+        (
+            e["status"].as_u64().unwrap(),
+            e["body"].as_str().unwrap().to_string(),
+            e["word"].as_str().unwrap().to_string(),
+        )
+    }
+
+    #[test]
+    fn vectors_810_the_file_is_the_towers_by_sha256() {
+        let sha = hex::encode(bsv_rs::primitives::hash::sha256(VECTORS.as_bytes()));
+        assert_eq!(
+            sha, VECTORS_SHA256,
+            "tests/vectors/index-evicted-422.json drifted from the tower's copy: {BUMP}"
+        );
+        let v: serde_json::Value = serde_json::from_str(VECTORS).unwrap();
+        assert_eq!(
+            v["vectors"].as_array().unwrap().len(),
+            2,
+            "two producers, two vectors"
+        );
+    }
+
+    #[test]
+    fn vectors_810_the_ungated_pre_write_refusal_is_the_vector_byte_for_byte() {
+        let (status, body, word) = vector(0);
+        assert_eq!((status, word.as_str()), (422, "REJECTED"));
+        let word = crate::admit_fast::refusal_status_word("REJECTED");
+        assert_eq!(
+            rendered(&evicted_refusal_message(word)),
+            body,
+            "evicted_refusal_message (the ungated pre-write 422): {BUMP}"
+        );
+    }
+
+    #[test]
+    fn vectors_810_the_write_side_guard_is_the_vector_byte_for_byte() {
+        let (status, body, word) = vector(1);
+        assert_eq!((status, word.as_str()), (422, "REJECTED"));
+        let word = crate::admit_fast::refusal_status_word("REJECTED");
+        assert_eq!(
+            rendered(&evicted_after_write_message(word)),
+            body,
+            "evicted_after_write_message (the #513 write-side guard 422): {BUMP}"
+        );
+    }
+
+    /// The route answers through the two named functions (no inline copy of either message), at 422.
+    #[test]
+    fn vectors_810_the_route_calls_the_pinned_messages() {
+        let src = include_str!("routes.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let prod = squash(prod);
+        for call in [
+            "letword=crate::admit_fast::refusal_status_word(&ev.reason);returnjson_error(&evicted_refusal_message(word),422);",
+            "letword=crate::admit_fast::refusal_status_word(&ev.reason);letresp=json_error(&evicted_after_write_message(word),422)?;",
+        ] {
+            assert_eq!(prod.matches(&squash(call)).count(), 1, "the route's call `{call}`: {BUMP}");
+        }
+        assert_eq!(
+            prod.matches(&squash("\"network rejected: evicted ("))
+                .count(),
+            2,
+            "the messages are spelled once each, in the named functions: {BUMP}"
         );
     }
 }
