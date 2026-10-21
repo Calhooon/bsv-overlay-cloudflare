@@ -83,7 +83,8 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 # identity-scoped read-window tests EXECUTE the exact shipped SQL against the
 # production `OVERLAY_MIGRATIONS` schema instead of merely pinning the string
 # (bsv-low #281). Test-only: never linked into the wasm32 Worker build.
-rusqlite = { version = "0.32", features = ["bundled"] }
+# `functions`: a pin may hold SQLite's `unixepoch()` to one `now` (bsv-low #794).
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 
 [lints]
 workspace = true
