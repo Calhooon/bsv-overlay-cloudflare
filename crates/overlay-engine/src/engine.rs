@@ -261,9 +261,12 @@ async fn hooked(
 /// (about eight carried single-input bodies), not the question's cost, which
 /// the 256 already bounded (a stranger could make it read 256 at no cost to
 /// the 16). Its cost, stated: the first topic of a submit that asks can spend
-/// the whole 256 and leave a later topic's question "not now". No LOW submit
-/// asks in two topics (`tm_pot` admits the JOIN's covenant and names nothing;
-/// the audit pin `fix791c_e`); the per-topic share returns the day one does.
+/// the whole 256 and leave a later topic's question "not now". No LOW
+/// submit's question reads in two topics (`tm_pot` admits the JOIN's covenant
+/// and names nothing; the spend-proof heal is `tm_pot`'s D17 (a) class and
+/// reads nothing there, its pot's body absent and unnamed; the audit pin
+/// `fix791c_e`); the per-topic share returns the day one does. It counts
+/// reads: a landed body's inserts are that body's own submit's writes.
 const PREDECESSOR_READS_PER_SUBMIT: usize = 256;
 
 /// The characters of a `predecessor_not_landed` fault that

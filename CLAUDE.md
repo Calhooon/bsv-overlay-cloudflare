@@ -1051,8 +1051,11 @@ single-input bodies: beta's two parked JOINs counted 16 and 18 on 4ec0507),
 never the cost the 256 already bound, and it is gone with its constant. The
 reads made are FIX-791-B's, read for read and in order. Its cost: the first
 topic of a submit that asks can spend the whole 256 and leave a later topic's
-question "not now"; no LOW submit asks in two topics (`tm_pot` admits the
-JOIN's covenant and names nothing, `fix791c_e` audits all 16 managers), and
+question "not now"; no LOW submit's question reads in two topics (`tm_pot`
+admits the JOIN's covenant and names nothing, `fix791c_e` audits all 16
+managers; the spend-proof heal, a settle and its BUMP under both, is
+`tm_pot`'s D17 (a) class, asked of every input, and reads nothing there
+because the pot's body is absent and unnamed, pinned by `fix791c_e` too), and
 the per-topic share returns the day one does. The boundary pins restated for
 the 256 (`--test gasp_topic_manager`): `delta559_m2_x7_*` (a head chain's
 question runs out at head 87, its landing does not fit at heads 85 and 86;
@@ -1246,16 +1249,35 @@ CARRIES and whose spent output is a P2PKH (the rule the manager admits by),
 in input order. Nothing else is named: a hop is no JOIN, an input whose source
 the BEEF does not carry is never named (its lock cannot be read; a proven JOIN
 presented alone names nothing and is recorded as before), bytes that do not
-parse name nothing. The bound: the names are the JOIN's own inputs (the
-covenant's two seats' hops), never a walk; no source is hydrated.
+parse name nothing. The bound: the names are the JOIN's own inputs, never a
+walk; no source is hydrated. For an honest JOIN that is the covenant's two
+seats' hops; for a stranger, any number (the covenant check reads the
+script's head and tail only, so any covenant-shaped output over N carried
+P2PKH-sourced inputs names N), bounded by the submit's 256 (`fix791c_d`).
 
 So the door lands each named carried hop first (D17 rule 2: the hop's dry run
 admits its stake, an opener), ancestors first, each landing charged to the
 submit's 256, and the JOIN then finds both coins: its admission marks each
-stake spent, tells the lookup services (`ls_lowfund`'s `pot_records` records
-the JOIN as the spender), and deletes it (D17 rule 1; the hop's change stays
+stake spent, tells the lookup services (`ls_pot`, which indexes `tm_lowfund`
+outputs into `pot_records`, records the JOIN as the spender), and deletes it (D17 rule 1; the hop's change stays
 held, its applied row stays). A hop the ledger already holds is found as a
-coin and landed nothing (no second applied row, no second insert).
+coin and landed nothing (no second applied row, no second insert). The 256
+counts READS: a landed body's inserts (every P2PKH output of a hop) are its
+own submit's writes, the ones its direct public submit makes, multiplied by
+at most the landings the 256 allows (about 60 single-input bodies); the D1
+per-invocation statement limit the 256 is sized against is the register's
+stated unknown.
+
+A JOIN whose named carried hop does NOT land (the landing guard refuses it
+under an open eviction, its walk could not run on an unmarked replay, or its
+landing does not fit the 256) is "not now" in `tm_lowfund`, where `0673eea`
+recorded the JOIN alone there; `tm_pot` asks nothing and admits the pot all
+the same, and a hop before it in input order that did land stays landed. It
+is money-neutral (the hop's spend was unrecorded either way) and D17's
+designed answer: the hop's MINED proof (or the operator's readmission) lets
+the replay land it, else a `not_now` letter under #576's bounds. Pin
+`fix791c_f` (RED with `join_hop_inputs` answering nothing: `left:
+["tm_pot", "tm_lowfund"]`).
 
 The engine change it needs (`Engine::successors_waiting`): a successor that
 found SOME of its coins is now asked too, of the inputs the manager names that
@@ -1284,7 +1306,9 @@ dupe; a JOIN alone names nothing; RED `[0]: landed once, left: []`),
 own validation and writes plus 256), `fix791c_e` (the audit of the 16
 managers over a JOIN, a hop, a settle and a sweep: only `tm_lowfund` names,
 and only the JOIN's 2; a JOIN under `tm_pot` and `tm_lowfund` reads exactly
-the sum of each alone), `fix791b_a` extended (beta's two letters each land
+the sum of each alone; the spend-proof heal under both reads each topic's
+applied row and coin and nothing more, RED with the absent-body name check
+removed: `tm_pot` reads 5 and waits), `fix791c_f` (above), `fix791b_a` extended (beta's two letters each land
 their JOIN's two hops, in 23 and 21 reads, the stakes gone, the changes held;
 its old assertion, the JOIN recorded, kept). Two mutants: the found-a-coin
 entry removed (RED `fix791c_b`), the loop ending at a found coin (RED

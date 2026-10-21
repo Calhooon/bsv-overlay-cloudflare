@@ -11911,4 +11911,184 @@ async fn fix791c_e_no_low_submit_asks_in_two_topics() {
         measured[0] + measured[1],
         "tm_pot asks nothing beside tm_lowfund: {measured:?}"
     );
+
+    // The other honest two-topic submit (the FIX-791-C lens's LOW-1): the
+    // spend-proof heal, a settle with its BUMP and nothing else under
+    // `[tm_pot, tm_lowfund]` (the client's `overlay.ts`), on a node whose
+    // `tm_pot` does not hold the pot coin. `tm_pot` admits nothing and finds
+    // no coin, so it is the D17 (a) class, asked of EVERY input whatever is
+    // named; it reads nothing because the pot's body is absent and unnamed.
+    // `tm_lowfund` admits the payouts and names nothing (no covenant). So
+    // neither topic's question reads: each topic makes its own validation
+    // reads (its applied row, one coin per input) and nothing more.
+    let mut heal = settle.clone();
+    for input in &mut heal.inputs {
+        input.source_transaction = None;
+    }
+    let heal = proven(&heal, 800);
+    let mut measured = Vec::new();
+    for topics in [
+        vec!["tm_pot"],
+        vec!["tm_lowfund"],
+        vec!["tm_pot", "tm_lowfund"],
+    ] {
+        let store = Rc::new(MemoryStorage::new());
+        let storage = ScriptedStore::plain(&store);
+        let reads = storage.reads.clone();
+        let engine = Engine::new(
+            topics
+                .iter()
+                .map(|t| {
+                    (
+                        t.to_string(),
+                        if *t == "tm_pot" { pot() } else { lowfund() },
+                    )
+                })
+                .collect(),
+            HashMap::new(),
+            Box::new(storage),
+            None,
+            EngineConfig::default(),
+        );
+        let beef = TaggedBEEF::new(
+            heal.to_beef(false).unwrap(),
+            topics.iter().map(|t| t.to_string()).collect(),
+        );
+        let r = submitted(&engine, &beef).await;
+        println!(
+            "#791-C (e) spend proof: {topics:?}: {} reads, applied {:?} landed {:?} ({})",
+            reads.get(),
+            r.applied_topics,
+            r.landed_predecessors,
+            r.summary()
+        );
+        assert!(r.is_durable(), "{topics:?}: {}", r.summary());
+        assert!(r.landed_predecessors.is_empty(), "{topics:?}");
+        assert_eq!(
+            reads.get(),
+            topics.len() * (1 + heal.inputs.len()),
+            "{topics:?}: each topic's applied row and its coin, no question read"
+        );
+        measured.push(reads.get());
+    }
+    assert_eq!(measured[2], measured[0] + measured[1], "{measured:?}");
+}
+
+// The FIX-791-C lens's LOW-2. A JOIN whose named carried hop does not land
+// is "not now" in `tm_lowfund`, where `0673eea` recorded the JOIN alone
+// there (its manager named nothing): here the hop is under an OPEN eviction,
+// so the door's landing guard refuses it before anything of it is written.
+// `tm_pot` asks nothing and admits the pot all the same; the hop's spend was
+// unrecorded either way, so no money word moves, and the hop's MINED proof
+// (or the operator's readmission) lets the replay land it. A hop before it
+// in input order that the guard lets through has landed and stays. RED with
+// `join_hop_inputs` answering nothing (0673eea's manager): `tm_lowfund` is
+// applied.
+#[tokio::test]
+async fn fix791c_f_a_join_whose_named_hop_is_evicted_waits_in_tm_lowfund_alone() {
+    let (_logs, _guard) = capture_logs();
+    let hops = [seat_hop(1), seat_hop(2)];
+    let join = join_over(&hops);
+    let evicted = hops[1].id();
+    let store = Rc::new(MemoryStorage::new());
+    let asked: Rc<RefCell<Vec<(String, String)>>> = Rc::default();
+    let mut engine = Engine::new(
+        HashMap::from([
+            (
+                "tm_pot".to_string(),
+                Box::new(bsv_overlay_discovery::pot::topic_manager::PotTopicManager::new())
+                    as Box<dyn TopicManager>,
+            ),
+            (
+                "tm_lowfund".to_string(),
+                Box::new(
+                    bsv_overlay_discovery::pot::lowfund_topic_manager::LowFundTopicManager::new(),
+                ) as Box<dyn TopicManager>,
+            ),
+        ]),
+        HashMap::new(),
+        Box::new(ScriptedStore::plain(&store)),
+        None,
+        EngineConfig::default(),
+    );
+    {
+        let asked = asked.clone();
+        let evicted = evicted.clone();
+        engine.set_landing_guard(Rc::new(move |txid: &str, topic: &str| {
+            asked
+                .borrow_mut()
+                .push((txid.to_string(), topic.to_string()));
+            let answer = if txid == evicted {
+                Err("under an OPEN eviction".to_string())
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { answer })
+        }));
+    }
+    let beef = TaggedBEEF::new(
+        join.to_beef(true).unwrap(),
+        vec!["tm_pot".to_string(), "tm_lowfund".to_string()],
+    );
+    let r = submitted(&engine, &beef).await;
+    println!(
+        "#791-C (f): durable {} applied {:?} landed {:?} asked {:?} ({})",
+        r.is_durable(),
+        r.applied_topics,
+        r.landed_predecessors,
+        asked.borrow(),
+        r.summary()
+    );
+    assert_eq!(
+        r.applied_topics,
+        vec!["tm_pot".to_string()],
+        "tm_pot admits the pot; tm_lowfund waits"
+    );
+    assert!(!r.is_durable(), "{}", r.summary());
+    // The hop before it in input order landed first and stays landed (the
+    // write its own public submit makes); the replay finds it as a coin.
+    assert_eq!(
+        r.landed_predecessors,
+        vec![(hops[0].id(), "tm_lowfund".to_string())]
+    );
+    assert!(
+        r.faults.iter().any(|f| f.site == "predecessor_not_landed"
+            && f.topic == "tm_lowfund"
+            && f.error.contains("refused by the landing guard")),
+        "{}",
+        r.summary()
+    );
+    let applied = |txid: String, topic: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .does_applied_transaction_exist(&AppliedTransaction {
+                    txid,
+                    topic: topic.to_string(),
+                })
+                .await
+                .unwrap()
+        }
+    };
+    assert!(applied(join.id(), "tm_pot").await, "the pot is recorded");
+    assert!(
+        !applied(join.id(), "tm_lowfund").await,
+        "the JOIN is not recorded in tm_lowfund"
+    );
+    assert!(
+        !applied(evicted.clone(), "tm_lowfund").await,
+        "the evicted hop writes nothing"
+    );
+    assert!(store
+        .find_output(&evicted, 0, Some("tm_lowfund"), None, false)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        asked
+            .borrow()
+            .iter()
+            .any(|(t, topic)| *t == evicted && topic == "tm_lowfund"),
+        "the guard is asked of the evicted hop"
+    );
 }
