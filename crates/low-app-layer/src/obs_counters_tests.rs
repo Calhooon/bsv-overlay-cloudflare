@@ -291,6 +291,8 @@ fn obs_566_recompute_seq_is_per_identity_and_rides_the_snapshot_row() {
             .unwrap(),
     )
     .unwrap();
+    conn.execute_batch(bsv_overlay_cloudflare::d1::HOP_CHAIN_PROBES_TIP_ALTER)
+        .unwrap();
     // one snapshot write, the batch's closing read-back answered as the route reads it: (stamp, seq)
     let mut write = |identity: &str, at: i64| -> (Option<i64>, Option<i64>) {
         let plan = owed_write_plan(identity, &[], at, Some(900_000), false);

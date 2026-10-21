@@ -732,7 +732,7 @@
    "readers": [],
    "rebuild_class": "chain",
    "never_wipe": false,
-   "holds": "courier memos per hop outpoint; `homeproof:` rows, the durable latch of a verified Proven word (low-app-layer owed.rs); `homecursor:` rows, the home walk's cursor (owed.rs). The overlay's expiry spares both prefixes (hop_probe_memos.rs). `spenderask:` rows, the durable courier ask stamp per spender (owed.rs `SPENDER_ASK_PREFIX`, L25-WITHHELD MEDIUM-1), which the expiry DOES take after two hours (its lifecycle)",
+   "holds": "courier memos per hop outpoint, each with the tip the owed walk read when it took the probe (`tipHeight`, #808; NULL on a memo written before it or by a tipless writer); `homeproof:` rows, the durable latch of a verified Proven word (low-app-layer owed.rs); `homecursor:` rows, the home walk's cursor (owed.rs). The overlay's expiry spares both prefixes (hop_probe_memos.rs). `spenderask:` rows, the durable courier ask stamp per spender (owed.rs `SPENDER_ASK_PREFIX`, L25-WITHHELD MEDIUM-1), which the expiry DOES take after two hours (its lifecycle)",
    "why": "courier memos, re-askable; the overlay expires the memos and marks them on a reorg. A wipe loses no money: every `homeproof:` latch becomes a courier re-probe again, 2 per recompute (OWED_HOME_PROBES_PER_RECOMPUTE), and the home walk restarts from its first cursor"
   },
   {

@@ -375,6 +375,7 @@ fn ns3_h1_expired_memo_is_reasked_even_when_spender_is_tracked() {
                 spent: r.get(2)?,
                 spending_txid: r.get(3)?,
                 spent_confirmed: r.get(4)?,
+                tip_height: None,
             })
         })
         .unwrap();

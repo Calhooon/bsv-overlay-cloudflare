@@ -718,6 +718,34 @@ pub struct ProbeMemo {
     pub spent: bool,
     pub spending_txid: Option<String>,
     pub spent_confirmed: Option<bool>,
+    /// bsv-low #808: the chain tip the walk had read when it took this probe (`hop_chain_probes.tipHeight`, overlay
+    /// migration 342). `None`: a memo written before the column, or by a writer with no tip (a walk whose chaintracks
+    /// read failed, a latch). The probe itself reads no header, so the binding is the height, never a header hash.
+    pub tip_height: Option<u64>,
+}
+
+/// The app layer's catch-up of overlay migration 342 (byte-identical; `schema::LATCH_COLUMN_ALTERS` issues it): the
+/// memo read names `tipHeight`, so a cold isolate ahead of the overlay must add it (epoch Rule 24).
+pub const HOP_CHAIN_PROBES_TIP_ALTER: &str =
+    "ALTER TABLE hop_chain_probes ADD COLUMN tipHeight INTEGER";
+
+/// PURE (bsv-low #808): THE MEMO'S TIP RULE. An UNSPENT memo PREDATES `walk_tip` when it was taken at a lower tip, or
+/// at no recorded tip: a block has arrived since the chain said "unspent", and that block may hold the competitor
+/// (loop 41's pair 13: a 278 s old unspent memo of a hop whose competitor mined at the walk's tip offered a dead
+/// sweep). Such a memo answers for nothing in the owed walk: it is asked again within the budget, and past the budget
+/// its word withholds the sweep (`HopChainWord::predates_tip`). A SPENT memo is never stale by tip (it only withholds,
+/// and its confirmed word has its own windows); a memo taken ABOVE the walk's tip (another isolate's fresher tip
+/// cache) is newer than this walk's view and stands. With no walk tip there is nothing to compare: the age rule alone
+/// (the served body then degrades every sweep on its NULL snapshot tip, `owed::degrade_stale_sweeps`).
+///
+/// What the memo's tip MEANS (the stated residual): the height chaintracks' `getPresentHeight` answered the walk before
+/// it asked, which is the same 30 s cross-isolate tip cache the served tip comes from. So the binding is to the tip as
+/// that cache saw it, not to the chain: a memo taken in the first seconds after a block, before the cache moved, is
+/// stamped one below and asked once more (harmless); and a memo taken before a block, read inside the 30 s before the
+/// cache shows that block, still answers at the old tip (#669's own residual, the same window; the courier's lag
+/// behind its block is outside it too). Past those 30 s the next walk reads the new tip and the memo predates it.
+pub fn memo_predates_tip(m: &ProbeMemo, walk_tip: Option<u64>) -> bool {
+    !m.spent && walk_tip.is_some_and(|t| m.tip_height.is_none_or(|h| h < t))
 }
 
 /// How old a memo may be to answer for a probe — the same five minutes as the isolate's `SPENT_ANY_PROBE_MAX_AGE_MS`
@@ -811,6 +839,29 @@ pub fn split_probe_targets_after_reorg(
     confirmed_max_age_ms: i64,
     reorg_clear_at_ms: Option<i64>,
 ) -> ProbePlan {
+    split_probe_targets_at_tip(
+        targets,
+        memos,
+        now_ms,
+        max_age_ms,
+        confirmed_max_age_ms,
+        reorg_clear_at_ms,
+        None,
+    )
+}
+
+/// PURE (bsv-low #808): THE OWED WALK'S SPLIT since #808. [`split_probe_targets_after_reorg`], and an unspent memo
+/// that [`memo_predates_tip`] `walk_tip` is not fresh, whatever its age: the outpoint is asked again (the expired
+/// group of [`order_probe_targets`], oldest memo first).
+pub fn split_probe_targets_at_tip(
+    targets: &[(String, u32)],
+    memos: &[ProbeMemo],
+    now_ms: i64,
+    max_age_ms: i64,
+    confirmed_max_age_ms: i64,
+    reorg_clear_at_ms: Option<i64>,
+    walk_tip: Option<u64>,
+) -> ProbePlan {
     let grace_end = reorg_clear_at_ms.map(|at| at.saturating_add(PROBE_MEMO_REORG_GRACE_MS));
     let mut answered = Vec::new();
     let mut to_probe = Vec::new();
@@ -830,7 +881,7 @@ pub fn split_probe_targets_after_reorg(
                 } else {
                     max_age_ms
                 };
-                age >= 0 && age < window
+                age >= 0 && age < window && !memo_predates_tip(m, walk_tip)
             });
         match fresh {
             Some(m) => answered.push((
@@ -874,10 +925,14 @@ pub fn confirmed_in_reorg_grace(
 /// and never `stale`: with more candidates than the budget (after a clear every confirmed hop of an identity is
 /// one) a row stayed `claimable: true` on the refused word until the rotation reached it, several walks on.
 /// Any other memo is served as before.
+///
+/// bsv-low #808: `walk_tip` is the walk's own tip; an unspent memo taken below it ([`memo_predates_tip`]) is served
+/// with `predates_tip`, which the derivation reads as a pending chain-wait, never a claim.
 pub fn stale_memo_word(
     m: &ProbeMemo,
     now_ms: i64,
     reorg_clear_at_ms: Option<i64>,
+    walk_tip: Option<u64>,
 ) -> crate::owed::HopChainWord {
     let refused = confirmation_refused(m, reorg_clear_at_ms);
     crate::owed::HopChainWord {
@@ -887,6 +942,8 @@ pub fn stale_memo_word(
         spent_confirmed: if refused { None } else { m.spent_confirmed },
         stale: true,
         age_ms: Some(now_ms - m.probed_at_ms),
+        probe_tip: m.tip_height,
+        predates_tip: memo_predates_tip(m, walk_tip),
     }
 }
 
@@ -1096,11 +1153,23 @@ pub fn probe_memo_key(txid: &str, vout: u32) -> String {
 }
 
 /// PURE: the memo a fresh probe leaves behind — only a KNOWN answer with a spent verdict; anything else is `None`.
+/// It records no tip ([`probe_memo_at_tip`] is the owed walk's).
 pub fn probe_memo_of(
     txid: &str,
     vout: u32,
     probe: &ChainSpendProbe,
     now_ms: i64,
+) -> Option<ProbeMemo> {
+    probe_memo_at_tip(txid, vout, probe, now_ms, None)
+}
+
+/// PURE (bsv-low #808): [`probe_memo_of`] bound to the tip the walk had read when it took the probe (`tipHeight`).
+pub fn probe_memo_at_tip(
+    txid: &str,
+    vout: u32,
+    probe: &ChainSpendProbe,
+    now_ms: i64,
+    tip: Option<u64>,
 ) -> Option<ProbeMemo> {
     if !probe.known {
         return None;
@@ -1112,6 +1181,7 @@ pub fn probe_memo_of(
         spent,
         spending_txid: probe.spending_txid.clone(),
         spent_confirmed: probe.spent_confirmed,
+        tip_height: tip,
     })
 }
 
@@ -1119,7 +1189,7 @@ pub fn probe_memo_of(
 pub fn probe_memo_read_sql(n: usize) -> String {
     let marks = std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ");
     format!(
-        "SELECT outpoint, probedAtMs, spent, spendingTxid, spentConfirmed FROM hop_chain_probes WHERE outpoint IN ({marks})"
+        "SELECT outpoint, probedAtMs, spent, spendingTxid, spentConfirmed, tipHeight FROM hop_chain_probes WHERE outpoint IN ({marks})"
     )
 }
 
@@ -1147,8 +1217,10 @@ pub fn probe_memo_read_chunks(targets: &[(String, u32)]) -> Vec<Vec<String>> {
 }
 
 /// The memo upsert (one row; the route batches them).
-pub const PROBE_MEMO_UPSERT_SQL: &str = "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) VALUES (?, ?, ?, ?, ?) \
-     ON CONFLICT(outpoint) DO UPDATE SET probedAtMs = excluded.probedAtMs, spent = excluded.spent, spendingTxid = excluded.spendingTxid, spentConfirmed = excluded.spentConfirmed";
+/// bsv-low #808: the sixth bind is the memo's tip (NULL for none); a rewrite takes the new memo's tip, so a memo
+/// rewritten by a writer with no tip is "taken at no recorded tip", never the old memo's.
+pub const PROBE_MEMO_UPSERT_SQL: &str = "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed, tipHeight) VALUES (?, ?, ?, ?, ?, ?) \
+     ON CONFLICT(outpoint) DO UPDATE SET probedAtMs = excluded.probedAtMs, spent = excluded.spent, spendingTxid = excluded.spendingTxid, spentConfirmed = excluded.spentConfirmed, tipHeight = excluded.tipHeight";
 
 /// The outpoints the route should re-check: the index-unspent entries, in
 /// served order, bounded.
@@ -2461,7 +2533,8 @@ mod tests {
                     at,
                     spent,
                     spent.then(|| "e5".repeat(32)),
-                    confirmed
+                    confirmed,
+                    None::<i64>
                 ],
             )
             .unwrap();
@@ -2477,6 +2550,7 @@ mod tests {
                         spent: r.get(2)?,
                         spending_txid: r.get(3)?,
                         spent_confirmed: r.get(4)?,
+                        tip_height: None,
                     })
                 })
                 .unwrap();
@@ -2595,7 +2669,7 @@ mod tests {
         let write = |at: i64| {
             conn.execute(
                 PROBE_MEMO_UPSERT_SQL,
-                rusqlite::params![key, at, true, "e5".repeat(32), true],
+                rusqlite::params![key, at, true, "e5".repeat(32), true, None::<i64>],
             )
             .unwrap();
         };
@@ -2612,6 +2686,7 @@ mod tests {
                         spent: r.get(2)?,
                         spending_txid: r.get(3)?,
                         spent_confirmed: r.get(4)?,
+                        tip_height: None,
                     })
                 })
                 .unwrap();
@@ -2713,7 +2788,7 @@ mod tests {
         ));
         assert!(routes.contains(&squash("let memos = read_probe_memos(db, &[candidates.as_slice(), &[crate::hops_view::reorg_mark_target()]].concat()).await;")));
         assert!(routes.contains(&squash(
-            "let reorg_clear = crate::hops_view::reorg_clear_at(&memos); let (answered, to_probe) = crate::hops_view::split_probe_targets_after_reorg( &candidates, &memos, now_ms, crate::hops_view::PROBE_MEMO_MAX_AGE_MS, crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS, reorg_clear, )"
+            "let reorg_clear = crate::hops_view::reorg_clear_at(&memos); let (answered, to_probe) = crate::hops_view::split_probe_targets_at_tip( &candidates, &memos, now_ms, crate::hops_view::PROBE_MEMO_MAX_AGE_MS, crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS, reorg_clear, tip, )"
         )));
     }
 
@@ -2804,7 +2879,7 @@ mod tests {
                     memo.spending_txid.as_deref().map(str::to_ascii_lowercase),
                 );
             }
-            let chain = HashMap::from([(key.clone(), stale_memo_word(memo, now_ms, clear))]);
+            let chain = HashMap::from([(key.clone(), stale_memo_word(memo, now_ms, clear, None))]);
             let mut sweeps = HashMap::from([(
                 key.clone(),
                 crate::hopsweep::FiledHopSweep {
@@ -2842,7 +2917,7 @@ mod tests {
         // THE REGRESSION: a rival confirmed word read inside the grace, served past the budget
         let rival_memo = memo_naming(&rival, m1);
         assert_eq!(
-            stale_memo_word(&rival_memo, w2, Some(t0)).spent_confirmed,
+            stale_memo_word(&rival_memo, w2, Some(t0), None).spent_confirmed,
             None,
             "the word claims nothing: its confirmation stays refused"
         );
@@ -2986,7 +3061,7 @@ mod tests {
                 .find(&squash(needle))
                 .unwrap_or_else(|| panic!("the owed walk no longer runs: {needle}"))
         };
-        let remembered = at("if crate::hops_view::confirmation_refused(m, reorg_clear) { refused_words.insert(key.clone(), m.spending_txid.as_deref().map(str::to_ascii_lowercase)); } hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear));");
+        let remembered = at("if crate::hops_view::confirmation_refused(m, reorg_clear) { refused_words.insert(key.clone(), m.spending_txid.as_deref().map(str::to_ascii_lowercase)); } hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear, tip));");
         let proof_read =
             at("hop_sweeps.insert(key, crate::hopsweep::pick_filed_sweep(newest, older));");
         let set_aside = at("let proofs_set_aside = crate::hops_view::set_aside_proofs_a_refused_word_contradicts(&mut hop_sweeps, &refused_words);");
@@ -3026,7 +3101,14 @@ mod tests {
         for (t, v) in &candidates {
             conn.execute(
                 PROBE_MEMO_UPSERT_SQL,
-                rusqlite::params![format!("{t}.{v}"), t0 + 5_000, true, "e5".repeat(32), true],
+                rusqlite::params![
+                    format!("{t}.{v}"),
+                    t0 + 5_000,
+                    true,
+                    "e5".repeat(32),
+                    true,
+                    None::<i64>
+                ],
             )
             .unwrap();
         }
@@ -3052,6 +3134,7 @@ mod tests {
                             spent: r.get(2)?,
                             spending_txid: r.get(3)?,
                             spent_confirmed: r.get(4)?,
+                            tip_height: None,
                         })
                     })
                     .unwrap();
@@ -3218,6 +3301,8 @@ mod tests {
             spent_confirmed: Some(confirmed),
             stale: false,
             age_ms: None,
+            probe_tip: None,
+            predates_tip: false,
         };
         let grace_of = |confirmed: Option<bool>, taken_at: i64| -> HashSet<String> {
             if confirmed_in_reorg_grace(confirmed, taken_at, clear) {
@@ -3277,7 +3362,7 @@ mod tests {
         );
         assert!(answered.is_empty() && to_probe.len() == 1, "asked again");
         // ... and PAST THE PROBE BUDGET the memo's word is served without the confirmation the grace refused
-        let stale = stale_memo_word(&memo, w2, clear);
+        let stale = stale_memo_word(&memo, w2, clear, None);
         assert_eq!(
             (
                 stale.stale,
@@ -3352,12 +3437,12 @@ mod tests {
             ..memo.clone()
         };
         assert_eq!(
-            stale_memo_word(&late, w3 + 3 * 60 * min, clear).spent_confirmed,
+            stale_memo_word(&late, w3 + 3 * 60 * min, clear, None).spent_confirmed,
             Some(true),
             "a memo read past the grace keeps its word when stale, as before"
         );
         assert_eq!(
-            stale_memo_word(&memo, w2, None).spent_confirmed,
+            stale_memo_word(&memo, w2, None, None).spent_confirmed,
             Some(true),
             "no reorg: as before"
         );
@@ -3366,7 +3451,7 @@ mod tests {
             ..memo.clone()
         };
         assert_eq!(
-            stale_memo_word(&unconfirmed, w2, clear).spent_confirmed,
+            stale_memo_word(&unconfirmed, w2, clear, None).spent_confirmed,
             Some(false),
             "only a confirmation is refused"
         );
@@ -3391,7 +3476,7 @@ mod tests {
         for needle in [
             "let reorg_clear = crate::hops_view::reorg_clear_at(&memos);",
             "if crate::hops_view::confirmed_in_reorg_grace(p.spent_confirmed, now_ms - age_ms.unwrap_or(0), reorg_clear) { grace_words.insert(outpoint_key(&t, v)); }",
-            "hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear));",
+            "hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear, tip));",
             "if crate::hops_view::confirmed_in_reorg_grace(row.spent_confirmed, now_ms, reorg_clear) { grace_words.insert(key.clone()); }",
             "crate::hops_view::mark_reorg_grace_rows(&mut rows, &grace_words); sort_rows_for_service(&mut rows);",
         ] {
@@ -3412,6 +3497,7 @@ mod tests {
             spent,
             spending_txid: if spent { Some("e5".repeat(32)) } else { None },
             spent_confirmed: if spent { Some(true) } else { None },
+            tip_height: None,
         };
         let memos = vec![
             memo("a1", 60_000, false),                   // fresh, unspent
@@ -3477,7 +3563,7 @@ mod tests {
             spent_confirmed: None,
         };
         assert_eq!(probe_memo_of("a1", 0, &unknown_spent, now), None);
-        assert_eq!(probe_memo_read_sql(3), "SELECT outpoint, probedAtMs, spent, spendingTxid, spentConfirmed FROM hop_chain_probes WHERE outpoint IN (?, ?, ?)");
+        assert_eq!(probe_memo_read_sql(3), "SELECT outpoint, probedAtMs, spent, spendingTxid, spentConfirmed, tipHeight FROM hop_chain_probes WHERE outpoint IN (?, ?, ?)");
     }
 
     /// bsv-low #469, the stranded cell's run 5 (2026-09-19): the owed walk's two rules against starvation, pinned on
@@ -3494,6 +3580,7 @@ mod tests {
             spent,
             spending_txid: if spent { Some("e5".repeat(32)) } else { None },
             spent_confirmed: confirmed,
+            tip_height: None,
         };
         // 1. the confirmed window (2 h since the gate's M1): a CONFIRMED spend 1 h old answers the owed walk and is asked
         //    by everyone else; 3 h old it is asked by all; an UNCONFIRMED spend and an UNSPENT word 6 min old are asked
