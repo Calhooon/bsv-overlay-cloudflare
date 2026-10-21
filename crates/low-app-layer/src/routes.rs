@@ -5757,8 +5757,7 @@ impl OwedWalk {
             slice,
         }
     }
-    /// A walk no claim holds (the first read's compute inside its request, the deferred alarm): a fresh invocation's
-    /// full slice from now.
+    /// A walk no claim holds (the first read's compute inside its request): a fresh invocation's full slice from now.
     fn unclaimed() -> Self {
         let now = worker::Date::now().as_millis() as i64;
         let slice = crate::owed::owed_walk_slice(now, crate::owed::owed_invocation_end(now))
@@ -5769,24 +5768,45 @@ impl OwedWalk {
             });
         Self::new(now, slice)
     }
+    /// The deferred alarm's walk (the FIX-800 lens's MEDIUM-3): the Durable Object's alarm has no `wait_until`
+    /// ceiling and holds no lock, so its walk takes its own slice (`owed::owed_deferred_walk_slice`: one #648 window).
+    fn deferred() -> Self {
+        let now = worker::Date::now().as_millis() as i64;
+        Self::new(now, crate::owed::owed_deferred_walk_slice(now))
+    }
 }
 
 /// bsv-low #800: `fut` unless `ms` pass first (`None`: dropped, as the platform would drop it at its ceiling).
 async fn owed_with_deadline<F: core::future::Future>(fut: F, ms: u64) -> Option<F::Output> {
+    owed_with_deadline_on(
+        fut,
+        worker::Delay::from(core::time::Duration::from_millis(ms)),
+    )
+    .await
+}
+
+/// The race itself, over any timer (the FIX-800 lens's LOW-3: pinned with a virtual clock, `fix800_e`): `fut` unless
+/// `timer` is ready first, in which case `fut` is DROPPED (`None`).
+async fn owed_with_deadline_on<F, T>(fut: F, timer: T) -> Option<F::Output>
+where
+    F: core::future::Future,
+    T: core::future::Future<Output = ()>,
+{
     use futures_util::future::Either;
-    let delay = worker::Delay::from(core::time::Duration::from_millis(ms));
-    futures_util::pin_mut!(fut, delay);
-    match futures_util::future::select(fut, delay).await {
+    futures_util::pin_mut!(fut, timer);
+    match futures_util::future::select(fut, timer).await {
         Either::Left((out, _)) => Some(out),
         Either::Right(((), _)) => None,
     }
 }
 
-/// How a claim's walk went: shed by the ceiling (#499: the shed re-marked the identity and armed its deferred walk),
-/// not started for want of a slice (#800), or run under its slice (`walked` is `None` when the claim dropped it at
-/// its hard deadline).
+/// How a claim's walk went: shed by the ceiling (#499: the CLAIM re-marks the identity and arms its deferred walk
+/// for `deferred`, captured before any await, once it released its lock), not started for want of a slice (#800),
+/// or run under its slice (`walked` is `None` when the claim dropped it at its hard deadline).
 pub(crate) enum OwedClaimWalk {
-    Shed,
+    Shed {
+        deferred: Option<i64>,
+    },
     NoSlice,
     Ran {
         rid: String,
@@ -5796,8 +5816,9 @@ pub(crate) enum OwedClaimWalk {
 
 /// ONE walk of a claim. The ceiling is asked first unless the caller already admitted it (the read's refresh
 /// reserves before its answer), then the walk runs in the slice its invocation has left (`owed::owed_walk_slice`),
-/// dropped at its hard deadline. Nothing is pushed here: the claim releases its lock first
-/// (`owed_recompute_claimed`), then tells the page (`owed_walk_told`).
+/// dropped at its hard deadline. Nothing is awaited here but the walk: the claim releases its lock first
+/// (`owed_recompute_claimed`), then re-marks a shed, marks a dropped walk stale and tells the page (the FIX-800 lens's
+/// LOW-2: the shed's two awaits ran under the lock).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn owed_recompute_and_push(
     env: &worker::Env,
@@ -5813,10 +5834,9 @@ pub(crate) async fn owed_recompute_and_push(
     // lens fold's M1: a walk in flight when the hook marked stale cleared that mark with its own write, and this
     // folded rerun is the one shed; without the re-mark the next read served the older rows as fresh)
     if !admitted && !owed_recompute_admit(identity_lc, source, true) {
-        let deferred = owed_deferred_deadline(identity_lc);
-        owed_shed_remark(db, identity_lc).await;
-        owed_schedule_deferred(env, identity_lc, deferred).await;
-        return OwedClaimWalk::Shed;
+        return OwedClaimWalk::Shed {
+            deferred: owed_deferred_deadline(identity_lc),
+        };
     }
     let now = worker::Date::now().as_millis() as i64;
     let Some(slice) = crate::owed::owed_walk_slice(now, invocation_end_ms) else {
@@ -5830,6 +5850,9 @@ pub(crate) async fn owed_recompute_and_push(
         return OwedClaimWalk::NoSlice;
     };
     let walk = OwedWalk::new(token, slice);
+    // the FIX-800 lens's LOW-1: this walk serves every ask folded before it starts, so their entry goes now; one
+    // still in the map after it was folded DURING it (the rerun's), and a read treats it as stale (`owed_folded_waiting`)
+    OWED_RERUN.with(|m| m.borrow_mut().remove(identity_lc));
     let walked = owed_walk_bounded(env, db, identity_lc, source, tip_hint, &walk).await;
     OwedClaimWalk::Ran {
         rid: walk.rid,
@@ -5916,16 +5939,32 @@ async fn owed_walk_told(
     Ok(())
 }
 
+/// bsv-low #800 (the FIX-800 lens's MEDIUM-1): a walk that wrote nothing (dropped at its deadline, never started)
+/// tells the page anyway, AFTER the identity's stale mark: the page re-reads `/owed` only on an event (no poll), so
+/// without it an open page kept the pre-filing list until the next tip or a reconnect. Its read is served the stored
+/// rows and walks on a fresh invocation; a read past #499's ceiling is shed (`refresh: "shed"`, `retryAfterMs`), so
+/// a walk that is dropped every time costs at most the ceiling's walks a window, then the alarm's one.
+async fn owed_stale_nudge(env: &worker::Env, identity_lc: &str, source: &str) {
+    crate::internal_events::first_party_push(
+        env,
+        identity_lc,
+        crate::owed::owed_stale_event_body(identity_lc, source),
+    )
+    .await;
+}
+
 /// The alarm owns one reserved walk from the exhausted window. It does not consume the next window's admits. Its
-/// walk is bounded like a claim's (bsv-low #800); one dropped at its deadline marks the identity stale and answers a
-/// fault (the alarm's one re-arm, #648).
+/// walk is bounded by its OWN deadline, one #648 window (`owed::OWED_DEFERRED_WALK_DEADLINE_MS`, 60 s; the FIX-800
+/// lens's MEDIUM-3: it ran under a claim's 24 s), never the invocation's 30 s: an alarm has no `wait_until` ceiling
+/// and holds no lock. One dropped at it marks the identity stale, tells the page (MEDIUM-1) and answers a fault (the
+/// alarm's one re-arm, #648).
 pub(crate) async fn owed_deferred_walk_and_push(
     env: &worker::Env,
     identity_lc: &str,
 ) -> worker::Result<()> {
     let db = env.d1("OVERLAY_DB")?;
     crate::owed::note_recompute_deferred();
-    let walk = OwedWalk::unclaimed();
+    let walk = OwedWalk::deferred();
     worker::console_log!("[owed] deferred walk {} for {identity_lc}", walk.rid);
     match owed_walk_bounded(env, &db, identity_lc, "deferred", None, &walk).await {
         Some(walked) => owed_walk_told(env, identity_lc, "deferred", &walk.rid, walked).await,
@@ -5937,6 +5976,7 @@ pub(crate) async fn owed_deferred_walk_and_push(
                 "walk deadline",
             )
             .await;
+            owed_stale_nudge(env, identity_lc, "deferred").await;
             Err(worker::Error::RustError(
                 "owed deferred walk dropped at its hard deadline".into(),
             ))
@@ -6050,7 +6090,8 @@ pub(crate) fn owed_rate_at_ceiling(now_ms: i64) -> usize {
 /// and a live claim re-stamps its progress before every walk (the delta-verify's LOW-2: a slow-but-answering D1
 /// must never read as an abandoned future, or the takeover starts the parallel walk this lock exists to prevent).
 /// bsv-low #800: 30 s, the platform's own `wait_until` ceiling (it was 60 s). Since every walk is dropped by its claim
-/// at its hard deadline (`owed::OWED_WALK_HARD_DEADLINE_MS`, 24 s) and the claim re-stamps before and after each, no
+/// at its hard deadline (at most `owed::OWED_WALK_HARD_DEADLINE_MS`, 27 s) and the claim re-stamps before and after
+/// each, with no await under the lock between them but the walk (the FIX-800 lens's LOW-2), no
 /// LIVE claim goes untouched for 30 s; a mark that has is a future the platform cancelled, and the next ask takes it
 /// over at once instead of 30 s later.
 pub(crate) const OWED_IN_FLIGHT_STALE_MS: i64 = crate::owed::OWED_PLATFORM_WAIT_UNTIL_MS;
@@ -6191,9 +6232,12 @@ pub(crate) async fn owed_recompute_claimed(
 ) {
     let mut src = source.to_string();
     let mut reruns = 0usize;
+    // the landed walks' pushes, made once the lock is released (the FIX-800 lens's LOW-2)
+    let mut told = Vec::new();
     loop {
         if !owed_refresh_touch(identity_lc, token) {
             // the mark is no longer ours (a takeover after a long silence): the other claim owns the rerun map now
+            owed_tell_all(env, identity_lc, told).await;
             return;
         }
         let admitted = std::mem::take(&mut first_admitted);
@@ -6209,10 +6253,14 @@ pub(crate) async fn owed_recompute_claimed(
         )
         .await;
         let (end, rid, walked) = match ran {
-            OwedClaimWalk::Shed => {
-                // the shed re-marked the identity stale and armed its deferred walk: a folded ask is served by that
-                // walk or the next read (it stays in the map for the next claim, as the overflow's below)
+            OwedClaimWalk::Shed { deferred } => {
+                // the FIX-800 lens's LOW-2: released FIRST, then the shed's re-mark and its deferred walk (#499; the
+                // deadline was captured before any await); a folded ask is served by that walk or the next read (it
+                // stays in the map for the next claim)
                 owed_refresh_end(identity_lc, token);
+                owed_shed_remark(db, identity_lc).await;
+                owed_schedule_deferred(env, identity_lc, deferred).await;
+                owed_tell_all(env, identity_lc, told).await;
                 return;
             }
             OwedClaimWalk::NoSlice => (crate::owed::OwedWalkEnd::NoSlice, String::new(), None),
@@ -6222,8 +6270,9 @@ pub(crate) async fn owed_recompute_claimed(
             // the delta-verify's LOW-4: a takeover DURING this walk owns the rerun map now — this claim must neither
             // steal a folded ask (dropping it on its own way out) nor mark stale on the takeover's behalf
             if let Some(w) = walked {
-                let _ = owed_walk_told(env, identity_lc, &src, &rid, w).await;
+                told.push((src.clone(), rid, w));
             }
+            owed_tell_all(env, identity_lc, told).await;
             return;
         }
         let folded = OWED_RERUN.with(|m| m.borrow().contains_key(identity_lc));
@@ -6234,13 +6283,14 @@ pub(crate) async fn owed_recompute_claimed(
         {
             // bsv-low #800: THE RELEASE POINT. The lock is released in the step the walk ended (its snapshot written,
             // cut at its budget, dropped at its deadline, or never started), before any further await, so no walk the
-            // platform can still cancel runs under it; the stale mark (one statement) and the push come after.
-            crate::owed::OwedClaimStep::Release { mark_stale } => {
+            // platform can still cancel runs under it; the stale mark (one statement) and the pushes come after.
+            crate::owed::OwedClaimStep::Release { mark_stale, nudge } => {
                 owed_refresh_end(identity_lc, token);
                 if mark_stale {
                     // the delta-verify's LOW-1: an ask left folded (or a walk that wrote nothing) is served by the
                     // NEXT read — the walk may just have written `stale = 0`, so the mark is set again here (a folded
-                    // ask itself stays in the map for the next claim)
+                    // ask itself stays in the map for the next claim, and a read on this isolate treats it as stale
+                    // even when a dropped walk's batch, landing after this mark, cleared it: the FIX-800 lens's LOW-1)
                     owed_mark_stale(
                         db,
                         crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
@@ -6254,13 +6304,20 @@ pub(crate) async fn owed_recompute_claimed(
                     .await;
                 }
                 if let Some(w) = walked {
-                    let _ = owed_walk_told(env, identity_lc, &src, &rid, w).await;
+                    told.push((src.clone(), rid, w));
+                }
+                owed_tell_all(env, identity_lc, told).await;
+                if nudge {
+                    // the FIX-800 lens's MEDIUM-1: nothing written, the page told after the mark, outside the lock
+                    owed_stale_nudge(env, identity_lc, &src).await;
                 }
                 return;
             }
             crate::owed::OwedClaimStep::Rerun => {
+                // the FIX-800 lens's LOW-2: the landed walk's push waits for the release (it ran here, under the
+                // lock); the twins' serialisation is unchanged, the first walk's push comes after the rerun's walk
                 if let Some(w) = walked {
-                    let _ = owed_walk_told(env, identity_lc, &src, &rid, w).await;
+                    told.push((src.clone(), rid, w));
                 }
                 match OWED_RERUN.with(|m| m.borrow_mut().remove(identity_lc)) {
                     Some(again) => {
@@ -6269,12 +6326,33 @@ pub(crate) async fn owed_recompute_claimed(
                     }
                     None => {
                         owed_refresh_end(identity_lc, token);
+                        owed_tell_all(env, identity_lc, told).await;
                         return;
                     }
                 }
             }
         }
     }
+}
+
+/// The walks a claim ran, told in their order once its lock is released (the FIX-800 lens's LOW-2).
+async fn owed_tell_all(
+    env: &worker::Env,
+    identity_lc: &str,
+    told: Vec<(String, String, std::result::Result<OwedComputed, String>)>,
+) {
+    for (src, rid, w) in told {
+        let _ = owed_walk_told(env, identity_lc, &src, &rid, w).await;
+    }
+}
+
+/// The FIX-800 lens's LOW-1: an ask folded during a walk and not served by a rerun stays in `OWED_RERUN` (and the
+/// claim marked the identity stale). A dropped walk's write batch, already sent, can land AFTER that mark and write
+/// `stale = 0`; the read on this isolate then still refreshes while the ask waits (the next walk takes the entry as it
+/// starts). Another isolate's read sees only the D1 mark: there the folded evidence waits for the open-row age (5 min)
+/// or the next trigger, as before.
+fn owed_folded_waiting(identity_lc: &str) -> bool {
+    OWED_RERUN.with(|m| m.borrow().contains_key(identity_lc))
 }
 
 /// The snapshot the table holds for `identity_lc` (the marker, then its rows): what a superseded read serves.
@@ -6525,7 +6603,8 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             // The read's rule (N5, `should_recompute`): the marker's stale flag; the tip reaching an in-progress
             // row's recovery height since the compute; an OPEN list older than 5 minutes; any list older than 15.
             // N7: the tip is read only when a row could flip on it (or a recompute is about to need it).
-            let stale = st.stale.unwrap_or(0.0) != 0.0;
+            // the FIX-800 lens's LOW-1: an ask folded on this isolate and still waiting reads as the mark
+            let stale = st.stale.unwrap_or(0.0) != 0.0 || owed_folded_waiting(&identity);
             let prev_tip = st.tip.map(|t| t as u64);
             let age_ms = now_ms.saturating_sub(st.computed_at_ms as i64);
             // N7: the tip is read only when a row could flip on it. bsv-low #669: a claimable hop-stranded sweep
@@ -10663,7 +10742,10 @@ mod tests {
         let step = owed_claim_step(OwedWalkEnd::WrittenCut, true, true, next_slice);
         assert_eq!(
             step,
-            OwedClaimStep::Release { mark_stale: true },
+            OwedClaimStep::Release {
+                mark_stale: true,
+                nudge: false
+            },
             "a cut walk never holds the lock into another walk"
         );
         assert!(super::owed_lock_release(&mut m, ID800, token));
@@ -10674,7 +10756,10 @@ mod tests {
         // a cut walk with nothing folded releases and marks nothing (its partial snapshot stands; the age rules go on)
         assert_eq!(
             owed_claim_step(OwedWalkEnd::WrittenCut, false, true, true),
-            OwedClaimStep::Release { mark_stale: false }
+            OwedClaimStep::Release {
+                mark_stale: false,
+                nudge: false
+            }
         );
     }
 
@@ -10689,11 +10774,17 @@ mod tests {
                 for slice in [false, true] {
                     assert_eq!(
                         owed_claim_step(OwedWalkEnd::PastDeadline, folded, left, slice),
-                        OwedClaimStep::Release { mark_stale: true }
+                        OwedClaimStep::Release {
+                            mark_stale: true,
+                            nudge: true
+                        }
                     );
                     assert_eq!(
                         owed_claim_step(OwedWalkEnd::NoSlice, folded, left, slice),
-                        OwedClaimStep::Release { mark_stale: true }
+                        OwedClaimStep::Release {
+                            mark_stale: true,
+                            nudge: true
+                        }
                     );
                 }
             }
@@ -10709,16 +10800,25 @@ mod tests {
         );
         assert_eq!(
             owed_claim_step(OwedWalkEnd::Written, true, true, false),
-            OwedClaimStep::Release { mark_stale: true },
+            OwedClaimStep::Release {
+                mark_stale: true,
+                nudge: false
+            },
             "no slice for the folded ask: the next read serves it"
         );
         assert_eq!(
             owed_claim_step(OwedWalkEnd::Written, true, false, true),
-            OwedClaimStep::Release { mark_stale: true }
+            OwedClaimStep::Release {
+                mark_stale: true,
+                nudge: false
+            }
         );
         assert_eq!(
             owed_claim_step(OwedWalkEnd::Written, false, true, true),
-            OwedClaimStep::Release { mark_stale: false }
+            OwedClaimStep::Release {
+                mark_stale: false,
+                nudge: false
+            }
         );
         // an abandoned claim: re-stamped at t0, cancelled by the platform, never released
         let t0 = 5_000_000i64;
@@ -10817,7 +10917,7 @@ mod tests {
             .expect("the claim");
         let body = &r[claimed..claimed + r[claimed..].find("asyncfnowed_read_stored(").unwrap()];
         assert!(body.contains(&squash(
-            "crate::owed::OwedClaimStep::Release { mark_stale } => { owed_refresh_end(identity_lc, token); if mark_stale {"
+            "crate::owed::OwedClaimStep::Release { mark_stale, nudge } => { owed_refresh_end(identity_lc, token); if mark_stale {"
         )));
         assert!(body.contains(&squash("let ran = owed_recompute_and_push(")));
         let bounded = r
@@ -10860,6 +10960,293 @@ mod tests {
             rp.matches(&squash("\"filing\", None, crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64),")).count(),
             1
         );
+    }
+
+    // ── the FIX-800 lens fold (bsv-low #800): the deadline's derivation, the race, the alarm, the nudge ──
+
+    /// A virtual clock for the deadline race (the lens's LOW-3): a future ready once the clock reaches `at`.
+    struct At {
+        clock: std::rc::Rc<std::cell::Cell<i64>>,
+        at: i64,
+    }
+    impl core::future::Future for At {
+        type Output = ();
+        fn poll(
+            self: core::pin::Pin<&mut Self>,
+            _: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<()> {
+            if self.clock.get() >= self.at {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        }
+    }
+    /// Run a walk of `walk_ms` against a timer of `deadline_ms` through the SHIPPED race (`owed_with_deadline_on`),
+    /// the clock moved 100 ms a poll: `Some(ended_at)` when the walk landed, `None` when the race dropped it (and the
+    /// clock at the drop).
+    fn race_virtual(walk_ms: i64, deadline_ms: u64) -> (Option<i64>, i64) {
+        let clock = std::rc::Rc::new(std::cell::Cell::new(0i64));
+        let walk = {
+            let c = clock.clone();
+            async move {
+                At {
+                    clock: c.clone(),
+                    at: walk_ms,
+                }
+                .await;
+                c.get()
+            }
+        };
+        let timer = At {
+            clock: clock.clone(),
+            at: deadline_ms as i64,
+        };
+        let fut = super::owed_with_deadline_on(walk, timer);
+        let mut fut = std::pin::pin!(fut);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = core::task::Context::from_waker(&waker);
+        for _ in 0..10_000 {
+            if let core::task::Poll::Ready(out) = core::future::Future::poll(fut.as_mut(), &mut cx)
+            {
+                return (out, clock.get());
+            }
+            clock.set(clock.get() + 100);
+        }
+        panic!("the race never ended");
+    }
+
+    /// The FIX-800 lens's MEDIUM-2 and LOW-3: the claimed walk's hard deadline is derived ONCE from the invocation's
+    /// start (30 s - 3 s reserve = 27 s), so a 26 s walk started at the invocation's start LANDS (as first built it
+    /// was dropped at 24 s: the start lag counted twice) and a 28 s one is CUT at 27 s; a walk started later gets what
+    /// is left. Through the shipped race over a virtual clock, so the race itself is pinned. To red: the slice capped
+    /// at 24 s from the walk's own start (a6b77c4's `owed_walk_slice`: "a 26 s walk lands, left: None"), or the race
+    /// replaced by `Some(fut.await)` ("a 28 s walk is cut").
+    #[test]
+    fn fix800_e_a_claimed_walk_runs_to_the_invocations_27s_and_is_cut_past_it() {
+        assert_eq!(
+            OWED_WALK_HARD_DEADLINE_MS,
+            OWED_PLATFORM_WAIT_UNTIL_MS - OWED_RELEASE_RESERVE_MS
+        );
+        assert_eq!(OWED_WALK_HARD_DEADLINE_MS, 27_000);
+        let t0 = 0i64;
+        let end = owed_invocation_end(t0);
+        let first = owed_walk_slice(t0, end).expect("a slice");
+        assert_eq!(
+            first.hard_deadline_ms, end,
+            "the deadline is the invocation's end"
+        );
+        assert_eq!(first.hard_ms(), 27_000);
+        assert_eq!(
+            race_virtual(26_000, first.hard_ms()),
+            (Some(26_000), 26_000),
+            "a 26 s walk lands"
+        );
+        assert_eq!(
+            race_virtual(28_000, first.hard_ms()),
+            (None, 27_000),
+            "a 28 s walk is cut at the invocation's 27 s"
+        );
+        // the hook's second identity, started 10 s in: 17 s left, a 16 s walk lands, an 18 s one is cut at 17 s
+        let second = owed_walk_slice(t0 + 10_000, end).expect("17 s left");
+        assert_eq!(second.hard_ms(), 17_000);
+        assert_eq!(race_virtual(16_000, second.hard_ms()).0, Some(16_000));
+        assert_eq!(race_virtual(18_000, second.hard_ms()), (None, 17_000));
+        // the outward budgets, as stated on `owed_walk_slice` (the lens's LOW-4)
+        for (start, outward) in [
+            (0, 12_000),
+            (3_000, 12_000),
+            (8_000, 9_500),
+            (11_000, 8_000),
+            (16_000, 5_500),
+            (19_000, 4_000),
+        ] {
+            let sl = owed_walk_slice(start, end).expect("a slice");
+            assert_eq!(
+                sl.outward_deadline_ms - start,
+                outward,
+                "a walk started at {start}"
+            );
+        }
+        assert!(owed_walk_slice(19_001, end).is_none());
+        // the production race is this one over the platform's timer
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let r = squash(include_str!("routes.rs"));
+        assert!(r.contains(&squash(
+            "async fn owed_with_deadline<F: core::future::Future>(fut: F, ms: u64) -> Option<F::Output> { owed_with_deadline_on( fut, worker::Delay::from(core::time::Duration::from_millis(ms)), ) .await }"
+        )));
+    }
+
+    /// The FIX-800 lens's MEDIUM-3: the deferred alarm's walk takes its OWN deadline, one #648 window (60 s), not a
+    /// claim's: a 40 s alarm walk lands, a 61 s one is dropped at 60 s; its outward budget stays 12 s. To red: the
+    /// alarm's slice a claim's (a6b77c4: `OwedWalk::unclaimed()`, 24 s: "an alarm walk of 40 s lands, left: None").
+    #[test]
+    fn fix800_f_the_alarms_walk_takes_its_own_window_and_lands_past_24s() {
+        use crate::owed::{owed_deferred_walk_slice, OWED_DEFERRED_WALK_DEADLINE_MS};
+        assert_eq!(
+            OWED_DEFERRED_WALK_DEADLINE_MS,
+            crate::owed::OWED_RECOMPUTE_RATE_WINDOW_MS
+        );
+        let sl = owed_deferred_walk_slice(0);
+        assert_eq!(sl.hard_ms(), 60_000);
+        assert_eq!(sl.outward_deadline_ms, OWED_RECOMPUTE_TIME_BUDGET_MS);
+        assert_eq!(
+            race_virtual(40_000, sl.hard_ms()).0,
+            Some(40_000),
+            "an alarm walk of 40 s lands"
+        );
+        assert_eq!(race_virtual(61_000, sl.hard_ms()), (None, 60_000));
+        // the alarm's walk is built from that slice, never a claim's or the first read's
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let src = include_str!("routes.rs");
+        let r = squash(&src[..src.find("\nmod tests {").expect("the tests module")]);
+        assert!(r.contains(&squash(
+            "fn deferred() -> Self { let now = worker::Date::now().as_millis() as i64; Self::new(now, crate::owed::owed_deferred_walk_slice(now)) }"
+        )));
+        let d = r
+            .find(&squash("pub(crate) async fn owed_deferred_walk_and_push("))
+            .expect("the alarm's walk");
+        let body = &r[d..d + r[d..]
+            .find(&squash("pub(crate) const OWED_RECOMPUTE_LEDGER_KEY"))
+            .unwrap()];
+        assert!(body.contains(&squash("let walk = OwedWalk::deferred();")));
+        assert!(!body.contains("OwedWalk::unclaimed()"));
+    }
+
+    /// The FIX-800 lens's MEDIUM-1: a walk dropped at its deadline, or never started, ends with the identity marked
+    /// stale AND the page told (`owed-changed`, rows null), the push after the mark and outside the lock; the alarm's
+    /// dropped walk too. To red: the nudge off for `PastDeadline` / `NoSlice` (a6b77c4's rule: "left: Release {
+    /// mark_stale: true, nudge: false }"), or the nudge moved above the mark or the release.
+    #[test]
+    fn fix800_g_a_dropped_or_unstarted_walk_marks_stale_and_tells_the_page() {
+        for end in [OwedWalkEnd::PastDeadline, OwedWalkEnd::NoSlice] {
+            for folded in [false, true] {
+                assert_eq!(
+                    owed_claim_step(end, folded, true, true),
+                    OwedClaimStep::Release {
+                        mark_stale: true,
+                        nudge: true
+                    },
+                    "{end:?}"
+                );
+            }
+        }
+        // a walk that wrote tells the page with its own push (`owed_walk_told`), never the nudge
+        for end in [
+            OwedWalkEnd::Written,
+            OwedWalkEnd::WrittenCut,
+            OwedWalkEnd::Faulted,
+        ] {
+            for folded in [false, true] {
+                if let OwedClaimStep::Release { nudge, .. } =
+                    owed_claim_step(end, folded, false, false)
+                {
+                    assert!(!nudge, "{end:?}");
+                }
+            }
+        }
+        let ev = crate::owed::owed_stale_event_body("ABcd", "walk");
+        assert_eq!(ev["kind"], "owed-changed");
+        assert_eq!(ev["identity"], "abcd");
+        assert_eq!(ev["recipient"], "abcd");
+        assert!(ev["rows"].is_null() && ev["computedAtMs"].is_null());
+        assert_eq!(ev["stale"], true);
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let src = include_str!("routes.rs");
+        let code: String = src[..src.find("\nmod tests {").expect("the tests module")]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = squash(&code);
+        let arm = r
+            .find(&squash(
+                "crate::owed::OwedClaimStep::Release { mark_stale, nudge } => {",
+            ))
+            .expect("the release arm");
+        let arm = &r[arm..arm
+            + r[arm..]
+                .find(&squash("crate::owed::OwedClaimStep::Rerun =>"))
+                .unwrap()];
+        let release = arm
+            .find("owed_refresh_end(identity_lc,token);")
+            .expect("the release");
+        let mark = arm.find("owed_mark_stale(").expect("the mark");
+        let nudge = arm
+            .find(&squash(
+                "if nudge { owed_stale_nudge(env, identity_lc, &src).await; }",
+            ))
+            .expect("the nudge");
+        assert!(
+            release < mark && mark < nudge,
+            "release, mark, then the push"
+        );
+        let d = r
+            .find(&squash("pub(crate) async fn owed_deferred_walk_and_push("))
+            .expect("the alarm's walk");
+        let alarm = &r[d..];
+        let am = alarm.find("\"walkdeadline\",").expect("the alarm's mark");
+        let an = alarm
+            .find(&squash(
+                "owed_stale_nudge(env, identity_lc, \"deferred\").await;",
+            ))
+            .expect("the alarm's nudge");
+        assert!(am < an);
+    }
+
+    /// The FIX-800 lens's LOW-2 and LOW-1. LOW-2: nothing but the walk is awaited under the lock: the shed's re-mark
+    /// and deferred walk run after the release, and a landed walk's push in the `Rerun` arm waits for the release
+    /// (`told`). LOW-1: the walk takes the folded asks it serves as it starts, and an ask still folded after a claim
+    /// reads as stale on this isolate, so a dropped walk's batch landing after the mark cannot strand it. To red:
+    /// `owed_walk_told(` back in the `Rerun` arm, the shed's awaits back in `owed_recompute_and_push`, or
+    /// `owed_folded_waiting` dropped from the read's `stale`.
+    #[test]
+    fn fix800_h_nothing_but_the_walk_is_awaited_under_the_lock_and_a_folded_ask_reads_stale() {
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let src = include_str!("routes.rs");
+        let code: String = src[..src.find("\nmod tests {").expect("the tests module")]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = squash(&code);
+        let rerun = r
+            .find(&squash("crate::owed::OwedClaimStep::Rerun => {"))
+            .expect("the rerun arm");
+        let rerun_arm = &r[rerun..rerun + r[rerun..].find(&squash("Some(again) =>")).unwrap()];
+        assert!(
+            !rerun_arm.contains(".await"),
+            "no await before the next walk: {rerun_arm}"
+        );
+        let push = r
+            .find(&squash("pub(crate) async fn owed_recompute_and_push("))
+            .expect("the claim's walk");
+        let push_body = &r[push..push
+            + r[push..]
+                .find(&squash("async fn owed_walk_bounded("))
+                .unwrap()];
+        assert_eq!(
+            push_body.matches(".await").count(),
+            1,
+            "the walk is the claim's walk function's one await"
+        );
+        let take = push_body
+            .find(&squash(
+                "OWED_RERUN.with(|m| m.borrow_mut().remove(identity_lc));",
+            ))
+            .expect("the walk takes the asks it serves");
+        let walk = push_body.find("owed_walk_bounded(").expect("the walk");
+        assert!(take < walk);
+        assert!(r.contains(&squash(
+            "let stale = st.stale.unwrap_or(0.0) != 0.0 || owed_folded_waiting(&identity);"
+        )));
+        // the read's rule over the isolate's map
+        let id = "02aa00000000000000000000000000000000000000000000000000000000fix800h";
+        assert!(!super::owed_folded_waiting(id));
+        OWED_RERUN.with(|m| crate::owed::owed_rerun_note(&mut m.borrow_mut(), id, "filing"));
+        assert!(super::owed_folded_waiting(id));
+        OWED_RERUN.with(|m| m.borrow_mut().remove(id));
+        assert!(!super::owed_folded_waiting(id));
     }
 
     // ── /live-view asks the tower BY OUTPOINT (2026-08-12) ────────────────

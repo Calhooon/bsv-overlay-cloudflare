@@ -853,11 +853,16 @@ pub const OWED_PLATFORM_WAIT_UNTIL_MS: i64 = 30_000;
 /// What a claim needs after its walk: the release (synchronous), one stale mark (one D1 statement) and the
 /// `owed-changed` push (one actor fetch). Kept out of every slice.
 pub const OWED_RELEASE_RESERVE_MS: i64 = 3_000;
-/// The hard deadline of ONE walk, from its start: 24 s. A walk started at the claim (the read's refresh, the hook's
-/// first identity) gets all of it and still leaves the reserve and 3 s of start lag (the hook's tip read, the read's
-/// answer) under the 30 s. The measured walks (loops 38 to 41) ran 12 to 16 s at p50 and 22 to 28 s at the tail; the
-/// tail is the case this cuts, at a point where the claim still runs.
-pub const OWED_WALK_HARD_DEADLINE_MS: i64 = 24_000;
+/// The hard deadline of ONE claimed walk, derived ONCE from the invocation's start (the FIX-800 lens's MEDIUM-2): the
+/// platform's 30 s less the 3 s reserve, 27 s. Every entry captures its invocation's end (`owed_invocation_end`) where
+/// its `wait_until` future starts, BEFORE the hook's tip read or the read's answer, so the start lag is already inside
+/// that end; a walk's hard deadline is that end and nothing shorter (`owed_walk_slice`). As first built the walk was
+/// also capped at 24 s from its OWN start "for 3 s of start lag", which counted the lag twice and dropped the 24 to
+/// 27 s walks the base had landed (loop 39's row-delivering `1 row in 28443 ms` band). A walk started at the
+/// invocation's start gets all 27 s; a later one gets what is left. The residual, stated: a walk of 27 s to about
+/// 29 s that the platform would still have let finish is dropped (the reserve is what pays the release, the stale
+/// mark and the push).
+pub const OWED_WALK_HARD_DEADLINE_MS: i64 = OWED_PLATFORM_WAIT_UNTIL_MS - OWED_RELEASE_RESERVE_MS;
 /// A walk is not started on a slice shorter than this (the hook's second identity behind a slow first one, a folded
 /// rerun behind a slow walk): it would reach its outward cut at 4 s and its hard deadline soon after, writing little
 /// or nothing. The identity is marked stale instead, so the next read walks it on a fresh invocation.
@@ -895,12 +900,30 @@ impl OwedWalkSlice {
 
 /// The slice a walk starting at `now_ms` may take of an invocation that must be done by `invocation_end_ms`
 /// (`owed_invocation_end`); `None` when less than [`OWED_WALK_MIN_SLICE_MS`] is left. PURE (pinned).
+///
+/// The hard deadline is the invocation's end (MEDIUM-2: the start lag is counted once, inside that end); the cap at
+/// [`OWED_WALK_HARD_DEADLINE_MS`] from `now_ms` binds only a clock read before the invocation's own start.
+///
+/// The outward budget is [`OWED_RECOMPUTE_TIME_BUDGET_MS`] or HALF the slice, whichever is less (the lens's LOW-4,
+/// stated, not equalised): the walk's stored D1 reads, the pay-vout pass and the write batch are NOT gated by the
+/// outward clock (skipping one would derive a different row, not a slower one), and loop 39's cut walks ran 22 to 28 s
+/// with their outward legs stopped at 12 s, so the ungated tail is the other half. A first walk gets 12 s of a 27 s
+/// slice; a folded rerun or the hook's next identity starting T s into the invocation gets min(12, (27 - T) / 2):
+/// 12 s at T = 3, 9.5 s at 8, 8 s at 11, 5.5 s at 16, 4 s at 19, and none past 19 (under the 8 s minimum slice).
+/// Equalising them at 12 s would push such a walk's ungated tail past its hard deadline, dropping it whole (nothing
+/// written) where the half cuts it (a partial snapshot written). The cost: those walks are cut more often, and a cut
+/// snapshot standing unmarked (`WrittenCut`, nothing folded) shows pending or withheld rows and honours unrechecked
+/// latches under R-HIGH-1's rule until the 5 min open-row age; the rule is unchanged, it runs more often.
 pub fn owed_walk_slice(now_ms: i64, invocation_end_ms: i64) -> Option<OwedWalkSlice> {
     let hard = now_ms
         .saturating_add(OWED_WALK_HARD_DEADLINE_MS)
         .min(invocation_end_ms);
+    owed_slice_to(now_ms, hard, OWED_WALK_MIN_SLICE_MS)
+}
+
+fn owed_slice_to(now_ms: i64, hard: i64, min_len: i64) -> Option<OwedWalkSlice> {
     let len = hard.saturating_sub(now_ms);
-    if len < OWED_WALK_MIN_SLICE_MS {
+    if len < min_len {
         return None;
     }
     Some(OwedWalkSlice {
@@ -908,6 +931,29 @@ pub fn owed_walk_slice(now_ms: i64, invocation_end_ms: i64) -> Option<OwedWalkSl
         outward_deadline_ms: now_ms.saturating_add(OWED_RECOMPUTE_TIME_BUDGET_MS.min(len / 2)),
         hard_deadline_ms: hard,
     })
+}
+
+/// The deferred alarm's walk (bsv-low #648) runs in the Durable Object's ALARM handler, not in a `wait_until`: it has
+/// no 30 s ceiling and holds no isolate lock, so the invocation's slice is not its bound (the FIX-800 lens's MEDIUM-3:
+/// as first built it was dropped at 24 s, so an identity whose walk is steadily past 24 s, exactly the heavy identity
+/// that reaches the alarm by a shed, could land by no path). Its own hard deadline is ONE #648 window,
+/// [`OWED_RECOMPUTE_RATE_WINDOW_MS`] (60 s): the alarm's faulted retry is armed for the NEXT window's end
+/// (`owed_fault_retry_due`), so a walk bounded by one window has ended before its own retry can be due, and two
+/// deferred walks of one identity never overlap; it is also the most one reserved walk may take of the window it is
+/// charged to. The platform's bound on an alarm handler's wall time is far above it (Cloudflare documents 15 minutes;
+/// not measured here). The outward budget stays 12 s (half of 60 s is more, and the outward legs are the couriers
+/// the rest of the walk must not wait on), so the 48 s past it are the ungated tail's (loop 39's longest: 16 s).
+pub const OWED_DEFERRED_WALK_DEADLINE_MS: i64 = OWED_RECOMPUTE_RATE_WINDOW_MS;
+
+/// The deferred alarm's slice from `now_ms`: [`OWED_DEFERRED_WALK_DEADLINE_MS`] long, its outward budget 12 s. PURE
+/// (pinned).
+pub fn owed_deferred_walk_slice(now_ms: i64) -> OwedWalkSlice {
+    owed_slice_to(
+        now_ms,
+        now_ms.saturating_add(OWED_DEFERRED_WALK_DEADLINE_MS),
+        0,
+    )
+    .expect("a positive deadline")
 }
 
 /// How one claimed walk ended, as the claim's next step reads it (bsv-low #800).
@@ -929,7 +975,13 @@ pub enum OwedWalkEnd {
 /// stale on the way out, or run one folded ask again. PURE (pinned).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwedClaimStep {
-    Release { mark_stale: bool },
+    /// `nudge`: after the stale mark, push `owed-changed` with no rows (`owed_stale_event_body`): the walk wrote
+    /// nothing, and the page re-reads `/owed` only on an event (the FIX-800 lens's MEDIUM-1), so its read, served the
+    /// stale rows, walks on a fresh invocation. Bounded by #499's ceiling: a read past it is shed (`retryAfterMs`).
+    Release {
+        mark_stale: bool,
+        nudge: bool,
+    },
     Rerun,
 }
 
@@ -946,17 +998,22 @@ pub fn owed_claim_step(
 ) -> OwedClaimStep {
     match end {
         // a partial snapshot stands (the next pass continues it, by the age rules); a folded ask marks it stale
-        OwedWalkEnd::WrittenCut => OwedClaimStep::Release { mark_stale: folded },
-        // nothing written by this walk: the identity is marked stale so the next read walks it
-        OwedWalkEnd::PastDeadline | OwedWalkEnd::NoSlice => {
-            OwedClaimStep::Release { mark_stale: true }
-        }
+        OwedWalkEnd::WrittenCut => OwedClaimStep::Release {
+            mark_stale: folded,
+            nudge: false,
+        },
+        // nothing written by this walk: the identity is marked stale and the page told, so its next read walks it
+        OwedWalkEnd::PastDeadline | OwedWalkEnd::NoSlice => OwedClaimStep::Release {
+            mark_stale: true,
+            nudge: true,
+        },
         OwedWalkEnd::Written | OwedWalkEnd::Faulted if folded && reruns_left && next_slice => {
             OwedClaimStep::Rerun
         }
-        OwedWalkEnd::Written | OwedWalkEnd::Faulted => {
-            OwedClaimStep::Release { mark_stale: folded }
-        }
+        OwedWalkEnd::Written | OwedWalkEnd::Faulted => OwedClaimStep::Release {
+            mark_stale: folded,
+            nudge: false,
+        },
     }
 }
 
@@ -5090,6 +5147,8 @@ pub fn owed_health_json() -> Value {
     v["recomputeWalkDeadline"] = json!(RECOMPUTE_WALK_DEADLINE.load(Ordering::Relaxed));
     v["recomputeNoSlice"] = json!(RECOMPUTE_NO_SLICE.load(Ordering::Relaxed));
     v["recomputeWalkHardDeadlineMs"] = json!(OWED_WALK_HARD_DEADLINE_MS);
+    // the FIX-800 lens's MEDIUM-3: the deferred alarm's own deadline
+    v["recomputeDeferredWalkDeadlineMs"] = json!(OWED_DEFERRED_WALK_DEADLINE_MS);
     v
 }
 
@@ -5117,6 +5176,22 @@ pub fn owed_changed_event_body(
         "source": source,
         "rows": rows,
         "computedAtMs": computed_at_ms,
+    })
+}
+
+/// bsv-low #800 (the FIX-800 lens's MEDIUM-1): the push of a walk that wrote NOTHING (dropped at its deadline, never
+/// started): the identity was marked stale, the rows are the stored ones, so `rows` and `computedAtMs` are null
+/// (the client's `lowEvents` parse reads both as null) and `stale` says why. The page re-reads `/owed` on it.
+pub fn owed_stale_event_body(identity: &str, source: &str) -> Value {
+    json!({
+        "v": 1,
+        "kind": "owed-changed",
+        "identity": identity.to_ascii_lowercase(),
+        "recipient": identity.to_ascii_lowercase(),
+        "source": source,
+        "rows": Value::Null,
+        "computedAtMs": Value::Null,
+        "stale": true,
     })
 }
 
@@ -13203,9 +13278,16 @@ pub(crate) mod tests {
             .expect("the hooks' entry");
         assert!(
             routes[push..].starts_with(&squash(
-                "pub(crate) async fn owed_recompute_and_push( env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>, token: i64, invocation_end_ms: i64, admitted: bool, ) -> OwedClaimWalk { if !admitted && !owed_recompute_admit(identity_lc, source, true) { let deferred = owed_deferred_deadline(identity_lc); owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc, deferred).await; return OwedClaimWalk::Shed; }"
+                "pub(crate) async fn owed_recompute_and_push( env: &worker::Env, db: &worker::D1Database, identity_lc: &str, source: &str, tip_hint: Option<u64>, token: i64, invocation_end_ms: i64, admitted: bool, ) -> OwedClaimWalk { if !admitted && !owed_recompute_admit(identity_lc, source, true) { return OwedClaimWalk::Shed { deferred: owed_deferred_deadline(identity_lc), }; }"
             )),
-            "a shed in owed_recompute_and_push re-marks the identity stale before it returns"
+            "a shed in owed_recompute_and_push captures its deferred deadline before any await and returns"
+        );
+        // the FIX-800 lens's LOW-2: the claim runs the re-mark and the deferred walk, once its lock is released
+        assert!(
+            routes.contains(&squash(
+                "OwedClaimWalk::Shed { deferred } => { owed_refresh_end(identity_lc, token); owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc, deferred).await;"
+            )),
+            "a shed claim releases, then re-marks the identity stale and arms its deferred walk"
         );
         let remark = routes
             .find(&squash("async fn owed_shed_remark("))
@@ -13240,7 +13322,7 @@ pub(crate) mod tests {
             .expect("the hooks' entry");
         let push_body = &routes[push..];
         // bsv-low #800: the read's refresh reserved before its answer (`admitted`); every other walk asks here
-        let ask = push_body.find(&squash("if !admitted && !owed_recompute_admit(identity_lc, source, true) { let deferred = owed_deferred_deadline(identity_lc); owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc, deferred).await; return OwedClaimWalk::Shed; }")).expect("the ask");
+        let ask = push_body.find(&squash("if !admitted && !owed_recompute_admit(identity_lc, source, true) { return OwedClaimWalk::Shed { deferred: owed_deferred_deadline(identity_lc), }; }")).expect("the ask");
         let walk = push_body
             .find(&squash(
                 "owed_recompute(env, db, identity_lc, source, tip_hint, walk)",
