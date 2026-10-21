@@ -3,7 +3,7 @@
   "method": "GET",
   "path": "/admin/slap-records",
   "headers": {
-    "Authorization": "Bearer parity-harness-test-token-2026"
+    "Authorization": "Bearer parity-harness-token"
   },
   "note": "State-dependent: both sides have the route + shape, but records[] reflects each side's own ingested SLAP store. Sync asymmetries across peers and admission-rule differences produce distinct row sets. Run `make parity-clean` for a deterministic baseline."
 }

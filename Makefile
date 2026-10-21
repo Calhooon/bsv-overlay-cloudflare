@@ -5,6 +5,12 @@
 # in parity mode + runs the differential harness + writes PARITY_REPORT.md.
 # Exit is non-zero on any un-noted divergence.
 
+# The harness's admin bearer: seeded into `wrangler dev`, read by
+# reference/docker-compose.yml (same default) and carried by the
+# parity-harness/corpus/admin/*.json fixtures. Override both sides together.
+ADMIN_TOKEN ?= parity-harness-token
+export ADMIN_TOKEN
+
 .PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ci-d1-board ownership app-layer-door \
         wrangler-dev harness test e2e-bsv-storage clean help
 
@@ -55,7 +61,7 @@ wrangler-dev:
 	    --var TOPIC_MANAGERS:tm_ship,tm_slap \
 	    --var LOOKUP_SERVICES:ls_ship,ls_slap \
 	    --var ENABLE_EXTENSIONS:false \
-	    --var ADMIN_TOKEN:parity-harness-test-token-2026 \
+	    --var ADMIN_TOKEN:$(ADMIN_TOKEN) \
 	    --var NODE_NAME:parityref
 
 ## -- Parity harness -----------------------------------------------------------
