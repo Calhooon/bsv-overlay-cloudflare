@@ -51,9 +51,9 @@ if (!WORKER_LOG) throw new Error('argv[3] must name the current worker run wrang
 
 const C_PUSHED = 'arc_ingest_pushed_total'
 const C_STATUS = 'arc_ingest_status_ignored_total'
-const C_NO_TOKEN = 'arc_ingest_unauthorized_no_token_total'
-const C_BAD_TOKEN = 'arc_ingest_unauthorized_bad_token_total'
-const ALL_COUNTERS = [C_PUSHED, C_STATUS, C_NO_TOKEN, C_BAD_TOKEN]
+const C_NO_AUTH = 'arc_ingest_unauthorized_no_token_total'
+const C_BAD_AUTH = 'arc_ingest_unauthorized_bad_token_total'
+const ALL_COUNTERS = [C_PUSHED, C_STATUS, C_NO_AUTH, C_BAD_AUTH]
 
 let failures = 0
 const results = []
@@ -162,7 +162,7 @@ async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, want
       fail(label, 'refusal log must name the pushed txid, status and User-Agent on one 401 line')
       return
     }
-    const reason = wantCounter === C_BAD_TOKEN ? 'bad token' : 'no token'
+    const reason = wantCounter === C_BAD_AUTH ? 'bad token' : 'no token'
     const bearer = refusedToken ?? ''
     const kind = /^[0-9a-f]{64}$/i.test(bearer) ? '64-hex' : 'other'
     if (!line.includes(`(${reason}: bearer ${kind}, ${Buffer.byteLength(bearer)} bytes)`)) {
@@ -236,7 +236,7 @@ async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, want
     txid,
     wantStatus: 401,
     wantBodyRe: /Unauthorized/,
-    wantCounter: C_BAD_TOKEN,
+    wantCounter: C_BAD_AUTH,
   })
 }
 
@@ -249,7 +249,7 @@ async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, want
     txid,
     wantStatus: 401,
     wantBodyRe: /Unauthorized/,
-    wantCounter: C_NO_TOKEN,
+    wantCounter: C_NO_AUTH,
   })
 }
 
@@ -262,7 +262,7 @@ async function expectIngest({ label, headers, txid, wantStatus, wantBodyRe, want
     txid,
     wantStatus: 401,
     wantBodyRe: /Unauthorized/,
-    wantCounter: C_NO_TOKEN,
+    wantCounter: C_NO_AUTH,
   })
 }
 

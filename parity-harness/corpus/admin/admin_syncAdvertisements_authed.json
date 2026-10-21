@@ -3,6 +3,6 @@
   "method": "POST",
   "path": "/admin/syncAdvertisements",
   "headers": {
-    "Authorization": "Bearer parity-harness-test-token-2026"
+    "Authorization": "Bearer parity-harness-token"
   }
 }

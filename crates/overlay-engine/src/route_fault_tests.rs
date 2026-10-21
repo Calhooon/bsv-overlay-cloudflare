@@ -71,7 +71,7 @@ impl crate::gasp::GASPRemoteFactory for HttpAnswerFactory {
     }
 }
 
-const ROUTE_PEER: &str = "https://production.example.workers.dev";
+const ROUTE_PEER: &str = "https://your-peer.example.workers.dev";
 
 /// One engine syncing `tm_test` from [`ROUTE_PEER`] through a transport
 /// that answers `status` and `body`; the peer's cadence starts at three

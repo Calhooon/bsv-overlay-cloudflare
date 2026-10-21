@@ -3,7 +3,7 @@
   "method": "POST",
   "path": "/admin/ban",
   "headers": {
-    "Authorization": "Bearer parity-harness-test-token-2026",
+    "Authorization": "Bearer parity-harness-token",
     "Content-Type": "application/json"
   },
   "body": {

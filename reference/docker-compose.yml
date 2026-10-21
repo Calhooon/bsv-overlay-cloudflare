@@ -46,7 +46,7 @@ services:
       NODE_NAME: "parityref"
       # Known harness token — same value seeded into wrangler dev. Keeps
       # /admin/* Bearer happy-path corpus deterministic on both sides.
-      ADMIN_TOKEN: "parity-harness-test-token-2026"
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-parity-harness-token}"
     depends_on:
       mongo:
         condition: service_healthy
