@@ -3016,13 +3016,24 @@ pub(crate) async fn internal_pot_changed(
     if !owed_identities.is_empty() {
         let env2 = env.clone();
         ctx.wait_until(async move {
+            // bsv-low #800: the identities share ONE invocation's 30 s; each walk takes the slice left
+            let invocation_end =
+                crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64);
             let Ok(db) = env2.d1("OVERLAY_DB") else {
                 return;
             };
             // N7: ONE tip read for every identity this call recomputes
             let tip = chaintracks_present_height_env(&env2, "owed").await.ok();
             for id in owed_identities {
-                owed_recompute_and_push_coalesced(&env2, &db, &id, "pot-changed", tip).await;
+                owed_recompute_and_push_coalesced(
+                    &env2,
+                    &db,
+                    &id,
+                    "pot-changed",
+                    tip,
+                    invocation_end,
+                )
+                .await;
             }
         });
     }
@@ -3214,12 +3225,16 @@ pub(crate) async fn internal_hop_changed(
     let env2 = env.clone();
     let ids = identities.clone();
     ctx.wait_until(async move {
+        // bsv-low #800: the identities share ONE invocation's 30 s; each walk takes the slice left
+        let invocation_end =
+            crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64);
         let Ok(db) = env2.d1("OVERLAY_DB") else {
             return;
         };
         let tip = chaintracks_present_height_env(&env2, "owed").await.ok();
         for id in ids {
-            owed_recompute_and_push_coalesced(&env2, &db, &id, "hop-changed", tip).await;
+            owed_recompute_and_push_coalesced(&env2, &db, &id, "hop-changed", tip, invocation_end)
+                .await;
         }
     });
     let ms = worker::Date::now().as_millis().saturating_sub(t0);
@@ -3281,6 +3296,9 @@ pub(crate) struct OwedComputed {
     pub superseded: bool,
     /// bsv-low #566: the identity's recompute sequence the write's read-back carried (its own on a landed write).
     pub recompute_seq: Option<i64>,
+    /// bsv-low #800: the walk stopped at its outward budget; the snapshot written is partial and the claim releases
+    /// its lock at once, the identity marked stale (`owed::owed_claim_step`).
+    pub budget_cut: bool,
 }
 
 #[derive(Deserialize)]
@@ -3335,7 +3353,7 @@ struct OwedStateD1 {
 async fn owed_party_cursor(
     db: &worker::D1Database,
     identity: &str,
-    started_ms: i64,
+    slice: &crate::owed::OwedWalkSlice,
     sources: &[crate::owed_cursor::Source],
 ) -> std::result::Result<Vec<serde_json::Value>, String> {
     use crate::owed_cursor::{candidates_sql, Cursor};
@@ -3369,9 +3387,7 @@ async fn owed_party_cursor(
             }
         }
         loop {
-            if worker::Date::now().as_millis() as i64 - started_ms
-                > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS
-            {
+            if slice.over_budget(worker::Date::now().as_millis() as i64) {
                 return Err(
                     "owed candidate cursor exceeded time budget; previous snapshot stands".into(),
                 );
@@ -3410,8 +3426,9 @@ pub(crate) async fn owed_recompute(
     identity_lc: &str,
     source: &str,
     tip_hint: Option<u64>,
+    walk: &OwedWalk,
 ) -> std::result::Result<OwedComputed, String> {
-    let result = owed_recompute_inner(env, db, identity_lc, source, tip_hint).await;
+    let result = owed_recompute_inner(env, db, identity_lc, source, tip_hint, walk).await;
     if result
         .as_ref()
         .is_err_and(|e| e.starts_with("markerless evidence:"))
@@ -3442,6 +3459,8 @@ async fn owed_recompute_inner(
     // N7: a tip the caller already read this invocation (the pot-changed hook reads it once for every identity it
     // recomputes; the read passes the one it fetched); `None` = read it here.
     tip_hint: Option<u64>,
+    // bsv-low #800: the walk's clock (its outward budget inside its slice) and its id for the log lines (#566)
+    walk: &OwedWalk,
 ) -> std::result::Result<OwedComputed, String> {
     use crate::owed::{
         derive_owed_rows, outpoint_key, refund_output_sats, sort_rows_for_service, OwedInputs,
@@ -3477,9 +3496,10 @@ async fn owed_recompute_inner(
     }
     let now_ms = worker::Date::now().as_millis() as i64;
     let started_ms = now_ms;
+    let rid = walk.rid.as_str();
     let over_budget = || {
-        worker::Date::now().as_millis() as i64 - started_ms
-            > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS
+        walk.slice
+            .over_budget(worker::Date::now().as_millis() as i64)
     };
     let mut probes_made = 0usize;
     let mut spender_reads = 0usize;
@@ -3490,7 +3510,7 @@ async fn owed_recompute_inner(
     let candidates = owed_party_cursor(
         db,
         identity_lc,
-        started_ms,
+        &walk.slice,
         &[
             crate::owed_cursor::Source::Party,
             crate::owed_cursor::Source::Link,
@@ -3538,7 +3558,7 @@ async fn owed_recompute_inner(
     let candidates = owed_party_cursor(
         db,
         identity_lc,
-        started_ms,
+        &walk.slice,
         &[crate::owed_cursor::Source::Hop],
     )
     .await?;
@@ -5115,7 +5135,7 @@ async fn owed_recompute_inner(
         identity_lc,
         &crate::owed::courier_home_outputs(&inputs),
         now_ms,
-        started_ms,
+        walk.slice.outward_deadline_ms,
     )
     .await;
     inputs.home_spends = &home_spends;
@@ -5247,7 +5267,7 @@ async fn owed_recompute_inner(
                 );
                 if kept > 0 {
                     worker::console_log!(
-                        "[owed] recompute {source} for {}…: {kept} judged courier-bytes payout(s) kept (the spender's bytes were withheld this pass)",
+                        "[owed] recompute {source} {rid} for {}…: {kept} judged courier-bytes payout(s) kept (the spender's bytes were withheld this pass)",
                         &identity_lc[..12.min(identity_lc.len())]
                     );
                 }
@@ -5263,7 +5283,7 @@ async fn owed_recompute_inner(
                 if carried > 0 {
                     crate::owed::note_spender_store_carried(carried as u64);
                     worker::console_log!(
-                        "[owed] recompute {source} for {}…: {carried} judged spent-elsewhere row(s) carried forward (the spender's bytes were withheld this pass)",
+                        "[owed] recompute {source} {rid} for {}…: {carried} judged spent-elsewhere row(s) carried forward (the spender's bytes were withheld this pass)",
                         &identity_lc[..12.min(identity_lc.len())]
                     );
                 }
@@ -5493,7 +5513,7 @@ async fn owed_recompute_inner(
     if superseded {
         crate::owed::note_recompute_write_superseded();
         worker::console_log!(
-            "[owed] recompute {source} for {}…: the snapshot of {now_ms} was NOT written, the marker carries a newer one ({}): {} ms in the walk",
+            "[owed] recompute {source} {rid} for {}…: the snapshot of {now_ms} was NOT written, the marker carries a newer one ({}): {} ms in the walk",
             &identity_lc[..12.min(identity_lc.len())],
             stamp_after.unwrap_or_default(),
             worker::Date::now().as_millis() as i64 - started_ms
@@ -5505,18 +5525,19 @@ async fn owed_recompute_inner(
             truncated: walk_cut,
             superseded,
             recompute_seq,
+            budget_cut,
         });
     }
     crate::owed::note_recompute(source, &rows);
     if courier_reads > 0 || courier_cap_hit {
         worker::console_log!(
-            "[owed] recompute {source} for {}…: {courier_reads} spender ask(s) went to the tx-any resolver (index-unknown spenders){}",
+            "[owed] recompute {source} {rid} for {}…: {courier_reads} spender ask(s) went to the tx-any resolver (index-unknown spenders){}",
             &identity_lc[..12.min(identity_lc.len())],
             if courier_cap_hit { "; the courier cap held the rest for a later pass" } else { "" }
         );
     }
     worker::console_log!(
-        "[owed] recompute {source} for {}…: {} rows in {} ms (results {}, hops {}, probes {}, spender reads {}, budget cut {}, walk cut {})",
+        "[owed] recompute {source} {rid} for {}…: {} rows in {} ms (results {}, hops {}, probes {}, spender reads {}, budget cut {}, walk cut {})",
         &identity_lc[..12.min(identity_lc.len())],
         rows.len(),
         worker::Date::now().as_millis() as i64 - started_ms,
@@ -5534,6 +5555,7 @@ async fn owed_recompute_inner(
         truncated: walk_cut,
         superseded,
         recompute_seq,
+        budget_cut,
     })
 }
 
@@ -5561,7 +5583,7 @@ async fn owed_home_spend_walk(
     identity_lc: &str,
     candidates: &[crate::owed::CourierHomeOutput],
     now_ms: i64,
-    started_ms: i64,
+    outward_deadline_ms: i64,
 ) -> std::collections::HashMap<String, crate::owed::HomeSpendWord> {
     use crate::owed::{
         home_cursor_of, home_cursor_target, home_latch_target, home_walk_window, OWED_HOME_WINDOW,
@@ -5602,7 +5624,7 @@ async fn owed_home_spend_walk(
     let mut world = HomeWalkCouriers {
         env,
         db,
-        started_ms,
+        outward_deadline_ms,
     };
     let pass = crate::owed::home_walk_pass(&mut world, &window, &memos, &memos, now_ms).await;
     let mut writes = pass.memos;
@@ -5679,12 +5701,12 @@ impl crate::owed::PayVoutWorld for PayVoutReads<'_> {
 struct HomeWalkCouriers<'a> {
     env: &'a worker::Env,
     db: &'a worker::D1Database,
-    started_ms: i64,
+    /// bsv-low #800: the walk's outward deadline (`owed::OwedWalkSlice`), no longer a fixed 12 s from its own start.
+    outward_deadline_ms: i64,
 }
 impl crate::owed::HomeWalkWorld for HomeWalkCouriers<'_> {
     fn over_budget(&self) -> bool {
-        worker::Date::now().as_millis() as i64 - self.started_ms
-            > crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS
+        worker::Date::now().as_millis() as i64 > self.outward_deadline_ms
     }
     async fn probe(&mut self, txid: &str, vout: u32) -> crate::hops_view::ChainSpendProbe {
         let row =
@@ -5719,53 +5741,155 @@ impl crate::owed::HomeWalkWorld for HomeWalkCouriers<'_> {
     }
 }
 
-/// ONE recompute for ONE identity, then the page told (`owed-changed` on its durable box). A fault is counted and
-/// logged, never propagated. Reached only through the claimed loop (`owed_recompute_claimed`): the hooks and the
-/// read path enter through `owed_recompute_and_push_coalesced` / the read arm's own claim.
+/// bsv-low #800: one walk's id (#566's ask: every log line of one walk carries it) and its clock.
+pub(crate) struct OwedWalk {
+    pub rid: String,
+    pub slice: crate::owed::OwedWalkSlice,
+}
+impl OwedWalk {
+    fn new(token: i64, slice: crate::owed::OwedWalkSlice) -> Self {
+        let mut b = [0u8; 4];
+        let nonce = getrandom::getrandom(&mut b)
+            .map(|_| u32::from_le_bytes(b))
+            .unwrap_or(0);
+        OwedWalk {
+            rid: crate::owed::owed_recompute_id(token, nonce),
+            slice,
+        }
+    }
+    /// A walk no claim holds (the first read's compute inside its request, the deferred alarm): a fresh invocation's
+    /// full slice from now.
+    fn unclaimed() -> Self {
+        let now = worker::Date::now().as_millis() as i64;
+        let slice = crate::owed::owed_walk_slice(now, crate::owed::owed_invocation_end(now))
+            .unwrap_or(crate::owed::OwedWalkSlice {
+                started_ms: now,
+                outward_deadline_ms: now + crate::owed::OWED_RECOMPUTE_TIME_BUDGET_MS,
+                hard_deadline_ms: now + crate::owed::OWED_WALK_HARD_DEADLINE_MS,
+            });
+        Self::new(now, slice)
+    }
+}
+
+/// bsv-low #800: `fut` unless `ms` pass first (`None`: dropped, as the platform would drop it at its ceiling).
+async fn owed_with_deadline<F: core::future::Future>(fut: F, ms: u64) -> Option<F::Output> {
+    use futures_util::future::Either;
+    let delay = worker::Delay::from(core::time::Duration::from_millis(ms));
+    futures_util::pin_mut!(fut, delay);
+    match futures_util::future::select(fut, delay).await {
+        Either::Left((out, _)) => Some(out),
+        Either::Right(((), _)) => None,
+    }
+}
+
+/// How a claim's walk went: shed by the ceiling (#499: the shed re-marked the identity and armed its deferred walk),
+/// not started for want of a slice (#800), or run under its slice (`walked` is `None` when the claim dropped it at
+/// its hard deadline).
+pub(crate) enum OwedClaimWalk {
+    Shed,
+    NoSlice,
+    Ran {
+        rid: String,
+        walked: Option<std::result::Result<OwedComputed, String>>,
+    },
+}
+
+/// ONE walk of a claim. The ceiling is asked first unless the caller already admitted it (the read's refresh
+/// reserves before its answer), then the walk runs in the slice its invocation has left (`owed::owed_walk_slice`),
+/// dropped at its hard deadline. Nothing is pushed here: the claim releases its lock first
+/// (`owed_recompute_claimed`), then tells the page (`owed_walk_told`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn owed_recompute_and_push(
     env: &worker::Env,
     db: &worker::D1Database,
     identity_lc: &str,
     source: &str,
     tip_hint: Option<u64>,
-) {
+    token: i64,
+    invocation_end_ms: i64,
+    admitted: bool,
+) -> OwedClaimWalk {
     // bsv-low #499: past the identity's ceiling the walk is shed, and the shed marks the identity stale AGAIN (the
     // lens fold's M1: a walk in flight when the hook marked stale cleared that mark with its own write, and this
     // folded rerun is the one shed; without the re-mark the next read served the older rows as fresh)
-    if !owed_recompute_admit(identity_lc, source, true) {
+    if !admitted && !owed_recompute_admit(identity_lc, source, true) {
         let deferred = owed_deferred_deadline(identity_lc);
         owed_shed_remark(db, identity_lc).await;
         owed_schedule_deferred(env, identity_lc, deferred).await;
-        return;
+        return OwedClaimWalk::Shed;
     }
-    let _ = owed_walk_and_push(env, db, identity_lc, source, tip_hint).await;
+    let now = worker::Date::now().as_millis() as i64;
+    let Some(slice) = crate::owed::owed_walk_slice(now, invocation_end_ms) else {
+        crate::owed::note_recompute_no_slice();
+        console_warn!(
+            "[owed] recompute ({source}) for {}… not started: {} ms of the invocation left, under the {} ms a walk needs (the identity is marked stale; the next read walks it)",
+            &identity_lc[..12.min(identity_lc.len())],
+            invocation_end_ms.saturating_sub(now),
+            crate::owed::OWED_WALK_MIN_SLICE_MS
+        );
+        return OwedClaimWalk::NoSlice;
+    };
+    let walk = OwedWalk::new(token, slice);
+    let walked = owed_walk_bounded(env, db, identity_lc, source, tip_hint, &walk).await;
+    OwedClaimWalk::Ran {
+        rid: walk.rid,
+        walked,
+    }
 }
 
-/// The alarm owns one reserved walk from the exhausted window. It does not consume the next window's admits.
-pub(crate) async fn owed_deferred_walk_and_push(
-    env: &worker::Env,
-    identity_lc: &str,
-) -> worker::Result<()> {
-    let db = env.d1("OVERLAY_DB")?;
-    crate::owed::note_recompute_deferred();
-    worker::console_log!("[owed] deferred walk for {identity_lc}");
-    owed_walk_and_push(env, &db, identity_lc, "deferred", None).await
-}
-
-async fn owed_walk_and_push(
+/// bsv-low #800: the walk under its hard deadline, under its own ledger (bsv-low #499, lens fold M3: keyed
+/// `owed-recompute` in `d1Budget`; the tally is kept for a dropped walk too). `None`: the walk was dropped at its
+/// hard deadline, counted and logged; nothing of it is known written (its one write batch is all or nothing and
+/// monotonic in its stamp, #487, so a batch that lands after the drop changes nothing a newer walk wrote).
+async fn owed_walk_bounded(
     env: &worker::Env,
     db: &worker::D1Database,
     identity_lc: &str,
     source: &str,
     tip_hint: Option<u64>,
-) -> worker::Result<()> {
-    // bsv-low #499 (lens fold M3): the walk runs under its own ledger, keyed `owed-recompute` in `d1Budget` (it runs
-    // after the answer, in `wait_until`, where no request's scope holds it; before, it landed only in `unscoped`)
-    let (walked, d1) =
-        crate::d1_ledger::scoped(owed_recompute(env, db, identity_lc, source, tip_hint)).await;
+    walk: &OwedWalk,
+) -> Option<std::result::Result<OwedComputed, String>> {
+    let wait = walk.slice.hard_ms();
+    let (walked, d1) = crate::d1_ledger::scoped(owed_with_deadline(
+        owed_recompute(env, db, identity_lc, source, tip_hint, walk),
+        wait,
+    ))
+    .await;
     crate::d1_ledger::record(OWED_RECOMPUTE_LEDGER_KEY, d1);
+    if walked.is_none() {
+        crate::owed::note_recompute_walk_deadline();
+        console_warn!(
+            "[owed] recompute ({source}) {} for {}… dropped at its hard deadline ({wait} ms): the lock is released and the identity marked stale",
+            walk.rid,
+            &identity_lc[..12.min(identity_lc.len())]
+        );
+    }
+    walked
+}
+
+/// The walk's end as the claim's step reads it (bsv-low #800).
+fn owed_walk_end(
+    walked: &Option<std::result::Result<OwedComputed, String>>,
+) -> crate::owed::OwedWalkEnd {
+    use crate::owed::OwedWalkEnd;
     match walked {
-        // bsv-low #487: a snapshot the write refused is not announced (the newer walk's own push stands)
+        None => OwedWalkEnd::PastDeadline,
+        Some(Err(_)) => OwedWalkEnd::Faulted,
+        Some(Ok(c)) if c.budget_cut => OwedWalkEnd::WrittenCut,
+        Some(Ok(_)) => OwedWalkEnd::Written,
+    }
+}
+
+/// A walk that ended, told: the page pushed `owed-changed` on a landed snapshot (bsv-low #487: a snapshot the write
+/// refused is not announced, the newer walk's own push stands); a fault counted and logged.
+async fn owed_walk_told(
+    env: &worker::Env,
+    identity_lc: &str,
+    source: &str,
+    rid: &str,
+    walked: std::result::Result<OwedComputed, String>,
+) -> worker::Result<()> {
+    match walked {
         Ok(c) if c.superseded => {}
         Ok(c) => {
             crate::internal_events::first_party_push(
@@ -5783,13 +5907,41 @@ async fn owed_walk_and_push(
         Err(e) => {
             crate::owed::note_recompute_fault();
             console_warn!(
-                "[owed] recompute ({source}) for {}… failed: {e}",
+                "[owed] recompute ({source}) {rid} for {}… failed: {e}",
                 &identity_lc[..12.min(identity_lc.len())]
             );
             return Err(worker::Error::RustError(e));
         }
     }
     Ok(())
+}
+
+/// The alarm owns one reserved walk from the exhausted window. It does not consume the next window's admits. Its
+/// walk is bounded like a claim's (bsv-low #800); one dropped at its deadline marks the identity stale and answers a
+/// fault (the alarm's one re-arm, #648).
+pub(crate) async fn owed_deferred_walk_and_push(
+    env: &worker::Env,
+    identity_lc: &str,
+) -> worker::Result<()> {
+    let db = env.d1("OVERLAY_DB")?;
+    crate::owed::note_recompute_deferred();
+    let walk = OwedWalk::unclaimed();
+    worker::console_log!("[owed] deferred walk {} for {identity_lc}", walk.rid);
+    match owed_walk_bounded(env, &db, identity_lc, "deferred", None, &walk).await {
+        Some(walked) => owed_walk_told(env, identity_lc, "deferred", &walk.rid, walked).await,
+        None => {
+            owed_mark_stale(
+                &db,
+                crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
+                &[JsValue::from_str(identity_lc)],
+                "walk deadline",
+            )
+            .await;
+            Err(worker::Error::RustError(
+                "owed deferred walk dropped at its hard deadline".into(),
+            ))
+        }
+    }
 }
 
 /// bsv-low #499 (lens fold M3): the `d1Budget` key of one detached recompute (the hooks', the claims' and the stale
@@ -5895,10 +6047,13 @@ pub(crate) fn owed_rate_at_ceiling(now_ms: i64) -> usize {
     OWED_RATE.with(|r| r.borrow().at_ceiling(now_ms))
 }
 /// An in-flight mark whose last PROGRESS is older than this is abandoned. The mark is `(token, last_progress_ms)`
-/// and a live claim re-stamps its progress before every walk (the delta-verify's LOW-2: a claim is up to three
-/// sequential walks whose D1 pages the 12 s outward budget does not bound; a slow-but-answering D1 must never read
-/// as an abandoned future, or the takeover starts the parallel walk this lock exists to prevent).
-pub(crate) const OWED_IN_FLIGHT_STALE_MS: i64 = 60_000;
+/// and a live claim re-stamps its progress before every walk (the delta-verify's LOW-2: a slow-but-answering D1
+/// must never read as an abandoned future, or the takeover starts the parallel walk this lock exists to prevent).
+/// bsv-low #800: 30 s, the platform's own `wait_until` ceiling (it was 60 s). Since every walk is dropped by its claim
+/// at its hard deadline (`owed::OWED_WALK_HARD_DEADLINE_MS`, 24 s) and the claim re-stamps before and after each, no
+/// LIVE claim goes untouched for 30 s; a mark that has is a future the platform cancelled, and the next ask takes it
+/// over at once instead of 30 s later.
+pub(crate) const OWED_IN_FLIGHT_STALE_MS: i64 = crate::owed::OWED_PLATFORM_WAIT_UNTIL_MS;
 /// PURE: may an ask claim the lock now? (no mark, or a mark whose progress is older than the stale bound: a takeover)
 pub(crate) fn owed_lock_free(mark: Option<(i64, i64)>, now_ms: i64) -> bool {
     mark.is_none_or(|(_, progress)| now_ms.saturating_sub(progress) >= OWED_IN_FLIGHT_STALE_MS)
@@ -5908,24 +6063,37 @@ pub(crate) fn owed_lock_free(mark: Option<(i64, i64)>, now_ms: i64) -> bool {
 /// a live mark holds it.
 fn owed_refresh_begin(identity_lc: &str, now_ms: i64) -> Option<i64> {
     OWED_REFRESHING.with(|s| {
-        let mut m = s.borrow_mut();
-        let prev = m.get(identity_lc).copied();
-        if !owed_lock_free(prev, now_ms) {
-            return None;
-        }
-        if let Some((_, progress)) = prev {
-            crate::owed::note_recompute_lock_takeover();
+        let (token, taken_over) = owed_lock_claim(&mut s.borrow_mut(), identity_lc, now_ms)?;
+        if let Some(age) = taken_over {
+            crate::owed::note_recompute_lock_takeover(age);
             worker::console_log!(
-                "[owed] recompute lock for {}… no progress for {} ms — taken over (an abandoned future)",
+                "[owed] recompute lock for {}… no progress for {} ms — taken over (an abandoned future; bound {} ms)",
                 &identity_lc[..12.min(identity_lc.len())],
-                now_ms.saturating_sub(progress)
+                age,
+                OWED_IN_FLIGHT_STALE_MS
             );
         }
-        // a token distinct from any earlier mark (a takeover in the same millisecond still gets its own)
-        let token = prev.map_or(now_ms, |(t, _)| now_ms.max(t + 1));
-        m.insert(identity_lc.to_string(), (token, now_ms));
         Some(token)
     })
+}
+/// PURE (pinned): claim the mark. `Some((token, Some(age)))` when an abandoned mark (silent `age` ms) was taken over,
+/// `Some((token, None))` on a free lock, `None` while a live mark holds it.
+pub(crate) fn owed_lock_claim(
+    map: &mut std::collections::HashMap<String, (i64, i64)>,
+    identity_lc: &str,
+    now_ms: i64,
+) -> Option<(i64, Option<i64>)> {
+    let prev = map.get(identity_lc).copied();
+    if !owed_lock_free(prev, now_ms) {
+        return None;
+    }
+    // a token distinct from any earlier mark (a takeover in the same millisecond still gets its own)
+    let token = prev.map_or(now_ms, |(t, _)| now_ms.max(t + 1));
+    map.insert(identity_lc.to_string(), (token, now_ms));
+    Some((
+        token,
+        prev.map(|(_, progress)| now_ms.saturating_sub(progress)),
+    ))
 }
 /// PURE (pinned): release the mark only when it is still OURS.
 pub(crate) fn owed_lock_release(
@@ -5984,6 +6152,8 @@ pub(crate) async fn owed_recompute_and_push_coalesced(
     identity_lc: &str,
     source: &str,
     tip_hint: Option<u64>,
+    // bsv-low #800: when the invocation this runs in must be done (`owed::owed_invocation_end` of its start)
+    invocation_end_ms: i64,
 ) {
     let now_ms = worker::Date::now().as_millis() as i64;
     let Some(token) = owed_refresh_begin(identity_lc, now_ms) else {
@@ -5991,13 +6161,24 @@ pub(crate) async fn owed_recompute_and_push_coalesced(
         crate::owed::note_recompute_coalesced();
         return;
     };
-    owed_recompute_claimed(env, db, identity_lc, source, tip_hint, token, false).await;
+    owed_recompute_claimed(
+        env,
+        db,
+        identity_lc,
+        source,
+        tip_hint,
+        token,
+        false,
+        invocation_end_ms,
+    )
+    .await;
 }
 
 /// The run behind a CLAIMED lock (`owed_refresh_begin` returned `Some(token)` to the caller, synchronously — the read path
 /// claims at its check so two queued stale reads cannot both kick, the gate's LOW-1): the recompute, then every ask
 /// folded meanwhile, once each, then the lock released. A rerun keeps the caller's tip hint (the gate's LOW-2: a
 /// re-read that blips would compute nothing; a tip a moment old is conservative — a gate reads "not open yet").
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn owed_recompute_claimed(
     env: &worker::Env,
     db: &worker::D1Database,
@@ -6006,6 +6187,7 @@ pub(crate) async fn owed_recompute_claimed(
     tip_hint: Option<u64>,
     token: i64,
     mut first_admitted: bool,
+    invocation_end_ms: i64,
 ) {
     let mut src = source.to_string();
     let mut reruns = 0usize;
@@ -6014,40 +6196,85 @@ pub(crate) async fn owed_recompute_claimed(
             // the mark is no longer ours (a takeover after a long silence): the other claim owns the rerun map now
             return;
         }
-        if first_admitted {
-            first_admitted = false;
-            let _ = owed_walk_and_push(env, db, identity_lc, &src, tip_hint).await;
-        } else {
-            owed_recompute_and_push(env, db, identity_lc, &src, tip_hint).await;
-        }
+        let admitted = std::mem::take(&mut first_admitted);
+        let ran = owed_recompute_and_push(
+            env,
+            db,
+            identity_lc,
+            &src,
+            tip_hint,
+            token,
+            invocation_end_ms,
+            admitted,
+        )
+        .await;
+        let (end, rid, walked) = match ran {
+            OwedClaimWalk::Shed => {
+                // the shed re-marked the identity stale and armed its deferred walk: a folded ask is served by that
+                // walk or the next read (it stays in the map for the next claim, as the overflow's below)
+                owed_refresh_end(identity_lc, token);
+                return;
+            }
+            OwedClaimWalk::NoSlice => (crate::owed::OwedWalkEnd::NoSlice, String::new(), None),
+            OwedClaimWalk::Ran { rid, walked } => (owed_walk_end(&walked), rid, walked),
+        };
         if !owed_refresh_touch(identity_lc, token) {
             // the delta-verify's LOW-4: a takeover DURING this walk owns the rerun map now — this claim must neither
             // steal a folded ask (dropping it on its own way out) nor mark stale on the takeover's behalf
+            if let Some(w) = walked {
+                let _ = owed_walk_told(env, identity_lc, &src, &rid, w).await;
+            }
             return;
         }
-        if reruns >= OWED_RERUNS_PER_CLAIM {
-            // the delta-verify's LOW-1: an ask left folded past the bound is served by the NEXT read — but the walk just
-            // wrote `stale = 0`, so the mark is set again here (the ask itself stays in the map for the next claim)
-            if OWED_RERUN.with(|m| m.borrow().contains_key(identity_lc)) {
-                owed_mark_stale(
-                    db,
-                    crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
-                    &[JsValue::from_str(identity_lc)],
-                    "coalesced overflow",
-                )
-                .await;
+        let folded = OWED_RERUN.with(|m| m.borrow().contains_key(identity_lc));
+        let next_slice =
+            crate::owed::owed_walk_slice(worker::Date::now().as_millis() as i64, invocation_end_ms)
+                .is_some();
+        match crate::owed::owed_claim_step(end, folded, reruns < OWED_RERUNS_PER_CLAIM, next_slice)
+        {
+            // bsv-low #800: THE RELEASE POINT. The lock is released in the step the walk ended (its snapshot written,
+            // cut at its budget, dropped at its deadline, or never started), before any further await, so no walk the
+            // platform can still cancel runs under it; the stale mark (one statement) and the push come after.
+            crate::owed::OwedClaimStep::Release { mark_stale } => {
+                owed_refresh_end(identity_lc, token);
+                if mark_stale {
+                    // the delta-verify's LOW-1: an ask left folded (or a walk that wrote nothing) is served by the
+                    // NEXT read — the walk may just have written `stale = 0`, so the mark is set again here (a folded
+                    // ask itself stays in the map for the next claim)
+                    owed_mark_stale(
+                        db,
+                        crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
+                        &[JsValue::from_str(identity_lc)],
+                        match end {
+                            crate::owed::OwedWalkEnd::PastDeadline => "walk deadline",
+                            crate::owed::OwedWalkEnd::NoSlice => "no slice",
+                            _ => "coalesced overflow",
+                        },
+                    )
+                    .await;
+                }
+                if let Some(w) = walked {
+                    let _ = owed_walk_told(env, identity_lc, &src, &rid, w).await;
+                }
+                return;
             }
-            break;
-        }
-        match OWED_RERUN.with(|m| m.borrow_mut().remove(identity_lc)) {
-            Some(again) => {
-                src = again;
-                reruns += 1;
+            crate::owed::OwedClaimStep::Rerun => {
+                if let Some(w) = walked {
+                    let _ = owed_walk_told(env, identity_lc, &src, &rid, w).await;
+                }
+                match OWED_RERUN.with(|m| m.borrow_mut().remove(identity_lc)) {
+                    Some(again) => {
+                        src = again;
+                        reruns += 1;
+                    }
+                    None => {
+                        owed_refresh_end(identity_lc, token);
+                        return;
+                    }
+                }
             }
-            None => break,
         }
     }
-    owed_refresh_end(identity_lc, token);
 }
 
 /// The snapshot the table holds for `identity_lc` (the marker, then its rows): what a superseded read serves.
@@ -6089,7 +6316,10 @@ pub(crate) async fn owed_compute_on_read(
     source: &'static str,
     tip_hint: Option<u64>,
 ) -> std::result::Result<crate::owed::OwedSnapshot, Result<Response>> {
-    match owed_recompute(env, db, identity_lc, source, tip_hint).await {
+    // bsv-low #800: the first read walks inside its own request under no claim; its walk keeps the slice's clock (the
+    // 12 s outward budget), and is not dropped (the request is not a `wait_until`)
+    let walk = OwedWalk::unclaimed();
+    match owed_recompute(env, db, identity_lc, source, tip_hint, &walk).await {
         // the lens fold's LOW-2: the write refused this walk's snapshot because a NEWER one stands (#487), so this
         // reader is served the stored rows, never its own older ones. The delta fold's LOW-4: when the stored read
         // faults too, the walk's own rows are served for that one response with NO claimable word in them
@@ -6353,6 +6583,10 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                             crate::owed::note_read_refresh(claim.is_some());
                             match claim {
                                 Some(token) => {
+                                    // bsv-low #800: the refresh's `wait_until` starts as this answer leaves
+                                    let invocation_end = crate::owed::owed_invocation_end(
+                                        worker::Date::now().as_millis() as i64,
+                                    );
                                     // Reserve before the answer: another ask cannot shed this read's accepted refresh later.
                                     let admitted = owed_recompute_admit(&identity, source, true);
                                     let env = ctx.env.clone();
@@ -6362,7 +6596,14 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                         wait.wait_until(async move {
                                             if let Ok(db) = env.d1("OVERLAY_DB") {
                                                 owed_recompute_claimed(
-                                                    &env, &db, &id, &src, None, token, true,
+                                                    &env,
+                                                    &db,
+                                                    &id,
+                                                    &src,
+                                                    None,
+                                                    token,
+                                                    true,
+                                                    invocation_end,
                                                 )
                                                 .await;
                                             } else {
@@ -10372,6 +10613,253 @@ mod tests {
             "a refreshed claim holds"
         );
         assert!(super::owed_lock_free(None, 0));
+    }
+
+    // ── bsv-low #800 (FIX-800-LOCK): the lock never outlives its walk's deadline ──
+    use crate::owed::{
+        owed_claim_step, owed_invocation_end, owed_walk_slice, OwedClaimStep, OwedWalkEnd,
+        OWED_PLATFORM_WAIT_UNTIL_MS, OWED_RECOMPUTE_TIME_BUDGET_MS, OWED_RELEASE_RESERVE_MS,
+        OWED_WALK_HARD_DEADLINE_MS, OWED_WALK_MIN_SLICE_MS,
+    };
+    const ID800: &str = "031b9ef0bd3a0000000000000000000000000000000000000000000000000000ab";
+
+    /// bsv-low #800 (a): a walk that reaches its time budget RELEASES the lock in the step it wrote its partial
+    /// snapshot, and the next read claims within one tick. Loop 39's shape: a read's refresh claims at t0, the
+    /// settle's `hop-changed` ask is folded behind it, the walk is cut at its outward budget and writes at t0 + 15 s.
+    /// On the base the claim ran the folded ask as a SECOND walk under the same lock (and the platform cancelled it
+    /// at t0 + 30 s, the lock held until a take-over 60 s silent); now it releases and marks the identity stale.
+    /// To red: `owed_claim_step` answering `Rerun` for a `WrittenCut` walk.
+    #[test]
+    fn fix800_a_a_cut_walk_releases_and_the_next_read_claims_within_one_tick() {
+        let t0 = 1_000_000i64;
+        let mut m = std::collections::HashMap::new();
+        let (token, taken) = super::owed_lock_claim(&mut m, ID800, t0).expect("a free lock");
+        assert_eq!(taken, None);
+        let end = owed_invocation_end(t0);
+        assert_eq!(
+            end,
+            t0 + OWED_PLATFORM_WAIT_UNTIL_MS - OWED_RELEASE_RESERVE_MS
+        );
+        let slice = owed_walk_slice(t0, end).expect("a fresh invocation has a slice");
+        assert_eq!(
+            slice.outward_deadline_ms,
+            t0 + OWED_RECOMPUTE_TIME_BUDGET_MS
+        );
+        assert_eq!(slice.hard_deadline_ms, t0 + OWED_WALK_HARD_DEADLINE_MS);
+        assert!(
+            slice.hard_deadline_ms <= end,
+            "the hard deadline leaves the reserve under the ceiling"
+        );
+        assert!(slice.over_budget(slice.outward_deadline_ms + 1));
+        assert!(!slice.over_budget(slice.outward_deadline_ms));
+        // the walk was cut and wrote its partial snapshot at t0 + 15 s; a hook's ask is folded
+        let wrote_at = t0 + 15_000;
+        assert!(super::owed_lock_touch(&mut m, ID800, token, wrote_at));
+        let next_slice = owed_walk_slice(wrote_at, end).is_some();
+        assert!(
+            next_slice,
+            "time is left: the rule, not the clock, refuses the second walk"
+        );
+        let step = owed_claim_step(OwedWalkEnd::WrittenCut, true, true, next_slice);
+        assert_eq!(
+            step,
+            OwedClaimStep::Release { mark_stale: true },
+            "a cut walk never holds the lock into another walk"
+        );
+        assert!(super::owed_lock_release(&mut m, ID800, token));
+        // the next read, one tick later, claims at once (no take-over: nothing was abandoned)
+        let (_, taken) =
+            super::owed_lock_claim(&mut m, ID800, wrote_at + 1).expect("the next read claims");
+        assert_eq!(taken, None, "a released lock is claimed, not taken over");
+        // a cut walk with nothing folded releases and marks nothing (its partial snapshot stands; the age rules go on)
+        assert_eq!(
+            owed_claim_step(OwedWalkEnd::WrittenCut, false, true, true),
+            OwedClaimStep::Release { mark_stale: false }
+        );
+    }
+
+    /// bsv-low #800 (b): a walk the claim drops at its hard deadline, or cannot start, releases and marks stale; an
+    /// ABANDONED future (the platform cancelled the claim itself) is taken over at the platform's own 30 s, never
+    /// 60 s, with its age counted. Loop 40's take-over was 182,532 ms. To red: `OWED_IN_FLIGHT_STALE_MS` back at
+    /// 60_000 (the base's: "held at the ceiling").
+    #[test]
+    fn fix800_b_a_dropped_or_abandoned_walk_never_holds_the_lock_past_the_ceiling() {
+        for folded in [false, true] {
+            for left in [false, true] {
+                for slice in [false, true] {
+                    assert_eq!(
+                        owed_claim_step(OwedWalkEnd::PastDeadline, folded, left, slice),
+                        OwedClaimStep::Release { mark_stale: true }
+                    );
+                    assert_eq!(
+                        owed_claim_step(OwedWalkEnd::NoSlice, folded, left, slice),
+                        OwedClaimStep::Release { mark_stale: true }
+                    );
+                }
+            }
+        }
+        // the twins (fleet loop 11) still serialise when the walk was quick and time is left
+        assert_eq!(
+            owed_claim_step(OwedWalkEnd::Written, true, true, true),
+            OwedClaimStep::Rerun
+        );
+        assert_eq!(
+            owed_claim_step(OwedWalkEnd::Faulted, true, true, true),
+            OwedClaimStep::Rerun
+        );
+        assert_eq!(
+            owed_claim_step(OwedWalkEnd::Written, true, true, false),
+            OwedClaimStep::Release { mark_stale: true },
+            "no slice for the folded ask: the next read serves it"
+        );
+        assert_eq!(
+            owed_claim_step(OwedWalkEnd::Written, true, false, true),
+            OwedClaimStep::Release { mark_stale: true }
+        );
+        assert_eq!(
+            owed_claim_step(OwedWalkEnd::Written, false, true, true),
+            OwedClaimStep::Release { mark_stale: false }
+        );
+        // an abandoned claim: re-stamped at t0, cancelled by the platform, never released
+        let t0 = 5_000_000i64;
+        let mut m = std::collections::HashMap::new();
+        let (token, _) = super::owed_lock_claim(&mut m, ID800, t0).unwrap();
+        assert!(
+            super::owed_lock_claim(&mut m, ID800, t0 + OWED_PLATFORM_WAIT_UNTIL_MS - 1).is_none(),
+            "a mark inside the ceiling may still be live"
+        );
+        let (taker, age) = super::owed_lock_claim(&mut m, ID800, t0 + OWED_PLATFORM_WAIT_UNTIL_MS)
+            .expect(
+                "held at the ceiling: a mark silent for the platform's 30 s is an abandoned future",
+            );
+        assert_eq!(
+            age,
+            Some(OWED_PLATFORM_WAIT_UNTIL_MS),
+            "the take-over carries its age"
+        );
+        assert!(taker > token);
+        assert!(
+            !super::owed_lock_release(&mut m, ID800, token),
+            "the abandoned token frees nothing"
+        );
+        // no LIVE claim goes untouched for the stale bound: every slice's hard deadline is inside it
+        let end = owed_invocation_end(t0);
+        let mut started = 0;
+        for off in (0..=OWED_PLATFORM_WAIT_UNTIL_MS).step_by(250) {
+            if let Some(sl) = owed_walk_slice(t0 + off, end) {
+                started += 1;
+                assert!(
+                    sl.hard_deadline_ms <= end,
+                    "offset {off}: the walk ends before the reserve"
+                );
+                assert!(sl.hard_deadline_ms - sl.started_ms >= OWED_WALK_MIN_SLICE_MS);
+                assert!(sl.hard_deadline_ms - sl.started_ms < super::OWED_IN_FLIGHT_STALE_MS);
+                assert!(sl.outward_deadline_ms < sl.hard_deadline_ms);
+                assert!(sl.outward_deadline_ms - sl.started_ms <= OWED_RECOMPUTE_TIME_BUDGET_MS);
+            } else {
+                assert!(
+                    end - (t0 + off) < OWED_WALK_MIN_SLICE_MS,
+                    "offset {off}: refused with time left"
+                );
+            }
+        }
+        assert!(started > 0);
+        // the hook's second identity behind a 16 s first walk gets the rest of the invocation, its outward budget
+        // halved; behind a 20 s one it is not started (7 s left)
+        let second = owed_walk_slice(t0 + 16_000, end).expect("11 s left");
+        assert_eq!(second.hard_deadline_ms, end);
+        assert_eq!(second.outward_deadline_ms, t0 + 16_000 + 5_500);
+        assert!(owed_walk_slice(t0 + 20_000, end).is_none());
+    }
+
+    /// bsv-low #800 (c): the take-over is counted with its age (the durable counter and the isolate's maximum), the
+    /// two new counters are mirrored, and every recompute carries an id (#566).
+    #[test]
+    fn fix800_c_the_takeover_counts_with_its_age_and_the_walk_carries_an_id() {
+        crate::owed::note_recompute_lock_takeover(182_532);
+        let h = crate::owed::owed_health_json();
+        assert!(h["recomputeLockTakeovers"].as_u64().unwrap() >= 1);
+        assert!(h["recomputeLockTakeoverMaxAgeMs"].as_u64().unwrap() >= 182_532);
+        assert_eq!(
+            h["recomputeWalkHardDeadlineMs"].as_i64(),
+            Some(OWED_WALK_HARD_DEADLINE_MS)
+        );
+        let names = crate::owed::owed_mirrored_counter_names();
+        for n in [
+            "applayer_owed_recompute_lock_takeovers_total",
+            "applayer_owed_recompute_walk_deadline_total",
+            "applayer_owed_recompute_no_slice_total",
+        ] {
+            assert!(names.iter().any(|x| x == n), "{n} mirrored");
+        }
+        let a = crate::owed::owed_recompute_id(1_761_000_000_000, 0xbeef);
+        let b = crate::owed::owed_recompute_id(1_761_000_000_000, 0xbeee);
+        assert!(a.starts_with('r') && a.len() <= 11, "{a}");
+        assert_ne!(a, b);
+    }
+
+    /// bsv-low #800 (d), the wiring: the claim releases in the step the walk ended, BEFORE any further await (the
+    /// stale mark and the push come after); the walk is raced against its hard deadline; every entry passes its
+    /// invocation's end; the take-over is counted with its age. To red: move `owed_refresh_end` below the stale mark.
+    #[test]
+    fn fix800_d_the_release_point_and_the_deadline_are_wired() {
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let src = include_str!("routes.rs");
+        let src = &src[..src.find("\nmod tests {").expect("the tests module")];
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = squash(&code);
+        let claimed = r
+            .find(&squash("pub(crate) async fn owed_recompute_claimed("))
+            .expect("the claim");
+        let body = &r[claimed..claimed + r[claimed..].find("asyncfnowed_read_stored(").unwrap()];
+        assert!(body.contains(&squash(
+            "crate::owed::OwedClaimStep::Release { mark_stale } => { owed_refresh_end(identity_lc, token); if mark_stale {"
+        )));
+        assert!(body.contains(&squash("let ran = owed_recompute_and_push(")));
+        let bounded = r
+            .find(&squash("async fn owed_walk_bounded("))
+            .expect("the bound");
+        assert!(r[bounded..].contains(&squash(
+            // split: `owed.rs`'s pin counts the walk's callers over this whole file
+            concat!(
+                "crate::d1_ledger::scoped(owed_with_deadline( owed_recompute(env, db, ",
+                "identity_lc, source, tip_hint, walk), wait, ))"
+            )
+        )));
+        assert!(r.contains(&squash(
+            "let walked = owed_walk_bounded(env, db, identity_lc, source, tip_hint, &walk).await;"
+        )));
+        assert!(r.contains(&squash("crate::owed::note_recompute_lock_takeover(age);")));
+        assert_eq!(
+            r.matches(&squash("owed_recompute_and_push_coalesced("))
+                .count(),
+            3,
+            "the definition and the two hooks"
+        );
+        assert_eq!(
+            r.matches(&squash("\"pot-changed\", tip, invocation_end,"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            r.matches(&squash("\"hop-changed\", tip, invocation_end)"))
+                .count(),
+            1
+        );
+        let rp = squash(include_str!("record_post.rs"));
+        assert_eq!(
+            rp.matches(&squash("\"filing\", None, invocation_end,"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rp.matches(&squash("\"filing\", None, crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64),")).count(),
+            1
+        );
     }
 
     // ── /live-view asks the tower BY OUTPOINT (2026-08-12) ────────────────

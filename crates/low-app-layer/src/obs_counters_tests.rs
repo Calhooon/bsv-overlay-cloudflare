@@ -147,6 +147,11 @@ fn obs_628_the_owed_health_keys_are_the_old_ones_and_recomputes_this_isolate() {
         "recomputeOpenAfterMs",
         "recomputeAnyAfterMs",
         "recomputesThisIsolate",
+        // bsv-low #800: the lock's take-over age, the walks dropped at their deadline or never started, the deadline
+        "recomputeLockTakeoverMaxAgeMs",
+        "recomputeWalkDeadline",
+        "recomputeNoSlice",
+        "recomputeWalkHardDeadlineMs",
     ];
     assert!(
         !keys.contains(&"recomputeSeq"),
