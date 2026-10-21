@@ -84,7 +84,11 @@
 //!      and per `(poster, family)` a day's budget
 //!      ([`RECORD_FILINGS_PER_IDENTITY_PER_DAY`], `429`). Both count FILED rows
 //!      only (`txid LIKE 'filed:%'`), never chain admissions. And a marker the
-//!      CHAIN already holds for this identity, game, pot and version is a
+//!      CHAIN already holds for this identity, game, pot and version, and
+//!      that VERIFIES as the identity's own (bsv-low #564: potparty's
+//!      `sigValid` 1, result's `claimValid` at its shape's tier, collected's
+//!      signature re-checked here; a chain row is admitted by byte format
+//!      only, so its presence alone is no-one's word), is a
 //!      no-op 200 (`alreadyIndexed`): nothing to add, nothing written, nothing
 //!      counted — so a stranger replaying a victim's public chain markers
 //!      (every field of them is served by the lookup services) can never
@@ -1342,20 +1346,58 @@ pub const POTREFUND_LATCH_SQL: &str = "UPDATE potrefund_records SET refundValid 
      WHERE txid = ?1 AND COALESCE(refundValid, 0) = 0";
 
 // The chain no-op (the delta-verify's HIGH-1): a marker the CHAIN already
-// holds for this identity, game, pot and VERSION. BINDS: (poster, gameId,
-// potTxid, the version flag) — potparty: `seatSettlePubkey IS NULL` (1 = v1);
-// result: `loserSigHex IS NULL` (1 = the plain claim); potrefund: (poster,
-// gameId, potTxid); collected: (poster, gameId).
+// holds for this identity, game, pot and VERSION, AND that verifies as the
+// identity's own (bsv-low #564/#565). BINDS: (poster, gameId, potTxid, the
+// version flag) — potparty: `seatSettlePubkey IS NULL` (1 = v1); result:
+// `loserSigHex IS NULL` (1 = the plain claim); potrefund: (poster, gameId,
+// potTxid); collected: (poster, gameId).
+//
+// #565: the flag is bound as the TEXT '1'/'0' (every bind of this door is a JS
+// string, and D1 binds a JS string as TEXT), and `(x IS NULL)` is an INTEGER
+// with no affinity, so SQLite compared INTEGER 1 with TEXT '1' unconverted:
+// never equal, the no-op never fired. `CAST(?4 AS INTEGER)` compares integer
+// with integer whatever the bind's type.
+//
+// #564: a chain row is admitted by BYTE FORMAT only, so its presence is no
+// proof it is the poster's: anyone can buy a marker naming another identity.
+// A chain row counts only when it verifies for the identity it names: potparty
+// by the overlay's own `sigValid` latch (1; NULL, not yet latched, and 0 do not
+// count), result by its `claimValid` tier at its own shape (1 for the plain
+// claim, 2 for the countersigned), collected by the door re-running the filed
+// path's signature check over each chain row's `sigHex`
+// ([`own_collected_chain_rows`], at most `COLLECTED_CHAIN_SIGS_READ` rows: past
+// them the filing proceeds, never a no-op on rows not checked). A row that does
+// not verify is no no-op: the filing goes on to the caps and writes its own.
 pub const POTPARTY_CHAIN_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM potparty_records \
      WHERE identity = ?1 AND gameId = ?2 AND potTxid = ?3 AND txid NOT LIKE 'filed:%' \
-       AND (seatSettlePubkey IS NULL) = ?4";
+       AND (seatSettlePubkey IS NULL) = CAST(?4 AS INTEGER) AND sigValid = 1";
 pub const POTREFUND_CHAIN_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM potrefund_records \
      WHERE identity = ?1 AND gameId = ?2 AND potTxid = ?3 AND txid NOT LIKE 'filed:%'";
 pub const RESULT_CHAIN_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM result_markers_v2 \
      WHERE winner = ?1 AND gameId = ?2 AND potTxid = ?3 AND txid NOT LIKE 'filed:%' \
-       AND (loserSigHex IS NULL) = ?4";
-pub const COLLECTED_CHAIN_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM collected_markers_v2 \
-     WHERE identity = ?1 AND gameId = ?2 AND txid NOT LIKE 'filed:%'";
+       AND (loserSigHex IS NULL) = CAST(?4 AS INTEGER) \
+       AND claimValid >= CASE WHEN loserSigHex IS NULL THEN 1 ELSE 2 END";
+/// The collected chain rows' signatures, not a count (#564): the door verifies each.
+pub const COLLECTED_CHAIN_ROWS_SQL: &str = "SELECT sigHex FROM collected_markers_v2 \
+     WHERE identity = ?1 AND gameId = ?2 AND txid NOT LIKE 'filed:%' AND sigHex IS NOT NULL \
+     LIMIT 16";
+/// The `LIMIT` of [`COLLECTED_CHAIN_ROWS_SQL`]: the most chain rows one filing verifies (16 ECDSA verifies).
+pub const COLLECTED_CHAIN_SIGS_READ: usize = 16;
+
+/// #564: how many of the collected chain rows read for (identity, game) carry a signature that verifies for that
+/// identity: the filed path's own check ([`collected_sig_verifies`]). Only those make the filing a no-op.
+pub fn own_collected_chain_rows(
+    identity_lc: &str,
+    game_id_lc: &str,
+    sig_hexes: &[Option<String>],
+) -> i64 {
+    sig_hexes
+        .iter()
+        .take(COLLECTED_CHAIN_SIGS_READ)
+        .flatten()
+        .filter(|sig| collected_sig_verifies(identity_lc, game_id_lc, &sig.to_ascii_lowercase()))
+        .count() as i64
+}
 
 /// The chain no-op statement and its binds for a verified record (a pure
 /// value, for the same reason as [`cap_queries`]). `None` for a held filing
@@ -1592,6 +1634,13 @@ fn js_num(n: i64) -> worker::wasm_bindgen::JsValue {
     (n as f64).into()
 }
 
+/// One collected chain row's signature (`COLLECTED_CHAIN_ROWS_SQL`).
+#[derive(Deserialize)]
+struct SigRowD1 {
+    #[serde(rename = "sigHex", default)]
+    sig_hex: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct CountRowD1 {
     #[serde(default)]
@@ -1809,8 +1858,21 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     let now = (worker::Date::now().as_millis() / 1000) as i64;
     // The chain no-op (step 6): the chain already holds this marker for this
     // identity — nothing to add, nothing written, nothing counted.
-    let chain_rows = match chain_rows_query(&verified) {
-        Some((chain_sql, chain_binds)) => {
+    // A chain row counts only when it verifies as the poster's own (#564).
+    let chain_rows = match (chain_rows_query(&verified), &verified) {
+        (Some((chain_sql, chain_binds)), VerifiedRecord::Collected(r)) => {
+            let sigs = db
+                .prepare(chain_sql)
+                .bind(&chain_binds.iter().map(|s| js(s)).collect::<Vec<_>>())?
+                .counted_all()
+                .await?
+                .results::<SigRowD1>()?
+                .into_iter()
+                .map(|row| row.sig_hex)
+                .collect::<Vec<_>>();
+            own_collected_chain_rows(&r.identity, &r.game_id, &sigs)
+        }
+        (Some((chain_sql, chain_binds)), _) => {
             count(
                 &db,
                 chain_sql,
@@ -1818,7 +1880,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
             )
             .await?
         }
-        None => 0,
+        (None, _) => 0,
     };
     if chain_rows > 0 {
         bump(&ALREADY_INDEXED_BY_KIND, kind);
@@ -3443,5 +3505,337 @@ pub(crate) mod tests {
             1,
             "the route is the file's only async door, so the insert is inside it"
         );
+    }
+
+    // ── W25C: the chain no-op (bsv-low #564, #565), over the SHIPPED statements under real SQLite ──
+
+    /// A fresh SQLite carrying the production schema (the overlay's migrations, as `tests/sql_prepares_sqlite.rs`).
+    fn w25c_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "{e}\n{sql}"
+                );
+            }
+        }
+        conn
+    }
+
+    /// The door's step 6 as the route runs it: the shipped statement with the shipped binds, each bound as TEXT (a
+    /// JS string binds as TEXT on D1, a `&str` as TEXT under rusqlite), then the collected rows' signature check.
+    fn w25c_door_chain_rows(conn: &rusqlite::Connection, v: &VerifiedRecord) -> i64 {
+        let (sql, binds) = chain_rows_query(v).unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        match v {
+            VerifiedRecord::Collected(r) => {
+                let sigs: Vec<Option<String>> = stmt
+                    .query_map(rusqlite::params_from_iter(binds.iter()), |row| row.get(0))
+                    .unwrap()
+                    .map(|x| x.unwrap())
+                    .collect();
+                own_collected_chain_rows(&r.identity, &r.game_id, &sigs)
+            }
+            _ => stmt
+                .query_row(rusqlite::params_from_iter(binds.iter()), |row| row.get(0))
+                .unwrap(),
+        }
+    }
+
+    /// The door's write when step 6 answers no no-op (the caps are under: one row each here).
+    fn w25c_file(conn: &rusqlite::Connection, v: &VerifiedRecord) {
+        match v {
+            VerifiedRecord::Potparty(r, valid) => {
+                conn.execute(
+                    POTPARTY_FILE_SQL,
+                    rusqlite::params![
+                        r.identity,
+                        r.opponent_identity,
+                        r.game_id,
+                        r.pot_txid,
+                        r.pot_vout,
+                        r.recovery_height,
+                        r.sig_hex,
+                        r.seat_settle_pubkey,
+                        r.seat_sig_hex,
+                        r.txid,
+                        0,
+                        1_000,
+                        i64::from(*valid)
+                    ],
+                )
+                .unwrap();
+            }
+            VerifiedRecord::Result(r, tier) => {
+                conn.execute(
+                    RESULT_FILE_SQL,
+                    rusqlite::params![
+                        r.game_id,
+                        r.winner,
+                        r.loser,
+                        r.pot_txid,
+                        r.settle_txid,
+                        r.winner_sig_hex,
+                        r.loser_sig_hex,
+                        r.cards_hex,
+                        r.txid,
+                        0,
+                        1_000,
+                        tier
+                    ],
+                )
+                .unwrap();
+            }
+            VerifiedRecord::Collected(r) => {
+                conn.execute(
+                    COLLECTED_FILE_SQL,
+                    rusqlite::params![
+                        r.identity, r.game_id, r.txid, 0, r.sig_hex, 1_000, r.pay_txid
+                    ],
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// One filing through step 6: `true` = the no-op `alreadyIndexed`, `false` = the filing wrote.
+    fn w25c_filing(conn: &rusqlite::Connection, v: &VerifiedRecord) -> bool {
+        if w25c_door_chain_rows(conn, v) > 0 {
+            return true;
+        }
+        w25c_file(conn, v);
+        false
+    }
+
+    fn w25c_count(conn: &rusqlite::Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn w25c_potparty(seat_settle: Option<&str>, txid: &str) -> PotpartyRecord {
+        PotpartyRecord {
+            identity: "02aa".into(),
+            opponent_identity: "02bb".into(),
+            game_id: "11".repeat(32),
+            pot_txid: "22".repeat(32),
+            pot_vout: 0,
+            recovery_height: 900_000,
+            sig_hex: "3044".into(),
+            seat_settle_pubkey: seat_settle.map(Into::into),
+            seat_sig_hex: seat_settle.map(|_| "3045".into()),
+            txid: txid.into(),
+            output_index: 0,
+            created_at: 0,
+        }
+    }
+
+    fn w25c_result(loser_sig: Option<&str>, txid: &str) -> ResultRecord {
+        ResultRecord {
+            game_id: "33".repeat(32),
+            winner: "02aa".into(),
+            loser: "02bb".into(),
+            pot_txid: "44".repeat(32),
+            settle_txid: "55".repeat(32),
+            winner_sig_hex: "3044".into(),
+            loser_sig_hex: loser_sig.map(Into::into),
+            cards_hex: None,
+            txid: txid.into(),
+            output_index: 0,
+            created_at: 0,
+        }
+    }
+
+    /// #565: a potparty or result marker the CHAIN holds (latched valid by the overlay), filed again through the
+    /// door, is the no-op `alreadyIndexed`; before the fix the version flag bound as TEXT '1' never equalled the
+    /// INTEGER `(x IS NULL)`, so the filing WROTE a second (filed) row beside the chain row.
+    #[test]
+    fn w25c_565_a_chain_marker_filed_again_is_the_no_op_under_real_sqlite() {
+        let conn = w25c_db();
+        // potparty v1: the chain row, latched sigValid = 1 (the overlay's admission latch)
+        let chain = VerifiedRecord::Potparty(w25c_potparty(None, &"cc".repeat(32)), true);
+        w25c_file(&conn, &chain);
+        let filed = VerifiedRecord::Potparty(w25c_potparty(None, "filed:pp1"), true);
+        assert_eq!(
+            w25c_door_chain_rows(&conn, &filed),
+            1,
+            "the v1 chain row is found"
+        );
+        assert!(w25c_filing(&conn, &filed), "the second filing is the no-op");
+        assert_eq!(
+            w25c_count(&conn, "SELECT COUNT(*) FROM potparty_records"),
+            1,
+            "no filed row beside the chain row"
+        );
+        // the version still parts them: a v2 filing over a v1 chain row is not a no-op
+        let filed_v2 = VerifiedRecord::Potparty(w25c_potparty(Some("02cc"), "filed:pp2"), true);
+        assert!(
+            !w25c_filing(&conn, &filed_v2),
+            "a v2 filing over a v1 chain row writes"
+        );
+        // ... and a v2 chain row makes a v2 filing the no-op
+        let conn = w25c_db();
+        w25c_file(
+            &conn,
+            &VerifiedRecord::Potparty(w25c_potparty(Some("02cc"), &"cd".repeat(32)), true),
+        );
+        assert!(w25c_filing(&conn, &filed_v2), "v2 over v2: the no-op");
+        assert!(!w25c_filing(&conn, &filed), "v1 over v2: writes");
+
+        // result, the plain claim: a chain row of tier 1
+        let conn = w25c_db();
+        w25c_file(
+            &conn,
+            &VerifiedRecord::Result(w25c_result(None, &"dd".repeat(32)), 1),
+        );
+        let filed = VerifiedRecord::Result(w25c_result(None, "filed:r1"), 1);
+        assert!(
+            w25c_filing(&conn, &filed),
+            "the plain claim filed again is the no-op"
+        );
+        assert_eq!(
+            w25c_count(&conn, "SELECT COUNT(*) FROM result_markers_v2"),
+            1
+        );
+        // the countersigned claim over a countersigned chain row of tier 2
+        let conn = w25c_db();
+        w25c_file(
+            &conn,
+            &VerifiedRecord::Result(w25c_result(Some("3045"), &"de".repeat(32)), 2),
+        );
+        let filed2 = VerifiedRecord::Result(w25c_result(Some("3045"), "filed:r2"), 2);
+        assert!(
+            w25c_filing(&conn, &filed2),
+            "countersigned filed again: the no-op"
+        );
+        assert!(
+            !w25c_filing(&conn, &filed),
+            "a plain claim over a countersigned chain row writes"
+        );
+    }
+
+    /// #564 and #565's own planted case: a chain row that does NOT verify for the identity it names (a stranger
+    /// bought it) is no no-op; the honest filing writes. The identity's own verified chain row still is the no-op.
+    #[test]
+    fn w25c_564_a_planted_chain_row_never_answers_already_indexed() {
+        // collected v1: the victim's real marker vs a stranger's chain row naming the victim
+        let victim = wallet(21);
+        let id = identity(&victim);
+        let id_lc = hex::encode(&id);
+        let gid = [0x5au8; 32];
+        let gid_lc = hex::encode(gid);
+        let challenge = collected_challenge(&gid_lc, &id_lc);
+        let own_sig = sign(&victim, collected_protocol(), &gid_lc, &challenge);
+        let stranger_sig = sign(&wallet(22), collected_protocol(), &gid_lc, &challenge);
+        let filing = verify_record_post(
+            RecordKind::Collected,
+            &script(&[b"LOW/collected/v1", &gid, &id, &own_sig]),
+            &id_lc,
+        )
+        .unwrap();
+        let chain_row = |txid: &str, sig: &[u8]| {
+            VerifiedRecord::Collected(CollectedRecord {
+                identity: id_lc.clone(),
+                game_id: gid_lc.clone(),
+                txid: txid.into(),
+                output_index: 0,
+                sig_hex: Some(hex::encode(sig)),
+                pay_txid: None,
+            })
+        };
+        let conn = w25c_db();
+        w25c_file(&conn, &chain_row(&"e1".repeat(32), &stranger_sig)); // a foreign key's signature
+        w25c_file(&conn, &chain_row(&"e2".repeat(32), &[0x30, 0x44, 0x01])); // junk
+        assert_eq!(
+            w25c_door_chain_rows(&conn, &filing),
+            0,
+            "no planted row is the victim's own"
+        );
+        assert!(
+            !w25c_filing(&conn, &filing),
+            "the honest v1 collected filing writes"
+        );
+        assert_eq!(
+            w25c_count(
+                &conn,
+                "SELECT COUNT(*) FROM collected_markers_v2 WHERE txid LIKE 'filed:%'"
+            ),
+            1,
+            "the victim's filed row is written beside the planted ones"
+        );
+        // the identity's own chain row: the no-op (upper-case hex too, as a chain row may be stored)
+        let conn = w25c_db();
+        w25c_file(&conn, &chain_row(&"e1".repeat(32), &stranger_sig));
+        w25c_file(&conn, &chain_row(&"e3".repeat(32), &own_sig));
+        assert!(
+            w25c_filing(&conn, &filing),
+            "the identity's own chain row: alreadyIndexed"
+        );
+        assert_eq!(
+            own_collected_chain_rows(
+                &id_lc,
+                &gid_lc,
+                &[Some(hex::encode(&own_sig).to_ascii_uppercase())]
+            ),
+            1
+        );
+        // past the read bound the filing proceeds: never a no-op on rows not checked
+        let junk = vec![Some(hex::encode(&stranger_sig)); COLLECTED_CHAIN_SIGS_READ];
+        let mut past = junk.clone();
+        past.push(Some(hex::encode(&own_sig)));
+        assert_eq!(own_collected_chain_rows(&id_lc, &gid_lc, &past), 0);
+        assert!(COLLECTED_CHAIN_ROWS_SQL.ends_with(&format!("LIMIT {COLLECTED_CHAIN_SIGS_READ}")));
+
+        // potparty: a chain row the overlay latched invalid (0) or has not latched (NULL) is no no-op
+        for latch in [Some(0i64), None] {
+            let conn = w25c_db();
+            let planted = w25c_potparty(None, &"f1".repeat(32));
+            conn.execute(
+                POTPARTY_FILE_SQL,
+                rusqlite::params![
+                    planted.identity,
+                    planted.opponent_identity,
+                    planted.game_id,
+                    planted.pot_txid,
+                    0,
+                    900_000,
+                    "3044",
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    planted.txid,
+                    0,
+                    1_000,
+                    latch
+                ],
+            )
+            .unwrap();
+            let filed = VerifiedRecord::Potparty(w25c_potparty(None, "filed:pp"), true);
+            assert!(
+                !w25c_filing(&conn, &filed),
+                "sigValid {latch:?}: the honest filing writes"
+            );
+        }
+        // result: a tier-0 chain row is no no-op, and a countersigned-shaped chain row whose countersig did not
+        // verify (tier 1) does not swallow the honest countersigned filing
+        let conn = w25c_db();
+        w25c_file(
+            &conn,
+            &VerifiedRecord::Result(w25c_result(None, &"f2".repeat(32)), 0),
+        );
+        assert!(!w25c_filing(
+            &conn,
+            &VerifiedRecord::Result(w25c_result(None, "filed:r"), 1)
+        ));
+        let conn = w25c_db();
+        w25c_file(
+            &conn,
+            &VerifiedRecord::Result(w25c_result(Some("3045"), &"f3".repeat(32)), 1),
+        );
+        assert!(!w25c_filing(
+            &conn,
+            &VerifiedRecord::Result(w25c_result(Some("3045"), "filed:r2"), 2)
+        ));
     }
 }
