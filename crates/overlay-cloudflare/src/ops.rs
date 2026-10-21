@@ -2019,6 +2019,26 @@ mod tests {
         conn
     }
 
+    /// bsv-low #794: hold SQLite's `unixepoch()` on `conn` to the value in the returned cell, so every statement a
+    /// pin runs (the shipped backlog, its old twin, a writer's `spentAt = unixepoch()`, a fixture's `createdAt`)
+    /// reads ONE `now` until the pin moves it. An application function overrides the built-in of its name and
+    /// arity; `unixepoch(time, ..)` with arguments stays SQLite's.
+    pub(crate) fn ns_cost_pin_clock(
+        conn: &rusqlite::Connection,
+        now: i64,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicI64> {
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(now));
+        let held = clock.clone();
+        conn.create_scalar_function(
+            "unixepoch",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |_| Ok(held.load(std::sync::atomic::Ordering::SeqCst)),
+        )
+        .unwrap();
+        clock
+    }
+
     /// NS-COST-BAR-1: the backlog before the count row (`index_janitor_backlog`'s old statement).
     pub(crate) const INDEX_JANITOR_BACKLOG_BEFORE_SQL: &str =
         "SELECT lockKind, COUNT(*) AS c FROM pot_records \
@@ -2049,12 +2069,21 @@ mod tests {
     /// NS-COST-BAR-1: the index janitor's backlog equals the old `GROUP BY` after every SHIPPED `pot_records` writer
     /// of `spent` or `lockKind` (the #284 upsert's insert and its conflict fill, the four spend marks, both CASes,
     /// an eviction's delete and restore), its class counts equal a count of the unspent rows, and the hour boundary
-    /// is the old one to the second.
+    /// is the old one to the second. The clock is held (bsv-low #794): read from the wall, a second boundary between
+    /// the young fixtures' writes and a later check aged y3 past the edge (`(1, 0, 1)`, about one run in three).
     #[test]
     fn ns_cost_unspent_kind_counts_are_exact_under_every_shipped_writer() {
         use crate::d1_discovery as d;
         use rusqlite::types::Value;
+        use std::sync::atomic::Ordering;
         let conn = ns_cost_migrated(false);
+        let now = 1_800_000_000i64;
+        let clock = ns_cost_pin_clock(&conn, now);
+        let sql_now = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row("SELECT unixepoch()", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(sql_now(&conn), now, "the held clock overrides SQLite's");
         let check = |what: &str| {
             let new = ns_cost_backlog_fold(&conn, INDEX_JANITOR_BACKLOG_SQL);
             assert_eq!(
@@ -2174,6 +2203,30 @@ mod tests {
             rusqlite::params!["s9", 1i64, 1i64, "o1", 0i64, "x"],
         );
         assert_eq!(check("a displace CAS that lands"), (1, 0, 0));
+        assert_eq!(
+            conn.query_row(
+                "SELECT spentAt FROM pot_records WHERE txid = 'o1'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            now,
+            "the CAS's spentAt reads the held now"
+        );
+        // The edge, moved by the pin alone: y2 sits at exactly now - 3600 (backlog), y3 at now - 3599 (young) until
+        // one second passes, when both statements count it at once.
+        assert_eq!(
+            conn.query_row(
+                "SELECT createdAt FROM pot_records WHERE txid = 'y2'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            now - 3600
+        );
+        clock.store(now + 1, Ordering::SeqCst);
+        assert_eq!(sql_now(&conn), now + 1);
+        assert_eq!(check("one second on: y3 is backlog"), (1, 0, 1));
     }
 
     /// NS-COST-BAR-1: `txRetiredTotal` and the expired-unproven total equal their `COUNT(*)`s after every SHIPPED
