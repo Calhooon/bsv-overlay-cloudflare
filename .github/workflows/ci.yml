@@ -222,3 +222,11 @@ jobs:
         done < <(git ls-files -z -- 'Cargo.lock' '*/Cargo.lock')
         [ "$found" -gt 0 ] || echo "no committed Cargo.lock"
         exit "$status"
+  scrub:
+    name: scrub
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
+    - run: tools/scrub.sh
