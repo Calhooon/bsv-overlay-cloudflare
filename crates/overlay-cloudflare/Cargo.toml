@@ -34,7 +34,10 @@ low-proof-replay = { package = "bsv-low-proof-replay", version = "0.3.1", path =
 bsv-rs = { workspace = true, features = ["wasm"] }
 # bsv-low #619 (L3): the door hosts the tracker for Arcade's words
 # (`door_words`); the same exact pin as the app layer, one copy in the lock.
-bsv-tracker = "=0.6.0"
+# Exactly 0.7.0 (REPIN-080-OVERLAY, 2026-10-21): the reorg rule BY THE ROOT (a `mined` word is `stale` iff its
+# root is not the active header's root at its height; `Reask::Reorg` means the root moved) and
+# `MempoolPresent` over `built` moves the word to `announced`. No public type changes.
+bsv-tracker = "=0.7.0"
 # 0.3 (bsv-low #348, was 0.1). Bumped because it is the only middleware line
 # compatible with `worker 0.8`, and it is the SAME major the low-watchtower
 # and low-app-layer already pin, so the fleet is now on one middleware lineage
@@ -50,7 +53,10 @@ bsv-tracker = "=0.6.0"
 # Exactly 0.7.0 (lane W8e, 2026-10-19): the middleware's release on bsv-rs 0.7.0 (core 0.4.0), one
 # bsv-rs in the lock. Its payment-prefix claim (`PaymentPrefixStore`, `PAYMENT_CLAIMS_MIGRATION`) is on
 # the payment path, which this crate does not link: no claims table here, the migration does not apply.
-bsv-middleware-cloudflare = "=0.7.0"
+# Exactly 0.7.1 (REPIN-080-OVERLAY, 2026-10-21): core stays 0.4.0, the floor bsv-rs `^0.7.0` takes the
+# workspace's 0.7.2. 0.7.1 is the payment door's fail-closed posture (`FaultPosture::Closed`, 503
+# `ERR_PAYMENT_UNAVAILABLE`, `PrefixGate::Refuse` gains `headers`); this crate links no payment door, unchanged.
+bsv-middleware-cloudflare = "=0.7.1"
 async-trait.workspace = true
 base64 = "0.22"
 hex.workspace = true

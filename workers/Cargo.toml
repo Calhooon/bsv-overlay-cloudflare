@@ -39,7 +39,7 @@ repository = "https://github.com/Calhooon/bsv-overlay-cloudflare"
 # BSV SDK: crates.io. `overlay` feature = types + transaction + script +
 # wallet. `auth`/`http` deliberately left off; they pull reqwest/tokio-net
 # which fail on wasm32.
-bsv-rs = { version = "=0.7.0", features = ["overlay"] }
+bsv-rs = { version = "=0.7.2", features = ["overlay"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -58,6 +58,8 @@ tracing = "0.1"
 # `bsv-middleware-core` 0.2.0, both on bsv-rs 0.4: one bsv-rs (the `=0.4.3` above) in the lock.
 # Since lane W8e (2026-10-19) both pin `=0.7.0`, whose core is 0.4.0 (the adapter asks `0.4.0`, the lock
 # holds exactly 0.4.0), both on bsv-rs 0.7.0: one bsv-rs (the `=0.7.0` above) in the lock.
+# Since REPIN-080-OVERLAY (2026-10-21) both pin `=0.7.1` (core still 0.4.0, floor bsv-rs `^0.7.0`), on bsv-rs
+# `=0.7.2` (0.7.1 HKDF and 0.7.2 the difficulty rule, both additive): one bsv-rs in the lock.
 
 # The lint bar (bsv-stack-lean #134): every member takes this table with
 # `lints.workspace = true`. The gate runs clippy with `-D warnings`, so a

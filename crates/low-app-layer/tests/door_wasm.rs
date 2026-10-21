@@ -6,7 +6,7 @@
 //! door's CORS, and the HIGH-1 guard runs on real requests.
 //!
 //! ```sh
-//! cd workers && CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=<wasm-bindgen-test-runner 0.2.126> \
+//! cd workers && CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=<wasm-bindgen-test-runner 0.2.129> \
 //!   cargo test -p low-app-layer --target wasm32-unknown-unknown --test door_wasm
 //! ```
 #![cfg(target_arch = "wasm32")]
