@@ -829,6 +829,13 @@ fn uhrp_err(e: String) -> UHRPStorageError {
 
 pub(crate) fn uhrp_lookup_query(query: &UHRPQuery, now_ms: i64) -> Query {
     let mut wb = WhereBuilder::new();
+    if let Some((txid, index)) = query.outpoint.as_ref() {
+        wb = wb.eq("txid", txid.as_str());
+        wb = wb.eq("outputIndex", *index);
+    }
+    if let Some(expiry) = query.expiry_time {
+        wb = wb.eq("expiryTime", expiry);
+    }
     if let Some(u) = query.uhrp_url.as_deref() {
         wb = wb.eq("uhrpUrl", u);
     }

@@ -202,6 +202,59 @@ mod tests {
         );
     }
 
+    /// bsv-low #819: the door's `outpoint` and `expiryTime` filters reach the
+    /// D1 statement (the reference's filters, read on the production schema).
+    #[test]
+    fn i819_outpoint_and_expiry_filters_bind_on_d1() {
+        let db = database();
+        let now = PROOFLESS_FLAG_MS * 3;
+        let old = (now - PROOFLESS_FLAG_MS) / 1000 - 1;
+        let a = "ab".repeat(32);
+        let b = "cd".repeat(32);
+        row(&db, &a, Some(old), true, 4_000_000_000);
+        row(&db, &b, Some(old), true, 4_000_000_001);
+        let by = |q: UHRPQuery| {
+            let mut got = run_lookup(&db, &crate::d1_discovery::uhrp_lookup_query(&q, now));
+            got.sort();
+            got
+        };
+        assert_eq!(
+            by(UHRPQuery {
+                outpoint: Some((a.clone(), 0)),
+                limit: Some(1),
+                ..Default::default()
+            }),
+            vec![a.clone()]
+        );
+        assert!(by(UHRPQuery {
+            outpoint: Some((a.clone(), 1)),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .is_empty());
+        assert_eq!(
+            by(UHRPQuery {
+                expiry_time: Some(4_000_000_001),
+                limit: Some(50),
+                ..Default::default()
+            }),
+            vec![b]
+        );
+        let sql = crate::d1_discovery::uhrp_lookup_query(
+            &UHRPQuery {
+                uhrp_url: Some("u".into()),
+                limit: Some(50),
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(
+            sql.sql().ends_with("ORDER BY createdAt DESC LIMIT 50"),
+            "{}",
+            sql.sql()
+        );
+    }
+
     #[test]
     fn proof_window_expiry_is_bounded_and_preserves_live_siblings() {
         let db = database();
