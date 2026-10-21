@@ -851,7 +851,13 @@ pub const OWED_RECOMPUTE_TIME_BUDGET_MS: i64 = 12_000;
 /// The platform's `wait_until` ceiling: a detached recompute is cancelled this long after the response.
 pub const OWED_PLATFORM_WAIT_UNTIL_MS: i64 = 30_000;
 /// What a claim needs after its walk: the release (synchronous), one stale mark (one D1 statement) and the
-/// `owed-changed` push (one actor fetch). Kept out of every slice.
+/// `owed-changed` push (one actor fetch), or for a dropped walk the alarm's arm (one actor fetch). Kept out of every
+/// slice. The FIX-800 delta lens's LOW-A, folded and stated: a claim now pushes ONE `owed-changed` (its last landed
+/// walk's, `routes::owed_told_last`), so the tail after a walk is at most the arm, the mark, one push and a nudge
+/// only when the arm failed. The mark is NOT bounded: a bounded mark can be dropped unlanded, which turns the next read
+/// into a no-op and the page silent (MEDIUM-1's class), where an unbounded one only risks the trailing push past 30 s.
+/// The band, stated: a mark slower than the reserve (the overload that dropped the walk) can cost that push; a
+/// dropped walk arms the alarm BEFORE its mark, so its arm is not the one cut, and the alarm's walk pushes.
 pub const OWED_RELEASE_RESERVE_MS: i64 = 3_000;
 /// The hard deadline of ONE claimed walk, derived ONCE from the invocation's start (the FIX-800 lens's MEDIUM-2): the
 /// platform's 30 s less the 3 s reserve, 27 s. Every entry captures its invocation's end (`owed_invocation_end`) where
@@ -975,12 +981,20 @@ pub enum OwedWalkEnd {
 /// stale on the way out, or run one folded ask again. PURE (pinned).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwedClaimStep {
-    /// `nudge`: after the stale mark, push `owed-changed` with no rows (`owed_stale_event_body`): the walk wrote
-    /// nothing, and the page re-reads `/owed` only on an event (the FIX-800 lens's MEDIUM-1), so its read, served the
-    /// stale rows, walks on a fresh invocation. Bounded by #499's ceiling: a read past it is shed (`retryAfterMs`).
+    /// `nudge`: after the stale mark, push `owed-changed` with no rows (`owed_stale_event_body`): the walk was never
+    /// started (no slice), and the page re-reads `/owed` only on an event (the FIX-800 lens's MEDIUM-1), so its read,
+    /// served the stale rows, walks on a FRESH invocation with a whole slice (once: it lands or is dropped).
+    ///
+    /// `to_alarm`: the walk was DROPPED at its hard deadline. The identity is handed to the deferred alarm walk
+    /// (`RecomputeRate::hand_to_alarm`, the window's one reserved walk, its own 60 s deadline: the one path that
+    /// lands a heavy identity) and the page is NOT nudged (the FIX-800 delta lens's MEDIUM-A: a nudge there made the
+    /// page re-read, which claimed another 27 s walk that was dropped again, one lap every ~28 s a tab, under the
+    /// ceiling, so the alarm was never reached). The alarm's landed walk pushes the rows; a read meanwhile is shed
+    /// with `retryAfterMs` past the alarm's landing. Only an arm that FAILED falls back to the nudge.
     Release {
         mark_stale: bool,
         nudge: bool,
+        to_alarm: bool,
     },
     Rerun,
 }
@@ -1001,11 +1015,20 @@ pub fn owed_claim_step(
         OwedWalkEnd::WrittenCut => OwedClaimStep::Release {
             mark_stale: folded,
             nudge: false,
+            to_alarm: false,
         },
-        // nothing written by this walk: the identity is marked stale and the page told, so its next read walks it
-        OwedWalkEnd::PastDeadline | OwedWalkEnd::NoSlice => OwedClaimStep::Release {
+        // dropped at its deadline (nothing written): marked stale and handed to the alarm's 60 s walk, the page not
+        // nudged into another walk that would be dropped the same way (the FIX-800 delta lens's MEDIUM-A)
+        OwedWalkEnd::PastDeadline => OwedClaimStep::Release {
+            mark_stale: true,
+            nudge: false,
+            to_alarm: true,
+        },
+        // never started (no slice): marked stale and the page told, so its next read walks on a fresh invocation
+        OwedWalkEnd::NoSlice => OwedClaimStep::Release {
             mark_stale: true,
             nudge: true,
+            to_alarm: false,
         },
         OwedWalkEnd::Written | OwedWalkEnd::Faulted if folded && reruns_left && next_slice => {
             OwedClaimStep::Rerun
@@ -1013,6 +1036,7 @@ pub fn owed_claim_step(
         OwedWalkEnd::Written | OwedWalkEnd::Faulted => OwedClaimStep::Release {
             mark_stale: folded,
             nudge: false,
+            to_alarm: false,
         },
     }
 }
@@ -4961,6 +4985,9 @@ pub struct RecomputeRate {
     /// identity (lowercase) -> (window start ms, recomputes run in it)
     windows: HashMap<String, (i64, u32)>,
     deferred: HashMap<String, i64>,
+    /// identity (lowercase) -> the unix-ms until which its request-path walks are refused: it was handed to the
+    /// deferred alarm walk by a DROPPED walk (`hand_to_alarm`, the FIX-800 delta lens's MEDIUM-A).
+    handed: HashMap<String, i64>,
 }
 
 impl RecomputeRate {
@@ -4972,6 +4999,12 @@ impl RecomputeRate {
                 now_ms.saturating_sub(*start) < OWED_RECOMPUTE_RATE_WINDOW_MS
             });
             self.deferred.retain(|_, end| *end > now_ms);
+            self.handed.retain(|_, until| *until > now_ms);
+        }
+        // the FIX-800 delta lens's MEDIUM-A: an identity handed to the alarm walks no request-path walk until the
+        // alarm's walk has had its whole deadline (a walk started here would be dropped as the last one was)
+        if self.handed_until(identity_lc, now_ms).is_some() {
+            return false;
         }
         let w = self
             .windows
@@ -5000,10 +5033,48 @@ impl RecomputeRate {
         self.deferred.insert(identity_lc.to_string(), end);
         Some(end)
     }
-    /// Scheduling failed: allow the next shed to repair this window's missing alarm.
+    /// The FIX-800 delta lens's MEDIUM-A: a claimed walk of `identity_lc` was DROPPED at its hard deadline. Hand the
+    /// identity to the deferred alarm walk of the window that walk was charged to (its end, the same reservation a
+    /// shed arms: ceiling + 1 walks a window kept), and refuse its request-path walks until that alarm's walk has
+    /// had its whole deadline: `max(end, now) + OWED_DEFERRED_WALK_DEADLINE_MS`. `Some(end)` when this call arms
+    /// the window's alarm; `None` when it is armed already (a shed's, or an earlier drop's: a second drop in the
+    /// window arms nothing new). PURE (pinned).
+    ///
+    /// The rate (per identity per isolate, the D1 overload band of loops 11 and 39 where the walk runs past 27 s):
+    /// the drop at d of a walk admitted at a >= the window's start s (d = a + 27 s) hands the identity off until
+    /// max(s + 60 s, d) + 60 s, which is 60 to 93 s past the drop. So the identity costs ONE request-path walk (27 s)
+    /// per hand-off, then the alarm's one (60 s, at the window's end), whatever the number of open tabs: at most one
+    /// request-path walk per 87 to 120 s (0.5 to 0.7 a minute) where fc64a957's nudge drove one every ~28 s per tab
+    /// (2.2 a minute a tab, never reaching the ceiling of 12, so never the alarm). If the alarm's walk is dropped too
+    /// it tells the page once and re-arms once (#648); the read that follows, past the hand-off, may start one more
+    /// request-path walk, which hands off again. Each isolate keeps its own map, so the bound is per isolate.
+    pub fn hand_to_alarm(&mut self, identity_lc: &str, now_ms: i64) -> Option<i64> {
+        let start = self.windows.get(identity_lc).map_or(now_ms, |(s, _)| *s);
+        let end = start.saturating_add(OWED_RECOMPUTE_RATE_WINDOW_MS);
+        let until = end
+            .max(now_ms)
+            .saturating_add(OWED_DEFERRED_WALK_DEADLINE_MS);
+        let h = self.handed.entry(identity_lc.to_string()).or_insert(until);
+        *h = (*h).max(until);
+        if self.deferred.get(identity_lc) == Some(&end) {
+            return None;
+        }
+        self.deferred.insert(identity_lc.to_string(), end);
+        Some(end)
+    }
+    /// Until when `identity_lc` is handed to its alarm (`hand_to_alarm`), if it still is at `now_ms`.
+    pub fn handed_until(&self, identity_lc: &str, now_ms: i64) -> Option<i64> {
+        self.handed
+            .get(identity_lc)
+            .copied()
+            .filter(|until| *until > now_ms)
+    }
+    /// Scheduling failed: allow the next shed to repair this window's missing alarm, and lift a hand-off that alarm
+    /// was to serve (with no alarm the request path must walk the identity again).
     pub fn unarm_deferred(&mut self, identity_lc: &str, end: i64) {
         if self.deferred.get(identity_lc) == Some(&end) {
             self.deferred.remove(identity_lc);
+            self.handed.remove(identity_lc);
         }
     }
     pub fn window_end(&self, identity_lc: &str) -> Option<i64> {
@@ -5011,13 +5082,20 @@ impl RecomputeRate {
             .get(identity_lc)
             .map(|(start, _)| start.saturating_add(OWED_RECOMPUTE_RATE_WINDOW_MS))
     }
-    /// Remainder of an exhausted window; reads can inspect this without spending another admission.
+    /// Remainder of an exhausted window, or of a hand-off to the alarm (the FIX-800 delta lens's MEDIUM-A: past the
+    /// alarm's expected landing, its due plus its 60 s deadline), whichever is later; reads can inspect this without
+    /// spending another admission.
     pub fn retry_after_ms(&self, identity_lc: &str, now_ms: i64) -> Option<i64> {
-        let (start, n) = self.windows.get(identity_lc)?;
-        let remaining = start
-            .saturating_add(OWED_RECOMPUTE_RATE_WINDOW_MS)
-            .saturating_sub(now_ms);
-        (*n >= OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW && remaining > 0).then_some(remaining)
+        let exhausted = self.windows.get(identity_lc).and_then(|(start, n)| {
+            let remaining = start
+                .saturating_add(OWED_RECOMPUTE_RATE_WINDOW_MS)
+                .saturating_sub(now_ms);
+            (*n >= OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW && remaining > 0).then_some(remaining)
+        });
+        let handed = self
+            .handed_until(identity_lc, now_ms)
+            .map(|until| until.saturating_sub(now_ms));
+        exhausted.max(handed)
     }
     /// The recomputes `identity_lc` has run in its current window (0 past it).
     pub fn in_window(&self, identity_lc: &str, now_ms: i64) -> u32 {
