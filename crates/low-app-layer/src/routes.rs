@@ -5939,11 +5939,13 @@ async fn owed_walk_told(
     Ok(())
 }
 
-/// bsv-low #800 (the FIX-800 lens's MEDIUM-1): a walk that wrote nothing (dropped at its deadline, never started)
-/// tells the page anyway, AFTER the identity's stale mark: the page re-reads `/owed` only on an event (no poll), so
-/// without it an open page kept the pre-filing list until the next tip or a reconnect. Its read is served the stored
-/// rows and walks on a fresh invocation; a read past #499's ceiling is shed (`refresh: "shed"`, `retryAfterMs`), so
-/// a walk that is dropped every time costs at most the ceiling's walks a window, then the alarm's one.
+/// bsv-low #800 (the FIX-800 lens's MEDIUM-1): a walk that was NEVER STARTED (no slice) tells the page anyway, AFTER
+/// the identity's stale mark: the page re-reads `/owed` only on an event (no poll), so without it an open page kept
+/// the pre-filing list until the next tip or a reconnect. Its read is served the stored rows and walks on a fresh
+/// invocation with a whole slice, once. A claimed walk DROPPED at its deadline does not nudge (the FIX-800 delta
+/// lens's MEDIUM-A: the re-read claimed another walk dropped the same way, a loop under #499's ceiling that never
+/// reached the alarm): it hands the identity to the alarm (`owed_hand_to_alarm`) and nudges only when that arm
+/// failed. The alarm's own walk nudges once on its drop, and pushes the rows when it lands.
 async fn owed_stale_nudge(env: &worker::Env, identity_lc: &str, source: &str) {
     crate::internal_events::first_party_push(
         env,
@@ -6027,7 +6029,7 @@ pub(crate) fn owed_recompute_admit(identity_lc: &str, source: &str, sheddable: b
     if !run {
         crate::owed::note_recompute_shed();
         console_warn!(
-            "[owed] recompute ({source}) for {}… shed: {} recomputes inside {} ms already (the snapshot stands)",
+            "[owed] recompute ({source}) for {}… shed: {} recomputes inside {} ms already, or handed to its deferred walk (the snapshot stands)",
             &identity_lc[..12.min(identity_lc.len())],
             crate::owed::OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW,
             crate::owed::OWED_RECOMPUTE_RATE_WINDOW_MS
@@ -6056,10 +6058,24 @@ fn owed_deferred_deadline(identity_lc: &str) -> Option<i64> {
             .arm_deferred(identity_lc, worker::Date::now().as_millis() as i64)
     })
 }
-async fn owed_schedule_deferred(env: &worker::Env, identity_lc: &str, deadline: Option<i64>) {
+/// The FIX-800 delta lens's MEDIUM-A: a dropped walk hands its identity to the window's deferred alarm walk
+/// (`owed::RecomputeRate::hand_to_alarm`), captured synchronously as the claim releases: `Some(end)` to arm, `None`
+/// when the window's alarm is armed already.
+fn owed_hand_to_alarm(identity_lc: &str) -> Option<i64> {
+    OWED_RATE.with(|r| {
+        r.borrow_mut()
+            .hand_to_alarm(identity_lc, worker::Date::now().as_millis() as i64)
+    })
+}
+/// `false` only when an alarm was to be armed and could not be (the reservation and any hand-off are lifted).
+async fn owed_schedule_deferred(
+    env: &worker::Env,
+    identity_lc: &str,
+    deadline: Option<i64>,
+) -> bool {
     // The shed captures the deadline BEFORE any await: a slow re-mark crossing the window must not lose its alarm.
     let Some(end) = deadline else {
-        return;
+        return true;
     };
     let result = async {
         let ns = env.durable_object("BOARD_VIEW")?;
@@ -6080,7 +6096,9 @@ async fn owed_schedule_deferred(env: &worker::Env, identity_lc: &str, deadline: 
         crate::owed::note_recompute_arm_failed();
         OWED_RATE.with(|r| r.borrow_mut().unarm_deferred(identity_lc, end));
         console_warn!("[owed] deferred alarm could not be armed: {e}");
+        return false;
     }
+    true
 }
 /// The identities at the ceiling on this isolate now, for `/health`.
 pub(crate) fn owed_rate_at_ceiling(now_ms: i64) -> usize {
@@ -6284,8 +6302,23 @@ pub(crate) async fn owed_recompute_claimed(
             // bsv-low #800: THE RELEASE POINT. The lock is released in the step the walk ended (its snapshot written,
             // cut at its budget, dropped at its deadline, or never started), before any further await, so no walk the
             // platform can still cancel runs under it; the stale mark (one statement) and the pushes come after.
-            crate::owed::OwedClaimStep::Release { mark_stale, nudge } => {
+            crate::owed::OwedClaimStep::Release {
+                mark_stale,
+                nudge,
+                to_alarm,
+            } => {
                 owed_refresh_end(identity_lc, token);
+                // the FIX-800 delta lens's MEDIUM-A: a DROPPED walk hands the identity to the window's alarm walk
+                // (captured before any await, armed before the mark so a slow mark cannot cost the arm), and does
+                // not nudge the page into another walk dropped the same way
+                let mut nudge = nudge;
+                if to_alarm {
+                    let deferred = owed_hand_to_alarm(identity_lc);
+                    if !owed_schedule_deferred(env, identity_lc, deferred).await {
+                        // no alarm: the page is told after the mark, as a walk never started is
+                        nudge = true;
+                    }
+                }
                 if mark_stale {
                     // the delta-verify's LOW-1: an ask left folded (or a walk that wrote nothing) is served by the
                     // NEXT read — the walk may just have written `stale = 0`, so the mark is set again here (a folded
@@ -6308,7 +6341,8 @@ pub(crate) async fn owed_recompute_claimed(
                 }
                 owed_tell_all(env, identity_lc, told).await;
                 if nudge {
-                    // the FIX-800 lens's MEDIUM-1: nothing written, the page told after the mark, outside the lock
+                    // the FIX-800 lens's MEDIUM-1: never started (or no alarm armed), the page told after the mark,
+                    // outside the lock
                     owed_stale_nudge(env, identity_lc, &src).await;
                 }
                 return;
@@ -6335,14 +6369,45 @@ pub(crate) async fn owed_recompute_claimed(
     }
 }
 
-/// The walks a claim ran, told in their order once its lock is released (the FIX-800 lens's LOW-2).
+/// The walks a claim ran, told once its lock is released (the FIX-800 lens's LOW-2). The FIX-800 delta lens's LOW-A:
+/// ONE push, the LAST landed walk's (the page re-reads `/owed` on any `owed-changed`, so an earlier walk's push adds
+/// nothing the last one's does not, and each push was one more actor fetch in the 3 s reserve); every fault is still
+/// counted and logged, and a superseded snapshot is still not announced.
 async fn owed_tell_all(
     env: &worker::Env,
     identity_lc: &str,
     told: Vec<(String, String, std::result::Result<OwedComputed, String>)>,
 ) {
-    for (src, rid, w) in told {
+    for (src, rid, w) in owed_told_last(told) {
         let _ = owed_walk_told(env, identity_lc, &src, &rid, w).await;
+    }
+}
+
+/// PURE (pinned): of the walks a claim ran, the faults (each counted and logged by `owed_walk_told`) and the LAST
+/// landed, announceable walk (not superseded), in their order.
+fn owed_told_last<T>(
+    told: Vec<(String, String, std::result::Result<T, String>)>,
+) -> Vec<(String, String, std::result::Result<T, String>)>
+where
+    T: OwedAnnounceable,
+{
+    let last = told
+        .iter()
+        .rposition(|(_, _, w)| matches!(w, Ok(c) if c.announceable()));
+    told.into_iter()
+        .enumerate()
+        .filter(|(i, (_, _, w))| w.is_err() || Some(*i) == last)
+        .map(|(_, t)| t)
+        .collect()
+}
+
+/// A walk's snapshot that `owed_walk_told` pushes (a landed one the write did not refuse, #487).
+trait OwedAnnounceable {
+    fn announceable(&self) -> bool;
+}
+impl OwedAnnounceable for OwedComputed {
+    fn announceable(&self) -> bool {
+        !self.superseded
     }
 }
 
@@ -10744,7 +10809,8 @@ mod tests {
             step,
             OwedClaimStep::Release {
                 mark_stale: true,
-                nudge: false
+                nudge: false,
+                to_alarm: false
             },
             "a cut walk never holds the lock into another walk"
         );
@@ -10758,7 +10824,8 @@ mod tests {
             owed_claim_step(OwedWalkEnd::WrittenCut, false, true, true),
             OwedClaimStep::Release {
                 mark_stale: false,
-                nudge: false
+                nudge: false,
+                to_alarm: false
             }
         );
     }
@@ -10776,14 +10843,16 @@ mod tests {
                         owed_claim_step(OwedWalkEnd::PastDeadline, folded, left, slice),
                         OwedClaimStep::Release {
                             mark_stale: true,
-                            nudge: true
+                            nudge: false,
+                            to_alarm: true
                         }
                     );
                     assert_eq!(
                         owed_claim_step(OwedWalkEnd::NoSlice, folded, left, slice),
                         OwedClaimStep::Release {
                             mark_stale: true,
-                            nudge: true
+                            nudge: true,
+                            to_alarm: false
                         }
                     );
                 }
@@ -10802,7 +10871,8 @@ mod tests {
             owed_claim_step(OwedWalkEnd::Written, true, true, false),
             OwedClaimStep::Release {
                 mark_stale: true,
-                nudge: false
+                nudge: false,
+                to_alarm: false
             },
             "no slice for the folded ask: the next read serves it"
         );
@@ -10810,14 +10880,16 @@ mod tests {
             owed_claim_step(OwedWalkEnd::Written, true, false, true),
             OwedClaimStep::Release {
                 mark_stale: true,
-                nudge: false
+                nudge: false,
+                to_alarm: false
             }
         );
         assert_eq!(
             owed_claim_step(OwedWalkEnd::Written, false, true, true),
             OwedClaimStep::Release {
                 mark_stale: false,
-                nudge: false
+                nudge: false,
+                to_alarm: false
             }
         );
         // an abandoned claim: re-stamped at t0, cancelled by the platform, never released
@@ -10917,7 +10989,7 @@ mod tests {
             .expect("the claim");
         let body = &r[claimed..claimed + r[claimed..].find("asyncfnowed_read_stored(").unwrap()];
         assert!(body.contains(&squash(
-            "crate::owed::OwedClaimStep::Release { mark_stale, nudge } => { owed_refresh_end(identity_lc, token); if mark_stale {"
+            "crate::owed::OwedClaimStep::Release { mark_stale, nudge, to_alarm, } => { owed_refresh_end(identity_lc, token);"
         )));
         assert!(body.contains(&squash("let ran = owed_recompute_and_push(")));
         let bounded = r
@@ -11113,23 +11185,21 @@ mod tests {
         assert!(!body.contains("OwedWalk::unclaimed()"));
     }
 
-    /// The FIX-800 lens's MEDIUM-1: a walk dropped at its deadline, or never started, ends with the identity marked
-    /// stale AND the page told (`owed-changed`, rows null), the push after the mark and outside the lock; the alarm's
-    /// dropped walk too. To red: the nudge off for `PastDeadline` / `NoSlice` (a6b77c4's rule: "left: Release {
-    /// mark_stale: true, nudge: false }"), or the nudge moved above the mark or the release.
+    /// The FIX-800 lens's MEDIUM-1, as the delta lens's MEDIUM-A left it: a walk never started ends with the identity
+    /// marked stale AND the page told (`owed-changed`, rows null), the push after the mark and outside the lock; the
+    /// alarm's dropped walk too. A walk DROPPED at its deadline is handed to the alarm instead (`fix800_i`). To red: the
+    /// nudge off for `NoSlice` (a6b77c4's rule), or the nudge moved above the mark or the release.
     #[test]
     fn fix800_g_a_dropped_or_unstarted_walk_marks_stale_and_tells_the_page() {
-        for end in [OwedWalkEnd::PastDeadline, OwedWalkEnd::NoSlice] {
-            for folded in [false, true] {
-                assert_eq!(
-                    owed_claim_step(end, folded, true, true),
-                    OwedClaimStep::Release {
-                        mark_stale: true,
-                        nudge: true
-                    },
-                    "{end:?}"
-                );
-            }
+        for folded in [false, true] {
+            assert_eq!(
+                owed_claim_step(OwedWalkEnd::NoSlice, folded, true, true),
+                OwedClaimStep::Release {
+                    mark_stale: true,
+                    nudge: true,
+                    to_alarm: false
+                },
+            );
         }
         // a walk that wrote tells the page with its own push (`owed_walk_told`), never the nudge
         for end in [
@@ -11161,7 +11231,7 @@ mod tests {
         let r = squash(&code);
         let arm = r
             .find(&squash(
-                "crate::owed::OwedClaimStep::Release { mark_stale, nudge } => {",
+                "crate::owed::OwedClaimStep::Release { mark_stale, nudge, to_alarm, } => {",
             ))
             .expect("the release arm");
         let arm = &r[arm..arm
@@ -11247,6 +11317,215 @@ mod tests {
         assert!(super::owed_folded_waiting(id));
         OWED_RERUN.with(|m| m.borrow_mut().remove(id));
         assert!(!super::owed_folded_waiting(id));
+    }
+
+    // ── the FIX-800 delta lens fold (bsv-low #800): the dropped walk goes to the alarm, one push a claim ──
+
+    /// The FIX-800 delta lens's MEDIUM-A: a walk DROPPED at its deadline arms the window's deferred alarm walk ONCE and
+    /// does not nudge the page; a second drop in the window arms nothing new; the identity's request-path walks are
+    /// refused, and a read is shed with `retryAfterMs` past the alarm's landing, until the alarm has had its whole
+    /// 60 s; a walk never started still nudges; the alarm's landed walk pushes the rows. On fc64a957 the step answered
+    /// a drop with the nudge, the loop drop, nudge, re-read, walk, drop under the ceiling. To red (the API kept, the
+    /// rule reverted alone): `PastDeadline` answering fc64a957's `Release { mark_stale: true, nudge: true, .. }`, the
+    /// arm made per call (no once), the hand-off not refusing a walk, or the Release arm not arming.
+    #[test]
+    fn fix800_i_a_dropped_walk_arms_the_alarm_once_and_pushes_nothing() {
+        use crate::owed::{
+            RecomputeRate, OWED_DEFERRED_WALK_DEADLINE_MS, OWED_RECOMPUTE_RATE_WINDOW_MS,
+        };
+        // the step: a drop goes to the alarm and pushes nothing; a walk never started pushes
+        for folded in [false, true] {
+            for left in [false, true] {
+                for slice in [false, true] {
+                    assert_eq!(
+                        owed_claim_step(OwedWalkEnd::PastDeadline, folded, left, slice),
+                        OwedClaimStep::Release {
+                            mark_stale: true,
+                            nudge: false,
+                            to_alarm: true
+                        },
+                        "a dropped walk arms the alarm and pushes nothing"
+                    );
+                    assert_eq!(
+                        owed_claim_step(OwedWalkEnd::NoSlice, folded, left, slice),
+                        OwedClaimStep::Release {
+                            mark_stale: true,
+                            nudge: true,
+                            to_alarm: false
+                        },
+                        "a walk never started pushes"
+                    );
+                }
+            }
+        }
+        for end in [
+            OwedWalkEnd::Written,
+            OwedWalkEnd::WrittenCut,
+            OwedWalkEnd::Faulted,
+        ] {
+            if let OwedClaimStep::Release { to_alarm, .. } =
+                owed_claim_step(end, true, false, false)
+            {
+                assert!(!to_alarm, "{end:?} arms nothing");
+            }
+        }
+        // the rate: the read's refresh admitted at s, its walk dropped at s + 27 s (loop 39's band)
+        let id = "02bb0000000000000000000000000000000000000000000000000000000fix800i";
+        let s = 7_000_000i64;
+        let mut rate = RecomputeRate::default();
+        assert!(rate.admit(id, s, true));
+        let drop_at = s + OWED_WALK_HARD_DEADLINE_MS;
+        let end = s + OWED_RECOMPUTE_RATE_WINDOW_MS;
+        assert_eq!(
+            rate.hand_to_alarm(id, drop_at),
+            Some(end),
+            "the first drop arms the window's one reserved walk, at its end"
+        );
+        let until = end + OWED_DEFERRED_WALK_DEADLINE_MS;
+        assert_eq!(rate.handed_until(id, drop_at), Some(until));
+        // the page's re-read (any event) is shed past the alarm's expected landing, never a new walk
+        assert_eq!(
+            rate.retry_after_ms(id, drop_at + 1),
+            Some(until - drop_at - 1)
+        );
+        assert!(
+            rate.retry_after_ms(id, drop_at + 1).unwrap()
+                > end + OWED_DEFERRED_WALK_DEADLINE_MS - drop_at - 2
+        );
+        for t in [drop_at + 1, end - 1, end, end + 1, until - 1] {
+            assert!(
+                !rate.admit(id, t, true),
+                "t = {t}: handed to the alarm, no request-path walk"
+            );
+        }
+        // a second drop in the window (a walk in flight before the first's hand-off) arms nothing new
+        assert_eq!(
+            rate.hand_to_alarm(id, drop_at + 2_000),
+            None,
+            "a second drop arms nothing new"
+        );
+        assert_eq!(rate.handed_until(id, drop_at + 2_000), Some(until));
+        // a shed of the same window finds its alarm armed: nothing new either
+        assert_eq!(rate.arm_deferred(id, drop_at + 3_000), None);
+        // past the alarm's whole deadline the request path walks again (one walk; a drop hands off anew)
+        assert_eq!(rate.retry_after_ms(id, until), None);
+        assert!(rate.admit(id, until, true));
+        let end2 = until + OWED_RECOMPUTE_RATE_WINDOW_MS;
+        assert_eq!(
+            rate.hand_to_alarm(id, until + OWED_WALK_HARD_DEADLINE_MS),
+            Some(end2)
+        );
+        // an arm that failed lifts the hand-off (no alarm: the request path walks, the claim nudges)
+        rate.unarm_deferred(id, end2);
+        assert_eq!(
+            rate.handed_until(id, until + OWED_WALK_HARD_DEADLINE_MS + 1),
+            None
+        );
+        assert!(rate.admit(id, until + OWED_WALK_HARD_DEADLINE_MS + 1, true));
+        // the stated rate: per hand-off one request-path walk (27 s), then 60 to 93 s handed off
+        for admitted_at in [s, s + 33_000] {
+            let mut r = RecomputeRate::default();
+            assert!(r.admit(id, s, true));
+            assert!(r.admit(id, admitted_at, true));
+            let d = admitted_at + OWED_WALK_HARD_DEADLINE_MS;
+            r.hand_to_alarm(id, d);
+            let off = r.handed_until(id, d).unwrap() - d;
+            assert!((60_000..=93_000).contains(&off), "{off}");
+        }
+        // the wiring: release, the hand-off captured and armed, then the mark; the nudge only when the arm failed
+        let squash = |x: &str| x.split_whitespace().collect::<String>();
+        let src = include_str!("routes.rs");
+        let code: String = src[..src.find("\nmod tests {").expect("the tests module")]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = squash(&code);
+        let arm = r
+            .find(&squash(
+                "crate::owed::OwedClaimStep::Release { mark_stale, nudge, to_alarm, } => {",
+            ))
+            .expect("the release arm");
+        let arm = &r[arm..arm
+            + r[arm..]
+                .find(&squash("crate::owed::OwedClaimStep::Rerun =>"))
+                .unwrap()];
+        let release = arm.find("owed_refresh_end(identity_lc,token);").unwrap();
+        let hand = arm
+            .find(&squash("if to_alarm { let deferred = owed_hand_to_alarm(identity_lc); if !owed_schedule_deferred(env, identity_lc, deferred).await { nudge = true; } }"))
+            .expect("a drop arms the alarm; only a failed arm nudges");
+        let mark = arm.find("owed_mark_stale(").unwrap();
+        assert!(
+            release < hand && hand < mark,
+            "release, the arm, then the mark"
+        );
+        // the alarm's landed walk pushes the rows; its drop marks and nudges once
+        let d = r
+            .find(&squash("pub(crate) async fn owed_deferred_walk_and_push("))
+            .unwrap();
+        let alarm = &r[d..d + r[d..]
+            .find(&squash("pub(crate) const OWED_RECOMPUTE_LEDGER_KEY"))
+            .unwrap()];
+        assert!(alarm.contains(&squash(
+            "Some(walked) => owed_walk_told(env, identity_lc, \"deferred\", &walk.rid, walked).await,"
+        )));
+        assert_eq!(alarm.matches("owed_stale_nudge(").count(), 1);
+        assert!(squash(include_str!("owed.rs")).contains(&squash(
+            "if self.handed_until(identity_lc, now_ms).is_some() { return false; }"
+        )));
+    }
+
+    impl super::OwedAnnounceable for bool {
+        fn announceable(&self) -> bool {
+            *self
+        }
+    }
+
+    /// The FIX-800 delta lens's LOW-A: a claim pushes ONE `owed-changed`, its LAST landed walk's (the page re-reads on
+    /// any), so the 3 s reserve carries the mark and one push; every fault is still told (counted and logged), a
+    /// superseded snapshot never. On fc64a957 every landed walk pushed. To red: `owed_tell_all` over `told` whole.
+    #[test]
+    fn fix800_j_a_claim_pushes_its_last_landed_walk_once() {
+        let w = |n: &str, r: Result<bool, String>| (n.to_string(), format!("r{n}"), r);
+        let names = |v: Vec<(String, String, Result<bool, String>)>| {
+            v.into_iter().map(|(n, ..)| n).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(super::owed_told_last(vec![
+                w("a", Ok(true)),
+                w("b", Ok(true))
+            ])),
+            ["b"],
+            "the first walk's push is superseded by the rerun's"
+        );
+        assert_eq!(
+            names(super::owed_told_last(vec![
+                w("a", Ok(true)),
+                w("b", Err("x".into()))
+            ])),
+            ["a", "b"],
+            "a landed walk behind a faulted rerun is still told, the fault too"
+        );
+        assert_eq!(
+            names(super::owed_told_last(vec![
+                w("a", Ok(true)),
+                w("b", Ok(false))
+            ])),
+            ["a"],
+            "a superseded snapshot is never the one announced"
+        );
+        assert_eq!(
+            names(super::owed_told_last(vec![
+                w("a", Err("x".into())),
+                w("b", Err("y".into()))
+            ])),
+            ["a", "b"]
+        );
+        assert!(super::owed_told_last::<bool>(vec![]).is_empty());
+        let squash = |x: &str| x.split_whitespace().collect::<String>();
+        assert!(squash(include_str!("routes.rs")).contains(&squash(
+            "for (src, rid, w) in owed_told_last(told) { let _ = owed_walk_told(env, identity_lc, &src, &rid, w).await; }"
+        )));
     }
 
     // ── /live-view asks the tower BY OUTPOINT (2026-08-12) ────────────────
