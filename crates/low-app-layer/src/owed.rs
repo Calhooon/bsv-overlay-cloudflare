@@ -857,7 +857,12 @@ pub const OWED_PLATFORM_WAIT_UNTIL_MS: i64 = 30_000;
 /// only when the arm failed. The mark is NOT bounded: a bounded mark can be dropped unlanded, which turns the next read
 /// into a no-op and the page silent (MEDIUM-1's class), where an unbounded one only risks the trailing push past 30 s.
 /// The band, stated: a mark slower than the reserve (the overload that dropped the walk) can cost that push; a
-/// dropped walk arms the alarm BEFORE its mark, so its arm is not the one cut, and the alarm's walk pushes.
+/// dropped walk arms the alarm BEFORE its mark, so its arm is not the one cut, and the alarm's walk pushes. The second
+/// delta lens's LOW-A, kept: an overrun past 30 s that cuts even the ARM (one actor fetch, no D1) leaves the isolate's
+/// map armed and handed with no alarm behind it: that window's sheds re-arm nothing and the page gets no push, and if no
+/// earlier mark landed the reads serve the old rows as fresh until the 5 min age; the hand-off still ends at its
+/// `until` (60 s past the drop when this claim armed). A shed hook (MEDIUM-B) adds one actor fetch (its note) before
+/// its mark and a nudge after it, in the same reserve.
 pub const OWED_RELEASE_RESERVE_MS: i64 = 3_000;
 /// The hard deadline of ONE claimed walk, derived ONCE from the invocation's start (the FIX-800 lens's MEDIUM-2): the
 /// platform's 30 s less the 3 s reserve, 27 s. Every entry captures its invocation's end (`owed_invocation_end`) where
@@ -4979,6 +4984,63 @@ pub const OWED_RECOMPUTE_RATE_WINDOW_MS: i64 = 60_000;
 /// Identities tracked before the expired windows are pruned (the map is per isolate and bounded by its traffic).
 const OWED_RECOMPUTE_RATE_PRUNE_AT: usize = 1024;
 
+/// What a dropped walk's hand-off decided (`RecomputeRate::hand_to_alarm`, the FIX-800 delta lenses' MEDIUM-A and
+/// LOW-C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwedHandOff {
+    /// `Some(end)`: arm the window's reserved alarm, keyed `end`; `None`: the window's alarm is armed already.
+    pub arm: Option<i64>,
+    /// When the alarm this call arms fires: the drop itself (`None` when nothing is armed here).
+    pub fire_at: Option<i64>,
+    /// Until when the identity's request-path walks are refused (the alarm's fire time plus its 60 s deadline).
+    pub until: i64,
+}
+
+/// The second FIX-800 delta lens's MEDIUM-B: what the identity's deferred actor answers a hook SHED while that
+/// actor's alarm is armed (`/owed-deferred-note`). PURE (pinned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwedAlarmNote {
+    /// The alarm is armed and its walk has not started: it reads the tables after the hook's evidence and pushes.
+    Pending,
+    /// The alarm's walk is in flight: the actor keeps the note (`owed-dirty`), and the walk marks the identity stale
+    /// AGAIN after its write, before its push (its write, stamped at its start, cleared the hook's mark).
+    Noted,
+    /// No alarm of this identity is armed or in flight (it ran, or none was): the hook's own mark stands.
+    Idle,
+}
+impl OwedAlarmNote {
+    pub fn word(self) -> &'static str {
+        match self {
+            OwedAlarmNote::Pending => "pending",
+            OwedAlarmNote::Noted => "noted",
+            OwedAlarmNote::Idle => "idle",
+        }
+    }
+    pub fn from_word(word: &str) -> Option<Self> {
+        [
+            OwedAlarmNote::Pending,
+            OwedAlarmNote::Noted,
+            OwedAlarmNote::Idle,
+        ]
+        .into_iter()
+        .find(|n| n.word() == word.trim())
+    }
+}
+/// PURE (pinned): the actor's answer to a shed hook's note, from what it holds: an arm for this identity, and whether
+/// its walk has started (`owed-started`, set durably before the walk).
+pub fn owed_alarm_note(armed_for_identity: bool, started: bool) -> OwedAlarmNote {
+    match (armed_for_identity, started) {
+        (true, false) => OwedAlarmNote::Pending,
+        (true, true) => OwedAlarmNote::Noted,
+        (false, _) => OwedAlarmNote::Idle,
+    }
+}
+/// PURE (pinned): does a shed hook tell the page after its mark? Always, unless the actor answered `Pending` (the
+/// alarm's walk is still to start and pushes its rows). `None` is a note that faulted: the page is told.
+pub fn owed_shed_nudges(answer: Option<OwedAlarmNote>) -> bool {
+    answer != Some(OwedAlarmNote::Pending)
+}
+
 /// PURE (pinned): the per-identity recompute counter of one isolate.
 #[derive(Debug, Default)]
 pub struct RecomputeRate {
@@ -5036,31 +5098,45 @@ impl RecomputeRate {
     /// The FIX-800 delta lens's MEDIUM-A: a claimed walk of `identity_lc` was DROPPED at its hard deadline. Hand the
     /// identity to the deferred alarm walk of the window that walk was charged to (its end, the same reservation a
     /// shed arms: ceiling + 1 walks a window kept), and refuse its request-path walks until that alarm's walk has
-    /// had its whole deadline: `max(end, now) + OWED_DEFERRED_WALK_DEADLINE_MS`. `Some(end)` when this call arms
-    /// the window's alarm; `None` when it is armed already (a shed's, or an earlier drop's: a second drop in the
-    /// window arms nothing new). PURE (pinned).
+    /// had its whole deadline. `arm: Some(end)` when this call arms the window's alarm; `None` when it is armed
+    /// already (a shed's, or an earlier drop's: a second drop in the window arms nothing new). PURE (pinned).
+    ///
+    /// The second delta lens's LOW-C: an alarm this call arms FIRES AT THE DROP (`fire_at`), while its reservation
+    /// stays keyed to the window's end (the actor's `due`: one reserved walk a window, ceiling + 1 kept), so the
+    /// hand-off lasts `now + OWED_DEFERRED_WALK_DEADLINE_MS`, 60 s past the drop, where it waited for the window's
+    /// end first (up to 33 s idle, a landing up to 120 s after the dropped walk started, past identityNone's 90 s
+    /// bar). An alarm armed already keeps its own fire time, which this call does not know: the hand-off then lasts
+    /// `max(end, now) + OWED_DEFERRED_WALK_DEADLINE_MS` (60 to 93 s past the drop), as before; that is the case of a
+    /// window a shed armed at the ceiling before the drop, whose alarm fires at the window's end (stated).
     ///
     /// The rate (per identity per isolate, the D1 overload band of loops 11 and 39 where the walk runs past 27 s):
-    /// the drop at d of a walk admitted at a >= the window's start s (d = a + 27 s) hands the identity off until
-    /// max(s + 60 s, d) + 60 s, which is 60 to 93 s past the drop. So the identity costs ONE request-path walk (27 s)
-    /// per hand-off, then the alarm's one (60 s, at the window's end), whatever the number of open tabs: at most one
-    /// request-path walk per 87 to 120 s (0.5 to 0.7 a minute) where fc64a957's nudge drove one every ~28 s per tab
-    /// (2.2 a minute a tab, never reaching the ceiling of 12, so never the alarm). If the alarm's walk is dropped too
-    /// it tells the page once and re-arms once (#648); the read that follows, past the hand-off, may start one more
-    /// request-path walk, which hands off again. Each isolate keeps its own map, so the bound is per isolate.
-    pub fn hand_to_alarm(&mut self, identity_lc: &str, now_ms: i64) -> Option<i64> {
+    /// the identity costs ONE request-path walk (27 s) per hand-off, then the alarm's one (60 s, from the drop),
+    /// whatever the number of open tabs: at most one request-path walk per 87 s (0.7 a minute) where fc64a957's
+    /// nudge drove one every ~28 s per tab (2.2 a minute a tab, never reaching the ceiling of 12, so never the
+    /// alarm). If the alarm's walk is dropped too it tells the page once and re-arms once (#648); the read that
+    /// follows, past the hand-off, may start one more request-path walk, which hands off again, and that hand-off's
+    /// arm REPLACES the faulted alarm's retry arm (`retry: false`), so under sustained overload #648's "re-arms
+    /// once, then abandoned" never abandons: the bound is this rate, not a count (the second delta lens's NOTE-2).
+    /// Each isolate keeps its own map, so the bound is per isolate (N isolates, N alarms a window: NOTE-1).
+    pub fn hand_to_alarm(&mut self, identity_lc: &str, now_ms: i64) -> OwedHandOff {
         let start = self.windows.get(identity_lc).map_or(now_ms, |(s, _)| *s);
         let end = start.saturating_add(OWED_RECOMPUTE_RATE_WINDOW_MS);
-        let until = end
-            .max(now_ms)
+        let arm = (self.deferred.get(identity_lc) != Some(&end)).then_some(end);
+        let fire_at = arm.map(|_| now_ms);
+        let until = fire_at
+            .unwrap_or_else(|| end.max(now_ms))
             .saturating_add(OWED_DEFERRED_WALK_DEADLINE_MS);
         let h = self.handed.entry(identity_lc.to_string()).or_insert(until);
         *h = (*h).max(until);
-        if self.deferred.get(identity_lc) == Some(&end) {
-            return None;
+        let until = *h;
+        if arm.is_some() {
+            self.deferred.insert(identity_lc.to_string(), end);
         }
-        self.deferred.insert(identity_lc.to_string(), end);
-        Some(end)
+        OwedHandOff {
+            arm,
+            fire_at,
+            until,
+        }
     }
     /// Until when `identity_lc` is handed to its alarm (`hand_to_alarm`), if it still is at `now_ms`.
     pub fn handed_until(&self, identity_lc: &str, now_ms: i64) -> Option<i64> {
@@ -13360,10 +13436,11 @@ pub(crate) mod tests {
             )),
             "a shed in owed_recompute_and_push captures its deferred deadline before any await and returns"
         );
-        // the FIX-800 lens's LOW-2: the claim runs the re-mark and the deferred walk, once its lock is released
+        // the FIX-800 lens's LOW-2: the claim runs the re-mark and the deferred walk, once its lock is released (the
+        // second FIX-800 delta lens's MEDIUM-B: after its note to an alarm armed already, `routes::fix800_k`)
         assert!(
             routes.contains(&squash(
-                "OwedClaimWalk::Shed { deferred } => { owed_refresh_end(identity_lc, token); owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc, deferred).await;"
+                "OwedClaimWalk::Shed { deferred } => { owed_refresh_end(identity_lc, token); let note = match deferred { None => Some(owed_note_alarm(env, identity_lc).await), Some(_) => None, }; owed_shed_remark(db, identity_lc).await; owed_schedule_deferred(env, identity_lc, deferred).await;"
             )),
             "a shed claim releases, then re-marks the identity stale and arms its deferred walk"
         );
