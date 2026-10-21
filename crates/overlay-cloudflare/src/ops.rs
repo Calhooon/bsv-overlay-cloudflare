@@ -275,11 +275,16 @@ pub const COUNTER_SUBMIT_PENDING_EVICTED: &str = "submit_pending_evicted_total";
 /// A fatal look the evidence check did not corroborate (kept; the #214 class).
 pub const COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED: &str =
     "submit_pending_refusal_uncorroborated_total";
-/// Unwitnessed at the end of the watch: silent (unknown / below SEEN), or
-/// still an orphan view (the parents unseen by Arcade).
+/// Unwitnessed at the end of the watch: silent (Arcade's last look unknown or below SEEN) AND the subject's
+/// `network_seen` still UNLATCHED (bsv-low #822: a subject another path latched is
+/// [`COUNTER_SUBMIT_PENDING_LATCHED_ELSEWHERE`], never silent).
 pub const COUNTER_SUBMIT_PENDING_SILENT: &str = "submit_pending_silent_total";
-/// Unwitnessed at the end of the watch: still an orphan view.
+/// Unwitnessed at the end of the watch: still an orphan view, and `network_seen` still UNLATCHED (bsv-low #822).
 pub const COUNTER_SUBMIT_PENDING_ORPHAN: &str = "submit_pending_orphan_total";
+/// bsv-low #822 (loop 42, pair 3): the watch saw no SEEN from Arcade, but the subject's `network_seen` was latched
+/// by another path by the watch's end (the #413 dual push's TAAL or GorillaPool SEEN, a callback, the door's own
+/// witness): Arcade's rank can sit at ACCEPTED_BY_NETWORK for 30 min after the network said SEEN. Never silent.
+pub const COUNTER_SUBMIT_PENDING_LATCHED_ELSEWHERE: &str = "submit_pending_latched_elsewhere_total";
 /// bsv-low loop 18 (2026-09-21, pair 11): an UNGATED write (the operator's historical modes; the lenient
 /// window) refused under an OPEN eviction (nothing written; a MINED proof or the operator's readmit opens it).
 pub const COUNTER_SUBMIT_REFUSED_EVICTED: &str = "submit_refused_evicted_total";
@@ -974,6 +979,27 @@ pub const COUNT_ROW_BACKFILLS: &[&str] = &[
     UNSPENT_KIND_BACKFILL,
 ];
 
+/// bsv-low #822: is `txid`'s `network_seen` latched? One primary-key read (the latch writes `lower(?)`).
+pub const NETWORK_SEEN_LATCHED_SQL: &str =
+    "SELECT 1 AS one FROM network_seen WHERE txid = lower(?1)";
+
+#[derive(serde::Deserialize)]
+struct LatchedRow {
+    #[allow(dead_code)]
+    one: i64,
+}
+
+/// bsv-low #822: [`NETWORK_SEEN_LATCHED_SQL`] for `txid`: `Ok(true)` latched, `Ok(false)` not, `Err` the read
+/// faulted (the caller's to name; never a silent "unlatched").
+pub async fn network_seen_latched(db: &D1Database, txid: &str) -> Result<bool, String> {
+    Query::new(NETWORK_SEEN_LATCHED_SQL)
+        .bind(txid)
+        .fetch_optional::<LatchedRow>(db)
+        .await
+        .map(|row| row.is_some())
+        .map_err(|e| e.to_string())
+}
+
 /// Latch [`NETWORK_SEEN_INSERT_SQL`] for `txid`. Best-effort: the latch only
 /// ACCELERATES verdict publication (the #371 third arm); a lost write leaves
 /// the row behind the merkle bar, which is the pre-#371 behaviour — so a D1
@@ -1479,6 +1505,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED,
         COUNTER_SUBMIT_PENDING_SILENT,
         COUNTER_SUBMIT_PENDING_ORPHAN,
+        COUNTER_SUBMIT_PENDING_LATCHED_ELSEWHERE,
         COUNTER_SUBMIT_PENDING_CONFIRMED_NOW,
         COUNTER_SUBMIT_PENDING_CONFIRM_ASKED,
         // bsv-low loop 18 (2026-09-21): the write-side guard's counters read 0 until they fire.
