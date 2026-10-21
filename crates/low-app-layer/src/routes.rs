@@ -5960,16 +5960,30 @@ async fn owed_stale_nudge(env: &worker::Env, identity_lc: &str, source: &str) {
 /// lens's MEDIUM-3: it ran under a claim's 24 s), never the invocation's 30 s: an alarm has no `wait_until` ceiling
 /// and holds no lock. One dropped at it marks the identity stale, tells the page (MEDIUM-1) and answers a fault (the
 /// alarm's one re-arm, #648).
-pub(crate) async fn owed_deferred_walk_and_push(
+///
+/// The second FIX-800 delta lens's MEDIUM-B: `noted` reads the actor's `owed-dirty` (a hook SHED during this walk's
+/// flight noted it, `owed_note_alarm`). A landed walk that was noted marks the identity stale AGAIN after its write
+/// (stamped at its start, it cleared the hook's mark) and before its push, so the page's re-read walks the evidence.
+pub(crate) async fn owed_deferred_walk_and_push<F, Fut>(
     env: &worker::Env,
     identity_lc: &str,
-) -> worker::Result<()> {
+    noted: F,
+) -> worker::Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let db = env.d1("OVERLAY_DB")?;
     crate::owed::note_recompute_deferred();
     let walk = OwedWalk::deferred();
     worker::console_log!("[owed] deferred walk {} for {identity_lc}", walk.rid);
     match owed_walk_bounded(env, &db, identity_lc, "deferred", None, &walk).await {
-        Some(walked) => owed_walk_told(env, identity_lc, "deferred", &walk.rid, walked).await,
+        Some(walked) => {
+            if walked.is_ok() && noted().await {
+                owed_remark_after_alarm(&db, identity_lc).await;
+            }
+            owed_walk_told(env, identity_lc, "deferred", &walk.rid, walked).await
+        }
         None => {
             owed_mark_stale(
                 &db,
@@ -5984,6 +5998,18 @@ pub(crate) async fn owed_deferred_walk_and_push(
             ))
         }
     }
+}
+
+/// The second FIX-800 delta lens's MEDIUM-B: the shipped stale mark, made by an alarm walk (or the actor's first-read
+/// walk) that a shed hook noted during its flight, after its write.
+pub(crate) async fn owed_remark_after_alarm(db: &worker::D1Database, identity_lc: &str) {
+    owed_mark_stale(
+        db,
+        crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
+        &[JsValue::from_str(identity_lc)],
+        "evidence during the alarm",
+    )
+    .await;
 }
 
 /// bsv-low #499 (lens fold M3): the `d1Budget` key of one detached recompute (the hooks', the claims' and the stale
@@ -6059,9 +6085,9 @@ fn owed_deferred_deadline(identity_lc: &str) -> Option<i64> {
     })
 }
 /// The FIX-800 delta lens's MEDIUM-A: a dropped walk hands its identity to the window's deferred alarm walk
-/// (`owed::RecomputeRate::hand_to_alarm`), captured synchronously as the claim releases: `Some(end)` to arm, `None`
-/// when the window's alarm is armed already.
-fn owed_hand_to_alarm(identity_lc: &str) -> Option<i64> {
+/// (`owed::RecomputeRate::hand_to_alarm`), captured synchronously as the claim releases: `arm: Some(end)` to arm (it
+/// fires at the drop, the second delta lens's LOW-C), `None` when the window's alarm is armed already.
+fn owed_hand_to_alarm(identity_lc: &str) -> crate::owed::OwedHandOff {
     OWED_RATE.with(|r| {
         r.borrow_mut()
             .hand_to_alarm(identity_lc, worker::Date::now().as_millis() as i64)
@@ -6073,17 +6099,32 @@ async fn owed_schedule_deferred(
     identity_lc: &str,
     deadline: Option<i64>,
 ) -> bool {
+    owed_schedule_deferred_at(env, identity_lc, deadline, None).await
+}
+/// The identity's deferred actor on THIS isolate (one per identity/isolate, #648).
+fn owed_deferred_stub(env: &worker::Env, identity_lc: &str) -> worker::Result<worker::Stub> {
+    let ns = env.durable_object("BOARD_VIEW")?;
+    let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity_lc}"));
+    ns.id_from_name(&name)?.get_stub()
+}
+/// `owed_schedule_deferred`, with the alarm's FIRE time apart from its reservation's key (`due`, the window's end):
+/// a dropped walk's alarm fires at the drop (the second FIX-800 delta lens's LOW-C). `None` fires at `due`.
+async fn owed_schedule_deferred_at(
+    env: &worker::Env,
+    identity_lc: &str,
+    deadline: Option<i64>,
+    fire_at: Option<i64>,
+) -> bool {
     // The shed captures the deadline BEFORE any await: a slow re-mark crossing the window must not lose its alarm.
     let Some(end) = deadline else {
         return true;
     };
+    let fire = fire_at.map(|f| format!("&fire={f}")).unwrap_or_default();
     let result = async {
-        let ns = env.durable_object("BOARD_VIEW")?;
-        let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity_lc}"));
-        let stub = ns.id_from_name(&name)?.get_stub()?;
+        let stub = owed_deferred_stub(env, identity_lc)?;
         let response = stub
             .fetch_with_str(&format!(
-                "https://board-view/owed-deferred?identity={identity_lc}&due={end}"
+                "https://board-view/owed-deferred?identity={identity_lc}&due={end}{fire}"
             ))
             .await?;
         if response.status_code() != 200 {
@@ -6099,6 +6140,34 @@ async fn owed_schedule_deferred(
         return false;
     }
     true
+}
+/// The second FIX-800 delta lens's MEDIUM-B: a hook SHED while this isolate's alarm of the identity is armed tells
+/// that actor (`/owed-deferred-note`), which answers whether its walk is still to start (`Pending`), in flight
+/// (`Noted`: the walk marks the identity stale again after its write) or not there (`Idle`). `None` on a fault.
+async fn owed_note_alarm(
+    env: &worker::Env,
+    identity_lc: &str,
+) -> Option<crate::owed::OwedAlarmNote> {
+    let answer = async {
+        let stub = owed_deferred_stub(env, identity_lc)?;
+        let mut response = stub
+            .fetch_with_str(&format!(
+                "https://board-view/owed-deferred-note?identity={identity_lc}"
+            ))
+            .await?;
+        if response.status_code() != 200 {
+            return Err(worker::Error::RustError("owed alarm note refused".into()));
+        }
+        response.text().await
+    }
+    .await;
+    match answer {
+        Ok(word) => crate::owed::OwedAlarmNote::from_word(&word),
+        Err(e) => {
+            console_warn!("[owed] deferred alarm could not be noted: {e}");
+            None
+        }
+    }
 }
 /// The identities at the ceiling on this isolate now, for `/health`.
 pub(crate) fn owed_rate_at_ceiling(now_ms: i64) -> usize {
@@ -6259,6 +6328,7 @@ pub(crate) async fn owed_recompute_claimed(
             return;
         }
         let admitted = std::mem::take(&mut first_admitted);
+        let walk_began_ms = worker::Date::now().as_millis() as i64;
         let ran = owed_recompute_and_push(
             env,
             db,
@@ -6276,9 +6346,26 @@ pub(crate) async fn owed_recompute_claimed(
                 // deadline was captured before any await); a folded ask is served by that walk or the next read (it
                 // stays in the map for the next claim)
                 owed_refresh_end(identity_lc, token);
+                // the second FIX-800 delta lens's MEDIUM-B: a hook shed while the window's alarm is armed already (a
+                // hand-off's, or a shed's at the ceiling) brings evidence the alarm's walk may have read past: its
+                // write, stamped at its START, clears this mark. So the hook NOTES the actor first, then marks: an
+                // alarm in flight marks the identity stale again after its write and before its push (durable, in
+                // D1, for every isolate's read); and the page is told after this mark unless the alarm is still to
+                // start (it reads the evidence and pushes). The shape: not the lens's durable `staleAtMs` (a
+                // migration and every mark's bind; this lane changes no statement and no migration), not its
+                // minimum (`OWED_RERUN` on this isolate alone: another isolate's read found `stale = 0`); this one
+                // closes the hand-off's band and the base's ceiling case for every reader, with the shipped mark.
+                // Left, as LOW-B: a walk of ANOTHER isolate in flight across this mark.
+                let note = match deferred {
+                    None => Some(owed_note_alarm(env, identity_lc).await),
+                    Some(_) => None,
+                };
                 owed_shed_remark(db, identity_lc).await;
                 owed_schedule_deferred(env, identity_lc, deferred).await;
                 owed_tell_all(env, identity_lc, told).await;
+                if note.is_some_and(crate::owed::owed_shed_nudges) {
+                    owed_stale_nudge(env, identity_lc, &src).await;
+                }
                 return;
             }
             OwedClaimWalk::NoSlice => (crate::owed::OwedWalkEnd::NoSlice, String::new(), None),
@@ -6313,8 +6400,10 @@ pub(crate) async fn owed_recompute_claimed(
                 // not nudge the page into another walk dropped the same way
                 let mut nudge = nudge;
                 if to_alarm {
-                    let deferred = owed_hand_to_alarm(identity_lc);
-                    if !owed_schedule_deferred(env, identity_lc, deferred).await {
+                    let hand = owed_hand_to_alarm(identity_lc);
+                    // the second delta lens's NOTE-3: the hand-off named, so a tail reads it beside the drop's line
+                    owed_log_hand_off(&src, &rid, identity_lc, walk_began_ms, &hand);
+                    if !owed_schedule_deferred_at(env, identity_lc, hand.arm, hand.fire_at).await {
                         // no alarm: the page is told after the mark, as a walk never started is
                         nudge = true;
                     }
@@ -6367,6 +6456,45 @@ pub(crate) async fn owed_recompute_claimed(
             }
         }
     }
+}
+
+/// The second FIX-800 delta lens's NOTE-3: ONE line at a dropped walk's hand-off, the identity, the drop's age (from
+/// the walk's start), the alarm's fire time and the hand-off's end (the alarm walk's deadline), so loop 43's tail
+/// (identityNone, owedDoorStrand) reads the arm directly between the drop's line and `[owed] deferred walk`.
+fn owed_log_hand_off(
+    src: &str,
+    rid: &str,
+    identity_lc: &str,
+    walk_began_ms: i64,
+    hand: &crate::owed::OwedHandOff,
+) {
+    let now = worker::Date::now().as_millis() as i64;
+    worker::console_log!(
+        "{}",
+        owed_hand_off_line(src, rid, identity_lc, now, walk_began_ms, hand)
+    );
+}
+/// PURE (pinned): the hand-off's line.
+fn owed_hand_off_line(
+    src: &str,
+    rid: &str,
+    identity_lc: &str,
+    now_ms: i64,
+    walk_began_ms: i64,
+    hand: &crate::owed::OwedHandOff,
+) -> String {
+    let fires = match (hand.arm, hand.fire_at) {
+        (Some(due), Some(fire)) => {
+            format!("armed: fires at {fire}, reserved for the window ending {due}")
+        }
+        _ => "already armed: the window's alarm fires at its own time".to_string(),
+    };
+    format!(
+        "[owed] recompute ({src}) {rid} for {identity_lc} handed to its deferred walk until {} ({fires}); the walk dropped {} ms after it started; the alarm walk's deadline {}",
+        hand.until,
+        now_ms.saturating_sub(walk_began_ms),
+        hand.until
+    )
 }
 
 /// The walks a claim ran, told once its lock is released (the FIX-800 lens's LOW-2). The FIX-800 delta lens's LOW-A:
@@ -11176,7 +11304,9 @@ mod tests {
             "fn deferred() -> Self { let now = worker::Date::now().as_millis() as i64; Self::new(now, crate::owed::owed_deferred_walk_slice(now)) }"
         )));
         let d = r
-            .find(&squash("pub(crate) async fn owed_deferred_walk_and_push("))
+            .find(&squash(
+                "pub(crate) async fn owed_deferred_walk_and_push<F, Fut>(",
+            ))
             .expect("the alarm's walk");
         let body = &r[d..d + r[d..]
             .find(&squash("pub(crate) const OWED_RECOMPUTE_LEDGER_KEY"))
@@ -11252,7 +11382,9 @@ mod tests {
             "release, mark, then the push"
         );
         let d = r
-            .find(&squash("pub(crate) async fn owed_deferred_walk_and_push("))
+            .find(&squash(
+                "pub(crate) async fn owed_deferred_walk_and_push<F, Fut>(",
+            ))
             .expect("the alarm's walk");
         let alarm = &r[d..];
         let am = alarm.find("\"walkdeadline\",").expect("the alarm's mark");
@@ -11376,21 +11508,21 @@ mod tests {
         assert!(rate.admit(id, s, true));
         let drop_at = s + OWED_WALK_HARD_DEADLINE_MS;
         let end = s + OWED_RECOMPUTE_RATE_WINDOW_MS;
+        let hand = rate.hand_to_alarm(id, drop_at);
         assert_eq!(
-            rate.hand_to_alarm(id, drop_at),
+            hand.arm,
             Some(end),
-            "the first drop arms the window's one reserved walk, at its end"
+            "the first drop arms the window's one reserved walk, keyed to its end"
         );
-        let until = end + OWED_DEFERRED_WALK_DEADLINE_MS;
+        // the second delta lens's LOW-C: it fires at the drop, so the hand-off is the alarm's 60 s from there
+        assert_eq!(hand.fire_at, Some(drop_at));
+        let until = drop_at + OWED_DEFERRED_WALK_DEADLINE_MS;
+        assert_eq!(hand.until, until);
         assert_eq!(rate.handed_until(id, drop_at), Some(until));
         // the page's re-read (any event) is shed past the alarm's expected landing, never a new walk
         assert_eq!(
             rate.retry_after_ms(id, drop_at + 1),
             Some(until - drop_at - 1)
-        );
-        assert!(
-            rate.retry_after_ms(id, drop_at + 1).unwrap()
-                > end + OWED_DEFERRED_WALK_DEADLINE_MS - drop_at - 2
         );
         for t in [drop_at + 1, end - 1, end, end + 1, until - 1] {
             assert!(
@@ -11398,12 +11530,16 @@ mod tests {
                 "t = {t}: handed to the alarm, no request-path walk"
             );
         }
-        // a second drop in the window (a walk in flight before the first's hand-off) arms nothing new
+        // a second drop in the window (a walk in flight before the first's hand-off) arms nothing new; not knowing the
+        // armed alarm's fire time, its hand-off lasts to the window's end plus the alarm's deadline
+        let second = rate.hand_to_alarm(id, drop_at + 2_000);
         assert_eq!(
-            rate.hand_to_alarm(id, drop_at + 2_000),
-            None,
+            (second.arm, second.fire_at),
+            (None, None),
             "a second drop arms nothing new"
         );
+        let until = end + OWED_DEFERRED_WALK_DEADLINE_MS;
+        assert_eq!(second.until, until);
         assert_eq!(rate.handed_until(id, drop_at + 2_000), Some(until));
         // a shed of the same window finds its alarm armed: nothing new either
         assert_eq!(rate.arm_deferred(id, drop_at + 3_000), None);
@@ -11412,7 +11548,8 @@ mod tests {
         assert!(rate.admit(id, until, true));
         let end2 = until + OWED_RECOMPUTE_RATE_WINDOW_MS;
         assert_eq!(
-            rate.hand_to_alarm(id, until + OWED_WALK_HARD_DEADLINE_MS),
+            rate.hand_to_alarm(id, until + OWED_WALK_HARD_DEADLINE_MS)
+                .arm,
             Some(end2)
         );
         // an arm that failed lifts the hand-off (no alarm: the request path walks, the claim nudges)
@@ -11422,15 +11559,14 @@ mod tests {
             None
         );
         assert!(rate.admit(id, until + OWED_WALK_HARD_DEADLINE_MS + 1, true));
-        // the stated rate: per hand-off one request-path walk (27 s), then 60 to 93 s handed off
+        // the stated rate: per hand-off one request-path walk (27 s), then 60 s handed off from the drop
         for admitted_at in [s, s + 33_000] {
             let mut r = RecomputeRate::default();
             assert!(r.admit(id, s, true));
             assert!(r.admit(id, admitted_at, true));
             let d = admitted_at + OWED_WALK_HARD_DEADLINE_MS;
-            r.hand_to_alarm(id, d);
-            let off = r.handed_until(id, d).unwrap() - d;
-            assert!((60_000..=93_000).contains(&off), "{off}");
+            let off = r.hand_to_alarm(id, d).until - d;
+            assert_eq!(off, OWED_DEFERRED_WALK_DEADLINE_MS, "{off}");
         }
         // the wiring: release, the hand-off captured and armed, then the mark; the nudge only when the arm failed
         let squash = |x: &str| x.split_whitespace().collect::<String>();
@@ -11452,7 +11588,7 @@ mod tests {
                 .unwrap()];
         let release = arm.find("owed_refresh_end(identity_lc,token);").unwrap();
         let hand = arm
-            .find(&squash("if to_alarm { let deferred = owed_hand_to_alarm(identity_lc); if !owed_schedule_deferred(env, identity_lc, deferred).await { nudge = true; } }"))
+            .find(&squash("if to_alarm { let hand = owed_hand_to_alarm(identity_lc); owed_log_hand_off(&src, &rid, identity_lc, walk_began_ms, &hand); if !owed_schedule_deferred_at(env, identity_lc, hand.arm, hand.fire_at).await { nudge = true; } }"))
             .expect("a drop arms the alarm; only a failed arm nudges");
         let mark = arm.find("owed_mark_stale(").unwrap();
         assert!(
@@ -11461,13 +11597,15 @@ mod tests {
         );
         // the alarm's landed walk pushes the rows; its drop marks and nudges once
         let d = r
-            .find(&squash("pub(crate) async fn owed_deferred_walk_and_push("))
+            .find(&squash(
+                "pub(crate) async fn owed_deferred_walk_and_push<F, Fut>(",
+            ))
             .unwrap();
         let alarm = &r[d..d + r[d..]
             .find(&squash("pub(crate) const OWED_RECOMPUTE_LEDGER_KEY"))
             .unwrap()];
         assert!(alarm.contains(&squash(
-            "Some(walked) => owed_walk_told(env, identity_lc, \"deferred\", &walk.rid, walked).await,"
+            "Some(walked) => { if walked.is_ok() && noted().await { owed_remark_after_alarm(&db, identity_lc).await; } owed_walk_told(env, identity_lc, \"deferred\", &walk.rid, walked).await }"
         )));
         assert_eq!(alarm.matches("owed_stale_nudge(").count(), 1);
         assert!(squash(include_str!("owed.rs")).contains(&squash(
@@ -11522,10 +11660,340 @@ mod tests {
             ["a", "b"]
         );
         assert!(super::owed_told_last::<bool>(vec![]).is_empty());
+        // the second delta lens's LOW-D: the wiring is read from the code ALONE (it matched its own literal here)
         let squash = |x: &str| x.split_whitespace().collect::<String>();
-        assert!(squash(include_str!("routes.rs")).contains(&squash(
-            "for (src, rid, w) in owed_told_last(told) { let _ = owed_walk_told(env, identity_lc, &src, &rid, w).await; }"
+        let r = squash(&fix800_code());
+        let tell = r
+            .find(&squash("async fn owed_tell_all("))
+            .expect("owed_tell_all");
+        let tell = &r[tell..tell + r[tell..].find(&squash("fn owed_told_last<T>(")).unwrap()];
+        assert!(
+            tell.contains(&squash(
+                "for (src, rid, w) in owed_told_last(told) { let _ = owed_walk_told(env, identity_lc, &src, &rid, w).await; }"
+            )),
+            "owed_tell_all tells owed_told_last's walks: {tell}"
+        );
+    }
+
+    /// The code of `routes.rs` before its tests module, comment lines out (the source pins read it, never a test's
+    /// own literal: the second FIX-800 delta lens's LOW-D).
+    fn fix800_code() -> String {
+        let src = include_str!("routes.rs");
+        src[..src.find("\nmod tests {").expect("the tests module")]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // ── the second FIX-800 delta lens fold (bsv-low #800): a hook shed during the alarm, the fire time, the line ──
+
+    /// The second FIX-800 delta lens's MEDIUM-B: a hook SHED while the window's alarm walks (the hand-off sheds every
+    /// hook of the identity on this isolate for the alarm's whole flight) must not be erased by that walk's write,
+    /// stamped at its start (`OWED_STATE_UPSERT_SQL` sets `stale = 0` at a stamp at least the stored one). The rule:
+    /// the hook notes the actor BEFORE its mark, an alarm walk in flight that was noted marks the identity stale
+    /// again after its write and before its push, and the hook tells the page after its mark unless the alarm is
+    /// still to start. Pinned over EVERY interleaving of the hook's three steps with the alarm's five, on the
+    /// SHIPPED statements under real SQLite: the page's last event always finds the identity stale (its read walks
+    /// the evidence). On 18d624dd the hook marked and folded nothing, and the alarm's write cleared the mark (the
+    /// API does not exist there). To red, the API kept, a rule reverted alone: the alarm ignoring the note, the hook
+    /// not nudging on `Noted`, the note after the mark, or the Shed arm not noting.
+    #[test]
+    fn fix800_k_a_hook_shed_during_the_alarms_flight_is_never_erased_by_its_write() {
+        use crate::owed::{owed_alarm_note, owed_shed_nudges, OwedAlarmNote};
+        // the actor's answer and the hook's nudge
+        assert_eq!(owed_alarm_note(true, false), OwedAlarmNote::Pending);
+        assert_eq!(owed_alarm_note(true, true), OwedAlarmNote::Noted);
+        assert_eq!(owed_alarm_note(false, true), OwedAlarmNote::Idle);
+        assert_eq!(owed_alarm_note(false, false), OwedAlarmNote::Idle);
+        for n in [
+            OwedAlarmNote::Pending,
+            OwedAlarmNote::Noted,
+            OwedAlarmNote::Idle,
+        ] {
+            assert_eq!(OwedAlarmNote::from_word(n.word()), Some(n));
+        }
+        assert_eq!(OwedAlarmNote::from_word("armed"), None);
+        assert!(!owed_shed_nudges(Some(OwedAlarmNote::Pending)));
+        assert!(owed_shed_nudges(Some(OwedAlarmNote::Noted)));
+        assert!(owed_shed_nudges(Some(OwedAlarmNote::Idle)));
+        assert!(owed_shed_nudges(None), "a note that faulted tells the page");
+
+        // the model: the old snapshot at 100; the alarm's walk started at 200 (owed-started set before it), the
+        // hook's evidence landed after; the shipped statements decide `stale`
+        let id = "02cc0000000000000000000000000000000000000000000000000000000fix800k";
+        #[derive(Clone, Copy, Debug)]
+        enum Step {
+            Note,
+            Mark,
+            Nudge,
+            Write,
+            ReadDirty,
+            Remark,
+            Push,
+            Clear,
+        }
+        let hook = [Step::Note, Step::Mark, Step::Nudge];
+        let alarm = [
+            Step::Write,
+            Step::ReadDirty,
+            Step::Remark,
+            Step::Push,
+            Step::Clear,
+        ];
+        let stale_of = |c: &rusqlite::Connection| -> i64 {
+            c.query_row(
+                "SELECT stale FROM owed_state WHERE identity = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let upsert = |c: &rusqlite::Connection, at: i64| {
+            c.execute(
+                crate::owed::OWED_STATE_UPSERT_SQL,
+                rusqlite::params![id, at, 1i64, 0i64, 0i64],
+            )
+            .unwrap();
+        };
+        let mark = |c: &rusqlite::Connection| {
+            c.execute(crate::owed::OWED_STALE_FOR_IDENTITY_SQL, [id])
+                .unwrap();
+        };
+        let total = hook.len() + alarm.len();
+        let mut runs = 0;
+        for mask in 0u32..(1 << total) {
+            if mask.count_ones() as usize != hook.len() {
+                continue;
+            }
+            let c = rusqlite::Connection::open_in_memory().unwrap();
+            c.execute(crate::owed::OWED_STATE_CREATE, []).unwrap();
+            c.execute(crate::owed::OWED_STATE_SEQ_ALTER, []).unwrap();
+            upsert(&c, 100);
+            let (mut hi, mut ai) = (0, 0);
+            let (mut cleared, mut dirty, mut seen_dirty) = (false, false, false);
+            let mut answer = None;
+            let mut events: Vec<(Step, i64)> = Vec::new();
+            let mut order = Vec::new();
+            for i in 0..total {
+                let step = if mask & (1 << i) != 0 {
+                    hi += 1;
+                    hook[hi - 1]
+                } else {
+                    ai += 1;
+                    alarm[ai - 1]
+                };
+                order.push(step);
+                match step {
+                    Step::Note => {
+                        let a = owed_alarm_note(!cleared, true);
+                        if a == OwedAlarmNote::Noted {
+                            dirty = true;
+                        }
+                        answer = Some(a);
+                    }
+                    Step::Mark => mark(&c),
+                    Step::Nudge => {
+                        if owed_shed_nudges(answer) {
+                            events.push((step, stale_of(&c)));
+                        }
+                    }
+                    Step::Write => upsert(&c, 200),
+                    Step::ReadDirty => seen_dirty = dirty,
+                    Step::Remark => {
+                        if seen_dirty {
+                            mark(&c)
+                        }
+                    }
+                    Step::Push => events.push((step, stale_of(&c))),
+                    Step::Clear => cleared = true,
+                }
+            }
+            let last = events.last().expect("the page is told");
+            assert_eq!(
+                last.1, 1,
+                "{order:?}: the page's last event ({:?}) must find the identity stale, events {events:?}",
+                last.0
+            );
+            runs += 1;
+        }
+        assert_eq!(runs, 56, "every interleaving of 3 hook steps among 8");
+        // the shipped statements alone: a mark, then a write stamped before it, clears it (the erasure)
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute(crate::owed::OWED_STATE_CREATE, []).unwrap();
+        c.execute(crate::owed::OWED_STATE_SEQ_ALTER, []).unwrap();
+        upsert(&c, 100);
+        mark(&c);
+        upsert(&c, 200);
+        assert_eq!(stale_of(&c), 0, "the erasure the fold answers");
+
+        // the wiring: the Shed arm notes BEFORE its mark when the window's alarm is armed already, nudges after it
+        let squash = |x: &str| x.split_whitespace().collect::<String>();
+        let r = squash(&fix800_code());
+        let shed = r
+            .find(&squash("OwedClaimWalk::Shed { deferred } => {"))
+            .expect("the shed arm");
+        let shed = &r[shed..shed
+            + r[shed..]
+                .find(&squash("OwedClaimWalk::NoSlice =>"))
+                .unwrap()];
+        let note = shed
+            .find(&squash(
+                "let note = match deferred { None => Some(owed_note_alarm(env, identity_lc).await), Some(_) => None, };",
+            ))
+            .expect("the shed notes the armed alarm");
+        let remark = shed
+            .find(&squash("owed_shed_remark(db, identity_lc).await;"))
+            .expect("the shed's mark");
+        let nudge = shed
+            .find(&squash(
+                "if note.is_some_and(crate::owed::owed_shed_nudges) { owed_stale_nudge(env, identity_lc, &src).await; }",
+            ))
+            .expect("the shed's nudge");
+        assert!(note < remark && remark < nudge, "note, mark, then nudge");
+        // the alarm's walk re-marks after its write, before its push
+        let d = r
+            .find(&squash(
+                "pub(crate) async fn owed_deferred_walk_and_push<F, Fut>(",
+            ))
+            .unwrap();
+        let walk = &r[d..d + r[d..]
+            .find(&squash("pub(crate) async fn owed_remark_after_alarm("))
+            .unwrap()];
+        let again = walk
+            .find(&squash("if walked.is_ok() && noted().await { owed_remark_after_alarm(&db, identity_lc).await; }"))
+            .expect("the noted walk marks again");
+        assert!(again < walk.find("owed_walk_told(").unwrap());
+        assert!(r.contains(&squash(
+            "crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(identity_lc)], \"evidence during the alarm\","
         )));
+        // the actor: a walk in flight keeps the note; the alarm and the first read read it
+        let b = squash(include_str!("board_view.rs"));
+        assert!(b.contains(&squash(
+            "if note == crate::owed::OwedAlarmNote::Noted { storage.put(\"owed-dirty\", true).await?; }"
+        )));
+        assert!(b.contains(&squash(
+            "held.as_deref() == Some(identity.as_str()) && due.is_some(), started,"
+        )));
+        assert!(b.contains(&squash(
+            "crate::routes::owed_deferred_walk_and_push(&self.env, &identity, || async { self.state .storage() .get::<bool>(\"owed-dirty\")"
+        )));
+        assert!(b.contains(&squash(
+            "if storage.get::<bool>(\"owed-dirty\").await?.unwrap_or(false) { crate::routes::owed_remark_after_alarm(&db, &identity).await; }"
+        )));
+    }
+
+    /// The second FIX-800 delta lens's LOW-C, LOW-D (D7) and NOTE-3. LOW-C: a dropped walk's alarm FIRES AT THE DROP
+    /// while its reservation stays keyed to the window's end (ceiling + 1 kept), so the identity lands at most 87 s
+    /// after the dropped walk started (27 + 60), under identityNone's 90 s, where 18d624dd waited for the window's end
+    /// (up to 120 s). D7: a walk dropped PAST its window's end is handed off 60 s from the drop, armed or not (the
+    /// `max(now)` floor). NOTE-3: one line names the hand-off. To red: the fire time dropped (fired at `due`), the
+    /// floor dropped (`end + 60 s`), or the line not logged in the Release arm.
+    #[test]
+    fn fix800_l_the_alarm_fires_at_the_drop_and_the_hand_off_is_named() {
+        use crate::owed::{
+            RecomputeRate, OWED_DEFERRED_WALK_DEADLINE_MS, OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW,
+            OWED_RECOMPUTE_RATE_WINDOW_MS,
+        };
+        let id = "02dd0000000000000000000000000000000000000000000000000000000fix800l";
+        let s = 9_000_000i64;
+        let end = s + OWED_RECOMPUTE_RATE_WINDOW_MS;
+        // LOW-C: a walk admitted anywhere in the window lands by its start + 87 s
+        for admitted_at in [s, s + 10_000, s + 33_000, s + 59_000] {
+            let mut r = RecomputeRate::default();
+            assert!(r.admit(id, s, true));
+            assert!(r.admit(id, admitted_at, true));
+            let d = admitted_at + OWED_WALK_HARD_DEADLINE_MS;
+            let h = r.hand_to_alarm(id, d);
+            assert_eq!(h.arm, Some(end), "the reservation stays the window's");
+            assert_eq!(h.fire_at, Some(d), "the alarm fires at the drop");
+            assert_eq!(h.until, d + OWED_DEFERRED_WALK_DEADLINE_MS);
+            assert!(h.until - admitted_at <= 90_000, "{}", h.until - admitted_at);
+            assert_eq!(
+                r.retry_after_ms(id, d),
+                Some(OWED_DEFERRED_WALK_DEADLINE_MS)
+            );
+        }
+        // D7, already armed (a shed at the ceiling armed the window's end; its 12th walk, admitted at s + 59 s, drops
+        // past the end): the hand-off is 60 s from the drop, never the window's end + 60 s
+        let mut r = RecomputeRate::default();
+        for k in 0..OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW {
+            let at = if k + 1 == OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW {
+                s + 59_000
+            } else {
+                s + i64::from(k)
+            };
+            assert!(r.admit(id, at, true));
+        }
+        assert!(!r.admit(id, s + 59_500, true));
+        assert_eq!(r.arm_deferred(id, s + 59_500), Some(end));
+        let d = s + 59_000 + OWED_WALK_HARD_DEADLINE_MS;
+        let h = r.hand_to_alarm(id, d);
+        assert_eq!((h.arm, h.fire_at), (None, None));
+        assert_eq!(
+            h.until,
+            d + OWED_DEFERRED_WALK_DEADLINE_MS,
+            "60 s past a drop past the end"
+        );
+        // the actor and the arm carry the fire time apart from `due`
+        let b = include_str!("board_view.rs");
+        let sq = |x: &str| x.split_whitespace().collect::<String>();
+        let b = sq(b);
+        assert!(b.contains(&sq(
+            ".find(|(k, _)| k == \"fire\") .and_then(|(_, v)| v.parse::<i64>().ok()) .map_or(due, |f| f.min(due));"
+        )));
+        assert!(b.contains(&sq(
+            "retry: false, fire, }) .await?; storage .set_alarm((fire - Date::now().as_millis() as i64).max(0))"
+        )));
+        assert!(b.contains(&sq("Some(due) => fire.map_or(due, |f| f.min(due)),")));
+        let r = sq(&fix800_code());
+        assert!(r.contains(&sq(
+            "\"https://board-view/owed-deferred?identity={identity_lc}&due={end}{fire}\""
+        )));
+        // NOTE-3: the line, and its place in the Release arm (before the arm, after the hand-off)
+        let line = super::owed_hand_off_line(
+            "hop-changed",
+            "r00ab",
+            id,
+            9_100_000,
+            9_073_000,
+            &crate::owed::OwedHandOff {
+                arm: Some(9_120_000),
+                fire_at: Some(9_100_000),
+                until: 9_160_000,
+            },
+        );
+        assert_eq!(
+            line,
+            format!("[owed] recompute (hop-changed) r00ab for {id} handed to its deferred walk until 9160000 (armed: fires at 9100000, reserved for the window ending 9120000); the walk dropped 27000 ms after it started; the alarm walk's deadline 9160000")
+        );
+        let armed = super::owed_hand_off_line(
+            "deferred",
+            "r1",
+            id,
+            5,
+            0,
+            &crate::owed::OwedHandOff {
+                arm: None,
+                fire_at: None,
+                until: 9,
+            },
+        );
+        assert!(armed.contains("(already armed: the window's alarm fires at its own time)"));
+        let hand = r
+            .find(&sq("let hand = owed_hand_to_alarm(identity_lc);"))
+            .unwrap();
+        let log = r
+            .find(&sq(
+                "owed_log_hand_off(&src, &rid, identity_lc, walk_began_ms, &hand);",
+            ))
+            .unwrap();
+        let arm = r
+            .find(&sq(
+                "owed_schedule_deferred_at(env, identity_lc, hand.arm, hand.fire_at)",
+            ))
+            .unwrap();
+        assert!(hand < log && log < arm);
     }
 
     // ── /live-view asks the tower BY OUTPOINT (2026-08-12) ────────────────
