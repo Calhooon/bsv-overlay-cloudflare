@@ -72,7 +72,10 @@ fn main() {
         game_id.to_vec(),
         1000u64.to_le_bytes().to_vec(), // stake: 1000 sats
         [0xAAu8; 32].to_vec(),          // rules hash
-        b"https://low-relay.dev-a3e.workers.dev".to_vec(),
+        // the relay URL the table names: `LOW_LIVE_PROOF_RELAY_URL`, never a deployment's real host in this tree
+        std::env::var("LOW_LIVE_PROOF_RELAY_URL")
+            .unwrap_or_else(|_| "https://relay.example.invalid".to_string())
+            .into_bytes(),
         950_000u32.to_le_bytes().to_vec(), // expiry height
     ];
     let table_output = make_signed_low_output(&signer, table_fields);

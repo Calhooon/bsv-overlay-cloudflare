@@ -636,7 +636,7 @@ fn agent_multiple_capabilities() {
         // and a different capabilities set; reusing that endpoint would cause the
         // lookup service to silently skip the new record as a duplicate.
         // URI validation requires path == "/", so we vary the hostname instead.
-        let endpoint = "https://multi-cap-test.dev-a3e.workers.dev";
+        let endpoint = "https://multi-cap-test.example.invalid";
         let capabilities = &["tool-use", "wallet", "messaging"];
 
         println!("Step 1: Creating and submitting multi-capability AGENT...");
@@ -698,7 +698,7 @@ fn agent_verify_pushdrop_roundtrip() {
         // (identity_key + endpoint) does not skip this registration as a duplicate
         // of a prior test's record. URI validation requires path == "/", so we
         // vary the hostname instead.
-        let endpoint = "https://roundtrip-test.dev-a3e.workers.dev";
+        let endpoint = "https://roundtrip-test.example.invalid";
         let capabilities = &["roundtrip-test"];
 
         // Submit an agent

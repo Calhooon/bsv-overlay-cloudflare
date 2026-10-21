@@ -46,6 +46,9 @@ command = "cargo install -q --version ^0.8 worker-build && worker-build --releas
 # auth client vs an unconfigured worker 503s), THEN ship + soak
 # (`anonymousByRoute` ≈ 0 for every identity route), THEN flip. Rollback is
 # flipping it back; no code change. Full closure criteria: `src/auth.rs` docs.
+# Hostnames are `__HOST_<NAME>__` placeholders (bsv-low RENDER-HOSTNAMES, record 926): a bare hostname each, injected
+# BY NAME at deploy by bsv-low's scripts/runner/patterns/render-wrangler.sh beside the `__LOW_..._ID__` ids; a name it
+# does not know refuses the render, so a literal `__HOST_` never reaches a deployed [vars].
 [vars]
 AUTH_ENFORCE = "true"  # the promotion 2026-09-21: the identity reads enforced (C6), as proven on beta
 # bsv-low #441: the session lane (one BRC-103 handshake per origin, then a MAC'd lane
@@ -58,17 +61,17 @@ SESSION_LANE = "true"
 # The relay this worker pushes events to (its /broadcast rooms + /push boxes),
 # reached through the RELAY service binding; the URL names the path/host the
 # relay sees. Pushes no-op without the BROADCAST_TOKEN secret.
-RELAY_URL = "https://low-relay.dev-a3e.workers.dev"
+RELAY_URL = "https://__HOST_RELAY__"
 # bsv-low loop 6: the path the OVERLAY binding sees for the block-event pass. Not a secret.
-OVERLAY_URL = "https://low-overlay.dev-a3e.workers.dev"
+OVERLAY_URL = "https://__HOST_OVERLAY__"
 # bsv-low #451 slice B: the Arcade endpoint `/tx-any` asks FIRST for a tx the index holds without a verified bump
 # (our broadcaster's live word is the network witness; the couriers only when it does not know). Not a secret.
 ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
 # bsv-low #532: the URL the IDENTITY binding (LOW's identity resolver) is asked for the identity views (any host:
 # over the binding only the path counts; the prod resolver has no workers.dev host), and the app origins those
 # views answer CORS to (comma separated, exact; unset = none; never localhost here, pinned). Not secrets.
-IDENTITY_URL = "https://low-identity-resolver.dev-a3e.workers.dev"
-IDENTITY_APP_ORIGINS = "https://bsvarcade.com,https://www.bsvarcade.com,https://low-pot.pages.dev"
+IDENTITY_URL = "https://__HOST_IDENTITY_RESOLVER__"
+IDENTITY_APP_ORIGINS = "https://bsvarcade.com,https://www.bsvarcade.com,https://__HOST_PAGES_PROD__"
 
 # Storage epoch (bsv-low THE ORDER item 2, owner-ruled 2026-08-06): served
 # verbatim by `GET /epoch` as {"storageEpoch": "<value>"}. BUMPING THIS VALUE
@@ -242,13 +245,13 @@ head_sampling_rate = 1
 name = "low-app-layer-beta"
 
 [env.beta.vars]
-RELAY_URL = "https://low-relay-beta.dev-a3e.workers.dev"
-OVERLAY_URL = "https://low-overlay-beta.dev-a3e.workers.dev"
+RELAY_URL = "https://__HOST_RELAY_BETA__"
+OVERLAY_URL = "https://__HOST_OVERLAY_BETA__"
 ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
 # bsv-low #532 (see the prod vars): beta's resolver, and beta's app origins (the beta site, the fleet's harness
 # deployment, a local dev server: localhost is on this beta list only, never prod's, pinned in identity_tests.rs).
-IDENTITY_URL = "https://low-identity-resolver-beta.dev-a3e.workers.dev"
-IDENTITY_APP_ORIGINS = "https://low-beta.pages.dev,https://low-harness.pages.dev,http://localhost:5173"
+IDENTITY_URL = "https://__HOST_IDENTITY_RESOLVER_BETA__"
+IDENTITY_APP_ORIGINS = "https://__HOST_PAGES_BETA__,https://__HOST_PAGES_HARNESS__,http://localhost:5173"
 # bsv-low #441 C6 (2026-09-14): STRICT on beta — the client's identity reads are
 # handshake-first (a cold read waits for its warmup, bounded) so an honest read is
 # never anonymous; prod stays lenient until the promotion.

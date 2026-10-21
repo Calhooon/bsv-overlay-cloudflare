@@ -143,7 +143,7 @@
 //! unset = none), with `Vary: Origin`, and expose every header a browser must
 //! read: the BRC-104 reply headers, the session lane's seal and offer,
 //! `Retry-After` and `ETag`. The match is exact, so a Pages preview host
-//! (`<sha>.low-pot.pages.dev`) reads no names (fail-safe). `localhost` is on
+//! (`<sha>.<project>.pages.dev`) reads no names (fail-safe). `localhost` is on
 //! the beta list only, never prod's (pinned against `wrangler.toml`); since bsv-low #597 a dev-server origin
 //! (`http://localhost:<port>`, `http://127.0.0.1:<port>`) is admitted in code in
 //! both envs, the identity views only. The kill
