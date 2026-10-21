@@ -732,8 +732,12 @@ pub const HOP_CHAIN_PROBES_TIP_ALTER: &str =
 /// PURE (bsv-low #808): THE MEMO'S TIP RULE. An UNSPENT memo PREDATES `walk_tip` when it was taken at a lower tip, or
 /// at no recorded tip: a block has arrived since the chain said "unspent", and that block may hold the competitor
 /// (loop 41's pair 13: a 278 s old unspent memo of a hop whose competitor mined at the walk's tip offered a dead
-/// sweep). Such a memo answers for nothing in the owed walk: it is asked again within the budget, and past the budget
-/// its word withholds the sweep (`HopChainWord::predates_tip`). A SPENT memo is never stale by tip (it only withholds,
+/// sweep). Such a memo answers for nothing in the owed walk: it is asked again within the budget, bypassing the
+/// isolate's 15 s `/spent-any` cache ([`reask_cache_max_age_ms`]), and past the budget its word
+/// (`HopChainWord::predates_tip`) withholds the sweep of an index-UNKNOWN hop and is served as silence on an
+/// index-UNSPENT one (`chainProbe: "index-unspent"` with `tipMoved` stated: #669b's narrowing; an out-of-date
+/// "unspent" is more evidence than none, and withholding it would hold an honest Collect on the walk's own budget,
+/// the FIX-808 lens's MEDIUM-1). A SPENT memo is never stale by tip (it only withholds,
 /// and its confirmed word has its own windows); a memo taken ABOVE the walk's tip (another isolate's fresher tip
 /// cache) is newer than this walk's view and stands. With no walk tip there is nothing to compare: the age rule alone
 /// (the served body then degrades every sweep on its NULL snapshot tip, `owed::degrade_stale_sweeps`).
@@ -744,8 +748,38 @@ pub const HOP_CHAIN_PROBES_TIP_ALTER: &str =
 /// stamped one below and asked once more (harmless); and a memo taken before a block, read inside the 30 s before the
 /// cache shows that block, still answers at the old tip (#669's own residual, the same window; the courier's lag
 /// behind its block is outside it too). Past those 30 s the next walk reads the new tip and the memo predates it.
+/// A re-ask that could not look (a 429, every courier faulting) leaves no chain word, so an index-UNSPENT hop is
+/// offered at the new tip through `index-unspent`: the #808 shape served by #669's own stated residual ("couriers
+/// unable to look"), self-healing on the next word (a spent word downgrades it; the next block degrades it again).
 pub fn memo_predates_tip(m: &ProbeMemo, walk_tip: Option<u64>) -> bool {
     !m.spent && walk_tip.is_some_and(|t| m.tip_height.is_none_or(|h| h < t))
+}
+
+/// PURE (bsv-low #808, the FIX-808 lens's LOW-1): how old an isolate-cached `/spent-any` answer the owed walk's
+/// fresh ask of `(txid, vout)` accepts. The cache (`SPENT_ANY_CACHE_TTL_MS`, 15 s, shared with the public route)
+/// holds no tip, so a word cached in the seconds before a block would be handed to the re-ask and stamped at the new
+/// tip, where it answers for five minutes: the #808 shape narrowed to 15 s. A target the tip rule sent back (its
+/// newest memo [`memo_predates_tip`]) therefore accepts NO cached answer (0: `spent_any_cache_fresh` is never true)
+/// and asks the couriers; every other target keeps the cache. The residual left is the walk's tip itself: it comes
+/// from the 30 s cross-isolate tip cache, so a fresh courier answer can still be stamped at a tip the chain has
+/// already passed (stated at [`memo_predates_tip`]).
+pub fn reask_cache_max_age_ms(
+    memos: &[ProbeMemo],
+    txid: &str,
+    vout: u32,
+    walk_tip: Option<u64>,
+) -> f64 {
+    let key = format!("{}.{vout}", txid.to_ascii_lowercase());
+    let sent_back = memos
+        .iter()
+        .filter(|m| m.outpoint == key)
+        .max_by_key(|m| m.probed_at_ms)
+        .is_some_and(|m| memo_predates_tip(m, walk_tip));
+    if sent_back {
+        0.0
+    } else {
+        crate::results::SPENT_ANY_CACHE_TTL_MS
+    }
 }
 
 /// How old a memo may be to answer for a probe — the same five minutes as the isolate's `SPENT_ANY_PROBE_MAX_AGE_MS`
@@ -2790,6 +2824,21 @@ mod tests {
         assert!(routes.contains(&squash(
             "let reorg_clear = crate::hops_view::reorg_clear_at(&memos); let (answered, to_probe) = crate::hops_view::split_probe_targets_at_tip( &candidates, &memos, now_ms, crate::hops_view::PROBE_MEMO_MAX_AGE_MS, crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS, reorg_clear, tip, )"
         )));
+        // bsv-low #808 (the FIX-808 lens's LOW-3): the memo's tip is WRITTEN at the walk's tip, BOUND into the upsert,
+        // and READ back under its column's name; a revert of any of them made every memo tipless with the lib green
+        let wired = |needle: &str| {
+            assert!(
+                routes.contains(&squash(needle)),
+                "the #808 tip wiring no longer runs: {needle}"
+            )
+        };
+        wired("if let Some(m) = crate::hops_view::probe_memo_at_tip(t, *v, &probe, now_ms, tip) { fresh.push(m); }");
+        wired("m.tip_height.map(|t| JsValue::from_f64(t as f64)).unwrap_or(JsValue::NULL), ];");
+        wired("#[serde(rename = \"tipHeight\", default)] tip_height: Option<i64>,");
+        // the walk's memo read (the one whose fault is counted), not the latch read's mapping of the same row
+        wired("probe_memo_read_faulted(db).await; return Vec::new(); } } } rows.into_iter().map(|r| crate::hops_view::ProbeMemo { outpoint: r.outpoint, probed_at_ms: r.probed_at_ms, spent: r.spent != 0, spending_txid: r.spending_txid, spent_confirmed: r.spent_confirmed.map(|v| v != 0), tip_height: r.tip_height.and_then(|t| u64::try_from(t).ok()), })");
+        // the lens's LOW-1: the re-ask the tip rule sent back bypasses the isolate's cache
+        wired("let max_age = crate::hops_view::reask_cache_max_age_ms(&memos, t, *v, tip); let row = spent_any_resolve_cached(t, *v, \"owed\", max_age).await;");
     }
 
     /// THE ONE PLACE these pins build `owed::OwedInputs` (the second delta lens's D2-M2): the struct holds

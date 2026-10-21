@@ -769,7 +769,8 @@ pub struct HopChainWord {
     /// walk's own tip for a probe it made). `None`: a memo written before the column, or by a walk with no tip.
     pub probe_tip: Option<u64>,
     /// bsv-low #808: an UNSPENT word taken below this walk's tip ([`crate::hops_view::memo_predates_tip`]), served
-    /// past the probe budget: the derivation withholds the sweep on it (a pending chain-wait), never offers it.
+    /// past the probe budget. On an index-UNKNOWN hop the derivation withholds the sweep on it (a pending chain-wait);
+    /// on an index-UNSPENT hop it is served as silence is (`index-unspent`, `tipMoved` stated; the lens's MEDIUM-1).
     pub predates_tip: bool,
 }
 
@@ -3490,11 +3491,23 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 match chain {
                     // bsv-low #808 (loop 41, pair 13): the chain's "unspent" was taken BELOW this walk's tip and the
                     // budget left no fresh ask (`hops_view::memo_predates_tip`): a block has arrived since, and it may
-                    // hold the competitor. #669's predating-probe rule, at the derivation: the sweep is withheld as a
-                    // pending chain-wait, never offered on the old word, and never handed to the index-unspent arm
-                    // below (the rung did speak; its word is out of date, and a moved tip withholds). The walk's
-                    // rotation asks the hop again (an open row re-derives within five minutes).
-                    Some(w) if w.looked && w.spent == Some(false) && w.predates_tip => {
+                    // hold the competitor. Within the budget the walk asks again (the fix's real win: it closes the
+                    // loop-41 occurrence whenever a slot exists). Past it (the eighth candidate, or the 12 s clock),
+                    // the word's fate follows the INDEX (the FIX-808 lens's MEDIUM-1, option (b)):
+                    //   - index-UNKNOWN (this arm): nothing else says unspent, so the out-of-date word withholds the
+                    //     sweep as a pending chain-wait; the walk's rotation asks the hop again.
+                    //   - index-UNSPENT (the `index-unspent` arm below): served EXACTLY as silence is, the sweep offered
+                    //     with `chainProbeTip` and `tipMoved` stated. An out-of-date "unspent" is strictly more evidence
+                    //     than none, and silence offers (#669b); withholding here would bring back the loop-28 class,
+                    //     an honest Collect held by the walk's OWN budget (a block makes every unspent memo predate, so
+                    //     N - 8 hops, or all of them past the clock, were held until the rotation or the 2 h memo TTL).
+                    //     A dead sweep costs a refused broadcast of the owner's own output, never an honest party's sats.
+                    Some(w)
+                        if w.looked
+                            && w.spent == Some(false)
+                            && w.predates_tip
+                            && h.status != HopStatus::Unspent =>
+                    {
                         facts["claim"] = Value::Null;
                         facts["claimable"] = json!(false);
                         facts["chainWait"] = json!("block");
@@ -3519,7 +3532,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             reason: Some(SWEEP_TIP_MOVED_REASON.to_string()),
                         });
                     }
-                    Some(w) if w.looked && w.spent == Some(false) => {
+                    Some(w) if w.looked && w.spent == Some(false) && !w.predates_tip => {
                         facts["claim"] = json!("sweep-hop");
                         facts["claimable"] = json!(true);
                         facts["chainProbe"] =
@@ -3605,6 +3618,20 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         facts["claim"] = json!("sweep-hop");
                         facts["claimable"] = json!(true);
                         facts["chainProbe"] = json!("index-unspent");
+                        // bsv-low #808 (the lens's MEDIUM-1 (b)): a past-budget "unspent" taken below this walk's tip
+                        // is served as silence is, its staleness stated: the tip it was taken at and that the tip moved
+                        if let Some(w) =
+                            chain.filter(|w| w.looked && w.spent == Some(false) && w.predates_tip)
+                        {
+                            facts["tipMoved"] = json!(true);
+                            facts["chainProbeTip"] = json!(w.probe_tip);
+                            if let Some(age) = w.age_ms {
+                                facts["chainProbeAgeMs"] = json!(age);
+                            }
+                            if let Some(tn) = i.tip {
+                                facts["servedTip"] = json!(tn);
+                            }
+                        }
                         // the FILED sweep rides the row when this identity filed one; without one the press signs a
                         // sweep on the device that owns the key (the same source block as the corroborated arm above)
                         match i.hop_sweeps.get(&outpoint) {
@@ -13868,12 +13895,25 @@ pub(crate) mod tests {
     /// The derivation over `chain` at `tip`, then the read-time gate at a TIP-CURRENT snapshot (the loop-41 shape: the
     /// snapshot was stamped at the served tip, so #669's snapshot-against-present check passes it through).
     fn served808(chain: &HashMap<String, HopChainWord>, tip: u64) -> Vec<OwedRow> {
+        served808_as(chain, tip, HopStatus::Unspent)
+    }
+
+    /// [`served808`] for a hop the index calls `status` (`Unknown`: the container never indexed it).
+    fn served808_as(
+        chain: &HashMap<String, HopChainWord>,
+        tip: u64,
+        status: HopStatus,
+    ) -> Vec<OwedRow> {
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let old = [hop(
+        let mut old = [hop(
             HopStatus::Unspent,
             None,
             Some(HOP_STRANDED_AFTER_MS + 1),
         )];
+        if status == HopStatus::Unknown {
+            old[0].status = status;
+            old[0].spent = None;
+        }
         let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(tip));
         i.hop_chain = chain;
         let mut rows = derive_owed_rows(&i);
@@ -13917,13 +13957,13 @@ pub(crate) mod tests {
             "a memo taken at {h} is no answer at {}: the hop is re-probed within the walk",
             h + 1
         );
-        // past the budget, at H+1: the old word withholds
+        // past the budget, at H+1, on an index-UNKNOWN hop: the old word withholds (nothing else says unspent)
         let past = walk808(&conn, h + 1, false, now).expect("the past-budget word");
-        let rows = served808(&past, h + 1);
+        let rows = served808_as(&past, h + 1, HopStatus::Unknown);
         assert_eq!(rows[0].family, OwedFamily::HopStranded);
         assert_eq!(
             rows[0].facts["claimable"], false,
-            "a memo taken before the block never offers the sweep (loop 41: claimable true on a 278 s old memo)"
+            "a memo taken before the block never offers an index-unknown hop's sweep"
         );
         assert!(rows[0].facts["claim"].is_null());
         assert_eq!(rows[0].facts["chainWait"], "block");
@@ -13937,6 +13977,19 @@ pub(crate) mod tests {
             row_is_open(&rows[0]),
             "an open row: the next cadence re-derives it"
         );
+        // past the budget on an index-UNSPENT hop (the lens's MEDIUM-1 (b)): served as silence is, its staleness stated
+        let rows = served808(&past, h + 1);
+        assert_eq!(rows[0].family, OwedFamily::HopStranded);
+        assert_eq!(rows[0].facts["chainProbe"], "index-unspent");
+        assert_eq!(rows[0].facts["claim"], "sweep-hop");
+        assert_eq!(
+            rows[0].facts["claimable"], true,
+            "an out-of-date unspent is more evidence than none: the honest Collect is not held by the walk's budget"
+        );
+        assert_eq!(rows[0].facts["tipMoved"], true);
+        assert_eq!(rows[0].facts["chainProbeTip"], h);
+        assert_eq!(rows[0].facts["servedTip"], h + 1);
+        assert_eq!(rows[0].facts["chainProbeAgeMs"], 277_950);
         // the fresh probe at the served tip, written back as the route writes it (bound to the walk's tip)
         let still = probe_memo_at_tip(&tx(0x07), 0, &unspent_probe808(), now, Some(h + 1)).unwrap();
         write_memos(&conn, &[still]);
@@ -14003,8 +14056,14 @@ pub(crate) mod tests {
             Err(()),
             "a memo with no recorded tip is asked again"
         );
-        let rows = served808(&walk808(&conn, h, false, now).unwrap(), h);
+        let tipless = walk808(&conn, h, false, now).unwrap();
+        let rows = served808_as(&tipless, h, HopStatus::Unknown);
         assert_eq!(rows[0].facts["claimable"], false);
+        assert!(rows[0].facts["chainProbeTip"].is_null());
+        let rows = served808(&tipless, h);
+        assert_eq!(rows[0].facts["chainProbe"], "index-unspent");
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["tipMoved"], true);
         assert!(rows[0].facts["chainProbeTip"].is_null());
         // the pure rule
         let unspent_at =
@@ -14060,5 +14119,163 @@ pub(crate) mod tests {
             "the rung still downgrades"
         );
         assert_ne!(rows[0].facts["claimable"], true);
+    }
+
+    /// PIN 808-D (the FIX-808 lens's MEDIUM-1, RED on `e487ee1f`: the two hops past the eighth slot, and every hop
+    /// past the 12 s clock, were withheld): ten index-unspent stranded hops, every memo "unspent" at H, one block, a
+    /// walk at H+1. The split sends all ten back; the first `OWED_PROBES_PER_RECOMPUTE` are asked FIRST (their fresh
+    /// word at H+1 offers), the rest take the past-budget word and are offered as silence is (`index-unspent`,
+    /// `tipMoved`). Past the clock (no ask at all) every hop is offered the same way. The same ten hops index-UNKNOWN:
+    /// the asked ones offer on their fresh word, the past-budget ones stay pending.
+    #[test]
+    fn pin808_d_past_the_budget_every_index_unspent_hop_is_asked_or_offered() {
+        use crate::hops_view::{
+            probe_memo_at_tip, split_probe_targets_at_tip, stale_memo_word,
+            PROBE_MEMO_CONFIRMED_MAX_AGE_MS, PROBE_MEMO_MAX_AGE_MS,
+        };
+        let (h, now) = (971_993u64, 10_000_000i64);
+        let targets: Vec<(String, u32)> = (0..10u8).map(|b| (tx(0x60 + b), 0)).collect();
+        let memos: Vec<_> = targets
+            .iter()
+            .map(|(t, v)| {
+                probe_memo_at_tip(t, *v, &unspent_probe808(), now - 60_000, Some(h)).unwrap()
+            })
+            .collect();
+        let (answered, to_probe) = split_probe_targets_at_tip(
+            &targets,
+            &memos,
+            now,
+            PROBE_MEMO_MAX_AGE_MS,
+            PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
+            None,
+            Some(h + 1),
+        );
+        assert!(answered.is_empty(), "a block: every unspent memo predates");
+        assert_eq!(
+            to_probe.len(),
+            10,
+            "within the budget each is asked again first"
+        );
+        // the walk's loop: `slots` fresh asks, the rest the past-budget word
+        let walk = |slots: usize| -> HashMap<String, HopChainWord> {
+            let mut chain = HashMap::new();
+            for (n, (t, v)) in to_probe.iter().enumerate() {
+                let key = format!("{t}:{v}");
+                let word = if n < slots {
+                    HopChainWord {
+                        looked: true,
+                        spent: Some(false),
+                        spending_txid: None,
+                        spent_confirmed: None,
+                        stale: false,
+                        age_ms: None,
+                        probe_tip: Some(h + 1),
+                        predates_tip: false,
+                    }
+                } else {
+                    let m = memos
+                        .iter()
+                        .find(|m| m.outpoint == format!("{t}.{v}"))
+                        .unwrap();
+                    stale_memo_word(m, now, None, Some(h + 1))
+                };
+                chain.insert(key, word);
+            }
+            chain
+        };
+        let served = |chain: &HashMap<String, HopChainWord>, status: HopStatus| {
+            let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+            let hops: Vec<HopEntry> = targets
+                .iter()
+                .map(|(t, _)| {
+                    let mut e = hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1));
+                    e.hop_txid = t.clone();
+                    if status == HopStatus::Unknown {
+                        e.status = status;
+                        e.spent = None;
+                    }
+                    e
+                })
+                .collect();
+            let mut i = inputs(&[], &[], &hops, &v, &c, &p, Some(h + 1));
+            i.hop_chain = chain;
+            let mut rows = derive_owed_rows(&i);
+            degrade_stale_sweeps(&mut rows, Some(h + 1), Some(h + 1));
+            rows
+        };
+        for (slots, label) in [
+            (OWED_PROBES_PER_RECOMPUTE, "the eighth slot"),
+            (0, "the 12 s clock"),
+        ] {
+            let chain = walk(slots);
+            let rows = served(&chain, HopStatus::Unspent);
+            assert_eq!(rows.len(), 10);
+            for r in &rows {
+                assert_eq!(
+                    r.facts["claimable"], true,
+                    "past {label}: an index-unspent hop is asked or offered, never held by the budget: {:?}",
+                    r.facts
+                );
+            }
+            let offered_as_silence = rows
+                .iter()
+                .filter(|r| r.facts["chainProbe"] == "index-unspent" && r.facts["tipMoved"] == true)
+                .count();
+            assert_eq!(offered_as_silence, 10 - slots, "past {label}");
+            let rows = served(&chain, HopStatus::Unknown);
+            let pending = rows.iter().filter(|r| r.facts["claimable"] != true).count();
+            assert_eq!(
+                pending,
+                10 - slots,
+                "past {label}: an index-unknown hop's out-of-date word still withholds"
+            );
+        }
+    }
+
+    /// PIN 808-E (the FIX-808 lens's LOW-1, RED on `e487ee1f`: the re-ask took the isolate's 15 s cache): a target the
+    /// tip rule sent back accepts no cached `/spent-any` answer; a never-probed target, a memo at the tip, a spent memo
+    /// and a tipless walk keep the cache.
+    #[test]
+    fn pin808_e_the_re_ask_the_tip_rule_sends_back_takes_no_cached_word() {
+        use crate::hops_view::{probe_memo_at_tip, reask_cache_max_age_ms};
+        use crate::results::{spent_any_cache_fresh, SPENT_ANY_CACHE_TTL_MS};
+        let (h, now) = (971_993u64, 10_000_000i64);
+        let (t, t2) = (tx(0x07), tx(0x08));
+        let below = probe_memo_at_tip(&t, 0, &unspent_probe808(), now - 60_000, Some(h)).unwrap();
+        let max_age = reask_cache_max_age_ms(std::slice::from_ref(&below), &t, 0, Some(h + 1));
+        assert_eq!(
+            max_age, 0.0,
+            "a memo below the walk's tip: the couriers are asked"
+        );
+        assert!(
+            !spent_any_cache_fresh(now as f64 - 1.0, now as f64, max_age),
+            "a word cached one millisecond before is not taken"
+        );
+        assert_eq!(
+            reask_cache_max_age_ms(std::slice::from_ref(&below), &t2, 0, Some(h + 1)),
+            SPENT_ANY_CACHE_TTL_MS,
+            "a never-probed target keeps the cache"
+        );
+        assert_eq!(
+            reask_cache_max_age_ms(std::slice::from_ref(&below), &t, 0, Some(h)),
+            SPENT_ANY_CACHE_TTL_MS,
+            "a memo at the walk's tip (re-asked by age) keeps the cache"
+        );
+        assert_eq!(
+            reask_cache_max_age_ms(std::slice::from_ref(&below), &t, 0, None),
+            SPENT_ANY_CACHE_TTL_MS,
+            "no walk tip: no tip rule"
+        );
+        let spent = crate::hops_view::ChainSpendProbe {
+            known: true,
+            spent: Some(true),
+            spending_txid: Some(tx(0x5d)),
+            spent_confirmed: None,
+        };
+        let spent_below = probe_memo_at_tip(&t, 0, &spent, now - 60_000, Some(h)).unwrap();
+        assert_eq!(
+            reask_cache_max_age_ms(&[spent_below], &t, 0, Some(h + 1)),
+            SPENT_ANY_CACHE_TTL_MS
+        );
     }
 }

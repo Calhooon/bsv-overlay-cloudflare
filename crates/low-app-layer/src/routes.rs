@@ -4291,9 +4291,10 @@ async fn owed_recompute_inner(
                 }
                 probed += 1;
                 probes_made += 1;
-                let row =
-                    spent_any_resolve_cached(t, *v, "owed", crate::results::SPENT_ANY_CACHE_TTL_MS)
-                        .await;
+                // bsv-low #808 (the lens's LOW-1): a target the tip rule sent back takes no isolate-cached word (a
+                // word cached in the seconds before the block would be stamped at the new tip)
+                let max_age = crate::hops_view::reask_cache_max_age_ms(&memos, t, *v, tip);
+                let row = spent_any_resolve_cached(t, *v, "owed", max_age).await;
                 let probe = crate::hops_view::ChainSpendProbe {
                     known: row.known,
                     spent: row.spent,
