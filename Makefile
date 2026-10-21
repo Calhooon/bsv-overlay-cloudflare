@@ -140,8 +140,8 @@ ci:
 # middleware path, wasm32 under Node (`crates/low-app-layer/tests/door_wasm.rs`):
 # a store fault through `process_auth_with_storage` is the door's 503 with
 # `Retry-After` and CORS, and the oversize guard on real requests. The
-# runner's version must equal the workers lock's wasm-bindgen (0.2.126).
-WASM_BINDGEN_TEST_RUNNER ?= $(firstword $(wildcard $(HOME)/bsv/targets/wbg-0.2.126/bin/wasm-bindgen-test-runner) wasm-bindgen-test-runner)
+# runner's version must equal the workers lock's wasm-bindgen (0.2.129; 0.2.126 until REPIN-080-OVERLAY, which took worker 0.8.7, whose floor it is).
+WASM_BINDGEN_TEST_RUNNER ?= $(firstword $(wildcard $(HOME)/bsv/targets/wbg-0.2.129/bin/wasm-bindgen-test-runner) wasm-bindgen-test-runner)
 app-layer-door:
 	CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=$(WASM_BINDGEN_TEST_RUNNER) cargo test $(WORKERS) -p low-app-layer --target wasm32-unknown-unknown --test door_wasm
 

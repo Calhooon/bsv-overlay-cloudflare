@@ -301,6 +301,15 @@ pub fn selection(event: &ChainEvent) -> Selection {
 /// The crate's own step: the stored row's state, restored from its checked proof against its recorded header
 /// ([`Row::restored_state`]), given the event as `Evidence::Chain` through `State::step`; the re-ask is the crate's.
 /// A row whose proof does not restore takes [`host_reask`], the same shapes.
+///
+/// REPIN-080-OVERLAY (bsv-tracker 0.7.0, the reorg rule BY THE ROOT): a reorg at or below the word's height and an
+/// invalidation of its checked header no longer mark the word stale; the crate rechecks the stored root against the
+/// headers it is given. The intake gives it NONE (the snapshot above: the pull reads no header), so the crate answers
+/// `Reask::Recheck` (suspect, no header), which is no queue kind ([`reask_columns`]) and would queue nothing. That
+/// answer is the crate saying "recheck this row": it is queued at the event's numbers ([`host_reask`], 0.6.0's
+/// marking, now the SELECTION, the bound of the recheck), and the drain runs the crate's recheck against the active
+/// headers ([`drain_one`]: a root that still matches holds, untouched; only a moved root is re-asked). So the queue
+/// is 0.6.0's row for row and only the rows whose root moved are fetched, the crate's ruling end to end.
 pub fn reask_of(row: &Row, event: &ChainEvent) -> Option<Reask> {
     match row.restored_state() {
         Ok(mut state) => {
@@ -313,15 +322,19 @@ pub fn reask_of(row: &Row, event: &ChainEvent) -> Option<Reask> {
                 &none,
                 Input::Evidence(Evidence::Chain(event.clone())),
             );
-            state.reask().cloned()
+            match state.reask() {
+                Some(Reask::Recheck) => host_reask(row, event),
+                other => other.cloned(),
+            }
         }
         Err(_) => host_reask(row, event),
     }
 }
 
-/// The crate's marking reproduced over a row (`State::on_chain`, bsv-tracker 0.6.0): a reorg at or below the mined
-/// height `Reask::Reorg { fork_height }`; a fork or a split there `Reask::Fork { height }`; an invalidation of the
-/// row's own header `Reask::Reorg` at the row's height; nothing else.
+/// The crate's marking reproduced over a row (`State::on_chain`, bsv-tracker 0.6.0; since 0.7.0 the bound of the
+/// drain's recheck by the root, [`reask_of`]): a reorg at or below the mined height `Reask::Reorg { fork_height }`; a
+/// fork or a split there `Reask::Fork { height }`; an invalidation of the row's own header `Reask::Reorg` at the
+/// row's height; nothing else.
 pub fn host_reask(row: &Row, event: &ChainEvent) -> Option<Reask> {
     let height = row
         .height
@@ -1430,6 +1443,55 @@ mod pins {
             7
         );
         assert_eq!(c.health()["tipAgeSeconds"], 600);
+    }
+
+    /// REPIN-080-OVERLAY (bsv-tracker 0.7.0, the reorg rule by the root): the crate's own step over the intake's empty
+    /// snapshot answers `Reask::Recheck` for a reorg at or below the row and an invalidation of its header (0.6.0
+    /// answered `Reask::Reorg`), which no queue kind holds; [`reask_of`] queues it at the event's numbers, so the
+    /// queue is 0.6.0's. And the root rule the drain applies: given the row's own header still active, the crate's
+    /// step over the same event leaves the word `mined` with no re-ask (held); given another root there, `stale` with
+    /// `Reask::Reorg` at the fork. RED with `reask_of` handing back the crate's `Recheck`: `i771_a` and this pin.
+    #[test]
+    fn repin080_a_the_crates_recheck_is_queued_at_the_events_numbers_and_the_root_decides() {
+        let row = mined(&txid(101), 101, &header_of(101));
+        for envelope in [REORG, INVALIDATED] {
+            let event = decode_envelope(envelope.as_bytes()).unwrap();
+            let mut raw = row.restored_state().unwrap();
+            let none = HeaderSnapshot {
+                tip: Ok(0),
+                headers: BTreeMap::new(),
+            };
+            let _ = raw.step(&PARAMS, &none, Input::Evidence(Evidence::Chain(event.clone())));
+            assert_eq!(raw.reask(), Some(&Reask::Recheck), "{envelope}: the crate's 0.7.0 answer");
+            assert!(matches!(raw.word(), Word::Mined(_)), "{envelope}: no stale mark without a header");
+            assert_eq!(
+                reask_of(&row, &event),
+                Some(Reask::Reorg { fork_height: 101 }),
+                "{envelope}: queued at the event's numbers"
+            );
+        }
+        let event = decode_envelope(REORG.as_bytes()).unwrap();
+        let at = |root: &str| HeaderSnapshot {
+            tip: Ok(102),
+            headers: BTreeMap::from([(
+                101,
+                Ok(Some(Header {
+                    hash: header_of(101),
+                    merkle_root: root.into(),
+                })),
+            )]),
+        };
+        let mut same = row.restored_state().unwrap();
+        same.step(&PARAMS, &at(&txid(101)), Input::Evidence(Evidence::Chain(event.clone())))
+            .unwrap();
+        assert!(matches!(same.word(), Word::Mined(_)), "the same root holds");
+        assert_eq!(same.reask(), None, "the same root: the marks clear");
+        let mut moved = row.restored_state().unwrap();
+        moved
+            .step(&PARAMS, &at(&txid(9_999)), Input::Evidence(Evidence::Chain(event)))
+            .unwrap();
+        assert!(matches!(moved.word(), Word::Stale), "a moved root is stale");
+        assert_eq!(moved.reask(), Some(&Reask::Reorg { fork_height: 101 }));
     }
 
     /// (b) An unknown kind, an unknown version and the Go server's shape stop the pull AT their cursor: the events

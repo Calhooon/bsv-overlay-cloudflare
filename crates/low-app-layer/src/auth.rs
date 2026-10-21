@@ -1442,7 +1442,11 @@ mod tests {
         let from_worker: E = worker::Error::RustError("KV PUT failed: 500".into()).into();
         assert_eq!(auth_fault_class(&from_worker), Transport);
         assert!(
-            include_str!("../Cargo.toml").contains("bsv-middleware-cloudflare = \"=0.7.0\""),
+            // REPIN-080-OVERLAY: 0.7.0 to 0.7.1 re-read; `AuthCloudflareError` and its `KvError` sites are
+            // byte-identical. The adapter diff is the payment door (not linked here) and `Retry-After` appended to
+            // the expose list of `add_cors_headers` / `add_lane_cors_headers`, which the middleware calls on its OWN
+            // answers (handshake, refusals): additive, and this crate's `cors::expose_list` already names it.
+            include_str!("../Cargo.toml").contains("bsv-middleware-cloudflare = \"=0.7.1\""),
             "the middleware pin moved: re-read AuthCloudflareError and its KvError sites first"
         );
     }
