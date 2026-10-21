@@ -20,9 +20,12 @@
 //! each input whose source body the BEEF CARRIES and whose spent output is a
 //! P2PKH (the rule this manager admits by). The door then lands each named
 //! carried hop first (D17 rule 2) and the JOIN's admission spends its coin.
-//! The bound: the names are the JOIN's own inputs (the covenant's two seats'
-//! hops), never a walk; a hop's own body is no JOIN and names nothing, so
-//! nothing above the hops is named. An input whose source the BEEF does not
+//! The bound: the names are the JOIN's own inputs, never a walk: for an
+//! honest JOIN the covenant's two seats' hops; for a stranger, any number
+//! (the covenant check reads the script's head and tail only), bounded by
+//! the submit's 256 reads (the door's; a landed hop's inserts are its own
+//! submit's writes, not counted there); a hop's own body is no JOIN and
+//! names nothing, so nothing above the hops is named. An input whose source the BEEF does not
 //! carry is never named (its lock cannot be read, and an absent named body
 //! would hold the JOIN "not now" until it landed: a proven JOIN presented
 //! alone names nothing and is recorded as before).
