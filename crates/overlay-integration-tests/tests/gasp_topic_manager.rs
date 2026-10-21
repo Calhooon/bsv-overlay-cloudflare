@@ -5584,11 +5584,18 @@ async fn delta559_m1_x9_a_read_fault_inside_the_predecessor_question_is_not_now(
 // applied row, its outputs) where it counted three. The reads MADE are the
 // same, read for read; the boundary moved: head 10 spends 16 counted reads on
 // heads 9 to 2 and is answered by the store on head 1 (it was head 7, at 15),
-// head 11 runs out on head 2 (it was head 8).
+// head 11 runs out on head 2 (it was head 8). Since FIX-791-C (record 901 item
+// 2) the bound is the submit's 256 alone, over every read: each head below
+// costs three (its applied row, its outputs, its coin), so up to head 84 the
+// store answers on head 1 and the door tries to land it (the re-judgement
+// after it, 2, and its own submit, 3, charged first); head 85's landing does
+// not fit (252 + 2 + 3 > 256), head 86's question reads its 255th on head 1
+// and cannot charge the re-judgement, and head 87 runs out on head 2 at 256.
 #[tokio::test]
-async fn delta559_m2_x7_the_read_bound_of_the_predecessor_question_is_sixteen_and_not_now() {
+async fn delta559_m2_x7_the_read_bound_of_the_predecessor_question_is_the_submits_256_and_not_now()
+{
     let (_logs, _guard) = capture_logs();
-    let nodes = chain(13);
+    let nodes = chain(90);
     let store = Rc::new(MemoryStorage::new());
     let calls = Calls::default();
     let scripted = ScriptedStore::armed(&store, node_txid(&nodes[1]), 0, InsertEvent::Faults);
@@ -5600,7 +5607,7 @@ async fn delta559_m2_x7_the_read_bound_of_the_predecessor_question_is_sixteen_an
     assert!(!submitted(&a, &proven_beef(&nodes[1])).await.is_durable());
     drop(a);
 
-    for k in 2..=11 {
+    for k in (2..=11).chain(84..=88) {
         // Head 1's insert stays refused: the landing the door tries first
         // (the E1D lens fold, M1) does not land, so the bound is what is
         // measured.
@@ -5624,30 +5631,35 @@ async fn delta559_m2_x7_the_read_bound_of_the_predecessor_question_is_sixteen_an
             "head {k}: {}",
             r.summary()
         );
-        // Up to head 10 the store answers (head 1 has not landed) and the
+        // Up to head 84 the store answers (head 1 has not landed) and the
         // door then submits head 1 first, three reads of that submit's own
-        // (its applied row, its coin, the read-back of its refused insert);
-        // head 11 runs out of its 16 counted reads on head 2, after the 24
-        // reads of heads 10 to 3. Each then reads its own outputs once before
-        // it answers "not now" (the E1D lens fold, L4).
-        assert_eq!(
-            asked,
-            if k <= 10 {
-                3 * (k - 1) + 3 + 1
-            } else {
-                3 * 8 + 1
-            },
-            "head {k}"
-        );
-        assert_eq!(
-            r.summary().contains("is not known to have landed"),
-            k == 11,
-            "head {k}: {}",
-            r.summary()
-        );
+        // (its applied row, its coin, the read-back of its refused insert).
+        // Past it the landing does not fit (85, 86) or the question runs out
+        // on head 2 (87, 88). Each then reads its own outputs once before it
+        // answers "not now" (the E1D lens fold, L4), while the 256 leave room.
+        let (expected, why) = match k {
+            ..=84 => (
+                3 * (k - 1) + 3 + 1,
+                "submitted first from the BEEF, it did not land",
+            ),
+            // 252 read, the re-judgement charged (254), head 1's own submit
+            // (3) does not fit; the re-judgement given back, one read left.
+            85 => (
+                3 * 84 + 1,
+                "its submit does not fit in the submit's 256 reads",
+            ),
+            // 255 read, the re-judgement (2) does not fit.
+            86 => (
+                3 * 85 + 1,
+                "its landing and the re-judgement after it do not fit",
+            ),
+            _ => (256, "the question ran out of the submit's 256 reads"),
+        };
+        assert_eq!(asked, expected, "head {k}");
+        assert!(r.summary().contains(why), "head {k}: {}", r.summary());
         assert_eq!(
             applied_rows(&store, &nodes).await[1..],
-            [false; 12],
+            [false; 89],
             "head {k} is not recorded"
         );
     }
@@ -5663,7 +5675,7 @@ async fn delta559_m2_x7_the_read_bound_of_the_predecessor_question_is_sixteen_an
         assert!(r.is_durable(), "head {k}: {}", r.summary());
     }
     assert_eq!(rows(&store, &nodes).await, ["12:spent=false"], "the tip");
-    assert_eq!(applied_rows(&store, &nodes).await, [true; 13]);
+    assert_eq!(applied_rows(&store, &nodes).await[..13], [true; 13]);
 }
 
 // ============================================================================
@@ -5829,7 +5841,14 @@ fn strangers(width: usize, inputs: u32) -> Vec<Transaction> {
 // one proven parent with 15 inputs. The same bytes answer the same on every
 // retry, so each was three retries and a dead letter, where the reference
 // records it. Now a proven body and a landed one cost nothing against the
-// bound, and each shape is recorded, on the first submit.
+// bound, and each shape is recorded, on the first submit. Since FIX-791-C
+// (record 901 item 2) there is no per-topic count to be free of: every read
+// counts against the submit's 256, and these shapes fit in it (17, 18, 17 and
+// 40 reads). The figure that moved is the UNPROVEN shape: six unproven
+// single-input parents over outpoints nobody holds read 18, past the 16 (on
+// 0673eea "ran out of its 16 reads", every submit), and are recorded now; 85
+// of them read 255 and are recorded, 86 run out of the 256 (`delta3_559_m1_a`
+// is the proven twin of that boundary).
 #[tokio::test]
 async fn delta2_559_m2_y2_proven_and_landed_bodies_do_not_count_against_the_read_bound() {
     let (_logs, _guard) = capture_logs();
@@ -5841,6 +5860,16 @@ async fn delta2_559_m2_y2_proven_and_landed_bodies_do_not_count_against_the_read
         // Wider than the 16: these reads are not counted against it. They
         // are 40 of the submit's allowance of 256 (`delta3_559_m1_*`).
         ("40 landed parents", strangers(40, 1), true),
+        (
+            "six unproven single-input parents",
+            unproven(strangers(6, 1)),
+            false,
+        ),
+        (
+            "85 unproven single-input parents",
+            unproven(strangers(85, 1)),
+            false,
+        ),
     ] {
         let store = Rc::new(MemoryStorage::new());
         let calls = Calls::default();
@@ -5862,7 +5891,7 @@ async fn delta2_559_m2_y2_proven_and_landed_bodies_do_not_count_against_the_read
             }
         }
         let subject = noop_over(&parents);
-        let r = submitted(&head_door(&store, &calls), &beef_of(&subject)).await;
+        let r = submitted(&head_door(&store, &calls), &partial_beef(&subject)).await;
         println!(
             "#559 M2 Y2: {shape}: durable {} applied {:?} ({})",
             r.is_durable(),
@@ -5878,6 +5907,28 @@ async fn delta2_559_m2_y2_proven_and_landed_bodies_do_not_count_against_the_read
         not_recorded.is_empty(),
         "recorded, as in the reference, every shape but: {not_recorded:?}"
     );
+    // One unproven parent more than the 256 hold.
+    let store = Rc::new(MemoryStorage::new());
+    let calls = Calls::default();
+    let subject = noop_over(&unproven(strangers(86, 1)));
+    let r = submitted(&head_door(&store, &calls), &partial_beef(&subject)).await;
+    assert!(!r.is_durable(), "{}", r.summary());
+    assert!(
+        r.summary()
+            .contains("the question ran out of the submit's 256 reads"),
+        "{}",
+        r.summary()
+    );
+}
+
+// `txs` with their proofs taken off.
+fn unproven(txs: Vec<Transaction>) -> Vec<Transaction> {
+    txs.into_iter()
+        .map(|mut tx| {
+            tx.merkle_path = None;
+            tx
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -10839,10 +10890,13 @@ async fn fix791_a_join_over_a_first_join_the_topic_holds_is_recorded_whatever_th
     // (the identity's hop rows held, the funding hops, extra absent inputs
     // of the deepest, recorded): the funding ancestry at 16 reads (5 hops,
     // one extra input) was the beta shape on 9878684 (the first JOIN named).
-    // Counted since FIX-791-B at two a hop and one an absent input: 6 hops
-    // count 13; 7 hops and one extra 16, recorded; 8 hops 17, and the walk
-    // runs out inside that ancestry, which the 16 still bound (D17's stated
-    // cost, unchanged).
+    // FIX-791-B moved the per-topic 16's boundary to 8 hops (counted at two a
+    // hop and one an absent input: 17). Since FIX-791-C (record 901 item 2)
+    // the bound is the submit's 256 alone, over every read the question
+    // makes: the first JOIN's applied row, then three a funding hop (its
+    // applied row, its outputs, its coin) and one an extra input, so 85 hops
+    // read 256 and are recorded, and one read more (85 hops and an extra
+    // input, or 86 hops) is "not now". The 8 hops the 16 refused record.
     for (rows, hops, extra, recorded) in [
         (0usize, 4usize, 0u32, true),
         (0, 5, 0, true),
@@ -10850,7 +10904,10 @@ async fn fix791_a_join_over_a_first_join_the_topic_holds_is_recorded_whatever_th
         (300, 5, 1, true),
         (300, 6, 0, true),
         (300, 7, 1, true),
-        (300, 8, 0, false),
+        (300, 8, 0, true),
+        (0, 85, 0, true),
+        (0, 85, 1, false),
+        (0, 86, 0, false),
     ] {
         let store = Rc::new(MemoryStorage::new());
         // The flood's rows: hops of one identity, each applied and held.
@@ -10911,6 +10968,11 @@ async fn fix791_a_join_over_a_first_join_the_topic_holds_is_recorded_whatever_th
                 r.summary()
             ));
         }
+        assert_eq!(
+            asked,
+            (1 + 3 * hops + extra as usize).min(256),
+            "{hops} +{extra}"
+        );
         if !recorded {
             assert_eq!(r.faults.len(), 1, "{}", r.summary());
             assert_eq!(r.faults[0].site, "predecessor_not_landed");
@@ -10919,11 +10981,16 @@ async fn fix791_a_join_over_a_first_join_the_topic_holds_is_recorded_whatever_th
                 "never the first JOIN, which the topic holds: {}",
                 r.summary()
             );
+            assert!(
+                r.faults[0].error.contains("the submit's 256 reads"),
+                "{}",
+                r.summary()
+            );
         }
     }
     assert!(
         wrong.is_empty(),
-        "a JOIN over a first JOIN the hop ledger holds is recorded unless the other seat's own ancestry passes the 16:\n{}",
+        "a JOIN over a first JOIN the hop ledger holds is recorded unless the other seat's own ancestry passes the submit's 256:\n{}",
         wrong.join("\n")
     );
 }
@@ -11095,9 +11162,7 @@ async fn fix791b_a_betas_two_parked_joins_land_in_the_hop_ledger() {
                 r.summary()
             ));
         }
-        // Nothing but the JOIN's applied row: it admits nothing (its one
-        // output is the pot covenant) and no body is a predecessor.
-        assert!(r.landed_predecessors.is_empty(), "{file}");
+        // The JOIN admits nothing (its one output is the pot covenant).
         assert!(
             store
                 .find_outputs_for_transaction(&txid, false)
@@ -11106,6 +11171,58 @@ async fn fix791b_a_betas_two_parked_joins_land_in_the_hop_ledger() {
                 .is_empty(),
             "{file}"
         );
+        // FIX-791-C: `tm_lowfund` names the JOIN's two hop inputs (their
+        // bodies carried, their stakes P2PKH), so the door lands both hops
+        // first, in input order, and the JOIN spends their stakes. On
+        // 0673eea nothing was landed and neither hop had an applied row.
+        let join = beef
+            .txs
+            .iter()
+            .find(|t| t.txid() == txid)
+            .and_then(|t| t.tx())
+            .unwrap();
+        let hops: Vec<String> = join
+            .inputs
+            .iter()
+            .map(|i| i.get_source_txid().unwrap())
+            .collect();
+        assert_eq!(
+            r.landed_predecessors,
+            hops.iter()
+                .map(|h| (h.clone(), FIX791_TOPIC.to_string()))
+                .collect::<Vec<_>>(),
+            "{file}: the JOIN's two hops landed first"
+        );
+        for (input, hop) in join.inputs.iter().zip(&hops) {
+            let row = AppliedTransaction {
+                txid: hop.clone(),
+                topic: FIX791_TOPIC.to_string(),
+            };
+            if !store.does_applied_transaction_exist(&row).await.unwrap() {
+                wrong.push(format!("{file}: hop {hop} has no applied row"));
+            }
+            // The stake the JOIN spent is no longer held (spent, then
+            // deleted: D17 rule 1); the hop's other P2PKH outputs are.
+            let held: Vec<(u32, bool)> = store
+                .find_outputs_for_transaction(hop, false)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|o| o.topic == FIX791_TOPIC)
+                .map(|o| (o.output_index, o.spent))
+                .collect();
+            println!("#791-C: {file}: hop {hop}: held {held:?}");
+            assert!(
+                !held
+                    .iter()
+                    .any(|(vout, _)| *vout == input.source_output_index),
+                "{file}: hop {hop}'s stake is spent by the JOIN: {held:?}"
+            );
+            assert!(
+                !held.is_empty() && held.iter().all(|(_, spent)| !spent),
+                "{file}: {hop}"
+            );
+        }
     }
     assert!(
         wrong.is_empty(),
@@ -11114,6 +11231,13 @@ async fn fix791b_a_betas_two_parked_joins_land_in_the_hop_ledger() {
     );
 }
 
+// FIX-791-C (record 901 item 2) re-states it for the 256 alone: the three
+// shapes read 3 a hop and 1 or 3 for the source (the reads MADE are those of
+// FIX-791-B, read for read: 6 hops x 3, the first JOIN's applied row, and
+// `funding`'s 3 when carried), well inside the 256, and all three are
+// recorded, as the reference records them. What FIX-791-B counted against
+// the 16 (15, 18, 18) bounds nothing now.
+//
 // MEDIUM-1 of the lens, and the bound of the cure. A JOIN whose direct inputs
 // are six unlanded hops, then (last) the hand's first JOIN, which the topic
 // holds; each hop spends an output of `funding`. With `funding` CARRIED (one
@@ -11131,7 +11255,11 @@ async fn fix791b_a_betas_two_parked_joins_land_in_the_hop_ledger() {
 async fn fix791b_b_six_unlanded_hops_before_a_held_join_count_their_carried_sources_once() {
     let (_logs, _guard) = capture_logs();
     let mut wrong = Vec::new();
-    for (shape, recorded) in [("carried", true), ("absent", false), ("landed", false)] {
+    for (shape, recorded, made) in [
+        ("carried", true, 22),
+        ("absent", true, 19),
+        ("landed", true, 19),
+    ] {
         let store = Rc::new(MemoryStorage::new());
         let mut first = Transaction::new();
         first.inputs.push(absent_input(9000));
@@ -11167,6 +11295,7 @@ async fn fix791b_b_six_unlanded_hops_before_a_held_join_count_their_carried_sour
         let reads = storage.reads.clone();
         let r = submitted(&hop_ledger(storage), &partial_beef(&join)).await;
         let asked = reads.get() - 1 - join.inputs.len();
+        assert_eq!(asked, made, "{shape}: the reads made");
         println!(
             "#791-B M1: hops over a {shape} source: the question read {asked}, durable {} applied {:?} ({})",
             r.is_durable(),
@@ -11211,7 +11340,7 @@ async fn fix791b_c_the_letters_fault_text_keeps_the_budgets_figure() {
                 topic: "tm_lowfund_beta".to_string(),
                 site: "predecessor_not_landed",
                 error: format!(
-                    "{} is not known to have landed: the question ran out of its 16 reads",
+                    "{} is not known to have landed: the question ran out of the submit's 256 reads",
                     "25".repeat(32)
                 ),
             },
@@ -11225,9 +11354,561 @@ async fn fix791b_c_the_letters_fault_text_keeps_the_budgets_figure() {
     };
     let summary = report.summary();
     assert!(
-        summary.contains("the question ran out of its 16 reads; "),
+        summary.contains("the question ran out of the submit's 256 reads; "),
         "{summary}"
     );
     // Every other fault is clipped as before.
     assert!(summary.ends_with(&format!("insert_output: {}", "x".repeat(120))));
+}
+
+// ============================================================================
+// bsv-low #791, FIX-791-C (the owner's rulings, record 901 items 1 and 2;
+// `docs/DESIGN-791-HOP-LEDGER-2026-10-20.md` in bsv-low, sections 1 to 4).
+// (1) `tm_lowfund` NAMES a JOIN's hop inputs (`identify_needed_inputs`: a
+// transaction with a pot covenant output, each input whose source body the
+// BEEF carries and whose spent output is a P2PKH), so the door lands the
+// carried hops a client never posted as predecessors (D17 rule 2) and the
+// JOIN's admission records their spend; a hop the ledger holds is found as a
+// coin and landed nothing. A JOIN that found one hop's coin is asked again of
+// the other (before, a found coin ended the question). (2) The question's one
+// bound is the submit's 256: the per-topic 16 is gone.
+// ============================================================================
+
+// The pot covenant, as the client's builder writes it (`tm_pot` admits it).
+fn join_covenant() -> LockingScript {
+    use bsv_overlay_discovery::pot::{covenant_lock_of, CovenantParams};
+    LockingScript::from_binary(&covenant_lock_of(&CovenantParams {
+        pub_a: [2; 33],
+        pub_b: [3; 33],
+        pub_tower: [2; 33],
+        pay_pkh_a: [0x0a; 20],
+        pay_pkh_b: [0x0b; 20],
+        rake_pkh: [0x0c; 20],
+        stake_a: 5000,
+        stake_b: 5000,
+        fee_sats: 100,
+        recovery_height: 900_000,
+    }))
+    .unwrap()
+}
+
+fn p2pkh_of(salt: u8) -> LockingScript {
+    let mut s = vec![0x76, 0xa9, 0x14];
+    s.extend([salt; 20]);
+    s.extend([0x88, 0xac]);
+    LockingScript::from_binary(&s).unwrap()
+}
+
+// A seat's hop as LOW builds it: the stake P2PKH at 0, the hop party's
+// `OP_RETURN` at 1, the wallet's change P2PKH at 2, over a wallet outpoint
+// the BEEF does not carry.
+fn seat_hop(seat: u8) -> Transaction {
+    let mut hop = Transaction::new();
+    hop.inputs.push(absent_input(6000 + seat as u32));
+    hop.outputs
+        .push(TransactionOutput::new(5000, p2pkh_of(seat)));
+    hop.outputs.push(TransactionOutput::new(
+        0,
+        LockingScript::from_binary(&[0x00, 0x6a, 0x01, seat]).unwrap(),
+    ));
+    hop.outputs
+        .push(TransactionOutput::new(700, p2pkh_of(0x80 + seat)));
+    hop
+}
+
+// A JOIN over each hop's stake output: the pot covenant, nothing else.
+fn join_over(hops: &[Transaction]) -> Transaction {
+    let mut join = Transaction::new();
+    for hop in hops {
+        join.inputs.push(spend_of(hop, 0));
+    }
+    join.outputs
+        .push(TransactionOutput::new(9_900, join_covenant()));
+    join
+}
+
+// Every spend the engine tells its lookup services: (spent txid, vout,
+// spending txid).
+#[derive(Clone, Default)]
+struct SpendLedger(Rc<RefCell<Vec<(String, u32, String)>>>);
+
+#[async_trait(?Send)]
+impl bsv_overlay_engine::lookup_service::LookupService for SpendLedger {
+    fn admission_mode(&self) -> AdmissionMode {
+        AdmissionMode::LockingScript
+    }
+    fn spend_notification_mode(&self) -> SpendNotificationMode {
+        SpendNotificationMode::Txid
+    }
+    fn reads_off_chain_values(&self, _topic: &str) -> bool {
+        false
+    }
+    async fn output_admitted_by_topic(
+        &self,
+        _payload: &OutputAdmittedByTopic,
+    ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
+        Ok(())
+    }
+    async fn output_spent(
+        &self,
+        payload: &OutputSpent,
+    ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
+        if let OutputSpent::Txid {
+            txid,
+            output_index,
+            spending_txid,
+            ..
+        } = payload
+        {
+            self.0
+                .borrow_mut()
+                .push((txid.clone(), *output_index, spending_txid.clone()));
+        }
+        Ok(())
+    }
+    async fn output_evicted(
+        &self,
+        _txid: &str,
+        _output_index: u32,
+    ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
+        Ok(())
+    }
+    async fn lookup(
+        &self,
+        _question: &LookupQuestion,
+    ) -> Result<LookupResult, bsv_overlay_engine::lookup_service::LookupServiceError> {
+        Ok(LookupResult::OutputList(vec![]))
+    }
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+// The hop ledger at the door over `storage`, its spends told to `spends`.
+fn ledger_door(storage: ScriptedStore, spends: &SpendLedger) -> Engine {
+    Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(bsv_overlay_discovery::pot::lowfund_topic_manager::LowFundTopicManager::new())
+                as Box<dyn TopicManager>,
+        )]),
+        HashMap::from([(
+            "ls_spends".to_string(),
+            Box::new(spends.clone()) as Box<dyn bsv_overlay_engine::lookup_service::LookupService>,
+        )]),
+        Box::new(storage),
+        None,
+        EngineConfig::default(),
+    )
+}
+
+async fn ledger_applied(store: &Rc<MemoryStorage>, txid: &str) -> bool {
+    store
+        .does_applied_transaction_exist(&AppliedTransaction {
+            txid: txid.to_string(),
+            topic: TOPIC.to_string(),
+        })
+        .await
+        .unwrap()
+}
+
+// The hop ledger's row of `txid.vout`: None when not held, else its spent flag.
+async fn ledger_row(store: &Rc<MemoryStorage>, txid: &str, vout: u32) -> Option<bool> {
+    store
+        .find_output(txid, vout, Some(TOPIC), None, false)
+        .await
+        .unwrap()
+        .map(|o| o.spent)
+}
+
+// (a) A JOIN whose two hops the client never posted. On 0673eea the JOIN was
+// recorded alone (the manager named nothing, it admits nothing and spends no
+// coin the topic holds): the hops had no applied row and their spend was
+// never told. Now both hops land first from the JOIN's BEEF, ancestors
+// first, each admitting its two P2PKH outputs; the JOIN then finds both
+// coins, its admission spends them (each stake told spent BY THE JOIN and
+// deleted, the change held), and it is recorded.
+#[tokio::test]
+async fn fix791c_a_a_join_whose_hops_were_never_posted_lands_them_and_records_their_spend() {
+    let (_logs, _guard) = capture_logs();
+    let hops = [seat_hop(1), seat_hop(2)];
+    let join = join_over(&hops);
+    let store = Rc::new(MemoryStorage::new());
+    let spends = SpendLedger::default();
+    let storage = ScriptedStore::plain(&store);
+    let reads = storage.reads.clone();
+    let r = submitted(&ledger_door(storage, &spends), &partial_beef(&join)).await;
+    println!(
+        "#791-C (a): {} reads, durable {} applied {:?} landed {:?} spends {:?} ({})",
+        reads.get(),
+        r.is_durable(),
+        r.applied_topics,
+        r.landed_predecessors,
+        spends.0.borrow(),
+        r.summary()
+    );
+    assert!(r.is_durable(), "{}", r.summary());
+    assert_eq!(r.applied_topics, vec![TOPIC.to_string()]);
+    assert!(
+        ledger_applied(&store, &join.id()).await,
+        "the JOIN is recorded"
+    );
+    assert_eq!(
+        r.landed_predecessors,
+        hops.iter()
+            .map(|h| (h.id(), TOPIC.to_string()))
+            .collect::<Vec<_>>(),
+        "both hops landed first, in the JOIN's input order"
+    );
+    let mut told = spends.0.borrow().clone();
+    told.sort();
+    let mut expected: Vec<_> = hops.iter().map(|h| (h.id(), 0, join.id())).collect();
+    expected.sort();
+    assert_eq!(told, expected, "each stake's spend by the JOIN is told");
+    for hop in &hops {
+        assert!(
+            ledger_applied(&store, &hop.id()).await,
+            "the hop's applied row"
+        );
+        assert_eq!(
+            ledger_row(&store, &hop.id(), 0).await,
+            None,
+            "the stake the JOIN spent is taken (D17 rule 1)"
+        );
+        assert_eq!(ledger_row(&store, &hop.id(), 1).await, None, "no P2PKH");
+        assert_eq!(
+            ledger_row(&store, &hop.id(), 2).await,
+            Some(false),
+            "the change is held"
+        );
+    }
+    // Nothing above the hops is named: the hops' own wallet inputs are no
+    // JOIN's, so the walk ends at them.
+    assert_eq!(r.landed_predecessors.len(), 2);
+}
+
+// (b) A JOIN whose hop the ledger holds lands once: the held hop is found as
+// a coin (no landing, no second applied row, no second insert), the other is
+// landed first, and the JOIN spends both. Both held: nothing landed. The
+// replay of the JOIN after (a) is a dupe. And a JOIN presented WITHOUT its
+// hops' bodies (a proven JOIN alone) names nothing and is recorded as before.
+#[tokio::test]
+async fn fix791c_b_a_join_whose_hop_the_ledger_holds_lands_once() {
+    let (_logs, _guard) = capture_logs();
+    for posted in [vec![0usize], vec![1], vec![0, 1]] {
+        let hops = [seat_hop(1), seat_hop(2)];
+        let join = join_over(&hops);
+        let store = Rc::new(MemoryStorage::new());
+        let spends = SpendLedger::default();
+        for &k in &posted {
+            let r = submitted(
+                &ledger_door(ScriptedStore::plain(&store), &spends),
+                &partial_beef(&hops[k]),
+            )
+            .await;
+            assert_eq!(r.applied_topics, vec![TOPIC.to_string()], "hop {k} posted");
+        }
+        let r = submitted(
+            &ledger_door(ScriptedStore::plain(&store), &spends),
+            &partial_beef(&join),
+        )
+        .await;
+        println!(
+            "#791-C (b): hops {posted:?} posted: durable {} landed {:?} ({})",
+            r.is_durable(),
+            r.landed_predecessors,
+            r.summary()
+        );
+        assert!(r.is_durable(), "{posted:?}: {}", r.summary());
+        assert!(ledger_applied(&store, &join.id()).await, "{posted:?}");
+        let unposted: Vec<_> = (0..2)
+            .filter(|k| !posted.contains(k))
+            .map(|k| (hops[k].id(), TOPIC.to_string()))
+            .collect();
+        assert_eq!(r.landed_predecessors, unposted, "{posted:?}: landed once");
+        assert_eq!(
+            spends.0.borrow().len(),
+            2,
+            "{posted:?}: two spends told once"
+        );
+        for hop in &hops {
+            assert_eq!(ledger_row(&store, &hop.id(), 0).await, None, "{posted:?}");
+            assert_eq!(
+                ledger_row(&store, &hop.id(), 2).await,
+                Some(false),
+                "{posted:?}"
+            );
+        }
+        // Its replay: a dupe, nothing landed or told again.
+        let again = submitted(
+            &ledger_door(ScriptedStore::plain(&store), &spends),
+            &partial_beef(&join),
+        )
+        .await;
+        assert_eq!(again.deduped_topics, vec![TOPIC.to_string()], "{posted:?}");
+        assert!(again.landed_predecessors.is_empty());
+        assert_eq!(spends.0.borrow().len(), 2, "{posted:?}");
+    }
+    // The JOIN proven and alone (its hops' bodies absent): nothing named.
+    let hops = [seat_hop(1), seat_hop(2)];
+    let mut alone = join_over(&hops);
+    for input in &mut alone.inputs {
+        input.source_transaction = None;
+    }
+    let alone = proven(&alone, 800);
+    let store = Rc::new(MemoryStorage::new());
+    let spends = SpendLedger::default();
+    let r = submitted(
+        &ledger_door(ScriptedStore::plain(&store), &spends),
+        &beef_of(&alone),
+    )
+    .await;
+    assert!(r.is_durable(), "{}", r.summary());
+    assert!(ledger_applied(&store, &alone.id()).await);
+    assert!(r.landed_predecessors.is_empty());
+    for hop in &hops {
+        assert!(!ledger_applied(&store, &hop.id()).await);
+    }
+}
+
+// (d) A stranger's BEEF whose JOIN-shaped subject spends many pay-to-key
+// bodies it carries: every one is named, and the door lands what the
+// submit's 256 reads hold, never more. Each landing is charged before it is
+// made (its validation and writes, 1 + 2 an input, and the JOIN's
+// re-judgement, 1 + one an input), so a wide JOIN lands fewer: measured, 2
+// and 8 inputs land every hop and are recorded, 40 land 5, 120 land 2 (the
+// question runs out), 200 land 1 (the second re-judgement does not fit).
+#[tokio::test]
+async fn fix791c_d_a_strangers_join_over_many_named_hops_costs_at_most_the_256() {
+    let (_logs, _guard) = capture_logs();
+    for width in [2usize, 8, 40, 120, 200] {
+        let hops: Vec<Transaction> = (0..width)
+            .map(|k| {
+                let mut hop = Transaction::new();
+                hop.inputs.push(absent_input(20_000 + k as u32));
+                hop.outputs.push(TransactionOutput::new(1000, p2pkh_of(7)));
+                hop
+            })
+            .collect();
+        let join = join_over(&hops);
+        let store = Rc::new(MemoryStorage::new());
+        let spends = SpendLedger::default();
+        let storage = ScriptedStore::plain(&store);
+        let reads = storage.reads.clone();
+        let r = submitted(&ledger_door(storage, &spends), &partial_beef(&join)).await;
+        let landed = r.landed_predecessors.len();
+        println!(
+            "#791-C (d): {width} named hops: {} reads, {landed} landed, durable {} ({})",
+            reads.get(),
+            r.is_durable(),
+            r.summary()
+        );
+        // The JOIN's own validation (its applied row, one coin per input)
+        // and, recorded, its writes' one read per spent coin; past them the
+        // 256, landings included.
+        assert!(
+            reads.get() <= 1 + 2 * width + 256,
+            "{width}: {} reads",
+            reads.get()
+        );
+        assert_eq!(r.is_durable(), landed == width, "{width}: {}", r.summary());
+        if landed < width {
+            assert_eq!(r.faults.len(), 1, "{width}: {}", r.summary());
+            assert_eq!(r.faults[0].site, "predecessor_not_landed");
+            assert!(
+                r.faults[0].error.contains("the submit's 256 reads"),
+                "{width}: {}",
+                r.faults[0].error
+            );
+        }
+        let expected = match width {
+            40 => 5,
+            120 => 2,
+            200 => 1,
+            w => w,
+        };
+        assert_eq!(landed, expected, "{width}");
+    }
+}
+
+// (e) No LOW submit asks in two topics: the per-topic share the 16 gave is
+// gone (record 901 item 2), and it would matter only for a submit whose
+// question runs in two topics. Audited over every manager of this workspace
+// (the worker's 16, `lib.rs`): only `tm_lowfund` names anything, and only a
+// JOIN's carried hops; so an ADMITTING submit asks only under `tm_lowfund`,
+// and `tm_pot`, which admits the JOIN's covenant, asks nothing. A JOIN under
+// both topics: `tm_pot` makes no read past its own validation and writes.
+#[tokio::test]
+async fn fix791c_e_no_low_submit_asks_in_two_topics() {
+    use bsv_overlay_discovery as d;
+    let (_logs, _guard) = capture_logs();
+    let managers: Vec<(&str, Box<dyn TopicManager>)> = vec![
+        (
+            "tm_ship",
+            Box::new(d::ship::topic_manager::SHIPTopicManager::new()),
+        ),
+        (
+            "tm_slap",
+            Box::new(d::slap::topic_manager::SLAPTopicManager::new()),
+        ),
+        (
+            "tm_uhrp",
+            Box::new(d::uhrp::topic_manager::UHRPTopicManager::new()),
+        ),
+        (
+            "tm_agent",
+            Box::new(d::agent::topic_manager::AgentTopicManager::new()),
+        ),
+        (
+            "tm_dm_delegation",
+            Box::new(d::dm_delegation::topic_manager::DmDelegationTopicManager::new()),
+        ),
+        (
+            "tm_low",
+            Box::new(d::low::topic_manager::LowTopicManager::new()),
+        ),
+        (
+            "tm_reveal",
+            Box::new(d::reveal::topic_manager::RevealTopicManager::new()),
+        ),
+        (
+            "tm_pot",
+            Box::new(d::pot::topic_manager::PotTopicManager::new()),
+        ),
+        (
+            "tm_lowfund",
+            Box::new(d::pot::lowfund_topic_manager::LowFundTopicManager::new()),
+        ),
+        (
+            "tm_collected",
+            Box::new(d::collected::topic_manager::CollectedTopicManager::new()),
+        ),
+        (
+            "tm_hand",
+            Box::new(d::hand::topic_manager::HandTopicManager::new()),
+        ),
+        (
+            "tm_result",
+            Box::new(d::result::topic_manager::ResultTopicManager::new()),
+        ),
+        (
+            "tm_proof",
+            Box::new(d::proof::topic_manager::ProofTopicManager::new()),
+        ),
+        (
+            "tm_potparty",
+            Box::new(d::potparty::topic_manager::PotpartyTopicManager::new()),
+        ),
+        (
+            "tm_potrefund",
+            Box::new(d::potrefund::topic_manager::PotrefundTopicManager::new()),
+        ),
+        (
+            "tm_hopparty",
+            Box::new(d::hopparty::topic_manager::HoppartyTopicManager::new()),
+        ),
+    ];
+    assert_eq!(managers.len(), 16);
+    let hops = [seat_hop(1), seat_hop(2)];
+    let join = join_over(&hops);
+    // A settle: the JOIN's pot coin to two P2PKH payouts.
+    let mut settle = Transaction::new();
+    settle.inputs.push(spend_of(&join, 0));
+    settle
+        .outputs
+        .push(TransactionOutput::new(5000, p2pkh_of(0x0a)));
+    settle
+        .outputs
+        .push(TransactionOutput::new(4800, p2pkh_of(0x0b)));
+    // A hop's sweep: its stake back to a P2PKH.
+    let mut sweep = Transaction::new();
+    sweep.inputs.push(spend_of(&hops[0], 0));
+    sweep
+        .outputs
+        .push(TransactionOutput::new(4900, p2pkh_of(0x0a)));
+    let bodies = [
+        ("join", &join),
+        ("hop", &hops[0]),
+        ("settle", &settle),
+        ("sweep", &sweep),
+    ];
+    let mut named = Vec::new();
+    for (topic, manager) in &managers {
+        for (shape, tx) in &bodies {
+            let beef = Beef::from_binary(&tx.to_beef(true).unwrap())
+                .unwrap()
+                .to_binary_atomic(&tx.id())
+                .unwrap();
+            let names = manager.identify_needed_inputs(&beef, None).await.unwrap();
+            if !names.is_empty() {
+                named.push((topic.to_string(), shape.to_string(), names.len()));
+            }
+        }
+    }
+    assert_eq!(
+        named,
+        vec![("tm_lowfund".to_string(), "join".to_string(), 2)],
+        "only tm_lowfund names, and only a JOIN's carried hops"
+    );
+
+    // The JOIN under tm_pot alone, tm_lowfund alone and both: tm_pot adds
+    // only its own validation and writes, the same reads it makes alone.
+    let pot = || {
+        Box::new(bsv_overlay_discovery::pot::topic_manager::PotTopicManager::new())
+            as Box<dyn TopicManager>
+    };
+    let lowfund = || {
+        Box::new(bsv_overlay_discovery::pot::lowfund_topic_manager::LowFundTopicManager::new())
+            as Box<dyn TopicManager>
+    };
+    let mut measured = Vec::new();
+    for topics in [
+        vec!["tm_pot"],
+        vec!["tm_lowfund"],
+        vec!["tm_pot", "tm_lowfund"],
+    ] {
+        let store = Rc::new(MemoryStorage::new());
+        let storage = ScriptedStore::plain(&store);
+        let reads = storage.reads.clone();
+        let engine = Engine::new(
+            topics
+                .iter()
+                .map(|t| {
+                    (
+                        t.to_string(),
+                        if *t == "tm_pot" { pot() } else { lowfund() },
+                    )
+                })
+                .collect(),
+            HashMap::new(),
+            Box::new(storage),
+            None,
+            EngineConfig::default(),
+        );
+        let beef = TaggedBEEF::new(
+            join.to_beef(true).unwrap(),
+            topics.iter().map(|t| t.to_string()).collect(),
+        );
+        let r = submitted(&engine, &beef).await;
+        println!(
+            "#791-C (e): {topics:?}: {} reads, applied {:?} landed {:?}",
+            reads.get(),
+            r.applied_topics,
+            r.landed_predecessors
+        );
+        assert!(r.is_durable(), "{topics:?}: {}", r.summary());
+        assert!(
+            r.landed_predecessors.iter().all(|(_, t)| t == "tm_lowfund"),
+            "{topics:?}"
+        );
+        measured.push(reads.get());
+    }
+    assert_eq!(
+        measured[2],
+        measured[0] + measured[1],
+        "tm_pot asks nothing beside tm_lowfund: {measured:?}"
+    );
 }

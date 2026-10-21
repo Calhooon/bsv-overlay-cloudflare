@@ -55,7 +55,8 @@ use crate::types::{
 /// on asking whether an admitted node's named inputs have LANDED (E1D's
 /// re-ask; the E1D lens fold, L3): two per transaction at most (its applied
 /// row, then its held outputs). A transaction past it is requested from the
-/// peer. The figure is the door's own per-topic bound (`PREDECESSOR_READS`).
+/// peer. The figure was the door's own per-topic bound (`PREDECESSOR_READS`, gone
+/// from the door since bsv-low #791 FIX-791-C); the walk keeps its own 16.
 const LANDED_READS_PER_NODE: usize = 16;
 
 /// A GASP node stored during in-progress graph construction.

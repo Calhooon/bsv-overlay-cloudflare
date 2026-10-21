@@ -960,7 +960,7 @@ now" on every presentation, three replays and a dead letter each. A
 successor that admits nothing starts the walk from every input; one that
 admits starts it only from the inputs the manager NAMES, and the engine's
 memory looks only at those too (the lens fold, L1), so under a manager that
-names nothing (all 16 of this workspace) an admitting successor is asked
+names nothing (15 of this workspace's 16) an admitting successor is asked
 nothing, as in the reference, and its BEEF is not even parsed; a successor
 that admits NOTHING is still asked of every input, so it waits for, or has
 landed first, a carried body that spends a coin the topic holds (case a):
@@ -1041,32 +1041,25 @@ body the reads reached).
 The question costs at most 256 store reads per SUBMIT over every body it
 reads, in every topic of the submit together (the third delta fold, M1:
 `PREDECESSOR_READS_PER_SUBMIT`; a later topic's question starts from what the
-earlier ones left). Inside that, 16 per topic is a COUNT over the bodies the
-BEEF does not prove and the store does not hold as landed (the second delta
-fold, M2; since FIX-791-B, 616a226, a coin read into a carried source counts
-only once that source is found landed, so the 16 is a count of two a body plus
-one per input whose source the BEEF does not carry or is later found landed,
-and the reads MADE per topic are bounded by the 256 alone): a proven body and
-one whose applied row or held output answers "landed" are read and cost
-nothing against the 16, though an unproven body
-needs room under it for the reads that find it landed (with 15 spent, one
-landed by a held output and no applied row is refused at its second read).
-"Proven" is the BEEF's word here (a body carrying a merkle path): no proof is
-checked at this question (the SPV walk and the anchor check are where proofs
-are checked), it switches the 16 off for that body and nothing else, and the
-256 do not ask it. Since bsv-low #791 (FIX-791-B, 2026-10-20) a coin read
-into a body the BEEF CARRIES counts against the 16 only once that body is
-found landed: found unlanded, its own outputs read (every output, every
-topic) already answered it, so a body whose sources the BEEF carries counts
-two reads, not two plus one an input. The reads made are unchanged, read for
-read and in order, and the 256 count them all; the count against the 16 is
-never higher at any read, and a walk that runs to its end counts at most 16.
-It is what records beta's two parked JOINs (two seats' hops the hop ledger
-never got, over their settles: 16 and 18 counted, refused; now 12 and 13),
-pinned by `fix791b_a` over the letters' bytes and beta's rows (`--test
-gasp_topic_manager fix791b`). The 16 still bounds an honest hand's unproven
-depth (about eight carried single-input bodies); the owner's question, the
-bound and the hop ledger's content, is in bsv-low
+earlier ones left). It is the question's ONE bound (bsv-low #791, FIX-791-C,
+the owner's ruling, record 901 item 2): every read counts, a proven or landed
+body's included. Until it a topic also stopped at 16 reads spent on bodies
+neither proven nor found landed (`PREDECESSOR_READS`, the second delta fold,
+M2), which FIX-791-B (616a226) counted late for a coin read into a carried
+body; that count bounded an honest hand's unproven DEPTH (about eight carried
+single-input bodies: beta's two parked JOINs counted 16 and 18 on 4ec0507),
+never the cost the 256 already bound, and it is gone with its constant. The
+reads made are FIX-791-B's, read for read and in order. Its cost: the first
+topic of a submit that asks can spend the whole 256 and leave a later topic's
+question "not now"; no LOW submit asks in two topics (`tm_pot` admits the
+JOIN's covenant and names nothing, `fix791c_e` audits all 16 managers), and
+the per-topic share returns the day one does. The boundary pins restated for
+the 256 (`--test gasp_topic_manager`): `delta559_m2_x7_*` (a head chain's
+question runs out at head 87, its landing does not fit at heads 85 and 86;
+it was head 11 under the 16), `fix791_a` (85 funding hops read 256 and
+record, one read more is "not now"; 8 hops recorded, refused under the 16),
+`fix791b_b` (all three shapes record), `delta2_559_m2_y2` (six and 85
+unproven single-input parents record, 86 run out). The design is in bsv-low
 `docs/DESIGN-791-HOP-LEDGER-2026-10-20.md`. A `predecessor_not_landed`
 fault keeps 320 characters in `MutationReport::summary` (120 for every
 other site), so the dead letter keeps the budget's figure. A GASP finalize
@@ -1194,17 +1187,13 @@ now" over a BEEF above 90,000 bytes answered 502 on every presentation
 room rides by key in R2, and the door refuses none for its size; "The queued
 BEEF in R2" below). It cannot tell a faulted predecessor from one nobody submitted
 yet: the successor is "not now" until it lands. And a transaction that admits
-nothing, found no coin and carries more UNPROVEN, UNLANDED bodies than 16
-reads settle (a carried single-input chain settles eight bodies at two a body,
-five when their sources are absent from the BEEF: FIX-791-B, 616a226; fewer
-with more inputs) is "not
-now" on every submit, where the reference records it: three retries and a
-dead letter each. So is one whose question needs more than 256 reads over
-the submit's topics, whatever its bodies are (a landed body costs one read by
-its applied row or two by a held output; a proven, unlanded one two and one
-more per input: 86 proven single-input parents nobody holds, or 43 under two
-topics): the reads of proven and landed bodies are free of the 16 and not of
-the 256, so the question never follows the BEEF past a constant. (5) What D1 does with a statement whose caller stopped waiting, or was
+nothing, found no coin and whose question needs more than 256 reads over the
+submit's topics, whatever its bodies are (a landed body costs one read by its
+applied row or two by a held output; an unlanded one two and one more per
+input: 86 single-input parents nobody holds, proven or not, or 43 under two
+topics; since FIX-791-C there is no per-topic 16 inside it), is "not now" on
+every submit, where the reference records it: three retries and a dead letter
+each. The question never follows the BEEF past a constant. (5) What D1 does with a statement whose caller stopped waiting, or was
 answered an error, is not known here; the engine assumes it may still land,
 at every door. A delete that never lands leaves the stale coin's spent row
 until that transaction's replay at the door finishes it (GASP does not replay
@@ -1243,6 +1232,64 @@ subject already holding its output (the lens fold, L4) trusts that output;
 one written by a finalize over a predecessor the peer pruned, or one an
 eviction stripped of its predecessor's rows, is recorded over an unlanded
 predecessor: the pruned case is limit (4), the eviction L2's guard.
+
+### The hop ledger names a JOIN's hops (bsv-low #791, FIX-791-C; the owner's ruling, record 901 item 1)
+
+The client's hop post is best-effort, so a JOIN reached `tm_lowfund` over hops
+the ledger never saw: the JOIN was recorded and the hops' spend was not (beta's
+two parked letters, `docs/DESIGN-791-HOP-LEDGER-2026-10-20.md` in bsv-low).
+`LowFundTopicManager::identify_needed_inputs`
+(`crates/overlay-discovery/src/pot/lowfund_topic_manager.rs`,
+`join_hop_inputs`) now NAMES, for a JOIN (a transaction with a pot covenant
+output, as `tm_pot` recognises it), each input whose source body the BEEF
+CARRIES and whose spent output is a P2PKH (the rule the manager admits by),
+in input order. Nothing else is named: a hop is no JOIN, an input whose source
+the BEEF does not carry is never named (its lock cannot be read; a proven JOIN
+presented alone names nothing and is recorded as before), bytes that do not
+parse name nothing. The bound: the names are the JOIN's own inputs (the
+covenant's two seats' hops), never a walk; no source is hydrated.
+
+So the door lands each named carried hop first (D17 rule 2: the hop's dry run
+admits its stake, an opener), ancestors first, each landing charged to the
+submit's 256, and the JOIN then finds both coins: its admission marks each
+stake spent, tells the lookup services (`ls_lowfund`'s `pot_records` records
+the JOIN as the spender), and deletes it (D17 rule 1; the hop's change stays
+held, its applied row stays). A hop the ledger already holds is found as a
+coin and landed nothing (no second applied row, no second insert).
+
+The engine change it needs (`Engine::successors_waiting`): a successor that
+found SOME of its coins is now asked too, of the inputs the manager names that
+the topic does not hold AND whose bodies the BEEF carries, and again after
+each landing while one is left. Before, a found coin ended the question, so a
+JOIN over two unposted hops landed the first and recorded without the second.
+An absent named input is still no reason to wait once a coin was found
+(`e1d_fold_l4`, a head spend over a held genesis that also names a decoy, is
+unchanged). Under a manager that names nothing (the other 15) nothing more is
+asked: one names call per such topic, no store read. Not at a GASP finalize.
+For any consumer manager that NAMES inputs (Zanaadu's), this widens the
+question: a carried named input that is unlanded is landed first even when
+another input's coin was found.
+
+On GASP the names are asked only for a proven node whose dry run admits
+(`find_needed_inputs`): a JOIN under `tm_lowfund` admits nothing (its one
+output is the covenant), and a node's BEEF there carries no sources, so the
+walk is unchanged.
+
+Pins (`--test gasp_topic_manager`, each RED on `0673eea`): `fix791c_a` (two
+unposted hops land, both stakes told spent by the JOIN, the changes held; RED
+`left: []`), `fix791c_b` (one hop held: the other lands once, the replay a
+dupe; a JOIN alone names nothing; RED `[0]: landed once, left: []`),
+`fix791c_d` (a stranger's JOIN over 2 to 200 named P2PKH bodies lands what the
+256 hold: 2, 8, 5 of 40, 2 of 120, 1 of 200; the submit's reads at most its
+own validation and writes plus 256), `fix791c_e` (the audit of the 16
+managers over a JOIN, a hop, a settle and a sweep: only `tm_lowfund` names,
+and only the JOIN's 2; a JOIN under `tm_pot` and `tm_lowfund` reads exactly
+the sum of each alone), `fix791b_a` extended (beta's two letters each land
+their JOIN's two hops, in 23 and 21 reads, the stakes gone, the changes held;
+its old assertion, the JOIN recorded, kept). Two mutants: the found-a-coin
+entry removed (RED `fix791c_b`), the loop ending at a found coin (RED
+`fix791c_a`, `fix791b_a`: one hop landed of two). `--lib lowfund` in
+`overlay-discovery` (`names_a_joins_carried_p2pkh_hop_inputs_and_nothing_else`).
 
 ## The dead letters (bsv-low #576, its lens fold, delta fold and delta-2 fold of 2026-10-08)
 
